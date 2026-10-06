@@ -332,16 +332,16 @@ mod drive {
         mode_name, place_table, read_table, repeat_runs, seed_path, slot_table, write_table,
     };
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
+    use bloomery_gpu_gates::{GateError, data_dir, ref_model_path, residency41};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LOCK,
         HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
-        ResidencyAt, ResidencyPick, ResidencyWhy, STEP_STATS,
+        ResidencyAt, ResidencyPick, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{Machine, Plan, workstation};
+    use model::placement::{Machine, Plan, PlanLevers, workstation};
     use runtime::{
         Advance, Committed, GenOutcome, Lookup, PassSink, Speculative, Stop, StopReason, Target,
         Want,
@@ -722,7 +722,6 @@ mod drive {
                 == Some(body::PrefillMode::Steps),
         };
         let residency = levers.residency_at(at);
-        record::residency_lever(residency).print();
         let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
         if cfg.body.residency != Residency::Off && (a.place == Place::Gate || check_finite) {
             return Err(format!(
@@ -807,6 +806,20 @@ mod drive {
             &Hparams::read(&file).map_err(|e| format!("{}: {e}", path.display()))?,
         );
         let headers = t.elapsed();
+        let machine = a.place.machine(reserve, tier_batch)?;
+        // The unset word against the plan the load will use, and the lever
+        // record naming what it resolved to, before the plan record the open
+        // prints. `--card-table` loads a plan it edits itself, beside a word
+        // that is `off` (refused below otherwise): no pre-plan there.
+        let (plan_n_l, residency) = match &a.diag.card_table {
+            Some(_) => (None, residency),
+            None => pre_plan(&file, &a, &cfg.place, machine, slots, residency)?,
+        };
+        record::residency_lever(residency).print();
+        if let Some(d) = residency.why.detail() {
+            eprintln!("{d}");
+        }
+        let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?;
         // The finite probe feeds step by step, outside the prompt call.
         let feed_mode = if check_finite {
             body::PrefillMode::Steps
@@ -815,7 +828,7 @@ mod drive {
         };
         let args = OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine(reserve, tier_batch)?,
+            machine,
             ctx: a.ctx,
             mode: a.mode,
             cfg: Ds41Cfg {
@@ -839,6 +852,7 @@ mod drive {
             pin_main,
             pinned,
             residency,
+            plan_n_l,
             hp: None,
             ctx_max: 0,
             call: None,
@@ -1052,6 +1066,36 @@ mod drive {
             record::residency_pass_of(kind, &r).print();
         }
         Ok(())
+    }
+
+    /// The plan the load will use, made once before the open: the same
+    /// inputs — the file's headers ([`PlanInputs::read`]), the placement's
+    /// `machine`, the run's `--ctx`, the placement's levers and the resident
+    /// `slots` — the open plans with (`Loaded::open` one sequence,
+    /// [`open_slots`] several), for the unset residency word to resolve
+    /// against ([`residency41::at_plan`]). Deterministic and milliseconds.
+    /// Returns the plan's per-layer card experts, for the open's own plan to
+    /// be checked against ([`Log::plan`]), and the word the plan left.
+    fn pre_plan(
+        file: &Split,
+        a: &Args,
+        place_levers: &PlanLevers,
+        machine: impl Fn(usize) -> Machine,
+        slots: usize,
+        pick: ResidencyPick,
+    ) -> Result<(Option<Vec<u64>>, ResidencyPick), GateError> {
+        const WHAT: &str = "generate_ds41 residency pre-plan";
+        let inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let machine = machine(inputs.model.layers);
+        let ctx = u64::try_from(a.ctx)
+            .map_err(|_| format!("{WHAT}: a context of {} positions passes u64", a.ctx))?;
+        let plan = match NonZeroUsize::new(slots).filter(|n| n.get() > 1) {
+            Some(n) => inputs.plan_with_slots(&machine, ctx, place_levers, n),
+            None => inputs.plan(&machine, ctx, place_levers),
+        }
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+        let pick = residency41::at_plan(&plan, pick)?;
+        Ok((Some(plan.n_l.clone()), pick))
     }
 
     /// The load of a plan that counts `slots` resident sequences
@@ -1667,9 +1711,13 @@ mod drive {
         plan: Option<Duration>,
         pin_main: bool,
         pinned: bool,
-        /// `BLOOMERY_RESIDENCY` as resolved, for the `residency host` record
-        /// and the churn pool's refusal under the placement's default.
+        /// `BLOOMERY_RESIDENCY` as resolved against the pre-plan, for the
+        /// `residency host` record.
         residency: ResidencyPick,
+        /// The pre-plan's per-layer card experts, once made: the open's own
+        /// plan must equal them ([`Log::plan`]). `None` under `--card-table`,
+        /// whose load edits the plan itself.
+        plan_n_l: Option<Vec<u64>>,
         /// The hyperparameters the plan was made from.
         hp: Option<Hparams>,
         /// The plan's `ctx_max`, once planned.
@@ -1692,18 +1740,20 @@ mod drive {
             self.plan = Some(self.t.elapsed() - self.headers);
             let a = self.a;
             record::plan(place, machine, plan).print();
+            // The open's plan is the pre-plan the unset word resolved
+            // against; a load whose plan moved under it names itself.
+            if let Some(pre) = &self.plan_n_l
+                && plan.n_l != *pre
+            {
+                return Err(SessionError::Refused(format!(
+                    "the plan the residency resolved on holds per-layer card experts {pre:?}; \
+                     the open's holds {n_l:?}",
+                    n_l = plan.n_l
+                )));
+            }
             let residency = self.cfg.body.residency;
             if let Some(pool) = swap::churn(plan, 0, residency)? {
                 record::residency_host(self.residency.word, &pool, plan).print();
-                if self.residency.why == ResidencyWhy::Place {
-                    pool.check(plan).map_err(|e| {
-                        SessionError::Refused(format!(
-                            "BLOOMERY_RESIDENCY unset is {} under --place {place}: {e}; \
-                             BLOOMERY_RESIDENCY=off loads the fixed placement",
-                            self.residency.word
-                        ))
-                    })?;
-                }
             }
             // The caches hold the plan's ctx_max positions, the value the
             // model is loaded with; --ctx only asks for it.

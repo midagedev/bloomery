@@ -39,6 +39,8 @@ pub mod qwen3moe;
 pub mod record;
 #[cfg(feature = "gpu")]
 pub mod residency38;
+#[cfg(feature = "deepseek41")]
+pub mod residency41;
 pub mod rounding;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;

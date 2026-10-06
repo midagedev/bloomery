@@ -671,46 +671,270 @@ fn residency38_unset_follows_the_plan() {
     }
     // 297 − 148 = 149 experts a layer, 2 layers, 10 B each: 2,980 B.
     assert_eq!(pick(&[297, 297], 2_980).pinned, Some(148));
-    let short = pick(&[297, 297], 2_979);
+    // One byte less of headroom: the pool shrinks 20 B a pinned count, so
+    // the first count whose pool fits 2,979 B is 149 (2,960 B).
+    let moved = pick(&[297, 297], 2_979);
     assert_eq!(
-        short,
+        moved,
         Residency38Pick {
-            pinned: None,
-            why: Residency38Why::HostShort {
-                needs: 2_980,
-                leaves: 2_979
-            }
+            pinned: Some(149),
+            why: Residency38Why::Moved { from: 148, to: 149 }
         }
     );
+    assert_eq!(moved.word(), "mid-p149-s1");
     assert_eq!(
-        short.why.to_string(),
-        "unset: the churn pool needs 2980 B, the plan leaves 2979 B"
+        moved.why.to_string(),
+        "unset: the plan's room moves the word's pinned experts p148→p149"
     );
+    // The same byte less of MemAvailable moves it too, under a headroom
+    // that takes the pool at the target.
     assert_eq!(
-        pick(&[297], -5).why,
-        Residency38Why::HostShort {
-            needs: 2_980,
-            leaves: -5
+        pick_mem(&[297, 297], 1 << 40, 2_979),
+        Residency38Pick {
+            pinned: Some(149),
+            why: Residency38Why::Moved { from: 148, to: 149 }
         }
     );
     assert_eq!(pick_mem(&[297, 297], 2_980, 2_980).pinned, Some(148));
-    let mem = pick_mem(&[297, 297], 1 << 40, 2_979);
+    // No pinned count the card side leaves (at most 295) fits a negative
+    // budget: `off` at the last pool probed, the ceiling's 40 B.
     assert_eq!(
-        mem.why,
-        Residency38Why::MemShort {
-            needs: 2_980,
-            leaves: 2_979
+        pick(&[297], -5).why,
+        Residency38Why::HostShort {
+            needs: 40,
+            leaves: -5
         }
     );
-    assert_eq!(mem.word(), "off");
     assert_eq!(
-        mem.why.to_string(),
-        "unset: the churn pool needs 2980 B, MemAvailable leaves 2979 B past the plan's host need"
+        pick(&[297], -5).why.to_string(),
+        "unset: the churn pool needs 40 B, the plan leaves -5 B"
+    );
+    assert_eq!(
+        pick_mem(&[297], 1 << 40, -5).why,
+        Residency38Why::MemShort {
+            needs: 40,
+            leaves: -5
+        }
     );
     assert_eq!(
         residency38_at_plan([297u64], 1, |_| Err::<u64, &str>("the pool"), 0, 0),
         Err("the pool"),
         "the pool's error is the call's"
+    );
+}
+
+/// The plan's room for a family's target word ([`room_for`]): the word at
+/// its target where its card slots and its host take it, at half the fewest
+/// where its card slots do not, raised where its host does not, `off` where
+/// neither side leaves a count.
+#[test]
+fn room_for_keeps_the_word_where_the_plan_has_room() {
+    // The pool shrinks as the pinned count grows: 10 B an expert past it, on
+    // layers of the fewest's count.
+    let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(10 * (fewest - p) as u64);
+    let room = |target: usize, spares: usize, n_l: &[u64], headroom: i128, mem_left: i128| {
+        let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
+        room_for(
+            target,
+            spares,
+            n_l.iter().copied(),
+            pool(fewest),
+            headroom,
+            mem_left,
+        )
+        .expect("no pool error")
+    };
+    let big = 1 << 40;
+    // The word's target where its card slots hold it, its spares and one
+    // that moves — equality included.
+    assert_eq!(room(40, 1, &[42, 0, 43], big, big), Room::AsIs);
+    assert_eq!(room(0, 1, &[2], big, big), Room::AsIs, "a target of 0 runs");
+    // Half the fewest where the target does not fit: 29/2 = 14.
+    for (n_l, to) in [
+        (&[29u64, 30][..], 14usize),
+        (&[30u64][..], 15),
+        (&[3u64][..], 1),
+    ] {
+        assert_eq!(
+            room(40, 1, n_l, big, big),
+            Room::Moved {
+                fewest: n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize,
+                from: 40,
+                to,
+                side: RoomSide::Card,
+            },
+            "{n_l:?}"
+        );
+    }
+    // No half the card slots hold: `off`, naming the fewest.
+    assert_eq!(
+        room(40, 1, &[2], big, big),
+        Room::Short(RoomShort::NoRoom { fewest: 2 })
+    );
+    for n_l in [&[0u64, 0][..], &[]] {
+        assert_eq!(
+            room(40, 1, n_l, big, big),
+            Room::Short(RoomShort::NoCardExperts)
+        );
+    }
+    // The host side: the pool at the word's P fits neither budget, and the
+    // first count above it whose pool fits raises it — 50 − 45 = 5 experts,
+    // 50 B — never past the card side's ceiling 48.
+    assert_eq!(
+        room(40, 1, &[50], 50, big),
+        Room::Moved {
+            fewest: 50,
+            from: 40,
+            to: 45,
+            side: RoomSide::Host,
+        }
+    );
+    assert_eq!(
+        room(40, 1, &[50], big, 50),
+        Room::Moved {
+            fewest: 50,
+            from: 40,
+            to: 45,
+            side: RoomSide::Host,
+        }
+    );
+    // No count the card side leaves fits the host (the ceiling 48's pool is
+    // 20 B): `off` at the last pool probed, naming the side.
+    assert_eq!(
+        room(40, 1, &[50], 19, big),
+        Room::Short(RoomShort::HostShort {
+            needs: 20,
+            leaves: 19
+        })
+    );
+    assert_eq!(
+        room(40, 1, &[50], big, 19),
+        Room::Short(RoomShort::MemShort {
+            needs: 20,
+            leaves: 19
+        })
+    );
+    assert_eq!(
+        room_for(40, 1, [42u64], |_| Err(()), 0, 0),
+        Err(()),
+        "the pool's error is the call's"
+    );
+}
+
+/// [`RESIDENCY`] unset on a V4.1 plan ([`residency_at_plan`]): the serving
+/// word where the plan has room for it, half the fewest where its card slots
+/// leave less, `off` where they leave nothing; a set word and every other
+/// why pass through untouched.
+#[test]
+fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
+    let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(10 * (fewest - p) as u64);
+    let unset = ResidencyPick {
+        word: RESIDENCY_SERVING,
+        why: ResidencyWhy::Place,
+    };
+    let at = |n_l: &[u64], headroom: i128, mem_left: i128| {
+        let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
+        residency_at_plan(unset, n_l.iter().copied(), pool(fewest), headroom, mem_left)
+            .expect("no pool error")
+    };
+    let big = 1 << 40;
+    // The serving word where the plan's layers hold it.
+    assert_eq!(at(&[42, 43], big, big), unset);
+    assert_eq!(at(&[42, 43], big, big).why.name(), "place");
+    // Half the plan's fewest card experts a layer where they hold no more.
+    for (n_l, word, fewest, to) in [
+        (&[30u64, 31][..], "mid-p15-s1", 30, 15usize),
+        (&[29u64][..], "mid-p14-s1", 29, 14),
+        (&[3u64][..], "mid-p1-s1", 3, 1),
+    ] {
+        assert_eq!(
+            at(n_l, big, big),
+            ResidencyPick {
+                word,
+                why: ResidencyWhy::Shrunk {
+                    fewest,
+                    from: 40,
+                    to,
+                    side: RoomSide::Card,
+                },
+            },
+            "{n_l:?}"
+        );
+    }
+    assert_eq!(
+        at(&[29], big, big)
+            .why
+            .detail()
+            .expect("the shrunk why details"),
+        "unset: p40→p14 (card: fewest 29, half)"
+    );
+    // Under the floor: `off`.
+    assert_eq!(
+        at(&[2, 9], big, big),
+        ResidencyPick {
+            word: "off",
+            why: ResidencyWhy::NoRoom { fewest: 2 }
+        }
+    );
+    assert_eq!(at(&[0, 0], big, big).why, ResidencyWhy::NoCardExperts);
+    assert_eq!(
+        at(&[2, 9], big, big)
+            .why
+            .detail()
+            .expect("the no-room why details"),
+        "unset: the plan's fewest card experts a layer (2) leave no room for the word's P or \
+         half of them"
+    );
+    assert_eq!(
+        ResidencyWhy::Place.detail(),
+        None,
+        "a why the plan did not move details nothing"
+    );
+    // The host side raises a word the card slots hold when its pool does not
+    // fit: the pool at p40 is 100 B, at p45 50 B.
+    let raised = residency_at_plan(
+        unset,
+        [50u64],
+        |p| Ok::<u64, ()>(10 * (50 - p) as u64),
+        50,
+        big,
+    )
+    .expect("no pool error");
+    assert_eq!(
+        raised,
+        ResidencyPick {
+            word: "mid-p45-s1",
+            why: ResidencyWhy::Shrunk {
+                fewest: 50,
+                from: 40,
+                to: 45,
+                side: RoomSide::Host,
+            },
+        }
+    );
+    assert_eq!(
+        raised.why.detail().expect("the raised why details"),
+        "unset: p40→p45 (host: the churn pool did not fit, raised)"
+    );
+    // A set word and every other why pass through untouched, the pool unasked.
+    let refused = |pick: ResidencyPick| {
+        residency_at_plan(pick, [30u64], |_| Err::<u64, ()>(()), 0, 0).expect("no pool error")
+    };
+    assert_eq!(
+        refused(ResidencyPick {
+            word: RESIDENCY_SERVING,
+            why: ResidencyWhy::Set,
+        })
+        .word,
+        RESIDENCY_SERVING
+    );
+    assert_eq!(
+        refused(ResidencyPick {
+            word: "off",
+            why: ResidencyWhy::FixedPlace,
+        })
+        .why,
+        ResidencyWhy::FixedPlace
     );
 }
 
@@ -840,7 +1064,8 @@ fn glm_unset_follows_the_place() {
 }
 
 /// The GLM seat's unset residency on the plan: the default word where it
-/// fits, else `off` naming the first shortfall; `off` and a set word pass
+/// fits, `off` where no pinned count the plan leaves fits the host, and
+/// moved up where a larger count's pool does; `off` and a set word pass
 /// through untouched.
 #[test]
 fn glm_residency_at_plan_takes_only_what_fits() {
@@ -849,6 +1074,7 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         why: GlmWhy::Serving,
     };
     let off = |why| GlmPick { word: "off", why };
+    // The host has room: the pool is asked at the word's pinned count alone.
     let fit = |n: &[u64], pool: u64, headroom, mem| {
         glm_residency_at_plan(
             mid,
@@ -867,20 +1093,6 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         fit(&[0, 1, 67], 10, 10, 10),
         Ok(off(GlmWhy::NoRoom { fewest: 1 }))
     );
-    assert_eq!(
-        fit(&[66], 10, 9, 10),
-        Ok(off(GlmWhy::HostShort {
-            needs: 10,
-            leaves: 9
-        }))
-    );
-    assert_eq!(
-        fit(&[66], 10, 10, 9),
-        Ok(off(GlmWhy::MemShort {
-            needs: 10,
-            leaves: 9
-        }))
-    );
     let gate = off(GlmWhy::Gate);
     assert_eq!(
         glm_residency_at_plan(gate, [66u64], |_| Err("not asked"), 0, 0),
@@ -891,6 +1103,61 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         glm_residency_at_plan(mid, [66u64], |_| Err::<u64, &str>("the pool"), 0, 0),
         Err("the pool"),
         "the pool's error is the call's"
+    );
+    // The host side: the pool at the word's pinned count fits, a byte less
+    // of headroom does not take it — the pool shrinks a byte a count, so the
+    // first count whose pool fits 9 B is 57 (66 − 57).
+    let shrink = |headroom, mem| {
+        glm_residency_at_plan(
+            mid,
+            [66u64],
+            |p| Ok::<u64, &str>((66 - p) as u64),
+            headroom,
+            mem,
+        )
+        .expect("no pool error")
+    };
+    assert_eq!(
+        shrink(9, 1 << 40),
+        GlmPick {
+            word: "mid-p57-s1",
+            why: GlmWhy::Moved { from: 0, to: 57 }
+        }
+    );
+    assert_eq!(
+        shrink(9, 1 << 40).why.to_string(),
+        "unset: the plan's room moves the word's pinned experts p0→p57"
+    );
+    assert_eq!(
+        shrink(1 << 40, 9).why,
+        GlmWhy::Moved { from: 0, to: 57 },
+        "MemAvailable moves it as the headroom does"
+    );
+    // A pool no count the card side leaves (2,000 B at the target, 200 B at
+    // the ceiling 64) fits: `off` at the ceiling's pool, naming the side.
+    let never = |headroom, mem| {
+        glm_residency_at_plan(
+            mid,
+            [66u64],
+            |p| Ok::<u64, &str>(100 * (66 - p) as u64),
+            headroom,
+            mem,
+        )
+        .expect("no pool error")
+    };
+    assert_eq!(
+        never(9, 1 << 40),
+        off(GlmWhy::HostShort {
+            needs: 200,
+            leaves: 9
+        })
+    );
+    assert_eq!(
+        never(1 << 40, 9),
+        off(GlmWhy::MemShort {
+            needs: 200,
+            leaves: 9
+        })
     );
 }
 

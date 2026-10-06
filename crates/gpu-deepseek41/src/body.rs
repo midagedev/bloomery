@@ -248,12 +248,24 @@ impl OpenCfg {
         levers: &bloomery_levers::Levers,
         at: ResidencyAt,
     ) -> Result<OpenCfg, GpuError> {
+        let residency = Residency::parse(levers.residency_at(at).word)?;
+        OpenCfg::from_levers_with(levers, residency)
+    }
+
+    /// [`OpenCfg::from_levers_at`] under a residency the caller resolved:
+    /// the word it resolved to against the plan the load runs
+    /// (`bloomery_levers::residency_at_plan`, called by the V4.1 binaries on
+    /// the plan they are about to load by), or the set word as it is;
+    /// `BLOOMERY_HOSTSTREAM` unset follows the residency handed in.
+    pub fn from_levers_with(
+        levers: &bloomery_levers::Levers,
+        residency: Residency,
+    ) -> Result<OpenCfg, GpuError> {
         const WHAT: &str = "deepseek41 OpenCfg";
         let prefill = PrefillMode::from_name(levers.prefill()).ok_or(GpuError::State {
             what: "BLOOMERY_PREFILL",
             missing: "batch or steps",
         })?;
-        let residency = Residency::parse(levers.residency_at(at).word)?;
         let hoststream = hoststream_under(levers.hoststream(), residency)?;
         let body = BodyLevers {
             ced: levers.ced(),

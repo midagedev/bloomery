@@ -958,6 +958,27 @@ pub enum ResidencyWhy {
     RouteTrace,
     /// Unset beside the step feed.
     PrefillSteps,
+    /// Unset, the plan moved the word's pinned experts (`from`) to `to`,
+    /// keeping its spares: `fewest` the plan's fewest card experts a layer,
+    /// `side` the side of the plan that moved it.
+    Shrunk {
+        fewest: usize,
+        from: usize,
+        to: usize,
+        side: RoomSide,
+    },
+    /// Unset, the plan holds no card expert.
+    NoCardExperts,
+    /// Unset, the plan's fewest card experts a layer (`fewest`) leave no
+    /// room for the word's P or half of them.
+    NoRoom { fewest: usize },
+    /// Unset, the churn pool at the last pinned count probed takes `needs`
+    /// bytes of host RAM; the plan leaves `leaves`.
+    HostShort { needs: u64, leaves: i128 },
+    /// Unset, the churn pool at the last pinned count probed takes `needs`
+    /// bytes; the host's `MemAvailable` leaves `leaves` past the plan's own
+    /// host need.
+    MemShort { needs: u64, leaves: i128 },
 }
 
 impl ResidencyWhy {
@@ -971,6 +992,54 @@ impl ResidencyWhy {
             ResidencyWhy::CheckFinite => "check_finite",
             ResidencyWhy::RouteTrace => "route_trace",
             ResidencyWhy::PrefillSteps => "prefill_steps",
+            ResidencyWhy::Shrunk { .. } => "shrunk",
+            ResidencyWhy::NoCardExperts => "no_card_experts",
+            ResidencyWhy::NoRoom { .. } => "no_room",
+            ResidencyWhy::HostShort { .. } => "host_short",
+            ResidencyWhy::MemShort { .. } => "mem_short",
+        }
+    }
+
+    /// The plan-side detail of an unset word the plan moved or refused, one
+    /// line beside the `residency lever` record; `None` where the why word
+    /// says it all.
+    #[must_use]
+    pub fn detail(self) -> Option<String> {
+        match self {
+            ResidencyWhy::Shrunk {
+                fewest,
+                from,
+                to,
+                side,
+            } => Some(match side {
+                RoomSide::Card => {
+                    format!("unset: p{from}→p{to} (card: fewest {fewest}, half)")
+                }
+                RoomSide::Host => format!(
+                    "unset: p{from}→p{to} (host: the churn pool did not \
+                                          fit, raised)"
+                ),
+            }),
+            ResidencyWhy::NoCardExperts => {
+                Some("unset: the plan holds no routed expert on the card".to_string())
+            }
+            ResidencyWhy::NoRoom { fewest } => Some(format!(
+                "unset: the plan's fewest card experts a layer ({fewest}) leave no room for the \
+                 word's P or half of them"
+            )),
+            ResidencyWhy::HostShort { needs, leaves } => Some(format!(
+                "unset: the churn pool needs {needs} B, the plan leaves {leaves} B"
+            )),
+            ResidencyWhy::MemShort { needs, leaves } => Some(format!(
+                "unset: the churn pool needs {needs} B, MemAvailable leaves {leaves} B past the \
+                 plan's host need"
+            )),
+            ResidencyWhy::Set
+            | ResidencyWhy::Place
+            | ResidencyWhy::FixedPlace
+            | ResidencyWhy::CheckFinite
+            | ResidencyWhy::RouteTrace
+            | ResidencyWhy::PrefillSteps => None,
         }
     }
 }
@@ -1007,6 +1076,226 @@ pub fn residency_unset(at: ResidencyAt) -> ResidencyPick {
         "off"
     };
     ResidencyPick { word, why }
+}
+
+/// The floor a family's word the plan moves its pinned count to keeps: a
+/// move below it runs `off` instead. The floor is the sitting of
+/// `docs/cards/v41shrink3090-ab.card`.
+pub const RESIDENCY_MIN_P: usize = 1;
+
+/// Which side of a plan moved a family's residency word off its target
+/// pinned count ([`Room::Moved`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomSide {
+    /// The plan's card slots: its fewest card experts a layer hold neither
+    /// the word's P nor half of them, its spares and one that moves.
+    Card,
+    /// The plan's host room: the churn pool at the word's P fits no pinned
+    /// count the card side leaves.
+    Host,
+}
+
+/// Why a family's residency word cannot run on a plan ([`Room::Short`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomShort {
+    /// No layer holds a card expert.
+    NoCardExperts,
+    /// The plan's fewest card experts a layer (`fewest`) leave no room for
+    /// the word's P or half of them, their spares and one that moves.
+    NoRoom { fewest: usize },
+    /// The churn pool at the last pinned count probed takes `needs` bytes of
+    /// host RAM; the plan leaves `leaves`.
+    HostShort { needs: u64, leaves: i128 },
+    /// The churn pool at the last pinned count probed takes `needs` bytes;
+    /// the host's `MemAvailable` leaves `leaves` past the plan's own host
+    /// need.
+    MemShort { needs: u64, leaves: i128 },
+}
+
+/// What a plan's room left of a family's target residency word
+/// ([`room_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room {
+    /// The word runs as it is: the plan's card slots hold its pinned count,
+    /// its spares and one that moves, and its host takes the churn pool
+    /// there.
+    AsIs,
+    /// The word runs at a moved pinned count, keeping its spares: `from` the
+    /// family's target, `to` what the plan's `side` left, on a plan whose
+    /// fewest card experts a layer is `fewest`.
+    Moved {
+        fewest: usize,
+        from: usize,
+        to: usize,
+        side: RoomSide,
+    },
+    /// The word cannot run: `off`, and why ([`RoomShort`]).
+    Short(RoomShort),
+}
+
+/// The room a plan leaves a family's target residency word: `target` the
+/// word's pinned experts, `spares` its free slots a layer, `card_experts`
+/// the plan's card experts a layer (a layer holding none left out),
+/// `pool_bytes` the churn pool's bytes at a pinned count (it shrinks as the
+/// count grows), `headroom` the plan's host headroom and `mem_left` what the
+/// host's `MemAvailable` leaves past the plan's own host need. The word runs
+/// at its target while its card slots hold it, its spares and one that
+/// moves; where they do not, at half the plan's fewest card experts a layer
+/// (the share [`residency38_at_plan`] derives), never under
+/// [`RESIDENCY_MIN_P`]; where the churn pool at that count fits neither
+/// budget, at the first count above it whose does, never past what the card
+/// slots hold. Through [`Room::Moved`] the word keeps its spares at the
+/// moved count; through [`Room::Short`] it does not run — a default the user
+/// did not set never refuses the load. An error of `pool_bytes` is the
+/// call's.
+pub fn room_for<E>(
+    target: usize,
+    spares: usize,
+    card_experts: impl IntoIterator<Item = u64>,
+    pool_bytes: impl Fn(usize) -> Result<u64, E>,
+    headroom: i128,
+    mem_left: i128,
+) -> Result<Room, E> {
+    let Some(fewest) = card_experts.into_iter().filter(|&n| n > 0).min() else {
+        return Ok(Room::Short(RoomShort::NoCardExperts));
+    };
+    let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
+    // The card side: a layer holds the word's P pinned, its spares and one
+    // that moves, so the plan's fewest layer leaves P at most fewest −
+    // spares − 1.
+    let ceiling = (fewest as isize)
+        .saturating_sub(spares as isize)
+        .saturating_sub(1);
+    // The word's P: its target where the card side holds it, else half the
+    // fewest, the share the Qwen3.8 rule derives — under the floor not at
+    // all, and past the ceiling no more than the target was.
+    let p = if target as isize <= ceiling {
+        target
+    } else {
+        let half = fewest / 2;
+        if half < RESIDENCY_MIN_P || half as isize > ceiling {
+            return Ok(Room::Short(RoomShort::NoRoom { fewest }));
+        }
+        half
+    };
+    // The host side at P: the churn pool there fits the plan's host headroom
+    // and what MemAvailable leaves past the plan's own host need.
+    let fits = |p: usize| -> Result<(u64, bool), E> {
+        let needs = pool_bytes(p)?;
+        Ok((
+            needs,
+            headroom >= i128::from(needs) && mem_left >= i128::from(needs),
+        ))
+    };
+    // The host side's refusal at the last count probed: the budget the pool
+    // there passes first names it, as the two checks ran.
+    let short = |needs: u64| {
+        if headroom < i128::from(needs) {
+            RoomShort::HostShort {
+                needs,
+                leaves: headroom,
+            }
+        } else {
+            RoomShort::MemShort {
+                needs,
+                leaves: mem_left,
+            }
+        }
+    };
+    let (needs, host_fits) = fits(p)?;
+    if host_fits {
+        return Ok(if p == target {
+            Room::AsIs
+        } else {
+            Room::Moved {
+                fewest,
+                from: target,
+                to: p,
+                side: RoomSide::Card,
+            }
+        });
+    }
+    // The pool shrinks as the count grows, so the first count above the
+    // word's whose pool fits is the nearest the sides leave; the probes stop
+    // at the card side's ceiling.
+    let mut needs = needs;
+    for q in p + 1..=ceiling as usize {
+        let (n, host_fits) = fits(q)?;
+        needs = n;
+        if host_fits {
+            return Ok(Room::Moved {
+                fewest,
+                from: target,
+                to: q,
+                side: RoomSide::Host,
+            });
+        }
+    }
+    Ok(Room::Short(short(needs)))
+}
+
+/// The word `mid-p{p}-s{s}` as a pick's `&'static str`: leaked once a
+/// resolution, as the set word's parse leaks it once a process
+/// ([`Kind::Residency`]).
+fn mid_word(p: usize, s: usize) -> &'static str {
+    Box::leak(format!("mid-p{p}-s{s}").into_boxed_str())
+}
+
+/// [`RESIDENCY`] unset on a V4.1 plan: `pick` as it is unless it runs the
+/// machine (`ResidencyWhy::Place` under a `mid-p<P>-s<S>` word); then
+/// [`room_for`] the word's P and spares against the plan — through
+/// [`ResidencyWhy::Shrunk`] the word runs at the P the plan leaves, `off`
+/// with why where it leaves none — a default the user did not set never
+/// refuses the load. A set word and every other why pass through untouched.
+/// An error of `pool_bytes` is the call's.
+pub fn residency_at_plan<E>(
+    pick: ResidencyPick,
+    card_experts: impl IntoIterator<Item = u64>,
+    pool_bytes: impl Fn(usize) -> Result<u64, E>,
+    headroom: i128,
+    mem_left: i128,
+) -> Result<ResidencyPick, E> {
+    if pick.why != ResidencyWhy::Place {
+        return Ok(pick);
+    }
+    let Some(ResidencyWord::Mid { pinned, spares }) = residency_word(pick.word) else {
+        return Ok(pick);
+    };
+    Ok(
+        match room_for(pinned, spares, card_experts, pool_bytes, headroom, mem_left)? {
+            Room::AsIs => pick,
+            Room::Moved {
+                fewest,
+                from,
+                to,
+                side,
+            } => ResidencyPick {
+                word: mid_word(to, spares),
+                why: ResidencyWhy::Shrunk {
+                    fewest,
+                    from,
+                    to,
+                    side,
+                },
+            },
+            Room::Short(RoomShort::NoCardExperts) => ResidencyPick {
+                word: "off",
+                why: ResidencyWhy::NoCardExperts,
+            },
+            Room::Short(RoomShort::NoRoom { fewest }) => ResidencyPick {
+                word: "off",
+                why: ResidencyWhy::NoRoom { fewest },
+            },
+            Room::Short(RoomShort::HostShort { needs, leaves }) => ResidencyPick {
+                word: "off",
+                why: ResidencyWhy::HostShort { needs, leaves },
+            },
+            Room::Short(RoomShort::MemShort { needs, leaves }) => ResidencyPick {
+                word: "off",
+                why: ResidencyWhy::MemShort { needs, leaves },
+            },
+        },
+    )
 }
 
 /// The slots a layer the Qwen3.8 unset word frees for flips in flight.
@@ -1052,6 +1341,9 @@ pub enum Residency38Why {
     /// The plan's fewest card experts a layer, `fewest`, leave no room for
     /// half of them pinned, the spares and one that moves.
     NoRoom { fewest: usize },
+    /// The plan's host room moved the word's pinned experts from `from` to
+    /// `to` (the churn pool shrinks as the pinned count grows).
+    Moved { from: usize, to: usize },
     /// The churn pool at P takes `needs` bytes of host RAM; the plan leaves
     /// `leaves`.
     HostShort { needs: u64, leaves: i128 },
@@ -1088,6 +1380,10 @@ impl fmt::Display for Residency38Why {
                 f,
                 "unset: the plan's fewest card experts a layer ({fewest}) leave no room for half \
                  of them pinned, {RESIDENCY38_SPARES} spare and one that moves"
+            ),
+            Residency38Why::Moved { from, to } => write!(
+                f,
+                "unset: the plan's room moves the word's pinned experts p{from}→p{to}"
             ),
             Residency38Why::HostShort { needs, leaves } => write!(
                 f,
@@ -1153,47 +1449,59 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 /// routed experts it leaves on no card, `pool_bytes` the churn pool's bytes
 /// at P pinned, `headroom` the plan's host headroom and `mem_left` what the
 /// host's `MemAvailable` leaves past the plan's own host need (the load's
-/// check before any upload). P is half the fewest; `off` when no layer holds
-/// one, when the host holds none (the pool would serve nothing), when the
-/// fewest leave no room for P pinned, the spares and one that moves, or when
-/// the pool at P does not fit the headroom or `mem_left` — a default the
-/// user did not set never refuses the load. An error of `pool_bytes` is the
-/// call's.
+/// check before any upload). P is half the fewest, the target [`room_for`]
+/// checks; `off` when no layer holds one, when the host holds none (the pool
+/// would serve nothing), when the fewest leave no room for P pinned, the
+/// spares and one that moves, or when no pool the card side leaves fits the
+/// headroom or `mem_left` — a default the user did not set never refuses the
+/// load. An error of `pool_bytes` is the call's.
 pub fn residency38_at_plan<E>(
     card_experts: impl IntoIterator<Item = u64>,
     host_experts: u64,
-    pool_bytes: impl FnOnce(usize) -> Result<u64, E>,
+    pool_bytes: impl Fn(usize) -> Result<u64, E>,
     headroom: i128,
     mem_left: i128,
 ) -> Result<Residency38Pick, E> {
-    let Some(fewest) = card_experts.into_iter().filter(|&n| n > 0).min() else {
+    let layers: Vec<u64> = card_experts.into_iter().collect();
+    let fewest = layers.iter().copied().filter(|&n| n > 0).min();
+    let Some(fewest) = fewest else {
         return Ok(Residency38Pick::off(Residency38Why::NoCardExperts));
     };
     if host_experts == 0 {
         return Ok(Residency38Pick::off(Residency38Why::NoHostExperts));
     }
     let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
-    let pinned = fewest / 2;
-    if pinned == 0 || fewest < pinned + RESIDENCY38_SPARES + 1 {
-        return Ok(Residency38Pick::off(Residency38Why::NoRoom { fewest }));
-    }
-    let needs = pool_bytes(pinned)?;
-    if headroom < i128::from(needs) {
-        return Ok(Residency38Pick::off(Residency38Why::HostShort {
-            needs,
-            leaves: headroom,
-        }));
-    }
-    if mem_left < i128::from(needs) {
-        return Ok(Residency38Pick::off(Residency38Why::MemShort {
-            needs,
-            leaves: mem_left,
-        }));
-    }
-    Ok(Residency38Pick {
-        pinned: Some(pinned),
-        why: Residency38Why::PlanA { fewest },
-    })
+    Ok(
+        match room_for(
+            fewest / 2,
+            RESIDENCY38_SPARES,
+            layers,
+            pool_bytes,
+            headroom,
+            mem_left,
+        )? {
+            Room::AsIs => Residency38Pick {
+                pinned: Some(fewest / 2),
+                why: Residency38Why::PlanA { fewest },
+            },
+            Room::Moved { from, to, .. } => Residency38Pick {
+                pinned: Some(to),
+                why: Residency38Why::Moved { from, to },
+            },
+            Room::Short(RoomShort::NoCardExperts) => {
+                Residency38Pick::off(Residency38Why::NoCardExperts)
+            }
+            Room::Short(RoomShort::NoRoom { fewest }) => {
+                Residency38Pick::off(Residency38Why::NoRoom { fewest })
+            }
+            Room::Short(RoomShort::HostShort { needs, leaves }) => {
+                Residency38Pick::off(Residency38Why::HostShort { needs, leaves })
+            }
+            Room::Short(RoomShort::MemShort { needs, leaves }) => {
+                Residency38Pick::off(Residency38Why::MemShort { needs, leaves })
+            }
+        },
+    )
 }
 
 /// What decides [`DRAFT`] unset on a qwen4exp file in `generate_qwen3moe`
@@ -1335,6 +1643,9 @@ pub enum GlmWhy {
     /// The plan's fewest card experts a layer, `fewest`, leave no room for
     /// the word's pinned experts, its spares and one that moves.
     NoRoom { fewest: u64 },
+    /// The plan's room moved the word's pinned experts from `from` to `to`
+    /// (the churn pool shrinks as the pinned count grows).
+    Moved { from: u64, to: u64 },
     /// The churn pool takes `needs` bytes of host RAM; the plan leaves
     /// `leaves`.
     HostShort { needs: u64, leaves: i128 },
@@ -1366,6 +1677,10 @@ impl fmt::Display for GlmWhy {
                 f,
                 "unset: the plan's fewest card experts a layer ({fewest}) leave no room for the \
                  word's pinned experts, its spares and one that moves"
+            ),
+            GlmWhy::Moved { from, to } => write!(
+                f,
+                "unset: the plan's room moves the word's pinned experts p{from}→p{to}"
             ),
             GlmWhy::HostShort { needs, leaves } => write!(
                 f,
@@ -1447,44 +1762,47 @@ pub fn glm_unset(at: GlmAt) -> GlmUnset {
 }
 
 /// [`glm_unset`]'s residency on the plan: `pick` as it is unless it runs the
-/// machine; then `off`, with why, when the plan holds no card expert
-/// (`card_experts` a layer, a layer holding none left out), when its fewest
-/// leave no room for the word's pinned experts, its spares and one that
-/// moves, or when the churn pool at the word's pinned count (`pool_bytes`)
-/// does not fit `headroom` (the plan's host headroom less what the load
-/// hosts beside it) or `mem_left` (what `MemAvailable` leaves past the
-/// load's host need) — a default the user did not set never refuses the
-/// load. An error of `pool_bytes` is the call's.
+/// machine; then [`room_for`] the word's P and spares against the plan —
+/// `off`, with why, when the plan holds no card expert (`card_experts` a
+/// layer, a layer holding none left out), when its fewest leave no room for
+/// the word's pinned experts, its spares and one that moves, or when no
+/// churn pool the card side leaves (`pool_bytes`) fits `headroom` (the
+/// plan's host headroom less what the load hosts beside it) or `mem_left`
+/// (what `MemAvailable` leaves past the load's host need) — a default the
+/// user did not set never refuses the load. An error of `pool_bytes` is the
+/// call's.
 pub fn glm_residency_at_plan<E>(
     pick: GlmPick,
     card_experts: impl IntoIterator<Item = u64>,
-    pool_bytes: impl FnOnce(usize) -> Result<u64, E>,
+    pool_bytes: impl Fn(usize) -> Result<u64, E>,
     headroom: i128,
     mem_left: i128,
 ) -> Result<GlmPick, E> {
     let Some(ResidencyWord::Mid { pinned, spares }) = residency_word(pick.word) else {
         return Ok(pick);
     };
-    let Some(fewest) = card_experts.into_iter().filter(|&n| n > 0).min() else {
-        return Ok(GlmPick::off(GlmWhy::NoCardExperts));
-    };
-    if usize::try_from(fewest).unwrap_or(usize::MAX) < pinned + spares + 1 {
-        return Ok(GlmPick::off(GlmWhy::NoRoom { fewest }));
-    }
-    let needs = pool_bytes(pinned)?;
-    if headroom < i128::from(needs) {
-        return Ok(GlmPick::off(GlmWhy::HostShort {
-            needs,
-            leaves: headroom,
-        }));
-    }
-    if mem_left < i128::from(needs) {
-        return Ok(GlmPick::off(GlmWhy::MemShort {
-            needs,
-            leaves: mem_left,
-        }));
-    }
-    Ok(pick)
+    Ok(
+        match room_for(pinned, spares, card_experts, pool_bytes, headroom, mem_left)? {
+            Room::AsIs => pick,
+            Room::Moved { from, to, .. } => GlmPick {
+                word: mid_word(to, spares),
+                why: GlmWhy::Moved {
+                    from: from as u64,
+                    to: to as u64,
+                },
+            },
+            Room::Short(RoomShort::NoCardExperts) => GlmPick::off(GlmWhy::NoCardExperts),
+            Room::Short(RoomShort::NoRoom { fewest }) => GlmPick::off(GlmWhy::NoRoom {
+                fewest: fewest as u64,
+            }),
+            Room::Short(RoomShort::HostShort { needs, leaves }) => {
+                GlmPick::off(GlmWhy::HostShort { needs, leaves })
+            }
+            Room::Short(RoomShort::MemShort { needs, leaves }) => {
+                GlmPick::off(GlmWhy::MemShort { needs, leaves })
+            }
+        },
+    )
 }
 
 /// The host tier's load settings, from a binary's one reading

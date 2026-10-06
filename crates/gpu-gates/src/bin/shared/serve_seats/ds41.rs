@@ -19,10 +19,14 @@
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! the chat template (`tokenizer.chat_template`) and the default alias
-//! (`general.name`). The plan line, then the `load`, host and `capture`
-//! lines of [`Generator::open`] go to stderr as `generate_ds41` prints them,
+//! (`general.name`). The `residency lever` line, then the plan line, then
+//! the `load`, host and `capture` lines of [`Generator::open`] go to stderr
+//! as `generate_ds41` prints them,
 //! then `listening on http://<addr>` once the model is loaded and the port is
-//! bound (`--port 0` binds a free one). Sampling is the sampler crate's chain
+//! bound (`--port 0` binds a free one). `BLOOMERY_RESIDENCY` unset resolves
+//! against the plan the seat prints (`residency41::at_plan`): the plan-side
+//! detail on the line beside the lever record when the plan moved or refused
+//! the word. Sampling is the sampler crate's chain
 //! with no repetition penalty; `temperature <= 0` is the engine's argmax, the
 //! ids `generate_ds41 --tokens <the prompt's ids>` prints.
 //!
@@ -45,9 +49,11 @@
 //!
 //! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
 //! holds the body's saved sequence states in host RAM. Its default is the
-//! lesser of [`CACHE_RAM_CAP`] and half the host headroom the printed plan
-//! leaves (host RAM less the host expert set, tables, shadows and reserves);
-//! the `cache` record prints it, and the token a prompt call is cut at so a
+//! shared [`CacheRam::of`] budget: the lesser of the cap
+//! (`bind::CACHE_RAM_CAP`) and half of what `MemAvailable` leaves past the
+//! plan's host need, the residency's churn pool and the checkpoints' host
+//! budget; the `cache` record prints
+//! it, and the token a prompt call is cut at so a
 //! later request keeps the start of a user message ([`USER_START`], with
 //! whether the chat template writes it). Every cache event and every prefix
 //! the body keeps less of than a request shares is a record line.
@@ -164,17 +170,17 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
+    CacheRam, Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
     sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_gpu_gates::{GateError, ref_model_path, residency41};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
-use model::placement::workstation::{self, TierBatchBytes};
+use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::{Committed, Lookup, Speculative, Target, Want};
@@ -199,10 +205,6 @@ pub const SLOTS: usize = 2;
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
-
-/// The most the prompt cache takes by default: llama-server's
-/// `--cache-ram` default.
-pub const CACHE_RAM_CAP: u64 = 8192 << 20;
 
 /// A prompt call is cut at a message start only this far past the call's
 /// start: below it the cut's second call costs more than the prefix a
@@ -349,7 +351,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             == Some(body::PrefillMode::Steps),
     };
     let residency = levers.residency_at(at);
-    record::residency_lever(residency).eprint();
     let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
     if cfg.body.residency != Residency::Off && a.place == Place::Gate {
         return Err(format!(
@@ -405,20 +406,24 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         &path,
         &inputs,
     )?;
-    let (card, placement, headroom) = print_plan(
+    let (card, placement, cache, residency) = print_plan(
         &inputs,
         a.place,
         (reserve, tier_batch),
         (ctx, slots),
         &cfg.place,
-        (cfg.body.residency, residency),
+        residency,
+        a.cache_ram,
     )?;
-    let cache_ram = a
-        .cache_ram
-        .unwrap_or_else(|| u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP)));
+    let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?;
+    // The record's `headroom` is the room the budget came from: what
+    // `MemAvailable` leaves past the plan's host need and the churn pool.
     Record::new(&record::CACHE_CONFIG)
-        .u("ram", cache_ram)
-        .u("headroom", headroom)
+        .u("ram", cache.ram)
+        .u(
+            "headroom",
+            i128::from(cache.available) - i128::from(cache.need) - i128::from(cache.pool),
+        )
         .w("user_start", USER_START)
         .w("in_template", template.contains(USER_START))
         .eprint();
@@ -444,7 +449,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         trace,
         stats: levers.step_stats(),
     };
-    let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache_ram)?;
+    let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?;
     let config = ServerConfig {
         model_alias: a.alias.unwrap_or(name),
         model_path: path.display().to_string(),
@@ -551,41 +556,44 @@ fn route_trace(
 /// The plan the engine is about to load under the placement's `levers`
 /// (with `reserve`, the DSpark draft's, and `tier_batch`, the tier's
 /// prompt-batch bytes, on its tier card), `slots` resident sequences of
-/// `ctx` positions each (`PlanInputs::plan_with_slots`), on stderr;
-/// returns its cards' names, the plan's placement for `/props` (`None`,
-/// and a line saying why, when a card's nvidia-smi index cannot be found)
-/// and the plan's host headroom in bytes. Under `residency` (the rule and
-/// the lever as resolved) the churn pool's record follows the plan's, and
-/// the headroom is what the pool leaves; a pool that does not fit is
-/// refused by name, naming the lever when it is the placement's default.
+/// `ctx` positions each (`PlanInputs::plan_with_slots`), on stderr. The
+/// unset residency word resolves against that plan first
+/// ([`residency41::at_plan`]), its `residency lever` record — the plan-side
+/// detail on the line beside it when the plan moved or refused the word —
+/// before the plan's own record; under the word it resolved to the churn
+/// pool's record follows the plan's, a set word's pool refused by name when
+/// it does not fit. Returns its cards' names, the plan's placement for
+/// `/props` (`None`, and a line saying why, when a card's nvidia-smi index
+/// cannot be found), the prompt cache's budget of the real host's room
+/// ([`CacheRam::of`]) and the residency word the load runs by.
 fn print_plan(
     inputs: &PlanInputs,
     place: Place,
     (reserve, tier_batch): (Option<u64>, Option<TierBatchBytes>),
     (ctx, slots): (usize, NonZeroUsize),
     levers: &PlanLevers,
-    residency: (Residency, ResidencyPick),
-) -> Result<(String, Option<PlacementProps>, i64), GateError> {
+    pick: ResidencyPick,
+    cache_ram: Option<u64>,
+) -> Result<(String, Option<PlacementProps>, CacheRam, ResidencyPick), GateError> {
     let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
     let plan = inputs.plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)?;
-    record::plan(place.name(), &machine, &plan).eprint();
-    let mut host_headroom = plan.host.headroom_bytes;
-    if let Some(pool) = swap::churn(&plan, 0, residency.0)? {
-        let pick = residency.1;
-        record::residency_host(pick.word, &pool, &plan).eprint();
-        host_headroom = match pool.check(&plan) {
-            Err(e) if pick.why == ResidencyWhy::Place => {
-                return Err(format!(
-                    "BLOOMERY_RESIDENCY unset is {} under --place {}: {e}; \
-                     BLOOMERY_RESIDENCY=off loads the fixed placement",
-                    pick.word,
-                    place.name()
-                )
-                .into());
-            }
-            r => r?,
-        };
+    let pick = residency41::at_plan(&plan, pick)?;
+    record::residency_lever(pick).eprint();
+    if let Some(d) = pick.why.detail() {
+        eprintln!("{d}");
     }
+    record::plan(place.name(), &machine, &plan).eprint();
+    let mut pool_bytes = 0;
+    if let Some(pool) = swap::churn(&plan, 0, Residency::parse(pick.word)?)? {
+        record::residency_host(pick.word, &pool, &plan).eprint();
+        // A set word is refused by name when its pool does not fit; the
+        // unset word was resolved against this plan, which fitted it.
+        if pick.why == ResidencyWhy::Set {
+            pool.check(&plan)?;
+        }
+        pool_bytes = pool.bytes;
+    }
+    let cache = CacheRam::of(cache_ram, HostNeed::of(&plan, 0).bytes(), pool_bytes)?;
     let gpus: Result<Vec<String>, String> = machine
         .all_cards()
         .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
@@ -594,10 +602,8 @@ fn print_plan(
     if let Err(e) = &placement {
         eprintln!("bloomery-serve-ds41: /props leaves the placement out: {e}");
     }
-    let headroom = i64::try_from(host_headroom)
-        .map_err(|_| format!("the plan's host headroom {host_headroom} B passes i64"))?;
     let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
-    Ok((cards.join("+"), placement.ok(), headroom))
+    Ok((cards.join("+"), placement.ok(), cache, pick))
 }
 
 const WHAT: &str = "bloomery-serve-ds41";
