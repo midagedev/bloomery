@@ -9,7 +9,7 @@
 //!                    [--cache-type-k f16|q8_0] [--parallel N] [--queue-depth Q]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
-//! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults
+//! doc); `--ctx-size` and `-c` are `--ctx` under llama-server's spellings, C defaults
 //! to the file's trained context capped to the largest whose whole load fits
 //! what the card had, its arena and reserve counted (a whole-card load; never
 //! under 4096, a multiple of 1024, one stderr line when the cap binds), or —
@@ -340,7 +340,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse().map_err(|e| format!("--port {v:?}: {e}"))?,
-            "--ctx" | "--ctx-size" => match v.parse::<usize>() {
+            f if serve::flag::CTX.contains(&f) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => a.ctx = Some(n),
                 _ => {
                     return Err(

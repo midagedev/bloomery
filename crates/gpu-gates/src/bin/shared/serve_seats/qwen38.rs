@@ -883,15 +883,15 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             .ok_or_else(|| format!("{flag} needs a value, or is unknown: {USAGE}"))?;
         match flag {
             "--host" => a.host = v.to_owned(),
-            "--port" => a.port = v.parse()?,
+            "--port" => a.port = serve::flag::number(flag, v)?,
             "--place" => a.place = Place38::parse(v)?,
-            "--ctx-size" | "--ctx" => a.ctx = Some(v.parse()?),
+            f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = Some(v.parse()?),
-            "--queue-depth" => a.queue_depth = Some(v.parse()?),
+            "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
+            "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
             "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
