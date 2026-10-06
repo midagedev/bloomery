@@ -34,11 +34,12 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Area | State |
 |---|---|
 | Linux x86-64, NVIDIA sm_86 (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number here comes from these cards |
-| Ada and Blackwell (sm_89, sm_120) | Not yet run here. The sm_86 PTX compiles at the first start (R570+ for Blackwell). [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
+| NVIDIA driver | R580 or newer (CUDA 13); an older driver is refused at the start |
+| Ada and Blackwell (sm_89, sm_120) | Not yet run here. The sm_86 PTX compiles for the card at the first start. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
-| Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B; in turn on the rest |
+| Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
 | Vision input (V4.1) | Not in this release |
@@ -47,17 +48,21 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 - **DeepSeek-V4.1 on one 24 GB card (RTX 3090, 4090) with no flags refuses to load**, naming
   `SwapMachine::new: … card slots for 40 pinned`. The default adaptive residency asks for more card room than the
-  plan leaves. Start it with `BLOOMERY_RESIDENCY=off`.
-- **Qwen3-30B and Qwen3.6 on a machine with two cards of different sizes** load on CUDA device 0, which may be the
-  smaller card. Pick the larger one with `CUDA_VISIBLE_DEVICES`.
+  plan leaves. Start that one command with the setting in front:
+  `BLOOMERY_RESIDENCY=off bloomery-serve --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M` (exported, it makes the other
+  seats refuse at the start).
+- **Qwen3-30B, Qwen3.6 and Clef-Flash on a machine with two cards of different sizes** load on CUDA device 0, which
+  may be the smaller card. Pick the larger one with `CUDA_VISIBLE_DEVICES`.
+- **Docker:** the image's server listens on 127.0.0.1 inside the container, so `-p 8080:8080` does not reach it. Add
+  `--host 0.0.0.0` after the image name.
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
 
 ## Install
 
-One binary, no CUDA toolkit and no Rust toolchain: Linux x86-64, glibc 2.34+, an NVIDIA GPU of compute capability
-8.6 or newer and its driver. On Windows, run it inside WSL2 (`wsl --install`, reboot, then the same commands).
+One binary, no CUDA toolkit and no Rust toolchain: Linux x86-64 with AVX2, glibc 2.34+, an NVIDIA GPU of compute
+capability 8.6 or newer and driver R580 or newer. On Windows, run it inside WSL2 (`wsl --install`, reboot, then the same commands).
 
 ```sh
 # Homebrew (Linux x86-64)
@@ -68,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/relea
 
 # or Docker (needs the host's NVIDIA Container Toolkit; model downloads live in the bloomery-cache volume)
 docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
-  ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+  ghcr.io/midagedev/bloomery --host 0.0.0.0 --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
 tar -xzf bloomery-0.2.3-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.3-linux-x86_64-cuda-sm86
@@ -125,7 +130,7 @@ Two requests at once (`--parallel 2`, both busy) after a 512-token prompt, decod
 | GLM-5.3-Flash `UD-Q4_K_XL` | 35.3 | 223 |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | — ³ |
 
-¹ two requests in turn, so one request's rate · ² adaptive residency off · ³ two requests in turn on two cards
+¹ measured when Qwen3.6 ran two requests in turn (one request's rate); one pass since 0.2.3, not re-measured · ² adaptive residency off · ³ two requests in turn on two cards
 today. Qwen3.8 and GLM-5.3 ran with the MTP draft off.
 
 ## Why it is fast

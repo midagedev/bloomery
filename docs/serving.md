@@ -36,7 +36,7 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   tier when its plan puts enough experts there to pay for it (the GLM row of the
   [A6000 + 3090 table](../README.md#numbers)). The plan line names what was picked.
 - **Two-card serving like `-ts`**: `--place a` for the largest visible card, `--place bp` to add the next one
-  as an expert tier, or a list (`0+1`) by CUDA index.
+  as an expert tier, or a list (`0+1`) by CUDA index (not on the qwen38 seat, which takes `a`, `gate` or `bp`).
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for images and video, upstream's `confidence` formula).
 
@@ -56,9 +56,9 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
 **Concurrent requests.** Every generative seat takes `--parallel N` (unset, 2). The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
-all of them: on a whole-card Qwen3-30B, on V4.1 (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
+all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
 request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
-placed Qwen3-30B (`--place a`), Qwen3.6, a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
+placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). The context splits as llama-server splits it
@@ -88,16 +88,21 @@ a step.
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
 decode starts warm (on by default, with `--place` unset, `a` or `bp`).
 
-**The engines behind the server.** `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat`
-streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are the standalone V4.1 and Qwen3.8 servers.
-Every seat and flag is its binary's `--help`.
+**The engines behind the server.** The release ships `bloomery-serve` alone. A source build also has
+`generate_ds41` (token ids in, greedy ids out), `bloomery-chat` (streams text) and the standalone V4.1 and Qwen3.8
+servers `bloomery-serve-ds41` and `bloomery-serve-qwen38` ([`BUILD.md`](BUILD.md)). Every seat and flag is its
+binary's `--help`.
 
 ## Limits
 
-- **sm_86+** GPUs; the prebuilt archive carries sm_86 PTX.
+- **sm_86+** GPUs and NVIDIA driver R580+ (CUDA 13); the prebuilt archive carries sm_86 PTX, compiled for the card
+  at the first start.
+- GLM-5.3 holds at most 16,384 positions a slot, whatever `--ctx-size` asks; a longer prompt is refused with
+  `exceed_context_size_error`. A 12–16 GB card's split Qwen3 load picks a small context (2,048 positions a slot at
+  `--parallel 2`); agent clients with long system prompts want `--parallel 1` there.
 - One model a server; one expert tier card at most (`--place bp`).
-- Concurrent streams run as one pass on a whole-card Qwen3-30B, on V4.1, GLM-5.3 and Qwen3.8; a placed Qwen3-30B,
-  Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
+- Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, GLM-5.3 and Qwen3.8; a placed
+  Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
   streams wait. The decide seat serves one request at a time; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows

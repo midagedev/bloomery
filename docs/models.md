@@ -19,7 +19,7 @@ request).
 
 ## Hardware
 
-**Required of every host**: an NVIDIA GPU of compute capability 8.6 or newer and its driver; a CPU with AVX2
+**Required of every host**: an NVIDIA GPU of compute capability 8.6 or newer and driver R580 or newer (CUDA 13); a CPU with AVX2
 and FMA (the prebuilt archive targets x86-64-v3); glibc 2.34+; Linux, or Windows through WSL2. NVMe is
 recommended — a load streams the file to the card, and V4.1 reads its engram table from disk as it runs.
 
@@ -32,7 +32,7 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | Qwen3-30B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 8 GB free beside a small card | 18.6 GB |
 | Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes); a 96 GB card holds every routed expert at a 4k context, and a second card adds none | 128 GB beside a 24 or 48 GB card, 64 GB beside a 96 GB card (about 101, 75 and 34 GB free, plus adaptive residency's pool where the host has it) | 111.3 GB, plus the 2.8 GB MTP draft |
 | GLM-5.3-Flash | 24 GB recommended | 256 GB | 199.7 GB |
-| DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB | 347.3 GB, plus 155.7 GB for the optional r8 sidecar |
+| DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB | 347.3 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
 
 Qwen3.8's 28.8 GB PLE table is read from host RAM whatever the cards, so no number of cards holds the whole
 file. `UD-Q3_K_XL` (90.0 GB, not yet run) keeps every routed expert on the host whatever the card, since no card
@@ -42,7 +42,7 @@ Q6_K, so the draft is off on it by name (a set `BLOOMERY_DRAFT=mtp` is refused a
 **Recommended** (the configuration every number in the README ran on): a 32-core AVX2 CPU with 8 DDR4
 channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found
 by device, not by name; a list word such as `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID`
-matches `nvidia-smi`'s numbering).
+matches `nvidia-smi`'s numbering; the qwen38 seat takes `a`, `gate` or `bp` only).
 
 Only the A6000, the 3090, and an RTX 3060 12 GB under WSL2 (running Clef-Flash, its download and its cache)
 have been run; other cards and drivers are untested — please open an issue with `--version` and the error

@@ -16,13 +16,13 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
   card on first start. Run on an RTX A6000 and an RTX 3090 (driver 615.71, Ubuntu 24.04) and, for Clef-Flash, on an
   RTX 3060 under WSL2 (Windows driver 591.86), where the answers equal the A6000's byte for byte. Other cards and
   drivers are untested.
-- The NVIDIA driver (`libcuda.so.1`). No CUDA toolkit is needed. The first start compiles the GPU code for the card
+- The NVIDIA driver R580 or newer (CUDA 13; `libcuda.so.1`). No CUDA toolkit is needed. The first start compiles the GPU code for the card
   and caches it (about 10–25 s measured); later starts take a few seconds. Do not set `CUDA_CACHE_DISABLE=1`: every
   start then recompiles and takes minutes.
 - What fits where:
   - Clef-Flash: run on a 12 GB card with the `Q3_K_S` file (4.26 GB); the files run from 4.26 GB (`Q3_K_S`) to 9.55 GB (`Q8_0`).
-  - Qwen3-30B-A3B and Qwen3.6-35B-A3B at `Q4_K_M`: a 24 GB card whole on device 0, or a 12-16 GB card with `--place a` (the routed experts on the CPU; the server plans the split itself when the file does not fit the card's free bytes).
-  - V4.1, GLM-5.3, Qwen3.8 (their experts partly on the CPU): a 24–48 GB card and a host with 256 GB of RAM.
+  - Qwen3-30B-A3B and Qwen3.6-35B-A3B at `Q4_K_M`: a 24 GB card whole, or a 12-16 GB card with the routed experts on the CPU (the server plans the split itself when the file does not fit the card's free bytes).
+  - V4.1 and GLM-5.3 (their experts partly on the CPU): a 24–48 GB card and a host with 256 GB of RAM; Qwen3.8: a 24–48 GB card and 128 GB of RAM.
 
 ## Run
 
@@ -66,7 +66,7 @@ Downloads go to `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` overrides it). A gated 
 
 ## Cards
 
-The ds41, glm and qwen3 seats take `--parallel N` (two by default): requests alternate in 64-token turns on one model, and a lone request pays nothing for the second slot. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
+Every generative seat takes `--parallel N` (two by default): the slots are resident sequences in the one model, and the busy ones advance together each round. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
 
 `--place` picks the cards for the models with CPU experts: `a` runs the model on the visible card with the most memory,
 `bp` adds the next card as an expert tier, and `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` makes it `nvidia-smi`'s numbering). The single-card models run on
