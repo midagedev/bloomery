@@ -153,7 +153,17 @@
 //!   different counts on the two slots (else the clause is red: the per-slot
 //!   keep never ran apart); and while a pass of slot 1's rows alone waits
 //!   for its commit a select of slot 1 is refused by name by the model, the
-//!   selection and the positions kept.
+//!   selection and the positions kept. Then (z) step after: both windows'
+//!   requests started alone on their own slots, five passes of both slots'
+//!   verify rows committed at fixed counts (every pass keeps part of one
+//!   slot's rows at least, the two counts differ, and the last keeps 1 of
+//!   parked slot 1's 2), then each slot's plain steps — slot 0's right
+//!   after the commit, slot 1's after the select that brings it live — the
+//!   call that reads a slot's sequence as the pass of several slots left it
+//!   and no later pass reads: each slot's ids, each step's argmax and
+//!   logits row bit for bit, its committed lane and position its window's
+//!   run alone on the load's own sequence before any slot exists, through
+//!   the session's verify of one sequence at the same counts.
 //!
 //! (l) and (h) hold at least one row each off a flip: a run that excuses
 //! every row as a flip fails.
@@ -201,7 +211,7 @@ mod gate {
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
-    use runtime::{Advance, Committed, Draft, PassSink, TapNeed, Target, Want};
+    use runtime::{Advance, Committed, Draft, Out, PassSink, TapNeed, Target, Verify, Want};
 
     /// Cache rows: the e2e gate's.
     const CTX: u64 = 3072;
@@ -3173,6 +3183,7 @@ mod gate {
                 capped_run(&mut s, b, depth, ROUNDS)?,
             ]);
         }
+        let after = [after_alone(&mut s, 0, a)?, after_alone(&mut s, 1, b)?];
         s.model_mut().add_slots(2)?;
         // Together, in the server's order: slot 0's prompt call and first
         // plain step run together, then slot 1's, then the drafted passes
@@ -3222,6 +3233,7 @@ mod gate {
             );
         }
         z_ok &= z_red("waiting", waiting_select(&mut s));
+        z_ok &= z_red("step after", step_after(&mut s, [a, b], &after));
         Ok(ids_ok && passes_ok && stores_ok && z_ok)
     }
 
@@ -3512,6 +3524,200 @@ mod gate {
     /// The selected slot's position.
     fn pos_live(s: &app::Session<Body38>) -> u32 {
         s.model().pos()
+    }
+
+    /// (z) step after's passes: each pass's rows a slot (slot 0, slot 1) —
+    /// the token before a proposal, then its window's next ids — each
+    /// slot's up to a verify's lanes and both slots' up to the widest pass
+    /// of two (8 rows).
+    const AFTER_WINDOWS: [(usize, usize); 5] = [(4, 4), (4, 3), (3, 4), (4, 2), (3, 2)];
+    /// Each [`AFTER_WINDOWS`] pass's kept rows a slot, fixed: every pass
+    /// keeps part of one slot's rows at least, the two counts differ, and
+    /// the last keeps 1 of slot 1's 2 — a partial keep of the parked slot
+    /// right before its plain steps.
+    const AFTER_KEEPS: [(usize, usize); 5] = [(2, 3), (4, 1), (1, 2), (3, 2), (2, 1)];
+    /// The plain steps after the passes: the second reads what the first
+    /// wrote.
+    const AFTER_STEPS: usize = 2;
+
+    /// One side of (z) step after's history: every verify row's id (the
+    /// prompt's argmax first), each plain step's argmax and logits row (its
+    /// bits), and the committed lane and position after the steps.
+    #[derive(PartialEq)]
+    struct After {
+        ids: Vec<u32>,
+        steps: Vec<(u32, Vec<u32>)>,
+        lane: u32,
+        pos: u32,
+    }
+
+    /// Slot `half`'s count of a `(slot 0, slot 1)` pair.
+    fn half_of((a, b): (usize, usize), half: usize) -> usize {
+        if half == 0 { a } else { b }
+    }
+
+    /// A pass's `m` rows of a slot: `last`, then `window`'s ids from `at`.
+    fn after_rows(window: &[u32], last: u32, at: usize, m: usize) -> Result<Vec<u32>, GateError> {
+        let fill = window
+            .get(at..at + m - 1)
+            .ok_or("the window holds too few ids for (z) step after's rows")?;
+        let mut rows = vec![last; m];
+        rows[1..].copy_from_slice(fill);
+        Ok(rows)
+    }
+
+    /// `rows` as one verify of the selected sequence through the session's
+    /// verify of one sequence, each row's argmax; waits for its commit.
+    fn verify_rows(s: &mut app::Session<Body38>, rows: &[u32]) -> Result<Vec<u32>, GateError> {
+        fn run<const M: usize>(
+            s: &mut app::Session<Body38>,
+            rows: &[u32],
+        ) -> Result<Vec<u32>, GateError> {
+            let rows: [u32; M] = rows
+                .try_into()
+                .map_err(|_| format!("{} rows for a verify of {M}", rows.len()))?;
+            Ok(Verify::verify(s, rows)?.to_vec())
+        }
+        match rows.len() {
+            2 => run::<2>(s, rows),
+            3 => run::<3>(s, rows),
+            4 => run::<4>(s, rows),
+            n => Err(
+                format!("a verify of {n} rows; (z) step after's passes run 2 to 4 a slot").into(),
+            ),
+        }
+    }
+
+    /// The selected slot's [`AFTER_STEPS`] plain steps from `last`, each
+    /// with its logits row, then its committed lane and position: the end
+    /// of an [`After`] whose verify rows' ids are `ids`.
+    fn after_steps(
+        s: &mut app::Session<Body38>,
+        ids: Vec<u32>,
+        mut last: u32,
+    ) -> Result<After, GateError> {
+        let mut steps = Vec::with_capacity(AFTER_STEPS);
+        for _ in 0..AFTER_STEPS {
+            let Out::Logits { argmax, row } = Target::step(s, last, Want::Logits)? else {
+                return Err("a step asked for its logits gave the argmax alone".into());
+            };
+            steps.push((argmax, row.iter().map(|v| v.to_bits()).collect()));
+            last = argmax;
+        }
+        Ok(After {
+            ids,
+            steps,
+            lane: s.model().body("slots")?.lane(),
+            pos: s.model().pos(),
+        })
+    }
+
+    /// (z) step after's reference for slot `half`'s side, on the selected
+    /// sequence from its reset: `window`'s prompt call, each
+    /// [`AFTER_WINDOWS`] pass of that slot's rows through the session's
+    /// verify of one sequence committed at its [`AFTER_KEEPS`] count, then
+    /// the plain steps.
+    fn after_alone(
+        s: &mut app::Session<Body38>,
+        half: usize,
+        window: &[u32],
+    ) -> Result<After, GateError> {
+        s.reset()?;
+        let mut last = Target::prompt(s, window, Want::Argmax)?.argmax();
+        let mut ids = vec![last];
+        let mut at = 0;
+        for (&w, &k) in AFTER_WINDOWS.iter().zip(&AFTER_KEEPS) {
+            let (m, k) = (half_of(w, half), half_of(k, half));
+            let rows = after_rows(window, last, at, m)?;
+            at += m - 1;
+            let out = verify_rows(s, &rows)?;
+            Verify::commit(s, k)?;
+            ids.extend_from_slice(&out);
+            last = out[k - 1];
+        }
+        after_steps(s, ids, last)
+    }
+
+    /// (z) step after (module doc): each window's request started on its
+    /// own slot from its reset (slot 0 window A, slot 1 window B), the
+    /// [`AFTER_WINDOWS`] each as one pass of both slots' verify rows
+    /// committed at its [`AFTER_KEEPS`] counts, then each slot selected and
+    /// its plain steps — slot 0's right after the commit (selected by the
+    /// pass), slot 1's after the select that exchanges it live. Against
+    /// `refs`, each window's [`after_alone`].
+    fn step_after(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+        refs: &[After; 2],
+    ) -> Result<bool, GateError> {
+        let mut last = [0; 2];
+        let mut ids = [Vec::new(), Vec::new()];
+        for slot in 0..2 {
+            s.select_slot(slot)?;
+            s.reset()?;
+            last[slot] = Target::prompt(s, windows[slot], Want::Argmax)?.argmax();
+            ids[slot].push(last[slot]);
+        }
+        let mut at = [0; 2];
+        for (&(m0, m1), &(k0, k1)) in AFTER_WINDOWS.iter().zip(&AFTER_KEEPS) {
+            let rows = [
+                after_rows(windows[0], last[0], at[0], m0)?,
+                after_rows(windows[1], last[1], at[1], m1)?,
+            ];
+            at = [at[0] + m0 - 1, at[1] + m1 - 1];
+            let out = s.verify_slots(&[(0, &rows[0]), (1, &rows[1])])?.ids;
+            if out.len() != m0 + m1 {
+                return Err(
+                    format!("a pass of {m0} and {m1} rows read back {} ids", out.len()).into(),
+                );
+            }
+            ids[0].extend_from_slice(&out[..m0]);
+            ids[1].extend_from_slice(&out[m0..]);
+            last = [out[k0 - 1], out[m0 + k1 - 1]];
+            s.commit_slots(&[k0, k1])?;
+        }
+        let mut off = Vec::new();
+        for (slot, (ids, r)) in ids.into_iter().zip(refs).enumerate() {
+            s.select_slot(slot)?;
+            let got = after_steps(s, ids, last[slot])?;
+            if got.ids != r.ids {
+                let at = got.ids.iter().zip(&r.ids).position(|(x, y)| x != y);
+                off.push(format!("slot {slot}'s verify ids apart at {at:?}"));
+            }
+            for (i, (g, w)) in got.steps.iter().zip(&r.steps).enumerate() {
+                if g.0 != w.0 {
+                    off.push(format!("slot {slot}'s step {i} id {} (alone {})", g.0, w.0));
+                } else if g.1 != w.1 {
+                    off.push(format!("slot {slot}'s step {i} logits row"));
+                }
+            }
+            if (got.lane, got.pos) != (r.lane, r.pos) {
+                off.push(format!(
+                    "slot {slot}'s lane and position {:?} (alone {:?})",
+                    (got.lane, got.pos),
+                    (r.lane, r.pos)
+                ));
+            }
+            if got.steps.len() != r.steps.len() {
+                off.push(format!("slot {slot}'s step count"));
+            }
+        }
+        let ok = off.is_empty();
+        println!(
+            "(z) step after: {} passes of both slots' verify rows at fixed keeps, the last \
+             keeping 1 of parked slot 1's 2 rows, then {AFTER_STEPS} plain steps a slot (slot 0 \
+             right after the commit, slot 1 after its select); {} {}",
+            AFTER_WINDOWS.len(),
+            if ok {
+                "each slot's ids, each step's id and logits row bit for bit, its lane and \
+                 position its window's alone run's"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     pub(super) fn run() -> Result<(), GateError> {
