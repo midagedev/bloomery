@@ -1,5 +1,5 @@
-//! The one device module of the 32-value-block family: the Q8_0 and Q5_1
-//! GEMMs, their activations' quantizers, the remapped route and the wide
+//! The one device module of the 32-value-block family: the Q8_0, IQ4_NL and
+//! Q5_1 GEMMs, their activations' quantizers, the remapped route and the wide
 //! F32 product — every `#[kernel]` entry of the family, so one bundle load
 //! serves them all. It is a module of its own, beside `kernels.rs`, so no
 //! entry of the K-quant family's module changes with it. Each GEMM entry is
@@ -10,8 +10,8 @@
 use super::act32::quant32_group;
 use super::f32tile::{STAGE_FLOATS, STAGES, f32_tile_body};
 use super::gemm32::{
-    B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, Q5_1_BLOCK_WORDS, Q8_0_BLOCK_BYTES, W32_ROW,
-    W32_STAGE_W, q8_0_file_block,
+    B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS,
+    Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, q8_0_file_block,
 };
 use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS};
 use super::remap::remap_id;
@@ -445,6 +445,58 @@ mod gemm32_kernels {
         gemm32_block!(
             wt: q51(w),
             mins: true,
+            params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
+                n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_q8_0p`] for the file's `block_iq4_nl` stream: `w` is
+    /// `n_experts · rows · blocks` blocks of 18 bytes, back to back, as u32
+    /// words; each staged row's eight code words are the block's nibbles
+    /// decoded through `iq.rs`'s `kvalues_iq4nl` register table and its `d`
+    /// the block's f16 scale. No min term (`s` is not read).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows * 18 * blocks,
+            2 * steps >= blocks,
+            q.len() >= act_cols * 16 * steps,
+            d.len() >= act_cols * 2 * steps,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_iq4nl(
+        w: &[u32],
+        q: &[u32],
+        d: &[f32],
+        s: &[i32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        blocks: u32,
+        steps: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        gemm32_block!(
+            wt: iq4nl(w),
+            mins: false,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
         );

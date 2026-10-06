@@ -1,19 +1,24 @@
-//! The 32-value-block GEMM: Q8_0 and Q5_1 weights times [`GemmAct32`]
-//! activations over a route table — one block per (tile, [`GEMM_BM`]-row
-//! slab), as the K-quant family runs, for the weights whose scales come per
-//! 32 values. Three entries, declared in `kernels32.rs`, differ only in how
-//! the weight bytes reach shared memory:
+//! The 32-value-block GEMM: Q8_0, IQ4_NL and Q5_1 weights times
+//! [`GemmAct32`] activations over a route table — one block per (tile,
+//! [`GEMM_BM`]-row slab), as the K-quant family runs, for the weights whose
+//! scales come per 32 values. Four entries, declared in `kernels32.rs`,
+//! differ only in how the weight bytes reach shared memory:
 //! - `gemm_q8_0p`: Q8_0 in the q8f32 planes (`qs` u32 words, eight per
 //!   block, and `d` the blocks' f16 bits, `q8f32.rs`'s layout) — the dense
 //!   projections, through a one-expert table;
 //! - `gemm_q8_0f`: the file's 34-byte `block_q8_0` stream (f16 `d`, then 32
 //!   int8 codes) as u32 words;
+//! - `gemm_iq4nl`: the file's 18-byte `block_iq4_nl` stream (f16 `d`, then
+//!   16 code bytes whose nibbles index `kvalues_iq4nl`), its codes decoded
+//!   to the table's int8 values and its `d` staged as f32 — the same staged
+//!   row `gemm_q8_0f` fills;
 //! - `gemm_q5_1`: the file's 24-byte `block_q5_1` stream (f16 `d` and `m`,
 //!   the high bits `qh`, the nibbles `qs[16]`) as u32 words.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
-//! Q5_1 the unsigned 5-bit code, 0..31) with the column's int8 codes, one
+//! IQ4_NL the signed `kvalues_iq4nl` entry of each nibble, |kv| ≤ 127; Q5_1
+//! the unsigned 5-bit code, 0..31) with the column's int8 codes, one
 //! `mma.m16n8k32` (mainline MMQ's Q8_0 way); `d_w` (and `m_w`) the block's
 //! f16 values, exact in f32; `d_a`, `s_a` the column's block scale and code
 //! sum. The block enters the f32 accumulator as
@@ -44,6 +49,7 @@ use super::grouped::{GEMM_BM, GEMM_THREADS};
 use super::kernels32::Gemm32Kernels;
 use super::route::gemm_max_tiles;
 use super::{GEMM_BN, GEMM32_STEP, GemmInput, GemmRoute};
+use crate::iq::iq4_word;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -69,9 +75,10 @@ pub(super) const D32_STAGE_W: usize = GEMM_BN * D32_ROW;
 const GEMM32_THREADS_U32: u32 = GEMM_THREADS as u32;
 
 // Byte sizes of one 32-value block as the file stores it (ggml's
-// `block_q8_0` and `block_q5_1`), and a Q5_1 block in words.
+// `block_q8_0`, `block_iq4_nl` and `block_q5_1`), and a Q5_1 block in words.
 pub(super) const Q8_0_BLOCK_BYTES: usize = 34;
 pub(super) const Q5_1_BLOCK_WORDS: usize = 6;
+pub(super) const IQ4_NL_BLOCK_BYTES: usize = 18;
 
 const _: () = assert!(GEMM32_STEP == 64 && W32_ROW == 16 + 4 && B32_ROW >= 16);
 const _: () = assert!((W32_ROW / 4) % 2 == 1 && (B32_ROW / 4) % 2 == 1);
@@ -81,7 +88,12 @@ const _: () = assert!(W32_ROW.is_multiple_of(4) && B32_ROW.is_multiple_of(4));
 // scale word) `tid % 4`.
 const _: () = assert!(GEMM_THREADS == 2 * GEMM_BM && GEMM_THREADS == 4 * GEMM_BN);
 // The entries' launch contracts spell the block sizes out as literals.
-const _: () = assert!(Q8_0_BLOCK_BYTES == 34 && Q5_1_BLOCK_WORDS == 6 && GEMM_THREADS == 256);
+const _: () = assert!(
+    Q8_0_BLOCK_BYTES == 34
+        && Q5_1_BLOCK_WORDS == 6
+        && IQ4_NL_BLOCK_BYTES == 18
+        && GEMM_THREADS == 256
+);
 // Every staged tile fits a block's static shared memory with room for two
 // blocks an SM (48 KiB static cap, 100 KiB an SM on sm_86).
 const _: () =
@@ -108,6 +120,23 @@ pub(super) fn q8_0_file_block(w: [u32; 9], x: usize) -> (u16, [u32; 8]) {
             win(7),
         ],
     )
+}
+
+/// An IQ4_NL file block's `d` bits and its eight staged code words from the
+/// five words `w` that cover it, the block starting at byte `x` of the
+/// stream (`x` is even, a block being 18 bytes): the low nibbles of its 16
+/// code bytes are values `0..16` and the high nibbles `16..32`, each decoded
+/// through `iq.rs`'s `kvalues_iq4nl` register table ([`iq4_word`]).
+#[inline(always)]
+pub(super) fn iq4_nl_file_block(w: [u32; 5], x: usize) -> (u16, [u32; 8]) {
+    let o = 8 * (x & 3) as u64;
+    let c = 8 * ((x & 3) + 2) as u64;
+    let win = |i: usize| (((u64::from(w[i + 1]) << 32) | u64::from(w[i])) >> c) as u32;
+    let (l0, h0) = iq4_word(win(0));
+    let (l1, h1) = iq4_word(win(1));
+    let (l2, h2) = iq4_word(win(2));
+    let (l3, h3) = iq4_word(win(3));
+    ((w[0] as u64 >> o) as u16, [l0, l1, l2, l3, h0, h1, h2, h3])
 }
 
 /// How the weight bytes of one (slab row, block) pair reach a stage, per
@@ -186,6 +215,25 @@ macro_rules! w32 {
             [0u32; 6]
         }
     }};
+    (@load iq4nl($w:ident), $live:expr, $n:expr) => {{
+        if $live {
+            let a = IQ4_NL_BLOCK_BYTES * $n / 4;
+            // SAFETY: the block's 18 bytes end at byte `18n + 17`, inside the
+            // stream (launch contract), so its five covering words `a ..= a +
+            // 4` are inside `w`.
+            unsafe {
+                [
+                    *$w.get_unchecked(a),
+                    *$w.get_unchecked(a + 1),
+                    *$w.get_unchecked(a + 2),
+                    *$w.get_unchecked(a + 3),
+                    *$w.get_unchecked(a + 4),
+                ]
+            }
+        } else {
+            [0u32; 5]
+        }
+    }};
     (@store plane($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
         if $live {
             // SAFETY: word 16 + pj of the pair's staged row, which no warp
@@ -229,6 +277,25 @@ macro_rules! w32 {
                 *p.add(7) = c[7];
                 *$dst.add(16 + $pj) = half_bits_to_f32(($raw[0] & 0xffff) as u16).to_bits();
                 *$dst.add(18 + $pj) = half_bits_to_f32(($raw[0] >> 16) as u16).to_bits();
+            }
+        }
+    }};
+    (@store iq4nl($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
+        if $live {
+            let (d, c) = iq4_nl_file_block($raw, IQ4_NL_BLOCK_BYTES * $n);
+            // SAFETY: the pair's eight code words and its `d` word of its
+            // staged row, which no warp reads before the next barrier.
+            unsafe {
+                let p = $dst.add(8 * $pj);
+                *p = c[0];
+                *p.add(1) = c[1];
+                *p.add(2) = c[2];
+                *p.add(3) = c[3];
+                *p.add(4) = c[4];
+                *p.add(5) = c[5];
+                *p.add(6) = c[6];
+                *p.add(7) = c[7];
+                *$dst.add(16 + $pj) = half_bits_to_f32(d).to_bits();
             }
         }
     }};
@@ -575,7 +642,7 @@ macro_rules! gemm32_block {
 }
 
 /// The weights of a 32-value GEMM: a stack of `n_experts · rows_per_expert`
-/// rows of K = `act.k()` values in one of the three layouts (module doc).
+/// rows of K = `act.k()` values in one of the four layouts (module doc).
 #[derive(Clone, Copy)]
 pub enum Gemm32Weight<'a> {
     /// Q8_0 in the q8f32 planes: `qs` rows × K/4 words, `d` rows × K/32
@@ -591,6 +658,11 @@ pub enum Gemm32Weight<'a> {
     /// The file's `block_q5_1` stream (24 bytes per 32 values): six words
     /// per block, `6 · K/32` per row.
     Q5_1File(&'a DeviceTensor<u32>),
+    /// The file's `block_iq4_nl` stream (18 bytes per 32 values: f16 `d`,
+    /// then 16 code bytes whose nibbles index `kvalues_iq4nl`) as u32 words,
+    /// zero-padded at its end to a whole number of words per row, as the
+    /// K-quant stacks are.
+    Iq4NlFile(&'a DeviceTensor<u32>),
 }
 
 /// [`Gemm32Kernels::enqueue_gemm32`]'s arguments: `w` the stack, `route`
@@ -651,7 +723,8 @@ impl Gemm32Launch {
         let stack_rows = match a.w {
             Gemm32Weight::Q8_0Plane { qs, .. }
             | Gemm32Weight::Q8_0File(qs)
-            | Gemm32Weight::Q5_1File(qs) => qs.rows(),
+            | Gemm32Weight::Q5_1File(qs)
+            | Gemm32Weight::Iq4NlFile(qs) => qs.rows(),
         };
         if stack_rows != n_rows {
             return Err(GpuError::shape(
@@ -709,6 +782,21 @@ impl Gemm32Launch {
                             Q5_1_BLOCK_WORDS * kb,
                             w.cols(),
                             w.buf().len()
+                        ),
+                    ));
+                }
+            }
+            Gemm32Weight::Iq4NlFile(w) => {
+                let bytes = n_rows * IQ4_NL_BLOCK_BYTES * kb;
+                let words = bytes.div_ceil(4).div_ceil(n_rows);
+                if w.cols() != words || 4 * w.buf().len() < bytes {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "IQ4_NL rows at K = {k} are {words} words, got {} words over {} \
+                             bytes",
+                            w.cols(),
+                            4 * w.buf().len()
                         ),
                     ));
                 }
@@ -818,6 +906,7 @@ impl Gemm32Kernels {
             }
             Gemm32Weight::Q8_0File(w) => launch!(prepare_gemm_q8_0f, gemm_q8_0f, w.buf()),
             Gemm32Weight::Q5_1File(w) => launch!(prepare_gemm_q5_1, gemm_q5_1, w.buf()),
+            Gemm32Weight::Iq4NlFile(w) => launch!(prepare_gemm_iq4nl, gemm_iq4nl, w.buf()),
         }
         Ok(())
     }
