@@ -1015,10 +1015,11 @@ mod tests {
             }
         }
         // One lane's partial over a row of three blocks sums what the scalar
-        // rule does, term for term.
+        // rule does, term for term, over the blocks the lane owns: lane 0
+        // takes blocks 0, 32, 64, …, so of three blocks only block 0.
         let row = 1;
         let mut want = 0.0f32;
-        for (b, &e) in d8.iter().enumerate() {
+        for (b, &e) in d8.iter().enumerate().step_by(32) {
             let g = row * 3 + b;
             let blk = &bytes[g * IQ4_NL_BLOCK_BYTES..][..IQ4_NL_BLOCK_BYTES];
             let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
