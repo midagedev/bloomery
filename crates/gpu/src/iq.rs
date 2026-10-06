@@ -99,7 +99,7 @@ const SUBS: usize = SB_VALUES / SUB_VALUES;
 /// The IQ2_XS grid behind a reference: one device global (module doc).
 const GRID2: &[u64; 512] = &IQ2XS_GRID;
 /// The IQ3_XXS grid, likewise.
-const GRID3: &[u32; 256] = &IQ3XXS_GRID;
+pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
 
 /// `KVALUES_IQ4NL` bytes `4i .. 4i + 4` as a little-endian word: the four
 /// `prmt` table words.
@@ -255,14 +255,14 @@ impl IqFormat {
 /// `s` is set. `(s & 15) · 0x0020_4081` puts bit `j` at bit `8j` with no
 /// carry (the four shifted copies do not overlap).
 #[inline(always)]
-fn sign_mask4(s: u32) -> u32 {
+pub(crate) fn sign_mask4(s: u32) -> u32 {
     ((s & 15).wrapping_mul(0x0020_4081) & 0x0101_0101).wrapping_mul(0xff)
 }
 
 /// The eight sign bits of a 7-bit sign index: the index with bit 7 its
 /// parity, ggml's `ksigns_iq2xs`.
 #[inline(always)]
-fn signs_of(i: u32) -> u32 {
+pub(crate) fn signs_of(i: u32) -> u32 {
     let mut p = i ^ (i >> 4);
     p ^= p >> 2;
     p ^= p >> 1;
@@ -273,7 +273,7 @@ fn signs_of(i: u32) -> u32 {
 /// per byte, with no carry between bytes because every grid magnitude is at
 /// least 4 (`!g + 1` stays below 256).
 #[inline(always)]
-fn signed4(g: u32, m: u32) -> u32 {
+pub(crate) fn signed4(g: u32, m: u32) -> u32 {
     (g ^ m).wrapping_add(m & 0x0101_0101)
 }
 
@@ -293,7 +293,7 @@ fn iq2_group(code: u32) -> (u32, u32) {
 /// One IQ3_XXS group: grid index bytes `i0` (values 0..4) and `i1` (4..8)
 /// under the sign index in the low 7 bits of `si`, as two value-order words.
 #[inline(always)]
-fn iq3_group(i0: u32, i1: u32, si: u32) -> (u32, u32) {
+pub(crate) fn iq3_group(i0: u32, i1: u32, si: u32) -> (u32, u32) {
     // SAFETY: both indices are bytes (& 255), below GRID3's length 256.
     let (g0, g1) = unsafe {
         (
@@ -309,7 +309,7 @@ fn iq3_group(i0: u32, i1: u32, si: u32) -> (u32, u32) {
 /// nibbles of its four bytes and the high nibbles, each as four bytes in byte
 /// order — `mxfp4`'s register table read by `prmt`, over `kvalues_iq4nl`.
 #[inline(always)]
-fn iq4_word(qs: u32) -> (u32, u32) {
+pub(crate) fn iq4_word(qs: u32) -> (u32, u32) {
     let sel = qs & 0x7777_7777;
     let pick = 0x3210_3210 | ((qs & 0x8888_8888) >> 1);
     let a = prmt(prmt(KV0, KV1, sel), prmt(KV2, KV3, sel), pick);
@@ -340,7 +340,7 @@ fn dp4_halves(w: &[u32; 8], x: &[u32; 8]) -> (i32, i32) {
 
 /// `Σ dp4a(w[i], x[i])` over all eight words, from 0, in word order.
 #[inline(always)]
-fn dp4_all(w: &[u32; 8], x: &[u32; 8]) -> i32 {
+pub(crate) fn dp4_all(w: &[u32; 8], x: &[u32; 8]) -> i32 {
     let mut s = dp4a_s32(w[0], x[0], 0);
     s = dp4a_s32(w[1], x[1], s);
     s = dp4a_s32(w[2], x[2], s);
@@ -375,7 +375,7 @@ fn byte_sum_halves(x: &[u32; 8]) -> (i32, i32) {
 /// `q.len() >= q0 + c · q_col + 256 · ceil((b + 1) / 32)` and `d8.len() >
 /// d0 + c · d_col + b / 4`.
 #[inline(always)]
-unsafe fn x_words(q: &[u32], d8: &[f32], qb: usize, db: usize) -> ([u32; 8], f32) {
+pub(crate) unsafe fn x_words(q: &[u32], d8: &[f32], qb: usize, db: usize) -> ([u32; 8], f32) {
     // SAFETY: qb = q0 + c·q_col + 256·(b >> 5) + (b & 31), so qb + 224 is
     // inside column c's words, and db inside its scales, by this fn's
     // contract.
@@ -432,7 +432,7 @@ impl ActCols<'_> {
     ///
     /// As [`x_words`] for column `c`.
     #[inline(always)]
-    unsafe fn col(&self, c: usize, b: usize) -> ([u32; 8], f32) {
+    pub(crate) unsafe fn col(&self, c: usize, b: usize) -> ([u32; 8], f32) {
         let qb = self.q0 + c * self.q_col + 256 * (b >> 5) + (b & 31);
         let db = self.d0 + c * self.d_col + (b >> 2);
         // SAFETY: this fn's contract.
