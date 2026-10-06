@@ -7,13 +7,15 @@
 //! gates' `$BLOOMERY_REF_MODEL`. The rules of a model named twice are
 //! [`hf::source`]'s. A decision model's head comes from the repo a `--hf`
 //! repo's model card says it quantizes ([`quantized_from`]), fetched by
-//! [`fetch_exact`].
+//! [`fetch_exact`]. The qwen4exp family's MTP draft is fetched beside a set
+//! only when the plan's own rule says the set can run it ([`draft_usable`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use gguf::Split;
 use hf::HfError;
-use hf::fetch::{Client, Event};
+use hf::fetch::{Client, Draft, Event};
 use hf::source::{self, Flags, Source};
 
 use crate::GateError;
@@ -49,10 +51,10 @@ pub fn take(args: &[String], path_flags: &[&str]) -> Result<(Flags, Vec<String>)
 }
 
 /// The cache client: its root `$BLOOMERY_CACHE`, else
-/// `~/.cache/bloomery/hf`.
+/// `~/.cache/bloomery/hf`; offline under `$HF_HUB_OFFLINE`.
 fn client() -> Result<Client, GateError> {
     let root = hf::cache_root(std::env::var_os("BLOOMERY_CACHE"), std::env::var_os("HOME"))?;
-    Ok(Client::new(root))
+    Ok(Client::new(root)?)
 }
 
 /// A fetch's event as its record line on stderr.
@@ -78,6 +80,10 @@ fn print(e: &Event<'_>) {
             .eprint(),
         Event::Offline { repo, why } => Record::new(&record::HF_OFFLINE)
             .w("repo", repo)
+            .w("reason", why)
+            .eprint(),
+        Event::DraftSkip { file, why } => Record::new(&record::HF_DRAFT_SKIP)
+            .w("file", file)
             .w("reason", why)
             .eprint(),
         Event::Progress { file, have, of } => Record::new(&record::HF_PROGRESS)
@@ -112,16 +118,32 @@ fn draft_name() -> &'static str {
         .expect("the qwen4exp DRAFT path names no file")
 }
 
+/// Whether the set whose first shard is `first` can run the qwen4exp MTP
+/// draft: the plan's own rule (`PlanInputs::mtp_borrows`, the target's
+/// `token_embd` and `output` in the format the draft reads them), why not as
+/// that rule says it; a shard the plan cannot describe runs no draft either.
+fn draft_usable(first: &Path) -> Result<(), String> {
+    let split = Split::open(first).map_err(|e| format!("open {}: {e}", first.display()))?;
+    let inputs =
+        model::arch::qwen35moe::place::PlanInputs::describe(&split).map_err(|e| e.to_string())?;
+    inputs.mtp_borrows().map_err(|e| e.to_string())
+}
+
 /// The local path of what `flags` and `env` (the gates' variable, `None`
 /// for a binary that reads none) name: a path as given, a repo's set
 /// fetched and checked (its first shard), the family's MTP draft beside it
-/// when the repo holds the file. `None` when nothing names one.
+/// when the repo holds the file and the set can run it ([`draft_usable`]; an
+/// `hf draft skipped` record says why not). `None` when nothing names one.
 pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, GateError> {
     match source::resolve(flags, env)? {
         None => Ok(None),
         Some(Source::File(p)) => Ok(Some(PathBuf::from(p))),
         Some(Source::Hf(r)) => {
-            let files = client()?.resolve(&r, Some(draft_name()), &mut print)?;
+            let draft = Draft {
+                name: draft_name(),
+                usable: &draft_usable,
+            };
+            let files = client()?.resolve(&r, Some(&draft), &mut print)?;
             Ok(Some(files.into_iter().next().ok_or_else(|| {
                 format!("--hf {r}: the picked set has no file")
             })?))

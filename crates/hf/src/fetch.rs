@@ -14,18 +14,21 @@
 //! right size with no such marker is read and checked once; one whose
 //! content is not the listing's (the repo moved it on) is removed and
 //! fetched again (`stale`); one shorter than the listing's is moved back to
-//! `.part` and resumed; one longer is refused. A `.part` whose check fails
-//! is removed, and the refusal names both digests.
+//! `.part` and resumed; one longer, or a `.part` longer than the file, is
+//! not the listing's either: removed and fetched again (`stale`). A `.part`
+//! whose check fails is removed, and the refusal names both digests.
 //!
 //! A listing that fails at the network — curl cannot resolve the host,
-//! connect, finish TLS or hear back in time ([`network_failure`]), not an
-//! HTTP status — leaves the cache to stand in: the files under the repo's
-//! cache directory that carry a `.verified` marker are the listing
+//! connect, finish TLS or hear back in time ([`network_failure`]) — or that
+//! the hub answers busy or down (HTTP 429 or 5xx, [`hub_unavailable`]), and
+//! every listing under `HF_HUB_OFFLINE` ([`hub_offline`]), which asks the hub
+//! nothing, leaves the cache to stand in: the files under the repo's cache
+//! directory that carry a `.verified` marker are the listing
 //! ([`verified_entries`]), the same pick runs over them, and exactly one
 //! complete set the quant names is used, each file `offline-cached`, after an
-//! `Offline` event with the network's reason. No such set, two, or a set
-//! missing a verified shard is [`HfError::Offline`] with the cache's own
-//! refusal; an HTTP error is refused as it is.
+//! `Offline` event with the reason. No such set, two, or a set missing a
+//! verified shard is [`HfError::Offline`] with the cache's own refusal; any
+//! other HTTP error is refused as it is.
 //!
 //! The token for a gated repo is `$HF_TOKEN`, else the text of
 //! `~/.cache/huggingface/token`. It reaches curl on its standard input as a
@@ -64,7 +67,8 @@ pub enum State {
     /// fetched again.
     Stale,
     /// In the cache with its `.verified` marker, used without a listing:
-    /// the network refused the listing.
+    /// the network or the hub refused the listing, or `HF_HUB_OFFLINE` asked
+    /// for none.
     OfflineCached,
 }
 
@@ -95,8 +99,12 @@ pub enum Event<'a> {
     },
     /// A running download's bytes on disk.
     Progress { file: &'a str, have: u64, of: u64 },
-    /// The listing failed at the network and the cache stands in: why.
+    /// No listing — the network or the hub refused it, or `HF_HUB_OFFLINE`
+    /// asked for none — and the cache stands in: why.
     Offline { repo: &'a str, why: &'a str },
+    /// The repo's MTP draft `file` left unfetched: the set cannot run it,
+    /// for `why` ([`Draft::usable`]).
+    DraftSkip { file: &'a str, why: &'a str },
     /// A file checked: the bytes this run fetched, and the digest.
     Done {
         file: &'a str,
@@ -104,6 +112,15 @@ pub enum Event<'a> {
         check: Check,
         digest: &'a str,
     },
+}
+
+/// The MTP draft a resolve fetches beside the set it picks
+/// ([`Client::resolve`]): the file name the family's draft goes by, and
+/// whether the set can run it — `usable` reads the set's first shard, once it
+/// is fetched, and says why not.
+pub struct Draft<'a> {
+    pub name: &'a str,
+    pub usable: &'a dyn Fn(&Path) -> Result<(), String>,
 }
 
 /// How a resolve reaches the hub and where it caches.
@@ -114,6 +131,27 @@ pub struct Client {
     pub token: Option<String>,
     pub root: PathBuf,
     pub curl: OsString,
+    /// `HF_HUB_OFFLINE` ([`hub_offline`]): no listing is asked for; the
+    /// cache's verified files stand in.
+    pub offline: bool,
+}
+
+/// Why a resolve under `HF_HUB_OFFLINE` asked the hub for no listing.
+const HUB_OFFLINE_WHY: &str = "HF_HUB_OFFLINE is set";
+
+/// Whether `HF_HUB_OFFLINE` (`v`, unset as `None`) asks for no network:
+/// `1`, `true`, `yes` and `on` do, `0`, `false`, `no`, `off` and the empty
+/// value do not (any case, as `huggingface_hub` reads it); any other value is
+/// [`HfError::HubOffline`].
+pub fn hub_offline(v: Option<&str>) -> Result<bool, HfError> {
+    let Some(v) = v else {
+        return Ok(false);
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(HfError::HubOffline(v.to_owned())),
+    }
 }
 
 /// `$HF_TOKEN` (`env`) when set and not blank, else the token file's text
@@ -145,6 +183,33 @@ pub fn network_failure(code: Option<i32>) -> bool {
     matches!(code, Some(5 | 6 | 7 | 28 | 35 | 52 | 55 | 56))
 }
 
+/// Whether curl's exit `code` and the HTTP `status` it named are the hub
+/// answering busy or down: 429 (too many requests) or any 5xx. Every other
+/// status is the hub's answer about the request.
+pub fn hub_unavailable(code: Option<i32>, status: Option<u16>) -> bool {
+    code == Some(22) && matches!(status, Some(429 | 500..=599))
+}
+
+/// curl's failure at `what` as its error: [`HfError::Network`] for the
+/// network ([`network_failure`]), [`HfError::Unavailable`] for a busy or
+/// down hub ([`hub_unavailable`]), [`HfError::Curl`] for everything else.
+fn failure(what: &str, code: Option<i32>, stderr: &str) -> HfError {
+    let (what, why) = (what.to_owned(), curl_why(code, stderr));
+    if network_failure(code) {
+        HfError::Network { what, why }
+    } else if hub_unavailable(code, http_status(stderr)) {
+        HfError::Unavailable { what, why }
+    } else {
+        HfError::Curl { what, why }
+    }
+}
+
+/// A repo's listing, or why there is none and the cache stands in.
+enum Listed {
+    Hub(Vec<Entry>),
+    Cache(String),
+}
+
 /// curl's failure as a sentence: an HTTP 401 or 403 says the repo may be
 /// gated, a 404 that it or the file is not there.
 fn curl_why(code: Option<i32>, stderr: &str) -> String {
@@ -165,17 +230,27 @@ fn curl_why(code: Option<i32>, stderr: &str) -> String {
 
 impl Client {
     /// The hub at `https://huggingface.co`, the cache root `root`, the token
-    /// from `$HF_TOKEN` or `$HOME/.cache/huggingface/token`, and `curl` from
-    /// `PATH`.
-    pub fn new(root: PathBuf) -> Client {
+    /// from `$HF_TOKEN` or `$HOME/.cache/huggingface/token`, `curl` from
+    /// `PATH`, and offline when `$HF_HUB_OFFLINE` says so ([`hub_offline`],
+    /// which refuses a value it does not read).
+    pub fn new(root: PathBuf) -> Result<Client, HfError> {
         let file = std::env::var_os("HOME")
             .and_then(|h| fs::read_to_string(Path::new(&h).join(".cache/huggingface/token")).ok());
-        Client {
+        let offline = match std::env::var_os("HF_HUB_OFFLINE") {
+            None => false,
+            Some(v) => {
+                hub_offline(Some(v.to_str().ok_or_else(|| {
+                    HfError::HubOffline(v.to_string_lossy().into_owned())
+                })?))?
+            }
+        };
+        Ok(Client {
             base: "https://huggingface.co".to_owned(),
             token: token_of(std::env::var("HF_TOKEN").ok(), file),
             root,
             curl: "curl".into(),
-        }
+            offline,
+        })
     }
 
     /// A curl command with the token on its standard input (none when
@@ -201,15 +276,11 @@ impl Client {
             why: e.to_string(),
         })?;
         if !out.status.success() {
-            let (what, why) = (
-                what.to_owned(),
-                curl_why(out.status.code(), &String::from_utf8_lossy(&out.stderr)),
-            );
-            return Err(if network_failure(out.status.code()) {
-                HfError::Network { what, why }
-            } else {
-                HfError::Curl { what, why }
-            });
+            return Err(failure(
+                what,
+                out.status.code(),
+                &String::from_utf8_lossy(&out.stderr),
+            ));
         }
         Ok(out.stdout)
     }
@@ -237,6 +308,23 @@ impl Client {
             })?;
         }
         Ok(())
+    }
+
+    /// `repo`'s listing ([`Client::listing`]), or why the cache stands in
+    /// for it: `HF_HUB_OFFLINE` asks the hub nothing, and a listing the
+    /// network refuses or the hub answers busy or down is none. Any other
+    /// failure is the refusal.
+    fn listed(&self, repo: &str) -> Result<Listed, HfError> {
+        if self.offline {
+            return Ok(Listed::Cache(HUB_OFFLINE_WHY.to_owned()));
+        }
+        match self.listing(repo) {
+            Ok(entries) => Ok(Listed::Hub(entries)),
+            Err(HfError::Network { why, .. } | HfError::Unavailable { why, .. }) => {
+                Ok(Listed::Cache(why))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Every file of `repo`'s main branch, each page of the listing
@@ -295,13 +383,9 @@ impl Client {
         let mut state = State::Fetch;
         if let Some(len) = size_of(dest)? {
             if len > entry.size {
-                return Err(HfError::Size {
-                    file: dest.display().to_string(),
-                    bytes: len,
-                    want: entry.size,
-                });
-            }
-            if len == entry.size {
+                remove(dest)?;
+                state = State::Stale;
+            } else if len == entry.size {
                 let marked = fs::read_to_string(&marker).ok();
                 if marked.as_deref().map(str::trim) == Some(entry.digest.as_str()) {
                     events(&Event::File {
@@ -336,13 +420,11 @@ impl Client {
             }
             let _ = fs::remove_file(&marker);
         }
-        let from = size_of(&part)?.unwrap_or(0);
+        let mut from = size_of(&part)?.unwrap_or(0);
         if from > entry.size {
-            return Err(HfError::Size {
-                file: part.display().to_string(),
-                bytes: from,
-                want: entry.size,
-            });
+            remove(&part)?;
+            from = 0;
+            state = State::Stale;
         }
         if from > 0 && state == State::Fetch {
             state = State::Resume;
@@ -453,8 +535,9 @@ impl Client {
 
     /// The set `r` picks in its repo, every file fetched and checked; the
     /// local paths in shard order (the first shard first). `draft`, the MTP
-    /// draft file name a model family runs beside its set, is fetched too
-    /// when the repo holds a file of the name ([`crate::mtp_draft`]):
+    /// draft a model family runs beside its set, is fetched too when the
+    /// repo holds a file of its name ([`crate::mtp_draft`]) and the fetched
+    /// set can run it ([`Draft::usable`]; a `DraftSkip` event says why not):
     /// beside the set's first shard, under its own name, not at its repo
     /// path. A repo holding none is fetched as it is, and offline the draft
     /// is not looked for: the file an earlier fetch landed beside the
@@ -462,12 +545,12 @@ impl Client {
     pub fn resolve(
         &self,
         r: &RepoRef,
-        draft: Option<&str>,
+        draft: Option<&Draft<'_>>,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
-        let entries = match self.listing(&r.repo) {
-            Err(HfError::Network { why, .. }) => return self.offline_set(r, &why, events),
-            other => other?,
+        let entries = match self.listed(&r.repo)? {
+            Listed::Hub(entries) => entries,
+            Listed::Cache(why) => return self.offline_set(r, &why, events),
         };
         let sets = gguf_sets(&r.repo, &entries)?;
         let set = crate::pick(&r.repo, &sets, r.quant.as_deref())?;
@@ -476,19 +559,27 @@ impl Client {
         for e in &set.files {
             files.push(self.fetch(&r.repo, e, events)?);
         }
-        if let Some(name) = draft
-            && let Some(e) = crate::mtp_draft(&r.repo, &entries, name)?
+        if let Some(d) = draft
+            && let Some(e) = crate::mtp_draft(&r.repo, &entries, d.name)?
         {
-            // Beside the first shard, under the name the engine opens it by:
-            // wherever the repo keeps the draft, the run finds it there.
-            let dest = files[0].with_file_name(name);
-            self.fetch_to(&r.repo, e, &dest, events)?;
+            match (d.usable)(&files[0]) {
+                // Beside the first shard, under the name the engine opens it
+                // by: wherever the repo keeps the draft, the run finds it there.
+                Ok(()) => {
+                    let dest = files[0].with_file_name(d.name);
+                    self.fetch_to(&r.repo, e, &dest, events)?;
+                }
+                Err(why) => events(&Event::DraftSkip {
+                    file: &e.path,
+                    why: &why,
+                }),
+            }
         }
         Ok(files)
     }
 
-    /// The one verified set of the cache `r` picks, the network having
-    /// refused the listing for `why`.
+    /// The one verified set of the cache `r` picks, there being no listing
+    /// for `why`.
     fn offline_set(
         &self,
         r: &RepoRef,
@@ -537,8 +628,8 @@ impl Client {
         paths: &[&str],
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
-        let entries = match self.listing(repo) {
-            Err(HfError::Network { why, .. }) => {
+        let entries = match self.listed(repo)? {
+            Listed::Cache(why) => {
                 let offline = |cache: HfError| HfError::Offline {
                     repo: repo.to_owned(),
                     why: why.clone(),
@@ -553,7 +644,7 @@ impl Client {
                 events(&Event::Offline { repo, why: &why });
                 return self.offline_files(repo, &files, events);
             }
-            other => other?,
+            Listed::Hub(entries) => entries,
         };
         exact(repo, &entries, paths)?
             .into_iter()
@@ -697,6 +788,7 @@ mod tests {
             token: None,
             root: dir.join("cache"),
             curl: "curl".into(),
+            offline: false,
         };
         let entry = Entry {
             path: path.to_owned(),
@@ -736,6 +828,7 @@ mod tests {
             token: None,
             root: dir.join("cache"),
             curl: "curl".into(),
+            offline: false,
         }
     }
 
@@ -743,6 +836,12 @@ mod tests {
     /// draft file name, what a resolve is given and what the engine's draft
     /// rule looks for beside the target.
     const DRAFT: &str = "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+
+    /// The draft of [`DRAFT`]'s name, which every set can run.
+    const RUNS: Draft<'static> = Draft {
+        name: DRAFT,
+        usable: &|_| Ok(()),
+    };
 
     fn states(events: &[String]) -> Vec<String> {
         events
@@ -758,6 +857,7 @@ mod tests {
             seen.push(match ev {
                 Event::File { state, from, .. } => format!("file {} {from}", state.name()),
                 Event::Done { fetched, .. } => format!("done {fetched}"),
+                Event::DraftSkip { .. } => "draft-skip".to_owned(),
                 Event::Progress { .. } => "progress".to_owned(),
                 Event::Set { .. } => "set".to_owned(),
                 Event::Offline { .. } => "offline".to_owned(),
@@ -842,6 +942,31 @@ mod tests {
         assert_eq!(fs::read(&p).expect("file"), body);
     }
 
+    /// A cached file longer than the repo's, or a `.part` longer than it, is
+    /// not the repo's file: removed and fetched again, never a refusal that
+    /// every later start meets.
+    #[test]
+    fn a_file_longer_than_the_repos_is_fetched_again() {
+        let d = scratch("longer");
+        let body = content();
+        let (c, e) = served(&d, "a/b", "m.gguf", &body);
+        let p = run(&c, "a/b", &e).0.expect("fetch");
+        let mut longer = body.clone();
+        longer.extend_from_slice(b"tail");
+        fs::write(&p, &longer).expect("overwrite");
+        let (r, seen) = run(&c, "a/b", &e);
+        r.expect("refetch");
+        assert_eq!(states(&seen), ["file stale 0"]);
+        assert_eq!(fs::read(&p).expect("file"), body);
+        fs::remove_file(&p).expect("file");
+        fs::remove_file(with_suffix(&p, ".verified")).expect("marker");
+        fs::write(with_suffix(&p, ".part"), &longer).expect("part");
+        let (r, seen) = run(&c, "a/b", &e);
+        r.expect("refetch the part");
+        assert_eq!(states(&seen), ["file stale 0"]);
+        assert_eq!(fs::read(&p).expect("file"), body);
+    }
+
     #[test]
     fn a_missing_file_is_curls_named_error() {
         let d = scratch("missing");
@@ -872,6 +997,7 @@ mod tests {
             token: None,
             root: root.to_owned(),
             curl: "curl".into(),
+            offline: false,
         }
     }
 
@@ -896,6 +1022,7 @@ mod tests {
             token: None,
             root: root.to_owned(),
             curl: "curl".into(),
+            offline: false,
         }
     }
 
@@ -987,19 +1114,132 @@ mod tests {
     fn an_http_error_stays_a_refusal_beside_a_verified_set() {
         let d = scratch("offline-http");
         cached(&d, "a/b", &["m-Q4_K_M.gguf"]);
-        match offline_run(&answering("404 Not Found", &d.join("cache")), "a/b:Q4_K_M").0 {
-            Err(HfError::Curl { why, .. }) => assert!(why.contains("404"), "{why}"),
-            other => panic!("{other:?}"),
+        for status in ["404 Not Found", "403 Forbidden", "400 Bad Request"] {
+            match offline_run(&answering(status, &d.join("cache")), "a/b:Q4_K_M").0 {
+                Err(HfError::Curl { why, .. }) => assert!(why.contains(&status[..3]), "{why}"),
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
+
+    /// A hub that answers busy (429) or down (5xx) is no listing: the
+    /// verified set stands in as it does when the network is gone, and with
+    /// none the refusal is the cache's.
+    #[test]
+    fn a_busy_or_down_hub_leaves_the_verified_set_to_stand_in() {
+        let d = scratch("offline-busy");
+        cached(&d, "a/b", &["m-Q4_K_M.gguf"]);
+        for status in [
+            "429 Too Many Requests",
+            "500 Internal Server Error",
+            "503 Service Unavailable",
+        ] {
+            let (got, seen) = offline_run(&answering(status, &d.join("cache")), "a/b:Q4_K_M");
+            assert_eq!(
+                got.expect(status),
+                [d.join("cache/a/b/m-Q4_K_M.gguf")],
+                "{seen:?}"
+            );
+            assert!(
+                seen[0].starts_with("offline exit 22") && seen[0].contains(&status[..3]),
+                "{seen:?}"
+            );
+            assert_eq!(seen[2], "file m-Q4_K_M.gguf offline-cached");
         }
         match offline_run(
-            &answering("503 Service Unavailable", &d.join("cache")),
-            "a/b",
+            &answering("502 Bad Gateway", &d.join("cache")),
+            "x/y:Q4_K_M",
         )
         .0
         {
-            Err(HfError::Curl { why, .. }) => assert!(why.contains("503"), "{why}"),
+            Err(HfError::Offline { why, cache, .. }) => {
+                assert!(why.contains("502"), "{why}");
+                assert!(matches!(*cache, HfError::NoGguf { .. }), "{cache}");
+            }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// curl's failures as their kinds: the network's codes and a busy or
+    /// down hub let the cache stand in; any other HTTP status, or an exit
+    /// that is neither, is the refusal.
+    #[test]
+    fn a_failure_is_the_networks_the_busy_hubs_or_a_refusal() {
+        let said = |s: u16| format!("curl: (22) The requested URL returned error: {s}");
+        for s in [429, 500, 502, 503, 504, 599] {
+            assert!(hub_unavailable(Some(22), Some(s)), "{s}");
+            assert!(
+                matches!(
+                    failure("l", Some(22), &said(s)),
+                    HfError::Unavailable { .. }
+                ),
+                "{s}"
+            );
+        }
+        for s in [400, 401, 403, 404, 410, 428, 600] {
+            assert!(!hub_unavailable(Some(22), Some(s)), "{s}");
+            assert!(
+                matches!(failure("l", Some(22), &said(s)), HfError::Curl { .. }),
+                "{s}"
+            );
+        }
+        assert!(!hub_unavailable(Some(22), None));
+        assert!(!hub_unavailable(Some(56), Some(503)));
+        assert!(matches!(
+            failure("l", Some(7), "refused"),
+            HfError::Network { .. }
+        ));
+        assert!(matches!(
+            failure("l", Some(23), "write"),
+            HfError::Curl { .. }
+        ));
+        assert!(matches!(failure("l", None, ""), HfError::Curl { .. }));
+    }
+
+    /// `HF_HUB_OFFLINE` as `huggingface_hub` reads it, and nothing else.
+    #[test]
+    fn hub_offline_reads_the_hubs_words_and_refuses_the_rest() {
+        assert!(!hub_offline(None).expect("unset"));
+        for v in ["1", "true", "TRUE", "Yes", "on", " 1 "] {
+            assert!(hub_offline(Some(v)).expect(v), "{v}");
+        }
+        for v in ["", "0", "false", "No", "OFF"] {
+            assert!(!hub_offline(Some(v)).expect(v), "{v}");
+        }
+        for v in ["2", "maybe", "offline"] {
+            match hub_offline(Some(v)) {
+                Err(e @ HfError::HubOffline(_)) => assert!(e.to_string().contains(v), "{e}"),
+                other => panic!("{v}: {other:?}"),
+            }
+        }
+    }
+
+    /// Under `HF_HUB_OFFLINE` the hub is not asked: a hub that would answer
+    /// with another listing is never read, the verified set stands in, and
+    /// with none the refusal names what the cache lacks.
+    #[test]
+    fn hub_offline_asks_the_hub_nothing() {
+        let d = scratch("offline-env");
+        cached(&d, "a/b", &["m-Q4_K_M.gguf"]);
+        let mut c = hub(&d, "a/b", &[("m-Q8_0.gguf", b"other")]);
+        c.offline = true;
+        let (got, seen) = offline_run(&c, "a/b:Q4_K_M");
+        assert_eq!(got.expect("offline"), [d.join("cache/a/b/m-Q4_K_M.gguf")]);
+        assert_eq!(seen[0], format!("offline {HUB_OFFLINE_WHY}"));
+        match offline_run(&c, "a/b:Q8_0").0 {
+            Err(e @ HfError::Offline { .. }) => {
+                let said = e.to_string();
+                assert!(
+                    said.contains(HUB_OFFLINE_WHY) && said.contains("Q8_0"),
+                    "{said}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            c.resolve_exact("a/b", &["README.md"], &mut |_| {}),
+            Err(HfError::Offline { .. })
+        ));
     }
 
     #[test]
@@ -1047,7 +1287,7 @@ mod tests {
         let r = RepoRef::parse("a/b:UD-Q4_K_XL").expect("repo");
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(DRAFT), &mut |ev| {
+            .resolve(&r, Some(&RUNS), &mut |ev| {
                 if let Event::File { file, state, .. } = ev {
                     seen.push(format!("file {file} {}", state.name()));
                 }
@@ -1078,13 +1318,66 @@ mod tests {
         );
         // A second resolve fetches nothing: the draft too is `cached`.
         let mut again = Vec::new();
-        c.resolve(&r, Some(DRAFT), &mut |ev| {
+        c.resolve(&r, Some(&RUNS), &mut |ev| {
             if let Event::File { state, .. } = ev {
                 again.push(state.name());
             }
         })
         .expect("again");
         assert_eq!(again, ["cached", "cached", "cached"]);
+    }
+
+    /// A set that cannot run the repo's draft (the predicate reads its
+    /// first shard and says why) leaves the draft unfetched, with one
+    /// `DraftSkip` event naming the file and the reason.
+    #[test]
+    fn a_draft_the_set_cannot_run_is_not_fetched() {
+        let d = scratch("draft-unusable");
+        let body = content();
+        let c = hub(
+            &d,
+            "a/b",
+            &[
+                ("UD-Q3_K_XL/m-UD-Q3_K_XL.gguf", &body),
+                ("MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", b"draft"),
+            ],
+        );
+        let first = d.join("cache/a/b/UD-Q3_K_XL/m-UD-Q3_K_XL.gguf");
+        let read = std::cell::RefCell::new(Vec::new());
+        let usable = |p: &Path| {
+            read.borrow_mut().push(p.to_path_buf());
+            Err("the target's output.weight is Q6_K".to_owned())
+        };
+        let draft = Draft {
+            name: DRAFT,
+            usable: &usable,
+        };
+        let r = RepoRef::parse("a/b:UD-Q3_K_XL").expect("repo");
+        let mut seen = Vec::new();
+        let got = c
+            .resolve(&r, Some(&draft), &mut |ev| match ev {
+                Event::File { file, .. } => seen.push(format!("file {file}")),
+                Event::DraftSkip { file, why } => seen.push(format!("skip {file}: {why}")),
+                _ => {}
+            })
+            .expect("resolve");
+        assert_eq!(got.as_slice(), std::slice::from_ref(&first));
+        assert_eq!(
+            read.borrow().as_slice(),
+            std::slice::from_ref(&first),
+            "the predicate read the first shard"
+        );
+        assert!(
+            !first.with_file_name(DRAFT).exists(),
+            "the draft was fetched"
+        );
+        assert_eq!(
+            seen,
+            [
+                "file UD-Q3_K_XL/m-UD-Q3_K_XL.gguf".to_owned(),
+                format!("skip MTP/{DRAFT}: the target's output.weight is Q6_K"),
+            ]
+        );
     }
 
     #[test]
@@ -1095,7 +1388,7 @@ mod tests {
         let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(DRAFT), &mut |ev| {
+            .resolve(&r, Some(&RUNS), &mut |ev| {
                 if let Event::File { file, .. } = ev {
                     seen.push(file.to_string());
                 }
@@ -1115,7 +1408,7 @@ mod tests {
             &[("Q4_K_XL/m-Q4_K_XL.gguf", &body), (DRAFT, b"draft")],
         );
         let r = RepoRef::parse("a/b:Q4_K_XL").expect("repo");
-        online.resolve(&r, Some(DRAFT), &mut |_| {}).expect("fetch");
+        online.resolve(&r, Some(&RUNS), &mut |_| {}).expect("fetch");
         assert!(
             d.join("cache/a/b/Q4_K_XL").join(DRAFT).is_file(),
             "the online fetch landed the draft beside the set"
@@ -1125,7 +1418,7 @@ mod tests {
         let c = unreachable(&d.join("cache"));
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(DRAFT), &mut |ev| {
+            .resolve(&r, Some(&RUNS), &mut |ev| {
                 if let Event::File { file, state, .. } = ev {
                     seen.push(format!("file {file} {}", state.name()));
                 }

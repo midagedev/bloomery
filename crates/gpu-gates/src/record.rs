@@ -2339,12 +2339,20 @@ pub static HF_FILE: Kind = Kind {
     ],
 };
 
-/// A `--hf` start the network refused, the cache standing in.
+/// A `--hf` start with no listing, the cache standing in.
 pub static HF_OFFLINE: Kind = Kind {
     name: "hf_offline",
     head: "hf offline",
-    doc: "A `--hf` start whose listing failed at the network (no host, no connection, a timeout, no TLS, no reply; not an HTTP status): the cache's one verified set the quant names is used, its files `offline-cached`, and the network's reason.",
+    doc: "A `--hf` start with no listing — it failed at the network (no host, no connection, a timeout, no TLS, no reply), the hub answered busy or down (HTTP 429 or 5xx), or HF_HUB_OFFLINE asked for none: the cache's one verified set the quant names is used, its files `offline-cached`, and the reason.",
     parts: &[key("repo", Word, ""), key("reason", Text, "")],
+};
+
+/// A `--hf` repo's MTP draft left unfetched.
+pub static HF_DRAFT_SKIP: Kind = Kind {
+    name: "hf_draft_skip",
+    head: "hf draft skipped",
+    doc: "The `--hf` repo's MTP draft file, not fetched: the set picked cannot run it, and why, as the plan's own rule (`PlanInputs::mtp_borrows`) says it.",
+    parts: &[key("file", Word, ""), key("reason", Text, "")],
 };
 
 /// A running `--hf` download.
