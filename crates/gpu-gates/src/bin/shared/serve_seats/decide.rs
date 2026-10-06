@@ -13,8 +13,8 @@
 //! The head's config (`--head-config`, else the row's config file beside
 //! the weights) picks the row of [`ROWS`]; a config no row knows is refused
 //! by name, listing the rows. The server takes `-m`/`--hf` out before this
-//! seat parses (its module doc); `--ctx-size` is `--ctx` under
-//! llama-server's spelling, and C defaults to the row's context.
+//! seat parses (its module doc); `--ctx-size` and `-c` are `--ctx` under
+//! llama-server's spellings, and C defaults to the row's context.
 //!
 //! Before any load the seat refuses by name a file whose architecture is
 //! not one of the row's backbones; then, on a worker thread that owns the
@@ -171,7 +171,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse().map_err(|e| format!("--port {v:?}: {e}"))?,
-            "--ctx" | "--ctx-size" => match v.parse::<usize>() {
+            f if serve::flag::CTX.contains(&f) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => a.ctx = Some(n),
                 _ => {
                     return Err(

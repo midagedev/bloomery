@@ -8,6 +8,10 @@
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
 //!                         [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
 //!
+//! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
+//! (`serve::flag::CTX`); a number flag's value that is not a number is
+//! refused naming the flag and the value.
+//!
 //! `PLACE` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
 //! (`generate::Place`, as `generate_ds41` takes it); a list whose stage card
 //! is not the A6000 and a list of more tier cards than the V4.1 body serves
@@ -174,6 +178,7 @@ use model::placement::workstation::{self, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::{Committed, Lookup, Speculative, Target, Want};
+use serve::flag::{CTX, number};
 use serve::{
     CacheNote, DeviceProps, DraftProps, Drafted, EngineError, EngineProps, FATAL_LINGER,
     PlacementProps, ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
@@ -247,13 +252,13 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             .ok_or_else(|| format!("{flag} needs a value, or is unknown: {USAGE}"))?;
         match flag {
             "--host" => a.host = v.to_owned(),
-            "--port" => a.port = v.parse()?,
+            "--port" => a.port = number(flag, v)?,
             "--place" => a.place = place::parse(v)?,
-            "--ctx" => a.ctx = v.parse()?,
+            f if CTX.contains(&f) => a.ctx = number(flag, v)?,
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
-            "--parallel" | "-np" => a.parallel = Some(v.parse()?),
-            "--queue-depth" => a.queue_depth = Some(v.parse()?),
+            "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
+            "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             "--park-ram" => {
                 mib_bytes(flag, v)?;
@@ -278,7 +283,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 
 /// A flag's value in MiB, as bytes.
 fn mib_bytes(flag: &str, v: &str) -> Result<u64, GateError> {
-    let mib: u64 = v.parse()?;
+    let mib: u64 = number(flag, v)?;
     Ok(mib
         .checked_mul(1 << 20)
         .ok_or_else(|| format!("{flag} {mib} MiB passes u64 bytes"))?)
