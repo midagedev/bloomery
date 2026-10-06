@@ -1308,6 +1308,37 @@ round −20 %, aggregate ≈ ×1.25 if the step is byte-bound, more where it is 
 attention stays per slot (separate KV planes). The term to measure first: our r(m) = pass(m)/pass(1) on the qwen3
 chain at m = 2 (the same term as the recentlit "verify m-rows" line above).
 
+- **llama.cpp b11443 speed changes** (10-06, GLM rounds lcpp-cuda and lcpp-host; reports in the lead specs
+  `leader/lcpp11443/report-{K,H}.md`): nothing predicts ≥ 1 % on a greedy headline.
+  - #29184 (the shared expert rides the routed MMVQ launch), ledger only. Folding our shexp gate_up (+ q8_1 + sh_down)
+    into the routed `_sel` launches saves 2–3 launches per MoE layer: −68…−102 µs at L = 40 and c_node 0.852 µs, which
+    is 0.2–0.3 % of the V4.1 step [derived]. It is 0 under residency, because it sits in the host bridge's shadow.
+  - #29901 (the 4-head indexer tile; it dispatches for n_head == 4, i.e. qwen4exp, not GLM). Our `qsa_score` already
+    stages the pooled key tile once per 8 rows. The residue is the per-row barrier pair and the 4× shared re-read, a
+    ceiling of 10–20 % of that kernel. It is 0 at P ≤ 4096 (no scoring below position 2048); revisit at ≥ 32k contexts.
+  - #29393 (RMS_NORM + SCALE), have: every norm of ours is one fused launch.
+  - #27851 (CPU k-quant tiles), already rejected at the KT #2212 line above (m_e ≤ 86 < break-even).
+  - **#27694 rejection-sampling verify (adopt candidate, serve at temp > 0):**
+    - The problem: our drafted seats accept by exact match (`crates/runtime/src/speculative.rs:202`
+      `accepted_rows`), so acceptance falls with temperature.
+    - The fix: accept with min(1, p/q) and draw the residual from norm(max(0, p − q)). This keeps the distribution
+      exactly.
+    - Upstream measured +5–13 % acceptance length for draft-mtp at temp 0.7.
+    - Predicted +4–12 % serve decode tok/s at temp 0.7 on q38/glmmtp [derived from upstream's band]. 0 on greedy
+      headlines.
+    - Out of scope: the V4.1 DSpark block draft.
+    - Trap: the n-gram lookup draft keeps greedy verify (#29924's bug).
+    - The draft's q already exists (`crates/gpu/src/mtp.rs`).
+  - **Check (S): post-EOG kept rows** (#29638's class). `generate` truncates the emitted tokens at the first EOG
+    (`crates/runtime/src/lib.rs:268`) after the verify has committed `kept` rows past it. If a serve seat keeps the
+    context across turns, those rows can survive into the next turn's prefix. One serve trace confirms it, and the
+    likely fix is to bound `kept` at the EOG.
+  - Baseline movement: re-cut the llama.cpp rows at ≥ b11443 for Qwen3.8 (mainline draft-mtp #29761, upstream 1.55×
+    on DGX Spark), GLM-5.3 (mainline #27773, still undrafted) and V4.1 (mainline, no longer the PR branch). Qwen3.6
+    and Clef move a little (#29184, #29393). The V4.1 llama.cpp pp4096 arm has stood FAIL since 09-28 and must be
+    resolved at that sitting. The box's `llama.cpp-mainline` (`53ed051ce`) moves first. The sitting needs the user's
+    approval (> 30 min).
+
 ### 재판정 잔여 (revisit)
 
 R2 Q3_K 밀집 m ≤ 8 대역(m=6이 m=1 GB/s의 90 % 밑이면 m > 1 명령 레버 카드 — DSpark 패스 +4.7 ms 위험; uniongroup 앞); R5 0·1층 Q5_K `_sel`을 카드로(순 −0.15…−0.4 ms); R6 목록 주장 확인·R7 DSpark 재유도(합집합 0.753로)·R8 rows % 4(plainfile이 덮었는지); N1·N2·N3·N4·N5는 시팅 큐와 사용자 결정.
