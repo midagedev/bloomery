@@ -1129,6 +1129,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The file q5_K's qdot harness and gate read, the V4.1 first shard when unset.",
     ),
     path(
+        "BLOOMERY_QWEN_Q4_MODEL",
+        Some("ref/build-qdot-ref.sh"),
+        "The Qwen3.8 UD-Q4_K_XL shard IQ4_NL's qdot harness and gate read, the second shard when unset.",
+    ),
+    path(
+        "BLOOMERY_QWEN_Q3_MODEL",
+        Some("ref/build-qdot-ref.sh"),
+        "The Qwen3.8 UD-Q3_K_XL shard IQ4_XS's qdot harness and gate read, the second shard when unset; its `.done` \
+         sentinel gates the real rows.",
+    ),
+    path(
         "BLOOMERY_QWEN3MOE_VOCAB",
         None,
         "The Qwen3-MoE file the tokenizer gate reads its vocabulary from, the box's when \

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the harnesses that link ik's own kernel tables, and run the eight
+# Build the harnesses that link ik's own kernel tables, and run the ten
 # reference ones (on the box). Runs under tools/box.sh (toolchain env already
 # sourced).
 #
@@ -20,14 +20,20 @@
 # mxfp4_x4_ref read the file named by BLOOMERY_V4_MODEL (default: the V4-Flash
 # first data shard, whose first IQ3_XXS and MXFP4 tensors are
 # blk.0.ffn_gate_exps.weight and blk.0.ffn_down_exps.weight; gate-qdot reads the
-# same variable with the same default). q8f0_ref reads no model: its synthetic
-# block set is written into its own dump.
+# same variable with the same default). iq4nl_ref reads the file named by
+# BLOOMERY_QWEN_Q4_MODEL (default: the Qwen3.8 UD-Q4_K_XL second shard, whose
+# first IQ4_NL tensor is per_layer_token_embd.weight) and iq4xs_ref the file
+# named by BLOOMERY_QWEN_Q3_MODEL (default: the Qwen3.8 UD-Q3_K_XL second shard,
+# which holds the one IQ4_XS layer's experts) — until that file's .done sentinel
+# exists iq4xs_ref dumps synthetic blocks under the name synthetic-iq4_xs and
+# says so. q8f0_ref reads no model: its synthetic block set is written into its
+# own dump.
 #
 # mxfp4_ref links libggml alone and dumps ggml's to_float of the first rows of one MXFP4 expert
 # tensor of the DSpark draft (BLOOMERY_DSPARK_MODEL, default the tl37 file) to
 # mxfp4-dspark-dequant.raw/.meta for gate-dspark-read; the .meta names the ik tree and commit.
 #
-# The seven *_rate harnesses are built but NOT run: each is a timed kernel-rate
+# The nine *_rate harnesses are built but NOT run: each is a timed kernel-rate
 # bench over a synthetic shape, and a measurement belongs to a quiet machine and
 # a lease, never to a build recipe. Building them here is what keeps them
 # compiling with the rest.
@@ -48,10 +54,12 @@ OUT=${Q3K_OUT:-$REF_BIN}
 Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-${BLOOMERY_V41_MODEL:?BLOOMERY_V41_MODEL unset — run through tools/box.sh, which exports it from the deepseek41 profile}}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 V4_MODEL=${BLOOMERY_V4_MODEL:-/models/DeepSeek-V4-Flash-0731-UD-Q3_K_M/DeepSeek-V4-Flash-0731-UD-Q3_K_M-00002-of-00004.gguf}
+QWEN_Q4_MODEL=${BLOOMERY_QWEN_Q4_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf}
+QWEN_Q3_MODEL=${BLOOMERY_QWEN_Q3_MODEL:-/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
-DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref"
-RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate"
+DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq4xs_ref"
+RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate iq4nl_rate iq4xs_rate"
 
 # Same flags for both sets: the rate harnesses include the same ik headers under
 # the same IQK_IMPLEMENT as their _ref twins.
@@ -66,6 +74,8 @@ for name in $DUMPERS; do
   case $name in
     q5k_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$Q5K_MODEL" ;;
     iq3xxs_ref|mxfp4_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$V4_MODEL" ;;
+    iq4nl_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$QWEN_Q4_MODEL" ;;
+    iq4xs_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$QWEN_Q3_MODEL" ;;
     *) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" ;;
   esac
 done
@@ -81,5 +91,6 @@ ls -l "$BLOOMERY_DATA"/ref/q4k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q6k-x4-ik-dot.
       "$BLOOMERY_DATA"/ref/q5k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q5k-v41-dequant.raw \
       "$BLOOMERY_DATA"/ref/iq3xxs-ik-dot.txt "$BLOOMERY_DATA"/ref/mxfp4-x4-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q8f0-ik-dot.txt \
+      "$BLOOMERY_DATA"/ref/iq4nl-ik-dot.txt "$BLOOMERY_DATA"/ref/iq4xs-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5k-v41-dequant.meta \
       "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.raw "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.meta

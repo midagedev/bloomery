@@ -1,0 +1,37 @@
+# The iqhost round's rate card: the two new host-tier kernels (IQ4_NL x q8_2_x4 down,
+# IQ4_XS x q8_K gate/up — the Qwen3.8 UD-Q3_K_XL host leg) against the formats they
+# replace at the same row width, in one qdot-rate sitting. Derived before the round:
+# the down row's bytes drop to 18/24 = 0.75x of Q5_1's with equal-or-lighter integer work
+# (one nibble table lookup vs the 5th-bit assembly; the sign fold adds two sign_epi8 per
+# block), so IQ4_NL/Q5_1 in us/row is predicted 0.75..1.0; the gate/up row's bytes are
+# 136/144 = 0.944x of Q4_K's with near-equal work, so IQ4_XS/Q4_K is predicted 0.9..1.1
+# [derived both]. The ruled term is the loss side only: the leg must not cost more per
+# row than the incumbent it replaces; the gain side routes to decide-below and feeds the
+# residency model either way.
+kind: noninf
+question: does the Qwen3.8 UD-Q3_K_XL host leg hold the UD-Q4_K_XL leg's per-row cost —
+  the worse of the two same-run us/row ratios, IQ4_NL(k=640)/Q5_1(k=640) and
+  IQ4_XS(k=2560)/Q4_K(k=2560), stay at or below the incumbent?
+term: qdot-rate us/row, the worse (larger) of the two ratios new/incumbent, per round —
+  single thread pinned to BLOOMERY_RATE_CORE, 360,448 rows x 6 passes per arm, every arm
+  of one process in one lease
+unit: %
+predict: -2..2
+rounds: 6
+margin: 3 % <the derived bands' loss side is 0 (IQ4_NL <= Q5_1, IQ4_XS within +-10 %
+  of Q4_K); 3 % clears the paired ruler at 6 rounds with room for the short-row latency
+  the derivation cannot close, and a miss beyond it re-derives rather than fails the leg>
+condition: the lead runs BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/iqhost-rate.card'
+  just measure-qdot-rate 6 on the main track (just build-ref first, so iq4nl_rate and
+  iq4xs_rate exist); arm order rotates every round, netdata frozen under the lease, no
+  other compute on the box; the IQ4_XS row rides along as the reference row for the one
+  layer of 48 that uses it — its cost is 1/48th of the gate/up leg and cannot move the
+  step alone
+decide-in: record the four us/row rows (IQ4_NL@640, Q5_1@640, IQ4_XS@2560, Q4_K@2560)
+  and ik's own iq4nl/iq4xs rates on the rig-log qdot-rate page, and price the
+  UD-Q3_K_XL host leg in the residency model at the measured per-row cost
+decide-below: the IQ4_NL row realized part of the 0.75x byte saving: record the rows and
+  feed the measured saving into the residency model; no kernel work this round
+decide-above: the IQ4_NL row is slower than Q5_1 beyond the margin: profile the bench
+  (perf -e cpu-clock on qdot-rate) before touching the kernel — the suspects are the
+  two sign_epi8 per block and the pshufb table lookup, against Q5_1's qh fold

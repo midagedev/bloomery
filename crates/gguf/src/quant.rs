@@ -1081,8 +1081,8 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
 ///
 /// | weight | activation |
 /// |---|---|
-/// | Q3_K, IQ3_XXS | `Q8_K` |
-/// | Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q8_0, MXFP4 | `Q8_2_X4` |
+/// | Q3_K, IQ3_XXS, IQ4_XS | `Q8_K` |
+/// | Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q8_0, MXFP4, IQ4_NL | `Q8_2_X4` |
 /// | F32, F16 | none |
 ///
 /// Using Q8_K for all of them is wrong by ~1e-3 on the Q5_1 down projection; the
@@ -1133,7 +1133,9 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// Q8_K (ggml.c:1116; `iqk_set_kernels_iquants` refuses any other activation type). Q8_0
 /// takes Q8_2_X4 too (ggml.c:831 on this AVX2 IQK build; the legacy-quants entry pairs it
 /// with `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, _, block_q8_2>`), the column qdot's Q8_0 kernel
-/// reads.
+/// reads. IQ4_NL takes Q8_2_X4 on AVX2 (ggml.c:1286-1288; the legacy-quants entry pairs it
+/// with `mul_mat_qX_0_q8_0_T<IQ4_NL_UnpackerS, _, block_q8_2>`) and IQ4_XS takes Q8_K
+/// (ggml.c:1302; `iqk_set_kernels_kquants` accepts Q8_K only for it).
 ///
 /// A weight type no CPU matmul here takes is refused, not given a format: BF16 activations
 /// are BF16 in ggml (`vec_dot_type`, ggml.c:1494), which this engine does not encode, and
@@ -1142,24 +1144,23 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// either.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
-        GgmlType::Q3_K | GgmlType::IQ3_XXS => Ok(Some(ActivationFormat::Q8K)),
+        GgmlType::Q3_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS => Ok(Some(ActivationFormat::Q8K)),
         GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_0
         | GgmlType::Q5_1
         | GgmlType::Q8_0
-        | GgmlType::MXFP4 => Ok(Some(ActivationFormat::Q8_2X4)),
+        | GgmlType::MXFP4
+        | GgmlType::IQ4_NL => Ok(Some(ActivationFormat::Q8_2X4)),
         GgmlType::F32 | GgmlType::F16 => Ok(None),
         GgmlType::BF16
         | GgmlType::Q2_K
         | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
         | GgmlType::IQ1_S
-        | GgmlType::IQ4_NL
         | GgmlType::IQ3_S
         | GgmlType::IQ2_S
-        | GgmlType::IQ4_XS
         | GgmlType::I8
         | GgmlType::I16
         | GgmlType::I32

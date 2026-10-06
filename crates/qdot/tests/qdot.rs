@@ -551,6 +551,49 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q8_0, &wrow80, &acol80, 2144).unwrap(),
         0.0
     );
+    // IQ4_NL uses 32-value blocks (18 bytes per 32 values) and q8_2 tails past the x4
+    // groups: k = 640 is the Qwen3.8 down row (20 blocks, 5 whole groups, no tail).
+    assert_eq!(col_bytes(GgmlType::IQ4_NL, 640), 144 * 5);
+    assert_eq!(col_bytes(GgmlType::IQ4_NL, 672), 144 * 5 + 36);
+    let wrownl = vec![0u8; 18 * 21];
+    let acolnl = vec![0u8; 144 * 5 + 36];
+    assert!(matches!(
+        dot_row(GgmlType::IQ4_NL, &wrownl, &acolnl, 100),
+        Err(QdotError::UnalignedK { k: 100, gran: 32 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ4_NL, &wrownl[..18 * 21 - 1], &acolnl, 672),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ4_NL, &wrownl, &acolnl[..144 * 5 + 35], 672),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::IQ4_NL, &wrownl, &acolnl, 672).unwrap(),
+        0.0
+    );
+    // IQ4_XS pairs q8_K with 136 weight bytes per 256 values (k = 2560, the Qwen3.8
+    // gate/up rows of the one IQ4_XS layer).
+    assert_eq!(col_bytes(GgmlType::IQ4_XS, 2560), 296 * 10);
+    let wrowxs = vec![0u8; 136 * 10];
+    let acolxs = vec![0u8; 296 * 10];
+    assert!(matches!(
+        dot_row(GgmlType::IQ4_XS, &wrowxs, &acolxs, 2560 + 32),
+        Err(QdotError::UnalignedK { k: 2592, gran: 256 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ4_XS, &wrowxs[..136 * 10 - 1], &acolxs, 2560),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ4_XS, &wrowxs, &acolxs[..296 * 10 - 1], 2560),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::IQ4_XS, &wrowxs, &acolxs, 2560).unwrap(),
+        0.0
+    );
     // Supported type table check.
     assert!(!supports(GgmlType::F16));
     assert!(supports(GgmlType::Q5_K));
@@ -558,6 +601,8 @@ fn rejects_unaligned_k() {
     assert!(supports(GgmlType::IQ3_XXS));
     assert!(supports(GgmlType::MXFP4));
     assert!(supports(GgmlType::Q8_0));
+    assert!(supports(GgmlType::IQ4_NL));
+    assert!(supports(GgmlType::IQ4_XS));
 }
 
 /// `col_bytes` panics on unaligned k.
@@ -1368,6 +1413,314 @@ fn hw_mxfp4_kernel_predicts_ik() {
     );
 }
 
+// ---------------------------------- IQ4_NL x Q8_2_X4 and IQ4_XS x Q8_K
+// The Qwen3.8-Flash-Next routed-expert formats. Both gates and their harnesses read one
+// dump per type (tools/ref/iq4nl_ref.cpp, tools/ref/iq4xs_ref.cpp), which carries the
+// weight rows beside ik's column and results — so this side needs no model file:
+//
+//   clause (what the contract says)                     | assertions
+//   ----------------------------------------------------|---------------------------------
+//   C1 the encoder codes a column byte for byte as      | gate 0's per-byte compare (NL);
+//      ik's quantize_row_q8_2_x4 (NL only: XS pairs    | col_bytes shape pins
+//      q8_K, whose ik encoder differs by design)        |
+//   C2 the AVX2 kernel equals its mirror bit for bit    | the dump's rows, kernel vs
+//      on real rows and on generated rows at every      | mirror; ROWS generated rows at
+//      tail shape                                       | each k; the s-bytes-ignored pin
+//   C3 on ik's own column the kernel is within 1 ULP    | gate B: every dumped row
+//      of ik's kernel (the IQ3_XXS band)                | within 1 ULP, worst reported
+//   C4 the 6-bit scale split (XS) and the sign fold     | generated-row gate A at
+//      (NL) decode every bit pattern                    | extreme bytes; f16 scale sweep
+//
+// IQ4_NL's real rows are the UD-Q4_K_XL file's per_layer_token_embd (the file this
+// engine serves); IQ4_XS's are the UD-Q3_K_XL file's one IQ4_XS gate/up layer, whose
+// download lands after this round — until its `.done` sentinel appears the harness
+// dumps synthetic blocks under the name synthetic-iq4_xs and says so, and the gates
+// run on those. A partial shard would read past EOF, so the sentinel gates the real
+// path, not the file's presence.
+
+/// One type's ik dump: the tensor name, k, ik's activation column, the weight rows the
+/// kernel ran on (hex), and ik's result bits per row.
+struct QwenDump {
+    name: String,
+    k: usize,
+    ik_acol: Vec<u8>,
+    rows: Vec<Vec<u8>>,
+    want: Vec<u32>,
+}
+
+/// Reads `$BLOOMERY_DATA/ref/<file>`, every line by its tag; an untagged or unknown
+/// line is refused, and the shapes must match the type's column and row contracts.
+fn qwen_dump(file: &str, ty: GgmlType, block: usize, gran: usize) -> QwenDump {
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let path = format!("{base}/ref/{file}");
+    let dump = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{path}: {e} — run just build-ref first"));
+    let mut d = QwenDump {
+        name: String::new(),
+        k: 0,
+        ik_acol: Vec::new(),
+        rows: Vec::new(),
+        want: Vec::new(),
+    };
+    for line in dump.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        match t.as_slice() {
+            ["tensor", name, "k", k] => {
+                d.name = (*name).to_string();
+                d.k = k.parse().unwrap();
+            }
+            [h] if h.len() > 64 => d.ik_acol = unhex(h),
+            ["w", r, h] => {
+                assert_eq!(r.parse::<usize>().unwrap(), d.rows.len(), "rows in order");
+                d.rows.push(unhex(h));
+            }
+            ["row", r, bits] => {
+                assert_eq!(
+                    r.parse::<usize>().unwrap(),
+                    d.want.len(),
+                    "results in order"
+                );
+                d.want
+                    .push(u32::from_str_radix(bits, 16).expect("ik dumps raw f32 bits"));
+            }
+            _ => panic!("{path}: an unknown line {:?}", &line[..line.len().min(40)]),
+        }
+    }
+    assert!(d.k > 0 && d.k.is_multiple_of(gran), "{path}: the dump's k");
+    assert_eq!(
+        d.ik_acol.len(),
+        col_bytes(ty, d.k),
+        "{path}: ik's column must size-match ours"
+    );
+    assert_eq!(d.rows.len(), d.want.len(), "{path}: rows and results");
+    assert!(
+        d.rows.len() >= 16,
+        "{path}: the dump needs at least 16 rows"
+    );
+    let row_bytes = block * d.k / gran;
+    for (r, w) in d.rows.iter().enumerate() {
+        assert_eq!(w.len(), row_bytes, "{path}: row {r}");
+    }
+    d
+}
+
+/// Gate A over generated rows: `ROWS` pseudo-random rows at every `k`, every byte a
+/// valid code, each block's f16 d masked finite, against a `quantize_col` column —
+/// kernel vs mirror, bit for bit.
+fn generated_gate_a(ty: GgmlType, block: usize, gran: usize, ks: &[usize]) {
+    assert!(
+        supports(ty),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    let mut rng = Lcg(0x1AD5_0BEE_5EED);
+    for &k in ks {
+        let row_bytes = block * k / gran;
+        let mut w = vec![0u8; ROWS * row_bytes];
+        for (i, b) in w.iter_mut().enumerate() {
+            *b = (rng.next_u32() >> 13) as u8;
+            if i % block == 1 {
+                *b &= 0x7b; // the f16 d's exponent top bit: keep every scale finite
+            }
+        }
+        let x: Vec<f32> = (0..k).map(|_| rng.unit() * 30.0).collect();
+        let mut acol = vec![0u8; col_bytes(ty, k)];
+        quantize_col(ty, &x, &mut acol);
+        for r in 0..ROWS {
+            let a = dot_row_avx2(ty, &w[r * row_bytes..], &acol, k).unwrap();
+            let b = dot_row_scalar(ty, &w[r * row_bytes..], &acol, k).unwrap();
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "{ty:?} k = {k} row {r}: kernel {a:e} (bits {:#x}) and mirror {b:e} (bits {:#x}) \
+                 must be bit-identical",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
+        eprintln!("{ty:?} gate A: {ROWS} generated rows bit-identical at k = {k}");
+    }
+}
+
+/// IQ4_NL gate 0: `quantize_col` codes the column byte for byte as ik's
+/// `quantize_row_q8_2_x4` — the column the harness coded is the attn_norm dump's
+/// first k values, as in the MXFP4 gate.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq4nl_encoder_matches_ik() {
+    let d = qwen_dump("iq4nl-ik-dot.txt", GgmlType::IQ4_NL, 18, 32);
+    let xs = oracle_f32("attn_norm-0", 2048 * 6)[..d.k].to_vec();
+    let mut acol = vec![0u8; col_bytes(GgmlType::IQ4_NL, d.k)];
+    quantize_col(GgmlType::IQ4_NL, &xs, &mut acol);
+    for (i, (a, b)) in d.ik_acol.iter().zip(&acol).enumerate() {
+        assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
+    }
+    eprintln!(
+        "IQ4_NL gate 0: {} encoder bytes bit-identical to ik's quantize_row_q8_2_x4 ({}, k = {})",
+        acol.len(),
+        d.name,
+        d.k
+    );
+}
+
+/// IQ4_NL gate A: kernel vs mirror on the dump's rows and on `ROWS` generated rows at
+/// the down width (k = 640, whole groups) and both tail shapes — plus the pin that
+/// the kernel never reads a group's i16 sum bytes (bytes 8..16): no min correction
+/// exists, so corrupting them must not move the dot.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq4nl_kernel_matches_mirror() {
+    assert!(
+        supports(GgmlType::IQ4_NL),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    let d = qwen_dump("iq4nl-ik-dot.txt", GgmlType::IQ4_NL, 18, 32);
+    for r in 0..d.rows.len() {
+        let a = dot_row_avx2(GgmlType::IQ4_NL, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        let b = dot_row_scalar(GgmlType::IQ4_NL, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "dump row {r}: kernel {a:e} and mirror {b:e} must be bit-identical"
+        );
+    }
+    eprintln!(
+        "IQ4_NL gate A: {} dump rows bit-identical ({}, k = {})",
+        d.rows.len(),
+        d.name,
+        d.k
+    );
+    generated_gate_a(GgmlType::IQ4_NL, 18, 32, &[640, 672, 96, 128]);
+
+    // The s-bytes pin: a q8_2 group's i16 sums (bytes 8..16) feed only the min
+    // corrections IQ4_NL does not have.
+    let k = 672;
+    let mut rng = Lcg(0x0FF1_600D);
+    let row_bytes = 18 * k / 32;
+    let mut w = vec![0u8; row_bytes];
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = (rng.next_u32() >> 13) as u8;
+        if i % 18 == 1 {
+            *b &= 0x7b;
+        }
+    }
+    let x: Vec<f32> = (0..k).map(|_| rng.unit() * 30.0).collect();
+    let mut acol = vec![0u8; col_bytes(GgmlType::IQ4_NL, k)];
+    quantize_col(GgmlType::IQ4_NL, &x, &mut acol);
+    let plain = dot_row(GgmlType::IQ4_NL, &w, &acol, k).unwrap();
+    // Whole 144-byte groups only: the 36-byte tail block that follows them lays its
+    // codes out from byte 4, and chunks_mut would hand it to this fill as a short group.
+    let whole = (acol.len() / 144) * 144;
+    for g in acol[..whole].chunks_mut(144) {
+        g[8..16].fill(0x5a);
+    }
+    assert_eq!(
+        dot_row(GgmlType::IQ4_NL, &w, &acol, k).unwrap().to_bits(),
+        plain.to_bits(),
+        "corrupting the q8_2 sums must not move an IQ4_NL dot"
+    );
+    // The tail's 36-byte blocks carry their sums at the same offsets.
+    let tail = acol.len() - 36;
+    acol[tail + 2..tail + 4].fill(0x5a);
+    assert_eq!(
+        dot_row(GgmlType::IQ4_NL, &w, &acol, k).unwrap().to_bits(),
+        plain.to_bits(),
+        "corrupting a tail block's sum must not move an IQ4_NL dot"
+    );
+    eprintln!("IQ4_NL gate A: the q8_2 sum bytes are never read (group and tail pinned)");
+}
+
+/// IQ4_NL gate B: every dumped row within 1 ULP of ik's
+/// `mul_mat_qX_0_q8_0_T<IQ4_NL_UnpackerS, 1, block_q8_2>` (the IQ3_XXS band).
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq4nl_kernel_predicts_ik() {
+    let d = qwen_dump("iq4nl-ik-dot.txt", GgmlType::IQ4_NL, 18, 32);
+    let mut worst = 0i64;
+    let mut exact = 0usize;
+    for (r, (&bits, row)) in d.want.iter().zip(&d.rows).enumerate() {
+        let got = dot_row(GgmlType::IQ4_NL, row, &d.ik_acol, d.k).unwrap();
+        let ulp = (got.to_bits() as i64 - bits as i64).abs();
+        assert!(
+            ulp <= 1,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(bits)
+        );
+        worst = worst.max(ulp);
+        exact += usize::from(ulp == 0);
+    }
+    eprintln!(
+        "IQ4_NL gate B: {} rows within 1 ULP of ik's mul_mat_qX_0_q8_0_T<IQ4_NL_UnpackerS> \
+         (on ik's own activations, {}): max {worst} ULP, {exact}/{} rows at 0 ULP",
+        d.want.len(),
+        d.name,
+        d.want.len()
+    );
+}
+
+/// IQ4_XS gate A: kernel vs mirror on the dump's rows (the UD-Q3_K_XL layer's rows, or
+/// the harness's synthetic blocks until that file's `.done` lands) and on `ROWS`
+/// generated rows at the gate/up width and both smaller block counts.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq4xs_kernel_matches_mirror() {
+    assert!(
+        supports(GgmlType::IQ4_XS),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    let d = qwen_dump("iq4xs-ik-dot.txt", GgmlType::IQ4_XS, 136, 256);
+    for r in 0..d.rows.len() {
+        let a = dot_row_avx2(GgmlType::IQ4_XS, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        let b = dot_row_scalar(GgmlType::IQ4_XS, &d.rows[r], &d.ik_acol, d.k).unwrap();
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "dump row {r}: kernel {a:e} and mirror {b:e} must be bit-identical"
+        );
+    }
+    let origin = if d.name == "synthetic-iq4_xs" {
+        "synthetic blocks — the UD-Q3_K_XL download's .done is not there yet"
+    } else {
+        d.name.as_str()
+    };
+    eprintln!(
+        "IQ4_XS gate A: {} dump rows bit-identical ({}, k = {})",
+        d.rows.len(),
+        origin,
+        d.k
+    );
+    generated_gate_a(GgmlType::IQ4_XS, 136, 256, &[2560, 512, 768]);
+}
+
+/// IQ4_XS gate B: every dumped row within 1 ULP of ik's
+/// `mul_mat_qX_K_q8_K_T<DequantizerIQ4XS, 1>` (the IQ3_XXS band).
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_iq4xs_kernel_predicts_ik() {
+    let d = qwen_dump("iq4xs-ik-dot.txt", GgmlType::IQ4_XS, 136, 256);
+    let mut worst = 0i64;
+    let mut exact = 0usize;
+    for (r, (&bits, row)) in d.want.iter().zip(&d.rows).enumerate() {
+        let got = dot_row(GgmlType::IQ4_XS, row, &d.ik_acol, d.k).unwrap();
+        let ulp = (got.to_bits() as i64 - bits as i64).abs();
+        assert!(
+            ulp <= 1,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(bits)
+        );
+        worst = worst.max(ulp);
+        exact += usize::from(ulp == 0);
+    }
+    let origin = if d.name == "synthetic-iq4_xs" {
+        "synthetic blocks"
+    } else {
+        d.name.as_str()
+    };
+    eprintln!(
+        "IQ4_XS gate B: {} rows within 1 ULP of ik's mul_mat_qX_K_q8_K_T<DequantizerIQ4XS> \
+         (on ik's own activations, {}): max {worst} ULP, {exact}/{} rows at 0 ULP",
+        d.want.len(),
+        origin,
+        d.want.len()
+    );
+}
+
 // ------------------------------------------------------- Q8_0 x Q8_2_X4
 // The oracle is a synthetic block set (tools/ref/q8f0_ref.cpp): its generator writes the
 // column's f32 values, ik's q8_2_x4 bytes of it and every weight row into the dump, so this
@@ -2155,6 +2508,8 @@ fn quantize_col_random_bit_identical() {
         (GgmlType::Q5_0, &[128, 160, 192, 352]),
         (GgmlType::Q5_1, &[128, 192, 10944]),
         (GgmlType::Q8_0, &[128, 224, 2144]),
+        (GgmlType::IQ4_NL, &[128, 640, 672]),
+        (GgmlType::IQ4_XS, &[256, 512]),
     ];
     const COLS: usize = 200;
     const MAGS: [f32; 11] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0, 1e2, 1e3, 1e4];
@@ -2574,6 +2929,14 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
         (GgmlType::Q5_K, 176, &[0, 2][..]),
         (GgmlType::Q6_K, 210, &[208][..]),
         (GgmlType::IQ3_XXS, 98, &[0][..]),
+        // IQ4_NL at k = 256 is eight 18-byte blocks, one f16 scale each.
+        (
+            GgmlType::IQ4_NL,
+            144,
+            &[0, 18, 36, 54, 72, 90, 108, 126][..],
+        ),
+        // IQ4_XS at k = 256 is one 136-byte block.
+        (GgmlType::IQ4_XS, 136, &[0][..]),
         // Q8_0 at k = 256 is eight 34-byte blocks, one f16 scale each.
         (
             GgmlType::Q8_0,

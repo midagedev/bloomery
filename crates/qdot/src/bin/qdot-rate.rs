@@ -24,6 +24,20 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
             b[0] = 0x70 | (b[0] & 0x0f);
         }
     }
+    // IQ4_NL and IQ4_XS carry an f16 d per block: mask its exponent's top bit (the
+    // block's second byte) so every scale stays finite, as iq4nl_rate.cpp and
+    // iq4xs_rate.cpp do — raw bytes give an infinity or NaN scale in 2 blocks of 256
+    // on average.
+    if ty == GgmlType::IQ4_NL {
+        for b in w.as_chunks_mut::<18>().0 {
+            b[1] &= 0x7b;
+        }
+    }
+    if ty == GgmlType::IQ4_XS {
+        for b in w.as_chunks_mut::<136>().0 {
+            b[1] &= 0x7b;
+        }
+    }
     let col: Vec<f32> = (0..k)
         .map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0)
         .collect();
@@ -70,4 +84,12 @@ fn main() {
     bench(GgmlType::IQ3_XXS, 4096, (4096 / 256) * 98, rows);
     // V4-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
     bench(GgmlType::MXFP4, 2048, (2048 / 32) * 17, rows);
+    // Qwen3.8 UD-Q3_K_XL ffn_down_exps shape (43 of 48 layers): k = 640 (20 x 18 B =
+    // 360 B/row), beside the Q5_1 row it replaces at the same k.
+    bench(GgmlType::IQ4_NL, 640, (640 / 32) * 18, rows);
+    bench(GgmlType::Q5_1, 640, (640 / 32) * 24, rows);
+    // Qwen3.8 UD-Q3_K_XL ffn_gate/up_exps shape (the one IQ4_XS layer): k = 2560
+    // (10 x 136 B = 1360 B/row), beside the Q4_K row it replaces at the same k.
+    bench(GgmlType::IQ4_XS, 2560, (2560 / 256) * 136, rows);
+    bench(GgmlType::Q4_K, 2560, (2560 / 256) * 144, rows);
 }

@@ -134,7 +134,10 @@ placement 0 0 0
 # PIN(2026-10-03): qdot 43 -> 45 fns (blocks 80 unchanged), new code, not old code relaxed: the row-lane pack's
 # prefetch helpers lane_ahead and lane_ahead_last (unsafe fns: each reads a line of `next` its caller sized); the
 # pack's three per-arm blocks became pack_group's one block plus one in each helper, each with its SAFETY line.
-qdot 80 45 0
+# PIN(2026-10-06): qdot 80 -> 86 blocks, 45 -> 47 fns, new kernels, not old code relaxed: the IQ4_NL and IQ4_XS
+# dots (dot_iq4nl_q82x4_avx2, dot_iq4xs_q8k_avx2: two unsafe fns, one block each) and the four dispatch arms that
+# call them; mxfp4_codes became lut4_codes for three users, each with its SAFETY line.
+qdot 86 47 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
