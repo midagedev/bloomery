@@ -2488,14 +2488,14 @@ impl FfnBatch {
     }
 
     /// Enqueue the copy of the oldest served set's host sums — `key`'s, else
-    /// refused by name — to the card ([`Hybrid::enqueue_upload`]).
-    /// Asynchronous.
+    /// refused by name — to the card, returning the copy's host time in
+    /// nanoseconds ([`Hybrid::enqueue_upload`]). Asynchronous.
     pub fn enqueue_upload<H: HostExperts>(
         &mut self,
         gpu: &Gpu,
         tier: &mut Hybrid<H>,
         key: BatchKey,
-    ) -> Result<(), GpuError> {
+    ) -> Result<u64, GpuError> {
         self.check_key(key)?;
         tier.enqueue_upload(gpu.stream(), &mut self.hsum, key)
     }

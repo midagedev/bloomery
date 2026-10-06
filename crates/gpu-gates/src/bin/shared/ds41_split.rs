@@ -29,6 +29,7 @@ pub fn split(s: &PrefillStats, counts: Option<&PromptCounts>) -> Result<Record, 
         .f("wait_ms", ms(s.wait_ns))
         .f("enqueue_ms", ms(s.enqueue_ns()))
         .f("copy_ms", ms(s.copy_ns))
+        .f("upload_ms", ms(s.upload_ns))
         .f("union_lb", per(ms(s.union_ns)))
         .f("wait_lb", per(ms(s.wait_ns)))
         .f(
@@ -37,6 +38,7 @@ pub fn split(s: &PrefillStats, counts: Option<&PromptCounts>) -> Result<Record, 
         )
         .f("enqueue_lb", per(ms(s.enqueue_ns())))
         .f("copy_lb", per(ms(s.copy_ns)))
+        .f("upload_lb", per(ms(s.upload_ns)))
         .f("entries_route", per(s.entries_route as f64))
         .f("entries_shadow", per(s.entries_shadow as f64))
         .f("excluded_lb", per(s.excluded_slots as f64));

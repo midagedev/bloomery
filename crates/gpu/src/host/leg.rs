@@ -376,7 +376,10 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
             if tiered {
                 return Ok(());
             }
-            return self.hybrid.enqueue_upload(self.stream, self.hsum, key);
+            return self
+                .hybrid
+                .enqueue_upload(self.stream, self.hsum, key)
+                .map(|_| ());
         };
         let t0 = Instant::now();
         let before = self.hybrid.stats();
@@ -446,7 +449,7 @@ mod tests {
                 }
                 Ok(())
             })?;
-            self.port.upload(self.stream, self.hsum, key)
+            self.port.upload(self.stream, self.hsum, key).map(|_| ())
         }
 
         fn refused(why: Refused) -> GpuError {

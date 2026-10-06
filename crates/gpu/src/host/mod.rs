@@ -1487,13 +1487,14 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// Enqueue the copy of the oldest served set's host sums — `key`'s, else
-    /// refused by name — to `hsum` ([`BatchPort::upload`]).
+    /// refused by name — to `hsum`, returning the copy's host time in
+    /// nanoseconds ([`BatchPort::upload`]).
     pub fn enqueue_upload(
         &mut self,
         stream: &CudaStream,
         hsum: &mut DeviceBuffer<f32>,
         key: BatchKey,
-    ) -> Result<(), GpuError> {
+    ) -> Result<u64, GpuError> {
         self.port_mut("HostTier::enqueue_upload")?
             .upload(stream, hsum, key)
     }

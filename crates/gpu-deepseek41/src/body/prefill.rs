@@ -1025,14 +1025,16 @@ pub struct PrefillStats {
     pub prologue_ns: u64,
     /// The launches' enqueue with every serve in it.
     pub chain_ns: u64,
-    /// Of `chain_ns`: the union calls, the waits on the route's copies and
-    /// the activations' copy into the union's view; of the waits, those of a
-    /// group's first batch — the layer-batches whose route the previous
+    /// Of `chain_ns`: the union calls, the waits on the route's copies, the
+    /// activations' copy into the union's view and the host time inside the
+    /// batch port's uploads (the HtoD copy's enqueue); of the waits, those
+    /// of a group's first batch — the layer-batches whose route the previous
     /// layer's last batch enqueued.
     pub union_ns: u64,
     pub wait_ns: u64,
     pub wait_first_ns: u64,
     pub copy_ns: u64,
+    pub upload_ns: u64,
     /// Card time, with [`Body::set_prefill_card_timing`] on: from each
     /// layer-batch's first launch to its route's copies (its attention alone
     /// where it has no block), and its shadow, which runs under the union;
@@ -1055,11 +1057,11 @@ pub struct PrefillStats {
 
 impl PrefillStats {
     /// Of `chain_ns`, the time the thread spent enqueueing: the rest once
-    /// the union calls, the waits and the copies are taken out.
+    /// the union calls, the waits, the copies and the uploads are taken out.
     #[must_use]
     pub fn enqueue_ns(&self) -> u64 {
         self.chain_ns
-            .saturating_sub(self.union_ns + self.wait_ns + self.copy_ns)
+            .saturating_sub(self.union_ns + self.wait_ns + self.copy_ns + self.upload_ns)
     }
 
     /// A group's sums `o` added to these; `group` stays. Every field is
@@ -1076,6 +1078,7 @@ impl PrefillStats {
             wait_ns,
             wait_first_ns,
             copy_ns,
+            upload_ns,
             card_timed,
             card_out_ms,
             card_in_ms,
@@ -1093,6 +1096,7 @@ impl PrefillStats {
         self.wait_ns += wait_ns;
         self.wait_first_ns += wait_first_ns;
         self.copy_ns += copy_ns;
+        self.upload_ns += upload_ns;
         self.card_timed |= card_timed;
         self.card_out_ms += card_out_ms;
         self.card_in_ms += card_in_ms;
@@ -2953,12 +2957,13 @@ impl<'a> GroupCx<'a> {
                     // tier's come back for the card sum that follows it on
                     // the stream — it reads the uploaded rows and the tier's
                     // together.
-                    let rows = self.hybrid.upload_and_tier_rows(
+                    let (rows, upload_ns) = self.hybrid.upload_and_tier_rows(
                         gpu.stream(),
                         batch.ffn.handback_mut(),
                         key,
                         STAGE_TIER,
                     )?;
+                    self.sums.upload_ns += upload_ns;
                     // The host's rows' copy to the card.
                     self.tally.route(i, m.set, 1)?;
                     self.ffn.enqueue_batch_acc_rows_tier(
@@ -2982,12 +2987,12 @@ impl<'a> GroupCx<'a> {
                     )?;
                     // The card sum over both cards' slots, one launch.
                     self.tally.route(i, m.set, 1)?;
-                    batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
+                    self.sums.upload_ns += batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
                     // The host sums' copy to the card.
                     self.tally.route(i, m.set, 1)?;
                 }
             } else {
-                batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
+                self.sums.upload_ns += batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
                 // The host's handback's copy to the card.
                 self.tally.route(i, m.set, 1)?;
                 if rows_form {

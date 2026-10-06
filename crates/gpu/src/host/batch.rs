@@ -742,13 +742,14 @@ impl BatchPort {
     /// sum, or under the rows form its host rows — which must be `key`'s, to
     /// `hsum` at the same values; the set is free again. A tiered set's tier
     /// rows must have been waited for ([`BatchPort::settle_tiers`]) — a join
-    /// without them is refused by name.
+    /// without them is refused by name. Returns the host time the copy's
+    /// enqueue took, in nanoseconds.
     pub fn upload(
         &mut self,
         stream: &CudaStream,
         hsum: &mut DeviceBuffer<f32>,
         key: BatchKey,
-    ) -> Result<(), GpuError> {
+    ) -> Result<u64, GpuError> {
         let per = self.host_rows.max(1) * self.n_embd;
         let BatchKey { at, u, .. } = key;
         let set = &mut self.sets[self.up];
@@ -781,14 +782,16 @@ impl BatchPort {
                 port.legs[self.up].leg = Leg::Rows(key);
             }
         }
+        let t0 = Instant::now();
         // SAFETY: the copy writes values at·per .. u·per of `hsum` from this
         // set's page-locked sums, which the host writes again only in this
         // set's next serve, after a wait on the event of its next download —
         // enqueued after this copy, since the set is free from here on.
         unsafe { htod(stream, hsum, &set.sum, at * per..u * per)? };
+        let upload_ns = nanos(t0.elapsed());
         set.stage = Stage::Free;
         self.up ^= 1;
-        Ok(())
+        Ok(upload_ns)
     }
 
     /// Tier `tier`'s rows of the set whose upload just left them — the
@@ -1379,14 +1382,15 @@ impl<H: HostExperts> HostTier<H> {
     /// the set's sums — its weighted sum, or its host rows — go to `hsum`,
     /// and the tier's rows come back for the launch that follows the upload
     /// on the stream: the rows join's card sum reads the uploaded rows and
-    /// the tier's together. Refused as the two it wraps are.
+    /// the tier's together, with the upload's host time in nanoseconds.
+    /// Refused as the two it wraps are.
     pub fn upload_and_tier_rows(
         &mut self,
         stream: &CudaStream,
         hsum: &mut DeviceBuffer<f32>,
         key: BatchKey,
         tier: usize,
-    ) -> Result<&DeviceBuffer<f32>, GpuError> {
+    ) -> Result<(&DeviceBuffer<f32>, u64), GpuError> {
         const WHAT: &str = "HostTier::upload_and_tier_rows";
         let deadline = Instant::now() + GO_DEADLINE;
         let late = self.port_mut(WHAT)?.settle_tiers(key, deadline)?;
@@ -1401,14 +1405,16 @@ impl<H: HostExperts> HostTier<H> {
                 )
             }));
         }
-        self.port_mut(WHAT)?.upload(stream, hsum, key)?;
-        self.port
+        let upload_ns = self.port_mut(WHAT)?.upload(stream, hsum, key)?;
+        let rows = self
+            .port
             .as_ref()
             .ok_or(GpuError::State {
                 what: WHAT,
                 missing: "the batch port's sets (HostTier::prepare_batch)",
             })?
-            .tier_rows_uploaded(tier, key)
+            .tier_rows_uploaded(tier, key)?;
+        Ok((rows, upload_ns))
     }
 
     /// The expert tiers' fault words once their streams have drained,
