@@ -1,0 +1,36 @@
+# Round eqC, the landing A/B before the slot-order combine becomes V4.1's only join: the prompt rate of the
+# eqC tree against its base (main at ad7b6518, the engine of 6f41d253, built in the iqtrain worktree) in one lease. The round's paper
+# (specs/eq/eqC-report.md, the prefill term): the rows join uploads host_rows rows a token whatever the token's
+# host slots, m * (host_rows - 1) * embd * 4 = 512 * 5 * 20,480 = 52.4 MB a 512-token layer-batch more than the
+# split sum; at 25-26.3 GB/s pinned htod that is 2.0-2.1 ms of a 62-64 ms layer-batch, -3.1..-3.3 % where the
+# card stream bounds the call (prose after G) and 0 where the host does (lcg) [derived]. Secondary terms: the
+# card sum's read of the uploaded rows (+0.09 ms), the host union's row copy (+0.7 ms, hidden on prose), +3
+# launches a block-layer (+2.6 us) [derived]. So the prose loss is predicted at most -3.3 %.
+kind: noninf
+question: does the eqC tree's prose prompt rate stay within the derived worst case of its base's, so the
+  slot-order combine can be V4.1's only join?
+term: pp tok/s @ P = 4096 (depth 4096), prose prompt (corpus-prose.ids, the first 4096), A6000, the default
+  placement and residency - (eqC - base) / base, paired by round; P = 512 rows read beside
+unit: %
+predict: -3.3..0
+rounds: 6
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, one run's SD about 0.55 and 1.1 %;
+  the larger
+margin: 5.0 % <the derivation's worst case is -3.3 % (the stride upload on a card-bound call), and at 6 rounds
+  the ruler's half-width is 1.6 %: a mean at the worst case has its lower bound near -4.9 %, which must still
+  pass; the mean is read against -3.3 % in decide-in>
+condition: the eqC tree's generate_ds41 against the base tree's in one lease, the order rotated every round,
+  BLOOMERY_DECODE_N=16 (the decode is not the question), from /Users/hckim/repo/bloomery-eqC:
+  BLOOMERY_REMOTE='~/repo/bloomery-eqC' BLOOMERY_AB_ROUNDS=6 BLOOMERY_DECODE_N=16
+  BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/eqc-pp.card' just depth-gpu-ds41
+  prose:4096 bin:/root/repo/bloomery-iqtrain/target/release/generate_ds41:prose:4096 prose:512
+  bin:/root/repo/bloomery-iqtrain/target/release/generate_ds41:prose:512 (the base built before the lease in
+  ~/repo/bloomery-iqtrain); the ratio is the `ratio pp xbin prose` line at P = 4096; no row carries [cold],
+  [cpu-busy] or [other-busy]. Box time 20..28 min [derived: two loads a round at 60..90 s, 4 prompts a round,
+  6 rounds, a warm-up]
+decide-in: the lower bound clears -5.0 % and the mean is at or above -3.3 %: hand eqC over to land; record the measured pp beside the derived
+  -3.1..-3.3 % in docs/plan.md's prefill row, and open the compacted per-token upload (S) as the follow-up that
+  takes the 13.5 MB of rows no kernel reads back
+decide-below: the lower bound passes -5.0 %, or the mean falls under -3.3 %: a term the paper missed; read the STEP_STATS rows (card_out, enqueue, the
+  upload's time) for which one, and report it before any code changes
+decide-above: n/a for noninf beyond 0: a gain means the upload hides under the card stream; record it and land
