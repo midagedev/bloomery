@@ -164,6 +164,41 @@ pub trait Engine: Send {
     fn advance_rows(&self) -> usize {
         1
     }
+    /// One drafted pass for a request that samples, by llama.cpp's
+    /// `common_sampler_sample_and_accept_n`. `last` and the ids the draft
+    /// proposes after it are evaluated together. Then, row by row in position
+    /// order, `sampler` takes an id from that row's logits, given `history`
+    /// (the request's ids so far) followed by the ids this pass already
+    /// appended. Each taken id is appended to `out`. The pass stops after the
+    /// first taken id that differs from the draft's id at its row, or after
+    /// the row past the last drafted id. The engine then stands as after an
+    /// [`Engine::advance`] that kept those ids, its draft anchored on the
+    /// last taken id. `history` and `sampler` come back with the outcome. The
+    /// sampler's draws are exactly one per appended id, as one
+    /// [`Engine::next`] and one sample per token give them, so a drafted and
+    /// a plain run of one seed take the same ids. Called only when
+    /// [`Engine::drafts_sampled`]; the default refuses by name.
+    fn advance_sampled(
+        &mut self,
+        last: u32,
+        history: Vec<u32>,
+        sampler: Sampler,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
+        let _ = (last, &out);
+        (
+            Err(EngineError(
+                "this engine does not draft a sampled request".to_string(),
+            )),
+            history,
+            sampler,
+        )
+    }
+    /// Whether [`Engine::advance_sampled`] runs: a drafting engine that reads
+    /// its verify rows' logits. The default is false.
+    fn drafts_sampled(&self) -> bool {
+        false
+    }
     /// The sequences this engine serves at once, each with a cache of its own
     /// of [`Engine::ctx_max`] positions: the most `--parallel` it takes. The
     /// default is 1.
