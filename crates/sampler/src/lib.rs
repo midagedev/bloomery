@@ -177,11 +177,12 @@ impl Sampler {
     }
 
     /// Draw the next token from one row of `logits` (id = index), penalizing
-    /// the tail of `recent` (the tokens so far, oldest first). An empty row
-    /// answers 0, as the engine's argmax does; ids past `u32::MAX` are not
-    /// candidates. With `temperature <= 0` and no active penalty the answer is
-    /// the engine's argmax bit for bit: the largest logit, ties to the lower
-    /// id, a NaN never winning.
+    /// the tail of `recent` (the tokens the caller holds so far, oldest
+    /// first: a server passes the prompt's tail followed by its generated
+    /// ids). An empty row answers 0, as the engine's argmax does; ids past
+    /// `u32::MAX` are not candidates. With `temperature <= 0` and no active
+    /// penalty the answer is the engine's argmax bit for bit: the largest
+    /// logit, ties to the lower id, a NaN never winning.
     #[must_use]
     pub fn sample(&mut self, logits: &[f32], recent: &[u32]) -> u32 {
         let p = self.params;

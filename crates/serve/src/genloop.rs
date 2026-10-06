@@ -222,6 +222,26 @@ fn out(logits: &mut [f32]) -> Option<&mut [f32]> {
     (!logits.is_empty()).then_some(logits)
 }
 
+/// The last `n` ids of `held` a draw's penalties see, in order: an image
+/// span's positions are left out, as llama-server skips the null ids a media
+/// chunk holds.
+fn prompt_tail(held: &Held, n: usize) -> Vec<u32> {
+    let mut spans = held.media.iter().rev().peekable();
+    let mut tail: Vec<u32> = Vec::new();
+    for (at, &id) in held.ids.iter().enumerate().rev() {
+        if tail.len() == n {
+            break;
+        }
+        while spans.next_if(|s| s.at > at).is_some() {}
+        if spans.peek().is_some_and(|s| at < s.end()) {
+            continue;
+        }
+        tail.push(id);
+    }
+    tail.reverse();
+    tail
+}
+
 /// The next id: the engine's argmax, or the sampler's draw. `banned` (the
 /// stop ids under `ignore_eos`, as llama-server's `logit_bias_eog`) get a
 /// -inf logit first, and a greedy request whose argmax is banned takes the
@@ -1155,6 +1175,13 @@ pub(crate) struct Gen {
     scan: StopScan,
     dec: Box<dyn Decoder>,
     generated: Vec<u32>,
+    /// The ids a draw sees, in order: the prompt's tail (its last
+    /// `repeat_last_n` ids, as much of the prompt as there is), then the
+    /// generated ids. llama-server feeds every prompt id into the sampler
+    /// before the first draw; only the window the penalties read is kept, so
+    /// a long prompt costs one bounded copy, not a copy a step. Only a
+    /// request that draws (which has a sampler) keeps it.
+    history: Vec<u32>,
     stop: StopKind,
     stopping_word: String,
     truncated: bool,
@@ -1164,7 +1191,7 @@ pub(crate) struct Gen {
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
-    /// The copy of the generated ids a sampled pass lends the engine
+    /// The copy of the history a sampled pass lends the engine
     /// ([`Slot::advance_sampled`]), kept for its capacity.
     lent: Vec<u32>,
     /// The token the loop takes next; `None` once there is none.
@@ -1215,6 +1242,7 @@ impl Gen {
             scan: StopScan::new(p.stop.clone()),
             dec: slot.vocab.decoder(),
             generated: Vec::new(),
+            history: Vec::new(),
             stop: StopKind::Limit,
             stopping_word: String::new(),
             truncated: false,
@@ -1255,7 +1283,7 @@ impl Gen {
             &mut self.sampler,
             g,
             &mut self.logits,
-            &self.generated,
+            &self.history,
             &self.banned,
         )
     }
@@ -1319,14 +1347,21 @@ impl Gen {
     }
 
     /// The prompt's opening on the selected slot: the engine told the reply
-    /// the request may make, and the cache brought to the longest prefix of
-    /// `held` it keeps. No id of the prompt is fed yet.
+    /// the request may make, the cache brought to the longest prefix of
+    /// `held` it keeps, and a request that draws seeds its sampler's history
+    /// with the prompt's tail. No id of the prompt is fed yet.
     pub(crate) fn open(
         &mut self,
         slot: &mut Slot,
         held: &Held,
         p: &GenParams,
     ) -> Result<Kept, GenError> {
+        // The history the draws read opens on the prompt's tail, the whole
+        // prompt's last `repeat_last_n` ids — the cached part included, as
+        // llama-server feeds `prompt.tokens` whole into the sampler.
+        if self.sampler.is_some() {
+            self.history = prompt_tail(held, p.sampling.repeat_last_n);
+        }
         // A request that passes has its first token from the prompt's step:
         // the passes make at most the rest.
         let passes = takes_passes(self.sampler.as_ref(), &self.banned, slot.engine.as_ref());
@@ -1478,6 +1513,9 @@ impl Gen {
                 return Err(GenError::Banned(tok));
             }
             self.generated.push(tok);
+            if self.sampler.is_some() {
+                self.history.push(tok);
+            }
             self.tim.predicted_n = self.generated.len();
             self.tim.predicted_ms = ms_since(self.t1);
             tick(&self.tim);
@@ -1567,10 +1605,10 @@ impl Gen {
     /// A [`Need::Sampled`] pass from `last` on the selected slot
     /// ([`Slot::advance_sampled`]): the request's sampler goes to the engine
     /// and comes back, so the next step or pass draws on from where this one
-    /// stopped, and the engine is lent the generated ids, the history a
-    /// step's draw is given ([`Gen::answer`]). Its tokens are then in hand as
-    /// an [`Engine::advance`] pass's, the loop adding each to the generated
-    /// ids as it takes it.
+    /// stopped, and the engine is lent the history a step's draw is given
+    /// ([`Gen::answer`]): the prompt's tail then the generated ids. Its
+    /// tokens are then in hand as an [`Engine::advance`] pass's, the loop
+    /// adding each to the generated ids as it takes it.
     ///
     /// # Panics
     ///
@@ -1585,13 +1623,8 @@ impl Gen {
             .sampler
             .take()
             .expect("a sampled pass of a request that samples");
-        let (d, sampler) = slot.advance_sampled(
-            last,
-            &self.generated,
-            &mut self.lent,
-            sampler,
-            &mut self.kept,
-        );
+        let (d, sampler) =
+            slot.advance_sampled(last, &self.history, &mut self.lent, sampler, &mut self.kept);
         self.sampler = Some(sampler);
         self.advanced(d?);
         Ok(())
@@ -1676,9 +1709,30 @@ pub(crate) fn generate(
 
 #[cfg(test)]
 mod tests {
-    use super::partial_path;
+    use super::{partial_path, prompt_tail};
+    use crate::media::{Held, ImageKey, MediaSpan};
     use crate::slotfile;
     use std::path::Path;
+
+    /// The penalties' prompt tail leaves an image span's positions out and
+    /// keeps the last `n` of the rest, in order.
+    #[test]
+    fn prompt_tail_leaves_image_spans_out() {
+        let span = |at, len| MediaSpan {
+            at,
+            len,
+            key: ImageKey([0; 32]),
+        };
+        let held = Held {
+            ids: vec![1, 2, 9, 9, 9, 3, 4, 9, 9, 5],
+            media: vec![span(2, 3), span(7, 2)],
+        };
+        assert_eq!(prompt_tail(&held, 64), vec![1, 2, 3, 4, 5]);
+        assert_eq!(prompt_tail(&held, 3), vec![3, 4, 5]);
+        assert_eq!(prompt_tail(&held, 0), Vec::<u32>::new());
+        let plain = Held::from(vec![7, 8, 9]);
+        assert_eq!(prompt_tail(&plain, 2), vec![8, 9]);
+    }
 
     /// Two saves to one path write two partial files, neither of which a
     /// slot file can be named.

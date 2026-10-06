@@ -190,6 +190,34 @@ fn hw_drafted_sampled_ids_are_the_plain_ids() {
     let (d, p) = (drain(&dlog), drain(&plog));
     assert!(count(&d, MockCall::Sampled) > 0, "no sampled pass ran");
     assert_eq!(count(&p, MockCall::Sampled), 0, "the plain twin ran a pass");
+    // The prompt's tail in the penalty window: a presence that pushes every
+    // echoed id below the mock's floor moves the draws — the first moved id
+    // named below — and the drafted run still takes the plain run's ids, its
+    // passes drawing on the same window the plain steps draw on.
+    let mut moved = None;
+    for seed in 1..=8u64 {
+        let neutral = ids_of(plain, &sampled(BRANCHY, 48, 0.8, seed)).0;
+        let mut body = sampled(BRANCHY, 48, 0.8, seed);
+        body["presence_penalty"] = json!(20.0);
+        let at = format!("penalized, seed {seed}, {body}");
+        let (want, w) = ids_of(plain, &body);
+        let (got, v) = ids_of(drafted, &body);
+        assert_eq!(got, want, "{at}: {v}");
+        assert_eq!(v["content"], w["content"], "{at}");
+        if moved.is_none()
+            && let Some(i) = got.iter().zip(&neutral).position(|(g, &n)| g != &n)
+        {
+            moved = Some((seed, i, got[i], neutral[i]));
+        }
+    }
+    let Some((seed, at, got, was)) = moved else {
+        panic!("presence 20 moved no drawn id over the seeds");
+    };
+    println!("presence 20 moved seed {seed}'s id {at}: {was} -> {got}");
+    assert!(
+        count(&drain(&dlog), MockCall::Sampled) > 0,
+        "the penalized arm's drafted requests passed"
+    );
 }
 
 /// Near the context's end a sampled pass that would pass it is not run: the

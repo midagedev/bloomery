@@ -190,8 +190,9 @@ pub trait Engine: Send {
     /// `common_sampler_sample_and_accept_n`. `last` and the ids the draft
     /// proposes after it are evaluated together. Then, row by row in position
     /// order, `sampler` takes an id from that row's logits, given `history`
-    /// (the request's ids so far) followed by the ids this pass already
-    /// appended. Each taken id is appended to `out`. The pass stops after the
+    /// (the ids its draws see: the prompt's tail then the generated ids so
+    /// far) followed by the ids this pass already appended. Each taken id is
+    /// appended to `out`. The pass stops after the
     /// first taken id that differs from the draft's id at its row, or after
     /// the row past the last drafted id. The engine then stands as after an
     /// [`Engine::advance`] that kept those ids, its draft anchored on the
@@ -724,8 +725,9 @@ pub struct SamplingParams {
     pub frequency_penalty: f32,
     /// Subtracted from a token's logit once if it occurs in the window.
     pub presence_penalty: f32,
-    /// The window: the last `repeat_last_n` ids (a request's `-1` is
-    /// replaced by the context size); 0 is off.
+    /// The window: the last `repeat_last_n` ids of the prompt's tail and the
+    /// generated ids, as llama-server's ring buffer over the prompt and the
+    /// reply is; 0 is off.
     pub repeat_last_n: usize,
     /// The effective seed (a request's `-1` is replaced by a clock-derived one).
     pub seed: u64,
@@ -759,7 +761,8 @@ impl SamplingParams {
     }
 }
 
-/// One request's sampler: `(logits, tokens generated so far) -> id`.
+/// One request's sampler: `(logits, the history a draw sees) -> id` — the
+/// prompt's tail then the generated ids, oldest first.
 pub type Sampler = Box<dyn FnMut(&[f32], &[u32]) -> u32 + Send>;
 
 /// Builds a sampler per request. The real one comes from the sampler crate; the
