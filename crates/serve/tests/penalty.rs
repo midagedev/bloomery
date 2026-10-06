@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 
 use common::{Reply, get, post, start};
 use serde_json::{Value, json};
+use serve::Tokenizer;
 
 const N_CTX: usize = 4096;
 
@@ -153,4 +154,69 @@ fn hw_presence_penalty_changes_the_sampled_ids() {
         "greedy, presence 20"
     );
     println!("presence: {plain} neutral, {penalized} at 20");
+}
+
+/// The penalty window opens on the prompt's ids, as llama-server's
+/// `init_sampler` does (it feeds every prompt id into the sampler before the
+/// first draw): the mock answers "abababab" with its bigram echo `a` — the
+/// follower of the last `b`'s most recent earlier occurrence, the PREDICTED
+/// logit — and a presence penalty that takes that `a` below the mock's floor
+/// moves the first id only while the window reaches into the prompt. The
+/// same request with the penalty off, or with a window too short to hold an
+/// `a`, answers the echo; a rerun over the cached prompt answers what the
+/// cold one did.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_the_penalty_window_opens_on_the_prompts_ids() {
+    let addr = start(N_CTX);
+    // The echoed `a`, and the first id at the mock's floor (-8, the lowest
+    // id once the echo is pushed under it).
+    let (a, floor) = (
+        u64::from(serve::MockTokenizer.encode("a")[0]),
+        u64::from(serve::MockTokenizer.bos()),
+    );
+    let first = |extra: Value| -> u64 {
+        let mut body = json!({
+            "prompt": "abababab",
+            "n_predict": 1,
+            "temperature": 0,
+            "return_tokens": true,
+        });
+        for (k, v) in extra.as_object().expect("an object") {
+            body[k] = v.clone();
+        }
+        let r = post(addr, "/completion", &body);
+        assert_eq!(r.status, 200, "{body}: {}", r.body);
+        r.json()["tokens"][0]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{body}: no first token: {}", r.body))
+    };
+    assert_eq!(first(json!({})), a, "greedy answers the mock's echo");
+    assert_eq!(
+        first(json!({"presence_penalty": 0.0})),
+        a,
+        "the penalty off"
+    );
+    // The echoed `a` (logit 4) and the prompt's `b` sit in the window: both
+    // go under every other id's floor, and the draw moves to the first of
+    // those.
+    assert_eq!(
+        first(json!({"presence_penalty": 20.0})),
+        floor,
+        "the prompt's ids are in the window"
+    );
+    // A window of one id holds only the prompt's last id (`b`): the echoed
+    // `a` stays unpenalized and wins.
+    assert_eq!(
+        first(json!({"presence_penalty": 20.0, "repeat_last_n": 1})),
+        a,
+        "a window short of the echoed id"
+    );
+    // The rerun's prompt is the slot's cache: the cache keeps positions, not
+    // the history the draws read.
+    assert_eq!(
+        first(json!({"presence_penalty": 20.0})),
+        floor,
+        "the cached rerun"
+    );
 }

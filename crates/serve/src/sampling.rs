@@ -1,8 +1,9 @@
 //! The server's own sampler, used until the sampler crate is plugged in through a
 //! [`SamplerFactory`]. llama-server's default chain restricted to the knobs this
-//! server accepts: the penalties over the last `repeat_last_n` ids of the history,
-//! then top_k, then top_p, then min_p, then temperature, then a draw; temperature
-//! `<= 0` takes the best candidate after the penalties.
+//! server accepts: the penalties over the last `repeat_last_n` ids of the history
+//! (the prompt's tail then the generated ids, as llama-server feeds the whole
+//! prompt into the sampler), then top_k, then top_p, then min_p, then temperature,
+//! then a draw; temperature `<= 0` takes the best candidate after the penalties.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
