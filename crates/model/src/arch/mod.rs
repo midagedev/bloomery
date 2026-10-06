@@ -345,6 +345,11 @@ pub(crate) mod synthetic {
         F32,
         /// Blocks of 32 values in 34 bytes; the first dim a multiple of 32.
         Q8_0,
+        /// Blocks of 256 values in 210 bytes; any first dim (a partial final
+        /// block is a header-only fixture's).
+        Q6K,
+        /// Blocks of 256 values in 144 bytes; any first dim.
+        Q4K,
     }
 
     impl Ty {
@@ -356,6 +361,8 @@ pub(crate) mod synthetic {
                     assert!(n.is_multiple_of(32), "{n} values are not whole Q8_0 blocks");
                     (8, n / 32 * 34)
                 }
+                Ty::Q6K => (14, n.div_ceil(256) * 210),
+                Ty::Q4K => (12, n.div_ceil(256) * 144),
             }
         }
     }
