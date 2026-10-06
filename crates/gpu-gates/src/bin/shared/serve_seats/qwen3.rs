@@ -1,6 +1,6 @@
 //! `bloomery-serve --model qwen3` — the llama-server-compatible HTTP API on
 //! the single-card Qwen engines: a qwen3moe file (Qwen3-30B-A3B) or a
-//! qwen35moe file (Qwen3.6-35B-A3B), the whole model on device 0, under
+//! qwen35moe file (Qwen3.6-35B-A3B), the whole model on one card, under
 //! `--place` placed by its plan on the card the word names with the routed
 //! experts the card's budget does not hold on the host tier.
 //!
@@ -43,11 +43,12 @@
 //! eager passes of up to eight ids (`app::Prompt for Body` takes passes at
 //! every length on a placed load), no pass captured.
 //!
-//! With `--place` unset the model opens as `generate_qwen3moe` opens it:
-//! the whole file on device 0 while the whole-fit verdict takes it (one
-//! stderr line with its terms), else the placed plan on `a`'s card, its
-//! `plan` record naming why (`whole_does_not_fit`). Each `--ctx` search
-//! prints one line more: its probes and the census readings it took.
+//! With `--place` unset the model opens as `generate_qwen3moe` opens it,
+//! on `a`'s card, the largest visible card: the whole file while the
+//! whole-fit verdict there takes it (one stderr line with its terms), else
+//! the placed plan on that card, its `plan` record naming why
+//! (`whole_does_not_fit`). Each `--ctx` search prints one line more: its
+//! probes and the census readings it took.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds:
 //! the session over the model answers the server's keep queries and cuts
@@ -134,6 +135,7 @@ use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
 use model::placement::PlanLevers;
+use model::placement::workstation::CardSpec;
 use runtime::Target as _;
 use serve::{
     CacheNote, EngineProps, FATAL_LINGER, Saved, ServeError, Server, ServerConfig, SlotConfig,
@@ -442,7 +444,7 @@ impl Body3 for Body {
     const ONE_PASS: bool = true;
 
     /// As `load` decided before the open, making no fit call of its own: the
-    /// whole model on device 0, or the placed plan made at the total, its
+    /// whole model on its card, or the placed plan made at the total, its
     /// load holding a sequence of `ctx` rows for each of `slots`
     /// (`q3place::open_qwen3_slots`).
     fn open(
@@ -455,7 +457,11 @@ impl Body3 for Body {
     ) -> Result<Qwen3moeModel, GateError> {
         let opts = Qwen3moeModel::lever_opts(ctx, kv)?;
         match load {
-            Q3Load::Whole => Ok(Qwen3moeModel::open(Gpu::new()?, file, opts)?),
+            Q3Load::Whole(card) => Ok(Qwen3moeModel::open(
+                Gpu::open_card(card.name, card.device)?,
+                file,
+                opts,
+            )?),
             Q3Load::Placed { q, total, why } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, why).eprint();
@@ -519,7 +525,7 @@ impl Body3 for Body35 {
     const ONE_PASS: bool = true;
 
     /// As `load` decided before the open, making no fit call of its own: the
-    /// whole model on device 0, or the placed plan made at the total, its
+    /// whole model on its card, or the placed plan made at the total, its
     /// machine carrying the sequences' rows, its load holding a sequence of
     /// `ctx` rows for each of `slots` (`q3place::open_qwen35_slots`).
     fn open(
@@ -532,7 +538,9 @@ impl Body3 for Body35 {
     ) -> Result<Qwen35moeModel, GateError> {
         let o = open35(ctx, kv)?;
         let mut m = match load {
-            Q3Load::Whole => Qwen35moeModel::open(Gpu::new()?, file, o)?,
+            Q3Load::Whole(card) => {
+                Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
+            }
             Q3Load::Placed { q, total, why } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, why).eprint();
@@ -791,9 +799,9 @@ impl<B: Body3> Seat for Q3<B> {
 /// carried into it ([`Body3::open`]), so the open makes no fit call of its
 /// own ([`decide`]).
 enum Q3Load {
-    /// The whole model on device 0: `--place` unset, and the whole-fit
-    /// verdict at the total takes the whole load.
-    Whole,
+    /// The whole model on this card, `a`'s: `--place` unset, and the
+    /// whole-fit verdict at the total on it takes the whole load.
+    Whole(CardSpec),
     /// The placed plan made at `total` positions on `q`'s card: `--place`'s
     /// (no `why`), or `a`'s card's when the whole load does not fit at the
     /// total (`why` names that, `q3place::WHY_NOT_WHOLE`).
@@ -808,7 +816,7 @@ enum Q3Load {
 /// resident sequences ([`Q3Load`]): `--place`'s plan on its card, else the
 /// whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`,
 /// `q3place::unplaced_qwen35_slots`, its line on stderr) — the whole model on
-/// device 0, or the placed plan on `a`'s card. A qwen35moe file's plans carry
+/// `a`'s card, or the placed plan on it. A qwen35moe file's plans carry
 /// its sequences' rows ([`seqs35`]) and their arena is a slot's load's
 /// (`q3place::share`). Made at the total, never at a slot's share: a card
 /// whose whole load fits a slot's rows and not the total's would open whole,
@@ -846,7 +854,7 @@ fn decide(
         (_, None) => q3place::unplaced_qwen3_slots(split, total, parallel, kv)?,
     };
     Ok(match unplaced {
-        q3place::Unplaced::Whole => Q3Load::Whole,
+        q3place::Unplaced::Whole(card) => Q3Load::Whole(card),
         q3place::Unplaced::Placed(q) => Q3Load::Placed {
             q,
             total,
@@ -944,7 +952,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let open = path.clone();
-    let device = a.place.map_or("device 0", Place::name).to_owned();
+    let device = match &load {
+        Q3Load::Whole(card) => card.name,
+        Q3Load::Placed { q, .. } => q.name(),
+    }
+    .to_owned();
     let parallel = a.parallel;
     let engine = match arch {
         Arch::Qwen3moe => SeatEngine::spawn(

@@ -2487,7 +2487,7 @@ mod gate {
         };
         let whole = matches!(
             q3place::unplaced_qwen35(&file, &o)?,
-            q3place::Unplaced::Whole
+            q3place::Unplaced::Whole(_)
         );
         println!("memguard quiet: whole decision {whole} {}", verdict(whole));
         let gpu = bloomery_gpu::Gpu::new()?;
@@ -2516,7 +2516,7 @@ mod gate {
         drop(gpu);
         let whole_again = matches!(
             q3place::unplaced_qwen35(&file, &o)?,
-            q3place::Unplaced::Whole
+            q3place::Unplaced::Whole(_)
         );
         println!(
             "memguard released: whole decision {whole_again} {}",
