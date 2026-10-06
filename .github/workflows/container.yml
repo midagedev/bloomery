@@ -1,4 +1,4 @@
-# Images the release: on a v* tag push (or a manual run naming one), downloads that
+# Images the release: on a v* tag push (or a manual run naming one), waits for and downloads that
 # release's own tarball and .sha256 and builds tools/release/Dockerfile around them,
 # so the image's bytes are the release's bytes, checked. The first publish creates
 # the package private; make it public once in its package settings.
@@ -26,7 +26,7 @@ jobs:
   build-and-publish:
     name: Build and publish
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -48,7 +48,13 @@ jobs:
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           v="${tag#v}"
           base="https://github.com/${{ github.repository }}/releases/download/${tag}"
-          curl -fsSL "$base/bloomery-${v}-linux-x86_64-cuda-sm86.tar.gz.sha256" -o rel.sha256
+          # The tag is pushed before publish.sh uploads the assets: wait for them.
+          for i in $(seq 1 80); do
+            curl -fsSL "$base/bloomery-${v}-linux-x86_64-cuda-sm86.tar.gz.sha256" -o rel.sha256 && break
+            echo "the release's .sha256 is not up yet (try $i of 80)"
+            sleep 30
+          done
+          [ -s rel.sha256 ] || { echo "the release's .sha256 never appeared at $base" >&2; exit 1; }
           sha=$(awk '{print $1}' rel.sha256)
           [ "${#sha}" = 64 ] || { echo "no digest in the release's .sha256" >&2; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
