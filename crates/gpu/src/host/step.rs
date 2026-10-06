@@ -642,9 +642,10 @@ pub struct StepPort {
     /// The routed ids each service sees, for the residency rule
     /// ([`super::swap::Tally`]); off without a residency machine.
     pub(super) tally: super::swap::Tally,
-    /// The residency machine's staging window, held open while the pool
-    /// waits for a go; `None` without a machine.
-    pub(super) window: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// The residency machine's staging window, closed only while a service
+    /// computes, from its go's landing to its signal ([`Closed`]); `None`
+    /// without a machine.
+    pub(super) window: Option<Arc<AtomicU32>>,
     /// Each service's wait for its go, from the host's start of the wait to
     /// the go seen (ns): the card's time between the host's last signal and
     /// this layer's go. A ring of [`GAP_RING`] made at load; `stats.gaps`
@@ -876,14 +877,9 @@ impl StepPort {
         let generation = word(&self.boundary.page, Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
-        if let Some(w) = &self.window {
-            w.store(1, Ordering::Release);
-        }
         let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
         let gap = nanos(entered.elapsed());
-        if let Some(w) = &self.window {
-            w.store(0, Ordering::Release);
-        }
+        let closed = Closed::close(self.window.as_ref());
         self.gaps[(self.stats.gaps % GAP_RING as u64) as usize] = gap;
         self.stats.gaps += 1;
         if early {
@@ -936,21 +932,24 @@ impl StepPort {
             hsum_off,
             t0,
             parks,
+            closed,
         })
     }
 
     /// The service of `go` is done: one added to the row's counter, the
-    /// sequence moved on, the service's time and parks counted.
-    fn signal(&mut self, row: usize, go: &Go) {
+    /// staging window open again, the sequence moved on, the service's time
+    /// and parks counted.
+    fn signal(&mut self, row: usize, go: Go) {
         word(&self.boundary.page, Word::Cnt(row)).fetch_add(1, Ordering::Release);
+        let Go {
+            t0, parks, closed, ..
+        } = go;
+        drop(closed);
         self.served = self.served.wrapping_add(1);
         let s = &mut self.stats;
         s.served += 1;
-        s.leg_ns += nanos(go.t0.elapsed());
-        s.parks_in_service += threads::pool()
-            .stats()
-            .worker_parks
-            .saturating_sub(go.parks);
+        s.leg_ns += nanos(t0.elapsed());
+        s.parks_in_service += threads::pool().stats().worker_parks.saturating_sub(parks);
     }
 
     /// Serve layer `layer` of row `row` in `chain` with `experts`, recording
@@ -1050,7 +1049,7 @@ impl StepPort {
             }
             None => false,
         };
-        self.signal(row, &go);
+        self.signal(row, go);
         if whole && let Some(t) = self.trace.as_mut() {
             t.write_row()?;
         }
@@ -1168,7 +1167,7 @@ impl StepPort {
         self.stats.host_calls += 1;
         self.slices = reuse_slices(lists);
         r?;
-        self.signal(0, &go);
+        self.signal(0, go);
         let s = &mut self.stats;
         s.host_slots += host_slots;
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
@@ -1220,13 +1219,41 @@ impl StepPort {
 }
 
 /// A go a service took ([`StepPort::take_go`]): the row's image and sum
-/// offsets in the page, the service's start and the pool's parks at its
-/// wait.
+/// offsets in the page, the service's start, the pool's parks at its wait,
+/// and the staging window closed for its compute.
 struct Go {
     image_off: usize,
     hsum_off: usize,
     t0: Instant,
     parks: u64,
+    closed: Closed,
+}
+
+/// The residency machine's staging window ([`StepPort::window`]) closed for
+/// one service's compute: the staging thread's DRAM copies stay out of the
+/// layer's host experts. Its drop opens the window again — at the signal,
+/// or when the service fails or unwinds before it — so the window is closed
+/// only while host code that waits on nothing of the card runs, and the
+/// staging thread never waits on a later launch
+/// ([`super::swap`]'s "No cycle through the card").
+struct Closed(Option<Arc<AtomicU32>>);
+
+impl Closed {
+    /// Close `window`, if there is one, until the guard drops.
+    fn close(window: Option<&Arc<AtomicU32>>) -> Closed {
+        if let Some(w) = window {
+            w.store(0, Ordering::Release);
+        }
+        Closed(window.cloned())
+    }
+}
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        if let Some(w) = &self.0 {
+            w.store(1, Ordering::Release);
+        }
+    }
 }
 
 /// `v`'s storage as an empty `Vec` of slices of another lifetime: the
@@ -1273,10 +1300,37 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape, CHAINS, Chain, GapSummary, gap_span};
+    use super::{Boundary, BoundaryShape, CHAINS, Chain, Closed, GapSummary, gap_span};
     use cuda_core::CudaContext;
     use model::ops::DEFER_MAX_COLS;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The staging window is closed while a service's guard lives and open
+    /// again however the service ends — its signal's drop, an error return,
+    /// an unwind — so the staging thread never waits past one service.
+    #[test]
+    fn a_closed_window_opens_however_the_service_ends() {
+        let w = Arc::new(AtomicU32::new(1));
+        let open = || w.load(Ordering::Acquire);
+        let closed = Closed::close(Some(&w));
+        assert_eq!(open(), 0);
+        drop(closed);
+        assert_eq!(open(), 1);
+        let failed = || -> Result<(), &'static str> {
+            let _closed = Closed::close(Some(&w));
+            Err("a refused service")
+        };
+        assert!(failed().is_err());
+        assert_eq!(open(), 1);
+        let unwound = std::panic::catch_unwind(|| {
+            let _closed = Closed::close(Some(&w));
+            panic!("a host expert panics");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(open(), 1);
+        drop(Closed::close(None));
+    }
 
     /// A span of go waits: least, lower median and most over the span, the
     /// ring's wrap followed; an empty span is zero; a span past the waits

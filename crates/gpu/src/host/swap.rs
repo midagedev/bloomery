@@ -33,7 +33,8 @@
 //! step ([`SwapSource::convert`]), a word back to the staging thread, and the
 //! flip's event; the staging thread prepares the victim for the host
 //! ([`SwapSource::prepare_victim`]), then copies the source bytes into the
-//! ring, gated to the host leg's wait window ([`SwapMachine::window`]).
+//! ring, gated to the staging window ([`SwapMachine::window`]), which a step
+//! service closes only while it computes a layer's host experts.
 //!
 //! **Boundaries.** [`SwapMachine::boundary`] runs before each pass's launch,
 //! in this order: the jobs of the flips live here are made due, and the host
@@ -67,12 +68,30 @@
 //! readback or ahead of it. Every host wait the machine
 //! makes — for a landing job, for a ring slot's last copy, for the copy
 //! stream at a reset or a drop — ends by [`MachineCfg::deadline`] with a
-//! named error; only a job not yet due waits for the window as long as the
-//! window stays closed, and with it its copy and any context synchronize or
-//! card free behind that copy: the machine's owner drops it before it frees
-//! anything ([`crate::host::HostTier::stop_swap`]), and the drop releases
-//! every such copy. A panic on the staging thread is a staging failure of its
-//! job, published like any other.
+//! named error; only a job not yet due waits for the window, and with it its
+//! copy and any context synchronize or card free behind that copy: the
+//! machine's owner drops it before it frees anything
+//! ([`crate::host::HostTier::stop_swap`]), and the drop releases every such
+//! copy. A panic on the staging thread is a staging failure of its job,
+//! published like any other.
+//!
+//! **No cycle through the card.** The copy stream's wait for a staging word
+//! is a stream memory op, an order the driver's scheduler does not see: a
+//! driver may run every stream of the context on one hardware queue (WDDM
+//! under WSL2, or `CUDA_DEVICE_MAX_CONNECTIONS=1`), and then everything
+//! enqueued on any stream after that wait — the engine stream's next launch,
+//! its readback — waits for the word too. So the staging thread raises every
+//! word without waiting on anything the card runs after it. A job stages
+//! once its ring slot's previous copy has drained, which sits ahead of its
+//! wait on the copy stream, and once it is open: the window open, the job
+//! due, or a flush. Due and flush are raised by host waits that need nothing
+//! of the card ([`SwapMachine::boundary`], [`SwapMachine::begin_call`], a
+//! reset's drain); the window is closed only from a step service's go
+//! landing to its signal, or its failure (`host::step`'s `Closed`), while
+//! host code runs that waits on nothing of the card, and a prompt's batch
+//! walk never closes it. Each word is therefore raised in bounded time
+//! whatever the card does after it, and one hardware queue only serializes
+//! the streams; it cannot close a cycle.
 //!
 //! **Broken.** An error after a call's first change — a boundary's first
 //! engine stream wait, `end_pass`'s first fold into the rule, a reset's first
@@ -801,8 +820,8 @@ fn micros(t0: Instant) -> u64 {
 /// worker. The copies are DRAM streams that sweep a ring slot's worth of L3,
 /// so not beside the dispatcher (the critical path, whose sibling the engram
 /// helper takes): the first worker's core sits on another CCD than the
-/// dispatcher's. The copies run while the pool waits for its go, so that
-/// worker only spins beside them. With no pinned pool, floating.
+/// dispatcher's. The copies run while no step service computes, so that
+/// worker only spins or idles beside them. With no pinned pool, floating.
 fn staging_placement() -> threads::helper::Placement {
     match threads::built().and_then(|p| p.worker_cpu(0)) {
         Some(c) => threads::helper::Placement::Sibling(c),
@@ -1039,7 +1058,10 @@ struct Shared {
     /// expert, or once its failure is recorded) at `2k`, `drained` (the copy
     /// stream's ticket once it has read the slot) at `2k + 1`.
     words: MappedHost,
-    /// The host leg's wait window: staging runs while it is nonzero.
+    /// The staging window: staging runs while it is nonzero. A step service
+    /// zeroes it from its go's landing to its signal (`host::step`'s
+    /// `Closed`), so the staging copies stay out of a layer's host experts;
+    /// at every other moment it is open.
     window: Arc<AtomicU32>,
     /// Jobs below this are due: their flips land at a boundary the host has
     /// reached, so they stage whatever the window says.
@@ -1161,11 +1183,11 @@ impl Shared {
                 || self.flush.load(Ordering::Acquire)
                 || job.n < self.due.load(Ordering::Acquire)
         };
-        // No deadline: a job not yet due is idle while no pass runs (a
-        // server between requests). What ends the wait: the step port's
-        // window, a boundary landing the job (`due`), a reset's flush
-        // (`drain_copies`, first thing in `reset`), and the drop's `stop`,
-        // which `wait_until` reads on every turn.
+        // No deadline: the window is closed only while a step service
+        // computes one layer. What ends the wait: the window opening, a
+        // boundary landing the job (`due`), a reset's flush (`drain_copies`,
+        // first thing in `reset`), and the drop's `stop`, which `wait_until`
+        // reads on every turn.
         if self.wait_until(open, None) != Ok(true) {
             return Ok(false);
         }
@@ -1895,10 +1917,10 @@ impl SwapMachine {
         }
     }
 
-    /// The host leg's wait window word: the staging thread copies while it
-    /// is nonzero. The step port holds it open while its pool waits for a
-    /// go, so the staging memcpy does not take DRAM from the host leg; a
-    /// machine nobody gates leaves it at 1.
+    /// The staging window word: the staging thread copies while it is
+    /// nonzero. The step port closes it only while a service computes a
+    /// layer's host experts, so the staging memcpy does not take DRAM from
+    /// them; a machine nobody gates leaves it at 1.
     #[must_use]
     pub fn window(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.shared.window)
@@ -2486,8 +2508,8 @@ impl SwapMachine {
             ));
         }
         // Every copy waits on the copy stream for its staging. Behind a
-        // closed window, with no flush, a job stages only once its flip is
-        // due, which a later boundary of this host thread makes; so this
+        // window held closed, with no flush, a job stages only once its flip
+        // is due, which a later boundary of this host thread makes; so this
         // thread must never enqueue so much behind unstaged jobs that the
         // stream's queue fills and the enqueue blocks. A boundary issues at
         // most the flips the rule keeps in flight (one event each); a reset
