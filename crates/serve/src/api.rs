@@ -979,12 +979,6 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         repeat_last_n,
         seed,
     };
-    if sampling.temperature <= 0.0 && sampling.penalizes() {
-        return Err(invalid(
-            "repeat_penalty, frequency_penalty and presence_penalty need temperature > 0 \
-             on this server: a greedy request takes the engine's argmax",
-        ));
-    }
     let p = GenParams {
         n_predict: if n_predict < 0 { -1 } else { n_predict },
         sampling,

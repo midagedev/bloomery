@@ -27,19 +27,26 @@
 //! verifies a proposal after `last`, the mock's own next token on two passes of
 //! three and another id on the third, and keeps what the target agrees with.
 //! [`DraftMock::with_slots`] serves several slots, the pass count — the state
-//! its draft keeps — one a slot.
+//! its draft keeps — one a slot. It drafts sampled requests too
+//! ([`Engine::advance_sampled`], unless [`DraftMock::without_sampled`]): a
+//! pass proposes its ids ([`DraftMock::with_sampled_draft`]: how many, and the
+//! share of them that are the target's argmax at their row, the rest another
+//! id), evaluates `last` and every proposal, reads every row, lets the sampler
+//! take ids row by row until one differs from the proposal, and takes the rest
+//! back with a `cut`. Its rows read the whole context, so a wrong commit
+//! changes every later row.
 //!
 //! Its saved state is its context: [`MOCK_STATE`], a u32 version, a u64 count
 //! and the ids, little-endian.
 
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::engine::{
-    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, ResidencyReset, SavedState,
-    StateError, Tokenizer,
+    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Sampler,
+    SavedState, StateError, Tokenizer,
 };
 use crate::slotfile;
 
@@ -414,15 +421,46 @@ pub struct DraftMock {
     inner: MockEngine,
     /// One pass counter a slot, the selected one's read by each pass.
     passes: Vec<usize>,
+    /// [`Engine::drafts_sampled`].
+    sampled: bool,
+    /// The ids a sampled pass proposes.
+    n_draft: usize,
+    /// Of every `of` proposals of a slot's sampled passes, the first `agree`
+    /// are the target's argmax at their row, the rest another id.
+    agree: usize,
+    of: usize,
+    /// One count of sampled proposals a slot.
+    proposals: Vec<usize>,
+    /// Every step and pass the server asked for, in order, when
+    /// [`DraftMock::logged`].
+    log: Option<Arc<Mutex<Vec<MockCall>>>>,
+}
+
+/// A step or pass a [`DraftMock`] was asked for ([`DraftMock::logged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockCall {
+    /// [`Engine::next`].
+    Next,
+    /// [`Engine::advance`].
+    Advance,
+    /// [`Engine::advance_sampled`].
+    Sampled,
 }
 
 impl DraftMock {
-    /// A drafting mock with room for `ctx_max` positions.
+    /// A drafting mock with room for `ctx_max` positions. It drafts sampled
+    /// requests, one id a pass, two proposals of three the target's argmax.
     #[must_use]
     pub fn new(ctx_max: usize) -> Self {
         DraftMock {
             inner: MockEngine::new(ctx_max),
             passes: vec![0],
+            sampled: true,
+            n_draft: 1,
+            agree: 2,
+            of: 3,
+            proposals: vec![0],
+            log: None,
         }
     }
 
@@ -438,7 +476,110 @@ impl DraftMock {
         DraftMock {
             inner: self.inner.with_slots(n),
             passes: vec![0; n],
+            proposals: vec![0; n],
+            ..self
         }
+    }
+
+    /// The same drafting mock declining sampled requests: they step.
+    #[must_use]
+    pub fn without_sampled(self) -> Self {
+        DraftMock {
+            sampled: false,
+            ..self
+        }
+    }
+
+    /// The same drafting mock whose sampled passes propose `n` ids, `agree`
+    /// of every `of` of them the target's argmax at their row.
+    ///
+    /// # Panics
+    ///
+    /// When `n` or `of` is 0, or `agree` is past `of`.
+    #[must_use]
+    pub fn with_sampled_draft(self, n: usize, agree: usize, of: usize) -> Self {
+        assert!(
+            n > 0 && of > 0 && agree <= of,
+            "a sampled draft of {n} ids agreeing {agree} of {of}"
+        );
+        DraftMock {
+            n_draft: n,
+            agree,
+            of,
+            ..self
+        }
+    }
+
+    /// The same drafting mock writing every step and pass it is asked for
+    /// into `log`.
+    #[must_use]
+    pub fn logged(self, log: Arc<Mutex<Vec<MockCall>>>) -> Self {
+        DraftMock {
+            log: Some(log),
+            ..self
+        }
+    }
+
+    fn record(&self, call: MockCall) {
+        if let Some(log) = &self.log {
+            log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(call);
+        }
+    }
+
+    /// The sampled pass ([`Engine::advance_sampled`]'s rule): the proposals
+    /// and the verify of `last` and each, every row read; the sampler's ids
+    /// row by row, `history` holding this pass's ids too while it draws; the
+    /// rows past the last kept id taken back.
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut Sampler,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, EngineError> {
+        if !self.sampled {
+            return Err(EngineError(
+                "mock: this draft does not draft a sampled request".to_owned(),
+            ));
+        }
+        let slot = self.inner.cur;
+        let at = self.inner.ctx.len();
+        let n_vocab = MockTokenizer.n_vocab();
+        let vocab = u32::try_from(n_vocab).expect("the mock's vocabulary fits u32");
+        let mut rows = vec![0.0f32; (self.n_draft + 1) * n_vocab];
+        let mut draft = Vec::with_capacity(self.n_draft);
+        let mut fed = last;
+        for (i, row) in rows.chunks_exact_mut(n_vocab).enumerate() {
+            let argmax = self.inner.next(fed, Some(row))?;
+            if i == self.n_draft {
+                break;
+            }
+            let p = self.proposals[slot];
+            self.proposals[slot] += 1;
+            fed = if p % self.of < self.agree {
+                argmax
+            } else {
+                (argmax + 1) % vocab
+            };
+            draft.push(fed);
+        }
+        let n = history.len();
+        for (i, row) in rows.chunks_exact(n_vocab).enumerate() {
+            let id = sampler(row, history);
+            history.push(id);
+            out.push(id);
+            if draft.get(i) != Some(&id) {
+                break;
+            }
+        }
+        history.truncate(n);
+        self.inner.cut(at + out.len())?;
+        Ok(Drafted {
+            proposed: self.n_draft,
+            accepted: out.len() - 1,
+        })
     }
 }
 
@@ -452,6 +593,7 @@ impl Engine for DraftMock {
     }
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.record(MockCall::Next);
         self.inner.next(last, logits_out)
     }
 
@@ -459,6 +601,7 @@ impl Engine for DraftMock {
     /// 1 on it, and both rows' argmax are kept. The selected slot's pass
     /// counter decides the proposal, so a slot's passes are its own.
     fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.record(MockCall::Advance);
         let slot = self.inner.cur;
         self.passes[slot] += 1;
         let first = self.inner.next(last, None)?;
@@ -483,8 +626,26 @@ impl Engine for DraftMock {
         })
     }
 
+    /// The greedy pass's two rows, or a sampled pass's `last` and its
+    /// proposals when they are more.
     fn advance_rows(&self) -> usize {
-        2
+        2.max(self.n_draft + 1)
+    }
+
+    fn advance_sampled(
+        &mut self,
+        last: u32,
+        mut history: Vec<u32>,
+        mut sampler: Sampler,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
+        self.record(MockCall::Sampled);
+        let d = self.pass_sampled(last, &mut history, &mut sampler, out);
+        (d, history, sampler)
+    }
+
+    fn drafts_sampled(&self) -> bool {
+        self.sampled
     }
 
     fn slots(&self) -> usize {
@@ -523,7 +684,7 @@ impl Engine for DraftMock {
         EngineProps {
             draft: Some(DraftProps {
                 model: "mock".to_owned(),
-                n_max: Some(1),
+                n_max: u64::try_from(self.n_draft).ok(),
                 kind: Some("mock".to_owned()),
                 ..DraftProps::default()
             }),

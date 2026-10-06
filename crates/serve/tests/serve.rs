@@ -2785,7 +2785,7 @@ fn served_ids(addr: std::net::SocketAddr, body: &Value) -> (Vec<u64>, Value) {
 #[ignore = "gate: just gate-serve"]
 fn hw_a_draft_serves_what_needs_the_logits() {
     let plain = start(4096);
-    let drafted = common::start_with(Box::new(serve::DraftMock::new(4096)));
+    let drafted = common::start_with(Box::new(serve::DraftMock::new(4096).without_sampled()));
     // `a` has four followers here, so a sampler at T = 1.5 branches; min_p
     // 0.01 keeps only those followers (the rest sit 12 logits down).
     let prompt = "abacadaeabacada";

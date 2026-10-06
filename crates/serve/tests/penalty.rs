@@ -88,11 +88,6 @@ fn hw_bad_penalties_are_named_400s() {
         (json!({"repeat_last_n": 2_147_483_648_i64}), "repeat_last_n"),
         (json!({"repeat_last_n": 2.5}), "repeat_last_n"),
         (json!({"repeat_last_n": "64"}), "repeat_last_n"),
-        // A greedy request takes the engine's argmax, which no penalty reaches.
-        (
-            json!({"temperature": 0, "presence_penalty": 1.5}),
-            "presence_penalty",
-        ),
         (json!({"logit_bias": [[7, 1.0]]}), "logit_bias"),
         (json!({"logit_bias": {"7": false}}), "logit_bias"),
     ];
@@ -109,6 +104,7 @@ fn hw_bad_penalties_are_named_400s() {
     let passed = [
         json!({"logit_bias": []}),
         json!({"logit_bias": {}}),
+        json!({"temperature": 0, "presence_penalty": 1.5}),
         json!({"temperature": 0, "presence_penalty": 1.5, "repeat_last_n": 0}),
         json!({"temperature": 0, "presence_penalty": 0, "repeat_penalty": 1}),
     ];
@@ -147,6 +143,14 @@ fn hw_presence_penalty_changes_the_sampled_ids() {
     assert_ne!(
         penalized, plain,
         "presence 20 takes the echoed id below the mock's floor"
+    );
+    // A greedy request takes the argmax after the penalties, as llama-server's
+    // chain does: top_k 1's draw.
+    assert_eq!(ids(json!({"temperature": 0.0})), plain, "greedy, neutral");
+    assert_eq!(
+        ids(json!({"temperature": 0.0, "presence_penalty": 20.0})),
+        penalized,
+        "greedy, presence 20"
     );
     println!("presence: {plain} neutral, {penalized} at 20");
 }

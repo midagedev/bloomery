@@ -169,3 +169,27 @@ pub fn assert_keys(obj: &Value, section: &str) {
         assert!(obj.get(&k).is_some(), "{section}: missing `{k}` in {obj}");
     }
 }
+
+/// Starts a server of `parallel` slots on `engine`, the V4.1 template and the
+/// sampler factory `sampler`.
+pub fn start_sampling(
+    engine: Box<dyn Engine>,
+    parallel: usize,
+    sampler: serve::SamplerFactory,
+) -> SocketAddr {
+    let config = ServerConfig {
+        model_alias: "mock".to_owned(),
+        model_path: "mock.gguf".to_owned(),
+        chat_template: V41_TEMPLATE.to_owned(),
+        sampler: Some(sampler),
+        fatal_linger: FATAL_LINGER,
+        slot_save_path: None,
+    };
+    let slots = serve::SlotConfig {
+        parallel,
+        ..serve::SlotConfig::default()
+    };
+    let server = Server::bind_with("127.0.0.1:0", engine, config, slots)
+        .unwrap_or_else(|e| panic!("bind: {e}"));
+    server.spawn().expect("spawn")
+}

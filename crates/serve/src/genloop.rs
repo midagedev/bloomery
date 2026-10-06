@@ -19,8 +19,13 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept. A request that samples or bans an id reads the logits row every
-//! token, which a pass does not give, so on the same engine it takes one
+//! and kept. A request that samples takes its passes through
+//! [`Engine::advance_sampled`] on an engine that drafts sampled requests
+//! ([`Engine::drafts_sampled`]), its sampler drawing each kept id from the
+//! verified rows, and only while its slot runs alone in the round: beside
+//! another busy slot, a pass's rows are not pinned to a step's, so it steps.
+//! A request that bans an id, or samples on another drafting engine, reads the
+//! logits row every token, which a pass does not give, so it takes one
 //! [`Engine::next`] a token and carries no draft counts.
 //!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
@@ -237,6 +242,14 @@ fn choose(
         None if banned.contains(&greedy) => sampling::argmax(logits),
         None => greedy,
     }
+}
+
+/// Whether a request takes its tokens after the first through the engine's
+/// passes when the engine drafts: one that bans no id, greedy
+/// ([`Engine::advance`]) or sampling on an engine that drafts sampled
+/// requests ([`Engine::advance_sampled`]).
+fn takes_passes(sampler: Option<&Sampler>, banned: &[u32], engine: &dyn Engine) -> bool {
+    banned.is_empty() && (sampler.is_none() || engine.drafts_sampled())
 }
 
 /// The engine and its slots: the ids each slot's cache holds, one per
@@ -740,6 +753,56 @@ impl Slot {
         let held = std::mem::take(&mut self.held);
         out.clear();
         let d = self.engine.advance(last, out)?;
+        self.check_pass(out, d)?;
+        self.held = held;
+        self.held.push(last);
+        self.held.extend_from_slice(&out[..out.len() - 1]);
+        Ok(d)
+    }
+
+    /// [`Engine::advance_sampled`] that books what it fed and checks what it
+    /// kept as [`Slot::advance`] does. The engine is lent a copy of
+    /// `history` in `lent` (kept for its capacity), which must come back
+    /// equal to it, else the engine's error; `sampler` comes back whatever
+    /// the outcome.
+    pub(crate) fn advance_sampled(
+        &mut self,
+        last: u32,
+        history: &[u32],
+        lent: &mut Vec<u32>,
+        sampler: Sampler,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Sampler) {
+        let held = std::mem::take(&mut self.held);
+        out.clear();
+        lent.clear();
+        lent.extend_from_slice(history);
+        let (d, back, sampler) =
+            self.engine
+                .advance_sampled(last, std::mem::take(lent), sampler, out);
+        let d = d.and_then(|d| {
+            self.check_pass(out, d)?;
+            if back != history {
+                return Err(EngineError(format!(
+                    "a sampled pass was lent a history of {} ids and handed back another of {}",
+                    history.len(),
+                    back.len()
+                )));
+            }
+            Ok(d)
+        });
+        *lent = back;
+        if d.is_ok() {
+            self.held = held;
+            self.held.push(last);
+            self.held.extend_from_slice(&out[..out.len() - 1]);
+        }
+        (d, sampler)
+    }
+
+    /// A pass that kept no token, more than the engine's rows, or other than
+    /// one more than its draft's accepted ids is the engine's error.
+    fn check_pass(&self, out: &[u32], d: Drafted) -> Result<(), EngineError> {
         let rows = self.engine.advance_rows();
         if out.is_empty()
             || out.len() > rows
@@ -753,10 +816,7 @@ impl Slot {
                 d.proposed
             )));
         }
-        self.held = held;
-        self.held.push(last);
-        self.held.extend_from_slice(&out[..out.len() - 1]);
-        Ok(d)
+        Ok(())
     }
 
     /// Writes the slot to `path` ([`slotfile`]'s layout): the file is written
@@ -938,6 +998,10 @@ pub(crate) enum Need {
     /// One drafted pass from this id ([`Engine::advance`] into
     /// [`Gen::kept_mut`]), whose count goes to [`Gen::advanced`].
     Advance(u32),
+    /// One drafted pass of a request that samples from this id
+    /// ([`Gen::advance_sampled`]) when its slot is the round's only busy
+    /// one; beside another, a [`Need::Step`] from it.
+    Sampled(u32),
     /// Nothing more: [`Gen::finish`] ends it.
     Done,
 }
@@ -1011,11 +1075,15 @@ pub(crate) struct Gen {
     stop: StopKind,
     stopping_word: String,
     truncated: bool,
-    /// A pass's rows; 1 steps. Only a greedy request with no banned id passes.
+    /// A pass's rows; 1 steps. A request with no banned id passes when it is
+    /// greedy, or samples on an engine that drafts sampled requests.
     rows: usize,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
+    /// The copy of the generated ids a sampled pass lends the engine
+    /// ([`Slot::advance_sampled`]), kept for its capacity.
+    lent: Vec<u32>,
     /// The token the loop takes next; `None` once there is none.
     tok: Option<u32>,
     /// The think-span budget, `None` on a request without one (or whose prompt
@@ -1027,7 +1095,10 @@ impl Gen {
     /// A generation of `p` for a prompt of `n` ids on `slot`'s engine; nothing
     /// runs yet.
     pub(crate) fn new(slot: &Slot, factory: &SamplerFactory, n: usize, p: &GenParams) -> Gen {
-        let sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
+        // A penalized request at temperature 0 takes the sampler's argmax after
+        // the penalties, as llama-server's chain does; only an unpenalized one is greedy.
+        let sampler =
+            (p.sampling.temperature > 0.0 || p.sampling.penalizes()).then(|| factory(&p.sampling));
         let stops = slot.vocab.stops();
         let banned = if p.ignore_eos {
             stops.clone()
@@ -1043,7 +1114,7 @@ impl Gen {
                 0
             }
         ];
-        let rows = if sampler.is_none() && banned.is_empty() {
+        let rows = if takes_passes(sampler.as_ref(), &banned, slot.engine.as_ref()) {
             slot.engine.advance_rows()
         } else {
             1
@@ -1067,6 +1138,7 @@ impl Gen {
             rows,
             kept: Vec::with_capacity(rows),
             taken: 0,
+            lent: Vec::new(),
             tok: None,
             think: p
                 .reasoning_budget
@@ -1170,9 +1242,9 @@ impl Gen {
         ids: &[u32],
         p: &GenParams,
     ) -> Result<Kept, GenError> {
-        // Only a greedy request with no banned id passes, and its first token is
-        // the prompt's step: the passes make at most the rest.
-        let passes = self.sampler.is_none() && self.banned.is_empty();
+        // A request that passes has its first token from the prompt's step:
+        // the passes make at most the rest.
+        let passes = takes_passes(self.sampler.as_ref(), &self.banned, slot.engine.as_ref());
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
             Ok(n) if passes => Some(n.saturating_sub(1)),
             Err(_) if passes => None,
@@ -1376,7 +1448,11 @@ impl Gen {
                 && self.think_left() >= self.rows
                 && n + len + self.rows - 1 <= self.ctx_max
             {
-                return Ok(Need::Advance(tok));
+                return Ok(if self.sampler.is_some() {
+                    Need::Sampled(tok)
+                } else {
+                    Need::Advance(tok)
+                });
             }
             return Ok(Need::Step(tok));
         }
@@ -1398,6 +1474,39 @@ impl Gen {
         self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
         self.tok = Some(self.kept[0]);
         self.taken = 1;
+    }
+
+    /// A [`Need::Sampled`] pass from `last` on the selected slot
+    /// ([`Slot::advance_sampled`]): the request's sampler goes to the engine
+    /// and comes back, so the next step or pass draws on from where this one
+    /// stopped, and the engine is lent the generated ids, the history a
+    /// step's draw is given ([`Gen::answer`]). Its tokens are then in hand as
+    /// an [`Engine::advance`] pass's, the loop adding each to the generated
+    /// ids as it takes it.
+    ///
+    /// # Panics
+    ///
+    /// When the request does not sample: [`Gen::pump`] asks for this pass
+    /// only of one that does.
+    pub(crate) fn advance_sampled(
+        &mut self,
+        slot: &mut Slot,
+        last: u32,
+    ) -> Result<(), EngineError> {
+        let sampler = self
+            .sampler
+            .take()
+            .expect("a sampled pass of a request that samples");
+        let (d, sampler) = slot.advance_sampled(
+            last,
+            &self.generated,
+            &mut self.lent,
+            sampler,
+            &mut self.kept,
+        );
+        self.sampler = Some(sampler);
+        self.advanced(d?);
+        Ok(())
     }
 
     /// The text still held, and the outcome.
@@ -1452,6 +1561,7 @@ impl Gen {
                     let d = slot.advance(t, &mut self.kept)?;
                     self.advanced(d);
                 }
+                Need::Sampled(t) => self.advance_sampled(slot, t)?,
             }
         }
     }
@@ -2318,5 +2428,112 @@ mod think_tests {
         let (fed, o) = run("x<think>yx", Some(0));
         assert_eq!(o.tokens, vec![4, CLOSE, MockTokenizer.eos()]);
         assert_eq!(fed, vec![X, 4, Y, X, 4, CLOSE]);
+    }
+}
+
+#[cfg(test)]
+mod sampled_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{GenParams, Slot, Timings, generate};
+    use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
+    use crate::mock::{DraftMock, MockTokenizer};
+    use crate::reasoning::ThinkEntry;
+    use crate::sampling;
+
+    /// [`DraftMock`] that logs what each request tells [`Engine::will_reply`].
+    struct Replies {
+        inner: DraftMock,
+        replies: Arc<Mutex<Vec<Option<usize>>>>,
+    }
+
+    impl Engine for Replies {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.inner.tokenizer()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.inner.prefill(ids)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            self.inner.next(last, out)
+        }
+        fn advance_rows(&self) -> usize {
+            self.inner.advance_rows()
+        }
+        fn advance_sampled(
+            &mut self,
+            last: u32,
+            history: Vec<u32>,
+            sampler: Sampler,
+            out: &mut Vec<u32>,
+        ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
+            self.inner.advance_sampled(last, history, sampler, out)
+        }
+        fn drafts_sampled(&self) -> bool {
+            self.inner.drafts_sampled()
+        }
+        fn will_reply(&mut self, tokens: Option<usize>) {
+            self.replies.lock().expect("the replies").push(tokens);
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.inner.reset()
+        }
+        fn keepable(&self, n: usize) -> usize {
+            self.inner.keepable(n)
+        }
+        fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+            self.inner.cut(n)
+        }
+        fn ctx_max(&self) -> usize {
+            self.inner.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    /// On an engine that drafts sampled requests, a sampled request tells it
+    /// the tokens after its first, as a greedy one does (the passes make at
+    /// most those); the same request banning the end of generation, which
+    /// steps, tells it none.
+    #[test]
+    fn a_sampled_request_tells_a_drafting_engine_its_passes() {
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let mut slot = Slot::new(Box::new(Replies {
+            inner: DraftMock::new(4096),
+            replies: Arc::clone(&replies),
+        }));
+        let ids = MockTokenizer.encode("abacadaeabacada");
+        for ignore_eos in [false, true] {
+            let p = GenParams {
+                n_predict: 8,
+                sampling: SamplingParams {
+                    temperature: 0.8,
+                    seed: 3,
+                    ..SamplingParams::default()
+                },
+                stop: Vec::new(),
+                ignore_eos,
+                stream: false,
+                timings_per_token: false,
+                return_progress: false,
+                include_usage: false,
+                cache_prompt: true,
+                reasoning_budget: None,
+                think_entry: ThinkEntry::Closed,
+            };
+            let mut tim = Timings::default();
+            generate(
+                &mut slot,
+                &sampling::reference_factory(),
+                &ids,
+                &p,
+                &mut |_| Ok(()),
+                &mut |_| {},
+                &mut tim,
+            )
+            .expect("a generation");
+        }
+        assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(0)]);
     }
 }

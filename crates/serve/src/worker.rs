@@ -594,20 +594,25 @@ impl Worker {
                     .select(a.slot)
                     .and_then(|()| self.slot.advance(t, a.job.kept_mut()))
                     .map(|d| a.job.advanced(d)),
+                Need::Sampled(t) => self
+                    .slot
+                    .select(a.slot)
+                    .and_then(|()| a.job.advance_sampled(&mut self.slot, t)),
                 Need::Done => unreachable!("a finished request left the running ones"),
             }
         } else {
             // One engine round, its rows split by what they need: the steps
             // of two slots or more in one call (one step is a select and a
             // `next`, as `step_slots`' doc requires), then the drafted passes
-            // in one. Within each call the rows keep `active`'s order.
+            // in one. Within each call the rows keep `active`'s order. A
+            // sampled request passes only alone in its round: here it steps.
             let mut steps: Vec<SlotRow<'_>> = Vec::new();
             let mut step_at: Vec<usize> = Vec::new();
             let mut passes: Vec<SlotPass<'_>> = Vec::new();
             let mut pass_at: Vec<usize> = Vec::new();
             for (i, (a, need)) in self.active.iter_mut().zip(&needs).enumerate() {
                 match *need {
-                    Need::Step(last) => {
+                    Need::Step(last) | Need::Sampled(last) => {
                         step_at.push(i);
                         steps.push(SlotRow {
                             slot: a.slot,
@@ -955,6 +960,7 @@ impl Worker {
                 .slot
                 .advance(t, a.job.kept_mut())
                 .map(|d| a.job.advanced(d)),
+            Need::Sampled(t) => a.job.advance_sampled(&mut self.slot, t),
             Need::Done => unreachable!("a finished request left the running ones"),
         };
         match called {
