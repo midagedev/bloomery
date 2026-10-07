@@ -197,6 +197,9 @@ generate_ds41   kv_append                                0           0
 generate_ds41   kv_append_pos_buf                        0           0
 generate_ds41   kv_norm_rope_append                      0           0
 generate_ds41   latent_rms_append                        0           0
+generate_ds41   mimo2_router                             0           0
+generate_ds41   mimo2_router_pick                        0           0
+generate_ds41   mimo2_router_scores                      0           0
 generate_ds41   moe_combine                              0           0
 generate_ds41   mtp_input                                0           0
 generate_ds41   neox_append_k192                         0           0

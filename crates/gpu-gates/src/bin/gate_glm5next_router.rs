@@ -1,10 +1,18 @@
-//! GPU gate for GLM-5.3-Flash's router (`bloomery_gpu_deepseek41::router::
-//! glm5next`): 288 experts scored `sigmoid(logit)`, a selection bias for the
-//! selection only, the top 8 by (value descending, index descending), the
-//! unbiased scores summed in f64 in slot order, narrowed, guarded
-//! (`renorm_divisor`), each divided by it and scaled by 2.5. Model-free: the
-//! router weight, the activations and the bias are seeded, so the gate needs
-//! no file and no reference set.
+//! GPU gate for the sigmoid routers of `bloomery_gpu_deepseek41::router`,
+//! GLM-5.3-Flash's (`glm5next`) and MiMo-V2.6-Flash's (`mimo2`): the experts
+//! scored `sigmoid(logit)`, a selection bias for the selection only, the top
+//! 8 by (value descending, index descending), the unbiased scores summed in
+//! f64 in slot order, narrowed, guarded (`renorm_divisor`), each divided by
+//! it and scaled by the file's `expert_weights_scale`. Model-free: the router
+//! weight, the activations and the bias are seeded, so the gate needs no file
+//! and no reference set.
+//!
+//! The clauses below run once per instance, as its own cases, over the same
+//! host rule: `glm5next` at 288 experts and a scale of 2.5, then `mimo2` at
+//! 256 experts and a scale of 1. A line names its instance by the entry in
+//! `ties case=` and `graph op=`; the instance's header line opens its
+//! clauses. The entry names below are `glm5next`'s; `mimo2`'s are the
+//! same with the prefix `mimo2_`.
 //!
 //! One clause per rule, each its own verdict line:
 //! - `logits`: [`TOKENS`] one-token launches (`glm5next_router`) at
@@ -65,11 +73,12 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::route_core::{renorm_divisor, sigmoid};
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
-    use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE};
+    use bloomery_gpu_deepseek41::router::{glm5next, mimo2};
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
-    use cuda_core::DeviceBuffer;
+    use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
+    use std::sync::Arc;
 
     const NAME: &str = "gate_glm5next_router";
     /// The router's input width: the model's hidden size.
@@ -77,8 +86,9 @@ mod gate {
     /// Tokens of the seeded clauses: seven full tiles of the batch score
     /// launch and a partial eighth.
     const TOKENS: usize = 61;
-    /// The file's `expert_weights_scale`.
-    const SCALE: f32 = 2.5;
+    /// Experts each token routes to: both instances keep eight.
+    const N_USED: usize = 8;
+    const _: () = assert!(glm5next::N_USED == N_USED && mimo2::N_USED == N_USED);
     /// CUDA's `expf` (the libdevice body the kernel calls): at most 2 ulp
     /// (CUDA C++ Programming Guide, mathematical functions), and `1 + expf`
     /// may be fused into its last step and round once — 2.5 ulp of `e^-x`,
@@ -86,6 +96,134 @@ mod gate {
     const DEVICE_EXP_ULPS: f64 = 2.5;
     /// The host's `expf` (glibc): at most 1 ulp, glibc's documented bound.
     const HOST_EXP_ULPS: f64 = 1.0;
+
+    /// A router instance under the gate: its module's types, entries and the
+    /// file numbers its rule is stated at. The clauses are generic over it, so
+    /// one clause list runs at each instance's own numbers.
+    trait Inst {
+        /// The one-token entry's name.
+        const OP: &'static str;
+        /// Experts the instance routes over.
+        const E: usize;
+        /// The instance's `expert_weights_scale`.
+        const SCALE: f32;
+        type Kernels;
+        type Out;
+        fn load(ctx: &Arc<CudaContext>) -> Result<Self::Kernels, GpuError>;
+        fn new_out(s: &CudaStream) -> Result<Self::Out, GpuError>;
+        #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
+        fn enqueue_router(
+            k: &Self::Kernels,
+            s: &CudaStream,
+            w: &DeviceTensor<f32>,
+            x: &DeviceBuffer<f32>,
+            bias: &DeviceBuffer<f32>,
+            out: &mut Self::Out,
+            fault: FaultSink,
+        ) -> Result<(), GpuError>;
+        #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
+        fn enqueue_rows(
+            k: &Self::Kernels,
+            s: &CudaStream,
+            w: &DeviceTensor<f32>,
+            x: &DeviceBuffer<f32>,
+            bias: &DeviceBuffer<f32>,
+            t: usize,
+            probs: &mut DeviceBuffer<f32>,
+            ids: &mut DeviceBuffer<u32>,
+            weights: &mut DeviceBuffer<f32>,
+            fault: FaultSink,
+        ) -> Result<(), GpuError>;
+        /// The launch's logits, scores, ids and weights.
+        #[allow(clippy::type_complexity, reason = "one gate helper's four readbacks")]
+        fn read(
+            out: &Self::Out,
+            s: &CudaStream,
+        ) -> Result<(Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>), GateError>;
+        /// Zero the four result buffers.
+        fn zero(out: &mut Self::Out, s: &CudaStream) -> Result<(), GateError>;
+        /// The block ticket count as it stands.
+        fn tickets(out: &Self::Out, s: &CudaStream) -> Result<u32, GateError>;
+    }
+
+    /// `$ty` as the instance of module `$m`, entry `$op`, at `$scale`.
+    macro_rules! instance {
+        ($ty:ident, $m:ident, $op:literal, $scale:expr) => {
+            struct $ty;
+
+            impl Inst for $ty {
+                const OP: &'static str = $op;
+                const E: usize = $m::N_EXPERT;
+                const SCALE: f32 = $scale;
+                type Kernels = $m::RouterKernels;
+                type Out = $m::RouterOut;
+
+                fn load(ctx: &Arc<CudaContext>) -> Result<Self::Kernels, GpuError> {
+                    $m::RouterKernels::load(ctx)
+                }
+
+                fn new_out(s: &CudaStream) -> Result<Self::Out, GpuError> {
+                    $m::RouterOut::new(s)
+                }
+
+                fn enqueue_router(
+                    k: &Self::Kernels,
+                    s: &CudaStream,
+                    w: &DeviceTensor<f32>,
+                    x: &DeviceBuffer<f32>,
+                    bias: &DeviceBuffer<f32>,
+                    out: &mut Self::Out,
+                    fault: FaultSink,
+                ) -> Result<(), GpuError> {
+                    k.enqueue_router(s, w, x, bias, Self::SCALE, out, fault)
+                }
+
+                fn enqueue_rows(
+                    k: &Self::Kernels,
+                    s: &CudaStream,
+                    w: &DeviceTensor<f32>,
+                    x: &DeviceBuffer<f32>,
+                    bias: &DeviceBuffer<f32>,
+                    t: usize,
+                    probs: &mut DeviceBuffer<f32>,
+                    ids: &mut DeviceBuffer<u32>,
+                    weights: &mut DeviceBuffer<f32>,
+                    fault: FaultSink,
+                ) -> Result<(), GpuError> {
+                    k.enqueue_router_rows(s, w, x, bias, Self::SCALE, t, probs, ids, weights, fault)
+                }
+
+                fn read(
+                    out: &Self::Out,
+                    s: &CudaStream,
+                ) -> Result<(Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>), GateError> {
+                    Ok((
+                        out.logits.to_host_vec(s)?,
+                        out.probs.to_host_vec(s)?,
+                        out.ids.to_host_vec(s)?,
+                        out.weights.to_host_vec(s)?,
+                    ))
+                }
+
+                fn zero(out: &mut Self::Out, s: &CudaStream) -> Result<(), GateError> {
+                    out.logits.zero_async(s)?;
+                    out.probs.zero_async(s)?;
+                    out.ids.zero_async(s)?;
+                    out.weights.zero_async(s)?;
+                    Ok(())
+                }
+
+                fn tickets(out: &Self::Out, s: &CudaStream) -> Result<u32, GateError> {
+                    Ok(out.tickets(s)?)
+                }
+            }
+        };
+    }
+
+    // GLM-5.3-Flash: 288 experts, the file's scale 2.5.
+    instance!(Glm, glm5next, "glm5next_router", 2.5);
+    // MiMo-V2.6-Flash: 256 experts, the file's scale 1.
+    instance!(Mimo, mimo2, "mimo2_router", 1.0);
 
     /// One f32 ulp at `v`: the spacing of f32 values at `|v|`'s binade (the
     /// subnormal spacing below the normal range).
@@ -148,17 +286,17 @@ mod gate {
 
     /// The weights rule on scores `p` at `ids`: summed in f64 in slot order,
     /// narrowed, guarded ([`renorm_divisor`]), each divided by it, scaled.
-    fn weights_rule(p: &[f32], ids: &[u32]) -> Vec<f32> {
+    fn weights_rule(p: &[f32], ids: &[u32], scale: f32) -> Vec<f32> {
         let g: Vec<f32> = ids.iter().map(|&i| p[i as usize]).collect();
         let div = renorm_divisor(g.iter().fold(0.0f64, |s, &v| s + f64::from(v)) as f32);
-        g.iter().map(|&v| v / div * SCALE).collect()
+        g.iter().map(|&v| v / div * scale).collect()
     }
 
     /// The same without the guard: ik's bare sum.
-    fn weights_bare(p: &[f32], ids: &[u32]) -> Vec<f32> {
+    fn weights_bare(p: &[f32], ids: &[u32], scale: f32) -> Vec<f32> {
         let g: Vec<f32> = ids.iter().map(|&i| p[i as usize]).collect();
         let div = g.iter().fold(0.0f64, |s, &v| s + f64::from(v)) as f32;
-        g.iter().map(|&v| v / div * SCALE).collect()
+        g.iter().map(|&v| v / div * scale).collect()
     }
 
     /// `1 / (1 + e^-x)` in f64: the exact key of a planted logit.
@@ -171,13 +309,13 @@ mod gate {
         a.to_bits().abs_diff(b.to_bits())
     }
 
-    struct Cx {
+    struct Cx<I: Inst> {
         gpu: Gpu,
-        rk: RouterKernels,
+        rk: I::Kernels,
     }
 
     /// What one-token launches leave, token-major: logits and scores
-    /// [`N_EXPERT`] a token, ids and weights [`N_USED`] a token, and the
+    /// the instance's expert count a token, ids and weights [`N_USED`] a token, and the
     /// ticket count after each launch.
     struct Routed {
         logits: Vec<f32>,
@@ -188,15 +326,15 @@ mod gate {
     }
 
     /// One `glm5next_router` launch per token of `x` (`k` a token).
-    fn one_token_runs(
-        cx: &Cx,
+    fn one_token_runs<I: Inst>(
+        cx: &Cx<I>,
         w: &DeviceTensor<f32>,
         x: &[f32],
         k: usize,
         bias: &DeviceBuffer<f32>,
     ) -> Result<Routed, GateError> {
         let s = cx.gpu.stream();
-        let mut out = RouterOut::new(s)?;
+        let mut out = I::new_out(s)?;
         let mut r = Routed {
             logits: Vec::new(),
             probs: Vec::new(),
@@ -206,22 +344,22 @@ mod gate {
         };
         for xt in x.chunks_exact(k) {
             let xd = DeviceBuffer::from_host(s, xt)?;
-            cx.rk
-                .enqueue_router(s, w, &xd, bias, SCALE, &mut out, cx.gpu.unlabelled_sink())?;
+            I::enqueue_router(&cx.rk, s, w, &xd, bias, &mut out, cx.gpu.unlabelled_sink())?;
             s.synchronize()?;
-            r.logits.extend(out.logits.to_host_vec(s)?);
-            r.probs.extend(out.probs.to_host_vec(s)?);
-            r.ids.extend(out.ids.to_host_vec(s)?);
-            r.weights.extend(out.weights.to_host_vec(s)?);
-            r.tickets.push(out.tickets(s)?);
+            let (logits, probs, ids, weights) = I::read(&out, s)?;
+            r.logits.extend(logits);
+            r.probs.extend(probs);
+            r.ids.extend(ids);
+            r.weights.extend(weights);
+            r.tickets.push(I::tickets(&out, s)?);
         }
         Ok(r)
     }
 
     /// The batch pair over every token of `x`: scores, ids, weights.
     #[allow(clippy::type_complexity, reason = "one gate helper's three readbacks")]
-    fn batch_run(
-        cx: &Cx,
+    fn batch_run<I: Inst>(
+        cx: &Cx<I>,
         w: &DeviceTensor<f32>,
         x: &[f32],
         k: usize,
@@ -230,15 +368,15 @@ mod gate {
         let s = cx.gpu.stream();
         let t = x.len() / k;
         let xd = DeviceBuffer::from_host(s, x)?;
-        let mut probs = DeviceBuffer::<f32>::zeroed(s, N_EXPERT * t)?;
+        let mut probs = DeviceBuffer::<f32>::zeroed(s, I::E * t)?;
         let mut ids = DeviceBuffer::<u32>::zeroed(s, N_USED * t)?;
         let mut weights = DeviceBuffer::<f32>::zeroed(s, N_USED * t)?;
-        cx.rk.enqueue_router_rows(
+        I::enqueue_rows(
+            &cx.rk,
             s,
             w,
             &xd,
             bias,
-            SCALE,
             t,
             &mut probs,
             &mut ids,
@@ -260,18 +398,18 @@ mod gate {
         bias: Vec<f32>,
     }
 
-    fn seeded_router() -> Seeded {
+    fn seeded_router<I: Inst>() -> Seeded {
         Seeded {
-            w: seeded(N_EXPERT * K, 7, -0.05, 0.1),
+            w: seeded(I::E * K, 7, -0.05, 0.1),
             x: seeded(TOKENS * K, 11, -2.0, 4.0),
-            bias: seeded(N_EXPERT, 13, -0.25, 0.5),
+            bias: seeded(I::E, 13, -0.25, 0.5),
         }
     }
 
     /// Clauses `logits`, `scores`, `ids`, `weights`, `batch`, with `r` the
     /// one-token launches over the seeded router.
-    fn seeded_clauses(
-        cx: &Cx,
+    fn seeded_clauses<I: Inst>(
+        cx: &Cx<I>,
         sd: &Seeded,
         w: &DeviceTensor<f32>,
         bias: &DeviceBuffer<f32>,
@@ -281,9 +419,9 @@ mod gate {
         let (mut worst, mut max_ulps) = (0.0f64, 0u32);
         for t in 0..TOKENS {
             let xt = &sd.x[t * K..(t + 1) * K];
-            let e_rows = t * N_EXPERT..(t + 1) * N_EXPERT;
+            let e_rows = t * I::E..(t + 1) * I::E;
             let s_rows = t * N_USED..(t + 1) * N_USED;
-            let lh: Vec<f32> = (0..N_EXPERT)
+            let lh: Vec<f32> = (0..I::E)
                 .map(|e| {
                     butterfly(std::array::from_fn(|lane| {
                         gemv_lane(&sd.w[e * K..(e + 1) * K], xt, lane)
@@ -300,7 +438,7 @@ mod gate {
                 max_ulps = max_ulps.max(ulps(p, h));
             }
             ids_ok += usize::from(select(pk, &sd.bias) == ik);
-            weights_ok += usize::from(bits_equal(wk, &weights_rule(pk, ik)));
+            weights_ok += usize::from(bits_equal(wk, &weights_rule(pk, ik, I::SCALE)));
         }
         let tickets_ok = r.tickets.iter().all(|&c| c == 0);
         let mut ok = true;
@@ -325,8 +463,9 @@ mod gate {
         );
         ok &= pass;
         let pass = weights_ok == TOKENS;
+        let scale = I::SCALE;
         println!(
-            "weights tokens={TOKENS} bit-identical to the host rule (f64 slot sum, guard, divide, x{SCALE}): \
+            "weights tokens={TOKENS} bit-identical to the host rule (f64 slot sum, guard, divide, x{scale}): \
              {weights_ok}/{TOKENS} {}",
             verdict(pass)
         );
@@ -336,10 +475,7 @@ mod gate {
         let (pb2, ib2, wb2) = batch_run(cx, w, &sd.x, K, bias)?;
         let same = (0..TOKENS)
             .filter(|&t| {
-                let (e, s) = (
-                    t * N_EXPERT..(t + 1) * N_EXPERT,
-                    t * N_USED..(t + 1) * N_USED,
-                );
+                let (e, s) = (t * I::E..(t + 1) * I::E, t * N_USED..(t + 1) * N_USED);
                 bits_equal(&pb[e.clone()], &r.probs[e])
                     && ib[s.clone()] == r.ids[s.clone()]
                     && bits_equal(&wb[s.clone()], &r.weights[s])
@@ -358,23 +494,23 @@ mod gate {
 
     /// The router of planted `logits` (the first column of a K = 32 weight
     /// against a one-hot input) and `bias`, one token: what it leaves.
-    fn planted(cx: &Cx, logits: &[f32], bias: &[f32]) -> Result<Routed, GateError> {
+    fn planted<I: Inst>(cx: &Cx<I>, logits: &[f32], bias: &[f32]) -> Result<Routed, GateError> {
         const PK: usize = 32;
         let s = cx.gpu.stream();
-        let mut w = vec![0.0f32; N_EXPERT * PK];
+        let mut w = vec![0.0f32; I::E * PK];
         for (e, &v) in logits.iter().enumerate() {
             w[e * PK] = v;
         }
         let mut x = vec![0.0f32; PK];
         x[0] = 1.0;
-        let wd = DeviceTensor::upload(s, &w, N_EXPERT, PK)?;
+        let wd = DeviceTensor::upload(s, &w, I::E, PK)?;
         let bd = DeviceBuffer::from_host(s, bias)?;
         one_token_runs(cx, &wd, &x, PK, &bd)
     }
 
     /// Clause `ties`: planted ties against the rule's statement.
-    fn ties(cx: &Cx) -> Result<bool, GateError> {
-        let base: Vec<f32> = (0..N_EXPERT).map(|e| -3.0 + 0.01 * e as f32).collect();
+    fn ties<I: Inst>(cx: &Cx<I>) -> Result<bool, GateError> {
+        let base: Vec<f32> = (0..I::E).map(|e| -3.0 + 0.01 * e as f32).collect();
         let plant = |pairs: &[(usize, f32)]| {
             let mut v = base.clone();
             for &(i, val) in pairs {
@@ -382,7 +518,7 @@ mod gate {
             }
             v
         };
-        let zero = vec![0.0f32; N_EXPERT];
+        let zero = vec![0.0f32; I::E];
         let mut bias_decides = zero.clone();
         bias_decides[7] = 0.5;
         bias_decides[77] = 0.5;
@@ -412,15 +548,15 @@ mod gate {
                 plant(&[(64, 7.0), (65, 7.0)]),
                 zero.clone(),
             ),
-            ("ends", plant(&[(0, 7.0), (287, 7.0)]), zero.clone()),
+            ("ends", plant(&[(0, 7.0), (I::E - 1, 7.0)]), zero.clone()),
             (
                 "three_way",
                 plant(&[(5, 7.0), (37, 7.0), (200, 7.0)]),
                 zero.clone(),
             ),
-            ("all_equal", vec![1.0; N_EXPERT], zero.clone()),
-            ("bias_decides", vec![1.0; N_EXPERT], bias_decides),
-            ("all_zero_scores", vec![-200.0; N_EXPERT], zero.clone()),
+            ("all_equal", vec![1.0; I::E], zero.clone()),
+            ("bias_decides", vec![1.0; I::E], bias_decides),
+            ("all_zero_scores", vec![-200.0; I::E], zero.clone()),
         ];
         let mut all = true;
         for (name, logits, bias) in cases {
@@ -432,7 +568,7 @@ mod gate {
                 .collect();
             let stated = top_by(&key, f64::total_cmp);
             let host = select(&r.probs, &bias);
-            let w_ok = bits_equal(&r.weights, &weights_rule(&r.probs, &r.ids));
+            let w_ok = bits_equal(&r.weights, &weights_rule(&r.probs, &r.ids, I::SCALE));
             let finite = r.weights.iter().all(|w| w.is_finite());
             let fault = cx.gpu.take_fault()?;
             let pass = r.ids == stated
@@ -456,12 +592,12 @@ mod gate {
     }
 
     /// Clause `guard`: every logit −40, eight scores summing below 2^-42.
-    fn guard(cx: &Cx) -> Result<bool, GateError> {
-        let r = planted(cx, &vec![-40.0; N_EXPERT], &vec![0.0; N_EXPERT])?;
+    fn guard<I: Inst>(cx: &Cx<I>) -> Result<bool, GateError> {
+        let r = planted(cx, &vec![-40.0; I::E], &vec![0.0; I::E])?;
         let sum: f64 = r.ids.iter().map(|&i| f64::from(r.probs[i as usize])).sum();
-        let w_ok = bits_equal(&r.weights, &weights_rule(&r.probs, &r.ids));
+        let w_ok = bits_equal(&r.weights, &weights_rule(&r.probs, &r.ids, I::SCALE));
         let finite = r.weights.iter().all(|w| w.is_finite());
-        let bare = weights_bare(&r.probs, &r.ids);
+        let bare = weights_bare(&r.probs, &r.ids, I::SCALE);
         let differ = r
             .weights
             .iter()
@@ -482,11 +618,11 @@ mod gate {
 
     /// Clause `fault`: a NaN router row and a −inf bias entry, each through
     /// both shapes, raise `Router`; a clean launch raises nothing.
-    fn fault(cx: &Cx, sd: &Seeded) -> Result<bool, GateError> {
+    fn fault<I: Inst>(cx: &Cx<I>, sd: &Seeded) -> Result<bool, GateError> {
         let s = cx.gpu.stream();
         let x = &sd.x[..8 * K];
         let want = Some(Fault::at(LAYER_NONE, FaultSite::Router));
-        let clean_w = DeviceTensor::upload(s, &sd.w, N_EXPERT, K)?;
+        let clean_w = DeviceTensor::upload(s, &sd.w, I::E, K)?;
         let clean_b = DeviceBuffer::from_host(s, &sd.bias)?;
         cx.gpu.take_fault()?;
         one_token_runs(cx, &clean_w, &x[..K], K, &clean_b)?;
@@ -494,7 +630,7 @@ mod gate {
         let clean = cx.gpu.take_fault()?;
         let mut nan_w = sd.w.clone();
         nan_w[17 * K + 5] = f32::NAN;
-        let nan_w = DeviceTensor::upload(s, &nan_w, N_EXPERT, K)?;
+        let nan_w = DeviceTensor::upload(s, &nan_w, I::E, K)?;
         let mut inf_b = sd.bias.clone();
         inf_b[200] = f32::NEG_INFINITY;
         let inf_b = DeviceBuffer::from_host(s, &inf_b)?;
@@ -522,61 +658,59 @@ mod gate {
     }
 
     /// Clause `graph`: the one-token launch as a captured graph.
-    fn graph(
-        cx: &Cx,
+    fn graph<I: Inst>(
+        cx: &Cx<I>,
         sd: &Seeded,
         w: &DeviceTensor<f32>,
         bias: &DeviceBuffer<f32>,
     ) -> Result<bool, GateError> {
         let s = cx.gpu.stream();
         let xd = DeviceBuffer::from_host(s, &sd.x[..K])?;
-        let mut out = RouterOut::new(s)?;
-        cx.rk
-            .enqueue_router(s, w, &xd, bias, SCALE, &mut out, cx.gpu.unlabelled_sink())?;
+        let mut out = I::new_out(s)?;
+        I::enqueue_router(&cx.rk, s, w, &xd, bias, &mut out, cx.gpu.unlabelled_sink())?;
         s.synchronize()?;
-        let eager = (
-            out.logits.to_host_vec(s)?,
-            out.probs.to_host_vec(s)?,
-            out.ids.to_host_vec(s)?,
-            out.weights.to_host_vec(s)?,
-        );
-        out.logits.zero_async(s)?;
-        out.probs.zero_async(s)?;
-        out.ids.zero_async(s)?;
-        out.weights.zero_async(s)?;
+        let eager = I::read(&out, s)?;
+        I::zero(&mut out, s)?;
         s.synchronize()?;
         let sink = cx.gpu.unlabelled_sink();
-        let g = cx.gpu.capture(|st| {
-            cx.rk
-                .enqueue_router(st, w, &xd, bias, SCALE, &mut out, sink)
-        })?;
+        let g = cx
+            .gpu
+            .capture(|st| I::enqueue_router(&cx.rk, st, w, &xd, bias, &mut out, sink))?;
         let (mut replays, mut tickets) = (true, Vec::new());
         for _ in 0..2 {
             g.launch(s)?;
             s.synchronize()?;
-            replays &= bits_equal(&out.logits.to_host_vec(s)?, &eager.0)
-                && bits_equal(&out.probs.to_host_vec(s)?, &eager.1)
-                && out.ids.to_host_vec(s)? == eager.2
-                && bits_equal(&out.weights.to_host_vec(s)?, &eager.3);
-            tickets.push(out.tickets(s)?);
+            let now = I::read(&out, s)?;
+            replays &= bits_equal(&now.0, &eager.0)
+                && bits_equal(&now.1, &eager.1)
+                && now.2 == eager.2
+                && bits_equal(&now.3, &eager.3);
+            tickets.push(I::tickets(&out, s)?);
         }
         let nodes = g.node_count();
         let pass = replays && nodes == 1 && tickets.iter().all(|&c| c == 0);
         println!(
-            "graph op=glm5next_router two_replays_bit_identical={replays} tickets_after={tickets:?} \
+            "graph op={} two_replays_bit_identical={replays} tickets_after={tickets:?} \
              graph_nodes={nodes} {}",
+            I::OP,
             verdict(pass)
         );
         Ok(pass)
     }
 
-    pub fn run() -> Result<(), GateError> {
-        let gpu = Gpu::new()?;
-        let rk = RouterKernels::load(gpu.context())?;
-        let cx = Cx { gpu, rk };
+    /// Every clause at instance `I`; whether all passed.
+    fn run_instance<I: Inst>(gpu: Gpu) -> Result<(Gpu, bool), GateError> {
+        println!(
+            "== {} ({} experts, top {N_USED}, sigmoid, x{}) ==",
+            I::OP,
+            I::E,
+            I::SCALE
+        );
+        let rk = I::load(gpu.context())?;
+        let cx = Cx::<I> { gpu, rk };
         let s = cx.gpu.stream();
-        let sd = seeded_router();
-        let w = DeviceTensor::upload(s, &sd.w, N_EXPERT, K)?;
+        let sd = seeded_router::<I>();
+        let w = DeviceTensor::upload(s, &sd.w, I::E, K)?;
         let bias = DeviceBuffer::from_host(s, &sd.bias)?;
         let r = one_token_runs(&cx, &w, &sd.x, K, &bias)?;
         let seeded_fault = cx.gpu.take_fault()?;
@@ -589,11 +723,23 @@ mod gate {
         ok &= guard(&cx)?;
         ok &= fault(&cx, &sd)?;
         ok &= graph(&cx, &sd, &w, &bias)?;
-        if ok {
+        Ok((cx.gpu, ok))
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        let (gpu, glm_ok) = run_instance::<Glm>(Gpu::new()?)?;
+        let (_gpu, mimo_ok) = run_instance::<Mimo>(gpu)?;
+        if glm_ok && mimo_ok {
             println!(
-                "PASSED: {NAME} — glm5next_router (288/8, sigmoid, x{SCALE}) and its batch pair: logits, \
-                 ids and weights bit-identical to the host rule over {TOKENS} seeded tokens, scores in the \
-                 sigmoid band, 8 tie cases, the guard, the fault, the graph"
+                "PASSED: {NAME} — {} ({}/{N_USED}, sigmoid, x{}) and {} ({}/{N_USED}, sigmoid, x{}), each with its batch \
+                 pair: logits, ids and weights bit-identical to the host rule over {TOKENS} seeded tokens, \
+                 scores in the sigmoid band, 8 tie cases, the guard, the fault, the graph",
+                Glm::OP,
+                Glm::E,
+                Glm::SCALE,
+                Mimo::OP,
+                Mimo::E,
+                Mimo::SCALE
             );
             Ok(())
         } else {
