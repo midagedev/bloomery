@@ -801,16 +801,61 @@ pub struct DecodeInput38 {
 
 /// The stream rule's costs of one Qwen3.8 expert — the architecture fact the
 /// expert stream reads beside the lane's measured rate: the host union's
-/// no-tile cost a column and its floor for an expert of the file's common
-/// layer kind on the pool's threads, and the card route's fixed and
-/// per-column cost of one streamed expert (the measured union bench and the
-/// q38seed card's decomposition, `docs/cards/q38seed-ab.card`).
+/// tile-path cost a column for an expert of the file's common layer kind and
+/// its weight-listing floor, and the card route's fixed and per-column cost
+/// of one streamed expert. The union's costs are the constrained fit of the
+/// Q4 prompt-union records (the per-layer `stat prompt lb` walls against
+/// their slots and listed experts, the pickrule round's fit: the records
+/// identify the per-column slope alone, the floor comes from the
+/// weight-listing anchor, one expert's bytes at the host's read bandwidth);
+/// the card route's are the q38seed card's decomposition
+/// (`docs/cards/q38seed-ab.card`), which the same records' shadow tail
+/// corroborates at the card's expert count.
 pub const XSTREAM_COSTS: Costs = Costs {
+    host_us_per_col: 3.67,
+    host_us_fixed: 19.95,
+    card_us_fixed: 13.0,
+    card_us_per_col: 0.16,
+};
+
+/// The stream rule's costs for a file whose common routed kind runs no tile
+/// path on the host union — the IQ files, whose experts this tree's host
+/// serves a column at a time: the row the family carried before the Q4
+/// recalibration, kept until the tiles land and their own records exist (the
+/// per-file override [`Body38::set_xstream_costs`] takes a calibrated row
+/// then).
+pub const XSTREAM_COSTS_NO_TILE: Costs = Costs {
     host_us_per_col: 7.0,
     host_us_fixed: 23.36,
     card_us_fixed: 13.0,
     card_us_per_col: 0.16,
 };
+
+/// The file's common routed kind: the gate·up type most of its layers carry —
+/// the kind whose host union the expert stream's costs row prices. Ties sit
+/// with the Q4 kind, the family's own.
+fn common_routed(stacks: &swap38::Qwen38Stacks) -> GgmlType {
+    let kinds = [
+        GgmlType::Q4_K,
+        GgmlType::Q5_K,
+        GgmlType::IQ3_XXS,
+        GgmlType::IQ4_XS,
+    ];
+    let count = |want: GgmlType| {
+        (0..)
+            .map_while(|l| stacks.pair(l))
+            .filter(|&(gate, _)| gate == want)
+            .count()
+    };
+    let mut best = (GgmlType::Q4_K, 0usize);
+    for ty in kinds {
+        let n = count(ty);
+        if n > best.1 {
+            best = (ty, n);
+        }
+    }
+    best.0
+}
 
 /// Everything Qwen3.8's chain owns. Field order is drop order: the host tier
 /// (its lock over the host set, its page windows) before the buffers.
@@ -900,6 +945,9 @@ pub struct Body38 {
     /// The NVMe expert tier's arena, when the plan paged routed experts
     /// ([`Body38::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
+    /// The file's common routed kind ([`common_routed`]): which expert
+    /// stream's costs row its walks take.
+    routed_gate: GgmlType,
     /// The recurrent stores on the host at chosen positions, and the PLE
     /// hash's history at each, ascending: the points a cut behind the fed
     /// positions restores. A prompt call takes them only while `marks` is on.
@@ -1499,6 +1547,7 @@ impl Body38 {
             mtp: None,
             residency_glue,
             nvme_tier,
+            routed_gate: common_routed(&stacks),
             ckpt,
             ple_points: Vec::new(),
             marks: false,
@@ -1785,8 +1834,15 @@ impl Body38 {
             ));
         }
         if mode == XMode::Split && self.hybrid.xstream().is_none() {
+            // The file's own row: the Q4 kind's recalibrated one, any other
+            // kind's the no-tile row until its tiles and their records exist.
+            let costs = if self.routed_gate == GgmlType::Q4_K {
+                XSTREAM_COSTS
+            } else {
+                XSTREAM_COSTS_NO_TILE
+            };
             let cfg = XCfg {
-                costs: XSTREAM_COSTS,
+                costs,
                 experts: geo::EXPERTS,
                 top_k: geo::N_USED,
                 max_half: 0,
