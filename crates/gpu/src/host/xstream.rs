@@ -743,7 +743,11 @@ impl XStream {
         Ok(bytes as f64 / us)
     }
 
-    /// The rule's constants of layer `layer` at the lane's rate.
+    /// The rule's constants of layer `layer` at the lane's rate: the family
+    /// row's costs with no unit's burst share and no model's card tail — a
+    /// load knows neither — for the paths that want the row itself. The
+    /// paths that know a unit's counts set its share through
+    /// [`xsplit::union_burst_share`] before they run the rule.
     fn constants_of(&self, layer: usize) -> Option<Constants> {
         let parts = self.source().part_bytes(layer);
         if parts.is_empty() {
@@ -756,6 +760,8 @@ impl XStream {
             host_us_fixed: c.host_us_fixed,
             card_us_fixed: c.card_us_fixed,
             card_us_per_col: c.card_us_per_col,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
             expert_b: parts.iter().map(|&b| b as u64).sum(),
             experts: self.cfg.experts,
             top_k: self.cfg.top_k,
@@ -882,7 +888,7 @@ impl XStream {
                 format!("layer {layer} streams outside a call (XStream::begin_call)"),
             ));
         }
-        let k = self
+        let mut k = self
             .constants(layer)
             .ok_or_else(|| GpuError::shape(WHAT, format!("layer {layer} holds no stage stack")))?;
         if self.cur.get(layer).is_none_or(Option::is_some) {
@@ -903,13 +909,17 @@ impl XStream {
         }
         self.excl_unit[layer] = Some(unit);
         self.excl[layer].clear();
+        // The unit's own share over the host set the pick left: the counts
+        // the union still serves, the experts it still lists. The rule's
+        // every copy below prices at the beside-union rate this gives.
+        let host_routed = host.iter().filter(|&&id| counts[id as usize] > 0).count();
+        let host_cols: u64 = host.iter().map(|&id| u64::from(counts[id as usize])).sum();
+        k.union_burst_share = xsplit::union_burst_share(host_cols, host_routed as u64, &k);
         stream_tail(counts, host, &k, &mut self.split)
             .map_err(|e| GpuError::shape(WHAT, format!("layer {layer}: {e}")))?;
         let tail = self.split.stream.len();
-        let host_routed = host.iter().filter(|&&id| counts[id as usize] > 0).count();
         let kept_us = k.host_us_per_col * self.split.host_columns as f64;
         let all: u64 = counts.iter().map(|&c| u64::from(c)).sum();
-        let host_cols: u64 = host.iter().map(|&id| u64::from(counts[id as usize])).sum();
         let card_us = k.card_us_per_col * all.saturating_sub(host_cols) as f64;
         let side = Sides {
             admitted,
@@ -1355,7 +1365,7 @@ pub fn stream_tail(
     // lights the ring and takes the hottest into `admit`, which the rule's
     // set takes back when the ring is lit and that expert is past the floor.
     xsplit::split(counts, host, 1, k, out)?;
-    if k.host_us_fixed > k.expert_b as f64 / k.lane_b_per_us + k.card_us_fixed {
+    if k.host_us_fixed > k.expert_b as f64 / xsplit::beside_b_per_us(k) + k.card_us_fixed {
         out.admit.clear();
         out.stream.clear();
         out.host_columns = 0;
@@ -1392,11 +1402,12 @@ struct Sides {
 }
 
 /// How many of the ranked `stream` the layer takes before the card's side —
-/// the lane's copies, then its route over its own columns and the streamed
-/// ones — passes the union the host keeps: the two run side by side, so past
-/// that point a streamed expert lengthens the layer.
+/// the lane's copies beside the union, then its route over its own columns
+/// and the streamed ones — passes the union the host keeps: the two run side
+/// by side, so past that point a streamed expert lengthens the layer. The
+/// copies price at the beside-union rate the unit's constants carry.
 fn balance_cut(stream: &[u32], counts: &[u32], k: &Constants, side: Sides) -> usize {
-    let copy_us = k.expert_b as f64 / k.lane_b_per_us;
+    let copy_us = k.expert_b as f64 / xsplit::beside_b_per_us(k);
     let host_of = |c: u32| (k.host_us_per_col * f64::from(c)).max(k.host_us_fixed);
     let Sides {
         admitted,
@@ -1519,14 +1530,18 @@ fn start_lane(
 mod tests {
     use super::*;
 
-    /// The A6000 shape of the rule's own test: m* = 23.096, m_min 1183.
+    /// The A6000 shape of the rule's own test, at the recalibrated family
+    /// row and its calibration share: beside 13116.6, m* = 70.429,
+    /// m_min 3606.
     fn a6000() -> Constants {
         Constants {
             lane_b_per_us: 21190.0,
-            host_us_per_col: 7.0,
-            host_us_fixed: 23.36,
+            host_us_per_col: 3.67,
+            host_us_fixed: 19.95,
             card_us_fixed: 13.0,
             card_us_per_col: 0.16,
+            union_burst_share: 0.381,
+            card_tail_us: 4690.0,
             expert_b: 3072000,
             experts: 512,
             top_k: 10,
@@ -1577,35 +1592,38 @@ mod tests {
     /// The balance stops the stream where the layer's copies and card
     /// columns would pass the union it keeps, the pick's admits and the
     /// stacks' own columns on the card's side first and the rule's kept
-    /// experts on the union (mutants: the admits left off the lane, the
-    /// stacks' columns dropped, the kept union dropped, the cut one late).
+    /// experts on the union — every copy at the beside-union rate the unit's
+    /// constants carry (mutants: the admits left off the lane, the stacks'
+    /// columns dropped, the kept union dropped, the cut one late, the copies
+    /// at the lane's own rate).
     #[test]
     fn the_balance_stops_where_the_lane_passes_the_union() {
         let k = a6000();
         let counts: Vec<u32> = vec![80; 512];
         let stream: Vec<u32> = (0..100).collect();
-        // A streamed expert costs the card's side its copy, its fixed and its
-        // columns' cost, 170.77 n with n streamed, and saves the union 560 a
-        // one: against 560 (100 - n), 76 stream and the 77th would pass.
+        // A streamed expert costs the card's side its copy beside the union
+        // (234.2), its fixed and its columns' cost — 260.0 with n streamed —
+        // and saves the union max(19.95, 3.67 x 80) = 293.6 a one: against
+        // 293.6 (100 - n), 53 stream and the 54th would pass.
         let side = |admitted, kept_us, card_us| Sides {
             admitted,
             kept_us,
             card_us,
         };
         assert_eq!(balance_cut(&stream, &counts, &k, side(0, 0.0, 0.0)), 76);
-        // 100 admits ahead on the lane take 14,497 of it first: with n
-        // streamed, 14,497 + 170.77 n against 560 (100 - n), so 56 stream.
+        // 100 admits ahead on the lane take 23,420.7 of it first: with n
+        // streamed, 23,420.7 + 260.0 n against 293.6 (100 - n), so 10.
         assert_eq!(balance_cut(&stream, &counts, &k, side(100, 0.0, 0.0)), 56);
         // The union the rule keeps anyway counts on the host's side: 10,000
-        // of it, 170.77 n against 10,000 + 560 (100 - n), so 90.
+        // of it cancels the same way, 260.0 n against 293.6 (100 - n), so 53.
         assert_eq!(
             balance_cut(&stream, &counts, &k, side(0, 10_000.0, 0.0)),
             90
         );
         // The stacks' own columns count on the card's side: 5,000 of them,
-        // 5,000 + 170.77 n against 560 (100 - n), so 69.
+        // 5,000 + 260.0 n against 293.6 (100 - n), so 44.
         assert_eq!(balance_cut(&stream, &counts, &k, side(0, 0.0, 5_000.0)), 69);
-        // Ten candidates: 170.77 n against 560 (10 - n), so 7.
+        // Ten candidates: 260.0 n against 293.6 (10 - n), so 5.
         assert_eq!(
             balance_cut(&stream[..10], &counts, &k, side(0, 0.0, 0.0)),
             7
