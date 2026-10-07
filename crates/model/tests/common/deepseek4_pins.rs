@@ -112,7 +112,10 @@ pub const PLAN_A: PlanPin = PlanPin {
         expert_bytes: 120_393_302_016,
         table_bytes: 443_688_960,
         shadow: 1_442_840_576,
-        headroom: 136_801_572_864,
+        // PIN(2026-10-07): 136_801_572_864 + 4_294_967_296 (workstation::ROW_CACHE): the engram
+        // row cache is a plan's reserve only while a row-gathered table lies on the NVMe tier, and
+        // this file's plans put none there.
+        headroom: 141_096_540_160,
     },
 };
 
@@ -142,7 +145,10 @@ pub const PLAN_B: PlanPin = PlanPin {
         expert_bytes: 120_393_302_016,
         table_bytes: 443_688_960,
         shadow: 1_442_840_576,
-        headroom: 136_801_572_864,
+        // PIN(2026-10-07): 136_801_572_864 + 4_294_967_296 (workstation::ROW_CACHE): the engram
+        // row cache is a plan's reserve only while a row-gathered table lies on the NVMe tier, and
+        // this file's plans put none there.
+        headroom: 141_096_540_160,
     },
 };
 
@@ -161,7 +167,10 @@ pub const PLAN_GATE: PlanPin = PlanPin {
         expert_bytes: 120_393_302_016,
         table_bytes: 443_688_960,
         shadow: 1_442_840_576,
-        headroom: 136_801_572_864,
+        // PIN(2026-10-07): 136_801_572_864 + 4_294_967_296 (workstation::ROW_CACHE): the engram
+        // row cache is a plan's reserve only while a row-gathered table lies on the NVMe tier, and
+        // this file's plans put none there.
+        headroom: 141_096_540_160,
     },
 };
 
