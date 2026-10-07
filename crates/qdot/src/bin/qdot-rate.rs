@@ -82,8 +82,10 @@ fn main() {
     bench(GgmlType::Q5_K, 2304, (2304 / 256) * 176, rows);
     // V4-Flash ffn_gate/up_exps shape: k = 4096 (16 x 98 B = 1568 B/row).
     bench(GgmlType::IQ3_XXS, 4096, (4096 / 256) * 98, rows);
-    // V4-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
+    // V4-Flash and MiMo-V2.6-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
     bench(GgmlType::MXFP4, 2048, (2048 / 32) * 17, rows);
+    // MiMo-V2.6-Flash ffn_gate/up_exps shape: k = 4096 (128 x 17 B = 2176 B/row).
+    bench(GgmlType::MXFP4, 4096, (4096 / 32) * 17, rows);
     // Qwen3.8 UD-Q3_K_XL ffn_down_exps shape (43 of 48 layers): k = 640 (20 x 18 B =
     // 360 B/row), beside the Q5_1 row it replaces at the same k.
     bench(GgmlType::IQ4_NL, 640, (640 / 32) * 18, rows);
