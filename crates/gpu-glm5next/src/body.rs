@@ -102,11 +102,11 @@ use bloomery_gpu_deepseek41::hc::{HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcPre
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::quant::dequant_row;
-use gguf::{GgmlType, Split, TensorInfo};
+use gguf::{GgmlType, Split};
 use model::arch::Arch;
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{self, KdaLanes, NextnInputs, NextnPlan, PlanInputs};
+use model::embed::EmbedTable;
 use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
@@ -627,58 +627,40 @@ impl RowScratch {
     }
 }
 
-/// The token embedding as the host reads it: the file's q8_0 rows, one
-/// dequantized per step and written four times, one copy a stream.
+/// The token embedding as the host reads it: the shared table's q8_0 rows,
+/// one dequantized per step and written four times, one copy a stream.
 struct Embedding {
     file: Arc<Split>,
-    shard: usize,
-    info: TensorInfo,
-    row_bytes: usize,
     n_vocab: usize,
     row: Vec<f32>,
     streams: Vec<f32>,
+    table: EmbedTable,
 }
 
 impl Embedding {
     fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
         let name = names::token_embd();
-        let refuse = |need: &'static str| GpuError::Tensor {
-            what: WHAT,
-            name: name.clone(),
-            need,
-        };
-        let (shard, info) = file
-            .find(&name)
-            .map(|(s, t)| (s, t.clone()))
-            .ok_or_else(|| refuse("in the file"))?;
-        if info.ty != GgmlType::Q8_0 || info.dims.first() != Some(&(n_embd as u64)) {
-            return Err(refuse("q8_0 rows of embedding_length values"));
-        }
-        let n_vocab = info.dims.get(1).copied().unwrap_or(0) as usize;
-        let row_bytes = n_embd / 32 * 34;
-        if n_vocab == 0 || info.nbytes != (n_vocab * row_bytes) as u64 {
-            return Err(refuse("a whole number of q8_0 rows"));
+        let table = EmbedTable::new(file.clone(), &name, n_embd)?;
+        if table.ty() != GgmlType::Q8_0 {
+            return Err(GpuError::Tensor {
+                what: WHAT,
+                name,
+                need: "q8_0 rows of embedding_length values",
+            });
         }
         Ok(Embedding {
             file,
-            shard,
-            info,
-            row_bytes,
-            n_vocab,
+            n_vocab: table.n_vocab(),
             row: vec![0.0; n_embd],
             streams: vec![0.0; HC_STREAMS * n_embd],
+            table,
         })
     }
 
     /// Row `token`, dequantized and repeated into the four streams; a token
     /// past the vocabulary is refused by name.
     fn fill(&mut self, token: u32) -> Result<(), GpuError> {
-        // The row is taken out for the read: `row_into` borrows the whole
-        // embedding over the file, so it cannot fill the row in place.
-        let mut row = std::mem::take(&mut self.row);
-        let read = self.row_into(token, &mut row);
-        self.row = row;
-        read?;
+        self.table.row_into(token, &mut self.row)?;
         for s in self.streams.chunks_exact_mut(self.row.len()) {
             s.copy_from_slice(&self.row);
         }
@@ -689,7 +671,7 @@ impl Embedding {
     /// stream; a token past the vocabulary is refused by name.
     fn fill_row(&self, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
         let (first, rest) = out.split_at_mut(self.row.len());
-        self.row_into(token, first)?;
+        self.table.row_into(token, first)?;
         for s in rest.chunks_exact_mut(first.len()) {
             s.copy_from_slice(first);
         }
@@ -699,23 +681,7 @@ impl Embedding {
     /// Token `token`'s embedding row into `out`, one copy; a token past the
     /// vocabulary is refused by name.
     fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
-        let t = token as usize;
-        if t >= self.n_vocab {
-            return Err(shape(format!(
-                "token {token} is past the {} embedding rows",
-                self.n_vocab
-            )));
-        }
-        let data = self
-            .file
-            .shard(self.shard)
-            .ok_or(GpuError::State {
-                what: WHAT,
-                missing: "the embedding's shard",
-            })?
-            .data(&self.info)?;
-        let src = &data[t * self.row_bytes..][..self.row_bytes];
-        dequant_row(GgmlType::Q8_0, src, out).map_err(model::ModelError::from)?;
+        self.table.row_into(token, out)?;
         Ok(())
     }
 }
