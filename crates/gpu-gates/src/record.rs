@@ -1897,9 +1897,10 @@ pub static CALL_STREAM: Kind = Kind {
           to take in the call's earlier jobs. The four after, each left out when the pick did \
           not measure it: the microseconds from the pick's start to the staging of the layer's \
           last pick job (the whole copy, read back at the call's end), the least count the pick \
-          admitted and the backlog bound it waited on, 1 when the floor came from no probe, and \
-          1 when the pick was the machine's refusal (a victim the host could not serve), whose \
-          kept 0 is no choice.",
+          admitted, the backlog bound it waited on, 1 when the floor came from no probe (a \
+          family's caller marks its own; an unmarked one leaves the part out), and 1 when the \
+          pick was the machine's refusal (a victim the host could not serve), whose kept 0 is \
+          no choice.",
     parts: &[
         key("group", U64, ""),
         key("layer", U64, ""),
@@ -3443,7 +3444,11 @@ pub fn call_stream(group: usize, p: &CallPick) -> Record {
     };
     let r = if p.refused == 0 {
         r.u("backlog", p.backlog)
-            .u("fallback", u64::from(p.fallback))
+    } else {
+        r
+    };
+    let r = if p.fallback > 0 {
+        r.u("fallback", u64::from(p.fallback))
     } else {
         r
     };
