@@ -28,7 +28,19 @@ pub struct Unimplemented {
 pub enum Need {
     /// Grouped-query flash attention: `head` values per head, `group` query
     /// heads to a key head (the shape table picks the pack that serves it).
-    Gqa { head: u32, group: u32 },
+    ///
+    /// The flash is also built for `value` values per value head, a `window`
+    /// of positions (`None`: every position), per-head `sinks` and a
+    /// multiplier on the value rows (`scaled`); a row serves a need only
+    /// where they match what it runs.
+    Gqa {
+        head: u32,
+        value: u32,
+        group: u32,
+        window: Option<u32>,
+        sinks: bool,
+        scaled: bool,
+    },
     /// The per-head q/k norm (when `qk_norm`) and rope of a GQA layer.
     QkRope {
         qk_norm: bool,
@@ -127,7 +139,30 @@ pub enum Need {
 impl fmt::Display for Need {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Need::Gqa { head, group } => write!(f, "GQA flash, head {head}, group {group}"),
+            Need::Gqa {
+                head,
+                value,
+                group,
+                window,
+                sinks,
+                scaled,
+            } => {
+                write!(f, "GQA flash, head {head}")?;
+                if value != head {
+                    write!(f, ", value {value}")?;
+                }
+                write!(f, ", group {group}")?;
+                if let Some(w) = window {
+                    write!(f, ", window {w}")?;
+                }
+                if *sinks {
+                    f.write_str(", sinks")?;
+                }
+                if *scaled {
+                    f.write_str(", value scale")?;
+                }
+                Ok(())
+            }
             Need::QkRope {
                 qk_norm,
                 head,
@@ -289,7 +324,11 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             Mixer::Gqa(g) => {
                 at(Need::Gqa {
                     head: g.head_dim,
+                    value: g.value_dim,
                     group: g.group(),
+                    window: g.window,
+                    sinks: g.sinks,
+                    scaled: g.value_scale.is_some(),
                 });
                 at(Need::QkRope {
                     qk_norm: g.qk_norm,

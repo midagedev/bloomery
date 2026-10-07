@@ -61,11 +61,16 @@ pub fn spec_of(
                     heads: spec_u32("attention.head_count", hp.n_head)?,
                     kv_heads: spec_u32("attention.head_count_kv", hp.n_head_kv)?,
                     head_dim: spec_u32("attention.key_length", hp.head_dim)?,
+                    // The reader holds the file to one width for q, k and v.
+                    value_dim: spec_u32("attention.key_length", hp.head_dim)?,
                     rope,
                     qk_norm: has.contains(names::attn_q_norm(l).as_str())
                         && has.contains(names::attn_k_norm(l).as_str()),
                     out_gate: false,
                     select: None,
+                    window: None,
+                    sinks: false,
+                    value_scale: None,
                 }),
                 ffn: Ffn::Moe(Moe {
                     experts: spec_u32("expert_count", e.n_expert)?,

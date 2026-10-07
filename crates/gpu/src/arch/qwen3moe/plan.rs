@@ -408,6 +408,7 @@ mod tests {
             heads,
             kv_heads,
             head_dim: q35::HEAD_DIM,
+            value_dim: q35::HEAD_DIM,
             rope: Rope {
                 mode: RopeMode::Imrope {
                     sections: [11, 11, 10, 0],
@@ -419,6 +420,9 @@ mod tests {
             qk_norm: true,
             out_gate: true,
             select: None,
+            window: None,
+            sinks: false,
+            value_scale: None,
         })
     }
 

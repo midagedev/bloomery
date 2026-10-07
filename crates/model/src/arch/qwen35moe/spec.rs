@@ -95,6 +95,8 @@ pub fn spec_of(
                         heads,
                         kv_heads: spec_u32("attention.head_count_kv", hp.n_head_kv)?,
                         head_dim,
+                        // The reader holds the file to one width for q, k and v.
+                        value_dim: head_dim,
                         rope,
                         qk_norm: has(format!("blk.{l}.attn_q_norm.weight"))
                             && has(format!("blk.{l}.attn_k_norm.weight")),
@@ -109,6 +111,9 @@ pub fn spec_of(
                                 rule: PoolRule::Mean { rope },
                             }),
                         },
+                        window: None,
+                        sinks: false,
+                        value_scale: None,
                     })
                 }
             };

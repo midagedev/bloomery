@@ -1845,6 +1845,15 @@ gate-deepseek4-meta:
 gate-glm5next-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test glm5next_meta -- --ignored --nocapture'
 
+# mimo2 (MiMo-V2.6-Flash) header gate: first the synthetic headers are refused by name (short or scalar per-layer
+# arrays, the two QKV forms, wrong dimensions); then the reader's description of the RL file's header is pinned: the
+# per-layer KV-head and window arrays, the two head widths (key 192, value 128), the window, sinks and value scale
+# per layer, the rope base per layer kind, the sigmoid noaux_tc router, the coverage list and the KV values per
+# layer. A doctored real shard 0 with one KV array entry cut is refused by name, and so is the MTP-only file.
+# Headers only, seconds.
+gate-mimo2-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mimo2 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mimo2_meta -- --ignored --nocapture'
+
 # glm5next (GLM-5.3-Flash) end-to-end: the program loaded once by the gate placement on the 3090 (every routed expert
 # on the host tier, the host set of about 185 GB populated), against ik's sets (refset `ik-glm5next`): the step's
 # node count, graph = eager bit for bit, every layer's streams on the batch set within the derived band, and the argmax
