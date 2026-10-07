@@ -353,9 +353,8 @@ fn check_tokens(what: &'static str, b: &GlueBatch, m: usize) -> Result<(), GpuEr
 /// bytes are the table's, as [`StepRows`] reads them for a step.
 pub struct PromptRows {
     engram: Arc<Engram>,
-    embd: (usize, TensorInfo),
+    embd: RowLayout,
     embd_bytes: usize,
-    n_vocab: usize,
     n_cols: usize,
     row_bytes: usize,
     cap: usize,
@@ -380,7 +379,6 @@ impl StepRows {
             engram: Arc::clone(&self.engram),
             embd: self.embd.clone(),
             embd_bytes: self.embd_bytes,
-            n_vocab: self.n_vocab,
             n_cols: self.n_cols,
             row_bytes: self.row_bytes,
             cap,
@@ -445,7 +443,6 @@ impl PromptRows {
             }
             embd_rows_into(
                 &self.embd,
-                [self.embd_bytes, self.n_vocab],
                 &mut self.embd_rows[t * self.embd_bytes..][..m * self.embd_bytes],
                 file,
                 plan,

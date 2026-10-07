@@ -24,6 +24,7 @@ use gguf::quant::GgmlType;
 use model::arch::deepseek41::names as target_names;
 use model::arch::dspark::{self, Borrow, DraftHparams, DraftTensor, Group, names};
 use model::arch::models::shape::{MoeShape, rules, select_router};
+use model::embed::RowLayout;
 use model::placement::CardFormat;
 
 use crate::experts_mxfp4::{MxStack, ROUTER_ROW};
@@ -31,9 +32,8 @@ use crate::markov::MARKOV_ROW_WORDS;
 
 const WHAT: &str = "draft::load";
 
-/// Values of one Q3_K super-block, and its bytes.
+/// Values of one Q3_K super-block.
 const Q3_K_BLOCK: usize = 256;
-const Q3_K_BYTES: usize = 110;
 
 /// How the target's `token_embd` rows sit in its file, and so in the draft's
 /// buffers and images: the file's bytes, a row's words from its first byte.
@@ -65,9 +65,10 @@ impl EmbdRows {
     /// The file bytes of one row of `n_embd` values.
     #[must_use]
     pub fn row_bytes(self, n_embd: usize) -> usize {
-        match self {
-            EmbdRows::Bf16 => 2 * n_embd,
-            EmbdRows::Q3K => n_embd / Q3_K_BLOCK * Q3_K_BYTES,
+        let ty = self.ty();
+        match (ty.blck_size(), ty.type_size()) {
+            (Some(blck), Some(size)) => size as usize * (n_embd / blck as usize),
+            _ => unreachable!("bf16 and Q3_K are sized types"),
         }
     }
 
@@ -578,31 +579,21 @@ impl DraftWeights {
 }
 
 /// Row `id` of the embedding `name` of `split`, `k` values: its file bytes
-/// and their format, the row stride taken from the tensor's type. A type
-/// with no [`EmbdRows`] format is refused by name.
+/// and their format. The row walk is [`RowLayout`]'s; a type with no
+/// [`EmbdRows`] format is refused by name.
 pub(super) fn embedding_row<'a>(
     split: &'a Split,
     name: &str,
     k: usize,
     id: u32,
 ) -> Result<(&'a [u8], EmbdRows), GpuError> {
-    let (_, t) = split
-        .find(name)
-        .ok_or_else(|| missing(name.to_string(), "in the file"))?;
-    let embd = EmbdRows::of(t.ty, k).ok_or_else(|| GpuError::Shape {
+    let layout = RowLayout::open(split, name, k)?;
+    let embd = EmbdRows::of(layout.ty(), k).ok_or_else(|| GpuError::Shape {
         what: WHAT,
         detail: format!(
             "{name} is {}; the draft reads bf16 or Q3_K rows of {k}",
-            t.ty
+            layout.ty()
         ),
     })?;
-    let bytes = file_bytes(split, name)?;
-    let row = embd.row_bytes(k);
-    let past = || GpuError::Shape {
-        what: WHAT,
-        detail: format!("{name}: row {id} past its {} bytes", bytes.len()),
-    };
-    let at = row.checked_mul(id as usize).ok_or_else(past)?;
-    let end = at.checked_add(row).ok_or_else(past)?;
-    Ok((bytes.get(at..end).ok_or_else(past)?, embd))
+    Ok((layout.row(split, id)?, embd))
 }
