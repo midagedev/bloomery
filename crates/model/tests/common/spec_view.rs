@@ -66,9 +66,16 @@ pub fn layer_line(layer: &LayerSpec) -> String {
     let mut o = String::new();
     match &layer.mixer {
         Mixer::Gqa(g) => {
+            // The value width joins the line only where it leaves the head's:
+            // every attached model's pins keep their text.
+            let v = if g.value_dim != g.head_dim {
+                format!(" v {}", g.value_dim)
+            } else {
+                String::new()
+            };
             let _ = write!(
                 o,
-                "gqa {}/{} x {} rope {} qk_norm {} out_gate {}",
+                "gqa {}/{} x {}{v} rope {} qk_norm {} out_gate {}",
                 g.heads,
                 g.kv_heads,
                 g.head_dim,
@@ -76,6 +83,17 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                 g.qk_norm,
                 g.out_gate
             );
+            // The window, sinks and value scale join the line only where set,
+            // for the same reason.
+            if let Some(w) = g.window {
+                let _ = write!(o, " win {w}");
+            }
+            if g.sinks {
+                o.push_str(" sinks");
+            }
+            if let Some(x) = g.value_scale {
+                let _ = write!(o, " vscale {x}");
+            }
             select(&mut o, g.select.as_ref());
         }
         Mixer::Latent(a) => {

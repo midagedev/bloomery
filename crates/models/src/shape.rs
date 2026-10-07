@@ -234,6 +234,14 @@ pub enum Refusal {
     Group,
     /// No flash is built for this head width.
     HeadWidth { served: Vec<u32> },
+    /// The value width is not the head width: no flash instance splits them.
+    ValueWidth { head: u32, value: u32 },
+    /// The layer attends a window of the positions: no flash cuts one.
+    Window { positions: u32 },
+    /// The layer carries per-head softmax sinks: no flash folds them in.
+    Sinks,
+    /// The layer scales its value rows: no flash applies the multiplier.
+    ValueScale,
     /// The head width's flashes take another query-head group.
     GqaGroup { group: u32, served: Vec<String> },
 }
@@ -295,6 +303,15 @@ impl fmt::Display for ShapeRefused {
             Refusal::HeadWidth { served } => {
                 write!(f, "no flash is built for this head; heads {served:?} are")
             }
+            Refusal::ValueWidth { head, value } => write!(
+                f,
+                "no flash splits the value width from the head width (head {head}, value {value})"
+            ),
+            Refusal::Window { positions } => {
+                write!(f, "no flash cuts a window of {positions} positions")
+            }
+            Refusal::Sinks => f.write_str("no flash folds per-head softmax sinks into the softmax"),
+            Refusal::ValueScale => f.write_str("no flash scales the value rows"),
             Refusal::GqaGroup { group, served } => write!(
                 f,
                 "group {group}; this head's flashes take {}",
@@ -383,6 +400,9 @@ pub mod rules {
     pub const SOFTMAX_NORM_GATED: RouterRule = super::SOFTMAX_NORM_GATED;
     /// √softplus scores, a selection bias, the kept scores renormalized.
     pub const BIASED_SQRT_SOFTPLUS: RouterRule = super::BIASED_SQRT_SOFTPLUS;
+    /// Sigmoid scores, a selection bias steering the choice only, the kept
+    /// unbiased scores renormalized: GLM-5.3's and MiMo-V2's noaux_tc router.
+    pub const BIASED_SIGMOID: RouterRule = super::BIASED_SIGMOID;
 }
 
 const fn body_eq(a: RouterBody, b: RouterBody) -> bool {
@@ -403,8 +423,18 @@ const fn score_eq(a: Score, b: Score) -> bool {
 pub struct AttnShape {
     pub n_head: u32,
     pub n_kv: u32,
-    /// Values per head.
+    /// Key and score values per head.
     pub head: u32,
+    /// Value values per head; every compiled flash takes it equal to `head`
+    /// — the first instance that splits them carries the width it is built
+    /// for in its row.
+    pub value: u32,
+    /// The positions attended; `None`: every position.
+    pub window: Option<u32>,
+    /// Per-head softmax sinks.
+    pub sinks: bool,
+    /// The value rows carry a multiplier.
+    pub scaled: bool,
 }
 
 impl AttnShape {
@@ -415,6 +445,10 @@ impl AttnShape {
             n_head: g.heads,
             n_kv: g.kv_heads,
             head: g.head_dim,
+            value: g.value_dim,
+            window: g.window,
+            sinks: g.sinks,
+            scaled: g.value_scale.is_some(),
         }
     }
 }
@@ -500,6 +534,21 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     };
     if s.n_kv == 0 || s.n_head == 0 || !s.n_head.is_multiple_of(s.n_kv) {
         return Err(refuse(Refusal::Group));
+    }
+    if s.value != s.head {
+        return Err(refuse(Refusal::ValueWidth {
+            head: s.head,
+            value: s.value,
+        }));
+    }
+    if let Some(positions) = s.window {
+        return Err(refuse(Refusal::Window { positions }));
+    }
+    if s.sinks {
+        return Err(refuse(Refusal::Sinks));
+    }
+    if s.scaled {
+        return Err(refuse(Refusal::ValueScale));
     }
     let group = s.n_head / s.n_kv;
     let width: Vec<&GqaInst> = GQA.iter().filter(|r| r.head == s.head).collect();
@@ -704,7 +753,15 @@ mod tests {
     }
 
     fn attn(n_head: u32, n_kv: u32, head: u32) -> AttnShape {
-        AttnShape { n_head, n_kv, head }
+        AttnShape {
+            n_head,
+            n_kv,
+            head,
+            value: head,
+            window: None,
+            sinks: false,
+            scaled: false,
+        }
     }
 
     /// Qwen3 32/4 × 128 (qwen3moe_meta.rs:409), Qwen3.6 16/2 × 256
@@ -746,6 +803,82 @@ mod tests {
         }
         let e = select_gqa(attn(24, 8, 256)).expect_err("group 3");
         assert!(e.to_string().contains("group 3"), "{e}");
+    }
+
+    /// A value width narrower than the head (MiMo-V2's K 192 / V 128) is
+    /// refused by name until a flash instance carries its width in its row;
+    /// the refusal names both widths.
+    #[test]
+    fn a_value_width_off_the_head_is_refused_by_name() {
+        let s = AttnShape {
+            n_head: 64,
+            n_kv: 4,
+            head: 192,
+            value: 128,
+            window: None,
+            sinks: false,
+            scaled: false,
+        };
+        let e = select_gqa(s).expect_err("K 192 V 128");
+        assert_eq!(
+            e.why,
+            Refusal::ValueWidth {
+                head: 192,
+                value: 128
+            }
+        );
+        assert!(
+            e.to_string()
+                .contains("no flash splits the value width from the head width"),
+            "{e}"
+        );
+        assert_eq!(e.shape, Shape::Attn(s));
+    }
+
+    /// A window, sinks or a value scale on a shape every flash row serves is
+    /// refused by name: the row's kernels run none of the three.
+    #[test]
+    fn a_window_sinks_or_value_scale_is_refused_by_name() {
+        let base = attn(32, 4, 128);
+        assert!(select_gqa(base).is_ok());
+        let windowed = AttnShape {
+            window: Some(128),
+            ..base
+        };
+        let sunk = AttnShape {
+            sinks: true,
+            ..base
+        };
+        let scaled = AttnShape {
+            scaled: true,
+            ..base
+        };
+        assert_eq!(
+            select_gqa(windowed).expect_err("a window").why,
+            Refusal::Window { positions: 128 }
+        );
+        assert_eq!(select_gqa(sunk).expect_err("sinks").why, Refusal::Sinks);
+        assert_eq!(
+            select_gqa(scaled).expect_err("a value scale").why,
+            Refusal::ValueScale
+        );
+        let e = select_gqa(windowed).expect_err("a window");
+        assert!(e.to_string().contains("window of 128 positions"), "{e}");
+    }
+
+    /// GLM-5.3's biased sigmoid rule is the shared one the module exports:
+    /// the noaux_tc router (sigmoid, the bias steering the choice only, the
+    /// kept unbiased scores renormalized) MiMo-V2 runs too.
+    #[test]
+    fn the_biased_sigmoid_rule_is_glm_5_3_flashs() {
+        let rule = RouterRule {
+            score: Score::Sigmoid,
+            bias: true,
+            norm: true,
+            gated: false,
+        };
+        assert_eq!(rules::BIASED_SIGMOID, rule);
+        assert!(select_router(moe(rule, 288, 8)).is_ok());
     }
 
     #[test]

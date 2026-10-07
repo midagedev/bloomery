@@ -58,6 +58,7 @@ pub enum Arch {
     Qwen35,
     Qwen4Exp,
     Glm5Next,
+    MiMo2,
 }
 
 impl Arch {
@@ -72,6 +73,7 @@ impl Arch {
             Arch::Qwen35 => "qwen35",
             Arch::Qwen4Exp => "qwen4exp",
             Arch::Glm5Next => "glm5next",
+            Arch::MiMo2 => "mimo2",
         }
     }
 }
@@ -155,8 +157,12 @@ pub struct Gqa {
     pub heads: u32,
     /// `attention.head_count_kv`; `heads` is a multiple of it.
     pub kv_heads: u32,
-    /// `attention.key_length`, which the value length equals: values per head.
+    /// `attention.key_length`: key and score values per head.
     pub head_dim: u32,
+    /// `attention.value_length`: value values per head; equal to `head_dim`
+    /// in every architecture but MiMo-V2's, whose value projection writes a
+    /// narrower head.
+    pub value_dim: u32,
     pub rope: Rope,
     /// A per-head RMS gain on q and k before the rope.
     pub qk_norm: bool,
@@ -164,6 +170,12 @@ pub struct Gqa {
     pub out_gate: bool,
     /// `None`: every position is attended.
     pub select: Option<Selector>,
+    /// The raw positions attended; `None`: every position.
+    pub window: Option<u32>,
+    /// A per-head softmax sink (`attn_sinks`).
+    pub sinks: bool,
+    /// A multiplier on the attention's value rows; `None`: 1.
+    pub value_scale: Option<f32>,
 }
 
 impl Gqa {
@@ -580,6 +592,9 @@ pub enum ToolFormat {
     Dsml,
     /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
     GlmXml,
+    /// Qwen's `<tool_call><function=NAME><parameter=KEY>…</parameter>
+    /// </function></tool_call>`, which MiMo-V2's template teaches.
+    QwenXml,
 }
 
 /// A reasoning span syntax.

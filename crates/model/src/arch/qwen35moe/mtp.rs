@@ -226,6 +226,7 @@ pub fn mtp_of(
             heads: t.gqa.heads,
             kv_heads: t.gqa.kv_heads,
             head_dim: t.gqa.head_dim,
+            value_dim: t.gqa.value_dim,
             rope: Rope {
                 mode: RopeMode::Imrope {
                     sections: sections(draft)?,
@@ -240,6 +241,9 @@ pub fn mtp_of(
             qk_norm: true,
             out_gate: out_gate(q, rows, t.gqa.heads, t.gqa.head_dim)?,
             select: None,
+            window: None,
+            sinks: false,
+            value_scale: None,
         }),
         // The keys matched the target's, and the architecture's router and
         // shared-expert gate are its constants: the target's block.

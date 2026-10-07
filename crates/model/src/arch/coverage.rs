@@ -53,6 +53,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen35Moe | Arch::Qwen35 => Some(Program::Qwen35Body),
         Arch::Glm5Next => Some(Program::Glm5nextBody),
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
+        Arch::MiMo2 => None,
     }
 }
 
@@ -125,7 +126,19 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::Qwen3moeBody, Program::Qwen35Body],
         at: "models/src/shape.rs GQA",
-        runs: |n| matches!(n, Need::Gqa { head, group } if gqa_row(*head, *group).is_some()),
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head,
+                    value,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                } if value == head && gqa_row(*head, *group).is_some()
+            )
+        },
     },
     Available {
         programs: &[Program::Qwen3moeBody],
@@ -336,7 +349,19 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::Qwen38Body],
         at: "models/src/shape.rs GQA, the `_256_p4` flash (Body38)",
-        runs: |n| matches!(n, Need::Gqa { head: 256, group: 12 } if gqa_row(256, 12).is_some()),
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head: 256,
+                    value: 256,
+                    group: 12,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                } if gqa_row(256, 12).is_some()
+            )
+        },
     },
     Available {
         programs: &[Program::Qwen38Body],
@@ -952,6 +977,79 @@ mod tests {
             .iter()
             .map(Need::to_string)
             .collect()
+    }
+
+    /// The Qwen bodies launch a flash with the value head the key head's
+    /// width and no window, sinks or value scale: a need that differs in
+    /// any of the four is no row's, so a MiMo layer is never read as covered.
+    #[test]
+    fn a_gqa_need_beyond_what_the_qwen_bodies_launch_is_uncovered() {
+        use super::AVAILABLE;
+        let plain = Need::Gqa {
+            head: 128,
+            value: 128,
+            group: 8,
+            window: None,
+            sinks: false,
+            scaled: false,
+        };
+        let runs = |n: &Need| {
+            AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&Program::Qwen3moeBody) && (a.runs)(n))
+        };
+        assert!(runs(&plain), "the plain head-128 flash is the body's");
+        let Need::Gqa { head, group, .. } = plain else {
+            unreachable!()
+        };
+        for (what, need) in [
+            (
+                "a narrower value head",
+                Need::Gqa {
+                    head,
+                    value: 64,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                },
+            ),
+            (
+                "a window",
+                Need::Gqa {
+                    head,
+                    value: head,
+                    group,
+                    window: Some(128),
+                    sinks: false,
+                    scaled: false,
+                },
+            ),
+            (
+                "sinks",
+                Need::Gqa {
+                    head,
+                    value: head,
+                    group,
+                    window: None,
+                    sinks: true,
+                    scaled: false,
+                },
+            ),
+            (
+                "a value scale",
+                Need::Gqa {
+                    head,
+                    value: head,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: true,
+                },
+            ),
+        ] {
+            assert!(!runs(&need), "{what} read as covered: {need}");
+        }
     }
 
     /// qwen35 and qwen35moe files are `Body35`'s, qwen3moe files `Body`'s.

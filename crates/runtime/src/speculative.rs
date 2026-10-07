@@ -1210,6 +1210,7 @@ mod tests {
                 heads: 4,
                 kv_heads: 2,
                 head_dim: 16,
+                value_dim: 16,
                 rope: Rope {
                     mode: RopeMode::Neox,
                     dims: 16,
@@ -1219,6 +1220,9 @@ mod tests {
                 qk_norm: true,
                 out_gate: true,
                 select: None,
+                window: None,
+                sinks: false,
+                value_scale: None,
             }),
             ffn: Ffn::Dense {
                 ff: 128,

@@ -15,6 +15,7 @@ pub mod deepseek2;
 pub mod deepseek41;
 pub mod dspark;
 pub mod glm5next;
+pub mod mimo2;
 pub mod qwen35moe;
 pub mod qwen3moe;
 
@@ -32,6 +33,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some("qwen3moe") => qwen3moe::spec::read(split)?,
         Some("qwen35moe" | "qwen35" | "qwen4exp") => qwen35moe::spec::read(split)?,
         Some("glm5next") => glm5next::spec::read(split)?,
+        Some("mimo2") => mimo2::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
                 other.unwrap_or("<missing>").to_string(),
@@ -511,6 +513,19 @@ mod tests {
             .to_string();
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("qwen4exp.block_count"), "{err}");
+    }
+
+    /// A `mimo2` header goes to its reader, which refuses a file without
+    /// keys by the first key it reads.
+    #[test]
+    fn a_mimo2_header_goes_to_its_reader() {
+        let path = super::synthetic::header("mimo2-spec", "mimo2", &[], &[]);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = super::spec(&split)
+            .expect_err("a header without keys")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("mimo2.block_count"), "{err}");
     }
 
     #[test]

@@ -2548,6 +2548,7 @@ mod tests {
                         heads: 24,
                         kv_heads: 2,
                         head_dim: 256,
+                        value_dim: 256,
                         rope: Rope {
                             mode: RopeMode::Imrope {
                                 sections: [11, 11, 10, 0],
@@ -2559,6 +2560,9 @@ mod tests {
                         qk_norm: true,
                         out_gate: true,
                         select: None,
+                        window: None,
+                        sinks: false,
+                        value_scale: None,
                     }),
                     ffn: Ffn::Moe(Moe {
                         experts: 512,
