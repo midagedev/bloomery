@@ -2894,6 +2894,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEVER,
+    &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_HOST,
     &LOAD_GENERATOR,

@@ -535,11 +535,8 @@ impl Placed {
         let machine = place.machine(None, tier_batch)?(inputs.model.layers);
         let rule = ctx_of(inputs, &machine, levers, nextn, set, slots)?;
         let ctx = u64::try_from(rule.ctx)?;
-        let tier_experts = plan_of(inputs, &machine, ctx, levers, nextn, slots)?
-            .tier_n_l
-            .iter()
-            .flatten()
-            .sum();
+        let tier_experts =
+            glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?;
         Ok(Placed {
             place,
             tier_batch,

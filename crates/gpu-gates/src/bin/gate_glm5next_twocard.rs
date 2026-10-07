@@ -122,7 +122,12 @@
 //! `cards` item exactly the driver name of the device the placement resolves
 //! to; the same check on
 //! the line with its first card's name grown by a letter inside the brackets
-//! is red. Two loads, one a process.
+//! is red. A child run with no `--place` takes the common unset rule
+//! (`generate::Place::choose`, by the GLM family's rule): on this gate's two
+//! cards its `place unset` record keeps `bp`, the offer's tier at or past the
+//! rule's break-even, naming the tier's experts in the plan at the child's
+//! default context and the rule's break-even and basis. Three loads, one a
+//! process.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -202,6 +207,14 @@ mod gate {
     const REFUSE_BOUND_S: f64 = 120.0;
     /// Prompt ids the `--records` arm's child runs.
     const RECORD_TOKENS: usize = 8;
+    /// The GLM family's unset rule as the child names it
+    /// (`shared/glm5next_place.rs`'s `TIER_RULE`): the tier experts that keep
+    /// the offer's tier card, and the card file that decides them.
+    const BREAK_EVEN: u64 = 526;
+    const TIER_BASIS: &str = "docs/cards/glmbp-ab.card";
+    /// The experts the child's plan of `bp` puts on this box's 3090 at its
+    /// default context, a band for the free bytes each census reads.
+    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1503..=1529;
 
     /// The prompt: the `d1k` set's prefill ids.
     fn prompt() -> Result<Vec<u32>, GateError> {
@@ -1356,20 +1369,29 @@ mod gate {
 
     // ------------------------------------------------ the load record's cards
 
-    /// The `load` record `generate_glm5next --place <place>` prints: the
-    /// binary beside this one, a short run of `ids`, stdout read whole by its
-    /// kinds.
-    fn load_record(place: &str, ids: &[u32]) -> Result<Fields, GateError> {
+    /// The binary's first record of `kind` of a short run of `ids` under
+    /// `args`: `generate_glm5next` beside this one, its stdout read whole by
+    /// its kinds, an error naming the run on a non-zero exit.
+    fn child_record(
+        kind: &'static record::Kind,
+        args: &[&str],
+        ids: &[u32],
+    ) -> Result<Fields, GateError> {
         let exe = std::env::current_exe()?.with_file_name("generate_glm5next");
         let tokens: Vec<String> = ids.iter().map(u32::to_string).collect();
         let out = std::process::Command::new(&exe)
-            .args(["--place", place, "--tokens", &tokens.join(","), "-n", "2"])
+            .args(args)
+            .arg("--tokens")
+            .arg(tokens.join(","))
+            .arg("-n")
+            .arg("2")
             .stdin(std::process::Stdio::null())
             .output()
             .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
         if !out.status.success() {
             return Err(format!(
-                "generate_glm5next --place {place}: {}; stderr: {}",
+                "generate_glm5next {}: {}; stderr: {}",
+                args.join(" "),
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
             )
@@ -1377,8 +1399,20 @@ mod gate {
         }
         let stdout = String::from_utf8(out.stdout)?;
         let log = record::Log::of(&stdout, record::GENERATE_GLM5NEXT)
-            .named(format!("generate_glm5next --place {place}"));
-        Ok(log.one(&record::LOAD_GENERATOR)?)
+            .named(format!("generate_glm5next {}", args.join(" ")));
+        Ok(log.one(kind)?)
+    }
+
+    /// The `load` record `generate_glm5next --place <place>` prints: a short
+    /// child run of `ids` ([`Self::child_record`]).
+    fn load_record(place: &str, ids: &[u32]) -> Result<Fields, GateError> {
+        child_record(&record::LOAD_GENERATOR, &["--place", place], ids)
+    }
+
+    /// The `place unset` record a child run with no `--place` prints: the
+    /// common rule's choice on this process's cards ([`Self::child_record`]).
+    fn unset_record(ids: &[u32]) -> Result<Fields, GateError> {
+        child_record(&record::PLACE_UNSET, &[], ids)
     }
 
     /// Whether `load`'s `cards` are exactly `want`, in order: each the
@@ -1452,6 +1486,33 @@ mod gate {
             );
             pass &= line;
         }
+        // A run with no `--place` takes the common rule: on this gate's two
+        // cards the offer is `bp`, kept at or past the family's break-even —
+        // the `place unset` record names the word, why, the tier's experts
+        // in the plan at the child's default context, and the rule's
+        // break-even and basis. FAIL-first: a CLI that keeps a placement of
+        // its own prints no `place unset` line, and the record read is red.
+        let unset = held(
+            "records-unset",
+            unset_record(ids).and_then(|p| {
+                let (place, why) = (p.word("place")?, p.text("why")?);
+                let tier = p.opt_u64("tier_experts")?;
+                let ok = place == "bp"
+                    && why == "two cards, tier at or past the break-even"
+                    && tier.is_some_and(|t| BP_TIER_EXPERTS.contains(&t) && t >= BREAK_EVEN)
+                    && p.opt_u64("break_even")? == Some(BREAK_EVEN)
+                    && p.opt_word("basis")? == Some(TIER_BASIS);
+                println!(
+                    "no --place: place unset place={place} why={why} tier_experts={tier:?} \
+                     break_even={:?} basis={:?}: {}",
+                    p.opt_u64("break_even")?,
+                    p.opt_word("basis")?,
+                    verdict(ok)
+                );
+                Ok(ok)
+            }),
+        );
+        pass &= unset;
         Ok(pass)
     }
 }
