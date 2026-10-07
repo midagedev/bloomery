@@ -882,6 +882,9 @@ pub struct HostScratch {
     xs: Vec<&'static Tensor2>,
     /// The down dispatch's inputs, the combines; empty between calls.
     srcs: Vec<GroupInput<'static>>,
+    /// The call's expert ids as the tier's `ensure` takes them, reused
+    /// across calls so a paged call allocates nothing.
+    tier_ids: Vec<u32>,
 }
 
 impl HostScratch {
@@ -910,6 +913,7 @@ impl HostScratch {
             down_w: Vec::with_capacity(n_used),
             xs: Vec::with_capacity(2 * n_used),
             srcs: Vec::with_capacity(n_used),
+            tier_ids: Vec::new(),
         })
     }
 
@@ -1192,6 +1196,9 @@ pub struct UnionScratch {
     /// `min(max_cols, DEFER_MAX_COLS) · per_list`, every expert such a call
     /// can list.
     claims: Vec<AtomicU8>,
+    /// The call's expert ids as the tier's `ensure` takes them, reused
+    /// across calls so a paged call allocates nothing.
+    tier_ids: Vec<u32>,
 }
 
 impl UnionScratch {
@@ -1306,6 +1313,7 @@ impl UnionScratch {
             claims: (0..cols.min(DEFER_MAX_COLS) * per_list)
                 .map(|_| AtomicU8::new(0))
                 .collect(),
+            tier_ids: Vec::new(),
         }
     }
 
@@ -1589,6 +1597,55 @@ impl GateUp {
     }
 }
 
+/// Why the host tier's NVMe tier refused a call: the named refusals the
+/// tier raises at the [`TierSlots`] seam, carried by [`ModelError::Tier`]
+/// wherever the host leg can meet them.
+#[derive(Debug, thiserror::Error)]
+pub enum TierError {
+    /// The tier holds the expert but its slot is unfilled: `ensure` did not
+    /// fill it before the call read it — never a silent mapping fallback,
+    /// which would hide a skipped `ensure` behind the right bytes.
+    #[error(
+        "the NVMe tier's slot for layer {layer} expert {id} is unfilled: ensure it before the call"
+    )]
+    Unfilled { layer: usize, id: u32 },
+    /// A fill's read failed: the tier's own error, naming what it read.
+    #[error("layer {layer} expert {id}: filling its slot: {source}")]
+    Fill {
+        layer: usize,
+        id: u32,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// The RAM arena a host layer's routed experts read from beside the file
+/// mapping, as the gpu side holds it: `ensure` fills the slots of the ids a
+/// call is about to read (a miss is read before the compute, so a call's
+/// bytes are exact), `slot` lends one expert's part — `part` 0 the gate,
+/// 1 the up, 2 the down — as the arena holds it, `None` when the slot is
+/// unfilled. The trait is the model side's handle because the arena is the
+/// gpu side's; the choice which expert reads where is the layer's
+/// ([`HostLayer::experts_into`]), not the arena's.
+pub trait TierSlots: Send + Sync {
+    /// Fill the slots of `layer`'s `ids` the tier does not already hold.
+    fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), TierError>;
+    /// Layer `layer`, expert `id`, part `part`'s bytes as the tier holds
+    /// them; `None` when its slot is unfilled.
+    fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
+}
+
+/// One layer's tier handle: the layer's own index (the arena's books are
+/// per layer), the plan's host segment for it (the ids the file mapping
+/// serves; every other id — the NVMe segment's and the card's victims — is
+/// the arena's), and the arena itself. Attached after the layer's build
+/// ([`HostLayer::attach_tier`]); a layer with none reads the mapping as it
+/// always did.
+struct LayerTier {
+    layer: usize,
+    host: std::ops::Range<u32>,
+    slots: std::sync::Arc<dyn TierSlots>,
+}
+
 /// One layer's routed experts as a host tier serves them: the three stacks —
 /// the gate and the up from the file or from its r8 sidecar, the down from
 /// the file — and the SwiGLU limit. Built once at load
@@ -1600,6 +1657,7 @@ pub struct HostLayer {
     down: ShardTensor,
     n_expert: usize,
     limit: f32,
+    tier: Option<LayerTier>,
 }
 
 impl HostLayer {
@@ -1663,7 +1721,52 @@ impl HostLayer {
             down,
             n_expert: spec.n_expert,
             limit: spec.swiglu_limit,
+            tier: None,
         })
+    }
+
+    /// Give this layer — the `layer`-th of the run — the NVMe tier's arena
+    /// and the plan's host segment for it: every id outside `host` the layer
+    /// reads from the arena ([`TierSlots::slot`]), every id inside it from
+    /// the file mapping as before. Load-time only, once; the arena outlives
+    /// the layer (the run and the tiers share it).
+    pub fn attach_tier(
+        &mut self,
+        layer: usize,
+        host: std::ops::Range<u32>,
+        slots: std::sync::Arc<dyn TierSlots>,
+    ) {
+        self.tier = Some(LayerTier { layer, host, slots });
+    }
+
+    /// One expert's part as this layer serves it, the one owner of the
+    /// choice: `cut` the file mapping's weight when the tier is absent or
+    /// the plan's host segment holds the id, else the arena slot's bytes
+    /// over the part's stack header — whose byte range the slot's bytes
+    /// mirror — refused by name when the slot is unfilled, never a silent
+    /// fallback to the mapping.
+    fn tier_or_mapping<'a>(
+        &'a self,
+        e: u32,
+        part: usize,
+        stack: &ShardTensor,
+        layout: RowLayout,
+        cut: impl FnOnce() -> Result<Weight<'a>, ModelError>,
+    ) -> Result<Weight<'a>, ModelError> {
+        let Some(tier) = &self.tier else {
+            return cut();
+        };
+        if tier.host.contains(&e) {
+            return cut();
+        }
+        match tier.slots.slot(tier.layer, e, part) {
+            Some(bytes) => ops::expert_weight(stack.info(), bytes, 0, layout),
+            None => Err(TierError::Unfilled {
+                layer: tier.layer,
+                id: e,
+            }
+            .into()),
+        }
     }
 
     /// The three stacks, `[gate, up, down]`, as the source file holds them:
@@ -1730,16 +1833,26 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         check_host_call(x, experts, out, scratch.n_used)?;
+        if let Some(tier) = &self.tier {
+            scratch.tier_ids.clear();
+            scratch.tier_ids.extend(experts.iter().map(|&(e, _)| e));
+            tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
+        }
         out.fill(0.0);
         if experts.is_empty() {
             return Ok(());
         }
         let weights = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
-            let e = e as usize;
             Ok([
-                self.gate.expert(split, e)?,
-                self.up.expert(split, e)?,
-                self.down.expert(split, e)?,
+                self.tier_or_mapping(e, 0, self.gate.source(), self.gate.layout(), || {
+                    self.gate.expert(split, e as usize)
+                })?,
+                self.tier_or_mapping(e, 1, self.up.source(), self.up.layout(), || {
+                    self.up.expert(split, e as usize)
+                })?,
+                self.tier_or_mapping(e, 2, &self.down, RowLayout::Rows, || {
+                    self.down.expert(split, e as usize)
+                })?,
             ])
         };
         serve(weights, Some(self.limit), x, experts, out, scratch)
@@ -1762,6 +1875,13 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         let x = x.into();
+        if let Some(tier) = &self.tier {
+            scratch.tier_ids.clear();
+            scratch
+                .tier_ids
+                .extend(lists.iter().flat_map(|l| l.iter().map(|&(e, _)| e)));
+            tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
+        }
         check_union_call(
             x,
             lists,
@@ -2271,5 +2391,156 @@ mod tests {
             "the union of lists of ten differs from its columns"
         );
         assert_eq!(passes, want_passes, "a narrow call's passes");
+    }
+
+    // ------------------------------------------------- the NVMe tier's slot
+
+    /// A [`super::TierSlots`] for the accessor tests: it owns every expert's
+    /// three parts as its slots' bytes (read from the layer's own file, so a
+    /// filled slot lends exactly the mapping's bytes), records the ids
+    /// `ensure` saw, and with `filled` off lends nothing — every slot
+    /// unfilled.
+    struct MockTier {
+        parts: Vec<Vec<u8>>,
+        filled: bool,
+        ensured: std::sync::Mutex<Vec<(usize, Vec<u32>)>>,
+    }
+
+    impl MockTier {
+        /// The tier over `layer`'s stacks of `split`, `filled` or not.
+        fn of(split: &gguf::Split, layer: &HostLayer, filled: bool) -> MockTier {
+            let n = layer.n_expert();
+            let stacks = layer.stacks();
+            let mut parts = Vec::with_capacity(3 * n);
+            for e in 0..n {
+                for s in stacks {
+                    parts.push(
+                        ops::ShardTensor::expert(s, split, e)
+                            .unwrap()
+                            .bytes()
+                            .to_vec(),
+                    );
+                }
+            }
+            MockTier {
+                parts,
+                filled,
+                ensured: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn ensured(&self) -> Vec<(usize, Vec<u32>)> {
+            self.ensured.lock().unwrap().clone()
+        }
+    }
+
+    impl super::TierSlots for MockTier {
+        fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), super::TierError> {
+            self.ensured.lock().unwrap().push((layer, ids.to_vec()));
+            Ok(())
+        }
+
+        fn slot(&self, _layer: usize, id: u32, part: usize) -> Option<&[u8]> {
+            self.filled.then(|| &self.parts[3 * id as usize + part][..])
+        }
+    }
+
+    /// The host segment's ids read the mapping and every other id the tier's
+    /// slot: an unfilled slot is refused by name, naming its layer and
+    /// expert, never a silent fallback to the mapping — and a filled slot
+    /// lends bytes the call turns into the mapping's own values, bit for
+    /// bit, while the `ensure` hook saw the call's ids.
+    #[test]
+    fn a_tier_slot_is_lent_or_refused_by_name() {
+        let (embd, ff, n_expert) = (256, 256, 6);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("tier", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let list = [(0u32, 0.4f32), (2, 0.6)];
+        let mut scratch = HostScratch::new(embd, ff, 3).unwrap();
+
+        // The unfilled slot: the plan's host segment holds id 1 alone, so
+        // the call's other ids are the tier's, whose slots lend nothing.
+        let empty = std::sync::Arc::new(MockTier::of(&split, &layer, false));
+        layer.attach_tier(4, 1..2, empty.clone());
+        match layer.experts_into(
+            R8Source::rows(&split),
+            &x,
+            &list,
+            &mut vec![0.0; embd],
+            &mut scratch,
+        ) {
+            Err(crate::ModelError::Tier(e @ super::TierError::Unfilled { layer: 4, id: 0 })) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unfilled") && msg.contains('4') && msg.contains('0'),
+                    "{msg}"
+                );
+            }
+            other => panic!("not the unfilled refusal by name: {other:?}"),
+        }
+        assert_eq!(
+            empty.ensured(),
+            vec![(4, vec![0, 2])],
+            "the ensure hook saw the call's ids at the tier's layer"
+        );
+
+        // The filled slot: bytes the call turns into the mapping's own
+        // values — the no-tier path's, bit for bit.
+        let full = std::sync::Arc::new(MockTier::of(&split, &layer, true));
+        layer.attach_tier(4, 1..2, full.clone());
+        let mut want = vec![f32::NAN; embd];
+        layer
+            .experts_into(R8Source::rows(&split), &x, &list, &mut want, &mut scratch)
+            .unwrap();
+        let plain = build_layer(&split, embd, ff, n_expert).unwrap();
+        let mut got = vec![f32::NAN; embd];
+        plain
+            .experts_into(R8Source::rows(&split), &x, &list, &mut got, &mut scratch)
+            .unwrap();
+        assert_eq!(
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a filled slot's call writes the mapping path's values"
+        );
+
+        // The union path's hook: the same ensure over its columns' ids, and
+        // the call's bits the plain path's.
+        let cols = 3;
+        let xw = Tensor2::from_vec(
+            embd,
+            cols,
+            (0..embd * cols)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+            .map(|j| [(j as u32 % 3, 0.5), (1, 0.5)].to_vec())
+            .collect();
+        let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+        let mut us_tier = UnionScratch::new_routed(embd, ff, 8, 3).unwrap();
+        let mut us_plain = UnionScratch::new_routed(embd, ff, 8, 3).unwrap();
+        let mut a = vec![f32::NAN; embd * cols];
+        layer
+            .experts_union_into(R8Source::rows(&split), &xw, &slices, &mut a, &mut us_tier)
+            .unwrap();
+        let mut b = vec![f32::NAN; embd * cols];
+        plain
+            .experts_union_into(R8Source::rows(&split), &xw, &slices, &mut b, &mut us_plain)
+            .unwrap();
+        assert_eq!(
+            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a tier-bearing union call writes the plain path's values"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 }

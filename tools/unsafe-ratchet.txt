@@ -14,7 +14,10 @@ decision 2 0 0
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
 # pages with libc's madvise, one block with its SAFETY line; a site's advice went through memmap2's safe call on its
 # own Mmap, which a split's &[u8] cannot take.
-engram 7 0 0
+# PIN(2026-10-08): engram 7 -> 8 blocks, new code, not old code relaxed: direct::AnonMap's DONTNEED
+# over its own anonymous mapping's range through memmap2's unchecked range advice, with its SAFETY
+# line — the safe Advice enum carries no DontNeed.
+engram 8 0 0
 engram-lab 0 0 0
 gguf 9 2 0
 # PIN(2026-10-01): gpu 1354 -> 1356, a new kernel entry, not old code relaxed: kda_delta_lanes (GLM's two-row
@@ -131,7 +134,11 @@ gguf 9 2 0
 # PIN(2026-10-08): gpu 1606 -> 1628 blocks and 173 -> 178 fns, moved code, not new code and not old code relaxed:
 # route_body.rs takes the router bodies from gpu-deepseek41's router.rs (router_body, scores_body, pick_body and the
 # publish_n and select_n stages they call): 22 blocks and 5 unsafe fns, each with its SAFETY line.
-gpu 1620 177 6
+# PIN(2026-10-08): gpu 1620 -> 1621 blocks, 6 -> 8 impls, new code, not old code relaxed: the NVMe
+# tier's arena fills its slots from the resident pool (host/nvtier.rs, the memcpy_pool idiom) — one
+# block building the pick's window slice, SharedArena's Send and Sync impls owning its disjoint-slot
+# argument, each with its SAFETY line.
+gpu 1621 177 8
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
