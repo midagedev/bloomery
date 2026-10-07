@@ -523,6 +523,52 @@ pp_means() {
     spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
     printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [cpu-busy %d/%d] [other-busy %d/%d] [cold %d/%d] [probe-off %d/%d]  untagged mean %s\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], c[k], n[k], o[k], n[k], f[k], n[k], po[k], n[k], (nx[k] ? sprintf("%.2f tok/s(pp) (n=%d)", sx[k] / nx[k], nx[k]) : "n/a (every row tagged)") } }' | sort
 }
+# ratio_table <prefix> <keys> <labels> <tagged> <tag field> [base]: records `label|key|round|value|…` on
+# stdin; for every key and every label of <labels>, each round's base / label ratio (arms that ran more
+# than once in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1
+# degrees of freedom, T975) and the ratio of the arm means. The base is ours (the default) or
+# ours@prose for the prose table. With tagged = 1 field 5 is the row's tags, and the
+# line ends with each side's count of [other-busy]; a <tag field> above 0 is the record's field that
+# holds its tags, and the line then ends with each side's count of [cold] and the base's of [probe-off]
+# (the header's probe tag: those rows stay in the ratio, counted so a reader sees them).
+ratio_table() {
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v tf="${5:-0}" -v base="${6:-ours}" -v rounds="$ROUNDS" -v t975="$T975" '{
+  k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
+  a = $1 SUBSEP $2; as[a] += $4; an[a]++
+  if (tagged && $5 ~ /other-busy/) bo[a]++
+  if (tagged && $5 ~ /cpu-busy/) bc[a]++
+  if (tf && $tf ~ /cold/) bk[a]++
+  if (tf && $tf ~ /cpu-busy/) bt[a]++
+  if (tf && $tf ~ /probe-off/) bp[a]++
+} END {
+  nt = split(t975, t, " ")
+  nd = split(deps, d, " ")
+  nr = split(refs, rf, " ")
+  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
+    ref = rf[j]
+    if (!((base SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
+    c = 0; m = 0; list = ""
+    for (r = 1; r <= rounds; r++) {
+      ko = base SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
+      if (!(ko in rn) || !(kr in rn)) continue
+      q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
+      list = list sprintf(" r%d %.4f", r, q)
+    }
+    if (c == 0) continue
+    m /= c; ss = 0
+    for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
+    if (c < 2) ci = "(one round: no interval)"
+    else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
+    else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
+    ao = base SUBSEP d[i]; ar = ref SUBSEP d[i]
+    busy = tagged ? sprintf("  busy: %s [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", base, bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
+    if (!tagged && tf) busy = sprintf("  cpu-busy: %s %d/%d, %s %d/%d", base, bt[ao], an[ao], ref, bt[ar], an[ar])
+    cold = tf ? sprintf("  cold: %s %d/%d, %s %d/%d  probe-off: %s %d/%d", base, bk[ao], an[ao], ref, bk[ar], an[ar], base, bp[ao], an[ao]) : ""
+    printf "%s%-5s %s/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s%s\n", prefix, d[i], base, ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy, cold
+  }
+}'
+}
+
 # q3_self_test: `depth-qwen3moe.sh --self-test`, the lever arms' parse and refusals (the header's
 # <D>@NAME=VALUE) on fixed arms against this tree's lever registry, and the prose arms' grammar and
 # refusals (the header's prose:<P>) against a temp corpus file in the self-test's own temp dir, each a
@@ -827,6 +873,8 @@ q3_self_test() {
   eq probe-mean-pp "$got" 'mean pp ours p=512      1500.00 tok/s(pp)  [1000.0..2000.0, spread 100.00%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 1/2]  untagged mean 2000.00 tok/s(pp) (n=1)'
   got=$(printf '%s\n' 'ours|512|1|1000.0| [probe-off]' | pp_means | sed 's/.*untagged mean //')
   eq probe-mean-all-tagged "$got" 'n/a (every row tagged)'
+  got=$(printf '%s\n' 'ours|512|1|1000.0| [probe-off]' 'llama|512|1|500.0|' | ROUNDS=1 T975= ratio_table "ratio pp p=" 512 llama 1 5 | grep -o 'probe-off: .*')
+  eq probe-ratio-count "$got" 'probe-off: ours 1/1'
   rm -rf "$pt"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
@@ -2105,50 +2153,6 @@ dry_cmd() {
     [ ${#ARM_ENVS[@]} -eq 0 ] || envs="env ${ARM_ENVS[*]} "
     echo "timeout --kill-after=10 $BOUND ${mem}${envs}${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
   fi
-}
-
-# ratio_table <prefix> <keys> <labels> <tagged> <tag field> [base]: records `label|key|round|value|…` on
-# stdin; for every key and every label of <labels>, each round's base / label ratio (arms that ran more
-# than once in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1
-# degrees of freedom, T975) and the ratio of the arm means. The base is ours (the default) or
-# ours@prose for the prose table. With tagged = 1 field 5 is the row's tags, and the
-# line ends with each side's count of [other-busy]; a <tag field> above 0 is the record's field that
-# holds its tags, and the line then ends with each side's count of [cold].
-ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v tf="${5:-0}" -v base="${6:-ours}" -v rounds="$ROUNDS" -v t975="$T975" '{
-  k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
-  a = $1 SUBSEP $2; as[a] += $4; an[a]++
-  if (tagged && $5 ~ /other-busy/) bo[a]++
-  if (tagged && $5 ~ /cpu-busy/) bc[a]++
-  if (tf && $tf ~ /cold/) bk[a]++
-  if (tf && $tf ~ /cpu-busy/) bt[a]++
-} END {
-  nt = split(t975, t, " ")
-  nd = split(deps, d, " ")
-  nr = split(refs, rf, " ")
-  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
-    ref = rf[j]
-    if (!((base SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
-    c = 0; m = 0; list = ""
-    for (r = 1; r <= rounds; r++) {
-      ko = base SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
-      if (!(ko in rn) || !(kr in rn)) continue
-      q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
-      list = list sprintf(" r%d %.4f", r, q)
-    }
-    if (c == 0) continue
-    m /= c; ss = 0
-    for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
-    if (c < 2) ci = "(one round: no interval)"
-    else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
-    else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
-    ao = base SUBSEP d[i]; ar = ref SUBSEP d[i]
-    busy = tagged ? sprintf("  busy: %s [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", base, bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
-    if (!tagged && tf) busy = sprintf("  cpu-busy: %s %d/%d, %s %d/%d", base, bt[ao], an[ao], ref, bt[ar], an[ar])
-    cold = tf ? sprintf("  cold: %s %d/%d, %s %d/%d", base, bk[ao], an[ao], ref, bk[ar], an[ar]) : ""
-    printf "%s%-5s %s/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s%s\n", prefix, d[i], base, ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy, cold
-  }
-}'
 }
 
 if [ -n "$DRY" ]; then
