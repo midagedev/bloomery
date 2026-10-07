@@ -215,6 +215,8 @@ def run(args: Any) -> int:
     cmd = [str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(args.port), "-np", "1",
            "-c", "16384", "-ngl", "99", "-a", model.name, "--no-ui"]
     print(f"lev_ref: {' '.join(cmd)}", flush=True)
+    # The runner's bound ends this process with SIGTERM: the server goes with it, not on to hold the card.
+    signal.signal(signal.SIGTERM, lambda number, _frame: sys.exit(128 + number))
     with open(log_path, "w") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
         (out / "server.pid").write_text(f"{proc.pid}\n")

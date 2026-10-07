@@ -982,9 +982,11 @@ gate-decision-lev:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --test lev -- --include-ignored --nocapture'
 # lev's oracle: the patched mainline server answering tools/ref/lev/{suite,edge}.jsonl on the lev file, its prompts' ids
 # and bodies into $BLOOMERY_DATA/lev/4b/ref (tools/ref/lev_ref.py; the server is built by tools/ref/build-lcpp-lev.sh,
-# the file fetched into /root/models/lev-4b/). A functional dump, no lease; on the card box.sh puts in view.
-dump-lev:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh '. tools/ref/ref-paths.sh && mkdir -p $BLOOMERY_DATA/lev/4b/ref && python3 tools/ref/lev_ref.py run --model "$LEV_MODEL" --tree "$LEV_LCPP" --suite tools/ref/lev/suite.jsonl --edge tools/ref/lev/edge.jsonl --out $BLOOMERY_DATA/lev/4b/ref'
+# the file fetched into /root/models/lev-4b/). A functional dump, no lease: the server runs through tools/gpu-gate.sh
+# (tools/ref/lev-dump.sh), under a card's gate lock and its bound, on the card the runner picks. OUT is the directory
+# written (another one shows the dump is the same without replacing the gates' files).
+dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'mkdir -p {{OUT}} && bash tools/ref/lev-dump.sh --suite tools/ref/lev/suite.jsonl --edge tools/ref/lev/edge.jsonl --out {{OUT}}'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙(정지 id 목록 전부), V4.1·GLM 채팅 템플릿 렌더링,
 # GLM 도구 호출 파서(glmxml), Qwen3의 헤르메스 호출·모델이 여는 생각 범위(hermes), 연결 상한·유휴 연결 종료·컨텍스트 끝의 정지(limits). 박스 자원 불필요.
 # Anthropic's Messages API on the chat path (anthropic). Qwen3.6's and Qwen3.8's XML tool calls, and every seat
