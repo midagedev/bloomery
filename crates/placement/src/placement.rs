@@ -777,8 +777,16 @@ pub struct CardTotals {
 /// The host's side of the plan.
 #[derive(Clone, Debug)]
 pub struct HostTotals {
+    /// Routed-expert bytes resident on the host ([`Device::Host`]).
     pub expert_bytes: u64,
+    /// Routed experts the host leg serves, summed over layers: the ids no
+    /// card holds, whether their bytes are resident on the host or on the
+    /// NVMe tier ([`HostTotals::nvme_expert_bytes`]).
     pub experts: u64,
+    /// Routed-expert bytes the host leg reads from the NVMe tier
+    /// ([`expert_nvme_tier`]); 0 when the host holds them all. Inside
+    /// [`Plan::nvme_bytes`], outside [`HostTotals::expert_bytes`].
+    pub nvme_expert_bytes: u64,
     /// Row-gathered tables held on the host.
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
@@ -855,6 +863,23 @@ pub enum PlacementError {
     /// An expert list that is not one: a repeated id, an id past the stack.
     #[error("expert list: {0}")]
     Experts(String),
+    /// A host room under the floor of the NVMe expert tier: the plan's host
+    /// terms outside the routed experts, and the transient reads of two
+    /// layers' NVMe-tier experts and one layer's host experts beside them.
+    #[error(
+        "the host room {room} B is under the NVMe expert tier's floor {floor} B (the host terms \
+         beside the routed experts {base} B + 3 × the heaviest layer's host-served experts \
+         {layer} B: two layers' transient reads and one layer's resident experts), the plan's \
+         need being {need} B: free host memory, or load by a placement whose cards hold more of \
+         the model"
+    )]
+    HostRoomFloor {
+        room: u64,
+        floor: u64,
+        base: u64,
+        layer: u64,
+        need: u64,
+    },
     /// A routed stack's expert on two cards at once, by their index in
     /// [`Machine::all_cards`]: an expert lives on one device.
     #[error("tensor {tensor}: expert {expert} is on card #{first} and on card #{second}")]
@@ -2365,6 +2390,220 @@ pub fn row_table_tier(
     Ok(())
 }
 
+/// The room a caller gave through the lever `name` (bytes, `M` and `G`
+/// binary units), read as [`workstation::HostRead::Given`]: `Ok(None)` for
+/// an unset one — the machine's reading stands. A value that is not bytes,
+/// is past u64 or is not UTF-8 is refused by name.
+pub fn host_room_given(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<(u64, workstation::HostRead)>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{name}={value:?} is not UTF-8; it takes bytes"))?;
+    match bloomery_levers::parse_bytes(text) {
+        Ok(bytes) => Ok(Some((bytes, workstation::HostRead::Given))),
+        Err(e) => Err(format!(
+            "{name}={e}; it takes bytes: digits, `_` separators allowed, then nothing, `M` or `G`"
+        )),
+    }
+}
+
+/// One layer's routed stacks as the NVMe expert tier splits them: each
+/// stack's row and the index of its host segment, the ids that segment holds
+/// (the same for every stack of the layer), and the bytes of one expert
+/// across the stacks.
+struct HostLayer {
+    stacks: Vec<(usize, usize)>,
+    ids: Vec<u32>,
+    unit: u64,
+}
+
+impl HostLayer {
+    fn bytes(&self) -> u64 {
+        self.unit * self.ids.len() as u64
+    }
+}
+
+/// Puts the routed experts the host cannot hold on the NVMe tier, for a plan
+/// whose host need ([`workstation::HostNeed`], what `HostNeed::check` holds
+/// the host's available bytes to) passes `room`: each layer's host-served
+/// ids split into the first `r_l`, which stay on the host, and the rest,
+/// which the host leg reads from the NVMe tier ([`Device::Nvme`],
+/// [`Format::NvmeFile`]). The `r_l` are spread over the layers by their host
+/// bytes, so the host's resident bytes fall by the overflow, to within one
+/// layer's expert; every stack of a layer splits at the same ids. A plan
+/// whose need `room` holds is left as it is.
+///
+/// Runs after [`row_table_tier`], which puts the row-gathered tables on the
+/// NVMe tier first: a plan that still needs a split with such a table on the
+/// host is refused by name. The need is the plan's, with no residency churn
+/// pool beside it and no transient window: a reader of the NVMe tier takes
+/// its two layers of transient reads from the room beside the plan's need
+/// ([`PlacementError::HostRoomFloor`] keeps the room for them).
+///
+/// The floor is `base + 3 W`: `base` the need with no routed expert on the
+/// host, `W` the host bytes of the layer with the most — two layers' reads
+/// of the NVMe tier and one layer's resident experts beside the other
+/// terms. A room under it is refused by name; the plan's `host.experts`
+/// counts the experts the host leg serves, on either tier.
+pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
+    let model = plan.model;
+    let need = workstation::HostNeed::of(plan, 0);
+    if need.bytes() <= room {
+        return Ok(());
+    }
+    if let Some(r) = plan
+        .rows
+        .iter()
+        .find(|r| row_read(model, r) && r.segments.iter().any(|s| s.device == Device::Host))
+    {
+        return Err(PlacementError::tensor(
+            &model.tensors[r.tensor],
+            format!(
+                "the host need {} B passes the room {room} B with a row-gathered table still on                  the host: row_table_tier places it on the NVMe tier first",
+                need.bytes()
+            ),
+        ));
+    }
+    let mut layers: Vec<HostLayer> = Vec::new();
+    let mut layer_of: Vec<Option<usize>> = vec![None; model.layers];
+    for (i, r) in plan.rows.iter().enumerate() {
+        let t = &model.tensors[r.tensor];
+        let Some(l) = t.layer.filter(|_| t.role == Role::RoutedExperts) else {
+            continue;
+        };
+        let Some((at, s)) = r
+            .segments
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.device == Device::Host)
+        else {
+            continue;
+        };
+        if s.format != Format::HostFile {
+            return Err(PlacementError::tensor(
+                t,
+                format!("a host segment as {}, not the file's bytes", s.format),
+            ));
+        }
+        let Some(list) = s.experts.as_ref() else {
+            return Err(PlacementError::tensor(
+                t,
+                "a host segment of a routed stack with no list",
+            ));
+        };
+        let (_, per) = per_expert(t, model.experts)?;
+        let Some(slot) = layer_of.get_mut(l) else {
+            return Err(PlacementError::tensor(
+                t,
+                format!("layer {l} is past the model's"),
+            ));
+        };
+        match *slot {
+            None => {
+                *slot = Some(layers.len());
+                layers.push(HostLayer {
+                    stacks: vec![(i, at)],
+                    ids: list.ids().to_vec(),
+                    unit: per,
+                });
+            }
+            Some(k) => {
+                let h = &mut layers[k];
+                if h.ids != list.ids() {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!("host experts {list} are not the other stacks' of layer {l}"),
+                    ));
+                }
+                h.stacks.push((i, at));
+                h.unit += per;
+            }
+        }
+    }
+    let base = workstation::HostNeed { experts: 0, ..need }.bytes();
+    let heavy = layers.iter().map(HostLayer::bytes).max().unwrap_or(0);
+    let floor = 3u64
+        .checked_mul(heavy)
+        .and_then(|w| w.checked_add(base))
+        .ok_or_else(|| PlacementError::Metadata {
+            key: "the NVMe expert tier's floor".to_string(),
+            detail: "passes u64 bytes".to_string(),
+        })?;
+    if room < floor {
+        return Err(PlacementError::HostRoomFloor {
+            room,
+            floor,
+            base,
+            layer: heavy,
+            need: need.bytes(),
+        });
+    }
+    // The host keeps `keep` of its `held` expert bytes; the floor leaves it
+    // at least three layers' worth.
+    let held = plan.host.expert_bytes;
+    let keep = held - (need.bytes() - room);
+    let share = |l: &HostLayer| u128::from(keep) * u128::from(l.bytes()) / u128::from(held);
+    let mut r: Vec<u64> = layers
+        .iter()
+        .map(|l| u64::try_from(share(l) / u128::from(l.unit)).unwrap_or(u64::MAX))
+        .collect();
+    let mut kept: u64 = r.iter().zip(&layers).map(|(&r, l)| r * l.unit).sum();
+    // The rest of the bytes to keep go one expert at a time to the layers
+    // whose share was cut the most.
+    let mut order: Vec<usize> = (0..layers.len()).collect();
+    let cut = |k: usize| share(&layers[k]) - u128::from(r[k] * layers[k].unit);
+    order.sort_by_key(|&k| std::cmp::Reverse(cut(k) * 1_000_000 / u128::from(layers[k].unit)));
+    for k in order {
+        let l = &layers[k];
+        if r[k] < l.ids.len() as u64 && kept + l.unit <= keep {
+            r[k] += 1;
+            kept += l.unit;
+        }
+    }
+    let mut moved = 0u64;
+    for (l, &keep_l) in layers.iter().zip(&r) {
+        let n = usize::try_from(keep_l)
+            .unwrap_or(usize::MAX)
+            .min(l.ids.len());
+        for &(i, at) in &l.stacks {
+            let t = &model.tensors[plan.rows[i].tensor];
+            let (_, per) = per_expert(t, model.experts)?;
+            let on_host = &l.ids[..n];
+            let off_host = &l.ids[n..];
+            let mut pieces = Vec::with_capacity(2);
+            if !on_host.is_empty() {
+                pieces.push(Segment {
+                    device: Device::Host,
+                    format: Format::HostFile,
+                    experts: Some(ExpertList::new(on_host.to_vec(), model.experts)?),
+                    resident_bytes: on_host.len() as u64 * per,
+                });
+            }
+            if !off_host.is_empty() {
+                let bytes = off_host.len() as u64 * per;
+                moved += bytes;
+                pieces.push(Segment {
+                    device: Device::Nvme,
+                    format: Format::NvmeFile,
+                    experts: Some(ExpertList::new(off_host.to_vec(), model.experts)?),
+                    resident_bytes: bytes,
+                });
+            }
+            plan.rows[i].segments.splice(at..=at, pieces);
+        }
+    }
+    plan.host.expert_bytes -= moved;
+    plan.host.nvme_expert_bytes += moved;
+    plan.nvme_bytes += moved;
+    plan.host.headroom_bytes += i128::from(moved);
+    Ok(())
+}
+
 /// The per-device sums of a finished set of rows; `kv_bytes` is, per card of
 /// [`Machine::all_cards`], its layers' cache and their ring shadows, which
 /// the host holds; `counts` the stage cards' `n_l` and the tiers'.
@@ -2392,6 +2631,7 @@ fn totals<'a>(
     let mut card_dense = vec![0u64; cards.len()];
     let mut card_experts = vec![0u64; cards.len()];
     let (mut host_experts, mut host_tables, mut nvme_bytes) = (0u64, 0u64, 0u64);
+    let mut nvme_experts = 0u64;
     for r in &rows {
         let is_routed = model.tensors[r.tensor].role == Role::RoutedExperts;
         for s in &r.segments {
@@ -2400,7 +2640,12 @@ fn totals<'a>(
                 (Device::Card(c), true) => card_experts[c] += s.resident_bytes,
                 (Device::Host, true) => host_experts += s.resident_bytes,
                 (Device::Host, false) => host_tables += s.resident_bytes,
-                (Device::Nvme, _) => nvme_bytes += s.resident_bytes,
+                (Device::Nvme, _) => {
+                    nvme_bytes += s.resident_bytes;
+                    if is_routed {
+                        nvme_experts += s.resident_bytes;
+                    }
+                }
                 (Device::Unused, _) => {}
             }
         }
@@ -2445,6 +2690,7 @@ fn totals<'a>(
             .filter(|&l| routing[l])
             .map(|l| model.experts - n_l[l] - tier_n_l.iter().map(|t| t[l]).sum::<u64>())
             .sum(),
+        nvme_expert_bytes: nvme_experts,
         table_bytes: host_tables,
         shadow_bytes,
         reserve_bytes,

@@ -161,8 +161,9 @@ pub struct PlanInputs {
     /// reading that decided ([`workstation::host_available_read`]): the PLE
     /// table's tier follows it ([`placement::row_table_tier`]) — on the host
     /// while the room holds the plan with the table there, else on the NVMe
-    /// tier. A gate that plans an arm by a room of its own sets it, read
-    /// [`HostRead::Given`].
+    /// tier; the routed experts the room still cannot hold follow it there
+    /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
+    /// of its own sets it, read [`HostRead::Given`].
     pub room: (u64, HostRead),
 }
 
@@ -494,6 +495,7 @@ impl PlanInputs {
             )?,
         };
         placement::row_table_tier(&mut plan, self.room.0, UBATCH_PLANNED)?;
+        placement::expert_nvme_tier(&mut plan, self.room.0)?;
         Ok(plan)
     }
 
