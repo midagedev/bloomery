@@ -121,6 +121,7 @@ use page::{MAX_ROWS, Word};
 use residency::HostResidency;
 use route_trace::RouteTrace;
 use runtime::swaprule::KeptRows;
+use runtime::xsplit;
 use slots::{MAX_TIERS, Slot, SlotMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -1071,6 +1072,67 @@ impl<H: HostExperts> HostTier<H> {
             *c += 1;
         }
         self.call_pick(stream, key.layer, counts, cap)
+    }
+
+    /// [`HostTier::call_pick`] under the stream rule's walk: `key`'s routed
+    /// ids counted into `counts` as [`HostTier::call_pick_routed`] counts
+    /// them, the layer's host experts read off this tier's map, and the
+    /// walk's plan ([`runtime::xsplit::admit_walk`], at `k`'s beside-union
+    /// rate once the unit's own burst share over that inherited host set is
+    /// set into it) set on the machine — the plan's floor as the call's
+    /// floor, its backlog bound as the pick path's — before the pick runs.
+    /// `queue_floor` is the machine's own bound's floor. Refused by name by
+    /// everything the counting, the walk and the pick refuse.
+    pub fn call_pick_walk(
+        &mut self,
+        stream: &CudaStream,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        k: xsplit::Constants,
+        queue_floor: u64,
+    ) -> Result<swap::CallPick, GpuError> {
+        const WHAT: &str = "HostTier::call_pick_walk";
+        let n_expert = self.slots.n_expert();
+        counts.clear();
+        counts.resize(n_expert, 0);
+        for &id in self.routed_ids(key)? {
+            let c = usize::try_from(id)
+                .ok()
+                .and_then(|i| counts.get_mut(i))
+                .ok_or_else(|| {
+                    GpuError::shape(
+                        WHAT,
+                        format!(
+                            "layer {}: a routed id {id} of {n_expert} experts",
+                            key.layer
+                        ),
+                    )
+                })?;
+            *c += 1;
+        }
+        let mut host = Vec::new();
+        let mut listed = 0u64;
+        let mut cols = 0u64;
+        if let Some(row) = self.slots.row(key.layer) {
+            for (id, &e) in (0u32..).zip(row) {
+                if Slot::of(e) != Slot::Host {
+                    continue;
+                }
+                host.push(id);
+                let count = u64::from(counts[id as usize]);
+                listed += u64::from(count > 0);
+                cols += count;
+            }
+        }
+        let mut unit = k;
+        unit.union_burst_share = xsplit::union_burst_share(cols, listed, &unit);
+        let plan = xsplit::admit_walk(counts, &host, &unit, queue_floor)
+            .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
+        self.call_floor(plan.floor)?;
+        if plan.backlog > 0 {
+            self.call_backlog(plan.backlog)?;
+        }
+        self.call_pick(stream, key.layer, counts, usize::MAX)
     }
 
     /// The open call's floor from its next pick on
