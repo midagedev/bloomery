@@ -607,6 +607,29 @@ dump-ref-mtp-qwen4exp:
 dump-ref-qwen4exp *VARIANT:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
+# The MiMo-V2.6-Flash (mimo2) oracle tree: /home/user/ik-mimo2, ik 043ced9a (the fused attn_qkv load) with the
+# one shared-oracle commit upstream lacks cherry-picked, checked by patch-id and configured as that tree, built under
+# the CPU lease, then dump_ref linked against it into $BLOOMERY_DATA/bin-mimo2 (tools/ref/build-ik-mimo2.sh; it
+# writes the tree's PROVENANCE). BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/ikmimo2-build.card'.
+build-ref-dump-mimo2:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'bash tools/ref/build-ik-mimo2.sh'
+
+# The mimo2 oracle: the same dumper under the mimo2 profile, ik on the CPU, the 5-id batch set into
+# $BLOOMERY_DATA/ref_mimo2/. A VARIANT (step4, d1k, d4096, each with an -every-node suffix) dumps one decode
+# step after a quiet prefill into a set of its own (models/mimo2.sh); d1k and d4096 read the first 1,025 and
+# 4,097 ids of $BLOOMERY_DATA/mimo2/corpus-prose.ids (sha256 pin): d1k is the first depth past the 128-id
+# sliding window, d4096 runs the nine full-attention layers over a deep context. Each dump pages in the whole
+# 167.4 GB split set under the CPU lease, so it needs a card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mimoref-dump.card'). The profile's tree is the mimo2
+# oracle tree and its dump_ref the one in bin-mimo2 (build-ref-dump-mimo2).
+dump-ref-mimo2 *VARIANT:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+
+# The same 5 ids on ik's CUDA backend into $BLOOMERY_DATA/ref_cuda_mimo2/. Not runnable as it stands: dump.sh's
+# -ngl 99 puts the 167.4 GB file on one card, so a CUDA set needs a placement first. No GPU consumer yet.
+dump-ref-mimo2-cuda:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:

@@ -1,0 +1,12 @@
+# Round mimoref: the MiMo-V2.6-Flash oracle tree, /home/user/ik-mimo2 (ik 043ced9a, the fused attn_qkv load,
+# + 49ef19d0, the one oracle commit upstream lacks; build-ik-mimo2.sh names the other four), built with --target
+# llama common llama-tokenize under the configure of /home/user/ik-idxkey, then dump_ref linked against it into
+# $BLOOMERY_DATA/bin-mimo2 (tools/ref/build-ik-mimo2.sh). Nothing is timed.
+# Minutes [derived]: candref-build.card's precedent, a full ik tree with ccache present wrote its 255 ggml objects
+# within 186 s; this base is 73 commits newer, with more CUDA sources and IQK FA for all quants: 3-15 min, the
+# link of dump_ref < 1.
+kind: exclusive
+reason: the ik build runs cmake --build -j 64 for minutes; beside a timed run or a gate batch it would
+  take their cores, so it holds the lease; why now: the shared oracle tree cannot load MiMo's fused
+  attn_qkv, so the MiMo reference sets have no oracle without this tree
+minutes: 3..15
