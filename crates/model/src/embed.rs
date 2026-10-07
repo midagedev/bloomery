@@ -1,9 +1,11 @@
 //! The token-embedding row walk the host side of every model shares: find
 //! the tensor in the file, check that it is whole rows of the model's
-//! width, slice one row's file bytes, dequantize it. A body holds
-//! [`EmbedTable`] beside what it does with the rows — a body that repeats
-//! a row into its streams copies what `row_into` fills, one that
-//! quantizes on the card reads `row`'s bytes alone.
+//! width, slice one row's file bytes, dequantize it. [`RowLayout`] is the
+//! walk; a body that owns its file holds [`EmbedTable`] (the layout and the
+//! file's `Arc`), one that borrows the file keeps the layout beside its
+//! borrow. A body that repeats a row into its streams copies what
+//! `row_into` fills; one that dequantizes on the card reads `row`'s bytes
+//! alone.
 
 use std::sync::Arc;
 
@@ -12,16 +14,13 @@ use gguf::{GgmlType, Split, TensorInfo};
 
 use crate::ModelError;
 
-/// A row table of an open [`Split`]: the token embedding — `n_vocab` rows
-/// of `n_embd` values of one ggml type — opened once at load and read a
-/// row at a time by token.
-///
-/// The file is held by its `Arc`, not borrowed: a body holds its table for
-/// the model's life inside holders that carry no lifetime (its model, a
-/// gate, a server), and the load shares the file with its other tiers
-/// anyway, so one more reference costs nothing a borrow would save.
-pub struct EmbedTable {
-    file: Arc<Split>,
+/// The geometry of a token-embedding table of an open [`Split`]: where the
+/// tensor sits and how its rows are laid out, checked once at open, then
+/// reads rows of whatever file it is handed. A holder of a borrowed
+/// [`Split`] keeps this beside its borrow; a holder that owns the file takes
+/// [`EmbedTable`].
+#[derive(Clone)]
+pub struct RowLayout {
     shard: usize,
     info: TensorInfo,
     n_embd: usize,
@@ -29,12 +28,12 @@ pub struct EmbedTable {
     n_vocab: usize,
 }
 
-impl EmbedTable {
+impl RowLayout {
     /// The tensor `name` of `file` as a table of rows `n_embd` values wide.
     /// Refused by name: a tensor not in the file, a first dimension other
     /// than `n_embd`, a type ggml sizes no row of `n_embd` values for, and
     /// bytes that are not a whole number of rows.
-    pub fn new(file: Arc<Split>, name: &str, n_embd: usize) -> Result<EmbedTable, ModelError> {
+    pub fn open(file: &Split, name: &str, n_embd: usize) -> Result<RowLayout, ModelError> {
         let (shard, info) = file
             .find(name)
             .map(|(s, t)| (s, t.clone()))
@@ -75,8 +74,7 @@ impl EmbedTable {
                 info.nbytes
             )));
         }
-        Ok(EmbedTable {
-            file,
+        Ok(RowLayout {
             shard,
             info,
             n_embd,
@@ -95,9 +93,15 @@ impl EmbedTable {
         self.n_vocab
     }
 
-    /// Row `token`'s file bytes. A token at or past the vocabulary is
-    /// refused by name, naming the token and the vocabulary.
-    pub fn row(&self, token: u32) -> Result<&[u8], ModelError> {
+    /// The file bytes of one row.
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// Row `token`'s bytes of `file`, the file this layout was opened on. A
+    /// token at or past the vocabulary is refused by name, naming the token
+    /// and the vocabulary.
+    pub fn row<'a>(&self, file: &'a Split, token: u32) -> Result<&'a [u8], ModelError> {
         let t = token as usize;
         if t >= self.n_vocab {
             return Err(self.refuse(format!(
@@ -105,38 +109,74 @@ impl EmbedTable {
                 n_vocab = self.n_vocab
             )));
         }
-        let data = self
-            .file
-            .shard(self.shard)
-            // `Split::find` proved the shard at open, and a `Split` never
-            // changes after.
-            .expect("the shard Split::find named at open")
-            .data(&self.info)?;
+        let shard = file.shard(self.shard).ok_or_else(|| {
+            self.refuse(format!("the file has no shard {shard}", shard = self.shard))
+        })?;
+        let data = shard.data(&self.info)?;
         Ok(&data[t * self.row_bytes..][..self.row_bytes])
+    }
+
+    /// The layout's refusal of `detail`, naming the tensor.
+    fn refuse(&self, detail: String) -> ModelError {
+        ModelError::EmbedRows {
+            tensor: self.info.name.clone(),
+            detail,
+        }
+    }
+}
+
+/// A row table of an open [`Split`]: the token embedding — `n_vocab` rows
+/// of `n_embd` values of one ggml type — opened once at load and read a
+/// row at a time by token.
+///
+/// The file is held by its `Arc`, not borrowed: a body holds its table for
+/// the model's life inside holders that carry no lifetime (its model, a
+/// gate, a server), and the load shares the file with its other tiers
+/// anyway, so one more reference costs nothing a borrow would save.
+pub struct EmbedTable {
+    file: Arc<Split>,
+    layout: RowLayout,
+}
+
+impl EmbedTable {
+    /// The tensor `name` of `file` as a table of rows `n_embd` values wide,
+    /// refused as [`RowLayout::open`] refuses it.
+    pub fn new(file: Arc<Split>, name: &str, n_embd: usize) -> Result<EmbedTable, ModelError> {
+        let layout = RowLayout::open(&file, name, n_embd)?;
+        Ok(EmbedTable { file, layout })
+    }
+
+    /// The table's ggml type, for a body whose load runs one type only.
+    pub fn ty(&self) -> GgmlType {
+        self.layout.ty()
+    }
+
+    /// The vocabulary: how many rows the table holds.
+    pub fn n_vocab(&self) -> usize {
+        self.layout.n_vocab()
+    }
+
+    /// Row `token`'s file bytes. A token at or past the vocabulary is
+    /// refused by name, naming the token and the vocabulary.
+    pub fn row(&self, token: u32) -> Result<&[u8], ModelError> {
+        self.layout.row(&self.file, token)
     }
 
     /// Row `token` dequantized into `out`, which holds the table's width.
     /// A token at or past the vocabulary is refused as [`EmbedTable::row`]
     /// refuses it.
     pub fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), ModelError> {
-        if out.len() != self.n_embd {
-            return Err(self.refuse(format!(
+        let layout = &self.layout;
+        if out.len() != layout.n_embd {
+            return Err(layout.refuse(format!(
                 "fills {n} values, out holds {m}",
-                n = self.n_embd,
+                n = layout.n_embd,
                 m = out.len()
             )));
         }
         let src = self.row(token)?;
-        dequant_row(self.info.ty, src, out)?;
+        dequant_row(layout.ty(), src, out)?;
         Ok(())
-    }
-
-    /// The table's refusal of `detail`, naming the tensor.
-    fn refuse(&self, detail: String) -> ModelError {
-        ModelError::EmbedRows {
-            tensor: self.info.name.clone(),
-            detail,
-        }
     }
 }
 
@@ -222,6 +262,20 @@ mod tests {
         let mut want = vec![0.0f32; N_EMBD];
         dequant_row(GgmlType::Q8_0, &row_of(2), &mut want).unwrap();
         assert_eq!(out, want);
+    }
+
+    /// The borrowed layout reads the bytes the owning table reads, and
+    /// refuses a token past the vocabulary the same way.
+    #[test]
+    fn the_layout_reads_the_tables_rows_of_a_borrowed_file() {
+        let t = table(4);
+        let l = RowLayout::open(&t.file, NAME, N_EMBD).unwrap();
+        assert_eq!((l.ty(), l.n_vocab(), l.row_bytes()), (t.ty(), 4, 34));
+        for token in 0..4u32 {
+            assert_eq!(l.row(&t.file, token).unwrap(), t.row(token).unwrap());
+        }
+        let want = t.row(4).unwrap_err().to_string();
+        assert_eq!(l.row(&t.file, 4).unwrap_err().to_string(), want);
     }
 
     /// A token at the vocabulary is refused by name, both numbers named.
