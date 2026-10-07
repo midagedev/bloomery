@@ -159,6 +159,15 @@ Order:
     (`tools/gate-paths.tsv:68`), and `crates/gpu/src/weights.rs` has no row. Map them by the family that reads them,
     and give `weights.rs` its row. (iqwire moved kernels, so its full list was right; the `*` rows widen every later
     coverage or mtp change.)
+- **gate-batch has no clean stop** (worker2, 2026-10-07, iqwire's stop; S, after 0.2.6).
+  - The main process writes no pid file, and lane X runs inside it. A stop through pid files can only TERM
+    `lane-X.child`, and each TERM starts the next item.
+  - A killed Mac `just` does not reach the box. 17 remote chains outlived the stop, as lock waiters and box.sh wrappers
+    in `lease_guard`. `box-gc` reported 0 because it selects only `target/` executables. One gate then took its locks
+    and started on both cards before it was killed.
+  - Fix: write `$$` to `OUT/batch.pid`. Have stop() end each item's remote chain through a remote pid file per item.
+    Have `box-gc` also select processes whose cwd is the track's remote dir (lock waiters, wrappers).
+  - FAIL-first: a stopped fixture batch leaves no remote process.
 - **Fixture tier (test doubles; the user, 2026-10-07: "네 추천대로 진행해줘")**. The design is the lead's specs
   `fxdouble/report-opus.md` and its addendum. Small fixture models force offloading and load warm in about 2–3 s
   [derived]. That moves whole-model gates out of the solo lane: the landing wall goes from 6,741 s to about 2,600–2,800
