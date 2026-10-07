@@ -9,18 +9,24 @@
 //! A decision model is named by its head (`serve::decide::pick`): `--head`,
 //! or, under `--hf` with no `--head`, the head repo of the row whose model
 //! card the `--hf` repo's card names as the model it quantizes
-//! (`model_file::quantized_from`), fetched into the cache with its config.
-//! The head's config (`--head-config`, else the row's config file beside
-//! the weights) picks the row of [`ROWS`]; a config no row knows is refused
-//! by name, listing the rows. The server takes `-m`/`--hf` out before this
-//! seat parses (its module doc); `--ctx-size` and `-c` are `--ctx` under
-//! llama-server's spellings, and C defaults to the row's context.
+//! (`model_file::quantized_from`), fetched into the cache with its config;
+//! or a model file whose architecture the row lists as carrying its head
+//! (`Row::in_file`: llama.cpp's `clef` layout), which needs no flag and
+//! reads the head from its own tensors; a `--head` beside such a file names
+//! the head instead (the file's trunk, the given head). The head's config
+//! (`--head-config`, else the row's config file beside the weights) picks
+//! the row of [`ROWS`]; a config no row knows is refused by name, listing
+//! the rows. The server takes `-m`/`--hf` out before this seat parses (its
+//! module doc); `--ctx-size` and `-c` are `--ctx` under llama-server's
+//! spellings, and C defaults to the row's context.
 //!
 //! Before any load the seat refuses by name a file whose architecture is
 //! not one of the row's backbones; then, on a worker thread that owns the
-//! card, it opens the head, refuses a head whose width is not the file's
-//! `embedding_length`, opens the tokenizer and the backbone ([`BODIES`]),
-//! and prints its `listening` record on stderr (`record::LISTENING_DECIDE`),
+//! card, it opens the head (a head read from the model file is named by the
+//! model file in the record and in `/props`), refuses a head whose width is
+//! not the file's `embedding_length`, opens the tokenizer and the backbone
+//! ([`BODIES`]), and prints its `listening` record on stderr
+//! (`record::LISTENING_DECIDE`),
 //! naming the model, quant, head, row and the address, P the bound port
 //! (`--port 0` binds a free one). Requests are POSTed to the row's routes and answered one at a
 //! time by the row's own part ([`Decision`]), which runs the backbone
@@ -43,9 +49,12 @@ use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
 use decision::release;
 use gguf::Split;
+use model::arch::is_qwen35_body;
 use serde_json::{Value, json};
 use serve::ServeError;
-use serve::decide::{Decide, DecideError, DecideServer, Decided, HeadFrom, Row, Seated};
+use serve::decide::{
+    Decide, DecideError, DecideServer, Decided, HeadFrom, HeadSource, Row, Seated,
+};
 use tokenizer::Tokenizer;
 
 use crate::clef_seat;
@@ -60,8 +69,9 @@ static KINDS: &[&Kind] = &[&record::LISTENING_DECIDE];
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
                      [--head <weights> [--head-config <file>]] [--host H] [--port P] [--ctx C]";
 
-/// A row's own part, opened from its head's weights and config.
-pub type Open = fn(&Path, &Path) -> Result<Box<dyn Decision>, GateError>;
+/// A row's own part, opened from its head's source: its weights and config files, or the model
+/// file that carries the head.
+pub type Open = fn(HeadSource<'_>) -> Result<Box<dyn Decision>, GateError>;
 
 /// Where this seat's head comes from: `serve::decide::pick` over [`ROWS`].
 pub type Pick = HeadFrom<'static, Open>;
@@ -72,6 +82,7 @@ pub const ROWS: &[Row<Open>] = &[Row {
     routes: release::ROUTES,
     ctx: release::CTX,
     backbones: release::BACKBONES,
+    in_file: release::IN_FILE,
     head_repo: release::HEAD_REPO,
     quant_repo: release::QUANT_REPO,
     head_file: release::HEAD_FILE,
@@ -113,11 +124,16 @@ impl Hidden for Qwen35moeModel {
 /// A backbone body opened from a file: its hidden-state call and the file.
 type OpenBody = fn(&Path, usize) -> Result<(Box<dyn Hidden>, Split), GateError>;
 
-/// The bodies a backbone can be, by file architecture.
-const BODIES: &[(&str, OpenBody)] = &[("qwen35", open_qwen35)];
+/// The file architectures a body opens.
+type Opens = fn(&str) -> bool;
 
-/// A `qwen35` file whole on one card, prompt ubatches of [`UBATCH`] ids
-/// clipped to the context.
+/// The bodies a backbone can be, each with the predicate of the file
+/// architectures it opens.
+const BODIES: &[(Opens, OpenBody)] = &[(is_qwen35_body, open_qwen35)];
+
+/// A Qwen3.5 dense file (`qwen35`, or `clef` with its head beside the trunk)
+/// whole on one card, prompt ubatches of [`UBATCH`] ids clipped to the
+/// context.
 fn open_qwen35(path: &Path, ctx: usize) -> Result<(Box<dyn Hidden>, Split), GateError> {
     let (model, split) = crate::qwen35_open::open(path, ctx, UBATCH.min(ctx))?;
     Ok((Box::new(model), split))
@@ -239,16 +255,31 @@ fn base_name(p: &Path) -> String {
 }
 
 /// What the worker opens: the model file, its name, architecture and width,
-/// the head's two files, the row's `open` and the context.
+/// the head's two files (none when the model file carries the head), the
+/// row's `open` and the context.
 struct Load {
     model: PathBuf,
     name: String,
     arch: String,
     width: u64,
-    head: PathBuf,
-    config: PathBuf,
+    head: Option<(PathBuf, PathBuf)>,
     open: Open,
     ctx: usize,
+}
+
+impl Load {
+    /// Where the row opens its head from.
+    fn head_source(&self) -> HeadSource<'_> {
+        match &self.head {
+            Some((head, config)) => HeadSource::Files { head, config },
+            None => HeadSource::InFile(&self.model),
+        }
+    }
+
+    /// The file that holds the head.
+    fn head_file(&self) -> &Path {
+        self.head.as_ref().map_or(&self.model, |(head, _)| head)
+    }
 }
 
 type Job = (String, Sender<Result<Decided, DecideError>>);
@@ -278,11 +309,11 @@ impl Decide for Seat {
 /// then answers `jobs` until the server drops its sender.
 fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) {
     let opened = (|| -> Result<(Box<dyn Decision>, Backbone, String), GateError> {
-        let head = (l.open)(&l.head, &l.config)?;
+        let head = (l.open)(l.head_source())?;
         if u64::try_from(head.hidden_size())? != l.width {
             return Err(format!(
                 "{}: the head reads hidden states of width {}, and the backbone {} gives {}",
-                l.head.display(),
+                l.head_file().display(),
                 head.hidden_size(),
                 l.model.display(),
                 l.width
@@ -292,7 +323,7 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
         let tokenizer = Tokenizer::from_gguf(&l.model)?;
         let (_, open_body) = BODIES
             .iter()
-            .find(|(arch, _)| *arch == l.arch)
+            .find(|(opens, _)| opens(&l.arch))
             .ok_or_else(|| format!("no backbone body opens a {} file", l.arch))?;
         let (body, file) = open_body(&l.model, l.ctx)?;
         let q = quant(&file);
@@ -322,12 +353,16 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
 
 /// The head's weights and config `from` names, with its row: `--head` and
 /// the row its config picks, or the row's head fetched from its repo,
-/// whose config that row must know.
-fn head_files(from: Pick) -> Result<(&'static Row<Open>, PathBuf, PathBuf), GateError> {
+/// whose config that row must know; none for a row whose model file carries
+/// the head.
+type HeadFiles = (&'static Row<Open>, Option<(PathBuf, PathBuf)>);
+
+fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
     match from {
+        HeadFrom::InFile(row) => Ok((row, None)),
         HeadFrom::Given { head, config } => {
             let (row, config) = serve::decide::row_of_config(ROWS, &head, config.as_deref())?;
-            Ok((row, head, config))
+            Ok((row, Some((head, config))))
         }
         HeadFrom::Fetch(row) => {
             let mut files =
@@ -349,7 +384,7 @@ fn head_files(from: Pick) -> Result<(&'static Row<Open>, PathBuf, PathBuf), Gate
                     row.name
                 )
             })?;
-            Ok((row, head, config))
+            Ok((row, Some((head, config))))
         }
     }
 }
@@ -361,7 +396,7 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
     bloomery_levers::at_main(&[])?;
     record::at_main(WHAT, KINDS);
     let a = parse_args(args)?;
-    let (row, head, config) = head_files(from)?;
+    let (row, head) = head_files(from)?;
     let model = ref_model_path()?;
     let split = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;
     let arch = split.architecture().unwrap_or("<missing>").to_owned();
@@ -378,7 +413,10 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         .arch_get_u64("embedding_length")
         .ok_or_else(|| format!("{}: no {arch}.embedding_length", model.display()))?;
     drop(split);
-    let (model_name, head_name) = (base_name(&model), base_name(&head));
+    let model_name = base_name(&model);
+    let head_name = head
+        .as_ref()
+        .map_or_else(|| model_name.clone(), |(h, _)| base_name(h));
     let name = hf.map_or_else(|| model_name.clone(), str::to_owned);
     let addr = format!("{}:{}", a.host, a.port);
     let ctx = a.ctx.unwrap_or(row.ctx);
@@ -388,7 +426,6 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         arch,
         width,
         head,
-        config,
         open: row.open,
         ctx,
     };

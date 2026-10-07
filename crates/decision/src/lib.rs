@@ -5,11 +5,13 @@
 //!
 //! [`json`] reads a request as Python does, [`render`] writes JSON as Python does, [`request`]
 //! validates, [`encode`] builds the ids, [`safetensors`] and [`head`] load and run the head,
+//! [`gguf_head`] reads the head from a model file that carries it (llama.cpp's Clef layout),
 //! [`rows`] gives the head its output embedding rows from a GGUF file, [`answer`] builds the body;
 //! [`release`] holds what a server needs to seat Clef.
 
 pub mod answer;
 pub mod encode;
+pub mod gguf_head;
 pub mod head;
 pub mod json;
 mod ops;
@@ -77,6 +79,8 @@ pub enum Error {
     },
     #[error("joint_head_config.json: {0}")]
     HeadConfig(String),
+    #[error("the head in the model file: {0}")]
+    InFileHead(String),
     #[error("hidden states hold {values} values: not {ids} rows of {width}")]
     HiddenShape {
         values: usize,

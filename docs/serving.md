@@ -53,6 +53,12 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic", "none": "Answer directly"}}}}'
 ```
 
+**Two layouts of the Clef-Flash GGUF.** The file's architecture picks the head's source. llama.cpp's `clef` layout
+carries the joint head inside the file (bartowski's current upload), so `bloomery-serve --hf
+bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qwen35` layout takes the release's head
+file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
+head instead of the file's own.
+
 **Concurrent requests.** Every generative seat takes `--parallel N` (unset, 2 over the automatic context; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
 llama-server reads it, and the startup line says so). The N slots are resident sequences
@@ -118,7 +124,8 @@ binary's `--help`.
 - A placed load's plan counts every slot's cache, so `--parallel 2` puts fewer experts on the card than
   `--parallel 1` (8 fewer on V4.1), and the two servers' answers can differ at a near tie, with residency on or off.
 - Clef takes text states only, and reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not the IQ
-  types, Q2_K, Q4_0 or Q4_1).
+  types, Q2_K, Q4_0 or Q4_1). A head inside a `clef` file is read as the file stores it (bartowski's: Q8_0 matrices,
+  which move a probability by under 3e-4 against the release's bf16 head on the eight reference requests).
 - V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
   before it; a long V4.1 prompt (P = 4096) is bound by the card, since the prompt call streams host experts in.
 - A pinned nightly with a pinned cuda-oxide revision from our fork ([`BUILD.md`](BUILD.md)).

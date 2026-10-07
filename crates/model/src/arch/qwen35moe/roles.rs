@@ -2,7 +2,8 @@
 //! name: the model-level names, then the per-layer stems, one table per
 //! variant (a stem one variant carries is unclassified in the others; qwen35
 //! is qwen35moe's mixer and norm stems with a dense FFN's in place of the
-//! routed ones). A name the table does not hold fails the file with every
+//! routed ones, and its file may carry a decision head's tensors, which are
+//! never loaded). A name the table does not hold fails the file with every
 //! such name listed.
 
 use gguf::Split;
@@ -100,11 +101,22 @@ fn qwen4exp_role(stem: &str) -> Option<Role> {
     }
 }
 
+/// Whether `name` is a tensor of the decision head a Clef-layout file
+/// (`clef`, llama.cpp) carries beside the trunk: the head's blocks, its
+/// `decision.*` tensors and its token types. `crates/decision` reads them; the
+/// body loads none.
+fn decision_head(name: &str) -> bool {
+    name == "token_types.weight" || name.starts_with("dec.blk.") || name.starts_with("decision.")
+}
+
 /// A tensor's role and layer by its name; `None` when the table does not
 /// hold it, or its layer is past `n_layer`. The PLE table has no layer in
 /// its name and belongs to the site's.
 fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
     let exp = hp.variant == Variant::Qwen4Exp;
+    if hp.variant == Variant::Qwen35 && decision_head(name) {
+        return Some((Role::Unused, None));
+    }
     match name {
         "token_embd.weight" => return Some((Role::TokenEmbedding, None)),
         "output.weight" => return Some((Role::Head, None)),

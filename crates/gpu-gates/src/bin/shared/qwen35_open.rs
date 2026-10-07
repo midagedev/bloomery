@@ -1,4 +1,5 @@
-//! The load of a Qwen3.5 dense file (`qwen35`, Clef's backbone) for its
+//! The load of a Qwen3.5 dense file (`qwen35`, or llama.cpp's Clef layout
+//! `clef`, which is the same trunk with a head beside it) for its
 //! prompt call, which `clef_hidden`, its gate and `bloomery-serve`'s decide
 //! seat share, and the ids file reader of the first two.
 
@@ -7,9 +8,9 @@ use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
-use model::arch::models::Arch;
 use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
+use model::arch::{QWEN35_BODY, is_qwen35_body};
 use model::placement::workstation::CardSpec;
 use model::placement::{KvBytes, whole_need};
 use std::path::Path;
@@ -44,13 +45,14 @@ pub fn read_ids(path: &Path, n: Option<usize>) -> Result<Vec<u32>, GateError> {
     }
 }
 
-/// The `qwen35` file at `path`, whole on one card: a cache of `ctx` rows,
+/// The Qwen3.5 dense file ([`QWEN35_BODY`]) at `path`, whole on one card: a cache of `ctx` rows,
 /// prompt ubatches of `ubatch` ids, the scalar flash for the row passes
 /// (`mma` false). The 27B file's group of 6 query heads a KV head runs the
 /// pairs' pass, which has no tensor-core form and is refused with `mma` at
 /// load; Clef-Flash's group of 4 would take it, but `gate_clef_hidden` holds
 /// the scalar pass, so every file opens with it. A file of any other
-/// architecture is refused by name. The card is `a`'s on one census
+/// architecture is refused by name. A `clef` file's head tensors are never
+/// loaded here. The card is `a`'s on one census
 /// reading ([`Place::A`]: the largest visible card by usable bytes, ties to
 /// the lower ordinal — the qwen3 seat's whole load takes the same pick,
 /// `PlaceQ3::unplaced_on`), whatever the CUDA order puts at device 0; a
@@ -59,10 +61,9 @@ pub fn read_ids(path: &Path, n: Option<usize>) -> Result<Vec<u32>, GateError> {
 /// backbone has no routed experts to move to the host tier.
 pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, Split), GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let want = Arch::Qwen35.name();
-    if split.architecture() != Some(want) {
+    if !split.architecture().is_some_and(is_qwen35_body) {
         return Err(format!(
-            "{} is {:?}, and this reads {want} (Qwen3.5 dense)",
+            "{} is {:?}, and this reads {QWEN35_BODY:?} (Qwen3.5 dense)",
             path.display(),
             split.architecture()
         )

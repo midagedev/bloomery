@@ -752,14 +752,17 @@ gate-gpu-qwen35moe-e2e:
 gate-gpu-clef-hidden:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
 
-# The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q3_K_S (4.3 GB) with the
-# release's head; the six refusals (a qwen35 file with no head, --model decide with no head, --model qwen3 with
-# --head, a head config no row knows, a head narrower than the backbone, a GGUF of llama.cpp's Clef layout) exit
-# before any backbone load, then one
+# The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
+# `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
+# decide with no head, --model qwen3 with --head, a head config no row knows, a head narrower than the backbone,
+# a GGUF of llama.cpp's Clef layout with no decision head) exit before any backbone load, then one
 # server answers the suite's first request on its row's route only, speaks llama.cpp's /v1/systemone wire (the
-# answer's model is the server's, /v1/models, the engine object, an image a 501), the same body again. Either card.
+# answer's model is the server's, /v1/models, the engine object, an image a 501), the same body again; then the
+# same quantization in llama.cpp's Clef layout (bartowski's current upload, 6.98 GB, the head inside the GGUF in
+# Q8_0; fetched into /root/models/clef-flash/) serves the request with no head flag, and its answers equal the
+# same file's with the release's head (the one difference: the head's dtype). Either card.
 gate-gpu-clef-serve:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q3_K_S.gguf --head /models/clef-flash/hf/joint_head.safetensors --dir $D'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
 
 # clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
 # position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.

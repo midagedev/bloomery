@@ -20,7 +20,8 @@
 //!
 //! A decision model is named by its head, not by its backbone's architecture: `--head` given, or a
 //! `--hf` repo whose model card names a row's head repo as the model it quantizes, seats it
-//! ([`pick`]); the head's config picks the row ([`row_of_config`]).
+//! ([`pick`]); the head's config picks the row ([`row_of_config`]). A file whose layout carries the
+//! head inside it ([`Row::in_file`]) needs neither: its architecture names the row.
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
@@ -109,6 +110,10 @@ pub struct Row<O> {
     pub ctx: usize,
     /// The file architectures whose hidden states the head reads.
     pub backbones: &'static [&'static str],
+    /// The `backbones` whose file carries the head itself, in its own tensors: a file of one of
+    /// them seats the row with no `--head` and no `--hf` card, and the head is read from the model
+    /// file ([`HeadSource::InFile`]). The others take a head file.
+    pub in_file: &'static [&'static str],
     /// The repo the head is fetched from under `--hf`.
     pub head_repo: &'static str,
     /// A repo whose model card names [`head_repo`](Row::head_repo) as the model it
@@ -155,13 +160,24 @@ pub enum HeadFrom<'r, O> {
     },
     /// The row's head repo, which the `--hf` repo's card names as the model it quantizes.
     Fetch(&'r Row<O>),
+    /// The model file itself: its architecture is one of the row's [`Row::in_file`].
+    InFile(&'r Row<O>),
 }
 
-/// The head the command line names, in this order: `--head`; under `--hf`, the head repo of the
-/// row whose backbones hold the file's architecture and which the repo's card (`card(repo)`: the
-/// model the card says the repo quantizes) names; else none. The card is read only when the decide
-/// seat is asked for (`--model decide`) or the file is one no generative seat serves and a row's
-/// backbone may be, so a generative seat's run reads no card.
+/// What a row's own part opens its head from, once the seat has the files: the head's weights and
+/// config files, or the model file that carries the head.
+#[derive(Clone, Copy, Debug)]
+pub enum HeadSource<'a> {
+    Files { head: &'a Path, config: &'a Path },
+    InFile(&'a Path),
+}
+
+/// The head the command line names, in this order: `--head`; a file whose architecture a row lists
+/// as [`Row::in_file`], with no generative `--model` word (its own head, and no card is read);
+/// under `--hf`, the head repo of the row whose backbones hold the file's architecture and which
+/// the repo's card (`card(repo)`: the model the card says the repo quantizes) names; else none.
+/// The card is read only when the decide seat is asked for (`--model decide`) or the file is one
+/// no generative seat serves and a row's backbone may be, so a generative seat's run reads no card.
 ///
 /// `Ok(None)` is no head: the file goes to the generative seats, which refuse a row's backbone by
 /// [`no_head`]. Refused by name: a file a row lists as unserved (whatever the flags), `--head`
@@ -194,6 +210,11 @@ pub fn pick<'r, O>(
     if let Some(c) = ask.head_config {
         return Err(format!("--head-config {} without --head", c.display()));
     }
+    if let Some(row) = rows.iter().find(|r| r.in_file.contains(&ask.arch))
+        && (decide || ask.word.is_none())
+    {
+        return Ok(Some(HeadFrom::InFile(row)));
+    }
     let backbone = rows.iter().any(|r| r.backbones.contains(&ask.arch));
     if !decide && (ask.word.is_some() || ask.generative || !backbone) {
         return Ok(None);
@@ -213,16 +234,23 @@ pub fn pick<'r, O>(
     Ok(None)
 }
 
-/// The refusal of a file of architecture `arch` with no head, naming what would seat it.
+/// The refusal of a file of architecture `arch` with no head, naming what would seat it: the
+/// backbones that take a head file (a layout that carries its head never needs this refusal).
 pub fn no_head<O>(arch: &str, rows: &[Row<O>]) -> String {
     let known: Vec<String> = rows
         .iter()
         .map(|r| {
+            let separate: Vec<&str> = r
+                .backbones
+                .iter()
+                .copied()
+                .filter(|b| !r.in_file.contains(b))
+                .collect();
             format!(
                 "{} (head repo {}, backbone {}; --hf {})",
                 r.name,
                 r.head_repo,
-                r.backbones.join(" or "),
+                separate.join(" or "),
                 r.quant_repo
             )
         })
@@ -816,7 +844,8 @@ mod tests {
         name: "rowa",
         routes: &["/v1/a"],
         ctx: 16,
-        backbones: &["qwen35"],
+        backbones: &["qwen35", "qwen35c"],
+        in_file: &["qwen35c"],
         head_repo: "Org/a",
         quant_repo: "q/a-GGUF:Q4",
         head_file: "a.safetensors",
@@ -876,6 +905,68 @@ mod tests {
             assert!(matches!(got, Ok(Some(HeadFrom::Fetch(r))) if r.name == "rowa"));
         }
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn a_file_that_carries_its_head_seats_its_row_alone() {
+        let mut n = 0;
+        let head = Path::new("/h/a.safetensors");
+        // No flag, `--model decide`, and `--hf`: the file's architecture names the row, and no
+        // card is read.
+        for (word, hf) in [
+            (None, None),
+            (Some(WORD), None),
+            (None, Some("q/a-GGUF")),
+            (Some(WORD), Some("q/a-GGUF")),
+        ] {
+            let a = Ask {
+                word,
+                hf,
+                ..ask("qwen35c")
+            };
+            let got = pick(&a, ROWS, &mut card(Some("Org/a"), &mut n));
+            assert!(
+                matches!(got, Ok(Some(HeadFrom::InFile(r))) if r.name == "rowa"),
+                "{a:?}"
+            );
+        }
+        assert_eq!(n, 0, "no card is read");
+        // `--head` names the head over the file's own.
+        let a = Ask {
+            head: Some(head),
+            ..ask("qwen35c")
+        };
+        assert!(matches!(
+            pick(&a, ROWS, &mut card(None, &mut n)),
+            Ok(Some(HeadFrom::Given { .. }))
+        ));
+        // A generative seat's word sends the file on, to be refused there by name.
+        let a = Ask {
+            word: Some("qwen3"),
+            ..ask("qwen35c")
+        };
+        assert!(matches!(pick(&a, ROWS, &mut card(None, &mut n)), Ok(None)));
+        // `--head-config` alone is the same refusal as on any file.
+        let a = Ask {
+            head_config: Some(head),
+            ..ask("qwen35c")
+        };
+        assert!(
+            pick(&a, ROWS, &mut card(None, &mut n))
+                .unwrap_err()
+                .contains("without --head")
+        );
+        // A layout with a separate head is not seated by its architecture alone.
+        assert!(matches!(
+            pick(&ask("qwen35"), ROWS, &mut card(None, &mut n)),
+            Ok(None)
+        ));
+        // Its refusal names the backbones that take a head file, not the layout that needs none.
+        let e = no_head("qwen35", ROWS);
+        assert!(
+            e.contains("backbone qwen35;") && !e.contains("qwen35c"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -5,14 +5,17 @@
 //! in f64 on the CPU, the `systemone()` body), `edge.jsonl` (6 encode-only requests) and, per suite
 //! request, `<id>.hidden.f32` and `<id>.lexical.{f32,ids}`. The requests themselves are
 //! `tools/ref/clef/{suite,edge}.jsonl`. The tokenizer is the Flash GGUF [`CLEF_GGUF`]; the head is
-//! the snapshot's `joint_head.safetensors` with its `joint_head_config.json` ([`CLEF_HEAD`]).
+//! the snapshot's `joint_head.safetensors` with its `joint_head_config.json` ([`CLEF_HEAD`]). The head
+//! in llama.cpp's Clef layout, the same release's weights as bartowski's GGUF carries them
+//! ([`CLEF_LAYOUT_GGUF`]), is held to the release's: tensor by tensor, and through the logits.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use decision::answer::{answer, probabilities};
 use decision::encode::{Encoded, EncodedQuestion, MAX_LENGTH, encode};
-use decision::head::ClefHead;
+use decision::gguf_head::GgufHead;
+use decision::head::{ClefHead, SCALARS, Weights};
 use decision::json::{self, Json};
 use decision::render::render;
 use decision::request::{Kind, Request};
@@ -31,6 +34,10 @@ const CLEF_GGUF: &str = "/models/clef-flash/clef-flash-Q4_K_M.gguf";
 
 /// The release snapshot's head, beside the model files.
 const CLEF_HEAD: &str = "/models/clef-flash/hf/joint_head.safetensors";
+
+/// bartowski's Clef-Flash Q5_K_M in llama.cpp's Clef layout (`general.architecture = clef`, the
+/// head inside the file, 6,982,686,880 bytes; HF commit `5fcdd9ba`).
+const CLEF_LAYOUT_GGUF: &str = "/root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf";
 
 fn jsonl(path: &PathBuf) -> Vec<Json> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -378,4 +385,203 @@ fn json_num(a: &Json) -> String {
     };
     p.and_then(Json::as_f64)
         .map_or_else(|| "?".into(), |v| v.to_string())
+}
+
+/// The head of the clef-layout file.
+fn load_gguf_head(split: &gguf::Split) -> ClefHead {
+    ClefHead::from_gguf(split).unwrap_or_else(|e| panic!("{CLEF_LAYOUT_GGUF}: {e}"))
+}
+
+/// layout, tensors: every tensor of the head in the clef-layout file against the release's
+/// `joint_head.safetensors`, widened to f32 as the release stores it (bf16).
+///
+/// The conversion's dtype change, named: llama.cpp's converter writes the norms, biases and the
+/// type embedding as f32 and the scorer's output weight as bf16 (widening a bf16 is exact), so
+/// those equal the release's bit for bit; the six projections, the attention and feed-forward
+/// matrices and the scorer's first weight are quantized to Q8_0. A Q8_0 block of 32 values
+/// stores `d = amax / 127` as f16 and `q = round(x / d)`: the error is at most `d / 2` from the
+/// rounding plus `127 · |d - f16(d)| <= 127 · d · 2^-11` from the scale, `0.5625 d`
+/// (ggml `quantize_row_q8_0_ref`; the file is quantized from bf16 or f32 values, never through
+/// f16, which would add `2 · 127 · 2^-11 d`). The three scalars are stored transformed: within
+/// two ulps of the f32 formula (`clef.py` computes them in f64).
+#[test]
+#[ignore = "needs the clef-layout GGUF and the release's head; just gate-decision-clef"]
+fn hw_clef_layout_tensors_are_the_releases_within_q8_0() {
+    let release = decision::safetensors::Safetensors::open(&PathBuf::from(CLEF_HEAD)).unwrap();
+    let split = gguf::Split::open(CLEF_LAYOUT_GGUF).unwrap_or_else(|e| panic!("{e}"));
+    let src = GgufHead::open(&split).unwrap_or_else(|e| panic!("{e}"));
+    let cfg = src.config();
+    println!("config from the file: {cfg:?}");
+    let (mut exact, mut q8, mut worst, mut bad) = (0usize, 0usize, 0f64, Vec::new());
+    for (name, shape) in cfg.weights() {
+        if SCALARS.contains(&name.as_str()) {
+            continue;
+        }
+        assert_eq!(src.shape(&name).as_ref(), Some(&shape), "{name}");
+        let want = release.tensor(&name).unwrap().data;
+        let got = src.tensor(&name).unwrap();
+        let types = src.stored_types(&name).unwrap();
+        if types.iter().all(|t| *t == gguf::GgmlType::Q8_0) {
+            q8 += 1;
+            for (w, g) in want.chunks(32).zip(got.chunks(32)) {
+                let d = w.iter().fold(0f32, |m, x| m.max(x.abs())) / 127.0;
+                for (a, b) in w.iter().zip(g) {
+                    let err = f64::from((a - b).abs());
+                    if d > 0.0 {
+                        worst = worst.max(err / f64::from(d));
+                    }
+                    if err > 0.5625 * f64::from(d) * (1.0 + 1e-6) {
+                        bad.push(format!("{name}: {a} vs {b}, d {d}"));
+                    }
+                }
+            }
+        } else if types
+            .iter()
+            .all(|t| matches!(t, gguf::GgmlType::F32 | gguf::GgmlType::BF16))
+        {
+            exact += 1;
+            if got
+                .iter()
+                .zip(&want)
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+            {
+                bad.push(format!("{name}: stored {types:?}, not the release's bits"));
+            }
+        } else {
+            bad.push(format!("{name}: stored as {types:?}"));
+        }
+    }
+    println!(
+        "head tensors: {exact} stored exactly (f32/bf16, bits equal), {q8} in Q8_0 with the largest \
+         error {worst:.4} of its block's step d = amax/127 (bound 0.5625)"
+    );
+    let release_scales = {
+        let raw = |n: &str| release.tensor(n).unwrap().data[0];
+        decision::head::scales_of(raw(SCALARS[0]), raw(SCALARS[1]), raw(SCALARS[2]))
+    };
+    let stored = src.scales().unwrap();
+    println!("scales: release {release_scales:?} file {stored:?}");
+    for (a, b) in [
+        (release_scales.0, stored.0),
+        (release_scales.1, stored.1),
+        (release_scales.2, stored.2),
+    ] {
+        assert!(
+            (a - b).abs() <= 2.0 * a.abs() * f32::EPSILON,
+            "{a} vs {b}: more than two ulps"
+        );
+    }
+    assert!(bad.is_empty(), "tensors off the release's: {bad:?}");
+    assert!(
+        q8 > 0 && exact > 0,
+        "{q8} Q8_0 tensors and {exact} exact ones"
+    );
+}
+
+/// What the head's logits move by with the file's Q8_0 matrices in place of the release's bf16
+/// ones, on the same hidden states and lexical rows.
+///
+/// PIN(2026-10-07): 5e-3 on a logit. Measured on the eight reference requests (31 questions): the
+/// worst request moves 1.4e-3 (the others 0.8e-3 to 1.3e-3), so the band is 3.6 times the worst;
+/// the runs repeat exactly. Written before the run: 1e-2, in 2e-3 to 5e-2 — a Q8_0 step
+/// `amax / 127` moves a weight by 0.45 % of its scale at random, and ~10 products on a path of
+/// LayerNorms were taken to add in quadrature to 1.4 % of a unit vector, which the joint logit
+/// `gate · (scale · cosine + residual)` (1.19 · cosine + 0.12 · residual) shows at 1e-2. The
+/// measure is a seventh of that: the residual connections carry each block's clean input past its
+/// noise, and the prior path (the output rows against the pooled states) reads no head weight.
+/// A wrong mapping is far outside it: with the key and value projections swapped the same run
+/// moves logits by 1.6 at the worst request and 0.4 to 1.2 at the others.
+const LAYOUT_LOGIT_BAND: f64 = 5e-3;
+
+/// A probability moves by `p (1 - p) <= 1/4` of its logit's move, and a softmax over two options
+/// by the difference of two: half of [`LAYOUT_LOGIT_BAND`], which also bounds the noul's sigmoid
+/// (measured worst 2.4e-4).
+const LAYOUT_PROB_BAND: f64 = 2.5e-3;
+
+/// The probability of an answer's top option, and how far its decision is from flipping: for a
+/// noul `|p - 0.5|`; for a choice or score half the top two probabilities' difference. A
+/// probability that moves by at most `b` flips the top only where this is at most `b`.
+fn slack(a: &Json) -> f64 {
+    if a.get("type").and_then(Json::as_str) == Some("noul") {
+        return (a.get("noul").and_then(Json::as_f64).unwrap() - 0.5).abs();
+    }
+    let Some(Json::Object(p)) = a.get("probabilities") else {
+        panic!("an answer without probabilities")
+    };
+    let mut v: Vec<f64> = p.iter().map(|e| e.1.as_f64().unwrap()).collect();
+    v.sort_by(|x, y| y.total_cmp(x));
+    (v[0] - v.get(1).copied().unwrap_or(0.0)) / 2.0
+}
+
+/// layout, logits: the clef-layout file's head and the release's, on the eight reference requests'
+/// own hidden states: the same inputs, so the only difference is the head's dtype
+/// ([`hw_clef_layout_tensors_are_the_releases_within_q8_0`]). Every logit within
+/// [`LAYOUT_LOGIT_BAND`], every probability within [`LAYOUT_PROB_BAND`], and every question's top
+/// the same unless its decision was within the probability band of flipping ([`slack`]).
+#[test]
+#[ignore = "needs the Clef reference under $BLOOMERY_DATA and the clef-layout GGUF; just gate-decision-clef"]
+fn hw_clef_layout_head_scores_as_the_release_head() {
+    let release = load_head();
+    let split = gguf::Split::open(CLEF_LAYOUT_GGUF).unwrap_or_else(|e| panic!("{e}"));
+    let layout = load_gguf_head(&split);
+    assert_eq!(layout.config(), release.config());
+    let reqs = requests();
+    let rows = jsonl(&data().join("ref/reference.jsonl"));
+    assert_eq!(rows.len(), 8);
+    let (mut worst_l, mut worst_p, mut bad) = (0f64, 0f64, Vec::new());
+    for row in &rows {
+        let id = id_of(row);
+        let req = Request::from_json(&reqs[&id]).unwrap();
+        let (enc, a) = our_logits(&release, row);
+        let (_, b) = our_logits(&layout, row);
+        let dl = a
+            .iter()
+            .flatten()
+            .zip(b.iter().flatten())
+            .map(|(x, y)| f64::from((x - y).abs()))
+            .fold(0.0, f64::max);
+        let dp = a
+            .iter()
+            .zip(&b)
+            .flat_map(|(x, y)| probabilities(x).into_iter().zip(probabilities(y)))
+            .map(|(x, y)| f64::from((x - y).abs()))
+            .fold(0.0, f64::max);
+        let model = reqs[&id].get("model").and_then(Json::as_str).unwrap();
+        let (body_a, body_b) = (
+            answer(&req, &enc, &a, model).unwrap(),
+            answer(&req, &enc, &b, model).unwrap(),
+        );
+        let (Some(Json::Object(ra)), Some(Json::Object(rb))) =
+            (body_a.get("answers"), body_b.get("answers"))
+        else {
+            panic!("{id}: no answers")
+        };
+        for ((q, x), (_, y)) in ra.iter().zip(rb) {
+            let (tx, ty, s) = (top(x), top(y), slack(x));
+            let flip = tx != ty;
+            println!(
+                "layout {id}/{q}: top release={tx} layout={ty} {} slack={s:.4} p_release={} p_layout={}",
+                if flip { "DIFFERENT" } else { "equal" },
+                json_num(x),
+                json_num(y)
+            );
+            if flip && s > LAYOUT_PROB_BAND {
+                bad.push(format!("{id}/{q}: top {tx} vs {ty} with slack {s:.4}"));
+            }
+        }
+        println!(
+            "layout {id}: n={} max|dlogit|={dl:.3e} (band {LAYOUT_LOGIT_BAND:.1e}) max|dp|={dp:.3e} (band {LAYOUT_PROB_BAND:.1e})",
+            enc.ids.len()
+        );
+        if dl > LAYOUT_LOGIT_BAND || dp > LAYOUT_PROB_BAND {
+            bad.push(format!("{id}: dlogit {dl:.3e}, dp {dp:.3e}"));
+        }
+        worst_l = worst_l.max(dl);
+        worst_p = worst_p.max(dp);
+    }
+    println!("layout: worst max|dlogit| {worst_l:.3e}, worst max|dp| {worst_p:.3e}");
+    assert!(
+        bad.is_empty(),
+        "the layout's head is off the release's: {bad:?}"
+    );
 }
