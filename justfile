@@ -423,6 +423,16 @@ bench-cpu-v41-host-check:
 time-cpu-v41-host *ARGS:
     BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/ref/host-rate.sh {{ARGS}}'
 
+# The NVMe tier's reader (lead-only): probe_nvread over Qwen3.8's routed experts, cold, at k = 1, 2, 3 experts a
+# batch from distinct layers and over one layer's range from an id, each read by the page-cache path (WILLNEED, then
+# POPULATE_READ split across threads) and by O_DIRECT preads of the same runs, each batch dropped and checked cold by
+# mincore before and resident after. The rows' header is the probe's, the lease, the witness blocks with the drive's
+# read counters, the drive's queue and the reconcile line are tools/ref/nvtier-read.sh's; the card is
+# docs/cards/nvtier-read.card. ARGS go to the runner (--rounds, --seed, --range-from, then the probe's own: --batches,
+# --threads, ...). Example: `BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/nvtier-read.card' just time-nvread`.
+time-nvread *ARGS:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-gpu-gates --bin probe_nvread && bash tools/ref/nvtier-read.sh {{ARGS}}'
+
 # 2026-09-20 사고(q_nope2 무한루크가 gate-mt를 매달아 병렬 에이전트 둘을 '무활동'으로 죽임)의
 # 보강. 이 트랙 원격 디렉터리 아래 실행 파일을 물고 있는 고아 프로세스를 찾아 죽인다.
 # 고르는 축은 /proc/<pid>/exe이지 cmdline이 아니다 — `pgrep -f "<dir>/target"`은 그 패턴을
@@ -1133,8 +1143,9 @@ gate-gpu-lib:
 # bloomery-gpu-gates 라이브러리의 단위 시험(호스트 전용, 카드·게이트 락 없음). ptx.rs의 컨테이너 판독 계약 —
 # 8의 배수 길이 페이로드의 마지막 본문, 번들 경계, 파서가 거부한 섹션은 빈 표가 아니라 오류 — 이 여기서 돈다.
 # gpu 피처 없이 빌드하므로 디바이스 크레이트를 컴파일하지 않고, 그래서 평범한 cargo다. just gate가 부른다.
+# probe_nvread's helper tests (batch split, quantiles, aligned spans, the seeded layer draw) run here too: the bin takes no feature.
 gate-gpu-gates-lib:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib --bin probe_nvread'
 
 # V4.1 오라클 세트 ref_deepseek41의 모든 행과 디코드 스텝 세트의 헤더를 하니스가 읽는지 본다. 호스트 전용이라 카드도
 # 게이트 락도 쓰지 않는다. 시험 둘의 출력이 섞이지 않게 한 스레드로 돈다.
@@ -1399,7 +1410,7 @@ gen-ds41 *ARGS:
 # P 1536 is weekly-gpu-ds41-flowcounts' three-batch arm, P 16384 the prefill headline's prompt. Loads nothing onto a card;
 # runs with the A6000 in view, since --place a plans the stage on the largest visible card.
 records-refresh:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden --bin probe_nvread >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden probe_nvread; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
 
 # The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 -n 2 under
 # BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), at --depth 512 once at the default

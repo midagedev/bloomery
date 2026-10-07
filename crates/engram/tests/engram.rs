@@ -10,7 +10,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
-use engram::rows::SplitTable;
+use engram::rows::{PageAdvice, SplitTable};
 use engram::{Engram, EngramError, RowTable, Site};
 use gguf::Split;
 
@@ -459,5 +459,344 @@ fn hw_engram_token_map_is_the_compressed_vocabulary() {
         "pad {} is outside the codomain 0..={max}, so a sequence start would \
          address a row the model never trained",
         hash.pad_id()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A routed expert stack as a row table: a synthetic file, no model on the box.
+
+/// The synthetic file's tensors, in file order. A filler first, so the stack's
+/// bytes start 64 B into the data section and not on a page; the stack's
+/// expert is 250 x 7 F32 values, 7,000 B, so no expert starts or ends on a
+/// page either.
+const PAD: &str = "pad.weight";
+const STACK: &str = "blk.0.ffn_gate_exps.weight";
+const TABLE: &str = "tab.weight";
+const RANK4: &str = "rank4.weight";
+const RANK1: &str = "rank1.weight";
+const EXPERTS: u64 = 9;
+const EXPERT_BYTES: u64 = 250 * 7 * 4;
+const TABLE_ROWS: u64 = 20;
+const TABLE_ROW_BYTES: u64 = 250 * 4;
+
+/// Deterministic bytes (xorshift64*), so a shifted or short read differs.
+fn random_bytes(seed: u64, n: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+        })
+        .collect()
+}
+
+/// A scratch directory under the build's own target directory (a disk, so the
+/// page-cache advice has pages to act on), removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("engram-{tag}-{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+        std::fs::create_dir_all(&d).unwrap();
+        Scratch(d)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The synthetic one-shard model in `dir`: returns its path and each tensor's
+/// bytes, by name.
+fn write_synthetic(dir: &std::path::Path) -> (std::path::PathBuf, Vec<(&'static str, Vec<u8>)>) {
+    use gguf::write::{Layout, TensorDecl, Writer};
+    let f32_tensor = |name: &'static str, dims: &[u64], seed: u64| {
+        let nbytes = dims.iter().product::<u64>() * 4;
+        (
+            TensorDecl {
+                name: name.to_string(),
+                dims: dims.to_vec(),
+                type_id: 0,
+                nbytes,
+            },
+            random_bytes(seed, nbytes),
+        )
+    };
+    let tensors = [
+        f32_tensor(PAD, &[13], 1),
+        f32_tensor(STACK, &[250, 7, EXPERTS], 2),
+        f32_tensor(TABLE, &[250, TABLE_ROWS], 3),
+        f32_tensor(RANK4, &[4, 3, 2, 2], 4),
+        f32_tensor(RANK1, &[16], 5),
+    ];
+    let layout = Layout::new(&[], tensors.iter().map(|(d, _)| d.clone()).collect()).unwrap();
+    let path = dir.join("synthetic.gguf");
+    let mut w = Writer::new(
+        std::io::BufWriter::new(File::create(&path).unwrap()),
+        layout,
+    )
+    .unwrap();
+    for (d, bytes) in &tensors {
+        w.tensor(&d.name, bytes).unwrap();
+    }
+    w.finish()
+        .unwrap()
+        .into_inner()
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    let named = tensors
+        .into_iter()
+        .map(|(d, b)| {
+            let name: &'static str = [PAD, STACK, TABLE, RANK4, RANK1]
+                .into_iter()
+                .find(|n| *n == d.name)
+                .unwrap();
+            (name, b)
+        })
+        .collect();
+    (path, named)
+}
+
+/// Where `name`'s first byte is in the file, from the header: the second
+/// witness the row bytes are compared at, as `hw_engram_rows_match_pread` does.
+fn header_offset(path: &std::path::Path, name: &str) -> u64 {
+    let inv = gguf::inventory_of(path).unwrap();
+    let t = inv.tensors.iter().find(|t| t.name == name).unwrap();
+    inv.data_base + t.offset
+}
+
+/// Open `name` of `split` the way a routed stack is read.
+fn open_table(split: &Arc<Split>, name: &str) -> Result<SplitTable, EngramError> {
+    SplitTable::open_with(Arc::clone(split), name, PageAdvice::Normal)
+}
+
+/// Expert `e` of the stack, through the row table, is the bytes the file holds
+/// at the header's offset for it.
+///
+/// What it holds the crate to: the row stride of a 3-D tensor is the bytes of
+/// one `[ne0, ne1]` slab, and the rows are the experts, so a stride taken from
+/// the first two dims only (a quarter of the bytes here), or from the wrong
+/// type, or an id counted from the wrong end, reads other bytes than a `pread`
+/// at `data base + offset + e x slab`.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_expert_stack_rows_are_the_files_bytes() {
+    let scratch = Scratch::new("stack");
+    let (path, tensors) = write_synthetic(&scratch.0);
+    let base = header_offset(&path, STACK);
+    assert_ne!(
+        base % 4096,
+        0,
+        "the synthetic stack must start off a page boundary, or it does not exercise the rounding"
+    );
+    let split = Arc::new(Split::open(&path).unwrap());
+    let table = open_table(&split, STACK).expect("a 3-D stack opens as a table of experts");
+    assert_eq!(table.row_bytes(), EXPERT_BYTES, "one expert is one row");
+
+    let file = File::open(&path).unwrap();
+    let stack = &tensors.iter().find(|(n, _)| *n == STACK).unwrap().1;
+    let ids: Vec<u32> = (0..EXPERTS as u32).rev().collect();
+    let mut copied = vec![0u8; ids.len() * EXPERT_BYTES as usize];
+    table.copy_rows(&ids, &mut copied).unwrap();
+    for (i, &e) in ids.iter().enumerate() {
+        let mut want = vec![0u8; EXPERT_BYTES as usize];
+        file.read_exact_at(&mut want, base + u64::from(e) * EXPERT_BYTES)
+            .unwrap();
+        let got = &copied[i * EXPERT_BYTES as usize..(i + 1) * EXPERT_BYTES as usize];
+        assert_eq!(
+            got,
+            &want[..],
+            "expert {e}: the table disagrees with a pread"
+        );
+        assert_eq!(
+            got,
+            &stack[e as usize * EXPERT_BYTES as usize..(e as usize + 1) * EXPERT_BYTES as usize],
+            "expert {e}: the table disagrees with the bytes the file was written from"
+        );
+    }
+    assert!(
+        matches!(
+            table.copy_rows(&[EXPERTS as u32], &mut vec![0u8; EXPERT_BYTES as usize]),
+            Err(EngramError::RowOutOfRange { id, rows, .. }) if id == EXPERTS as u32 && rows == EXPERTS
+        ),
+        "an expert id past the stack is refused by name"
+    );
+}
+
+/// A 2-D table opens and reads as it did before the stack case.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_two_d_table_rows_are_unchanged() {
+    let scratch = Scratch::new("table");
+    let (path, tensors) = write_synthetic(&scratch.0);
+    let base = header_offset(&path, TABLE);
+    let split = Arc::new(Split::open(&path).unwrap());
+    let table = open_table(&split, TABLE).expect("a 2-D table opens");
+    assert_eq!(table.row_bytes(), TABLE_ROW_BYTES);
+
+    let file = File::open(&path).unwrap();
+    let source = &tensors.iter().find(|(n, _)| *n == TABLE).unwrap().1;
+    let ids: Vec<u32> = vec![0, 7, TABLE_ROWS as u32 - 1];
+    let mut copied = vec![0u8; ids.len() * TABLE_ROW_BYTES as usize];
+    table.copy_rows(&ids, &mut copied).unwrap();
+    for (i, &r) in ids.iter().enumerate() {
+        let mut want = vec![0u8; TABLE_ROW_BYTES as usize];
+        file.read_exact_at(&mut want, base + u64::from(r) * TABLE_ROW_BYTES)
+            .unwrap();
+        let got = &copied[i * TABLE_ROW_BYTES as usize..(i + 1) * TABLE_ROW_BYTES as usize];
+        assert_eq!(got, &want[..], "row {r}: the table disagrees with a pread");
+        assert_eq!(
+            got,
+            &source[r as usize * TABLE_ROW_BYTES as usize
+                ..(r as usize + 1) * TABLE_ROW_BYTES as usize],
+            "row {r}: the table disagrees with the bytes the file was written from"
+        );
+    }
+}
+
+/// A tensor that is neither a 2-D table nor a 3-D stack is refused, and the
+/// refusal names the tensor and its dims.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_refuses_other_ranks_by_name() {
+    let scratch = Scratch::new("rank");
+    let (path, _) = write_synthetic(&scratch.0);
+    let split = Arc::new(Split::open(&path).unwrap());
+    for (name, dims) in [(RANK4, vec![4u64, 3, 2, 2]), (RANK1, vec![16u64])] {
+        match open_table(&split, name) {
+            Err(EngramError::NotATable {
+                name: n, dims: d, ..
+            }) => {
+                assert_eq!(n, name);
+                assert_eq!(d, dims, "{name}: the refusal carries the header's dims");
+            }
+            Err(other) => panic!("{name}: refused as {other:?}, not by name as NotATable"),
+            Ok(_) => panic!("{name}: a tensor of rank {} opened as a table", dims.len()),
+        }
+    }
+}
+
+/// An eviction leaves none of the named experts' pages in the page cache, a
+/// prefetch and populate leave all of them, and the file range a row names is
+/// where the header puts it.
+///
+/// The drop is checked by `mincore`, which reports the page cache of a file
+/// mapping to the file's owner (the box's gates run as the owner). The whole
+/// stack is dropped first so a neighbour's page shared with a named expert
+/// does not stay resident from the write.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_expert_stack_evicts_and_reads_back() {
+    let scratch = Scratch::new("evict");
+    let (path, _) = write_synthetic(&scratch.0);
+    let base = header_offset(&path, STACK);
+    let split = Arc::new(Split::open(&path).unwrap());
+    let table = open_table(&split, STACK).unwrap();
+    let all: Vec<u32> = (0..EXPERTS as u32).collect();
+    let ids = [0u32, 3, 8];
+
+    for &id in &all {
+        assert_eq!(
+            table.file_range(id).unwrap(),
+            (base + u64::from(id) * EXPERT_BYTES, EXPERT_BYTES),
+            "expert {id}: its range in the file"
+        );
+    }
+    assert!(
+        matches!(
+            table.file_range(EXPERTS as u32),
+            Err(EngramError::RowOutOfRange { .. })
+        ),
+        "a range past the stack is refused by name"
+    );
+
+    table.evict_rows(&all).unwrap();
+    let cold = table.resident_pages(&ids).unwrap();
+    assert!(cold.total > 0, "the named experts span pages");
+    assert_eq!(
+        cold.resident, 0,
+        "after an eviction no page of the named experts is in the page cache ({} of {})",
+        cold.resident, cold.total
+    );
+    assert_eq!(table.resident_rows(&ids).unwrap(), 0);
+
+    table.prefetch(&ids).unwrap();
+    table.populate(&ids).unwrap();
+    let warm = table.resident_pages(&ids).unwrap();
+    assert_eq!(warm.total, cold.total, "the same pages are counted");
+    assert_eq!(
+        warm.resident, warm.total,
+        "after a populate every page of the named experts is resident"
+    );
+    assert_eq!(table.resident_rows(&ids).unwrap(), ids.len() as u64);
+
+    table.evict_rows(&ids).unwrap();
+    assert_eq!(
+        table.resident_pages(&ids).unwrap().resident,
+        0,
+        "the experts just read are dropped again"
+    );
+    assert!(
+        matches!(
+            table.evict_rows(&[EXPERTS as u32]),
+            Err(EngramError::RowOutOfRange { .. })
+        ),
+        "an eviction past the stack is refused by name"
+    );
+}
+
+/// A direct handle reads the file's bytes at an aligned offset into an aligned
+/// buffer, carries the `O_DIRECT` flag, and a path that is not there is
+/// refused by name.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_open_direct_reads_the_files_bytes() {
+    use std::os::fd::AsRawFd;
+    let scratch = Scratch::new("direct");
+    let (path, _) = write_synthetic(&scratch.0);
+    let direct = engram::open_direct(&path).expect("a file on a disk opens for direct reads");
+
+    let fdinfo =
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", direct.as_raw_fd())).unwrap();
+    let flags = fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("flags:"))
+        .map(|v| u32::from_str_radix(v.trim(), 8).unwrap())
+        .expect("fdinfo names the open flags");
+    assert_ne!(
+        flags & 0o40000,
+        0,
+        "the handle carries O_DIRECT: flags {flags:o}"
+    );
+
+    let align = engram::DIRECT_ALIGN;
+    let mut backing = vec![0u8; 2 * align];
+    let off = backing.as_ptr().align_offset(align);
+    let buf = &mut backing[off..off + align];
+    direct.read_exact_at(buf, 0).unwrap();
+    let mut want = vec![0u8; align];
+    File::open(&path)
+        .unwrap()
+        .read_exact_at(&mut want, 0)
+        .unwrap();
+    assert_eq!(
+        &buf[..],
+        &want[..],
+        "an aligned direct read returns the file's first block"
+    );
+
+    let missing = scratch.0.join("absent.gguf");
+    assert!(
+        matches!(engram::open_direct(&missing), Err(EngramError::OpenDirect { path, .. }) if path == missing),
+        "a path that is not there is refused by name, carrying the path"
     );
 }

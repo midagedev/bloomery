@@ -41,3 +41,4 @@ crates/gpu-gates/src/bin/gate_qwen3moe_flash.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_swap.rs 2 a gate binary, never pinned (its placement clause pins a thread only around a machine's build); the free arm's timing thread, spawned between machines, never pinned
 crates/gpu-gates/src/bin/gate_vision_encoder.rs 1 a gate binary, never pinned
 crates/hf/src/fetch.rs 1 a test's local HTTP answerer (the HTTP-error clause), from a test thread that is never pinned
+crates/gpu-gates/src/bin/probe_nvread.rs 1 a probe binary, never pinned: the cache and direct arms' resident workers
