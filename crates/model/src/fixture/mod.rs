@@ -9,10 +9,12 @@
 //! file. The fixture is the map's layers and the source's globals. Every
 //! tensor keeps its source's dims and type id and is renamed `blk.L.` →
 //! `blk.f.`; the exceptions are a tensor the family's [`Tables`] resize and a
-//! routed stack the ff override narrows. The metadata is the source header's,
-//! each architecture key by the family's [`KeyRule`] (a key it does not name
-//! is an error), and five keys of its own: [`KEY_VERSION`], [`KEY_SEED`],
-//! [`KEY_SOURCE_LAYERS`], [`KEY_SOURCE_SHA256`] and [`KEY_CARD_BUDGET`]. A
+//! routed stack the ff override narrows. The metadata is the source header's:
+//! the `split.`, `general.`, `tokenizer.` and `quantize.` keys copied (the
+//! last two are the format's own namespaces), each architecture key by the
+//! family's [`KeyRule`] (a key it does not name is an error), and five keys of
+//! its own: [`KEY_VERSION`], [`KEY_SEED`], [`KEY_SOURCE_LAYERS`],
+//! [`KEY_SOURCE_SHA256`] and [`KEY_CARD_BUDGET`]. A
 //! file holding only some of the planned tensors also carries [`KEY_SUBSET`];
 //! the engine must not run such a file.
 //!
@@ -42,16 +44,21 @@ use gguf::{GgmlType, LoadError};
 
 use crate::placement::PlacementError;
 
+mod budget;
 mod fill;
 mod plan;
 mod spec;
 mod verify;
 mod write;
 
+pub use budget::check as check_budget;
 pub use fill::{Band, CHUNK_TARGET, FloatTy, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
 pub(crate) use plan::{int_like, items, unsigned};
-pub use spec::{DraftRules, DraftSpec, Family, FixtureSpec, KeyRule, Options, Tables};
+pub use spec::{
+    Budget, CardBudget, CardExperts, DraftRules, DraftSpec, Family, FixtureSpec, KeyRule, Options,
+    Tables,
+};
 pub use verify::{
     Sample, VerifyStats, check_tensor, check_units, rms_within, sample_chunks, verify,
 };
@@ -99,6 +106,8 @@ pub enum FixtureError {
         set: &'static str,
         source: WriteError,
     },
+    #[error("the card budget: {0}")]
+    Budget(String),
     #[error("the source is {got:?}, not a {want} file")]
     Architecture {
         got: Option<String>,

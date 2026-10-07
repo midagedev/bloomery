@@ -23,7 +23,7 @@ pub struct FixtureSpec {
     /// family has no such key.
     pub ratios: Vec<u64>,
     /// The card budget a fixture records when the caller gives none.
-    pub card_budget: u64,
+    pub card_budget: CardBudget,
     /// The range every block's `d` (and `dmin`) is drawn inside, by the
     /// rules and checked by `verify`; a type whose scale cannot fit it at a
     /// tensor's K is refused by name.
@@ -47,12 +47,48 @@ impl FixtureSpec {
     pub fn options(&self) -> Options {
         Options {
             seed: DEFAULT_SEED,
-            card_budget: self.card_budget,
+            card_budget: None,
             shard_bytes: DEFAULT_SHARD_BYTES,
             tensors: None,
             draft_tensors: None,
         }
     }
+}
+
+/// The card budget a spec records when the caller names none.
+#[derive(Clone, Copy)]
+pub enum CardBudget {
+    /// This many bytes, whatever the written file plans.
+    Fixed(u64),
+    /// The cap [`budget::choose`](super::budget::choose) finds for the
+    /// written file: the family's own plan of it holds half of every
+    /// card-eligible layer's experts on the card.
+    Planned(Budget),
+}
+
+/// A family's plan of its written file under a card budget, which
+/// [`CardBudget::Planned`] searches the cap through. The chosen cap's
+/// conditions — the context the plan runs at, and the machine and resident
+/// slots [`Budget::card_experts`] names — are the family's; wherever the
+/// recorded value is read they are named with it.
+#[derive(Clone, Copy)]
+pub struct Budget {
+    /// The positions the choosing plan runs at.
+    pub ctx: u64,
+    /// The per-layer card expert counts of the written file planned under
+    /// `budget` bytes (`None`: each card's own usable bytes), and the file's
+    /// expert count a layer's share is half of; a planner refusal is the
+    /// error.
+    pub card_experts: fn(&Split, Option<u64>) -> Result<CardExperts, FixtureError>,
+}
+
+/// What [`Budget::card_experts`] returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardExperts {
+    /// Per layer of the file: the experts its stage card holds.
+    pub per_layer: Vec<u64>,
+    /// The file's expert count, one number for every layer.
+    pub experts: u64,
 }
 
 /// A family's draft file: a separate model whose fixture is written beside
@@ -91,6 +127,11 @@ pub enum KeyRule {
     /// The source's value, which must be 0: the reason names the layers the
     /// map does not carry.
     Zero(&'static str),
+    /// The rule's value in place of the source's, in the source's integer
+    /// type: a fact of the map, not of the source (an interval the fixture
+    /// re-derives its layer kinds from, say). The key must be in the source:
+    /// [`Family::required_keys`] names it.
+    Set(u64),
     /// [`FixtureSpec::ff`] when set, else the source's value.
     Ff,
     /// The family's [`Tables::key`] computes it.
@@ -106,6 +147,14 @@ pub trait Family: Sync {
     /// The value of every element of a 1-D F32 tensor, by its name past
     /// `blk.N.`; `None` is a 1-D tensor with no fill rule.
     fn const_value(&self, leaf: &str) -> Option<f32>;
+
+    /// The architecture keys (past `<arch>.`) every source must carry,
+    /// because the fixture's header is not right without them: a key a
+    /// [`KeyRule::Set`] rewrites, which the plan only walks if the source
+    /// has it. A source without one is refused by name.
+    fn required_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// The axis of tensor `leaf` (its name past `blk.N.`) that is the
     /// routed experts' feed-forward width, which [`FixtureSpec::ff`]
@@ -184,6 +233,19 @@ pub trait DraftRules: Sync {
     /// one file: a split key is refused before this is asked.
     fn kvs(&self, draft: &Split, n_source: usize, n_fixture: usize) -> Result<Kvs, FixtureError>;
 
+    /// The fixture name of the real draft's tensor `name`, for a target
+    /// fixture of `n_fixture` layers cut from `n_source`: the identity — a
+    /// draft whose own layer indices the target does not read.
+    fn tensor(
+        &self,
+        name: &str,
+        n_source: usize,
+        n_fixture: usize,
+    ) -> Result<String, FixtureError> {
+        let _ = (n_source, n_fixture);
+        Ok(name.to_string())
+    }
+
     /// The draft fixture reads, through the engine's own reader, as a draft
     /// of `target`; with both files `whole`, its inventory against the
     /// target holds too.
@@ -200,7 +262,9 @@ pub trait DraftRules: Sync {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub seed: u64,
-    pub card_budget: u64,
+    /// The card budget the fixture records; `None` when the caller sets
+    /// none — the spec's, or its planner's ([`Budget`]).
+    pub card_budget: Option<u64>,
     pub shard_bytes: u64,
     /// Only these target tensors (a subset file), in plan order.
     pub tensors: Option<Vec<String>>,

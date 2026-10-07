@@ -9,7 +9,7 @@ use super::fill::{
     Band, Q4K_MIN_PER_SCALE, Q5K_MIN_PER_SCALE, Rule, Window, q3k_scale, scale_min_k4, unit_bytes,
 };
 use super::plan::{FilePlan, PlannedTensor, header_sha256, items, plan, unsigned};
-use super::spec::{FixtureSpec, Options};
+use super::spec::{CardBudget, FixtureSpec, Options};
 use super::{
     DEFAULT_SHARD_BYTES, FIXTURE_VERSION, FixtureError, KEY_CARD_BUDGET, KEY_SEED,
     KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_SUBSET, KEY_VERSION, meta,
@@ -365,7 +365,7 @@ fn read_options(spec: &FixtureSpec, split: &Split) -> Result<Options, FixtureErr
     };
     Ok(Options {
         seed: unsigned(KEY_SEED, get(KEY_SEED)?)?,
-        card_budget: unsigned(KEY_CARD_BUDGET, get(KEY_CARD_BUDGET)?)?,
+        card_budget: Some(unsigned(KEY_CARD_BUDGET, get(KEY_CARD_BUDGET)?)?),
         shard_bytes: DEFAULT_SHARD_BYTES,
         tensors: subset,
         draft_tensors: None,
@@ -478,7 +478,7 @@ pub fn verify(
                 return Err(FixtureError::Mismatch {
                     what: "draft keys".into(),
                     detail: format!(
-                        "seed {} budget {}, the target's {} {}",
+                        "seed {} budget {:?}, the target's {} {:?}",
                         o.seed, o.card_budget, opts.seed, opts.card_budget
                     ),
                 });
@@ -492,6 +492,14 @@ pub fn verify(
     let whole = opts.tensors.is_none();
     if whole {
         spec.family.check_kinds(spec, fixture, source)?;
+    }
+    if whole && let CardBudget::Planned(planner) = spec.card_budget {
+        // The recorded budget is re-planned on the written file, before its
+        // bytes are read: the plan the chooser settled on is a property of
+        // the fixture, so a file whose plan moved (a lever, a machine
+        // figure, a budget edited in the header) fails here by the counts
+        // its layers hold.
+        super::budget::check(&planner, fixture, plan.card_budget)?;
     }
     let target = check_file(fixture, &plan.target, opts.seed, spec.window, progress)?;
     let draft_stats = match (draft, &plan.draft, &spec.draft) {

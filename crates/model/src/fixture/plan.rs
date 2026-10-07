@@ -10,7 +10,7 @@ use gguf::{GgmlType, Split, Value};
 use sha2::{Digest, Sha256};
 
 use super::fill::{Rule, Window, chunk_len, chunk_rng, fill_units, rule_for};
-use super::spec::{DraftSpec, Family, FixtureSpec, KeyRule, Options, Tables};
+use super::spec::{CardBudget, DraftSpec, Family, FixtureSpec, KeyRule, Options, Tables};
 use super::{
     FIXTURE_VERSION, FixtureError, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256,
     KEY_SUBSET, KEY_VERSION, meta,
@@ -171,8 +171,12 @@ impl FilePlan {
 pub struct Plan {
     pub target: FilePlan,
     pub draft: Option<FilePlan>,
-    /// The family's tables, one line each ([`Tables::lines`]).
+    /// The family's tables, one line each ([`Tables::lines`]), and the note
+    /// of a planned card budget.
     pub notes: Vec<String>,
+    /// The card budget the fixture records: the caller's, or the spec's
+    /// ([`FixtureSpec::card_budget`]).
+    pub card_budget: u64,
 }
 
 /// `template`'s integer variant holding `v`.
@@ -235,7 +239,13 @@ fn fixture_keys(spec: &FixtureSpec, opts: &Options, source_sha: String) -> Vec<(
             Value::Array(spec.layers.iter().map(|&l| Value::U32(l as u32)).collect()),
         ),
         (KEY_SOURCE_SHA256.to_string(), Value::String(source_sha)),
-        (KEY_CARD_BUDGET.to_string(), Value::U64(opts.card_budget)),
+        // The caller's budget, or a placeholder of the same size until the
+        // spec's is known: the plan sets it (`set_budget`) without moving a
+        // byte of the layout.
+        (
+            KEY_CARD_BUDGET.to_string(),
+            Value::U64(opts.card_budget.unwrap_or(0)),
+        ),
     ]
 }
 
@@ -364,17 +374,54 @@ pub fn plan(
     let ff = source_ff.zip(spec.ff);
     let tensors = target_tensors(spec, source, tables.as_ref(), ff, &mut rules)?;
     let tensors = apply_subset(tensors, opts.tensors.as_ref(), &mut kvs)?;
-    let target = shard(spec.stem, kvs, split_keys, tensors, opts.shard_bytes)?;
-    let draft = match (draft, &spec.draft) {
+    let mut target = shard(spec.stem, kvs, split_keys, tensors, opts.shard_bytes)?;
+    let mut draft = match (draft, &spec.draft) {
         (None, _) => None,
         (Some(d), Some(ds)) => Some(plan_draft(spec, ds, d, n_layer, opts, &mut rules)?),
         (Some(_), None) => return Err(FixtureError::NoDraft { arch: spec.arch }),
     };
+    let mut notes = tables.lines();
+    let card_budget = match (opts.card_budget, spec.card_budget) {
+        (Some(b), _) => b,
+        (None, CardBudget::Fixed(b)) => b,
+        (None, CardBudget::Planned(_)) if opts.tensors.is_some() => {
+            return Err(FixtureError::Budget(
+                "a subset file holds no whole plan to choose the budget from; give --card-budget"
+                    .into(),
+            ));
+        }
+        (None, CardBudget::Planned(planner)) => {
+            let b = super::budget::choose(&planner, &target)?;
+            notes.push(format!(
+                "card budget {b} ({} MiB): half the experts on the card on every card-eligible \
+                 layer, planned at {} positions",
+                b / (1024 * 1024),
+                planner.ctx
+            ));
+            b
+        }
+    };
+    set_budget(&mut target.kvs, card_budget)?;
+    if let Some(d) = draft.as_mut() {
+        set_budget(&mut d.kvs, card_budget)?;
+    }
     Ok(Plan {
         target,
         draft,
-        notes: tables.lines(),
+        notes,
+        card_budget,
     })
+}
+
+/// Replace the recorded card budget in `kvs`, whose entry the placeholder
+/// already holds.
+fn set_budget(kvs: &mut Kvs, budget: u64) -> Result<(), FixtureError> {
+    let (_, v) = kvs
+        .iter_mut()
+        .find(|(k, _)| k == KEY_CARD_BUDGET)
+        .ok_or_else(|| meta(KEY_CARD_BUDGET, "the plan holds no budget entry to set"))?;
+    *v = Value::U64(budget);
+    Ok(())
 }
 
 /// The target's metadata in the source's order, each key by the family's
@@ -397,7 +444,7 @@ fn target_kvs(
             kvs.push((k.to_string(), v.clone()));
             continue;
         }
-        if k.starts_with("general.") || k.starts_with("tokenizer.") {
+        if k.starts_with("general.") || k.starts_with("tokenizer.") || k.starts_with("quantize.") {
             kvs.push((k.to_string(), v.clone()));
             continue;
         }
@@ -450,6 +497,7 @@ fn target_kvs(
                     None => v.clone(),
                 }
             }
+            KeyRule::Set(to) => int_like(k, v, to)?,
             KeyRule::Table => tables.key(k, suffix, v)?,
         };
         kvs.push((k.to_string(), nv));
@@ -461,6 +509,17 @@ fn target_kvs(
                 "the spec's ratios {:?} have no ratios key in the source",
                 spec.ratios
             ),
+        ));
+    }
+    if let Some(key) = spec
+        .family
+        .required_keys()
+        .iter()
+        .find(|k| source.value(&format!("{arch_prefix}{k}")).is_none())
+    {
+        return Err(meta(
+            &format!("{arch_prefix}{key}"),
+            "is absent from the source: the fixture's header is not right without it",
         ));
     }
     if let Some(ff) = spec.ff
@@ -668,9 +727,13 @@ fn plan_draft(
         source,
     })?;
     kvs.extend(fixture_keys(spec, opts, header_sha256(draft)));
+    let n_fixture = spec.layers.len();
     let tensors = draft
         .iter_tensors()
-        .map(|(_, t)| planned(rules, t.name.clone(), &t.name, None, t.dims.clone(), t.ty))
+        .map(|(_, t)| {
+            let name = ds.rules.tensor(&t.name, n_layer, n_fixture)?;
+            planned(rules, name, &t.name, None, t.dims.clone(), t.ty)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let tensors = apply_subset(tensors, opts.draft_tensors.as_ref(), &mut kvs)?;
     let n = tensors.len();

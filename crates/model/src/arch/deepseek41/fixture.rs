@@ -22,8 +22,8 @@ use gguf::{Split, Value};
 use super::hparams::{DenseStream, Hparams, LayerKind, Stream};
 use crate::arch::dspark::{self, DraftHparams};
 use crate::fixture::{
-    DraftRules, DraftSpec, Family, FixtureError, FixtureSpec, KeyRule, Kvs, Tables, Window,
-    int_like, items, meta, unsigned,
+    CardBudget, DraftRules, DraftSpec, Family, FixtureError, FixtureSpec, KeyRule, Kvs, Tables,
+    Window, int_like, items, meta, unsigned,
 };
 
 /// Fixture layer `f` holds source layer `LAYER_MAP[f]`: one layer per kind
@@ -69,7 +69,7 @@ pub fn spec() -> FixtureSpec {
         stem: STEM,
         layers: LAYER_MAP.to_vec(),
         ratios: FIXTURE_RATIOS.to_vec(),
-        card_budget: DEFAULT_CARD_BUDGET,
+        card_budget: CardBudget::Fixed(DEFAULT_CARD_BUDGET),
         window: Window::new(D_MIN, D_MAX).expect("[2^-13, 2^-10] is inside the normal f16 values"),
         ff: None,
         default_source: gguf::v41::model,

@@ -33,6 +33,9 @@ pub struct GenerateStats {
     pub tensors: usize,
     pub bytes: u64,
     pub file_bytes: u64,
+    /// The card budget the files record: the caller's, or the family
+    /// planner's choice.
+    pub card_budget: u64,
     pub gen_secs: f64,
     pub write_secs: f64,
     pub sync_secs: f64,
@@ -68,6 +71,7 @@ pub fn generate(
         });
     }
     let plan = plan(spec, source, draft, opts)?;
+    let card_budget = plan.card_budget;
     let mut files = plan.target.layouts()?;
     let mut sets = vec![(&plan.target, files.len())];
     if let Some(d) = &plan.draft {
@@ -123,6 +127,7 @@ pub fn generate(
         tensors: w.tensors,
         bytes: w.bytes,
         file_bytes: need,
+        card_budget,
         gen_secs: w.gen_secs,
         write_secs: w.write_secs,
         sync_secs: w.sync_secs,

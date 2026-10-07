@@ -18,6 +18,7 @@
 //! `src/models/qwen4exp.cpp` and
 //! `src/llama-hparams.cpp` unless another file is named.
 
+pub mod fixture;
 pub mod head_list;
 pub mod host;
 pub mod hparams;

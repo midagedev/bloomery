@@ -9,7 +9,8 @@
 //! The spec is the family's whose architecture the first file declares (for `verify`, the
 //! fixture's, which is its source's); an architecture with no spec is refused by name.
 //! Flags of `plan` and `generate`: `--seed N`, `--card-budget B` (bytes, or `nM`/`nG` as
-//! `BLOOMERY_CARD_BUDGET` takes them; the spec's budget when absent), `--shard-bytes B`
+//! `BLOOMERY_CARD_BUDGET` takes them; the spec's budget when absent, a fixed one or the
+//! cap its family's plan of the written file chooses), `--shard-bytes B`
 //! (tensor data a shard holds at most), and `--tensors a,b,…` / `--draft-tensors a,b,…` for a
 //! file holding only those tensors (it carries `bloomery.fixture.subset`). `plan` writes
 //! nothing. `generate` refuses an existing `<out dir>`, writes into `<out dir>.tmp.<pid>` and
@@ -25,6 +26,7 @@ use std::process::ExitCode;
 
 use gguf::Split;
 use model::arch::deepseek41::fixture as v41;
+use model::arch::qwen35moe::fixture as qwen38;
 use model::fixture::{
     self, DEFAULT_SEED, DEFAULT_SHARD_BYTES, FilePlan, FixtureSpec, Options, PlannedTensor, Sample,
     TensorStat,
@@ -37,7 +39,7 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...";
 
 /// Every family's spec, found by the architecture it declares.
-const SPECS: [fn() -> FixtureSpec; 1] = [v41::spec];
+const SPECS: [fn() -> FixtureSpec; 2] = [v41::spec, qwen38::spec];
 
 /// The flags `plan` and `generate` take.
 const PLAN_FLAGS: [&str; 6] = [
@@ -154,12 +156,12 @@ impl Args {
         Ok(a)
     }
 
-    /// The plan's options: the flags given, the spec's and the generator's
-    /// defaults for the rest.
-    fn options(&self, spec: &FixtureSpec) -> Options {
+    /// The plan's options: the flags given, the generator's defaults for the
+    /// rest (`--card-budget` absent leaves the budget to the spec's).
+    fn options(&self) -> Options {
         Options {
             seed: self.seed.unwrap_or(DEFAULT_SEED),
-            card_budget: self.card_budget.unwrap_or(spec.card_budget),
+            card_budget: self.card_budget,
             shard_bytes: self.shard_bytes.unwrap_or(DEFAULT_SHARD_BYTES),
             tensors: self.tensors.clone(),
             draft_tensors: self.draft_tensors.clone(),
@@ -244,14 +246,14 @@ fn print_files(what: &str, p: &FilePlan) -> Res<u64> {
 fn plan(source: &str, a: &Args) -> Res<()> {
     let split = open(source)?;
     let spec = spec_of(&split, source)?;
-    let opts = a.options(&spec);
+    let opts = a.options();
     let draft = a.draft.as_deref().map(open).transpose()?;
     let p = fixture::plan(&spec, &split, draft.as_ref(), &opts)?;
     println!(
         "fixture: plan source={source} ({} shards) seed={} card_budget={} shard_bytes={} window={}",
         split.shard_count(),
         opts.seed,
-        opts.card_budget,
+        p.card_budget,
         opts.shard_bytes,
         spec.window
     );
@@ -303,12 +305,13 @@ fn peak_rss_kib() -> i64 {
 fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
     let split = open(source)?;
     let spec = spec_of(&split, source)?;
-    let opts = a.options(&spec);
+    let opts = a.options();
     let draft = a.draft.as_deref().map(open).transpose()?;
     println!(
         "fixture: generate {source} -> {out} seed={} card_budget={} draft={}",
         opts.seed,
-        opts.card_budget,
+        opts.card_budget
+            .map_or("planned".to_string(), |b| b.to_string()),
         a.draft.as_deref().unwrap_or("none")
     );
     let mut line = |t: &TensorStat| {
@@ -326,10 +329,12 @@ fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
         &mut line,
     )?;
     println!(
-        "fixture: generate done tensors={} bytes={} file_bytes={} gen_secs={:.2} write_secs={:.2} sync_secs={:.2} secs={:.2} peak_rss_kib={} out={}",
+        "fixture: generate done tensors={} bytes={} file_bytes={} card_budget={} gen_secs={:.2} \
+         write_secs={:.2} sync_secs={:.2} secs={:.2} peak_rss_kib={} out={}",
         s.tensors,
         s.bytes,
         s.file_bytes,
+        s.card_budget,
         s.gen_secs,
         s.write_secs,
         s.sync_secs,
