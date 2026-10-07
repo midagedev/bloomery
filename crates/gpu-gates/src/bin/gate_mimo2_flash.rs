@@ -79,13 +79,14 @@ mod gate {
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
         GateError, RefManifest, activations, bits_equal, checks_failed, mask_bits_in,
-        ref_dir_named, ref_tensor_logical_in, verdict,
+        ref_dir_named, ref_model_path, ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::GgmlType;
     use gguf::Split;
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
     use model::arch::mimo2::hparams::{Hparams, Kind};
+    use refset::arch::mimo2::IK;
 
     /// An f16 NaN the unread cache rows are overwritten with.
     const NAN16: u16 = 0x7e00;
@@ -1658,22 +1659,20 @@ mod gate {
         let stream = gpu.stream();
         let mut ok = true;
         let mut split: Option<(Split, Hparams)> = None;
-        println!(
-            "ik sets: no ik-mimo2 family module in this tree; the sets are read by path through refset's \
-             reader and their family check is skipped"
-        );
         let mut windows_bite = 0usize;
         for name in SETS {
             let dir = ref_dir_named(name);
-            let man = RefManifest::read(&dir)?;
-            if man.arch.as_deref() != Some("mimo2") {
-                return Err(format!("{name}: # arch is {:?}, want mimo2", man.arch).into());
-            }
+            let man = RefManifest::open(&dir, &IK)?;
             if split.is_none() {
-                let path = man.header.model().ok_or("the set names no # model")?;
-                let s = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+                let path = ref_model_path()?;
+                let s = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
                 if s.architecture() != Some("mimo2") {
-                    return Err(format!("{path} is {:?}, want mimo2", s.architecture()).into());
+                    return Err(format!(
+                        "{} is {:?}, want mimo2",
+                        path.display(),
+                        s.architecture()
+                    )
+                    .into());
                 }
                 let hp = Hparams::read(&s).map_err(|e| e.to_string())?;
                 if hp.value_scale.to_bits() != V_SCALE.to_bits()
