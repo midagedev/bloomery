@@ -185,6 +185,12 @@ Order:
   - XS each: `.config/nextest.toml` has no user (delete or adopt); `overflow-checks` per untrusted-input package (not
     profile-wide: overflow MIR breaks device lowering); a rust-analyzer config for the Mac.
   - Done: the lead's pre-push hook (fmt + five fast check-*.sh, 22 s).
+- **gpu-gate.sh holds a card lock while it waits for the V4.1 load lock** (xstream23, 2026-10-07; S, after 0.2.6).
+  The A6000 then idles (1 MiB in use) while `any` items fall back to the 3090 queue. Round gate items waited 20+ min
+  each. The order is deliberate (`tools/gpu-gate.sh` self-test "lock order": a load queued on its card lock holds no
+  V4.1 load lock), so reversing it moves the idle to the other lock. Fix: take both locks together, retrying with
+  non-blocking `flock -n` on each and holding neither while waiting. FAIL-first: a held load lock leaves the other
+  item's card free for an `any` item.
 - **gate-batch has no clean stop** (worker2, 2026-10-07, iqwire's stop; S, after 0.2.6).
   - The main process writes no pid file, and lane X runs inside it. A stop through pid files can only TERM
     `lane-X.child`, and each TERM starts the next item.
