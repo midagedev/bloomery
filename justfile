@@ -832,10 +832,11 @@ gate-gpu-qwen4exp-e2e:
 # stack, the load naming the three types on path=fused; and the same prompt and 8 decode steps at the pool's default
 # width and at width 1 (two processes, each loading the file, BLOOMERY_POISON=1) leave the same ids and logits bit for
 # bit. Loads the 90 GB file twice: alone in a batch, under the big-load lock.
+# Stays solo (r1) in the real tier only: its file is UD-Q3_K_XL's i-quants, which the Qwen3.8 fixture (Q4) does not hold; a non-real tier is refused by name (66).
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen4exp-iqleg:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = real ] || { echo "gate-gpu-qwen4exp-iqleg: no fixture tier: its file is UD-Q3_K_XL (i-quants), the fixture is Q4 (exit 66)" >&2; exit 66; } && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
 
 # Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
 # store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,
