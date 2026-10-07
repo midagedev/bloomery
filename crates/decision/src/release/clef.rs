@@ -19,10 +19,13 @@ pub const CTX: usize = MAX_LENGTH;
 /// in the two layouts a GGUF of it comes in ([`IN_FILE`] is the one that holds its head).
 pub const BACKBONES: &[&str] = &["qwen35", "clef"];
 
+/// The architecture of llama.cpp's Clef layout, whose file carries the head itself.
+pub const LAYOUT_ARCH: &str = "clef";
+
 /// The [`BACKBONES`] whose file carries the head itself, so the seat reads it from the model file
 /// ([`crate::head::ClefHead::from_gguf`]) and a head file is not asked for: llama.cpp's `clef`
 /// layout. The other backbones (`qwen35`) take the release's head file.
-pub const IN_FILE: &[&str] = &["clef"];
+pub const IN_FILE: &[&str] = &[LAYOUT_ARCH];
 
 /// The repo the release's head is fetched from.
 pub const HEAD_REPO: &str = "Cloudflare/clef-flash";

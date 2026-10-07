@@ -29,13 +29,17 @@
 //! A decision model is named by its head, not by its architecture
 //! (`serve::decide::pick`): `--head`, or a `--hf` repo whose model card
 //! names a decision row's head repo as the model it quantizes, picks the
-//! decide seat (`serve_seats::decide`); `--head` beside a generative seat's
-//! `--model` is refused by name, and so is `--model decide` with no head.
+//! decide seat (`serve_seats::decide`); so does a model file that carries
+//! its head, by its `<arch>.decision.type` (lev: the file's own head, no
+//! flag) or its `clef` architecture; `--head` beside a generative seat's
+//! `--model` is refused by name, and so is `--model decide` with no head,
+//! and a file whose decision type no row serves (`kev`).
 //! Otherwise, with no `--model`, the architecture of the file's first shard
 //! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next the glm
 //! seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe the qwen3 seat;
 //! a file of a decision row's backbone (qwen35) with no head is refused by
-//! name, saying what would seat it (`--head`, or a row's `--hf` repo); a
+//! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
+//! that carries its head); a
 //! file whose architecture no seat serves is refused by name listing the
 //! seat words; a file whose architecture does not match an explicit
 //! `--model` is refused by name before any load.
@@ -92,6 +96,11 @@ mod qwen35_open;
 #[path = "shared/clef_seat.rs"]
 mod clef_seat;
 
+// lev's row's own part (`crate::lev_seat`).
+#[cfg(feature = "clef")]
+#[path = "shared/lev_seat.rs"]
+mod lev_seat;
+
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_serve_levers.rs"]
 mod serve_levers;
@@ -139,7 +148,8 @@ models (the --model word is optional with a model file: the file's architecture 
   qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
   glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL
   qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
-  decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M";
+  decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
+  decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
     /// What every start prints on stderr before the load begins: the claim
     /// holds for every start (a start cannot know whether it is the card's
@@ -297,11 +307,15 @@ models (the --model word is optional with a model file: the file's architecture 
     }
 
     /// The `general.architecture` of the model file's first shard
-    /// ([`ref_model_path`]).
-    fn file_arch() -> Result<String, GateError> {
+    /// ([`ref_model_path`]) and its `<arch>.decision.type`, when it has one.
+    fn file_facts() -> Result<(String, Option<String>), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        Ok(split.architecture().unwrap_or("<missing>").to_owned())
+        let decision = split.arch_get_str("decision.type").map(str::to_owned);
+        Ok((
+            split.architecture().unwrap_or("<missing>").to_owned(),
+            decision,
+        ))
     }
 
     /// The head the arguments name ([`serve::decide::pick`]) and the rest:
@@ -313,13 +327,14 @@ models (the --model word is optional with a model file: the file's architecture 
         rest: &[String],
     ) -> Result<(Option<decide::Pick>, Vec<String>), GateError> {
         let (given, rest) = serve::decide::take_head(rest)?;
-        let arch = file_arch()?;
+        let (arch, decision) = file_facts()?;
         let ask = Ask {
             head: given.head.as_deref(),
             head_config: given.config.as_deref(),
             word: word.map(Word::word),
             hf: repo,
             arch: &arch,
+            decision: decision.as_deref(),
             generative: Model::ALL.iter().any(|m| m.serves(&arch)),
         };
         let from = serve::decide::pick(&ask, decide::ROWS, &mut |r| {

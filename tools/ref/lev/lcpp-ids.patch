@@ -1,0 +1,18 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3242,6 +3242,15 @@
+                             }
+                         }*/
+ 
++                        // bloomery: the prompt ids of a decision task, one line a task
++                        if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
++                            std::string ids;
++                            for (int i = 0; i < (int) input_tokens.size(); i++) {
++                                ids += std::to_string(input_tokens[i]) + " ";
++                            }
++                            SLT_INF(slot, "bloomery-ids n %d: %s\n", (int) input_tokens.size(), ids.c_str());
++                        }
++
+                         // keep track how many tokens we can reuse from the previous state
+                         int n_past = 0;
+ 

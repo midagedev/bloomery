@@ -20,8 +20,10 @@
 //!
 //! A decision model is named by its head, not by its backbone's architecture: `--head` given, or a
 //! `--hf` repo whose model card names a row's head repo as the model it quantizes, seats it
-//! ([`pick`]); the head's config picks the row ([`row_of_config`]). A file whose layout carries the
-//! head inside it ([`Row::in_file`]) needs neither: its architecture names the row.
+//! ([`pick`]); the head's config picks the row ([`row_of_config`]). A file that carries the head
+//! inside it ([`Row::in_file`]) needs neither: its architecture (Clef's layout) or its
+//! `<architecture>.decision.type` (lev, whose head is the file's own language-model head) names the
+//! row, and a decision type no row serves is refused by name.
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
@@ -98,6 +100,33 @@ pub trait Decide: Send {
 /// The `--model` word of the decide seat.
 pub const WORD: &str = "decide";
 
+/// How a model file says it carries a row's head itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InFile {
+    /// Its `general.architecture` is this one: llama.cpp's Clef layout (`clef`), a file whose tensors
+    /// hold the head.
+    Arch(&'static str),
+    /// Its `<architecture>.decision.type` is this one (`lev`): the file's own language-model head is
+    /// the model's, and its metadata holds the prompt template and the temperatures.
+    Decision(&'static str),
+}
+
+/// The head a row also takes as files of its own: a repo to fetch them from, or `--head`.
+#[derive(Debug)]
+pub struct HeadRepo {
+    /// The repo the head is fetched from under `--hf`.
+    pub repo: &'static str,
+    /// A repo whose model card names [`repo`](HeadRepo::repo) as the model it quantizes, whose set
+    /// seats the row under `--hf`: the `--hf` a bare-backbone refusal points at.
+    pub quant_repo: &'static str,
+    /// The head's weights in that repo.
+    pub file: &'static str,
+    /// The head config's file name, beside the weights.
+    pub config_file: &'static str,
+    /// Whether a head config's text is this row's, or why not.
+    pub knows: fn(&str) -> Result<(), String>,
+}
+
 /// One decision model the decide seat serves: the facts it reads before it opens anything, and the
 /// model's own part, `open`, which the seat calls.
 #[derive(Debug)]
@@ -110,27 +139,35 @@ pub struct Row<O> {
     pub ctx: usize,
     /// The file architectures whose hidden states the head reads.
     pub backbones: &'static [&'static str],
-    /// The `backbones` whose file carries the head itself, in its own tensors: a file of one of
-    /// them seats the row with no `--head` and no `--hf` card, and the head is read from the model
-    /// file ([`HeadSource::InFile`]). The others take a head file.
-    pub in_file: &'static [&'static str],
-    /// The repo the head is fetched from under `--hf`.
-    pub head_repo: &'static str,
-    /// A repo whose model card names [`head_repo`](Row::head_repo) as the model it
-    /// quantizes, whose set seats the row under `--hf`: the `--hf` a bare-backbone
-    /// refusal points at.
-    pub quant_repo: &'static str,
-    /// The head's weights in that repo.
-    pub head_file: &'static str,
-    /// The head config's file name, beside the weights.
-    pub config_file: &'static str,
-    /// Whether a head config's text is this row's, or why not.
-    pub knows: fn(&str) -> Result<(), String>,
+    /// How a file that carries the head itself names the row: a file that matches seats it with no
+    /// `--head` and no `--hf` card, and the head is read from the model file
+    /// ([`HeadSource::InFile`]).
+    pub in_file: &'static [InFile],
+    /// The head the row also takes as files, or none: a row whose head is only ever the file's own.
+    pub head: Option<HeadRepo>,
     /// File architectures that carry this model in a layout the seat does not read, each with what
     /// the refusal says (what the file is, and what to serve instead).
     pub unserved: &'static [(&'static str, &'static str)],
     /// The model's own part.
     pub open: O,
+}
+
+impl<O> Row<O> {
+    /// Whether a file of this `general.architecture` carries the row's head itself.
+    #[must_use]
+    pub fn in_file_arch(&self, arch: &str) -> bool {
+        self.in_file
+            .iter()
+            .any(|k| matches!(k, InFile::Arch(a) if *a == arch))
+    }
+
+    /// Whether a file of this `<arch>.decision.type` carries the row's head itself.
+    #[must_use]
+    pub fn in_file_decision(&self, kind: &str) -> bool {
+        self.in_file
+            .iter()
+            .any(|k| matches!(k, InFile::Decision(t) if *t == kind))
+    }
 }
 
 /// What the command line asks of the decide seat.
@@ -146,6 +183,8 @@ pub struct Ask<'a> {
     pub hf: Option<&'a str>,
     /// The model file's architecture.
     pub arch: &'a str,
+    /// The model file's `<arch>.decision.type`, when it has one.
+    pub decision: Option<&'a str>,
     /// Whether a generative seat serves `arch`.
     pub generative: bool,
 }
@@ -160,7 +199,7 @@ pub enum HeadFrom<'r, O> {
     },
     /// The row's head repo, which the `--hf` repo's card names as the model it quantizes.
     Fetch(&'r Row<O>),
-    /// The model file itself: its architecture is one of the row's [`Row::in_file`].
+    /// The model file itself: its architecture or decision type is one of the row's [`Row::in_file`].
     InFile(&'r Row<O>),
 }
 
@@ -172,16 +211,20 @@ pub enum HeadSource<'a> {
     InFile(&'a Path),
 }
 
-/// The head the command line names, in this order: `--head`; a file whose architecture a row lists
-/// as [`Row::in_file`], with no generative `--model` word (its own head, and no card is read);
-/// under `--hf`, the head repo of the row whose backbones hold the file's architecture and which
-/// the repo's card (`card(repo)`: the model the card says the repo quantizes) names; else none.
-/// The card is read only when the decide seat is asked for (`--model decide`) or the file is one
-/// no generative seat serves and a row's backbone may be, so a generative seat's run reads no card.
+/// The head the command line names, in this order: a file whose `<arch>.decision.type` a row lists as
+/// [`Row::in_file`] (its own head; no head flag is taken beside it and no card is read); `--head`; a
+/// file whose architecture a row lists as [`Row::in_file`], with no generative `--model` word (its
+/// own head, and no card is read); under `--hf`, the head repo of the row whose backbones hold the
+/// file's architecture and which the repo's card (`card(repo)`: the model the card says the repo
+/// quantizes) names; else none. The card is read only when the decide seat is asked for (`--model
+/// decide`) or the file is one no generative seat serves and a row's backbone may be, so a
+/// generative seat's run reads no card.
 ///
 /// `Ok(None)` is no head: the file goes to the generative seats, which refuse a row's backbone by
-/// [`no_head`]. Refused by name: a file a row lists as unserved (whatever the flags), `--head`
-/// beside a generative seat's word, `--head-config` without `--head`, `--model decide` with no head.
+/// [`no_head`]. Refused by name: a file a row lists as unserved (whatever the flags), a file whose
+/// decision type no row serves, `--head` or `--head-config` beside a file whose head is its own
+/// decision type's, a generative seat's word beside one, `--head` beside a generative seat's word,
+/// `--head-config` without `--head`, `--model decide` with no head.
 pub fn pick<'r, O>(
     ask: &Ask<'_>,
     rows: &'r [Row<O>],
@@ -195,6 +238,36 @@ pub fn pick<'r, O>(
         return Err(format!("a {} file is {why}", ask.arch));
     }
     let decide = ask.word == Some(WORD);
+    let by_arch = rows.iter().any(|r| r.in_file_arch(ask.arch));
+    if let (false, Some(kind)) = (by_arch, ask.decision) {
+        let arch = ask.arch;
+        let Some(row) = rows
+            .iter()
+            .find(|r| r.backbones.contains(&arch) && r.in_file_decision(kind))
+        else {
+            return Err(format!(
+                "a {arch} file whose {arch}.decision.type is {kind}: this server serves no such \
+                 decision model; it serves {}",
+                served_in_file(rows)
+            ));
+        };
+        for (flag, value) in [("--head", ask.head), ("--head-config", ask.head_config)] {
+            if let Some(v) = value {
+                return Err(format!(
+                    "{flag} {} beside a {kind} file: its head is the model file's own, which no \
+                     head file replaces",
+                    v.display()
+                ));
+            }
+        }
+        return match ask.word {
+            Some(w) if w != WORD => Err(format!(
+                "--model {w} on a {kind} file: a decision model is the decide seat's (--model \
+                 {WORD}, or no --model)"
+            )),
+            _ => Ok(Some(HeadFrom::InFile(row))),
+        };
+    }
     if let Some(head) = ask.head {
         if let Some(w) = ask.word.filter(|_| !decide) {
             return Err(format!(
@@ -210,7 +283,7 @@ pub fn pick<'r, O>(
     if let Some(c) = ask.head_config {
         return Err(format!("--head-config {} without --head", c.display()));
     }
-    if let Some(row) = rows.iter().find(|r| r.in_file.contains(&ask.arch))
+    if let Some(row) = rows.iter().find(|r| r.in_file_arch(ask.arch))
         && (decide || ask.word.is_none())
     {
         return Ok(Some(HeadFrom::InFile(row)));
@@ -221,10 +294,12 @@ pub fn pick<'r, O>(
     }
     if let Some(repo) = ask.hf {
         let base = card(repo)?;
-        if let Some(row) = rows
-            .iter()
-            .find(|r| base.as_deref() == Some(r.head_repo) && r.backbones.contains(&ask.arch))
-        {
+        if let Some(row) = rows.iter().find(|r| {
+            r.head
+                .as_ref()
+                .is_some_and(|h| base.as_deref() == Some(h.repo))
+                && r.backbones.contains(&ask.arch)
+        }) {
             return Ok(Some(HeadFrom::Fetch(row)));
         }
     }
@@ -234,8 +309,26 @@ pub fn pick<'r, O>(
     Ok(None)
 }
 
+/// What the rows serve from a file's own head, for a refusal to list: their decision types and
+/// their layouts' architectures.
+fn served_in_file<O>(rows: &[Row<O>]) -> String {
+    let (mut types, mut archs) = (Vec::new(), Vec::new());
+    for kind in rows.iter().flat_map(|r| r.in_file) {
+        match kind {
+            InFile::Decision(t) => types.push(*t),
+            InFile::Arch(a) => archs.push(*a),
+        }
+    }
+    format!(
+        "{} by decision type and {} by architecture",
+        types.join(", "),
+        archs.join(", ")
+    )
+}
+
 /// The refusal of a file of architecture `arch` with no head, naming what would seat it: the
-/// backbones that take a head file (a layout that carries its head never needs this refusal).
+/// backbones that take a head file, and the model files that hold their head (a layout that carries
+/// its head never needs this refusal).
 pub fn no_head<O>(arch: &str, rows: &[Row<O>]) -> String {
     let known: Vec<String> = rows
         .iter()
@@ -244,15 +337,32 @@ pub fn no_head<O>(arch: &str, rows: &[Row<O>]) -> String {
                 .backbones
                 .iter()
                 .copied()
-                .filter(|b| !r.in_file.contains(b))
+                .filter(|b| !r.in_file_arch(b))
                 .collect();
-            format!(
-                "{} (head repo {}, backbone {}; --hf {})",
-                r.name,
-                r.head_repo,
-                separate.join(" or "),
-                r.quant_repo
-            )
+            let own: Vec<&str> = r
+                .in_file
+                .iter()
+                .filter_map(|k| match k {
+                    InFile::Decision(t) => Some(*t),
+                    InFile::Arch(_) => None,
+                })
+                .collect();
+            match &r.head {
+                Some(h) => format!(
+                    "{} (head repo {}, backbone {}; --hf {})",
+                    r.name,
+                    h.repo,
+                    separate.join(" or "),
+                    h.quant_repo
+                ),
+                None => format!(
+                    "{} (the head is the model file's own: a {} file whose decision type is {}, \
+                     with no --head)",
+                    r.name,
+                    r.backbones.join(" or "),
+                    own.join(" or ")
+                ),
+            }
         })
         .collect();
     format!(
@@ -272,10 +382,10 @@ pub fn row_of_config<'r, O>(
     config: Option<&Path>,
 ) -> Result<(&'r Row<O>, PathBuf), String> {
     let mut why = Vec::new();
-    for row in rows {
-        let path = config.map_or_else(|| head.with_file_name(row.config_file), Path::to_path_buf);
+    for (row, repo) in rows.iter().filter_map(|r| r.head.as_ref().map(|h| (r, h))) {
+        let path = config.map_or_else(|| head.with_file_name(repo.config_file), Path::to_path_buf);
         match std::fs::read_to_string(&path) {
-            Ok(text) => match (row.knows)(&text) {
+            Ok(text) => match (repo.knows)(&text) {
                 Ok(()) => return Ok((row, path)),
                 Err(e) => why.push(format!("{}: {}: {e}", row.name, path.display())),
             },
@@ -840,20 +950,34 @@ mod tests {
         }
     }
 
-    const ROWS: &[Row<()>] = &[Row {
-        name: "rowa",
-        routes: &["/v1/a"],
-        ctx: 16,
-        backbones: &["qwen35", "qwen35c"],
-        in_file: &["qwen35c"],
-        head_repo: "Org/a",
-        quant_repo: "q/a-GGUF:Q4",
-        head_file: "a.safetensors",
-        config_file: "a.json",
-        knows: knows_a,
-        unserved: &[("rowa_gguf", "rowa in another layout; serve --hf q/a")],
-        open: (),
-    }];
+    const ROWS: &[Row<()>] = &[
+        Row {
+            name: "rowa",
+            routes: &["/v1/a"],
+            ctx: 16,
+            backbones: &["qwen35", "qwen35c"],
+            in_file: &[InFile::Arch("qwen35c")],
+            head: Some(HeadRepo {
+                repo: "Org/a",
+                quant_repo: "q/a-GGUF:Q4",
+                file: "a.safetensors",
+                config_file: "a.json",
+                knows: knows_a,
+            }),
+            unserved: &[("rowa_gguf", "rowa in another layout; serve --hf q/a")],
+            open: (),
+        },
+        Row {
+            name: "rowb",
+            routes: &["/v1/b"],
+            ctx: 16,
+            backbones: &["qwen35"],
+            in_file: &[InFile::Decision("lbl")],
+            head: None,
+            unserved: &[],
+            open: (),
+        },
+    ];
 
     fn ask(arch: &str) -> Ask<'_> {
         Ask {
@@ -862,6 +986,7 @@ mod tests {
             word: None,
             hf: None,
             arch,
+            decision: None,
             generative: false,
         }
     }
@@ -965,6 +1090,112 @@ mod tests {
         let e = no_head("qwen35", ROWS);
         assert!(
             e.contains("backbone qwen35;") && !e.contains("qwen35c"),
+            "{e}"
+        );
+    }
+
+    /// A file whose decision type a row lists is that row's with no flag and no card; a type no row
+    /// lists is refused by name; a head flag, or a generative word, beside one is refused. A layout
+    /// named by architecture keeps its `--head` override whatever type it carries.
+    #[test]
+    fn a_decision_type_names_its_row() {
+        let mut n = 0;
+        let head = Path::new("/h/a.safetensors");
+        let typed = |arch| Ask {
+            decision: Some("lbl"),
+            ..ask(arch)
+        };
+        for (word, hf) in [
+            (None, None),
+            (Some(WORD), None),
+            (None, Some("q/b")),
+            (Some(WORD), Some("q/b")),
+        ] {
+            let a = Ask {
+                word,
+                hf,
+                ..typed("qwen35")
+            };
+            let got = pick(&a, ROWS, &mut card(Some("Org/a"), &mut n));
+            assert!(
+                matches!(got, Ok(Some(HeadFrom::InFile(r))) if r.name == "rowb"),
+                "{a:?}"
+            );
+        }
+        assert_eq!(n, 0, "no card is read");
+        // A flag that names another head is refused beside it, whatever the word.
+        for a in [
+            Ask {
+                head: Some(head),
+                ..typed("qwen35")
+            },
+            Ask {
+                head: Some(head),
+                word: Some(WORD),
+                ..typed("qwen35")
+            },
+            Ask {
+                head_config: Some(head),
+                ..typed("qwen35")
+            },
+        ] {
+            let e = pick(&a, ROWS, &mut card(None, &mut n)).unwrap_err();
+            assert!(
+                e.contains("beside a lbl file: its head is the model file's own")
+                    && (e.starts_with("--head /h/a.safetensors ")
+                        || e.starts_with("--head-config /h/a.safetensors ")),
+                "{e}"
+            );
+        }
+        let a = Ask {
+            word: Some("qwen3"),
+            ..typed("qwen35")
+        };
+        let e = pick(&a, ROWS, &mut card(None, &mut n)).unwrap_err();
+        assert!(
+            e.starts_with("--model qwen3 on a lbl file: a decision model is the decide seat's"),
+            "{e}"
+        );
+        // A type no row serves, or a backbone the row does not read: refused by the type's name.
+        for (arch, kind) in [("qwen35", "kev"), ("llama", "lbl")] {
+            let a = Ask {
+                decision: Some(kind),
+                ..ask(arch)
+            };
+            let e = pick(&a, ROWS, &mut card(None, &mut n)).unwrap_err();
+            assert_eq!(
+                e,
+                format!(
+                    "a {arch} file whose {arch}.decision.type is {kind}: this server serves no such \
+                     decision model; it serves lbl by decision type and qwen35c by architecture"
+                )
+            );
+        }
+        // A layout named by architecture is seated by it, and `--head` still names the head over
+        // the file's own, though the file carries a decision type.
+        let a = Ask {
+            decision: Some("rowa"),
+            ..ask("qwen35c")
+        };
+        assert!(matches!(
+            pick(&a, ROWS, &mut card(None, &mut n)),
+            Ok(Some(HeadFrom::InFile(r))) if r.name == "rowa"
+        ));
+        let a = Ask {
+            head: Some(head),
+            ..a
+        };
+        assert!(matches!(
+            pick(&a, ROWS, &mut card(None, &mut n)),
+            Ok(Some(HeadFrom::Given { .. }))
+        ));
+        // A bare backbone's refusal names the row that needs no head, beside the one that takes one.
+        let e = no_head("qwen35", ROWS);
+        assert!(
+            e.contains("rowa (head repo Org/a, backbone qwen35; --hf q/a-GGUF:Q4)")
+                && e.contains(
+                    "rowb (the head is the model file's own: a qwen35 file whose decision type is lbl, with no --head)"
+                ),
             "{e}"
         );
     }

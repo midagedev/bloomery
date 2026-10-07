@@ -10,13 +10,16 @@
 //! or, under `--hf` with no `--head`, the head repo of the row whose model
 //! card the `--hf` repo's card names as the model it quantizes
 //! (`model_file::quantized_from`), fetched into the cache with its config;
-//! or a model file whose architecture the row lists as carrying its head
-//! (`Row::in_file`: llama.cpp's `clef` layout), which needs no flag and
-//! reads the head from its own tensors; a `--head` beside such a file names
-//! the head instead (the file's trunk, the given head). The head's config
-//! (`--head-config`, else the row's config file beside the weights) picks
-//! the row of [`ROWS`]; a config no row knows is refused by name, listing
-//! the rows. The server takes `-m`/`--hf` out before this seat parses (its
+//! or a model file that carries its head (`Row::in_file`), which needs no
+//! flag: llama.cpp's `clef` layout (the architecture names the row, and the
+//! head is read from the file's tensors; a `--head` beside it names the head
+//! instead, the file's trunk and the given head), or a file whose
+//! `<arch>.decision.type` names the row (`lev`: the file's own language-model
+//! head, its `systemone` template and its temperatures are the model, and a
+//! head flag beside it is refused). A decision type no row serves (`kev`) is
+//! refused by name. The head's config (`--head-config`, else the row's config
+//! file beside the weights) picks the row of [`ROWS`]; a config no row knows
+//! is refused by name, listing the rows. The server takes `-m`/`--hf` out before this seat parses (its
 //! module doc); `--ctx-size` and `-c` are `--ctx` under llama-server's
 //! spellings, and C defaults to the row's context.
 //!
@@ -47,17 +50,17 @@ use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{PrefillPath, Qwen35moeModel};
 use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
-use decision::release;
+use decision::release::{clef, lev};
 use gguf::Split;
 use model::arch::is_qwen35_body;
 use serde_json::{Value, json};
 use serve::ServeError;
 use serve::decide::{
-    Decide, DecideError, DecideServer, Decided, HeadFrom, HeadSource, Row, Seated,
+    Decide, DecideError, DecideServer, Decided, HeadFrom, HeadRepo, HeadSource, InFile, Row, Seated,
 };
 use tokenizer::Tokenizer;
 
-use crate::clef_seat;
+use crate::{clef_seat, lev_seat};
 
 /// The seat's record bin name, the `listening` record's head.
 const WHAT: &str = "bloomery-serve-decide";
@@ -77,20 +80,34 @@ pub type Open = fn(HeadSource<'_>) -> Result<Box<dyn Decision>, GateError>;
 pub type Pick = HeadFrom<'static, Open>;
 
 /// The decision models this seat serves, one row each.
-pub const ROWS: &[Row<Open>] = &[Row {
-    name: release::NAME,
-    routes: release::ROUTES,
-    ctx: release::CTX,
-    backbones: release::BACKBONES,
-    in_file: release::IN_FILE,
-    head_repo: release::HEAD_REPO,
-    quant_repo: release::QUANT_REPO,
-    head_file: release::HEAD_FILE,
-    config_file: release::HEAD_CONFIG,
-    knows: release::knows,
-    unserved: release::UNSERVED,
-    open: clef_seat::open,
-}];
+pub const ROWS: &[Row<Open>] = &[
+    Row {
+        name: clef::NAME,
+        routes: clef::ROUTES,
+        ctx: clef::CTX,
+        backbones: clef::BACKBONES,
+        in_file: &[InFile::Arch(clef::LAYOUT_ARCH)],
+        head: Some(HeadRepo {
+            repo: clef::HEAD_REPO,
+            quant_repo: clef::QUANT_REPO,
+            file: clef::HEAD_FILE,
+            config_file: clef::HEAD_CONFIG,
+            knows: clef::knows,
+        }),
+        unserved: clef::UNSERVED,
+        open: clef_seat::open,
+    },
+    Row {
+        name: lev::NAME,
+        routes: lev::ROUTES,
+        ctx: lev::CTX,
+        backbones: lev::BACKBONES,
+        in_file: &[InFile::Decision(lev::DECISION_TYPE)],
+        head: None,
+        unserved: &[],
+        open: lev_seat::open,
+    },
+];
 
 /// A decision model's own part, opened: its head, and how a request body
 /// becomes an answer.
@@ -365,19 +382,22 @@ fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
             Ok((row, Some((head, config))))
         }
         HeadFrom::Fetch(row) => {
+            let repo = row
+                .head
+                .as_ref()
+                .ok_or_else(|| format!("the {} row has no head repo to fetch", row.name))?;
             let mut files =
-                model_file::fetch_exact(row.head_repo, &[row.head_file, row.config_file])?
-                    .into_iter();
+                model_file::fetch_exact(repo.repo, &[repo.file, repo.config_file])?.into_iter();
             let (Some(head), Some(config)) = (files.next(), files.next()) else {
                 return Err(format!(
                     "{}: the head's fetch returned fewer than two files",
-                    row.head_repo
+                    repo.repo
                 )
                 .into());
             };
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("{}: {e}", config.display()))?;
-            (row.knows)(&text).map_err(|e| {
+            (repo.knows)(&text).map_err(|e| {
                 format!(
                     "{}: the {} row does not know its own repo's head config: {e}",
                     config.display(),

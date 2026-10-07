@@ -1,19 +1,24 @@
-//! A decision model's request and head: a SystemOne request to token ids and spans, the backbone's
-//! hidden states through the joint schema head to per-option logits, and the logits to the SystemOne
-//! response body. One decision model runs today, Clef (Cloudflare's), so the head and the prompt are
-//! Clef's, named so; the crate is pure host code.
+//! The decision models' requests, heads and answers: a SystemOne request validated, the backbone's
+//! hidden states turned into per-option scores, and the scores into the SystemOne response body. Two
+//! kinds of model run, and the crate is pure host code. A joint head ([`head`], [`encode`]) is Clef's
+//! (Cloudflare's): one prompt holds every question, and a head of its own reads the backbone's
+//! hidden states at each option's tokens. A label readout ([`label`]) is lev's, and the family's
+//! (nimble, pplx-decider, OpenJev): one prompt a question variant from the model's own `systemone`
+//! template, the answer the language-model head's logits at label tokens.
 //!
 //! [`json`] reads a request as Python does, [`render`] writes JSON as Python does, [`request`]
-//! validates, [`encode`] builds the ids, [`safetensors`] and [`head`] load and run the head,
-//! [`gguf_head`] reads the head from a model file that carries it (llama.cpp's Clef layout),
-//! [`rows`] gives the head its output embedding rows from a GGUF file, [`answer`] builds the body;
-//! [`release`] holds what a server needs to seat Clef.
+//! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`safetensors`] and
+//! [`head`] load and run Clef's head, [`gguf_head`] reads it from a model file that carries it
+//! (llama.cpp's Clef layout), [`rows`] gives either model its output embedding rows from a GGUF file,
+//! [`answer`] builds the shared parts of a body, [`label`] the label models'; [`release`] holds what a
+//! server needs to seat each model.
 
 pub mod answer;
 pub mod encode;
 pub mod gguf_head;
 pub mod head;
 pub mod json;
+pub mod label;
 mod ops;
 mod pool;
 pub mod release;
@@ -81,6 +86,9 @@ pub enum Error {
     HeadConfig(String),
     #[error("the head in the model file: {0}")]
     InFileHead(String),
+    /// A label model's file or setup (its template, labels, temperatures).
+    #[error("the label model: {0}")]
+    Label(String),
     #[error("hidden states hold {values} values: not {ids} rows of {width}")]
     HiddenShape {
         values: usize,

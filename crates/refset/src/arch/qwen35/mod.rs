@@ -3,8 +3,9 @@
 //! `tools/ref/hidden_ref.cpp` in the node dumps' set format by the mainline
 //! tree [`LCPP_BUILD`] (`tools/ref/models/qwen35.sh`): [`HIDDEN`] from the
 //! 27B Q4_K_M file [`MODEL`], [`HIDDEN_FLASH_Q8`] from Clef-Flash's published
-//! Q8_0 file [`MODEL_FLASH_Q8`] — one family a file, so a set of one is
-//! refused by name where the other is read.
+//! Q8_0 file [`MODEL_FLASH_Q8`], [`HIDDEN_LEV`] from lev's Q4_K_M file
+//! [`MODEL_LEV`] (Qwen3.5-4B, its head tied to the token embedding) — one
+//! family a file, so a set of one is refused by name where another is read.
 
 use crate::family::{Build, Family, Identity};
 
@@ -42,6 +43,19 @@ pub const FLASH_Q8_P4096: &str = "ref_qwen35_flashq8_hidden_p4096";
 /// The Flash Q8_0 sets, shortest first.
 pub const FLASH_Q8_SETS: &[&str] = &[FLASH_Q8_P64, FLASH_Q8_P600, FLASH_Q8_P4096];
 
+/// lev (`ggml-org/lev-GGUF`'s Q4_K_M: 32 layers of width 2,560, a tied head),
+/// under the box's `/root/models`.
+pub const MODEL_LEV: &str = "/root/models/lev-4b/lev-Q4_K_M.gguf";
+
+/// The same 64, 600 and 4,096 prose ids (lev's vocabulary is the 27B's)
+/// through [`MODEL_LEV`].
+pub const LEV_P64: &str = "ref_qwen35_lev_hidden_p64";
+pub const LEV_P600: &str = "ref_qwen35_lev_hidden_p600";
+pub const LEV_P4096: &str = "ref_qwen35_lev_hidden_p4096";
+
+/// The lev sets, shortest first.
+pub const LEV_SETS: &[&str] = &[LEV_P64, LEV_P600, LEV_P4096];
+
 /// [`MODEL`], as a family's `runs`.
 fn model() -> String {
     MODEL.to_string()
@@ -50,6 +64,11 @@ fn model() -> String {
 /// [`MODEL_FLASH_Q8`], as a family's `runs`.
 fn model_flash_q8() -> String {
     MODEL_FLASH_Q8.to_string()
+}
+
+/// [`MODEL_LEV`], as a family's `runs`.
+fn model_lev() -> String {
+    MODEL_LEV.to_string()
 }
 
 /// llama.cpp mainline's final-norm hidden states.
@@ -80,12 +99,28 @@ pub static HIDDEN_FLASH_Q8: Family = Family {
     consumers: &["gate-gpu-clef-hidden"],
 };
 
+/// llama.cpp mainline's final-norm hidden states of lev at Q4_K_M.
+pub static HIDDEN_LEV: Family = Family {
+    name: "hidden-qwen35-lev",
+    sets: LEV_SETS,
+    resolve: None,
+    recipe: "just dump-hidden-qwen35",
+    identity: Identity::Manifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(LCPP_BUILD)),
+    runs: Some(model_lev),
+    draft_runs: None,
+    consumers: &["gate-gpu-clef-hidden"],
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&HIDDEN, &HIDDEN_FLASH_Q8];
+pub static FAMILIES: &[&Family] = &[&HIDDEN, &HIDDEN_FLASH_Q8, &HIDDEN_LEV];
 
 #[cfg(test)]
 mod tests {
-    use super::{ARCH, HIDDEN, HIDDEN_FLASH_Q8, LCPP_BUILD, MODEL, MODEL_FLASH_Q8};
+    use super::{
+        ARCH, HIDDEN, HIDDEN_FLASH_Q8, HIDDEN_LEV, LCPP_BUILD, MODEL, MODEL_FLASH_Q8, MODEL_LEV,
+    };
     use crate::RefError;
     use std::path::Path;
 
@@ -137,7 +172,8 @@ mod tests {
     }
 
     /// Each file's sets open through its own family only: a Flash Q8_0 set
-    /// is read by its family and refused by the 27B's, and the other way.
+    /// is read by its family and refused by the 27B's and by lev's, and the
+    /// other way round.
     #[test]
     fn a_set_opens_through_its_files_family_only() -> Result<(), RefError> {
         let dir = std::env::temp_dir().join(format!(
@@ -154,6 +190,15 @@ mod tests {
             .check_set(&dir)
             .expect_err("refused")
             .to_string();
+        assert!(e.contains("dumped from"), "{e}");
+        write_set(&dir, MODEL_LEV, LCPP_BUILD, ARCH, true);
+        assert_eq!(HIDDEN_LEV.check_set(&dir)?.dumped_from, MODEL_LEV);
+        for family in [&HIDDEN, &HIDDEN_FLASH_Q8] {
+            let e = family.check_set(&dir).expect_err("refused").to_string();
+            assert!(e.contains("dumped from"), "{}: {e}", family.name);
+        }
+        write_set(&dir, MODEL_FLASH_Q8, LCPP_BUILD, ARCH, true);
+        let e = HIDDEN_LEV.check_set(&dir).expect_err("refused").to_string();
         assert!(e.contains("dumped from"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
