@@ -1014,8 +1014,13 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// The open call's pick at layer `layer` from the batch counts `counts`
-    /// ([`swap::SwapMachine::call_pick`]) over this tier's map. Refused by
-    /// name without a machine.
+    /// ([`swap::SwapMachine::call_pick`]) over this tier's map. A pick the
+    /// machine refuses for a victim the host does not serve from resident
+    /// pages once its pages are read in again ([`GpuError::Unresident`],
+    /// counted in the call's report) admits nothing: the layer's experts stay
+    /// where they are, and the call goes on with the layer's host experts on
+    /// the host. Refused by name without a machine, and the pick's other
+    /// refusals.
     pub fn call_pick(
         &mut self,
         stream: &CudaStream,
@@ -1027,7 +1032,10 @@ impl<H: HostExperts> HostTier<H> {
             "HostTier::call_pick",
             "a residency machine (HostTier::start_swap)",
         ))?;
-        m.call_pick(stream, &mut self.slots, layer, counts, cap)
+        match m.call_pick(stream, &mut self.slots, layer, counts, cap) {
+            Err(GpuError::Unresident { .. }) => Ok(swap::CallPick::nothing(layer, counts)),
+            r => r,
+        }
     }
 
     /// [`HostTier::call_pick`] at `key`'s layer from the routed ids of

@@ -1744,7 +1744,13 @@ pub static RESIDENCY_PASS: Kind = Kind {
           them waiting for the landing jobs' staging and issuing the new flips' copies, and the staging thread's since the last \
           boundary copying into the ring and preparing victims; the experts the machine's thread \
           found not host-resident and read in again since the last boundary (a page the page \
-          cache let go), their bytes and its microseconds doing it.",
+          cache let go), their bytes and its microseconds doing it; the experts it found not \
+          host-resident even once read in again since the last boundary (this one's landing \
+          victims, the load's and a reset's: each sent to the host all the same, served from the \
+          file) and the last of them as layer:expert:site; and the experts sent so that this \
+          boundary found still on the host and not resident, which the pass it opens serves from \
+          the file, and the first of them as layer:expert:site:passes, the passes each has been \
+          served from the file so far.",
     parts: &[
         key("pass", Word, ""),
         key("boundary", U64, ""),
@@ -1764,6 +1770,10 @@ pub static RESIDENCY_PASS: Kind = Kind {
         key("rereads", U64, ""),
         key("reread_bytes", U64, "B"),
         key("reread_us", U64, "us"),
+        opt("unresident", U64, ""),
+        opt("unresident_last", Csv, ""),
+        opt("faulting", U64, ""),
+        opt("faulting_first", Csv, ""),
     ],
 };
 
@@ -1856,8 +1866,11 @@ pub static CALL_STREAM_END: Kind = Kind {
     doc: "A prompt call's end on the residency machine: the picks that admitted an expert, the \
           experts admitted and their bytes, the host's microseconds in the picks and of them \
           waiting for the staging thread, whether the call's placement stays for the passes \
-          after it (1) or went back to the call's start (0) with the experts copied back, and \
-          the host's microseconds in the end.",
+          after it (1) or went back to the call's start (0) with the experts copied back, the \
+          host's microseconds in the end, and the experts found not host-resident even once read \
+          in again in the call (a pick's victim, whose pick admitted nothing, or an expert the \
+          end sent back all the same, served from the file) and the last of them as \
+          layer:expert:site.",
     parts: &[
         key("picks", U64, ""),
         key("admitted", U64, ""),
@@ -1867,6 +1880,8 @@ pub static CALL_STREAM_END: Kind = Kind {
         key("kept", U64, ""),
         key("restored", U64, ""),
         key("end_us", U64, "us"),
+        opt("unresident", U64, ""),
+        opt("unresident_last", Csv, ""),
     ],
 };
 
@@ -3142,6 +3157,10 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("rereads", r.rereads)
         .u("reread_bytes", r.reread_bytes)
         .u("reread_us", r.reread_us)
+        .u("unresident", r.unresident.count())
+        .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
+        .u("faulting", r.faulting.count())
+        .csv("faulting_first", r.faulting.first().map(|f| f.mark()))
 }
 
 /// A helper thread's record: `name`, where it asked to run, the cpu it is
@@ -3287,6 +3306,8 @@ pub fn call_report(r: &CallReport) -> Record {
         .u("kept", u64::from(r.kept))
         .u("restored", r.restored)
         .u("end_us", r.end_us)
+        .u("unresident", r.unresident.count())
+        .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
 }
 
 /// A prompt unit's stream record at one layer, of ubatch `ubatch`.

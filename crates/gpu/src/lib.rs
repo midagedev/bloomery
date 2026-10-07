@@ -153,6 +153,15 @@ pub enum GpuError {
     /// wait and refuses to serve again, so the model is unusable, not the
     /// call's arguments wrong.
     Protocol { what: &'static str, detail: String },
+    /// The residency machine refused a flip whose expert the host would
+    /// serve from the file, not from resident pages, once its pages were
+    /// read in again: `refused` names the expert and where it was sent. The
+    /// machine is unchanged and the refusal counted; a caller that can do
+    /// without the flip goes on (a prompt call's pick admits nothing).
+    Unresident {
+        what: &'static str,
+        refused: host::swap::Unresident,
+    },
     /// A kernel raised the card's fault word (crate::fault): an input it has
     /// no defined answer for, at `fault`'s layer and site. The step that
     /// read it back returned no token, and the state it wrote — caches,
@@ -465,6 +474,7 @@ impl std::fmt::Display for GpuError {
             GpuError::Plan { what, source } => write!(f, "{what}: {source}"),
             GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
             GpuError::Protocol { what, detail } => write!(f, "{what}: {detail}"),
+            GpuError::Unresident { what, refused } => write!(f, "{what}: {refused}"),
             GpuError::Fault {
                 what,
                 fault,

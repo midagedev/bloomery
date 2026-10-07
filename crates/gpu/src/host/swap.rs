@@ -39,10 +39,10 @@
 //! **Boundaries.** [`SwapMachine::boundary`] runs before each pass's launch,
 //! in this order: the jobs of the flips live here are made due, and the host
 //! waits until the staging thread has published each (its victim prepared,
-//! its bytes in the ring, or its failure recorded); a staging failure, or a
-//! victim the host cannot serve from resident pages once its pages are read
-//! in again, is refused by name there, before anything changes. Then the
-//! engine stream waits for those
+//! its bytes in the ring, or its failure recorded); a staging failure is
+//! refused by name there, before anything changes, and a victim the host
+//! does not serve from resident pages goes to it all the same (**Host
+//! residency**). Then the engine stream waits for those
 //! flips' copies; the changed words of the card's copy are written on the
 //! engine stream; the host [`SlotMap`] takes the same change; this boundary's
 //! event is recorded; then the rule plans and the new flips' copies are
@@ -108,8 +108,23 @@
 //! the page cache after the load or after the staging thread's prepare: the
 //! owner then reads the expert's pages in again on the machine's thread
 //! ([`SwapSource::prepare_victim`]), a page fault's cost paid once and
-//! counted ([`PassReport::rereads`]), and refuses by name only an expert
-//! still not resident after it — one the host set does not hold.
+//! counted ([`PassReport::rereads`]). An expert still not resident after it
+//! — one the host set does not hold, or whose pages the page cache let go
+//! again in between — the host would serve from the file, a page fault a
+//! step: the owner counts it and names it ([`Unresident`]; a boundary's
+//! [`PassReport::unresident`], a call's [`CallReport::unresident`]), and its
+//! site decides by one rule: a refusal before any move skips, one after a
+//! landed copy proceeds. A call's pick, whose copies have not started, is
+//! refused by name ([`GpuError::Unresident`]), the machine unchanged, and
+//! its caller goes on with nothing admitted
+//! ([`crate::host::HostTier::call_pick`]). Every other site sends the expert
+//! on (`send_on`): a boundary's landing victim, whose admit's copy has
+//! landed, a spare slot's at the load, one a reset or a call's end sends
+//! back; the host serves it from the file's mapping, the same bytes a page
+//! fault at a time, and the machine follows it from boundary to boundary
+//! until it is resident again or off the host, counting the passes served so
+//! ([`PassReport::faulting`]): a sustained page pressure shows in the
+//! records, not as a quiet slowdown.
 //!
 //! **Counting.** The ids a pass routes are noted per (layer, row) into a
 //! [`Tally`] and folded into the rule at [`SwapMachine::end_pass`] for the
@@ -274,7 +289,8 @@ pub trait SwapSource: Send + Sync {
     /// Whether the host serves layer `layer`'s expert `id` from resident
     /// pages now. The machine asks it through its one decision
     /// (`host_serves`): an expert that is not is prepared and asked again,
-    /// and a flip whose victim still is not is refused by name.
+    /// and one that still is not is counted ([`Unresident`]), its site
+    /// refusing the flip or sending the expert on.
     fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError>;
 
     /// Release the host pages of layer `layer`'s expert `id`, which stays on
@@ -1051,6 +1067,182 @@ impl Rereads {
     }
 }
 
+/// Where the machine sends an expert to the host, the site of a
+/// `host_serves` decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostSite {
+    /// A spare slot's expert at [`SwapMachine::new`].
+    Load,
+    /// A boundary's landing victim of expert `admit` into slot `slot`.
+    Boundary { admit: u32, slot: u32 },
+    /// An admitted expert a reset sends back.
+    Reset,
+    /// A call's pick's victim of expert `admit`.
+    Pick { admit: u32 },
+    /// An expert a call admitted, sent back at the end of a call not kept.
+    Restore,
+}
+
+impl HostSite {
+    /// The site as a record's word.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            HostSite::Load => "load",
+            HostSite::Boundary { .. } => "boundary",
+            HostSite::Reset => "reset",
+            HostSite::Pick { .. } => "pick",
+            HostSite::Restore => "restore",
+        }
+    }
+}
+
+impl std::fmt::Display for HostSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            HostSite::Load => write!(f, "a spare slot's expert"),
+            HostSite::Boundary { admit, slot } => {
+                write!(f, "the victim of expert {admit} into slot {slot}")
+            }
+            HostSite::Reset => write!(f, "an admitted expert the reset sends back"),
+            HostSite::Pick { admit } => write!(f, "the victim of expert {admit} in a call's pick"),
+            HostSite::Restore => write!(f, "an expert a call admitted"),
+        }
+    }
+}
+
+/// An expert the machine sent toward the host that is not host-resident
+/// once its pages were read in again (`host_serves`): the host serves it
+/// from the file, a page fault a step. Its layer, its id and its site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unresident {
+    pub layer: usize,
+    pub id: u32,
+    pub site: HostSite,
+}
+
+impl Unresident {
+    /// `layer:id:site`, a record's list item.
+    #[must_use]
+    pub fn mark(&self) -> String {
+        format!("{}:{}:{}", self.layer, self.id, self.site.word())
+    }
+}
+
+impl std::fmt::Display for Unresident {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "layer {} expert {}, {}, is not host-resident after its pages were read in again: \
+             the host would serve it from the file (a page fault a step), so the flip is refused",
+            self.layer, self.id, self.site
+        )
+    }
+}
+
+/// The experts `host_serves` found not host-resident once their pages were
+/// read in again, since a report last took them — a boundary's
+/// ([`PassReport::unresident`]) or a call's end's
+/// ([`CallReport::unresident`]): how many, and the last
+/// [`Unresidents::LAST`] of them, oldest first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unresidents {
+    count: usize,
+    last: [Option<Unresident>; Unresidents::LAST],
+}
+
+impl Unresidents {
+    /// The experts kept by name.
+    pub const LAST: usize = 4;
+
+    fn note(&mut self, u: Unresident) {
+        self.count += 1;
+        match self.last.iter_mut().find(|s| s.is_none()) {
+            Some(free) => *free = Some(u),
+            None => {
+                self.last.rotate_left(1);
+                self.last[Unresidents::LAST - 1] = Some(u);
+            }
+        }
+    }
+
+    /// How many.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The last ones, oldest first.
+    pub fn last(&self) -> impl Iterator<Item = Unresident> + '_ {
+        self.last.iter().flatten().copied()
+    }
+}
+
+/// Whether the host serves an expert the machine sends it from resident
+/// pages (`host_serves`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Served {
+    /// From resident pages: now, or once read in again.
+    Resident,
+    /// From the file: not resident once read in again, and counted.
+    Unresident(Unresident),
+}
+
+/// An expert a site sent to the host not host-resident (`send_on`),
+/// followed from boundary to boundary until it is resident again or leaves
+/// the host: the passes those boundaries opened with the host serving it
+/// from the file, a page fault a step it is routed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Faulted {
+    pub expert: Unresident,
+    pub passes: u64,
+}
+
+impl Faulted {
+    /// `layer:id:site:passes`, a record's list item.
+    #[must_use]
+    pub fn mark(&self) -> String {
+        format!("{}:{}", self.expert.mark(), self.passes)
+    }
+}
+
+/// The followed experts a boundary found still on the host and not
+/// resident, which the pass it opens serves from the file
+/// ([`PassReport::faulting`]): how many, and the first
+/// [`Faulting::FIRST`] of them, the longest followed first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Faulting {
+    count: usize,
+    first: [Option<Faulted>; Faulting::FIRST],
+}
+
+impl Faulting {
+    /// The experts kept by name.
+    pub const FIRST: usize = 4;
+
+    fn of(followed: &[Faulted]) -> Faulting {
+        let mut out = Faulting {
+            count: followed.len(),
+            ..Faulting::default()
+        };
+        for (slot, f) in out.first.iter_mut().zip(followed) {
+            *slot = Some(*f);
+        }
+        out
+    }
+
+    /// How many.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The first ones, the longest followed first.
+    pub fn first(&self) -> impl Iterator<Item = Faulted> + '_ {
+        self.first.iter().flatten().copied()
+    }
+}
+
 /// What the staging thread and the machine share.
 pub(crate) struct Shared {
     source: Arc<dyn SwapSource>,
@@ -1346,6 +1538,15 @@ pub struct PassReport {
     pub rereads: usize,
     pub reread_bytes: u64,
     pub reread_us: u64,
+    /// Experts found not host-resident once their pages were read in again
+    /// since the last boundary, this one's landing victims, the load's and
+    /// a reset's with it (`host_serves`), each sent to the host all the
+    /// same, the host serving it from the file; the last of them by name.
+    pub unresident: Unresidents,
+    /// The experts sent to the host not resident that this boundary found
+    /// still on the host and not resident, which the pass it opens serves
+    /// from the file, each with the passes it has been served so.
+    pub faulting: Faulting,
     /// Made ahead of its pass ([`SwapMachine::boundary_ahead`]): after the
     /// pass before it was served and ended, before that pass's readback.
     pub ahead: bool,
@@ -1506,6 +1707,19 @@ pub struct CallPick {
     pub land: Vec<LandBatch>,
 }
 
+impl CallPick {
+    /// The pick that admits nothing at layer `layer` from `counts`: what a
+    /// pick the machine refused stands for, every expert where it was.
+    #[must_use]
+    pub fn nothing(layer: usize, counts: &[u32]) -> CallPick {
+        CallPick {
+            layer,
+            counts: counts_digest(counts),
+            ..CallPick::default()
+        }
+    }
+}
+
 /// What a call did ([`SwapMachine::end_call`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CallReport {
@@ -1521,6 +1735,12 @@ pub struct CallReport {
     pub restored: usize,
     /// Host microseconds the end took.
     pub end_us: u64,
+    /// Experts found not host-resident once their pages were read in again
+    /// in the call (`host_serves`): a pick's victim, whose pick was refused
+    /// and admitted nothing, or an admitted expert the end sent back all
+    /// the same, the host serving it from the file; the last of them by
+    /// name.
+    pub unresident: Unresidents,
 }
 
 /// An open call: what it asked, each layer's card set at its start (in the
@@ -1638,6 +1858,12 @@ pub struct SwapMachine {
     changed: Vec<(usize, u32, u32)>,
     /// The error that broke the machine, named in every later refusal.
     broken: Option<String>,
+    /// The experts `host_serves` found not host-resident since a report
+    /// last took them: the next boundary's, or the open call's end's.
+    unresident: Unresidents,
+    /// The experts sent to the host not host-resident, followed until
+    /// resident again or off the host ([`SwapMachine::recheck`]).
+    faulted: Vec<Faulted>,
     /// Per layer of the map: a call's landed event (on the copy stream,
     /// after a pick's copies) and reader event (on the engine stream, after
     /// the call's last read of the layer's slots); the open call.
@@ -1669,9 +1895,12 @@ impl SwapMachine {
     /// Refused by name: a layer whose stage card capacity is not its live
     /// count, a layer with card slots fewer than `pinned + spares + 1`, a
     /// delay of 0, a pinned list of another length, a view of another
-    /// length, a `top_k` of 0 or past [`TALLY_TOP_K`], a part not a whole
-    /// number of words, and a freed expert the source cannot bring to the
-    /// host.
+    /// length, a `top_k` of 0 or past [`TALLY_TOP_K`], and a part not a
+    /// whole number of words. A freed expert the host does not serve from
+    /// resident pages once its pages are read in again goes to the host all
+    /// the same (`send_on`): the host serves it from the file, and the
+    /// first boundary's report counts it and follows it
+    /// ([`PassReport::unresident`], [`PassReport::faulting`]).
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
@@ -1757,11 +1986,18 @@ impl SwapMachine {
             unrouted.push(l - layers.start);
         }
         let rereads = Rereads::default();
+        let mut unresident = Unresidents::default();
+        let mut faulted = Vec::new();
         for &(l, id) in &layout.freed {
             source.prepare_victim(l, id)?;
-            host_serves(&*source, &rereads, WHAT, l, id, || {
-                "a spare slot's expert".to_string()
-            })?;
+            send_on(
+                &*source,
+                &rereads,
+                (&mut unresident, &mut faulted),
+                l,
+                id,
+                HostSite::Load,
+            )?;
         }
         let rule = SwapMachine::rule_of(&layout, &cfg, n_expert, &unrouted)?;
         let events = (0..layers.len() * cfg.params.spares)
@@ -1806,6 +2042,8 @@ impl SwapMachine {
             ops: Vec::with_capacity(BATCH_OPS),
             changed: Vec::new(),
             broken: None,
+            unresident,
+            faulted,
             call_landed,
             call_read,
             call: None,
@@ -2326,11 +2564,13 @@ impl SwapMachine {
     /// event is recorded, then the rule plans and the new flips' copies are
     /// issued. Refused by name, the machine unchanged: a boundary twice with
     /// no pass between, one while a boundary made ahead waits for its launch
-    /// ([`SwapMachine::boundary_ahead`]), a landing job not staged within the
-    /// deadline, and a landing flip whose victim the host cannot serve from
-    /// resident pages once its pages are read in again (a victim whose pages
-    /// the page cache let go since the staging thread's prepare is read in
-    /// on this thread, [`PassReport::rereads`]).
+    /// ([`SwapMachine::boundary_ahead`]), and a landing job not staged within
+    /// the deadline. A landing flip whose victim the host does not serve from
+    /// resident pages lands all the same, its copy in place: a victim whose
+    /// pages the page cache let go since the staging thread's prepare is read
+    /// in on this thread ([`PassReport::rereads`]), and one still not
+    /// resident after it is served from the file, counted and followed
+    /// ([`PassReport::unresident`], [`PassReport::faulting`]).
     /// Refused by name, the machine broken: a staging failure, a ledger that
     /// does not hold the flips the rule lands, and any error after the first
     /// change.
@@ -2370,22 +2610,29 @@ impl SwapMachine {
         }
         report.wait_us = micros(t0);
         self.refuse_staging_failure(WHAT, Some(b))?;
-        let shared = &self.shared;
+        // The flips' copies have landed in their slots: a victim the host
+        // does not serve from resident pages goes all the same.
         for f in &landing {
-            host_serves(
-                &*shared.source,
-                &shared.rereads,
-                WHAT,
+            send_on(
+                &*self.shared.source,
+                &self.shared.rereads,
+                (&mut self.unresident, &mut self.faulted),
                 f.layer,
                 f.victim,
-                || format!("the victim of expert {} into slot {}", f.admit, f.slot),
+                HostSite::Boundary {
+                    admit: f.admit,
+                    slot: f.slot,
+                },
             )?;
         }
         let changed = self.land_and_plan(b, stream, slots, &landing, &mut report);
         self.after_change(changed, || format!("boundary {b}"))?;
+        let faulting = self.recheck(slots);
+        report.faulting = self.after_change(faulting, || format!("boundary {b}"))?;
         report.stage_us = self.shared.stage_ns.swap(0, Ordering::Relaxed) / 1000;
         report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
         (report.rereads, report.reread_bytes, report.reread_us) = self.shared.rereads.take();
+        report.unresident = std::mem::take(&mut self.unresident);
         self.planned = Some(b);
         self.mirror_landing();
         report.boundary_us = micros(start);
@@ -2459,6 +2706,27 @@ impl SwapMachine {
                 ),
             )),
         }
+    }
+
+    /// Every followed expert against `slots`, the map the pass this boundary
+    /// opens runs on: one back on the card, or resident again, leaves the
+    /// list; every other one that pass serves from the file, one more pass
+    /// counted. The ones left, for the report. Nothing to do and nothing
+    /// allocated while none is followed.
+    fn recheck(&mut self, slots: &SlotMap) -> Result<Faulting, GpuError> {
+        let mut i = 0;
+        while i < self.faulted.len() {
+            let u = self.faulted[i].expert;
+            let gone = slots.slot(u.layer, u.id) != Some(Slot::Host)
+                || self.shared.source.host_resident(u.layer, u.id)?;
+            if gone {
+                self.faulted.remove(i);
+            } else {
+                self.faulted[i].passes += 1;
+                i += 1;
+            }
+        }
+        Ok(Faulting::of(&self.faulted))
     }
 
     /// The flips live at boundary `b` as the ledger holds them, in the rule's
@@ -2807,9 +3075,10 @@ impl SwapMachine {
         Ok(cancelled)
     }
 
-    /// Every live expert not in its layer's seed to the host (prepared, and
-    /// refused by name unless host-resident), its slot spare; the seed
-    /// experts not live, per layer, which the reset copies back.
+    /// Every live expert not in its layer's seed to the host (prepared; one
+    /// not host-resident once read in again goes all the same, `send_on`),
+    /// its slot spare; the seed experts not live, per layer, which the reset
+    /// copies back.
     fn send_back(&mut self, slots: &mut SlotMap) -> Result<Vec<(usize, u32)>, GpuError> {
         const WHAT: &str = "SwapMachine::reset";
         let mut back = Vec::new();
@@ -2819,11 +3088,15 @@ impl SwapMachine {
                 .filter(|&id| matches!(slots.slot(l, id), Some(Slot::Card(_))))
                 .collect();
             for &id in live.iter().filter(|id| !seed.contains(id)) {
-                let shared = &self.shared;
-                shared.source.prepare_victim(l, id)?;
-                host_serves(&*shared.source, &shared.rereads, WHAT, l, id, || {
-                    "an admitted expert the reset sends back".to_string()
-                })?;
+                self.shared.source.prepare_victim(l, id)?;
+                send_on(
+                    &*self.shared.source,
+                    &self.shared.rereads,
+                    (&mut self.unresident, &mut self.faulted),
+                    l,
+                    id,
+                    HostSite::Reset,
+                )?;
                 if let Slot::Card(s) = slots.evict(l, id)? {
                     self.ledger.row_mut(l)[s as usize] = SlotState::Spare;
                 }
@@ -3032,8 +3305,11 @@ impl SwapMachine {
     /// name, the machine unchanged: no call open, a layer outside the map,
     /// counts of another length, a layer whose last pick no reader has
     /// waited for ([`SwapMachine::call_reader`]), and a victim the host
-    /// cannot serve from resident pages once its pages are read in again.
-    /// Any error after the first job is sent breaks the machine.
+    /// cannot serve from resident pages once its pages are read in again —
+    /// [`GpuError::Unresident`], counted in the call's report, which a
+    /// caller can do without ([`crate::host::HostTier::call_pick`]: the pick
+    /// admits nothing). Any error after the first job is sent breaks the
+    /// machine.
     pub fn call_pick(
         &mut self,
         stream: &CudaStream,
@@ -3102,9 +3378,12 @@ impl SwapMachine {
     /// Every victim of `picks` is on the stage card in the host map and
     /// served by the host from resident pages — read in again here when the
     /// page cache let its pages go, since nothing prepared it before the
-    /// pick — else refused by name as `what`.
+    /// pick — else refused by name as `what`: a victim still not resident
+    /// once read in again is counted and refused as
+    /// [`GpuError::Unresident`], which a caller can do without (the pick
+    /// admits nothing).
     fn check_victims(
-        &self,
+        &mut self,
         slots: &SlotMap,
         layer: usize,
         picks: &[Flip],
@@ -3124,14 +3403,17 @@ impl SwapMachine {
                 ));
             }
             let shared = &self.shared;
-            host_serves(
+            let served = host_serves(
                 &*shared.source,
                 &shared.rereads,
-                what,
+                &mut self.unresident,
                 layer,
                 f.evict,
-                || format!("the victim of expert {} in a call's pick", f.admit),
+                HostSite::Pick { admit: f.admit },
             )?;
+            if let Served::Unresident(refused) = served {
+                return Err(GpuError::Unresident { what, refused });
+            }
         }
         Ok(())
     }
@@ -3244,8 +3526,12 @@ impl SwapMachine {
     /// with, the experts the call sent to the host copied back behind a
     /// boundary event of `stream` into the slots of those it admitted, which
     /// go back to the host. The staging window gates the staging thread
-    /// again. Refused by name, the machine unchanged: no call open. Any
-    /// error after the first change breaks the machine.
+    /// again. An expert the end sends back that the host does not serve from
+    /// resident pages once its pages are read in again goes all the same
+    /// (`send_on`), counted ([`CallReport::unresident`]) and followed from
+    /// the next boundary on ([`PassReport::faulting`]). Refused by name, the machine
+    /// unchanged: no call open. Any error after the first change breaks the
+    /// machine.
     pub fn end_call(
         &mut self,
         stream: &CudaStream,
@@ -3265,6 +3551,7 @@ impl SwapMachine {
             kept,
             restored,
             end_us: micros(t0),
+            unresident: std::mem::take(&mut self.unresident),
             ..call.report
         })
     }
@@ -3320,10 +3607,14 @@ impl SwapMachine {
                 ));
             }
             for (&a, &v) in came.iter().zip(&went) {
-                let shared = &self.shared;
-                host_serves(&*shared.source, &shared.rereads, WHAT, l, a, || {
-                    "an expert a call admitted".to_string()
-                })?;
+                send_on(
+                    &*self.shared.source,
+                    &self.shared.rereads,
+                    (&mut self.unresident, &mut self.faulted),
+                    l,
+                    a,
+                    HostSite::Restore,
+                )?;
                 let Slot::Card(s) = slots.evict(l, a)? else {
                     return Err(GpuError::protocol(
                         WHAT,
@@ -3525,45 +3816,65 @@ fn rule_err(what: &'static str, e: runtime::swaprule::SwapRuleError) -> GpuError
     }
 }
 
-/// The machine's one decision that the host serves layer `layer`'s expert
-/// `id` from resident pages, made on the machine's thread for every expert
-/// it sends to the host: resident now, it is; else its pages are read in
-/// again ([`SwapSource::prepare_victim`]) and it is asked once more — a page
-/// the page cache let go since the load or the staging thread's prepare,
-/// read back at a page fault's cost once and counted in `rereads`. Still not
-/// resident (the host set does not hold it), the refusal of `what` names
-/// `which` expert it is. A free function, not a method a source could
-/// override: the decision and its count are the machine's.
+/// The machine's one decision whether the host serves layer `layer`'s
+/// expert `id`, sent to the host at `site`, from resident pages, made on the
+/// machine's thread for every expert it sends there: resident now, it does;
+/// else its pages are read in again ([`SwapSource::prepare_victim`]) and it
+/// is asked once more — a page the page cache let go since the load or the
+/// staging thread's prepare, read back at a page fault's cost once and
+/// counted in `rereads`. Still not resident (the host set does not hold it,
+/// or the page cache let it go again in between), the host would serve it
+/// from the file: counted in `unresident`, and the site's to refuse or to
+/// send it on. A free function, not a method a source could override: the
+/// decision and its counts are the machine's.
 fn host_serves(
     source: &dyn SwapSource,
     rereads: &Rereads,
-    what: &'static str,
+    unresident: &mut Unresidents,
     layer: usize,
     id: u32,
-    which: impl FnOnce() -> String,
-) -> Result<(), GpuError> {
+    site: HostSite,
+) -> Result<Served, GpuError> {
     if source.host_resident(layer, id)? {
-        return Ok(());
+        return Ok(Served::Resident);
     }
     let t0 = Instant::now();
     source.prepare_victim(layer, id)?;
     if !source.host_resident(layer, id)? {
-        return Err(not_resident(what, layer, id, &which()));
+        let u = Unresident { layer, id, site };
+        unresident.note(u);
+        return Ok(Served::Unresident(u));
     }
     let bytes: usize = source.part_bytes(layer).iter().sum();
     rereads.note(bytes as u64, nanos(t0));
-    Ok(())
+    Ok(Served::Resident)
 }
 
-fn not_resident(what: &'static str, layer: usize, id: u32, which: &str) -> GpuError {
-    GpuError::protocol(
-        what,
-        format!(
-            "layer {layer} expert {id}, {which}, is not host-resident after its pages were read \
-             in again: the host would serve it from the file (a page fault a step), so the flip \
-             is refused"
-        ),
-    )
+/// Layer `layer`'s expert `id` to the host at `site`, a site whose flip
+/// already moved or must (a boundary's landing victim, whose admit's copy
+/// has landed; a spare slot's at the load; one a reset or a call's end
+/// sends back): `host_serves` decides and counts in `unresident`, and an
+/// expert not resident goes all the same — the host serves it from the
+/// file's mapping, the same bytes a page fault at a time — followed in
+/// `faulted` (once: a second sending restarts its count) until a boundary
+/// finds it resident again or off the host ([`SwapMachine::recheck`]). The
+/// one site that refuses instead is a call's pick, before any move.
+fn send_on(
+    source: &dyn SwapSource,
+    rereads: &Rereads,
+    (unresident, faulted): (&mut Unresidents, &mut Vec<Faulted>),
+    layer: usize,
+    id: u32,
+    site: HostSite,
+) -> Result<(), GpuError> {
+    if let Served::Unresident(u) = host_serves(source, rereads, unresident, layer, id, site)? {
+        faulted.retain(|f| (f.expert.layer, f.expert.id) != (layer, id));
+        faulted.push(Faulted {
+            expert: u,
+            passes: 0,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
