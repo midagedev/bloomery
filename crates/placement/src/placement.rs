@@ -889,6 +889,14 @@ pub enum PlacementError {
          expert of the layers whose stacks a card can hold; plan without it"
     )]
     IdleTier { card: String, tier: usize },
+    /// A tier card on a plan that keeps every routed stack on the host
+    /// ([`plan_host_routed`]): no card holds a routed expert, so the tier
+    /// has nothing to hold.
+    #[error(
+        "tier card {card} (tier {tier}) holds no expert: this plan puts every \
+         routed expert on the host; plan without it"
+    )]
+    HostRoutedTier { card: String, tier: usize },
     /// A draft reserve on a tier the plan does not have.
     #[error(
         "the draft's reserve is on tier {on}, and the plan has {tiers} tier cards: the draft's \
@@ -1727,7 +1735,9 @@ pub fn plan_routed_reserving<'a>(
 
 /// [`plan`] with every routed stack on the host: no card is eligible for the
 /// expert rule, for a program with no card kernel for the model's routed
-/// experts. The card budget applies as in [`plan`].
+/// experts. A machine with an expert tier card is refused by name
+/// ([`PlacementError::HostRoutedTier`]): the tier would hold nothing. The
+/// card budget applies as in [`plan`].
 pub fn plan_host_routed<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1735,6 +1745,12 @@ pub fn plan_host_routed<'a>(
     kv: &dyn KvBytes,
     levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlacementError> {
+    if let Some((t, tier)) = machine.tiers.iter().enumerate().next() {
+        return Err(PlacementError::HostRoutedTier {
+            card: tier.name.clone(),
+            tier: t,
+        });
+    }
     plan_rule(
         model,
         machine,
@@ -2766,8 +2782,8 @@ mod tests {
 
     /// A tier after a stage card that holds every expert is refused by name;
     /// a tier with experts left to take, one whose budget leaves it none
-    /// while the host keeps the rest, and one beside a planner that puts
-    /// every routed stack on the host plan.
+    /// while the host keeps the rest, and the host-routed planner, which
+    /// refuses a tier card by name.
     #[test]
     fn a_tier_with_nothing_left_is_refused() {
         let model = layered(3);
@@ -2793,9 +2809,15 @@ mod tests {
         let plan = plan_with(&model, &small, 4096, &NoKv, None).expect("a tier too small");
         assert_eq!(plan.tier_n_l, vec![vec![0, 0, 0]]);
         assert!(plan.host.experts > 0);
-        let plan = plan_host_routed(&model, &whole, 4096, &NoKv, &PlanLevers::default())
-            .expect("every stack on the host");
-        assert_eq!(plan.host.experts, 24);
+        match plan_host_routed(&model, &whole, 4096, &NoKv, &PlanLevers::default()) {
+            Err(e @ PlacementError::HostRoutedTier { .. }) => assert_eq!(
+                e.to_string(),
+                "tier card tier (tier 0) holds no expert: this plan puts every routed expert \
+                 on the host; plan without it"
+            ),
+            Err(e) => panic!("{e}, not HostRoutedTier"),
+            Ok(_) => panic!("the host-routed planner accepted a tier card"),
+        }
     }
 
     /// A card another process holds: the census's free reading caps the

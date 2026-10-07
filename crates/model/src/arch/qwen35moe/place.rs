@@ -59,7 +59,7 @@ use crate::placement::workstation::{
 };
 use crate::placement::{
     self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
-    Plan, PlanLevers, RoutedFormat, Unimplemented, Violation,
+    Plan, PlanLevers, RoutedFormat, Unimplemented, Violation, checked, joined,
 };
 
 use runtime::stores::{
@@ -200,13 +200,20 @@ pub enum PlaceError {
     #[error(transparent)]
     HeadRows(#[from] HeadRowsError),
     /// A machine with an expert tier card, planned with every routed expert
-    /// on the host.
+    /// on the host: the tier would hold none. The wrapped refusal is the
+    /// planner's own; this text carries what it lacks — the lever that made
+    /// the all-host plan (`BLOOMERY_QWEN38_EXPERTS=host`) and the plan that
+    /// runs the card experts (plan (b′)).
     #[error(
         "the machine has the expert tier card {tier}, and the plan puts every routed expert on \
          the host (BLOOMERY_QWEN38_EXPERTS=host): the tier would hold none; plan (b′) runs the \
          card experts"
     )]
-    TierHost { tier: String },
+    TierHost {
+        tier: String,
+        /// The planner's own refusal of the tier card.
+        origin: Box<PlacementError>,
+    },
     /// A machine with an expert tier card, under a card rule whose program
     /// hangs no tier ([`PlanInputs::plan_rule`]).
     #[error(
@@ -239,10 +246,17 @@ pub enum PlaceError {
     DraftBorrow { name: String, ty: Option<GgmlType> },
 }
 
-/// The violations, `; `-separated.
-fn joined(broken: &[Violation]) -> String {
-    let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-    list.join("; ")
+/// The planner's refusal of a tier card on the all-host plan
+/// (`PlacementError::HostRoutedTier`), wrapped as the program's own
+/// ([`PlaceError::TierHost`]); every other refusal passes through.
+fn tier_host(e: PlacementError) -> PlaceError {
+    let PlacementError::HostRoutedTier { card, .. } = &e else {
+        return PlaceError::Placement(e);
+    };
+    PlaceError::TierHost {
+        tier: card.clone(),
+        origin: Box::new(e),
+    }
 }
 
 impl PlanInputs {
@@ -350,12 +364,7 @@ impl PlanInputs {
         }
         check_draft_reserve(machine, None)?;
         let plan = self.target(machine, ctx_max, levers, experts, 0)?;
-        let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
-        }
+        checked(plan).map_err(PlaceError::Broken)
     }
 
     /// [`PlanInputs::plan_with`] for a load that serves `slots` resident
@@ -396,12 +405,7 @@ impl PlanInputs {
         // class, out of the budget `rows` reserved above, so
         // [`Plan::violations`] holds the card's bound against them.
         plan.cards[0].kv_bytes += rows;
-        let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
-        }
+        checked(plan).map_err(PlaceError::Broken)
     }
 
     /// What one resident sequence of a load of the file holds on its card
@@ -425,8 +429,8 @@ impl PlanInputs {
     /// with expert tier cards, the stage cards first and each tier the next
     /// ids after them (plan (b′), [`machine_bp`]); then the PLE table's tier
     /// by the host's room ([`placement::row_table_tier`]). A tier machine
-    /// under [`Experts::Host`] is refused by name: its tier would hold
-    /// nothing.
+    /// under [`Experts::Host`] is refused by name ([`PlaceError::TierHost`]):
+    /// its tier would hold nothing.
     fn target<'a>(
         &'a self,
         machine: &'a Machine,
@@ -435,11 +439,6 @@ impl PlanInputs {
         experts: Experts,
         reserve: u64,
     ) -> Result<Plan<'a>, PlaceError> {
-        if let (Some(tier), Experts::Host) = (machine.tiers.first(), experts) {
-            return Err(PlaceError::TierHost {
-                tier: tier.name.clone(),
-            });
-        }
         let rule = match experts {
             Experts::Host => None,
             Experts::Card => Some(card_routed as RoutedFormat),
@@ -458,11 +457,6 @@ impl PlanInputs {
         reserve: u64,
         kv: &dyn KvBytes,
     ) -> Result<Plan<'a>, PlaceError> {
-        if let (Some(tier), Experts::Host) = (machine.tiers.first(), experts) {
-            return Err(PlaceError::TierHost {
-                tier: tier.name.clone(),
-            });
-        }
         let rule = match experts {
             Experts::Host => None,
             Experts::Card => Some(card_routed as RoutedFormat),
@@ -474,7 +468,9 @@ impl PlanInputs {
     /// per-layer bytes: every routed expert on the host for `None`, else the
     /// expert rule over the layers whose routed stacks `rule` loads within
     /// each card's budget less `reserve`; then the PLE table's tier by the
-    /// host's room ([`placement::row_table_tier`]).
+    /// host's room ([`placement::row_table_tier`]). The all-host rule's own
+    /// refusal of a tier card ([`PlaceError::TierHost`]) is wrapped to carry
+    /// the program's lever and plan.
     fn target_rule_of<'a>(
         &'a self,
         machine: &'a Machine,
@@ -485,7 +481,8 @@ impl PlanInputs {
         kv: &dyn KvBytes,
     ) -> Result<Plan<'a>, PlaceError> {
         let mut plan = match rule {
-            None => placement::plan_host_routed(&self.model, machine, ctx_max, kv, levers)?,
+            None => placement::plan_host_routed(&self.model, machine, ctx_max, kv, levers)
+                .map_err(tier_host)?,
             Some(rule) => placement::plan_routed_reserving(
                 &self.model,
                 machine,
@@ -537,12 +534,7 @@ impl PlanInputs {
         }
         check_draft_reserve(machine, None)?;
         let plan = self.target_rule(machine, ctx_max, levers, Some(rule), 0)?;
-        let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
-        }
+        checked(plan).map_err(PlaceError::Broken)
     }
 
     /// Every routed stack whose layer keeps all its experts on the host
