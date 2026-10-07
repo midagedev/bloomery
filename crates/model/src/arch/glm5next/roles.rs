@@ -9,32 +9,10 @@ use gguf::Split;
 
 use super::hparams::Hparams;
 use crate::arch::classify::{Counts, classify_with};
+use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-/// A tensor a layer of some kind carries, by stem: its role, and whether
-/// the file must carry it (ik creates it without `TENSOR_NOT_REQUIRED`).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Stem {
-    pub(super) name: &'static str,
-    pub(super) role: Role,
-    pub(super) required: bool,
-}
-
-const fn req(name: &'static str, role: Role) -> Stem {
-    Stem {
-        name,
-        role,
-        required: true,
-    }
-}
-
-const fn opt(name: &'static str, role: Role) -> Stem {
-    Stem {
-        name,
-        role,
-        required: false,
-    }
-}
+pub(super) use crate::arch::stems::{Stem, required};
 
 /// A KDA delta-rule layer's mixer; `ssm_f_b` and `ssm_g_b` are required
 /// because without them ik takes another decay rule (`src/llama-kda.cpp`,
@@ -155,11 +133,6 @@ pub fn nextn_role(stem: &str) -> Option<Role> {
         .flat_map(|g| g.iter())
         .find(|s| s.name == stem)
         .map(|s| s.role)
-}
-
-/// The names of `stems` the file must carry.
-pub(super) fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
-    stems.iter().filter(|s| s.required).map(|s| s.name)
 }
 
 /// The role of a trunk layer's stem.
