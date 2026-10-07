@@ -1282,7 +1282,14 @@ ik 자신의 점곱과 64행 0 ULP). 활성 짝은 ik 디스패치에서 읽었�
 (`ggml.c:1316`, `iqk_gemm_legacy_quants.cpp:2483`). IQ3_XXS에는 인코더 게이트 0이 없다 — ik의 AVX2 q8_K 인코더는 부호 없는 최댓값으로 코드를
 만들어 스케일이 늘 양수고 우리는 ggml 참조(부호 있는 극값)라 바이트가 다르고 곱만 같다. 적재 줄 `load host_tier type= k= path=fused|dequant_row`가
 `HostLayer::build`에서 (형식, k)마다 한 번 찍힌다(V4.1: q3_K 5120·q5_K 2304·q4_K 2304 모두 fused). kr-cpu K5·K6·K9·K10 닫힘.
-**미측정**: 단일 스레드 속도 예측(IQ3_XXS 4.0–5.2 GB/s — 적재 포트 한계라 4.6 GB/s 선 바로 옆, 호스트 레그 110–135 GB/s[유도]; MXFP4 12.8–14.6;
+~~**미측정**~~ **Measured 2026-10-08** (card `m2-mxfp4-rate`, one lease, core 2, 3 rounds alternating with ik, witness quiet:
+cpu and io pressure 0.00–0.02): MXFP4 × Q8_2_X4 single thread **k = 4096 12.9–13.2 GB/s** (mean 13.1, in band) and **k = 2048
+11.9–12.5** (mean 12.3, 4 % under the band's low edge); ik's k = 2048 twin 13.6–14.3 (mean 14.0), so ours/ik ≈ 0.88 at 2048, outside
+0.95–1.05 — a term the derivation missed, first thing the MiMo prompt-path round profiles (`perf -e cpu-clock` on qdot-rate k = 2048).
+Both clear the MiMo decode leg's ~7.8 GB/s break-even by ≥ 1.5×, so that leg stays bound by host DRAM: card experts (R5) come next.
+Same lease, the other rows of this line: IQ3_XXS k = 4096 ours 5.0–5.2 (in band, above the 4.6 line), ik 3.2 at the same shape;
+the Q3_K anchor 10.7–11.0 (was 10.8). The prediction as written:
+단일 스레드 속도 예측(IQ3_XXS 4.0–5.2 GB/s — 적재 포트 한계라 4.6 GB/s 선 바로 옆, 호스트 레그 110–135 GB/s[유도]; MXFP4 12.8–14.6;
 ours/ik 0.95–1.05; 기준 Q3_K 10.8 실측)은 `just measure-qdot-rate`(조용한 박스)가 확인한다. IQ3_XXS가 4.6 아래면 V4 호스트 레그는 ALU 바운드라
 40–54 tok/s 항을 다시 판단한다. K6(F16C)와 `fuses`가 dispatch 경로를 건드렸으므로 `ab-decode` 같은 임대 A/B 1회(예상 ≤ 잡음).
 **판단 하나**: K5는 "두 경로가 같은 정의된 출력"으로 닫았다 — 전부 NaN인 블록이 코드 0으로 조용히 양자화된다(전에는 AVX2가 인덱스 패닉).
