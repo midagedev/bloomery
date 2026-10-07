@@ -36,8 +36,9 @@
 //!
 //! The same row reads serve a row-gathered table another model's load maps
 //! through its [`gguf::Split`] ([`rows::SplitTable`]: Qwen3.8's PLE table
-//! when its plan leaves it on the NVMe tier), and a [`prefetch::Prefetcher`]
-//! reads either ([`RowTables`]).
+//! when its plan leaves it on the NVMe tier, or a routed stack of experts,
+//! each expert a row), and a [`prefetch::Prefetcher`] reads either
+//! ([`RowTables`]).
 //!
 //! The header comes from [`gguf::inventory_of`], which parses headers only and
 //! never populates a mapping, and this crate maps each shard itself so the
@@ -127,8 +128,17 @@ pub enum EngramError {
     RowBufferSize { want: usize, got: usize },
     #[error("{name}: ggml type {ty} has no block size in ggml's size table")]
     UnsizedType { name: String, ty: u32 },
-    #[error("{name}: expected a 2-D tensor, header says dims {dims:?}")]
-    NotATable { name: String, dims: Vec<u64> },
+    #[error("{name}: expected {want}, header says dims {dims:?}")]
+    NotATable {
+        name: String,
+        dims: Vec<u64>,
+        want: &'static str,
+    },
+    #[error("{path}: opening for direct reads: {source}")]
+    OpenDirect {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{name}: row length {ne0} is not a multiple of its type's block ({block})")]
     UnalignedRow { name: String, ne0: u64, block: u64 },
     #[error(
@@ -215,6 +225,7 @@ impl Site {
             return Err(EngramError::NotATable {
                 name: t.name.clone(),
                 dims: t.dims.clone(),
+                want: "a 2-D table",
             });
         };
         if !ne0.is_multiple_of(block) {
@@ -478,24 +489,54 @@ impl Site {
                 .unchecked_advise_range(UncheckedAdvice::DontNeed, first, span)
                 .map_err(|e| self.io_err("madvise(DONTNEED)", e))?;
         }
-        // SAFETY: the descriptor is this file's own and `self` outlives the call.
-        let rc = unsafe {
-            libc::posix_fadvise(
-                self.file.as_raw_fd(),
-                fadvise_off(first),
-                fadvise_off(span),
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
-        if rc != 0 {
-            return Err(self.io_err(
-                "posix_fadvise(DONTNEED)",
-                std::io::Error::from_raw_os_error(rc),
-            ));
-        }
-        Ok(())
+        fadvise_dontneed(&self.file, first, span)
+            .map_err(|e| self.io_err("posix_fadvise(DONTNEED)", e))
     }
 }
+
+/// `posix_fadvise(DONTNEED)` over `at .. at + len` of `file`: the page-cache
+/// half of an eviction, after the mapping's own entries are dropped.
+fn fadvise_dontneed(file: &File, at: usize, len: usize) -> Result<(), std::io::Error> {
+    // SAFETY: the descriptor is `file`'s own, borrowed for the call, and the
+    // range is plain numbers: fadvise reads and writes no memory of ours.
+    let rc = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            fadvise_off(at),
+            fadvise_off(len),
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
+/// The alignment `O_DIRECT` reads keep: the buffer's address, the file
+/// offset and the length are each a multiple of it (a drive's logical block
+/// is 512 B or 4 KiB; this holds for both).
+pub const DIRECT_ALIGN: usize = 4096;
+
+/// `path` opened for reads that bypass the page cache (`O_DIRECT`). Every
+/// read through the handle takes a buffer, a file offset and a length that
+/// are multiples of [`DIRECT_ALIGN`]; the kernel refuses any other with
+/// `EINVAL`.
+pub fn open_direct(path: &Path) -> Result<File, EngramError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .map_err(|source| EngramError::OpenDirect {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Pages one `mincore` call covers.
+const MINCORE_PAGES: usize = 8;
 
 /// `sysconf(_SC_PAGESIZE)`: the unit a row's pages round to.
 fn page_size() -> usize {
@@ -564,7 +605,7 @@ impl TableBytes<'_> {
     }
 
     /// `madvise(advice)` over the whole pages that hold the table: once at a
-    /// load, `MADV_RANDOM` ([`rows::SplitTable::open`]).
+    /// load ([`rows::SplitTable::open`]).
     fn advise_all(&self, advice: libc::c_int, op: &'static str) -> Result<(), EngramError> {
         let start = self.bytes.as_ptr() as usize;
         let first = start / self.page * self.page;
@@ -584,7 +625,12 @@ impl TableBytes<'_> {
         // SAFETY: every caller rounds a span of `bytes` out to the whole pages
         // that hold it, which lie inside the mapping `bytes` lies in (the
         // type's contract); madvise reads and writes no memory of ours
-        // through them.
+        // through them. The one advice that can change what a read returns
+        // is DONTNEED on an anonymous mapping, which zeroes the range; every
+        // mapping this type covers is a read-only file mapping (a site's own,
+        // and a split's, whose shards `gguf::Split::open` maps from their
+        // files and nothing else), where it drops the page-table entries and
+        // the next touch reads the file's bytes again.
         let rc = unsafe { libc::madvise(first as *mut libc::c_void, len, advice) };
         if rc == 0 {
             Ok(())
@@ -606,29 +652,58 @@ impl TableBytes<'_> {
     /// [`Site::resident_rows`]' count: the rows of `ids` whose pages `mincore`
     /// reports all resident, a call per row of at most eight pages each.
     fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
-        const CHUNK: usize = 8;
         let mut resident = 0u64;
         for &id in ids {
             let (first, span) = self.pages(id)?;
             let mut all = true;
             let mut at = first;
             while all && at < first + span {
-                let len = (first + span - at).min(CHUNK * self.page);
-                let mut vec = [0u8; CHUNK];
-                // SAFETY: `at .. at + len` is page-aligned and inside the
-                // mapping (`pages` rounds the row out to the mapping's own
-                // pages), and `vec` holds one byte for each of the at most
-                // `CHUNK` pages of that range.
-                let rc = unsafe { libc::mincore(at as *mut libc::c_void, len, vec.as_mut_ptr()) };
-                if rc != 0 {
-                    return Err(self.io("mincore", std::io::Error::last_os_error()));
-                }
+                let len = (first + span - at).min(MINCORE_PAGES * self.page);
+                let vec = self.mincore_chunk(at, len)?;
                 all = vec[..len.div_ceil(self.page)].iter().all(|b| b & 1 == 1);
                 at += len;
             }
             resident += u64::from(all);
         }
         Ok(resident)
+    }
+
+    /// The pages `mincore` reports resident among those `ids`' rows span, and
+    /// the pages they span: a row's whole pages, counted once for each row
+    /// that names them, so two neighbours' shared page counts twice. The
+    /// count a drop is checked against (nothing resident) and a read (every
+    /// page).
+    fn resident_pages(&self, ids: &[u32]) -> Result<(u64, u64), EngramError> {
+        let (mut resident, mut total) = (0u64, 0u64);
+        for &id in ids {
+            let (first, span) = self.pages(id)?;
+            let mut at = first;
+            while at < first + span {
+                let len = (first + span - at).min(MINCORE_PAGES * self.page);
+                let vec = self.mincore_chunk(at, len)?;
+                let pages = len.div_ceil(self.page);
+                resident += vec[..pages].iter().filter(|b| *b & 1 == 1).count() as u64;
+                total += pages as u64;
+                at += len;
+            }
+        }
+        Ok((resident, total))
+    }
+
+    /// `mincore` over `at .. at + len`, a page-aligned span of at most
+    /// [`MINCORE_PAGES`] pages inside the mapping: one byte a page, bit 0 set
+    /// when the page is in the page cache.
+    fn mincore_chunk(&self, at: usize, len: usize) -> Result<[u8; MINCORE_PAGES], EngramError> {
+        let mut vec = [0u8; MINCORE_PAGES];
+        // SAFETY: `at .. at + len` is page-aligned and inside the mapping
+        // (`pages` rounds a row out to the mapping's own pages), and `vec`
+        // holds one byte for each of the at most `MINCORE_PAGES` pages of
+        // that range.
+        let rc = unsafe { libc::mincore(at as *mut libc::c_void, len, vec.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(self.io("mincore", std::io::Error::last_os_error()));
+        }
+        Ok(vec)
     }
 
     /// [`Site::copy_rows`]' copy: every row of `ids`, in order, into `out`

@@ -1,0 +1,57 @@
+# Lead, nvtier R0 (design: the nvtier report §3): the one box term of the NVMe tier. Routed experts past a
+# small host's RAM live in the file's page cache, read on a miss through engram's RowTable (WILLNEED over every
+# missed part, then POPULATE_READ split across the pool). Its bands rest on R, the rate that path reads a
+# decode layer's cold experts at.
+# Derived per case [assumption: 0.5 us a page to submit a WILLNEED, 0.1 us a page to map, 0.1 ms to the first
+# byte, a drive that reads 6.12 GB/s; none measured here]. A batch's wall is the larger of the caller's submit
+# loop and the drive, plus the first-byte latency and the join, so R rises with k:
+#   k1 4.2..5.2   k2 4.6..5.6   k3 5.0..5.8   range [256, 512) 5.4..6.2
+# References, written after a functional run (not a result) had shown direct1 over the range far under
+# 6.12: direct1 (a 1 MB pread a part, one in flight: first-byte latency plus the transfer) 3.4..4.6; `drive`
+# (4 MiB requests on one thread) 5.5..6.7. The request size odmax read at is not confirmed here.
+# The decision statistic: a decode layer with a miss reads 1.5 experts on average [derived: 22.3 misses a
+# token over 14.5 layers with a miss, the design's keep+prep+seat replay at 22 GB], so `case=k2 arm=cache`
+# decides against the band; k1 and k3 bracket it and say which term moved (first-byte latency, or bandwidth).
+# Wall [derived]: build 2-5 min; the probe about 20 s of reads (3 x 66 batches of 1-3 ms with their drops,
+# 18 range batches of ~0.7 s); the lease about 8 min with the witness blocks. Side effect: the sitting leaves
+# the file's pages cold for the next load.
+kind: profile
+question: does the page-cache path (WILLNEED, then POPULATE_READ split across threads) read a decode
+  layer's missed Qwen3.8 experts near the drive's O_DIRECT rate, so the RAM tier can stay the file's page
+  cache?
+term: R(k), the median over 64 batches per k of (a batch's bytes / ns from the first WILLNEED to the last
+  part populated), k = 1, 2, 3 cold experts a batch from distinct layers (three parts each, gate up down),
+  Qwen3.8 UD-Q4_K_XL, 8 populate threads, this box's model drive, probe_nvread's rows `nvread arm=cache
+  case=k1|k2|k3 median=`; beside it the same path over one layer's experts [256, 512) (`case=range`, 16
+  batches) and the O_DIRECT preads of the same runs (`arm=direct1`, one thread, the odswap reader's shape;
+  `arm=directN`, the cache arm's split; `arm=drive`, the range's bytes in 4 MiB requests on one thread)
+unit: GB/s
+predict: 4.0..6.3
+condition: one lease (tools/ref/nvtier-read.sh through `just time-nvread`: lease_take, a timeout on every
+  child), the probe under --lease (rows carry lease=true); each batch's runs dropped (MADV_DONTNEED then
+  posix_fadvise DONTNEED) and read 0 resident by mincore before the cache arm (a batch that does not is
+  redrawn and counted in `redraws`; past the bound the run ends by name) and fully resident after it (else
+  the run ends by name); the probe proves before its first batch that mincore sees the cache (a drop leaves
+  0 pages of an expert, a populate all of them); runs drawn from distinct layers by a printed seed, so no
+  batch's readahead warms another's; no other process maps a file of the model's directory (the runner
+  refuses with 75 naming it); the cache arm reads bytes nothing has read since their drop; witness blocks
+  pre and post carry the drive's read counters, and their delta is within 5 % of the rows' summed
+  `read_bytes` [assumption: the tolerance; the runner prints the ratio], so no other reader used the drive
+  and no readahead overread; the runner's `[reclaim]` line shows no direct scan or allocation stall across
+  the round, and no `[cpu-busy]` or `[mem-full]` tag stands, or the cache arm's rate is read with that tag
+  (the box's page cache is usually full, so the cache arm's allocations can meet reclaim); the O_DIRECT
+  reference valid, `arm=drive case=range` within 10 % of 6.12 GB/s (rig-log 09-29#odmax), or the run
+  measured the drive's state, not the path. The small-k direct rows read bytes the drive served a moment
+  earlier in the batch: upper bounds, not references
+decide-in: when the `case=k2 arm=cache` median is in the band (the statistic the three decisions read), build R2 as specced (the page-cache tier through engram's RowTable) and carry the k1..k3 medians
+  into the decode bands; open R4's lane source only if the `case=range arm=cache` median is under 5.0, its
+  pp4096 gain on the 32 GB host then over +20 %, else R4 waits for exclusive tiers alone. A reference outside
+  its band voids the sitting whatever R reads: rerun once
+decide-below: when that median is below lo, switch R2's reader to O_DIRECT into an anonymous RAM-tier arena with per-expert pointers in
+  HostLayer (crates/model/src/moe.rs, M to L), re-derive the 32 GB host's bands at the range rows'
+  `arm=directN` median, re-spec R2 before its reader lands; first read the range rows' `directN` against
+  `cache`, because a cache below 4.0 beside a directN near 6 says the page-cache path loses to its own submit
+  loop, not the drive
+decide-above: when that median is above hi, an instrument fault (warm pages or a drive cache): read the `redraws` and the read_bytes
+  reconciliation, then rerun once; a reading above 6.3 with the reference in its band is a faster path than
+  the derivation allowed and is carried as measured

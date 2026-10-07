@@ -1628,6 +1628,33 @@ pub static CLEF_ROWS: Kind = Kind {
     ],
 };
 
+/// One result row of `probe_nvread`: an arm over a case of cold routed-expert
+/// runs, the batches' rate quantiles and what the run asked of the drive.
+pub static NVREAD: Kind = Kind {
+    name: "nvread",
+    head: "nvread",
+    doc: "One arm (cache: WILLNEED then POPULATE_READ split across threads; direct1 and directN: O_DIRECT preads of each part on one thread and on the same split; drive: in the range case, O_DIRECT preads of each stack's whole contiguous run in large requests on one thread) over one case (k1, k2, k3: that many experts from distinct layers a batch; range: one layer's whole expert range from a named id): the experts a batch reads, the threads, the measured and warm-up batches, the batches redrawn because a dropped run was still resident, the mean useful bytes and the mean page-rounded bytes a batch, every byte the arm asked of the drive, the batch rate's median, 10th and 90th percentile, the median batch wall, the draw seed, whether the run holds the lease, and the cache arm's picks.",
+    parts: &[
+        key("arm", Word, ""),
+        key("case", Word, ""),
+        key("experts", U64, ""),
+        key("threads", U64, ""),
+        key("batches", U64, ""),
+        key("warmup", U64, ""),
+        key("redraws", U64, ""),
+        key("bytes", U64, "B"),
+        key("span_bytes", U64, "B"),
+        key("read_bytes", U64, "B"),
+        key("median", F64(3), "GB/s"),
+        key("p10", F64(3), "GB/s"),
+        key("p90", F64(3), "GB/s"),
+        key("ms", F64(3), "ms"),
+        key("seed", U64, ""),
+        key("lease", Bool, ""),
+        opt("draws", Csv, ""),
+    ],
+};
+
 pub static TIME_PROMPT: Kind = Kind {
     name: "time_prompt",
     head: "time prompt",
@@ -2923,6 +2950,9 @@ pub static CLEF_HIDDEN_BIN: &[&Kind] = &[&CLEF_HIDDEN, &CLEF_ROWS];
 /// its name and the case's.
 pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 
+/// The records `probe_nvread` prints: one row an arm and case.
+pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
+
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, and the budget.
@@ -3350,6 +3380,7 @@ mod tests {
             GENERATE_GLM5NEXT,
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,
+            PROBE_NVREAD,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
             names.sort_unstable();
@@ -3561,6 +3592,11 @@ mod tests {
                 GATE_DEEPSEEK41_PREFILL,
                 include_str!("../../../tools/bloomery/schema/gate_deepseek41_prefill.jsonl"),
             ),
+            (
+                "probe_nvread",
+                PROBE_NVREAD,
+                include_str!("../../../tools/bloomery/schema/probe_nvread.jsonl"),
+            ),
         ];
         for (bin, kinds, file) in files {
             assert!(
@@ -3654,6 +3690,7 @@ mod tests {
             GENERATE_QWEN3MOE,
             CLEF_HIDDEN_BIN,
             GATE_DEEPSEEK41_PREFILL,
+            PROBE_NVREAD,
         ] {
             for &kind in set {
                 for full in [true, false] {
