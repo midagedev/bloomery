@@ -11,6 +11,7 @@ crates/model/src/ops.rs	BLOOMERY_POISON,BLOOMERY_STEAL	[03]
 crates/model/src/moe.rs	BLOOMERY_EXPERT_LOG	[03]
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_PIN_MAIN	[03]
 crates/gpu/src/hybrid.rs	BLOOMERY_HYBRID_NL	v2fence
+crates/model/src/placement/workstation.rs	BLOOMERY_HOST_ROOM	nvtier
 crates/gpu/src/arch/qwen3moe/ubatch.rs	BLOOMERY_QWEN3_UBATCH	[03]
 crates/model/src/arch/deepseek2/attn.rs	BLOOMERY_FLASH_SIMD,BLOOMERY_KV_PREFETCH,BLOOMERY_KV_PREFETCH_ROWS,BLOOMERY_FLASH_SEGMENTS,BLOOMERY_ATTN_BUNDLE,BLOOMERY_ATTN_HALVES	v2fence
 crates/model/src/profile.rs	BLOOMERY_PROFILE	v2fence
