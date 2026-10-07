@@ -219,8 +219,6 @@ use bloomery_gpu_gates::ds41_media;
 #[cfg(feature = "vision")]
 use bloomery_gpu_vision::encoder::Encoder;
 #[cfg(feature = "vision")]
-use cuda_core::CudaContext;
-#[cfg(feature = "vision")]
 use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision::arch::deepseek41v::Hparams as VisionHparams;
@@ -993,8 +991,7 @@ fn open_encoder(s: &mut Session<Body>, a: &SeatArgs) -> Result<Option<Vision>, G
         .map_err(|_| format!("--mmproj {}: ordinal {}", path.display(), seat.ordinal))?;
     let (stream, enc) = on_encoder_card(s, || {
         let on_card = |e| format!("--mmproj {}: the card {}: {e}", path.display(), seat.name);
-        let ctx = CudaContext::new(ordinal).map_err(on_card)?;
-        let stream = ctx.new_stream().map_err(on_card)?;
+        let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(ordinal).map_err(on_card)?;
         let enc = Encoder::load(&ctx, &stream, &file)
             .map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
         Ok((stream, enc))
