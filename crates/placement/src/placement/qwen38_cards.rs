@@ -12,13 +12,13 @@ use gguf::GgmlType;
 
 use super::churn::ChurnPool;
 use super::workstation::{
-    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HostNeed, MARGIN, MIB,
-    SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, census_usable, host, resolve,
-    tier_batch_host_bytes, tier_batch_staging_bytes,
+    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_USABLE, HostNeed,
+    MARGIN, MIB, OS_OTHER, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
+    census_usable, host, resolve, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use super::{
-    Card, CardFormat, Device, Format, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
-    Plan, PlanLevers, Role, plan_routed_reserving,
+    Card, CardFormat, Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
+    PlanLevers, Role, plan_routed_reserving,
 };
 use crate::slots::{SeqTerms, Stores};
 
@@ -295,13 +295,15 @@ fn machine_bp(stage_spec: CardSpec, tier: CardSpec) -> Machine {
 /// for `slots` resident sequences (`PlanInputs::plan_with_slots` under
 /// `Experts::Card`, no draft): every slot's stores, the bytes beside them of
 /// every slot but the live one reserved out of the expert budget, then the
-/// PLE table moved from the NVMe tier to the host (`ple_on_host`). A plan
-/// that breaks an invariant fails the test by name.
+/// PLE table's tier by the host's `room` ([`super::row_table_tier`] for
+/// calls of up to [`UBATCH_PLANNED`] positions, as `PlanInputs` places it).
+/// A plan that breaks an invariant fails the test by name.
 fn plan_at<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx: u64,
     slots: u64,
+    room: u64,
 ) -> Result<Plan<'a>, PlacementError> {
     let terms = SeqTerms {
         layers: Stores {
@@ -315,22 +317,23 @@ fn plan_at<'a>(
     let kv = terms.slots_of(slots);
     let levers = PlanLevers::default();
     let mut plan = plan_routed_reserving(model, machine, ctx, &kv, &levers, card_routed, rows)?;
-    for r in &mut plan.rows {
-        if model.tensors[r.tensor].role != Role::EngramTable {
-            continue;
-        }
-        let s = &mut r.segments[0];
-        assert_eq!((s.device, s.format), (Device::Nvme, Format::NvmeFile));
-        plan.nvme_bytes -= s.resident_bytes;
-        plan.host.table_bytes += s.resident_bytes;
-        plan.host.headroom_bytes -= i128::from(s.resident_bytes);
-        (s.device, s.format) = (Device::Host, Format::HostFile);
-    }
+    super::row_table_tier(&mut plan, room, UBATCH_PLANNED)?;
     plan.cards[0].kv_bytes += rows;
     let broken = plan.violations();
     assert!(broken.is_empty(), "ctx {ctx} slots {slots}: {broken:?}");
     Ok(plan)
 }
+
+/// The most positions one PLE fill reads (`qwen35moe::place::UBATCH_PLANNED`,
+/// the largest ubatch a load runs).
+const UBATCH_PLANNED: u64 = 4096;
+
+/// The box's room with nothing loaded [derived from the measured `free -b`
+/// figures: `HOST_USABLE` less `OS_OTHER`], and the room of the 64 GiB host
+/// the sitting holds a Qwen3.8 arm to (`depth-qwen3moe`'s `mem=61G` scope:
+/// `MemoryMax` 61 GiB, nothing charged yet).
+const BOX_ROOM: u64 = HOST_USABLE - OS_OTHER;
+const SCOPE_61G: u64 = 61 << 30;
 
 /// The unset residency rule on `plan` with `MemAvailable` ample
 /// (`residency38_at_plan`), and its churn pool's bytes.
@@ -348,19 +351,24 @@ fn residency(plan: &Plan<'_>) -> (Residency38Pick, u64) {
     (pick, bytes)
 }
 
-/// The Q4 file's routed experts and the PLE table, in the file's bytes, and
-/// the host's engram row cache reserve: what the box gate pins as
-/// `HOST_EXPERTS` and `HOST_TABLES`, and `workstation::ROW_CACHE`.
+/// The Q4 file's routed experts and the PLE table, in the file's bytes:
+/// what the box gate pins as `HOST_EXPERTS` and `HOST_TABLES`.
 const Q4_ROUTED: u64 = 77_017_907_200;
 const PLE_TABLE: u64 = 28_800_138_240;
-const ROW_CACHE: u64 = 4_294_967_296;
+// PIN(2026-10-07): the PLE table's row room on the NVMe tier, which a plan
+// sets aside in place of the 4 GiB engram row cache (was ROW_CACHE,
+// 4,294,967,296, the reserve of every machine's host): a call of
+// UBATCH_PLANNED 4,096 positions reads 16 rows a position, each 90 B
+// IQ4_NL row on at most 1 + ⌈89 / 4,096⌉ = 2 pages of 4,096 B —
+// 4,096 · 16 · 2 · 4,096 = 536,870,912 B (`row_room`).
+const ROW_ROOM: u64 = 536_870_912;
 
 /// One, two or four such cards: the unset `--place` of `generate_qwen3moe`
 /// and of the Qwen3.8 seat is `a`, the stage on cuda0 — the lowest ordinal
 /// among equal usable bytes — and no tier. On it, at 4,096 positions and one
 /// sequence, the card holds every routed expert of all 48 layers, so the
-/// host serves none and the host need is the PLE table and the row cache
-/// alone; the unset residency rule is `off`, no churn pool beside it: no
+/// host serves none and the host need is the PLE table alone; the unset
+/// residency rule is `off`, no churn pool beside it: no
 /// host expert is left to move to the card. The restated terms first give
 /// the box gate's A6000
 /// row at the same context and ubatch (`CARD_PLANS`: 262 experts on the
@@ -376,7 +384,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
         .sum();
     assert_eq!(routed, Q4_ROUTED);
     let m = machine_a(A6000);
-    let a6000 = plan_at(&q4, &m, 4096, 1).expect("the A6000 plan");
+    let a6000 = plan_at(&q4, &m, 4096, 1, BOX_ROOM).expect("the A6000 plan");
     let want: Vec<u64> = (0..LAYERS)
         .map(|l| if l < 40 { 262 } else { 261 })
         .collect();
@@ -399,7 +407,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
         )
     );
     let m = machine_a(one);
-    let plan = plan_at(&q4, &m, 4096, 1).expect("the 96 GB plan");
+    let plan = plan_at(&q4, &m, 4096, 1, BOX_ROOM).expect("the 96 GB plan");
     assert_eq!(plan.n_l, vec![EXPERTS; LAYERS]);
     assert_eq!(
         (
@@ -410,7 +418,11 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
         ),
         (EXPERTS * LAYERS as u64, Q4_ROUTED, 0, 0)
     );
-    assert_eq!(HostNeed::of(&plan, 0).bytes(), PLE_TABLE + ROW_CACHE);
+    // PIN(2026-10-07): the PLE table alone; was PLE_TABLE + 4 GiB, the engram
+    // row cache every machine's host reserved. The room holds the table, so
+    // the plan reads it from the host and sets no row reserve aside
+    // (`row_table_tier`; `q3_routes_onto_cards_like_the_q4_file` pins the NVMe arm).
+    assert_eq!(HostNeed::of(&plan, 0).bytes(), PLE_TABLE);
     // PIN(2026-10-06): `off` (NoHostExperts), no pool; was `mid-p256-s1`
     // with a pool of Q4_ROUTED / 2. plan.host.experts is 0 above, so a pool
     // of the card's experts past the pinned ones serves no host expert.
@@ -428,10 +440,16 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
 /// The Q3 file's routed gate and up are IQ3_XXS or IQ4_XS and its downs
 /// IQ4_NL or Q8_0: all of them card types (`card_routed`), so on a large
 /// enough card every routed expert is the card's as the Q4 file's are — the
-/// host need the PLE table and the row cache alone, the residency rule
+/// host need the PLE table alone, the residency rule
 /// `off` for no host expert left. Under `--place bp` on two such cards both
 /// plans are refused by name as a tier card that holds no expert: each
-/// file's stage card holds every expert.
+/// file's stage card holds every expert. On the gate card, at the 8,192
+/// positions of the 64 GiB plan, the PLE table's tier follows the host's
+/// room (`row_table_tier`): the box's room holds the plan with the table on
+/// the host, where it stays with no row reserve; the 61 GiB scope's does
+/// not, so the table stays on the NVMe tier and the plan sets its row room
+/// aside instead — a need the scope holds. The rule's boundary is the host
+/// arm's need itself.
 // PIN(2026-10-06): the iq stacks joined `card_routed` (iqwire), so the Q3
 // file plans onto cards like the Q4 file; was n_l 0 on every layer, the
 // whole routed share host-side (`NoCardExperts`), and the bp refusal because
@@ -454,13 +472,17 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     assert_eq!(routed, 55_823_564_800);
     let cards = picked("bp", &census_96(2));
     let m = machine_a(cards[0]);
-    let plan = plan_at(&q3, &m, 4096, 1).expect("the Q3 plan");
+    let plan = plan_at(&q3, &m, 4096, 1, BOX_ROOM).expect("the Q3 plan");
     assert_eq!(plan.n_l, vec![EXPERTS; LAYERS]);
     assert_eq!(
         (plan.cards[0].experts, plan.cards[0].expert_bytes),
         (EXPERTS * LAYERS as u64, routed)
     );
-    assert_eq!(HostNeed::of(&plan, 0).bytes(), PLE_TABLE + ROW_CACHE);
+    // PIN(2026-10-07): the PLE table alone; was PLE_TABLE + 4 GiB, the engram
+    // row cache every machine's host reserved. The room holds the table, so
+    // the plan reads it from the host and sets no row reserve aside
+    // (`row_table_tier`; the gate card's NVMe arm below).
+    assert_eq!(HostNeed::of(&plan, 0).bytes(), PLE_TABLE);
     assert_eq!(
         residency(&plan),
         (
@@ -471,17 +493,77 @@ fn q3_routes_onto_cards_like_the_q4_file() {
             0
         )
     );
+    let gate = machine_a(RTX_3090);
+    let at = |room: u64| plan_at(&q3, &gate, 8192, 1, room).expect("the gate card's Q3 plan");
+    let host = at(BOX_ROOM);
+    let host_need = HostNeed::of(&host, 0).bytes();
+    assert_eq!(
+        (
+            host.row_tier().expect("one tier"),
+            host.nvme_bytes,
+            host.host.table_bytes,
+            host.host.row_reserve_bytes
+        ),
+        (Some(Device::Host), 0, PLE_TABLE, 0)
+    );
+    let nvme = at(SCOPE_61G);
+    let nvme_need = HostNeed::of(&nvme, 0).bytes();
+    assert_eq!(
+        (
+            nvme.row_tier().expect("one tier"),
+            nvme.nvme_bytes,
+            nvme.host.table_bytes,
+            nvme.host.row_reserve_bytes
+        ),
+        (Some(Device::Nvme), PLE_TABLE, 0, ROW_ROOM)
+    );
+    // The host experts are the routed share less the 13,899,033,600 B the
+    // 3090 holds (the iqplan's 64 GiB plan holds 10,967,959,552 B beside the
+    // draft's 2,919,229,612 B reserve, within 12 MB of the same budget); the
+    // host arm adds the table to them, the NVMe arm the row room (the OS
+    // reserve is MemAvailable's own and leaves the need).
+    assert_eq!(
+        (host.host.expert_bytes, host_need, nvme_need),
+        (41_924_531_200, 70_724_669_440, 42_461_402_112)
+    );
+    assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
+    assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
+    assert_eq!(
+        at(host_need).row_tier().expect("one tier"),
+        Some(Device::Host)
+    );
+    assert_eq!(
+        at(host_need - 1).row_tier().expect("one tier"),
+        Some(Device::Nvme)
+    );
+    // A table the rule already moved is not the NVMe tier's to place again,
+    // and a table on no tier a reader takes is refused by name.
+    let mut moved = at(BOX_ROOM);
+    assert!(matches!(
+        super::row_table_tier(&mut moved, BOX_ROOM, UBATCH_PLANNED),
+        Err(PlacementError::Tensor { .. })
+    ));
+    let ple = moved
+        .rows
+        .iter()
+        .position(|r| q3.tensors[r.tensor].role == Role::EngramTable)
+        .expect("the PLE row");
+    moved.rows[ple].segments[0].device = Device::Unused;
+    assert!(matches!(
+        moved.row_tier(),
+        Err(PlacementError::Tensor { .. })
+    ));
     let bp = machine_bp(cards[0], cards[1]);
     // PIN(2026-10-06): refused (IdleTier); was a plan whose tier_n_l is 0 on
     // every layer. The stage holds all 512 experts of every layer, so no
     // expert is left for the tier.
     assert!(matches!(
-        plan_at(&q3, &bp, 4096, 1),
+        plan_at(&q3, &bp, 4096, 1, BOX_ROOM),
         Err(PlacementError::IdleTier { tier: 0, .. })
     ));
     let q4 = model(false);
     assert!(matches!(
-        plan_at(&q4, &bp, 4096, 1),
+        plan_at(&q4, &bp, 4096, 1, BOX_ROOM),
         Err(PlacementError::IdleTier { tier: 0, .. })
     ));
 }
@@ -519,7 +601,7 @@ fn both_files_lend_the_draft_their_output_matrices() {
 fn two_slots(ctx: u64) -> (u64, Vec<u64>, u64) {
     let q4 = model(false);
     let m = machine_a(picked("a", &census_96(1))[0]);
-    let p = plan_at(&q4, &m, ctx, 2).expect("a two-slot plan");
+    let p = plan_at(&q4, &m, ctx, 2, BOX_ROOM).expect("a two-slot plan");
     (p.cards[0].expert_bytes, p.n_l.clone(), p.host.experts)
 }
 

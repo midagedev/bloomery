@@ -782,7 +782,12 @@ pub struct HostTotals {
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
     pub shadow_bytes: u64,
+    /// The machine's host reserves and [`HostTotals::row_reserve_bytes`].
     pub reserve_bytes: u64,
+    /// What the host sets aside for the row-gathered tables the program
+    /// reads from the NVMe tier ([`row_table_tier`]); 0 when none lies
+    /// there. Inside [`HostTotals::reserve_bytes`].
+    pub row_reserve_bytes: u64,
     /// usable − experts − tables − shadows − reserves.
     pub headroom_bytes: i128,
 }
@@ -838,6 +843,10 @@ pub enum PlacementError {
     /// kernel's answer.
     #[error("host lock: {0}")]
     Host(String),
+    /// The host's available bytes could not be read
+    /// ([`workstation::host_room`]'s reading): the file or value that failed.
+    #[error("the host's room: {0}")]
+    HostRoom(String),
     /// A host set, a walk or a page release met an r8 sidecar it cannot take
     /// beside its pair: the sidecar's own named refusal.
     #[error(transparent)]
@@ -2190,6 +2199,159 @@ pub fn whole_need(
     })
 }
 
+/// Whether `r` places a row-gathered table the program reads by row id
+/// ([`Role::EngramTable`]): what [`row_table_tier`] places and the row
+/// reserve is for.
+fn row_read(model: &ModelTensors, r: &Row) -> bool {
+    model
+        .tensors
+        .get(r.tensor)
+        .is_some_and(|t| t.role == Role::EngramTable)
+}
+
+/// The row reserve [`totals`] sets aside: [`workstation::ROW_CACHE`], the
+/// engram row cache — the hot rows a reader keeps beside the drive — when
+/// any row-gathered table lies on the NVMe tier, 0 when none does. A plan
+/// whose maker sizes its tables' reader ([`row_table_tier`]) replaces it.
+fn row_cache_reserve(model: &ModelTensors, rows: &[Row]) -> u64 {
+    let on_nvme = rows
+        .iter()
+        .filter(|r| row_read(model, r))
+        .flat_map(|r| &r.segments)
+        .any(|s| s.device == Device::Nvme);
+    if on_nvme { workstation::ROW_CACHE } else { 0 }
+}
+
+/// The page-cache bytes a reader of `model`'s row-gathered tables
+/// ([`Role::EngramTable`]) holds while it reads one call of up to
+/// `positions` positions from the NVMe tier: per table, its rows a position
+/// ([`ModelTensor::gathered_rows`]) for every position, each row on at most
+/// `1 + ⌈(row bytes − 1) / page⌉` pages of [`workstation::ROW_PAGE`] — the
+/// ids are hashed, so a call's rows are counted on pages of their own, and
+/// a row may straddle a page boundary. The reader advises and copies one
+/// call at a time, so one call's pages are what must stay resident until
+/// its copy. A table with no per-token row count, or a room past u64, is
+/// refused by name.
+pub fn row_room(model: &ModelTensors, positions: u64) -> Result<u64, PlacementError> {
+    let page = workstation::ROW_PAGE;
+    model
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::EngramTable)
+        .try_fold(0u64, |sum, t| {
+            let rows = t.gathered_rows.ok_or_else(|| {
+                PlacementError::tensor(t, "a row-gathered table without a per-token row count")
+            })?;
+            let pages = 1 + row_bytes(t)?.saturating_sub(1).div_ceil(page);
+            positions
+                .checked_mul(rows)
+                .and_then(|n| n.checked_mul(pages))
+                .and_then(|n| n.checked_mul(page))
+                .and_then(|n| sum.checked_add(n))
+                .ok_or_else(|| {
+                    PlacementError::tensor(
+                        t,
+                        format!("the row room of a call of {positions} positions passes u64 bytes"),
+                    )
+                })
+        })
+}
+
+/// Where `plan`'s row-gathered tables ([`Role::EngramTable`]) are read
+/// from, the one rule for a plan whose maker sizes their reader: on the
+/// host in their file bytes when `room` — the host's available bytes
+/// ([`workstation::host_room`]'s reading, or a room the caller gives) —
+/// holds the plan's host need with them there ([`workstation::HostNeed`],
+/// no churn pool beside it); else on the NVMe tier, where the role rule
+/// placed them ([`place_whole`]), with their reader's room for a call of up
+/// to `positions` positions ([`row_room`]) as the plan's row reserve, in
+/// place of the row cache [`totals`] set aside. A plan with no such table
+/// is left as it is; [`Plan::row_tier`] reads the outcome. A table of other
+/// than one NVMe file segment, or a sum past u64, is refused by name.
+pub fn row_table_tier(
+    plan: &mut Plan<'_>,
+    room: u64,
+    positions: u64,
+) -> Result<(), PlacementError> {
+    let model = plan.model;
+    let tables: Vec<usize> = (0..plan.rows.len())
+        .filter(|&i| row_read(model, &plan.rows[i]))
+        .collect();
+    let mut moved = 0u64;
+    for &i in &tables {
+        let r = &plan.rows[i];
+        let t = &model.tensors[r.tensor];
+        let [s] = r.segments.as_slice() else {
+            return Err(PlacementError::tensor(
+                t,
+                format!(
+                    "the row-gathered table in {} segments, not one",
+                    r.segments.len()
+                ),
+            ));
+        };
+        if (s.device, s.format) != (Device::Nvme, Format::NvmeFile) {
+            return Err(PlacementError::tensor(
+                t,
+                format!(
+                    "the row-gathered table on {:?} as {}, not the NVMe tier's file bytes",
+                    s.device, s.format
+                ),
+            ));
+        }
+        moved = moved
+            .checked_add(s.resident_bytes)
+            .ok_or_else(|| PlacementError::tensor(t, "the row-gathered tables' bytes pass u64"))?;
+    }
+    let Some(&first) = tables.first() else {
+        return Ok(());
+    };
+    let named = &model.tensors[plan.rows[first].tensor];
+    let past = |what: &str| PlacementError::tensor(named, format!("{what} passes u64 bytes"));
+    let old = plan.host.row_reserve_bytes;
+    let mut host_arm = workstation::HostNeed::of(plan, 0);
+    host_arm.tables = host_arm
+        .tables
+        .checked_add(moved)
+        .ok_or_else(|| past("the host's tables with the row-gathered ones"))?;
+    host_arm.reserves = host_arm.reserves.checked_sub(old).ok_or_else(|| {
+        PlacementError::tensor(
+            named,
+            format!(
+                "the plan's row reserve {old} B is past its host reserves {} B",
+                host_arm.reserves
+            ),
+        )
+    })?;
+    let new = if host_arm.bytes() <= room {
+        plan.nvme_bytes = plan.nvme_bytes.checked_sub(moved).ok_or_else(|| {
+            PlacementError::tensor(
+                named,
+                format!(
+                    "the row-gathered tables' {moved} B pass the NVMe tier's {} B",
+                    plan.nvme_bytes
+                ),
+            )
+        })?;
+        plan.host.table_bytes = host_arm.tables;
+        plan.host.headroom_bytes -= i128::from(moved);
+        for &i in &tables {
+            let s = &mut plan.rows[i].segments[0];
+            (s.device, s.format) = (Device::Host, Format::HostFile);
+        }
+        0
+    } else {
+        row_room(model, positions)?
+    };
+    plan.host.reserve_bytes = host_arm
+        .reserves
+        .checked_add(new)
+        .ok_or_else(|| past("the host's reserves with the row room"))?;
+    plan.host.row_reserve_bytes = new;
+    plan.host.headroom_bytes += i128::from(old) - i128::from(new);
+    Ok(())
+}
+
 /// The per-device sums of a finished set of rows; `kv_bytes` is, per card of
 /// [`Machine::all_cards`], its layers' cache and their ring shadows, which
 /// the host holds; `counts` the stage cards' `n_l` and the tiers'.
@@ -2260,7 +2422,9 @@ fn totals<'a>(
             }
         })
         .collect();
-    let reserve_bytes: u64 = machine.host.reserves.iter().map(|(_, b)| b).sum();
+    let row_reserve = row_cache_reserve(model, &rows);
+    let reserve_bytes: u64 =
+        machine.host.reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
     let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow)| shadow).sum();
     let host = HostTotals {
         expert_bytes: host_experts,
@@ -2271,6 +2435,7 @@ fn totals<'a>(
         table_bytes: host_tables,
         shadow_bytes,
         reserve_bytes,
+        row_reserve_bytes: row_reserve,
         headroom_bytes: i128::from(machine.host.usable_bytes)
             - i128::from(host_experts + host_tables + shadow_bytes + reserve_bytes),
     };
@@ -2372,7 +2537,8 @@ impl Plan<'_> {
         let host = &self.machine.host;
         let total = host_resident
             + self.host.shadow_bytes
-            + host.reserves.iter().map(|(_, b)| b).sum::<u64>();
+            + host.reserves.iter().map(|(_, b)| b).sum::<u64>()
+            + self.host.row_reserve_bytes;
         if total > host.usable_bytes {
             out.push(Violation::HostOver {
                 total,
@@ -2380,6 +2546,42 @@ impl Plan<'_> {
             });
         }
         out
+    }
+
+    /// The tier the plan's row-gathered tables ([`Role::EngramTable`]) are
+    /// read from: `Some(Device::Host)` in their file bytes on the host,
+    /// `Some(Device::Nvme)` from the NVMe tier, `None` for a model with
+    /// none. A table on a card, unused or in other than one file segment,
+    /// and tables split between the two tiers, are refused by name: a reader
+    /// would read them from a tier the plan does not name.
+    pub fn row_tier(&self) -> Result<Option<Device>, PlacementError> {
+        let mut tier = None;
+        for r in self.rows.iter().filter(|r| row_read(self.model, r)) {
+            let t = &self.model.tensors[r.tensor];
+            let here = match r.segments.as_slice() {
+                [s] if (s.device, s.format) == (Device::Host, Format::HostFile) => Device::Host,
+                [s] if (s.device, s.format) == (Device::Nvme, Format::NvmeFile) => Device::Nvme,
+                segments => {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!(
+                            "the row-gathered table as {segments:?}, neither the host's nor the \
+                             NVMe tier's file bytes"
+                        ),
+                    ));
+                }
+            };
+            match tier {
+                Some(d) if d != here => {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!("the row-gathered table on {here:?}, another on {d:?}"),
+                    ));
+                }
+                _ => tier = Some(here),
+            }
+        }
+        Ok(tier)
     }
 }
 

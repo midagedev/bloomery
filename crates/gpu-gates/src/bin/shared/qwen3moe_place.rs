@@ -45,8 +45,8 @@ use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
-    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, WholeLoad,
-    WholeNeed,
+    self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
+    WholeLoad, WholeNeed,
 };
 use runtime::seqstate::HOST_BUDGET;
 
@@ -453,6 +453,17 @@ impl PlaceQ3 {
         let r = match why {
             Some(w) => r.w("why", w),
             None => r,
+        };
+        // A qwen35moe-family file's PLE table: its tier and the room's
+        // reading that chose it; a plan with none, and a qwen3moe file,
+        // print neither. A tier no reader takes prints as refused.
+        let r = match (&self.inputs, plan.row_tier()) {
+            (Inputs::Qwen35(i), Ok(Some(Device::Nvme))) => {
+                r.w("rows", "nvme").w("read", i.room.1.word())
+            }
+            (Inputs::Qwen35(i), Ok(Some(_))) => r.w("rows", "host").w("read", i.room.1.word()),
+            (Inputs::Qwen35(_), Err(_)) => r.w("rows", "refused"),
+            (Inputs::Qwen35(_), Ok(None)) | (Inputs::Qwen3(_), _) => r,
         };
         r.csv("devices", record::plan_devices(plan.machine))
             .w("cuda_order", record::cuda_order())

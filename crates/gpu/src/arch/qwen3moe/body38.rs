@@ -142,12 +142,15 @@ use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::Hash;
 use engram::hash::{History, Window};
+use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
+use engram::rows::SplitTable;
 use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
-use model::placement::Plan;
+use model::placement::{Device, Plan};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take, Why};
 use runtime::swaprule::KeptRows;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -344,7 +347,12 @@ pub enum LayerKind38 {
 }
 
 /// The PLE site's host side: the hash and the sequence's history, the table
-/// in the file, and the rows of the positions last filled, decoded.
+/// in the file, the rows of the positions last filled, decoded, and — when
+/// the plan left the table on the NVMe tier — its reader. One mapping of the
+/// table, two residencies: on the host the load's host set holds its pages
+/// and a fill decodes them from the split's mapping as they are; on the NVMe
+/// tier a fill's rows are advised and copied off the step thread
+/// ([`PleRead`]) and decoded from the copy.
 struct PleHost {
     hash: Hash,
     hist: History,
@@ -361,13 +369,121 @@ struct PleHost {
     ids: Vec<u32>,
     named: usize,
     e: Vec<f32>,
+    /// The NVMe tier's reader; `None` on the host.
+    nvme: Option<PleRead>,
+}
+
+/// The PLE table's reads from the NVMe tier: engram's prefetcher over the
+/// table in the split's own mapping ([`SplitTable`]), whose helper advises
+/// a fill's rows and copies them, so the step thread takes neither the
+/// advice nor a fault. A fill nothing read ahead waits for its own rows; a
+/// prompt call's later ubatches are read one ahead while the ubatch before
+/// them computes ([`PleHost::prompt_start`]).
+struct PleRead {
+    rows: Prefetcher,
+    /// A prompt call's ubatches not yet filled, in order; while `flight`
+    /// holds, the front's rows are on the helper.
+    ahead: VecDeque<PleBatch>,
+    flight: bool,
+}
+
+/// One ubatch of a prompt call as [`PleHost::prompt_start`] reads it ahead:
+/// its first position, its positions and its row ids.
+struct PleBatch {
+    pos: u32,
+    n: usize,
+    ids: Vec<u32>,
+}
+
+impl PleRead {
+    /// The reader of `file`'s table `name`, for fills of up to `max_rows`
+    /// rows; its helper on the SMT sibling of the loading thread's core when
+    /// that thread is pinned (the step thread loads), else floating.
+    fn open(file: &Arc<Split>, name: &str, max_rows: usize) -> Result<PleRead, GpuError> {
+        let table =
+            SplitTable::open(Arc::clone(file), name).map_err(|e| GpuError::plan(WHAT, e))?;
+        let rows = Prefetcher::over(
+            Arc::new(table),
+            &[max_rows],
+            HelperOptions {
+                mode: FillMode::Touch,
+                cpu: caller_sibling(),
+                classify: false,
+            },
+        )
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+        Ok(PleRead {
+            rows,
+            ahead: VecDeque::new(),
+            flight: false,
+        })
+    }
+
+    /// The batch on the helper taken back unread: a call that stopped
+    /// before its fills took it, or a new prompt call.
+    fn drain(&mut self) -> Result<(), GpuError> {
+        if std::mem::take(&mut self.flight) {
+            self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+        Ok(())
+    }
+
+    /// `ids`, the rows of the fill of `n` positions at `pos`, copied to
+    /// [`Prefetcher::filled`]: the batch read ahead when it is this fill's,
+    /// else read now; then the next ubatch read ahead goes to the helper, to
+    /// run while this one computes.
+    fn read(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
+        let own = self
+            .ahead
+            .front()
+            .is_some_and(|b| b.pos == pos && b.n == n && b.ids == ids);
+        if own {
+            self.ahead.pop_front();
+        } else {
+            self.drain()?;
+            self.ahead.clear();
+        }
+        if !self.flight {
+            self.rows
+                .submit([ids])
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+        self.flight = false;
+        self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+        if let Some(next) = self.ahead.front() {
+            self.rows
+                .submit([next.ids.as_slice()])
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+            self.flight = true;
+        }
+        Ok(())
+    }
+}
+
+/// `rows`, IQ4_NL rows of `width` values each, decoded into `e` in order.
+fn ple_decode<'r>(
+    e: &mut [f32],
+    width: usize,
+    rows: impl Iterator<Item = &'r [u8]>,
+) -> Result<(), GpuError> {
+    for (src, out) in rows.zip(e.chunks_exact_mut(width)) {
+        dequant_row(GgmlType::IQ4_NL, src, out).map_err(model::ModelError::from)?;
+    }
+    Ok(())
 }
 
 impl PleHost {
     /// The table `per_layer_token_embd` of `file`, IQ4_NL rows of the hash's
     /// width, and the hash from the first shard's keys, for calls of up to
-    /// `cap` positions. Load-time only.
-    fn new(file: Arc<Split>, n_vocab: usize, cap: usize) -> Result<PleHost, GpuError> {
+    /// `cap` positions, read from `tier` — the plan's
+    /// ([`Plan::row_tier`]): the host, or the NVMe tier through its reader
+    /// ([`PleRead`]); any other tier is refused by name. Load-time only.
+    fn new(
+        file: Arc<Split>,
+        n_vocab: usize,
+        cap: usize,
+        tier: Device,
+    ) -> Result<PleHost, GpuError> {
         let name = model::arch::qwen35moe::names::per_layer_token_embd();
         let refuse = |need: &'static str| GpuError::Tensor {
             what: WHAT,
@@ -403,6 +519,15 @@ impl PleHost {
         if rows == 0 || info.nbytes != (rows * row_bytes) as u64 {
             return Err(refuse("a whole number of IQ4_NL rows"));
         }
+        let nvme = match tier {
+            Device::Host => None,
+            Device::Nvme => Some(PleRead::open(&file, &name, cap * per_token)?),
+            Device::Card(_) | Device::Unused => {
+                return Err(refuse(
+                    "on the host or the NVMe tier, where the plan reads it",
+                ));
+            }
+        };
         Ok(PleHost {
             hash,
             hist,
@@ -415,15 +540,18 @@ impl PleHost {
             ids: vec![0; cap * per_token],
             named: 0,
             e: vec![0.0; cap * geo::HIDDEN],
+            nvme,
         })
     }
 
     /// The rows of `tokens` at positions `pos ..`, decoded into the first
     /// `tokens.len()` positions of `e`, and the history past them, returned:
     /// the history stays where it stands until the call's launch takes the
-    /// returned one ([`Body38::launch`]). A token the hash refuses (the
-    /// image placeholder, an id past the vocabulary), a position other than
-    /// the history's next, or a row past the table is refused by name.
+    /// returned one ([`Body38::launch`]). On the NVMe tier the rows come
+    /// from the reader's copy ([`PleRead::read`]), on the host from the
+    /// mapping. A token the hash refuses (the image placeholder, an id past
+    /// the vocabulary), a position other than the history's next, or a row
+    /// past the table is refused by name.
     fn fill(&mut self, pos: u32, tokens: &[u32]) -> Result<History, GpuError> {
         let n = tokens.len();
         let per_token = geo::HIDDEN / self.width;
@@ -443,17 +571,71 @@ impl PleHost {
                 format!("PLE row {r} past the table's {} rows", self.rows),
             ));
         }
-        let data = self
-            .file
-            .shard(self.shard)
-            .ok_or(GpuError::state(WHAT, "the PLE table's shard"))?
-            .data(&self.info)?;
-        for (j, &r) in ids.iter().enumerate() {
-            let src = &data[r as usize * self.row_bytes..][..self.row_bytes];
-            let out = &mut self.e[j * self.width..][..self.width];
-            dequant_row(GgmlType::IQ4_NL, src, out).map_err(model::ModelError::from)?;
+        let (ids, rb) = (&self.ids[..self.named], self.row_bytes);
+        match &mut self.nvme {
+            None => {
+                let data = self
+                    .file
+                    .shard(self.shard)
+                    .ok_or(GpuError::state(WHAT, "the PLE table's shard"))?
+                    .data(&self.info)?;
+                let rows = ids.iter().map(|&r| &data[r as usize * rb..][..rb]);
+                ple_decode(&mut self.e, self.width, rows)?;
+            }
+            Some(read) => {
+                read.read(pos, n, ids)?;
+                let filled = read.rows.filled();
+                if filled.len() != ids.len() * rb {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "the PLE reader copied {} B for {} rows of {rb} B",
+                            filled.len(),
+                            ids.len()
+                        ),
+                    ));
+                }
+                ple_decode(&mut self.e, self.width, filled.chunks_exact(rb))?;
+            }
         }
         Ok(hist)
+    }
+
+    /// Read a Gemm call's ubatches ahead: `tokens` at `pos`, cut into
+    /// ubatches of at most `rows` ([`ubatch_cut`], the cut the call runs),
+    /// each one's row ids computed now from a clone of the history walked
+    /// as the fills will walk it. The first ubatch's fill reads its own
+    /// rows, the call's one exposed read; each fill then hands the helper
+    /// the next ubatch's ([`PleRead::read`]). On the host nothing is read
+    /// ahead: the fills decode pages the load populated. A call whose rows
+    /// the hash refuses reads nothing ahead, and its first fill refuses it
+    /// by name.
+    fn prompt_start(&mut self, pos: u32, tokens: &[u32], rows: usize) -> Result<(), GpuError> {
+        let Some(read) = &mut self.nvme else {
+            return Ok(());
+        };
+        read.drain()?;
+        read.ahead.clear();
+        let per_token = geo::HIDDEN / self.width;
+        let mut hist = self.hist.clone();
+        let mut at = 0usize;
+        for m in ubatch_cut(tokens.len(), rows) {
+            let Some(p) = u32::try_from(at).ok().and_then(|a| pos.checked_add(a)) else {
+                break;
+            };
+            let mut ids = vec![0u32; m * per_token];
+            if self
+                .hash
+                .ple_rows_into(&mut hist, u64::from(p), &tokens[at..at + m], &mut ids)
+                .is_err()
+            {
+                read.ahead.clear();
+                break;
+            }
+            read.ahead.push_back(PleBatch { pos: p, n: m, ids });
+            at += m;
+        }
+        Ok(())
     }
 
     /// The history a verify's `fill` moved past its rows, moved instead
@@ -475,8 +657,12 @@ impl PleHost {
         Ok(())
     }
 
-    /// A new sequence's history.
+    /// A new sequence's history; on the NVMe tier, nothing read ahead.
     fn restart(&mut self) -> Result<(), GpuError> {
+        if let Some(read) = &mut self.nvme {
+            read.drain()?;
+            read.ahead.clear();
+        }
         self.hist = self
             .hash
             .new_history()
@@ -1216,7 +1402,13 @@ impl Body38 {
             let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
             hybrid.check_tier_reserves(plan.machine, &cards)?;
         }
-        let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols)?;
+        // The PLE table's tier is the plan's: the host set built above holds
+        // it on the host; on the NVMe tier its reader reads it.
+        let ple_tier = plan
+            .row_tier()
+            .map_err(|e| GpuError::plan(WHAT, e))?
+            .ok_or(GpuError::state(WHAT, "a plan that places the PLE table"))?;
+        let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols, ple_tier)?;
         let lens = stores
             .iter()
             .filter(|s| matches!(s, Store38::Rec { .. }))
@@ -2910,6 +3102,14 @@ impl GpuModel<Body38> {
             }
             Prompt38::Gemm => {
                 let rows = self.body(WHAT_P)?.wide.rows;
+                // The call's PLE rows are read ahead: the first ubatch's fill
+                // reads its own, each later one's runs under the ubatch
+                // before it ([`PleHost::prompt_start`]).
+                let pos0 = self.pos();
+                {
+                    let (_, _, body) = self.body_parts(WHAT_P)?;
+                    body.ple.prompt_start(pos0, tokens, rows)?;
+                }
                 let (mut next, mut at) = (None, 0);
                 for m in ubatch_cut(tokens.len(), rows) {
                     let chunk = &tokens[at..at + m];
