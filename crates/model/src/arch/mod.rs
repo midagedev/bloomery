@@ -10,6 +10,7 @@ use crate::placement::{ModelTensors, PlacementError};
 use gguf::{Gguf, Split, Value};
 use models::{ChatSpec, ModelSpec, ReasoningFormat, ToolFormat};
 
+mod classify;
 pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;

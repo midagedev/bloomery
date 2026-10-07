@@ -11,6 +11,7 @@ use gguf::Split;
 
 use super::hparams::Hparams;
 use super::names;
+use crate::arch::classify::{Counts, classify_with};
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
 
 /// How a rule matches the part of a name after `blk.N.`.
@@ -78,38 +79,19 @@ fn role(name: &str) -> Option<(Role, Option<usize>)> {
 /// Every tensor of `split` with its role and header facts, and the model's
 /// layer and expert counts from `hp`, the file's [`Hparams`].
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    let mut tensors = Vec::with_capacity(split.tensor_count());
-    let mut unclassified = Vec::new();
-    for (shard, t) in split.iter_tensors() {
-        let Some((role, layer)) = role(&t.name) else {
-            unclassified.push(t.name.clone());
-            continue;
-        };
-        tensors.push(ModelTensor {
-            name: t.name.clone(),
-            shard,
-            layer,
-            role,
-            ty: t.ty,
-            dims: t.dims.clone(),
-            file_bytes: t.nbytes,
-            gathered_rows: None,
-        });
-    }
-    if !unclassified.is_empty() {
-        return Err(PlacementError::Unclassified {
-            names: unclassified,
-        });
-    }
-    for t in &mut tensors {
+    let mut model = classify_with(
+        split,
+        role,
+        Counts {
+            layers: hp.n_layer,
+            experts: hp.experts.n_expert as u64,
+            experts_used: hp.experts.n_used as u64,
+        },
+    )?;
+    for t in &mut model.tensors {
         t.gathered_rows = gathered_rows(split, t)?;
     }
-    Ok(ModelTensors {
-        tensors,
-        layers: hp.n_layer,
-        experts: hp.experts.n_expert as u64,
-        experts_used: hp.experts.n_used as u64,
-    })
+    Ok(model)
 }
 
 /// Rows one token reads from a row-gathered table: one row of the token

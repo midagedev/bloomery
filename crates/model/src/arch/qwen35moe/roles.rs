@@ -9,7 +9,8 @@
 use gguf::Split;
 
 use super::hparams::{Hparams, Variant};
-use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
+use crate::arch::classify::{Counts, classify_with};
+use crate::placement::{ModelTensors, PlacementError, Role};
 
 /// The role of a stem qwen35moe and qwen35 share: the GDN layers' mixer, the
 /// GQA layers' mixer, the post-attention (pre-FFN) norm.
@@ -142,42 +143,27 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
 
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
+    // The per-layer embedding table reads a row per PLE head, a count only
+    // qwen4exp's header carries (`Ple::heads`); the trunk's token embedding
+    // reads one.
     let ple_rows = hp
         .exp
         .as_ref()
         .and_then(|e| e.ple)
         .map(|p| p.heads() as u64);
-    let mut tensors = Vec::with_capacity(split.tensor_count());
-    let mut unclassified = Vec::new();
-    for (shard, t) in split.iter_tensors() {
-        let Some((role, layer)) = role(&t.name, hp) else {
-            unclassified.push(t.name.clone());
-            continue;
-        };
-        tensors.push(ModelTensor {
-            name: t.name.clone(),
-            shard,
-            layer,
-            role,
-            ty: t.ty,
-            dims: t.dims.clone(),
-            file_bytes: t.nbytes,
-            gathered_rows: match role {
-                Role::TokenEmbedding => Some(1),
-                Role::EngramTable => ple_rows,
-                _ => None,
-            },
-        });
+    let mut model = classify_with(
+        split,
+        |name| role(name, hp),
+        Counts {
+            layers: hp.n_layer,
+            experts: hp.n_expert as u64,
+            experts_used: hp.n_used as u64,
+        },
+    )?;
+    for t in &mut model.tensors {
+        if t.role == Role::EngramTable {
+            t.gathered_rows = ple_rows;
+        }
     }
-    if !unclassified.is_empty() {
-        return Err(PlacementError::Unclassified {
-            names: unclassified,
-        });
-    }
-    Ok(ModelTensors {
-        tensors,
-        layers: hp.n_layer,
-        experts: hp.n_expert as u64,
-        experts_used: hp.n_used as u64,
-    })
+    Ok(model)
 }
