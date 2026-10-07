@@ -76,17 +76,17 @@ const KV: &[&str] = &[
     "kv 8x320 values: 1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
 ];
 
-// PIN(2026-10-07): the coverage check's list (feature: layers). No program runs a mimo2 file yet,
+// PIN(2026-10-08): the coverage check's list (feature: layers). No program runs a mimo2 file yet,
 // so a need is an item unless a row of any program covers it: the dense block (Body35's dense
-// path, 16384 a multiple of its 256) and the Q8_0/F32 tensors other programs' pins read are not
-// items; the flash at head 192 with the value head split from it, the rope without a QK norm, the
-// sigmoid router at a width no body is built for (the 288 of GLM's) and the mxfp4 stacks are. The
-// flash needs name the value head, the window, the sinks and the value scale, which no flash row runs.
+// path, 16384 a multiple of its 256), the Q8_0/F32 tensors other programs' pins read and the
+// sigmoid router (the BiasedSigmoid body's 256-wide row beside GLM's 288) are not items; the flash
+// at head 192 with the value head split from it, the rope without a QK norm and the mxfp4 stacks
+// are. The flash needs name the value head, the window, the sinks and the value scale, which no
+// flash row runs.
 const COVERAGE: &[&str] = &[
     "GQA flash, head 192, value 128, group 16, value scale: 0,5,11,17,23,29,35,41,47",
     "GQA flash, head 192, value 128, group 8, window 128, sinks, value scale: 1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
     "rope without a QK norm: head 192, NeoX, 64 of 192 dims: 0-47",
-    "router: sigmoid, 256 experts, top 8, with a selection bias: 1-47",
     "mxfp4 routed experts on a card: 1-47",
     "mxfp4 routed experts gate and up (the body reads q4_K): 1-47",
     "mxfp4 routed experts down (the body reads q4_K and q6_K): 1-47",
