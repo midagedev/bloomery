@@ -128,7 +128,10 @@ gguf 9 2 0
 # PIN(2026-10-08): gpu 1582 -> 1606 blocks and 171 -> 173 fns, new code, not old code relaxed: MiMo's K192/V128
 # flash (flash_gqa.rs: the seg and merge-sink bodies' plane, sink and query reads, 17 blocks and the two bodies as
 # unsafe fns) and its rope-only append (rope_neox.rs neox_append_k192, 7 blocks), each with its SAFETY line.
-gpu 1606 173 6
+# PIN(2026-10-08): gpu 1606 -> 1628 blocks and 173 -> 178 fns, moved code, not new code and not old code relaxed:
+# route_body.rs takes the router bodies from gpu-deepseek41's router.rs (router_body, scores_body, pick_body and the
+# publish_n and select_n stages they call): 22 blocks and 5 unsafe fns, each with its SAFETY line.
+gpu 1628 178 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -136,7 +139,10 @@ gpu 1606 173 6
 # chain/ffn/batch.rs 57 -> 41 blocks, 5 -> 6 fns: the bucket pass moved to the gpu crate, the gather and the tile
 # prologue taken from it, and Q3GateUpTiles::run and Q3Planes::copy (the two methods its tile cores call) in place
 # of gather_at; each with its SAFETY line.
-gpu-deepseek41 448 53 0
+# PIN(2026-10-08): gpu-deepseek41 448 -> 426 blocks and 53 -> 48 fns, the move above: the router bodies went to the
+# gpu crate's route_body.rs, 22 blocks and 5 unsafe fns. The mimo2 instance is the glm5next macro's second use and
+# adds no unsafe line.
+gpu-deepseek41 426 48 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.

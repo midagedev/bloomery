@@ -70,6 +70,7 @@ pub mod q8f32;
 pub mod qsa;
 pub mod rope_neox;
 pub mod rope_table;
+pub mod route_body;
 pub mod route_core;
 pub mod router;
 pub mod site;
