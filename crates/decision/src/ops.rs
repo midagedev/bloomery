@@ -158,7 +158,10 @@ pub(crate) fn blocked_sum(v: &[f32]) -> f32 {
     v.chunks(SUM_BLOCK).map(|c| c.iter().sum::<f32>()).sum()
 }
 
-/// LayerNorm of every `width`-wide row of `x` in place (eps 1e-5, the biased variance), rows split
+/// The epsilon of every LayerNorm of the head (torch's default).
+pub const LAYER_NORM_EPS: f32 = 1e-5;
+
+/// LayerNorm of every `width`-wide row of `x` in place ([`LAYER_NORM_EPS`], the biased variance), rows split
 /// over threads when there are many.
 pub(crate) fn layer_norm(x: &mut [f32], width: usize, w: &[f32], b: &[f32]) {
     let t = threads().min((x.len() / THREAD_NORM).max(1));
@@ -188,7 +191,7 @@ fn layer_norm_rows(x: &mut [f32], width: usize, w: &[f32], b: &[f32]) {
         for v in t {
             var += (v - mean) * (v - mean);
         }
-        let rstd = 1.0 / (var * inv + 1e-5).sqrt();
+        let rstd = 1.0 / (var * inv + LAYER_NORM_EPS).sqrt();
         for ((v, w), b) in row.iter_mut().zip(w).zip(b) {
             *v = (*v - mean) * rstd * w + b;
         }

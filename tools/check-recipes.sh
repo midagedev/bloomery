@@ -344,6 +344,7 @@ blk_pytools() {
     "tools/ref/ds41pp.py self-test"
     "tools/ref/gguf-ranges.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
+    "tools/ref/lev_ref.py --self-test"
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"

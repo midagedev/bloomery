@@ -52,6 +52,20 @@ fn err<T>(msg: impl Into<String>) -> Result<T, TemplateError> {
     Err(TemplateError(msg.into()))
 }
 
+/// How `tojson` writes a float. The default is Python's, which is the HF environment's and jinja2's.
+/// A template written for llama.cpp's own jinja runtime (the decision models' `systemone`
+/// templates) is rendered the way that runtime renders it, which writes a float as a C++ `ostream`
+/// does a double.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Floats {
+    /// `float.__repr__`: the shortest digits that read back, `1250.0`.
+    #[default]
+    Python,
+    /// The `ostream` default for a double, six significant digits (`%g`): `1250`, `0.1`,
+    /// `1.23457e+06`.
+    Cpp,
+}
+
 /// A parsed chat template.
 pub struct ChatTemplate {
     source: String,
@@ -87,8 +101,17 @@ impl ChatTemplate {
         &self.source
     }
 
-    /// Renders with `vars` as the global context.
+    /// Renders with `vars` as the global context, floats as Python writes them.
     pub fn render(&self, vars: &Map<String, Value>) -> Result<String, TemplateError> {
+        self.render_with(vars, Floats::Python)
+    }
+
+    /// Renders with `vars` as the global context and `tojson` writing floats as `floats` says.
+    pub fn render_with(
+        &self,
+        vars: &Map<String, Value>,
+        floats: Floats,
+    ) -> Result<String, TemplateError> {
         let globals: HashMap<String, V> = vars
             .iter()
             .map(|(k, v)| (k.clone(), V::J(v.clone())))
@@ -97,6 +120,7 @@ impl ChatTemplate {
             frames: vec![globals],
             floor: 0,
             calls: 0,
+            floats,
             out: String::new(),
         };
         r.nodes(&self.body)?;
@@ -1237,6 +1261,36 @@ fn py_float(f: f64, out: &mut String) {
     }
 }
 
+/// A float as a C++ `ostream` writes a double by default: `%g` with six significant digits, the
+/// shorter of positional and scientific notation, trailing zeros dropped (`1250`, `0.1`, `100000`,
+/// `1.23457e+06`, `1e-05`).
+fn cpp_float(f: f64, out: &mut String) {
+    if f.is_sign_negative() {
+        out.push('-');
+    }
+    let f = f.abs();
+    if f == 0.0 {
+        out.push('0');
+        return;
+    }
+    // `%e` at five decimals names the exponent after rounding to six digits, which picks the form.
+    let sci = format!("{f:.5e}");
+    let (mantissa, exp) = sci.split_once('e').expect("{:e} prints an exponent");
+    let exp: i32 = exp.parse().expect("{:e} prints an integer exponent");
+    if (-4..6).contains(&exp) {
+        let decimals = usize::try_from(5 - exp).expect("exp is below 6");
+        let fixed = format!("{f:.decimals$}");
+        out.push_str(if fixed.contains('.') {
+            fixed.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            &fixed
+        });
+    } else {
+        out.push_str(mantissa.trim_end_matches('0').trim_end_matches('.'));
+        let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
+    }
+}
+
 /// Python's `str.isprintable` past ASCII. The standard library's debug
 /// escape leaves a character alone exactly when it is printable by that
 /// definition (general category not Other or Separator), except these
@@ -1308,6 +1362,7 @@ fn py_hex_escape(c: char, out: &mut String) {
 
 /// `json.dumps` options, as the HF environment's `tojson` passes them.
 struct JsonStyle {
+    floats: Floats,
     ensure_ascii: bool,
     /// The text of one indent level; `None` is the one-line form.
     indent: Option<String>,
@@ -1320,6 +1375,7 @@ impl JsonStyle {
     /// `json.dumps`'s defaults as `tojson` sets them (`ensure_ascii` off).
     fn plain() -> Self {
         JsonStyle {
+            floats: Floats::Python,
             ensure_ascii: false,
             indent: None,
             item_sep: ", ".into(),
@@ -1347,7 +1403,10 @@ impl JsonStyle {
         match v {
             Value::Null => s.push_str("null"),
             Value::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
-            Value::Number(n) => py_number(n, s),
+            Value::Number(n) => match (self.floats, n.is_f64()) {
+                (Floats::Cpp, true) => cpp_float(n.as_f64().unwrap_or(0.0), s),
+                _ => py_number(n, s),
+            },
             Value::String(x) => self.string(x, s),
             Value::Array(a) if a.is_empty() => s.push_str("[]"),
             Value::Object(o) if o.is_empty() => s.push_str("{}"),
@@ -1413,7 +1472,11 @@ impl JsonStyle {
 
 /// `tojson`'s arguments: `ensure_ascii`, `indent`, `separators`, `sort_keys`,
 /// in that order or by name.
-fn tojson_style(args: &[V], kwargs: &[(&str, V)]) -> Result<JsonStyle, TemplateError> {
+fn tojson_style(
+    args: &[V],
+    kwargs: &[(&str, V)],
+    floats: Floats,
+) -> Result<JsonStyle, TemplateError> {
     const NAMES: [&str; 4] = ["ensure_ascii", "indent", "separators", "sort_keys"];
     if args.len() > NAMES.len() {
         return err("tojson takes at most 4 positional arguments");
@@ -1433,6 +1496,7 @@ fn tojson_style(args: &[V], kwargs: &[(&str, V)]) -> Result<JsonStyle, TemplateE
     }
     let [ascii, indent, separators, sort_keys] = given;
     let mut style = JsonStyle::plain();
+    style.floats = floats;
     style.ensure_ascii = ascii.is_some_and(V::truthy);
     style.sort_keys = sort_keys.is_some_and(V::truthy);
     style.indent = match indent {
@@ -1490,6 +1554,8 @@ struct Renderer {
     floor: usize,
     /// Macro calls in progress.
     calls: usize,
+    /// How `tojson` writes a float.
+    floats: Floats,
     out: String,
 }
 
@@ -1664,7 +1730,7 @@ impl Renderer {
                     .map(|a| self.eval(a))
                     .collect::<Result<_, _>>()?;
                 let kwargs = self.eval_kwargs(kwargs)?;
-                filter(v, name, &args, &kwargs)?
+                filter(v, name, &args, &kwargs, self.floats)?
             }
             Expr::Test(x, name, negate) => {
                 let v = self.eval(x)?;
@@ -2251,9 +2317,15 @@ fn split_whitespace(s: &str, max: Option<usize>) -> Vec<String> {
     out
 }
 
-fn filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+fn filter(
+    v: V,
+    name: &str,
+    args: &[V],
+    kwargs: &[(&str, V)],
+    floats: Floats,
+) -> Result<V, TemplateError> {
     if name == "tojson" {
-        let style = tojson_style(args, kwargs)?;
+        let style = tojson_style(args, kwargs, floats)?;
         return Ok(V::J(Value::String(
             style.dumps(&v.into_json(JsonUse::ToJson)?),
         )));
@@ -2630,7 +2702,7 @@ mod tests {
         }
     }
 
-    const V41: &str = include_str!("../tests/fixtures/v41-chat-template.jinja");
+    const V41: &str = include_str!("../../serve/tests/fixtures/v41-chat-template.jinja");
     const BOS: &str = "<｜begin▁of▁sentence｜>";
 
     fn v41(vars: Value) -> String {
@@ -3453,5 +3525,54 @@ mod tests {
             bad.len(),
             bad.join("\n")
         );
+    }
+
+    /// `tojson` writes a float as Python does by default and as llama.cpp's jinja runtime does
+    /// under [`Floats::Cpp`] (a C++ `ostream`'s double: C's `printf("%g")`); an integer, a string
+    /// and the layout around the float are the same in both. Each Cpp text is `'%g' % x` in
+    /// CPython, each Python text its `repr(x)`.
+    #[test]
+    fn tojson_writes_a_float_as_either_runtime_does() {
+        let t = ChatTemplate::parse("{{ x | tojson }}").expect("parses");
+        let one = |x: Value, floats: Floats| {
+            let Value::Object(m) = json!({ "x": x }) else {
+                unreachable!()
+            };
+            t.render_with(&m, floats).expect("renders")
+        };
+        for (f, cpp, py) in [
+            (1250.0, "1250", "1250.0"),
+            (0.1, "0.1", "0.1"),
+            (1_234_567.0, "1.23457e+06", "1234567.0"),
+            (100_000.0, "100000", "100000.0"),
+            (999_999.5, "1e+06", "999999.5"),
+            (1e-5, "1e-05", "1e-05"),
+            (0.0001, "0.0001", "0.0001"),
+            (1.234_567_89, "1.23457", "1.23456789"),
+            (-2.5, "-2.5", "-2.5"),
+            (1e16, "1e+16", "1e+16"),
+            (123_456.7, "123457", "123456.7"),
+            (0.0, "0", "0.0"),
+            (-0.0, "-0", "-0.0"),
+            (2.5e-7, "2.5e-07", "2.5e-07"),
+            (99_999.95, "99999.9", "99999.95"),
+        ] {
+            assert_eq!(one(json!(f), Floats::Cpp), cpp, "{f:e} as C++");
+            assert_eq!(one(json!(f), Floats::Python), py, "{f:e} as Python");
+        }
+        let mixed = json!({"total": 1250.0, "n": 3, "s": "1250.0", "l": [0.5, 2]});
+        assert_eq!(
+            one(mixed.clone(), Floats::Cpp),
+            r#"{"total": 1250, "n": 3, "s": "1250.0", "l": [0.5, 2]}"#
+        );
+        assert_eq!(
+            one(mixed, Floats::Python),
+            r#"{"total": 1250.0, "n": 3, "s": "1250.0", "l": [0.5, 2]}"#
+        );
+        // `render` is Python's.
+        let Value::Object(m) = json!({ "x": 1250.0 }) else {
+            unreachable!()
+        };
+        assert_eq!(t.render(&m).expect("renders"), "1250.0");
     }
 }

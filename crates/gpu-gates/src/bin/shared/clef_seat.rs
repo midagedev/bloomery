@@ -7,7 +7,6 @@
 //! encoding past the seat's context a 400 by name, a backbone or head
 //! failure a 500. Each request's stages go to stderr on one line.
 
-use std::path::Path;
 use std::time::Instant;
 
 use bloomery_gpu_gates::GateError;
@@ -18,15 +17,21 @@ use decision::head::ClefHead;
 use decision::render::dumps;
 use decision::request::Request;
 use decision::rows::output_rows;
-use serve::decide::{DecideError, Decided};
+use gguf::Split;
+use serve::decide::{DecideError, Decided, HeadSource};
 
 use crate::serve_seats::decide::{Backbone, Decision};
 
-/// The release's head at `head` with its config at `config`.
-pub fn open(head: &Path, config: &Path) -> Result<Box<dyn Decision>, GateError> {
-    Ok(Box::new(Clef {
-        head: ClefHead::open(head, Some(config))?,
-    }))
+/// The head `from` names: the release's head file with its config, or the
+/// decision tensors of a model file in llama.cpp's Clef layout.
+pub fn open(from: HeadSource<'_>) -> Result<Box<dyn Decision>, GateError> {
+    let head = match from {
+        HeadSource::Files { head, config } => ClefHead::open(head, Some(config))?,
+        HeadSource::InFile(model) => ClefHead::from_gguf(
+            &Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?,
+        )?,
+    };
+    Ok(Box::new(Clef { head }))
 }
 
 /// Whether a decision crate error is the request's (a 400) or the engine's

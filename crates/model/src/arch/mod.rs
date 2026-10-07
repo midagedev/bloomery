@@ -30,7 +30,8 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
     Ok(match split.architecture() {
         Some("deepseek41" | DEEPSEEK4) => deepseek41::spec::read(split)?,
         Some("qwen3moe") => qwen3moe::spec::read(split)?,
-        Some("qwen35moe" | "qwen35" | "qwen4exp") => qwen35moe::spec::read(split)?,
+        Some("qwen35moe" | "qwen4exp") => qwen35moe::spec::read(split)?,
+        Some(a) if is_qwen35_body(a) => qwen35moe::spec::read(split)?,
         Some("glm5next") => glm5next::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
@@ -79,18 +80,33 @@ pub fn deepseek41_model(split: &Split) -> Result<deepseek41::hparams::Model, Pla
     }
 }
 
+/// The `general.architecture` strings whose body is the Qwen3.5 dense trunk
+/// ([`qwen35moe::hparams::Variant::Qwen35`]): `qwen35`, and `clef`, llama.cpp's
+/// layout of the same trunk with a decision head's tensors beside it (the head
+/// is read by `crates/decision`, never by the body). The metadata keys of the
+/// body are read under the file's own architecture string.
+pub const QWEN35_BODY: &[&str] = &["qwen35", "clef"];
+
+/// Whether a file of architecture `arch` has the Qwen3.5 dense body
+/// ([`QWEN35_BODY`]).
+#[must_use]
+pub fn is_qwen35_body(arch: &str) -> bool {
+    QWEN35_BODY.contains(&arch)
+}
+
 /// Which of the [`qwen35moe`] module's variants `split` holds, by its
 /// `general.architecture`; any other string is an error naming it.
 pub fn qwen35moe_variant(split: &Split) -> Result<qwen35moe::hparams::Variant, PlacementError> {
     use qwen35moe::hparams::Variant;
     match split.architecture() {
         Some("qwen35moe") => Ok(Variant::Qwen35Moe),
-        Some("qwen35") => Ok(Variant::Qwen35),
+        Some(a) if is_qwen35_body(a) => Ok(Variant::Qwen35),
         Some("qwen4exp") => Ok(Variant::Qwen4Exp),
         other => Err(PlacementError::Metadata {
             key: "general.architecture".to_string(),
             detail: format!(
-                "is {:?}; the qwen35moe module reads qwen35moe, qwen35 and qwen4exp",
+                "is {:?}; the qwen35moe module reads qwen35moe, qwen4exp and the Qwen3.5 dense \
+                 bodies {QWEN35_BODY:?}",
                 other.unwrap_or("<missing>")
             ),
         }),

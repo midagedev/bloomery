@@ -1358,4 +1358,71 @@ pub(super) mod tests {
             "{err}"
         );
     }
+
+    /// llama.cpp's Clef layout (`clef`) is the Qwen3.5 dense body: the same
+    /// description read under the file's own key prefix, the decision head's
+    /// tensors beside the trunk's carried and never loaded.
+    #[test]
+    fn a_clef_header_reads_as_the_qwen35_body_and_its_head_is_unused() {
+        let mut t = qwen35_tensors();
+        let head = [
+            "dec.blk.0.cross_attn_q.weight",
+            "dec.blk.2.attn_norm.bias",
+            "decision.proj_memory.weight",
+            "decision.scales",
+            "token_types.weight",
+        ];
+        t.extend(head.iter().map(|n| ((*n).to_string(), vec![1])));
+        let hp = read("clef-ok", "clef", &qwen35_keys(), &t).expect("the header reads");
+        assert_eq!(hp.variant, Variant::Qwen35);
+        assert_eq!(hp.ff, Some(48));
+        let path = header_shaped(
+            "clef-spec",
+            "clef",
+            &qwen35_keys(),
+            &[("tokenizer.ggml.pre", V::Str("qwen35"))],
+            &t,
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = crate::arch::spec(&split);
+        let _ = std::fs::remove_file(&path);
+        let read = read.expect("the description reads");
+        assert_eq!(read.spec.arch, models::Arch::Qwen35);
+        for n in head {
+            let row = read.tensors.tensors.iter().find(|r| r.name == n).expect(n);
+            assert_eq!(
+                (row.role, row.layer),
+                (crate::placement::Role::Unused, None),
+                "{n}"
+            );
+        }
+        let unused = read
+            .tensors
+            .tensors
+            .iter()
+            .filter(|r| r.role == crate::placement::Role::Unused)
+            .count();
+        assert_eq!(unused, head.len());
+    }
+
+    /// A head tensor the table does not name is still a refusal by name, and a
+    /// file of another architecture string is not the body.
+    #[test]
+    fn a_stray_head_tensor_and_another_architecture_are_refused() {
+        let mut t = qwen35_tensors();
+        t.push(("decoder.blk.0.attn_q.weight".to_string(), vec![1]));
+        let path = header_shaped("clef-stray", "clef", &qwen35_keys(), &[], &t);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = crate::arch::spec(&split)
+            .expect_err("a tensor no table holds")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("1 tensors have no role: decoder.blk.0.attn_q.weight"),
+            "{err}"
+        );
+        let err =
+            read("clef-other", "clef2", &qwen35_keys(), &qwen35_tensors()).expect_err("refused");
+        assert!(err.contains("clef2") && err.contains("\"clef\""), "{err}");
+    }
 }

@@ -54,7 +54,7 @@ fn num(x: f64) -> Json {
 
 /// A choice's confidence over its options' probabilities `p`: `(p_max − u) / (1 − u)` clamped at
 /// 0, `u = 1 / n`; one option is certain.
-fn confidence_choice(p: &[f64]) -> f64 {
+pub(crate) fn confidence_choice(p: &[f64]) -> f64 {
     if p.len() < 2 {
         return 1.0;
     }
@@ -66,7 +66,7 @@ fn confidence_choice(p: &[f64]) -> f64 {
 /// A score's confidence over its levels' probabilities `p`: one less the mean distance to the first
 /// most probable level over that of the uniform distribution to the middle level, clamped at 0; one
 /// level is certain.
-fn confidence_score(p: &[f64]) -> f64 {
+pub(crate) fn confidence_score(p: &[f64]) -> f64 {
     let n = p.len();
     if n < 2 {
         return 1.0;
@@ -83,6 +83,69 @@ fn confidence_score(p: &[f64]) -> f64 {
         dist_uniform += (i as f64 - (n - 1) as f64 / 2.0).abs() / n as f64;
     }
     (1.0 - dist / dist_uniform).max(0.0)
+}
+
+/// llama.cpp's server's probabilities of a question asked in `variants` (`format_answer`): each
+/// variant's scores through a softmax at `temperature` in f64 (the f32 difference to the variant's
+/// largest score, divided by the temperature), the variants averaged, the second one in the reverse
+/// order of the first (it showed the options reversed). A score that is not finite is refused by
+/// name, where llama.cpp's would be NaN.
+pub fn softmax_averaged(variants: &[Vec<f32>], temperature: f32) -> Result<Vec<f64>, Error> {
+    let n = variants.first().map_or(0, Vec::len);
+    if n == 0 {
+        return Err(Error::Logits("no scores to answer from".into()));
+    }
+    let mut probs = vec![0.0f64; n];
+    for (v, scores) in variants.iter().enumerate() {
+        if scores.len() != n {
+            return Err(Error::Logits(format!(
+                "variant {v} has {} scores, variant 0 has {n}",
+                scores.len()
+            )));
+        }
+        if scores.iter().any(|x| !x.is_finite()) {
+            return Err(Error::Logits(format!(
+                "variant {v} has a score that is not finite: the model could not evaluate the decision"
+            )));
+        }
+        let top = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f64> = scores
+            .iter()
+            .map(|&x| (f64::from(x - top) / f64::from(temperature)).exp())
+            .collect();
+        let mut sum = 0.0f64;
+        for e in &exps {
+            sum += e;
+        }
+        for (i, e) in exps.iter().enumerate() {
+            let at = if v == 0 { i } else { n - 1 - i };
+            probs[at] += e / sum / variants.len() as f64;
+        }
+    }
+    Ok(probs)
+}
+
+/// A noul read on `probs.len()` ratings, 0 certainly no to the last certainly yes: the expected
+/// rating over the scale, `Σ pᵢ · i / (n − 1)`, summed in llama.cpp's order.
+#[must_use]
+pub fn expected_rating(probs: &[f64]) -> f64 {
+    let top = probs.len().saturating_sub(1) as f64;
+    let mut expected = 0.0f64;
+    for (i, p) in probs.iter().enumerate() {
+        expected += p * i as f64 / top;
+    }
+    expected
+}
+
+/// A score's expected level, `Σ i · pᵢ`, summed in llama.cpp's order (a plain left-to-right sum, not
+/// Python's `sum`).
+#[must_use]
+pub fn expected_level(probs: &[f64]) -> f64 {
+    let mut expected = 0.0f64;
+    for (i, p) in probs.iter().enumerate() {
+        expected += i as f64 * p;
+    }
+    expected
 }
 
 /// The response body for `req`, encoded as `enc`, with `logits` from the head, answered by the

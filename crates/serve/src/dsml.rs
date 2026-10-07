@@ -25,13 +25,13 @@
 //! Every decision depends on the text only, never on how it was cut into pieces,
 //! so a stream and a whole response parse to the same message.
 
+use jinja::ChatTemplate;
 use serde_json::{Map, json};
 
 use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
 use crate::hermes::{self, HermesError, HermesScan};
 use crate::qwenxml::{self, ParamKinds, QwenScan, QwenXmlError};
 use crate::reasoning::{ReasoningFormat, Split, THINK_CLOSE, ThinkSplit, partial_suffix};
-use crate::template::ChatTemplate;
 
 /// The template's `dsml_token`.
 pub const DSML: &str = "｜DSML｜";

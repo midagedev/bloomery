@@ -20,6 +20,8 @@ workspace = true
 # The HTTP layer is std::net on purpose: one slot, one engine mutex, and SSE needs a flush per
 # event. JSON is its only third-party need.
 bloomery-gguf = { path = "../gguf" }
+# The chat-template engine: `ChatTemplate` and `TemplateError` are the jinja crate's, re-exported here.
+bloomery-jinja = { path = "../jinja" }
 # The media part: the image decoders and a model's MediaModel (data plus one prepare) are the vision
 # crate's; an image's cache key is the sha256 of its file bytes.
 bloomery-vision = { path = "../vision" }

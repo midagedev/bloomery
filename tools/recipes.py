@@ -6106,7 +6106,7 @@ def self_test() -> int:
     dspark = sel("crates/gpu-gates/src/bin/shared/ds41_dspark.rs")
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-glm5next-serve",
-                      "gate-gpu-qwen3-serve", "gate-ptx-spill"},
+                      "gate-gpu-lev-serve", "gate-gpu-qwen3-serve", "gate-ptx-spill"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
     expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,
@@ -6315,7 +6315,7 @@ def self_test() -> int:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-decision", "bloomery-hf", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")

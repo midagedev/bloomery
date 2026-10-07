@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
-description = "A decision model's request encoder and joint schema head (Clef's), on the host in f32"
+description = "The decision models' request encoders, heads and answers on the host: Clef's joint schema head in f32, and the label readout of lev"
 
 [lib]
 name = "decision"
@@ -22,6 +22,11 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+bloomery-jinja = { path = "../jinja" }
 bloomery-tokenizer = { path = "../tokenizer" }
+# The label models' prompt templates take serde_json values (the jinja crate's input). `preserve_order`
+# keeps an object's keys in the order they were built in; no other feature is wanted here (the request
+# reader in `json` is ours, for exact integers).
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 thiserror.workspace = true
 matrixmultiply.workspace = true

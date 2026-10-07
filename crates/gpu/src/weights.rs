@@ -27,6 +27,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 
+/// The lm_head tensor's name, and the token embedding that serves as it when the file ties them.
+pub const HEAD_TENSOR: &str = "output.weight";
+const EMBED_TENSOR: &str = "token_embd.weight";
+
+/// The file tensor that is `split`'s lm_head: `output.weight`, or `token_embd.weight` when the
+/// file carries no `output.weight` (tied embeddings: llama.cpp's loader falls back to the token
+/// embedding for the output: `src/models/qwen35.cpp:52`, the `output == NULL` arm). A file with
+/// neither is answered `output.weight`, which every reader then refuses by name as absent.
+#[must_use]
+pub fn head_tensor(split: &Split) -> &'static str {
+    if split.find(HEAD_TENSOR).is_none() && split.find(EMBED_TENSOR).is_some() {
+        EMBED_TENSOR
+    } else {
+        HEAD_TENSOR
+    }
+}
+
 /// One resident weight in the format its kernel loads. A new meaning gets a
 /// new variant: derived weights have their own (`Q8_0Derived`) and never
 /// travel as a file tensor.
@@ -145,6 +162,9 @@ fn held<T: cuda_core::DeviceCopy>(t: &DeviceTensor<T>) -> usize {
 /// code reads through `get` and never allocates.
 pub struct Weights {
     by_name: BTreeMap<String, DevWeight>,
+    /// The file ties its head to the token embedding ([`head_tensor`]): `output.weight` is the
+    /// resident `token_embd.weight`.
+    tied: bool,
 }
 
 impl Weights {
@@ -155,7 +175,11 @@ impl Weights {
     /// uploads them, each from its own shard. A tensor whose type has no
     /// device format is an error naming the tensor and type — never a silent
     /// skip. File tensors only: what an architecture derives from them is
-    /// filed afterwards, through `Weights::insert_derived`.
+    /// filed afterwards, through `Weights::insert_derived`. A file with the
+    /// non-block tensors and no `output.weight` ties its head to the token
+    /// embedding ([`head_tensor`]): `get("output.weight")` answers the one
+    /// resident embedding, so every reader of the head finds it by its one
+    /// name and no second copy is uploaded.
     pub fn load(
         stream: &CudaStream,
         split: &Split,
@@ -182,7 +206,8 @@ impl Weights {
                 keep.insert(t.name.as_str());
             }
         }
-        Weights::load_where(stream, split, |name| keep.contains(name))
+        let tied = globals && head_tensor(split) == EMBED_TENSOR;
+        Weights::load_named(stream, split, |name| keep.contains(name), tied)
     }
 
     /// Upload every segment `plan` puts on card `card` ([`Weights::load_rows`]
@@ -243,7 +268,18 @@ impl Weights {
     pub fn load_where(
         stream: &CudaStream,
         split: &Split,
+        keep: impl FnMut(&str) -> bool,
+    ) -> Result<Weights, GpuError> {
+        Weights::load_named(stream, split, keep, false)
+    }
+
+    /// [`Weights::load_where`], and with `tied` the token embedding is also the head
+    /// ([`Weights::get`]).
+    fn load_named(
+        stream: &CudaStream,
+        split: &Split,
         mut keep: impl FnMut(&str) -> bool,
+        tied: bool,
     ) -> Result<Weights, GpuError> {
         stream.context().bind_to_thread()?;
         let mut by_name = BTreeMap::new();
@@ -271,7 +307,7 @@ impl Weights {
             );
         }
         ring.finish(stream)?;
-        Ok(Weights { by_name })
+        Ok(Weights { by_name, tied })
     }
 
     /// File `w` as a derived weight under `name`. The `derived.` prefix keeps
@@ -550,6 +586,11 @@ impl Weights {
     /// The resident weight for `name` — a file tensor name, or the `derived.`
     /// name an architecture filed a derived weight under.
     pub fn get(&self, name: &str) -> Option<&DevWeight> {
+        let name = if self.tied && name == HEAD_TENSOR {
+            EMBED_TENSOR
+        } else {
+            name
+        };
         self.by_name.get(name)
     }
 
@@ -688,7 +729,10 @@ fn load_segments(
         }
     }
     ring.finish(stream)?;
-    Ok(Weights { by_name })
+    Ok(Weights {
+        by_name,
+        tied: false,
+    })
 }
 
 /// Upload placement segment `seg` of tensor `t`, a stack of `experts` when
@@ -1038,8 +1082,53 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::derived_slot_free;
+    use super::{HEAD_TENSOR, derived_slot_free, head_tensor};
+    use gguf::Split;
+    use gguf::write::{Layout, TensorDecl, Writer};
     use std::collections::BTreeMap;
+
+    /// A GGUF of F32 tensors of two rows of four named `names`, at `path`.
+    fn write_file(path: &std::path::Path, names: &[&str]) {
+        let decls: Vec<TensorDecl> = names
+            .iter()
+            .map(|n| TensorDecl {
+                name: (*n).to_string(),
+                dims: vec![4, 2],
+                type_id: 0,
+                nbytes: 32,
+            })
+            .collect();
+        let layout = Layout::new(&[], decls).unwrap_or_else(|e| panic!("{e}"));
+        let file =
+            std::io::BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| panic!("{e}")));
+        let mut w = Writer::new(file, layout).unwrap_or_else(|e| panic!("{e}"));
+        for n in names {
+            w.tensor(n, &[0u8; 32]).unwrap_or_else(|e| panic!("{e}"));
+        }
+        w.finish().unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The head is `output.weight` when the file has it, the token embedding
+    /// when it has no output (tied), and `output.weight` again when it has
+    /// neither, which every reader refuses by name as absent.
+    #[test]
+    fn the_head_is_the_output_else_the_tied_embedding() {
+        let dir = std::env::temp_dir().join(format!("bloomery-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let cases = [
+            (&["token_embd.weight", "output.weight"][..], HEAD_TENSOR),
+            (&["token_embd.weight"][..], "token_embd.weight"),
+            (&["output.weight"][..], HEAD_TENSOR),
+            (&["output_norm.weight"][..], HEAD_TENSOR),
+        ];
+        for (i, (names, want)) in cases.iter().enumerate() {
+            let path = dir.join(format!("{i}.gguf"));
+            write_file(&path, names);
+            let split = Split::open(&path).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(head_tensor(&split), *want, "{names:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `insert_derived`'s guard, which runs before anything is filed: a name
     /// outside the `derived.` prefix is refused even when nothing holds it,

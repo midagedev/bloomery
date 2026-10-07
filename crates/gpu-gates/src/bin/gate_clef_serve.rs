@@ -1,8 +1,10 @@
 //! `gate_clef_serve` — the decide seat of `bloomery-serve` on Clef-Flash: a
-//! `qwen35` file with the release's head, one process at a time on the card
-//! the runner pins.
+//! `qwen35` file with the release's head, and a `clef` file (llama.cpp's
+//! layout, the head inside the GGUF), one process at a time on the card the
+//! runner pins.
 //!
-//!     gate_clef_serve --model <gguf> --head <joint_head.safetensors> --dir <dir>
+//!     gate_clef_serve --model <gguf> --head <joint_head.safetensors>
+//!                     --clef-model <gguf> --dir <dir>
 //!
 //! Every server is `bloomery-serve` beside this binary with
 //! `BLOOMERY_REF_MODEL` removed from its environment (the file is named
@@ -36,9 +38,23 @@
 //!   (`--head-config` of a config no row knows), `narrow_head` (a head of
 //!   hidden width 16, written into `<dir>`, against the file's
 //!   `embedding_length`: refused before the backbone loads),
-//!   `clef_layout_gguf` (a GGUF of arch `clef`, written into `<dir>`, is
-//!   refused as llama.cpp's Clef layout, with bartowski's `--hf` line:
-//!   refused before the backbone loads).
+//!   `clef_layout_without_its_head` (a GGUF of arch `clef` and no decision
+//!   head, written into `<dir>`, is refused for it: the file carries no
+//!   head, and the refusal is before the backbone loads);
+//! - the clef layout (`--clef-model`, the same Clef-Flash quantization
+//!   bartowski publishes in llama.cpp's layout), each server alone on the
+//!   card after the `qwen35` one stopped:
+//!   `clef_layout_serves_its_head` (`-m <clef gguf>` with no `--head` prints
+//!   its listening line naming the model file as the head and the row
+//!   `clef`; `/props` names them; the first request answers every question
+//!   with `timings` last) and `clef_layout_head_is_the_release_head` (the
+//!   same server's first-request answers against `-m <clef gguf> --head
+//!   <release head>`: the one difference between the two is the head, the
+//!   file's Q8_0 matrices against the release's bf16, so every question's
+//!   chosen option is the same and every probability within
+//!   [`HEAD_DTYPE_BAND`]). The `qwen35` file's answers against the clef
+//!   file's are printed beside them as a diagnostic: the two files are
+//!   separate quantizations of the backbone.
 //!
 //! Logs per server in `<dir>/<clause>/` (`server.out`, `server.err`, the
 //! bodies).
@@ -56,34 +72,35 @@ fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_clef_serve", gate::run())
 }
 
+// The decide seat's card gates' shared helpers.
+#[cfg(all(feature = "deepseek41", feature = "clef"))]
+#[path = "shared/decide_gate.rs"]
+mod decide_gate;
+
 #[cfg(all(feature = "deepseek41", feature = "clef"))]
 mod gate {
-    use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
 
-    use bloomery_gpu_gates::serve_client::{Served, curl};
-    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_gates::serve_client::curl;
+    use bloomery_gpu_gates::{GateError, checks_failed};
     use decision::head::HeadConfig;
     use decision::safetensors::write;
     use serde_json::Value;
 
-    const USAGE: &str =
-        "usage: gate_clef_serve --model <gguf> --head <joint_head.safetensors> --dir <dir>";
+    use crate::decide_gate::{check, compare, listening, post_raw, refused, spawn, untimed, utf8};
 
-    /// How long a refused server may take to exit: it refuses before any
-    /// load of the backbone.
-    const REFUSE_WITHIN: Duration = Duration::from_secs(120);
+    const USAGE: &str = "usage: gate_clef_serve --model <gguf> --head <joint_head.safetensors> \
+                         --clef-model <gguf> --dir <dir>";
 
     struct Args {
         model: PathBuf,
         head: PathBuf,
+        clef: PathBuf,
         dir: PathBuf,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        let (mut model, mut head, mut dir) = (None, None, None);
+        let (mut model, mut head, mut clef, mut dir) = (None, None, None, None);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
@@ -92,128 +109,20 @@ mod gate {
             match flag.as_str() {
                 "--model" => model = Some(PathBuf::from(v)),
                 "--head" => head = Some(PathBuf::from(v)),
+                "--clef-model" => clef = Some(PathBuf::from(v)),
                 "--dir" => dir = Some(PathBuf::from(v)),
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        match (model, head, dir) {
-            (Some(model), Some(head), Some(dir)) => Ok(Args { model, head, dir }),
+        match (model, head, clef, dir) {
+            (Some(model), Some(head), Some(clef), Some(dir)) => Ok(Args {
+                model,
+                head,
+                clef,
+                dir,
+            }),
             _ => Err(USAGE.into()),
         }
-    }
-
-    fn check(ok: &mut bool, name: &str, pass: bool) {
-        println!("check {name}: {}", verdict(pass));
-        *ok &= pass;
-    }
-
-    fn utf8(p: &Path) -> Result<&str, GateError> {
-        Ok(p.to_str()
-            .ok_or_else(|| format!("{} is not UTF-8", p.display()))?)
-    }
-
-    /// `bloomery-serve` beside this binary with `args`, `BLOOMERY_REF_MODEL`
-    /// removed, its logs in `<dir>/<name>/`.
-    fn spawn(dir: &Path, name: &str, args: &[&str]) -> Result<(Served, PathBuf), GateError> {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d)?;
-        let mut cmd = Command::new(std::env::current_exe()?.with_file_name("bloomery-serve"));
-        cmd.env_remove("BLOOMERY_REF_MODEL");
-        Ok((Served::spawn_cmd(cmd, args, &d)?, d))
-    }
-
-    /// Whether the server of `args` exits non-zero within [`REFUSE_WITHIN`]
-    /// with every one of `want` in its stderr; a server still running then
-    /// is killed and fails the clause.
-    fn refused(dir: &Path, name: &str, args: &[&str], want: &[&str]) -> Result<bool, GateError> {
-        let (mut s, d) = spawn(dir, name, args)?;
-        let t = Instant::now();
-        let status = loop {
-            if let Some(status) = s.child.try_wait()? {
-                break Some(status);
-            }
-            if t.elapsed() > REFUSE_WITHIN {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        };
-        let err = std::fs::read_to_string(d.join("server.err"))?;
-        let pass = match status {
-            Some(st) => {
-                let named = want.iter().all(|w| err.contains(w));
-                println!("{name}: exit {st}, names {want:?}: {named}");
-                !st.success() && named
-            }
-            None => {
-                println!(
-                    "{name}: still running after {REFUSE_WITHIN:?}: {}",
-                    s.stop()?
-                );
-                false
-            }
-        };
-        if !pass {
-            println!("{name} stderr:\n{err}");
-        }
-        Ok(pass)
-    }
-
-    /// How long the server may take to load and listen, and how often its
-    /// stderr is read meanwhile.
-    const LISTEN_WITHIN: Duration = Duration::from_secs(300);
-    const LISTEN_POLL: Duration = Duration::from_millis(500);
-
-    /// The seat's `listening` record in the server's stderr, read every
-    /// [`LISTEN_POLL`] for at most [`LISTEN_WITHIN`]; a server that exits
-    /// first fails by name.
-    fn listening(s: &mut Served, err_log: &Path) -> Result<String, GateError> {
-        let t = Instant::now();
-        while t.elapsed() < LISTEN_WITHIN {
-            let text = std::fs::read_to_string(err_log).unwrap_or_default();
-            if let Some(l) = text.lines().find(|l| l.contains("listening on http://")) {
-                return Ok(l.to_owned());
-            }
-            if let Some(st) = s.child.try_wait()? {
-                return Err(format!("the server exited ({st}) before listening").into());
-            }
-            std::thread::sleep(LISTEN_POLL);
-        }
-        Err(format!("the server did not listen within {LISTEN_WITHIN:?}").into())
-    }
-
-    /// `text` POSTed to `url` as it is (curl's stdin, no re-serialization:
-    /// the request's key order is its questions' order): the status and the
-    /// body.
-    fn post_raw(url: &str, text: &str) -> Result<(u16, String), GateError> {
-        let mut c = Command::new("curl")
-            .args(["-sS", "--max-time", "600", "-w", "\n%{http_code}"])
-            .args([
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-                url,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        c.stdin
-            .take()
-            .ok_or("curl has no stdin")?
-            .write_all(text.as_bytes())?;
-        let out = c.wait_with_output()?;
-        let all = String::from_utf8(out.stdout)?;
-        let (body, code) = all
-            .rsplit_once('\n')
-            .ok_or_else(|| format!("curl {url}: no status line"))?;
-        Ok((code.trim().parse()?, body.to_owned()))
-    }
-
-    /// `body` with the `timings` object the server appends as its last key
-    /// taken out, or `None` when it has none.
-    fn untimed(body: &str) -> Option<&str> {
-        let at = body.rfind(",\"timings\":")?;
-        body.trim_end().ends_with("}}").then_some(&body[..at])
     }
 
     /// The first request of the English suite, without its `id`, as text.
@@ -237,16 +146,20 @@ mod gate {
         Ok((body, questions))
     }
 
-    /// A GGUF whose metadata names arch `clef` and holds nothing else,
-    /// written into `dir`: the refusal of llama.cpp's Clef layout reads the
-    /// header only, so no tensor is needed.
+    /// A GGUF whose metadata names arch `clef` and its `embedding_length`
+    /// and holds nothing else, written into `dir`: a clef file with no
+    /// decision head, which the seat refuses on reading its keys, so no
+    /// tensor is needed.
     fn clef_layout_file(dir: &Path) -> Result<PathBuf, GateError> {
-        let kvs = vec![(
-            gguf::GENERAL_ARCHITECTURE.to_owned(),
-            gguf::Value::String("clef".to_owned()),
-        )];
+        let kvs = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.to_owned(),
+                gguf::Value::String("clef".to_owned()),
+            ),
+            ("clef.embedding_length".to_owned(), gguf::Value::U32(16)),
+        ];
         let layout = gguf::write::Layout::new(&kvs, Vec::new())?;
-        let path = dir.join("clef-layout.gguf");
+        let path = dir.join("clef-no-head.gguf");
         let file = std::fs::File::create(&path)?;
         gguf::write::Writer::new(file, layout)?.finish()?;
         Ok(path)
@@ -317,6 +230,60 @@ mod gate {
         Ok(helps && starts)
     }
 
+    /// The band of one answer's probability between the clef file's own head (Q8_0 matrices) and
+    /// the release's (bf16): the head is the only difference between the two servers, which run one
+    /// file on one card.
+    ///
+    /// PIN(2026-10-07): 2.5e-3, the `LAYOUT_PROB_BAND` of `crates/decision/tests/clef.rs`, which
+    /// derives it from the logit band (a probability moves by at most a quarter of the difference
+    /// of two logits' moves) and measures the head alone on the eight reference requests: the worst
+    /// probability moves 2.4e-4 (`route-01`, this gate's request, the worst of them), the band is
+    /// ten times that.
+    const HEAD_DTYPE_BAND: f64 = 2.5e-3;
+
+    /// One server's first-request round: the listening line, `/props`, the first request's status
+    /// and body.
+    struct Once {
+        line: String,
+        props: Value,
+        status: u16,
+        body: String,
+    }
+
+    /// `bloomery-serve` with `args` in `<dir>/<name>/`, its `/props` and `req` posted to
+    /// `/v1/systemone`, then stopped.
+    fn serve_once(dir: &Path, name: &str, args: &[&str], req: &str) -> Result<Once, GateError> {
+        let (mut s, d) = spawn(dir, name, args)?;
+        let line = listening(&mut s, &d.join("server.err"))?;
+        println!("{line}");
+        let addr = line
+            .split_once("listening on http://")
+            .and_then(|(_, r)| r.split_whitespace().next())
+            .ok_or("no address in the listening record")?
+            .to_owned();
+        let (st, props) = curl(&format!("http://{addr}/props"), None, false)?;
+        let props: Value = serde_json::from_str(&props)?;
+        println!("{name}: /props {st} {props}");
+        let (status, body) = post_raw(&format!("http://{addr}/v1/systemone"), req)?;
+        std::fs::write(d.join("first.json"), &body)?;
+        println!("{name}: server stopped: {}", s.stop()?);
+        Ok(Once {
+            line,
+            props,
+            status,
+            body,
+        })
+    }
+
+    /// Whether the request was a 200 answering every one of `questions`, `timings` last.
+    fn whole(o: &Once, questions: &[String]) -> bool {
+        let v: Value = serde_json::from_str(&o.body).unwrap_or(Value::Null);
+        o.status == 200
+            && questions.iter().all(|q| v["answers"].get(q).is_some())
+            && untimed(&o.body).is_some()
+            && v["timings"]["prompt_n"].as_u64().is_some_and(|n| n > 0)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
         std::fs::create_dir_all(&a.dir)?;
@@ -374,18 +341,23 @@ mod gate {
             &["the head reads hidden states of width 16"],
         )?;
         check(&mut ok, "narrow_head", pass);
-        let clef = clef_layout_file(&a.dir)?;
+        // PIN(2026-10-07): the clause that held llama.cpp's Clef layout refused ("does not serve
+        // yet", with bartowski's `--hf` line) is this one. The layout is served now (bartowski's
+        // current Q5_K_M is in it, and `--hf bartowski/Cloudflare_clef-flash-GGUF` fetches it), so
+        // a file of arch `clef` is refused for what it can lack: its head. The header-only file
+        // has no `clef.decision.type`.
+        let clef_bare = clef_layout_file(&a.dir)?;
         let pass = refused(
             &a.dir,
-            "clef_layout_gguf",
-            &["-m", utf8(&clef)?, "--head", head],
+            "clef_layout_without_its_head",
+            &["-m", utf8(&clef_bare)?],
             &[
-                "llama.cpp's Clef layout",
-                "does not serve yet",
-                "--hf bartowski/Cloudflare_clef-flash-GGUF",
+                "the head in the model file",
+                "clef.decision.type is absent",
+                "the file carries no decision head",
             ],
         )?;
-        check(&mut ok, "clef_layout_gguf", pass);
+        check(&mut ok, "clef_layout_without_its_head", pass);
 
         // The seat serving its row.
         let (mut s, d) = spawn(
@@ -451,6 +423,50 @@ mod gate {
         let same = st == 200 && untimed(&first).is_some() && untimed(&first) == untimed(&again);
         check(&mut ok, "a_repeat_is_the_same_body", same);
         println!("server stopped: {}", s.stop()?);
+
+        // The clef layout: the same first request to the file alone (its own head) and to the file
+        // with the release's head. Same card, same backbone bytes, same prompt pass: the two
+        // answers differ by the head alone.
+        let clef = utf8(&a.clef)?;
+        let clef_file_name = a.clef.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let own = serve_once(&a.dir, "clef_layout", &["-m", clef, "--port", "0"], &req)?;
+        let mut serves = own.line.contains(&format!("model={clef_file_name}"))
+            && own.line.contains(&format!("head={clef_file_name}"))
+            && own.line.contains("row=clef")
+            && own.props["row"] == "clef"
+            && own.props["head"] == clef_file_name
+            && own.props["routes"] == serde_json::json!(["/v1/systemone"]);
+        let own_body = whole(&own, &questions);
+        println!(
+            "clef layout: head {} in /props, answered whole {own_body}",
+            own.props["head"]
+        );
+        serves &= own_body;
+        check(&mut ok, "clef_layout_serves_its_head", serves);
+        let given = serve_once(
+            &a.dir,
+            "clef_layout_release_head",
+            &["-m", clef, "--head", head, "--port", "0"],
+            &req,
+        )?;
+        let given_body = whole(&given, &questions);
+        let (v_own, v_given): (Value, Value) = (
+            serde_json::from_str(&own.body).unwrap_or(Value::Null),
+            serde_json::from_str(&given.body).unwrap_or(Value::Null),
+        );
+        let (tops, dp) = compare("release head vs file's head", &v_given, &v_own, &questions);
+        println!(
+            "max |dp| over the file's head and the release's {dp:.4} (band {HEAD_DTYPE_BAND})"
+        );
+        check(
+            &mut ok,
+            "clef_layout_head_is_the_release_head",
+            own_body && given_body && tops && dp <= HEAD_DTYPE_BAND,
+        );
+        // Diagnostic, no check: the `qwen35` file's answers against the clef file's. The two are
+        // separate quantizations of the backbone, so their answers differ by more than the head.
+        let (tops, dp) = compare("qwen35 file vs clef file", &v, &v_own, &questions);
+        println!("diagnostic: qwen35 file against clef file: tops equal {tops}, max |dp| {dp:.4}");
 
         if ok {
             println!("gate_clef_serve: all checks passed");

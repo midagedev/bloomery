@@ -71,9 +71,43 @@ pub const MAX_IMAGES: usize = 8;
 const NOUL_TRUE: &str = "The proposition is true or the answer is yes.";
 const NOUL_FALSE: &str = "The proposition is false or the answer is no.";
 
+/// What a decision model's wire does to a request, beside the checks every model shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rules {
+    /// A choice's options are sorted by key (code point order); else they keep the criteria's order.
+    pub choice_sorted: bool,
+    /// A noul's options are `true` then `false`; else `false` then `true`.
+    pub noul_true_first: bool,
+    /// A noul option the criteria do not describe has the release's sentence; else no description.
+    pub noul_defaults: bool,
+    /// The checks llama.cpp's server makes (`parse_questions`) that the release's Python does not:
+    /// a `state` that is not null, every question's `instructions` given, a score's 2 to 10 levels, a
+    /// noul's `criteria` absent, null or an object.
+    pub strict: bool,
+}
+
+impl Rules {
+    /// The release's, which Clef's seat follows: choice sorted, `true` first, the release's
+    /// sentences, and only the release's checks.
+    pub const CLEF: Rules = Rules {
+        choice_sorted: true,
+        noul_true_first: true,
+        noul_defaults: true,
+        strict: false,
+    };
+}
+
+/// A score's number of levels, at least and at most, as llama.cpp's server accepts it.
+const SCORE_LEVELS: std::ops::RangeInclusive<usize> = 2..=10;
+
 impl Request {
-    /// Validate a parsed request body.
+    /// Validate a parsed request body under the release's rules ([`Rules::CLEF`]).
     pub fn from_json(body: &Json) -> Result<Request, Error> {
+        Request::from_json_with(body, &Rules::CLEF)
+    }
+
+    /// Validate a parsed request body under `rules`.
+    pub fn from_json_with(body: &Json, rules: &Rules) -> Result<Request, Error> {
         let Json::Object(_) = body else {
             return Err(Error::Request(format!(
                 "the body is {}, not an object",
@@ -83,6 +117,9 @@ impl Request {
         let Some(state) = body.get("state") else {
             return Err(Error::Request("state is required".into()));
         };
+        if rules.strict && *state == Json::Null {
+            return Err(Error::Request("state is required, and is not null".into()));
+        }
         let questions = match body.get("questions") {
             Some(Json::Object(q)) if !q.is_empty() => q,
             _ => return Err(Error::Request("at least one question is required".into())),
@@ -107,6 +144,9 @@ impl Request {
                 }
             };
             let criteria = q.get("criteria").cloned();
+            if rules.strict {
+                strict_checks(id, kind, q.get("instructions"), criteria.as_ref())?;
+            }
             if kind != Kind::Noul && !criteria.as_ref().is_some_and(Json::truthy) {
                 return Err(Error::Question {
                     id: id.clone(),
@@ -158,6 +198,39 @@ impl Request {
             state: state.clone(),
             questions: out,
         })
+    }
+}
+
+/// [`Rules::strict`]'s checks on one question.
+fn strict_checks(
+    id: &str,
+    kind: Kind,
+    instructions: Option<&Json>,
+    criteria: Option<&Json>,
+) -> Result<(), Error> {
+    let refuse = |what: String| Error::Question {
+        id: id.to_owned(),
+        what,
+    };
+    if instructions.is_none_or(|v| *v == Json::Null) {
+        return Err(refuse("\"instructions\" must be provided".into()));
+    }
+    match (kind, criteria) {
+        (Kind::Score, Some(Json::Array(levels))) if !SCORE_LEVELS.contains(&levels.len()) => {
+            Err(refuse(format!(
+                "\"criteria\" must be an array of {} to {} levels, not {}",
+                SCORE_LEVELS.start(),
+                SCORE_LEVELS.end(),
+                levels.len()
+            )))
+        }
+        (Kind::Noul, Some(c)) if !matches!(c, Json::Null | Json::Object(_)) => {
+            Err(refuse(format!(
+                "noul criteria must be an object, or absent, not {}",
+                c.kind()
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -214,11 +287,19 @@ fn image_count(body: &Json, state: &Json) -> Result<usize, Error> {
 }
 
 impl Question {
-    /// The release's `question_options`: `noul` takes `true` then `false` (defaults, overridden by
-    /// the criteria), `choice` its criteria sorted by key (code point order), `score` its levels by
-    /// index.
+    /// The release's `question_options` ([`Rules::CLEF`]): `noul` takes `true` then `false`
+    /// (defaults, overridden by the criteria), `choice` its criteria sorted by key (code point
+    /// order), `score` its levels by index.
     #[must_use]
     pub fn options(&self) -> Vec<Opt> {
+        self.options_with(&Rules::CLEF)
+    }
+
+    /// The options in the order `rules` gives them: a `noul`'s two (described by the criteria, else
+    /// by the release's sentence or none), a `choice`'s criteria (sorted by key, or as sent), a
+    /// `score`'s levels by index.
+    #[must_use]
+    pub fn options_with(&self, rules: &Rules) -> Vec<Opt> {
         match (self.kind, &self.criteria) {
             (Kind::Noul, c) => {
                 let over = |key: &str| match c {
@@ -227,14 +308,18 @@ impl Question {
                     }
                     _ => None,
                 };
-                [("true", NOUL_TRUE), ("false", NOUL_FALSE)]
-                    .into_iter()
+                let both = if rules.noul_true_first {
+                    [("true", NOUL_TRUE), ("false", NOUL_FALSE)]
+                } else {
+                    [("false", NOUL_FALSE), ("true", NOUL_TRUE)]
+                };
+                both.into_iter()
                     .map(|(key, default)| Opt {
                         id: key.to_string(),
                         description: match over(key) {
                             Some(Json::Null) => None,
                             Some(v) => Some(v.clone()),
-                            None => Some(Json::Str(default.to_string())),
+                            None => rules.noul_defaults.then(|| Json::Str(default.to_string())),
                         },
                     })
                     .collect()
@@ -247,7 +332,9 @@ impl Question {
                         description: (*v != Json::Null).then(|| v.clone()),
                     })
                     .collect();
-                opts.sort_by(|a, b| a.id.cmp(&b.id));
+                if rules.choice_sorted {
+                    opts.sort_by(|a, b| a.id.cmp(&b.id));
+                }
                 opts
             }
             (Kind::Score, Some(Json::Array(levels))) => levels
@@ -450,5 +537,118 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+    /// llama.cpp's other models: criteria order, `false` first, no default sentences, strict.
+    const SENT: Rules = Rules {
+        choice_sorted: false,
+        noul_true_first: false,
+        noul_defaults: false,
+        strict: true,
+    };
+
+    /// The rules order a question's options and describe a noul's: the release's sorted choice and
+    /// `true` first with its sentences, llama.cpp's request order and `false` first with none.
+    #[test]
+    fn rules_order_the_options_and_describe_the_noul() {
+        let r = req(r#"{"state":1,"questions":{
+            "c":{"type":"choice","criteria":{"zeta":"Z","alpha":null,"Mid":"M"}},
+            "n":{"type":"noul","criteria":{"true":"Yes."}},
+            "m":{"type":"noul"}}}"#)
+        .unwrap();
+        let seen = |q: usize, rules: &Rules| -> Vec<(String, Option<Json>)> {
+            r.questions[q]
+                .options_with(rules)
+                .into_iter()
+                .map(|o| (o.id, o.description))
+                .collect()
+        };
+        let s = |t: &str| Some(Json::Str(t.into()));
+        let ids = |q: usize, rules: &Rules| -> Vec<String> {
+            seen(q, rules).into_iter().map(|o| o.0).collect()
+        };
+        assert_eq!(ids(0, &Rules::CLEF), ["Mid", "alpha", "zeta"]);
+        assert_eq!(ids(0, &SENT), ["zeta", "alpha", "Mid"]);
+        assert_eq!(seen(0, &SENT)[1].1, None, "a null description is none");
+        assert_eq!(ids(1, &Rules::CLEF), ["true", "false"]);
+        assert_eq!(ids(1, &SENT), ["false", "true"]);
+        assert_eq!(
+            seen(1, &SENT),
+            [("false".to_owned(), None), ("true".to_owned(), s("Yes."))]
+        );
+        assert_eq!(
+            seen(2, &SENT),
+            [("false".to_owned(), None), ("true".to_owned(), None)]
+        );
+        assert_eq!(
+            seen(2, &Rules::CLEF),
+            [
+                ("true".to_owned(), s(NOUL_TRUE)),
+                ("false".to_owned(), s(NOUL_FALSE))
+            ]
+        );
+        // `options()` is the release's.
+        assert_eq!(
+            r.questions[0].options(),
+            r.questions[0].options_with(&Rules::CLEF)
+        );
+    }
+
+    /// [`Rules::strict`] is llama.cpp's `parse_questions`: each case is refused by name under it and
+    /// is a request the release's rules take.
+    #[test]
+    fn strict_rules_are_llama_cpps_checks() {
+        let ok =
+            |q: &str| format!(r#"{{"state":"s","questions":{{"q":{{"instructions":"I",{q}}}}}}}"#);
+        for (text, want) in [
+            (
+                r#"{"state":null,"questions":{"q":{"type":"noul","instructions":"I"}}}"#.to_owned(),
+                "state is required, and is not null",
+            ),
+            (
+                r#"{"state":1,"questions":{"q":{"type":"noul"}}}"#.to_owned(),
+                "q: \"instructions\" must be provided",
+            ),
+            (
+                r#"{"state":1,"questions":{"q":{"type":"noul","instructions":null}}}"#.to_owned(),
+                "q: \"instructions\" must be provided",
+            ),
+            (
+                ok(r#""type":"score","criteria":["only"]"#),
+                "q: \"criteria\" must be an array of 2 to 10 levels, not 1",
+            ),
+            (
+                ok(r#""type":"score","criteria":[0,1,2,3,4,5,6,7,8,9,10]"#),
+                "q: \"criteria\" must be an array of 2 to 10 levels, not 11",
+            ),
+            (
+                ok(r#""type":"noul","criteria":[]"#),
+                "q: noul criteria must be an object, or absent, not an array",
+            ),
+            (
+                ok(r#""type":"noul","criteria":"yes""#),
+                "q: noul criteria must be an object, or absent, not a string",
+            ),
+        ] {
+            let e = Request::from_json_with(&parse(&text).unwrap(), &SENT)
+                .expect_err(&text)
+                .to_string();
+            assert!(e.contains(want), "{text}: {e}");
+        }
+        // The release takes the ones it has no rule against, and a null noul criteria passes both.
+        for text in [
+            r#"{"state":null,"questions":{"q":{"type":"noul"}}}"#.to_owned(),
+            r#"{"state":1,"questions":{"q":{"type":"noul","instructions":null}}}"#.to_owned(),
+            ok(r#""type":"score","criteria":["only"]"#),
+            ok(r#""type":"noul","criteria":[]"#),
+        ] {
+            assert!(
+                Request::from_json_with(&parse(&text).unwrap(), &Rules::CLEF).is_ok(),
+                "{text}"
+            );
+        }
+        let null = ok(r#""type":"noul","criteria":null"#);
+        assert!(Request::from_json_with(&parse(&null).unwrap(), &SENT).is_ok());
+        let two = ok(r#""type":"score","criteria":["a","b"]"#);
+        assert!(Request::from_json_with(&parse(&two).unwrap(), &SENT).is_ok());
     }
 }

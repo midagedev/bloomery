@@ -32,6 +32,13 @@
 //!   decode step, its count plus the Q8_0 head's three; a pass of 5 and of 8
 //!   rows, its count plus each row's copy into its head and the head.
 //!
+//! - (l) the same on lev as ggml-org publishes it at Q4_K_M (`qwen35`, a
+//!   Qwen3.5-4B: 32 layers of width 2,560 — 24 gated-delta, 8 gated GQA at
+//!   16/4 heads of 256 — each with a dense SwiGLU FFN, and its head tied to
+//!   the token embedding; `refset::arch::qwen35`'s [`HIDDEN_LEV`] sets): the
+//!   4B geometry the decide seat's lev row serves, held to the Q4_K_M bands
+//!   of its own floor.
+//!
 //! No bound is put on the worst position: at some positions of a prompt
 //! mainline's own two backends lie order one apart (the bands' notes).
 //!
@@ -65,8 +72,8 @@ mod gate {
     };
     use gguf::Split;
     use refset::arch::qwen35::{
-        FLASH_Q8_P64, FLASH_Q8_P600, FLASH_Q8_P4096, HIDDEN, HIDDEN_FLASH_Q8, MODEL_FLASH_Q8, P64,
-        P600, P4096,
+        FLASH_Q8_P64, FLASH_Q8_P600, FLASH_Q8_P4096, HIDDEN, HIDDEN_FLASH_Q8, HIDDEN_LEV, LEV_P64,
+        LEV_P600, LEV_P4096, MODEL_FLASH_Q8, MODEL_LEV, P64, P600, P4096,
     };
     use refset::family::Family;
     use std::path::Path;
@@ -74,6 +81,8 @@ mod gate {
     /// The 27B's width and Clef-Flash's, as the headers state them.
     const WIDTH: usize = 5120;
     const FLASH_WIDTH: usize = 4096;
+    /// lev's.
+    const LEV_WIDTH: usize = 2560;
 
     /// Cache rows and the ubatch: the longest set's prompt as one ubatch.
     const CTX: usize = 4096;
@@ -180,6 +189,28 @@ mod gate {
         p90: 0.10,
         cut: 0.16,
         share: 0.05,
+    };
+
+    /// PIN(2026-10-07): lev Q4_K_M on the auto path and on the pass path. Both
+    /// sides read the same Q4_K/Q6_K codes and differ in the 8-bit
+    /// activations as the 27B sets do (ours q8_1 per 128 values, mainline's
+    /// MMQ q8_1 per 32), so the bands are the oracle's own floor, as for
+    /// Clef-Flash: mainline's CPU twin (`just dump-hidden-qwen35 --cpu-twin`,
+    /// q8_K per 256, another realization of the same rule) reads medians of
+    /// 0.046, 0.052 and 0.050 from its CUDA rows on the 64-, 600- and 4,096-id
+    /// sets (`tools/ref/hidden-diff.py <set>.cpu <set>`), quarters' medians up
+    /// to 0.066, 90th percentiles of 0.068, 0.076 and 0.075, and 0, 1 and 31
+    /// positions past 0.32 (0, 0.17 and 0.76 %). The median band is 1.25
+    /// times its largest, each quarter's 1.3 times its largest, the 90th
+    /// percentile 1.3 times its largest, and the share past 0.32 twice its
+    /// largest. The 27B's √(layers) scaling predicted 0.045 to 0.069 for the
+    /// twin's median; it read 0.046 to 0.052.
+    const LEV_Q4KM: Bands = Bands {
+        median: 0.065,
+        quarter: 0.085,
+        p90: 0.10,
+        cut: TAIL_CUT,
+        share: 0.016,
     };
 
     /// `‖a − b‖ / ‖b‖` in f64, a NaN reading infinite; and the max abs error.
@@ -396,6 +427,22 @@ mod gate {
             }
         }
         ok &= launches(&mut engine)?;
+        drop(engine);
+
+        let lev = Path::new(MODEL_LEV);
+        let (mut engine, _) = qwen35_open::open(lev, CTX, U_GATE)?;
+        println!(
+            "(l) lev Q4_K_M ({}): final-norm hidden states against mainline's result_norm",
+            lev.display()
+        );
+        for (name, n) in [(LEV_P64, 64), (LEV_P600, 600), (LEV_P4096, 4096)] {
+            let (ids, lcpp) = open_set(&HIDDEN_LEV, (name, n, LEV_WIDTH))?;
+            let at = |path| (name, path, LEV_WIDTH);
+            ok &= check(&mut engine, at(PrefillPath::Auto), &LEV_Q4KM, &ids, &lcpp)?;
+            if n == 64 {
+                ok &= check(&mut engine, at(PrefillPath::Pass), &LEV_Q4KM, &ids, &lcpp)?;
+            }
+        }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 

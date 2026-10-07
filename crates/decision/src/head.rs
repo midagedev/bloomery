@@ -5,7 +5,9 @@
 //! GELU feed-forward), `option_summary_norm`, `layers` torch `TransformerDecoderLayer`s
 //! (`norm_first`, gelu: self-attention, cross-attention over the raw memory, feed-forward),
 //! `field_norm`, `option_norm`, the residual scorer and three scalars. The weight names are the
-//! module's `state_dict` names; a missing or extra name is refused by name.
+//! module's `state_dict` names; a missing or extra name is refused by name. The weights come from
+//! a [`Weights`] source under those names: the release's safetensors file, or the decision tensors
+//! of a model file in llama.cpp's Clef layout ([`crate::gguf_head`]); one loader serves both.
 
 use std::path::Path;
 use std::time::Instant;
@@ -15,6 +17,8 @@ use crate::encode::Encoded;
 use crate::json::{self, Json};
 use crate::ops::{self, Mha, dot, gelu, layer_norm, layer_normed, linear, normalized};
 use crate::safetensors::Safetensors;
+
+pub use crate::ops::LAYER_NORM_EPS;
 
 /// The head config's file name beside the head's weights.
 pub const CONFIG_FILE: &str = "joint_head_config.json";
@@ -92,21 +96,26 @@ impl HeadConfig {
             vals[i] = Some(n);
         }
         let get = |i: usize| vals[i].ok_or_else(|| Error::HeadConfig(format!("no {}", KEYS[i])));
-        let cfg = HeadConfig {
+        HeadConfig {
             hidden_size: get(0)?,
             width: get(1)?,
             routing_layers: get(2)?,
             layers: get(3)?,
             heads: get(4)?,
             feedforward: get(5)?,
-        };
-        if cfg.heads == 0 || !cfg.width.is_multiple_of(cfg.heads) {
+        }
+        .checked()
+    }
+
+    /// `self` when its width splits into its heads, else refused by name.
+    pub fn checked(self) -> Result<HeadConfig, Error> {
+        if self.heads == 0 || !self.width.is_multiple_of(self.heads) {
             return Err(Error::HeadConfig(format!(
                 "width {} does not split into {} heads",
-                cfg.width, cfg.heads
+                self.width, self.heads
             )));
         }
-        Ok(cfg)
+        Ok(self)
     }
 
     /// Every `state_dict` name of the head with its shape (`[]` is a scalar).
@@ -167,10 +176,66 @@ impl HeadConfig {
         add("residual_scorer.0.bias".into(), &[w]);
         add("residual_scorer.3.weight".into(), &[1, w]);
         add("residual_scorer.3.bias".into(), &[1]);
-        for s in ["prior_logit_scale", "joint_logit_scale", "residual_gate"] {
+        for s in SCALARS {
             add(s.into(), &[]);
         }
         v
+    }
+}
+
+/// The three learned scalars' `state_dict` names, in the order [`ClefHead::scales`] gives them.
+pub const SCALARS: [&str; 3] = ["prior_logit_scale", "joint_logit_scale", "residual_gate"];
+
+/// The three raw scalars as the logits use them: `exp(min(prior_logit_scale, ln 100))`,
+/// `exp(min(joint_logit_scale, ln 100))` and `sigmoid(residual_gate)`.
+#[must_use]
+pub fn scales_of(prior_logit_scale: f32, joint_logit_scale: f32, residual_gate: f32) -> Scales {
+    let cap = 100f32.ln();
+    (
+        prior_logit_scale.min(cap).exp(),
+        joint_logit_scale.min(cap).exp(),
+        1.0 / (1.0 + (-residual_gate).exp()),
+    )
+}
+
+/// The prior scale, the joint scale and the residual gate, as the logits use them.
+pub type Scales = (f32, f32, f32);
+
+/// Where a head's tensors come from: its `state_dict` names (module header) with their torch
+/// shapes, each converted to f32 row-major. A source that stores the three scalars already
+/// transformed ([`scales_of`]) says so by giving them through [`Weights::scales`].
+pub trait Weights {
+    /// Every name the source holds that is the head's, the scalars' included and an unknown one
+    /// as it is stored, so that [`ClefHead::from_weights`] can refuse it.
+    fn names(&self) -> Vec<String>;
+    /// `name`'s torch shape (`[]` is a scalar), or `None` when the source holds no such tensor.
+    fn shape(&self, name: &str) -> Option<Vec<usize>>;
+    /// `name` as f32, row-major. Not asked for the scalars.
+    fn tensor(&self, name: &str) -> Result<Vec<f32>, Error>;
+    /// The three scalars as the logits use them.
+    fn scales(&self) -> Result<Scales, Error>;
+}
+
+impl Weights for Safetensors {
+    fn names(&self) -> Vec<String> {
+        Safetensors::names(self).map(str::to_string).collect()
+    }
+
+    fn shape(&self, name: &str) -> Option<Vec<usize>> {
+        self.entry(name).map(|e| e.shape.clone())
+    }
+
+    fn tensor(&self, name: &str) -> Result<Vec<f32>, Error> {
+        Safetensors::tensor(self, name).map(|t| t.data)
+    }
+
+    fn scales(&self) -> Result<Scales, Error> {
+        let raw = |name: &str| Safetensors::tensor(self, name).map(|t| t.data[0]);
+        Ok(scales_of(
+            raw(SCALARS[0])?,
+            raw(SCALARS[1])?,
+            raw(SCALARS[2])?,
+        ))
     }
 }
 
@@ -233,9 +298,7 @@ pub struct ClefHead {
     scorer0_b: Vec<f32>,
     scorer3_w: Vec<f32>,
     scorer3_b: f32,
-    prior_logit_scale: f32,
-    joint_logit_scale: f32,
-    residual_gate: f32,
+    scales: Scales,
 }
 
 /// The output rows of a list of token ids: `[ids.len(), hidden]` row-major, or why not.
@@ -250,24 +313,37 @@ impl ClefHead {
         ClefHead::from_safetensors(&Safetensors::open(path)?, HeadConfig::parse(&text)?)
     }
 
+    /// The head inside a model file in llama.cpp's Clef layout: its shape from the file's
+    /// `<arch>.decision.*` keys and tensors, its weights from the decision tensors
+    /// ([`crate::gguf_head`]).
+    pub fn from_gguf(split: &gguf::Split) -> Result<ClefHead, Error> {
+        let src = crate::gguf_head::GgufHead::open(split)?;
+        ClefHead::from_weights(&src, src.config())
+    }
+
     /// The head from a parsed file: its names and shapes must be exactly `cfg.weights()`.
     pub fn from_safetensors(st: &Safetensors, cfg: HeadConfig) -> Result<ClefHead, Error> {
+        ClefHead::from_weights(st, cfg)
+    }
+
+    /// The head from `src`: its names and shapes must be exactly `cfg.weights()`.
+    pub fn from_weights(src: &dyn Weights, cfg: HeadConfig) -> Result<ClefHead, Error> {
         let want = cfg.weights();
         let mut missing = Vec::new();
         let mut shapes = Vec::new();
         for (name, shape) in &want {
-            match st.entry(name) {
+            match src.shape(name) {
                 None => missing.push(name.clone()),
-                Some(e) if e.shape != *shape => {
-                    shapes.push(format!("{name} {:?} (want {shape:?})", e.shape))
+                Some(got) if got != *shape => {
+                    shapes.push(format!("{name} {got:?} (want {shape:?})"))
                 }
                 Some(_) => {}
             }
         }
-        let extra: Vec<String> = st
+        let extra: Vec<String> = src
             .names()
+            .into_iter()
             .filter(|n| !want.iter().any(|(w, _)| w == n))
-            .map(str::to_string)
             .collect();
         if !(missing.is_empty() && extra.is_empty() && shapes.is_empty()) {
             return Err(Error::Weights {
@@ -276,7 +352,7 @@ impl ClefHead {
                 shapes,
             });
         }
-        let t = |name: &str| st.tensor(name).map(|t| t.data);
+        let t = |name: &str| src.tensor(name);
         let s = |name: &str| -> Result<f32, Error> { Ok(t(name)?[0]) };
         let norm = |p: &str| -> Result<Norm, Error> {
             Ok(Norm {
@@ -346,9 +422,7 @@ impl ClefHead {
             scorer0_b: t("residual_scorer.0.bias")?,
             scorer3_w: t("residual_scorer.3.weight")?,
             scorer3_b: s("residual_scorer.3.bias")?,
-            prior_logit_scale: s("prior_logit_scale")?,
-            joint_logit_scale: s("joint_logit_scale")?,
-            residual_gate: s("residual_gate")?,
+            scales: src.scales()?,
         })
     }
 
@@ -358,16 +432,10 @@ impl ClefHead {
         self.cfg
     }
 
-    /// The three scalars as the logits use them: `exp(min(prior_logit_scale, ln 100))`,
-    /// `exp(min(joint_logit_scale, ln 100))` and `sigmoid(residual_gate)`.
+    /// The three scalars as the logits use them ([`scales_of`]).
     #[must_use]
-    pub fn scales(&self) -> (f32, f32, f32) {
-        let cap = 100f32.ln();
-        (
-            self.prior_logit_scale.min(cap).exp(),
-            self.joint_logit_scale.min(cap).exp(),
-            1.0 / (1.0 + (-self.residual_gate).exp()),
-        )
+    pub fn scales(&self) -> Scales {
+        self.scales
     }
 
     /// Per question, one logit per option in span order. `hidden` is the backbone's last hidden
@@ -691,13 +759,13 @@ fn check_spans(enc: &Encoded) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::encode::encode_with;
     use crate::request::Request;
     use crate::safetensors::write;
 
-    const CFG: HeadConfig = HeadConfig {
+    pub(crate) const CFG: HeadConfig = HeadConfig {
         hidden_size: 16,
         width: 8,
         routing_layers: 2,
@@ -706,7 +774,7 @@ mod tests {
         feedforward: 12,
     };
 
-    fn bf16(n: usize, seed: u32) -> Vec<u8> {
+    pub(crate) fn bf16(n: usize, seed: u32) -> Vec<u8> {
         let mut s = seed;
         (0..n)
             .flat_map(|_| {
@@ -718,7 +786,12 @@ mod tests {
     }
 
     fn file(skip: Option<&str>, extra: bool) -> Safetensors {
-        let weights = CFG.weights();
+        file_of(CFG, skip, extra)
+    }
+
+    /// A release-shaped head file of `cfg`: every weight bf16, seeded by its index.
+    pub(crate) fn file_of(cfg: HeadConfig, skip: Option<&str>, extra: bool) -> Safetensors {
+        let weights = cfg.weights();
         let raw: Vec<Vec<u8>> = weights
             .iter()
             .enumerate()

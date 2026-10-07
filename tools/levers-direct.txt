@@ -59,6 +59,7 @@ crates/qdot/tests/qdot.rs	BLOOMERY_MODEL,BLOOMERY_DATA,BLOOMERY_Q5K_MODEL,BLOOME
 crates/serve/build.rs	CARGO_MANIFEST_DIR,BLOOMERY_GIT_COMMIT	stays: cargo's crate directory and the synced tree's commit
 crates/tokenizer/tests/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB,BLOOMERY_DATA	stays: the vocabulary file and the data directory
 crates/decision/tests/clef.rs	BLOOMERY_DATA	stays: the data directory
+crates/decision/tests/lev.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
 crates/gpu-gates/src/tier.rs	BLOOMERY_TIER	stays: the tier a gate runs in, read once here and checked against the file it opens
 crates/gpu-gates/src/model_file.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable

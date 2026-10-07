@@ -552,7 +552,8 @@ dump-ref-qwen35moe *VARIANT:
 # The Qwen3.5 dense (qwen35, Clef's backbone) hidden-state oracle: hidden_ref linked against llama.cpp mainline's build
 # (tools/ref/build-hidden.sh), then llama.cpp's result_norm of every position of the first 64, 600 and 4,096 prose ids
 # into $BLOOMERY_DATA/ref_qwen35_hidden_p{64,600,4096}/ (the 27B Q4_K_M file; refset family hidden-qwen35) and
-# $BLOOMERY_DATA/ref_qwen35_flashq8_hidden_p{64,600,4096}/ (Clef-Flash at bartowski's Q8_0; hidden-qwen35-flash-q8),
+# $BLOOMERY_DATA/ref_qwen35_flashq8_hidden_p{64,600,4096}/ (Clef-Flash at bartowski's Q8_0; hidden-qwen35-flash-q8) and
+# $BLOOMERY_DATA/ref_qwen35_lev_hidden_p{64,600,4096}/ (lev at ggml-org's Q4_K_M, the 4B geometry with a tied head; hidden-qwen35-lev),
 # tools/ref/hidden.sh. Each dump puts its whole file on the card box.sh puts in view; no lease (a functional oracle). `--cpu-twin` writes each
 # set's CPU twin into <set>.cpu/ instead (no card, 16 threads): the oracle's own floor the gate's bands come from.
 build-ref-hidden:
@@ -748,18 +749,32 @@ gate-gpu-qwen35moe-e2e:
 # then the prompt call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a
 # reset as one GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the
 # same file (`just dump-hidden-qwen35`), every position within the derived band: the 27B Q4_K_M file (16.5 GB), then
-# Clef-Flash at bartowski's Q8_0 (9.5 GB: every site through the launch its type picks). Fits either card.
+# Clef-Flash at bartowski's Q8_0 (9.5 GB: every site through the launch its type picks), then lev at Q4_K_M (3 GB, the
+# 4B geometry with its head tied to the token embedding). Fits either card.
 gate-gpu-clef-hidden:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
 
-# The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q3_K_S (4.3 GB) with the
-# release's head; the six refusals (a qwen35 file with no head, --model decide with no head, --model qwen3 with
-# --head, a head config no row knows, a head narrower than the backbone, a GGUF of llama.cpp's Clef layout) exit
-# before any backbone load, then one
+# The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
+# `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
+# decide with no head, --model qwen3 with --head, a head config no row knows, a head narrower than the backbone,
+# a GGUF of llama.cpp's Clef layout with no decision head) exit before any backbone load, then one
 # server answers the suite's first request on its row's route only, speaks llama.cpp's /v1/systemone wire (the
-# answer's model is the server's, /v1/models, the engine object, an image a 501), the same body again. Either card.
+# answer's model is the server's, /v1/models, the engine object, an image a 501), the same body again; then the
+# same quantization in llama.cpp's Clef layout (bartowski's current upload, 6.98 GB, the head inside the GGUF in
+# Q8_0; fetched into /root/models/clef-flash/) serves the request with no head flag, and its answers equal the
+# same file's with the release's head (the one difference: the head's dtype). Either card.
 gate-gpu-clef-serve:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q3_K_S.gguf --head /models/clef-flash/hf/joint_head.safetensors --dir $D'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
+
+# The decide seat of bloomery-serve on lev (gate_lev_serve's doc): ggml-org/lev-GGUF's Q4_K_M (3.0 GB, a `qwen35`
+# file with `qwen35.decision.type = lev`, fetched into /root/models/lev-4b/) with no head flag; five refusals before
+# any backbone load (--head beside a lev file, --model decide --head beside one, a GGUF whose decision type is kev,
+# a qwen35 file with no decision keys, --help's table), then one server answers the 14 requests of tools/ref/lev/
+# against llama.cpp mainline's server (`just dump-lev`): the same body shape and top options, usage the sum of the
+# prompts' ids; ARGS `--hf ggml-org/lev-GGUF:Q4_K_M` adds the clause that serves the file from the hub, no head flag, and
+# answers the first request as the `-m` server does (a network read). Either card.
+gate-gpu-lev-serve *ARGS:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
 
 # clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
 # position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.
@@ -962,6 +977,19 @@ gate-tokenizer:
 # exact, f32 logits inside the derived band of the f64 referee, the body's shape and top options.
 gate-decision-clef:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --lib --test clef -- --include-ignored --nocapture'
+# lev's label readout (crates/decision, host only) against llama.cpp mainline's server (tools/ref/lev_ref.py's files
+# under $BLOOMERY_DATA/lev/4b/ref): the label list and every prompt's ids of the 14 requests equal the server's, the
+# answer math by hand-computed cases (temperatures, buckets, the variants' softmax average, the rating scale), and the
+# policy (option order, prompt shape, refusals).
+gate-decision-lev:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --test lev -- --include-ignored --nocapture'
+# lev's oracle: the patched mainline server answering tools/ref/lev/{suite,edge}.jsonl on the lev file, its prompts' ids
+# and bodies into $BLOOMERY_DATA/lev/4b/ref (tools/ref/lev_ref.py; the server is built by tools/ref/build-lcpp-lev.sh,
+# the file fetched into /root/models/lev-4b/). A functional dump, no lease: the server runs through tools/gpu-gate.sh
+# (tools/ref/lev-dump.sh), under a card's gate lock and its bound, on the card the runner picks. OUT is the directory
+# written (another one shows the dump is the same without replacing the gates' files).
+dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'mkdir -p {{OUT}} && bash tools/ref/lev-dump.sh --suite tools/ref/lev/suite.jsonl --edge tools/ref/lev/edge.jsonl --out {{OUT}}'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙(정지 id 목록 전부), V4.1·GLM 채팅 템플릿 렌더링,
 # GLM 도구 호출 파서(glmxml), Qwen3의 헤르메스 호출·모델이 여는 생각 범위(hermes), 연결 상한·유휴 연결 종료·컨텍스트 끝의 정지(limits). 박스 자원 불필요.
 # Anthropic's Messages API on the chat path (anthropic). Qwen3.6's and Qwen3.8's XML tool calls, and every seat
@@ -969,6 +997,12 @@ gate-decision-clef:
 # llama-server takes them (penalty). A sampled request's drafted passes against its plain steps (sampdraft).
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
+
+# The template engine (crates/jinja, host only): its unit tests, the HF environment's whitespace control, scoping,
+# macros, filters and tests, Python's `str()` and slicing rules, and the V4.1 template rendered by hand. The engine's
+# jinja2-parity cases are gate-serve's. No network, no card.
+gate-jinja:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-jinja --lib -- --nocapture'
 
 # engram IO 실험실의 시험(crates/engram-lab, 엔진 사용처 없음): 컨텍스트 창의 슬롯 순서, 행 캐시의 LRU를 스택
 # 거리 모의와 대조, 캐시가 내주는 바이트. 이름이 gate-가 아니라 lab-이라 `just affected`가 엔진 착륙에서 고르지
