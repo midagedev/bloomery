@@ -35,7 +35,7 @@
 //!   ids and weights to the host;
 //! - the shadow (a routed layer): the card experts, where the slot map puts
 //!   any, and the shared expert, while the host serves every token of the
-//!   batch in one union call ([`GlmHost`]'s) and uploads the sums;
+//!   batch in one union call ([`HostRun`]'s) and uploads the sums;
 //! - the back: the host's sums plus the shadow's, and `hc_post`.
 //!
 //! The head runs after the last layer of the batch that holds the call's last
@@ -99,6 +99,7 @@ use bloomery_gpu::checkpoint::{Checkpoints, Pending};
 use bloomery_gpu::fault::read_cards;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
+use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::kpool;
 use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for};
 use bloomery_gpu::linear::conv::KdaConvArgs;
@@ -129,7 +130,6 @@ use super::{
 };
 use crate::ffn::{self, CardRows, CardTiles};
 use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
-use crate::host::GlmHost;
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAccTier, Places};
@@ -1710,7 +1710,7 @@ impl Body {
 /// that the head was enqueued; an inner group reads both words here.
 fn read_fault(
     gpu: &Gpu,
-    hybrid: &mut bloomery_gpu::hybrid::Hybrid<GlmHost>,
+    hybrid: &mut bloomery_gpu::hybrid::Hybrid<HostRun>,
     last: bool,
 ) -> Result<bool, GpuError> {
     let tier = hybrid.tier_fault()?;
@@ -2432,7 +2432,7 @@ impl PromptProgram<'_> {
     /// into `normed`, the router over every token (the scores, then each
     /// token's picks), the timer's [`Mark::FrontEnd`], and the download of
     /// the rows, weights and ids to the host.
-    fn route(&mut self, port: &mut BatchLeg<'_, GlmHost>, at: At) -> Result<(), GpuError> {
+    fn route(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let (gpu, w, t) = (self.gpu, self.w, self.t[at.unit]);
         let stream = gpu.stream();
@@ -2595,7 +2595,7 @@ impl PromptProgram<'_> {
     /// every token's slots in slot order from the stage card's downs or the
     /// tier's rows (`ds41_ffn_card_acc_8_tier`), then the shared expert's
     /// output added — the shadow's two launches of a one-card layer.
-    fn join_tier(&mut self, port: &mut BatchLeg<'_, GlmHost>, at: At) -> Result<(), GpuError> {
+    fn join_tier(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let (gpu, t) = (self.gpu, self.t[at.unit]);
         let n = self.p.d.embd;
@@ -2683,7 +2683,7 @@ impl PromptProgram<'_> {
 }
 
 impl<'a> LayerProgram for PromptProgram<'a> {
-    type Port = BatchLeg<'a, GlmHost>;
+    type Port = BatchLeg<'a, HostRun>;
 
     /// A routed layer's; the dense lead has none.
     fn host_leg(&self, at: At) -> bool {
@@ -2694,7 +2694,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
     /// its `hc_post`, or the routed block up to its download, the routed
     /// layer's parts marked for the walk's timer; then a KDA layer's stores
     /// into the open take of the mark its unit ends on.
-    fn front(&mut self, port: &mut BatchLeg<'a, GlmHost>, at: At) -> Result<(), GpuError> {
+    fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let (l, u) = (at.layer, at.unit);
         let kind = self.p.cfg[l].kind;
         let routed = kind.host_leg();
@@ -2744,7 +2744,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
     }
 
     /// A routed layer's card experts and shared expert under its host leg.
-    fn shadow(&mut self, port: &mut BatchLeg<'a, GlmHost>, at: At) -> Result<(), GpuError> {
+    fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.p.cfg[at.layer].kind.host_leg() {
             return Ok(());
         }
@@ -2758,7 +2758,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
 
     /// A routed layer's host sums (the walk's serve uploaded them) plus the
     /// shadow's, and `hc_post`.
-    fn back(&mut self, port: &mut BatchLeg<'a, GlmHost>, at: At) -> Result<(), GpuError> {
+    fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         if !self.p.cfg[l].kind.host_leg() {
             return Ok(());

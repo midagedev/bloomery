@@ -80,6 +80,7 @@ use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::refuse_tier_count;
+use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::TierOpen;
@@ -114,7 +115,7 @@ use runtime::seqstate::{HOST_BUDGET, Kept, Take};
 use runtime::swaprule::KeptRows;
 
 use crate::ffn::CardExperts;
-use crate::host::GlmHost;
+use crate::host::routed_layers;
 use crate::program;
 use crate::swap;
 use crate::tensors::LayerNames;
@@ -696,7 +697,7 @@ pub struct StepInput {
 /// the host set, its page windows, its residency machine) before the
 /// buffers.
 pub struct Body {
-    hybrid: Hybrid<GlmHost>,
+    hybrid: Hybrid<HostRun>,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
     /// Each layer's tensor names, made at load.
@@ -1582,7 +1583,17 @@ impl Body {
             LOAD_ROWS,
         )?;
         let file = Arc::clone(file);
-        let experts = GlmHost::build(Arc::clone(&file), hp, run.clone(), host.r8)?;
+        let experts = HostRun::build(
+            Arc::clone(&file),
+            run.start,
+            host.r8,
+            HostWidths {
+                embd: hp.n_embd,
+                ff: hp.expert_ff,
+                n_used: hp.n_used,
+            },
+            |src| routed_layers(src, hp, run.clone()),
+        )?;
         let tier_cards = tiers
             .iter()
             .enumerate()
@@ -1746,12 +1757,12 @@ impl Body {
 
     /// The host tier.
     #[must_use]
-    pub fn hybrid(&self) -> &Hybrid<GlmHost> {
+    pub fn hybrid(&self) -> &Hybrid<HostRun> {
         &self.hybrid
     }
 
     /// The host tier, for a caller that attaches or marks its route trace.
-    pub fn hybrid_mut(&mut self) -> &mut Hybrid<GlmHost> {
+    pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
         &mut self.hybrid
     }
 
@@ -1818,7 +1829,7 @@ impl Body {
     }
 
     /// The walk's parts, lent apart from the host tier.
-    pub(crate) fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<GlmHost>) {
+    pub(crate) fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<HostRun>) {
         (
             Parts::of(
                 &self.k,
