@@ -1317,7 +1317,7 @@ impl Body {
             deadline: swap::DEADLINE,
             top_k: N_USED,
             max_rows: LOAD_ROWS,
-            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers, None)?),
+            stacks: Arc::new(swap::stacks(inputs, map_layers, None)?),
         };
         GpuModel::load_placed_with(
             file,
@@ -1428,7 +1428,7 @@ impl Body {
             deadline: swap::DEADLINE,
             top_k: N_USED,
             max_rows: LOAD_ROWS,
-            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers, Some(nextn.index))?),
+            stacks: Arc::new(swap::stacks(inputs, map_layers, Some(nextn.index))?),
         };
         let hosted = plan.host_runs().map_err(|e| GpuError::plan(WHAT, e))?;
         GpuModel::load_placed_hosting(

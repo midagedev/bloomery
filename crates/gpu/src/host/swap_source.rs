@@ -188,38 +188,24 @@ pub struct StackFacts {
     pub sidecar: fn() -> GpuError,
 }
 
-/// A three-stack [`FileStacks`] over the file source for a model whose card
-/// holds the file's bytes: each layer's gate, up and down read from the
-/// plan's tensors by the family's names, each layer's types as the file
-/// holds them, and nothing to convert — a staged part is its slot's bytes,
-/// and the r8 sidecar, a format Q3_K stacks alone have, is refused by name.
-/// Every family fact is an input ([`StackFacts`]): the names function, the
-/// per-layer type check the family's card leg forces, whether a layer may
-/// hold none of its stacks (a dense block), the map layers, the unrouted
-/// layers, and the sidecar refusal in the family's words.
+/// The [`FileStacks`] of a model whose card holds the file's bytes: each
+/// layer's gate, up and down types read from the plan's tensors, nothing to
+/// convert, every family fact an input ([`StackFacts`]).
 pub struct PlanStacks {
-    /// Layer `l`'s gate, up and down file names, in stack order.
     names_of: fn(usize) -> [String; 3],
     /// Per layer, its three stacks' types in stack order; `None` on a layer
     /// that holds none of them.
     types: Vec<Option<[GgmlType; 3]>>,
-    /// The layers the body's slot map holds ([`FileStacks::map_layers`]).
     map_layers: Option<usize>,
-    /// The map's layers no pass routes ([`FileStacks::unrouted`]).
     unrouted: Vec<usize>,
-    /// The r8 sidecar's refusal ([`FileStacks::open`]), in the family's
-    /// words.
     sidecar: fn() -> GpuError,
 }
 
 impl PlanStacks {
-    /// The stacks of the `model.layers` layers of `model`, each layer's
-    /// types read from its tensors by the facts' names. Refused by name
-    /// under the facts' `what`: a layer that holds some of its three stacks
-    /// but not all, and — when the family allows no empty layer, so every
-    /// layer holds its three — a layer that holds none; a layer a family
-    /// with empty layers holds none of enters the table empty. The facts'
-    /// `check` holds each complete layer. Load-time only.
+    /// The stacks of `model`'s layers by the facts' names. Refused by name
+    /// under the facts' `what`: a layer missing some of its three stacks
+    /// (all three, unless the facts allow an empty layer), and a complete
+    /// layer the facts' `check` refuses. Load-time only.
     pub fn of(model: &ModelTensors, facts: StackFacts) -> Result<PlanStacks, GpuError> {
         let find = |name: &str| model.tensors.iter().find(|t| t.name == name).map(|t| t.ty);
         let mut types = Vec::with_capacity(model.layers);

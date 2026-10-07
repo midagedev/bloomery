@@ -112,7 +112,7 @@ use super::scratch38::{
     dims, kept_lane, store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
-use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
+use super::swap38::{self, DEADLINE, LIVE_DELAY};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
@@ -972,7 +972,7 @@ impl Body38 {
 
     /// [`Body38::open_placed`] under `residency`: `mid-p<P>-s<S>` runs the
     /// residency machine over the card's routed stacks
-    /// ([`crate::host::swap`], [`Qwen38Stacks`]) — the load's host set also
+    /// ([`crate::host::swap`], [`swap38::Qwen38Stacks`]) — the load's host set also
     /// holds each layer's churn pool (the card's experts past the first `P`),
     /// refused by name when the plan's host headroom cannot take it — while
     /// `off` is [`Body38::open_placed`] itself. The lever's word a load runs
@@ -1163,7 +1163,7 @@ impl Body38 {
             deadline: DEADLINE,
             top_k: geo::N_USED,
             max_rows: PASS_ROWS,
-            stacks: Arc::new(Qwen38Stacks::of(&inputs.model)?),
+            stacks: Arc::new(swap38::stacks(&inputs.model)?),
         };
         GpuModel::load_placed_with(
             file,
@@ -1325,7 +1325,7 @@ impl Body38 {
             n,
             geo::EXPERTS,
         )?);
-        let stacks = Qwen38Stacks::of(&inputs.model)?;
+        let stacks = swap38::stacks(&inputs.model)?;
         let card = Card38::new(gpu, w, &stacks, &map, n)?;
         // A tier layer's join sums the card's slots and the tier's in one
         // launch, which a layer with no card expert does not run.

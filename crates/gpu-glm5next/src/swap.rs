@@ -1,6 +1,6 @@
 //! GLM's side of adaptive expert residency ([`bloomery_gpu::host::swap`]):
-//! the model's [`FileStacks`] for the common file source
-//! (`bloomery_gpu::host::swap_source::FileSwap`) — [`Glm5Stacks`], each
+//! the model's stack table for the common file source
+//! (`bloomery_gpu::host::swap_source::FileSwap`) — [`stacks`], each
 //! layer's gate, up and down — with the machine's live delay and deadline
 //! ([`LIVE_DELAY`], [`DEADLINE`]).
 //!
@@ -18,12 +18,8 @@
 //! Q3_K's alone, and no GLM stack is one), so a staged part is its slot's
 //! bytes as it stands.
 
-use std::sync::Arc;
-
 use bloomery_gpu::GpuError;
-use bloomery_gpu::host::swap_source::{Convert, FileStacks, PlanStacks, StackFacts};
-use cuda_core::CudaContext;
-use gguf::quant::GgmlType;
+use bloomery_gpu::host::swap_source::{PlanStacks, StackFacts};
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::PlanInputs;
 
@@ -38,80 +34,39 @@ fn stack_names(l: usize) -> [String; 3] {
     ]
 }
 
-/// The r8 sidecar's refusal ([`FileStacks::open`]): the sidecar's format is
+/// The r8 sidecar's refusal (`FileStacks::open`): the sidecar's format is
 /// Q3_K's alone and no stack of the file is one.
 fn no_sidecar() -> GpuError {
     GpuError::State {
-        what: "Glm5Stacks::open",
+        what: "glm5next::swap::stacks",
         missing: "no r8 sidecar for GLM's stacks: the sidecar's format is Q3_K's alone \
                   and no stack of the file is one (BLOOMERY_R8=off)",
     }
 }
 
-/// GLM's [`FileStacks`] for the common file source: the common three-stack
-/// table ([`PlanStacks`]) with GLM's facts — a layer may hold none of its
-/// stacks (a dense block), the place rule owns which stacks take card slots
-/// (no type check of its own here), and the slot map's run of layers with
-/// its unrouted next-token layer. The card holds the file's bytes; the file
-/// is the one owner of the split.
-pub struct Glm5Stacks(PlanStacks);
-
-impl Glm5Stacks {
-    /// The stacks of the layers `inputs` describes, their types read from
-    /// its tensors, for a body whose slot map holds `map_layers` layers
-    /// (the host tier's run: every routed layer, and on a NextN load the
-    /// next-token layer after them — the machine's per-layer lists cover
-    /// these, not the card's whole range the dense lead is part of), the
-    /// last of them the next-token layer `nextn` on a NextN load (the map's
-    /// last layer, which no pass routes — the draft's walks serve it through
-    /// the batch port, which notes no id — and which holds no card slot).
-    /// Refused by name: a layer that holds some of its three stacks but not
-    /// all.
-    pub fn of(
-        inputs: &PlanInputs,
-        map_layers: usize,
-        nextn: Option<usize>,
-    ) -> Result<Glm5Stacks, GpuError> {
-        PlanStacks::of(
-            &inputs.model,
-            StackFacts {
-                what: "Glm5Stacks::of",
-                names: stack_names,
-                check: None,
-                empty: true,
-                map_layers: Some(map_layers),
-                unrouted: nextn.into_iter().collect(),
-                sidecar: no_sidecar,
-            },
-        )
-        .map(Glm5Stacks)
-    }
-}
-
-impl FileStacks for Glm5Stacks {
-    fn names(&self, layer: usize) -> Vec<String> {
-        self.0.names(layer)
-    }
-
-    fn types(&self, layer: usize) -> &[GgmlType] {
-        self.0.types(layer)
-    }
-
-    fn map_layers(&self) -> Option<usize> {
-        self.0.map_layers()
-    }
-
-    fn unrouted(&self) -> Vec<usize> {
-        self.0.unrouted()
-    }
-
-    fn open(
-        &self,
-        dims: &[u64],
-        parts: &[usize],
-        sidecar: bool,
-        ctx: &Arc<CudaContext>,
-    ) -> Result<Option<Arc<dyn Convert>>, GpuError> {
-        self.0.open(dims, parts, sidecar, ctx)
-    }
+/// The stacks of the layers `inputs` describes, their types read from its
+/// tensors, over GLM's facts: a layer may hold none of its stacks (a dense
+/// block); the place rule owns which stacks take card slots (no type check
+/// here); the slot map holds `map_layers` layers (every routed layer, and on
+/// a NextN load the next-token layer after them), the last of them the
+/// unrouted next-token layer `nextn` on a NextN load (the draft's walks serve
+/// it through the batch port, which notes no id; it holds no card slot).
+/// Refused by name: a layer that holds some of its three stacks but not all.
+pub fn stacks(
+    inputs: &PlanInputs,
+    map_layers: usize,
+    nextn: Option<usize>,
+) -> Result<PlanStacks, GpuError> {
+    PlanStacks::of(
+        &inputs.model,
+        StackFacts {
+            what: "glm5next::swap::stacks",
+            names: stack_names,
+            check: None,
+            empty: true,
+            map_layers: Some(map_layers),
+            unrouted: nextn.into_iter().collect(),
+            sidecar: no_sidecar,
+        },
+    )
 }
