@@ -43,10 +43,13 @@
 //! next waits for — the residency machine's word protocol: a fill thread
 //! waits on nothing the card runs after the copy that waits for it, so one
 //! hardware queue (WDDM, `CUDA_DEVICE_MAX_CONNECTIONS=1`) only serializes
-//! the streams. A layer's last copy records its landed event, which the
-//! engine stream waits for before the layer's card route. When the pinned
-//! staging cannot be allocated the lane copies from the source's pageable
-//! bytes on the copy stream, the engine thread enqueueing each copy.
+//! the streams. A layer's copies record one landed event a batch
+//! ([`LandBatch`], the batching this module owns), which the layer's card
+//! route waits before the GEMM batch over that batch's slots — the copies
+//! and the GEMMs of a layer's shadow pipeline instead of running one after
+//! the other. When the pinned staging cannot be allocated the lane copies
+//! from the source's pageable bytes on the copy stream, the engine thread
+//! enqueueing each copy.
 //!
 //! **No wait without a bound.** Every host wait (a fill thread for a slot's
 //! drained word, the engine thread for the staging backlog, the drop for the
@@ -196,9 +199,118 @@ pub struct XReport {
     pub end_us: u64,
 }
 
+/// The most landing batches a layer's copies split into ([`land_batch_size`]
+/// keeps the count at or under it).
+pub const LAND_BATCHES: usize = 3;
+
+/// A layer's landing slots a card route's GEMM batch covers, and the event
+/// that guards it: one of the batches a layer's copies on the copy stream
+/// split into ([`land_batch_size`]), each batch's event recorded on the copy
+/// stream after that batch's last copy, so the GEMM batch over the batch's
+/// slots — reading the batch's map row, the layer's places with every expert
+/// outside the batch [`HOST`] — waits for its own copies and no later one.
+/// `event` is `None` for a batch over slots no copy lands in, which waits
+/// nothing. Both landing paths fill them: the residency machine's pick (its
+/// admits into the stage stacks) and this module's stream (its copies into a
+/// ring half); the card route only reads them.
+///
+/// [`HOST`]: super::slots::HOST
+#[derive(Clone, Debug)]
+pub struct LandBatch {
+    /// The batch's map row, host-mapped and device-visible: `experts` words.
+    pub map: sys::CUdeviceptr,
+    /// The copy stream's event after the batch's last copy; `None` when no
+    /// copy lands in the batch's slots.
+    pub event: Option<Arc<CudaEvent>>,
+}
+
+/// The batch size rule: a layer's `n` landing slots split into batches of at
+/// most this many, the first a third of them. The shape is Strata's measured
+/// one (`prefill.cpp`'s `per = max(1, ring / 3)`, its comment: "the next
+/// batch's blobs arrive while one computes"): with a third of the landing
+/// set a GEMM batch, one third computes while the copy lane streams the
+/// next and the issuer may run into the third after it, so the first batch
+/// that waits is bound by a third of the layer's copy time and the GEMMs
+/// finish under the copies whenever the copies are the layer's longer side.
+/// Rounded up (Strata floors), so the batch count stays at or under
+/// [`LAND_BATCHES`] for every `n`.
+#[must_use]
+pub fn land_batch_size(n: usize) -> usize {
+    n.div_ceil(LAND_BATCHES).max(1)
+}
+
+/// Per layer of a map, the landing batches' map rows (host-mapped,
+/// device-visible, one a batch past a leading batch-0 row) and events: the
+/// pool both landing paths write their [`LandBatch`]s through. A layer's
+/// rows are written by the host at its landing (before the card route's
+/// launches that read them are enqueued) and read by that layer's route
+/// alone, which the walk's order has the host seen complete — the front's
+/// download of the layer after it — before any later landing rewrites them.
+pub struct LandRows {
+    rows: MappedHost,
+    /// Per layer, [`LAND_BATCHES`] events.
+    events: Vec<Vec<Arc<CudaEvent>>>,
+    experts: usize,
+}
+
+impl LandRows {
+    /// `layers` layers of `experts` experts, their batch rows and events.
+    /// Load-time only.
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        layers: usize,
+        experts: usize,
+    ) -> Result<LandRows, GpuError> {
+        let rows = MappedHost::new(
+            ctx,
+            layers * (1 + LAND_BATCHES) * experts * 4,
+            "cuMemHostAlloc (landing batches)",
+        )?;
+        let events = (0..layers)
+            .map(|_| {
+                (0..LAND_BATCHES)
+                    .map(|_| ctx.new_event(None).map(Arc::new))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LandRows {
+            rows,
+            events,
+            experts,
+        })
+    }
+
+    /// Batch `batch`'s map row of `layer`, `experts` words for the host to
+    /// fill. Batch 0 is each landing path's own leading row (the slots no
+    /// copy lands in); the batches after it hold the landing batches.
+    #[must_use]
+    pub fn row_mut(&mut self, layer: usize, batch: usize) -> &mut [u32] {
+        let at = (layer * (1 + LAND_BATCHES) + batch) * self.experts * 4;
+        // SAFETY: the row is `experts` words inside the rows page (sized
+        // `(1 + LAND_BATCHES)` rows a layer, page-aligned): inside it and
+        // 4-aligned. Nothing reads the row on the card until the landing
+        // path publishes this fill by enqueuing the launches that name it.
+        unsafe { std::slice::from_raw_parts_mut(self.rows.host_at(at).cast::<u32>(), self.experts) }
+    }
+
+    /// Batch `batch`'s event of `layer` (`0..LAND_BATCHES`), recorded on the
+    /// copy stream after that batch's last copy.
+    #[must_use]
+    pub fn event(&self, layer: usize, batch: usize) -> Arc<CudaEvent> {
+        Arc::clone(&self.events[layer][batch])
+    }
+
+    /// The batch's map row's device address, for a [`LandBatch`].
+    #[must_use]
+    pub fn row_dev(&self, layer: usize, batch: usize) -> sys::CUdeviceptr {
+        self.rows
+            .dev_at((layer * (1 + LAND_BATCHES) + batch) * self.experts * 4)
+    }
+}
+
 /// The card's view of a layer's stream, for its card route
 /// ([`XStream::ring_layer`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RingLayer {
     /// The experts the half holds, slots `0..n`.
     pub n: usize,
@@ -210,6 +322,9 @@ pub struct RingLayer {
     pub union_map: sys::CUdeviceptr,
     /// Per part (gate, up, down) the half's first slot.
     pub parts: [sys::CUdeviceptr; PARTS],
+    /// The landing batches the layer's copies split into, a GEMM batch each
+    /// ([`LandBatch`]): the ring pass runs one per batch, waiting its event.
+    pub batches: Vec<LandBatch>,
 }
 
 /// An expert's parts: gate, up, down.
@@ -457,9 +572,7 @@ pub struct XStream {
     /// Per half the ring row and the union row, `experts` words each.
     rows: MappedHost,
     lane: Lane,
-    /// Per half: the copy stream's landed event of its last stream, and the
-    /// engine stream's event after that stream's last reader.
-    landed: Vec<CudaEvent>,
+    /// Per half: the engine stream's event after that stream's last reader.
     used: Vec<CudaEvent>,
     /// Streams issued since the load: the next one's half.
     issued: u64,
@@ -483,6 +596,10 @@ pub struct XStream {
     /// Per layer the rule's constants: `None` for a layer the source holds
     /// no stage stack of.
     consts: Vec<Option<Constants>>,
+    /// The landing batches' rows and events ([`LandRows`]), and per layer
+    /// how many batches its last stream took.
+    land: LandRows,
+    land_n: Vec<usize>,
 }
 
 impl XStream {
@@ -574,7 +691,8 @@ impl XStream {
                 .map(|_| ctx.new_event(None))
                 .collect::<Result<Vec<_>, _>>()
         };
-        let (landed, used) = (new_events(HALVES)?, new_events(HALVES)?);
+        let used = new_events(HALVES)?;
+        let land = LandRows::new(ctx, layers, cfg.experts)?;
         let lane = start_lane(ctx, source, slot_bytes, &cfg)?;
         let mut x = XStream {
             consts: Vec::new(),
@@ -583,7 +701,6 @@ impl XStream {
             ring,
             rows,
             lane,
-            landed,
             used,
             issued: 0,
             cur: vec![None; layers],
@@ -594,6 +711,8 @@ impl XStream {
             rank: Vec::new(),
             lane_b_per_us: 0.0,
             report: XReport::default(),
+            land,
+            land_n: vec![0; layers],
         };
         x.lane_b_per_us = x.probe()?;
         x.consts = (0..layers).map(|l| x.constants_of(l)).collect();
@@ -731,18 +850,22 @@ impl XStream {
     /// `n_card` the stage stacks' experts. The rule's set
     /// ([`stream_tail`]) cut at the half and at the balance streams: the
     /// half's rows written, the copies issued onto the copy stream behind
-    /// the half's last reader, the landed event recorded, and the engine
-    /// stream `engine` made to wait for it. A layer that streams nothing
-    /// issues nothing. Refused by name: a layer with no stage stack, a
-    /// layer streaming twice before its read, a staging failure, and the
-    /// rule's own refusals.
+    /// the half's last reader, a batch event recorded after each batch's
+    /// last copy ([`land_batch_size`]) — the engine stream waits for none of
+    /// them here; the layer's card route waits each batch before the GEMM
+    /// batch over its slots. A layer that streams nothing issues nothing.
+    /// Refused by name: a layer with no stage stack, a layer streaming twice
+    /// before its read, a staging failure, and the rule's own refusals.
     #[allow(
         clippy::too_many_arguments,
         reason = "the unit, its width and counts, the host set, the pick, the stage row and the engine stream (rust-quality R8)"
     )]
     pub fn layer(
         &mut self,
-        engine: &CudaStream,
+        // The engine stream: no longer waited here — the layer's card route
+        // waits each batch before the GEMM batch over its slots
+        // (`XStream::wait_layer` for the wholesale form).
+        _engine: &CudaStream,
         unit: BatchKey,
         cols: usize,
         counts: &[u32],
@@ -819,7 +942,8 @@ impl XStream {
         if take > 0 {
             let half = (self.issued % HALVES as u64) as usize;
             self.write_rows(half, stage, n_card)?;
-            let (bytes, backlog) = self.issue(engine, layer, half)?;
+            self.write_land_rows(layer);
+            let (bytes, backlog) = self.issue(layer, half)?;
             self.issued += 1;
             self.cur[layer] = Some(Batch { half, n: take });
             let ex = &mut self.excl[layer];
@@ -884,34 +1008,49 @@ impl XStream {
         Ok(())
     }
 
+    /// The ring batch rows of the ranked stream in `self.rank` for layer
+    /// `layer` ([`LandRows`]'s rows past the leading one): batch `b`'s row
+    /// names only its own ranks' experts, at their ring slots (slot `i` the
+    /// `i`-th ranked), every other expert [`HOST`].
+    fn write_land_rows(&mut self, layer: usize) {
+        let n = self.rank.len();
+        let per = land_batch_size(n);
+        self.land_n[layer] = n.div_ceil(per);
+        for b in 0..self.land_n[layer] {
+            let row = self.land.row_mut(layer, b + 1);
+            row.fill(HOST);
+            for i in (b * per)..n.min((b + 1) * per) {
+                row[self.rank[i] as usize] = u32::try_from(i).expect("a half's slots fit u32");
+            }
+        }
+    }
+
     /// Issue the ranked stream in `self.rank` of layer `layer` into half
     /// `half`: the copy stream waits for the half's last reader, each
-    /// expert's copies follow, the half's landed event after them, and the
-    /// engine stream waits for it. The bytes copied and the host
-    /// microseconds spent waiting for the staging backlog.
-    fn issue(
-        &mut self,
-        engine: &CudaStream,
-        layer: usize,
-        half: usize,
-    ) -> Result<(u64, u64), GpuError> {
+    /// expert's copies follow, and the batch an expert's copy closes records
+    /// its event after it ([`land_batch_size`]) — the engine stream's waits
+    /// are the card route's, a batch a GEMM batch. The bytes copied and the
+    /// host microseconds spent waiting for the staging backlog.
+    fn issue(&mut self, layer: usize, half: usize) -> Result<(u64, u64), GpuError> {
         self.copy.wait(&self.used[half])?;
         let rank = std::mem::take(&mut self.rank);
         let mut bytes = 0u64;
         let mut backlog = 0u64;
+        let per = land_batch_size(rank.len());
         let r = (|| {
             for (i, &id) in rank.iter().enumerate() {
                 let t = Instant::now();
                 self.wait_backlog()?;
                 backlog += micros(t);
                 bytes += self.copy_expert(layer, id, half, i)?;
+                if (i + 1) % per == 0 || i + 1 == rank.len() {
+                    self.land.event(layer, i / per).record(&self.copy)?;
+                }
             }
             Ok::<(), GpuError>(())
         })();
         self.rank = rank;
         r?;
-        self.landed[half].record(&self.copy)?;
-        engine.wait(&self.landed[half])?;
         Ok((bytes, backlog))
     }
 
@@ -1077,7 +1216,24 @@ impl XStream {
             ring_map: self.rows.dev_at(2 * b.half * e * 4),
             union_map: self.rows.dev_at((2 * b.half + 1) * e * 4),
             parts: at,
+            batches: (0..self.land_n.get(layer).copied().unwrap_or(0))
+                .map(|b| LandBatch {
+                    map: self.land.row_dev(layer, b + 1),
+                    event: Some(self.land.event(layer, b)),
+                })
+                .collect(),
         })
+    }
+
+    /// The engine stream `engine` waits for every batch of layer `layer`'s
+    /// stream — the contract the layer's card route honours batch by batch,
+    /// for a caller that reads the ring wholesale. Nothing for a layer that
+    /// streamed nothing.
+    pub fn wait_layer(&self, engine: &CudaStream, layer: usize) -> Result<(), GpuError> {
+        for b in 0..self.land_n.get(layer).copied().unwrap_or(0) {
+            engine.wait(&self.land.event(layer, b))?;
+        }
+        Ok(())
     }
 
     /// The streamed experts of `unit`'s layer, ascending: the host serve of

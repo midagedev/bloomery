@@ -1,0 +1,39 @@
+# pfcopy — lever 2 (per-batch landed events, the wait after the stack GEMMs) against main.
+# The prediction is the ppgap report's §③/⑤ lever 2, [derived] from the defaults' functional
+# decomposition (func-arm2-stepstats.log): the shadow's copies 18.4 ms and route GEMMs 8.4 ms run
+# one after the other behind one landed event a layer; batched, the shadow's card wall becomes
+# max(copies, GEMMs) + pick ≈ 22-23 ms of its 31.1, −0.30..−0.45 s of the 3,194 ms prompt.
+# Lever 1 (run-ahead admits from a routing-independent ranking) is stopped on paper: the only
+# rankings available at a unit's start are heat-blind (the rule's counts are zero at a fresh load,
+# the seed does not rank host experts), and the derivation below shows a heat-blind set roughly
+# doubles the host union to ~20 ms a layer, above the post-lever-1 shadow, eating the gain.
+# The functional run on the reviewer's tree (worker2, 2026-10-07, A6000, Q4, DRAFT off, the box shared with other
+# gates) read the warm 4096 arm at 2,850.6 ms with shadow 1,136.7 ms (23.7 a layer) against func-arm2's 3,194.0 and
+# 1,497.0: -343 ms, inside the band. Its DRAFT-on arms were void (a 591 % gate and seven rustc beside them), so the
+# defaults' rows below are the sitting's own: the draft's 2.85 GB of card bytes push ~890 more experts to the admits
+# (18.5 GB a 4096 prompt against ~17.6), the same copy-then-GEMM shape, so the same share [derived].
+# Wall [derived]: 6 arms x 4 rounds of a fresh Qwen3.8 load and prompt (~50-60 s each): 20-24 min.
+kind: ab
+question: does batching a layer's landing copies (a third a GEMM batch, each batch behind its own
+  landed event, the live slots first with no wait) shorten the Qwen3.8 prompt?
+term: pp tok/s @ P=4096, prose corpus, one ubatch, A6000, plan (a), the 0.2.6 defaults, DRAFT off —
+  (lever 2 − base) / base, paired by round; the defaults' draft-on rows at 4096 and 512 of the same
+  sitting are secondary, judged against the same band
+unit: %
+predict: +10.4..+16.4
+rounds: 4
+condition: the base (d9dac683, built in the base worktree whose box remote is
+  ~/repo/bloomery-pfcopy-base) and lever-2 generate_qwen3moe binaries alternate in one lease
+  (BLOOMERY_AB_ROUNDS=4 just depth-gpu-qwen4exp prose:4096@BLOOMERY_DRAFT=off
+  bin:/root/repo/bloomery-pfcopy-base/target/release/generate_qwen3moe:prose:4096@BLOOMERY_DRAFT=off
+  prose:4096 bin:/root/repo/bloomery-pfcopy-base/target/release/generate_qwen3moe:prose:4096
+  prose:512 bin:/root/repo/bloomery-pfcopy-base/target/release/generate_qwen3moe:prose:512), the
+  order rotated every round, no lever set but the term's DRAFT=off pair, no row [cpu-busy] or
+  [other-busy]; the secondary rows are the defaults (draft on) at 4096 and 512, each judged against
+  the same band; the same sitting's functional arms (BLOOMERY_STEP_STATS=1) hold the shadow sums to
+  the model above
+decide-in: land lever 2 (the batching in xstream.rs/swap.rs, the batched route in wide38.rs)
+decide-below: the pipelining did not reach the model's share — read the step-stats shadow sums
+  (which of copies, GEMMs or the pick moved) and an nsys lane-duty row before another change
+decide-above: a term the model missed (the pick's host path, launch overhead of the extra
+  per-batch places/remap/swiglu) — re-derive before landing
