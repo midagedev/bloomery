@@ -361,8 +361,8 @@ mod cli {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
-    use model::placement::workstation::{self, CardSpec};
-    use model::placement::{Machine, Plan, PlanLevers};
+    use model::placement::workstation::{self, CardSpec, HostRead};
+    use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
@@ -964,9 +964,16 @@ mod cli {
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
     /// card's experts, the tier card's when the plan has one, the stage
-    /// card's free bytes when the census read them, and each plan card's
-    /// device (`record::plan_devices`).
-    fn plan38_line(place: Place38, experts: Experts, plan: &Plan<'_>) -> String {
+    /// card's free bytes when the census read them, the PLE table's tier and
+    /// the reading of the host's room that chose it (`read`), and each plan
+    /// card's device (`record::plan_devices`). A plan whose PLE tier is not
+    /// one the reader takes is refused by name (`Plan::row_tier`).
+    fn plan38_line(
+        place: Place38,
+        experts: Experts,
+        plan: &Plan<'_>,
+        read: &HostRead,
+    ) -> Result<String, GateError> {
         let r = Record::new(&record::PLAN38)
             .w("place", place.name())
             .w("card", place.card().name)
@@ -984,9 +991,16 @@ mod cli {
             Some(free) => r.u("card_free", free),
             None => r,
         };
-        r.csv("devices", record::plan_devices(plan.machine))
+        let r = match plan.row_tier()? {
+            Some(Device::Host) => r.w("rows", "host"),
+            Some(Device::Nvme) => r.w("rows", "nvme"),
+            Some(other) => return Err(format!("the PLE table's tier {other:?}").into()),
+            None => r,
+        };
+        Ok(r.w("read", read.word())
+            .csv("devices", record::plan_devices(plan.machine))
             .w("cuda_order", record::cuda_order())
-            .line()
+            .line())
     }
 
     /// One pass of `rows` ids on the Qwen3.6 model: the argmax after the last.
@@ -1967,7 +1981,7 @@ mod cli {
             experts,
             slots,
         )?;
-        println!("{}", plan38_line(place, experts, &plan));
+        println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
         let residency = residency38(&plan, lever, Record::print)?;
         let mut m = Body38::open_placed_residency(
             file,
@@ -2049,7 +2063,10 @@ mod cli {
             &mtp,
             experts,
         )?;
-        println!("{}", plan38_line(place, experts, &plan.plan));
+        println!(
+            "{}",
+            plan38_line(place, experts, &plan.plan, &inputs.room.1)?
+        );
         let residency = residency38(&plan.plan, lever, Record::print)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,

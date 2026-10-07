@@ -1021,7 +1021,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not.",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -1035,6 +1035,8 @@ pub static PLAN38: Kind = Kind {
         opt("tier_experts", U64, "experts"),
         opt("card_free", U64, "B"),
         opt("why", Word, ""),
+        opt("rows", Word, ""),
+        opt("read", Word, ""),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
     ],

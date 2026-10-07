@@ -6,8 +6,10 @@
 //! run is refused there by the coverage check; then the placement puts every
 //! tensor but the routed stacks where its role says — the trunk, the
 //! hyper-connections, the PLE site's projections, the router, the shared
-//! expert and the head on the card, the PLE table on the host in its file
-//! bytes ([`ple_on_host`]), its rows gathered by the host — and the routed
+//! expert and the head on the card, the PLE table where the host's room says
+//! ([`placement::row_table_tier`]: on the host in its file bytes when the
+//! room holds it, else on the NVMe tier with its row-read room charged to
+//! the host), its rows gathered by the host — and the routed
 //! experts where [`Experts`] says: every one on the host
 //! ([`PlanInputs::plan`], the plan the program loads), or by the expert rule
 //! ([`PlanInputs::plan_with`] under [`Experts::Card`]): each eligible layer's
@@ -51,12 +53,13 @@ use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::workstation::{
-    A6000, CONTEXT, CardSpec, GRANULE, MARGIN, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
-    TIER_BATCH_RESERVE, TierBatchBytes, host, tier_batch_host_bytes, tier_batch_staging_bytes,
+    self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
+    TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host, tier_batch_host_bytes,
+    tier_batch_staging_bytes,
 };
 use crate::placement::{
-    self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor, ModelTensors,
-    PlacementError, Plan, PlanLevers, RoutedFormat, Unimplemented, Violation,
+    self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
+    Plan, PlanLevers, RoutedFormat, Unimplemented, Violation,
 };
 
 use runtime::stores::{
@@ -154,6 +157,13 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's recurrent and cache bytes.
     pub kv: KvLayout,
+    /// The host's available bytes when the inputs were read, with the
+    /// reading that decided ([`workstation::host_available_read`]): the PLE
+    /// table's tier follows it ([`placement::row_table_tier`]) — on the host
+    /// while the room holds the plan with the table there, else on the NVMe
+    /// tier. A gate that plans an arm by a room of its own sets it, read
+    /// [`HostRead::Given`].
+    pub room: (u64, HostRead),
 }
 
 /// Why a plan was refused.
@@ -237,9 +247,10 @@ fn joined(broken: &[Violation]) -> String {
 
 impl PlanInputs {
     /// `split`'s hyperparameters, then its tensors' roles, then its
-    /// description, the first that fails being the error; then the file is
-    /// refused if it has a feature the engine does not run
-    /// ([`PlacementError::Unimplemented`], every one listed).
+    /// description, then the host's room ([`PlanInputs::describe`]), the
+    /// first that fails being the error; then the file is refused if it has
+    /// a feature the engine does not run ([`PlacementError::Unimplemented`],
+    /// every one listed).
     pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
         let inputs = PlanInputs::describe(split)?;
         let missing = inputs.unimplemented();
@@ -278,18 +289,24 @@ impl PlanInputs {
         Ok(())
     }
 
-    /// [`PlanInputs::read`] without the refusal of unimplemented features.
+    /// [`PlanInputs::read`] without the refusal of unimplemented features:
+    /// the file's description and the host's room
+    /// ([`workstation::host_available_read`]), a room that cannot be read
+    /// refused by name — the PLE table's tier would follow a room nobody
+    /// read.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let chat = chat_of(split, None, None)?;
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
+        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
             model,
             spec,
             kv,
+            room,
         })
     }
 
@@ -300,8 +317,9 @@ impl PlanInputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`, every routed expert and the PLE table on the
-    /// host ([`PlanInputs::plan_with`] under [`Experts::Host`]).
+    /// the placement's `levers`, every routed expert on the host and the PLE
+    /// table where [`PlanInputs::room`] says ([`PlanInputs::plan_with`] under
+    /// [`Experts::Host`]).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -313,11 +331,12 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`, the routed experts where `experts` says and
-    /// the PLE table on the host; refused past [`KERNEL_POSITIONS`], when it
-    /// cannot be built, or when it breaks an invariant; a machine whose stage
-    /// card reserves bytes for an MTP draft ([`MTP_RESERVE`]) is refused by
-    /// name, as is a tier machine under [`Experts::Host`]. A card plan
-    /// whose budget leaves no expert on the card is the [`Experts::Host`]
+    /// the PLE table where [`PlanInputs::room`] says
+    /// ([`placement::row_table_tier`]); refused past [`KERNEL_POSITIONS`],
+    /// when it cannot be built, or when it breaks an invariant; a machine
+    /// whose stage card reserves bytes for an MTP draft ([`MTP_RESERVE`]) is
+    /// refused by name, as is a tier machine under [`Experts::Host`]. A card
+    /// plan whose budget leaves no expert on the card is the [`Experts::Host`]
     /// plan of the same levers.
     pub fn plan_with<'a>(
         &'a self,
@@ -404,9 +423,10 @@ impl PlanInputs {
     /// expert rule over [`card_routed`]'s layers within each card's budget
     /// less `reserve` ([`placement::plan_routed_reserving`]) — on a machine
     /// with expert tier cards, the stage cards first and each tier the next
-    /// ids after them (plan (b′), [`machine_bp`]); then the PLE table moved
-    /// to the host ([`ple_on_host`]). A tier machine under [`Experts::Host`]
-    /// is refused by name: its tier would hold nothing.
+    /// ids after them (plan (b′), [`machine_bp`]); then the PLE table's tier
+    /// by the host's room ([`placement::row_table_tier`]). A tier machine
+    /// under [`Experts::Host`] is refused by name: its tier would hold
+    /// nothing.
     fn target<'a>(
         &'a self,
         machine: &'a Machine,
@@ -453,8 +473,8 @@ impl PlanInputs {
     /// The target's plan, unchecked, under the card rule `rule` over `kv`'s
     /// per-layer bytes: every routed expert on the host for `None`, else the
     /// expert rule over the layers whose routed stacks `rule` loads within
-    /// each card's budget less `reserve`; then the PLE table moved to the
-    /// host.
+    /// each card's budget less `reserve`; then the PLE table's tier by the
+    /// host's room ([`placement::row_table_tier`]).
     fn target_rule_of<'a>(
         &'a self,
         machine: &'a Machine,
@@ -476,14 +496,14 @@ impl PlanInputs {
                 reserve,
             )?,
         };
-        ple_on_host(&mut plan)?;
+        placement::row_table_tier(&mut plan, self.room.0, UBATCH_PLANNED)?;
         Ok(plan)
     }
 
     /// The target's plan, unchecked, under the card rule `rule`: every
     /// routed expert on the host for `None`, else the expert rule over the
     /// layers whose routed stacks `rule` loads within each card's budget
-    /// less `reserve`; then the PLE table moved to the host.
+    /// less `reserve`; then the PLE table's tier by the host's room.
     fn target_rule<'a>(
         &'a self,
         machine: &'a Machine,
@@ -755,60 +775,6 @@ impl PlanInputs {
             arena_bytes: arena,
         })
     }
-}
-
-/// `plan` with the PLE table's one segment moved from the NVMe tier, where
-/// the placement's role rule puts a row-gathered table, to the host in its
-/// file bytes, and its bytes from `nvme_bytes` to the host's tables (and out
-/// of the host's headroom). Every step reads the table's hashed rows from
-/// host RAM before its launch, so its pages belong to the host set a load
-/// reads in and may lock ([`placement::host_lock::HostSet`]): a first touch
-/// in a step is a read from the drive. In this architecture the one
-/// [`Role::EngramTable`] is the PLE table; a file without one is left as it
-/// is. A PLE row of other than one NVMe file segment is refused by name.
-fn ple_on_host(plan: &mut Plan<'_>) -> Result<(), PlacementError> {
-    let model = plan.model;
-    for r in &mut plan.rows {
-        let Some(t) = model
-            .tensors
-            .get(r.tensor)
-            .filter(|t| t.role == Role::EngramTable)
-        else {
-            continue;
-        };
-        let refuse = |detail: String| PlacementError::Tensor {
-            name: t.name.clone(),
-            detail,
-        };
-        let n = r.segments.len();
-        let [s] = r.segments.as_mut_slice() else {
-            return Err(refuse(format!("the PLE table in {n} segments, not one")));
-        };
-        if (s.device, s.format) != (Device::Nvme, Format::NvmeFile) {
-            return Err(refuse(format!(
-                "the PLE table on {:?} as {}, not the NVMe tier's file bytes",
-                s.device, s.format
-            )));
-        }
-        let b = s.resident_bytes;
-        let nvme = plan.nvme_bytes.checked_sub(b).ok_or_else(|| {
-            refuse(format!(
-                "the PLE table's {b} bytes pass the NVMe tier's {}",
-                plan.nvme_bytes
-            ))
-        })?;
-        let tables = plan.host.table_bytes.checked_add(b).ok_or_else(|| {
-            refuse(format!(
-                "the host's {} table bytes and the PLE table's {b} pass u64",
-                plan.host.table_bytes
-            ))
-        })?;
-        plan.nvme_bytes = nvme;
-        plan.host.table_bytes = tables;
-        plan.host.headroom_bytes -= i128::from(b);
-        (s.device, s.format) = (Device::Host, Format::HostFile);
-    }
-    Ok(())
 }
 
 /// A draft plan's card terms: its granules (dense, experts, rounding), its
@@ -3001,6 +2967,7 @@ mod tests {
         };
         use super::mtp::{draft, file};
         use crate::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
+        use crate::placement::workstation::HostRead;
         use crate::placement::{
             self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Plan,
             PlanLevers, Role,
@@ -3107,6 +3074,7 @@ mod tests {
                 },
                 spec,
                 kv,
+                room: (u64::MAX, HostRead::Given),
             }
         }
 
@@ -3368,8 +3336,8 @@ mod tests {
             machine_bp, machine_for_experts, tier_batch_of,
         };
         use crate::placement::workstation::{
-            A6000, CONTEXT, MARGIN, OS_RESERVE, ROW_CACHE_RESERVE, RTX_3090, SCRATCH,
-            TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes,
+            A6000, CONTEXT, MARGIN, OS_RESERVE, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+            TIER_BATCH_RESERVE, TierBatchBytes,
         };
 
         // PIN(2026-10-02): the tier's block scratch is its block route's
@@ -3456,11 +3424,14 @@ mod tests {
                     vec![(TIER_BATCH_RESERVE.to_string(), 845_710_360)]
                 );
                 let names: Vec<&str> = m.host.reserves.iter().map(|(n, _)| n.as_str()).collect();
-                assert_eq!(
-                    names,
-                    [ROW_CACHE_RESERVE, OS_RESERVE, TIER_BATCH_HOST_RESERVE]
-                );
-                assert_eq!(m.host.reserves[2].1, 839_188_480);
+                // PIN(2026-10-07): the OS reserve and the tier batch's rows;
+                // was [ROW_CACHE_RESERVE, OS_RESERVE, TIER_BATCH_HOST_RESERVE].
+                // workstation::host() carries the OS's reserve alone: the row
+                // reserve is a plan's, set aside while its row-gathered tables
+                // lie on the NVMe tier (HostTotals::row_reserve_bytes), so the
+                // machine's list is its host's plus the tiers' batch rows.
+                assert_eq!(names, [OS_RESERVE, TIER_BATCH_HOST_RESERVE]);
+                assert_eq!(m.host.reserves[1].1, 839_188_480);
                 assert_eq!(m.host.usable_bytes, a.host.usable_bytes);
             }
         }
