@@ -108,7 +108,7 @@ pub enum Experts {
 /// type alone: a stack of one of these types in a place the card leg does not
 /// run it in (a Q5_1, Q8_0 or IQ4_NL gate or up, a Q4_K, Q5_K, IQ3_XXS or
 /// IQ4_XS down) is refused by
-/// name at load (`Card38::new`, `Qwen38Stacks::of`). A stack of any other type
+/// name at load (`Card38::new`, `swap38::stacks`). A stack of any other type
 /// keeps its layer's experts on the host ([`host_only_reason`]).
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {

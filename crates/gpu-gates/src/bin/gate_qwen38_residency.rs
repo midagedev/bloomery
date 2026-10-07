@@ -31,7 +31,7 @@
 //!   name).
 //! - `transform`: after the history, every expert the machine admitted holds
 //!   in its slot, part by part, the bytes a static load uploads for it —
-//!   the file's Q4_K gate and up, Q5_1 down (mutant: `Qwen38Stacks::names`
+//!   the file's Q4_K gate and up, Q5_1 down (mutant: `swap38::stacks`' names
 //!   returns the gate and the up swapped, so the up's bytes stage into the
 //!   gate's stack).
 //! - `passes` (green-only): a history's boundaries end, in order, no pass,
