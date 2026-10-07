@@ -1062,8 +1062,11 @@ const CARD_ROUNDING_Q3: u64 = 397_191_680;
 // each stack in whole 2 MiB granules past CARD_DENSE_Q3 + CARD_ROUNDING_Q3, within CARD_PLANS'
 // own budgets: the machine terms are none of the file's — the same usable, cache, context,
 // scratch and route scratch, margin and draft reserve, the draft's own plan unchanged beside the
-// target (it borrows the target's matrices; the Q6_K head's 68,736 B of activation bytes enter
-// the CardOver total alone, not the spread's budget)].
+// target (it borrows the target's matrices)]. PIN(2026-10-07): the draft reserve the spread fills
+// within now holds the Q6_K head's 68,736 B of activation bytes as the CardOver total does
+// (`MtpInputs::arena_bytes`, round q3seat); every drafted row here left 400,148 B or more of slack
+// before it, so no row moves [derived: the q3seat replica reproduced all eight drafted rows'
+// expert bytes, the least slack the 3090's at ctx 4,096 and U 512].
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
