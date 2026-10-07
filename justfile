@@ -771,7 +771,8 @@ clef-hidden *ARGS:
 # batch set within the borrowed band with the router's flips named, the step after each set's prompt (4, 1,024 and
 # 3,000 positions), D3K's prompt by passes = by steps, and the refusals. Loads the whole host set: alone in a batch,
 # under the big-load lock.
-[group('solo')]
+# solo-real, reason r1 (the whole host set under the big-load lock; not both cards, no host-memory pin): the fixture tier balances it.
+[group('solo-real')]
 [group('v41-load')]
 gate-gpu-qwen4exp-e2e:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
@@ -783,7 +784,8 @@ gate-gpu-qwen4exp-e2e:
 # clears the band — the row-list head against the full head, the target's streams paired with ik's hidden rows, the
 # captured walks = the eager ones, and the refusals and the NaN fault. Loads the whole host set: alone in a batch, under
 # the big-load lock.
-[group('solo')]
+# solo-real, reason r1 (the whole host set under the big-load lock; not both cards, no host-memory pin): the fixture tier balances it.
+[group('solo-real')]
 [group('v41-load')]
 gate-gpu-qwen4exp-mtp:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
@@ -1420,10 +1422,11 @@ weekly-gpu-ds41-serve:
 # with flips landed, every admitted slot byte for byte a static load's, the passes' kinds and kept rows (the prompt one
 # pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Plan (a) on the A6000 (the
 # gate plans with the A6000 machine). Loads the whole host set: alone in a batch, under the big-load lock.
+# Stays solo on the A6000 (no conversion): the fixture tier refuses it (66), the binary opens the real file whatever the tier names.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-residency:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = real ] || { echo "gate-gpu-qwen38-residency: no fixture tier yet (the router double, R4): it opens the real file whatever the tier names (exit 66)" >&2; exit 66; } && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
 
 # Qwen3.8 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier on the 3090, its decode walks (a
 # step and the 2-, 3- and 4-row verifies) and its ubatch prompt walk serving the tier. The reference is the same plan
@@ -1438,6 +1441,7 @@ gate-gpu-qwen38-residency:
 # steps bit for bit. --lost: the tier's stream held behind a host flag, the step named as a lost card, CardLost, the
 # next step refused. Up to five loads, one after the other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a
 # batch.
+# solo, reason r2 (both cards, both gate locks; no host-memory pin): stays solo in the fixture tier, which runs it in lane X in seconds.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
