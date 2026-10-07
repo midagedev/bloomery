@@ -12,7 +12,7 @@ crates/serve/src/decide.rs 1 the decision server's connection threads, spawned b
 crates/decision/src/pool.rs 1 the head's resident workers, one per CPU, started on first use by the decision bins, gates and server, never pinned
 crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those never pin
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
-crates/model/src/arch/deepseek41/fixture.rs 1 the gate fixture's builder, a gate-side tool
+crates/model/src/fixture/plan.rs 1 the gate fixture's builder, a gate-side tool
 crates/model/src/placement/host_lock.rs 1 PENDING (triage): the host set's walk at load, spawned by the step thread after pin_caller — every chunk on one cpu
 crates/model/src/r8file.rs 2 PENDING (triage): the r8 repack and check at load; available_parallelism reads the pinned caller's mask, so one thread
 crates/model/src/bin/bench_v41_host.rs 1 a bench binary
