@@ -53,6 +53,58 @@ The ppgap levers 1–4 together predict 1,258 → 2,000–2,700 tok/s at P = 409
 
 MiMo R5–R8, the levers 3–4 and the fixture tier may land later in the line.
 
+State on 2026-10-08 07:00 (main `d78c38d6`): the cleflayout fix, V4.1 vision in the server (`--mmproj`), the second
+decision model (lev) and pfcopy lever 2 (timed: pp4096 +3.2 %, under its band; cause below) are on main. Open: MiMo
+through R4 (worker1's train 2 carries R3a and the lifts), then the user-facing pass and the tag.
+
+### What the 10-07/08 night left (leader — train 1 `68c0c067`, 143/143 green; train 2 running)
+
+**leader**
+- visseat2: the FAIL-first of `mmproj_the_placeholder_expands_to_the_span` was not run (rc 75, both cards held by
+  train 2); rerun on the mutant tree after train 2. XS.
+- visseat2: cuda-core 0.3.1 `DeviceBuffer::zeroed`/`from_host` allocate on the thread's current context but record
+  `stream.context()` → nvlabs-ledger row 41; `serve_seats/ds41.rs` `on_encoder_card` is the workaround, removed when
+  capsync binds at allocation. S.
+- visseat2: `encoder_seat` (`serve_seats/ds41.rs`) and `seat_of` (`gate_ds41_serve.rs`) are two copies of one rule →
+  one owner in the lib. S. The card-name token `.replace(' ', "_")` in five places → one helper. XS.
+- visseat2: `--place a` with the DSpark draft on the 3090 puts the encoder beside the draft with no fit check. S.
+  Loading the encoder after the model costs ≤ 1.1 s a start [derived] that overlap would save. S.
+- No gate builds the release feature set (`glm5next,clef,vision`); a weekly item would close the binary cell. S.
+  README.ko.md vision and lev rows (the leader writes Korean). XS.
+- decidelat (design, 2026-10-08): R0 decidemeasure → R1 resetzero (−3.3..−3.8 ms) → R2 hosthead2 (head 22–28 → 5–8
+  ms) ∥ R3 decideprefix (36-id prefix, −8.7/−22 ms) → R4 card head only on R2's residual → R5 schema-first opt-in.
+  A6000 103 → ~69 ms, 3060 225 → ~165 ms [derived]. After train 2. M.
+- T: `tools/gpu-gate.sh --cmd` (lev-dump.sh symlinks itself into `target/release` to take the card lock). S.
+- T: `just records-refresh` plans `tools/flow/plans/ds41-p*.rec` from live MemAvailable (the same code gave three
+  different plans); pin the planning machine's memory figure. S.
+- T: gate-paths rows for `gpu-mimo2/**`, `app/arch/mimo2/**`, `models/**`, `model/lib.rs`, `gpu/fault.rs`,
+  `flash_gqa`/rope, `host/swap_source.rs`, and worker2's nvtier patch. S.
+- e2eharness: the named-tie path (second → tie_numbers → tie_allowed) never fires on any recipe set (0 ties
+  measured), so its mutant stays green; needs a forced-tie arm or a tie set. S.
+
+**worker1**
+- `BreakEven` lib test repeats the qwen38 seat's rate literals. S.
+- Stem/req/opt/required tables duplicated between `glm5next` and `mimo2` `roles.rs` → one lift. S.
+- e2e harness conversions next: qwen4exp (−205 lines; a short tap becomes a named panic), qwen3moe/qwen35moe (their
+  rel/quant_gap differ in algorithm: rename, not merge). S–M.
+
+**worker2**
+- A contended load picks a lighter Qwen3.8 prompt plan for the whole process: the lane probe at load sets m*, a probe
+  beside another load reads low (7.4 vs 20.6 GB/s), and the process then admits ~30 % fewer experts (4,095 vs 5,805
+  at 4096) for its life. The sitting runner tags it [probe-off]; the engine does not correct it. Derive among:
+  re-probe at the first prompt call, max of N probes, a quiet probe point the engine controls, or the call's own
+  measured copy rate updating m*. S–M.
+- `pickrate` (next pfcopy lever): pfcopy lever 2 gave +3.2 % because the pick's copies run at ~15 GB/s through one
+  staging thread (~24 ms a layer); N copy threads at the lane's 20 GB/s ≈ −0.29 s at pp4096 (+9..+10 %), −51..−57 ms
+  at Q4 512 [derived]. M.
+- iqtile follow-up: `tile_units` IQ rows in `crates/model/src/ops.rs`. S.
+- pickrule: the triple measured pp4096 −399 ms (−12.8 %) but pp512 +57 ms slower; redesigned (τ a per-width level,
+  0.125 µs × card picks); implementation running. M.
+- nvtier: R2a held until R2b (the paged plan's union reads twice until the host-leg wiring). R3 sitting approved by
+  the user (2026-10-08, ~25–30 min, R0's 20 s re-measure inside). The default at small RAM (max arena when room < ½
+  host-leg bytes) trades pp4096 610–700 → 390–430 for decode 13–19 → 26–29 [derived]: the landing states that cost in
+  the coverage table and the README limits.
+
 ## Top priority: the common-machine gap (GitHub #1, the user, 2026-10-07)
 
 A user measured bloomery 0.2.5 against Strata on one machine and one file: RTX 5090 32 GB, Core Ultra 9 285K (AVX2 +
