@@ -8,8 +8,11 @@
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 
-use engram::{Engram, EngramError, Site};
+use engram::rows::SplitTable;
+use engram::{Engram, EngramError, RowTable, Site};
+use gguf::Split;
 
 /// The split set the gates open: the directory of [`gguf::v41::model`].
 fn model_dir() -> String {
@@ -140,10 +143,16 @@ fn hw_engram_rows_match_pread() {
 /// row. An off-by-one stride there, or a straddling row copied short, would be
 /// invisible to the borrowing gates above. The sample carries the page
 /// straddler for exactly that reason.
+///
+/// The same table read through its split's own mapping ([`SplitTable`], the
+/// read Qwen3.8's PLE table takes from the NVMe tier) copies the same bytes,
+/// and its advice takes rows that start mid-page: each is rounded out to the
+/// whole pages that hold it, which `madvise` requires.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 split"]
 fn hw_engram_copy_rows_matches_row() {
     let engram = open();
+    let split = Arc::new(Split::open(gguf::v41::model()).unwrap());
 
     for site in engram.sites() {
         let ids = sample(site, 64);
@@ -166,6 +175,24 @@ fn hw_engram_copy_rows_matches_row() {
             site.copy_rows(&ids, &mut copied[..ids.len() * stride - 1])
                 .is_err(),
             "{}: a short buffer must be refused",
+            site.name()
+        );
+
+        let table = SplitTable::open(Arc::clone(&split), site.name()).unwrap();
+        assert_eq!(table.row_bytes(), site.row_bytes(), "{}", site.name());
+        table.prefetch(&ids).unwrap();
+        let mut via_split = vec![0u8; ids.len() * stride];
+        table.copy_rows(&ids, &mut via_split).unwrap();
+        assert!(
+            via_split == copied,
+            "{}: the split's mapping copies other bytes than the site's",
+            site.name()
+        );
+        assert!(
+            table
+                .copy_rows(&ids, &mut via_split[..ids.len() * stride - 1])
+                .is_err(),
+            "{}: a short buffer must be refused through the split",
             site.name()
         );
     }

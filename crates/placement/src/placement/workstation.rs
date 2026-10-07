@@ -107,16 +107,23 @@ pub const MARGIN: u64 = 1 << 30;
 /// `cuMemGetAllocationGranularity` reports the same size].
 pub const GRANULE: NonZeroU64 = NonZeroU64::new(2 * MIB).expect("2 MiB is not zero");
 
-/// The host's usable bytes, its engram row cache, and the OS and everything
-/// else [measured, `free -b`].
+/// The host's usable bytes and the OS and everything else [measured,
+/// `free -b`].
 pub const HOST_USABLE: u64 = 270_071_001_088;
-pub const ROW_CACHE: u64 = 4_294_967_296;
 pub const OS_OTHER: u64 = 6_694_629_376;
 
-/// What the host tier's two reserves are called: [`ROW_CACHE`], and
-/// [`OS_OTHER`] — what the OS and every other process held when
-/// [`HOST_USABLE`] was measured.
-pub const ROW_CACHE_RESERVE: &str = "engram row cache";
+/// The engram row cache: the hot rows a reader of row-gathered tables keeps
+/// beside the drive, which a plan sets aside on the host while such a table
+/// lies on the NVMe tier and its maker sized no reader of its own
+/// ([`super::row_table_tier`] replaces it with [`super::row_room`]).
+pub const ROW_CACHE: u64 = 4_294_967_296;
+
+/// The page the row room counts in ([`super::row_room`]): the host's base
+/// page, 4 KiB on x86_64, the unit a fault and an advise read.
+pub const ROW_PAGE: u64 = 4096;
+
+/// What the machine's [`OS_OTHER`] is called: what the OS and every other
+/// process held when [`HOST_USABLE`] was measured.
 pub const OS_RESERVE: &str = "OS and other";
 
 /// The serving context the plans are made for.
@@ -159,15 +166,14 @@ fn tier(spec: CardSpec) -> Card {
     card(spec, 0..0, false)
 }
 
-/// The host tier with its reserves.
+/// The host tier with its reserves: the OS's alone. What a plan's own
+/// tables need beside them — the row reserve of its row-gathered tables on
+/// the NVMe tier — is the plan's ([`super::HostTotals::row_reserve_bytes`]).
 #[must_use]
 pub fn host() -> Host {
     Host {
         usable_bytes: HOST_USABLE,
-        reserves: vec![
-            (ROW_CACHE_RESERVE.to_string(), ROW_CACHE),
-            (OS_RESERVE.to_string(), OS_OTHER),
-        ],
+        reserves: vec![(OS_RESERVE.to_string(), OS_OTHER)],
     }
 }
 
@@ -617,6 +623,9 @@ pub enum HostRead {
     /// The room under the cgroup v2 memory limit at `path`, as
     /// [`cgroup_v2_path`] names it under `/sys/fs/cgroup`.
     Cgroup { path: String },
+    /// A room the caller gave instead of reading this machine (a gate that
+    /// plans an arm by the room it names).
+    Given,
 }
 
 impl fmt::Display for HostRead {
@@ -628,17 +637,20 @@ impl fmt::Display for HostRead {
                 "the room under the cgroup v2 memory limit at /sys/fs/cgroup{path} \
                  (memory.max − memory.current + active_file + inactive_file)"
             ),
+            HostRead::Given => write!(f, "a room the caller gave, not read from this machine"),
         }
     }
 }
 
 impl HostRead {
-    /// One word for a `key=value` line: `MemAvailable`, or `cgroup:<path>`.
+    /// One word for a `key=value` line: `MemAvailable`, `cgroup:<path>`, or
+    /// `given`.
     #[must_use]
     pub fn word(&self) -> String {
         match self {
             HostRead::MemAvailable => "MemAvailable".to_string(),
             HostRead::Cgroup { path } => format!("cgroup:{path}"),
+            HostRead::Given => "given".to_string(),
         }
     }
 }

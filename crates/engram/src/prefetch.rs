@@ -1,4 +1,6 @@
-//! A helper thread that turns one token's engram read into a memcpy.
+//! A helper thread that turns one token's engram read into a memcpy — of an
+//! [`crate::Engram`]'s sites, or of any other row-gathered tables
+//! ([`crate::RowTables`], [`Prefetcher::over`]).
 //!
 //! The engine's step is its calling thread's serial time, so the question this
 //! module answers is not "how long does the read take" but "how many
@@ -31,7 +33,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::{Engram, EngramError, faults_thread};
+use crate::{Engram, EngramError, RowTable, RowTables, faults_thread};
 
 /// How [`Prefetcher::with_options`] starts its helper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,13 +166,26 @@ impl Prefetcher {
         max_rows_per_site: &[usize],
         options: HelperOptions,
     ) -> Result<Prefetcher, EngramError> {
-        let sites = engram.sites();
-        if max_rows_per_site.len() != sites.len() {
+        Prefetcher::over(engram, max_rows_per_site, options)
+    }
+
+    /// [`Prefetcher::with_options`] over any row-gathered tables
+    /// ([`RowTables`]: an [`Engram`]'s sites, or a table in its load's split,
+    /// [`crate::rows::SplitTable`]), sized for at most
+    /// `max_rows_per_site[t]` rows of table `t` per token.
+    pub fn over(
+        tables: Arc<dyn RowTables>,
+        max_rows_per_site: &[usize],
+        options: HelperOptions,
+    ) -> Result<Prefetcher, EngramError> {
+        if max_rows_per_site.len() != tables.count() {
             return Err(EngramError::Prefetch(
                 "max_rows_per_site must have one entry per site",
             ));
         }
-        let row_bytes: Vec<usize> = sites.iter().map(|s| s.row_bytes() as usize).collect();
+        let row_bytes: Vec<usize> = (0..tables.count())
+            .map(|i| table_of(tables.as_ref(), i).map(|t| t.row_bytes() as usize))
+            .collect::<Result<_, _>>()?;
         let buf_len: usize = max_rows_per_site
             .iter()
             .zip(&row_bytes)
@@ -200,7 +215,7 @@ impl Prefetcher {
                 threads::helper::Placement::Pin,
             ),
             move || {
-                helper(&engram, options, &job_rx, &done_tx);
+                helper(tables.as_ref(), options, &job_rx, &done_tx);
             },
         )
         .map_err(|e| match e {
@@ -375,10 +390,18 @@ impl Drop for Prefetcher {
 /// Errors travel back with the buffer rather than ending the helper: the owner
 /// is blocked in `wait` and has to be told, and the next token may well be
 /// fine.
-fn helper(engram: &Engram, options: HelperOptions, jobs: &Receiver<Job>, done: &Sender<Filled>) {
+fn helper(
+    tables: &dyn RowTables,
+    options: HelperOptions,
+    jobs: &Receiver<Job>,
+    done: &Sender<Filled>,
+) {
     let HelperOptions { mode, classify, .. } = options;
     let base = faults_thread();
-    let sites = engram.sites();
+    // The sizing checked every table at `over`, so each index here names one.
+    let sites: Vec<&dyn RowTable> = (0..tables.count())
+        .filter_map(|i| tables.table(i))
+        .collect();
     while let Ok(mut job) = jobs.recv() {
         let mut err = None;
         let rows: u64 = job.ids.iter().map(|ids| ids.len() as u64).sum();
@@ -465,3 +488,11 @@ fn helper(engram: &Engram, options: HelperOptions, jobs: &Receiver<Job>, done: &
 /// floating caller or a core without SMT: the helper then floats too, off the
 /// caller's cpu ([`Prefetcher::with_options`]).
 pub use threads::helper::caller_sibling;
+
+/// Table `i` of `tables`, refused by name when the source counts it and
+/// holds none.
+fn table_of(tables: &dyn RowTables, i: usize) -> Result<&dyn RowTable, EngramError> {
+    tables.table(i).ok_or(EngramError::Prefetch(
+        "the row source counts a table it does not hold",
+    ))
+}

@@ -34,6 +34,11 @@
 //!   [`Site::copy_rows`] and [`prefetch::Prefetcher`] exist: the helper thread
 //!   advises, faults and copies, and the step thread gets one memcpy.
 //!
+//! The same row reads serve a row-gathered table another model's load maps
+//! through its [`gguf::Split`] ([`rows::SplitTable`]: Qwen3.8's PLE table
+//! when its plan leaves it on the NVMe tier), and a [`prefetch::Prefetcher`]
+//! reads either ([`RowTables`]).
+//!
 //! The header comes from [`gguf::inventory_of`], which parses headers only and
 //! never populates a mapping, and this crate maps each shard itself so the
 //! mapping can be `MADV_RANDOM`. The strict reader ([`gguf::Gguf`]) sizes
@@ -49,6 +54,7 @@ use memmap2::{Advice, Mmap, UncheckedAdvice};
 
 pub mod hash;
 pub mod prefetch;
+pub mod rows;
 
 pub use hash::Hash;
 
@@ -152,6 +158,8 @@ pub enum EngramError {
     },
     #[error("{name}: row {id} is past the {rows} rows the header states")]
     RowOutOfRange { name: String, id: u32, rows: u64 },
+    #[error("no shard of the split carries the row-gathered table {name}")]
+    MissingTable { name: String },
     #[error(
         "token {token} is past the {map} entries of the engram token map: not a token of this model"
     )]
@@ -241,10 +249,7 @@ impl Site {
             });
         }
 
-        // SAFETY: `sysconf` reads a static system value and touches no memory of
-        // ours; a negative return means the name is unknown, which _SC_PAGESIZE
-        // never is on the platforms this crate builds for.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        let page = page_size() as u64;
 
         let io = |op: &'static str| {
             move |source| EngramError::SiteIo {
@@ -350,25 +355,7 @@ impl Site {
     /// depth. The cost is one syscall per row, paid whether or not the page is
     /// already resident.
     pub fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
-        for &id in ids {
-            if u64::from(id) >= self.rows {
-                return Err(EngramError::RowOutOfRange {
-                    name: self.name.clone(),
-                    id,
-                    rows: self.rows,
-                });
-            }
-            // `advise_range` rounds the start down to a page and the kernel
-            // rounds the length up, so a row that straddles advises both pages.
-            self.map
-                .advise_range(
-                    Advice::WillNeed,
-                    self.file_offset(id) as usize,
-                    self.row_bytes as usize,
-                )
-                .map_err(|e| self.io_err("madvise(WILLNEED)", e))?;
-        }
-        Ok(())
+        self.view().prefetch(ids)
     }
 
     /// Fault `ids`' pages in and return only when they are resident.
@@ -381,20 +368,7 @@ impl Site {
     /// and `populate` after, which then waits on reads already in flight.
     /// Calling it alone on cold rows pays the device latency once per row.
     pub fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
-        for &id in ids {
-            if u64::from(id) >= self.rows {
-                return Err(EngramError::RowOutOfRange {
-                    name: self.name.clone(),
-                    id,
-                    rows: self.rows,
-                });
-            }
-            let (first, span) = self.page_span(self.file_offset(id), self.row_bytes);
-            self.map
-                .advise_range(Advice::PopulateRead, first, span)
-                .map_err(|e| self.io_err("madvise(POPULATE_READ)", e))?;
-        }
-        Ok(())
+        self.view().populate(ids)
     }
 
     /// How many rows of `ids` have every page in the page cache right now
@@ -406,42 +380,7 @@ impl Site {
     /// sees only the pages this process has mapped, so a cached-but-unmapped
     /// row reads as not resident.
     pub fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
-        const CHUNK: usize = 8;
-        let mut resident = 0u64;
-        for &id in ids {
-            if u64::from(id) >= self.rows {
-                return Err(EngramError::RowOutOfRange {
-                    name: self.name.clone(),
-                    id,
-                    rows: self.rows,
-                });
-            }
-            let (first, span) = self.page_span(self.file_offset(id), self.row_bytes);
-            let page = self.page as usize;
-            let mut all = true;
-            let mut at = first;
-            while all && at < first + span {
-                let len = (first + span - at).min(CHUNK * page);
-                let mut vec = [0u8; CHUNK];
-                // SAFETY: `at..at + len` is page-aligned and inside the live
-                // mapping (`page_span` clamps to it), and `vec` holds one byte
-                // for each of the at most `CHUNK` pages of that range.
-                let rc = unsafe {
-                    libc::mincore(
-                        self.map.as_ptr().add(at).cast_mut().cast(),
-                        len,
-                        vec.as_mut_ptr(),
-                    )
-                };
-                if rc != 0 {
-                    return Err(self.io_err("mincore", std::io::Error::last_os_error()));
-                }
-                all = vec[..len.div_ceil(page)].iter().all(|b| b & 1 == 1);
-                at += len;
-            }
-            resident += u64::from(all);
-        }
-        Ok(resident)
+        self.view().resident_rows(ids)
     }
 
     /// Every row of `ids`, in order, **copied** into `out`.
@@ -451,20 +390,19 @@ impl Site {
     /// the point: [`prefetch::Prefetcher`] calls this on its helper so the step
     /// thread never touches the mapping.
     pub fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError> {
-        let stride = self.row_bytes as usize;
-        let want = ids.len() * stride;
-        if out.len() != want {
-            return Err(EngramError::OutBufferSize {
-                name: self.name.clone(),
-                rows: ids.len(),
-                want,
-                got: out.len(),
-            });
+        self.view().copy_rows(ids, out)
+    }
+
+    /// The table's rows in the mapping, as the row reads see them.
+    fn view(&self) -> TableBytes<'_> {
+        let at = self.base as usize;
+        TableBytes {
+            name: &self.name,
+            path: &self.path,
+            bytes: &self.map[at..at + (self.rows * self.row_bytes) as usize],
+            row_bytes: self.row_bytes as usize,
+            page: self.page as usize,
         }
-        for (&id, slot) in ids.iter().zip(out.chunks_exact_mut(stride)) {
-            slot.copy_from_slice(self.row(id)?);
-        }
-        Ok(())
     }
 
     /// Drop `ids`' pages from this process and from the page cache, so the next
@@ -556,6 +494,225 @@ impl Site {
             ));
         }
         Ok(())
+    }
+}
+
+/// `sysconf(_SC_PAGESIZE)`: the unit a row's pages round to.
+fn page_size() -> usize {
+    // SAFETY: `sysconf` reads a static system value and touches no memory of
+    // ours; a negative return means the name is unknown, which _SC_PAGESIZE
+    // never is on the platforms this crate builds for.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize
+}
+
+/// One row-gathered table's bytes in a file mapping and the row reads over
+/// them — the advice, the residency query and the copy — for a [`Site`]'s
+/// own mapping and a [`rows::SplitTable`]'s split mapping alike. `bytes`
+/// lies inside a mapping that starts on a page boundary (every `mmap`
+/// does), so the whole pages a row's span rounds out to are the mapping's.
+struct TableBytes<'a> {
+    name: &'a str,
+    /// The file the mapping reads, for the refusals.
+    path: &'a Path,
+    bytes: &'a [u8],
+    row_bytes: usize,
+    /// `sysconf(_SC_PAGESIZE)`: the unit a row's pages round to.
+    page: usize,
+}
+
+impl TableBytes<'_> {
+    /// Rows in the table.
+    fn rows(&self) -> u64 {
+        (self.bytes.len() / self.row_bytes) as u64
+    }
+
+    /// Row `id`'s bytes; refused by name past the table, so a wrong id never
+    /// slices into the next tensor.
+    fn row(&self, id: u32) -> Result<&[u8], EngramError> {
+        let at = id as usize * self.row_bytes;
+        self.bytes
+            .get(at..at + self.row_bytes)
+            .ok_or_else(|| EngramError::RowOutOfRange {
+                name: self.name.to_owned(),
+                id,
+                rows: self.rows(),
+            })
+    }
+
+    /// The whole pages that hold row `id`: the row's start rounded down to a
+    /// page and its end up — a row that straddles a boundary names both.
+    fn pages(&self, id: u32) -> Result<(usize, usize), EngramError> {
+        let start = self.row(id)?.as_ptr() as usize;
+        let first = start / self.page * self.page;
+        let end = (start + self.row_bytes).div_ceil(self.page) * self.page;
+        Ok((first, end - first))
+    }
+
+    /// One `madvise(advice)` over each row's pages, `op` naming it in a
+    /// refusal.
+    fn advise(
+        &self,
+        ids: &[u32],
+        advice: libc::c_int,
+        op: &'static str,
+    ) -> Result<(), EngramError> {
+        for &id in ids {
+            let (first, len) = self.pages(id)?;
+            self.advise_pages(first, len, advice, op)?;
+        }
+        Ok(())
+    }
+
+    /// `madvise(advice)` over the whole pages that hold the table: once at a
+    /// load, `MADV_RANDOM` ([`rows::SplitTable::open`]).
+    fn advise_all(&self, advice: libc::c_int, op: &'static str) -> Result<(), EngramError> {
+        let start = self.bytes.as_ptr() as usize;
+        let first = start / self.page * self.page;
+        let end = (start + self.bytes.len()).div_ceil(self.page) * self.page;
+        self.advise_pages(first, end - first, advice, op)
+    }
+
+    /// One `madvise(advice)` over `first .. first + len`, whole pages of the
+    /// mapping `bytes` lies in.
+    fn advise_pages(
+        &self,
+        first: usize,
+        len: usize,
+        advice: libc::c_int,
+        op: &'static str,
+    ) -> Result<(), EngramError> {
+        // SAFETY: every caller rounds a span of `bytes` out to the whole pages
+        // that hold it, which lie inside the mapping `bytes` lies in (the
+        // type's contract); madvise reads and writes no memory of ours
+        // through them.
+        let rc = unsafe { libc::madvise(first as *mut libc::c_void, len, advice) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(self.io(op, std::io::Error::last_os_error()))
+        }
+    }
+
+    /// [`Site::prefetch`]'s read: `WILLNEED` over each row's pages.
+    fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.advise(ids, libc::MADV_WILLNEED, "madvise(WILLNEED)")
+    }
+
+    /// [`Site::populate`]'s read: `POPULATE_READ` over each row's pages.
+    fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.advise(ids, libc::MADV_POPULATE_READ, "madvise(POPULATE_READ)")
+    }
+
+    /// [`Site::resident_rows`]' count: the rows of `ids` whose pages `mincore`
+    /// reports all resident, a call per row of at most eight pages each.
+    fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
+        const CHUNK: usize = 8;
+        let mut resident = 0u64;
+        for &id in ids {
+            let (first, span) = self.pages(id)?;
+            let mut all = true;
+            let mut at = first;
+            while all && at < first + span {
+                let len = (first + span - at).min(CHUNK * self.page);
+                let mut vec = [0u8; CHUNK];
+                // SAFETY: `at .. at + len` is page-aligned and inside the
+                // mapping (`pages` rounds the row out to the mapping's own
+                // pages), and `vec` holds one byte for each of the at most
+                // `CHUNK` pages of that range.
+                let rc = unsafe { libc::mincore(at as *mut libc::c_void, len, vec.as_mut_ptr()) };
+                if rc != 0 {
+                    return Err(self.io("mincore", std::io::Error::last_os_error()));
+                }
+                all = vec[..len.div_ceil(self.page)].iter().all(|b| b & 1 == 1);
+                at += len;
+            }
+            resident += u64::from(all);
+        }
+        Ok(resident)
+    }
+
+    /// [`Site::copy_rows`]' copy: every row of `ids`, in order, into `out`
+    /// of exactly `ids.len()` rows.
+    fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError> {
+        let want = ids.len() * self.row_bytes;
+        if out.len() != want {
+            return Err(EngramError::OutBufferSize {
+                name: self.name.to_owned(),
+                rows: ids.len(),
+                want,
+                got: out.len(),
+            });
+        }
+        for (&id, slot) in ids.iter().zip(out.chunks_exact_mut(self.row_bytes)) {
+            slot.copy_from_slice(self.row(id)?);
+        }
+        Ok(())
+    }
+
+    fn io(&self, op: &'static str, source: std::io::Error) -> EngramError {
+        EngramError::SiteIo {
+            name: self.name.to_owned(),
+            path: self.path.to_path_buf(),
+            op,
+            source,
+        }
+    }
+}
+
+/// A row-gathered table a [`prefetch::Prefetcher`] reads: fixed-size rows by
+/// id, advised, populated, classified and copied ([`Site`], an engram site
+/// in its own mapping; [`rows::SplitTable`], a table in its load's split).
+pub trait RowTable: Send + Sync {
+    /// Bytes in one row.
+    fn row_bytes(&self) -> u64;
+    /// `WILLNEED` over `ids`' pages ([`Site::prefetch`]).
+    fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError>;
+    /// `POPULATE_READ` over `ids`' pages ([`Site::populate`]).
+    fn populate(&self, ids: &[u32]) -> Result<(), EngramError>;
+    /// The rows of `ids` already resident ([`Site::resident_rows`]).
+    fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError>;
+    /// `ids`' rows copied into `out` ([`Site::copy_rows`]).
+    fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError>;
+}
+
+impl RowTable for Site {
+    fn row_bytes(&self) -> u64 {
+        self.row_bytes
+    }
+
+    fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.view().prefetch(ids)
+    }
+
+    fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.view().populate(ids)
+    }
+
+    fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
+        self.view().resident_rows(ids)
+    }
+
+    fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError> {
+        self.view().copy_rows(ids, out)
+    }
+}
+
+/// The tables one [`prefetch::Prefetcher`] reads, in the order its jobs
+/// name them: an [`Engram`]'s sites, or one [`rows::SplitTable`].
+pub trait RowTables: Send + Sync {
+    /// How many tables a job names.
+    fn count(&self) -> usize;
+    /// Table `i`; `None` past [`RowTables::count`].
+    fn table(&self, i: usize) -> Option<&dyn RowTable>;
+}
+
+impl RowTables for Engram {
+    fn count(&self) -> usize {
+        self.sites.len()
+    }
+
+    fn table(&self, i: usize) -> Option<&dyn RowTable> {
+        self.sites.get(i).map(|s| s as &dyn RowTable)
     }
 }
 

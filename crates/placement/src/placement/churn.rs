@@ -151,6 +151,7 @@ mod tests {
                 table_bytes: 0,
                 shadow_bytes: 0,
                 reserve_bytes: 0,
+                row_reserve_bytes: 0,
                 headroom_bytes: headroom,
             },
             nvme_bytes: 0,

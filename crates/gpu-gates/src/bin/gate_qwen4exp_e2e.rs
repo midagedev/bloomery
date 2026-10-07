@@ -198,6 +198,17 @@
 //!   waiting for its commit is refused by name, moving nothing; and a
 //!   rollback of slot 1 (a verify's commit) leaves slot 0's continuation its
 //!   solo run's.
+//! - (z) the PLE table on the NVMe tier: the host plan made with the host's
+//!   room given ([`PlanInputs::room`]) as the host arm's need less one byte,
+//!   so the placement leaves the table on the NVMe tier with its row room
+//!   set aside, against the same plan at the reading's room, the table on
+//!   the host, both loaded at a ubatch of [`ZUB`]: each plan line names its
+//!   tier, and the NVMe arm's batch set as graph steps and as one eager
+//!   pass, and D3K's prefill as one call of three ubatches (its later two
+//!   read ahead) with the step after it, are the host arm's bit for bit —
+//!   every token, logit and store: the same rows decoded, only where they
+//!   are read from moves. The step thread's faults across each arm's graph
+//!   steps are printed.
 //!
 //! Named differences, not banded away: ik combines the block as
 //! `routed + σ(g)·shared`, ours as `hsum + shared·w` with the sigmoid weight
@@ -250,7 +261,8 @@ mod gate {
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
-    use model::placement::PlanLevers;
+    use model::placement::workstation::{HostNeed, HostRead, RTX_3090};
+    use model::placement::{Device, PlanLevers};
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
 
     /// Cache rows: D3K's step at position 3,000, with room.
@@ -507,6 +519,20 @@ mod gate {
         plan_levers: &PlanLevers,
         slots: usize,
     ) -> Result<Qwen38Model, GateError> {
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        Ok(open_at(experts, plan_levers, slots, ub, None)?.0)
+    }
+
+    /// [`open_slots`] at a ubatch of `ub`, the host's room the reading's or
+    /// `room` given ([`PlanInputs::room`]); with the tier the plan reads the
+    /// PLE table from, which the plan line names.
+    fn open_at(
+        experts: Experts,
+        plan_levers: &PlanLevers,
+        slots: usize,
+        ub: usize,
+        room: Option<u64>,
+    ) -> Result<(Qwen38Model, Option<Device>), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         if file.architecture() != Some("qwen4exp") {
@@ -515,8 +541,10 @@ mod gate {
         let t = Instant::now();
         // `describe`, not `read`: `read` refuses the chat surface's two
         // items too; `open_placed` refuses what `ALLOWED` does not name.
-        let inputs = PlanInputs::describe(&file)?;
-        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        let mut inputs = PlanInputs::describe(&file)?;
+        if let Some(r) = room {
+            inputs.room = (r, HostRead::Given);
+        }
         let machine = machine_for_experts(
             crate::gate_card::card()?,
             inputs.spec.layers.len(),
@@ -525,13 +553,18 @@ mod gate {
         );
         let plan = inputs.plan_with_slots(&machine, CTX as u64, plan_levers, experts, slots)?;
         let held = plan.n_l.iter().filter(|&&n| n > 0).count();
+        let tier = plan.row_tier()?;
         println!(
-            "plan card={} experts={experts:?} slots={slots} ctx_max={} host_experts={} \
-             card_experts={} card_layers={held}",
+            "plan card={} experts={experts:?} slots={slots} ctx_max={} ubatch={ub} host_experts={} \
+             card_experts={} card_layers={held} ple={} room={} read={} row_reserve={}",
             crate::gate_card::card()?.name,
             plan.ctx_max,
             plan.host.experts,
-            plan.cards[0].experts
+            plan.cards[0].experts,
+            tier_word(tier),
+            inputs.room.0,
+            inputs.room.1.word(),
+            plan.host.row_reserve_bytes
         );
         let mut m = Body38::open_placed_slots(file, &plan, &inputs, 0, levers.host(), ub, slots)?;
         m.set_mode(StepMode::Graph);
@@ -541,7 +574,18 @@ mod gate {
             m.layers().len(),
             t.elapsed().as_secs_f64()
         );
-        Ok(m)
+        Ok((m, tier))
+    }
+
+    /// A plan's PLE tier as the plan line prints it.
+    fn tier_word(tier: Option<Device>) -> &'static str {
+        match tier {
+            Some(Device::Host) => "host",
+            Some(Device::Nvme) => "nvme",
+            Some(Device::Card(_)) => "card",
+            Some(Device::Unused) => "unused",
+            None => "none",
+        }
     }
 
     // ------------------------------------------------------ (s) structure
@@ -3487,6 +3531,109 @@ mod gate {
         Ok(past && pending_ok && iso_ok && harness_ok)
     }
 
+    /// The (z) arms' ubatch: D3K's 3,001-position prefill runs as one call of
+    /// three ubatches (1,024, 1,024, 953), so the NVMe arm's first ubatch
+    /// reads its own rows and the two after it are read ahead.
+    const ZUB: usize = 1024;
+
+    /// One (z) arm's runs: the batch set as graph steps from a reset (with the
+    /// step thread's faults across them) and as one eager pass, and D3K's
+    /// prefill as one ubatch call with the graph step after it.
+    fn z_runs(
+        m: &mut Qwen38Model,
+        toks: &[u32],
+        prefill: &[u32],
+    ) -> Result<([Run; 3], engram::Faults), GateError> {
+        let before = engram::faults_thread();
+        let steps = run_steps(m, toks, StepMode::Graph, true)?;
+        let after = engram::faults_thread();
+        let faults = engram::Faults {
+            major: after.major - before.major,
+            minor: after.minor - before.minor,
+        };
+        let pass = run_pass(m, toks)?;
+        fresh(m)?;
+        let last = m.prompt38(prefill, Prompt38::Gemm)?;
+        let first = m.logits()?;
+        let next = m.step(&[last])?;
+        let logits = vec![first, m.logits()?];
+        let (stores, ple_ring) = stores(m)?;
+        let gemm = Run {
+            tokens: vec![last, next],
+            logits,
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores,
+            ple_ring,
+        };
+        Ok(([steps, pass, gemm], faults))
+    }
+
+    /// (z) The PLE table read from the NVMe tier: the host plan with the
+    /// host's room given as the host arm's need less one byte, so the rule
+    /// leaves the table on the NVMe tier, against the same plan at the
+    /// reading's room, the table on the host; both at a ubatch of [`ZUB`].
+    /// Each plan line names its tier; the NVMe arm's every token, logit and
+    /// store is the host arm's bit for bit — the same rows decoded, only
+    /// where they are read from moves — on the graph steps, the eager pass
+    /// and the ubatch call whose later ubatches are read ahead. The step
+    /// thread's faults across each arm's graph steps are printed.
+    fn ple_nvme(toks: &[u32]) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        let prefill = prefill.to_vec();
+        let levers = PlanLevers::default();
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let inputs = PlanInputs::describe(&file)?;
+        let machine = machine_for_experts(
+            RTX_3090,
+            inputs.spec.layers.len(),
+            u64::try_from(ZUB)?,
+            Experts::Host,
+        );
+        let host_need = HostNeed::of(
+            &inputs.plan_with_slots(&machine, CTX as u64, &levers, Experts::Host, 1)?,
+            0,
+        )
+        .bytes();
+        drop(inputs);
+        drop(file);
+        let (mut m, host_tier) = open_at(Experts::Host, &levers, 1, ZUB, None)?;
+        let (want, host_faults) = z_runs(&mut m, toks, &prefill)?;
+        drop(m);
+        let (mut m, nvme_tier) = open_at(Experts::Host, &levers, 1, ZUB, Some(host_need - 1))?;
+        let (got, nvme_faults) = z_runs(&mut m, toks, &prefill)?;
+        drop(m);
+        let tiers = host_tier == Some(Device::Host) && nvme_tier == Some(Device::Nvme);
+        println!(
+            "ple tiers: the reading's room puts the table on the {} tier, a room of the host \
+             arm's need {host_need} B less one byte on the {} tier {}",
+            tier_word(host_tier),
+            tier_word(nvme_tier),
+            verdict(tiers)
+        );
+        println!(
+            "ple step thread faults across the batch set's graph steps: host arm {} major {} \
+             minor, NVMe arm {} major {} minor (runtime values)",
+            host_faults.major, host_faults.minor, nvme_faults.major, nvme_faults.minor
+        );
+        let mut ok = tiers;
+        for ((label, last_only), (g, w)) in [
+            ("ple nvme vs host: five graph steps", false),
+            ("ple nvme vs host: one eager pass", true),
+            (
+                "ple nvme vs host: D3K by one call of three ubatches, and its step",
+                false,
+            ),
+        ]
+        .into_iter()
+        .zip(got.iter().zip(&want))
+        {
+            ok &= same_run(label, g, w, last_only);
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let mut m = open(Experts::Host, &PlanLevers::default())?;
         let mut ok = structure(&mut m)?;
@@ -3523,6 +3670,7 @@ mod gate {
         ok &= position_owner(&mut m, &toks)?;
         ok &= refusals(&mut m)?;
         drop(m);
+        ok &= ple_nvme(&toks)?;
         ok &= slots_plan(Experts::Host, &PlanLevers::default())?;
         ok &= slots_two(Experts::Host, &PlanLevers::default())?;
         ok &= card_leg(&toks, &eager, &man)?;
