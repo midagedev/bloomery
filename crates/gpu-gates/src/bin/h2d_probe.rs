@@ -503,8 +503,14 @@ mod probe {
         }
     }
 
-    fn one_shot(ctx: &Arc<CudaContext>, card: &Card, arm: Arm, a: &Args) -> Result<(), GateError> {
-        let stream = ctx.new_stream()?;
+    fn one_shot(
+        ctx: &Arc<CudaContext>,
+        first: &Arc<CudaStream>,
+        card: &Card,
+        arm: Arm,
+        a: &Args,
+    ) -> Result<(), GateError> {
+        let stream = Arc::clone(first);
         let bytes = a.bytes.unwrap_or(arm.default_bytes());
         let reps = a.reps.unwrap_or(arm.default_reps());
         let mut dev = DeviceBuffer::<u8>::zeroed(&stream, bytes)?;
@@ -620,10 +626,9 @@ mod probe {
         start: &Barrier,
         origin: Instant,
     ) -> Result<Loop, GateError> {
-        let ctx = CudaContext::new(ordinal)?;
+        let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(ordinal)?;
         let card = Card::of(&ctx)?;
         card.print()?;
-        let stream = ctx.new_stream()?;
         let pinned = PinnedHostBuffer::<u8>::zeroed(&ctx, bytes)?;
         let mut dev = DeviceBuffer::<u8>::zeroed(&stream, bytes)?;
         // SAFETY: `pinned` outlives the copy: the stream is synchronized on
@@ -774,7 +779,7 @@ mod probe {
             println!("h2d topo | {line}");
         }
         for i in 0..device_count()? {
-            let ctx = CudaContext::new(i)?;
+            let ctx = bloomery_gpu::capsync::fresh_context(i)?;
             Card::of(&ctx)?.print()?;
         }
         Ok(())
@@ -850,7 +855,13 @@ mod probe {
         }
     }
 
-    fn copy_loop(ctx: &Arc<CudaContext>, card: &Card, arm: Arm, a: &Args) -> Result<(), GateError> {
+    fn copy_loop(
+        ctx: &Arc<CudaContext>,
+        first: &Arc<CudaStream>,
+        card: &Card,
+        arm: Arm,
+        a: &Args,
+    ) -> Result<(), GateError> {
         let seconds = a
             .seconds
             .expect("check_args requires --seconds for a loop arm");
@@ -858,7 +869,7 @@ mod probe {
         let chunk = a.chunk_bytes;
         let src = Source::open(bytes)?;
         let offsets: Vec<usize> = (0..bytes / chunk).map(|i| i * chunk).collect();
-        let stream = ctx.new_stream()?;
+        let stream = Arc::clone(first);
         let mut dev = DeviceBuffer::<u8>::zeroed(&stream, chunk)?;
         let window = src.window();
         let sampler = Sampler::start(card);
@@ -964,13 +975,16 @@ mod probe {
                 Arm::Attach => attach()?,
                 Arm::Sustained | Arm::Both => sustained(&a, arm)?,
                 _ => {
-                    let ctx = CudaContext::new(0)?;
+                    // The handle and its first stream (whose creation runs
+                    // the context-wide synchronize) come from the
+                    // capture-safe owner; the arm below reuses that stream.
+                    let (ctx, first) = bloomery_gpu::capsync::fresh_stream(0)?;
                     let card = Card::of(&ctx)?;
                     card.print()?;
                     if arm.is_loop() {
-                        copy_loop(&ctx, &card, arm, &a)?;
+                        copy_loop(&ctx, &first, &card, arm, &a)?;
                     } else {
-                        one_shot(&ctx, &card, arm, &a)?;
+                        one_shot(&ctx, &first, &card, arm, &a)?;
                     }
                 }
             }

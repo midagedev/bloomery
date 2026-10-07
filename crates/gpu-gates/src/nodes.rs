@@ -104,7 +104,8 @@ fn drv(rc: sys::CUresult, what: &str) -> Result<(), GateError> {
 
 /// Capture what `enqueue` records on `stream` (and on any stream it forks
 /// into the capture) and read the template back, then destroy it without
-/// instantiating it.
+/// instantiating it: `bloomery_gpu::capture_template` over the begin..end
+/// (the device's capture lock lives there), then the walk.
 ///
 /// The order is `cuGraphGetNodes`', which lists a captured template's nodes
 /// in the order they were created, that is the host's enqueue order across
@@ -118,27 +119,10 @@ pub fn capture_order(
     stream: &CudaStream,
     enqueue: impl FnOnce() -> Result<(), GpuError>,
 ) -> Result<Captured, GateError> {
-    let hs = stream.cu_stream();
-    // SAFETY: `hs` is a live stream that is not capturing (every capture
-    // before this one ended).
-    let rc = unsafe {
-        sys::cuStreamBeginCapture_v2(
-            hs,
-            sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )
-    };
-    drv(rc, "cuStreamBeginCapture_v2")?;
-    let enqueued = enqueue();
-    let mut graph: sys::CUgraph = std::ptr::null_mut();
-    // SAFETY: the stream is capturing (begun above); this ends it on every
-    // path and writes the template, or null, into `graph`.
-    let ended = unsafe { sys::cuStreamEndCapture(hs, &mut graph) };
-    let order = match enqueued {
-        Err(e) => Err(e.into()),
-        Ok(()) => drv(ended, "cuStreamEndCapture").and_then(|()| read_template(graph)),
-    };
+    let graph = bloomery_gpu::capture_template(stream, |_| enqueue())?;
+    let order = read_template(graph);
     if !graph.is_null() {
-        // SAFETY: a non-null handle from the end of the capture is a
+        // SAFETY: the non-null handle capture_template returned is a valid
         // template, destroyed exactly once here.
         unsafe { sys::cuGraphDestroy(graph) };
     }

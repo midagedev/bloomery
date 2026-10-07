@@ -414,7 +414,6 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
 mod tests {
     use super::super::batch::BatchPort;
     use super::*;
-    use cuda_core::CudaContext;
     use runtime::sched::{self, LayerProgram};
 
     /// The batch port's exchange under a walk's order, keyed as the leg keys
@@ -532,8 +531,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_three_units_across_a_layer_take_the_sets_in_turn() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let (n_embd, cap) = (2, 4);
         let mut port = BatchPort::new(&ctx, n_embd, 1, cap).expect("a batch port");
         let mut hsum = DeviceBuffer::<f32>::zeroed(&stream, cap * n_embd).expect("hsum");

@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 pub mod arch;
 pub mod cand;
+pub mod capsync;
 pub mod checkpoint;
 pub mod cores;
 pub mod elem;
@@ -80,7 +81,8 @@ pub mod weights;
 
 pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
 pub use graph::{
-    Branch, FLAG_WAIT_OPS, Graph, HostFlags, KernelNode, NodeInfo, capturing, node_info,
+    Branch, FLAG_WAIT_OPS, Graph, HostFlags, KernelNode, NodeInfo, capture_template, capturing,
+    node_info,
 };
 pub use model::{GpuModel, Slots};
 pub use watchdog::Busy as EngineBusy;
@@ -1923,22 +1925,14 @@ pub fn role_stream(ctx: &Arc<CudaContext>, role: StreamRole) -> Result<Arc<CudaS
 /// released: the process's anchor under every `Gpu`'s own handle.
 static ANCHORS: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
 
-/// A handle of its own on device `device`'s primary context, over the anchor
-/// the process retains on first use and releases only at exit, so no `Gpu`'s
-/// drop is the context's final release. Releasing it mid-run is what crashes —
-/// the A6000's final release after the 3090's, once an expert tier had run
-/// across the two, faults inside `cuDevicePrimaryCtxRelease` with every stream
-/// idle and every free bound to its own context. The handle is the `Gpu`'s own
-/// because the driver error a drop records stays on its handle until that
-/// handle's next call: a `Gpu` never surfaces another's (a tier and a draft
-/// share the 3090). The memory a `Gpu` allocates still comes back as it
-/// drops; the bundle modules stay loaded on the anchor ([`bundle_module`]).
-fn primary_context(device: usize) -> Result<Arc<CudaContext>, GpuError> {
-    anchor(device)?;
-    Ok(CudaContext::new(device)?)
-}
-
-/// Device `device`'s anchor ([`ANCHORS`]), retained here on first use.
+/// Device `device`'s anchor ([`ANCHORS`]), retained here on first use: the
+/// process's handle that outlives every `Gpu`, so no `Gpu`'s drop is the
+/// primary context's final release — releasing it mid-run is what crashes
+/// (the A6000's final release after the 3090's, once an expert tier had
+/// run across the two, faults inside `cuDevicePrimaryCtxRelease` with
+/// every stream idle and every free bound to its own context). The anchor
+/// makes no stream, so it runs no context-wide synchronize; its handle
+/// comes from [`capsync::fresh_context`] with every other fresh handle.
 fn anchor(device: usize) -> Result<Arc<CudaContext>, GpuError> {
     let mut held = ANCHORS.lock().unwrap_or_else(PoisonError::into_inner);
     if held.len() <= device {
@@ -1947,7 +1941,7 @@ fn anchor(device: usize) -> Result<Arc<CudaContext>, GpuError> {
     match &held[device] {
         Some(anchor) => Ok(Arc::clone(anchor)),
         None => {
-            let anchor = CudaContext::new(device)?;
+            let anchor = crate::capsync::fresh_context(device)?;
             held[device] = Some(Arc::clone(&anchor));
             Ok(anchor)
         }
@@ -2120,13 +2114,17 @@ impl Gpu {
         Gpu::with_device(0)
     }
 
-    /// Take device `device`'s primary context ([`primary_context`]), make
-    /// the engine stream, and bind the K-quant module here and one family
-    /// per kernel file to this crate's bundle module on the device
-    /// ([`bundle_module`]), loaded by the first `Gpu` on it. Load-time only.
+    /// Take a handle of `device`'s own on its primary context with the
+    /// engine stream as the handle's first stream, both under the device's
+    /// capture lock ([`capsync::fresh_handle`]), and bind the K-quant
+    /// module here and one family per kernel file to this crate's bundle
+    /// module on the device ([`bundle_module`]), loaded by the first `Gpu`
+    /// on it. The handle is the `Gpu`'s own because the driver error a drop
+    /// records stays on its handle until that handle's next call: a `Gpu`
+    /// never surfaces another's (a tier and a draft share the 3090).
+    /// Load-time only.
     pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
-        let ctx = primary_context(device)?;
-        let stream = role_stream(&ctx, StreamRole::Engine)?;
+        let (ctx, stream) = capsync::fresh_handle(device, StreamRole::Engine)?;
         // First: the modules below that raise are given it at load.
         let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
         // SAFETY: this package owns the embedded device bundle produced for

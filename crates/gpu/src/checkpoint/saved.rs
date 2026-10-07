@@ -352,7 +352,6 @@ fn shape(detail: impl Into<String>) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuda_core::CudaContext;
 
     /// A state of 5 positions carries rows 0..5 of a two-plane store, the
     /// recurrent stores at 5 and the point at 3; put back on an empty model it
@@ -362,8 +361,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_state_goes_and_comes_back() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let who = Identity {
             arch: "test",
             file: PathBuf::from("/x"),

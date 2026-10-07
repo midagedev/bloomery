@@ -1,0 +1,15 @@
+# The recurrence gate of crates/gpu/src/capsync.rs: a fresh context handle,
+# a context-wide synchronize and a direct cuCtxSynchronize belong to that
+# module alone, because the context-wide synchronize a fresh handle's first
+# stream runs breaks another thread's stream capture on the same context.
+# Every other caller goes through capsync (fresh_handle, fresh_stream,
+# fresh_context, ctx_sync, ctx_sync_in_drop); the owner's own lines carry
+# #[allow(clippy::disallowed_methods, reason = "...")].
+# A path clippy cannot resolve is silently ignored, so every entry here was
+# proven to fire: one planted call per path raised just mac-lint's warning
+# count from 41 and turned it red, and removing the plants brought 41 back.
+disallowed-methods = [
+    "cuda_core::CudaContext::new",
+    "cuda_core::CudaContext::synchronize",
+    "cuda_core::sys::cuCtxSynchronize",
+]
