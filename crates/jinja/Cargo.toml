@@ -1,0 +1,19 @@
+[package]
+name = "bloomery-jinja"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "A Jinja subset, enough for the chat templates GGUF files carry: HF's environment semantics, jinja2-parity-gated"
+
+[lib]
+name = "jinja"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `preserve_order`: an object keeps the key order it was parsed or built in, as a Python dict
+# does, so a template's `tojson` and `.items()` see an object's keys as jinja2 does.
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+thiserror.workspace = true

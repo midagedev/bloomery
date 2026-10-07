@@ -142,6 +142,7 @@ gpu-gates 62 5 1
 gpu-glm5next 4 0 0
 gpu-vision 48 0 0
 hf 0 0 0
+jinja 0 0 0
 levers 0 0 0
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output

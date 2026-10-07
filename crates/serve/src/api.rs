@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
 use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
@@ -66,7 +67,6 @@ use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::swap::Park;
-use crate::template::{ChatTemplate, TemplateError};
 use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 
 /// Anthropic's Messages API, a child of this module so it runs the chat path's
