@@ -970,6 +970,12 @@ gate-decision-clef:
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
 
+# The template engine (crates/jinja, host only): its unit tests, the HF environment's whitespace control, scoping,
+# macros, filters and tests, Python's `str()` and slicing rules, and the V4.1 template rendered by hand. The engine's
+# jinja2-parity cases are gate-serve's. No network, no card.
+gate-jinja:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-jinja --lib -- --nocapture'
+
 # engram IO 실험실의 시험(crates/engram-lab, 엔진 사용처 없음): 컨텍스트 창의 슬롯 순서, 행 캐시의 LRU를 스택
 # 거리 모의와 대조, 캐시가 내주는 바이트. 이름이 gate-가 아니라 lab-이라 `just affected`가 엔진 착륙에서 고르지
 # 않는다. V4.1 분할 파일과 engram-corpus 스트림이 있어야 돈다.

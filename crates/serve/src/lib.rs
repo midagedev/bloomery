@@ -33,7 +33,6 @@ mod sched;
 mod slotfile;
 mod stop;
 mod swap;
-pub mod template;
 mod worker;
 
 pub use api::{
@@ -45,7 +44,7 @@ pub use engine::{
     ModelProps, PlacementProps, ResidencyReset, Sampler, SamplerFactory, SamplingParams, Saved,
     SavedState, SlotPass, SlotRow, StateError, Tokenizer,
 };
+pub use jinja::{ChatTemplate, TemplateError};
 pub use mock::{DraftMock, MockEngine, MockTokenizer, ScriptedEngine};
 pub use sched::{FifoPicker, SlotConfig, SlotPicker, SlotSummary, WaitingRequest};
 pub use swap::{Park, QUANTUM, SwapEngine};
-pub use template::{ChatTemplate, TemplateError};

@@ -2630,7 +2630,7 @@ mod tests {
         }
     }
 
-    const V41: &str = include_str!("../tests/fixtures/v41-chat-template.jinja");
+    const V41: &str = include_str!("../../serve/tests/fixtures/v41-chat-template.jinja");
     const BOS: &str = "<｜begin▁of▁sentence｜>";
 
     fn v41(vars: Value) -> String {

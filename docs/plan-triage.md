@@ -2,6 +2,57 @@
 
 여기는 **아직 할 일만** 있다. 2026-09-25 새벽에 다시 썼다 — 그 전 판(라운드 보고 절 스무 개와 09-23 GPU 선 목록의 원문, 155 KB)은 [`plan-ledger.md`](plan-ledger.md) 「plan-triage.md 2026-09-25 이전 판」에 원문 그대로 있고, 항목의 근거·수치·기제가 필요하면 거기서 찾는다. 항목은 받을 라운드별로 한 줄씩이고 크기는 XS·S·M·L이다. 착륙한 줄은 지운다(원문은 장부, 결과는 커밋 메시지와 rig-log). 수치는 `[유도]`가 아니면 실측이다.
 
+## Release 0.2.7 — orchestration (the user, 2026-10-07 evening)
+
+Scope, from the user: vision input, the prefill levers, a second decision model, Xiaomi MiMo-V2.6-Flash. Models are
+added now **to improve the code**: each attachment lifts the logic it shares into common owners before the model's
+own code, and every landing reports the files and lines it touched outside the model's own crate. The baselines are
+Qwen3.8 core at 32 files and GLM-5.3 core at 28. The user rule for releases now holds: the user-facing pass runs
+before the tag (AGENTS.md 「Commands」, Releases).
+
+### Tracks (one owner each; file boundaries decide who may edit what)
+
+| Track | Owner | Files it owns | Items, in order |
+|---|---|---|---|
+| L: decision models, vision, release | leader | `crates/decision`, `serve_seats/{decide,ds41}.rs`, `bind.rs`, `ds41_media.rs`, `crates/serve`, `crates/hf`, README, release tools | ① `cleflayout` (GLM, running): the decide seat reads llama.cpp's clef layout, which fixes 0.2.6's looping `--hf bartowski/…` line ② `decide2` (GLM design, running) → its implementation round: the second decision model, `crates/decision` made generic (lev/Kev family first) ③ `visseat2` (GLM, running): V4.1 `--mmproj` in the server, 10-06 work rebased ④ Clef vision (`clefvis` design) after ② and ③ share their owners ⑤ timed sittings and the release train |
+| W1: MiMo, placement | worker1 | `crates/model/src/arch/mimo2`, `crates/models`, `crates/placement`, `crates/refset/src/arch/mimo2`, `crates/gpu/src/flash_gqa.rs`, `rope_neox.rs`, `mxfp4_sel.rs` (new) | ① `mimo1` (GLM, running): R1 the reader + lifts (router row, AttnShape V width, per-layer arrays) ② R2 refset (box, ik dump of the RL/MOPD file) ③ R3a/R3b flash K≠V, window, sinks ④ R4 first e2e, all experts on the host ⑤ R5 card experts (MXFP4 `_sel`, `CardFormat` row) ⑥ R6 MTP ⑦ R7 residency ⑧ R8 prompt path. Design: the lead's specs `mimo26/report.md` §4–§6. Then the open placement items below (q38big q3/q7/q8, Qwen3.x unset load on device 0, the never-run `sampled_served` arm) |
+| W2: prefill, kernels, IQ | worker2 | `crates/gpu/src/host/*`, `crates/gpu/src/arch/qwen3moe/*`, `crates/gpu/src/{iq,iq_sel}.rs`, `crates/qdot`, `crates/runtime/src/xsplit*` | ① `pfcopy` (GLM, running): ppgap lever 2 (per-batch landed events), then lever 1 (run-ahead admits) ② ppgap lever 3 (selected flash: one block per (row, kv head), no 3× re-staging) and lever 4 (delta scan pipeline); lever 3 edits `flash_gqa.rs`, so it runs after W1's R3 lands or as W1's file with W2's spec ③ `capsync` (branch, box proof `specs/iq/capsync/box-proof.sh`) ④ the IQ file slower than Q4 at P = 512 (775 vs 943 tok/s, cause unread) ⑤ IQ host-leg gate (the Q3 file's e2e arm, run twice bit-equal) ⑥ `resprofile` (branch; `host/swap.rs`, after pfcopy) ⑦ more IQ types (IQ3_S, IQ2_*, IQ1_M, BF16): Strata-style files and the V4-Flash port |
+| T: gate and tool speed | leader, as GLM rounds | `tools/gate-batch.sh`, `tools/gpu-gate.sh`, `tools/box*.sh`, `tools/gate-paths.tsv`, `crates/model/src/fixture` | the fixture tier (`fxcommon` branch → R1 `fxq38gen` → R2/R8 → R3…), gate-batch clean stop, gpu-gate.sh lock order, `gate-paths.tsv` rows (coverage.rs, mtp.rs, weights.rs), `check-loads` split (mac-static 59 → ~30 s), levers XSTREAM unset text |
+
+The ppgap levers 1–4 together predict 1,258 → 2,000–2,700 tok/s at P = 4096 on the A6000 [derived, the lead's specs
+`ppgap/report.md` §⑤]. Decode needs no round: the 4090 gap sits inside its hardware and file envelope.
+
+### How the tracks run
+
+- A track owner is a session (worker1, worker2) or the leader. It launches its own GLM rounds (`--effort max`, one
+  worktree each, `--label` named by purpose), reviews their diffs, runs their owning gates with
+  `tools/gate-batch.sh --round-ledger`, and commits to its own branch. **main moves only by the leader**, which
+  re-runs the landing gates under its ledger.
+- Round loop: `just mac-static main` (≤ 1 min) before a round reports.
+- **Express vs train.** A branch whose `just affected --narrow` set is small or disjoint lands alone when green:
+  decision, serve, hf, vision seat, tools. Branches touching `crates/gpu`, `crates/models` or `crates/placement` (77–120
+  gates) ride **one train** (branches W1-R1/R3, W2-pfcopy/lever 3/capsync) when two or more are green. The train cuts
+  at a time the leader announces to both workers a session ahead.
+- **Box.** Functional gates take any idle card. Timed numbers are the leader's, in sittings under a hold
+  (`/root/bloomery-<owner>-hold`), each ≤ 30 min with its card. A worker asks the leader for a sitting. Box jobs over
+  30 minutes (downloads, R-b batches) need the user's approval.
+  - The MiMo MOPD download (170 GB) is running under the user's go (2026-10-07).
+  - The RL file is on the box already.
+- **Coverage table up front.** Every feature round reports placement × model × binary on/off. The leader tells the
+  user every off cell in the landing message.
+- Each landing message also states the files touched outside the model's crate (model rounds) and the gate wall.
+
+### 0.2.7 cut criteria
+
+- the cleflayout fix;
+- V4.1 vision in the server;
+- the second decision model;
+- pfcopy levers 1–2 with a timed A/B;
+- MiMo through R4 (first e2e, all host experts) at least;
+- then the user-facing pass and the tag.
+
+MiMo R5–R8, the levers 3–4 and the fixture tier may land later in the line.
+
 ## Top priority: the common-machine gap (GitHub #1, the user, 2026-10-07)
 
 A user measured bloomery 0.2.5 against Strata on one machine and one file: RTX 5090 32 GB, Core Ultra 9 285K (AVX2 +
@@ -43,7 +94,7 @@ second term. His `/metrics` (asked on #1) settle E and W.
 | G7 | AVX-VNNI host kernels | M | prefill share only; decode 0 | after G1 |
 | G8 | drafted ≠ plain: verify row 0 differs from the plain step by ≥ 0.44 logits at the first divergence (Q4, row 0; Q3 rows 1); the README / `generate_qwen3moe.rs:164` equality claim is false on both files | S–M | — | worker2, opus narrowing |
 
-### The next release: IQ quants and the two-channel host (the user, 2026-10-07)
+### The 0.2.6 release: IQ quants and the two-channel host (the user, 2026-10-07; shipped as v0.2.6, open rows moved into 「Release 0.2.7」)
 
 The user: these two lead and go out together.
 

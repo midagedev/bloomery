@@ -221,6 +221,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-jinja"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bloomery-levers"
 version = "0.1.0"
 
@@ -291,6 +299,7 @@ name = "bloomery-serve"
 version = "0.2.6"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-jinja",
  "bloomery-vision",
  "serde_json",
  "sha2",
