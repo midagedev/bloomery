@@ -1001,6 +1001,7 @@ fn hw_qwen4exp_card_plan() {
             + MARGIN;
         let levers = PlanLevers {
             card_budget_bytes: Some(floor),
+            ..PlanLevers::default()
         };
         let pair = (
             inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
@@ -1408,6 +1409,7 @@ fn hw_qwen4exp_q3_card_plan() {
             + MARGIN;
         let levers = PlanLevers {
             card_budget_bytes: Some(floor),
+            ..PlanLevers::default()
         };
         let pair = (
             inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),

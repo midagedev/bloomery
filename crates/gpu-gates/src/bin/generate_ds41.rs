@@ -335,8 +335,8 @@ mod drive {
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path, residency41};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LOCK,
-        HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
-        ResidencyAt, ResidencyPick, STEP_STATS,
+        HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RES_PROFILE,
+        RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -696,6 +696,7 @@ mod drive {
         ENGRAM_HELPER,
         STEP_STATS,
         CARD_BUDGET,
+        RES_PROFILE,
         PIN_MAIN,
         DRAFT,
         CHECK_FINITE,
@@ -1740,6 +1741,7 @@ mod drive {
             self.plan = Some(self.t.elapsed() - self.headers);
             let a = self.a;
             record::plan(place, machine, plan).print();
+            record::residency_seed(plan).print();
             // The open's plan is the pre-plan the unset word resolved
             // against; a load whose plan moved under it names itself.
             if let Some(pre) = &self.plan_n_l

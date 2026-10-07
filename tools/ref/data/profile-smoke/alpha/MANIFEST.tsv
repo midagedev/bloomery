@@ -1,0 +1,22 @@
+# router_trace — bloomery engine: the routed ids of every position the engine ran, in step order, as the host step port read them
+# model	/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+# model_file	Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+# arch	qwen4exp
+# build	generate_qwen3moe
+# engine	bloomery (not an ik build)
+# tokens	4096
+# n_expert	16
+# n_expert_used	2
+# n_layer	2
+# feed	one step per position: a prompt call's ids one step each (call rows)
+# slots	slots-<layer>.u8 beside topk-<layer>.u16: C stage card, T tier card, H host
+# place	a
+# experts	card
+# prefill	step
+# layer	layer	tokens	file	slots
+layer	0	4096	topk-0.u16	slots-0.u8
+layer	1	4096	topk-1.u16	slots-1.u8
+# call	index	first	prompt_call	end	pos0
+call	0	0	8	4096	0
+# positions	4096
+# complete	4096	2

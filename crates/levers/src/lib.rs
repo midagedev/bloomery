@@ -32,8 +32,8 @@ pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
     HOST_LOCK, HOST_POPULATE, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
     MTP_HEAD_ROWS, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
-    PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS,
-    THREADS,
+    PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RES_PROFILE, RESIDENCY, ROUTE_TRACE, SPIN,
+    STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -251,6 +251,15 @@ pub enum MtpHead<'a> {
     Full,
     /// The row list at this path.
     List(&'a Path),
+}
+
+/// A set `BLOOMERY_RES_PROFILE`: where the residency profile is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResProfile<'a> {
+    /// `off`: no profile is read or written.
+    Off,
+    /// The profile file at this path.
+    File(&'a Path),
 }
 
 /// A value its kind took.
@@ -648,6 +657,14 @@ impl Levers {
             .unwrap_or_else(|| panic!("{name} is not among the levers this reading parsed"))
     }
 
+    /// Whether the reading's binary acts on the lever `name`: it lists it
+    /// ([`at_main`]), or the reading acts on every lever ([`Levers::from_env`]).
+    /// One it does not act on holds its default, and set it was refused.
+    #[must_use]
+    pub fn acts_on(&self, name: &str) -> bool {
+        self.entry(name).acts
+    }
+
     fn flag(&self, name: &str) -> bool {
         match self.entry(name).value {
             Some(Value::Flag(b)) => b,
@@ -778,6 +795,19 @@ impl Levers {
     #[must_use]
     pub fn mtp_windows(&self) -> bool {
         self.flag(MTP_WINDOWS)
+    }
+
+    /// `BLOOMERY_RES_PROFILE`: `off` or the residency profile's path; `None`
+    /// unset (the model's file under the user's cache, the placement crate's
+    /// rule: `bloomery_placement::profile::ProfileLever`).
+    #[must_use]
+    pub fn res_profile(&self) -> Option<ResProfile<'_>> {
+        match &self.entry(RES_PROFILE).value {
+            None => None,
+            Some(Value::Word("off")) => Some(ResProfile::Off),
+            Some(Value::Path(p)) => Some(ResProfile::File(p)),
+            v => panic!("{RES_PROFILE} holds {v:?}, not off or a path"),
+        }
     }
 
     /// `BLOOMERY_ROUTE_TRACE`: the route trace's new directory; `None` unset

@@ -86,6 +86,15 @@
 //!   lands and a step runs (mutant: each count checked in the keeps' loop,
 //!   just before its slot's keep, so slot 0 keeps its row before slot 1's
 //!   count is refused).
+//! - `profile` (the residency profile seed, `placement::profile`): a load
+//!   planned with the profile at a fresh path keeps the id prefix (no file
+//!   there yet), runs a history, and its machine writes the file when it
+//!   stops; the next plan with the same profile takes each layer's top `n_l`
+//!   of the file by `rank_key`, and that load's machine holds them (its seed:
+//!   the set less its spare); a truncated file is refused by name at the
+//!   plan, which keeps the id prefix (mutants: the seed out of the qwen4exp
+//!   planner — the second load holds the prefix; the machine's tally hook
+//!   removed — no file at the second plan).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -126,6 +135,7 @@ mod gate {
     use model::placement::Machine;
     use model::placement::PlanLevers;
     use model::placement::churn::ChurnPool;
+    use model::placement::profile::{self, CardSeed, ProfileLever};
     use model::placement::workstation::A6000;
     use refset::arch::qwen4exp::MODEL;
     use runtime::swaprule::SwapRule;
@@ -667,6 +677,119 @@ mod gate {
         Ok(ok)
     }
 
+    /// `profile` (module doc): two loads one after the other on `machine`,
+    /// each planned with the profile at a fresh file, then a plan of the file
+    /// truncated.
+    fn profile_clause(
+        path: &Path,
+        inputs: &PlanInputs,
+        machine: &Machine,
+        residency: Residency,
+        host: bloomery_levers::HostCfg,
+        ub: usize,
+        ids: &[u32],
+    ) -> Result<bool, GateError> {
+        let dir = std::env::temp_dir().join(format!("{NAME}-profile-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let file = dir.join("profile");
+        let levers = PlanLevers {
+            profile: ProfileLever::File(file.clone()),
+            ..PlanLevers::default()
+        };
+        let plan = |what: &str| {
+            inputs
+                .plan_with(machine, CTX as u64, &levers, Experts::Card)
+                .map_err(|e| GateError::from(format!("the {what} plan: {e}")))
+        };
+        let load = |plan: &model::placement::Plan<'_>| -> Result<Session<Body38>, GateError> {
+            let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            Ok(Session::from_model(
+                Body38::open_placed_residency(split, plan, inputs, 0, host, ub, residency, 1)?,
+                CTX as u32,
+            ))
+        };
+        let first = plan("first")?;
+        record::residency_seed(&first).print();
+        let fresh = matches!(&first.seed.card, CardSeed::Prefix { why, .. } if why == "no profile there yet");
+        {
+            let mut s = load(&first)?;
+            history(&mut s, ids)?;
+        }
+        let key = inputs
+            .profile_key
+            .clone()
+            .map_err(|e| format!("the model file's profile key: {e}"))?;
+        let (layers, experts) = (inputs.model.layers, inputs.model.experts as usize);
+        let written = profile::read(&file, &key, layers, experts);
+        let pairs = written.as_ref().map_or(0, profile::Profile::pairs);
+        let second = plan("second")?;
+        record::residency_seed(&second).print();
+        let took = second.seed.card
+            == CardSeed::Profile {
+                path: file.clone(),
+                pairs,
+            };
+        // Each card layer's machine seed against the file's top n_l, ascending
+        // (the slot order), less the spare its last slot gives up.
+        let (mut held, mut layers_on, mut moved) = (0usize, 0usize, 0usize);
+        if let Ok(p) = &written {
+            let s = load(&second)?;
+            let m = s.model();
+            let b = m.body(NAME)?;
+            let swap = b.hybrid().swap().ok_or("the second load runs no machine")?;
+            for (l, &n) in second.n_l.iter().enumerate() {
+                let n = n as usize;
+                if n == 0 {
+                    continue;
+                }
+                layers_on += 1;
+                let mut want = p.order(l)[..n].to_vec();
+                want.sort_unstable();
+                moved += usize::from(want.iter().zip(0u32..).any(|(&e, i)| e != i));
+                want.truncate(n - 1);
+                held += usize::from(swap.seed(l)? == want);
+            }
+        }
+        let bytes = std::fs::read(&file).unwrap_or_default();
+        std::fs::write(&file, &bytes[..bytes.len().min(10)])
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        let third = plan("truncated")?;
+        record::residency_seed(&third).print();
+        let refused = matches!(&third.seed.card, CardSeed::Prefix { why, .. } if why.contains("short of the 24"));
+        let prefix = third
+            .rows
+            .iter()
+            .flat_map(|r| &r.segments)
+            .filter(|seg| matches!(seg.device, model::placement::Device::Card(_)))
+            .all(|seg| seg.experts.as_ref().is_none_or(|e| e.as_prefix().is_some()));
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let ok = fresh
+            && written.is_ok()
+            && pairs > 0
+            && took
+            && layers_on > 0
+            && held == layers_on
+            && moved > 0
+            && refused
+            && prefix;
+        println!(
+            "profile: a fresh file keeps the id prefix {fresh}; the first load's machine wrote \
+             {} ({pairs} pairs); the second plan took it {took}; {held} of {layers_on} card \
+             layers' machine seeds are the file's top n_l less the spare ({moved} off the id \
+             prefix); a truncated file refused by name {refused}, the plan on the id prefix \
+             {prefix}: {}",
+            written.as_ref().map_or_else(
+                |e| format!("nothing readable ({e})"),
+                |_| file.display().to_string()
+            ),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// `refuse`: the host one byte short of the churn pool.
     fn refuse_clause(
         path: &Path,
@@ -823,6 +946,8 @@ mod gate {
         let mut s = open_slots(path, &inputs, &machine, host, ub)?;
         pass &= slots_drafted_clause(&mut s, &ids)?;
         pass &= commit_counts_clause(&mut s, &ids)?;
+        drop(s);
+        pass &= profile_clause(path, &inputs, &machine, residency, host, ub, &ids)?;
 
         if pass {
             println!("{NAME}: every clause passed");

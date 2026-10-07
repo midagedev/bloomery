@@ -4,11 +4,12 @@
 
 use bloomery_levers::{
     CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOSTSTREAM,
-    PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, STEP_STATS,
+    PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RES_PROFILE, RESIDENCY, ROUTE_TRACE, STEP_STATS,
 };
 
 /// Besides the pool's two: how a prompt is fed, and the batched feed's CED
-/// triangle and group; the step rows' helper; the placement's card budget;
+/// triangle and group; the step rows' helper; the placement's card budget
+/// and residency profile;
 /// the main thread's pin; the host tier's load settings; the draft; the route
 /// trace; adaptive expert residency and its prompt streaming; the step
 /// statistics, whose rounds of several slots the seat counts, and which on
@@ -21,6 +22,7 @@ pub const ACTS_ON: &[&str] = &[
     PREFILL_GROUP,
     ENGRAM_HELPER,
     CARD_BUDGET,
+    RES_PROFILE,
     PIN_MAIN,
     HOST_POPULATE,
     HOST_LOCK,

@@ -37,6 +37,9 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's cache and compressor bytes.
     pub kv: KvLayout,
+    /// The model file's residency profile key ([`placement::profile::ModelKey`]),
+    /// or why the file has none: what a plan's cards seed from.
+    pub profile_key: Result<placement::profile::ModelKey, String>,
 }
 
 /// The expert tier's prompt-batch bytes plan (b′) reserves for a file of
@@ -98,6 +101,7 @@ impl PlanInputs {
             model,
             spec,
             kv,
+            profile_key: placement::profile::ModelKey::of(split).map_err(|e| e.to_string()),
         })
     }
 
@@ -135,7 +139,8 @@ impl PlanInputs {
         slots: NonZeroUsize,
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
-        let plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
+        let mut plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
+        placement::profile::seed(&mut plan, &levers.profile, &self.profile_key)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)

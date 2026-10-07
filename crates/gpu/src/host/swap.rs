@@ -113,7 +113,9 @@
 //!
 //! **Counting.** The ids a pass routes are noted per (layer, row) into a
 //! [`Tally`] and folded into the rule at [`SwapMachine::end_pass`] for the
-//! pass's kept rows only, so a rejected row leaves no trace.
+//! pass's kept rows only, so a rejected row leaves no trace; the same rows
+//! go to the residency profile when the load names one
+//! ([`MachineCfg::profile`]).
 //!
 //! **Calls.** A prompt call is one pass whose map moves inside it: between
 //! [`SwapMachine::begin_call`] and [`SwapMachine::end_call`] the rule makes
@@ -152,6 +154,8 @@ use super::slots::{HOST, Slot, SlotMap};
 use super::{Drain, drain_within, poll_drained};
 use crate::GpuError;
 use crate::graph::{MappedHost, cu, mem_batch, op_write};
+
+mod profile;
 
 /// The residency lever: `off`, or the rule's `mid` parameters with `P`
 /// pinned seed experts a layer and `S` spare slots a layer (`mid-p<P>-s<S>`).
@@ -1561,6 +1565,9 @@ pub struct MachineCfg {
     /// the bound must be longer than the longest pass plus one expert's
     /// preparation and staging.
     pub deadline: Duration,
+    /// The residency profile the machine adds its kept rows' picks to
+    /// ([`model::placement::profile`]); `None`, it counts nothing.
+    pub profile: Option<model::placement::profile::ProfileTarget>,
 }
 
 /// The machine's view of a load's map ([`SwapMachine::new`]): per layer, the
@@ -1631,6 +1638,8 @@ pub struct SwapMachine {
     changed: Vec<(usize, u32, u32)>,
     /// The error that broke the machine, named in every later refusal.
     broken: Option<String>,
+    /// The kept rows' picks since the last addition to the profile.
+    profile: Option<profile::ProfileTally>,
     /// Per layer of the map: a call's landed event (on the copy stream,
     /// after a pick's copies) and reader event (on the engine stream, after
     /// the call's last read of the layer's slots); the open call.
@@ -1767,6 +1776,11 @@ impl SwapMachine {
         let call_read = (0..layers.len())
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
+        let profile = cfg
+            .profile
+            .clone()
+            .map(|t| profile::ProfileTally::new(t, layers.clone(), n_expert))
+            .transpose()?;
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
         let Staging { shared, tx, thread } =
@@ -1796,6 +1810,7 @@ impl SwapMachine {
             ops: Vec::with_capacity(BATCH_OPS),
             changed: Vec::new(),
             broken: None,
+            profile,
             call_landed,
             call_read,
             call: None,
@@ -2239,6 +2254,9 @@ impl SwapMachine {
         let pass = self.rule.passes();
         let folded = self.fold(tally, kept, WHAT);
         self.after_change(folded, || format!("the end of pass {pass}"))?;
+        if let Some(p) = &mut self.profile {
+            p.fold(tally, kept);
+        }
         tally.clear();
         self.kept = kept;
         self.end_us = micros(start);
@@ -3362,6 +3380,9 @@ fn counts_digest(counts: &[u32]) -> u64 {
 
 impl Drop for SwapMachine {
     fn drop(&mut self) {
+        if let Some(p) = &mut self.profile {
+            p.flush();
+        }
         let deadline = self.shared.deadline;
         self.shared.stop.store(true, Ordering::Release);
         self.tx = None;

@@ -277,6 +277,7 @@ selftests=(
   "tools/ref/gguf-ranges.py --self-test"
   "tools/ref/hidden-diff.py --self-test"
   "tools/ref/ptx-canon.py --self-test"
+  "tools/ref/profile-crossgenre.py --self-test"
   "tools/ref/route-trace-chat.py --self-test"
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-residency.py --self-test"

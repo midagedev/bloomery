@@ -776,6 +776,7 @@ impl<B: ChainBody> GpuModel<B> {
                         max_rows: residency.max_rows,
                         unrouted: residency.stacks.unrouted(),
                         deadline: residency.deadline,
+                        profile: plan.seed.target.clone(),
                     },
                 )
             }

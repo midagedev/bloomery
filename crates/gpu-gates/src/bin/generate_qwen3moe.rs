@@ -1955,6 +1955,7 @@ mod cli {
             slots,
         )?;
         println!("{}", plan38_line(place, experts, &plan));
+        record::residency_seed(&plan).print();
         let residency = residency38(&plan, lever, Record::print)?;
         let mut m = Body38::open_placed_residency(
             file,
@@ -2037,6 +2038,7 @@ mod cli {
             experts,
         )?;
         println!("{}", plan38_line(place, experts, &plan.plan));
+        record::residency_seed(&plan.plan).print();
         let residency = residency38(&plan.plan, lever, Record::print)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,

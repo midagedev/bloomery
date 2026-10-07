@@ -70,6 +70,7 @@ mod drive {
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PIN_MAIN, R8,
+        RES_PROFILE,
     };
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
@@ -239,6 +240,7 @@ mod drive {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
             CARD_BUDGET,
+            RES_PROFILE,
             PIN_MAIN,
             HOST_POPULATE,
             HOST_LOCK,

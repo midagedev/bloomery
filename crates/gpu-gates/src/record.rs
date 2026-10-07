@@ -1773,6 +1773,23 @@ pub static RESIDENCY_LEVER: Kind = Kind {
     parts: &[key("residency", Word, ""), key("why", Word, "")],
 };
 
+/// Which experts a plan's cards took ([`model::placement::profile::Seed`]).
+pub static RESIDENCY_SEED: Kind = Kind {
+    name: "residency_seed",
+    head: "residency seed",
+    doc: "Which experts the plan's card segments took (BLOOMERY_RES_PROFILE): seed=profile, each \
+          layer's top experts of the residency profile at path, which counts pairs (layer, \
+          expert) pairs; or seed=prefix, each layer's id prefix, pairs 0, and why (off, no HOME, \
+          no model key, no card expert, no file there yet, or the read's refusal by name), with \
+          the path where the plan looked when it did.",
+    parts: &[
+        key("seed", Word, ""),
+        key("pairs", U64, ""),
+        opt("path", Text, ""),
+        opt("why", Text, ""),
+    ],
+};
+
 /// What `BLOOMERY_RESIDENCY` unset resolved to in `generate_qwen3moe`
 /// ([`bloomery_levers::Residency38Pick`]).
 pub static RESIDENCY_UNSET: Kind = Kind {
@@ -2644,6 +2661,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &DRAFT_SUMMARY,
     &SMOKE,
     &RESIDENCY_LEVER,
+    &RESIDENCY_SEED,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
@@ -2763,6 +2781,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEVER,
+    &RESIDENCY_SEED,
     &PLAN,
     &RESIDENCY_HOST,
     &LOAD_GENERATOR,
@@ -2824,6 +2843,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &STAT_PROMPT_SPLIT,
     &STAT_PROMPT_LB,
     &RESIDENCY_LEVER,
+    &RESIDENCY_SEED,
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
@@ -2969,6 +2989,27 @@ pub fn host_residency(h: &HostResidency) -> Vec<Record> {
         );
     }
     out
+}
+
+/// The `residency seed` record of `plan`: which experts its cards took.
+pub fn residency_seed(plan: &Plan<'_>) -> Record {
+    use model::placement::profile::CardSeed;
+    match &plan.seed.card {
+        CardSeed::Profile { path, pairs } => Record::new(&RESIDENCY_SEED)
+            .w("seed", "profile")
+            .u("pairs", pairs)
+            .w("path", path.display()),
+        CardSeed::Prefix { path, why } => {
+            let r = Record::new(&RESIDENCY_SEED)
+                .w("seed", "prefix")
+                .u("pairs", 0);
+            let r = match path {
+                Some(p) => r.w("path", p.display()),
+                None => r,
+            };
+            r.w("why", why)
+        }
+    }
 }
 
 /// The resolved residency lever's record.

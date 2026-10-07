@@ -693,6 +693,15 @@ gate-profile:
 gate-placement:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test placement -- --include-ignored --nocapture && bash tools/gate.sh --release -p bloomery-placement --lib -- --include-ignored --nocapture'
 
+# The residency profile seed (BLOOMERY_RES_PROFILE): the seed's own tests (the file, its refusals, the
+# rank and a plan's stage and tier cards), then the cross-genre replay over V4.1's four genres in
+# $BLOOMERY_DATA/router/ (prose, code, korean, d2-chat): a profile learned on genre A seeding genre B,
+# 16 pairs at two card shares, static and after 96 and 672 tokens of the rule, each cell red past its
+# pair's pinned loss plus 2 SE of its own noise (tools/ref/profile-crossgenre.py, PINS). Host only, no card;
+# the box's numpy is the ft venv's, as dump-jpeg's.
+gate-resprofile:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-placement --lib -- profile --include-ignored --nocapture && timeout --kill-after=10 900 /home/user/ft/bin/python3 tools/ref/profile-crossgenre.py gate v41 --data "$BLOOMERY_DATA/router"'
+
 # B5 메타 게이트. 먼저 층 표 단위 시험을 돌린다: 일부러 깨뜨린 층 표 일곱 개를 ik 적재기의 검사 넷과 우리 거부 둘이
 # 각각 깨진 그 층에서 거부해야 한다. 이어서 V4.1의 하이퍼파라미터·층 종류·텐서 이름(arch/deepseek41/{hparams,names}.rs)을
 # ik가 같은 파일에서 읽은 값(적재 출력과 헤더), ik가 지은 그래프(오라클 매니페스트 둘의 노드), 파일의 텐서 목록과
@@ -1310,9 +1319,10 @@ gen-ds41 *ARGS:
 # checked_in_schemas_are_current holds to the binaries', and the engine's plans the flow model reads
 # (generate_ds41 --plan, placement (a), P 128/256/384/512/1536/4096/16384, CED on and off) into tools/flow/plans/:
 # P 1536 is weekly-gpu-ds41-flowcounts' three-batch arm, P 16384 the prefill headline's prompt. Loads nothing onto a card;
-# runs with the A6000 in view, since --place a plans the stage on the largest visible card.
+# runs with the A6000 in view, since --place a plans the stage on the largest visible card. The plans read no residency
+# profile (BLOOMERY_RES_PROFILE=off): the box's own runs write one, and these files must not carry its history.
 records-refresh:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c BLOOMERY_RES_PROFILE=off" && BLOOMERY_CED=$c BLOOMERY_RES_PROFILE=off target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
 
 # The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 -n 2 under
 # BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), at --depth 512 once at the default

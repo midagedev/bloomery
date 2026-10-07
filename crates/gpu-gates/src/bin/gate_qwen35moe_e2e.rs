@@ -2537,6 +2537,7 @@ mod gate {
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(PLACED_BUDGET),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         q.record(&plan, None).print();

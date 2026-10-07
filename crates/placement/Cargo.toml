@@ -18,4 +18,8 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
+# The residency profile ranks a layer's experts by the one rank the residency
+# rules share (`runtime::xsplit::rank_key`); the runtime depends on the model
+# description alone, so the edge makes no cycle.
+bloomery-runtime = { path = "../runtime" }
 thiserror = { workspace = true }

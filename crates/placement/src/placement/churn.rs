@@ -157,6 +157,7 @@ mod tests {
             n_l: Vec::new(),
             tier_n_l: Vec::new(),
             card_budget: None,
+            seed: crate::placement::profile::Seed::default(),
         }
     }
 

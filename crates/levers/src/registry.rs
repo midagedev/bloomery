@@ -29,6 +29,7 @@ pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 pub const MTP_DRAFT: &str = "BLOOMERY_MTP_DRAFT";
 pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
+pub const RES_PROFILE: &str = "BLOOMERY_RES_PROFILE";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
@@ -500,6 +501,34 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               prints its `residency pass` records, a request's reset keeps the residency, and \
               `POST /residency/reset` moves it back to the seed with a `residency reset` record. \
               Every other binary refuses it set, by name.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: RES_PROFILE,
+        class: Class::C,
+        kind: Kind::PathOr(&["off"]),
+        default: Unset::Means(
+            "`<cache>/bloomery/profiles/<model key>`, `<cache>` the user's cache directory \
+             (`$XDG_CACHE_HOME` when absolute, else `~/.cache`), the key the model file's first \
+             shard's name less `.gguf` and its split suffix (`bloomery_placement::r8::model_stem`); \
+             no profile where neither is set",
+        ),
+        doc: "The residency profile: per (layer, expert) the count of the engine's own router \
+              picks over the kept rows of every pass a residency machine ended, undecayed, one \
+              file per model file that every seat and process reads and adds to \
+              (`placement::profile`). A plan that puts routed experts on a card takes each \
+              layer's top `n_l` by count (count descending, id ascending: `runtime::xsplit::\
+              rank_key`) in place of the id prefix, a tier card the next ones; a layer the file \
+              ranks fewer than that keeps the id prefix for the rest. A running machine adds \
+              its counts to the file every 2,048 passes and when it stops, written to a \
+              temporary file and renamed over it, so a reader never sees a torn file. A file \
+              that is short, malformed, of another shape or of another model file is refused \
+              by name and the plan keeps the id prefix; the generate binaries print a \
+              `residency seed` record after the `plan` line: `seed=profile` with the path and \
+              the pairs the file ranks, or `seed=prefix` and why. `off` keeps the id prefix and \
+              writes nothing; any other value is the file's path. The engine's planning binaries \
+              act on it (generate, serve, chat); a gate or tool that plans does not, and reads \
+              and writes no profile.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

@@ -226,7 +226,8 @@ mod cli {
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
-        PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
+        PREFILL_GROUP, R8, RES_PROFILE, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy,
+        STEP_STATS,
     };
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
@@ -237,6 +238,7 @@ mod cli {
 
     const ACTS_ON: &[&str] = &[
         CARD_BUDGET,
+        RES_PROFILE,
         HOST_POPULATE,
         HOST_LOCK,
         CARD_DONTNEED,
@@ -332,6 +334,7 @@ mod cli {
             plan: &Plan<'_>,
         ) -> Result<bool, SessionError> {
             record::plan(place, machine, plan).print();
+            record::residency_seed(plan).print();
             self.top_k = inputs.hp.indexer.top_k;
             if let Some((r, word)) = self.residency {
                 residency_room(plan, r, word).map_err(SessionError::Caller)?;

@@ -154,6 +154,9 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's recurrent and cache bytes.
     pub kv: KvLayout,
+    /// The model file's residency profile key ([`placement::profile::ModelKey`]),
+    /// or why the file has none: what a plan's cards seed from.
+    pub profile_key: Result<placement::profile::ModelKey, String>,
 }
 
 /// Why a plan was refused.
@@ -290,6 +293,7 @@ impl PlanInputs {
             model,
             spec,
             kv,
+            profile_key: placement::profile::ModelKey::of(split).map_err(|e| e.to_string()),
         })
     }
 
@@ -477,6 +481,7 @@ impl PlanInputs {
             )?,
         };
         ple_on_host(&mut plan)?;
+        placement::profile::seed(&mut plan, &levers.profile, &self.profile_key)?;
         Ok(plan)
     }
 
@@ -2494,6 +2499,7 @@ mod tests {
             let (model, machine) = (model(), machine(131 * MIB));
             let levers = PlanLevers {
                 card_budget_bytes: Some(2 * MIB),
+                ..PlanLevers::default()
             };
             let card = card_plan(&model, &machine, &levers, 0);
             let host = placement::plan_host_routed(&model, &machine, 4096, &NoKv, &levers)
@@ -3095,6 +3101,7 @@ mod tests {
                 },
                 spec,
                 kv,
+                profile_key: Err("a test's inputs read no file".to_string()),
             }
         }
 

@@ -1055,6 +1055,7 @@ mod gate {
             max_rows: MAX_ROWS,
             unrouted: Vec::new(),
             deadline,
+            profile: None,
         }
     }
 

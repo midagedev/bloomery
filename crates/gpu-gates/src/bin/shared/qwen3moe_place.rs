@@ -108,12 +108,13 @@ fn probed() {
     PROBES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The levers a placed load acts on: the plan's card budget and the host
-/// set's load (`Levers::host`). A binary lists them as acted on only when
-/// `--place` is given, so one set beside an unplaced load is refused by
-/// name.
-pub const PLACED_LEVERS: [&str; 4] = [
+/// The levers a placed load acts on: the plan's card budget, its residency
+/// profile, and the host set's load (`Levers::host`). A binary lists them as
+/// acted on only when `--place` is given, so one set beside an unplaced load
+/// is refused by name.
+pub const PLACED_LEVERS: [&str; 5] = [
     bloomery_levers::CARD_BUDGET,
+    bloomery_levers::RES_PROFILE,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,

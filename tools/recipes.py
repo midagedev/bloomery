@@ -4835,7 +4835,8 @@ def key_self_test(expect, real: Side) -> None:
     for n, hit in never_only_readers:
         expect(n in never, f"{n} reads {hit}: an entry the box manifest leaves out (DATA_NEVER_ONLY), and {n} can skip — take it out of DATA_NEVER_ONLY")
     expect(any(n == "gate-tokenizer" for n, _ in never_only_readers), "no gate-* recipe names the tokenizer data: DATA_NEVER_ONLY_NAMED no longer sees gate-tokenizer's reads")
-    expect(never == {"gate-1-1", "gate-tokenizer"}, f"never-skip gate recipes: {sorted(never)}")
+    # gate-resprofile runs the box's numpy python, /home/user/ft (IK_READ's home path): outside the key.
+    expect(never == {"gate-1-1", "gate-resprofile", "gate-tokenizer"}, f"never-skip gate recipes: {sorted(never)}")
     expect(
         tree_scoped <= never,
         f"skippable gate-* recipes keyed on the whole tree: {sorted(tree_scoped - never)} — a script in the closure walks the tree",
@@ -5774,7 +5775,7 @@ def self_test() -> int:
     # records.py, which loads the schema (the scan reaches records.py by routes.py's chain of tools)
     weeklies = [n for n in recipes if n.startswith(WEEKLY_PREFIX)]
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
-    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-resprofile", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     for n in ("check", "lint"):
         expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
 

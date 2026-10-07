@@ -262,6 +262,9 @@ pub struct PlanInputs {
     /// Each trunk layer's recurrent and cache bytes, at one KDA lane
     /// ([`KvLayout::with_lanes`] for more).
     pub kv: KvLayout,
+    /// The model file's residency profile key ([`placement::profile::ModelKey`]),
+    /// or why the file has none: what a plan's cards seed from.
+    pub profile_key: Result<placement::profile::ModelKey, String>,
 }
 
 /// Why a plan was refused.
@@ -384,6 +387,7 @@ impl PlanInputs {
             model,
             spec,
             kv,
+            profile_key: placement::profile::ModelKey::of(split).map_err(|e| e.to_string()),
         })
     }
 
@@ -464,6 +468,7 @@ impl PlanInputs {
             card_routed,
             front.saturating_add(beside),
         )?;
+        placement::profile::seed(&mut plan, &levers.profile, &self.profile_key)?;
         // The bytes beside the stores ride the stage card's KV term, out of
         // the budget reserved above, so the card's bound holds them.
         if let Some(t) = plan.cards.first_mut() {
@@ -798,6 +803,7 @@ impl PlanInputs {
             card_routed,
             reserve,
         )?;
+        placement::profile::seed(&mut plan, &levers.profile, &self.profile_key)?;
         // The bytes beside the stores ride the stage card's KV term, as
         // [`PlanInputs::plan_slots`] counts them.
         plan.cards[0].kv_bytes += beside;

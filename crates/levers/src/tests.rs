@@ -344,6 +344,7 @@ fn accessors_read_their_rows() {
             (CARD_DONTNEED, "0"),
             (R8, "off"),
             (RESIDENCY, "mid-p40-s1"),
+            (RES_PROFILE, "/data/profile"),
             (QWEN38_EXPERTS, "card"),
             (HOSTSTREAM, "on"),
             (QWEN3_KV, "q8_0"),
@@ -373,6 +374,10 @@ fn accessors_read_their_rows() {
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), Some("mid-p40-s1"));
+    assert_eq!(
+        set.res_profile(),
+        Some(ResProfile::File(Path::new("/data/profile")))
+    );
     assert_eq!(set.qwen38_experts(), "card");
     assert_eq!(set.qwen38_experts_set(), Some("card"));
     assert_eq!(set.qwen3_kv_set(), Some("q8_0"));
@@ -413,6 +418,7 @@ fn accessors_read_their_rows() {
             CARD_DONTNEED,
             R8,
             RESIDENCY,
+            RES_PROFILE,
             QWEN38_EXPERTS,
             HOSTSTREAM,
             QWEN3_KV,
@@ -1614,4 +1620,49 @@ fn mtp_head_rows_takes_full_or_a_path() {
         Some(MtpHead::List(Path::new("./full")))
     );
     assert!(read_one("").is_err(), "the empty value is no path");
+}
+
+/// `BLOOMERY_RES_PROFILE` takes `off` or a path; unset reads as none (the
+/// placement crate's default directory).
+#[test]
+fn res_profile_takes_off_or_a_path() {
+    let read_one = |v: &str| read(&env(&[(RES_PROFILE, v)]), Scope::Every);
+    assert_eq!(
+        read_one("off").expect("off is the word").res_profile(),
+        Some(ResProfile::Off)
+    );
+    assert_eq!(
+        read_one("./off").expect("a path").res_profile(),
+        Some(ResProfile::File(Path::new("./off")))
+    );
+    assert!(read_one("").is_err(), "the empty value is no path");
+    let unset = read(&env::<&str>(&[]), Scope::Every).expect("nothing set");
+    assert_eq!(unset.res_profile(), None);
+}
+
+/// `acts_on` says whether a reading's binary acts on a lever: the ones its
+/// list names, every one for a reading that acts on all, none other.
+#[test]
+fn acts_on_is_the_binarys_list() {
+    let none = read(
+        &env::<&str>(&[]),
+        Scope::Main {
+            bin: "b",
+            acts_on: &[],
+        },
+    )
+    .expect("nothing set");
+    assert!(!none.acts_on(RES_PROFILE));
+    let listed = read(
+        &env::<&str>(&[]),
+        Scope::Main {
+            bin: "b",
+            acts_on: &[RES_PROFILE],
+        },
+    )
+    .expect("nothing set");
+    assert!(listed.acts_on(RES_PROFILE));
+    assert!(!listed.acts_on(CARD_BUDGET));
+    let every = read(&env::<&str>(&[]), Scope::Every).expect("nothing set");
+    assert!(every.acts_on(RES_PROFILE));
 }

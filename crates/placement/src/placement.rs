@@ -36,6 +36,7 @@ use gguf::GgmlType;
 pub mod card_budget;
 pub mod churn;
 pub mod devices;
+pub mod profile;
 pub mod workstation;
 
 #[cfg(test)]
@@ -810,6 +811,10 @@ pub struct Plan<'a> {
     /// The card byte budget the plan was made under: every card planned
     /// with `min(usable, budget)` usable bytes ([`Plan::usable_bytes`]).
     pub card_budget: Option<u64>,
+    /// Which experts the card segments took — the id prefix, or a residency
+    /// profile's top ones ([`profile::seed`]) — and the profile a machine
+    /// that runs the plan adds to.
+    pub seed: profile::Seed,
 }
 
 /// Why a placement could not be built; each variant names what it refused.
@@ -1585,20 +1590,33 @@ fn footprint(
 
 /// The placement's levers, which a binary parses once
 /// ([`PlanLevers::from_levers`]): the card budget `BLOOMERY_CARD_BUDGET`
-/// sets. The default is none: each card's own usable bytes.
+/// sets and the residency profile `BLOOMERY_RES_PROFILE` names. The default
+/// is none of either: each card's own usable bytes, the id prefix.
 #[derive(Clone, Debug, Default)]
 pub struct PlanLevers {
     /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: every card of
     /// the plan plans with `min(usable, budget)`; `None` unset, each card's
     /// own usable bytes.
     pub card_budget_bytes: Option<u64>,
+    /// The residency profile a model's plan seeds its cards from
+    /// ([`profile::seed`]).
+    pub profile: profile::ProfileLever,
 }
 
 impl PlanLevers {
-    /// The placement's levers of a binary's one parse.
+    /// The placement's levers of a binary's one parse; the profile's
+    /// directory under the cache directory the binary runs with
+    /// (`XDG_CACHE_HOME`, else `HOME`'s `.cache`), and no profile for a binary
+    /// that does not act on `BLOOMERY_RES_PROFILE`.
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, PlacementError> {
         Ok(PlanLevers {
             card_budget_bytes: levers.card_budget_bytes(),
+            profile: profile::ProfileLever::of(
+                levers.acts_on(bloomery_levers::RES_PROFILE),
+                levers.res_profile(),
+                std::env::var_os("HOME"),
+                std::env::var_os("XDG_CACHE_HOME"),
+            ),
         })
     }
 }
@@ -2285,6 +2303,7 @@ fn totals<'a>(
         n_l,
         tier_n_l,
         card_budget,
+        seed: profile::Seed::default(),
     }
 }
 
@@ -2594,6 +2613,105 @@ mod tests {
         let plan = plan_host_routed(&model, &whole, 4096, &NoKv, &PlanLevers::default())
             .expect("every stack on the host");
         assert_eq!(plan.host.experts, 24);
+    }
+
+    /// A residency profile seeds each layer's cards in the planner's order:
+    /// the stage card its top `n_l` by the profile's rank, the tier the next
+    /// ones, the host the rest; a layer the profile ranks shorter keeps the
+    /// id prefix after its ranked experts; every count and byte total stands.
+    /// A file the read refuses, and `off`, keep the planner's id prefix, the
+    /// seed saying why; only `off` leaves no file for a machine to write.
+    #[test]
+    fn a_profile_seeds_the_stage_and_tier_cards() {
+        use profile::{CardSeed, ModelKey, Profile, ProfileLever};
+        let model = layered(3);
+        let machine = Machine {
+            cards: vec![bytes_card("stage", HEAD + 5 * EXPERT, 0..3)],
+            tiers: vec![bytes_card("tier", 4 * EXPERT, 0..0)],
+            host: host(),
+        };
+        let base = plan_with(&model, &machine, 4096, &NoKv, None).expect("planned");
+        assert_eq!(
+            (base.n_l.clone(), base.tier_n_l.clone()),
+            (vec![2, 2, 1], vec![vec![1, 1, 2]])
+        );
+        let lists = |p: &Plan<'_>| -> Vec<Vec<Vec<u32>>> {
+            p.rows
+                .iter()
+                .filter(|r| model.tensors[r.tensor].role == Role::RoutedExperts)
+                .map(|r| {
+                    r.segments
+                        .iter()
+                        .map(|s| s.experts.as_ref().map_or(Vec::new(), |e| e.ids().to_vec()))
+                        .collect()
+                })
+                .collect()
+        };
+        let key = ModelKey {
+            stem: "layered".to_string(),
+            shards: vec![("layered.gguf".to_string(), 1)],
+        };
+        let mut prof = Profile::new(key.clone(), 3, 8);
+        for (id, c) in [(7, 9), (5, 8), (3, 7), (1, 6)] {
+            prof.counts[id] = c;
+        }
+        prof.counts[8 + 6] = 1;
+        let dir = std::env::temp_dir().join(format!("bloomery-seed-{}", std::process::id()));
+        let path = dir.join("layered");
+        profile::write(&path, &prof).expect("written");
+        let mut seeded = base.clone();
+        profile::seed(
+            &mut seeded,
+            &ProfileLever::File(path.clone()),
+            &Ok(key.clone()),
+        )
+        .expect("seeded");
+        assert_eq!(
+            seeded.seed.card,
+            CardSeed::Profile {
+                path: path.clone(),
+                pairs: 5
+            }
+        );
+        assert_eq!(
+            lists(&seeded),
+            vec![
+                vec![vec![5, 7], vec![3], vec![0, 1, 2, 4, 6]],
+                vec![vec![0, 6], vec![1], vec![2, 3, 4, 5, 7]],
+                vec![vec![0], vec![1, 2], vec![3, 4, 5, 6, 7]],
+            ]
+        );
+        assert_eq!(
+            (seeded.n_l.clone(), seeded.tier_n_l.clone()),
+            (base.n_l.clone(), base.tier_n_l.clone())
+        );
+        let bytes = |p: &Plan<'_>| {
+            p.cards
+                .iter()
+                .map(|c| (c.expert_bytes, c.experts))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bytes(&seeded), bytes(&base));
+        assert_eq!(seeded.seed.target.as_ref().map(|t| &t.path), Some(&path));
+        std::fs::write(&path, b"BLMRPRF1").expect("torn");
+        let mut torn = base.clone();
+        profile::seed(
+            &mut torn,
+            &ProfileLever::File(path.clone()),
+            &Ok(key.clone()),
+        )
+        .expect("kept");
+        assert_eq!(lists(&torn), lists(&base));
+        match &torn.seed.card {
+            CardSeed::Prefix { why, .. } => assert!(why.contains("short of the 24"), "{why}"),
+            c => panic!("{c:?}, not the prefix"),
+        }
+        assert!(torn.seed.target.is_some());
+        let mut off = base.clone();
+        profile::seed(&mut off, &ProfileLever::Off, &Ok(key)).expect("off");
+        assert_eq!(lists(&off), lists(&base));
+        assert_eq!(off.seed.target, None);
+        std::fs::remove_dir_all(&dir).expect("cleaned");
     }
 
     /// A card another process holds: the census's free reading caps the

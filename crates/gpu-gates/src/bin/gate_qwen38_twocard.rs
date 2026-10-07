@@ -752,6 +752,7 @@ mod gate {
         for gib in BUDGETS {
             let levers = PlanLevers {
                 card_budget_bytes: Some(gib << 30),
+                ..PlanLevers::default()
             };
             let plan = inputs
                 .plan_with(bp, ctx as u64, &levers, Experts::Card)

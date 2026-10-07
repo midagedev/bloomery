@@ -22,6 +22,24 @@ pub const R8_ARCH: &str = "bloomery-r8";
 /// bytes as another type's. Never 211: ik reads that as its `Q3_K_R4`.
 pub const Q3K_R8_TYPE: u32 = 1011;
 
+/// The model key of a file whose first shard is named `name`: the name
+/// without `.gguf` and without llama.cpp's shard suffix `-NNNNN-of-NNNNN`.
+/// The one rule that names a file after a model file: the r8 sidecar's
+/// (`r8file::sidecar_path`) and the residency profile's
+/// ([`crate::placement::profile`]).
+#[must_use]
+pub fn model_stem(name: &str) -> &str {
+    let stem = name.strip_suffix(".gguf").unwrap_or(name);
+    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    let Some((head, count)) = stem.rsplit_once("-of-") else {
+        return stem;
+    };
+    match head.rsplit_once('-') {
+        Some((base, no)) if digits(no) && digits(count) => base,
+        _ => stem,
+    }
+}
+
 /// Why a sidecar is not written, not opened or not equal to its source. The
 /// identity refusals carry the sidecar's path, what it recorded and what the
 /// source is now.
@@ -189,4 +207,25 @@ pub enum R8Error {
         .path.display()
     )]
     ResidentCopy { path: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    /// `.gguf` and llama.cpp's five-digit shard suffix go; any other suffix
+    /// stays.
+    #[test]
+    fn the_model_stem_drops_the_shard_suffix_alone() {
+        for (name, stem) in [
+            (
+                "DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf",
+                "DeepSeek-V4.1-Flash-Q3_K_M",
+            ),
+            ("model.gguf", "model"),
+            ("m-1-of-2.gguf", "m-1-of-2"),
+            ("m-00001-of-00002", "m"),
+            ("noext", "noext"),
+        ] {
+            assert_eq!(super::model_stem(name), stem, "{name}");
+        }
+    }
 }

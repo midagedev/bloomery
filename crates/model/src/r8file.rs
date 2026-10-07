@@ -103,22 +103,12 @@ pub fn sidecar_path(first_shard: &Path) -> Result<PathBuf, R8Error> {
             source,
         })?
     };
-    let stem = name.strip_suffix(".gguf").unwrap_or(&name);
     let mut side = dir.into_os_string();
     side.push("-r8");
-    Ok(PathBuf::from(side).join(format!("{}-r8.gguf", without_split(stem))))
-}
-
-/// `stem` without a trailing `-NNNNN-of-NNNNN`, llama.cpp's shard suffix.
-fn without_split(stem: &str) -> &str {
-    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
-    let Some((head, count)) = stem.rsplit_once("-of-") else {
-        return stem;
-    };
-    match head.rsplit_once('-') {
-        Some((base, no)) if digits(no) && digits(count) => base,
-        _ => stem,
-    }
+    Ok(PathBuf::from(side).join(format!(
+        "{}-r8.gguf",
+        bloomery_placement::r8::model_stem(&name)
+    )))
 }
 
 /// A source stack the sidecar takes: the shard that holds it, its header
