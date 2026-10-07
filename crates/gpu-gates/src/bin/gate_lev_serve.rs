@@ -24,9 +24,10 @@
 //!   taken out (each prompt runs from a reset);
 //! - `tops_match_mainline`: every request's body against the dump's: the same shape (keys and their
 //!   order, the legends, the usage, the number kinds) exactly, and every question's top option the
-//!   same; the largest |dp| over every probability and each question's margin in the dump are
-//!   printed, not pinned (the backbone under it agrees with mainline's within its own noise, so a
-//!   probability band would pin that);
+//!   same; each question's margin in the dump is printed (a margin under the backbone's noise is a
+//!   near-tie, its top pinned as it is);
+//! - `probabilities_within_band`: the largest |dp| over every probability of the 14 requests at most
+//!   [`DP_BAND`];
 //! - `hf_serves_its_row` (only with `--hf`: it fetches the file from the hub, a network read): `--hf
 //!   <repo[:quant]> --port 0` and no head flag lists the same model file, head and row, and answers the
 //!   first request with the body of the `-m` server's, byte for byte but the `model` (the hub's repo, as
@@ -72,6 +73,14 @@ mod gate {
 
     /// The suite and edge requests: the 14 the dump answers.
     const REQUEST_FILES: [&str; 2] = ["suite.jsonl", "edge.jsonl"];
+
+    /// PIN(2026-10-08): the band on the largest |dp|, ours against mainline's server, over every
+    /// probability of the 14 requests. Both read the same Q4_K_M codes and differ in the backbone's
+    /// 8-bit activations and f32 sum order (the hidden-state gate's median relative distance is
+    /// 0.045), which reads 0.0632 at the worst probability (`sentiment-07`'s `bug_report`). 0.25 is
+    /// 4 times that. A variant not mapped back to its options' order (a second prompt that showed
+    /// them reversed) reads 0.39 to 0.49 on the same requests, 1.6 times the band and more.
+    const DP_BAND: f64 = 0.25;
 
     /// The models table line `bloomery-serve --help` prints for lev
     /// ([`drive::MODELS`] in `bloomery_serve.rs`).
@@ -448,10 +457,9 @@ mod gate {
             tops &= same_tops;
             worst = worst.max(dp);
         }
-        println!(
-            "max |dp| over every question of the 14 requests {worst:.4} (diagnostic, not pinned)"
-        );
+        println!("max |dp| over every question of the 14 requests {worst:.4} (band {DP_BAND})");
         check(&mut ok, "tops_match_mainline", shapes && tops);
+        check(&mut ok, "probabilities_within_band", worst <= DP_BAND);
         println!("server stopped: {}", s.stop()?);
 
         if let Some(spec) = &a.hf {
