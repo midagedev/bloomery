@@ -570,9 +570,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::Words(&["off", "admit", "split"]),
         default: Unset::Means(
-            "Qwen3.8 (`generate_qwen3moe`): `split` under `--place a` with a residency (`admit` when \
-             the card has no room for the ring), `admit` under `--place bp` with one, `off` \
-             everywhere else",
+            "Qwen3.8 (`generate_qwen3moe` and the serve seat, one rule): `split` under `--place a` \
+             with a residency (`admit` when the card has no room for the ring), `admit` under \
+             `--place bp` with one, `off` everywhere else",
         ),
         doc: "Qwen3.8 prompt calls fed by ubatches under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \

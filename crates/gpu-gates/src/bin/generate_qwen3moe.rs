@@ -140,8 +140,9 @@
 //! others) sets what each prompt call moves (`Body38::set_xstream`):
 //! `admit` streams its hottest host experts into the residency pool, `split`
 //! admits and then streams the host experts the stream rule sends to the
-//! card through the expert stream's ring. Unset it is `split` under
-//! `--place a` with a residency machine — `admit` under `bp`, whose expert
+//! card through the expert stream's ring. Unset (the rule the Qwen3.8 serve
+//! seat shares, `shared/xstream38.rs`) it is `split` under `--place a`
+//! with a residency machine — `admit` under `bp`, whose expert
 //! tier the ring does not serve, and where the card has no room for the
 //! ring, named on the `xstream=` line — and `off` everywhere else; `admit`
 //! or `split` beside `BLOOMERY_RESIDENCY=off` is refused by name, and so is
@@ -331,10 +332,15 @@ mod q3place;
 mod gen_slots;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/xstream38.rs"]
+mod xstream38;
+
+#[cfg(feature = "gpu")]
 mod cli {
     use super::gen_slots;
     use super::q3place::{self, PlaceQ3};
     use super::taps;
+    use super::xstream38::{Stage38, xstream38};
     use app::Session;
     use app::arch::qwen3moe::Q38Cfg;
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
@@ -347,10 +353,10 @@ mod cli {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
-    use bloomery_gpu::host::xstream::{XLayer, XMode, XReport, XSTREAM_ROOM};
+    use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
-    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
+    use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::{Place, card_words};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -945,6 +951,15 @@ mod cli {
         /// (residency, the MTP draft, host streaming) treat as plan (a).
         fn stage_a(self) -> bool {
             matches!(self.kind, Kind38::A | Kind38::Bp)
+        }
+
+        /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
+        fn stage38(self) -> Stage38 {
+            match self.kind {
+                Kind38::A => Stage38::A,
+                Kind38::Bp => Stage38::Tiered,
+                Kind38::Gate => Stage38::Other,
+            }
         }
 
         /// The machine a plan of `inputs` at ubatches of `ub` positions
@@ -2173,13 +2188,9 @@ mod cli {
         Ok(())
     }
 
-    /// `BLOOMERY_XSTREAM` on the load (`Body38::set_xstream`), then its
-    /// `xstream=` line: as set; unset, `split` under `--place a` with a
-    /// residency machine (`admit` when the card has no room for the stream's
-    /// ring, the refusal named on the line), `admit` under `bp` with one
-    /// (its expert tier the ring does not serve), `off` everywhere else.
-    /// `admit` or `split` beside `BLOOMERY_RESIDENCY=off` is refused there by
-    /// name, and `BLOOMERY_HOSTSTREAM` set here.
+    /// `BLOOMERY_XSTREAM` on the load and its `xstream=` line, by the rule
+    /// the Qwen3.8 serve seat shares ([`xstream38`]); `BLOOMERY_HOSTSTREAM`
+    /// set here is refused by name.
     fn stream38(
         m: &mut Qwen38Model,
         levers: &Levers,
@@ -2194,33 +2205,8 @@ mod cli {
             );
         }
         let (gpu, _, body) = m.body_parts("generate_qwen3moe")?;
-        let why = match levers.xstream() {
-            Some(word) => {
-                body.set_xstream(gpu, XMode::parse(word)?)?;
-                "set".to_string()
-            }
-            None if residency == Residency::Off || !place.stage_a() => {
-                body.set_xstream(gpu, XMode::Off)?;
-                "unset: no residency or not --place a".to_string()
-            }
-            None if place.kind == Kind38::Bp => {
-                body.set_xstream(gpu, XMode::Admit)?;
-                "unset: --place bp, whose expert tier the ring does not serve".to_string()
-            }
-            None => match body.set_xstream(gpu, XMode::Split) {
-                Ok(()) => "unset: --place a with a residency".to_string(),
-                Err(
-                    e @ GpuError::Shape {
-                        what: XSTREAM_ROOM, ..
-                    },
-                ) => {
-                    body.set_xstream(gpu, XMode::Admit)?;
-                    format!("unset: split has no room: {e}")
-                }
-                Err(e) => return Err(e.into()),
-            },
-        };
-        println!("xstream={} ({why})", body.xstream_word());
+        let line = xstream38(gpu, body, levers.xstream(), place.stage38(), residency)?;
+        println!("{line}");
         Ok(())
     }
 

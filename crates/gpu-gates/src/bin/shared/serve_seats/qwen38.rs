@@ -192,6 +192,13 @@
 //! on, never one step an id — so the body's refusal of a step-fed prompt
 //! beside the machine is never reached.
 //!
+//! `BLOOMERY_XSTREAM` resolves by the rule `generate_qwen3moe` runs
+//! (`shared/xstream38.rs`): set as given; unset `split` under `--place a`
+//! with a residency machine (`admit` when the card has no room for the
+//! stream's ring), `admit` under `--place bp` with one, `off` everywhere
+//! else. The open resolves it last, after the slots and the drafts, and
+//! prints its `xstream=` line (the word, then why) after the capture lines.
+//!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70.
@@ -207,8 +214,8 @@
 //! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
 //! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
 //! tier's load settings, `BLOOMERY_PIN_MAIN`, the draft's levers,
-//! `BLOOMERY_RESIDENCY` and `BLOOMERY_STEP_STATS` (the `slots round` record
-//! a round of several slots prints); the ubatch size
+//! `BLOOMERY_RESIDENCY`, `BLOOMERY_XSTREAM` and `BLOOMERY_STEP_STATS` (the
+//! `slots round` record a round of several slots prints); the ubatch size
 //! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
 //! stderr lines named above are records of the kinds
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
@@ -260,6 +267,10 @@ use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
 
+#[path = "../xstream38.rs"]
+mod xstream38;
+use xstream38::{Stage38, xstream38};
+
 /// The levers `bloomery-serve-qwen38` acts on, for its own `main` and for
 /// `gate_qwen38_serve`'s (the gate starts the server with its own
 /// environment, so a lever the server would refuse is refused by the gate
@@ -277,6 +288,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_DRAFT,
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
+    bloomery_levers::XSTREAM,
     bloomery_levers::STEP_STATS,
 ];
 
@@ -432,6 +444,15 @@ impl Place38 {
     /// treat as plan (a).
     fn stage_a(self) -> bool {
         matches!(self.kind, Kind38::A | Kind38::Bp)
+    }
+
+    /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
+    fn stage38(self) -> Stage38 {
+        match self.kind {
+            Kind38::A => Stage38::A,
+            Kind38::Bp => Stage38::Tiered,
+            Kind38::Gate => Stage38::Other,
+        }
     }
 
     /// The placement holds an expert tier card (plan (b′)): the body runs
@@ -1195,6 +1216,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_bytes,
         draft_off,
         residency,
+        xstream: levers.xstream(),
         stats: levers.step_stats(),
         width,
     };
@@ -1266,6 +1288,9 @@ struct SeatArgs {
     draft_off: Option<Draft38Off>,
     /// The residency the load runs ([`residency38`]).
     residency: Residency,
+    /// `BLOOMERY_XSTREAM` as set, or unset for the shared rule
+    /// ([`xstream38`]).
+    xstream: Option<&'static str>,
     /// `BLOOMERY_STEP_STATS`, the round records the seat prints.
     stats: bool,
     /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
@@ -1502,6 +1527,11 @@ impl Q38 {
                 a.place.name()
             );
         }
+        // The expert stream last: a started ring takes the card's free bytes
+        // past its keep, so every card buffer the open makes comes before it.
+        let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
+        let line = xstream38(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
+        eprintln!("{line}");
         Ok(Q38 {
             s,
             drafts,
