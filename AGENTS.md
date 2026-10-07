@@ -102,6 +102,11 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   rows in `tools/gate-paths.tsv` or its own text changes. `just stage-gpu-load-v41 [--plan a]` (plan (b) staged on
   both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
   `placement/{workstation,host_lock}.rs`, `crates/gpu/src/{hybrid,weights}.rs` or `gate_load_v41.rs` runs it by name.
+- **Releases.** `just release-build <v>`, then `tools/release/publish.sh <v>`. Between the union batch and the tag
+  runs the user-facing pass: the candidate tarball's `bloomery-serve` at the serving defaults (no `--parallel`, MTP
+  and every lever unset, a typical `--ctx-size`), on each placement a user picks (`a`, `bp`), with a short and a
+  ≥ 4K-token prompt (toktape tapes). It is read before the tag, and the release message states its numbers and
+  every off cell (a feature off on a placement, model or binary). A bench sitting with set levers is not this pass.
 - `just gate` excludes the measure targets (they need a quiet machine and a lock) and `just deny`. Build artifacts land
   in the workspace root `target/`; the measure runners read only from there.
 
