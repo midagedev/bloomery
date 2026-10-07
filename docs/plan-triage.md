@@ -159,6 +159,20 @@ Order:
     (`tools/gate-paths.tsv:68`), and `crates/gpu/src/weights.rs` has no row. Map them by the family that reads them,
     and give `weights.rs` its row. (iqwire moved kernels, so its full list was right; the `*` rows widen every later
     coverage or mtp change.)
+- **Fixture tier (test doubles; the user, 2026-10-07: "네 추천대로 진행해줘")**. The design is the lead's specs
+  `fxdouble/report-opus.md` and its addendum. Small fixture models force offloading and load warm in about 2–3 s
+  [derived]. That moves whole-model gates out of the solo lane: the landing wall goes from 6,741 s to about 2,600–2,800
+  s [derived]. Three hosts: the box (real files), sihyung and dopc (fixtures, planned with pick `a`; dopc is the
+  baseline, a 4060 8 GB with 16 GB RAM). The Qwen3.8 fixture is 4 layers, about 8.9 GB [derived].
+  - Rounds: R0 `fxcommon` (one family-agnostic generator; running) → R1 `fxq38gen` → R2 `fxtier` (tier in the ledger
+    key) and R8 `fxhost` (one runner for dopc and sihyung, host in the key), both after the 0.2.6 tag and gatewall,
+    since both edit `gate-batch.sh` → R3 `fxq38gates` → R4 `fxroute`, R5 GLM, R6 V4.1, R7 the fixture oracles. None
+    rides the 0.2.6 train.
+  - Approved: about 12 GB on /models for R1; R3's real-file run past 30 min. R5/R6's real-file runs (GLM 34–94 min,
+    V4.1 about 33 min) are not covered by this approval: ask when they come up.
+  - Release batches become R-a: the fixture tier plus real-only arms (about 65 min [derived]), with self-consistency
+    clauses on real weights moved to `just weekly`. The first release after the tier lands runs R-a and R-b (all real,
+    about 112 min) both. A red only in R-b is a fixture gap to close before R-a stands alone.
 - **IQ types on the threaded host leg have no gate** (worker2, 2026-10-07; after 0.2.6, S). No gate in iqwire's batch
   runs IQ3_XXS/IQ4_XS through `moe.rs`'s threaded host leg. `gate-moe` has no IQ type. The qwen4exp/qwen38 e2e gates
   load UD-Q4_K_XL, whose routed stacks hold no IQ type. qdot's tests pin the IQ dots, but serially. So iq-sel-2's
