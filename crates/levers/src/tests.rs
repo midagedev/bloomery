@@ -485,7 +485,7 @@ fn residency_unset_follows_the_placement() {
     for (at, word, why) in [
         (
             at(true, false, false, false),
-            "mid-p40-s1",
+            "mid-p0-s1",
             ResidencyWhy::Place,
         ),
         (
@@ -540,9 +540,10 @@ fn residency_unset_follows_the_placement() {
 
 /// `BLOOMERY_RESIDENCY` unset in `generate_qwen3moe`: `off` before the plan
 /// where the machine does not run, the first condition that holds named;
-/// on plan (a) `mid-p<P>-s1`, P half the plan's fewest card experts a layer,
+/// on plan (a) `mid-p<P>-s1`, no seed expert pinned where the host takes
+/// the churn pool at 0 and the first P whose pool fits where it does not,
 /// and `off` with why when no layer holds one, when the fewest leave no room,
-/// and when the churn pool at P does not fit the plan's host headroom or
+/// and when no pool the card side leaves fits the plan's host headroom or
 /// what `MemAvailable` leaves.
 #[test]
 fn residency38_unset_follows_the_plan() {
@@ -610,20 +611,20 @@ fn residency38_unset_follows_the_plan() {
     assert_eq!(
         derived,
         Residency38Pick {
-            pinned: Some(148),
+            pinned: Some(0),
             why: Residency38Why::PlanA { fewest: 297 }
         }
     );
-    assert_eq!(derived.word(), "mid-p148-s1");
+    assert_eq!(derived.word(), "mid-p0-s1");
     assert_eq!(
         derived.why.to_string(),
-        "unset: plan (a), P half the plan's fewest card experts a layer (297)"
+        "unset: plan (a), no seed expert pinned (the plan's fewest card experts a layer is 297)"
     );
     let row = spec(RESIDENCY).expect("the row");
     row.kind
         .parse(&derived.word())
         .unwrap_or_else(|e| panic!("the derived word at the plain plan's count: {e}"));
-    assert_eq!(pick(&[3, 4], 1 << 40).word(), "mid-p1-s1");
+    assert_eq!(pick(&[3, 4], 1 << 40).word(), "mid-p0-s1");
     for n_l in [&[0u64, 0][..], &[]] {
         let p = pick(n_l, 1 << 40);
         assert_eq!(
@@ -658,41 +659,54 @@ fn residency38_unset_follows_the_plan() {
         Residency38Why::NoCardExperts,
         "no card expert is the first why"
     );
-    for fewest in [1u64, 2] {
-        assert_eq!(
-            pick(&[fewest, 9], 1 << 40),
-            Residency38Pick {
-                pinned: None,
-                why: Residency38Why::NoRoom {
-                    fewest: fewest as usize
-                }
-            }
-        );
-    }
-    // 297 − 148 = 149 experts a layer, 2 layers, 10 B each: 2,980 B.
-    assert_eq!(pick(&[297, 297], 2_980).pinned, Some(148));
-    // One byte less of headroom: the pool shrinks 20 B a pinned count, so
-    // the first count whose pool fits 2,979 B is 149 (2,960 B).
+    // A plan whose one card layer holds a single expert: the word's P 0
+    // needs it less the spares and one that moves — no room. At two experts
+    // the unpinned default fits.
+    assert_eq!(
+        pick(&[1, 9], 1 << 40),
+        Residency38Pick {
+            pinned: None,
+            why: Residency38Why::NoRoom { fewest: 1 }
+        }
+    );
+    assert_eq!(
+        pick(&[2, 9], 1 << 40).pinned,
+        Some(0),
+        "the unpinned default fits a plan of two card experts a layer"
+    );
+    // The churn pool at P 0 is 297 experts a layer, 2 layers, 10 B each:
+    // 5,940 B. A headroom of 2,980 B does not take it: the pool shrinks
+    // 20 B a pinned count, so the first count whose pool fits is 148
+    // (2,980 B).
+    assert_eq!(
+        pick(&[297, 297], 2_980),
+        Residency38Pick {
+            pinned: Some(148),
+            why: Residency38Why::Moved { from: 0, to: 148 }
+        }
+    );
+    // One byte less of headroom: the first count whose pool fits 2,979 B is
+    // 149 (2,960 B).
     let moved = pick(&[297, 297], 2_979);
     assert_eq!(
         moved,
         Residency38Pick {
             pinned: Some(149),
-            why: Residency38Why::Moved { from: 148, to: 149 }
+            why: Residency38Why::Moved { from: 0, to: 149 }
         }
     );
     assert_eq!(moved.word(), "mid-p149-s1");
     assert_eq!(
         moved.why.to_string(),
-        "unset: the plan's room moves the word's pinned experts p148→p149"
+        "unset: the plan's room moves the word's pinned experts p0→p149"
     );
     // The same byte less of MemAvailable moves it too, under a headroom
-    // that takes the pool at the target.
+    // that takes the pool at the raised count.
     assert_eq!(
         pick_mem(&[297, 297], 1 << 40, 2_979),
         Residency38Pick {
             pinned: Some(149),
-            why: Residency38Why::Moved { from: 148, to: 149 }
+            why: Residency38Why::Moved { from: 0, to: 149 }
         }
     );
     assert_eq!(pick_mem(&[297, 297], 2_980, 2_980).pinned, Some(148));
@@ -822,9 +836,11 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
 }
 
 /// [`RESIDENCY`] unset on a V4.1 plan ([`residency_at_plan`]): the serving
-/// word where the plan has room for it, half the fewest where its card slots
-/// leave less, `off` where they leave nothing; a set word and every other
-/// why pass through untouched.
+/// word `mid-p0-s1` wherever the plan's card slots hold the rule at all —
+/// its P 0 fits every plan but a one-expert layer — raised to the first P
+/// whose churn pool fits where the host does not take the pool at 0, `off`
+/// where neither side leaves a count; a set word and every other why pass
+/// through untouched.
 #[test]
 fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(10 * (fewest - p) as u64);
@@ -838,51 +854,27 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
             .expect("no pool error")
     };
     let big = 1 << 40;
-    // The serving word where the plan's layers hold it.
+    // The serving word wherever the plan's layers hold the rule.
     assert_eq!(at(&[42, 43], big, big), unset);
     assert_eq!(at(&[42, 43], big, big).why.name(), "place");
-    // Half the plan's fewest card experts a layer where they hold no more.
-    for (n_l, word, fewest, to) in [
-        (&[30u64, 31][..], "mid-p15-s1", 30, 15usize),
-        (&[29u64][..], "mid-p14-s1", 29, 14),
-        (&[3u64][..], "mid-p1-s1", 3, 1),
-    ] {
-        assert_eq!(
-            at(n_l, big, big),
-            ResidencyPick {
-                word,
-                why: ResidencyWhy::Shrunk {
-                    fewest,
-                    from: 40,
-                    to,
-                    side: RoomSide::Card,
-                },
-            },
-            "{n_l:?}"
-        );
-    }
+    assert_eq!(at(&[29, 30], big, big), unset);
+    assert_eq!(at(&[3], big, big), unset);
+    // A plan whose one card layer holds a single expert: the word's P 0
+    // needs it less the spares and one that moves — no room.
     assert_eq!(
-        at(&[29], big, big)
-            .why
-            .detail()
-            .expect("the shrunk why details"),
-        "unset: p40→p14 (card: fewest 29, half)"
-    );
-    // Under the floor: `off`.
-    assert_eq!(
-        at(&[2, 9], big, big),
+        at(&[1, 9], big, big),
         ResidencyPick {
             word: "off",
-            why: ResidencyWhy::NoRoom { fewest: 2 }
+            why: ResidencyWhy::NoRoom { fewest: 1 }
         }
     );
     assert_eq!(at(&[0, 0], big, big).why, ResidencyWhy::NoCardExperts);
     assert_eq!(
-        at(&[2, 9], big, big)
+        at(&[1, 9], big, big)
             .why
             .detail()
             .expect("the no-room why details"),
-        "unset: the plan's fewest card experts a layer (2) leave no room for the word's P or \
+        "unset: the plan's fewest card experts a layer (1) leave no room for the word's P or \
          half of them"
     );
     assert_eq!(
@@ -890,8 +882,9 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         None,
         "a why the plan did not move details nothing"
     );
-    // The host side raises a word the card slots hold when its pool does not
-    // fit: the pool at p40 is 100 B, at p45 50 B.
+    // The host side raises the word where the pool at its P 0 does not fit:
+    // the pool at p0 is 500 B, at p45 50 B, so the first count whose pool
+    // fits a headroom of 50 B is 45.
     let raised = residency_at_plan(
         unset,
         [50u64],
@@ -906,7 +899,7 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
             word: "mid-p45-s1",
             why: ResidencyWhy::Shrunk {
                 fewest: 50,
-                from: 40,
+                from: 0,
                 to: 45,
                 side: RoomSide::Host,
             },
@@ -914,7 +907,7 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     );
     assert_eq!(
         raised.why.detail().expect("the raised why details"),
-        "unset: p40→p45 (host: the churn pool did not fit, raised)"
+        "unset: p0→p45 (host: the churn pool did not fit, raised)"
     );
     // A set word and every other why pass through untouched, the pool unasked.
     let refused = |pick: ResidencyPick| {

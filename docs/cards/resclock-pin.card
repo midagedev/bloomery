@@ -1,0 +1,30 @@
+# Round resclock, piece 2 (the unpinned default): unset (P 0) against today's pin on this tree's
+# build, Qwen3.8 MTP decode at the common machine's card share. Same binary, lever arms; the clock is
+# the kept-row one on both (piece 1 is docs/cards/resclock-ab.card).
+# Band [derived, the resclock paper round's section 2.1]: un-pinning moves a fresh reply's hit by
+# +0.2 points at 96 tokens and +1.6 at 672 (37.7 -> 37.9, 62.0 -> 63.6, the token clock at a 22 %
+# share); host bytes a token fall 0.3 % and 4.2 %, 0.02 and 0.17 ms of a 22 ms and an 18.9 ms token:
+# 0..+0.9 %. Its +8.3 points are steady-state (one rule over a long session), which a depth run, a
+# load an arm, does not reach. As an ab card that band holds 0 and no round count resolves it, so it
+# is read as not slower by more than the margin.
+kind: noninf
+question: does running unset (no seed expert pinned) cost Qwen3.8 MTP decode against today's pin at
+  the common machine's card share?
+term: decode tok/s @ depth 512 and 4096, BLOOMERY_DRAFT=mtp, A6000, a card budget calibrated to
+  the common machine's 5,482 card experts - (unset - mid-p<P>-s1) / mid-p<P>-s1, paired by round
+unit: %
+predict: 0..+0.9
+rounds: 6
+sd: 0.6 % same-binary per round, AGENTS.md 「Know the ruler」
+condition: just depth-gpu-qwen4exp in one lease on this tree's build, order rotated every round,
+  arms 512 512@BLOOMERY_RESIDENCY=mid-p<P>-s1 4096 4096@BLOOMERY_RESIDENCY=mid-p<P>-s1 with P
+  today's unset derivation at that plan, half its fewest card experts a layer (63 [derived] at
+  5,482 card experts); BLOOMERY_BOX_ENV holds BLOOMERY_DRAFT=mtp and BLOOMERY_CARD_BUDGET
+  calibrated by its plan line to card_experts 5,482 (G5's chatarm arm); the bare arm's residency
+  unset record names mid-p0-s1 (the host takes the pool at 0); no [cpu-busy] or [other-busy] row
+decide-in: land piece 2 (the unpinned default)
+decide-below: read the arms' residency pass and host records - a pool of every card expert
+  costs the host more than the derivation holds (page cache, staging); keep the pin as the default
+  and re-derive the pool's host term
+decide-above: the pinned half cost hits on a fresh reply too - read the residency means, and price
+  the steady-state gain with a long-session arm before the profile round

@@ -417,16 +417,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::C,
         kind: Kind::Residency,
         default: Unset::Means(
-            "V4.1 follows the placement and the plan: `mid-p40-s1` under `--place a` and `bp` \
-             where the plan has room for it, half the plan's fewest card experts a layer \
-             (`mid-p<P>-s<S>`, P at least 1) where its card slots leave less, `off` where they \
-             leave no room for the word or half of them, or no churn pool the card side leaves \
-             fits the plan's host headroom or `MemAvailable`; `off` under `gate`, beside \
+            "V4.1 follows the placement and the plan: `mid-p0-s1` under `--place a` and `bp` \
+             where the plan's host takes its churn pool, the first P whose pool fits \
+             (`mid-p<P>-s1`) where the plan's host headroom or `MemAvailable` does not, `off` \
+             where the card slots leave no room for the word or no churn pool the card side \
+             leaves fits; `off` under `gate`, beside \
              `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or `BLOOMERY_PREFILL=steps`; \
              `generate_qwen3moe` on a qwen4exp file follows its plan: \
-             `mid-p<P>-s1` under `--place a`, P half the plan's fewest card experts a layer, \
-             `off` under `--place gate`, beside `BLOOMERY_ROUTE_TRACE`, `--prefill step` or \
-             `--dump-taps`, on a qwen3moe or qwen35moe file, and on plan (a) when the plan \
+             `mid-p<P>-s1` under `--place a`, P 0 where the plan's host takes the churn pool \
+             and the first P whose pool fits where it does not, `off` under `--place gate`, \
+             beside `BLOOMERY_ROUTE_TRACE`, `--prefill step` or `--dump-taps`, on a qwen3moe or \
+             qwen35moe file, and on plan (a) when the plan \
              leaves no room for the word, or no churn pool the card side leaves fits its host \
              headroom or `MemAvailable`; `bloomery-serve-qwen38` by the same rule under \
              `--place a` and `off` under `gate`; the GLM seat of `bloomery-serve` `mid-p0-s1` \
@@ -437,18 +438,26 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
               stage card's routed stacks, the first P seed experts of each layer never a victim \
-              and S slots a layer freed for flips in flight. V4.1 under `--place a` and \
+              and S slots a layer freed for flips in flight. The rule plans every 4 kept rows, \
+              not every 4 passes, so a drafted pass of several kept rows swaps at the same \
+              kept-token rate a plain one does; the rows past 4 carry to the next plan. Its cap \
+              is a churn guard, not link-sized: the copies one planning pass issues are a few \
+              percent of what the card's link and the host's staging land inside the live \
+              delay, so the link never sizes it. V4.1 under `--place a` and \
               `bp` (`generate_ds41`, `bloomery-serve-ds41`): the load's host set also holds \
               the churn pool, each layer's stage card experts past the first P, refused by \
               name when the plan's host headroom cannot take it, and prints `residency host`; \
               every pass prints `residency pass`; only an explicit call resets it (an arm's \
               clear, the server's `POST /residency/reset`), with a `residency reset` record. \
               Unset follows the placement (`bloomery_levers::residency_unset`): the serving \
-              default `mid-p40-s1` under `--place a` and `bp`, checked against the plan there \
-              (`bloomery_levers::residency_at_plan`) — half the plan's fewest card experts a \
-              layer where its card slots leave the default no room, `off` where they leave the \
-              word or half of it none, or no churn pool the card side leaves fits the plan's \
-              host headroom or `MemAvailable` — and `off` where the machine does not run — \
+              default `mid-p0-s1` under `--place a` and `bp`, checked against the plan there \
+              (`bloomery_levers::residency_at_plan`) — no seed expert pinned, so the churn pool \
+              holds every stage card expert, P x layers x expert bytes of host RAM more than a \
+              word that pins P (Qwen3.8 at a 22 % card share, 63 pinned a layer: +8.3 GB); the \
+              pin is the fallback under host-RAM pressure: the first P whose churn pool fits \
+              where the plan's host headroom or `MemAvailable` does not take the pool at 0, \
+              `off` where the card slots leave no room for the word or no churn pool the card \
+              side leaves fits — and `off` where the machine does not run — \
               `--place gate`, beside `BLOOMERY_CHECK_FINITE=1`, beside \
               `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing) and beside \
               `BLOOMERY_PREFILL=steps` (each prompt id would end a pass the rule counts); both \
@@ -459,19 +468,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the route trace and the step feed. Qwen3.8 (`generate_qwen3moe` on a qwen4exp \
               file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset follows the \
               plan (`bloomery_levers::residency38_unset`, `residency38_at_plan`) — under \
-              `--place a` `mid-p<P>-s1`, P half the fewest card experts a layer of the plan \
-              the load runs (the plain or the MTP plan, at its `--ctx`), derived at load so \
-              the default always fits the plan; `off` under `--place gate`, beside \
+              `--place a` `mid-p<P>-s1`, P 0 where the host room of the plan the load runs \
+              (the plain or the MTP plan, at its `--ctx`) takes the churn pool and the first P \
+              whose pool fits where it does not, derived at load so the default always fits the \
+              plan; `off` under `--place gate`, beside \
               `BLOOMERY_ROUTE_TRACE`, with `--prefill step`, under `--dump-taps`, on a \
               qwen3moe or qwen35moe file, when the plan holds no card expert, when it leaves \
               no routed expert on the host (the pool would serve none) or its fewest \
-              leave no room for P pinned, one spare and one that moves, and when the churn \
-              pool at P does not fit the plan's host headroom or what the host's \
+              leave no room for one spare and one that moves, and when no churn pool the card \
+              side leaves fits the plan's host headroom or what the host's \
               `MemAvailable` leaves past the plan's host need — never a refusal; the word and \
               why print as a `residency unset` record after the `plan` line (on a qwen3moe or \
               qwen35moe file, and under `--dump-taps`, before the load). \
-              `mid-p148-s1` is the word a set lever names for plan (a) at the plain plan's \
-              count; set, \
+              `mid-p0-s1` is the word a set lever names for plan (a) where its host takes the \
+              pool; set, \
               `mid-…` runs the same machine over the card's routed stacks, the load's host set \
               holds the churn pool, refused by name as above, and prints `residency host`, and \
               each arm prints its `residency pass` records after its lines; an arm's clear \

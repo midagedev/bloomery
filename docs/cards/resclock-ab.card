@@ -1,0 +1,37 @@
+# Round resclock, piece 1 (the clock): the rule counting kept rows instead of passes, on Qwen3.8 MTP
+# decode at the common machine's card share. Two builds in one lease: a build of the round's base
+# (the pass clock) against this tree, both under the same word, so only the clock differs. Piece 2
+# (the unpinned default) is docs/cards/resclock-pin.card, same-binary lever arms on this tree.
+# Band [derived, the resclock paper round's sections 2-3 and its sensitivity replay, q38 prose]: at
+# a 22 % card share and our prose E 3.3 the pass clock plans every 13 kept rows and holds hit 31.6 %
+# on a fresh 96-token reply, the kept-row clock every 4 and 37.7 %; host bytes a token (1 - hit) x
+# 43 layers x 10 slots x 3.072 MB go 0.904 -> 0.823 GB, at the host's 121 GB/s expert read rate
+# 7.47 -> 6.80 ms; on a token of 14.7 ms beside the host term (our 52 % share's 18.6 ms less its
+# 3.88 ms of host) that is +3.0 % with the host term fully exposed and +1.5 % with half of it.
+# Plain decode is not an arm: a pass of one kept row plans at the same boundaries on both builds.
+kind: ab
+question: does counting kept rows instead of passes shorten Qwen3.8 MTP decode at the common
+  machine's card share?
+term: decode tok/s @ depth 512 and 4096, BLOOMERY_DRAFT=mtp, A6000, a card budget calibrated to
+  the common machine's 5,482 card experts - (this tree - the base build) / the base build, paired
+  by round
+unit: %
+predict: +1.5..+3
+rounds: 6
+sd: 0.6 % same-binary per round, AGENTS.md 「Know the ruler」 (the two builds alternate in one lease,
+  each round both, the order rotated)
+condition: just depth-gpu-qwen4exp in one lease, arms 512 bin:<base tree>/target/release/
+  generate_qwen3moe:512 4096 bin:<base tree>/target/release/generate_qwen3moe:4096, the base tree a
+  build of this round's base commit; BLOOMERY_BOX_ENV holds, for every arm, BLOOMERY_DRAFT=mtp,
+  BLOOMERY_CARD_BUDGET calibrated by its plan line to card_experts 5,482 (G5's chatarm arm) and
+  BLOOMERY_RESIDENCY=mid-p<P>-s1 with P the base build's unset word at that plan (its residency
+  unset record, a plan-only run first; 63 [derived] at 5,482 card experts), so both builds run one
+  word; every row prints its residency mean and its mtp E(4); no [cpu-busy] or [other-busy] row
+decide-in: land piece 1 (the kept-row clock) and read the pin card (resclock-pin.card) in the
+  same sitting
+decide-below: read both builds' residency pass records (made/pass, landed/pass) and mtp E(4) - if
+  the kept-row build does not plan about E times as often a pass, the clock is not wired as
+  derived; if it does and the step did not move, the host term was hidden at that share - re-derive
+  the resource timeline before touching the rule again
+decide-above: the host was a larger share of the token than derived - re-read the timeline at that
+  share, then open the profile round (piece 3) with the larger host term in its band
