@@ -59,11 +59,13 @@ pub const GEN_SLOTS_MAX: u64 = 8;
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
 const SESSION: &str = "session";
+const NVTIER: &str = "nvtier";
 
 const OPS: &str = "crates/model/src/ops.rs";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
 const HYBRID: &str = "crates/gpu/src/hybrid.rs";
 const DECODE: &str = "crates/model/src/bin/bloomery-decode.rs";
+const WORKSTATION: &str = "crates/model/src/placement/workstation.rs";
 
 /// What an unset name that is no lever means.
 const OWNERS: Unset = Unset::Means("its owner's default");
@@ -213,6 +215,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               floor is refused with each term. `M` and `G` are binary units. The `plan` \
               line prints `card_budget=`.",
         site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: "BLOOMERY_HOST_ROOM",
+        class: Class::C,
+        kind: Kind::Bytes,
+        default: Unset::Means("the host's available bytes, read from this machine"),
+        doc: "Placement: the host's room in bytes (`M` and `G` binary units), read as given \
+              instead of from `/proc/meminfo` and the cgroup limits — an emulation of a \
+              smaller host and an override. It reaches every reader of the host's available \
+              bytes: the placed loads' host-need check, the residency rules' room and the \
+              Qwen3.8 plan's tiers, where the routed experts a room cannot hold are planned \
+              on the NVMe tier; a room under that tier's floor is refused with the room, the \
+              floor and the need.",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: WORKSTATION,
+                round: NVTIER,
+            }],
+        },
     },
     LeverSpec {
         name: PIN_MAIN,
