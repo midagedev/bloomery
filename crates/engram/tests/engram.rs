@@ -800,3 +800,95 @@ fn hw_engram_open_direct_reads_the_files_bytes() {
         "a path that is not there is refused by name, carrying the path"
     );
 }
+
+/// A [`engram::direct::DirectFile`] opens with the probe read, reads an
+/// aligned span's bytes at the skew the span's own start leaves, returns
+/// fewer bytes than asked where the file ends inside the span, and refuses
+/// an unaligned buffer or offset by name; the buffered handle reads the
+/// same bytes through the page cache.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_direct_file_reads_aligned_spans() {
+    use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
+    let scratch = Scratch::new("direct-file");
+    let (path, _) = write_synthetic(&scratch.0);
+
+    let file = DirectFile::open(&path).expect("a disk-backed file opens and probes");
+    assert!(file.is_direct());
+
+    // One expert's aligned span, read at the skew into an aligned window —
+    // the shape every arena fill uses.
+    let (at, len) = (37 * 512 + 17, 4096 + 100);
+    let (start, span, _) = aligned_span(at as u64, len as u64);
+    let mut backing = vec![0u8; span + DIRECT_ALIGN];
+    let off = backing.as_ptr().align_offset(DIRECT_ALIGN);
+    let skew = at as usize - start as usize;
+    let window = &mut backing[off..off + span];
+    let got = file
+        .read_span(window, start)
+        .expect("an aligned span reads");
+    assert_eq!(got, span, "the span is inside the file");
+    let mut want = vec![0u8; len];
+    File::open(&path)
+        .unwrap()
+        .read_exact_at(&mut want, at as u64)
+        .unwrap();
+    assert_eq!(
+        &window[skew..skew + len],
+        &want[..],
+        "the bytes at the span's skew are the file's at the caller's offset"
+    );
+
+    // The file ends inside this span: fewer bytes than asked, not an error.
+    let end = std::fs::metadata(&path).unwrap().len();
+    let (last, span, _) = aligned_span(end - 1, 1);
+    let mut tail = vec![0u8; span + DIRECT_ALIGN];
+    let off = tail.as_ptr().align_offset(DIRECT_ALIGN);
+    let got = file
+        .read_span(&mut tail[off..off + span], last)
+        .expect("a span the file ends inside reads what is there");
+    assert_eq!(
+        got,
+        (end - last) as usize,
+        "the read stops at the file's end, inside the last block"
+    );
+
+    // An unaligned buffer or offset is a named refusal, never a silent read.
+    let mut mis = vec![0u8; 2 * DIRECT_ALIGN];
+    let off = mis.as_ptr().align_offset(DIRECT_ALIGN);
+    assert!(
+        matches!(
+            file.read_span(&mut mis[off + 1..off + 1 + DIRECT_ALIGN], 0),
+            Err(EngramError::DirectUnaligned { .. })
+        ),
+        "an unaligned buffer is refused by name"
+    );
+    assert!(
+        matches!(
+            file.read_span(&mut mis[off..off + DIRECT_ALIGN], 1),
+            Err(EngramError::DirectUnaligned { .. })
+        ),
+        "an unaligned offset is refused by name"
+    );
+    assert!(
+        matches!(
+            file.read_span(&mut mis[off..off + DIRECT_ALIGN / 2], 0),
+            Err(EngramError::DirectUnaligned { .. })
+        ),
+        "an unaligned length is refused by name"
+    );
+
+    // The buffered handle takes any buffer and reads the same bytes.
+    let buffered = DirectFile::open_buffered(&path).expect("a plain open");
+    assert!(!buffered.is_direct());
+    let mut one = [7u8; 1];
+    buffered
+        .read_span(&mut one, 3)
+        .expect("any buffer, buffered");
+    let mut want = [0u8; 1];
+    File::open(&path)
+        .unwrap()
+        .read_exact_at(&mut want, 3)
+        .unwrap();
+    assert_eq!(one, want);
+}

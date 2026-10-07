@@ -16,6 +16,13 @@ use model::{Tensor2, Tensor2View};
 use super::HostExperts;
 use crate::GpuError;
 
+/// The NVMe expert tier's RAM arena, declared here until the host module's
+/// own list is free to hold it: one owner, the file at its side.
+#[path = "nvtier.rs"]
+pub(crate) mod nvtier;
+
+pub use nvtier::{NvTier, NvTierStats};
+
 /// The widths a host call serves: the model width, the routed experts'
 /// feed-forward width and the routed slots a token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +45,10 @@ pub struct HostRun {
     widths: HostWidths,
     /// The union's slabs, once [`HostRun::prepare_union`] made them.
     union: Option<UnionScratch>,
+    /// The NVMe expert tier's arena, when the plan built one and
+    /// [`HostRun::attach_tier`] gave it: every paged layer's ids outside
+    /// its host segment read from it.
+    tier: Option<Arc<NvTier>>,
 }
 
 impl HostRun {
@@ -68,7 +79,37 @@ impl HostRun {
             scratch: HostScratch::new(widths.embd, widths.ff, widths.n_used)?,
             widths,
             union: None,
+            tier: None,
         })
+    }
+
+    /// Give the run the NVMe expert tier's arena, and each layer the run
+    /// covers its own handle: the plan's host segment and the arena, the
+    /// parts resolved by the layer's stack names. Load-time only, once,
+    /// after the build; a run with no tier keeps reading the file mapping
+    /// alone.
+    pub fn attach_tier(&mut self, tier: Option<Arc<NvTier>>) -> Result<(), GpuError> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let Some(tier) = tier.as_ref() else {
+                break;
+            };
+            let l = self.first + i;
+            if !tier.covers(l) {
+                continue;
+            }
+            let names = layer.stacks().map(|s| s.info().name.clone());
+            tier.note_parts(l, &names.each_ref().map(|n| n.as_str()))?;
+            layer.attach_tier(l, tier.host_ids(l), tier.slots());
+        }
+        self.tier = tier;
+        Ok(())
+    }
+
+    /// The run's NVMe expert tier, when the plan built one; the counters a
+    /// caller reads ([`nvtier::NvTier::stats`]).
+    #[must_use]
+    pub fn tier(&self) -> Option<&Arc<NvTier>> {
+        self.tier.as_ref()
     }
 
     /// The union's slabs for batch calls of up to `cols` columns of the

@@ -75,6 +75,19 @@ pub fn residency38(
         Lever38::Unset(pre) => {
             let pick = match pre {
                 Some(off) => off,
+                None if plan.host.nvme_expert_bytes > 0 => {
+                    // A paged plan serves its victims from the NVMe tier's
+                    // arena, not from a churn pool of host pages: the pool is
+                    // 0 and the room's own reading decides nothing here.
+                    residency38_at_plan(
+                        plan.n_l.iter().copied(),
+                        plan.host.experts,
+                        |_: usize| -> Result<u64, String> { Ok(0) },
+                        plan.host.headroom_bytes,
+                        i128::MAX,
+                    )
+                    .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
+                }
                 None => {
                     // The load refuses a host set past the host's available
                     // bytes before any upload; the default leaves the pool

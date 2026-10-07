@@ -149,6 +149,7 @@ mod tests {
                 expert_bytes: 0,
                 experts: 0,
                 nvme_expert_bytes: 0,
+                nvme_arena_bytes: 0,
                 table_bytes: 0,
                 shadow_bytes: 0,
                 reserve_bytes: 0,
