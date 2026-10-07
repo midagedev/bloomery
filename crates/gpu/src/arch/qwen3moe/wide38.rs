@@ -17,9 +17,11 @@
 //!   experts, the card route ([`CardRoute38`]): per [`ROUTE_ROWS`] run, in
 //!   the shadow after the front's download, the compressed ids and the
 //!   places from the walk's ids, the remapped route table, the gate and up
-//!   GEMMs of the layer's type (Q4_K or Q5_K), the card slots' SwiGLU
-//!   (`swiglu_quant32_sel`), the down GEMM of its type (the file's Q5_1 or
-//!   Q8_0 blocks) and the card sum into the unit-wide acc — the host tier
+//!   GEMMs of the layer's type (Q4_K, Q5_K, IQ3_XXS or IQ4_XS), the card
+//!   slots' SwiGLU
+//!   (`swiglu_quant32_sel`), the down GEMM of its type (the file's Q5_1,
+//!   Q8_0 or IQ4_NL blocks) and the card sum into the unit-wide acc — the
+//!   host tier
 //!   serves the rest of the slots, and the back adds the card sum on a
 //!   layer with card experts (`q38_card_shared_add`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
@@ -457,8 +459,15 @@ impl CardRoute38 {
         let (n_card, gate, up) = (st.n_card, st.gate, st.up);
         let gate_up_ty = GemmWeight::from_ggml(st.gate_up_ty)?;
         let down = match st.down_ty {
+            GgmlType::Q5_1 => Gemm32Weight::Q5_1File(st.down),
             GgmlType::Q8_0 => Gemm32Weight::Q8_0File(st.down),
-            _ => Gemm32Weight::Q5_1File(st.down),
+            GgmlType::IQ4_NL => Gemm32Weight::Iq4NlFile(st.down),
+            other => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
+                ));
+            }
         };
         let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
         let pitch = geo::N_USED + 1;

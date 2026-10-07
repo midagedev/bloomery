@@ -1035,6 +1035,413 @@ fn hw_qwen4exp_card_plan() {
     );
 }
 
+/// The Q3 file: unsloth's `UD-Q3_K_XL`. Its first shard holds the header and
+/// no tensor.
+const Q3: &str =
+    "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+
+// PIN(2026-10-06): the Q3 file's dense card part and routed share [derived from its headers, as
+// CARD_DENSE's derivation reads the Q4 file's: every non-routed tensor but the PLE table on the
+// card in its CardFormat, the head one Q6_K word buffer of 521,472,000 B (248,320 rows of ten
+// 210 B super-blocks) in place of the Q4 file's two Q8_0 planes of 675,430,400 B, every other
+// non-routed tensor the same type and size in both files; the routed stacks, 43 layers of an
+// IQ3_XXS gate and up (627,200 B each: 640 rows of ten 98 B super-blocks) with an IQ4_NL down
+// (921,600 B: 2,560 rows of twenty 18 B blocks), 2,176,000 B an expert, layers 4, 30, 46 and 47
+// that gate and up with a Q8_0 down (1,740,800 B), 2,995,200 B, and layer 2 an IQ4_XS gate and
+// up (870,400 B each) with that down, 3,481,600 B; 512 experts a layer].
+const CARD_DENSE_Q3: u64 = 5_390_947_840;
+const HOST_EXPERTS_Q3: u64 = 55_823_564_800;
+// PIN(2026-10-06): the dense part's granules at no expert [derived: CARD_ROUNDING's heap walk
+// over the Q3 file's dense uploads, the head's smaller buffer].
+const CARD_ROUNDING_Q3: u64 = 397_191_680;
+
+// PIN(2026-10-06): the card rule's plan of the Q3 file (`hw_qwen4exp_card_plan`'s clauses over
+// it, every stack a card type since `card_routed` reads the i-quants) [derived by a replica that
+// first reproduced all sixteen CARD_PLANS rows of the Q4 file exactly, then replayed the spread
+// over the same 48 layers with the per-layer expert bytes 2,176,000 / 2,995,200 / 3,481,600 B,
+// each stack in whole 2 MiB granules past CARD_DENSE_Q3 + CARD_ROUNDING_Q3, within CARD_PLANS'
+// own budgets: the machine terms are none of the file's — the same usable, cache, context,
+// scratch and route scratch, margin and draft reserve, the draft's own plan unchanged beside the
+// target (it borrows the target's matrices; the Q6_K head's 68,736 B of activation bytes enter
+// the CardOver total alone, not the spread's budget)].
+const CARD_PLANS_Q3: [CardPlanRow; 16] = [
+    (
+        "A6000",
+        4_096,
+        false,
+        4_096,
+        365,
+        1,
+        364,
+        39_689_241_600,
+        444_786_176,
+    ),
+    (
+        "A6000",
+        4_096,
+        false,
+        512,
+        388,
+        21,
+        387,
+        42_242_585_600,
+        586_282_496,
+    ),
+    (
+        "A6000",
+        4_096,
+        true,
+        4_096,
+        338,
+        4,
+        337,
+        36_753_254_400,
+        532_840_960,
+    ),
+    (
+        "A6000",
+        4_096,
+        true,
+        512,
+        362,
+        28,
+        361,
+        39_423_027_200,
+        553_714_176,
+    ),
+    (
+        "A6000",
+        32_768,
+        false,
+        4_096,
+        355,
+        41,
+        354,
+        38_688_921_600,
+        629_314_048,
+    ),
+    (
+        "A6000",
+        32_768,
+        false,
+        512,
+        381,
+        48,
+        381,
+        41_540_582_400,
+        470_396_416,
+    ),
+    (
+        "A6000",
+        32_768,
+        true,
+        4_096,
+        328,
+        46,
+        327,
+        35_755_980_800,
+        657_699_328,
+    ),
+    (
+        "A6000",
+        32_768,
+        true,
+        512,
+        355,
+        7,
+        354,
+        38_614_118_400,
+        490_207_744,
+    ),
+    (
+        "3090",
+        4_096,
+        false,
+        4_096,
+        128,
+        41,
+        127,
+        13_939_020_800,
+        590_878_208,
+    ),
+    (
+        "3090",
+        4_096,
+        false,
+        512,
+        154,
+        5,
+        153,
+        16_694_656_000,
+        530_083_328,
+    ),
+    (
+        "3090",
+        4_096,
+        true,
+        4_096,
+        103,
+        22,
+        102,
+        11_171_097_600,
+        512_966_144,
+    ),
+    (
+        "3090",
+        4_096,
+        true,
+        512,
+        128,
+        17,
+        127,
+        13_885_977_600,
+        492_926_464,
+    ),
+    (
+        "3090",
+        32_768,
+        false,
+        4_096,
+        121,
+        29,
+        120,
+        13_148_876_800,
+        565_230_080,
+    ),
+    (
+        "3090",
+        32_768,
+        false,
+        512,
+        146,
+        21,
+        145,
+        15_857_228_800,
+        553_815_552,
+    ),
+    (
+        "3090",
+        32_768,
+        true,
+        4_096,
+        94,
+        34,
+        93,
+        10_216_755_200,
+        592_796_160,
+    ),
+    (
+        "3090",
+        32_768,
+        true,
+        512,
+        119,
+        40,
+        118,
+        12_955_571_200,
+        548_820_480,
+    ),
+];
+
+/// The card rule's plan of the Q3 file: `hw_qwen4exp_card_plan`'s clauses
+/// over it — the coverage list the Q4 file's (the i-quant stacks and the
+/// Q6_K head no items), the shared MTP draft read against it with its
+/// borrowed head the Q6_K form, every stack the card's, and the rows of
+/// [`CARD_PLANS_Q3`] with the same segment checks.
+#[test]
+#[ignore = "needs the UD-Q3_K_XL shards and the shared MTP file on the box (just gate-qwen4exp-meta)"]
+fn hw_qwen4exp_q3_card_plan() {
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::mtp::BorrowedHead;
+    use model::arch::qwen35moe::place::{self, Experts, MtpInputs, PlanInputs};
+    use model::placement::workstation::{A6000, CONTEXT, MARGIN, RTX_3090};
+    use model::placement::{CardFormat, Device, Format, Plan, PlanLevers, Role};
+
+    let mut o = String::new();
+    let mut b: Vec<String> = Vec::new();
+    let mut check = |o: &mut String, what: String, ok: bool| {
+        let _ = writeln!(o, "{what}: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            b.push(what);
+        }
+    };
+    let split = Split::open(Q3).unwrap_or_else(|e| panic!("open {Q3}: {e}"));
+    let inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    let list = spec_view::items(&inputs.unimplemented());
+    check(
+        &mut o,
+        format!("the coverage list is the Q4 file's: {list:?}"),
+        list.iter().map(String::as_str).eq(COVERAGE.iter().copied()),
+    );
+    let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
+    let mtp = MtpInputs::read(&draft, &split, &inputs, HeadRows::Full)
+        .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED} over {Q3}: {e}"));
+    check(
+        &mut o,
+        format!(
+            "the borrowed head is the Q6_K form: {:?}",
+            mtp.borrowed_head
+        ),
+        mtp.borrowed_head == BorrowedHead::Q6K,
+    );
+    let host_only = inputs.host_only();
+    check(
+        &mut o,
+        format!("the stacks the card experts do not read: {host_only:?}"),
+        host_only.is_empty(),
+    );
+    let per_expert = |t: &model::placement::ModelTensor| t.file_bytes / inputs.model.experts;
+    let view = |p: &Plan<'_>| {
+        format!(
+            "{:?}",
+            (
+                &p.rows,
+                &p.cards,
+                &p.host,
+                p.nvme_bytes,
+                &p.n_l,
+                p.ctx_max,
+                p.card_budget
+            )
+        )
+    };
+    let levers = PlanLevers::default();
+    for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS_Q3 {
+        let card = if name == A6000.name { A6000 } else { RTX_3090 };
+        let machine = place::machine_for_experts(card, inputs.hp.n_layer, u, Experts::Card);
+        let got = if with_draft {
+            inputs
+                .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
+                .map(|m| {
+                    let host = inputs.plan_mtp(&machine, ctx, &levers, &mtp).ok();
+                    let same = host.is_some_and(|h| view(&h.draft) == view(&m.draft));
+                    (m.plan, same)
+                })
+        } else {
+            inputs
+                .plan_with(&machine, ctx, &levers, Experts::Card)
+                .map(|p| (p, true))
+        };
+        let (plan, draft_same) = match got {
+            Ok(p) => p,
+            Err(e) => {
+                check(
+                    &mut o,
+                    format!("{name} ctx {ctx} draft {with_draft} U {u}: refused: {e}"),
+                    false,
+                );
+                continue;
+            }
+        };
+        let want: Vec<u64> = (0..plan.n_l.len())
+            .map(|l| if l < at_high { high } else { low })
+            .collect();
+        let mut segs_bad = Vec::new();
+        for r in &plan.rows {
+            let t = &inputs.model.tensors[r.tensor];
+            if t.role != Role::RoutedExperts {
+                continue;
+            }
+            let n = plan.n_l[t.layer.unwrap_or(0)];
+            let host_ok = r.segments.last().is_some_and(|s| {
+                s.device == Device::Host
+                    && s.resident_bytes == (inputs.model.experts - n) * per_expert(t)
+            });
+            let card_ok = match r.segments.as_slice() {
+                [_] => n == 0,
+                [c, _] => {
+                    c.device == Device::Card(0)
+                        && c.format == Format::Card(CardFormat::KQuant)
+                        && c.resident_bytes == n * per_expert(t)
+                        && c.experts.as_ref().and_then(|e| e.as_prefix()) == Some(n)
+                }
+                _ => false,
+            };
+            if !(host_ok && card_ok) {
+                segs_bad.push(t.name.clone());
+            }
+        }
+        let c = &plan.cards[0];
+        let kv = KV_AT
+            .iter()
+            .find(|&&(x, _)| x == ctx)
+            .map_or(0, |&(_, k)| k);
+        let figures = [
+            ("card dense", c.dense_bytes, CARD_DENSE_Q3),
+            ("card experts", c.expert_bytes, experts),
+            ("card rounding", c.rounding_bytes, rounding),
+            ("card kv", c.kv_bytes, kv),
+            (
+                "host experts",
+                plan.host.expert_bytes,
+                HOST_EXPERTS_Q3 - experts,
+            ),
+            ("card scratch", c.scratch_bytes, card_scratch_at(u)),
+            ("host tables", plan.host.table_bytes, HOST_TABLES),
+            ("nvme", plan.nvme_bytes, 0),
+        ];
+        let bytes_ok = figures.iter().all(|&(_, g, w)| g == w);
+        let shown: Vec<String> = figures
+            .iter()
+            .map(|(what, g, w)| format!("{what} {g} (want {w})"))
+            .collect();
+        check(
+            &mut o,
+            format!(
+                "{name} ctx {ctx} draft {with_draft} U {u}: n_l {high} on the first {at_high}, \
+                 {low} on the rest ({}); segments off the rule {segs_bad:?}; the draft's plan \
+                 the host-routed one's {draft_same}; {}; headroom {}",
+                plan.n_l == want,
+                shown.join(", "),
+                c.headroom_bytes
+            ),
+            plan.n_l == want && segs_bad.is_empty() && draft_same && bytes_ok,
+        );
+    }
+    for card in [A6000, RTX_3090] {
+        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        let floor = CARD_DENSE_Q3
+            + CARD_ROUNDING_Q3
+            + KV_AT[0].1
+            + CONTEXT
+            + scratch_at(place::UBATCH_PLANNED)
+            + MARGIN;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(floor),
+        };
+        let pair = (
+            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
+            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Host),
+        );
+        let (ok, text) = match pair {
+            (Ok(c), Ok(h)) => (
+                c.n_l.iter().all(|&n| n == 0) && view(&c) == view(&h),
+                format!(
+                    "card experts {}, the host-routed plan's field for field {}",
+                    c.cards[0].experts,
+                    view(&c) == view(&h)
+                ),
+            ),
+            (c, h) => (false, format!("card {:?} host {:?}", c.err(), h.err())),
+        };
+        check(
+            &mut o,
+            format!(
+                "{} ctx {} under a card budget of its floor {floor}: {text}",
+                card.name, KV_AT[0].0
+            ),
+            ok,
+        );
+    }
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} clause(s) failed:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}
+
 /// Plan (b′)'s row: the A6000's counts (`high` on the first `at_high`
 /// layers, `low` on the rest), both cards' totals a layer (`total_high` on
 /// the first `total_at_high`, one fewer on the rest), the tier's experts,

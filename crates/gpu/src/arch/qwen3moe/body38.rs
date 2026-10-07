@@ -658,6 +658,9 @@ pub struct Body38 {
     pending: Option<Pending38>,
     /// Each layer's streams after it and its route, when a gate armed them.
     taps: Option<Taps38>,
+    /// The loaded `output`'s form (`mtp::output_form`): the step's launch
+    /// count's head term ([`step_launches`]).
+    head_form: model::arch::qwen35moe::mtp::BorrowedHead,
     eps: f32,
     vocab: usize,
     ctx: usize,
@@ -1230,6 +1233,17 @@ impl Body38 {
             card: gpu.device_name()?,
             ctx,
         };
+        // The loaded `output`'s form, the step's head-count term: the one
+        // owner of the list is `mtp::output_form` (the borrow check asks it
+        // too); a type it does not take (a Q4_K head, no file today) counts
+        // as the Q8_0 form's, which reads the f32 rows with no quantize.
+        let head_form = match w.get(&model::arch::qwen35moe::names::output()) {
+            Some(crate::weights::DevWeight::KQuant { ty, .. }) => {
+                model::arch::qwen35moe::mtp::output_form(*ty)
+                    .unwrap_or(model::arch::qwen35moe::mtp::BorrowedHead::Q8_0)
+            }
+            _ => model::arch::qwen35moe::mtp::BorrowedHead::Q8_0,
+        };
         let mut body = Body38 {
             hybrid,
             plans,
@@ -1258,6 +1272,7 @@ impl Body38 {
             taps: None,
             eps: spec.rms_eps,
             vocab: spec.vocab as usize,
+            head_form,
             ctx,
             held: 0,
             staged: None,
@@ -1299,7 +1314,7 @@ impl Body38 {
     #[must_use]
     pub fn step_launches(&self) -> (usize, usize) {
         (
-            step_launches(&self.plans, &self.card, self.tier.as_ref()),
+            step_launches(&self.plans, &self.card, self.tier.as_ref(), self.head_form),
             STEP_MEMOPS * self.plans.len(),
         )
     }
@@ -1702,7 +1717,13 @@ impl Body38 {
     /// count).
     #[must_use]
     pub fn verify_launches(&self, m: usize) -> usize {
-        verify_launches(&self.plans, &self.card, self.tier.as_ref(), m)
+        verify_launches(
+            &self.plans,
+            &self.card,
+            self.tier.as_ref(),
+            m,
+            self.head_form,
+        )
     }
 
     /// Refused by name unless the stores hold `pos` positions: a call from

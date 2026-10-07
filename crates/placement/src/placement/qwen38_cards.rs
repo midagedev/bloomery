@@ -182,13 +182,18 @@ fn model(q3: bool) -> ModelTensors {
     }
 }
 
-/// The card leg's routed stacks (`qwen35moe::place::card_routed`): a Q4_K
-/// or Q5_K gate and up, a Q5_1 or Q8_0 down, in the file's blocks.
+/// The card leg's routed stacks (`qwen35moe::place::card_routed`): a Q4_K,
+/// Q5_K, IQ3_XXS or IQ4_XS gate and up, a Q5_1, Q8_0 or IQ4_NL down, in the
+/// file's blocks.
 fn card_routed(ty: GgmlType) -> Option<CardFormat> {
     match ty {
-        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_1 | GgmlType::Q8_0 => {
-            Some(CardFormat::KQuant)
-        }
+        GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q5_1
+        | GgmlType::Q8_0
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ4_XS
+        | GgmlType::IQ4_NL => Some(CardFormat::KQuant),
         _ => None,
     }
 }
@@ -421,14 +426,18 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
 }
 
 /// The Q3 file's routed gate and up are IQ3_XXS or IQ4_XS and its downs
-/// IQ4_NL or Q8_0: no layer's three stacks are all card types, so on any
-/// card every routed expert stays on the host, the host need is those, the
-/// PLE table and the row cache, and the residency rule is `off`. Under
-/// `--place bp` on two such cards both plans are refused by name as a tier
-/// card that holds no expert: the Q3 file's because no layer's stacks are
-/// card types, the Q4 file's because its stage card holds every expert.
+/// IQ4_NL or Q8_0: all of them card types (`card_routed`), so on a large
+/// enough card every routed expert is the card's as the Q4 file's are — the
+/// host need the PLE table and the row cache alone, the residency rule
+/// `off` for no host expert left. Under `--place bp` on two such cards both
+/// plans are refused by name as a tier card that holds no expert: each
+/// file's stage card holds every expert.
+// PIN(2026-10-06): the iq stacks joined `card_routed` (iqwire), so the Q3
+// file plans onto cards like the Q4 file; was n_l 0 on every layer, the
+// whole routed share host-side (`NoCardExperts`), and the bp refusal because
+// no layer's stacks were card types — now because the stage holds them all.
 #[test]
-fn q3_keeps_every_routed_expert_on_the_host() {
+fn q3_routes_onto_cards_like_the_q4_file() {
     let q3 = model(true);
     let bytes = |keep: fn(&ModelTensor) -> bool| -> u64 {
         q3.tensors
@@ -446,29 +455,26 @@ fn q3_keeps_every_routed_expert_on_the_host() {
     let cards = picked("bp", &census_96(2));
     let m = machine_a(cards[0]);
     let plan = plan_at(&q3, &m, 4096, 1).expect("the Q3 plan");
-    assert_eq!(plan.n_l, vec![0; LAYERS]);
+    assert_eq!(plan.n_l, vec![EXPERTS; LAYERS]);
     assert_eq!(
-        (plan.host.experts, plan.host.expert_bytes),
+        (plan.cards[0].experts, plan.cards[0].expert_bytes),
         (EXPERTS * LAYERS as u64, routed)
     );
-    assert_eq!(
-        HostNeed::of(&plan, 0).bytes(),
-        routed + PLE_TABLE + ROW_CACHE
-    );
+    assert_eq!(HostNeed::of(&plan, 0).bytes(), PLE_TABLE + ROW_CACHE);
     assert_eq!(
         residency(&plan),
         (
             Residency38Pick {
                 pinned: None,
-                why: Residency38Why::NoCardExperts
+                why: Residency38Why::NoHostExperts
             },
             0
         )
     );
     let bp = machine_bp(cards[0], cards[1]);
     // PIN(2026-10-06): refused (IdleTier); was a plan whose tier_n_l is 0 on
-    // every layer. The tier's eligible layers are none, so no expert is
-    // left for it.
+    // every layer. The stage holds all 512 experts of every layer, so no
+    // expert is left for the tier.
     assert!(matches!(
         plan_at(&q3, &bp, 4096, 1),
         Err(PlacementError::IdleTier { tier: 0, .. })
@@ -481,11 +487,14 @@ fn q3_keeps_every_routed_expert_on_the_host() {
 }
 
 /// The target matrices an MTP draft file borrows, `token_embd` and
-/// `output`, are Q8_0 in the Q4 file, the one format the draft reads them
-/// in; the Q3 file's `output` is Q6_K, so its draft is refused or, unset on
-/// the seat, off (`PlanInputs::mtp_borrows`).
+/// `output`: the Q4 file's are Q8_0, and the Q3 file's `output` is the Q6_K
+/// form the draft's head gemv also reads, so both files lend them
+/// (`PlanInputs::mtp_borrows`); `token_embd` is Q8_0 in both.
+// PIN(2026-10-06): `output` follows `mtp::head_kind`'s set (Q8_0 or Q6_K,
+// iqwire), so the Q3 file's Q6_K head lends too; was Q8_0 alone, which
+// turned the Q3 seat's unset draft off.
 #[test]
-fn only_the_q4_file_lends_the_draft_q8_0_matrices() {
+fn both_files_lend_the_draft_their_output_matrices() {
     let types = |q3: bool| -> Vec<(String, GgmlType)> {
         model(q3)
             .tensors

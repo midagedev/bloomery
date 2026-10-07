@@ -12,8 +12,9 @@
 //! ([`PlanInputs::plan`], the plan the program loads), or by the expert rule
 //! ([`PlanInputs::plan_with`] under [`Experts::Card`]): each eligible layer's
 //! id prefix `[0, n_l)`, spread evenly, on the layers whose three routed stacks the card experts read
-//! ([`card_routed`]: a Q4_K or Q5_K gate and up, a Q5_1 or Q8_0 down, each in
-//! the file's blocks), the rest on the host. A layer with a stack they do not
+//! ([`card_routed`]: a Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and up, a Q5_1,
+//! Q8_0 or IQ4_NL down, each in the file's blocks), the rest on the host. A
+//! layer with a stack they do not
 //! read keeps every expert on the host, each such stack named with the reason
 //! ([`PlanInputs::host_only`]).
 //!
@@ -95,20 +96,27 @@ pub enum Experts {
 }
 
 /// The routed stacks the card experts read, in their card format, each as the
-/// file stores it ([`CardFormat::KQuant`]): a Q4_K or Q5_K gate and up
-/// (`kq_gate_up_act_q4k`, `kq_gate_up_act_q5k`) and a Q5_1 or Q8_0 down
-/// (`q5_1_gemv_sel`, `q8_0_gemv_sel32`: the down's `block_q5_1`s, 24 bytes a
-/// 32 values, or `block_q8_0`s, 34 bytes, unpacked). The rule reads a stack's
+/// file stores it ([`CardFormat::KQuant`]): a Q4_K, Q5_K, IQ3_XXS or IQ4_XS
+/// gate and up (`kq_gate_up_act_q4k`, `kq_gate_up_act_q5k`,
+/// `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`) and a Q5_1, Q8_0 or IQ4_NL
+/// down (`q5_1_gemv_sel`, `q8_0_gemv_sel32`, `iq4_nl_gemv_sel32`: the down's
+/// `block_q5_1`s, 24 bytes a 32 values, its `block_q8_0`s, 34 bytes, or its
+/// `block_iq4_nl`s, 18 bytes, unpacked). The rule reads a stack's
 /// type alone: a stack of one of these types in a place the card leg does not
-/// run it in (a Q5_1 or Q8_0 gate or up, a Q4_K or Q5_K down) is refused by
+/// run it in (a Q5_1, Q8_0 or IQ4_NL gate or up, a Q4_K, Q5_K, IQ3_XXS or
+/// IQ4_XS down) is refused by
 /// name at load (`Card38::new`, `Qwen38Stacks::of`). A stack of any other type
 /// keeps its layer's experts on the host ([`host_only_reason`]).
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
     match ty {
-        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_1 | GgmlType::Q8_0 => {
-            Some(CardFormat::KQuant)
-        }
+        GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q5_1
+        | GgmlType::Q8_0
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ4_XS
+        | GgmlType::IQ4_NL => Some(CardFormat::KQuant),
         _ => None,
     }
 }
@@ -121,8 +129,8 @@ pub fn host_only_reason(ty: GgmlType) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{ty}: no card expert kernel of this program reads it (the gate and up Q4_K or \
-         Q5_K, the down Q5_1 or Q8_0)"
+        "{ty}: no card expert kernel of this program reads it (the gate and up Q4_K, Q5_K, \
+         IQ3_XXS or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL)"
     ))
 }
 
@@ -214,8 +222,8 @@ pub enum PlaceError {
     /// A target matrix an MTP draft file borrows ([`PlanInputs::mtp_borrows`])
     /// absent, or in another format than the one the draft's program reads.
     #[error(
-        "the target's {name} is {}; the MTP draft reads the target's token_embd and output as \
-         Q8_0",
+        "the target's {name} is {}; the MTP draft reads the target's token_embd as Q8_0 and its \
+         output as Q8_0 or Q6_K",
         ty.map_or("absent".to_string(), |t| t.to_string())
     )]
     DraftBorrow { name: String, ty: Option<GgmlType> },
@@ -243,19 +251,27 @@ impl PlanInputs {
     }
 
     /// The target's matrices an MTP draft file borrows, `token_embd` and
-    /// `output`, each in the format the draft's program reads them in, Q8_0;
-    /// else the first that is absent or another format, by name
-    /// ([`PlaceError::DraftBorrow`]). [`MtpInputs::read`] refuses a draft by
-    /// it; the Qwen3.8 seat's unset `BLOOMERY_DRAFT` drafts nothing by it.
+    /// `output`, each in a format the draft's program reads: `token_embd`
+    /// Q8_0 (the embedding-row reads its q8_0 rows), `output` one of
+    /// [`mtp::head_kind`]'s forms (Q8_0 or Q6_K, one owner with it in
+    /// [`mtp::output_form`]); else the first that is absent or another
+    /// format, by name ([`PlaceError::DraftBorrow`]). [`MtpInputs::read`]
+    /// refuses a draft by it; the Qwen3.8 seat's unset `BLOOMERY_DRAFT`
+    /// drafts nothing by it.
     pub fn mtp_borrows(&self) -> Result<(), PlaceError> {
-        for name in [names::token_embd(), names::output()] {
+        for (name, borrowed) in [(names::token_embd(), false), (names::output(), true)] {
             let ty = self
                 .model
                 .tensors
                 .iter()
                 .find(|t| t.name == name)
                 .map(|t| t.ty);
-            if ty != Some(GgmlType::Q8_0) {
+            let ok = if borrowed {
+                mtp::output_form(ty.unwrap_or(GgmlType::F32)).is_some()
+            } else {
+                ty == Some(GgmlType::Q8_0)
+            };
+            if !ok {
                 return Err(PlaceError::DraftBorrow { name, ty });
             }
         }
@@ -2209,6 +2225,8 @@ mod tests {
         const GATE_Q5K: u64 = 640 * 10 * 176;
         /// A Q8_0 down expert, 2560 rows of twenty 34-byte blocks.
         const DOWN_Q80: u64 = 2560 * 20 * 34;
+        /// An IQ4_NL down expert, 2560 rows of twenty 18-byte blocks.
+        const DOWN_NL: u64 = 2560 * 20 * 18;
 
         /// Layer `l`'s card bytes an expert: its gate, up and down.
         fn expert_bytes(l: usize) -> u64 {
@@ -2329,9 +2347,9 @@ mod tests {
         }
 
         /// The card format of each routed type, and the named reason of each
-        /// type it leaves on the host; the Q5_1 and Q8_0 downs' card bytes are
-        /// their file bytes, a whole Q5_1 tensor keeps its packed format and a
-        /// whole Q8_0 tensor its planes.
+        /// type it leaves on the host; the Q5_1, Q8_0 and IQ4_NL downs' card
+        /// bytes are their file bytes, a whole Q5_1 tensor keeps its packed
+        /// format and a whole Q8_0 tensor its planes.
         #[test]
         fn routed_types_and_their_reasons() {
             for ty in [
@@ -2339,11 +2357,19 @@ mod tests {
                 GgmlType::Q5_K,
                 GgmlType::Q5_1,
                 GgmlType::Q8_0,
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ4_XS,
+                GgmlType::IQ4_NL,
             ] {
                 assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
                 assert_eq!(host_only_reason(ty), None, "{ty}");
             }
-            for ty in [GgmlType::Q6_K, GgmlType::Q5_0, GgmlType::Q3_K] {
+            for ty in [
+                GgmlType::Q6_K,
+                GgmlType::Q5_0,
+                GgmlType::Q3_K,
+                GgmlType::IQ2_S,
+            ] {
                 assert_eq!(card_routed(ty), None, "{ty}");
                 let why = host_only_reason(ty).expect("a stack the card does not read is named");
                 assert!(why.starts_with(&ty.to_string()), "{why}");
@@ -2357,6 +2383,11 @@ mod tests {
                 assert_eq!(
                     CardFormat::KQuant.resident_bytes(GgmlType::Q8_0, 640, 2560 * n),
                     Some(DOWN_Q80 * n),
+                    "{n} experts"
+                );
+                assert_eq!(
+                    CardFormat::KQuant.resident_bytes(GgmlType::IQ4_NL, 640, 2560 * n),
+                    Some(DOWN_NL * n),
                     "{n} experts"
                 );
             }
@@ -3206,10 +3237,15 @@ mod tests {
         }
 
         /// The target's `token_embd` and `output`, which an MTP draft file
-        /// borrows, pass only as Q8_0; the first absent or of another format
-        /// is named (the UD-Q3_K_XL file's `output` is Q6_K).
+        /// borrows, pass as Q8_0, and `output` besides as the Q6_K form its
+        /// gemv also reads (the UD-Q3_K_XL file's `output`); the first
+        /// absent or of another format is named.
+        // PIN(2026-10-06): `output` widened to `mtp::head_kind`'s set (Q8_0
+        // or Q6_K, one owner `mtp::output_form`) so the UD-Q3_K_XL target
+        // lends its Q6_K head to the draft; `token_embd` stays Q8_0 alone —
+        // the old test refused a Q6_K `output` by name.
         #[test]
-        fn mtp_borrows_name_a_matrix_not_q8_0() {
+        fn mtp_borrows_name_a_matrix_the_head_does_not_read() {
             let matrix = |name: &str, ty: GgmlType| ModelTensor {
                 name: name.to_string(),
                 shard: 0,
@@ -3229,19 +3265,21 @@ mod tests {
                 );
                 i.mtp_borrows()
             };
-            assert!(with(Some(GgmlType::Q8_0), Some(GgmlType::Q8_0)).is_ok());
+            for out in [GgmlType::Q8_0, GgmlType::Q6_K] {
+                assert!(with(Some(GgmlType::Q8_0), Some(out)).is_ok(), "{out}");
+            }
             for (embd, out, name, ty) in [
                 (
                     Some(GgmlType::Q8_0),
-                    Some(GgmlType::Q6_K),
+                    Some(GgmlType::Q4_K),
                     "output.weight",
-                    Some(GgmlType::Q6_K),
+                    Some(GgmlType::Q4_K),
                 ),
                 (
-                    Some(GgmlType::Q4_K),
                     Some(GgmlType::Q6_K),
+                    Some(GgmlType::Q8_0),
                     "token_embd.weight",
-                    Some(GgmlType::Q4_K),
+                    Some(GgmlType::Q6_K),
                 ),
                 (Some(GgmlType::Q8_0), None, "output.weight", None),
             ] {
@@ -3252,13 +3290,13 @@ mod tests {
                     other => panic!("{embd:?} {out:?}: {other:?}"),
                 }
             }
-            match with(Some(GgmlType::Q8_0), Some(GgmlType::Q6_K)) {
+            match with(Some(GgmlType::Q8_0), Some(GgmlType::Q4_K)) {
                 Err(e) => assert_eq!(
                     e.to_string(),
-                    "the target's output.weight is q6_K; the MTP draft reads the target's \
-                     token_embd and output as Q8_0"
+                    "the target's output.weight is q4_K; the MTP draft reads the target's \
+                     token_embd as Q8_0 and its output as Q8_0 or Q6_K"
                 ),
-                Ok(()) => panic!("a Q6_K output passed"),
+                Ok(()) => panic!("a Q4_K output passed"),
             }
         }
 

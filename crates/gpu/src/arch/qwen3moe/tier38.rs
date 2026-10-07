@@ -324,8 +324,15 @@ impl BlockRoute38 {
             })?;
         let gate_up_ty = GemmWeight::from_ggml(st.gate_up_ty)?;
         let down = match st.down_ty {
+            GgmlType::Q5_1 => Gemm32Weight::Q5_1File(st.down),
             GgmlType::Q8_0 => Gemm32Weight::Q8_0File(st.down),
-            _ => Gemm32Weight::Q5_1File(st.down),
+            GgmlType::IQ4_NL => Gemm32Weight::Iq4NlFile(st.down),
+            other => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
+                ));
+            }
         };
         let (stream, sink) = (gpu.stream(), gpu.layer_sink(l)?);
         self.q38

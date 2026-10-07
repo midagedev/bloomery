@@ -4,10 +4,11 @@
 //!
 //! The captured step, the verify and the eager pass run the card leg: on a
 //! layer with card experts the shadow quantizes the unit's normed rows to
-//! q8_1, runs the gate·up `_sel` of the layer's type (Q4_K or Q5_K) with
+//! q8_1, runs the gate·up `_sel` of the layer's type (Q4_K, Q5_K, IQ3_XXS
+//! or IQ4_XS) with
 //! SiLU·mul over the unit's ten slots a column, the 32-value q8_1 of the
-//! card slots' columns, the down `_sel` of its type (Q5_1 or Q8_0, the
-//! file's blocks) and the card slots' weighted sum (`q38_card_acc`) —
+//! card slots' columns, the down `_sel` of its type (Q5_1, Q8_0 or IQ4_NL,
+//! the file's blocks) and the card slots' weighted sum (`q38_card_acc`) —
 //! [`CARD_LAUNCHES`] — and the back combines `(hsum + acc) + sh·w`
 //! (`q38_card_shared_add`). The ubatch walk runs the card route
 //! (`wide38`'s, over the same stacks through the grouped GEMMs) on a layer
@@ -50,6 +51,7 @@ use super::program38::Ctx38;
 use super::scratch38::PASS_ROWS;
 use super::swap38::Qwen38Stacks;
 use crate::hybrid::SlotMap;
+use crate::iq_sel::{IqDown, IqGateUp, IqSelKernels};
 use crate::kquant::{Act, GateUpAct, KquantKernels};
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
@@ -196,9 +198,9 @@ pub(super) struct Stacks38<'w> {
     pub(super) gate: &'w DeviceTensor<u32>,
     pub(super) up: &'w DeviceTensor<u32>,
     pub(super) down: &'w DeviceTensor<u32>,
-    /// The gate's and the up's type: Q4_K or Q5_K.
+    /// The gate's and the up's type: Q4_K, Q5_K, IQ3_XXS or IQ4_XS.
     pub(super) gate_up_ty: GgmlType,
-    /// The down's type: Q5_1 or Q8_0.
+    /// The down's type: Q5_1, Q8_0 or IQ4_NL.
     pub(super) down_ty: GgmlType,
 }
 
@@ -211,6 +213,7 @@ pub(super) struct SelRun {
     kq: KquantKernels,
     q51: Q51SelKernels,
     q80: Q80SelKernels,
+    iqsel: IqSelKernels,
     /// The normed rows' q8_1 form, a column a token.
     act_x: Q8Act,
     /// The gate·up's output, [`geo::FF`] values a slot.
@@ -229,6 +232,7 @@ impl SelRun {
             kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
             q51: Q51SelKernels::load(gpu.context(), gpu.fault_word())?,
             q80: Q80SelKernels::load(gpu.context(), gpu.fault_word())?,
+            iqsel: IqSelKernels::load(gpu.context(), gpu.fault_word())?,
             act_x: Q8Act::with_k(stream, cols, geo::HIDDEN)?,
             h: DeviceBuffer::zeroed(stream, cols * SLOTS * geo::FF)?,
             act_h: (1..=cols)
@@ -294,12 +298,35 @@ impl SelRun {
             slots_per_col: SLOTS,
             rule: Act::SiluMul,
         };
-        if cl.gate_up_ty == GgmlType::Q5_K {
-            self.kq
-                .enqueue_gate_up_q5k(stream, &gu, sink, &mut self.h)?;
-        } else {
-            self.kq
-                .enqueue_gate_up_q4k(stream, &gu, sink, &mut self.h)?;
+        match cl.gate_up_ty {
+            GgmlType::Q4_K => self
+                .kq
+                .enqueue_gate_up_q4k(stream, &gu, sink, &mut self.h)?,
+            GgmlType::Q5_K => self
+                .kq
+                .enqueue_gate_up_q5k(stream, &gu, sink, &mut self.h)?,
+            GgmlType::IQ3_XXS | GgmlType::IQ4_XS => self.iqsel.enqueue_gate_up(
+                stream,
+                &IqGateUp {
+                    ty: cl.gate_up_ty,
+                    wg: gu.wg,
+                    wu: gu.wu,
+                    act: &self.act_x,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert: geo::FF,
+                    slots_per_col: SLOTS,
+                    rule: Act::SiluMul,
+                },
+                sink,
+                &mut self.h,
+            )?,
+            other => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("a gate·up stack of {other}, which no card kernel reads"),
+                ));
+            }
         }
         gpu.q5().enqueue_quantize_q8_sel(
             stream,
@@ -313,21 +340,8 @@ impl SelRun {
             sink,
         )?;
         let wd = stack(w, &cl.down, cl.down_ty, n_card * geo::HIDDEN)?;
-        if cl.down_ty == GgmlType::Q8_0 {
-            self.q80.enqueue_gemv_q8_0_sel32(
-                stream,
-                &Q80SelDown {
-                    w: wd,
-                    act: act_h,
-                    sel,
-                    n_slots: slots,
-                    rows_per_expert: geo::HIDDEN,
-                },
-                sink,
-                down,
-            )
-        } else {
-            self.q51.enqueue_gemv_q5_1_sel(
+        match cl.down_ty {
+            GgmlType::Q5_1 => self.q51.enqueue_gemv_q5_1_sel(
                 stream,
                 &Q51SelDown {
                     w: wd,
@@ -338,7 +352,35 @@ impl SelRun {
                 },
                 sink,
                 down,
-            )
+            ),
+            GgmlType::Q8_0 => self.q80.enqueue_gemv_q8_0_sel32(
+                stream,
+                &Q80SelDown {
+                    w: wd,
+                    act: act_h,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert: geo::HIDDEN,
+                },
+                sink,
+                down,
+            ),
+            GgmlType::IQ4_NL => self.iqsel.enqueue_down(
+                stream,
+                &IqDown {
+                    w: wd,
+                    act: act_h,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert: geo::HIDDEN,
+                },
+                sink,
+                down,
+            ),
+            other => Err(GpuError::shape(
+                WHAT,
+                format!("a down stack of {other}, which no card kernel reads"),
+            )),
         }
     }
 }
@@ -383,8 +425,9 @@ fn stack<'w>(
             what: WHAT,
             name: name.to_string(),
             need: "a resident routed stack of the slot map's experts of its layer on this card, \
-                   in the file's blocks of the type the plan lists for it (the gate and up Q4_K \
-                   or Q5_K, the down Q5_1 or Q8_0), each that count's rows",
+                   in the file's blocks of the type the plan lists for it (the gate and up Q4_K, \
+                   Q5_K, IQ3_XXS or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL), each that count's \
+                   rows",
         }),
     }
 }
@@ -433,16 +476,21 @@ pub(super) fn leg_layers(
 }
 
 /// Layer `l`'s gate·up and down types as `stacks` lists them, refused by
-/// name unless the card leg runs them: the gate and up Q4_K or Q5_K, the
-/// down Q5_1 or Q8_0.
+/// name unless the card leg runs them: the gate and up Q4_K, Q5_K, IQ3_XXS
+/// or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL.
 fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), GpuError> {
     match stacks.pair(l) {
-        Some(p @ (GgmlType::Q4_K | GgmlType::Q5_K, GgmlType::Q5_1 | GgmlType::Q8_0)) => Ok(p),
+        Some(
+            p @ (
+                GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS,
+                GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL,
+            ),
+        ) => Ok(p),
         other => Err(GpuError::shape(
             WHAT,
             format!(
                 "layer {l}'s card experts in gate·up and down types {other:?}: the card leg runs a \
-                 Q4_K or Q5_K gate and up and a Q5_1 or Q8_0 down"
+                 Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and up and a Q5_1, Q8_0 or IQ4_NL down"
             ),
         )),
     }

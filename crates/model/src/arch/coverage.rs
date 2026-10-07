@@ -731,8 +731,8 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the head reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "output head (the head reads q8_0 planes, q6_K or q4_K word planes)",
+        reads: &[GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K],
     },
     TypePin {
         program: Program::Qwen38Body,
@@ -764,6 +764,18 @@ fn routed_gate_up(name: &str) -> bool {
 /// whole-card bodies launch q4_K or q6_K.
 fn routed_down(name: &str) -> bool {
     name.ends_with(".ffn_down_exps.weight")
+}
+
+/// A routed stack of a Qwen38Body file no side of a plan runs: not one
+/// [`card_routed`](crate::arch::qwen35moe::place::card_routed) loads on the
+/// card, and no fused qdot kernel serves it on the host at its row width —
+/// `HostLayer::build`'s own admission ([`qdot::fuses`], the check the union
+/// call makes of every stack it serves), asked here at the stack's first
+/// dim, its `k`.
+fn q38_routed_unrun(t: &ModelTensor) -> bool {
+    let k = t.dims.first().copied().unwrap_or(0);
+    crate::arch::qwen35moe::place::card_routed(t.ty).is_none()
+        && !qdot::fuses(t.ty, usize::try_from(k).unwrap_or(usize::MAX))
 }
 
 /// A qwen4exp selector's key or query projection, which `Body38` reads as
@@ -853,10 +865,18 @@ pub fn check_with(
                 // The V4.1 chain's and the glm5next body's rule: a stack of a
                 // type no card format loads. A layer whose stacks the program's
                 // card experts do not read keeps them on the host, whose load
-                // refuses a type with no host kernel; the qwen4exp body serves
-                // every stack on the host.
-                Some(Program::Deepseek41Chain | Program::Glm5nextBody | Program::Qwen38Body) => {
+                // refuses a type with no host kernel.
+                Some(Program::Deepseek41Chain | Program::Glm5nextBody) => {
                     if CardFormat::of(t.ty).is_none() {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // The qwen4exp body's rule: a stack passes when the program
+                // can run it — on the card by its expert rule (`card_routed`)
+                // or on the host by a qdot fused kernel at the stack's row
+                // width ([`q38_routed_unrun`], the one owner).
+                Some(Program::Qwen38Body) => {
+                    if q38_routed_unrun(t) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -1089,6 +1109,96 @@ mod tests {
                 &matrix("ffn_gate_shexp.weight", Role::SharedExpert, GgmlType::Q8_0)
             ),
             ["q8_0 shared expert gate and up, joined into the routed stacks (the body reads q4_K)"]
+        );
+    }
+
+    /// A routed stack of a qwen4exp file passes when the program can run it
+    /// — on the card by the expert rule's types (the i-quants of the
+    /// UD-Q3_K_XL file beside the K-quants) or on the host by a fused qdot
+    /// kernel at its row width — and a stack no side runs is an item, named
+    /// by its type.
+    // PIN(2026-10-06): the Qwen38Body routed rule widened from
+    // `CardFormat::of` to card-or-host so the UD-Q3_K_XL file's stacks
+    /// (iq3_xxs, iq4_xs gate and up, iq4_nl down) are no items; the host
+    /// admission is qdot's own (`q38_routed_unrun`).
+    #[test]
+    fn a_qwen38_routed_stack_runs_on_a_card_or_the_host() {
+        let routed = |ty: GgmlType, k: u64| ModelTensor {
+            name: "blk.0.ffn_gate_exps.weight".to_string(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::RoutedExperts,
+            ty,
+            dims: vec![k, 640, 512],
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        // The card's: the K-quants and the i-quants at the file's widths.
+        for (ty, k) in [
+            (GgmlType::Q4_K, 2560),
+            (GgmlType::Q5_K, 2560),
+            (GgmlType::Q5_1, 640),
+            (GgmlType::Q8_0, 640),
+            (GgmlType::IQ3_XXS, 2560),
+            (GgmlType::IQ4_XS, 2560),
+            (GgmlType::IQ4_NL, 640),
+        ] {
+            assert!(!super::q38_routed_unrun(&routed(ty, k)), "{ty}");
+        }
+        // The host's alone: q6_K and q3_K stacks stay host-served.
+        for ty in [GgmlType::Q6_K, GgmlType::Q3_K] {
+            assert!(!super::q38_routed_unrun(&routed(ty, 2560)), "{ty}");
+        }
+        // No side: a type no card expert kernel reads and no fused qdot
+        // kernel serves.
+        for ty in [GgmlType::IQ2_S, GgmlType::F32] {
+            assert!(super::q38_routed_unrun(&routed(ty, 2560)), "{ty}");
+        }
+    }
+
+    /// The qwen4exp head's pin reads the set the head kernel reads
+    /// (`gpu::head`'s `head_out_w`): q8_0 planes, a q6_K or q4_K word plane;
+    /// another type of `output` is an item, and the embedding's pin stays
+    /// q8_0 alone.
+    // PIN(2026-10-06): q6_K (and q4_K, which the same gemv reads) joined the
+    /// head's set so the UD-Q3_K_XL file's q6_K output loads.
+    #[test]
+    fn the_qwen38_head_pin_reads_the_head_kernels_set() {
+        for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K] {
+            assert_eq!(
+                items(
+                    Program::Qwen38Body,
+                    &ModelTensor {
+                        name: "output.weight".into(),
+                        layer: None,
+                        ..matrix("", Role::Head, ty)
+                    }
+                ),
+                Vec::<String>::new(),
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            items(
+                Program::Qwen38Body,
+                &ModelTensor {
+                    name: "output.weight".into(),
+                    layer: None,
+                    ..matrix("", Role::Head, GgmlType::Q5_K)
+                }
+            ),
+            ["q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes)"]
+        );
+        assert_eq!(
+            items(
+                Program::Qwen38Body,
+                &ModelTensor {
+                    name: "token_embd.weight".into(),
+                    layer: None,
+                    ..matrix("", Role::TokenEmbedding, GgmlType::Q6_K)
+                }
+            ),
+            ["q6_K token embedding (the card reads q8_0 rows)"]
         );
     }
 }
