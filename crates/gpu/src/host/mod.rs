@@ -1086,6 +1086,27 @@ impl<H: HostExperts> HostTier<H> {
             .set_call_floor(floor)
     }
 
+    /// The open call's pick path's backlog bound from its next pick on
+    /// ([`swap::SwapMachine::set_call_backlog`]). Refused by name without a
+    /// machine.
+    pub fn call_backlog(&mut self, backlog: u64) -> Result<(), GpuError> {
+        self.swap
+            .as_mut()
+            .ok_or(GpuError::state(
+                "HostTier::call_backlog",
+                "a residency machine (HostTier::start_swap)",
+            ))?
+            .set_call_backlog(backlog)
+    }
+
+    /// Read the call's picks' `staged_us` back after its end
+    /// ([`swap::SwapMachine::fill_staged_us`]): nothing without a machine.
+    pub fn call_staged_us(&self, picks: &mut [(usize, swap::CallPick)]) {
+        if let Some(m) = self.swap.as_ref() {
+            m.fill_staged_us(picks);
+        }
+    }
+
     /// The open call's landed event of layer `layer`
     /// ([`swap::SwapMachine::call_landed`]); `None` without a machine.
     pub fn call_landed(&self, layer: usize) -> Result<Option<&CudaEvent>, GpuError> {

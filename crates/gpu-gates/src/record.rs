@@ -1894,7 +1894,12 @@ pub static CALL_STREAM: Kind = Kind {
           (each in place of a pool resident sent to the host) and the pool residents kept, the \
           bytes the admitted experts' copies move, the pick's input (FNV-1a 64 of its counts, \
           hex), and the host's microseconds in the pick, of them waiting for the staging thread \
-          to take in the call's earlier jobs.",
+          to take in the call's earlier jobs. The four after, each left out when the pick did \
+          not measure it: the microseconds from the pick's start to the staging of the layer's \
+          last pick job (the whole copy, read back at the call's end), the least count the pick \
+          admitted and the backlog bound it waited on, 1 when the floor came from no probe, and \
+          1 when the pick was the machine's refusal (a victim the host could not serve), whose \
+          kept 0 is no choice.",
     parts: &[
         key("group", U64, ""),
         key("layer", U64, ""),
@@ -1904,6 +1909,11 @@ pub static CALL_STREAM: Kind = Kind {
         key("counts", Word, ""),
         key("pick_us", U64, "us"),
         key("backlog_us", U64, "us"),
+        opt("staged_us", U64, "us"),
+        opt("floor", U64, ""),
+        opt("backlog", U64, ""),
+        opt("fallback", U64, ""),
+        opt("refused", U64, ""),
     ],
 };
 
@@ -3407,10 +3417,12 @@ pub fn prompt_stats(s: &PromptStats) -> Vec<Record> {
     out
 }
 
-/// A prompt call's pick record, of group `group`.
+/// A prompt call's pick record, of group `group`. The optional parts print
+/// only where the pick measured them: a refused pick carries `refused`
+/// alone, a pick that moved nothing leaves `staged_us` out.
 #[cfg(feature = "gpu")]
 pub fn call_stream(group: usize, p: &CallPick) -> Record {
-    Record::new(&CALL_STREAM)
+    let r = Record::new(&CALL_STREAM)
         .u("group", group)
         .u("layer", p.layer)
         .u("admitted", p.admitted)
@@ -3418,7 +3430,28 @@ pub fn call_stream(group: usize, p: &CallPick) -> Record {
         .u("bytes", p.bytes)
         .w("counts", format!("{:016x}", p.counts))
         .u("pick_us", p.pick_us)
-        .u("backlog_us", p.backlog_us)
+        .u("backlog_us", p.backlog_us);
+    let r = if p.staged_us > 0 {
+        r.u("staged_us", p.staged_us)
+    } else {
+        r
+    };
+    let r = if p.floor > 0 {
+        r.u("floor", p.floor)
+    } else {
+        r
+    };
+    let r = if p.refused == 0 {
+        r.u("backlog", p.backlog)
+            .u("fallback", u64::from(p.fallback))
+    } else {
+        r
+    };
+    if p.refused > 0 {
+        r.u("refused", u64::from(p.refused))
+    } else {
+        r
+    }
 }
 
 /// A prompt call's end record.

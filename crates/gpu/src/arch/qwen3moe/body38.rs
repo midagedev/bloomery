@@ -3177,6 +3177,9 @@ impl GpuModel<Body38> {
         let ended = body.hybrid.call_end(gpu.stream(), kept);
         body.stream.xend = x?;
         body.stream.end = ended?;
+        // The stamps are final now: the end waited every layer's landed
+        // event, and every copy landed behind its staged ticket.
+        body.hybrid.call_staged_us(&mut body.stream.picks);
         Ok(())
     }
 
