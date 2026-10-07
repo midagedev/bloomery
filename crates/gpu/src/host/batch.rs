@@ -2,10 +2,11 @@
 //! protocol. The card copies a block's activations and routing to the host
 //! behind an event ([`BatchPort::download`]); the calling thread waits on
 //! that event and serves the block's host experts in one union call
-//! ([`BatchPort::serve`], through [`BatchService`]); one copy sends the sums
-//! back ([`BatchPort::upload`]). The port holds two sets, taken in turn, so a
-//! layer-batch's route copies into one set while the union still reads the
-//! other.
+//! ([`BatchPort::serve`], through [`BatchService`]); one copy on the port's
+//! own copy stream sends the sums back, and the engine stream waits for it
+//! before the join ([`BatchPort::upload`]). The port holds two sets, taken in
+//! turn, so a layer-batch's route copies into one set while the union still
+//! reads the other.
 //!
 //! With expert tiers ([`super::tier::TierCard`]) a set also carries each
 //! tier's leg of a tiered layer ([`BatchPort::attach_tier`], one a tier): the
@@ -102,13 +103,15 @@ enum Stage {
 
 /// One set: page-locked copies of a block's activations, routing and host
 /// sums — a column's weighted sum, or under the rows form its host slots'
-/// unweighted rows — the event its route's copies complete at, and its stage.
+/// unweighted rows — the event its route's copies complete at, the event its
+/// upload's copy completes at (the port's copy stream), and its stage.
 struct Set {
     x: PinnedHostBuffer<f32>,
     ids: PinnedHostBuffer<u32>,
     w: PinnedHostBuffer<f32>,
     sum: PinnedHostBuffer<f32>,
     routed: CudaEvent,
+    landed: CudaEvent,
     stage: Stage,
 }
 
@@ -180,10 +183,24 @@ pub struct TierBatchStats {
 /// event of the set whose buffers it reads: a serve that waited on a shared
 /// event would wait for the next batch's route too — the same bits with the
 /// overlap gone. Nothing outside this port names a set's event.
+///
+/// The uploads run on the port's own copy stream, so the copy runs beside the
+/// launches the engine stream holds ahead of the join instead of in line with
+/// them ([`BatchPort::upload`]).
 pub struct BatchPort {
     sets: [Set; 2],
     /// Each tier's side, in tier order ([`BatchPort::attach_tier`]).
     tiers: Vec<TierPort>,
+    /// The stage card's stream every upload's copy runs on; nothing else
+    /// enqueues on it.
+    copy: Arc<CudaStream>,
+    /// On the engine stream, after the launches that read the last upload's
+    /// destination ([`BatchPort::mark_read`]), or recorded by the next upload
+    /// itself; the next copy waits for it.
+    read: CudaEvent,
+    /// Whether `read` stands after every reader of the last upload's
+    /// destination: marked since that upload, or no upload yet.
+    read_marked: bool,
     n_embd: usize,
     n_used: usize,
     /// The sets' sums' form: 0 — a column's weighted sum; `k` — its first `k`
@@ -256,12 +273,16 @@ impl BatchPort {
                 w: pinned("cuMemAllocHost (the batch's routing)", cap * n_used)?,
                 sum: pinned("cuMemAllocHost (the batch's host sums)", cap * per * n_embd)?,
                 routed: ctx.new_event(None)?,
+                landed: ctx.new_event(None)?,
                 stage: Stage::Free,
             })
         };
         Ok(BatchPort {
             sets: [set()?, set()?],
             tiers: Vec::new(),
+            copy: ctx.new_stream()?,
+            read: ctx.new_event(None)?,
+            read_marked: true,
             n_embd,
             n_used,
             host_rows,
@@ -357,9 +378,11 @@ impl BatchPort {
     /// Both sets free, the next download into the first: at a group's
     /// start. Host bookkeeping only; the sets are next written by the group's
     /// downloads, when neither card's stream holds a copy of an earlier group
-    /// (the group's prologue waits for the stage's stream; a group that
-    /// failed drained the tier's, or lost the tier, after which the host
-    /// tier serves nothing more).
+    /// (the group's prologue waits for the stage's stream, which waited for
+    /// every upload's copy; a group that failed drained the tier's, or lost
+    /// the tier, after which the host tier serves nothing more). The read
+    /// mark stays: it stands after an earlier group's last readers, or the
+    /// next upload records its own.
     pub fn begin(&mut self) {
         for s in &mut self.sets {
             s.stage = Stage::Free;
@@ -744,6 +767,13 @@ impl BatchPort {
     /// rows must have been waited for ([`BatchPort::settle_tiers`]) — a join
     /// without them is refused by name. Returns the host time the copy's
     /// enqueue took, in nanoseconds.
+    ///
+    /// The copy runs on the port's copy stream, after the read mark (the
+    /// launches that read `hsum`'s present values; with no mark since the
+    /// last upload, everything `stream` holds now); then the set's event,
+    /// which `stream` — the engine stream, the one the set's downloads go on —
+    /// waits for before anything enqueued after this call, so the join that
+    /// reads `hsum` and the set's next download follow the copy.
     pub fn upload(
         &mut self,
         stream: &CudaStream,
@@ -783,15 +813,49 @@ impl BatchPort {
             }
         }
         let t0 = Instant::now();
+        if !self.read_marked {
+            self.read.record(stream)?;
+        }
+        self.copy.wait(&self.read)?;
         // SAFETY: the copy writes values at·per .. u·per of `hsum` from this
-        // set's page-locked sums, which the host writes again only in this
-        // set's next serve, after a wait on the event of its next download —
-        // enqueued after this copy, since the set is free from here on.
-        unsafe { htod(stream, hsum, &set.sum, at * per..u * per)? };
+        // set's page-locked sums once the launches that read what it
+        // overwrites have run (the wait above). The host writes the sums
+        // again only in this set's next serve, after a wait on the event of
+        // its next download, which `stream` runs after its wait below for
+        // this copy's event — or, if that wait cannot be enqueued, after the
+        // host has drained the copy stream.
+        unsafe { htod(&self.copy, hsum, &set.sum, at * per..u * per)? };
+        if let Err(e) = set
+            .landed
+            .record(&self.copy)
+            .and_then(|()| stream.wait(&set.landed))
+        {
+            return Err(match self.copy.synchronize() {
+                Ok(()) => e.into(),
+                Err(d) => GpuError::protocol(
+                    PORT,
+                    format!(
+                        "the upload of {key:?}: the engine stream's wait for the copy failed \
+                         ({e}), and so did draining the copy stream ({d})"
+                    ),
+                ),
+            });
+        }
+        self.read_marked = false;
         let upload_ns = nanos(t0.elapsed());
         set.stage = Stage::Free;
         self.up ^= 1;
         Ok(upload_ns)
+    }
+
+    /// Mark on `stream`, the engine stream, the end of the launches that read
+    /// the last upload's destination: the next upload's copy waits for this
+    /// mark, not for everything `stream` holds when that upload is enqueued.
+    /// A caller marks only once every such launch is enqueued.
+    pub fn mark_read(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.read.record(stream)?;
+        self.read_marked = true;
+        Ok(())
     }
 
     /// Tier `tier`'s rows of the set whose upload just left them — the

@@ -1499,6 +1499,14 @@ impl<H: HostExperts> HostTier<H> {
             .upload(stream, hsum, key)
     }
 
+    /// Mark on `stream` the end of the launches that read the last upload's
+    /// sums, so the next upload's copy waits for them alone
+    /// ([`BatchPort::mark_read`]).
+    pub fn mark_upload_read(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.port_mut("HostTier::mark_upload_read")?
+            .mark_read(stream)
+    }
+
     /// The refusal that failed a service and so poisoned the tier, else the
     /// first one a returning (unwatched batch) service recorded — what the
     /// caller of a failed step names with [`name_refusal`] once the stream

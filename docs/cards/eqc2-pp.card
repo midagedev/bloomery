@@ -1,0 +1,33 @@
+# Round eqc2, the re-sit of eqc-pp after the prompt batch's host rows upload left the stage card's compute stream.
+# eqc-pp (2026-10-07, A6000, one lease, 6 rounds) measured -3.36 % at P = 4096 and -4.34 % at P = 512 against main,
+# with the step stats placing the loss on the host-serial path: enqueue_lb +2.36 ms (P = 512) and +1.08 ms
+# (P = 4096) a layer-batch, union_lb +0.6 ms, the card terms unmoved (the eqc-pp sitting). With the upload on
+# the port's own copy stream and the join waiting on its event, enqueue_lb returns to base +- 0.3 ms and union_lb keeps
+# its +0.6 ms (the host union's row copy): chain 10571 against 10440 ms at P = 4096, 2646 against 2621 ms at P = 512,
+# so the prose prompt rate is -1.6..-0.6 % against main [derived].
+kind: noninf
+question: with the rows upload off the compute stream, does the eqC tree's prose prompt rate sit within the derived
+  remainder of the host union's row copy, so the slot-order combine can be V4.1's only join?
+term: pp tok/s @ P = 4096 (depth 4096), prose prompt (corpus-prose.ids, the first 4096), A6000, the default
+  placement and residency - (eqc2 - base) / base, paired by round; P = 512 rows read beside against the same band;
+  enqueue_lb and union_lb of both arms from the split line, upload_lb of the eqc2 arm
+unit: %
+predict: -1.6..-0.6
+rounds: 6
+sd: 0.25 % the eqc-pp sitting (2026-10-07, A6000, one lease): the per-round prose pp ratio of two binaries in one lease,
+  spread 0.23 % at P = 512 and 0.09 % at P = 4096; the larger, rounded up
+margin: 2.0 % <the derivation leaves -1.6 % at worst; at 6 rounds the ruler's half-width is about 0.4 %, so a mean at
+  the band's low end passes with its lower bound above -2.0 %; past it, a term the move did not take out>
+condition: the eqc2 tree's generate_ds41 against main's in one lease, the order rotated every round, from
+  /Users/hckim/repo/bloomery-eqc2: BLOOMERY_REMOTE='~/repo/bloomery-eqc2' BLOOMERY_AB_ROUNDS=6
+  BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/eqc2-pp.card' just depth-gpu-ds41
+  prose:4096 bin:/root/repo/bloomery-iqtrain/target/release/generate_ds41:prose:4096 prose:512
+  bin:/root/repo/bloomery-iqtrain/target/release/generate_ds41:prose:512 (the base built from main's engine in
+  ~/repo/bloomery-iqtrain before the lease); no row carries [cold], [cpu-busy] or [other-busy]. Box time 14..20 min
+  [derived: eqc-pp's sitting ran 13.5 min with its build]
+decide-in: the mean sits in -1.6..-0.6 % or above and the lower bound clears -2.0 %: hand eqC + eqc2 over to land;
+  record the measured pp and the enqueue/union terms beside the derived ones in docs/plan.md's prefill row
+decide-below: the mean falls under -1.6 %, or the lower bound passes -2.0 %: read the split line (upload_lb,
+  enqueue_lb, union_lb, card_*) for the term the move did not take out, and report it before any code changes
+decide-above: the rate is within 0.6 % of main: the host union's row copy hides under the card stream after all;
+  record it and land

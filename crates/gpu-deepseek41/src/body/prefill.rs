@@ -1007,6 +1007,12 @@ struct StreamCall {
 /// previous layer-batch's upload and join.
 const CARD_MARKS: usize = 4;
 
+/// The queue entries one upload of the host's handback enqueues
+/// (`BatchPort::upload`): on the port's copy stream its wait for the read
+/// mark the previous post left after its join, the copy and its event; on
+/// the engine stream the wait for that event.
+const UPLOAD_ENTRIES: u64 = 4;
+
 /// Where a batch's time went, summed over the batches since the last
 /// [`Body::take_prefill_stats`]. Host times are wall clock on the calling
 /// thread; the card times are event pairs on the engine stream.
@@ -2965,7 +2971,7 @@ impl<'a> GroupCx<'a> {
                     )?;
                     self.sums.upload_ns += upload_ns;
                     // The host's rows' copy to the card.
-                    self.tally.route(i, m.set, 1)?;
+                    self.tally.route(i, m.set, UPLOAD_ENTRIES)?;
                     self.ffn.enqueue_batch_acc_rows_tier(
                         gpu,
                         &mut batch.ffn,
@@ -2989,12 +2995,12 @@ impl<'a> GroupCx<'a> {
                     self.tally.route(i, m.set, 1)?;
                     self.sums.upload_ns += batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
                     // The host sums' copy to the card.
-                    self.tally.route(i, m.set, 1)?;
+                    self.tally.route(i, m.set, UPLOAD_ENTRIES)?;
                 }
             } else {
                 self.sums.upload_ns += batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
                 // The host's handback's copy to the card.
-                self.tally.route(i, m.set, 1)?;
+                self.tally.route(i, m.set, UPLOAD_ENTRIES)?;
                 if rows_form {
                     // The shadow held the routing for the rows join's card
                     // sum, which reads the uploaded rows: past the group's
@@ -3024,6 +3030,11 @@ impl<'a> GroupCx<'a> {
                 },
             )?;
             // The join, one launch.
+            self.tally.route(i, m.set, 1)?;
+            // The join is the last launch that reads the handback: the next
+            // upload's copy waits for this mark, not for the shadow and the
+            // route enqueued after it.
+            self.hybrid.mark_upload_read(gpu.stream())?;
             self.tally.route(i, m.set, 1)?;
         }
         m.cur.s ^= 1;

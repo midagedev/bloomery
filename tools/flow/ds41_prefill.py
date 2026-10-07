@@ -343,6 +343,13 @@ TAIL_BULK_ACTS = 6             # enqueue_batch_route: scores + pick + places; Ff
 TAIL_EVENTS = 1                # FfnBatch::enqueue_download: the event the host waits on
 TAIL_PREBULK_ACTS = 3          # three D2H; router and places ran per chunk (d37136c batch.rs:815-866)
 POST_ACTS = 2                  # FfnBatch::enqueue_upload, FfnPiece::enqueue_batch_join
+ROWS_POST_ACTS = 1             # `rows` (the rows join): FfnPiece::enqueue_batch_acc_rows[_tier], the card sum over every slot,
+                               # which reads the uploaded rows and so runs in the post (body/prefill.rs GroupCx::post)
+ROWS_HELD_COPIES = 3           # `rows`: the shadow's copies of the block's routing it holds for that card sum, in place of
+                               # the card sum's one launch (body/prefill.rs shadow_entries, `held`)
+UPCOPY_EVENTS = 4              # `upcopy`: the upload on the batch port's copy stream (gpu/src/host/batch.rs BatchPort::upload)
+                               # adds its wait for the read mark, its event and the engine stream's wait for that event to the
+                               # copy; the read mark after the join is the fourth (GroupCx::post, HostTier::mark_upload_read)
 HEAD_ACTS = 7                  # the trace: 7 activities after the last join
 SHADOW_EXPERT_CHUNK = 8        # enqueue_batch_shadow_chunk: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose
 SHADOW_EXPERT_BLOCK = 5        # the expert arm's block: buckets, grouped gate-up, quantize_sel, grouped down, card_acc
@@ -1079,6 +1086,9 @@ def shadow_lb(p, cfg, lb, rt):
         else:
             t += SHADOW_NOCARD_BLOCK * g
             acts += SHADOW_NOCARD_BLOCK
+        if cfg.get("rows"):                # the block's last launch, the card sum, leaves for the post
+            t += (ROWS_HELD_COPIES - 1) * g
+            acts += ROWS_HELD_COPIES - 1
     ev = TIMED_SHADOW_EVENTS_G if cfg.get("marks4") else TIMED_SHADOW_EVENTS
     return t, acts, (ev if cfg.get("timed") else 0)
 
@@ -1172,6 +1182,12 @@ def post_card(p, lb):
     """The upload of the host sums and the join (FfnBatch::enqueue_upload, FfnPiece::enqueue_batch_join), card ms."""
     return lb.T * X_BYTES / (p["post_h2d_gbs"] * 1e6) + (lb.T * p["post_batch_tok"]) / 1000.0 \
         + POST_ACTS * p["gap_act"] / 1000.0
+
+
+def post_entries(cfg):
+    """The queue entries a layer-batch's post enqueues where it has a block, as the engine's counter counts them: the
+    upload and the join, the rows join's card sum (`rows`), and the copy stream's events and the read mark (`upcopy`)."""
+    return POST_ACTS + (ROWS_POST_ACTS if cfg.get("rows") else 0) + (UPCOPY_EVENTS if cfg.get("upcopy") else 0)
 
 
 def post_parts(p, lb):
@@ -1783,7 +1799,7 @@ def run_prompt(p, cfg, P, rt, U, kfix=None):
     agg["enqueue"] += batch_enq / n
     agg["card_proj"] = sum(r["terms"]["proj"] + r["terms"]["small"] + r["terms"]["part_proj"] for r in recs) / n
     # the stat line's entries_route + entries_shadow: the layers' calls, the posts, the batches' gathers
-    agg["entries"] = agg["acts_r"] + agg["ev_r"] + agg["acts_s"] + agg["ev_s"] + (POST_ACTS * len(served) + batch_n) / n
+    agg["entries"] = agg["acts_r"] + agg["ev_r"] + agg["acts_s"] + agg["ev_s"] + (post_entries(cfg) * len(served) + batch_n) / n
     agg["route"] = agg["wait"] + agg["enqueue"]
     agg["nonunion"] = (wall - sum(r["union"] for r in served)) / n
     agg["prologue"] = sum(u for _, u, _ in plan) * p["prologue_tok"] / 1000.0
@@ -1831,11 +1847,19 @@ CONFIGS = {
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True),
     # the engine from candwire on: PG1 / PG2's flow with the candidate mask's launches (cand_acts) in every full chunk
-    # of its source and consumers; what --counts holds a counter log of today's tree to
+    # of its source and consumers
     "CW1": dict(commit="candwire", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True,
                 marks4=True, cand=True),
     "CW2": dict(commit="candwire", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True, cand=True),
+    # the engine from eqC and eqc2 on: CW1 / CW2's flow under the rows join (`rows`: the shadow holds the block's routing,
+    # the card sum runs in the post) with the upload on the batch port's copy stream (`upcopy`); what --counts holds a
+    # counter log of today's tree to. Their entries are the engine's; their timeline still prices the card sum in the
+    # shadow and a weighted-sum upload in the card FIFO
+    "EQ1": dict(commit="eqc2", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True,
+                marks4=True, cand=True, rows=True, upcopy=True),
+    "EQ2": dict(commit="eqc2", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
+                wrap=True, marks4=True, cand=True, rows=True, upcopy=True),
     # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), frequency list 384, CED on, G 2
     # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
     # sitting (09-28#v41-release): main 53e2def, the same flow, lcg at the id prefix, no STEP_STATS (no card marks)
@@ -3323,8 +3347,8 @@ def counts(P, cname="PG2", ced=True):
     (route entries, shadow entries)}), the route's with the upload and join of a layer-batch that has a block."""
     cfg = dict(CONFIGS[cname], ced=ced)
     recs = evaluate(central(), cfg, P)["recs"]
-    lbs = {(x["lb"].b, x["lb"].l): (x["acts_r"] + x["ev_r"] + (POST_ACTS if x["lb"].T else 0), x["acts_s"] + x["ev_s"])
-           for x in recs}
+    lbs = {(x["lb"].b, x["lb"].l): (x["acts_r"] + x["ev_r"] + (post_entries(cfg) if x["lb"].T else 0),
+                                    x["acts_s"] + x["ev_s"]) for x in recs}
     front = {j: batch_acts(lbs0[0].chunks, u) for j, (_, u, lbs0) in enumerate(prompt_plan(P, ced))}
     return front, lbs
 
@@ -3332,7 +3356,7 @@ def counts(P, cname="PG2", ced=True):
 def check_counts(path):
     """--counts LOG: a generate_ds41 run's counter (`stat prefill front` a batch, `stat prefill lb` a layer-batch,
     printed under BLOOMERY_STEP_STATS=1) against counts() for the same call, which its `call plan` record names (P,
-    CED, G: CW1 or CW2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
+    CED, G: EQ1 or EQ2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
     cannot be compared."""
     recs = records.read(path)
     cp = records.first(recs, "call_plan")
@@ -3346,9 +3370,9 @@ def check_counts(path):
     P, ced, G = cp["end"] - cp["first"], cp["ced"] == "on", cp["group"]
     if cp["first"] != 0 or G not in (1, 2):
         print(f"{path}: a call at {cp['first']}..{cp['end']} under G {G}; the model's configs run a call from position 0 "
-              f"under G 1 (CW1) or 2 (CW2)")
+              f"under G 1 (EQ1) or 2 (EQ2)")
         return 64
-    cname = "CW2" if G == 2 else "CW1"
+    cname = "EQ2" if G == 2 else "EQ1"
     want_front, want = counts(P, cname, ced)
     df = {b: front.get(b, 0) - want_front.get(b, 0) for b in sorted(set(front) | set(want_front))}
     rows = [(k, got.get(k, (0, 0)), want.get(k, (0, 0))) for k in sorted(set(got) | set(want))]
@@ -3538,6 +3562,16 @@ def self_test():
               cfront == front and clbs.keys() == lbs.keys() and role > 0
               and sum(r for r, _ in moved.values()) == role and all(s == 0 for _, s in moved.values()),
               str(sum(r for r, _ in moved.values())))
+        # the rows join and the copy stream's upload add to each layer-batch with a block, nothing elsewhere
+        efront, elbs = counts(P, "EQ2")
+        blocks = {(x["lb"].b, x["lb"].l) for x in evaluate(central(), dict(CONFIGS["CW2"], ced=True), P)["recs"]
+                  if x["lb"].T}
+        step = (ROWS_POST_ACTS + UPCOPY_EVENTS, ROWS_HELD_COPIES - 1)
+        moved = {k: (elbs[k][0] - clbs[k][0], elbs[k][1] - clbs[k][1]) for k in clbs}
+        check(f"EQ2 at P {P} = CW2 + {step[0]} route and {step[1]} shadow entries on each of its {len(blocks)} "
+              f"layer-batches with a block", efront == cfront and elbs.keys() == clbs.keys() and len(blocks) > 0
+              and all(d == (step if k in blocks else (0, 0)) for k, d in moved.items()),
+              str(sorted(set(moved.values()))))
     cfg, rn = row_cfg(p, "B1prose", {"rt": "prose"})
     got = evaluate(p, cfg, 512, rn)["agg"]["host_slots"]
     check("the prose routing reproduces its anchor: 52,189 host slots at P 512 (0.1 %)", abs(got - 52189) / 52189 < 1e-3,
