@@ -91,6 +91,7 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
     use bloomery_gpu_deepseek41::span::span;
+    use bloomery_gpu_gates::ds41_media;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, split_f32, verdict};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP,
@@ -98,7 +99,6 @@ mod gate {
     };
     use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
     use gguf::Split;
-    use gguf::quant::GgmlType;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
     use model::placement::workstation;
@@ -193,48 +193,13 @@ mod gate {
             .into());
         }
         let aligner = read_bf16(&dir.join(&file.name))?;
-        // The learned delimiter rows, by name, from the mmproj the set names
-        // (their owner: vision's deepseek41v names), cast to the span's bf16
-        // as the reference's merge casts them (`to(h.dtype)`, RTNE) — the
-        // file carries them F32.
+        // The span itself — the learned delimiter rows of the mmproj the set
+        // names and the splice over the aligner rows — is the one library
+        // owner `bloomery_gpu_gates::ds41_media` (this gate and the serve
+        // seat's `--mmproj` path share it).
         let mmproj = gguf::Gguf::open(&set.mmproj)?;
-        let delimiter = |name: &str| -> Result<Vec<u16>, GateError> {
-            let t = mmproj
-                .find(name)
-                .ok_or_else(|| format!("{name}: not in {}", set.mmproj.display()))?;
-            if t.dims != [n_embd as u64] || t.ty != GgmlType::F32 {
-                return Err(
-                    format!("{name} is {:?} {:?}, want F32 [{n_embd}]", t.ty, t.dims).into(),
-                );
-            }
-            Ok(mmproj
-                .data(t)?
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| cuda_device::convert::f32_to_bf16_rne(f32::from_le_bytes(*c)))
-                .collect())
-        };
-        let (start, newline, end) = (
-            delimiter("v.token_embd.img_start")?,
-            delimiter("v.image_newline")?,
-            delimiter("v.token_embd.img_end")?,
-        );
-        let mut rows = Vec::with_capacity(img.n_tokens * n_embd);
-        let mut kinds = Vec::with_capacity(img.n_tokens);
-        let mut push = |row: &[u16], kind: MediaKind| {
-            rows.extend_from_slice(row);
-            kinds.push(kind);
-        };
-        push(&start, MediaKind::Start);
-        for r in 0..h {
-            for c in 0..w {
-                let at = (r * w + c) * n_embd;
-                push(&aligner[at..at + n_embd], MediaKind::Image);
-            }
-            push(&newline, MediaKind::NewLine);
-        }
-        push(&end, MediaKind::End);
+        let d = ds41_media::delims(&mmproj, n_embd)?;
+        let (rows, kinds) = ds41_media::span_rows(&aligner, (h, w), n_embd, &d)?;
         Ok((
             Feed {
                 rows,

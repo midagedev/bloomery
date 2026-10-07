@@ -71,9 +71,10 @@ serde_json = { version = "=1.0.151", optional = true }
 # library never names the session crate, which names the V4.1 device crate under `deepseek41`.
 bloomery-app = { path = "../app", optional = true }
 bloomery-runtime = { path = "../runtime", optional = true }
-# The V4.1 image encoder on the card and its host crate, reached only through the `vision` feature
-# (`gate_vision_encoder`): a compiler failure in the encoder's device code breaks that gate's build
-# and no other.
+# The V4.1 image encoder on the card and its host crate: the device encoder is reached
+# only through the `vision` feature (`gate_vision_encoder`), so a compiler failure in its
+# device code breaks that gate's build and no other; the host crate `deepseek41` reaches
+# too (the feature's own comment below).
 bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
@@ -101,6 +102,11 @@ deepseek41 = [
     "dep:bloomery-app",
     "bloomery-app/deepseek41",
     "dep:bloomery-runtime",
+    # The V4.1 image input's host half (the span assembly `ds41_media` and the
+    # encoder file's hyperparameters), pure: the device encoder stays behind
+    # `vision`, so a compiler failure in its device code still breaks that
+    # gate's build and no other.
+    "dep:bloomery-vision",
 ]
 vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
 clef = ["gpu", "dep:bloomery-decision", "dep:bloomery-serve", "dep:serde_json"]

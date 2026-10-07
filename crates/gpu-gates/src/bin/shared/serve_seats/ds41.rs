@@ -7,6 +7,7 @@
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
 //!                         [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
+//!                         [--mmproj FILE]
 //!
 //! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
 //! (`serve::flag::CTX`); a number flag's value that is not a number is
@@ -153,6 +154,26 @@
 //! then carries the window's features to the draft, and the ids are the full
 //! prompt's. The lookup draft rebuilds its n-gram tables from the target's
 //! token history at a request's first token.
+//!
+//! `--mmproj FILE` (llama-server's spelling) turns the seat's image input on
+//! (behind the `vision` feature — the encoder's device code; a build without
+//! it refuses the flag by name, and the seat serves no image): the file is
+//! the V4.1 encoder's GGUF, opened at load and refused by name when it is
+//! not ([`gpu_vision::Encoder::load`]'s check), and the encoder is resident
+//! from then on — on a card this process holds that the placement's plan
+//! leaves off it (the 3090 under `--place a` here, at no cost to the plan),
+//! else on the stage card as a named reserve the plan's fit counts
+//! ([`EncoderSeat`]); the `vision` line after the load names the card, which
+//! of the two it is, and the encoder's bytes. A request's image parts expand
+//! to their spans (`serve::media` over the engine's [`Seat::media_model`]),
+//! each span encoded on the resident encoder and spliced into the prompt
+//! call ([`ds41_media`]'s one assembly with the media gate); the seat's
+//! resident slots carry each span's history with their sequences, and the
+//! prompt cache keys a kept prefix by its images as well as its ids.
+//! Refused by name: `--mmproj` under the step feed (a span's rows enter only
+//! through the batched call), and an image under the DSpark draft (its
+//! window is fed by the prompt call's features, which a media call hands
+//! none).
 
 use std::any::Any;
 use std::io::{Read, Write};
@@ -193,13 +214,28 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
+#[cfg(feature = "vision")]
+use bloomery_gpu_gates::ds41_media;
+#[cfg(feature = "vision")]
+use bloomery_gpu_vision::encoder::Encoder;
+#[cfg(feature = "vision")]
+use cuda_core::CudaContext;
+#[cfg(feature = "vision")]
+use serve::media::MediaFeed;
+#[cfg(feature = "vision")]
+use vision::arch::deepseek41v::Hparams as VisionHparams;
+#[cfg(feature = "vision")]
+use vision::arch::deepseek41v::card::CardBytes;
+#[cfg(feature = "vision")]
+use vision::arch::deepseek41v::media::Media;
+
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
 
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
                      [--cache-ram MIB] [--parallel N] [--queue-depth Q] \
-                     [--slot-save-path DIR]";
+                     [--slot-save-path DIR] [--mmproj FILE]";
 
 /// The resident sequences the seat serves when `--parallel` is not given.
 pub const SLOTS: usize = 2;
@@ -230,6 +266,9 @@ struct Args {
     /// `--slot-save-path`: the directory the slot actions answer from;
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
+    /// `--mmproj`: the V4.1 encoder file whose images the seat serves;
+    /// `None` serves no image.
+    mmproj: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -243,6 +282,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         parallel: None,
         queue_depth: None,
         slot_save_path: None,
+        mmproj: None,
     };
     let mut park_ram = false;
     let mut it = args.iter().map(|s| s.as_str());
@@ -263,6 +303,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
+            "--mmproj" => a.mmproj = Some(PathBuf::from(v)),
             "--park-ram" => {
                 mib_bytes(flag, v)?;
                 park_ram = true;
@@ -338,6 +379,104 @@ fn slot_ctx(ctx: usize, slots: NonZeroUsize) -> Result<usize, GateError> {
     Ok(ctx)
 }
 
+/// Where the V4.1 image encoder sits under `--mmproj` (the design's
+/// load-time residency advice): on a card this process holds that the
+/// placement's plan leaves off it — the 3090 under `--place a` on this
+/// workstation, at no cost to the plan — or, when every held card is on the
+/// plan, on the stage card as a named reserve the plan's fit counts
+/// ([`model::placement::Card::reserves`]).
+#[derive(Clone)]
+struct EncoderSeat {
+    /// The card's name as the placement's plan gives it.
+    name: String,
+    /// The card's CUDA ordinal in this process.
+    ordinal: u32,
+    /// The bytes the plan reserves on the stage card — the encoder's card
+    /// figure (`CardBytes`), the one its load holds itself to; `None` off the
+    /// plan.
+    reserve: Option<u64>,
+}
+
+/// The encoder's seat under `place` for an encoder of `bytes` on its card
+/// ([`EncoderSeat`]'s rule): the off-plan card of the fewest bytes this
+/// process sees — several tie to the lower ordinal — else the stage card
+/// with those bytes as its reserve.
+fn encoder_seat(place: Place, bytes: u64) -> Result<EncoderSeat, GateError> {
+    // The aliases' specs name this workstation's cards with no device; the
+    // census resolution is what makes on_plan mean the cards this process
+    // holds (the gate's own seat_of derives it the same way).
+    let specs = place.on_host()?.card_specs()?;
+    let census = bloomery_gpu::census()?;
+    let on_plan = |uuid: &[u8; 16]| {
+        specs
+            .iter()
+            .filter_map(|c| c.device)
+            .any(|d| &d.uuid == uuid)
+    };
+    match census
+        .iter()
+        .filter(|d| !on_plan(&d.uuid))
+        .min_by_key(|d| (d.total_bytes, d.ordinal))
+    {
+        Some(d) => Ok(EncoderSeat {
+            name: d.name.clone(),
+            ordinal: d.ordinal,
+            reserve: None,
+        }),
+        None => {
+            let spec = specs.first().ok_or("--place names no stage card")?;
+            let device = spec.device.ok_or_else(|| {
+                format!(
+                    "--place {}: the stage card was not resolved to a device",
+                    place.name()
+                )
+            })?;
+            Ok(EncoderSeat {
+                name: spec.name.to_string(),
+                ordinal: device.ordinal,
+                reserve: Some(bytes),
+            })
+        }
+    }
+}
+
+/// What `--mmproj` opened for the plan: the encoder file's card figure —
+/// refused by name when the file is not the V4.1 encoder's, the same check
+/// [`Encoder::load`] runs — and the seat that figure goes on. Refused by
+/// name under the step feed: a span's rows enter only through the batched
+/// call.
+#[cfg(feature = "vision")]
+fn vision_of(a: &Args, prefill: body::PrefillMode) -> Result<Option<EncoderSeat>, GateError> {
+    let Some(path) = &a.mmproj else {
+        return Ok(None);
+    };
+    if prefill != body::PrefillMode::Batch {
+        return Err(format!(
+            "--mmproj under BLOOMERY_PREFILL={}: a media span's rows enter only through the \
+             batched prompt call (BLOOMERY_PREFILL=batch)",
+            prefill.name()
+        )
+        .into());
+    }
+    let file = gguf::Gguf::open(path).map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
+    let hp = VisionHparams::read(&file)?;
+    let bytes = CardBytes::of(&hp).total();
+    Ok(Some(encoder_seat(a.place, bytes)?))
+}
+
+/// `--mmproj` on a build that takes no images: the flag is refused by name
+/// (the encoder's device code sits behind the `vision` feature).
+#[cfg(not(feature = "vision"))]
+fn vision_of(a: &Args, prefill: body::PrefillMode) -> Result<(), GateError> {
+    let _ = prefill;
+    match &a.mmproj {
+        Some(_) => {
+            Err("--mmproj: this build takes no images (built without the vision feature)".into())
+        }
+        None => Ok(()),
+    }
+}
+
 /// Loads the model and serves until the listener or the engine fails;
 /// `Ok` carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
@@ -377,6 +516,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         "parallel rule=slots slots={slots} slot_ctx={ctx} total={} from={from}",
         slots.get() * ctx
     );
+    // The encoder's file is read before the plan, which reserves its bytes.
+    #[cfg(feature = "vision")]
+    let vision_seat = vision_of(&a, cfg.body.prefill)?;
+    #[cfg(feature = "vision")]
+    let vision_reserve = vision_seat.as_ref().and_then(|s| s.reserve);
+    #[cfg(not(feature = "vision"))]
+    vision_of(&a, cfg.body.prefill)?;
+    #[cfg(not(feature = "vision"))]
+    let vision_reserve = None;
     // The draft's file is read before the target's load, which takes a minute.
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -418,7 +566,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (card, placement, cache, residency) = print_plan(
         &inputs,
         a.place,
-        (reserve, tier_batch),
+        (reserve, tier_batch, vision_reserve),
         (ctx, slots),
         &cfg.place,
         residency,
@@ -458,6 +606,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         trace,
         stats: levers.step_stats(),
         width,
+        n_embd: inputs.hp.n_embd,
+        mmproj: a.mmproj.clone(),
+        #[cfg(feature = "vision")]
+        vision: vision_seat,
+        #[cfg(not(feature = "vision"))]
+        vision: None,
     };
     let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?;
     let config = ServerConfig {
@@ -565,8 +719,10 @@ fn route_trace(
 
 /// The plan the engine is about to load under the placement's `levers`
 /// (with `reserve`, the DSpark draft's, and `tier_batch`, the tier's
-/// prompt-batch bytes, on its tier card), `slots` resident sequences of
-/// `ctx` positions each (`PlanInputs::plan_with_slots`), on stderr. The
+/// prompt-batch bytes, on its tier card, and `vision_reserve`, the image
+/// encoder's bytes, on the stage card when no held card sits off the plan),
+/// `slots` resident sequences of `ctx` positions each
+/// (`PlanInputs::plan_with_slots`), on stderr. The
 /// unset residency word resolves against that plan first
 /// ([`residency41::at_plan`]), its `residency lever` record — the plan-side
 /// detail on the line beside it when the plan moved or refused the word —
@@ -575,18 +731,37 @@ fn route_trace(
 /// it does not fit. Returns its cards' names, the plan's placement for
 /// `/props` (`None`, and a line saying why, when a card's nvidia-smi index
 /// cannot be found), the prompt cache's budget of the real host's room
-/// ([`CacheRam::of`]) and the residency word the load runs by.
+/// ([`CacheRam::of`]) and the residency word the load runs by. A plan the
+/// vision reserve does not fit is the plan's own refusal with the reserve
+/// named before its terms.
 fn print_plan(
     inputs: &PlanInputs,
     place: Place,
-    (reserve, tier_batch): (Option<u64>, Option<TierBatchBytes>),
+    (reserve, tier_batch, vision_reserve): (Option<u64>, Option<TierBatchBytes>, Option<u64>),
     (ctx, slots): (usize, NonZeroUsize),
     levers: &PlanLevers,
     pick: ResidencyPick,
     cache_ram: Option<u64>,
 ) -> Result<(String, Option<PlacementProps>, CacheRam, ResidencyPick), GateError> {
-    let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
-    let plan = inputs.plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)?;
+    let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
+    if let Some(bytes) = vision_reserve {
+        machine.cards[0]
+            .reserves
+            .push((VISION_RESERVE.to_owned(), bytes));
+    }
+    let plan = inputs
+        .plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)
+        .map_err(|e| {
+            vision_reserve.map_or_else(
+                || e.to_string(),
+                |bytes| {
+                    format!(
+                        "the plan holds the image encoder's {bytes} B as the stage card's \
+                     {VISION_RESERVE} reserve: {e}"
+                    )
+                },
+            )
+        })?;
     let pick = residency41::at_plan(&plan, pick)?;
     record::residency_lever(pick).eprint();
     if let Some(d) = pick.why.detail() {
@@ -618,6 +793,10 @@ fn print_plan(
 
 const WHAT: &str = "bloomery-serve-ds41";
 
+/// What the image encoder's reserve on a stage card is called, as the plan's
+/// terms name it (beside `workstation`'s draft and tier-batch reserves).
+const VISION_RESERVE: &str = "image encoder";
+
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place,
@@ -644,6 +823,14 @@ struct SeatArgs {
     /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
     /// chooser's (`cost`) or the draft's own (`fixed`).
     width: WidthMode,
+    /// The model file's embedding width: the width of a media span's row.
+    n_embd: usize,
+    /// `--mmproj`: the encoder file (never set on a build without the
+    /// `vision` feature, which refuses the flag).
+    mmproj: Option<PathBuf>,
+    /// The encoder's seat under `--mmproj` ([`vision_of`]'s pick); `None`
+    /// without the flag.
+    vision: Option<EncoderSeat>,
 }
 
 /// The draft the seat serves, verified by the pair pass, behind the width
@@ -674,6 +861,89 @@ struct V41 {
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
+    /// The resident image encoder and its splice halves (`--mmproj`).
+    #[cfg(feature = "vision")]
+    vision: Option<Vision>,
+}
+
+/// The seat's resident image encoder and the halves its spans splice from:
+/// the encoder on its card, the delimiter rows of its file, the model's
+/// embedding width (a row's width) and the media description the engine
+/// answers ([`Seat::media_model`]). Behind the `vision` feature.
+#[cfg(feature = "vision")]
+struct Vision {
+    enc: Encoder,
+    /// The encoder's own stream: `encode` enqueues on it and the row
+    /// readback synchronizes it.
+    stream: Arc<cuda_core::CudaStream>,
+    delims: ds41_media::Delims,
+    /// The model file's `n_embd`.
+    n_embd: usize,
+    media: Arc<Media>,
+}
+
+/// A media call's rows: every feed's image encoded on the resident encoder,
+/// its aligner rows read back as bf16 and spliced ([`ds41_media::span_rows`]),
+/// all in one pair of buffers — the rows, the kinds, and each span's
+/// positions, rows and kinds as ranges of them.
+#[cfg(feature = "vision")]
+type SpanRows = (
+    Vec<u16>,
+    Vec<body::MediaKind>,
+    Vec<(
+        std::ops::Range<usize>,
+        std::ops::Range<usize>,
+        std::ops::Range<usize>,
+    )>,
+);
+
+#[cfg(feature = "vision")]
+impl Vision {
+    /// [`SpanRows`] of `feeds`, encoded in order.
+    fn span_rows(&mut self, feeds: &[MediaFeed]) -> Result<SpanRows, GateError> {
+        let mut rows = Vec::new();
+        let mut kinds = Vec::new();
+        let mut ats = Vec::new();
+        for f in feeds {
+            let p = &f.prepared.patches;
+            let (h, w) = (p.plan.n_llm_h, p.plan.n_llm_w);
+            let encoded = self
+                .enc
+                .encode(p)
+                .map_err(|e| format!("the image at {}: {e}", f.at))?;
+            let all = encoded
+                .rows
+                .buf()
+                .to_host_vec(&self.stream)
+                .map_err(|e| format!("the image at {}: {e}", f.at))?;
+            let want = h * w * self.n_embd;
+            let aligner = all.get(..want).ok_or_else(|| {
+                format!(
+                    "the image at {}: {} aligner values for a {h}x{w} grid, want {want}",
+                    f.at,
+                    all.len()
+                )
+            })?;
+            let (r, k) = ds41_media::span_rows(aligner, (h, w), self.n_embd, &self.delims)?;
+            if k.len() != f.prepared.span_len {
+                return Err(format!(
+                    "the image at {}: a {h}x{w} grid splices {} positions, its prepare said {}",
+                    f.at,
+                    k.len(),
+                    f.prepared.span_len
+                )
+                .into());
+            }
+            ats.push((
+                f.at..f.at + k.len(),
+                rows.len()..rows.len() + r.len(),
+                kinds.len()..kinds.len() + k.len(),
+            ));
+            rows.extend(r);
+            kinds.extend(k);
+        }
+        Ok((rows, kinds, ats))
+    }
 }
 
 /// A body's saved sequence state, as the server's prompt cache holds it,
@@ -703,6 +973,86 @@ impl Saved for Ds41Saved {
     }
 }
 
+/// The resident image encoder of `--mmproj` ([`Vision`]), opened on the seat
+/// the plan picked ([`EncoderSeat`]): the file loaded on its card — refused
+/// by name when it is not the V4.1 encoder's, or when its uploads are not
+/// the card figure the plan reserved (`Encoder::load`'s own check) — its
+/// aligner width held against the model's embedding, the delimiter rows of
+/// its file read once, and the prompt batch's media half made
+/// ([`body::prepare_media`]). The `vision` line that follows the load names
+/// the card, which of the two seats it is, and the encoder's bytes.
+#[cfg(feature = "vision")]
+fn open_encoder(s: &mut Session<Body>, a: &SeatArgs) -> Result<Option<Vision>, GateError> {
+    let (Some(path), Some(seat)) = (&a.mmproj, &a.vision) else {
+        return Ok(None);
+    };
+    let t = Instant::now();
+    let file = gguf::Gguf::open(path).map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
+    let hp = VisionHparams::read(&file)?;
+    let ordinal = usize::try_from(seat.ordinal)
+        .map_err(|_| format!("--mmproj {}: ordinal {}", path.display(), seat.ordinal))?;
+    let (stream, enc) = on_encoder_card(s, || {
+        let on_card = |e| format!("--mmproj {}: the card {}: {e}", path.display(), seat.name);
+        let ctx = CudaContext::new(ordinal).map_err(on_card)?;
+        let stream = ctx.new_stream().map_err(on_card)?;
+        let enc = Encoder::load(&ctx, &stream, &file)
+            .map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
+        Ok((stream, enc))
+    })?;
+    if hp.out_dim != a.n_embd {
+        return Err(format!(
+            "--mmproj {}: the encoder's aligner rows are {} wide, the model's embedding is {}",
+            path.display(),
+            hp.out_dim,
+            a.n_embd
+        )
+        .into());
+    }
+    let delims = ds41_media::delims(&file, a.n_embd)?;
+    // The prompt batch's media half, beside the batch buffers the session's
+    // own ready made.
+    body::prepare_media(s.model_mut())?;
+    eprintln!(
+        "vision card={} seat={} weights={} scratch={} load_s={:.1}",
+        seat.name.replace(' ', "_"),
+        if seat.reserve.is_some() {
+            "stage-reserve"
+        } else {
+            "off-plan"
+        },
+        enc.weight_bytes(),
+        enc.scratch_bytes(),
+        t.elapsed().as_secs_f64(),
+    );
+    Ok(Some(Vision {
+        enc,
+        stream,
+        delims,
+        n_embd: a.n_embd,
+        media: Arc::new(Media::new(hp.grid())),
+    }))
+}
+
+/// Runs `work` — encoder calls, which leave the encoder's card bound to the
+/// engine thread — then binds the model's card back, whether or not `work`
+/// succeeded, so every body call after it runs with the model's card bound.
+#[cfg(feature = "vision")]
+fn on_encoder_card<T>(
+    s: &Session<Body>,
+    work: impl FnOnce() -> Result<T, GateError>,
+) -> Result<T, GateError> {
+    let out = work();
+    // An allocation lands in the thread's current context (cuda-core's
+    // DeviceBuffer), not in its stream's: the body's would land on the
+    // encoder's card.
+    s.model()
+        .gpu()
+        .context()
+        .bind_to_thread()
+        .map_err(|e| format!("binding the model's card back after the encoder: {e}"))?;
+    out
+}
+
 impl V41 {
     /// The session by `a.place` (the `load`, host set and `capture`
     /// lines), the draft `a.draft` names on it (its `load draft=dspark`
@@ -715,8 +1065,19 @@ impl V41 {
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         // The plan counts every resident sequence, which the session's own
         // open (one sequence) does not: the model is opened here by that
-        // plan, then handed to the session.
-        let machine = a.place.machine(a.reserve, a.tier_batch)?;
+        // plan, then handed to the session. The encoder's reserve rides the
+        // same plan when it sits on the stage card ([`print_plan`]'s rule).
+        let plain = a.place.machine(a.reserve, a.tier_batch)?;
+        let vision_reserve = a.vision.as_ref().and_then(|s| s.reserve);
+        let machine = move |layers: usize| {
+            let mut machine = plain(layers);
+            if let Some(bytes) = vision_reserve {
+                machine.cards[0]
+                    .reserves
+                    .push((VISION_RESERVE.to_owned(), bytes));
+            }
+            machine
+        };
         let mut m = body::open_slots(file, machine, a.ctx, &a.cfg, a.slots)?;
         m.set_mode(StepMode::Graph);
         let mut log = Log { a: &a, pinned, t };
@@ -736,6 +1097,8 @@ impl V41 {
             None => None,
         };
         let mut s = loaded.ready(&mut log)?;
+        #[cfg(feature = "vision")]
+        let vision = open_encoder(&mut s, &a)?;
         if let Some(t) = trace {
             s.model_mut()
                 .body_parts(WHAT)?
@@ -785,6 +1148,8 @@ impl V41 {
             draft,
             one_pass: a.slots.get() > 1 && a.draft == Draft::Off,
             stats: a.stats,
+            #[cfg(feature = "vision")]
+            vision,
         })
     }
 
@@ -884,6 +1249,59 @@ impl Seat for V41 {
             }
             Served::Off => self.s.prompt(ids, Want::Argmax)?.argmax(),
         };
+        self.print_passes()?;
+        Ok(next)
+    }
+
+    /// The resident encoder's media description ([`Vision::media`]); `None`
+    /// without `--mmproj`, an engine that takes no image.
+    #[cfg(feature = "vision")]
+    fn media_model(&self) -> Option<serve::media::SharedMediaModel> {
+        self.vision.as_ref().map(|v| {
+            let media: serve::media::SharedMediaModel = v.media.clone();
+            media
+        })
+    }
+
+    /// Each feed's image encoded on the resident encoder, its aligner rows
+    /// read back as bf16 and spliced — the one assembly [`ds41_media`] gives
+    /// the media gate — into one prompt call ([`Session::prompt_media`]),
+    /// the model's card bound back between the two ([`on_encoder_card`]).
+    /// The lookup draft rebuilds its tables
+    /// from the target's history at its next pass, as after any prompt call;
+    /// the DSpark draft is refused by name (its window is fed by the prompt
+    /// call's features, which a media call hands none).
+    #[cfg(feature = "vision")]
+    fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
+        let V41 {
+            s, vision, draft, ..
+        } = self;
+        let Some(v) = vision.as_mut() else {
+            return Err("no --mmproj: this seat serves no image".into());
+        };
+        match draft {
+            Served::Dspark(_) => {
+                return Err(
+                    "an image under BLOOMERY_DRAFT=dspark: the draft's window is fed by the \
+                     prompt call's features, which a media call hands none; serve the lookup \
+                     draft, or none"
+                        .into(),
+                );
+            }
+            Served::Lookup(_, follows) => *follows = false,
+            Served::Off => {}
+        }
+        // Each span borrows its own ranges of the call's one pair of buffers.
+        let (rows, kinds, ats) = on_encoder_card(s, || v.span_rows(feeds))?;
+        let spans: Vec<body::MediaSpan<'_>> = ats
+            .iter()
+            .map(|(at, r, k)| body::MediaSpan {
+                at: at.clone(),
+                rows: &rows[r.clone()],
+                kinds: &kinds[k.clone()],
+            })
+            .collect();
+        let next = s.prompt_media(ids, &spans, Want::Argmax)?.argmax();
         self.print_passes()?;
         Ok(next)
     }

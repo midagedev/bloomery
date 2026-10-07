@@ -16,6 +16,8 @@ pub mod act_rule;
 #[cfg(feature = "deepseek41")]
 pub mod bind;
 pub mod block;
+#[cfg(feature = "deepseek41")]
+pub mod ds41_media;
 pub mod ds41_meta;
 pub mod engine;
 pub mod flip;
