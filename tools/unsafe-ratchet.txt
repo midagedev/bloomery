@@ -169,7 +169,10 @@ placement 0 0 0
 # kernels — the q8_1 quantizer, the Q3_K and Q4_K dots, the warp butterfly and card_expf (five unsafe fns: four
 # AVX2 bodies, one block each, and the register-only card_warp_sum) and the five dispatch arms that call them,
 # each with its SAFETY line.
-qdot 95 52 0
+# PIN(2026-10-07): qdot 95 -> 102 blocks, 52 -> 56 fns, new kernels, not old code relaxed: the IQ3_XXS, IQ4_XS and
+# IQ4_NL tiles (three unsafe fns and the shared #[inline(always)] q8k_block_step, one block each) and the three
+# dispatch arms that call them, each with its SAFETY line.
+qdot 102 56 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

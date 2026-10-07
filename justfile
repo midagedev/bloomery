@@ -791,6 +791,18 @@ clef-hidden *ARGS:
 gate-gpu-qwen4exp-e2e:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
 
+# Qwen3.8 UD-Q3_K_XL's i-quant routed experts (IQ3_XXS and IQ4_XS gate/up, IQ4_NL down) through the threaded host leg
+# on the 3090's plan (either card, shared/gate_card.rs): the leg's per-expert gate, up, combine and down and its union
+# call's tile equal an independent recompute from the file's rows by qdot's dot bit for bit on a sampled set of layers
+# and host-served experts; the 512-position prompt's ubatch walk lists host slots on every layer holding an i-quant
+# stack, the load naming the three types on path=fused; and the same prompt and 8 decode steps at the pool's default
+# width and at width 1 (two processes, each loading the file, BLOOMERY_POISON=1) leave the same ids and logits bit for
+# bit. Loads the 90 GB file twice: alone in a batch, under the big-load lock.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-qwen4exp-iqleg:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
+
 # Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
 # store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,
 # and Mtp38::open's refusals — then every graph of ik's MTP draft set (mtp-qwen4exp) replayed teacher-forced — eh_proj,

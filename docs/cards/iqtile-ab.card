@@ -1,0 +1,43 @@
+# iqtile: the IQ3_XXS / IQ4_XS / IQ4_NL tile kernels (crates/qdot) against main, one lease on the A6000, the Qwen3.8
+# UD-Q3_K_XL file, MTP draft on (the default), P = 512 and 4096. Base = main's binary; changed = this branch's.
+#
+# Decomposition [derived]: the Q3 file's routed experts are IQ3_XXS / IQ4_XS (gate, up) and IQ4_NL (down). Before the
+# tile, dot_row_cols called dot_row once per column, so each weight block's decode (~43 of ~48 uops per 32 values in
+# IQ3_XXS) ran once per column: 12.1..13.3 us a (expert, column) slot on 32 workers (iqpp512, measured), against Q4_K's
+# tiled 3.28 us. A tile decodes once and runs the per-column steps C times: 5 + 43/r uops a column for IQ3_XXS and
+# 4 + 8/r for IQ4_NL, r = the columns a block meets, which puts the slot at 3.0..4.3 us. The saving on the 512-token
+# prompt is -260..-315 ms [derived, functional run's ms]. The functional run read 689.8 ms where the sitting read
+# 661 ms (775 tok/s), so the saving is scaled by 661 / 689.8 = 0.958: -249..-302 ms. 661 ms becomes 412..359 ms,
+# pp512 775 -> 1,243..1,426 tok/s: +60..+84 %. At 4096 the host union is a smaller part of the prompt: -52 ms on
+# 2,848 ms (1,438 -> 1,465 tok/s, +1.9 %), inside the ruler at 4 rounds (+-1.0 % on a difference of arm means), so it is
+# read as a sign and a size, not a verdict.
+# Re-banded from a functional run (worker2, 2026-10-07 20:02-20:08, A6000, this branch, the box shared, load 17-20,
+# three arms a process): draft off 422.9 / 406.8 / 395.9 ms against iqpp512's 629.8; draft on 482.7 / 434.8 / 499.9
+# against 689.8. The union fell 452.6 -> ~225 ms, so the slot is ~6.3..7.5 us, not the derived 3.0..4.3: the missed
+# term is the tile's slot cost (on a shared box, so part may be contention). The term's band is the draft-on ratio
+# 0.630..0.725 on the sitting's 661 ms: 416..479 ms, pp512 1,069..1,231 tok/s, +38..+59 %.
+# Wall [derived]: 4 arms x 4 rounds of a fresh Qwen3.8 load (~40 s each) plus the prompt runs, 12..16 min.
+# Runner (the lead's, main tree, the full output to a file first):
+# BLOOMERY_HOLD_OWNER=iqtile BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=4
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/iqtile-ab.card BLOOMERY_GEN_CTX=4352' just depth-gpu-qwen4exp
+#   bin:/root/repo/bloomery/target/release/generate_qwen3moe:prose:512@model=<Q3>
+#   bin:/root/repo/bloomery/target/release/generate_qwen3moe:prose:4096@model=<Q3>
+#   prose:512@model=<Q3> prose:4096@model=<Q3>
+# (the first two are the base arms, main's binary built before the sitting; the last two are this branch's, <Q3> the
+# UD-Q3_K_XL first shard.)
+kind: ab
+question: do the IQ3_XXS / IQ4_XS / IQ4_NL tile kernels cut the Q3 file's 512-token prompt time as the functional
+  run says (pp tok/s up 38..59 %)?
+term: pp tok/s @ prose:512, ctx 4352, A6000, Qwen3.8 UD-Q3_K_XL at its defaults (MTP draft on), changed arm over base
+unit: %
+predict: 38..59
+rounds: 4
+condition: one lease, four rounds, a fresh process per load group, majflt near 0 (no [cold] row), no [cpu-busy] or
+  [other-busy] row; both binaries load the same plan (the plan line's card experts a layer equal), the base arm at the
+  sitting's 775 tok/s (661 ms) within the ruler; pp4096 is read beside it (predicted +1.9 %, 1,438 -> 1,465 tok/s)
+decide-in: the per-column decode was the term; land the tiles with the three gates' records, and add the IQ rows to
+  tile_units in crates/model/src/ops.rs so the dispatch cost model sees them
+decide-below: part of the 512-token slot cost is not the repeated decode (the per-column step, the columns per block, or
+  the host union's balance): read the arm's prompt stats (slot us, columns per block) against the functional ~6.3..7.5 us before landing
+decide-above: more than the repeated decode moved (the model's tile_units already cost IQ rows as untiled and the
+  dispatch changed with the tile): re-derive the slot term and check the base arm for a cold or contended window
