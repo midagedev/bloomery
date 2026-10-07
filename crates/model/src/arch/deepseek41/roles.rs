@@ -56,9 +56,10 @@ const LAYER_RULES: &[(Pattern, Role)] = &[
     (Pattern::Prefix("indexer"), Role::Attention),
 ];
 
-/// A tensor's role and layer by its name; `None` when no rule matches. The
-/// per-layer rules apply to `blk.N.` names only.
-fn role(name: &str) -> Option<(Role, Option<usize>)> {
+/// A tensor's role and layer by its name; `None` when no rule matches or
+/// its layer is past `n_layer`. The per-layer rules apply to `blk.N.` names
+/// only.
+fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
     if name.starts_with("mtp.") || (!name.starts_with("blk.") && name.contains(".mtp.")) {
         return Some((Role::Unused, None));
     }
@@ -69,7 +70,7 @@ fn role(name: &str) -> Option<(Role, Option<usize>)> {
         return Some((Role::Head, None));
     }
     let (layer, rest) = name.strip_prefix("blk.")?.split_once('.')?;
-    let layer = layer.parse().ok()?;
+    let layer = layer.parse().ok().filter(|&l| l < n_layer)?;
     LAYER_RULES
         .iter()
         .find(|(p, _)| p.matches(rest))
@@ -81,7 +82,7 @@ fn role(name: &str) -> Option<(Role, Option<usize>)> {
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
     let mut model = classify_with(
         split,
-        role,
+        |name| role(name, hp.n_layer),
         Counts {
             layers: hp.n_layer,
             experts: hp.experts.n_expert as u64,
@@ -130,26 +131,27 @@ mod tests {
 
     /// A multi-token-prediction head's tensors are never loaded, whatever
     /// their layer and whatever decode name follows the prefix; a name no rule
-    /// knows gets no role, so `classify` lists it.
+    /// knows gets no role, so `classify` lists it. The V4-Flash file's 43
+    /// layers.
     #[test]
     fn mtp_heads_are_unused_and_unknown_names_have_no_role() {
         for (name, layer) in [
-            ("blk.43.nextn.eh_proj.weight", Some(43)),
-            ("blk.43.nextn.hc_head_down.weight", Some(43)),
-            ("blk.43.nextn.ffn_up_exps.weight", Some(43)),
+            ("blk.42.nextn.eh_proj.weight", Some(42)),
+            ("blk.42.nextn.hc_head_down.weight", Some(42)),
+            ("blk.42.nextn.ffn_up_exps.weight", Some(42)),
             ("blk.2.mtp.attn_q.weight", Some(2)),
             ("blk.2.ffn.mtp.proj.weight", Some(2)),
             ("mtp.0.eh_proj.weight", None),
             ("model.mtp.norm.weight", None),
         ] {
-            assert_eq!(role(name), Some((Role::Unused, layer)), "{name}");
+            assert_eq!(role(name, 43), Some((Role::Unused, layer)), "{name}");
         }
         assert_eq!(
-            role("blk.0.exp_probs_b.bias"),
+            role("blk.0.exp_probs_b.bias", 43),
             Some((Role::Router, Some(0)))
         );
         assert_eq!(
-            role("blk.2.ffn_gate_tid2eid.weight"),
+            role("blk.2.ffn_gate_tid2eid.weight", 43),
             Some((Role::HashTable, Some(2)))
         );
         for name in [
@@ -157,7 +159,20 @@ mod tests {
             "blk.0.post_attention_norm.weight",
             "rope_freqs.weight",
         ] {
-            assert_eq!(role(name), None, "{name}");
+            assert_eq!(role(name, 43), None, "{name}");
         }
+    }
+
+    /// A `blk.` name whose layer is past the file's gets no role, so
+    /// `classify` lists it with the unclassified — the bound the other
+    /// families' role tables hold.
+    #[test]
+    fn a_layer_past_the_file_gets_no_role() {
+        assert_eq!(role("blk.61.attn_q.weight", 43), None);
+        assert_eq!(role("blk.43.attn_q.weight", 43), None);
+        assert_eq!(
+            role("blk.42.attn_q.weight", 43),
+            Some((Role::Attention, Some(42)))
+        );
     }
 }
