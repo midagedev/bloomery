@@ -359,8 +359,18 @@ mod card;
 mod gate_card;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use crate::card;
+    use crate::e2e::{
+        Worst, argmax, clause, clause_timed, elapsed, first_flip_layers, flips_report, ik_last,
+        layer_rels, layer_table, minus, normed, outcome, pick, print_layers, quant_gap, refused_by,
+        refused_saying, rel, same_bits, second, set_open, tap, tap_at, tie_numbers, word_after,
+        worst_off_path,
+    };
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -380,8 +390,8 @@ mod gate {
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ik_q8_2, patch_bytes,
-        ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
+        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, patch_bytes, split_f32,
+        topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
@@ -557,59 +567,6 @@ mod gate {
     fn store_bytes(ctx: usize, lanes: usize) -> usize {
         N_KDA * ((lanes * 64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + lanes * 4)
             + N_LATENT * (ctx * (512 + 256) + ctx.div_ceil(4) * 128) * 2
-    }
-
-    /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
-    /// neither passes a band.
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() {
-            return f64::INFINITY;
-        }
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            num += (f64::from(x) - f64::from(y)).powi(2);
-            den += f64::from(y).powi(2);
-        }
-        let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
-        if r.is_nan() { f64::INFINITY } else { r }
-    }
-
-    /// The first index of the largest value, as the head's argmax breaks ties.
-    fn argmax(v: &[f32]) -> u32 {
-        let best = v
-            .iter()
-            .enumerate()
-            .fold(0usize, |b, (i, &x)| if x > v[b] { i } else { b });
-        best as u32
-    }
-
-    /// The runner-up's index: the largest value other than at `top`.
-    fn second(v: &[f32], top: u32) -> u32 {
-        let best = v.iter().enumerate().fold(None::<usize>, |b, (i, &x)| {
-            if i == top as usize {
-                b
-            } else {
-                match b {
-                    Some(j) if v[j] >= x => Some(j),
-                    _ => Some(i),
-                }
-            }
-        });
-        best.unwrap_or(0) as u32
-    }
-
-    /// A set's tap `name` in its logical order.
-    fn tap(man: &RefManifest, name: &str) -> Result<Vec<f32>, GateError> {
-        Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, 0)?)?)
-    }
-
-    /// One clause's elapsed line when it ends: the module header's code for
-    /// it and its wall in seconds, the load line's own shape.
-    fn elapsed(what: &str, t: &Instant) {
-        println!(
-            "clause {what} in {:.1} s (runtime value)",
-            t.elapsed().as_secs_f64()
-        );
     }
 
     /// The open's records, as the gate prints them.
@@ -839,11 +796,6 @@ mod gate {
         Ok(r)
     }
 
-    /// Bit equality of two logits rows.
-    fn same_bits(a: &[f32], b: &[f32]) -> bool {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-    }
-
     fn one_chain(graph: &Run, eager: &Run) -> bool {
         let tokens = graph.tokens == eager.tokens;
         let logits = graph.logits.len() == eager.logits.len()
@@ -860,71 +812,6 @@ mod gate {
             verdict(ok)
         );
         ok
-    }
-
-    /// Each layer's worst relative distance over the positions `taps` holds
-    /// against ik's `l_out-L`, whose last rows are those positions' (ik
-    /// keeps only the output token's rows past the last attention), and the
-    /// index into `taps` it was met at.
-    fn layer_rels(man: &RefManifest, taps: &[Vec<f32>]) -> Result<Vec<(f64, usize)>, GateError> {
-        Ok(worst_of(&layer_table(man, taps)?))
-    }
-
-    /// Each row's worst entry of a [`layer_table`] and the tap it was met at.
-    fn worst_of(table: &[Vec<Option<f64>>]) -> Vec<(f64, usize)> {
-        table
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .filter_map(|(t, e)| e.map(|e| (e, t)))
-                    .fold((0.0f64, 0usize), |w, x| if x.0 > w.0 { x } else { w })
-            })
-            .collect()
-    }
-
-    /// Each layer's relative distance at every position `taps` holds
-    /// against ik's `l_out-L` (`None` where ik kept no row for it).
-    fn layer_table(
-        man: &RefManifest,
-        taps: &[Vec<f32>],
-    ) -> Result<Vec<Vec<Option<f64>>>, GateError> {
-        let row = STREAMS * HIDDEN;
-        let n = taps.len();
-        (0..N_LAYER)
-            .map(|l| {
-                let ik = tap(man, &format!("l_out-{l}"))?;
-                let kept = ik.len() / row;
-                Ok(taps
-                    .iter()
-                    .enumerate()
-                    .map(|(t, ours)| {
-                        let i = (t + kept).checked_sub(n)?;
-                        Some(rel(
-                            &ours[l * row..(l + 1) * row],
-                            &ik[i * row..(i + 1) * row],
-                        ))
-                    })
-                    .collect())
-            })
-            .collect()
-    }
-
-    /// The worst layer and the first of layers `0..held` past the band,
-    /// printed; whether every one of those is inside it.
-    fn print_layers(what: &str, rels: &[(f64, usize)], held: usize) -> bool {
-        for (l, &(e, t)) in rels.iter().enumerate() {
-            if l % 8 == 0 || l == rels.len() - 1 || (l < held && e > FREE_BAND) {
-                println!("{what} layer={l} l_out_rel={e:.3e} at tap {t}");
-            }
-        }
-        match rels.iter().take(held).position(|&(e, _)| e > FREE_BAND) {
-            Some(l) => {
-                println!("{what}: first layer past the band {FREE_BAND:.2}: {l}");
-                false
-            }
-            None => true,
-        }
     }
 
     // ------------------------------------------------ routing and flips
@@ -1109,20 +996,6 @@ mod gate {
 
     // --------------------------------------------------- (c) free
 
-    /// Whether a flip at `(l', t')` lies on the path of layer `l`'s output
-    /// at position `t`: every layer from `l'` on reads it at `t'`, and every
-    /// later position through the mixers' stores.
-    fn on_path(flips: &[Flip], l: usize, t: usize, same_position: bool) -> bool {
-        flips.iter().any(|f| {
-            f.layer <= l
-                && if same_position {
-                    f.token == t
-                } else {
-                    f.token <= t
-                }
-        })
-    }
-
     /// The free clause's verdict, and by position the first layer a flip
     /// lies on the path of ([`N_LAYER`] where none does). The picks come
     /// from the layered run, so the clause is void — a named FAIL — when
@@ -1134,7 +1007,7 @@ mod gate {
         (layered, layered_ok): (&[Vec<ForcedRow>], bool),
         routes: &[Option<IkRoute>],
     ) -> Result<(bool, Vec<usize>), GateError> {
-        let table = layer_table(man, &eager.taps)?;
+        let table = layer_table(man, &eager.taps, STREAMS * HIDDEN, N_LAYER)?;
         for (l, row) in table.iter().enumerate() {
             let cells: Vec<String> = row
                 .iter()
@@ -1154,33 +1027,10 @@ mod gate {
                 flips.extend(flip_at(l, t, route, ik));
             }
         }
-        for f in &flips {
-            println!("{}", f.line("free", FLIP_ERR_CAP));
-        }
-        let flips_ok = flips.iter().all(|f| f.allowed(FLIP_ERR_CAP));
-        let worst_held = |same: bool| -> (f64, usize, usize, usize) {
-            let mut w = (0.0f64, 0usize, 0usize, 0usize);
-            for (l, row) in table.iter().enumerate() {
-                for (t, e) in row.iter().enumerate() {
-                    let Some(e) = *e else { continue };
-                    if on_path(&flips, l, t, same) {
-                        w.3 += 1;
-                    } else if e > w.0 {
-                        (w.0, w.1, w.2) = (e, l, t);
-                    }
-                }
-            }
-            w
-        };
-        let (held, hl, ht, exempt) = worst_held(false);
-        let (same, sl, st, same_exempt) = worst_held(true);
-        let firsts: Vec<usize> = (0..eager.taps.len())
-            .map(|t| {
-                (0..N_LAYER)
-                    .find(|&l| on_path(&flips, l, t, false))
-                    .unwrap_or(N_LAYER)
-            })
-            .collect();
+        let flips_ok = flips_report(&flips, "free", FLIP_ERR_CAP);
+        let (held, hl, ht, exempt) = worst_off_path(&table, &flips, false);
+        let (same, sl, st, same_exempt) = worst_off_path(&table, &flips, true);
+        let firsts = first_flip_layers(&flips, eager.taps.len(), N_LAYER);
         println!(
             "free: the band holds before the first flip on a position's path (any flip at an \
              earlier or equal layer and position); first such layer by position {}; {exempt} \
@@ -1195,13 +1045,9 @@ mod gate {
             "free (same-position path, printed): worst l_out_rel={same:.3e} at layer {sl} \
              position {st}; {same_exempt} outputs past a flip at their own position"
         );
-        let ik = tap(man, "result_output")?;
-        let ik_last = &ik[ik
-            .len()
-            .checked_sub(N_VOCAB)
-            .ok_or("result_output holds no row")?..];
+        let ik_last = ik_last(man, N_VOCAB)?;
         let ours = eager.logits.last().ok_or("no logits")?;
-        let (top, ik_top) = (argmax(ours), argmax(ik_last));
+        let (top, ik_top) = (argmax(ours), argmax(&ik_last));
         if !layered_ok {
             println!(
                 "free: FAIL: void — the layered run is not the chain's ((l) is red), so the \
@@ -1216,67 +1062,13 @@ mod gate {
             eager.tokens.len(),
             flips.len(),
             flips.iter().filter(|f| f.allowed(FLIP_ERR_CAP)).count(),
-            rel(ours, ik_last),
+            rel(ours, &ik_last),
             verdict(ok)
         );
         Ok((ok, firsts))
     }
 
     // ------------------------------------------------ (f) teacher-forced
-
-    /// `‖x̂_ik − x‖ / ‖x‖`: how far ik's 8-bit activation of `x` (q8_2,
-    /// blocks of 32, a bf16 scale) sits from the f32 `x` our kernels read.
-    fn quant_gap(x: &[f32]) -> f64 {
-        let whole = x.len() / ik_q8_2::QK * ik_q8_2::QK;
-        rel(&ik_q8_2::reconstruct(&x[..whole]), &x[..whole])
-    }
-
-    /// The RMS-normed rows of `x` times `gain`, in f64 then rounded: the
-    /// input a mixer's projections read, near enough for its gap.
-    fn normed(x: &[f32], gain: &[f32]) -> Vec<f32> {
-        x.chunks(HIDDEN)
-            .flat_map(|r| {
-                let ms = r.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / HIDDEN as f64;
-                let s = 1.0 / (ms + 1e-6).sqrt();
-                r.iter()
-                    .zip(gain)
-                    .map(move |(&v, &g)| (f64::from(v) * s * f64::from(g)) as f32)
-            })
-            .collect()
-    }
-
-    /// Worst ratio and its tap, over a layer's taps.
-    #[derive(Default)]
-    struct Worst {
-        ratio: f64,
-        tap: String,
-        lines: Vec<String>,
-    }
-
-    impl Worst {
-        fn add(&mut self, tap: &str, e: f64, gap: f64) {
-            let r = e / gap.max(f64::MIN_POSITIVE);
-            let r = if r.is_nan() { f64::INFINITY } else { r };
-            self.lines
-                .push(format!("{tap} rel={e:.3e} gap={gap:.3e} ratio={r:.2}"));
-            if self.tap.is_empty() || r > self.ratio {
-                self.ratio = r;
-                self.tap = tap.to_string();
-            }
-        }
-    }
-
-    /// `rows` of `k` values of `v`, concatenated.
-    fn pick(v: &[f32], k: usize, rows: &[usize]) -> Vec<f32> {
-        rows.iter()
-            .flat_map(|&t| v[t * k..(t + 1) * k].to_vec())
-            .collect()
-    }
-
-    /// `a − b`, value by value.
-    fn minus(a: &[f32], b: &[f32]) -> Vec<f32> {
-        a.iter().zip(b).map(|(&x, &y)| x - y).collect()
-    }
 
     /// One field of every row, concatenated.
     fn cat(rows: &[ForcedRow], f: impl Fn(&ForcedRow) -> &[f32]) -> Vec<f32> {
@@ -1326,7 +1118,7 @@ mod gate {
             let gap_hca = quant_gap(&tap_at(man, &format!("hc_pre-{l}"), 0)?);
             let fold_a = tap(man, &format!("hc_attn_pre-{l}"))?;
             let gain = split_f32(&file, &names::attn_norm(l), HIDDEN)?;
-            let gap_a = quant_gap(&normed(&fold_a, &gain));
+            let gap_a = quant_gap(&normed(&fold_a, &gain, HIDDEN));
             let (y_name, out_name) = match kind.mixer {
                 MixerKind::DeltaRule => ("final_output", "linear_attn_out"),
                 MixerKind::Latent => ("kqv_2d", "kqv_out"),
@@ -1468,11 +1260,6 @@ mod gate {
         Ok((ok, errs))
     }
 
-    /// A set's tap `name`, occurrence `occ`, in its logical order.
-    fn tap_at(man: &RefManifest, name: &str, occ: u32) -> Result<Vec<f32>, GateError> {
-        Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, occ)?)?)
-    }
-
     // --------------------------------------------------- (t) step sets
 
     /// The step of set `name` after its prefill fed by our steps; its
@@ -1487,44 +1274,16 @@ mod gate {
         band: Option<(&[u32], usize)>,
         ties: &mut usize,
     ) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(name), family)?;
-        let (pos, step, prefill) = man.step()?;
-        let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
-        let [tok] = step[..] else {
-            return Err(format!("{name}: a step of {} tokens, not one", step.len()).into());
-        };
-        let held = match band {
-            Some((toks, first)) => {
-                if toks.split_last() != Some((&tok, &prefill[..])) {
-                    return Err(format!(
-                        "{name}: prefill {prefill:?} and step {tok} are not the batch set's {toks:?}"
-                    )
-                    .into());
-                }
-                first
-            }
-            None => 0,
-        };
+        let (man, pos, tok, prefill, held) = set_open((name, family), band)?;
         m.reset()?;
         let t = Instant::now();
         if !prefill.is_empty() {
             m.step(&prefill)?;
         }
         let r = run_last(m, tok)?;
-        let ik = tap(&man, "result_output")?;
-        let ik_last = &ik[ik
-            .len()
-            .checked_sub(N_VOCAB)
-            .ok_or("result_output holds no row")?..];
-        let (top, ik_top) = (argmax(&r.1), argmax(ik_last));
-        let ik_2 = second(ik_last, ik_top);
-        let margin = f64::from(ik_last[ik_top as usize]) - f64::from(ik_last[ik_2 as usize]);
-        let dist = [ik_top, ik_2]
-            .iter()
-            .map(|&i| (f64::from(r.1[i as usize]) - f64::from(ik_last[i as usize])).abs())
-            .fold(0.0, f64::max);
-        let logits_rel = rel(&r.1, ik_last);
-        let rels = layer_rels(&man, std::slice::from_ref(&r.0))?;
+        let ik_last = ik_last(&man, N_VOCAB)?;
+        let (top, ik_top, ik_2, margin, dist, logits_rel) = tie_numbers(&r.1, &ik_last);
+        let rels = layer_rels(&man, std::slice::from_ref(&r.0), STREAMS * HIDDEN, N_LAYER)?;
         let input_rel = rels.last().map_or(f64::INFINITY, |r| r.0);
         let tie = tie_allowed(
             (top, ik_top, ik_2),
@@ -1533,7 +1292,7 @@ mod gate {
             HEAD_RATIO,
         );
         *ties += usize::from(tie);
-        let inside = print_layers(name, &rels, held);
+        let inside = print_layers(name, &rels, held, FREE_BAND);
         let ok = (top == ik_top || tie) && inside;
         println!(
             "step {name}: logits digest {:016x} (FNV-1a over the f32 bits)",
@@ -2496,24 +2255,6 @@ mod gate {
         Ok(b_back && a_on)
     }
 
-    /// A slot clause's verdict, an error it ended in printed as its FAIL
-    /// rather than ending the gate.
-    fn clause(what: &str, r: Result<bool, GateError>) -> bool {
-        r.unwrap_or_else(|e| {
-            println!("slots {what}: ended in error \"{e}\" {}", verdict(false));
-            false
-        })
-    }
-
-    /// A slot clause's verdict with its elapsed line: the work timed inside
-    /// the closure, then [`clause`]'s FAIL line when it ended in one.
-    fn clause_timed(what: &str, body: impl FnOnce() -> Result<bool, GateError>) -> bool {
-        let t = Instant::now();
-        let r = body();
-        elapsed(what, &t);
-        clause(what, r)
-    }
-
     /// The (slots) clauses (the module header): the harness's contracts and
     /// the body's own between them on one load, then (sd) and (s3) on a load
     /// of their own.
@@ -2536,9 +2277,9 @@ mod gate {
         let t = Instant::now();
         let mut s = slots_gate::interleave(&body)?;
         elapsed("(slots) harness open (H1, H3, H6, H7)", &t);
-        let mut ok = clause_timed("(sp) plan", || slots_plan(&body, s.model()));
-        ok &= clause_timed("(sc) cut", || slots_cut(&mut s, &body));
-        ok &= clause_timed("(g5) on the NextN load", || g5_nextn(s.model()));
+        let mut ok = clause_timed("slots", "(sp) plan", || slots_plan(&body, s.model()));
+        ok &= clause_timed("slots", "(sc) cut", || slots_cut(&mut s, &body));
+        ok &= clause_timed("slots", "(g5) on the NextN load", || g5_nextn(s.model()));
         let t = Instant::now();
         ok &= s.finish()?;
         elapsed("(slots) harness finish (H4, H5, H5R)", &t);
@@ -2569,7 +2310,7 @@ mod gate {
         match sd {
             Ok((sd, runs)) => {
                 ok &= sd;
-                ok &= clause_timed("(s3) park/resume", || {
+                ok &= clause_timed("slots", "(s3) park/resume", || {
                     slots_resume(
                         &mut s,
                         &mut spec,
@@ -2581,8 +2322,12 @@ mod gate {
                 });
             }
             Err(e) => {
-                ok &= clause("(sd) drafted", Err(e));
-                ok &= clause("(s3) park/resume", Err("(sd) drafted ended first".into()));
+                ok &= clause("slots", "(sd) drafted", Err(e));
+                ok &= clause(
+                    "slots",
+                    "(s3) park/resume",
+                    Err("(sd) drafted ended first".into()),
+                );
             }
         }
         // The stagger's loads hold the card next: the drafted load goes first.
@@ -2884,11 +2629,6 @@ mod gate {
         Ok(m)
     }
 
-    /// Whether `r` is `what`'s shape refusal whose words hold `says`.
-    fn refused_by<T>(r: &Result<T, GpuError>, what: &str, says: &str) -> bool {
-        matches!(r, Err(GpuError::Shape { what: w, detail }) if *w == what && detail.contains(says))
-    }
-
     /// (g1)-(g5) on their two loads (module doc): the one-lane load's, then
     /// the two-lane load's (g4).
     fn stagger(
@@ -2917,25 +2657,31 @@ mod gate {
                 Ok((bits, runs)) => {
                     ok &= bits;
                     if mode == StepMode::Graph {
-                        ok &= clause_timed("(g2) cut", || g2_cut(&mut m, (a, b), runs, (&sa, &sb)));
+                        ok &= clause_timed("slots", "(g2) cut", || {
+                            g2_cut(&mut m, (a, b), runs, (&sa, &sb))
+                        });
                     }
                 }
                 Err(e) => {
-                    ok &= clause(&format!("(g1) bits {mode:?}"), Err(e));
+                    ok &= clause("slots", &format!("(g1) bits {mode:?}"), Err(e));
                     if mode == StepMode::Graph {
-                        ok &= clause("(g2) cut", Err("(g1) ended first".into()));
+                        ok &= clause("slots", "(g2) cut", Err("(g1) ended first".into()));
                     }
                 }
             }
-            ok &= clause_timed(&format!("(g1b) parked {mode:?}"), || {
+            ok &= clause_timed("slots", &format!("(g1b) parked {mode:?}"), || {
                 g1b_parked(&mut m, (a, b), (&sa, &sb), mode)
             });
         }
         m.set_mode(StepMode::Graph);
-        ok &= clause_timed("(g3) fault", || g3_fault(&mut m, (a, b), (&sa, &sb)));
-        ok &= clause_timed("(g5) refusals", || g5_refusals(&mut m, inputs, (a, b)));
+        ok &= clause_timed("slots", "(g3) fault", || {
+            g3_fault(&mut m, (a, b), (&sa, &sb))
+        });
+        ok &= clause_timed("slots", "(g5) refusals", || {
+            g5_refusals(&mut m, inputs, (a, b))
+        });
         drop(m);
-        ok &= clause_timed("(g4) walk", || g4_walk(levers, inputs, (a, b)));
+        ok &= clause_timed("slots", "(g4) walk", || g4_walk(levers, inputs, (a, b)));
         Ok(ok)
     }
 
@@ -3743,20 +3489,6 @@ mod gate {
         Ok(pass)
     }
 
-    /// Whether `r` is `what`'s shape refusal whose words hold every one of
-    /// `says`.
-    fn refused_saying<T>(r: &Result<T, GpuError>, what: &str, says: &[&str]) -> bool {
-        says.iter().all(|s| refused_by(r, what, s))
-    }
-
-    /// A refusal's text for a line: the error, or that the call ran.
-    fn outcome<T>(r: &Result<T, GpuError>) -> String {
-        match r {
-            Ok(_) => "ran".to_string(),
-            Err(e) => format!("\"{e}\""),
-        }
-    }
-
     /// An (h3) arm's pass: the model's outcome, inside the arm's own setup's.
     type HPass = Result<Result<SlotsOut, GpuError>, GateError>;
 
@@ -4143,13 +3875,13 @@ mod gate {
         elapsed("(h) solo runs", &t);
         let mut ok = true;
         for mode in [StepMode::Graph, StepMode::Eager] {
-            ok &= clause_timed(&format!("(h1) interleave {mode:?}"), || {
+            ok &= clause_timed("slots", &format!("(h1) interleave {mode:?}"), || {
                 h1_bits(s, (a, b), &solos, mode)
             });
         }
-        ok &= clause_timed("(h2) forced keeps", || h2_kept(s, (a, b)));
-        ok &= clause_timed("(h3) refusals", || h3_refusals(s, inputs, (a, b)));
-        ok &= clause_timed("(h4) walk", || h4_walk(s, (a, b)));
+        ok &= clause_timed("slots", "(h2) forced keeps", || h2_kept(s, (a, b)));
+        ok &= clause_timed("slots", "(h3) refusals", || h3_refusals(s, inputs, (a, b)));
+        ok &= clause_timed("slots", "(h4) walk", || h4_walk(s, (a, b)));
         Ok(ok)
     }
 
@@ -4212,10 +3944,9 @@ mod gate {
     /// `--step-sets short|long|all`, `all` when absent; refused beside an
     /// `--only` that runs no load at [`CTX`]'s clauses.
     fn step_sets(only: Only) -> Result<StepSets, GateError> {
-        let args: Vec<String> = std::env::args().collect();
-        let sets = match args.iter().position(|a| a == "--step-sets") {
+        let sets = match word_after("--step-sets") {
             None => return Ok(StepSets::All),
-            Some(i) => match args.get(i + 1).map(String::as_str) {
+            Some(w) => match w.as_deref() {
                 Some("all") => StepSets::All,
                 Some("short") => StepSets::Short,
                 Some("long") => StepSets::Long,
@@ -4238,10 +3969,9 @@ mod gate {
     /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`, or
     /// every clause.
     fn only() -> Result<Only, GateError> {
-        let args: Vec<String> = std::env::args().collect();
-        match args.iter().position(|a| a == "--only") {
+        match word_after("--only") {
             None => Ok(Only::All),
-            Some(i) => match args.get(i + 1).map(String::as_str) {
+            Some(w) => match w.as_deref() {
                 Some("main") => Ok(Only::Main),
                 Some("pp") => Ok(Only::Pp),
                 Some("pplong") => Ok(Only::PpLong),
