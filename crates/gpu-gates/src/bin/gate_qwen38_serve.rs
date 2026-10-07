@@ -34,6 +34,15 @@
 //!   deltas concatenate to the non-streamed content, and the stream ends with
 //!   `data: [DONE]`;
 //! - `/tokenize` of `--prompt` is `--ids`;
+//! - the `xstream=` line ([`xstream_agrees`]) of this server, the residency
+//!   clause's and the slots clause's second: the unset `BLOOMERY_XSTREAM`
+//!   rule, stated here apart from the seat's resolver — `off` at `--place
+//!   gate` (the first two, residency off and on), `split` at `--place a`
+//!   with the adaptive residency (the third, the user's case; `admit` only
+//!   with the ring's room refusal named on the line). FAIL-first mutants:
+//!   the seat resolving no stream prints no line, red on all three; the
+//!   seat handing the rule `--place gate`'s stage, or no residency, prints
+//!   `off` on the third, red there;
 //! - the positions the server serves: `/props`' `n_ctx` is the context it
 //!   was started at; a prompt of that many ids is a 400
 //!   (`exceed_context_size_error`, naming it) and the server stays up;
@@ -235,8 +244,9 @@
 //! server `off`) and `BLOOMERY_RESIDENCY` (`off`, the residency clause's
 //! word there) — the slots clause's second server alone sets neither: it is
 //! the seat under its own defaults (the user's case).
-//! `BLOOMERY_RESIDENCY` set in this binary's environment is
-//! refused by name.
+//! `BLOOMERY_RESIDENCY` and `BLOOMERY_XSTREAM` set in this binary's
+//! environment are refused by name: every server holds the unset
+//! `xstream=` rule.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -263,6 +273,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
+    use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
@@ -298,6 +309,7 @@ mod gate {
         bloomery_levers::MTP_DRAFT,
         bloomery_levers::MTP_WIDTH,
         bloomery_levers::RESIDENCY,
+        bloomery_levers::XSTREAM,
     ];
 
     const USAGE: &str = "usage: gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text> \
@@ -1205,6 +1217,41 @@ mod gate {
             .map(str::to_owned))
     }
 
+    /// The seat's `xstream=` line against the unset rule (the module
+    /// header), stated here apart from the seat's resolver: at `--place a`
+    /// (`place_a`) with the residency the server's `residency` records name
+    /// running, `split` (`admit` only with the ring's room refusal named);
+    /// at `--place gate` or with none, `off`. Each why is the line's own.
+    fn xstream_agrees(err_log: &Path, place_a: bool) -> Result<bool, GateError> {
+        let Some(line) = std::fs::read_to_string(err_log)?
+            .lines()
+            .find(|l| l.starts_with("xstream="))
+            .map(str::to_owned)
+        else {
+            println!("the server printed no `xstream=` line");
+            return Ok(false);
+        };
+        let log = seat_log(err_log)?;
+        let residency = match log.first(&record::RESIDENCY_UNSET)? {
+            Some(r) => r.word("residency")?.to_owned(),
+            None => log
+                .one(&record::RESIDENCY_LEVER)?
+                .word("residency")?
+                .to_owned(),
+        };
+        let word = line["xstream=".len()..].split(' ').next().unwrap_or("");
+        let agrees = match (place_a && residency != "off", word) {
+            (true, "split") => line.ends_with("(unset: --place a with a residency)"),
+            (true, "admit") => {
+                line.contains("(unset: split has no room: ") && line.contains(XSTREAM_ROOM)
+            }
+            (false, "off") => line.ends_with("(unset: no residency or not --place a)"),
+            _ => false,
+        };
+        println!("{line} (residency {residency}, --place a {place_a}): agrees {agrees}");
+        Ok(agrees)
+    }
+
     /// The `residency` clause (the module header): a server under
     /// [`RESIDENCY_WORD`], started alone once the others have stopped,
     /// serves `completion`, its reset is a 200 with its record, and
@@ -1238,6 +1285,11 @@ mod gate {
             &mut ok,
             "residency_loads_the_word",
             lever_word == word && why == "set" && host_word == word,
+        );
+        check(
+            &mut ok,
+            "residency_xstream_line_is_the_unset_rules",
+            xstream_agrees(&err_log, false)?,
         );
         let (st, body) = curl(&url("/completion"), Some(completion), false)?;
         let ids = ids_of(&json_of("/completion", st, &body)?["tokens"]);
@@ -2087,6 +2139,11 @@ mod gate {
             ok,
             "slots_default_parallel_line_names_the_rule",
             line.contains("rule=slots") && parallel_agrees(&line, Some(2)) == Some(true),
+        );
+        check(
+            ok,
+            "slots_default_xstream_line_is_the_unset_rules",
+            xstream_agrees(&err_log, true)?,
         );
         let (a_ids, b_ids) = (
             rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
@@ -3033,6 +3090,13 @@ mod gate {
             )
             .into());
         }
+        if let Some(word) = levers.xstream() {
+            return Err(format!(
+                "BLOOMERY_XSTREAM={word}: the gate holds its servers' `xstream=` lines to the \
+                 unset rule"
+            )
+            .into());
+        }
         let a = parse_args()?;
         let reference = gen_tokens(&a.gen_log)?;
         std::fs::create_dir_all(&a.dir)?;
@@ -3072,6 +3136,11 @@ mod gate {
              {usable}"
         );
         check(&mut ok, "plan_names_the_cards_free_bytes", free_named);
+        check(
+            &mut ok,
+            "xstream_line_is_the_unset_rules",
+            xstream_agrees(&err_log, false)?,
+        );
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
