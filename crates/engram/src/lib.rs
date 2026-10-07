@@ -53,10 +53,13 @@ use std::path::{Path, PathBuf};
 use gguf::{Inventory, LoadError, RawTensorInfo, ggml_type_info, inventory_of};
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 
+pub mod direct;
 pub mod hash;
 pub mod prefetch;
 pub mod rows;
 
+pub use direct::DIRECT_ALIGN;
+pub use direct::open_direct;
 pub use hash::Hash;
 
 /// The tensor one engram site lives in. The block index is metadata, so this is
@@ -137,6 +140,37 @@ pub enum EngramError {
     #[error("{path}: opening for direct reads: {source}")]
     OpenDirect {
         path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(
+        "{path}: the direct-read probe of its first block: {source}: the mount does not take \
+         O_DIRECT reads"
+    )]
+    DirectProbe {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path}: a direct read of {len} B at {at}: {source}")]
+    DirectRead {
+        path: PathBuf,
+        at: u64,
+        len: usize,
+        source: std::io::Error,
+    },
+    #[error(
+        "{path}: a direct read of {len} B at {at}: the buffer, the offset and the length must \
+         each be a multiple of {DIRECT_ALIGN}"
+    )]
+    DirectUnaligned { path: PathBuf, at: u64, len: usize },
+    #[error("the anonymous mapping of {bytes} B: {source}")]
+    AnonMap {
+        bytes: usize,
+        source: std::io::Error,
+    },
+    #[error("returning the anonymous mapping's {len} B at {at}: {source}")]
+    AnonMapAdvise {
+        at: usize,
+        len: usize,
         source: std::io::Error,
     },
     #[error("{name}: row length {ne0} is not a multiple of its type's block ({block})")]
@@ -512,27 +546,6 @@ fn fadvise_dontneed(file: &File, at: usize, len: usize) -> Result<(), std::io::E
     } else {
         Err(std::io::Error::from_raw_os_error(rc))
     }
-}
-
-/// The alignment `O_DIRECT` reads keep: the buffer's address, the file
-/// offset and the length are each a multiple of it (a drive's logical block
-/// is 512 B or 4 KiB; this holds for both).
-pub const DIRECT_ALIGN: usize = 4096;
-
-/// `path` opened for reads that bypass the page cache (`O_DIRECT`). Every
-/// read through the handle takes a buffer, a file offset and a length that
-/// are multiples of [`DIRECT_ALIGN`]; the kernel refuses any other with
-/// `EINVAL`.
-pub fn open_direct(path: &Path) -> Result<File, EngramError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-        .map_err(|source| EngramError::OpenDirect {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 /// Pages one `mincore` call covers.

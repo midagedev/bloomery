@@ -703,6 +703,7 @@ fn layer_unit(model: &ModelTensors, layer: usize) -> u64 {
 struct NvmeArm {
     old_need: u64,
     room: u64,
+    arena: u64,
     moved: u64,
     r_min: u64,
     r_max: u64,
@@ -734,20 +735,39 @@ fn nvme_arm(room: u64) -> NvmeArm {
     assert_eq!(split.host.table_bytes, 0);
     assert_eq!(split.host.row_reserve_bytes, ROW_ROOM);
 
+    // The split dial's own terms, from the unsplit plan's bytes: the floor,
+    // then the arena it picks for this room, which the plan states.
+    let layer_bytes = (0..LAYERS)
+        .map(|l| layer_split(&twin, l).2)
+        .max()
+        .expect("layers");
+    let base = HostNeed {
+        experts: 0,
+        ..HostNeed::of(&twin, 0)
+    }
+    .bytes();
+    let floor = base + 3 * layer_bytes;
+    let arena = super::nvme_arena_of(room, twin.host.expert_bytes, floor, None)
+        .expect("the dial's default");
+    assert_eq!(
+        split.host.nvme_arena_bytes, arena,
+        "the plan states the arena the dial chose"
+    );
+
     let need = HostNeed::of(&split, 0).bytes();
     let moved = split.host.nvme_expert_bytes;
-    let overflow = old_need - room;
+    let overflow = old_need - (room - arena);
     let max_unit = (0..LAYERS)
         .map(|l| layer_unit(&q4, l))
         .max()
         .expect("layers");
     assert!(need <= room, "need {need} B passes the room {room} B");
     assert_eq!(need + moved, old_need);
-    // The NVMe segments are the overflow, to within the one expert a layer's
-    // whole experts leave.
+    // The NVMe segments are the overflow the arena grew, to within the one
+    // expert a layer's whole experts leave.
     assert!(
         overflow <= moved && moved < overflow + max_unit,
-        "moved {moved} B for an overflow of {overflow} B"
+        "moved {moved} B for an overflow of {overflow} B (arena {arena} B)"
     );
 
     // Every expert once, the host's ids before the NVMe's; the sums of the
@@ -815,48 +835,73 @@ fn nvme_arm(room: u64) -> NvmeArm {
 
     // The floor, from the unsplit plan's own bytes: the host terms beside
     // the routed experts, and three of the heaviest layer's host-served
-    // experts.
-    let layer_bytes = (0..LAYERS)
-        .map(|l| layer_split(&twin, l).2)
-        .max()
-        .expect("layers");
-    let base = HostNeed {
-        experts: 0,
-        ..HostNeed::of(&twin, 0)
-    }
-    .bytes();
+    // experts — the terms the dial's arena leaves over it.
     let arm = NvmeArm {
         old_need,
         room,
+        arena,
         moved,
         r_min,
         r_max,
         host_bytes: split.host.expert_bytes,
-        floor: base + 3 * layer_bytes,
+        floor,
         max_unit,
     };
     println!(
-        "room {} B | old need {} B | host experts {} B | NVMe experts {} B | PLE NVMe | r_l {}..{} | floor {} B",
-        arm.room, arm.old_need, arm.host_bytes, arm.moved, arm.r_min, arm.r_max, arm.floor
+        "room {} B | old need {} B | arena {} B | host experts {} B | NVMe experts {} B | PLE NVMe | r_l {}..{} | floor {} B",
+        arm.room,
+        arm.old_need,
+        arm.arena,
+        arm.host_bytes,
+        arm.moved,
+        arm.r_min,
+        arm.r_max,
+        arm.floor
     );
     arm
 }
 
 /// A host of 27 GiB (a 32 GB machine's room): the PLE table on the NVMe
-/// tier first, then each layer's host experts split between the host and the
-/// NVMe tier by the overflow.
+/// tier first, then the split dial gives the tier the largest arena the room
+/// leaves above the floor, and each layer's host experts split between the
+/// host and the NVMe tier by the overflow the arena grew.
 #[test]
 fn a_27_gib_room_puts_the_overflow_on_the_nvme_tier() {
     let arm = nvme_arm(27 << 30);
     assert!(arm.moved > 0 && arm.r_min > 0 && arm.r_max < EXPERTS);
+    // The deep split: the room cannot hold half the host leg, so the arena
+    // takes what the floor leaves — and the host segments shrink to it.
+    assert!(arm.arena > 0, "the dial gives the deep split an arena");
+    assert_eq!(arm.arena, arm.room - arm.floor);
+
+    // On the paged plan the unset residency rule resolves mid with no churn
+    // pool: the arena serves the victims (residency38's paged branch).
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let split = plan_at(&q4, &gate, 4096, 1, 27 << 30).expect("the split plan");
+    let pick = residency38_at_plan(
+        split.n_l.iter().copied(),
+        split.host.experts,
+        |_: usize| -> Result<u64, PlacementError> { Ok(0) },
+        split.host.headroom_bytes,
+        i128::MAX,
+    )
+    .expect("the paged plan's rule");
+    assert_eq!(
+        (pick.pinned, pick.word()),
+        (Some(0), "mid-p0-s1".to_string()),
+        "a paged plan's unset rule is mid with no churn pool"
+    );
 }
 
-/// A host of 58 GiB (a 64 GB machine's room): the same rule, a smaller
-/// overflow.
+/// A host of 58 GiB (a 64 GB machine's room): the room covers over half the
+/// host leg, so the dial keeps R1's split — no arena — and the overflow is
+/// the smaller one.
 #[test]
 fn a_58_gib_room_puts_the_overflow_on_the_nvme_tier() {
     let big = nvme_arm(58 << 30);
     let small = nvme_arm(27 << 30);
+    assert_eq!(big.arena, 0, "the dial keeps R1's split on a wide room");
+    assert!(small.arena > 0);
     assert!(0 < big.moved && big.moved < small.moved);
     assert!(big.r_min > small.r_max);
 }
@@ -904,6 +949,45 @@ fn a_room_under_the_floor_is_refused_by_name() {
     let at = nvme_arm(arm.floor);
     assert!(at.r_min <= at.r_max && at.moved > 0);
     assert!(at.max_unit > 0);
+}
+
+/// The split dial's own rule ([`super::nvme_arena_of`]): the default is the
+/// largest arena the room leaves above the floor on a room that cannot hold
+/// half the host leg's bytes, 0 on one that covers it; a value the lever
+/// gives is taken as it is and one that pushes the host segments under the
+/// floor is refused by name, with the room, the floor and the value.
+#[test]
+fn the_split_dial_picks_its_arena_or_refuses_a_too_large_one() {
+    use super::nvme_arena_of;
+    let of = |room, held, floor, given| {
+        nvme_arena_of(room, held, floor, given).expect("the dial picks an arena")
+    };
+    let (room, held, floor) = (27 << 30, 63_166_000_000u64, 5_560_000_000);
+    // The default: the deep split takes the largest arena that fits.
+    assert_eq!(of(room, held, floor, None), room - floor);
+    // A room that covers over half the host leg keeps R1's split.
+    assert_eq!(of(58 << 30, held, floor, None), 0);
+    // The boundary itself: exactly half the host leg takes no arena.
+    assert_eq!(of(held / 2, held, floor, None), 0);
+    assert_eq!(of(held / 2 - 1, held, floor, None), held / 2 - 1 - floor);
+    // A given arena is taken as it is, up to the largest that fits.
+    assert_eq!(of(room, held, floor, Some(1 << 30)), 1 << 30);
+    assert_eq!(of(room, held, floor, Some(room - floor)), room - floor);
+    // One that pushes the host segments under the floor is refused by name.
+    match nvme_arena_of(room, held, floor, Some(room - floor + 1)) {
+        Err(PlacementError::NvTierArena {
+            arena,
+            room: r,
+            floor: f,
+        }) => {
+            assert_eq!((arena, r, f), (room - floor + 1, room, floor));
+        }
+        other => panic!("not refused by name: {:?}", other),
+    }
+    let msg = nvme_arena_of(room, held, floor, Some(u64::MAX))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains(&room.to_string()) && msg.contains(&floor.to_string()));
 }
 
 /// `BLOOMERY_HOST_ROOM`'s reading: a set value is a room the caller gave; an

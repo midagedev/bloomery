@@ -51,9 +51,7 @@
 //! layer, an `--range-from` past the experts) is a named error.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -62,8 +60,9 @@ use std::time::Instant;
 
 use bloomery_gpu_gates::record::{self, NVREAD, PROBE_NVREAD, Record};
 use bloomery_gpu_gates::{GateError, exit_with, ref_model_path};
+use engram::RowTable;
+use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
 use engram::rows::{PageAdvice, SplitTable};
-use engram::{DIRECT_ALIGN, RowTable, open_direct};
 use gguf::Split;
 
 /// The `general.architecture` the probe reads.
@@ -359,18 +358,9 @@ struct Read {
     need: usize,
 }
 
-/// The aligned read of `len` bytes at `at`: the start rounded down to the
-/// alignment, the span to the end rounded up, and the bytes from the start
-/// through the part's last byte.
-fn aligned_span(at: u64, len: u64) -> (u64, usize, usize) {
-    let a = DIRECT_ALIGN as u64;
-    let start = at / a * a;
-    let end = (at + len).div_ceil(a) * a;
-    (start, (end - start) as usize, (at + len - start) as usize)
-}
-
-/// `r` read into the aligned part of `scratch`, which grows to hold it.
-fn read_direct(file: &File, r: &Read, scratch: &mut Vec<u8>) -> Result<(), String> {
+/// `r` read into the aligned part of `scratch`, which grows to hold it, by
+/// the one direct reader (`engram::direct::DirectFile::read_span`).
+fn read_direct(file: &DirectFile, r: &Read, scratch: &mut Vec<u8>) -> Result<(), String> {
     let want = r.span + DIRECT_ALIGN;
     if scratch.len() < want {
         scratch.resize(want, 0);
@@ -382,20 +372,12 @@ fn read_direct(file: &File, r: &Read, scratch: &mut Vec<u8>) -> Result<(), Strin
         ));
     }
     let buf = &mut scratch[off..off + r.span];
-    if !(buf.as_ptr() as usize).is_multiple_of(DIRECT_ALIGN)
-        || !r.start.is_multiple_of(DIRECT_ALIGN as u64)
-    {
-        return Err(format!(
-            "an O_DIRECT read needs the buffer and the file offset {} aligned to {DIRECT_ALIGN}",
-            r.start
-        ));
-    }
     let n = file
-        .read_at(buf, r.start)
-        .map_err(|e| format!("pread {} B at {}: {e}", r.span, r.start))?;
+        .read_span(buf, r.start)
+        .map_err(|e| format!("{}: {e}", file.path().display()))?;
     if n < r.need {
         return Err(format!(
-            "short pread at {}: {n} B of the {} B the part needs",
+            "short read at {}: {n} B of the {} B the part needs",
             r.start, r.need
         ));
     }
@@ -463,8 +445,8 @@ struct Sample {
 struct Rig {
     /// Layer `l`'s stacks are tables `3 l ..= 3 l + 2`, in [`STACKS`] order.
     tables: Arc<Vec<SplitTable>>,
-    /// Each table's shard, opened `O_DIRECT`.
-    files: Arc<Vec<Arc<File>>>,
+    /// Each table's shard, opened `O_DIRECT` (the reader's own handle).
+    files: Arc<Vec<Arc<DirectFile>>>,
     pool: Pool,
     /// The single-thread arm's buffer.
     scratch: Vec<u8>,
@@ -508,13 +490,13 @@ impl Rig {
                 tables.push(t);
             }
         }
-        let mut handles: HashMap<PathBuf, Arc<File>> = HashMap::new();
+        let mut handles: HashMap<PathBuf, Arc<DirectFile>> = HashMap::new();
         let mut files = Vec::with_capacity(tables.len());
         for t in &tables {
             let f = match handles.get(t.path()) {
                 Some(f) => Arc::clone(f),
                 None => {
-                    let f = Arc::new(open_direct(t.path())?);
+                    let f = Arc::new(DirectFile::open(t.path())?);
                     handles.insert(t.path().to_path_buf(), Arc::clone(&f));
                     f
                 }

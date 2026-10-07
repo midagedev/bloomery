@@ -1555,6 +1555,18 @@ gate-gpu-ds41-chat:
 weekly-gpu-ds41-serve:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41,vision --release --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && bash tools/gpu-gate.sh gate_ds41_serve --mmproj --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
 
+# nvtier R2의 게이트: 페이지드 계획(방 27 GiB — 분할 다이얼이 아레나를 준다)의 NVMe 전문가 티어 램 아레나를
+# 상주 전 계획과 같은 파일에서 적재해, 설계 §7의 조항들을 본다 — 비트 동일성(512 프롬프트 + 96 탐욕 스텝),
+# 아레나의 계수(미스·채움·축출 > 0, 상주 바이트 ≤ 예산, 버퍼드 읽기 0), --audit의 슬롯 대 pread memcmp,
+# 이름 붙은 거부(바닥, 직독 탐침, 한 슬롯 못 되는 예산), 그리고 레지던시 조항(풀 0의 mid, unresident·faulting 0).
+# 아레나가 모델 매핑을 결코 advise하지 않음을 조항이 지킨다(gate_nvtier.rs의 advice_disjoint). 2026-10-08에
+# 페이지드 티어의 두 이름 붙은 거부(HOST_LOCK 병행, r8 상주 사본)를 뺐다 — 커버리지 변경, 게이트 머리말에 근거.
+# 게이트 본체는 R2b(body38의 티어 build가 붙는 자리)까지 끝까지 안 돈다: 이 라운드는 컴파일과 순수 조력기 시험.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-nvtier:
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && bash tools/gpu-gate.sh gate_nvtier'
+
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice
 # with flips landed, every admitted slot byte for byte a static load's, the passes' kinds and kept rows (the prompt one

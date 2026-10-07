@@ -347,6 +347,10 @@ name = "gate_hybrid"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_nvtier"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_swap"
 required-features = ["gpu"]
 

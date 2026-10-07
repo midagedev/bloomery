@@ -39,6 +39,7 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
+use crate::host::run::NvTier;
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
@@ -1674,6 +1675,39 @@ fn launch_served<B: ChainBody>(
 /// bytes) beside it. The pieces, and the host set. Every placed load passes
 /// here, so the two refusals before any upload are made once: a plan's card
 /// that is not one visible device ([`Gpu::open_card`]), and a
+/// The NVMe expert tier of a paged load, the common chain's one build
+/// every family's host run attaches
+/// ([`HostRun::attach_tier`](crate::host::run::HostRun::attach_tier)):
+/// the arena the split dial reserved (`HostTotals::nvme_arena_bytes`)
+/// over `file`'s shards, read `O_DIRECT` or — the lever's fallback —
+/// through the page cache ([`bloomery_levers::nvtier_levers`]). `None`
+/// on a plan that pages no routed expert or reserved no arena: the host
+/// leg reads the file mapping as it stands. Refused by name: a load
+/// whose r8 pair reads a sidecar while the plan pages routed experts —
+/// the slot's bytes follow the sidecar resolution, which the tier does
+/// not carry yet.
+pub fn nvme_tier(
+    plan: &Plan<'_>,
+    file: &Arc<Split>,
+    r8: bool,
+) -> Result<Option<Arc<NvTier>>, GpuError> {
+    const WHAT: &str = "GpuModel::nvme_tier";
+    if plan.host.nvme_expert_bytes == 0 {
+        return Ok(None);
+    }
+    let levers = bloomery_levers::nvtier_levers().map_err(|e| GpuError::plan(WHAT, e))?;
+    let pair = model::r8file::R8Pair::at_load(Arc::clone(file), r8)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+    if pair.source().sidecar().is_some() {
+        return Err(GpuError::shape(
+            WHAT,
+            "a paged plan under an r8 pair that reads a sidecar: the NVMe tier's slots follow \
+             the sidecar's bytes, which the tier does not fill from yet",
+        ));
+    }
+    NvTier::of_paged(plan, file, levers.direct).map(|t| t.map(Arc::new))
+}
+
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
     file: &Split,

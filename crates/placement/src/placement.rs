@@ -787,6 +787,13 @@ pub struct HostTotals {
     /// ([`expert_nvme_tier`]); 0 when the host holds them all. Inside
     /// [`Plan::nvme_bytes`], outside [`HostTotals::expert_bytes`].
     pub nvme_expert_bytes: u64,
+    /// The RAM arena the NVMe expert tier fills for the experts
+    /// [`HostTotals::nvme_expert_bytes`] counts — the split dial's choice
+    /// for this plan's room ([`nvme_arena_of`]): the largest arena the room
+    /// leaves above the tier's floor on a room that must move over half the
+    /// host leg's bytes, else 0. Beside the plan's own bytes: the arena is
+    /// the tier's memory, not a segment.
+    pub nvme_arena_bytes: u64,
     /// Row-gathered tables held on the host.
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
@@ -880,6 +887,14 @@ pub enum PlacementError {
         layer: u64,
         need: u64,
     },
+    /// An arena the lever `BLOOMERY_NVTIER_BYTES` names that the room cannot
+    /// take: the host segments it leaves fall under the NVMe expert tier's
+    /// floor.
+    #[error(
+        "the NVMe tier's arena {arena} B leaves the host room {room} B under its floor {floor} B \
+         (the arena takes at most room − floor): lower the arena, or free host memory"
+    )]
+    NvTierArena { arena: u64, room: u64, floor: u64 },
     /// A routed stack's expert on two cards at once, by their index in
     /// [`Machine::all_cards`]: an expert lives on one device.
     #[error("tensor {tensor}: expert {expert} is on card #{first} and on card #{second}")]
@@ -2445,11 +2460,37 @@ impl HostLayer {
 /// its two layers of transient reads from the room beside the plan's need
 /// ([`PlacementError::HostRoomFloor`] keeps the room for them).
 ///
+/// The arena bytes the split dial gives this plan's room: the lever
+/// `BLOOMERY_NVTIER_BYTES` (`given`) when set — refused by name where it
+/// pushes the host segments the room leaves under the tier's `floor` — else
+/// the largest arena the room leaves above the floor (`room − floor`) when
+/// the room cannot hold half the host leg's `held` routed-expert bytes (a
+/// deep split: the prompt is NVMe-bound either way, so prefill loses little
+/// while decode's warm set doubles), else 0 (a room that covers the host
+/// leg: the split keeps every host expert it can and the arena is the
+/// lever's alone). The one owner of the arena's bytes; the plan states what
+/// it chose in [`HostTotals::nvme_arena_bytes`].
+pub fn nvme_arena_of(
+    room: u64,
+    held: u64,
+    floor: u64,
+    given: Option<u64>,
+) -> Result<u64, PlacementError> {
+    let max = room - floor;
+    match given {
+        Some(arena) if arena > max => Err(PlacementError::NvTierArena { arena, room, floor }),
+        Some(arena) => Ok(arena),
+        None => Ok(u64::from(room < held / 2) * max),
+    }
+}
+
 /// The floor is `base + 3 W`: `base` the need with no routed expert on the
-/// host, `W` the host bytes of the layer with the most — two layers' reads
-/// of the NVMe tier and one layer's resident experts beside the other
-/// terms. A room under it is refused by name; the plan's `host.experts`
-/// counts the experts the host leg serves, on either tier.
+/// host, `W` the host bytes of the layer with the most — the room's host
+/// terms beside the routed experts hold `1 W` of host-served expert
+/// segments, `2 W` of the prompt run-ahead's page-cache window and the RAM
+/// arena [`nvme_arena_of`] picks: `1 W + 2 W + arena = room − base − 3 W` at
+/// the largest arena. A room under it is refused by name; the plan's
+/// `host.experts` counts the experts the host leg serves, on either tier.
 pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
@@ -2464,7 +2505,8 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
         return Err(PlacementError::tensor(
             &model.tensors[r.tensor],
             format!(
-                "the host need {} B passes the room {room} B with a row-gathered table still on                  the host: row_table_tier places it on the NVMe tier first",
+                "the host need {} B passes the room {room} B with a row-gathered table still on \
+                 the host: row_table_tier places it on the NVMe tier first",
                 need.bytes()
             ),
         ));
@@ -2543,9 +2585,17 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
             need: need.bytes(),
         });
     }
+    // The split dial: the arena's bytes come out of the host segments the
+    // room holds, the split running on the room that remains.
+    let held = plan.host.expert_bytes;
+    let given = bloomery_levers::nvtier_levers()
+        .map_err(|e| PlacementError::HostRoom(format!("BLOOMERY_NVTIER_BYTES: {e}")))?
+        .bytes;
+    let arena = nvme_arena_of(room, held, floor, given)?;
+    let room = room - arena;
+    plan.host.nvme_arena_bytes = arena;
     // The host keeps `keep` of its `held` expert bytes; the floor leaves it
     // at least three layers' worth.
-    let held = plan.host.expert_bytes;
     let keep = held - (need.bytes() - room);
     let share = |l: &HostLayer| u128::from(keep) * u128::from(l.bytes()) / u128::from(held);
     let mut r: Vec<u64> = layers
@@ -2691,6 +2741,7 @@ fn totals<'a>(
             .map(|l| model.experts - n_l[l] - tier_n_l.iter().map(|t| t[l]).sum::<u64>())
             .sum(),
         nvme_expert_bytes: nvme_experts,
+        nvme_arena_bytes: 0,
         table_bytes: host_tables,
         shadow_bytes,
         reserve_bytes,
