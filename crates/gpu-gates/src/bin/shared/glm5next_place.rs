@@ -4,13 +4,29 @@
 //! `generate_glm5next` and the GLM seat of `bloomery-serve` read them here.
 
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{Place, TierRule};
 use model::arch::glm5next::hparams::Hparams;
 use model::placement::workstation::TierBatchBytes;
 
 /// The expert tier cards the GLM body serves: the host tier's count
 /// (`Body::open_placed_lanes` refuses past it before any upload).
 const SERVED_TIERS: usize = bloomery_gpu::host::SERVED_TIERS;
+
+/// The GLM family's input to the common unset rule (`Place::choose`): the
+/// tier cards its body serves, and the tier kept only when the plan puts at
+/// least this many experts on it — the tier size whose predicted decode gain
+/// clears 0 (docs/cards/glmbp-ab.card). The GLM seat reads it;
+/// `generate_glm5next` keeps its own `--place` until its round takes the
+/// rule.
+#[allow(
+    dead_code,
+    reason = "the seat reads it; the CLI keeps its own --place word until its round takes the rule"
+)]
+pub const TIER_RULE: TierRule = TierRule {
+    tiers: SERVED_TIERS,
+    break_even: Some(526),
+    basis: "docs/cards/glmbp-ab.card",
+};
 
 /// A GLM binary's `--place` word (`Place::parse`), refused by name before
 /// any plan when it lists more tier cards than the GLM body serves.

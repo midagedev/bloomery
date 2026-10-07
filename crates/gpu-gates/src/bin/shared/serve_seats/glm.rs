@@ -33,18 +33,18 @@
 //! prompt-batch bytes `place::tier_batch`'s) and its list spelling
 //! `a6000+3090`; a list of more tier cards than the GLM body serves
 //! (`bloomery_gpu::host::SERVED_TIERS`) is refused by name before the plan.
-//! Unset, the cards decide, on the census the placement resolves against,
-//! read once: with a second card visible the seat plans `bp` as it would
-//! run it (`Place::by_cards`) and keeps it when the plan puts at least
-//! `TIER_BREAK_EVEN` experts on the tier card, else it runs `a`
-//! (`Place::keep_tier`); with one card, `a`. A `place unset` record after
-//! the levers' records and before the `ctx` line names the word, why
-//! (`two cards, tier at or past the break-even`,
-//! `two cards, tier under the break-even`, `two cards, the tier's plan
-//! refused` (the refusal on stderr), `one card`, or `set` under the
-//! flag), the tier's experts in that plan of `bp` (under the flag, the
-//! placement's own; 0 with no tier card) and the break-even. A refusal of
-//! that plan of `bp` is the seat's refusal by name. The
+//! Unset, the common rule every serving seat takes decides
+//! (`Place::choose`, by the GLM family's `glm_place::TIER_RULE`: the tier
+//! card kept only when the plan puts at least the rule's break-even experts
+//! on it and more than none) on the census the placement resolves against,
+//! read once. A `place unset` record after the levers' records and before
+//! the `ctx` line names the word, why (`set` under the flag; `one card`;
+//! on two cards `tier at or past the break-even`, `tier under the
+//! break-even`, `the tier holds no expert`, or `the tier's plan refused`
+//! (the refusal on stderr)), the tier's experts in that plan of `bp` where
+//! the rule asked the plan for them (never under the flag or on one card),
+//! and the rule's break-even and basis. A refusal of the chosen placement's
+//! plan is the seat's refusal by name. The
 //! positions a slot serves are the stores the load sized for each sequence
 //! (`--ctx` names one request's context: while `--parallel` names no count
 //! one slot serves the whole of it, and under `--parallel N` it is the
@@ -508,11 +508,6 @@ fn plan_of<'a>(
     })
 }
 
-/// With `--place` unset, a second card serves as plan (b′)'s tier only when
-/// the plan puts this many experts on it: the tier size whose predicted
-/// decode gain clears 0 (docs/cards/glmbp-ab.card).
-const TIER_BREAK_EVEN: u64 = 526;
-
 /// A placement as the seat plans it: the tier's prompt-batch bytes, the
 /// machine, the context rule over it, and the experts its tier cards hold
 /// in the plan at the rule's context (0 with no tier card).
@@ -636,8 +631,7 @@ fn residency_at(
 struct Args {
     host: String,
     port: u16,
-    /// `--place`; `None` takes what the cards call for ([`Place::by_cards`],
-    /// [`Place::keep_tier`]).
+    /// `--place`; `None` takes the common rule's choice ([`Place::choose`]).
     place: Option<Place>,
     /// `--ctx`; `None` takes the rule's default.
     ctx: Option<usize>,
@@ -729,13 +723,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     let a = parse_args(args)?;
     // The census the placement resolves against, read once: `--place` as
-    // given, or unset the cards' offer and, when its plan drops the tier,
-    // `a` on the same reading.
+    // given, or unset the common rule's choice on the same reading.
     let census = gpu_census::census()?;
-    let offer = match a.place {
-        Some(p) => p.on(&census)?,
-        None => Place::by_cards(&census)?,
-    };
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let path = ref_model_path()?;
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
@@ -811,9 +800,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // is never under it while the card holds it — and the context the rule
     // chooses is asked again below.
     let at_ctx = set.unwrap_or(CTX);
-    // `a` and `bp` both serve, so the offer's picks are the placement's.
+    // Whether the placement serves: an unset flag does (the common rule
+    // never picks `gate`), and a set one does unless it is `gate`.
     let unset = glm_unset(GlmAt {
-        serving_place: offer != Place::Gate,
+        serving_place: a.place.is_none_or(|p| p != Place::Gate),
         nextn_layers: inputs.hp.n_layer.saturating_sub(inputs.hp.n_trunk),
         need: NEED,
         ctx: at_ctx,
@@ -834,42 +824,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Some(_) => None,
     };
     let plan_place = |p: Place| Placed::of(p, &inputs, &plan_levers, nextn.as_ref(), set, slots);
-    // Unset on two cards, a refused plan of the tier's placement runs `a`,
-    // the refusal named on stderr: an unset flag never refuses a load that
-    // `--place a` serves.
-    let (placed, place_why, tier_experts) = match (a.place, plan_place(offer)) {
-        (Some(_), first) => {
-            let first = first?;
-            let n = first.tier_experts;
-            (first, "set", n)
-        }
-        (None, Err(e)) if offer != Place::A => {
-            eprintln!(
-                "bloomery-serve-glm: --place unset, {} on two cards refused ({e}); the largest \
-                 card alone (a)",
-                offer.name()
-            );
-            (
-                plan_place(Place::A.on(&census)?)?,
-                "two cards, the tier's plan refused",
-                0,
-            )
-        }
-        (None, first) => {
-            let first = first?;
-            let n = first.tier_experts;
-            match offer.keep_tier(&census, n, TIER_BREAK_EVEN)? {
-                (p, why) if p == offer => (first, why, n),
-                (p, why) => (plan_place(p)?, why, n),
-            }
-        }
-    };
-    Record::new(&record::PLACE_UNSET_GLM)
-        .w("place", placed.place.name())
-        .w("why", place_why)
-        .u("tier_experts", tier_experts)
-        .u("break_even", TIER_BREAK_EVEN)
-        .eprint();
+    // The placement the seat runs by (`Place::choose`, by the GLM family's
+    // `TIER_RULE`): the plan of the offer names its tier count, and an unset
+    // flag never refuses a load that `--place a` serves — a refused plan of
+    // the offer runs `a`, the refusal named on stderr. Planning the chosen
+    // placement again is milliseconds.
+    let chosen = Place::choose(a.place, &census, glm_place::TIER_RULE, |p| {
+        Ok(plan_place(p)?.tier_experts)
+    })?;
+    chosen.record().eprint();
+    let placed = plan_place(chosen.place)?;
     let Placed {
         place,
         tier_batch,

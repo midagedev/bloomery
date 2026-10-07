@@ -118,12 +118,15 @@
 //!   `listening` record the same split, and `/props`' `n_ctx` is the slot
 //!   context.
 //!   Then one more server of `--parallel 2` under the seat's own defaults
-//!   — `--place a`, no `BLOOMERY_DRAFT`, no `BLOOMERY_RESIDENCY` (the
-//!   user's case: the A6000 stages, the adaptive residency runs, the draft
-//!   runs; `BLOOMERY_STEP_STATS=1` for (v3)'s records) — runs the together
-//!   pair once and holds (v2) and (v3) alone, no id equality: under the
+//!   — no `--place`, no `BLOOMERY_DRAFT`, no `BLOOMERY_RESIDENCY` (the
+//!   user's case: the unset rule picks the placement, the adaptive
+//!   residency runs, the draft runs; `BLOOMERY_STEP_STATS=1` for (v3)'s
+//!   records) — runs the together pair once and holds (v2) and (v3) alone,
+//!   no id equality: under the
 //!   adaptive residency the other stream moves experts between the host and
-//!   the card, so a stream's bits need not equal its alone run's.
+//!   the card, so a stream's bits need not equal its alone run's. Its
+//!   `place unset` record is the common rule's on this gate's one visible
+//!   card ([`unset_place_is_the_rule`]).
 //!   The swap clause this replaces is gone: the turn path it held
 //!   (`serve::SwapEngine`, the park of a preempted request's state) left
 //!   the seat with the resident slots — no load of this seat takes turns
@@ -2130,11 +2133,13 @@ mod gate {
     }
 
     /// The slots clause's second server (the module header): the seat under
-    /// its own defaults at `--parallel 2` — `--place a`, neither lever set —
-    /// runs the together pair once and holds (v2) and (v3) alone; under the
-    /// adaptive residency a stream's bits need not equal its alone run's, so
-    /// no id equality is asked. This gate's own card is the 3090; this
-    /// server's stage is the A6000 (the user's case), its load waiting out a
+    /// its own defaults at `--parallel 2` — no `--place`, neither lever set
+    /// (the user's case) — runs the together pair once and holds (v2) and
+    /// (v3) alone; under the adaptive residency a stream's bits need not
+    /// equal its alone run's, so no id equality is asked. The recipe leaves
+    /// the box env file's CUDA_VISIBLE_DEVICES pin (the 3090) in place, so
+    /// the seat sees one card: the unset rule's `place unset` record names
+    /// it (`unset_place_is_the_rule`), and the server's load waits out a
     /// timing sitting by the box guard this gate runs under.
     fn slots_default_residency(dir: &Path, ok: &mut bool) -> Result<bool, GateError> {
         let own = dir.join("slots-default");
@@ -2146,16 +2151,7 @@ mod gate {
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
             .env_remove(bloomery_levers::MTP_DRAFT)
             .env(bloomery_levers::STEP_STATS, "1");
-        let args = [
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--place",
-            "a",
-            "--parallel",
-            "2",
-        ];
+        let args = ["--host", "127.0.0.1", "--port", "0", "--parallel", "2"];
         let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
         println!("slots-default server pid {}", served.child.id());
         let addr = match served.address(&err_log, POLLS, POLL) {
@@ -2165,6 +2161,7 @@ mod gate {
                     "slots-default: the server never listened: {e}; it said: {}",
                     std::fs::read_to_string(&err_log).unwrap_or_default()
                 );
+                check(ok, "unset_place_is_the_rule", false);
                 check(ok, "slots_default_rounds_carry_both_slots", false);
                 check(ok, "slots_default_rounds_of_both_run_one_pass", false);
                 let _ = served.stop();
@@ -2179,6 +2176,32 @@ mod gate {
             ok,
             "slots_default_parallel_line_names_the_rule",
             line.contains("rule=slots") && parallel_agrees(&line, Some(2)) == Some(true),
+        );
+        // The common rule's own record on the unset flag: the pin leaves one
+        // card visible, so the offer is `a` on it and the plan is never
+        // asked. FAIL-first: a seat that keeps a hard-coded default
+        // placement names `why=set`; one that runs `bp` on a one-card view
+        // never listens; a rule with a break-even names it and asks the plan.
+        let placed = seat_log(&err_log)?.one(&record::PLACE_UNSET)?;
+        let (place, why, tier, break_even, basis) = (
+            placed.word("place")?,
+            placed.text("why")?,
+            placed.opt_u64("tier_experts")?,
+            placed.opt_u64("break_even")?,
+            placed.opt_word("basis")?.unwrap_or(""),
+        );
+        println!(
+            "slots-default: place unset place={place} why={why} tier_experts={tier:?} \
+             break_even={break_even:?} basis={basis}"
+        );
+        check(
+            ok,
+            "unset_place_is_the_rule",
+            place == "a"
+                && why == "one card"
+                && tier.is_none()
+                && break_even.is_none()
+                && basis == "docs/cards/q38bpbug-ab.card",
         );
         check(
             ok,
