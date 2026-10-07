@@ -443,6 +443,86 @@
 # process on either card as an arm starts is waited out (10 minutes, then rc 75). A dry run prints the
 # pre-lease checks' verdict and goes on.
 set -uo pipefail
+# Probe tag. Qwen3.8's prompt plan reads the lane rate the load probes (`xstream_lane_gbs=` on the load's
+# `xstream=` line): the pick floor m* follows it, so a load on a contended box probes a low rate and
+# admits fewer experts (7.43 GB/s: m_min 3194, 4095 experts admitted; 20.56: m_min 1216, 5805) — a
+# lighter plan for the whole process, not the plan of its pair. An ours row whose arm printed that line
+# carries ` | lane_gbs=<v> m_min=<m>` and, from the prompt call's `call stream end` record,
+# ` admitted=<n> bytes=<b>` after its majflt column; a row printing none (xstream off, a reference
+# engine's arm) carries none. A row whose lane_gbs is under PROBE_QUIET_LO ends in ` [probe-off]`, after
+# [cold], and the closing summary counts those rows. No upper edge: nothing in the record shows a high
+# probe to be a fault.
+# PROBE_QUIET_LO = 18.5 GB/s, a constant like COLD_PCT (no env override: an unregistered lever name would
+# bypass crates/levers). PIN(2026-10-07): from every xstream_lane_gbs the
+# lead's and the rounds' logs hold on the A6000 box that day (44 loads): the known-quiet loads (clean
+# sittings, quiet functional runs) read 18.9 to 20.94, the known-contended ones (a V4.1 load or builds
+# beside the load) 4.4 to 17.5; 18.5 sits between 17.5 and 18.9, so no known-quiet load is tagged and
+# no known-contended one is missed. Two loads read in the gap (18.27, 18.39: not classified in the logs)
+# and are tagged. Move it only with a new record.
+PROBE_QUIET_LO=18.5
+
+# probe_row <text>: PROBE_COL and PROBE_TAG of an ours arm from the load's lines and the arm's own output
+# (the text): the first `xstream_lane_gbs=` and `xstream_m_min=`, the last `call stream end` record's
+# admitted= and bytes=. Both empty when the text has no `xstream_lane_gbs=` (the row invents none).
+probe_row() {
+  local rec gbs mmin adm bytes off
+  PROBE_COL='' PROBE_TAG=''
+  rec=$(printf '%s\n' "$1" | awk -v lo="$PROBE_QUIET_LO" '
+    g == "" && match($0, /xstream_lane_gbs=[0-9.]+/) { g = substr($0, RSTART + 17, RLENGTH - 17) }
+    m == "" && match($0, /xstream_m_min=[0-9a-z]+/) { m = substr($0, RSTART + 14, RLENGTH - 14) }
+    /^call stream end / {
+      if (match($0, /admitted=[0-9]+/)) a = substr($0, RSTART + 9, RLENGTH - 9)
+      if (match($0, /bytes=[0-9]+/)) b = substr($0, RSTART + 6, RLENGTH - 6)
+    }
+    END { if (g != "") printf "%s %s %s %s %d\n", g, (m == "" ? "-" : m), (a == "" ? "-" : a), (b == "" ? "-" : b), (g + 0 < lo + 0) }')
+  [ -n "$rec" ] || return 0
+  read -r gbs mmin adm bytes off <<< "$rec"
+  PROBE_COL=" | lane_gbs=$gbs"
+  [ "$mmin" = - ] || PROBE_COL+=" m_min=$mmin"
+  [ "$adm" = - ] || PROBE_COL+=" admitted=$adm"
+  [ "$bytes" = - ] || PROBE_COL+=" bytes=$bytes"
+  [ "$off" = 0 ] || PROBE_TAG=' [probe-off]'
+  return 0
+}
+
+# The closing summary's per-arm mean lines, one function a table so the self-test reads them. Each prints
+# the arm's mean over all its rows, its tag counts, then the mean over the rows that carry none of
+# [cpu-busy], [other-busy], [cold] and [probe-off] (`n/a` when every row is tagged).
+TAGGED_RE='cold|cpu-busy|other-busy|probe-off'
+# arm_means: `label|depth|round|tps_mean|tps_p50|tags|nslots` records on stdin (the decode rows).
+arm_means() {
+  awk -F'|' -v tre="$TAGGED_RE" '{
+  k = $1 " d=" $2; s[k] += $4; n[k]++; if ($5 != "") { sp[k] += $5; np[k]++ }
+  if ($6 ~ /cold/) c[k]++
+  if ($6 ~ /probe-off/) po[k]++
+  if ($6 !~ tre) { sx[k] += $4; nx[k]++ }
+  if ($7 != "") agg[k] = $7
+  if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
+} END { for (k in s) {
+  spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
+  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)  [cold %d/%d] [probe-off %d/%d]  untagged mean %s\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : (k in agg ? sprintf("(aggregate of %d slots)", agg[k]) : "")), n[k], c[k], n[k], po[k], n[k], (nx[k] ? sprintf("%.2f tok/s (n=%d)", sx[k] / nx[k], nx[k]) : "n/a (every row tagged)") } }' | sort
+}
+# pass_means: `label|depth|round|passes_per_s|tags` records (the MTP pass time).
+pass_means() {
+  awk -F'|' -v tre="$TAGGED_RE" '{
+    k = $1 " d=" $2; ms = 1e3 / $4; s[k] += ms; n[k]++
+    if ($5 ~ /cold/) c[k]++
+    if ($5 ~ /probe-off/) po[k]++
+    if ($5 !~ tre) { sx[k] += ms; nx[k]++ }
+    if (mn[k] == "" || ms < mn[k] + 0) mn[k] = ms; if (mx[k] == "" || ms > mx[k] + 0) mx[k] = ms
+  } END { for (k in s) printf "mean pass %-14s %9.4f ms/pass  [%.4f..%.4f]  (n=%d)  [cold %d/%d] [probe-off %d/%d]  untagged mean %s\n", k, s[k] / n[k], mn[k], mx[k], n[k], c[k], n[k], po[k], n[k], (nx[k] ? sprintf("%.4f ms/pass (n=%d)", sx[k] / nx[k], nx[k]) : "n/a (every row tagged)") }' | sort
+}
+# pp_means: `label|P|round|tok/s(pp)|tags` records (the prefill rows).
+pp_means() {
+  awk -F'|' -v tre="$TAGGED_RE" '{
+    k = $1 " p=" $2; s[k] += $4; n[k]++
+    if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
+    if ($5 ~ /cpu-busy/) c[k]++; if ($5 ~ /other-busy/) o[k]++; if ($5 ~ /cold/) f[k]++; if ($5 ~ /probe-off/) po[k]++
+    if ($5 !~ tre) { sx[k] += $4; nx[k]++ }
+  } END { for (k in s) {
+    spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
+    printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [cpu-busy %d/%d] [other-busy %d/%d] [cold %d/%d] [probe-off %d/%d]  untagged mean %s\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], c[k], n[k], o[k], n[k], f[k], n[k], po[k], n[k], (nx[k] ? sprintf("%.2f tok/s(pp) (n=%d)", sx[k] / nx[k], nx[k]) : "n/a (every row tagged)") } }' | sort
+}
 # q3_self_test: `depth-qwen3moe.sh --self-test`, the lever arms' parse and refusals (the header's
 # <D>@NAME=VALUE) on fixed arms against this tree's lever registry, and the prose arms' grammar and
 # refusals (the header's prose:<P>) against a temp corpus file in the self-test's own temp dir, each a
@@ -714,6 +794,39 @@ q3_self_test() {
   want prose-bin-nop 64 "bin:<path>:prose:<P> takes a prompt length P after prose:"
   run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/release/generate_qwen3moe:prose:900
   want prose-bin-past 64 "a prose prompt of 900 ids"
+  # The probe tag (the header's probe tag) on fixed arm outputs: the row's fields and tag from probe_row,
+  # the summary's counts and untagged mean from the mean functions.
+  local ld_q ld_c call_q call_c got
+  ld_q='xstream=split xstream_half=97 xstream_staging=64 xstream_lane_gbs=20.56 xstream_m_min=1216 (unset: split)'
+  ld_c='xstream=split xstream_half=97 xstream_staging=64 xstream_lane_gbs=7.43 xstream_m_min=3194 (unset: split)'
+  call_q='call stream end picks=12 admitted=5805 bytes=18197299200 pick_us=1 backlog_us=0 kept=1 restored=0 end_us=2'
+  call_c='call stream end picks=12 admitted=4095 bytes=12835000000 pick_us=1 backlog_us=0 kept=1 restored=0 end_us=2'
+  # eq <name> <got> <want>
+  eq() {
+    checks=$((checks + 1))
+    if [ "$2" = "$3" ]; then
+      echo "ok $1"
+    else
+      echo "FAIL $1: got [$2], want [$3]"
+      fails=$((fails + 1))
+    fi
+  }
+  probe_row "$(printf '%s\n%s\n' "$ld_q" "$call_q")"
+  eq probe-quiet "$PROBE_COL|$PROBE_TAG" ' | lane_gbs=20.56 m_min=1216 admitted=5805 bytes=18197299200|'
+  probe_row "$(printf '%s\n%s\n' "$ld_c" "$call_c")"
+  eq probe-off-tag "$PROBE_COL|$PROBE_TAG" ' | lane_gbs=7.43 m_min=3194 admitted=4095 bytes=12835000000| [probe-off]'
+  probe_row "$(printf 'load place=a cards=[A6000]\nstep 0 plan=1\ncall stream end picks=1 admitted=9 bytes=9\n')"
+  eq probe-no-xstream "[$PROBE_COL|$PROBE_TAG]" '[|]'
+  probe_row "$(printf '%s\n' "$ld_c")"
+  eq probe-no-call "$PROBE_COL|$PROBE_TAG" ' | lane_gbs=7.43 m_min=3194| [probe-off]'
+  probe_row "$(printf 'xstream=split xstream_lane_gbs=18.50 xstream_m_min=none\n')"
+  eq probe-band-edge "$PROBE_COL|$PROBE_TAG" ' | lane_gbs=18.50 m_min=none|'
+  got=$(printf '%s\n' 'ours|6|1|40.00|10.0|  [cpu-busy]|' 'ours|6|2|42.00|10.0||' 'ours|6|3|20.00|10.0| [probe-off]|' | arm_means)
+  eq probe-mean-decode "$got" 'mean ours d=6          34.00 tok/s  [20.00..42.00, spread 110.00%]  10.00 tok/s(p50) (n=3)  [cold 0/3] [probe-off 1/3]  untagged mean 42.00 tok/s (n=1)'
+  got=$(printf '%s\n' 'ours|512|1|1000.0| [probe-off]' 'ours|512|2|2000.0|' | pp_means)
+  eq probe-mean-pp "$got" 'mean pp ours p=512      1500.00 tok/s(pp)  [1000.0..2000.0, spread 100.00%]  (n=2)  [cpu-busy 0/2] [other-busy 0/2] [cold 0/2] [probe-off 1/2]  untagged mean 2000.00 tok/s(pp) (n=1)'
+  got=$(printf '%s\n' 'ours|512|1|1000.0| [probe-off]' | pp_means | sed 's/.*untagged mean //')
+  eq probe-mean-all-tagged "$got" 'n/a (every row tagged)'
   rm -rf "$pt"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
@@ -1554,12 +1667,13 @@ ref_arm() {
 }
 
 # The closing summary's row counts: every ROW line, and those that carried [cpu-busy], [other-busy] and
-# [cold].
+# [cold] and [probe-off] (ours rows only: a reference's PROBE_TAG is empty).
 count_row() {
   n_rows=$((n_rows + 1))
   [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
   [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
   [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1))
+  [ -z "${PROBE_TAG:-}" ] || probe_rows=$((probe_rows + 1))
 }
 
 # pp_rows: every `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_qwen3moe
@@ -1768,6 +1882,9 @@ ours_post() {
     timed='? (a one-arm run prints its prompt ids before its load: the whole process)'
   fi
   cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 0
+  # The load's probe and the prompt call's admits (the header's probe tag): the load's lines are the
+  # process's header under a shared load, this arm's own output under a one-arm process.
+  probe_row "$(printf '%s\n%s\n' "${LG_HEADER:-}" "$out")"
   # The row names its placement: the arm's --place, or a in the two-card mode with none (the binary's).
   local rowplace=${A_PLACE[$i]}
   [ -n "$rowplace" ] || [ -z "$TIMING_CARDS" ] || rowplace=a
@@ -1776,18 +1893,18 @@ ours_post() {
     # a round's, so 1000 / mean is one stream's rate.
     local agg
     agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$COLD_TAG$PROBE_TAG"
     counted || return 0
     count_row
-    sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG|$nslots")
+    sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG|$nslots")
   else
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$COLD_TAG$PROBE_TAG"
     counted || return 0
     count_row
-    sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+    sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
   fi
-  [ -z "$pps" ] || pass_sums+=("$label|$dep|$r|$pps|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
-  [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+  [ -z "$pps" ] || pass_sums+=("$label|$dep|$r|$pps|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
+  [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
   res_sums_add "$label" "$dep" "$r"
   # The greedy cross-check's ours side: the plain rows (no NAME=VALUE list) of this tree's binary.
   case ${A_KIND[$i]}:$label in
@@ -1806,7 +1923,7 @@ lg_before_load() {
 }
 lg_pre() {
   prime_tag "$1"
-  CPU_BUSY_TAG=
+  CPU_BUSY_TAG= PROBE_COL= PROBE_TAG=
   guard_cpu "pre r$2 ${ARMS[$1]}"
   ours_pre "$@"
 }
@@ -1823,7 +1940,7 @@ srv_after() { guard_cpu "post r$1 $2 $3"; }
 # unit_guard <index> <round>: the contention guards before an arm's own process: the other card, the
 # timing card and the CPU.
 unit_guard() {
-  CPU_BUSY_TAG=
+  CPU_BUSY_TAG= PROBE_COL= PROBE_TAG=
   guard_other
   guard_timing
   guard_cpu "pre r$2 ${ARMS[$1]}"
@@ -2102,7 +2219,7 @@ guard_timing
 guard_cpu pre
 
 sums=() pp_sums=() pass_sums=()
-n_rows=0 busy_rows=0 other_rows=0 cold_rows=0
+n_rows=0 busy_rows=0 other_rows=0 cold_rows=0 probe_rows=0
 if [ "$ORDER" = rotate ]; then
   if [ "$AB_WARMUP" = 1 ]; then
     ROW_TAG=WARMUP
@@ -2118,6 +2235,7 @@ echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
+echo "probe-off rows: $probe_rows of $n_rows (an ours row whose load probed lane_gbs under ${PROBE_QUIET_LO} GB/s: a lighter prompt plan than its pair's)"
 warm_rows_summary
 # The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours
 # is a failed arm and drops out at its depth or P with them; a later id's part is a [xcheck-tail] line.
@@ -2131,14 +2249,7 @@ failed_tally
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)"
 echo "    — the cross-engine ratio reads these. The p50 column is ours only. ==="
-[ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | awk -F'|' '{
-  k = $1 " d=" $2; s[k] += $4; n[k]++; if ($5 != "") { sp[k] += $5; np[k]++ }
-  if ($6 ~ /cold/) c[k]++
-  if ($7 != "") agg[k] = $7
-  if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
-} END { for (k in s) {
-  spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
-  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : (k in agg ? sprintf("(aggregate of %d slots)", agg[k]) : "")), n[k], c[k], n[k] } }' | sort
+[ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | arm_means
 echo
 echo "=== ours / reference per depth: each round's ratio of the pair measured in that round (arms"
 echo "    that ran more than once in a round are averaged first), their mean with its 95 % interval"
@@ -2183,11 +2294,7 @@ if [ ${#pass_sums[@]} -gt 0 ]; then
   echo "=== pass time per arm (ms a verify pass under MTP, mean_ms × steps / passes of the row's SMOKE line:"
   echo "    the counted passes' wall over their number, $CARD_NAME). The ratios below are over passes a"
   echo "    second, 1000 / ms, the decode table's statistics ==="
-  printf '%s\n' "${pass_sums[@]}" | awk -F'|' '{
-    k = $1 " d=" $2; ms = 1e3 / $4; s[k] += ms; n[k]++
-    if ($5 ~ /cold/) c[k]++
-    if (mn[k] == "" || ms < mn[k] + 0) mn[k] = ms; if (mx[k] == "" || ms > mx[k] + 0) mx[k] = ms
-  } END { for (k in s) printf "mean pass %-14s %9.4f ms/pass  [%.4f..%.4f]  (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], n[k], c[k], n[k] }' | sort
+  printf '%s\n' "${pass_sums[@]}" | pass_means
   printf '%s\n' "${pass_sums[@]}" | ratio_table "ratio pass d=" "$deps" "$refs" 0 5
   if [ -n "$prose_refs" ]; then
     echo
@@ -2200,13 +2307,7 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   echo "=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, $CARD_NAME). Ours: its time prompt"
   echo "    row (prefill through its token's readback); llama-bench's pp value over one repetition;"
   echo "    mistral.rs P / TTFT over one request. The tags count the rows that met contention or faults. ==="
-  printf '%s\n' "${pp_sums[@]}" | awk -F'|' '{
-    k = $1 " p=" $2; s[k] += $4; n[k]++
-    if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
-    if ($5 ~ /cpu-busy/) c[k]++; if ($5 ~ /other-busy/) o[k]++; if ($5 ~ /cold/) f[k]++
-  } END { for (k in s) {
-    spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
-    printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [cpu-busy %d/%d] [other-busy %d/%d] [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], c[k], n[k], o[k], n[k], f[k], n[k] } }' | sort
+  printf '%s\n' "${pp_sums[@]}" | pp_means
   echo
   echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
   echo "    values, then how many of each side's rows carried [other-busy] and [cold] ==="
