@@ -116,7 +116,11 @@ gguf 9 2 0
 # PIN(2026-10-06): gpu 1551 -> 1573 blocks, a new kernel pair, not old code relaxed: q6k_gemv_ids and
 # q6k_gemv_ids_mcol (the MTP draft's Q6_K head over the target's output through a row map, q6k_ids.rs) add the
 # two entries' id loads, fault NaN stores, byte-window loads and lane stores, each with its SAFETY line.
-gpu 1573 171 6
+# PIN(2026-10-07): gpu 1573 -> 1579 blocks, new code, not old code relaxed: the expert stream (host/xstream.rs)
+# adds the staging fill's copy into its pinned slot, the ring's two mapped rows written as host slices, the lane's
+# pinned and pageable cuMemcpyHtoDAsync and the card's cuMemGetInfo for the ring's room (five), and Qwen3.8's card
+# route (wide38.rs) the ring pass's device windows (one); each with its SAFETY line.
+gpu 1579 171 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -131,7 +135,10 @@ gpu-deepseek41 448 53 0
 # PIN(2026-10-03): gpu-gates 61 -> 62 blocks, new code, not old code relaxed: gate_qwen3moe_flash's q8 window
 # refusal (the q8 prefill's `kq` at 8 bytes past a 16-byte boundary) takes its window over a padded
 # allocation in one block, with its SAFETY line.
-gpu-gates 60 5 1
+# PIN(2026-10-07): gpu-gates 60 -> 62 blocks, new code, not old code relaxed: gate_xstream copies a half's ring
+# slots and its mapped rows back on the engine stream (two cuMemcpy*Async blocks), as no safe device-pointer copy of
+# the ring's raw places exists; each with its SAFETY line.
+gpu-gates 62 5 1
 gpu-glm5next 4 0 0
 gpu-vision 48 0 0
 hf 0 0 0

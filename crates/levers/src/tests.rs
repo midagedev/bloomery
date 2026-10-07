@@ -346,6 +346,7 @@ fn accessors_read_their_rows() {
             (RESIDENCY, "mid-p40-s1"),
             (QWEN38_EXPERTS, "card"),
             (HOSTSTREAM, "on"),
+            (XSTREAM, "split"),
             (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
             (PREFILL_GROUP, "8"),
@@ -377,6 +378,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.qwen38_experts_set(), Some("card"));
     assert_eq!(set.qwen3_kv_set(), Some("q8_0"));
     assert_eq!(set.hoststream(), Some(true));
+    assert_eq!(set.xstream(), Some("split"));
     assert!(set.lane_prefetch());
     assert_eq!(set.gen_slots(), 2);
     assert_eq!(
@@ -416,6 +418,7 @@ fn accessors_read_their_rows() {
             RESIDENCY,
             QWEN38_EXPERTS,
             HOSTSTREAM,
+            XSTREAM,
             QWEN3_KV,
             LANE_PREFETCH,
             GEN_SLOTS

@@ -1,0 +1,60 @@
+# Round xstream23 (R2 + R3): the one expert-stream owner (crates/gpu/src/host/xstream.rs) wired into Qwen3.8's
+# ubatch walk. BLOOMERY_XSTREAM=split admits the residency pick (its floor the stream rule's m*, from the lane's
+# probed rate) and then streams the host experts the rule (runtime::xsplit) sends to the card through a ring of
+# card slots for the ubatch alone, cut at the ring's half and where the card's side (the pick's and the stream's
+# copies on one lane, then the stacks' own columns and the streamed ones) would pass the union the host keeps.
+# Same binary, every arm BLOOMERY_RESIDENCY=mid-p148-s1 and BLOOMERY_DRAFT=off; split against off; admit (the
+# shipped shape) read beside, not judged.
+#
+# Decomposition per layer of the one 4,096-column unit, A6000 plan a, prose. The round's functional run (same
+# binary and levers, gpu-gate.sh on the A6000, not timed, the box shared with other rounds' gates) gives every
+# term but the window's own scale:
+#   off   the union of every host expert's columns: 19,350 slots a layer at 4.92 us = 95.2 ms, plus 30.4 ms a
+#         layer waiting on the card's front -> walk 6.22 s, prompt 6.26 s functional; 6.64 s and pp4096 616.9
+#         timed (rig-log 09-30, the q38seed arms).
+#   split the pick admits 76.7 experts a layer (3,683), the stream takes 26.2 a layer of the rule's tail (1,258
+#         over the 42 layers that streamed, at most 91 of the ring's half of 97) and 85,806 of their columns;
+#         the union keeps 3,165 slots a layer (15.5 ms) while the card's shadow (the pick's and the stream's
+#         copies at the probed 20.49 GB/s, then the route) takes ~28 ms: the walk is 62 ms a layer, card-bound
+#         -> 3.03 s functional. Scaled by the off arm's timed/functional ratio (6.64 / 6.26): ~3.2 s timed,
+#         pp4096 ~1,280.
+#   A second functional run, 4,100 ids (a 4,096-column unit and a 4-column one the stream skips), gave split
+#         3.10 s and off 5.37 s, the same 16 greedy ids: the off arm moves with the shared box's host load
+#         (5.37-6.26 s) while split, card-bound, holds (3.03-3.10 s).
+#   => split vs off +65..+120 % (the functional ratios +73 % and +106 %, the timed off arm's 6.64 s at the top).
+#   admit beside it: q38seed measured +71.6 % (3.87 s); split moves ~1,258 more experts' columns to the card.
+# The derivation before the functional run (+60..+80 %, split ~ admit) took the replay's post-pick union of
+# 2,190 columns a layer; the live run keeps 5,165 a layer before the stream (3,165 kept + 2,000 streamed). That
+# term was the miss.
+# Runner (from /Users/hckim/repo/bloomery-xstream23, the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/xstream-pp.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=4
+# just depth-gpu-qwen4exp prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_XSTREAM=off
+#   prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_XSTREAM=split
+#   prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_XSTREAM=admit
+# Wall [derived]: 3 arms x 4 rounds of a fresh Qwen3.8 load (q38seed's 4 x 4 took 9-12 min), 7..10 min.
+kind: ab
+question: does the expert stream's split (the pick at the rule's floor, then the stream cut at the ring's half
+  and the balance) lift Qwen3.8's pp4096 over the plain arm by the derived band, the shipped admit arm beside it?
+term: pp tok/s @ prose:4096, ctx 4352 (BLOOMERY_GEN_CTX=4352), A6000, plan a, BLOOMERY_RESIDENCY=mid-p148-s1 and
+  BLOOMERY_DRAFT=off in every arm; BLOOMERY_XSTREAM=split against BLOOMERY_XSTREAM=off, same binary, paired by
+  round; the BLOOMERY_XSTREAM=admit arm run beside, not judged
+unit: %
+predict: +65..+120
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, all arms in one lease, a fresh process per load group, the host set and the PLE table
+  warm (majflt near 0), no [cpu-busy] or [other-busy] row; a functional run of the same binary and levers just
+  before the window (gpu-gate.sh on the A6000, not timed, BLOOMERY_STEP_STATS=1) shows the split arm's
+  `xstream=split` line with xstream_half at least 8, one `xstream` record a card layer of the 4,096-column
+  ubatch, streamed at most min(tail, half), the records' host_columns summing to the `stat prompt host`
+  host_slots, and the `xstream end` record with lane_gbs above 10; distinct tokens equal between the split and
+  off arms within the band's greedy margin
+decide-in: land split as the unset value; then the balance's host cost from the call's own union (the split
+  arm's shadow runs ~28 ms against a 15.5 ms union a layer: the rule's 7.0 us a column against the measured
+  4.9 over-streams) as its own card, and the common-machine card (docs/cards/xstream-common.card)
+decide-below: read the split arm's `xstream` records and `stat prompt` lines before any change: streamed far
+  under ~26 a layer means the half or the balance cut (lane_gbs names the lane); streamed near it with the walk
+  long means the card's shadow binds harder than the functional run showed, which an nsys of one ubatch
+  decomposes
+decide-above: check distinct tokens and the off arm's union slots (~19,350 a layer) before believing it;
+  re-derive the off arm's wait on the card's front first

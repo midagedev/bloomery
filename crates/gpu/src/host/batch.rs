@@ -1200,8 +1200,9 @@ impl<H: HostExperts> HostTier<H> {
     /// The oldest download not served yet — `key`'s, else refused by name —
     /// waited for; each of a tiered set's tier services enqueued on that
     /// tier's stream, in tier order ([`enqueue_tier_leg`]); then its layer's
-    /// host experts served for its tokens in one union call, the sums into
-    /// the set the upload sends. A failed tier enqueue poisons the host tier
+    /// host experts served for its tokens in one union call, less the ones
+    /// the expert stream sends to the card ([`HostTier::xstream_layer`]), the
+    /// sums into the set the upload sends. A failed tier enqueue poisons the host tier
     /// and releases every card's waits; a poisoned host tier is refused by
     /// name before any card is given work. Returns the host time outside the
     /// union call.
@@ -1223,6 +1224,7 @@ impl<H: HostExperts> HostTier<H> {
             &mut self.tiers,
         );
         let (slots, fault) = (&self.slots, self.fault.as_ref());
+        let exclude = self.xstream.as_ref().map_or(&[][..], |x| x.excluded(key));
         let mut tier_failed = false;
         let r = port.serve_tiered(
             key,
@@ -1243,7 +1245,7 @@ impl<H: HostExperts> HostTier<H> {
                     hidden: h.hidden,
                     n_used: h.n_used,
                 };
-                batch.serve_guarded(t, layer, x, ids, w, &[], out)
+                batch.serve_guarded(t, layer, x, ids, w, exclude, out)
             },
         );
         if let Err(e) = &r

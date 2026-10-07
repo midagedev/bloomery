@@ -136,13 +136,19 @@
 //! beside `BLOOMERY_ROUTE_TRACE`, when the plan's host headroom cannot take
 //! its churn pool, and by the body at a step-fed prompt.
 //!
-//! `BLOOMERY_HOSTSTREAM` (a qwen4exp file only, refused by name on the
-//! others) streams each prompt call's hottest host experts into the
-//! residency pool (`Body38::set_hoststream`): unset it is on under
-//! `--place a` or `bp` with a residency machine and off everywhere else; `on`
-//! beside `BLOOMERY_RESIDENCY=off` is refused by name. A streaming call
-//! prints a `call stream` record a pick and a `call stream end` record
-//! after its arm's lines.
+//! `BLOOMERY_XSTREAM` (a qwen4exp file only, refused by name on the
+//! others) sets what each prompt call moves (`Body38::set_xstream`):
+//! `admit` streams its hottest host experts into the residency pool, `split`
+//! admits and then streams the host experts the stream rule sends to the
+//! card through the expert stream's ring. Unset it is `split` under
+//! `--place a` with a residency machine — `admit` under `bp`, whose expert
+//! tier the ring does not serve, and where the card has no room for the
+//! ring, named on the `xstream=` line — and `off` everywhere else; `admit`
+//! or `split` beside `BLOOMERY_RESIDENCY=off` is refused by name, and so is
+//! `BLOOMERY_HOSTSTREAM` set (V4.1's lever) on a qwen4exp file. The load
+//! prints an `xstream=` line after its other lines; a streaming call prints
+//! a `call stream` record a pick, an `xstream` record a streamed layer, and
+//! `call stream end` and `xstream end` records after its arm's lines.
 //!
 //! `BLOOMERY_DRAFT` unset on a qwen4exp file follows the placement
 //! (`bloomery_levers::draft38_unset`): under `--place a` or `bp` the MTP draft runs
@@ -341,9 +347,10 @@ mod cli {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
+    use bloomery_gpu::host::xstream::{XLayer, XMode, XReport, XSTREAM_ROOM};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
-    use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
+    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::{Place, card_words};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -539,7 +546,7 @@ mod cli {
         /// The last prompt call's streaming picks, each with its ubatch, and
         /// its end; none for a body that does not stream.
         fn stream_records(_m: &mut GpuModel<Self>) -> Result<StreamRecords, GateError> {
-            Ok((Vec::new(), None))
+            Ok((Vec::new(), None, Vec::new(), None))
         }
 
         /// What the body refuses of the load `m` before a run of `slots`
@@ -844,9 +851,13 @@ mod cli {
             Ok(m.body_parts("generate_qwen3moe")?.2.take_residency_passes())
         }
 
-        /// [`Body38::take_stream_records`].
+        /// [`Body38::take_stream_records`] and
+        /// [`Body38::take_xstream_records`].
         fn stream_records(m: &mut Qwen38Model) -> Result<StreamRecords, GateError> {
-            Ok(m.body_parts("generate_qwen3moe")?.2.take_stream_records())
+            let body = m.body_parts("generate_qwen3moe")?.2;
+            let (picks, end) = body.take_stream_records();
+            let (layers, xend) = body.take_xstream_records();
+            Ok((picks, end, layers, xend))
         }
     }
 
@@ -1045,8 +1056,14 @@ mod cli {
         slots: usize,
     }
 
-    /// A prompt call's streaming picks, each with its ubatch, and its end.
-    type StreamRecords = (Vec<(usize, CallPick)>, Option<CallReport>);
+    /// A prompt call's streaming picks, each with its ubatch, and its end;
+    /// its streamed layers, each with its ubatch, and the stream's end.
+    type StreamRecords = (
+        Vec<(usize, CallPick)>,
+        Option<CallReport>,
+        Vec<(usize, XLayer)>,
+        Option<XReport>,
+    );
 
     /// One arm: its ids and its generated count.
     struct Arm {
@@ -1071,6 +1088,7 @@ mod cli {
             bloomery_levers::MTP_WIDTH,
             bloomery_levers::RESIDENCY,
             bloomery_levers::HOSTSTREAM,
+            bloomery_levers::XSTREAM,
             bloomery_levers::GEN_SLOTS,
         ];
         if std::env::args().any(|a| a == "--place") {
@@ -1305,8 +1323,15 @@ mod cli {
         }
         if family != Family::Qwen38 && levers.hoststream().is_some() {
             return Err(
-                "BLOOMERY_HOSTSTREAM streams a qwen4exp prompt's host experts into its \
-                 residency pool; a qwen3moe or qwen35moe plan holds every one on the card"
+                "BLOOMERY_HOSTSTREAM streams a V4.1 prompt's host experts into its residency \
+                 pool; a qwen3moe or qwen35moe plan holds every one on the card"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && levers.xstream().is_some() {
+            return Err(
+                "BLOOMERY_XSTREAM moves a qwen4exp prompt's host experts to the card; a qwen3moe \
+                 or qwen35moe plan holds every one on the card"
                     .into(),
             );
         }
@@ -2148,20 +2173,54 @@ mod cli {
         Ok(())
     }
 
-    /// `BLOOMERY_HOSTSTREAM` on the load (`Body38::set_hoststream`): as set;
-    /// unset, on under `--place a` with a residency machine (V4.1's rule),
-    /// off everywhere else. `on` beside `BLOOMERY_RESIDENCY=off` is refused
-    /// there by name.
+    /// `BLOOMERY_XSTREAM` on the load (`Body38::set_xstream`), then its
+    /// `xstream=` line: as set; unset, `split` under `--place a` with a
+    /// residency machine (`admit` when the card has no room for the stream's
+    /// ring, the refusal named on the line), `admit` under `bp` with one
+    /// (its expert tier the ring does not serve), `off` everywhere else.
+    /// `admit` or `split` beside `BLOOMERY_RESIDENCY=off` is refused there by
+    /// name, and `BLOOMERY_HOSTSTREAM` set here.
     fn stream38(
         m: &mut Qwen38Model,
         levers: &Levers,
         place: Place38,
         residency: Residency,
     ) -> Result<(), GateError> {
-        let on = levers
-            .hoststream()
-            .unwrap_or(place.stage_a() && residency != Residency::Off);
-        m.body_parts("generate_qwen3moe")?.2.set_hoststream(on)?;
+        if levers.hoststream().is_some() {
+            return Err(
+                "BLOOMERY_HOSTSTREAM is V4.1's lever; a qwen4exp load reads BLOOMERY_XSTREAM \
+                 (off, admit or split)"
+                    .into(),
+            );
+        }
+        let (gpu, _, body) = m.body_parts("generate_qwen3moe")?;
+        let why = match levers.xstream() {
+            Some(word) => {
+                body.set_xstream(gpu, XMode::parse(word)?)?;
+                "set".to_string()
+            }
+            None if residency == Residency::Off || !place.stage_a() => {
+                body.set_xstream(gpu, XMode::Off)?;
+                "unset: no residency or not --place a".to_string()
+            }
+            None if place.kind == Kind38::Bp => {
+                body.set_xstream(gpu, XMode::Admit)?;
+                "unset: --place bp, whose expert tier the ring does not serve".to_string()
+            }
+            None => match body.set_xstream(gpu, XMode::Split) {
+                Ok(()) => "unset: --place a with a residency".to_string(),
+                Err(
+                    e @ GpuError::Shape {
+                        what: XSTREAM_ROOM, ..
+                    },
+                ) => {
+                    body.set_xstream(gpu, XMode::Admit)?;
+                    format!("unset: split has no room: {e}")
+                }
+                Err(e) => return Err(e.into()),
+            },
+        };
+        println!("xstream={} ({why})", body.xstream_word());
         Ok(())
     }
 
@@ -2309,12 +2368,18 @@ mod cli {
     /// The `residency pass` records of the boundaries since the last print,
     /// after the arm's lines: nothing prints between two timed steps.
     fn print_passes<B: Prompted>(m: &mut GpuModel<B>) -> Result<(), GateError> {
-        let (picks, end) = B::stream_records(m)?;
+        let (picks, end, layers, xend) = B::stream_records(m)?;
         for (ubatch, p) in &picks {
             record::call_stream(*ubatch, p).print();
         }
+        for (ubatch, x) in &layers {
+            record::xstream_layer(*ubatch, x).print();
+        }
         if let Some(r) = end {
             record::call_report(&r).print();
+        }
+        if let Some(r) = xend {
+            record::xstream_end(&r).print();
         }
         for (kind, r) in B::residency_passes(m)? {
             record::residency_pass_of(kind, &r).print();

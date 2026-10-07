@@ -31,6 +31,7 @@ pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
 pub const MTP_WIDTH: &str = "BLOOMERY_MTP_WIDTH";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
+pub const XSTREAM: &str = "BLOOMERY_XSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
@@ -549,8 +550,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::OnOff,
         default: Unset::Means(
-            "V4.1: on under a residency (`BLOOMERY_RESIDENCY` not `off`), off without one; \
-             Qwen3.8: on under `--place a` with a residency, off everywhere else",
+            "V4.1: on under a residency (`BLOOMERY_RESIDENCY` not `off`), off without one",
         ),
         doc: "V4.1 prompt calls under adaptive residency (`BLOOMERY_RESIDENCY=mid-…`): `on` \
               streams each group's hottest host experts into the residency's churn pool at \
@@ -561,16 +561,38 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               prompt call bit for bit the decode steps' state, the same-binary arm. Unset follows \
               the residency: on under one, off without one. `on` is refused by name at the load \
               beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
-              stream`, every call `call stream end`. Qwen3.8 (`generate_qwen3moe`) runs the \
-              same call mode in its ubatch walk: `on` moves each card layer's pool toward the \
-              ubatch's hottest host experts before the layer's card route (a count of at least \
-              the walk's `STREAM_FLOOR`), the union and the route under the moved map, and the \
-              call's picks stay for the decode; a pass-fed prompt, and one of fewer ids than the \
-              floor, opens no call (its rows give an expert fewer counts than the floor, so \
-              its pick could admit nothing). \
-              Unset there is on under `--place a` with a residency, off everywhere else; \
-              `off` is the same-binary arm; `on` is refused by name beside \
-              `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file.",
+              stream`, every call `call stream end`. A Qwen3.8 load refuses it set by name and \
+              reads `BLOOMERY_XSTREAM`.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: XSTREAM,
+        class: Class::A,
+        kind: Kind::Words(&["off", "admit", "split"]),
+        default: Unset::Means(
+            "Qwen3.8 (`generate_qwen3moe`): `split` under `--place a` with a residency (`admit` when \
+             the card has no room for the ring), `admit` under `--place bp` with one, `off` \
+             everywhere else",
+        ),
+        doc: "Qwen3.8 prompt calls fed by ubatches under adaptive residency \
+              (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
+              route. `admit` moves the residency's pool toward the ubatch's hottest host experts \
+              (`host::swap` call mode, a count of at least the walk's floor), and the call's picks \
+              stay for the decode after it. `split` admits, then streams the host experts the \
+              rule (`runtime::xsplit`) sends to the card through a ring of card slots for the \
+              ubatch alone (`host::xstream`): an expert streams when its columns cost the host \
+              union more than its copy and the card's columns, at the lane's rate the load's \
+              probe measured, cut at the ring's half and where the layer's copies would pass the \
+              union it keeps; a ubatch narrower than the rule's least width streams nothing, so \
+              decode and short prompts run as under `admit`. The host union leaves the streamed \
+              experts out. The prompt's bits are then the band's, not the decode steps'. `off` \
+              keeps a prompt call bit for bit the decode steps' state, the same-binary arm. \
+              Unset is `split` under `--place a` with a residency (`admit` when the card has no \
+              room for the ring, the load line saying so), `admit` under `--place bp` (the ring \
+              serves no expert tier), `off` everywhere else; `admit` and `split` are refused by \
+              name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` on \
+              a load with an expert tier. The load line prints `xstream=`, \
+              every streamed layer an `xstream` record, every call `xstream end`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

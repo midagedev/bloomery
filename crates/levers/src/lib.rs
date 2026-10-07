@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 mod registry;
 use registry::REGISTRY;
+pub use registry::XSTREAM;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
     HOST_LOCK, HOST_POPULATE, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
@@ -856,6 +857,14 @@ impl Levers {
             Some(Value::Flag(b)) => Some(b),
             ref v => panic!("{HOSTSTREAM} holds {v:?}, not a flag"),
         }
+    }
+
+    /// `BLOOMERY_XSTREAM`: what a Qwen3.8 prompt call moves — `off`, `admit`
+    /// (the residency's pick) or `split` (the pick, then the expert stream);
+    /// `None` when unset, which the binary resolves.
+    #[must_use]
+    pub fn xstream(&self) -> Option<&'static str> {
+        self.word(XSTREAM)
     }
 
     /// `BLOOMERY_LANE_PREFETCH`: the host union's row-lane packs prefetch

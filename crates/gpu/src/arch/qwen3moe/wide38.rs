@@ -69,22 +69,28 @@
 //! map with an expert on a tier card on a load that hung no tier is refused
 //! by name at the walk's entry (`card38`), before anything moves.
 //!
-//! Under host streaming (`BLOOMERY_HOSTSTREAM=on`, a residency machine, a
-//! prompt call fed by ubatches: V4.1's `body::prefill` flow at one ubatch a
-//! group) every walk of the call moves each card layer's residency pool
-//! toward the experts the unit routes most, at that layer: in the shadow, the
-//! host waits for the front's download, counts the unit's routed ids and the
-//! machine's pick (`SwapMachine::call_pick`, [`STREAM_FLOOR`] the least count
-//! admitted) sends the pool's coldest residents to the host and copies the
-//! hottest host experts over them; the engine stream waits for those copies
-//! before the card route, and the serve's union and the card route both run
-//! under the moved map. Unlike V4.1 there is no second card pass: the pick
-//! comes before the layer's only card route, which reads the moved words. The
-//! route is then the layer's reader of the call ([`Gemm38::stream_read`]),
-//! which the next ubatch's pick copies behind. The call's placement stays
-//! for the decode after it. A token's bits then depend on its ubatch's
-//! routing too — which of its experts the pick moved sums on the card, not
-//! the host — so the numeric class above holds for an unstreamed walk only.
+//! Under host streaming (`BLOOMERY_XSTREAM=admit|split`, a residency
+//! machine, a prompt call fed by ubatches) every walk of the call moves each
+//! card layer's residency pool toward the experts the unit routes most, at
+//! that layer: in the shadow, the host waits for the front's download,
+//! counts the unit's routed ids and the machine's pick
+//! (`SwapMachine::call_pick`, the least count admitted [`STREAM_FLOOR`] under
+//! `admit`, the stream rule's floor under `split`) sends the pool's coldest
+//! residents to the host and copies the hottest host experts over them; the
+//! engine stream waits for those copies before the card route, and the
+//! serve's union and the card route both run under the moved map. Under
+//! `split` the expert stream ([`crate::host::xstream`]) then sends the host
+//! experts its rule picks to a half of its ring for this unit alone, and the
+//! card route runs a second set of its launches over that half
+//! ([`CardRoute38::enqueue`]'s ring pass) before the card sum, which reads
+//! the stack's places and the ring's together; the serve's union leaves the
+//! streamed experts out. The route is then the layer's reader of the call
+//! ([`Gemm38::stream_read`]), which the next ubatch's pick and the ring's
+//! next use of the half copy behind. The call's placement stays for the
+//! decode after it; the stream's does not. A token's bits then depend on its
+//! ubatch's routing too — which of its experts the pick moved or the stream
+//! sent sums on the card, not the host — so the numeric class above holds
+//! for an unstreamed walk only.
 
 use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
@@ -106,6 +112,7 @@ use crate::host::BatchLeg;
 use crate::host::handoff::Places;
 use crate::host::run::HostRun;
 use crate::host::swap::{CallPick, CallReport};
+use crate::host::xstream::{RingLayer, XLayer, XMode, XReport};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -335,6 +342,36 @@ pub(super) struct CardRoute38 {
     /// The identity map over the experts (`e -> e`): the ids compression's
     /// stand-in for the places rule's map.
     ids_map: DeviceBuffer<u32>,
+    /// The ring pass's buffers once the load armed the expert stream
+    /// ([`CardRoute38::arm_ring`]).
+    ring: Option<RingRoute38>,
+}
+
+/// The ring pass's buffers: the route table over a half of the expert
+/// stream's ring, and per run the slots' places in the half (the ring row's)
+/// and in the card sum's places (the union row's), ten a run token.
+struct RingRoute38 {
+    route: GemmRoute,
+    sel: DeviceBuffer<u32>,
+    union: DeviceBuffer<u32>,
+}
+
+/// Layer `l`'s down stack `w` of type `ty` as the 32-value GEMM reads it:
+/// the file's Q5_1, Q8_0 or IQ4_NL blocks; any other type refused by name.
+fn down_weight(
+    l: usize,
+    ty: GgmlType,
+    w: &DeviceTensor<u32>,
+) -> Result<Gemm32Weight<'_>, GpuError> {
+    match ty {
+        GgmlType::Q5_1 => Ok(Gemm32Weight::Q5_1File(w)),
+        GgmlType::Q8_0 => Ok(Gemm32Weight::Q8_0File(w)),
+        GgmlType::IQ4_NL => Ok(Gemm32Weight::Iq4NlFile(w)),
+        other => Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
+        )),
+    }
 }
 
 impl CardRoute38 {
@@ -391,7 +428,31 @@ impl CardRoute38 {
                 stream,
                 &(0..geo::EXPERTS as u32).collect::<Vec<_>>(),
             )?,
+            ring: None,
         })
+    }
+
+    /// The ring pass's buffers for a half of `half_slots` slots of the
+    /// expert stream's ring: its route table and the run's two places.
+    /// Load-time only; a second arming is refused by name.
+    pub(super) fn arm_ring(
+        &mut self,
+        stream: &CudaStream,
+        half_slots: usize,
+    ) -> Result<(), GpuError> {
+        if self.ring.is_some() {
+            return Err(GpuError::state(
+                WHAT,
+                "a card route the ring is not armed on",
+            ));
+        }
+        let slots = self.run * geo::N_USED;
+        self.ring = Some(RingRoute38 {
+            route: GemmRoute::new(stream, slots, half_slots)?,
+            sel: DeviceBuffer::zeroed(stream, slots)?,
+            union: DeviceBuffer::zeroed(stream, slots)?,
+        });
+        Ok(())
     }
 
     /// Device bytes.
@@ -408,6 +469,9 @@ impl CardRoute38 {
             + self.trank.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
             + self.ids_map.num_bytes()
+            + self.ring.as_ref().map_or(0, |r| {
+                r.route.bytes() + r.sel.num_bytes() + r.union.num_bytes()
+            })
     }
 
     /// The route table's index for the experts' count `n_card`, refused by
@@ -439,12 +503,22 @@ impl CardRoute38 {
     /// into the unit-wide acc's rows for the run. Nine launches a run. On a
     /// tier layer (`tiered`) the card sum is the join's
     /// ([`CardRoute38::enqueue_tier_acc`]): eight launches a run, the places
-    /// and the down rows kept at the run's tokens of the unit. Refused by
-    /// name on a layer without card experts. Asynchronous, allocation-free,
-    /// capturable.
+    /// and the down rows kept at the run's tokens of the unit.
+    ///
+    /// With the layer's stream (`ring`, a half of the expert stream's ring)
+    /// each run then runs the ring pass before the card sum: the slots'
+    /// places in the half (the ring row) and in the card sum's (the union
+    /// row), the ring's route table, the gate and up GEMMs over the half, the
+    /// SwiGLU of the streamed slots and the down GEMM over the half — seven
+    /// launches — and the card sum reads the union places at the stack's
+    /// experts plus the streamed ones, so the stack's and the ring's slots
+    /// sum in slot order in one launch. Refused by name: a layer without card
+    /// experts, a stream on a tier layer, and a stream on a route the load
+    /// did not arm ([`CardRoute38::arm_ring`]). Asynchronous,
+    /// allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the route's ids, weights, normed rows, the slot map, the layer and the unit's width (rust-quality R8)"
+        reason = "the route's ids, weights, normed rows, the slot map, the layer, the unit's width and the stream (rust-quality R8)"
     )]
     pub(super) fn enqueue(
         &mut self,
@@ -454,21 +528,12 @@ impl CardRoute38 {
         (ffn_x, ids, weights): (&DeviceBuffer<f32>, &DeviceBuffer<u32>, &DeviceBuffer<f32>),
         slots: &DeviceTensor<u32>,
         (m, tiered): (usize, bool),
+        ring: Option<&RingLayer>,
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
         let (n_card, gate, up) = (st.n_card, st.gate, st.up);
         let gate_up_ty = GemmWeight::from_ggml(st.gate_up_ty)?;
-        let down = match st.down_ty {
-            GgmlType::Q5_1 => Gemm32Weight::Q5_1File(st.down),
-            GgmlType::Q8_0 => Gemm32Weight::Q8_0File(st.down),
-            GgmlType::IQ4_NL => Gemm32Weight::Iq4NlFile(st.down),
-            other => {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
-                ));
-            }
-        };
+        let down = down_weight(l, st.down_ty, st.down)?;
         let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
         let pitch = geo::N_USED + 1;
         // SAFETY: layer l's row of the slot map's card copy (`EXPERTS` words
@@ -487,113 +552,211 @@ impl CardRoute38 {
                 ),
             ));
         }
-        let mut c0 = 0;
-        while c0 < m {
-            let n = self.run.min(m - c0);
-            // The places and the down rows of the run: from the run's first
-            // token of the unit when the route keeps them for the join, else
-            // from the run buffers' start.
-            let at = if kept { c0 } else { 0 };
-            // SAFETY: tokens c0 .. c0 + n <= m <= rows of the walk's ids and
-            // weights (`rows · pitch` each) and the arena's `ffn_x`
-            // (`rows · HIDDEN`); the places and the down rows hold ten slots a
-            // token of the unit when kept, else of the run, so at .. at + n
-            // lies inside them; every buffer stays in place for this run's
-            // launches.
-            let (ids_w, w_w, x_w, mut acc_w, mut sel_w, mut down_w) = unsafe {
-                (
-                    param_view::<u32>(ids, c0 * pitch, n * pitch),
-                    f32_view(weights, c0 * pitch, n * pitch),
-                    f32_view(ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
-                    f32_view(&self.acc, c0 * geo::HIDDEN, n * geo::HIDDEN),
-                    param_view::<u32>(&self.sel, at * geo::N_USED, n * geo::N_USED),
-                    f32_view(
-                        &self.down,
-                        at * geo::N_USED * geo::HIDDEN,
-                        n * geo::N_USED * geo::HIDDEN,
-                    ),
-                )
-            };
-            let places = |map: &DeviceBuffer<u32>, out: &mut DeviceBuffer<u32>| {
-                c.k.handoff.enqueue_places_cols(
-                    stream,
-                    &Places {
-                        ids: &ids_w,
-                        map,
-                        row_off: 0,
-                        n_expert: geo::EXPERTS,
-                    },
-                    pitch,
-                    n,
-                    sink,
-                    out,
-                )
-            };
-            places(&self.ids_map, &mut self.ids)?;
-            places(&map, &mut sel_w)?;
-            let table = self.table_at(n_card)?;
-            c.k.g32.enqueue_route_remap(
-                stream,
-                &self.ids,
-                &map,
-                n * geo::N_USED,
-                &mut self.routes[table],
-                sink,
-            )?;
-            gpu.enqueue_quantize_gemm(&x_w, n, &mut self.x, sink)?;
-            for (w, y) in [(gate, &mut self.g), (up, &mut self.u)] {
-                c.k.gemm.enqueue_gemm(
-                    stream,
-                    GemmArgs {
-                        ty: gate_up_ty,
-                        w,
-                        rows_per_expert: geo::FF,
-                        act: &self.x,
-                        route: &self.routes[table],
-                        input: GemmInput::Shared { top_k: geo::N_USED },
-                        y,
-                    },
-                )?;
-            }
-            c.k.g32.enqueue_swiglu_quant32_sel(
-                stream,
-                &self.g,
-                &self.u,
-                &sel_w,
-                n_card,
-                n * geo::N_USED,
-                &mut self.act,
-                sink,
-            )?;
-            c.k.g32.enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: down,
-                    rows_per_expert: geo::HIDDEN,
-                    act: &self.act,
-                    route: &self.routes[table],
-                    input: GemmInput::PerSlot,
-                    y: &mut down_w,
-                },
-            )?;
-            if !tiered {
-                c.k.q38.enqueue_card_acc(
-                    stream,
-                    CardAccArgs {
-                        down: &down_w,
-                        w: &w_w,
-                        sel: &sel_w,
-                        n: geo::HIDDEN,
-                        m: n,
-                        n_card,
-                        fault: sink,
-                        acc: &mut acc_w,
-                    },
-                )?;
-            }
-            c0 += n;
+        if ring.is_some() && (tiered || self.ring.is_none()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: a stream of the expert stream's ring on a {}",
+                    if tiered {
+                        "tier layer (the ring serves a load with no expert tier)"
+                    } else {
+                        "card route the load did not arm for it"
+                    }
+                ),
+            ));
         }
-        Ok(())
+        let ctx = gpu.context();
+        // SAFETY: the stream's ring row and union row are `EXPERTS` words of
+        // its mapped host rows, and its half holds `half_slots` experts of
+        // this layer's part bytes in each part from the half's first slot —
+        // its gate and up rows of the stack's words, its down rows likewise
+        // (`XStream::ring_layer`); all stay allocated while the stream lives,
+        // past these launches, and the windows are given back below.
+        let windows = ring.map(|r| unsafe {
+            (
+                crate::tensor::window::<u32>(r.ring_map, geo::EXPERTS, ctx),
+                crate::tensor::window::<u32>(r.union_map, geo::EXPERTS, ctx),
+                DeviceTensor::<u32>::window(r.parts[0], r.half_slots * geo::FF, gate.cols(), ctx),
+                DeviceTensor::<u32>::window(r.parts[1], r.half_slots * geo::FF, up.cols(), ctx),
+                DeviceTensor::<u32>::window(
+                    r.parts[2],
+                    r.half_slots * geo::HIDDEN,
+                    st.down.cols(),
+                    ctx,
+                ),
+            )
+        });
+        let ran = (|| {
+            let mut c0 = 0;
+            while c0 < m {
+                let n = self.run.min(m - c0);
+                // The places and the down rows of the run: from the run's
+                // first token of the unit when the route keeps them for the
+                // join, else from the run buffers' start.
+                let at = if kept { c0 } else { 0 };
+                // SAFETY: tokens c0 .. c0 + n <= m <= rows of the walk's ids
+                // and weights (`rows · pitch` each) and the arena's `ffn_x`
+                // (`rows · HIDDEN`); the places and the down rows hold ten
+                // slots a token of the unit when kept, else of the run, so at
+                // .. at + n lies inside them; every buffer stays in place for
+                // this run's launches.
+                let (ids_w, w_w, x_w, mut acc_w, mut sel_w, mut down_w) = unsafe {
+                    (
+                        param_view::<u32>(ids, c0 * pitch, n * pitch),
+                        f32_view(weights, c0 * pitch, n * pitch),
+                        f32_view(ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                        f32_view(&self.acc, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                        param_view::<u32>(&self.sel, at * geo::N_USED, n * geo::N_USED),
+                        f32_view(
+                            &self.down,
+                            at * geo::N_USED * geo::HIDDEN,
+                            n * geo::N_USED * geo::HIDDEN,
+                        ),
+                    )
+                };
+                let places = |map: &DeviceBuffer<u32>, out: &mut DeviceBuffer<u32>| {
+                    c.k.handoff.enqueue_places_cols(
+                        stream,
+                        &Places {
+                            ids: &ids_w,
+                            map,
+                            row_off: 0,
+                            n_expert: geo::EXPERTS,
+                        },
+                        pitch,
+                        n,
+                        sink,
+                        out,
+                    )
+                };
+                places(&self.ids_map, &mut self.ids)?;
+                places(&map, &mut sel_w)?;
+                let table = self.table_at(n_card)?;
+                c.k.g32.enqueue_route_remap(
+                    stream,
+                    &self.ids,
+                    &map,
+                    n * geo::N_USED,
+                    &mut self.routes[table],
+                    sink,
+                )?;
+                gpu.enqueue_quantize_gemm(&x_w, n, &mut self.x, sink)?;
+                for (w, y) in [(gate, &mut self.g), (up, &mut self.u)] {
+                    c.k.gemm.enqueue_gemm(
+                        stream,
+                        GemmArgs {
+                            ty: gate_up_ty,
+                            w,
+                            rows_per_expert: geo::FF,
+                            act: &self.x,
+                            route: &self.routes[table],
+                            input: GemmInput::Shared { top_k: geo::N_USED },
+                            y,
+                        },
+                    )?;
+                }
+                c.k.g32.enqueue_swiglu_quant32_sel(
+                    stream,
+                    &self.g,
+                    &self.u,
+                    &sel_w,
+                    n_card,
+                    n * geo::N_USED,
+                    &mut self.act,
+                    sink,
+                )?;
+                c.k.g32.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w: down,
+                        rows_per_expert: geo::HIDDEN,
+                        act: &self.act,
+                        route: &self.routes[table],
+                        input: GemmInput::PerSlot,
+                        y: &mut down_w,
+                    },
+                )?;
+                // The card sum's places and experts: the stack's, or with a
+                // stream the union row's over the stack's and the ring's.
+                let mut sum_places = (&*sel_w, n_card);
+                if let (Some(r), Some((ring_map, union_map, wg, wu, wd)), Some(rr)) =
+                    (ring, windows.as_ref(), self.ring.as_mut())
+                {
+                    places(ring_map, &mut rr.sel)?;
+                    places(union_map, &mut rr.union)?;
+                    c.k.g32.enqueue_route_remap(
+                        stream,
+                        &self.ids,
+                        ring_map,
+                        n * geo::N_USED,
+                        &mut rr.route,
+                        sink,
+                    )?;
+                    for (w, y) in [(&**wg, &mut self.g), (&**wu, &mut self.u)] {
+                        c.k.gemm.enqueue_gemm(
+                            stream,
+                            GemmArgs {
+                                ty: gate_up_ty,
+                                w,
+                                rows_per_expert: geo::FF,
+                                act: &self.x,
+                                route: &rr.route,
+                                input: GemmInput::Shared { top_k: geo::N_USED },
+                                y,
+                            },
+                        )?;
+                    }
+                    c.k.g32.enqueue_swiglu_quant32_sel(
+                        stream,
+                        &self.g,
+                        &self.u,
+                        &rr.sel,
+                        r.n,
+                        n * geo::N_USED,
+                        &mut self.act,
+                        sink,
+                    )?;
+                    c.k.g32.enqueue_gemm32(
+                        stream,
+                        Gemm32Args {
+                            w: down_weight(l, st.down_ty, wd)?,
+                            rows_per_expert: geo::HIDDEN,
+                            act: &self.act,
+                            route: &rr.route,
+                            input: GemmInput::PerSlot,
+                            y: &mut down_w,
+                        },
+                    )?;
+                    sum_places = (&rr.union, n_card + r.n);
+                }
+                if !tiered {
+                    c.k.q38.enqueue_card_acc(
+                        stream,
+                        CardAccArgs {
+                            down: &down_w,
+                            w: &w_w,
+                            sel: sum_places.0,
+                            n: geo::HIDDEN,
+                            m: n,
+                            n_card: sum_places.1,
+                            fault: sink,
+                            acc: &mut acc_w,
+                        },
+                    )?;
+                }
+                c0 += n;
+            }
+            Ok(())
+        })();
+        if let Some((ring_map, union_map, wg, wu, wd)) = windows {
+            for w in [ring_map, union_map] {
+                drop(std::mem::ManuallyDrop::into_inner(w).into_raw_parts());
+            }
+            for w in [wg, wu, wd] {
+                DeviceTensor::release(w);
+            }
+        }
+        ran
     }
 
     /// The unit's tier places, for the front's places launch and the
@@ -1128,10 +1291,11 @@ impl WideParts<'_> {
     /// Layer `l`'s card route over the arena's `ffn_x`, when it has card
     /// experts ([`CardRoute38::enqueue`], the walk's module doc): the places
     /// from the walk's ids, the grouped gate·up, SwiGLU and down over the
-    /// run's tokens, the card sums into the unit-wide acc. Called from the
-    /// walk's shadow only — after the front's download, the stream order the
+    /// run's tokens, the ring pass over the layer's stream when `ring` is
+    /// one, the card sums into the unit-wide acc. Called from the walk's
+    /// shadow only — after the front's download, the stream order the
     /// route's buffers exist under.
-    fn route_card(&mut self, l: usize) -> Result<(), GpuError> {
+    fn route_card(&mut self, l: usize, ring: Option<&RingLayer>) -> Result<(), GpuError> {
         if !self.card.has(l) {
             return Ok(());
         }
@@ -1149,6 +1313,7 @@ impl WideParts<'_> {
             (&s.ffn_x, &x.ids, &x.weights),
             self.slots,
             (m, tiered),
+            ring,
         )
     }
 
@@ -1567,30 +1732,54 @@ fn qsa(
     Ok((dense, m - dense))
 }
 
-/// The least count an expert's ubatch routes to it for a streaming pick to
+/// The least count an expert's ubatch routes to it for an `admit` pick to
 /// admit it: about the least column count whose share of the host union
 /// passes one flip's copy on the staging ring (an expert's three stacks),
 /// which the layer's card route waits for [derived]; V4.1's `STREAM_FLOOR`,
 /// the same value, sits inside that estimate's error. Below it a flip
 /// lengthens a layer whose card already waits on its copies more than it
-/// shortens the union.
+/// shortens the union. A `split` pick in a unit that lights the stream's
+/// ring admits from the stream rule's floor, at the lane's measured rate,
+/// instead ([`pick_floor`]).
 pub(super) const STREAM_FLOOR: u32 = 32;
 
-/// A prompt call's host streaming (`BLOOMERY_HOSTSTREAM`, the residency
-/// machine's call mode): whether the next prompt calls stream, whether one
-/// is streaming now, the pick's count buffer, and the call's pick and end
-/// records for the binary that prints them.
+/// A `split` pick's floor at a layer of the rule's constants `k`, in a unit
+/// wide enough to light the stream's ring: the least count past the stream
+/// rule's floor ([`runtime::xsplit::m_star`]), the count from which the card
+/// pays the expert's copy back, admitted or streamed. [`STREAM_FLOOR`] for a
+/// layer the stream holds no constants of.
+pub(super) fn pick_floor(k: Option<runtime::xsplit::Constants>) -> u32 {
+    k.map_or(STREAM_FLOOR, |k| {
+        let floor = runtime::xsplit::m_star(&k).floor();
+        if floor.is_finite() && floor < f64::from(u32::MAX) {
+            floor as u32 + 1
+        } else {
+            u32::MAX
+        }
+    })
+}
+
+/// A prompt call's host streaming (`BLOOMERY_XSTREAM`, the residency
+/// machine's call mode and the expert stream): what the next prompt calls
+/// move, whether one is streaming now, the pick's count buffer, and the
+/// call's pick, stream and end records for the binary that prints them.
 #[derive(Default)]
 pub(super) struct Stream38 {
-    /// The next prompt calls stream ([`super::body38::Body38::set_hoststream`]).
-    pub(super) lever: bool,
+    /// What the next prompt calls move ([`super::body38::Body38::set_xstream`]).
+    pub(super) mode: Option<XMode>,
     /// A call is streaming: every ubatch walk of it picks.
     pub(super) on: bool,
+    /// The streaming call runs the expert stream too (`split`).
+    pub(super) split: bool,
     /// The ubatch the walk runs, from 0, the pick records' group.
     pub(super) ubatch: usize,
     counts: Vec<u32>,
     pub(super) picks: Vec<(usize, CallPick)>,
     pub(super) end: Option<CallReport>,
+    /// Per streamed layer of the call, its ubatch and what it streamed; the
+    /// stream's end.
+    pub(super) layers: Vec<(usize, XLayer)>,
+    pub(super) xend: Option<XReport>,
 }
 
 /// A ubatch's walk `(1, m, Batch)`: every layer through the batch port at
@@ -1648,23 +1837,48 @@ impl<'a> Gemm38<'a> {
     /// Under host streaming, on a layer with card experts, the layer's pick
     /// before its card route: the host waits for the front's download of the
     /// unit's routed ids, counts them, and the residency machine's pick
-    /// (`SwapMachine::call_pick`, [`STREAM_FLOOR`] the least count admitted)
-    /// sends the pool's coldest residents to the host and copies the unit's
-    /// hottest host experts over them, the host map and the card's copy of
-    /// the layer's words moved at once — so the union the walk's serve runs
-    /// next, and the card route, run under the moved map — then the engine
-    /// stream waits for the pick's copies. Nothing else, and nothing in a
-    /// unit of fewer rows than the floor.
-    fn stream_pick(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+    /// (`SwapMachine::call_pick`, the least count admitted [`STREAM_FLOOR`]
+    /// under `admit`, [`pick_floor`] under `split`) sends the pool's coldest
+    /// residents to the host and copies the unit's hottest host experts over
+    /// them, the host map and the card's copy of the layer's words moved at
+    /// once — so the union the walk's serve runs next, and the card route,
+    /// run under the moved map — then the engine stream waits for the pick's
+    /// copies. Under `split` the expert stream then takes the layer
+    /// ([`crate::host::HostTier::xstream_layer`]): the host experts its rule
+    /// sends to the card stream into a half of its ring, the engine stream
+    /// waits for their copies, and the serve leaves them out; the layer's
+    /// ring view for its card route is returned. Nothing else, and nothing in
+    /// a unit of fewer rows than the floor.
+    fn stream_pick(
+        &mut self,
+        port: &mut BatchLeg<'a, HostRun>,
+        at: At,
+    ) -> Result<Option<RingLayer>, GpuError> {
         let l = at.layer;
+        if !self.p.stream.on || !self.p.card.has(l) {
+            return Ok(None);
+        }
+        let split = self.p.stream.split;
+        // The stream's floor only where its ring is lit: a narrower unit
+        // admits as `admit` does, so short prompts move what they did.
+        let k = port.hybrid().xstream().and_then(|x| x.constants(l));
+        let lit = split && k.is_some_and(|k| self.p.m as u64 >= runtime::xsplit::m_min(&k));
+        let floor = match lit {
+            true => pick_floor(k),
+            false => STREAM_FLOOR,
+        };
         // A unit of fewer rows than the floor gives no expert a count the
-        // pick admits (a call's last ubatch can be one).
-        if !self.p.stream.on || !self.p.card.has(l) || self.p.m < STREAM_FLOOR as usize {
-            return Ok(());
+        // pick admits (a call's last ubatch can be one), and the stream's
+        // least width is wider than its floor.
+        if self.p.m < floor as usize {
+            return Ok(None);
         }
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
         let s = &mut *self.p.stream;
+        if split {
+            port.hybrid().call_floor(floor)?;
+        }
         let pick = port
             .hybrid()
             .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?;
@@ -1674,18 +1888,32 @@ impl<'a> Gemm38<'a> {
             "a residency machine's call for the streamed layer",
         ))?;
         stream.wait(landed)?;
-        Ok(())
+        if !split {
+            return Ok(None);
+        }
+        let x = port
+            .hybrid()
+            .xstream_layer(stream, key, self.p.m, &s.counts, pick.admitted)?;
+        s.layers.push((s.ubatch, x));
+        Ok(port.hybrid().xstream_ring(l))
     }
 
     /// Under host streaming, on a layer with card experts, the layer's last
     /// read of its slots in the call so far, after its card route
     /// (`SwapMachine::call_reader`): the next ubatch's pick of the layer
-    /// copies behind it. Nothing else.
+    /// copies behind it; under `split` the read of its stream's half too
+    /// ([`crate::host::HostTier::xstream_read`]), which the half's next
+    /// stream copies behind. Nothing else.
     fn stream_read(&mut self, port: &mut BatchLeg<'a, HostRun>, l: usize) -> Result<(), GpuError> {
         if !self.p.stream.on || !self.p.card.has(l) {
             return Ok(());
         }
-        port.hybrid().call_reader(l, self.p.c.gpu.stream())
+        let stream = self.p.c.gpu.stream();
+        port.hybrid().call_reader(l, stream)?;
+        if self.p.stream.split {
+            port.hybrid().xstream_read(l, stream)?;
+        }
+        Ok(())
     }
 
     /// After the walk: the head's mix over the unit's columns (the last
@@ -1757,20 +1985,20 @@ impl<'a> LayerProgram for Gemm38<'a> {
     /// the d2h would queue behind the route's card GEMMs and the host tier
     /// would start late by their whole time. Under host streaming the shared
     /// expert comes first, so the card runs it while the host counts and
-    /// picks; then the layer's pick and the route after its copies
-    /// ([`Gemm38::stream_pick`]), the route the layer's last read of its
-    /// slots in the call ([`Gemm38::stream_read`]).
+    /// picks; then the layer's pick (and stream) and the route after its
+    /// copies ([`Gemm38::stream_pick`]), the route the layer's last read of
+    /// its slots in the call ([`Gemm38::stream_read`]).
     fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
         let r = if self.p.stream.on {
             self.p
                 .shared(at.layer)
                 .and_then(|()| self.stream_pick(port, at))
-                .and_then(|()| self.p.route_card(at.layer))
+                .and_then(|ring| self.p.route_card(at.layer, ring.as_ref()))
                 .and_then(|()| self.stream_read(port, at.layer))
         } else {
             self.p
-                .route_card(at.layer)
+                .route_card(at.layer, None)
                 .and_then(|()| self.p.shared(at.layer))
         }
         .and_then(|()| port.mark(at, Mark::Shadow as usize));

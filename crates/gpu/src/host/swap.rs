@@ -3345,6 +3345,13 @@ impl SwapMachine {
     pub fn deadline(&self) -> Duration {
         self.shared.deadline
     }
+
+    /// The machine's source: what the expert stream ([`super::xstream`])
+    /// copies a prompt unit's streamed experts from.
+    #[must_use]
+    pub(crate) fn source(&self) -> Arc<dyn SwapSource> {
+        Arc::clone(&self.shared.source)
+    }
 }
 
 /// FNV-1a 64 over `counts`, each a little-endian `u32`: a pick's input

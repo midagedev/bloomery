@@ -37,6 +37,7 @@ pub mod stores;
 pub mod swaprule;
 pub mod width;
 pub mod words;
+pub mod xsplit;
 
 pub use lookup::Lookup;
 pub use speculative::{
