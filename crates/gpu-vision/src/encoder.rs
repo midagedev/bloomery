@@ -31,7 +31,12 @@
 //! Weights: every matrix as the file's bf16; the gains and biases, which the file holds as f32
 //! (exact promotions of the checkpoint's bf16), as f32 — the kernels add a bias and scale by a
 //! gain in f32. `ffn_gate` and `ffn_up` are uploaded as one `[2·ff, dim]` matrix (gate rows
-//! first), `MLP.w1`'s own layout, so step 8 is one GEMM.
+//! first), `MLP.w1`'s own layout, so step 8 is one GEMM. The span's delimiter rows stay in the
+//! file: the text model's span assembly reads them on the host.
+//!
+//! Bytes on the card: `vision::arch::deepseek41v::card`'s figure, the one a plan reserves — the
+//! activations are allocated from its lengths, and a load whose uploads differ from its weights is
+//! refused by name.
 
 use crate::aligner::{AlignerKernels, UnfoldArgs, cells};
 use crate::attn::{AttnArgs, AttnKernels, QkvLayout};
@@ -44,6 +49,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Gguf;
 use std::sync::Arc;
 use vision::Patches;
+use vision::arch::deepseek41v::card::{CardBytes, ScratchLens};
 use vision::arch::deepseek41v::{Hparams, names, tensors};
 
 /// One block's weights on the card.
@@ -72,8 +78,8 @@ struct Weights {
 }
 
 impl Weights {
-    /// Bytes on the card: two per bf16, four per f32.
-    fn bytes(&self) -> usize {
+    /// Bytes uploaded: two per bf16, four per f32 — what the load holds against the card figure.
+    fn uploaded(&self) -> usize {
         let blocks: usize = self
             .blocks
             .iter()
@@ -121,12 +127,13 @@ pub struct Encoded<'a> {
 }
 
 /// The loaded encoder: the chain of one file, the activations of the largest image a plan makes,
-/// and the stream every call runs on. A call takes `&mut self`: one image at a time owns the
-/// activations, which are reused in the stream's order, and the rows it returns borrow them until
-/// the next call.
+/// its bytes on the card, and the stream every call runs on. A call takes `&mut self`: one image
+/// at a time owns the activations, which are reused in the stream's order, and the rows it returns
+/// borrow them until the next call.
 pub struct Encoder {
     chain: Chain,
     s: Scratch,
+    card: CardBytes,
     stream: Arc<CudaStream>,
 }
 
@@ -140,18 +147,16 @@ struct Chain {
     mlp: MlpKernels,
     aligner: AlignerKernels,
     w: Weights,
-    weight_bytes: usize,
 }
 
-/// The activations of the largest image a plan makes (`GridParams::max_patches` patches,
-/// `GridParams::max_cells` aligner rows), allocated at load. An image of `n` patches uses the
-/// first `n` rows of each buffer: its patches and its RoPE table are copied in, and every launch
-/// reads only rows that a copy or an earlier launch of the same image wrote, so nothing a larger
-/// image left behind is read.
+/// The activations of the largest image a plan makes, allocated at load from [`ScratchLens`]
+/// (`GridParams::max_patches` patches, `GridParams::max_cells` aligner rows). An image of `n`
+/// patches uses the first `n` rows of each buffer: its patches and its RoPE table are copied in,
+/// and every launch reads only rows that a copy or an earlier launch of the same image wrote, so
+/// nothing a larger image left behind is read.
 struct Scratch {
-    /// Patches and aligner rows the buffers hold.
-    max_patches: usize,
-    max_cells: usize,
+    /// The lengths the buffers were allocated at.
+    lens: ScratchLens,
     /// The image's patches and its RoPE table.
     patches: DeviceBuffer<u16>,
     cs: DeviceBuffer<f32>,
@@ -175,8 +180,9 @@ fn err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static) ->
 
 impl Encoder {
     /// Read the file's hyperparameters and tensor table (both refused by name when they are not
-    /// the V4.1 encoder's), upload every weight and allocate the activations; every later call
-    /// runs on `stream`. Load-time only.
+    /// the V4.1 encoder's), upload every weight — refused by name when the uploads are not the
+    /// card figure's weights ([`CardBytes`]) — and allocate the activations; every later call runs
+    /// on `stream`. Load-time only.
     pub fn load(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
@@ -190,6 +196,16 @@ impl Encoder {
                 .map(|t| (t.name.as_str(), t.dims.as_slice(), t.ty)),
         )
         .map_err(|e| err(what, e))?;
+        if hp.dim / hp.n_head != 2 * PAIRS {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "heads of {} values; the RoPE table turns {PAIRS} pairs a head",
+                    hp.dim / hp.n_head
+                ),
+            });
+        }
+        let card = CardBytes::of(&hp);
         let bf16 = |name: String| up_bf16(stream, file, &name);
         let f32s = |name: String| up_f32(stream, file, &name);
         let mut blocks = Vec::with_capacity(hp.n_layer);
@@ -217,8 +233,18 @@ impl Encoder {
             mm2_w: bf16(names::mm2_weight())?,
             mm2_b: f32s(names::mm2_bias())?,
         };
-        let bytes = w.bytes();
-        let s = Scratch::new(stream, &hp)?;
+        let uploaded = w.uploaded();
+        if uploaded as u64 != card.weights {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "uploaded {uploaded} B of weights; the card figure of the file's tensor table \
+                     (CardBytes) is {} B",
+                    card.weights
+                ),
+            });
+        }
+        let s = Scratch::new(stream, ScratchLens::of(&hp))?;
         stream.synchronize()?;
         Ok(Encoder {
             chain: Chain {
@@ -230,9 +256,9 @@ impl Encoder {
                 aligner: AlignerKernels::load(ctx)?,
                 hp,
                 w,
-                weight_bytes: bytes,
             },
             s,
+            card,
             stream: Arc::clone(stream),
         })
     }
@@ -243,16 +269,18 @@ impl Encoder {
         &self.chain.hp
     }
 
-    /// Bytes of weights on the card.
+    /// Bytes of weights on the card: the card figure's ([`CardBytes::weights`]), which the load
+    /// held the uploads to.
     #[must_use]
-    pub fn weight_bytes(&self) -> usize {
-        self.chain.weight_bytes
+    pub fn weight_bytes(&self) -> u64 {
+        self.card.weights
     }
 
-    /// Bytes of activations on the card: the buffers of the largest image a plan makes.
+    /// Bytes of activations on the card: the buffers of the largest image a plan makes, allocated
+    /// at the card figure's lengths ([`CardBytes::scratch`]).
     #[must_use]
-    pub fn scratch_bytes(&self) -> usize {
-        self.s.bytes()
+    pub fn scratch_bytes(&self) -> u64 {
+        self.card.scratch
     }
 
     /// Chain launches of one encode at `n_layer` blocks: the patch GEMM, nine per block, the
@@ -374,46 +402,24 @@ impl Encoder {
 }
 
 impl Scratch {
-    /// The buffers of `hp`'s largest plan, zero-filled. Load-time only.
-    fn new(stream: &CudaStream, hp: &Hparams) -> Result<Scratch, GpuError> {
-        let grid = hp.grid();
-        let (n, n_llm) = (grid.max_patches(), grid.max_cells());
-        let (dim, ff) = (hp.dim, hp.ff);
-        let unfold_w = dim * hp.downsample * hp.downsample;
+    /// The buffers at `lens`, zero-filled. Load-time only.
+    fn new(stream: &CudaStream, lens: ScratchLens) -> Result<Scratch, GpuError> {
+        let bf16 = |n: usize| DeviceBuffer::<u16>::zeroed(stream, n);
         Ok(Scratch {
-            max_patches: n,
-            max_cells: n_llm,
-            patches: DeviceBuffer::zeroed(stream, n * 3 * hp.patch * hp.patch)?,
-            cs: DeviceBuffer::zeroed(stream, n * 2 * PAIRS)?,
-            xa: DeviceBuffer::zeroed(stream, n * dim)?,
-            xb: DeviceBuffer::zeroed(stream, n * dim)?,
-            h: DeviceBuffer::zeroed(stream, n * dim)?,
-            qkv: DeviceBuffer::zeroed(stream, n * 3 * dim)?,
-            att: DeviceBuffer::zeroed(stream, n * dim)?,
-            u: DeviceBuffer::zeroed(stream, n * 2 * ff)?,
-            act: DeviceBuffer::zeroed(stream, n * ff)?,
-            un: DeviceBuffer::zeroed(stream, n_llm * unfold_w)?,
-            hh: DeviceBuffer::zeroed(stream, n_llm * hp.out_dim)?,
-            rows: DeviceBuffer::zeroed(stream, n_llm * hp.out_dim)?,
+            lens,
+            patches: bf16(lens.patches)?,
+            cs: DeviceBuffer::zeroed(stream, lens.cs)?,
+            xa: bf16(lens.xa)?,
+            xb: bf16(lens.xb)?,
+            h: bf16(lens.h)?,
+            qkv: bf16(lens.qkv)?,
+            att: bf16(lens.att)?,
+            u: bf16(lens.u)?,
+            act: bf16(lens.act)?,
+            un: bf16(lens.un)?,
+            hh: bf16(lens.hh)?,
+            rows: bf16(lens.rows)?,
         })
-    }
-
-    /// Bytes on the card.
-    fn bytes(&self) -> usize {
-        let bf16 = [
-            &self.patches,
-            &self.xa,
-            &self.xb,
-            &self.h,
-            &self.qkv,
-            &self.att,
-            &self.u,
-            &self.act,
-            &self.un,
-            &self.hh,
-            &self.rows,
-        ];
-        self.cs.num_bytes() + bf16.iter().map(|b| b.num_bytes()).sum::<usize>()
     }
 
     /// Start an `n_h × n_w` image: refuse a grid larger than the buffers (no plan makes one),
@@ -427,12 +433,12 @@ impl Scratch {
     ) -> Result<(), GpuError> {
         let (ch, cw) = cells(n_h, n_w, hp.downsample);
         let (n, n_llm) = (n_h * n_w, ch * cw);
-        if n > self.max_patches || n_llm > self.max_cells {
+        if n > self.lens.max_patches || n_llm > self.lens.max_cells {
             return Err(GpuError::Shape {
                 what,
                 detail: format!(
                     "a {n_h}x{n_w} grid ({n} patches, {n_llm} aligner rows) does not fit the encoder's buffers, sized for the largest grid a plan makes: {} patches, {} aligner rows",
-                    self.max_patches, self.max_cells
+                    self.lens.max_patches, self.lens.max_cells
                 ),
             });
         }

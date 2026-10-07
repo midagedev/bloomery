@@ -44,7 +44,7 @@ else
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
   # The commit goes to cargo alone: the servers refuse a BLOOMERY_* variable they do not read.
-  BLOOMERY_BUILD_COMMIT="$COMMIT" cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release "${bin_args[@]}"
+  BLOOMERY_BUILD_COMMIT="$COMMIT" cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision --release "${bin_args[@]}"
 fi
 
 fail=0

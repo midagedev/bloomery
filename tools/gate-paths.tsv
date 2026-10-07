@@ -92,7 +92,8 @@ crates/gpu/src/arch/deepseek2/**	gate-ds41-bind gate-gpu-e2e gate-gpu-hybrid gat
 # weekly-* recipe has a row.
 crates/serve/**	weekly-gpu-ds41-serve	the server crate
 crates/gpu-gates/src/bin/{bloomery_serve_ds41.rs,gate_ds41_serve.rs}	weekly-gpu-ds41-serve	the V4.1 server and its gate's own bins
-crates/gpu-gates/src/{bind*,serve_client.rs}	weekly-gpu-ds41-serve	the server's engine binding and the gate's HTTP client
+crates/gpu-gates/src/bin/shared/serve_seats/ds41.rs	weekly-gpu-ds41-serve	the V4.1 server's seat (the flags, the plan, the image encoder)
+crates/gpu-gates/src/{bind*,ds41_media.rs,serve_client.rs}	weekly-gpu-ds41-serve	the server's engine binding, the V4.1 image span assembly it shares with the media gate, and the gate's HTTP client
 crates/app/**	weekly-gpu-ds41-serve	the session the server drives
 crates/gpu-glm5next/**	weekly-gpu-glm5next-e2e-long	the GLM engine: its long step sets are its only comparisons with ik past 4 positions
 crates/model/src/arch/glm5next/**	weekly-gpu-glm5next-e2e-long	the GLM file's reader and placement

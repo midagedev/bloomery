@@ -4,7 +4,8 @@
 //! Matrices are bf16 (the checkpoint's own type — the file is a relabelling of it); gains, biases
 //! and delimiter rows are f32. A tensor under a name the table does not know is refused by that
 //! name before anything else is looked at, so a file of another layout fails on its first
-//! unfamiliar tensor, not on a shape.
+//! unfamiliar tensor, not on a shape. Each row also says where the tensor lives once loaded
+//! ([`Home`]): the encoder's card, or the host's span assembly.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,12 +14,41 @@ use gguf::GgmlType;
 use super::{Hparams, names};
 use crate::VisionError;
 
+/// Where a tensor of the file lives once it is loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Home {
+    /// Uploaded with the encoder's weights (`gpu_vision::Encoder::load`).
+    Card,
+    /// A span delimiter row: the text model's input, read on the host by the span assembly and
+    /// never uploaded with the encoder.
+    Span,
+}
+
 /// One tensor the file must hold, dims in ggml `ne[]` order (the contiguous axis first).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Expected {
     pub name: String,
     pub dims: Vec<u64>,
     pub ty: GgmlType,
+    pub home: Home,
+}
+
+impl Expected {
+    /// The tensor's bytes, in the file and wherever it is loaded: two per bf16 value, four per
+    /// f32.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        let values: u64 = self.dims.iter().product();
+        match self.ty {
+            GgmlType::BF16 => 2 * values,
+            GgmlType::F32 => 4 * values,
+            ty => unreachable!(
+                "the {} table holds bf16 and f32 rows; {} is {ty}",
+                super::PROJECTOR_TYPE,
+                self.name
+            ),
+        }
+    }
 }
 
 /// Every tensor of a file with these hyperparameters, in the table's order.
@@ -31,11 +61,17 @@ pub fn expected(hp: &Hparams) -> Vec<Expected> {
         name,
         dims: dims.to_vec(),
         ty: GgmlType::BF16,
+        home: Home::Card,
     };
     let vec = |name: String, n: u64| Expected {
         name,
         dims: vec![n],
         ty: GgmlType::F32,
+        home: Home::Card,
+    };
+    let span = |name: String| Expected {
+        home: Home::Span,
+        ..vec(name, out)
     };
     let mut all = vec![
         mat(names::patch_embd_weight(), &[p, p, 3, dim]),
@@ -60,9 +96,9 @@ pub fn expected(hp: &Hparams) -> Vec<Expected> {
         vec(names::mm1_bias(), out),
         mat(names::mm2_weight(), &[out, out]),
         vec(names::mm2_bias(), out),
-        vec(names::img_start(), out),
-        vec(names::img_end(), out),
-        vec(names::image_newline(), out),
+        span(names::img_start()),
+        span(names::img_end()),
+        span(names::image_newline()),
     ]);
     all
 }
@@ -110,11 +146,12 @@ pub fn check<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{check, expected};
     use crate::arch::deepseek41v::Hparams;
 
-    fn hp() -> Hparams {
+    /// The V4.1 file's hyperparameters.
+    pub(in crate::arch::deepseek41v) fn hp() -> Hparams {
         Hparams {
             n_layer: 32,
             dim: 1024,

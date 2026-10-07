@@ -50,6 +50,7 @@ use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
+use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
     PlacementProps, ResidencyReset, SamplerFactory, SamplingParams, Saved, SavedState, StateError,
@@ -453,6 +454,10 @@ const PIPE_DEPTH: usize = 2;
 /// What the engine thread is asked to do.
 enum Cmd {
     Prefill(Vec<u32>),
+    /// [`Seat::prefill_media`]: `ids` with the images they carry, one feed a
+    /// span, every span whole inside the call ([`Engine::prefill_media`]'s
+    /// contract).
+    PrefillMedia(Vec<u32>, Vec<MediaFeed>),
     /// With the engine's logits buffer when the caller wants the row.
     Next {
         last: u32,
@@ -590,6 +595,24 @@ pub trait Seat: 'static {
     /// one step per id), the draft fed as the call hands its rows over; the
     /// argmax after the last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError>;
+    /// [`Seat::prefill`] where the slice carries images
+    /// ([`Engine::prefill_media`]'s contract): each feed's `at` is its span's
+    /// first position in `ids`, every span lies whole inside the slice, and
+    /// every position of a span carries the model's image token. The default
+    /// is [`Seat::prefill`] when the slice carries no image, and a named
+    /// refusal when it does.
+    fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
+        if feeds.is_empty() {
+            return self.prefill(ids);
+        }
+        Err("this seat takes no image input".into())
+    }
+    /// The seat's image input, `None` for a seat that takes none
+    /// ([`Engine::media_model`]): read once, at the load. The default is
+    /// `None`.
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        None
+    }
     /// One step on `last` at `pos`, the draft fed its row; the argmax after it.
     fn step(&mut self, last: u32) -> Result<u32, GateError>;
     /// The head's logits after the last step into `row` (`n_vocab` f32).
@@ -791,6 +814,8 @@ pub struct SeatEngine {
     slot_drafts: bool,
     /// [`Seat::drafts_sampled`], the opened seat's.
     drafts_sampled: bool,
+    /// [`Seat::media_model`], the opened seat's.
+    media: Option<SharedMediaModel>,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -839,8 +864,20 @@ impl SeatEngine {
     {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
-        let (opened, loaded) =
-            mpsc::channel::<Result<(usize, usize, usize, bool, bool, EngineProps), String>>();
+        let (opened, loaded) = mpsc::channel::<
+            Result<
+                (
+                    usize,
+                    usize,
+                    usize,
+                    bool,
+                    bool,
+                    Option<SharedMediaModel>,
+                    EngineProps,
+                ),
+                String,
+            >,
+        >();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -859,6 +896,7 @@ impl SeatEngine {
                         g.slots(),
                         g.slot_drafts(),
                         g.drafts_sampled(),
+                        g.media_model(),
                         g.props(props),
                     )))
                     .is_err()
@@ -967,8 +1005,9 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, slots, slot_drafts, drafts_sampled, props) = match loaded.recv() {
-            Ok(Ok((c, rows, n, d, ds, props))) => (c.min(defined), rows, n, d, ds, props),
+        let (ctx_max, rows, slots, slot_drafts, drafts_sampled, media, props) = match loaded.recv()
+        {
+            Ok(Ok((c, rows, n, d, ds, m, props))) => (c.min(defined), rows, n, d, ds, m, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -986,6 +1025,7 @@ impl SeatEngine {
             slots,
             slot_drafts,
             drafts_sampled,
+            media,
             card,
             props,
             cache_ram,
@@ -1409,6 +1449,19 @@ fn serve_cmd<S: Seat>(
                 .map_err(refuse)
                 .and_then(|()| g.prefill(&ids).map_err(|e| refuse(e.to_string())))
         }
+        Cmd::PrefillMedia(ids, feeds) => {
+            let refuse = |e: String| {
+                format!(
+                    "prefill of {} ids with {} image(s) from position {at}: {e}",
+                    ids.len(),
+                    feeds.len()
+                )
+            };
+            check_feed(g, ids.len()).map_err(refuse).and_then(|()| {
+                g.prefill_media(&ids, &feeds)
+                    .map_err(|e| refuse(e.to_string()))
+            })
+        }
         Cmd::Next { last, mut logits } => {
             let arg = next_row(g, last, logits.as_deref_mut(), n_vocab);
             return (arg, logits);
@@ -1791,11 +1844,31 @@ impl Engine for SeatEngine {
         self.vocab.clone()
     }
 
+    /// The seat's ([`Seat::media_model`]), read once at the load: a shared
+    /// handle, the same one every request thread prepares images on.
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        self.media.clone()
+    }
+
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
         if ids.is_empty() {
             return Ok(());
         }
         self.link.call(Cmd::Prefill(ids.to_vec())).map(|_| ())
+    }
+
+    /// The seat's ([`Seat::prefill_media`]) as one command on the engine
+    /// thread; an empty feed takes [`Engine::prefill`]'s plain command.
+    fn prefill_media(&mut self, ids: &[u32], media: &[MediaFeed]) -> Result<(), EngineError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if media.is_empty() {
+            return self.prefill(ids);
+        }
+        self.link
+            .call(Cmd::PrefillMedia(ids.to_vec(), media.to_vec()))
+            .map(|_| ())
     }
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
@@ -2355,6 +2428,205 @@ mod tests {
             pick(mem_left_38(available, need, 2)).why,
             bloomery_levers::Residency38Why::MemShort { .. }
         ));
+    }
+
+    mod media {
+        use std::sync::Arc;
+
+        use serve::media::{ImageKey, MediaFeed};
+
+        use super::super::{Cmd, Seat, serve_cmd};
+        use crate::GateError;
+
+        /// One recorded call: the ids it took, each feed's position and key.
+        type Took = Vec<(Vec<u32>, Vec<(usize, u8)>)>;
+
+        /// A feed of a two-position span whose image is keyed `key`, at `at`.
+        fn feed(at: usize, key: u8) -> MediaFeed {
+            MediaFeed {
+                at,
+                key: ImageKey([key; 32]),
+                prepared: Arc::new(vision::Prepared {
+                    span_len: 2,
+                    patches: vision::Patches {
+                        plan: vision::grid::GridPlan {
+                            n_llm_h: 1,
+                            n_llm_w: 1,
+                            best_h: 14,
+                            best_w: 14,
+                        },
+                        n_vit_h: 1,
+                        n_vit_w: 1,
+                        patch_len: 3,
+                        bf16: vec![0; 3],
+                    },
+                }),
+            }
+        }
+
+        /// A seat that takes images: its `prefill_media` records the call it
+        /// took (the ids and each feed's position and key) and answers 7; its
+        /// `prefill` answers 5; each call advances `pos` past its ids, as a
+        /// seat does. Without the override, [`NoImages`] holds the trait's
+        /// defaults over the same two.
+        struct Images {
+            pos: usize,
+            took: Took,
+        }
+
+        impl Seat for Images {
+            fn pos(&self) -> usize {
+                self.pos
+            }
+            fn ctx_max(&self) -> usize {
+                1 << 10
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+                self.took.push((ids.to_vec(), Vec::new()));
+                self.pos += ids.len();
+                Ok(5)
+            }
+            fn prefill_media(
+                &mut self,
+                ids: &[u32],
+                feeds: &[MediaFeed],
+            ) -> Result<u32, GateError> {
+                self.took.push((
+                    ids.to_vec(),
+                    feeds.iter().map(|f| (f.at, f.key.0[0])).collect::<Vec<_>>(),
+                ));
+                self.pos += ids.len();
+                Ok(7)
+            }
+            fn step(&mut self, _: u32) -> Result<u32, GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn logits_into(&self, _: &mut [f32]) -> Result<(), GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn reset(&mut self) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn rollback(&mut self, _: u32) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn keep(&self, _: usize) -> (usize, Option<String>) {
+                (0, None)
+            }
+            fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
+                Vec::new()
+            }
+            fn snapshot(&mut self) -> Result<Arc<dyn serve::Saved>, GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn resume(&mut self, _: &dyn serve::Saved) -> Result<(), GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn note(_: &serve::CacheNote) {}
+        }
+
+        /// [`Images`] with the trait's `prefill_media` default: the same
+        /// record shape tells which path each call took.
+        struct NoImages {
+            took: Took,
+        }
+
+        impl NoImages {
+            /// The seat over a fresh record.
+            fn new() -> NoImages {
+                NoImages { took: Vec::new() }
+            }
+        }
+
+        impl Seat for NoImages {
+            fn pos(&self) -> usize {
+                0
+            }
+            fn ctx_max(&self) -> usize {
+                1 << 10
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+                self.took.push((ids.to_vec(), Vec::new()));
+                Ok(5)
+            }
+            fn step(&mut self, _: u32) -> Result<u32, GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn logits_into(&self, _: &mut [f32]) -> Result<(), GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn reset(&mut self) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn rollback(&mut self, _: u32) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn keep(&self, _: usize) -> (usize, Option<String>) {
+                (0, None)
+            }
+            fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
+                Vec::new()
+            }
+            fn snapshot(&mut self) -> Result<Arc<dyn serve::Saved>, GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn resume(&mut self, _: &dyn serve::Saved) -> Result<(), GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn note(_: &serve::CacheNote) {}
+        }
+
+        /// A `PrefillMedia` command is the seat's own `prefill_media` with
+        /// its ids and each feed's position and key, and the seat's answer is
+        /// the reply's; a call past the context is refused before it runs,
+        /// naming the call and the position.
+        #[test]
+        fn a_prefill_media_command_reaches_the_seat() {
+            let mut g = Images {
+                pos: 3,
+                took: Vec::new(),
+            };
+            let ids = vec![9u32, 4, 4, 8];
+            let feeds = vec![feed(1, 2), feed(4, 3)];
+            let (r, logits) = serve_cmd(&mut g, Cmd::PrefillMedia(ids.clone(), feeds), 8);
+            assert_eq!(r.expect("the call"), 7);
+            assert!(logits.is_none());
+            assert_eq!(
+                g.took,
+                vec![(ids, vec![(1, 2u8), (4, 3)])],
+                "one call, the ids and both feeds as the seat took them"
+            );
+            let long = vec![0u32; 1 << 10];
+            let e = serve_cmd(&mut g, Cmd::PrefillMedia(long, vec![feed(0, 1)]), 8)
+                .0
+                .expect_err("a call past the context");
+            assert!(
+                e.contains("prefill of 1024 ids with 1 image(s) from position 7"),
+                "{e}"
+            );
+            assert_eq!(g.took.len(), 1, "the refused call reached no seat");
+        }
+
+        /// The trait's default ([`Seat::prefill_media`]): a call that carries
+        /// no image is the seat's plain `prefill`, one that carries any is a
+        /// named refusal — the engine that took no [`Seat::media_model`]
+        /// never answers an image with text.
+        #[test]
+        fn the_default_seat_refuses_an_image_by_name() {
+            let mut g = NoImages::new();
+            let (r, _) = serve_cmd(&mut g, Cmd::PrefillMedia(vec![1, 2], Vec::new()), 8);
+            assert_eq!(r.expect("the plain call"), 5);
+            assert_eq!(g.took, vec![(vec![1, 2], Vec::new())]);
+            let e = serve_cmd(
+                &mut g,
+                Cmd::PrefillMedia(vec![1, 2, 3], vec![feed(0, 1)]),
+                8,
+            )
+            .0
+            .expect_err("an image the default refuses");
+            assert!(e.contains("this seat takes no image input"), "{e}");
+            assert_eq!(g.took.len(), 1, "the refused call reached no prefill");
+        }
     }
 
     mod slot_files {

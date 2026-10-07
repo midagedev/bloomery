@@ -119,6 +119,10 @@ dispatch=(
   'crates/gpu/src/lib.rs type Qwen3moeModel'
   # gpu-vision 은 deepseek41v 탑 자신의 크레이트다(이름이 gpu-<arch> 가 아닐 뿐) — 인코더가 그 탑의 이름표를 읽는다.
   'crates/gpu-vision/src/encoder.rs use'
+  # The V4.1 media span's one owner (ds41_media, the media gate and the serve seat share it):
+  # Hparams::read refuses a non-deepseek41v file by name, and the delimiter names and the card
+  # figure it reads are the tower's own.
+  'crates/gpu-gates/src/ds41_media.rs use'
   # CPU 디코드 바이너리: Arch::detect 로 다른 아키텍처를 거절한 뒤 deepseek2 순전파를 돈다.
   'crates/model/src/bin/bloomery-decode.rs use'
   # r8 사이드카 변환기: Hparams::read 가 deepseek41 이 아닌 파일을 이름 붙여 거절한 뒤 V4.1 의 routed 술어를 쓴다.

@@ -1436,18 +1436,24 @@ gate-gpu-ds41-chat:
 # server's and generate_ds41's, and checks /props' draft object and row, the draft counts in timings and /metrics, the
 # sampled and ignore_eos requests served by plain steps with no draft counted, and prefix reuse under the draft
 # (a continuation, a cut, a resume) against
-# cache_prompt: false. Then plan (b′) with the draft (--place bp: the A6000 plan (a), the 3090 the expert tier and the
-# draft): generate_ds41 --place bp under the draft, then gate_ds41_serve --place bp holds the server's greedy ids to it
+# cache_prompt: false. Then the image clauses (gate_ds41_serve --mmproj: the server built with the vision feature, the
+# same build gate-gpu-vision and gate-gpu-ds41-media's encoder file): /props vision on, the encoder's seat and bytes on
+# its `vision` line (the off-plan card under the gate placement), the bar-chart scene's values read from a data URL, the
+# same image's span kept through the prompt cache, the reserve path under --place bp (the plan's bytes carry the
+# encoder's reserve), and the plain server's no-vision no-reserve /props. Then plan (b′) with the draft (--place bp: the
+# A6000 plan (a), the 3090 the expert tier and the draft): generate_ds41 --place bp under the draft, then
+# gate_ds41_serve --place bp holds the server's greedy ids to it
 # (both under BLOOMERY_RESIDENCY=off: the fixed placement, whose card and host rounding do not move with a flip's timing) and
 # checks /props (the A6000, the tier card with the plan's tier bytes and the draft's class, the host) and the draft counts
 # in timings. Both cards in view (BLOOMERY_CARD=both: gpu-gate.sh takes both cards' gate locks, and the batch runs it
-# alone). Five loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/, the
-# two-card run's in target/serve-gate/bp/. Weekly: `just weekly` runs it, and `just affected` names it when a file its
+# alone). Eight loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/, the
+# image runs' in target/serve-gate/{mmproj,mmproj-bp,no-mmproj}/, the two-card run's in target/serve-gate/bp/. Weekly:
+# `just weekly` runs it, and `just affected` names it when a file its
 # triggers in tools/gate-paths.tsv match changes.
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-serve:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41,vision --release --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && bash tools/gpu-gate.sh gate_ds41_serve --mmproj --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
 
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice

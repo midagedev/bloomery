@@ -14,7 +14,8 @@
 //! * [`media`] — what a model tells the server about its image input ([`MediaModel`]): data plus
 //!   one prepare.
 //! * [`arch`] — per projector type, the names and hyperparameters of the encoder file (the mmproj
-//!   GGUF), each read once and refused by name when this crate does not run it.
+//!   GGUF), each read once and refused by name when this crate does not run it, and the encoder's
+//!   bytes on its card.
 //!
 //! The reference is deepseek-ai/DeepSeek-V4.1-Flash `inference/image_processor.py` and
 //! `inference/vision.py`, and Pillow's `libImaging/Resample.c` and `ImageOps.py` of the version

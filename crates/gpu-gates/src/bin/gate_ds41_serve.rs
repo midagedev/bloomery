@@ -2,7 +2,8 @@
 //! driven over HTTP, as one process under the GPU gate lock.
 //!
 //!     gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>
-//!                     [--plain <the plain run's --dir> | --place bp | --slots | --need-path]
+//!                     [--plain <the plain run's --dir> | --place bp | --slots | --need-path |
+//!                      --mmproj]
 //!
 //! Starts the server beside this binary (`--port 0 --place gate --parallel
 //! 1`, the plain engine this gate's body holds), reads its
@@ -160,6 +161,40 @@
 //! checks (p4)'s save without `--slot-save-path` on it, nothing else: a run
 //! of that clause that loads the model once.
 //!
+//! With `--mmproj` (no draft; refused beside `--plain`, `--place bp`,
+//! `--slots` and `--need-path`), the gate runs the image clauses alone — a
+//! build of the server with the `vision` feature, which the weekly recipe
+//! builds — and nothing above, over three servers, each started after the
+//! one before it is gone (one load on the cards at a time):
+//!
+//! - the server of [`SERVER_ARGS`] with `--mmproj <the vision set's encoder
+//!   file>` (the one `gate-gpu-vision` and `gate-gpu-ds41-media` load): (a)
+//!   `/props`' `modalities.vision` is true, and its `vision` line names the
+//!   encoder's card — a card the plan leaves off it, not the stage card —
+//!   and the bytes of the encoder's card figure
+//!   (`vision::arch::deepseek41v::card`) as weights and
+//!   activations; (b) a chat with the bar-chart scene
+//!   (`tools/ref/vision/scenes/chart-bars.png`, `make_scenes.py`'s bars 42,
+//!   27, 35 and 18) as a `data:` URL, thinking off, greedy, `max_tokens` 64:
+//!   HTTP 200 and the reply's content names every bar's value; (c) the same
+//!   chat again keeps the image's span through the prompt cache — the second
+//!   run's `timings.cache_n` is at least the span's end: the rendered
+//!   prompt's one image placeholder, expanded to the grid plan's span of the
+//!   scene's size (the first run's `usage.prompt_tokens` is the rendered
+//!   prompt less the placeholder plus the span);
+//! - a server of [`BP_SERVER_ARGS`] with the same `--mmproj` and no draft
+//!   (`BLOOMERY_RESIDENCY=off`, the fixed placement): every held card is on
+//!   the plan, so the encoder takes a named reserve on the stage card — its
+//!   `vision` line says so and names the stage card, `/props`' vision is
+//!   true, and its placement's bytes are the gate's own plan (b′) of the
+//!   file with that reserve (the encoder displaces experts from the stage
+//!   card to the host, so the reserve is in the bytes, not beside them);
+//! - a server of [`SERVER_ARGS`] with no `--mmproj` (d): its `/props`
+//!   `modalities.vision` is false, its stderr holds no `vision` line, and
+//!   its per-card bytes are what `place.machine` gives for the same
+//!   arguments with no reserve ([`props_engine`]'s own check) — a structural
+//!   check within this one run, not a golden file.
+//!
 //! With `--plain`, under `BLOOMERY_DRAFT=dspark` (refused otherwise), the gate
 //! checks the server's DSpark draft instead, and nothing above:
 //!
@@ -256,19 +291,22 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{
         Served, curl, ids_of, json_of, metric, parse_ids, server_log,
     };
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
-    use gguf::Split;
+    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
+    use gguf::{Gguf, Split};
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::{self, PlanInputs};
     use model::arch::deepseek41::plan::Planner;
     use model::placement::{Card, PlanLevers, workstation};
     use refset::arch::deepseek41::VERIFIED_POSITIONS;
+    use refset::arch::deepseek41v::{VISION, VISION_SET};
+    use refset::vision::VisionSet;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
+    use vision::arch::deepseek41v::card::CardBytes;
 
     use crate::dspark;
 
-    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp | --slots | --need-path]";
+    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp | --slots | --need-path | --mmproj]";
     /// Where the first `/completion`'s ids go in `--dir`, for the draft run.
     const COMPLETION_IDS: &str = "completion.ids";
     /// Where the probe's ids go in `--dir`, for the draft run.
@@ -500,11 +538,14 @@ mod gate {
         /// `--need-path`: the main server's slot save without
         /// `--slot-save-path` alone.
         need_path: bool,
+        /// `--mmproj`: the image clauses alone.
+        mmproj: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None);
-        let (mut plain, mut bp, mut slots, mut need_path) = (None, false, false, false);
+        let (mut plain, mut bp, mut slots, mut need_path, mut mmproj) =
+            (None, false, false, false, false);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             if flag == "--slots" {
@@ -513,6 +554,10 @@ mod gate {
             }
             if flag == "--need-path" {
                 need_path = true;
+                continue;
+            }
+            if flag == "--mmproj" {
+                mmproj = true;
                 continue;
             }
             let v = it
@@ -548,6 +593,9 @@ mod gate {
         if slots && need_path {
             return Err(format!("--slots and --need-path each run one part alone: {USAGE}").into());
         }
+        if mmproj && (slots || need_path || bp || plain.is_some()) {
+            return Err("--mmproj runs the image clauses alone".into());
+        }
         match (gen_log, prompt, ids, dir) {
             (Some(gen_log), Some(prompt), Some(ids), Some(dir)) => Ok(Args {
                 gen_log,
@@ -558,6 +606,7 @@ mod gate {
                 bp,
                 slots,
                 need_path,
+                mmproj,
             }),
             _ => Err(USAGE.into()),
         }
@@ -1630,6 +1679,348 @@ mod gate {
         }
     }
 
+    // ------------------------------------------------------------ images
+
+    /// The mmproj clauses' facts: the vision set's encoder file (the one
+    /// `gate-gpu-vision` and `gate-gpu-ds41-media` load, its grid and its
+    /// card figure) and the chart scene (`make_scenes.py`'s bars) — its bytes
+    /// and the span its grid makes of them.
+    struct Scene {
+        /// The encoder file the servers take as `--mmproj`.
+        mmproj: PathBuf,
+        /// The encoder's card figure (`vision::arch::deepseek41v::card`'s).
+        bytes: CardBytes,
+        /// The chart scene's PNG bytes.
+        png: Vec<u8>,
+        /// The positions its image takes in a prompt, delimiters included.
+        span_len: usize,
+        /// The image token every span position carries.
+        token: u32,
+    }
+
+    /// The clauses' scene (module header), from the set the profile holds and
+    /// the tree's own scene file.
+    fn scene() -> Result<Scene, GateError> {
+        let dir = match std::env::var("BLOOMERY_VISION_SET") {
+            Ok(set) => data_dir().join("ref-vision").join(set),
+            Err(_) => VISION.path(VISION_SET),
+        };
+        let set = VisionSet::read(&dir)?;
+        if !set.complete {
+            return Err(format!("{}: the set is not complete", dir.display()).into());
+        }
+        let png_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/ref/vision/scenes/chart-bars.png");
+        let png = std::fs::read(&png_path).map_err(|e| format!("{}: {e}", png_path.display()))?;
+        let file = Gguf::open(&set.mmproj)?;
+        let hp = vision::arch::deepseek41v::Hparams::read(&file)?;
+        let img = vision::Rgb8::from_png(&png)?;
+        let span_len = vision::grid::plan_image_grid(img.width, img.height, &hp.grid()).n_tokens();
+        Ok(Scene {
+            mmproj: set.mmproj,
+            bytes: CardBytes::of(&hp),
+            png,
+            span_len,
+            token: set.image_token_id,
+        })
+    }
+
+    /// The bytes of `png` as standard base64 with padding — the alphabet
+    /// `serve::media`'s strict decoder reads; no encoder exists in the tree
+    /// to borrow.
+    fn base64(png: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(png.len().div_ceil(3) * 4);
+        for c in png.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// The image chat of clause (b) (module header): the scene as a `data:`
+    /// URL, thinking off, greedy, 64 tokens.
+    fn chart_chat(s: &Scene) -> Value {
+        json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "List each bar's value."},
+                {"type": "image_url", "image_url": {"url":
+                    format!("data:image/png;base64,{}", base64(&s.png))}},
+            ]}],
+            "temperature": 0, "max_tokens": 64,
+            "chat_template_kwargs": {"thinking": false},
+        })
+    }
+
+    /// The server's `vision` line (the seat's `open_encoder`'s), as its card,
+    /// its seat word and its bytes; `None` when the server printed none.
+    fn vision_line(err_log: &Path) -> Result<Option<(String, String, u64, u64)>, GateError> {
+        let text = std::fs::read_to_string(err_log)?;
+        let Some(line) = text.lines().find(|l| l.starts_with("vision ")) else {
+            return Ok(None);
+        };
+        let (mut card, mut seat, mut weights, mut scratch) =
+            (String::new(), String::new(), None, None);
+        for f in line.split_whitespace() {
+            match f.split_once('=') {
+                Some(("card", v)) => card = v.to_owned(),
+                Some(("seat", v)) => seat = v.to_owned(),
+                Some(("weights", v)) => weights = v.parse::<u64>().ok(),
+                Some(("scratch", v)) => scratch = v.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        match (weights, scratch) {
+            (Some(weights), Some(scratch)) if !card.is_empty() && !seat.is_empty() => {
+                Ok(Some((card, seat, weights, scratch)))
+            }
+            _ => Err(format!("the server's vision line does not parse: {line}").into()),
+        }
+    }
+
+    /// Which encoder seat this card view leaves `place` (the seat's own
+    /// `encoder_seat`'s rule, as this gate computes it): the card the line
+    /// names (spaces as underscores, as the line prints it) and its word —
+    /// the off-plan card of the fewest bytes when a visible card sits off
+    /// the placement, else the stage card's reserve.
+    fn seat_of(place: Place) -> Result<(String, &'static str), GateError> {
+        let specs = place.on_host()?.card_specs()?;
+        let census = bloomery_gpu::census()?;
+        let on_plan = |uuid: &[u8; 16]| {
+            specs
+                .iter()
+                .filter_map(|c| c.device)
+                .any(|d| &d.uuid == uuid)
+        };
+        Ok(
+            match census
+                .iter()
+                .filter(|d| !on_plan(&d.uuid))
+                .min_by_key(|d| (d.total_bytes, d.ordinal))
+            {
+                Some(d) => (d.name.replace(' ', "_"), "off-plan"),
+                None => (specs[0].name.replace(' ', "_"), "stage-reserve"),
+            },
+        )
+    }
+
+    /// The image clauses (module header): three servers, each started after
+    /// the one before it is gone.
+    fn images(a: &Args, levers: &PlanLevers) -> Result<bool, GateError> {
+        let s = scene()?;
+        let mmproj = s.mmproj.display().to_string();
+        let (want_card, want_seat) = seat_of(Place::Gate)?;
+        println!(
+            "the encoder of {} ({} B of weights, {} B of activations); the gate placement \
+             leaves it {} on {want_card}; the scene takes {} positions of token {}",
+            s.mmproj.display(),
+            s.bytes.weights,
+            s.bytes.scratch,
+            want_seat,
+            s.span_len,
+            s.token
+        );
+        let mut ok = true;
+
+        // The gate server with the encoder: (a) vision on, the encoder's seat
+        // and bytes; (b) the chart read; (c) the span kept.
+        let dir = a.dir.join("mmproj");
+        std::fs::create_dir_all(&dir)?;
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        args.extend(["--mmproj", mmproj.as_str()]);
+        let err_log = dir.join("server.err");
+        let mut served = Served::spawn(&args, &dir)?;
+        println!("server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let props = json_of("/props", st, &body)?;
+        println!("props modalities {}", props["modalities"]);
+        check(
+            &mut ok,
+            "mmproj_props_vision_true",
+            props["modalities"]["vision"] == json!(true),
+        );
+        let (card, seat, weights, scratch) =
+            vision_line(&err_log)?.ok_or("the server printed no vision line")?;
+        println!("vision line: card={card} seat={seat} weights={weights} scratch={scratch}");
+        check(
+            &mut ok,
+            "mmproj_encoder_sits_where_the_plan_leaves_it",
+            card == want_card
+                && seat == want_seat
+                && weights == s.bytes.weights
+                && scratch == s.bytes.scratch,
+        );
+
+        let chat = chart_chat(&s);
+        let (st, body) = curl(&url("/v1/chat/completions"), Some(&chat), false)?;
+        let reply = json_of("/v1/chat/completions", st, &body)?;
+        let m = &reply["choices"][0]["message"];
+        let content = m["content"].as_str().unwrap_or("");
+        println!("chart reply: {content}");
+        let bars = ["42", "27", "35", "18"];
+        check(
+            &mut ok,
+            "mmproj_chart_names_every_bar",
+            m["reasoning_content"].as_str().is_none_or(str::is_empty)
+                && bars.iter().all(|v| content.contains(v)),
+        );
+
+        // The span's end in the served prompt: the rendered prompt holds the
+        // image's one placeholder token, which the server expands to the grid
+        // plan's span (serve::media::expand_spans) — the prompt it evaluates
+        // is the rendered one less the placeholder plus the span.
+        let ids = rendered(&url, &chat["messages"], &chat["chat_template_kwargs"])?;
+        let at = ids
+            .iter()
+            .position(|&i| i == s.token)
+            .ok_or("the rendered prompt holds no image token")?;
+        let span_end = at + s.span_len;
+        let prompt_tokens = reply["usage"]["prompt_tokens"].as_u64();
+        println!(
+            "rendered prompt {} ids, the placeholder at {at}; served prompt {prompt_tokens:?} ids",
+            ids.len()
+        );
+        check(
+            &mut ok,
+            "mmproj_the_placeholder_expands_to_the_span",
+            ids.iter().filter(|&&i| i == s.token).count() == 1
+                && prompt_tokens == u64::try_from(ids.len() - 1 + s.span_len).ok(),
+        );
+        let (st, body) = curl(&url("/v1/chat/completions"), Some(&chat), false)?;
+        let again = json_of("/v1/chat/completions", st, &body)?;
+        let cache_n = again["timings"]["cache_n"].as_u64();
+        println!("the same image again: cache_n {cache_n:?} of the span's end {span_end}");
+        check(
+            &mut ok,
+            "mmproj_same_image_keeps_the_span",
+            cache_n.is_some_and(|n| n >= span_end as u64),
+        );
+        println!("server stopped: {}", served.stop()?);
+
+        // The reserve path: under bp every held card is on the plan, so the
+        // encoder takes a named reserve on the stage card — the plan's bytes
+        // carry it (the encoder displaces experts from the stage card).
+        let dir = a.dir.join("mmproj-bp");
+        std::fs::create_dir_all(&dir)?;
+        let mut cmd = Command::new(Served::exe()?);
+        cmd.env("BLOOMERY_RESIDENCY", "off");
+        let mut args: Vec<&str> = BP_SERVER_ARGS.to_vec();
+        args.extend(["--mmproj", mmproj.as_str()]);
+        let err_log = dir.join("server.err");
+        let mut served = Served::spawn_cmd(cmd, &args, &dir)?;
+        println!("bp server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let machine_of = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let mut machine = machine_of(inputs.model.layers);
+        machine.cards[0].free_bytes = Some(server_card_free(&err_log)?);
+        // The reserve's name is the seat's own word ("image encoder"); the
+        // plan's arithmetic reads only its bytes. The same plan without it
+        // holds the reserve's worth of experts more on the stage card — the
+        // reserve is in the bytes, not beside them.
+        let plain_stage = {
+            let mut plain = machine_of(inputs.model.layers);
+            plain.cards[0].free_bytes = machine.cards[0].free_bytes;
+            let p = inputs.plan(&plain, workstation::CTX_MAX, levers)?;
+            p.cards[0].dense_bytes + p.cards[0].expert_bytes
+        };
+        machine.cards[0]
+            .reserves
+            .push(("image encoder".to_owned(), s.bytes.total()));
+        let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
+        let (card, tcard) = match plan.cards.as_slice() {
+            [c, t, ..] => (c, t),
+            _ => return Err("plan (b′) is not a stage card and a tier card".into()),
+        };
+        let (stage_bytes, tier_bytes) = (
+            card.dense_bytes + card.expert_bytes,
+            tcard.dense_bytes + tcard.expert_bytes,
+        );
+        let host_bytes = plan.host.expert_bytes + plan.host.table_bytes;
+        println!(
+            "plan (b′) with the encoder's {} B reserve: stage {stage_bytes} B (the same plan \
+             without it {plain_stage} B), tier {tier_bytes} B, host {host_bytes} B",
+            s.bytes.total(),
+        );
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let props = json_of("/props", st, &body)?;
+        let devices = props["engine"]["placement"]["devices"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        check(
+            &mut ok,
+            "mmproj_bp_vision_true",
+            props["modalities"]["vision"] == json!(true),
+        );
+        check(
+            &mut ok,
+            "mmproj_bp_the_reserve_moves_experts",
+            stage_bytes != plain_stage,
+        );
+        check(
+            &mut ok,
+            "mmproj_bp_bytes_are_the_plans_with_the_reserve",
+            devices.len() == 3
+                && devices[0]["bytes"] == json!(stage_bytes)
+                && devices[1]["bytes"] == json!(tier_bytes)
+                && devices[2]["bytes"] == json!(host_bytes),
+        );
+        let (card, seat, _, _) =
+            vision_line(&err_log)?.ok_or("the bp server printed no vision line")?;
+        let (bp_card, bp_seat) = seat_of(Place::Bp)?;
+        println!("bp vision line: card={card} seat={seat}");
+        check(
+            &mut ok,
+            "mmproj_bp_encoder_on_the_stage_card",
+            card == bp_card && seat == bp_seat && seat == "stage-reserve",
+        );
+        println!("bp server stopped: {}", served.stop()?);
+
+        // (d) Without the encoder: no vision, no vision line, and the plan of
+        // no reserve (props_engine's own check).
+        let dir = a.dir.join("no-mmproj");
+        std::fs::create_dir_all(&dir)?;
+        let err_log = dir.join("server.err");
+        let mut served = Served::spawn(&SERVER_ARGS, &dir)?;
+        println!("plain server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let props = json_of("/props", st, &body)?;
+        let mut d_ok = props["modalities"]["vision"] == json!(false);
+        let no_line = vision_line(&err_log)?.is_none();
+        d_ok &= no_line;
+        println!(
+            "plain server: modalities.vision {} vision_line_printed={}",
+            props["modalities"]["vision"], !no_line
+        );
+        let argv: Vec<String> = std::iter::once(Served::exe()?.display().to_string())
+            .chain(SERVER_ARGS.iter().map(|a| (*a).to_owned()))
+            .collect();
+        d_ok &= props_engine(&url, &argv, served.child.id(), levers, &err_log)?;
+        check(&mut ok, "mmproj_absent_serves_no_image", d_ok);
+        println!("plain server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// The context the slots server names: its `parallel` line (the rule,
     /// two slots, the default context a slot and their total), its `slots`
     /// line (two sequences made of two planned) and `/props`' `n_ctx`.
@@ -2486,6 +2877,13 @@ mod gate {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
         let place = PlanLevers::from_levers(&levers)?;
+        if a.mmproj && levers.draft().is_some() {
+            return Err(format!(
+                "--mmproj takes no draft; BLOOMERY_DRAFT={:?} is set",
+                levers.draft()
+            )
+            .into());
+        }
         match (&a.plain, levers.draft()) {
             (None, Some("dspark")) if a.bp => return tiered(&a, &place),
             _ if a.bp => {
@@ -2499,6 +2897,14 @@ mod gate {
             }
             (Some(plain), Some("dspark")) => return drafted(&a, plain, &place),
             (None, None) if a.need_path => return need_path(&a),
+            (None, None) if a.mmproj => {
+                std::fs::create_dir_all(&a.dir)?;
+                if images(&a, &place)? {
+                    println!("weekly-gpu-ds41-serve mmproj: PASS");
+                    return Ok(());
+                }
+                return Err(checks_failed());
+            }
             (None, None) if a.slots => {
                 std::fs::create_dir_all(&a.dir)?;
                 let ok = slots(&a)? & slots_refuse_dspark(&a)?;
