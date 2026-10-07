@@ -1,0 +1,37 @@
+# Round mimoref: ik's CPU node dumps of the MiMo-V2.6-Flash MOPD MXFP4 split set (two shards, shard 1
+# the 5,948,608 B header and shard 2 the 167,363,516,512 B of tensors: 167.4 GB in all), each one
+# `just dump-ref-mimo2 [VARIANT]` under this card: the batch set, then step4, step4-every-node, d1k
+# and d4096, one lease each. dump_ref loads without --defer-experts, so ik's loader populates the
+# shards in turn (one stream), then computes on 32 threads, then writes the nodes to /root/bloomery-data.
+# The three phases run one after the other: the wall is their sum. The one term the batch dump fixes:
+# this file's cold-read rate through the loader's populate, read from the witness block's read-sectors
+# and wall; the step dumps then read nothing from the device unless a run between two dumps evicted
+# the file.
+# Minutes per dump [derived], scaled from glmref's measured GLM dumps (199.7 GB: batch cold 133 s at
+# ~1.5-1.7 GB/s, step4-every-node warm 17 s, d1k warm 29 s; commit 0b5d1c9):
+#   populate  cold: 167.4 GB at 1.5-1.7 GB/s (GLM's measured rates): 98-112 s; at the single-stream
+#             priors 1.07-1.33 GB/s 126-156 s. Warm: the page cache mapped again, >= 7 GB/s: <= 24 s
+#   fixed     lease, witnesses, ~470 tensors' metadata over two shards, context: 3-15 s
+#   compute   2 FLOP an active parameter a token at the design's 15.45 B active (SWA attn 3.68 +
+#             full attn 0.80 + dense FFN 0.20 + top-8 MoE 9.46 + embed/head 1.25 + router/norms/sinks
+#             0.05; scripts/derive.py, specs/leader/mimo26) = 30.9 GFLOP a token, attention over the
+#             context added below, at 1.25 TFLOP/s (qwen35moe's measured 1,024-token prefill) to
+#             3 TFLOP/s (GLM's d1k): batch and step4 5 tokens ~0.15 TFLOP < 1 s; d1k 1,025 tokens
+#             31.7 + attention 0.6 = 32.3 TFLOP 11-26 s; d4096 4,097 tokens 126.6 + attention 7.0
+#             (9 full layers x 4,097^2 x 64 x (192+128) x 2 FLOP + 39 SWA layers over the 128 window)
+#             = 133.6 TFLOP 45-107 s
+#   dump      2.5-4.5 GB a set (qwen35moe's 1.5-1.6 GB at 40 layers, hidden 2048; GLM's 3.3-3.8 GB
+#             at 46 layers, hidden 4096, a 4-wide residual; this model 48 layers, hidden 4096, one
+#             residual) at the 0.5 GB/s the qwen3moe and qwen35moe step dumps wrote: 5-9 s
+#   batch cold 1.8-2.6 min; step4, step4-every-node warm 0.2-0.9 min; d1k warm 0.3-1.3 min; d4096
+#   warm 0.9-2.6 min; 3.5-8.5 min in all. A step dump that reads the file from the device again (a
+#   peer's run between two dumps evicted it) costs the populate term again (98-156 s); all five cold
+#   is at most 12 min. A dump needs the ik tree past the fused-attn_qkv load (upstream #2556) — see
+#   the profile's IK note; the walls above assume only that the loader works.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and populates the whole 167.4 GB split set into the page
+  cache, evicting that much of what else is cached (the V4.1 host set or the GLM set among it);
+  beside a timed run or a gate batch it would take their cores, their memory bandwidth and their
+  cache, so it holds the lease; why now: the mimo2 oracle every MiMo kernel and body round is judged
+  against (round mimoref)
+minutes: 0.2..2.6

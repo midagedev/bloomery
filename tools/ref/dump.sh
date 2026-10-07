@@ -64,7 +64,9 @@ case $BACKEND in
 esac
 VARIANT=${1:-}
 CTX=$REF_CTX
-BIN_DIR=$BLOOMERY_DATA/bin
+# A profile whose oracle tree is not the shared one names its own dump_ref directory under
+# $BLOOMERY_DATA (REF_BIN_NAME); every other profile takes the shared bin.
+BIN_DIR=$BLOOMERY_DATA/${REF_BIN_NAME:-bin}
 TOKENS_SHA256=
 STEP_ARGS=()
 if [ -z "$VARIANT" ]; then

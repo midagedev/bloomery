@@ -9,6 +9,7 @@ use crate::family::{Family, Identity};
 pub mod deepseek41;
 pub mod deepseek41v;
 pub mod glm5next;
+pub mod mimo2;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
@@ -20,6 +21,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (qwen35moe::ARCH, qwen35moe::FAMILIES),
     (qwen35::ARCH, qwen35::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
+    (mimo2::ARCH, mimo2::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
 ];
 
