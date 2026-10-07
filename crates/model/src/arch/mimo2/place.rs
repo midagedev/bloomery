@@ -19,7 +19,7 @@ use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::{
     self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
-    Violation,
+    Violation, checked, joined,
 };
 
 const F16_BYTES: u64 = 2;
@@ -40,29 +40,18 @@ pub struct PlanInputs {
 /// Why a plan was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
-    /// The placement could not be built.
+    /// The placement could not be built — a machine that hangs an expert
+    /// tier card among its refusals ([`PlacementError::HostRoutedTier`]):
+    /// this plan keeps every routed expert on the host, so the tier would
+    /// hold nothing.
     #[error(transparent)]
     Placement(#[from] PlacementError),
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]
     Broken(Vec<Violation>),
-    /// A machine that hangs an expert tier card: this plan keeps every
-    /// routed expert on the host, so the tier would hold nothing. The
-    /// card-expert program is a later round's.
-    #[error(
-        "the machine has the expert tier card {tier}; this plan keeps every routed expert on the \
-         host, so the tier would hold none — the card-expert program is a later round's"
-    )]
-    Tier { tier: String },
     /// A context of no position: no plane, nothing to serve.
     #[error("ctx_max 0: a plan serves at least one position")]
     CtxZero,
-}
-
-/// The violations, `; `-separated.
-fn joined(broken: &[Violation]) -> String {
-    let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-    list.join("; ")
 }
 
 impl PlanInputs {
@@ -116,9 +105,9 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`, every routed expert on the host and none on
-    /// a card; refused by name a context of no position and a machine that
-    /// hangs an expert tier card, and as the placement refuses a context
-    /// whose KV planes do not fit the card.
+    /// a card; refused by name a context of no position, and as the
+    /// placement refuses a machine that hangs an expert tier card (it would
+    /// hold nothing) and a context whose KV planes do not fit the card.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -128,18 +117,8 @@ impl PlanInputs {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
-        if let Some(tier) = machine.tiers.first() {
-            return Err(PlaceError::Tier {
-                tier: tier.name.clone(),
-            });
-        }
         let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
-        let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
-        }
+        checked(plan).map_err(PlaceError::Broken)
     }
 }
 

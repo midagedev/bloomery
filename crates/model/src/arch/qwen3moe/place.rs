@@ -19,7 +19,7 @@ use super::roles;
 use crate::placement::workstation::{CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host};
 use crate::placement::{
     self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Violation,
+    Violation, checked, joined,
 };
 use runtime::stores::{kv_q8_row_bytes, kv_row_bytes};
 
@@ -141,12 +141,6 @@ pub enum PlaceError {
     Tier { tier: String },
 }
 
-/// The violations, `; `-separated.
-fn joined(broken: &[Violation]) -> String {
-    let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-    list.join("; ")
-}
-
 /// What a plan of a qwen3moe file is made from, read from its headers.
 #[derive(Debug)]
 pub struct PlanInputs {
@@ -189,11 +183,6 @@ impl PlanInputs {
         }
         let plan =
             placement::plan_routed(&self.model, machine, ctx_max, &self.kv, levers, card_routed)?;
-        let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
-        }
+        checked(plan).map_err(PlaceError::Broken)
     }
 }
