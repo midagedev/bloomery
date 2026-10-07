@@ -21,6 +21,7 @@
 //!      multiplies a verification pass by k. Bucket → per-bucket matmul → inverse permutation.
 
 pub mod arch;
+pub mod embed;
 pub mod ffn;
 pub mod fileio;
 pub mod fixture;
@@ -47,6 +48,11 @@ pub struct Slot {
 pub enum ModelError {
     #[error("tensor {0} is not in the file")]
     MissingTensor(String),
+    /// A row table read by token (the token embedding, for example) the
+    /// file does not shape as its reader needs, or a token past its rows:
+    /// the table's tensor, and the refusal.
+    #[error("{tensor}: {detail}")]
+    EmbedRows { tensor: String, detail: String },
     #[error("unsupported architecture {0:?}")]
     UnknownArchitecture(String),
     #[error("{what}: expected [{want_ne0}, {want_ne1}], got [{got_ne0}, {got_ne1}]")]
