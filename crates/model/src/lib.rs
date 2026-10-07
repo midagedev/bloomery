@@ -100,6 +100,11 @@ pub enum ModelError {
     /// A refusal of the r8 sidecar format: writing, opening or comparing it.
     #[error(transparent)]
     R8(#[from] r8file::R8Error),
+    /// The host tier's NVMe arena refused a read the host leg asked for: an
+    /// unfilled slot or a failed fill, naming its layer and expert
+    /// ([`moe::TierError`]).
+    #[error(transparent)]
+    Tier(#[from] moe::TierError),
 }
 
 /// A hyperparameter reader's metadata refusal stays a metadata error and an

@@ -996,8 +996,10 @@ fn stack_cut(info: &TensorInfo) -> Result<(usize, usize), crate::ModelError> {
 }
 
 /// Matrix `e` of stack `info` over the stack's bytes `stack`, its rows in
-/// `layout`; an expert past the stack is refused by name.
-fn expert_weight<'a>(
+/// `layout`; an expert past the stack is refused by name. The host tier's
+/// NVMe arena cuts the same matrix over a slot's bytes (`e` 0, the slot
+/// holding one expert).
+pub(crate) fn expert_weight<'a>(
     info: &TensorInfo,
     stack: &'a [u8],
     e: usize,

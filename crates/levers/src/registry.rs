@@ -37,6 +37,8 @@ pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
+pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
+pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -234,6 +236,36 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: NVTIER,
             }],
         },
+    },
+    LeverSpec {
+        name: NVTIER_BYTES,
+        class: Class::C,
+        kind: Kind::Bytes,
+        default: Unset::Means(
+            "the split dial's default: the largest arena the room leaves above the NVMe tier's \
+             floor when the room must move over half the host leg's bytes, else no arena (R1's \
+             split)",
+        ),
+        doc: "Placement: the RAM arena the NVMe expert tier fills for the routed experts a \
+              room cannot hold, in bytes (`M` and `G` binary units). The arena's bytes come out \
+              of the host segments — the split leaves the room less them — and a value that \
+              pushes the host segments under the tier's floor is refused by name with the room, \
+              the floor and the value. A room the plan's host need already holds plans no \
+              arena. Read where the plan is made, beside `BLOOMERY_HOST_ROOM`.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: NVTIER_READ,
+        class: Class::C,
+        kind: Kind::Words(&["direct", "buffered"]),
+        default: Unset::Is("direct"),
+        doc: "The NVMe expert tier's reads: `direct` opens the shards with `O_DIRECT` and \
+              proves the mount with one probe read at load — a filesystem without direct IO \
+              (a Windows mount under WSL2) is refused by name; `buffered` opts into reads the \
+              page cache serves, exact at the same bytes and counted by the tier's stats as \
+              buffered — the fallback the probe's refusal names, not a preference. Read where \
+              the tier is built.",
+        site: Site::Parsed { left: &[] },
     },
     LeverSpec {
         name: PIN_MAIN,
