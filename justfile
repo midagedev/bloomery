@@ -1446,22 +1446,30 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
 # the profile comment's) — and five is at most the eight the gate needs: below Prompt38::GEMM_FROM both engines
 # feed the prompt by bit-for-bit passes, so the server's greedy ids are generate_qwen3moe's; at nine or more each
 # runs the prompt's last position through a different arm of the ubatch walk. generate_qwen3moe --tokens <those
-# ids> -n 16 under its own gate-lock hold, then gate_qwen38_serve under another: it starts bloomery-serve-qwen38
-# --port 0 --place gate, and checks /props' engine object against its own plan of the file (architecture
-# qwen4exp, each device's bytes = the plan's, the KV bytes), /completion's ids at temperature 0 against
-# generate_qwen3moe's (all 16, or a prefix ending in the end-of-generation id), the same /completion again and
-# once more after the other requests (a request keeps no prefix: every request prefills from a reset), a chat
-# turn streamed and not streamed (same content, [DONE] last), /tokenize of the prompt against REF_TOKENS, and a
-# prompt of the served context a 400 the server survives; then one server alone under BLOOMERY_RESIDENCY=mid-p0-s1:
-# its residency records and passes, a reset of diff 0, the same request after it with the first one's ids. Three
-# loads; logs and the raw stream in
-# target/q38-serve-gate/. The build takes the deepseek41 feature, not the qwen family's plain gpu:
+# ids> -n 16 under its own gate-lock hold, then gate_qwen38_serve as two processes under another, the arms one
+# after another. --arm plain first: it starts bloomery-serve-qwen38 --port 0 --place gate with
+# BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off, and checks /props' engine object against its own plan of the file
+# (architecture qwen4exp, each device's bytes = the plan's, the KV bytes), /completion's ids at temperature 0
+# against generate_qwen3moe's (all 16, or a prefix ending in the end-of-generation id), the same /completion
+# again and once more after the other requests (a request keeps no prefix: every request prefills from a reset),
+# a chat turn streamed and not streamed (same content, [DONE] last), /tokenize of the prompt against
+# REF_TOKENS, a prompt of the served context a 400 the server survives, and the plain cache clause; then its
+# own servers one at a time: the cache clause again under BLOOMERY_DRAFT=mtp, the ctx clause's flagless,
+# refused and one-slot servers, one server alone under BLOOMERY_RESIDENCY=mid-p0-s1 (its residency records and
+# passes, a reset of diff 0, the same request after it with the first one's ids), the slots pair (the gate's own
+# --parallel 2 shape and the seat under its own defaults), the drafted rounds server, the width chooser's and
+# the sampled rounds one. --arm drafted second: the main server under BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off
+# (the fixed window), /props' draft object against the gate's drafted plan, the greedy pass's ids and its draft
+# counts, the continued requests (each keeps the held prefix, one `mtp prompt` record a prompt call past it,
+# the plain ids) and the sampled ones (a sampled /completion drafts; the same at top_k 1 gives this server's
+# greedy ids). Logs and the raw stream in target/q38-serve-gate/{plain,drafted}/ (the gen log at its root).
+# The build takes the deepseek41 feature, not the qwen family's plain gpu:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_qwen3moe --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_qwen3moe --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --arm plain --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/plain && bash tools/gpu-gate.sh gate_qwen38_serve --arm drafted --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/drafted'
 
 # The qwen3 seat of bloomery-serve (--model qwen3 -m <file>) against generate_qwen3moe, on the qwen3moe profile's file
 # (Qwen3-30B-A3B, the MODEL box.sh exports under BLOOMERY_MODEL=qwen3moe) and the qwen35moe profile's (Qwen3.6-35B-A3B,

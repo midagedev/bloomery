@@ -1370,6 +1370,7 @@ pub fn card_table(loaded: &CardTable, file: &CardTable, path: &Path) -> Result<R
 #[cfg(test)]
 mod tests {
     use model::placement::Machine;
+    use model::placement::devices::census_usable;
     use model::placement::workstation::{self, A6000, DeviceInfo, RTX_3090, TierBatchBytes};
 
     use super::Place;
@@ -1590,8 +1591,10 @@ mod tests {
     }
 
     /// A fake census of devices by short name, each its measured total
-    /// (the A6000's and the 3090's) or twice the A6000's.
-    fn census(names: &[&str]) -> Vec<DeviceInfo> {
+    /// (the A6000's and the 3090's) or twice the A6000's, and its full
+    /// usable bytes free (`census_usable`'s figure, a quiet card). Shared
+    /// with `draft_card_tests` below.
+    pub(super) fn census(names: &[&str]) -> Vec<DeviceInfo> {
         names
             .iter()
             .enumerate()
@@ -1605,7 +1608,7 @@ mod tests {
                     ordinal: u32::try_from(i).expect("small"),
                     name,
                     total_bytes,
-                    free_bytes: total_bytes / 1024 / 1024 * 1024,
+                    free_bytes: census_usable(total_bytes),
                     uuid: [u8::try_from(i).expect("small") + 1; 16],
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                     held_by: None,
@@ -1756,30 +1759,7 @@ mod draft_card_tests {
     use model::placement::workstation::{A6000, DeviceInfo, RTX_3090};
 
     use super::Place;
-
-    /// A fake census of devices by short name, each its measured total.
-    fn census(names: &[&str]) -> Vec<DeviceInfo> {
-        names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                let (name, total_bytes) = match *n {
-                    "3090" => ("NVIDIA GeForce RTX 3090", 25_351_356_416),
-                    "A6000" => ("NVIDIA RTX A6000", 50_952_536_064),
-                    other => panic!("no fake device {other}"),
-                };
-                DeviceInfo {
-                    ordinal: u32::try_from(i).expect("small"),
-                    name: name.to_string(),
-                    total_bytes,
-                    free_bytes: total_bytes / 1024 / 1024 * 1024,
-                    uuid: [u8::try_from(i).expect("small") + 1; 16],
-                    pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
-                    held_by: None,
-                }
-            })
-            .collect()
-    }
+    use super::tests::census;
 
     /// `BLOOMERY_DSPARK_CARD`'s card on a census ([`Place::draft_spec`]):
     /// unset, the 3090 wherever it is in view (beside the A6000 under `a`,

@@ -1,12 +1,16 @@
 //! `gate_qwen38_serve` — `bloomery-serve-qwen38` on the 3090 (placement
 //! gate), driven over HTTP, as one process under the GPU gate lock.
 //!
-//!     gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text>
-//!                       --ids <a,b,…> --dir <out>
+//!     gate_qwen38_serve --arm plain|drafted --gen <generate_qwen3moe log>
+//!                       --prompt <text> --ids <a,b,…> --dir <out>
 //!
-//! Starts the server beside this binary (`--host 127.0.0.1 --port 0 --place
-//! gate --ctx-size 4096`), reads its address from its stderr, waits for
-//! `/health`, then checks:
+//! Two arms, one a process, the recipe's two gate-lock holds: `plain`, the
+//! main server with the draft off and then every clause of its own below,
+//! and `drafted`, the main server with the draft on and its drafted clauses
+//! alone (the bullets that name it), stopped before any other server. Each
+//! arm starts the server beside this binary (`--host 127.0.0.1 --port 0
+//! --place gate --ctx-size 4096`), reads its address from its stderr, waits
+//! for `/health`, then checks:
 //!
 //! - `/props`' `engine` object, printed once, against this gate's own plan of
 //!   the file the server opens (the gate card, the server's default context,
@@ -57,14 +61,18 @@
 //!   saying why by name, and below it resets with the draft on; both sides
 //!   of the break-even at the turn's end, by reply length, each with a fresh
 //!   run's ids and its `mtp keep` record;
-//! - under `BLOOMERY_DRAFT=mtp`, requests that extend the sequence the
+//! - under the draft (`--arm drafted`, that arm's main server): a greedy
+//!   `/completion` gives the plain run's ids with its draft counts carried
+//!   (a draft changes which passes run, never a token), and `/props`'
+//!   `engine.draft` names the draft file
+//!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
+//!   requests that extend the sequence the
 //!   server holds (`continued`): each keeps the held prefix (`cache_n`), a
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
 //!   up at the kept position, nothing skipped — and none prints a skip, and
 //!   each drafts, with the plain run's ids (the generated ones); the prompt
 //!   resent keeps its end by a cut, after which the extension drafts
-//!   nothing, by name, with the same prompt's ids fed fresh; `/props`' `engine.draft` names the draft file
-//!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
+//!   nothing, by name, with the same prompt's ids fed fresh;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) drafts, its
 //!   passes' rows drawn by its sampler (`Engine::advance_sampled`), and the
 //!   same request at `top_k` 1 drafts and gives this server's greedy ids;
@@ -205,10 +213,12 @@
 //!   round clause alone (the fallback loop's ids are its alone ids too).
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for, and more servers start on the card, one at a time:
+//! waited for — the drafted arm ends here — and, on the plain arm, more
+//! servers start on the card, one at a time:
 //!
-//! - `cache` again on a server with the draft the first did not run
-//!   (`BLOOMERY_DRAFT=mtp` when it ran `off`, and the other way);
+//! - `cache` again on a drafted server (`BLOOMERY_DRAFT=mtp`, the fixed
+//!   window; the plain arm's main server ran the draft off, so this server
+//!   runs the clause's drafted half);
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
 //!   (the margin rule's answer — or the largest the card holds when that is
 //!   fewer, or the prompt cache's clamp of it), the largest context the card
@@ -245,14 +255,15 @@
 //! are the server's (`ACTS_ON`, the same list): one the server would refuse
 //! is refused here, at `main`, before the server starts. The gate sets two of
 //! them itself on every server it starts, so neither the placement's defaults
-//! nor the environment move what a clause means: `BLOOMERY_DRAFT` (`mtp` when
-//! this binary's environment names it, else `off`; the sampled clause's plain
-//! server `off`) and `BLOOMERY_RESIDENCY` (`off`, the residency clause's
-//! word there) — the slots clause's second server alone sets neither: it is
-//! the seat under its own defaults (the user's case).
-//! `BLOOMERY_RESIDENCY` and `BLOOMERY_XSTREAM` set in this binary's
-//! environment are refused by name: every server holds the unset
-//! `xstream=` rule.
+//! nor the environment move what a clause means: `BLOOMERY_DRAFT` (`mtp` on
+//! the drafted arm's main server and the drafting clauses' own servers, `off`
+//! on the plain arm's main server and the plain clauses' own) and
+//! `BLOOMERY_RESIDENCY` (`off`, the residency clause's word there) — the
+//! slots clause's second server alone sets neither: it is the seat under its
+//! own defaults (the user's case). `BLOOMERY_DRAFT`, `BLOOMERY_RESIDENCY` and
+//! `BLOOMERY_XSTREAM` set in this binary's environment are refused by name:
+//! the arm names the draft (a set `BLOOMERY_MTP_DRAFT` needs the drafted
+//! arm), and every server holds the unset `xstream=` rule.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -318,8 +329,8 @@ mod gate {
         bloomery_levers::XSTREAM,
     ];
 
-    const USAGE: &str = "usage: gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text> \
-                         --ids <a,b,…> --dir <out>";
+    const USAGE: &str = "usage: gate_qwen38_serve --arm plain|drafted --gen <generate_qwen3moe log> \
+                         --prompt <text> --ids <a,b,…> --dir <out>";
 
     /// The server's arguments after its path; `/props` must echo them. The
     /// context is named: the clauses below count on [`CTX`] positions, and
@@ -532,7 +543,27 @@ mod gate {
         }
     }
 
+    /// The arms, one a process (the module header): `plain`, the main
+    /// server with the draft off and every clause of its own; `drafted`,
+    /// the main server with the draft on and its drafted clauses alone.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Arm {
+        Plain,
+        Drafted,
+    }
+
+    impl Arm {
+        fn parse(v: &str) -> Result<Arm, GateError> {
+            match v {
+                "plain" => Ok(Arm::Plain),
+                "drafted" => Ok(Arm::Drafted),
+                other => Err(format!("--arm is plain or drafted, not {other}").into()),
+            }
+        }
+    }
+
     struct Args {
+        arm: Arm,
         gen_log: PathBuf,
         prompt: String,
         ids: Vec<u32>,
@@ -540,13 +571,14 @@ mod gate {
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        let (mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None);
+        let (mut arm, mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None, None);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
                 .next()
                 .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
             match flag.as_str() {
+                "--arm" => arm = Some(Arm::parse(&v)?),
                 "--gen" => gen_log = Some(PathBuf::from(v)),
                 "--prompt" => prompt = Some(v),
                 "--ids" => ids = Some(parse_ids(&v)?),
@@ -554,8 +586,9 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        match (gen_log, prompt, ids, dir) {
-            (Some(gen_log), Some(prompt), Some(ids), Some(dir)) => Ok(Args {
+        match (arm, gen_log, prompt, ids, dir) {
+            (Some(arm), Some(gen_log), Some(prompt), Some(ids), Some(dir)) => Ok(Args {
+                arm,
                 gen_log,
                 prompt,
                 ids,
@@ -572,19 +605,20 @@ mod gate {
 
     /// `/props`' `engine` object (the module header) against the plan of the
     /// file the server opens, made here from its headers the way the server
-    /// makes it, under the levers the server inherits; `argv` and `pid` are
-    /// the process this gate spawned.
+    /// makes it, under the levers the server inherits; `mtp` the arm's main
+    /// server (the draft's terms in its plan). `argv` and `pid` are the
+    /// process this gate spawned.
     fn props_engine(
         url: &dyn Fn(&str) -> String,
         argv: &[String],
         pid: u32,
         levers: &bloomery_levers::Levers,
         err_log: &Path,
+        mtp: bool,
     ) -> Result<bool, GateError> {
         let (st, body) = curl(&url("/props"), None, false)?;
         let e = json_of("/props", st, &body)?["engine"].clone();
         println!("props engine {e}");
-        let mtp = levers.draft() == Some("mtp");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
@@ -2311,31 +2345,26 @@ mod gate {
         Ok(ok)
     }
 
-    /// The `cache` clause on a server of its own with the draft the main
-    /// server did not run (`drafted`), the residency off.
-    fn cache_other(dir: &Path, drafted: bool) -> Result<bool, GateError> {
-        let label = if drafted { "drafted" } else { "plain" };
-        let own = dir.join(format!("cache-{label}"));
+    /// The `cache` clause's drafted half on a server of its own (the module
+    /// header): `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and the fixed
+    /// window — the plain arm's main server ran the draft off, so this
+    /// server runs the clause under it.
+    fn cache_other(dir: &Path) -> Result<bool, GateError> {
+        let own = dir.join("cache-drafted");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
         let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::DRAFT, if drafted { "mtp" } else { "off" })
-            .env(bloomery_levers::RESIDENCY, "off");
-        if drafted {
-            // The fixed window, as the main server's drafted clauses: the
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off")
+            // The fixed window, as the drafted arm's main server: the
             // clause holds draft counts across runs.
-            cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
-        } else {
-            cmd.env_remove(bloomery_levers::MTP_HEAD_ROWS)
-                .env_remove(bloomery_levers::MTP_DRAFT)
-                .env_remove(bloomery_levers::MTP_WIDTH);
-        }
+            .env(bloomery_levers::MTP_WIDTH, "fixed");
         let mut served = Served38::spawn_with(&SERVER_ARGS, &own, &mut cmd)?;
-        println!("cache {label} server pid {}", served.child.id());
+        println!("cache drafted server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
-        let ok = cache(&url, &err_log, drafted, label)?;
-        println!("cache {label} server stopped: {}", served.stop()?);
+        let ok = cache(&url, &err_log, true, "drafted")?;
+        println!("cache drafted server stopped: {}", served.stop()?);
         Ok(ok)
     }
 
@@ -3163,44 +3192,25 @@ mod gate {
         Ok(ok)
     }
 
-    pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(ACTS_ON)?;
-        if levers.draft() != Some("mtp") && levers.mtp_draft().is_some() {
-            return Err(
-                "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp".into(),
-            );
-        }
-        if let Some(word) = levers.residency() {
-            return Err(format!(
-                "BLOOMERY_RESIDENCY={word}: the gate sets it on every server it starts (off, and \
-                 the residency clause's mid-p0-s1)"
-            )
-            .into());
-        }
-        if let Some(word) = levers.xstream() {
-            return Err(format!(
-                "BLOOMERY_XSTREAM={word}: the gate holds its servers' `xstream=` lines to the \
-                 unset rule"
-            )
-            .into());
-        }
-        let a = parse_args()?;
-        let reference = gen_tokens(&a.gen_log)?;
-        std::fs::create_dir_all(&a.dir)?;
+    /// The plain arm (the module header): the main server with the draft
+    /// off — every clause that needs no draft — then, one at a time, the
+    /// clauses' own servers: the cache clause's drafted half, `ctx`,
+    /// `residency`, the slots pair, the drafted rounds, the width chooser
+    /// and the sampled rounds.
+    fn plain(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+        prompt: &str,
+        ids: &[u32],
+        reference: &[u32],
+    ) -> Result<bool, GateError> {
         let exe = Served38::exe()?;
-        let err_log = a.dir.join("server.err");
-        let drafted = levers.draft() == Some("mtp");
+        let err_log = dir.join("server.err");
         let mut cmd = Command::new(&exe);
-        cmd.env(bloomery_levers::DRAFT, if drafted { "mtp" } else { "off" })
-            .env(bloomery_levers::RESIDENCY, "off");
-        if drafted {
-            // The fixed window (the module header): this server's drafted
-            // clauses hold counts across two runs of it.
-            cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
-        } else {
-            cmd.env_remove(bloomery_levers::MTP_WIDTH);
-        }
-        let mut served = Served38::spawn_with(&SERVER_ARGS, &a.dir, &mut cmd)?;
+        cmd.env(bloomery_levers::DRAFT, "off")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        let mut served = Served38::spawn_with(&SERVER_ARGS, dir, &mut cmd)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
@@ -3231,10 +3241,10 @@ mod gate {
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
-        ok &= props_engine(&url, &argv, served.child.id(), &levers, &err_log)?;
+        ok &= props_engine(&url, &argv, served.child.id(), levers, &err_log, false)?;
 
         let completion = json!({
-            "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
@@ -3248,20 +3258,8 @@ mod gate {
         check(
             &mut ok,
             "completion_ids_are_generate_qwen3moe",
-            agree(&first, &stop, &reference),
+            agree(&first, &stop, reference),
         );
-        if levers.draft() == Some("mtp") {
-            // The drafted server's own clause: the greedy ids above are the
-            // plain run's (a draft changes which passes run, never a token),
-            // and the pass carried its counts.
-            let d = &c1["timings"];
-            check(
-                &mut ok,
-                "drafted_timings_carry_the_draft_counts",
-                d["draft_n"].as_u64().is_some_and(|n| n > 0)
-                    && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
-            );
-        }
 
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c2 = json_of("/completion", st, &body)?;
@@ -3293,7 +3291,7 @@ mod gate {
         let mut streamed = chat.clone();
         streamed["stream"] = json!(true);
         let (st, sse) = curl(&url("/v1/chat/completions"), Some(&streamed), true)?;
-        std::fs::write(a.dir.join("chat-stream.sse"), &sse)?;
+        std::fs::write(dir.join("chat-stream.sse"), &sse)?;
         let events: Vec<&str> = sse
             .split("\n\n")
             .filter_map(|e| e.strip_prefix("data: "))
@@ -3322,14 +3320,10 @@ mod gate {
             events.last() == Some(&"[DONE]"),
         );
 
-        let (st, body) = curl(
-            &url("/tokenize"),
-            Some(&json!({"content": a.prompt})),
-            false,
-        )?;
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({"content": prompt})), false)?;
         let tok = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
-        println!("tokenize {tok:?} ids {:?}", a.ids);
-        check(&mut ok, "tokenize_is_the_ids", tok == a.ids);
+        println!("tokenize {tok:?} ids {ids:?}");
+        check(&mut ok, "tokenize_is_the_ids", tok == ids);
 
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c3 = json_of("/completion", st, &body)?;
@@ -3344,47 +3338,145 @@ mod gate {
             ids_of(&c3["tokens"]) == first,
         );
 
-        let id = a.ids.iter().copied().min().ok_or("--ids is empty")?;
+        let id = ids.iter().copied().min().ok_or("--ids is empty")?;
         ok &= position_limit(&url, id)?;
-        let drafted = levers.draft() == Some("mtp");
-        ok &= cache(
-            &url,
-            &err_log,
-            drafted,
-            if drafted { "drafted" } else { "plain" },
-        )?;
-        let sampled = json!({
-            "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
-            "seed": SAMPLED_SEED, "return_tokens": true,
-        });
-        if levers.draft() == Some("mtp") {
-            ok &= continued(&url, &err_log, &a.ids, &reference)?;
-            let (st, body) = curl(&url("/completion"), Some(&sampled), false)?;
-            let top1 = json!({
-                "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
-                "top_k": 1, "seed": SAMPLED_SEED, "return_tokens": true,
-            });
-            let (st1, body1) = curl(&url("/completion"), Some(&top1), false)?;
-            ok &= sampled_served((st, &body), (st1, &body1), &first)?;
-        }
+        ok &= cache(&url, &err_log, false, "plain")?;
 
         println!("server stopped: {}", served.stop()?);
-        ok &= cache_other(&a.dir, !drafted)?;
-        ok &= ctx(&a.dir, &levers)?;
-        ok &= residency(&a.dir, &completion)?;
+        ok &= cache_other(dir)?;
+        ok &= ctx(dir, levers)?;
+        ok &= residency(dir, &completion)?;
         // The resident slots together (the module header): its own servers,
-        // the first with the draft on whatever this binary's lever says.
-        ok &= slots_flow_together(&a.dir)?;
+        // the first with the draft on.
+        ok &= slots_flow_together(dir)?;
         // The drafted rounds run as one pass (the module header): its own
         // server, the draft on, the residency off, the round records on.
-        ok &= slots_drafted_rounds(&a.dir)?;
+        ok &= slots_drafted_rounds(dir)?;
         // The width chooser's server (the module header): the draft on, the
         // residency off, `BLOOMERY_MTP_WIDTH=cost`.
-        ok &= width_cost(&a.dir, &a.prompt, &reference)?;
+        ok &= width_cost(dir, prompt, reference)?;
         // The plain rounds of a load that drafts nothing run as one pass
         // (the module header): its own server, sampled requests that step,
         // the round records on.
-        ok &= slots_sampled_rounds(&a.dir)?;
+        ok &= slots_sampled_rounds(dir)?;
+        Ok(ok)
+    }
+
+    /// The drafted arm (the module header): the main server of
+    /// [`SERVER_ARGS`] under `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`
+    /// and the fixed window, running the main arm's drafted clauses alone —
+    /// `/props`' `engine` against the gate's own plan with the draft (its
+    /// card bytes the draft's among them, its `draft` naming the file
+    /// [`draft_file`] picks), the greedy pass's ids and its draft counts,
+    /// `continued` and the sampled requests — none of the plain arm's other
+    /// clauses: each runs there on the plain main server, and the `cache`
+    /// clause's drafted half on the plain arm's cache-drafted server.
+    fn drafted_main(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+        prompt: &str,
+        ids: &[u32],
+        reference: &[u32],
+    ) -> Result<bool, GateError> {
+        let err_log = dir.join("server.err");
+        let exe = Served38::exe()?;
+        let mut cmd = Command::new(&exe);
+        // The fixed window (the module header): this server's drafted
+        // clauses hold counts across requests of it.
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::MTP_WIDTH, "fixed");
+        let mut served = Served38::spawn_with(&SERVER_ARGS, dir, &mut cmd)?;
+        println!("server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        println!("server listening on {addr}");
+
+        let mut ok = true;
+        let (st, body) = curl(&url("/health"), None, false)?;
+        println!("health {st} {body}");
+        let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
+            .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
+            .collect();
+        ok &= props_engine(&url, &argv, served.child.id(), levers, &err_log, true)?;
+        let completion = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
+        let c1 = json_of("/completion", st, &body)?;
+        let first = ids_of(&c1["tokens"]);
+        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        println!(
+            "completion tokens {first:?} stop_type={stop} content={}",
+            c1["content"]
+        );
+        println!("generate_qwen3moe {reference:?}");
+        // The drafted server's own clause: the greedy ids are the plain
+        // run's (a draft changes which passes run, never a token), and the
+        // pass carried its counts.
+        let d = &c1["timings"];
+        check(
+            &mut ok,
+            "drafted_ids_are_the_plain_runs",
+            agree(&first, &stop, reference),
+        );
+        check(
+            &mut ok,
+            "drafted_timings_carry_the_draft_counts",
+            d["draft_n"].as_u64().is_some_and(|n| n > 0)
+                && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
+        );
+        ok &= continued(&url, &err_log, ids, reference)?;
+        let sampled = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
+            "seed": SAMPLED_SEED, "return_tokens": true,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&sampled), false)?;
+        let top1 = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
+            "top_k": 1, "seed": SAMPLED_SEED, "return_tokens": true,
+        });
+        let (st1, body1) = curl(&url("/completion"), Some(&top1), false)?;
+        ok &= sampled_served((st, &body), (st1, &body1), &first)?;
+        println!("server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(ACTS_ON)?;
+        if let Some(word) = levers.residency() {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={word}: the gate sets it on every server it starts (off, and \
+                 the residency clause's mid-p0-s1)"
+            )
+            .into());
+        }
+        if let Some(word) = levers.xstream() {
+            return Err(format!(
+                "BLOOMERY_XSTREAM={word}: the gate holds its servers' `xstream=` lines to the \
+                 unset rule"
+            )
+            .into());
+        }
+        if let Some(word) = levers.draft() {
+            return Err(format!(
+                "BLOOMERY_DRAFT={word}: the gate sets it on every server it starts (the plain \
+                 arm off, the drafted arm mtp)"
+            )
+            .into());
+        }
+        let a = parse_args()?;
+        if a.arm != Arm::Drafted && levers.mtp_draft().is_some() {
+            return Err(
+                "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs --arm drafted".into(),
+            );
+        }
+        let reference = gen_tokens(&a.gen_log)?;
+        std::fs::create_dir_all(&a.dir)?;
+        let ok = match a.arm {
+            Arm::Plain => plain(&a.dir, &levers, &a.prompt, &a.ids, &reference)?,
+            Arm::Drafted => drafted_main(&a.dir, &levers, &a.prompt, &a.ids, &reference)?,
+        };
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())
