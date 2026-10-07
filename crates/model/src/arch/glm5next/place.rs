@@ -21,7 +21,8 @@ use crate::arch::coverage;
 use crate::placement::workstation::{self, GRANULE, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
-    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation, checked,
+    joined,
 };
 
 const F16_BYTES: u64 = 2;
@@ -336,12 +337,6 @@ fn card_terms(t: &CardTotals) -> u64 {
         + t.reserve_bytes
 }
 
-/// The violations, `; `-separated.
-fn joined(broken: &[Violation]) -> String {
-    let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-    list.join("; ")
-}
-
 /// The deepest context the plan serves: ik's `--dsa` step set at position
 /// 16,382 of a 16,384-position context (`tools/ref/models/glm5next.sh`,
 /// variant `d16kdsa`), the deepest reference the selector is checked at.
@@ -469,10 +464,7 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.kv_bytes += beside;
         }
-        let broken = plan.violations();
-        if !broken.is_empty() {
-            return Err(PlaceError::Broken(broken));
-        }
+        let plan = checked(plan).map_err(PlaceError::Broken)?;
         if let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             refuse_front(card, card_terms(t), limit, front)?;

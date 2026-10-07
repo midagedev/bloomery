@@ -242,11 +242,14 @@ fn hw_mimo2_plan() {
         .expect_err("a machine that hangs an expert tier card is refused by name")
         .to_string();
     let _ = writeln!(o, "  as the plan refuses a tier card: {err}");
-    if !(err.contains("the expert tier card 3090")
-        && err.contains("the card-expert program is a later round's"))
+    // PIN(2026-10-08): the tier refusal is the placement's own
+    // (HostRoutedTier), lifted from the family's Tier variant — it names the
+    // card and the all-host plan, no longer the card-expert round.
+    if !(err.contains("tier card 3090")
+        && err.contains("this plan puts every routed expert on the host"))
     {
         b.push(format!(
-            "the tier refusal names neither the card nor the round: {err}"
+            "the tier refusal names neither the card nor the all-host plan: {err}"
         ));
     }
     let err = inputs
