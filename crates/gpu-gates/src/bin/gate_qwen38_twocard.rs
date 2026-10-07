@@ -44,8 +44,10 @@
 //!   steps.
 //! - `--residency`: the tier load under `mid-p<P>-s1`, `P` half the plan's
 //!   fewest stage experts a layer (the stage's count, not the union's): the
-//!   history twice the same, flips landed; against the residency-off tier
-//!   run, `gate_qwen38_residency`'s stream rule (the machine moves experts
+//!   history twice the same, flips landed (in the real tier: that flips land
+//!   at all is the router's skew, which a fixture's generated router lacks, so
+//!   the fixture tier prints the counts and holds the rest); against the
+//!   residency-off tier run, `gate_qwen38_residency`'s stream rule (the machine moves experts
 //!   between the card and the host, whose sums run in another order): the
 //!   prompt's last logits row within
 //!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN) of the off run's,
@@ -98,13 +100,19 @@ mod gate {
     use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
-    use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
-    use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
+    use bloomery_gpu_gates::q38_fixture as q38;
+    use bloomery_gpu_gates::tier::Tag;
+    use bloomery_gpu_gates::{
+        GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
+    };
+    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
-    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_bp, tier_batch};
+    use model::arch::qwen35moe::place::{Experts, PlaceError, PlanInputs, machine_bp, tier_batch};
     use model::placement::host_lock::{HostFile, HostSet};
     use model::placement::workstation::RTX_3090;
-    use model::placement::{Device, ExpertList, Machine, Plan, PlanLevers, Role, Row, Segment};
+    use model::placement::{
+        Device, ExpertList, Machine, PlacementError, Plan, PlanLevers, Role, Row, Segment,
+    };
     use refset::arch::qwen4exp::MODEL;
     use runtime::{Out, Target, Verify, Want};
 
@@ -127,8 +135,10 @@ mod gate {
     /// for the steps after it.
     const CTX_4K: usize = 4352;
     const PROMPT_4K: usize = 4096;
-    /// The card budgets tried, largest first, GiB.
-    const BUDGETS: [u64; 10] = [26, 25, 24, 23, 22, 21, 20, 19, 18, 16];
+    /// The card budget the real file's gate takes, GiB: the literal the budget
+    /// search ([`chosen_plan`]) replaced, the witness the real tier prints the
+    /// search's pick beside and requires equal.
+    const REAL_BUDGET_GIB: u64 = 26;
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
     /// Nodes of a tier graph a tier layer, nine: the go wait, the
@@ -542,6 +552,7 @@ mod gate {
         (ids, prompt_ids): (&[u32], &[u32]),
         (off, off_prompt): (Option<&Run>, Option<&Run>),
         (split, plan): (&Split, &Plan<'_>),
+        skewed: bool,
     ) -> Result<bool, GateError> {
         let first = history(s, ids)?;
         let again = history(s, ids)?;
@@ -552,11 +563,16 @@ mod gate {
                 .iter()
                 .zip(&again.logits)
                 .all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
-        let flips = first.landed > 0 && again.landed > 0;
+        let flips = !skewed || (first.landed > 0 && again.landed > 0);
         println!(
-            "residency: the history twice the same {det}, flips landed {} and {}: {}",
+            "residency: the history twice the same {det}, flips landed {} and {}{}: {}",
             first.landed,
             again.landed,
+            if skewed {
+                ""
+            } else {
+                " (printed, not pinned in this tier)"
+            },
             verdict(det && flips)
         );
         let mut ok = det && flips;
@@ -742,25 +758,61 @@ mod gate {
         Ok(ok)
     }
 
-    /// Plan (b′) on `bp` at `ctx` positions under the largest budget of
-    /// [`BUDGETS`] that fits the gate ([`unfit`]), printed with why each
-    /// larger one did not.
+    /// What [`chosen_plan`] found: the plan, and whether its budget is the
+    /// largest whole GiB the gate fits (the next one is refused) and, on the
+    /// real file, the literal's.
+    struct Chosen<'a> {
+        plan: Plan<'a>,
+        tight: bool,
+    }
+
+    /// Plan (b′) under a whole-GiB budget on both cards: the plan (`None` when the
+    /// stage card holds every routed expert and the tier card is left idle,
+    /// `PlacementError::IdleTier`) and why it cannot be the gate's ([`unfit`]).
+    /// Any other refusal is an error.
+    fn plan_under<'a>(
+        inputs: &'a PlanInputs,
+        bp: &'a Machine,
+        ctx: usize,
+        gib: u64,
+    ) -> Result<(Option<Plan<'a>>, Option<String>), GateError> {
+        let levers = PlanLevers {
+            card_budget_bytes: Some(gib << 30),
+        };
+        match inputs.plan_with(bp, ctx as u64, &levers, Experts::Card) {
+            Ok(plan) => {
+                let why = unfit(&plan);
+                Ok((Some(plan), why))
+            }
+            Err(PlaceError::Placement(PlacementError::IdleTier { card, tier })) => Ok((
+                None,
+                Some(format!(
+                    "tier card {card} (tier {tier}) holds no expert: the stage card holds every one"
+                )),
+            )),
+            Err(e) => Err(format!("plan (b′) under {gib} GiB: {e}").into()),
+        }
+    }
+
+    /// Plan (b′) on `bp` at `ctx` positions under the largest whole-GiB budget
+    /// that fits the gate ([`unfit`]), searched down from the stage card's
+    /// usable GiB, printed with why each larger one did not. The pick is held
+    /// to be the largest: the next whole GiB above it is refused (re-planned
+    /// here, not read off the search). On the real file the search lands on
+    /// [`REAL_BUDGET_GIB`], where the next one's union passes the A6000's bytes.
     fn chosen_plan<'a>(
         inputs: &'a PlanInputs,
         bp: &'a Machine,
         ctx: usize,
-    ) -> Result<Plan<'a>, GateError> {
-        for gib in BUDGETS {
-            let levers = PlanLevers {
-                card_budget_bytes: Some(gib << 30),
-            };
-            let plan = inputs
-                .plan_with(bp, ctx as u64, &levers, Experts::Card)
-                .map_err(|e| format!("plan (b′) under {gib} GiB: {e}"))?;
-            if let Some(why) = unfit(&plan) {
+    ) -> Result<Chosen<'a>, GateError> {
+        let top = bp.cards[0].usable_bytes >> 30;
+        for gib in (1..=top).rev() {
+            let (plan, why) = plan_under(inputs, bp, ctx, gib)?;
+            if let Some(why) = why {
                 println!("budget {gib} GiB at {ctx} positions: {why}; next");
                 continue;
             }
+            let plan = plan.ok_or("a plan under a budget that fits the gate has no plan")?;
             let held = |v: &[u64]| {
                 (
                     v.iter().copied().min().unwrap_or(0),
@@ -777,9 +829,25 @@ mod gate {
                 tier_layers(&plan).len(),
                 plan.host.experts
             );
-            return Ok(plan);
+            let next = gib + 1;
+            let tight = if next > top {
+                true
+            } else {
+                let (_, why) = plan_under(inputs, bp, ctx, next)?;
+                println!(
+                    "budget {gib} GiB is the largest whole GiB the gate fits: {next} GiB {} {}",
+                    why.as_deref().unwrap_or("fits"),
+                    verdict(why.is_some())
+                );
+                why.is_some()
+            };
+            let witnessed = q38::witness("twocard budget GiB", gib, REAL_BUDGET_GIB);
+            return Ok(Chosen {
+                plan,
+                tight: tight && witnessed,
+            });
         }
-        Err(format!("no budget of BUDGETS fits the gate at {ctx} positions").into())
+        Err(format!("no whole-GiB budget fits the gate at {ctx} positions").into())
     }
 
     /// The prompt calls' host streaming: the residency pool's pick
@@ -951,7 +1019,7 @@ mod gate {
         }
         let layers = inputs.spec.layers.len();
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
-        let plan = chosen_plan(inputs, &bp, CTX_4K)?;
+        let Chosen { plan, tight } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
         let ids = prose38(PROMPT_4K)?;
         let mut um = bp.clone();
@@ -970,28 +1038,56 @@ mod gate {
             &want,
             &got,
         );
-        Ok(batch_precondition(served, Some(&tl)) && ok)
+        Ok(batch_precondition(served, Some(&tl)) && ok && tight)
+    }
+
+    /// A self-consistency clause: it runs in both tiers, so a tier that
+    /// deferred it would be refused by name here, not skipped.
+    fn sc(name: &str) -> Result<(), GateError> {
+        if q38::clause(name, Tag::SelfConsistency)? {
+            Ok(())
+        } else {
+            Err(format!("the self-consistency clause {name:?} was deferred").into())
+        }
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
+        let levers =
+            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
         let host = levers.host();
         let args = parse_args()?;
-        let path = Path::new(MODEL);
+        let path_buf = ref_model_path()?;
+        let path = path_buf.as_path();
         let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
+        let mut pass = q38::witness(
+            "model file",
+            path.to_string_lossy().into_owned(),
+            MODEL.to_string(),
+        );
+        // The plans' budget is the search's ([`chosen_plan`]): a caller's budget
+        // lever is not read, so one that disagrees with the fixture's header is
+        // refused here as every other gate refuses it.
+        q38::plan_levers(&split, &levers, 0)?;
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
-        let plan = chosen_plan(&inputs, &bp, CTX)?;
+        let Chosen {
+            plan,
+            tight: tight_3k,
+            ..
+        } = chosen_plan(&inputs, &bp, CTX)?;
+        pass &= tight_3k;
         let tl = tier_layers(&plan);
         let ids = prose38(PROMPT + 32)?;
         let prompt_ids = prose38(PROMPT_U)?;
         let mut off_prompt = None;
-        let mut pass = true;
         let mut last: Option<Session<Body38>> = None;
         let mut off_run = None;
         if args.union {
+            sc(
+                "--union: the tier load's history, prompt calls and structure = the union reference's",
+            )?;
             let mut um = bp.clone();
             um.tiers.clear();
             let uplan = union_plan(&plan, &um)?;
@@ -1035,6 +1131,13 @@ mod gate {
             last = Some(t);
         }
         if args.residency {
+            // The flips landing at all is the router's skew (the double of the router is R4's):
+            // a fixture's generated router has none, so the fixture tier holds the rest of the
+            // arm and prints the counts.
+            let skewed = q38::clause(
+                "--residency: flips landed under the router's skew (the double of the router is R4's)",
+                Tag::FileBound,
+            )?;
             drop(last.take());
             let slots = plan
                 .n_l
@@ -1057,10 +1160,12 @@ mod gate {
                 (&ids, &prompt_ids),
                 (off_run.as_ref(), off_prompt.as_ref()),
                 (&split, &plan),
+                skewed,
             )?;
             last = Some(t);
         }
         if args.lost {
+            sc("--lost: the tier's stream held behind a host flag is named as a lost card")?;
             let mut s = match last.take() {
                 Some(s) => s,
                 None => open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?,
@@ -1068,9 +1173,14 @@ mod gate {
             pass &= lost_case(s.model_mut(), &ids)?;
         }
         if args.prompt4k {
+            sc("--prompt4k: a 4,096-id prompt call, two cards = the union")?;
             drop(last.take());
             pass &= prompt4k(path, &inputs, host)?;
         }
+        let (ran, deferred) = q38::tally();
+        println!(
+            "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
+        );
         if !pass {
             return Err(checks_failed());
         }
