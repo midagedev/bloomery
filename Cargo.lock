@@ -130,9 +130,11 @@ dependencies = [
  "bloomery-model",
  "bloomery-runtime",
  "bloomery-threads",
+ "crc32fast",
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "indexmap",
 ]
 
 [[package]]
