@@ -1,0 +1,32 @@
+# The 0.2.6 release film's three arms, one lease on the A6000: 0.2.5's build on UD-Q4_K_XL with the host stream off
+# (0.2.5's server never streamed a prompt's host experts), 0.2.6 on UD-Q4_K_XL at its defaults, 0.2.6 on UD-Q3_K_XL
+# (the IQ file 0.2.6 loads) at its defaults; the MTP draft at each build's default (on), P = 512 and 4096, ctx 4352.
+# A first window with BLOOMERY_DRAFT=off on every arm (2026-10-07) measured pp4096 773.3 / 1,286.3 / 1,494.0 and
+# decode 56.7 / 62.0 / 65.5; it is not what a user runs, so this window takes the defaults.
+#
+# Decomposition [derived]: the xstream-pp sitting (rig-log, 4 rounds, same plan) measured pp4096 off 772.9 and split
+# 1,350.5; the 0.2.5 arm is the off shape on 0.2.5's code, so ~770. The Q3 file is 89.99 GB against 111.33 GB (0.81×
+# a layer's expert bytes): the plan seats ~19 % more experts on the card and each streamed or copied expert is 19 %
+# smaller, so the card shadow (copy 15.4 of ~28 ms a layer) and the host union both shrink, while the card front
+# (19 / 65 ms a layer, 1.46 s at 4,096) does not move: 3.0 s -> ~2.4..2.8 s, pp4096 1,450..1,700.
+# Wall [derived]: 6 arms x 4 rounds of a fresh Qwen3.8 load (~40 s each, q38seed's 4 x 4 took 9-12 min), 15..20 min.
+# Runner (main tree, the full output to a file first):
+# BLOOMERY_HOLD_OWNER=sit026 BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=4
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/vid026-3arm.card BLOOMERY_GEN_CTX=4352' just depth-gpu-qwen4exp
+#   bin:/root/repo/bloomery-v025/target/release/generate_qwen3moe:prose:512@BLOOMERY_HOSTSTREAM=off
+#   bin:/root/repo/bloomery-v025/target/release/generate_qwen3moe:prose:4096@BLOOMERY_HOSTSTREAM=off
+#   prose:512 prose:4096 prose:512@model=<Q3> prose:4096@model=<Q3>
+kind: baseline
+question: what do a user's three choices read on the A6000 for a 512- and a 4,096-token prompt and the decode after
+  it: 0.2.5 on UD-Q4_K_XL, 0.2.6 on UD-Q4_K_XL, 0.2.6 on UD-Q3_K_XL?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, the 0.2.6 UD-Q3_K_XL arm at its defaults (MTP draft on)
+unit: tok/s
+predict: 1300..1550
+condition: one lease, four rounds, a fresh process per load group, majflt near 0 (no [cold] row), no [cpu-busy] or
+  [other-busy] row; each arm's load line names its draft (on), and the 0.2.6 Q4 arm's pp4096 at or under the draft-off
+  window's 1,286.3 (the draft's card bytes push target experts off the card)
+reason: the release film's numbers, and the IQ file's first timed prompt row; why now: the film waits on it
+decide-in: fill the film's data from this window; the Q3 row goes into rig-log beside the Q4 rows
+decide-below: the IQ file's prompt path pays a term the bytes do not: read the arm's xstream records (streamed,
+  bytes, lane_gbs) and stat prompt lines against the Q4 arm's before the film uses the row
+decide-above: check the Q3 arm's plan line (card experts a layer) before believing it; then re-derive the front term

@@ -35,12 +35,14 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 |---|---|
 | Linux x86-64, NVIDIA sm_86 (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number here comes from these cards |
 | NVIDIA driver | R580 or newer (CUDA 13); an older driver is refused at the start |
-| Ada and Blackwell (sm_89, sm_120) | Not yet run here. The sm_86 PTX compiles for the card at the first start. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
-| Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel |
+| Ada and Blackwell (sm_89, sm_120) | Blackwell ran on a user's RTX 5090 under WSL2 ([#2](https://github.com/midagedev/bloomery/issues/2)): the sm_86 PTX compiles for the card at the first start. Ada not yet run. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
+| Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. Every number here comes from an 8-channel host; a 2-channel desktop host is not measured here and runs the CPU experts slower |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
-| Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest |
-| MTP draft (Qwen3.8, GLM-5.3) | On by default |
+| Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does |
+| MTP draft (Qwen3.8, GLM-5.3) | On by default; its width follows measured cost |
+| Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
+| i-quants | Qwen3.8 `UD-Q3_K_XL` (IQ3_XXS, IQ4_XS, IQ4_NL experts) runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. IQ3_S, IQ2_*, IQ1_M and BF16 tensors are not loaded yet |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
 | Vision input (V4.1) | Not in this release |
 
@@ -118,6 +120,16 @@ Two requests at once (`--parallel 2`, both busy) after a 512-token prompt, decod
 | GLM-5.3-Flash `UD-Q4_K_XL` | 35.3 | 223 |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | — ³ |
 
+**RTX A6000 48 GB, one request, Qwen3.8-Flash-Next (0.2.6, MTP on, `--place a`)**
+
+| File | Prompt tok/s (P = 512) | Prompt tok/s (P = 4096) | Decode tok/s after the 4,096-token prompt |
+|---|---|---|---|
+| `UD-Q4_K_XL` | 943 | 1,258 | 89.1 |
+| `UD-Q3_K_XL` | 775 | 1,438 | 98.4 |
+
+A prose prompt, 96 tokens after it, four rounds in one window, the serving defaults; 0.2.5 read the same 4,096-token
+prompt at 733 tok/s and decoded at 73.6 ([measured](https://github.com/midagedev/rig-log/blob/main/log/2026-10-07.md#rel026-3arm)).
+
 ¹ measured when Qwen3.6 ran two requests in turn (one request's rate); one pass since 0.2.3, not re-measured · ² adaptive residency off · ³ two requests in turn on two cards
 today. Qwen3.8 and GLM-5.3 ran with the MTP draft off.
 
@@ -127,6 +139,8 @@ Each point has a same-engine measurement in [`docs/performance.md`](docs/perform
 
 - **Experts move to where they are used**: V4.1 decode 29.48 → 43.86 tok/s with adaptive residency.
 - **The card and the CPU work on a prompt at once** (V4.1): two batches in flight, 1.20× at P = 4096.
+- **A prompt's CPU experts move to the card** (Qwen3.8): each layer seats the experts the prompt uses most, and
+  they stay for the answer; P = 4096 from 733 to 1,258 tok/s on the A6000.
 - **Qwen prompts as int8 tensor-core GEMMs**: P = 4096 from 357 to 2,615 tok/s, then a prefill flash kernel.
 - **CPU experts at memory speed**: AVX2 kernels on the stored quantization, grouped dispatch on a pinned pool.
 - **One CUDA graph a decode step**, with the CPU experts inside it, and speculative decoding (MTP, DSpark).

@@ -59,6 +59,11 @@ language is not one of the reasons: the kernels are Rust (274 of them, through
   at P = 4096, the host's wait for routes falling from 17.8 to 0.8 ms per layer-batch
   ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#prefillgroup-ab)). A batched prompt leaves the same state as one step per
   token, bit for bit.
+- **A prompt's CPU experts move to the card (Qwen3.8).** Each layer of a prompt seats the host experts it calls
+  most on the card before it runs them, and under `--place a` streams more through a ring of card slots when the
+  host would still finish last; the seated experts stay for the answer. One binary, the path off against on, a
+  4,096-token prose prompt on the A6000 (residency `mid-p148-s1`, MTP off): 772.9 → 1,350.5 tok/s; seating alone
+  gave 1,342.1 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-10-07.md#rel026-xstream)).
 - **Qwen prompts as tensor-core matrix products.** The Qwens' prompt weights and routed experts run as grouped
   int8 tensor-core GEMMs: P = 4096 went from 357 tok/s (eight positions a pass) to 2,615
   ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab)). A prefill-only flash attention kernel, where a block owns 64
