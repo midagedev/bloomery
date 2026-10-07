@@ -136,11 +136,13 @@ generate_ds41   glm5next_router_pick                     0           0
 generate_ds41   glm5next_router_scores                   0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
+generate_ds41   gqa_flash_merge_sink                     0           0
 generate_ds41   gqa_flash_seg                            0           0
 generate_ds41   gqa_flash_seg_256                        0           0
 generate_ds41   gqa_flash_seg_256_p2                     0           0
 generate_ds41   gqa_flash_seg_256_p4                     0           0
 generate_ds41   gqa_flash_seg_256_p4_sel                 0           0
+generate_ds41   gqa_flash_seg_k192                       0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
 generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p4                 0           0
@@ -197,6 +199,7 @@ generate_ds41   kv_norm_rope_append                      0           0
 generate_ds41   latent_rms_append                        0           0
 generate_ds41   moe_combine                              0           0
 generate_ds41   mtp_input                                0           0
+generate_ds41   neox_append_k192                         0           0
 generate_ds41   norm_quant                               0           0
 generate_ds41   ple_conv                                 0           0
 generate_ds41   ple_gate                                 0           0
@@ -344,11 +347,13 @@ gate_e2e   gemm_route_remap                         0           0
 gate_e2e   gemm_swiglu_quant                        0           0
 gate_e2e   gqa_flash_merge                          0           0
 gate_e2e   gqa_flash_merge_256                      0           0
+gate_e2e   gqa_flash_merge_sink                     0           0
 gate_e2e   gqa_flash_seg                            0           0
 gate_e2e   gqa_flash_seg_256                        0           0
 gate_e2e   gqa_flash_seg_256_p2                     0           0
 gate_e2e   gqa_flash_seg_256_p4                     0           0
 gate_e2e   gqa_flash_seg_256_p4_sel                 0           0
+gate_e2e   gqa_flash_seg_k192                       0           0
 gate_e2e   gqa_flash_seg_mma                        0           0
 gate_e2e   gqa_flash_seg_mma_256                    0           0
 gate_e2e   gqa_flash_seg_mma_256_p4                 0           0
@@ -404,6 +409,7 @@ gate_e2e   kv_norm_rope_append                      0           0
 gate_e2e   latent_rms_append                        0           0
 gate_e2e   moe_combine                              0           0
 gate_e2e   mtp_input                                0           0
+gate_e2e   neox_append_k192                         0           0
 gate_e2e   norm_quant                               0           0
 gate_e2e   ple_conv                                 0           0
 gate_e2e   ple_gate                                 0           0
