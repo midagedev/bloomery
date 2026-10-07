@@ -53,7 +53,8 @@ pub const GENERAL_ALIGNMENT: &str = "general.alignment";
 
 /// One GGUF metadata value. Tags are the on-disk value-type ids:
 /// 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 bool, 8 string,
-/// 9 array, 10 u64, 11 i64, 12 f64.
+/// 9 array, 10 u64, 11 i64, 12 f64. An array's elements share one tag, and
+/// it is not 9: ggml reads no array of arrays.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     U8(u8),
@@ -126,6 +127,12 @@ pub enum LoadError {
     Truncated { at: u64, need: u64, len: u64 },
     #[error("metadata value type tag {0} is not a GGUF value type (0-12)")]
     BadValueType(u32),
+    /// An array whose element tag is 9: ggml reads arrays of scalars and of
+    /// strings only, and aborts on an array of arrays.
+    #[error("metadata {key:?} is an array of arrays; GGUF arrays hold scalars or strings")]
+    NestedArray { key: String },
+    #[error("{} is {value}: the alignment is a nonzero u32", GENERAL_ALIGNMENT)]
+    Alignment { value: String },
     #[error("tensor {name:?}: n_dims {n} outside 1..=4")]
     BadDims { name: String, n: u32 },
     #[error("tensor {name:?}: dims must all be >= 1, got {dims:?}")]
@@ -825,12 +832,19 @@ impl Value {
     }
 }
 
-fn meta_u32(meta: &[(String, Value)], key: &str) -> Option<u32> {
-    match meta.iter().find(|(k, _)| k == key).map(|(_, v)| v) {
-        Some(Value::U32(v)) => Some(*v),
-        Some(Value::U16(v)) => Some(*v as u32),
-        Some(Value::U8(v)) => Some(*v as u32),
-        _ => None,
+/// The alignment the first `general.alignment` sets: a u32, as ggml reads
+/// it, and not 0, which no offset can be rounded to; 32 when absent.
+fn alignment_of(meta: &[(String, Value)]) -> Result<u64, LoadError> {
+    match meta
+        .iter()
+        .find(|(k, _)| k == GENERAL_ALIGNMENT)
+        .map(|(_, v)| v)
+    {
+        None => Ok(write::DEFAULT_ALIGNMENT),
+        Some(Value::U32(a)) if *a != 0 => Ok(u64::from(*a)),
+        Some(other) => Err(LoadError::Alignment {
+            value: format!("{other:?}"),
+        }),
     }
 }
 
@@ -955,7 +969,7 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     for _ in 0..n_kv {
         let key = rd.string()?;
         let tag = rd.u32()?;
-        let val = read_value(&mut rd, tag)?;
+        let val = read_value(&mut rd, &key, tag)?;
         meta.push((key, val));
     }
 
@@ -988,7 +1002,7 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     // Alignment and the data base, mirroring ggml.c:31432-31447:
     // `general.alignment` (u32 KV) or 32, then round the end of the
     // tensor-info section up to it.
-    let alignment = meta_u32(&meta, GENERAL_ALIGNMENT).unwrap_or(32) as u64;
+    let alignment = alignment_of(&meta)?;
     let header_end = rd.pos as u64;
     let data_base = header_end.div_ceil(alignment) * alignment;
     Ok(Header {
@@ -1066,7 +1080,9 @@ impl Reader<'_> {
     }
 }
 
-fn read_value(rd: &mut Reader<'_>, tag: u32) -> Result<Value, LoadError> {
+/// The value of metadata pair `key`, of type `tag`. An array's elements are
+/// never arrays, so the recursion is one level deep.
+fn read_value(rd: &mut Reader<'_>, key: &str, tag: u32) -> Result<Value, LoadError> {
     Ok(match tag {
         0 => Value::U8(rd.u8()?),
         1 => Value::I8(rd.u8()? as i8),
@@ -1079,14 +1095,25 @@ fn read_value(rd: &mut Reader<'_>, tag: u32) -> Result<Value, LoadError> {
         8 => Value::String(rd.string()?),
         9 => {
             // Array: u32 element tag, u64 count, then the elements. The
-            // capacity is capped so a lying count cannot pre-allocate
-            // gigabytes — a count that outruns the file dies at Truncated
-            // when the elements actually run out.
+            // element tag is a scalar or string type, checked before the
+            // count so an empty array is held to it too. The capacity is
+            // capped so a lying count cannot pre-allocate gigabytes — a count
+            // that outruns the file dies at Truncated when the elements
+            // actually run out.
             let elem_tag = rd.u32()?;
+            match elem_tag {
+                0..=8 | 10..=12 => {}
+                9 => {
+                    return Err(LoadError::NestedArray {
+                        key: key.to_string(),
+                    });
+                }
+                other => return Err(LoadError::BadValueType(other)),
+            }
             let n = rd.u64()?;
             let mut items = Vec::with_capacity(n.min(4096) as usize);
             for _ in 0..n {
-                items.push(read_value(rd, elem_tag)?);
+                items.push(read_value(rd, key, elem_tag)?);
             }
             Value::Array(items)
         }

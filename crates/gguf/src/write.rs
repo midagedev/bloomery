@@ -14,10 +14,11 @@
 //! What a reader would refuse is refused here by name, before a byte is
 //! written: a repeated key or tensor name, an alignment that is not a
 //! power-of-two u32, an array whose elements carry different value tags or
-//! none (an empty array has no element type), dims outside 1..=4 or holding
-//! a 0, and, for a type id ggml's table sizes ([`crate::ggml_type_info`]), a
-//! first dim off the block or a byte count its dims do not make. A type id no
-//! table knows is taken with the byte count its declaration states.
+//! none (an empty array has no element type) or are arrays themselves, dims
+//! outside 1..=4 or holding a 0, and, for a type id ggml's table sizes
+//! ([`crate::ggml_type_info`]), a first dim off the block or a byte count its
+//! dims do not make. A type id no table knows is taken with the byte count
+//! its declaration states.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -68,6 +69,8 @@ pub enum WriteError {
     EmptyArray { key: String },
     #[error("metadata {key:?}: an array mixes value tags {first} and {other}")]
     MixedArray { key: String, first: u32, other: u32 },
+    #[error("metadata {key:?} is an array of arrays; GGUF arrays hold scalars or strings")]
+    NestedArray { key: String },
     #[error(
         "{} is {value}: the alignment is a power-of-two u32",
         GENERAL_ALIGNMENT
@@ -254,8 +257,8 @@ fn check_tensor(t: &TensorDecl) -> Result<(), WriteError> {
     Ok(())
 }
 
-/// An array's elements must share one value tag, and there must be one to
-/// share; nested arrays are checked the same way.
+/// An array's elements must share one value tag, there must be one to
+/// share, and it is not the array tag: the reader refuses an array of arrays.
 fn check_value(key: &str, v: &Value) -> Result<(), WriteError> {
     let Value::Array(items) = v else {
         return Ok(());
@@ -265,6 +268,11 @@ fn check_value(key: &str, v: &Value) -> Result<(), WriteError> {
             key: key.to_string(),
         });
     };
+    if let Value::Array(_) = first {
+        return Err(WriteError::NestedArray {
+            key: key.to_string(),
+        });
+    }
     for item in items {
         if tag(item) != tag(first) {
             return Err(WriteError::MixedArray {
@@ -273,7 +281,6 @@ fn check_value(key: &str, v: &Value) -> Result<(), WriteError> {
                 other: tag(item),
             });
         }
-        check_value(key, item)?;
     }
     Ok(())
 }
@@ -304,7 +311,7 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
 }
 
 /// A value without its tag; an array is its element tag, its count and its
-/// elements (checked non-empty and uniform by [`check_value`]).
+/// elements (checked non-empty, uniform and not arrays by [`check_value`]).
 fn put_value(b: &mut Vec<u8>, v: &Value) {
     match v {
         Value::U8(x) => b.push(*x),
@@ -484,7 +491,7 @@ mod tests {
         }
     }
 
-    /// Every value type the reader parses, arrays nested and not.
+    /// Every value type the reader parses, arrays of numbers and of strings.
     fn every_value() -> Vec<(String, Value)> {
         let s = |x: &str| Value::String(x.to_string());
         [
@@ -509,14 +516,6 @@ mod tests {
                 Value::Array(vec![Value::U32(1), Value::U32(2), Value::U32(u32::MAX)]),
             ),
             ("t.arr.str", Value::Array(vec![s("a"), s(""), s("ccc")])),
-            (
-                "t.arr.nested",
-                Value::Array(vec![
-                    Value::Array(vec![Value::I8(-1), Value::I8(2)]),
-                    Value::Array(vec![s("x")]),
-                    Value::Array(vec![Value::Array(vec![Value::F64(1.5)])]),
-                ]),
-            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -524,7 +523,7 @@ mod tests {
     }
 
     /// The writer round trip at `alignment` (`None`: no alignment key, so
-    /// 32): every value type, nested arrays and several tensors of known
+    /// 32): every value type, arrays and several tensors of known
     /// types read back through the strict reader with the same pairs in the
     /// same order, the same names, dims, types, offsets, byte counts and
     /// bytes, and the file ends where the layout said.
@@ -666,9 +665,9 @@ mod tests {
             WriteError::EmptyArray { key } => assert_eq!(key, "e"),
             other => panic!("wrong refusal: {other}"),
         }
-        let inner_empty = Value::Array(vec![Value::Array(vec![])]);
-        match layout_err(&kv("n", inner_empty), vec![]) {
-            WriteError::EmptyArray { key } => assert_eq!(key, "n"),
+        let nested = Value::Array(vec![Value::Array(vec![Value::U8(1)])]);
+        match layout_err(&kv("n", nested), vec![]) {
+            WriteError::NestedArray { key } => assert_eq!(key, "n"),
             other => panic!("wrong refusal: {other}"),
         }
         match layout_err(

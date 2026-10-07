@@ -90,7 +90,7 @@ fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }
 
-fn read_line(r: &mut BufReader<TcpStream>) -> io::Result<Option<String>> {
+fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut buf = Vec::new();
     let n = r
         .by_ref()
@@ -184,7 +184,7 @@ pub(crate) fn read_request(
     Ok(Some(req))
 }
 
-fn read_chunked(r: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
+fn read_chunked(r: &mut impl BufRead) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let line = read_line(r)?.ok_or_else(|| bad("closed inside a chunk"))?;
@@ -195,7 +195,8 @@ fn read_chunked(r: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
             while read_line(r)?.is_some_and(|l| !l.is_empty()) {}
             return Ok(body);
         }
-        if body.len() + size > MAX_BODY {
+        // The loop keeps `body.len() <= MAX_BODY`, so the subtraction cannot underflow.
+        if size > MAX_BODY - body.len() {
             return Err(bad("body too large"));
         }
         let at = body.len();
@@ -318,7 +319,30 @@ impl<'a> EventStream<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_query;
+    use super::{parse_query, read_chunked};
+    use std::io::ErrorKind;
+
+    /// Chunks join into the body, extensions and trailers aside; a chunk size
+    /// that carries the body past the limit is refused by name, also when the
+    /// client's size would wrap the running total.
+    #[test]
+    fn chunked_bodies_decode_and_stop_at_the_limit() {
+        let body = read_chunked(&mut &b"3;x=y\r\nabc\r\n1\r\nd\r\n0\r\nT: v\r\n\r\n"[..])
+            .expect("a valid chunked body");
+        assert_eq!(body, b"abcd");
+        for hostile in [
+            "4000001\r\n",
+            "1\r\na\r\nffffffffffffffff\r\n",
+            "2\r\nab\r\nfffffffffffffffe\r\n",
+        ] {
+            let err = read_chunked(&mut hostile.as_bytes()).expect_err(hostile);
+            assert_eq!(
+                (err.kind(), err.to_string().as_str()),
+                (ErrorKind::InvalidData, "body too large"),
+                "{hostile:?}"
+            );
+        }
+    }
 
     /// `%2F` decodes to `/`, `+` to a space, in keys and values alike; a key
     /// with no `=` has the empty value; a broken escape is an error.

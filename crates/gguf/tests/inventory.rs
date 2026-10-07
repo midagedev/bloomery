@@ -1,6 +1,8 @@
 //! Inventory contracts, on synthetic files: the header-only path carries
-//! what the strict reader refuses, reports unknown sizes as `None`, and
-//! agrees with `Gguf::open` on every field for types both accept.
+//! what the strict reader refuses, reports unknown sizes as `None`, agrees
+//! with `Gguf::open` on every field for types both accept, and refuses, as
+//! it does, metadata ggml does not read (an array of arrays, an alignment
+//! that is 0 or not a u32).
 
 use std::path::PathBuf;
 
@@ -51,6 +53,79 @@ fn tmp(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("gguf-inventory-{}-{name}", std::process::id()));
     p
+}
+
+/// A file of no tensors whose one metadata pair is `key`, of value tag
+/// `tag`, with the value's bytes `value`.
+fn one_kv(path: &std::path::Path, key: &str, tag: u32, value: &[u8]) {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    put_u32(&mut b, 3);
+    put_u64(&mut b, 0);
+    put_u64(&mut b, 1);
+    put_str(&mut b, key);
+    put_u32(&mut b, tag);
+    b.extend_from_slice(value);
+    std::fs::write(path, b).expect("write synthetic gguf");
+}
+
+/// Both entry points' verdict on the file at `path`.
+fn both(path: &std::path::Path) -> [Result<(), LoadError>; 2] {
+    [inventory_of(path).map(|_| ()), Gguf::open(path).map(|_| ())]
+}
+
+/// An array holds one scalar or string type, as ggml's reader requires: both
+/// entry points refuse an array of arrays by its key, and an element tag that
+/// is no value type even when the array is empty.
+#[test]
+fn an_array_holds_no_arrays() {
+    let p = tmp("nested.gguf");
+    // Element tag 9, one element: itself an empty array of u32.
+    let mut nested = Vec::new();
+    put_u32(&mut nested, 9);
+    put_u64(&mut nested, 1);
+    put_u32(&mut nested, 4);
+    put_u64(&mut nested, 0);
+    one_kv(&p, "k", 9, &nested);
+    for r in both(&p) {
+        match r {
+            Err(LoadError::NestedArray { key }) => assert_eq!(key, "k"),
+            other => panic!("an array of arrays must be refused by name, got {other:?}"),
+        }
+    }
+    // Element tag 13, no elements.
+    let mut empty = Vec::new();
+    put_u32(&mut empty, 13);
+    put_u64(&mut empty, 0);
+    one_kv(&p, "k", 9, &empty);
+    for r in both(&p) {
+        match r {
+            Err(LoadError::BadValueType(13)) => {}
+            other => panic!("element tag 13 must be refused, got {other:?}"),
+        }
+    }
+    std::fs::remove_file(&p).unwrap();
+}
+
+/// `general.alignment` is a u32, as ggml reads it, and not 0: both entry
+/// points refuse a 0 and a u16 by name instead of dividing by zero or taking
+/// another type's value.
+#[test]
+fn the_alignment_is_a_nonzero_u32() {
+    let p = tmp("alignment.gguf");
+    for (tag, value, shown) in [
+        (4, 0u32.to_le_bytes().to_vec(), "U32(0)"),
+        (2, 32u16.to_le_bytes().to_vec(), "U16(32)"),
+    ] {
+        one_kv(&p, "general.alignment", tag, &value);
+        for r in both(&p) {
+            match r {
+                Err(LoadError::Alignment { value }) => assert_eq!(value, shown),
+                other => panic!("alignment {shown} must be refused by name, got {other:?}"),
+            }
+        }
+    }
+    std::fs::remove_file(&p).unwrap();
 }
 
 /// The contract this crate exists for: a tensor whose ggml type the engine
