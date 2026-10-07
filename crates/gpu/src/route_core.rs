@@ -13,8 +13,9 @@
 //!
 //! [`Score`] names the element-wise score functions. Softmax is not one — it
 //! needs all of a token's logits — and stays in its wrapper's own pass.
-//! A router body generic over its score takes one of them as a type
-//! parameter (`gpu-deepseek41`'s `router::glm5next` routes with [`Sigmoid`]).
+//! A router body generic over its score ([`crate::route_body`]) takes one of
+//! them as a type parameter (`gpu-deepseek41`'s `router::glm5next` routes with
+//! [`Sigmoid`]).
 //!
 //! A weight stage that renormalizes its selected scores divides by
 //! [`renorm_divisor`] of their sum: the one guard every such stage and its
