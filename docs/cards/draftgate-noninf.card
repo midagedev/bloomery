@@ -11,7 +11,7 @@ term: decode tok/s @ depth 512 and 4096, BLOOMERY_DRAFT=mtp, A6000, place a -
   (cost - fixed) / fixed, paired by round
 unit: %
 predict: -0.5..+0.9
-rounds: 6
+rounds: 14
 sd: 0.6 % same-binary per round, AGENTS.md 「Know the ruler」
 condition: just depth-gpu-qwen4exp in one lease on this tree's build, order rotated every round,
   arms 512@BLOOMERY_MTP_WIDTH=cost 512@BLOOMERY_MTP_WIDTH=fixed 4096@BLOOMERY_MTP_WIDTH=cost
