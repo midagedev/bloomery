@@ -185,6 +185,15 @@ Order:
   - XS each: `.config/nextest.toml` has no user (delete or adopt); `overflow-checks` per untrusted-input package (not
     profile-wide: overflow MIR breaks device lowering); a rust-analyzer config for the Mac.
   - Done: the lead's pre-push hook (fmt + five fast check-*.sh, 22 s).
+- **A graph capture broken by another thread's call on the same device** (worker2, 2026-10-07; S, after 0.2.6).
+  - Symptom: `gate-gpu-lib` went red once (eqc2's batch). A context test's second `Gpu::with_device(0)` got 900
+    ("operation not permitted when stream is capturing", `lib.rs:2834`, `:2872`), and the concurrent graph test's
+    capture failed with 901 (`graph.rs:944`). The capture is THREAD_LOCAL (`graph.rs:92-95`) on a non-blocking stream.
+  - Name the call before any fix, with a box loop of the capture test against one other thread: arm 1 that thread only
+    does cuMemAlloc, arm 2 it only loads a module. A test mutex would hide an engine version of the same race.
+    `capture_step` (`model.rs:972`), `capture_rows` (`:1809`) and the prefill `capture_pass` run while another thread
+    on the device can load or allocate (a second card's thread, the swap staging helper, a lazily loaded family).
+  - If arm 2 reproduces it, the engine rule is "every module loads before the first capture", pinned by a test.
 - **gpu-gate.sh holds a card lock while it waits for the V4.1 load lock** (xstream23, 2026-10-07; S, after 0.2.6).
   The A6000 then idles (1 MiB in use) while `any` items fall back to the 3090 queue. Round gate items waited 20+ min
   each. The order is deliberate (`tools/gpu-gate.sh` self-test "lock order": a load queued on its card lock holds no
