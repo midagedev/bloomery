@@ -26,3 +26,8 @@ bloomery-runtime = { path = "../runtime" }
 # The pinned pool the hybrid host tier waits on and computes with (the CPU
 # engine dispatches its expert matmuls on the same pool).
 bloomery-threads = { path = "../threads" }
+# One feature set for every build of this crate: png's flate2 and serve's serde_json turn on these crates'
+# `default`, the `--features gpu` builds alone do not, and a feature list is part of cargo's unit hash, so
+# without these lines the crate and its cuda-* chain compile once per feature set.
+crc32fast = "1.5"
+indexmap = "2.14"
