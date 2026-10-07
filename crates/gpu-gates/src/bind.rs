@@ -2310,8 +2310,7 @@ mod tests {
     fn the_residency38_room_subtracts_the_checkpoints() {
         use crate::residency38::{checkpoint_bytes, mem_left_38};
         // A plan of one card layer of 100 experts, its host the rest: the
-        // unset rule's P is half the fewest (50), the pool a fixed 10 GiB
-        // whatever P is.
+        // unset rule pins none (P 0), the pool a fixed 10 GiB whatever P is.
         let pick = |mem_left: i128| {
             bloomery_levers::residency38_at_plan(
                 [100u64],
@@ -2326,7 +2325,7 @@ mod tests {
         // Without the checkpoints the pool fits: the word runs at P.
         assert_eq!(
             pick(i128::from(available) - i128::from(need)).pinned,
-            Some(50)
+            Some(0)
         );
         // With them it does not (12 − 4 GiB < 10 GiB): off, MemShort naming
         // the pool's bytes and the room the checkpoints leave.

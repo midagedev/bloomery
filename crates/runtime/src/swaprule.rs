@@ -2,7 +2,9 @@
 //! on the card, as a pure function of the routing history.
 //!
 //! The rule counts every kept row's routed ids per layer. Every
-//! [`SwapParams::every`] passes it pairs each layer's most-used experts off the
+//! [`SwapParams::every`] kept rows (the clock counts kept rows, not passes,
+//! so a drafted pass of several kept rows swaps at the same kept-token rate
+//! a plain one does) it pairs each layer's most-used experts off the
 //! card with its least-used ones on it and admits a pair when the admitted
 //! count clears [`SwapParams::min_count`] and the victim's count by
 //! [`SwapParams::margin`]; at most [`SwapParams::cap`] pairs a planning pass
@@ -32,7 +34,10 @@ use std::fmt;
 /// The rule's constants.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SwapParams {
-    /// A planning pass at every boundary that is a multiple of this, 1 or more.
+    /// How often a planning pass runs, in kept rows, 1 or more: at the first
+    /// boundary whose ended passes have kept this many rows past the last
+    /// plan's ([`SwapRule::plan`]). A pass of one kept row plans at every
+    /// boundary that is a multiple of this.
     pub every: u64,
     /// The most flips one planning pass makes over all layers, 1 or more.
     pub cap: usize,
@@ -49,8 +54,8 @@ pub struct SwapParams {
 }
 
 impl SwapParams {
-    /// The parameters the replay chose (every 4, cap 24, margin 3, min count
-    /// 2, decay 0.9, one spare) at a model's live delay.
+    /// The parameters the replay chose (every 4 kept rows, cap 24, margin 3,
+    /// min count 2, decay 0.9, one spare) at a model's live delay.
     #[must_use]
     pub const fn mid(delay: u64) -> Self {
         SwapParams {
@@ -462,6 +467,8 @@ pub struct SwapRule {
     pass_rows: usize,
     /// Passes ended since the seed.
     passes: u64,
+    /// Kept rows the ended passes have kept past the last plan's.
+    since: u64,
     /// The last boundary planned.
     planned: u64,
     cand: Vec<(f64, u32)>,
@@ -486,6 +493,7 @@ impl PartialEq for SwapRule {
             && self.pending == o.pending
             && self.pass_rows == o.pass_rows
             && self.passes == o.passes
+            && self.since == o.since
             && self.planned == o.planned
             && self.flips == o.flips
             && self.observed().eq(o.observed())
@@ -705,6 +713,7 @@ impl SwapRule {
             seen: vec![false; shape.max_rows * layers],
             pass_rows: 0,
             passes: 0,
+            since: 0,
             planned: 0,
             cand: Vec::with_capacity(params.spares),
             vict: Vec::with_capacity(params.spares),
@@ -913,13 +922,18 @@ impl SwapRule {
         self.seen[..self.pass_rows * l_n].fill(false);
         self.pass_rows = 0;
         self.passes += 1;
+        self.since += kept.count() as u64;
         Ok(())
     }
 
     /// The boundary `boundary` the last pass ended at: the flips going live
-    /// there land, and at a multiple of [`SwapParams::every`] a planning pass
-    /// makes new flips, live at `boundary + delay`, then every count decays.
-    /// Returns the flips made here, in the order they were made.
+    /// there land, and when the ended passes have kept
+    /// [`SwapParams::every`] rows past the last plan's, a planning pass makes
+    /// new flips, live at `boundary + delay`, then every count decays. The
+    /// kept rows past `every` carry to the next plan, so plans come every
+    /// `every` kept rows whatever rows a pass keeps; a boundary plans once at
+    /// most, and what a pass of more than `every` rows keeps past that carries
+    /// below `every`. Returns the flips made here, in the order they were made.
     ///
     /// Ties: candidates by (count descending, id ascending), victims by (count ascending, id ascending).
     pub fn plan(&mut self, boundary: u64) -> Result<&[Flip], SwapRuleError> {
@@ -935,7 +949,8 @@ impl SwapRule {
         }
         self.land(boundary);
         self.flips.clear();
-        if boundary.is_multiple_of(self.params.every) {
+        if self.since >= self.params.every {
+            self.since %= self.params.every;
             self.make_pairs();
             self.issue(boundary);
             let decay = self.params.decay;
@@ -1247,6 +1262,7 @@ impl SwapRule {
         self.seen.fill(false);
         self.pass_rows = 0;
         self.passes = 0;
+        self.since = 0;
         self.planned = 0;
         self.cand.clear();
         self.vict.clear();
@@ -1493,6 +1509,115 @@ mod tests {
             want.clone(),
             "a prefix of the kept count is the wrong fold"
         );
+    }
+
+    /// The same kept rows, as passes of 3 kept rows and as passes of 1, plan
+    /// at the same kept-row counts and make the same flips there: the rule's
+    /// clock counts kept rows, not passes, so a drafted reply (a pass of
+    /// several kept rows) swaps at the same kept-token rate a plain one
+    /// does. Mutant: a clock that counts passes, under which the 3-row shape
+    /// plans every 3 × `every` kept rows.
+    #[test]
+    fn the_same_kept_rows_plan_at_the_same_kept_row_counts() {
+        // Every 3 kept rows a new expert takes all the routing.
+        let rows: Vec<Vec<u32>> = (0..15u32).map(|i| vec![10 + i / 3]).collect();
+        let p = params(3, 96, 1.5, 2.0, 0.9);
+        let shape = Shape {
+            experts: 32,
+            top_k: 1,
+            max_rows: 3,
+        };
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3]];
+        // Drive the same kept-row sequence at a pass shape: `per` kept rows
+        // a pass, each pass observed at its rows and ended at a prefix, every
+        // boundary planned. Returns each flip as (kept rows so far, admit,
+        // evict).
+        let run = |per: usize| {
+            let mut r = SwapRule::new(p, shape, &seed, &[4]).unwrap();
+            let mut flips = Vec::new();
+            let mut kept_rows = 0usize;
+            for (b, chunk) in rows.chunks(per).enumerate() {
+                for (row, ids) in chunk.iter().enumerate() {
+                    r.observe(0, row, ids).unwrap();
+                }
+                r.end_pass(KeptRows::prefix(per)).unwrap();
+                kept_rows += per;
+                for &f in r.plan(b as u64 + 1).unwrap() {
+                    flips.push((kept_rows, f.admit, f.evict));
+                }
+            }
+            (flips, r.live(0).unwrap().collect::<Vec<_>>())
+        };
+        let (wide, wide_set) = run(3);
+        let (narrow, narrow_set) = run(1);
+        assert!(!wide.is_empty(), "the history makes flips");
+        assert_eq!(wide, narrow);
+        assert_eq!(wide_set, narrow_set);
+    }
+
+    /// Drive `passes` (kept rows a pass, every row of a pass kept) over a
+    /// history in which every row routes a fresh expert, with cap 1, margin
+    /// 0 and min count 1 against eight unrouted seed experts: each planning
+    /// pass makes exactly one flip, so the flips stamp the plans. Returns the
+    /// kept rows ended at each plan.
+    fn plan_stamps(every: u64, passes: &[usize]) -> Vec<usize> {
+        let p = params(every, 1, 0.0, 1.0, 0.9);
+        let max_rows = passes.iter().copied().max().unwrap_or(1);
+        let rows: usize = passes.iter().sum();
+        let shape = Shape {
+            experts: 16 + rows,
+            top_k: 1,
+            max_rows,
+        };
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3, 4, 5, 6, 7]];
+        let mut r = SwapRule::new(p, shape, &seed, &[8]).unwrap();
+        let (mut kept_rows, mut stamps) = (0usize, Vec::new());
+        for (b, &per) in passes.iter().enumerate() {
+            for row in 0..per {
+                r.observe(0, row, &[16 + (kept_rows + row) as u32]).unwrap();
+            }
+            r.end_pass(KeptRows::prefix(per)).unwrap();
+            kept_rows += per;
+            let made = r.plan(b as u64 + 1).unwrap().len();
+            assert!(made <= 1, "cap 1 makes one flip a plan at most");
+            if made == 1 {
+                stamps.push(kept_rows);
+            }
+        }
+        stamps
+    }
+
+    /// Plans come every `every` kept rows whatever rows a pass keeps: the
+    /// k-th plan is at the first boundary whose ended passes have kept
+    /// k × `every` rows, for passes of 1, 2 and 3 rows at `every` 4, so a
+    /// drafted reply plans as often a kept row as a plain one. A pass of
+    /// one kept row plans at every boundary that is a multiple of `every`,
+    /// the boundaries a clock that counts passes plans at: plain decode is
+    /// the same under either. Mutants: a plan that drops the rows past
+    /// `every` (3-row passes plan at 6, 12, 18 and 24), a clock that counts
+    /// passes (3-row passes plan at 12 and 24).
+    #[test]
+    fn plans_come_every_every_kept_rows_whatever_a_pass_keeps() {
+        let every = 4usize;
+        for per in [1usize, 2, 3] {
+            let passes = vec![per; 24 / per];
+            let want: Vec<usize> = (1..=6).map(|k| (k * every).div_ceil(per) * per).collect();
+            assert_eq!(plan_stamps(every as u64, &passes), want, "passes of {per}");
+        }
+        assert_eq!(plan_stamps(4, &[3; 8]), [6, 9, 12, 18, 21, 24]);
+        assert_eq!(plan_stamps(4, &[1; 24]), [4, 8, 12, 16, 20, 24]);
+    }
+
+    /// A boundary plans once at most: a pass that keeps 9 rows at `every` 4
+    /// plans at its boundary, and the rows past two `every`s carry below
+    /// `every` (1), so the next plans come at 12 and 16 kept rows. Mutants: a
+    /// carry with no bound (a second plan at 10), a plan that drops the rows
+    /// past `every` (the next plan at 13).
+    #[test]
+    fn a_wide_pass_plans_once_and_carries_the_rest_below_every() {
+        let mut passes = vec![9usize];
+        passes.extend([1; 7]);
+        assert_eq!(plan_stamps(4, &passes), [9, 12, 16]);
     }
 
     /// A mask holds rows 0..64 alone, so a pass bound of 64 or more holds no
@@ -2119,6 +2244,12 @@ mod tests {
         /// `p` counted, every flip in the order the rule makes it.
         fn plan_case(f: &Json) {
             let p = f.get("params");
+            // The rule plans by kept rows; a file the replay wrote on its pass
+            // clock holds another rule's flips.
+            match *p.get("clock") {
+                Json::Str(ref w) if w == "kept" => {}
+                ref v => panic!("fixture: params' clock is {v:?}, not the rule's \"kept\""),
+            }
             let params = SwapParams {
                 every: p.get("every").int(),
                 cap: p.get("cap").int() as usize,

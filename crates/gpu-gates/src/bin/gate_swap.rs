@@ -18,8 +18,9 @@
 //!
 //! The trace: 120 passes of the synthetic router (a hot set of 8 drifting
 //! every 20 passes, never the seed's first 4), every fifth pass two rows of
-//! which the first is kept. The rule: every 2, cap 6, margin 1, min count 2,
-//! decay 0.9, one spare, live delay 3, 4 pinned seed experts a layer.
+//! which the first is kept. The rule: every 2 kept rows, cap 6, margin 1,
+//! min count 2, decay 0.9, one spare, live delay 3, 4 pinned seed experts a
+//! layer.
 //!
 //! Each pass runs in the engine's order: the ids refreshed by a
 //! synchronizing copy, the boundary, the graph, then the engine stream
@@ -53,6 +54,10 @@
 //! - c6: an independent rule fed every row of the trace and ended at the kept
 //!   rows makes, boundary for boundary, the flips the machine made (its
 //!   mutant: the machine ends each pass at every row it noted).
+//! - clock: a history of passes that keep 2 rows each plans every `every`
+//!   kept rows — flips at odd boundaries too, which a pass clock at `every` 2
+//!   never issues — and the machine's flips are an independent rule's over
+//!   the same history (its mutant: the rule's clock counting passes).
 //! - c7: a reset with flips in flight cancels them and brings every layer's
 //!   card set back to its seed (`residency reset` diff=0, the live sets and
 //!   the slot ledger's), releases the host pages of the seed experts it
@@ -794,6 +799,21 @@ mod gate {
             decay: 0.9,
             spares: 1,
             delay,
+        }
+    }
+
+    /// The trace's first `2 × passes` rows re-chunked into `passes` passes
+    /// of 2 rows each, both kept: the drafted shape (a pass of several kept
+    /// rows) at this trace's own routing.
+    fn two_row_trace(trace: &Trace, passes: usize) -> Trace {
+        let flat: Vec<[[u32; K]; L]> = trace
+            .passes
+            .iter()
+            .flat_map(|(rows, _)| rows.iter().copied())
+            .take(2 * passes)
+            .collect();
+        Trace {
+            passes: flat.chunks(2).map(|c| (c.to_vec(), 2)).collect(),
         }
     }
 
@@ -1780,6 +1800,49 @@ mod gate {
             verdict(c6)
         );
         Ok(c6)
+    }
+
+    /// The kept-row clock over a two-row-pass history: with `every` 2 and
+    /// every pass keeping 2 rows the machine plans at every boundary, so
+    /// some flip is issued at an odd one — a pass clock at `every` 2 issues
+    /// flips at even boundaries only — and its flips are an independent
+    /// rule's over the same history, its values clean.
+    fn clock(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
+        let two = two_row_trace(trace, 40);
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            &two,
+            0..two.passes.len(),
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let want = rule_replay(&two, DELAY)?;
+        let first_diff = (0..want.len().max(r.flips.len()))
+            .find(|&i| want.get(i) != r.flips.get(i))
+            .map(|i| (want.get(i).copied(), r.flips.get(i).copied()));
+        let odd = r.flips.iter().filter(|(b, _)| b % 2 == 1).count();
+        let ok = r.err.is_none()
+            && !want.is_empty()
+            && first_diff.is_none()
+            && odd > 0
+            && clean(&r.values);
+        println!(
+            "clock kept rows: {} two-row passes, {} flips (an independent rule's {}), at odd \
+             boundaries {odd} (a pass clock at every 2 issues none), errors (stale, double, miss) \
+             {:?}, first difference (rule, machine) {first_diff:?} {}",
+            two.passes.len(),
+            r.flips.len(),
+            want.len(),
+            errs(&r.values),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     fn pinned(a: &Run) -> bool {
@@ -3312,6 +3375,7 @@ mod gate {
         ok &= c3_event(&gpu, &pm, &trace)?;
         ok &= c5(&[&a, &b, &h]);
         ok &= c6(&trace, &a)?;
+        ok &= clock(&gpu, &pm, &trace)?;
         ok &= pinned(&a);
         ok &= priority(&gpu, &a)?;
         record::residency_pass(&a.reports.last().copied().unwrap_or_default()).print();

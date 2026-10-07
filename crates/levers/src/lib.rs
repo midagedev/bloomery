@@ -912,8 +912,10 @@ impl Levers {
 /// experts.
 pub const QWEN38_EXPERTS_UNSET: &str = "card";
 
-/// The residency word a serving placement runs by with [`RESIDENCY`] unset.
-pub const RESIDENCY_SERVING: &str = "mid-p40-s1";
+/// The residency word a serving placement runs by with [`RESIDENCY`] unset:
+/// no seed expert pinned (the pin is the host-room fallback's, not the
+/// default's), one spare a layer.
+pub const RESIDENCY_SERVING: &str = "mid-p0-s1";
 
 /// What decides [`RESIDENCY`] unset, as the binary that reads it knows its
 /// load before it opens anything ([`Levers::residency_at`]).
@@ -1140,11 +1142,10 @@ pub enum Room {
 /// count grows), `headroom` the plan's host headroom and `mem_left` what the
 /// host's `MemAvailable` leaves past the plan's own host need. The word runs
 /// at its target while its card slots hold it, its spares and one that
-/// moves; where they do not, at half the plan's fewest card experts a layer
-/// (the share [`residency38_at_plan`] derives), never under
-/// [`RESIDENCY_MIN_P`]; where the churn pool at that count fits neither
-/// budget, at the first count above it whose does, never past what the card
-/// slots hold. Through [`Room::Moved`] the word keeps its spares at the
+/// moves; where they do not, at half the plan's fewest card experts a layer,
+/// never under [`RESIDENCY_MIN_P`]; where the churn pool at that count fits
+/// neither budget, at the first count above it whose does, never past what
+/// the card slots hold. Through [`Room::Moved`] the word keeps its spares at the
 /// moved count; through [`Room::Short`] it does not run — a default the user
 /// did not set never refuses the load. An error of `pool_bytes` is the
 /// call's.
@@ -1321,7 +1322,8 @@ pub struct Residency38At {
 /// [`RESIDENCY`] unset; its `Display` is the `residency unset` record's why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Residency38Why {
-    /// Plan (a): P half the plan's fewest card experts a layer, `fewest`.
+    /// Plan (a): no seed expert pinned; `fewest` the plan's fewest card
+    /// experts a layer.
     PlanA { fewest: usize },
     /// `--dump-taps` runs a qwen3moe file.
     DumpTaps,
@@ -1357,7 +1359,8 @@ impl fmt::Display for Residency38Why {
         match *self {
             Residency38Why::PlanA { fewest } => write!(
                 f,
-                "unset: plan (a), P half the plan's fewest card experts a layer ({fewest})"
+                "unset: plan (a), no seed expert pinned (the plan's fewest card experts a layer \
+                 is {fewest})"
             ),
             Residency38Why::DumpTaps => f.write_str("unset: --dump-taps runs a qwen3moe file"),
             Residency38Why::Family => f.write_str(
@@ -1451,12 +1454,13 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 /// host's available bytes leave past the plan's own host need and whatever
 /// the caller counts beside it (the load's check before any upload; the
 /// Qwen3.8 room subtracts the checkpoints the load holds,
-/// gpu-gates' `mem_left_38`). P is half the fewest, the target [`room_for`]
-/// checks; `off` when no layer holds one, when the host holds none (the pool
-/// would serve nothing), when the fewest leave no room for P pinned, the
-/// spares and one that moves, or when no pool the card side leaves fits the
-/// headroom or `mem_left` — a default the user did not set never refuses the
-/// load. An error of `pool_bytes` is the call's.
+/// gpu-gates' `mem_left_38`). P is 0, no seed expert pinned — where the
+/// churn pool at 0 fits neither budget, the first P above it whose does
+/// ([`room_for`]'s upward probe); `off` when no layer holds one, when the
+/// host holds none (the pool would serve nothing), when the fewest leave no
+/// room for P pinned, the spares and one that moves, or when no pool the
+/// card side leaves fits the headroom or `mem_left` — a default the user did
+/// not set never refuses the load. An error of `pool_bytes` is the call's.
 pub fn residency38_at_plan<E>(
     card_experts: impl IntoIterator<Item = u64>,
     host_experts: u64,
@@ -1475,7 +1479,7 @@ pub fn residency38_at_plan<E>(
     let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
     Ok(
         match room_for(
-            fewest / 2,
+            0,
             RESIDENCY38_SPARES,
             layers,
             pool_bytes,
@@ -1483,7 +1487,7 @@ pub fn residency38_at_plan<E>(
             mem_left,
         )? {
             Room::AsIs => Residency38Pick {
-                pinned: Some(fewest / 2),
+                pinned: Some(0),
                 why: Residency38Why::PlanA { fewest },
             },
             Room::Moved { from, to, .. } => Residency38Pick {

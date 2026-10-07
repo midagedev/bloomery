@@ -109,15 +109,19 @@ fixture  A synthetic trace (a 32-bit LCG, so the file is the same on every numpy
          written inline as ids comma-separated and layers '/'-separated; an away id in its layer's
          seed is refused, and so is a file in which no flip moves.
 
-The rule (every, cap, margin, min_count, decay): after every `every` passes, per layer the missing
-experts by decayed count (descending, ties to the lower id) pair rank for rank with the residents by
+The rule (every, cap, margin, min_count, decay, clock): every `every` kept rows (clock `kept`, the
+clock the engine runs: a boundary plans when the ended passes have kept `every` rows past the last
+plan's, the rows past `every` carry, and a boundary plans once at most) or at every `every`-th
+boundary (clock `pass`), per layer the missing experts by decayed count (descending, ties to the
+lower id) pair rank for rank with the residents by
 count (ascending, ties to the lower id) while count_in >= min_count and count_in >= count_out +
 margin; the pairs go by gain descending, then layer ascending, then in id ascending, at most `cap`
 over all layers (and under flip at most --spares in flight a layer); then every count decays by
 `decay`. The copies live at a boundary land before it plans (crates/runtime's swaprule). Presets:
-    mid     every 4, cap 24, margin 3, min_count 2, decay 0.9    (the adopted setting)
-    strata  every 4, cap 96, margin 1.5, min_count 2, decay 0.7  (Strata's default)
-    knee    every 16, cap 24, margin 6, min_count 2, decay 0.9
+    mid     every 4, cap 24, margin 3, min_count 2, decay 0.9    (the adopted setting; clock kept)
+    strata  every 4, cap 96, margin 1.5, min_count 2, decay 0.7  (Strata's default; clock pass, its
+            source plans every 4 verify windows)
+    knee    every 16, cap 24, margin 6, min_count 2, decay 0.9   (clock kept)
 
 Needs numpy (the Mac's python3 has it; check-recipes runs the self-test there).
 """
@@ -178,7 +182,7 @@ FAMILY = {
 }
 RULES = {
     "mid": dict(every=4, cap=24, margin=3.0, min_count=2.0, decay=0.9),
-    "strata": dict(every=4, cap=96, margin=1.5, min_count=2.0, decay=0.7),
+    "strata": dict(every=4, cap=96, margin=1.5, min_count=2.0, decay=0.7, clock="pass"),
     "knee": dict(every=16, cap=24, margin=6.0, min_count=2.0, decay=0.9),
 }
 B_PIN, B_PAGE = 25.0, 14.4  # GB/s: the rates the recorded replays priced with (A6000: 26.28 / 21.16)
@@ -201,15 +205,19 @@ class Rule:
         self.name = name
         self.every, self.cap, self.margin = int(p["every"]), int(p["cap"]), float(p["margin"])
         self.min_count, self.decay = float(p["min_count"]), float(p["decay"])
+        self.clock = p.get("clock") or "kept"
         if self.every < 1 or self.cap < 0:
             raise ToolError(f"rule {name}: every {self.every} and cap {self.cap} must be >= 1 and >= 0")
+        if self.clock not in ("kept", "pass"):
+            raise ToolError(f"rule {name}: clock {self.clock!r} is not 'kept' or 'pass'")
 
     def params(self):
-        return dict(every=self.every, cap=self.cap, margin=self.margin, min_count=self.min_count,
-                    decay=self.decay)
+        return dict(every=self.every, clock=self.clock, cap=self.cap, margin=self.margin,
+                    min_count=self.min_count, decay=self.decay)
 
     def text(self):
-        return (f"{self.name} (every {self.every}, cap {self.cap}, margin {self.margin:g}, "
+        return (f"{self.name} (every {self.every} {'kept rows' if self.clock == 'kept' else 'passes'}, "
+                f"cap {self.cap}, margin {self.margin:g}, "
                 f"min_count {self.min_count:g}, decay {self.decay:g})")
 
 
@@ -456,8 +464,8 @@ def pass_swaps(counts, resident, pend_in, pend_out, n_l, rule, per_layer_cap, ti
 
 
 class Replay:
-    def __init__(self, hits_layer, per_row, swaps):
-        self.hits_layer, self.per_row, self.swaps = hits_layer, per_row, swaps
+    def __init__(self, hits_layer, per_row, swaps, plans):
+        self.hits_layer, self.per_row, self.swaps, self.plans = hits_layer, per_row, swaps, plans
 
 
 def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_cap=True, d=1, link=None,
@@ -479,7 +487,8 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
     pend_in = np.zeros((L, E), dtype=bool)
     pend_out = np.zeros((L, E), dtype=bool)
     heap = []
-    seq = swaps = 0
+    seq = swaps = plans = 0
+    since = 0  # kept rows the ended passes have kept past the last plan's (clock kept)
     hits = np.zeros(L, dtype=np.int64)
     per_row = np.zeros(X.shape[0])
     per_layer_cap = spares if sem == "flip" else None
@@ -509,9 +518,20 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
             per_row[r] = hr.mean()
             if rule is not None and r < r0 + kept:
                 counts[ar, sel] += 1.0
-        if rule is None or (p + 1) % rule.every:
+        if rule is None:
             continue
         b = p + 1
+        if rule.clock == "pass":
+            due = b % rule.every == 0
+        else:
+            since += kept
+            due = since >= rule.every
+            if due:
+                # the rows past `every` carry to the next plan; a boundary plans once at most
+                since %= rule.every
+        if not due:
+            continue
+        plans += 1
         if in_flight_cap:
             land(b)
         for i, e_in, e_out, g in pass_swaps(counts, resident, pend_in, pend_out, n_l, rule, per_layer_cap, ties,
@@ -531,7 +551,7 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
             if on_flip is not None:
                 on_flip(b, i, e_out, e_in, live)
         counts *= rule.decay
-    return Replay(hits, per_row, swaps)
+    return Replay(hits, per_row, swaps, plans)
 
 
 def adaptive(X, seed, n_l, E, rule, link=None, record=None):
@@ -810,7 +830,9 @@ class Lcg:
 FIXTURE_CONTRACT = {
     "boundary": "passes are numbered from 0; boundary b follows pass b-1; the first `kept` rows of a pass add 1.0 each "
                 "to their ids' counts (f64), every row of a pass is served by the set in force at its start; at every "
-                "boundary b the flips with live_at = b land first, then, when b % every == 0, the rule plans and every "
+                "boundary b the flips with live_at = b land first, then, when the passes ended since the seed have kept "
+                "`every` rows past the last plan's (params.clock `kept`: the rows past `every` carry, so the carry "
+                "is the kept total mod `every` and a boundary plans once at most), the rule plans and every "
                 "count is multiplied by decay; a flip planned at b is live from pass live_at = b + d (d = 0: it lands "
                 "at b after the plan); a flip is in flight from its boundary until it lands, so one with live_at = b "
                 "is no longer in flight when boundary b plans",
@@ -1151,14 +1173,16 @@ def streams_replay(fam, streams, seeds, pol, rule, link_gbps, a, data, sets, ext
     joined = "+".join(n for n, _, _, _ in streams)
     rows = []
 
-    def emit(policy, sd, label, hits, swaps, rec=None, link=None, ties=None):
+    def emit(policy, sd, label, hits, swaps, rec=None, link=None, ties=None, plans=None):
         r = v1_row(fam, s0, a.cap, n_l, policy, sd, label, hits, swaps, link, a.pin_gbps, a.page_gbps,
                    tokens=npass, rows=rows_pass, name=joined)
         r.update(role="pooled", streams=joined, rows_pass=rows_pass)
         if turn is not None:
             r["turn"] = turn
         if ties is not None:
-            r["cap_bound"] = ties["cap_bound"] / max(npass // rule.every, 1)
+            # plans: the replay's own planning boundaries (a kept-row clock over
+            # B-row passes plans B times as often as a pass clock while B <= every)
+            r["cap_bound"] = ties["cap_bound"] / max(plans if plans is not None else npass // rule.every, 1)
         if rec is not None:
             u = unique_misses(X, rec, rows_pass, s0.E)
             r["host_gb_unique"] = u * S / npass / 1e9
@@ -1191,7 +1215,7 @@ def streams_replay(fam, streams, seeds, pol, rule, link_gbps, a, data, sets, ext
             r = replay(X, seed_resident(lists[sd], n_l, s0.E), n_l, s0.E, rule, sem="hole", d=0, link=link,
                        record=rec, passes=passes, ties=ties)
             emit("adaptive", sd, f"{rule.name}[{sd}{',' + extra if extra else ''}]", r.hits_layer, r.swaps, rec, link,
-                 ties)
+                 ties, plans=r.plans)
     if "belady" in pol:
         h, adm = belady(X, lists[seeds[0]], n_l)
         emit("belady", seeds[0], f"belady[{seeds[0]}]", h, adm)
@@ -2120,9 +2144,9 @@ def case_fixture():
     assert min(fo["header"]["ties"].values()) > 0, fo["header"]["ties"]
 
 
-FIXTURE_40_MD5 = "41d76600be3391b18b70ab58e0fd5913"
+FIXTURE_40_MD5 = "267b9a38beeb1f472a38285660045978"
 OPEN_FIXTURE_MD5 = "1791eb13350ebdac4eb72e234e68ec13"
-AWAY_FIXTURE_MD5 = "37962c30fb113dde9a81a470208d8211"
+AWAY_FIXTURE_MD5 = "eee3dd7afdaae47a14533799e21ed0c0"
 
 
 def case_in_flight():
@@ -2224,8 +2248,9 @@ def case_streams_one():
 def case_streams_twice():
     # B = 2 of one fixture set at offset 0: both streams are the whole eval half, so every pass counts each id
     # twice. Doubled counts against margin 3 and min_count 2 are the single stream's counts against 1.5 and 1
-    # (decay and the gain order scale with them, exactly in binary), so each stream's adaptive row is that
-    # replay's, and differs from the stream alone (the case tells two counts from one).
+    # (decay and the gain order scale with them, exactly in binary), and the kept-row clock's every 4 over
+    # passes of 2 kept rows plans every 2 passes, so the single stream's twin runs every 2 — so each stream's
+    # adaptive row is that replay's, and differs from the stream alone (the case tells two counts from one).
     with tempfile.TemporaryDirectory() as root:
         fixture_sets(root, (("prose", 1, 240),))
         rows, text = hit_json(["hit", "v41", "--streams", "prose,prose", "--offset", "0", "--cap", "n16", "--seed", "in",
@@ -2237,8 +2262,8 @@ def case_streams_twice():
         X = hit_eval_stack(s, F)
         n_l = [16] * len(F["eligible"])
         seed = seed_lists("v41", s, "in", root)
-        r = replay(X, seed_resident(seed, n_l, 384), n_l, 384, Rule("mid", margin=1.5, min_count=1.0), sem="hole", d=0,
-                   link=Link(F["expert_bytes"], B_PIN, F["step_ms"]))
+        r = replay(X, seed_resident(seed, n_l, 384), n_l, 384, Rule("mid", every=2, margin=1.5, min_count=1.0),
+                   sem="hole", d=0, link=Link(F["expert_bytes"], B_PIN, F["step_ms"]))
         want = r.hits_layer.sum() / (X.shape[0] * X.shape[1] * X.shape[2])
         for pol in ("static", "adaptive"):
             s0, s1, pooled = by[(pol, "s0")], by[(pol, "s1")], by[(pol, "pooled")]
