@@ -22,7 +22,12 @@
 //!   under the host tier, its prompt-batch bytes `place::tier_batch`'s), also
 //!   spelled `a6000+3090`. A list of more tier cards than the GLM body serves
 //!   and a stage other than the A6000 are refused by name before the plan.
-//!   Default `gate`. The NextN draft and residency run beside `bp` as beside
+//!   Unset, the common rule every serving seat takes (`generate::Place::choose`,
+//!   by the GLM family's `glm_place::TIER_RULE`): the cards' offer, `bp` on
+//!   two cards, kept when its plan puts at least the rule's break-even
+//!   experts on the tier and more than none, else `a` — the word and why a
+//!   `place unset` record prints after the levers' records. The NextN draft
+//!   and residency run beside `bp` as beside
 //!   `a`: the tier serves the target's experts it holds, the residency
 //!   machine moves the stage card's alone, and the draft's walk stays on the
 //!   stage card and the host.
@@ -222,7 +227,7 @@ mod cli {
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
-    use bloomery_gpu_gates::{GateError, ref_model_path};
+    use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
@@ -230,8 +235,7 @@ mod cli {
         STEP_STATS,
     };
     use gguf::Split;
-    use model::arch::glm5next::hparams::Hparams;
-    use model::arch::glm5next::place::PlanInputs;
+    use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
     use model::placement::{Machine, Plan, PlanLevers};
     use runtime::layer::hosted;
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
@@ -516,12 +520,12 @@ mod cli {
             return Err(format!("{flag} acts on the plain run: not beside {what}").into());
         }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
-        let placement = match flag("--place")? {
-            None => Place::Gate,
-            Some(v) => glm_place::parse(&v)?,
-        }
-        .on_host()?;
-        let place = placement.name();
+        // The flag's word, refused by name here before any plan; unset, the
+        // common rule chooses on the file's plan once the file is open.
+        let place_flag = match flag("--place")? {
+            Some(v) => Some(glm_place::parse(&v)?),
+            None => None,
+        };
         let mode = match flag("--mode")?.as_deref() {
             None | Some("graph") => StepMode::Graph,
             Some("eager") => StepMode::Eager,
@@ -592,7 +596,39 @@ mod cli {
         }
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let tier_batch = glm_place::tier_batch(placement, &Hparams::read(&file)?);
+        // The placement the run takes (`Place::choose`, by the GLM family's
+        // `glm_place::TIER_RULE`): a set flag as given; unset, the cards'
+        // offer — `bp` on two cards, kept when its plan holds the rule's
+        // break-even experts or more and more than none, else `a`. The plan
+        // the rule asks for is the load this run opens — the draft's NextN
+        // plan, the pair probe's two KDA lanes, else the plain plan of the
+        // slot count — at the run's context, and the load plans the chosen
+        // placement again (planning is milliseconds). `place unset` names
+        // the word, the why and the rule.
+        let inputs = PlanInputs::read(&file)?;
+        let nextn = drafted.then(|| NextnInputs::read(&inputs)).transpose()?;
+        let plan_levers = PlanLevers::from_levers(&levers)?;
+        let lanes = if pair { KdaLanes::Two } else { KdaLanes::One };
+        let chosen = Place::choose(
+            place_flag,
+            &gpu_census::census()?,
+            glm_place::TIER_RULE,
+            |offer| {
+                glm_place::tier_experts(
+                    offer,
+                    &inputs,
+                    u64::try_from(ctx)?,
+                    &plan_levers,
+                    nextn.as_ref(),
+                    lanes,
+                    slots,
+                )
+            },
+        )?;
+        chosen.record().print();
+        let placement = chosen.place;
+        let place = placement.name();
+        let tier_batch = glm_place::tier_batch(placement, &inputs.hp);
         let machine = placement.machine(None, tier_batch)?;
         let trace = trace_of(
             &levers,
@@ -612,7 +648,7 @@ mod cli {
         }
         let group = levers.prefill_group();
         let cfg = GlmCfg {
-            place: PlanLevers::from_levers(&levers)?,
+            place: plan_levers,
             host: levers.host(),
             prefill,
             group,

@@ -49,7 +49,11 @@
 //! whole-fit verdict there takes it (one stderr line with its terms), else
 //! the placed plan on that card, its `plan` record naming why
 //! (`whole_does_not_fit`). Each `--ctx` search prints one line more: its
-//! probes and the census readings it took.
+//! probes and the census readings it took. The seat takes the common rule
+//! every serving seat takes (`generate::Place::choose`, by [`Q3_RULE`]: the
+//! body serves no tier card): a `place unset` record names the word `a`
+//! and why — `one card`, or on two `the body serves no tier card` — before
+//! the first search.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds:
 //! the session over the model answers the server's keep queries and cuts
@@ -136,9 +140,9 @@ use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{Seat, SeatEngine, SlotStep, Vocab, sampler_factory};
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
@@ -155,6 +159,15 @@ const NAME: &str = "bloomery-serve-qwen3";
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--place W] [--cache-type-k f16|q8_0] \
                      [--parallel N] [--queue-depth Q]";
+
+/// The family's fact for the common unset rule (`Place::choose`): the body
+/// serves no tier card, so an unset `--place` runs `a` on the largest card
+/// and no card file decides anything.
+const Q3_RULE: TierRule = TierRule {
+    tiers: 0,
+    break_even: None,
+    basis: "",
+};
 
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
@@ -949,6 +962,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             a.ctx.unwrap_or_default()
         );
     }
+    // The common unset rule, once, on one census reading: the load below
+    // still takes `a`'s card (`PlaceQ3::unplaced_on`), the rule's own pick
+    // for a body with no tier card; its `place unset` record is printed here.
+    let census = gpu_census::census()?;
+    Place::choose(a.place, &census, Q3_RULE, |p| {
+        Err(format!(
+            "--place unset: the qwen3 body serves no tier card, so no tier count for {}",
+            p.name()
+        )
+        .into())
+    })?
+    .record()
+    .eprint();
     let ctx = match a.ctx {
         Some(c) => c,
         None => default_ctx(&split, arch, a.place, slots, &levers, kv)?,

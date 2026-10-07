@@ -104,6 +104,85 @@ const fn alias(i: usize) -> Place {
     }
 }
 
+/// A family's input to the common unset-`--place` rule ([`Place::choose`]):
+/// the expert tier cards its body serves, the tier count that pays once a
+/// sitting has shown the tier not slower (`None` until one has), and the card
+/// file that decides it (empty: the family names none).
+#[derive(Clone, Copy)]
+pub struct TierRule {
+    /// The tier cards the family's body serves.
+    pub tiers: usize,
+    /// The least tier experts that pay, where a sitting has shown they do.
+    pub break_even: Option<u64>,
+    /// The card file that decided [`Self::break_even`].
+    pub basis: &'static str,
+}
+
+/// [`Place::choose`]'s answer: the placement to run, why in the words a
+/// `place unset` record prints, the tier count where the rule asked the plan
+/// for it, and the rule that chose.
+pub struct PlaceWhy {
+    /// The placement, resolved against the census.
+    pub place: Place,
+    pub why: &'static str,
+    /// The experts the offered placement's tier cards hold in its plan, where
+    /// the rule asked ([`Place::choose`]'s `tier_of`); `None` where it did
+    /// not.
+    pub tier_experts: Option<u64>,
+    /// The rule that chose.
+    pub rule: TierRule,
+}
+
+impl PlaceWhy {
+    /// The `place unset` record: the word and why always; the tier count only
+    /// where the rule asked the plan for it; the rule's break-even and basis
+    /// whenever it has them.
+    pub fn record(&self) -> Record {
+        let r = Record::new(&record::PLACE_UNSET)
+            .w("place", self.place.name())
+            .w("why", self.why);
+        let r = match self.tier_experts {
+            Some(n) => r.u("tier_experts", n),
+            None => r,
+        };
+        let r = match self.rule.break_even {
+            Some(e) => r.u("break_even", e),
+            None => r,
+        };
+        match self.rule.basis {
+            "" => r,
+            b => r.w("basis", b),
+        }
+    }
+}
+
+/// A drafted seat's break-even: `per_token` is the ids a reset re-prefills in
+/// the time the draft saves one reply token, so a kept prefix of fewer than
+/// `⌈reply · per_token⌉` positions costs less to prefill again than keeping
+/// it costs the reply's `reply` tokens.
+#[derive(Clone, Copy, Debug)]
+pub struct BreakEven {
+    pub per_token: f64,
+}
+
+impl BreakEven {
+    /// The draft's gain a token (the plain step's seconds less the drafted
+    /// decode's, from their positions per second) times the ids per second a
+    /// reset re-prefills at.
+    pub fn new(plain_tps: f64, drafted_tps: f64, prompt_ids_per_s: f64) -> BreakEven {
+        BreakEven {
+            per_token: (1.0 / plain_tps - 1.0 / drafted_tps) * prompt_ids_per_s,
+        }
+    }
+
+    /// The kept positions that break even with a reply of `reply` tokens
+    /// through passes.
+    pub fn at(self, reply: usize) -> usize {
+        let r = f64::from(u32::try_from(reply).unwrap_or(u32::MAX));
+        (r * self.per_token).ceil() as usize
+    }
+}
+
 #[allow(
     non_upper_case_globals,
     reason = "the aliases keep the names callers match on: Place::A, Place::Gate, Place::Bp"
@@ -206,10 +285,9 @@ impl Place {
 
     /// The placement the cards in `census` offer, resolved against it
     /// ([`Place::on`]): [`Place::Bp`] when its picks find two devices (the
-    /// largest the stage, the next-largest its tier), else [`Place::A`]. Its
-    /// tier is kept only by the plan's count ([`Place::keep_tier`]). A census
-    /// with no device is `a`'s refusal by name; a refusal of `bp`'s other
-    /// than too few devices is `bp`'s.
+    /// largest the stage, the next-largest its tier), else [`Place::A`]. A
+    /// census with no device is `a`'s refusal by name; a refusal of `bp`'s
+    /// other than too few devices is `bp`'s.
     pub fn by_cards(census: &[DeviceInfo]) -> Result<Place, GateError> {
         match workstation::resolve(Place::Bp.picks(), census) {
             Ok(_) => Place::Bp.on(census),
@@ -221,25 +299,83 @@ impl Place {
         }
     }
 
-    /// [`Place::by_cards`]'s offer kept or dropped by its plan, and why in
-    /// the words a record prints: a placement with a tier card keeps it when
-    /// its tier cards hold `tier_experts`, at least `break_even` (`two cards,
-    /// tier at or past the break-even`), else it is [`Place::A`] resolved
-    /// against `census` (`two cards, tier under the break-even`); one with
-    /// no tier card is itself (`one card`).
-    pub fn keep_tier(
-        self,
+    /// The placement a serving seat runs by, set or unset, and why in the
+    /// words a `place unset` record prints: `flag` set runs it as given
+    /// (`set`), the plan never asked; unset, the cards' offer
+    /// ([`Place::by_cards`]) — itself on one card (`one card`) — kept by
+    /// `rule` on two: the body serves no tier card, or no sitting has shown
+    /// the tier not slower, and [`Place::A`] runs, the plan never asked;
+    /// else `tier_of` names the experts the offer's plan holds on its tier
+    /// card, and the offer keeps the card at or past `rule`'s break-even with
+    /// more than no expert — under it, for no expert, or for a plan that
+    /// refuses (the refusal on stderr), [`Place::A`] runs. An unset flag
+    /// never refuses a load `--place a` serves.
+    pub fn choose(
+        flag: Option<Place>,
         census: &[DeviceInfo],
-        tier_experts: u64,
-        break_even: u64,
-    ) -> Result<(Place, &'static str), GateError> {
-        if self.n == 1 {
-            return Ok((self, "one card"));
+        rule: TierRule,
+        tier_of: impl FnOnce(Place) -> Result<u64, GateError>,
+    ) -> Result<PlaceWhy, GateError> {
+        if let Some(p) = flag {
+            return Ok(PlaceWhy {
+                place: p.on(census)?,
+                why: "set",
+                tier_experts: None,
+                rule,
+            });
         }
-        if tier_experts >= break_even {
-            return Ok((self, "two cards, tier at or past the break-even"));
+        let offer = Place::by_cards(census)?;
+        if offer.tier_cards().is_empty() {
+            return Ok(PlaceWhy {
+                place: offer,
+                why: "one card",
+                tier_experts: None,
+                rule,
+            });
         }
-        Ok((Place::A.on(census)?, "two cards, tier under the break-even"))
+        let a = |why: &'static str, n: Option<u64>| -> Result<PlaceWhy, GateError> {
+            Ok(PlaceWhy {
+                place: Place::A.on(census)?,
+                why,
+                tier_experts: n,
+                rule,
+            })
+        };
+        if rule.tiers == 0 {
+            return a("two cards, the body serves no tier card", None);
+        }
+        let Some(e) = rule.break_even else {
+            return a("two cards, no sitting has shown the tier not slower", None);
+        };
+        let (place, why, n) = match tier_of(offer) {
+            Err(x) => {
+                eprintln!(
+                    "--place unset: the tier's plan refused ({x}); the largest card alone (a)"
+                );
+                (
+                    Place::A.on(census)?,
+                    "two cards, the tier's plan refused",
+                    None,
+                )
+            }
+            Ok(0) => (
+                Place::A.on(census)?,
+                "two cards, the tier holds no expert",
+                Some(0),
+            ),
+            Ok(n) if n >= e => (offer, "two cards, tier at or past the break-even", Some(n)),
+            Ok(n) => (
+                Place::A.on(census)?,
+                "two cards, tier under the break-even",
+                Some(n),
+            ),
+        };
+        Ok(PlaceWhy {
+            place,
+            why,
+            tier_experts: n,
+            rule,
+        })
     }
 
     /// The word as typed: an alias's own word, or the picks of a list
@@ -1373,7 +1509,7 @@ mod tests {
     use model::placement::devices::census_usable;
     use model::placement::workstation::{self, A6000, DeviceInfo, RTX_3090, TierBatchBytes};
 
-    use super::Place;
+    use super::{BreakEven, GateError, Place, TierRule};
 
     const BATCH: TierBatchBytes = workstation::tier_batch_bytes(5120, 2304, 6, 512);
 
@@ -1516,72 +1652,236 @@ mod tests {
         assert_eq!(m.tiers[0].device.map(|d| d.ordinal), Some(1));
     }
 
-    /// The placement the cards call for ([`Place::by_cards`], then
-    /// [`Place::keep_tier`] at a break-even of 526 tier experts): one card is
-    /// `a` on it, whichever card it is, whatever the count; two keep `bp` —
-    /// the larger the stage and the other its tier, in both enumeration
-    /// orders; two of one name across both; of three, the two largest — at
-    /// the break-even and past it, and are `a` on the larger below it; no
-    /// device is `a`'s refusal by name.
+    /// The unset rule ([`Place::choose`]) at a GLM-like [`TierRule`]: one
+    /// card is `a` on it, whichever card it is, whatever the rule and the
+    /// count; a body that serves no tier card and a rule with no break-even
+    /// run `a` without asking the plan; with both, the offer keeps its tier
+    /// card at and past the break-even — in both enumeration orders, on two
+    /// of one name, and of three the two largest — and is `a` on the larger
+    /// under it, for no expert, and for a plan that refuses; the flag set
+    /// names its word, the plan never asked; of four equal cards, the two
+    /// lowest ordinals; no device is `a`'s refusal by name. Where the rule
+    /// must not ask the plan, the closure it would ask panics.
     #[test]
-    fn the_cards_call_for_a_or_bp() {
+    fn the_unset_rule() {
         const BREAK_EVEN: u64 = 526;
         const PAYS: &str = "two cards, tier at or past the break-even";
         const SHORT: &str = "two cards, tier under the break-even";
-        let at = |names: &[&str], tier_experts: u64| {
-            let c = census(names);
-            Place::by_cards(&c)
-                .and_then(|p| p.keep_tier(&c, tier_experts, BREAK_EVEN))
-                .map(|(p, why)| {
+        const NONE_YET: &str = "two cards, no sitting has shown the tier not slower";
+        const NO_TIER: &str = "two cards, the body serves no tier card";
+        const REFUSED: &str = "two cards, the tier's plan refused";
+        const EMPTY: &str = "two cards, the tier holds no expert";
+        const RULE: TierRule = TierRule {
+            tiers: 1,
+            break_even: Some(BREAK_EVEN),
+            basis: "docs/cards/glmbp-ab.card",
+        };
+        /// What the rule chose, as the test holds it: the word, the cards,
+        /// the draft's device, the why and the tier count.
+        type Chosen = (
+            &'static str,
+            Vec<&'static str>,
+            Option<u32>,
+            &'static str,
+            Option<u64>,
+        );
+        let at = |flag: Option<Place>,
+                  names: &[&str],
+                  rule: TierRule,
+                  tier_of: &dyn Fn(Place) -> Result<u64, GateError>|
+         -> Result<Chosen, String> {
+            Place::choose(flag, &census(names), rule, tier_of)
+                .map(|w| {
                     (
-                        p.name(),
-                        p.cards(),
-                        p.draft_device().map(|d| d.ordinal),
-                        why,
+                        w.place.name(),
+                        w.place.cards(),
+                        w.place.draft_device().map(|d| d.ordinal),
+                        w.why,
+                        w.tier_experts,
                     )
                 })
                 .map_err(|e| e.to_string())
         };
-        for e in [0, BREAK_EVEN - 1, BREAK_EVEN] {
-            assert_eq!(
-                at(&["A6000"], e),
-                Ok(("a", vec!["A6000"], None, "one card"))
-            );
-            assert_eq!(at(&["3090"], e), Ok(("a", vec!["3090"], None, "one card")));
+        fn count(n: u64) -> impl Fn(Place) -> Result<u64, GateError> {
+            move |_| Ok(n)
         }
+        fn refused(_: Place) -> Result<u64, GateError> {
+            Err("the plan is refused: the tier card would stay idle (IdleTier)".into())
+        }
+        fn never_asked(_: Place) -> Result<u64, GateError> {
+            panic!("the rule asked the plan for its tier count where it must not")
+        }
+        // One card is the offer itself, whatever the card, the rule and the
+        // count.
+        for (names, card) in [
+            (&["A6000"][..], "A6000"),
+            (&["3090"][..], "3090"),
+            (
+                &["Blackwell"][..],
+                "RTX_PRO_6000_Blackwell_Workstation_Edition",
+            ),
+        ] {
+            for rule in [
+                RULE,
+                TierRule {
+                    tiers: 0,
+                    break_even: None,
+                    basis: "",
+                },
+            ] {
+                assert_eq!(
+                    at(None, names, rule, &never_asked),
+                    Ok(("a", vec![card], None, "one card", None)),
+                    "{names:?}"
+                );
+            }
+        }
+        // Two cards the plan is never asked about.
+        for (rule, why) in [
+            (
+                TierRule {
+                    tiers: 0,
+                    break_even: Some(BREAK_EVEN),
+                    basis: "",
+                },
+                NO_TIER,
+            ),
+            (
+                TierRule {
+                    tiers: 1,
+                    break_even: None,
+                    basis: "",
+                },
+                NONE_YET,
+            ),
+        ] {
+            assert_eq!(
+                at(None, &["3090", "A6000"], rule, &never_asked),
+                Ok(("a", vec!["A6000"], None, why, None))
+            );
+        }
+        // Two cards by the plan's count, in both enumeration orders; n 0 is
+        // the no-expert arm below, whatever the break-even is.
         for (order, tier) in [(["3090", "A6000"], 0), (["A6000", "3090"], 1)] {
-            for e in [BREAK_EVEN, BREAK_EVEN + 1] {
+            for n in [1, BREAK_EVEN - 1] {
                 assert_eq!(
-                    at(&order, e),
-                    Ok(("bp", vec!["A6000", "3090"], Some(tier), PAYS)),
-                    "{order:?} {e}"
+                    at(None, &order, RULE, &count(n)),
+                    Ok(("a", vec!["A6000"], None, SHORT, Some(n))),
+                    "{order:?} {n}"
                 );
             }
-            for e in [0, BREAK_EVEN - 1] {
-                assert_eq!(
-                    at(&order, e),
-                    Ok(("a", vec!["A6000"], None, SHORT)),
-                    "{order:?} {e}"
-                );
-            }
+            assert_eq!(
+                at(None, &order, RULE, &count(BREAK_EVEN)),
+                Ok((
+                    "bp",
+                    vec!["A6000", "3090"],
+                    Some(tier),
+                    PAYS,
+                    Some(BREAK_EVEN)
+                )),
+                "{order:?}"
+            );
+            assert_eq!(
+                at(None, &order, RULE, &count(BREAK_EVEN + 1)),
+                Ok((
+                    "bp",
+                    vec!["A6000", "3090"],
+                    Some(tier),
+                    PAYS,
+                    Some(BREAK_EVEN + 1)
+                )),
+                "{order:?}"
+            );
+            assert_eq!(
+                at(None, &order, RULE, &refused),
+                Ok(("a", vec!["A6000"], None, REFUSED, None)),
+                "{order:?}"
+            );
+        }
+        // No expert is `a` whatever the break-even is.
+        for e in [0, BREAK_EVEN] {
+            assert_eq!(
+                at(
+                    None,
+                    &["A6000", "3090"],
+                    TierRule {
+                        tiers: 1,
+                        break_even: Some(e),
+                        basis: ""
+                    },
+                    &count(0)
+                ),
+                Ok(("a", vec!["A6000"], None, EMPTY, Some(0))),
+                "e {e}"
+            );
         }
         assert_eq!(
-            at(&["3090", "3090"], BREAK_EVEN),
-            Ok(("bp", vec!["3090", "3090"], Some(1), PAYS))
+            at(
+                None,
+                &["A6000", "3090"],
+                TierRule {
+                    tiers: 1,
+                    break_even: Some(0),
+                    basis: ""
+                },
+                &count(1)
+            ),
+            Ok(("bp", vec!["A6000", "3090"], Some(1), PAYS, Some(1)))
+        );
+        assert_eq!(
+            at(None, &["3090", "3090"], RULE, &count(BREAK_EVEN)),
+            Ok(("bp", vec!["3090", "3090"], Some(1), PAYS, Some(BREAK_EVEN)))
         );
         assert_eq!(
             at(
+                None,
                 &["3090", "NVIDIA RTX 6000 Ada Generation", "A6000"],
-                BREAK_EVEN
+                RULE,
+                &count(BREAK_EVEN)
             ),
             Ok((
                 "bp",
                 vec!["RTX_6000_Ada_Generation", "A6000"],
                 Some(2),
-                PAYS
+                PAYS,
+                Some(BREAK_EVEN)
             ))
         );
-        let e = at(&[], BREAK_EVEN).expect_err("no device");
+        // The flag set names its word, the plan never asked.
+        for (word, p) in [("a", Place::A), ("bp", Place::Bp)] {
+            assert_eq!(
+                at(Some(p), &["3090", "A6000"], RULE, &never_asked),
+                Ok((
+                    word,
+                    if word == "a" {
+                        vec!["A6000"]
+                    } else {
+                        vec!["A6000", "3090"]
+                    },
+                    if word == "a" { None } else { Some(0) },
+                    "set",
+                    None
+                ))
+            );
+        }
+        // Four equal cards: `bp` takes the two lowest ordinals, in either
+        // enumeration order.
+        for (order, stage, tier) in [
+            (["a", "b", "c", "d"], "fake_card_a", "fake_card_b"),
+            (["d", "c", "b", "a"], "fake_card_d", "fake_card_c"),
+        ] {
+            let names: Vec<String> = order
+                .map(|w| format!("fake card {w}"))
+                .into_iter()
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            assert_eq!(
+                at(None, &names, RULE, &count(BREAK_EVEN)),
+                Ok(("bp", vec![stage, tier], Some(1), PAYS, Some(BREAK_EVEN))),
+                "{order:?}"
+            );
+        }
+        let e = at(None, &[], RULE, &never_asked).expect_err("no device");
         assert!(
             e.starts_with(
                 "--place a: the placement takes the largest visible card, and 0 devices are visible"
@@ -1590,10 +1890,21 @@ mod tests {
         );
     }
 
+    /// The Qwen3.8 seat's break-even at its nominal reply of 277 tokens, on
+    /// the seat's rates (`serve_seats/qwen38.rs`: `PLAIN_TPS`, `DRAFTED_TPS`,
+    /// `PROMPT_IDS_PER_S`, and `BP_PROMPT_RATIO` for `bp`): the ubatch walk's
+    /// rate under `a`, that rate times the ratio under `bp`.
+    #[test]
+    fn the_break_even_at_the_nominal_reply() {
+        let a = BreakEven::new(57.88, 79.33, 1224.1);
+        let bp = BreakEven::new(57.88, 79.33, 1224.1 * 1.379);
+        assert_eq!((a.at(277), bp.at(277)), (1585, 2185));
+    }
+
     /// A fake census of devices by short name, each its measured total
-    /// (the A6000's and the 3090's) or twice the A6000's, and its full
-    /// usable bytes free (`census_usable`'s figure, a quiet card). Shared
-    /// with `draft_card_tests` below.
+    /// (the A6000's, the 3090's, a 96 GB Blackwell's) or twice the A6000's,
+    /// and its full usable bytes free (`census_usable`'s figure, a quiet
+    /// card). Shared with `draft_card_tests` below.
     pub(super) fn census(names: &[&str]) -> Vec<DeviceInfo> {
         names
             .iter()
@@ -1602,6 +1913,10 @@ mod tests {
                 let (name, total_bytes) = match *n {
                     "3090" => ("NVIDIA GeForce RTX 3090".to_string(), 25_351_356_416),
                     "A6000" => ("NVIDIA RTX A6000".to_string(), 50_952_536_064),
+                    "Blackwell" => (
+                        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition".to_string(),
+                        96 * 1024 * 1024 * 1024,
+                    ),
                     other => (other.to_string(), 2 * 50_952_536_064),
                 };
                 DeviceInfo {

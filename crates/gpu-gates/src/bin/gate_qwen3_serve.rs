@@ -658,6 +658,32 @@ mod gate {
                         load.word("cache")?
                     );
                     check(ok, "default_load_names_f16", load.word("cache")? == "f16");
+                    // The common rule's record on the unset flag: a body with
+                    // no tier card runs `a`, on one card or two, names no
+                    // break-even, basis or tier count. FAIL-first: a seat
+                    // that skips the record finds none; one that keeps a
+                    // tier names `bp` or a count.
+                    let placed = seat_log(&err_log)?.one(&record::PLACE_UNSET)?;
+                    let (place, why) = (placed.word("place")?, placed.text("why")?);
+                    let (tier, even, basis) = (
+                        placed.opt_u64("tier_experts")?,
+                        placed.opt_u64("break_even")?,
+                        placed.opt_word("basis")?,
+                    );
+                    println!(
+                        "default arm: place unset place={place} why={why} tier_experts={tier:?} \
+                         break_even={even:?} basis={basis:?}"
+                    );
+                    check(
+                        ok,
+                        "unset_place_is_the_rule",
+                        place == "a"
+                            && (why == "one card"
+                                || why == "two cards, the body serves no tier card")
+                            && tier.is_none()
+                            && even.is_none()
+                            && basis.is_none(),
+                    );
                     let log = std::fs::read_to_string(&err_log)?;
                     ctx_default_is_the_trained_context(model, &split, &log, n, trained, ok)?;
                     default_n = Some(n);

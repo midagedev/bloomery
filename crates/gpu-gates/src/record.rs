@@ -2529,25 +2529,30 @@ pub static LOAD_DRAFT_OFF_GLM: Kind = Kind {
     parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
 };
 
-/// The placement the GLM seat runs by: `--place` set, or unset and what the
-/// cards call for (`generate::Place::by_cards`, `Place::keep_tier`).
-pub static PLACE_UNSET_GLM: Kind = Kind {
-    name: "place_unset_glm",
+/// The placement a serving seat runs by: `--place` set, or unset and the
+/// common rule's choice (`generate::Place::choose`).
+pub static PLACE_UNSET: Kind = Kind {
+    name: "place_unset",
     head: "place unset",
-    doc: "The placement the GLM seat runs by, after the levers' records and before the ctx line and \
-          the plan, and why: set (--place, its word as the plan line prints it), or unset and what \
-          the cards call for — on two cards the plan of bp (the largest the stage, the next-largest \
-          its expert tier) kept when its tier holds at least the break-even (two cards, tier at or \
-          past the break-even), else a (two cards, tier under the break-even), or a when that plan \
-          is refused (two cards, the tier's plan refused; the refusal on stderr); on one card a \
-          (one card). tier_experts is the experts the tier cards hold in that plan of bp, or under \
-          --place in the placement's own plan (0 with no tier card or a refused plan); break_even \
-          is the seat's threshold.",
+    doc: "The placement a serving seat runs by, after the levers' records and before the ctx line \
+          and the plan, and why: set (--place, its word as the plan line prints it), or unset and \
+          the common rule's choice on the cards — one card, the offer itself (one card); two \
+          cards, a when the body serves no tier card (two cards, the body serves no tier card) or \
+          no sitting has shown the tier not slower (two cards, no sitting has shown the tier not \
+          slower), and else by the plan of bp (the largest the stage, the next-largest its expert \
+          tier): kept when its tier holds at least the break-even and more than no expert (two \
+          cards, tier at or past the break-even), else a (two cards, tier under the break-even; \
+          two cards, the tier holds no expert; two cards, the tier's plan refused, the refusal on \
+          stderr). tier_experts is the experts the tier cards hold in that plan of bp, only where \
+          the rule asked the plan for them (never under --place, on one card, or on a refused \
+          plan); break_even and basis name the family's rule, basis the card file that decides it, \
+          whenever the family has them.",
     parts: &[
         key("place", Word, ""),
         key("why", Text, ""),
-        key("tier_experts", U64, "experts"),
-        key("break_even", U64, "experts"),
+        opt("tier_experts", U64, "experts"),
+        opt("break_even", U64, "experts"),
+        opt("basis", Word, ""),
     ],
 };
 
@@ -2827,6 +2832,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &MTP_HEAD38,
     &MTP_KEEP38,
     &RESIDENCY_LEVER,
+    &PLACE_UNSET,
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
@@ -2835,10 +2841,12 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &MTP_WIDTH,
 ];
 
-/// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: a `--hf`
+/// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf`
 /// fetch's lines (printed by the server before the seat registers), the
 /// load, the address and each request's note of the prefix it kept none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
+    &PLACE_UNSET,
     &PLAN38,
     &HF_OFFLINE,
     &HF_SET,
@@ -2861,7 +2869,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
-    &PLACE_UNSET_GLM,
+    &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_UNSET_GLM,
     &RESIDENCY_HOST,
@@ -2886,6 +2894,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEVER,
+    &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_HOST,
     &LOAD_GENERATOR,

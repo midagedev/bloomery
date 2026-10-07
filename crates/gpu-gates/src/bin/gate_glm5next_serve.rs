@@ -30,10 +30,12 @@
 //! headroom past the churn pool non-negative, the pool inside the plan's
 //! host terms — every placement's `ctx` line naming a default context at or
 //! past the floor; under `--place gate` both `off`, no `residency host`;
-//! each of the three a `place unset` record of its word and `why=set`; and
+//! each of the three a `place unset` record of its word and `why=set` (no
+//! `tier_experts`: the rule never asked the plan under the flag); and
 //! with no `--place`, on this box's two cards, `place unset place=bp`
 //! (why `two cards, tier at or past the break-even`, its `tier_experts` in
-//! [`BP_TIER_EXPERTS`] and at least its `break_even`), the unset rule's
+//! [`BP_TIER_EXPERTS`] and at least [`BREAK_EVEN`], its `break_even` that
+//! count and its `basis` the rule's card file), the unset rule's
 //! `mtp` and `mid-p0-s1`, and a plan on the cards `--place bp` plans:
 //!
 //! - the seat's `--ctx` rule ([`ctx`], on the gate card, one slot): the
@@ -353,6 +355,10 @@ mod gate {
     /// The experts the seat's plan of `bp` puts on this box's 3090 at the
     /// seat's defaults, a band for the free bytes each census reads.
     const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1490..=1515;
+    /// The GLM family's rule as the seat names it: the tier count the unset
+    /// rule keeps the tier card at (glm_place::TIER_RULE's, the card file
+    /// its `basis`).
+    const BREAK_EVEN: u64 = 526;
 
     /// The arms, one a process: `slots` is the drafted arm's (s5) alone,
     /// its server and clauses, which `drafted` runs too.
@@ -829,22 +835,33 @@ mod gate {
             g_ok && picks(&g, "off", "off")?,
         );
         // The placement every run names (`place unset`): under the flag its
-        // word, `why=set`; with none, on this box's two cards, the plan of
-        // `bp` kept — its tier at or past the break-even, the experts in
+        // word, `why=set` and no tier count (the rule never asked the plan);
+        // with none, on this box's two cards, the plan of `bp` kept — its
+        // tier at or past the break-even, the experts in
         // [`BP_TIER_EXPERTS`] — the unset rules of a serving placement, and
         // its plan on the cards `--place bp` plans (the `devices` list holds
         // each card's usable bytes, not its free ones). FAIL-first: a seat
         // that keeps `a` unset, or drops the tier it should keep, prints
         // `place=a` and a plan of one card; a seat that drops the flag names
-        // the cards' rule under `--place a` and `gate`.
-        let placed = |lines: &[String]| -> Result<(String, String, u64, u64), GateError> {
-            let r = seat_log(lines).one(&record::PLACE_UNSET_GLM)?;
-            Ok((
-                r.word("place")?.to_owned(),
-                r.text("why")?.to_owned(),
-                r.u64("tier_experts")?,
-                r.u64("break_even")?,
-            ))
+        // the cards' rule under `--place a` and `gate`; a rule with no
+        // break-even leaves the fields out.
+        /// The `place unset` record's fields as the clauses read them.
+        struct Placed {
+            place: String,
+            why: String,
+            tier_experts: Option<u64>,
+            break_even: Option<u64>,
+            basis: String,
+        }
+        let placed = |lines: &[String]| -> Result<Placed, GateError> {
+            let r = seat_log(lines).one(&record::PLACE_UNSET)?;
+            Ok(Placed {
+                place: r.word("place")?.to_owned(),
+                why: r.text("why")?.to_owned(),
+                tier_experts: r.opt_u64("tier_experts")?,
+                break_even: r.opt_u64("break_even")?,
+                basis: r.opt_word("basis")?.unwrap_or("").to_owned(),
+            })
         };
         let devices = |lines: &[String]| -> Result<(String, Vec<String>), GateError> {
             let plan = seat_log(lines).one(&record::PLAN)?;
@@ -857,25 +874,36 @@ mod gate {
         };
         let mut named = true;
         for (word, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
-            let (place, why, tier, _) = placed(lines)?;
-            println!("--place {word}: place unset place={place} why={why} tier_experts={tier}");
-            named &= place == word && why == "set";
+            let p = placed(lines)?;
+            println!(
+                "--place {word}: place unset place={} why={} tier_experts={:?} \
+                 break_even={:?} basis={}",
+                p.place, p.why, p.tier_experts, p.break_even, p.basis
+            );
+            named &= p.place == word
+                && p.why == "set"
+                && p.tier_experts.is_none()
+                && p.break_even == Some(BREAK_EVEN)
+                && p.basis == "docs/cards/glmbp-ab.card";
         }
         check(&mut ok, "set_place_is_named_set", named);
         let (u_ok, unset) = plan_only(dir, None)?;
         let follows = u_ok && {
-            let (place, why, tier, break_even) = placed(&unset)?;
+            let p = placed(&unset)?;
             let (plan_place, cards) = devices(&unset)?;
             let (_, bp_cards) = devices(&bp)?;
             println!(
-                "no --place: place unset place={place} why={why} tier_experts={tier} \
-                 break_even={break_even}; plan place={plan_place} devices {cards:?} (--place bp: \
-                 {bp_cards:?})"
+                "no --place: place unset place={} why={} tier_experts={:?} \
+                 break_even={:?} basis={}; plan place={plan_place} devices \
+                 {cards:?} (--place bp: {bp_cards:?})",
+                p.place, p.why, p.tier_experts, p.break_even, p.basis
             );
-            place == "bp"
-                && why == "two cards, tier at or past the break-even"
-                && BP_TIER_EXPERTS.contains(&tier)
-                && tier >= break_even
+            p.place == "bp"
+                && p.why == "two cards, tier at or past the break-even"
+                && p.tier_experts
+                    .is_some_and(|t| BP_TIER_EXPERTS.contains(&t) && t >= BREAK_EVEN)
+                && p.break_even == Some(BREAK_EVEN)
+                && p.basis == "docs/cards/glmbp-ab.card"
                 && picks(&unset, "mtp", RESIDENCY_WORD)?
                 && plan_place == "bp"
                 && cards.len() == 2

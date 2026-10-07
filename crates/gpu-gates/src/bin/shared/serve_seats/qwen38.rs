@@ -26,6 +26,12 @@
 //! leaves a position's bits a function of its own inputs, so a longer
 //! prompt's greedy ids are the walk's, not a step-fed run's).
 //!
+//! `--place` set runs its word as given; unset, the common rule every
+//! serving seat takes decides (`generate::Place::choose`, by this family's
+//! [`Q38_RULE`]: no break-even yet, so two cards run `a` — one card `a` on
+//! the one card), its `place unset` record the first of the seat's records
+//! after a set residency lever's.
+//!
 //! The positions a slot serves are the stores the load sized
 //! (`--ctx-size` names one request's context: while `--parallel` names no
 //! count one slot serves the whole of it, and under `--parallel N` it is
@@ -243,11 +249,11 @@ use bloomery_gpu_gates::bind::{
     CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
     placement_props, sampler_factory,
 };
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{BreakEven, Place, TierRule};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
-use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
     Draft38At, Draft38Off, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
     residency38_unset,
@@ -333,44 +339,32 @@ const PLAIN_TPS: f64 = 57.88;
 const DRAFTED_TPS: f64 = 79.33;
 const PROMPT_IDS_PER_S: f64 = 1224.1;
 
-/// The drafted seat's break-even ([`Q38::draft_keep`]): `per_token` is the
-/// ids a reset re-prefills in the time the draft saves one reply token, so
-/// a kept prefix of fewer than `⌈reply · per_token⌉` positions costs less
-/// to prefill again than keeping it costs the reply's `reply` tokens.
-#[derive(Clone, Copy, Debug)]
-struct BreakEven {
-    per_token: f64,
-}
+/// The prompt rate under `bp` over `a`'s, the same lease
+/// (docs/cards/q38bpbug-ab.card: P 512, draft off, A6000 + 3090).
+const BP_PROMPT_RATIO: f64 = 1.379;
 
-impl BreakEven {
-    /// The break-even at `place`: the draft's gain a token times the rate a
-    /// reset re-prefills at — the ubatch walk's under `a` and `gate` (plan
-    /// (a)'s stands for the 3090's: the product is a ratio of one card's own
-    /// rates). Under `bp` the prompt runs that walk too
-    /// (`Body38::resolve_prompt`: a tier load takes it at every length), at a
-    /// rate this table does not hold: it waits on the qwen38 two-card lease
-    /// A/B of `docs/cards/q38tier-ab.card`, and until that sitting lands the
-    /// plain step's rate stands in, which understates the break-even with it
-    /// — the seat keeps prefixes a reset would re-prefill for less.
-    fn of(place: Place38) -> BreakEven {
-        let gain = 1.0 / PLAIN_TPS - 1.0 / DRAFTED_TPS;
-        let rate = match place.kind {
-            Kind38::A | Kind38::Gate => PROMPT_IDS_PER_S,
-            // bp's own walk rate, not this: the lease A/B the comment above
-            // names.
-            Kind38::Bp => PLAIN_TPS,
-        };
-        BreakEven {
-            per_token: gain * rate,
-        }
-    }
+/// The Qwen3.8 family's input to the common unset rule (`Place::choose`):
+/// one expert tier card served, no break-even yet — no sitting has shown
+/// the tier not slower (docs/cards/q38bpbug-ab.card holds the measured
+/// rates a break-even would be derived from).
+const Q38_RULE: TierRule = TierRule {
+    tiers: 1,
+    break_even: None,
+    basis: "docs/cards/q38bpbug-ab.card",
+};
 
-    /// The kept positions that break even with a reply of `reply` tokens
-    /// through passes.
-    fn at(self, reply: usize) -> usize {
-        let r = f64::from(u32::try_from(reply).unwrap_or(u32::MAX));
-        (r * self.per_token).ceil() as usize
-    }
+/// The drafted seat's break-even at `place` ([`Q38::draft_keep`]): the
+/// draft's gain a token times the rate a reset re-prefills at — the ubatch
+/// walk's under `a` and `gate` (plan (a)'s stands for the 3090's: the product
+/// is a ratio of one card's own rates), and that walk under `bp` at its
+/// measured prompt ratio over `a`'s ([`BP_PROMPT_RATIO`],
+/// docs/cards/q38bpbug-ab.card).
+fn break_even_of(place: Place38) -> BreakEven {
+    let rate = match place.kind {
+        Kind38::A | Kind38::Gate => PROMPT_IDS_PER_S,
+        Kind38::Bp => PROMPT_IDS_PER_S * BP_PROMPT_RATIO,
+    };
+    BreakEven::new(PLAIN_TPS, DRAFTED_TPS, rate)
 }
 
 /// The branch a drafted request took at its kept prefix ([`Q38::draft_keep`]),
@@ -429,14 +423,6 @@ impl Place38 {
             }
         };
         Ok(Place38 { kind, cards })
-    }
-
-    /// The placement on this process's devices (`Place::on_host`).
-    fn on_host(self) -> Result<Place38, GateError> {
-        Ok(Place38 {
-            cards: self.cards.on_host()?,
-            ..self
-        })
     }
 
     fn name(self) -> &'static str {
@@ -915,6 +901,10 @@ impl Ctx38 {
 struct Args {
     host: String,
     port: u16,
+    /// `--place`; `None` takes the common rule's choice ([`Place::choose`]).
+    flag: Option<Place38>,
+    /// The placement the seat runs by: the flag's word, or the common rule's
+    /// choice, resolved against this process's devices.
     place: Place38,
     /// `--ctx-size`; `None` takes the rule's default.
     ctx: Option<usize>,
@@ -940,6 +930,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
+        flag: None,
         place: Place38::A,
         ctx: None,
         alias: None,
@@ -961,7 +952,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = serve::flag::number(flag, v)?,
-            "--place" => a.place = Place38::parse(v)?,
+            "--place" => a.flag = Some(Place38::parse(v)?),
             f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
@@ -986,7 +977,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 .into(),
         );
     }
-    a.place = a.place.on_host()?;
     Ok(a)
 }
 
@@ -1008,7 +998,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Some(word) => Some((Residency::parse(word)?, word)),
         None => None,
     };
-    let a = parse_args(args)?;
+    let mut a = parse_args(args)?;
+    // The placement the seat runs by: the flag's word, or unset the common
+    // rule's (`Place::choose`) on the census, read once. The kind is read by
+    // structure — the flag's when set, and unset `Bp` only where the chosen
+    // placement holds a tier card — never off the chosen word, which
+    // `Place::on` spells as card names when an alias lands on other devices.
+    let census = gpu_census::census()?;
+    let chosen = Place::choose(a.flag.map(|p| p.cards), &census, Q38_RULE, |p| {
+        Err(format!(
+            "--place unset: Qwen3.8 has no break-even yet, so no tier count for {}",
+            p.name()
+        )
+        .into())
+    })?;
+    chosen.record().eprint();
+    a.place = Place38 {
+        kind: match a.flag {
+            Some(f) => f.kind,
+            None if chosen.place.tier_cards().is_empty() => Kind38::A,
+            None => Kind38::Bp,
+        },
+        cards: chosen.place,
+    };
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -1132,7 +1144,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         slots * rule.ctx
     );
     if mtp {
-        let be = BreakEven::of(a.place);
+        let be = break_even_of(a.place);
         eprintln!(
             "draft keep place={} break_even={} reply={NOMINAL_REPLY} per_reply_token={} (the \
              kept prefix below which a request that would leave the MTP draft off resets; \
@@ -1559,7 +1571,7 @@ impl Q38 {
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
             residency,
-            break_even: a.mtp.then(|| BreakEven::of(a.place)),
+            break_even: a.mtp.then(|| break_even_of(a.place)),
             one_pass: pass_of_slots && a.mtp,
             step_pass: pass_of_slots && !a.mtp,
             stats: a.stats,
