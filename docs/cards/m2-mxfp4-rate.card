@@ -1,0 +1,42 @@
+# The MXFP4 x Q8_2_X4 single-core rate, never measured: the v4host round's
+# prediction (docs/plan-ledger.md:1285, "미측정") read against its measured
+# anchor. Anchor (measured): Q3_K x Q8_K single-core qdot-rate 10.8 GB/s
+# (rig-log log/2026-09-20.md:8, MUL-26, 360,448 rows x 880 B). Low edge
+# [derived]: the instruction-ratio scaling 10.8 x (136/110) x (130/136) ~ 12.8
+# GB/s — MXFP4 carries 136 B and ~136 instructions per 256 values where Q3_K
+# carries 110 B and ~130. High edge [derived]: the MXFP4 inner loop's
+# vector-pipe census (~30 cycles per 256 values, loads not binding) carrying
+# Q3_K's measured inefficiency (46 cycles measured vs ~30-33 bound, x1.4) ->
+# ~42 cycles -> ~9.3 ns per 136 B ~ 14.6 GB/s. Break-even [derived, r4design
+# §7 "qdot 항"]: the decode host leg stays DRAM-bound while the per-core rate
+# clears ~7.8 GB/s — t(m) = max(W, a + c·m) at m = 1 has W 92-99 µs (13.37 MB
+# per expert at 135-145 GB/s) against a + c = 40.4 + 30.2 µs, so the leg tips
+# only at c' <= 51.8 µs per expert-column.
+kind: calibration
+question: does the MXFP4 x Q8_2_X4 dot's single-core rate keep MiMo-V2.6-Flash's
+  decode host leg bound by host DRAM — per-core rate at or above the ~7.8 GB/s
+  break-even, inside the predicted band?
+term: qdot-rate single-thread GB/s of MXFP4 rows at k = 4096 (MiMo
+  ffn_gate/up_exps, 2176 B/row) and k = 2048 (MiMo ffn_down_exps, 1088 B/row),
+  360,448 rows x 6 passes per arm, one pinned core (BLOOMERY_RATE_CORE), the
+  runner's rounds alternating with ik's mxfp4_x4_rate in one lease
+unit: GB/s
+predict: 12.8..14.6
+condition: the lead runs, after just build-ref (so mxfp4_x4_rate exists),
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/m2-mxfp4-rate.card'
+  just measure-qdot-rate 3 on this tree — the recipe builds qdot-rate itself,
+  the runner pins one core and reverses arm order every round, and the witness
+  shows no other compute on the box
+reason: sets qdot's MXFP4 per-column cost c in docs/plan.md:77's host-union row
+  (t(m) = max(W, a + c·m)) and closes plan-ledger.md:1285's "미측정" (MXFP4
+  12.8-14.6); why now: the rate decides whether MiMo's card-expert round (R5)
+  or an MXFP4 decode kernel round comes first, and it is the prompt-path round
+  (R8)'s first lever
+decide-in: the decode leg is DRAM-bound; record the rate in plan-ledger.md's
+  v4host line and in plan.md's host-union row; R5 (card experts) next; an
+  MXFP4 tile only in the R8 prompt-path round
+decide-below: under 7.8 GB/s the decode leg is ALU-bound and an MXFP4 decode
+  kernel round comes before R5; between 7.8 and 12.8 a term the derivation
+  missed: profile qdot-rate (perf -e cpu-clock) before deciding
+decide-above: rewrite the MXFP4 c in plan.md's host-union row and re-derive
+  MiMo's prompt-path (R8) prediction
