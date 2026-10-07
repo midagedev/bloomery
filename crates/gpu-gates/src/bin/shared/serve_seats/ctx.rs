@@ -33,7 +33,9 @@ pub fn largest(
 /// most [`MARGIN`](model::placement::workstation::MARGIN) fewer bytes than
 /// `base_bytes` (the plan's at `base_at`): `fit` when every context to
 /// there does, `base_at` when no step past it does, else the largest that
-/// does rounded down to `step` (never under `base_at`).
+/// does rounded down to `step` (never under `base_at`). A context whose plan
+/// is refused is not within, as the fit's own search reads it: a probe is
+/// never the seat's refusal.
 pub fn within_margin(
     fit: usize,
     base_at: usize,
@@ -41,7 +43,7 @@ pub fn within_margin(
     step: usize,
     card_bytes: &dyn Fn(usize) -> Result<u64, GateError>,
 ) -> Result<usize, GateError> {
-    let within = |c: usize| Ok(base_bytes.saturating_sub(card_bytes(c)?) <= MARGIN);
+    let within = |c: usize| Ok(card_bytes(c).is_ok_and(|b| base_bytes.saturating_sub(b) <= MARGIN));
     let c = largest(base_at, fit, within)?;
     if c == fit {
         return Ok(c);

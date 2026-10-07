@@ -675,13 +675,21 @@ struct Ctx38 {
     /// context the card holds, fewer than [`CTX`]), `cache` (one state in
     /// the prompt cache's budget).
     rule: &'static str,
-    /// The largest slot context the card holds ([`fit38`]).
-    fit: Fit38,
-    /// The largest slot context within the plan's margin ([`margin38`]).
-    margin_ctx: usize,
-    /// The plan's card expert bytes at [`CTX`] a slot and at `ctx`.
-    base_bytes: u64,
+    /// What the default's search found; `None` for a set context, which
+    /// plans its own split alone.
+    search: Option<Search38>,
+    /// The plan's card expert bytes at `ctx`.
     card_bytes: u64,
+}
+
+/// The default's search: the largest slot context the card holds
+/// ([`fit38`]), the largest within the plan's margin ([`margin38`]), and the
+/// plan's card expert bytes at [`CTX`] a slot.
+#[derive(Clone, Copy)]
+struct Search38 {
+    fit: Fit38,
+    margin_ctx: usize,
+    base_bytes: u64,
 }
 
 /// The largest slot context the card holds beside the plan's dense weights,
@@ -739,42 +747,61 @@ fn margin38(
 /// cache's bound comes after ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     let n = plans.slots;
-    let split = |c: usize| c / n;
     if let Some(c) = set {
-        if split(c) == 0 {
+        let ctx = c / n;
+        if ctx == 0 {
             return Err(
                 format!("--ctx-size {c}: --parallel {n} splits it to no position a slot").into(),
             );
         }
-        serve_ctx(u64::try_from(split(c))?, &plans.inputs.hp)?;
+        serve_ctx(u64::try_from(ctx)?, &plans.inputs.hp)?;
+        // A set context plans its own split alone: the default's search
+        // probes contexts the flag did not name, and a refusal at one of them
+        // is not this load's.
+        return match plans.card(ctx) {
+            Ok(card_bytes) => Ok(Ctx38 {
+                ctx,
+                slots: n,
+                rule: "set",
+                search: None,
+                card_bytes,
+            }),
+            Err(refused) => {
+                let fit = fit38(plans)?;
+                if ctx > fit.ctx {
+                    Err(format!(
+                        "--ctx-size {c}: with --parallel {n} each slot takes {ctx} positions and \
+                         the card holds at most {} a slot beside the plan's dense weights \
+                         (`--place {}`)",
+                        fit.ctx,
+                        plans.place.name()
+                    )
+                    .into())
+                } else {
+                    Err(refused)
+                }
+            }
+        };
     }
     let fit = fit38(plans)?;
     let base_at = CTX.min(fit.ctx);
     let base_bytes = plans.card(base_at)?;
     let margin_ctx = margin38(plans, fit.ctx, base_at, base_bytes)?;
-    let (ctx, rule) = match set {
-        Some(c) if split(c) > fit.ctx => {
-            return Err(format!(
-                "--ctx-size {c}: with --parallel {n} each slot takes {} positions and the card \
-                 holds at most {} a slot beside the plan's dense weights (`--place {}`)",
-                split(c),
-                fit.ctx,
-                plans.place.name()
-            )
-            .into());
-        }
-        Some(c) => (split(c), "set"),
-        None if base_at < CTX => (base_at, "card"),
+    let (ctx, rule) = if base_at < CTX {
+        (base_at, "card")
+    } else {
         // Unset takes the fit's context without paying its card experts.
-        None => (margin_ctx, "margin"),
+        (margin_ctx, "margin")
     };
     Ok(Ctx38 {
         ctx,
         slots: n,
         rule,
-        fit,
-        margin_ctx,
-        base_bytes,
+        search: Some(Search38 {
+            fit,
+            margin_ctx,
+            base_bytes,
+        }),
         card_bytes: plans.card(ctx)?,
     })
 }
@@ -816,8 +843,20 @@ impl Ctx38 {
     }
 
     /// The `ctx` line on stderr: every context a slot's, `total` the slots'
-    /// sum, `base` the plan at [`CTX`] a slot the margin counts against.
+    /// sum, `base` the plan at [`CTX`] a slot the margin counts against; a
+    /// set context's line carries no search terms (it ran none).
     fn print(&self) {
+        let Some(s) = self.search else {
+            eprintln!(
+                "ctx rule={} ctx={} slots={} total={} card_expert_bytes={}",
+                self.rule,
+                self.ctx,
+                self.slots,
+                self.slots * self.ctx,
+                self.card_bytes
+            );
+            return;
+        };
         eprintln!(
             "ctx rule={} ctx={} slots={} total={} fit={} fit_card_expert_bytes={} margin_ctx={} \
              base={CTX} base_card_expert_bytes={} card_expert_bytes={} lost_bytes={} \
@@ -826,12 +865,12 @@ impl Ctx38 {
             self.ctx,
             self.slots,
             self.slots * self.ctx,
-            self.fit.ctx,
-            self.fit.card_bytes,
-            self.margin_ctx,
-            self.base_bytes,
+            s.fit.ctx,
+            s.fit.card_bytes,
+            s.margin_ctx,
+            s.base_bytes,
             self.card_bytes,
-            self.base_bytes.saturating_sub(self.card_bytes)
+            s.base_bytes.saturating_sub(self.card_bytes)
         );
     }
 }
