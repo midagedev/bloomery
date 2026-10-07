@@ -1805,32 +1805,18 @@ fn qsa(
     Ok((dense, m - dense))
 }
 
-/// The least count an expert's ubatch routes to it for an `admit` pick to
-/// admit it: about the least column count whose share of the host union
-/// passes one flip's copy on the staging ring (an expert's three stacks),
-/// which the layer's card route waits for [derived]; V4.1's `STREAM_FLOOR`,
-/// the same value, sits inside that estimate's error. Below it a flip
-/// lengthens a layer whose card already waits on its copies more than it
-/// shortens the union. A `split` pick in a unit that lights the stream's
-/// ring admits from the stream rule's floor, at the lane's measured rate,
-/// instead ([`pick_floor`]).
+/// The no-probe floor: the least count an expert's ubatch routes to it for a
+/// pick to admit it on a load whose lane never probed — every `admit` pick,
+/// and a `split` pick at a layer the stream holds no constants of — about
+/// the least column count whose share of the host union passes one flip's
+/// copy on the staging ring (an expert's three stacks), which the layer's
+/// card route waits for [derived]; V4.1's `STREAM_FLOOR`, the same value,
+/// sits inside that estimate's error. Below it a flip lengthens a layer
+/// whose card already waits on its copies more than it shortens the union.
+/// A `split` pick at a probed layer admits from the walk's own plan
+/// ([`runtime::xsplit::admit_walk`]) instead, counted per pick by the pick
+/// record's `fallback`.
 pub(super) const STREAM_FLOOR: u32 = 32;
-
-/// A `split` pick's floor at a layer of the rule's constants `k`, in a unit
-/// wide enough to light the stream's ring: the least count past the stream
-/// rule's floor ([`runtime::xsplit::m_star`]), the count from which the card
-/// pays the expert's copy back, admitted or streamed. [`STREAM_FLOOR`] for a
-/// layer the stream holds no constants of.
-pub(super) fn pick_floor(k: Option<runtime::xsplit::Constants>) -> u32 {
-    k.map_or(STREAM_FLOOR, |k| {
-        let floor = runtime::xsplit::m_star(&k).floor();
-        if floor.is_finite() && floor < f64::from(u32::MAX) {
-            floor as u32 + 1
-        } else {
-            u32::MAX
-        }
-    })
-}
 
 /// A prompt call's host streaming (`BLOOMERY_XSTREAM`, the residency
 /// machine's call mode and the expert stream): what the next prompt calls
@@ -1844,6 +1830,10 @@ pub(super) struct Stream38 {
     pub(super) on: bool,
     /// The streaming call runs the expert stream too (`split`).
     pub(super) split: bool,
+    /// The card tail a split pick's walk balances with, set when a streaming
+    /// call opens: the family's measured one on the Q4 kind, none on a kind
+    /// whose route no record has priced.
+    pub(super) card_tail_us: f64,
     /// The ubatch the walk runs, from 0, the pick records' group.
     pub(super) ubatch: usize,
     counts: Vec<u32>,
@@ -1910,20 +1900,23 @@ impl<'a> Gemm38<'a> {
     /// Under host streaming, on a layer with card experts, the layer's pick
     /// before its card route: the host waits for the front's download of the
     /// unit's routed ids, counts them, and the residency machine's pick
-    /// (`SwapMachine::call_pick`, the least count admitted [`STREAM_FLOOR`]
-    /// under `admit`, [`pick_floor`] under `split`) sends the pool's coldest
-    /// residents to the host and copies the unit's hottest host experts over
-    /// them — in victim-slot order, a landing batch a third of them, each
-    /// batch's event on the copy stream after its last copy ([`LandBatch`])
-    /// — the host map and the card's copy of the layer's words moved at
-    /// once, so the union the walk's serve runs next, and the card route,
-    /// run under the moved map, each GEMM batch waiting its own batch's
-    /// event and no later copy. Under `split` the expert stream then takes
-    /// the layer ([`crate::host::HostTier::xstream_layer`]): the host
-    /// experts its rule sends to the card stream into a half of its ring,
-    /// its copies batched the same way, and the serve leaves them out; the
-    /// layer's ring view for its card route is returned. Nothing else, and
-    /// nothing in a unit of fewer rows than the floor.
+    /// (`SwapMachine::call_pick`) sends the pool's coldest residents to the
+    /// host and copies the unit's hottest host experts over them — the least
+    /// count admitted [`STREAM_FLOOR`] on a load whose lane never probed,
+    /// the walk's own floor and backlog bound
+    /// ([`crate::host::HostTier::call_pick_walk`], every copy at the
+    /// beside-union rate) where it did — in victim-slot order, a landing
+    /// batch a third of them, each batch's event on the copy stream after
+    /// its last copy ([`LandBatch`]) — the host map and the card's copy of
+    /// the layer's words moved at once, so the union the walk's serve runs
+    /// next, and the card route, run under the moved map, each GEMM batch
+    /// waiting its own batch's event and no later copy. Under `split` the
+    /// expert stream then takes the layer
+    /// ([`crate::host::HostTier::xstream_layer`]): the host experts its rule
+    /// sends to the card stream into a half of its ring, its copies batched
+    /// the same way, and the serve leaves them out; the layer's ring view
+    /// for its card route is returned. Nothing else, and nothing in a unit
+    /// narrower than the gate the pick admits from.
     fn stream_pick(
         &mut self,
         port: &mut BatchLeg<'a, HostRun>,
@@ -1934,33 +1927,41 @@ impl<'a> Gemm38<'a> {
             return Ok((None, Vec::new()));
         }
         let split = self.p.stream.split;
-        // The stream's floor only where its ring is lit: a narrower unit
-        // admits as `admit` does, so short prompts move what they did.
-        let k = port.hybrid().xstream().and_then(|x| x.constants(l));
-        let lit = split && k.is_some_and(|k| self.p.m as u64 >= runtime::xsplit::m_min(&k));
-        let floor = match lit {
-            true => pick_floor(k),
-            false => STREAM_FLOOR,
+        // The walk only where the lane probed: its gate is the least width
+        // whose picks could pay a first admit. A load with no probe admits
+        // from the stream floor, so short prompts move what they did.
+        let mut k = port.hybrid().xstream().and_then(|x| x.constants(l));
+        let walked = split && k.is_some();
+        let gate = match k.as_mut() {
+            Some(k) if split => {
+                k.card_tail_us = self.p.stream.card_tail_us;
+                runtime::xsplit::walk_gate(k)
+            }
+            _ => STREAM_FLOOR,
         };
-        // A unit of fewer rows than the floor gives no expert a count the
-        // pick admits (a call's last ubatch can be one), and the stream's
-        // least width is wider than its floor.
-        if self.p.m < floor as usize {
+        // A unit of fewer rows than the gate gives no expert a count the
+        // pick admits (a call's last ubatch can be one).
+        if self.p.m < gate as usize {
             return Ok((None, Vec::new()));
         }
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
         let s = &mut *self.p.stream;
-        if split {
-            port.hybrid().call_floor(floor)?;
-        }
-        let mut pick = port
-            .hybrid()
-            .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?;
+        let mut pick = match (split, k) {
+            (true, Some(k)) => port.hybrid().call_pick_walk(
+                stream,
+                key,
+                &mut s.counts,
+                k,
+                crate::host::swap::RING_SLOTS as u64,
+            )?,
+            _ => port
+                .hybrid()
+                .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?,
+        };
         // The no-probe floor witness: the pick admitted from the stream
-        // floor (a load whose lane never probed, or a unit too narrow to
-        // light the ring) rather than the stream rule's measured one.
-        pick.fallback = u32::from(!lit);
+        // floor rather than the walk's measured plan.
+        pick.fallback = u32::from(!walked);
         let admitted = pick.admitted;
         let land = std::mem::take(&mut pick.land);
         s.picks.push((s.ubatch, pick));

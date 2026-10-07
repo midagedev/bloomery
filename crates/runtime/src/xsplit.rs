@@ -4,21 +4,44 @@
 //! counts and constants measured at load. No machine, card or model name
 //! enters the rule; every constant is an input.
 //!
+//! **Two rates.** A copy gets one of two rates. Alone — the pick phase, while
+//! the walk thread waits for the staging thread — it runs at the lane's
+//! measured rate `lane_b_per_us`. Beside the union — every copy a pick leaves
+//! behind it, and every copy the ring makes — the union's expert-weight reads
+//! hold the host's DRAM for their share of its own window, and a copy beside
+//! it runs at [`beside_b_per_us`]: the lane's rate less the union's burst
+//! share [`union_burst_share`], a pure function of the unit's own counts
+//! (its listed host experts and their columns) and the union's costs W and c.
+//! The rule prices every copy at the rate it gets, never at the lane's alone.
+//!
 //! An expert routed `m` columns of the unit leaves the host union when it
 //! costs more there than on the lane plus the card:
 //! `max(W, c·m) > b/r + f + k·m`, for the host union's fixed cost W and
-//! per-column cost c, the lane's rate r, the expert's b bytes and the card's
-//! fixed cost f and per-column cost k. [`m_star`] is that inequality's
-//! crossover on its per-column branch, `(b/r + f)/(c − k)`; while W is at
-//! most `b/r + f` the experts that stream are exactly those routed past it.
-//! [`m_min`] is the least unit width that streams: a column spreads its top-k
-//! picks over the choice set, so the average expert's count `top_k·m/experts`
-//! first clears [`m_star`] at `m_min = m_star·experts/top_k`. Below it the
-//! ring stays dark and the pool admits alone. Both lists fill in the one
-//! ranking [`rank_key`], so the same counts give the same split.
-//! [`stream_tail`] is the ring's half alone, over a host set whose admits
-//! are already taken; [`split`] takes its tail through it, so the stream
-//! inequality has one caller.
+//! per-column cost c, the lane's beside-union rate r, the expert's b bytes
+//! and the card's fixed cost f and per-column cost k. [`m_star`] is that
+//! inequality's crossover on its per-column branch, `(b/r + f)/(c − k)`;
+//! while W is at most `b/r + f` the experts that stream are exactly those
+//! routed past it. [`m_min`] is the least unit width that streams: a column
+//! spreads its top-k picks over the choice set, so the average expert's
+//! count `top_k·m/experts` first clears [`m_star`] at
+//! `m_min = m_star·experts/top_k`. Below it the ring stays dark and the pool
+//! admits alone. Both lists fill in the one ranking [`rank_key`], so the
+//! same counts give the same split. [`stream_tail`] is the ring's half
+//! alone, over a host set whose admits are already taken; [`split`] takes
+//! its tail through it, so the stream inequality has one caller.
+//!
+//! **The walk.** A split pick's admits and its backlog bound come from one
+//! balance over the two chains a layer runs after its pick returns: the
+//! card's — the admits' copies beside the union, then the route's tail τ
+//! ([`Constants::card_tail_us`]) — and the host union's, each admitted
+//! expert's cost leaving it. [`admit_walk`] walks the host experts hottest
+//! first, admitting while the card chain stays under the union, and returns
+//! the floor (the coldest admit's count, a rank-contiguous set) and the
+//! backlog bound: exactly the jobs whose copies fit inside the union's
+//! shadow, the rest staging alone ahead of it. [`walk_gate`] is the least
+//! unit width whose picks could pay the walk's first admit: a prompt
+//! narrower than it admits nothing whatever its counts, so a caller gates on
+//! it before it counts.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -27,7 +50,8 @@ use std::fmt;
 /// geometry, every field's unit in its name.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Constants {
-    /// The copy lane's host→card rate [B/µs].
+    /// The copy lane's host→card rate [B/µs], measured alone: the pick
+    /// phase's rate, and the base the beside-union rate takes from.
     pub lane_b_per_us: f64,
     /// The host union's per-column cost of one expert [µs/col].
     pub host_us_per_col: f64,
@@ -37,6 +61,17 @@ pub struct Constants {
     pub card_us_fixed: f64,
     /// The card's per-column cost of one streamed expert [µs/col].
     pub card_us_per_col: f64,
+    /// The union's weight-listing burst share of its own window: the
+    /// fraction of the union's window its expert-weight reads hold the
+    /// host's DRAM, during which a copy beside it gets nothing of the lane's
+    /// rate. A load's family row carries 0 (no unit known); the paths that
+    /// know a unit's counts set it through [`union_burst_share`].
+    pub union_burst_share: f64,
+    /// The card route's tail past a layer's last copy [µs]: the work the
+    /// pipeline cannot hide behind the copies, the walk's card chain ends
+    /// with it. A family row without one carries 0; the model that measured
+    /// its route sets its own at its walk. The ring's rule never reads it.
+    pub card_tail_us: f64,
     /// One routed expert's bytes in the layer [B].
     pub expert_b: u64,
     /// The router's choice set: routed experts in the layer.
@@ -46,25 +81,50 @@ pub struct Constants {
 }
 
 /// The rule for one expert routed `count` columns of the unit: it streams
-/// when the host union's cost is above the lane's and the card's together.
+/// when the host union's cost is above the lane's and the card's together —
+/// the lane's copy priced beside the union, where it runs.
 fn streams(k: &Constants, count: u32) -> bool {
     let m = f64::from(count);
     let host = k.host_us_fixed.max(k.host_us_per_col * m);
-    let lane_card = k.expert_b as f64 / k.lane_b_per_us + k.card_us_fixed + k.card_us_per_col * m;
+    let lane_card =
+        k.expert_b as f64 / beside_b_per_us(k) + k.card_us_fixed + k.card_us_per_col * m;
     host > lane_card
 }
 
+/// The union's weight-listing burst share of its own window for a unit that
+/// routes `cols` columns over `listed` host experts: the union's fixed
+/// weight-reading cost against its whole cost, the share of its window a
+/// copy beside it loses. Pure in the unit's counts and the union's costs;
+/// 0 with nothing listed (no weight reads to lose the lane to).
+#[must_use]
+pub fn union_burst_share(cols: u64, listed: u64, k: &Constants) -> f64 {
+    let fixed = k.host_us_fixed * listed as f64;
+    let whole = fixed + k.host_us_per_col * cols as f64;
+    if whole <= 0.0 {
+        return 0.0;
+    }
+    fixed / whole
+}
+
+/// The beside-union copy rate [B/µs]: the lane's measured rate less the
+/// union's burst share of it — the rate every copy the pick leaves behind
+/// it, and every ring copy, gets.
+#[must_use]
+pub fn beside_b_per_us(k: &Constants) -> f64 {
+    k.lane_b_per_us * (1.0 - k.union_burst_share)
+}
+
 /// The stream floor: the count past which the rule's per-column branch
-/// streams, `c·m > b/r + f + k·m` solved for m, `(b/r + f)/(c − k)`. A card
-/// column that costs at least the host's never pays its fixed cost back: the
-/// floor is then infinite. In columns.
+/// streams, `c·m > b/r + f + k·m` solved for m, `(b/r + f)/(c − k)` at the
+/// beside-union rate r. A card column that costs at least the host's never
+/// pays its fixed cost back: the floor is then infinite. In columns.
 #[must_use]
 pub fn m_star(k: &Constants) -> f64 {
     let per_col = k.host_us_per_col - k.card_us_per_col;
     if per_col <= 0.0 {
         return f64::INFINITY;
     }
-    (k.expert_b as f64 / k.lane_b_per_us + k.card_us_fixed) / per_col
+    (k.expert_b as f64 / beside_b_per_us(k) + k.card_us_fixed) / per_col
 }
 
 /// The least unit width that streams: a column's top-k picks spread over the
@@ -81,6 +141,112 @@ pub fn m_min(k: &Constants) -> u64 {
 #[must_use]
 pub fn rank_key(count: u32, id: u32) -> (Reverse<u32>, u32) {
     (Reverse(count), id)
+}
+
+/// A split pick's plan from [`admit_walk`]: the floor its admits come from
+/// and the backlog bound its copies leave the staging thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmitPlan {
+    /// The least count an admitted expert has in the pick's counts: the
+    /// coldest admit of the walk's rank-contiguous set, so a floor
+    /// reproduces the set exactly. `u32::MAX` when the walk admits nothing.
+    pub floor: u32,
+    /// The most of the call's jobs the staging thread may leave unstaged
+    /// when the pick issues another: the jobs whose copies beside the union
+    /// fit inside its shadow, the rest staging alone ahead of it. 0 when the
+    /// walk admits nothing (no job ever issues at the bound).
+    pub backlog: u64,
+}
+
+/// The ranked chain-balance walk: a split pick's admits and its backlog
+/// bound, over the layer's routed `counts` (one a router expert) and its
+/// host-tier `host` ids in any order, at the unit's constants `k` (its
+/// beside-union share set, its card tail the model's own). The card chain
+/// runs the admits' copies beside the union and ends at the route's tail;
+/// the host chain loses each admitted expert's union cost. Walking hottest
+/// first ([`rank_key`]), an expert is admitted while the card chain after it
+/// stays under the union it leaves — the wall the walk balances is the
+/// longer of the two chains, so past that point an admit lengthens the
+/// layer. The floor is the coldest admit's count; the backlog bound leaves
+/// beside the union exactly the jobs whose copies fit inside its shadow,
+/// `⌈(U − τ)·r/b⌉` clamped to the caller's queue floor and to the admits
+/// there are.
+///
+/// Refused by name: the constants the derivations cannot read, counts of
+/// another length than the layer's experts, and a host list naming an
+/// expert outside the layer or twice.
+///
+/// # Errors
+/// Every refusal names its input; see [`SplitError`].
+pub fn admit_walk(
+    counts: &[u32],
+    host: &[u32],
+    k: &Constants,
+    queue_floor: u64,
+) -> Result<AdmitPlan, SplitError> {
+    check_constants(k)?;
+    check_counts(counts, k)?;
+    check_host(host, k, &mut Vec::new())?;
+    let copy_us = k.expert_b as f64 / beside_b_per_us(k);
+    let host_us = |m: u32| k.host_us_fixed.max(k.host_us_per_col * f64::from(m));
+    let mut ranked: Vec<u32> = host.to_vec();
+    ranked.retain(|&id| counts[id as usize] > 0);
+    ranked.sort_unstable_by_key(|&id| rank_key(counts[id as usize], id));
+    let union = ranked
+        .iter()
+        .map(|&id| host_us(counts[id as usize]))
+        .sum::<f64>();
+    let mut card = k.card_tail_us;
+    let mut left = union;
+    let mut admits: u64 = 0;
+    let mut plan = AdmitPlan {
+        floor: u32::MAX,
+        backlog: 0,
+    };
+    for &id in &ranked {
+        let count = counts[id as usize];
+        let card_next = card + copy_us;
+        let left_next = left - host_us(count);
+        if card_next > left_next {
+            break;
+        }
+        card = card_next;
+        left = left_next;
+        plan.floor = count;
+        admits += 1;
+    }
+    if plan.floor == u32::MAX {
+        return Ok(plan);
+    }
+    // The shadow bound: the jobs whose copies fit inside the union the walk
+    // left, the rest staging alone ahead of it — never fewer than the
+    // machine's queue floor, never more than the admits there are.
+    let shadow = (left - k.card_tail_us).max(0.0) * beside_b_per_us(k) / k.expert_b as f64;
+    let bound = shadow
+        .ceil()
+        .clamp(queue_floor.min(admits) as f64, admits as f64);
+    plan.backlog = bound as u64;
+    Ok(plan)
+}
+
+/// The least unit width whose picks could pay the walk's first admit: any
+/// admit needs the union to cost at least one copy beside it and the card's
+/// tail, and a unit of `m` columns costs the union at most `top_k·m` of
+/// both the fixed and the per-column kind — an expert listed at most once a
+/// column. A prompt narrower than the gate admits nothing whatever its
+/// counts, so a caller gates before it counts. In columns.
+#[must_use]
+pub fn walk_gate(k: &Constants) -> u32 {
+    let copy_us = k.expert_b as f64 / beside_b_per_us(k);
+    let per_pick = (k.host_us_fixed + k.host_us_per_col) * k.top_k as f64;
+    if per_pick <= 0.0 {
+        return 1;
+    }
+    let gate = ((copy_us + k.card_tail_us) / per_pick).ceil();
+    if !(gate.is_finite() && gate >= 1.0 && gate < f64::from(u32::MAX)) {
+        return u32::MAX;
+    }
+    gate as u32
 }
 
 /// One layer's share of a prompt unit: what leaves the host union, and what
@@ -360,6 +526,13 @@ fn check_constants(k: &Constants) -> Result<(), SplitError> {
     if !(k.card_us_per_col.is_finite() && k.card_us_per_col >= 0.0) {
         return param("card_us_per_col", "finite, 0 or more");
     }
+    if !(k.union_burst_share.is_finite() && k.union_burst_share >= 0.0 && k.union_burst_share < 1.0)
+    {
+        return param("union_burst_share", "finite, 0 or more, under 1");
+    }
+    if !(k.card_tail_us.is_finite() && k.card_tail_us >= 0.0) {
+        return param("card_tail_us", "finite, 0 or more");
+    }
     if k.expert_b == 0 {
         return param("expert_b", "1 or more");
     }
@@ -383,7 +556,8 @@ mod tests {
     /// 50000 B over a lane of 1000 B/µs copies in 50, the card's fixed cost
     /// adds 10, and the host's 10.5 a column against the card's 0.5 puts
     /// m* = (50 + 10)/(10.5 − 0.5) = 6; eight experts routed two a column put
-    /// m_min at 6 × 8/2 = 24. W = 2 is under b/r + f = 60.
+    /// m_min at 6 × 8/2 = 24. W = 2 is under b/r + f = 60. No burst share:
+    /// the beside-union rate is the lane's own, so every number stays exact.
     fn plain() -> Constants {
         Constants {
             lane_b_per_us: 1000.0,
@@ -391,6 +565,8 @@ mod tests {
             host_us_fixed: 2.0,
             card_us_fixed: 10.0,
             card_us_per_col: 0.5,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
             expert_b: 50000,
             experts: 8,
             top_k: 2,
@@ -398,28 +574,32 @@ mod tests {
     }
 
     /// The A6000 plan (a) calibration: 512 routed experts, ten picks a
-    /// column, the lane's rate beside the running union, the no-tile host
-    /// union (W 23.36, c 7.0), the common layer kind's expert bytes and the
-    /// card's per-expert costs (13 + 0.16 a column).
-    /// m* = (3072000/21190 + 13)/(7 − 0.16) = 157.974/6.84 = 23.096,
-    /// m_min = ceil(23.096 × 512/10) = ceil(1182.49) = 1183.
+    /// column, the lane's measured rate, the recalibrated tile-path host
+    /// union (W 19.95, c 3.67), the common layer kind's expert bytes, the
+    /// card's per-expert costs (13 + 0.16 a column), the calibration shape's
+    /// burst share and the fitted route tail.
+    /// beside = 21190 × (1 − 0.381) = 13116.6,
+    /// m* = (3072000/13116.6 + 13)/(3.67 − 0.16) = 247.207/3.51 = 70.429,
+    /// m_min = ceil(70.429 × 51.2) = ceil(3605.98) = 3606.
     fn a6000() -> Constants {
         Constants {
             lane_b_per_us: 21190.0,
-            host_us_per_col: 7.0,
-            host_us_fixed: 23.36,
+            host_us_per_col: 3.67,
+            host_us_fixed: 19.95,
             card_us_fixed: 13.0,
             card_us_per_col: 0.16,
+            union_burst_share: 0.381,
+            card_tail_us: 4690.0,
             expert_b: 3072000,
             experts: 512,
             top_k: 10,
         }
     }
 
-    /// The 3090 plan (a) calibration: the A6000's link and host, the card's
-    /// costs at the design's ×1.25 (16.25 + 0.2 a column).
-    /// m* = (3072000/21190 + 16.25)/(7 − 0.2) = 161.224/6.8 = 23.709,
-    /// m_min = ceil(23.709 × 51.2) = ceil(1213.92) = 1214.
+    /// The 3090 plan (a) calibration: the A6000's link, union and share, the
+    /// card's costs at the design's ×1.25 (16.25 + 0.2 a column).
+    /// m* = (234.207 + 16.25)/(3.67 − 0.2) = 250.457/3.47 = 72.178,
+    /// m_min = ceil(72.178 × 51.2) = ceil(3695.5) = 3696.
     fn a3090() -> Constants {
         Constants {
             card_us_fixed: 16.25,
@@ -428,11 +608,13 @@ mod tests {
         }
     }
 
-    /// The 5090 calibration: the same expert bytes and routing, the pageable
-    /// staging rate that box holds, its fitted host union (W 38.4, c 6.2) and
-    /// the card's costs at the design's ×0.6 (7.8 + 0.096 a column).
-    /// m* = (3072000/21200 + 7.8)/(6.2 − 0.096) = 152.706/6.104 = 25.017,
-    /// m_min = ceil(25.017 × 51.2) = ceil(1280.89) = 1281.
+    /// The 5090 calibration: the same expert bytes and routing at the A6000's
+    /// share, the pageable staging rate that box holds, its fitted host union
+    /// (W 38.4, c 6.2) and the card's costs at the design's ×0.6
+    /// (7.8 + 0.096 a column).
+    /// beside = 21200 × 0.619 = 13122.8,
+    /// m* = (3072000/13122.8 + 7.8)/(6.2 − 0.096) = 241.897/6.104 = 39.629,
+    /// m_min = ceil(39.629 × 51.2) = ceil(2025.01) = 2026.
     fn their_5090() -> Constants {
         Constants {
             lane_b_per_us: 21200.0,
@@ -443,6 +625,7 @@ mod tests {
             expert_b: 3072000,
             experts: 512,
             top_k: 10,
+            ..a6000()
         }
     }
 
@@ -668,10 +851,10 @@ mod tests {
     /// The A6000 shape: 512 experts routed ten a column, 301 on the card and
     /// 211 on the host, a pool of 301 − 148 = 153 (the card's experts past
     /// `mid-p148-s1`'s pinned seed). At 512 columns every expert carries
-    /// 512 × 10/512 = 10 and the unit is under m_min 1183, so the pool admits
+    /// 512 × 10/512 = 10 and the unit is under m_min 3606, so the pool admits
     /// alone: ids 301..454, the other 58 keep 58 × 10 = 580 columns on the
-    /// union. A 512-column unit that routes every host expert 24 times, past
-    /// the floor of 23.096 (211 × 24 = 5064 picks, 56 on the card make
+    /// union. A 512-column unit that routes every host expert 24 times, under
+    /// the floor of 70.429 (211 × 24 = 5064 picks, 56 on the card make
     /// 5120 = 512 × 10), is still under m_min: admit alone, 58 × 24 = 1392
     /// columns kept. At 4096 each carries 80, past the floor, and the unit
     /// clears m_min: the same admits, the ring takes the 58 past them
@@ -700,8 +883,8 @@ mod tests {
 
     /// The 5090 shape: the same 512 experts and routing, 5482/48 → 114 on the
     /// card and 398 on the host, a pool of its 2746 churn slots / 48 → 57. At
-    /// 4096 columns every expert carries 80, past the floor of 25.017, and the
-    /// unit clears m_min 1281: the pool admits ids 114..171 and the ring
+    /// 4096 columns every expert carries 80, past the floor of 39.629, and the
+    /// unit clears m_min 2026: the pool admits ids 114..171 and the ring
     /// streams all 341 host experts past them, 341/398 of the host tier; the
     /// union keeps none (mutants: the rule's inequality reversed, m_min
     /// without the router's top-k).
@@ -717,8 +900,8 @@ mod tests {
     }
 
     /// m* and m_min on all three machines' calibrations, each derived in its
-    /// constants' comment: m_min 1183, 1214 and 1281 (mutants: the card's
-    /// fixed cost subtracted, the mean without the choice set's spread).
+    /// constants' comment (mutants: the card's fixed cost subtracted, the
+    /// mean without the choice set's spread).
     #[test]
     fn m_min_on_all_three_machines() {
         assert!((m_star(&a6000()) - 23.096).abs() < 0.001);
@@ -911,5 +1094,175 @@ mod tests {
             55,
             SplitError::HostDuplicate { id: 5 },
         );
+    }
+
+    /// The lever-2 log's layer-1 shape (4137 columns over 212 listed host
+    /// experts) as a counts vector: the admits' worth uniform from the
+    /// today-floor 25 to the layer's hottest count 52, the union's listed
+    /// experts at the layer's mean count. For the share and the walk tests,
+    /// [derived] from that log's `stat prompt lb` row.
+    fn layer1_shape() -> (Vec<u32>, Vec<u32>) {
+        let mut counts = vec![0u32; 512];
+        for (i, c) in counts[..122].iter_mut().enumerate() {
+            *c = u32::try_from(25 + (i * 27) / 122).expect("a count");
+        }
+        for c in counts[122..334].iter_mut() {
+            *c = 27;
+        }
+        let host: Vec<u32> = (0..334).collect();
+        (counts, host)
+    }
+
+    /// The union's burst share at the calibration shape sits inside its
+    /// measured band, and the beside-union rate is the lane's less it: at
+    /// layer 1, W x 212 over W x 212 + c x 4137 (mutant: the share without
+    /// the per-column term, which saturates it to 1).
+    #[test]
+    fn the_burst_share_sits_in_its_band_and_cuts_the_lane() {
+        let k = a6000();
+        let s = union_burst_share(4137, 212, &k);
+        assert!((0.2..0.6).contains(&s), "the share at layer 1 is {s}");
+        let cold = union_burst_share(0, 0, &k);
+        assert_eq!(cold, 0.0, "nothing listed: no weight reads to lose to");
+        let mut unit = k;
+        unit.union_burst_share = s;
+        assert!((beside_b_per_us(&unit) - k.lane_b_per_us * (1.0 - s)).abs() < 1e-9);
+    }
+
+    /// The stream floor prices its copy beside the union, where it runs: at
+    /// the recalibrated costs and share, m* = 70.429, past the alone-rate
+    /// floor the lane's own rate gives, 46.3 (mutant: the floor at the
+    /// lane's rate alone).
+    #[test]
+    fn the_stream_floor_prices_its_copy_beside_the_union() {
+        let k = a6000();
+        assert!((m_star(&k) - 70.429).abs() < 0.001);
+        let alone = k.expert_b as f64 / k.lane_b_per_us + k.card_us_fixed;
+        assert!(
+            m_star(&k) > alone / (k.host_us_per_col - k.card_us_per_col),
+            "the beside-union rate must price dearer than the lane's own"
+        );
+    }
+
+    /// The walk admits past the balance the beside-union rate stops at: the
+    /// same layer-1 shape at two shares, the lane's own (a copy alone, the
+    /// mutant the rule must not price at) and the calibration's — the dearer
+    /// copies cross the union's saving sooner, so the floor the beside rate
+    /// returns is the higher and admits the fewer.
+    #[test]
+    fn the_walk_stops_sooner_at_the_beside_union_rate() {
+        let (counts, host) = layer1_shape();
+        let mut alone = a6000();
+        alone.union_burst_share = 0.0;
+        let beside = a6000();
+        let fast = admit_walk(&counts, &host, &alone, 4).unwrap();
+        let slow = admit_walk(&counts, &host, &beside, 4).unwrap();
+        assert!(
+            fast.floor < slow.floor,
+            "the alone rate admits past the balance: {} against {}",
+            fast.floor,
+            slow.floor
+        );
+        assert!(fast.backlog >= slow.backlog);
+    }
+
+    /// The card's tail sits at the head of the walk's card chain, and the
+    /// backlog bound never passes the admits there are: the same four hot
+    /// experts — each saving the union 300, each copy 100 — admit three with
+    /// no tail (the chain from 0) and two with a 200 tail, the bound riding
+    /// to the admits both times. A walk that drops the tail admits the
+    /// third expert the tail's weight refused (mutant: the chain from 0
+    /// whatever the tail).
+    #[test]
+    fn the_backlog_bound_fits_the_unions_shadow_past_the_tail() {
+        let k = Constants {
+            lane_b_per_us: 1000.0,
+            host_us_per_col: 10.0,
+            host_us_fixed: 50.0,
+            card_us_fixed: 13.0,
+            card_us_per_col: 0.16,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
+            expert_b: 100000,
+            experts: 8,
+            top_k: 2,
+        };
+        let counts = [30, 30, 30, 30, 0, 0, 0, 0];
+        let host: Vec<u32> = (0..8).collect();
+        let none = admit_walk(&counts, &host, &k, 1).unwrap();
+        assert_eq!(none.floor, 30);
+        assert_eq!(none.backlog, 3, "the bound rides to the admits");
+        let mut tailed = k;
+        tailed.card_tail_us = 200.0;
+        let some = admit_walk(&counts, &host, &tailed, 1).unwrap();
+        assert_eq!(some.floor, 30);
+        assert_eq!(some.backlog, 2, "the tail's weight refuses the third admit");
+        // The shadow's own tail term: at a stop the union the walk leaves
+        // already covers the admits' copies (the chain crossed under it), so
+        // the bound is the admits — the box's stamps read whether it held.
+        assert!(some.backlog <= 2 && none.backlog <= 3);
+    }
+
+    /// A share at or past the whole window, or one no number reads, is
+    /// refused by name: no copy is priced at a rate the union cannot leave
+    /// it (mutant: the range check dropped).
+    #[test]
+    fn a_share_the_union_cannot_leave_is_refused_by_name() {
+        let (counts, host) = layer1_shape();
+        for bad in [1.0, 1.4, f64::NAN, f64::INFINITY, -0.1] {
+            let mut k = a6000();
+            k.union_burst_share = bad;
+            assert_eq!(
+                admit_walk(&counts, &host, &k, 4),
+                Err(SplitError::Param {
+                    name: "union_burst_share",
+                    range: "finite, 0 or more, under 1"
+                }),
+                "the share {bad}"
+            );
+        }
+    }
+
+    /// The fit's form: an expert over W/c costs the union its columns alone,
+    /// one under it costs W — the max form's two branches. Two hot experts
+    /// at 40 columns (over W/c = 5) and six cold at 4 (under it): the colds'
+    /// saving is W each, too little for the card chain's third copy, so the
+    /// walk admits the two hot alone; a sum form (W added to every expert's
+    /// columns too) inflates the colds' saving and buys a third admit
+    /// (mutant: the host cost W + c·m).
+    #[test]
+    fn the_walk_prices_the_max_form_the_fit_selected() {
+        let k = Constants {
+            lane_b_per_us: 1000.0,
+            host_us_per_col: 10.0,
+            host_us_fixed: 50.0,
+            card_us_fixed: 13.0,
+            card_us_per_col: 0.16,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
+            expert_b: 100000,
+            experts: 8,
+            top_k: 2,
+        };
+        let counts = [40, 40, 4, 4, 4, 4, 4, 4];
+        let host: Vec<u32> = (0..8).collect();
+        let plan = admit_walk(&counts, &host, &k, 1).unwrap();
+        // A copy is 100, the union 2 x 400 + 6 x 50 = 1100: the third
+        // admit's 300 passes 250 only under the sum form's 90-a-cold.
+        assert_eq!(plan.floor, 40, "the two hottest alone");
+    }
+
+    /// The walk's gate: a unit narrower than the least width whose picks
+    /// could pay the first admit admits nothing, and the gate is that
+    /// derivation, one copy and the tail over a pick's worth of the union
+    /// (mutant: the gate without the tail).
+    #[test]
+    fn the_walks_gate_covers_the_first_admits_copy_and_tail() {
+        let k = a6000();
+        // (234.2 + 4690) / (19.95 + 3.67) x 10 = 20.85 -> 21.
+        assert_eq!(walk_gate(&k), 21);
+        let mut no_tail = k;
+        no_tail.card_tail_us = 0.0;
+        assert_eq!(walk_gate(&no_tail), 1);
     }
 }
