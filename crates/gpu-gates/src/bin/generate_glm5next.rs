@@ -226,13 +226,15 @@ mod cli {
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
-        PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
+        MTP_WIDTH, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy,
+        STEP_STATS,
     };
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers};
     use runtime::layer::hosted;
+    use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
     use runtime::{Advance, Committed, Draft, PassSink, Stop, Target, Verify, Want};
 
     const ACTS_ON: &[&str] = &[
@@ -243,6 +245,7 @@ mod cli {
         R8,
         ROUTE_TRACE,
         DRAFT,
+        MTP_WIDTH,
         RESIDENCY,
         STEP_STATS,
         PREFILL_GROUP,
@@ -461,6 +464,13 @@ mod cli {
                 .into());
             }
         };
+        if !drafted && levers.mtp_width().is_some() {
+            return Err(
+                "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; this run drafts \
+                 nothing"
+                    .into(),
+            );
+        }
         if drafted {
             if n_gen < 2 {
                 return Err(
@@ -736,7 +746,7 @@ mod cli {
                 logits: has("--logits"),
                 pair,
             };
-            return drafted_run(&mut s, &arm);
+            return drafted_run(&mut s, &arm, WidthMode::of(levers.mtp_width())?);
         }
         if stats {
             bloomery_gpu_glm5next::set_prompt_stats(s.model_mut(), true)?;
@@ -1107,9 +1117,12 @@ mod cli {
     /// store walked over its units, then windows until `-n` tokens are out,
     /// every kept token the target's own argmax; the lines the module doc
     /// names, the `residency pass` records last.
-    fn drafted_run(s: &mut Session<Body>, a: &Arm<'_>) -> Result<(), GateError> {
+    fn drafted_run(s: &mut Session<Body>, a: &Arm<'_>, width: WidthMode) -> Result<(), GateError> {
         let draft = MtpDraft::open(s.model(), a.prefill, StepMode::Eager)?;
-        let mut spec = s.with_draft::<MtpDraft<Body>, VERIFY_ROWS>(draft, &mut PairCapture)?;
+        let mut spec = s.with_draft::<Choosing<MtpDraft<Body>>, VERIFY_ROWS>(
+            draft.choosing(width)?,
+            &mut PairCapture,
+        )?;
         fed(a.ids);
         let t_feed = Instant::now();
         // The server's cut (`--last-step`): the prompt less its last id

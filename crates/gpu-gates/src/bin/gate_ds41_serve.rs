@@ -183,7 +183,18 @@
 //!   its generated ids keeps no more than its shared prefix less the draft's
 //!   window, and more than none; a long conversation put back from the prompt
 //!   cache after another one keeps the same bound;
-//! - `/metrics`' `spec_decode_num_draft_tokens_total` is above 0.
+//! - `/metrics`' `spec_decode_num_draft_tokens_total` is above 0;
+//! - the width chooser ([`width_cost`], a server of its own under
+//!   `BLOOMERY_MTP_WIDTH=cost`): the probe's ids are still the plain run's,
+//!   the draft's counts carried (kept proposals among them), and the `mtp
+//!   width` record a one-id request prints is the chooser's own — its windows
+//!   its width-1 passes, `E` inside the pair's rows, plain steps among the
+//!   passes (the warm-up measures both widths).
+//!
+//! The draft's servers above and the `--place bp` one run
+//! `BLOOMERY_MTP_WIDTH=fixed`, every proposal verified: their clauses hold
+//! counts and ids across runs, which a chooser its clock drives does not
+//! promise.
 //!
 //! With `--place bp`, under `BLOOMERY_DRAFT=dspark` (refused otherwise, and
 //! beside `--plain`), the server runs plan (b′) — plan (a) on the A6000, the
@@ -1533,6 +1544,74 @@ mod gate {
         Ok(ok)
     }
 
+    /// The width chooser's server (the module header): the DSpark draft of
+    /// this process's `BLOOMERY_DRAFT=dspark` under
+    /// `BLOOMERY_MTP_WIDTH=cost`, the probe's prompt (`probe`, whose greedy
+    /// continuation the fixed window both keeps and rejects proposals of)
+    /// then a one-id request — the chooser's `mtp width` record prints at the
+    /// slot's next prompt call — holding: the probe's ids the plain server's
+    /// (`plain_probe`: the chooser changes which rows a pass runs, never a
+    /// token), the draft's counts carried, and the record the chooser's own
+    /// (its windows its width-1 passes, `E` inside the pair's rows, plain
+    /// steps among the passes: the warm-up measures both widths).
+    fn width_cost(a: &Args, probe: &[u32], plain_probe: &[u32]) -> Result<bool, GateError> {
+        let dir = a.dir.join("width-cost");
+        std::fs::create_dir_all(&dir)?;
+        let err_log = dir.join("server.err");
+        let mut cmd = std::process::Command::new(Served::exe()?);
+        cmd.env(bloomery_levers::MTP_WIDTH, "cost");
+        let mut served = Served::spawn_cmd(cmd, &SERVER_ARGS, &dir)?;
+        println!("width-cost server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let (ids, _, t) = drafted_run(&url, "width-cost probe", probe, false)?;
+        check(
+            &mut ok,
+            "width_cost_ids_are_the_plain_servers",
+            ids.len() == DRAFT_PREDICT && ids == plain_probe,
+        );
+        let (n, acc) = (as_count(&t["draft_n"]), as_count(&t["draft_n_accepted"]));
+        check(
+            &mut ok,
+            "width_cost_draft_counts_carried",
+            n.zip(acc)
+                .is_some_and(|(n, acc)| n > 0 && acc > 0 && acc <= n),
+        );
+        let flush = json!({
+            "prompt": a.prompt, "n_predict": 1, "temperature": 0, "return_tokens": true,
+        });
+        let (st, _) = curl(&url("/completion"), Some(&flush), false)?;
+        check(&mut ok, "width_cost_flush_ok", st == 200);
+        let records = server_log(&err_log, record::BLOOMERY_SERVE_DS41)?.all(&record::MTP_WIDTH)?;
+        println!("width-cost mtp width records: {records:?}");
+        let Some(rec) = records.first() else {
+            check(&mut ok, "width_cost_record_is_the_choosers", false);
+            println!("width-cost server stopped: {}", served.stop()?);
+            return Ok(ok);
+        };
+        let windows = rec.u64("windows")?;
+        let widths: Vec<u64> = rec
+            .csv("widths")?
+            .iter()
+            .map(|v| v.parse::<u64>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("mtp width widths: {e}"))?;
+        let e = rec.f64("e")?;
+        println!("width-cost record windows={windows} widths={widths:?} e={e:.3}");
+        check(
+            &mut ok,
+            "width_cost_record_is_the_choosers",
+            widths.len() == 2
+                && windows > 0
+                && windows == widths[1]
+                && widths[0] > 0
+                && (1.0..=2.0).contains(&e),
+        );
+        println!("width-cost server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// `--need-path`: the main server (`SERVER_ARGS`) and (p4)'s save
     /// without `--slot-save-path` on it, nothing else: one load.
     fn need_path(a: &Args) -> Result<(), GateError> {
@@ -2011,7 +2090,11 @@ mod gate {
         );
         std::fs::create_dir_all(&a.dir)?;
         let err_log = a.dir.join("server.err");
-        let mut served = Served::spawn(&SERVER_ARGS, &a.dir)?;
+        // The fixed window (the module header): this arm holds draft counts
+        // and the plain server's ids.
+        let mut cmd = std::process::Command::new(Served::exe()?);
+        cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
+        let mut served = Served::spawn_cmd(cmd, &SERVER_ARGS, &a.dir)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
@@ -2047,7 +2130,8 @@ mod gate {
             "draft_timings_carry_the_drafts_counts",
             n.zip(acc).is_some_and(|(n, acc)| n > 0 && acc <= n),
         );
-        let (probe, _, t) = drafted_run(&url, "draft probe", &probe_prompt(&url)?, false)?;
+        let probe_ids = probe_prompt(&url)?;
+        let (probe, _, t) = drafted_run(&url, "draft probe", &probe_ids, false)?;
         println!("plain probe      {plain_probe:?}");
         println!("probe timings {t}");
         check(
@@ -2081,6 +2165,7 @@ mod gate {
         );
 
         println!("server stopped: {}", served.stop()?);
+        ok &= width_cost(a, &probe_ids, &plain_probe)?;
         if ok {
             println!("weekly-gpu-ds41-serve draft: PASS");
             Ok(())
@@ -2248,7 +2333,10 @@ mod gate {
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served::exe()?;
         let err_log = a.dir.join("server.err");
-        let mut served = Served::spawn(&BP_SERVER_ARGS, &a.dir)?;
+        // The fixed window (the module header).
+        let mut cmd = std::process::Command::new(Served::exe()?);
+        cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
+        let mut served = Served::spawn_cmd(cmd, &BP_SERVER_ARGS, &a.dir)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");

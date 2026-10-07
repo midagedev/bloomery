@@ -2135,11 +2135,14 @@ pub static MTP_SUMMARY: Kind = Kind {
     name: "mtp_summary",
     head: "mtp summary",
     doc: "BLOOMERY_DRAFT=mtp: the windows' proposals and the rows each kept (a count a kept \
-          length, 1 to the window's rows: 4 for Qwen3.8, 2 for GLM-5.3), the positions and \
-          passes over the run, and the kept passes' positions per second.",
+          length, 1 to the window's rows: 4 for Qwen3.8, 2 for GLM-5.3), every pass by the ids \
+          it verified (one count a width, 0 a plain step; the draft's whole width on every pass \
+          under `BLOOMERY_MTP_WIDTH=fixed`), the positions and passes over the run, and the \
+          kept passes' positions per second.",
     parts: &[
         key("proposals", U64, ""),
         key("kept", List, "windows"),
+        key("widths", List, ""),
         key("positions", U64, "positions"),
         key("passes", U64, ""),
         key("tok/s(positions)", F64(2), "tok/s"),
@@ -2153,13 +2156,34 @@ pub static MTP_WINDOW: Kind = Kind {
     doc: "BLOOMERY_MTP_WINDOWS: one drafted window, after the arm's mtp summary: its pass (the \
           time pass row's number), the target's position before its verify, the proposal's ids, \
           each one's probability among the draft head's rows (as the chain read it back, in the \
-          proposal's order) and how many of the ids the target kept.",
+          proposal's order), how many of those ids the pass verified (the width chooser's \
+          cut; the whole proposal under `BLOOMERY_MTP_WIDTH=fixed`) and how many of them the \
+          target kept.",
     parts: &[
         key("window", U64, ""),
         key("pos", U64, "positions"),
         key("ids", Csv, ""),
         key("p", Csv, ""),
+        key("width", U64, ""),
         key("accepted", U64, ""),
+    ],
+};
+
+/// A drafting server's width chooser over one request.
+pub static MTP_WIDTH: Kind = Kind {
+    name: "mtp_width",
+    head: "mtp width",
+    doc: "BLOOMERY_MTP_WIDTH=cost: the width chooser's passes over one request of a drafting \
+          server, printed at the slot's next prompt call: the passes that verified a proposal \
+          (windows), the windows by the rows they kept (one count a kept length, 1 to the \
+          draft's width + 1), every pass by the ids it verified (one count a width, 0 the plain \
+          step: the gate closed, the warm-up's or a probe's plain turn, a shadow's pass) and E, \
+          the mean rows a window kept.",
+    parts: &[
+        key("windows", U64, ""),
+        key("kept", Csv, "windows"),
+        key("widths", Csv, "passes"),
+        key("e", F64(3), ""),
     ],
 };
 
@@ -2693,6 +2717,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
+    &MTP_WIDTH,
     &SLOTS_ROUND,
 ];
 
@@ -2711,6 +2736,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &SLOTS_ROUND,
+    &MTP_WIDTH,
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: a `--hf`
@@ -2758,6 +2784,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
     &SLOTS_ROUND,
+    &MTP_WIDTH,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.

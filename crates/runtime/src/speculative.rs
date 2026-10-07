@@ -77,6 +77,33 @@ pub trait Draft<T: Verify> {
     /// and the pass panics by name.
     fn propose(&mut self, t: &mut T, last: u32, out: &mut [u32]) -> Result<usize, T::Error>;
 
+    /// [`Draft::propose`] with each proposed id's own probability under the
+    /// draft, written to the front of `p` (`out.len()` long at least) in the
+    /// proposal's order: the id the draft most believes in and how much. A
+    /// draft with no probabilities of its own reports certainty, `p` every
+    /// 1 — the caller's calibration then carries the estimate alone. The
+    /// default runs [`Draft::propose`] and reports certainty.
+    fn propose_p(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        out: &mut [u32],
+        p: &mut [f32],
+    ) -> Result<usize, T::Error> {
+        let n = self.propose(t, last, out)?;
+        if let Some(p) = p.get_mut(..n) {
+            p.fill(1.0);
+        }
+        Ok(n)
+    }
+
+    /// The last proposal was never verified and never will be (the width
+    /// chooser's shadow: scored against the target's own tokens only): a
+    /// draft that kept anything of it — a window record, a pending
+    /// probability — drops it here, so its next accept reads the window
+    /// that ran. The default keeps nothing, so does nothing.
+    fn unproposed(&mut self) {}
+
     /// The verify of `rows` keeps its first `accepted` rows; `out` holds one
     /// id a row, the id the pass took at each kept row ([`Pick`]: the
     /// argmax on a greedy pass, the draw on a sampled one) and the argmax
@@ -95,8 +122,8 @@ pub trait Draft<T: Verify> {
     /// `next`.
     fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error>;
 
-    /// [`Draft::stepped`] of a pass whose proposal was held back (a closed
-    /// [`crate::Gated`]): the draft still takes in the position — a window it
+    /// [`Draft::stepped`] of a pass whose proposal was held back (the width
+    /// chooser's cut of 0): the draft still takes in the position — a window it
     /// keeps cannot be rebuilt — but may queue the work, as long as its next
     /// [`Draft::propose`] sees every position before it. The default is
     /// [`Draft::stepped`].

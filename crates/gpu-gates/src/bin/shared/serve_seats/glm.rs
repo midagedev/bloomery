@@ -227,6 +227,7 @@ use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes, host_avail
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 use runtime::seqstate::Why;
+use runtime::width::Mode as WidthMode;
 use serve::flag::number;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
@@ -271,6 +272,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::R8,
     bloomery_levers::PIN_MAIN,
     bloomery_levers::DRAFT,
+    bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
 ];
@@ -713,6 +715,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 /// carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
+    let width = WidthMode::of(levers.mtp_width())?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     let a = parse_args(args)?;
     // The census the placement resolves against, read once: `--place` as
@@ -799,6 +802,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     });
     let lever = residency_of(&levers, a.prefill, unset.residency)?;
     let draft_off = draft_of(&levers, at_ctx, unset.draft)?;
+    if let (Some(why), Some(_)) = (&draft_off, levers.mtp_width()) {
+        return Err(format!(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
+             nothing ({why})"
+        )
+        .into());
+    }
     let model = model_props(&split, &inputs.model);
     let nextn = match draft_off {
         None => Some(NextnInputs::read(&inputs)?),
@@ -926,6 +936,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_bytes,
         residency,
         stats: levers.step_stats(),
+        width,
     };
     let engine = SeatEngine::spawn(
         move || Glm::open(open),
@@ -990,6 +1001,9 @@ struct SeatArgs {
     /// Whether the seat counts its rounds of several slots
     /// (`BLOOMERY_STEP_STATS`, the binary's `main` parsed).
     stats: bool,
+    /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
+    /// chooser's (`cost`) or the draft's own (`fixed`).
+    width: WidthMode,
 }
 
 /// The GLM session on the engine thread: the session over the model, the
@@ -1072,7 +1086,7 @@ impl Glm {
         s.add_slots(a.slots)?;
         let drafted = match a.draft_off {
             Some(_) => SlotDrafts::none(),
-            None => SlotDrafts::open(&mut s, a.slots, &mut PairCapture, |m| {
+            None => SlotDrafts::open(&mut s, a.slots, a.width, &mut PairCapture, |m| {
                 MtpDraft::open(m, prefill, StepMode::Eager)
             })?,
         };
@@ -1122,7 +1136,7 @@ impl Glm {
                 .specs_mut()
                 .get(r.slot)
                 .and_then(Option::as_ref)
-                .is_some_and(|spec| spec.draft().skipping());
+                .is_some_and(|spec| spec.draft().draft().skipping());
             if skips && !self.drafted.is_off(r.slot) {
                 self.drafted.turn_off(r.slot, SKIP_OFF_WHY)?;
             }

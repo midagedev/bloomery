@@ -31,7 +31,7 @@ use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
     HOST_LOCK, HOST_POPULATE, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
-    MTP_HEAD_ROWS, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
+    MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
     PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS,
     THREADS,
 };
@@ -778,6 +778,13 @@ impl Levers {
     #[must_use]
     pub fn mtp_windows(&self) -> bool {
         self.flag(MTP_WINDOWS)
+    }
+
+    /// `BLOOMERY_MTP_WIDTH` as set, `cost` or `fixed`; `None` unset, which a
+    /// run that drafts reads as `cost` (`runtime::width::Mode::of`).
+    #[must_use]
+    pub fn mtp_width(&self) -> Option<&'static str> {
+        self.word(MTP_WIDTH)
     }
 
     /// `BLOOMERY_ROUTE_TRACE`: the route trace's new directory; `None` unset

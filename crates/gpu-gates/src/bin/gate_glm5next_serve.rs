@@ -203,7 +203,16 @@
 //!   cut (`--last-step`), so both run the same batches, count the rule's
 //!   steps the same and land their flips at the same passes; through which
 //!   pass the first landing sits is printed, not held (the reset clause
-//!   above holds the seed's determinism).
+//!   above holds the seed's determinism);
+//! - the width chooser ([`width_cost`], a load of its own under
+//!   `BLOOMERY_MTP_WIDTH=cost`, the arm's levers otherwise): the prompt's
+//!   greedy ids are the fixed window's, the draft's counts carried, and the
+//!   `mtp width` record a one-id request prints is the chooser's own — its
+//!   windows its width-1 passes, `E` inside the pair's rows, plain steps
+//!   among the passes (the warm-up measures both widths). Every other
+//!   drafted load this gate starts pins `BLOOMERY_MTP_WIDTH=fixed`: their
+//!   clauses hold counts and passes equal across two runs, which a chooser
+//!   its clock drives does not promise.
 //!
 //! A request that extends the held sequence (the prompt and the ids it
 //! generated) is printed with its `cache_n` and the draft's `mtp prompt`
@@ -263,6 +272,7 @@ mod gate {
         bloomery_levers::R8,
         bloomery_levers::PIN_MAIN,
         bloomery_levers::DRAFT,
+        bloomery_levers::MTP_WIDTH,
         bloomery_levers::RESIDENCY,
         bloomery_levers::STEP_STATS,
     ];
@@ -366,7 +376,8 @@ mod gate {
 
     /// The levers a process runs under: `BLOOMERY_DRAFT` and
     /// `BLOOMERY_RESIDENCY` set (both, on the server and the CLI alike), or
-    /// both unset ([`UNSET`]).
+    /// both unset ([`UNSET`]); a drafted load also names its width,
+    /// `BLOOMERY_MTP_WIDTH=fixed` (the module header).
     type Levers = &'static [(&'static str, &'static str)];
     /// The plain arm's server and CLI.
     const PLAIN: Levers = &[
@@ -377,6 +388,7 @@ mod gate {
     const DRAFT_ONLY: Levers = &[
         (bloomery_levers::DRAFT, "mtp"),
         (bloomery_levers::RESIDENCY, "off"),
+        (bloomery_levers::MTP_WIDTH, "fixed"),
     ];
     /// The drafted arm's slots server: the draft with no residency (the bits
     /// need no expert moving) and the seat's rounds counted, each a `slots
@@ -385,11 +397,13 @@ mod gate {
         (bloomery_levers::DRAFT, "mtp"),
         (bloomery_levers::RESIDENCY, "off"),
         (bloomery_levers::STEP_STATS, "1"),
+        (bloomery_levers::MTP_WIDTH, "fixed"),
     ];
     /// The drafted arm's server and CLI.
     const DRAFTED: Levers = &[
         (bloomery_levers::DRAFT, "mtp"),
         (bloomery_levers::RESIDENCY, RESIDENCY_WORD),
+        (bloomery_levers::MTP_WIDTH, "fixed"),
     ];
     /// Both levers unset: the seat's own rule.
     const UNSET: Levers = &[];
@@ -2306,6 +2320,80 @@ mod gate {
         Ok(ok)
     }
 
+    /// The width chooser's server (the module header): the drafted arm's
+    /// own load with `BLOOMERY_MTP_WIDTH=cost`, one greedy request of the
+    /// arm's ids then a one-id flush — the chooser's `mtp width` record
+    /// prints at the slot's next prompt call — holding: the ids the fixed
+    /// window's (the chooser changes which rows a pass runs, never a
+    /// token), the draft counts carried, and the record the chooser's own
+    /// (its windows the widths above 0 it names, E inside the pair's rows,
+    /// the plain step's width among the passes: the warm-up rotation
+    /// measured both widths of the one-id draft).
+    fn width_cost(dir: &Path, ids: &[u32], fixed: &[u32]) -> Result<bool, GateError> {
+        let own = dir.join("width-cost");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let levers: Levers = &[
+            (bloomery_levers::DRAFT, "mtp"),
+            (bloomery_levers::RESIDENCY, RESIDENCY_WORD),
+            (bloomery_levers::MTP_WIDTH, "cost"),
+        ];
+        let mut served = Served::spawn(&SERVER_ARGS, &own, levers)?;
+        println!("width-cost server pid {}", served.child.id());
+        let addr = served.address(&err_log)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let c = greedy(&url, ids, N_PREDICT, false)?;
+        let got = ids_of(&c["tokens"]);
+        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        let t = &c["timings"];
+        println!(
+            "width-cost tokens {got:?} stop_type={stop} draft_n={} draft_n_accepted={}",
+            t["draft_n"], t["draft_n_accepted"]
+        );
+        check(
+            &mut ok,
+            "width_cost_ids_are_the_fixed_windows",
+            !got.is_empty() && agree(&got, &stop, fixed),
+        );
+        check(
+            &mut ok,
+            "width_cost_draft_counts_carried",
+            t["draft_n"].as_u64().is_some_and(|n| n > 0)
+                && t["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
+        );
+        let _ = greedy(&url, ids, 1, false)?;
+        let records = seat_log(&lines_from(&err_log, 0)?).all(&record::MTP_WIDTH)?;
+        println!("width-cost mtp width records: {records:?}");
+        let Some(rec) = records.first() else {
+            check(&mut ok, "width_cost_record_is_the_choosers", false);
+            check(&mut ok, "width_cost_stepped_plainly", false);
+            println!("width-cost server stopped: {}", served.stop()?);
+            return Ok(ok);
+        };
+        let windows = rec.u64("windows")?;
+        let widths: Vec<u64> = rec
+            .csv("widths")?
+            .iter()
+            .map(|v| v.parse::<u64>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("mtp width widths: {e}"))?;
+        let e = rec.f64("e")?;
+        println!("width-cost record windows={windows} widths={widths:?} e={e:.3}");
+        check(
+            &mut ok,
+            "width_cost_record_is_the_choosers",
+            windows > 0 && windows == widths[1] && (1.0..=2.0).contains(&e),
+        );
+        check(
+            &mut ok,
+            "width_cost_stepped_plainly",
+            widths.first().is_some_and(|&n| n > 0),
+        );
+        println!("width-cost server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// The drafted arm (the module header).
     fn drafted(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let bytes = nextn_plan_bytes(levers)?;
@@ -2432,6 +2520,7 @@ mod gate {
         ok &= resume_under_residency(&url, &err_log)?;
 
         println!("drafted server stopped: {}", served.stop()?);
+        ok &= width_cost(dir, &ids, &first)?;
         ok &= split_refused(dir)?;
         ok &= slots_flow_together(dir)?;
 

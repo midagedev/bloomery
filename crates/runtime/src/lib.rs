@@ -4,9 +4,9 @@
 //! step, and — where the model can — a pass of several rows ([`Verify`]) that
 //! verifies a draft's proposal. How a generation moves on is an [`Advance`]:
 //! [`Plain`] steps once a pass, [`Speculative`] runs a [`Draft`]'s proposal
-//! through a verify and keeps the rows the target agrees with, and [`Gated`]
-//! lets a draft's verify passes run only while they pay. [`generate`] is the
-//! one loop over both, until the [`Stop`] rule ends it.
+//! through a verify and keeps the rows the target agrees with, and
+//! [`width::Choosing`] verifies each proposal at the width that pays.
+//! [`generate`] is the one loop over both, until the [`Stop`] rule ends it.
 //!
 //! A pass takes each row's id by a [`Pick`]: the target's argmax
 //! ([`Argmax`], the greedy pass), or a draw from the row's logits ([`Sample`]
@@ -24,7 +24,6 @@
 //! that pin it must agree on.
 
 pub mod combine;
-pub mod gate;
 pub mod hc_gated;
 pub mod layer;
 mod lookup;
@@ -36,15 +35,16 @@ pub mod state;
 mod stop;
 pub mod stores;
 pub mod swaprule;
+pub mod width;
 pub mod words;
 
-pub use gate::Gated;
 pub use lookup::Lookup;
 pub use speculative::{
     Argmax, Draft, NotBuilt, Pick, Program, RowLogits, Sample, Speculative, TapNeed, Tapped, Width,
     Widths, Window, accepted_rows, program,
 };
 pub use stop::{NoTokens, Stop, StopReason};
+pub use width::{Choosing, Chosen, Rule, Tally, WidthError};
 
 use std::time::{Duration, Instant};
 

@@ -123,6 +123,18 @@
 //!   before it listens; a context search that ignores the slot count loads
 //!   a plan of one sequence and makes the second slot's load fail (the
 //!   server never listens) or (v4) red.
+//! - the width chooser's clause ([`width_cost`], a server of its own under
+//!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
+//!   `BLOOMERY_MTP_WIDTH=cost`): one greedy request then a one-id flush,
+//!   its ids the plain run's, its draft counts carried, and the chooser's
+//!   `mtp width` record its own aggregate — windows the widths above 0,
+//!   E inside the window's rows, a width below the draft's own among the
+//!   passes. Every other drafted server this gate starts pins
+//!   `BLOOMERY_MTP_WIDTH=fixed`: the clauses that compare draft counts
+//!   across two runs of a server hold the fixed window (a chooser its
+//!   clock drives promises no count twice); the seat under its own
+//!   defaults (the slots clause's second server, no lever set) drafts with
+//!   the chooser, as the user's server now does.
 //! - the drafted rounds clauses ([`slots_drafted_rounds`], a server of its
 //!   own under `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
 //!   `BLOOMERY_STEP_STATS=1`): two greedy drafted streamed requests of the
@@ -284,6 +296,7 @@ mod gate {
         bloomery_levers::DRAFT,
         bloomery_levers::MTP_HEAD_ROWS,
         bloomery_levers::MTP_DRAFT,
+        bloomery_levers::MTP_WIDTH,
         bloomery_levers::RESIDENCY,
     ];
 
@@ -1847,6 +1860,9 @@ mod gate {
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env(bloomery_levers::RESIDENCY, "off")
+            // The fixed window: the clause holds draft counts equal across
+            // two runs, which a clock-driven chooser does not promise.
+            .env(bloomery_levers::MTP_WIDTH, "fixed")
             .env(bloomery_levers::STEP_STATS, "1");
         let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
         println!("slots server pid {}", served.child.id());
@@ -2121,6 +2137,117 @@ mod gate {
         Ok(*ok)
     }
 
+    /// The width chooser's own server (the module header): the draft on,
+    /// the residency off and `BLOOMERY_MTP_WIDTH=cost`, one greedy request
+    /// of the gate's prompt then a one-id flush — the chooser's `mtp width`
+    /// record prints at the slot's next prompt call — holding: the request's
+    /// ids the plain run's (the chooser changes which rows a pass runs,
+    /// never a token), its draft counts carried, and the record the
+    /// chooser's own: its windows the widths above 0 it names, E inside the
+    /// window's rows, and at least one pass of a width below the draft's
+    /// own (the warm-up rotation's measurements, on this server too). The
+    /// per-window width is the CLI gate's clause (its window records); this
+    /// server's records are the chooser's aggregates.
+    fn width_cost(dir: &Path, prompt: &str, reference: &[u32]) -> Result<bool, GateError> {
+        let own = dir.join("width-cost");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::MTP_WIDTH, "cost");
+        let mut served = Served38::spawn_with(&SERVER_ARGS, &own, &mut cmd)?;
+        println!("width-cost server pid {}", served.child.id());
+        let addr = match served.address(&err_log, POLLS, POLL) {
+            Ok(a) => a,
+            Err(e) => {
+                println!(
+                    "width-cost: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                let _ = served.stop();
+                for name in [
+                    "width_cost_ids_are_the_plain_runs",
+                    "width_cost_draft_counts_carried",
+                    "width_cost_record_is_the_choosers",
+                    "width_cost_cut_a_window",
+                ] {
+                    check(&mut false, name, false);
+                }
+                return Ok(false);
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let completion = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
+        let c = json_of("/completion", st, &body)?;
+        let ids = ids_of(&c["tokens"]);
+        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        println!("width-cost tokens {ids:?} stop_type={stop}");
+        check(
+            &mut ok,
+            "width_cost_ids_are_the_plain_runs",
+            agree(&ids, &stop, reference),
+        );
+        let d = &c["timings"];
+        check(
+            &mut ok,
+            "width_cost_draft_counts_carried",
+            d["draft_n"].as_u64().is_some_and(|n| n > 0)
+                && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
+        );
+        // The flush: the chooser's record of the request above prints at
+        // this prompt call.
+        let flush = json!({
+            "prompt": prompt, "n_predict": 1, "temperature": 0, "return_tokens": true,
+        });
+        let (st, _) = curl(&url("/completion"), Some(&flush), false)?;
+        check(&mut ok, "width_cost_flush_ok", st == 200);
+        let records = seat_log(&err_log)?.all(&record::MTP_WIDTH)?;
+        println!("width-cost {records:?}");
+        let Some(rec) = records.first() else {
+            check(&mut ok, "width_cost_record_is_the_choosers", false);
+            check(&mut ok, "width_cost_cut_a_window", false);
+            println!("width-cost server stopped: {}", served.stop()?);
+            return Ok(ok);
+        };
+        let windows = rec.u64("windows")?;
+        let widths: Vec<u64> = rec
+            .csv("widths")?
+            .iter()
+            .map(|v| v.parse::<u64>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("mtp width widths: {e}"))?;
+        let verified: u64 = widths
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(k, &n)| n * k as u64)
+            .sum();
+        let e = rec.f64("e")?;
+        println!(
+            "width-cost record windows={windows} widths={widths:?} e={e:.3} (verified \
+             {verified} positions)"
+        );
+        check(
+            &mut ok,
+            "width_cost_record_is_the_choosers",
+            windows > 0
+                && windows == widths.iter().skip(1).sum::<u64>()
+                && (1.0..=4.0).contains(&e),
+        );
+        check(
+            &mut ok,
+            "width_cost_cut_a_window",
+            widths.iter().take(3).any(|&n| n > 0),
+        );
+        println!("width-cost server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// The `cache` clause on a server of its own with the draft the main
     /// server did not run (`drafted`), the residency off.
     fn cache_other(dir: &Path, drafted: bool) -> Result<bool, GateError> {
@@ -2131,9 +2258,14 @@ mod gate {
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, if drafted { "mtp" } else { "off" })
             .env(bloomery_levers::RESIDENCY, "off");
-        if !drafted {
+        if drafted {
+            // The fixed window, as the main server's drafted clauses: the
+            // clause holds draft counts across runs.
+            cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
+        } else {
             cmd.env_remove(bloomery_levers::MTP_HEAD_ROWS)
-                .env_remove(bloomery_levers::MTP_DRAFT);
+                .env_remove(bloomery_levers::MTP_DRAFT)
+                .env_remove(bloomery_levers::MTP_WIDTH);
         }
         let mut served = Served38::spawn_with(&SERVER_ARGS, &own, &mut cmd)?;
         println!("cache {label} server pid {}", served.child.id());
@@ -2186,6 +2318,9 @@ mod gate {
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env(bloomery_levers::RESIDENCY, "off")
+            // The fixed window: the clause holds draft counts equal across
+            // two runs, which a clock-driven chooser does not promise.
+            .env(bloomery_levers::MTP_WIDTH, "fixed")
             .env(bloomery_levers::STEP_STATS, "1");
         let mut served = Served38::spawn_with(&args, &d, &mut cmd)?;
         println!("slots-drafted server pid {}", served.child.id());
@@ -2903,16 +3038,17 @@ mod gate {
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served38::exe()?;
         let err_log = a.dir.join("server.err");
+        let drafted = levers.draft() == Some("mtp");
         let mut cmd = Command::new(&exe);
-        cmd.env(
-            bloomery_levers::DRAFT,
-            if levers.draft() == Some("mtp") {
-                "mtp"
-            } else {
-                "off"
-            },
-        )
-        .env(bloomery_levers::RESIDENCY, "off");
+        cmd.env(bloomery_levers::DRAFT, if drafted { "mtp" } else { "off" })
+            .env(bloomery_levers::RESIDENCY, "off");
+        if drafted {
+            // The fixed window (the module header): this server's drafted
+            // clauses hold counts across two runs of it.
+            cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
+        } else {
+            cmd.env_remove(bloomery_levers::MTP_WIDTH);
+        }
         let mut served = Served38::spawn_with(&SERVER_ARGS, &a.dir, &mut cmd)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
@@ -3086,6 +3222,9 @@ mod gate {
         // The drafted rounds run as one pass (the module header): its own
         // server, the draft on, the residency off, the round records on.
         ok &= slots_drafted_rounds(&a.dir)?;
+        // The width chooser's server (the module header): the draft on, the
+        // residency off, `BLOOMERY_MTP_WIDTH=cost`.
+        ok &= width_cost(&a.dir, &a.prompt, &reference)?;
         // The plain rounds of a load that drafts nothing run as one pass
         // (the module header): its own server, sampled requests that step,
         // the round records on.
