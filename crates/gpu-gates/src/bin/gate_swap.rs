@@ -173,6 +173,14 @@
 //!   expert whose count is under the new floor, and a floor set with no call
 //!   open is refused by name (its mutant: the pick reads the floor the call
 //!   began with, not the one set since).
+//! - s6 landing batches: a pick of six admits reports a live batch (no event,
+//!   the layer's places with every victim and every admit `HOST`) and landing
+//!   batches of a third of the admits in ascending slot order, each row
+//!   naming its own admits at their slots alone; with the staging thread held
+//!   at the fourth job, the first batch's event alone lands its slots and
+//!   leaves the later batches' uncopied, and every batch's event lands all
+//!   (its mutants: every batch's event recorded after the last copy; each
+//!   batch's first admit in the previous batch's row).
 //!
 //! Evicted (a host set populated and not locked, whose pages the page cache
 //! lets go): a victim not host-resident when the machine decides is read
@@ -206,6 +214,7 @@ mod gate {
         CallCfg, CallPick, CallReport, Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState,
         SwapMachine, SwapSource, Transform, set_leak_sink,
     };
+    use bloomery_gpu::host::xstream::land_batch_size;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
@@ -412,6 +421,62 @@ mod gate {
         /// Every expert host-resident from the load (a churn pool the load's
         /// host set holds), bar the stuck ones.
         all_resident: bool,
+        /// Holds the staging thread inside the source from a job on.
+        hold: Option<Arc<SourceHold>>,
+    }
+
+    /// A gate-side hold on the staging thread, which stages a call's jobs in
+    /// order: once armed, the source blocks reading the part 0 of every job
+    /// from the `allow`-th on (counted from the arming) until it is opened,
+    /// so the copies of the jobs before it land and the later ones stay
+    /// behind their staging word.
+    #[derive(Debug, Default)]
+    struct SourceHold {
+        armed: AtomicBool,
+        open: AtomicBool,
+        allow: std::sync::atomic::AtomicUsize,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SourceHold {
+        /// Let `allow` jobs through from here, hold the rest.
+        fn arm(&self, allow: usize) {
+            self.seen.store(0, Ordering::Release);
+            self.allow.store(allow, Ordering::Release);
+            self.open.store(false, Ordering::Release);
+            self.armed.store(true, Ordering::Release);
+        }
+
+        fn release(&self) {
+            self.open.store(true, Ordering::Release);
+        }
+
+        /// Jobs the staging thread has taken since the arming.
+        fn taken(&self) -> usize {
+            self.seen.load(Ordering::Acquire)
+        }
+
+        /// The source's side: called with each job's part 0.
+        fn pass(&self) {
+            if !self.armed.load(Ordering::Acquire) {
+                return;
+            }
+            let k = self.seen.fetch_add(1, Ordering::AcqRel);
+            if k >= self.allow.load(Ordering::Acquire) {
+                while !self.open.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// Opens its hold when dropped: every path out of an arm that armed one.
+    struct HoldGuard(Arc<SourceHold>);
+
+    impl Drop for HoldGuard {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     /// The synthetic source: every expert's bytes on the host; the stacks'
@@ -594,6 +659,11 @@ mod gate {
         }
 
         fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
+            if part == 0
+                && let Some(h) = &self.faults.hold
+            {
+                h.pass();
+            }
             if self.faults.fail_source == Some((layer, id)) {
                 return Err(GpuError::Shape {
                     what: "Synth::source",
@@ -3175,6 +3245,219 @@ mod gate {
         Ok(ok)
     }
 
+    /// The `u32` words at device address `ptr`, `n` of them, read on `stream`.
+    fn words(stream: &CudaStream, ptr: sys::CUdeviceptr, n: usize) -> Result<Vec<u32>, GateError> {
+        let buf = DeviceBuffer::<u32>::zeroed(stream, n)?;
+        // SAFETY: `ptr` is a landing row of `n` words, alive while the
+        // machine lives; `buf` holds `n` words; the copy is drained below.
+        let rc = unsafe {
+            sys::cuMemcpyDtoDAsync_v2(buf.cu_deviceptr(), ptr, 4 * n, stream.cu_stream())
+        };
+        if rc != sys::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoDAsync rc {rc}").into());
+        }
+        Ok(buf.to_host_vec(stream)?)
+    }
+
+    /// Layer `l`'s stack's snapshot buffers, one a part, not yet filled.
+    fn snap_alloc(stream: &CudaStream, l: usize) -> Result<Vec<DeviceBuffer<u32>>, GateError> {
+        PART_BYTES
+            .iter()
+            .map(|&b| {
+                Ok(DeviceBuffer::<u32>::zeroed(
+                    stream,
+                    N_L[li(l)].max(1) * b / 4,
+                )?)
+            })
+            .collect()
+    }
+
+    /// Layer `l`'s stack copied into `snap` on `stream`, behind whatever the
+    /// stream has waited for.
+    fn snap_fill(
+        stream: &CudaStream,
+        stacks: &Stacks,
+        l: usize,
+        snap: &mut [DeviceBuffer<u32>],
+    ) -> Result<(), GateError> {
+        for (s, buf) in snap.iter_mut().zip(&stacks.bufs[li(l)]) {
+            s.copy_from_device_async(buf, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Whether slot `slot` of layer `l`'s snapshot holds expert `e`'s bytes.
+    fn slot_holds(
+        stream: &CudaStream,
+        snap: &[DeviceBuffer<u32>],
+        l: usize,
+        slot: u32,
+        e: u32,
+    ) -> Result<bool, GateError> {
+        for (p, buf) in snap.iter().enumerate() {
+            let w = PART_BYTES[p] / 4;
+            let got = buf.to_host_vec(stream)?;
+            let at = slot as usize * w;
+            if !(0..w).all(|i| got[at + i] == word(l, e, p, i)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// s6 landing batches: one pick of six admits splits into landing
+    /// batches of a third (two admits) in ascending slot order. The live
+    /// batch has no event and the layer's places with every victim and every
+    /// admit `HOST`; each landing batch has an event and its own admits at
+    /// their slots alone, every other expert `HOST`. With the staging thread
+    /// held at the third job, the engine stream waiting for the first
+    /// batch's event alone finishes with the first batch's slots holding
+    /// their admits' bytes and the later batches' slots not, and after the
+    /// release the call's landed event leaves every admitted slot holding
+    /// its admit's bytes (its mutants: every batch's event recorded after
+    /// the last copy; each batch's first admit in the previous batch's row).
+    fn s6(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        // Counts built for the clause, as s5's: layer 2's pool at the call's
+        // start is the seed's experts 4..=10, so six off-card experts take
+        // six of its seven slots.
+        const WANT: [u32; 6] = [20, 21, 22, 23, 24, 25];
+        let layer = LAYERS.start;
+        let hold = Arc::new(SourceHold::default());
+        let faults = Faults {
+            all_resident: true,
+            hold: Some(Arc::clone(&hold)),
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s6's machine: {e}").into());
+        }
+        // Every path out opens the hold, before the machine drops.
+        let _guard = HoldGuard(Arc::clone(&hold));
+        let stream = gpu.stream();
+        let per = land_batch_size(WANT.len());
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let before: Vec<Slot> = (0..E as u32)
+            .map(|e| r.slots.slot(layer, e).unwrap_or(Slot::Host))
+            .collect();
+        let mut counts = vec![0u32; E];
+        for (k, &e) in WANT.iter().enumerate() {
+            counts[e as usize] = 10 - k as u32;
+        }
+        hold.arm(per);
+        let pick = m.call_pick(stream, &mut r.slots, layer, &counts, usize::MAX)?;
+        let after: Vec<Slot> = (0..E as u32)
+            .map(|e| r.slots.slot(layer, e).unwrap_or(Slot::Host))
+            .collect();
+
+        // The expected rows, from the host map before and after the pick.
+        let card = |s: Slot| match s {
+            Slot::Card(c) => Some(c),
+            _ => None,
+        };
+        let mut admits: Vec<(u32, u32)> = (0..E as u32)
+            .filter(|&e| card(before[e as usize]).is_none())
+            .filter_map(|e| card(after[e as usize]).map(|s| (s, e)))
+            .collect();
+        admits.sort_unstable();
+        let live_want: Vec<u32> = (0..E)
+            .map(|e| match (card(before[e]), card(after[e])) {
+                (Some(b), Some(_)) => b,
+                _ => HOST,
+            })
+            .collect();
+        let chunks: Vec<&[(u32, u32)]> = admits.chunks(per).collect();
+        let shape_ok = pick.admitted == WANT.len()
+            && admits.len() == WANT.len()
+            && pick.land.len() == 1 + chunks.len()
+            && chunks.len() == 3;
+        // The boundary: the engine stream waits for the first landing
+        // batch's event alone; the staging thread holds the third job.
+        let mut first_ok = false;
+        let mut later_ok = false;
+        let mut waited = false;
+        // Freed only after the hold opens: a free waits for the copy stream.
+        let mut first_snap = None;
+        if shape_ok && let Some(ev) = pick.land[1].event.as_deref() {
+            let mut snap = snap_alloc(stream, layer)?;
+            stream.wait(ev)?;
+            snap_fill(stream, &r.card.stacks, layer, &mut snap)?;
+            std::thread::sleep(HOLD_SETTLE);
+            waited = stream.query() == Ok(false);
+            if !waited {
+                first_ok = true;
+                later_ok = true;
+                for (k, &(s, e)) in admits.iter().enumerate() {
+                    let holds = slot_holds(stream, &snap, layer, s, e)?;
+                    if k < per {
+                        first_ok &= holds;
+                    } else {
+                        later_ok &= !holds;
+                    }
+                }
+            }
+            first_snap = Some(snap);
+        }
+        let held = hold.taken();
+        hold.release();
+        drop(first_snap);
+        // The rows after the release: a read's buffer is freed behind the copy
+        // stream.
+        let mut rows_ok = shape_ok && pick.land[0].event.is_none();
+        let mut rows_seen = Vec::new();
+        for (b, lb) in pick.land.iter().enumerate() {
+            let row = words(stream, lb.map, E)?;
+            if b > 0 && shape_ok {
+                let mut want = vec![HOST; E];
+                for &(s, e) in chunks[b - 1] {
+                    want[e as usize] = s;
+                }
+                rows_ok &= lb.event.is_some() && row == want;
+            } else if b == 0 {
+                rows_ok &= row == live_want;
+            }
+            rows_seen.push(
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &w)| w != HOST)
+                    .map(|(e, &w)| (e, w))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        // Every batch's event, through the call's landed event.
+        stream.wait(m.call_landed(layer)?)?;
+        let mut snap = snap_alloc(stream, layer)?;
+        snap_fill(stream, &r.card.stacks, layer, &mut snap)?;
+        let mut all_ok = shape_ok;
+        for &(s, e) in &admits {
+            all_ok &= slot_holds(stream, &snap, layer, s, e)?;
+        }
+        for l in LAYERS {
+            m.call_reader(l, stream)?;
+        }
+        let ended = m.end_call(stream, &mut r.slots, true).is_ok();
+        let boundary_ok = first_ok && later_ok && !waited && held >= per;
+        let ok = rows_ok && boundary_ok && all_ok && hold.taken() == WANT.len() && ended;
+        println!(
+            "s6 landing batches: {} admits (slots {:?}) in {} landing batches of {per}: rows {} \
+             (live {:?}, batches {:?}); first batch's event alone with the staging thread held at \
+             job {per}: engine stream still waiting {waited}, first batch's slots landed {first_ok}, \
+             later batches' slots uncopied {later_ok}, jobs taken {held}; every batch's event: all \
+             slots landed {all_ok}, jobs taken {}, call ends {ended} {}",
+            pick.admitted,
+            admits.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            pick.land.len().saturating_sub(1),
+            rows_ok,
+            rows_seen.first(),
+            rows_seen.get(1..),
+            hold.taken(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     // ----------------------------------------------------------- evicted
 
     /// Layer 2's experts `ids`, for a fault's list.
@@ -3408,6 +3691,7 @@ mod gate {
         ok &= s2(&gpu, &pm, &trace)?;
         ok &= s4(&gpu, &pm, &trace)?;
         ok &= s5(&gpu, &pm)?;
+        ok &= s6(&gpu, &pm)?;
         ok &= evicted(&gpu, &pm, &trace, &a, &[&a, &b, &h])?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
@@ -3431,7 +3715,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end."
             );
             Ok(())
         } else {
