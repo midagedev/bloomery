@@ -80,11 +80,14 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   Under box.sh's default pin, `BLOOMERY_GATE_CARD=3090|a6000|any` picks (default `3090`; `any` takes an idle A6000 when
   no timing lease is held, else the 3090). Pass it through `BLOOMERY_BOX_ENV`.
 - **Landing batches.** `tools/gate-batch.sh --list FILE` takes `just affected` output and runs it in lanes (A the 3090,
-  B the A6000, X alone after both: `[group('solo')]` or `BLOOMERY_CARD=both`); it refuses to start while the timing
-  lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose input key
-  (`tools/recipes.py key`) is green in `~/.cache/bloomery/gate-ledger.tsv`; `--round-ledger` (a round's) records only in
-  `gate-ledger-rounds.tsv`. The lead reads the rounds' file only with `--trust-rounds`, and only for a change that moves
-  no behaviour (`just ptx-scan` equal to the base). A rebase moves the key of every item the landed commits touch.
+  B the A6000, X alone after both: `[group('solo')]` or `BLOOMERY_CARD=both`). A lane that empties its queue takes the
+  other lane's unstarted balanced items onto its own card, after a `lease_free` probe; a fixed, solo or v41-load item
+  never moves, and a moved item's key, times row and `lane=` name the card it ran on. It refuses to start while the
+  timing lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose
+  input key (`tools/recipes.py key`) is green in `~/.cache/bloomery/gate-ledger.tsv`; `--round-ledger` (a round's)
+  records only in `gate-ledger-rounds.tsv`. The lead reads the rounds' file only with `--trust-rounds`, and only for a
+  change that moves no behaviour (`just ptx-scan` equal to the base). A rebase moves the key of every item the landed
+  commits touch.
 - **Narrowing.** The graph over-selects a host-only change. When `just ptx-scan` equals the base for every bin the
   change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
   checks; `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list and why. A kernel, a launch or a byte

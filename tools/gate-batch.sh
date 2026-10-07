@@ -74,6 +74,20 @@
 # serializes their builds by one lock on the box tree's target directory, so a long lane-B build makes a
 # lane-A item that starts inside it wait: lane B's order decides when its long builds start, and in a
 # landing list whose longest balanced item runs on the Mac, check-recipes, they start after it).
+# Work stealing: a lane that empties its own queue takes the other lane's not-yet-started movable
+# items, in run order — a balanced item (class F: either card, or no card) that is not a ledger
+# skip. A fixed, solo, v41-load or one-lane item never moves, and neither does an item the ledger
+# already holds green (its key names one card). The thief runs a stolen item on its own lane's card
+# — the item's other candidate: BLOOMERY_GATE_CARD is rewritten, and the ledger key, the ledger
+# state and the times row's card label move with it, so the record names the card the item ran on
+# and run.log's lane= names the lane that ran it; a no-card item (host group, plain CPU checks)
+# changes lanes only. A steal onto a card first probes the timing lease through box.sh (READONLY,
+# so no rsync: `. tools/ref/lease-probe.sh && lease_free`, the shared-lock probe — never an
+# exclusive flock) and takes no card while the lease is held, re-probing after RETRY_WAIT seconds
+# — waited in 1 s slices that end the pass the moment no candidate remains, so a sitting longer
+# than the wait costs the lane nothing beyond its own items; a hold, or a sitting that starts after
+# the probe, is the stolen item's own box.sh guard, as it is for every item. --lanes 1 steals
+# nothing.
 # --lanes 1 runs every item in the
 # list's order in one lane (labelled A), with no card forced — the recipes' own defaults, as a hand
 # batch runs them.
@@ -215,6 +229,7 @@ SMOKE=(
 )
 TRIES_MAX=11
 RETRY_WAIT=30
+STEAL_WAIT=$RETRY_WAIT # a held timing lease: the steal's re-probe bound, waited in 1 s slices
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/ (tools/mac-check.sh), rounded up to a whole GiB
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
@@ -413,6 +428,18 @@ x-v41b: x-v41dep
 
 x-v41dep:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gpu-gate.sh xw'
+
+steal-slow:
+    ./tools/box.sh 'bash tools/gpu-gate.sh gen_s'
+
+steal-fix:
+    ./tools/box.sh 'bash tools/gpu-gate.sh gen_f'
+
+steal-bal:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_b'
+
+steal-lib:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p sl'
 JF
   # The default profile a recipe with no BLOOMERY_MODEL loads.
   mkdir -p "$t/tools/ref"
@@ -445,7 +472,7 @@ DF
     rc=0
     out=$("$@" 2>&1) || rc=$?
     if [ "$rc" != "$want" ]; then fail "$name" "rc $rc, want $want"
-    elif ! printf '%s\n' "$out" | grep -Eq -- "$pat"; then fail "$name" "no line matches /$pat/"
+    elif ! grep -Eq -- "$pat" <<< "$out"; then fail "$name" "no line matches /$pat/"
     else pass "$name"; fi
   }
   local gb=(bash "$t/tools/gate-batch.sh")
@@ -488,7 +515,7 @@ DF
     '  gate-x  crates/x/src/lib.rs (+1)' 'recipes: gate-x' 'always: ' 'left out (1), each by ptx-scan gx: identical:' \
     '  - gate-y  (ptx-scan gx: identical)' 'unmapped (0):' > "$t/aff-narrow.txt"
   check 'list: a narrowed affected output runs the recipes it keeps' 0 '^lane [AB]  gate-x ' "${gb[@]}" --dry-run --list "$t/aff-narrow.txt"
-  if printf '%s\n' "$out" | grep -q 'gate-y'; then fail 'list: a narrowed affected output does not run a left-out recipe' "gate-y is in the batch"
+  if grep -q 'gate-y' <<< "$out"; then fail 'list: a narrowed affected output does not run a left-out recipe' "gate-y is in the batch"
   else pass 'list: a narrowed affected output does not run a left-out recipe'; fi
   # A weekly recipe a trigger named: its `  weekly-` line runs, beside the gate lines.
   printf '%s\n' 'affected: a..b — 2 changed files, 1 of 6 gate-recipes selected, 1 of 2 weekly-recipes by a trigger' \
@@ -498,12 +525,153 @@ DF
   # --weekly: every weekly-* recipe of the justfile, each in its class; none of another name.
   check 'weekly: a weekly recipe with no group is balanced' 0 '^lane [AB]  weekly-a ' "${gb[@]}" --dry-run --weekly
   check 'weekly: a solo weekly recipe runs alone' 0 '^lane X  weekly-b ' "${gb[@]}" --dry-run --weekly
-  if printf '%s\n' "$out" | grep -Eq '^lane [ABX]  (gate|v41|host|plain)'; then fail 'weekly: nothing but the weekly-* recipes' "another recipe is in the batch"
+  if grep -Eq '^lane [ABX]  (gate|v41|host|plain)' <<< "$out"; then fail 'weekly: nothing but the weekly-* recipes' "another recipe is in the batch"
   else pass 'weekly: nothing but the weekly-* recipes'; fi
   check 'weekly: with items, a named error' 64 'exclusive' "${gb[@]}" --dry-run --weekly gate-x
   printf '%s\n' 'something else' 'affected: a..b — 1 changed file' '  gate-x  crates/x/src/lib.rs (+1)' > "$t/aff-other.txt"
   check 'list: any other line above the affected: header is a malformed item' 65 "aff-other.txt:1: malformed item 'something else'" \
     "${gb[@]}" --dry-run --list "$t/aff-other.txt"
+  # Work stealing (the header's paragraph): real batch runs on the fixture, through a fake box.sh
+  # that logs every call and never runs the command, and a key stub that keys an item by its own
+  # text (env included: the card names differ). An item's env drives the fake: FAKE_SLEEP holds the
+  # call that many seconds, FAKE_UNTIL=<word> ends the hold early once a logged command (or the
+  # steal's lease probe, logged as `probe`) ends in <word>, then FAKE_GRACE seconds more — so a
+  # case waits on the other lane's progress, not on a race — and FAKE_LEASE_UP=1 raises the lease
+  # marker the fake answers the steal's READONLY probe (`. tools/ref/lease-probe.sh && lease_free`)
+  # from.
+  cat > "$t/tools/box.sh" << 'FB'
+#!/bin/sh
+st=$(dirname "$0")/../fake-state
+mkdir -p "$st"
+case "$*" in
+  '. tools/ref/lease-probe.sh && lease_free')
+    echo probe >> "$st/probe.log"
+    [ -e "$st/lease-up" ] || exit 0
+    echo '[guard] the fake lease is up' >&2
+    exit 1 ;;
+esac
+for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
+printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+[ "${FAKE_LEASE_UP:-0}" = 1 ] && : > "$st/lease-up"
+k=0
+while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
+  if [ -n "${FAKE_UNTIL:-}" ] && cat "$st/box.log" "$st/probe.log" 2> /dev/null | grep -q "${FAKE_UNTIL}\$"; then
+    sleep "${FAKE_GRACE:-0}"
+    break
+  fi
+  sleep 1
+  k=$((k + 1))
+done
+exit 0
+FB
+  chmod +x "$t/tools/box.sh"
+  cat > "$t/tools/recipes.py" << 'FP'
+#!/usr/bin/env python3
+import sys
+a = sys.argv[1:]
+if a[:1] == ["box-manifest"]:
+    sys.exit(0)
+items, i, pd = [], 1, None
+while i < len(a):
+    if a[i].startswith("--"):
+        if a[i] == "--parts-dir":
+            pd = a[i + 1]
+        i += 1 if a[i] == "--rerun" else 2
+        continue
+    items.append(a[i])
+    i += 1
+for k, it in enumerate(items):
+    print(f"stub-{it}\t{it}\trun\tstub")
+    if pd:
+        import os
+        os.makedirs(pd, exist_ok=True)
+        with open(f"{pd}/{k}.parts", "w") as fh:
+            fh.write("stub\n")
+FP
+  want() { # <name> <file> <ERE>: the file holds a matching line
+    n=$((n + 1))
+    if [ -f "$2" ] && grep -Eq -- "$3" "$2"; then echo "ok $1"
+    else bad=$((bad + 1)); echo "FAIL $1: no line matches /$3/ in $2"; fi
+  }
+  want_not() { # <name> <file> <ERE>: the file holds no matching line
+    n=$((n + 1))
+    if [ -f "$2" ] && grep -Eq -- "$3" "$2"; then bad=$((bad + 1)); echo "FAIL $1: a line matches /$3/ in $2"
+    else echo "ok $1"; fi
+  }
+  want_row() { # <name> <file> <awk program over $1 (env) and $2 (command)>: a row answers it
+    n=$((n + 1))
+    if [ -f "$2" ] && [ -n "$(awk -F'\t' "$3" "$2")" ]; then echo "ok $1"
+    else bad=$((bad + 1)); echo "FAIL $1: no row of $2 answers {$3}"; fi
+  }
+  want_no_row() { # <name> <file> <awk program>: no row answers it
+    n=$((n + 1))
+    if [ -f "$2" ] && [ -n "$(awk -F'\t' "$3" "$2")" ]; then bad=$((bad + 1)); echo "FAIL $1: a row of $2 answers {$3}"
+    else echo "ok $1"; fi
+  }
+  steal_case() { # <tag> <times rows…> -- <items…>: one real batch run on the fixture, rc printed;
+    # LEASE_UP=1 puts the fake lease up before the batch starts
+    local tag=$1 rc=0
+    local times=$t/times-$tag.tsv
+    shift
+    local rows=()
+    while [ "$1" != -- ]; do rows+=("$1"); shift; done
+    shift
+    printf '%s\n' "${rows[@]}" > "$times"
+    rm -rf "$t/fake-state" "$t/target/c-$tag"
+    if [ "${LEASE_UP:-0}" = 1 ]; then mkdir -p "$t/fake-state" && : > "$t/fake-state/lease-up"; fi
+    BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+      "${gb[@]}" --out "$t/target/c-$tag" --round-ledger "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
+    printf '%s' "$rc"
+  }
+  rc_ok() { # <name> <tag> <want total>: the case's batch ended green
+    if [ "$(cat "$t/rc-$2")" = 0 ] && grep -Eq "^DONE total=$3 red=0 " "$t/out-$2.log"; then pass "$1"
+    else fail "$1" "rc=$(cat "$t/rc-$2") $(tail -1 "$t/out-$2.log" 2>/dev/null)"; fi
+  }
+  local d=2026-09-27T10:00:00+0900
+  # A contended 3090: lane A's first item (fixed) holds its lane until the balanced item behind it
+  # has run — on today's runner, 20 s and then in lane A. Lane B, idle, steals it onto the A6000;
+  # the times row and the ledger key name that card.
+  local slow_a='steal-slow@FAKE_SLEEP=20,FAKE_UNTIL=gen_b'
+  rc=$(steal_case steal-a "$slow_a	A	3090	30	$d" "host	B	none	70	$d" "steal-bal	A	3090	60	$d" \
+    "plain-any	B	a6000	10	$d" -- "$slow_a" host steal-bal plain-any)
+  printf '%s' "$rc" > "$t/rc-steal-a"
+  rc_ok 'steal: a contended lane A and an idle lane B end green' steal-a 4
+  want 'steal: the balanced item runs in lane B' "$t/target/c-steal-a/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=B( |$)'
+  want_row 'steal: its box call carries the A6000 card' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_b$/'
+  want 'steal: its times row names lane B and the A6000' "$t/times-steal-a.tsv" "$(printf '^steal-bal\tB\ta6000\t')"
+  want 'steal: the ledger records it under the A6000 key' "$t/rounds-steal-a.tsv" "$(printf '^stub-steal-bal@BLOOMERY_GATE_CARD=a6000\tsteal-bal\t')"
+  # A fixed item never moves: lane B empties while two fixed items wait behind lane A's first (held
+  # until lane B's own item ran, then 3 s more), a 3090 one and a no-card one (device code with no
+  # gate lock, which lands on the box env's 3090 pin), and takes neither.
+  local slow_f='steal-slow@FAKE_SLEEP=20,FAKE_UNTIL=other,FAKE_GRACE=3'
+  rc=$(steal_case steal-fix "$slow_f	A	3090	30	$d" "steal-fix	A	3090	30	$d" "steal-lib	A	3090	30	$d" \
+    "plain-any	B	a6000	10	$d" -- "$slow_f" steal-fix steal-lib plain-any)
+  printf '%s' "$rc" > "$t/rc-steal-fix"
+  rc_ok 'steal: fixed items end green' steal-fix 4
+  want_row 'steal: the fixed 3090 item stays in lane A on the 3090' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_f$/'
+  want 'steal: its run.log line names lane A' "$t/target/c-steal-fix/run.log" '^steal-fix rc=0 [0-9]+s try=1 lane=A( |$)'
+  want 'steal: the fixed no-card item stays in lane A' "$t/target/c-steal-fix/run.log" '^steal-lib rc=0 [0-9]+s try=1 lane=A( |$)'
+  want_no_row 'steal: no fixed call reached the A6000' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_f$/'
+  # A held timing lease keeps every item off the A6000: the lease is up from the start, lane A's first
+  # item holds its lane until the thief has probed (then 2 s more), and the owner — whose own items a
+  # real box would hold in the guard — runs the balanced item on the 3090.
+  local slow_l='steal-slow@FAKE_SLEEP=20,FAKE_UNTIL=probe,FAKE_GRACE=2'
+  rc=$(LEASE_UP=1 steal_case steal-lease "$slow_l	A	3090	30	$d" "host	B	none	70	$d" "steal-bal	A	3090	60	$d" \
+    "plain-any	B	a6000	10	$d" -- "$slow_l" host steal-bal plain-any)
+  printf '%s' "$rc" > "$t/rc-steal-lease"
+  rc_ok 'steal: a held timing lease ends green' steal-lease 4
+  want 'steal: the thief probed the lease' "$t/fake-state/probe.log" '^probe$'
+  want_row 'steal: the balanced item stayed off the A6000' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_b$/'
+  want_no_row 'steal: no call reached the A6000 under the lease' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_[bf]$/'
+  # The dry run names the movable items (its own times rows, so the balance is fixed).
+  printf '%s\n' 'steal-slow@FAKE_SLEEP=3	A	3090	30	2026-09-27T10:00:00+0900' \
+    'host	B	none	70	2026-09-27T10:00:00+0900' 'steal-bal	A	3090	60	2026-09-27T10:00:00+0900' > "$t/times-dry.tsv"
+  out=$(BLOOMERY_GATE_TIMES=$t/times-dry.tsv "${gb[@]}" --dry-run 'steal-slow@FAKE_SLEEP=3' host steal-bal 2>&1) \
+    || fail 'steal: the dry run of a movable pair failed' "$out"
+  if grep -A3 '^lane A  steal-bal' <<< "$out" | grep -q 'movable'; then pass 'steal: the dry run names the balanced item movable'
+  else fail 'steal: the dry run names the balanced item movable' "no movable line under steal-bal"; fi
+  if grep -A3 '^lane A  steal-slow' <<< "$out" | grep -q 'movable'; then fail 'steal: the dry run leaves a fixed item unmarked' "a movable line under steal-slow"
+  else pass 'steal: the dry run leaves a fixed item unmarked'; fi
   # Cold builds: the final try's section only; a local crate is the tree's, a registry or git one is not.
   printf '%s\n' '=== try 1 x' '   Compiling libc v0.2.155' '=== try 2 x' '   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery/crates/gpu)' > "$t/warm.log"
   printf '%s\n' '=== try 1 x' '   Compiling cuda-core v0.1.0 (https://github.com/x/cuda-oxide?branch=b#abc)' '    Finished `release`' > "$t/cold.log"
@@ -1541,6 +1709,12 @@ if [ "$DRY" = 1 ]; then
   for i in "${ORDER[@]}"; do
     printf 'lane %s  %-28s %s\n        %s — %s\n' "${P_LANE[$i]}" "${P_STEM[$i]}" "$(cmd_of "$i")" "${P_PLAN[$i]}" "${P_WHY[$i]}"
     [ "$LEDGER" = 0 ] || printf '        ledger: %s — %s\n' "${P_LST[$i]}" "${P_LDET[$i]}"
+    if [ "$LANES" = 2 ]; then
+      IFS=$'\x1f' read -r cls _ _ _ _ _ _ _ _ _ _ _ _ <<< "${R_REC[$i]}"
+      if [ "$cls" = F ] && [ "${P_LST[$i]}" != skip ]; then
+        printf '        movable — an idle lane may take it on its card (never a fixed, solo or v41-load item)\n'
+      fi
+    fi
   done
   predicted
   exit 0
@@ -1563,6 +1737,7 @@ fi
 
 # run.log exists from here on (a refused start leaves none, so the same --out can be retried).
 : > "$RUNLOG"
+mkdir -p "$OUT/claims" # one claim per item: the owner's start and the thief's steal agree on it
 T0=$(date +%s)
 echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" >> "$RUNLOG"
 echo "gate-batch: $N items, lanes $LANES, logs in $OUT"
@@ -1618,13 +1793,124 @@ skip_item() { # $1 = plan index, $2 = lane label: the ledger holds a green run o
   echo "$line"
 }
 
-run_lane() { # $1 = lane label; runs its items in the run order (ORDER), then writes lane-<lane>.s
+# Work stealing (the header's paragraph above the lanes): one claim per item, under DIR/claims —
+# the owner claims an item before it starts it, the thief before it steals one, and an item runs
+# exactly once however the two lanes race.
+claim_item() { # $1 = plan index, $2 = the claiming lane: wins the item's claim?
+  local f="$OUT/claims/$1"
+  ( set -o noclobber; printf '%s\n' "$2" > "$f" ) 2> /dev/null
+}
+
+claimed() { [ -e "$OUT/claims/$1" ]; }
+
+# The card this lane would run a balanced item on — its candidate for the lane's card, `-` for a
+# no-card item — or empty when the item has no candidate here (a fixed item's single card, or the
+# other card only).
+steal_card() { # $1 = plan index, $2 = lane
+  local cards want
+  want=$([ "$2" = A ] && printf 3090 || printf a6000)
+  IFS=$'\x1f' read -r _ _ _ _ _ _ _ _ _ _ _ cards _ <<< "${R_REC[$1]}"
+  case " $cards " in
+    ' - ') printf -- '-' ;;
+    *" $want "*) printf '%s' "$want" ;;
+  esac
+}
+
+# movable: the other lane's item this lane may take — class F (the plan's own word that either
+# card, or no card, runs it), not a ledger skip, not yet claimed.
+stealable() { # $1 = plan index, $2 = lane
+  local i=$1 cls other
+  other=$([ "$2" = A ] && printf B || printf A)
+  [ "${P_LANE[$i]}" = "$other" ] || return 1
+  IFS=$'\x1f' read -r cls _ _ _ _ _ _ _ _ _ _ _ _ <<< "${R_REC[$i]}"
+  [ "$cls" = F ] || return 1
+  [ "${P_LST[$i]}" != skip ] || return 1
+  ! claimed "$i" || return 1
+  [ -n "$(steal_card "$i" "$2")" ]
+}
+
+# Rewrite a stolen item's placement onto this lane's card: the env, the times label and the ledger
+# key, state and candidate move to the item's other candidate, so the row and the record name the
+# card it ran on. A no-card item needs none of it (its one candidate runs anywhere).
+switch_candidate() { # $1 = plan index, $2 = the lane's card (or -)
+  local i=$1 card=$2 env cards labels c pos=-1 k=0 l='' lc=0 j
+  IFS=$'\x1f' read -r _ _ _ env _ _ _ _ _ _ _ cards labels _ <<< "${R_REC[$i]}"
+  [ "$card" = - ] || env="${env:+$env }BLOOMERY_GATE_CARD=$card"
+  P_ENV[$i]=$env
+  for c in $cards; do
+    [ "$c" = "$card" ] && pos=$k
+    k=$((k + 1))
+  done
+  [ "$pos" -ge 0 ] || return 0
+  for c in $labels; do
+    [ "$lc" = "$pos" ] && l=$c
+    lc=$((lc + 1))
+  done
+  j=$((${R_C0[$i]} + pos))
+  P_TCARD[$i]=$l
+  P_CI[$i]=$j P_KEY[$i]=${C_KEY[$j]} P_LST[$i]=${C_LST[$j]} P_LDET[$i]=${C_LDET[$j]}
+}
+
+# The timing-lease probe of a steal: lease_free through box.sh, READONLY so there is no rsync and
+# no guard wait (the probe is itself the read — the shared-lock probe, never an exclusive flock).
+# Free prints 0; held, or a lease that cannot be tested (named), prints nonzero and the steal takes
+# no card.
+lease_free_for_steal() {
+  local out rc=0
+  out=$(BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" '. tools/ref/lease-probe.sh && lease_free' 2>&1) || rc=$?
+  if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then
+    echo "gate-batch: the steal's lease probe through box.sh failed (rc $rc): $out — taking no card until it reads free" >&2
+  fi
+  [ "$rc" = 0 ]
+}
+
+# The steal pass: while the other lane has an unstarted movable item, take the next one in run
+# order onto this lane's card. A steal onto a card probes the timing lease first and waits it out
+# in 1 s slices (up to RETRY_WAIT) while candidates remain: never a card while the lease is held,
+# and no lane sleeps past the last candidate. The loop always ends: every turn runs an item, loses
+# a claim, waits a slice, or finds no candidate.
+steal_pass() { # $1 = lane
+  local lane=$1 i j card k
+  while :; do
+    i=-1
+    for j in "${ORDER[@]}"; do
+      if stealable "$j" "$lane"; then i=$j; break; fi
+    done
+    [ "$i" -ge 0 ] || return 0
+    card=$(steal_card "$i" "$lane")
+    if [ "$card" != - ] && ! lease_free_for_steal; then
+      for ((k = 0; k < STEAL_WAIT; k++)); do
+        sleep 1
+        i=-1
+        for j in "${ORDER[@]}"; do
+          if stealable "$j" "$lane"; then i=$j; break; fi
+        done
+        [ "$i" -ge 0 ] || return 0
+      done
+      continue
+    fi
+    claim_item "$i" "steal-$lane" || continue
+    switch_candidate "$i" "$card"
+    run_item "$i" "$lane"
+  done
+}
+
+run_lane() { # $1 = lane label; runs its items in the run order (ORDER), then steals the other
+  # lane's unstarted movable items (above), then writes lane-<lane>.s
   local lane=$1 t0 i
   t0=$(date +%s)
   for i in "${ORDER[@]}"; do
     [ "${P_LANE[$i]}" = "$lane" ] || continue
-    if [ "${P_LST[$i]}" = skip ]; then skip_item "$i" "$lane"; else run_item "$i" "$lane"; fi
+    if [ "${P_LST[$i]}" = skip ]; then
+      skip_item "$i" "$lane"
+    else
+      claim_item "$i" "$lane" || continue # the other lane stole it while this one was busy
+      run_item "$i" "$lane"
+    fi
   done
+  case $lane in
+    A | B) [ "$LANES" = 2 ] && steal_pass "$lane" ;;
+  esac
   echo $(($(date +%s) - t0)) > "$OUT/lane-$lane.s"
 }
 
