@@ -833,6 +833,12 @@ fn micros(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Whole nanoseconds since the epoch `t0`, saturated: the staging stamps'
+/// and the pick starts' common clock.
+fn nanos_since(t0: Instant) -> u64 {
+    u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Where the staging thread runs: the SMT sibling of the pool's first
 /// worker. The copies are DRAM streams that sweep a ring slot's worth of L3,
 /// so not beside the dispatcher (the critical path, whose sibling the engram
@@ -923,6 +929,10 @@ struct Job {
     victim: Option<u32>,
     ring: usize,
     ticket: u32,
+    /// The job is a prompt pick's copy, one of the layer's counter the
+    /// staging thread takes from ([`Shared::pick_left`]): a boundary's,
+    /// a reset's and a restore's are not.
+    stamp: bool,
 }
 
 /// The staging ring: [`RING_SLOTS`] experts of `slot_bytes`, pinned and
@@ -1274,6 +1284,17 @@ pub(crate) struct Shared {
     /// before each one's ticket is published: `jobs_issued - served` copies
     /// wait for staging.
     served: AtomicU64,
+    /// Per layer of the map, the jobs of the layer's current pick the staging
+    /// thread has not stamped yet: the pick stores its count before it issues
+    /// its copies, the thread takes one a staged job.
+    pick_left: Vec<AtomicU64>,
+    /// Per layer of the map, the stamp epoch's nanoseconds at the moment the
+    /// layer's last outstanding pick job staged (0: none yet): the pick
+    /// record's `staged_us` reads against the pick's own start.
+    pick_stamp_ns: Vec<AtomicU64>,
+    /// The stamp epoch, the machine's birth: every stamp and pick start is
+    /// nanoseconds since it.
+    epoch: Instant,
     stop: AtomicBool,
     /// The first staging failure, which the next boundary or reset returns.
     failed: Mutex<Option<StagingFailure>>,
@@ -1484,6 +1505,15 @@ impl Shared {
             // ticket stays released.
             self.staged(job.ring)
                 .fetch_max(job.ticket, Ordering::AcqRel);
+            if job.stamp {
+                // The pick's per-layer remaining-jobs counter, one atomic a
+                // job: the thread that stages the layer's last one stamps the
+                // wall for the pick record's `staged_us`.
+                let left = self.pick_left[job.layer].fetch_sub(1, Ordering::AcqRel);
+                if left == 1 {
+                    self.pick_stamp_ns[job.layer].store(nanos_since(self.epoch), Ordering::Release);
+                }
+            }
         }
     }
 }
@@ -1699,22 +1729,49 @@ pub struct CallPick {
     /// Of those, host microseconds it waited for the staging thread to take
     /// in enough of the call's earlier jobs.
     pub backlog_us: u64,
+    /// Host microseconds from this pick's start to the staging thread's
+    /// staging of the layer's last outstanding pick job — the whole copy,
+    /// the backlog jobs beside the union included, so at or past `pick_us`.
+    /// 0 until the call's end reads it back
+    /// ([`SwapMachine::fill_staged_us`]): a pick that moved nothing, or one
+    /// no machine measured, carries 0 and the record leaves the part out.
+    pub staged_us: u64,
+    /// The least count the pick admitted ([`CallCfg::floor`]), as this pick
+    /// found it; 0 when the pick was refused and no floor was read.
+    pub floor: u64,
+    /// The pick's backlog bound: the most of the call's jobs the staging
+    /// thread may leave unstaged when the pick issues another
+    /// ([`SwapMachine::call_backlog`], or the call's own
+    /// [`SwapMachine::set_call_backlog`]); 0 when the pick was refused.
+    pub backlog: u64,
+    /// 1 when the pick admitted from the no-probe floor (the stream floor a
+    /// load whose lane probe never ran admits from), 0 from a measured rule.
+    pub fallback: u32,
+    /// 1 when this is the nothing of a pick the machine refused (a victim
+    /// the host could not serve from resident pages), so `kept` 0 means the
+    /// pick never ran, not that it kept no pool.
+    pub refused: u32,
     /// The pick's landing batches, a GEMM batch each ([`LandBatch`]): the
     /// leading one the layer's live slots (no copy lands in them), then the
     /// admits' slots in slot order, a third of them a batch. The layer's
     /// card route waits each batch's event before the GEMM batch over its
     /// slots, so the copies and the GEMMs pipeline.
     pub land: Vec<LandBatch>,
+    /// The pick's start in the staging stamps' epoch
+    /// ([`Shared::epoch`]), for `staged_us`'s late read; 0 without one.
+    pub(crate) pick_at_ns: u64,
 }
 
 impl CallPick {
     /// The pick that admits nothing at layer `layer` from `counts`: what a
-    /// pick the machine refused stands for, every expert where it was.
+    /// pick the machine refused stands for, every expert where it was —
+    /// `refused` marks it, so its empty halves do not read as a choice.
     #[must_use]
     pub fn nothing(layer: usize, counts: &[u32]) -> CallPick {
         CallPick {
             layer,
             counts: counts_digest(counts),
+            refused: 1,
             ..CallPick::default()
         }
     }
@@ -1747,6 +1804,11 @@ pub struct CallReport {
 /// rule's layer numbering, ascending ids), and its sums so far.
 struct Call {
     cfg: CallCfg,
+    /// The pick path's backlog bound ([`SwapMachine::wait_backlog`]): the
+    /// machine's own until a caller narrows it
+    /// ([`SwapMachine::set_call_backlog`]); the boundary path never reads
+    /// it. The call's own: a new call starts at the machine's.
+    backlog: u64,
     start: Vec<Vec<u32>>,
     report: CallReport,
     /// The flush as the call found it.
@@ -2173,6 +2235,9 @@ impl SwapMachine {
             deadline: cfg.deadline,
             flush: AtomicBool::new(false),
             served: AtomicU64::new(0),
+            pick_left: (0..cfg.pinned.len()).map(|_| AtomicU64::new(0)).collect(),
+            pick_stamp_ns: (0..cfg.pinned.len()).map(|_| AtomicU64::new(0)).collect(),
+            epoch: Instant::now(),
             stage_ns: AtomicU64::new(0),
             prepare_ns: AtomicU64::new(0),
             rereads,
@@ -2714,17 +2779,33 @@ impl SwapMachine {
     /// counted. The ones left, for the report. Nothing to do and nothing
     /// allocated while none is followed.
     fn recheck(&mut self, slots: &SlotMap) -> Result<Faulting, GpuError> {
-        let mut i = 0;
-        while i < self.faulted.len() {
-            let u = self.faulted[i].expert;
-            let gone = slots.slot(u.layer, u.id) != Some(Slot::Host)
-                || self.shared.source.host_resident(u.layer, u.id)?;
-            if gone {
-                self.faulted.remove(i);
-            } else {
-                self.faulted[i].passes += 1;
-                i += 1;
+        let mut refused: Option<GpuError> = None;
+        self.faulted.retain_mut(|u| {
+            if refused.is_some() {
+                return true;
             }
+            let gone = match self
+                .shared
+                .source
+                .host_resident(u.expert.layer, u.expert.id)
+            {
+                Ok(resident) => {
+                    slots.slot(u.expert.layer, u.expert.id) != Some(Slot::Host) || resident
+                }
+                Err(e) => {
+                    refused = Some(e);
+                    return true;
+                }
+            };
+            if gone {
+                false
+            } else {
+                u.passes += 1;
+                true
+            }
+        });
+        if let Some(e) = refused {
+            return Err(e);
         }
         Ok(Faulting::of(&self.faulted))
     }
@@ -2907,6 +2988,7 @@ impl SwapMachine {
             victim,
             ring,
             ticket,
+            stamp: gate == Gate::Waited,
         };
         let d = dispatch::send(self.tx.as_ref(), job, WHAT)?;
         self.jobs_issued += 1;
@@ -3221,6 +3303,7 @@ impl SwapMachine {
         let flush_was = self.shared.flush.swap(true, Ordering::AcqRel);
         self.call = Some(Call {
             cfg,
+            backlog: self.call_backlog(),
             start,
             report: CallReport::default(),
             flush_was,
@@ -3274,9 +3357,16 @@ impl SwapMachine {
     }
 
     /// Wait, within the deadline, until the staging thread has taken in all
-    /// but [`SwapMachine::call_backlog`] of the jobs issued.
+    /// but [`SwapMachine::call_backlog`] of the jobs issued — the open
+    /// call's own bound where a caller set one
+    /// ([`SwapMachine::set_call_backlog`]); the boundary's issue path reads
+    /// the machine's, not this wait.
     fn wait_backlog(&self, what: &'static str) -> Result<(), GpuError> {
-        let (bound, issued) = (self.call_backlog(), self.jobs_issued);
+        let bound = self
+            .call
+            .as_ref()
+            .map_or_else(|| self.call_backlog(), |c| c.backlog);
+        let issued = self.jobs_issued;
         let shared = &self.shared;
         let fits = || issued - shared.served.load(Ordering::Acquire) < bound;
         match shared.wait_until(fits, Some(shared.deadline)) {
@@ -3364,6 +3454,14 @@ impl SwapMachine {
         self.picks = picks;
         moved?;
         report.pick_us = micros(t0);
+        report.floor = u64::from(floor);
+        report.backlog = self
+            .call
+            .as_ref()
+            .map_or_else(|| self.call_backlog(), |c| c.backlog);
+        report.pick_at_ns = t0
+            .checked_duration_since(self.shared.epoch)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         if let Some(c) = self.call.as_mut() {
             let r = &mut c.report;
             r.picks += usize::from(report.admitted > 0);
@@ -3473,6 +3571,14 @@ impl SwapMachine {
         order.sort_unstable_by_key(|&(_, s)| s);
         let per = land_batch_size(order.len());
         let batches = order.len().div_ceil(per);
+        // The pick's stamp counter ahead of the first job's issue: the
+        // staging thread takes one a staged copy and stamps the layer's wall
+        // at the zero crossing (`Shared::pick_left`).
+        self.shared
+            .pick_left
+            .get(layer)
+            .ok_or_else(|| GpuError::protocol(WHAT, format!("layer {layer} outside the map")))?
+            .store(order.len() as u64, Ordering::Release);
         {
             let live = self.land.row_mut(i, 0);
             live.copy_from_slice(&places);
@@ -3669,6 +3775,47 @@ impl SwapMachine {
                 "SwapMachine::set_call_floor",
                 "a prompt call open (begin_call)",
             )),
+        }
+    }
+
+    /// The open call's pick path's backlog bound from its next pick on: the
+    /// most of the call's jobs the staging thread may leave unstaged when a
+    /// pick issues another. The call's own until this; the boundary's issue
+    /// path keeps the machine's bound whatever this says, and the call's end
+    /// drops the value with the call. Refused by name with no call open and
+    /// for a bound of no jobs.
+    pub fn set_call_backlog(&mut self, backlog: u64) -> Result<(), GpuError> {
+        const WHAT_B: &str = "SwapMachine::set_call_backlog";
+        if backlog == 0 {
+            return Err(GpuError::shape(
+                WHAT_B,
+                "a backlog bound of at least one job (a pick always leaves the \
+                 staging thread one to take)",
+            ));
+        }
+        match self.call.as_mut() {
+            Some(c) => {
+                c.backlog = backlog;
+                Ok(())
+            }
+            None => Err(GpuError::state(WHAT_B, "a prompt call open (begin_call)")),
+        }
+    }
+
+    /// Read each pick's `staged_us` back, after the call's end: the layer's
+    /// stamp less the pick's start, whole microseconds, 0 where the layer
+    /// stamped nothing past the pick's start (a pick that moved nothing). A
+    /// layer the call picks again keeps one stamp cell, so an earlier pick
+    /// of it reads the later crossing. The stamps are final once every copy
+    /// landed, which the call's end waited for.
+    pub fn fill_staged_us(&self, picks: &mut [(usize, CallPick)]) {
+        for (_, p) in picks.iter_mut() {
+            let stamp = self
+                .shared
+                .pick_stamp_ns
+                .get(p.layer)
+                .map_or(0, |s| s.load(Ordering::Acquire));
+            p.staged_us = stamp.checked_sub(p.pick_at_ns).map_or(0, |ns| ns / 1_000);
         }
     }
 
