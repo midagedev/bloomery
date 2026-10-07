@@ -3272,21 +3272,33 @@ fn hw_q8k_codes_at_subnormal_scales() {
 /// (the strict `Gguf::open` refuses the first shard's bf16 `token_embd`):
 /// (name, k, row bytes, the first `rows` rows).
 fn v41_rows(ty: GgmlType, prefer: &str, rows: usize) -> (String, usize, usize, Vec<u8>) {
-    use std::os::unix::fs::FileExt;
-    let first = gguf::v41::model();
-    let shards: Vec<String> = match first.find("-00001-of-") {
-        Some(at) => (1..=99)
-            .map(|i| format!("{}-{i:05}-of-{}", &first[..at], &first[at + 10..]))
-            .take_while(|p| std::path::Path::new(p).exists())
-            .collect(),
-        None => vec![first.clone()],
-    };
     let block = match ty {
         GgmlType::Q3_K => 110,
         GgmlType::Q4_K => 144,
         GgmlType::Q5_K => 176,
         GgmlType::Q6_K => 210,
         _ => panic!("no tile row source for {ty:?}"),
+    };
+    split_rows(&gguf::v41::model(), ty, block, 256, prefer, rows)
+}
+
+/// [`v41_rows`] for any split set named by one of its shards (`first`, or the
+/// only file): the type's `block` bytes per `gran` values.
+fn split_rows(
+    first: &str,
+    ty: GgmlType,
+    block: usize,
+    gran: usize,
+    prefer: &str,
+    rows: usize,
+) -> (String, usize, usize, Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    let shards: Vec<String> = match first.find("-00001-of-") {
+        Some(at) => (1..=99)
+            .map(|i| format!("{}-{i:05}-of-{}", &first[..at], &first[at + 10..]))
+            .take_while(|p| std::path::Path::new(p).exists())
+            .collect(),
+        None => vec![first.to_string()],
     };
     for path in &shards {
         let inv = gguf::inventory_of(path).unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -3298,9 +3310,9 @@ fn v41_rows(ty: GgmlType, prefer: &str, rows: usize) -> (String, usize, usize, V
             continue;
         };
         let k = t.dims[0] as usize;
-        assert!(k.is_multiple_of(256), "{}: k = {k}", t.name);
+        assert!(k.is_multiple_of(gran), "{}: k = {k}", t.name);
         let n = t.dims[1..].iter().product::<u64>() as usize;
-        let row_bytes = block * k / 256;
+        let row_bytes = block * k / gran;
         assert_eq!(t.nbytes, Some((n * row_bytes) as u64), "{}: bytes", t.name);
         assert!(
             n >= rows,
@@ -3834,6 +3846,176 @@ fn hw_q8f0_tile_matches_dot_row() {
          bit-identical",
         d.k
     );
+}
+
+// ------------------------------------- IQ3_XXS, IQ4_XS and IQ4_NL tiles
+// The Qwen3.8 UD-Q3_K_XL routed experts: IQ3_XXS and IQ4_XS gate/up
+// (k = 2560, Q8_K columns), IQ4_NL down (k = 640, Q8_2_X4 columns). Each clause
+// runs random rows, end rows and the file's real rows through
+// `assert_tile_matches`.
+
+/// A kind of end block: its bytes, whole.
+type IqEnd = fn() -> Vec<u8>;
+
+/// f16 bits of 1.0, −1.0 and the smallest subnormal.
+const F16_ONE: u16 = 0x3C00;
+const F16_NEG_ONE: u16 = 0xBC00;
+const F16_TINY: u16 = 0x0001;
+
+/// An IQ3_XXS block: f16 `d`, the 64 grid index bytes from `idx`, the eight
+/// sign/scale words from `word`.
+fn iq3xxs_block(d: u16, idx: impl Fn(usize) -> u8, word: impl Fn(usize) -> u32) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    b.extend((0..64).map(idx));
+    for w in 0..8 {
+        b.extend_from_slice(&word(w).to_le_bytes());
+    }
+    b
+}
+
+/// An IQ4_XS block: f16 `d`, `scales_h`, `scales_l` and the 128 code bytes
+/// from `qs`.
+fn iq4xs_block(d: u16, scales_h: u16, scales_l: [u8; 4], qs: impl Fn(usize) -> u8) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    b.extend_from_slice(&scales_h.to_le_bytes());
+    b.extend_from_slice(&scales_l);
+    b.extend((0..128).map(qs));
+    b
+}
+
+/// An IQ4_NL block: f16 `d` and the 16 code bytes from `qs`.
+fn iq4nl_block(d: u16, qs: impl Fn(usize) -> u8) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    b.extend((0..16).map(qs));
+    b
+}
+
+/// IQ3_XXS end blocks: the largest grid entries with every sign bit and the
+/// top scale under either sign of `d`, the smallest scale with no signs, a
+/// scrambled pattern, d = 0 and a subnormal d.
+const IQ3XXS_ENDS: [IqEnd; 7] = [
+    || iq3xxs_block(F16_ONE, |_| 0xFF, |_| 0xFFFF_FFFF),
+    || iq3xxs_block(F16_NEG_ONE, |_| 0xFF, |_| 0xFFFF_FFFF),
+    || iq3xxs_block(F16_ONE, |_| 0xFF, |_| 0),
+    || iq3xxs_block(F16_ONE, |_| 0, |_| 0x0FFF_FFFF),
+    || {
+        iq3xxs_block(
+            F16_ONE,
+            |i| (i * 37 + 11) as u8,
+            |w| 0xA5C3_1E87u32.rotate_left(5 * w as u32),
+        )
+    },
+    || iq3xxs_block(0, |_| 0xFF, |_| 0xFFFF_FFFF),
+    || iq3xxs_block(F16_TINY, |i| i as u8, |_| 0xF0F0_F0F0),
+];
+
+/// IQ4_XS end blocks: every code 15 (offset 241, whose pair with a ±127
+/// column byte saturates `maddubs`) under the top and the bottom scales, every
+/// code 0, half-and-half nibbles, a ramp, d = 0 and a subnormal d.
+const IQ4XS_ENDS: [IqEnd; 8] = [
+    || iq4xs_block(F16_ONE, 0xFFFF, [0xFF; 4], |_| 0xFF),
+    || iq4xs_block(F16_NEG_ONE, 0xFFFF, [0xFF; 4], |_| 0xFF),
+    || iq4xs_block(F16_ONE, 0, [0; 4], |_| 0xFF),
+    || iq4xs_block(F16_ONE, 0xFFFF, [0xFF; 4], |_| 0),
+    || iq4xs_block(F16_ONE, 0xA5A5, [0x5A, 0xA5, 0x3C, 0xC3], |_| 0x0F),
+    || {
+        iq4xs_block(F16_ONE, 0x1234, [0x12, 0x34, 0x56, 0x78], |i| {
+            (i * 37) as u8
+        })
+    },
+    || iq4xs_block(0, 0xFFFF, [0xFF; 4], |_| 0xFF),
+    || iq4xs_block(F16_TINY, 0xFFFF, [0xFF; 4], |_| 0xF0),
+];
+
+/// IQ4_NL end blocks: every code 15 and every code 0 (|w| 113 and 127),
+/// alternating nibbles, a ramp, a negative d, d = 0 and a subnormal d.
+const IQ4NL_ENDS: [IqEnd; 7] = [
+    || iq4nl_block(F16_ONE, |_| 0xFF),
+    || iq4nl_block(F16_ONE, |_| 0),
+    || iq4nl_block(F16_ONE, |_| 0x0F),
+    || iq4nl_block(F16_ONE, |i| (i * 37) as u8),
+    || iq4nl_block(F16_NEG_ONE, |_| 0xF0),
+    || iq4nl_block(0, |_| 0xFF),
+    || iq4nl_block(F16_TINY, |i| i as u8),
+];
+
+/// A random block of `len` bytes whose f16 `d` (the first two bytes) is a
+/// finite scale of either sign.
+fn iq_random_block(rng: &mut Lcg, len: usize) -> Vec<u8> {
+    let mut b: Vec<u8> = (0..len).map(|_| (rng.next_u32() >> 13) as u8).collect();
+    b[0..2].copy_from_slice(&rand_f16(rng).to_le_bytes());
+    b
+}
+
+/// Random rows and end rows of `ty` at each of `ks`, against the ±3.0 and
+/// seeded columns: tile = `dot_row` per column, bit for bit. `block` bytes
+/// hold `gran` values.
+fn iq_tile_synthetic(ty: GgmlType, block: usize, gran: usize, ks: &[usize], ends: &[IqEnd]) {
+    let mut rng = Lcg(0x1A_7113 ^ block as u64);
+    for &k in ks {
+        let nb = k / gran;
+        let row_bytes = nb * block;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let mut rows = Vec::new();
+        for _ in 0..LEGACY_RANDOM_ROWS * nb {
+            rows.extend_from_slice(&iq_random_block(&mut rng, block));
+        }
+        let calls = assert_tile_matches(ty, "random rows", k, row_bytes, &rows, &cols);
+        eprintln!("{ty:?} tile: random rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+        let rows = legacy_end_rows(ends, nb, |end| end());
+        let calls = assert_tile_matches(ty, "end rows", k, row_bytes, &rows, &cols);
+        eprintln!("{ty:?} tile: end rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+    }
+}
+
+/// The first [`TILE_ROWS`] rows of the Qwen3.8 UD-Q3_K_XL routed-expert
+/// tensor of `ty` against the seeded columns: tile = `dot_row` per column.
+fn iq_tile_real(ty: GgmlType, block: usize, gran: usize) {
+    // The first shard of the file `tools/ref/build-qdot-ref.sh` names for the dumps.
+    let first =
+        "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+    let (name, k, row_bytes, bytes) = split_rows(first, ty, block, gran, "exps", TILE_ROWS);
+    let calls = assert_tile_matches(
+        ty,
+        &name,
+        k,
+        row_bytes,
+        &bytes,
+        &legacy_tile_columns(ty, k, vec![]),
+    );
+    eprintln!("{ty:?} tile: {name} (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+}
+
+/// IQ3_XXS tile clause: random rows and the ends of [`IQ3XXS_ENDS`] at k =
+/// 2560 (gate/up), 768 and 256, then the file's first routed-expert rows —
+/// tile = `dot_row` per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2) and the Qwen3.8 UD-Q3_K_XL file"]
+fn hw_iq3xxs_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ3_XXS, 98, 256, &[2560, 768, 256], &IQ3XXS_ENDS);
+    iq_tile_real(GgmlType::IQ3_XXS, 98, 256);
+}
+
+/// IQ4_XS tile clause: random rows and the ends of [`IQ4XS_ENDS`] (the code-15
+/// blocks reach the `maddubs` saturation against the ±3.0 columns) at k =
+/// 2560, 768 and 256, then the file's first routed-expert rows — tile =
+/// `dot_row` per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2) and the Qwen3.8 UD-Q3_K_XL file"]
+fn hw_iq4xs_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ4_XS, 136, 256, &[2560, 768, 256], &IQ4XS_ENDS);
+    iq_tile_real(GgmlType::IQ4_XS, 136, 256);
+}
+
+/// IQ4_NL tile clause: random rows and the ends of [`IQ4NL_ENDS`] at each of
+/// [`LEGACY_TILE_KS`] (640 is the routed down; 736 and 96 end in tail blocks),
+/// then the file's first routed-expert rows — tile = `dot_row` per column, bit
+/// for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2) and the Qwen3.8 UD-Q3_K_XL file"]
+fn hw_iq4nl_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ4_NL, 18, 32, &LEGACY_TILE_KS, &IQ4NL_ENDS);
+    iq_tile_real(GgmlType::IQ4_NL, 18, 32);
 }
 
 /// A tile call's column count outside `1..=TILE_COLS`, an `out` of another
