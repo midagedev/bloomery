@@ -22,11 +22,15 @@
 //! - rows: the half's ring row holds slot `i` for the `i`-th streamed expert
 //!   and HOST for every other; its union row the stage map's places with
 //!   `n_card + i` for the `i`-th.
-//! - landed: with every fill thread held [`LANE_HOLD`] a job, a copy of each
-//!   streamed slot the engine stream makes right after the layer reads the
-//!   source's bytes of that slot's expert, part by part (mutants: the engine
-//!   stream's wait for the landed event removed; a part copied 16 bytes off
-//!   its place).
+//! - landed: with every fill thread held [`LANE_HOLD`] a job, the stream's
+//!   copies record one event a batch, a third of them ([`land_batch_size`]):
+//!   a snapshot of the whole half behind the first batch's event alone reads
+//!   that batch's slots the source's bytes and every later batch's the bytes
+//!   the probe left there (mutants: a single event for the whole layer, the
+//!   one-wait shape this gate replaces, or an event recorded before its
+//!   batch's own copies), and one behind every batch's event reads each slot
+//!   its expert's source bytes, part by part (mutant: a batch's wait
+//!   dropped; a part copied 16 bytes off its place).
 //! - reuse: with the engine stream held by a host flag over a copy of a
 //!   half's slots and the read after it, the half's next stream (two later)
 //!   is issued and the host waits [`HOST_WAIT`] before it lets the engine go: the
@@ -71,7 +75,7 @@ mod gate {
     use bloomery_gpu::host::slots::HOST;
     use bloomery_gpu::host::swap::{Piece, SwapSource, Transform};
     use bloomery_gpu::host::xstream::{
-        Costs, PARTS, RingLayer, XCfg, XSTREAM_ROOM, XStream, stream_tail,
+        Costs, PARTS, RingLayer, XCfg, XSTREAM_ROOM, XStream, land_batch_size, stream_tail,
     };
     use bloomery_gpu::{Gpu, GpuError, HostFlags};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
@@ -351,7 +355,7 @@ mod gate {
         );
         ok &= probe_ok;
 
-        // set, rows, landed
+        // set, rows, landed (a batch a third of the stream)
         x.begin_call();
         x.delay_lane(LANE_HOLD);
         let ca = counts(UNIT_A);
@@ -361,9 +365,25 @@ mod gate {
             .ring_layer(0)
             .ok_or("a ring view of a layer that streamed")?;
         let snap = DeviceBuffer::<u8>::zeroed(stream, HALF * PART_BYTES.iter().sum::<usize>())?;
+        // The first batch's event alone: every later batch's copies are
+        // still behind held fill-thread jobs, so their slots read the bytes
+        // the probe left in the half — one event a batch is real.
+        let per = land_batch_size(r.n);
+        let one: usize = PART_BYTES.iter().sum();
+        if let Some(e) = r.batches.first().and_then(|b| b.event.as_deref()) {
+            stream.wait(e)?;
+        }
+        snapshot(stream, &r, r.n, &snap)?;
+        let first = snap.to_host_vec(stream)?;
+        let boundary_ok = r.batches.len() > 1
+            && bytes_match(&src, 0, &want_a[..per], &first)
+            && !bytes_match(&src, 0, &want_a[per..], &first[per * one..]);
+        // Every batch's event: each slot reads its own expert's bytes.
+        x.wait_layer(stream, 0)?;
         snapshot(stream, &r, r.n, &snap)?;
         let got = snap.to_host_vec(stream)?;
         x.delay_lane(Duration::ZERO);
+        let landed_ok = boundary_ok && bytes_match(&src, 0, &want_a, &got);
         let mut sorted = want_a.clone();
         sorted.sort_unstable();
         let host_columns: u64 = host()
@@ -404,11 +424,14 @@ mod gate {
             verdict(rows_ok)
         );
         ok &= rows_ok;
-        let landed_ok = bytes_match(&src, 0, &want_a, &got);
         println!(
-            "landed: with every fill thread held {LANE_HOLD:?} a job, the engine stream's copy right \
-             after the layer reads each streamed slot's source bytes {}",
-            verdict(landed_ok)
+            "landed: with every fill thread held {LANE_HOLD:?} a job, the first batch's event \
+             ({} of {} slots) alone lands its own slots and leaves the later batches' uncopied \
+             {}, and every batch's event lands each slot its expert's bytes {}",
+            per,
+            r.n,
+            verdict(boundary_ok),
+            verdict(bytes_match(&src, 0, &want_a, &got))
         );
         ok &= landed_ok;
         x.read(0, stream)?;
@@ -554,10 +577,11 @@ mod gate {
         if ok {
             println!(
                 "gate_xstream: PASS — the stream is the rule's set cut at the half in rank order, \
-                 its rows and exclusion set say so, the engine stream reads a slot only once its \
-                 copy has landed, a half's next stream waits for the half's read, an unread \
-                 stream refuses the call's end, a stuck lane is a named error within its \
-                 deadline, and a ring with no room is refused by its own name."
+                 its rows and exclusion set say so, the engine stream reads a batch's slots only \
+                 once that batch's copies have landed (a batch a third of them), a half's next \
+                 stream waits for the half's read, an unread stream refuses the call's end, a \
+                 stuck lane is a named error within its deadline, and a ring with no room is \
+                 refused by its own name."
             );
             Ok(())
         } else {

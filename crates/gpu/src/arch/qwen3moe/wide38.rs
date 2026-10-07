@@ -76,21 +76,25 @@
 //! counts the unit's routed ids and the machine's pick
 //! (`SwapMachine::call_pick`, the least count admitted [`STREAM_FLOOR`] under
 //! `admit`, the stream rule's floor under `split`) sends the pool's coldest
-//! residents to the host and copies the hottest host experts over them; the
-//! engine stream waits for those copies before the card route, and the
-//! serve's union and the card route both run under the moved map. Under
-//! `split` the expert stream ([`crate::host::xstream`]) then sends the host
-//! experts its rule picks to a half of its ring for this unit alone, and the
-//! card route runs a second set of its launches over that half
-//! ([`CardRoute38::enqueue`]'s ring pass) before the card sum, which reads
-//! the stack's places and the ring's together; the serve's union leaves the
-//! streamed experts out. The route is then the layer's reader of the call
-//! ([`Gemm38::stream_read`]), which the next ubatch's pick and the ring's
-//! next use of the half copy behind. The call's placement stays for the
-//! decode after it; the stream's does not. A token's bits then depend on its
-//! ubatch's routing too — which of its experts the pick moved or the stream
-//! sent sums on the card, not the host — so the numeric class above holds
-//! for an unstreamed walk only.
+//! residents to the host and copies the hottest host experts over them, in
+//! victim-slot order a landing batch a third of them, each batch's event on
+//! the copy stream after its last copy; the card route runs a GEMM batch
+//! over each batch's slots behind its own event — the slots no copy lands
+//! in first, waiting nothing — so the copies and the route's GEMMs pipeline
+//! instead of the route waiting for them all, and the serve's union and the
+//! card route both run under the moved map. Under `split` the expert stream
+//! ([`crate::host::xstream`]) then sends the host experts its rule picks to
+//! a half of its ring for this unit alone, its copies batched the same way,
+//! and the card route runs a second set of its launches over that half
+//! ([`CardRoute38::enqueue`]'s ring pass, a GEMM batch a landing batch)
+//! before the card sum, which reads the stack's places and the ring's
+//! together; the serve's union leaves the streamed experts out. The route is
+//! then the layer's reader of the call ([`Gemm38::stream_read`]), which the
+//! next ubatch's pick and the ring's next use of the half copy behind. The
+//! call's placement stays for the decode after it; the stream's does not. A
+//! token's bits then depend on its ubatch's routing too — which of its
+//! experts the pick moved or the stream sent sums on the card, not the host
+//! — so the numeric class above holds for an unstreamed walk only.
 
 use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
@@ -112,7 +116,7 @@ use crate::host::BatchLeg;
 use crate::host::handoff::Places;
 use crate::host::run::HostRun;
 use crate::host::swap::{CallPick, CallReport};
-use crate::host::xstream::{RingLayer, XLayer, XMode, XReport};
+use crate::host::xstream::{LandBatch, RingLayer, XLayer, XMode, XReport};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -126,7 +130,7 @@ use crate::q38::{
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::DeviceTensor;
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -342,6 +346,9 @@ pub(super) struct CardRoute38 {
     /// The identity map over the experts (`e -> e`): the ids compression's
     /// stand-in for the places rule's map.
     ids_map: DeviceBuffer<u32>,
+    /// A landing batch's places, the batched stack pass's (a batch at a
+    /// time; `sel` holds the full run's for the card sum).
+    bsel: DeviceBuffer<u32>,
     /// The ring pass's buffers once the load armed the expert stream
     /// ([`CardRoute38::arm_ring`]).
     ring: Option<RingRoute38>,
@@ -372,6 +379,86 @@ fn down_weight(
             format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
         )),
     }
+}
+
+/// One GEMM batch of a route pass over `map` — the batch's places, a
+/// host-mapped row of a landing batch ([`LandBatch`]) or the card's own map
+/// copy for the whole of a pass nothing batched — with the engine stream
+/// `stream` waiting `wait` first (the batch's landed event; `None` for a
+/// batch nothing lands in): the places into `sel`, the route table over the
+/// map, the gate and up GEMMs, the SwiGLU over `sel` (every place below
+/// `n_places` a column it writes) and the down GEMM into the run's `down_y`
+/// rows. Six launches; only the batch's slots are touched, so a pass's
+/// batches write the rows the whole pass always wrote, the same kernels on
+/// the same values — the bits do not move.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the batch's context, wait, ids, map, weights, width, places bound, sink, run rows and buffers (rust-quality R8)"
+)]
+fn enqueue_gemm_batch(
+    c: &Ctx38<'_>,
+    stream: &CudaStream,
+    wait: Option<&CudaEvent>,
+    (walk_ids, ids): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
+    map: &DeviceBuffer<u32>,
+    (ty, gate, up): (GemmWeight, &DeviceTensor<u32>, &DeviceTensor<u32>),
+    down: Gemm32Weight<'_>,
+    (n, n_places): (usize, usize),
+    sink: FaultSink,
+    down_y: &mut DeviceBuffer<f32>,
+    (x, g, u, act): (
+        &GemmAct,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut GemmAct32,
+    ),
+    (sel, route): (&mut DeviceBuffer<u32>, &mut GemmRoute),
+) -> Result<(), GpuError> {
+    if let Some(e) = wait {
+        stream.wait(e)?;
+    }
+    c.k.handoff.enqueue_places_cols(
+        stream,
+        &Places {
+            ids: walk_ids,
+            map,
+            row_off: 0,
+            n_expert: map.len(),
+        },
+        geo::N_USED + 1,
+        n,
+        sink,
+        sel,
+    )?;
+    c.k.g32
+        .enqueue_route_remap(stream, ids, map, n * geo::N_USED, route, sink)?;
+    for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
+        c.k.gemm.enqueue_gemm(
+            stream,
+            GemmArgs {
+                ty,
+                w,
+                rows_per_expert: geo::FF,
+                act: x,
+                route,
+                input: GemmInput::Shared { top_k: geo::N_USED },
+                y,
+            },
+        )?;
+    }
+    c.k.g32
+        .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_places, n * geo::N_USED, act, sink)?;
+    c.k.g32.enqueue_gemm32(
+        stream,
+        Gemm32Args {
+            w: down,
+            rows_per_expert: geo::HIDDEN,
+            act,
+            route,
+            input: GemmInput::PerSlot,
+            y: down_y,
+        },
+    )
 }
 
 impl CardRoute38 {
@@ -428,6 +515,7 @@ impl CardRoute38 {
                 stream,
                 &(0..geo::EXPERTS as u32).collect::<Vec<_>>(),
             )?,
+            bsel: DeviceBuffer::zeroed(stream, kept)?,
             ring: None,
         })
     }
@@ -469,6 +557,7 @@ impl CardRoute38 {
             + self.trank.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
             + self.ids_map.num_bytes()
+            + self.bsel.num_bytes()
             + self.ring.as_ref().map_or(0, |r| {
                 r.route.bytes() + r.sel.num_bytes() + r.union.num_bytes()
             })
@@ -493,32 +582,34 @@ impl CardRoute38 {
 
     /// Enqueue layer `l`'s card route over the unit's `m` tokens (module
     /// doc): per run of at most `run` tokens, the compressed ids and the
-    /// places from the walk's ids (`ids`, eleven slots a token, the shared
-    /// expert's last — never read), the remapped route table over the slot
-    /// map's layer row (`slots`), the q8_1 of the run's normed rows
-    /// (`ffn_x`, `[m][HIDDEN]`), the gate and up GEMMs of the layer's type
-    /// (Q4_K or Q5_K) over the unit's ten slots a token, the card slots'
-    /// SwiGLU, the down GEMM of its type (the file's Q5_1 or Q8_0 blocks) and
-    /// the card sum by the router's weights (`weights`, eleven a token)
-    /// into the unit-wide acc's rows for the run. Nine launches a run. On a
+    /// full places from the walk's ids (`ids`, eleven slots a token, the
+    /// shared expert's last — never read), the q8_1 of the run's normed rows
+    /// (`ffn_x`, `[m][HIDDEN]`), then the stack pass as one GEMM batch a
+    /// landing batch of the layer's pick (`land`, [`enqueue_gemm_batch`]):
+    /// the leading batch the slots no copy lands in, which wait nothing,
+    /// then the admits' slots in slot order, each batch behind its own
+    /// landed event — or, when the pick moved nothing, the whole stack at
+    /// once over the slot map's layer row (`slots`) as the pass always ran.
+    /// The card sum by the router's weights (`weights`, eleven a token)
+    /// into the unit-wide acc's rows for the run reads the full places. On a
     /// tier layer (`tiered`) the card sum is the join's
-    /// ([`CardRoute38::enqueue_tier_acc`]): eight launches a run, the places
-    /// and the down rows kept at the run's tokens of the unit.
+    /// ([`CardRoute38::enqueue_tier_acc`]): the places and the down rows
+    /// kept at the run's tokens of the unit.
     ///
     /// With the layer's stream (`ring`, a half of the expert stream's ring)
-    /// each run then runs the ring pass before the card sum: the slots'
-    /// places in the half (the ring row) and in the card sum's (the union
-    /// row), the ring's route table, the gate and up GEMMs over the half, the
-    /// SwiGLU of the streamed slots and the down GEMM over the half — seven
-    /// launches — and the card sum reads the union places at the stack's
-    /// experts plus the streamed ones, so the stack's and the ring's slots
-    /// sum in slot order in one launch. Refused by name: a layer without card
-    /// experts, a stream on a tier layer, and a stream on a route the load
-    /// did not arm ([`CardRoute38::arm_ring`]). Asynchronous,
-    /// allocation-free, capturable.
+    /// each run then runs the ring pass before the card sum, one GEMM batch
+    /// a landing batch of the stream's copies — each behind its own event,
+    /// the route table and the gate and up GEMMs over the batch's map row,
+    /// the SwiGLU of the batch's streamed slots and the down GEMM — and the
+    /// card sum reads the union places at the stack's experts plus the
+    /// streamed ones, so the stack's and the ring's slots sum in slot order
+    /// in one launch. Refused by name: a layer without card experts, a
+    /// stream on a tier layer, and a stream on a route the load did not arm
+    /// ([`CardRoute38::arm_ring`]). Asynchronous, allocation-free,
+    /// capturable.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the route's ids, weights, normed rows, the slot map, the layer, the unit's width and the stream (rust-quality R8)"
+        reason = "the route's ids, weights, normed rows, the slot map, the layer, the unit's width, the stream and the pick's batches (rust-quality R8)"
     )]
     pub(super) fn enqueue(
         &mut self,
@@ -529,6 +620,7 @@ impl CardRoute38 {
         slots: &DeviceTensor<u32>,
         (m, tiered): (usize, bool),
         ring: Option<&RingLayer>,
+        land: &[LandBatch],
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
         let (n_card, gate, up) = (st.n_card, st.gate, st.up);
@@ -566,15 +658,14 @@ impl CardRoute38 {
             ));
         }
         let ctx = gpu.context();
-        // SAFETY: the stream's ring row and union row are `EXPERTS` words of
-        // its mapped host rows, and its half holds `half_slots` experts of
-        // this layer's part bytes in each part from the half's first slot —
-        // its gate and up rows of the stack's words, its down rows likewise
+        // SAFETY: the stream's union row is `EXPERTS` words of its mapped
+        // host rows, and its half holds `half_slots` experts of this layer's
+        // part bytes in each part from the half's first slot — its gate and
+        // up rows of the stack's words, its down rows likewise
         // (`XStream::ring_layer`); all stay allocated while the stream lives,
         // past these launches, and the windows are given back below.
         let windows = ring.map(|r| unsafe {
             (
-                crate::tensor::window::<u32>(r.ring_map, geo::EXPERTS, ctx),
                 crate::tensor::window::<u32>(r.union_map, geo::EXPERTS, ctx),
                 DeviceTensor::<u32>::window(r.parts[0], r.half_slots * geo::FF, gate.cols(), ctx),
                 DeviceTensor::<u32>::window(r.parts[1], r.half_slots * geo::FF, up.cols(), ctx),
@@ -630,103 +721,84 @@ impl CardRoute38 {
                     )
                 };
                 places(&self.ids_map, &mut self.ids)?;
-                places(&map, &mut sel_w)?;
                 let table = self.table_at(n_card)?;
-                c.k.g32.enqueue_route_remap(
-                    stream,
-                    &self.ids,
-                    &map,
-                    n * geo::N_USED,
-                    &mut self.routes[table],
-                    sink,
-                )?;
                 gpu.enqueue_quantize_gemm(&x_w, n, &mut self.x, sink)?;
-                for (w, y) in [(gate, &mut self.g), (up, &mut self.u)] {
-                    c.k.gemm.enqueue_gemm(
+                // The stack pass: one GEMM batch a landing batch of the
+                // layer's pick, the leading one (nothing lands in it) first,
+                // or the whole stack at once when the pick moved nothing.
+                if land.is_empty() {
+                    enqueue_gemm_batch(
+                        c,
                         stream,
-                        GemmArgs {
-                            ty: gate_up_ty,
-                            w,
-                            rows_per_expert: geo::FF,
-                            act: &self.x,
-                            route: &self.routes[table],
-                            input: GemmInput::Shared { top_k: geo::N_USED },
-                            y,
-                        },
+                        None,
+                        (&ids_w, &self.ids),
+                        &map,
+                        (gate_up_ty, gate, up),
+                        down,
+                        (n, n_card),
+                        sink,
+                        &mut down_w,
+                        (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                        (&mut sel_w, &mut self.routes[table]),
                     )?;
+                } else {
+                    // The full places beside the batches: the card sum's
+                    // (the join's on a tier layer).
+                    places(&map, &mut sel_w)?;
+                    for b in land {
+                        // SAFETY: the batch's map row is `EXPERTS` words of
+                        // its host-mapped row (`LandBatch`), filled before
+                        // this launch was enqueued and reused only after the
+                        // walk's order has this run complete.
+                        let bmap =
+                            unsafe { crate::tensor::window::<u32>(b.map, geo::EXPERTS, ctx) };
+                        let ran = enqueue_gemm_batch(
+                            c,
+                            stream,
+                            b.event.as_deref(),
+                            (&ids_w, &self.ids),
+                            &bmap,
+                            (gate_up_ty, gate, up),
+                            down,
+                            (n, n_card),
+                            sink,
+                            &mut down_w,
+                            (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                            (&mut self.bsel, &mut self.routes[table]),
+                        );
+                        drop(std::mem::ManuallyDrop::into_inner(bmap).into_raw_parts());
+                        ran?;
+                    }
                 }
-                c.k.g32.enqueue_swiglu_quant32_sel(
-                    stream,
-                    &self.g,
-                    &self.u,
-                    &sel_w,
-                    n_card,
-                    n * geo::N_USED,
-                    &mut self.act,
-                    sink,
-                )?;
-                c.k.g32.enqueue_gemm32(
-                    stream,
-                    Gemm32Args {
-                        w: down,
-                        rows_per_expert: geo::HIDDEN,
-                        act: &self.act,
-                        route: &self.routes[table],
-                        input: GemmInput::PerSlot,
-                        y: &mut down_w,
-                    },
-                )?;
                 // The card sum's places and experts: the stack's, or with a
                 // stream the union row's over the stack's and the ring's.
                 let mut sum_places = (&*sel_w, n_card);
-                if let (Some(r), Some((ring_map, union_map, wg, wu, wd)), Some(rr)) =
+                if let (Some(r), Some((union_map, wg, wu, wd)), Some(rr)) =
                     (ring, windows.as_ref(), self.ring.as_mut())
                 {
-                    places(ring_map, &mut rr.sel)?;
                     places(union_map, &mut rr.union)?;
-                    c.k.g32.enqueue_route_remap(
-                        stream,
-                        &self.ids,
-                        ring_map,
-                        n * geo::N_USED,
-                        &mut rr.route,
-                        sink,
-                    )?;
-                    for (w, y) in [(&**wg, &mut self.g), (&**wu, &mut self.u)] {
-                        c.k.gemm.enqueue_gemm(
+                    for b in &r.batches {
+                        // SAFETY: as the stack pass's batch rows, the
+                        // stream's own.
+                        let bmap =
+                            unsafe { crate::tensor::window::<u32>(b.map, geo::EXPERTS, ctx) };
+                        let ran = enqueue_gemm_batch(
+                            c,
                             stream,
-                            GemmArgs {
-                                ty: gate_up_ty,
-                                w,
-                                rows_per_expert: geo::FF,
-                                act: &self.x,
-                                route: &rr.route,
-                                input: GemmInput::Shared { top_k: geo::N_USED },
-                                y,
-                            },
-                        )?;
+                            b.event.as_deref(),
+                            (&ids_w, &self.ids),
+                            &bmap,
+                            (gate_up_ty, wg, wu),
+                            down_weight(l, st.down_ty, wd)?,
+                            (n, r.n),
+                            sink,
+                            &mut down_w,
+                            (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                            (&mut rr.sel, &mut rr.route),
+                        );
+                        drop(std::mem::ManuallyDrop::into_inner(bmap).into_raw_parts());
+                        ran?;
                     }
-                    c.k.g32.enqueue_swiglu_quant32_sel(
-                        stream,
-                        &self.g,
-                        &self.u,
-                        &rr.sel,
-                        r.n,
-                        n * geo::N_USED,
-                        &mut self.act,
-                        sink,
-                    )?;
-                    c.k.g32.enqueue_gemm32(
-                        stream,
-                        Gemm32Args {
-                            w: down_weight(l, st.down_ty, wd)?,
-                            rows_per_expert: geo::HIDDEN,
-                            act: &self.act,
-                            route: &rr.route,
-                            input: GemmInput::PerSlot,
-                            y: &mut down_w,
-                        },
-                    )?;
                     sum_places = (&rr.union, n_card + r.n);
                 }
                 if !tiered {
@@ -748,10 +820,8 @@ impl CardRoute38 {
             }
             Ok(())
         })();
-        if let Some((ring_map, union_map, wg, wu, wd)) = windows {
-            for w in [ring_map, union_map] {
-                drop(std::mem::ManuallyDrop::into_inner(w).into_raw_parts());
-            }
+        if let Some((union_map, wg, wu, wd)) = windows {
+            drop(std::mem::ManuallyDrop::into_inner(union_map).into_raw_parts());
             for w in [wg, wu, wd] {
                 DeviceTensor::release(w);
             }
@@ -1291,11 +1361,17 @@ impl WideParts<'_> {
     /// Layer `l`'s card route over the arena's `ffn_x`, when it has card
     /// experts ([`CardRoute38::enqueue`], the walk's module doc): the places
     /// from the walk's ids, the grouped gate·up, SwiGLU and down over the
-    /// run's tokens, the ring pass over the layer's stream when `ring` is
-    /// one, the card sums into the unit-wide acc. Called from the walk's
-    /// shadow only — after the front's download, the stream order the
-    /// route's buffers exist under.
-    fn route_card(&mut self, l: usize, ring: Option<&RingLayer>) -> Result<(), GpuError> {
+    /// run's tokens — a GEMM batch a landing batch of the pick (`land`), each
+    /// behind its own landed event — the ring pass over the layer's stream
+    /// when `ring` is one, the card sums into the unit-wide acc. Called from
+    /// the walk's shadow only — after the front's download, the stream order
+    /// the route's buffers exist under.
+    fn route_card(
+        &mut self,
+        l: usize,
+        ring: Option<&RingLayer>,
+        land: &[LandBatch],
+    ) -> Result<(), GpuError> {
         if !self.card.has(l) {
             return Ok(());
         }
@@ -1314,6 +1390,7 @@ impl WideParts<'_> {
             self.slots,
             (m, tiered),
             ring,
+            land,
         )
     }
 
@@ -1840,23 +1917,25 @@ impl<'a> Gemm38<'a> {
     /// (`SwapMachine::call_pick`, the least count admitted [`STREAM_FLOOR`]
     /// under `admit`, [`pick_floor`] under `split`) sends the pool's coldest
     /// residents to the host and copies the unit's hottest host experts over
-    /// them, the host map and the card's copy of the layer's words moved at
-    /// once — so the union the walk's serve runs next, and the card route,
-    /// run under the moved map — then the engine stream waits for the pick's
-    /// copies. Under `split` the expert stream then takes the layer
-    /// ([`crate::host::HostTier::xstream_layer`]): the host experts its rule
-    /// sends to the card stream into a half of its ring, the engine stream
-    /// waits for their copies, and the serve leaves them out; the layer's
-    /// ring view for its card route is returned. Nothing else, and nothing in
-    /// a unit of fewer rows than the floor.
+    /// them — in victim-slot order, a landing batch a third of them, each
+    /// batch's event on the copy stream after its last copy ([`LandBatch`])
+    /// — the host map and the card's copy of the layer's words moved at
+    /// once, so the union the walk's serve runs next, and the card route,
+    /// run under the moved map, each GEMM batch waiting its own batch's
+    /// event and no later copy. Under `split` the expert stream then takes
+    /// the layer ([`crate::host::HostTier::xstream_layer`]): the host
+    /// experts its rule sends to the card stream into a half of its ring,
+    /// its copies batched the same way, and the serve leaves them out; the
+    /// layer's ring view for its card route is returned. Nothing else, and
+    /// nothing in a unit of fewer rows than the floor.
     fn stream_pick(
         &mut self,
         port: &mut BatchLeg<'a, HostRun>,
         at: At,
-    ) -> Result<Option<RingLayer>, GpuError> {
+    ) -> Result<(Option<RingLayer>, Vec<LandBatch>), GpuError> {
         let l = at.layer;
         if !self.p.stream.on || !self.p.card.has(l) {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
         let split = self.p.stream.split;
         // The stream's floor only where its ring is lit: a narrower unit
@@ -1871,7 +1950,7 @@ impl<'a> Gemm38<'a> {
         // pick admits (a call's last ubatch can be one), and the stream's
         // least width is wider than its floor.
         if self.p.m < floor as usize {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
@@ -1879,23 +1958,20 @@ impl<'a> Gemm38<'a> {
         if split {
             port.hybrid().call_floor(floor)?;
         }
-        let pick = port
+        let mut pick = port
             .hybrid()
             .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?;
+        let admitted = pick.admitted;
+        let land = std::mem::take(&mut pick.land);
         s.picks.push((s.ubatch, pick));
-        let landed = port.hybrid().call_landed(l)?.ok_or(GpuError::state(
-            WHAT,
-            "a residency machine's call for the streamed layer",
-        ))?;
-        stream.wait(landed)?;
         if !split {
-            return Ok(None);
+            return Ok((None, land));
         }
         let x = port
             .hybrid()
-            .xstream_layer(stream, key, self.p.m, &s.counts, pick.admitted)?;
+            .xstream_layer(stream, key, self.p.m, &s.counts, admitted)?;
         s.layers.push((s.ubatch, x));
-        Ok(port.hybrid().xstream_ring(l))
+        Ok((port.hybrid().xstream_ring(l), land))
     }
 
     /// Under host streaming, on a layer with card experts, the layer's last
@@ -1985,20 +2061,21 @@ impl<'a> LayerProgram for Gemm38<'a> {
     /// the d2h would queue behind the route's card GEMMs and the host tier
     /// would start late by their whole time. Under host streaming the shared
     /// expert comes first, so the card runs it while the host counts and
-    /// picks; then the layer's pick (and stream) and the route after its
-    /// copies ([`Gemm38::stream_pick`]), the route the layer's last read of
-    /// its slots in the call ([`Gemm38::stream_read`]).
+    /// picks; then the layer's pick (and stream) and the route, its GEMM
+    /// batches each behind the landing batch it reads ([`Gemm38::stream_pick`]),
+    /// the route the layer's last read of its slots in the call
+    /// ([`Gemm38::stream_read`]).
     fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
         let r = if self.p.stream.on {
             self.p
                 .shared(at.layer)
                 .and_then(|()| self.stream_pick(port, at))
-                .and_then(|ring| self.p.route_card(at.layer, ring.as_ref()))
+                .and_then(|(ring, land)| self.p.route_card(at.layer, ring.as_ref(), &land))
                 .and_then(|()| self.stream_read(port, at.layer))
         } else {
             self.p
-                .route_card(at.layer, None)
+                .route_card(at.layer, None, &[])
                 .and_then(|()| self.p.shared(at.layer))
         }
         .and_then(|()| port.mark(at, Mark::Shadow as usize));

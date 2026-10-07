@@ -149,6 +149,7 @@ use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
 use runtime::swaprule::{Flip, KeptRows, Shape, SwapParams, SwapRule};
 
 use super::slots::{HOST, Slot, SlotMap};
+use super::xstream::{LandBatch, LandRows, land_batch_size};
 use super::{Drain, drain_within, poll_drained};
 use crate::GpuError;
 use crate::graph::{MappedHost, cu, mem_batch, op_write};
@@ -1478,7 +1479,7 @@ pub struct CallCfg {
 
 /// What one pick did ([`SwapMachine::call_pick`]), for the `call stream`
 /// record.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct CallPick {
     pub layer: usize,
     /// Experts admitted, each in place of a pool resident sent to the host.
@@ -1497,6 +1498,12 @@ pub struct CallPick {
     /// Of those, host microseconds it waited for the staging thread to take
     /// in enough of the call's earlier jobs.
     pub backlog_us: u64,
+    /// The pick's landing batches, a GEMM batch each ([`LandBatch`]): the
+    /// leading one the layer's live slots (no copy lands in them), then the
+    /// admits' slots in slot order, a third of them a batch. The layer's
+    /// card route waits each batch's event before the GEMM batch over its
+    /// slots, so the copies and the GEMMs pipeline.
+    pub land: Vec<LandBatch>,
 }
 
 /// What a call did ([`SwapMachine::end_call`]).
@@ -1638,6 +1645,8 @@ pub struct SwapMachine {
     call_read: Vec<CudaEvent>,
     call: Option<Call>,
     picks: Vec<Flip>,
+    /// The pick's landing batches' map rows and events ([`LandRows`]).
+    land: LandRows,
     tx: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
@@ -1767,6 +1776,7 @@ impl SwapMachine {
         let call_read = (0..layers.len())
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
+        let land = LandRows::new(ctx, layers.len(), n_expert)?;
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
         let Staging { shared, tx, thread } =
@@ -1800,6 +1810,7 @@ impl SwapMachine {
             call_read,
             call: None,
             picks: Vec::new(),
+            land,
             tx: Some(tx),
             thread: Some(thread),
             shared,
@@ -3125,7 +3136,14 @@ impl SwapMachine {
         Ok(())
     }
 
-    /// A pick's changes, the first on ([`SwapMachine::call_pick`]).
+    /// A pick's changes, the first on ([`SwapMachine::call_pick`]). The
+    /// copies land in victim-slot order, a landing batch a third of them
+    /// ([`land_batch_size`]), each batch's event recorded on the copy stream
+    /// after its last copy: the layer's card route runs a GEMM batch over
+    /// each batch's slots behind its own event, the slots no copy lands in
+    /// first, so the copies and the route's GEMMs pipeline instead of the
+    /// route waiting for them all. The pick's set is the same either order —
+    /// each flip a distinct slot — so only the copy stream's order moves.
     fn move_pool(
         &mut self,
         stream: &CudaStream,
@@ -3150,13 +3168,62 @@ impl SwapMachine {
             to.push(s);
         }
         self.copy.wait(&self.call_read[i])?;
-        for (f, &s) in picks.iter().zip(&to) {
+        // The batches' rows before any copy: the layer's places as the stage
+        // card reads them, batch 0 the live slots (every victim HOST), batch
+        // b the b-th landing batch's admits at their slots, every other
+        // expert HOST.
+        let row = slots
+            .row(layer)
+            .ok_or_else(|| GpuError::protocol(WHAT, format!("layer {layer} outside the map")))?;
+        let places: Vec<u32> = row
+            .iter()
+            .map(|&w| match Slot::of(w) {
+                Slot::Card(s) => s,
+                Slot::Host | Slot::Tier { .. } => HOST,
+            })
+            .collect();
+        let mut order: Vec<(usize, u32)> = picks
+            .iter()
+            .zip(&to)
+            .enumerate()
+            .map(|(j, (_, &s))| (j, s))
+            .collect();
+        order.sort_unstable_by_key(|&(_, s)| s);
+        let per = land_batch_size(order.len());
+        let batches = order.len().div_ceil(per);
+        {
+            let live = self.land.row_mut(i, 0);
+            live.copy_from_slice(&places);
+            for f in picks {
+                live[f.evict as usize] = HOST;
+            }
+            for b in 0..batches {
+                let row = self.land.row_mut(i, b + 1);
+                row.fill(HOST);
+                for &(j, s) in &order[b * per..order.len().min((b + 1) * per)] {
+                    row[picks[j].admit as usize] = s;
+                }
+            }
+        }
+        for (k, &(j, s)) in order.iter().enumerate() {
             let t = Instant::now();
             self.wait_backlog(WHAT)?;
             report.backlog_us += micros(t);
-            report.bytes += self.copy_into(slots, layer, f.admit, s, None, Gate::Waited)?;
+            report.bytes += self.copy_into(slots, layer, picks[j].admit, s, None, Gate::Waited)?;
+            if (k + 1) % per == 0 || k + 1 == order.len() {
+                self.land.event(i, k / per).record(&self.copy)?;
+            }
         }
         self.call_landed[i].record(&self.copy)?;
+        report.land.reserve(batches + 1);
+        report.land.push(LandBatch {
+            map: self.land.row_dev(i, 0),
+            event: None,
+        });
+        report.land.extend((0..batches).map(|b| LandBatch {
+            map: self.land.row_dev(i, b + 1),
+            event: Some(self.land.event(i, b)),
+        }));
         let moves: Vec<Flip> = picks.iter().map(|f| Flip { layer: i, ..*f }).collect();
         self.rule.settle(&moves).map_err(|e| rule_err(WHAT, e))?;
         for (f, &s) in picks.iter().zip(&to) {
