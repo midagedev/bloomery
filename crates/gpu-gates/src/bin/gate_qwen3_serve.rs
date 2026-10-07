@@ -211,13 +211,25 @@
 //!   prompt call taking its checkpoints in its own sequence). FAIL-first: a
 //!   round that leaves the wrong slot selected runs the second request's
 //!   prompt over the first's sequence, and both requests' ids move at once.
-//! - `slot_ctx_too_small_is_refused`, on both arms: `--ctx 15`
-//!   under the default two slots — a slot of 7 rows, one under the 8 rows
+//! - `slot_ctx_too_small_is_refused` and `ctx_set_parallel_unset_is_one_slot`
+//!   (both arms): the refusal, `--ctx 15 --parallel 2` — a slot of 7 rows,
+//!   one under the 8 rows
 //!   a slot loads at (`router::MAX_TOKENS`: the widest pass a whole-card
 //!   load captures, and one whole prompt pass of a placed load) — ends the
 //!   process before the load, naming the total, the slot count and the
-//!   slot ctx. FAIL-first: the refusal dropped loads the slot and dies in
-//!   the pass capture under the launcher's own message.
+//!   slot ctx; the same `--ctx 15` with no `--parallel` takes one slot at
+//!   the whole flag, its `parallel` line (`from=ctx`) and the one-request
+//!   note on stderr before the load, the server stopped there.
+//!   PIN(2026-10-07): the refusal's flag set gained its `--parallel 2` — a
+//!   set `--ctx` with no `--parallel` is one request's context now
+//!   (`ctx::slots_of`), so the split refusal needs the count said, and the
+//!   unset flag set is the one-slot rule's own check. Re-pin by
+//!   specification, not a relaxation: the refusal holds its named message
+//!   at the same boundary, and the one-slot rule is a new check beside it.
+//!   FAIL-first: the refusal dropped loads the slot and dies in
+//!   the pass capture under the launcher's own message; a seat that still
+//!   splits a set `--ctx` by its default two prints `slots=2 slot_ctx=7`
+//!   and dies in the load instead of the one-slot line.
 //! - `ctx_search_reads_the_census_once`, `ctx_default`'s arms that search
 //!   (default, placed, q8): each `--ctx` search the seat ran names its
 //!   probes and its census readings on one line, and every one read the
@@ -273,8 +285,10 @@
 //! arms pass none — they die at flag parsing before the seat splits
 //! anything — and its flag-wins arm pins `--parallel 1`; the slots clause's
 //! two arms pass `--parallel 2` (resident on both files: the whole-card load
-//! and the budgeted placed one) and the refusal arm passes none (the default
-//! two are what makes the split too small); the slots-round clause's two
+//! and the budgeted placed one), the refusal arm passes `--parallel 2` too
+//! (the split it refuses is the flag's), and its one-slot arm passes none (a
+//! set `--ctx` alone is one request's context, one slot at the whole flag);
+//! the slots-round clause's two
 //! arms (both files) pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
 //! environment (the whole-card load and the budgeted placed one), and the
 //! late arm passes `--parallel 2` (whole-card, no lever); the host-tier
@@ -389,9 +403,10 @@ mod gate {
     const LATE_POLL: Duration = Duration::from_millis(50);
     const LATE_POLLS: usize = 600;
 
-    /// The refusal arm's `--ctx`: two slots of one row under the seat's
-    /// least slot context, the widest pass a whole-card load captures
-    /// ([`MAX_TOKENS`] rows).
+    /// The refusal arm's `--ctx`: `--parallel 2` of it leaves a slot of one
+    /// row under the seat's least slot context, the widest pass a
+    /// whole-card load captures ([`MAX_TOKENS`] rows); the one-slot arm
+    /// takes the whole of it, over the floor.
     const SLOTS_REFUSED_CTX: usize = 2 * MAX_TOKENS - 1;
 
     /// The fewest rows the seat's prompt call runs as the GEMM walk
@@ -2219,10 +2234,16 @@ mod gate {
         Ok(())
     }
 
-    /// The refusal clause (module header): `--ctx` [`SLOTS_REFUSED_CTX`]
-    /// under the default two slots ends the process before the load,
-    /// naming the total, the slot count and the slot ctx it split, one row
-    /// under the seat's least. A refusal that loads instead shows as the
+    /// The refusal clause (module header), two arms.
+    /// PIN(2026-10-07): the refusal arm passes `--parallel 2` — a set `--ctx`
+    /// with no `--parallel` is one request's context now (`ctx::slots_of`),
+    /// so the two-slot split the floor refuses needs the count said — and
+    /// the one-slot arm holds that unset-flag rule on the same `--ctx`: the
+    /// server takes one slot at the whole flag and says so (`from=ctx`, the
+    /// one-request note) before its load, stopped there. Re-pin by
+    /// specification, not a relaxation: the refusal keeps its named message
+    /// at the same boundary, and the one-slot rule is a new check beside it.
+    /// A refusal that loads instead shows as the
     /// server still running (or listening) past the polls and is stopped
     /// here, red; one that dies inside the load names another cause, red.
     fn slot_ctx_too_small_is_refused(
@@ -2239,7 +2260,18 @@ mod gate {
         let total = SLOTS_REFUSED_CTX.to_string();
         let mut s = Served::spawn_cmd(
             cmd,
-            &["--model", "qwen3", "--port", "0", "--ctx", &total, "-m", m],
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--ctx",
+                &total,
+                "--parallel",
+                "2",
+                "-m",
+                m,
+            ],
             &d,
         )?;
         let mut said = String::new();
@@ -2266,6 +2298,62 @@ mod gate {
             s.child.try_wait()?.map(|s| s.code())
         );
         check(ok, "slot_ctx_too_small_is_refused", refused);
+        let _ = s.stop();
+
+        // The one-slot arm: the same `--ctx` with no `--parallel` is one
+        // request's context — one slot at the whole flag, the `parallel`
+        // line and the one-request note on stderr before the load, the
+        // server stopped there (a set `--parallel` still splitting it would
+        // print `slots=2 slot_ctx=7` and refuse to load).
+        let d = dir.join("one-slot");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &["--model", "qwen3", "--port", "0", "--ctx", &total, "-m", m],
+            &d,
+        )?;
+        let mut said = String::new();
+        let mut line = None;
+        for _ in 0..360 {
+            said = std::fs::read_to_string(&err_log).unwrap_or_default();
+            line = said
+                .lines()
+                .find(|l| l.starts_with("parallel rule="))
+                .map(str::to_owned);
+            if line.is_some() || s.child.try_wait()?.is_some() {
+                break;
+            }
+            if said.contains("listening on http://") {
+                break;
+            }
+            std::thread::sleep(SLOTS_POLL);
+        }
+        if s.child.try_wait()?.is_none() {
+            println!("one-slot arm: server stopped: {}", s.stop()?);
+        }
+        let one_request = format!(
+            "--ctx-size {total} is one request's context; add --parallel N to serve N requests at \
+             once (they split it)"
+        );
+        let agrees = line.as_deref().is_some_and(|l| {
+            let f = |k: &str| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix(&format!("{k}=")))
+            };
+            f("slots") == Some("1")
+                && f("slot_ctx") == Some(total.as_str())
+                && f("total") == Some(total.as_str())
+                && f("from") == Some("ctx")
+        });
+        println!("one-slot arm: {line:?}; said {said}");
+        check(
+            ok,
+            "ctx_set_parallel_unset_is_one_slot",
+            agrees && said.contains(&one_request),
+        );
         let _ = s.stop();
         Ok(())
     }

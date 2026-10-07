@@ -46,7 +46,9 @@
 //! placement's own; 0 with no tier card) and the break-even. A refusal of
 //! that plan of `bp` is the seat's refusal by name. The
 //! positions a slot serves are the stores the load sized for each sequence
-//! (`--ctx` names the total the slots split): `/props`' `n_ctx` is that
+//! (`--ctx` names one request's context: while `--parallel` names no count
+//! one slot serves the whole of it, and under `--parallel N` it is the
+//! total the N slots split): `/props`' `n_ctx` is that
 //! number, a prompt that long is a 400 before it reaches the engine, and
 //! generation stops there with `truncated`. Unset, a slot's context is the
 //! file's trained context (`context_length`) capped to what the plan takes —
@@ -59,7 +61,10 @@
 //! a `ctx` line on stderr names the rule, the chosen context, the slots and
 //! their total, the trained context, the fit and the margin. Set, the flag
 //! is the total and each slot takes `total / N` positions rounded down
-//! (llama-server's `-np N` without `-kvu`), a slot under the body's floor
+//! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
+//! alone it is one request's context, one slot at the whole of it
+//! (`serve_seats::ctx::slots_of`; one line on stderr says so) — a slot
+//! under the body's floor
 //! refused by name before the plan — one position, or the MTP draft's
 //! window under `BLOOMERY_DRAFT=mtp` — and the plan refusing it by name past
 //! the oracle and when the card cannot hold every slot.
@@ -99,13 +104,15 @@
 //! and `save` and `restore` answer the server's own 501, a state being a
 //! host value and not a file.
 //!
-//! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
+//! `--parallel N` (`-np N`) serves N resident sequences inside
 //! the one model (`Session::add_slots` over the body's `Slots`): the server
 //! steps every running slot in each round, the sequences switched by
 //! pointer exchange and each slot's own draft held beside it
 //! ([`SlotDrafts`]), so each request's tokens are its solo run's;
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
-//! by name. The round's shape the open decided once, from the load and the
+//! by name. `--parallel` naming no count, the seat serves one slot beside a
+//! set `--ctx` (the flag is one request's context, `ctx::slots_of`) and its
+//! default two over the automatic context. The round's shape the open decided once, from the load and the
 //! body's `SlotRows::MAX_ROWS`: a plain load (no NextN draft) runs a round of
 //! steps as one pass of the busy rows
 //! (`serve_seats::rounds::step_rows_one_pass`, cut at that bound); a NextN
@@ -124,7 +131,8 @@
 //! requests runs the steps' call and the passes' apart. A refusal
 //! mid-round is the server's error, never a fallback to the loop. A
 //! `parallel` line on stderr names the rule (`slots`), the slots, a slot's
-//! context, the total and the shape: `pass=one` where the open decided one
+//! context, the total, what set the count (`from`: the `--parallel` flag, a
+//! set `--ctx`, the default) and the shape: `pass=one` where the open decided one
 //! pass, `pass=turns` for a NextN load on a body whose pass holds fewer
 //! rows than two windows; under
 //! `BLOOMERY_STEP_STATS=1` each round of several slots prints a `slots
@@ -644,8 +652,10 @@ struct Args {
     prefill: PrefillMode,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
-    /// `--parallel`: the resident sequences the seat serves.
-    parallel: usize,
+    /// `--parallel`: the resident sequences the seat serves; `None` takes
+    /// one slot beside a set `--ctx`, else the default 2
+    /// ([`super::ctx::slots_of`]).
+    parallel: Option<usize>,
     queue_depth: Option<usize>,
 }
 
@@ -661,7 +671,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         template_file: None,
         prefill: PrefillMode::Batch,
         plan_only: false,
-        parallel: 2,
+        parallel: None,
         queue_depth: None,
     };
     let mut it = args.iter().map(|s| s.as_str());
@@ -684,7 +694,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = number(flag, v)?,
+            "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--park-ram" => {
                 return Err(format!(
@@ -705,7 +715,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.ctx == Some(0) {
         return Err("--ctx 0: the stores hold no position".into());
     }
-    if a.parallel == 0 {
+    if a.parallel == Some(0) {
         return Err("--parallel 0: the server serves no slot".into());
     }
     Ok(a)
@@ -755,8 +765,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // A slot's share of `--ctx`, refused by name under the body's least a
     // slot before anything is planned: one position, or the MTP draft's
     // window under `BLOOMERY_DRAFT=mtp` (unset, the rule below drafts only
-    // where a window fits, and never refuses).
-    let slots = a.parallel;
+    // where a window fits, and never refuses). The slot count itself: a set
+    // `--ctx` with no `--parallel` is one request's context — one slot at
+    // the whole of it (`ctx::slots_of`).
+    let (slots, from) = super::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    if from == "ctx" {
+        eprintln!(
+            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
+             once (they split it)",
+            a.ctx.unwrap_or_default()
+        );
+    }
     let (floor, why) = match levers.draft() {
         Some("mtp") => (
             NEED_FLOOR,
@@ -895,7 +914,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let cache = CacheRam::of(a.cache_ram, HostNeed::of(&plan, beside).bytes(), pool)?;
     eprintln!("{}", cache.line());
     eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={} total={} pass={}",
+        "parallel rule=slots slots={slots} slot_ctx={} total={} from={from} pass={}",
         rule.ctx,
         slots * rule.ctx,
         // The round's shape the open below runs (the module doc).

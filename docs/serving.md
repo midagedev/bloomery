@@ -53,7 +53,9 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic", "none": "Answer directly"}}}}'
 ```
 
-**Concurrent requests.** Every generative seat takes `--parallel N` (unset, 2). The N slots are resident sequences
+**Concurrent requests.** Every generative seat takes `--parallel N` (unset, 2 over the automatic context; a set
+`--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
+llama-server reads it, and the startup line says so). The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
@@ -61,9 +63,10 @@ request's drafted verify window rides the same pass (two windows a pass; with th
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
-the placement follows every stream's passes (see [Limits](#limits)). The context splits as llama-server splits it
-with `-np N` and no `-kvu`: `--ctx-size` (or the automatic choice) is the total and each slot holds `total / N` rows,
-except on V4.1, where every slot holds the whole context; `--parallel 1` keeps one sequence with the whole context.
+the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
+llama-server splits it with `-np N` and no `-kvu`: the total (a set `--ctx-size`, or the automatic choice when no
+context is named) is split and each slot holds `total / N` rows, except on V4.1, where every slot holds the whole
+context; `--parallel 1` keeps one sequence with the whole context.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
 
@@ -100,7 +103,8 @@ binary's `--help`.
   at the first start.
 - GLM-5.3 holds at most 16,384 positions a slot, whatever `--ctx-size` asks; a longer prompt is refused with
   `exceed_context_size_error`. A 12–16 GB card's split Qwen3 load picks a small context (2,048 positions a slot at
-  `--parallel 2`); agent clients with long system prompts want `--parallel 1` there.
+  `--parallel 2`); agent clients with long system prompts want the context to one request there (`--parallel 1`, or
+  a set `--ctx-size` with no `--parallel`).
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other

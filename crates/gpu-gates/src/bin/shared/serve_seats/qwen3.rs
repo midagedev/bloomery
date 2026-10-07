@@ -27,8 +27,9 @@
 //! GEMM, qwen35moe's wide, no unit under the gemv arm's cut — passes below)
 //! — then steps the last, which `generate_qwen3moe --last-step` does too.
 //! Its first shard gives the vocabulary, `tokenizer.chat_template` the chat
-//! template and `general.name` the alias. Two slots by default
-//! (`--parallel`), one only at `--parallel 1`; sampling is the sampler
+//! template and `general.name` the alias. One slot at the whole `--ctx`
+//! while `--parallel` names no count beside a set flag, else two slots by
+//! default (`--parallel N`), one only at `--parallel 1`; sampling is the sampler
 //! crate's chain with no repetition penalty, `temperature <= 0` the
 //! engine's argmax.
 //!
@@ -68,11 +69,15 @@
 //! to stderr (`record::BLOOMERY_SERVE_QWEN3`). An engine error ends the
 //! process with the crash block and exit code 70, as every seat's.
 //!
-//! `--parallel N` (`-np N`, default 2) serves N slots, on both files N
+//! `--parallel N` (`-np N`) serves N slots, on both files N
 //! resident sequences inside the one model (`GpuModel::add_slots` on the
 //! session: a qwen3moe file's per-position caches, a qwen35moe file's
 //! `Slot35` — its K/V planes, its delta layers' recurrent states and conv
-//! rings, its held count and its checkpoints), the context split across them
+//! rings, its held count and its checkpoints). `--parallel` naming no
+//! count, the seat serves one slot beside a set `--ctx` (the flag is one
+//! request's context, `ctx::slots_of`; one line on stderr says so) and its
+//! default two over the auto choice. Under more slots than one the context
+//! is split across them
 //! as llama-server splits it with `-np N` and no `-kvu`: the `--ctx` the
 //! flags named (or the auto choice when unset) is the total, each slot
 //! `total / N` rows rounded down — a cache row is the granularity, so the
@@ -104,7 +109,10 @@
 //! Under `BLOOMERY_STEP_STATS=1` each round of several slots
 //! prints a `slots round` record naming its command, rows, passes and the
 //! slots the seat serves. `--parallel 1` is exactly the one-sequence server.
-//! `--queue-depth Q` bounds the requests that wait for a slot; `--park-ram`
+//! A `parallel` line on stderr before the load names the rule (`slots`), the
+//! slots, a slot's context, the total and what set the count (`from`: the
+//! `--parallel` flag, a set `--ctx`, the default). `--queue-depth Q` bounds
+//! the requests that wait for a slot; `--park-ram`
 //! is refused by name: the resident slots hold no parked state the flag
 //! could budget.
 //!
@@ -296,8 +304,9 @@ struct Args {
     /// over the `BLOOMERY_QWEN3_KV` lever's word when given.
     cache_type_k: Option<String>,
     /// `--parallel`: the slots the server serves, resident sequences on
-    /// either file's load.
-    parallel: usize,
+    /// either file's load; `None` takes one slot beside a set `--ctx`, else
+    /// the default 2 ([`super::ctx::slots_of`]).
+    parallel: Option<usize>,
     queue_depth: Option<usize>,
 }
 
@@ -321,12 +330,14 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         place: None,
         cache_type_k: None,
-        // The fixed default, not an elastic one: the second slot is a
-        // resident sequence the context split bounds (no byte budget to size
-        // it from). A lone request pays nothing for it beyond its share of
-        // the context: the other slot sits parked empty; `--parallel 1`
-        // keeps the one sequence.
-        parallel: 2,
+        // `None` resolves through `ctx::slots_of`: one slot beside a set
+        // `--ctx` (the flag is one request's context), else the fixed
+        // default 2, not an elastic one — the second slot is a resident
+        // sequence the context split bounds (no byte budget to size it
+        // from). A lone request pays nothing for it beyond its share of the
+        // context: the other slot sits parked empty; `--parallel 1` keeps
+        // the one sequence.
+        parallel: None,
         queue_depth: None,
     };
     let mut it = args.iter().map(String::as_str);
@@ -358,7 +369,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 );
             }
             "--parallel" | "-np" => match v.parse::<usize>() {
-                Ok(n) if n > 0 => a.parallel = n,
+                Ok(n) if n > 0 => a.parallel = Some(n),
                 _ => {
                     return Err(
                         format!("{flag} takes a whole number of at least 1, not {v:?}").into(),
@@ -879,13 +890,12 @@ const _: () = assert!(SLOT_CTX_MIN == MAX_PASS_ROWS);
 /// granularity, the floor exact; N slots never more rows than the
 /// one-sequence load, so never more stores than the verdict or the plan at
 /// the total counts), a split that leaves a slot under [`SLOT_CTX_MIN`] rows
-/// refused by name before anything is decided or loaded. One slot is the one
-/// sequence of the whole context.
+/// refused by name before anything is decided or loaded — one slot (the one
+/// sequence of the whole context, the count a set `--ctx` with no
+/// `--parallel` serves) held to the same floor, so a too-small flag is a
+/// named refusal on every count.
 fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
-    if parallel <= 1 {
-        return Ok(ctx);
-    }
-    let slot_ctx = ctx / parallel;
+    let slot_ctx = if parallel <= 1 { ctx } else { ctx / parallel };
     if slot_ctx < SLOT_CTX_MIN {
         return Err(format!(
             "--parallel {parallel} of a --ctx of {ctx}: a slot's context of {slot_ctx} rows is \
@@ -928,9 +938,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .and_then(|v| v.as_str())
         .unwrap_or("qwen3")
         .to_owned();
+    // The slot count before the context it sizes: a set `--ctx` with no
+    // `--parallel` is one request's context — one slot at the whole of it
+    // (`ctx::slots_of`).
+    let (slots, from) = super::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    if from == "ctx" {
+        eprintln!(
+            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
+             once (they split it)",
+            a.ctx.unwrap_or_default()
+        );
+    }
     let ctx = match a.ctx {
         Some(c) => c,
-        None => default_ctx(&split, arch, a.place, a.parallel, &levers, kv)?,
+        None => default_ctx(&split, arch, a.place, slots, &levers, kv)?,
     };
     if !matches!(arch, Arch::Qwen3moe | Arch::Qwen35moe) {
         return Err(format!(
@@ -942,13 +963,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     // Resident slots on both files: the model loads with a slot's share and
     // parks the rest of the slots after its captures.
-    let slot_ctx = slot_ctx(ctx, a.parallel)?;
+    let slot_ctx = slot_ctx(ctx, slots)?;
     // What the file loads as is decided here, once, at the total: the open
     // makes no fit call of its own (`decide`).
-    let load = decide(&split, arch, ctx, a.place, a.parallel, kv)?;
+    let load = decide(&split, arch, ctx, a.place, slots, kv)?;
     if matches!(arch, Arch::Qwen35moe) {
-        q3place::checkpoints_fit(seqs35(a.parallel), matches!(load, Q3Load::Placed { .. }))?;
+        q3place::checkpoints_fit(seqs35(slots), matches!(load, Q3Load::Placed { .. }))?;
     }
+    // The slots the seat serves, one line before the load (`from` names what
+    // set the count).
+    eprintln!(
+        "parallel rule=slots slots={slots} slot_ctx={slot_ctx} total={} from={from}",
+        slots * slot_ctx
+    );
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let open = path.clone();
@@ -957,10 +984,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Q3Load::Placed { q, .. } => q.name(),
     }
     .to_owned();
-    let parallel = a.parallel;
     let engine = match arch {
         Arch::Qwen3moe => SeatEngine::spawn(
-            move || Q3::<Body>::open(&open, slot_ctx, parallel, load, &levers, kv),
+            move || Q3::<Body>::open(&open, slot_ctx, slots, load, &levers, kv),
             slot_ctx,
             vocab,
             device,
@@ -968,7 +994,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
         _ => SeatEngine::spawn(
-            move || Q3::<Body35>::open(&open, slot_ctx, parallel, load, &levers, kv),
+            move || Q3::<Body35>::open(&open, slot_ctx, slots, load, &levers, kv),
             slot_ctx,
             vocab,
             device,
@@ -986,16 +1012,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     // The seat's own slots are the engine's: the seat made them at its open,
     // and the server steps them together.
-    let slots = SlotConfig {
-        parallel: a.parallel,
+    let config_slots = SlotConfig {
+        parallel: slots,
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };
-    let server = Server::bind_with((a.host.as_str(), a.port), Box::new(engine), config, slots)?;
+    let server = Server::bind_with(
+        (a.host.as_str(), a.port),
+        Box::new(engine),
+        config,
+        config_slots,
+    )?;
     Record::new(&record::LISTENING_QWEN3)
         .w("arch", arch.name())
         .u("ctx", slot_ctx)
-        .u("slots", a.parallel)
+        .u("slots", slots)
         .u("slot_ctx", slot_ctx)
         .w("addr", server.local_addr()?)
         .eprint();

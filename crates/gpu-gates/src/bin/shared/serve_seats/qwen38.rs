@@ -27,7 +27,9 @@
 //! prompt's greedy ids are the walk's, not a step-fed run's).
 //!
 //! The positions a slot serves are the stores the load sized
-//! (`--ctx-size` names the total the slots split): `/props`' `n_ctx` is a
+//! (`--ctx-size` names one request's context: while `--parallel` names no
+//! count one slot serves the whole of it, and under `--parallel N` it is
+//! the total the N slots split): `/props`' `n_ctx` is a
 //! slot's number, a prompt that long is a 400 before it reaches the engine,
 //! and generation stops there with `truncated`. Unset, the context is
 //! [`margin38`]'s answer over a slot's share — the largest multiple of
@@ -85,8 +87,8 @@
 //! with the draft beside one without it) is refused by name; every save,
 //! load, eviction and skip prints as a line.
 //!
-//! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
-//! the one model (`Session::add_slots` over `Body38`'s [`Slots`]): on a
+//! `--parallel N` (`-np N`) serves N resident sequences inside the one
+//! model (`Session::add_slots` over `Body38`'s [`Slots`]): on a
 //! drafted load the server's round of the busy slots' drafted passes runs
 //! as one pass of their windows (`app::mtp::pass_slots`, every slot's rows
 //! verified together, the round cut into passes at the body's
@@ -101,10 +103,15 @@
 //! solo run's. Under `--place bp` (an expert tier card, beside which the
 //! body runs no pass of several slots) every round runs a slot at a time,
 //! and the open prints a line that says so. `--parallel 1` is exactly the
-//! one-sequence server, its rounds one pass a slot. The context is split
+//! one-sequence server, its rounds one pass a slot. `--parallel` naming no
+//! count, the seat serves one slot beside a set `--ctx-size` (the flag is
+//! one request's context, `ctx::slots_of`; one line on stderr says so) and
+//! its default two over the automatic context. Under more slots than one
+//! the context is split
 //! as llama-server splits it with
-//! `-np N` and no `-kvu`: the `--ctx-size` the flags named (or the automatic
-//! choice when unset) is the total, each slot `total / N` positions rounded
+//! `-np N` and no `-kvu`: the total (the `--ctx-size` the flags named, or
+//! the automatic choice when unset) is the slots' sum, each slot `total /
+//! N` positions rounded
 //! down, and the search for the default — the largest total whose N-slot
 //! plan fits the card within the margin rule `ctx38` applies, each slot a
 //! multiple of [`CTX_STEP`] — runs over a slot's context, the plan counting
@@ -113,9 +120,10 @@
 //! the load, naming the split. Nothing parks: no slot ever waits for another
 //! (a slot's round runs whether the others stream), so `--park-ram` is
 //! refused by name — resident slots hold their state on the card, in the
-//! plan. A `parallel` line on stderr names the rule (`slots`), the slots and
-//! the split they serve. `--queue-depth Q` bounds the requests that wait for
-//! a slot.
+//! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
+//! the split they serve and what set the count (`from`: the `--parallel`
+//! flag, a set `--ctx-size`, the default). `--queue-depth Q` bounds the
+//! requests that wait for a slot.
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
@@ -698,7 +706,8 @@ struct Ctx38 {
     ctx: usize,
     /// The resident sequences the plan counted.
     slots: usize,
-    /// `set` (`--ctx-size`, the total the slots split), or what decided the
+    /// `set` (`--ctx-size`: under a set `--parallel N` the total the slots
+    /// split, alone one slot's whole context), or what decided the
     /// default: `margin` ([`margin38`]'s answer), `card` (the largest
     /// context the card holds, fewer than [`CTX`]), `cache` (one state in
     /// the prompt cache's budget).
@@ -918,7 +927,8 @@ struct Args {
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
-    /// the default, 2.
+    /// one slot beside a set `--ctx-size`, else the default 2
+    /// ([`super::ctx::slots_of`]).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; set is refused by name (resident slots park
@@ -1085,8 +1095,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     drop(split);
     // The slot count first: it shapes the context search itself, every plan
-    // the seat asks for counting each sequence (`Plans::slots`).
-    let slots = a.parallel.unwrap_or(2);
+    // the seat asks for counting each sequence (`Plans::slots`). A set
+    // `--ctx-size` with no `--parallel` is one request's context — one slot
+    // at the whole of it (`ctx::slots_of`).
+    let (slots, from) = super::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    if from == "ctx" {
+        eprintln!(
+            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
+             once (they split it)",
+            a.ctx.unwrap_or_default()
+        );
+    }
     let plans = Plans {
         inputs: &inputs,
         place: a.place,
@@ -1104,10 +1123,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
         cache.line()
     );
-    // The slots the seat serves ([`Session::add_slots`]): the flag's, or 2 —
-    // one drafted pass a slot a round, nothing parked.
+    // The slots the seat serves ([`Session::add_slots`]): the flag's, one
+    // beside a set `--ctx-size`, or 2 — one drafted pass a slot a round,
+    // nothing parked.
     eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={} total={}",
+        "parallel rule=slots slots={slots} slot_ctx={} total={} from={from}",
         rule.ctx,
         slots * rule.ctx
     );

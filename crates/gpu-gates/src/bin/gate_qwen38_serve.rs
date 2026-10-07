@@ -72,7 +72,10 @@
 //!   rule names its slots, and the line's own terms hold them — the slots
 //!   are the flag's (`--parallel 2`) or the default's (2, the `ctx` clause's
 //!   flagless server), and the split they serve (`slot_ctx`, `total`) is the
-//!   `ctx` line's own context times the slots;
+//!   `ctx` line's own context times the slots — with the word that set the
+//!   count (`from`: `flag`, the `--parallel`; `ctx`, a set `--ctx-size`
+//!   under no `--parallel`, the one-slot rule the `ctx` clause holds too;
+//!   `default`);
 //! - the slots clause ([`slots_flow_together`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`): two greedy streamed
 //!   requests of distinct prompts on `--parallel 2`, each first run alone
@@ -212,7 +215,10 @@
 //!   holds with its card expert bytes and the largest within the plan's
 //!   margin, before its load, each the rule's against this gate's own plans
 //!   (stopped there), the fit at most the file's serving cap
-//!   (`place::serve_ctx`), and one asked for a position past the fit is
+//!   (`place::serve_ctx`); one with `--ctx-size` set and no `--parallel`
+//!   takes one slot at the whole flag (`from=ctx` on its `parallel` line,
+//!   and the one-request note on stderr), and one asked for a position past
+//!   the one-slot fit is
 //!   refused by name before it listens (the card's rule, or the cap's when
 //!   the card holds more);
 //! - `residency`: `bloomery-serve-qwen38` with the same arguments under
@@ -2795,16 +2801,17 @@ mod gate {
         Ok(ok)
     }
 
-    /// The plan's card expert bytes on the gate card at a slot's `ctx`, the
-    /// two resident slots of this clause's flagless server counted
-    /// (`plan_with_slots`), plain, as the server makes it; `None` when no
-    /// plan takes the context.
+    /// The plan's card expert bytes on the gate card at a slot's `ctx`,
+    /// `slots` resident sequences counted (`plan_with_slots`), plain, as the
+    /// server makes it — the clause's flagless server's two, the refusal
+    /// arm's one; `None` when no plan takes the context.
     fn card_at(
         inputs: &PlanInputs,
         levers: &PlanLevers,
         experts: Experts,
         ctx: usize,
         free: Option<u64>,
+        slots: usize,
     ) -> Result<Option<u64>, GateError> {
         let mut machine = machine_for_experts(
             RTX_3090,
@@ -2814,7 +2821,7 @@ mod gate {
         );
         machine.cards[0].free_bytes = free;
         Ok(inputs
-            .plan_with_slots(&machine, u64::try_from(ctx)?, levers, experts, 2)
+            .plan_with_slots(&machine, u64::try_from(ctx)?, levers, experts, slots)
             .ok()
             .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
     }
@@ -2836,19 +2843,28 @@ mod gate {
     /// expert bytes; its `margin_ctx` holds at most the plan's margin fewer
     /// card expert bytes than the two-slot plan at [`CTX`], and the next
     /// multiple of [`CTX_STEP`] past it more (or it is the fit). A server
-    /// asked for a total whose slot share passes the fit is refused by name
-    /// before it listens: by the card's rule when the card bounds the fit,
+    /// with `--ctx-size` set and no `--parallel` takes one slot at the whole
+    /// flag (the `from=ctx` rule; the clause's last server holds the line
+    /// and the one-request note beside it), and one asked for a context one
+    /// past the one-slot fit is refused by name
+    /// before it listens: by the card's rule when the card bounds that fit,
     /// by the cap's (the trained context, YaRN not built) when the cap
     /// does. Mutants: the default ignoring the fit (staying at the base);
     /// the default passing the fit through without the margin rule; the
     /// refusal of a context past the card taken out (the load's own plan
     /// refuses it, not by the rule's name); the cap's refusal taken out
-    /// (the card's rule names the clamped fit instead).
+    /// (the card's rule names the clamped fit instead); a set `--ctx-size`
+    /// still split by the default two (the one-slot line names two slots,
+    /// and the one-request note prints nowhere).
     // PIN(2026-10-05): re-derived for the seat's default two resident slots — every
-    /// `at` below is `plan_with_slots(2)` at a slot's context, the default `--parallel`
-    /// names two (the `parallel` line's check), and the refusal arm asks for the total
-    /// whose slot share is one past the fit. Was the one-sequence search (round
-    /// q38rules).
+    // `at` below is `plan_with_slots(2)` at a slot's context, and the default
+    // `--parallel` names two (the `parallel` line's check). Was the
+    // one-sequence search (round q38rules). The refusal arm's own count moved
+    // to one slot by the PIN(2026-10-07) below.
+    // PIN(2026-10-07): the refusal arm and the one-slot arm take one slot — a set
+    // `--ctx-size` with no `--parallel` is one request's context now (`ctx::slots_of`),
+    // so the arm's `at1` below is `plan_with_slots(1)` and its ask is one past the
+    // one-slot fit.
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -2945,7 +2961,7 @@ mod gate {
             .find_map(|w| w.strip_prefix("ram="))
             .and_then(|v| v.parse::<u64>().ok())
             .ok_or("a `cache` line without its ram")?;
-        let at = |c: usize| card_at(&inputs, &plan_levers, experts, c, free);
+        let at = |c: usize| card_at(&inputs, &plan_levers, experts, c, free, 2);
         let base = at(CTX)?.ok_or("no plan at the base context")?;
         let lost = |c: usize| -> Result<Option<u64>, GateError> {
             Ok(at(c)?.map(|e| base.saturating_sub(e)))
@@ -3026,11 +3042,28 @@ mod gate {
                 && (margin_ctx == fit
                     || (margin_ctx.is_multiple_of(CTX_STEP) && past.is_none_or(|l| l > margin))),
         );
-        // The refusal arm asks for a total whose slot share is one past the
-        // fit: the server splits `--ctx-size` over its default two slots, so
-        // the total the arm names is twice the share it refuses.
-        let over = (2 * (fit + 1)).to_string();
-        let share = fit + 1;
+        // PIN(2026-10-07): the refusal arm's server takes one slot — a set
+        // `--ctx-size` with no `--parallel` is one request's context now, the
+        // one-slot `from=ctx` rule the arm below holds — so the arm asks for
+        // one past the one-slot fit (every `at1` a `plan_with_slots(1)` at a
+        // slot's context), not the total whose two-slot share was one past
+        // the two-slot fit. Re-pin by specification (the seat's
+        // `--ctx-size` rule), not a relaxation: the refusal is still asked
+        // one past the boundary the card holds, at the slot count the flag
+        // set now serves, and still by name.
+        let at1 = |c: usize| card_at(&inputs, &plan_levers, experts, c, free, 1);
+        let (mut lo, mut hi) = (1, cap);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if at1(mid)?.is_some() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let fit1 = lo;
+        let card_bounds1 = fit1 < cap;
+        let over = (fit1 + 1).to_string();
         let args: Vec<&str> = DEFAULT_ARGS
             .iter()
             .copied()
@@ -3046,14 +3079,14 @@ mod gate {
             std::thread::sleep(Duration::from_secs(1));
         }
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
-        let named = if card_bounds {
+        let named = if card_bounds1 {
             format!(
-                "--ctx-size {over}: with --parallel 2 each slot takes {share} positions and the \
-                 card holds at most {fit} a slot beside the plan's dense weights (`--place gate`)"
+                "--ctx-size {over}: with --parallel 1 each slot takes {over} positions and the \
+                 card holds at most {fit1} a slot beside the plan's dense weights (`--place gate`)"
             )
         } else {
             format!(
-                "a context of {share} positions: the file was trained at {cap} (context_length), \
+                "a context of {over} positions: the file was trained at {cap} (context_length), \
                  and a load serves at most {cap}; YaRN scaling past the trained context is not \
                  implemented"
             )
@@ -3072,6 +3105,60 @@ mod gate {
             &mut ok,
             "ctx_past_the_fit_is_refused_by_name",
             status.is_some_and(|s| !s.success()) && text.contains(&named) && !listened,
+        );
+
+        // The one-slot rule itself, the flag set the refusal arm now shares:
+        // `--ctx-size 8192` with no `--parallel` prints its `parallel` line
+        // (before the load; the server is stopped there) with one slot at
+        // the whole 8192, `from=ctx`, and the one-request line beside it.
+        // FAIL-first on the old split: that line read `slots=2
+        // slot_ctx=4096 total=8192` and carried no `from=`, and the
+        // one-request line printed nowhere.
+        let ctx_arg = "8192".to_owned();
+        let one_args: Vec<&str> = DEFAULT_ARGS
+            .iter()
+            .copied()
+            .chain(["--ctx-size", ctx_arg.as_str()])
+            .collect();
+        let mut served = spawn(&one_args)?;
+        let mut pline = None;
+        for _ in 0..POLLS {
+            let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+            pline = text
+                .lines()
+                .find(|l| l.starts_with("parallel rule="))
+                .map(str::to_owned);
+            if pline.is_some() || served.child.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if served.child.try_wait()?.is_none() {
+            println!("ctx: the one-slot server stopped: {}", served.stop()?);
+        }
+        let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+        let one_request = format!(
+            "--ctx-size {ctx_arg} is one request's context; add --parallel N to serve N requests \
+             at once (they split it)"
+        );
+        let agrees = pline.as_deref().is_some_and(|l| {
+            let f = |k: &str| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix(&format!("{k}=")))
+            };
+            f("slots") == Some("1")
+                && f("slot_ctx") == Some("8192")
+                && f("total") == Some("8192")
+                && f("from") == Some("ctx")
+        });
+        println!(
+            "ctx: one-slot {pline:?}; one-request line {}; it said: {text}",
+            text.contains(&one_request)
+        );
+        check(
+            &mut ok,
+            "ctx_set_parallel_unset_is_one_slot",
+            agrees && text.contains(&one_request),
         );
         Ok(ok)
     }
