@@ -159,6 +159,32 @@ Order:
     (`tools/gate-paths.tsv:68`), and `crates/gpu/src/weights.rs` has no row. Map them by the family that reads them,
     and give `weights.rs` its row. (iqwire moved kernels, so its full list was right; the `*` rows widen every later
     coverage or mtp change.)
+- **Work environment audit** (envaudit, 2026-10-07, the user: "what would a senior Rust/GPU engineer expect";
+  lead's specs `envaudit/report-opus.md`). Linking is not the build cost: 138 warm bin builds in trainf took 284 s,
+  and the linker is already LLD. The cost is `bloomery-gpu` compiled 6 times per batch, at 134–149 s each.
+  - Build variants (XS): `crc32fast`/`indexmap` resolve to `[std]` in some builds and `[default,std]` in others, so
+    `bloomery-gpu` and its cuda-* chain build in 3 variants. One edge in `crates/gpu/Cargo.toml` fixes it (branch
+    `featedge`, ptx-scan pair running). It avoids 51 compiles in 95 clean batches [derived].
+  - cargo-oxide `test` vs `build` rustflags (S fork + M pin move): `passthrough.rs:97-101` gives `test` CargoSelected
+    and `build` ReleaseLike, so every test gate rebuilds the whole graph. It avoids 27 compiles. An upstream candidate.
+  - A prebuild phase in gate-batch (S–M, after the edge): one build per feature set before the lanes start. It ends the
+    cross-lane build-dir lock waits (trainf lane A 427 s; 207 wait lines in 82 batches).
+  - Measure `bloomery-gpu`'s codegen (94 % of the unit): host LLVM or device PTX. If device and single-threaded,
+    splitting kernels across device crates is the lever (L).
+  - compute-sanitizer arm (S–M): memcheck/racecheck/initcheck/synccheck on `gate_kquant`, `gate_iq`, `gate_cand`,
+    `gate_hc_gated` in an own remote dir, with a planted-OOB FAIL-first. No file:line yet, because the JIT load passes
+    no line-info option and the PTX carries no `.loc`. Fixture e2e arms after R3.
+  - Fuzz targets (S, Mac): cargo-fuzz on serve `http::read_request`/`read_chunked`, `template` parse, gguf
+    `parse_header`, tool-call parsers. Two defects found by reading are in round `inputfix`: the chunked-size overflow
+    (`http.rs:198`) and unbounded nested-array recursion (`gguf lib.rs:1078-1091`).
+  - TSan once on `bloomery-threads` (S); loom later (M).
+  - Hosted CI (M): fmt, check, the clippy ratchet, the pure and Linux host tests, check-*.sh and deny on a free Linux
+    runner. `tools/mac-check.sh` needs a Linux path.
+  - Dropped, predicted 0: LTO (its card's band holds 0, `card.py` rc 68), mold, sccache, `-Zthreads`, PGO/BOLT,
+    L2 persistence. Debug info only as a separate profile, since device `.loc` lines would move ptx-scan md5s.
+  - XS each: `.config/nextest.toml` has no user (delete or adopt); `overflow-checks` per untrusted-input package (not
+    profile-wide: overflow MIR breaks device lowering); a rust-analyzer config for the Mac.
+  - Done: the lead's pre-push hook (fmt + five fast check-*.sh, 22 s).
 - **gate-batch has no clean stop** (worker2, 2026-10-07, iqwire's stop; S, after 0.2.6).
   - The main process writes no pid file, and lane X runs inside it. A stop through pid files can only TERM
     `lane-X.child`, and each TERM starts the next item.
