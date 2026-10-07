@@ -64,7 +64,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-qwen38` | the same, `--features deepseek41` (the feature scopes the server code; it runs no V4.1 code) | Qwen3.8-Flash-Next |
-| `bloomery-serve` | `… --features glm5next,clef --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|decide`; the ds41 and qwen38 seats are the two binaries above) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, Clef-Flash |
+| `bloomery-serve` | `… --features glm5next,clef,vision --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, Clef-Flash, lev |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |
@@ -252,20 +252,18 @@ The same binary opens the Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` file (`unsloth/Qw
 
 ## Clef-Flash
 
-[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone (`qwen35`, dense) and a small joint schema head that scores every allowed option of every question in one prompt pass. The backbone is bartowski's GGUF; the head is the release's own file.
+[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone and a small joint schema head that scores every allowed option of every question in one prompt pass. bartowski's current GGUF upload is llama.cpp's `clef` layout, which carries the head inside the file; an older `qwen35`-layout file takes the release's own head file.
 
 ```sh
-hf download bartowski/Cloudflare_clef-flash-GGUF Cloudflare_clef-flash-Q8_0.gguf --local-dir ~/models/clef-flash
-hf download Cloudflare/clef-flash joint_head.safetensors joint_head_config.json --local-dir ~/models/clef-flash/hf
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision --release --bin bloomery-serve
 
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve
-
-# the backbone on one card (see Picking the card), the head on the host; --head picks the decide seat
-target/release/bloomery-serve -m ~/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf \
-  --head ~/models/clef-flash/hf/joint_head.safetensors --port 8091
-
-# or with no download step: the head comes from the repo bartowski's model card names as the model it quantizes
+# the backbone on one card (see Picking the card), the head (in the file) on the host
 target/release/bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q8_0 --port 8091
+
+# a qwen35-layout file: --head names the release's head file, its joint_head_config.json beside it
+hf download Cloudflare/clef-flash joint_head.safetensors joint_head_config.json --local-dir ~/models/clef-flash/hf
+target/release/bloomery-serve -m ~/models/clef-flash/<qwen35-layout file>.gguf \
+  --head ~/models/clef-flash/hf/joint_head.safetensors --port 8091
 
 curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
   "state": "User: what is the weather in Seoul tomorrow? Tools available: web_search, calculator, calendar.",
@@ -273,6 +271,8 @@ curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic",
                  "calendar": "Read or write events", "none": "Answer directly"}}}}'
 ```
+
+[lev](https://huggingface.co/ggml-org/lev-GGUF) is a second decision model on the same seat: a Qwen3.5-4B file whose `qwen35.decision.type` is `lev`, read by its label readout, with the request rendered by the file's own `systemone` template. The same binary serves it with no head flag: `bloomery-serve --hf ggml-org/lev-GGUF:Q4_K_M` (or `-m lev-Q4_K_M.gguf`). A `kev` file, a `qwen35` file with no decision keys and `--head` beside lev are refused by name.
 
 Every K-quant file of the same upload runs too, down to `Cloudflare_clef-flash-Q3_K_S.gguf` (4.26 GB); how close each one's answers are to the release's: [`tools/ref/clef/agreement.md`](../tools/ref/clef/agreement.md). The backbone reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 weights; the upload's IQ, Q2_K and Q4_0/Q4_1 files carry other types, which it refuses by name before loading.
 

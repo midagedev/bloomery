@@ -45,7 +45,7 @@ Where it ends today: one model a server, sm_86+ GPUs, and the seats' own default
 
 ## The seats
 
-The decide seat answers SystemOne requests, one at a time, text states only:
+The decide seat answers SystemOne requests, one at a time, text states only. It serves two decision models: Clef-Flash (a joint schema head) and lev (`--hf ggml-org/lev-GGUF:Q4_K_M`, a label readout; its file's `qwen35.decision.type` picks it, and its request is rendered by the file's own `systemone` template):
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weather in Seoul tomorrow? Tools available: web_search, calculator.",
