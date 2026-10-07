@@ -784,6 +784,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     fn prompt(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
         let (path, head) = (self.path, self.head);
         let start = t.pos();
+        let _busy = t.model().prompt_busy();
         let Some(&id) = ids.first() else {
             return Ok(B::prompt_with(t.model_mut(), ids, path, None)?);
         };

@@ -75,6 +75,7 @@ pub mod site;
 pub(crate) mod tensor;
 pub(crate) mod upload;
 pub(crate) mod view;
+pub(crate) mod watchdog;
 pub mod weights;
 
 pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
@@ -82,6 +83,7 @@ pub use graph::{
     Branch, FLAG_WAIT_OPS, Graph, HostFlags, KernelNode, NodeInfo, capturing, node_info,
 };
 pub use model::{GpuModel, Slots};
+pub use watchdog::Busy as EngineBusy;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.
 pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;
@@ -174,6 +176,20 @@ pub enum GpuError {
     HostPoisoned {
         what: &'static str,
         poison: Box<host::Poison>,
+    },
+    /// An engine-thread wait on the card ran out of its bound
+    /// ([`host::ENGINE_BOUND`]): the work `what` waited for had not finished
+    /// after `waited`. The card is stuck at work that waits on something
+    /// that did not come, or far slower than any step; `note` is what the
+    /// host tier's residency machine held then ([`swap::SwapMachine::stall_note`]),
+    /// empty without one or where the wait cannot reach it.
+    ///
+    /// [`swap::SwapMachine::stall_note`]: host::swap::SwapMachine::stall_note
+    Stalled {
+        what: &'static str,
+        waited: std::time::Duration,
+        bound: std::time::Duration,
+        note: String,
     },
 }
 
@@ -469,6 +485,22 @@ impl std::fmt::Display for GpuError {
                 f,
                 "{what}: an earlier hybrid service failed and released the stream: {poison}"
             ),
+            GpuError::Stalled {
+                what,
+                waited,
+                bound,
+                note,
+            } => {
+                write!(
+                    f,
+                    "{what}: the card's work did not finish in {waited:?}, bound {bound:?}"
+                )?;
+                if note.is_empty() {
+                    Ok(())
+                } else {
+                    write!(f, "; {note}")
+                }
+            }
         }
     }
 }
@@ -2154,10 +2186,11 @@ impl Gpu {
     }
 
     /// The fault the allocation holds, if any — the first-layer word and
-    /// that layer's site mask: the engine stream waited for, so they see
-    /// every launch enqueued before them, then read ([`fault::read`]).
+    /// that layer's site mask: the engine stream waited for within
+    /// [`host::ENGINE_BOUND`] ([`host::await_done`]), so they see every
+    /// launch enqueued before them, then read ([`fault::read`]).
     pub fn fault(&self) -> Result<Option<Fault>, GpuError> {
-        self.stream.synchronize()?;
+        host::await_done("Gpu::fault", || self.stream.query())?;
         fault::read(&self.fault)
     }
 

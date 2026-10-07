@@ -188,6 +188,7 @@ impl Session<Body> {
         want: Want,
     ) -> Result<Out<'_>, SessionError> {
         self.idle("prompt")?;
+        let _busy = self.model().prompt_busy();
         match self.model().body(WHAT)?.prefill_mode() {
             PrefillMode::Batch => {
                 let argmax = call(self.model_mut(), |m| body::prefill_media(m, ids, media))?;
@@ -214,6 +215,7 @@ impl Session<Body> {
         sink: FeatureSink<'_>,
     ) -> Result<u32, SessionError> {
         self.idle("prompt")?;
+        let _busy = self.model().prompt_busy();
         match self.model().body(WHAT)?.prefill_mode() {
             PrefillMode::Batch => {
                 let rows = FeatureRows { window, sink };
