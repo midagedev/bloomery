@@ -20,9 +20,18 @@
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
 # BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
+# BLOOMERY_TIER=real|fixture (unset: real) and BLOOMERY_FIXTURE_MODEL: the fixture tier (tools/box.sh resolves both, see
+# tools/ref/ref-paths.sh). A run asking for the V4.1 load lock takes none when its tier is fixture AND its
+# BLOOMERY_REF_MODEL is the file box.sh resolved the tier to (BLOOMERY_FIXTURE_MODEL): the lock keeps two ~190 GB host sets
+# out of each other's page cache, and a fixture's host set is a few GB. The request alone does not skip it: a fixture tier whose
+# model is not the resolved fixture file (a caller's own BLOOMERY_REF_MODEL, a family the tier left on its real file) takes the
+# lock as a real load does, and says so. A fixture run does not open the lock file at all. Any other BLOOMERY_TIER value is 64.
+# Locks. A run takes its card lock(s) and, when it loads, the V4.1 load lock TOGETHER: each poll tries every lock it needs
+# without blocking, and a run that got the card but not the load lock lets the card go before it sleeps, so a loader queued behind
+# another load holds no card — an `any` gate takes it. Nothing waits while holding a lock, except the two-card order below.
 set -uo pipefail
 GATE_LOCK=/root/bloomery-gate.lock A6000_LOCK=/root/bloomery-gate-a6000.lock
-V41_LOCK=/root/bloomery-v41-load.lock V41_BOUND=1800 POLL=5 CARD_BOUND=1800
+V41_LOCK=/root/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
 
 # The runner's own tests: each case runs this script with --test-locks <tmp> (the three locks under <tmp>,
 # the V4.1 load lock's bound 6 s, the card locks' 4 s, the polls 1 s), BLOOMERY_LEASE_LOCK at a file the test holds or not, a stub
@@ -97,6 +106,7 @@ PY
     local o=$1 c=$2 l=$3
     shift 3
     (cd "$t/tree" && env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES \
+      -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL \
       PATH="$t/bin:$PATH" BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
       bash "$self" --test-locks "$t" ok) > "$o" 2>&1
   }
@@ -198,7 +208,7 @@ PY
   gate "$t/out" 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_LEASE_PROC=/proc || rc=$?
   cat "$t/first" >> "$t/out"
   judge 'two V4.1 loads at once: the second waits, names the holder, counts the wait' "$rc" 0 \
-    'waits for the V4\.1 load lock .*holding the 3090 gate lock'
+    'waits for the V4\.1 load lock .*holding no gate lock'
   if [ -d /proc/self ]; then
     judge '  … its wait line names the first run as the holder' "$rc" 0 '\[lease\] +pid [0-9]+ holds it'
   else
@@ -225,7 +235,9 @@ PY
   flock -x 6 || { echo "FAIL: the test cannot hold the 3090 gate lock"; return 1; }
   gate "$t/first" 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 &
   p1=$!
-  sleep 1
+  # Half a poll later, so the second run's first look at the load lock falls between the first run's polls: each poll of a queued
+  # loader tests the lock with a shared hold of a few ms, and a second loader's exclusive try that lands inside it is refused once.
+  sleep 1.5
   rc=0 t0=$SECONDS
   gate "$t/out" a6000 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 || rc=$?
   el=$((SECONDS - t0))
@@ -237,6 +249,83 @@ PY
   wait "$p1" || rc=$?
   cp "$t/first" "$t/out"
   judge '  … and runs once its card lock frees' "$rc" 0 'waited [0-9]+ s for the gate lock \(3090\)'
+  # Taken together: the load lock is held (by the test) and two loaders wait on it, one asking `any` each. A loader that held
+  # the card it had got while it waited would leave an `any` gate that is no load with no card — 75 after the card bound
+  # (4 s here); with neither held, that gate takes a card at once. Each loader's seconds are its load-lock wait alone.
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  gate "$t/w1" any "$t/lease" BLOOMERY_GATE_V41_LOAD=1 &
+  p1=$!
+  gate "$t/w2" any "$t/lease" BLOOMERY_GATE_V41_LOAD=1 &
+  p2=$!
+  sleep 1
+  rc=0 t0=$SECONDS
+  gate "$t/out" any "$t/lease" || rc=$?
+  el=$((SECONDS - t0))
+  echo "elapsed ${el} s" >> "$t/out"
+  judge 'together: two loaders queued on the load lock hold no card, an any gate takes one at once' "$rc" 0 'elapsed [0-2] s' 'no gate lock'
+  judge '  … and takes it, not a queue' "$rc" 0 'ok on the (3090|a6000) \(asked any\)'
+  flock -u 6
+  exec 6>&-
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  # Each loader counts its own load-lock wait. A card wait may show too: at the instant the lock frees both ask for the one card
+  # `any` picks, and the loser waits for it honestly, so no line here says a card was not waited for.
+  cp "$t/w1" "$t/out"
+  judge '  … the first queued loader runs once the lock frees, counting its load-lock wait' "$rc" 0 'waited [0-9]+ s for the V4\.1 load lock'
+  cp "$t/w2" "$t/out"
+  judge '  … and the second' "$rc" 0 'waited [0-9]+ s for the V4\.1 load lock'
+  # The same for a loader of both cards: it took both card locks, then waited for the load lock holding them.
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  gate "$t/w1" both "$t/lease" BLOOMERY_BOX_CARD=both BLOOMERY_GATE_V41_LOAD=1 &
+  p1=$!
+  sleep 1
+  rc=0 t0=$SECONDS
+  gate "$t/out" any "$t/lease" || rc=$?
+  el=$((SECONDS - t0))
+  echo "elapsed ${el} s" >> "$t/out"
+  judge 'together: a two-card loader queued on the load lock holds no card, an any gate takes one at once' "$rc" 0 'elapsed [0-2] s' 'no gate lock'
+  flock -u 6
+  exec 6>&-
+  rc=0
+  wait "$p1" || rc=$?
+  cp "$t/w1" "$t/out"
+  judge '  … and the loader runs on both cards once the lock frees' "$rc" 0 'on both cards, both gate locks \(asked both\), V4\.1 load lock'
+  # The tier. A fixture load takes no V4.1 load lock — only when its model is the file box.sh resolved: the lock file is not opened
+  # (a directory stands there, which a real load refuses with 69), a held lock is not waited for, a request without the resolved
+  # file is refused nothing and takes the lock as a real load does.
+  rm -f "$t/v41-load.lock"
+  mkdir "$t/v41-load.lock"
+  FX='BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_MODEL=/m/fx-00001-of-00001.gguf'
+  case_ 'a real load whose lock file cannot be opened: 69, named' 69 'cannot open .*v41-load\.lock' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1
+  # shellcheck disable=SC2086 # FX is K=V words
+  case_ 'a fixture load opens no load lock and takes none' 0 'ok on the 3090 \(asked 3090\), tier fixture: no V4\.1 load lock' 3090 "$t/lease" \
+    BLOOMERY_GATE_V41_LOAD=1 $FX BLOOMERY_REF_MODEL=/m/fx-00001-of-00001.gguf
+  rmdir "$t/v41-load.lock"
+  : > "$t/v41-load.lock"
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  rc=0 t0=$SECONDS
+  # shellcheck disable=SC2086
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 $FX BLOOMERY_REF_MODEL=/m/fx-00001-of-00001.gguf || rc=$?
+  el=$((SECONDS - t0))
+  echo "elapsed ${el} s" >> "$t/out"
+  judge 'a fixture load does not wait for a held load lock' "$rc" 0 'elapsed [0-2] s' 'waits for the V4\.1'
+  # shellcheck disable=SC2086
+  case_ "a fixture tier with another model than the resolved fixture takes the lock (a held one: 75), and says so" 75 \
+    "BLOOMERY_TIER=fixture, but BLOOMERY_REF_MODEL='/m/real\.gguf' is not the fixture box.sh resolved" \
+    3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 $FX BLOOMERY_REF_MODEL=/m/real.gguf
+  case_ 'a fixture tier with no resolved fixture takes the lock too' 75 'BLOOMERY_FIXTURE_MODEL=..\): the V4\.1 load lock is taken' \
+    3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_TIER=fixture BLOOMERY_REF_MODEL=/m/real.gguf
+  case_ 'a fixture tier that names no model at all takes the lock too' 75 "BLOOMERY_REF_MODEL='' is not the fixture box.sh resolved \\(BLOOMERY_FIXTURE_MODEL=''\\)" \
+    3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_TIER=fixture
+  flock -u 6
+  exec 6>&-
+  case_ 'a real tier names no fixture: the lock is taken as before' 0 'ok on the 3090 \(asked 3090\), V4\.1 load lock$' 3090 "$t/lease" \
+    BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_TIER=real
+  case_ 'BLOOMERY_TIER other than real or fixture: 64, named' 64 'BLOOMERY_TIER is real or fixture .*got .tier2.' 3090 "$t/lease" BLOOMERY_TIER=tier2
   # The bound: a lock that never frees is 75, named, after V41_BOUND (6 s under --test-locks).
   exec 6> "$t/v41-load.lock"
   flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
@@ -270,6 +359,22 @@ case $V41 in
   0 | 1) ;;
   *) echo "gpu-gate.sh: BLOOMERY_GATE_V41_LOAD is 1 (the run loads V4.1) or 0/unset, got '$V41'" >&2; exit 64 ;;
 esac
+# The tier (the header): the V4.1 load lock is for a real load. A fixture run takes it only when its model is not the
+# resolved fixture file.
+TIER=${BLOOMERY_TIER:-real}
+case $TIER in
+  real | fixture) ;;
+  *) echo "gpu-gate.sh: BLOOMERY_TIER is real or fixture (unset: real), got '$TIER'" >&2; exit 64 ;;
+esac
+TIER_NOTE=
+if [ "$V41" = 1 ] && [ "$TIER" = fixture ]; then
+  if [ -n "${BLOOMERY_FIXTURE_MODEL:-}" ] && [ "${BLOOMERY_REF_MODEL:-}" = "$BLOOMERY_FIXTURE_MODEL" ]; then
+    V41=0
+    TIER_NOTE=', tier fixture: no V4.1 load lock'
+  else
+    echo "gpu-gate.sh: BLOOMERY_TIER=fixture, but BLOOMERY_REF_MODEL='${BLOOMERY_REF_MODEL:-}' is not the fixture box.sh resolved (BLOOMERY_FIXTURE_MODEL='${BLOOMERY_FIXTURE_MODEL:-}'): the V4.1 load lock is taken, as for a real load" >&2
+  fi
+fi
 # BLOOMERY_GATE_STACKS=<seconds>: the binary runs under tools/ref/stack-watch.sh, which dumps its thread
 # stacks and ends it once its output has stopped for that long, so a hang says where before the bound.
 STACKS=${BLOOMERY_GATE_STACKS:-}
@@ -329,7 +434,9 @@ a6000_idle() {
   ! nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -q "$u"
 }
 # 락 파일을 못 여는 셸(박스의 root가 아니거나 박스가 아님)은 경쟁이 아니다 — 여기서 이름을 대고 끝난다.
-for lock in "9:$GATE_LOCK" "8:$A6000_LOCK"; do
+LOCK_FILES=("9:$GATE_LOCK" "8:$A6000_LOCK")
+[ "$V41" = 0 ] || LOCK_FILES+=("7:$V41_LOCK")
+for lock in "${LOCK_FILES[@]}"; do
   eval "exec ${lock%%:*}>${lock#*:}" 2> /dev/null || { echo "gpu-gate.sh: cannot open ${lock#*:} — the gate runs on the box, as root" >&2; exit 69; }
 done
 # The held lease's timing card: the record lease_take writes beside the lock once it holds it
@@ -477,69 +584,90 @@ take_3090() {
   fi
   GOT=3090
 }
-GOT=
-LOCK_T0=$SECONDS
-if [ "$CARD" = both ]; then
-  # 3090 락을 먼저, 그것을 쥔 채 A6000 락을. 다른 실행은 락을 하나만 쥐므로 이 순서로는 교착이 없고, 막혀 기다리는
-  # flock은 해제 순간 깨어나 5초마다 도는 한 카드 실행들의 폴링보다 먼저 잡는다(둘이 함께 빌 때만 잡는 폴링은 게이트가
-  # 이어지는 동안 굶는다).
-  start=$SECONDS
-  if flock -w 1800 9; then
-    left=$((1800 - (SECONDS - start)))
+# take_card: one try, without blocking, at the card lock(s) this run asked for; GOT names what it holds, empty when none.
+take_card() {
+  GOT=
+  case "$CARD" in
+    3090) take_3090 || true ;;
+    a6000) take_a6000 || true ;;
+    any) take_a6000 || take_3090 || true ;;
+  esac
+}
+# take_both: the 3090 lock first, then, holding it, the A6000's. Every other run holds one card lock and never waits while
+# holding it, so this order cannot deadlock; a blocked flock wakes at the release before the polls of one-card runs
+# (a poll that takes only when both are free starves while gates keep coming). Blocks up to what is left of CARD_BOUND.
+take_both() {
+  local left=$((CARD_BOUND - CARD_W)) start=$SECONDS
+  [ "$left" -ge 1 ] || left=1
+  GOT=
+  if flock -w "$left" 9; then
+    left=$((left - (SECONDS - start)))
     if flock -w "$((left > 0 ? left : 1))" 8; then GOT=both; else flock -u 9; fi
   fi
-else
-  for ((waited = 0; waited <= CARD_BOUND; waited += POLL)); do
-    case "$CARD" in
-      3090) take_3090 ;;
-      a6000) take_a6000 ;;
-      any) take_a6000 || take_3090 ;;
-    esac
-    [ -n "$GOT" ] && break
-    sleep "$POLL"
-  done
-fi
-if [ -z "$GOT" ]; then
-  echo "gpu-gate.sh: no gate lock ($CARD) was free within ${CARD_BOUND} s — contention, not a red gate" >&2
-  exit 75
-fi
-# The wait is not the gate's time: tools/gate-batch.sh subtracts this line's seconds from the item's times row.
-LOCK_WAIT=$((SECONDS - LOCK_T0))
-[ "$LOCK_WAIT" = 0 ] || echo "gpu-gate.sh: waited ${LOCK_WAIT} s for the gate lock ($CARD)" >&2
-# The V4.1 load lock: one V4.1 load on the box at a time, across trees and batches — two at once push each
-# other's host set (~190 GB of the 256 GB) out of the page cache and both turn IO-bound. Lock order, the
-# deadlock rule: it is taken only while this run already holds its card lock(s), always after them, and
-# no card lock is ever taken while holding it; a run that is not a V4.1 load never touches it. So a run
-# holding it waits on nothing, and no cycle can form. The wait holds the card lock(s) — that card is the
-# one this load will use — and names the lock's holders at once and once a minute; after V41_BOUND
-# seconds it is 75 (contention, not a red gate). The descriptor stays open for the binary, so the lock
-# lives exactly as long as the load's process.
-if [ "$V41" = 1 ]; then
-  eval "exec 7>$V41_LOCK" 2> /dev/null || { echo "gpu-gate.sh: cannot open $V41_LOCK — the gate runs on the box, as root" >&2; exit 69; }
-  V41_T0=$SECONDS said=-60
-  until flock -n 7; do
-    el=$((SECONDS - V41_T0))
-    if [ "$el" -ge "$V41_BOUND" ]; then
-      echo "gpu-gate.sh: $NAME: the V4.1 load lock $V41_LOCK was not free within ${V41_BOUND} s — contention, not a red gate (rc 75)" >&2
-      exit 75
+}
+drop_card() {
+  case "$GOT" in
+    3090) flock -u 9 ;;
+    a6000) flock -u 8 ;;
+    both) flock -u 9; flock -u 8 ;;
+  esac
+  GOT=
+}
+# The V4.1 load lock: one V4.1 load on the box at a time, across trees and batches — two at once push each other's
+# host set (~190 GB of the 256 GB) out of the page cache and both turn IO-bound. It is held by the binary for the whole
+# run: the descriptor stays open, so the lock lives exactly as long as the load's process.
+# The run takes it TOGETHER with its card lock(s): each poll tries the lock and then the card without blocking, and a run that
+# got a card but not the lock lets the card go before it sleeps. A loader queued behind another load therefore holds no card
+# while it waits (it held one for the other load's whole run, and an `any` gate found both cards taken with one idle); the
+# poll's first look is a shared test of the lock, so while it is held the poll touches no card and no nvidia-smi.
+# The only wait that holds a lock is take_both's second card lock, in the order above. The waits are the bounds' own:
+# CARD_BOUND for a poll that found no card, V41_BOUND for one that found the card and not the lock, each 75 (contention, not a
+# red gate) with the lock named; the load lock's holders are named at once and once a minute.
+# Each poll's seconds go to one of the two waits, so the two `waited` lines never overlap: tools/gate-batch.sh subtracts both.
+GOT=
+CARD_W=0 LOAD_W=0 why='' said=-60 last=$SECONDS
+while :; do
+  why=
+  if [ "$V41" = 1 ] && ! flock -s -n "$V41_LOCK" true 2> /dev/null; then
+    why=load
+  else
+    if [ "$CARD" = both ]; then take_both; else take_card; fi
+    if [ -z "$GOT" ]; then
+      why=card
+    elif [ "$V41" = 1 ] && ! flock -n 7; then
+      drop_card
+      why=load
     fi
-    if [ $((el - said)) -ge 60 ]; then
-      echo "gpu-gate.sh: $NAME waits for the V4.1 load lock $V41_LOCK (another run is loading V4.1), holding the $GOT gate lock; ${el} s so far, its holders:" >&2
-      lease_holders "$V41_LOCK" >&2
-      said=$el
-    fi
-    sleep "$POLL"
-  done
-  # Not the gate's time either: tools/gate-batch.sh subtracts this line's seconds as it does the card lock's.
-  V41_WAIT=$((SECONDS - V41_T0))
-  [ "$V41_WAIT" = 0 ] || echo "gpu-gate.sh: waited ${V41_WAIT} s for the V4.1 load lock" >&2
-fi
+  fi
+  [ -n "$why" ] || break
+  if [ "$why" = load ] && [ $((LOAD_W - said)) -ge 60 ]; then
+    echo "gpu-gate.sh: $NAME waits for the V4.1 load lock $V41_LOCK (another run is loading V4.1), holding no gate lock; ${LOAD_W} s so far, its holders:" >&2
+    lease_holders "$V41_LOCK" >&2
+    said=$LOAD_W
+  fi
+  sleep "$POLL"
+  spent=$((SECONDS - last)) last=$SECONDS
+  if [ "$why" = card ]; then CARD_W=$((CARD_W + spent)); else LOAD_W=$((LOAD_W + spent)); fi
+  if [ "$CARD_W" -ge "$CARD_BOUND" ] && [ "$why" = card ]; then
+    echo "gpu-gate.sh: no gate lock ($CARD) was free within ${CARD_BOUND} s — contention, not a red gate" >&2
+    exit 75
+  fi
+  if [ "$LOAD_W" -ge "$V41_BOUND" ] && [ "$why" = load ]; then
+    echo "gpu-gate.sh: $NAME: the V4.1 load lock $V41_LOCK was not free within ${V41_BOUND} s — contention, not a red gate (rc 75)" >&2
+    exit 75
+  fi
+done
+# What the last poll spent (take_both's blocking) was a wait for the card lock.
+CARD_W=$((CARD_W + SECONDS - last))
+# The waits are not the gate's time: tools/gate-batch.sh subtracts these lines' seconds from the item's times row.
+[ "$CARD_W" = 0 ] || echo "gpu-gate.sh: waited ${CARD_W} s for the gate lock ($CARD)" >&2
+[ "$LOAD_W" = 0 ] || echo "gpu-gate.sh: waited ${LOAD_W} s for the V4.1 load lock" >&2
 if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then
   U=$(uuid_of "$([ "$GOT" = a6000 ] && echo A6000 || echo 3090)")
   [ -n "$U" ] || { echo "gpu-gate.sh: the $GOT lookup failed" >&2; exit 75; }
   export CUDA_VISIBLE_DEVICES=$U
 fi
-echo "gpu-gate.sh: $NAME on $([ "$GOT" = both ] && echo 'both cards, both gate locks' || echo "the $GOT") (asked $CARD)$([ "$V41" = 0 ] || echo ', V4.1 load lock')" >&2
+echo "gpu-gate.sh: $NAME on $([ "$GOT" = both ] && echo 'both cards, both gate locks' || echo "the $GOT") (asked $CARD)$([ "$V41" = 0 ] || echo ', V4.1 load lock')$TIER_NOTE" >&2
 if [ -n "$STACKS" ]; then
   bash "${BASH_SOURCE[0]%/*}/ref/stack-watch.sh" "$STACKS" "$NAME" -- timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 elif [ "$GDB" = 1 ]; then

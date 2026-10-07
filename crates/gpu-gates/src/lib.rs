@@ -46,6 +46,7 @@ pub mod rounding;
 pub mod serve_client;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
+pub mod tier;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
@@ -103,15 +104,25 @@ pub fn checks_failed() -> GateError {
 /// `tools/box.sh` exports it into every box command, the same value the
 /// runners and the C++ harnesses read. An empty value counts as unset, as in
 /// the profile. `open_model` and any gate that prints the path read it here,
-/// so the printed name is the file that was opened.
+/// so the printed name is the file that was opened. Under `BLOOMERY_TIER=fixture`
+/// ([`tier`]) the file must be a whole fixture: a path that is not one is a
+/// named error here, never a gate that ran on a real file under the fixture's
+/// name. The real tier, and no tier, return the path unread.
 pub fn ref_model_path() -> Result<PathBuf, GateError> {
-    if let Some(p) = model_file::model_file() {
-        return Ok(p.clone());
+    let path = if let Some(p) = model_file::model_file() {
+        p.clone()
+    } else {
+        match std::env::var_os("BLOOMERY_REF_MODEL") {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => return Err(hf::source::NONE.into()),
+        }
+    };
+    let tier = tier::Tier::from_env()?;
+    if tier == tier::Tier::Fixture {
+        let g = Gguf::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        tier.check_file(&path, g.iter_kv().map(|(k, _)| k))?;
     }
-    match std::env::var_os("BLOOMERY_REF_MODEL") {
-        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-        _ => Err(hf::source::NONE.into()),
-    }
+    Ok(path)
 }
 
 pub use refset::data_dir;

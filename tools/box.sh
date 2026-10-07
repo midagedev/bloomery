@@ -21,6 +21,14 @@
 #                             hold — a sitting script puts its hold up and runs its runners through
 #                             box.sh; the lease and every other hold still stop it, and with its own
 #                             hold up and another that went up first it gives way at once (75)
+#   BLOOMERY_TIER=real|fixture  the tier the command runs in (unset: real, and every byte of the remote command as before). It
+#                             names the tier the model file comes from: tools/ref/ref-paths.sh resolves BLOOMERY_REF_MODEL
+#                             to the family's fixture under `fixture`, exports the fixture's card budget as BLOOMERY_CARD_BUDGET
+#                             and the file as BLOOMERY_FIXTURE_MODEL (set only when the tier resolved one; tools/gpu-gate.sh
+#                             skips its V4.1 load lock only for that file), and refuses a family with none (66) — it never runs
+#                             one on its real file. The tier comes from the environment here or a BLOOMERY_TIER entry of
+#                             BLOOMERY_BOX_ENV, which is read here, before the profile: an entry the profile had not seen would
+#                             reach the binary and not the file. Both set to different tiers is 64.
 #   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
 #                             guard: the way to read a sitting's log, the owner's own included, while it
 #                             runs. Refused (64) when the command names cargo, just, make, cmake, ninja
@@ -42,6 +50,26 @@ HOLD_OWNER=${BLOOMERY_HOLD_OWNER:-}
 case $HOLD_OWNER in
   *[!A-Za-z0-9_]*) echo "box.sh: BLOOMERY_HOLD_OWNER is the <owner> of /root/bloomery-<owner>-hold (letters, digits, _), got '$HOLD_OWNER'" >&2; exit 64 ;;
 esac
+# The tier (the header), named before anything is synced: a refusal touches nothing on the box.
+TIER_MAC=${BLOOMERY_TIER:-} TIER_BOX=
+read -r -a tier_env <<< "${BLOOMERY_BOX_ENV:-}"
+for kv in ${tier_env[@]+"${tier_env[@]}"}; do
+  [ "${kv%%=*}" != BLOOMERY_TIER ] || TIER_BOX=${kv#*=}
+done
+for t in "$TIER_MAC" "$TIER_BOX"; do
+  case "$t" in
+    '' | real | fixture) ;;
+    *) echo "box.sh: BLOOMERY_TIER is real or fixture (unset: real), got '$t'" >&2; exit 64 ;;
+  esac
+done
+if [ -n "$TIER_MAC" ] && [ -n "$TIER_BOX" ] && [ "$TIER_MAC" != "$TIER_BOX" ]; then
+  echo "box.sh: BLOOMERY_TIER is '$TIER_MAC' in the environment and '$TIER_BOX' in BLOOMERY_BOX_ENV: name one" >&2
+  exit 64
+fi
+TIER=${TIER_BOX:-${TIER_MAC:-real}}
+# Exported ahead of the profile below, so ref-paths.sh sees it; nothing is added for a command that names none.
+TIERX=
+[ -z "$TIER_MAC$TIER_BOX" ] || TIERX="export BLOOMERY_TIER=$TIER && "
 READONLY=0
 case ${BLOOMERY_BOX_READONLY:-0} in
   0) GUARD="( cd $REMOTE && . tools/ref/lease-probe.sh && lease_guard $BOX_WAIT $HOLD_OWNER ) && " ;;
@@ -117,6 +145,11 @@ if [ -n "${BLOOMERY_MODEL:-}" ]; then
   MODEL_PICK="BLOOMERY_MODEL=$(printf %q "$BLOOMERY_MODEL") && "
 fi
 PROFILE="__p=\$(${MODEL_PICK}. tools/ref/ref-paths.sh && printf %s \"\$BLOOMERY_MODEL\") && export BLOOMERY_REF_MODEL_PROFILE=\"\$__p\" && __m=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_REF_MODEL=\"\$__m\" && unset __p __m"
+# The fixture tier also takes the fixture file's card budget and names the file, in one more read of ref-paths.sh each; a family
+# whose real file stands (FIXTURE_FILE empty) exports neither, and a file that is not a whole fixture stops the command (65).
+if [ "$TIER" = fixture ]; then
+  PROFILE="$PROFILE && __f=\$(. tools/ref/ref-paths.sh && printf %s \"\$FIXTURE_FILE\") && __b=\$(. tools/ref/ref-paths.sh && fixture_budget) && { [ -z \"\$__f\" ] || export BLOOMERY_FIXTURE_MODEL=\"\$__f\" BLOOMERY_CARD_BUDGET=\"\$__b\"; } && unset __f __b"
+fi
 # The V4.1 file (BLOOMERY_V41_MODEL, and its directory as BLOOMERY_V41_DIR) is exported into every command
 # whatever profile it picked: the deepseek41 profile owns the choice (its V41_MODEL), and the crates and
 # scripts that open V4.1 under another profile (the tokenizer, engram, qdot and placement tests, the
@@ -185,4 +218,4 @@ esac
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 ssh "$HOST" "${GUARD}source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $V41 && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$CARD && $OXIDE$ENVS$*"
+} && cd $REMOTE && $V41 && $TIERX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$CARD && $OXIDE$ENVS$*"
