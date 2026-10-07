@@ -8,32 +8,11 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
+use crate::arch::classify::{Counts, classify_with};
+use crate::arch::stems::{opt, req};
+use crate::placement::{ModelTensors, PlacementError, Role};
 
-/// A tensor a layer of some kind carries, by stem: its role, and whether
-/// the file must carry it (ik creates it without `TENSOR_NOT_REQUIRED`).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Stem {
-    pub(super) name: &'static str,
-    pub(super) role: Role,
-    pub(super) required: bool,
-}
-
-const fn req(name: &'static str, role: Role) -> Stem {
-    Stem {
-        name,
-        role,
-        required: true,
-    }
-}
-
-const fn opt(name: &'static str, role: Role) -> Stem {
-    Stem {
-        name,
-        role,
-        required: false,
-    }
-}
+pub(super) use crate::arch::stems::{Stem, required};
 
 /// A KDA delta-rule layer's mixer; `ssm_f_b` and `ssm_g_b` are required
 /// because without them ik takes another decay rule (`src/llama-kda.cpp`,
@@ -156,11 +135,6 @@ pub fn nextn_role(stem: &str) -> Option<Role> {
         .map(|s| s.role)
 }
 
-/// The names of `stems` the file must carry.
-pub(super) fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
-    stems.iter().filter(|s| s.required).map(|s| s.name)
-}
-
 /// The role of a trunk layer's stem.
 fn layer_role(stem: &str) -> Option<Role> {
     TRUNK
@@ -195,35 +169,15 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
 
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    let mut tensors = Vec::with_capacity(split.tensor_count());
-    let mut unclassified = Vec::new();
-    for (shard, t) in split.iter_tensors() {
-        let Some((role, layer)) = role(&t.name, hp) else {
-            unclassified.push(t.name.clone());
-            continue;
-        };
-        tensors.push(ModelTensor {
-            name: t.name.clone(),
-            shard,
-            layer,
-            role,
-            ty: t.ty,
-            dims: t.dims.clone(),
-            file_bytes: t.nbytes,
-            gathered_rows: (role == Role::TokenEmbedding).then_some(1),
-        });
-    }
-    if !unclassified.is_empty() {
-        return Err(PlacementError::Unclassified {
-            names: unclassified,
-        });
-    }
-    Ok(ModelTensors {
-        tensors,
-        layers: hp.n_trunk,
-        experts: hp.n_expert as u64,
-        experts_used: hp.n_used as u64,
-    })
+    classify_with(
+        split,
+        |name| role(name, hp),
+        Counts {
+            layers: hp.n_trunk,
+            experts: hp.n_expert as u64,
+            experts_used: hp.n_used as u64,
+        },
+    )
 }
 
 #[cfg(test)]

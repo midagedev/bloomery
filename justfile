@@ -898,6 +898,12 @@ gate-gpu-glm-sel:
 gate-gpu-glm5next-gemm:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_gemm'
 
+# MiMo-V2's attention kernels: the rope-only append and the K192/V128 scalar flash with the window and the sinks
+# (A1-A2, F0-F9 on seeded data; G1-G2 on ik's ref_mimo2* sets, each opened through the ik-mimo2 family check against
+# the mimo2 profile's model file).
+gate-gpu-mimo2-flash *ARGS:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_mimo2_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_flash {{ARGS}}'
+
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
 

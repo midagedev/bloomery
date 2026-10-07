@@ -69,7 +69,8 @@ const TENSORS: &[&str] = &[
 
 // PIN(2026-10-07): the KV cache the description asks a layer to hold, in values a position: the
 // full layers' 4 heads of 320 (key 192 + value 128; 2 B/value in the f16 cache) and the window
-// layers' 8 — the window layers' ring holds `attention.sliding_window` rows alone.
+// layers' 8 — every layer a plane of the whole context, its window bounding what a query reads,
+// not what the layer holds.
 const KV: &[&str] = &[
     "kv 4x320 values: 0,5,11,17,23,29,35,41,47",
     "kv 8x320 values: 1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
@@ -153,6 +154,135 @@ fn hw_mimo2_spec() {
         b.len(),
         b.join("\n  ")
     );
+}
+
+// PIN(2026-10-08): the plan of the RL file through `arch::mimo2::place::PlanInputs` on the gate
+// machine (the 3090, all 48 trunk layers and the head) at the gate context 4160, made from
+// `PlanInputs::describe` — the coverage list refuses every mimo2 file today, the program being a
+// later round's. KV a position over the trunk 222,720 B = (39 window × 8 + 9 full × 4) KV heads ×
+// 320 values (key 192 + value 128) × 2 B, every layer a full plane.
+// PIN(2026-10-08): the card's weights 5,839,528,704 B [derived] = attention Q8_0 9 × 94,699,520 +
+// 39 × 100,270,080 (a layer's rows: 4,096 × (64·192 + kv·(192 + 128)) of qkv + 64·128 × 4,096 of
+// o, × 34/32) + the dense block 3 × 4,096 × 16,384 × 34/32 + the head 152,576 × 4,096 × 34/32 +
+// the routers 47 × 256 × 4,096 × 4 + the norms, biases and sinks 97 × 4,096 × 4 + 47 × 256 × 4 +
+// 39 × 64 × 4. Host routed 160,859,947,008 B [derived] = 47 × 256 experts × 3 × 4,096 × 2,048
+// values × 17/32 B (MXFP4); the embedding 664,010,752 B = 152,576 × 4,096 × 34/32 on the host as
+// the row-gathered table. n_l 0 on every layer: this program runs no card expert.
+/// The plan of the RL file onto the gate machine: what
+/// `arch::mimo2::place::PlanInputs` resolves for the file the spec test
+/// reads — every routed expert on the host (this program runs no card
+/// expert), every layer's KV planes full — and the plan's named refusals:
+/// a machine that hangs an expert tier card and a context of no position.
+#[test]
+#[ignore = "needs the MiMo-V2.6-Flash-RL shards on the box (just gate-mimo2-meta)"]
+fn hw_mimo2_plan() {
+    use model::placement::PlanLevers;
+    use model::placement::workstation;
+
+    let mut o = String::new();
+    let mut b = Vec::new();
+    let split = Split::open(MIMO).unwrap_or_else(|e| panic!("open {MIMO}: {e}"));
+    let inputs = model::arch::mimo2::place::PlanInputs::describe(&split)
+        .unwrap_or_else(|e| panic!("plan inputs of {MIMO}: {e}"));
+    let layers = inputs.hp.n_trunk;
+    let ctx: u64 = 4160;
+    let _ = writeln!(
+        o,
+        "file {MIMO}, {layers} trunk layers, gate machine at ctx {ctx}"
+    );
+    row(
+        &mut o,
+        &mut b,
+        "kv bytes a position over the trunk",
+        inputs.kv.bytes(0..layers, 1),
+        222_720,
+    );
+    let machine = workstation::plan_gate(layers);
+    let plan = inputs
+        .plan(&machine, ctx, &PlanLevers::default())
+        .unwrap_or_else(|e| panic!("plan on the gate machine at ctx {ctx}: {e}"));
+    let card = &plan.cards[0];
+    row(
+        &mut o,
+        &mut b,
+        "card weight bytes",
+        card.dense_bytes + card.expert_bytes,
+        5_839_528_704,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "card kv bytes",
+        card.kv_bytes,
+        ctx * 222_720,
+    );
+    row(&mut o, &mut b, "n_l", plan.n_l.clone(), vec![0; layers]);
+    row(
+        &mut o,
+        &mut b,
+        "host routed bytes",
+        plan.host.expert_bytes,
+        160_859_947_008,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "host table bytes (the embedding)",
+        plan.host.table_bytes,
+        664_010_752,
+    );
+    let mut tiered = workstation::plan_gate(layers);
+    let mut tier = tiered.cards[0].clone();
+    tier.layers = 0..0;
+    tier.head = false;
+    tier.token_embedding = false;
+    tiered.tiers.push(tier);
+    let err = inputs
+        .plan(&tiered, ctx, &PlanLevers::default())
+        .expect_err("a machine that hangs an expert tier card is refused by name")
+        .to_string();
+    let _ = writeln!(o, "  as the plan refuses a tier card: {err}");
+    // PIN(2026-10-08): the tier refusal is the placement's own
+    // (HostRoutedTier), lifted from the family's Tier variant — it names the
+    // card and the all-host plan, no longer the card-expert round.
+    if !(err.contains("tier card 3090")
+        && err.contains("this plan puts every routed expert on the host"))
+    {
+        b.push(format!(
+            "the tier refusal names neither the card nor the all-host plan: {err}"
+        ));
+    }
+    let err = inputs
+        .plan(&machine, 0, &PlanLevers::default())
+        .expect_err("a context of no position is refused by name")
+        .to_string();
+    let _ = writeln!(o, "  as the plan refuses ctx 0: {err}");
+    if !err.contains("ctx_max 0") {
+        b.push(format!("the ctx-0 refusal: {err}"));
+    }
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}
+
+/// One compared value: a line of the printed table, and an entry of `bad`
+/// when it differs.
+fn row<T: PartialEq + std::fmt::Debug>(
+    out: &mut String,
+    bad: &mut Vec<String>,
+    what: &str,
+    got: T,
+    want: T,
+) {
+    let mark = if got == want { "ok " } else { "BAD" };
+    let _ = writeln!(out, "  {mark} {what:<34} {got:?}");
+    if got != want {
+        bad.push(format!("{what}: got {got:?}, want {want:?}"));
+    }
 }
 
 /// Each run of layers that hold one KV width, in values a position: the

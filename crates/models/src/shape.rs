@@ -234,13 +234,19 @@ pub enum Refusal {
     Group,
     /// No flash is built for this head width.
     HeadWidth { served: Vec<u32> },
-    /// The value width is not the head width: no flash instance splits them.
-    ValueWidth { head: u32, value: u32 },
-    /// The layer attends a window of the positions: no flash cuts one.
+    /// No flash is built for this value width at this head width: `served` are
+    /// the value widths the head's rows carry.
+    ValueWidth {
+        head: u32,
+        value: u32,
+        served: Vec<u32>,
+    },
+    /// The layer attends a window of the positions: the selected row cuts none.
     Window { positions: u32 },
-    /// The layer carries per-head softmax sinks: no flash folds them in.
+    /// The layer carries per-head softmax sinks: the selected row folds none in.
     Sinks,
-    /// The layer scales its value rows: no flash applies the multiplier.
+    /// The layer scales its value rows: the selected row's append applies no
+    /// multiplier.
     ValueScale,
     /// The head width's flashes take another query-head group.
     GqaGroup { group: u32, served: Vec<String> },
@@ -303,15 +309,22 @@ impl fmt::Display for ShapeRefused {
             Refusal::HeadWidth { served } => {
                 write!(f, "no flash is built for this head; heads {served:?} are")
             }
-            Refusal::ValueWidth { head, value } => write!(
+            Refusal::ValueWidth {
+                head,
+                value,
+                served,
+            } => write!(
                 f,
-                "no flash splits the value width from the head width (head {head}, value {value})"
+                "no flash is built for a value width of {value} at a head of {head}; \
+                 values {served:?} are"
             ),
             Refusal::Window { positions } => {
-                write!(f, "no flash cuts a window of {positions} positions")
+                write!(f, "this flash cuts no window of {positions} positions")
             }
-            Refusal::Sinks => f.write_str("no flash folds per-head softmax sinks into the softmax"),
-            Refusal::ValueScale => f.write_str("no flash scales the value rows"),
+            Refusal::Sinks => {
+                f.write_str("this flash folds no per-head softmax sinks into the softmax")
+            }
+            Refusal::ValueScale => f.write_str("this flash's append applies no value multiplier"),
             Refusal::GqaGroup { group, served } => write!(
                 f,
                 "group {group}; this head's flashes take {}",
@@ -425,9 +438,7 @@ pub struct AttnShape {
     pub n_kv: u32,
     /// Key and score values per head.
     pub head: u32,
-    /// Value values per head; every compiled flash takes it equal to `head`
-    /// — the first instance that splits them carries the width it is built
-    /// for in its row.
+    /// Value values per head: a row serves the width it is built for.
     pub value: u32,
     /// The positions attended; `None`: every position.
     pub window: Option<u32>,
@@ -465,11 +476,20 @@ pub enum GroupRule {
 /// One compiled GQA flash instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GqaInst {
-    /// Values per head: the tiles' and the register vectors' width.
+    /// Key and score values per head: the key tile's width.
     pub head: u32,
+    /// Value values per head: the value tile's and the register vectors'
+    /// width.
+    pub value: u32,
     /// Query heads one block holds.
     pub pack: u32,
     pub group: GroupRule,
+    /// The instance cuts a window of the positions (a launch argument).
+    pub window: bool,
+    /// The instance folds per-head softmax sinks into the softmax.
+    pub sinks: bool,
+    /// The instance's append multiplies the value rows by the layer's scale.
+    pub value_scale: bool,
     /// The code that owns the instance.
     pub at: &'static str,
 }
@@ -496,37 +516,66 @@ impl GqaInst {
 pub const GQA: &[GqaInst] = &[
     GqaInst {
         head: 128,
+        value: 128,
         pack: 8,
         group: GroupRule::One,
+        window: false,
+        sinks: false,
+        value_scale: false,
         at: "gpu/src/flash_gqa.rs HEAD, GROUP",
     },
     GqaInst {
         head: 256,
+        value: 256,
         pack: 8,
         group: GroupRule::One,
+        window: false,
+        sinks: false,
+        value_scale: false,
         at: "gpu/src/flash_gqa.rs HEAD_256, GROUP (the _256 entries)",
     },
     GqaInst {
         head: 256,
+        value: 256,
         pack: 4,
         group: GroupRule::Packs,
+        window: false,
+        sinks: false,
+        value_scale: false,
         at: "gpu/src/flash_gqa.rs PACK_4 (the _256_p4 entries)",
     },
     GqaInst {
         head: 256,
+        value: 256,
         pack: 2,
         group: GroupRule::Packs,
+        window: false,
+        sinks: false,
+        value_scale: false,
         at: "gpu/src/flash_gqa.rs PACK_2 (the _256_p2 entries, scalar pass only)",
+    },
+    GqaInst {
+        head: 192,
+        value: 128,
+        pack: 8,
+        group: GroupRule::Packs,
+        window: true,
+        sinks: true,
+        value_scale: true,
+        at: "gpu/src/flash_gqa.rs HEAD_K192 (the _k192 entries, scalar pass only; \
+             gpu/src/rope_neox.rs neox_append_k192)",
     },
 ];
 
-/// The first GQA row, in [`GQA`]'s order, built for `s.head` that takes its
-/// group.
+/// The first GQA row, in [`GQA`]'s order, built for `s.head` and `s.value`
+/// that takes its group and serves its window, sinks and value scale.
 ///
 /// # Errors
 ///
 /// [`ShapeRefused`] naming `s` when the heads do not group, no row has its
-/// head width, or none of those takes its group.
+/// head width, none of those has its value width, none of those takes its
+/// group, or the selected row does not cut its window, fold its sinks or
+/// apply its value scale.
 pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     let refuse = |why| ShapeRefused {
         shape: Shape::Attn(s),
@@ -535,31 +584,27 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     if s.n_kv == 0 || s.n_head == 0 || !s.n_head.is_multiple_of(s.n_kv) {
         return Err(refuse(Refusal::Group));
     }
-    if s.value != s.head {
-        return Err(refuse(Refusal::ValueWidth {
-            head: s.head,
-            value: s.value,
-        }));
-    }
-    if let Some(positions) = s.window {
-        return Err(refuse(Refusal::Window { positions }));
-    }
-    if s.sinks {
-        return Err(refuse(Refusal::Sinks));
-    }
-    if s.scaled {
-        return Err(refuse(Refusal::ValueScale));
-    }
     let group = s.n_head / s.n_kv;
-    let width: Vec<&GqaInst> = GQA.iter().filter(|r| r.head == s.head).collect();
-    if width.is_empty() {
+    let head: Vec<&GqaInst> = GQA.iter().filter(|r| r.head == s.head).collect();
+    if head.is_empty() {
         let mut served: Vec<u32> = GQA.iter().map(|r| r.head).collect();
+        served.sort_unstable();
         served.dedup();
         return Err(refuse(Refusal::HeadWidth { served }));
     }
-    match gqa_row(s.head, group) {
-        Some(r) => Ok(r),
-        None => Err(refuse(Refusal::GqaGroup {
+    let width: Vec<&&GqaInst> = head.iter().filter(|r| r.value == s.value).collect();
+    if width.is_empty() {
+        let mut served: Vec<u32> = head.iter().map(|r| r.value).collect();
+        served.sort_unstable();
+        served.dedup();
+        return Err(refuse(Refusal::ValueWidth {
+            head: s.head,
+            value: s.value,
+            served,
+        }));
+    }
+    let Some(row) = gqa_row_v(s.head, s.value, group) else {
+        return Err(refuse(Refusal::GqaGroup {
             group,
             served: width
                 .iter()
@@ -568,17 +613,36 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
                     GroupRule::Packs => format!("a multiple of {}", r.pack),
                 })
                 .collect(),
-        })),
+        }));
+    };
+    if let Some(positions) = s.window
+        && !row.window
+    {
+        return Err(refuse(Refusal::Window { positions }));
     }
+    if s.sinks && !row.sinks {
+        return Err(refuse(Refusal::Sinks));
+    }
+    if s.scaled && !row.value_scale {
+        return Err(refuse(Refusal::ValueScale));
+    }
+    Ok(row)
 }
 
-/// The first row, in [`GQA`]'s order, built for `head` that takes `group`
-/// query heads a key head.
+/// The first row, in [`GQA`]'s order, built for `head` key values and `value`
+/// value values that takes `group` query heads a key head.
+#[must_use]
+pub fn gqa_row_v(head: u32, value: u32, group: u32) -> Option<GqaInst> {
+    GQA.iter()
+        .find(|r| r.head == head && r.value == value && r.takes(group))
+        .copied()
+}
+
+/// [`gqa_row_v`] at a value width equal to the head's: the rows the
+/// Qwen bodies launch.
 #[must_use]
 pub fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
-    GQA.iter()
-        .find(|r| r.head == head && r.takes(group))
-        .copied()
+    gqa_row_v(head, head, group)
 }
 
 #[cfg(test)]
@@ -791,11 +855,11 @@ mod tests {
                 served: vec!["exactly 8".to_string()]
             }
         );
-        let e = select_gqa(attn(16, 2, 192)).expect_err("head 192");
+        let e = select_gqa(attn(16, 2, 160)).expect_err("head 160");
         assert_eq!(
             e.why,
             Refusal::HeadWidth {
-                served: vec![128, 256]
+                served: vec![128, 192, 256]
             }
         );
         for s in [attn(24, 5, 256), attn(24, 0, 256), attn(0, 2, 256)] {
@@ -805,34 +869,100 @@ mod tests {
         assert!(e.to_string().contains("group 3"), "{e}");
     }
 
-    /// A value width narrower than the head (MiMo-V2's K 192 / V 128) is
-    /// refused by name until a flash instance carries its width in its row;
-    /// the refusal names both widths.
-    #[test]
-    fn a_value_width_off_the_head_is_refused_by_name() {
-        let s = AttnShape {
-            n_head: 64,
-            n_kv: 4,
+    fn mimo(n_head: u32, n_kv: u32, window: Option<u32>, sinks: bool) -> AttnShape {
+        AttnShape {
+            n_head,
+            n_kv,
             head: 192,
             value: 128,
-            window: None,
-            sinks: false,
-            scaled: false,
+            window,
+            sinks,
+            scaled: true,
+        }
+    }
+
+    /// MiMo-V2.6-Flash (the GGUF header: `key_length` 192, `value_length` 128,
+    /// 64 query heads, `head_count_kv` 4 on the nine full layers and 8 on the
+    /// sliding ones, `sliding_window` 128, `attn_sinks` on the sliding layers,
+    /// `value_scale` 0.707) selects the K192 row: packs 2 on a full layer,
+    /// packs 1 on a sliding one.
+    #[test]
+    fn mimo_v2_selects_the_k192_row() {
+        for (name, s, packs) in [
+            ("full", mimo(64, 4, None, false), 2),
+            ("sliding", mimo(64, 8, Some(128), true), 1),
+        ] {
+            let row = select_gqa(s).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((row.head, row.value, row.pack), (192, 128, 8), "{name}");
+            assert_eq!(row.packs(s.n_head / s.n_kv), packs, "{name}");
+        }
+    }
+
+    /// A pair of widths no row holds is refused by name, naming the value
+    /// widths the head's rows carry: the K192 row's head with the Qwen value
+    /// width, and the row's value width at a head it is not built for.
+    #[test]
+    fn a_pair_of_widths_no_row_holds_is_refused_by_name() {
+        // PIN(2026-10-07): the K192 row serves 192/128, so the pair pinned here is 192/192.
+        let s = AttnShape {
+            head: 192,
+            value: 192,
+            ..mimo(64, 4, None, false)
         };
-        let e = select_gqa(s).expect_err("K 192 V 128");
+        let e = select_gqa(s).expect_err("K 192 V 192");
         assert_eq!(
             e.why,
             Refusal::ValueWidth {
                 head: 192,
-                value: 128
+                value: 192,
+                served: vec![128]
             }
         );
         assert!(
             e.to_string()
-                .contains("no flash splits the value width from the head width"),
+                .contains("no flash is built for a value width of 192 at a head of 192"),
             "{e}"
         );
         assert_eq!(e.shape, Shape::Attn(s));
+        let s = AttnShape {
+            head: 128,
+            value: 192,
+            ..attn(32, 4, 128)
+        };
+        assert_eq!(
+            select_gqa(s).expect_err("K 128 V 192").why,
+            Refusal::ValueWidth {
+                head: 128,
+                value: 192,
+                served: vec![128]
+            }
+        );
+    }
+
+    /// The K192 row takes groups that are multiples of 8 and refuses others
+    /// by name; a window, sinks or value scale it does not serve are refused
+    /// by the row that was selected.
+    #[test]
+    fn the_k192_row_takes_its_groups_only() {
+        let e = select_gqa(mimo(48, 4, None, false)).expect_err("group 12");
+        assert_eq!(
+            e.why,
+            Refusal::GqaGroup {
+                group: 12,
+                served: vec!["a multiple of 8".to_string()]
+            }
+        );
+        assert!(select_gqa(mimo(64, 4, None, false)).is_ok());
+        assert!(select_gqa(mimo(8, 1, None, false)).is_ok());
+        assert_eq!(
+            select_gqa(mimo(40, 8, None, false))
+                .expect_err("group 5")
+                .why,
+            Refusal::GqaGroup {
+                group: 5,
+                served: vec!["a multiple of 8".to_string()]
+            }
+        );
     }
 
     /// A window, sinks or a value scale on a shape every flash row serves is

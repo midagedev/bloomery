@@ -10,6 +10,7 @@ use crate::placement::{ModelTensors, PlacementError};
 use gguf::{Gguf, Split, Value};
 use models::{ChatSpec, ModelSpec, ReasoningFormat, ToolFormat};
 
+mod classify;
 pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
@@ -18,6 +19,7 @@ pub mod glm5next;
 pub mod mimo2;
 pub mod qwen35moe;
 pub mod qwen3moe;
+mod stems;
 
 /// The typed model description, its readers' output: re-exported so a
 /// caller names one crate for the model and its description.

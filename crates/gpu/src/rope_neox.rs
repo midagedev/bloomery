@@ -57,6 +57,15 @@
 //! ([`q8_block_warp`]). A block holding a non-finite value is refused: a NaN
 //! scale, zero codes and [`FaultSite::KvQuant`], never a plausible block.
 //!
+//! [`RopeNeoxKernels::enqueue_neox_append_k192`] is MiMo-V2's append: no norm
+//! (the model has none), key heads of [`HEAD_K192`] values whose first
+//! [`ROT_K192`] turn through the same [`neox_pair`] and the rest pass through,
+//! value heads of [`V_HEAD_K192`] multiplied by the layer's value scale in f32
+//! before the f16 rounding — the two roundings of ik's `Vcur_scales` node and
+//! its f16 cache copy — and the rope table of the layer's own `freq_base`
+//! (the sliding layers' and the full layers' differ), read in place from the
+//! token's fused `[Q | K | V]` row.
+//!
 //! [`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`] is the head-128
 //! launch over several sequences' f16 caches: token `t` appends into the
 //! planes of row `t` of a per-row table ([`RowPlanes`], the launch's
@@ -122,6 +131,22 @@ pub const fn owned_pair(head: usize, rot: usize, t: usize) -> (usize, usize) {
         (t + rot / 2, t + head / 2)
     }
 }
+
+/// Key values per head of the rope-only instance (MiMo-V2): the first
+/// [`ROT_K192`] of each query and key head turn (NEOX pairs `(i, i +
+/// ROT_K192/2)`), the rest pass through, and the value heads are
+/// [`V_HEAD_K192`] wide. Threads of its block, one per owned pair of a key
+/// head (`owned_pair(HEAD_K192, ROT_K192, t)`), and its warps.
+pub const HEAD_K192: usize = 192;
+pub const ROT_K192: usize = 64;
+pub const V_HEAD_K192: usize = 128;
+const THREADS_K192: usize = HEAD_K192 / 2;
+const THREADS_K192_U32: u32 = THREADS_K192 as u32;
+// The entry's launch contract spells these out as 192, 64, 128 and 96 threads.
+const _: () = assert!(HEAD_K192 == 192 && ROT_K192 == 64 && V_HEAD_K192 == 128);
+const _: () = assert!(THREADS_K192_U32 as usize == THREADS_K192 && THREADS_K192 == 96);
+// A value head's pairs `(t, t + V_HEAD_K192/2)` are owned by the first threads.
+const _: () = assert!(V_HEAD_K192 / 2 <= THREADS_K192 && ROT_K192 / 2 <= THREADS_K192);
 
 /// The norm, partial turn and append of [`rope_neox_kernels::head_norm_neox_append_256`]
 /// over heads of `HEAD` values, the first `ROT` turned, `WARPS = HEAD/64`
@@ -1249,6 +1274,144 @@ mod rope_neox_kernels {
             )
         };
     }
+
+    /// The turn and append of `m` tokens of MiMo-V2's heads, no norm (the model
+    /// has no q/k norm): key heads of [`HEAD_K192`] values whose first
+    /// [`ROT_K192`] turn, value heads of [`V_HEAD_K192`], read in place from
+    /// each token's fused row `qkv` — `[query heads | key heads | value
+    /// heads]`, `n_head · 192 + n_kv · 320` f32. Block `b = t·(n_head + n_kv)
+    /// + h`, 96 threads, thread `t` the pair `owned_pair(192, 64, t)`: a query
+    /// head `h` is turned and written to `q[(t·n_head + h)·192 ..]`; key head
+    /// `j = h − n_head` is turned, written back in place in `qkv` and rounded
+    /// to f16 into `cache_k` row `j·ctx + pos[t]`, and value head `j` times
+    /// `v_scale` (one f32 multiply, then the f16 rounding — ik's
+    /// `Vcur_scales` node into the f16 cache copy) into `cache_v` at the same
+    /// row. The turn is [`neox_pair`] by table pair `i` of row `pos[t]`
+    /// (`table[pos[t]·64 ..]`); a pass-through value is the source value. A
+    /// position at or past `ctx` raises [`FaultSite::CachePos`], writes NaN
+    /// over the head's output and appends nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(96)]
+    #[launch_contract(
+        domain = 1,
+        block = (96, 1, 1),
+        requires = (
+            qkv.len() >= m * (n_head * 192 + n_kv * 320),
+            q.len() >= m * n_head * 192,
+            table.len() >= ctx * 64,
+            pos.len() >= m,
+            cache_k.len() >= n_kv * ctx * 192,
+            cache_v.len() >= n_kv * ctx * 128
+        )
+    )]
+    pub fn neox_append_k192(
+        table: &[f32],
+        pos: &[u32],
+        v_scale: f32,
+        n_head: u32,
+        n_kv: u32,
+        ctx: u32,
+        m: u32,
+        fault: FaultSink,
+        mut qkv: DisjointSlice<f32>,
+        mut q: DisjointSlice<f32>,
+        mut cache_k: DisjointSlice<u16>,
+        mut cache_v: DisjointSlice<u16>,
+    ) {
+        let heads = (n_head + n_kv) as usize;
+        let b = thread::blockIdx_x() as usize;
+        if b >= m as usize * heads {
+            return; // block-uniform
+        }
+        let t = b / heads;
+        let h = b - t * heads;
+        let tid = thread::threadIdx_x() as usize;
+        let nh = n_head as usize;
+        let is_q = h < nh;
+        let kh = h.wrapping_sub(nh);
+        let (i0, i1) = owned_pair(HEAD_K192, ROT_K192, tid);
+        // The token's fused row, and the head's first value in it.
+        let row = t * (nh * HEAD_K192 + n_kv as usize * (HEAD_K192 + V_HEAD_K192));
+        let src = row + h * HEAD_K192;
+        // SAFETY: t < m <= pos.len() by the launch contract.
+        let p = unsafe { *pos.get_unchecked(t) } as usize;
+        // SAFETY: i0, i1 < HEAD_K192 and src + HEAD_K192 <= row + (n_head +
+        // n_kv)·192, inside qkv by the launch contract.
+        let (x0, x1) = unsafe {
+            (
+                *qkv.get_unchecked_mut(src + i0),
+                *qkv.get_unchecked_mut(src + i1),
+            )
+        };
+        let dst = if is_q { (t * nh + h) * HEAD_K192 } else { src };
+
+        if p >= ctx as usize {
+            if tid == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            // SAFETY: the output positions of this thread's two values.
+            unsafe {
+                if is_q {
+                    *q.get_unchecked_mut(dst + i0) = f32::NAN;
+                    *q.get_unchecked_mut(dst + i1) = f32::NAN;
+                } else {
+                    *qkv.get_unchecked_mut(dst + i0) = f32::NAN;
+                    *qkv.get_unchecked_mut(dst + i1) = f32::NAN;
+                }
+            }
+            return; // block-uniform: p is the token's
+        }
+        let (y0, y1) = if tid < ROT_K192 / 2 {
+            // SAFETY: p < ctx and 2·tid + 1 < ROT_K192: the pair is inside
+            // row p of the table's ctx rows of 64.
+            let (c, s) = unsafe {
+                (
+                    *table.get_unchecked(p * ROT_K192 + 2 * tid),
+                    *table.get_unchecked(p * ROT_K192 + 2 * tid + 1),
+                )
+            };
+            neox_pair(x0, x1, c, s)
+        } else {
+            (x0, x1)
+        };
+        if is_q {
+            // SAFETY: the output positions of this thread's two values.
+            unsafe {
+                *q.get_unchecked_mut(dst + i0) = y0;
+                *q.get_unchecked_mut(dst + i1) = y1;
+            }
+            return;
+        }
+        // SAFETY: the positions read above; this thread owns them.
+        unsafe {
+            *qkv.get_unchecked_mut(dst + i0) = y0;
+            *qkv.get_unchecked_mut(dst + i1) = y1;
+        }
+        // SAFETY: kh < n_kv and p < ctx, so the rows are inside the planes;
+        // one thread per pair of the key row, and the first 64 per pair of
+        // the value row; the tokens of one launch hold distinct positions (the
+        // launch contract), so no two blocks write one row. The value head
+        // sits after every key head of the token's row and no thread writes
+        // that region.
+        unsafe {
+            let at = (kh * ctx as usize + p) * HEAD_K192;
+            *cache_k.get_unchecked_mut(at + i0) = f32_to_f16_bits(y0);
+            *cache_k.get_unchecked_mut(at + i1) = f32_to_f16_bits(y1);
+            if tid < V_HEAD_K192 / 2 {
+                let vsrc = row + (nh + n_kv as usize) * HEAD_K192 + kh * V_HEAD_K192;
+                let vat = (kh * ctx as usize + p) * V_HEAD_K192;
+                let v0 = *qkv.get_unchecked_mut(vsrc + tid);
+                let v1 = *qkv.get_unchecked_mut(vsrc + tid + V_HEAD_K192 / 2);
+                *cache_v.get_unchecked_mut(vat + tid) = f32_to_f16_bits(mul_rn_f32(v0, v_scale));
+                *cache_v.get_unchecked_mut(vat + tid + V_HEAD_K192 / 2) =
+                    f32_to_f16_bits(mul_rn_f32(v1, v_scale));
+            }
+        }
+    }
 }
 
 /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]'s arguments: `m`
@@ -1385,6 +1548,31 @@ pub struct PartialNeoxQ8Args<'a> {
     pub kd: &'a mut DeviceBuffer<u16>,
     pub vq: &'a mut DeviceBuffer<u32>,
     pub vd: &'a mut DeviceBuffer<u16>,
+}
+
+/// [`RopeNeoxKernels::enqueue_neox_append_k192`]'s arguments: `m` tokens'
+/// fused rows `qkv` (`n_head` query heads of [`HEAD_K192`] values, `n_kv` key
+/// heads of [`HEAD_K192`], `n_kv` value heads of [`V_HEAD_K192`], in that
+/// order, token-major; the key heads are turned in place), the query output
+/// `q` (`n_head` heads of [`HEAD_K192`], token-major), the rope table
+/// ([`ROT_K192`] f32 per position, at least `ctx` rows, `RopeTable::push` over
+/// a [`ROT_K192`]-wide spec at the layer's `freq_base`), the positions, the
+/// value multiplier, the sink a position past the planes raises on, and the
+/// layer's key plane of `n_kv · ctx` rows of [`HEAD_K192`] f16 and value plane
+/// of `n_kv · ctx` rows of [`V_HEAD_K192`].
+pub struct K192Args<'a> {
+    pub qkv: &'a mut DeviceBuffer<f32>,
+    pub q: &'a mut DeviceBuffer<f32>,
+    pub table: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub v_scale: f32,
+    pub n_head: usize,
+    pub n_kv: usize,
+    pub ctx: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub cache_k: &'a mut DeviceBuffer<u16>,
+    pub cache_v: &'a mut DeviceBuffer<u16>,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -1781,6 +1969,82 @@ impl RopeNeoxKernels {
                 stream, &prep, gq, gk, table, pos, v, eps, n_head, n_kv, ctx, m, fault, q, k, rows,
             )?;
         }
+        Ok(())
+    }
+
+    /// Enqueue the turn and append of `args.m` tokens of MiMo-V2's heads, no
+    /// norm: one block per (token, head), `m·(n_head + n_kv)` blocks of 96
+    /// threads ([`rope_neox_kernels::neox_append_k192`]). Positions as in
+    /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]: distinct, below
+    /// `ctx`; one at or past it raises [`FaultSite::CachePos`] on `args.fault`,
+    /// leaves the token's heads NaN and is not appended. A non-finite
+    /// `v_scale`, a short buffer or a zero count is refused by name before the
+    /// launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_neox_append_k192(
+        &self,
+        stream: &CudaStream,
+        args: K192Args<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_neox_append_k192";
+        let K192Args {
+            qkv,
+            q,
+            table,
+            pos,
+            v_scale,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+            cache_k,
+            cache_v,
+        } = args;
+        if n_head == 0 || n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need n_head, n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
+                     n_kv={n_kv} ctx={ctx} m={m}"
+                ),
+            ));
+        }
+        if !v_scale.is_finite() {
+            return Err(GpuError::shape(
+                what,
+                format!("the value multiplier must be finite, got {v_scale}"),
+            ));
+        }
+        let lens = [
+            (
+                "qkv",
+                qkv.len(),
+                m * (n_head * HEAD_K192 + n_kv * (HEAD_K192 + V_HEAD_K192)),
+            ),
+            ("q", q.len(), m * n_head * HEAD_K192),
+            ("table", table.len(), ctx * ROT_K192),
+            ("pos", pos.len(), m),
+            ("cache_k", cache_k.len(), n_kv * ctx * HEAD_K192),
+            ("cache_v", cache_v.len(), n_kv * ctx * V_HEAD_K192),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * (n_head + n_kv))?;
+        let n_head = launch_u32(what, "n_head", n_head)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep =
+            self.module
+                .prepare_neox_append_k192(LaunchConfig1D::new(grid, THREADS_K192_U32, 0))?;
+        self.module.neox_append_k192(
+            stream, &prep, table, pos, v_scale, n_head, n_kv, ctx, m, fault, qkv, q, cache_k,
+            cache_v,
+        )?;
         Ok(())
     }
 }

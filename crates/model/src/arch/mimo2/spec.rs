@@ -101,8 +101,15 @@ pub fn spec_of(
                 shared: None,
             })
         } else {
+            // A header the reader read a dense layer of always carries the
+            // key; one it did not is refused by the key's name, not read as
+            // a block of width 0.
+            let ff = hp.dense_ff.ok_or_else(|| PlacementError::Metadata {
+                key: "feed_forward_length".to_string(),
+                detail: format!("is absent, and layer {l} is a dense block"),
+            })?;
             Ffn::Dense {
-                ff: spec_u32("feed_forward_length", hp.dense_ff.unwrap_or(0))?,
+                ff: spec_u32("feed_forward_length", ff)?,
                 act: Act::SwiGlu { limit: None },
             }
         };
@@ -228,6 +235,36 @@ mod tests {
                 "{listed:?} not listed: {items:?}"
             );
         }
+    }
+
+    /// A dense layer of a header whose `feed_forward_length` the reader never
+    /// read (no layer of the file's own reader needed one) is refused by the
+    /// key's name, not described as a dense block of width 0.
+    #[test]
+    fn a_dense_layer_without_ff_is_refused_by_name() {
+        use models::ReasoningFormat;
+
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("qwen2")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let path = crate::arch::synthetic::header_shaped(
+            "mimo2-no-ff",
+            "mimo2",
+            &keys(),
+            &global,
+            &tensors(),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let mut hp = super::super::hparams::Hparams::read(&split).expect("the header reads");
+        hp.dense_ff = None;
+        let tensors = super::roles::classify(&split, &hp).expect("the tensors classify");
+        let chat = crate::arch::chat_of(&split, super::TOOLS, Some(ReasoningFormat::ThinkSpan))
+            .expect("the chat surface reads");
+        let err = super::spec_of(&hp, &tensors, chat)
+            .expect_err("a dense layer without feed_forward_length is refused");
+        assert!(err.to_string().contains("feed_forward_length"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A mimo2 file is listed against the whole tree: the flash at its head

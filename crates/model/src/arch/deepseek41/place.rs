@@ -24,6 +24,7 @@ use crate::arch::coverage;
 use crate::placement::workstation::{self, TierBatchBytes};
 use crate::placement::{
     self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
+    checked, joined,
 };
 
 /// What a plan of a V4.1 or V4 file is made from, read from its headers.
@@ -63,12 +64,6 @@ pub enum PlaceError {
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]
     Broken(Vec<Violation>),
-}
-
-/// The violations, `; `-separated.
-fn joined(broken: &[Violation]) -> String {
-    let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-    list.join("; ")
 }
 
 impl PlanInputs {
@@ -136,12 +131,7 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
         let plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
-        let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
-        }
+        checked(plan).map_err(PlaceError::Broken)
     }
 
     /// What one resident sequence of a load of the file holds on its card
