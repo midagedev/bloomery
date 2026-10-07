@@ -335,13 +335,14 @@ mod drive {
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path, residency41};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LOCK,
-        HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
-        ResidencyAt, ResidencyPick, STEP_STATS,
+        HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP, R8,
+        RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
+    use runtime::width::{Choosing, Chosen, Mode as WidthMode};
     use runtime::{
         Advance, Committed, GenOutcome, Lookup, PassSink, Speculative, Stop, StopReason, Target,
         Want,
@@ -698,6 +699,7 @@ mod drive {
         CARD_BUDGET,
         PIN_MAIN,
         DRAFT,
+        MTP_WIDTH,
         CHECK_FINITE,
         HOST_POPULATE,
         HOST_LOCK,
@@ -713,6 +715,14 @@ mod drive {
         record::at_main("generate_ds41", record::GENERATE_DS41);
         let a = parse_args(&levers)?;
         let draft = Draft::from_levers(&levers)?;
+        let width = WidthMode::of(levers.mtp_width())?;
+        if draft == Draft::Off && levers.mtp_width().is_some() {
+            return Err(
+                "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
+                 BLOOMERY_DRAFT=off runs the plain path"
+                    .into(),
+            );
+        }
         let check_finite = finite_lever(&a, draft, &levers)?;
         let at = ResidencyAt {
             serving_place: a.place != Place::Gate,
@@ -1018,23 +1028,33 @@ mod drive {
                 })
             }
             (Draft::Lookup, ..) => {
-                let mut spec = s.with_draft::<_, PAIR_ROWS>(Lookup::new(), &mut log)?;
+                let mut spec =
+                    s.with_draft::<_, PAIR_ROWS>(behind(Lookup::new(), width)?, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()));
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, Some(d), _) => {
-                let mut spec = s.with_draft::<_, PAIR_ROWS>(d, &mut log)?;
+                let mut spec = s.with_draft::<_, PAIR_ROWS>(behind(d, width)?, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
-                    Ok(d.draft_mut().check_fault()?)
+                    Ok(d.draft_mut().draft_mut().check_fault()?)
                 });
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
         }
+    }
+
+    /// `d` behind the width chooser of `mode` (`runtime::width`): this
+    /// binary's drafts are the chooser's, whatever their own width.
+    fn behind<D: runtime::Draft<Session<Body>>>(
+        d: D,
+        mode: WidthMode,
+    ) -> Result<Choosing<D>, SessionError> {
+        Ok(d.choosing(mode)?)
     }
 
     /// The residency views of `s`'s body ([`Residence`]): its stage card's

@@ -31,6 +31,7 @@ use app::{RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
+use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{
     Advance, Argmax, Draft, Pick, Plain, Sample, Speculative, Target as _, Want, Widths, Window,
 };
@@ -44,8 +45,10 @@ pub(crate) struct ParkedDraft<A> {
     off: Option<&'static str>,
 }
 
-/// One slot's drafted window over its own [`MtpDraft`].
-type Spec<B, const M: usize> = Speculative<MtpDraft<B>, M>;
+/// One slot's drafted window over its own [`MtpDraft`] behind the shared
+/// width chooser (`runtime::width`), which `fixed` passes through untouched:
+/// every family's seat drives the one type.
+type Spec<B, const M: usize> = Speculative<Choosing<MtpDraft<B>>, M>;
 
 /// The drafts a seat drives its session's slots with, one a resident slot,
 /// `M` = the body's [`MtpBody::VERIFY_ROWS`], or none: every pass a plain
@@ -76,27 +79,32 @@ where
     }
 
     /// One draft a resident slot, `slots` of them, each opened by the seat's
-    /// `open` (the draft's prompt path and step mode are the seat's): slot
+    /// `open` (the draft's prompt path and step mode are the seat's) and set
+    /// behind the width chooser of `mode` (`runtime::width`): slot
     /// 0's driven through [`Session::with_draft`], which captures every
     /// width's verify pass on the model (`log` told of each), each further
     /// slot's opened beside it, the model's captures shared by every slot's
     /// draft. Every slot starts as a fresh draft: nothing waits, nothing
     /// skipped. Load-time, once the session serves its slots; refused by name
-    /// for no slot.
+    /// for no slot and a rule the chooser cannot run by.
     pub(crate) fn open(
         s: &mut Session<B>,
         slots: usize,
+        mode: WidthMode,
         log: &mut impl RowsLog,
         mut open: impl FnMut(&GpuModel<B>) -> Result<MtpDraft<B>, SessionError>,
     ) -> Result<Self, GateError> {
         if slots == 0 {
             return Err("the MTP drafts of no slot".into());
         }
-        let first = open(s.model())?;
+        let choose = |d: MtpDraft<B>| -> Result<Choosing<MtpDraft<B>>, SessionError> {
+            Ok(d.choosing(mode)?)
+        };
+        let first = choose(open(s.model())?)?;
         let mut specs = Vec::with_capacity(slots);
         specs.push(Some(s.with_draft(first, log)?));
         for _ in 1..slots {
-            specs.push(Some(Speculative::new(open(s.model())?)));
+            specs.push(Some(Speculative::new(choose(open(s.model())?)?)));
         }
         Ok(SlotDrafts {
             specs,
@@ -148,9 +156,15 @@ where
 
     /// `slot`'s draft off until the slot's next reset, for `why`: the
     /// session's position moved where the draft holds no rows to rejoin at.
-    /// Nothing without a draft; refused as [`SlotDrafts::has`].
+    /// The chooser's passes over the request before are closed out first
+    /// (an `mtp width` record under the cost mode): a call the draft sits
+    /// out prints none. Nothing without a draft; refused as
+    /// [`SlotDrafts::has`].
     pub(crate) fn turn_off(&mut self, slot: usize, why: &'static str) -> Result<(), GateError> {
         if self.has(slot)? {
+            if let Some(spec) = self.specs[slot].as_mut() {
+                print_widths(spec);
+            }
             self.off[slot] = Some((why, false));
         }
         Ok(())
@@ -169,10 +183,12 @@ where
         }
     }
 
-    /// The prompt on `slot`, the session's selected one: under the draft the
-    /// draft's own prompt call, its store walked over the prompt's units,
-    /// then its join record; without it, or while it is off, the session's
-    /// prompt call.
+    /// The prompt on `slot`, the session's selected one: the chooser's
+    /// passes over the request that just left the slot closed out first —
+    /// an `mtp width` record under the cost mode, none under `fixed` —
+    /// then under the draft the draft's own prompt call, its store walked
+    /// over the prompt's units, then its join record; without it, or while
+    /// it is off, the session's prompt call.
     pub(crate) fn prefill(
         &mut self,
         s: &mut Session<B>,
@@ -185,6 +201,7 @@ where
         }
         match self.spec_mut(slot)? {
             Some(spec) => {
+                print_widths(spec);
                 let next = Advance::prompt(spec, s, ids)?;
                 print_join(spec);
                 Ok(next)
@@ -235,7 +252,8 @@ where
         }
         let drafting = !self.is_off(slot);
         if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
-            spec.draft_mut().before_step(s, last)?;
+            print_widths(spec);
+            spec.draft_mut().draft_mut().before_step(s, last)?;
             print_join(spec);
         }
         let next = s.step(last, Want::Argmax)?.argmax();
@@ -336,7 +354,8 @@ where
         if drafting {
             self.off[slot] = None;
             if let Some(spec) = self.specs[slot].as_mut() {
-                spec.draft_mut().restart();
+                print_widths(spec);
+                spec.draft_mut().draft_mut().restart();
             }
         }
         Ok(())
@@ -351,7 +370,7 @@ where
             return Ok(None);
         }
         Ok(self.specs[slot].as_ref().map(|spec| ParkedDraft {
-            draft: spec.draft().park(),
+            draft: spec.draft().draft().park(),
             off: self.off[slot].map(|(why, _)| why),
         }))
     }
@@ -382,7 +401,7 @@ where
     ) -> Result<(), GateError> {
         self.takes(p)?;
         if let (Some(spec), Some(p)) = (self.spec_mut(slot)?, p) {
-            spec.draft_mut().unpark(&p.draft);
+            spec.draft_mut().draft_mut().unpark(&p.draft);
             self.off[slot] = p.off.map(|why| (why, false));
         }
         Ok(())
@@ -400,11 +419,32 @@ where
 /// The draft's join to the held sequence, when a call made one: how many
 /// rows it caught up, or why it skips.
 fn print_join<B: MtpBody, const M: usize>(spec: &mut Spec<B, M>) {
-    if let Some(j) = spec.draft_mut().take_joined() {
+    if let Some(j) = spec.draft_mut().draft_mut().take_joined() {
         Record::new(&record::MTP_PROMPT)
             .u("start", j.start)
             .u("caught_up", j.caught_up)
             .w("skipped", j.skipped.unwrap_or("none"))
             .eprint();
     }
+}
+
+/// The chooser's passes over the request a slot just finished, as its `mtp
+/// width` record: nothing under `fixed`, whose passes are the draft's own,
+/// and nothing for a request that ran no pass. The ds41 seat drains its own
+/// drafts the same way.
+pub(crate) fn print_widths<D, const M: usize>(spec: &mut Speculative<Choosing<D>, M>) {
+    let choosing = spec.draft_mut();
+    if choosing.mode() != WidthMode::Cost {
+        return;
+    }
+    let t = choosing.take_tally();
+    if t.passes() == 0 {
+        return;
+    }
+    Record::new(&record::MTP_WIDTH)
+        .u("windows", t.windows)
+        .csv("kept", &t.kept)
+        .csv("widths", &t.widths)
+        .f("e", t.e())
+        .eprint();
 }

@@ -116,6 +116,14 @@
 //!   sequence: the draft joins at the call's start and drafts with the plain
 //!   run's ids, and restarted beside the held sequence it skips the next
 //!   call by name, proposing nothing, the ids still the plain run's.
+//! - (c) the width chooser (`BLOOMERY_MTP_WIDTH=cost`): the draft behind
+//!   `runtime::width`'s `Choosing` over the same model — every window's
+//!   verify width at most its proposal, its kept rows the target's, the
+//!   greedy ids the plain run's whatever widths ran, the widths that ran
+//!   the chooser's tally's, cuts below the draft's own exercised by the
+//!   rotation and the probes; and closed (a rule no drafted width wins)
+//!   the pass steps plainly with the draft's proposals shadowed, never a
+//!   window of one, the ids still the plain run's.
 //! - (p) a partial accept's records: the commit of a verify that kept fewer
 //!   rows than it ran cuts the draft's records to the kept rows — after a
 //!   drafted run the draft store's count stands at the model's position, a
@@ -211,6 +219,7 @@ mod gate {
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
+    use runtime::width::Chosen as _;
     use runtime::{Advance, Committed, Draft, Out, PassSink, TapNeed, Target, Verify, Want};
 
     /// Cache rows: the e2e gate's.
@@ -2787,6 +2796,200 @@ mod gate {
         Ok((m, ok))
     }
 
+    /// A clock the chooser reads that this clause moves: each pass's wall
+    /// a fixed cost of the rows it ran, so the chooser's picks are the same
+    /// every run.
+    #[derive(Clone)]
+    struct Ticks(std::rc::Rc<std::cell::Cell<std::time::Duration>>);
+
+    impl runtime::width::Clock for Ticks {
+        fn now(&mut self) -> std::time::Duration {
+            self.0.get()
+        }
+    }
+
+    /// The [`Ticks`] clock's plain step: a synthetic unit, the order of a
+    /// real step so the clock's readings stay ordinary times.
+    const STEP_UNIT: std::time::Duration = std::time::Duration::from_millis(40);
+
+    /// Every pass's rows, kept rows and whether it verified a proposal, the
+    /// clock moved by the pass's cost: `cost[r - 1]` of [`STEP_UNIT`] for `r`
+    /// rows.
+    struct Cut {
+        clock: Ticks,
+        cost: [f64; 4],
+        rows: Vec<usize>,
+        kept: Vec<usize>,
+        proposed: Vec<bool>,
+    }
+
+    impl PassSink<app::Session<Body38>> for Cut {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &app::Session<Body38>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _: &app::Session<Body38>,
+            c: &Committed,
+            _: &[u32],
+            _: std::time::Duration,
+        ) -> Result<(), GateError> {
+            let wall = STEP_UNIT.mul_f64(self.cost[c.rows - 1]);
+            self.clock.0.set(self.clock.0.get() + wall);
+            self.rows.push(c.rows);
+            self.kept.push(c.kept);
+            self.proposed.push(c.proposed);
+            Ok(())
+        }
+    }
+
+    /// What [`choosing_run`] leaves: the model, the tokens, the passes, the
+    /// draft's windows, the chooser's tally and its incumbent at the end.
+    type Chose = (
+        Qwen38Model,
+        Vec<u32>,
+        Cut,
+        Vec<app::mtp::WindowDraft>,
+        runtime::Tally,
+        usize,
+    );
+
+    /// One greedy run of `n` tokens from a reset, the draft behind the
+    /// chooser on a [`Ticks`] clock of `cost`, its windows kept.
+    fn choosing_run(
+        m: Qwen38Model,
+        prompt: &[u32],
+        ctx: u32,
+        n: usize,
+        cost: [f64; 4],
+    ) -> Result<Chose, GateError> {
+        let mut m = m;
+        m.reset()?;
+        let mut s = app::Session::from_model(m, ctx);
+        let mut draft = app::mtp::MtpDraft::open(
+            s.model(),
+            Prompt38::Auto,
+            bloomery_gpu::model::StepMode::Graph,
+        )?;
+        draft.keep_windows();
+        let clock = Ticks(std::rc::Rc::default());
+        let choosing = draft.choosing_by(
+            runtime::width::Mode::Cost,
+            runtime::width::Rule::DEFAULT,
+            clock.clone(),
+        )?;
+        let mut spec = s.with_draft::<runtime::Choosing<app::mtp::MtpDraft<Body38>, Ticks>, 4>(
+            choosing, &mut Quiet,
+        )?;
+        let first = spec.prompt(&mut s, prompt)?;
+        let mut cut = Cut {
+            clock,
+            cost,
+            rows: Vec::new(),
+            kept: Vec::new(),
+            proposed: Vec::new(),
+        };
+        let out = runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(n, ctx)?,
+            &mut cut,
+        )?;
+        let tally = spec.draft_mut().take_tally();
+        let width = spec.draft().width();
+        let windows = spec.draft_mut().draft_mut().take_windows();
+        let mut m = s.into_model();
+        m.reset()?;
+        Ok((m, out.tokens, cut, windows, tally, width))
+    }
+
+    /// (c) the width chooser (`BLOOMERY_MTP_WIDTH=cost`, `runtime::width`):
+    /// the draft behind it over the same model, its windows kept, on a
+    /// [`Ticks`] clock. First the walls of the A6000's passes (2, 3, 4 rows
+    /// at 1.383, 1.767, 2.15 steps, W(3)'s line [derived]): the tokens the
+    /// plain run's whatever ran; every window's record the width its pass
+    /// ran (rows − 1), the whole proposal the draft's three ids, its kept
+    /// ids the plain run's next tokens and its first rejected id not; the
+    /// chooser's tally the passes' widths and kept rows; the warm-up's cuts
+    /// below the draft's width ran. Then walls on which no drafted width
+    /// pays: the chooser closes, the draft's proposals run as shadows (never
+    /// a window) and the plain passes are the draft's held steps — the tokens
+    /// still the plain run's, the windows the verifies' alone.
+    fn width_chooser(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 64;
+        let ctx = m.body("width chooser")?.ctx() as u32;
+        // A last window may keep up to three ids past the N-th.
+        let (m, plain) = plain_run(m, prompt, Prompt38::Auto, N + 3)?;
+        let base = prompt.len();
+        let mut ok = true;
+        let mut m = m;
+        for (what, cost) in [
+            ("paying", [1.0, 1.383, 1.767, 2.15]),
+            ("losing", [1.0, 10.0, 10.0, 10.0]),
+        ] {
+            let (back, tokens, cut, windows, tally, width) = choosing_run(m, prompt, ctx, N, cost)?;
+            m = back;
+            let ids_ok = tokens[..N] == plain.tokens[..N];
+            // Each verified pass's window record, in order.
+            let verified: Vec<usize> = (0..cut.rows.len()).filter(|&i| cut.proposed[i]).collect();
+            let mut windows_ok = verified.len() == windows.len();
+            for (&i, w) in verified.iter().zip(&windows) {
+                let at = w.pos as usize - base;
+                let ids_kept = w.ids[..w.accepted]
+                    .iter()
+                    .zip(&plain.tokens[at + 1..])
+                    .all(|(d, t)| d == t);
+                let rejected = w.accepted == w.width
+                    || plain.tokens.get(at + 1 + w.accepted) != Some(&w.ids[w.accepted]);
+                let one = w.width + 1 == cut.rows[i]
+                    && w.accepted + 1 == cut.kept[i]
+                    && w.ids.len() == 3
+                    && ids_kept
+                    && rejected;
+                if !one {
+                    println!(
+                        "(c) {what}: pass {i} ran {} rows and kept {}; its window at {} verified \
+                         {} of {:?}, the target keeping {}",
+                        cut.rows[i], cut.kept[i], w.pos, w.width, w.ids, w.accepted
+                    );
+                }
+                windows_ok &= one;
+            }
+            let mut widths = vec![0u64; 4];
+            let mut kept = vec![0u64; 4];
+            for (i, &r) in cut.rows.iter().enumerate() {
+                widths[r - 1] += 1;
+                if cut.proposed[i] {
+                    kept[cut.kept[i] - 1] += 1;
+                }
+            }
+            let tally_ok = tally.widths == widths && tally.kept == kept;
+            let shape_ok = match what {
+                "paying" => widths[1] > 0 && widths[2] > 0 && widths[0] > 0,
+                _ => width == 0 && widths[0] * 2 > widths.iter().sum::<u64>(),
+            };
+            println!(
+                "(c) {what}: the {N} ids = the plain run's {}; {} windows, each its pass's width \
+                 with the target's kept ids {}; the chooser's widths {:?} = the passes' {:?} {}; \
+                 incumbent {width}, the cuts and the gate {}",
+                verdict(ids_ok),
+                windows.len(),
+                verdict(windows_ok),
+                tally.widths,
+                widths,
+                verdict(tally_ok),
+                verdict(shape_ok)
+            );
+            ok &= ids_ok && windows_ok && tally_ok && shape_ok;
+        }
+        Ok((m, ok))
+    }
+
     /// (w) prompt calls that continue the held sequence: after the drafted
     /// windows of `prompt`, three ids the model did not generate fed by the
     /// rule's prompt call, then windows. The draft joins at the call's start
@@ -3881,6 +4084,8 @@ mod gate {
         ok &= refusals(&mut m, &warm)?;
         let (m, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
         ok &= w_ok;
+        let (m, width_ok) = width_chooser(m, &prompt)?;
+        ok &= width_ok;
         let (mut m, c_ok) = continued(m, &prompt)?;
         ok &= c_ok;
         ok &= arena_holds(&mut m, &prompt)?;

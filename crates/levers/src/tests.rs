@@ -406,6 +406,7 @@ fn accessors_read_their_rows() {
             MTP_HEAD_ROWS,
             MTP_DRAFT,
             MTP_WINDOWS,
+            MTP_WIDTH,
             ROUTE_TRACE,
             CHECK_FINITE,
             HOST_POPULATE,
@@ -420,6 +421,22 @@ fn accessors_read_their_rows() {
             GEN_SLOTS
         ]
     );
+}
+
+/// `BLOOMERY_MTP_WIDTH` takes its two words, unset is no word (a run that
+/// drafts reads it as `cost`), and another word is refused by name.
+#[test]
+fn mtp_width_takes_cost_and_fixed() {
+    for w in ["cost", "fixed"] {
+        let set = read(&env(&[(MTP_WIDTH, w)]), Scope::Every).expect("a word the row takes");
+        assert_eq!(set.mtp_width(), Some(w));
+    }
+    let set = read(&env::<&str>(&[]), Scope::Every).unwrap();
+    assert_eq!(set.mtp_width(), None);
+    let Err(other) = read(&env(&[(MTP_WIDTH, "wide")]), Scope::Every) else {
+        panic!("a word the row does not take is refused");
+    };
+    assert!(other.to_string().contains("BLOOMERY_MTP_WIDTH"), "{other}");
 }
 
 /// `BLOOMERY_QWEN3_KV` takes the two cache-format words, and unset is the

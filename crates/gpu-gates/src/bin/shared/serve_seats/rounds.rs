@@ -167,7 +167,11 @@ where
 /// resident slot; a slot with none is refused by name) and `depth`, the
 /// depth the seat's one-slot pass proposes, its kept ids into `out` and
 /// what it drafted into `drafted`, exactly as the fallback loop's `pass`
-/// fills them. Returns the passes it ran.
+/// fills them. Returns the passes it ran. The windows run the draft's
+/// whole width past the slot's width chooser, which only counts them
+/// (`runtime::width::Choosing::round_ran`): the pass packs every window at
+/// the full depth, so a cut row is no work saved, and its wall is the
+/// round's, no width's.
 ///
 /// Rows are laid in slot order ([`slot_order`]), each row's kept ids and
 /// counts back to that row; each slot's rows are bit for bit its own
@@ -258,6 +262,7 @@ where
                     draft: spec
                         .as_mut()
                         .expect("a draft the check above took")
+                        .draft_mut()
                         .draft_mut(),
                     out,
                 });
@@ -269,6 +274,9 @@ where
             rows[i].out = out;
         }
         for (&i, c) in pass.iter().zip(run?) {
+            if let Some(spec) = specs[rows[i].slot].as_mut() {
+                spec.draft_mut().round_ran(c.rows, c.kept);
+            }
             rows[i].drafted = Drafted {
                 proposed: if c.proposed { c.rows - 1 } else { 0 },
                 accepted: c.kept - 1,

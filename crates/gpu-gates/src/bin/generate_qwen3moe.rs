@@ -365,6 +365,7 @@ mod cli {
     use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
+    use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
@@ -1021,6 +1022,9 @@ mod cli {
         stats: bool,
         /// `BLOOMERY_MTP_WINDOWS`, as the levers hold it.
         windows: bool,
+        /// `BLOOMERY_MTP_WIDTH`, as the levers hold it: the width chooser's
+        /// mode (`cost`) or the fixed window (`fixed`).
+        width: WidthMode,
         /// `--last-step`: the prompt's last id is a step of its own.
         last_step: bool,
         /// `BLOOMERY_GEN_SLOTS`: the streams an arm decodes in one pass.
@@ -1050,6 +1054,7 @@ mod cli {
             bloomery_levers::MTP_HEAD_ROWS,
             bloomery_levers::MTP_DRAFT,
             bloomery_levers::MTP_WINDOWS,
+            bloomery_levers::MTP_WIDTH,
             bloomery_levers::RESIDENCY,
             bloomery_levers::HOSTSTREAM,
             bloomery_levers::GEN_SLOTS,
@@ -1334,6 +1339,13 @@ mod cli {
             )
             .into());
         }
+        if draft == Draft38::Off && levers.mtp_width().is_some() {
+            return Err(format!(
+                "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; {}",
+                no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
+            )
+            .into());
+        }
         let (place_a, prefill_step) = match chosen {
             Chosen::Qwen38(path, place, _) => (place.stage_a(), path == Prompt38::Step),
             Chosen::Qwen3(..) | Chosen::Qwen35(..) => (false, false),
@@ -1383,6 +1395,7 @@ mod cli {
             ctx,
             stats: levers.step_stats(),
             windows: levers.mtp_windows(),
+            width: WidthMode::of(levers.mtp_width())?,
             last_step,
             slots,
         };
@@ -2220,9 +2233,10 @@ mod cli {
 
     /// Every arm on the loaded model through the MTP draft: the session over
     /// it, the draft opened beside it (the verify passes of 2 to 4 rows
-    /// captured in graph mode, each width's nodes printed), each arm its
-    /// prompt — the draft walked over its units — and its windows; each
-    /// after the first from the session's clear, the draft started over.
+    /// captured in graph mode, each width's nodes printed) behind the width
+    /// chooser `BLOOMERY_MTP_WIDTH` names, each arm its prompt — the draft
+    /// walked over its units — and its windows; each after the first from
+    /// the session's clear, the draft started over.
     fn drive38_mtp(
         m: Qwen38Model,
         cfg: Q38Cfg,
@@ -2237,12 +2251,15 @@ mod cli {
         if run.windows {
             draft.keep_windows();
         }
-        let mut spec = s.with_draft::<MtpDraft<Body38>, 4>(draft, &mut VerifyCaptures)?;
+        let mut spec = s.with_draft::<Choosing<MtpDraft<Body38>>, 4>(
+            draft.choosing(run.width)?,
+            &mut VerifyCaptures,
+        )?;
         let count = arms.len();
         for (i, arm) in arms.iter().enumerate() {
             if i > 0 {
                 s.clear()?;
-                spec.draft_mut().restart();
+                spec.draft_mut().draft_mut().restart();
                 if let Some(c) = s.take_cleared() {
                     record::residency_reset(&c).print();
                 }
@@ -2288,12 +2305,13 @@ mod cli {
         Ok(())
     }
 
-    /// What the drafted generation's sink keeps: every pass's outcome and
-    /// wall, every kept token at its position, and the stats probes.
+    /// What the drafted generation's sink keeps: every pass's outcome —
+    /// whether it verified a proposal, the rows it kept, the rows it ran —
+    /// and its wall, every kept token at its position, and the stats probes.
     struct Windows {
         stats: bool,
         emitted: Vec<(u32, u32)>,
-        passes: Vec<(bool, usize, f64, Duration)>,
+        passes: Vec<(bool, usize, usize, f64, Duration)>,
         probes: Vec<Probe>,
         n_gen: usize,
     }
@@ -2322,6 +2340,7 @@ mod cli {
             self.passes.push((
                 c.proposed,
                 c.kept,
+                c.rows,
                 wall.as_secs_f64() * 1e3 / c.kept as f64,
                 wall,
             ));
@@ -2337,7 +2356,7 @@ mod cli {
     /// tokens are out, every kept token the target's own argmax.
     fn run_arm38_mtp(
         s: &mut Session<Body38>,
-        spec: &mut Speculative<MtpDraft<Body38>, 4>,
+        spec: &mut Speculative<Choosing<MtpDraft<Body38>>, 4>,
         path: Prompt38,
         run: &Run,
         arm: &Arm,
@@ -2384,7 +2403,7 @@ mod cli {
             // A pass's wall over its positions is the row a plain run's step
             // wall compares with: one a kept position.
             let mut at = 0usize;
-            for (i, &(proposed, rows, per, wall)) in sink.passes.iter().enumerate() {
+            for (i, &(proposed, rows, _, per, wall)) in sink.passes.iter().enumerate() {
                 Record::new(&record::TIME_PASS)
                     .u("i", i + 1)
                     .flag("warm", i < warm)
@@ -2411,16 +2430,16 @@ mod cli {
         }
         mtp_summary(&sink.passes, warm);
         if run.windows {
-            mtp_windows(&sink.passes, &spec.draft_mut().take_windows())?;
+            mtp_windows(&sink.passes, &spec.draft_mut().draft_mut().take_windows())?;
         }
         if run.timed {
             let counted = &sink.passes[warm..];
             let positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
             let ms: f64 = counted
                 .iter()
-                .map(|&(_, _, _, w)| w.as_secs_f64() * 1e3)
+                .map(|&(_, _, _, _, w)| w.as_secs_f64() * 1e3)
                 .sum();
-            let mut per: Vec<f64> = counted.iter().map(|&(_, _, p, _)| p).collect();
+            let mut per: Vec<f64> = counted.iter().map(|&(_, _, _, p, _)| p).collect();
             per.sort_by(f64::total_cmp);
             let p50 = per[per.len() / 2];
             let mean = ms / positions as f64;
@@ -2442,27 +2461,31 @@ mod cli {
     }
 
     /// The `mtp summary` record: the windows' proposals, the kept lengths'
-    /// histogram, the positions and their rate over the counted passes.
-    fn mtp_summary(passes: &[(bool, usize, f64, Duration)], warm: usize) {
+    /// and the verified widths' histograms, the positions and their rate
+    /// over the counted passes.
+    fn mtp_summary(passes: &[(bool, usize, usize, f64, Duration)], warm: usize) {
         let mut kept = [0u64; 4];
+        let mut widths = [0u64; 4];
         let mut positions = 0usize;
         let mut proposals = 0usize;
-        for &(p, k, ..) in passes {
+        for &(p, k, rows, ..) in passes {
             if p {
                 proposals += 1;
             }
             kept[k - 1] += 1;
+            widths[rows - 1] += 1;
             positions += k;
         }
         let counted = &passes[warm..];
         let counted_positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
         let ms: f64 = counted
             .iter()
-            .map(|&(_, _, _, w)| w.as_secs_f64() * 1e3)
+            .map(|&(_, _, _, _, w)| w.as_secs_f64() * 1e3)
             .sum();
         Record::new(&record::MTP_SUMMARY)
             .u("proposals", proposals)
             .list("kept", &kept)
+            .list("widths", &widths)
             .u("positions", positions)
             .u("passes", passes.len())
             .f("tok/s(positions)", counted_positions as f64 * 1e3 / ms)
@@ -2470,18 +2493,19 @@ mod cli {
     }
 
     /// The `mtp window` records: each drafted window beside its pass, which
-    /// must keep one row past the ids the draft says the target kept. A
-    /// window the passes do not hold, or a pass the draft kept no window of,
-    /// is refused by name.
+    /// must keep one row past the ids the draft says the target kept and run
+    /// one row past the ids it says the pass verified. A window the passes
+    /// do not hold, or a pass the draft kept no window of, is refused by
+    /// name.
     fn mtp_windows(
-        passes: &[(bool, usize, f64, Duration)],
+        passes: &[(bool, usize, usize, f64, Duration)],
         windows: &[WindowDraft],
     ) -> Result<(), GateError> {
-        let drafted: Vec<(usize, usize)> = passes
+        let drafted: Vec<(usize, usize, usize)> = passes
             .iter()
             .enumerate()
             .filter(|(_, p)| p.0)
-            .map(|(i, p)| (i + 1, p.1))
+            .map(|(i, p)| (i + 1, p.1, p.2))
             .collect();
         if drafted.len() != windows.len() {
             return Err(format!(
@@ -2491,24 +2515,30 @@ mod cli {
             )
             .into());
         }
-        for (&(pass, kept), w) in drafted.iter().zip(windows) {
-            if w.accepted + 1 != kept || w.ids.len() != w.p.len() {
+        for (&(pass, kept, rows), w) in drafted.iter().zip(windows) {
+            if w.accepted + 1 != kept
+                || w.ids.len() != w.p.len()
+                || w.width + 1 != rows
+                || w.width > w.ids.len()
+            {
                 return Err(format!(
-                    "generate_qwen3moe: pass {pass} kept {kept} rows, and its window kept {} of \
-                     {} ids with {} probabilities",
-                    w.accepted,
+                    "generate_qwen3moe: pass {pass} ran {rows} rows and kept {kept}, and its \
+                     window verified {} of its {} ids ({} probabilities), the target keeping {}",
+                    w.width,
                     w.ids.len(),
-                    w.p.len()
+                    w.p.len(),
+                    w.accepted
                 )
                 .into());
             }
         }
-        for (&(pass, _), w) in drafted.iter().zip(windows) {
+        for (&(pass, ..), w) in drafted.iter().zip(windows) {
             Record::new(&record::MTP_WINDOW)
                 .u("window", pass)
                 .u("pos", w.pos)
                 .csv("ids", &w.ids)
                 .csv("p", w.p.iter().map(|p| format!("{p:.5}")))
+                .u("width", w.width)
                 .u("accepted", w.accepted)
                 .print();
         }

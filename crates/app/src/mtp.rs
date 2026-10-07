@@ -71,6 +71,14 @@ use crate::{Keep, Prompt, Session, SessionError};
 /// The window's name in its refusals.
 const WHAT: &str = "MTP window";
 
+/// A width chooser's refusal is the session's: the window's own refusal,
+/// by name.
+impl From<runtime::WidthError> for SessionError {
+    fn from(e: runtime::WidthError) -> SessionError {
+        SessionError::Refused(e.to_string())
+    }
+}
+
 /// How a walk runs ([`MtpBody::walk`], [`MtpBody::chain`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalkMode {
@@ -151,6 +159,12 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// of at most this many, and a refresh (at most [`MtpBody::VERIFY_ROWS`]
     /// rows) is one walk.
     const WALK_ROWS: usize;
+
+    /// Whether the chain's one readback holds each proposed id's probability
+    /// beside it, so [`MtpBody::chain`] takes `p` at no further device work;
+    /// a body whose readback holds the ids alone refuses `p` by name, and its
+    /// window reports certainty ([`Draft::propose_p`]'s default).
+    const PROBS: bool = false;
 
     /// The most rows one store walk ([`WalkMode::Store`], the prompt's
     /// warmup) takes: a body whose store walk runs wider than its whole walks
@@ -266,6 +280,10 @@ struct Refresh<A> {
     pos0: u32,
     walk: A,
     first: usize,
+    /// A store walk already wrote the rows ([`Draft::held`]'s step row): a
+    /// step after them walks nothing for them, and the next chain walks them
+    /// again for its head.
+    stored: bool,
 }
 
 impl<A: Copy> Refresh<A> {
@@ -284,19 +302,22 @@ impl<A: Copy> Refresh<A> {
 
 /// One drafted window as the draft saw it ([`MtpDraft::keep_windows`]): the
 /// target's position before its verify, the proposal's ids and each one's
-/// probability among the head's rows, and how many of them the target kept.
+/// probability among the head's rows, how many of those ids the pass
+/// verified (the width chooser's cut; the proposal's whole length when
+/// nothing cut it) and how many of them the target kept.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowDraft {
     pub pos: u32,
     pub ids: Vec<u32>,
     pub p: Vec<f32>,
+    /// The ids the pass verified, at most the proposal's length.
+    pub width: usize,
     pub accepted: usize,
 }
 
-/// What [`MtpDraft::keep_windows`] keeps: the last proposal's probabilities
-/// until its accept, and every window since the last take.
+/// What [`MtpDraft::keep_windows`] keeps: the last proposal until its
+/// accept, and every window since the last take.
 struct Windows {
-    p: Vec<f32>,
     pending: Option<(Vec<u32>, Vec<f32>)>,
     kept: Vec<WindowDraft>,
 }
@@ -366,9 +387,13 @@ pub struct MtpDraft<B: MtpBody> {
     /// Why the draft proposes nothing until the next prompt call from
     /// position 0 or restart; `None` while it drafts.
     skip: Option<&'static str>,
-    /// The windows kept under [`MtpDraft::keep_windows`]; `None`, the chain
-    /// reads no probability and nothing is kept.
+    /// The windows kept under [`MtpDraft::keep_windows`]; `None`, nothing
+    /// is kept.
     windows: Option<Windows>,
+    /// The last chain's probabilities, when it read them: a body whose
+    /// readback holds them ([`MtpBody::PROBS`]) behind the width chooser,
+    /// or the kept windows.
+    p: Vec<f32>,
 }
 
 impl<B: MtpBody> MtpDraft<B> {
@@ -390,6 +415,7 @@ impl<B: MtpBody> MtpDraft<B> {
             joined: None,
             skip: None,
             windows: None,
+            p: vec![0.0; B::WIDTH],
         })
     }
 
@@ -398,7 +424,6 @@ impl<B: MtpBody> MtpDraft<B> {
     /// holds. Load-time only.
     pub fn keep_windows(&mut self) {
         self.windows = Some(Windows {
-            p: vec![0.0; B::WIDTH],
             pending: None,
             kept: Vec::new(),
         });
@@ -475,6 +500,7 @@ impl<B: MtpBody> MtpDraft<B> {
             pos0: p0 + 1,
             walk: B::VERIFY_ARENA,
             first: 0,
+            stored: false,
         });
         if let Some(w) = &mut self.windows {
             let (ids, p) = w.pending.take().ok_or_else(|| {
@@ -486,6 +512,7 @@ impl<B: MtpBody> MtpDraft<B> {
                 pos: p0,
                 ids,
                 p,
+                width: rows.len() - 1,
                 accepted: accepted - 1,
             });
         }
@@ -587,6 +614,7 @@ impl<B: MtpBody> MtpDraft<B> {
                 pos0: here,
                 walk,
                 first: rows - 1,
+                stored: false,
             },
             (None, None) => return Ok(Err(NOTHING_WAITS)),
         };
@@ -768,6 +796,70 @@ where
     Ok(done)
 }
 
+impl<B: MtpBody> MtpDraft<B> {
+    /// One chain, one readback (the module doc): the recorded refresh's
+    /// walk — its last row `last`, the token at the target's position, whose
+    /// prediction is the first proposal — then own walks while the context
+    /// holds them and the proposal fits `out`: at most `out.len()` ids, so a
+    /// caller caps a window's depth by the room it hands. No room is refused
+    /// by name. The refresh's last row is `last` whatever the call that
+    /// recorded it took there: a step tells the draft its argmax, and a
+    /// sampled request feeds its draw. With `read_p`, each id's probability
+    /// as the same readback holds it, into the draft's own `p`.
+    fn chain(
+        &mut self,
+        t: &mut Session<B>,
+        last: u32,
+        out: &mut [u32],
+        read_p: bool,
+    ) -> Result<usize, SessionError> {
+        if self.skip.is_some() {
+            return Ok(0);
+        }
+        let Some(mut r) = self.next.take() else {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: a proposal before the draft's refresh (its prompt call, or the accept \
+                 before it)"
+            )));
+        };
+        // The refresh's last row is the token at the target's position, which
+        // the target has not run yet: the refresh ends one past it.
+        let end = r.pos0 as usize + r.tokens.len();
+        let here = t.pos() as usize;
+        if end != here + 1 {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: a refresh of {} rows ending at {end}, where the target stands at {here} \
+                 (its next token's row ends at {})",
+                r.tokens.len(),
+                here + 1
+            )));
+        }
+        let room = out.len().min(B::WIDTH);
+        if room == 0 {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: a proposal into no room"
+            )));
+        }
+        if let Some(l) = r.tokens.last_mut() {
+            *l = last;
+        }
+        let own = (room - 1).min(t.ctx() as usize - end);
+        let n = B::chain(
+            t.model_mut(),
+            r.feed(),
+            own,
+            self.head,
+            self.mode,
+            out,
+            read_p.then_some(&mut self.p[..]),
+        )?;
+        if let Some(w) = &mut self.windows {
+            w.pending = Some((out[..n].to_vec(), self.p[..n].to_vec()));
+        }
+        Ok(n)
+    }
+}
+
 impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// The most ids a proposal holds: the body's [`MtpBody::WIDTH`].
     const WIDTH: usize = B::WIDTH;
@@ -870,77 +962,55 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             pos0: t.pos(),
             walk,
             first: rows - 1,
+            stored: false,
         });
         Ok(())
     }
 
-    /// One chain, one readback (the module doc): the recorded refresh's
-    /// walk — its last row `last`, the token at the target's position, whose
-    /// prediction is the first proposal — then own walks while the context
-    /// holds them and the proposal fits `out`: at most `out.len()` ids, so a
-    /// caller caps a window's depth by the room it hands. No room is refused
-    /// by name. The refresh's last row is `last` whatever the call that
-    /// recorded it took there: a step tells the draft its argmax, and a
-    /// sampled request feeds its draw.
+    /// One chain, one readback ([`MtpDraft::chain`]); each id's
+    /// probability read back only for the kept windows
+    /// ([`MtpDraft::keep_windows`]).
     fn propose(
         &mut self,
         t: &mut Session<B>,
         last: u32,
         out: &mut [u32],
     ) -> Result<usize, SessionError> {
-        if self.skip.is_some() {
-            return Ok(0);
+        self.chain(t, last, out, self.windows.is_some())
+    }
+
+    /// The same chain with each proposed id's probability among the head's
+    /// rows written to `p` beside it, from the readback that already holds
+    /// it ([`MtpBody::PROBS`]); a body whose readback holds none reports
+    /// certainty, every 1.
+    fn propose_p(
+        &mut self,
+        t: &mut Session<B>,
+        last: u32,
+        out: &mut [u32],
+        p: &mut [f32],
+    ) -> Result<usize, SessionError> {
+        let n = self.chain(t, last, out, B::PROBS || self.windows.is_some())?;
+        let places = p.len();
+        let p = p.get_mut(..n).ok_or_else(|| {
+            SessionError::Refused(format!(
+                "{WHAT}: a proposal of {n} ids into {places} probabilities"
+            ))
+        })?;
+        if B::PROBS {
+            p.copy_from_slice(&self.p[..n]);
+        } else {
+            p.fill(1.0);
         }
-        let Some(mut r) = self.next.take() else {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: a proposal before the draft's refresh (its prompt call, or the accept \
-                 before it)"
-            )));
-        };
-        // The refresh's last row is the token at the target's position, which
-        // the target has not run yet: the refresh ends one past it.
-        let end = r.pos0 as usize + r.tokens.len();
-        let here = t.pos() as usize;
-        if end != here + 1 {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: a refresh of {} rows ending at {end}, where the target stands at {here} \
-                 (its next token's row ends at {})",
-                r.tokens.len(),
-                here + 1
-            )));
-        }
-        let room = out.len().min(Self::WIDTH);
-        if room == 0 {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: a proposal into no room"
-            )));
-        }
-        if let Some(l) = r.tokens.last_mut() {
-            *l = last;
-        }
-        let own = (room - 1).min(t.ctx() as usize - end);
-        let Some(w) = &mut self.windows else {
-            return Ok(B::chain(
-                t.model_mut(),
-                r.feed(),
-                own,
-                self.head,
-                self.mode,
-                out,
-                None,
-            )?);
-        };
-        let n = B::chain(
-            t.model_mut(),
-            r.feed(),
-            own,
-            self.head,
-            self.mode,
-            out,
-            Some(&mut w.p),
-        )?;
-        w.pending = Some((out[..n].to_vec(), w.p[..n].to_vec()));
         Ok(n)
+    }
+
+    /// The last proposal was never verified: its kept window, if any, is
+    /// dropped, so the next accept records the window that ran.
+    fn unproposed(&mut self) {
+        if let Some(w) = &mut self.windows {
+            w.pending = None;
+        }
     }
 
     /// The next refresh recorded before the commit takes the rejected rows
@@ -965,7 +1035,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// the position after it, with the hidden row the step wrote
     /// ([`MtpBody::STEP_ARENA`]), as the next refresh. Refused by name when
     /// the waiting rows read the step's own arena, which the step has
-    /// overwritten.
+    /// overwritten, unless a store walk already wrote them ([`Draft::held`]).
     fn stepped(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
         if self.skip.is_some() {
             return Ok(());
@@ -977,6 +1047,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
                 pos0: t.pos() - 1,
                 walk,
                 first: rows - 1,
+                stored: false,
             }),
             (None, None) => {
                 // A one-id prompt feeds no prompt call: the step ran position
@@ -997,7 +1068,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
                 None
             }
         };
-        if let Some(r) = waiting {
+        if let Some(r) = waiting.filter(|r| !r.stored) {
             if r.walk == B::STEP_ARENA {
                 return Err(SessionError::Refused(format!(
                     "{WHAT}: a step after rows whose hidden rows the step's own arena held (a \
@@ -1011,7 +1082,27 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             pos0: t.pos(),
             walk: B::STEP_ARENA,
             first: 0,
+            stored: false,
         });
+        Ok(())
+    }
+
+    /// [`Draft::stepped`] of a pass the width chooser held back, then the
+    /// step's own row walked into the store at once ([`WalkMode::Store`]):
+    /// the next step overwrites the arena that row reads, and the chooser
+    /// may hold that step back too. The row stays the next refresh, which
+    /// the next chain walks again for its head and a step after it skips. A
+    /// row past the context is left unwalked: no chain runs there.
+    fn held(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
+        self.stepped(t, last, next)?;
+        let (head, ctx) = (self.head, t.ctx() as usize);
+        if self.skip.is_none()
+            && let Some(r) = &mut self.next
+            && r.pos0 as usize + r.tokens.len() <= ctx
+        {
+            B::walk(t.model_mut(), r.feed(), head, WalkMode::Store)?;
+            r.stored = true;
+        }
         Ok(())
     }
 }

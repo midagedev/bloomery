@@ -155,8 +155,13 @@
 //! loop with the shared window `app::mtp::MtpDraft` (the shared draft file
 //! beside the target or `BLOOMERY_MTP_DRAFT`'s, its head
 //! `BLOOMERY_MTP_HEAD_ROWS`'s: unset the shipped list on a target of its
-//! tokenizer, `full` the full head): windows of four rows, the greedy ids the plain
-//! server's, `pass_rows` 4. A sampling or id-banning request takes plain
+//! tokenizer, `full` the full head) behind the shared width chooser
+//! (`BLOOMERY_MTP_WIDTH`, `runtime::width`): windows of at most four rows
+//! — `cost`, the default, verifies the width whose measured pass wall pays
+//! most and none while no width beats the plain step, `fixed` the draft's
+//! three ids whole — the greedy ids the plain server's, `pass_rows` 4;
+//! under `cost` a request's `mtp width` record prints at the slot's next
+//! prompt call. A sampling or id-banning request takes plain
 //! steps (the server's loop asks a pass only of a greedy request with no
 //! banned id), each step's row the target's, read before the step is told
 //! to the draft; its ids are the plain server's. A `load draft=mtp` line
@@ -246,6 +251,7 @@ use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
+use runtime::width::Mode as WidthMode;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
     Server, ServerConfig, SlotConfig,
@@ -269,6 +275,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::DRAFT,
     bloomery_levers::MTP_HEAD_ROWS,
     bloomery_levers::MTP_DRAFT,
+    bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
 ];
@@ -954,7 +961,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             )
             .into());
         }
+        if levers.mtp_width().is_some() {
+            return Err(format!(
+                "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
+                 nothing ({why})"
+            )
+            .into());
+        }
     }
+    let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let tok = Tokenizer::from_gguf(&path)?;
@@ -1142,6 +1157,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_off,
         residency,
         stats: levers.step_stats(),
+        width,
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -1213,6 +1229,9 @@ struct SeatArgs {
     residency: Residency,
     /// `BLOOMERY_STEP_STATS`, the round records the seat prints.
     stats: bool,
+    /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
+    /// chooser's (`cost`) or the draft's own (`fixed`).
+    width: WidthMode,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -1428,7 +1447,7 @@ impl Q38 {
                         Ok(())
                     }
                 }
-                SlotDrafts::open(&mut s, a.slots, &mut Captures, |m| {
+                SlotDrafts::open(&mut s, a.slots, a.width, &mut Captures, |m| {
                     MtpDraft::open(m, Prompt38::Auto, StepMode::Graph)
                 })?
             }
@@ -1656,8 +1675,9 @@ impl Seat for Q38 {
         }))
     }
 
-    /// One pass from `last`: under the draft the window of four rows,
-    /// its kept tokens and counts; without it one step.
+    /// One pass from `last`: under the draft the window of at most its four
+    /// rows (the width chooser's cut under `BLOOMERY_MTP_WIDTH=cost`), its
+    /// kept tokens and counts; without it one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
         self.before_call();
         let sel = self.s.selected();
@@ -1666,8 +1686,8 @@ impl Seat for Q38 {
         Ok(d)
     }
 
-    /// The most positions one pass runs: the draft's four rows, or one
-    /// step without it.
+    /// The most positions one pass runs: the draft's four rows (a window
+    /// may run narrower under the width chooser), or one step without it.
     fn pass_rows(&self) -> usize {
         self.drafts.pass_rows(self.s.selected())
     }

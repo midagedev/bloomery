@@ -1,11 +1,11 @@
 //! A target on the host for the tests: a deterministic "model" whose greedy
 //! next token is a function of the history, and a log of every call.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::gate::{Clock, GateError};
+use crate::width::{Clock, WidthError};
 use crate::{Committed, Out, PassSink, RowLogits, Target, Verify, Want};
 
 /// The ids the mock's rows span.
@@ -23,33 +23,37 @@ pub(crate) enum Call {
 #[derive(Debug)]
 pub(crate) enum MockError {
     Mock(&'static str),
-    Gate(GateError),
+    Width(WidthError),
 }
 
 impl std::fmt::Display for MockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MockError::Mock(why) => f.write_str(why),
-            MockError::Gate(e) => e.fmt(f),
+            MockError::Width(e) => e.fmt(f),
         }
     }
 }
 
 impl std::error::Error for MockError {}
 
-impl From<GateError> for MockError {
-    fn from(e: GateError) -> MockError {
-        MockError::Gate(e)
+impl From<WidthError> for MockError {
+    fn from(e: WidthError) -> MockError {
+        MockError::Width(e)
     }
 }
 
 /// A clock the mock's calls move: each step and each verify advances it by
-/// its cost, in microseconds; a test changes the costs as it runs.
+/// its cost, in microseconds; a test changes the costs as it runs, the
+/// verify's by the rows it ran when a cost a row count is set.
 #[derive(Debug, Default)]
 pub(crate) struct Clockwork {
     pub(crate) now: Cell<u64>,
     pub(crate) step: Cell<u64>,
     pub(crate) verify: Cell<u64>,
+    /// A verify of `r` rows' cost, `r − 1` values; unset, every verify the
+    /// one `verify` cost.
+    pub(crate) by_rows: RefCell<Option<Vec<u64>>>,
 }
 
 impl Clockwork {
@@ -58,7 +62,22 @@ impl Clockwork {
             now: Cell::new(0),
             step: Cell::new(step),
             verify: Cell::new(verify),
+            by_rows: RefCell::new(None),
         })
+    }
+
+    /// A verify of `r` rows costs `us`, one value a row count from 2 on;
+    /// a row count unset keeps the one `verify` cost.
+    pub(crate) fn verify_rows(&self, us: &[u64]) {
+        *self.by_rows.borrow_mut() = Some(us.to_vec());
+    }
+
+    fn cost_of(&self, rows: usize) -> u64 {
+        self.by_rows
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.get(rows - 2).copied())
+            .unwrap_or(self.verify.get())
     }
 
     pub(crate) fn advance(&self, us: u64) {
@@ -273,7 +292,7 @@ impl Verify for Mock {
         self.idle()?;
         self.fits(M)?;
         if let Some(c) = &self.clock {
-            c.advance(c.verify.get());
+            c.advance(c.cost_of(M));
         }
         let first = self.history.len();
         let mut out = [0u32; M];

@@ -183,7 +183,8 @@ use model::arch::dspark::DraftHparams;
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
-use runtime::{Committed, Lookup, Speculative, Target, Want};
+use runtime::width::{Choosing, Chosen, Mode as WidthMode};
+use runtime::{Committed, Draft as RtDraft, Lookup, Speculative, Target, Want};
 use serve::flag::{CTX, number};
 use serve::{
     CacheNote, DeviceProps, DraftProps, Drafted, EngineError, EngineProps, FATAL_LINGER,
@@ -361,6 +362,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .into());
     }
     let draft = Draft::from_levers(&levers)?;
+    let width = WidthMode::of(levers.mtp_width())?;
+    if draft == Draft::Off && levers.mtp_width().is_some() {
+        return Err(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
+             BLOOMERY_DRAFT=off serves no draft"
+                .into(),
+        );
+    }
     let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
     // Before anything is read or planned: a context no slot can serve.
     let ctx = slot_ctx(a.ctx, slots)?;
@@ -448,6 +457,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         tier_batch,
         trace,
         stats: levers.step_stats(),
+        width,
     };
     let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?;
     let config = ServerConfig {
@@ -631,16 +641,22 @@ struct SeatArgs {
     trace: Option<RouteTrace>,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
+    /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
+    /// chooser's (`cost`) or the draft's own (`fixed`).
+    width: WidthMode,
 }
 
-/// The draft the seat serves, verified by the pair pass.
+/// The draft the seat serves, verified by the pair pass, behind the width
+/// chooser `BLOOMERY_MTP_WIDTH` names (its width 1: the chooser's cut of 0
+/// is the gate, the pair pass against the plain step).
 enum Served {
     Off,
     /// The lookup, and whether its context is the target's token history
-    /// and the token the target stands before.
-    Lookup(Speculative<Lookup, PAIR_ROWS>, bool),
+    /// and the token the target stands before. Boxed: the chooser beside
+    /// the lookup is the size of its rings, as the DSpark draft's is.
+    Lookup(Box<Speculative<Choosing<Lookup>, PAIR_ROWS>>, bool),
     /// Boxed: the draft body is the size of its graphs and buffers.
-    Dspark(Box<Speculative<CardDraft<DraftBody>, PAIR_ROWS>>),
+    Dspark(Box<Speculative<Choosing<CardDraft<DraftBody>>, PAIR_ROWS>>),
 }
 
 /// The V4.1 session on the engine thread, and its draft.
@@ -735,12 +751,18 @@ impl V41 {
         let draft = match (a.draft, spark) {
             (Draft::Off, _) => Served::Off,
             (Draft::Lookup, _) => Served::Lookup(
-                s.with_draft::<_, PAIR_ROWS>(Lookup::new(), &mut log)?,
+                Box::new(s.with_draft::<Choosing<Lookup>, PAIR_ROWS>(
+                    behind(Lookup::new(), a.width)?,
+                    &mut log,
+                )?),
                 false,
             ),
-            (Draft::Dspark, Some(d)) => {
-                Served::Dspark(Box::new(s.with_draft::<_, PAIR_ROWS>(d, &mut log)?))
-            }
+            (Draft::Dspark, Some(d)) => Served::Dspark(Box::new(s.with_draft::<Choosing<
+                CardDraft<DraftBody>,
+            >, PAIR_ROWS>(
+                behind(d, a.width)?,
+                &mut log,
+            )?)),
             (Draft::Dspark, None) => {
                 return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
             }
@@ -774,7 +796,7 @@ impl V41 {
     /// the draft over feeds it before its first proposal.
     fn window(&self) -> usize {
         match &self.draft {
-            Served::Dspark(d) => d.draft().window(),
+            Served::Dspark(d) => d.draft().draft().window(),
             Served::Off | Served::Lookup(..) => 0,
         }
     }
@@ -799,7 +821,7 @@ impl V41 {
         match &mut self.draft {
             Served::Off => {}
             Served::Lookup(_, follows) => *follows = false,
-            Served::Dspark(d) => d.draft_mut().forget(),
+            Served::Dspark(d) => d.draft_mut().draft_mut().forget(),
         }
     }
 
@@ -810,7 +832,7 @@ impl V41 {
         if let Served::Lookup(spec, follows) = draft
             && !*follows
         {
-            let l = spec.draft_mut();
+            let l = spec.draft_mut().draft_mut();
             l.reset();
             for &id in s.model().body(WHAT)?.history() {
                 l.push(id);
@@ -820,6 +842,12 @@ impl V41 {
         }
         Ok(())
     }
+}
+
+/// `d` behind the width chooser of `mode` ([`runtime::width`]): the seat's
+/// drafts are the chooser's, whatever their own width.
+fn behind<D: RtDraft<Session<Body>>>(d: D, mode: WidthMode) -> Result<Choosing<D>, SessionError> {
+    Ok(d.choosing(mode)?)
 }
 
 /// A pass's draft counts: the proposal's ids, the ones kept.
@@ -845,8 +873,12 @@ impl Seat for V41 {
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         let next = match &mut self.draft {
-            Served::Dspark(d) => d.draft_mut().feed_call(&mut self.s, ids)?,
-            Served::Lookup(_, follows) => {
+            Served::Dspark(d) => {
+                super::drafted::print_widths(&mut **d);
+                d.draft_mut().draft_mut().feed_call(&mut self.s, ids)?
+            }
+            Served::Lookup(spec, follows) => {
+                super::drafted::print_widths(spec);
                 *follows = false;
                 self.s.prompt(ids, Want::Argmax)?.argmax()
             }
@@ -860,7 +892,7 @@ impl Seat for V41 {
         let next = self.s.step(last, Want::Argmax)?.argmax();
         self.print_passes()?;
         match &mut self.draft {
-            Served::Lookup(spec, true) => spec.draft_mut().push(next),
+            Served::Lookup(spec, true) => spec.draft_mut().draft_mut().push(next),
             Served::Dspark(d) => {
                 runtime::Draft::stepped(d.draft_mut(), &mut self.s, last, next)?;
             }
@@ -877,7 +909,7 @@ impl Seat for V41 {
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
         self.lookup_follows(last)?;
         let c = match &mut self.draft {
-            Served::Lookup(spec, _) => runtime::Advance::pass(spec, &mut self.s, last, out)?,
+            Served::Lookup(spec, _) => runtime::Advance::pass(&mut **spec, &mut self.s, last, out)?,
             Served::Dspark(spec) => runtime::Advance::pass(&mut **spec, &mut self.s, last, out)?,
             Served::Off => {
                 out.push(self.step(last)?);
@@ -953,7 +985,7 @@ impl Seat for V41 {
         match &mut self.draft {
             Served::Off => {}
             Served::Lookup(_, follows) => *follows = false,
-            Served::Dspark(d) => d.draft_mut().restart()?,
+            Served::Dspark(d) => d.draft_mut().draft_mut().restart()?,
         }
         Ok(())
     }
@@ -988,7 +1020,7 @@ impl Seat for V41 {
         };
         let continues = match &self.draft {
             Served::Dspark(d) => {
-                u32::try_from(n).is_ok_and(|n| n == self.s.pos() && d.draft().follows(n))
+                u32::try_from(n).is_ok_and(|n| n == self.s.pos() && d.draft().draft().follows(n))
             }
             Served::Off | Served::Lookup(..) => true,
         };
@@ -1065,7 +1097,7 @@ impl Seat for V41 {
                 });
             }
             Served::Dspark(spec) => {
-                let d = spec.draft();
+                let d = spec.draft().draft();
                 let device = d
                     .device()
                     .ok()

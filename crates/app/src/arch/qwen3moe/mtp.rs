@@ -19,6 +19,9 @@ impl MtpBody for Body38 {
     const WALK_ROWS: usize = MTP_ROWS;
     /// The prompt's store walks run wide, through the GEMM path.
     const STORE_ROWS: usize = MTP_STORE_ROWS;
+    /// The walk's argmax writes each row's probability beside its id, and
+    /// the chain reads both back at once ([`Qwen38Model::mtp_chain`]).
+    const PROBS: bool = true;
 
     type Arena = TargetRows;
     const STEP_ARENA: TargetRows = TargetRows::Step;

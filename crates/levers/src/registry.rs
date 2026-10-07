@@ -28,6 +28,7 @@ pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 pub const MTP_DRAFT: &str = "BLOOMERY_MTP_DRAFT";
 pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
+pub const MTP_WIDTH: &str = "BLOOMERY_MTP_WIDTH";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
@@ -337,8 +338,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               summary` — its pass, the target's position before it, the proposal's ids, each \
               one's probability among the draft head's rows (from the chain's one readback, \
               which holds them either way) and how many the target kept. Refused by name on a \
-              run that drafts nothing. Off, the chain hands back its ids alone and nothing is \
-              kept; the tokens are the same either way.",
+              run that drafts nothing. Off, nothing is kept; the tokens are the same either \
+              way.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: MTP_WIDTH,
+        class: Class::A,
+        kind: Kind::Words(&["cost", "fixed"]),
+        default: Unset::Means("`cost` on a run that drafts"),
+        doc: "A run that drafts (the MTP draft of `generate_qwen3moe`, `generate_glm5next` and \
+              their serve seats; the lookup and DSpark drafts of `generate_ds41` and \
+              `bloomery-serve-ds41`): how many of a proposal's ids a pass verifies. `cost` \
+              (unset) puts the draft behind the width chooser (`runtime::width`): each window \
+              verifies the width whose expected kept positions over its measured pass wall is \
+              highest, and none while no width beats the plain step by its margin; the draft \
+              still proposes its whole width, and only the rows a pass runs change, never a \
+              token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
+              server prints an `mtp width` record a request under `cost`. Refused by name on a \
+              run that drafts nothing.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
