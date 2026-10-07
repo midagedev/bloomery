@@ -13,8 +13,9 @@ use gguf::GgmlType;
 use super::churn::ChurnPool;
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_USABLE, HostNeed,
-    MARGIN, MIB, OS_OTHER, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-    census_usable, host, resolve, tier_batch_host_bytes, tier_batch_staging_bytes,
+    HostRead, MARGIN, MIB, OS_OTHER, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    TIER_BATCH_RESERVE, census_usable, host, resolve, tier_batch_host_bytes,
+    tier_batch_staging_bytes,
 };
 use super::{
     Card, CardFormat, Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
@@ -305,6 +306,19 @@ fn plan_at<'a>(
     slots: u64,
     room: u64,
 ) -> Result<Plan<'a>, PlacementError> {
+    plan_with(model, machine, ctx, slots, room, true)
+}
+
+/// [`plan_at`], the NVMe expert tier ([`super::expert_nvme_tier`], as
+/// `PlanInputs` runs it after the PLE table's) applied or not.
+fn plan_with<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx: u64,
+    slots: u64,
+    room: u64,
+    experts_to_nvme: bool,
+) -> Result<Plan<'a>, PlacementError> {
     let terms = SeqTerms {
         layers: Stores {
             kv: &Kv38,
@@ -318,6 +332,9 @@ fn plan_at<'a>(
     let levers = PlanLevers::default();
     let mut plan = plan_routed_reserving(model, machine, ctx, &kv, &levers, card_routed, rows)?;
     super::row_table_tier(&mut plan, room, UBATCH_PLANNED)?;
+    if experts_to_nvme {
+        super::expert_nvme_tier(&mut plan, room)?;
+    }
     plan.cards[0].kv_bytes += rows;
     let broken = plan.violations();
     assert!(broken.is_empty(), "ctx {ctx} slots {slots}: {broken:?}");
@@ -634,4 +651,300 @@ fn two_slots_default_context_is_252416() {
         (lo, hi, n_l.iter().filter(|&&n| n == hi).count(), host),
         (504, 505, 47, 337)
     );
+}
+
+/// The host-served routed experts of `layer` in `plan`: per routed stack, its
+/// Host segment's expert count and its NVMe segment's, and the bytes of both
+/// sides.
+fn layer_split(plan: &Plan<'_>, layer: usize) -> (u64, u64, u64, u64) {
+    let (mut host_n, mut nvme_n, mut host_b, mut nvme_b) = (0, 0, 0, 0);
+    let mut first = true;
+    for r in &plan.rows {
+        let t = &plan.model.tensors[r.tensor];
+        if t.role != Role::RoutedExperts || t.layer != Some(layer) {
+            continue;
+        }
+        for s in &r.segments {
+            let n = s.experts.as_ref().map_or(0, |l| l.len());
+            match s.device {
+                Device::Host => {
+                    host_b += s.resident_bytes;
+                    if first {
+                        host_n += n;
+                    }
+                }
+                Device::Nvme => {
+                    nvme_b += s.resident_bytes;
+                    if first {
+                        nvme_n += n;
+                    }
+                }
+                _ => {}
+            }
+        }
+        first = false;
+    }
+    (host_n, nvme_n, host_b, nvme_b)
+}
+
+/// Bytes of one expert of `layer` across its routed stacks.
+fn layer_unit(model: &ModelTensors, layer: usize) -> u64 {
+    model
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(layer))
+        .map(|t| t.file_bytes / EXPERTS)
+        .sum()
+}
+
+/// What the tests derive of a plan on the gate card beside a room: the plan
+/// with the NVMe expert tier, its unsplit twin at the same room, and the
+/// numbers of the table.
+struct NvmeArm {
+    old_need: u64,
+    room: u64,
+    moved: u64,
+    r_min: u64,
+    r_max: u64,
+    host_bytes: u64,
+    floor: u64,
+    max_unit: u64,
+}
+
+/// The gate card's Q4 plan at 4,096 positions beside `room` (the 3090: 92
+/// or 93 experts a layer on the card, the rest host-served), every clause
+/// both plans of the NVMe tier share, and the arm's numbers. `old_need` is
+/// the need the unsplit plan has with the PLE table on the NVMe tier,
+/// derived from the box plan: its need less the table plus the row room.
+fn nvme_arm(room: u64) -> NvmeArm {
+    let q4 = model(false);
+    let gate = machine_a(RTX_3090);
+    let box_plan = plan_at(&q4, &gate, 4096, 1, BOX_ROOM).expect("the box plan");
+    assert_eq!(
+        box_plan.host.nvme_expert_bytes, 0,
+        "the box room splits nothing"
+    );
+    let old_need = HostNeed::of(&box_plan, 0).bytes() - PLE_TABLE + ROW_ROOM;
+    let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
+    let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
+    assert_eq!(HostNeed::of(&twin, 0).bytes(), old_need);
+
+    // The PLE table first: on the NVMe tier, the row room set aside.
+    assert_eq!(split.row_tier().expect("one tier"), Some(Device::Nvme));
+    assert_eq!(split.host.table_bytes, 0);
+    assert_eq!(split.host.row_reserve_bytes, ROW_ROOM);
+
+    let need = HostNeed::of(&split, 0).bytes();
+    let moved = split.host.nvme_expert_bytes;
+    let overflow = old_need - room;
+    let max_unit = (0..LAYERS)
+        .map(|l| layer_unit(&q4, l))
+        .max()
+        .expect("layers");
+    assert!(need <= room, "need {need} B passes the room {room} B");
+    assert_eq!(need + moved, old_need);
+    // The NVMe segments are the overflow, to within the one expert a layer's
+    // whole experts leave.
+    assert!(
+        overflow <= moved && moved < overflow + max_unit,
+        "moved {moved} B for an overflow of {overflow} B"
+    );
+
+    // Every expert once, the host's ids before the NVMe's; the sums of the
+    // rows are the plan's fields; the card side is the unsplit plan's.
+    let (mut host_sum, mut nvme_sum) = (0, 0);
+    let (mut r_min, mut r_max) = (u64::MAX, 0);
+    for l in 0..LAYERS {
+        let (host_n, nvme_n, host_b, nvme_b) = layer_split(&split, l);
+        let (t_host_n, t_nvme_n, ..) = layer_split(&twin, l);
+        assert_eq!(nvme_n + host_n, t_host_n, "layer {l}");
+        assert_eq!(t_nvme_n, 0);
+        let unit = layer_unit(&q4, l);
+        assert_eq!(
+            (host_b, nvme_b),
+            (host_n * unit, nvme_n * unit),
+            "layer {l}"
+        );
+        host_sum += host_b;
+        nvme_sum += nvme_b;
+        r_min = r_min.min(host_n);
+        r_max = r_max.max(host_n);
+        for r in &split.rows {
+            let t = &q4.tensors[r.tensor];
+            if t.role != Role::RoutedExperts || t.layer != Some(l) {
+                continue;
+            }
+            let ids: Vec<u32> = r
+                .segments
+                .iter()
+                .filter(|s| matches!(s.device, Device::Host | Device::Nvme))
+                .flat_map(|s| s.experts.as_ref().expect("a list").ids().to_vec())
+                .collect();
+            assert!(
+                ids.windows(2).all(|w| w[0] < w[1]),
+                "layer {l}: host ids, then NVMe's"
+            );
+            let on_host = r.segments.iter().find(|s| s.device == Device::Host);
+            assert_eq!(
+                on_host.map_or(0, |s| s.experts.as_ref().expect("a list").len()),
+                host_n
+            );
+        }
+    }
+    assert_eq!(host_sum, split.host.expert_bytes);
+    assert_eq!(nvme_sum, moved);
+    assert_eq!(split.nvme_bytes, PLE_TABLE + moved);
+    assert_eq!(split.host.expert_bytes + moved, twin.host.expert_bytes);
+    assert_eq!(format!("{:?}", split.n_l), format!("{:?}", twin.n_l));
+    assert_eq!(
+        format!("{:?}", split.tier_n_l),
+        format!("{:?}", twin.tier_n_l)
+    );
+    assert_eq!(format!("{:?}", split.cards), format!("{:?}", twin.cards));
+    for (a, b) in split.rows.iter().zip(&twin.rows) {
+        let card = |r: &super::Row| -> String {
+            let on: Vec<_> = r
+                .segments
+                .iter()
+                .filter(|s| matches!(s.device, Device::Card(_)))
+                .collect();
+            format!("{on:?}")
+        };
+        assert_eq!(card(a), card(b), "{}", q4.tensors[a.tensor].name);
+    }
+
+    // The floor, from the unsplit plan's own bytes: the host terms beside
+    // the routed experts, and three of the heaviest layer's host-served
+    // experts.
+    let layer_bytes = (0..LAYERS)
+        .map(|l| layer_split(&twin, l).2)
+        .max()
+        .expect("layers");
+    let base = HostNeed {
+        experts: 0,
+        ..HostNeed::of(&twin, 0)
+    }
+    .bytes();
+    let arm = NvmeArm {
+        old_need,
+        room,
+        moved,
+        r_min,
+        r_max,
+        host_bytes: split.host.expert_bytes,
+        floor: base + 3 * layer_bytes,
+        max_unit,
+    };
+    println!(
+        "room {} B | old need {} B | host experts {} B | NVMe experts {} B | PLE NVMe | r_l {}..{} | floor {} B",
+        arm.room, arm.old_need, arm.host_bytes, arm.moved, arm.r_min, arm.r_max, arm.floor
+    );
+    arm
+}
+
+/// A host of 27 GiB (a 32 GB machine's room): the PLE table on the NVMe
+/// tier first, then each layer's host experts split between the host and the
+/// NVMe tier by the overflow.
+#[test]
+fn a_27_gib_room_puts_the_overflow_on_the_nvme_tier() {
+    let arm = nvme_arm(27 << 30);
+    assert!(arm.moved > 0 && arm.r_min > 0 && arm.r_max < EXPERTS);
+}
+
+/// A host of 58 GiB (a 64 GB machine's room): the same rule, a smaller
+/// overflow.
+#[test]
+fn a_58_gib_room_puts_the_overflow_on_the_nvme_tier() {
+    let big = nvme_arm(58 << 30);
+    let small = nvme_arm(27 << 30);
+    assert!(0 < big.moved && big.moved < small.moved);
+    assert!(big.r_min > small.r_max);
+}
+
+/// A room that holds the plan's host need is no case for the tier: the plan
+/// is the unsplit plan's, byte for byte, and one byte under the need moves
+/// experts.
+#[test]
+fn a_room_that_holds_the_need_keeps_the_plan_unchanged() {
+    let q4 = model(false);
+    let gate = machine_a(RTX_3090);
+    let box_plan = plan_at(&q4, &gate, 4096, 1, BOX_ROOM).expect("the box plan");
+    let need = HostNeed::of(&box_plan, 0).bytes() - PLE_TABLE + ROW_ROOM;
+    for room in [BOX_ROOM, need + 1, need] {
+        let kept = plan_at(&q4, &gate, 4096, 1, room).expect("the plan");
+        let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
+        assert_eq!(format!("{kept:?}"), format!("{twin:?}"), "room {room}");
+    }
+    let under = plan_at(&q4, &gate, 4096, 1, need - 1).expect("the plan");
+    assert!(under.host.nvme_expert_bytes > 0);
+    assert!(HostNeed::of(&under, 0).bytes() < need);
+}
+
+/// A room under the floor is refused by name, with the room, the floor and
+/// the need; the floor itself is planned.
+#[test]
+fn a_room_under_the_floor_is_refused_by_name() {
+    let arm = nvme_arm(27 << 30);
+    let q4 = model(false);
+    let gate = machine_a(RTX_3090);
+    match plan_at(&q4, &gate, 4096, 1, arm.floor - 1) {
+        Err(PlacementError::HostRoomFloor {
+            room, floor, need, ..
+        }) => assert_eq!(
+            (room, floor, need),
+            (arm.floor - 1, arm.floor, arm.old_need)
+        ),
+        other => panic!("not refused by name: {:?}", other.map(|p| p.host)),
+    }
+    let msg = plan_at(&q4, &gate, 4096, 1, arm.floor - 1)
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains(&(arm.floor - 1).to_string()) && msg.contains(&arm.floor.to_string()));
+    let at = nvme_arm(arm.floor);
+    assert!(at.r_min <= at.r_max && at.moved > 0);
+    assert!(at.max_unit > 0);
+}
+
+/// `BLOOMERY_HOST_ROOM`'s reading: a set value is a room the caller gave; an
+/// unset one leaves the machine's reading; anything else is refused naming
+/// the lever and the value.
+#[test]
+fn the_host_room_lever_reads_bytes_or_is_refused_by_name() {
+    use std::ffi::OsStr;
+    let read = |v: Option<&str>| super::host_room_given("BLOOMERY_HOST_ROOM", v.map(OsStr::new));
+    assert_eq!(read(None), Ok(None));
+    assert_eq!(read(Some("27G")), Ok(Some((27 << 30, HostRead::Given))));
+    assert_eq!(read(Some("512M")), Ok(Some((512 << 20, HostRead::Given))));
+    assert_eq!(
+        read(Some("28_991_029_248")),
+        Ok(Some((28_991_029_248, HostRead::Given)))
+    );
+    for bad in [
+        "",
+        "abc",
+        "-1",
+        "1.5G",
+        "27 G",
+        "27g",
+        "27GiB",
+        "99999999999999999999G",
+    ] {
+        let e = read(Some(bad)).expect_err(bad);
+        assert!(
+            e.contains("BLOOMERY_HOST_ROOM") && e.contains(&format!("{bad:?}")),
+            "{e}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let e =
+            super::host_room_given("BLOOMERY_HOST_ROOM", Some(OsStr::from_bytes(&[0xff, b'G'])))
+                .expect_err("not UTF-8");
+        assert!(
+            e.contains("BLOOMERY_HOST_ROOM") && e.contains("UTF-8"),
+            "{e}"
+        );
+    }
 }
