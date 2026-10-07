@@ -156,10 +156,13 @@
 //!   kept rows, its draft's windows (the proposals, their probabilities and
 //!   acceptances) and its draft store equal its window run alone on the
 //!   load's own sequence before any slot exists through the session's
-//!   verify of one sequence, its proposals capped alike (`Capped`); at least
-//!   one pass at each depth keeps fewer rows than it ran, and one keeps
-//!   different counts on the two slots (else the clause is red: the per-slot
-//!   keep never ran apart); and while a pass of slot 1's rows alone waits
+//!   verify of one sequence, its proposals capped alike (`Capped`); in the
+//!   at least one pass at each depth keeps fewer rows than it ran, and in the
+//!   real tier one keeps different counts on the two slots (else the clause
+//!   is red: the per-slot keep never ran apart; a fixture's generated draft
+//!   has every proposal refused, so the fixture tier prints that count and
+//!   does not pin it, the step-after arm's fixed counts keeping the two slots
+//!   apart there); and while a pass of slot 1's rows alone waits
 //!   for its commit a select of slot 1 is refused by name by the model, the
 //!   selection and the positions kept. Then (z) step after: both windows'
 //!   requests started alone on their own slots, five passes of both slots'
@@ -194,7 +197,12 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/q38_arch.rs"]
+mod q38_arch;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use bloomery_gpu::GpuError;
@@ -205,25 +213,176 @@ mod gate {
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip};
+    use bloomery_gpu_gates::q38_fixture::{self as q38, Shape};
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
-    use gguf::Split;
+    use bloomery_gpu_gates::tier::{Tag, Tier};
+    use bloomery_gpu_gates::{
+        GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
+    };
+    use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
     use gguf::quant::{GgmlType, half_to_f32};
+    use gguf::{Gguf, Split};
     use model::arch::models::{Borrows, HeadRows, MtpSource};
     use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256,
+        Experts, MtpInputs, MtpPlan, PlanInputs, machine, machine_for_experts, vocab_sha256,
     };
     use model::fileio::hex;
     use model::placement::PlanLevers;
     use refset::arch::qwen4exp::IK;
     use refset::arch::qwen4exp::MODEL;
-    use refset::arch::qwen4exp::mtp::{DRAFT, MTP, MTP_SET};
+    use refset::arch::qwen4exp::mtp::{DRAFT, DraftFrom, MTP, MTP_SET, draft_file};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
     use runtime::width::Chosen as _;
     use runtime::{Advance, Committed, Draft, Out, PassSink, TapNeed, Target, Verify, Want};
+
+    /// The gate's one reading of what the run is made from: the target file
+    /// (`ref_model_path`, a whole fixture under the fixture tier), the draft
+    /// file beside it (the engine's own discovery), the host load config, the
+    /// plan's budget (the caller's lever in the real tier, the header's in the
+    /// fixture tier, [`plan_levers`]) and the layer counts the header names.
+    /// Set once, first thing in `run`, before any load.
+    struct Cfg {
+        path: std::path::PathBuf,
+        draft: std::path::PathBuf,
+        host: HostCfg,
+        header_budget: Option<u64>,
+        lever_budget: Option<u64>,
+        shape: Shape,
+        n_expert: usize,
+    }
+
+    static CFG: std::sync::OnceLock<Cfg> = std::sync::OnceLock::new();
+
+    fn cfg() -> &'static Cfg {
+        CFG.get().expect("init runs before any clause")
+    }
+
+    /// The draft layer's index in the draft file: the target's layer count,
+    /// as the engine names the layer past the target's (the real file's 48).
+    fn draft_layer() -> usize {
+        cfg().shape.n_layer
+    }
+
+    /// The target file, opened as a split of architecture `qwen4exp`.
+    fn open_target() -> Result<Split, GateError> {
+        let path = &cfg().path;
+        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if file.architecture() != Some("qwen4exp") {
+            return Err(format!(
+                "{} is {:?}, not qwen4exp",
+                path.display(),
+                file.architecture()
+            )
+            .into());
+        }
+        Ok(file)
+    }
+
+    /// The MTP draft file a run of `target` opens: the engine's own discovery (`BLOOMERY_MTP_DRAFT`,
+    /// else the shared draft's name beside the target, else the family's path), and in the fixture tier
+    /// a whole fixture beside the target — never the real draft the discovery falls back to.
+    ///
+    /// # Errors
+    /// The fixture tier's discovery landing on the family's real draft, or on a file that is not a
+    /// whole fixture.
+    fn draft_path(levers: &Levers, target: &Path) -> Result<PathBuf, GateError> {
+        let (path, from) = draft_file(levers.mtp_draft(), target);
+        let tier = q38::tier()?;
+        if tier == Tier::Fixture {
+            if from == DraftFrom::Family {
+                return Err(format!(
+                    "the fixture tier found no shared draft beside {} and would open the real one at \
+                     {}",
+                    target.display(),
+                    path.display()
+                )
+                .into());
+            }
+            let g = Gguf::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            tier.check_file(&path, g.iter_kv().map(|(k, _)| k))?;
+        }
+        Ok(path)
+    }
+
+    /// The draft file beside the target.
+    fn open_draft() -> Result<Split, GateError> {
+        let path = &cfg().draft;
+        Split::open(path).map_err(|e| format!("open {}: {e}", path.display()).into())
+    }
+
+    /// The plan's levers for a load that reserves `extra` card bytes for the
+    /// draft out of the same budget (0: the target alone): the real tier's
+    /// lever, or the header's budget plus `extra` (`q38_fixture::budget_levers`).
+    fn plan_levers(extra: u64) -> Result<PlanLevers, GateError> {
+        q38::budget_levers(q38::tier()?, cfg().header_budget, cfg().lever_budget, extra)
+    }
+
+    /// The card a plan is made on: the real tier's the gate runner's (the
+    /// 3090's bytes on the card in view), the fixture tier's `a`
+    /// (`q38_fixture::card`).
+    fn card() -> Result<model::placement::workstation::CardSpec, GateError> {
+        q38::card(crate::gate_card::card)
+    }
+
+    /// Read the headers once and print each derived value beside the real
+    /// file's literal it replaced ([`q38::witness`]).
+    fn init() -> Result<bool, GateError> {
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        let path = ref_model_path()?;
+        let draft = draft_path(&levers, &path)?;
+        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::describe(&file)?;
+        let shape = crate::q38_arch::shape_of(&inputs.hp)?;
+        let header_budget = q38::header_budget(&file)?;
+        let n_expert = inputs.hp.n_expert;
+        let cfg = Cfg {
+            path,
+            draft,
+            host: levers.host(),
+            header_budget,
+            lever_budget: levers.card_budget_bytes(),
+            shape,
+            n_expert,
+        };
+        let mut ok = q38::witness(
+            "model file",
+            cfg.path.to_string_lossy().into_owned(),
+            MODEL.to_string(),
+        );
+        ok &= q38::witness(
+            "draft file",
+            cfg.draft.to_string_lossy().into_owned(),
+            DRAFT.to_string(),
+        );
+        ok &= q38::witness("draft layer", cfg.shape.n_layer, REAL_DRAFT_LAYER);
+        ok &= q38::witness(
+            "card budget",
+            cfg.lever_budget,
+            PlanLevers::default().card_budget_bytes,
+        );
+        ok &= q38::witness_card(&card()?);
+        if CFG.set(cfg).is_err() {
+            return Err("the gate's configuration was read twice".into());
+        }
+        Ok(ok)
+    }
+
+    /// A self-consistency clause: it runs in both tiers, so a tier that
+    /// deferred it would be refused by name here, not skipped.
+    fn sc(name: &str) -> Result<(), GateError> {
+        if q38::clause(name, Tag::SelfConsistency)? {
+            Ok(())
+        } else {
+            Err(format!("the self-consistency clause {name:?} was deferred").into())
+        }
+    }
+
+    /// The draft layer's index in the real file's draft (the target's 48
+    /// layers): the literal [`draft_layer`] replaced.
+    const REAL_DRAFT_LAYER: usize = 48;
 
     /// Cache rows: the e2e gate's.
     const CTX: u64 = 3072;
@@ -231,8 +390,9 @@ mod gate {
     const LIST_ROWS: u32 = 40_960;
     /// The shipped list's rows ([`SHIPPED`]'s first line).
     const SHIPPED_ROWS: usize = 65_536;
-    /// The draft layer's index in the draft file: ik names its nodes by it.
-    const LAYER: usize = 48;
+    /// The draft layer's index in ik's node names: the real file's 48 target
+    /// layers. ik's sets are the real tier's, so the names stay.
+    const IK_LAYER: usize = 48;
     /// Streams of a hidden row, and the values of one.
     const STREAMS: usize = 4;
     const HIDDEN: usize = 2560;
@@ -454,16 +614,16 @@ mod gate {
                 .into_iter()
                 .map(|v| v as usize)
                 .collect::<Vec<_>>();
-            let topk_row = find(&format!("ffn_moe_topk-{LAYER}"))?;
+            let topk_row = find(&format!("ffn_moe_topk-{IK_LAYER}"))?;
             let topk = set.i32s(topk_row, Layout::Logical)?;
             let g = IkGraph {
                 block,
                 graph,
                 states: f32s("inp_mtp_states")?,
-                eh: f32s(&format!("mtp_eh_proj-{LAYER}"))?,
-                l_out: f32s(&format!("l_out-{LAYER}"))?,
+                eh: f32s(&format!("mtp_eh_proj-{IK_LAYER}"))?,
+                l_out: f32s(&format!("l_out-{IK_LAYER}"))?,
                 logits: f32s("result_output")?,
-                router: f32s(&format!("ffn_moe_logits-{LAYER}"))?,
+                router: f32s(&format!("ffn_moe_logits-{IK_LAYER}"))?,
                 topk,
                 tokens,
                 pos,
@@ -677,7 +837,7 @@ mod gate {
         /// The site `sub` of the draft layer (`attn`, `ffn`), or the head's
         /// (`nextn.hc_head`, no inject).
         fn open(draft: &Split, stem: &str, inject: bool) -> Result<HostSite, GateError> {
-            let b = |s: &str| format!("blk.{LAYER}.{stem}_{s}.weight");
+            let b = |s: &str| format!("blk.{}.{stem}_{s}.weight", draft_layer());
             let q = |s: &str| HostQ8::open(draft, &b(s)).map(|m| m.dequant());
             Ok(HostSite {
                 gamma: bloomery_gpu_gates::split_f32(draft, &b("norm"), WIDE)?,
@@ -717,9 +877,14 @@ mod gate {
 
     impl<'a> Host<'a> {
         fn open(file: &'a Split, draft: &'a Split, eps: f32) -> Result<Host<'a>, GateError> {
-            let o = |stem: &str| HostQ8::open(draft, &format!("blk.{LAYER}.{stem}.weight"));
+            let o =
+                |stem: &str| HostQ8::open(draft, &format!("blk.{}.{stem}.weight", draft_layer()));
             let f = |stem: &str, n: usize| {
-                bloomery_gpu_gates::split_f32(draft, &format!("blk.{LAYER}.{stem}.weight"), n)
+                bloomery_gpu_gates::split_f32(
+                    draft,
+                    &format!("blk.{}.{stem}.weight", draft_layer()),
+                    n,
+                )
             };
             Ok(Host {
                 embd: HostQ8::open(file, "token_embd.weight")?,
@@ -1154,12 +1319,17 @@ mod gate {
     }
 
     /// Replay graph `g` in runs of up to [`MTP_ROWS`] rows, the full head,
-    /// the taps armed, into `r`.
+    /// the taps armed, into `r`. ik's rows are the feed in both tiers (the
+    /// fixture copies the vocabulary and the hidden rows are finite inputs);
+    /// `vs_ik` is the oracle clauses: (e), (l) and (h)'s comparison with ik's
+    /// output are made only when it holds, and the node-local pins (n) and
+    /// (h)'s kernel against our own full head are made always.
     fn replay(
         m: &mut Qwen38Model,
         g: &IkGraph,
         host: &Host<'_>,
         r: &mut Replay,
+        vs_ik: bool,
     ) -> Result<(), GateError> {
         let n = g.tokens.len();
         let vocab = m.body("replay")?.vocab();
@@ -1190,7 +1360,11 @@ mod gate {
             for t in 0..rows {
                 let at = c0 + t;
                 let span = at * WIDE..(at + 1) * WIDE;
-                let e = rel(&taps.eh[t * WIDE..(t + 1) * WIDE], &g.eh[span.clone()]);
+                let e = if vs_ik {
+                    rel(&taps.eh[t * WIDE..(t + 1) * WIDE], &g.eh[span.clone()])
+                } else {
+                    0.0
+                };
                 r.eh_worst = r.eh_worst.max(e);
                 if e > eh_band() {
                     r.eh_fail += 1;
@@ -1201,12 +1375,17 @@ mod gate {
                 let ours_v = &taps.logits[t * taps.logits_row..t * taps.logits_row + N_EXPERT];
                 let ik_v = &g.router[at * N_EXPERT..(at + 1) * N_EXPERT];
                 let ik_ids = &g.topk[at * N_USED..(at + 1) * N_USED];
-                if let Some(f) = Flip::between(
-                    (LAYER, at),
-                    (&ours_ids, ours_v),
-                    (ik_ids, ik_v),
-                    flip::margin(ik_v, ik_ids),
-                ) {
+                if let Some(f) = vs_ik
+                    .then(|| {
+                        Flip::between(
+                            (IK_LAYER, at),
+                            (&ours_ids, ours_v),
+                            (ik_ids, ik_v),
+                            flip::margin(ik_v, ik_ids),
+                        )
+                    })
+                    .flatten()
+                {
                     flipped[t] = true;
                     r.flips += 1;
                     let cap = flip_cap(router_band(), ik_v);
@@ -1224,7 +1403,7 @@ mod gate {
                 }
                 let l_out = &w.l_out[t * WIDE..(t + 1) * WIDE];
                 pin_row(host, g, at, &taps, t, l_out, &mut r.pins);
-                if !flipped[t] {
+                if vs_ik && !flipped[t] {
                     r.l_out_held += 1;
                     r.l_out_worst = r.l_out_worst.max(rel(l_out, &g.l_out[span]));
                 }
@@ -1256,6 +1435,9 @@ mod gate {
                 pin_logits(host, head_in, &ours, &mut r.pins.logits, &|| {
                     format!("{} row {o}", g.label())
                 });
+                if !vs_ik {
+                    continue;
+                }
                 let ik = &g.logits[k * vocab..(k + 1) * vocab];
                 let (top, _) = top2(&ours);
                 let (ik_top, ik_2) = top2(ik);
@@ -1378,7 +1560,14 @@ mod gate {
         let ours = m.target_streams(TargetRows::Pass, rows)?;
         let at = |pos: usize| warm.pos.iter().position(|&p| p as usize == pos);
         let mut by_shift = Vec::new();
+        let vs_ik = q38::clause(
+            "(t) the target's streams after the prompt against ik's MTP hidden rows, shifted by one",
+            Tag::Oracle,
+        )?;
         for s in 0..3usize {
+            if !vs_ik {
+                break;
+            }
             let mut worst = 0.0f64;
             let mut pairs = 0;
             for t in 0..rows {
@@ -1396,12 +1585,14 @@ mod gate {
             );
             by_shift.push(if pairs > 0 { worst } else { f64::INFINITY });
         }
-        let shift_ok =
-            by_shift[1] <= FREE_BAND && by_shift[1] < by_shift[0] && by_shift[1] < by_shift[2];
-        println!(
-            "(t) ik's row p reads the target's hidden of p − 1, within {FREE_BAND:.2}: {}",
-            verdict(shift_ok)
-        );
+        let shift_ok = !vs_ik
+            || (by_shift[1] <= FREE_BAND && by_shift[1] < by_shift[0] && by_shift[1] < by_shift[2]);
+        if vs_ik {
+            println!(
+                "(t) ik's row p reads the target's hidden of p − 1, within {FREE_BAND:.2}: {}",
+                verdict(shift_ok)
+            );
+        }
         // The walk starts one past the arena's first position — each of its
         // rows at q reads the hidden row at q − 1, the arena's rows 0..rows
         // (the prompt's last unit's rows, `first` on) — and runs one row past
@@ -1653,7 +1844,8 @@ mod gate {
         );
         let raised = match &r {
             Err(GpuError::Fault { fault, .. }) => {
-                fault.layer as usize == LAYER && fault.sites & (1 << FaultSite::HcMix as u32) != 0
+                fault.layer as usize == draft_layer()
+                    && fault.sites & (1 << FaultSite::HcMix as u32) != 0
             }
             _ => false,
         };
@@ -1932,25 +2124,12 @@ mod gate {
     fn resume_refused(
         m: Qwen38Model,
         inputs: &PlanInputs,
-        levers: &bloomery_levers::Levers,
         ub: usize,
         prompt: &[u32],
     ) -> Result<(Qwen38Model, bool), GateError> {
-        let machine = machine(
-            crate::gate_card::card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-        );
-        let plan_levers = PlanLevers::from_levers(levers)?;
-        let plain_plan = inputs.plan(&machine, CTX, &plan_levers)?;
-        let mut b = Body38::open_placed(
-            Split::open(MODEL)?,
-            &plain_plan,
-            inputs,
-            0,
-            levers.host(),
-            ub,
-        )?;
+        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let plain_plan = inputs.plan(&machine, CTX, &plan_levers(0)?)?;
+        let mut b = Body38::open_placed(open_target()?, &plain_plan, inputs, 0, cfg().host, ub)?;
         // Other ids over the same length: the state's rows differ from
         // whatever this model's stores hold, so a copy that should not
         // happen shows.
@@ -3135,7 +3314,7 @@ mod gate {
         mtp: &MtpInputs,
         ids: &[u32],
     ) -> Result<bool, GateError> {
-        let target = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let target = open_target()?;
         let d = &plan.draft.cards[0];
         let body = m.body("mtp load")?;
         let Some(mtp38) = body.mtp() else {
@@ -3335,26 +3514,18 @@ mod gate {
     fn slots_windows(
         inputs: &PlanInputs,
         mtp: &MtpInputs,
-        levers: &bloomery_levers::Levers,
         ub: usize,
         a: &[u32],
         b: &[u32],
     ) -> Result<bool, GateError> {
         const ROUNDS: usize = 8;
         let ctx = u32::try_from(CTX)?;
-        let (file, draft_file) = (
-            Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?,
-            Split::open(DRAFT).map_err(|e| format!("open {DRAFT}: {e}"))?,
-        );
-        let machine = machine(
-            crate::gate_card::card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-        );
+        let (file, draft_file) = (open_target()?, open_draft()?);
+        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
         let plan = inputs.plan_mtp_with_slots(
             &machine,
             CTX,
-            &PlanLevers::from_levers(levers)?,
+            &plan_levers(mtp.card_bytes_of(CTX, 2)?)?,
             mtp,
             Experts::Host,
             2,
@@ -3364,7 +3535,7 @@ mod gate {
             &plan,
             inputs,
             0,
-            levers.host(),
+            cfg().host,
             ub,
             &draft_file,
             mtp,
@@ -3447,10 +3618,19 @@ mod gate {
             verdict(ids_ok && passes_ok && stores_ok)
         );
         let mut z_ok = true;
+        // The equality of each slot's run with its window alone, and a pass that keeps fewer
+        // rows than it ran, are self-consistency; that the two slots keep different counts in
+        // one pass is a property of the draft's weights against the target's, which the
+        // shipped draft has and a fixture's generated one does not (every proposal is
+        // refused there).
+        let uneven = q38::clause(
+            "(z) at each depth a pass keeps different counts on the two slots",
+            Tag::FileBound,
+        )?;
         for (depth, refs) in DEPTHS.into_iter().zip(&capped) {
             z_ok &= z_red(
                 &format!("depth {depth}"),
-                one_pass_windows(&mut s, [a, b], depth, ROUNDS, refs),
+                one_pass_windows(&mut s, [a, b], depth, ROUNDS, refs, uneven),
             );
         }
         z_ok &= z_red("waiting", waiting_select(&mut s));
@@ -3608,13 +3788,17 @@ mod gate {
     /// (slot 0 window A, slot 1 window B, in the server's order), then
     /// `rounds` passes of both slots' drafted rows in one pass
     /// ([`app::mtp::pass_slots`]), each slot's draft its own; against
-    /// `refs`, each window's [`capped_run`].
+    /// `refs`, each window's [`capped_run`]. `uneven` holds the passes to
+    /// the module doc's coverage of a pass keeping different counts on the
+    /// two slots: the real tier's, where the shipped draft's proposals are
+    /// accepted unevenly.
     fn one_pass_windows(
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
         depth: usize,
         rounds: usize,
         refs: &[Drafted; 2],
+        uneven: bool,
     ) -> Result<bool, GateError> {
         let mut drafts = [fresh_draft(s)?, fresh_draft(s)?];
         let mut outs = [Vec::new(), Vec::new()];
@@ -3684,11 +3868,11 @@ mod gate {
             );
         }
         let same = off.is_empty();
-        let ok = same && rejected > 0 && apart > 0;
+        let ok = same && rejected > 0 && (!uneven || apart > 0);
         println!(
             "(z) two slots in one pass at depth {depth} (a pass of {} rows): {rounds} passes; \
              {}; {rejected} slot passes kept fewer rows than they ran, {apart} passes kept \
-             different counts on the two slots {}",
+             different counts on the two slots{} {}",
             2 * (depth + 1),
             if same {
                 "each slot's ids, kept rows, draft windows and draft store its window's alone \
@@ -3696,6 +3880,11 @@ mod gate {
                     .to_string()
             } else {
                 format!("differs in {}", off.join(", "))
+            },
+            if uneven {
+                ""
+            } else {
+                " (printed, not pinned in this tier)"
             },
             verdict(ok)
         );
@@ -3941,8 +4130,50 @@ mod gate {
         Ok(ok)
     }
 
+    /// (d) the drafting load's budget. The draft reserves its card bytes
+    /// ([`MtpInputs::card_bytes`]) out of the same card budget, so the
+    /// header's budget plus those bytes ([`plan_levers`]) leaves the target's
+    /// routed experts on the card as many as the target alone holds under the
+    /// header's budget: the card plan's counts a layer, drafted and alone, are
+    /// equal, and in the fixture tier each layer's is half the file's experts —
+    /// the header's contract, from which a budget one granule off leaves a
+    /// layer one expert short. The real tier's budget is the caller's lever
+    /// (unset: none), whose plans hold the draft's bytes out of the card's
+    /// own: the counts are printed there, not pinned.
+    fn draft_budget(inputs: &PlanInputs, mtp: &MtpInputs, ub: usize) -> Result<bool, GateError> {
+        let machine = machine_for_experts(
+            card()?,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            Experts::Card,
+        );
+        let alone = inputs.plan_with(&machine, CTX, &plan_levers(0)?, Experts::Card)?;
+        let extra = mtp.card_bytes(CTX)?;
+        let drafted =
+            inputs.plan_mtp_with(&machine, CTX, &plan_levers(extra)?, mtp, Experts::Card)?;
+        let fixture = q38::tier()? == Tier::Fixture;
+        let want = (cfg().n_expert / 2) as u64;
+        let (a, d) = (&alone.n_l, &drafted.plan.n_l);
+        let held = |v: &[u64]| (v.iter().min().copied(), v.iter().max().copied());
+        let ok = !fixture || (a == d && d.iter().all(|&n| n == want));
+        println!(
+            "(d) the drafting load's budget: card experts a layer alone {:?} and drafted {:?} \
+             under {:?} + the draft's {extra} B{} {}",
+            held(a),
+            held(d),
+            plan_levers(extra)?.card_budget_bytes,
+            if fixture {
+                format!(" (want {want} on every layer both ways: half the experts)")
+            } else {
+                " (the real tier's budget is the lever's: counts printed, not pinned)".to_string()
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[])?;
+        let witnessed = init()?;
         let dir = MTP.path(MTP_SET);
         let set = MtpSet::open(&dir, &MTP)?;
         let prompt = set
@@ -3969,10 +4200,12 @@ mod gate {
             MIXED_BAND,
             LO_BAND
         );
-        let open = |p: &str| Split::open(p).map_err(|e| format!("open {p}: {e}"));
-        let (file, draft) = (open(MODEL)?, open(DRAFT)?);
+        let (file, draft) = (open_target()?, open_draft()?);
         let t = Instant::now();
         let inputs = PlanInputs::describe(&file)?;
+        sc(
+            "(u) the unset head is the shipped list of the target's tokenizer (copied into a fixture)",
+        )?;
         let shipped_ok = shipped_head(&file, inputs.spec.vocab)?;
         let ids: Vec<u32> = (0..LIST_ROWS).map(|i| i * 6).collect();
         let rows = HeadRows::List {
@@ -3981,17 +4214,15 @@ mod gate {
         };
         let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
-        let machine = machine(
-            crate::gate_card::card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-        );
-        let plan = inputs.plan_mtp(&machine, CTX, &PlanLevers::from_levers(&levers)?, &mtp)?;
+        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let extra = mtp.card_bytes(CTX)?;
+        let plan = inputs.plan_mtp(&machine, CTX, &plan_levers(extra)?, &mtp)?;
         let d = &plan.draft.cards[0];
         println!(
-            "plan card={} ctx_max={CTX} draft dense={} experts={} rounding={} kv={} map={} \
-             arena={} headroom={}",
-            crate::gate_card::card()?.name,
+            "plan card={} ctx_max={CTX} card_budget={:?} (the draft's card bytes {extra} in it) \
+             draft dense={} experts={} rounding={} kv={} map={} arena={} headroom={}",
+            card()?.name,
+            plan_levers(extra)?.card_budget_bytes,
             d.dense_bytes,
             d.expert_bytes,
             d.rounding_bytes,
@@ -4000,33 +4231,40 @@ mod gate {
             plan.arena_bytes,
             plan.headroom_bytes
         );
-        let mut m =
-            Body38::open_placed_mtp(file, &plan, &inputs, 0, levers.host(), ub, &draft, &mtp)?;
+        let mut m = Body38::open_placed_mtp(file, &plan, &inputs, 0, cfg().host, ub, &draft, &mtp)?;
         let arena = m.body("mtp")?.mtp().map_or(0, |d| d.arena_bytes());
         println!(
             "load card={} ctx_max={CTX} resident_bytes={} in {:.1} s; the draft program's arena \
              {arena} bytes (runtime value, outside the plan)",
-            crate::gate_card::card()?.name,
+            card()?.name,
             m.resident_bytes(),
             t.elapsed().as_secs_f64()
         );
-        let mut ok = shipped_ok;
+        let mut ok = shipped_ok && witnessed;
+        sc("(d)(q) the draft's load holds its plan's bytes; Mtp38::open's refusals")?;
         ok &= draft_load(&m, plan, &inputs, &draft, &mtp, &ids)?;
+        sc("(d) the drafting load's budget keeps the target's card experts a layer")?;
+        ok &= draft_budget(&inputs, &mtp, ub)?;
         ok &= refused(
             "the draft's own row before any walk",
             m.mtp_draft(MtpFeed::Own { pos0: 0 }, MtpHead::Rows, MtpMode::Eager),
             "a walk before the draft's own row",
         );
 
-        let head_file = open(MODEL)?;
+        let head_file = open_target()?;
         let host = Host::open(&head_file, &draft, inputs.hp.rms_eps)?;
         m.set_mtp_taps(true)?;
         let mut r = Replay::new();
         let mut last = None;
         let mut warm = None;
+        sc("(n) the node-local pins and (h)'s kernel on every replayed row")?;
+        let vs_ik = q38::clause(
+            "(e)(l)(h) every graph of ik's set replayed: eh_proj, routes, l_out and the argmax against ik's",
+            Tag::Oracle,
+        )?;
         for &(b, g) in &order {
             let ig = IkGraph::read(&set, b, g)?;
-            replay(&mut m, &ig, &host, &mut r)?;
+            replay(&mut m, &ig, &host, &mut r, vs_ik)?;
             if g == Graph::Warmup {
                 warm = Some(ig);
             } else {
@@ -4035,45 +4273,60 @@ mod gate {
         }
         let warm = warm.ok_or("the set has no warmup graph")?;
         let last = last.ok_or("the set has no block graph")?;
-        let e_ok = r.eh_fail == 0 && r.rows > 0;
-        println!(
-            "(e) {} rows: eh_proj worst {:.3e} (band {:.3e}), {} past {}",
-            r.rows,
-            r.eh_worst,
-            eh_band(),
-            r.eh_fail,
-            verdict(e_ok)
-        );
-        let l_ok = r.flips_bad == 0 && r.l_out_held > 0;
-        println!(
-            "(l) {} rows, {} on flips, {} flips not allowed; l_out's distance from ik's on the {} \
-             rows held {:.3e} (printed, not held: the rounding of ik's q8 activations) {}",
-            r.rows,
-            r.flips,
-            r.flips_bad,
-            r.l_out_held,
-            r.l_out_worst,
-            verdict(l_ok)
-        );
-        let h_ok = r.argmax_bad == 0 && r.kernel_bad == 0 && r.heads_held > 0;
-        println!(
-            "(h) {} head rows, {} held: argmax = ik's {}, ties {}, wrong {}; ik's smallest top-2 \
-             margin {}; the draft's token = our argmax but {}; the logits' distance from ik's \
-             {:.3e} (printed, not held) {}",
-            r.heads,
-            r.heads_held,
-            r.argmax_same,
-            r.argmax_tie,
-            r.argmax_bad,
-            r.margin_min
-                .as_ref()
-                .map_or("-".to_string(), |(m, q, at)| format!(
-                    "{m:.3e}, {q:.2} of its tie cap, at {at}"
-                )),
-            r.kernel_bad,
-            r.logits_worst,
-            verdict(h_ok)
-        );
+        let (e_ok, l_ok, h_ok) = if vs_ik {
+            let e_ok = r.eh_fail == 0 && r.rows > 0;
+            println!(
+                "(e) {} rows: eh_proj worst {:.3e} (band {:.3e}), {} past {}",
+                r.rows,
+                r.eh_worst,
+                eh_band(),
+                r.eh_fail,
+                verdict(e_ok)
+            );
+            let l_ok = r.flips_bad == 0 && r.l_out_held > 0;
+            println!(
+                "(l) {} rows, {} on flips, {} flips not allowed; l_out's distance from ik's on \
+                 the {} rows held {:.3e} (printed, not held: the rounding of ik's q8 \
+                 activations) {}",
+                r.rows,
+                r.flips,
+                r.flips_bad,
+                r.l_out_held,
+                r.l_out_worst,
+                verdict(l_ok)
+            );
+            let h_ok = r.argmax_bad == 0 && r.kernel_bad == 0 && r.heads_held > 0;
+            println!(
+                "(h) {} head rows, {} held: argmax = ik's {}, ties {}, wrong {}; ik's smallest \
+                 top-2 margin {}; the draft's token = our argmax but {}; the logits' distance \
+                 from ik's {:.3e} (printed, not held) {}",
+                r.heads,
+                r.heads_held,
+                r.argmax_same,
+                r.argmax_tie,
+                r.argmax_bad,
+                r.margin_min
+                    .as_ref()
+                    .map_or("-".to_string(), |(m, q, at)| format!(
+                        "{m:.3e}, {q:.2} of its tie cap, at {at}"
+                    )),
+                r.kernel_bad,
+                r.logits_worst,
+                verdict(h_ok)
+            );
+            (e_ok, l_ok, h_ok)
+        } else {
+            let h_ok = r.kernel_bad == 0 && r.heads > 0 && r.rows > 0;
+            println!(
+                "(h) {} rows, {} head rows: the draft's token = our full head's argmax but {} \
+                 {}",
+                r.rows,
+                r.heads,
+                r.kernel_bad,
+                verdict(h_ok)
+            );
+            (true, true, h_ok)
+        };
         let mut n_ok = true;
         for p in r.pins.all() {
             println!("{}", p.line());
@@ -4091,29 +4344,42 @@ mod gate {
             })
             .transpose()?
             .ok_or("the load opened no row list")?;
+        sc("(r) the row-list head against the full head")?;
         ok &= map == ids;
         ok &= list_head(&mut m, &last, &map)?;
         m.set_mtp_taps(false)?;
+        sc("(t) the pairing: the draft's walk fed the target's rows in place = from the host")?;
         ok &= pairing(&mut m, &prompt, &warm)?;
+        sc("(g) a captured walk = the eager walk")?;
         ok &= graphs(&mut m, &warm)?;
+        sc("(f) the walk's refusals and the NaN fault")?;
         ok &= refusals(&mut m, &warm)?;
+        sc("(w) the windows end to end: drafted ids = plain ids")?;
         let (m, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
         ok &= w_ok;
+        sc("(c) the width chooser")?;
         let (m, width_ok) = width_chooser(m, &prompt)?;
         ok &= width_ok;
         let (mut m, c_ok) = continued(m, &prompt)?;
         ok &= c_ok;
         ok &= arena_holds(&mut m, &prompt)?;
+        sc("(p) a partial accept's records")?;
         let (model, p_ok) = kept_state(m, &prompt)?;
         ok &= p_ok;
-        let (model, x_ok) = resume_refused(model, &inputs, &levers, ub, &prompt)?;
+        sc("(x) a resume of a state without the draft's side is refused")?;
+        let (model, x_ok) = resume_refused(model, &inputs, ub, &prompt)?;
         ok &= x_ok;
         drop(model);
         // Window B diverges from window A from position 0 on: the corpus's
         // deep window read past A's whole length, so no per-sequence state
         // the two share by content can pass for one the slots exchanged.
         let deep = deep_prompt()?;
-        ok &= slots_windows(&inputs, &mtp, &levers, ub, &prompt, &deep[1000..])?;
+        sc("(y)(z) two drafted sequences resident: interleaved and as one pass")?;
+        ok &= slots_windows(&inputs, &mtp, ub, &prompt, &deep[1000..])?;
+        let (ran, deferred) = q38::tally();
+        println!(
+            "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
+        );
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

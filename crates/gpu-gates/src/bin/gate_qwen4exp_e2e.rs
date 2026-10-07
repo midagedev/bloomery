@@ -17,9 +17,25 @@
 //! holds qwen4exp to `Body38`'s own rows (`crates/model/src/arch/coverage.rs`,
 //! not this gate's to change).
 //!
+//! Tiers (`BLOOMERY_TIER`, `crates/gpu-gates/src/tier.rs`): the real tier
+//! runs every clause on the real file. The fixture tier opens the small file
+//! `fixture generate` wrote (`ref_model_path`: a whole fixture or a named
+//! error), plans with `a` (the largest visible card) under the card budget
+//! its header records, and runs the self-consistency clauses — two arms of the
+//! engine under one plan agree, a count against the plan's own derivation —
+//! while every comparison with ik's output (the free arm's layer outputs, flips
+//! and last argmax, the step sets, each ubatch arm's last argmax) is an oracle
+//! clause and prints a `deferred(real)` line. The sets' token ids are read in
+//! both tiers: the fixture copies the real file's vocabulary. Every layer
+//! count, node count and store byte is derived from the header
+//! (`q38_fixture::Shape`); the real tier prints each beside the literal it
+//! replaced and requires them equal (`move proof` lines).
+//!
 //! What is asserted:
-//! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes,
-//!   [`MEMOPS`] of them stream memory-operation batches (each layer's go and
+//! - (s) structure: the captured decode step holds the header's node count
+//!   (the embedding row, each layer's launches by its kind, the PLE site and the
+//!   head: 1,151 on the real file),
+//!   one pair of memory-operation batches a layer of them stream (each layer's go and
 //!   wait) and the rest kernels, and the program's own count
 //!   (`Body38::step_launches`) is the same; the selecting layers are every
 //!   fourth ([`qsa_layers`]); the stores' bytes equal their derivation from
@@ -90,7 +106,7 @@
 //!   pooled row past the count set to NaN after the commit ([`POOL_POISON`]),
 //!   the step after and the one after it (which completes pool 513 again)
 //!   bit for bit the steps', raising nothing. Structure: each verify's graph holds
-//!   [`NODES_VERIFY`] nodes, [`MEMOPS`] of them batch mem ops, one argmax,
+//!   the header's verify node count (1,235 on the real file), two a layer of them batch mem ops, one argmax,
 //!   one `ds41_ffn_handoff_10_cols` a layer and no one-column handoff; a
 //!   replay's host tier serves each layer once with one call into the host
 //!   experts (48 services, 48 calls, 48 `Cols` services). Refusals: a step
@@ -157,7 +173,8 @@
 //! - (k) the card leg: after every clause above, the host plan's model
 //!   dropped, the card rule's plan (`place::Experts::Card`: each eligible
 //!   layer's id prefix on the card) loaded on the same card. Its step graph
-//!   holds [`NODES_DECODE_CARD`] nodes over [`CARD_LAYERS`] card layers, the
+//!   holds the header's decode nodes plus the leg's five a card layer (1,391 over
+//!   the real file's 48), over the plan's card layers, the
 //!   program's count. The pass's places entry, on synthetic ids at the
 //!   router's pitch, writes each slot's place, [`HOST`] and `expert_id` for
 //!   an id past the experts, and reads no shared expert's word
@@ -170,7 +187,7 @@
 //!   eager steps the graph steps' bits, one pass of the five rows the steps'
 //!   last token, logits and every store bit for bit, and verifies of 2, 3
 //!   and 4 rows kept whole every row bit for bit the steps' (each graph
-//!   [`NODES_VERIFY_CARD`] nodes). (iii) The ubatch walk — the card route's
+//!   holds the verify's nodes plus the same five a card layer). (iii) The ubatch walk — the card route's
 //!   — with the pass's routes planted against the pass of the same plan
 //!   within [`gemm_band`] (the forced arm's shape: the card route
 //!   quantizes the same blocks the pass's card leg quantizes), and the
@@ -180,7 +197,7 @@
 //!   of 4,096).
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
-//!   [`IMAGE_TOKEN`] as a step, as a pass and as a ubatch is refused by name
+//!   the header's image placeholder (`ple.image_token_id`) as a step, as a pass and as a ubatch is refused by name
 //!   with the position kept and the model not poisoned; a prompt past the
 //!   stores is refused by name before any launch, on every path, the
 //!   position kept.
@@ -237,6 +254,10 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/q38_arch.rs"]
+mod q38_arch;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::time::Instant;
 
@@ -251,30 +272,33 @@ mod gate {
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::q38_fixture::{self as q38, Shape};
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
+    use bloomery_gpu_gates::tier::Tag;
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in,
-        topk_ids_logical_within, verdict,
+        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_model_path,
+        ref_tensor_logical_in, topk_ids_logical_within, verdict,
     };
+    use bloomery_levers::{CARD_BUDGET, HostCfg};
     use cuda_core::{DeviceBuffer, sys};
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
-    use model::placement::workstation::{HostNeed, HostRead, RTX_3090};
+    use model::placement::workstation::{HostNeed, HostRead};
     use model::placement::{Device, PlanLevers};
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
 
-    /// The file's shape, as the header states it (qwen4arch-design §1): what
-    /// the derivations below are written against.
+    /// The file's widths, as the header states them (qwen4arch-design §1) and
+    /// the engine's kernels fix them (`plan38.rs` refuses a file that differs,
+    /// the fixture keeps them): what the derivations below are written
+    /// against. The layer counts are not here: they come from the header
+    /// ([`shape`]).
     const HIDDEN: usize = 2560;
     const STREAMS: usize = 4;
-    const N_LAYER: usize = 48;
-    const N_QSA: usize = 12;
-    const N_GDN: usize = 36;
     const N_EXPERT: usize = 512;
     const N_USED: usize = 10;
     /// Delta layers: 48 value heads and 16 key heads of 128, a conv of 4
@@ -292,8 +316,9 @@ mod gate {
     const PLE_DILATION: usize = 3;
     /// The most positions an eager pass or a ring's tail takes.
     const PASS_ROWS: usize = 8;
-    /// The image placeholder the file's PLE hash refuses as an input.
-    const IMAGE_TOKEN: u32 = 248_056;
+    /// The real file's image placeholder, `ple.image_token_id`: the token its
+    /// PLE hash refuses as an input.
+    const REAL_IMAGE_TOKEN: u32 = 248_056;
 
     /// The f16 pattern every selecting store's planes hold before a run
     /// (100.0): `reset` leaves those rows as they were, and a path that reads
@@ -302,6 +327,12 @@ mod gate {
     /// from any key, value or indexer key the model writes.
     const PLANE_FILL: u16 = 0x5640;
 
+    /// The real file's layer counts and the captured graphs' node counts: the
+    /// literals the gate carried before it derived them from the header
+    /// ([`shape`], `q38_fixture::Shape`), kept as the witnesses the real tier
+    /// prints each derived value beside ([`witnesses`]) and requires equal.
+    /// Each node count is the pin's derivation, one launch at a time:
+    ///
     /// PIN(2026-09-27): the captured decode step's node count, derived before
     /// the chain was built: the embedding row; each layer's two mixes, three
     /// launches each (the grouped norm with the down projection, the up, the
@@ -315,25 +346,24 @@ mod gate {
     /// gated sum); the PLE site's 5 on layer 1 (the combine, key and value,
     /// gate, conv); the head's 5 (its mix's three, the q8_0 gemv, the argmax):
     /// 1 + 36·22 + 12·29 + 5 + 5.
-    const NODES_DECODE: usize = 1151;
+    const REAL_N_LAYER: usize = 48;
+    const REAL_PLE_LAYER: usize = 1;
+    const REAL_N_QSA: usize = 12;
+    const REAL_N_GDN: usize = 36;
+    const REAL_NODES_DECODE: usize = 1151;
 
     /// PIN(2026-09-27): each layer's go and wait.
-    const MEMOPS: usize = 2 * N_LAYER;
-
-    const _: () =
-        assert!(NODES_DECODE == 1 + N_GDN * 22 + N_QSA * 29 + 5 + 5 && N_GDN + N_QSA == N_LAYER);
+    const REAL_MEMOPS: usize = 2 * REAL_N_LAYER;
 
     /// PIN(2026-09-28): the captured verify's node count at 2, 3 and 4 rows,
-    /// derived before the chain was built: the step's [`NODES_DECODE`], plus
-    /// at more than one row each delta layer's two token-major copies (β and
-    /// α out of the joined projection) and each selecting layer's one (the
+    /// derived before the chain was built: the step's [`REAL_NODES_DECODE`],
+    /// plus at more than one row each delta layer's two token-major copies (β
+    /// and α out of the joined projection) and each selecting layer's one (the
     /// indexer queries); the handoff (one launch writing every row's image),
     /// the go, the wait and the head (its mix's three, one q8_0 gemv over
     /// every row, one argmax) are one each whatever the rows:
     /// 1151 + 36·2 + 12·1.
-    const NODES_VERIFY: usize = 1235;
-
-    const _: () = assert!(NODES_VERIFY == NODES_DECODE + N_GDN * 2 + N_QSA);
+    const REAL_NODES_VERIFY: usize = 1235;
 
     /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
     /// of several slots' rows, derived before the pass was built: the
@@ -343,9 +373,7 @@ mod gate {
     /// pool, the selection's two, the q/k norm, turn and append, the
     /// selected flash's two) — and the copy of a parked slot's rows into its
     /// own: 1 + 1 + 36·2 + 12·8 + 1.
-    const NODES_SLOT: usize = 171;
-
-    const _: () = assert!(NODES_SLOT == 1 + 1 + N_GDN * 2 + N_QSA * 8 + 1);
+    const REAL_NODES_SLOT: usize = 171;
 
     /// PIN(2026-09-29): the layers the gate card's card plan puts routed
     /// experts on, derived before the leg was built: the 48 less the five
@@ -359,7 +387,7 @@ mod gate {
     /// up and the q8_0 downs (`kq_gate_up_act_q5k`, `q8_0_gemv_sel32`), so
     /// `place::host_only` is empty and every layer holds its prefix (93/92 on
     /// the 3090 at 4,096 positions and a ubatch of 4,096, `CARD_PLANS`).
-    const CARD_LAYERS: usize = 48;
+    const REAL_CARD_LAYERS: usize = 48;
 
     /// PIN(2026-09-29): the captured step's and verify's node counts under
     /// the card plan, derived before the leg was built: each card layer's
@@ -369,13 +397,149 @@ mod gate {
     /// 1151 + 5·43 and 1235 + 5·43.
     /// PIN(2026-10-01): over the 48 card layers, the same five launches on
     /// each whatever its types: 1151 + 5·48 and 1235 + 5·48.
-    const NODES_DECODE_CARD: usize = 1391;
-    const NODES_VERIFY_CARD: usize = 1475;
+    const REAL_NODES_DECODE_CARD: usize = 1391;
+    const REAL_NODES_VERIFY_CARD: usize = 1475;
 
-    const _: () = assert!(
-        NODES_DECODE_CARD == NODES_DECODE + 5 * CARD_LAYERS
-            && NODES_VERIFY_CARD == NODES_VERIFY + 5 * CARD_LAYERS
-    );
+    /// The gate's one reading of what the run is made from: the model file
+    /// (`ref_model_path`, a whole fixture under the fixture tier), the host
+    /// load config and the plan's levers (the budget the header records in
+    /// the fixture tier, [`q38::plan_levers`]), and the layer kinds the
+    /// header names. Set once, first thing in `run`, before any load.
+    struct Cfg {
+        path: std::path::PathBuf,
+        host: HostCfg,
+        plan_levers: PlanLevers,
+        shape: Shape,
+        n_expert: usize,
+    }
+
+    static CFG: std::sync::OnceLock<Cfg> = std::sync::OnceLock::new();
+
+    fn cfg() -> &'static Cfg {
+        CFG.get().expect("init runs before any clause")
+    }
+
+    /// The layer kinds the header names ([`q38::Shape`]): never read off the
+    /// loaded body, which the structure clause holds against them.
+    fn shape() -> &'static Shape {
+        &cfg().shape
+    }
+
+    fn n_layer() -> usize {
+        shape().n_layer
+    }
+
+    fn n_qsa() -> usize {
+        shape().n_qsa()
+    }
+
+    fn n_gdn() -> usize {
+        shape().n_gdn()
+    }
+
+    fn nodes_decode() -> usize {
+        shape().nodes_decode()
+    }
+
+    fn memops() -> usize {
+        shape().memops()
+    }
+
+    fn nodes_verify() -> usize {
+        shape().nodes_verify()
+    }
+
+    /// The PLE site's layer: the band of the PLE ring is the error model's
+    /// at the layer that writes it.
+    fn ple_layer() -> Result<usize, GateError> {
+        shape()
+            .ple_layer
+            .ok_or_else(|| "the header lists no PLE site (ple.layers)".into())
+    }
+
+    /// The model file this gate runs on, opened as a split of architecture
+    /// `qwen4exp`.
+    fn open_split() -> Result<Split, GateError> {
+        let path = &cfg().path;
+        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if file.architecture() != Some("qwen4exp") {
+            return Err(format!(
+                "{} is {:?}, not qwen4exp",
+                path.display(),
+                file.architecture()
+            )
+            .into());
+        }
+        Ok(file)
+    }
+
+    /// Read the file's header once: the path the tier names, the levers, the
+    /// plan's budget and the layer kinds; print each derived value beside
+    /// the real file's literal it replaced ([`witnesses`]).
+    fn init() -> Result<bool, GateError> {
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        let path = ref_model_path()?;
+        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::describe(&file)?;
+        let shape = crate::q38_arch::shape_of(&inputs.hp)?;
+        let plan_levers = q38::plan_levers(&file, &levers, 0)?;
+        let n_expert = inputs.hp.n_expert;
+        let cfg = Cfg {
+            path,
+            host: levers.host(),
+            plan_levers,
+            shape,
+            n_expert,
+        };
+        if CFG.set(cfg).is_err() {
+            return Err("the gate's configuration was read twice".into());
+        }
+        witnesses()
+    }
+
+    /// The move proof: each value the header gives, beside the literal the
+    /// real file's gate carried. In the real tier they are equal; the
+    /// fixture tier prints the fixture's own.
+    fn witnesses() -> Result<bool, GateError> {
+        let s = shape();
+        let model = cfg().path.to_string_lossy().into_owned();
+        let mut ok = q38::witness("model file", model, MODEL.to_string());
+        ok &= q38::witness("N_LAYER", s.n_layer, REAL_N_LAYER);
+        ok &= q38::witness("PLE_LAYER", s.ple_layer.unwrap_or(0), REAL_PLE_LAYER);
+        ok &= q38::witness("N_QSA", s.n_qsa(), REAL_N_QSA);
+        ok &= q38::witness("N_GDN", s.n_gdn(), REAL_N_GDN);
+        ok &= q38::witness("NODES_DECODE", s.nodes_decode(), REAL_NODES_DECODE);
+        ok &= q38::witness("MEMOPS", s.memops(), REAL_MEMOPS);
+        ok &= q38::witness("NODES_VERIFY", s.nodes_verify(), REAL_NODES_VERIFY);
+        ok &= q38::witness("NODES_SLOT", s.nodes_slot(), REAL_NODES_SLOT);
+        ok &= q38::witness("IMAGE_TOKEN", s.image_token.unwrap_or(0), REAL_IMAGE_TOKEN);
+        ok &= q38::witness(
+            "plan levers' card budget",
+            cfg().plan_levers.card_budget_bytes,
+            PlanLevers::default().card_budget_bytes,
+        );
+        ok &= q38::witness_card(&card()?);
+        Ok(ok)
+    }
+
+    /// The move proof of the card plan's counts, printed when the card plan
+    /// is loaded: the card layers the plan holds routed experts on, and the
+    /// node counts under them.
+    fn card_witnesses(card_layers: usize) -> bool {
+        let s = shape();
+        let mut ok = q38::witness("CARD_LAYERS", card_layers, REAL_CARD_LAYERS);
+        ok &= q38::witness(
+            "NODES_DECODE_CARD",
+            s.nodes_decode_card(card_layers),
+            REAL_NODES_DECODE_CARD,
+        );
+        ok &= q38::witness(
+            "NODES_VERIFY_CARD",
+            s.nodes_verify_card(card_layers),
+            REAL_NODES_VERIFY_CARD,
+        );
+        ok
+    }
 
     /// Lanes of a delta layer's state, a verify's rows at most.
     const LANES: usize = 4;
@@ -424,9 +588,10 @@ mod gate {
     /// not the router's. A flip-aware bound from a Qwen3.8 forced arm replaces it.
     const FLIP_ERR_CAP: f64 = 2.0;
 
-    /// The selecting layers: every fourth, as the header's interval states.
+    /// The selecting layers the header's interval names (`(il + 1) % interval
+    /// == 0`): every fourth on the real file, every second on the fixture.
     fn qsa_layers() -> Vec<usize> {
-        (0..N_LAYER).filter(|l| l % 4 == 3).collect()
+        shape().qsa.clone()
     }
 
     /// The stores' bytes at [`CTX`] rows, derived from the header: each
@@ -443,7 +608,7 @@ mod gate {
         let rec = LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + CONV_RING * conv_ch * 4;
         let sel = CTX * (2 * N_KV * HEAD * 2 + IDX_DIM * 2) + CTX.div_ceil(POOL) * IDX_DIM * 2;
         let ple = ((PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS) * STREAMS * HIDDEN * 4;
-        N_GDN * rec + N_QSA * sel + ple
+        n_gdn() * rec + n_qsa() * sel + ple
     }
 
     /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
@@ -505,22 +670,57 @@ mod gate {
         Ok(ik[at..].to_vec())
     }
 
+    /// Whether our last argmax `top` is ik's `result_output` argmax, and
+    /// ik's as the line prints it: an oracle clause, which the fixture tier
+    /// leaves to the real one (true, and `not compared`).
+    fn ik_argmax(
+        man: &RefManifest,
+        vocab: usize,
+        clause: &str,
+        top: u32,
+    ) -> Result<(bool, String), GateError> {
+        if !q38::clause(&format!("{clause} against ik's"), Tag::Oracle)? {
+            return Ok((true, "not compared in this tier".to_string()));
+        }
+        let ik_top = argmax(&ik_last(man, vocab)?);
+        Ok((top == ik_top, ik_top.to_string()))
+    }
+
+    /// What a load made: the model, the tier its plan reads the PLE table
+    /// from, and what the plan holds on the card.
+    struct Opened {
+        model: Qwen38Model,
+        ple_tier: Option<Device>,
+        card: CardPlan,
+    }
+
+    /// The plan's routed experts on the card: the layers that hold any, and
+    /// each layer's count (`Plan::n_l`) — the plan's own, read before the
+    /// body is built, so the structure clause holds the body to it.
+    struct CardPlan {
+        layers: usize,
+        n_l: Vec<u64>,
+    }
+
+    /// The card a plan is made on: the real tier's the gate runner's
+    /// (the 3090's bytes on the card in view), the fixture tier's `a`
+    /// (`q38_fixture::card`).
+    fn card() -> Result<model::placement::workstation::CardSpec, GateError> {
+        q38::card(crate::gate_card::card)
+    }
+
     /// The model placed on the gate card by its plan, the routed experts
-    /// where `experts` says under the placement's `plan_levers`.
-    fn open(experts: Experts, plan_levers: &PlanLevers) -> Result<Qwen38Model, GateError> {
-        open_slots(experts, plan_levers, 1)
+    /// where `experts` says under the placement's levers ([`Cfg`]).
+    fn open(experts: Experts) -> Result<Qwen38Model, GateError> {
+        open_slots(experts, 1)
     }
 
     /// [`open`] for a load that serves `slots` resident sequences
     /// ([`Body38::open_placed_slots`]): the plan counts them
     /// ([`PlanInputs::plan_with_slots`]).
-    fn open_slots(
-        experts: Experts,
-        plan_levers: &PlanLevers,
-        slots: usize,
-    ) -> Result<Qwen38Model, GateError> {
+    fn open_slots(experts: Experts, slots: usize) -> Result<Qwen38Model, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        Ok(open_at(experts, plan_levers, slots, ub, None)?.0)
+        Ok(open_at(experts, slots, ub, None)?.model)
     }
 
     /// [`open_slots`] at a ubatch of `ub`, the host's room the reading's or
@@ -528,16 +728,11 @@ mod gate {
     /// PLE table from, which the plan line names.
     fn open_at(
         experts: Experts,
-        plan_levers: &PlanLevers,
         slots: usize,
         ub: usize,
         room: Option<u64>,
-    ) -> Result<(Qwen38Model, Option<Device>), GateError> {
-        let levers = bloomery_levers::at_main(&[])?;
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        if file.architecture() != Some("qwen4exp") {
-            return Err(format!("{MODEL} is {:?}, not qwen4exp", file.architecture()).into());
-        }
+    ) -> Result<Opened, GateError> {
+        let file = open_split()?;
         let t = Instant::now();
         // `describe`, not `read`: `read` refuses the chat surface's two
         // items too; `open_placed` refuses what `ALLOWED` does not name.
@@ -545,28 +740,29 @@ mod gate {
         if let Some(r) = room {
             inputs.room = (r, HostRead::Given);
         }
-        let machine = machine_for_experts(
-            crate::gate_card::card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-            experts,
-        );
-        let plan = inputs.plan_with_slots(&machine, CTX as u64, plan_levers, experts, slots)?;
+        let card = card()?;
+        let machine =
+            machine_for_experts(card, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
+        let plan =
+            inputs.plan_with_slots(&machine, CTX as u64, &cfg().plan_levers, experts, slots)?;
         let held = plan.n_l.iter().filter(|&&n| n > 0).count();
         let tier = plan.row_tier()?;
         println!(
             "plan card={} experts={experts:?} slots={slots} ctx_max={} ubatch={ub} host_experts={} \
-             card_experts={} card_layers={held} ple={} room={} read={} row_reserve={}",
-            crate::gate_card::card()?.name,
+             card_experts={} card_layers={held} ple={} room={} read={} row_reserve={} \
+             card_budget={:?}",
+            card.name,
             plan.ctx_max,
             plan.host.experts,
             plan.cards[0].experts,
             tier_word(tier),
             inputs.room.0,
             inputs.room.1.word(),
-            plan.host.row_reserve_bytes
+            plan.host.row_reserve_bytes,
+            cfg().plan_levers.card_budget_bytes
         );
-        let mut m = Body38::open_placed_slots(file, &plan, &inputs, 0, levers.host(), ub, slots)?;
+        let n_l = plan.n_l.clone();
+        let mut m = Body38::open_placed_slots(file, &plan, &inputs, 0, cfg().host, ub, slots)?;
         m.set_mode(StepMode::Graph);
         println!(
             "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
@@ -574,7 +770,11 @@ mod gate {
             m.layers().len(),
             t.elapsed().as_secs_f64()
         );
-        Ok((m, tier))
+        Ok(Opened {
+            model: m,
+            ple_tier: tier,
+            card: CardPlan { layers: held, n_l },
+        })
     }
 
     /// A plan's PLE tier as the plan line prints it.
@@ -598,27 +798,28 @@ mod gate {
             .filter(|&l| kinds[l] == LayerKind38::Qsa)
             .collect();
         let (stores, want_stores) = (body.store_bytes(), store_bytes());
-        let mut ok = kinds.len() == N_LAYER && qsa == qsa_layers() && stores == want_stores;
+        let mut ok = kinds.len() == n_layer() && qsa == qsa_layers() && stores == want_stores;
         println!(
             "structure layers={} selecting at {qsa:?}; store bytes {stores} (want {want_stores}, \
              derived) {}",
             kinds.len(),
             verdict(ok)
         );
-        let (counted, memops) = body.step_launches();
+        let (counted, memops_counted) = body.step_launches();
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let pass = nodes == NODES_DECODE
-            && counted == NODES_DECODE
-            && memops == MEMOPS
-            && b == MEMOPS
-            && k == NODES_DECODE - MEMOPS
+        let (want_nodes, want_memops) = (nodes_decode(), memops());
+        let pass = nodes == want_nodes
+            && counted == want_nodes
+            && memops_counted == want_memops
+            && b == want_memops
+            && k == want_nodes - want_memops
             && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {NODES_DECODE}; the program counts \
-             {counted}, {memops} of them batch_mem_op) kernel={k} batch_mem_op={b} (want \
-             {MEMOPS}) other={other} {}",
+            "structure decode graph_nodes={nodes} (want {want_nodes}; the program counts \
+             {counted}, {memops_counted} of them batch_mem_op) kernel={k} batch_mem_op={b} (want \
+             {want_memops}) other={other} {}",
             verdict(pass)
         );
         ok &= pass;
@@ -798,7 +999,7 @@ mod gate {
     ) -> Result<Vec<Vec<Option<f64>>>, GateError> {
         let row = STREAMS * HIDDEN;
         let n = taps.len();
-        (0..N_LAYER)
+        (0..n_layer())
             .map(|l| {
                 let ik = tap(man, &format!("l_out-{l}"))?;
                 let kept = ik.len() / row;
@@ -929,17 +1130,12 @@ mod gate {
     }
 
     /// The free clause's verdict, and by position the first layer a flip
-    /// lies on the path of ([`N_LAYER`] where none does).
+    /// lies on the path of ([`n_layer`] where none does). Every route tap
+    /// the top ten of its own logits is a self-consistency clause; the
+    /// layer outputs against ik's, the flips against ik's routing and the
+    /// last argmax against ik's are the oracle's, and the fixture tier
+    /// leaves them to the real one (no flip is then on any path).
     fn free(man: &RefManifest, eager: &Run, vocab: usize) -> Result<(bool, Vec<usize>), GateError> {
-        let table = layer_table(man, &eager.taps)?;
-        for (l, row) in table.iter().enumerate() {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|e| e.map_or("-".to_string(), |e| format!("{e:.3e}")))
-                .collect();
-            println!("free table layer={l} l_out_rel by tap {}", cells.join(" "));
-        }
-        let mut flips = Vec::new();
         let mut inconsistent = Vec::new();
         for (t, routes) in eager.routes.iter().enumerate() {
             for (l, r) in routes.iter().enumerate() {
@@ -955,7 +1151,22 @@ mod gate {
             &inconsistent[..inconsistent.len().min(8)],
             verdict(inconsistent.is_empty())
         );
-        for l in 0..N_LAYER {
+        if !q38::clause(
+            "(c) free: each layer's output, each route and the last argmax against ik's",
+            Tag::Oracle,
+        )? {
+            return Ok((inconsistent.is_empty(), vec![n_layer(); eager.taps.len()]));
+        }
+        let table = layer_table(man, &eager.taps)?;
+        for (l, row) in table.iter().enumerate() {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|e| e.map_or("-".to_string(), |e| format!("{e:.3e}")))
+                .collect();
+            println!("free table layer={l} l_out_rel by tap {}", cells.join(" "));
+        }
+        let mut flips = Vec::new();
+        for l in 0..n_layer() {
             let ik = IkRoute::read(man, l)?;
             if ik.tokens() != eager.routes.len() {
                 return Err(format!(
@@ -993,9 +1204,9 @@ mod gate {
         }
         let firsts: Vec<usize> = (0..eager.taps.len())
             .map(|t| {
-                (0..N_LAYER)
+                (0..n_layer())
                     .find(|&l| on_path(&flips, l, t))
-                    .unwrap_or(N_LAYER)
+                    .unwrap_or(n_layer())
             })
             .collect();
         println!(
@@ -1035,14 +1246,36 @@ mod gate {
     /// The step of set `name` after its prefill fed by `path`; its argmax
     /// against ik's, a tie named and counted; with `band` — the batch set's
     /// tokens and the first layer a flip lies on the path of its last
-    /// position — its layer outputs below that layer held to the band.
+    /// position — its layer outputs below that layer held to the band. The
+    /// whole comparison is an oracle clause: the fixture tier leaves it to
+    /// the real one, and runs the step only when another clause reads its
+    /// run (`feeds`: (q) reads D3K's step-fed run), returning the empty run
+    /// when it does not.
     fn step_set(
         m: &mut Qwen38Model,
         name: &str,
         path: Prompt38,
-        band: Option<(&[u32], usize)>,
+        (band, feeds): (Option<(&[u32], usize)>, bool),
         ties: &mut usize,
     ) -> Result<(bool, Run), GateError> {
+        let vs_ik = q38::clause(
+            &format!(
+                "(t) step set {name} fed by {}: argmax, layer outputs and logits against ik's",
+                path.name()
+            ),
+            Tag::Oracle,
+        )?;
+        if !vs_ik && !feeds {
+            let none = Run {
+                tokens: Vec::new(),
+                logits: Vec::new(),
+                taps: Vec::new(),
+                routes: Vec::new(),
+                stores: Vec::new(),
+                ple_ring: Vec::new(),
+            };
+            return Ok((true, none));
+        }
         let man = RefManifest::open(&data_dir().join(name), &IK)?;
         let (pos, step, prefill) = man.step()?;
         let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
@@ -1067,6 +1300,16 @@ mod gate {
             m.prompt38(&prefill, path)?;
         }
         let r = run_last(m, tok)?;
+        if !vs_ik {
+            println!(
+                "step {name}: position {pos} after {} fed by {} ({:.1} s, runtime value); \
+                 compared with ik's in the real tier only",
+                prefill.len(),
+                path.name(),
+                t.elapsed().as_secs_f64()
+            );
+            return Ok((true, r));
+        }
         let vocab = m.body("step_set")?.vocab();
         let ik = ik_last(&man, vocab)?;
         let ours = r.logits.last().ok_or("no logits")?;
@@ -1386,18 +1629,19 @@ mod gate {
         let argmax = named(&|n| n.contains("argmax"));
         let cols = named(&|n| n == "ds41_ffn_handoff_10_cols");
         let one = named(&|n| n == "ds41_ffn_handoff_10");
+        let (want_memops, layers) = (memops(), n_layer());
         let ok = nodes == want
             && counted == want
-            && b == MEMOPS
+            && b == want_memops
             && other == 0
             && argmax == 1
-            && cols == N_LAYER
+            && cols == layers
             && one == 0;
         println!(
             "verify structure T={T}: graph_nodes={nodes} (want {want}; the program counts \
-             {counted}) batch_mem_op={b} (want {MEMOPS}) other={other}; argmax launches {argmax} \
-             (want 1: one head of {T} rows); ds41_ffn_handoff_10_cols {cols} (want {N_LAYER}), \
-             ds41_ffn_handoff_10 {one} (want 0) {}",
+             {counted}) batch_mem_op={b} (want {want_memops}) other={other}; argmax launches \
+             {argmax} (want 1: one head of {T} rows); ds41_ffn_handoff_10_cols {cols} (want \
+             {layers}), ds41_ffn_handoff_10 {one} (want 0) {}",
             verdict(ok)
         );
         Ok(ok)
@@ -1441,11 +1685,12 @@ mod gate {
         let all = refs.last().ok_or("the reference of four rows")?;
         let rows_ok = v.tokens[..] == all.tokens[..T]
             && (0..T).all(|r| same_bits(&v.logits[r], &all.logits[r]));
-        let services = served == [N_LAYER as u64; 3];
+        let layers = n_layer();
+        let services = served == [layers as u64; 3];
         ok &= rows_ok && services;
         println!(
             "verify {label}: every row's token and logits bit for bit the steps' {rows_ok}; the \
-             replay's services, host calls and Cols services {served:?} (want {N_LAYER} each: \
+             replay's services, host calls and Cols services {served:?} (want {layers} each: \
              one go, one union call and one wait a layer) {}",
             verdict(rows_ok && services)
         );
@@ -1455,9 +1700,9 @@ mod gate {
     fn verify_clause(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
         let (rows, next) = verify_rows(toks)?;
         let mut ok = true;
-        ok &= verify_structure::<2>(m, NODES_VERIFY)?;
-        ok &= verify_structure::<3>(m, NODES_VERIFY)?;
-        ok &= verify_structure::<4>(m, NODES_VERIFY)?;
+        ok &= verify_structure::<2>(m, nodes_verify())?;
+        ok &= verify_structure::<3>(m, nodes_verify())?;
+        ok &= verify_structure::<4>(m, nodes_verify())?;
         let refs = (1..=LANES)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
             .collect::<Result<Vec<_>, _>>()?;
@@ -2226,13 +2471,13 @@ mod gate {
         let after = m.body("gemm_free")?.ubatch_split();
         let pass = &pass_run;
         let vocab = m.body("gemm_free")?.vocab();
-        let ik_top = argmax(&ik_last(man, vocab)?);
         let (last, top) = (free.tokens[0], argmax(&free.logits[0]));
-        let mut ok = top == ik_top && last == top;
+        let (ik_ok, ik_text) = ik_argmax(man, vocab, "(g) free: the last argmax", top)?;
+        let mut ok = ik_ok && last == top;
         println!(
-            "gemm free: last argmax ours={top} (returned {last}) ik={ik_top} (the pass's {:?}) {}",
+            "gemm free: last argmax ours={top} (returned {last}) ik={ik_text} (the pass's {:?}) {}",
             pass.tokens,
-            verdict(top == ik_top && last == top)
+            verdict(ik_ok && last == top)
         );
         let want = format!("the last ubatch walk ran 0..{n}");
         let named = matches!(&ask, Err(e) if e.to_string().contains(&want));
@@ -2257,7 +2502,7 @@ mod gate {
             })
             .collect();
         let taps_ok = routes.len() == n
-            && routes.iter().all(|ls| ls.len() == N_LAYER)
+            && routes.iter().all(|ls| ls.len() == n_layer())
             && inconsistent.is_empty();
         ok &= taps_ok;
         println!(
@@ -2283,16 +2528,17 @@ mod gate {
             verdict(flips_ok)
         );
         let (layers, ple) = live_rel(&free, pass, n);
+        let shown: Vec<usize> = (0..layers.len())
+            .filter(|l| l % 8 == 0 || l + 1 == n_layer())
+            .collect();
         println!(
-            "gemm free: last logits' distance from the pass's {:.3e}, stores' at layers 0, 8, \
-             .., 47 {:?}, PLE ring {ple:.3e} (printed: the flips move them; the forced arm holds \
-             the bands)",
+            "gemm free: last logits' distance from the pass's {:.3e}, stores' at layers {shown:?} \
+             {:?}, PLE ring {ple:.3e} (printed: the flips move them; the forced arm holds the \
+             bands)",
             rel(&free.logits[0], pass.logits.last().ok_or("no pass logits")?),
-            layers
+            shown
                 .iter()
-                .enumerate()
-                .filter(|(l, _)| l % 8 == 0 || l + 1 == N_LAYER)
-                .map(|(_, e)| format!("{e:.3e}"))
+                .map(|&l| format!("{:.3e}", layers[l]))
                 .collect::<Vec<_>>()
         );
         let split_ok = split.is_some() && after.is_none();
@@ -2383,7 +2629,7 @@ mod gate {
                 }
             }
         }
-        let cells = n * N_LAYER;
+        let cells = n * n_layer();
         let ids_ok = routes.len() == n && taken == cells;
         let mut ok = ids_ok;
         println!(
@@ -2393,19 +2639,19 @@ mod gate {
             verdict(ids_ok)
         );
         let vocab = m.body("gemm_forced")?.vocab();
-        let ik_top = argmax(&ik_last(man, vocab)?);
         let (last, top) = (forced.tokens[0], argmax(&forced.logits[0]));
-        let argmax_ok = top == ik_top && last == top;
+        let (ik_ok, ik_text) = ik_argmax(man, vocab, "(g) forced: the last argmax", top)?;
+        let argmax_ok = ik_ok && last == top;
         ok &= argmax_ok;
         let logits_rel = rel(
             &forced.logits[0],
             pass.logits.last().ok_or("no pass logits")?,
         );
-        let head_band = gemm_band(N_LAYER - 1);
+        let head_band = gemm_band(n_layer() - 1);
         let logits_ok = logits_rel <= head_band;
         ok &= logits_ok;
         println!(
-            "gemm forced: last argmax ours={top} (returned {last}) ik={ik_top}; last logits' \
+            "gemm forced: last argmax ours={top} (returned {last}) ik={ik_text}; last logits' \
              distance from the pass's {logits_rel:.3e} (band {head_band:.3e}) {}",
             verdict(argmax_ok && logits_ok)
         );
@@ -2423,17 +2669,18 @@ mod gate {
                 );
             }
         }
-        let ple_ok = ple <= gemm_band(1);
-        let stores_ok = layers.len() == N_LAYER && past.is_empty() && ple_ok;
+        let ple_band = gemm_band(ple_layer()?);
+        let ple_ok = ple <= ple_band;
+        let stores_ok = layers.len() == n_layer() && past.is_empty() && ple_ok;
         ok &= stores_ok;
         println!(
             "gemm forced: every layer's store within its band, past it at {past:?}; PLE ring \
              {ple:.3e} (band {:.3e}) {}",
-            gemm_band(1),
+            ple_band,
             verdict(stores_ok)
         );
         let (mut worst, mut wl, mut peak) = (0.0f64, 0usize, 0.0f64);
-        for l in 0..N_LAYER {
+        for l in 0..n_layer() {
             let (mut rel_l, mut peak_l) = (0.0f64, 0.0f64);
             for (ours, theirs) in routes.iter().zip(&eager.routes) {
                 let (Some(o), Some(p)) = (ours.get(l), theirs.get(l)) else {
@@ -2453,7 +2700,7 @@ mod gate {
                 (worst, wl) = (rel_l / gemm_band(l), l);
             }
             peak = peak.max(peak_l / (3.0 * gemm_band(l)));
-            if l % 8 == 0 || l + 1 == N_LAYER {
+            if l % 8 == 0 || l + 1 == n_layer() {
                 println!(
                     "gemm forced: layer {l} router logits' error over their spread, worst over \
                      positions {rel_l:.3e} (the input's band {:.3e}); peak {peak_l:.3e} (the margin \
@@ -2579,7 +2826,7 @@ mod gate {
             true,
         );
         ok &= gemm_timed(m, &prefill, &one)?;
-        ok &= step_set(m, D3K, Prompt38::Gemm, None, ties)?.0;
+        ok &= step_set(m, D3K, Prompt38::Gemm, (None, false), ties)?.0;
         Ok(ok)
     }
 
@@ -2630,10 +2877,11 @@ mod gate {
             ),
             None => (0, 0, 0),
         };
-        let rec_ok = ubatches == 1 && rows == N_LAYER && spans == N_LAYER;
+        let layers = n_layer();
+        let rec_ok = ubatches == 1 && rows == layers && spans == layers;
         println!(
             "gemm {D3K}: the timed walk's record: {ubatches} ubatch(es) (want 1), {rows} layer rows \
-             (want {N_LAYER}), {spans} with every card span read (want {N_LAYER}) {}",
+             (want {layers}), {spans} with every card span read (want {layers}) {}",
             verdict(rec_ok)
         );
         ok &= rec_ok;
@@ -2711,8 +2959,12 @@ mod gate {
         }
     }
 
+    /// The layer (g)'s map refusals plant their map on: the real file's layer
+    /// 7, or the file's last layer where it has fewer.
+    const PLANT_LAYER: usize = 7;
+
     /// (g) the map refusals: with a slot map planted (`Body38::plant_slot_map`)
-    /// that holds expert 3 of layer 7 on the tier card, each walk's call after
+    /// that holds expert 3 of the planted layer on the tier card, each walk's call after
     /// the prefix is refused by name — the walk, the layer and the count —
     /// before anything moves, the position kept and the model not poisoned.
     /// With the plant taken back the same call runs. The plant is taken back
@@ -2721,10 +2973,11 @@ mod gate {
         let mode = m.mode();
         let (rows, _) = verify_rows(toks)?;
         let rows = [rows[0], rows[1]];
+        let at = PLANT_LAYER.min(n_layer() - 1);
         let planted = |entry: u32| -> Result<SlotMap, GateError> {
-            let mut entries = vec![HOST; N_LAYER * N_EXPERT];
-            entries[7 * N_EXPERT + 3] = entry;
-            Ok(SlotMap::from_rows(0..N_LAYER, N_EXPERT, entries)?)
+            let mut entries = vec![HOST; n_layer() * N_EXPERT];
+            entries[at * N_EXPERT + 3] = entry;
+            Ok(SlotMap::from_rows(0..n_layer(), N_EXPERT, entries)?)
         };
         let tier = planted(Slot::Tier { tier: 0, slot: 0 }.entry()?)?;
         let cases = [
@@ -2743,7 +2996,7 @@ mod gate {
             let got = w.run(m, toks, rows);
             m.body_parts("map_refusals")?.2.plant_slot_map(None)?;
             let want = format!(
-                "the {} walk has no {leg}: layer 7 holds 1 routed experts on the {device}",
+                "the {} walk has no {leg}: layer {at} holds 1 routed experts on the {device}",
                 w.name()
             );
             let named = matches!(&got, Err(e) if e.to_string().contains(&want));
@@ -2753,7 +3006,7 @@ mod gate {
             let line_ok = named && kept && again.is_ok();
             ok &= line_ok;
             println!(
-                "map refusal, {}: a slot map with expert 3 of layer 7 on the {device} at \
+                "map refusal, {}: a slot map with expert 3 of layer {at} on the {device} at \
                  position {before} -> {}; position {pos} (kept, not poisoned: {kept}); the same \
                  call with the plant taken back: {} {}",
                 w.name(),
@@ -2804,30 +3057,57 @@ mod gate {
         }
     }
 
-    /// (k) structure under the card plan: [`CARD_LAYERS`] layers run the
-    /// leg, and the captured step holds [`NODES_DECODE_CARD`] nodes,
-    /// [`MEMOPS`] of them batch mem ops, as the program counts.
-    fn card_structure(m: &mut Qwen38Model) -> Result<bool, GateError> {
+    /// (k) structure under the card plan, against the plan's own counts: the
+    /// body runs the leg on exactly the layers the plan holds routed experts
+    /// on, the captured step holds the header's node count plus the leg's
+    /// five launches on each of them, [`memops`] of them batch mem ops, as
+    /// the program counts. In the fixture tier the plan is also held to its
+    /// contract: the header's budget puts half the experts
+    /// (`n_expert / 2`) on the card of every card layer — a budget one
+    /// granule off leaves a layer one expert short.
+    fn card_structure(m: &mut Qwen38Model, plan: &CardPlan) -> Result<bool, GateError> {
         let nodes = m.capture_step()?;
         let body = m.body("card_structure")?;
-        let (layers, (counted, memops)) = (body.card_layers(), body.step_launches());
+        let (layers, (counted, memops_counted)) = (body.card_layers(), body.step_launches());
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let ok = layers == CARD_LAYERS
-            && nodes == NODES_DECODE_CARD
-            && counted == NODES_DECODE_CARD
-            && memops == MEMOPS
-            && b == MEMOPS
-            && k == NODES_DECODE_CARD - MEMOPS
+        let want_nodes = shape().nodes_decode_card(plan.layers);
+        let want_memops = memops();
+        let ok = layers == plan.layers
+            && nodes == want_nodes
+            && counted == want_nodes
+            && memops_counted == want_memops
+            && b == want_memops
+            && k == want_nodes - want_memops
             && other == 0;
         println!(
-            "card leg structure: card layers {layers} (want {CARD_LAYERS}); decode graph_nodes=\
-             {nodes} (want {NODES_DECODE_CARD}; the program counts {counted}, {memops} of them \
-             batch_mem_op) kernel={k} batch_mem_op={b} (want {MEMOPS}) other={other} {}",
+            "card leg structure: card layers {layers} (want {}, the plan's); decode graph_nodes=\
+             {nodes} (want {want_nodes}; the program counts {counted}, {memops_counted} of them \
+             batch_mem_op) kernel={k} batch_mem_op={b} (want {want_memops}) other={other} {}",
+            plan.layers,
             verdict(ok)
         );
-        Ok(ok)
+        let held = |on: &dyn Fn(u64) -> bool| plan.n_l.iter().filter(|&&n| on(n)).count();
+        let fixture = q38::tier()? == bloomery_gpu_gates::tier::Tier::Fixture;
+        let want_each = (cfg().n_expert / 2) as u64;
+        let contract = !fixture || plan.n_l.iter().all(|&n| n == want_each);
+        println!(
+            "card leg plan: {} of {} layers hold routed experts on the card, a layer's count \
+             {:?}..{:?}{} {}",
+            held(&|n| n > 0),
+            plan.n_l.len(),
+            plan.n_l.iter().min(),
+            plan.n_l.iter().max(),
+            if fixture {
+                format!(" (want {want_each} on every layer: half the experts, the header's budget)")
+            } else {
+                " (the real file's counts are `qwen4exp_meta`'s CARD_PLANS)".to_string()
+            },
+            verdict(contract)
+        );
+        let witnessed = card_witnesses(plan.layers);
+        Ok(ok && contract && witnessed)
     }
 
     /// PIN(2026-09-29): the card plan's layer outputs against the host
@@ -2971,7 +3251,7 @@ mod gate {
         };
         let (mut held, mut past, mut worst) = (0usize, Vec::new(), 0.0f64);
         for (t, (a, b)) in card.taps.iter().zip(&host.taps).enumerate() {
-            for l in 0..N_LAYER {
+            for l in 0..n_layer() {
                 let e = match (a.get(l * row..(l + 1) * row), b.get(l * row..(l + 1) * row)) {
                     (Some(x), Some(y)) => rel(x, y),
                     _ => f64::INFINITY,
@@ -2994,7 +3274,7 @@ mod gate {
             &past[..past.len().min(8)],
             verdict(layers_ok)
         );
-        let band = card_band(N_LAYER - 1);
+        let band = card_band(n_layer() - 1);
         let mut ties = 0usize;
         for (t, (a, b)) in card.logits.iter().zip(&host.logits).enumerate() {
             let (top, want) = (argmax(a), argmax(b));
@@ -3033,8 +3313,9 @@ mod gate {
     /// logits and every store bit for bit, and a verify of 2, 3 and 4 rows
     /// kept whole returns every row's token and logits bit for bit the
     /// steps' — the leg's kernels are independent per slot and column; each
-    /// verify's graph holds [`NODES_VERIFY_CARD`] nodes.
-    fn card_rows(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+    /// verify's graph holds the header's verify nodes plus the leg's five
+    /// launches on each of the plan's card layers.
+    fn card_rows(m: &mut Qwen38Model, toks: &[u32], plan: &CardPlan) -> Result<bool, GateError> {
         let eager = run_steps(m, toks, StepMode::Eager, true)?;
         let graph = run_steps(m, toks, StepMode::Graph, true)?;
         let mut ok = same_run(
@@ -3050,9 +3331,10 @@ mod gate {
             &graph,
             true,
         );
-        ok &= verify_structure::<2>(m, NODES_VERIFY_CARD)?;
-        ok &= verify_structure::<3>(m, NODES_VERIFY_CARD)?;
-        ok &= verify_structure::<4>(m, NODES_VERIFY_CARD)?;
+        let want = shape().nodes_verify_card(plan.layers);
+        ok &= verify_structure::<2>(m, want)?;
+        ok &= verify_structure::<3>(m, want)?;
+        ok &= verify_structure::<4>(m, want)?;
         let (rows, next) = verify_rows(toks)?;
         let refs = (1..=LANES)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
@@ -3088,7 +3370,7 @@ mod gate {
                 taken += usize::from(o.ids == p.ids);
             }
         }
-        let cells = n * N_LAYER;
+        let cells = n * n_layer();
         let ids_ok = routes.len() == n && taken == cells;
         let mut ok = ids_ok;
         println!(
@@ -3097,19 +3379,19 @@ mod gate {
             verdict(ids_ok)
         );
         let vocab = m.body("card_gemm")?.vocab();
-        let ik_top = argmax(&ik_last(man, vocab)?);
         let (last, top) = (forced.tokens[0], argmax(&forced.logits[0]));
-        let argmax_ok = top == ik_top && last == top;
+        let (ik_ok, ik_text) = ik_argmax(man, vocab, "(k)(iii) card gemm: the last argmax", top)?;
+        let argmax_ok = ik_ok && last == top;
         ok &= argmax_ok;
         let logits_rel = rel(
             &forced.logits[0],
             pass.logits.last().ok_or("no pass logits")?,
         );
-        let head_band = gemm_band(N_LAYER - 1);
+        let head_band = gemm_band(n_layer() - 1);
         let logits_ok = logits_rel <= head_band;
         ok &= logits_ok;
         println!(
-            "card leg gemm: last argmax ours={top} (returned {last}) ik={ik_top}; last logits' \
+            "card leg gemm: last argmax ours={top} (returned {last}) ik={ik_text}; last logits' \
              distance from the pass's {logits_rel:.3e} (band {head_band:.3e}) {}",
             verdict(argmax_ok && logits_ok)
         );
@@ -3120,13 +3402,14 @@ mod gate {
             .filter(|&(l, &e)| e > gemm_band(l) || e.is_nan())
             .map(|(l, _)| l)
             .collect();
-        let ple_ok = ple <= gemm_band(1);
-        let stores_ok = layers.len() == N_LAYER && past.is_empty() && ple_ok;
+        let ple_band = gemm_band(ple_layer()?);
+        let ple_ok = ple <= ple_band;
+        let stores_ok = layers.len() == n_layer() && past.is_empty() && ple_ok;
         ok &= stores_ok;
         println!(
             "card leg gemm: every layer's store within its band, past it at {past:?}; PLE ring \
              {ple:.3e} (band {:.3e}) {}",
-            gemm_band(1),
+            ple_band,
             verdict(stores_ok)
         );
         // The batch set, one free walk and two cut, bit for bit.
@@ -3193,8 +3476,13 @@ mod gate {
     /// dropped first), then its structure, the places entry's rule, (i)
     /// against `host`, (ii) and (iii).
     fn card_leg(toks: &[u32], host: &Run, man: &RefManifest) -> Result<bool, GateError> {
-        let mut m = match open(Experts::Card, &PlanLevers::default()) {
-            Ok(m) => m,
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        let Opened {
+            model: mut m,
+            card: plan,
+            ..
+        } = match open_at(Experts::Card, 1, ub, None) {
+            Ok(o) => o,
             Err(e) => {
                 println!(
                     "card leg: the card plan's load FAILED: {e} {}",
@@ -3203,10 +3491,10 @@ mod gate {
                 return Ok(false);
             }
         };
-        let mut ok = guarded("structure", &mut m, card_structure)?;
+        let mut ok = guarded("structure", &mut m, |m| card_structure(m, &plan))?;
         ok &= guarded("places rule", &mut m, places_rule)?;
         ok &= guarded("vs host", &mut m, |m| card_vs_host(m, toks, host))?;
-        ok &= guarded("rows", &mut m, |m| card_rows(m, toks))?;
+        ok &= guarded("rows", &mut m, |m| card_rows(m, toks, &plan))?;
         ok &= guarded("gemm", &mut m, |m| card_gemm(m, man, toks))?;
         Ok(ok)
     }
@@ -3243,12 +3531,16 @@ mod gate {
         );
         m.reset()?;
         m.step(&[0])?;
+        // The placeholder is the header's (`ple.image_token_id`).
+        let image = shape()
+            .image_token
+            .ok_or("the header lists no image placeholder (ple.image_token_id)")?;
         // A step refuses its one token; a pass refuses the whole pass before
         // any row of it runs.
         for (path, ids) in [
-            (Prompt38::Step, &[IMAGE_TOKEN][..]),
-            (Prompt38::Pass, &[1, IMAGE_TOKEN][..]),
-            (Prompt38::Gemm, &[1, IMAGE_TOKEN][..]),
+            (Prompt38::Step, &[image][..]),
+            (Prompt38::Pass, &[1, image][..]),
+            (Prompt38::Gemm, &[1, image][..]),
         ] {
             let before = m.pos();
             let got = m.prompt38(ids, path);
@@ -3257,7 +3549,7 @@ mod gate {
             let kept = m.pos() == before && m.poisoned().is_none();
             ok &= named && kept;
             println!(
-                "refusal: the image placeholder {IMAGE_TOKEN} by {} at position {before} -> {}; \
+                "refusal: the image placeholder {image} by {} at position {before} -> {}; \
                  position {} (kept: {kept}) {}",
                 path.name(),
                 match &got {
@@ -3324,21 +3616,20 @@ mod gate {
     /// [`open_slots`], stream 0 window A by the pass path and stream 1
     /// window B by the ubatch path, each from [`fresh`] (the selecting
     /// planes filled, which [`slot_digest`] reads whole).
-    struct Slots38<'a> {
+    struct Slots38 {
         experts: Experts,
-        plan_levers: &'a PlanLevers,
         a: Vec<u32>,
         b: Vec<u32>,
     }
 
-    impl SlotsAdapter for Slots38<'_> {
+    impl SlotsAdapter for Slots38 {
         type Body = Body38;
 
         const STEPS: usize = 8;
         const TAIL: usize = 4;
 
         fn open(&self, slots: usize) -> Result<Qwen38Model, GateError> {
-            open_slots(self.experts, self.plan_levers, slots)
+            open_slots(self.experts, slots)
         }
 
         fn rewind(&self, m: &mut Qwen38Model) -> Result<(), GateError> {
@@ -3398,13 +3689,14 @@ mod gate {
         }
     }
 
-    impl PassAdapter for Slots38<'_> {
-        /// [`NODES_SLOT`].
+    impl PassAdapter for Slots38 {
+        /// The header's slot nodes ([`Shape::nodes_slot`]).
         fn added_slot_launches(&self, _m: &Qwen38Model) -> Result<Launches, GateError> {
+            let (gdn, qsa) = (n_gdn(), n_qsa());
             Ok(Launches {
-                n: NODES_SLOT,
+                n: shape().nodes_slot(),
                 terms: format!(
-                    "the embedding 1 + the PLE conv 1 + {N_GDN} delta layers' 2 + {N_QSA} \
+                    "the embedding 1 + the PLE conv 1 + {gdn} delta layers' 2 + {qsa} \
                      selecting layers' 8 + the parked rows' copy 1"
                 ),
             })
@@ -3427,7 +3719,7 @@ mod gate {
     /// arena-row buffers (`(1 + PASS_ROWS) · STREAMS · HIDDEN` f32,
     /// `seq38_bytes`' rows term) — and at one slot is the plan every other
     /// clause loads by.
-    fn slots_plan(experts: Experts, plan_levers: &PlanLevers) -> Result<bool, GateError> {
+    fn slots_plan(experts: Experts) -> Result<bool, GateError> {
         let seq = {
             use runtime::stores as st;
             let rec = st::recurrent_bytes(V_HEADS, K_HEADS, HEAD_V, CONV)
@@ -3435,18 +3727,19 @@ mod gate {
             let sel = st::selecting_bytes(N_KV, HEAD, IDX_DIM, POOL, CTX);
             let ple = st::ple_ring_bytes(PLE_TAPS, PLE_DILATION, STREAMS, HIDDEN);
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
-            u64::try_from(N_GDN)? * rec + u64::try_from(N_QSA)? * sel + ple + 4 + rows as u64
+            u64::try_from(n_gdn())? * rec + u64::try_from(n_qsa())? * sel + ple + 4 + rows as u64
         };
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_split()?;
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
-            crate::gate_card::card()?,
+            card()?,
             inputs.spec.layers.len(),
             u64::try_from(ub)?,
             experts,
         );
         let ctx = CTX as u64;
+        let plan_levers = &cfg().plan_levers;
         let plain = inputs.plan_with(&machine, ctx, plan_levers, experts)?;
         let one = inputs.plan_with_slots(&machine, ctx, plan_levers, experts, 1)?;
         let two = inputs.plan_with_slots(&machine, ctx, plan_levers, experts, 2)?;
@@ -3477,10 +3770,9 @@ mod gate {
     /// (y) (module doc): the harness's contracts over the plan of two and,
     /// between its halves, the body's own clauses. The clause's model is
     /// dropped with its second sequence.
-    fn slots_two(experts: Experts, plan_levers: &PlanLevers) -> Result<bool, GateError> {
+    fn slots_two(experts: Experts) -> Result<bool, GateError> {
         let body = Slots38 {
             experts,
-            plan_levers,
             a: prefill_of(STEP4)?,
             b: prefill_of(D1K)?,
         };
@@ -3582,26 +3874,35 @@ mod gate {
         let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
         let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
-        let levers = PlanLevers::default();
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_split()?;
         let inputs = PlanInputs::describe(&file)?;
+        // The host arm's need is read off the plan the loads below make: the
+        // same card ([`card`], not a card by name), the same levers.
         let machine = machine_for_experts(
-            RTX_3090,
+            card()?,
             inputs.spec.layers.len(),
             u64::try_from(ZUB)?,
             Experts::Host,
         );
         let host_need = HostNeed::of(
-            &inputs.plan_with_slots(&machine, CTX as u64, &levers, Experts::Host, 1)?,
+            &inputs.plan_with_slots(&machine, CTX as u64, &cfg().plan_levers, Experts::Host, 1)?,
             0,
         )
         .bytes();
         drop(inputs);
         drop(file);
-        let (mut m, host_tier) = open_at(Experts::Host, &levers, 1, ZUB, None)?;
+        let Opened {
+            model: mut m,
+            ple_tier: host_tier,
+            ..
+        } = open_at(Experts::Host, 1, ZUB, None)?;
         let (want, host_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
-        let (mut m, nvme_tier) = open_at(Experts::Host, &levers, 1, ZUB, Some(host_need - 1))?;
+        let Opened {
+            model: mut m,
+            ple_tier: nvme_tier,
+            ..
+        } = open_at(Experts::Host, 1, ZUB, Some(host_need - 1))?;
         let (got, nvme_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
         let tiers = host_tier == Some(Device::Host) && nvme_tier == Some(Device::Nvme);
@@ -3634,46 +3935,75 @@ mod gate {
         Ok(ok)
     }
 
+    /// A self-consistency clause: it runs in both tiers, so a tier that
+    /// deferred it would be refused by name here, not skipped.
+    fn sc(name: &str) -> Result<(), GateError> {
+        if q38::clause(name, Tag::SelfConsistency)? {
+            Ok(())
+        } else {
+            Err(format!("the self-consistency clause {name:?} was deferred").into())
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
-        let mut m = open(Experts::Host, &PlanLevers::default())?;
-        let mut ok = structure(&mut m)?;
+        let mut ok = init()?;
+        let mut m = open(Experts::Host)?;
+        sc("(s) structure: the header's layer kinds, store bytes and node counts")?;
+        ok &= structure(&mut m)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
+        sc("(h) the head of m rows: finite rows, NaN faults")?;
         ok &= head_rows(&mut m, &toks)?;
+        sc("(p) one program: graph = eager = pass, reset clears")?;
         let (paths_ok, eager) = paths(&mut m, &toks)?;
         ok &= paths_ok;
         let vocab = m.body("run")?.vocab();
+        sc("(c) free: every route tap the top ten of its own logits")?;
         let (free_ok, firsts) = free(&man, &eager, vocab)?;
         ok &= free_ok;
+        sc("(g) the ubatch walk on the batch set: taps, flips, forced arm, auto")?;
         ok &= gemm_batch(&mut m, &man, &toks, &eager)?;
         let last = *firsts.last().ok_or("no positions")?;
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
         for (name, band) in [(STEP4, band), (STEP4_EVERY_NODE, band), (D1K, None)] {
-            ok &= step_set(&mut m, name, Prompt38::Step, band, &mut ties)?.0;
+            ok &= step_set(&mut m, name, Prompt38::Step, (band, false), &mut ties)?.0;
         }
-        let (d3k_ok, d3k) = step_set(&mut m, D3K, Prompt38::Step, None, &mut ties)?;
+        let (d3k_ok, d3k) = step_set(&mut m, D3K, Prompt38::Step, (None, true), &mut ties)?;
         ok &= d3k_ok;
         println!(
             "{D3K}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
              ours does not read (a named difference, its logits printed)"
         );
         println!("step sets: {ties} named tie(s)");
+        sc("(q) D3K's prefill by passes = by steps")?;
         ok &= pass_selects(&mut m, &d3k)?;
         drop(d3k);
+        sc("(g) D3K by ubatches: the cut, the walk's split, the timed record")?;
         ok &= gemm_d3k(&mut m, &mut ties)?;
+        sc("(g) the map refusals and auto")?;
         ok &= map_refusals(&mut m, &toks)?;
         ok &= gemm_auto();
         println!("step sets and the ubatch's D3K step: {ties} named tie(s)");
+        sc("(v) the verify: rows = steps, commits, structure, refusals")?;
         ok &= verify_clause(&mut m, &toks)?;
+        sc("(o) one owner of the position")?;
         ok &= position_owner(&mut m, &toks)?;
+        sc("(r) refusals")?;
         ok &= refusals(&mut m)?;
         drop(m);
+        sc("(z) the PLE table on the NVMe tier = on the host")?;
         ok &= ple_nvme(&toks)?;
-        ok &= slots_plan(Experts::Host, &PlanLevers::default())?;
-        ok &= slots_two(Experts::Host, &PlanLevers::default())?;
+        sc("(y) resident slots: the plan's bytes and the harness's contracts")?;
+        ok &= slots_plan(Experts::Host)?;
+        ok &= slots_two(Experts::Host)?;
+        sc("(k) the card leg: structure, places rule, vs the host plan, rows, ubatch walk")?;
         ok &= card_leg(&toks, &eager, &man)?;
+        let (ran, deferred) = q38::tally();
+        println!(
+            "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
+        );
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }
