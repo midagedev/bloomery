@@ -868,7 +868,13 @@ impl Pre35 {
         }
         let vocab = spec.vocab as usize;
         ty_of(file, "token_embd.weight", vocab, d.hidden, EMBED)?;
-        ty_of(file, "output.weight", vocab, d.hidden, HEAD_TY)?;
+        ty_of(
+            file,
+            crate::weights::head_tensor(file),
+            vocab,
+            d.hidden,
+            HEAD_TY,
+        )?;
         let plans = kinds
             .iter()
             .zip(&spec.layers)
