@@ -45,7 +45,7 @@ use cuda_core::{CudaContext, CudaStream, sys};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::placement::host_lock::{HostFile, HostSet, expert_run};
-use model::placement::{ModelTensor, Plan};
+use model::placement::{ModelTensor, ModelTensors, Plan};
 use model::r8file::R8Pair;
 use runtime::swaprule::KeptRows;
 
@@ -119,6 +119,191 @@ pub trait Convert: Send + Sync {
         dst: sys::CUdeviceptr,
         stream: &CudaStream,
     ) -> Result<(), GpuError>;
+}
+
+/// Passes from the boundary that makes a flip to the one it lands at, for a
+/// model whose card holds the file's bytes ([`PlanStacks`]). The victims are
+/// host-resident (the churn pool), so a flip waits on no NVMe read, only on
+/// its staging and its copy: a planning pass makes at most the rule's `cap`
+/// flips ([`runtime::swaprule::SwapParams::mid`]), each one expert's memcpy
+/// into the pinned ring on one thread and one H2D copy over the card's link,
+/// an expert's copy running under the next one's memcpy (the ring holds
+/// [`super::swap::RING_SLOTS`] experts). A whole pass's staging and copies —
+/// its experts' bytes over the ring's rate beside the host leg — stay far
+/// inside two passes' wall of decode steps at the model's width [derived],
+/// so two passes hold it. The staging runs in the host leg's wait window, a
+/// share of the step this derivation does not price: a late staging makes
+/// the host wait at the landing and a late copy the engine stream, and
+/// neither moves the boundary a flip lands at.
+pub const LIVE_DELAY: u64 = 2;
+
+/// The bound on every host wait of the machine. A boundary runs after the
+/// last launched pass's host service has returned: before a launch, or ahead
+/// of the next pass after a step's kept row and before its readback
+/// (`GpuModel::run_tokens`), while the engine stream still runs that step's
+/// last kernels and its head. So the engine stream need not be empty, but
+/// nothing on it waits on this thread: every host word its waits read was
+/// written by a service that has returned. The one host wait a boundary
+/// makes is for a landing flip's staging. The flip's job `n` was issued
+/// `LIVE_DELAY` = 2 boundaries back (a live delay of 1 or more, which the
+/// machine holds), and its staging waits only for its ring slot's previous
+/// copy, an earlier job issued at or before that boundary. That copy
+/// waits on the copy stream for its own staging (an earlier, due job: the
+/// same argument) and for the boundary event recorded when it was issued,
+/// which precedes the last launched pass in the engine stream's order, so
+/// the stream reaches it with no further host action — the waits before it
+/// are copies whose staging the host already waited for at their own
+/// landing, and the host words of passes already served. No wait can
+/// close a cycle through the engine stream, and a wait is for the staging
+/// thread and the copy stream alone: at most a planning pass's `cap`
+/// experts ([`runtime::swaprule::SwapParams::mid`]), far inside this bound.
+/// A late copy landing at a boundary made ahead delays the step's readback,
+/// which the engine stream orders after that boundary's wait.
+pub const DEADLINE: Duration = Duration::from_secs(30);
+
+/// The family's contract on one complete layer's stack types
+/// ([`StackFacts::check`]): the layer's number and its gate, up and down
+/// types as the file holds them, `Err` the family's own refusal.
+pub type LayerCheck = fn(usize, [GgmlType; 3]) -> Result<(), GpuError>;
+
+/// The family facts a [`PlanStacks`] read takes: what differs per model
+/// about its three routed stacks, every field the family's own.
+pub struct StackFacts {
+    /// The refusal name of the family's constructor, the `what` its
+    /// load-time refusals carry.
+    pub what: &'static str,
+    /// Layer `l`'s gate, up and down file names, in stack order.
+    pub names: fn(usize) -> [String; 3],
+    /// The family's contract on a complete layer's stack types, checked
+    /// layer by layer; `None`: the family's place rule owns it.
+    pub check: Option<LayerCheck>,
+    /// Whether a layer may hold none of its stacks (a dense block).
+    pub empty: bool,
+    /// The layers the body's slot map holds ([`FileStacks::map_layers`]).
+    pub map_layers: Option<usize>,
+    /// The map's layers no pass routes ([`FileStacks::unrouted`]).
+    pub unrouted: Vec<usize>,
+    /// The r8 sidecar's refusal ([`FileStacks::open`]), in the family's
+    /// words.
+    pub sidecar: fn() -> GpuError,
+}
+
+/// A three-stack [`FileStacks`] over the file source for a model whose card
+/// holds the file's bytes: each layer's gate, up and down read from the
+/// plan's tensors by the family's names, each layer's types as the file
+/// holds them, and nothing to convert — a staged part is its slot's bytes,
+/// and the r8 sidecar, a format Q3_K stacks alone have, is refused by name.
+/// Every family fact is an input ([`StackFacts`]): the names function, the
+/// per-layer type check the family's card leg forces, whether a layer may
+/// hold none of its stacks (a dense block), the map layers, the unrouted
+/// layers, and the sidecar refusal in the family's words.
+pub struct PlanStacks {
+    /// Layer `l`'s gate, up and down file names, in stack order.
+    names_of: fn(usize) -> [String; 3],
+    /// Per layer, its three stacks' types in stack order; `None` on a layer
+    /// that holds none of them.
+    types: Vec<Option<[GgmlType; 3]>>,
+    /// The layers the body's slot map holds ([`FileStacks::map_layers`]).
+    map_layers: Option<usize>,
+    /// The map's layers no pass routes ([`FileStacks::unrouted`]).
+    unrouted: Vec<usize>,
+    /// The r8 sidecar's refusal ([`FileStacks::open`]), in the family's
+    /// words.
+    sidecar: fn() -> GpuError,
+}
+
+impl PlanStacks {
+    /// The stacks of the `model.layers` layers of `model`, each layer's
+    /// types read from its tensors by the facts' names. Refused by name
+    /// under the facts' `what`: a layer that holds some of its three stacks
+    /// but not all, and — when the family allows no empty layer, so every
+    /// layer holds its three — a layer that holds none; a layer a family
+    /// with empty layers holds none of enters the table empty. The facts'
+    /// `check` holds each complete layer. Load-time only.
+    pub fn of(model: &ModelTensors, facts: StackFacts) -> Result<PlanStacks, GpuError> {
+        let find = |name: &str| model.tensors.iter().find(|t| t.name == name).map(|t| t.ty);
+        let mut types = Vec::with_capacity(model.layers);
+        for l in 0..model.layers {
+            let names = (facts.names)(l);
+            let found: [Option<GgmlType>; 3] = [find(&names[0]), find(&names[1]), find(&names[2])];
+            types.push(match found {
+                [None, None, None] if facts.empty => None,
+                [Some(gate), Some(up), Some(down)] => {
+                    if let Some(check) = facts.check {
+                        check(l, [gate, up, down])?;
+                    }
+                    Some([gate, up, down])
+                }
+                _ => {
+                    let (name, _) = names
+                        .iter()
+                        .zip(found)
+                        .find(|(_, t)| t.is_none())
+                        .expect("a layer with a missing stack names it");
+                    return Err(GpuError::Tensor {
+                        what: facts.what,
+                        name: name.clone(),
+                        need: if facts.empty {
+                            "all three routed stacks: a layer holds either all of them or none"
+                        } else {
+                            "every layer's three routed stacks"
+                        },
+                    });
+                }
+            });
+        }
+        Ok(PlanStacks {
+            names_of: facts.names,
+            types,
+            map_layers: facts.map_layers,
+            unrouted: facts.unrouted,
+            sidecar: facts.sidecar,
+        })
+    }
+
+    /// Layer `l`'s gate·up type and down type, as [`FileStacks::types`] lists
+    /// them; `None` past the model's layers and on a layer that holds none.
+    #[must_use]
+    pub fn pair(&self, l: usize) -> Option<(GgmlType, GgmlType)> {
+        self.types
+            .get(l)
+            .and_then(Option::as_ref)
+            .map(|t| (t[0], t[2]))
+    }
+}
+
+impl FileStacks for PlanStacks {
+    fn names(&self, layer: usize) -> Vec<String> {
+        (self.names_of)(layer).to_vec()
+    }
+
+    fn types(&self, layer: usize) -> &[GgmlType] {
+        self.types
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map_or(&[], |t| t.as_slice())
+    }
+
+    fn map_layers(&self) -> Option<usize> {
+        self.map_layers
+    }
+
+    fn unrouted(&self) -> Vec<usize> {
+        self.unrouted.clone()
+    }
+
+    fn open(
+        &self,
+        _dims: &[u64],
+        _parts: &[usize],
+        sidecar: bool,
+        _ctx: &Arc<CudaContext>,
+    ) -> Result<Option<Arc<dyn Convert>>, GpuError> {
+        if sidecar {
+            return Err((self.sidecar)());
+        }
+        Ok(None)
+    }
 }
 
 /// What a placed load under [`Residency`] asks the load path for
@@ -970,5 +1155,216 @@ mod tests {
             }
             r => panic!("a layer of other parts is refused, got {r:?}"),
         }
+    }
+
+    /// A plan of `layers` layers whose layer `l` holds the stacks `of(l)`
+    /// names — a tensor per `Some`, in stack order, no real tensor data.
+    fn plan(layers: usize, of: impl Fn(usize) -> [Option<GgmlType>; 3]) -> ModelTensors {
+        let mut tensors = Vec::new();
+        for l in 0..layers {
+            for (i, ty) in of(l).into_iter().enumerate() {
+                if let Some(ty) = ty {
+                    tensors.push(stack(
+                        l,
+                        &format!("layer.{l}.{}", ["gate", "up", "down"][i]),
+                        ty,
+                        &[8, 8, 8],
+                        1,
+                    ));
+                }
+            }
+        }
+        ModelTensors {
+            tensors,
+            layers,
+            experts: 8,
+            experts_used: 8,
+        }
+    }
+
+    /// Layer `l`'s three stack names as [`plan`] writes them.
+    fn three_names(l: usize) -> [String; 3] {
+        ["gate", "up", "down"].map(|part| format!("layer.{l}.{part}"))
+    }
+
+    /// The sidecar refusal of the tests' families, its text never read.
+    fn no_sidecar() -> GpuError {
+        GpuError::State {
+            what: "the tests' stacks",
+            missing: "no sidecar",
+        }
+    }
+
+    /// A layer that holds some of its three stacks but not all is refused by
+    /// the name of the first one missing, under the caller's own `what`, in a
+    /// family whose layers may hold none. Mutant: the refusal's `need` reads
+    /// the all-three family's string (the emptiness arms swapped) — the need
+    /// assert catches it.
+    #[test]
+    fn a_partial_layer_is_refused_by_its_first_missing_stack() {
+        let plan = plan(2, |l| {
+            if l == 0 {
+                [Some(GgmlType::Q4_K); 3]
+            } else {
+                [Some(GgmlType::Q4_K), Some(GgmlType::Q4_K), None]
+            }
+        });
+        match PlanStacks::of(
+            &plan,
+            StackFacts {
+                what: "of",
+                names: three_names,
+                check: None,
+                empty: true,
+                map_layers: None,
+                unrouted: Vec::new(),
+                sidecar: no_sidecar,
+            },
+        ) {
+            Err(GpuError::Tensor { what, name, need }) => {
+                assert_eq!(
+                    (what, name.as_str(), need),
+                    (
+                        "of",
+                        "layer.1.down",
+                        "all three routed stacks: a layer holds either all of them or none"
+                    )
+                );
+            }
+            _ => panic!("a partial layer is refused"),
+        }
+    }
+
+    /// A layer that holds none of its stacks enters the table empty in a
+    /// family whose layers may hold none: its `types` list is empty and its
+    /// `pair` absent, the layers beside it untouched. Mutant: the empty row
+    /// stored as a stack of default types — the empty-layer arm catches it.
+    #[test]
+    fn a_layer_with_no_stacks_enters_the_table_empty() {
+        let plan = plan(3, |l| match l {
+            0 => [
+                Some(GgmlType::Q4_K),
+                Some(GgmlType::Q5_K),
+                Some(GgmlType::Q6_K),
+            ],
+            1 => [None; 3],
+            _ => [Some(GgmlType::Q5_K); 3],
+        });
+        let stacks = PlanStacks::of(
+            &plan,
+            StackFacts {
+                what: "of",
+                names: three_names,
+                check: None,
+                empty: true,
+                map_layers: None,
+                unrouted: Vec::new(),
+                sidecar: no_sidecar,
+            },
+        )
+        .expect("a family with empty layers reads its layers");
+        assert_eq!(
+            stacks.types(0),
+            &[GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K]
+        );
+        assert_eq!(stacks.types(1), &[]);
+        assert_eq!(stacks.types(2), &[GgmlType::Q5_K; 3]);
+        assert_eq!(stacks.pair(0), Some((GgmlType::Q4_K, GgmlType::Q6_K)));
+        assert_eq!(stacks.pair(1), None);
+    }
+
+    /// In a family every layer of which holds all three stacks, a layer that
+    /// holds none — and one that holds some — is refused by the name of the
+    /// first stack missing. Mutant: as the partial layer's.
+    #[test]
+    fn a_missing_stack_is_refused_where_every_layer_holds_all_three() {
+        let cases = [
+            ([None, None, None], "layer.0.gate"),
+            ([Some(GgmlType::Q4_K), None, None], "layer.0.up"),
+        ];
+        for (held, name) in cases {
+            let plan = plan(1, |_| held);
+            match PlanStacks::of(
+                &plan,
+                StackFacts {
+                    what: "of",
+                    names: three_names,
+                    check: None,
+                    empty: false,
+                    map_layers: None,
+                    unrouted: Vec::new(),
+                    sidecar: no_sidecar,
+                },
+            ) {
+                Err(GpuError::Tensor {
+                    what,
+                    name: n,
+                    need,
+                }) => {
+                    assert_eq!((what, n.as_str()), ("of", name), "of {held:?}");
+                    assert_eq!(need, "every layer's three routed stacks", "of {held:?}");
+                }
+                _ => panic!("a layer missing a stack is refused, of {held:?}"),
+            }
+        }
+    }
+
+    /// The family's check holds each complete layer's types and spares the
+    /// empty rows: its refusal of layer 1 reaches the caller, and the same
+    /// check passes a family whose layer 1 holds no stacks. Mutant: the
+    /// check never called — the layer 1 arm catches it.
+    #[test]
+    fn the_family_check_holds_each_complete_layer() {
+        fn not_q6(l: usize, [gate, _, _]: [GgmlType; 3]) -> Result<(), GpuError> {
+            if l == 1 && gate == GgmlType::Q6_K {
+                return Err(GpuError::shape("the check", format!("layer {l}")));
+            }
+            Ok(())
+        }
+        let q6 = plan(2, |l| {
+            if l == 1 {
+                [Some(GgmlType::Q6_K); 3]
+            } else {
+                [Some(GgmlType::Q4_K); 3]
+            }
+        });
+        match PlanStacks::of(
+            &q6,
+            StackFacts {
+                what: "of",
+                names: three_names,
+                check: Some(not_q6),
+                empty: true,
+                map_layers: None,
+                unrouted: Vec::new(),
+                sidecar: no_sidecar,
+            },
+        ) {
+            Err(GpuError::Shape { what, detail }) => {
+                assert_eq!((what, detail.as_str()), ("the check", "layer 1"));
+            }
+            _ => panic!("the family check's refusal reaches the caller"),
+        }
+        let empty = plan(2, |l| {
+            if l == 1 {
+                [None; 3]
+            } else {
+                [Some(GgmlType::Q4_K); 3]
+            }
+        });
+        let stacks = PlanStacks::of(
+            &empty,
+            StackFacts {
+                what: "of",
+                names: three_names,
+                check: Some(not_q6),
+                empty: true,
+                map_layers: None,
+                unrouted: Vec::new(),
+                sidecar: no_sidecar,
+            },
+        )
+        .expect("the check spares an empty layer");
+        assert_eq!(stacks.types(1), &[]);
     }
 }
