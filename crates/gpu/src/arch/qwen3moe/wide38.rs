@@ -1957,6 +1957,10 @@ impl<'a> Gemm38<'a> {
         let mut pick = port
             .hybrid()
             .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?;
+        // The no-probe floor witness: the pick admitted from the stream
+        // floor (a load whose lane never probed, or a unit too narrow to
+        // light the ring) rather than the stream rule's measured one.
+        pick.fallback = u32::from(!lit);
         let admitted = pick.admitted;
         let land = std::mem::take(&mut pick.land);
         s.picks.push((s.ubatch, pick));
