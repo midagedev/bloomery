@@ -53,12 +53,23 @@
 #             name, a runner's or a path's variable and a name no row names are refused, the registry
 #             read only when an arm has an `@`); a name given twice; a value holding `,`, `@`, `|` or
 #             white space; a name the runner's own environment already sets (BLOOMERY_BOX_ENV reaches
-#             every arm, so the plain rows' labels would hide it); and `@` on a reference, server or bin:
-#             arm — a lever of ours is not a reference's. The item place=<a|gate|bp> is no lever: it is the
-#             arm's placement (Placement below), in its load key and its --place, never a variable its
-#             process gets; the label keeps it. The item mem=<N>G is no lever either: it is the arm's
-#             host memory (Mem below), a systemd-run scope of the arm's process, never a variable
-#             its process gets; the label keeps it.
+#             every arm, so the plain rows' labels would hide it); and `@` on a reference or server arm —
+#             a lever of ours is not a reference's (a bin: arm takes a list of its own, bin: below). The
+#             item place=<a|gate|bp> is no lever: it is the arm's placement (Placement below), in its load
+#             key and its --place, never a variable its process gets; the label keeps it. The item
+#             mem=<N>G is no lever either: it is the arm's host memory (Mem below), a systemd-run scope
+#             of the arm's process, never a variable its process gets; the label keeps it. The item
+#             model=<absolute path> is no lever either: it is the arm's model file, the BLOOMERY_REF_MODEL
+#             that arm's process alone runs under (every other arm the profile's file), in its load key,
+#             for ours and bin: arms; the label keeps it. The arm's prompt stays the arm's own — a prose
+#             arm still feeds the profile's corpus, whose ids must be the same tokenizer's as the named
+#             file's; the runner does not check that (the Q3_K_XL and Q4_K_XL Qwen3.8 files share one).
+#             Refused by name before anything runs: a relative path, one holding `@`, `|` or white space,
+#             and model given twice (a `,` separates the list's items, so a path with one never arrives
+#             whole: the item after it is no NAME=VALUE and is refused there); model= on a reference or
+#             server arm; and at run time a file that is not there, before the lease (not under
+#             --parse-arms, which runs on the Mac). A model= arm is a load of its own — the load reads
+#             one file — so its rows are read beside arms on the same file, never across files.
 #             `depth-qwen3moe.sh --parse-arms [--registry <registry.rs>] <arms...>` parses the arms as a
 #             run does and prints each arm's kind, depth, label, variables and load key — a prose arm's
 #             line also its corpus path and the file's first three ids (`-` when the file is not readable
@@ -105,7 +116,13 @@
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
 #             two builds. bin:<path>:prose:<P> feeds it the prose arms' prompt, row label
-#             `bin:<tree>@prose`, in the prose table beside `prose:<P>`. It is a base by construction, so its freshness is not asked; its tree line
+#             `bin:<tree>@prose`, in the prose table beside `prose:<P>`. bin:<path>:<D or prose:<P>>
+#             @NAME=VALUE[,NAME=VALUE...] sets those variables for that build's process: the same
+#             grammar and refusals as an ours lever arm's — the registry is this tree's, and an older
+#             binary that refuses a lever ends the arm a FAIL row (Failures below) — with the model=
+#             item among them (`bin:<tree>@prose@BLOOMERY_HOSTSTREAM=off`,
+#             `bin:<tree>@model=<path>,BLOOMERY_HOSTSTREAM=off`: the label keeps the list); place= and
+#             mem= are an ours arm's items and are refused on it. It is a base by construction, so its freshness is not asked; its tree line
 #             (sha256, HEAD, dirty files) is printed with the references'. Every label is its own
 #             engine in the per-arm means and in the ratio table (ours / each other label).
 #   ik:<D>    ik: llama-bench -p 0 -n 0 -gp D,N -r 1 $IK_GPU_FLAGS (D = 0: plain tg N). The D-token
@@ -383,8 +400,8 @@
 # items (`prose:512@place=bp`, `6@place=a,BLOOMERY_QWEN38_EXPERTS=host`): that arm runs at --place <word>
 # over BLOOMERY_GEN_PLACE, in a load of its own (the place is in the load key); the label keeps it
 # (`ours@prose@place=bp`), so `prose:512 prose:512@place=bp` is the same-binary placement A/B in the prose
-# table. place= on another profile, on a reference or server arm, a word outside a|gate|bp, an empty one
-# and place given twice are refused by name before anything runs (tools/ref/arm-place.sh, shared with
+# table. place= on another profile, on a reference, server or bin: arm, a word outside a|gate|bp, an
+# empty one and place given twice are refused by name before anything runs (tools/ref/arm-place.sh, shared with
 # depth-ds41.sh and depth-glm5next.sh, its refusals one text in all three). Under one card a placement whose
 # card is not the timing card is refused (64), bp too; every row of an arm with a --place names it (`place
 # <p>`), and one whose load line names another placement is a FAIL row.
@@ -400,7 +417,8 @@
 # memory.current + the file pages), so the model's shards in the page cache do not eat the limit whether
 # the scope or an earlier arm outside one faulted them in; the pages another arm cached stay charged
 # where that arm ran, so the scope simulates the small host for the guard's arithmetic, not the cold
-# reads of one. mem= on a reference, server or bin: arm rides the '@' refusal those arms take; an empty
+# reads of one. mem= on a reference or server arm rides the '@' refusal those arms take, and on a bin:
+# arm is refused by name (its list holds the build's levers and model=); an empty
 # value, one with no G, a value that is not a whole number of GiB and mem given twice are refused by
 # name before anything runs.
 #
@@ -526,8 +544,8 @@ q3_self_test() {
     run_parse -- "$ex"
     want "ref-${ex%%:*}" 64 "a lever of ours is not a reference's"
   done
-  run_parse -- bin:/root/repo/b/target/release/generate_qwen3moe:6@BLOOMERY_THREADS=8
-  want bin-arm 64 "a bin: arm is another build"
+  run_parse -- bin:/root/repo/b/target/release/generate_qwen3moe:6@FOO=1
+  want bin-arm 64 "FOO is no row of the lever registry"
   # The reader holds the registry's shape: a row it cannot read stops it by name.
   printf 'pub(crate) static REGISTRY: &[LeverSpec] = &[\n    LeverSpec {\n        class: Class::A,\n    },\n];\n' > "${TMPDIR:-/tmp}/q3arm-registry.$$.rs"
   run_parse -- --registry "${TMPDIR:-/tmp}/q3arm-registry.$$.rs" 6@BLOOMERY_THREADS=8
@@ -647,6 +665,48 @@ q3_self_test() {
   want mem-twice 64 "mem is given twice"
   run_parse -- lcpp:6@mem=61G
   want mem-ref 64 "a lever of ours is not a reference's"
+  # The model= item (the header's model=): the arm's own model file, BLOOMERY_REF_MODEL for its process
+  # alone and a part of its load key; and the bin: arm's list (the header's bin:), an ours lever arm's
+  # grammar over this tree's registry with model= among its items; each refusal by name.
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:512@model=/m/q3.gguf
+  want model-arm 0 \
+    "[parse] prose:512@model=/m/q3.gguf: kind=ours depth=512 label=ours@prose@model=/m/q3.gguf env=- load=$bin|ctx=768|model=/m/q3.gguf corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102 model=/m/q3.gguf"
+  run_parse -- 6@model=/m/q3.gguf,BLOOMERY_THREADS=8
+  want model-lever 0 \
+    "[parse] 6@model=/m/q3.gguf,BLOOMERY_THREADS=8: kind=ours depth=6 label=ours@model=/m/q3.gguf,BLOOMERY_THREADS=8 env=BLOOMERY_THREADS=8 load=$bin|ctx=256|model=/m/q3.gguf|BLOOMERY_THREADS=8 model=/m/q3.gguf"
+  run_parse -- 6@model=q3.gguf
+  want model-relative 64 "model=q3.gguf is a relative path"
+  run_parse -- '6@model=/m/q 3.gguf'
+  want model-space 64 "the path of model= holds white space"
+  run_parse -- '6@model=/m/q|3.gguf'
+  want model-bar 64 "the path of model= holds '|'"
+  run_parse -- 6@model=/m/q@3.gguf
+  want model-at 64 "the path of model= holds '@'"
+  run_parse -- 6@model=/m/a.gguf,model=/m/b.gguf
+  want model-twice 64 "model is given twice"
+  run_parse -- 6@model=
+  want model-empty 64 "model= names no file"
+  for ex in lcpp:6@model=/m/q3.gguf lcppsrv:6@model=/m/q3.gguf; do
+    run_parse -- "$ex"
+    want "model-ref-${ex%%:*}" 64 "model= sets the arm's BLOOMERY_REF_MODEL, and ${ex%%:*} is a reference engine's arm"
+  done
+  # Under --parse-arms a model= file that is not there (the box's path, read on the Mac) is not asked;
+  # a run refuses it before the lease.
+  run_parse -- 6@model=/nonexistent/q3.gguf
+  want model-parse-nofile 0 "[parse] 6@model=/nonexistent/q3.gguf: kind=ours depth=6 label=ours@model=/nonexistent/q3.gguf env=- load=$bin|ctx=256|model=/nonexistent/q3.gguf model=/nonexistent/q3.gguf"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen3moe BLOOMERY_DATA="$pt/data" "$BASH" "$me" 6@model=/nonexistent/q3.gguf 2>&1)
+  rc=$?
+  want model-nofile 2 "no model file at /nonexistent/q3.gguf"
+  run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/target/release/generate_qwen3moe:prose:512@BLOOMERY_HOSTSTREAM=off
+  want bin-lever 0 \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:512@BLOOMERY_HOSTSTREAM=off: kind=bin depth=512 label=bin:t@prose@BLOOMERY_HOSTSTREAM=off env=BLOOMERY_HOSTSTREAM=off load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
+  run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/target/release/generate_qwen3moe:6@model=/m/q3.gguf,BLOOMERY_HOSTSTREAM=off
+  want bin-model 0 \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:6@model=/m/q3.gguf,BLOOMERY_HOSTSTREAM=off: kind=bin depth=6 label=bin:t@model=/m/q3.gguf,BLOOMERY_HOSTSTREAM=off env=BLOOMERY_HOSTSTREAM=off load=(a process of its own) model=/m/q3.gguf"
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@place=a
+  want bin-place 64 "place= is an ours arm's item here"
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@mem=61G
+  want bin-mem 64 "mem= is an ours arm's item here"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
   want prose-bin 0 \
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
@@ -737,8 +797,8 @@ ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
 # (ours, bin, or the reference's), the binary (ours and bin) and a server arm's ids (lcg).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_IDS=()
-# A lever arm's NAME=VALUE list as given less its place= item (comma-separated; empty for every other
-# arm): the variables its process gets.
+# A lever arm's NAME=VALUE list as given less its place=, mem= and model= items (comma-separated; empty
+# for every other arm): the variables its process gets.
 A_ENV=()
 # An ours or bin: arm's placement (its place= word, else BLOOMERY_GEN_PLACE; empty: no --place) and whether
 # place= set it (1, or empty); empty for a reference or server arm.
@@ -746,13 +806,16 @@ A_PLACE=() A_PLACE_SET=()
 # An ours arm's mem= item (the header's Mem): its N, the whole GiB the arm's systemd-run scope holds
 # (empty for every other arm).
 A_MEM=()
+# An ours or bin: arm's model= item (the header's model=): its file, the BLOOMERY_REF_MODEL the arm's
+# process runs under (empty for every other arm: the profile's file, inherited).
+A_MODEL=()
 # A prose arm's prompt, the corpus's first P ids comma-separated as --tokens takes them (empty for
 # every other arm); under --parse-arms the placeholder `<prose_prompt P>` its load lines print.
 A_TOK=()
 # An aggregate arm's N (the header's <D>@BLOOMERY_GEN_SLOTS=N, N >= 2; empty for every other arm).
 A_SLOTS=()
 arm_usage() {
-  echo "depth-qwen3moe.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D>" >&2
+  echo "depth-qwen3moe.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D|prose:<P>>[@NAME=VALUE,...]" >&2
   exit 64
 }
 arm_refuse() {
@@ -832,15 +895,60 @@ arm_mem_split() {
   # shellcheck disable=SC2034 # read by split_at below
   ARM_MEM_REST=$rest
 }
+# arm_model_split <arm> <NAME=VALUE list>: the list's model= item into ARM_MODEL (empty without one) and
+# the rest, every other item as given and in order, into ARM_MODEL_REST. The item is no lever: it is the
+# arm's model file (the header's model=), BLOOMERY_REF_MODEL for that arm's process alone. A relative
+# path, one holding '@', '|' or white space, and model given twice are refused by name (a ',' in the path
+# is not representable: the list's grammar separates items with it, so a path with one parses as more
+# items and is refused by that grammar).
+arm_model_split() {
+  local a=$1 s="$2," e rest='' seen=''
+  ARM_MODEL=''
+  while [ -n "$s" ]; do
+    e=${s%%,*} s=${s#*,}
+    case $e in
+      model=*)
+        [ -z "$ARM_MODEL" ] || arm_refuse "$a" "model is given twice"
+        ARM_MODEL=${e#model=}
+        case $ARM_MODEL in
+          '') arm_refuse "$a" "model= names no file (the item is model=<absolute path>, the file the arm's process opens as BLOOMERY_REF_MODEL)" ;;
+        esac
+        case $ARM_MODEL in
+          /*) ;;
+          *) arm_refuse "$a" "model=$ARM_MODEL is a relative path: the item is model=<absolute path>, the file the arm's process opens as BLOOMERY_REF_MODEL" ;;
+        esac
+        case $ARM_MODEL in
+          *@*) arm_refuse "$a" "the path of model= holds '@', which opens an arm's variable list" ;;
+        esac
+        case $ARM_MODEL in
+          *'|'*) arm_refuse "$a" "the path of model= holds '|', the separator of this runner's records" ;;
+        esac
+        case $ARM_MODEL in
+          *[[:space:]]*) arm_refuse "$a" "the path of model= holds white space" ;;
+        esac
+        ;;
+      *) rest+="${seen:+,}$e" seen=1 ;;
+    esac
+  done
+  # shellcheck disable=SC2034 # read by split_at and the bin: arm's parse below
+  ARM_MODEL_REST=$rest
+}
+# arm_has_model <NAME=VALUE list>: whether the list holds a model= item.
+arm_has_model() { [[ ,$1 == *,model=* ]]; }
+# model_ref_refuse <arm> <engine>: model= on a reference or server arm, refused by name.
+model_ref_refuse() {
+  arm_refuse "$1" "model= sets the arm's BLOOMERY_REF_MODEL, and $2 is a reference engine's arm, which opens the profile's file"
+}
 # split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
-# by lever-arms.sh), APLACE (its place= word, empty without one) and AMEM (its mem= N, empty without one);
-# place= only a qwen4exp file takes.
+# by lever-arms.sh), APLACE (its place= word, empty without one), AMEM (its mem= N, empty without one) and
+# AMODEL (its model= path, empty without one); place= only a qwen4exp file takes.
 split_at() {
   AT=$2
   [ -n "$2" ] || arm_envs_ok "$1" "$2"
   arm_place_split "$1" "$2"
   arm_mem_split "$1" "$ARM_REST"
-  ENVS=$ARM_MEM_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM
+  arm_model_split "$1" "$ARM_MEM_REST"
+  ENVS=$ARM_MODEL_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM AMODEL=$ARM_MODEL
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
   if [ -n "$APLACE" ] && [ "$MODEL_NAME" != qwen4exp ]; then
     place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
@@ -859,15 +967,17 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM=''
-  # `@` is ours only (a <D> arm's or a prose arm's list): split at it first, so a value with a `:` is
-  # not read as a reference's arm. place= on a reference arm is refused by name (the header's Placement).
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM='' AMODEL='' blist=''
+  # `@` is ours, a prose arm's or a bin: arm's list: split at it first, so a value with a `:` is not
+  # read as a reference's arm. place= and model= on a reference or server arm are refused by name (the
+  # header's Placement, model=).
   case ${a%%@*} in
     "$a") ;;
     prose:*) ;;
-    bin:*) arm_refuse "$a" "'@' sets a lever of this tree's binary, and a bin: arm is another build, run as it is" ;;
+    bin:*) ;;
     *:*)
       ! arm_has_place "${a#*@}" || place_ref_refuse "$a" "${eng%%+*}"
+      ! arm_has_model "${a#*@}" || model_ref_refuse "$a" "${eng%%+*}"
       arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's"
       ;;
   esac
@@ -886,12 +996,19 @@ for a in "${ARMS[@]}"; do
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
     A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok") A_SLOTS+=('')
-    A_PLACE+=('') A_PLACE_SET+=('') A_MEM+=('')
+    A_PLACE+=('') A_PLACE_SET+=('') A_MEM+=('') A_MODEL+=('')
     continue
   fi
   case $a in
     bin:*)
       kind=bin eng=bin bin=${a#bin:}
+      # `@` opens the build's own variable list (the header's bin:): the same grammar and refusals as an
+      # ours lever arm's — the registry is this tree's — with the model= item among it. place= and mem=
+      # are an ours arm's items here and are refused by name.
+      case $bin in
+        *@*) blist=${bin#*@} bin=${bin%%@*} ;;
+        *) blist='' ;;
+      esac
       dep=${bin##*:} bin=${bin%:*}
       corpus=''
       if [ "${bin##*:}" = prose ]; then
@@ -909,6 +1026,15 @@ for a in "${ARMS[@]}"; do
         corpus_check "$a" "$dep"
         tok=$(corpus_ids "$dep")
         label+=@prose
+      fi
+      if [ -n "$blist" ]; then
+        label+=@$blist
+        arm_model_split "$a" "$blist"
+        blist=$ARM_MODEL_REST
+        ! arm_has_place "$blist" || arm_refuse "$a" "place= is an ours arm's item here (this runner's --place over BLOOMERY_GEN_PLACE); a bin: arm's list holds the build's levers and model="
+        [[ ",$blist," != *",mem="* ]] || arm_refuse "$a" "mem= is an ours arm's item here (this runner's systemd-run scope); a bin: arm's list holds the build's levers and model="
+        [ -z "$blist" ] || arm_envs_ok "$a" "$blist"
+        envs=$blist AMODEL=$ARM_MODEL
       fi
       ;;
     prose:*)
@@ -974,7 +1100,7 @@ for a in "${ARMS[@]}"; do
     echo "depth-qwen3moe.sh: our arm '$a' feeds $ASLOTS slots × $dep = $((dep * ASLOTS)) ids, past the 20000 one --tokens argument holds" >&2
     exit 64
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS") A_MEM+=("${AMEM:-}")
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS") A_MEM+=("${AMEM:-}") A_MODEL+=("${AMODEL:-}")
   # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
@@ -999,27 +1125,29 @@ arm_env_list() {
   [ "${A_ENV[$1]}" = "$LG_SOLO" ] && return 0
   lg_strip_solo "${A_ENV[$1]}"
 }
-# A lever arm's variables are load-time, so they go into its key, sorted; `|solo` on an arm whose list
-# holds BLOOMERY_AB_LOAD=arm.
+# A lever arm's variables are load-time, so they go into its key, sorted; a model= arm's file too (a
+# load reads one file); `|solo` on an arm whose list holds BLOOMERY_AB_LOAD=arm.
 for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
   [ "${A_KIND[$i]}" = ours ] || continue
   # A mem= arm's scope is its process's, so the arm never shares a load (the header's Mem): no key,
   # as a bin: arm.
   [ -z "${A_MEM[$i]}" ] || continue
-  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${A_PLACE[$i]:+|place=${A_PLACE[$i]}}"
+  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${A_PLACE[$i]:+|place=${A_PLACE[$i]}}${A_MODEL[$i]:+|model=${A_MODEL[$i]}}"
   [ -n "${A_ENV[$i]}" ] || continue
   env_key=$(lg_env_key "$(arm_env_list "$i")")
   [ -z "$env_key" ] || LG_KEY[i]+="|$env_key"
   if lg_is_solo "${A_ENV[$i]}"; then LG_KEY[i]+='|solo'; fi
 done
-# arm_envs <i>: the variables arm <i> of ours runs with, into ARM_ENVS (NAME=VALUE words); a unit's arms
-# share them (their load key holds them).
+# arm_envs <i>: the variables arm <i>'s process runs with (ours or bin:), into ARM_ENVS (NAME=VALUE
+# words); a unit's arms share them (their load key holds them) — a model= arm's BLOOMERY_REF_MODEL among
+# them (its key holds the file).
 arm_envs() {
   local envs
   ARM_ENVS=()
   envs=$(arm_env_list "$1")
   [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
+  [ -z "${A_MODEL[$1]}" ] || ARM_ENVS+=("BLOOMERY_REF_MODEL=${A_MODEL[$1]}")
 }
 # lg_cmd <indices...>: the driver's hook (tools/ref/load-groups.sh): one load's command line into LG_CMD,
 # and into LG_ENV the variables its process runs under, its arms' (one list: their load key holds it).
@@ -1050,6 +1178,7 @@ if [ -n "$PARSE_ONLY" ]; then
     fi
     [ -z "${A_SLOTS[$i]}" ] || extra+=" slots=${A_SLOTS[$i]} feed=$(arm_feed "$i")"
     [ -z "${A_MEM[$i]}" ] || extra+=" mem=${A_MEM[$i]}G"
+    [ -z "${A_MODEL[$i]}" ] || extra+=" model=${A_MODEL[$i]}"
     echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}$extra"
   done
   echo "[parse] order: $ORDER"
@@ -1077,6 +1206,16 @@ if [ -n "$PARSE_ONLY" ]; then
   fi
   exit 0
 fi
+# A model= arm's file is the box's (the header's model=): a run refuses one that is not there before the
+# lease and before the card; --parse-arms (above) runs on the Mac and does not.
+MODEL_ARMS=0
+for i in "${!ARMS[@]}"; do
+  [ -z "${A_MODEL[$i]}" ] || MODEL_ARMS=1
+  [ -z "${A_MODEL[$i]}" ] || [ -f "${A_MODEL[$i]}" ] || {
+    echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no model file at ${A_MODEL[$i]} (model= names the file its process opens as BLOOMERY_REF_MODEL, the first shard of a family)" >&2
+    exit 2
+  }
+done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
 # has the two-card mode (the header's Two cards).
 TIMING_CARDS_RUNNER=1
@@ -1154,6 +1293,12 @@ for i in "${!ARMS[@]}"; do [ -z "${A_MEM[$i]}" ] || MEM_ARMS=1; done
 mem_arms_line() {
   local i o=''
   for i in "${!ARMS[@]}"; do [ -z "${A_MEM[$i]}" ] || o+="${o:+, }${ARMS[$i]} ${A_MEM[$i]}G"; done
+  echo "$o"
+}
+# model_arms_line: the [config] model line's arms, `<arm> <path>` each.
+model_arms_line() {
+  local i o=''
+  for i in "${!ARMS[@]}"; do [ -z "${A_MODEL[$i]}" ] || o+="${o:+, }${ARMS[$i]} ${A_MODEL[$i]}"; done
   echo "$o"
 }
 SRVBIN=
@@ -1468,17 +1613,17 @@ exit $rc
 ours_arm() {
   local i=$1 r=$2 out rc t0 t1 f0 f1
   ours_pre "$i" "$r"
+  arm_envs "$i"
   t0=$(date +%s)
   f0=$(majflt_now)
   if [ -n "${A_MEM[$i]}" ]; then
-    arm_envs "$i"
     out=$(timeout --kill-after=10 "$BOUND" systemd-run --scope --quiet \
       -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
       env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} bash -c "$MEM_SCOPE_SCRIPT" -- \
       "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" \
       ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
   else
-    out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+    out=$(timeout --kill-after=10 "$BOUND" env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
   fi
   rc=$?
   f1=$(majflt_now)
@@ -1496,12 +1641,14 @@ ours_post() {
   local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed ran mtp=''
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} ctx=$(arm_ctx "$i")
   witness "post r$r $label d=$dep n=$N ctx=$ctx"
-  # A mem= arm's witness names its scope's peak (the header's Mem), read inside the scope.
+  # A mem= arm's witness names its scope's peak (the header's Mem), read inside the scope; a model=
+  # arm's names its file, the profile's witness line above naming the profile's.
   if [ -n "${A_MEM[$i]}" ]; then
     p=$(sed -n 's/^scope mem=peak:\([^ ]*\) cgroup:\(.*\)$/\1 \2/p' <<< "$out" | tail -n 1)
     p=${p:-"? ?"}
     echo "    mem scope: MemoryMax=${A_MEM[$i]}G MemorySwapMax=0 peak=${p%% *} B cgroup=${p#* }"
   fi
+  [ -z "${A_MODEL[$i]}" ] || echo "    model: BLOOMERY_REF_MODEL=${A_MODEL[$i]} (the profile's file: $MODEL)"
   guard_cpu "post r$r $label d=$dep"
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || slot=" | slot $((${a% *} + 1))/${a#* }"
@@ -1835,9 +1982,11 @@ dry_cmd() {
     arm_envs "$i"
     echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
   else
-    local mem=''
+    local mem='' envs=''
     [ -z "${A_MEM[$i]}" ] || mem="systemd-run --scope --quiet -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 "
-    echo "timeout --kill-after=10 $BOUND ${mem}${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
+    arm_envs "$i"
+    [ ${#ARM_ENVS[@]} -eq 0 ] || envs="env ${ARM_ENVS[*]} "
+    echo "timeout --kill-after=10 $BOUND ${mem}${envs}${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
   fi
 }
 
@@ -1929,6 +2078,7 @@ echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME 
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}${PLACE:+ --place $PLACE}"
 [ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
 [ "$MEM_ARMS" = 0 ] || echo "[config] mem: $(mem_arms_line) — each arm's process in systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0, its peak in the arm's witness"
+[ "$MODEL_ARMS" = 0 ] || echo "[config] model: $(model_arms_line) — each arm's process opens its file as BLOOMERY_REF_MODEL, the profile's $MODEL otherwise"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
 blocks_config
