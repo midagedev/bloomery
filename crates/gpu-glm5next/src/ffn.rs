@@ -44,6 +44,7 @@
 //! every sum from 2^-42 up. The two agree bit for bit unless all eight
 //! sigmoid scores sit below that: a named difference.
 
+use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
     Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, SelDown, TileGather,
@@ -61,7 +62,6 @@ use model::arch::glm5next::place::{card_routed, card_tile_bytes};
 use models::{Ffn, LayerSpec};
 
 use crate::body::{Parts, f32t, f32v, gemv, weight};
-use crate::host::GlmHost;
 use crate::tensors::{FfnNames, LayerNames, other_kind};
 use crate::tier::{STAGE_TIER, TierSide};
 
@@ -412,7 +412,7 @@ pub(crate) fn front(
     gpu: &Gpu,
     w: &Weights,
     p: &mut Parts<'_>,
-    hybrid: &mut Hybrid<GlmHost>,
+    hybrid: &mut Hybrid<HostRun>,
     l: usize,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
@@ -777,7 +777,7 @@ pub(crate) fn unrun(st: &Stack<'_>) -> GpuError {
 pub(crate) fn back(
     gpu: &Gpu,
     p: &mut Parts<'_>,
-    hybrid: &Hybrid<GlmHost>,
+    hybrid: &Hybrid<HostRun>,
     l: usize,
 ) -> Result<(), GpuError> {
     let n_tier = p.card.tier_k(l);
@@ -802,7 +802,7 @@ pub(crate) fn back(
 fn back_tier(
     gpu: &Gpu,
     p: &mut Parts<'_>,
-    hybrid: &Hybrid<GlmHost>,
+    hybrid: &Hybrid<HostRun>,
     l: usize,
     n_tier: usize,
 ) -> Result<(), GpuError> {

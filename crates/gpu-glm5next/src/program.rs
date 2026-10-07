@@ -1,6 +1,6 @@
 //! The GLM layer program of the one-token step, of the verify's two rows and
 //! of a pass of slots' rows ([`StepProgram`]) and the port its host legs
-//! go through ([`HostLeg`]): [`runtime::sched::walk`] over the point `(1, 1,
+//! go through ([`StepLeg`]): [`runtime::sched::walk`] over the point `(1, 1,
 //! Step)`, `(2, 1, Step)` for the verify, or a pass's point ([`slots_point`]:
 //! [`runtime::sched::slot_lanes`]' for a plain pass's slots, a row each,
 //! `(m, 1, Step)` for a NextN load's slots' `m` verify rows), whose rows run
@@ -29,17 +29,17 @@
 //! layer with card experts); the head adds the mean and its own three.
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::StepLeg;
+use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::hc::{HcPostArgs, HcQ8Params, HcQ8PreArgs};
-use cuda_core::CudaStream;
 use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
-use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
+use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind};
 
 use crate::body::{LANES, LOAD_ROWS, Parts, f32v, q8};
-use crate::host::GlmHost;
 use crate::tensors::LayerNames;
 use crate::{ffn, kda, mla};
 
@@ -99,7 +99,7 @@ pub(crate) fn walk_step(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
-    hybrid: &mut Hybrid<GlmHost>,
+    hybrid: &mut Hybrid<HostRun>,
     head: &mut Head,
 ) -> Result<(), GpuError> {
     walk(gpu, w, parts, hybrid, STEP, [Some(head), None, None, None])
@@ -111,7 +111,7 @@ pub(crate) fn walk_pair(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
-    hybrid: &mut Hybrid<GlmHost>,
+    hybrid: &mut Hybrid<HostRun>,
     heads: [&mut Head; LANES],
 ) -> Result<(), GpuError> {
     let o = Overlap {
@@ -129,7 +129,9 @@ pub(crate) fn walk_pair(
 /// quad for two. A pass of no slot is refused by name.
 pub(crate) fn slots_point(slots: usize, rows: usize) -> Result<Overlap, GpuError> {
     if rows == slots {
-        return Ok(sched::slot_lanes(slots).map_err(HostLeg::refused)?.overlap);
+        return Ok(sched::slot_lanes(slots)
+            .map_err(StepLeg::<HostRun>::refused)?
+            .overlap);
     }
     Ok(Overlap {
         units: rows,
@@ -146,7 +148,7 @@ pub(crate) fn walk_slots(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
-    hybrid: &mut Hybrid<GlmHost>,
+    hybrid: &mut Hybrid<HostRun>,
     slots: usize,
     heads: &mut [Head],
 ) -> Result<(), GpuError> {
@@ -177,15 +179,12 @@ fn walk(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
-    hybrid: &mut Hybrid<GlmHost>,
+    hybrid: &mut Hybrid<HostRun>,
     o: Overlap,
     heads: [Option<&mut Head>; LOAD_ROWS],
 ) -> Result<(), GpuError> {
     let layers = parts.cfg.len();
-    let mut port = HostLeg {
-        stream: gpu.stream(),
-        hybrid,
-    };
+    let mut port = StepLeg::new(gpu.stream(), hybrid);
     let mut prog = StepProgram {
         gpu,
         w,
@@ -194,33 +193,6 @@ fn walk(
         heads,
     };
     sched::walk(o, layers, &mut port, &mut prog)
-}
-
-/// The step's host leg through the body's host tier.
-pub(crate) struct HostLeg<'a> {
-    stream: &'a CudaStream,
-    hybrid: &'a mut Hybrid<GlmHost>,
-}
-
-impl Port for HostLeg<'_> {
-    type Error = GpuError;
-    const KIND: PortKind = PortKind::Step;
-
-    /// Opens the host tier's step port on the point's rows
-    /// ([`Hybrid::open_step`]): one row of one column, two for the verify or
-    /// a pass of two slots' rows, four for a NextN load's two slots' verify
-    /// rows (the boundary must carry them); any other point is refused by
-    /// name.
-    fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
-        self.hybrid.open_step(self.stream, o.units, o.cols)
-    }
-
-    fn refused(why: Refused) -> GpuError {
-        GpuError::Shape {
-            what: WHAT,
-            detail: why.to_string(),
-        }
-    }
 }
 
 /// The GLM program over one walk: the body's parts, each row's stream
@@ -256,7 +228,7 @@ impl StepProgram<'_, '_> {
 }
 
 impl<'s> LayerProgram for StepProgram<'s, '_> {
-    type Port = HostLeg<'s>;
+    type Port = StepLeg<'s, HostRun>;
 
     /// The row's stream buffer 0, which its embedding wrote.
     fn begin(&mut self, unit: usize) -> Result<(), GpuError> {
@@ -266,7 +238,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
 
     /// The mixer sub-layer, then the block's input and the dense block with
     /// its `hc_post`, or the routed block up to its go.
-    fn front(&mut self, port: &mut HostLeg<'s>, at: At) -> Result<(), GpuError> {
+    fn front(&mut self, port: &mut StepLeg<'s, HostRun>, at: At) -> Result<(), GpuError> {
         self.at(at.unit)?;
         let (gpu, w, l) = (self.gpu, self.w, at.layer);
         let kind = self.parts.cfg[l].kind;
@@ -289,32 +261,38 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
                 self.hc_out()?;
                 self.parts.tap(gpu, l, self.cur[at.unit])
             }
-            FfnKind::Moe => ffn::front(gpu, w, &mut self.parts, port.hybrid, l),
+            FfnKind::Moe => ffn::front(gpu, w, &mut self.parts, port.hybrid(), l),
         }
     }
 
     /// A routed layer's card experts and shared expert under its host leg.
-    fn shadow(&mut self, port: &mut HostLeg<'s>, at: At) -> Result<(), GpuError> {
+    fn shadow(&mut self, port: &mut StepLeg<'s, HostRun>, at: At) -> Result<(), GpuError> {
         self.at(at.unit)?;
         let l = at.layer;
         if !self.parts.cfg[l].kind.host_leg() {
             return Ok(());
         }
-        ffn::shadow(self.gpu, self.w, &mut self.parts, port.hybrid.boundary(), l)
+        ffn::shadow(
+            self.gpu,
+            self.w,
+            &mut self.parts,
+            port.hybrid().boundary(),
+            l,
+        )
     }
 
     /// A routed layer's wait, sum and `hc_post`, its tap, and the host tier
     /// told the layer is enqueued (an eager chain is served there).
-    fn back(&mut self, port: &mut HostLeg<'s>, at: At) -> Result<(), GpuError> {
+    fn back(&mut self, port: &mut StepLeg<'s, HostRun>, at: At) -> Result<(), GpuError> {
         let (gpu, l) = (self.gpu, at.layer);
         if !self.parts.cfg[l].kind.host_leg() {
             return Ok(());
         }
         self.at(at.unit)?;
-        ffn::back(gpu, &mut self.parts, port.hybrid, l)?;
+        ffn::back(gpu, &mut self.parts, port.hybrid(), l)?;
         self.hc_out()?;
         self.parts.tap(gpu, l, self.cur[at.unit])?;
-        port.hybrid.row_enqueued(l, at.unit)
+        port.hybrid().row_enqueued(l, at.unit)
     }
 
     /// The row's streams' mean into its head, and the head.

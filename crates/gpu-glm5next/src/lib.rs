@@ -57,7 +57,6 @@ pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, LOAD_ROWS, NEXTN_ON_TIER, Plant,
     TIER_BEFORE_UPLOAD, prompt, set_taps,
 };
-pub use host::GlmHost;
 pub use model::arch::glm5next::place::KdaLanes;
 pub use program::{layer_launches, step_launches};
 pub use swap::{DEADLINE, LIVE_DELAY};
