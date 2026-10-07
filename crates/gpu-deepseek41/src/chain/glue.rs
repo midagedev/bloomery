@@ -58,11 +58,12 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread}
 use cuda_host::cuda_module;
 use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
 use engram::{Engram, Faults};
+use gguf::Split;
 use gguf::quant::GgmlType;
-use gguf::{Split, TensorInfo};
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::StepPlan;
+use model::embed::RowLayout;
 
 use crate::chain::ffn::ShadowWork;
 use crate::dense::{Dense, DenseKernels};
@@ -1148,8 +1149,8 @@ pub struct StepRows {
     helper: Option<Prefetcher>,
     /// Kept when [`RowsLevers::stats`] is on.
     stats: Option<EngramStats>,
-    /// `token_embd`'s shard and header, and the bytes of one of its rows.
-    embd: (usize, TensorInfo),
+    /// `token_embd`'s layout in the file.
+    embd: RowLayout,
     embd_bytes: usize,
     n_vocab: usize,
     /// Rows a site gathers per token, and bytes a row.
@@ -1185,26 +1186,20 @@ impl StepRows {
         const WHAT: &str = "StepRows::open";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
         let name = names::token_embd();
-        let (shard, info) = file.find(&name).ok_or_else(|| GpuError::Tensor {
-            what: WHAT,
-            name: name.clone(),
-            need: "in the file",
-        })?;
-        let embd_bytes = match info.ty {
-            GgmlType::BF16 => Some(2 * hp.n_embd),
-            GgmlType::Q3_K if hp.n_embd.is_multiple_of(Q3_K_BLOCK) => {
-                Some(hp.n_embd / Q3_K_BLOCK * Q3_K_BYTES)
-            }
-            _ => None,
-        };
-        let Some(embd_bytes) = embd_bytes.filter(|_| {
-            info.dims == [hp.n_embd as u64, hp.n_vocab as u64] && info.ty == hp.rows.token_embd
-        }) else {
+        let embd = RowLayout::open(file, &name, hp.n_embd)?;
+        let embd_ok = matches!(embd.ty(), GgmlType::BF16 | GgmlType::Q3_K)
+            && embd.ty() == hp.rows.token_embd
+            && embd.n_vocab() == hp.n_vocab;
+        if !embd_ok {
             return Err(refuse(format!(
-                "{name} is {} {:?}, want bf16 or Q3_K [{}, {}]",
-                info.ty, info.dims, hp.n_embd, hp.n_vocab
+                "{name} is {} of {} rows, want bf16 or Q3_K [{}, {}]",
+                embd.ty(),
+                embd.n_vocab(),
+                hp.n_embd,
+                hp.n_vocab
             )));
-        };
+        }
+        let embd_bytes = embd.row_bytes();
         let paths = (0..file.shard_count()).filter_map(|i| file.shard_path(i));
         let engram = Engram::open(paths).map_err(|e| GpuError::plan(WHAT, e))?;
         engram
@@ -1268,7 +1263,7 @@ impl StepRows {
         Ok(StepRows {
             helper,
             stats: levers.stats.then(EngramStats::default),
-            embd: (shard, info.clone()),
+            embd,
             embd_bytes,
             n_vocab: hp.n_vocab,
             n_cols,
@@ -1322,13 +1317,7 @@ impl StepRows {
         }
         check_tokens(plan, self.n_vocab)?;
         if self.helper.is_none() {
-            embd_rows_into(
-                &self.embd,
-                [self.embd_bytes, self.n_vocab],
-                &mut self.embd_rows,
-                file,
-                plan,
-            )?;
+            embd_rows_into(&self.embd, &mut self.embd_rows, file, plan)?;
         }
         let site_bytes = self.n_cols * self.row_bytes;
         let token_ids = self.engram.sites().len() * self.n_cols;
@@ -1345,13 +1334,7 @@ impl StepRows {
                     // Only the first token overlaps the embedding rows; a
                     // step of one token, the engine's, is all of it.
                     if k == 0 {
-                        let embd = embd_rows_into(
-                            &self.embd,
-                            [self.embd_bytes, self.n_vocab],
-                            &mut self.embd_rows,
-                            file,
-                            plan,
-                        );
+                        let embd = embd_rows_into(&self.embd, &mut self.embd_rows, file, plan);
                         // The helper holds a job: take it back before an
                         // error leaves, or the next begin's submit is refused.
                         if let Err(e) = embd {
@@ -1535,34 +1518,24 @@ fn check_tokens(plan: &StepPlan, n_vocab: usize) -> Result<(), GpuError> {
     }
 }
 
-/// Every token's embedding row of `plan` into `out` (`row` bytes a token, as
-/// the file stores them), from `file`'s `token_embd` of `n_vocab` rows at
-/// `embd` (its shard and header).
+/// Every token's embedding row of `plan` into `out` (`embd.row_bytes()`
+/// bytes a token, as the file stores them), from `file`'s `token_embd` laid
+/// out as `embd`.
 fn embd_rows_into(
-    embd: &(usize, TensorInfo),
-    [row, n_vocab]: [usize; 2],
+    embd: &RowLayout,
     out: &mut [u8],
     file: &Split,
     plan: &StepPlan,
 ) -> Result<(), GpuError> {
-    const WHAT: &str = "StepRows::fill";
-    let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
-    let (shard, info) = embd;
-    let table = file
-        .shard(*shard)
-        .ok_or_else(|| refuse(format!("the file has no shard {shard}")))?
-        .data(info)?;
-    for (&token, dst) in plan.tokens.iter().zip(out.chunks_exact_mut(row)) {
-        let t = token as usize;
-        let bytes = (t < n_vocab)
-            .then(|| table.get(t * row..(t + 1) * row))
-            .flatten()
-            .ok_or_else(|| {
-                refuse(format!(
-                    "token {token}: no row of {row} bytes in a table of {n_vocab} rows, {} bytes",
-                    table.len()
-                ))
-            })?;
+    for (&token, dst) in plan
+        .tokens
+        .iter()
+        .zip(out.chunks_exact_mut(embd.row_bytes()))
+    {
+        let bytes = embd.row(file, token).map_err(|e| GpuError::Shape {
+            what: "StepRows::fill",
+            detail: e.to_string(),
+        })?;
         dst.copy_from_slice(bytes);
     }
     Ok(())
