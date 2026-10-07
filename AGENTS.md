@@ -90,8 +90,11 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
 - **Landing batches.** `tools/gate-batch.sh --list FILE` takes `just affected` output and runs it in lanes (A the 3090,
   B the A6000, X alone after both: `[group('solo')]` or `BLOOMERY_CARD=both`). A lane that empties its queue takes the
   other lane's unstarted balanced items onto its own card, after a `lease_free` probe; a fixed, solo or v41-load item
-  never moves, and a moved item's key, times row and `lane=` name the card it ran on. It refuses to start while the
-  timing lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose
+  never moves, and a moved item's key, times row and `lane=` name the card it ran on. `--tier real|fixture` (default
+  real) runs the batch on each family's fixture files: `[group('solo-real')]` is alone in the real tier and balanced in the
+  fixture tier, a family with no fixture is a named red item (rc 66, never a run on its real file), the keys and times keep
+  the tiers apart, and the DONE line counts the clauses a fixture run left to the real tier (`deferred=`). It refuses to
+  start while the timing lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose
   input key (`tools/recipes.py key`) is green in `~/.cache/bloomery/gate-ledger.tsv`; `--round-ledger` (a round's)
   records only in `gate-ledger-rounds.tsv`. The lead reads the rounds' file only with `--trust-rounds`, and only for a
   change that moves no behaviour (`just ptx-scan` equal to the base). A rebase moves the key of every item the landed

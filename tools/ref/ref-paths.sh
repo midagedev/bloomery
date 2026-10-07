@@ -30,6 +30,19 @@
 # here, and a script that picks another profile is refused, because the export would not follow it:
 # the second profile's set name, tokens and lease would be applied to the first profile's file.
 #
+# The tier. BLOOMERY_TIER is `real` (unset is the same: every name here is as the profile defines it) or `fixture`: the
+# model file is the family's fixture — the small file `fixture generate` writes (crates/model/src/bin/fixture.rs), whose header
+# names the card budget that forces the plan to offload (`fixture_budget`, below; tools/box.sh exports it as BLOOMERY_CARD_BUDGET).
+# What the fixture tier does is the family's, one row of the table below:
+#   a fixture directory    the first shard `*-00001-of-*.gguf` of the one directory under $BLOOMERY_FIXTURE_ROOT
+#                          (default /models/fixtures), one a family; MODEL becomes it unless BLOOMERY_REF_MODEL names a file
+#                          already (a caller's own wins), and FIXTURE_FILE names it either way. Not one file there: 66.
+#   self                   the family's real file is small: it stands, FIXTURE_FILE stays empty.
+#   none                   the family has no fixture yet — and so does a profile the table does not name: 66, naming the
+#                          family. Never a run on the real file.
+# Exit codes: 64 a BLOOMERY_TIER that is neither, 65 a fixture whose header is not a whole fixture (`fixture_budget`), 66 no
+# fixture for the family.
+#
 # SC2034: the sourcing script reads these, which shellcheck does not see in this file alone.
 # shellcheck disable=SC2034
 : "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
@@ -50,3 +63,79 @@ source "$__ref_paths_profile"
 unset __ref_paths_profile
 IKBIN=${IKBIN:-$IK/build/bin/llama-bench}
 : "${BLOOMERY_DATA:=/root/bloomery-data}"
+
+REF_PATHS_DIR=${BASH_SOURCE[0]%/*}
+FIXTURE_FILE=
+case "${BLOOMERY_TIER:-real}" in
+  real) ;;
+  fixture)
+    case "$BLOOMERY_MODEL" in
+      qwen4exp) __fixture_dir=qwen38 ;;
+      deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;
+      *) __fixture_dir=none ;;
+    esac
+    case "$__fixture_dir" in
+      self) ;;
+      none)
+        echo "ref-paths.sh: BLOOMERY_TIER=fixture, but the family '$BLOOMERY_MODEL' has no fixture yet (the table in $REF_PATHS_DIR/ref-paths.sh): not running it on its real file (exit 66)" >&2
+        exit 66
+        ;;
+      *)
+        __fixture_root=${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}
+        __fixture_files=("$__fixture_root/$__fixture_dir"/*-00001-of-*.gguf)
+        if [ ! -e "${__fixture_files[0]}" ]; then
+          echo "ref-paths.sh: BLOOMERY_TIER=fixture: the family '$BLOOMERY_MODEL' has no fixture file, no $__fixture_root/$__fixture_dir/*-00001-of-*.gguf (\`fixture generate\` writes it); not running it on its real file (exit 66)" >&2
+          exit 66
+        fi
+        if [ "${#__fixture_files[@]}" != 1 ]; then
+          echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir holds ${#__fixture_files[@]} first shards (${__fixture_files[*]}), not one (exit 66)" >&2
+          exit 66
+        fi
+        FIXTURE_FILE=${__fixture_files[0]}
+        [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_FILE
+        ;;
+    esac
+    unset __fixture_dir __fixture_root __fixture_files
+    ;;
+  *)
+    echo "ref-paths.sh: BLOOMERY_TIER is real (unset: the same) or fixture, got '${BLOOMERY_TIER}'" >&2
+    exit 64
+    ;;
+esac
+
+# fixture_budget: what a command under the fixture tier needs of the fixture's header, once per command (tools/box.sh calls it):
+# the card budget the generator recorded (bloomery.fixture.card_budget, bytes) on stdout, nothing for a family whose real file
+# stands (FIXTURE_FILE empty). The header is read through tools/ref/gguf-ranges.py's reader; a file that is not a whole fixture
+# — no bloomery.fixture.version key, a bloomery.fixture.subset key (it holds some of the planned tensors only), no
+# positive integer card budget, or no readable header — is a named 65 (or the reader's own code), never a plan without a budget.
+fixture_budget() {
+  [ -n "$FIXTURE_FILE" ] || return 0
+  python3 -I - "$REF_PATHS_DIR/gguf-ranges.py" "$FIXTURE_FILE" << 'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("gguf_ranges", sys.argv[1])
+reader = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(reader)
+path = sys.argv[2]
+
+
+def refuse(code, why):
+    print(f"ref-paths.sh: BLOOMERY_TIER=fixture: {why} (exit {code})", file=sys.stderr)
+    sys.exit(code)
+
+
+try:
+    meta = reader.header(path)[0]
+except reader.Refusal as e:
+    refuse(e.code, str(e))
+if "bloomery.fixture.version" not in meta:
+    refuse(65, f"{path} has no bloomery.fixture.version key: it is not a fixture file")
+if "bloomery.fixture.subset" in meta:
+    refuse(65, f"{path} carries bloomery.fixture.subset: it holds only some of the planned tensors, and the engine must not run it")
+budget = meta.get("bloomery.fixture.card_budget")
+if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+    refuse(65, f"{path} records no positive bloomery.fixture.card_budget (read {budget!r})")
+print(budget)
+PY
+}

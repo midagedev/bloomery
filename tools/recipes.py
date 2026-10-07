@@ -148,6 +148,7 @@ import fcntl
 import functools
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -3774,14 +3775,32 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #   item      ARGS, the item's full BLOOMERY_BOX_ENV (the caller's, then the item's, then the lane's
 #             card), the card that env forces
 #   mac-env   the Mac-side variables tools/box.sh carries or reads (BLOOMERY_REMOTE is not one: it
-#             names a track's directory, not an input), and the versions of just and python3
+#             names a track's directory, not an input) — among them BLOOMERY_TIER, unset and `real` the one value
+#             `real`, so a fixture-tier green never stands for the real file's — and the versions of just and python3
 #   box       every line of the box manifest (`box-manifest`, fetched once per batch), its model rows
-#             only for the model directories the item can open (KeyContext.model_scope)
+#             only for the model directories the item can open (KeyContext.model_scope); the fixture
+#             directory's rows (FIXTURE_ROOT, every file under it) only for an item in the fixture tier
 # Not in it: the binary (its paths are per track) and the commit.
 
 KEY_VERSION = "bloomery-gate-key 1"
 MANIFEST_VERSION = "box-manifest 1"
-MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL")
+MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_TIER", "BLOOMERY_V41_MODEL")
+# The fixture tier's files (tools/ref/ref-paths.sh: one directory a family under it). Its rows belong to the keys of fixture-tier
+# items only: a real item must not rerun because a fixture was regenerated, and a fixture item must, whatever a fixture file's
+# directory is called — so the box manifest lists every file under it, subdirectories included, and no file's literal
+# brings it into a real item's key (KeyContext.literal_dirs).
+FIXTURE_ROOT = "/models/fixtures"
+
+
+def tier_of(values: list[str], mac: str | None) -> str:
+    """The tier an item runs in: the last BLOOMERY_TIER=<t> entry of `values` (the box env, then the item's env), else the
+    Mac's BLOOMERY_TIER; unset and empty are `real`, as in tools/box.sh. A value that is neither is returned as it is."""
+    tier = mac or "real"
+    for e in values:
+        k, _, v = e.partition("=")
+        if k == "BLOOMERY_TIER":
+            tier = v or "real"
+    return tier
 KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".cargo/cuda-oxide.toml"]
 # tools/box.sh's rsync excludes (target/ and .git/ at any depth; *.ptx, *.ll, .oxide-artifacts/ at the
 # root), plus per-checkout noise no gate reads that would split the key by checkout: a worktree's .git
@@ -4041,7 +4060,7 @@ class KeyContext:
         self.box_env = box_env
         env = dict(os.environ) if environ is None else environ
         self.env = env
-        self.mac = [f"mac-env\t{v}\t{env[v] if v in env else '<unset>'}" for v in MAC_ENV]
+        self.mac = [f"mac-env\t{v}\t{tier_of([], env.get(v)) if v == 'BLOOMERY_TIER' else env[v] if v in env else '<unset>'}" for v in MAC_ENV]
         self.mac += [f"mac-tool\tjust\t{just_version()}", f"mac-tool\tpython3\t{platform.python_version()}"]
         self.manifest, self.manifest_head, self.manifest_error = load_manifest(manifest_path)
         if manifest_error:
@@ -4071,7 +4090,8 @@ class KeyContext:
 
     def literal_dirs(self, rel: str) -> frozenset[str]:
         if rel not in self._lit:
-            self._lit[rel] = file_model_literal_dirs(os.path.join(self.side.tree.root, rel)) if scans_for_models(rel) else frozenset()
+            found = file_model_literal_dirs(os.path.join(self.side.tree.root, rel)) if scans_for_models(rel) else frozenset()
+            self._lit[rel] = found - {FIXTURE_ROOT}
         return self._lit[rel]
 
     def model_scope(self, names: list[str], files: set[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[dict[str, str], set[str]]:
@@ -4104,6 +4124,9 @@ class KeyContext:
             if d:
                 dirs.setdefault(d, f"the Mac's {k}")
         need = set(dirs)
+        if tier_of(eff, self.env.get("BLOOMERY_TIER")) == "fixture":
+            dirs.setdefault(FIXTURE_ROOT, "the fixture tier")
+            need.add(FIXTURE_ROOT)
         for w in envs + argv:
             for v in w.split(","):
                 d = model_dir_of(v.split("=", 1)[-1])
@@ -4647,12 +4670,49 @@ def model_dirs(root: str = ROOT) -> set[str]:
     defaults), the box command's environment names, or the tree names literally — the directory of each,
     so a split set's shards all count. Never /models itself, whose listing moves whenever any model is
     fetched. An item's key selects its own rows out of these (KeyContext.model_scope)."""
-    env = {k: v for k, v in os.environ.items() if k != "BLOOMERY_REF_MODEL"}
+    env = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_TIER")}
     dirs: set[str] = set()
     for prof in sorted(glob.glob(os.path.join(root, "tools/ref/models/*.sh"))):
         dirs |= profile_dirs(root, os.path.relpath(prof, root), env)
     dirs |= {d for d in map(model_dir_of, os.environ.values()) if d}
-    return dirs | tree_model_dirs(root)
+    return dirs | tree_model_dirs(root) | {FIXTURE_ROOT}
+
+
+def model_dir_rows(d: str, recurse: bool) -> list[tuple]:
+    """The manifest rows of the entries of the model directory `d`: each file's size, mtime, ctime and inode (a link's target
+    and a dangling link's state too), each subdirectory a `dir` row — and, with `recurse`, the rows of what is inside it. The
+    fixture root recurses: its files sit one directory a family down, and a fixture rewritten in place must move the keys that
+    read it."""
+    rows: list[tuple] = []
+    for f in sorted(os.listdir(d)):
+        p = os.path.join(d, f)
+        lst = os.lstat(p)
+        if stat.S_ISDIR(lst.st_mode):
+            rows.append(("model", p, "dir"))
+            if recurse:
+                rows += model_dir_rows(p, True)
+            continue
+        link = os.readlink(p) if stat.S_ISLNK(lst.st_mode) else ""
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            rows.append(("model", p, "->", link, "dangling"))
+            continue
+        rows.append(("model", p, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino) + (("->", link) if link else ()))
+    return rows
+
+
+def manifest_model_rows(d: str, fixture_root: str = FIXTURE_ROOT) -> list[tuple]:
+    """The box manifest's rows of one model path of model_dirs(): a file's own row, a directory that is absent or empty named so,
+    a directory's entries (model_dir_rows; the fixture root's reach below its family directories)."""
+    if os.path.isfile(d):
+        st = os.stat(d)
+        return [("model", d, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)]
+    if not os.path.isdir(d):
+        return [("model-dir", d, "absent")]
+    if not os.listdir(d):
+        return [("model-dir", d, "empty")]
+    return model_dir_rows(d, d == fixture_root)
 
 
 def cmd_box_manifest(args: argparse.Namespace) -> int:
@@ -4695,29 +4755,7 @@ def cmd_box_manifest(args: argparse.Namespace) -> int:
         drows, nfiles = data_manifest(data, cache, args.workers)
         rows += drows
         for d in sorted(model_dirs()):
-            if os.path.isfile(d):
-                st = os.stat(d)
-                rows.append(("model", d, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
-                continue
-            if not os.path.isdir(d):
-                rows.append(("model-dir", d, "absent"))
-                continue
-            if not os.listdir(d):
-                rows.append(("model-dir", d, "empty"))
-                continue
-            for f in sorted(os.listdir(d)):
-                p = os.path.join(d, f)
-                lst = os.lstat(p)
-                if stat.S_ISDIR(lst.st_mode):
-                    rows.append(("model", p, "dir"))
-                    continue
-                link = os.readlink(p) if stat.S_ISLNK(lst.st_mode) else ""
-                try:
-                    st = os.stat(p)
-                except FileNotFoundError:
-                    rows.append(("model", p, "->", link, "dangling"))
-                    continue
-                rows.append(("model", p, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino) + (("->", link) if link else ()))
+            rows += manifest_model_rows(d)
         took = time.time() - t0
         head = (
             f"# {MANIFEST_VERSION} host={platform.node()} remote={ROOT} data={data} took={took:.2f}s "
@@ -5067,6 +5105,43 @@ def key_self_test(expect, real: Side) -> None:
         expect(one("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--y") != base["args"], "ARGS do not move the key")
         expect(moved(keys(sa, box_env="BLOOMERY_X=1")) == set(items), "the caller's BLOOMERY_BOX_ENV does not move every key")
         expect(moved(keys(sa, environ={"BLOOMERY_DATA": "/x"})) == set(items), "the Mac's BLOOMERY_DATA does not move every key")
+        # The tier: one item under the real tier and under the fixture tier is two keys, whichever way the tier is named, and unset
+        # and `real` are one — a fixture green must never stand for the real file's, nor `--tier real` split the real greens.
+        fx_env = {"BLOOMERY_TIER": "fixture"}
+        expect(moved(keys(sa, environ=fx_env)) == set(items), "the Mac's BLOOMERY_TIER=fixture does not move every key")
+        expect(moved(keys(sa, box_env="BLOOMERY_TIER=fixture")) == set(items), "a BLOOMERY_TIER entry of the box env does not move every key")
+        expect(not moved(keys(sa, environ={"BLOOMERY_TIER": "real"})), "BLOOMERY_TIER=real moves a key: it is the unset value")
+        expect(not moved(keys(sa, environ={"BLOOMERY_TIER": ""})), "an empty BLOOMERY_TIER moves a key: it is the unset value")
+        expect(keys(sa, environ=fx_env) != keys(sa, environ={"BLOOMERY_TIER": "bad"}), "an unnamed tier keys like the fixture tier")
+        # The Mac-env part itself (a fixture tier's manifest rows move the key as well, so a moved key alone would not show a lost part).
+        mac_row = lambda e: [r for r in KeyContext(sa, mf, environ=e).mac if r.startswith("mac-env\tBLOOMERY_TIER\t")]  # noqa: E731
+        expect("BLOOMERY_TIER" in MAC_ENV, "BLOOMERY_TIER is not in MAC_ENV")
+        expect(mac_row(fx_env) == ["mac-env\tBLOOMERY_TIER\tfixture"], f"the Mac's BLOOMERY_TIER=fixture is not a key part: {mac_row(fx_env)}")
+        expect(mac_row({}) == mac_row({"BLOOMERY_TIER": "real"}) == mac_row({"BLOOMERY_TIER": ""}) == ["mac-env\tBLOOMERY_TIER\treal"],
+               f"unset, empty and `real` are not one key part: {mac_row({})} {mac_row({'BLOOMERY_TIER': 'real'})} {mac_row({'BLOOMERY_TIER': ''})}")
+        # ... and the ledger reader: a green recorded at the fixture key does not skip the real item, and skips the fixture one.
+        k_real, k_fix = (keys(sa, environ=e, only={"x": items["gpu"]})["x"] for e in ({}, fx_env))
+        with tempfile.TemporaryDirectory(prefix="recipes-tier-ledger-") as ld:
+            lp = os.path.join(ld, "ledger.tsv")
+            with open(lp, "w", encoding="utf-8") as fh:
+                fh.write(f"{k_fix}\tgate-gpu-q4k-sel\t{items['gpu']}\tc1\t2026-10-07T09:00:00+0900\t/t/fx\n")
+            st_real, _ = ledger_status(k_real, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
+            st_fix, _ = ledger_status(k_fix, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
+        expect(st_real == "run" and st_fix == "skip", f"a fixture-tier green and the ledger: the real item {st_real}, the fixture one {st_fix}")
+        # The fixture directory's rows belong to the fixture tier's keys alone: a real key does not move with them, a fixture key
+        # does, and the row of a file inside a family's directory is one (the manifest lists below a subdirectory there).
+        fx_file = f"model\t{FIXTURE_ROOT}/qwen38/q-00001-of-00001.gguf\t100\t1\t2\t3"
+        fixture_free = [ln for ln in manifest[:-1] if not ln.startswith(f"model-dir\t{FIXTURE_ROOT}\t")]
+        write_manifest(fixture_free + ["# end"])
+        real_before, fix_before = keys(sa), keys(sa, environ=fx_env)
+        write_manifest(fixture_free + [fx_file, "# end"])
+        expect(not moved(keys(sa)), "a fixture file's manifest row moved a real-tier key")
+        expect(keys(sa, environ=fx_env) != fix_before and all(keys(sa, environ=fx_env)[k] != fix_before[k] for k in items),
+               "a fixture file's manifest row did not move every fixture-tier key")
+        write_manifest(fixture_free + [fx_file.replace("\t100\t", "\t101\t"), "# end"])
+        expect(all(keys(sa, environ=fx_env)[k] != fix_before[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
+        write_manifest(manifest)
+        expect(keys(sa) == base, "the base manifest, restored, keys another way")
         for i in range(1, nfixed - 1):
             mut = list(manifest)
             mut[i] = mut[i] + "x"
@@ -5137,7 +5212,11 @@ def key_self_test(expect, real: Side) -> None:
         write_manifest(manifest)
         c = KeyContext(sa, mf, "", {}, settings=settings)
         rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
-        expect(len(rows) == len([ln for ln in manifest if ln.startswith(("model\t", "model-dir\t"))]), f"a whole-tree item holds {len(rows)} model rows, not the manifest's all")
+        all_rows = [ln for ln in manifest if ln.startswith(("model\t", "model-dir\t"))]
+        tier_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == FIXTURE_ROOT]
+        expect(len(rows) == len(all_rows) - len(tier_rows), f"a whole-tree item holds {len(rows)} model rows, not the manifest's all but the fixture tier's {len(tier_rows)}")
+        fx_rows = [p for p in KeyContext(sa, mf, "BLOOMERY_TIER=fixture", {}, settings=settings).parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
+        expect(len(fx_rows) == len(all_rows), f"a whole-tree item of the fixture tier holds {len(fx_rows)} model rows, not the manifest's all")
         penv = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL", "BLOOMERY_DSPARK_MODEL")}
         for prof in sorted(glob.glob(os.path.join(roots[0], "tools/ref/models/*.sh"))):
             rel = os.path.relpath(prof, roots[0])
@@ -5460,6 +5539,147 @@ def ledger_self_test(expect) -> None:
         expect(st == "run" and "no green record of gate-q" in det, f"unknown item: {st} {det}")
         st, det = ledger_status(k_none, "gate-y", "gate-y", [], leds)
         expect(st == "run" and det.endswith("(src=round)"), f"history from the rounds' ledger is labelled: {st} {det}")
+
+
+def manifest_rows_self_test(expect) -> None:
+    """The fixture root's manifest rows reach below a family's directory: every file there has a row that moves when the file is
+    rewritten; any other model directory lists its subdirectories as `dir` rows only, as before."""
+    with tempfile.TemporaryDirectory(prefix="recipes-rows-") as tmp:
+        fam = os.path.join(tmp, "qwen38")
+        os.makedirs(os.path.join(fam, "draft"))
+        for rel in ("qwen38/f-00001-of-00001.gguf", "qwen38/draft/f-draft.gguf", "top.txt"):
+            with open(os.path.join(tmp, rel), "wb") as fh:
+                fh.write(b"x" * 10)
+        deep = manifest_model_rows(tmp, fixture_root=tmp)
+        names = [os.path.relpath(r[1], tmp) for r in deep]
+        expect(names == ["qwen38", "qwen38/draft", "qwen38/draft/f-draft.gguf", "qwen38/f-00001-of-00001.gguf", "top.txt"],
+               f"fixture-root rows: {names}")
+        flat_rows = manifest_model_rows(tmp, fixture_root=os.path.join(tmp, "elsewhere"))
+        flat = [os.path.relpath(r[1], tmp) for r in flat_rows]
+        expect(flat == ["qwen38", "top.txt"] and flat_rows[0][2] == "dir", f"another model directory's rows: {flat}")
+        with open(os.path.join(fam, "f-00001-of-00001.gguf"), "ab") as fh:
+            fh.write(b"y")
+        expect(manifest_model_rows(tmp, fixture_root=tmp) != deep, "a file rewritten below the fixture root moved no row")
+        expect(manifest_model_rows(os.path.join(tmp, "nowhere")) == [("model-dir", os.path.join(tmp, "nowhere"), "absent")], "an absent model directory has no row")
+        os.makedirs(os.path.join(tmp, "empty"))
+        expect(manifest_model_rows(os.path.join(tmp, "empty")) == [("model-dir", os.path.join(tmp, "empty"), "empty")], "an empty model directory has no row")
+        # model_dirs on a tree that names no fixture directory itself: the fixture root is listed all the same.
+        os.makedirs(os.path.join(tmp, "bare/tools/ref/models"))
+        expect(FIXTURE_ROOT in model_dirs(os.path.join(tmp, "bare")), f"the box manifest does not list {FIXTURE_ROOT}")
+
+
+def ref_paths_self_test(expect) -> None:
+    """tools/ref/ref-paths.sh under BLOOMERY_TIER on a scratch tree (stub profiles, a fixture directory written with gguf-ranges.py's
+    writer): the real tier changes nothing; the fixture tier resolves the family's fixture and its budget, a caller's own
+    BLOOMERY_REF_MODEL wins, a family that is small stays on its file, and a family with no fixture, a directory with none or two,
+    a file that is not a whole fixture and a tier that is neither are each a named non-zero exit."""
+    src = os.path.join(ROOT, "tools/ref")
+    spec = importlib.util.spec_from_file_location("gguf_ranges_t", os.path.join(src, "gguf-ranges.py"))
+    gr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gr)
+    with tempfile.TemporaryDirectory(prefix="recipes-refpaths-") as tmp:
+        os.makedirs(os.path.join(tmp, "tools/ref/models"))
+        for f in ("ref-paths.sh", "gguf-ranges.py"):
+            shutil.copyfile(os.path.join(src, f), os.path.join(tmp, "tools/ref", f))
+        for fam in ("qwen4exp", "deepseek2", "glm5next", "newfam"):
+            with open(os.path.join(tmp, f"tools/ref/models/{fam}.sh"), "w", encoding="utf-8") as fh:
+                fh.write(f"MODEL_NAME={fam}\nMODEL=${{BLOOMERY_REF_MODEL:-/models/real/{fam}.gguf}}\n")
+        root = os.path.join(tmp, "fixtures")
+        fam_dir = os.path.join(root, "qwen38")
+        os.makedirs(fam_dir)
+        first = os.path.join(fam_dir, "qwen38-fixture-00001-of-00001.gguf")
+
+        def write(path: str, kvs: list[tuple[str, int, int]]) -> None:
+            packed = [gr._kv_string("general.architecture", "qwen4exp")] + [gr._kv_scalar(k, t, v) for k, t, v in kvs]
+            gr.write_gguf(path, packed, [("token_embd.weight", 0, [8, 3], b"\1" * 96)])
+
+        whole = [("bloomery.fixture.version", 4, 1), ("bloomery.fixture.card_budget", 10, 6190000000)]
+        write(first, whole)
+
+        def run(profile: str, script: str, **env: str) -> tuple[int, str, str]:
+            e = {"PATH": os.environ["PATH"], "HOME": tmp, "BLOOMERY_MODEL": profile, "BLOOMERY_FIXTURE_ROOT": root, **env}
+            r = subprocess.run(["bash", "-c", f". tools/ref/ref-paths.sh && {script}"], cwd=tmp, env=e, capture_output=True, text=True)
+            return r.returncode, r.stdout, r.stderr
+
+        show = 'echo "$MODEL|$FIXTURE_FILE"'
+        real = "/models/real/qwen4exp.gguf|"
+        for env in ({}, {"BLOOMERY_TIER": "real"}, {"BLOOMERY_TIER": ""}):
+            rc, out, err = run("qwen4exp", show, **env)
+            expect(rc == 0 and out.strip() == real, f"ref-paths real tier {env}: {rc} {out!r} {err!r}")
+        rc, out, err = run("qwen4exp", f"{show}; fixture_budget", BLOOMERY_TIER="fixture")
+        expect(rc == 0 and out.split() == [f"{first}|{first}", "6190000000"], f"ref-paths fixture tier: {rc} {out!r} {err!r}")
+        rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="fixture", BLOOMERY_REF_MODEL="/x/own.gguf")
+        expect(rc == 0 and out.strip() == f"/x/own.gguf|{first}", f"ref-paths: a caller's own file does not win, or the fixture is not named: {rc} {out!r}")
+        rc, out, err = run("deepseek2", f"{show}; fixture_budget; echo budget-rc=$?", BLOOMERY_TIER="fixture")
+        expect(rc == 0 and out.split() == ["/models/real/deepseek2.gguf|", "budget-rc=0"], f"ref-paths: a small family does not stand: {rc} {out!r} {err!r}")
+        for fam in ("glm5next", "newfam"):
+            rc, out, err = run(fam, show, BLOOMERY_TIER="fixture")
+            expect(rc == 66 and out == "" and f"the family '{fam}' has no fixture yet" in err and "exit 66" in err, f"ref-paths: {fam} has no fixture: {rc} {out!r} {err!r}")
+        rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="both")
+        expect(rc == 64 and "BLOOMERY_TIER is real (unset: the same) or fixture, got 'both'" in err, f"ref-paths: a bad tier: {rc} {err!r}")
+        rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="fixture", BLOOMERY_FIXTURE_ROOT=os.path.join(tmp, "nowhere"))
+        expect(rc == 66 and "has no fixture file" in err and "nowhere/qwen38/*-00001-of-*.gguf" in err, f"ref-paths: no directory: {rc} {err!r}")
+        second = os.path.join(fam_dir, "other-00001-of-00002.gguf")
+        write(second, whole)
+        rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="fixture")
+        expect(rc == 66 and "holds 2 first shards" in err, f"ref-paths: two first shards: {rc} {out!r} {err!r}")
+        os.remove(second)
+        # a file that is not a whole fixture: the budget read is the named refusal
+        for why, kvs in (("has no bloomery.fixture.version key", [("bloomery.fixture.card_budget", 10, 5)]),
+                         ("carries bloomery.fixture.subset", whole + [("bloomery.fixture.subset", 4, 1)]),
+                         ("records no positive bloomery.fixture.card_budget", [("bloomery.fixture.version", 4, 1)]),
+                         ("records no positive bloomery.fixture.card_budget", [("bloomery.fixture.version", 4, 1), ("bloomery.fixture.card_budget", 10, 0)])):
+            write(first, kvs)
+            rc, out, err = run("qwen4exp", "fixture_budget", BLOOMERY_TIER="fixture")
+            expect(rc == 65 and out == "" and why in err, f"ref-paths: a file that {why}: {rc} {out!r} {err!r}")
+        with open(first, "wb") as fh:
+            fh.write(b"not a gguf at all")
+        rc, out, err = run("qwen4exp", "fixture_budget", BLOOMERY_TIER="fixture")
+        expect(rc == 65 and "is not a GGUF file" in err, f"ref-paths: a file that is no GGUF: {rc} {out!r} {err!r}")
+
+
+def box_tier_self_test(expect) -> None:
+    """tools/box.sh's tier, on a scratch tree with a stub ssh and rsync that log the commands: with no tier named the remote command
+    holds nothing of it; a tier named in the environment or in a BLOOMERY_BOX_ENV entry is exported before the first read of
+    ref-paths.sh (an entry the profile had not seen would reach the binary and not the file); the fixture tier adds the budget and
+    file reads; two tiers named, or one that is neither, end the command at 64 before anything reaches the box."""
+    with tempfile.TemporaryDirectory(prefix="recipes-boxtier-") as tmp:
+        os.makedirs(os.path.join(tmp, "tools"))
+        os.makedirs(os.path.join(tmp, "stubs"))
+        shutil.copyfile(os.path.join(ROOT, "tools/box.sh"), os.path.join(tmp, "tools/box.sh"))
+        shutil.copyfile(os.path.join(ROOT, "Cargo.toml"), os.path.join(tmp, "Cargo.toml"))
+        log = os.path.join(tmp, "ssh.log")
+        for name, body in (("ssh", f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> {shlex.quote(log)}\n'), ("rsync", "#!/bin/sh\n")):
+            path = os.path.join(tmp, "stubs", name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+
+        def run(**env: str) -> tuple[int, str, str]:
+            if os.path.exists(log):
+                os.remove(log)
+            e = {"PATH": f"{os.path.join(tmp, 'stubs')}:/usr/bin:/bin", "HOME": tmp, "BLOOMERY_REMOTE": "~/repo/x", **env}
+            r = subprocess.run(["bash", os.path.join(tmp, "tools/box.sh"), "echo hi"], env=e, capture_output=True, text=True)
+            sent = open(log, encoding="utf-8").read() if os.path.exists(log) else ""
+            return r.returncode, sent, r.stderr
+
+        first = "tools/ref/ref-paths.sh"
+        rc, sent, err = run()
+        expect(rc == 0 and "BLOOMERY_TIER" not in sent and "fixture_budget" not in sent and "BLOOMERY_FIXTURE_MODEL" not in sent,
+               f"box.sh with no tier names it in the remote command: {rc} {err!r}")
+        rc, real, err = run(BLOOMERY_TIER="real")
+        expect(rc == 0 and "export BLOOMERY_TIER=real &&" in real and "fixture_budget" not in real, f"box.sh BLOOMERY_TIER=real: {rc} {err!r}")
+        for how, env in (("the environment", {"BLOOMERY_TIER": "fixture"}), ("BLOOMERY_BOX_ENV", {"BLOOMERY_BOX_ENV": "FOO=1 BLOOMERY_TIER=fixture"})):
+            rc, sent, err = run(**env)
+            at, ref = sent.find("export BLOOMERY_TIER=fixture &&"), sent.find(first)
+            expect(rc == 0 and 0 <= at < ref, f"box.sh: the tier named in {how} is not exported before ref-paths.sh is read: {rc} {err!r}")
+            expect("fixture_budget" in sent and "BLOOMERY_FIXTURE_MODEL" in sent and "BLOOMERY_CARD_BUDGET" in sent,
+                   f"box.sh: the tier named in {how} does not take the fixture's budget and file: {sent[-400:]!r}")
+        expect(sent.count("fixture_budget") == 1, f"box.sh reads the fixture's budget more than once: {sent.count('fixture_budget')}")
+        rc, sent, err = run(BLOOMERY_TIER="fixture", BLOOMERY_BOX_ENV="BLOOMERY_TIER=real")
+        expect(rc == 64 and sent == "" and "name one" in err, f"box.sh: two tiers named: {rc} {sent!r} {err!r}")
+        rc, sent, err = run(BLOOMERY_BOX_ENV="BLOOMERY_TIER=both")
+        expect(rc == 64 and sent == "" and "real or fixture" in err and "'both'" in err, f"box.sh: a tier that is neither: {rc} {sent!r} {err!r}")
 
 
 def narrow_self_test(expect, side: Side) -> None:
@@ -6171,6 +6391,9 @@ def self_test() -> int:
     # the green ledger's key
     key_self_test(expect, side)
     ledger_self_test(expect)
+    manifest_rows_self_test(expect)
+    ref_paths_self_test(expect)
+    box_tier_self_test(expect)
 
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
