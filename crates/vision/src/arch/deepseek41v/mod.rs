@@ -3,6 +3,7 @@
 //! with a linear patch embedding and 2D RoPE, and the aligner (a 3×3 unfold, then two linear layers
 //! with an erf GELU between), plus the three learned span delimiters.
 
+pub mod card;
 pub mod hparams;
 pub mod media;
 pub mod names;
