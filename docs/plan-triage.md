@@ -185,6 +185,22 @@ Order:
   - XS each: `.config/nextest.toml` has no user (delete or adopt); `overflow-checks` per untrusted-input package (not
     profile-wide: overflow MIR breaks device lowering); a rust-analyzer config for the Mac.
   - Done: the lead's pre-push hook (fmt + five fast check-*.sh, 22 s).
+- **A graph capture broken by another thread's call on the same device** (worker2, 2026-10-07; S, after 0.2.6).
+  - Symptom: `gate-gpu-lib` went red once (eqc2's batch). A context test's second `Gpu::with_device(0)` got 900
+    ("operation not permitted when stream is capturing", `lib.rs:2834`, `:2872`), and the concurrent graph test's
+    capture failed with 901 (`graph.rs:944`). The capture is THREAD_LOCAL (`graph.rs:92-95`) on a non-blocking stream.
+  - The call, by code reading (worker2 and eqc2r; the lead re-read the source): the first stream on a fresh
+    `CudaContext` handle runs a context-wide `cuCtxSynchronize` (cuda-core 0.3.1 `simt/context.rs:461-465`, nvlabs-ledger
+    row 40). `primary_context` builds a fresh handle for every `Gpu` (`lib.rs:1904-1906`), so creating a `Gpu` on a
+    device breaks a capture that another thread is running there. The THREAD_LOCAL mode does not cover a context-wide
+    sync. Neither alloc nor module load is the call.
+  - Confirm with one box loop: capture on thread A while thread B only runs `CudaContext::new(0)` + `new_stream()`. It
+    should give 900/901. With B's stream made before A begins, it should run clean.
+  - Engine exposure: any `Gpu` or handle made on a device while that device captures. Check the tier gate's two `Gpu`s
+    on one card, a draft model's `Gpu`, a second card's thread, and swap/stage helpers that open their own handle.
+  - Fix after the loop, one owner: (a) `primary_context` takes each handle's first stream before any capture can run;
+    (b) one handle per device through `ANCHORS` (changes `hw_gpus_on_a_device_hold_their_own_handles`); (c) a fork
+    switch for `event_tracking` (a pin move). No test mutex: it would hide the engine's version of the race.
 - **gpu-gate.sh holds a card lock while it waits for the V4.1 load lock** (xstream23, 2026-10-07; S, after 0.2.6).
   The A6000 then idles (1 MiB in use) while `any` items fall back to the 3090 queue. Round gate items waited 20+ min
   each. The order is deliberate (`tools/gpu-gate.sh` self-test "lock order": a load queued on its card lock holds no
