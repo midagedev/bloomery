@@ -1084,7 +1084,7 @@ mod cli {
     /// window's proposal, kept rows and wall in ms.
     struct Windows {
         kept: Vec<(u32, u32, f64)>,
-        passes: Vec<(bool, usize, f64)>,
+        passes: Vec<(bool, usize, usize, f64)>,
     }
 
     impl PassSink<Session<Body>> for Windows {
@@ -1106,7 +1106,7 @@ mod cli {
             for (r, &token) in (0u32..).zip(tokens) {
                 self.kept.push((c.pos + r, token, per));
             }
-            self.passes.push((c.proposed, c.kept, ms));
+            self.passes.push((c.proposed, c.kept, c.rows, ms));
             Ok(())
         }
     }
@@ -1194,7 +1194,7 @@ mod cli {
         if a.timed {
             // Pass k's first kept position is generated token `at`.
             let mut at = 1;
-            for (k, &(proposed, kept, ms)) in (1usize..).zip(&sink.passes) {
+            for (k, &(proposed, kept, _, ms)) in (1usize..).zip(&sink.passes) {
                 Record::new(&record::TIME_PASS)
                     .u("i", k)
                     .flag("warm", at <= a.warm)
@@ -1212,12 +1212,15 @@ mod cli {
         let counted_ms: f64 = counted.iter().sum();
         let rate = counted.len() as f64 * 1e3 / counted_ms;
         let mut kept = [0u64; VERIFY_ROWS];
-        for &(_, k, _) in &sink.passes {
+        let mut widths = [0u64; VERIFY_ROWS];
+        for &(_, k, rows, _) in &sink.passes {
             kept[k - 1] += 1;
+            widths[rows - 1] += 1;
         }
         Record::new(&record::MTP_SUMMARY)
             .u("proposals", sink.passes.iter().filter(|p| p.0).count())
             .list("kept", &kept)
+            .list("widths", &widths)
             .u("positions", sink.passes.iter().map(|p| p.1).sum::<usize>())
             .u("passes", sink.passes.len())
             .f("tok/s(positions)", rate)
