@@ -278,8 +278,8 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Glm5nextBody],
-        at: "models/src/shape.rs ROUTERS, the Glm5next body",
-        runs: |n| routes(n, &[RouterBody::Glm5next]),
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body",
+        runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
     },
     Available {
         programs: &[Program::Glm5nextBody],
