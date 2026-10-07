@@ -12,32 +12,10 @@ use gguf::Split;
 
 use super::hparams::Hparams;
 use crate::arch::classify::{Counts, classify_with};
+use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-/// A tensor a layer of some kind carries, by stem: its role, and whether the
-/// file must carry it (llama.cpp creates it without `TENSOR_NOT_REQUIRED`).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Stem {
-    pub(super) name: &'static str,
-    pub(super) role: Role,
-    pub(super) required: bool,
-}
-
-const fn req(name: &'static str, role: Role) -> Stem {
-    Stem {
-        name,
-        role,
-        required: true,
-    }
-}
-
-const fn opt(name: &'static str, role: Role) -> Stem {
-    Stem {
-        name,
-        role,
-        required: false,
-    }
-}
+pub(super) use crate::arch::stems::{Stem, required};
 
 /// Every layer's mixer block beside the projections: the norms. The fused
 /// QKV matrix (`attn_qkv`) and the split one (`attn_q` + `attn_k` +
@@ -99,11 +77,6 @@ pub(super) const NEXTN: &[Stem] = &[
 
 /// Every stem a trunk layer may carry, by group.
 const TRUNK: [&[Stem]; 4] = [MIXER, DENSE, MOE, QKV_SPLIT];
-
-/// The names of `stems` the file must carry.
-pub(super) fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
-    stems.iter().filter(|s| s.required).map(|s| s.name)
-}
 
 /// The role of a trunk layer's stem.
 pub(super) fn layer_role(stem: &str) -> Option<Role> {
