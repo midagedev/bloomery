@@ -204,6 +204,13 @@ gate-gpu-hybrid *ARGS:
 gate-gpu-swap *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_swap {{ARGS}}'
 
+# The expert stream's gate (no model file, a synthetic source): the stream is the rule's set cut at the ring's half in
+# rank order, its rows and exclusion set say so, the engine stream reads a slot only once its copy landed, a half's next
+# stream waits for the half's read, an unread stream refuses the call's end, a stuck lane is a named error within its
+# deadline, a ring with no room is refused by its own name.
+gate-gpu-xstream *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_xstream && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_xstream {{ARGS}}'
+
 # 양자화 모델의 정확한 수학(가중치는 정확히 역양자화, 활성·어텐션은 f64, q8·f16 반올림 없음)으로 교사 강제 자의
 # 한 프롬프트를 푼다: 스텝마다 정확 top1·마진·ik 토큰 격차. 두 엔진(우리, ik)이 갈리는 자리의 심판이다.
 # CPU 64스레드를 쓰므로 기계 전역 임대를 잡는다. 예: `just exact-ref 12 --steps 23`, `--kv f16`은 캐시 f16 반올림 팔.

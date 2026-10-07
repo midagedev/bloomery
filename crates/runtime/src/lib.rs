@@ -37,6 +37,7 @@ mod stop;
 pub mod stores;
 pub mod swaprule;
 pub mod words;
+pub mod xsplit;
 
 pub use gate::Gated;
 pub use lookup::Lookup;

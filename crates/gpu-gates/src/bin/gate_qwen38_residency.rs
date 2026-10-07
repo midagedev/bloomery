@@ -50,7 +50,7 @@
 //!   byte (`dropped_bytes` 0: the churn pool stays in the host set for the
 //!   model's life) (mutant: the reset's copies of the seed experts back
 //!   skipped).
-//! - `stream` (host streaming, `Body38::set_hoststream`): from a clear, the
+//! - `stream` (host streaming, `Body38::set_xstream`'s `admit`): from a clear, the
 //!   first [`STREAM_PROMPT`] ids of the qwen4exp prose corpus as one prompt
 //!   call, then [`STREAM_STEPS`] greedy steps, once with the prompt's
 //!   streaming off and once on. On, the call's end leaves a live set other
@@ -72,6 +72,26 @@
 //!   while the union reads the moved map, so an admitted expert's columns
 //!   run nowhere and the logits part); the short prompt's guard removed (its
 //!   call opens and ends, admitting nothing).
+//! - `split` (the expert stream, `Body38::set_xstream`'s `split`, its rule
+//!   at the gate's [`SPLIT_COSTS`]: a host column dear enough that the
+//!   balance streams nearly every routed host expert the pick leaves, so the
+//!   ring carries hundreds a layer): from a clear, the first
+//!   [`SPLIT_PROMPT`] ids of the qwen4exp prose corpus as one prompt call
+//!   (one ubatch past the stream's least width), then [`STREAM_STEPS`]
+//!   greedy steps, once off and twice split. Count pins: an `xstream` record
+//!   per card layer, experts streamed, each record's streamed at most its
+//!   tail and the ring's half, and the call's excluded host slots — what
+//!   the serve left out, counted by the serve — the records' streamed
+//!   columns (none off). The band: a streamed expert's columns run on the
+//!   card route's blocks, so the split run agrees with the off run as the
+//!   admit run does (`stream`'s rule). Reproducible: the two split runs'
+//!   records, prompt logits (bit for bit) and greedy ids are the same.
+//!   Mutants, one a rule: the serve's exclusion set dropped (the union
+//!   computes the streamed experts again: the count pin and the band); the
+//!   ring row's slots reversed against the copies (each streamed column
+//!   reads another expert's weights: the band); the floor in the stream's
+//!   way back dropped is `xstream`'s unit test's (here every routed host
+//!   expert clears the gate's floor).
 //! - `slots_drafted`: a drafted pass of two slots' verify rows folds each
 //!   slot's accepted rows — slot 0 keeping one of its three rows, slot 1
 //!   two of theirs — so the boundary that ends it reports 3 kept rows as
@@ -115,9 +135,10 @@ mod gate {
 
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, XSTREAM_COSTS};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState};
+    use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
@@ -145,6 +166,16 @@ mod gate {
     const STREAM_PROMPT: usize = 512;
     /// Greedy steps after the streaming clause's prompt.
     const STREAM_STEPS: usize = 32;
+    /// The `split` clause's prompt: one ubatch past the stream's least
+    /// width at the family's costs and at the gate's.
+    const SPLIT_PROMPT: usize = 2048;
+    /// The `split` clause's rule costs: the family's, with a host column a
+    /// thousand microseconds, so the stream's floor sits under one column and
+    /// the balance cuts only the last few experts of a layer.
+    const SPLIT_COSTS: Costs = Costs {
+        host_us_per_col: 1000.0,
+        ..XSTREAM_COSTS
+    };
 
     /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
     fn prose(n: usize) -> Result<Vec<u32>, GateError> {
@@ -383,6 +414,11 @@ mod gate {
         moved: usize,
         open: bool,
         end: Option<CallReport>,
+        /// The host slots the prompt call's serves left out, by the serve's
+        /// own count, and the call's `xstream` records.
+        excluded: u64,
+        xlayers: Vec<(usize, XLayer)>,
+        xend: Option<XReport>,
     }
 
     /// The layers whose live set is not their seed.
@@ -413,16 +449,29 @@ mod gate {
         Ok(moved)
     }
 
-    /// One run of the streaming clause from a clear, the prompt call's
-    /// streaming `on`; the lever off again after it.
-    fn stream_run(s: &mut Session<Body38>, ids: &[u32], on: bool) -> Result<StreamRun, GateError> {
+    /// The prompt calls' host streaming (`Body38::set_xstream`): the
+    /// residency pool's pick under `admit`, the pick and the expert stream
+    /// under `split`, nothing off.
+    fn set_stream(s: &mut Session<Body38>, mode: XMode) -> Result<(), GateError> {
+        let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
+        Ok(body.set_xstream(gpu, mode)?)
+    }
+
+    /// One run of a streaming clause from a clear, the prompt call's
+    /// streaming `mode`; the lever off again after it.
+    fn stream_run(
+        s: &mut Session<Body38>,
+        ids: &[u32],
+        mode: XMode,
+    ) -> Result<StreamRun, GateError> {
         s.clear()?;
         take_passes(s)?;
-        s.model_mut().body_parts(NAME)?.2.set_hoststream(on)?;
+        set_stream(s, mode)?;
         let stats = |s: &Session<Body38>| -> Result<_, GateError> {
             Ok(s.model().body(NAME)?.hybrid().stats())
         };
         let before = stats(s)?.batch_host_slots;
+        let excluded_before = stats(s)?.batch_excluded_slots;
         let out = s.prompt(ids, Want::Logits)?;
         let mut next = out.argmax();
         let Out::Logits { row, .. } = out else {
@@ -431,7 +480,9 @@ mod gate {
         let logits = row.to_vec();
         let mut margins = vec![margin(&logits)?];
         let prompt_slots = stats(s)?.batch_host_slots - before;
+        let excluded = stats(s)?.batch_excluded_slots - excluded_before;
         let (_, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        let (xlayers, xend) = s.model_mut().body_parts(NAME)?.2.take_xstream_records();
         let moved = moved_layers(s)?;
         let open = s
             .model()
@@ -454,7 +505,7 @@ mod gate {
             tokens.push(next);
         }
         take_passes(s)?;
-        s.model_mut().body_parts(NAME)?.2.set_hoststream(false)?;
+        set_stream(s, XMode::Off)?;
         Ok(StreamRun {
             tokens,
             logits,
@@ -464,7 +515,113 @@ mod gate {
             moved,
             open,
             end,
+            excluded,
+            xlayers,
+            xend,
         })
+    }
+
+    /// How a streamed run `on` agrees with the unstreamed `off` (the card and
+    /// the host sum a token's experts in another split): the prompt's last
+    /// logits row's max |diff|, within [`GREEDY_MARGIN`]; where the greedy
+    /// ids first part, if anywhere; and whether they are equal or part at a
+    /// near tie (`on`'s top-1 margin there below it).
+    fn agree(on: &StreamRun, off: &StreamRun) -> (f32, bool, Option<usize>, bool) {
+        let dlogit = on
+            .logits
+            .iter()
+            .zip(&off.logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let logits_ok = on.logits.len() == off.logits.len() && dlogit < GREEDY_MARGIN;
+        let parted = on.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
+        let ids_ok = on.tokens.len() == off.tokens.len()
+            && parted.is_none_or(|i| on.margins.get(i).is_some_and(|&m| m < GREEDY_MARGIN));
+        (dlogit, logits_ok, parted, ids_ok)
+    }
+
+    /// `split`: the expert stream at the gate's costs, off once and split
+    /// twice, from a clear each.
+    fn split_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        let ids = prose38(SPLIT_PROMPT)?;
+        let off = stream_run(s, &ids, XMode::Off)?;
+        // `split`'s first setting starts the stream; the gate's costs then.
+        set_stream(s, XMode::Split)?;
+        let body = s.model_mut().body_parts(NAME)?.2;
+        body.set_xstream_costs(SPLIT_COSTS)?;
+        println!("split: xstream={}", body.xstream_word());
+        set_stream(s, XMode::Off)?;
+        let a = stream_run(s, &ids, XMode::Split)?;
+        let b = stream_run(s, &ids, XMode::Split)?;
+        for (u, x) in &a.xlayers {
+            record::xstream_layer(*u, x).print();
+        }
+        if let Some(e) = &a.xend {
+            record::xstream_end(e).print();
+        }
+        let half = a.xend.map_or(0, |e| e.half_slots);
+        let streamed: usize = a.xlayers.iter().map(|(_, x)| x.streamed).sum();
+        let columns =
+            |r: &StreamRun| -> u64 { r.xlayers.iter().map(|(_, x)| x.streamed_columns).sum() };
+        let records_ok = !a.xlayers.is_empty()
+            && a.xend.is_some_and(|e| e.streamed == streamed)
+            && streamed > 0
+            && a.xlayers.iter().all(|(_, x)| {
+                x.streamed <= x.tail
+                    && x.tail <= x.host
+                    && x.streamed <= half
+                    && (x.streamed == 0) == (x.streamed_columns == 0)
+            })
+            && off.xlayers.is_empty()
+            && off.xend.is_none();
+        let count_ok = a.excluded == columns(&a) && b.excluded == columns(&b) && off.excluded == 0;
+        let (dlogit, logits_ok, parted, ids_ok) = agree(&a, &off);
+        let key = |r: &StreamRun| -> Vec<(usize, usize, usize, usize, u64, u64)> {
+            r.xlayers
+                .iter()
+                .map(|(u, x)| {
+                    (
+                        *u,
+                        x.layer,
+                        x.tail,
+                        x.streamed,
+                        x.streamed_columns,
+                        x.host_columns,
+                    )
+                })
+                .collect()
+        };
+        let same_bits = a.logits.len() == b.logits.len()
+            && a.logits
+                .iter()
+                .zip(&b.logits)
+                .all(|(x, y)| x.to_bits() == y.to_bits());
+        let repro_ok = key(&a) == key(&b) && same_bits && a.tokens == b.tokens;
+        let ok = records_ok && count_ok && logits_ok && ids_ok && repro_ok;
+        println!(
+            "split: a {SPLIT_PROMPT}-id prompt call: {} xstream records, {streamed} experts \
+             streamed (half {half}), each within its tail and the half {records_ok}; the serve's \
+             excluded host slots {} / {} / {} (off / split / split again) against the records' \
+             streamed columns {} / {} {count_ok}; the prompt's logits max|diff| against off \
+             {dlogit} (under {GREEDY_MARGIN}: {logits_ok}), {} greedy ids equal or parted at a \
+             near tie {ids_ok}{}; the two split runs' records, logits bits and ids the same \
+             {repro_ok}: {}",
+            a.xlayers.len(),
+            off.excluded,
+            a.excluded,
+            b.excluded,
+            columns(&a),
+            columns(&b),
+            a.tokens.len(),
+            parted
+                .map(|i| format!(
+                    " (first parted at {i}, split's margin {:?})",
+                    a.margins.get(i)
+                ))
+                .unwrap_or_default(),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// The top-1 margin of a logits row; a value that is not finite is
@@ -488,32 +645,23 @@ mod gate {
     /// `stream`: the prompt call streaming against not, from a clear each.
     fn stream_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
         let ids = prose38(STREAM_PROMPT)?;
-        let off = stream_run(s, &ids, false)?;
-        let on = stream_run(s, &ids, true)?;
+        let off = stream_run(s, &ids, XMode::Off)?;
+        let on = stream_run(s, &ids, XMode::Admit)?;
         if let Some(r) = &on.end {
             record::call_report(r).print();
         }
         let admitted = on.end.map_or(0, |r| r.admitted);
         let map_ok = on.moved > 0 && off.moved == 0 && admitted > 0 && !on.open && !off.open;
         let slots_ok = on.first_slots < off.first_slots;
-        let dlogit = on
-            .logits
-            .iter()
-            .zip(&off.logits)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let logits_ok = on.logits.len() == off.logits.len() && dlogit < GREEDY_MARGIN;
-        let parted = on.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
-        let ids_ok = on.tokens.len() == off.tokens.len()
-            && parted.is_none_or(|i| on.margins.get(i).is_some_and(|&m| m < GREEDY_MARGIN));
+        let (dlogit, logits_ok, parted, ids_ok) = agree(&on, &off);
         // A prompt too short for the floor opens no call.
         let short_ids = prose38(Body38::STREAM_FLOOR as usize - 1)?;
         s.clear()?;
         take_passes(s)?;
-        s.model_mut().body_parts(NAME)?.2.set_hoststream(true)?;
+        set_stream(s, XMode::Admit)?;
         s.prompt(&short_ids, Want::Argmax)?;
         let (short_picks, short_end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
-        s.model_mut().body_parts(NAME)?.2.set_hoststream(false)?;
+        set_stream(s, XMode::Off)?;
         take_passes(s)?;
         let short_ok = short_picks.is_empty() && short_end.is_none();
         println!(
@@ -817,6 +965,7 @@ mod gate {
         );
 
         pass &= stream_clause(&mut s)?;
+        pass &= split_clause(&mut s)?;
         // The gate's load is done: the card holds one load, and the slots
         // clauses bring their own.
         drop(s);

@@ -34,6 +34,8 @@ use bloomery_gpu::host::PassKind;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::host::swap::{CallPick, CallReport, Leak, PassReport, ResetReport};
 #[cfg(feature = "gpu")]
+use bloomery_gpu::host::xstream::{XLayer, XReport};
+#[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::prompt_timing::PromptStats;
@@ -1866,6 +1868,56 @@ pub static CALL_STREAM_END: Kind = Kind {
     ],
 };
 
+/// One layer of a prompt unit on the expert stream
+/// ([`bloomery_gpu::host::xstream::XLayer`]).
+pub static XSTREAM: Kind = Kind {
+    name: "xstream",
+    head: "xstream",
+    doc: "One layer of a prompt call's ubatch on the expert stream (`BLOOMERY_XSTREAM=split`): \
+          the ubatch, the layer, the ubatch's columns, the host experts it routes there after the \
+          residency pick, of them the ones the stream rule sends to the card (`tail`), of those \
+          the ones that streamed — the rule's set cut at the ring's half and where the layer's \
+          copies would pass the union it keeps, in rank order — and their columns (the serve's \
+          excluded slots), the columns the host union keeps, the bytes the stream copies, and the host's microseconds in the split and the \
+          issue, of them waiting for the fill threads to take in the staging backlog.",
+    parts: &[
+        key("ubatch", U64, ""),
+        key("layer", U64, ""),
+        key("cols", U64, ""),
+        key("host", U64, ""),
+        key("tail", U64, ""),
+        key("streamed", U64, ""),
+        key("streamed_columns", U64, ""),
+        key("host_columns", U64, ""),
+        key("bytes", U64, "B"),
+        key("issue_us", U64, "us"),
+        key("backlog_us", U64, "us"),
+    ],
+};
+
+/// A prompt call's end on the expert stream
+/// ([`bloomery_gpu::host::xstream::XReport`]).
+pub static XSTREAM_END: Kind = Kind {
+    name: "xstream_end",
+    head: "xstream end",
+    doc: "A prompt call's end on the expert stream: the layers that streamed, their experts and \
+          bytes, the host's microseconds in the splits and the issues and of them waiting for the \
+          staging backlog, the ring's slots a half, the pinned staging's slots (0: the lane \
+          copies the source's pageable bytes), the lane's rate the load's probe measured, and the \
+          host's microseconds in the end.",
+    parts: &[
+        key("layers", U64, ""),
+        key("streamed", U64, ""),
+        key("bytes", U64, "B"),
+        key("issue_us", U64, "us"),
+        key("backlog_us", U64, "us"),
+        key("half_slots", U64, ""),
+        key("staging_slots", U64, ""),
+        key("lane_gbs", F64(2), "GB/s"),
+        key("end_us", U64, "us"),
+    ],
+};
+
 /// A helper thread the load spawned (`threads::helper::helpers`).
 pub static HELPER: Kind = Kind {
     name: "helper",
@@ -2830,6 +2882,8 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &RESIDENCY_RESET,
     &CALL_STREAM,
     &CALL_STREAM_END,
+    &XSTREAM,
+    &XSTREAM_END,
 ];
 
 /// The records `clef_hidden` prints: the prompt call's, then, given row ids,
@@ -3203,6 +3257,38 @@ pub fn call_report(r: &CallReport) -> Record {
         .u("backlog_us", r.backlog_us)
         .u("kept", u64::from(r.kept))
         .u("restored", r.restored)
+        .u("end_us", r.end_us)
+}
+
+/// A prompt unit's stream record at one layer, of ubatch `ubatch`.
+#[cfg(feature = "gpu")]
+pub fn xstream_layer(ubatch: usize, x: &XLayer) -> Record {
+    Record::new(&XSTREAM)
+        .u("ubatch", ubatch)
+        .u("layer", x.layer)
+        .u("cols", x.cols)
+        .u("host", x.host)
+        .u("tail", x.tail)
+        .u("streamed", x.streamed)
+        .u("streamed_columns", x.streamed_columns)
+        .u("host_columns", x.host_columns)
+        .u("bytes", x.bytes)
+        .u("issue_us", x.issue_us)
+        .u("backlog_us", x.backlog_us)
+}
+
+/// A prompt call's end record on the expert stream.
+#[cfg(feature = "gpu")]
+pub fn xstream_end(r: &XReport) -> Record {
+    Record::new(&XSTREAM_END)
+        .u("layers", r.layers)
+        .u("streamed", r.streamed)
+        .u("bytes", r.bytes)
+        .u("issue_us", r.issue_us)
+        .u("backlog_us", r.backlog_us)
+        .u("half_slots", r.half_slots)
+        .u("staging_slots", r.staging_slots)
+        .f("lane_gbs", r.lane_b_per_us / 1000.0)
         .u("end_us", r.end_us)
 }
 

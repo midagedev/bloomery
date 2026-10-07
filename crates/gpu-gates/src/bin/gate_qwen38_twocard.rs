@@ -95,6 +95,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model};
     use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet};
+    use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
@@ -781,6 +782,14 @@ mod gate {
         Err(format!("no budget of BUDGETS fits the gate at {ctx} positions").into())
     }
 
+    /// The prompt calls' host streaming: the residency pool's pick
+    /// (`Body38::set_xstream`'s `admit`) when `on`, nothing when off.
+    fn set_stream(s: &mut Session<Body38>, on: bool) -> Result<(), GateError> {
+        let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
+        let mode = if on { XMode::Admit } else { XMode::Off };
+        Ok(body.set_xstream(gpu, mode)?)
+    }
+
     /// From a clear, `ids` as one prompt call (the session's path: ubatches
     /// for a prompt this long) with the call's host streaming `stream`, then
     /// [`PROMPT_STEPS`] greedy steps: the prompt's last logits row and its
@@ -788,7 +797,7 @@ mod gate {
     fn prompt_run(s: &mut Session<Body38>, ids: &[u32], stream: bool) -> Result<Run, GateError> {
         s.clear()?;
         take_passes(s)?;
-        s.model_mut().body_parts(NAME)?.2.set_hoststream(stream)?;
+        set_stream(s, stream)?;
         let mut run = Run::default();
         let out = s.prompt(ids, Want::Logits)?;
         let Out::Logits { argmax, row } = out else {
@@ -800,7 +809,7 @@ mod gate {
         for _ in 0..PROMPT_STEPS {
             next = step(s, &mut run, next)?;
         }
-        s.model_mut().body_parts(NAME)?.2.set_hoststream(false)?;
+        set_stream(s, false)?;
         run.landed = take_passes(s)?.iter().map(|(_, r)| r.landed).sum();
         Ok(run)
     }

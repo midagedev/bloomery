@@ -1,0 +1,49 @@
+# Round xstream23: the common-machine arm of the expert stream (G5's ruler) — the 5090 owner's card shape on our
+# box: the A6000 planned with BLOOMERY_CARD_BUDGET=17186472394 (5,482 experts' bytes at the file's layer mean of
+# 3,134,978.6 B [derived]), BLOOMERY_THREADS=16, BLOOMERY_RESIDENCY=mid-p57-s1, BLOOMERY_DRAFT=off. Our host is
+# still ours (32 Zen 3 cores, DDR4 at 147.7 GB/s; 16 threads of it), and so is our PCIe 4.0 link: the arm rules the
+# card budget and the routing shape, not the 5090's link or its DRAM. Same binary, split against off.
+#
+# Decomposition [derived] per layer of the one 4,096-column prose unit: the card holds ~114 experts a layer, the
+# host ~398 (the design report's 1.3 table at h = 398); the union at 16 threads costs ~9.7 us a column (the 1-5
+# thread table's 16-thread efficiency 0.72 on 7.0).
+#   off   rest 27.9 ms + the union of ~398 host experts' prose columns: uniform routing puts 31,781 columns a layer
+#         on them (the 1.3 table); prose's id-prefix share on the card is lower than uniform's 22 % on this shape,
+#         so 27-32k columns x 9.7 us = 260-310 ms a layer -> 13.8-16.2 s a unit, pp4096 255-300.
+#   split the pick admits up to the pool's 57 a layer; the stream takes the tail in rank order until the card's
+#         side (the lane at 21.19 GB/s, 145 us an expert, plus 13 + 0.16 us a column and the stacks' columns)
+#         meets the union it leaves: with ~70 columns an expert a streamed expert saves 679 us of union for
+#         ~170 us of lane and card, so the balance sits near 300-340 streamed a layer, the union ~50-60 ms and the
+#         lane ~50-58 ms -> ~85 ms a layer with the rest, 3.7-4.3 s a unit, pp4096 950-1,100. The ring's half
+#         (up to 398 slots, 1.6 GB, the card has ~24 GB free under the budget) does not cut.
+#   => split vs off +200..+350 % [derived]; the design report's +380..+480 % took its copy-bound 2.83 s at a full
+#      stream of all 398 a layer (the uniform model's), which the balance does not reach on a link this slow.
+# Runner (from /Users/hckim/repo/bloomery-xstream23, the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/xstream-common.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=2
+# just depth-gpu-qwen4exp
+#   prose:4096@BLOOMERY_CARD_BUDGET=17186472394,BLOOMERY_THREADS=16,BLOOMERY_RESIDENCY=mid-p57-s1,BLOOMERY_DRAFT=off,BLOOMERY_XSTREAM=off
+#   prose:4096@BLOOMERY_CARD_BUDGET=17186472394,BLOOMERY_THREADS=16,BLOOMERY_RESIDENCY=mid-p57-s1,BLOOMERY_DRAFT=off,BLOOMERY_XSTREAM=split
+# Wall [derived]: 2 arms x 2 rounds, the off arm ~16 s a prompt plus a load: ~6 min.
+kind: ab
+question: on the common machine's card shape (a 17.2 GB card budget, 16 threads, mid-p57-s1), does the expert
+  stream's split lift Qwen3.8's pp4096 over the plain arm by the derived band?
+term: pp tok/s @ prose:4096, ctx 4352 (BLOOMERY_GEN_CTX=4352), A6000, plan a under BLOOMERY_CARD_BUDGET=17186472394,
+  BLOOMERY_THREADS=16, BLOOMERY_RESIDENCY=mid-p57-s1 and BLOOMERY_DRAFT=off in both arms; BLOOMERY_XSTREAM=split
+  against BLOOMERY_XSTREAM=off, same binary, paired by round
+unit: %
+predict: +200..+350
+rounds: 2
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, both arms in one lease, a fresh process per load group, the host set warm (majflt near 0),
+  no [cpu-busy] or [other-busy] row; the plan line names card_budget=17186472394 and each arm's `residency lever`
+  mid-p57-s1; a functional run of the same binary and levers just before the window (gpu-gate.sh on the A6000, not
+  timed) shows `xstream=split` with xstream_half above 300, `xstream` records with streamed above 200 a layer of
+  the 4,096-column ubatch, and distinct tokens equal between the arms within the band's greedy margin
+decide-in: the stream's term holds on the common machine's shape: post the 5090 owner the lever (unset = split) and
+  card G2's decode seam next
+decide-below: read the split arm's `xstream` records first: streamed far under ~300 a layer means the balance or
+  the half cut it (the lane's probed rate, lane_gbs, below 21 names the lane); streamed near the plan with the
+  wall long means the ring pass's GEMMs or the lane's backlog (backlog_us) bind, which an nsys of one ubatch
+  decomposes before any change
+decide-above: check distinct tokens and the off arm's union columns against the 27-32k a layer before believing it;
+  re-derive the off arm (the 16-thread union rate) first

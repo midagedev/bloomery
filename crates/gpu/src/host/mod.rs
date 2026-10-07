@@ -105,6 +105,7 @@ pub mod step;
 pub mod swap;
 pub mod swap_source;
 pub mod tier;
+pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 
@@ -119,7 +120,7 @@ use page::{MAX_ROWS, Word};
 use residency::HostResidency;
 use route_trace::RouteTrace;
 use runtime::swaprule::KeptRows;
-use slots::{MAX_TIERS, SlotMap};
+use slots::{MAX_TIERS, Slot, SlotMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -784,6 +785,10 @@ pub struct HostTier<H> {
     /// The stage card's copy of the map the machine writes: after `swap`, so
     /// it outlives the machine that holds its address.
     swap_view: Option<Arc<DeviceTensor<u32>>>,
+    /// The expert stream over the machine's source, once started
+    /// ([`HostTier::xstream_start`]): its streamed experts leave the batch
+    /// port's serve.
+    xstream: Option<xstream::XStream>,
 }
 
 impl<H> HostTier<H> {
@@ -796,6 +801,7 @@ impl<H> HostTier<H> {
     /// on the card waits with it: every owner of a running machine calls
     /// this before it frees anything on the card. Idempotent.
     pub fn stop_swap(&mut self) {
+        drop(self.xstream.take());
         drop(self.swap.take());
         self.swap_kept = None;
     }
@@ -845,6 +851,7 @@ impl<H: HostExperts> HostTier<H> {
             swap: None,
             swap_kept: None,
             swap_view: None,
+            xstream: None,
         })
     }
 
@@ -1097,6 +1104,154 @@ impl<H: HostExperts> HostTier<H> {
             Some(m) => m.end_call(stream, &mut self.slots, kept).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Start the expert stream ([`xstream::XStream::new`]) over the
+    /// residency machine's source, for the map's layers: its ring sized from
+    /// the card's free bytes, its probe streaming up to `probe` host experts
+    /// of the first layer with stage stacks. `cfg`'s `max_half` and `probe`
+    /// are set here from the map: the most host experts a layer holds, and
+    /// that layer's. Refused by name: no machine, a second stream, and
+    /// [`xstream::XStream::new`]'s refusals. Load-time only.
+    pub fn xstream_start(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        mut cfg: xstream::XCfg,
+        probe: usize,
+    ) -> Result<&xstream::XStream, GpuError> {
+        const WHAT: &str = "HostTier::xstream_start";
+        if self.xstream.is_some() {
+            return Err(GpuError::state(WHAT, "a tier without an expert stream"));
+        }
+        let source = self
+            .swap
+            .as_ref()
+            .ok_or(GpuError::state(
+                WHAT,
+                "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>)",
+            ))?
+            .source();
+        let n_expert = u32::try_from(self.slots.n_expert())
+            .map_err(|_| GpuError::shape(WHAT, "a map of more experts than u32 counts"))?;
+        let mut max_half = 0;
+        let mut first = None;
+        for l in self.slots.layers() {
+            if source.part_bytes(l).is_empty() {
+                continue;
+            }
+            let host: Vec<u32> = (0..n_expert)
+                .filter(|&id| self.slots.slot(l, id) == Some(Slot::Host))
+                .collect();
+            max_half = max_half.max(host.len());
+            if first.is_none() && !host.is_empty() {
+                first = Some((l, host));
+            }
+        }
+        let (l, host) = first.ok_or(GpuError::state(
+            WHAT,
+            "a layer with stage stacks and host experts",
+        ))?;
+        cfg.max_half = max_half;
+        cfg.probe = host.iter().rev().take(probe).map(|&id| (l, id)).collect();
+        let layers = self.slots.layers().end;
+        let x = xstream::XStream::new(ctx, stream, source, layers, cfg)?;
+        Ok(self.xstream.insert(x))
+    }
+
+    /// The expert stream, once started.
+    #[must_use]
+    pub fn xstream(&self) -> Option<&xstream::XStream> {
+        self.xstream.as_ref()
+    }
+
+    /// The expert stream to change, once started.
+    pub fn xstream_mut(&mut self) -> Option<&mut xstream::XStream> {
+        self.xstream.as_mut()
+    }
+
+    /// Open a call on the expert stream; `false` without one.
+    pub fn xstream_begin(&mut self) -> bool {
+        match self.xstream.as_mut() {
+            Some(x) => {
+                x.begin_call();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Layer `unit.layer` of the walk's unit `unit` (its serve's key), of
+    /// `cols` columns, on the expert stream
+    /// ([`xstream::XStream::layer`]) from the unit's `counts` (one a router
+    /// expert, as [`HostTier::call_pick_routed`] counted them) after a pick
+    /// that admitted `admitted`: the layer's host experts and its stage row
+    /// read off this tier's map, the stage stacks' experts its capacity.
+    /// The streamed experts leave the batch port's serve of the layer until
+    /// [`HostTier::xstream_read`]. Refused by name without a stream.
+    pub fn xstream_layer(
+        &mut self,
+        stream: &CudaStream,
+        unit: BatchKey,
+        cols: usize,
+        counts: &[u32],
+        admitted: usize,
+    ) -> Result<xstream::XLayer, GpuError> {
+        const WHAT: &str = "HostTier::xstream_layer";
+        let layer = unit.layer;
+        let x = self.xstream.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an expert stream (HostTier::xstream_start)",
+        ))?;
+        let row = self
+            .slots
+            .row(layer)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("layer {layer} outside the map")))?;
+        let n_card = self.slots.capacity(layer)?;
+        let mut host = Vec::with_capacity(row.len());
+        let mut stage = Vec::with_capacity(row.len());
+        for (id, &e) in (0u32..).zip(row) {
+            match Slot::of(e) {
+                Slot::Card(s) => stage.push(s),
+                Slot::Host => {
+                    host.push(id);
+                    stage.push(slots::HOST);
+                }
+                Slot::Tier { .. } => stage.push(slots::HOST),
+            }
+        }
+        x.layer(
+            stream,
+            unit,
+            cols,
+            counts,
+            (&host, admitted),
+            (&stage, n_card),
+        )
+    }
+
+    /// Layer `layer`'s stream as its card route reads it; `None` without a
+    /// stream or when the layer streams nothing.
+    #[must_use]
+    pub fn xstream_ring(&self, layer: usize) -> Option<xstream::RingLayer> {
+        self.xstream.as_ref()?.ring_layer(layer)
+    }
+
+    /// Layer `layer`'s card route has run on `stream`
+    /// ([`xstream::XStream::read`]); nothing without a stream.
+    pub fn xstream_read(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
+        match self.xstream.as_mut() {
+            Some(x) => x.read(layer, stream),
+            None => Ok(()),
+        }
+    }
+
+    /// End the call on the expert stream; `None` without one.
+    pub fn xstream_end(&mut self) -> Result<Option<xstream::XReport>, GpuError> {
+        self.xstream
+            .as_mut()
+            .map(xstream::XStream::end_call)
+            .transpose()
     }
 
     /// The residency back to its seed at a quiet boundary on `stream`
