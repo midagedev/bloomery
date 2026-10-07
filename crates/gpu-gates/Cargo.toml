@@ -440,6 +440,10 @@ name = "gate_qwen3moe_experts"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_mimo2_flash"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_qwen3moe_flash"
 required-features = ["gpu"]
 

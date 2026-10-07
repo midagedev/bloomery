@@ -106,6 +106,25 @@
 //! `t` reads the planes of row `t` of a per-row table ([`RowPlanes`], the
 //! launch's grid-constant parameter) and is otherwise `seg_mma`'s row over
 //! them; the merge is [`flash_gqa_kernels::gqa_flash_merge`].
+//!
+//! The `_k192` entries ([`FlashGqaKernels::enqueue_pass_k192`]) serve MiMo-V2's
+//! heads: scores over [`HEAD_K192`] key values, values of [`HEAD`], `packs`
+//! blocks of [`GROUP`] query heads a key head (`seg_scalar_kv`, the scalar
+//! reduction above over 96 key words), and per layer a window of positions
+//! and a per-head sink. The window is one rule ([`window_cut`]): a row of
+//! `limit` live keys attends the last `window` of them, cut into
+//! [`window_segments`] segments from its first windowed key, so no segment,
+//! tile or partial exists below it and no score is masked. The sink
+//! (`gqa_flash_merge_sink`) joins the softmax last, as the partial `(sink, 1,
+//! 0)`, unscaled: segments ascending, then the sink. A row of at most
+//! `window` keys is cut into the same 64-key segments with or without a
+//! window. Without a window and without sinks the merge is
+//! [`flash_gqa_kernels::gqa_flash_merge`].
+//!
+//! Both merges skip a segment whose partial is neutral (`s = 0`). Over a
+//! finite row that skip is unreachable: a row's segments are cut from its
+//! first key (windowed or not), so each of its `⌈n / span⌉` live segments
+//! holds a key. It guards a partial no kernel here writes for a live segment.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -290,6 +309,77 @@ const _: () = {
     while live <= 2_051 {
         assert!(seg_span_holds(live, segs, SEG_KEYS));
         live += 1;
+    }
+};
+
+/// Key values per head of the MiMo-V2 instance
+/// ([`FlashGqaKernels::enqueue_pass_k192`]): its value rows are [`HEAD`]
+/// wide, so the key planes are `[n_kv][ctx][HEAD_K192]` and the value planes
+/// `[n_kv][ctx][HEAD]`.
+pub const HEAD_K192: usize = 192;
+/// u32 words of one K192 key row and its staged stride (odd, so lane `j`
+/// reads word `w` of key `j` at `97j + w` from a distinct bank), and its
+/// u64 words.
+const ROW_WORDS_K192: usize = HEAD_K192 / 2;
+const K_STRIDE_K192: usize = ROW_WORDS_K192 + 1;
+const ROW_QWORDS_K192: usize = HEAD_K192 / 4;
+// The K192 entries' launch contracts spell HEAD_K192 and its words out as 192, 96 and 48.
+const _: () = assert!(HEAD_K192 == 192 && ROW_WORDS_K192 == 96 && ROW_QWORDS_K192 == 48);
+const _: () = assert!(ROW_WORDS_K192.is_multiple_of(ILP) && K_STRIDE_K192 % 2 == 1);
+/// The merge of [`FlashGqaKernels::enqueue_pass_k192`] with the sinks: one
+/// thread a value dim, [`HEAD`] of them.
+const MERGE_THREADS_SINK: u32 = HEAD as u32;
+
+/// The window a row of `limit` live keys attends: `(first, n_w)`, the keys
+/// `[first, first + n_w)` — the last `window` of them, or all of them for
+/// `window == 0` (no window). A key at position `p` attends the keys
+/// `p − window < k <= p`, itself included, so the row whose live count is
+/// `limit = p + 1` starts at `limit − min(limit, window)`. The one owner of
+/// the window's lower bound: the K192 segment pass and its merge cut the
+/// `n_w` keys with [`seg_span`] and walk them from `first`, so no segment,
+/// tile or partial exists below `first`.
+#[inline(always)]
+#[must_use]
+pub const fn window_cut(limit: usize, window: usize) -> (usize, usize) {
+    let first = if window == 0 || limit < window {
+        0
+    } else {
+        limit - window
+    };
+    (first, limit - first)
+}
+
+/// Segments a K192 launch with `window` cuts a row into: [`SEGMENTS`]
+/// without a window, else whole [`SEG_KEYS`]-key segments of the window.
+#[must_use]
+pub const fn window_segments(window: usize) -> usize {
+    if window == 0 {
+        SEGMENTS
+    } else {
+        window.div_ceil(SEG_KEYS)
+    }
+}
+
+// The window cut's invariants: the cut keeps `first + n_w = limit` and
+// `n_w <= window`; at 128 positions in two segments of 64 the span is the
+// floor for every live count (so `n_w <= 128` and an `n_w` of 128 or less is
+// cut into the same 64-key segments with or without a window), and no row
+// has a segment past its window; no window is today's cut.
+const _: () = {
+    assert!(window_segments(0) == SEGMENTS && window_segments(128) == 2);
+    assert!(window_segments(129) == 3 && window_segments(1) == 1);
+    let segs = window_segments(128);
+    let mut limit = 0;
+    while limit <= 65_536 {
+        let (first, n_w) = window_cut(limit, 128);
+        assert!(first + n_w == limit && n_w <= 128 && n_w <= limit);
+        assert!(first == 0 || n_w == 128);
+        assert!(seg_span(n_w, segs, SEG_KEYS) == SEG_KEYS);
+        assert!(seg_span_holds(n_w, segs, SEG_KEYS));
+        assert!(n_w.div_ceil(SEG_KEYS) <= segs);
+        let (first, n_w) = window_cut(limit, 0);
+        assert!(first == 0 && n_w == limit);
+        limit += 1;
     }
 };
 
@@ -2428,6 +2518,302 @@ unsafe fn merge_body<const HEAD: usize>(
     unsafe { *y.get_unchecked_mut(b * HEAD + d) = acc * (1.0 / s) };
 }
 
+// ------------------------------------------------------------ the K192 bodies
+//
+// MiMo-V2's heads: scores over 192 key values, values of 128, per layer a
+// window of the positions (the sliding layers) and a per-head sink in the
+// softmax. New bodies over [`HEAD_K192`] and [`HEAD`] that reuse the walks
+// above without editing them: the tile step is `fold_tile_w_p` at the value
+// width, the block map `seg_block`, the cut [`seg_span`] over the window's
+// keys ([`window_cut`]).
+
+/// The scalar segment pass of [`flash_gqa_kernels::gqa_flash_seg_k192`] in
+/// blocks of `PACK` query heads ([`seg_block`], `packs` of them per key
+/// head): [`seg_scalar_p`]'s grid, partial index, neutral segment, tile
+/// walk and reduction structure at a key width of [`HEAD_K192`] and a value
+/// width of [`HEAD`], over the keys [`window_cut`] names — segment `seg` of
+/// a row of `n_w` windowed keys walks `[first + seg·span, first +
+/// min((seg + 1)·span, n_w))` with `span` = [`seg_span`] of `n_w`. Lane `j`
+/// scores key `t0 + j` over the 96 key words (partial `p` takes the word
+/// pairs `p, p + 4, …`), lane `l` holds value dims `4l .. 4l + 3`.
+///
+/// SAFETY: the entry's launch contract (every buffer bound it names), a block
+/// of `PACK · 32` threads, and the four tiles this block's shared memory as
+/// the entry declared them: the pack's query rows (`PACK · HEAD_K192` f32),
+/// the key tile at stride `K_STRIDE_K192` words, the value tile (`KEY_TILE ·
+/// HEAD/4` u64) and the weight tile (`PACK · KEY_TILE`).
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
+)]
+unsafe fn seg_scalar_kv<const PACK: usize>(
+    q: &[f32],
+    kc: &[u16],
+    vc: &[u16],
+    n_keys_buf: &[u32],
+    scale: f32,
+    n_kv: u32,
+    ctx: u32,
+    segs: u32,
+    seg_keys: u32,
+    m: u32,
+    packs: usize,
+    window: usize,
+    mut part_v: DisjointSlice<f32>,
+    mut part_ms: DisjointSlice<f32>,
+    qs: *mut f32,
+    ks: *mut u32,
+    vs: *mut u64,
+    ws: *mut f32,
+) {
+    const { assert!(PACK == GROUP) };
+    const { assert!((KEY_TILE * ROW_QWORDS_K192).is_multiple_of(PACK * 32)) };
+    const { assert!((KEY_TILE * HEAD / 4).is_multiple_of(PACK * 32)) };
+    let threads = PACK * 32;
+    // q values one thread stages, and K and V tile words per tile.
+    let per_thread = HEAD_K192 / 32;
+    let stage_k = KEY_TILE * ROW_QWORDS_K192 / threads;
+    let stage_v = KEY_TILE * ROW_QWORDS / threads;
+
+    let b = thread::blockIdx_x() as usize;
+    let nkv = n_kv as usize;
+    let n_seg = segs as usize;
+    let rows = m as usize;
+    let Some((t, seg, kh, head0, n_head)) = seg_block::<PACK>(b, rows, nkv, packs, n_seg) else {
+        return; // block-uniform
+    };
+    let tid = thread::threadIdx_x() as usize;
+    let w = tid / 32;
+    let lane = warp::lane_id() as usize;
+    let h = head0 + w;
+    let idx = (t * n_head + h) * n_seg + seg;
+    let ctx = ctx as usize;
+    // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+    let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
+    let (first, n_w) = window_cut(limit, window);
+    let span = seg_span(n_w, n_seg, seg_keys as usize);
+    let lo_rel = seg * span;
+    if lo_rel >= n_w {
+        if lane == 0 {
+            // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
+            unsafe {
+                *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+            }
+        }
+        return; // block-uniform: lo_rel and n_w are the block's
+    }
+    let lo = first + lo_rel;
+    let hi = first + (lo_rel + span).min(n_w);
+
+    // Row t's pack of query rows: thread `tid` stages values
+    // `per_thread·tid ..` of the pack's PACK·HEAD_K192.
+    let qb = (t * n_head + head0) * HEAD_K192;
+    let mut i = 0usize;
+    while i < per_thread {
+        // SAFETY: qb + per_thread·tid + i < (t·n_head + head0 + PACK)·HEAD_K192
+        // <= m·n_head·HEAD_K192 <= q.len(); the shared index < PACK·HEAD_K192.
+        unsafe { *qs.add(per_thread * tid + i) = *q.get_unchecked(qb + per_thread * tid + i) };
+        i += 1;
+    }
+
+    let k_plane = kh * ctx * HEAD_K192;
+    let v_plane = kh * ctx * HEAD;
+    let k64 = kc.as_ptr() as *const u64;
+    let v64 = vc.as_ptr() as *const u64;
+    let mut mx = f32::NEG_INFINITY;
+    let mut s_sum = 0.0f32;
+    let mut acc = [[0.0f32; 4]; 1];
+    let mut t0 = lo;
+    while t0 < hi {
+        thread::sync_threads();
+        // Stage the tile: 32 keys × 48 u64 of K and × 32 u64 of V; a key at
+        // or past `hi` stages zeros.
+        let mut i = 0usize;
+        while i < stage_k {
+            let e = tid + threads * i;
+            let key = e / ROW_QWORDS_K192;
+            let word = e - key * ROW_QWORDS_K192;
+            let kw = if t0 + key < hi {
+                // SAFETY: t0 + key < hi <= ctx, so the row is inside key head
+                // kh's key plane; a row is HEAD_K192 u16 = 48 u64 and the
+                // plane starts 8-byte aligned (a device allocation), so the
+                // u64 read is aligned and inside the plane.
+                unsafe { *k64.add((k_plane + (t0 + key) * HEAD_K192) / 4 + word) }
+            } else {
+                0u64
+            };
+            // SAFETY: key < 32 and word < 48: 2·word + 1 < K_STRIDE_K192.
+            unsafe {
+                *ks.add(key * K_STRIDE_K192 + 2 * word) = kw as u32;
+                *ks.add(key * K_STRIDE_K192 + 2 * word + 1) = (kw >> 32) as u32;
+            }
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < stage_v {
+            let e = tid + threads * i;
+            let key = e / ROW_QWORDS;
+            let word = e - key * ROW_QWORDS;
+            let vw = if t0 + key < hi {
+                // SAFETY: as the key row, in the value plane of HEAD u16 =
+                // 32 u64 a row.
+                unsafe { *v64.add((v_plane + (t0 + key) * HEAD) / 4 + word) }
+            } else {
+                0u64
+            };
+            // SAFETY: key < 32 and word < 32: inside VS.
+            unsafe { *vs.add(key * ROW_QWORDS + word) = vw };
+            i += 1;
+        }
+        thread::sync_threads();
+
+        // The score of key t0 + lane for head h.
+        let live = t0 + lane < hi;
+        let mut a = [0.0f32; ILP];
+        let mut wd = 0usize;
+        while wd < ROW_WORDS_K192 {
+            let mut p = 0usize;
+            while p < ILP {
+                // SAFETY: lane < 32, wd + p < ROW_WORDS_K192: inside KS; the
+                // query index w·HEAD_K192 + 2(wd + p) + 1 < PACK·HEAD_K192.
+                let (kw, q0, q1) = unsafe {
+                    (
+                        *ks.add(lane * K_STRIDE_K192 + wd + p),
+                        *qs.add(w * HEAD_K192 + 2 * (wd + p)),
+                        *qs.add(w * HEAD_K192 + 2 * (wd + p) + 1),
+                    )
+                };
+                let k0 = half_bits_to_f32(kw as u16);
+                let k1 = half_bits_to_f32((kw >> 16) as u16);
+                a[p] = f32::mul_add(q0, k0, a[p]);
+                a[p] = f32::mul_add(q1, k1, a[p]);
+                p += 1;
+            }
+            wd += ILP;
+        }
+        let dot = (a[0] + a[1]) + (a[2] + a[3]);
+        let sc = if live { dot * scale } else { f32::NEG_INFINITY };
+
+        // SAFETY: WS and VS are this block's tiles, VS staged before the
+        // barrier above; w < PACK and lane < 32.
+        unsafe {
+            fold_tile_w_p::<HEAD, 1>(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane)
+        };
+        t0 += KEY_TILE;
+    }
+
+    // SAFETY: idx < m·n_head·segs; dims 4·lane .. +3 of the partial row are
+    // this lane's alone, and lane 0 writes (m, s).
+    unsafe {
+        let o = idx * HEAD + 4 * lane;
+        *part_v.get_unchecked_mut(o) = acc[0][0];
+        *part_v.get_unchecked_mut(o + 1) = acc[0][1];
+        *part_v.get_unchecked_mut(o + 2) = acc[0][2];
+        *part_v.get_unchecked_mut(o + 3) = acc[0][3];
+        if lane == 0 {
+            *part_ms.get_unchecked_mut(2 * idx) = mx;
+            *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
+        }
+    }
+}
+
+/// The merge of [`flash_gqa_kernels::gqa_flash_merge_sink`]: [`merge_body`]'s
+/// walk at [`HEAD`] over the window's segments (`window_cut`'s `n_w` keys cut
+/// by [`seg_span`], the live segments folded ascending through
+/// `online_fold`), then head `h`'s sink joins as the partial `(sink, 1, 0)`
+/// — unscaled, one more logit in the denominator and nothing in the value —
+/// and `acc · (1/s)`. Segments ascending, then the sink: this order is the
+/// gate. A sink of `−inf` is neutral (`dev_exp(−inf − mx)` is 0, nothing
+/// changes but the sign of a zero); a NaN or `+inf` sink has no defined
+/// softmax and writes NaN into the row. A refused row raises
+/// [`FaultSite::KeyCount`] and writes NaN in every dim, as [`merge_body`].
+///
+/// SAFETY: the entry's launch contract and a block of [`HEAD`] threads.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
+)]
+unsafe fn merge_sink_body(
+    part_v: &[f32],
+    part_ms: &[f32],
+    n_keys_buf: &[u32],
+    sinks: &[f32],
+    n_head: u32,
+    ctx: u32,
+    segs: u32,
+    seg_keys: u32,
+    m: u32,
+    window: usize,
+    fault: FaultSink,
+    mut y: DisjointSlice<f32>,
+) {
+    let b = thread::blockIdx_x() as usize;
+    let nh = n_head as usize;
+    if b >= m as usize * nh {
+        return; // block-uniform
+    }
+    let t = b / nh;
+    let h = b - t * nh;
+    let d = thread::threadIdx_x() as usize;
+    let n_seg = segs as usize;
+    // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+    let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx as usize);
+    if limit == 0 {
+        if d == 0 {
+            fault.raise(FaultSite::KeyCount);
+        }
+        // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
+        unsafe { *y.get_unchecked_mut(b * HEAD + d) = f32::NAN };
+        return; // block-uniform: the row is the block's
+    }
+    let (_, n_w) = window_cut(limit, window);
+    // seg_span keeps ⌈n_w / span⌉ <= segs (its const check at the launch's
+    // windows), so the walk below stays inside the row's segments.
+    let live = n_w.div_ceil(seg_span(n_w, n_seg, seg_keys as usize));
+    let mut mx = f32::NEG_INFINITY;
+    let mut s = 0.0f32;
+    let mut acc = 0.0f32;
+    let mut j = 0usize;
+    while j < live {
+        let mut ms = [0.0f32; 2 * MERGE_BATCH];
+        let mut vs = [0.0f32; MERGE_BATCH];
+        for i in 0..MERGE_BATCH {
+            cuda_device::thread::__unroll_config::<0>();
+            if j + i < live {
+                let idx = b * n_seg + j + i;
+                // SAFETY: idx < m·n_head·segs: both slots inside part_ms, and
+                // idx·HEAD + d < m·n_head·segs·HEAD <= part_v.len(). A live
+                // segment wrote all three.
+                unsafe {
+                    ms[2 * i] = *part_ms.get_unchecked(2 * idx);
+                    ms[2 * i + 1] = *part_ms.get_unchecked(2 * idx + 1);
+                    vs[i] = *part_v.get_unchecked(idx * HEAD + d);
+                }
+            }
+        }
+        for i in 0..MERGE_BATCH {
+            cuda_device::thread::__unroll_config::<0>();
+            if j + i < live && ms[2 * i + 1] != 0.0 {
+                (mx, s, acc) = online_fold(mx, s, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
+            }
+        }
+        j += MERGE_BATCH;
+    }
+    // SAFETY: h < n_head <= sinks.len() by the launch contract.
+    let sink = unsafe { *sinks.get_unchecked(h) };
+    let (_, s, acc) = online_fold(mx, s, acc, sink, 1.0, 0.0);
+    let out = if sink.is_nan() || sink == f32::INFINITY {
+        f32::NAN
+    } else {
+        acc * (1.0 / s)
+    };
+    // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
+    unsafe { *y.get_unchecked_mut(b * HEAD + d) = out };
+}
+
 #[cuda_module]
 mod flash_gqa_kernels {
     use super::*;
@@ -3725,6 +4111,135 @@ mod flash_gqa_kernels {
             )
         };
     }
+
+    /// The segment pass of MiMo-V2's heads: scores over [`HEAD_K192`] key
+    /// values, values of [`HEAD`], blocks of [`GROUP`] query heads, `packs` of
+    /// them per key head (`seg_scalar_kv`): block `b = ((seg·n_kv + kh)·packs
+    /// + p)·m + t`, warp `w` query head `(kh·packs + p)·8 + w`. With `window`
+    /// 0 a row walks every live key, as [`gqa_flash_seg`]; else the last
+    /// `window` of them ([`window_cut`]), cut into `segs` segments from the
+    /// row's first windowed key.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            q.len() >= m * n_kv * packs * 8 * 192,
+            kc.len() >= n_kv * ctx * 192,
+            vc.len() >= n_kv * ctx * 128,
+            part_v.len() >= m * n_kv * packs * 8 * segs * 128,
+            part_ms.len() >= m * n_kv * packs * 8 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_k192(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        window: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { GROUP * HEAD_K192 }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE_K192 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_K192 and GROUP; the raw form reaches it
+        // without a reference. The launch contract is `seg_scalar_kv`'s.
+        unsafe {
+            seg_scalar_kv::<GROUP>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                window as usize,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
+    /// The merge of MiMo-V2's heads (`merge_sink_body`): [`gqa_flash_merge`]
+    /// over the window's segments with head `h`'s sink folded in last,
+    /// `sinks[h]`, unscaled, `−inf` neutral.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            sinks.len() >= n_head,
+            part_v.len() >= m * n_head * segs * 128,
+            part_ms.len() >= m * n_head * segs * 2,
+            y.len() >= m * n_head * 128
+        )
+    )]
+    pub fn gqa_flash_merge_sink(
+        part_v: &[f32],
+        part_ms: &[f32],
+        n_keys_buf: &[u32],
+        sinks: &[f32],
+        n_head: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        window: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `merge_sink_body`'s, and the block is
+        // HEAD threads.
+        unsafe {
+            merge_sink_body(
+                part_v,
+                part_ms,
+                n_keys_buf,
+                sinks,
+                n_head,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                window as usize,
+                fault,
+                y,
+            )
+        };
+    }
 }
 
 /// The segment entry of a packed pass: the pack's scalar or tensor-core body.
@@ -3819,6 +4334,70 @@ pub(crate) struct GqaRowsArgs<'a> {
     pub(crate) part_ms: &'a mut DeviceBuffer<f32>,
     pub(crate) fault: FaultSink,
     pub(crate) y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashGqaKernels::enqueue_pass_k192`]'s arguments: `m` rows of `n_head`
+/// query heads of [`HEAD_K192`] values (roped, unscaled, token-major), the
+/// layer's key plane of `n_kv · ctx` rows of [`HEAD_K192`] and value plane of
+/// `n_kv · ctx` rows of [`HEAD`] (the f16 planes
+/// `RopeNeoxKernels::enqueue_neox_append_k192` writes), each row's live key
+/// count on the device (`m` of them), the layer's window in positions (0:
+/// every live key) and its per-head sinks (`n_head` f32, or none), the
+/// partials scratch (`m · n_head ·` [`window_segments`]`(window)` rows, the
+/// [`partials_v_len`] and [`partials_ms_len`] of a launch at that many
+/// segments), the sink a refused count raises on, and the output rows of
+/// [`HEAD`] values, token-major.
+pub struct GqaK192Args<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub kc: &'a DeviceBuffer<u16>,
+    pub vc: &'a DeviceBuffer<u16>,
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub scale: f32,
+    pub n_kv: usize,
+    pub ctx: usize,
+    pub m: usize,
+    pub window: usize,
+    pub sinks: Option<&'a DeviceBuffer<f32>>,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashGqaKernels::enqueue_merge_k192`]'s arguments: the partials of a
+/// segment pass at `window` ([`window_segments`] segments a row's head), each
+/// row's live count, the layer's sinks (or none), the cache height the counts
+/// are held to, `m` rows, the sink a refused count raises on, and the output
+/// rows of [`HEAD`] values.
+pub struct GqaK192MergeArgs<'a> {
+    pub part_v: &'a DeviceBuffer<f32>,
+    pub part_ms: &'a DeviceBuffer<f32>,
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub sinks: Option<&'a DeviceBuffer<f32>>,
+    pub ctx: usize,
+    pub m: usize,
+    pub window: usize,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The loader's check of a layer's sinks as the host holds them, before they
+/// go to the card: every value must be finite, else refused by name with the
+/// head. A device buffer is not read at launch, so this is where a non-finite
+/// sink of a file is refused; `−inf` is the kernel's neutral value, not a
+/// file's.
+///
+/// # Errors
+///
+/// [`GpuError`] naming the first head whose sink is NaN or infinite.
+pub fn check_sinks(sinks: &[f32]) -> Result<(), GpuError> {
+    match sinks.iter().position(|v| !v.is_finite()) {
+        Some(h) => Err(GpuError::shape(
+            "flash_gqa::check_sinks",
+            format!("the sink of head {h} is {}, not finite", sinks[h]),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -4505,6 +5084,219 @@ impl FlashGqaKernels {
         self.module.gqa_flash_merge_256(
             stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
         )?;
+        Ok(())
+    }
+
+    /// Enqueue `m` rows' attention over heads of [`HEAD_K192`] key values and
+    /// [`HEAD`] value values, `n_head` query heads over `args.n_kv` key heads
+    /// in blocks of [`GROUP`] (`n_head` a nonzero multiple of `8 · n_kv`,
+    /// refused by name otherwise; `packs = n_head / (8 · n_kv)` blocks a key
+    /// head): the segment pass `gqa_flash_seg_k192` (`m · n_kv · packs ·
+    /// segs` blocks of 256 threads) and a merge. Without a window the row's
+    /// keys are cut into [`SEGMENTS`] segments from key 0; with `window`
+    /// positions into [`window_segments`] segments from the row's first
+    /// windowed key ([`window_cut`]). Without sinks the merge is
+    /// [`flash_gqa_kernels::gqa_flash_merge`] and a window is refused by name
+    /// (that merge cuts from key 0); with sinks it is `gqa_flash_merge_sink`
+    /// at any window, head `h` folding `sinks[h]` last. A non-finite scale, a
+    /// short buffer or a zero count is refused by name before the launch; a
+    /// sink the device holds as NaN or `+inf` makes its row NaN (a device
+    /// buffer is not read here — the loader refuses a non-finite sink). A
+    /// count of zero or past `ctx` raises [`FaultSite::KeyCount`] on
+    /// `args.fault` and its row is NaN. Two launches. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_pass_k192(
+        &self,
+        stream: &CudaStream,
+        args: GqaK192Args<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_k192";
+        let GqaK192Args {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            window,
+            sinks,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || ctx == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
+            ));
+        }
+        if n_head == 0 || !n_head.is_multiple_of(n_kv * GROUP) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the kernel packs {GROUP} query heads a block, so the group must be a \
+                     multiple of {GROUP}; got {n_head} heads over {n_kv}"
+                ),
+            ));
+        }
+        if !scale.is_finite() {
+            return Err(GpuError::shape(
+                what,
+                format!("the score scale must be finite, got {scale}"),
+            ));
+        }
+        if window > 0 && sinks.is_none() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a window of {window} positions needs the sink merge (the merge without \
+                     sinks cuts every row from key 0); pass the layer's sinks"
+                ),
+            ));
+        }
+        let packs = n_head / (n_kv * GROUP);
+        let segs = window_segments(window);
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD_K192),
+            ("kc", kc.len(), n_kv * ctx * HEAD_K192),
+            ("vc", vc.len(), n_kv * ctx * HEAD),
+            ("n_keys", n_keys.len(), m),
+            ("part_v", part_v.len(), partials_len(m, n_head, segs, HEAD)),
+            ("part_ms", part_ms.len(), partials_len(m, n_head, segs, 2)),
+            ("y", y.len(), m * n_head * HEAD),
+            ("sinks", sinks.map_or(n_head, |s| s.len()), n_head),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * n_kv * packs * segs)?;
+        let packs = launch_u32(what, "packs", packs)?;
+        let n_kv_u = launch_u32(what, "n_kv", n_kv)?;
+        let ctx_u = launch_u32(what, "ctx", ctx)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m_u = launch_u32(what, "m", m)?;
+        let window_u = launch_u32(what, "window", window)?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
+        let prep = self.module.prepare_gqa_flash_seg_k192(cfg)?;
+        self.module.gqa_flash_seg_k192(
+            stream,
+            &prep,
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv_u,
+            ctx_u,
+            segs,
+            seg_keys,
+            m_u,
+            packs,
+            window_u,
+            &mut *part_v,
+            &mut *part_ms,
+        )?;
+        self.enqueue_merge_k192(
+            stream,
+            GqaK192MergeArgs {
+                part_v,
+                part_ms,
+                n_keys,
+                sinks,
+                ctx,
+                m,
+                window,
+                fault,
+                y,
+            },
+            n_head,
+        )
+    }
+
+    /// The merge of [`FlashGqaKernels::enqueue_pass_k192`] alone, over the
+    /// partials of a segment pass launched at the same `window`: `m · n_head`
+    /// blocks of [`HEAD`] threads, `gqa_flash_merge` without sinks (and
+    /// without a window) and `gqa_flash_merge_sink` with them. The refusals
+    /// of the pass: a window without sinks, a short buffer, a zero count.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_merge_k192(
+        &self,
+        stream: &CudaStream,
+        args: GqaK192MergeArgs<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_merge_k192";
+        let GqaK192MergeArgs {
+            part_v,
+            part_ms,
+            n_keys,
+            sinks,
+            ctx,
+            m,
+            window,
+            fault,
+            y,
+        } = args;
+        if n_head == 0 || ctx == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need n_head, ctx and m >= 1, got n_head={n_head} ctx={ctx} m={m}"),
+            ));
+        }
+        if window > 0 && sinks.is_none() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a window of {window} positions needs the sink merge (the merge without \
+                     sinks cuts every row from key 0); pass the layer's sinks"
+                ),
+            ));
+        }
+        let segs = window_segments(window);
+        let lens = [
+            ("part_v", part_v.len(), partials_len(m, n_head, segs, HEAD)),
+            ("part_ms", part_ms.len(), partials_len(m, n_head, segs, 2)),
+            ("n_keys", n_keys.len(), m),
+            ("y", y.len(), m * n_head * HEAD),
+            ("sinks", sinks.map_or(n_head, |s| s.len()), n_head),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
+        let window = launch_u32(what, "window", window)?;
+        let cfg = LaunchConfig1D::new(merge_grid, MERGE_THREADS_SINK, 0);
+        match sinks {
+            Some(sinks) => {
+                let prep = self.module.prepare_gqa_flash_merge_sink(cfg)?;
+                self.module.gqa_flash_merge_sink(
+                    stream, &prep, part_v, part_ms, n_keys, sinks, heads, ctx, segs, seg_keys, m,
+                    window, fault, y,
+                )?;
+            }
+            None => {
+                let prep = self.module.prepare_gqa_flash_merge(cfg)?;
+                self.module.gqa_flash_merge(
+                    stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
+                )?;
+            }
+        }
         Ok(())
     }
 }

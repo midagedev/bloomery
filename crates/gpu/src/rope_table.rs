@@ -269,13 +269,15 @@ mod tests {
 
     /// The engine's table is ggml's recipe bit for bit at positions the
     /// oracle sets do not reach — up to the model's context length — for
-    /// both of V4.1's ropes and qwen3moe's, both ways. V4.1's constants are
+    /// both of V4.1's ropes, qwen3moe's and MiMo-V2's, both ways. V4.1's constants are
     /// its file's (`rope.freq_base`, `attention.compress_rope_freq_base`,
     /// `rope.scaling.{factor, original_context_length, yarn_beta_fast,
     /// yarn_beta_slow}`, `rope.dimension_count`), and the recipe fills a
     /// 512-value head's cache of which the tail reads its first `n_dims`;
     /// qwen3moe's rope is plain at `rope.freq_base` over the whole 128-value
-    /// head, so its recipe fills 128 values. Every
+    /// head, so its recipe fills 128 values; MiMo-V2's is plain at its full
+    /// layers' `rope.freq_base` over the first 64 values of a 192-value head,
+    /// so its recipe fills 192 (its sliding layers' base is the window row's). Every
     /// input goes through `black_box`, so neither side is folded at compile
     /// time by a libm other than the one the other side calls.
     #[test]
@@ -290,6 +292,11 @@ mod tests {
                 "qwen3moe",
                 RopeSpec::window(black_box(10_000_000.0), black_box(128)),
                 128,
+            ),
+            (
+                "mimo2",
+                RopeSpec::window(black_box(10_000_000.0), black_box(64)),
+                192,
             ),
             (
                 "yarn",
