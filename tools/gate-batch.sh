@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it)
@@ -45,8 +45,14 @@
 #      a6000 for an `any` one); a BLOOMERY_CARD recipe gets none (box.sh picks). Alone means within
 #      this batch: another track's box jobs still run. The attribute is read from `just --dump --dump-format json`, where a recipe's
 #      "attributes" list holds {"group": "solo"}; a `[group('…')]` value anywhere in the justfile other
-#      than solo, v41-load and host is a named error — a group is a scheduling class here, and a typo must
+#      than solo, solo-real, v41-load and host is a named error — a group is a scheduling class here, and a typo must
 #      not drop a gate out of its class.
+#   solo-real: `[group('solo')]` in the real tier, balanced in the fixture tier (--tier below). A gate whose reason for running
+#      alone is its host set — the whole model loaded beside other lanes, and the box-wide V4.1 load lock — and not its two
+#      cards or a host-memory count it pins. Its gpu-gate.sh calls all take the `any` card, which is what the fixture tier
+#      balances it on; it carries no box.sh card pick (that keeps it alone in both tiers: use solo), no `solo` or `host`, and no
+#      `[group('v41-load')]` pin in the fixture tier (below) — each a named error where it can be told from the recipe's text.
+#      A solo-real recipe's arm handed through another recipe is refused in both tiers, as a solo one's is.
 #   host: a recipe that carries `[group('host')]` — device code built and run by `cargo oxide test` on a
 #      device-linked crate whose tests open no card (tools/recipes.py check holds that: the code of every
 #      test it runs names no card opener) — is balanced like a recipe with no device code, with no card
@@ -58,8 +64,19 @@
 #      tools/gpu-gate.sh's V4.1 load lock, which a member asks for by exporting
 #      BLOOMERY_GATE_V41_LOAD=1 in its box command (group and export must name the same recipes, a named
 #      error otherwise). The lane is for the plan: members in two lanes would serialize on that lock
-#      anyway, so lane sums that ran them in parallel would be wrong, and the waiting one would hold its
-#      lane's card lock through the wait.
+#      anyway, so lane sums that ran them in parallel would be wrong. In the fixture tier the group pins
+#      nothing: a fixture load takes no V4.1 load lock (tools/gpu-gate.sh), so a member is placed by its
+#      gpu-gate.sh form like any recipe, and a 3090-only call still keeps it in lane A.
+#   --tier real|fixture (default real; BLOOMERY_TIER in the environment names the same, and the two must agree): the tier
+#      the batch runs in, passed to every item as BLOOMERY_TIER=fixture in its BLOOMERY_BOX_ENV — tools/box.sh resolves each
+#      item's model file from it (the family's fixture, tools/ref/ref-paths.sh), and a family with none is a named red item
+#      (rc 66), never a run on the real file. The real tier adds nothing to the environment: its commands, keys and times are
+#      today's. In the fixture tier a `[group('solo-real')]` recipe is balanced and `v41-load` pins no lane (above), the keys
+#      carry the tier (they carry the box env), and the times file keeps the fixture runs apart from the real ones — a fixture
+#      item's row is `name@BLOOMERY_TIER=fixture[…]`, an entry of its own. An item's own `@BLOOMERY_TIER=…` is a named error:
+#      the tier is the batch's. Clauses a fixture run leaves to the real tier print `deferred(real)` lines (crates/gpu-gates/
+#      src/tier.rs); each item's line in run.log gains `deferred=<n>` when its log holds any, and the DONE line ends with the
+#      batch's total.
 # A recipe that runs a timing runner or takes the timing lease is refused, because a batch's builds
 # contaminate a timed run. Two tests: what a script the recipe runs does, followed transitively — a
 # tools/…sh that calls lease_take (tools/ref/lease.sh), or that opens the lease lock for a descriptor
@@ -235,7 +252,7 @@ MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes | --self-test"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -278,6 +295,16 @@ cold_of() {
     /^=== try / { on = 0 }
     on && /^ *Compiling [A-Za-z0-9_-]+ v[0-9]/ && !/ \(\// { c = 1 }
     END { print c + 0 }' "$1"
+}
+
+# deferred_of <log> <try>: the `deferred(real)` lines of the try's section of the item's log — the clauses a fixture-tier
+# gate left to the real tier (crates/gpu-gates/src/tier.rs prints them; its test holds this prefix to that file's).
+deferred_of() {
+  awk -v t="=== try $2 " '
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && /^deferred\(real\) / { n++ }
+    END { print n + 0 }' "$1"
 }
 
 # try_waits <log> <try>: the seconds the given try spent waiting, not running — box.sh's guard for a sitting
@@ -354,6 +381,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # `ok <name>` or `FAIL <name>: <why>` with the output; exit 0 iff none failed. check-recipes runs it.
 self_test() {
   local self t n=0 bad=0 out rc
+  unset BLOOMERY_TIER # the tier of a case is the case's own
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-test.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
   # shellcheck disable=SC2064 # the path is fixed now
@@ -406,6 +434,15 @@ weekly-a:
 [group('solo')]
 weekly-b:
     ./tools/box.sh 'BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh wb'
+
+[group('solo-real')]
+sr-any:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_sr'
+
+[group('solo-real')]
+[group('v41-load')]
+sr-v41:
+    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_sv'
 
 [group('solo')]
 x-glm:
@@ -552,6 +589,11 @@ case "$*" in
 esac
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+n=0
+while [ "$n" -lt "${FAKE_DEFER:-0}" ]; do
+  echo "deferred(real) oracle: fake clause $n"
+  n=$((n + 1))
+done
 [ "${FAKE_LEASE_UP:-0}" = 1 ] && : > "$st/lease-up"
 k=0
 while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
@@ -574,6 +616,12 @@ if a[:1] == ["box-manifest"]:
 items, i, pd = [], 1, None
 while i < len(a):
     if a[i].startswith("--"):
+        if a[i] == "--box-env":
+            import os
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fake-state")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "keycalls.log"), "a") as fh:
+                fh.write(a[i + 1] + "\n")
         if a[i] == "--parts-dir":
             pd = a[i + 1]
         i += 1 if a[i] == "--rerun" else 2
@@ -672,6 +720,89 @@ FP
   else fail 'steal: the dry run names the balanced item movable' "no movable line under steal-bal"; fi
   if grep -A3 '^lane A  steal-slow' <<< "$out" | grep -q 'movable'; then fail 'steal: the dry run leaves a fixed item unmarked' "a movable line under steal-slow"
   else pass 'steal: the dry run leaves a fixed item unmarked'; fi
+  # The tier. solo-real is solo in the real tier and balanced in the fixture tier; `v41-load` pins lane A in the real tier only.
+  check 'tier: a solo-real recipe is alone in the real tier' 0 "^sr-any	X	solo	a6000	sr-any: \[group\('solo-real'\)\]" "${gb[@]}" --classes
+  check 'tier: … and balanced over both cards in the fixture tier' 0 "^sr-any	F	balanced	3090,a6000	sr-any: \[group\('solo-real'\)\]" \
+    "${gb[@]}" --tier fixture --classes
+  check 'tier: a solo-real v41-load recipe is alone in the real tier (solo wins)' 0 '^sr-v41	X	solo	a6000	' "${gb[@]}" --classes
+  check 'tier: … and balanced in the fixture tier, the v41-load group pinning no lane' 0 '^sr-v41	F	balanced	3090,a6000	' "${gb[@]}" --tier fixture --classes
+  check 'tier: a plain v41-load recipe stays in lane A in the real tier' 0 '^v41-any	A	fixed	3090	' "${gb[@]}" --classes
+  check 'tier: … and is balanced in the fixture tier, which takes no load lock' 0 '^v41-any	F	balanced	3090,a6000	' "${gb[@]}" --tier fixture --classes
+  check 'tier: a 3090-only v41-load recipe stays in lane A in the fixture tier' 0 '^v41-a	A	fixed	3090	' "${gb[@]}" --tier fixture --classes
+  check 'tier: a solo recipe is alone in both tiers' 0 '^v41-solo	X	solo	3090	' "${gb[@]}" --tier fixture --classes
+  check 'tier: the real tier names nothing in the box env: lane X, no BLOOMERY_TIER' 0 \
+    "^lane X  sr-any +BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=a6000' just sr-any$" "${gb[@]}" --dry-run sr-any host
+  check 'tier: the fixture tier passes BLOOMERY_TIER=fixture to the item, which lane A or B runs' 0 \
+    "^lane [AB]  sr-any +BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=(3090|a6000)' just sr-any$" "${gb[@]}" --tier fixture --dry-run sr-any host
+  out=$("${gb[@]}" --dry-run sr-any host plain-any 2>&1) || fail 'tier: the real dry run failed' "$out"
+  if grep -q BLOOMERY_TIER <<< "$out"; then fail 'tier: the real tier leaves BLOOMERY_TIER out of every command' "a line names it"
+  else pass 'tier: the real tier leaves BLOOMERY_TIER out of every command'; fi
+  check 'tier: BLOOMERY_TIER in the environment is the batch tier' 0 "^lane [AB]  sr-any +BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture " \
+    env BLOOMERY_TIER=fixture "${gb[@]}" --dry-run sr-any
+  check 'tier: a BLOOMERY_TIER entry of the caller box env is the batch tier too, once' 0 "^lane [AB]  sr-any +BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=" \
+    env BLOOMERY_BOX_ENV=BLOOMERY_TIER=fixture "${gb[@]}" --dry-run sr-any
+  check 'tier: --tier other than real or fixture: 64, named' 64 "^gate-batch: --tier is real or fixture, got 'both'" "${gb[@]}" --tier both --dry-run host
+  check 'tier: --tier without a value: 64' 64 '^gate-batch: --tier needs real or fixture' "${gb[@]}" --dry-run host --tier
+  check 'tier: the flag and the environment naming two tiers: 64, named' 64 "^gate-batch: --tier names the tier 'fixture' and BLOOMERY_TIER in the environment 'real'" \
+    env BLOOMERY_TIER=real "${gb[@]}" --tier fixture --dry-run host
+  check 'tier: the flag and the box env naming two tiers: 64, named' 64 "^gate-batch: --tier names the tier 'real' and BLOOMERY_BOX_ENV's BLOOMERY_TIER 'fixture'" \
+    env BLOOMERY_BOX_ENV=BLOOMERY_TIER=fixture "${gb[@]}" --tier real --dry-run host
+  check "tier: an item's own BLOOMERY_TIER is refused: the tier is the batch's" 65 "sets BLOOMERY_TIER; the tier is the batch's" \
+    "${gb[@]}" --dry-run 'plain-any@BLOOMERY_TIER=fixture'
+  # The times file keeps the tiers apart: a fixture item's row is an entry of its own.
+  printf '%s\n' 'plain-any	B	a6000	10	2026-09-27T10:00:00+0900' 'plain-any@BLOOMERY_TIER=fixture	B	a6000	77	2026-09-27T10:00:00+0900' > "$t/times-tier.tsv"
+  check 'tier: a real item expects its real rows' 0 'balanced, expected 10 s \(median of 1 row\)' env "BLOOMERY_GATE_TIMES=$t/times-tier.tsv" "${gb[@]}" --dry-run plain-any
+  check 'tier: a fixture item expects its own rows' 0 'balanced, expected 77 s \(median of 1 row\)' env "BLOOMERY_GATE_TIMES=$t/times-tier.tsv" "${gb[@]}" --tier fixture --dry-run plain-any
+  # A solo-real recipe the fixture tier could not place is a named error.
+  cp "$t/justfile" "$t/justfile.good"
+  printf '%s\n' '' "[group('solo-real')]" "[group('solo')]" 'sr-solo:' "    ./tools/box.sh 'BLOOMERY_GATE_CARD=\${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'tier: solo-real with solo: a named error' 65 "recipe sr-solo: \[group\('solo-real'\)\] with \[group\('solo'\)\]" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' "[group('solo-real')]" 'sr-3090:' "    ./tools/box.sh 'bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'tier: solo-real with a 3090-only gpu-gate.sh call: a named error' 65 "recipe sr-3090: \[group\('solo-real'\)\] with its tools/gpu-gate.sh calls are not all .*(forms: 3090)" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' "[group('solo-real')]" 'sr-none:' "    ./tools/box.sh 'bash tools/gate.sh -p y'" >> "$t/justfile"
+  check 'tier: solo-real with no gpu-gate.sh call: a named error' 65 "recipe sr-none: \[group\('solo-real'\)\] with its tools/gpu-gate.sh calls are not all .*(forms: none)" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' "[group('solo-real')]" 'sr-both:' "    BLOOMERY_CARD=both ./tools/box.sh 'BLOOMERY_GATE_CARD=\${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'tier: solo-real with a box.sh card pick: a named error' 65 "recipe sr-both: \[group\('solo-real'\)\] with BLOOMERY_CARD=both .*\(use solo\)" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' "[group('host')]" "[group('solo-real')]" 'sr-host:' "    ./tools/box.sh 'bash tools/gate.sh --oxide -p hd'" >> "$t/justfile"
+  check 'tier: solo-real with host: a named error' 65 "recipe sr-host: \[group\('host'\)\] with \[group\('solo-real'\)\]" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  # A solo-real recipe's flags are its own arm: another recipe handing them is refused in either tier, and the recipe's own item
+  # with them is not.
+  printf '%s\n' '' "[group('solo-real')]" 'sr-arm *ARGS:' "    ./tools/box.sh 'BLOOMERY_GATE_CARD=\${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_y --sr-arm {{ARGS}}'" >> "$t/justfile"
+  check "tier: a solo-real recipe's arm handed through another recipe is refused in the fixture tier" 65 \
+    "'v41-a:--sr-arm' hands gen_y --sr-arm, the arm of the solo recipe sr-arm" "${gb[@]}" --tier fixture --dry-run 'v41-a:--sr-arm'
+  check '  … and in the real tier' 65 "'v41-a:--sr-arm' hands gen_y --sr-arm, the arm of the solo recipe sr-arm" "${gb[@]}" --dry-run 'v41-a:--sr-arm'
+  check "  … while the recipe's own item with its flag runs in lane A or B in the fixture tier" 0 '^lane [AB]  sr-arm ' "${gb[@]}" --tier fixture --dry-run 'sr-arm:--sr-arm'
+  check '  … and alone in the real tier' 0 '^lane X  sr-arm ' "${gb[@]}" --dry-run 'sr-arm:--sr-arm'
+  cp "$t/justfile.good" "$t/justfile"
+  # Run: a fixture batch's items carry the tier in their box env, every key call (the plan's and the recheck's) sees it, the
+  # clauses an item left to the real tier are counted (its line, then the DONE line); the real tier does none of that.
+  rc=$(steal_case tier-fx "steal-bal	B	a6000	10	$d" -- --tier fixture 'steal-bal@FAKE_DEFER=2')
+  printf '%s' "$rc" > "$t/rc-tier-fx"
+  rc_ok 'tier run: a fixture batch ends green' tier-fx 1
+  want_row 'tier run: its box call carries BLOOMERY_TIER=fixture' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_b$/'
+  want 'tier run: its item line counts the deferred clauses' "$t/target/c-tier-fx/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] deferred=2 ledger=recorded item=steal-bal@FAKE_DEFER=2$'
+  want 'tier run: the DONE line totals them' "$t/target/c-tier-fx/run.log" '^DONE total=1 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2$'
+  want 'tier run: the times row is an entry of its own' "$t/times-tier-fx.tsv" "$(printf '^steal-bal@FAKE_DEFER=2,BLOOMERY_TIER=fixture\t')"
+  n=$((n + 1))
+  if [ "$(grep -c . "$t/fake-state/keycalls.log")" -ge 2 ] && ! grep -qv 'BLOOMERY_TIER=fixture' "$t/fake-state/keycalls.log"; then echo 'ok tier run: the plan'"'"'s key call and the recheck both carry the tier'
+  else bad=$((bad + 1)); echo "FAIL tier run: a key call lacks the tier: $(cat "$t/fake-state/keycalls.log" 2>&1)"; fi
+  # A fixture batch whose gates left nothing to the real tier (none is converted yet) still ends green, its total 0.
+  rc=$(steal_case tier-f0 "steal-bal	B	a6000	10	$d" -- --tier fixture steal-bal)
+  printf '%s' "$rc" > "$t/rc-tier-f0"
+  rc_ok 'tier run: a fixture batch whose gates defer nothing ends green' tier-f0 1
+  want 'tier run: … its DONE line totals 0' "$t/target/c-tier-f0/run.log" '^DONE total=1 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=0$'
+  want_not 'tier run: … and its item line counts none' "$t/target/c-tier-f0/run.log" '^steal-bal .* deferred='
+  rc=$(steal_case tier-re "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_DEFER=2')
+  printf '%s' "$rc" > "$t/rc-tier-re"
+  rc_ok 'tier run: the same item in the real tier ends green' tier-re 1
+  want_no_row 'tier run: … and none of its calls names the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER/'
+  want_not 'tier run: … and the DONE line counts no deferrals' "$t/target/c-tier-re/run.log" '^DONE .* deferred='
+  want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] deferred=2 ledger=recorded '
   # Cold builds: the final try's section only; a local crate is the tree's, a registry or git one is not.
   printf '%s\n' '=== try 1 x' '   Compiling libc v0.2.155' '=== try 2 x' '   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery/crates/gpu)' > "$t/warm.log"
   printf '%s\n' '=== try 1 x' '   Compiling cuda-core v0.1.0 (https://github.com/x/cuda-oxide?branch=b#abc)' '    Finished `release`' > "$t/cold.log"
@@ -745,7 +876,7 @@ if [ "${1:-}" = --self-test ]; then
   self_test
   exit $?
 fi
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0
+OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG=''
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -764,6 +895,8 @@ while [ $# -gt 0 ]; do
     --rerun) RERUN=1; shift ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
+    --tier) [ $# -ge 2 ] || die "--tier needs real or fixture; $USAGE"
+      TIER_FLAG=$2; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     --*) die "unknown option '$1'; $USAGE" ;;
     *) [ -z "$SRC" ] || [ "$SRC" = items ] || die "--smoke, --weekly, --list, --classes and items are exclusive; $USAGE"
@@ -780,6 +913,32 @@ fi
 command -v just > /dev/null || die "just is not on PATH"
 command -v python3 > /dev/null || die "python3 is not on PATH"
 
+# The tier (the header's --tier paragraph). Three places may name it — the flag, a BLOOMERY_TIER entry of BLOOMERY_BOX_ENV
+# (where tools/box.sh reads it for the item's model file) and BLOOMERY_TIER in the environment — and they must agree: two
+# tiers named at once would plan one and run the other. The fixture tier reaches every item through BLOOMERY_BOX_ENV, so the
+# plan, the keys, the key rechecks and the runs all see the same string; the real tier adds nothing.
+TIER_BOX=''
+for kv in ${BLOOMERY_BOX_ENV:-}; do
+  [ "${kv%%=*}" != BLOOMERY_TIER ] || TIER_BOX=${kv#*=}
+done
+TIER='' TIER_FROM=''
+for src in "--tier:$TIER_FLAG" "BLOOMERY_BOX_ENV's BLOOMERY_TIER:$TIER_BOX" "BLOOMERY_TIER in the environment:${BLOOMERY_TIER:-}"; do
+  [ -n "${src#*:}" ] || continue
+  case "${src#*:}" in
+    real | fixture) ;;
+    *) die "${src%%:*} is real or fixture, got '${src#*:}'" ;;
+  esac
+  if [ -z "$TIER" ]; then
+    TIER=${src#*:} TIER_FROM=${src%%:*}
+  elif [ "$TIER" != "${src#*:}" ]; then
+    die "$TIER_FROM names the tier '$TIER' and ${src%%:*} '${src#*:}': name one"
+  fi
+done
+[ -n "$TIER" ] || TIER=real
+if [ "$TIER" = fixture ] && [ -z "$TIER_BOX" ]; then
+  BLOOMERY_BOX_ENV="${BLOOMERY_BOX_ENV:+$BLOOMERY_BOX_ENV }BLOOMERY_TIER=fixture"
+fi
+
 # The plan, in two passes. The first (PYPLAN) validates and classifies every item: one record per
 # item, fields split by \x1f — class (A fixed, F balanced, X alone), log stem, recipe, the item's env
 # (space separated, no card), ARGS (shell-quoted for eval), the item as written, the reason, the kind
@@ -792,8 +951,8 @@ IFS= read -r -d '' PYPLAN << 'PY' || true
 import fcntl, json, os, re, shlex, statistics, subprocess, sys
 from datetime import datetime
 
-root, lanes, src, listfile, caller_env, times_path, default_s = sys.argv[1:8]
-raw_items = sys.argv[8:]
+root, lanes, src, listfile, caller_env, times_path, default_s, tier = sys.argv[1:9]
+raw_items = sys.argv[9:]
 just = ["just", "--justfile", root + "/justfile", "--working-directory", root]
 
 
@@ -1080,6 +1239,7 @@ def classify(name):
 # there too): a group is a scheduling class here, and a typo must not drop a gate out of its class.
 GROUPS = {
     "solo": "alone in lane X, after both lanes",
+    "solo-real": "alone in lane X in the real tier, balanced over lanes A and B in the fixture tier",
     "v41-load": "lane A, one after another (solo wins)",
     "host": "balanced over lanes A and B, no card forced: device-crate tests that open no card",
 }
@@ -1125,7 +1285,7 @@ for n in sorted(recipes):
     if {"group": "host"} not in recipes[n]["attributes"]:
         continue
     text = "\n".join(body(m) for m in closure(n, set()))
-    why = [f"[group('{g}')]" for g in ("solo", "v41-load") if group_of(n, g)]
+    why = [f"[group('{g}')]" for g in ("solo", "solo-real", "v41-load") if group_of(n, g)]
     why += [w for w, hit in (("a tools/gpu-gate.sh call", GPU_GATE in text), ("a box.sh card pick", BOX_CARD.search(text))) if hit]
     if why:
         host_bad.append(f"recipe {n}: [group('host')] with {' and '.join(why)} — a host recipe opens no card and runs beside other items")
@@ -1135,8 +1295,43 @@ if host_bad:
     fail(f"{len(host_bad)} host recipe(s) that open a card or run alone; nothing ran")
 
 
+def solo_any(name):
+    """Whether the recipe is solo or solo-real, whatever the tier: what its own arms are judged by."""
+    return group_of(name, "solo") or group_of(name, "solo-real")
+
+
 def solo_of(name):
-    return group_of(name, "solo")
+    """The recipes that keep name alone in this tier: [group('solo')], and [group('solo-real')] in the real tier."""
+    return group_of(name, "solo") + (group_of(name, "solo-real") if tier == "real" else [])
+
+
+# A solo-real recipe is balanced in the fixture tier, so it must be one the balance can place: every gpu-gate.sh call of it takes
+# the `any` card, and nothing keeps it alone or on a card in either tier — a `solo` beside it, a box.sh card pick (both cards
+# or the A6000 alone: it stays alone whatever the tier) or a 3090-only call would each make the second tier's placement the
+# first's, and the group a name for nothing.
+sr_bad = []
+for n in sorted(recipes):
+    if {"group": "solo-real"} not in recipes[n]["attributes"]:
+        continue
+    why = []
+    if group_of(n, "solo"):
+        why.append("[group('solo')] — a recipe is alone in both tiers (solo) or in the real one (solo-real)")
+    text = "\n".join(body(m) for m in closure(n, set()))
+    if BOX_CARD.search(text):
+        why.append(f"{BOX_CARD.search(text).group(0)} — a box.sh card pick keeps a recipe alone in both tiers (use solo)")
+    if not why:
+        lane, reason = classify(n)
+        if lane in ("T", "R"):
+            why.append(reason)
+        elif GATE_FORMS[n] != {"any"}:
+            seen = ", ".join(sorted(GATE_FORMS[n])) or "none"
+            why.append(f"its tools/gpu-gate.sh calls are not all `{ANY}` (forms: {seen}) — the fixture tier balances it on the any card")
+    if why:
+        sr_bad.append(f"recipe {n}: [group('solo-real')] with " + "; ".join(why))
+if sr_bad:
+    for e in sr_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(sr_bad)} solo-real recipe(s) the fixture tier could not place; nothing ran")
 
 
 # A solo recipe's arm run through another recipe: a non-solo item whose ARGS hand a solo recipe's
@@ -1154,7 +1349,7 @@ def gate_calls(name):
 
 SOLO_ARMS = {}
 for _n in recipes:
-    if {"group": "solo"} in recipes[_n]["attributes"]:
+    if {"group": "solo"} in recipes[_n]["attributes"] or {"group": "solo-real"} in recipes[_n]["attributes"]:
         for _bin, _flags in gate_calls(_n):
             for _f in _flags:
                 SOLO_ARMS.setdefault((_bin, _f), _n)
@@ -1162,7 +1357,7 @@ for _n in recipes:
 
 def solo_arm(name, argv):
     """The (flag, solo recipe) whose arm the item's ARGS select, or None."""
-    if solo_of(name):
+    if solo_any(name):
         return None
     for n in closure(name, set()):
         for b, _ in gate_calls(n):
@@ -1267,9 +1462,10 @@ def placement(name, lane, lanes):
     if group_of(name, "host"):
         # Device code with no card: its lane is a scheduling choice, and the balance makes it.
         return "F", "balanced", ["-"], ["none"]
-    if group_of(name, "v41-load"):
+    if group_of(name, "v41-load") and tier == "real":
         # One lane: two V4.1 loads at once evict each other's host set from the page cache. Lane A,
         # where the 3090-only (`--place gate`) loads already are; an `any` member runs on the 3090.
+        # Not in the fixture tier: a fixture load takes no V4.1 load lock and has no such host set.
         return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
     if lane == "A":
         return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
@@ -1289,7 +1485,7 @@ if src == "classes":
             print("\t".join([name, lane, "timed" if lane == "T" else "refused", "-", reason]))
         else:
             cls, kind, cards, _ = placement(name, lane, "2")
-            tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load", "host") for n in group_of(name, g)]
+            tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host") for n in group_of(name, g)]
             print("\t".join([name, cls, kind, ",".join(cards), "; ".join(tags + [reason])]))
     sys.exit(0)
 
@@ -1343,6 +1539,8 @@ for item, at in zip(raw_items, where):
                 errors.append(f"{at}: env entry {kv!r} of {item!r} is not K=V (no spaces)")
             elif lanes == "2" and k == "BLOOMERY_GATE_CARD":
                 errors.append(f"{at}: {item!r} sets BLOOMERY_GATE_CARD; with two lanes the card is the runner's (use --lanes 1)")
+            elif k == "BLOOMERY_TIER":
+                errors.append(f"{at}: {item!r} sets BLOOMERY_TIER; the tier is the batch's (--tier), as it decides the item's lane")
             else:
                 envs.append(f"{k}={v}")
     argv = []
@@ -1374,11 +1572,13 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} hands {b} {flag}, the arm of the solo recipe {solo_n} — it runs alone in "
                       f"lane X with what that recipe sets around it; list {solo_n} instead")
         continue
-    tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load", "host") for n in group_of(name, g)]
+    tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host") for n in group_of(name, g)]
     if tags:
         reason = "; ".join(tags + [reason])
     qargs = " ".join(shlex.quote(a) for a in argv)
-    tkey = name + ("@" + ",".join(envs) if envs else "") + (":" + qargs if argv else "")
+    # A fixture run is not the real one: its row is an entry of its own, so neither pollutes the other's median.
+    tenvs = envs + (["BLOOMERY_TIER=fixture"] if tier == "fixture" else [])
+    tkey = name + ("@" + ",".join(tenvs) if tenvs else "") + (":" + qargs if argv else "")
     if re.search(r"[\t\n]", tkey):
         errors.append(f"{at}: {item!r} holds a tab or a newline in its env or ARGS: the times file is one tab-separated row per item")
         continue
@@ -1404,7 +1604,7 @@ xs = sorted((k for k, rec in enumerate(out) if rec.startswith("X\x1f")), key=lam
 out = [rec for rec in out if not rec.startswith("X\x1f")] + [out[k] for k in xs]
 print("\n".join(out))
 PY
-PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" ${ITEMS[@]+"${ITEMS[@]}"}) \
+PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" ${ITEMS[@]+"${ITEMS[@]}"}) \
   || RC=$? die "the list did not validate (above)"
 if [ "$SRC" = classes ]; then
   printf '%s\n' "$PLAN0"
@@ -1745,7 +1945,7 @@ predicted
 
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0 deferred=0
   local argv=()
   eval "argv=(${P_ARGS[$i]})"
   benv=$(box_env_of "$i")
@@ -1773,6 +1973,8 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   ran=$((ran > waits ? ran - waits : 0))
   cold=$(cold_of "$log" "$try")
   [ "$cold" = 0 ] || line="$line cold=1"
+  deferred=$(deferred_of "$log" "$try")
+  [ "$deferred" = 0 ] || line="$line deferred=$deferred"
   [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
   # build's row goes to COLD_FILE, which no plan reads.
@@ -1965,6 +2167,10 @@ for ((i = 0; i < N; i++)); do
     break
   fi
 done
+# The fixture tier's clauses left to the real tier, summed over the items' lines (the lanes ran in subshells).
+if [ "$TIER" = fixture ]; then
+  done_line="$done_line deferred=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^deferred=[0-9]+$/) n += substr($i, 10) } END { print n + 0 }' "$RUNLOG")"
+fi
 echo "$done_line" >> "$RUNLOG"
 echo "$done_line"
 if [ "$red" -ne 0 ]; then

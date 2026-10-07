@@ -23,6 +23,7 @@
 pub mod arch;
 pub mod ffn;
 pub mod fileio;
+pub mod fixture;
 pub mod head;
 pub mod kv;
 pub mod moe;

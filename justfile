@@ -890,10 +890,13 @@ gate-union:
 gate-r8:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test r8file -- --include-ignored --nocapture'
 
-# The V4.1 gate fixture's generator (model::arch::deepseek41::fixture, bin v41fixture) against the real file's header and
-# the real DSpark draft's: the plan (the map's nine layers, the metadata overrides, the engine reading the
-# header-only files as the source's layer kinds), determinism, every sampled block's scales and RMS, and
-# small subset files written, opened and verified end to end (under 1 GB each, removed). Reads headers
+# The gate fixture generator (model::fixture, bin fixture) on the V4.1 spec (model::arch::deepseek41::fixture) against
+# the real file's header and the real DSpark draft's: the plan (the map's nine layers, the metadata overrides, the engine
+# reading the header-only files as the source's layer kinds), determinism, every sampled block's scales and RMS, small
+# subset files written, opened and verified end to end (under 1 GB each, removed), and the named refusals. The Qwen3.8 spec
+# (model::arch::qwen35moe::fixture) against the Qwen3.8 file's header and the shared MTP draft's, at the profile's paths:
+# the four-layer plan read back by the engine's hparams at interval 2, the planned card budget (the written file's plan
+# under it holds half the experts on every layer the card loads), and the ik-silent traps refused by name. Reads headers
 # only; writes only under this tree's target/tmp.
 gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test fixture -- --include-ignored --nocapture --test-threads=1'

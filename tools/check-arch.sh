@@ -123,8 +123,8 @@ dispatch=(
   'crates/model/src/bin/bloomery-decode.rs use'
   # r8 사이드카 변환기: Hparams::read 가 deepseek41 이 아닌 파일을 이름 붙여 거절한 뒤 V4.1 의 routed 술어를 쓴다.
   'crates/model/src/bin/r8conv.rs use'
-  # V4.1 게이트 fixture 도구: 원본 헤더를 Hparams::read 로 읽어 deepseek41 이 아닌 파일은 이름 붙여 거절한 뒤 V4.1 층 맵으로 fixture 를 만든다.
-  'crates/model/src/bin/v41fixture.rs use'
+  # The gate fixture tool: its SPECS table maps an architecture to that family's fixture spec, and refuses one with no spec by name.
+  'crates/model/src/bin/fixture.rs use'
   # 호스트 union 벤치: 파일의 아키텍처가 qwen4exp 일 때만 qwen35moe 의 Hparams·텐서 이름·host::layers 로 routed 층을 연다.
   'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.

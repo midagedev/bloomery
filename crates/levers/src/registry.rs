@@ -1097,6 +1097,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The `engram-rate` binary `tools/ref/engram-rate.sh` runs.",
     ),
     path(
+        "BLOOMERY_FIXTURE_MODEL",
+        Some("box.sh"),
+        "The fixture file `tools/box.sh` resolved the fixture tier's model to (the first shard), set only \
+         when the tier resolved one. `tools/gpu-gate.sh` takes no V4.1 load lock for a run whose \
+         `BLOOMERY_REF_MODEL` is this file and asks for none otherwise.",
+    ),
+    path(
+        "BLOOMERY_FIXTURE_ROOT",
+        Some("ref/ref-paths.sh"),
+        "Box side: the directory the fixture tier's files live in, one directory a family \
+         (`/models/fixtures` when unset); `tools/ref/ref-paths.sh` reads it, and `tools/box.sh` does \
+         not carry it from the Mac.",
+    ),
+    path(
         "BLOOMERY_GATE_LEDGER",
         Some("gate-batch.sh"),
         "Mac side: the green ledger `tools/gate-batch.sh --ledger` reads and writes.",
@@ -1859,6 +1873,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The model attention gate's handshake with the child it runs of its own test \
          binary: the file the split-K child writes.",
     ),
+    LeverSpec {
+        name: "BLOOMERY_TIER",
+        class: Class::R,
+        kind: Kind::Words(&["real", "fixture"]),
+        default: Unset::Is("real"),
+        doc: "The tier a box command runs in: `real` is the files the model profiles name, \
+              `fixture` the small files `fixture generate` writes, one directory a family. \
+              `tools/box.sh` reads it from the environment or `BLOOMERY_BOX_ENV` and resolves the \
+              model file and `BLOOMERY_CARD_BUDGET` from the family's fixture \
+              (`tools/ref/ref-paths.sh`; a family with none is refused, never run on its real file); \
+              `tools/gate-batch.sh --tier` passes it to every item, `tools/gpu-gate.sh` takes no \
+              V4.1 load lock for a resolved fixture, and a gate's clauses run by their tag \
+              (`crates/gpu-gates/src/tier.rs`). It is part of every ledger key.",
+        site: Site::Env {
+            script: Some("box.sh"),
+        },
+    },
     runner(
         "BLOOMERY_TIMING_CARDS",
         Some("ref/timing-card.sh"),

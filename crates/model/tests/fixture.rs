@@ -1,6 +1,6 @@
-//! The V4.1 gate fixture's generator (`model::arch::deepseek41::fixture`, bin `v41fixture`),
-//! against the real file's header (`gguf::v41::model`) and the real DSpark
-//! draft's (`$BLOOMERY_DSPARK_MODEL`). Four contracts:
+//! The gate fixture generator (`model::fixture`, bin `fixture`) on the V4.1 spec
+//! (`model::arch::deepseek41::fixture`), against the real file's header (`gguf::v41::model`) and
+//! the real DSpark draft's (`$BLOOMERY_DSPARK_MODEL`). Five contracts:
 //!
 //! 1. the plan: the nine layers are the map's, each tensor its source's name,
 //!    dims and type, the metadata overrides exactly the list, no nested
@@ -16,8 +16,36 @@
 //!    existing directory are refused by name; each written file's sha256 is
 //!    printed, the record that today's generator writes today's bytes;
 //! 5. refusals: a draft naming more target layers than the fixture has, a
-//!    `general.alignment` the writer would not take, and a flag its verb does
-//!    not take are refused by name.
+//!    `general.alignment` the writer would not take, an ff override the V4.1
+//!    spec has no rule for, a flag its verb does not take, and a file whose
+//!    architecture has no spec are refused by name;
+//! 6. a second family: a synthetic family plugs in through `FixtureSpec`
+//!    alone — its key rules, a table that resizes a global, an ff override, a
+//!    layer-id list — and its fixture is planned, written and verified; the
+//!    spec's ratios one short, a layer list the map does not hold, a draft for
+//!    a family with none and another architecture are refused by name;
+//! 7. the Q5_1 and IQ4_NL rules under the V4.1 spec's window: a filled chunk
+//!    dequantizes (`gguf::dequant_row`) to an RMS within ±10 % of 1/√K and
+//!    every block holds its rule; a K whose `d` no code choice puts in the
+//!    window is refused with `NoScale`;
+//! 8. the window is the spec's: a wider one admits Q5_1 at K = 640, which
+//!    V4.1's refuses, and a window that leaves the normal f16 values is
+//!    refused by name.
+//!
+//! The Qwen3.8 spec (`model::arch::qwen35moe::fixture`) against the real file's header and the
+//! real shared MTP draft's, header-only files only (each file a hole beyond its header):
+//!
+//! 9. the plan: four layers from source layers 2, 3, 1 and 47, the interval written 2, and the
+//!    engine's own hparams reader reading the header-only files back as four layers of kinds
+//!    [GDN, QSA, GDN, QSA], pools [0, 4, 0, 4], the PLE site at layer 2, and the draft as a draft
+//!    of the target;
+//! 10. the card budget: the plan of the written file under its recorded budget holds half of the
+//!     experts (256) on every layer `card_routed` admits and none on the others, its budgetless
+//!     plan all of them; a budget one step either side of the recorded one is refused by name, and
+//!     `verify` refuses a header whose recorded budget is not the plan's;
+//! 11. the silent traps of ik's reader: a per-layer array one short, a missing `ple.layers`, and
+//!     a missing `full_attention_interval` are refused by name, in the source and in the written
+//!     file, as is a draft's ratios array one short of its layers.
 //!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
@@ -27,13 +55,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use gguf::write::{Layout, Writer};
+use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Split, Value};
-use model::arch::deepseek41::fixture::{
-    self, FilePlan, FixtureError, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256,
-    KEY_VERSION, LAYER_MAP, Options, Plan, PlannedTensor, Rule, Sample,
-};
+use model::arch::deepseek41::fixture::{self as v41, LAYER_MAP};
+use model::arch::qwen35moe::fixture as q38;
+use model::arch::qwen35moe::hparams::Kind;
+use model::arch::qwen35moe::place::{Experts, PlanInputs, UBATCH_PLANNED, machine_for_experts};
 use model::fileio;
+use model::fixture::{
+    self, CHUNK_TARGET, CardBudget, Family, FilePlan, FixtureError, FixtureSpec, KEY_CARD_BUDGET,
+    KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION, KeyRule, Options, Plan,
+    PlannedTensor, Rule, Sample, Tables, Window, rule_for,
+};
+use model::placement::PlanLevers;
+use model::placement::workstation::RTX_3090;
 use sha2::{Digest, Sha256};
 
 const ARCH: &str = "deepseek41";
@@ -54,7 +89,8 @@ fn draft() -> Split {
 }
 
 fn full_plan(src: &Split, d: &Split) -> Plan {
-    fixture::plan(src, Some(d), &Options::default()).expect("the plan of the real file")
+    let spec = v41::spec();
+    fixture::plan(&spec, src, Some(d), &spec.options()).expect("the plan of the real file")
 }
 
 /// A fresh directory under the target's tmp dir, removed when dropped —
@@ -131,7 +167,11 @@ fn hw_fixture_plan() {
             None => src_globals.push(info.name.clone()),
         }
     }
-    let site_rows: Vec<u64> = p.engram_rows.iter().map(|&(fx, _)| fx).collect();
+    let site_rows: Vec<u64> = v41::engram_rows(&src)
+        .unwrap()
+        .iter()
+        .map(|&(fx, _)| fx)
+        .collect();
     for (f, &l) in LAYER_MAP.iter().enumerate() {
         let ours: Vec<&PlannedTensor> = t.tensors.iter().filter(|x| x.layer == Some(f)).collect();
         let theirs = &src_layers[&l];
@@ -251,7 +291,7 @@ fn hw_fixture_plan() {
             .take_while(|d| d * d <= n)
             .all(|d| !n.is_multiple_of(d))
     };
-    let all: Vec<u64> = (fixture::ENGRAM_PRIME_FLOOR + 1..)
+    let all: Vec<u64> = (v41::ENGRAM_PRIME_FLOOR + 1..)
         .filter(|&n| is_prime(n))
         .take(48)
         .collect();
@@ -283,7 +323,7 @@ fn hw_fixture_plan() {
     );
     assert_eq!(
         get(KEY_CARD_BUDGET).as_u64(),
-        Some(fixture::DEFAULT_CARD_BUDGET)
+        Some(v41::DEFAULT_CARD_BUDGET)
     );
     let dp = p.draft.as_ref().unwrap();
     let dtheirs: HashMap<&str, &Value> = d.iter_kv().collect();
@@ -342,9 +382,10 @@ fn hw_fixture_plan() {
     let first = header_only(t, dd);
     let draft_file = header_only(dp, dd);
     let fx = Split::open(&first).unwrap();
-    let hp = fixture::check_kinds(&fx, &src).unwrap();
+    let spec = v41::spec();
+    let hp = v41::check_kinds(&spec, &fx, &src).unwrap();
     let dx = Split::open(&draft_file).unwrap();
-    let dhp = fixture::check_draft(&dx, &fx, true).unwrap();
+    let dhp = v41::check_draft(&spec, &dx, &fx, true).unwrap();
     let real_bytes: u64 = std::fs::read_dir(dd)
         .unwrap()
         .map(|e| {
@@ -472,6 +513,7 @@ fn hw_fixture_scales() {
     let src = source();
     let d = draft();
     let p = full_plan(&src, &d);
+    let window = v41::spec().window;
     let all: Vec<&PlannedTensor> = p
         .target
         .tensors
@@ -491,7 +533,7 @@ fn hw_fixture_scales() {
                         let mut buf = vec![0u8; r.len()];
                         t.fill_chunk(7, c, &mut buf);
                         let unit = t.ty.type_size().unwrap() as usize;
-                        let got = fixture::check_units(t, &buf, r.start / unit)
+                        let got = fixture::check_units(t, &buf, r.start / unit, window)
                             .unwrap_or_else(|e| panic!("{e}"));
                         total.blocks += got.blocks;
                         total.values += got.values;
@@ -520,7 +562,7 @@ fn hw_fixture_scales() {
             _ => Vec::new(),
         };
         assert!(
-            ds.iter().all(|&b| fixture::d_in_window(b)),
+            ds.iter().all(|&b| window.holds(b)),
             "{}: {}",
             t.name,
             t.rule.describe()
@@ -561,7 +603,7 @@ fn hw_fixture_scales() {
 /// The binary on `args`: status, stdout, stderr, echoed.
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
     let t = Instant::now();
-    let o = Command::new(env!("CARGO_BIN_EXE_v41fixture"))
+    let o = Command::new(env!("CARGO_BIN_EXE_fixture"))
         .args(args)
         .output()
         .unwrap();
@@ -571,7 +613,7 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
     );
     let tail: Vec<&str> = out.lines().filter(|l| !l.contains(" type=")).collect();
     println!(
-        "$ v41fixture {}\n{}\n{err}rc={:?} wall={:.2}s",
+        "$ fixture {}\n{}\n{err}rc={:?} wall={:.2}s",
         args.join(" "),
         tail.join("\n"),
         o.status.code(),
@@ -627,12 +669,13 @@ fn hw_fixture_end_to_end() {
         "blk.1.engram_embd.weight",
         "blk.2.ffn_down_shexp.weight",
     ];
+    let spec = v41::spec();
     let opts = Options {
         tensors: Some(subset.map(String::from).to_vec()),
         shard_bytes: u64::MAX,
-        ..Options::default()
+        ..spec.options()
     };
-    let p = fixture::plan(&src, None, &opts).unwrap();
+    let p = fixture::plan(&spec, &src, None, &opts).unwrap();
     let cap = p.target.padded(&p.target.tensors[0]) + p.target.padded(&p.target.tensors[1]);
     let types: Vec<String> = p
         .target
@@ -665,25 +708,23 @@ fn hw_fixture_end_to_end() {
     let gen_wall = t0.elapsed().as_secs_f64();
     assert_eq!(rc, Some(0));
     assert!(
-        stdout.contains("v41fixture: generate done tensors=9 "),
+        stdout.contains("fixture: generate done tensors=9 "),
         "no summary"
     );
     for n in subset {
         assert!(
-            stdout.contains(&format!("v41fixture: tensor {n} ")),
+            stdout.contains(&format!("fixture: tensor {n} ")),
             "no line for {n}"
         );
     }
     let peak = children_peak_kib();
-    let first = out.join(format!("{}-00001-of-00002.gguf", fixture::STEM));
+    let first = out.join(format!("{}-00001-of-00002.gguf", v41::STEM));
     let fx = Split::open(&first).unwrap();
     assert_eq!(fx.shard_count(), 2);
     let first_s = first.to_str().unwrap();
     let (rc, stdout, _) = run(&["verify", first_s, "--source", &src_path]);
     assert_eq!(rc, Some(0));
-    assert!(
-        stdout.contains("v41fixture: verify done tensors=9 ") && stdout.contains("subset=true")
-    );
+    assert!(stdout.contains("fixture: verify done tensors=9 ") && stdout.contains("subset=true"));
     print_file_shas(&out);
     let (rc, _, stderr) = run(&[
         "verify",
@@ -755,7 +796,7 @@ fn hw_fixture_end_to_end() {
     let draft_wall = t1.elapsed().as_secs_f64();
     assert_eq!(rc, Some(0));
     assert!(
-        stdout.contains("v41fixture: generate done tensors=6 "),
+        stdout.contains("fixture: generate done tensors=6 "),
         "no summary"
     );
     let peak2 = children_peak_kib();
@@ -766,10 +807,10 @@ fn hw_fixture_end_to_end() {
         .collect();
     assert_eq!(
         beside,
-        [format!("{}-00001-of-00001.gguf", fixture::STEM)],
+        [format!("{}-00001-of-00001.gguf", v41::STEM)],
         "a directory reader of the target's shards must not meet the draft"
     );
-    let dfile = out.join(fixture::DRAFT_FILE);
+    let dfile = out.join(v41::DRAFT_FILE);
     let dx = Split::open(&dfile).unwrap();
     let dtypes: Vec<String> = dx
         .iter_tensors()
@@ -783,7 +824,7 @@ fn hw_fixture_end_to_end() {
     assert!(dbytes < 1 << 30);
     drop(dx);
     print_file_shas(&out);
-    let first = out.join(format!("{}-00001-of-00001.gguf", fixture::STEM));
+    let first = out.join(format!("{}-00001-of-00001.gguf", v41::STEM));
     let (rc, stdout, _) = run(&[
         "verify",
         first.to_str().unwrap(),
@@ -855,12 +896,13 @@ fn hw_fixture_refusals() {
     let n_layer = u32::try_from(src.arch_get_u64("block_count").unwrap()).unwrap();
     let guard = dir("refusals");
     let d = &guard.0;
+    let spec = v41::spec();
     let mut bad: Vec<String> = Vec::new();
 
     // A draft that reads the source's last ten layers: more than the fixture's nine.
     let n = LAYER_MAP.len() as u32 + 1;
     let wide = draft_header(&d.join("wide.gguf"), &draft_kvs(n_layer - n..n_layer, &[]));
-    match fixture::plan(&src, Some(&wide), &Options::default()) {
+    match fixture::plan(&spec, &src, Some(&wide), &spec.options()) {
         Err(e @ FixtureError::Metadata { .. })
             if e.to_string()
                 .contains("more target layers than the fixture's 9") =>
@@ -886,10 +928,39 @@ fn hw_fixture_refusals() {
     ));
     patch_alignment(&align_path, 48);
     let align = Split::open(&align_path).unwrap();
-    match fixture::plan(&src, Some(&align), &Options::default()) {
+    match fixture::plan(&spec, &src, Some(&align), &spec.options()) {
         Err(e @ FixtureError::Alignment { .. }) => println!("refusals: alignment 48: {e}"),
         Err(e) => bad.push(format!("alignment 48: refused as {e}")),
         Ok(_) => bad.push("alignment 48: planned".to_string()),
+    }
+
+    // An ff override: the V4.1 spec names no ff key, so it has no rule for one.
+    let narrow = FixtureSpec {
+        ff: Some(512),
+        ..v41::spec()
+    };
+    match fixture::plan(&narrow, &src, None, &narrow.options()) {
+        Err(e @ FixtureError::Metadata { .. }) if e.to_string().contains("has no ff key") => {
+            println!("refusals: ff 512: {e}");
+        }
+        Err(e) => bad.push(format!("ff 512: refused as {e}")),
+        Ok(_) => bad.push("ff 512: planned".to_string()),
+    }
+
+    // A file of an architecture no spec covers, and the V4-Flash string the
+    // engine reads with the V4.1 module: the binary refuses both by name.
+    for arch in ["nofamily", model::arch::DEEPSEEK4] {
+        let path = d.join(format!("{arch}.gguf"));
+        let kvs = [(
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String(arch.into()),
+        )];
+        drop(draft_header(&path, &kvs));
+        let want = format!("architecture Some({arch:?}) has no fixture spec");
+        let (rc, _, stderr) = run(&["plan", path.to_str().unwrap()]);
+        if rc != Some(1) || !stderr.contains(&want) {
+            bad.push(format!("{arch}: rc {rc:?}, not refused with {want:?}"));
+        }
     }
 
     // Flags a verb does not take, a flag twice, and a draft subset with no draft.
@@ -923,5 +994,872 @@ fn hw_fixture_refusals() {
         "not refused by name:\n  {}",
         bad.join("\n  ")
     );
-    println!("refusals: all 6 refused by name");
+    println!("refusals: all 9 refused by name");
+}
+
+/// The second family's rules: every generic key rule, a constant for its
+/// norms, an ff axis on each expert stack, and a table.
+struct Toy;
+
+impl Family for Toy {
+    fn key_rule(&self, suffix: &str) -> Option<KeyRule> {
+        Some(match suffix {
+            "block_count" => KeyRule::BlockCount,
+            "embedding_length" => KeyRule::Copy,
+            "ratios" => KeyRule::Ratios,
+            "layer_list" => KeyRule::LayerIds,
+            "per_layer" => KeyRule::PerLayer,
+            "expert_feed_forward_length" => KeyRule::Ff,
+            "table_rows" => KeyRule::Table,
+            _ => return None,
+        })
+    }
+
+    fn const_value(&self, leaf: &str) -> Option<f32> {
+        matches!(leaf, "norm.weight" | "output_norm.weight").then_some(1.0)
+    }
+
+    fn ff_axis(&self, leaf: &str) -> Option<usize> {
+        match leaf {
+            "ffn_up_exps.weight" => Some(1),
+            "ffn_down_exps.weight" => Some(0),
+            _ => None,
+        }
+    }
+
+    fn tables(
+        &self,
+        _source: &Split,
+        _spec: &FixtureSpec,
+    ) -> Result<Box<dyn Tables>, FixtureError> {
+        Ok(Box::new(ToyTable))
+    }
+
+    fn check_kinds(
+        &self,
+        spec: &FixtureSpec,
+        fixture: &Split,
+        _source: &Split,
+    ) -> Result<(), FixtureError> {
+        let n = fixture.arch_get_u64("block_count");
+        if n == Some(spec.layers.len() as u64) {
+            Ok(())
+        } else {
+            Err(FixtureError::Mismatch {
+                what: "layer count".into(),
+                detail: format!("{n:?}"),
+            })
+        }
+    }
+}
+
+/// The second family's table: `tab.weight` and its row count cut to
+/// [`TOY_ROWS`].
+struct ToyTable;
+
+const TOY_ROWS: u64 = 100;
+
+impl Tables for ToyTable {
+    fn key(&self, key: &str, suffix: &str, _v: &Value) -> Result<Value, FixtureError> {
+        match suffix {
+            "table_rows" => Ok(Value::U32(TOY_ROWS as u32)),
+            _ => Err(FixtureError::Metadata {
+                key: key.to_string(),
+                detail: "not a toy table key".into(),
+            }),
+        }
+    }
+
+    fn dims(
+        &self,
+        _name: &str,
+        layer: Option<usize>,
+        leaf: &str,
+        dims: &[u64],
+    ) -> Result<Option<Vec<u64>>, FixtureError> {
+        Ok((layer.is_none() && leaf == "tab.weight").then(|| vec![dims[0], TOY_ROWS]))
+    }
+
+    fn lines(&self) -> Vec<String> {
+        vec![format!("toy table rows={TOY_ROWS} (source 1000)")]
+    }
+}
+
+static TOY: Toy = Toy;
+
+/// A four-layer source of the second family: one file, its tensors zero.
+fn toy_source(path: &Path) -> Split {
+    let arr = |v: &[u32]| Value::Array(v.iter().map(|&x| Value::U32(x)).collect());
+    let mut tensors: Vec<(&str, Vec<u64>, GgmlType)> = vec![
+        ("tab.weight", vec![64, 1000], GgmlType::BF16),
+        ("output_norm.weight", vec![64], GgmlType::F32),
+    ];
+    let names: Vec<[String; 4]> = (0..4)
+        .map(|l| {
+            ["norm", "attn", "ffn_up_exps", "ffn_down_exps"].map(|n| format!("blk.{l}.{n}.weight"))
+        })
+        .collect();
+    for n in &names {
+        tensors.push((&n[0], vec![64], GgmlType::F32));
+        tensors.push((&n[1], vec![4096, 8], GgmlType::Q8_0));
+        tensors.push((&n[2], vec![64, 512, 4], GgmlType::BF16));
+        tensors.push((&n[3], vec![512, 64, 4], GgmlType::BF16));
+    }
+    let kvs = vec![
+        (
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String("toy".into()),
+        ),
+        ("split.no".to_string(), Value::U16(0)),
+        ("split.count".to_string(), Value::U16(1)),
+        (
+            "split.tensors.count".to_string(),
+            Value::I32(tensors.len() as i32),
+        ),
+        ("toy.block_count".to_string(), Value::U32(4)),
+        ("toy.embedding_length".to_string(), Value::U32(64)),
+        ("toy.ratios".to_string(), arr(&[5, 6, 6, 7, 9])),
+        ("toy.layer_list".to_string(), arr(&[3])),
+        ("toy.per_layer".to_string(), arr(&[10, 11, 12, 13])),
+        (
+            "toy.expert_feed_forward_length".to_string(),
+            Value::U32(512),
+        ),
+        ("toy.table_rows".to_string(), Value::U32(1000)),
+    ];
+    let decls: Vec<TensorDecl> = tensors
+        .iter()
+        .map(|(name, dims, ty)| {
+            let (_, blck, tsz) = gguf::ggml_type_info(ty.as_u32()).unwrap();
+            TensorDecl {
+                name: name.to_string(),
+                dims: dims.clone(),
+                type_id: ty.as_u32(),
+                nbytes: tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>(),
+            }
+        })
+        .collect();
+    let bytes: Vec<u64> = decls.iter().map(|t| t.nbytes).collect();
+    let layout = Layout::new(&kvs, decls).unwrap();
+    let mut w = Writer::new(File::create(path).unwrap(), layout).unwrap();
+    for ((name, _, _), n) in tensors.iter().zip(bytes) {
+        w.tensor(name, &vec![0u8; n as usize]).unwrap();
+    }
+    w.finish().unwrap();
+    Split::open(path).unwrap()
+}
+
+fn toy_spec() -> FixtureSpec {
+    FixtureSpec {
+        arch: "toy",
+        stem: "toy-fixture",
+        layers: vec![0, 3],
+        ratios: vec![5, 7],
+        card_budget: CardBudget::Fixed(1 << 30),
+        window: Window::new(1.0 / 16384.0, 1.0 / 64.0).unwrap(),
+        ff: Some(256),
+        default_source: String::new,
+        draft: None,
+        family: &TOY,
+    }
+}
+
+/// Contract 6: a second family.
+#[test]
+fn fixture_second_family() {
+    let guard = dir("toy");
+    let d = &guard.0;
+    let src = toy_source(&d.join("toy-00001-of-00001.gguf"));
+    let spec = toy_spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let kv = |k: &str| {
+        &p.target
+            .kvs
+            .iter()
+            .find(|(n, _)| n == k)
+            .unwrap_or_else(|| panic!("no {k}"))
+            .1
+    };
+    assert_eq!(kv("toy.block_count"), &Value::U32(2));
+    assert_eq!(unsigned_items(kv("toy.ratios")), [5, 7, 9]);
+    assert_eq!(unsigned_items(kv("toy.layer_list")), [1]);
+    assert_eq!(unsigned_items(kv("toy.per_layer")), [10, 13]);
+    assert_eq!(kv("toy.expert_feed_forward_length"), &Value::U32(256));
+    assert_eq!(kv("toy.table_rows"), &Value::U32(TOY_ROWS as u32));
+    assert_eq!(unsigned_items(kv(KEY_SOURCE_LAYERS)), [0, 3]);
+    let got: Vec<(String, String, Vec<u64>)> = p
+        .target
+        .tensors
+        .iter()
+        .map(|t| (t.name.clone(), t.source.clone(), t.dims.clone()))
+        .collect();
+    let mut want = vec![
+        (
+            "tab.weight".to_string(),
+            "tab.weight".to_string(),
+            vec![64, TOY_ROWS],
+        ),
+        (
+            "output_norm.weight".into(),
+            "output_norm.weight".into(),
+            vec![64],
+        ),
+    ];
+    for (f, l) in [(0, 0), (1, 3)] {
+        for (n, dims) in [
+            ("norm", vec![64]),
+            ("attn", vec![4096, 8]),
+            ("ffn_up_exps", vec![64, 256, 4]),
+            ("ffn_down_exps", vec![256, 64, 4]),
+        ] {
+            want.push((
+                format!("blk.{f}.{n}.weight"),
+                format!("blk.{l}.{n}.weight"),
+                dims,
+            ));
+        }
+    }
+    assert_eq!(got, want);
+    assert_eq!(
+        p.notes,
+        [format!("toy table rows={TOY_ROWS} (source 1000)")]
+    );
+    println!(
+        "second family: plan {} tensors, notes {:?}",
+        got.len(),
+        p.notes
+    );
+
+    let out = d.join("out");
+    let opts = Options {
+        seed: 3,
+        ..spec.options()
+    };
+    let s = fixture::generate(&spec, &src, None, &out, &opts, &mut |_| {}).unwrap();
+    let fx = Split::open(out.join("toy-fixture-00001-of-00001.gguf")).unwrap();
+    let (v, none) = fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    assert_eq!((v.tensors, v.subset, none.is_none()), (10, false, true));
+    println!(
+        "second family: wrote {} tensors, {} bytes; verify {} tensors, {} blocks",
+        s.tensors, s.file_bytes, v.tensors, v.blocks
+    );
+
+    let mut bad: Vec<String> = Vec::new();
+    let refusals: [(&str, FixtureSpec, bool, &str); 4] = [
+        (
+            "the spec's ratios one short",
+            FixtureSpec {
+                ratios: vec![5],
+                ..toy_spec()
+            },
+            false,
+            "the fixture is built for [5]",
+        ),
+        (
+            "a layer list the map does not hold",
+            FixtureSpec {
+                layers: vec![0, 1],
+                ratios: vec![5, 6],
+                ..toy_spec()
+            },
+            false,
+            "lists layer 3, which the map does not hold",
+        ),
+        (
+            "a draft for a family with none",
+            toy_spec(),
+            true,
+            "the toy fixture has no draft file",
+        ),
+        (
+            "another architecture",
+            FixtureSpec {
+                arch: "other",
+                ..toy_spec()
+            },
+            false,
+            "not a other file",
+        ),
+    ];
+    for (what, spec, with_draft, want) in refusals {
+        let draft = with_draft.then_some(&src);
+        match fixture::plan(&spec, &src, draft, &spec.options()) {
+            Err(e) if e.to_string().contains(want) => println!("second family: {what}: {e}"),
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(_) => bad.push(format!("{what}: planned")),
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "not refused by name:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// A tensor of `ty` with rows of `k` values under `rule`, as many rows as one
+/// chunk holds.
+fn one_chunk(ty: GgmlType, k: u64, rule: Rule) -> PlannedTensor {
+    let unit = ty.type_size().unwrap();
+    let rows = CHUNK_TARGET as u64 / unit * 32 / k;
+    PlannedTensor {
+        name: format!("t.{ty}.{k}"),
+        source: String::new(),
+        layer: None,
+        dims: vec![k, rows],
+        ty,
+        nbytes: rows * (k / 32) * unit,
+        rule,
+    }
+}
+
+/// `t`'s one chunk filled under seed 7 and dequantized by `gguf::dequant_row`:
+/// its RMS over `1/√K`, after every block passes `check_units` and the sample
+/// `rms_within` under `window`.
+fn filled_ratio(t: &PlannedTensor, window: Window) -> Result<f64, FixtureError> {
+    let mut bytes = vec![0u8; t.nbytes as usize];
+    t.fill_chunk(7, 0, &mut bytes);
+    let mut y = vec![0f32; bytes.len() / t.ty.type_size().unwrap() as usize * 32];
+    gguf::dequant_row(t.ty, &bytes, &mut y).unwrap();
+    let rms = (y.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / y.len() as f64).sqrt();
+    let sample = fixture::check_units(t, &bytes, 0, window)?;
+    fixture::rms_within(t, &sample)?;
+    Ok(rms * (t.dims[0] as f64).sqrt())
+}
+
+/// Contract 7: the Q5_1 and IQ4_NL rules fill at σ under V4.1's window. Every
+/// case runs; the failures are listed together.
+#[test]
+fn fixture_new_rules_fill_at_sigma() {
+    let window = v41::spec().window;
+    let mut bad = Vec::new();
+    for (ty, k) in [
+        (GgmlType::Q5_1, 16384),
+        (GgmlType::Q5_1, 65536),
+        (GgmlType::IQ4_NL, 160),
+        (GgmlType::IQ4_NL, 4096),
+    ] {
+        let t = match rule_for("t", ty, k, window) {
+            Ok(rule) => one_chunk(ty, k, rule),
+            Err(e) => {
+                bad.push(format!("{ty} K = {k}: {e}"));
+                continue;
+            }
+        };
+        match filled_ratio(&t, window) {
+            Ok(r) if (0.9..=1.1).contains(&r) => println!(
+                "new rules: {ty} K = {k} in {window}: {}; RMS / (1/sqrt K) = {r:.4}",
+                t.rule.describe()
+            ),
+            Ok(r) => bad.push(format!("{ty} K = {k}: RMS / (1/sqrt K) = {r:.4}")),
+            Err(e) => bad.push(format!("{ty} K = {k}: {e}")),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 7: a σ whose `d` no code choice puts in V4.1's window is refused
+/// with `NoScale`, at both ends of each rule's range. Every case runs.
+#[test]
+fn fixture_new_rules_refuse_out_of_window() {
+    let window = v41::spec().window;
+    let mut bad = Vec::new();
+    for (ty, k) in [
+        (GgmlType::Q5_1, 640),
+        (GgmlType::Q5_1, 1 << 21),
+        (GgmlType::IQ4_NL, 32),
+        (GgmlType::IQ4_NL, 1 << 27),
+    ] {
+        match rule_for("t", ty, k, window) {
+            Err(e @ FixtureError::NoScale { .. }) => println!("new rules: {ty} K = {k}: {e}"),
+            Err(e) => bad.push(format!("{ty} K = {k}: refused as {e}, not NoScale")),
+            Ok(r) => bad.push(format!("{ty} K = {k}: planned {}", r.describe())),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 8: the second family's window, [2^-14, 2^-6], is wider than
+/// V4.1's and admits Q5_1 at K = 640 (`d = σ/√85.25 = 2^-7.87`), which V4.1's
+/// refuses; its blocks fill at σ and hold under the wide window, and V4.1's
+/// window refuses them by name.
+#[test]
+fn fixture_wider_window_admits_q5_1_at_k640() {
+    let (ty, k) = (GgmlType::Q5_1, 640);
+    let narrow = v41::spec().window;
+    let wide = toy_spec().window;
+    match rule_for("t", ty, k, narrow) {
+        Err(e @ FixtureError::NoScale { .. }) => println!("window: {ty} K = {k}: {e}"),
+        other => panic!("{ty} K = {k} under {narrow}: {other:?}, not NoScale"),
+    }
+    let t = one_chunk(ty, k, rule_for("t", ty, k, wide).unwrap());
+    let r = filled_ratio(&t, wide).unwrap();
+    println!(
+        "window: {ty} K = {k} in {wide}: {}; RMS / (1/sqrt K) = {r:.4}",
+        t.rule.describe()
+    );
+    assert!((0.9..=1.1).contains(&r), "RMS / (1/sqrt K) = {r:.4}");
+    match filled_ratio(&t, narrow) {
+        Err(e @ FixtureError::Block { .. }) if e.to_string().contains(&narrow.to_string()) => {
+            println!("window: the same blocks under {narrow}: {e}");
+        }
+        other => panic!("the K = 640 blocks under {narrow}: {other:?}, not a Block error"),
+    }
+}
+
+/// Contract 8: a window that leaves the normal f16 values `[2^-14, 65504]` is
+/// refused by name; their whole range is a window.
+#[test]
+fn fixture_window_leaves_normal_f16_refused() {
+    let mut bad = Vec::new();
+    for (lo, hi) in [
+        (1.0 / 32768.0, 1.0 / 1024.0),
+        (1.0 / 8192.0, 65536.0),
+        (1.0 / 1024.0, 1.0 / 8192.0),
+        (f32::NAN, 1.0),
+    ] {
+        match Window::new(lo, hi) {
+            Err(e @ FixtureError::BadWindow { .. }) => println!("window: [{lo:e}, {hi:e}]: {e}"),
+            Err(e) => bad.push(format!("[{lo:e}, {hi:e}]: refused as {e}")),
+            Ok(w) => bad.push(format!("[{lo:e}, {hi:e}]: taken as {w}")),
+        }
+    }
+    if let Err(e) = Window::new(1.0 / 16384.0, 65504.0) {
+        bad.push(format!("the normal f16 range itself: {e}"));
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+// ------------------------------------------------------------------ Qwen3.8
+
+const RATIOS: &str = "qwen4exp.attention.compress_ratios";
+const PLE_LAYERS: &str = "qwen4exp.ple.layers";
+const INTERVAL: &str = "qwen4exp.full_attention_interval";
+
+fn q38_source() -> Split {
+    Split::open(q38::DEFAULT_MODEL)
+        .unwrap_or_else(|e| panic!("open the Qwen3.8 file {}: {e}", q38::DEFAULT_MODEL))
+}
+
+fn q38_draft() -> Split {
+    Split::open(q38::DEFAULT_MTP_MODEL)
+        .unwrap_or_else(|e| panic!("open the Qwen3.8 MTP draft {}: {e}", q38::DEFAULT_MTP_MODEL))
+}
+
+/// The value of `key` in `kvs`.
+fn kv<'a>(kvs: &'a mut [(String, Value)], key: &str) -> &'a mut Value {
+    &mut kvs
+        .iter_mut()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("no {key}"))
+        .1
+}
+
+/// `kvs` without `key`, which it must hold.
+fn drop_key(kvs: &mut Vec<(String, Value)>, key: &str) {
+    let n = kvs.len();
+    kvs.retain(|(k, _)| k != key);
+    assert_eq!(kvs.len(), n - 1, "no {key}");
+}
+
+/// The array `key` without its last item.
+fn pop_item(kvs: &mut [(String, Value)], key: &str) {
+    match kv(kvs, key) {
+        Value::Array(a) => {
+            a.pop().expect("a non-empty array");
+        }
+        other => panic!("{key} is {other:?}, not an array"),
+    }
+}
+
+/// The integer `v` as `n` in `v`'s type.
+fn retype(v: &Value, n: u64) -> Value {
+    match v {
+        Value::U8(_) => Value::U8(n as u8),
+        Value::U16(_) => Value::U16(n as u16),
+        Value::U32(_) => Value::U32(n as u32),
+        Value::U64(_) => Value::U64(n),
+        Value::I8(_) => Value::I8(n as i8),
+        Value::I16(_) => Value::I16(n as i16),
+        Value::I32(_) => Value::I32(n as i32),
+        Value::I64(_) => Value::I64(n as i64),
+        other => panic!("{other:?} is not an integer"),
+    }
+}
+
+/// `src`'s header as one sparse file `name` under `d`: its metadata through
+/// `edit` (a split set's keys as a one-file set's) and its tensors the ones
+/// `keep` takes — what the planner reads of a source, whatever the source's
+/// size.
+fn edited_header(
+    src: &Split,
+    d: &Path,
+    name: &str,
+    keep: impl Fn(&str) -> bool,
+    edit: impl FnOnce(&mut Vec<(String, Value)>),
+) -> Split {
+    let tensors: Vec<TensorDecl> = src
+        .iter_tensors()
+        .filter(|(_, t)| keep(&t.name))
+        .map(|(_, t)| TensorDecl {
+            name: t.name.clone(),
+            dims: t.dims.clone(),
+            type_id: t.ty.as_u32(),
+            nbytes: t.nbytes,
+        })
+        .collect();
+    let n = tensors.len() as u64;
+    let mut kvs: Vec<(String, Value)> = src
+        .iter_kv()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    for (k, v) in &mut kvs {
+        let one = match k.as_str() {
+            "split.no" => 0,
+            "split.count" => 1,
+            "split.tensors.count" => n,
+            _ => continue,
+        };
+        *v = retype(v, one);
+    }
+    edit(&mut kvs);
+    let layout = Layout::new(&kvs, tensors).unwrap();
+    let path = d.join(name);
+    let len = layout.file_len();
+    let file = File::create(&path).unwrap();
+    drop(Writer::new(&file, layout).unwrap());
+    file.set_len(len).unwrap();
+    Split::open(&path).unwrap()
+}
+
+/// A tensor of the map's layers, or no layer's.
+fn q38_keep(name: &str) -> bool {
+    match name.strip_prefix("blk.").and_then(|r| r.split_once('.')) {
+        Some((l, _)) => l
+            .parse::<usize>()
+            .is_ok_and(|l| q38::LAYER_MAP.contains(&l)),
+        None => true,
+    }
+}
+
+/// An edit of a header's metadata.
+type Edit = fn(&mut Vec<(String, Value)>);
+
+/// Contract 9: the plan, and the engine's reader reading it back.
+#[test]
+#[ignore = "needs the box and the Qwen3.8 file and MTP draft (just gate-fixture)"]
+fn hw_fixture_q38_plan() {
+    let src = q38_source();
+    let draft = q38_draft();
+    let spec = q38::spec();
+    let p = fixture::plan(&spec, &src, Some(&draft), &spec.options())
+        .expect("the plan of the real files");
+    let get = |plan: &FilePlan, k: &str| -> Value {
+        plan.kvs
+            .iter()
+            .find(|(n, _)| n == k)
+            .unwrap_or_else(|| panic!("no {k}"))
+            .1
+            .clone()
+    };
+    let t = &p.target;
+    assert_eq!(unsigned_items(&get(t, KEY_SOURCE_LAYERS)), [2, 3, 1, 47]);
+    assert_eq!(get(t, "qwen4exp.block_count").as_unsigned(), Some(4));
+    assert_eq!(src.arch_get_u64("full_attention_interval"), Some(4));
+    assert_eq!(get(t, INTERVAL).as_unsigned(), Some(2));
+    assert_eq!(unsigned_items(&get(t, PLE_LAYERS)), [2]);
+    assert_eq!(unsigned_items(&get(t, RATIOS)), [0, 4, 0, 4]);
+    for pt in &t.tensors {
+        if let Some(f) = pt.layer {
+            assert!(pt.name.starts_with(&format!("blk.{f}.")), "{}", pt.name);
+            let l = q38::LAYER_MAP[f];
+            assert!(pt.source.starts_with(&format!("blk.{l}.")), "{}", pt.source);
+        }
+    }
+
+    // `ssm_a` is `−e^A_log`, folded by the converter: a positive constant
+    // would grow the recurrent state every step (decay `exp(softplus · ssm_a)`).
+    let decays: Vec<f32> = t
+        .tensors
+        .iter()
+        .filter(|pt| pt.name.ends_with(".ssm_a"))
+        .map(|pt| match pt.rule {
+            Rule::Const { value } => value,
+            ref other => panic!("{}: {}, not a constant", pt.name, other.describe()),
+        })
+        .collect();
+    assert_eq!(decays.len(), 2, "the two GDN layers' ssm_a");
+    assert!(
+        decays.iter().all(|&v| v < 0.0),
+        "ssm_a {decays:?}: a decay below 1 needs it negative"
+    );
+
+    let guard = dir("q38plan");
+    let first = header_only(t, &guard.0);
+    let fx = Split::open(&first).unwrap();
+    let hp = q38::check_kinds(&spec, &fx, &src).unwrap();
+    assert_eq!((hp.n_layer, hp.interval), (4, 2));
+    assert_eq!(
+        hp.kinds,
+        [
+            Kind::DeltaRule,
+            Kind::Attention,
+            Kind::DeltaRule,
+            Kind::Attention
+        ]
+    );
+    let exp = hp.exp.as_ref().expect("a qwen4exp file");
+    assert_eq!(exp.ratios, [0, 4, 0, 4]);
+    assert_eq!(exp.ple.map(|p| p.layer), Some(2));
+
+    let dplan = p.draft.as_ref().expect("the MTP companion's plan");
+    let dfirst = header_only(dplan, &guard.0);
+    // A run with no draft lever opens the real draft's file name beside its
+    // target (`refset`'s `qwen4exp::mtp::draft_file`), else the real draft:
+    // the companion is written under that name, beside the fixture.
+    assert_eq!(
+        Path::new(q38::DRAFT_FILE).file_name(),
+        Path::new(q38::DEFAULT_MTP_MODEL).file_name(),
+        "the companion's name is the real draft's"
+    );
+    assert_eq!(
+        dfirst.parent(),
+        first.parent(),
+        "the companion lies beside the target"
+    );
+    let dfx = Split::open(&dfirst).unwrap();
+    spec.draft
+        .expect("the spec names the MTP companion")
+        .rules
+        .check(&spec, &dfx, &fx, true)
+        .expect("the companion reads as a draft of the fixture");
+    println!(
+        "q38 plan: {} layers at interval {} kinds {:?} pools {:?} ple at {:?}; target {} B, draft {} B",
+        hp.n_layer,
+        hp.interval,
+        hp.kinds,
+        exp.ratios,
+        exp.ple.map(|p| p.layer),
+        t.layouts()
+            .unwrap()
+            .iter()
+            .map(|(_, l)| l.file_len())
+            .sum::<u64>(),
+        dplan
+            .layouts()
+            .unwrap()
+            .iter()
+            .map(|(_, l)| l.file_len())
+            .sum::<u64>(),
+    );
+}
+
+/// Contract 10: the recorded card budget makes the written file's plan hold
+/// half of the experts on every layer the card loads, as the gates plan it.
+#[test]
+#[ignore = "needs the box and the Qwen3.8 file (just gate-fixture)"]
+fn hw_fixture_q38_budget() {
+    let src = q38_source();
+    let spec = q38::spec();
+    let CardBudget::Planned(planner) = spec.card_budget else {
+        panic!("the Qwen3.8 spec plans its card budget");
+    };
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let recorded = p.card_budget;
+    let mut kvs = p.target.kvs.clone();
+    assert_eq!(*kv(&mut kvs, KEY_CARD_BUDGET), Value::U64(recorded));
+
+    let guard = dir("q38budget");
+    let fx = Split::open(header_only(&p.target, &guard.0)).unwrap();
+    // The plan the gates make of a file (`gate_qwen4exp_e2e`'s `open_at`).
+    let inputs = PlanInputs::describe(&fx).unwrap();
+    let layers = inputs.spec.layers.len();
+    let experts = inputs.model.experts;
+    assert_eq!((layers, experts), (4, 512));
+    // A layer whose stacks no card kernel loads keeps all its experts on the
+    // host; the engine lists them, and the plan is held to that list.
+    let host_only: Vec<usize> = inputs.host_only().iter().map(|h| h.layer).collect();
+    let machine = machine_for_experts(
+        RTX_3090,
+        layers,
+        UBATCH_PLANNED.min(q38::BUDGET_CTX),
+        Experts::Card,
+    );
+    let at = |budget: Option<u64>| -> Vec<u64> {
+        let levers = PlanLevers {
+            card_budget_bytes: budget,
+        };
+        inputs
+            .plan_with_slots(&machine, q38::BUDGET_CTX, &levers, Experts::Card, 1)
+            .unwrap()
+            .n_l
+            .clone()
+    };
+    let want = |n: u64| -> Vec<u64> {
+        (0..layers)
+            .map(|l| if host_only.contains(&l) { 0 } else { n })
+            .collect()
+    };
+    assert_eq!(
+        at(None),
+        want(experts),
+        "the budgetless plan holds every expert it can"
+    );
+    assert_eq!(
+        at(Some(recorded)),
+        want(experts / 2),
+        "the plan under {recorded}"
+    );
+    assert!(
+        recorded < RTX_3090.usable_bytes(),
+        "a budget {recorded} that does not bind a card of {}",
+        RTX_3090.usable_bytes()
+    );
+    fixture::check_budget(&planner, &fx, recorded).unwrap();
+
+    let mut bad: Vec<String> = Vec::new();
+    for (what, budget) in [
+        ("64 MiB below", recorded - (64 << 20)),
+        ("1 GiB above", recorded + (1 << 30)),
+    ] {
+        match fixture::check_budget(&planner, &fx, budget) {
+            Err(e @ FixtureError::Budget(_)) => println!("q38 budget: {what}: {e}"),
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(c) => bad.push(format!("{what}: holds {:?}", c.per_layer)),
+        }
+    }
+
+    // `verify` re-plans the written file under the budget its header records.
+    let mut edited = p.target.clone();
+    *kv(&mut edited.kvs, KEY_CARD_BUDGET) = Value::U64(recorded - (64 << 20));
+    let g2 = dir("q38budget-edited");
+    let fx2 = Split::open(header_only(&edited, &g2.0)).unwrap();
+    match fixture::verify(&spec, &fx2, &src, None, &mut |_, _| {}) {
+        Err(e @ FixtureError::Budget(_)) if e.to_string().contains("plan under the budget") => {
+            println!(
+                "q38 budget: verify of a header recording {}: {e}",
+                recorded - (64 << 20)
+            );
+        }
+        other => bad.push(format!("verify of an edited budget: {other:?}")),
+    }
+    // The control: the recorded header passes that check and meets its holes.
+    match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+        Err(FixtureError::Budget(m)) => bad.push(format!("verify of the recorded budget: {m}")),
+        Err(e) => println!("q38 budget: control, the recorded header passes the budget check: {e}"),
+        Ok(_) => bad.push("a file of holes verified".into()),
+    }
+    println!(
+        "q38 budget: recorded {recorded} B ({} MiB); layers {layers}; host-only {host_only:?}; \
+         unbounded {:?}; recorded {:?}",
+        recorded / (1 << 20),
+        at(None),
+        at(Some(recorded)),
+    );
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 11: the traps ik's reader falls into silently are refused by
+/// name, in the source, in the written file and in the draft.
+#[test]
+#[ignore = "needs the box and the Qwen3.8 file and MTP draft (just gate-fixture)"]
+fn hw_fixture_q38_refusals() {
+    let src = q38_source();
+    let draft = q38_draft();
+    let spec = q38::spec();
+    let guard = dir("q38refusals");
+    let d = &guard.0;
+    let mut bad: Vec<String> = Vec::new();
+
+    // The control: the real header rewritten as a one-file set plans, to the
+    // real plan's tensors, so each refusal below is its edit's.
+    let real = fixture::plan(&spec, &src, Some(&draft), &spec.options()).unwrap();
+    let names =
+        |p: &FilePlan| -> Vec<String> { p.tensors.iter().map(|t| t.name.clone()).collect() };
+    let same = edited_header(&src, d, "same.gguf", q38_keep, |_| {});
+    match fixture::plan(&spec, &same, None, &spec.options()) {
+        Ok(p) if names(&p.target) == names(&real.target) => {
+            println!(
+                "q38 refusals: the control plans {} tensors",
+                p.target.tensors.len()
+            );
+        }
+        Ok(_) => bad.push("the control plans other tensors".into()),
+        Err(e) => bad.push(format!("the control: {e}")),
+    }
+    std::fs::remove_file(d.join("same.gguf")).unwrap();
+
+    let source_rows: [(&str, Edit, &[&str]); 3] = [
+        (
+            "source ratios one short",
+            |kvs| pop_item(kvs, RATIOS),
+            &[RATIOS, "has 47 values for 48 layers"],
+        ),
+        (
+            "source ple.layers missing",
+            |kvs| drop_key(kvs, PLE_LAYERS),
+            &[PLE_LAYERS, "is absent"],
+        ),
+        (
+            "source interval missing",
+            |kvs| drop_key(kvs, INTERVAL),
+            &[INTERVAL, "is absent from the source"],
+        ),
+    ];
+    for (what, edit, want) in source_rows {
+        let file = format!("{}.gguf", what.replace(' ', "-"));
+        let edited = edited_header(&src, d, &file, q38_keep, edit);
+        match fixture::plan(&spec, &edited, None, &spec.options()) {
+            Err(e) if want.iter().all(|w| e.to_string().contains(w)) => {
+                println!("q38 refusals: {what}: {e}");
+            }
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(_) => bad.push(format!("{what}: planned")),
+        }
+        std::fs::remove_file(d.join(&file)).unwrap();
+    }
+
+    // The draft: the MTP layer's pool read from an array one short of the
+    // draft's layers is the main layers' last, which ik takes silently.
+    let short = edited_header(
+        &draft,
+        d,
+        "mtp-short.gguf",
+        |_| true,
+        |kvs| pop_item(kvs, RATIOS),
+    );
+    match fixture::plan(&spec, &src, Some(&short), &spec.options()) {
+        Err(e) if e.to_string().contains("has 48 values, the main layers'") => {
+            println!("q38 refusals: draft ratios one short: {e}");
+        }
+        Err(e) => bad.push(format!("draft ratios one short: refused as {e}")),
+        Ok(_) => bad.push("draft ratios one short: planned".into()),
+    }
+
+    // The written file, from the real plan's header with one edit.
+    let fixture_rows: [(&str, Edit, &[&str]); 2] = [
+        (
+            "fixture ratios one short",
+            |kvs| pop_item(kvs, RATIOS),
+            &[RATIOS, "has 3 values for 4 layers"],
+        ),
+        (
+            "fixture ple.layers missing",
+            |kvs| drop_key(kvs, PLE_LAYERS),
+            &["per_layer_token_embd.weight", "carries none there"],
+        ),
+    ];
+    for (what, edit, want) in fixture_rows {
+        let mut plan = real.target.clone();
+        edit(&mut plan.kvs);
+        let g = dir(&format!("q38refusals-{}", what.replace(' ', "-")));
+        let fx = Split::open(header_only(&plan, &g.0)).unwrap();
+        match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+            Err(e) if want.iter().all(|w| e.to_string().contains(w)) => {
+                println!("q38 refusals: {what}: {e}");
+            }
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(_) => bad.push(format!("{what}: verified")),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }

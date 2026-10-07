@@ -23,7 +23,7 @@ crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
 crates/model/src/bin/bloomery-decode.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_REF_MODEL	gatestoml
-crates/model/src/bin/v41fixture.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/model/src/arch/deepseek41/fixture.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/gate_dspark_read.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/gate_dspark_hc.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_MODEL	gatestoml
@@ -60,5 +60,6 @@ crates/serve/build.rs	CARGO_MANIFEST_DIR,BLOOMERY_GIT_COMMIT	stays: cargo's crat
 crates/tokenizer/tests/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB,BLOOMERY_DATA	stays: the vocabulary file and the data directory
 crates/decision/tests/clef.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
+crates/gpu-gates/src/tier.rs	BLOOMERY_TIER	stays: the tier a gate runs in, read once here and checked against the file it opens
 crates/gpu-gates/src/model_file.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
 crates/hf/src/fetch.rs	HF_TOKEN,HOME,HF_HUB_OFFLINE	stays: the hub token for a gated repo, and its file; the hub's own switch to stay offline
