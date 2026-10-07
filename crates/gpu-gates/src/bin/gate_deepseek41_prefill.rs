@@ -1,5 +1,5 @@
 //! GPU gate for the V4.1 prompt batch (`body::prefill`) on the gate
-//! placement (`workstation::plan_gate`): a batched prefill of `P` ids leaves
+//! placement (`crate::gate_card::plan_gate`): a batched prefill of `P` ids leaves
 //! the model where `P` decode steps over the same ids leave it, bit for bit,
 //! in everything a later step or cut reads.
 //!
@@ -215,6 +215,10 @@ mod finite;
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_split.rs"]
 mod split;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
@@ -434,6 +438,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
+        crate::gate_card::init()?;
         record::at_main("gate_deepseek41_prefill", record::GATE_DEEPSEEK41_PREFILL);
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
@@ -445,7 +450,7 @@ mod gate {
         let t = Instant::now();
         let mut m = body::open(
             file,
-            workstation::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;

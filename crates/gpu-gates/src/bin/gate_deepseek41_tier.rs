@@ -1,6 +1,6 @@
 //! GPU gate for the V4.1 expert tier (`bloomery_gpu::host::tier`), on one
 //! card: the loopback. The stage and the tier both run on the gate card
-//! (`workstation::plan_gate`), two `Gpu`s on it. Each routed layer's card
+//! (`crate::gate_card::plan_gate`), two `Gpu`s on it. Each routed layer's card
 //! list is its id prefix `[0, n_l)`. The tiered plan moves the last [`K3`] of
 //! them, ids `n_l - K3 .. n_l`, from card 0 to device 1 (the tier) through
 //! the placement's own split (`placement::routed_row`): the (b′) shape, the
@@ -93,6 +93,10 @@ fn main() -> std::process::ExitCode {
     reason = "B8 reads the draft's header only; the loop half serves generate_ds41"
 )]
 mod dspark;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
@@ -236,8 +240,9 @@ mod gate {
     /// one stage card, at index [`TIER_DEVICE`]: the tier card and the host
     /// carry the tier's prompt-batch reserves for the file of `hp`
     /// (`workstation::plan_bp`'s), which a tiered load checks its
-    /// allocations against. The tier card is the gate card by name: the
-    /// stage and the tier share it.
+    /// allocations against. (b′)'s tier is the 3090, whose bytes the gate
+    /// card plans; it goes on the gate card by name, so the stage and the
+    /// tier share it.
     fn tier_machine(machine: &Machine, hp: &Hparams) -> Result<Machine, GateError> {
         if machine.cards.len() != TIER_DEVICE || !machine.tiers.is_empty() {
             return Err(format!(
@@ -253,10 +258,10 @@ mod gate {
             .tiers
             .iter()
             .map(|t| t.name.as_str())
-            .ne([machine.cards[0].name.as_str()])
+            .ne([workstation::RTX_3090.name])
         {
             return Err(format!(
-                "plan (b′)'s tier cards {:?} are not the gate card {}",
+                "plan (b′)'s tier cards {:?} are not the 3090, whose bytes the gate card {} plans",
                 bp.tiers.iter().map(|t| &t.name).collect::<Vec<_>>(),
                 machine.cards[0].name
             )
@@ -264,6 +269,10 @@ mod gate {
         }
         let mut out = machine.clone();
         out.tiers = bp.tiers;
+        for t in &mut out.tiers {
+            t.name.clone_from(&machine.cards[0].name);
+            t.device = machine.cards[0].device;
+        }
         out.host = bp.host;
         Ok(out)
     }
@@ -601,6 +610,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
+        crate::gate_card::init()?;
         let args = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         // The batch clauses run the prompt call, so the tiered load makes its
@@ -609,7 +619,7 @@ mod gate {
         let path = workstation::model_v41();
         let split = || Split::open(&path).map_err(|e| format!("open {path}: {e}"));
         let inputs = PlanInputs::read(&split()?)?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
         let meta = BodyMeta {
             hp: inputs.hp.clone(),

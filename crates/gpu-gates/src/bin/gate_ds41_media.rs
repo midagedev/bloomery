@@ -78,6 +78,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use app::Session;
     use bloomery_gpu::model::StepMode;
@@ -738,6 +742,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
+        crate::gate_card::init()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let hp = Hparams::read(&Split::open(&path).map_err(|e| format!("open {path}: {e}"))?)?;
@@ -752,7 +757,7 @@ mod gate {
         let t = std::time::Instant::now();
         let mut m = body::open(
             file,
-            workstation::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;

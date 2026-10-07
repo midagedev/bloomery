@@ -1,6 +1,6 @@
 //! GPU gate for GLM's adaptive expert residency on the real model
 //! (`bloomery_gpu_glm5next::swap`, `BLOOMERY_RESIDENCY`): the file planned
-//! onto the gate card (`workstation::plan_gate`, one card — the trunk's
+//! onto the gate card (`crate::gate_card::plan_gate`, one card — the trunk's
 //! release scope; a plan over more than one card is refused at the body's
 //! load), the residency machine over the stage card's routed stacks, the
 //! lever set here from the plan's own card slots a layer (the environment
@@ -144,6 +144,10 @@ fn main() -> std::process::ExitCode {
 pub mod residency_clauses;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use crate::residency_clauses::StaticProbe;
     use std::ops::Range;
@@ -168,7 +172,7 @@ mod gate {
         NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
     };
     use model::placement::churn::ChurnPool;
-    use model::placement::{Machine, ModelTensors, Plan, PlanLevers, Violation, workstation};
+    use model::placement::{Machine, ModelTensors, Plan, PlanLevers, Violation};
     use refset::arch::glm5next::{MTP, MTP_SET};
     use refset::mtpref::MtpSet;
     use runtime::layer::hosted;
@@ -1285,10 +1289,11 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
+        crate::gate_card::init()?;
         let path = refset::arch::glm5next::MODEL.to_string();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&file).map_err(|e| format!("{path}: {e}"))?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = PlanLevers::from_levers(&levers)?;
         let plan = inputs
             .plan(&machine, CTX as u64, &place)

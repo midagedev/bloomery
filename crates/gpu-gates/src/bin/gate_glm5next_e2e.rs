@@ -4,7 +4,7 @@
 //! card where the plan puts them (each layer's id prefix) and on the host
 //! tier otherwise, the streams' mean, the q8_0 head
 //! and the argmax — loaded
-//! once by its placement on the gate card (`workstation::plan_gate`), against
+//! once by its placement on the gate card (`crate::gate_card::plan_gate`), against
 //! ik's CPU oracle sets (`refset::arch::glm5next`: the 5-token batch set, the
 //! step after a fused 4-token prefill, the same after a prefill run node by
 //! node, the step after a fused 1,024-token prefill of the prose, and the
@@ -355,6 +355,10 @@ fn main() -> std::process::ExitCode {
 mod card;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use crate::card;
     use std::path::PathBuf;
@@ -392,7 +396,7 @@ mod gate {
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, NextnPlan, PlanInputs};
-    use model::placement::{Machine, Plan, PlanLevers, workstation};
+    use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::{FfnKind, Layer, MixerKind};
@@ -694,7 +698,7 @@ mod gate {
         };
         let args = OpenArgs {
             place: "gate",
-            machine: workstation::plan_gate,
+            machine: crate::gate_card::plan_gate,
             ctx,
             mode: StepMode::Graph,
             cfg,
@@ -2111,7 +2115,7 @@ mod gate {
 
         fn open(&self, slots: usize) -> Result<Glm5nextModel, GateError> {
             let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-            let machine = workstation::plan_gate(self.inputs.model.layers);
+            let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
             let np = self.plan(&machine, slots)?;
             let t = Instant::now();
             let mut m = Body::open_placed_nextn_slots(
@@ -2231,7 +2235,7 @@ mod gate {
         let named = matches!(&past, Err(e) if e.to_string().contains(&format!(
             "of a load whose plan counted {SLOTS} resident sequences"
         )));
-        let machine = workstation::plan_gate(a.inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
         let counted = |n: usize| -> Result<u64, GateError> {
             let np = a.plan(&machine, n)?;
             Ok(np.plan.cards[0].kv_bytes + np.nextn.cards[0].kv_bytes)
@@ -2850,7 +2854,7 @@ mod gate {
         slots: usize,
     ) -> Result<Glm5nextModel, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = PlanLevers::from_levers(levers)?;
         let plan = inputs.plan_slots(&machine, u64::try_from(SLOT_CTX)?, &place, lanes, slots)?;
         let term = plan.machine.cards[0].scratch_bytes;
@@ -4257,6 +4261,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        crate::gate_card::init()?;
         let only = only()?;
         let sets = step_sets(only)?;
         let mut ok = true;

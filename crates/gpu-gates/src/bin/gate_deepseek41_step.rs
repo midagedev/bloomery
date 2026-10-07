@@ -1,6 +1,6 @@
 //! GPU gate for the assembled V4.1 decode step (`bloomery_gpu_deepseek41::body`,
 //! B5 phases 1 and 2: the indexer's selection wired in), on the gate placement
-//! (`workstation::plan_gate`: the 3090 runs every layer and the head, the host
+//! (`crate::gate_card::plan_gate`: the 3090 runs every layer and the head, the host
 //! tier the experts the plan leaves off the card). The model is opened through
 //! the engine's own entry (`body::open`); what each mode pins is the chain's
 //! contract — the pieces' and the ops' values are their own gates'.
@@ -190,6 +190,10 @@ mod shadow;
 mod skew;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use crate::shadow;
     use crate::skew;
@@ -351,6 +355,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
+        crate::gate_card::init()?;
         let args = parse_args()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         // The route trace's clauses feed their prompts through the session's
@@ -369,7 +374,7 @@ mod gate {
         if args.slots {
             return slots_run(&path, &hp, &inputs, &cfg);
         }
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let planned = &plan.cards[0];
         println!(
@@ -381,7 +386,7 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let mut m = body::open(
             file,
-            workstation::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(CTX_MAX)?,
             &cfg,
         )?;
@@ -481,7 +486,7 @@ mod gate {
             let ctx = usize::try_from(CTX_MAX)?;
             Ok(body::open_slots(
                 file,
-                workstation::plan_gate,
+                crate::gate_card::plan_gate,
                 ctx,
                 self.cfg,
                 slots,
@@ -667,7 +672,7 @@ mod gate {
         cfg: &body::OpenCfg,
     ) -> Result<bool, GateError> {
         let n = slots_gate::STREAMS;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let one = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let two = inputs.plan_with_slots(
             &machine,

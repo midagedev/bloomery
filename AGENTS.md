@@ -28,8 +28,13 @@ To run or evaluate bloomery rather than develop it, read the README's "Status" s
   name and power limit. 3090 numbers from before 2026-09-22 and A6000 numbers never share a table. A model that does
   not fit one card may carry a separate "A6000+3090" table: the reference engine gets the same two cards (`-ts`) in the
   same lease, the 3090 stays at its 250 W cap, the witness blocks check for Xid before and after. The 3090 is the
-  gate-and-build card: `tools/box.sh` defaults to it, `gpu-power-limit.service` caps it at 250 W, and a compute process
-  on it does not stop a timing run (recorded `[other-busy]`; abort with `BLOOMERY_OTHER_STRICT=1`).
+  card of the public numbers, not of the gates: a functional gate takes either card unless a fact pins it. A gate bin
+  that runs the gate plan (the 3090's bytes, `workstation::plan_gate`, the plan the README's 3090 rows are measured
+  at) plans those bytes on the card it holds (`crates/gpu-gates/src/bin/shared/gate_card.rs`), so its pins hold on
+  either card. The 3090 pins today: `--place gate` through `generate` (it opens the 3090 by name), `gate-gpu-lib` (no
+  gate lock), `gate-gpu-hybrid` (its host pool shares the V4.1 gates' cores) and a landing batch's v41-load lane.
+  `tools/box.sh` defaults to the 3090, `gpu-power-limit.service` caps it at 250 W, and a compute process on it does
+  not stop a timing run (recorded `[other-busy]`; abort with `BLOOMERY_OTHER_STRICT=1`).
   `BLOOMERY_CARD=a6000|both tools/box.sh …` runs functional work on the A6000 and refuses (rc 75) while that card has
   a compute process; the pick reaches the box as `BLOOMERY_BOX_CARD`.
 - **Never start a box job longer than 30 minutes without the user's approval.** Estimate the wall first and batch long
@@ -78,7 +83,8 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   `BLOOMERY_CARD=a6000|both` the runner takes that card's lock, or both for `both` (the 3090's first, then the A6000's;
   every other run holds one, so the order cannot deadlock), and refuses (64) a `BLOOMERY_GATE_CARD` naming another card.
   Under box.sh's default pin, `BLOOMERY_GATE_CARD=3090|a6000|any` picks (default `3090`; `any` takes an idle A6000 when
-  no timing lease is held, else the 3090). Pass it through `BLOOMERY_BOX_ENV`.
+  no timing lease is held, else the 3090). A gate recipe passes `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` unless
+  a pin above holds it or it picks its cards through box.sh. Pass it through `BLOOMERY_BOX_ENV`.
 - **Landing batches.** `tools/gate-batch.sh --list FILE` takes `just affected` output and runs it in lanes (A the 3090,
   B the A6000, X alone after both: `[group('solo')]` or `BLOOMERY_CARD=both`). A lane that empties its queue takes the
   other lane's unstarted balanced items onto its own card, after a `lease_free` probe; a fixed, solo or v41-load item

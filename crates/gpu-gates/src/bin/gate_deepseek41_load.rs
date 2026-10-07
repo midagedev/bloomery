@@ -1,7 +1,7 @@
 //! Gate `gate-ds41-load`: the V4.1 body on the gate card. The model is loaded
 //! through the entry the engine opens V4.1 with
 //! (`bloomery_gpu_deepseek41::body::open`) by the gate placement
-//! (`workstation::plan_gate`: the 3090 runs every layer and the head) at the
+//! (`crate::gate_card::plan_gate`: the 3090 runs every layer and the head) at the
 //! serving context, and checked against the plan this binary makes from the
 //! same file. A correctness run: every time and memory figure it prints is a
 //! runtime value.
@@ -57,6 +57,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::btree_map::Entry;
     use std::collections::{BTreeMap, BTreeSet};
@@ -102,11 +106,12 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
+        crate::gate_card::init()?;
         let cfg = OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs
             .plan(&machine, CTX_MAX, &cfg.place)
             .map_err(|e| format!("the gate plan: {e}"))?;
@@ -192,7 +197,12 @@ mod gate {
     fn load(path: &str, n: usize, cfg: &OpenCfg) -> Result<Deepseek41Model, GateError> {
         let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
         let start = Instant::now();
-        let m = body::open(file, workstation::plan_gate, usize::try_from(CTX_MAX)?, cfg)?;
+        let m = body::open(
+            file,
+            crate::gate_card::plan_gate,
+            usize::try_from(CTX_MAX)?,
+            cfg,
+        )?;
         println!(
             "load {n}: {} B resident in {:.1} s (runtime value)",
             m.resident_bytes(),

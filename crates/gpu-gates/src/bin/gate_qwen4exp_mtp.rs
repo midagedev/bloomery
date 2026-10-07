@@ -182,6 +182,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::time::Instant;
 
@@ -204,7 +208,6 @@ mod gate {
     };
     use model::fileio::hex;
     use model::placement::PlanLevers;
-    use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::IK;
     use refset::arch::qwen4exp::MODEL;
     use refset::arch::qwen4exp::mtp::{DRAFT, MTP, MTP_SET};
@@ -1924,7 +1927,11 @@ mod gate {
         ub: usize,
         prompt: &[u32],
     ) -> Result<(Qwen38Model, bool), GateError> {
-        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(
+            crate::gate_card::card()?,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+        );
         let plan_levers = PlanLevers::from_levers(levers)?;
         let plain_plan = inputs.plan(&machine, CTX, &plan_levers)?;
         let mut b = Body38::open_placed(
@@ -3136,7 +3143,11 @@ mod gate {
             Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?,
             Split::open(DRAFT).map_err(|e| format!("open {DRAFT}: {e}"))?,
         );
-        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(
+            crate::gate_card::card()?,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+        );
         let plan = inputs.plan_mtp_with_slots(
             &machine,
             CTX,
@@ -3767,13 +3778,17 @@ mod gate {
         };
         let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
-        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(
+            crate::gate_card::card()?,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+        );
         let plan = inputs.plan_mtp(&machine, CTX, &PlanLevers::from_levers(&levers)?, &mtp)?;
         let d = &plan.draft.cards[0];
         println!(
             "plan card={} ctx_max={CTX} draft dense={} experts={} rounding={} kv={} map={} \
              arena={} headroom={}",
-            RTX_3090.name,
+            crate::gate_card::card()?.name,
             d.dense_bytes,
             d.expert_bytes,
             d.rounding_bytes,
@@ -3788,7 +3803,7 @@ mod gate {
         println!(
             "load card={} ctx_max={CTX} resident_bytes={} in {:.1} s; the draft program's arena \
              {arena} bytes (runtime value, outside the plan)",
-            RTX_3090.name,
+            crate::gate_card::card()?.name,
             m.resident_bytes(),
             t.elapsed().as_secs_f64()
         );

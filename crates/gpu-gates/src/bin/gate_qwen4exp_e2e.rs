@@ -222,6 +222,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::time::Instant;
 
@@ -247,7 +251,6 @@ mod gate {
     use gguf::quant::half_to_f32;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
     use model::placement::PlanLevers;
-    use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
 
     /// Cache rows: D3K's step at position 3,000, with room.
@@ -515,7 +518,7 @@ mod gate {
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
-            RTX_3090,
+            crate::gate_card::card()?,
             inputs.spec.layers.len(),
             u64::try_from(ub)?,
             experts,
@@ -525,7 +528,10 @@ mod gate {
         println!(
             "plan card={} experts={experts:?} slots={slots} ctx_max={} host_experts={} \
              card_experts={} card_layers={held}",
-            RTX_3090.name, plan.ctx_max, plan.host.experts, plan.cards[0].experts
+            crate::gate_card::card()?.name,
+            plan.ctx_max,
+            plan.host.experts,
+            plan.cards[0].experts
         );
         let mut m = Body38::open_placed_slots(file, &plan, &inputs, 0, levers.host(), ub, slots)?;
         m.set_mode(StepMode::Graph);
@@ -3391,7 +3397,7 @@ mod gate {
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
-            RTX_3090,
+            crate::gate_card::card()?,
             inputs.spec.layers.len(),
             u64::try_from(ub)?,
             experts,

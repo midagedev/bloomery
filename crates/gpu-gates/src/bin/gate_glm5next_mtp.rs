@@ -105,6 +105,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use std::time::Instant;
 
@@ -128,7 +132,7 @@ mod gate {
     use gguf::Split;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
-    use model::placement::{PlanLevers, workstation};
+    use model::placement::PlanLevers;
     use refset::arch::glm5next::{D1K, IK, MODEL, MTP, MTP_SET};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
@@ -1391,7 +1395,7 @@ mod gate {
         windows: [&[u32]; 2],
     ) -> Result<bool, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = PlanLevers::from_levers(levers)?;
         let np =
             inputs.plan_nextn_slots(&machine, u64::try_from(Z_CTX)?, &place, nextn, Z_SLOTS)?;
@@ -1504,6 +1508,7 @@ mod gate {
 
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
+        crate::gate_card::init()?;
         let dir = MTP.path(MTP_SET);
         let set = MtpSet::open(&dir, &MTP)?;
         let prompt = set
@@ -1528,7 +1533,7 @@ mod gate {
         let file = open(MODEL)?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = PlanLevers::from_levers(&levers)?;
         let ctx = u64::try_from(CTX)?;
         let base = inputs.plan(&machine, ctx, &place)?;

@@ -1,5 +1,5 @@
 //! GPU gate for long greedy runs of the V4.1 engine on the gate placement
-//! (`workstation::plan_gate`, the 3090), the model opened through the
+//! (`crate::gate_card::plan_gate`, the 3090), the model opened through the
 //! engine's own entry (`body::open`). Every position the run steps goes
 //! first through the finite probe (`shared/ds41_finite.rs`): the position's
 //! step eagerly, outside the graph, each sub-layer's streams read where it
@@ -145,6 +145,10 @@ fn collapse_self_check(periods: &[usize], collapse: usize) -> bool {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::model::StepMode;
@@ -272,6 +276,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
+        crate::gate_card::init()?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {
@@ -286,7 +291,7 @@ mod gate {
         let eos = bloomery_gpu_gates::eos_token_id(&file)?;
         let mut m = body::open(
             file,
-            workstation::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(CTX_MAX)?,
             &cfg,
         )?;
