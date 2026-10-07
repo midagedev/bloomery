@@ -1,0 +1,9 @@
+# The 0.2.6 release tapes: bloomery-serve (the 0.2.6 tree, 39b13149) --model qwen38 at the serving defaults
+# (every BLOOMERY_* lever unset: --place a on the A6000, adaptive residency, the prompt path's seat-and-stream,
+# the shared MTP draft with its cost-chosen width), Qwen3.8-Flash-Next UD-Q4_K_XL, greedy, thinking off, one
+# discarded warm-up, one toktape tape a prompt: the clip41 prompts and one ~4K-token prompt (a public doc to
+# summarize) whose prefill is the release's point. The headline numbers stay the depth runners'.
+kind: exclusive
+reason: one 111 GB model load (~45 s) and four timed requests whose per-token times are the tape, so the box must be
+  quiet; why now: the user wants the release tape published today
+minutes: 10..20
