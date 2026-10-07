@@ -44,17 +44,34 @@ fi
 # tests (--self-test) run here too, so the parser the lead's batch lists come from is tested wherever
 # this check runs.
 python3 "$(dirname "$0")/recipes.py" check
-python3 "$(dirname "$0")/recipes.py" --self-test
-"$(dirname "$0")/gate-batch.sh" --smoke --dry-run > /dev/null
-# A timed recipe checks its card before it builds: tools/ref/card-precheck.sh (the `precheck` variable)
-# comes before the first cargo build of its box command, so a missing or refused card costs no build.
-# Timed is gate-batch.sh's class T (--classes: the classifier the batch runs, not a copy of its
-# regexes). A recipe whose build is a just dependency cannot run the precheck first from its own box
-# command; those are named on one line and do not fail here.
-classes=$(mktemp)
-trap 'rm -f "$classes"' EXIT
-"$(dirname "$0")/gate-batch.sh" --classes > "$classes"
-python3 - "$JF" "$classes" << 'PY'
+# The blocks below are independent — each runs in its own subshell on fixtures in its own temp
+# directory — so they run as parallel background jobs and report in this file's order after a barrier:
+# each block's own output (its last line where the serial form printed only that), its full output and
+# its named error on failure, and the first red block's own rc ends the check. The serial form's
+# ~172 s wall was these blocks one after another (measured 2026-10-07); the barrier holds every
+# assertion the serial form held.
+B=$(mktemp -d)
+trap 'rm -rf "$B"' EXIT
+
+# blk_NAME: one block. Its stdout is what the serial form printed; a failure prints its named error to
+# stderr and returns nonzero. `$(dirname "$0")` still names this script's directory inside a function.
+blk_selftest() {
+  if ! python3 "$(dirname "$0")/recipes.py" --self-test; then
+    echo "check-recipes: the recipes.py self-test failed" >&2
+    return 1
+  fi
+}
+blk_smoke() {
+  if ! "$(dirname "$0")/gate-batch.sh" --smoke --dry-run > /dev/null; then
+    echo "check-recipes: the gate-batch smoke run failed" >&2
+    return 1
+  fi
+}
+blk_cardorder() {
+  local classes rc
+  classes=$(mktemp) || return 1
+  "$(dirname "$0")/gate-batch.sh" --classes > "$classes" || { rm -f "$classes"; return 1; }
+  python3 - "$JF" "$classes" << 'PY'
 import json, re, subprocess, sys
 
 jf, classes = sys.argv[1], sys.argv[2]
@@ -124,191 +141,269 @@ if via_dep:
     print(f"check-recipes: {len(via_dep)} timed recipes build in a just dependency before their box command, "
           f"where the precheck cannot come first: {'; '.join(via_dep)}")
 PY
+  rc=$?
+  rm -f "$classes"
+  return "$rc"
+}
 # The card and lease stub tests (tools/ref/card-tests/run.sh): card.py, lease_take's refusals,
 # lease-hold.sh and gpu-ab.py's card check, against a copy of that code and a lock file of their own.
-if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then
-  echo "$cards" >&2
-  echo "check-recipes: the card tests failed" >&2
-  exit 1
-fi
-echo "${cards##*$'\n'}"
+blk_cardtests() {
+  if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then
+    echo "$cards" >&2
+    echo "check-recipes: the card tests failed" >&2
+    return 1
+  fi
+  echo "${cards##*$'\n'}"
+}
 # lease.sh's own self-test: lease_gpu_idle (the take's timing-card check) and the witness tag, on a
 # stub nvidia-smi in a temp dir, no card, no lock, no /proc.
-if ! lse=$(bash "$(dirname "$0")/ref/lease.sh" --self-test 2>&1); then
-  echo "$lse" >&2
-  echo "check-recipes: the lease self-test failed" >&2
-  exit 1
-fi
-echo "${lse##*$'\n'}"
+blk_lease() {
+  if ! lse=$(bash "$(dirname "$0")/ref/lease.sh" --self-test 2>&1); then
+    echo "$lse" >&2
+    echo "check-recipes: the lease self-test failed" >&2
+    return 1
+  fi
+  echo "${lse##*$'\n'}"
+}
 # box-tracks.sh deletes remote track directories: its selection (only the names given, never a new stale
 # the reader did not see, a bare --remove refused) is tested on fixed input, no ssh.
-if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
-  echo "$bt" >&2
-  echo "check-recipes: the box-tracks self-test failed" >&2
-  exit 1
-fi
-echo "${bt##*$'\n'}"
+blk_boxtracks() {
+  if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
+    echo "$bt" >&2
+    echo "check-recipes: the box-tracks self-test failed" >&2
+    return 1
+  fi
+  echo "${bt##*$'\n'}"
+}
 # load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
 # rotation are tested on fixed keys, no process started.
-if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
-  echo "$lg" >&2
-  echo "check-recipes: the load-groups self-test failed" >&2
-  exit 1
-fi
-echo "${lg##*$'\n'}"
+blk_loadgroups() {
+  if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
+    echo "$lg" >&2
+    echo "check-recipes: the load-groups self-test failed" >&2
+    return 1
+  fi
+  echo "${lg##*$'\n'}"
+}
 # lcpp-fit.sh builds the depth runners' llama.cpp fit arms and reads what the fit chose: its flag
 # rewrite, its --help probe (stub binaries) and its column (fixture output) are tested here, no box.
-if ! lf=$(bash "$(dirname "$0")/ref/lcpp-fit.sh" --self-test 2>&1); then
-  echo "$lf" >&2
-  echo "check-recipes: the lcpp-fit self-test failed" >&2
-  exit 1
-fi
-echo "${lf##*$'\n'}"
+blk_lcppfit() {
+  if ! lf=$(bash "$(dirname "$0")/ref/lcpp-fit.sh" --self-test 2>&1); then
+    echo "$lf" >&2
+    echo "check-recipes: the lcpp-fit self-test failed" >&2
+    return 1
+  fi
+  echo "${lf##*$'\n'}"
+}
 # cold-blocks.sh is the depth runners' cold tag and engine-block planner: its bound, its flag rewrite, its
 # order refusal and its block plan on fixed arms are tested here, no box.
-if ! cb=$(bash "$(dirname "$0")/ref/cold-blocks.sh" --self-test 2>&1); then
-  echo "$cb" >&2
-  echo "check-recipes: the cold-blocks self-test failed" >&2
-  exit 1
-fi
-echo "${cb##*$'\n'}"
+blk_coldblocks() {
+  if ! cb=$(bash "$(dirname "$0")/ref/cold-blocks.sh" --self-test 2>&1); then
+    echo "$cb" >&2
+    echo "check-recipes: the cold-blocks self-test failed" >&2
+    return 1
+  fi
+  echo "${cb##*$'\n'}"
+}
 # slots-arm.sh is the depth runners' aggregate arm (<arm>@BLOOMERY_GEN_SLOTS=N): its N, its plain twin, the
 # environment's refusal, its time pass and residency clauses and the plain tables' labels, no box.
-if ! sat=$(bash "$(dirname "$0")/ref/slots-arm.sh" --self-test 2>&1); then
-  echo "$sat" >&2
-  echo "check-recipes: the slots-arm self-test failed" >&2
-  exit 1
-fi
-echo "${sat##*$'\n'}"
+blk_slotsarm() {
+  if ! sat=$(bash "$(dirname "$0")/ref/slots-arm.sh" --self-test 2>&1); then
+    echo "$sat" >&2
+    echo "check-recipes: the slots-arm self-test failed" >&2
+    return 1
+  fi
+  echo "${sat##*$'\n'}"
+}
 # lcpp-warm.sh is the depth runners' llama-server arms: its flag translation (against V4.1's LCPP_CLI_FLAGS),
 # its refusals, the context, the --help probe and a stub server's start, requests, checks and stop (python3
 # and curl, 127.0.0.1) are tested here, no box.
-if ! lw=$(bash "$(dirname "$0")/ref/lcpp-warm.sh" --self-test 2>&1); then
-  echo "$lw" >&2
-  echo "check-recipes: the lcpp-warm self-test failed" >&2
-  exit 1
-fi
-echo "${lw##*$'\n'}"
+blk_lcppwarm() {
+  if ! lw=$(bash "$(dirname "$0")/ref/lcpp-warm.sh" --self-test 2>&1); then
+    echo "$lw" >&2
+    echo "check-recipes: the lcpp-warm self-test failed" >&2
+    return 1
+  fi
+  echo "${lw##*$'\n'}"
+}
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
-if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
-  echo "$mc" >&2
-  echo "check-recipes: the mac-check self-test failed" >&2
-  exit 1
-fi
-echo "${mc##*$'\n'}"
+blk_maccheck() {
+  if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
+    echo "$mc" >&2
+    echo "check-recipes: the mac-check self-test failed" >&2
+    return 1
+  fi
+  echo "${mc##*$'\n'}"
+}
 # gate-batch.sh's placement rules (the v41-load lane, a batch or a solo recipe's arm as an item, a cold
 # build's times row) on a fixture justfile and fixture times rows, no box.
-if ! gbt=$(bash "$(dirname "$0")/gate-batch.sh" --self-test 2>&1); then
-  echo "$gbt" >&2
-  echo "check-recipes: the gate-batch self-test failed" >&2
-  exit 1
-fi
-echo "${gbt##*$'\n'}"
+blk_gatebatch() {
+  if ! gbt=$(bash "$(dirname "$0")/gate-batch.sh" --self-test 2>&1); then
+    echo "$gbt" >&2
+    echo "check-recipes: the gate-batch self-test failed" >&2
+    return 1
+  fi
+  echo "${gbt##*$'\n'}"
+}
 # gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
 # a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
-if ! ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1); then
-  echo "$ggt" >&2
-  echo "check-recipes: the gpu-gate self-test failed" >&2
-  exit 1
-fi
-echo "${ggt##*$'\n'}"
+blk_gpugate() {
+  if ! ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1); then
+    echo "$ggt" >&2
+    echo "check-recipes: the gpu-gate self-test failed" >&2
+    return 1
+  fi
+  echo "${ggt##*$'\n'}"
+}
 # stack-watch.sh (gpu-gate.sh's BLOOMERY_GATE_STACKS): output passed through, a quiet stub dumped and ended by
 # its comm among the spawned command's descendants only, a quiet command with no such process left alone.
-if ! swt=$(bash "$(dirname "$0")/ref/stack-watch.sh" --self-test 2>&1); then
-  echo "$swt" >&2
-  echo "check-recipes: the stack-watch self-test failed" >&2
-  exit 1
-fi
-echo "${swt##*$'\n'}"
+blk_stackwatch() {
+  if ! swt=$(bash "$(dirname "$0")/ref/stack-watch.sh" --self-test 2>&1); then
+    echo "$swt" >&2
+    echo "check-recipes: the stack-watch self-test failed" >&2
+    return 1
+  fi
+  echo "${swt##*$'\n'}"
+}
 # ptx-spill-check.sh's table reading (a process-substitution table read for every binary, a binary with no
 # pinned row) and its verdict lines, through a stub ptx-scan.sh on fixed scans, no build.
-if ! psc=$(bash "$(dirname "$0")/ptx-spill-check.sh" --self-test 2>&1); then
-  echo "$psc" >&2
-  echo "check-recipes: the ptx-spill-check self-test failed" >&2
-  exit 1
-fi
-echo "${psc##*$'\n'}"
+blk_ptxspill() {
+  if ! psc=$(bash "$(dirname "$0")/ptx-spill-check.sh" --self-test 2>&1); then
+    echo "$psc" >&2
+    echo "check-recipes: the ptx-spill-check self-test failed" >&2
+    return 1
+  fi
+  echo "${psc##*$'\n'}"
+}
 # scan-args.sh is the three scan recipes' refusal of a cargo feature given where the scan's own words go
 # (ptx-scan, sass-scan, lds-scan): its cases on a fixed feature list and the real crates/gpu-gates table.
-if ! sa=$(bash "$(dirname "$0")/scan-args.sh" --self-test 2>&1); then
-  echo "$sa" >&2
-  echo "check-recipes: the scan-args self-test failed" >&2
-  exit 1
-fi
-echo "${sa##*$'\n'}"
+blk_scanargs() {
+  if ! sa=$(bash "$(dirname "$0")/scan-args.sh" --self-test 2>&1); then
+    echo "$sa" >&2
+    echo "check-recipes: the scan-args self-test failed" >&2
+    return 1
+  fi
+  echo "${sa##*$'\n'}"
+}
 # lds-scan.sh's rows (its PTX and SASS counts over a fixture binary, stub extractor, ptxas and cuobjdump),
 # its filter, its failed-scan banner and its usage refusal, no box.
-if ! ls=$(bash "$(dirname "$0")/lds-scan.sh" --self-test 2>&1); then
-  echo "$ls" >&2
-  echo "check-recipes: the lds-scan self-test failed" >&2
-  exit 1
-fi
-echo "${ls##*$'\n'}"
+blk_ldsscan() {
+  if ! ls=$(bash "$(dirname "$0")/lds-scan.sh" --self-test 2>&1); then
+    echo "$ls" >&2
+    echo "check-recipes: the lds-scan self-test failed" >&2
+    return 1
+  fi
+  echo "${ls##*$'\n'}"
+}
 # mutant-run.sh's kill, survive, not-built and no-Compiling verdicts, its restore checks (a broken copy, an
 # edit during the run, a TERM) and its refusals, in a temp git repo with a fake gate, no box.
-if ! mrt=$(bash "$(dirname "$0")/mutant-run.sh" --self-test 2>&1); then
-  echo "$mrt" >&2
-  echo "check-recipes: the mutant-run self-test failed" >&2
-  exit 1
-fi
-echo "${mrt##*$'\n'}"
-# Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
-# that grows one is listed here, and the comparison below fails on one that is not.
-selftests=(
-  "tools/bloomery/manifest.py --self-test"
-  "tools/bloomery/records.py --self-test"
-  "tools/bloomery/rows.py --self-test"
-  "tools/bloomery/route_trace.py --self-test"
-  "tools/check-comment-only.py --self-test"
-  "tools/flow/ds41_prefill.py --self-test"
-  "tools/flow/pplb.py --self-test"
-  "tools/flow/q38width.py --self-test"
-  "tools/flow/routes.py --self-test"
-  "tools/mac-disk.py --self-test"
-  "tools/ref/check-int-twins.py --self-test"
-  "tools/ref/clef/e2e.py --self-test"
-  "tools/ref/clef_ref.py --self-test"
-  "tools/ref/dma-dram-share.py --self-test"
-  "tools/ref/draft-accept.py --self-test"
-  "tools/ref/draft-vocab.py --self-test"
-  "tools/ref/ds41copy.py --self-test"
-  "tools/ref/ds41pp.py self-test"
-  "tools/ref/gguf-ranges.py --self-test"
-  "tools/ref/hidden-diff.py --self-test"
-  "tools/ref/ptx-canon.py --self-test"
-  "tools/ref/route-trace-chat.py --self-test"
-  "tools/ref/router-coverage.py --self-test"
-  "tools/ref/router-residency.py --self-test"
-  "tools/ref/set-diff.py --self-test"
-  "tools/ref/window-union.py --self-test"
-  "tools/verdict-diff.py --self-test"
-)
-root="$(cd "$(dirname "$0")/.." && pwd)"
-listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)
-found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools | grep -vx 'tools/recipes.py' | sort)
-if [ "$listed" != "$found" ]; then
-  echo "check-recipes: the Python tools with a self-test and the list this check runs differ (< listed, > found):" >&2
-  diff <(echo "$listed") <(echo "$found") >&2 || true
-  exit 1
-fi
-for t in "${selftests[@]}"; do
-  read -r f arg <<< "$t"
-  if ! out=$(cd "$root" && python3 "$f" "$arg" 2>&1); then
-    echo "$out" >&2
-    echo "check-recipes: $f $arg failed" >&2
-    exit 1
+blk_mutantrun() {
+  if ! mrt=$(bash "$(dirname "$0")/mutant-run.sh" --self-test 2>&1); then
+    echo "$mrt" >&2
+    echo "check-recipes: the mutant-run self-test failed" >&2
+    return 1
   fi
-done
-echo "check-recipes: ${#selftests[@]} tool self-tests ok"
+  echo "${mrt##*$'\n'}"
+}
+# mac-static.sh runs the round loop's lanes (fmt-check, lint, the scoped combos and the check scripts in
+# parallel): its lane orchestration, its rc/wall capture and its red-step naming are tested against
+# /bin/true, /bin/false and sleep stubs, no cargo, no check script.
+blk_macstatic() {
+  if ! mst=$(bash "$(dirname "$0")/mac-static.sh" --self-test 2>&1); then
+    echo "$mst" >&2
+    echo "check-recipes: the mac-static self-test failed" >&2
+    return 1
+  fi
+  echo "${mst##*$'\n'}"
+}
+# Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
+# that grows one is listed here, and the comparison below fails on one that is not. The tools run as
+# parallel jobs (they are independent processes on their own temp fixtures); their failures land in one
+# file and are reported together.
+blk_pytools() {
+  local root t f arg out pf
+  selftests=(
+    "tools/bloomery/manifest.py --self-test"
+    "tools/bloomery/records.py --self-test"
+    "tools/bloomery/rows.py --self-test"
+    "tools/bloomery/route_trace.py --self-test"
+    "tools/check-comment-only.py --self-test"
+    "tools/flow/ds41_prefill.py --self-test"
+    "tools/flow/pplb.py --self-test"
+    "tools/flow/q38width.py --self-test"
+    "tools/flow/routes.py --self-test"
+    "tools/mac-disk.py --self-test"
+    "tools/ref/check-int-twins.py --self-test"
+    "tools/ref/clef/e2e.py --self-test"
+    "tools/ref/clef_ref.py --self-test"
+    "tools/ref/dma-dram-share.py --self-test"
+    "tools/ref/draft-accept.py --self-test"
+    "tools/ref/draft-vocab.py --self-test"
+    "tools/ref/ds41copy.py --self-test"
+    "tools/ref/ds41pp.py self-test"
+    "tools/ref/gguf-ranges.py --self-test"
+    "tools/ref/hidden-diff.py --self-test"
+    "tools/ref/ptx-canon.py --self-test"
+    "tools/ref/route-trace-chat.py --self-test"
+    "tools/ref/router-coverage.py --self-test"
+    "tools/ref/router-residency.py --self-test"
+    "tools/ref/set-diff.py --self-test"
+    "tools/ref/window-union.py --self-test"
+    "tools/verdict-diff.py --self-test"
+  )
+  root="$(cd "$(dirname "$0")/.." && pwd)"
+  listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)
+  found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools | grep -vx 'tools/recipes.py' | sort)
+  if [ "$listed" != "$found" ]; then
+    echo "check-recipes: the Python tools with a self-test and the list this check runs differ (< listed, > found):" >&2
+    diff <(echo "$listed") <(echo "$found") >&2 || true
+    return 1
+  fi
+  pf=$B/pytools.fails
+  : > "$pf"
+  for t in "${selftests[@]}"; do
+    ( read -r f arg <<< "$t"
+      if ! out=$(cd "$root" && python3 "$f" "$arg" 2>&1); then
+        printf '%s\n%s\n' "$out" "check-recipes: $f $arg failed" >> "$pf"
+      fi
+    ) &
+  done
+  wait
+  if [ -s "$pf" ]; then
+    cat "$pf" >&2
+    return 1
+  fi
+  echo "check-recipes: ${#selftests[@]} tool self-tests ok"
+}
 # Every #[test] in the workspace is run by some gate-* or lab-* recipe's cargo test call on the box: its
 # target, the features its path's cfgs need, its name filter and its #[ignore] (tools/recipes.py
 # orphan-tests). A test no gate runs is neither a test nor a gate: without gate-ds41-bind, gpu-gates' bind
 # tests sit behind a feature no recipe enables. An input the scan cannot read fails here by file and line.
-if ! ot=$(python3 "$(dirname "$0")/recipes.py" orphan-tests 2>&1); then
-  echo "$ot" >&2
-  echo "check-recipes: a test no gate-* or lab-* recipe runs, or a source the scan cannot read (tools/recipes.py orphan-tests)" >&2
-  exit 1
-fi
-echo "${ot##*$'\n'}"
+blk_orphan() {
+  if ! ot=$(python3 "$(dirname "$0")/recipes.py" orphan-tests 2>&1); then
+    echo "$ot" >&2
+    echo "check-recipes: a test no gate-* or lab-* recipe runs, or a source the scan cannot read (tools/recipes.py orphan-tests)" >&2
+    return 1
+  fi
+  echo "${ot##*$'\n'}"
+}
+
+BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic pytools orphan)
+for b in "${BLOCKS[@]}"; do
+  ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
+done
+wait
+rc=0
+for b in "${BLOCKS[@]}"; do
+  brc=$(cat "$B/$b.rc" 2> /dev/null) || brc=255 # a block killed before its wrapper wrote the rc
+  if [ "$brc" != 0 ]; then
+    cat "$B/$b.out" >&2
+    [ "$rc" != 0 ] || rc=$brc
+  else
+    cat "$B/$b.out"
+  fi
+done
+[ "$rc" = 0 ] || exit "$rc"
 echo "check-recipes: ok"

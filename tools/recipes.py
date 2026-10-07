@@ -130,7 +130,11 @@ the `check` and `lint` recipes (`tools/mac-check.sh check` and `lint` run their 
 whose package, features or targets come from a recipe parameter (`{{…}}`: known at run time only); a
 doctest (rustdoc compiles it and cargo check has no doctest mode — the lib it imports is checked in the
 package's plain shape). The profile is not part of a shape: no source in the tree reads
-`cfg(debug_assertions)`, and `cargo check` builds no code whose optimisation level matters.
+`cfg(debug_assertions)`, and `cargo check` builds no code whose optimisation level matters. `--base` scopes
+the list for a round's loop (a shape whose inputs — shape_inputs — hold no file changed since the base, or
+whose input key is green in the `--ledger`, skips with why; a run's combo lines gain the key as a fourth
+field, which `tools/mac-check.sh combos --ledger` appends to the ledger green), so a loop that edited one
+crate checks only the shapes that read it; without the flags the list is the full one the lead's landing uses.
 """
 
 from __future__ import annotations
@@ -3157,14 +3161,121 @@ def build_shapes(tree: Tree, recipes: dict[str, Recipe]) -> tuple[list[Combo], l
     return [shapes[k] for k in order], skips, len(tuples)
 
 
+# ----------------------------------------------------------------------------------------------
+# the shape input key (`combos --base`/`--ledger`): what a round's loop may skip
+# ----------------------------------------------------------------------------------------------
+
+# Files every shape's check reads whatever its package: the workspace's dependency resolution, the
+# toolchain pin and the two rustflags owners (a moved pin or flag re-checks every shape), and this
+# tool and its runner — their sha moves every key when they change, the gate ledger's rule.
+SHAPE_KEY_META = (
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+    ".cargo/cuda-oxide.toml",
+    "tools/recipes.py",
+    "tools/mac-check.sh",
+)
+
+# The Mac static ledger: one `<key>\\tgreen\\t<YYYY-MM-DD HH:MM>\\t<tree>` line a green shape, appended
+# by `tools/mac-check.sh combos --ledger`. The key is the inputs' content hash, so a green record is
+# tree-independent — another tree at the same inputs reuses it.
+def read_shape_ledger(path: str) -> tuple[dict[str, tuple[str, str]], int]:
+    """({key: (date, tree)}, malformed lines) of the Mac static ledger; a missing file is empty."""
+    green: dict[str, tuple[str, str]] = {}
+    bad = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                f = ln.rstrip("\n").split("\t")
+                if len(f) == 4 and re.fullmatch(r"[0-9a-f]{64}", f[0]) and f[1] == "green":
+                    green[f[0]] = (f[2], f[3])
+                else:
+                    bad += 1
+    except FileNotFoundError:
+        pass
+    return green, bad
+
+
+def shape_inputs(tree: Tree, c: Combo) -> set[str]:
+    """Every file the shape's `cargo check` reads: each selector's files (its own package's target,
+    lib and test-only modules, and every linked lib's), plus the manifests of its package and its
+    dependency closure, plus SHAPE_KEY_META."""
+    rels: set[str] = set()
+    for kind, name in c.selectors:
+        rels |= set(tree.target_files(c.package, kind, name, c.features, not c.no_default, c.all_features))
+    pkg = tree.packages[c.package]
+    rels.add(pkg.manifest)
+    linked = tree.closure(pkg, c.features, dev=c.test, default=not c.no_default, all_features=c.all_features)
+    rels |= {tree.packages[q].manifest for q in linked}
+    rels |= set(SHAPE_KEY_META)
+    return rels
+
+
+def shape_key(c: Combo, rels: set[str], memo: dict[str, str]) -> str:
+    """sha256 over the command and each input's (sha256, path), content-only (no mtimes): the same
+    tree state gives the same key whatever copied or touched it. `memo` caches path -> sha256."""
+    h = hashlib.sha256()
+    h.update(f"mac-static-shape-v1\n{c.command()}\n".encode())
+    for rel in sorted(rels):
+        if rel not in memo:
+            try:
+                with open(os.path.join(ROOT, rel), "rb") as fh:
+                    memo[rel] = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                memo[rel] = "missing"
+        h.update(f"{memo[rel]}\t{rel}\n".encode())
+    return h.hexdigest()
+
+
 def cmd_combos(args: argparse.Namespace) -> int:
+    if args.ledger and args.base is None:
+        raise RecipeError("combos --ledger reads keys the --base form prints; give --base too")
     tree = Tree(ROOT)
     shapes, skips, n = build_shapes(tree, load_justfile(args.justfile or os.path.join(ROOT, "justfile")))
+    scoped = args.base is not None
+    green: dict[str, tuple[str, str]] = {}
+    changed: set[str] = set()
+    base_note = ""
+    if scoped:
+        try:
+            files, a_rev, b_rev = changed_files(args.base)
+        except RecipeError as err:
+            raise RecipeError(f"combos --base {args.base}: {err}")
+        changed = set(files)
+        base_note = f" since {a_rev[:9]}" + ("" if b_rev is None else f"..{b_rev[:9]}")
+        if args.ledger:
+            green, bad = read_shape_ledger(args.ledger)
+            if bad:
+                print(f"recipes.py combos: {args.ledger}: {bad} malformed line(s) ignored (they cannot skip a shape)", file=sys.stderr)
+    memo: dict[str, str] = {}
+    run = kept_green = kept_same = 0
     for c in shapes:
-        print(f"combo\t{c.label()}\t{c.command()}")
+        if not scoped:
+            print(f"combo\t{c.label()}\t{c.command()}")
+            run += 1
+            continue
+        rels = shape_inputs(tree, c)
+        key = shape_key(c, rels, memo)
+        if key in green:
+            date, tname = green[key]
+            print(f"skip\t{c.label()}\tgreen at {date} in {tname} (ledger {os.path.basename(args.ledger)})")
+            kept_green += 1
+            continue
+        if not (changed & rels):
+            print(f"skip\t{c.label()}\tno input file changed{base_note} ({len(rels)} inputs)")
+            kept_same += 1
+            continue
+        print(f"combo\t{c.label()}\t{c.command()}\t{key}")
+        run += 1
     for r, why in skips:
         print(f"skip\t{r}\t{why}")
-    print(f"total\t{len(shapes)} commands, {n} distinct (package, target, mode, features) tuples, {len(skips)} left out by name")
+    if scoped:
+        print(f"total\t{run} of {len(shapes)} commands to run, {n} distinct (package, target, mode, features) tuples, "
+              f"{kept_green} green in the ledger, {kept_same} with no input changed{base_note}, {len(skips)} left out by name")
+    else:
+        print(f"total\t{len(shapes)} commands, {n} distinct (package, target, mode, features) tuples, {len(skips)} left out by name")
     return 0
 
 
@@ -5705,6 +5816,33 @@ def self_test() -> int:
         except RecipeError as err:
             expect("g: --bin no_such_bin" in str(err), f"combos: an unresolvable call refused without its name: {err}")
 
+    # the shape input key: content-only (the memo's hash, not any mtime), stable for the same inputs,
+    # moved by a command or an input's content; the ledger reader takes only green 64-key lines
+    c1 = Combo("p", False, ("a",), (), ["a"], False, False, selectors={("lib", None)})
+    c2 = Combo("p", False, ("a",), (), ["a"], False, False, selectors={("lib", None)})
+    c3 = Combo("p", True, ("a",), (), ["a"], False, False, selectors={("lib", None)})
+    memo = {"Cargo.toml": "0" * 64, "p/src/lib.rs": "1" * 64}
+    expect(shape_key(c1, {"Cargo.toml", "p/src/lib.rs"}, memo) == shape_key(c2, {"p/src/lib.rs", "Cargo.toml"}, dict(memo)),
+           "shape key: the same inputs in another order gave another key")
+    expect(shape_key(c1, {"Cargo.toml", "p/src/lib.rs"}, memo) != shape_key(c3, {"Cargo.toml", "p/src/lib.rs"}, dict(memo)),
+           "shape key: another command (a test profile) gave the same key")
+    expect(shape_key(c1, {"Cargo.toml", "p/src/lib.rs"}, memo) != shape_key(c1, {"Cargo.toml", "p/src/lib.rs"}, {**memo, "Cargo.toml": "2" * 64}),
+           "shape key: a changed input content gave the same key")
+    with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False) as fh:
+        k = "a" * 64
+        fh.write(f"{k}\tgreen\t2026-10-07 16:00\tbloomery-x\nnope\tgreen\t2026-10-07 16:00\tt\n{k[:-1]}\tgreen\td\tt\n{k}\tred\td\tt\n")
+        lp = fh.name
+    green, bad = read_shape_ledger(lp)
+    os.unlink(lp)
+    expect(list(green) == [k] and green[k] == ("2026-10-07 16:00", "bloomery-x"), f"shape ledger: the green lines read {green}")
+    expect(bad == 3, f"shape ledger: {bad} malformed lines counted, not 3")
+    expect(read_shape_ledger(lp) == ({}, 0), "shape ledger: a missing file is not empty")
+    try:
+        cmd_combos(argparse.Namespace(justfile=None, base=None, ledger="x"))
+        fails.append("combos: --ledger without --base accepted")
+    except RecipeError as err:
+        expect("--base" in str(err), f"combos: --ledger without --base refused without naming --base: {err}")
+
     # the real tree
     side = make_side(ROOT)
     tree, recipes, graph = side.tree, side.recipes, side.graph
@@ -6076,8 +6214,10 @@ def main(argv: list[str]) -> int:
     ot.add_argument("--justfile")
     pc = sub.add_parser("pure-crates", help="the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason")
     pc.add_argument("--names", action="store_true", help="the pure crates' names only, one a line")
-    cb = sub.add_parser("combos", help="every build shape a recipe compiles, one `cargo check` command each (tools/mac-check.sh combos): combo<TAB>label<TAB>command, skip<TAB>recipe<TAB>why, total<TAB>counts")
+    cb = sub.add_parser("combos", help="every build shape a recipe compiles, one `cargo check` command each (tools/mac-check.sh combos): combo<TAB>label<TAB>command, skip<TAB>recipe<TAB>why, total<TAB>counts; --base scopes to shapes an input file of which changed (combo lines gain a fourth field, the input key)")
     cb.add_argument("--justfile")
+    cb.add_argument("--base", help="a shape whose inputs hold no file changed since this BASE (or A..B) skips with why; with --ledger, a green key skips too")
+    cb.add_argument("--ledger", help="with --base: the Mac static ledger (tools/mac-check.sh combos --ledger appends it) whose green keys skip")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")

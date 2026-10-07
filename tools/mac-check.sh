@@ -16,11 +16,17 @@
 # set, the gate recipes others (`--features gpu` alone, a lib with no feature, a test build). It runs every
 # shape, a red one too, names each red shape at the end, and prints the ones the list leaves out by name.
 #
-#   tools/mac-check.sh check|lint|fmt|fmt-check|test|combos
+#   tools/mac-check.sh check|lint|fmt|fmt-check|test|combos [--base SPEC] [--ledger FILE]
 #   tools/mac-check.sh --self-test   the derivation, the refusals, the ratchet, the target directory,
 #                                    the test totals, the toolchain and prerequisite checks against a
 #                                    fake HOME, and the disk floor against a fake df; runs no cargo
 #                                    (check-recipes runs it)
+#
+# `combos --base SPEC --ledger FILE` is the round loop's scoped form (tools/mac-static.sh runs it):
+# recipes.py prints only the shapes an input file of which changed since SPEC, or whose input key is
+# not green in the ledger, each combo line carrying its 64-hex key; a shape that checks green is
+# appended to the ledger as `<key>\tgreen\t<date>\t<tree>`, so the next run at the same inputs skips
+# it. The full `combos` (no flags) stays the lead's landing form. --ledger without --base is a named 64.
 #
 # Exit: cargo's own code (`test`: the first crate's that is not 0; `combos`: the first red shape's).
 # `lint` also ends 1 when its `^warning:` count (the box's ruler, one per target a warning appears in)
@@ -100,25 +106,33 @@ totals() {
        END { if (!n) exit 1; printf "%d passed, %d failed, %d ignored in %d test binaries\n", p, f, g, n }' "$1"
 }
 
-# combo_lines: recipes.py combos' output on stdin, checked line by line — `combo<TAB>label<TAB>command`,
-# `skip<TAB>recipe<TAB>why`, one `total<TAB>counts` last — or 64 naming the first line that is not one,
-# and 70 when it lists no shape.
+# combo_lines [TABS]: recipes.py combos' output on stdin, checked line by line — `combo<TAB>label<TAB>command`
+# (TABS=3, the --base form: a fourth field, the 64-hex input key), `skip<TAB>recipe<TAB>why`, one
+# `total<TAB>counts` last — or 64 naming the first line that is not one, and 70 when it lists no shape.
 combo_lines() {
-  local line kind a b n=0 no=0 total=0
+  local tabs=${1:-2} line kind a b k n=0 no=0 total=0
   while IFS= read -r line; do
     no=$((no + 1))
-    IFS=$'\t' read -r kind a b <<< "$line"
+    IFS=$'\t' read -r kind a b k <<< "$line"
     if [ "$total" != 0 ]; then
       say "mac-check.sh: recipes.py combos line $no follows its total line: $line"
       return 64
     fi
     case $kind in
       combo | skip)
-        if [ -z "$a" ] || [ -z "$b" ] || [ "$(printf '%s' "$line" | tr -cd '\t' | wc -c | tr -d ' ')" != 2 ]; then
+        local want=2
+        [ "$kind" = combo ] && want=$tabs
+        if [ -z "$a" ] || [ -z "$b" ] || [ "$(printf '%s' "$line" | tr -cd '\t' | wc -c | tr -d ' ')" != "$want" ]; then
           say "mac-check.sh: recipes.py combos line $no is not $kind<TAB>…<TAB>…: $line"
           return 64
         fi
-        [ "$kind" = skip ] || n=$((n + 1))
+        if [ "$kind" = combo ]; then
+          if [ "$tabs" = 3 ] && [[ ! $k =~ ^[0-9a-f]{64}$ ]]; then
+            say "mac-check.sh: recipes.py combos line $no has no 64-hex input key: $line"
+            return 64
+          fi
+          n=$((n + 1))
+        fi
         ;;
       total) total=1 ;;
       *)
@@ -131,7 +145,7 @@ combo_lines() {
     say "mac-check.sh: recipes.py combos printed no total line (cut short?)"
     return 64
   fi
-  if [ "$n" = 0 ]; then
+  if [ "$n" = 0 ] && [ "$tabs" != 3 ]; then # the --base form may list no shape to run: every one skipped
     say "mac-check.sh: recipes.py combos lists no build shape"
     return 70
   fi
@@ -465,6 +479,29 @@ self_test() {
   done
   rm -f "${TMPDIR:-/tmp}/mac-check-combos.$$"
   printf '%s\n' "$a" "$b" | combo_lines || fail "combo_lines refused a list of one shape and its total"
+  # the --base form: combo lines carry a 64-hex key (3 tabs), skip lines keep 2, a list whose every
+  # shape skips is accepted, and a combo line without a key is refused by name
+  k=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  printf '%s\n' "combo${tab}p build [x]: 1 targets${tab}cargo check -p p --bin b${tab}$k" "skip${tab}r${tab}why" "total${tab}0 of 1 commands to run" | combo_lines 3 ||
+    fail "combo_lines 3 refused a scoped list of one keyed shape, one skip and its total"
+  printf '%s\n' "skip${tab}r${tab}why" "total${tab}0 of 1 commands to run" | combo_lines 3 || fail "combo_lines 3 refused a scoped list with no shape to run"
+  for t in "combo${tab}p build [x]: 1 targets${tab}cargo check -p p --bin b${tab}nothex|no 64-hex input key" \
+    "combo${tab}p build [x]: 1 targets${tab}cargo check -p p --bin b${tab}${k}a|no 64-hex input key" \
+    "combo${tab}p build [x]: 1 targets${tab}cargo check -p p|not combo<TAB>"; do
+    why=${t##*|}
+    out=$(printf '%s\n' "${t%|*}" "total${tab}1 commands" | combo_lines 3 2>&1) && fail "combo_lines 3 accepted '${t%|*}'" || {
+      case $out in *"$why"*) ;; *) fail "combo_lines 3 refused '${t%|*}' without naming '$why': $out" ;; esac
+    }
+  done
+  # the combos block's own refusals, before any cargo: 64, named
+  for t in "--bogus|not '--bogus'" "--base|needs a value" "--base main --ledger|needs a value" "--ledger /tmp/x|--ledger reads the keys"; do
+    args=${t%%|*}
+    why=${t##*|}
+    out=$("$HERE/tools/mac-check.sh" combos $args < /dev/null 2>&1) && fail "combos $args accepted" || {
+      [ $? = 64 ] || fail "combos $args refused with another rc"
+      case $out in *"$why"*) ;; *) fail "combos $args refused without naming '$why': $out" ;; esac
+    }
+  done
 
   # the host triple and the channel
   [ "$(host_triple Darwin arm64)" = aarch64-apple-darwin ] || fail "Darwin arm64 is not aarch64-apple-darwin"
@@ -619,10 +656,12 @@ EOF
 
 case ${1:-} in
   --self-test) [ $# = 1 ] || { say "mac-check.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
-  check | lint | fmt | fmt-check | test | combos) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
+  check | lint | fmt | fmt-check | test) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
+  combos) : ;; # its own block takes --base SPEC and --ledger FILE
   *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test|combos | --self-test"; exit 64 ;;
 esac
 MODE=$1
+[ "$MODE" != combos ] || shift
 HOST=$(host_triple "$(uname -s)" "$(uname -m)") || exit $?
 CHANNEL=$(channel) || exit $?
 TC=$HOME/.rustup/toolchains/$CHANNEL-$HOST/bin
@@ -658,22 +697,42 @@ if [ "$MODE" = test ]; then
   exit "$rc"
 fi
 if [ "$MODE" = combos ]; then
-  LIST=$(python3 "$HERE/tools/recipes.py" combos) || exit $?
-  combo_lines <<< "$LIST" || exit $?
+  BASE= LEDGER=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --base) [ $# -ge 2 ] || { say "mac-check.sh: --base needs a value"; exit 64; }; BASE=$2; shift 2 ;;
+      --ledger) [ $# -ge 2 ] || { say "mac-check.sh: --ledger needs a value"; exit 64; }; LEDGER=$2; shift 2 ;;
+      *) say "mac-check.sh: combos takes --base SPEC and --ledger FILE, not '$1'"; exit 64 ;;
+    esac
+  done
+  [ -z "$LEDGER" ] || [ -n "$BASE" ] || { say "mac-check.sh: --ledger reads the keys the --base form prints; give --base too"; exit 64; }
+  RC_ARGS=(combos)
+  [ -z "$BASE" ] || RC_ARGS+=(--base "$BASE")
+  [ -z "$LEDGER" ] || RC_ARGS+=(--ledger "$LEDGER")
+  LIST=$(python3 "$HERE/tools/recipes.py" "${RC_ARGS[@]}") || exit $?
+  combo_lines $([ -n "$BASE" ] && echo 3) <<< "$LIST" || exit $?
   setup combos "$TC" "$HERE" || exit $?
   mkdir -p "$HERE/target"
   LOG=$HERE/target/mac-check-combos.log
   LOCK0=$(md5 -q "$HERE/Cargo.lock")
-  HEAD="mac-check: cargo check --target $TARGET for each build shape of tools/recipes.py combos ($("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"); CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
+  HEAD="mac-check: cargo check --target $TARGET for each build shape of tools/recipes.py combos${BASE:+ scoped to --base $BASE}${LEDGER:+, ledger $LEDGER} ($("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"); CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
   say "$HEAD; log $LOG"
   echo "$HEAD" > "$LOG"
   rc=0
   n=0
   TOTAL=
   reds=()
-  while IFS=$'\t' read -r -u 3 kind label cmd; do
+  skips_scoped=0
+  while IFS=$'\t' read -r -u 3 kind label cmd key; do
     case $kind in
-      skip) echo "mac-check: left out by name: $label — $cmd" >> "$LOG" ;;
+      skip)
+        if [ -n "$BASE" ]; then
+          skips_scoped=$((skips_scoped + 1))
+          echo "mac-check: skipped (scoped): $label — $cmd" >> "$LOG"
+        else
+          echo "mac-check: left out by name: $label — $cmd" >> "$LOG"
+        fi
+        ;;
       total) TOTAL=$label ;;
       combo)
         DERIVED=$(derive check "$cmd") || exit 64
@@ -688,6 +747,9 @@ if [ "$MODE" = combos ]; then
         if [ "$crc" != 0 ]; then
           reds+=("$label: ${ARGV[*]}")
           [ "$rc" != 0 ] || rc=$crc
+        elif [ -n "$LEDGER" ]; then
+          mkdir -p "$(dirname "$LEDGER")"
+          printf '%s\tgreen\t%s\t%s\n' "$key" "$(date '+%Y-%m-%d %H:%M')" "${HERE##*/}" >> "$LEDGER"
         fi
         ;;
     esac
@@ -695,7 +757,7 @@ if [ "$MODE" = combos ]; then
   cat "$LOG"
   [ "$(md5 -q "$HERE/Cargo.lock")" = "$LOCK0" ] || say "mac-check: cargo rewrote Cargo.lock in this tree (a dependency edit's lock refresh): commit it with the edit"
   for r in "${reds[@]+"${reds[@]}"}"; do echo "mac-check: red shape $r"; done
-  echo "mac-check: combos rc $rc; $n shapes run, ${#reds[@]} red, in $SECONDS s (recipes.py combos: $TOTAL)"
+  echo "mac-check: combos rc $rc; $n shapes run, ${#reds[@]} red${BASE:+, $skips_scoped skipped (scoped)}, in $SECONDS s (recipes.py combos: $TOTAL)"
   exit "$rc"
 fi
 RECIPE=$(recipe_of "$MODE")

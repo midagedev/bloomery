@@ -14,7 +14,9 @@ To run or evaluate bloomery rather than develop it, read the README's "Status" s
   the CUDA codegen backend. Use `cargo oxide` (the recipes do).
 - **Never run a gate on the Mac.** The Mac is arm64 and an editor: `qdot` uses `std::arch::x86_64`, `threads` Linux
   affinity calls. On the Mac run only the static tier (`just mac-check`, `just mac-lint`: check and clippy as an
-  x86_64-linux cross check, no linker; `just mac-fmt-check`) and the pure crates' native tests (`just mac-test`, the
+  x86_64-linux cross check, no linker; `just mac-fmt-check`; `just mac-static [BASE]`: the round loop's one command —
+  fmt-check, lint, the combos scoped to BASE's changed files and every check script, in parallel, tools/mac-static.sh)
+  and the pure crates' native tests (`just mac-test`, the
   crates `tools/recipes.py pure-crates` selects). A Mac result is development-loop evidence; landing evidence is the
   box's record. Every box command goes through `tools/box.sh`, whose rsync is `--delete`: never edit on the box.
 - **Never hand-run a benchmark.** Measurements belong to the lease runners in `tools/ref/` (`decode-measure.sh`,

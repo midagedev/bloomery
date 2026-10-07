@@ -71,6 +71,13 @@ mac-fmt-check:
 mac-test:
     ./tools/mac-check.sh test
 
+# 라운드 루프의 맥 정적 계층 한 줄(≤180 s 목표): fmt-check와 check 스크립트 여덟은 병렬 레인, cargo 레인은 lint(clippy가
+# type-check를 겸한다 — check를 따로 돌리면 멤버 크레이트를 두 번 짓는다) 다음 BASE 범위 combos. BASE를 주면 그 base
+# 이후 바뀐 파일을 입력에 갖는 모양만 돌고 초록이 레저(~/.cache/bloomery/mac-static-ledger.tsv)에 남는다; 인자 없이 전체.
+# 주인은 tools/mac-static.sh다.
+mac-static *ARGS:
+    ./tools/mac-static.sh {{ARGS}}
+
 # 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
 check-recipes:
     ./tools/check-recipes.sh
