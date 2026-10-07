@@ -30,7 +30,7 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   card's experts on the qwen38 seat, the placed plan's margin on the glm seat), `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
   auto context nearly doubles on the same card; `--cache-type-v` does not exist, both planes quantize together),
-  `--host/--port`, `--alias`.
+  `--host/--port`, `--alias`, `--mmproj <file>` (the V4.1 seat's image input, below).
 - **No placement flag needed**: leave `--place` out on every model and the load picks for you — the largest
   visible card, a split onto the CPU when the file does not fit it, and on GLM-5.3 the second card as an expert
   tier when its plan puts enough experts there to pay for it (the GLM row of the
@@ -91,6 +91,16 @@ a step.
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
 decode starts warm (on by default, with `--place` unset, `a` or `bp`).
+
+**Image input (V4.1).** The V4.1 seat reads images when it is started with `--mmproj <file>`, llama-server's
+flag, naming the model's vision-encoder GGUF: `mmproj-DeepSeek-V4.1-Flash-BF16.gguf` (a file of another encoder
+is refused by name). Images travel inside the request as PNG or JPEG bytes: an OpenAI `image_url` part holding a
+`data:` URL, or an Anthropic `image` block with a base64 source; any other URL is refused, not fetched. The
+encoder loads once at start and stays resident, 1.31 GB of weights and activations: on a card the load's plan
+leaves off it, or, when every card is on the plan, as a named reserve whose bytes the plan counts on the stage
+card; the `vision` line at start names the card and the bytes. A request's image spans ride the prompt cache like
+its ids: the same image sent again keeps its span. Without the flag the server serves no image, and `/props`
+answers `vision: false`.
 
 **The engines behind the server.** The release ships `bloomery-serve` alone. A source build also has
 `generate_ds41` (token ids in, greedy ids out), `bloomery-chat` (streams text) and the standalone V4.1 and Qwen3.8

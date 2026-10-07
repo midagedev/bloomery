@@ -44,7 +44,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
 | i-quants | Qwen3.8 `UD-Q3_K_XL` (IQ3_XXS, IQ4_XS, IQ4_NL experts) runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. IQ3_S, IQ2_*, IQ1_M and BF16 tensors are not loaded yet |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
-| Vision input (V4.1) | Not in this release |
+| Vision input (V4.1) | On with `--mmproj <file>` (llama-server's flag), the encoder GGUF `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`; images go in as base64 (`data:` URLs), not fetched URLs. The encoder (1.31 GB) stays resident on a card the plan leaves free, else on the stage card as a reserve the plan counts |
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
