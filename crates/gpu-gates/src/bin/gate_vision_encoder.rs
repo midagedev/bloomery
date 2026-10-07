@@ -1145,8 +1145,7 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let set = read_set()?;
         let file = Gguf::open(&set.mmproj)?;
-        let ctx = CudaContext::new(0)?;
-        let stream = ctx.new_stream()?;
+        let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(0)?;
         let mut enc = Encoder::load(&ctx, &stream, &file)?;
         let hp = enc.hparams().clone();
         let want_launches = Encoder::launches(hp.n_layer);

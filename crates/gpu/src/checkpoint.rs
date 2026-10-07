@@ -564,10 +564,12 @@ impl Checkpoints {
 
 impl Drop for Checkpoints {
     /// With a take open, its copies may still write its slot: the context is
-    /// waited for before the slots are freed.
+    /// waited for before the slots are freed, under the device's capture
+    /// lock ([`crate::capsync::ctx_sync_in_drop`], which a drop path calls
+    /// because it must not panic).
     fn drop(&mut self) {
         if self.open > 0 {
-            let _ = self.ctx.synchronize();
+            let _ = crate::capsync::ctx_sync_in_drop(&self.ctx, "Checkpoints::drop");
         }
     }
 }
@@ -590,8 +592,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_restore_refuses_a_slot_no_copy_filled() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let mut c = Checkpoints::new(&ctx, vec![4, 3], 1 << 20, 512).expect("checkpoints");
         let mut a = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("a store");
         let mut b = DeviceBuffer::from_host(&stream, &[2.0f32; 3]).expect("a store");
@@ -651,8 +652,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_open_copy_seal_and_abandon() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let mut c = Checkpoints::new(&ctx, vec![4, 3], 1 << 20, 512).expect("checkpoints");
         let mut a = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("a store");
         let mut b = DeviceBuffer::from_host(&stream, &[2.0f32; 3]).expect("a store");

@@ -34,7 +34,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), bloomery_gpu_gates::GateError> {
     use bloomery_gpu_gates::ptx;
-    use cuda_core::{CudaContext, DriverError, sys};
+    use cuda_core::{DriverError, sys};
     use std::path::PathBuf;
 
     let mut args = std::env::args_os().skip(1);
@@ -50,7 +50,7 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
         return Err(format!("{}: no PTX module in the section", section.display()).into());
     }
 
-    let ctx = CudaContext::new(0)?;
+    let ctx = bloomery_gpu::capsync::fresh_context(0)?;
     let mut version = 0i32;
     // SAFETY: the out-pointer is a live local the call only writes.
     let rc = unsafe { sys::cuDriverGetVersion(&mut version) };

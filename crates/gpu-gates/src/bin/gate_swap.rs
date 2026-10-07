@@ -2494,12 +2494,13 @@ mod gate {
     }
 
     /// Synchronizes the context when it drops, as the V4.1 body's ring
-    /// shadows do.
+    /// shadows do — through the capture-safe owner, which a drop path calls
+    /// because it must not panic.
     struct CtxSync(Arc<CudaContext>);
 
     impl Drop for CtxSync {
         fn drop(&mut self) {
-            if let Err(e) = self.0.synchronize() {
+            if let Err(e) = bloomery_gpu::capsync::ctx_sync_in_drop(&self.0, "gate_swap CtxSync") {
                 println!("dropq: the context synchronize failed: {e}");
             }
         }

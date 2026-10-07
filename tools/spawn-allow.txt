@@ -11,6 +11,7 @@ crates/serve/src/api.rs 3 the HTTP server's threads, spawned by the serve main o
 crates/serve/src/decide.rs 1 the decision server's connection threads, spawned by its accept loop, never pinned
 crates/decision/src/pool.rs 1 the head's resident workers, one per CPU, started on first use by the decision bins, gates and server, never pinned
 crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those never pin
+crates/gpu/src/graph.rs 2 the capture-race tests' second threads, from a libtest thread that is never pinned
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
 crates/model/src/arch/deepseek41/fixture.rs 1 the gate fixture's builder, a gate-side tool
 crates/model/src/placement/host_lock.rs 1 PENDING (triage): the host set's walk at load, spawned by the step thread after pin_caller — every chunk on one cpu

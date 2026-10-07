@@ -561,7 +561,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_window_panics_by_name_when_rows_times_cols_wraps() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let ctx = crate::capsync::fresh_context(0).expect("CUDA device 0");
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: the product overflows, so the call panics before `ptr`
             // or `ctx` is used.

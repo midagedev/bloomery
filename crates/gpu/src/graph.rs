@@ -61,31 +61,36 @@ pub struct Graph {
 // mutability.
 unsafe impl Send for Graph {}
 
-impl Graph {
-    /// Capture everything `body` enqueues on `stream` into a graph and
-    /// instantiate it.
-    ///
-    /// `stream` must be a real stream (`CudaContext::new_stream`): the driver
-    /// refuses capture on the legacy null stream, which is what
-    /// `default_stream()` hands out, so that case is rejected here with a
-    /// readable error instead of `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`. The
-    /// body must not allocate, free or synchronize (no `DeviceBuffer::zeroed`
-    /// / `from_host` / `to_host_vec`, no drops of device buffers) — those are
-    /// not capturable and abort the capture. A body that returns `Err` or
-    /// panics still ends the capture and frees the partial template: the
-    /// stream is capturable again afterwards.
-    pub(crate) fn capture<F>(stream: &CudaStream, body: F) -> Result<Graph, GpuError>
-    where
-        F: FnOnce(&CudaStream) -> Result<(), GpuError>,
-    {
-        let hs = stream.cu_stream();
-        if hs.is_null() {
-            return Err(GpuError::state(
-                "Graph::capture",
-                "refused on the legacy default (null) stream; capture needs \
-                 CudaContext::new_stream()",
-            ));
-        }
+/// Begin a capture of everything `body` enqueues on `stream`, run the body,
+/// and end the capture: the one place in the workspace
+/// `cuStreamBeginCapture` is called, so the device's capture lock and this
+/// thread's capture note — which keep a context-wide synchronize out of
+/// the capture ([`crate::capsync`]) — live here, over the whole
+/// begin..end. Returns the raw template for the caller to instantiate
+/// ([`Graph::capture`]) or read (`gpu-gates`' node walk) and destroy.
+///
+/// `stream` must be a real stream (`CudaContext::new_stream`): the driver
+/// refuses capture on the legacy null stream, which is what
+/// `default_stream()` hands out, so that case is rejected here with a
+/// readable error instead of `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`. The
+/// body must not allocate, free or synchronize (no `DeviceBuffer::zeroed`
+/// / `from_host` / `to_host_vec`, no drops of device buffers) — those are
+/// not capturable and abort the capture. A body that returns `Err` or
+/// panics still ends the capture and frees the partial template: the
+/// stream is capturable again afterwards.
+pub fn capture_template<F>(stream: &CudaStream, body: F) -> Result<sys::CUgraph, GpuError>
+where
+    F: FnOnce(&CudaStream) -> Result<(), GpuError>,
+{
+    let hs = stream.cu_stream();
+    if hs.is_null() {
+        return Err(GpuError::state(
+            "capture_template",
+            "refused on the legacy default (null) stream; capture needs \
+             CudaContext::new_stream()",
+        ));
+    }
+    crate::capsync::capture_hold(stream.context().ordinal(), move || {
         // SAFETY: hs is a live stream of the current context and not capturing
         // (a nested capture fails here with the driver's own error).
         let begun = unsafe {
@@ -125,6 +130,20 @@ impl Graph {
             Ok(Ok(())) => {}
         }
         ended?;
+        Ok(graph)
+    })
+}
+
+impl Graph {
+    /// Capture everything `body` enqueues on `stream` into a graph and
+    /// instantiate it: [`capture_template`] over the begin..end, then the
+    /// node count, the instantiation and the once-for-all upload. See
+    /// [`capture_template`] for what the body may not do.
+    pub(crate) fn capture<F>(stream: &CudaStream, body: F) -> Result<Graph, GpuError>
+    where
+        F: FnOnce(&CudaStream) -> Result<(), GpuError>,
+    {
+        let graph = capture_template(stream, body)?;
 
         let mut nodes = 0usize;
         // SAFETY: a null node array asks only for the count.
@@ -155,9 +174,9 @@ impl Graph {
         };
         // The upload the first launch of an exec would otherwise do inside
         // its own call, done once here on the stream the replays use.
-        // SAFETY: exec is the live instantiation above; hs is the live stream
-        // it was captured on.
-        let rc = unsafe { sys::cuGraphUpload(captured.exec, hs) };
+        // SAFETY: exec is the live instantiation above; the stream is the
+        // live one it was captured on.
+        let rc = unsafe { sys::cuGraphUpload(captured.exec, stream.cu_stream()) };
         cu(rc, "cuGraphUpload")?;
         Ok(captured)
     }
@@ -750,10 +769,11 @@ impl Drop for Graph {
 #[cfg(test)]
 mod tests {
     use super::{FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu};
-    use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
-    use cuda_core::{CudaContext, DeviceBuffer, PinnedHostBuffer, sys};
+    use crate::{DeviceTensor, Gpu, GpuError, Q8Act, capsync};
+    use cuda_core::{DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
     use std::panic::AssertUnwindSafe;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     /// A captured wait on a flag holds the copy behind it until the host
@@ -766,8 +786,7 @@ mod tests {
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_host_flag_holds_a_copy_until_raised() {
         const N: usize = 1024;
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (ctx, stream) = capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let flags = HostFlags::new(&ctx, 2).expect("two host flags");
         let mut staging = PinnedHostBuffer::<u32>::zeroed(&ctx, N).expect("pinned staging");
         let dst = DeviceBuffer::<u32>::zeroed(&stream, N).expect("a device buffer");
@@ -831,8 +850,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_nodes_report_a_captured_host_function() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (_ctx, stream) = capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let mut buf = DeviceBuffer::<u32>::zeroed(&stream, 64).expect("a device buffer");
         stream
             .synchronize()
@@ -1071,5 +1089,153 @@ mod tests {
             "the stream is still capturing after a body that panicked"
         );
         step.assert_replays(&gpu, &eager, "a body that panicked");
+    }
+
+    /// How long a race test's capture body holds the window open for thread
+    /// B: B's path from the signal to the context-wide synchronize of a
+    /// fresh handle's first stream is two handle creations and a priority
+    /// query — the synchronize is the first thing a fresh handle does after
+    /// its constructor — so this bound covers it many times over, and B
+    /// reaches its synchronize while the capture is still open on code that
+    /// does not hold it out. It cannot pass red-side on the wait alone: the
+    /// capture closes before B's answer only on this timeout, and B always
+    /// gets here first. On code that does hold B out (the owner's exclusive
+    /// side), the timeout is what the green path pays.
+    const RACE_WAIT: Duration = Duration::from_secs(5);
+
+    /// A one-entry PTX module the naming test JIT-loads inside another
+    /// thread's capture: the smallest load that reaches the driver's module
+    /// path. Its target is at or below every card the gates run on, so the
+    /// JIT accepts it everywhere.
+    const NOP_PTX: &[u8] = b"\
+        .version 7.0\n\
+        .target sm_80\n\
+        .address_size 64\n\
+        .visible .entry capsync_probe_nop()\n\
+        {\n\
+        \tret;\n\
+        }\n";
+
+    /// A fresh handle's first stream waits for a capture on its device:
+    /// while thread A captures, thread B opens a second `Gpu`, and B's
+    /// open, A's capture and the capture's replay all succeed — the
+    /// context-wide synchronize a fresh handle's first stream runs cannot
+    /// land inside the capture. The outcome is pinned whole (both sides
+    /// succeed), not the mechanism.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_capsync_race_fresh_first_stream_waits_for_a_capture() {
+        let gpu = Gpu::new().expect("a Gpu on device 0");
+        let mut step = Step::new(&gpu);
+        let eager = step.eager(&gpu);
+        let (opened_tx, opened_rx) = mpsc::channel::<Result<(), String>>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        // A `Gpu` never crosses threads: B opens it, drops it and sends only
+        // the answer.
+        let b = std::thread::spawn(move || {
+            go_rx
+                .recv_timeout(RACE_WAIT * 2)
+                .expect("A signals inside its capture");
+            let opened = match Gpu::with_device(0) {
+                Ok(_gpu) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            };
+            opened_tx.send(opened).expect("A still collects the open");
+        });
+        let graph = gpu
+            .capture(|_| {
+                step.enqueue(&gpu)?;
+                go_tx.send(()).expect("B waits for the signal");
+                // B answers inside the capture only when nothing held it
+                // back; held out, it answers once this capture has ended,
+                // and the wait closes on its timeout either way.
+                let _ = opened_rx.recv_timeout(RACE_WAIT);
+                Ok(())
+            })
+            .expect("the capture with a second Gpu opening under it");
+        assert_eq!(
+            graph.node_count(),
+            2,
+            "the capture recorded what the body enqueued"
+        );
+        let opened = opened_rx
+            .recv_timeout(RACE_WAIT)
+            .expect("B finishes once the capture has ended");
+        opened.expect("the second Gpu's open under the capture");
+        b.join().expect("B does not panic");
+        step.assert_replays(
+            &gpu,
+            &eager,
+            "a capture raced by a fresh handle's first stream",
+        );
+    }
+
+    /// The call that breaks a capture is the context-wide synchronize, not
+    /// the work around it: a handle that already has its stream — made
+    /// before the capture began — allocates a device buffer and JIT-loads
+    /// a module inside the capture, and B's work, the capture and the
+    /// replay all succeed, because no path either call takes synchronizes
+    /// the whole context. The buffer and the module are dropped after the
+    /// capture has ended, so their drops stay out of the claim.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_capsync_alloc_and_module_load_leave_a_capture_whole() {
+        let gpu = Gpu::new().expect("a Gpu on device 0");
+        let mut step = Step::new(&gpu);
+        let eager = step.eager(&gpu);
+        let (ctx, stream) = capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (end_tx, end_rx) = mpsc::channel::<()>();
+        let b = std::thread::spawn(move || {
+            go_rx
+                .recv_timeout(RACE_WAIT * 2)
+                .expect("A signals inside its capture");
+            let work: Result<_, GpuError> = (|| {
+                // cuda-core's `DeviceBuffer::zeroed` allocates without binding
+                // the stream's context, so this fresh thread binds it first
+                // (docs/upstream/nvlabs-ledger.md); the bind is no
+                // context-wide call.
+                ctx.bind_to_thread()?;
+                let bytes = DeviceBuffer::<u32>::zeroed(&stream, 4096)?;
+                let module = ctx.load_module_from_image(NOP_PTX)?;
+                Ok((bytes, module))
+            })();
+            let answer = match &work {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            };
+            done_tx.send(answer).expect("A still collects the work");
+            // The buffer and module drop when this closure returns, which
+            // the wait below holds past the capture's end: a drop is not
+            // part of what this test claims is safe inside a capture.
+            end_rx
+                .recv_timeout(RACE_WAIT * 2)
+                .expect("A ends its capture");
+        });
+        let graph = gpu
+            .capture(|_| {
+                step.enqueue(&gpu)?;
+                go_tx.send(()).expect("B waits for the signal");
+                // B holds no lock, so its answer lands inside the capture.
+                done_rx
+                    .recv_timeout(RACE_WAIT)
+                    .expect("B's work needs no lock, so it answers inside")
+                    .expect("B's allocation and module load inside the capture");
+                Ok(())
+            })
+            .expect("the capture with an allocation and a module load under it");
+        assert_eq!(
+            graph.node_count(),
+            2,
+            "the capture recorded what the body enqueued"
+        );
+        end_tx.send(()).expect("B drops after the capture");
+        b.join().expect("B does not panic");
+        step.assert_replays(
+            &gpu,
+            &eager,
+            "a capture raced by an allocation and a module load",
+        );
     }
 }

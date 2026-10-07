@@ -610,9 +610,12 @@ impl Drop for Shadows {
         // stream order: the context finishes that work before `host` frees
         // it. The body's drop has stopped the residency machine first, so no
         // copy waits on a staging word here ([`Hybrid::stop_swap`]). A drop
-        // returns no error: a failed synchronize is named on stderr.
+        // returns no error: a failed synchronize is named on stderr. The
+        // synchronize runs under the device's capture lock
+        // ([`bloomery_gpu::capsync::ctx_sync_in_drop`], which a drop path
+        // calls because it must not panic).
         let ctx = self.host.context();
-        if let Err(e) = ctx.synchronize() {
+        if let Err(e) = bloomery_gpu::capsync::ctx_sync_in_drop(ctx, "deepseek41 Body drop") {
             eprintln!(
                 "deepseek41 Body drop: the context did not synchronize before the ring shadows \
                  ({} B) were freed: {e}",

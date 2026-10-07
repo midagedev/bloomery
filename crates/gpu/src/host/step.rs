@@ -1301,7 +1301,6 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
 #[cfg(test)]
 mod tests {
     use super::{Boundary, BoundaryShape, CHAINS, Chain, Closed, GapSummary, gap_span};
-    use cuda_core::CudaContext;
     use model::ops::DEFER_MAX_COLS;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1423,8 +1422,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_boundary_gives_back_its_context_handles() {
-        let ctx = CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.new_stream().expect("a stream");
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let shape = BoundaryShape {
             hidden: 256,
             n_used: 6,
