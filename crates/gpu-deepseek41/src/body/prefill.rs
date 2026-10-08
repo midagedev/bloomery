@@ -2807,23 +2807,12 @@ impl<'a> GroupCx<'a> {
         };
         self.ffn
             .enqueue_batch_shadow_chunks(gpu, bl, card, &mut batch.ffn, &block)?;
-        let n_expert = self.hybrid.slots().n_expert();
-        let counts = &mut batch.stream.counts;
-        counts.clear();
-        counts.resize(n_expert, 0);
-        for &id in self.hybrid.routed_ids(m.key(l, r.at))? {
-            let c = usize::try_from(id)
-                .ok()
-                .and_then(|id| counts.get_mut(id))
-                .ok_or_else(|| GpuError::Shape {
-                    what: WHAT,
-                    detail: format!("layer {l}: a routed id {id} of {n_expert} experts"),
-                })?;
-            *c += 1;
-        }
-        let pick = self
-            .hybrid
-            .call_pick(gpu.stream(), l, &batch.stream.counts, usize::MAX)?;
+        let pick = self.hybrid.call_pick_routed(
+            gpu.stream(),
+            m.key(l, r.at),
+            &mut batch.stream.counts,
+            usize::MAX,
+        )?;
         batch.stream.picks.push((batch.stream.group, pick));
         self.ffn
             .enqueue_batch_replace(gpu, bl, &mut batch.ffn, &block, self.slots)?;
