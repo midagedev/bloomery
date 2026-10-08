@@ -2,7 +2,10 @@
 //!
 //! Endpoints: `POST /v1/chat/completions`, `POST /v1/messages` and
 //! `POST /v1/messages/count_tokens` (Anthropic's Messages API on the chat
-//! path), `POST /completion`, `POST /tokenize`,
+//! path), `POST /completion`, `POST /v1/completions` (OpenAI's text
+//! completion shape on the completion path), `POST /chat/completions/input_tokens`
+//! and `POST /v1/chat/completions/input_tokens` (the chat prompt's id count),
+//! `POST /tokenize`,
 //! `POST /detokenize`, `POST /apply-template`, `GET /v1/models`, `GET /health`,
 //! `GET /props`, `GET /slots`, `POST /slots/{id}?action=save|restore|erase`,
 //! `GET /metrics`, `POST /residency/reset` and `POST /shutdown` (bloomery's

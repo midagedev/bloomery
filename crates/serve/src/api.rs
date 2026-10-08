@@ -80,6 +80,10 @@ use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 /// own steps.
 #[path = "anthropic.rs"]
 mod anthropic;
+/// OpenAI's text completion API and the chat token counts, a child of this
+/// module so they run the completion and chat paths' own steps.
+#[path = "oaicompl.rs"]
+mod oaicompl;
 /// OpenAI's Responses API, a child of this module so it runs the chat path's
 /// own steps.
 #[path = "responses.rs"]
@@ -1074,7 +1078,11 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", "/residency/reset") => return residency_reset(state, req, w),
         ("POST", "/shutdown") => return post_shutdown(state, req, w),
         ("POST", "/completion" | "/completions") => return completion(state, req, w),
+        ("POST", "/v1/completions") => return oaicompl::completions(state, req, w),
         ("POST", "/v1/chat/completions" | "/chat/completions") => return chat(state, req, w),
+        ("POST", "/v1/chat/completions/input_tokens" | "/chat/completions/input_tokens") => {
+            return oaicompl::count_tokens(state, req, w);
+        }
         ("POST", "/v1/messages") => return anthropic::messages(state, req, w),
         ("POST", "/v1/messages/count_tokens") => return anthropic::count_tokens(state, req, w),
         ("POST", "/v1/responses" | "/responses") => return responses::create(state, req, w),
