@@ -1810,11 +1810,16 @@ struct Rendered {
 /// becomes one text: on an engine that takes images, its parts flattened by
 /// the model's rule ([`media::flatten`]), each image the model's placeholder;
 /// on one that takes none, its text parts joined, any other part refused by
-/// name ([`content_text`]). Nothing is dropped.
+/// name ([`content_text`]). Nothing is dropped. A `developer` message reaches
+/// the template as `system`, as llama-server maps it, and the thinking vars
+/// ([`thinking_vars`]) reach it in llama-server's order.
 fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiError> {
     let Some(Value::Array(msgs)) = b.get("messages") else {
         return Err(invalid("'messages' is required and must be an array"));
     };
+    // GPT-OSS's template is the one that renders the `developer` role itself,
+    // named by the `<|channel|>` marker in its source.
+    let gpt_oss = state.template.source().contains("<|channel|>");
     let mut messages = Vec::with_capacity(msgs.len());
     let mut images = Vec::new();
     for m in msgs {
@@ -1824,7 +1829,18 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         let Some(role) = m.get("role").and_then(Value::as_str) else {
             return Err(invalid("each message needs a string 'role'"));
         };
+        // llama-server maps `developer` to `system` before the template: a
+        // template without a branch for the role drops the message, and
+        // OpenAI clients send one every turn. The mapped role is what the
+        // content flattening and the template both see, as there the mapping
+        // also runs before anything reads a role.
+        let role = if role == "developer" && !gpt_oss {
+            "system"
+        } else {
+            role
+        };
         let mut flat = m.clone();
+        flat.insert("role".into(), Value::String(role.to_owned()));
         if let Some(Value::Array(parts)) = m.get("content") {
             let text = match &state.media {
                 None => content_text(parts)?,
@@ -1852,14 +1868,10 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         "eos_token".into(),
         Value::String(state.info.eos_text.clone()),
     );
-    for key in ["tools", "reasoning_effort"] {
-        if let Some(v) = b.get(key).filter(|v| !v.is_null()) {
-            vars.insert(key.into(), v.clone());
-        }
+    if let Some(v) = b.get("tools").filter(|v| !v.is_null()) {
+        vars.insert("tools".into(), v.clone());
     }
-    if let Some(Value::Object(kw)) = b.get("chat_template_kwargs") {
-        vars.extend(kw.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
+    thinking_vars(b, &mut vars)?;
     let text = state.template.render(&vars).map_err(|e| ApiError {
         retry_after: false,
         code: 500,
@@ -1867,6 +1879,56 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         message: e.to_string(),
     })?;
     Ok(Rendered { text, images })
+}
+
+/// The thinking vars a chat body carries, in llama-server's order: the kwargs
+/// `enable_thinking` first — a bool sets it, a string is a 400 naming it —
+/// then the OpenAI `reasoning_effort`, whose `"none"` turns thinking off and
+/// does not reach the template as itself (a kwargs `reasoning_effort` is
+/// erased with it). The resolved `enable_thinking` replaces the kwargs entry,
+/// as llama-server's template application writes the resolved value over it,
+/// so `"none"` wins over a kwargs `true`. It lands in `vars` only when
+/// something asked: a template that tells an undefined `enable_thinking` from
+/// `true` (V4.1's takes its `thinking` from it) keeps its own default when
+/// nothing did.
+fn thinking_vars(b: &Map<String, Value>, vars: &mut Map<String, Value>) -> Result<(), ApiError> {
+    let kwargs = b.get("chat_template_kwargs").and_then(Value::as_object);
+    let mut thinking: Option<bool> = None;
+    if let Some(kw) = kwargs {
+        match kw.get("enable_thinking") {
+            Some(Value::Bool(on)) => thinking = Some(*on),
+            Some(Value::String(_)) => {
+                return Err(invalid(
+                    "invalid type for \"enable_thinking\" (expected boolean, got string)",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let effort = b.get("reasoning_effort").filter(|v| !v.is_null());
+    let off = effort.and_then(Value::as_str) == Some("none");
+    if off {
+        thinking = Some(false);
+    } else if let Some(v) = effort {
+        vars.insert("reasoning_effort".into(), v.clone());
+    }
+    if let Some(on) = thinking {
+        vars.insert("enable_thinking".into(), Value::Bool(on));
+    }
+    if let Some(kw) = kwargs {
+        // The resolved bool replaces a kwargs `enable_thinking`; any other
+        // value of it passes through as it came, as llama-server's resolution
+        // leaves it alone.
+        vars.extend(
+            kw.iter()
+                .filter(|(k, _)| {
+                    !(thinking.is_some() && k.as_str() == "enable_thinking")
+                        && !(off && k.as_str() == "reasoning_effort")
+                })
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+    }
+    Ok(())
 }
 
 /// The text of an array `content` on an engine that takes no images: its text
@@ -3490,5 +3552,274 @@ mod tests {
                 "the loop left at the first check after its call"
             );
         }
+    }
+
+    // -------------------------------------------------- chat template rendering
+
+    /// The mock configuration serving `template`'s source.
+    fn templated(template: &str) -> super::ServerConfig {
+        super::ServerConfig {
+            chat_template: template.to_owned(),
+            ..super::testserve::mock_config()
+        }
+    }
+
+    /// `/apply-template`'s status and body for `body`.
+    fn applied(addr: SocketAddr, body: &Value) -> (u16, String) {
+        roundtrip(addr, "POST", "/apply-template", &body.to_string())
+    }
+
+    /// The `prompt` an `/apply-template` answer carries.
+    fn applied_prompt(body: &str) -> String {
+        serde_json::from_str::<Value>(body).expect("the answer is JSON")["prompt"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// A `developer` message renders exactly as the same message with its
+    /// role set to `system`, on every fixture template: llama-server's
+    /// mapping, which every template but GPT-OSS's gets. Each template
+    /// renders the system message — none drops or refuses it — so the mapped
+    /// role lands in the prompt's text.
+    #[test]
+    fn developer_messages_render_as_system_on_every_fixture_template() {
+        let fixtures = [
+            (
+                "qwen38",
+                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
+            ),
+            (
+                "v41",
+                include_str!("../tests/fixtures/v41-chat-template.jinja"),
+            ),
+            (
+                "glm5",
+                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
+            ),
+            (
+                "qwen3",
+                include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
+            ),
+            (
+                "qwen36",
+                include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
+            ),
+        ];
+        for (name, template) in fixtures {
+            let (addr, _state, _ended) =
+                super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(template));
+            let with_role = |role: &str| {
+                json!({
+                    "messages": [
+                        { "role": role, "content": "You are terse." },
+                        { "role": "user", "content": "Hi" },
+                    ]
+                })
+            };
+            let (status, developer) = applied(addr, &with_role("developer"));
+            assert_eq!(status, 200, "{name}: {developer}");
+            let (status, system) = applied(addr, &with_role("system"));
+            assert_eq!(status, 200, "{name}: {system}");
+            assert_eq!(developer, system, "{name}: developer renders as system");
+            let prompt = applied_prompt(&developer);
+            assert!(
+                prompt.contains("You are terse."),
+                "{name}: the system message renders: {prompt}"
+            );
+        }
+    }
+
+    /// A template whose source carries `<|channel|>` — GPT-OSS's marker —
+    /// keeps the `developer` role: the mapping is every template's but its.
+    #[test]
+    fn a_channel_template_keeps_the_developer_role() {
+        let template = concat!(
+            "{%- for m in messages %}",
+            "{%- if m.role == 'developer' %}{{- '<|channel|>developer|>' ~ m.content }}",
+            "{%- elif m.role == 'system' %}{{- 'system|' ~ m.content }}",
+            "{%- else %}{{- m.role ~ '|' ~ m.content }}",
+            "{%- endif %}",
+            "{%- endfor %}",
+        );
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(template));
+        let with_role = |role: &str| {
+            json!({
+                "messages": [
+                    { "role": role, "content": "You are terse." },
+                    { "role": "user", "content": "Hi" },
+                ]
+            })
+        };
+        let (status, developer) = applied(addr, &with_role("developer"));
+        assert_eq!(status, 200, "{developer}");
+        assert_eq!(
+            applied_prompt(&developer),
+            "<|channel|>developer|>You are terse.user|Hi"
+        );
+        let (status, system) = applied(addr, &with_role("system"));
+        assert_eq!(status, 200, "{system}");
+        assert_eq!(applied_prompt(&system), "system|You are terse.user|Hi");
+    }
+
+    /// `reasoning_effort: "none"` on Qwen3.8's template turns thinking off:
+    /// it renders as `chat_template_kwargs: {"enable_thinking": false}` does
+    /// — the prompt ends with the closed empty span — it wins over a kwargs
+    /// `enable_thinking: true`, and it erases a kwargs `reasoning_effort`.
+    /// Another effort reaches the template as today, in its own words.
+    #[test]
+    fn reasoning_effort_none_turns_thinking_off_on_qwen38() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(include_str!("../tests/fixtures/qwen38-chat-template.jinja")),
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let (status, off) = applied(
+            addr,
+            &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": false } }),
+        );
+        assert_eq!(status, 200, "{off}");
+        for body in [
+            json!({ "messages": messages(), "reasoning_effort": "none" }),
+            json!({
+                "messages": messages(),
+                "reasoning_effort": "none",
+                "chat_template_kwargs": { "enable_thinking": true },
+            }),
+            json!({
+                "messages": messages(),
+                "reasoning_effort": "none",
+                "chat_template_kwargs": { "reasoning_effort": "high" },
+            }),
+        ] {
+            let (status, prompt) = applied(addr, &body);
+            assert_eq!(status, 200, "{prompt}");
+            assert_eq!(prompt, off, "none turns thinking off");
+            let p = applied_prompt(&prompt);
+            assert!(
+                p.ends_with("<think>\n\n</think>\n\n"),
+                "the span is closed: {p}"
+            );
+        }
+        let (status, high) = applied(
+            addr,
+            &json!({ "messages": messages(), "reasoning_effort": "high" }),
+        );
+        assert_eq!(status, 200, "{high}");
+        let p = applied_prompt(&high);
+        assert!(
+            p.contains("Reasoning effort is set to xhigh."),
+            "another effort reaches the template: {p}"
+        );
+        assert!(p.ends_with("<think>\n"), "its span stays open: {p}");
+    }
+
+    /// `reasoning_effort: "none"` on GLM-5's template renders as
+    /// `chat_template_kwargs: {"enable_thinking": false}` does: no
+    /// `reasoning_effort` reaches the template (its effort header keeps its
+    /// default; it reads `reasoning_effort`, not `enable_thinking`), and
+    /// another effort still reaches it.
+    #[test]
+    fn reasoning_effort_none_turns_thinking_off_on_glm5() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(include_str!("../tests/fixtures/glm5-chat-template.jinja")),
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let (status, off) = applied(
+            addr,
+            &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": false } }),
+        );
+        assert_eq!(status, 200, "{off}");
+        let (status, none) = applied(
+            addr,
+            &json!({ "messages": messages(), "reasoning_effort": "none" }),
+        );
+        assert_eq!(status, 200, "{none}");
+        assert_eq!(none, off, "none turns thinking off");
+        let (status, high) = applied(
+            addr,
+            &json!({ "messages": messages(), "reasoning_effort": "high" }),
+        );
+        assert_eq!(status, 200, "{high}");
+        assert_eq!(
+            applied_prompt(&high),
+            "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>"
+        );
+    }
+
+    /// `chat_template_kwargs.enable_thinking` as a string is a 400 naming it,
+    /// llama-server's refusal for a quoted bool; a bool reaches the template
+    /// as today.
+    #[test]
+    fn a_string_enable_thinking_kwarg_is_refused_by_name() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let (status, body) = applied(
+            addr,
+            &json!({
+                "messages": messages(),
+                "chat_template_kwargs": { "enable_thinking": "false" },
+            }),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body.contains("enable_thinking"),
+            "the 400 names the field: {body}"
+        );
+        for on in [true, false] {
+            let (status, body) = applied(
+                addr,
+                &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": on } }),
+            );
+            assert_eq!(status, 200, "{body}");
+        }
+    }
+
+    /// With thinking off the whole output is `content`: the template closed
+    /// the span in the prompt (`reasoning_effort: "none"`), so the output
+    /// parser starts outside it and the think budget holds nothing. The same
+    /// request without it opens the span, and the whole output is
+    /// `reasoning_content`.
+    #[test]
+    fn thinking_off_puts_the_whole_output_in_content() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(4096)),
+            templated(include_str!("../tests/fixtures/qwen38-chat-template.jinja")),
+        );
+        let message = |effort: &str| {
+            let body = format!(
+                "{{\"messages\":[{{\"role\":\"user\",\"content\":\"Hi\"}}],\
+                 \"temperature\":0,\"max_tokens\":4,\"reasoning_budget\":2{effort}}}"
+            );
+            let (status, text) = roundtrip(addr, "POST", "/v1/chat/completions", &body);
+            assert_eq!(status, 200, "{text}");
+            serde_json::from_str::<Value>(&text).expect("JSON")["choices"][0]["message"].clone()
+        };
+        let on = message("");
+        assert!(
+            on["reasoning_content"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "thinking on: the output is reasoning: {on}"
+        );
+        assert_eq!(
+            on["content"].as_str(),
+            Some(""),
+            "thinking on: no content: {on}"
+        );
+        let off = message(",\"reasoning_effort\":\"none\"");
+        assert!(
+            off.get("reasoning_content").is_none(),
+            "thinking off: no reasoning: {off}"
+        );
+        assert!(
+            off["content"].as_str().is_some_and(|s| !s.is_empty()),
+            "thinking off: the whole output is content: {off}"
+        );
     }
 }

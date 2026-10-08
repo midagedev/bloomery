@@ -20,6 +20,13 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **`reasoning_budget`**, per request on `/v1/chat/completions` and `/completion`: llama-server's
   `--reasoning-budget` — the think span's budget in generated ids taken while the span is open, `0` closing it at
   once, `-1` or absent unrestricted, and silently ignored when the template already closed the span.
+- **`developer` messages** reach the chat template as `system`, the mapping llama-server applies before it — every
+  template but GPT-OSS's, whose `<|channel|>` marker in the template source keeps the role. A template with no
+  branch for the role would drop the message, and OpenAI clients send one every turn.
+- **`reasoning_effort: "none"`** turns thinking off before the template, as llama-server does: the template reads
+  `enable_thinking: false` (`chat_template_kwargs` sets it too — a bool, a quoted string is a 400 naming it, and
+  `"none"` wins over a kwargs `true`), no `reasoning_effort` reaches the template, and the whole output lands in
+  `content`.
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`.
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
