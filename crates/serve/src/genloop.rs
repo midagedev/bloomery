@@ -28,6 +28,15 @@
 //! logits row every token, which a pass does not give, so it takes one
 //! [`Engine::next`] a token and carries no draft counts.
 //!
+//! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
+//! row every token too, so it also takes one [`Engine::next`] a token, greedy
+//! or not: each row is read before the loop bans an id in it, and each taken
+//! id's value goes to the request's log with the text it released
+//! ([`crate::api::logprobs`]). Its stream sends one event a token, the text possibly
+//! empty, and the end of generation's own; a request that asks for nothing
+//! meets one check of its fixed `None` where a row is read and one where a
+//! token's text goes out.
+//!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
 //! next step a row of one [`Engine::step_slots`], its next drafted pass a row
@@ -47,6 +56,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+use crate::api::logprobs::{Ask, Collector, RowError};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams,
     Saved, SlotPass, SlotRow, StateError, Tokenizer,
@@ -56,7 +66,7 @@ use crate::promptcache::PromptCache;
 use crate::reasoning::{THINK_CLOSE, ThinkEntry, ThinkSplit};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
-use crate::stop::StopScan;
+use crate::stop::{Pushed, StopScan};
 
 /// Request knobs after parsing, llama-server defaults filled in.
 #[derive(Clone, Debug)]
@@ -83,6 +93,10 @@ pub(crate) struct GenParams {
     /// ids before a model-opened span spends nothing, and its close ids are
     /// not forced until the span opens.
     pub think_entry: ThinkEntry,
+    /// The probabilities the request asked for and the log its generation
+    /// writes them to; `None` asks for none. Only the routes that render them
+    /// set it.
+    pub logprobs: Option<Ask>,
 }
 
 /// llama-server's `timings` object, as the server clocked it.
@@ -211,6 +225,11 @@ pub(crate) enum GenError {
     /// logit the loop had set to -inf: a sampler defect, not the engine's.
     #[error("ignore_eos: the sampler chose end-of-generation id {0}, whose logit is -inf")]
     Banned(u32),
+    /// The row a generated token was taken from has no distribution (a NaN,
+    /// a +inf, no finite logit) for the probabilities the request asked for.
+    /// It ends the request, wherever in the generation it is met.
+    #[error("the probabilities of generated token {token}: {error}")]
+    Logprobs { token: usize, error: RowError },
 }
 
 pub(crate) fn ms_since(t: Instant) -> f64 {
@@ -266,11 +285,16 @@ fn choose(
 }
 
 /// Whether a request takes its tokens after the first through the engine's
-/// passes when the engine drafts: one that bans no id, greedy
-/// ([`Engine::advance`]) or sampling on an engine that drafts sampled
-/// requests ([`Engine::advance_sampled`]).
-fn takes_passes(sampler: Option<&Sampler>, banned: &[u32], engine: &dyn Engine) -> bool {
-    banned.is_empty() && (sampler.is_none() || engine.drafts_sampled())
+/// passes when the engine drafts: one that bans no id and asks for no
+/// probabilities (`asks`), greedy ([`Engine::advance`]) or sampling on an
+/// engine that drafts sampled requests ([`Engine::advance_sampled`]).
+fn takes_passes(
+    sampler: Option<&Sampler>,
+    banned: &[u32],
+    asks: bool,
+    engine: &dyn Engine,
+) -> bool {
+    banned.is_empty() && !asks && (sampler.is_none() || engine.drafts_sampled())
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -1157,9 +1181,9 @@ impl Think {
 /// thread can step several slots' generations in one engine call. `ids` is
 /// non-empty and shorter than the context. [`Gen::timings`] are filled even
 /// when the sink failed midway (the caller's counters still see the work
-/// done). A greedy request never asks the engine for its logits, and takes its
-/// tokens after the first through the engine's passes. `tick` sees the timings
-/// after every generated token.
+/// done). A greedy request that asks for no probabilities never asks the
+/// engine for its logits, and takes its tokens after the first through the
+/// engine's passes. `tick` sees the timings after every generated token.
 pub(crate) struct Gen {
     n: usize,
     ctx_max: usize,
@@ -1199,6 +1223,9 @@ pub(crate) struct Gen {
     /// The think-span budget, `None` on a request without one (or whose prompt
     /// closed the span) and once the span closed.
     think: Option<Think>,
+    /// What reads each row and writes the request's probabilities, `None` on
+    /// a request that asks for none.
+    probs: Option<Collector>,
 }
 
 impl Gen {
@@ -1215,16 +1242,23 @@ impl Gen {
         } else {
             Vec::new()
         };
-        // A greedy request reads the logits only to step past a banned argmax.
+        let probs = p.logprobs.as_ref().map(Ask::collector);
+        // A greedy request reads the logits only to step past a banned argmax
+        // or for the probabilities it asked for.
         let logits = vec![
             0.0f32;
-            if sampler.is_some() || !banned.is_empty() {
+            if sampler.is_some() || !banned.is_empty() || probs.is_some() {
                 slot.vocab.n_vocab()
             } else {
                 0
             }
         ];
-        let rows = if takes_passes(sampler.as_ref(), &banned, slot.engine.as_ref()) {
+        let rows = if takes_passes(
+            sampler.as_ref(),
+            &banned,
+            probs.is_some(),
+            slot.engine.as_ref(),
+        ) {
             slot.engine.advance_rows()
         } else {
             1
@@ -1254,6 +1288,7 @@ impl Gen {
             think: p
                 .reasoning_budget
                 .map(|left| Think::new(p.think_entry, left, slot.vocab.encode(THINK_CLOSE))),
+            probs,
         }
     }
 
@@ -1274,8 +1309,13 @@ impl Gen {
 
     /// The id the loop takes for an engine answer `g`: the next forced close id
     /// while one is queued (the engine's answer is discarded — the loop never
-    /// commits it, so nothing desyncs), else the sampled or greedy choice.
+    /// commits it, so nothing desyncs), else the sampled or greedy choice. A
+    /// request that asks for probabilities reads the row first, as the engine
+    /// wrote it, before a banned id's logit is set to -inf.
     fn answer(&mut self, g: u32) -> u32 {
+        if let Some(c) = self.probs.as_mut() {
+            c.read(&self.logits);
+        }
         if let Some(id) = self.think.as_mut().and_then(Think::next_forced) {
             return id;
         }
@@ -1364,7 +1404,12 @@ impl Gen {
         }
         // A request that passes has its first token from the prompt's step:
         // the passes make at most the rest.
-        let passes = takes_passes(self.sampler.as_ref(), &self.banned, slot.engine.as_ref());
+        let passes = takes_passes(
+            self.sampler.as_ref(),
+            &self.banned,
+            self.probs.is_some(),
+            slot.engine.as_ref(),
+        );
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
             Ok(n) if passes => Some(n.saturating_sub(1)),
             Err(_) if passes => None,
@@ -1524,7 +1569,27 @@ impl Gen {
                 break;
             }
             let piece = self.dec.push(tok);
-            if let Some(piece) = &piece {
+            // The token's text out. A request that asks for probabilities
+            // sends an event a token, its value written first, the text
+            // possibly empty; any other sends text alone, when there is some.
+            if let Some(c) = self.probs.as_mut() {
+                let pushed = match &piece {
+                    Some(piece) => self.scan.push(piece),
+                    None => Pushed {
+                        send: String::new(),
+                        stopped: None,
+                    },
+                };
+                let token = self.generated.len() - 1;
+                c.take(tok, &self.logits, &pushed.send)
+                    .map_err(|error| GenError::Logprobs { token, error })?;
+                sink(Event::Text(&pushed.send, &self.tim))?;
+                if let Some(w) = pushed.stopped {
+                    self.stop = StopKind::Word;
+                    self.stopping_word = w;
+                    break;
+                }
+            } else if let Some(piece) = &piece {
                 let pushed = self.scan.push(piece);
                 if !pushed.send.is_empty() {
                     sink(Event::Text(&pushed.send, &self.tim))?;
@@ -1630,24 +1695,42 @@ impl Gen {
         Ok(())
     }
 
-    /// The text still held, and the outcome.
+    /// The text still held, and the outcome. On a request that asks for
+    /// probabilities, a generation that ended on an end-of-generation id
+    /// writes that id's value here, with the held text as what it released,
+    /// and sends it in an event of its own.
     pub(crate) fn finish(
         &mut self,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<Outcome, GenError> {
+        let mut rest = String::new();
         if self.stop != StopKind::Word {
             let tail = self.dec.flush();
             let pushed = self.scan.push(&tail);
-            let mut rest = pushed.send;
+            rest = pushed.send;
             if let Some(w) = pushed.stopped {
                 self.stop = StopKind::Word;
                 self.stopping_word = w;
             } else {
                 rest.push_str(&self.scan.finish());
             }
-            if !rest.is_empty() {
-                sink(Event::Text(&rest, &self.tim))?;
-            }
+        }
+        // `pump` takes the end-of-generation id without its text out: the one
+        // generated id that can still lack its value here.
+        let valued = match self.probs.as_mut() {
+            Some(c) => match self.generated.get(c.taken()) {
+                Some(&eog) => {
+                    let token = c.taken();
+                    c.take(eog, &self.logits, &rest)
+                        .map_err(|error| GenError::Logprobs { token, error })?;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if valued || !rest.is_empty() {
+            sink(Event::Text(&rest, &self.tim))?;
         }
         self.tim.predicted_ms = ms_since(self.t1);
         Ok(Outcome {
@@ -1763,6 +1846,7 @@ mod cache_tests {
     use std::time::Duration;
 
     use super::{GenParams, Outcome, Slot, Timings, generate};
+    use crate::api::logprobs::Ask;
     use crate::engine::{
         CacheNote, Decoder, Engine, EngineError, SamplingParams, Saved, StateError, Tokenizer,
     };
@@ -1996,6 +2080,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            logprobs: None,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -2121,6 +2206,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            logprobs: None,
         };
         let mut tim = Timings::default();
         let r = generate(
@@ -2220,6 +2306,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            logprobs: None,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -2234,6 +2321,43 @@ mod cache_tests {
         )
         .expect("a generation");
         assert_eq!(log.lock().expect("log").replies, [Some(7), Some(0)]);
+    }
+
+    /// A greedy request that asks for probabilities takes no pass (each of
+    /// its rows is a step's), so it tells the engine none of its reply comes
+    /// from one.
+    #[test]
+    fn an_asking_request_tells_the_engine_it_takes_no_pass() {
+        let (mut slot, log) = Probe::slot(0, false);
+        let p = GenParams {
+            n_predict: 8,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Vec::new(),
+            ignore_eos: false,
+            stream: false,
+            timings_per_token: false,
+            return_progress: false,
+            include_usage: false,
+            cache_prompt: true,
+            reasoning_budget: None,
+            think_entry: ThinkEntry::Closed,
+            logprobs: Some(Ask::new(2, MockTokenizer.n_vocab())),
+        };
+        let mut tim = Timings::default();
+        generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &enc("<｜User｜>the cat sat on the mat and the "),
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut tim,
+        )
+        .expect("a generation");
+        assert_eq!(log.lock().expect("log").replies, [Some(0)]);
     }
 
     /// One request ([`run`]) and what it cost the engine in states: the
@@ -2387,6 +2511,7 @@ mod media_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            logprobs: None,
         };
         let factory = sampling::reference_factory();
         let mut g = Gen::new(slot, &factory, p.held.len(), &params);
@@ -2689,6 +2814,7 @@ mod think_tests {
             cache_prompt: true,
             reasoning_budget: budget,
             think_entry: ThinkEntry::of_prompt(prompt),
+            logprobs: None,
         };
         let mut tim = Timings::default();
         let o = generate(
@@ -2890,6 +3016,7 @@ mod sampled_tests {
                 cache_prompt: true,
                 reasoning_budget: None,
                 think_entry: ThinkEntry::Closed,
+                logprobs: None,
             };
             let mut tim = Timings::default();
             generate(

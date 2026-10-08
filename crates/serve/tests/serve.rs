@@ -214,7 +214,11 @@ fn hw_errors_are_openai_objects() {
         "invalid_request_error",
     );
     check(
-        post(addr, "/completion", &json!({"prompt": "ab", "n_probs": 3})),
+        post(
+            addr,
+            "/completion",
+            &json!({"prompt": "ab", "n_probs": 101}),
+        ),
         400,
         "invalid_request_error",
     );
@@ -428,7 +432,7 @@ fn hw_unsupported_fields_are_refused() {
         ("response_format", json!({"type": "json_object"})),
         ("json_schema", json!({"type": "object"})),
         ("grammar", json!("root ::= \"a\"")),
-        ("logprobs", json!(true)),
+        ("logprobs", json!(5)),
         ("top_logprobs", json!(2)),
         ("n", json!(2)),
         ("tool_choice", json!("required")),
@@ -453,7 +457,7 @@ fn hw_unsupported_fields_are_refused() {
         ("json_schema", Value::Null),
         ("grammar", json!("")),
         ("logprobs", json!(false)),
-        ("top_logprobs", json!(0)),
+        ("top_logprobs", Value::Null),
         ("n", json!(1)),
         ("tools", json!([])),
         (
