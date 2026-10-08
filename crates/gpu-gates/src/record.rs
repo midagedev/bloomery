@@ -2739,6 +2739,7 @@ pub static TAPS_DUMP: Kind = Kind {
 
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
+    &PLACE_UNSET,
     &PLAN,
     &CALL_PLAN,
     &CALL_GROUPS,
@@ -2795,6 +2796,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
 
 /// What `bloomery-chat` prints, all on stderr.
 pub static BLOOMERY_CHAT: &[&Kind] = &[
+    &PLACE_UNSET,
     &PROMPT_IDS,
     &PLAN,
     &LOAD_GENERATOR,
@@ -2811,6 +2813,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 /// What `bloomery-serve-ds41` prints, all on stderr, and the rounds of
 /// several slots a `BLOOMERY_STEP_STATS` run counts.
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
+    &PLACE_UNSET,
     &PLAN,
     &CACHE_CONFIG,
     &LOAD_GENERATOR,
@@ -2948,9 +2951,11 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 ];
 
 /// What `generate_qwen3moe` prints as records: a load's `plan` (a qwen4exp
-/// line; a placed qwen3moe or qwen35moe line names its architecture),
-/// its residency lever's word (set, before the load; unset, after the
-/// `plan`, or before the load on another family and under `--dump-taps`)
+/// line; a placed qwen3moe or qwen35moe line names its architecture), the
+/// common unset rule's `place unset` (after a set residency lever's word,
+/// before the load), its residency lever's word (set, before the load;
+/// unset, after the `plan`, or before the load on another family and under
+/// `--dump-taps`)
 /// and, drafting nothing, why after the `load` line, drafting, its head
 /// after the `load draft=mtp` line; under `--dump-taps`,
 /// after its `load` line; under `--time`, a drafted arm's passes and a
@@ -2972,6 +2977,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &STAT_PROMPT_SPLIT,
     &STAT_PROMPT_LB,
     &RESIDENCY_LEVER,
+    &PLACE_UNSET,
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,

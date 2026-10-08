@@ -16,12 +16,15 @@
 //! `PLACE` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
 //! (`generate::Place`, as `generate_ds41` takes it); a list whose stage card
 //! is not the A6000 and a list of more tier cards than the V4.1 body serves
-//! are refused by name before any plan.
+//! are refused by name before any plan. Unset it is the common rule's
+//! (`generate::Place::choose` by `place::TIER_RULE`): `a`, and a `place unset`
+//! record names the placement and why, first of the seat's records.
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! the chat template (`tokenizer.chat_template`) and the default alias
-//! (`general.name`). The `residency lever` line, then the plan line, then
-//! the `load`, host and `capture` lines of [`Generator::open`] go to stderr
+//! (`general.name`). The `place unset` record, the `residency lever` line,
+//! then the plan line, then the `load`, host and `capture` lines of
+//! [`Generator::open`] go to stderr
 //! as `generate_ds41` prints them,
 //! then `listening on http://<addr>` once the model is loaded and the port is
 //! bound (`--port 0` binds a free one). `BLOOMERY_RESIDENCY` unset resolves
@@ -194,7 +197,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
     sampler_factory,
 };
-use bloomery_gpu_gates::generate::{Place, mode_name};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, ref_model_path, residency41};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
@@ -252,6 +255,8 @@ const DRAFT_CLASS: &str = "draft";
 struct Args {
     host: String,
     port: u16,
+    /// The placement the seat runs by, resolved against this process's
+    /// devices by the common unset rule ([`place::choose`]).
     place: Place,
     ctx: usize,
     alias: Option<String>,
@@ -269,7 +274,7 @@ struct Args {
     mmproj: Option<PathBuf>,
 }
 
-fn parse_args(args: &[String]) -> Result<Args, GateError> {
+fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
@@ -283,6 +288,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         mmproj: None,
     };
     let mut park_ram = false;
+    let mut place_flag = None;
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -294,7 +300,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = number(flag, v)?,
-            "--place" => a.place = place::parse(v)?,
+            "--place" => place_flag = Some(place::parse(v)?),
             f if CTX.contains(&f) => a.ctx = number(flag, v)?,
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
@@ -319,8 +325,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 .into(),
         );
     }
-    a.place = a.place.on_host()?;
-    Ok(a)
+    let placed = place::choose(place_flag)?;
+    a.place = placed.place;
+    Ok((a, placed))
 }
 
 /// A flag's value in MiB, as bytes.
@@ -480,7 +487,8 @@ fn vision_of(a: &Args, prefill: body::PrefillMode) -> Result<(), GateError> {
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
-    let a = parse_args(args)?;
+    let (a, placed) = parse_args(args)?;
+    placed.record().eprint();
     let at = ResidencyAt {
         serving_place: a.place != Place::Gate,
         check_finite: false,

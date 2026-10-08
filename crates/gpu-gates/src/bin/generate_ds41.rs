@@ -13,9 +13,12 @@
 //!     generate_ds41 --records-schema
 //!
 //! Defaults: prompt 0 (none when `--depth` is given), N 32, C the serving
-//! context (`workstation::CTX_MAX`), place `a`, mode graph, W 0. A flag given
-//! twice takes its last value, so a recipe's default can be overridden by
-//! the arguments after it.
+//! context (`workstation::CTX_MAX`), place `a` (the common unset rule,
+//! `generate::Place::choose` by `place::TIER_RULE`: no break-even yet, so
+//! `a` on one card or two), mode graph, W 0. A flag given twice takes its
+//! last value, so a recipe's default can be overridden by the arguments
+//! after it. A `place unset` record names the placement and why, first of the
+//! run's records, `--plan` runs included.
 //!
 //! Greedy only, one token per generated step. The fed ids go in batches of
 //! up to `body::T_MAX` positions (`body::prefill`, bit for bit the steps'
@@ -330,8 +333,9 @@ mod drive {
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_deepseek41::swap;
     use bloomery_gpu_gates::generate::{
-        Diag, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table, dump_table,
-        mode_name, place_table, read_table, repeat_runs, seed_path, slot_table, write_table,
+        Diag, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
+        dump_table, mode_name, place_table, read_table, repeat_runs, seed_path, slot_table,
+        write_table,
     };
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency41};
@@ -433,6 +437,8 @@ mod drive {
         depth: Option<usize>,
         n_gen: usize,
         ctx: usize,
+        /// The placement the run loads by, resolved against this process's
+        /// devices by the common unset rule ([`place::choose`]).
         place: Place,
         mode: StepMode,
         timed: bool,
@@ -453,7 +459,7 @@ mod drive {
         dump_now: bool,
     }
 
-    fn parse_args(levers: &Levers) -> Result<Args, GateError> {
+    fn parse_args(levers: &Levers) -> Result<(Args, PlaceWhy), GateError> {
         let mut a = Args {
             prompt: Prompt::Default,
             depth: None,
@@ -472,6 +478,7 @@ mod drive {
             dump_now: false,
         };
         let (mut row, mut ids) = (None, None);
+        let mut place_flag = None;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             if flag == "--time" {
@@ -510,7 +517,7 @@ mod drive {
                 "-n" => a.n_gen = v.parse()?,
                 "--ctx" => a.ctx = v.parse()?,
                 "--warm" => a.warm = Some(v.parse()?),
-                "--place" => a.place = place::parse(&v)?,
+                "--place" => place_flag = Some(place::parse(&v)?),
                 "--mode" => {
                     a.mode = match v.as_str() {
                         "graph" => StepMode::Graph,
@@ -556,8 +563,9 @@ mod drive {
         for arm in &a.arms {
             check_counts(&a.for_arm(arm))?;
         }
-        a.place = a.place.on_host()?;
-        Ok(a)
+        let placed = place::choose(place_flag)?;
+        a.place = placed.place;
+        Ok((a, placed))
     }
 
     impl Args {
@@ -715,7 +723,8 @@ mod drive {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         record::at_main("generate_ds41", record::GENERATE_DS41);
-        let a = parse_args(&levers)?;
+        let (a, placed) = parse_args(&levers)?;
+        placed.record().print();
         let draft = Draft::from_levers(&levers)?;
         let width = WidthMode::of(levers.mtp_width())?;
         if draft == Draft::Off && levers.mtp_width().is_some() {

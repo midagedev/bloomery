@@ -64,7 +64,12 @@
 //! the A6000 as under `a` with the 3090 as its expert tier
 //! (`place::machine_bp`, the tier's experts printed as the `plan` line's
 //! `tier=` and `tier_experts=`; the tier serves the decode walks and the
-//! ubatch walk, not the pass) — and printed as a `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
+//! ubatch walk, not the pass) — and printed as a `plan` line. A `place unset`
+//! record, first of the run's records after a set residency lever's, names
+//! the placement and why: the common rule's
+//! (`generate::Place::choose` by `q38place::Q38_RULE`), so unset is `a` (no
+//! break-even yet) and a card list that is none of `a`, `gate` and `bp` is
+//! refused by name. Its `--prefill` is `auto` (the default: `gemm` for a prompt
 //! of nine positions or more, `pass` below; `gemm` at every length under
 //! `bp`), `gemm` (ubatches of up to the
 //! load's size through the host tier's batch port at their width, the Q8_0
@@ -95,7 +100,11 @@
 //! bytes — the plan's own test of the whole file's card bytes plus its KV,
 //! context, scratch and margin against the census's free reading — and when
 //! it does not, the placed plan on that card runs instead, its `plan` line
-//! naming why (`why=whole_does_not_fit`). The placement's levers
+//! naming why (`why=whole_does_not_fit`). A `place unset` record names the
+//! placement the flag or the common rule gave (`generate::Place::choose` by
+//! `q3place::Q3_RULE`: the body serves no tier card, so unset is `a`) before
+//! the `load` line; the load itself takes the flag as given, or unset the
+//! pick above. The placement's levers
 //! (`BLOOMERY_CARD_BUDGET` and the host set's, `q3place::PLACED_LEVERS`)
 //! act on a run that names `--place`, on any file; set without it they are
 //! refused by name.
@@ -328,6 +337,10 @@ mod taps;
 mod q3place;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen38_place.rs"]
+mod q38place;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/gen_slots.rs"]
 mod gen_slots;
 
@@ -339,6 +352,7 @@ mod xstream38;
 mod cli {
     use super::gen_slots;
     use super::q3place::{self, PlaceQ3};
+    use super::q38place;
     use super::taps;
     use super::xstream38::{Stage38, xstream38};
     use app::Session;
@@ -362,7 +376,7 @@ mod cli {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
-    use bloomery_gpu_gates::{Fnv1a64, GateError, ref_model_path};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
         residency38_unset,
@@ -374,7 +388,7 @@ mod cli {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
-    use model::placement::workstation::{self, CardSpec, HostRead};
+    use model::placement::workstation::HostRead;
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
@@ -876,116 +890,84 @@ mod cli {
         .into()
     }
 
-    /// Which placement `--place` names.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Kind38 {
-        /// The stage on the largest visible card (the A6000 here, the timing
-        /// card; the default).
-        A,
-        /// The 3090, the gate card.
-        Gate,
-        /// Plan (b′): the stage as under `a`, the next-largest card its
-        /// expert tier (`place::machine_bp_on`).
-        Bp,
-    }
-
-    /// Where `--place` puts a qwen4exp plan's stage card, and its expert
-    /// tier card when it has one: the kind, and the cards its alias resolved
-    /// to on this process's devices (`workstation::resolve` of the census).
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    struct Place38 {
-        kind: Kind38,
-        stage: CardSpec,
-        tier: Option<CardSpec>,
-    }
-
-    impl Place38 {
-        fn parse(arg: Option<&str>) -> Result<Place38, GateError> {
-            let (kind, word) = match arg {
-                None | Some("a") => (Kind38::A, "a"),
-                Some("gate") => (Kind38::Gate, "gate"),
-                Some("bp") => (Kind38::Bp, "bp"),
-                Some(o) => {
+    /// `--place` on a qwen4exp file, by the common unset rule (`Place::choose`
+    /// by `q38place::Q38_RULE`) on one census reading, its `place unset`
+    /// record printed: a set word as given, `a`, `gate` or `bp` (plan (b′): the
+    /// next-largest card as the largest's expert tier; a card list spelled as
+    /// one of them is it, any other list has no Qwen3.8 plan and is refused by
+    /// name), else `a`.
+    fn place38(arg: Option<&str>) -> Result<Place, GateError> {
+        let flag = match arg {
+            None => None,
+            Some(word) => {
+                let place = Place::parse(word)?;
+                if ![Place::A, Place::Gate, Place::Bp].contains(&place) {
                     return Err(format!(
-                        "--place is a, gate or bp (plan (b′): the next-largest card as the \
-                         largest's expert tier), not {o}"
+                        "--place {word}: a qwen4exp plan is placed a, gate or bp (plan (b′): the \
+                         next-largest card as the largest's expert tier); a card list that is \
+                         none of them has no Qwen3.8 plan"
                     )
                     .into());
                 }
-            };
-            let (_, picks) = workstation::ALIASES
-                .iter()
-                .find(|(w, _)| *w == word)
-                .ok_or_else(|| format!("--place {word}: no alias of that word"))?;
-            let specs = workstation::resolve(picks, &bloomery_gpu_gates::gpu_census::census()?)
-                .map_err(|e| format!("--place {word}: {e}"))?;
-            Ok(Place38 {
-                kind,
-                stage: specs[0],
-                tier: specs.get(1).copied(),
-            })
-        }
-
-        fn name(self) -> &'static str {
-            match self.kind {
-                Kind38::A => "a",
-                Kind38::Gate => "gate",
-                Kind38::Bp => "bp",
+                Some(place)
             }
-        }
+        };
+        let chosen = q38place::choose(flag, &gpu_census::census()?)?;
+        chosen.record().print();
+        Ok(chosen.place)
+    }
 
-        /// The stage card's spec.
-        fn card(self) -> CardSpec {
-            self.stage
-        }
+    /// The placement holds an expert tier card: plan (b′).
+    fn tiered(place: Place) -> bool {
+        !place.tier_cards().is_empty()
+    }
 
-        /// The cards the placement resolved to: the stage card, then the
-        /// expert tier card when it has one.
-        fn specs(self) -> Vec<CardSpec> {
-            let mut specs = vec![self.stage];
-            specs.extend(self.tier);
-            specs
-        }
+    /// The stage card is the A6000: the placement the Qwen3.8 defaults
+    /// (residency, the MTP draft, host streaming) treat as plan (a); the gate
+    /// plan's stage is the 3090.
+    fn stage_a(place: Place) -> bool {
+        place != Place::Gate
+    }
 
-        /// The stage card is the A6000: the placement the Qwen3.8 defaults
-        /// (residency, the MTP draft, host streaming) treat as plan (a).
-        fn stage_a(self) -> bool {
-            matches!(self.kind, Kind38::A | Kind38::Bp)
+    /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
+    fn stage38(place: Place) -> Stage38 {
+        if tiered(place) {
+            Stage38::Tiered
+        } else if place == Place::Gate {
+            Stage38::Other
+        } else {
+            Stage38::A
         }
+    }
 
-        /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
-        fn stage38(self) -> Stage38 {
-            match self.kind {
-                Kind38::A => Stage38::A,
-                Kind38::Bp => Stage38::Tiered,
-                Kind38::Gate => Stage38::Other,
+    /// The machine a plan of `inputs` at ubatches of `ub` positions under
+    /// `experts` runs on, over `place`'s cards; `draft` the MTP draft's card
+    /// bytes when the draft runs beside the target, which plan (b′) reserves on
+    /// its stage card (`place::machine_bp_on`) and the one-card plans count in
+    /// `plan_mtp_with` instead.
+    fn machine38(
+        place: Place,
+        inputs: &PlanInputs,
+        ub: u64,
+        experts: Experts,
+        draft: Option<u64>,
+    ) -> Result<Machine, GateError> {
+        let layers = inputs.spec.layers.len();
+        Ok(match place.card_specs()?.as_slice() {
+            &[stage, tier] => {
+                machine_bp_on((stage, tier), layers, ub, draft, tier_batch(&inputs.hp, ub))
             }
-        }
-
-        /// The machine a plan of `inputs` at ubatches of `ub` positions
-        /// under `experts` runs on; `draft` the MTP draft's card bytes when
-        /// the draft runs beside the target, which plan (b′) reserves on its
-        /// stage card (`place::machine_bp_on`) and the one-card plans count in
-        /// `plan_mtp_with` instead.
-        fn machine(
-            self,
-            inputs: &PlanInputs,
-            ub: u64,
-            experts: Experts,
-            draft: Option<u64>,
-        ) -> Machine {
-            let layers = inputs.spec.layers.len();
-            match (self.kind, self.tier) {
-                (Kind38::Bp, Some(tier)) => machine_bp_on(
-                    (self.stage, tier),
-                    layers,
-                    ub,
-                    draft,
-                    tier_batch(&inputs.hp, ub),
-                ),
-                _ => machine_for_experts(self.card(), layers, ub, experts),
+            &[stage] => machine_for_experts(stage, layers, ub, experts),
+            cards => {
+                return Err(format!(
+                    "--place {}: a qwen4exp plan takes a stage card and at most one tier card, \
+                     not {} cards",
+                    place.name(),
+                    cards.len()
+                )
+                .into());
             }
-        }
+        })
     }
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
@@ -995,14 +977,14 @@ mod cli {
     /// card's device (`record::plan_devices`). A plan whose PLE tier is not
     /// one the reader takes is refused by name (`Plan::row_tier`).
     fn plan38_line(
-        place: Place38,
+        place: Place,
         experts: Experts,
         plan: &Plan<'_>,
         read: &HostRead,
     ) -> Result<String, GateError> {
         let r = Record::new(&record::PLAN38)
             .w("place", place.name())
-            .w("card", place.card().name)
+            .w("card", place.card_specs()?[0].name)
             .w("experts", experts_name(experts))
             .u("ctx_max", plan.ctx_max)
             .u("host_experts", plan.host.experts)
@@ -1289,7 +1271,7 @@ mod cli {
                 if let Some(d) = seed_depth {
                     return Err(no_seed38(d));
                 }
-                let place = Place38::parse(place.as_deref())?;
+                let place = place38(place.as_deref())?;
                 let (draft, off) = draft38(&levers, place, logits, &arms, ctx)?;
                 if slots > 1 && draft == Draft38::Mtp {
                     return Err(format!(
@@ -1401,7 +1383,7 @@ mod cli {
             .into());
         }
         let (place_a, prefill_step) = match chosen {
-            Chosen::Qwen38(path, place, _) => (place.stage_a(), path == Prompt38::Step),
+            Chosen::Qwen38(path, place, _) => (stage_a(place), path == Prompt38::Step),
             Chosen::Qwen3(..) | Chosen::Qwen35(..) => (false, false),
         };
         let at = Residency38At {
@@ -1571,7 +1553,7 @@ mod cli {
     /// refused by name.
     fn draft38(
         levers: &Levers,
-        place: Place38,
+        place: Place,
         logits: bool,
         arms: &[Arm],
         ctx: usize,
@@ -1597,7 +1579,7 @@ mod cli {
                     .max()
                     .unwrap_or(0);
                 let at = Draft38At {
-                    place_a: place.stage_a(),
+                    place_a: stage_a(place),
                     logits,
                     route_trace: levers.route_trace().is_some(),
                     file: &file,
@@ -1740,24 +1722,33 @@ mod cli {
     enum Chosen {
         Qwen3(PrefillPath, Option<Place>),
         Qwen35(PrefillPath, Option<Place>),
-        Qwen38(Prompt38, Place38, Draft38),
+        Qwen38(Prompt38, Place, Draft38),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
     /// (`generate::Place`), refused by name beside `--prefill gemm` — a
-    /// placed prompt runs as passes through the host tier's batch port.
+    /// placed prompt runs as passes through the host tier's batch port. The
+    /// common unset rule (`Place::choose` by `q3place::Q3_RULE`) prints its
+    /// `place unset` record, set or unset; the flag goes on as given, so an
+    /// unset one loads the census pick (`q3place::open_unplaced_qwen3`).
     fn place_q3(arg: Option<&str>, prefill: Option<&str>) -> Result<Option<Place>, GateError> {
-        let Some(word) = arg else {
-            return Ok(None);
+        let flag = match arg {
+            None => None,
+            Some(word) => {
+                if prefill == Some("gemm") {
+                    return Err(format!(
+                        "--prefill gemm beside --place {word}: a placed qwen3moe or qwen35moe \
+                         prompt runs as passes through the host tier (auto or pass)"
+                    )
+                    .into());
+                }
+                Some(Place::parse(word)?)
+            }
         };
-        if prefill == Some("gemm") {
-            return Err(format!(
-                "--prefill gemm beside --place {word}: a placed qwen3moe or qwen35moe prompt \
-                 runs as passes through the host tier (auto or pass)"
-            )
-            .into());
-        }
-        Ok(Some(Place::parse(word)?))
+        q3place::choose(flag, &gpu_census::census()?)?
+            .record()
+            .print();
+        Ok(flag)
     }
 
     /// The Qwen3-30B-A3B model of `file` — under `place` by its plan
@@ -1935,7 +1926,7 @@ mod cli {
     fn trace38(
         levers: &Levers,
         file: &Split,
-        (path, place, experts): (Prompt38, Place38, Experts),
+        (path, place, experts): (Prompt38, Place, Experts),
         chunk: Option<usize>,
         timed: bool,
     ) -> Result<Option<RouteTrace>, GateError> {
@@ -1983,8 +1974,8 @@ mod cli {
     /// `generate::card_words` of the placement's cards (the stage card, then
     /// the expert tier card; a device that is not the placement's refused by
     /// name), as a record's csv field writes them.
-    fn cards38(m: &Qwen38Model, place: Place38) -> Result<String, GateError> {
-        let specs = place.specs();
+    fn cards38(m: &Qwen38Model, place: Place) -> Result<String, GateError> {
+        let specs = place.card_specs()?;
         let planned: Vec<&str> = specs.iter().map(|s| s.name).collect();
         let tiers = m.body("generate_qwen3moe")?.hybrid().tiers();
         let words = card_words(place.name(), &planned, Some(&specs), m.gpu(), tiers)?;
@@ -2005,14 +1996,14 @@ mod cli {
         file: Split,
         levers: &Levers,
         (ctx, mode, slots): (usize, StepMode, usize),
-        (path, place, experts): (Prompt38, Place38, Experts),
+        (path, place, experts): (Prompt38, Place, Experts),
         (lever, draft_off): (Lever38<'static>, Option<&Draft38Off>),
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
-        let machine = place.machine(&inputs, u64::try_from(ub)?, experts, None);
+        let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, None)?;
         // One slot is `plan_with` itself.
         let plan = inputs.plan_with_slots(
             &machine,
@@ -2072,7 +2063,7 @@ mod cli {
         file: Split,
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
-        (path, place, experts): (Prompt38, Place38, Experts),
+        (path, place, experts): (Prompt38, Place, Experts),
         lever: Lever38<'static>,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
@@ -2091,11 +2082,12 @@ mod cli {
         })?;
         let mtp = MtpInputs::read(&draft_split, &file, &inputs, rows)?;
         let ctx_max = u64::try_from(ctx)?;
-        let reserve = match place.kind {
-            Kind38::Bp => Some(mtp.card_bytes(ctx_max)?),
-            Kind38::A | Kind38::Gate => None,
+        let reserve = if tiered(place) {
+            Some(mtp.card_bytes(ctx_max)?)
+        } else {
+            None
         };
-        let machine = place.machine(&inputs, u64::try_from(ub)?, experts, reserve);
+        let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, reserve)?;
         let plan = inputs.plan_mtp_with(
             &machine,
             ctx_max,
@@ -2194,7 +2186,7 @@ mod cli {
     fn stream38(
         m: &mut Qwen38Model,
         levers: &Levers,
-        place: Place38,
+        place: Place,
         residency: Residency,
     ) -> Result<(), GateError> {
         if levers.hoststream().is_some() {
@@ -2205,7 +2197,7 @@ mod cli {
             );
         }
         let (gpu, _, body) = m.body_parts("generate_qwen3moe")?;
-        let line = xstream38(gpu, body, levers.xstream(), place.stage38(), residency)?;
+        let line = xstream38(gpu, body, levers.xstream(), stage38(place), residency)?;
         println!("{line}");
         Ok(())
     }

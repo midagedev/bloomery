@@ -36,7 +36,7 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
@@ -118,6 +118,34 @@ pub const PLACED_LEVERS: [&str; 4] = [
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,
 ];
+
+/// The Qwen3 family's input to the common unset rule (`Place::choose`): the
+/// body serves no tier card, so an unset `--place` runs `a` on the largest
+/// card and no card file decides anything.
+pub const Q3_RULE: TierRule = TierRule {
+    tiers: 0,
+    break_even: None,
+    basis: "",
+};
+
+/// The placement a qwen3moe or qwen35moe binary's `--place` names, and why,
+/// on `census` (`Place::choose` by [`Q3_RULE`]): `flag` as given when set,
+/// else `a`, the plan never asked. An unset load still takes
+/// [`PlaceQ3::unplaced_on`]'s pick, the same card; the caller prints
+/// [`PlaceWhy::record`].
+#[allow(
+    dead_code,
+    reason = "the CLI and the qwen3 seat choose by the rule; the e2e gates include the planner without it"
+)]
+pub fn choose(flag: Option<Place>, census: &[DeviceInfo]) -> Result<PlaceWhy, GateError> {
+    Place::choose(flag, census, Q3_RULE, |p| {
+        Err(format!(
+            "--place unset: the qwen3 body serves no tier card, so no tier count for {}",
+            p.name()
+        )
+        .into())
+    })
+}
 
 /// The plan inputs of one of the two architectures; the qwen35moe ones,
 /// which carry the typed model description too, boxed.
