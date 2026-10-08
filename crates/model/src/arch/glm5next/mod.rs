@@ -11,6 +11,7 @@
 //! dialect's authority is ik_llama.cpp; the line numbers cited are its
 //! `src/llama-hparams.cpp` unless another file is named.
 
+pub mod fixture;
 pub mod host;
 pub mod hparams;
 pub mod names;
