@@ -1033,6 +1033,60 @@ fn draft38_unset_follows_the_place_and_the_file() {
     );
 }
 
+/// The unset draft's yield to the context ([`DraftYield::of`]): it fires
+/// when the drafted plan leaves a slot under the base the plain rule aims
+/// for, and only then — a draft that meets the base, or denies no position,
+/// stays on.
+///
+/// The card figures [measured, the 0.2.8 candidate on a RTX 3060 12 GB at
+/// the serving defaults, logs sih-smoke028b (draft on: fit 702, the plan's
+/// draft reserve 2,842,413,228 B) and sih-smoke028c (draft off: fit 6165)];
+/// the 3090 and A6000 rows [derived from the same logs: the per-position
+/// two-slot store bytes 2,842,413,228 / (2 · (6165 − 702)) ≈ 260,051 B and
+/// the card's dense ≈ 7.19 GB put the drafted fit at ≈ 26,200 on the 3090's
+/// 23.67 GB budget and ≈ 75,400 on the A6000's 49.28 GB — both far over the
+/// 4096 base, so the draft stays on there].
+#[test]
+fn draft_yields_to_the_context_only_under_the_base() {
+    let r = 2_842_413_228_u64;
+    // The 3060: the drafted fit under the base and under the plain fit.
+    let y = DraftYield::of(702, 6165, 4096, r).expect("the draft yields");
+    assert_eq!(
+        y,
+        DraftYield {
+            with: 702,
+            without: 6165,
+            base: 4096,
+            card_bytes: r,
+        }
+    );
+    assert_eq!(
+        y.to_string(),
+        "unset: the draft's 2842413228 B on the card leave a slot 702 positions, under the \
+         rule's base of 4096; without the draft a slot takes 6165"
+    );
+    assert_eq!(Draft38Off::Yield(y).to_string(), y.to_string());
+    // The 3090 and the A6000: the drafted fit over the base, the draft on.
+    assert!(DraftYield::of(26_200, 31_600, 4096, r).is_none(), "3090");
+    assert!(DraftYield::of(75_400, 80_700, 4096, r).is_none(), "A6000");
+    // A draft that just meets the base stays on, and one that denies no
+    // position (a serving cap that binds both rules) stays on.
+    assert!(DraftYield::of(4096, 6165, 4096, r).is_none(), "at the base");
+    assert!(DraftYield::of(2048, 2048, 4096, r).is_none(), "cap-bound");
+    // A card whose plain fit also sits under the base still yields: the
+    // draft denies positions there too.
+    let small = DraftYield::of(600, 3000, 3000, r).expect("both under the base");
+    assert_eq!(
+        small,
+        DraftYield {
+            with: 600,
+            without: 3000,
+            base: 3000,
+            card_bytes: r,
+        }
+    );
+}
+
 /// The GLM seat's levers unset: under a serving placement (`--place a` or
 /// `bp`, both `serving_place`) the NextN draft and the
 /// residency's default word; `off`, the first condition that holds named,
