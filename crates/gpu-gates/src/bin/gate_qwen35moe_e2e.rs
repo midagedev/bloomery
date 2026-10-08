@@ -38,7 +38,7 @@
 //!   ik's, and its FFN half run alone on ik's own FFN input against ik's MoE
 //!   taps; every tap's relative error over the relative distance between
 //!   the two sides' 8-bit activations of the input that reaches it
-//!   ([`quant_gap`]) within [`RATIO_BAND`]; the routed ids equal as sets
+//!   ([`quant_gap_two_sided`]) within [`RATIO_BAND`]; the routed ids equal as sets
 //!   except where ik's own margin between its eighth pick and the best
 //!   other expert lies inside our logits' measured error (counted,
 //!   printed); the decay's underflow sites (exp(g) = 0) equal.
@@ -215,11 +215,20 @@ fn main() -> std::process::ExitCode {
 mod q3place;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/e2e.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the argmax, the tap reader and the RMS-normed rows; the rest of the runner serves the GLM and Qwen3.8 gates"
+)]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/flash_grid.rs"]
 mod flash_grid;
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use super::e2e::{argmax, normed, tap};
     use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
     use bloomery_gpu::NodeInfo;
@@ -325,7 +334,6 @@ mod gate {
     const N_KV: usize = 2;
     const HEAD: usize = 256;
     const ROT: usize = 64;
-    const EPS: f64 = 1e-6;
 
     /// PIN(2026-09-27): the captured decode step's node count, derived before
     /// the chain was built: the embedding row; each delta layer's 8 mixer
@@ -374,7 +382,7 @@ mod gate {
     /// PIN(2026-09-27): the teacher-forced bound on a tap's error ratio — its
     /// relative error over the relative distance between the two sides'
     /// 8-bit activations of the input that reaches it (ours q8_1 per 128
-    /// values, ik's q8_2 per 32: [`quant_gap`]; two inputs in quadrature).
+    /// values, ik's q8_2 per 32: [`quant_gap_two_sided`]; two inputs in quadrature).
     /// Derivation, the qwen3moe gate's: to first order a linear map carries
     /// its input's relative perturbation unchanged, so a projection reads
     /// about 1; the kernels are held to their host rules bit for bit or
@@ -408,8 +416,10 @@ mod gate {
         N_ATTN * 2 * N_KV * CTX * HEAD * 2 + N_DELTA * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4
     }
 
-    /// `‖a − b‖ / ‖base‖` over the values, in f64.
-    fn rel(a: &[f32], b: &[f32], base: impl Fn(usize) -> f64) -> f64 {
+    /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
+    /// values from `base`: not `e2e::rel`, which divides by `‖b‖` and is
+    /// infinite on a length mismatch or a NaN (this one has neither guard).
+    fn rel_base(a: &[f32], b: &[f32], base: impl Fn(usize) -> f64) -> f64 {
         let (mut num, mut den) = (0.0f64, 0.0f64);
         for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
             num += (f64::from(x) - f64::from(y)).powi(2);
@@ -418,7 +428,7 @@ mod gate {
         (num / den.max(f64::MIN_POSITIVE)).sqrt()
     }
 
-    /// `rel` of our last `ik.len()` values against ik's, on ik's own norm:
+    /// `rel_base` of our last `ik.len()` values against ik's, on ik's own norm:
     /// a tap ik keeps only the output token's rows of (the last layer past
     /// its attention) meets our last rows. Infinite when ik holds more
     /// values than ours, and a NaN reads infinite, so neither passes a band.
@@ -426,7 +436,7 @@ mod gate {
         let Some(tail) = ours.len().checked_sub(ik.len()).map(|s| &ours[s..]) else {
             return f64::INFINITY;
         };
-        worse(0.0, rel(tail, ik, |i| f64::from(ik[i])))
+        worse(0.0, rel_base(tail, ik, |i| f64::from(ik[i])))
     }
 
     /// The larger of two errors, a NaN counting as infinite: `f64::max`
@@ -441,40 +451,12 @@ mod gate {
 
     /// `‖x̂_ours − x̂_ik‖ / ‖x‖` over the `k`-value rows of `x`: how far apart
     /// the two sides' 8-bit activations of the same input sit (ours q8_1 per
-    /// 128 values, ik q8_2 per 32).
-    fn quant_gap(x: &[f32], k: usize) -> f64 {
+    /// 128 values, ik q8_2 per 32). Not `e2e::quant_gap`, which is ik's q8_2
+    /// against the f32 `x` our kernels read.
+    fn quant_gap_two_sided(x: &[f32], k: usize) -> f64 {
         let o = q8_1_dequant(x, k, x.len() / k);
         let i = ik_q8_2::reconstruct(x);
-        rel(&o, &i, |j| f64::from(x[j]))
-    }
-
-    /// The RMS-normed rows of `x` (`k` values each) times `gain`, in f64
-    /// then rounded: the input a norm+quant launch quantizes, near enough
-    /// for its gap.
-    fn normed(x: &[f32], gain: &[f32], k: usize) -> Vec<f32> {
-        x.chunks(k)
-            .flat_map(|r| {
-                let ms = r.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / k as f64;
-                let s = 1.0 / (ms + EPS).sqrt();
-                r.iter()
-                    .zip(gain)
-                    .map(move |(&v, &g)| (f64::from(v) * s * f64::from(g)) as f32)
-            })
-            .collect()
-    }
-
-    /// The first index of the largest value, as the head's argmax breaks ties.
-    fn argmax(v: &[f32]) -> u32 {
-        let best = v
-            .iter()
-            .enumerate()
-            .fold(0usize, |b, (i, &x)| if x > v[b] { i } else { b });
-        best as u32
-    }
-
-    /// A set's tap `name` in its logical order.
-    fn tap(man: &RefManifest, name: &str) -> Result<Vec<f32>, GateError> {
-        Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, 0)?)?)
+        rel_base(&o, &i, |j| f64::from(x[j]))
     }
 
     /// The node a set dumps as `name`, or when that row only relabels
@@ -501,7 +483,8 @@ mod gate {
         v.len().checked_sub(n * k).map(|s| &v[s..])
     }
 
-    /// Worst ratio and its tap, over a layer's taps.
+    /// Worst ratio and its tap, over a layer's taps. Not `e2e::Worst`, whose
+    /// lines also print the gap (this gate's printed lines do not).
     #[derive(Default)]
     struct Worst {
         ratio: f64,
@@ -948,7 +931,7 @@ mod gate {
         upd: (&[f32], &[f32]),
         w: &mut Worst,
     ) -> Result<bool, GateError> {
-        let gap_y = quant_gap(&r.y, N_V * HEAD_V);
+        let gap_y = quant_gap_two_sided(&r.y, N_V * HEAD_V);
         w.add(
             "qkv_mixed",
             rel_to(&r.x, &tap(man, &format!("qkv_mixed-{l}"))?),
@@ -1105,7 +1088,7 @@ mod gate {
                 r.fa[i] * sigmoid(r.qg[t * Q_ROWS + h * 2 * HEAD + HEAD + d])
             })
             .collect();
-        let gap_g = quant_gap(&gated, N_HEAD * HEAD);
+        let gap_g = quant_gap_two_sided(&gated, N_HEAD * HEAD);
         w.add(
             "qkv_gated (host product)",
             rel_to(&gated, &tap(man, &format!("qkv_gated-{l}"))?),
@@ -1155,7 +1138,7 @@ mod gate {
         let ffn_in = last_rows(ffn_in, HIDDEN, t_n)
             .ok_or_else(|| format!("layer {l}: ik routes {t_n} rows, the input holds fewer"))?;
         let f = m.ffn_rows(l, ffn_in)?;
-        let gap = quant_gap(&normed(ffn_in, &gains.ffn_norm[l], HIDDEN), HIDDEN);
+        let gap = quant_gap_two_sided(&normed(ffn_in, &gains.ffn_norm[l], HIDDEN), HIDDEN);
         let ik_logits: Vec<f32> = (0..t_n)
             .flat_map(|t| {
                 let mut row = logits[t * n_expert..(t + 1) * n_expert].to_vec();
@@ -1285,7 +1268,7 @@ mod gate {
             let x_in = last_rows(&x_all, HIDDEN, t_n).ok_or("a layer input row is missing")?;
             load(m, l)?;
             let run = m.layer_rows(l, x_in, pos)?;
-            let gap_in = quant_gap(&normed(x_in, gains.attn(l)?, HIDDEN), HIDDEN);
+            let gap_in = quant_gap_two_sided(&normed(x_in, gains.attn(l)?, HIDDEN), HIDDEN);
             let mut w = Worst::default();
             let body_ok = match (&run.mixer, kind) {
                 (Mixer35Run::Delta(r), LayerKind35::Delta) => {
@@ -1496,7 +1479,7 @@ mod gate {
                     tap(&man, &format!("l_out-{}", l - 1))?
                 };
                 let x_in = last_rows(&x_in, HIDDEN, 1).ok_or("input")?;
-                let gap = quant_gap(&normed(x_in, &gains.attn_norm[l], HIDDEN), HIDDEN);
+                let gap = quant_gap_two_sided(&normed(x_in, &gains.attn_norm[l], HIDDEN), HIDDEN);
                 worst_state = worse(worst_state, rel_to(state, &t) / gap.max(f64::MIN_POSITIVE));
             }
             if l % 8 == 0 || l == taps.len() - 1 || e > FREE_BAND {
