@@ -12,6 +12,13 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   and llama-server tutorials apply as they are.
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
+- **The OpenAI text completion API**: `POST /v1/completions` runs the `/completion` path under OpenAI's shape —
+  `object: "text_completion"`, `choices` with `finish_reason` `stop`/`length`, `usage`, and a stream of chunks ending
+  in `data: [DONE]`. One completion a request: a `prompt` array of several prompts, `echo`, a non-empty `suffix` and
+  `best_of > 1` are refused by name, as is `logprobs`.
+- **Chat token counts**: `POST /chat/completions/input_tokens` (and its `/v1/` spelling) answers
+  `{"input_tokens": N}` with the same chat request's prompt ids — the chat template's render, an image as its span;
+  `max_tokens` is not needed.
 - **Tool calls on every generative model**: DeepSeek-V4.1-Flash (DSML), GLM-5.3-Flash (its XML), Qwen3-30B
   (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup) parse into
   `tool_calls` and `tool_use` blocks, so agent clients work against each of them.
