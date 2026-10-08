@@ -137,10 +137,11 @@
 //!   untouched: its stores, position and draft store unchanged.
 //! - (i) a pass the width chooser holds back right after the server's cut
 //!   step (the prompt call, then its last id as the seat's first step): the
-//!   held pass's step has overwritten the step's arena the anchor the cut
-//!   step recorded reads, and no walk sits between — the step store-walks
-//!   its row at once, so the pass takes the position in instead of refusing
-//!   and the drafted ids stay the plain run's.
+//!   chooser walks the draft's waiting rows first (`Draft::before_plain`,
+//!   the call its propose makes on the plain pass it returns), then the
+//!   target steps and overwrites the arena the anchor read — after the
+//!   walk — so the pass takes the position in instead of refusing and the
+//!   drafted ids stay the plain run's.
 //! - (y) two drafted sequences resident over a plan of two
 //!   (`PlanInputs::plan_mtp_with_slots`, `Body38::open_placed_mtp_slots`),
 //!   in the server's order (`worker.rs`'s `start` → `genloop`'s `prompt`):
@@ -3765,12 +3766,14 @@ mod gate {
 
     /// (i) the width chooser's held pass right after the server's cut step
     /// (a request's prompt call, then its last id as the seat's first step,
-    /// [`start`]): the pass the chooser holds back steps the target and the
-    /// draft hears of it through [`Draft::held`] with no walk between, the
-    /// anchor the cut step recorded reading the step's own arena the held
-    /// pass's step has overwritten — the step store-walks its row at once,
-    /// so the held pass takes the position in instead of refusing, and the
-    /// drafted ids after it stay the plain run's.
+    /// [`start`]): the chooser walks the draft's waiting rows first
+    /// ([`Draft::before_plain`], the call `runtime::width`'s `Choosing`
+    /// makes on the plain pass its `propose` returns), then the target
+    /// steps and the draft hears of it through [`Draft::held`] — the step
+    /// overwrites the arena the anchor read only after the walk, so the
+    /// held pass takes the position in instead of refusing, the store
+    /// never holds a position past the target's, and the drafted ids after
+    /// it stay the plain run's.
     fn held_after_cut(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
         const N: usize = 8;
         let ctx = m.body("held after the cut")?.ctx() as u32;
@@ -3778,10 +3781,12 @@ mod gate {
         let mut s = app::Session::from_model(m, ctx);
         let mut d = fresh_draft(&s)?;
         let mut out = start(&mut s, &mut d, prompt)?;
-        // The chooser-held pass: the target steps, then the draft is told
-        // through Draft::held — the chooser proposes nothing first, so no
-        // walk sits between the step and the anchor it overwrote.
+        // The chooser-held pass as the width chooser's propose runs it: the
+        // hook walks the anchor the cut step recorded, then the target
+        // steps (overwriting that arena), then the draft is told through
+        // Draft::held.
         let last = *out.last().ok_or("no token after the cut step")?;
+        Draft::before_plain(&mut d, &mut s, last)?;
         let next = Target::step(&mut s, last, Want::Argmax)?.argmax();
         Draft::held(&mut d, &mut s, last, next)?;
         out.push(next);
