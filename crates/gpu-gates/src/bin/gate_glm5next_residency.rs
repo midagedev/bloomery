@@ -148,6 +148,10 @@ pub mod residency_clauses;
 mod gate_card;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use crate::residency_clauses::StaticProbe;
     use std::ops::Range;
@@ -155,15 +159,15 @@ mod gate {
 
     use app::arch::glm5next::{GlmCfg, open_nextn, open_resident};
     use app::mtp::MtpDraft;
-    use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
+    use app::{Loaded, OpenArgs, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{Residence, place_table};
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed, set_prefill};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
+    use bloomery_gpu_glm5next::{Body, PrefillMode, feed, set_prefill};
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -177,6 +181,8 @@ mod gate {
     use refset::mtpref::MtpSet;
     use runtime::layer::hosted;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Verify, Want};
+
+    use crate::quiet::Quiet;
 
     const NAME: &str = "gate_glm5next_residency";
     /// Positions the stores hold: a prompt and the steps with room.
@@ -234,43 +240,6 @@ mod gate {
                 ((x >> 33) % vocab as u64) as u32
             })
             .collect()
-    }
-
-    /// FNV-1a 64 over a logits row's f32 bits.
-    fn fnv(row: &[f32]) -> u64 {
-        row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
-            v.to_bits()
-                .to_le_bytes()
-                .iter()
-                .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
-        })
-    }
-
-    /// The open's records: none; the gate prints its own lines.
-    struct Quiet;
-
-    impl OpenLog<Body> for Quiet {
-        fn plan(
-            &mut self,
-            _: &'static str,
-            _: &PlanInputs,
-            _: &Machine,
-            _: &Plan<'_>,
-        ) -> Result<bool, SessionError> {
-            Ok(true)
-        }
-
-        fn load(&mut self, _: &Glm5nextModel) -> Result<(), SessionError> {
-            Ok(())
-        }
-
-        fn capture(&mut self, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-
-        fn prompt_buffers(&mut self, _: &Glm5nextModel) -> Result<(), SessionError> {
-            Ok(())
-        }
     }
 
     /// The file planned onto `machine` and loaded under `residency`, its
@@ -375,7 +344,7 @@ mod gate {
         for _ in 0..STEPS {
             let out = s.step(next, Want::Logits)?;
             if let Out::Logits { row, .. } = out {
-                h.fnvs.push(fnv(row));
+                h.fnvs.push(Fnv1a64::default().f32s(row).value());
             }
             next = out.argmax();
             h.tokens.push(next);
@@ -1020,7 +989,13 @@ mod gate {
             let tokens = s.verify([fed[PAIR * k], fed[PAIR * k + 1]])?;
             let logits = s.model().rows_logits::<PAIR>()?;
             s.commit(PAIR)?;
-            got.push((tokens, [fnv(&logits[0]), fnv(&logits[1])]));
+            got.push((
+                tokens,
+                [
+                    Fnv1a64::default().f32s(&logits[0]).value(),
+                    Fnv1a64::default().f32s(&logits[1]).value(),
+                ],
+            ));
         }
         let passes = s.model_mut().body_parts(NAME)?.2.take_residency_passes();
         let landings: Vec<usize> = passes.iter().map(|(_, r)| r.landed).collect();
@@ -1077,15 +1052,6 @@ mod gate {
         }
     }
 
-    /// The verify's capture, heard by nobody.
-    struct QuietRows;
-
-    impl RowsLog for QuietRows {
-        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
     /// The stacked history from a clear (the residency back to its seed):
     /// the prompt call with the draft's store walks, then MTP windows
     /// (`Speculative<MtpDraft<Body>, 2>`) for [`STEPS`] ids.
@@ -1094,7 +1060,7 @@ mod gate {
         s.clear()?;
         s.model_mut().body_parts(NAME)?.2.take_residency_passes();
         let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
-        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut QuietRows)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let first = spec.prompt(s, ids)?;
         let mut w = Windows::default();
         let stop = Stop::new(STEPS, s.ctx())?;

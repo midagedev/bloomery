@@ -191,8 +191,8 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
-        GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir, open_model,
-        verdict,
+        Fnv1a64, GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir,
+        open_model, verdict,
     };
     use cuda_core::DeviceBuffer;
     use gguf::iq_tables::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
@@ -1041,17 +1041,6 @@ mod gate {
         p
     }
 
-    /// FNV-1a over the bits of `y`: one run's every output, for comparing
-    /// two builds' logs.
-    fn fnv(y: &[f32]) -> u64 {
-        y.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
-            v.to_bits()
-                .to_le_bytes()
-                .iter()
-                .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
-        })
-    }
-
     /// `max|a − b| / max|b|`.
     fn rel_diff(a: &[f32], b: &[f32]) -> f64 {
         let num = a.iter().zip(b).fold(0.0f64, |m, (&x, &y)| {
@@ -1153,7 +1142,7 @@ mod gate {
                     refc.checked,
                     refc.worst_ratio,
                     refc.bits_differ,
-                    fnv(&y),
+                    Fnv1a64::default().f32s(&y).value(),
                     verdict(pass)
                 );
                 if let Some(f) = &refc.fail {
@@ -1645,7 +1634,7 @@ mod gate {
                 refc.checked,
                 refc.worst_ratio,
                 refc.bits_differ,
-                fnv(&got),
+                Fnv1a64::default().f32s(&got).value(),
                 verdict(pass)
             );
             if let Some(f) = &refc.fail {
@@ -2694,7 +2683,7 @@ mod gate {
     /// The 32-value family (`Gemm32Kernels`): module doc, last part.
     mod g32 {
         use super::{
-            Lcg, ROUTINGS, Routing, SENT, TOKENS, fnv, pad, route_ids, route_ref, row_checked,
+            Lcg, ROUTINGS, Routing, SENT, TOKENS, pad, route_ids, route_ref, row_checked,
             synthetic, wanted,
         };
         use bloomery_gpu::gemm::{
@@ -2706,7 +2695,9 @@ mod gate {
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
         use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, host_act};
         use bloomery_gpu_gates::rounding::gamma;
-        use bloomery_gpu_gates::{GateError, activations, bits_equal, bytes_to_words, verdict};
+        use bloomery_gpu_gates::{
+            Fnv1a64, GateError, activations, bits_equal, bytes_to_words, verdict,
+        };
         use cuda_core::DeviceBuffer;
         use gguf::iq_tables::KVALUES_IQ4NL;
         use gguf::quant::{GgmlType, dequant_row, half_to_f32};
@@ -3643,7 +3634,7 @@ mod gate {
                              decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                              worst_err_over_band={worst:.3} band_off={band_off} contract_bits_differ={bits_off} \
                              file_eq_plane={layouts} y_fnv={:016x} {}",
-                            fnv(&got),
+                            Fnv1a64::default().f32s(&got).value(),
                             verdict(pass)
                         );
                         if let Some(f) = first {
@@ -3819,7 +3810,7 @@ mod gate {
                              decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                              worst_err_over_band={worst:.3} band_off={band_off} contract_bits_differ={bits_off} \
                              y_fnv={:016x} {}",
-                            fnv(&got),
+                            Fnv1a64::default().f32s(&got).value(),
                             verdict(pass)
                         );
                         if let Some(f) = first {
@@ -3905,7 +3896,7 @@ mod gate {
                          decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                          worst_err_over_band={worst:.3} band_off={band_off} \
                          contract_bits_differ={bits_off} y_fnv={:016x} {}",
-                        fnv(&got),
+                        Fnv1a64::default().f32s(&got).value(),
                         verdict(pass)
                     );
                     if let Some(f) = first {

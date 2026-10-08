@@ -332,7 +332,7 @@ mod drive {
         mode_name, place_table, read_table, repeat_runs, seed_path, slot_table, write_table,
     };
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::{GateError, data_dir, ref_model_path, residency41};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency41};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LOCK,
         HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP, R8,
@@ -2238,11 +2238,7 @@ mod drive {
             .enumerate()
             .max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(&x.0)))
             .map_or(0, |(i, _)| i);
-        let fnv = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
-            v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-            })
-        });
+        let fnv = Fnv1a64::default().f32s(&row).value();
         Record::new(&record::LOGITS)
             .u("n", row.len())
             .u("argmax", argmax)

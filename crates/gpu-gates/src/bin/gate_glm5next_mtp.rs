@@ -109,6 +109,10 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use std::time::Instant;
 
@@ -138,6 +142,8 @@ mod gate {
     use refset::mtpref::{Graph, MtpSet};
     use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Draft, PassSink, Target, Verify, Want, accepted_rows};
+
+    use crate::quiet::Quiet;
 
     /// Cache rows: the e2e gate's main load.
     const CTX: usize = 3136;
@@ -930,15 +936,6 @@ mod gate {
         ) -> Result<(), GateError> {
             self.rows.push(c.kept);
             self.proposed.push(c.proposed);
-            Ok(())
-        }
-    }
-
-    /// The rows-log that hears nothing.
-    struct Quiet;
-
-    impl app::RowsLog for Quiet {
-        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), app::SessionError> {
             Ok(())
         }
     }

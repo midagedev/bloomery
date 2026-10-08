@@ -143,12 +143,16 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use std::time::Instant;
 
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident};
     use app::mtp::MtpDraft;
-    use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
+    use app::{Loaded, OpenArgs, Session};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::host::slots::Slot;
@@ -158,7 +162,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
     use bloomery_gpu_glm5next::{
         Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, feed,
         set_prefill_group,
@@ -174,6 +178,8 @@ mod gate {
     use refset::arch::glm5next::{D1K, IK, MODEL};
     use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Want};
+
+    use crate::quiet::Quiet;
 
     const NAME: &str = "gate_glm5next_twocard";
     /// The card budget both plans are made under (module header: the union
@@ -286,30 +292,6 @@ mod gate {
         out.cards.truncate(flat.cards.len());
         out.tier_n_l.clear();
         Ok(out)
-    }
-
-    /// The open's records: none; the gate prints its own lines.
-    struct Quiet;
-
-    impl OpenLog<Body> for Quiet {
-        fn plan(
-            &mut self,
-            _: &'static str,
-            _: &PlanInputs,
-            _: &Machine,
-            _: &Plan<'_>,
-        ) -> Result<bool, SessionError> {
-            Ok(true)
-        }
-        fn load(&mut self, _: &Glm5nextModel) -> Result<(), SessionError> {
-            Ok(())
-        }
-        fn capture(&mut self, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-        fn prompt_buffers(&mut self, _: &Glm5nextModel) -> Result<(), SessionError> {
-            Ok(())
-        }
     }
 
     /// The tiered load through the binaries' open, refused unless its tier's
@@ -849,16 +831,6 @@ mod gate {
 
     // ------------------------------------------ residency beside the tier
 
-    /// FNV-1a 64 over a logits row's f32 bits.
-    fn fnv(row: &[f32]) -> u64 {
-        row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
-            v.to_bits()
-                .to_le_bytes()
-                .iter()
-                .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
-        })
-    }
-
     /// A clause's verdict, an error it met printed as its red line.
     fn held(clause: &str, r: Result<bool, GateError>) -> bool {
         r.unwrap_or_else(|e| {
@@ -891,7 +863,7 @@ mod gate {
         for _ in 0..STEPS {
             let out = s.step(next, Want::Logits)?;
             if let Out::Logits { row, .. } = out {
-                fnvs.push(fnv(row));
+                fnvs.push(Fnv1a64::default().f32s(row).value());
             }
             next = out.argmax();
             tokens.push(next);
@@ -936,15 +908,6 @@ mod gate {
         }
     }
 
-    /// The verify's capture, heard by nobody.
-    struct QuietRows;
-
-    impl RowsLog for QuietRows {
-        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
     /// What a drafted history saw: the generated ids, each window's proposal
     /// and kept rows, each boundary's ended pass and the flips that landed.
     #[derive(PartialEq)]
@@ -962,7 +925,7 @@ mod gate {
         s.clear()?;
         s.model_mut().body_parts(NAME)?.2.take_residency_passes();
         let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
-        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut QuietRows)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let first = spec.prompt(s, ids)?;
         let before = tier_counts(s.model())?;
         let mut w = Windows::default();

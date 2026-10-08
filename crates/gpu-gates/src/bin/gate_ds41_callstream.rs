@@ -92,6 +92,10 @@ fn main() -> std::process::ExitCode {
 mod ds41_open;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_residency.rs"]
 mod residency;
 
@@ -101,7 +105,7 @@ mod residency_clauses;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use crate::ds41_open::{fnv, open};
+    use crate::ds41_open::open;
     use crate::residency::{self, StaticProbe};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -114,7 +118,7 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{
-        GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
+        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
     };
     use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_POPULATE, R8};
     use gguf::Split;
@@ -262,7 +266,7 @@ mod gate {
         match out {
             Out::Logits { argmax, row } => Ok(Pos {
                 argmax,
-                fnv: fnv(row),
+                fnv: Fnv1a64::default().f32s(row).value(),
                 margin: margin(row)?,
             }),
             Out::Argmax(_) => Err("a call asked for its logits returned the argmax alone".into()),
