@@ -11,7 +11,9 @@ To run or evaluate bloomery rather than develop it, read the README's "Status" s
 
 - **Never build a device crate with plain `cargo`.** `crates/gpu` and every crate that links it (`gpu-deepseek41`,
   `gpu-glm5next`, `gpu-vision`, `gpu-gates` with its `gpu` feature) hold `#[cuda_module]`/`#[kernel]` code that needs
-  the CUDA codegen backend. Use `cargo oxide` (the recipes do).
+  the CUDA codegen backend. Use `cargo oxide` (the recipes do). One exception, off the box: the host nightly
+  (`tools/nightly/run.sh`) runs `bloomery-app`'s default-feature tests under plain cargo, which open no card
+  (`tools/recipes.py` HOST_DEVICE_LINKED holds the reason); its numbers are host-tier evidence, never a kernel's.
 - **Never run a gate on the Mac.** The Mac is arm64 and an editor: `qdot` uses `std::arch::x86_64`, `threads` Linux
   affinity calls. On the Mac run only the static tier (`just mac-check`, `just mac-lint`: check and clippy as an
   x86_64-linux cross check, no linker; `just mac-fmt-check`; `just mac-static [BASE]`: the round loop's one command —
