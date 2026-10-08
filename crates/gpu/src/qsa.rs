@@ -1,7 +1,7 @@
 //! Qwen3.8's token-pool selector (QSA) on the card: the pooled keys, each
 //! query row's scores over them, and the exact top-k that turns the scores
 //! into the token list the selected flash reads
-//! ([`crate::flash_gqa::FlashGqaKernels::enqueue_pass_256_p4_sel`]).
+//! ([`crate::flash_gqa::FlashGqaKernels::enqueue_pass_256_p12_sel`]).
 //!
 //! The rule is `runtime::qsa`'s, mirrored here: pool `j` is tokens `[4j, 4j +
 //! 4)`; a row of live count `c` (its position plus one) sees the `c / 4`

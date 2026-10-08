@@ -87,7 +87,7 @@ use std::ops::Range;
 /// What the walks' errors name.
 const WHAT: &str = "qwen4exp program";
 
-/// The selected flash's pass: the tensor-core one.
+/// The draft walk's dense flash pass: the tensor-core one.
 pub(super) const MMA: bool = true;
 
 /// A delta layer's mixer launches at one row: the q·k·v, `z` and joined
@@ -1420,7 +1420,7 @@ fn qsa_attend(
     )?;
     let (kc, vc) = kv.f16("qwen38::attention")?;
     let width = sel.width();
-    c.k.flash.enqueue_pass_256_p4_sel(
+    c.k.flash.enqueue_pass_256_p12_sel(
         stream,
         GqaSelArgs {
             q,
@@ -1439,7 +1439,6 @@ fn qsa_attend(
             y,
         },
         geo::N_HEAD,
-        MMA,
     )
 }
 

@@ -138,9 +138,6 @@ use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
 
-/// The selected flash's pass: the tensor-core one.
-const MMA: bool = true;
-
 /// The indexer keys a select keeps, as `qsa::scored` takes them.
 const KEPT_U32: u32 = geo::KEPT as u32;
 const _: () = assert!(KEPT_U32 as usize == geo::KEPT);
@@ -1769,7 +1766,7 @@ fn qsa(
                 scratch: &mut q.sel,
             },
         )?;
-        c.k.flash.enqueue_pass_256_p4_sel(
+        c.k.flash.enqueue_pass_256_p12_sel(
             stream,
             GqaSelArgs {
                 q: &qw,
@@ -1788,7 +1785,6 @@ fn qsa(
                 y: &mut yw,
             },
             geo::N_HEAD,
-            MMA,
         )?;
         t0 += n;
     }
