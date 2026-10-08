@@ -155,7 +155,7 @@ gpu-deepseek41 426 48 0
 # PIN(2026-10-07): gpu-gates 62 -> 63 blocks, new code, not old code relaxed: gate_swap's s6 reads a pick's landing
 # batch rows back from their raw device addresses (one cuMemcpyDtoDAsync block, the same form as gate_xstream's),
 # with its SAFETY line.
-gpu-gates 63 5 1
+gpu-gates 61 5 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 gpu-vision 48 0 0

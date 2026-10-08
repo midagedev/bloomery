@@ -44,8 +44,8 @@ fn model() -> String {
     MODEL.to_string()
 }
 
-/// ik's node dumps: the batch set and the decode-step sets. No gate reads
-/// them yet: the mimo2 gates do not exist, so `consumers` is empty.
+/// ik's node dumps: the batch set and the decode-step sets, which the MiMo
+/// end-to-end weekly (`gate_mimo2_e2e`) reads.
 pub static IK: Family = Family {
     name: "ik-mimo2",
     sets: &[BATCH, STEP4, STEP4_EVERY_NODE, D1K, D4096],
@@ -56,7 +56,7 @@ pub static IK: Family = Family {
     build: Some(Build::Is(IK_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["weekly-gpu-mimo2-e2e"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
