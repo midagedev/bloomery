@@ -24,7 +24,9 @@
 //! 3090 as its expert tier (the `load` line's `cards=` names both, with the
 //! tier's experts and bytes; the prompt goes one step per id, as it always
 //! does here). A lost tier card is the step's named error and ends the run
-//! with a nonzero exit.
+//! with a nonzero exit. Unset it is the common rule's (`generate::Place::choose`
+//! by `place::TIER_RULE`): `a`, a `place unset` record naming it and why
+//! before the prompt's ids.
 //!
 //! Everything but the text goes to stderr: the `prompt_ids` line, the plan,
 //! `load` and `capture` lines, then after the run the `ids` line (every
@@ -65,7 +67,7 @@ mod drive {
     use app::arch::deepseek41::Ds41Cfg;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model};
-    use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
+    use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place, PlaceWhy};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
@@ -88,6 +90,8 @@ mod drive {
     struct Args {
         prompt: Vec<u8>,
         n_gen: usize,
+        /// The placement the run loads by, resolved against this process's
+        /// devices by the common unset rule ([`place::choose`]).
         place: Place,
         ctx: usize,
         parse_special: bool,
@@ -116,7 +120,7 @@ mod drive {
         }
     }
 
-    fn parse_args() -> Result<Args, GateError> {
+    fn parse_args() -> Result<(Args, PlaceWhy), GateError> {
         let mut a = Args {
             prompt: Vec::new(),
             n_gen: 256,
@@ -127,6 +131,7 @@ mod drive {
             greedy: false,
         };
         let (mut sources, mut sampling_flags) = (0, Vec::new());
+        let mut place_flag = None;
         let mut it = std::env::args_os().skip(1);
         while let Some(flag) = it.next() {
             let flag = flag.to_string_lossy().into_owned();
@@ -168,7 +173,7 @@ mod drive {
                     false
                 }
                 "--place" => {
-                    a.place = place::parse(&v)?;
+                    place_flag = Some(place::parse(&v)?);
                     false
                 }
                 "--ctx" => {
@@ -225,8 +230,9 @@ mod drive {
         if a.n_gen == 0 {
             return Err("-n wants at least one generated token".into());
         }
-        a.place = a.place.on_host()?;
-        Ok(a)
+        let placed = place::choose(place_flag)?;
+        a.place = placed.place;
+        Ok((a, placed))
     }
 
     /// An argument's bytes as given (the prompt need not be UTF-8).
@@ -246,7 +252,8 @@ mod drive {
             R8,
         ])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
-        let a = parse_args()?;
+        let (a, placed) = parse_args()?;
+        placed.record().eprint();
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         // The chat feeds its prompt one step per id (`Generator::prefill`), so
         // its load makes no prompt batch's buffers, tiered or not.

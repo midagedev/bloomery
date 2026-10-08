@@ -19,6 +19,9 @@
 //!   and equal to the plan's card (dense + experts) and host (experts +
 //!   tables) bytes; the cards' KV bytes; `ctx_verified` the deepest reference
 //!   set's (`refset::arch::deepseek41::VERIFIED_POSITIONS`); no draft;
+//! - the server's `place unset` record (the common rule's, `Place::choose`):
+//!   `place=gate`, `why=set`, and no tier count, break-even or basis under a
+//!   flag;
 //! - `/completion` of `--prompt` at temperature 0 with `return_tokens`: its
 //!   ids are `generate_ds41 --tokens <--ids> -n 16`'s `tokens` line — all 16,
 //!   or a prefix ending in the end-of-generation id when the server stopped
@@ -2950,6 +2953,30 @@ mod gate {
             .chain(SERVER_ARGS.iter().map(|a| (*a).to_owned()))
             .collect();
         ok &= props_engine(&url, &argv, served.child.id(), &place, &err_log)?;
+        // The placement the seat names (`place unset`): under `--place gate`
+        // its word, `why=set`, and no tier count, break-even or basis (the
+        // rule never asks the plan under a flag). FAIL-first: a seat that
+        // skips the record leaves no line; one that drops the flag names the
+        // rule's `a`.
+        let placed =
+            server_log(&err_log, record::BLOOMERY_SERVE_DS41)?.first(&record::PLACE_UNSET)?;
+        let named = match &placed {
+            None => "no record".to_owned(),
+            Some(r) => format!(
+                "place={} why={} tier_experts={:?} break_even={:?} basis={:?}",
+                r.word("place")?,
+                r.text("why")?,
+                r.opt_u64("tier_experts")?,
+                r.opt_u64("break_even")?,
+                r.opt_word("basis")?
+            ),
+        };
+        println!("place unset: {named}");
+        check(
+            &mut ok,
+            "place_unset_names_the_flag",
+            named == "place=gate why=set tier_experts=None break_even=None basis=None",
+        );
 
         let completion = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,

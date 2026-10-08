@@ -28,7 +28,7 @@
 //!
 //! `--place` set runs its word as given; unset, the common rule every
 //! serving seat takes decides (`generate::Place::choose`, by this family's
-//! [`Q38_RULE`]: no break-even yet, so two cards run `a` — one card `a` on
+//! `q38place::Q38_RULE`: no break-even yet, so two cards run `a` — one card `a` on
 //! the one card), its `place unset` record the first of the seat's records
 //! after a set residency lever's.
 //!
@@ -249,7 +249,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
     placement_props, sampler_factory,
 };
-use bloomery_gpu_gates::generate::{BreakEven, Place, TierRule};
+use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
@@ -281,6 +281,8 @@ use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
 
+#[path = "../qwen38_place.rs"]
+mod q38place;
 #[path = "../xstream38.rs"]
 mod xstream38;
 use xstream38::{Stage38, xstream38};
@@ -342,16 +344,6 @@ const PROMPT_IDS_PER_S: f64 = 1224.1;
 /// The prompt rate under `bp` over `a`'s, the same lease
 /// (docs/cards/q38bpbug-ab.card: P 512, draft off, A6000 + 3090).
 const BP_PROMPT_RATIO: f64 = 1.379;
-
-/// The Qwen3.8 family's input to the common unset rule (`Place::choose`):
-/// one expert tier card served, no break-even yet — no sitting has shown
-/// the tier not slower (docs/cards/q38bpbug-ab.card holds the measured
-/// rates a break-even would be derived from).
-const Q38_RULE: TierRule = TierRule {
-    tiers: 1,
-    break_even: None,
-    basis: "docs/cards/q38bpbug-ab.card",
-};
 
 /// The drafted seat's break-even at `place` ([`Q38::draft_keep`]): the
 /// draft's gain a token times the rate a reset re-prefills at — the ubatch
@@ -1005,13 +997,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // placement holds a tier card — never off the chosen word, which
     // `Place::on` spells as card names when an alias lands on other devices.
     let census = gpu_census::census()?;
-    let chosen = Place::choose(a.flag.map(|p| p.cards), &census, Q38_RULE, |p| {
-        Err(format!(
-            "--place unset: Qwen3.8 has no break-even yet, so no tier count for {}",
-            p.name()
-        )
-        .into())
-    })?;
+    let chosen = q38place::choose(a.flag.map(|p| p.cards), &census)?;
     chosen.record().eprint();
     a.place = Place38 {
         kind: match a.flag {
