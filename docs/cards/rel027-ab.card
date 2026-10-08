@@ -1,0 +1,39 @@
+# 0.2.6 against the 0.2.7 candidate, the user's defaults, one lease on the A6000: v0.2.6's build and the candidate's
+# on UD-Q4_K_XL and UD-Q3_K_XL; the MTP draft at each build's default (on), P = 512 and 4096, ctx 4352. The 0.2.7
+# release notes open with these rows.
+#
+# Decomposition [derived]: the 0.2.6 rows (rig-log 2026-10-07#rel026-3arm) are Q4 943.0 / 1,257.7 (3.26 s at 4096)
+# and Q3 775.0 / 1,438.4. Since then, on the prompt path:
+# - pfcopy lever 2: per-batch landing events, pp4096 +3.2 % measured (same-binary A/B) -> ~3.16 s;
+# - lever 3 (aedaead3): the selected flash stages a key once a (row, kv head), -0.15..-0.30 s at pp4096 (design §4),
+#   0 at pp512 (no selection below position 2,048);
+# - iqtile (dae925ca): the Q3 file's IQ host leg gets multi-column tiles, Q3 pp512 -260..-315 ms functional and
+#   pp4096 -52 ms [derived, iqpp512 report], Q4 unaffected.
+# Q4: pp4096 2.86..3.01 s -> 1,360..1,430; pp512 943 +- the window (no prompt lever below 2,048 positions for Q4). Q3: pp4096 ~2.4..2.6 s -> 1,575..1,710; pp512
+# 0.35..0.45 s -> 1,140..1,460 (wide: the iqtile term was never timed). Decode after 4K: lever 3 also runs in the step
+# program's QSA (program38 qsa_attend), which selects only past position 2,048 (qsa.rs:138-140): about -0.14 ms a
+# step at depth 4096 (12.6 -> 4.2 MB a QSA layer-step, 12 layers; worker2, design §4), ~+1 % at ~89 tok/s [derived];
+# lever 3 is 0 at pp512 and at depth <= 2,048.
+# Wall [derived]: 8 arms x 4 rounds of a fresh Qwen3.8 load (~40 s each; vid026-3arm's 6 x 4 took ~20 min), 22..28 min.
+# Runner (main tree after the train lands, the full output to a file first):
+# BLOOMERY_HOLD_OWNER=sit027 BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=4
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/rel027-ab.card BLOOMERY_GEN_CTX=4352' just depth-gpu-qwen4exp
+#   bin:/root/repo/bloomery-v026/target/release/generate_qwen3moe:prose:512
+#   bin:/root/repo/bloomery-v026/target/release/generate_qwen3moe:prose:4096
+#   bin:/root/repo/bloomery-v026/target/release/generate_qwen3moe:prose:512@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+#   bin:/root/repo/bloomery-v026/target/release/generate_qwen3moe:prose:4096@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+#   prose:512 prose:4096 prose:512@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf prose:4096@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+kind: baseline
+question: what does a user's 0.2.7 read against 0.2.6 on the A6000 for a 512- and a 4,096-token prompt and the decode
+  after it, on UD-Q4_K_XL and UD-Q3_K_XL, at the defaults?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, the 0.2.7 UD-Q4_K_XL arm at its defaults (MTP draft on)
+unit: tok/s
+predict: 1360..1430
+condition: one lease, four rounds, a fresh process per load group, no [cold] row on the candidate's arms, no
+  [cpu-busy] or [other-busy] row; the v0.2.6 Q4 arm within 1 % of 1,257.7 (else the window moved and the rows carry
+  the window's ratio, not 0.2.6's published number)
+reason: the 0.2.7 release notes' measured headline (the user, 2026-10-08: a visible gain every release)
+decide-in: the notes and README's 0.2.7 rows take this window's numbers
+decide-below: read the candidate arm's xstream records and stat prompt lines against v0.2.6's: which of lever 2,
+  lever 3 did not land its term
+decide-above: check the plan line (card experts a layer) and the draft line before believing it

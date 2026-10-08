@@ -1,0 +1,31 @@
+# Round glmpick: GLM-5.3-Flash's prompt call picks each batch's hottest host experts into the residency pool
+# (HostTier::call_pick_routed at floor 32, the machine's call mode, Qwen3.8's `admit`) before its card route, the
+# route running over the pick's landing batches; the admits stay for the answer. Same binary, lever arms.
+# Decomposition [derived, glmpick report §1]: a 512-column routed layer-batch on plan (a) is F + max(U + 4.8, S),
+# U 48.1 ms (3,184 host slots x 10.74 us + 193 x 72.2 us, glmpp3-pp.card), S 13.7 (glmnext-cardtile.card); the pick
+# moves ~1,100 net slots (22 admits, glmpaper replay) off the union, U' 36.3 x 1.05..1.12 (DRAM), a copy chain of
+# 334 MB at 10.5..12 GB/s (28..32 ms) + tail 1.5..7 under it; the model is calibrated to 196.20 (68f72d68).
+# pp4096 at G2 picks the KDA layers only: +6..+21 % [derived]. Box ~20..25 min [derived: 3 rounds x 4 arms at
+# 45..75 s loads, the warm-ups, one build].
+kind: ab
+question: does picking each batch's hottest host experts into the residency pool before its card route take ~1,100
+  slots a layer-batch off the host union, with the copies under the union?
+term: pp tok/s @ P = 512, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352,
+  BLOOMERY_RESIDENCY=mid-p0-s1, MTP off - (admit - off) / off, one binary, paired by round
+unit: %
+predict: +6..+22
+rounds: 3
+condition: one hold, one invocation: BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_RESIDENCY=mid-p0-s1
+  BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmpick-pp.card' just depth-gpu-glm5next
+  512 512@BLOOMERY_XSTREAM=off 4096 4096@BLOOMERY_XSTREAM=off (the bare arm's unset word resolves to admit under
+  the residency; its load line prints xstream=admit). Every admit row prints call stream records with admitted > 0
+  on the KDA layers and none on the latent layers of a two-unit walk; every off row prints none; the plan line is
+  the same in all arms. A row marked [cold], [cpu-busy] or [other-busy] is void. pp4096 rows are read beside the
+  term against +6..+21.
+decide-in: land stage 1 as 0.2.8's prompt lever; the release pass adds a GLM A6000 row (P 512 and 4096) to the
+  README; queue C2 (the probe without the ring) and then R3 (the walk)
+decide-below: read pick_us and backlog_us from the call stream records and one STEP_STATS row: if the copy chain
+  binds (backlog_us past ~5 ms a layer), wait for C1 and sit again; if admits fall under 15 a layer, the floor is
+  too high for this prompt, so re-derive it from the router replay
+decide-above: the union's per-expert W term or the contention s was overestimated: refit the lane law from one
+  STEP_STATS row, then land

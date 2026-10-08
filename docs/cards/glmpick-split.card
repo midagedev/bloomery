@@ -1,0 +1,23 @@
+# Round glmpick: the one term its derivation cannot close, the host union's ms a routed layer-batch (U) on GLM-5.3-Flash
+# today. The last measured split (glmgroup, 10-02) predates the GEMM front; U 48.1 ms is the lane law's fit
+# (glmpp3-pp.card:6-10: 3,184 host slots x 10.74 us + 193 experts x 72.2 us), which models 68f72d68's pp512 at
+# 2,679 ms against 2,610 measured. The pick's band hangs on it (glmpick report §1.3): U >= 45 lands stage 1 as designed,
+# 40..45 lands it after pickrate C1, under 40 the copy chain binds and stage 2 waits.
+# STEP_STATS syncs each layer: read U, F (front) and S (card shadow) only, never the wall. MTP off (generate_glm5next
+# refuses STEP_STATS beside the draft). ~8..12 min [derived: ~4 min build, two warm-ups, two rows, 45..75 s loads].
+# Runner (main tree):
+# BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3
+#   BLOOMERY_LEASE_CARD=docs/cards/glmpick-split.card' just depth-gpu-glm5next
+#   512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_STEP_STATS=1 4096@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_STEP_STATS=1
+kind: profile
+question: how many ms of a 512-column routed KDA layer-batch does the host union take on GLM-5.3-Flash today, plan (a),
+  A6000?
+term: union_ms @ stat prefill lb, P = 512, KDA layers, A6000, plan (a), BLOOMERY_RESIDENCY=mid-p0-s1, MTP off
+unit: ms
+predict: 42..52
+condition: one lease, one round, main at the run's commit; a row marked [cold], [cpu-busy] or [other-busy] is void;
+  card_shadow_ms near 13.7 and the KDA front near 5.8 (else the lane law's other terms moved too)
+decide-in: U >= 45: the GLM pick's stage 1 lands as designed (R1, then R2's gate, then the glmpick-pp A/B)
+decide-below: U 40..45: stage 1 lands after pickrate C1 (copy rate >= 14 GB/s); U under 40: the copy chain binds,
+  stage 2's walk comes first and the band is re-derived
+decide-above: U over 52: re-fit the lane law from this row before the A/B; the band rises
