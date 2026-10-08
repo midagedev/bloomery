@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 
 pub mod arch;
+pub mod clefvis;
 mod columns;
 pub mod dsref;
 pub mod family;
