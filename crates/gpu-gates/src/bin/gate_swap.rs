@@ -204,6 +204,23 @@
 //!   pages a fault brings back as the same bytes; only the time moves, and
 //!   the records now show it.
 //!
+//! - s8 backlog: a pick's wait for the staging thread returns at the bound
+//!   the call's setter named. With the staging thread held at its first job,
+//!   a pick of three admits under a bound of three issues all its jobs and
+//!   returns; under a bound of two it is refused by name at its third job,
+//!   the message naming the bound, and a bound of no jobs and a bound set
+//!   with no call open are refused by name (its mutants: the setter's value
+//!   never stored, so the pick waits on the machine's own bound; the wait's
+//!   bound one job loose).
+//! - s9 staged: a pick's `staged_us` is the wall from the pick's start to
+//!   the staging of its layer's last pick job. With the staging thread let
+//!   through the first of a two-admit pick's jobs and held at the second for
+//!   the settle time, the call's end reads it at the settle time or more,
+//!   past the pick's own host time, and a pick that admits nothing reads 0
+//!   (its mutants: the stamp posted at the layer's first job, which the
+//!   hold leaves under the settle time; the stamp read from another layer's
+//!   cell, which gives the pick that moved nothing a wall).
+//!
 //! Evicted (a host set populated and not locked, whose pages the page cache
 //! lets go): a victim not host-resident when the machine decides is read
 //! back in and the flip goes on — at a boundary whose landing victims the
@@ -505,8 +522,8 @@ mod gate {
 
     /// The synthetic source: every expert's bytes on the host; the stacks'
     /// addresses; residency per expert, the card's experts not resident at
-    /// load (their pages dropped), preparing makes an expert resident unless
-    /// it is stuck.
+    /// load (their pages dropped), a stuck expert never resident (a host
+    /// expert too), preparing makes any other expert resident.
     struct Synth {
         bytes: Vec<Vec<u8>>,
         bases: Vec<[sys::CUdeviceptr; PARTS]>,
@@ -533,9 +550,11 @@ mod gate {
             let resident = (0..L * E)
                 .map(|x| {
                     let (l, e) = (LAYERS.start + x / E, (x % E) as u32);
-                    let all = faults.all_resident && !faults.stuck.contains(&(l, e));
+                    let stuck = faults.stuck.contains(&(l, e));
                     let evicted = faults.evicted.contains(&(l, e));
-                    AtomicBool::new(!evicted && (all || x % E >= caps[x / E]))
+                    AtomicBool::new(
+                        !stuck && !evicted && (faults.all_resident || x % E >= caps[x / E]),
+                    )
                 })
                 .collect();
             Synth {
@@ -3422,6 +3441,178 @@ mod gate {
         Ok(ok)
     }
 
+    /// s8 backlog: the call's backlog bound sets where a pick's wait for the
+    /// staging thread returns. The staging thread is held at its first job, so
+    /// no job is ever served: a pick issues job `k` when `k` is under the
+    /// bound, and blocks at the first that is not. A pick of three admits
+    /// under a bound of three issues all three and returns; under a bound of
+    /// two it is refused by name at the third job within the deadline, the
+    /// message naming the bound, and the machine, broken by an error after the
+    /// first job, is dropped behind the released hold. A bound of no jobs and a
+    /// bound set with no call open are each refused by name. Its mutants: the
+    /// setter's value never stored (the pick waits on the machine's own bound,
+    /// which three jobs never reach), the wait one job loose (the bound's
+    /// third-job refusal does not come).
+    fn s8(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        const WANT: [u32; 3] = [20, 21, 22];
+        let layer = LAYERS.start;
+        let stream = gpu.stream();
+        let mut counts = vec![0u32; E];
+        for (k, &e) in WANT.iter().enumerate() {
+            counts[e as usize] = 10 - k as u32;
+        }
+        // Arm one: a bound of three, three admits.
+        let hold = Arc::new(SourceHold::default());
+        let faults = Faults {
+            all_resident: true,
+            hold: Some(Arc::clone(&hold)),
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s8's machine: {e}").into());
+        }
+        let _guard = HoldGuard(Arc::clone(&hold));
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        let no_call = m.set_call_backlog(3).err().map(|e| e.to_string());
+        let no_call_named = no_call.as_deref().is_some_and(|e| {
+            e.contains("SwapMachine::set_call_backlog") && e.contains("a prompt call open")
+        });
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let zero = m.set_call_backlog(0).err().map(|e| e.to_string());
+        let zero_named = zero.as_deref().is_some_and(|e| {
+            e.contains("SwapMachine::set_call_backlog") && e.contains("at least one job")
+        });
+        m.set_call_backlog(3)?;
+        hold.arm(0);
+        let t0 = Instant::now();
+        let fits = m.call_pick(stream, &mut r.slots, layer, &counts, usize::MAX);
+        let fit_took = t0.elapsed();
+        std::thread::sleep(HOLD_SETTLE);
+        let held_at = hold.taken();
+        hold.release();
+        let fit_ok = fits.as_ref().is_ok_and(|p| p.admitted == WANT.len())
+            && fit_took < STALL_DEADLINE
+            && held_at == 1;
+        for l in LAYERS {
+            m.call_reader(l, stream)?;
+        }
+        let ended = m.end_call(stream, &mut r.slots, true).is_ok();
+        drop(r);
+        drop(_guard);
+
+        // Arm two: a bound of two, three admits, a short deadline.
+        let hold = Arc::new(SourceHold::default());
+        let faults = Faults {
+            all_resident: true,
+            hold: Some(Arc::clone(&hold)),
+            ..Faults::default()
+        };
+        let mut r = start(gpu, pm, seed_map(&[])?, faults, cfg(DELAY, STALL_DEADLINE))?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s8's second machine: {e}").into());
+        }
+        let _guard = HoldGuard(Arc::clone(&hold));
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        m.set_call_backlog(2)?;
+        hold.arm(0);
+        let t0 = Instant::now();
+        let refused = m
+            .call_pick(stream, &mut r.slots, layer, &counts, usize::MAX)
+            .err()
+            .map(|e| e.to_string());
+        let refused_took = t0.elapsed();
+        hold.release();
+        let refused_named = refused.as_deref().is_some_and(|e| {
+            e.contains("SwapMachine::call_pick") && e.contains("the call's last 2 in")
+        });
+        let blocked_ok = refused_named && refused_took >= STALL_DEADLINE;
+        let ok = no_call_named && zero_named && fit_ok && ended && blocked_ok;
+        println!(
+            "s8 backlog: set_call_backlog with no call open \"{}\" named {no_call_named}, of no jobs \
+             \"{}\" named {zero_named}; a bound of 3 and 3 admits under a held staging thread: pick \
+             {} in {fit_took:?}, jobs taken {held_at}, call ends {ended}; a bound of 2 and 3 admits: \
+             \"{}\" after {refused_took:?} (deadline {STALL_DEADLINE:?}), named {refused_named} {}",
+            no_call.as_deref().unwrap_or("accepted"),
+            zero.as_deref().unwrap_or("accepted"),
+            fits.as_ref()
+                .map_or_else(|e| e.to_string(), |p| format!("admitted {}", p.admitted)),
+            refused.as_deref().unwrap_or("returned"),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// s9 staged: a pick's `staged_us` is read back at the call's end as the
+    /// wall from the pick's start to the staging of its layer's last pick job.
+    /// With the staging thread let through the first job of a pick of two
+    /// admits (layer 2) and held at the second for the settle time, beside a
+    /// pick that admits nothing (layer 3), the layer-2 pick reads at least the
+    /// settle time and at least its own host time, and the pick that moved
+    /// nothing reads 0, its layer's stamp never posted. Its mutants: the stamp
+    /// posted at the layer's first job (staged before the hold, far under the
+    /// settle time), the stamp read from another layer's cell (the pick that
+    /// moved nothing then reads a wall).
+    fn s9(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        const WANT: [u32; 2] = [20, 21];
+        let (busy, idle) = (LAYERS.start, LAYERS.start + 1);
+        let hold = Arc::new(SourceHold::default());
+        let faults = Faults {
+            all_resident: true,
+            hold: Some(Arc::clone(&hold)),
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s9's machine: {e}").into());
+        }
+        let _guard = HoldGuard(Arc::clone(&hold));
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let mut counts = vec![0u32; E];
+        for (k, &e) in WANT.iter().enumerate() {
+            counts[e as usize] = 10 - k as u32;
+        }
+        hold.arm(1);
+        let first = m.call_pick(stream, &mut r.slots, busy, &counts, usize::MAX)?;
+        let none = m.call_pick(stream, &mut r.slots, idle, &[0u32; E], usize::MAX)?;
+        std::thread::sleep(HOLD_SETTLE);
+        hold.release();
+        for l in LAYERS {
+            m.call_reader(l, stream)?;
+        }
+        m.end_call(stream, &mut r.slots, true)?;
+        // The end orders the engine stream behind the copies, not the host:
+        // the engine reads the stamps after its readback, so this does too.
+        drain(gpu)?;
+        let mut picks = vec![(0usize, first), (0usize, none)];
+        m.fill_staged_us(&mut picks);
+        let settle_us = u64::try_from(HOLD_SETTLE.as_micros())?;
+        let (busy_pick, idle_pick) = (&picks[0].1, &picks[1].1);
+        let ok = busy_pick.admitted == WANT.len()
+            && busy_pick.staged_us >= settle_us
+            && busy_pick.staged_us >= busy_pick.pick_us
+            && idle_pick.admitted == 0
+            && idle_pick.staged_us == 0;
+        println!(
+            "s9 staged: staging held {HOLD_SETTLE:?} after a pick of {} admits: staged_us {} (want \
+             {settle_us} or more, its pick_us {}); a pick that moved nothing: admitted {}, staged_us \
+             {} (want 0) {}",
+            busy_pick.admitted,
+            busy_pick.staged_us,
+            busy_pick.pick_us,
+            idle_pick.admitted,
+            idle_pick.staged_us,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// A real [`HostTier`] over `stacks`, as `dropq_tier` builds one, its
     /// machine started over a source with `faults`: the engine's caller of
     /// the machine. The caller declares `stacks` first, so they drop after
@@ -3959,6 +4150,8 @@ mod gate {
         ok &= s4(&gpu, &pm, &trace)?;
         ok &= s5(&gpu, &pm)?;
         ok &= s6(&gpu, &pm)?;
+        ok &= s8(&gpu, &pm)?;
+        ok &= s9(&gpu, &pm)?;
         ok &= s7_pick(&gpu, &trace)?;
         ok &= s7_boundary(&gpu, &pm, &trace, &a)?;
         ok &= s7_load(&gpu, &pm)?;
@@ -3985,7 +4178,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the staging thread returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end."
             );
             Ok(())
         } else {

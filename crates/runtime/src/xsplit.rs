@@ -34,14 +34,16 @@
 //! balance over the two chains a layer runs after its pick returns: the
 //! card's — the admits' copies beside the union, then the route's tail τ
 //! ([`Constants::card_tail_us`]) — and the host union's, each admitted
-//! expert's cost leaving it. [`admit_walk`] walks the host experts hottest
-//! first, admitting while the card chain stays under the union, and returns
-//! the floor (the coldest admit's count, a rank-contiguous set) and the
-//! backlog bound: exactly the jobs whose copies fit inside the union's
-//! shadow, the rest staging alone ahead of it. [`walk_gate`] is the least
-//! unit width whose picks could pay the walk's first admit: a prompt
-//! narrower than it admits nothing whatever its counts, so a caller gates on
-//! it before it counts.
+//! expert's cost leaving it. The tail is a level per unit width, not a
+//! family constant: [`unit_constants`] prices it per card pick, a rate the
+//! family passes, from the unit's own counts. [`admit_walk`] walks the host
+//! experts hottest first, admitting while the card chain stays under the
+//! union, and returns the floor (the coldest admit's count, a
+//! rank-contiguous set) and the backlog bound: exactly the jobs whose copies
+//! fit inside the union's shadow, the rest staging alone ahead of it.
+//! [`walk_gate`] is the least unit width whose picks could pay the walk's
+//! first admit: a prompt narrower than it admits nothing whatever its
+//! counts, so a caller gates on it before it counts.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -69,8 +71,9 @@ pub struct Constants {
     pub union_burst_share: f64,
     /// The card route's tail past a layer's last copy [µs]: the work the
     /// pipeline cannot hide behind the copies, the walk's card chain ends
-    /// with it. A family row without one carries 0; the model that measured
-    /// its route sets its own at its walk. The ring's rule never reads it.
+    /// with it. A family row carries 0; [`unit_constants`] sets the unit's
+    /// own, a family rate times the unit's card picks. The ring's rule and
+    /// [`walk_gate`] never read it.
     pub card_tail_us: f64,
     /// One routed expert's bytes in the layer [B].
     pub expert_b: u64,
@@ -104,6 +107,56 @@ pub fn union_burst_share(cols: u64, listed: u64, k: &Constants) -> f64 {
         return 0.0;
     }
     fixed / whole
+}
+
+/// A unit's constants for the walk: `k` with the unit's own burst share
+/// ([`union_burst_share`] over the host experts' columns and the listed ones
+/// among them) and its card tail, `card_tail_us_per_pick` [µs per card pick]
+/// times the unit's card picks — the routed picks `counts` holds less the
+/// columns the `host` experts take, the host set as the pick finds it, before
+/// its admits move. The route's tail is a level per unit
+/// width, so it is priced from the unit's counts and never set once for the
+/// family; `card_tail_us_per_pick` is the family's rate, 0 where no record
+/// has priced its route.
+///
+/// Refused by name: counts of another length than the layer's experts, a
+/// host list naming an expert outside the layer, or one that takes more
+/// columns than the unit routed (an expert named twice), and a rate that is
+/// not finite and 0 or more.
+///
+/// # Errors
+/// Every refusal names its input; see [`SplitError`].
+pub fn unit_constants(
+    k: &Constants,
+    card_tail_us_per_pick: f64,
+    counts: &[u32],
+    host: &[u32],
+) -> Result<Constants, SplitError> {
+    if !(card_tail_us_per_pick.is_finite() && card_tail_us_per_pick >= 0.0) {
+        return Err(SplitError::Param {
+            name: "card_tail_us_per_pick",
+            range: "finite, 0 or more",
+        });
+    }
+    let total = check_counts(counts, k)?;
+    let mut listed = 0u64;
+    let mut cols = 0u64;
+    for &id in host {
+        let count = *counts.get(id as usize).ok_or(SplitError::HostOutOfRange {
+            id,
+            experts: k.experts,
+        })?;
+        listed += u64::from(count > 0);
+        cols += u64::from(count);
+    }
+    let card_picks = total.checked_sub(cols).ok_or(SplitError::Param {
+        name: "host",
+        range: "each expert once",
+    })?;
+    let mut unit = *k;
+    unit.union_burst_share = union_burst_share(cols, listed, &unit);
+    unit.card_tail_us = card_tail_us_per_pick * card_picks as f64;
+    Ok(unit)
 }
 
 /// The beside-union copy rate [B/µs]: the lane's measured rate less the
@@ -229,12 +282,19 @@ pub fn admit_walk(
     Ok(plan)
 }
 
-/// The least unit width whose picks could pay the walk's first admit: any
-/// admit needs the union to cost at least one copy beside it and the card's
-/// tail, and a unit of `m` columns costs the union at most `top_k·m` of
+/// The least unit width whose picks could pay the walk's first admit: an
+/// admit needs the union to cost at least one copy beside it (the first
+/// admit's copy and the card's tail ahead of it, the union less the expert it
+/// loses), and a unit of `m` columns costs the union at most `top_k·m` of
 /// both the fixed and the per-column kind — an expert listed at most once a
-/// column. A prompt narrower than the gate admits nothing whatever its
-/// counts, so a caller gates before it counts. In columns.
+/// column. The tail is not an input: it is the rate times the card picks,
+/// and a unit whose every pick sits on the host has none, where the union is
+/// the largest, so a bound that never skips a unit the walk would admit from
+/// takes it at 0. The copy is priced at `k`'s beside-union rate; a unit's own
+/// share only slows it, so a `k` with no share (the family's) under-states
+/// the gate and never over-states it. A prompt narrower than the gate admits
+/// nothing whatever its counts, so a caller gates before it counts. In
+/// columns.
 #[must_use]
 pub fn walk_gate(k: &Constants) -> u32 {
     let copy_us = k.expert_b as f64 / beside_b_per_us(k);
@@ -242,7 +302,7 @@ pub fn walk_gate(k: &Constants) -> u32 {
     if per_pick <= 0.0 {
         return 1;
     }
-    let gate = ((copy_us + k.card_tail_us) / per_pick).ceil();
+    let gate = (copy_us / per_pick).ceil();
     if !(gate.is_finite() && gate >= 1.0 && gate < f64::from(u32::MAX)) {
         return u32::MAX;
     }
@@ -577,7 +637,8 @@ mod tests {
     /// column, the lane's measured rate, the recalibrated tile-path host
     /// union (W 19.95, c 3.67), the common layer kind's expert bytes, the
     /// card's per-expert costs (13 + 0.16 a column), the calibration shape's
-    /// burst share and the fitted route tail.
+    /// burst share and a flat route tail of 4690, which the tests that set
+    /// their own tail overwrite.
     /// beside = 21190 × (1 − 0.381) = 13116.6,
     /// m* = (3072000/13116.6 + 13)/(3.67 − 0.16) = 247.207/3.51 = 70.429,
     /// m_min = ceil(70.429 × 51.2) = ceil(3605.98) = 3606.
@@ -614,7 +675,7 @@ mod tests {
     /// (7.8 + 0.096 a column).
     /// beside = 21200 × 0.619 = 13122.8,
     /// m* = (3072000/13122.8 + 7.8)/(6.2 − 0.096) = 241.897/6.104 = 39.629,
-    /// m_min = ceil(39.629 × 51.2) = ceil(2025.01) = 2026.
+    /// m_min = ceil(39.629 × 51.2) = ceil(2029.01) = 2030.
     fn their_5090() -> Constants {
         Constants {
             lane_b_per_us: 21200.0,
@@ -884,7 +945,7 @@ mod tests {
     /// The 5090 shape: the same 512 experts and routing, 5482/48 → 114 on the
     /// card and 398 on the host, a pool of its 2746 churn slots / 48 → 57. At
     /// 4096 columns every expert carries 80, past the floor of 39.629, and the
-    /// unit clears m_min 2026: the pool admits ids 114..171 and the ring
+    /// unit clears m_min 2030: the pool admits ids 114..171 and the ring
     /// streams all 341 host experts past them, 341/398 of the host tier; the
     /// union keeps none (mutants: the rule's inequality reversed, m_min
     /// without the router's top-k).
@@ -902,15 +963,21 @@ mod tests {
     /// m* and m_min on all three machines' calibrations, each derived in its
     /// constants' comment (mutants: the card's fixed cost subtracted, the
     /// mean without the choice set's spread).
+    ///
+    /// PIN(2026-10-08): m* 23.096, 23.709, 25.017 and m_min 1183, 1214, 1281
+    /// before the rule priced its copies beside the union; now m* 70.429,
+    /// 72.178, 39.629 and m_min 3606, 3696, 2030, the values the constants'
+    /// comments derive at the beside-union rate (A6000: (3072000/13116.6 +
+    /// 13)/(3.67 - 0.16) = 70.429).
     #[test]
     fn m_min_on_all_three_machines() {
-        assert!((m_star(&a6000()) - 23.096).abs() < 0.001);
-        assert!((m_star(&a3090()) - 23.709).abs() < 0.001);
-        assert!((m_star(&their_5090()) - 25.017).abs() < 0.001);
+        assert!((m_star(&a6000()) - 70.429).abs() < 0.001);
+        assert!((m_star(&a3090()) - 72.178).abs() < 0.001);
+        assert!((m_star(&their_5090()) - 39.629).abs() < 0.001);
         for (name, k, want) in [
-            ("A6000", a6000(), 1183),
-            ("3090", a3090(), 1214),
-            ("5090", their_5090(), 1281),
+            ("A6000", a6000(), 3606),
+            ("3090", a3090(), 3696),
+            ("5090", their_5090(), 2030),
         ] {
             assert_eq!(m_min(&k), want, "{name}");
         }
@@ -1096,6 +1163,24 @@ mod tests {
         );
     }
 
+    /// Constants of 8 experts routed two a column whose first admit's copy
+    /// is 1000 (a 10^6 B expert over a lane of 1000 B a microsecond), no burst share and
+    /// no tail, for the gate and the unit pricing: W 50, c 10.
+    fn gate_shape() -> Constants {
+        Constants {
+            lane_b_per_us: 1000.0,
+            host_us_per_col: 10.0,
+            host_us_fixed: 50.0,
+            card_us_fixed: 13.0,
+            card_us_per_col: 0.16,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
+            expert_b: 1_000_000,
+            experts: 8,
+            top_k: 2,
+        }
+    }
+
     /// The lever-2 log's layer-1 shape (4137 columns over 212 listed host
     /// experts) as a counts vector: the admits' worth uniform from the
     /// today-floor 25 to the layer's hottest count 52, the union's listed
@@ -1252,17 +1337,228 @@ mod tests {
         assert_eq!(plan.floor, 40, "the two hottest alone");
     }
 
-    /// The walk's gate: a unit narrower than the least width whose picks
-    /// could pay the first admit admits nothing, and the gate is that
-    /// derivation, one copy and the tail over a pick's worth of the union
-    /// (mutant: the gate without the tail).
+    /// The walk's gate is the first admit's copy over a pick's worth of the
+    /// union, with no tail: at the 8-expert shape's copy of 1000 (a
+    /// 10^6 B expert over a lane of 1000 B a microsecond) and (50 + 10) × 2 = 120 a
+    /// column the gate is ⌈1000/120⌉ = 9, whatever tail the constants carry
+    /// (mutant: the gate reading the tail, which 4690 would lift to 48).
+    ///
+    /// PIN(2026-10-08): the gate pinned 21 at the family's flat 4690 µs tail
+    /// ((234.2 + 4690)/(19.95 + 3.67) × 10); the tail is now a level per
+    /// unit width the walk prices from the unit's counts, which a gate before
+    /// the counts cannot read, so the gate is derived at the tail's least
+    /// value, 0, and is 1 at the A6000 shape.
     #[test]
-    fn the_walks_gate_covers_the_first_admits_copy_and_tail() {
+    fn the_walks_gate_is_the_copy_over_a_picks_union() {
+        let mut k = gate_shape();
+        assert_eq!(walk_gate(&k), 9);
+        k.card_tail_us = 4690.0;
+        assert_eq!(walk_gate(&k), 9, "the tail is not an input of the gate");
+        let a = a6000();
+        // 234.2 / ((19.95 + 3.67) x 10) = 0.99 -> 1.
+        assert_eq!(walk_gate(&a), 1);
+    }
+
+    /// The gate never skips a unit the walk would admit from: over every
+    /// unit width under it, a thousand units each at random picks over 512 experts and a
+    /// random host set admit nothing at the worst tail (none), and over the
+    /// widths past it some unit admits (the gate is not vacuous). A walk gate
+    /// that read the 4690 tail would skip the widths 9..48 these units
+    /// admit at (mutant: the gate with a tail).
+    #[test]
+    fn the_walks_gate_never_skips_a_unit_the_walk_admits_from() {
+        let k = Constants {
+            experts: 512,
+            ..gate_shape()
+        };
+        let gate = walk_gate(&k);
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n
+        };
+        let mut admitted_past = 0;
+        for m in 1..=3 * gate as usize {
+            for _ in 0..1000 {
+                let mut counts = vec![0u32; 512];
+                for _ in 0..m {
+                    let a = next(512) as usize;
+                    let b = (a + 1 + next(511) as usize) % 512;
+                    counts[a] += 1;
+                    counts[b] += 1;
+                }
+                let host: Vec<u32> = (0..512).filter(|_| next(4) != 0).collect();
+                let mut unit = unit_constants(&k, 0.0, &counts, &host).unwrap();
+                // The gate's copy is at no share, the walk's best case: a
+                // unit's own share only slows the copy.
+                unit.union_burst_share = 0.0;
+                let plan = admit_walk(&counts, &host, &unit, 1).unwrap();
+                let admits = plan.floor != u32::MAX;
+                if m < gate as usize {
+                    assert!(
+                        !admits,
+                        "a unit of {m} columns admits under the gate {gate}"
+                    );
+                } else {
+                    admitted_past += usize::from(admits);
+                }
+            }
+        }
+        assert!(
+            admitted_past > 0,
+            "no unit past the gate admits: a vacuous gate"
+        );
+    }
+
+    /// A unit's tail is the rate times its card picks and its share the
+    /// union's own: of 40 routed picks, 4 + 4 sit on two listed host experts
+    /// (a third host expert is unrouted) and 12 + 20 on the card, so 32 card
+    /// picks at 0.5 each make 16 (mutant: the tail from the host's columns,
+    /// 8 picks, not the card's).
+    #[test]
+    fn a_units_tail_is_the_rate_times_its_card_picks() {
+        let k = Constants {
+            card_tail_us: 7.0,
+            union_burst_share: 0.9,
+            ..gate_shape()
+        };
+        let counts = [4, 4, 0, 0, 12, 20, 0, 0];
+        let host = [0, 1, 2];
+        let unit = unit_constants(&k, 0.5, &counts, &host).unwrap();
+        assert_eq!(unit.card_tail_us, 16.0, "32 card picks at 0.5");
+        // W x 2 listed over W x 2 + c x 8 columns = 100/180.
+        assert!((unit.union_burst_share - 100.0 / 180.0).abs() < 1e-12);
+        assert_eq!(unit.lane_b_per_us, k.lane_b_per_us);
+        let none = unit_constants(&k, 0.0, &counts, &host).unwrap();
+        assert_eq!(none.card_tail_us, 0.0, "a family with no rate has no tail");
+    }
+
+    /// Every input the pricing cannot read is refused by name (mutants: the
+    /// host bound unchecked, the subtraction unchecked, the rate unchecked).
+    #[test]
+    fn a_units_pricing_refuses_by_name() {
+        let k = gate_shape();
+        let counts = [4, 4, 0, 0, 12, 20, 0, 0];
+        assert_eq!(
+            unit_constants(&k, 0.5, &counts, &[0, 8]),
+            Err(SplitError::HostOutOfRange { id: 8, experts: 8 })
+        );
+        assert_eq!(
+            unit_constants(&k, 0.5, &counts[..4], &[0]),
+            Err(SplitError::CountsShape { len: 4, want: 8 })
+        );
+        let twice = unit_constants(&k, 0.5, &[40, 0, 0, 0, 0, 0, 0, 0], &[0, 0]);
+        assert_eq!(
+            twice,
+            Err(SplitError::Param {
+                name: "host",
+                range: "each expert once"
+            })
+        );
+        for bad in [-0.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                unit_constants(&k, bad, &counts, &[0]),
+                Err(SplitError::Param {
+                    name: "card_tail_us_per_pick",
+                    range: "finite, 0 or more"
+                }),
+                "the rate {bad}"
+            );
+        }
+    }
+
+    /// The 512-column unit of the A6000 plan (a) Q4 file, as the
+    /// walk sees it before a pick: 130 listed host experts, the first 20 the
+    /// admits' worth (110 down to 50 columns), the next 30 under them (50
+    /// down to 6), the rest 5 each, 2863 columns on the host; the 382 card
+    /// experts take the other 2257 of the unit's 5120 picks. [derived] from
+    /// the 512-column calls' per-layer medians (129.5 listed host experts,
+    /// 1581 kept columns, the admits' columns past it); a stand, not a
+    /// record.
+    fn unit512() -> (Vec<u32>, Vec<u32>) {
+        let mut counts = vec![0u32; 512];
+        for (i, c) in counts[..20].iter_mut().enumerate() {
+            *c = u32::try_from(110 - (i * 60) / 19).expect("a count");
+        }
+        for (i, c) in counts[20..50].iter_mut().enumerate() {
+            *c = u32::try_from(50 - (i * 44) / 29).expect("a count");
+        }
+        counts[50..130].fill(5);
+        let host_cols: u32 = counts[..130].iter().sum();
+        let card = 5120 - host_cols;
+        for (j, c) in counts[130..].iter_mut().enumerate() {
+            *c = card / 382 + u32::from((j as u32) < card % 382);
+        }
+        assert_eq!(counts.iter().sum::<u32>(), 5120);
+        (counts, (0..130).collect())
+    }
+
+    /// The admits the walk makes over `unit512`'s host set at constants `k`:
+    /// the host experts at or over its floor.
+    fn walk_admits(counts: &[u32], host: &[u32], k: &Constants) -> usize {
+        let plan = admit_walk(counts, host, k, 1).unwrap();
+        host.iter()
+            .filter(|&&id| counts[id as usize] >= plan.floor)
+            .count()
+    }
+
+    /// The ring's rule never reads the card's tail: m*, m_min and the tail's
+    /// split are the same at no tail, at the flat 4690 and at a unit's
+    /// priced one (the negative witness of the tail's pricing: the ring's
+    /// floor moves with nothing the walk's tail sets; mutant: the floor
+    /// reading the tail as a fixed cost).
+    #[test]
+    fn the_rings_rule_never_reads_the_tail() {
+        let (counts, host) = unit512();
+        let base = a6000();
+        let priced = unit_constants(&base, 0.125, &counts, &host).unwrap();
+        let mut zero = priced;
+        zero.card_tail_us = 0.0;
+        let mut flat = priced;
+        flat.card_tail_us = 4690.0;
+        let (mut a, mut b, mut c) = (Split::default(), Split::default(), Split::default());
+        for (k, out) in [(&zero, &mut a), (&flat, &mut b), (&priced, &mut c)] {
+            assert_eq!(m_star(k), m_star(&zero));
+            assert_eq!(m_min(k), m_min(&zero));
+            split(&counts, &host, 22, k, out).unwrap();
+        }
+        assert_eq!((&a, &b), (&b, &c));
+    }
+
+    /// The tail priced per card pick at a 512-column unit lands the
+    /// 989-class (a call's 989 admits over 48 layers, 20.6 a layer): the
+    /// walk admits 22 here, its tail 0.125 x 2257 = 282.125. The flat
+    /// 4690 the family carried before stops it at 11, under the class, and
+    /// a tail of 0 over-admits at 23 (mutants: the tail left at the family's
+    /// 4690, the tail left at 0 whatever the rate).
+    #[test]
+    fn the_priced_tail_admits_the_class_a_flat_tail_cannot() {
+        const CLASS: f64 = 989.0 / 48.0;
+        let (counts, host) = unit512();
         let k = a6000();
-        // (234.2 + 4690) / (19.95 + 3.67) x 10 = 20.85 -> 21.
-        assert_eq!(walk_gate(&k), 21);
-        let mut no_tail = k;
-        no_tail.card_tail_us = 0.0;
-        assert_eq!(walk_gate(&no_tail), 1);
+        let priced = unit_constants(&k, 0.125, &counts, &host).unwrap();
+        let at = walk_admits(&counts, &host, &priced);
+        let mut flat = priced;
+        flat.card_tail_us = 4690.0;
+        let under = walk_admits(&counts, &host, &flat);
+        let mut zero = priced;
+        zero.card_tail_us = 0.0;
+        let over = walk_admits(&counts, &host, &zero);
+        assert!(
+            at as f64 >= CLASS,
+            "the priced tail admits {at}, under the class {CLASS}"
+        );
+        assert!(
+            (under as f64) < CLASS,
+            "a flat tail admits {under}, the class {CLASS}"
+        );
+        assert!(
+            over > at,
+            "no tail admits {over}, no more than the priced {at}"
+        );
+        assert_eq!((at, under, over), (22, 11, 23));
+        assert_eq!(priced.card_tail_us, 0.125 * 2257.0);
     }
 }

@@ -1900,7 +1900,9 @@ pub static CALL_STREAM: Kind = Kind {
           admitted, the backlog bound it waited on, 1 when the floor came from no probe (a \
           family's caller marks its own; an unmarked one leaves the part out), and 1 when the \
           pick was the machine's refusal (a victim the host could not serve), whose kept 0 is \
-          no choice.",
+          no choice. The two last, on every pick that was not refused: the admitted experts' \
+          summed counts (the columns that leave the host union) and the victims' (the columns \
+          that move back to it).",
     parts: &[
         key("group", U64, ""),
         key("layer", U64, ""),
@@ -1915,6 +1917,8 @@ pub static CALL_STREAM: Kind = Kind {
         opt("backlog", U64, ""),
         opt("fallback", U64, ""),
         opt("refused", U64, ""),
+        opt("admit_cols", U64, ""),
+        opt("victim_cols", U64, ""),
     ],
 };
 
@@ -3420,7 +3424,8 @@ pub fn prompt_stats(s: &PromptStats) -> Vec<Record> {
 
 /// A prompt call's pick record, of group `group`. The optional parts print
 /// only where the pick measured them: a refused pick carries `refused`
-/// alone, a pick that moved nothing leaves `staged_us` out.
+/// alone, a pick that moved nothing leaves `staged_us` out, and a pick that
+/// ran carries its admit and victim columns (0 when it moved nothing).
 #[cfg(feature = "gpu")]
 pub fn call_stream(group: usize, p: &CallPick) -> Record {
     let r = Record::new(&CALL_STREAM)
@@ -3455,7 +3460,8 @@ pub fn call_stream(group: usize, p: &CallPick) -> Record {
     if p.refused > 0 {
         r.u("refused", u64::from(p.refused))
     } else {
-        r
+        r.u("admit_cols", p.admit_cols)
+            .u("victim_cols", p.victim_cols)
     }
 }
 

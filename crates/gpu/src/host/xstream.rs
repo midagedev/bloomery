@@ -1541,7 +1541,7 @@ mod tests {
             card_us_fixed: 13.0,
             card_us_per_col: 0.16,
             union_burst_share: 0.381,
-            card_tail_us: 4690.0,
+            card_tail_us: 0.0,
             expert_b: 3072000,
             experts: 512,
             top_k: 10,
@@ -1553,6 +1553,13 @@ mod tests {
     /// id ascending, the rest's columns kept (mutants: the hottest left in
     /// `admit`, the unit gate dropped, the floor dropped from the hottest's
     /// way back).
+    ///
+    /// PIN(2026-10-08): the streamed set (400..480) and the kept columns
+    /// 32 x 20 = 640 held at m* 23.1; the rule now prices its copy beside the
+    /// union, m* 70.429 (the constants' derivation), so the 40 experts at 60
+    /// columns (440..480) sit under it and stay on the union: the streamed
+    /// set is (400..440), the 40 at 80, and the kept columns are
+    /// 40 x 60 + 32 x 20 = 3040.
     #[test]
     fn the_tail_is_the_rules_whole_set_with_nothing_admitted() {
         let k = a6000();
@@ -1569,9 +1576,9 @@ mod tests {
         let mut out = Split::default();
         stream_tail(&counts, &host, &k, &mut out).unwrap();
         assert!(out.admit.is_empty());
-        let want: Vec<u32> = (400..480).collect();
+        let want: Vec<u32> = (400..440).collect();
         assert_eq!(out.stream, want);
-        assert_eq!(out.host_columns, 32 * 20);
+        assert_eq!(out.host_columns, 40 * 60 + 32 * 20);
         // A 512-column unit is under m_min: nothing streams.
         let small = [10u32; 512];
         stream_tail(&small, &host, &k, &mut out).unwrap();
@@ -1596,6 +1603,11 @@ mod tests {
     /// constants carry (mutants: the admits left off the lane, the stacks'
     /// columns dropped, the kept union dropped, the cut one late, the copies
     /// at the lane's own rate).
+    ///
+    /// PIN(2026-10-08): the cuts 76, 56, 90, 69 and 7 held at the copy priced
+    /// at the lane's own rate (145.07); the copy is now beside the union
+    /// (234.2), so each cut re-derives from the comment's own arithmetic
+    /// below: 53, 10, 71, 44 and 5.
     #[test]
     fn the_balance_stops_where_the_lane_passes_the_union() {
         let k = a6000();
@@ -1610,23 +1622,23 @@ mod tests {
             kept_us,
             card_us,
         };
-        assert_eq!(balance_cut(&stream, &counts, &k, side(0, 0.0, 0.0)), 76);
+        assert_eq!(balance_cut(&stream, &counts, &k, side(0, 0.0, 0.0)), 53);
         // 100 admits ahead on the lane take 23,420.7 of it first: with n
         // streamed, 23,420.7 + 260.0 n against 293.6 (100 - n), so 10.
-        assert_eq!(balance_cut(&stream, &counts, &k, side(100, 0.0, 0.0)), 56);
+        assert_eq!(balance_cut(&stream, &counts, &k, side(100, 0.0, 0.0)), 10);
         // The union the rule keeps anyway counts on the host's side: 10,000
-        // of it cancels the same way, 260.0 n against 293.6 (100 - n), so 53.
+        // of it adds to it, 260.0 n against 10,000 + 293.6 (100 - n), so 71.
         assert_eq!(
             balance_cut(&stream, &counts, &k, side(0, 10_000.0, 0.0)),
-            90
+            71
         );
         // The stacks' own columns count on the card's side: 5,000 of them,
         // 5,000 + 260.0 n against 293.6 (100 - n), so 44.
-        assert_eq!(balance_cut(&stream, &counts, &k, side(0, 0.0, 5_000.0)), 69);
+        assert_eq!(balance_cut(&stream, &counts, &k, side(0, 0.0, 5_000.0)), 44);
         // Ten candidates: 260.0 n against 293.6 (10 - n), so 5.
         assert_eq!(
             balance_cut(&stream[..10], &counts, &k, side(0, 0.0, 0.0)),
-            7
+            5
         );
     }
 }
