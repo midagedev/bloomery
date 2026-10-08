@@ -31,6 +31,11 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ## Status (0.2.6)
 
+> **Known issue in 0.2.6** ([#3](https://github.com/midagedev/bloomery/issues/3)): with the MTP draft on (the default
+> for Qwen3.8 and GLM-5.3), a request can stop with `MTP window: a step after rows whose hidden rows the step's own
+> arena held` and the server exits. It is intermittent. Workaround: start the server with `BLOOMERY_MTP_WIDTH=fixed`
+> (or `BLOOMERY_DRAFT=off`). The fix ships in 0.2.7.
+
 | Area | State |
 |---|---|
 | Linux x86-64, NVIDIA sm_86 (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number here comes from these cards |
