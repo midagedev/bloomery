@@ -93,7 +93,7 @@
 //!   mutant: the machine not marked broken).
 //! - panic: a source that panics on a flip's expert is a named error at or
 //!   before the boundary the flip lands at, within the deadline (its mutant:
-//!   no catch on the staging thread).
+//!   no catch on the lane's threads).
 //! - pinned: no flip evicts a pinned seed expert and each keeps its slot for
 //!   the whole run, while flips evict other seed experts.
 //! - fault code: the driver error the copy stream's query returns at a drop
@@ -101,11 +101,28 @@
 //!   prints it (its mutant: the code dropped, the word `fault` alone).
 //! - stall: a victim that takes longer to prepare than the machine's
 //!   deadline is a named error at the boundary it would land at, returned
-//!   before the preparation ends; the machine dropped then leaves its
-//!   staging thread to finish, never that thread's to free, and reports the
-//!   leak by name.
-//! - placement: a machine built on a thread pinned to one cpu runs its
-//!   staging thread off that cpu.
+//!   before the preparation ends; the machine dropped then leaves its lane
+//!   threads to finish, never one of theirs to free, and reports the leak by
+//!   name.
+//! - placement: a machine built on a thread pinned to one cpu runs each of
+//!   its lane threads off that cpu.
+//! - lane-a: a reset under a closed window (c7's arm, every job's staging
+//!   paced so that jobs taken one after another overlap) stages its seed
+//!   copies on two lane threads or more, back at the seed, and the trace
+//!   after it gives the fresh run's values (its mutant: one lane thread).
+//! - lane-b: c1's history with the copies prompt and every job's staging
+//!   paced stages the jobs the window opened one at a time (`peak_window`
+//!   1), with the prompt run's values and flips; the reset above and c3's
+//!   history under a closed window, paced too, stage the jobs a flush or a
+//!   landing opened several at once (`peak_open` 2 or more), the held run
+//!   with the prompt run's values and every landing late (its mutants: the
+//!   receive lock released before a window job's stage; a job's gate judged
+//!   outside the lock — each a `peak_window` past 1).
+//! - lane-c: a pick of more admits than the ring holds, its copies held on
+//!   the copy stream while the lane stages, leaves every admitted slot with
+//!   its admit's bytes once released: a job that takes a ring slot again
+//!   waits for that slot's last copy to drain (its mutant: no drained wait,
+//!   the slot's bytes overwritten before its copy reads them).
 //! - leaks: once every machine is dropped, the stall arm's is the one leak
 //!   reported.
 //! - queue: two arms, each a run to its last flip and a reset under a closed
@@ -116,7 +133,7 @@
 //!   in-flight bound refuses that by name unless the reset's copies stage as
 //!   they are issued. The heavy arm, run only once the light one passes,
 //!   adds [`INFLATE`] copy stream commands a part (one job then carries more
-//!   than the stream queues): a job reaches the staging thread before its
+//!   than the stream queues): a job reaches the lane before its
 //!   commands reach the copy stream, and the reset's copies go out a ring's
 //!   worth at a time, so the host never blocks enqueuing behind copies
 //!   nothing stages. Its mutants: the job sent after its commands; the
@@ -173,8 +190,8 @@
 //! - s6 landing batches: a pick of six admits reports a live batch (no event,
 //!   the layer's places with every victim and every admit `HOST`) and landing
 //!   batches of a third of the admits in ascending slot order, each row
-//!   naming its own admits at their slots alone; with the staging thread held
-//!   at the fourth job, the first batch's event alone lands its slots and
+//!   naming its own admits at their slots alone; with the lane held at the
+//!   later batches' jobs, the first batch's event alone lands its slots and
 //!   leaves the later batches' uncopied, and every batch's event lands all
 //!   (its mutants: every batch's event recorded after the last copy; each
 //!   batch's first admit in the previous batch's row).
@@ -204,17 +221,19 @@
 //!   pages a fault brings back as the same bytes; only the time moves, and
 //!   the records now show it.
 //!
-//! - s8 backlog: a pick's wait for the staging thread returns at the bound
-//!   the call's setter named. With the staging thread held at its first job,
-//!   a pick of three admits under a bound of three issues all its jobs and
+//! - s8 backlog: a pick's wait for the lane returns at the bound the call's
+//!   setter named. With the lane held at every job, a pick of three admits
+//!   under a bound of three issues all its jobs, each taken by a lane thread
+//!   up to the lane's threads, and
 //!   returns; under a bound of two it is refused by name at its third job,
 //!   the message naming the bound, and a bound of no jobs and a bound set
 //!   with no call open are refused by name (its mutants: the setter's value
 //!   never stored, so the pick waits on the machine's own bound; the wait's
 //!   bound one job loose).
 //! - s9 staged: a pick's `staged_us` is the wall from the pick's start to
-//!   the staging of its layer's last pick job. With the staging thread let
-//!   through the first of a two-admit pick's jobs and held at the second for
+//!   the staging of its layer's last pick job. With the lane let through
+//!   the first of a two-admit pick's jobs to reach the source and held at the
+//!   other for
 //!   the settle time, the call's end reads it at the settle time or more,
 //!   past the pick's own host time, and a pick that admits nothing reads 0
 //!   (its mutants: the stamp posted at the layer's first job, which the
@@ -224,7 +243,7 @@
 //! Evicted (a host set populated and not locked, whose pages the page cache
 //! lets go): a victim not host-resident when the machine decides is read
 //! back in and the flip goes on — at a boundary whose landing victims the
-//! staging thread prepared and lost again, at a call's pick and at the end
+//! lane prepared and lost again, at a call's pick and at the end
 //! of a call not kept — each arm running to its end with the values, card
 //! sets and flips of its twin without the fault, and counting the experts it
 //! read in again (its mutant: no prepare in the machine's one decision,
@@ -246,10 +265,11 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats, RING_SLOTS};
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
     use bloomery_gpu::host::swap::{
         CallCfg, CallPick, CallReport, HostSite, Leak, LeakReason, MachineCfg, PassReport, Piece,
@@ -287,14 +307,18 @@ mod gate {
     /// How soon a dropped machine's copy stream must drain; a copy it left
     /// waiting on the slow victim's ticket never does.
     const RELEASED: Duration = Duration::from_millis(500);
-    /// How long after its drop the stall arm's staging thread may take to
-    /// end: the slow preparation it was left inside, and its exit.
+    /// How long after its drop the stall arm's lane threads may take to
+    /// end: the slow preparation one was left inside, and their exits.
     const JOINED: Duration = Duration::from_secs(4);
     /// The gate's own bound on a pass's engine stream.
     const ENGINE_DRAIN: Duration = Duration::from_secs(30);
     /// How long a held arm lets the unheld side run before it looks: every
     /// copy and launch here takes microseconds.
     const HOLD_SETTLE: Duration = Duration::from_millis(200);
+    /// How long a paced job's staging takes ([`Pace`]): far past a lane
+    /// thread's wake from the receive lock, so a job the lane takes while
+    /// another stages overlaps it.
+    const PACE: Duration = Duration::from_millis(5);
     const DELAY: u64 = 3;
     /// Copy stream commands the queue arm's source adds to each part it
     /// copies: one job then carries thousands and a reset's seed copies tens
@@ -442,7 +466,7 @@ mod gate {
     /// What an arm's source does wrong: `stuck` experts never become
     /// host-resident, `evicted` ones lose their pages after every prepare
     /// but the machine's own thread's — not resident from the load,
-    /// `all_resident` or not, and a staging thread's prepare of one leaves
+    /// `all_resident` or not, and a lane thread's prepare of one leaves
     /// it not resident (the page cache let it go again before the machine
     /// looked) — `slow` ones take `SLOW` to prepare, `fail_source` and
     /// `panic_source` fail or panic when their bytes are read, every stack
@@ -462,26 +486,42 @@ mod gate {
         /// Every expert host-resident from the load (a churn pool the load's
         /// host set holds), bar the stuck ones.
         all_resident: bool,
-        /// Holds the staging thread inside the source from a job on.
+        /// Holds the lane inside the source from a job on.
         hold: Option<Arc<SourceHold>>,
+        /// Paces every job's staging while it is on.
+        pace: Option<Arc<Pace>>,
     }
 
-    /// A gate-side hold on the staging thread, which stages a call's jobs in
-    /// order: once armed, the source blocks reading the part 0 of every job
-    /// from the `allow`-th on (counted from the arming) until it is opened,
-    /// so the copies of the jobs before it land and the later ones stay
-    /// behind their staging word.
+    /// A gate-side hold on the lane: once armed, the source blocks reading
+    /// the part 0 of a job until it is opened — every job from the
+    /// `allow`-th to reach the source on (counted from the arming), or,
+    /// armed by experts, every job of those — so the copies of the jobs it
+    /// lets through land and the others stay behind their staging word. The
+    /// lane's threads reach the source in no fixed order, so a hold that
+    /// must let given jobs through names their experts.
     #[derive(Debug, Default)]
     struct SourceHold {
         armed: AtomicBool,
         open: AtomicBool,
         allow: std::sync::atomic::AtomicUsize,
         seen: std::sync::atomic::AtomicUsize,
+        /// Armed by experts: the ids it holds, whatever their order.
+        ids: Mutex<Option<Vec<u32>>>,
     }
 
     impl SourceHold {
         /// Let `allow` jobs through from here, hold the rest.
         fn arm(&self, allow: usize) {
+            self.arm_with(allow, None);
+        }
+
+        /// Hold the jobs of experts `ids` from here, let the rest through.
+        fn arm_ids(&self, ids: &[u32]) {
+            self.arm_with(0, Some(ids.to_vec()));
+        }
+
+        fn arm_with(&self, allow: usize, ids: Option<Vec<u32>>) {
+            *self.ids.lock().unwrap_or_else(PoisonError::into_inner) = ids;
             self.seen.store(0, Ordering::Release);
             self.allow.store(allow, Ordering::Release);
             self.open.store(false, Ordering::Release);
@@ -492,21 +532,54 @@ mod gate {
             self.open.store(true, Ordering::Release);
         }
 
-        /// Jobs the staging thread has taken since the arming.
+        /// Jobs the lane has taken to the source since the arming.
         fn taken(&self) -> usize {
             self.seen.load(Ordering::Acquire)
         }
 
-        /// The source's side: called with each job's part 0.
-        fn pass(&self) {
+        /// The source's side: called with each job's part 0, expert `id`.
+        fn pass(&self, id: u32) {
             if !self.armed.load(Ordering::Acquire) {
                 return;
             }
             let k = self.seen.fetch_add(1, Ordering::AcqRel);
-            if k >= self.allow.load(Ordering::Acquire) {
+            let held = match &*self.ids.lock().unwrap_or_else(PoisonError::into_inner) {
+                Some(ids) => ids.contains(&id),
+                None => k >= self.allow.load(Ordering::Acquire),
+            };
+            if held {
                 while !self.open.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+            }
+        }
+    }
+
+    /// A gate-side pace on the lane: while on, every job's staging takes
+    /// [`PACE`] at its part 0, as a model expert's memcpy takes its time; a
+    /// synthetic expert's own staging takes less than a lane thread's wake
+    /// from the receive lock, so without it the jobs the lane takes one
+    /// after another never stage at once.
+    #[derive(Debug)]
+    struct Pace {
+        on: AtomicBool,
+    }
+
+    impl Pace {
+        fn new(on: bool) -> Pace {
+            Pace {
+                on: AtomicBool::new(on),
+            }
+        }
+
+        fn set(&self, on: bool) {
+            self.on.store(on, Ordering::Release);
+        }
+
+        /// The source's side: called with each job's part 0.
+        fn pass(&self) {
+            if self.on.load(Ordering::Acquire) {
+                std::thread::sleep(PACE);
             }
         }
     }
@@ -600,7 +673,7 @@ mod gate {
     }
 
     /// The tids of this process's threads named as the swap machine names
-    /// its staging thread.
+    /// its lane threads.
     fn staging_tids() -> Result<Vec<String>, GateError> {
         let mut out = Vec::new();
         for t in std::fs::read_dir("/proc/self/task")? {
@@ -648,9 +721,10 @@ mod gate {
     }
 
     /// placement: a machine built on a thread pinned to one cpu (as a
-    /// binary's step thread is) runs its staging thread off that cpu: the
-    /// staging copies never take turns with the step. With no pool built the
-    /// staging thread floats, its mask wider than the one cpu.
+    /// binary's step thread is) runs each of its [`LANE_THREADS`] lane
+    /// threads off that cpu: the staging copies never take turns with the
+    /// step. With no pool built the lane threads float, each one's mask wider
+    /// than the one cpu.
     fn placement(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
         let wide = threads::helper::mask()?;
         let Some(&c) = wide.first().filter(|_| wide.len() > 1) else {
@@ -663,23 +737,31 @@ mod gate {
         let restored = set_mask(&wide);
         let r = built?;
         restored?;
-        let tid = staging_tids()?
-            .into_iter()
-            .find(|t| !before.contains(t))
-            .ok_or("gate_swap: the machine's staging thread")?;
-        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
-        let list = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
-            .ok_or("gate_swap: Cpus_allowed_list")?
-            .trim()
-            .to_owned();
-        let cpus = list_cpus(&list)?;
+        let mut lanes = Vec::with_capacity(LANE_THREADS);
+        for tid in staging_tids()?.into_iter().filter(|t| !before.contains(t)) {
+            let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
+            let list = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .ok_or("gate_swap: Cpus_allowed_list")?
+                .trim()
+                .to_owned();
+            let cpus = list_cpus(&list)?;
+            lanes.push((tid, list, cpus));
+        }
         drop(r);
-        let ok = !(cpus == 1 && list == c.to_string());
+        let off = lanes
+            .iter()
+            .all(|(_, list, cpus)| !(*cpus == 1 && *list == c.to_string()));
+        let ok = lanes.len() == LANE_THREADS && off;
+        let named: Vec<String> = lanes
+            .iter()
+            .map(|(tid, list, cpus)| format!("{tid} Cpus_allowed_list {list} ({cpus} cpus)"))
+            .collect();
         println!(
-            "placement: a machine built on a thread pinned to cpu {c}: its staging thread {tid} \
-             Cpus_allowed_list {list} ({cpus} cpus) {}",
+            "placement: a machine built on a thread pinned to cpu {c}: its {} lane threads (want \
+             {LANE_THREADS}) {named:?}, each off cpu {c} {off} {}",
+            lanes.len(),
             verdict(ok)
         );
         Ok(ok)
@@ -705,7 +787,12 @@ mod gate {
             if part == 0
                 && let Some(h) = &self.faults.hold
             {
-                h.pass();
+                h.pass(id);
+            }
+            if part == 0
+                && let Some(p) = &self.faults.pace
+            {
+                p.pass();
             }
             if self.faults.fail_source == Some((layer, id)) {
                 return Err(GpuError::Shape {
@@ -2427,7 +2514,7 @@ mod gate {
             ..Faults::default()
         };
         println!(
-            "panic: the staging thread's panic message below is this clause's (layer {l} expert \
+            "panic: the lane thread's panic message below is this clause's (layer {l} expert \
              {})",
             f.admit
         );
@@ -2489,11 +2576,11 @@ mod gate {
     /// stall: a victim that takes longer to prepare than the machine's
     /// deadline is a named error at the boundary it would land at, not a
     /// wait without end; and the machine, dropped with that preparation in
-    /// flight, leaves no copy waiting on the card, and its staging thread,
-    /// left to finish the preparation, is never the last owner of the shared
-    /// state (it would free the ring's pinned pages and the source there,
+    /// flight, leaves no copy waiting on the card, and its lane threads, left
+    /// to finish the preparation, are never the last owner of the shared
+    /// state (one would free the ring's pinned pages and the source there,
     /// inside the driver beside the next clause). The clause ends only once
-    /// that thread has. A copy nobody releases holds every later free on the
+    /// those threads have. A copy nobody releases holds every later free on the
     /// card, so on that fail the gate ends here, by name.
     fn stall(
         gpu: &Gpu,
@@ -2546,8 +2633,8 @@ mod gate {
             && leaked == [LeakReason::Join];
         println!(
             "stall: a victim {SLOW:?} to prepare under a {STALL_DEADLINE:?} deadline: after {} passes \
-             in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {}; its staging \
-             thread {} {:?} after the drop, the source dropped on {on:?} (never swap-staging), \
+             in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {}; its lane \
+             threads {} {:?} after the drop, the source dropped on {on:?} (never swap-staging), \
              leaks reported {leaked:?} (want [Join]) {}",
             st.values.len(),
             if drained {
@@ -2615,7 +2702,7 @@ mod gate {
     }
 
     /// dropq: `a`'s first flip boundary issued under a closed window, so its
-    /// copies wait on staging words the staging thread will not raise until
+    /// copies wait on staging words the lane will not raise until
     /// the flips are due; then the machine dropped inside a [`Dropq`] under
     /// the queue arm's watchdog ([`watched`]).
     fn dropq(
@@ -3292,8 +3379,8 @@ mod gate {
     /// batches of a third (two admits) in ascending slot order. The live
     /// batch has no event and the layer's places with every victim and every
     /// admit `HOST`; each landing batch has an event and its own admits at
-    /// their slots alone, every other expert `HOST`. With the staging thread
-    /// held at the third job, the engine stream waiting for the first
+    /// their slots alone, every other expert `HOST`. With the lane held at
+    /// the later batches' jobs, the engine stream waiting for the first
     /// batch's event alone finishes with the first batch's slots holding
     /// their admits' bytes and the later batches' slots not, and after the
     /// release the call's landed event leaves every admitted slot holding
@@ -3329,7 +3416,11 @@ mod gate {
         for (k, &e) in WANT.iter().enumerate() {
             counts[e as usize] = 10 - k as u32;
         }
-        hold.arm(per);
+        // The rule admits the hottest first, each into the coldest pool
+        // resident's slot by id (`SwapRule::call_pick`), so the jobs go out
+        // in `WANT`'s order (held below): the hold names the jobs past the
+        // first batch by their experts.
+        hold.arm_ids(&WANT[per..]);
         let pick = m.call_pick(stream, &mut r.slots, layer, &counts, usize::MAX)?;
         let after: Vec<Slot> = (0..E as u32)
             .map(|e| r.slots.slot(layer, e).unwrap_or(Slot::Host))
@@ -3354,10 +3445,11 @@ mod gate {
         let chunks: Vec<&[(u32, u32)]> = admits.chunks(per).collect();
         let shape_ok = pick.admitted == WANT.len()
             && admits.len() == WANT.len()
+            && admits.iter().map(|&(_, e)| e).eq(WANT)
             && pick.land.len() == 1 + chunks.len()
             && chunks.len() == 3;
         // The boundary: the engine stream waits for the first landing
-        // batch's event alone; the staging thread holds the third job.
+        // batch's event alone; the lane holds every later batch's jobs.
         let mut first_ok = false;
         let mut later_ok = false;
         let mut waited = false;
@@ -3425,8 +3517,8 @@ mod gate {
         let ok = rows_ok && boundary_ok && all_ok && hold.taken() == WANT.len() && ended;
         println!(
             "s6 landing batches: {} admits (slots {:?}) in {} landing batches of {per}: rows {} \
-             (live {:?}, batches {:?}); first batch's event alone with the staging thread held at \
-             job {per}: engine stream still waiting {waited}, first batch's slots landed {first_ok}, \
+             (live {:?}, batches {:?}); first batch's event alone with the lane held from job \
+             {per}: engine stream still waiting {waited}, first batch's slots landed {first_ok}, \
              later batches' slots uncopied {later_ok}, jobs taken {held}; every batch's event: all \
              slots landed {all_ok}, jobs taken {}, call ends {ended} {}",
             pick.admitted,
@@ -3442,10 +3534,11 @@ mod gate {
     }
 
     /// s8 backlog: the call's backlog bound sets where a pick's wait for the
-    /// staging thread returns. The staging thread is held at its first job, so
-    /// no job is ever served: a pick issues job `k` when `k` is under the
-    /// bound, and blocks at the first that is not. A pick of three admits
-    /// under a bound of three issues all three and returns; under a bound of
+    /// lane returns. The lane is held at every job, so no job is ever served:
+    /// a pick issues job `k` when `k` is under the bound, and blocks at the
+    /// first that is not. A pick of three admits under a bound of three
+    /// issues all three and returns, each job taken to the source by a lane
+    /// thread of its own up to the lane's threads; under a bound of
     /// two it is refused by name at the third job within the deadline, the
     /// message naming the bound, and the machine, broken by an error after the
     /// first job, is dropped behind the released hold. A bound of no jobs and a
@@ -3494,7 +3587,7 @@ mod gate {
         hold.release();
         let fit_ok = fits.as_ref().is_ok_and(|p| p.admitted == WANT.len())
             && fit_took < STALL_DEADLINE
-            && held_at == 1;
+            && held_at == WANT.len().min(LANE_THREADS);
         for l in LAYERS {
             m.call_reader(l, stream)?;
         }
@@ -3533,7 +3626,7 @@ mod gate {
         let ok = no_call_named && zero_named && fit_ok && ended && blocked_ok;
         println!(
             "s8 backlog: set_call_backlog with no call open \"{}\" named {no_call_named}, of no jobs \
-             \"{}\" named {zero_named}; a bound of 3 and 3 admits under a held staging thread: pick \
+             \"{}\" named {zero_named}; a bound of 3 and 3 admits under a held lane: pick \
              {} in {fit_took:?}, jobs taken {held_at}, call ends {ended}; a bound of 2 and 3 admits: \
              \"{}\" after {refused_took:?} (deadline {STALL_DEADLINE:?}), named {refused_named} {}",
             no_call.as_deref().unwrap_or("accepted"),
@@ -3548,8 +3641,9 @@ mod gate {
 
     /// s9 staged: a pick's `staged_us` is read back at the call's end as the
     /// wall from the pick's start to the staging of its layer's last pick job.
-    /// With the staging thread let through the first job of a pick of two
-    /// admits (layer 2) and held at the second for the settle time, beside a
+    /// With the lane let through the first job of a pick of two admits (layer
+    /// 2) to reach the source and held at the other for the settle time,
+    /// beside a
     /// pick that admits nothing (layer 3), the layer-2 pick reads at least the
     /// settle time and at least its own host time, and the pick that moved
     /// nothing reads 0, its layer's stamp never posted. Its mutants: the stamp
@@ -3987,9 +4081,9 @@ mod gate {
     }
 
     /// evicted: a victim whose pages the page cache let go after the load
-    /// or after the staging thread's prepare (a host set populated, not
+    /// or after a lane thread's prepare (a host set populated, not
     /// locked) is read back in by the machine, never refused — at a
-    /// boundary (layer 2's pool, whose flips' victims the staging thread
+    /// boundary (layer 2's pool, whose flips' victims the lane
     /// prepares and loses again), at a call's pick (layer 2's pool, not
     /// resident from the load) and at a call's end (layer 2's host experts,
     /// which a one-step call admits and its end, not kept, sends back; one
@@ -4022,7 +4116,7 @@ mod gate {
             && clean(&r.values)
             && rereads(&r) > 0;
         println!(
-            "evicted boundary: layer 2's pool lost after the staging thread's prepare, {} passes, \
+            "evicted boundary: layer 2's pool lost after the lane's prepare, {} passes, \
              values and flips equal the prompt run {}, {} victims read in again; error {} {}",
             r.values.len(),
             fnvs(&r.values) == fnvs(&a.values) && r.flips == a.flips,
@@ -4089,6 +4183,243 @@ mod gate {
         Ok(at_boundary && at_pick && at_end && quiet)
     }
 
+    /// A fresh stage-only arm whose source paces every job's staging
+    /// ([`Pace`]), the pace on from the start when `on`; the pace, to turn.
+    fn paced(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        on: bool,
+    ) -> Result<(Run, Arc<Pace>), GateError> {
+        let pace = Arc::new(Pace::new(on));
+        let faults = Faults {
+            pace: Some(Arc::clone(&pace)),
+            ..Faults::default()
+        };
+        Ok((plain(gpu, pm, faults, DELAY)?, pace))
+    }
+
+    fn lane_stats(run: &Run) -> Result<LaneStats, GateError> {
+        Ok(run
+            .machine
+            .as_ref()
+            .ok_or("gate_swap: no machine")?
+            .lane_stats())
+    }
+
+    /// lane-b (window): c1's history with the copies prompt and every job's
+    /// staging paced, so a boundary's later flips are taken while its first
+    /// stages: the jobs the window opened stage under the receive lock, one
+    /// at a time, and the run gives the prompt run's values and flips. A
+    /// paced job can be due by the time a thread takes it, so `peak_open` is
+    /// not judged here. Its mutants: the lock released before a window job's
+    /// stage; the job's gate judged outside the lock.
+    fn lane_window(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (mut r, _pace) = paced(gpu, pm, true)?;
+        drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let st = lane_stats(&r)?;
+        let most = r.reports.iter().map(|p| p.made).max().unwrap_or(0);
+        let same = r.err.is_none()
+            && fnvs(&r.values) == fnvs(&a.values)
+            && r.flips == a.flips
+            && clean(&r.values);
+        let ok = same && most >= 2 && st.peak_window == 1;
+        println!(
+            "lane-b window: c1's history, the copies prompt, every job's staging paced {PACE:?}, \
+             the most flips one boundary made {most} (want 2 or more): peak_window {} (want 1), \
+             peak_open {} (not judged), jobs taken {:?}; values and flips = the prompt run's \
+             {same}; error {} {}",
+            st.peak_window,
+            st.peak_open,
+            st.taken,
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// lane-b (due): c3's history, the window closed for the whole run, with
+    /// every job's staging paced: a boundary that lands two flips or more
+    /// makes their jobs due at once, and the lane stages them on several
+    /// threads at once; every landing is late and the values are the prompt
+    /// run's. Its mutant: one lane thread (`peak_open` 1).
+    fn lane_due(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (mut h, _pace) = paced(gpu, pm, true)?;
+        drive(gpu, &mut h, trace, 0..PASSES, Copies::Held, Hold::None)?;
+        let st = lane_stats(&h)?;
+        let late: usize = h.reports.iter().map(|p| p.late).sum();
+        let most = h.reports.iter().map(|p| p.landed).max().unwrap_or(0);
+        let same = h.err.is_none()
+            && fnvs(&h.values) == fnvs(&a.values)
+            && clean(&h.values)
+            && late == h.slot_moves;
+        let ok = same && most >= 2 && st.peak_open >= 2;
+        println!(
+            "lane-b due: c3's history, the window closed all run, every job's staging paced \
+             {PACE:?}, the most flips one boundary landed {most} (want 2 or more): peak_open {} \
+             (want 2 or more), peak_window {}, jobs taken {:?}; late landings {late} of {}, values \
+             = the prompt run's {same}; error {} {}",
+            st.peak_open,
+            st.peak_window,
+            st.taken,
+            h.slot_moves,
+            show(&h.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// lane-a and lane-b (flush): c7's arm, driven unpaced to the last
+    /// boundary that made flips, then reset under a closed window with every
+    /// job's staging paced: the reset's seed copies stage under its flush on
+    /// two lane threads or more (lane-a) and several at once (lane-b), every
+    /// layer back at its seed, and the trace after it gives the fresh run's
+    /// values. Its mutant: one lane thread (one thread takes every job,
+    /// `peak_open` 1).
+    fn lane_flush(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
+        let (mut r, pace) = paced(gpu, pm, false)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..b_last as usize + 1,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let driven = r.err.is_none();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let before = m.lane_stats();
+        let window = m.window();
+        window.store(0, Ordering::Release);
+        pace.set(true);
+        let reset = m.reset(gpu.stream(), &mut r.slots);
+        pace.set(false);
+        window.store(1, Ordering::Release);
+        let after = m.lane_stats();
+        let rep = match reset {
+            Ok(rep) => rep,
+            Err(e) => {
+                println!("lane-a reset after boundary {b_last}: {e} FAIL");
+                return Ok(false);
+            }
+        };
+        let took: Vec<u64> = after
+            .taken
+            .iter()
+            .zip(&before.taken)
+            .map(|(x, y)| x - y)
+            .collect();
+        let threads = took.iter().filter(|&&n| n > 0).count();
+        r.values.clear();
+        r.flips.clear();
+        drive(gpu, &mut r, trace, 0..40, Copies::Prompt, Hold::None)?;
+        let again = r.err.is_none() && fnvs(&r.values) == fnvs(&a.values[..40]);
+        let lane_a = driven && rep.diff == 0 && rep.copies >= 16 && threads >= 2 && again;
+        let lane_b = after.peak_open >= 2;
+        println!(
+            "lane-a flush: a reset after boundary {b_last} under a closed window, every job's \
+             staging paced {PACE:?}: {} seed copies (want 16 or more), diff {}, jobs taken per \
+             lane thread {took:?} ({threads} threads took one, want 2 or more); 40 passes after it \
+             = the fresh run's {again} {}",
+            rep.copies,
+            rep.diff,
+            verdict(lane_a)
+        );
+        println!(
+            "lane-b flush: the same reset: peak_open {} (want 2 or more; {} before it), \
+             peak_window {} {}",
+            after.peak_open,
+            before.peak_open,
+            after.peak_window,
+            verdict(lane_b)
+        );
+        Ok(lane_a && lane_b)
+    }
+
+    /// lane-c: no stale sum when a ring slot is taken again. A call's pick
+    /// of six admits (s6's counts, more jobs than the ring holds) with the
+    /// machine's copy stream held from before the pick: the lane stages the
+    /// first ring's worth while their copies wait, and the jobs that take
+    /// those ring slots again wait for each slot's copy to drain; after the
+    /// release every admitted slot holds its admit's bytes. Its mutant: the
+    /// drained wait skipped (a later job's bytes overwrite an earlier one's
+    /// in its ring slot before that one's copy reads them).
+    fn lane_reuse(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        const WANT: [u32; 6] = [20, 21, 22, 23, 24, 25];
+        let layer = LAYERS.start;
+        let faults = Faults {
+            all_resident: true,
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: lane-c's machine: {e}").into());
+        }
+        let flags = HostFlags::new(gpu.context(), 1)?;
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let mut counts = vec![0u32; E];
+        for (k, &e) in WANT.iter().enumerate() {
+            counts[e as usize] = 10 - k as u32;
+        }
+        flags.clear(0)?;
+        flags.enqueue_wait(m.copy_stream(), 0)?;
+        let pick = m.call_pick(stream, &mut r.slots, layer, &counts, usize::MAX);
+        std::thread::sleep(HOLD_SETTLE);
+        // Every path out raises the flag before the pick's error is read.
+        flags.raise(0)?;
+        let pick = pick?;
+        let admits: Vec<(u32, u32)> = WANT
+            .iter()
+            .filter_map(|&e| match r.slots.slot(layer, e) {
+                Some(Slot::Card(s)) => Some((s, e)),
+                _ => None,
+            })
+            .collect();
+        stream.wait(m.call_landed(layer)?)?;
+        let mut snap = snap_alloc(stream, layer)?;
+        snap_fill(stream, &r.card.stacks, layer, &mut snap)?;
+        let mut holds = 0usize;
+        for &(s, e) in &admits {
+            holds += usize::from(slot_holds(stream, &snap, layer, s, e)?);
+        }
+        for l in LAYERS {
+            m.call_reader(l, stream)?;
+        }
+        let ended = m.end_call(stream, &mut r.slots, true).is_ok();
+        let ok = pick.admitted == WANT.len()
+            && admits.len() == WANT.len()
+            && WANT.len() > RING_SLOTS
+            && holds == WANT.len()
+            && ended;
+        println!(
+            "lane-c ring slot reuse: a pick of {} admits through {RING_SLOTS} ring slots, the copy \
+             stream held {HOLD_SETTLE:?} while the lane staged: admitted slots holding their \
+             admit's bytes after the release {holds} of {}, call ends {ended} {}",
+            pick.admitted,
+            admits.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -4132,6 +4463,10 @@ mod gate {
         ok &= fault_code()?;
         ok &= stall(&gpu, &pm, &trace)?;
         ok &= placement(&gpu, &pm)?;
+        ok &= lane_window(&gpu, &pm, &trace, &a)?;
+        ok &= lane_due(&gpu, &pm, &trace, &a)?;
+        ok &= lane_flush(&gpu, &pm, &trace, &a)?;
+        ok &= lane_reuse(&gpu, &pm)?;
         let light = queue(&gpu, &pm, &trace, &a, LIGHT)?;
         ok &= light;
         if light {
@@ -4178,7 +4513,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the staging thread returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
             );
             Ok(())
         } else {

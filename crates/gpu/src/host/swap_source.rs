@@ -127,9 +127,11 @@ pub trait Convert: Send + Sync {
 /// host-resident (the churn pool), so a flip waits on no NVMe read, only on
 /// its staging and its copy: a planning pass makes at most the rule's `cap`
 /// flips ([`runtime::swaprule::SwapParams::mid`]), each one expert's memcpy
-/// into the pinned ring on one thread and one H2D copy over the card's link,
-/// an expert's copy running under the next one's memcpy (the ring holds
-/// [`super::swap::RING_SLOTS`] experts). A whole pass's staging and copies —
+/// into the pinned ring on a lane thread and one H2D copy over the card's
+/// link, an expert's copy running under the next one's memcpy (the ring holds
+/// [`super::lane::RING_SLOTS`] experts). The lane stages on up to
+/// [`super::lane::LANE_THREADS`] threads, and a flip the window opened on
+/// one at a time. A whole pass's staging and copies —
 /// its experts' bytes over the ring's rate beside the host leg — stay far
 /// inside two passes' wall of decode steps at the model's width [derived],
 /// so two passes hold it. The staging runs in the host leg's wait window, a
