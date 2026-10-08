@@ -1667,14 +1667,6 @@ fn launch_served<B: ChainBody>(
     }
 }
 
-/// The steps of a placed load before its body: the plan's card and context
-/// budget, the card, the host's memory against the plan's host need, the
-/// card's weights with `derive`'s filings, and — after the uploads, so the
-/// card's file bytes have left the page cache first — the plan's host set
-/// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
-/// bytes) beside it. The pieces, and the host set. Every placed load passes
-/// here, so the two refusals before any upload are made once: a plan's card
-/// that is not one visible device ([`Gpu::open_card`]), and a
 /// The NVMe expert tier of a paged load, the common chain's one build
 /// every family's host run attaches
 /// ([`HostRun::attach_tier`](crate::host::run::HostRun::attach_tier)):
@@ -1708,6 +1700,14 @@ pub fn nvme_tier(
     NvTier::of_paged(plan, file, levers.direct).map(|t| t.map(Arc::new))
 }
 
+/// The steps of a placed load before its body: the plan's card and context
+/// budget, the card, the host's memory against the plan's host need, the
+/// card's weights with `derive`'s filings, and — after the uploads, so the
+/// card's file bytes have left the page cache first — the plan's host set
+/// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
+/// bytes) beside it. The pieces, and the host set. Every placed load passes
+/// here, so the two refusals before any upload are made once: a plan's card
+/// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
     file: &Split,
