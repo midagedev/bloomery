@@ -43,6 +43,17 @@
 //!   the plain gemv of an upload of just that slot's expert's rows from the
 //!   file — the contract `gate_p9`/`gate_q4k_sel` pin on a prefix, here on the
 //!   loaded stacks, so a list whose gather puts another expert in a slot fails.
+//! - (vii) r8 off: after (v), one load whose host tier reads the source
+//!   (`BLOOMERY_R8=off`, the path of every load with no sidecar beside its file)
+//!   and then one that reads the r8 sidecar, each fed [`R8_PROMPT`] prose ids
+//!   and one greedy step from the prompt's argmax. The off load's host set
+//!   holds no sidecar byte and the r8 load's holds some; both computed host
+//!   experts; the two give the same argmax and logits bit for bit at the
+//!   prompt's end and at the step. Bits, not a band: the r8 tile writes each
+//!   (row, column) `qdot::dot_row`'s value (`qdot::dot_q3k_r8_cols`), and the
+//!   source's rows take `dot_row` or `dot_row_cols`, which writes the same
+//!   (`ops::PairWork::compute_rows`); no other term reads the layout. The r8
+//!   load runs last, so the sidecar's pages are the ones it leaves cached.
 //!
 //! Before any upload the card is found by name and must have free what the
 //! plan puts on it besides the context; a short card refuses the run.
@@ -88,7 +99,9 @@ mod gate {
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::tier;
-    use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
+    use bloomery_gpu_gates::{
+        Fnv1a64, GateError, bits_equal, bytes_to_words, checks_failed, prose_ids, verdict,
+    };
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -98,6 +111,7 @@ mod gate {
     use model::arch::deepseek41::kv::KvLayout;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
+    use model::placement::host_lock::HostFile;
     use model::placement::{CardFormat, Device, KvBytes, Plan, Role, workstation};
 
     // The decode-step sets whose positions check (iii) builds are `ds41_tier::DECODE_SETS`:
@@ -114,6 +128,10 @@ mod gate {
     /// The device granule a page-locked allocation of the shadows' size takes
     /// from the card (check v).
     const PINNED_GRANULE: i128 = 2 << 20;
+
+    /// Check (vii)'s prompt: prose ids fed one position at a time, every
+    /// position a step through the host tier.
+    const R8_PROMPT: usize = 16;
 
     pub fn run() -> Result<(), GateError> {
         let levers =
@@ -195,6 +213,8 @@ mod gate {
         let free4 = free(&probe)?;
         crate::ds41_tier::sc("(v) reload: a second load takes what the first took")?;
         ok &= check_reload([free0, free1, free2, free3, free4], captured, shadow_host);
+        crate::ds41_tier::sc("(vii) r8 off: the source read steps the r8 load's bits")?;
+        ok &= check_r8_off(&path, &cfg)?;
 
         println!("gate_deepseek41_load: {}", tier::tally_line());
         if !ok {
@@ -207,7 +227,8 @@ mod gate {
              at positions 4, 301 and 1025 reads back as the plan's integers and RopeTable's \
              tables; the chain captures and a synthetic depth refuses; a second load takes what \
              the first took and each drop gives back all but the context's capture (and the \
-             page-locked shadows' granule it keeps)"
+             page-locked shadows' granule it keeps); a load under BLOOMERY_R8=off reads the \
+             source and steps the r8 load's bits"
         );
         Ok(())
     }
@@ -1039,5 +1060,76 @@ mod gate {
             );
         }
         pass
+    }
+
+    /// One load of check (vii) as the clause reads it: its host set's pages
+    /// in the r8 sidecar (`HostSet::files`), the host experts its steps
+    /// computed, and the argmax and logits FNV at the prompt's end and at the
+    /// greedy step.
+    struct R8Arm {
+        sidecar_pages: u64,
+        host_slots: u64,
+        out: [(u32, u64); 2],
+    }
+
+    /// Load `n` by the gate placement under `cfg` with the host tier reading
+    /// the r8 sidecar (`r8`) or the source, fed `ids` and one greedy step.
+    fn r8_arm(
+        path: &str,
+        n: usize,
+        cfg: &OpenCfg,
+        r8: bool,
+        ids: &[u32],
+    ) -> Result<R8Arm, GateError> {
+        const WHAT: &str = "gate_deepseek41_load (vii)";
+        let mut cfg = cfg.clone();
+        cfg.body.host.r8 = r8;
+        let mut m = load(path, n, &cfg)?;
+        let sidecar_pages = m
+            .body(WHAT)?
+            .hybrid()
+            .residency()
+            .ok_or("the gate plan's load holds no host set")?
+            .set()
+            .files()
+            .iter()
+            .filter(|(file, _)| matches!(file, HostFile::Sidecar(_)))
+            .map(|(_, pages)| pages)
+            .sum();
+        let fnv = |row: &[f32]| Fnv1a64::default().f32s(row).value();
+        let at_prompt = m.step(ids)?;
+        let prompt_fnv = fnv(&m.logits()?);
+        let at_step = m.step(&[at_prompt])?;
+        let step_fnv = fnv(&m.logits()?);
+        Ok(R8Arm {
+            sidecar_pages,
+            host_slots: m.body(WHAT)?.hybrid().stats().host_slots,
+            out: [(at_prompt, prompt_fnv), (at_step, step_fnv)],
+        })
+    }
+
+    /// Check (vii): a load under `BLOOMERY_R8=off`, then one reading the r8
+    /// sidecar, each fed the same prompt and step.
+    fn check_r8_off(path: &str, cfg: &OpenCfg) -> Result<bool, GateError> {
+        let ids = prose_ids("engram", R8_PROMPT)?;
+        let off = r8_arm(path, 3, cfg, false, &ids)?;
+        let on = r8_arm(path, 4, cfg, true, &ids)?;
+        let read = off.sidecar_pages == 0 && on.sidecar_pages > 0;
+        let served = off.host_slots > 0 && on.host_slots > 0;
+        let same = off.out == on.out;
+        let pass = read && served && same;
+        println!(
+            "check vii: BLOOMERY_R8=off reads {} pages of the sidecar, the r8 load {}; host experts \
+             computed {} and {}; {R8_PROMPT} prose ids then a step: (argmax, logits FNV) {:x?} \
+             against the r8 load's {:x?}, same {same}: {}",
+            off.sidecar_pages,
+            on.sidecar_pages,
+            off.host_slots,
+            on.host_slots,
+            off.out,
+            on.out,
+            verdict(pass)
+        );
+        Ok(pass)
     }
 }

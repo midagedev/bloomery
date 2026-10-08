@@ -11,8 +11,8 @@ BLOOMERY_CARD_BUDGET	gate-gpu-qwen3-serve	12G	crates/gpu-gates/src/bin/gate_qwen
 BLOOMERY_CED	records-refresh	$c	justfile::records-refresh:	the loop runs both words; `on` is the unset default
 BLOOMERY_DRAFT	gate-gpu-ds41-draft	lookup	justfile::> $D/code-plain.log	the recipe's plain arm (code-plain.log) runs the unset plain path
 BLOOMERY_DRAFT	gate-gpu-ds41-dspark-loop	dspark	justfile::generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log	the recipe's plain arm (plain.log) runs the unset plain path
-BLOOMERY_DRAFT	gate-gpu-glm5next-serve	mtp	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn drafted(	the drafted arm pins the unset rule's own words under a/bp; the --plan unset clauses at :779 print the rule
-BLOOMERY_DRAFT	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &default, PLAIN)?	the plain arm's server runs --place gate, where unset resolves to the plain path
+BLOOMERY_DRAFT	gate-gpu-glm5next-serve	mtp	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn unset_load(	unset_load: the seat as a user starts it, every lever unset (bp on the two cards), loads the unset rule's mtp
+BLOOMERY_DRAFT	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn unset_load(	unset_load: the seat as a user starts it, every lever unset (bp on the two cards), loads what unset resolves to
 BLOOMERY_DRAFT	gate-gpu-qwen38-serve	mtp	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	slots_default_residency: the seat at its own defaults, both levers unset (the user's case)
 BLOOMERY_DRAFT	gate-gpu-qwen38-serve	off	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	slots_default_residency: the seat at its own defaults, both levers unset (the user's case)
 BLOOMERY_DRAFT	weekly-gpu-ds41-serve	dspark	justfile::bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D &&	the recipe's first gate_ds41_serve run serves with BLOOMERY_DRAFT unset (the plain path)
@@ -37,8 +37,8 @@ BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs::cmd.env_remove("B
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the pinned word is the default; the main server's load names the f16 cache with no flag
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q6_0	none	2026-10-08: a refusal probe — the seat refuses the word by name before any load, so no path runs at any value
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q8_0	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the main server runs the f16 cache (the unset default) and its load names it
-BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn drafted(	the drafted arm pins the unset rule's word under a/bp; the --plan unset clauses at :779 print the rule
-BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &default, PLAIN)?	the plain arm's server at --place gate, where unset resolves off
+BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn unset_load(	unset_load: the seat as a user starts it, every lever unset (bp on the two cards), loads the unset rule's mid-p0-s1
+BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn unset_load(	unset_load: the seat as a user starts it, every lever unset (bp on the two cards), loads what unset resolves to
 BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	the seat at its own defaults: unset resolves mid-p<P>-s1 under the cards' rule
 BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	off	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	the seat at its own defaults, both levers unset (the user's case)
 BLOOMERY_RESIDENCY	weekly-gpu-ds41-serve	off	justfile::gate-gpu-ds41-twocard *ARGS='--union':	gate-gpu-ds41-twocard --union runs plan (b′) with the levers unset (the placement default mid-p0-s1)

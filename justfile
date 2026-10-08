@@ -1390,8 +1390,10 @@ gate-gpu-ds41-callstream *ARGS:
 
 # The same residency clauses on plan (a), the serving plan: every layer and the head on the A6000, no tier card
 # (gate_ds41_callstream --place a --only residency; the tier clause asks that the host map holds no tier entry), and
-# the static clause, whose load of the dumped card table follows the residency load's teardown. The A6000 alone, the
-# host set locked, one load at a time, alone in a batch.
+# the static clause, whose load of the dumped card table follows the residency load's teardown, then the serving
+# default's load: the word the V4.1 seat runs with BLOOMERY_RESIDENCY unset on this plan (mid-p0-s1 where the host takes
+# its churn pool, else the first P whose pool fits), its pinned count and c1. The A6000 alone, the host set locked, one
+# load at a time, alone in a batch.
 # Group solo-real, reason r1 (its host set is locked under the big-load lock: the whole file on the real tier, ~15 GB on a fixture)
 # on one card, the A6000 by box.sh's pick (`BLOOMERY_CARD=a6000`): alone in the real tier, and in the fixture tier fixed to lane B.
 [group('solo-real')]
@@ -1770,6 +1772,9 @@ kld-diff A B *ARGS:
 # 상태는 KvLayout의 바이트와 같아야 한다. 위치 4·301·1025의 스텝 이미지를 되읽어 계획의 정수·RopeTable의 표와 맞춘다.
 # 체인은 캡처돼야 하고(노드 수는 step 게이트의 몫) 합성 깊이는 거부돼야 한다. 두 번째 적재는 첫 번째와 같은 양을 가져가고,
 # 드롭은 컨텍스트의 첫 캡처가 쥔 몫만 빼고 전부 돌려줘야 한다. 측정이 아니라 정확성 실행이다(파일 중 카드 몫을 두 번 읽는다).
+# Then two loads more, the host tier reading the source (BLOOMERY_R8=off: no sidecar byte in its host set) and then the
+# r8 sidecar, each fed 16 prose ids and a greedy step: the same argmax and logits bit for bit. The source load's populate
+# reads the routed gates and ups from the file, and the r8 load, last, leaves the sidecar's pages cached.
 [group('v41-load')]
 gate-ds41-load:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_load && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_load'
@@ -2049,7 +2054,9 @@ gate-gpu-glm5next-residency:
 # BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off and under BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off (three loads); --arm
 # drafted (BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p0-s1, the clip's levers) holds the draft's records and counts, the
 # residency's records, its reset and the same ids after it, and the ids against the CLI under the same levers through
-# the first landed flip (two loads). Logs in target/glm-serve-gate/{plain,plain/mtp,drafted}/.
+# the first landed flip (two loads). --arm plain ends with the seat as a user starts it (no --place, --ctx or
+# --parallel, no lever set: bp on the two cards), holding the unset rules' words at the load (draft mtp, residency
+# mid-p0-s1, pinned 0) and a chat turn served. Logs in target/glm-serve-gate/{plain,plain/mtp,plain/unset,drafted}/.
 # Loads the whole host set: alone in a batch, under the big-load lock. Both cards in view: the --plan arms' a and bp
 # plan on the largest card and the next-largest; the loads stay on the gate placement's card (--place gate).
 # Real-only: the gate states its clauses against the real file's numbers (the unset rule's bp pick, BP_TIER_EXPERTS and
