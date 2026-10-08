@@ -65,12 +65,13 @@
 //!   every flip's path against ik's `l_out-L` within [`FREE_BAND`], the
 //!   outputs past a flip printed and counted; the last position's argmax
 //!   equal to ik's `result_output` argmax.
-//! - (t) each step set: its prefill fed by our own steps from a reset, then
-//!   the step; its argmax equal to ik's, or — named and counted — our argmax
-//!   ik's runner-up, ik's own margin between the two inside twice the
-//!   distance between our logits and ik's at those ids, and our whole
-//!   logits row within [`FREE_BAND`] of ik's. The logits row is printed and
-//!   bounds only a tie, as in the GLM gate: [`FREE_BAND`] bounds a layer
+//! - (t) each step set: its prefill fed by our own steps from a reset (D3K's,
+//!   3,000 positions, by ubatches under (g); the same positions by steps are
+//!   (q)'s windows), then the step; its argmax equal to ik's, or — named and
+//!   counted — our argmax ik's runner-up, ik's own margin between the two
+//!   inside twice the distance between our logits and ik's at those ids, and
+//!   our whole logits row within [`FREE_BAND`] of ik's. The logits row is
+//!   printed and bounds only a tie, as in the GLM gate: [`FREE_BAND`] bounds a layer
 //!   output off every flip's path, and every step set's last position lies
 //!   on a flip's path from its first layers (the router's top-10 margins
 //!   over 512 sit under ik's q8_2 spacing). The step's layer outputs
@@ -80,11 +81,23 @@
 //!   pool (1,024 positions, 256 pools, under the 512 the selector keeps), so
 //!   its selection list is the identity; D3K's reads a selection (751 pools
 //!   past 512).
-//! - (q) the pass in the selector region: D3K's prefill as eager passes of
+//! - (q) the pass against the step, in both tiers (self-consistency; ik's bits
+//!   are not read). (q1) the dense region: D1K's prefill as eager passes of
 //!   up to eight positions (`Prompt38::Pass`) from a reset with the planes
-//!   filled, then the same
-//!   step, leaves the step-fed run's step token, logits, layer outputs and
-//!   every store bit for bit.
+//!   filled, then the same step, leaves (t)'s step-fed run's step token,
+//!   logits, layer outputs and every store bit for bit. (q2) the selector
+//!   region: windows over D3K's prefill, in ascending order ([`windows`]),
+//!   each placed where a pass does different work from a step on the rows
+//!   that select ([`Edge`]: a row's work depends on the rows it shares a
+//!   launch with, and on where the pass's chunk edges fall). Each arm walks once
+//!   from a reset: the gaps between the windows by ubatches
+//!   (`Prompt38::Gemm`), each window by graph steps in one arm and by passes
+//!   in the other. At each window's end, and after the eager step the
+//!   prefill's length names (taps armed), the two arms' last token, logits and
+//!   every store equal bit for bit, the first window that differs named. Both
+//!   arms cut the ubatches at the same positions, so a window starts from the
+//!   same bits in both, and what differs is the window's rows. D3K's ik compare
+//!   is (g)'s ubatch-fed one.
 //! - (v) the verify: after a prefix of two steps, a verify of the first T
 //!   of four rows ([`verify_rows`]; T = 2, 3, 4, `step_rows`, captured) — one
 //!   row completing pool 0 — returns every row's argmax and logits bit for
@@ -101,7 +114,7 @@
 //!   its token and logits; a second verify from a moved lane (4 rows after a
 //!   commit of 3, lanes 2, 3, 0, 1) the same against its steps; an eager
 //!   verify bit for bit the replay; and a deep verify in the selector
-//!   region, after [`DEEP`] positions of D3K's prefill by passes, its row
+//!   region, after [`DEEP`] positions of D3K's prefill by one ubatch, its row
 //!   completing pool 513 rejected, the same against its steps — with every
 //!   pooled row past the count set to NaN after the commit ([`POOL_POISON`]),
 //!   the step after and the one after it (which completes pool 513 again)
@@ -266,6 +279,10 @@ mod gate_card;
 mod q38_arch;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen38_open.rs"]
+mod qwen38_open;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::time::Instant;
 
@@ -273,6 +290,7 @@ mod gate {
         argmax, first_flip_layers, flips_report, ik_last, layer_rels, layer_table, print_layers,
         rel, same_bits, second, set_open, tap, tie_numbers, worst_off_path,
     };
+    use crate::qwen38_open::{Open38, Opened38, PlanFacts};
 
     use bloomery_gpu::arch::qwen3moe::{
         Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
@@ -280,8 +298,10 @@ mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::batch::HOT_COLS;
     use bloomery_gpu::host::handoff::{HandoffKernels, Places};
+    use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::hybrid::{HOST, Slot, SlotMap};
     use bloomery_gpu::model::{ChainBody, StepMode};
+    use bloomery_gpu::qsa::POOL_TILE;
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -298,7 +318,6 @@ mod gate {
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
-    use model::placement::workstation::{HostNeed, HostRead};
     use model::placement::{Device, PlanLevers};
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
 
@@ -473,17 +492,7 @@ mod gate {
     /// The model file this gate runs on, opened as a split of architecture
     /// `qwen4exp`.
     fn open_split() -> Result<Split, GateError> {
-        let path = &cfg().path;
-        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        if file.architecture() != Some("qwen4exp") {
-            return Err(format!(
-                "{} is {:?}, not qwen4exp",
-                path.display(),
-                file.architecture()
-            )
-            .into());
-        }
-        Ok(file)
+        crate::qwen38_open::open_split(&cfg().path)
     }
 
     /// Read the file's header once: the path the tier names, the levers, the
@@ -561,6 +570,13 @@ mod gate {
     /// a pass.
     const CONV_RING: usize = CONV - 1 + PASS_ROWS;
     const PLE_RING: usize = (PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS;
+    // The windows are derived from these copies: they are the engine's.
+    const _: () = assert!(
+        CONV_RING == bloomery_gpu::linear::RING_ROWS
+            && PLE_RING == bloomery_gpu::ple::RING_ROWS
+            && PASS_ROWS == bloomery_gpu::linear::PASS_ROWS
+            && POOL == bloomery_gpu::qsa::POOL
+    );
 
     /// Positions of the verify's prefix: the verify starts at position 2,
     /// so its row 1 (position 3, count 4) completes pool 0.
@@ -640,22 +656,6 @@ mod gate {
         Ok((top == ik_top, ik_top.to_string()))
     }
 
-    /// What a load made: the model, the tier its plan reads the PLE table
-    /// from, and what the plan holds on the card.
-    struct Opened {
-        model: Qwen38Model,
-        ple_tier: Option<Device>,
-        card: CardPlan,
-    }
-
-    /// The plan's routed experts on the card: the layers that hold any, and
-    /// each layer's count (`Plan::n_l`) — the plan's own, read before the
-    /// body is built, so the structure clause holds the body to it.
-    struct CardPlan {
-        layers: usize,
-        n_l: Vec<u64>,
-    }
-
     /// The card a plan is made on: the real tier's the gate runner's
     /// (the 3090's bytes on the card in view), the fixture tier's `a`
     /// (`q38_fixture::card`).
@@ -678,57 +678,55 @@ mod gate {
     }
 
     /// [`open_slots`] at a ubatch of `ub`, the host's room the reading's or
-    /// `room` given ([`PlanInputs::room`]); with the tier the plan reads the
-    /// PLE table from, which the plan line names.
+    /// `room` given ([`PlanInputs::room`]); with the plan's facts, which the
+    /// plan line prints and the structure clause holds the body to (each
+    /// layer's card experts are the plan's own, read before the body is
+    /// built), among them the tier the plan reads the PLE table from.
     fn open_at(
         experts: Experts,
         slots: usize,
         ub: usize,
         room: Option<u64>,
-    ) -> Result<Opened, GateError> {
+    ) -> Result<Opened38, GateError> {
         let file = open_split()?;
         let t = Instant::now();
-        // `describe`, not `read`: `read` refuses the chat surface's two
-        // items too; `open_placed` refuses what `ALLOWED` does not name.
-        let mut inputs = PlanInputs::describe(&file)?;
-        if let Some(r) = room {
-            inputs.room = (r, HostRead::Given);
-        }
         let card = card()?;
-        let machine =
-            machine_for_experts(card, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
-        let plan =
-            inputs.plan_with_slots(&machine, CTX as u64, &cfg().plan_levers, experts, slots)?;
-        let held = plan.n_l.iter().filter(|&&n| n > 0).count();
-        let tier = plan.row_tier()?;
+        let planned = Open38 {
+            card,
+            ctx: CTX,
+            ub,
+            experts,
+            slots,
+            plan_levers: &cfg().plan_levers,
+            host: cfg().host,
+            room,
+            residency: Residency::Off,
+        }
+        .plan(file)?;
+        let p = planned.facts();
         println!(
             "plan card={} experts={experts:?} slots={slots} ctx_max={} ubatch={ub} host_experts={} \
-             card_experts={} card_layers={held} ple={} room={} read={} row_reserve={} \
+             card_experts={} card_layers={} ple={} room={} read={} row_reserve={} \
              card_budget={:?}",
             card.name,
-            plan.ctx_max,
-            plan.host.experts,
-            plan.cards[0].experts,
-            tier_word(tier),
-            inputs.room.0,
-            inputs.room.1.word(),
-            plan.host.row_reserve_bytes,
+            p.ctx_max,
+            p.host_experts,
+            p.card_experts,
+            p.card_layers,
+            tier_word(p.ple_tier),
+            p.room.0,
+            p.room.1.word(),
+            p.row_reserve_bytes,
             cfg().plan_levers.card_budget_bytes
         );
-        let n_l = plan.n_l.clone();
-        let mut m = Body38::open_placed_slots(file, &plan, &inputs, 0, cfg().host, ub, slots)?;
-        m.set_mode(StepMode::Graph);
+        let o = planned.open()?;
         println!(
             "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
-            m.resident_bytes(),
-            m.layers().len(),
+            o.model.resident_bytes(),
+            o.model.layers().len(),
             t.elapsed().as_secs_f64()
         );
-        Ok(Opened {
-            model: m,
-            ple_tier: tier,
-            card: CardPlan { layers: held, n_l },
-        })
+        Ok(o)
     }
 
     /// A plan's PLE tier as the plan line prints it.
@@ -792,6 +790,20 @@ mod gate {
         routes: Vec<Vec<RouteTap>>,
         stores: Vec<Store38Host>,
         ple_ring: Vec<f32>,
+    }
+
+    impl Run {
+        /// A run that holds nothing.
+        fn empty() -> Run {
+            Run {
+                tokens: Vec::new(),
+                logits: Vec::new(),
+                taps: Vec::new(),
+                routes: Vec::new(),
+                stores: Vec::new(),
+                ple_ring: Vec::new(),
+            }
+        }
     }
 
     /// Arm or disarm the layer and route taps.
@@ -1114,21 +1126,31 @@ mod gate {
         run_steps(m, &[tok], StepMode::Eager, false)
     }
 
-    /// The step of set `name` after its prefill fed by `path`; its argmax
-    /// against ik's, a tie named and counted; with `band` — the batch set's
-    /// tokens and the first layer a flip lies on the path of its last
-    /// position — its layer outputs below that layer held to the band. The
-    /// whole comparison is an oracle clause: the fixture tier leaves it to
-    /// the real one, and runs the step only when another clause reads its
-    /// run (`feeds`: (q) reads D3K's step-fed run), returning the empty run
-    /// when it does not.
-    fn step_set(
-        m: &mut Qwen38Model,
-        name: &str,
+    /// A step set opened for [`step_after`]: its oracle set, the step's
+    /// position and token, the prefill and the layers its band holds.
+    struct StepSet<'a> {
+        name: &'a str,
+        path: Prompt38,
+        /// Whether the step is compared with ik's (the real tier).
+        vs_ik: bool,
+        man: RefManifest,
+        pos: u32,
+        tok: u32,
+        prefill: Vec<u32>,
+        held: usize,
+    }
+
+    /// Step set `name`, its prefill to be fed by `path`, opened with `band` —
+    /// the batch set's tokens and the first layer a flip lies on the path of
+    /// its last position. The comparison with ik's is an oracle clause: the
+    /// fixture tier leaves it to the real one, and keeps the step only when
+    /// another clause reads its run (`feeds`: (q1) reads D1K's step-fed run);
+    /// `None` when neither asks for it.
+    fn open_step_set<'a>(
+        name: &'a str,
         path: Prompt38,
         (band, feeds): (Option<(&[u32], usize)>, bool),
-        ties: &mut usize,
-    ) -> Result<(bool, Run), GateError> {
+    ) -> Result<Option<StepSet<'a>>, GateError> {
         let vs_ik = q38::clause(
             &format!(
                 "(t) step set {name} fed by {}: argmax, layer outputs and logits against ik's",
@@ -1137,23 +1159,62 @@ mod gate {
             Tag::Oracle,
         )?;
         if !vs_ik && !feeds {
-            let none = Run {
-                tokens: Vec::new(),
-                logits: Vec::new(),
-                taps: Vec::new(),
-                routes: Vec::new(),
-                stores: Vec::new(),
-                ple_ring: Vec::new(),
-            };
-            return Ok((true, none));
+            return Ok(None);
         }
         let (man, pos, tok, prefill, held) = set_open((name, &IK), band)?;
+        Ok(Some(StepSet {
+            name,
+            path,
+            vs_ik,
+            man,
+            pos,
+            tok,
+            prefill,
+            held,
+        }))
+    }
+
+    /// The step of set `name` after its prefill fed by `path`: [`fresh`],
+    /// the prefill, then [`step_after`]. The empty run when the set is not
+    /// opened ([`open_step_set`]).
+    fn step_set(
+        m: &mut Qwen38Model,
+        name: &str,
+        path: Prompt38,
+        flags: (Option<(&[u32], usize)>, bool),
+        ties: &mut usize,
+    ) -> Result<(bool, Run), GateError> {
+        let Some(set) = open_step_set(name, path, flags)? else {
+            return Ok((true, Run::empty()));
+        };
         fresh(m)?;
         let t = Instant::now();
-        if !prefill.is_empty() {
-            m.prompt38(&prefill, path)?;
+        if !set.prefill.is_empty() {
+            m.prompt38(&set.prefill, path)?;
         }
-        let r = run_last(m, tok)?;
+        step_after(m, &set, t, ties)
+    }
+
+    /// The step of `set` from where its prefill, fed since `t`, left the
+    /// model; its argmax against ik's, a tie named and counted, its layer
+    /// outputs below the band's layer held to it, and the run the step left.
+    fn step_after(
+        m: &mut Qwen38Model,
+        set: &StepSet<'_>,
+        t: Instant,
+        ties: &mut usize,
+    ) -> Result<(bool, Run), GateError> {
+        let StepSet {
+            name,
+            path,
+            vs_ik,
+            man,
+            pos,
+            tok,
+            prefill,
+            held,
+        } = set;
+        let r = run_last(m, *tok)?;
         if !vs_ik {
             println!(
                 "step {name}: position {pos} after {} fed by {} ({:.1} s, runtime value); \
@@ -1165,13 +1226,13 @@ mod gate {
             return Ok((true, r));
         }
         let vocab = m.body("step_set")?.vocab();
-        let ik = ik_last(&man, vocab)?;
+        let ik = ik_last(man, vocab)?;
         let ours = r.logits.last().ok_or("no logits")?;
         let (top, ik_top, ik_2, margin, dist, logits_rel) = tie_numbers(ours, &ik);
         let tie = top != ik_top && top == ik_2 && margin <= 2.0 * dist && logits_rel <= FREE_BAND;
         *ties += usize::from(tie);
-        let rels = layer_rels(&man, &r.taps, STREAMS * HIDDEN, n_layer())?;
-        let inside = print_layers(name, &rels, held, FREE_BAND);
+        let rels = layer_rels(man, &r.taps, STREAMS * HIDDEN, n_layer())?;
+        let inside = print_layers(name, &rels, *held, FREE_BAND);
         let ok = (top == ik_top || tie) && inside;
         println!(
             "step {name}: position {pos} after {} fed by {} ({:.1} s, runtime value); argmax \
@@ -1190,31 +1251,327 @@ mod gate {
         Ok((ok, r))
     }
 
-    // ------------------------------------ (q) the pass past the dense region
+    // ------------------------------------------- (q) the pass against the step
 
-    /// D3K's prefill by passes against `steps`, its step-fed run: the step's
-    /// token, logits, layer outputs and every store bit for bit.
-    fn pass_selects(m: &mut Qwen38Model, steps: &Run) -> Result<bool, GateError> {
-        let (_, _, tok, prefill, _) = set_open((D3K, &IK), None)?;
+    /// Whether two runs' layer outputs (the taps) are equal bit for bit.
+    fn same_taps(a: &Run, b: &Run) -> bool {
+        a.taps.len() == b.taps.len() && a.taps.iter().zip(&b.taps).all(|(x, y)| same_bits(x, y))
+    }
+
+    /// (q1): set `name`'s prefill by passes against `steps`, its step-fed
+    /// run: the step's token, logits, layer outputs and every store bit for
+    /// bit.
+    fn pass_selects(m: &mut Qwen38Model, name: &str, steps: &Run) -> Result<bool, GateError> {
+        let (_, _, tok, prefill, _) = set_open((name, &IK), None)?;
         fresh(m)?;
         let t = Instant::now();
         m.prompt38(&prefill, Prompt38::Pass)?;
         let fed = t.elapsed().as_secs_f64();
         let r = run_last(m, tok)?;
-        let taps = r.taps.len() == steps.taps.len()
-            && r.taps.iter().zip(&steps.taps).all(|(a, b)| same_bits(a, b));
+        let taps = same_taps(&r, steps);
         let mut ok = taps;
         println!(
-            "pass {D3K}: {} ids by passes of up to {} ({fed:.1} s, runtime value), then the \
+            "pass {name}: {} ids by passes of up to {} ({fed:.1} s, runtime value), then the \
              step: layer outputs bit for bit the step-fed run's: {taps}",
             prefill.len(),
             Prompt38::PASS_ROWS
         );
         ok &= same_run(
-            "D3K fed by passes vs fed by steps, the step after",
+            &format!("{name} fed by passes vs fed by steps, the step after"),
             &r,
             steps,
             false,
+        );
+        Ok(ok)
+    }
+
+    /// A window of D3K's prefill, positions `lo .. hi`: (q2) runs it by passes
+    /// and by steps.
+    #[derive(Clone, Copy)]
+    struct Window {
+        lo: usize,
+        hi: usize,
+    }
+
+    /// What a pass does differently from a step where a row selects: each is
+    /// a place where one row's work depends on the rows it shares a launch
+    /// with, or where the pass's chunk edges (`Prompt38::Pass` cuts a call in
+    /// chunks of [`PASS_ROWS`] from its first position) fall against the
+    /// rule's.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Edge {
+        /// A chunk in the dense region past the rows (q1) walks, every row's
+        /// list the identity of 1,025 to 2,048 keys (the selected flash's
+        /// segments past the 16 (q1)'s lists reach), that completes a pool in
+        /// the middle of the chunk and wraps a ring there.
+        Dense,
+        /// A chunk holding rows on both sides of [`ONSET`]: the first selecting
+        /// row's list is a selection beside the rows before it, whose list is
+        /// the identity (`qsa_score`'s per-row `scored` over one tile loop,
+        /// `qsa_topk`'s block a row, one selected flash over lists of
+        /// different lengths).
+        Onset,
+        /// A selecting row completing a pool inside a chunk, read by the rows
+        /// after it in the same chunk (`qsa_pool` before `qsa_score`, one
+        /// launch of the chunk's rows).
+        PoolMid,
+        /// A selecting row completing a pool as a chunk's last row, read by
+        /// the next launch.
+        PoolLast,
+        /// A chunk whose selecting rows see `POOL_TILE · k` and `POOL_TILE · k
+        /// + 1` complete pools beside each other: the score tile that starts
+        /// at pool `POOL_TILE · k` is live for the later row alone
+        /// (`qsa_score`'s `live_max` over the launch's rows and each row's
+        /// `p0 < nb`).
+        Tile,
+        /// A chunk whose slot writes wrap the PLE ring ([`PLE_RING`] rows).
+        PleRing,
+        /// The same for the delta layers' conv ring ([`CONV_RING`] rows).
+        ConvRing,
+        /// A chunk of fewer than [`PASS_ROWS`] rows, the rows' `m` another
+        /// than the full pass's.
+        ShortPass,
+        /// The window that ends at the prefill's end, whose last row completes
+        /// the last pool, then the step reads a tail of one key.
+        Tail,
+    }
+
+    const EDGES: [Edge; 9] = [
+        Edge::Dense,
+        Edge::Onset,
+        Edge::PoolMid,
+        Edge::PoolLast,
+        Edge::Tile,
+        Edge::PleRing,
+        Edge::ConvRing,
+        Edge::ShortPass,
+        Edge::Tail,
+    ];
+
+    impl Edge {
+        fn name(self) -> &'static str {
+            match self {
+                Edge::Dense => "dense",
+                Edge::Onset => "onset",
+                Edge::PoolMid => "pool-mid",
+                Edge::PoolLast => "pool-last",
+                Edge::Tile => "tile",
+                Edge::PleRing => "ple-ring",
+                Edge::ConvRing => "conv-ring",
+                Edge::ShortPass => "short-pass",
+                Edge::Tail => "tail",
+            }
+        }
+    }
+
+    /// (q2)'s windows over a prefill of `n` ids, ascending:
+    /// - [1,680, 1,696): the dense region past (q1)'s rows; position 1,683,
+    ///   a multiple of both ring sizes (17 · 11 · 9), is row 3 of the first
+    ///   chunk and completes pool 420 there;
+    /// - [2,048, 2,075): the chunk [2,048, 2,056) holds [`ONSET`] with three
+    ///   rows before it, the onset row completes pool 512 and sees the 17th
+    ///   tile with one live pool, the chunk's last row completes pool 513
+    ///   for the next chunk, a multiple of both ring sizes (2,057) falls in the
+    ///   second chunk, and the last chunk is three rows;
+    /// - [2,178, 2,194): chunks start two off a pool edge (pools complete at
+    ///   their rows 1 and 5), and row 2,179 is the first to see 545 pools, the
+    ///   18th tile live for it alone beside 2,178's 544;
+    /// - the last three chunks: the last row completes pool 749 and the step
+    ///   at the prefill's length reads a tail of one key.
+    fn windows(n: usize) -> [Window; 4] {
+        [
+            Window {
+                lo: DENSE_AT,
+                hi: DENSE_AT + 2 * PASS_ROWS,
+            },
+            Window {
+                lo: ONSET - 3,
+                hi: ONSET + 24,
+            },
+            Window {
+                lo: TILE_AT - 1,
+                hi: TILE_AT - 1 + 2 * PASS_ROWS,
+            },
+            Window {
+                lo: n.saturating_sub(3 * PASS_ROWS),
+                hi: n,
+            },
+        ]
+    }
+
+    /// The edges window `w` of a prefill of `n` ids covers, derived from the
+    /// chunks `Prompt38::Pass` cuts it into; `dense_from`, the first position
+    /// (q1)'s passes do not reach.
+    fn edges(w: Window, (n, dense_from): (usize, usize)) -> Vec<Edge> {
+        let completes = |p: usize| (p + 1).is_multiple_of(POOL);
+        let wraps = |p: usize| p.is_multiple_of(PLE_RING) || p.is_multiple_of(CONV_RING);
+        let mut found = Vec::new();
+        let mut add = |e: Edge, hit: bool| {
+            if hit && !found.contains(&e) {
+                found.push(e);
+            }
+        };
+        for p0 in (w.lo..w.hi).step_by(PASS_ROWS) {
+            let m = PASS_ROWS.min(w.hi - p0);
+            let last = p0 + m - 1;
+            add(
+                Edge::Dense,
+                p0 >= dense_from
+                    && last < ONSET
+                    && (p0..last).any(completes)
+                    && (p0 + 1..=last).any(wraps),
+            );
+            add(Edge::Onset, p0 < ONSET && ONSET <= last);
+            add(
+                Edge::PoolMid,
+                (p0..last).any(|p| p >= ONSET && completes(p)),
+            );
+            add(Edge::PoolLast, last >= ONSET && completes(last));
+            add(
+                Edge::Tile,
+                (p0 + 1..=last).any(|p| (p + 1) % (POOL * POOL_TILE) == POOL && p / POOL > KEPT),
+            );
+            add(
+                Edge::PleRing,
+                (p0 + 1..=last).any(|p| p.is_multiple_of(PLE_RING)),
+            );
+            add(
+                Edge::ConvRing,
+                (p0 + 1..=last).any(|p| p.is_multiple_of(CONV_RING)),
+            );
+            add(Edge::ShortPass, m > 1 && m < PASS_ROWS && p0 >= ONSET);
+        }
+        add(Edge::Tail, w.hi == n && (n + 1) % POOL == 1);
+        found
+    }
+
+    /// One arm of (q2): from [`fresh`], `ids` (D3K's prefill) by ubatches over
+    /// each gap between the windows `ws` and by `path` over each window, `end` taking
+    /// the run left at each window's end (its last token and logits and every
+    /// store), then, last, the eager step of `tok` with the taps armed.
+    fn walk_windows(
+        m: &mut Qwen38Model,
+        (ids, tok): (&[u32], u32),
+        ws: &[Window],
+        path: Prompt38,
+        mut end: impl FnMut(usize, Run) -> Result<(), GateError>,
+    ) -> Result<(), GateError> {
+        fresh(m)?;
+        m.set_mode(StepMode::Graph);
+        let mut at = 0;
+        for (i, w) in ws.iter().enumerate() {
+            if w.lo < at || w.hi <= w.lo || ids.len() < w.hi {
+                return Err(format!(
+                    "(q2) window {i} [{}, {}) after position {at}, in {} ids: windows ascend, \
+                     each of a row or more",
+                    w.lo,
+                    w.hi,
+                    ids.len()
+                )
+                .into());
+            }
+            let t = Instant::now();
+            if w.lo > at {
+                m.prompt38(&ids[at..w.lo], Prompt38::Gemm)?;
+            }
+            let gap = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let last = m.prompt38(&ids[w.lo..w.hi], path)?;
+            let rows = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let logits = m.logits()?;
+            let (stores, ple_ring) = stores(m)?;
+            println!(
+                "(q2) by {} window {i} [{}, {}): the gap of {} ids by ubatches {gap:.1} s, the \
+                 window {rows:.1} s, the readback {:.2} s (runtime values)",
+                path.name(),
+                w.lo,
+                w.hi,
+                w.lo - at,
+                t.elapsed().as_secs_f64()
+            );
+            at = w.hi;
+            end(
+                i,
+                Run {
+                    tokens: vec![last],
+                    logits: vec![logits],
+                    taps: Vec::new(),
+                    routes: Vec::new(),
+                    stores,
+                    ple_ring,
+                },
+            )?;
+        }
+        let r = run_last(m, tok)?;
+        end(ws.len(), r)
+    }
+
+    /// (q2): D3K's prefill in the selector region, the windows ([`windows`])
+    /// by passes against by steps, each arm's gaps by ubatches; the last
+    /// token, logits and every store at each window's end, and the step after
+    /// the last, bit for bit. A window the two arms differ at is named, the
+    /// first.
+    fn pass_windows(m: &mut Qwen38Model) -> Result<bool, GateError> {
+        let (_, _, tok, prefill, _) = set_open((D3K, &IK), None)?;
+        let n = prefill.len();
+        let dense_from = set_open((D1K, &IK), None)?.3.len();
+        let ws = windows(n);
+        let mut covered = Vec::new();
+        for (i, w) in ws.iter().enumerate() {
+            let here = edges(*w, (n, dense_from));
+            println!(
+                "(q2) window {i} [{}, {}): {} rows in {} passes; covers {}",
+                w.lo,
+                w.hi,
+                w.hi - w.lo,
+                (w.hi - w.lo).div_ceil(PASS_ROWS),
+                here.iter().map(|e| e.name()).collect::<Vec<_>>().join(", ")
+            );
+            covered.extend(here);
+        }
+        if let Some(e) = EDGES.iter().find(|e| !covered.contains(e)) {
+            return Err(format!(
+                "(q2): no window covers the {} edge ({} ids, windows {:?})",
+                e.name(),
+                n,
+                ws.map(|w| (w.lo, w.hi))
+            )
+            .into());
+        }
+        let mut steps = Vec::new();
+        walk_windows(m, (&prefill, tok), &ws, Prompt38::Step, |_, r| {
+            steps.push(r);
+            Ok(())
+        })?;
+        let (mut ok, mut first) = (true, None);
+        walk_windows(m, (&prefill, tok), &ws, Prompt38::Pass, |i, r| {
+            let want = &steps[i];
+            let (label, taps) = match ws.get(i) {
+                Some(w) => (
+                    format!("window {i} [{}, {}) by passes vs by steps", w.lo, w.hi),
+                    true,
+                ),
+                None => (
+                    format!("the step at {n} after the windows, passes vs steps"),
+                    same_taps(&r, want),
+                ),
+            };
+            let same = same_run(&label, &r, want, true) && taps;
+            if !same {
+                first.get_or_insert(i);
+            }
+            ok &= same;
+            Ok(())
+        })?;
+        println!(
+            "(q2) {} windows and the step after, passes vs steps: first differing {} {}",
+            ws.len(),
+            first.map_or("none".to_string(), |i| ws.get(i).map_or(
+                "the step after the windows".to_string(),
+                |w| format!("window {i} [{}, {})", w.lo, w.hi)
+            )),
+            verdict(ok)
         );
         Ok(ok)
     }
@@ -1263,11 +1620,11 @@ mod gate {
     }
 
     /// Where a (v) run stands before its rows: [`fresh`], then the prefix
-    /// as graph steps or as one prompt by passes.
+    /// as graph steps or as one prompt by ubatches.
     #[derive(Clone, Copy)]
     enum Prefix<'a> {
         Steps(&'a [u32]),
-        Pass(&'a [u32]),
+        Gemm(&'a [u32]),
     }
 
     impl Prefix<'_> {
@@ -1276,7 +1633,7 @@ mod gate {
             m.set_mode(StepMode::Graph);
             match self {
                 Prefix::Steps(t) => m.step(t)?,
-                Prefix::Pass(t) => m.prompt38(t, Prompt38::Pass)?,
+                Prefix::Gemm(t) => m.prompt38(t, Prompt38::Gemm)?,
             };
             Ok(())
         }
@@ -1621,7 +1978,7 @@ mod gate {
         Ok(ok)
     }
 
-    /// The deep verify: D3K's first [`DEEP`] prefill ids by passes, then a
+    /// The deep verify: D3K's first [`DEEP`] prefill ids by one ubatch, then a
     /// verify of the next four kept to [`DEEP_KEPT`], against the steps of
     /// those rows; the pooled rows past the count poisoned, then the two
     /// steps after, the prefill's next ids.
@@ -1632,7 +1989,7 @@ mod gate {
             .get(..DEEP + LANES)
             .ok_or_else(|| format!("{D3K}: a prefill of {} ids", prefill.len()))?
             .to_vec();
-        let (prefix, rows) = (Prefix::Pass(&ids[..DEEP]), &ids[DEEP..]);
+        let (prefix, rows) = (Prefix::Gemm(&ids[..DEEP]), &ids[DEEP..]);
         let rows: [u32; LANES] = std::array::from_fn(|i| rows[i]);
         let (next, then) = (rows[DEEP_KEPT], rows[DEEP_KEPT + 1]);
         let want = ref_run(m, prefix, &[&rows[..DEEP_KEPT]], next)?;
@@ -2609,7 +2966,8 @@ mod gate {
     /// (g) on D3K's prefill: one ubatch against two cut inside the selecting
     /// rows ([`SPLIT`], mid-pool, off the eight-row runs), the last logits and
     /// every store bit for bit; the walk's cut of the selecting layers' rows
-    /// against the rule's; then the step after the ubatch against ik's.
+    /// against the rule's; and the step after the one ubatch against ik's,
+    /// taken before the cut walk starts from a reset.
     fn gemm_d3k(m: &mut Qwen38Model, ties: &mut usize) -> Result<bool, GateError> {
         let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
         let (_, _, prefill) = man.step()?;
@@ -2638,7 +2996,7 @@ mod gate {
         // select keeps (TOP_K 2,048 over pools of 4): at a count of
         // 4 · 513 = 2,052, position 2,051. From position 0 the prefill
         // flash takes the 2,051 rows before it.
-        let dense = (POOL * (KEPT + 1) - 1).min(prefill.len());
+        let dense = ONSET.min(prefill.len());
         let want = (dense, prefill.len() - dense);
         let split_ok = rows >= prefill.len() && split == Some(want);
         println!(
@@ -2649,6 +3007,16 @@ mod gate {
             verdict(split_ok)
         );
         let mut ok = split_ok;
+        // The step after the one-ubatch walk, against ik's: the model stands
+        // where the walk left it (the readbacks above move nothing), and the
+        // cut walk below starts from a reset.
+        if let Some(set) = open_step_set(D3K, Prompt38::Gemm, (None, false))? {
+            ok &= step_after(m, &set, t, ties)?.0;
+        }
+        println!(
+            "{D3K}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
+             ours does not read (a named difference, its logits printed)"
+        );
         fresh(m)?;
         m.prompt38(&prefill[..SPLIT], Prompt38::Gemm)?;
         let cut_tok = m.prompt38(&prefill[SPLIT..], Prompt38::Gemm)?;
@@ -2668,7 +3036,6 @@ mod gate {
             true,
         );
         ok &= gemm_timed(m, &prefill, &one)?;
-        ok &= step_set(m, D3K, Prompt38::Gemm, (None, false), ties)?.0;
         Ok(ok)
     }
 
@@ -2764,8 +3131,23 @@ mod gate {
     /// the router's first 2,048-token run.
     const SPLIT: usize = 2601;
     const KEPT: usize = 512;
-    const _: () =
-        assert!(!SPLIT.is_multiple_of(POOL) && !(SPLIT - POOL * (KEPT + 1) + 1).is_multiple_of(8));
+    /// The first position whose row selects: its count, `POOL · (KEPT + 1)`,
+    /// is the first to see more complete pools than the [`KEPT`] a select
+    /// keeps.
+    const ONSET: usize = POOL * (KEPT + 1) - 1;
+    /// The first position whose row sees `KEPT + POOL_TILE + 1` complete
+    /// pools: the score tile that starts at pool `KEPT + POOL_TILE` is live
+    /// for that row alone, beside the row before it.
+    const TILE_AT: usize = POOL * (KEPT + POOL_TILE + 1) - 1;
+    /// The first position of (q2)'s dense-region window: a multiple of the
+    /// pass's rows whose row 3 is 1,683, a multiple of both rings' sizes.
+    const DENSE_AT: usize = 1680;
+    const _: () = assert!(!SPLIT.is_multiple_of(POOL) && !(SPLIT - ONSET).is_multiple_of(8));
+    const _: () = assert!(
+        DENSE_AT.is_multiple_of(PASS_ROWS)
+            && (DENSE_AT + 3).is_multiple_of(PLE_RING * CONV_RING)
+            && (DENSE_AT + 4).is_multiple_of(POOL)
+    );
 
     /// The walks (g)'s map refusals plant their maps on, each from
     /// position [`PREFIX`].
@@ -2907,16 +3289,16 @@ mod gate {
     /// contract: the header's budget puts half the experts
     /// (`n_expert / 2`) on the card of every card layer — a budget one
     /// granule off leaves a layer one expert short.
-    fn card_structure(m: &mut Qwen38Model, plan: &CardPlan) -> Result<bool, GateError> {
+    fn card_structure(m: &mut Qwen38Model, plan: &PlanFacts) -> Result<bool, GateError> {
         let nodes = m.capture_step()?;
         let body = m.body("card_structure")?;
         let (layers, (counted, memops_counted)) = (body.card_layers(), body.step_launches());
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let want_nodes = shape().nodes_decode_card(plan.layers);
+        let want_nodes = shape().nodes_decode_card(plan.card_layers);
         let want_memops = memops();
-        let ok = layers == plan.layers
+        let ok = layers == plan.card_layers
             && nodes == want_nodes
             && counted == want_nodes
             && memops_counted == want_memops
@@ -2927,7 +3309,7 @@ mod gate {
             "card leg structure: card layers {layers} (want {}, the plan's); decode graph_nodes=\
              {nodes} (want {want_nodes}; the program counts {counted}, {memops_counted} of them \
              batch_mem_op) kernel={k} batch_mem_op={b} (want {want_memops}) other={other} {}",
-            plan.layers,
+            plan.card_layers,
             verdict(ok)
         );
         let held = |on: &dyn Fn(u64) -> bool| plan.n_l.iter().filter(|&&n| on(n)).count();
@@ -2948,7 +3330,7 @@ mod gate {
             },
             verdict(contract)
         );
-        let witnessed = card_witnesses(plan.layers);
+        let witnessed = card_witnesses(plan.card_layers);
         Ok(ok && contract && witnessed)
     }
 
@@ -3157,7 +3539,7 @@ mod gate {
     /// steps' — the leg's kernels are independent per slot and column; each
     /// verify's graph holds the header's verify nodes plus the leg's five
     /// launches on each of the plan's card layers.
-    fn card_rows(m: &mut Qwen38Model, toks: &[u32], plan: &CardPlan) -> Result<bool, GateError> {
+    fn card_rows(m: &mut Qwen38Model, toks: &[u32], plan: &PlanFacts) -> Result<bool, GateError> {
         let eager = run_steps(m, toks, StepMode::Eager, true)?;
         let graph = run_steps(m, toks, StepMode::Graph, true)?;
         let mut ok = same_run(
@@ -3173,7 +3555,7 @@ mod gate {
             &graph,
             true,
         );
-        let want = shape().nodes_verify_card(plan.layers);
+        let want = shape().nodes_verify_card(plan.card_layers);
         ok &= verify_structure::<2>(m, want)?;
         ok &= verify_structure::<3>(m, want)?;
         ok &= verify_structure::<4>(m, want)?;
@@ -3319,11 +3701,7 @@ mod gate {
     /// against `host`, (ii) and (iii).
     fn card_leg(toks: &[u32], host: &Run, man: &RefManifest) -> Result<bool, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let Opened {
-            model: mut m,
-            card: plan,
-            ..
-        } = match open_at(Experts::Card, 1, ub, None) {
+        let Opened38 { model: mut m, plan } = match open_at(Experts::Card, 1, ub, None) {
             Ok(o) => o,
             Err(e) => {
                 println!(
@@ -3716,37 +4094,36 @@ mod gate {
         let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
         let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
-        let file = open_split()?;
-        let inputs = PlanInputs::describe(&file)?;
         // The host arm's need is read off the plan the loads below make: the
         // same card ([`card`], not a card by name), the same levers.
-        let machine = machine_for_experts(
-            card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ZUB)?,
-            Experts::Host,
-        );
-        let host_need = HostNeed::of(
-            &inputs.plan_with_slots(&machine, CTX as u64, &cfg().plan_levers, Experts::Host, 1)?,
-            0,
-        )
+        let host_need = Open38 {
+            card: card()?,
+            ctx: CTX,
+            ub: ZUB,
+            experts: Experts::Host,
+            slots: 1,
+            plan_levers: &cfg().plan_levers,
+            host: cfg().host,
+            room: None,
+            residency: Residency::Off,
+        }
+        .plan(open_split()?)?
+        .facts()
+        .host_need
         .bytes();
-        drop(inputs);
-        drop(file);
-        let Opened {
+        let Opened38 {
             model: mut m,
-            ple_tier: host_tier,
-            ..
+            plan: host_plan,
         } = open_at(Experts::Host, 1, ZUB, None)?;
         let (want, host_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
-        let Opened {
+        let Opened38 {
             model: mut m,
-            ple_tier: nvme_tier,
-            ..
+            plan: nvme_plan,
         } = open_at(Experts::Host, 1, ZUB, Some(host_need - 1))?;
         let (got, nvme_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
+        let (host_tier, nvme_tier) = (host_plan.ple_tier, nvme_plan.ple_tier);
         let tiers = host_tier == Some(Device::Host) && nvme_tier == Some(Device::Nvme);
         println!(
             "ple tiers: the reading's room puts the table on the {} tier, a room of the host \
@@ -3776,6 +4153,12 @@ mod gate {
         }
         Ok(ok)
     }
+
+    /// The reason D3K has no step-fed walk of 3,000 steps, printed where its
+    /// clauses stand.
+    const MOVED_D3K: &str = "(q2) MOVED(2026-10-08, gatecensus R8): D3K's step-fed walk (3,000 \
+        steps) is replaced by D1K's passes = steps and windows over the selector region's \
+        boundaries from a shared GEMM prefix; D3K's ik compare is the GEMM-fed one.";
 
     /// A self-consistency clause: it runs in both tiers, so a tier that
     /// deferred it would be refused by name here, not skipped.
@@ -3809,19 +4192,18 @@ mod gate {
         let last = *firsts.last().ok_or("no positions")?;
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
-        for (name, band) in [(STEP4, band), (STEP4_EVERY_NODE, band), (D1K, None)] {
+        for (name, band) in [(STEP4, band), (STEP4_EVERY_NODE, band)] {
             ok &= step_set(&mut m, name, Prompt38::Step, (band, false), &mut ties)?.0;
         }
-        let (d3k_ok, d3k) = step_set(&mut m, D3K, Prompt38::Step, (None, true), &mut ties)?;
-        ok &= d3k_ok;
-        println!(
-            "{D3K}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
-             ours does not read (a named difference, its logits printed)"
-        );
+        let (d1k_ok, d1k) = step_set(&mut m, D1K, Prompt38::Step, (None, true), &mut ties)?;
+        ok &= d1k_ok;
         println!("step sets: {ties} named tie(s)");
-        sc("(q) D3K's prefill by passes = by steps")?;
-        ok &= pass_selects(&mut m, &d3k)?;
-        drop(d3k);
+        sc("(q1) D1K's prefill by passes = by steps: the dense region")?;
+        ok &= pass_selects(&mut m, D1K, &d1k)?;
+        drop(d1k);
+        println!("{MOVED_D3K}");
+        sc(MOVED_D3K)?;
+        ok &= pass_windows(&mut m)?;
         sc("(g) D3K by ubatches: the cut, the walk's split, the timed record")?;
         ok &= gemm_d3k(&mut m, &mut ties)?;
         sc("(g) the map refusals and auto")?;

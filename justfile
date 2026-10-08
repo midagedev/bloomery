@@ -825,8 +825,8 @@ clef-hidden *ARGS:
 # Qwen3.8-Flash-Next (qwen4exp) whole-program gate on the 3090's plan (either card, shared/gate_card.rs): the step's
 # node count, graph = eager = one pass (logits and every store bit for bit), reset clears, every layer's streams on the
 # batch set within the borrowed band with the router's flips named, the step after each set's prompt (4, 1,024 and
-# 3,000 positions), D3K's prompt by passes = by steps, and the refusals. Loads the whole host set: alone in a batch,
-# under the big-load lock.
+# 3,000 positions; D3K's fed by ubatches), D1K's prompt by passes = by steps, windows over D3K's selector region by
+# passes = by steps, and the refusals. Loads the whole host set: alone in a batch, under the big-load lock.
 # solo-real, reason r1 (the whole host set under the big-load lock; not both cards, no host-memory pin): the fixture tier balances it.
 [group('solo-real')]
 [group('v41-load')]
