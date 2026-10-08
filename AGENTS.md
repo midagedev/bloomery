@@ -106,6 +106,10 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   change that moves no behaviour (`just ptx-scan` equal to the base). A rebase moves the key of every item the landed
   commits touch. While the lead's `--ledger` batch runs, other tracks' GPU gates wait (a GPU-only hold,
   `/root/bloomery-batch.gpuhold`, read by `tools/gpu-gate.sh`; `--no-gpu-hold` opts out); builds do not.
+  A `--round-ledger` batch yields to that hold instead of queueing behind it: an item whose try ends rc 75
+  on it ends `rc=yield` naming the hold's owner (counted in the DONE line's `yielded=`), is not retried and
+  leaves no times row or ledger record — while a plain card-lock rc 75 keeps its retry and the lead's own
+  batch keeps waiting.
 - **Narrowing.** The graph over-selects a host-only change. When `just ptx-scan` equals the base for every bin the
   change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
   checks; `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list and why. A kernel, a launch or a byte
