@@ -224,10 +224,12 @@
 //! of the draft's `target_layers`, built before the capture. The fed ids go
 //! by the prompt schedule, the draft taking the features the call hands it
 //! (every position's under steps, the draft's window under a batch); then
-//! every pass proposes (`kind=` on the `draft summary` line names the
-//! draft), runs the pair over `[next, proposal]` and appends the features of
-//! the positions it keeps. The rows and lines are the lookup's; a
-//! `load draft=dspark` line follows the `load` line.
+//! each pass the width chooser drafts (`runtime::width`; every pass under
+//! `BLOOMERY_MTP_WIDTH=fixed`) proposes, runs the pair over `[next,
+//! proposal]` and appends the features of the positions it keeps. `kind=` on
+//! the `draft summary` line names the draft and `width=` the chooser's mode,
+//! under `cost` with its state at the run's end. The rows and lines are the
+//! lookup's; a `load draft=dspark` line follows the `load` line.
 //!
 //! `BLOOMERY_GEN_SLOTS=N` (unset or 1 is the one-sequence run above, line
 //! for line) decodes N streams in one pass (`GpuModel::step_slots`, the
@@ -2371,10 +2373,10 @@ mod drive {
         s: &mut Session<Body>,
         a: &Args,
         f: &Fed<'_>,
-        spec: &mut Speculative<D, PAIR_ROWS>,
+        spec: &mut Speculative<Choosing<D>, PAIR_ROWS>,
         steps: &'static str,
         kind: &'static str,
-        after: impl FnOnce(&mut Speculative<D, PAIR_ROWS>) -> Result<(), GateError>,
+        after: impl FnOnce(&mut Speculative<Choosing<D>, PAIR_ROWS>) -> Result<(), GateError>,
     ) -> Result<(), GateError> {
         let depth = f.ids.len();
         let (first, feed_time) = feed(s, spec, f, steps)?;
@@ -2407,7 +2409,7 @@ mod drive {
             print_counts(s.model())?;
             print_stats(&sink.probes, warm);
         }
-        print_draft_summary(a, &passes, f.prompt_len, depth, kind);
+        print_draft_summary(a, &passes, f.prompt_len, depth, kind, spec.draft_mut());
         Ok(())
     }
 
@@ -2438,14 +2440,17 @@ mod drive {
     }
 
     /// The `draft summary` over every pass (the rate over the passes past
-    /// `--warm`), then the `SMOKE` footer when timed: `generate`'s keys over
-    /// the kept passes, then `positions=` and `tok/s(positions)=`.
-    fn print_draft_summary(
+    /// `--warm`) with the width chooser's mode and, under `cost`, its state
+    /// at the run's end and the passes it ran closed ([`record::width_gate`]);
+    /// then the `SMOKE` footer when timed: `generate`'s keys over the kept
+    /// passes, then `positions=` and `tok/s(positions)=`.
+    fn print_draft_summary<D>(
         a: &Args,
         passes: &[(PassKind, f64)],
         prompt_len: usize,
         depth: usize,
         kind: &str,
+        chooser: &mut Choosing<D>,
     ) {
         let warm = a.warm.unwrap_or(0);
         let proposals = passes.iter().filter(|p| p.0 != PassKind::Plain).count();
@@ -2455,14 +2460,22 @@ mod drive {
         let kept_positions: usize = kept.iter().map(|p| p.0.positions()).sum();
         let kept_ms: f64 = kept.iter().map(|p| p.1).sum();
         let rate = kept_positions as f64 * 1e3 / kept_ms;
-        Record::new(&record::DRAFT_SUMMARY)
+        let summary = Record::new(&record::DRAFT_SUMMARY)
             .u("proposals", proposals)
             .u("accepts", accepts)
             .u("positions", positions)
             .u("passes", passes.len())
             .f("tok/s(positions)", rate)
             .w("kind", kind)
-            .print();
+            .w("width", chooser.mode().word());
+        let summary = match chooser.mode() {
+            WidthMode::Fixed => summary,
+            WidthMode::Cost => {
+                let closed = chooser.take_tally().closed;
+                record::width_gate(summary, &chooser.gate_state(), closed)
+            }
+        };
+        summary.print();
         if a.timed {
             let mut sorted: Vec<f64> = kept.iter().map(|p| p.1).collect();
             sorted.sort_by(f64::total_cmp);

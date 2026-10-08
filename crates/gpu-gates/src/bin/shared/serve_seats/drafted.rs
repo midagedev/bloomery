@@ -428,10 +428,10 @@ fn print_join<B: MtpBody, const M: usize>(spec: &mut Spec<B, M>) {
     }
 }
 
-/// The chooser's passes over the request a slot just finished, as its `mtp
-/// width` record: nothing under `fixed`, whose passes are the draft's own,
-/// and nothing for a request that ran no pass. The ds41 seat drains its own
-/// drafts the same way.
+/// The chooser's passes over the request a slot just finished and its state
+/// at the request's end, as its `mtp width` record: nothing under `fixed`,
+/// whose passes are the draft's own, and nothing for a request that ran no
+/// pass. The ds41 seat drains its own drafts the same way.
 pub(crate) fn print_widths<D, const M: usize>(spec: &mut Speculative<Choosing<D>, M>) {
     let choosing = spec.draft_mut();
     if choosing.mode() != WidthMode::Cost {
@@ -441,10 +441,10 @@ pub(crate) fn print_widths<D, const M: usize>(spec: &mut Speculative<Choosing<D>
     if t.passes() == 0 {
         return;
     }
-    Record::new(&record::MTP_WIDTH)
+    let r = Record::new(&record::MTP_WIDTH)
         .u("windows", t.windows)
         .csv("kept", &t.kept)
         .csv("widths", &t.widths)
-        .f("e", t.e())
-        .eprint();
+        .f("e", t.e());
+    record::width_gate(r, &choosing.gate_state(), t.closed).eprint();
 }
