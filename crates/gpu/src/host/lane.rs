@@ -1,29 +1,48 @@
 //! The residency machine's copy lane, which the machine owns
 //! ([`super::swap::SwapMachine`]): the staging ring its copy stream copies
-//! from, the ring's staged and drained words, the job queue and the staging
-//! thread. The machine issues a job a copy and enqueues the copy behind the
-//! job's staged word ([`dispatch`]); the staging thread prepares the job's
-//! victim, waits for the job to open (the staging window open, a flush, or
-//! the job due) and for its ring slot's previous copy to drain, copies the
-//! expert's bytes into the slot and raises the word. Why no wait here can
-//! close a cycle through the card is the machine's to argue (its module doc,
-//! **No wait without a bound** and **No cycle through the card**).
+//! from, the ring's staged and drained words, the job queue and the
+//! [`LANE_THREADS`] threads that fill the ring. The machine issues a job a
+//! copy and enqueues the copy behind the job's staged word ([`dispatch`]).
+//!
+//! **The receive lock.** A lane thread takes the next job in issue order
+//! under one lock and, still under it, prepares the job's victim, waits for
+//! the job to open (the staging window open, a flush, or the job due) and,
+//! within the deadline, for its ring slot's previous copy to drain. Then it
+//! copies the expert's bytes into the slot and raises the word: inside the
+//! lock for a job the window opened, so those stage one at a time beside
+//! the steps the window gates; outside it for a job a flush or its landing
+//! opened (a prompt call's picks, a reset's and a restore's copies, a late
+//! flip), so up to [`LANE_THREADS`] of those stage at once. A victim's
+//! preparation stays in issue order under the lock, one lane thread at a
+//! time: a source's preparation (the NVMe tier's books and its reads) is
+//! written for one lane caller. The lock closes no cycle: job `n` waits only
+//! on job `n − RING_SLOTS`'s copy, a job an earlier holder of the lock took,
+//! whose staging needs the lock no more. A panic or a poisoned lock stops no
+//! other thread. Why no wait here can close a cycle through the card is the
+//! machine's to argue (its module doc, **No wait without a bound** and **No
+//! cycle through the card**).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cuda_core::{CudaContext, CudaStream, sys};
 
 use super::swap::{SwapSource, Transform};
+use super::xstream::FILL_THREADS;
 use crate::GpuError;
 use crate::graph::{MappedHost, cu};
 
 /// Experts the staging ring holds at once.
 pub const RING_SLOTS: usize = 4;
+
+/// The lane's threads. Jobs the staging window opened stage on one of them
+/// at a time; jobs a flush or their landing opened stage on all of them at
+/// once.
+pub const LANE_THREADS: usize = 4;
 
 /// Bytes between two words of the staging page: a cache line each.
 pub(super) const WORD_STRIDE: usize = 64;
@@ -34,14 +53,17 @@ fn nanos_since(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Where the staging thread runs: the SMT sibling of the pool's first
-/// worker. The copies are DRAM streams that sweep a ring slot's worth of L3,
-/// so not beside the dispatcher (the critical path, whose sibling the engram
-/// helper takes): the first worker's core sits on another CCD than the
-/// dispatcher's. The copies run while no step service computes, so that
-/// worker only spins or idles beside them. With no pinned pool, floating.
-fn staging_placement() -> threads::helper::Placement {
-    match threads::built().and_then(|p| p.worker_cpu(0)) {
+/// Where lane thread `t` runs: the SMT sibling of the pool's worker
+/// [`FILL_THREADS`]` + t`, past the expert stream's fill threads on the
+/// first workers' siblings. The copies are DRAM streams that sweep a ring
+/// slot's worth of L3; the pool spreads its workers over the CCDs in turn,
+/// so the lane's threads spread over them too, none on the dispatcher's core
+/// (the critical path, whose sibling the engram helper takes). A prompt
+/// call's copies run beside the union the pool's workers compute, so those
+/// workers share their cores with the copies then. Floating, thread by
+/// thread, where the pool holds or pins no such worker.
+fn lane_placement(t: usize) -> threads::helper::Placement {
+    match threads::built().and_then(|p| p.worker_cpu(FILL_THREADS + t)) {
         Some(c) => threads::helper::Placement::Sibling(c),
         None => threads::helper::Placement::Float,
     }
@@ -57,9 +79,9 @@ pub(super) fn ring_ticket(n: u64) -> Result<(usize, u32), GpuError> {
 }
 
 /// The one way a wait on a staging word goes on the copy stream: a copy
-/// stream wait whose word only the staging thread raises is enqueued only
-/// for a job that thread already holds, so the thread enqueueing never waits
-/// on a wait it has yet to release.
+/// stream wait whose word only the lane raises is enqueued only for a job
+/// the lane's queue already holds, so the thread enqueueing never waits on
+/// a wait it has yet to release.
 pub(super) mod dispatch {
     use std::sync::mpsc;
 
@@ -69,7 +91,7 @@ pub(super) mod dispatch {
     use crate::GpuError;
     use crate::graph::{MappedHost, mem_batch, op_wait_geq};
 
-    /// A job the staging thread holds. Only [`send`] makes one.
+    /// A job the lane holds. Only [`send`] makes one.
     pub(in crate::host) struct Dispatched {
         ring: usize,
         ticket: u32,
@@ -85,8 +107,8 @@ pub(super) mod dispatch {
         }
     }
 
-    /// `job` to the staging thread over `tx`; refused by name as `what` when
-    /// the thread has stopped.
+    /// `job` to the lane over `tx`; refused by name as `what` when its
+    /// threads have stopped.
     pub(super) fn send(
         tx: Option<&mpsc::Sender<Job>>,
         job: Job,
@@ -94,7 +116,7 @@ pub(super) mod dispatch {
     ) -> Result<Dispatched, GpuError> {
         let (ring, ticket) = (job.ring, job.ticket);
         tx.and_then(|tx| tx.send(job).ok())
-            .ok_or_else(|| GpuError::protocol(what, "the staging thread has stopped"))?;
+            .ok_or_else(|| GpuError::protocol(what, "the lane has stopped"))?;
         Ok(Dispatched { ring, ticket })
     }
 
@@ -114,8 +136,8 @@ pub(super) mod dispatch {
     }
 }
 
-/// One expert's copy for the staging thread: first the victim to prepare,
-/// then ring slot `ring`, `ticket` its use of that slot.
+/// One expert's copy for the lane: first the victim to prepare, then ring
+/// slot `ring`, `ticket` its use of that slot.
 pub(super) struct Job {
     /// The job's place in issue order.
     pub(super) n: u64,
@@ -124,9 +146,9 @@ pub(super) struct Job {
     pub(super) victim: Option<u32>,
     pub(super) ring: usize,
     pub(super) ticket: u32,
-    /// The job is a prompt pick's copy, one of the layer's counter the
-    /// staging thread takes from ([`Shared::pick_left`]): a boundary's,
-    /// a reset's and a restore's are not.
+    /// The job is a prompt pick's copy, one of the layer's counter the lane
+    /// takes from ([`Shared::pick_left`]): a boundary's, a reset's and a
+    /// restore's are not.
     pub(super) stamp: bool,
 }
 
@@ -165,18 +187,19 @@ impl Ring {
         Ok(k * self.slot_bytes + at)
     }
 
-    /// `bytes` into ring slot `k` at byte `at`. The caller is the ring's one
-    /// host writer and writes slot `k` only once the copy stream has read
-    /// its previous use (`drained`).
+    /// `bytes` into ring slot `k` at byte `at`. The caller is slot `k`'s one
+    /// host writer, the lane thread that holds the slot's job, and writes it
+    /// only once the copy stream has read its previous use (`drained`).
     fn write(&self, k: usize, at: usize, bytes: &[u8]) -> Result<(), GpuError> {
         let off = self.span(k, at, bytes.len(), "SwapMachine ring write")?;
         // SAFETY: [off, off + len) lies inside the page (checked above); no
         // copy reads ring slot k until the staging word publishes this use,
-        // and the staging thread is the only host writer. The word's Release
-        // store follows these stores in program order, which x86 (TSO) keeps
-        // in the coherent write-back pinned page, and the copy engine reads
-        // the page over PCIe with no SM cache between: the copy the word
-        // lets through reads these bytes.
+        // and the thread holding the slot's job is its only host writer (job
+        // n + RING_SLOTS writes the slot only once job n's copy has drained
+        // it). The word's Release store follows these stores in program
+        // order, which x86 (TSO) keeps in the coherent write-back pinned
+        // page, and the copy engine reads the page over PCIe with no SM cache
+        // between: the copy the word lets through reads these bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.page.host_at(off), bytes.len());
         }
@@ -210,7 +233,7 @@ impl Ring {
     }
 }
 
-/// The staging thread's first failure: its job and the thread's own error.
+/// The lane's first failure: its job and the lane thread's own error.
 pub(super) struct StagingFailure {
     pub(super) job: u64,
     pub(super) layer: usize,
@@ -218,7 +241,7 @@ pub(super) struct StagingFailure {
     pub(super) error: GpuError,
 }
 
-/// What the staging thread and the machine share.
+/// What the lane threads and the machine share.
 pub(crate) struct Shared {
     pub(super) source: Arc<dyn SwapSource>,
     pub(super) ring: Ring,
@@ -238,19 +261,20 @@ pub(crate) struct Shared {
     pub(super) deadline: Duration,
     /// Stage whatever the window says: a quiet boundary's relayout.
     pub(super) flush: AtomicBool,
-    /// Nanoseconds the staging thread spent copying into the ring and
-    /// preparing victims, since a boundary last took them.
+    /// Nanoseconds the lane threads spent copying into the ring and
+    /// preparing victims, summed over the threads, since a boundary last
+    /// took them.
     pub(super) stage_ns: AtomicU64,
     pub(super) prepare_ns: AtomicU64,
-    /// Jobs the staging thread has finished (staged, or failed), counted
-    /// before each one's ticket is published: `jobs_issued - served` copies
-    /// wait for staging.
+    /// Jobs the lane has finished (staged, or failed), counted before each
+    /// one's ticket is published, in the order they finish: `jobs_issued -
+    /// served` copies wait for staging.
     pub(super) served: AtomicU64,
     /// Per layer index below the map's last layer (a job names its layer by
     /// its index in the model, not its place in the map), the jobs of the
-    /// layer's current pick the staging thread has not stamped yet: the pick
-    /// stores its count before it issues its copies, the thread takes one a
-    /// staged job.
+    /// layer's current pick the lane has not stamped yet: the pick stores its
+    /// count before it issues its copies, a lane thread takes one a staged
+    /// job.
     pub(super) pick_left: Vec<AtomicU64>,
     /// Per layer index below the map's last layer, the stamp epoch's
     /// nanoseconds at the moment the layer's last outstanding pick job staged
@@ -263,6 +287,14 @@ pub(crate) struct Shared {
     stop: AtomicBool,
     /// The first staging failure, which the next boundary or reset returns.
     failed: Mutex<Option<StagingFailure>>,
+    /// Per lane thread, the jobs it took ([`LaneStats::taken`]).
+    taken: [AtomicU64; LANE_THREADS],
+    /// The jobs staging now that the window opened, and those a flush or
+    /// their landing opened; the most of each at once ([`LaneStats`]).
+    in_window: AtomicU32,
+    in_open: AtomicU32,
+    peak_window: AtomicU32,
+    peak_open: AtomicU32,
     /// The machine's own job count and the next boundary one of its flips
     /// lands at, mirrored for a reader that holds no machine (the stall
     /// note, [`Shared::stall_note`]; the engine watchdog): stored where the
@@ -356,12 +388,12 @@ impl Shared {
         Ok(true)
     }
 
-    /// The staging thread's first failure, taken: the next boundary or reset
-    /// refuses with it.
+    /// The lane's first failure, taken: the next boundary or reset refuses
+    /// with it.
     pub(super) fn take_failure(&self) -> Option<StagingFailure> {
         self.failed
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
 
@@ -404,11 +436,17 @@ impl Shared {
         Ok(())
     }
 
+    /// What the lane did since the load ([`LaneStats`]).
+    pub(super) fn lane_stats(&self) -> LaneStats {
+        LaneStats {
+            taken: std::array::from_fn(|t| self.taken[t].load(Ordering::Relaxed)),
+            peak_window: self.peak_window.load(Ordering::Relaxed),
+            peak_open: self.peak_open.load(Ordering::Relaxed),
+        }
+    }
+
     fn fail(&self, job: &Job, error: GpuError) {
-        let mut f = self
-            .failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut f = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
         if f.is_none() {
             *f = Some(StagingFailure {
                 job: job.n,
@@ -419,21 +457,25 @@ impl Shared {
         }
     }
 
-    /// One job: prepare its victim, wait for the window (or a flush, or the
-    /// job due) and, within the deadline, for its ring slot's last copy;
-    /// stage. `Ok(false)` when the machine stops first.
-    fn serve(&self, job: &Job) -> Result<bool, GpuError> {
+    /// One job, taken under the receive lock `taken`: under it, its victim
+    /// prepared, the wait for the window (or a flush, or the job due) and,
+    /// within the deadline, for its ring slot's last copy; then the stage,
+    /// under the lock for a job the window opened, past it for one a flush
+    /// or its landing opened. `Ok(false)` when the machine stops first.
+    fn serve(
+        &self,
+        job: &Job,
+        taken: MutexGuard<'_, mpsc::Receiver<Job>>,
+    ) -> Result<bool, GpuError> {
         if let Some(v) = job.victim {
             let t0 = Instant::now();
             self.source.prepare_victim(job.layer, v)?;
             self.prepare_ns
                 .fetch_add(super::nanos(t0.elapsed()), Ordering::Relaxed);
         }
-        let open = || {
-            self.window.load(Ordering::Acquire) != 0
-                || self.flush.load(Ordering::Acquire)
-                || job.n < self.due.load(Ordering::Acquire)
-        };
+        let forced =
+            || self.flush.load(Ordering::Acquire) || job.n < self.due.load(Ordering::Acquire);
+        let open = || self.window.load(Ordering::Acquire) != 0 || forced();
         // No deadline: the window is closed only while a step service
         // computes one layer. What ends the wait: the window opening, a
         // boundary landing the job (`due`), a reset's flush (`drain_copies`,
@@ -442,6 +484,9 @@ impl Shared {
         if self.wait_until(open, None) != Ok(true) {
             return Ok(false);
         }
+        // What opened it, read once it is open: a flush or its landing
+        // before the window.
+        let by_window = !forced();
         let prev = job.ticket - 1;
         let drained = || self.drained(job.ring).load(Ordering::Acquire) >= prev;
         match self.wait_until(drained, Some(self.deadline)) {
@@ -458,6 +503,12 @@ impl Shared {
                 ));
             }
         }
+        let _staging = if by_window {
+            InFlight::enter(&self.in_window, &self.peak_window)
+        } else {
+            drop(taken);
+            InFlight::enter(&self.in_open, &self.peak_open)
+        };
         let t0 = Instant::now();
         self.stage(job)?;
         self.stage_ns
@@ -465,15 +516,20 @@ impl Shared {
         Ok(true)
     }
 
-    /// The staging thread: each job served ([`Shared::serve`]) and its
-    /// ticket published. A failure — an error or a panic — is recorded for
-    /// the next boundary, which waits for the ticket and refuses before its
-    /// flip could go live, and the ticket is published anyway, so the copy
-    /// stream never hangs on it: the bytes it copies land in a slot no entry
-    /// names.
-    fn run(&self, jobs: &mpsc::Receiver<Job>) {
-        while let Ok(job) = jobs.recv() {
-            match catch_unwind(AssertUnwindSafe(|| self.serve(&job))) {
+    /// Lane thread `me`: each job taken in issue order under the receive
+    /// lock `jobs`, served ([`Shared::serve`]) and its ticket published. A
+    /// failure — an error or a panic — is recorded for the next boundary,
+    /// which waits for the ticket and refuses before its flip could go live,
+    /// and the ticket is published anyway, so the copy stream never hangs on
+    /// it: the bytes it copies land in a slot no entry names.
+    fn run(&self, me: usize, jobs: &Mutex<mpsc::Receiver<Job>>) {
+        loop {
+            let taken = jobs.lock().unwrap_or_else(PoisonError::into_inner);
+            let Ok(job) = taken.recv() else {
+                return;
+            };
+            self.taken[me].fetch_add(1, Ordering::Relaxed);
+            match catch_unwind(AssertUnwindSafe(|| self.serve(&job, taken))) {
                 Ok(Ok(true)) => {}
                 Ok(Ok(false)) => return,
                 Ok(Err(e)) => self.fail(&job, e),
@@ -485,7 +541,7 @@ impl Shared {
                         .unwrap_or_else(|| "a payload that is not text".to_string());
                     let e = GpuError::protocol(
                         "SwapMachine staging",
-                        format!("the staging thread panicked: {why}"),
+                        format!("a lane thread panicked: {why}"),
                     );
                     self.fail(&job, e);
                 }
@@ -493,9 +549,10 @@ impl Shared {
             self.served.fetch_add(1, Ordering::AcqRel);
             if job.stamp {
                 // The pick's per-layer remaining-jobs counter, one atomic a
-                // job: the thread that stages the layer's last one stamps the
-                // wall for the pick record's `staged_us`, before it publishes
-                // the ticket, so a copy that landed has its stamp posted.
+                // job: the thread that finishes the layer's last one, the
+                // last to finish, stamps the wall for the pick record's
+                // `staged_us`, before it publishes the ticket, so a copy that
+                // landed has its stamp posted.
                 let left = self.pick_left[job.layer].fetch_sub(1, Ordering::AcqRel);
                 if left == 1 {
                     self.pick_stamp_ns[job.layer].store(nanos_since(self.epoch), Ordering::Release);
@@ -509,16 +566,47 @@ impl Shared {
     }
 }
 
-/// The staging thread and its job queue, which the machine holds beside the
-/// shared state ([`start`]) and stops in its drop ([`Lane::stop`]).
+/// One job staging, counted in the in-flight count of its kind and that
+/// kind's peak raised to it; the count comes down when it drops, a panic's
+/// unwind included.
+struct InFlight<'a>(&'a AtomicU32);
+
+impl<'a> InFlight<'a> {
+    fn enter(now: &'a AtomicU32, peak: &AtomicU32) -> InFlight<'a> {
+        let n = now.fetch_add(1, Ordering::AcqRel) + 1;
+        peak.fetch_max(n, Ordering::AcqRel);
+        InFlight(now)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What the lane did since the load ([`super::swap::SwapMachine::lane_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LaneStats {
+    /// Per lane thread, the jobs it took.
+    pub taken: [u64; LANE_THREADS],
+    /// The most jobs the staging window opened that staged at once: one,
+    /// by the receive lock.
+    pub peak_window: u32,
+    /// The most jobs a flush or their landing opened that staged at once.
+    pub peak_open: u32,
+}
+
+/// The lane's threads and their job queue, which the machine holds beside
+/// the shared state ([`start`]) and stops in its drop ([`Lane::stop`]).
 pub(super) struct Lane {
     tx: Option<mpsc::Sender<Job>>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Lane {
-    /// `job` to the staging thread ([`dispatch::send`]); refused by name as
-    /// `what` when the thread has stopped.
+    /// `job` to the lane ([`dispatch::send`]); refused by name as `what`
+    /// when its threads have stopped.
     pub(super) fn send(
         &self,
         job: Job,
@@ -527,17 +615,18 @@ impl Lane {
         dispatch::send(self.tx.as_ref(), job, what)
     }
 
-    /// Stop the staging thread of `shared` and join it within `deadline`:
-    /// whether it ended.
+    /// Stop the lane threads of `shared` and join them, all within one
+    /// `deadline`: whether every one ended. A thread still running past it
+    /// is left to finish on its own.
     pub(super) fn stop(&mut self, shared: &Shared, deadline: Duration) -> bool {
         shared.stop.store(true, Ordering::Release);
         self.tx = None;
+        let t0 = Instant::now();
+        while !self.threads.iter().all(JoinHandle::is_finished) && t0.elapsed() <= deadline {
+            std::thread::sleep(Duration::from_micros(200));
+        }
         let mut joined = true;
-        if let Some(t) = self.thread.take() {
-            let t0 = Instant::now();
-            while !t.is_finished() && t0.elapsed() <= deadline {
-                std::thread::sleep(Duration::from_micros(200));
-            }
+        for t in self.threads.drain(..) {
             if t.is_finished() {
                 // A panic outside a job has nowhere to go on the drop path.
                 let _ = t.join();
@@ -549,9 +638,9 @@ impl Lane {
     }
 }
 
-/// The ring, the staging words and the staging thread over `source`,
-/// every host wait bounded by `deadline`, whose pick stamps cover the layer
-/// indices below `layers_end`.
+/// The ring, the staging words and the lane's [`LANE_THREADS`] threads over
+/// `source`, every host wait bounded by `deadline`, whose pick stamps cover
+/// the layer indices below `layers_end`.
 pub(super) fn start(
     ctx: &Arc<CudaContext>,
     source: Arc<dyn SwapSource>,
@@ -581,34 +670,63 @@ pub(super) fn start(
         failed: Mutex::new(None),
         jobs_issued: AtomicU64::new(0),
         next_landing: AtomicU64::new(NO_FLIP_LANDING),
+        taken: std::array::from_fn(|_| AtomicU64::new(0)),
+        in_window: AtomicU32::new(0),
+        in_open: AtomicU32::new(0),
+        peak_window: AtomicU32::new(0),
+        peak_open: AtomicU32::new(0),
     });
     let (tx, rx) = mpsc::channel::<Job>();
+    let jobs = Arc::new(Mutex::new(rx));
+    let mut lane = Lane {
+        tx: Some(tx),
+        threads: Vec::with_capacity(LANE_THREADS),
+    };
+    for t in 0..LANE_THREADS {
+        match spawn(ctx, &shared, &jobs, t) {
+            Ok(thread) => lane.threads.push(thread),
+            // The threads started are ending: joined here, so their
+            // references to the shared state go before this one.
+            Err(e) => {
+                shared.stop.store(true, Ordering::Release);
+                lane.tx = None;
+                for thread in lane.threads.drain(..) {
+                    let _ = thread.join();
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok((shared, lane))
+}
+
+/// Lane thread `t` over `shared`, taking from `jobs`, once it has bound
+/// `ctx`.
+fn spawn(
+    ctx: &Arc<CudaContext>,
+    shared: &Arc<Shared>,
+    jobs: &Arc<Mutex<mpsc::Receiver<Job>>>,
+    t: usize,
+) -> Result<JoinHandle<()>, GpuError> {
     let (bound_tx, bound_rx) = mpsc::channel::<Result<(), GpuError>>();
-    let for_thread = Arc::clone(&shared);
+    let (for_thread, jobs) = (Arc::clone(shared), Arc::clone(jobs));
     let ctx = Arc::clone(ctx);
     // A helper, not a plain spawn: the step thread that builds the machine
     // may be pinned to one cpu, and the staging copies would take turns
     // with the step on it. The thread binds the context first: the
     // source's calls on it may reach the driver.
-    let (thread, _) =
-        threads::helper::spawn_helper("swap-staging", staging_placement(), move || {
-            let bound = ctx.bind_to_thread().map_err(GpuError::from);
-            let ok = bound.is_ok();
-            if bound_tx.send(bound).is_ok() && ok {
-                for_thread.run(&rx);
-            }
-        })
-        .map_err(|e| GpuError::plan("SwapMachine::new: the staging thread", e))?;
+    let (thread, _) = threads::helper::spawn_helper("swap-staging", lane_placement(t), move || {
+        let bound = ctx.bind_to_thread().map_err(GpuError::from);
+        let ok = bound.is_ok();
+        if bound_tx.send(bound).is_ok() && ok {
+            for_thread.run(t, &jobs);
+        }
+    })
+    .map_err(|e| GpuError::plan("SwapMachine::new: a lane thread", e))?;
     match bound_rx.recv() {
-        Ok(Ok(())) => Ok((
-            shared,
-            Lane {
-                tx: Some(tx),
-                thread: Some(thread),
-            },
-        )),
+        Ok(Ok(())) => Ok(thread),
         // The thread is ending: joined here, so its reference to the
-        // shared state goes before this one.
+        // shared state goes before the caller's.
         Ok(Err(e)) => {
             let _ = thread.join();
             Err(e)
@@ -617,7 +735,7 @@ pub(super) fn start(
             let _ = thread.join();
             Err(GpuError::protocol(
                 "SwapMachine::new",
-                "the staging thread ended before it bound the context",
+                "a lane thread ended before it bound the context",
             ))
         }
     }
