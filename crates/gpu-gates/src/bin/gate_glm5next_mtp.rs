@@ -90,6 +90,13 @@
 //!   round keeping fewer rows than it ran and a round keeping different
 //!   counts on the two slots, else the clause is red (the per-slot keep
 //!   never ran apart).
+//!
+//! Tiers (`BLOOMERY_TIER`): the clauses that read ik's MTP set (the set's input, the replayed graphs, the walk's
+//! warm-up rows) are `Tag::Oracle`, and those that need the file's trained draft (a window that accepts, two slots that
+//! keep different counts) are `Tag::FileBound`; the fixture tier defers them to the real tier by name and runs the rest
+//! on the fixture, whose random draft rejects every proposal (the state-bytes clause counts the pair arena at the rows
+//! its last window kept). The prompt is the first 64 ids of the prose corpus in both tiers; the real tier witnesses that
+//! they are the set's.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -109,6 +116,10 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_tier.rs"]
+mod glm5next_tier;
+
+#[cfg(feature = "glm5next")]
 #[path = "shared/quiet.rs"]
 mod quiet;
 
@@ -124,25 +135,23 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::rounding::q8_32_rel;
-    use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, patch_bytes, verdict,
-    };
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
         NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
         nextn_logits, nextn_store, nextn_target_streams, nextn_walk, prompt_with, seq_bytes,
         seq_resume, seq_save, set_prefill, set_prefill_group,
     };
-    use gguf::Split;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
-    use model::placement::PlanLevers;
-    use refset::arch::glm5next::{D1K, IK, MODEL, MTP, MTP_SET};
+    use refset::arch::glm5next::D1K;
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Draft, PassSink, Target, Verify, Want, accepted_rows};
 
+    use crate::glm5next_tier;
     use crate::quiet::Quiet;
 
     /// Cache rows: the e2e gate's main load.
@@ -704,7 +713,6 @@ mod gate {
     /// step that writes its buffers.
     fn pairing(
         m: &mut Glm5nextModel,
-        set: &MtpSet,
         prompt: &[u32],
         hidden: usize,
         eps: f32,
@@ -759,40 +767,46 @@ mod gate {
              groups of one, bit for bit {}",
             verdict(same2)
         );
-        let warm = IkGraph::read(set, -1, Graph::Warmup, hidden)?;
-        let pos_ok = warm.tokens == prompt && warm.pos.iter().copied().eq(0..n as u32);
-        if !pos_ok {
-            println!("(p) the warmup's rows are not the prompt's at positions 0.. FAIL");
-            return Ok(false);
-        }
-        let ik_row = |p: usize| &warm.states[p * hidden..(p + 1) * hidden];
-        let (mut worst, mut bad_shift) = (0.0f64, 0usize);
-        for q in 0..n - 1 {
-            let ours = &batch[q * hidden..(q + 1) * hidden];
-            let at = rel(ours, ik_row(q + 1));
-            worst = worst.max(at);
-            let before = rel(ours, ik_row(q));
-            let after = (q + 2 < n).then(|| rel(ours, ik_row(q + 2)));
-            let shifted = before <= at || after.is_some_and(|a| a <= at);
-            if shifted {
-                bad_shift += 1;
+        // Oracle: ik's warmup rows are of the real file.
+        if tier::run_clause(
+            "(p) our row at q against ik's warmup row q + 1",
+            Tag::Oracle,
+        )? {
+            let warm = IkGraph::read(glm5next_tier::mtp_set()?, -1, Graph::Warmup, hidden)?;
+            let pos_ok = warm.tokens == prompt && warm.pos.iter().copied().eq(0..n as u32);
+            if !pos_ok {
+                println!("(p) the warmup's rows are not the prompt's at positions 0.. FAIL");
+                return Ok(false);
             }
+            let ik_row = |p: usize| &warm.states[p * hidden..(p + 1) * hidden];
+            let (mut worst, mut bad_shift) = (0.0f64, 0usize);
+            for q in 0..n - 1 {
+                let ours = &batch[q * hidden..(q + 1) * hidden];
+                let at = rel(ours, ik_row(q + 1));
+                worst = worst.max(at);
+                let before = rel(ours, ik_row(q));
+                let after = (q + 2 < n).then(|| rel(ours, ik_row(q + 2)));
+                let shifted = before <= at || after.is_some_and(|a| a <= at);
+                if shifted {
+                    bad_shift += 1;
+                }
+                println!(
+                    "(p) row {q}: against ik's row {} {at:.3e}, row {q} {before:.3e}, row {} {}{}",
+                    q + 1,
+                    q + 2,
+                    after.map_or_else(|| "-".to_string(), |a| format!("{a:.3e}")),
+                    if shifted { " closer off its pair" } else { "" }
+                );
+            }
+            let ik_ok = bad_shift == 0;
+            ok &= ik_ok;
             println!(
-                "(p) row {q}: against ik's row {} {at:.3e}, row {q} {before:.3e}, row {} {}{}",
-                q + 1,
-                q + 2,
-                after.map_or_else(|| "-".to_string(), |a| format!("{a:.3e}")),
-                if shifted { " closer off its pair" } else { "" }
+                "(p) our row at q against ik's warmup row q + 1, {} rows: worst {worst:.3e} (printed), \
+                 {bad_shift} closer at q or q + 2 {}",
+                n - 1,
+                verdict(ik_ok)
             );
         }
-        let ik_ok = bad_shift == 0;
-        ok &= ik_ok;
-        println!(
-            "(p) our row at q against ik's warmup row q + 1, {} rows: worst {worst:.3e} (printed), \
-             {bad_shift} closer at q or q + 2 {}",
-            n - 1,
-            verdict(ik_ok)
-        );
 
         m.reset()?;
         set_prefill(m, PrefillMode::Batch)?;
@@ -947,8 +961,8 @@ mod gate {
         prompt: &[u32],
         path: PrefillMode,
         plain: &Plain,
-        set: &MtpSet,
-    ) -> Result<(Glm5nextModel, bool), GateError> {
+        set: Option<&MtpSet>,
+    ) -> Result<(Glm5nextModel, bool, Option<usize>), GateError> {
         let mut m = m;
         m.reset()?;
         set_prefill(&mut m, path)?;
@@ -976,19 +990,40 @@ mod gate {
             .filter(|&(&r, &p)| p && r == M)
             .count();
         let rejected = windows - accepted;
-        let rows_ok = rejected > 0 && accepted > 0;
+        // A proposal the target accepts is the file's draft: a fixture's NextN layer is random,
+        // whose proposals the target refuses, so only the real tier requires one.
+        let accepts = tier::premise(
+            "(w) a window accepts a proposal",
+            Tag::FileBound,
+            accepted > 0,
+        )?;
+        let rows_ok = rejected > 0 && accepts;
+        let ik = set.map_or_else(
+            || "no set of ik's".to_string(),
+            |s| {
+                format!(
+                    "{} blocks, {} accepted",
+                    s.verify.len(),
+                    s.verify.iter().map(|v| v.accepted).sum::<usize>()
+                )
+            },
+        );
         println!(
             "(w) {path:?}: the drafted run's {N} ids = the plain run's {}",
             verdict(ids_ok)
         );
         println!(
-            "(w) {path:?}: {windows} windows, {accepted} accepted, {rejected} rejected a row (ik: {} \
-             blocks, {} accepted) {}",
-            set.verify.len(),
-            set.verify.iter().map(|v| v.accepted).sum::<usize>(),
+            "(w) {path:?}: {windows} windows, {accepted} accepted, {rejected} rejected a row (ik: \
+             {ik}) {}",
             verdict(rows_ok)
         );
-        Ok((m, ids_ok && rows_ok))
+        let last_window = k
+            .rows
+            .iter()
+            .zip(&k.proposed)
+            .rev()
+            .find_map(|(&r, &p)| p.then_some(r));
+        Ok((m, ids_ok && rows_ok, last_window))
     }
 
     /// Whether `r` is refused by name, `want` in its message.
@@ -1391,9 +1426,9 @@ mod gate {
         levers: &bloomery_levers::Levers,
         windows: [&[u32]; 2],
     ) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
-        let place = PlanLevers::from_levers(levers)?;
+        let file = glm5next_tier::open()?;
+        let machine = tier::plan_gate(inputs.model.layers);
+        let place = glm5next_tier::plan_levers(levers, 0)?;
         let np =
             inputs.plan_nextn_slots(&machine, u64::try_from(Z_CTX)?, &place, nextn, Z_SLOTS)?;
         let t = Instant::now();
@@ -1483,7 +1518,14 @@ mod gate {
             .count();
         let kept = |rs: &[Committed]| rs.iter().map(|c| c.kept).collect::<Vec<_>>();
         let same = off.is_empty();
-        let ok = same && rejected > 0 && apart > 0;
+        // Two slots keeping different counts in a round needs a draft that is right on one and
+        // wrong on the other, which the file's draft does and a fixture's random layer does not.
+        let uneven = tier::premise(
+            "(z) a round keeps different counts on the two slots",
+            Tag::FileBound,
+            apart > 0,
+        )?;
+        let ok = same && rejected > 0 && uneven;
         println!(
             "(z) two slots in one pass: {Z_ROUNDS} rounds, each window's draft its own and its \
              proposal capped at the seat's depth {SLOT_DEPTH} (a pass of {} rows), kept slot 0 \
@@ -1504,34 +1546,37 @@ mod gate {
     }
 
     pub(super) fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[])?;
-        crate::gate_card::init()?;
-        let dir = MTP.path(MTP_SET);
-        let set = MtpSet::open(&dir, &MTP)?;
-        let prompt = set
-            .tokens
-            .clone()
-            .ok_or_else(|| format!("{}: no # tokens line", dir.display()))?;
-        let order = graphs_of(&set);
-        let accepted: usize = set.verify.iter().map(|v| v.accepted).sum();
-        println!(
-            "{}: {} graphs over {} blocks ({accepted} accepted), prompt {} ids, family {}",
-            dir.display(),
-            order.len(),
-            set.blocks().len(),
-            prompt.len(),
-            MTP.name
-        );
+        let levers = bloomery_levers::at_main(&tier::acts_on(&[])?)?;
+        glm5next_tier::init(crate::gate_card::init)?;
+        // The prompt is the prose corpus's first ids in both tiers (the set's own, held equal to
+        // them, in the real tier); the set itself is read by the Oracle clauses alone.
+        let prompt = glm5next_tier::mtp_prompt()?;
+        let set = if Tier::from_env()? == Tier::Real {
+            Some(glm5next_tier::mtp_set()?)
+        } else {
+            None
+        };
+        if let Some(set) = set {
+            let accepted: usize = set.verify.iter().map(|v| v.accepted).sum();
+            println!(
+                "{}: {} graphs over {} blocks ({accepted} accepted), prompt {} ids, family {}",
+                set.dir.display(),
+                graphs_of(set).len(),
+                set.blocks().len(),
+                prompt.len(),
+                refset::arch::glm5next::MTP.name
+            );
+        }
         println!(
             "bands: the logits' (held, and the argmax cap's) {:.4e}",
             logits_band()
         );
-        let open = |p: &str| Split::open(p).map_err(|e| format!("open {p}: {e}"));
-        let file = open(MODEL)?;
+        let open = glm5next_tier::open;
+        let file = open()?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
-        let place = PlanLevers::from_levers(&levers)?;
+        let machine = tier::plan_gate(inputs.model.layers);
+        let place = glm5next_tier::plan_levers(&levers, 0)?;
         let ctx = u64::try_from(CTX)?;
         let base = inputs.plan(&machine, ctx, &place)?;
         let np = inputs.plan_nextn(&machine, ctx, &place, &nextn)?;
@@ -1551,7 +1596,7 @@ mod gate {
         // at the two KDA lanes the plan counts.
         let t = Instant::now();
         let mut m = Body::open_placed_lanes(
-            open(MODEL)?,
+            open()?,
             &np.plan,
             &inputs,
             0,
@@ -1566,6 +1611,7 @@ mod gate {
             m.resident_bytes()
         );
         let hidden = m.body("run")?.nextn_hidden_width();
+        tier::sc("(f) refusals on a load without the layer")?;
         let mut ok = refused(
             "a walk on a load without the layer",
             nextn_walk(
@@ -1590,8 +1636,10 @@ mod gate {
             }),
             "an MTP draft on a load without the NextN layer",
         );
+        tier::sc("(t) the NextN load's plain run is the load without the layer's")?;
         let reference = plain(&mut m, &prompt, PrefillMode::Batch)?;
         // (s) this load's sequence state, for the NextN load to refuse.
+        tier::sc("(s) a sequence state across the two layouts, and seq_bytes")?;
         let without = seq_save(&mut m)?;
         // The state a load really holds pins the plan-time formula of its
         // bytes (`seq_bytes`, the elastic `--parallel` default's unit) at the
@@ -1609,7 +1657,7 @@ mod gate {
 
         // The NextN load.
         let t = Instant::now();
-        let mut m = Body::open_placed_nextn(open(MODEL)?, &np, &inputs, &nextn, 0, levers.host())?;
+        let mut m = Body::open_placed_nextn(open()?, &np, &inputs, &nextn, 0, levers.host())?;
         m.set_mode(StepMode::Graph);
         let (res, arena) = m
             .body("run")?
@@ -1626,11 +1674,24 @@ mod gate {
 
         ok &= layout_refused(&mut m, &without);
         drop(without);
-        ok &= pos_mask(&set, hidden)?;
+        if tier::run_clause(
+            "(m) the set's MTP input: no position mask, no zero row",
+            Tag::Oracle,
+        )? {
+            ok &= pos_mask(glm5next_tier::mtp_set()?, hidden)?;
+        }
+        tier::sc("(f) the walk's refusals on the NextN load")?;
         ok &= refusals(&mut m, hidden)?;
+        tier::sc("(h) a fault in a chain poisons the model")?;
         ok &= chain_fault(&mut m, nextn.index, hidden)?;
-        ok &= pairing(&mut m, &set, &prompt, hidden, inputs.hp.rms_eps)?;
-        ok &= oracle(&mut m, &set, hidden)?;
+        tier::sc("(p) the pairing: the hidden rows a walk reads")?;
+        ok &= pairing(&mut m, &prompt, hidden, inputs.hp.rms_eps)?;
+        if tier::run_clause(
+            "(o) teacher-forced: every graph of the set replayed against ik's",
+            Tag::Oracle,
+        )? {
+            ok &= oracle(&mut m, glm5next_tier::mtp_set()?, hidden)?;
+        }
 
         let with = plain(&mut m, &prompt, PrefillMode::Batch)?;
         let ids_same = with.ids == reference.ids;
@@ -1643,49 +1704,69 @@ mod gate {
             with.steps.len(),
             verdict(steps_same)
         );
-        let ik = ik_stream(&set);
-        let agree = ik.iter().zip(&with.ids).take_while(|(a, b)| a == b).count();
-        println!(
-            "(t) ik's committed stream: {} ids, the plain run's first {agree} of them (printed, \
-             not held)",
-            ik.len()
-        );
+        if tier::run_clause(
+            "(t) ik's committed stream beside the plain run (printed, not held)",
+            Tag::Oracle,
+        )? {
+            let ik = ik_stream(glm5next_tier::mtp_set()?);
+            let agree = ik.iter().zip(&with.ids).take_while(|(a, b)| a == b).count();
+            println!(
+                "(t) ik's committed stream: {} ids, the plain run's first {agree} of them \
+                 (printed, not held)",
+                ik.len()
+            );
+        }
 
         // Each path against its own plain run: a prompt batch past a chunk
         // runs the GEMM, so the two paths' plain runs are not one run's bits.
         let by_steps = plain(&mut m, &prompt, PrefillMode::Steps)?;
+        let mut kept_last = None;
         for (path, plain) in [(PrefillMode::Batch, &with), (PrefillMode::Steps, &by_steps)] {
-            let (model, w_ok) = drafted(m, &prompt, path, plain, &set)?;
+            tier::sc(&format!(
+                "(w) the drafted windows on the {path:?} feed are the plain run's"
+            ))?;
+            let (model, w_ok, kept) = drafted(m, &prompt, path, plain, set)?;
             m = model;
             ok &= w_ok;
+            kept_last = kept;
         }
         // The drafted load's own state pins the formula's draft side: the
         // last window's verify behind a step leaves both arenas at the rows
-        // the formula's draft term counts.
+        // the formula's draft term counts. A window that keeps one row leaves the pair arena
+        // that row short, which the fixture tier's random draft does (it rejects every proposal);
+        // the real tier holds the formula as it stands.
+        tier::sc("(s) the drafted load's state = seq_bytes with the draft")?;
         let with_state = seq_save(&mut m)?;
         let with_at = usize::try_from(with_state.positions())?;
-        let with_bytes = seq_bytes(&inputs, with_at, true);
-        ok &= with_bytes == with_state.bytes() as u64;
+        let arena_row = (inputs.hp.hc.streams * inputs.hp.n_embd * size_of::<f32>()) as u64;
+        let short = match Tier::from_env()? {
+            Tier::Real => 0,
+            Tier::Fixture => M - kept_last.unwrap_or(M).min(M),
+        };
+        let with_bytes = seq_bytes(&inputs, with_at, true) - short as u64 * arena_row;
+        let state_ok = with_bytes == with_state.bytes() as u64;
+        ok &= state_ok;
         println!(
             "(s) the drafted load's state {} B = seq_bytes at {with_at} positions with the \
-             draft: {}",
+             draft, {short} pair row(s) short: {}",
             with_state.bytes(),
-            verdict(with_bytes == with_state.bytes() as u64)
+            verdict(state_ok)
         );
         m.reset()?;
         // (z) on a load of its own: this one's plan counts one sequence, and
         // the card holds one load.
         drop(m);
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, prefill) = man.step()?;
+        let prefill = glm5next_tier::d1k_prefill()?;
         if prefill.len() < 340 {
             return Err(format!("{D1K}: {} prefill ids, (z) reads 340", prefill.len()).into());
         }
         let windows = [&prefill[..33], &prefill[300..340]];
+        tier::sc("(z) two windows' drafted rounds as one pass of both slots")?;
         ok &= slots_pass(&inputs, &nextn, &levers, windows).unwrap_or_else(|e| {
             println!("(z) a call failed: {e} {}", verdict(false));
             false
         });
+        println!("gate_glm5next_mtp: {}", tier::tally_line());
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

@@ -74,6 +74,9 @@
 //! A set that is not a `--dsa` dump (no `--dsa` on the dumper's command
 //! line, or no `dsa_indexer_score-3` row) is refused by name: the family's
 //! file, build and architecture checks cannot tell a dense set from one.
+//!
+//! Tiers (`BLOOMERY_TIER`): clauses 1-6 are synthetic (`tier::sc`) and run on either file; clauses 7-10 read ik's `--dsa`
+//! sets and are `Tag::Oracle` clauses the fixture tier defers to the real tier by name, a set at a time.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -87,6 +90,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/glm5next_tier.rs"]
+mod glm5next_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::kpool::{DIM, HEADS, KpoolKernels, ScoreArgs, weights_scale};
     use bloomery_gpu::latent::{
@@ -96,10 +103,11 @@ mod gate {
     use bloomery_gpu::qsa::{QsaKernels, TopkHighArgs, list_width};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu};
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, SelectedRows};
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        GateError, NAN_F16, RefManifest, bits_equal, checks_failed, data_dir, max_rel_err,
-        no_local_depot, open_split, ref_tensor_logical_in, split_f32, topk_ids_logical_within,
-        verdict, widened_f16_rows_in,
+        GateError, NAN_F16, RefManifest, bits_equal, checks_failed, max_rel_err, no_local_depot,
+        open_split, ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
+        widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -109,6 +117,8 @@ mod gate {
     use refset::arch::glm5next::{D3K_DSA, D16K_DSA, IK_DSA};
     use refset::ik::{Layout, plain_is_logical, ref_ints, ref_tensor_logical_masked_in};
     use runtime::qsa::{Qsa, Tie, select_by};
+
+    use crate::glm5next_tier;
 
     /// Pools a row keeps, and its longest list.
     const KEPT: usize = 512;
@@ -387,23 +397,43 @@ mod gate {
             clauses += 1;
             failed += u32::from(!pass);
         };
+        // Clauses 1–6 run on synthetic inputs at the kernels' shapes: self-consistency, both tiers.
+        tier::sc("1 pool: the pool pass against the host rule, bit for bit")?;
         tally(pool_case(&cx)?);
+        tier::sc("2 score: the score pass against the rule within the tensor-core band")?;
         let (score_ok, sc) = score_case(&cx)?;
         tally(score_ok);
+        tier::sc("3 topk: the lists of the top-k against the rule's, ties to the higher pool")?;
         tally(topk_case(&cx, &sc)?);
+        tier::sc("4 identity: the attention over the list is the prefix attention")?;
         tally(identity_case(&cx)?);
+        tier::sc("5 fault: each kernel's fault site, raised in its layer alone")?;
         for pass in fault_cases(&cx)? {
             tally(pass);
         }
+        tier::sc("6 shape: the three entries compile with no local depot")?;
         tally(no_local_depot(&[
             "index_pool",
             "kpool_score",
             "qsa_topk_high",
         ])?);
-        let split = open_split(Arch::Glm5next, "just gate-gpu-glm-sel")?;
+        // Clauses 7–10 read ik's `--dsa` sets, dumped from the real file: Oracle clauses, left to
+        // the real tier by name.
+        let mut split = None;
         for set in [D3K_DSA, D16K_DSA] {
-            for pass in ik_set(&cx, &split, set)? {
-                tally(pass);
+            if !tier::run_clause(
+                &format!("7-10 ik: every latent layer teacher-forced on the --dsa set {set}"),
+                Tag::Oracle,
+            )? {
+                continue;
+            }
+            if split.is_none() {
+                split = Some(open_split(Arch::Glm5next, "just gate-gpu-glm-sel")?);
+            }
+            if let Some(split) = &split {
+                for pass in ik_set(&cx, split, set)? {
+                    tally(pass);
+                }
             }
         }
         let pass = failed == 0;
@@ -411,6 +441,7 @@ mod gate {
             "gate_glm_sel: {clauses} clauses, {failed} failed — {}",
             verdict(pass)
         );
+        println!("gate_glm_sel: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
@@ -970,7 +1001,7 @@ mod gate {
 
     /// Clauses 7–10 on set `set`, every latent layer.
     fn ik_set(cx: &Ctx<'_>, split: &Split, set: &str) -> Result<Vec<bool>, GateError> {
-        let man = RefManifest::open(&data_dir().join(set), &IK_DSA)?;
+        let man = glm5next_tier::ik_set(set, &IK_DSA)?;
         let flags = man.header.flags.as_deref().unwrap_or("");
         if !flags
             .split_whitespace()

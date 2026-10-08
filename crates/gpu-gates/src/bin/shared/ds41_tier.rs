@@ -6,19 +6,15 @@
 //! literal prints the two side by side (`tier::witness`), equal on the real file.
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use bloomery_gpu_deepseek41::body::{self, CHUNK, CedLayer};
+use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
-use bloomery_gpu_gates::tier::{self, Tag, Tier};
-use bloomery_gpu_gates::{GateError, data_dir};
-use bloomery_levers::CARD_BUDGET;
+use bloomery_gpu_gates::tier::{self, Tier};
 use gguf::Gguf;
 use model::arch::deepseek41::hparams::Hparams;
 use model::placement::Machine;
-use model::placement::workstation::{self, CardSpec};
-
-static CARD: OnceLock<CardSpec> = OnceLock::new();
+use model::placement::workstation::CardSpec;
 
 /// The decode-step sets of the real file's oracle (`step4`, `d1`, `d2`), each with the position of
 /// its step and the indexer `top_k` ik ran it with (`None`: the file's): `step4` at 4, where no csa
@@ -67,17 +63,7 @@ pub fn witness_set(name: &str, pos: u32, top_k: usize, file_top_k: usize) -> Res
 /// # Errors
 /// A file that is missing or holds fewer ids.
 pub fn prose_ids(n: usize) -> Result<Vec<u32>, GateError> {
-    let path = data_dir().join("engram").join("corpus-prose.ids");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ids = text
-        .split_whitespace()
-        .take(n)
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()?;
-    if ids.len() < n {
-        return Err(format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into());
-    }
-    Ok(ids)
+    tier::prose_ids("engram", n)
 }
 
 /// The V4.1 file a gate opens: the one `gguf::v41::model` owner's answer (a
@@ -105,12 +91,7 @@ pub fn model_path() -> Result<String, GateError> {
 /// # Errors
 /// A census no card is found in, or a card spec in the real tier that is not the 3090's bytes.
 pub fn init() -> Result<CardSpec, GateError> {
-    let card = tier::card(crate::gate_card::init)?;
-    let card = *CARD.get_or_init(|| card);
-    if !tier::witness_card(&card) {
-        return Err("the gate card's bytes are not RTX_3090's in the real tier".into());
-    }
-    Ok(card)
+    tier::init_card(crate::gate_card::init)
 }
 
 /// The gate placement on the card [`init`] fixed: every layer and the head on it, beside the host.
@@ -119,10 +100,7 @@ pub fn init() -> Result<CardSpec, GateError> {
 /// Before [`init`].
 #[must_use]
 pub fn plan_gate(layers: usize) -> Machine {
-    let card = CARD
-        .get()
-        .expect("ds41_tier::init runs before the gate plan is made");
-    workstation::plan_on(*card, layers)
+    tier::plan_gate(layers)
 }
 
 /// The levers a gate parses: `real`, and in the fixture tier the card budget too — the fixture's
@@ -131,11 +109,7 @@ pub fn plan_gate(layers: usize) -> Machine {
 /// # Errors
 /// A `BLOOMERY_TIER` that is neither tier.
 pub fn acts_on(real: &[&'static str]) -> Result<Vec<&'static str>, GateError> {
-    let mut levers = real.to_vec();
-    if Tier::from_env()? == Tier::Fixture && !levers.contains(&CARD_BUDGET) {
-        levers.push(CARD_BUDGET);
-    }
-    Ok(levers)
+    tier::acts_on(real)
 }
 
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
@@ -144,11 +118,7 @@ pub fn acts_on(real: &[&'static str]) -> Result<Vec<&'static str>, GateError> {
 /// # Errors
 /// As [`tier::run_clause`], or a tier that deferred a self-consistency clause.
 pub fn sc(name: &str) -> Result<(), GateError> {
-    if tier::run_clause(name, Tag::SelfConsistency)? {
-        Ok(())
-    } else {
-        Err(format!("the self-consistency clause {name:?} was deferred").into())
-    }
+    tier::sc(name)
 }
 
 /// The last layer that owns a compressor or index keys: the layers above it run their block at the

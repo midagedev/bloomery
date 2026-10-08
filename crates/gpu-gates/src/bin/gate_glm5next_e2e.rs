@@ -336,6 +336,13 @@
 //! their bare sum, ours adds `1e-20` (under half an ulp of every sum from
 //! 2^-42 up); ik's CPU head quantizes the normed row to q8_0 per 32 values
 //! for its q8_0 lm_head, ours multiplies the f32 row.
+//!
+//! Tiers (`BLOOMERY_TIER`): the real tier holds every clause against the real file and ik's sets. The fixture tier
+//! runs the self-consistency clauses on the GLM fixture file (`tier::sc`) and leaves the clauses that read ik's
+//! sets (free, forced, the step sets) to the real tier by name (`Tag::Oracle`), as it does a premise the fixture's
+//! random weights cannot meet (`Tag::FileBound`: the solo run's proposals). The layer, node and memory-operation
+//! counts and the Q6_K layers are read from the opened file (`shared/glm5next_tier.rs`); the real tier prints a
+//! witness line that each equals the literal it replaced.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -363,6 +370,10 @@ mod gate_card;
 mod e2e;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_tier.rs"]
+mod glm5next_tier;
+
+#[cfg(feature = "glm5next")]
 #[path = "shared/quiet.rs"]
 mod quiet;
 
@@ -375,6 +386,7 @@ mod gate {
         refused_saying, rel, same_bits, second, set_open, tap, tap_at, tie_numbers, word_after,
         worst_off_path,
     };
+    use crate::glm5next_tier;
     use crate::quiet::Quiet;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -394,8 +406,9 @@ mod gate {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, patch_bytes, split_f32,
+        Fnv1a64, GateError, RefManifest, checks_failed, patch_bytes, split_f32,
         topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
@@ -411,8 +424,8 @@ mod gate {
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, NextnPlan, PlanInputs};
-    use model::placement::{Machine, Plan, PlanLevers};
-    use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
+    use model::placement::{Machine, Plan};
+    use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::{FfnKind, Layer, MixerKind};
     use runtime::swaprule::KeptRows;
@@ -469,34 +482,12 @@ mod gate {
             && LONG_TAIL + 512 > LONG
     );
 
-    /// The file's shape, as the header states it (glmops-design §1): what
-    /// the derivations below are written against.
+    /// The file's shape the kernels fix, as the header states it (glmops-design §1): what the
+    /// derivations below are written against. The counts of layers by kind are the file's
+    /// ([`glm5next_tier::Shape`], read from its header).
     const HIDDEN: usize = 4096;
     const STREAMS: usize = 4;
-    const N_LAYER: usize = 45;
-    const N_LATENT: usize = 11;
-    const N_KDA: usize = 34;
-    const N_DENSE: usize = 3;
-    const N_ROUTED: usize = 42;
     const N_VOCAB: usize = 154_880;
-
-    /// PIN(2026-09-28): the captured decode step's node count, derived before
-    /// the chain was built: every layer's two sub-layers take three launches
-    /// each for the streams (`hc_pre_q8_0`, the fold, `hc_post`); a KDA mixer
-    /// 11 (the norm, four q8_0 projections of the normed row — the q·k·v
-    /// joined, the two low-rank halves, β — and two of the halves, the conv
-    /// and prep, the delta step, the gated norm, the output projection); a
-    /// latent mixer 16 (the norm, the joined projection, the q_a norm, two
-    /// appends; the selector's pool, head weights, indexer query, scores and
-    /// top-k on the branch, which adds no node; q_b, k_b, the attention's two
-    /// launches, v_b, the output projection); a dense block 3 (norm,
-    /// gate·up, down); a routed block 8 (norm, router, handoff, the go, the
-    /// shared gate·up and down, the wait, the sum); the head 4 (the mean, the
-    /// norm, the q8_0 gemv, the argmax): 45·6 + 34·11 + 11·16 + 3·3 + 42·8 + 4.
-    const NODES_DECODE: usize = 1169;
-
-    /// PIN(2026-09-27): each routed layer's go and wait.
-    const MEMOPS: usize = 2 * N_ROUTED;
 
     /// PIN(2026-09-27): the shadow's launches more on a routed layer with card
     /// experts: the norm's q8_1, the gate·up `_sel`, the q8_1 of its card
@@ -504,15 +495,10 @@ mod gate {
     /// shared expert's output.
     const CARD_NODES: usize = 6;
 
-    /// The routed layers whose downs are Q6_K in the file (the header), which
-    /// the card experts do not read.
-    const Q6K_DOWN: [usize; 3] = [11, 12, 44];
-
-    const _: () = assert!(
-        NODES_DECODE == N_LAYER * 6 + N_KDA * 11 + N_LATENT * 16 + N_DENSE * 3 + N_ROUTED * 8 + 4
-            && N_KDA + N_LATENT == N_LAYER
-            && N_DENSE + N_ROUTED == N_LAYER
-    );
+    /// The trunk's layers, from the header.
+    fn n_layer() -> usize {
+        glm5next_tier::shape().n_layer
+    }
 
     /// PIN(2026-09-27): the teacher-forced bound on a tap's error ratio — its
     /// relative error over the relative distance between ik's 8-bit
@@ -570,8 +556,9 @@ mod gate {
     /// f32; each latent layer's latent and index rows, 512 + 256 f16 a
     /// position, and its pool plane, 128 f16 a pool of four.
     fn store_bytes(ctx: usize, lanes: usize) -> usize {
-        N_KDA * ((lanes * 64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + lanes * 4)
-            + N_LATENT * (ctx * (512 + 256) + ctx.div_ceil(4) * 128) * 2
+        let shape = glm5next_tier::shape();
+        shape.n_kda() * ((lanes * 64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + lanes * 4)
+            + shape.n_latent() * (ctx * (512 + 256) + ctx.div_ceil(4) * 128) * 2
     }
 
     /// The open's records, as the gate prints them.
@@ -643,9 +630,9 @@ mod gate {
         prefill: PrefillMode,
         lanes: KdaLanes,
     ) -> Result<(Session<Body>, Opened), GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let cfg = GlmCfg {
-            place: PlanLevers::from_levers(levers)?,
+            place: glm5next_tier::plan_levers(levers, 0)?,
             host: levers.host(),
             prefill,
             group: 1,
@@ -660,7 +647,7 @@ mod gate {
         };
         let args = OpenArgs {
             place: "gate",
-            machine: crate::gate_card::plan_gate,
+            machine: tier::plan_gate,
             ctx,
             mode: StepMode::Graph,
             cfg,
@@ -697,13 +684,13 @@ mod gate {
         };
         let latent = at(&|l| kinds[l].mixer == MixerKind::Latent);
         let dense = at(&|l| kinds[l].ffn == FfnKind::Dense);
-        let want_latent: Vec<usize> = (0..N_LAYER).filter(|l| l % 4 == 3).collect();
+        let shape = glm5next_tier::shape();
         let lanes = body.lanes();
         let (stores, want_stores) = (body.store_bytes(), store_bytes(CTX, lanes.count()));
-        let mut ok = kinds.len() == N_LAYER
-            && latent == want_latent
-            && dense == (0..N_DENSE).collect::<Vec<_>>()
-            && body.host_run() == (N_DENSE..N_LAYER)
+        let mut ok = kinds.len() == shape.n_layer
+            && latent == shape.latent
+            && dense == (0..shape.n_dense).collect::<Vec<_>>()
+            && body.host_run() == (shape.n_dense..shape.n_layer)
             && lanes == KdaLanes::Two
             && stores == want_stores;
         println!(
@@ -732,7 +719,7 @@ mod gate {
             };
             map_is_plan &= on_card as u64 == planned(l);
         }
-        let readable = at(&|l| kinds[l].ffn == FfnKind::Moe && !Q6K_DOWN.contains(&l));
+        let readable = at(&|l| kinds[l].ffn == FfnKind::Moe && !shape.q6k_down.contains(&l));
         let card_ok = map_is_plan
             && card_layers.iter().all(|l| readable.contains(l))
             && (budgeted || card_layers == readable);
@@ -740,8 +727,9 @@ mod gate {
         println!(
             "structure the plan's card experts on {} routed layers {card_layers:?}, per layer \
              {per_layer:?}, the slot map the same ({map_is_plan}); none on a dense layer or on \
-             {Q6K_DOWN:?}, and {} {}",
+             {:?}, and {} {}",
             card_layers.len(),
+            shape.q6k_down,
             if budgeted {
                 "a card budget set".to_string()
             } else {
@@ -750,16 +738,17 @@ mod gate {
             verdict(card_ok)
         );
         ok &= card_ok;
-        let want = NODES_DECODE + CARD_NODES * card_layers.len();
+        let (decode, memops) = (shape.nodes_decode(), shape.memops());
+        let want = decode + CARD_NODES * card_layers.len();
         let counted = step_launches(&mixers, &ffns, &cards);
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
         let pass =
-            nodes == want && counted == want && b == MEMOPS && k == want - MEMOPS && other == 0;
+            nodes == want && counted == want && b == memops && k == want - memops && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {want} = {NODES_DECODE} + {CARD_NODES} x {} \
-             card layers; the program counts {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) \
+            "structure decode graph_nodes={nodes} (want {want} = {decode} + {CARD_NODES} x {} \
+             card layers; the program counts {counted}) kernel={k} batch_mem_op={b} (want {memops}) \
              other={other} {}",
             card_layers.len(),
             verdict(pass)
@@ -881,9 +870,9 @@ mod gate {
 
     /// Every routed layer's ik routing, by layer (`None` for a dense one).
     fn ik_routes(man: &RefManifest) -> Result<Vec<Option<IkRoute>>, GateError> {
-        (0..N_LAYER)
+        (0..n_layer())
             .map(|l| {
-                if l < N_DENSE {
+                if l < glm5next_tier::shape().n_dense {
                     Ok(None)
                 } else {
                     IkRoute::read(man, l).map(Some)
@@ -952,13 +941,13 @@ mod gate {
     /// The batch tokens through every layer, one layer at a time, each on
     /// our own previous layer's streams, from the embedding.
     fn layered(m: &mut Glm5nextModel, toks: &[u32]) -> Result<Vec<Vec<ForcedRow>>, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let mut x: Vec<Vec<f32>> = toks
             .iter()
             .map(|&t| embedding(&file, t))
             .collect::<Result<_, _>>()?;
-        let mut all = Vec::with_capacity(N_LAYER);
-        for l in 0..N_LAYER {
+        let mut all = Vec::with_capacity(n_layer());
+        for l in 0..n_layer() {
             let inputs: Vec<&[f32]> = x.iter().map(Vec::as_slice).collect();
             let rows = layer_rows(m, l, &inputs, None)?;
             x = rows.iter().map(|r| r.out.clone()).collect();
@@ -984,7 +973,7 @@ mod gate {
             })
             .map(|(l, t, _)| (l, t))
             .collect();
-        let ok = layered.len() == N_LAYER
+        let ok = layered.len() == n_layer()
             && layered.iter().all(|r| r.len() == eager.taps.len())
             && differ.is_empty();
         println!(
@@ -1002,7 +991,7 @@ mod gate {
     // --------------------------------------------------- (c) free
 
     /// The free clause's verdict, and by position the first layer a flip
-    /// lies on the path of ([`N_LAYER`] where none does). The picks come
+    /// lies on the path of ([`n_layer`] where none does). The picks come
     /// from the layered run, so the clause is void — a named FAIL — when
     /// `layered_ok` says that run is not the chain's: its flips would excuse
     /// what another chain did.
@@ -1012,7 +1001,7 @@ mod gate {
         (layered, layered_ok): (&[Vec<ForcedRow>], bool),
         routes: &[Option<IkRoute>],
     ) -> Result<(bool, Vec<usize>), GateError> {
-        let table = layer_table(man, &eager.taps, STREAMS * HIDDEN, N_LAYER)?;
+        let table = layer_table(man, &eager.taps, STREAMS * HIDDEN, n_layer())?;
         for (l, row) in table.iter().enumerate() {
             let cells: Vec<String> = row
                 .iter()
@@ -1035,7 +1024,7 @@ mod gate {
         let flips_ok = flips_report(&flips, "free", FLIP_ERR_CAP);
         let (held, hl, ht, exempt) = worst_off_path(&table, &flips, false);
         let (same, sl, st, same_exempt) = worst_off_path(&table, &flips, true);
-        let firsts = first_flip_layers(&flips, eager.taps.len(), N_LAYER);
+        let firsts = first_flip_layers(&flips, eager.taps.len(), n_layer());
         println!(
             "free: the band holds before the first flip on a position's path (any flip at an \
              earlier or equal layer and position); first such layer by position {}; {exempt} \
@@ -1092,11 +1081,11 @@ mod gate {
         man: &RefManifest,
         routes: &[Option<IkRoute>],
     ) -> Result<(bool, Vec<f64>), GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let kinds = m.body("forced")?.kinds();
         let row = STREAMS * HIDDEN;
         let (mut ok, mut worst, mut flips_all) = (true, 0.0f64, 0usize);
-        let mut errs = Vec::with_capacity(N_LAYER);
+        let mut errs = Vec::with_capacity(n_layer());
         for (l, kind) in kinds.iter().enumerate() {
             let x = if l == 0 {
                 tap(man, "hc_init")?
@@ -1245,7 +1234,7 @@ mod gate {
                 t_n - kept.len(),
                 verdict(pass)
             );
-            if !pass || l % 8 == 0 || l == N_LAYER - 1 {
+            if !pass || l % 8 == 0 || l == n_layer() - 1 {
                 for line in &w.lines {
                     println!("  forced layer={l} {line}");
                 }
@@ -1256,10 +1245,11 @@ mod gate {
         let e_max = errs.iter().copied().fold(0.0, f64::max);
         let quad = errs.iter().map(|e| e * e).sum::<f64>().sqrt();
         println!(
-            "forced: {N_LAYER} layers on ik's inputs; worst ratio {worst:.2} (band {RATIO_BAND}); \
-             {flips_all} flips; worst stream error a layer {e_max:.3e}, sqrt(45)·it {:.3e}, the \
-             errors in quadrature {quad:.3e} (FREE_BAND's derivation input) {}",
-            (N_LAYER as f64).sqrt() * e_max,
+            "forced: {} layers on ik's inputs; worst ratio {worst:.2} (band {RATIO_BAND}); \
+             {flips_all} flips; worst stream error a layer {e_max:.3e}, sqrt(layers)·it {:.3e}, \
+             the errors in quadrature {quad:.3e} (FREE_BAND's derivation input) {}",
+            n_layer(),
+            (n_layer() as f64).sqrt() * e_max,
             verdict(ok)
         );
         Ok((ok, errs))
@@ -1288,7 +1278,12 @@ mod gate {
         let r = run_last(m, tok)?;
         let ik_last = ik_last(&man, N_VOCAB)?;
         let (top, ik_top, ik_2, margin, dist, logits_rel) = tie_numbers(&r.1, &ik_last);
-        let rels = layer_rels(&man, std::slice::from_ref(&r.0), STREAMS * HIDDEN, N_LAYER)?;
+        let rels = layer_rels(
+            &man,
+            std::slice::from_ref(&r.0),
+            STREAMS * HIDDEN,
+            n_layer(),
+        )?;
         let input_rel = rels.last().map_or(f64::INFINITY, |r| r.0);
         let tie = tie_allowed(
             (top, ik_top, ik_2),
@@ -1646,9 +1641,7 @@ mod gate {
     }
 
     fn keep(s: &mut Session<Body>, feed: &str) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, prefill) = man.step()?;
-        let ids = prefill.to_vec();
+        let ids = glm5next_tier::d1k_prefill()?;
         if ids.len() < 964 {
             return Err(format!("{D1K}: {} prefill ids, the clause reads 964", ids.len()).into());
         }
@@ -1846,7 +1839,7 @@ mod gate {
             machine: &'p Machine,
             slots: usize,
         ) -> Result<NextnPlan<'p>, GateError> {
-            let place = PlanLevers::from_levers(self.levers)?;
+            let place = glm5next_tier::plan_levers(self.levers, 0)?;
             let ctx = u64::try_from(SLOT_CTX)?;
             Ok(self
                 .inputs
@@ -1869,8 +1862,8 @@ mod gate {
         const TAIL: usize = 6;
 
         fn open(&self, slots: usize) -> Result<Glm5nextModel, GateError> {
-            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-            let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
+            let file = glm5next_tier::open()?;
+            let machine = tier::plan_gate(self.inputs.model.layers);
             let np = self.plan(&machine, slots)?;
             let t = Instant::now();
             let mut m = Body::open_placed_nextn_slots(
@@ -1990,7 +1983,7 @@ mod gate {
         let named = matches!(&past, Err(e) if e.to_string().contains(&format!(
             "of a load whose plan counted {SLOTS} resident sequences"
         )));
-        let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
+        let machine = tier::plan_gate(a.inputs.model.layers);
         let counted = |n: usize| -> Result<u64, GateError> {
             let np = a.plan(&machine, n)?;
             Ok(np.plan.cards[0].kv_bytes + np.nextn.cards[0].kv_bytes)
@@ -2260,7 +2253,7 @@ mod gate {
         // slot 1's prompt call's checkpoint, which a ledger the slots shared
         // would hold slot 0's in place of.
         let (a, b, c) = slot_prompts(&prefill);
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
         drop(file);
@@ -2271,12 +2264,14 @@ mod gate {
             prompts: [a, b],
         };
         let t = Instant::now();
+        tier::sc("(slots) harness open: H1 interleave, H3 bytes, H6 refusals, H7 captures")?;
         let mut s = slots_gate::interleave(&body)?;
         elapsed("(slots) harness open (H1, H3, H6, H7)", &t);
         let mut ok = clause_timed("slots", "(sp) plan", || slots_plan(&body, s.model()));
         ok &= clause_timed("slots", "(sc) cut", || slots_cut(&mut s, &body));
         ok &= clause_timed("slots", "(g5) on the NextN load", || g5_nextn(s.model()));
         let t = Instant::now();
+        tier::sc("(slots) harness finish: H4 reset, H5 refusals")?;
         ok &= s.finish()?;
         elapsed("(slots) harness finish (H4, H5, H5R)", &t);
         // (sd) and (s3) drive the MTP draft through a session, which owns
@@ -2291,16 +2286,24 @@ mod gate {
         let solo_a = drafted_solo(&mut s, &mut spec, &mut parked, 0, a)?;
         let solo_b = drafted_solo(&mut s, &mut spec, &mut parked, 0, b)?;
         let solo_passes = || solo_a[1].passes.iter().chain(&solo_b[1].passes);
+        // The runs' coverage is the file's draft: the NextN layer of a fixture is random, whose
+        // proposals the target refuses, so the coverage premise is the real tier's.
         let proposed = solo_passes().any(|&(p, k)| p && k == PAIR)
             && solo_passes().any(|&(p, k)| p && k < PAIR);
+        let held = tier::premise(
+            "(sd) the solo drafted runs accept and reject a proposal",
+            Tag::FileBound,
+            proposed,
+        )?;
         println!(
-            "slots: the solo drafted runs accept and reject a proposal {}",
-            verdict(proposed)
+            "slots: the solo drafted runs accept and reject a proposal: {proposed} {}",
+            verdict(held)
         );
-        ok &= proposed;
+        ok &= held;
         elapsed("(sd) solo runs", &t);
         let solos = (&solo_a[0], &solo_b[0]);
         let t = Instant::now();
+        tier::sc("(sd) drafted: two slots under the draft, each its solo run")?;
         let sd = slots_drafted(&mut s, &mut spec, &mut parked, (a, b), solos);
         elapsed("(sd) drafted", &t);
         match sd {
@@ -2336,14 +2339,13 @@ mod gate {
 
     /// The prose set's prefill ids the slot clauses cut their prompts from.
     fn slot_prefill() -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, prefill) = man.step()?;
+        let prefill = glm5next_tier::d1k_prefill()?;
         if prefill.len() < 700 {
             return Err(
                 format!("{D1K}: {} prefill ids, the clause reads 700", prefill.len()).into(),
             );
         }
-        Ok(prefill.to_vec())
+        Ok(prefill)
     }
 
     /// The slot clauses' three prompts out of `prefill` ([`slot_prefill`]):
@@ -2595,9 +2597,9 @@ mod gate {
         lanes: KdaLanes,
         slots: usize,
     ) -> Result<Glm5nextModel, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
-        let place = PlanLevers::from_levers(levers)?;
+        let file = glm5next_tier::open()?;
+        let machine = tier::plan_gate(inputs.model.layers);
+        let place = glm5next_tier::plan_levers(levers, 0)?;
         let plan = inputs.plan_slots(&machine, u64::try_from(SLOT_CTX)?, &place, lanes, slots)?;
         let term = plan.machine.cards[0].scratch_bytes;
         let t = Instant::now();
@@ -2648,6 +2650,7 @@ mod gate {
         for mode in [StepMode::Graph, StepMode::Eager] {
             m.set_mode(mode);
             let t = Instant::now();
+            tier::sc(&format!("(g1) bits {mode:?}"))?;
             let g1 = g1_bits(&mut m, (a, b), (&sa, &sb), mode);
             elapsed(&format!("(g1) bits {mode:?}"), &t);
             match g1 {
@@ -3039,7 +3042,7 @@ mod gate {
                 let trace = RouteTrace::create(
                     &dir,
                     TraceHeader {
-                        model: PathBuf::from(MODEL),
+                        model: PathBuf::from(glm5next_tier::model_path()?),
                         arch: "glm5next".to_owned(),
                         build: "gate_glm5next_e2e".to_owned(),
                         n_expert: inputs.hp.n_expert,
@@ -3583,7 +3586,7 @@ mod gate {
                 let trace = RouteTrace::create(
                     &dir,
                     TraceHeader {
-                        model: PathBuf::from(MODEL),
+                        model: PathBuf::from(glm5next_tier::model_path()?),
                         arch: "glm5next".to_owned(),
                         build: "gate_glm5next_e2e".to_owned(),
                         n_expert: inputs.hp.n_expert,
@@ -3999,8 +4002,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
-        crate::gate_card::init()?;
+        let levers = bloomery_levers::at_main(&tier::acts_on(&[CARD_BUDGET])?)?;
+        glm5next_tier::init(crate::gate_card::init)?;
+        glm5next_tier::dense_ctx(CTX_PP)?;
         let only = only()?;
         let sets = step_sets(only)?;
         let mut ok = true;
@@ -4017,12 +4021,14 @@ mod gate {
         if only == Only::Keep {
             let t = Instant::now();
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
+            tier::sc("(k) checkpoints and cuts")?;
             ok &= keep_groups(&mut s)?;
             elapsed("arm keep", &t);
         }
         if only == Only::PpLong {
             let t = Instant::now();
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::One)?;
+            tier::sc("(pb-long) the prompt batch past the dense limit")?;
             ok &= prompt_long(s.model_mut())?;
             elapsed("arm pplong", &t);
         }
@@ -4039,7 +4045,7 @@ mod gate {
         if only == Only::Stagger {
             let prefill = slot_prefill()?;
             let (a, b, _) = slot_prompts(&prefill);
-            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let file = glm5next_tier::open()?;
             let inputs = PlanInputs::read(&file)?;
             drop(file);
             let t = Instant::now();
@@ -4049,7 +4055,7 @@ mod gate {
         if only == Only::StaggerDraft {
             let prefill = slot_prefill()?;
             let (a, b, _) = slot_prompts(&prefill);
-            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let file = glm5next_tier::open()?;
             let inputs = PlanInputs::read(&file)?;
             let nextn = NextnInputs::read(&inputs)?;
             drop(file);
@@ -4066,68 +4072,113 @@ mod gate {
             ok &= stagger_draft(&mut s, &body.inputs, (a, b))?;
             elapsed("arm stagger-draft", &t);
         }
+        println!("gate_glm5next_e2e: {}", tier::tally_line());
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 
+    /// The batch set's manifest and ik's routing of every routed layer, opened by the clause that
+    /// reads them: an Oracle clause's, so never in the fixture tier.
+    fn batch_oracle() -> Result<(RefManifest, Vec<Option<IkRoute>>), GateError> {
+        let man = glm5next_tier::ik_set(BATCH, &IK)?;
+        let routes = ik_routes(&man)?;
+        Ok((man, routes))
+    }
+
     /// Every clause on the steps feed, on the load at [`CTX`] of two KDA
-    /// lanes: (v) verifies on it.
+    /// lanes: (v) verifies on it. The clauses that read ik's sets — (c), (f)
+    /// and (t) — are Oracle clauses: the fixture tier leaves them to the real
+    /// tier, by name.
     fn main_clauses(levers: &bloomery_levers::Levers, sets: StepSets) -> Result<bool, GateError> {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
         let t = Instant::now();
+        tier::sc("(card) the card experts' slot map, slots and copy")?;
         let mut ok = card::clauses(&mut s, &opened.n_l, opened.experts, opened.budgeted)?;
         elapsed("(card)", &t);
         let m = s.model_mut();
         let t = Instant::now();
+        tier::sc("(s) structure")?;
         ok &= structure(m, &opened)?;
         elapsed("(s)", &t);
-        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
-        let (_, toks, _) = man.step()?;
-        let toks = toks.to_vec();
+        let toks = glm5next_tier::batch_tokens()?;
         let t = Instant::now();
+        tier::sc("(p) one chain: graph steps = eager steps")?;
         let graph = run_steps(m, &toks, StepMode::Graph)?;
         let eager = run_steps(m, &toks, StepMode::Eager)?;
         ok &= one_chain(&graph, &eager);
         elapsed("(p)", &t);
         let t = Instant::now();
+        tier::sc("(a) taps armed after a capture")?;
         ok &= taps_after_capture(m, &toks, &eager)?;
         elapsed("(a)", &t);
         let t = Instant::now();
+        tier::sc("(o) one owner of the position")?;
         ok &= position_owner(m, &toks, &graph)?;
         elapsed("(o)", &t);
         let t = Instant::now();
+        tier::sc("(h) the head's fault")?;
         ok &= head_fault(m, toks[0], graph.tokens[0])?;
         elapsed("(h)", &t);
-        let routes = ik_routes(&man)?;
         let t = Instant::now();
+        tier::sc("(l) layer by layer: the forced arm runs what the chain runs")?;
         let layered = layered(m, &toks)?;
         let layered_ok = layered_is_chain(&layered, &eager);
         ok &= layered_ok;
         elapsed("(l)", &t);
-        let t = Instant::now();
-        let (free_ok, firsts) = free(&man, &eager, (&layered, layered_ok), &routes)?;
-        ok &= free_ok;
-        elapsed("(c)", &t);
+        // The first layer a flip lies on the path of, at the last position: what (t)'s band reads.
+        let mut last = None;
+        if tier::run_clause(
+            "(c) free: layer outputs, routes and the last argmax against ik's batch set",
+            Tag::Oracle,
+        )? {
+            let t = Instant::now();
+            let (man, routes) = batch_oracle()?;
+            let (free_ok, firsts) = free(&man, &eager, (&layered, layered_ok), &routes)?;
+            ok &= free_ok;
+            last = Some(*firsts.last().ok_or("no positions")?);
+            elapsed("(c)", &t);
+        }
         drop(layered);
-        let last = *firsts.last().ok_or("no positions")?;
-        let t = Instant::now();
-        let (forced_ok, _) = forced(m, &man, &routes)?;
-        ok &= forced_ok;
-        elapsed("(f)", &t);
+        if tier::run_clause(
+            "(f) forced: each sub-layer teacher-forced on ik's taps",
+            Tag::Oracle,
+        )? {
+            let t = Instant::now();
+            let (man, routes) = batch_oracle()?;
+            let (forced_ok, _) = forced(m, &man, &routes)?;
+            ok &= forced_ok;
+            elapsed("(f)", &t);
+        }
         let mut ties = 0usize;
-        let band = Some((&toks[..], last));
         let mut ran = Vec::new();
-        for (set, band) in [
-            ((STEP4, &IK), band),
-            ((STEP4_EVERY_NODE, &IK), band),
-            ((D1K, &IK), None),
-            ((D3K_DSA, &IK_DSA), None),
+        for (set, banded) in [
+            ((STEP4, &IK), true),
+            ((STEP4_EVERY_NODE, &IK), true),
+            ((D1K, &IK), false),
+            ((D3K_DSA, &IK_DSA), false),
         ] {
-            if sets.takes(set.0) {
-                let t = Instant::now();
-                ok &= step_set(m, set, band, &mut ties)?;
-                elapsed(&format!("(t) {}", set.0), &t);
-                ran.push(set.0);
+            if !sets.takes(set.0) {
+                continue;
             }
+            if !tier::run_clause(
+                &format!(
+                    "(t) {}: the step's argmax and layer outputs against ik's",
+                    set.0
+                ),
+                Tag::Oracle,
+            )? {
+                continue;
+            }
+            let band = if banded {
+                let last =
+                    last.ok_or("(t)'s band reads the first flip of (c), which did not run")?;
+                Some((&toks[..], last))
+            } else {
+                None
+            };
+            let t = Instant::now();
+            ok &= step_set(m, set, band, &mut ties)?;
+            elapsed(&format!("(t) {}", set.0), &t);
+            ran.push(set.0);
         }
         println!(
             "step sets ({}): {} ran, {ties} named tie(s)",
@@ -4135,12 +4186,15 @@ mod gate {
             ran.join(" ")
         );
         let t = Instant::now();
+        tier::sc("(k) checkpoints and cuts")?;
         ok &= keep_groups(&mut s)?;
         elapsed("(k)", &t);
         let t = Instant::now();
+        tier::sc("(pb-long) the prompt batch past the dense limit")?;
         ok &= prompt_long(s.model_mut())?;
         elapsed("(pb-long)", &t);
         let t = Instant::now();
+        tier::sc("(v) the verify of two rows")?;
         ok &= verify_clause(s.model_mut(), &toks, &graph, opened.nodes);
         elapsed("(v)", &t);
         Ok(ok)
@@ -4152,15 +4206,15 @@ mod gate {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
         let m = s.model_mut();
         let t = Instant::now();
+        tier::sc("(s) structure")?;
         let mut ok = structure(m, &opened)?;
         elapsed("(s)", &t);
-        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
-        let (_, toks, _) = man.step()?;
-        let toks = toks.to_vec();
+        let toks = glm5next_tier::batch_tokens()?;
         let t = Instant::now();
         let graph = run_steps(m, &toks, StepMode::Graph)?;
         elapsed("(v) the plain graph run", &t);
         let t = Instant::now();
+        tier::sc("(v) the verify of two rows")?;
         ok &= verify_clause(m, &toks, &graph, opened.nodes);
         elapsed("(v)", &t);
         Ok(ok)
@@ -4493,7 +4547,7 @@ mod gate {
 
     /// Each layer's live store values joined, in layer order.
     fn by_layer(rows: &[StoreRows]) -> Vec<Vec<f32>> {
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); N_LAYER];
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); n_layer()];
         for r in rows {
             if let Some(v) = out.get_mut(r.layer) {
                 v.extend_from_slice(&r.values);
@@ -4685,7 +4739,7 @@ mod gate {
             }
         }
         // The earliest position a flip lies at below each layer.
-        let mut below = vec![usize::MAX; N_LAYER + 1];
+        let mut below = vec![usize::MAX; n_layer() + 1];
         for (f, _, _) in &flips {
             for e in below.iter_mut().skip(f.layer + 1) {
                 *e = (*e).min(f.token);
@@ -4797,7 +4851,7 @@ mod gate {
         let theirs = by_layer(&want.stores);
         let taps = prompt_route_taps(m, p)?;
         let tally = judge_routes("gemm", p, (&taps, routes), bias, &bands.stream);
-        let reach = tally.low.unwrap_or(N_LAYER - 1);
+        let reach = tally.low.unwrap_or(n_layer() - 1);
         let (mut held_ok, mut worst, mut worst_l, mut past, mut past_l) =
             (true, 0.0f64, 0usize, 0.0f64, 0usize);
         for (l, (o, w)) in ours.iter().zip(&theirs).enumerate() {
@@ -4819,7 +4873,7 @@ mod gate {
                 (past, past_l) = (r, l);
             }
         }
-        let head = bands.stream[N_LAYER - 1];
+        let head = bands.stream[n_layer() - 1];
         let logits_rel = rel(&logits, &want.logits);
         let logits_ok = tally.low.is_some() || logits_rel <= head;
         let top = argmax(&want.logits);
@@ -4933,7 +4987,7 @@ mod gate {
                 );
             }
         }
-        let head = bands.stream[N_LAYER - 1];
+        let head = bands.stream[n_layer() - 1];
         let logits_rel = rel(&logits, &want.logits);
         let top = argmax(&want.logits);
         let tok_gap = f64::from(want.logits[top as usize])
@@ -5017,11 +5071,13 @@ mod gate {
         let m = s.model_mut();
         let ids = lcg_ids(CTX_PP + 1);
         let t = Instant::now();
+        tier::sc("(l1) the plain load holds one KDA lane")?;
         let mut ok = one_lane(m, &ids[..3])?;
         elapsed("(l1)", &t);
         // (pb): the steps' record, then the chunk calls' against it.
         m.reset()?;
         let t = Instant::now();
+        tier::sc("(pb) steps: the plain steps' record at each count")?;
         let mut after = Vec::new();
         for (i, &id) in ids[..CTX_PP].iter().enumerate() {
             let argmax = m.step(&[id])?;
@@ -5044,6 +5100,7 @@ mod gate {
         set_prefill_group(m, 1)?;
         set_prompt_route_taps(m, CTX_PP)?;
         let t = Instant::now();
+        tier::sc("(pb) chunk calls: a batch of at most a chunk is the steps")?;
         let Reference {
             ok: chunks_ok,
             held: reference,
@@ -5063,11 +5120,12 @@ mod gate {
             bands.stores[4],
             bands.stream[0],
             bands.stream[3],
-            bands.stream[N_LAYER - 1]
+            bands.stream[n_layer() - 1]
         );
         // Groups of one: a call of at most a chunk the steps' bits, one past
         // it against the chunk calls.
         let t = Instant::now();
+        tier::sc("(pb) groups of one: the GEMM's calls against the reference, within the bands")?;
         let mut ones = Vec::with_capacity(after.len());
         for (a, r) in after.iter().zip(&reference) {
             if a.p < GEMM_FROM {
@@ -5088,6 +5146,7 @@ mod gate {
         // The forced arm: the reference's routes planted.
         set_prompt_route_taps(m, 0)?;
         let t = Instant::now();
+        tier::sc("(pb) forced: the reference's routes planted, every layer within its band")?;
         plant_prompt_routes(m, Some((&routes, CTX_PP)))?;
         for r in reference.iter().filter(|r| r.after.p >= GEMM_FROM) {
             ok &= gemm_forced(m, &ids, r, &bands)?;
@@ -5099,6 +5158,9 @@ mod gate {
         for g in GROUPS.into_iter().filter(|&g| g > 1) {
             set_prefill_group(m, g)?;
             let t = Instant::now();
+            tier::sc(&format!(
+                "(pb) groups of {g}: each call the call at groups of one"
+            ))?;
             for one in &ones {
                 let Some(one) = one else {
                     println!("prompt batch G={g}: no call at groups of one to hold it to FAIL");
@@ -5111,14 +5173,17 @@ mod gate {
         }
         set_prefill_group(m, 1)?;
         let t = Instant::now();
+        tier::sc("(pr) a call one position past the stores is refused by name")?;
         ok &= refused_past(m, &ids)?;
         elapsed("(pr)", &t);
         set_prefill_group(m, 2)?;
         let t = Instant::now();
+        tier::sc("(pg) a failure planted in a group's walk")?;
         ok &= planted_group(m, &ids)?;
         elapsed("(pg)", &t);
         let clean = ones.iter().flatten().find(|a| a.p == 9).map(|a| a.argmax);
         let t = Instant::now();
+        tier::sc("(pf) a NaN in the first layer's norm: the step's and the batch's fault")?;
         for g in [1, 2] {
             set_prefill_group(m, g)?;
             ok &= batch_fault(m, &ids[..9], &ids[..513], clean, g)?;

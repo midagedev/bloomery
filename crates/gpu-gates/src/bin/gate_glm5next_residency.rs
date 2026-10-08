@@ -122,6 +122,10 @@
 //!   the same ids, windows and flips, flips landed (mutant: the walk reads
 //!   one NextN key past its position, so the second history reads a row the
 //!   first left behind).
+//!
+//! Tiers (`BLOOMERY_TIER`): every clause runs on the fixture but the ones that need the file's routing skew (flips
+//! landed and an expert admitted: `Tag::FileBound`), which the fixture tier defers to the real tier by name. The prompt
+//! is the prose corpus's first ids in both tiers, witnessed equal to the MTP set's in the real tier.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -148,6 +152,10 @@ pub mod residency_clauses;
 mod gate_card;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_tier.rs"]
+mod glm5next_tier;
+
+#[cfg(feature = "glm5next")]
 #[path = "shared/quiet.rs"]
 mod quiet;
 
@@ -166,6 +174,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{Residence, place_table};
     use bloomery_gpu_gates::record;
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{Body, PrefillMode, feed, set_prefill};
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
@@ -176,12 +185,11 @@ mod gate {
         NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
     };
     use model::placement::churn::ChurnPool;
-    use model::placement::{Machine, ModelTensors, Plan, PlanLevers, Violation};
-    use refset::arch::glm5next::{MTP, MTP_SET};
-    use refset::mtpref::MtpSet;
+    use model::placement::{Machine, ModelTensors, Plan, Violation};
     use runtime::layer::hosted;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Verify, Want};
 
+    use crate::glm5next_tier;
     use crate::quiet::Quiet;
 
     const NAME: &str = "gate_glm5next_residency";
@@ -253,12 +261,12 @@ mod gate {
         let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&file).map_err(|e| format!("{path}: {e}"))?;
         let plan = inputs
-            .plan(machine, CTX as u64, &PlanLevers::from_levers(levers)?)
+            .plan(machine, CTX as u64, &glm5next_tier::plan_levers(levers, 0)?)
             .map_err(|e| format!("{path}: {e}"))?;
         let ctx = u32::try_from(plan.ctx_max).map_err(|e| format!("{path}: {e}"))?;
         let m = Body::open_placed_with(file, &plan, &inputs, 0, levers.host(), residency)?;
         let cfg = GlmCfg {
-            place: PlanLevers::from_levers(levers)?,
+            place: glm5next_tier::plan_levers(levers, 0)?,
             host: levers.host(),
             prefill: PrefillMode::Batch,
             group: 1,
@@ -400,7 +408,7 @@ mod gate {
         plan: &Plan<'_>,
         residency: Residency,
     ) -> Result<bool, GateError> {
-        let place = PlanLevers::from_levers(levers)?;
+        let place = glm5next_tier::plan_levers(levers, 0)?;
         let front = prompt_reserve_bytes(&inputs.hp, CTX as u64, false);
         let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) else {
             return Err("the gate machine has no stage card".into());
@@ -585,7 +593,7 @@ mod gate {
             })
             .collect::<Vec<_>>()
             .join(" and ");
-        let ok = checked > 0
+        let ok = (checked > 0 || !glm5next_tier::skew()?)
             && bad.is_empty()
             && !cards.is_empty()
             && off_header.is_empty()
@@ -644,11 +652,12 @@ mod gate {
     /// history `held` ends, against the host map, the machine's ledger and
     /// the map the history started from.
     fn table_clause(s: &Session<Body>, held: &History) -> Result<bool, GateError> {
-        crate::residency_clauses::table_clause(
+        crate::residency_clauses::table_clause_with(
             &residence(s)?,
             &held.start,
             held.landed,
             "the history",
+            glm5next_tier::skew()?,
         )
     }
 
@@ -679,7 +688,7 @@ mod gate {
             ctx: CTX,
             mode: StepMode::Graph,
             cfg: GlmCfg {
-                place: PlanLevers::from_levers(levers)?,
+                place: glm5next_tier::plan_levers(levers, 0)?,
                 host: levers.host(),
                 prefill: PrefillMode::Batch,
                 group: 1,
@@ -707,7 +716,7 @@ mod gate {
 
     /// A clause's verdict, an error it met printed as its red line.
     fn held(clause: &str, r: Result<bool, GateError>) -> bool {
-        r.unwrap_or_else(|e| {
+        tier::sc(clause).and(r).unwrap_or_else(|e| {
             println!("{clause}: error \"{e}\": {}", verdict(false));
             false
         })
@@ -729,7 +738,7 @@ mod gate {
             ctx: CTX,
             mode: StepMode::Graph,
             cfg: GlmCfg {
-                place: PlanLevers::from_levers(levers)?,
+                place: glm5next_tier::plan_levers(levers, 0)?,
                 host: levers.host(),
                 prefill: PrefillMode::Batch,
                 group: 1,
@@ -758,7 +767,7 @@ mod gate {
         let short = i128::from(machine.host.usable_bytes) - np.plan.host.headroom_bytes + need - 1;
         let mut small = machine.clone();
         small.host.usable_bytes = u64::try_from(short)?;
-        let place = PlanLevers::from_levers(levers)?;
+        let place = glm5next_tier::plan_levers(levers, 0)?;
         let planner = match inputs.plan_nextn(&small, CTX as u64, &place, nextn) {
             Ok(p) => {
                 let same_pool = ChurnPool::of(&p.plan, 0, 0).is_ok_and(|q| q.bytes == pool.bytes);
@@ -813,7 +822,7 @@ mod gate {
         inputs: &PlanInputs,
         nextn: &NextnInputs,
     ) -> Result<bool, GateError> {
-        let place = PlanLevers::from_levers(levers)?;
+        let place = glm5next_tier::plan_levers(levers, 0)?;
         let front = prompt_reserve_bytes(&inputs.hp, CTX as u64, false);
         let Some(card) = machine.cards.first() else {
             return Err("the gate machine has no stage card".into());
@@ -1150,9 +1159,9 @@ mod gate {
 
     /// `c1-mtp`: the stacked history twice, a residency reset between, gives
     /// the same ids, windows and flips, flips landed.
-    fn c1_mtp_clause(a: &Drafted, b: &Drafted) -> bool {
+    fn c1_mtp_clause(a: &Drafted, b: &Drafted, skew: bool) -> bool {
         let landed: usize = a.landings.iter().sum();
-        let ok = a == b && landed > 0;
+        let ok = a == b && (landed > 0 || !skew);
         println!(
             "c1-mtp: the stacked history twice, {} ids, {} windows, {landed} flips landed: same \
              {}: {}",
@@ -1164,23 +1173,16 @@ mod gate {
         ok
     }
 
-    /// The NextN clauses, on a NextN load of the gate placement under
-    /// [`NEXTN_LEVER`]: `nextn-refuse` before it, then `nextn-open`,
-    /// `pair-map`, `pair-fold`, `draft-quiet` and `c1-mtp` on it.
     /// The prose prompt of ik's MTP draft set (refset `mtp-glm5next`), on
     /// which a draft both keeps and rejects rows: the lcg prompt's greedy
     /// output repeats, so every window keeps both and `pair-fold` has no
-    /// rejected row to fold.
+    /// rejected row to fold. The prose corpus's first ids in both tiers
+    /// ([`glm5next_tier::mtp_prompt`]).
     fn prose_ids() -> Result<Vec<u32>, GateError> {
-        let dir = MTP.path(MTP_SET);
-        let set = MtpSet::open(&dir, &MTP)?;
-        let ids = set
-            .tokens
-            .ok_or_else(|| format!("{}: no # tokens line", dir.display()))?;
+        let ids = glm5next_tier::mtp_prompt()?;
         if ids.len() < PROMPT {
             return Err(format!(
-                "{}: a prompt of {} ids, the NextN clauses read {PROMPT}",
-                dir.display(),
+                "a prompt of {} ids, the NextN clauses read {PROMPT}",
                 ids.len()
             )
             .into());
@@ -1188,6 +1190,9 @@ mod gate {
         Ok(ids)
     }
 
+    /// The NextN clauses, on a NextN load of the gate placement under
+    /// [`NEXTN_LEVER`]: `nextn-refuse` before it, then `nextn-open`,
+    /// `pair-map`, `pair-fold`, `draft-quiet` and `c1-mtp` on it.
     fn nextn_clauses(
         path: &str,
         machine: &Machine,
@@ -1196,7 +1201,7 @@ mod gate {
         ids: &[u32],
     ) -> Result<bool, GateError> {
         let nextn = NextnInputs::read(inputs).map_err(|e| format!("{path}: {e}"))?;
-        let place = PlanLevers::from_levers(levers)?;
+        let place = glm5next_tier::plan_levers(levers, 0)?;
         let np = inputs
             .plan_nextn(machine, CTX as u64, &place, &nextn)
             .map_err(|e| format!("{path}: {e}"))?;
@@ -1235,10 +1240,14 @@ mod gate {
         ok &= held("pair-map", pair_map_clause(&mut s, &ids[..PROMPT]));
         match drafted_history(&mut s, &ids[..PROMPT]) {
             Ok(a) => {
+                tier::sc("pair-fold: a drafted history's passes")?;
                 ok &= pair_fold_clause(&a);
                 ok &= held("draft-quiet", draft_quiet_clause(&s, &trunk, nextn.index));
                 let b = drafted_history(&mut s, &ids[..PROMPT]);
-                ok &= held("c1-mtp", b.map(|b| c1_mtp_clause(&a, &b)));
+                ok &= held(
+                    "c1-mtp",
+                    b.and_then(|b| Ok(c1_mtp_clause(&a, &b, glm5next_tier::skew()?))),
+                );
             }
             Err(e) => {
                 println!(
@@ -1253,14 +1262,19 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers =
-            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
-        crate::gate_card::init()?;
-        let path = refset::arch::glm5next::MODEL.to_string();
+        let levers = bloomery_levers::at_main(&tier::acts_on(&[
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?)?;
+        glm5next_tier::init(crate::gate_card::init)?;
+        let path = glm5next_tier::model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&file).map_err(|e| format!("{path}: {e}"))?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
-        let place = PlanLevers::from_levers(&levers)?;
+        let machine = tier::plan_gate(inputs.model.layers);
+        let place = glm5next_tier::plan_levers(&levers, 0)?;
         let plan = inputs
             .plan(&machine, CTX as u64, &place)
             .map_err(|e| format!("{path}: {e}"))?;
@@ -1270,6 +1284,7 @@ mod gate {
              {}",
             word_of(residency)
         );
+        tier::sc("refuse: the churn pool's host refusal at load")?;
         let mut pass = refuse_clause(&path, &machine, &levers, &plan, residency)?;
         pass &= held(
             "front-refuse",
@@ -1287,15 +1302,24 @@ mod gate {
         let ids = lcg_ids(PROMPT + 8, inputs.hp.n_vocab);
 
         let first = history(&mut s, &ids[..PROMPT])?;
+        tier::sc("passes: a pass counts its kept rows only")?;
         pass &= crate::residency_clauses::passes_clause(&first.passes, STEPS);
 
+        tier::sc("transform: every admitted expert holds the bytes a static load uploads")?;
         pass &= transform_clause(&s, &inputs.model, &seeds)?;
+        tier::sc("steps: the steps feed is refused under the machine")?;
         pass &= steps_clause(&mut s, &ids)?;
 
         let again = history(&mut s, &ids[..PROMPT])?;
-        pass &=
-            crate::residency_clauses::c1_clause(first.tokens.len(), first.landed, first == again);
+        tier::sc("c1: the history twice gives the same tokens and logits")?;
+        pass &= crate::residency_clauses::c1_clause_with(
+            first.tokens.len(),
+            first.landed,
+            first == again,
+            glm5next_tier::skew()?,
+        );
 
+        tier::sc("table: the stage card's copy of the map")?;
         pass &= table_clause(&s, &again)?;
         let probe = static_probe(&mut s, &ids[..PROMPT])?;
 
@@ -1303,12 +1327,14 @@ mod gate {
             .residency_reset()?
             .ok_or("the load runs no residency machine")?;
         record::residency_reset(&r).print();
+        tier::sc("c7: a residency reset brings every live set back to its seed")?;
         pass &= crate::residency_clauses::c7_clause(&r, machine_of(&s)?, &seeds);
         drop(s);
 
         pass &= held("static", static_clause(&path, &machine, &levers, &probe));
         pass &= nextn_clauses(&path, &machine, &levers, &inputs, &prose_ids()?)?;
 
+        println!("{NAME}: {}", tier::tally_line());
         if pass {
             println!("{NAME}: every clause passed");
             Ok(())

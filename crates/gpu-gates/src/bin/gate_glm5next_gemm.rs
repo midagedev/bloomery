@@ -37,6 +37,9 @@
 //!   input's, query heads of other rows than the front's query rows, and a
 //!   dense block on a front sized for none each give their named error,
 //!   with no launch made.
+//!
+//! Tiers (`BLOOMERY_TIER`): every clause is a self-consistency clause (`tier::sc`) on the layers of the opened file
+//! (layer 0 dense, layer 4 KDA, layer 3 latent), so the fixture tier runs them all on the fixture.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -52,10 +55,15 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_tier.rs"]
+mod glm5next_tier;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::gemm32::{HostAct, dot32, host_act};
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::T_MAX;
     use bloomery_gpu_glm5next::gemm::{
@@ -67,7 +75,8 @@ mod gate {
     use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::FrontWidths;
-    use refset::arch::glm5next::MODEL;
+
+    use crate::glm5next_tier;
 
     /// The dense lead's first layer, a routed KDA layer and a latent layer.
     const LEAD: usize = 0;
@@ -671,7 +680,7 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let w = load(stream, &file)?;
         let hp = Hparams::read(&file)?;
         let low = HostW::of(&file, &[names::ssm_g_a(KDA)])?.rows;
@@ -709,6 +718,9 @@ mod gate {
         let mut pass = true;
         // A short count first, then the batch's: the table refilled for each
         // new count, every column of both written.
+        tier::sc("(g1) bits: every projection bit for bit the host transcription of the contract")?;
+        tier::sc("(g2) quantize: one launch per distinct input, one GEMM per projection")?;
+        tier::sc("(g3) refuse: the named errors, with no launch made")?;
         for at in [(KDA, SHORT), (LEAD, T_MAX), (KDA, T_MAX)] {
             pass &= kda_layer(&gpu, &file, &w, &mut front, at)?;
         }
@@ -729,6 +741,7 @@ mod gate {
             ),
         );
         pass &= refusals(&gpu, &w, &mut front)?;
+        println!("gate_glm5next_gemm: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }

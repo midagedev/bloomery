@@ -128,6 +128,12 @@
 //! rule's break-even, naming the tier's experts in the plan at the child's
 //! default context and the rule's break-even and basis. Three loads, one a
 //! process.
+//!
+//! Tiers (`BLOOMERY_TIER`): the card budget is [`BUDGET`] in the real tier and the header's in the fixture tier
+//! (`shared/glm5next_tier.rs`). The clauses that need the file's trained weights (a pair that accepts a proposal, flips
+//! landed and an expert admitted, the plan with no budget leaving tier experts, the unset rule's bp at the real file's
+//! tier size) are `Tag::FileBound` and the fixture tier defers them to the real tier by name; every bit-for-bit clause
+//! runs on the fixture.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -141,6 +147,10 @@ fn main() {
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_twocard", gate::run())
 }
+
+#[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_tier.rs"]
+mod glm5next_tier;
 
 #[cfg(feature = "glm5next")]
 #[path = "shared/quiet.rs"]
@@ -162,23 +172,23 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
-    use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{
         Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, feed,
         set_prefill_group,
     };
     use bloomery_levers::{CARD_DONTNEED, GLM_RESIDENCY_UNSET, HOST_LOCK, HOST_POPULATE};
-    use gguf::Split;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{self, KdaLanes, NextnInputs, NextnPlan, PlanInputs};
     use model::placement::{
         self, Device, ExpertList, Format, Machine, Plan, PlanLevers, Role, Row, Segment,
         workstation,
     };
-    use refset::arch::glm5next::{D1K, IK, MODEL};
     use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Want};
 
+    use crate::glm5next_tier;
     use crate::quiet::Quiet;
 
     const NAME: &str = "gate_glm5next_twocard";
@@ -224,11 +234,14 @@ mod gate {
 
     /// The prompt: the `d1k` set's prefill ids.
     fn prompt() -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, prefill) = man.step()?;
+        let prefill = glm5next_tier::d1k_prefill()?;
         let n = PROMPT.max(CALL_PROMPT).max(GROUP_PROMPT);
         if prefill.len() < n {
-            return Err(format!("{D1K}: {} prefill ids, the gate reads {n}", prefill.len()).into());
+            return Err(format!(
+                "the d1k set's prefill is {} ids, the gate reads {n}",
+                prefill.len()
+            )
+            .into());
         }
         Ok(prefill[..n].to_vec())
     }
@@ -301,7 +314,7 @@ mod gate {
         cfg: &GlmCfg,
     ) -> Result<Session<Body>, GateError> {
         let t0 = Instant::now();
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let args = OpenArgs {
             place: Place::Bp.name(),
             machine,
@@ -351,7 +364,7 @@ mod gate {
         cfg: &GlmCfg,
     ) -> Result<Session<Body>, GateError> {
         let t0 = Instant::now();
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let mut model = Body::open_placed_lanes(
             file,
             plan,
@@ -695,23 +708,33 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let arm = arm_of()?;
-        let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
-        let mut place_levers = PlanLevers::from_levers(&levers)?;
-        place_levers.card_budget_bytes = Some(BUDGET);
+        let levers =
+            bloomery_levers::at_main(&tier::acts_on(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?)?;
+        glm5next_tier::init_file()?;
+        // Both plans run under one budget that no environment moves: the real tier's
+        // [`BUDGET`], a parameter of the real file (the union it leaves fits the A6000); the
+        // fixture tier's, the header's, which the generator planned to put half of the experts
+        // on a card.
+        let place_levers = match Tier::from_env()? {
+            Tier::Real => PlanLevers {
+                card_budget_bytes: Some(BUDGET),
+            },
+            Tier::Fixture => glm5next_tier::plan_levers(&levers, 0)?,
+        };
         let cfg = GlmCfg {
             place: place_levers,
             host: levers.host(),
             prefill: PrefillMode::Batch,
             group: 1,
         };
-        let inputs =
-            PlanInputs::read(&Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?)?;
+        let inputs = PlanInputs::read(&glm5next_tier::open()?)?;
         let pass = match arm {
             Arm::Bits => bits(&cfg, &inputs)?,
             Arm::Residency => residency_arm(&cfg, &inputs)?,
             Arm::Nextn => nextn_arm(&cfg, &inputs)?,
             Arm::Records => records_arm()?,
         };
+        println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
@@ -726,6 +749,10 @@ mod gate {
         let layers = inputs.model.layers;
         let two = bp(layers);
         let plan = inputs.plan_lanes(&two, u64::try_from(CTX)?, &cfg.place, KdaLanes::Two)?;
+        let budget = cfg
+            .place
+            .card_budget_bytes
+            .ok_or("the gate plans under a card budget")?;
         let tier_n = plan.tier_n_l.first().ok_or("plan (b′) has no tier")?;
         let tier_layers: Vec<usize> = (0..layers)
             .filter(|&l| tier_n.get(l).is_some_and(|&n| n > 0))
@@ -738,7 +765,7 @@ mod gate {
             )
         };
         println!(
-            "plan (b′) under a card budget of {BUDGET} B: stage {} experts (n_l {:?}), tier {} \
+            "plan (b′) under a card budget of {budget} B: stage {} experts (n_l {:?}), tier {} \
              experts (per layer {:?}) on {} layers, host {} experts",
             plan.cards[0].experts,
             held(&plan.n_l),
@@ -747,22 +774,30 @@ mod gate {
             tier_layers.len(),
             plan.host.experts
         );
-        let free = PlanLevers::default();
-        let unbudgeted = inputs.plan_lanes(&two, u64::try_from(CTX)?, &free, KdaLanes::One)?;
-        println!(
-            "plan (b′) with no card budget at ctx {} and one KDA lane (not loaded): stage {} \
-             experts, tier {} experts, host {} experts; per layer stage {:?}, tier {:?}",
-            CTX,
-            unbudgeted.cards[0].experts,
-            unbudgeted.cards.get(1).map_or(0, |c| c.experts),
-            unbudgeted.host.experts,
-            unbudgeted.n_l,
-            unbudgeted.tier_n_l.first()
-        );
+        // The card's whole room holds every routed expert of a file this small, which leaves the
+        // tier idle and the plan refused by name; only the real file's host set needs a tier there.
+        if tier::run_clause(
+            "the plan with no card budget leaves the tier experts",
+            Tag::FileBound,
+        )? {
+            let free = PlanLevers::default();
+            let unbudgeted = inputs.plan_lanes(&two, u64::try_from(CTX)?, &free, KdaLanes::One)?;
+            println!(
+                "plan (b′) with no card budget at ctx {} and one KDA lane (not loaded): stage {} \
+                 experts, tier {} experts, host {} experts; per layer stage {:?}, tier {:?}",
+                CTX,
+                unbudgeted.cards[0].experts,
+                unbudgeted.cards.get(1).map_or(0, |c| c.experts),
+                unbudgeted.host.experts,
+                unbudgeted.n_l,
+                unbudgeted.tier_n_l.first()
+            );
+        }
         let hybrid: Vec<usize> = (0..layers)
             .filter(|&l| plan.n_l.get(l).is_some_and(|&n| n > 0))
             .collect();
         let mut pass = true;
+        tier::sc("precondition sets: the tier holds experts on the stage's hybrid layers")?;
         if hybrid == tier_layers {
             println!(
                 "ok precondition sets: the tier holds experts on the stage's {} hybrid layers",
@@ -795,6 +830,15 @@ mod gate {
             let run = legs(&mut s, &prompt)?;
             (run, group_leg(&mut s, &prompt)?)
         };
+        for name in [
+            "decode bits: step",
+            "decode bits: pair",
+            "call bits",
+            "group bits: groups of two against groups of one",
+            "structure: the stage's step graph has the reference's node count",
+        ] {
+            tier::sc(name)?;
+        }
         pass &= same("decode bits: step", &want.step, &got.step);
         pass &= same("decode bits: pair", &want.pair, &got.pair);
         pass &= same("call bits", &want.call, &got.call);
@@ -811,7 +855,14 @@ mod gate {
             );
             pass = false;
         }
-        if got.accepts > 0 && got.rejects > 0 {
+        // A pass that keeps its draft is the file's NextN layer: a fixture's is random, whose
+        // proposals the target refuses, so only the real tier requires one kept.
+        let accepts = tier::premise(
+            "precondition pair: a pass keeps its draft",
+            Tag::FileBound,
+            got.accepts > 0,
+        )?;
+        if accepts && got.rejects > 0 {
             println!(
                 "ok precondition pair: the passes kept {} drafts and rejected {}",
                 got.accepts, got.rejects
@@ -824,6 +875,7 @@ mod gate {
             );
             pass = false;
         }
+        tier::sc("precondition sent: every tier layer was sent a routed slot")?;
         pass &= sent_every("decode", got.sent_decode.as_ref(), &tier_layers, false);
         pass &= sent_every("call", got.sent_call.as_ref(), &tier_layers, true);
         Ok(pass)
@@ -831,8 +883,13 @@ mod gate {
 
     // ------------------------------------------ residency beside the tier
 
-    /// A clause's verdict, an error it met printed as its red line.
+    /// A self-consistency clause's verdict, registered as one ([`reported`]).
     fn held(clause: &str, r: Result<bool, GateError>) -> bool {
+        reported(clause, tier::sc(clause).and(r))
+    }
+
+    /// A clause's verdict, an error it met printed as its red line.
+    fn reported(clause: &str, r: Result<bool, GateError>) -> bool {
         r.unwrap_or_else(|e| {
             println!("FAIL {clause}: error \"{e}\"");
             false
@@ -1031,9 +1088,9 @@ mod gate {
     }
 
     /// `what` (determinism): `a` and `b` equal, and flips landed in `a`.
-    fn twice<T: PartialEq>(what: &str, a: &T, b: &T, landings: &[usize]) -> bool {
+    fn twice<T: PartialEq>(what: &str, a: &T, b: &T, landings: &[usize], skew: bool) -> bool {
         let landed: usize = landings.iter().sum();
-        let ok = a == b && landed > 0;
+        let ok = a == b && (landed > 0 || !skew);
         println!(
             "{what}: the same schedule twice the same {}, {landed} flips landed: {}",
             a == b,
@@ -1055,7 +1112,7 @@ mod gate {
             mode: StepMode::Graph,
             cfg: cfg.clone(),
         };
-        let file = || Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"));
+        let file = glm5next_tier::open;
         println!("{NAME} --residency: plan (b′) under BLOOMERY_RESIDENCY {GLM_RESIDENCY_UNSET}");
         let mut pass = true;
         {
@@ -1070,7 +1127,8 @@ mod gate {
             let b = history(&mut s, ids);
             match (a, b) {
                 (Ok((a, sent)), Ok((b, _))) => {
-                    pass &= twice("res-twice", &a, &b, &a.landings);
+                    tier::sc("res-twice: the same history twice")?;
+                    pass &= twice("res-twice", &a, &b, &a.landings, glm5next_tier::skew()?);
                     pass &= sent_every("residency", sent.as_ref(), &tier_layers, false);
                 }
                 (a, b) => {
@@ -1096,7 +1154,8 @@ mod gate {
             let b = drafted(&mut s, ids);
             match (a, b) {
                 (Ok((a, sent)), Ok((b, _))) => {
-                    pass &= twice("res-mtp-twice", &a, &b, &a.landings);
+                    tier::sc("res-mtp-twice: the same drafted history twice")?;
+                    pass &= twice("res-mtp-twice", &a, &b, &a.landings, glm5next_tier::skew()?);
                     pass &= sent_every("residency drafted", sent.as_ref(), &tier_layers, false);
                 }
                 (a, b) => {
@@ -1178,7 +1237,7 @@ mod gate {
         }
         t.role = Role::RoutedExperts;
         let doctored = nextn_on_tier_plan(np, &model, nextn)?;
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let t0 = Instant::now();
         let opened = Body::open_placed_nextn_with(
             file,
@@ -1219,7 +1278,7 @@ mod gate {
         cfg: &GlmCfg,
     ) -> Result<Session<Body>, GateError> {
         let t0 = Instant::now();
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let mut model =
             Body::open_placed_nextn_with(file, np, inputs, nextn, 0, cfg.host, Residency::Off)?;
         model.set_mode(StepMode::Graph);
@@ -1298,7 +1357,7 @@ mod gate {
             mode: StepMode::Graph,
             cfg: cfg.clone(),
         };
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = glm5next_tier::open()?;
         let mut s = open_nextn(file, args, Residency::Off, &mut Quiet)?
             .ok_or("the NextN open planned nothing")?;
         tier_on_3090(&s, "NextN load", t0)?;
@@ -1312,7 +1371,9 @@ mod gate {
             .zip(&want.tokens)
             .position(|(a, b)| a != b);
         let bits = got.tokens == want.tokens && got.windows == want.windows;
-        let ok = bits && accepted > 0 && rejected > 0;
+        let accepts = tier::premise("nextn-bits: a draft is kept", Tag::FileBound, accepted > 0)?;
+        let ok = bits && accepts && rejected > 0;
+        tier::sc("nextn-bits: the drafted history's ids and windows are the reference's")?;
         println!(
             "nextn-bits: {} ids in {} windows, the reference's {} ids in {} windows, the same \
              {bits} (first id apart {differ:?}); {accepted} drafts kept, {rejected} rejected: {}",
@@ -1455,7 +1516,12 @@ mod gate {
         // in the plan at the child's default context, and the rule's
         // break-even and basis. FAIL-first: a CLI that keeps a placement of
         // its own prints no `place unset` line, and the record read is red.
-        let unset = held(
+        // The rule's choice reads the plan's tier experts at the real file's size against the
+        // family's break-even: a clause of the real file.
+        let unset = !tier::run_clause(
+            "records-unset: the unset rule keeps bp at the real file's tier size",
+            Tag::FileBound,
+        )? || reported(
             "records-unset",
             unset_record(ids).and_then(|p| {
                 let (place, why) = (p.word("place")?, p.text("why")?);

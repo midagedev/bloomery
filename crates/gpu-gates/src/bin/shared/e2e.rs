@@ -8,9 +8,8 @@ use std::time::Instant;
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu_gates::flip::Flip;
-use bloomery_gpu_gates::{
-    GateError, RefManifest, data_dir, ik_q8_2, ref_tensor_logical_in, verdict,
-};
+use bloomery_gpu_gates::tier;
+use bloomery_gpu_gates::{GateError, RefManifest, ik_q8_2, ref_tensor_logical_in, verdict};
 use refset::family::Family;
 
 /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
@@ -220,7 +219,7 @@ pub fn set_open(
     (name, family): (&str, &Family),
     band: Option<(&[u32], usize)>,
 ) -> Result<(RefManifest, u32, u32, Vec<u32>, usize), GateError> {
-    let man = RefManifest::open(&data_dir().join(name), family)?;
+    let man = crate::glm5next_tier::ik_set(name, family)?;
     let (pos, step, prefill) = man.step()?;
     let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
     let [tok] = step[..] else {
@@ -274,14 +273,16 @@ pub fn clause(group: &str, what: &str, r: Result<bool, GateError>) -> bool {
 }
 
 /// A clause group's verdict with its elapsed line: the work timed inside the
-/// closure, then [`clause`]'s FAIL line when it ended in one.
+/// closure, then [`clause`]'s FAIL line when it ended in one. Every clause run
+/// through here is self-consistency (the engine's arms against each other), so
+/// both tiers run it; it is registered as one first.
 pub fn clause_timed(
     group: &str,
     what: &str,
     body: impl FnOnce() -> Result<bool, GateError>,
 ) -> bool {
     let t = Instant::now();
-    let r = body();
+    let r = tier::sc(&format!("{group} {what}")).and_then(|()| body());
     elapsed(what, &t);
     clause(group, what, r)
 }
