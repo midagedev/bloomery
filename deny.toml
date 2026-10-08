@@ -20,12 +20,19 @@ allow-wildcard-paths = true
 skip = [
   { crate = "miniz_oxide@0.8.9", reason = "png 0.18.1 (pinned by crates/vision) takes miniz_oxide 0.8 directly and 0.9 through flate2; only a png release that moves to 0.9 joins them" },
 ]
+# Two copies of a crate whose types cross the cuda-host boundary are two crates to rustc (a crates.io cuda-core
+# beside the one cuda-host takes by path from its repository; any version or source counts as a second copy).
+deny = [
+  { crate = "cuda-core", deny-multiple-versions = true },
+  { crate = "cuda-bindings", deny-multiple-versions = true },
+  { crate = "oxide-artifacts", deny-multiple-versions = true },
+]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
-  "https://github.com/NVlabs/cuda-oxide.git",
+  "https://github.com/NVIDIA/cuda-rust.git",
   # Cargo.toml [patch]: 위 rev + 업스트림에 낼 패치.
   "https://github.com/midagedev/cuda-oxide.git",
 ]

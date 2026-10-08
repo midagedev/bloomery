@@ -204,14 +204,14 @@ fi
 # cuda-oxide 백엔드(librustc_codegen_cuda.so)는 핀 rev마다 제 디렉터리에 둔다: ~/.cargo/cuda-oxide-bloomery/<rev>/.
 # cargo-oxide의 기본 캐시(~/.cargo/cuda-oxide/)는 소스가 새로워 보이면 그 자리에서 다시 빌드하고, 그동안 다른 트랙의
 # rustc가 그 .so를 mmap한 채 SIGBUS를 맞는다(nvlabs-ledger 19). rev로 고정한 경로의 파일은 한 번 놓이면 바뀌지 않는다.
-# rev는 Cargo.toml [patch]의 포크 rev이고, 그 절이 없으면 [workspace.dependencies]의 rev다. cargo oxide를 부르는
-# 명령은 그 파일이 없거나 옆의 source-rev.txt가 그 rev가 아니면 이름을 대고 멈춘다(rc 70) — CUDA_OXIDE_BACKEND로
+# rev는 Cargo.toml [patch."https://github.com/NVIDIA/cuda-rust.git"]의 포크 rev이고, 그 절이 없으면
+# [workspace.dependencies]의 rev다. cargo oxide를 부르는 명령은 그 파일이 없거나 옆의 source-rev.txt가 그 rev가 아니면 이름을 대고 멈춘다(rc 70) — CUDA_OXIDE_BACKEND로
 # 고정하면 cargo-oxide는 백엔드와 의존성의 커밋을 대조하지 않으므로 그 대조는 여기가 한다. 새 rev의 백엔드는 그 rev의 체크아웃(~/.cargo/git/checkouts/
-# cuda-oxide-*/<rev>)의 crates/rustc-codegen-cuda를 빌드해 같은 디렉터리의 임시 파일로 복사한 뒤 mv로 놓고, 그
+# cuda-oxide-*/<rev>)의 cuda-oxide/crates/rustc-codegen-cuda를 빌드해 같은 디렉터리의 임시 파일로 복사한 뒤 mv로 놓고, 그
 # 체크아웃의 커밋을 source-rev.txt에 쓴다. 포크 커밋이 백엔드 크레이트의 의존 폐포를 건드리지 않은 핀 이동은 앞 rev의
 # 백엔드를 같은 방법(임시 파일 + mv)으로 복사해 써도 된다. 그때는 사본의 md5와 근거를 그 디렉터리의 PROVENANCE에 적고,
 # source-rev.txt는 그 .so를 지은 커밋이 아니라 그 .so가 섬기는 rev를 적는다.
-OXREV=$(sed -n '/^\[patch\."https:\/\/github.com\/NVlabs\/cuda-oxide.git"\]/,/^\[workspace/s/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml")
+OXREV=$(sed -n '/^\[patch\."https:\/\/github.com\/NVIDIA\/cuda-rust.git"\]/,/^\[workspace/s/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml")
 [ -n "$OXREV" ] || OXREV=$(sed -n 's/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml" | head -1)
 [ -n "$OXREV" ] || { echo "box.sh: no cuda-oxide rev in $HERE/Cargo.toml" >&2; exit 70; }
 OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librustc_codegen_cuda.so && "

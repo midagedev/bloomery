@@ -6,12 +6,15 @@ exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_s
 
 [workspace.dependencies]
 # cuda-oxide는 rev로 고정한다. 떠 있으면 어제의 수치와 오늘의 수치가 다른 컴파일러에서 나온다.
-cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
-cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
-# .oxart 컨테이너 파서는 cuda-core의 모듈 로더가 링크하는 그 사본이다(crates.io). 같은 semver 줄의 요구는
-# 한 버전으로 합쳐지므로, 게이트는 드라이버에 넘어가는 텍스트를 로더 자신의 코드로 자른다.
+cuda-device = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "1691162ab9204ef21b0329c2e8059815420dfd5a" }
+cuda-host = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "1691162ab9204ef21b0329c2e8059815420dfd5a" }
+# cuda-host takes cuda-core by path inside the same repository, so cuda-core comes from that repository and rev
+# too (and through the same [patch] below): a crates.io copy would be a second crate whose types are not cuda-host's.
+cuda-core = { version = "0.4.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "1691162ab9204ef21b0329c2e8059815420dfd5a" }
+# The .oxart container parser is the copy cuda-core's module loader links: cuda-core and cuda-host both take
+# oxide-artifacts from crates.io (the repository's own copy is its publish source, not a dependency). Requirements on
+# one semver line unify into one version, so the gates cut the text handed to the driver with the loader's own code.
 oxide-artifacts = "0.2.1"
-cuda-core = "0.3.1"
 libc = "0.2"
 # The decision head's host sgemm (crates/decision); its own threading stays off.
 matrixmultiply = { version = "0.3.10", default-features = false, features = ["std"] }
@@ -19,12 +22,14 @@ memmap2 = "0.9"
 sha2 = "0.10"
 thiserror = "2"
 
-# cuda-oxide는 위 선언 그대로 NVlabs 저장소의 rev에 의존하고, 실제 소스는 우리 포크(midagedev/cuda-oxide)의 `bloomery`
-# 브랜치에서 받는다. 포크 = 위 rev + 업스트림에 낼 패치들이다(THIRD_PARTY_NOTICES.md에 목록). 패치가 0개가 되면 이 절을
-# 지운다. rev를 옮기면 박스의 백엔드도 그 rev로 새로 지어야 한다(tools/box.sh의 CUDA_OXIDE_BACKEND 참조).
-[patch."https://github.com/NVlabs/cuda-oxide.git"]
-cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "0af1016c72c2224857d02bead7bdb7cbc10e580b" }
-cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "0af1016c72c2224857d02bead7bdb7cbc10e580b" }
+# The declarations above name the NVIDIA/cuda-rust rev (cuda-oxide lives under cuda-oxide/ there, cuda-core at the
+# root); the source comes from our fork (midagedev/cuda-oxide), branch `bloomery` = that rev + the patches meant for
+# upstream (listed in THIRD_PARTY_NOTICES.md). With no patch left this section goes. A rev move here needs the box's
+# backend rebuilt for that rev (tools/box.sh, CUDA_OXIDE_BACKEND).
+[patch."https://github.com/NVIDIA/cuda-rust.git"]
+cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "4da6c138448538ca12218cb80924c070417ab419" }
+cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "4da6c138448538ca12218cb80924c070417ab419" }
+cuda-core = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "4da6c138448538ca12218cb80924c070417ab419" }
 
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]

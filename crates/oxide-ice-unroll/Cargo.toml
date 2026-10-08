@@ -6,7 +6,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
-# Shared host-side runtime, published from NVlabs/cutile-rs.
-cuda-core = "0.3.1"
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git" }
+# The shared host runtime, from the same repository: cuda-host takes it by path there.
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git" }

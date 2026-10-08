@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 cuda-device.workspace = true
 cuda-host.workspace = true
-# Shared host-side runtime, published from NVlabs/cutile-rs.
+# The host runtime cutile-rs and cuda-oxide share, from cuda-oxide's repository and rev (the workspace entry).
 cuda-core.workspace = true
 # Dependency direction is gpu -> model/gguf only (docs/gpu-design.md decision 1):
 # metadata readers and `Derived` are reused, and model never learns about gpu.

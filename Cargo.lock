@@ -401,7 +401,7 @@ dependencies = [
 [[package]]
 name = "cuda-artifact-finalizer"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
@@ -412,9 +412,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-bindings"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f42e2c99c56bf2eef9d569435bfd72a478dfaea3f178b8e5bae891875bbbe2e"
+version = "0.4.0"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "bindgen",
  "libloading",
@@ -426,9 +425,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-core"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84bdb592a2844148fb13bdfbbab158879f56916bde1d1a1b6580ca27f23850cd"
+version = "0.4.0"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "anyhow",
  "cuda-bindings",
@@ -439,9 +437,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-core-derive"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a48da7d10c1078f7fbb87d7176e9476affadea148babf31946e348073872d44"
+version = "0.4.0"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -451,7 +448,7 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "cuda-macros",
 ]
@@ -459,7 +456,7 @@ dependencies = [
 [[package]]
 name = "cuda-host"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-core",
@@ -475,7 +472,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -486,7 +483,7 @@ dependencies = [
 [[package]]
 name = "cuda-target-spec"
 version = "0.1.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 
 [[package]]
 name = "digest"
@@ -500,9 +497,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.18.0"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "equivalent"
@@ -624,9 +621,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lazycell"
@@ -636,9 +633,9 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "libloading"
@@ -653,7 +650,7 @@ dependencies = [
 [[package]]
 name = "libnvvm-sys"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "cuda-target-spec",
  "libloading",
@@ -736,7 +733,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 dependencies = [
  "libloading",
  "thiserror",
@@ -804,7 +801,7 @@ dependencies = [
 [[package]]
 name = "ptx-parse"
 version = "0.1.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 
 [[package]]
 name = "quote"
@@ -853,7 +850,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=0af1016c72c2224857d02bead7bdb7cbc10e580b#0af1016c72c2224857d02bead7bdb7cbc10e580b"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138448538ca12218cb80924c070417ab419"
 
 [[package]]
 name = "rustc-hash"
@@ -976,18 +973,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1114,18 +1111,18 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.57"
+version = "0.8.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
+checksum = "879fb705ce98c32e41ebdb970fbe1204f8492423b314c6ab0354c3e7b5542866"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.57"
+version = "0.8.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
+checksum = "708882a28301d604fa039cc7727607a98d04c4b86dc76ec9cc683f805d709759"
 dependencies = [
  "proc-macro2",
  "quote",
