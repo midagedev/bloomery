@@ -38,6 +38,10 @@ pub enum Identity {
     /// `# rows\t<vision set>\t<repo>@<revision>`: the checkpoint the image
     /// rows came from, whose revision the family pins.
     ForkManifest { rows_revision: &'static str },
+    /// `# model\t<path>` in a Clef image-input set's `MANIFEST.tsv` (`tools/ref/clefvis/dump_mtmd.cpp`): the node
+    /// dumps' identity, then the checks of [`crate::clefvis::ClefvisSet`] for the kind of set the variant names (the
+    /// `# clefvis` line, the mmproj file and its sha256, the rows the kind needs).
+    Clefvis(crate::clefvis::Kind),
 }
 
 /// The ik build a family's sets must name.
@@ -285,6 +289,14 @@ impl Family {
                     dumped_from: stated(set.model.as_deref()),
                     draft: None,
                     build: set.build,
+                })
+            }
+            Identity::Clefvis(_) => {
+                let set = crate::clefvis::ClefvisSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.man.header.model()),
+                    draft: None,
+                    build: set.man.build.clone(),
                 })
             }
             Identity::Checkpoint { .. } => {

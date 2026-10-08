@@ -9,6 +9,8 @@
 
 use crate::family::{Build, Family, Identity};
 
+pub mod clefvis;
+
 /// The file every qwen35 set is dumped from and the tree runs: Clef's text
 /// backbone through mainline's converter and `llama-quantize` Q4_K_M.
 pub const MODEL: &str = "/models/clef-27b/clef-27b-Q4_K_M.gguf";
@@ -114,7 +116,16 @@ pub static HIDDEN_LEV: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&HIDDEN, &HIDDEN_FLASH_Q8, &HIDDEN_LEV];
+pub static FAMILIES: &[&Family] = &[
+    &HIDDEN,
+    &HIDDEN_FLASH_Q8,
+    &HIDDEN_LEV,
+    &clefvis::PREPROC,
+    &clefvis::TAPS,
+    &clefvis::HIDDEN,
+    &clefvis::PROSE,
+    &clefvis::BF16ROWS,
+];
 
 #[cfg(test)]
 mod tests {
