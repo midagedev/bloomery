@@ -1,6 +1,7 @@
 //! GPU gate for the assembled V4.1 decode step (`bloomery_gpu_deepseek41::body`,
 //! B5 phases 1 and 2: the indexer's selection wired in), on the gate placement
-//! (`crate::gate_card::plan_gate`: the 3090 runs every layer and the head, the host
+//! (`crate::ds41_tier::plan_gate`: the 3090's bytes run every layer and the head in the real tier,
+//! the largest visible card under the header's card budget in the fixture tier; the host
 //! tier the experts the plan leaves off the card). The model is opened through
 //! the engine's own entry (`body::open`); what each mode pins is the chain's
 //! contract — the pieces' and the ops' values are their own gates'.
@@ -182,6 +183,14 @@ fn main() -> std::process::ExitCode {
 mod finite;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_nodes.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate prints the table of kinds; the DSpark loop gate reads the node count"
+)]
+mod nodes;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_shadow.rs"]
 mod shadow;
 
@@ -194,7 +203,16 @@ mod skew;
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the card, the path, the clause tags and the decode-step table; the triangle's facts serve the prefill gate"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::nodes::ARRIVALS;
     use crate::shadow;
     use crate::skew;
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -225,6 +243,7 @@ mod gate {
     use bloomery_gpu_gates::slots_gate::{
         self, Derived, Interleaved, Launches, PassAdapter, SlotsAdapter,
     };
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, bits_equal, checks_failed,
         data_dir, patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
@@ -234,11 +253,11 @@ mod gate {
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
     };
     use cuda_core::sys;
+    use gguf::Split;
     use gguf::quant::half_to_f32;
-    use gguf::{GgmlType, Split};
     use model::Tensor2;
     use model::arch::Arch;
-    use model::arch::deepseek41::hparams::{CandidateRole, Hparams};
+    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
@@ -248,6 +267,9 @@ mod gate {
 
     /// The decode-step sets of phase 1.
     const SETS: [&str; 2] = [STEP4, D1N];
+    /// The ids the fixture tier steps to each of `ds41_tier::DECODE_SETS`' positions: the prose
+    /// corpus, whose first 1,026 ids reach the longest.
+    const REPLAY_IDS: usize = 1026;
     /// The decode-step sets whose streams select (phase 2).
     const SELECT_SETS: [&str; 2] = [D1, D2];
     /// f32's unit roundoff.
@@ -355,7 +377,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::gate_card::init()?;
+        crate::ds41_tier::init()?;
         let args = parse_args()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         // The route trace's clauses feed their prompts through the session's
@@ -367,14 +389,20 @@ mod gate {
                 free_trace_dir(&std::env::current_dir()?.join(dir))?;
             }
         }
-        let path = workstation::model_v41();
+        let path = crate::ds41_tier::model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        cfg.place = tier::plan_levers(&split, &levers, 0)?;
         let hp = Hparams::read(&split)?;
         let inputs = PlanInputs::read(&split)?;
         if args.slots {
-            return slots_run(&path, &hp, &inputs, &cfg);
+            crate::ds41_tier::sc(
+                "--slots: the slot harness's contracts on a load of two sequences",
+            )?;
+            let r = slots_run(&path, &hp, &inputs, &cfg);
+            println!("gate_deepseek41_step: {}", tier::tally_line());
+            return r;
         }
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let planned = &plan.cards[0];
         println!(
@@ -386,7 +414,7 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let mut m = body::open(
             file,
-            crate::gate_card::plan_gate,
+            crate::ds41_tier::plan_gate,
             usize::try_from(CTX_MAX)?,
             &cfg,
         )?;
@@ -409,16 +437,36 @@ mod gate {
 
         let mut pass = true;
         if args.structure {
+            crate::ds41_tier::sc(
+                "--structure: the step graph is the predicted nodes, replay = eager, topology",
+            )?;
             pass &= structure(&mut m, &mut head, &split, &hp)?;
+            crate::ds41_tier::sc(
+                "--structure: a card fault is the step's error and poison, a reset lifts it",
+            )?;
             pass &= fault_case(&mut m, plan.n_l.len())?;
+            crate::ds41_tier::sc("--structure: a fault behind an error is the fault")?;
             pass &= fault_behind_error_case(&mut m, &hp)?;
+            crate::ds41_tier::sc("--structure: the route trace is the step's routing")?;
             pass &= route_trace_case(&mut m, &mut head, &hp, &path)?;
             pass &= route_trace_recover_case(&mut m, &hp, &path)?;
         }
-        if args.sets {
+        // The sets' clauses compare the engine with ik's dump of the real file, which the
+        // fixture's weights are not: the oracle's, deferred in the fixture tier.
+        if args.sets
+            && tier::run_clause(
+                "--sets: the step's seams against ik's dump on the decode-step sets (step4, d1n)",
+                Tag::Oracle,
+            )?
+        {
             pass &= sets(&mut m, &mut head, &split, &hp, cfg.body.host.r8, &SETS)?;
         }
-        if args.select {
+        if args.select
+            && tier::run_clause(
+                "--select: the indexer's selection against ik's lists on the decode-step sets (d1, d2)",
+                Tag::Oracle,
+            )?
+        {
             pass &= sets(
                 &mut m,
                 &mut head,
@@ -428,12 +476,18 @@ mod gate {
                 &SELECT_SETS,
             )?;
         }
-        if let Some(tag) = &args.ppl {
+        if let Some(tag) = &args.ppl
+            && tier::run_clause(
+                "--ppl: the step's perplexity against ik's on the corpus",
+                Tag::Oracle,
+            )?
+        {
             pass &= ppl(&mut m, &hp, tag)?;
         }
         if args.skew.any() {
             pass &= skew::clauses(&mut m, &split, &hp, &args.skew)?;
         }
+        println!("gate_deepseek41_step: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
@@ -486,7 +540,7 @@ mod gate {
             let ctx = usize::try_from(CTX_MAX)?;
             Ok(body::open_slots(
                 file,
-                crate::gate_card::plan_gate,
+                crate::ds41_tier::plan_gate,
                 ctx,
                 self.cfg,
                 slots,
@@ -672,7 +726,7 @@ mod gate {
         cfg: &body::OpenCfg,
     ) -> Result<bool, GateError> {
         let n = slots_gate::STREAMS;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
         let one = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let two = inputs.plan_with_slots(
             &machine,
@@ -2471,122 +2525,60 @@ mod gate {
         })
     }
 
-    /// The step's predicted kernels: per layer the attention's (14, and on a
-    /// compressor's layer its kv projection, its gate and pool above ratio 1
-    /// or its row at ratio 1, and three for index keys; on an indexer layer
-    /// its two projections and the score and top-k passes, and without a
-    /// compressor the q8_1 of the normed input its weights read unless q_a
-    /// or kv, being K-quants, already had the norm leave it; two more on a
-    /// layer the candidate mask gives a role — the source's block keys and
-    /// selection, a consumer's compaction and remap; one more for the
-    /// q8_1 of the heads when wo_a is a K-quant and one for wo_a's when wo_b
-    /// is a q3_K/q4_K) and the MoE sub-layer's (its own count: ten with card
-    /// experts, seven without, one more for a q8_1 shared down projection);
-    /// the glue's (the broadcast, three and two per engram site and one more
-    /// for the looked-up rows' q8_1 when wkv is a K-quant, the collapse and
-    /// the head's four) and the gather — less one launch for each projection
-    /// a Q3_K row join folds into another's (`join_projections`). The types
-    /// come from `split`. Printed as the table G2 pins.
-    fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<(usize, usize), GateError> {
-        let ty = |name: String| {
-            split
-                .find(&name)
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| format!("{name} is not in the file"))
+    /// The fixture tier's replay clause: from a reset, `ids[..at]` stepped in graph mode, the state
+    /// saved (`body::snapshot`); the next step (`ids[at]`) run eagerly with the seams unobserved and
+    /// its outputs read, the state put back (`body::resume`) and the same step replayed from a
+    /// capture of the chain: the two outputs — logits, every cache and compressor state — equal
+    /// bit for bit. The real tier runs the same two arms from the sets' injected state.
+    fn replay_from_steps(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        hp: &Hparams,
+        ids: &[u32],
+        (name, at, top_k): (&str, usize, usize),
+    ) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        for &id in &ids[..at] {
+            m.step(&[id])?;
+        }
+        let saved = body::snapshot(m)?;
+        let token = ids[at];
+        let pos = u32::try_from(at)?;
+        let (eager, graph) = {
+            let (gpu, w, body) = m.body_parts("structure")?;
+            body.set_indexer_top_k(gpu, top_k)?;
+            let input = body.decode_input(token, pos)?;
+            body.refresh(gpu.stream(), &input)?;
+            body.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))?;
+            gpu.stream().synchronize()?;
+            let eager = outputs(gpu, body, head, hp.n_layer)?;
+            let graph = gpu.capture(|_| body.enqueue_chain(gpu, w, head))?;
+            (eager, graph)
         };
-        let kquant = |t: GgmlType| {
-            matches!(
-                t,
-                GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
-            )
+        body::resume(m, &saved)?;
+        let replay = {
+            let (gpu, _, body) = m.body_parts("structure")?;
+            let input = body.decode_input(token, pos)?;
+            body.refresh(gpu.stream(), &input)?;
+            graph.launch(gpu.stream())?;
+            body.serve_captured(Chain::Step)?;
+            gpu.stream().synchronize()?;
+            let replay = outputs(gpu, body, head, hp.n_layer)?;
+            body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
+            replay
         };
-        let q8_1 = |t: GgmlType| matches!(t, GgmlType::Q3_K | GgmlType::Q4_K);
-        let mut kinds: Vec<(String, usize, usize, usize)> = Vec::new();
-        let mut attn_total = 0;
-        let mut ffn_total = 0;
-        for (l, k) in hp.layers.iter().enumerate() {
-            let own = k
-                .compressor
-                .filter(|_| k.stream.is_some_and(|s| s.kv_source == l));
-            let normed_q8_1 = q8_1(ty(names::attn_q_a(l))?) || q8_1(ty(names::attn_kv(l))?);
-            // PIN(2026-09-24): `join_projections` folds each group of Q3_K projections of one
-            // activation into one launch (ds41dense): kv and the indexer's weights into q_a's,
-            // the indexer's query into q_b's, a gated compressor's gate into its kv.
-            let q3k = |name: String| ty(name).map(|t| t == GgmlType::Q3_K);
-            let proj_q3k = !k.indexer || q3k(names::indexer_proj(l))?;
-            let join_qkv = q3k(names::attn_q_a(l))? && q3k(names::attn_kv(l))? && proj_q3k;
-            let join_query =
-                k.indexer && q3k(names::attn_q_b(l))? && q3k(names::indexer_attn_q_b(l))?;
-            let join_kv_gate = own.is_some_and(|c| c.gated)
-                && q3k(names::attn_compressor_kv(l))?
-                && q3k(names::attn_compressor_gate(l))?;
-            let folded = usize::from(join_qkv) * (1 + usize::from(k.indexer))
-                + usize::from(join_query)
-                + usize::from(join_kv_gate);
-            let attn = 14 - folded
-                + own.map_or(0, |c| 1 + if c.gated { 2 } else { 1 })
-                + if k.index_keys { 3 } else { 0 }
-                + match (k.indexer, own) {
-                    (false, _) => 0,
-                    (true, Some(_)) => 4,
-                    (true, None) if normed_q8_1 => 4,
-                    (true, None) => 5,
-                }
-                // PIN(2026-10-02): the candidate mask's launches (candwire): two on its
-                // source and two on each consumer, 2 + 4 × 2 = 10 a step on the V4.1 file.
-                + 2 * usize::from(hp.candidate_role(l).is_some())
-                + usize::from(kquant(ty(names::attn_output_a(l))?))
-                + usize::from(q8_1(ty(names::attn_output_b(l))?));
-            let ffn = body
-                .ffn_launches(l)
-                .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-            attn_total += attn;
-            ffn_total += ffn;
-            let name = format!(
-                "{}{}{}{}{}",
-                match (k.stream, own) {
-                    (None, _) => "window".to_string(),
-                    (Some(s), Some(_)) => format!("source-r{}", s.ratio),
-                    (Some(s), None) => format!("reader-r{}", s.ratio),
-                },
-                if k.indexer { "+indexer" } else { "" },
-                match hp.candidate_role(l) {
-                    Some(CandidateRole::Source) => "+cand-source",
-                    Some(CandidateRole::Consumer) => "+cand-consumer",
-                    None => "",
-                },
-                if k.engram.is_some() { "+engram" } else { "" },
-                if ffn > 7 { "+card" } else { "+host-only" }
-            );
-            match kinds.iter_mut().find(|e| e.0 == name) {
-                Some(e) => e.3 += 1,
-                None => kinds.push((name, attn, ffn, 1)),
-            }
-        }
-        let sites = hp.engram()?.layer_ids.len();
-        let mut wkv_q8_1 = 0;
-        for &l in &hp.engram()?.layer_ids {
-            wkv_q8_1 += usize::from(q8_1(ty(names::engram_wkv(l))?));
-        }
-        let glue = 1 + 3 * sites + wkv_q8_1 + 2 * sites + 1 + 4;
-        for (name, a, f, n) in &kinds {
-            println!(
-                "predict kind={name} layers={n} attn_kernels={a} ffn_kernels={f} memops=2 \
-                 nodes_per_layer={}",
-                a + f + 2
-            );
-        }
-        let kernels = 1 + attn_total + ffn_total + glue;
-        // PIN(2026-09-25): the engram rows reach the card after the launch — one flag wait and
-        // one copy before the first site's token-only work (`RowsArrival`), where the step had
-        // two batches per layer and no copy.
-        let memops = 2 * hp.n_layer + ARRIVALS;
+        drop(graph);
+        let same = replay == eager;
         println!(
-            "predict step: gather 1 + attn {attn_total} + ffn {ffn_total} + glue {glue} = {kernels} \
-             kernels, {memops} memops (go and wait per layer, {ARRIVALS} rows wait), {ARRIVALS} \
-             memcpy (the rows' arrival), 0 other"
+            "graph set={name} (position {at} of the corpus) replay_bit_identical_to_eager={same} \
+             (logits, {} state buffers, {} compressor buffers): {}",
+            eager.state.len(),
+            eager.comp.len(),
+            verdict(same)
         );
-        Ok((kernels, memops))
+        m.reset()?;
+        Ok(same)
     }
 
     fn structure(
@@ -2597,7 +2589,9 @@ mod gate {
     ) -> Result<bool, GateError> {
         let (want_k, want_m) = {
             let (_, _, body) = m.body_parts("structure")?;
-            predicted(split, hp, body)?
+            let p = crate::nodes::predicted(split, hp, body)?;
+            p.print();
+            (p.kernels, p.memops)
         };
         let nodes = m.capture_step()?;
         let list = m.step_graph_nodes()?;
@@ -2617,8 +2611,19 @@ mod gate {
         );
 
         let mut all_same = true;
-        for name in [STEP4, D1, D2] {
+        let fixture = tier::Tier::from_env()? == tier::Tier::Fixture;
+        if fixture {
+            // The sets' injected state is the ik dump's: the fixture tier steps the corpus ids to the
+            // same positions and replays the next step from the engine's own saved state.
+            let ids = crate::ds41_tier::prose_ids(REPLAY_IDS)?;
+            for (name, at, over) in crate::ds41_tier::DECODE_SETS {
+                let top_k = over.unwrap_or(hp.indexer.top_k);
+                all_same &= replay_from_steps(m, head, hp, &ids, (name, at as usize, top_k))?;
+            }
+        }
+        for name in [STEP4, D1, D2].into_iter().filter(|_| !fixture) {
             let set = open_set(split, hp, name)?;
+            crate::ds41_tier::witness_set(name, set.pos, set.top_k, hp.indexer.top_k)?;
             let state = set_state(&set, hp)?;
             let (gpu, w, body) = m.body_parts("structure")?;
             body.set_indexer_top_k(gpu, set.top_k)?;
@@ -2663,9 +2668,6 @@ mod gate {
         piece_modules(gpu, body, hp, split)?;
         Ok(ok_nodes && all_same && ok_topo && ok_shadow && ok_arrival)
     }
-
-    /// Flag waits a step holds: the engram rows' arrival, one per step.
-    const ARRIVALS: usize = 1;
 
     /// Whether node `n` is a go or a wait batch of the host tier — a memop
     /// batch other than the rows' flag wait.

@@ -1,11 +1,14 @@
 //! GPU gate for the DSpark loop's target side: the feature tap
 //! (`body::attach_features`, `Body::read_features`) on the gate placement
-//! (`workstation::plan_gate`), its layers the draft file's `target_layers`
+//! (`crate::ds41_tier::plan_gate`), its layers the draft file's `target_layers`
 //! (`$BLOOMERY_DSPARK_MODEL`, header only: no draft is loaded here).
 //!
 //! - `--structure`: the step and the pair pass captured with the tap hold
 //!   exactly the nodes they hold without it plus one kernel per tapped layer
-//!   and row, pinned; in the step's capture each `ds41_hc_mean` depends on
+//!   and row; those counts are the step's node count predicted from the file
+//!   (`shared/ds41_nodes.rs`, the step gate's own table) plus the taps — twice the plain
+//!   step's for the pair — where they were two literals of the real file (1182 and 2364);
+//!   in the step's capture each `ds41_hc_mean` depends on
 //!   the MoE join (`ds41_ffn_post*`) of the layer before its tapped layer
 //!   alone. Without the tap the counts are the plain step's (the step gate
 //!   pins those).
@@ -18,6 +21,9 @@
 //!   against it, bit for bit: the eager step's features, the graph run's,
 //!   and both rows of a pair pass over the same two tokens replayed after a
 //!   rollback. A read of row 1 after a one-row step is refused.
+//!
+//! Every clause is self-consistency (the engine against its own prediction and its own eager
+//! step), so the fixture tier runs both arms; the prompt's ids and the greedy steps are inputs.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -49,11 +55,32 @@ mod finite;
 mod dspark;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_nodes.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the predicted node count; the step gate prints the table of kinds"
+)]
+mod nodes;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order};
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
@@ -65,15 +92,15 @@ mod gate {
     use crate::{dspark, finite};
 
     const NAME: &str = "gate_deepseek41_dsloop";
-    /// PIN(2026-10-02): the step captured with the tl37 draft's tap: the
-    /// plain step's 1179 nodes (1169 before the candidate mask's 2 + 4 × 2 =
-    /// 10 launches, 1167 before the engram rows' wait and copy nodes) and one
-    /// `ds41_hc_mean` per tapped layer.
-    const TAP_STEP_NODES: usize = 1182;
-    /// PIN(2026-10-02): the pair pass with the same tap: twice the plain
-    /// step's nodes (each row runs its own ten candidate launches) and one
-    /// `ds41_hc_mean` per tapped layer and row.
-    const TAP_PAIR_NODES: usize = 2364;
+    /// The step captured with the tl37 draft's tap on the real file, as a literal: the plain
+    /// step's 1179 nodes (1169 before the candidate mask's 2 + 4 × 2 = 10 launches, 1167 before the
+    /// engram rows' wait and copy nodes) and one `ds41_hc_mean` per tapped layer. The gate's pin
+    /// is the value derived from the file ([`structure`]); the real tier prints it beside this.
+    const REAL_TAP_STEP_NODES: usize = 1182;
+    /// The pair pass with the same tap on the real file, as a literal: twice the plain step's
+    /// nodes (each row runs its own ten candidate launches) and one `ds41_hc_mean` per tapped
+    /// layer and row.
+    const REAL_TAP_PAIR_NODES: usize = 2364;
     /// Positions the greedy run stands at before the checks.
     const RUN: u32 = 144;
     /// The positions checked: even, so a rollback to them is granted
@@ -135,15 +162,20 @@ mod gate {
             R8,
         ])?;
         let args = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        crate::ds41_tier::init()?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
         let layers = dhp.target_layers.clone();
-        let path = workstation::model_v41();
-        let hp = Hparams::read(&Split::open(&path).map_err(|e| format!("open {path}: {e}"))?)?;
+        let path = crate::ds41_tier::model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let hp = Hparams::read(&split)?;
+        // The draft is read for its header only, so the plan reserves nothing for it.
+        cfg.place = tier::plan_levers(&split, &levers, 0)?;
+        premises(&hp, &layers)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let mut m = body::open(
             file,
-            workstation::plan_gate,
+            crate::ds41_tier::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
@@ -156,7 +188,7 @@ mod gate {
         );
         let mut pass = true;
         let plain = if args.structure {
-            Some(plain_counts(&mut m, ids[0])?)
+            Some(plain_counts(&mut m, ids[0], &split, &hp)?)
         } else {
             None
         };
@@ -164,11 +196,16 @@ mod gate {
         body::attach_features(&mut m, &layers)?;
         m.set_mode(StepMode::Graph);
         if let Some(plain) = plain {
+            crate::ds41_tier::sc(
+                "--structure: the tapped step and pair are the plain nodes plus the taps",
+            )?;
             pass &= structure(&mut m, &layers, ids[0], plain)?;
         }
         if args.tap {
+            crate::ds41_tier::sc("--tap: the features are the host mean, eager, graph and pair")?;
             pass &= tap(&mut m, &hp, &layers, &ids)?;
         }
+        println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
@@ -176,14 +213,52 @@ mod gate {
         Ok(())
     }
 
-    /// The step's and the pair's node counts without a tap.
-    fn plain_counts(m: &mut Deepseek41Model, t: u32) -> Result<[usize; 2], GateError> {
+    /// The run's own shape against the file: the two checked positions straddle the window ring's
+    /// wrap (the earlier one before it wraps, both pairs inside the run) and the run stands past
+    /// the later one; each is the real file's literal at its window of 128 and is printed beside
+    /// the header's.
+    fn premises(hp: &Hparams, layers: &[usize]) -> Result<(), GateError> {
+        let [late, early] = CHECKS;
+        let (late, early, run) = (late as usize, early as usize, RUN as usize);
+        if !(early + 1 < hp.window && hp.window < late && late + 2 < run) {
+            return Err(format!(
+                "{NAME}: the checks at {early} and {late} of {run} positions do not straddle the \
+                 window of {} rows",
+                hp.window
+            )
+            .into());
+        }
+        if layers.iter().any(|&l| l >= hp.n_layer || l == 0) {
+            return Err(format!(
+                "{NAME}: the draft's target layers {layers:?} are not inside the file's {} \
+                 layers (the tap reads the MoE join before each, so none is layer 0)",
+                hp.n_layer
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The step's and the pair's node counts without a tap, and the step's node count predicted
+    /// from the file ([`crate::nodes::predicted`]) before the tap is attached.
+    fn plain_counts(
+        m: &mut Deepseek41Model,
+        t: u32,
+        split: &Split,
+        hp: &Hparams,
+    ) -> Result<[usize; 3], GateError> {
+        let predicted = {
+            let (_, _, body) = m.body_parts(NAME)?;
+            crate::nodes::predicted(split, hp, body)?.nodes()
+        };
         let step = m.capture_step()?;
         m.step_rows([t, t])?;
         let pair = m.rows_graph_nodes::<PAIR_ROWS>()?.len();
         m.reset()?;
-        println!("{NAME}: structure | no tap: step {step} nodes, pair {pair}");
-        Ok([step, pair])
+        println!(
+            "{NAME}: structure | no tap: step {step} nodes (predicted {predicted}), pair {pair}"
+        );
+        Ok([step, pair, predicted])
     }
 
     /// `--structure` (module doc), with the tap attached.
@@ -191,20 +266,26 @@ mod gate {
         m: &mut Deepseek41Model,
         layers: &[usize],
         t: u32,
-        [step0, pair0]: [usize; 2],
+        [step0, pair0, predicted]: [usize; 3],
     ) -> Result<bool, GateError> {
         let n = layers.len();
         let step = m.capture_step()?;
         m.step_rows([t, t])?;
         let pair = m.rows_graph_nodes::<PAIR_ROWS>()?.len();
         m.reset()?;
+        // The pins the real file held as literals: the plain step's predicted nodes and one
+        // `ds41_hc_mean` a tapped layer, twice that and one a layer and row for the pair.
+        let (pin_step, pin_pair) = (predicted + n, 2 * predicted + 2 * n);
+        let moved = tier::witness("tap step nodes", pin_step, REAL_TAP_STEP_NODES)
+            & tier::witness("tap pair nodes", pin_pair, REAL_TAP_PAIR_NODES);
         let counts = step == step0 + n
             && pair == pair0 + 2 * n
-            && step == TAP_STEP_NODES
-            && pair == TAP_PAIR_NODES;
+            && step == pin_step
+            && pair == pin_pair
+            && moved;
         println!(
-            "{NAME}: structure | with the tap: step {step} nodes (plain {step0} + {n}, pinned \
-             {TAP_STEP_NODES}), pair {pair} (plain {pair0} + {}, pinned {TAP_PAIR_NODES}): {}",
+            "{NAME}: structure | with the tap: step {step} nodes (plain {step0} + {n}, predicted \
+             {pin_step}), pair {pair} (plain {pair0} + {}, predicted {pin_pair}): {}",
             2 * n,
             verdict(counts)
         );

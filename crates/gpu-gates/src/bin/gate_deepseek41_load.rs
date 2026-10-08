@@ -1,10 +1,14 @@
 //! Gate `gate-ds41-load`: the V4.1 body on the gate card. The model is loaded
 //! through the entry the engine opens V4.1 with
 //! (`bloomery_gpu_deepseek41::body::open`) by the gate placement
-//! (`crate::gate_card::plan_gate`: the 3090 runs every layer and the head) at the
-//! serving context, and checked against the plan this binary makes from the
+//! (`crate::ds41_tier::plan_gate`: the 3090's bytes run every layer and the head in the real
+//! tier, the largest visible card plan `a` in the fixture tier, under the header's card budget)
+//! at the serving context, and checked against the plan this binary makes from the
 //! same file. A correctness run: every time and memory figure it prints is a
-//! runtime value.
+//! runtime value. Every clause is self-consistency (the engine against its own plan, KvLayout
+//! and RopeTable), so the fixture tier runs all six; the steps check (iii) builds are the decode-step
+//! sets' in the real tier and the same positions over a synthetic id sequence in the fixture
+//! tier (the ids select no plan field).
 //!
 //! - (i) segments: every segment the plan puts on the card is resident at the
 //!   plan's buffer bytes, nothing else is, and the total is the card's dense +
@@ -61,6 +65,14 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::btree_map::Entry;
     use std::collections::{BTreeMap, BTreeSet};
@@ -74,8 +86,8 @@ mod gate {
     use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -88,10 +100,10 @@ mod gate {
     use model::arch::deepseek41::plan::{Planner, StepPlan};
     use model::placement::{CardFormat, Device, KvBytes, Plan, Role, workstation};
 
-    /// The decode-step sets whose positions check (iii) builds: 4, where no
-    /// csa group completes, and 301 and 1,025, where one does and the window
-    /// ring has wrapped.
-    const STEP_SETS: [&str; 3] = [STEP4, D1, D2];
+    // The decode-step sets whose positions check (iii) builds are `ds41_tier::DECODE_SETS`:
+    // `step4`'s 4, where no csa group completes, and 301 and 1,025, where one does and the window
+    // ring has wrapped. The fixture tier builds the same positions over a synthetic id sequence;
+    // the real tier reads them from the sets and prints each beside the table (`witness_set`).
 
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
@@ -106,12 +118,13 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
-        crate::gate_card::init()?;
-        let cfg = OpenCfg::from_levers(&levers)?;
-        let path = workstation::model_v41();
+        crate::ds41_tier::init()?;
+        let mut cfg = OpenCfg::from_levers(&levers)?;
+        let path = crate::ds41_tier::model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        cfg.place = tier::plan_levers(&split, &levers, 0)?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
         let plan = inputs
             .plan(&machine, CTX_MAX, &cfg.place)
             .map_err(|e| format!("the gate plan: {e}"))?;
@@ -151,17 +164,27 @@ mod gate {
         let shadow_host;
         {
             let w = m.weights();
+            crate::ds41_tier::sc("(i) segments: the plan's buffers resident, the experts' bytes")?;
             ok &= check_segments(&plan, w, &inputs.hp);
             ok &= check_expert_bytes(&plan, w);
         }
         {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_load")?;
+            crate::ds41_tier::sc("(i) slot map: the card experts' id prefix, card and host copy")?;
             ok &= check_slots(&plan, &lists, body, gpu.stream())?;
+            crate::ds41_tier::sc(
+                "(vi) slots: the `_sel` gemv is the plain gemv of the slot's rows",
+            )?;
             ok &= check_sel(&plan, &lists, &path, gpu, w)?;
+            crate::ds41_tier::sc("(ii) state: KvLayout's bytes and the plan's shadow term")?;
             ok &= check_state(&inputs.kv, &plan, body);
             shadow_host = body.shadow_host().bytes;
-            ok &= check_image(&planner, &specs, body, gpu.stream())?;
+            crate::ds41_tier::sc(
+                "(iii) image: the step image read back is the plan's and RopeTable's",
+            )?;
+            ok &= check_image(&planner, &specs, inputs.hp.n_vocab, body, gpu.stream())?;
         }
+        crate::ds41_tier::sc("(iv) capture: the chain captures")?;
         let (capture_ok, captured) = check_capture(&mut m, &probe)?;
         ok &= capture_ok;
         drop(m);
@@ -170,8 +193,10 @@ mod gate {
         let free3 = free(&probe)?;
         drop(m);
         let free4 = free(&probe)?;
+        crate::ds41_tier::sc("(v) reload: a second load takes what the first took")?;
         ok &= check_reload([free0, free1, free2, free3, free4], captured, shadow_host);
 
+        println!("gate_deepseek41_load: {}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
         }
@@ -199,7 +224,7 @@ mod gate {
         let start = Instant::now();
         let m = body::open(
             file,
-            crate::gate_card::plan_gate,
+            crate::ds41_tier::plan_gate,
             usize::try_from(CTX_MAX)?,
             cfg,
         )?;
@@ -704,8 +729,17 @@ mod gate {
     /// The step a decode-step set holds: its sequence (`# tokens`) and the
     /// step's position (`# decode_pos`, its last token's). The set opens
     /// through the V4.1 oracle's family check, so a set of another model
-    /// file is refused by name.
-    fn step_of(set: &str) -> Result<(Vec<u32>, u32), GateError> {
+    /// file is refused by name; the real tier prints the set's position beside
+    /// `DECODE_SETS`' and requires them equal. The fixture tier has no set of
+    /// its file: the same position over `pos + 1` ids of a fixed spread across
+    /// the vocabulary, which the plan reads for nothing but their count.
+    fn step_of(set: &str, at: u32, n_vocab: usize) -> Result<(Vec<u32>, u32), GateError> {
+        if tier::Tier::from_env()? == tier::Tier::Fixture {
+            let ids = (0..=at)
+                .map(|i| u32::try_from(1 + (u64::from(i) * 7919) % (n_vocab as u64 - 1)))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok((ids, at));
+        }
         let man = for_arch(Arch::Deepseek41)?.open_named(set)?;
         if man.header.decode_pos.is_none() {
             return Err(format!(
@@ -715,6 +749,10 @@ mod gate {
             .into());
         }
         let (pos, step, before) = man.step()?;
+        if pos != at {
+            return Err(format!("{set}: the set's position {pos} is not DECODE_SETS' {at}").into());
+        }
+        tier::witness(&format!("{set} step position"), pos, at);
         Ok(([before, step].concat(), pos))
     }
 
@@ -733,6 +771,7 @@ mod gate {
     fn check_image(
         planner: &Planner,
         specs: &(RopeSpec, RopeSpec),
+        n_vocab: usize,
         body: &mut Body,
         stream: &CudaStream,
     ) -> Result<bool, GateError> {
@@ -750,8 +789,8 @@ mod gate {
         );
         let mut ok = true;
         let mut plan = StepPlan::default();
-        for set in STEP_SETS {
-            let (tokens, pos) = step_of(set)?;
+        for (set, at, _) in crate::ds41_tier::DECODE_SETS {
+            let (tokens, pos) = step_of(set, at, n_vocab)?;
             let at = pos as usize;
             planner.plan_into(&tokens[at..], pos, &tokens[..at], &mut plan)?;
             let embd: Vec<u8> = (0..dims.embd_bytes)

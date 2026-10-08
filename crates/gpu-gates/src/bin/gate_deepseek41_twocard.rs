@@ -19,10 +19,12 @@
 //!
 //! The loopback plan is refused unless every row's segments sit on the same
 //! device indices with the same experts as the two-card plan's, before any
-//! load. The plans are made under the card budget [`BUDGET`]
+//! load. The plans are made under a card budget
 //! (`PlanLevers::card_budget_bytes`, the field `BLOOMERY_CARD_BUDGET` sets;
-//! the lever itself is refused here so the environment cannot move the
-//! sets): it caps every card, the tier's too, so the A6000 holds the stage's
+//! the lever itself is refused here in the real tier so the environment cannot move the
+//! sets): [`BUDGET`] in the real tier, the header's `bloomery.fixture.card_budget` plus the
+//! draft's card bytes in the fixture tier (the lever there must equal the header's). It caps
+//! every card, the tier's too, so the A6000 holds the stage's
 //! and the tier's sets at once. Every load feeds a prompt call as a prompt
 //! batch (`PrefillMode::Batch`, set here; `BLOOMERY_PREFILL` is refused, so
 //! the environment cannot move the feed, and the reference and the tiered
@@ -43,7 +45,8 @@
 //!   sent at least one routed slot over the two-card run (the tier's
 //!   per-layer hits), and by the prompt call alone, whose batch the tier
 //!   served (its batch services); the pair passes kept and rejected a
-//!   proposal each at least once; or the run proves nothing and fails by
+//!   proposal each at least once (a property of the draft file's content, so the fixture
+//!   tier defers it: its random draft keeps none); or the run proves nothing and fails by
 //!   name.
 //! - `--lost`: on the two-card model, the tier's stream held behind a host
 //!   flag before a step — the tier stops signalling: within the go deadline
@@ -79,6 +82,22 @@ mod dspark;
 mod quiet;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate plans on the placement's own cards; the tier glue names the gate card"
+)]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the levers and the clause tags; the card and the triangle's facts serve the other gates"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::path::Path;
     use std::sync::Arc;
@@ -108,10 +127,11 @@ mod gate {
     use crate::quiet::Quiet;
 
     const NAME: &str = "gate_deepseek41_twocard";
-    /// The card budget both plans are made under: the stage's dense bytes,
+    /// The card budget both plans are made under on the real file: the stage's dense bytes,
     /// cache and set-asides take about 5.7 GB of it, the tier loses the
     /// draft's reserve besides, so the loopback's A6000 holds both sets with
-    /// room [derived from the placement pins].
+    /// room [derived from the placement pins]. A free parameter of the real file, not a value
+    /// the header gives; the fixture tier plans under its header's budget plus the draft's.
     const BUDGET: u64 = 16 << 30;
     /// Prompt positions, fed one decode step each.
     const PROMPT: usize = 32;
@@ -528,24 +548,40 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[
+        let levers = bloomery_levers::at_main(&crate::ds41_tier::acts_on(&[
             ENGRAM_HELPER,
             HOST_POPULATE,
             HOST_LOCK,
             CARD_DONTNEED,
             R8,
-        ])?;
+        ])?)?;
         let args = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
-        cfg.place.card_budget_bytes = Some(BUDGET);
         cfg.body.prefill = PrefillMode::Batch;
         let draft = dspark::draft_hparams()?;
         let path = ref_model_path()?;
         let reserve = dspark::draft_reserve(Place::Bp, &draft.0, &path)?
             .ok_or("plan (b′) made no draft reserve")?;
-        let inputs = PlanInputs::read(
-            &Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
+        let head = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // The real tier plans under the gate's own budget (the lever is refused there); the
+        // fixture tier under its header's plus the draft's card bytes, the lever held equal to it.
+        let tier = bloomery_gpu_gates::tier::Tier::from_env()?;
+        let lever = match tier {
+            bloomery_gpu_gates::tier::Tier::Real => Some(BUDGET),
+            bloomery_gpu_gates::tier::Tier::Fixture => levers.card_budget_bytes(),
+        };
+        cfg.place = bloomery_gpu_gates::tier::budget_levers(
+            tier,
+            bloomery_gpu_gates::tier::header_budget(&head)?,
+            lever,
+            reserve,
         )?;
+        let budget = cfg
+            .place
+            .card_budget_bytes
+            .ok_or("the plan has no card budget")?;
+        let inputs = PlanInputs::read(&head)?;
+        drop(head);
         let bp = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
         let layers = inputs.model.layers;
         let (two, lmachine) = (bp(layers), looped(bp(layers)));
@@ -563,7 +599,7 @@ mod gate {
             )
         };
         println!(
-            "plan (b′) under a card budget of {BUDGET} B, the draft's reserve {reserve} B: stage \
+            "plan (b′) under a card budget of {budget} B, the draft's reserve {reserve} B: stage \
              {} experts (n_l {:?}), tier {} experts (per layer {:?}) on {} layers, host {} experts",
             plan.cards[0].experts,
             held(&plan.n_l),
@@ -597,6 +633,14 @@ mod gate {
             }
         }
         let prompt = prose(PROMPT.max(CALL_PROMPT))?;
+        if args.union {
+            crate::ds41_tier::sc(
+                "--union: two cards (and the loopback) are the union reference, bit for bit",
+            )?;
+        }
+        if args.lost {
+            crate::ds41_tier::sc("--lost: the held tier stream is named as a lost card")?;
+        }
 
         let reference = if args.union {
             let uplan = union_plan(&plan)?;
@@ -640,9 +684,24 @@ mod gate {
                 );
                 pass = false;
             }
-            if got.accepts > 0 && got.rejects > 0 {
+            // What a draft keeps is its file's content: the real draft keeps and rejects, a
+            // fixture's random one keeps none, so the fixture tier prints the counts and the
+            // equalities above hold the passes' tokens and kept counts.
+            let both = got.accepts > 0 && got.rejects > 0;
+            let held = bloomery_gpu_gates::tier::premise(
+                "pair passes kept and rejected a proposal each (the real draft's accept rate)",
+                bloomery_gpu_gates::tier::Tag::FileBound,
+                both,
+            )?;
+            if both {
                 println!(
                     "ok precondition: the pair passes kept {} proposals and rejected {}",
+                    got.accepts, got.rejects
+                );
+            } else if held {
+                println!(
+                    "precondition left to the real tier: the pair passes kept {} proposals and \
+                     rejected {}",
                     got.accepts, got.rejects
                 );
             } else {
@@ -689,6 +748,7 @@ mod gate {
             pass &= lost_case(o.s.model_mut(), &prompt)?;
         }
         drop(o);
+        println!("{NAME}: {}", bloomery_gpu_gates::tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }

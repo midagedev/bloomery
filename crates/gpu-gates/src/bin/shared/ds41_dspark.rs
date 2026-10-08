@@ -16,22 +16,34 @@ use std::path::Path;
 
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
-use gguf::Split;
+use bloomery_gpu_gates::tier::Tier;
+use gguf::{Gguf, Split};
 use model::arch::dspark::{self, DraftHparams};
 use model::placement::workstation::{self, CardSpec};
 
 /// The draft file: `$BLOOMERY_DSPARK_MODEL`, which the recipes export from
-/// the V4.1 profile's `DSPARK_MODEL` (`tools/ref/models/deepseek41.sh`).
+/// the V4.1 profile's `DSPARK_MODEL` (`tools/ref/models/deepseek41.sh`), and under
+/// `ref-paths.sh`'s fixture tier the fixture's own draft. In the fixture tier the file must be a
+/// whole fixture ([`bloomery_gpu_gates::tier`]): a run whose target is a fixture never reads the
+/// real draft, whose `target_layers` point past the fixture's layers.
 pub fn draft_path() -> Result<PathBuf, GateError> {
-    match std::env::var_os("BLOOMERY_DSPARK_MODEL") {
-        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-        _ => Err(
-            "BLOOMERY_DSPARK_MODEL unset — export the V4.1 profile's DSPARK_MODEL \
+    let path = match std::env::var_os("BLOOMERY_DSPARK_MODEL") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            return Err(
+                "BLOOMERY_DSPARK_MODEL unset — export the V4.1 profile's DSPARK_MODEL \
                   (`. tools/ref/ref-paths.sh` under BLOOMERY_MODEL=deepseek41), as the dspark \
                   recipes do"
-                .into(),
-        ),
+                    .into(),
+            );
+        }
+    };
+    let tier = Tier::from_env()?;
+    if tier == Tier::Fixture {
+        let g = Gguf::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        tier.check_file(&path, g.iter_kv().map(|(k, _)| k))?;
     }
+    Ok(path)
 }
 
 /// The draft file's hyperparameters, read from its header alone.

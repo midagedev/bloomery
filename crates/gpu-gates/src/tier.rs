@@ -27,8 +27,16 @@
 //! fixture tier is a named error, never a clause that quietly ran or
 //! quietly did not.
 
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use bloomery_levers::Levers;
+use gguf::Split;
+use model::fixture::KEY_CARD_BUDGET;
+use model::placement::PlanLevers;
+
+use crate::{GateError, verdict};
 
 /// The variable the tier is read from.
 pub const ENV: &str = "BLOOMERY_TIER";
@@ -253,6 +261,194 @@ pub fn deferred_line(clause: &str, tag: Tag) -> String {
     format!("{DEFERRED} {}: {clause}", tag.name())
 }
 
+static RAN: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether this process's tier runs the clause `name`, which carries `tag`; when it does not, the
+/// clause's [`DEFERRED`] line is printed (the batch counts it). Every verdict a gate prints is
+/// decided by one of these calls (the clause's function, or the sub-assertion that compares with a
+/// reference), so a clause with no tag has no way to run: the tag is the call's argument.
+///
+/// # Errors
+/// [`TierError::BadValue`] for a `BLOOMERY_TIER` that is neither tier.
+pub fn run_clause(name: &str, tag: Tag) -> Result<bool, GateError> {
+    let runs = Tier::from_env()?.clause(name, Some(tag))?;
+    let counter = if runs { &RAN } else { &DEFERRED_COUNT };
+    counter.fetch_add(1, Ordering::Relaxed);
+    Ok(runs)
+}
+
+/// A precondition that proves a clause is not vacuous (a flip landed, a tier slot was hit, a draft
+/// token was accepted) and whose truth is a property of the file's content: `holds` is required
+/// where the tier runs the premise, and not asserted where it defers (the fixture's uniform
+/// routing reads 0 there, which proves nothing about the engine). The equality the premise guards
+/// runs in both tiers.
+///
+/// # Errors
+/// As [`run_clause`].
+pub fn premise(name: &str, tag: Tag, holds: bool) -> Result<bool, GateError> {
+    Ok(!run_clause(name, tag)? || holds)
+}
+
+/// The clauses decided so far in this process: how many ran and how many were deferred, as the
+/// gate's closing line prints them.
+#[must_use]
+pub fn tally() -> (usize, usize) {
+    (
+        RAN.load(Ordering::Relaxed),
+        DEFERRED_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// The gate's closing line of the tally: `clauses: N ran, M left to the real tier`.
+#[must_use]
+pub fn tally_line() -> String {
+    let (ran, left) = tally();
+    format!("clauses: {ran} ran, {left} left to the real tier")
+}
+
+/// The move proof of one derived value: in the real tier the value beside the literal it replaced,
+/// and whether they are equal; in the fixture tier the derived value beside the real file's, with
+/// no verdict (the fixture's shape differs by construction).
+pub fn witness<T: PartialEq + Debug>(name: &str, derived: T, real: T) -> bool {
+    match Tier::from_env() {
+        Ok(Tier::Fixture) => {
+            println!("derived {name} = {derived:?} (the real file's {real:?})");
+            true
+        }
+        _ => {
+            let ok = derived == real;
+            println!(
+                "move proof {name}: derived {derived:?}, the old literal {real:?} {}",
+                verdict(ok)
+            );
+            ok
+        }
+    }
+}
+
+/// The key the generator records the single-card budget under, read from a header.
+///
+/// # Errors
+/// A key of another type than u64.
+pub fn header_budget(split: &Split) -> Result<Option<u64>, GateError> {
+    match split.value(KEY_CARD_BUDGET) {
+        None => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{KEY_CARD_BUDGET} holds {v:?}, not a u64").into()),
+    }
+}
+
+/// The plan's levers: the real tier's are the caller's (`BLOOMERY_CARD_BUDGET`, unset: none, as
+/// every gate had them); the fixture tier's budget is the one the generator recorded in the header
+/// — the budget that puts half the experts on the card of every card-eligible layer — plus `extra`,
+/// the card bytes a drafting load reserves out of the same budget (the draft's `card_bytes`; 0 for
+/// a target-only plan). A budget lever the caller set that differs from the header is refused by
+/// name, never planned under.
+///
+/// # Errors
+/// The fixture tier's file with no budget key, or a lever that names another budget.
+pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLevers, GateError> {
+    budget_levers(
+        Tier::from_env()?,
+        header_budget(split)?,
+        levers.card_budget_bytes(),
+        extra,
+    )
+}
+
+/// [`plan_levers`] of its three inputs: the tier, the header's budget and the caller's lever.
+///
+/// # Errors
+/// As [`plan_levers`].
+pub fn budget_levers(
+    tier: Tier,
+    header: Option<u64>,
+    lever: Option<u64>,
+    extra: u64,
+) -> Result<PlanLevers, GateError> {
+    match tier {
+        Tier::Real => Ok(PlanLevers {
+            card_budget_bytes: lever,
+        }),
+        Tier::Fixture => {
+            let header =
+                header.ok_or_else(|| format!("the fixture header has no {KEY_CARD_BUDGET}"))?;
+            if let Some(l) = lever
+                && l != header
+            {
+                return Err(format!(
+                    "BLOOMERY_CARD_BUDGET={l} and the fixture's {KEY_CARD_BUDGET} is {header}: \
+                     the fixture tier plans under the header's budget"
+                )
+                .into());
+            }
+            Ok(PlanLevers {
+                card_budget_bytes: Some(header + extra),
+            })
+        }
+    }
+}
+
+/// The card a plan is made on, and the machine's usable bytes with it. The real tier keeps what
+/// the gates had (`real`: the 3090's bytes on the card the runner put in view). The fixture tier
+/// resolves `a` against this process's devices (`--place a`): the largest visible card as the
+/// device reports itself, its free bytes included.
+///
+/// # Errors
+/// `a` finding no card.
+#[cfg(feature = "gpu")]
+pub fn card(
+    real: impl FnOnce() -> Result<model::placement::workstation::CardSpec, GateError>,
+) -> Result<model::placement::workstation::CardSpec, GateError> {
+    use model::placement::workstation::CardSpec;
+    use std::sync::OnceLock;
+
+    static A: OnceLock<CardSpec> = OnceLock::new();
+    match Tier::from_env()? {
+        Tier::Real => real(),
+        Tier::Fixture => {
+            if let Some(c) = A.get() {
+                return Ok(*c);
+            }
+            let specs = crate::generate::Place::A.on_host()?.card_specs()?;
+            let card = *specs.first().ok_or("--place a resolved to no card")?;
+            Ok(*A.get_or_init(|| card))
+        }
+    }
+}
+
+/// The move proof of the card a plan is made on: its bytes (total, the driver's reserve, the
+/// resolved device, the free bytes, the holders) beside `RTX_3090`'s, the lookup every plan made
+/// before the card was derived. The real tier requires them equal; the name is the one difference,
+/// printed apart: the plan lookup opens the card in view by its own name.
+#[cfg(feature = "gpu")]
+pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
+    use model::placement::workstation::{CardSpec, RTX_3090};
+
+    let bytes = |c: &CardSpec| {
+        (
+            c.total_bytes,
+            c.driver_reserve_bytes,
+            c.device,
+            c.free_bytes,
+            c.held_by,
+        )
+    };
+    let ok = witness(
+        "card bytes (total, driver reserve, device, free, holders)",
+        bytes(derived),
+        bytes(&RTX_3090),
+    );
+    println!(
+        "named difference: the card's name {:?}, the old literal's {:?}",
+        derived.name, RTX_3090.name
+    );
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +610,23 @@ mod tests {
                 "the generator in crates/model/src has no {key:?} literal"
             );
         }
+    }
+
+    /// The real tier plans under the caller's lever whatever the header holds; the fixture tier
+    /// under the header's budget plus a drafting load's card bytes, and refuses a lever that
+    /// names another budget and a header with none. Mutant: the extra dropped or doubled, the
+    /// lever preferred, the real tier reading the header.
+    #[test]
+    fn the_budget_is_the_levers_in_the_real_tier_and_the_headers_plus_the_draft_in_the_fixture() {
+        let b = |t, h, l, x| budget_levers(t, h, l, x).map(|p| p.card_budget_bytes);
+        assert_eq!(b(Tier::Real, Some(9), None, 5).expect("real"), None);
+        assert_eq!(b(Tier::Real, None, Some(7), 5).expect("real"), Some(7));
+        assert_eq!(b(Tier::Fixture, Some(9), None, 0).expect("plain"), Some(9));
+        assert_eq!(
+            b(Tier::Fixture, Some(9), Some(9), 5).expect("draft"),
+            Some(14)
+        );
+        assert!(b(Tier::Fixture, Some(9), Some(8), 0).is_err());
+        assert!(b(Tier::Fixture, None, None, 0).is_err());
     }
 }

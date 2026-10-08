@@ -77,6 +77,12 @@
 //!
 //! The gate runs with the r8 sidecar (`BLOOMERY_R8` on, its default): without
 //! it no flip unpacks, and `transform` is red by name.
+//!
+//! Tiers (`crate::ds41_tier`, `bloomery_gpu_gates::tier`): every equality and structure clause is
+//! self-consistency and runs on a fixture. What the real file's routing skew makes true — flips
+//! land, an expert is admitted, the copy of the map moves off its start, the live sets leave the
+//! seed — is one file-bound premise ([`skew`]); a fixture's generated router has no skew, so the
+//! fixture tier defers it and the clauses' equalities hold the rest of each arm.
 
 use crate::ds41_open::{open, open_edited};
 use std::path::Path;
@@ -91,6 +97,7 @@ use bloomery_gpu_deepseek41::body::{Body, OpenCfg};
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::generate::{Place, Residence, place_table};
 use bloomery_gpu_gates::record;
+use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, verdict};
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, workstation};
@@ -128,6 +135,22 @@ fn prose(n: usize) -> Result<Vec<u32>, GateError> {
         return Err(format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into());
     }
     Ok(ids)
+}
+
+/// The premise every flip-dependent clause shares: the history's flips land, an expert is
+/// admitted, the card's copy moves off its start, the live sets leave the seed. It is the real
+/// file's routing skew (file-bound): `true` when this tier asserts it, `false` when the fixture
+/// tier leaves it to the real one, its line printed once.
+fn skew() -> Result<bool, GateError> {
+    static SKEW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&s) = SKEW.get() {
+        return Ok(s);
+    }
+    let s = tier::run_clause(
+        "c1, transform, keep, table: flips landed and an expert admitted (the file's routing skew)",
+        Tag::FileBound,
+    )?;
+    Ok(*SKEW.get_or_init(|| s))
 }
 
 /// Milliseconds since `t`.
@@ -353,7 +376,11 @@ fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
     let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
     let (checked, bad) =
         crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers, |_| 3)?;
-    Ok(crate::residency_clauses::transform_verdict(checked, &bad))
+    Ok(crate::residency_clauses::transform_verdict_with(
+        checked,
+        &bad,
+        skew()?,
+    ))
 }
 
 /// `resident`: the churn pool and the host experts in, the pinned out.
@@ -413,11 +440,12 @@ fn residence(s: &Session<Body>) -> Result<Residence<'_>, GateError> {
 /// `table`: the stage card's copy after `held`, the held history, against
 /// the host map, the ledger and the map `held` started from.
 fn table_clause(s: &Session<Body>, held: &History) -> Result<bool, GateError> {
-    crate::residency_clauses::table_clause(
+    crate::residency_clauses::table_clause_with(
         &residence(s)?,
         &held.start,
         held.landed,
         "the held history",
+        skew()?,
     )
 }
 
@@ -482,6 +510,7 @@ pub fn clauses(
         s.commit(2)?;
         Ok(())
     })?;
+    crate::ds41_tier::sc("c6: a pair pass counts its kept rows only")?;
     let c6 = one == step && both != one;
     println!(
         "c6: a pair pass keeping one row leaves the rule a step leaves ({}), keeping both \
@@ -493,13 +522,23 @@ pub fn clauses(
     pass &= c6;
 
     let first = history(s, &ids, None)?;
+    crate::ds41_tier::sc("transform: an admitted expert's slot is a static load's bytes")?;
     pass &= transform_clause(s)?;
+    crate::ds41_tier::sc("resident: the host set answers the truth")?;
     pass &= resident_clause(s, &seeds)?;
     let again = history(s, &ids, None)?;
-    pass &= crate::residency_clauses::c1_clause(first.tokens.len(), first.landed, first == again);
+    crate::ds41_tier::sc("c1: the history twice gives the same tokens and logits")?;
+    pass &= crate::residency_clauses::c1_clause_with(
+        first.tokens.len(),
+        first.landed,
+        first == again,
+        skew()?,
+    );
 
+    crate::ds41_tier::sc("passes: a history's boundaries end the pass kinds in order")?;
     pass &= crate::residency_clauses::passes_clause(&first.passes, STEPS);
 
+    crate::ds41_tier::sc("tier: every tier entry is where the load put it")?;
     let tier_ok = if place == Place::A {
         let after = tier_entries(s)?.len();
         let ok = tier_at_load.is_empty() && after == 0;
@@ -528,6 +567,7 @@ pub fn clauses(
     pass &= tier_ok;
 
     let held = history(s, &ids, Some(flags))?;
+    crate::ds41_tier::sc("c3: the held copy stream gives the first run's tokens and logits")?;
     let c3 = held.tokens == first.tokens && held.fnvs == first.fnvs;
     println!(
         "c3: the history with the copy stream held {HOLD:?}: {} flips landed, same tokens \
@@ -538,6 +578,7 @@ pub fn clauses(
     pass &= c3;
 
     // The seat's reset on a cache miss is `Target::reset`.
+    crate::ds41_tier::sc("keep: the seat's reset leaves the residency where use took it")?;
     let _ = s.take_cleared();
     let before = (live_sets(s, &seeds)?, rule_of(s)?);
     runtime::Target::reset(s)?;
@@ -546,7 +587,7 @@ pub fn clauses(
         live.len() != seed.len() || seed.iter().any(|e| !live.contains(e))
     });
     let cleared = s.take_cleared().is_some();
-    let keep = moved && before == after && !cleared;
+    let keep = (moved || !skew()?) && before == after && !cleared;
     println!(
         "keep: the serve seat's reset (Target::reset) after the held history, the live sets \
          off the seed {moved}: live sets and rule unchanged {}, no residency reset {}: {}",
@@ -556,9 +597,13 @@ pub fn clauses(
     );
     pass &= keep;
 
+    crate::ds41_tier::sc("table: the card's copy is the host map and the ledger, no slot twice")?;
     pass &= table_clause(s, &held)?;
     let probe = match place == Place::A {
-        true => Some(static_probe(s, &ids)?),
+        true => {
+            crate::ds41_tier::sc("static: the residency computes the placement its copy holds")?;
+            Some(static_probe(s, &ids)?)
+        }
         false => None,
     };
 
@@ -571,6 +616,7 @@ pub fn clauses(
         let b = m.body(NAME)?;
         b.hybrid().swap().ok_or("no machine")?
     };
+    crate::ds41_tier::sc("c7: a residency reset brings every layer back to its seed")?;
     pass &= crate::residency_clauses::c7_clause(&r, machine, &seeds);
     Ok((pass, probe))
 }

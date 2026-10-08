@@ -71,6 +71,7 @@ case "${BLOOMERY_TIER:-real}" in
   fixture)
     case "$BLOOMERY_MODEL" in
       qwen4exp) __fixture_dir=qwen38 ;;
+      deepseek41) __fixture_dir=v41 ;;
       deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;
       *) __fixture_dir=none ;;
     esac
@@ -93,9 +94,20 @@ case "${BLOOMERY_TIER:-real}" in
         fi
         FIXTURE_FILE=${__fixture_files[0]}
         [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_FILE
+        # A family whose fixture has a DSpark draft keeps it in a directory of its own beside the target's shards (the glob above sees
+        # the target's first shard only): the fixture tier's draft is that file, never the real draft the profile names. A caller's own
+        # BLOOMERY_DSPARK_MODEL wins, as it does in the profile (the Rust side refuses a draft that is not a whole fixture).
+        if [ "$BLOOMERY_MODEL" = deepseek41 ] && [ -z "${BLOOMERY_DSPARK_MODEL:-}" ]; then
+          __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
+          if [ ! -e "${__fixture_drafts[0]}" ] || [ "${#__fixture_drafts[@]}" != 1 ]; then
+            echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)" >&2
+            exit 66
+          fi
+          DSPARK_MODEL=${__fixture_drafts[0]}
+        fi
         ;;
     esac
-    unset __fixture_dir __fixture_root __fixture_files
+    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts
     ;;
   *)
     echo "ref-paths.sh: BLOOMERY_TIER is real (unset: the same) or fixture, got '${BLOOMERY_TIER}'" >&2

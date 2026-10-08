@@ -1,5 +1,7 @@
 //! GPU gate for the V4.1 text-side image injection (`body::prefill_media`,
-//! `Session::prompt_media`) on the gate placement: a prompt whose media
+//! `Session::prompt_media`) on the gate placement (`crate::ds41_tier::plan_gate`: the 3090's
+//! bytes in the real tier, the largest visible card under the header's card budget in the
+//! fixture tier): a prompt whose media
 //! span carries bf16 rows takes those rows at its positions, picks its
 //! experts there with `exp_probs_b_vl`, and hashes its engram n-grams as
 //! DEAD — each clause against a rule the gate computes itself, on the
@@ -56,6 +58,11 @@
 //!   `prefill_media` and `Session::prompt_media` both), a span the call
 //!   does not hold whole, and a cut inside a span.
 //!
+//! Every clause is self-consistency — the engine against a rule the gate computes from the
+//! model's own tensors, over the vision set's rows as inputs — so the fixture tier runs all of
+//! them; (ii)'s coverage needs the file's `exp_probs_b_vl` to pick differently from
+//! `exp_probs_b` somewhere, which the fixture's biases (0 and a uniform ±0.1) do.
+//!
 //! Text-only prompts are `gate-gpu-ds41-prefill`'s (bit for bit); the
 //! kernels are untouched (ptx-scan against the base). The FAIL-first
 //! mutants — the rows staged one position off, the media broadcast reading
@@ -82,6 +89,14 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use app::Session;
     use bloomery_gpu::model::StepMode;
@@ -92,6 +107,7 @@ mod gate {
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::ds41_media;
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, split_f32, verdict};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP,
@@ -707,10 +723,13 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::gate_card::init()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
-        let path = workstation::model_v41();
-        let hp = Hparams::read(&Split::open(&path).map_err(|e| format!("open {path}: {e}"))?)?;
+        crate::ds41_tier::init()?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
+        let path = crate::ds41_tier::model_path()?;
+        let head = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        cfg.place = tier::plan_levers(&head, &levers, 0)?;
+        let hp = Hparams::read(&head)?;
+        drop(head);
         let sites = hp
             .engram
             .as_ref()
@@ -722,7 +741,7 @@ mod gate {
         let t = std::time::Instant::now();
         let mut m = body::open(
             file,
-            crate::gate_card::plan_gate,
+            crate::ds41_tier::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
@@ -789,6 +808,11 @@ mod gate {
                 &mut m, layout, &feed, &of, n_embd, &text_bias, &vl_bias, &sites,
             )?);
         }
+        crate::ds41_tier::sc("(i) embedding: the media positions hold the widened row")?;
+        crate::ds41_tier::sc("(ii) router: every route seam's ids are the host pick's")?;
+        crate::ds41_tier::sc(
+            "(ii) coverage: the two biases' picks differ at an image and a separator",
+        )?;
         for (what, layout, seen) in [
             ("mid", &mid, &seens[0]),
             ("cross", &cross, &seens[1]),
@@ -882,6 +906,7 @@ mod gate {
             cover.1,
             verdict(pass)
         );
+        crate::ds41_tier::sc("(iii) engram: the media streams pass the engram step unchanged")?;
         for site in &sites {
             // (iii): the engram seam's media streams equal what the engram
             // step read — the layer before's post-join streams where it runs
@@ -941,6 +966,7 @@ mod gate {
         }
 
         // (iv): split invariance. The cuts sit in the text before the span.
+        crate::ds41_tier::sc("(iv) split invariance: one call = two calls cut before the span")?;
         for (what, layout, cut) in [("mid", &mid, 30usize), ("cross", &cross, 100usize)] {
             let p = layout.positions();
             let fed = &corpus[p..p + STEPS];
@@ -1027,6 +1053,7 @@ mod gate {
         let p = end.positions();
         let (s0, e0) = (end.at, end.at + span_len);
         let fed = &corpus[p..p + STEPS];
+        crate::ds41_tier::sc("(v) decode: the dead lookback after an image-ending prompt")?;
         let straight = run_once(&mut m, &hp, &end, &feed, &[p], fed)?;
         m.reset()?;
         body::prefill_media(&mut m, &end.ids, &[end.span(&feed)])?;
@@ -1063,6 +1090,7 @@ mod gate {
             verdict(dead_ok)
         );
         // The snapshot and the byte form, each resumed after step SNAP_AT.
+        crate::ds41_tier::sc("(v) snapshot: resume and save/restore give the uninterrupted ids")?;
         let snap = resumed(&mut m, &end, &feed, fed, |m| {
             let s = body::snapshot(m)?;
             body::resume(m, &s)?;
@@ -1090,6 +1118,7 @@ mod gate {
 
         // (vi): the refusals, by name. The model stands at the resumed state
         // of the ending layout, its span in the history.
+        crate::ds41_tier::sc("(vi) refusals: a cut inside a span, a torn span, media under steps")?;
         let cut_ok = refused(m.rollback(u32::try_from(s0 + 40)?), "inside the media span");
         ok &= cut_ok;
         println!(
@@ -1131,6 +1160,7 @@ mod gate {
         m.body_parts(NAME)?.2.set_prefill_mode(PrefillMode::Batch);
         m.reset()?;
 
+        println!("{NAME}: {}", tier::tally_line());
         if ok {
             println!("gate-gpu-ds41-media: PASS");
             Ok(())
