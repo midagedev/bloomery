@@ -5,15 +5,21 @@
 //! the oldest of them. When more requests wait than slots are free, a
 //! [`SlotPicker`] chooses which one goes next ([`FifoPicker`], the oldest, by
 //! default). The request then takes, of the free slots, the one whose held
-//! sequence shares the longest prefix with its own (llama-server's choice,
-//! without its similarity floor): its cache keeps the most. A shared prefix
-//! counts an image span only when both sides hold the same image
-//! ([`common_prefix`]), so a request takes the slot that holds its
-//! image, not one that holds another of the same grid. Among equals a slot
-//! that holds no ids comes before one that holds a conversation: seating the
-//! request there cuts nothing, so nothing is saved either. When the slots
-//! take one engine in turns, the slot whose state the engine holds goes
-//! before the least recently used: taking another moves that state aside.
+//! sequence shares the longest prefix with its own: its cache keeps the
+//! most. A shared prefix counts only past llama-server's similarity floor
+//! (strictly more than 0.1 of the request's ids,
+//! [`PROMPT_SIMILARITY_FLOOR`]; a slot at or under it counts as sharing
+//! nothing), so a request that barely matches an idle conversation takes an
+//! empty slot instead of cutting it. A shared prefix counts an image span
+//! only when both sides hold the same image ([`common_prefix`]), so a
+//! request takes the slot that holds its image, not one that holds another
+//! of the same grid. Among equals a slot that holds no ids comes before one
+//! that holds a conversation: seating the request there cuts nothing, so
+//! nothing is saved either. When the slots take one engine in turns, the
+//! slot whose state the engine holds goes before the least recently used:
+//! taking another moves that state aside. Those last two orders are
+//! bloomery's; llama-server floors the prefix and then takes the least
+//! recently used free slot alone.
 //!
 //! A slot action (save, restore, erase) reserves its slot, and a residency
 //! reset every slot, only while the slot is free and no request waits, so
@@ -345,12 +351,35 @@ impl<R, A> Board<R, A> {
     }
 }
 
+/// llama-server's prompt-similarity floor, 0.1, held as the exact fraction
+/// (1, 10): its `slot_prompt_similarity` default, set by
+/// `-sps/--slot-prompt-similarity` (`0` there turns the floor off; ours is
+/// no flag). A free slot's shared prefix counts only when it holds strictly
+/// more than this fraction of the request's ids.
+const PROMPT_SIMILARITY_FLOOR: (usize, usize) = (1, 10);
+
+/// The prefix a free slot ranks by: itself when it clears
+/// [`PROMPT_SIMILARITY_FLOOR`] against a request of `len` ids, else none —
+/// the strict `>` of llama-server, so a prefix exactly at the floor shares
+/// nothing. In integers (`prefix * 10 > len`), so no float division rounds
+/// at the floor's edge; a request of no ids, which the HTTP layer refuses
+/// before one queues, divides nothing and shares nothing here.
+fn floored_prefix(prefix: usize, len: usize) -> usize {
+    if prefix * PROMPT_SIMILARITY_FLOOR.1 > len * PROMPT_SIMILARITY_FLOOR.0 {
+        prefix
+    } else {
+        0
+    }
+}
+
 /// Of the free slots, the one whose held sequence shares the longest prefix
 /// with `req` — the same images in the spans ([`common_prefix`]), so the slot
 /// that holds the request's image beats one that holds another of the same
-/// grid; among equals one that holds no ids (nothing is cut or saved),
-/// then the one the engine is on, then the least recently used, then the
-/// lowest id.
+/// grid. A prefix at or under [`PROMPT_SIMILARITY_FLOOR`], 0.1 of `req`'s
+/// ids, counts as none, so a request that clears it nowhere falls to the
+/// orders below the prefix: one that holds no ids (nothing is cut or
+/// saved), then the one the engine is on, then the least recently used, then
+/// the lowest id.
 fn best_slot<'h>(
     slots: &[SlotState],
     free: &[usize],
@@ -361,7 +390,7 @@ fn best_slot<'h>(
     let key = |i: usize| {
         let held = held(i);
         (
-            common_prefix(held, req),
+            floored_prefix(common_prefix(held, req), req.ids.len()),
             held.is_empty(),
             on == Some(i),
             Reverse(slots[i].last_used),
@@ -414,6 +443,14 @@ mod tests {
             }],
             ids,
         }
+    }
+
+    /// A sequence of 20 ids whose first `n` are 0 to `n − 1` and whose rest
+    /// starts at `tail`: two of these share exactly the ids their heads
+    /// share, so a request of `seq_sharing(20, _)` shares `n` of its 20 with
+    /// `seq_sharing(n, other_tail)`.
+    fn seq_sharing(n: u32, tail: u32) -> Held {
+        Held::from((0..n).chain(tail..tail + 20 - n).collect::<Vec<u32>>())
     }
 
     /// At N = 2 a free slot takes the oldest waiting request: four queued
@@ -566,6 +603,135 @@ mod tests {
             b.admit(nothing, Some(1))[0].0,
             1,
             "both empty: the slot the engine is on, not the least recently used"
+        );
+    }
+
+    /// A shared prefix counts only past llama-server's similarity floor, 0.1
+    /// of the request's ids: a request that shares 1 of its 20 ids with an
+    /// idle conversation (5 %) takes the empty slot, one that shares 3 of 20
+    /// (15 %) takes the conversation's slot over the empty one, and one
+    /// exactly at the floor (2 of 20, 10 %) takes the empty slot — the floor
+    /// is a strict `>`.
+    #[test]
+    fn a_request_under_the_similarity_floor_takes_the_empty_slot() {
+        let mut b = board(2, 8);
+        for r in 0..2 {
+            b.enqueue(Held::from(vec![r]), r).expect("room");
+        }
+        b.admit(nothing, None);
+        // Slot 0, released first, holds a conversation and is the least
+        // recently used; slot 1, released after, holds nothing.
+        b.release(0);
+        b.release(1);
+        let (a, empty) = (seq_sharing(20, 100), Held::default());
+        let held = |i: usize| if i == 0 { &a } else { &empty };
+        b.enqueue(seq_sharing(1, 200), 2).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            1,
+            "1 of 20 shared (5 %, under the floor): the empty slot, not the idle conversation"
+        );
+        b.release(1);
+        b.enqueue(seq_sharing(3, 200), 3).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            0,
+            "3 of 20 shared (15 %, past the floor): the conversation's slot"
+        );
+        b.release(0);
+        b.enqueue(seq_sharing(2, 200), 4).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            1,
+            "2 of 20 shared (10 %, exactly the floor): not a candidate"
+        );
+    }
+
+    /// Of the held slots past the floor the longest shared prefix wins,
+    /// wherever the slot sits in the orders below the prefix; two that share
+    /// equally fall to them: the slot the engine is on, then the least
+    /// recently used.
+    #[test]
+    fn held_slots_past_the_floor_rank_by_shared_prefix() {
+        let mut b = board(3, 8);
+        for r in 0..3 {
+            b.enqueue(Held::from(vec![r]), r).expect("room");
+        }
+        b.admit(nothing, None);
+        for slot in 0..3 {
+            b.release(slot);
+        }
+        // Released in id order: slot 0 is the least recently used, slot 2
+        // the most.
+        let one = [
+            seq_sharing(3, 100),
+            seq_sharing(0, 140),
+            seq_sharing(4, 180),
+        ];
+        let held = |i: usize| &one[i];
+        b.enqueue(seq_sharing(20, 0), 3).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            2,
+            "4 of 20 on slot 2 beats 3 on slot 0, the least recently used"
+        );
+        b.release(2);
+        let two = [
+            seq_sharing(4, 100),
+            seq_sharing(0, 140),
+            seq_sharing(4, 180),
+        ];
+        let held = |i: usize| &two[i];
+        b.enqueue(seq_sharing(20, 0), 4).expect("room");
+        assert_eq!(
+            b.admit(held, Some(2))[0].0,
+            2,
+            "equal 4 of 20: the slot the engine is on, not slot 0, the least recently used"
+        );
+        b.release(2);
+        b.enqueue(seq_sharing(20, 0), 5).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            0,
+            "equal 4 of 20, no engine: the least recently used"
+        );
+    }
+
+    /// With every slot held and no prefix past the floor — one exactly at
+    /// it, one under — the orders below the prefix decide as they did before
+    /// it: the slot the engine is on, then the least recently used. The floor
+    /// turns a small prefix into none; it never leaves a request unseated.
+    #[test]
+    fn with_no_slot_past_the_floor_the_orders_below_decide() {
+        let mut b = board(3, 8);
+        for r in 0..3 {
+            b.enqueue(Held::from(vec![r]), r).expect("room");
+        }
+        b.admit(nothing, None);
+        for slot in 0..3 {
+            b.release(slot);
+        }
+        // Slot 0, the least recently used, would win on prefix with no floor
+        // (2 of 20, exactly at it); the engine's slot 2 shares nothing.
+        let all = [
+            seq_sharing(2, 100),
+            seq_sharing(1, 140),
+            seq_sharing(0, 180),
+        ];
+        let held = |i: usize| &all[i];
+        b.enqueue(seq_sharing(20, 0), 3).expect("room");
+        assert_eq!(
+            b.admit(held, Some(2))[0].0,
+            2,
+            "no slot past the floor: the slot the engine is on, not slot 0, whose 2 of 20 \
+             sits exactly at it"
+        );
+        b.release(2);
+        b.enqueue(seq_sharing(20, 0), 4).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            0,
+            "no engine: the least recently used"
         );
     }
 
