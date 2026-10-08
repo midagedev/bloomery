@@ -20,6 +20,8 @@
 //! their fills before the books give the slot away.
 
 use std::ops::Range;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -95,17 +97,123 @@ fn pick_slot(slots: &[SlotBook]) -> Option<usize> {
         .map(|(k, _)| k)
 }
 
-/// Where part `part` of the expert slot `slot` holds `r`'s bytes: the
-/// window's base in the mapping and the logical bytes' offset into it.
+/// What one `ensure` claimed under the books' lock: the slots to fill, the
+/// filled slots it let go (their pages to return) and the ids it did not
+/// find filled.
+struct Claim {
+    picks: Vec<Pick>,
+    evicted: Vec<usize>,
+    misses: u64,
+}
+
+/// The books' pass of one `ensure` over `layer`'s `ids`: ids the plan's host
+/// segment holds are skipped, a filled one's tick is refreshed, every other
+/// takes a slot — the first free, else the least recently used filled one,
+/// which it evicts — and is marked filling. Pure over the books: no read, no
+/// page returned. The `seen` marks are this call's alone; a mark that
+/// outlived its call would skip an expert evicted since, and its slot would
+/// read unfilled.
+fn claim_slots(arena: &LayerArena, books: &mut Books, ids: &[u32]) -> Result<Claim, String> {
+    if books.seen.len() != arena.n_expert as usize {
+        books.seen.resize(arena.n_expert as usize, false);
+    }
+    books.seen.fill(false);
+    let mut claim = Claim {
+        picks: Vec::new(),
+        evicted: Vec::new(),
+        misses: 0,
+    };
+    for &id in ids {
+        let Some(at) = usize::try_from(id)
+            .ok()
+            .filter(|&i| i < arena.n_expert as usize)
+        else {
+            return Err(format!(
+                "expert {id} is past the {} experts",
+                arena.n_expert
+            ));
+        };
+        if arena.host.contains(&id) || std::mem::replace(&mut books.seen[at], true) {
+            continue;
+        }
+        if let Some(slot) = arena.filled(id) {
+            books.tick += 1;
+            arena.slots[slot].tick.store(books.tick, Ordering::Relaxed);
+            continue;
+        }
+        claim.misses += 1;
+        let slot = pick_slot(&arena.slots)
+            .ok_or("every slot is filling: two ensures raced a layer".to_string())?;
+        if arena.slots[slot].state.load(Ordering::Relaxed) == FILLED {
+            let gone = arena.slots[slot].id.load(Ordering::Relaxed);
+            arena.of_id[gone as usize].store(0, Ordering::Relaxed);
+            claim.evicted.push(slot);
+        }
+        arena.slots[slot].state.store(FILLING, Ordering::Relaxed);
+        arena.slots[slot].id.store(id, Ordering::Relaxed);
+        arena.of_id[at].store(slot as u32 + 1, Ordering::Relaxed);
+        claim.picks.push(Pick { slot, id });
+    }
+    Ok(claim)
+}
+
+/// Where part `part` of the expert slot at byte `slot_off` of the mapping
+/// holds `r`'s bytes: the logical bytes' offset in the mapping and their
+/// length (the window's base plus the run's skew).
 fn window_span(
-    slot_bytes: usize,
+    slot_off: usize,
     windows: &[usize; PARTS],
-    slot: usize,
     part: usize,
     r: PartRange,
 ) -> (usize, usize) {
-    let base = slot * slot_bytes + windows[part];
-    (base + r.skew, r.len)
+    (slot_off + windows[part] + r.skew, r.len)
+}
+
+/// Each paged layer's byte offset in the mapping: the layers' `count` slots
+/// laid one after the other, a layer's `slot_sizes` entry a slot. The
+/// offsets never overlap and the end is `count × Σ slot_sizes`.
+fn layer_bases(count: usize, slot_sizes: &[usize]) -> Vec<usize> {
+    let mut at = 0;
+    slot_sizes
+        .iter()
+        .map(|&b| {
+            let base = at;
+            at += count * b;
+            base
+        })
+        .collect()
+}
+
+/// The offsets an audit reads of one part's span of `len` bytes at file
+/// offset `at`: the first and the last page of it, the part's own first and
+/// last bytes, and one page between — six sites a torn or zeroed slot
+/// cannot all pass.
+#[must_use]
+pub fn audit_offsets(at: u64, len: usize) -> [usize; 6] {
+    let page = DIRECT_ALIGN;
+    let last = len.saturating_sub(1);
+    let mid = (at as usize + len / 2) & !(page - 1);
+    [
+        0,
+        page,
+        len.saturating_sub(page),
+        len / 2,
+        mid.saturating_sub(at as usize),
+        last,
+    ]
+    .map(|o| o.min(last))
+}
+
+/// Whether the arena's own address ranges (`[start, end)`, the spans its
+/// evictions return) and the model mapping's are disjoint: the arena never
+/// advises the model mapping, so a lock's pinned pages and an r8 copy's
+/// pages stay theirs. A mutant that madvises a model page names an arena
+/// range that overlaps the mapping's, and this turns false.
+#[must_use]
+pub fn advice_disjoint(arena: &[(usize, usize)], model: &[(usize, usize)]) -> bool {
+    arena
+        .iter()
+        .all(|&(a0, a1)| model.iter().all(|&(m0, m1)| a1 <= m0 || m1 <= a0))
 }
 
 /// One layer of the arena: its slots and their books.
@@ -117,6 +225,8 @@ struct LayerArena {
     /// Slot `k`'s part `p` window at `windows[p]` bytes into the slot.
     windows: [usize; PARTS],
     slot_bytes: usize,
+    /// The layer's first byte in the mapping ([`layer_bases`]).
+    base: usize,
     /// The plan's stack row each of the leg's parts reads, resolved at the
     /// attach by name ([`NvTier::note_parts`]); unread until then, and
     /// every pick of the layer refused by name after.
@@ -132,6 +242,22 @@ struct LayerArena {
     /// Per slot: its state (a pick's read), its id and LRU tick (the
     /// lock's alone).
     slots: Vec<SlotBook>,
+}
+
+impl LayerArena {
+    /// Slot `slot`'s first byte in the mapping.
+    fn slot_off(&self, slot: usize) -> usize {
+        self.base + slot * self.slot_bytes
+    }
+
+    /// The slot holding expert `id` filled, if one does — the one reading
+    /// of the books a pick, the residency seam and `ensure`'s hit check
+    /// share. `id` past the layer's experts holds none.
+    fn filled(&self, id: u32) -> Option<usize> {
+        let held = self.of_id.get(id as usize)?.load(Ordering::Relaxed);
+        let slot = (held as usize).checked_sub(1)?;
+        (self.slots[slot].state.load(Ordering::Relaxed) == FILLED).then_some(slot)
+    }
 }
 
 struct SlotBook {
@@ -195,6 +321,11 @@ pub struct NvTier {
     books: Mutex<Books>,
     stats: Stats,
     budget: u64,
+    /// The routed-expert bytes the plan pages on the NVMe tier.
+    paged: u64,
+    /// One buffered handle per shard, once [`NvTier::audit_on`] turned the
+    /// audit on.
+    audit: OnceLock<Vec<(PathBuf, std::fs::File)>>,
     /// The mapping's first byte, for the pool's fill workers — each fill
     /// writes its own slot's own window, disjoint by the books' slot
     /// ownership.
@@ -383,6 +514,7 @@ impl NvTier {
                 n_expert: model.experts as u32,
                 windows,
                 slot_bytes,
+                base: 0,
                 part_of: OnceLock::new(),
                 files: rows_files.map(|i| Arc::clone(&files[i])),
                 names: rows.clone().try_into().expect("three rows"),
@@ -402,7 +534,9 @@ impl NvTier {
         let bytes = count * slot_sizes.iter().sum::<usize>();
         let map = AnonMap::new(bytes)
             .map_err(|e| GpuError::shape(WHAT, format!("the arena's {bytes} B: {e}")))?;
-        for arena in arenas.iter_mut().flatten() {
+        let bases = layer_bases(count, &slot_sizes);
+        for (arena, base) in arenas.iter_mut().flatten().zip(bases) {
+            arena.base = base;
             arena.slots = (0..count)
                 .map(|_| SlotBook {
                     state: AtomicU32::new(FREE),
@@ -421,6 +555,8 @@ impl NvTier {
             }),
             stats: Stats::default(),
             budget: plan.host.nvme_arena_bytes,
+            paged: plan.host.nvme_expert_bytes,
+            audit: OnceLock::new(),
         }))
     }
 
@@ -436,6 +572,31 @@ impl NvTier {
             .get(layer)
             .and_then(|l| l.as_ref())
             .map_or(0..0, |l| l.host.clone())
+    }
+
+    /// Whether the arena, not the file mapping, serves layer `layer`'s
+    /// expert `id`: the layer is a paged one and the plan's host segment
+    /// does not hold the id — the NVMe segment's ids and the card's
+    /// victims. The one predicate `ensure`, the residency seam and the
+    /// leg's pick share; an id it names false reads the mapping as it
+    /// always did.
+    #[must_use]
+    pub fn serves(&self, layer: usize, id: u32) -> bool {
+        self.by_layer
+            .get(layer)
+            .and_then(|l| l.as_ref())
+            .is_some_and(|l| !l.host.contains(&id))
+    }
+
+    /// Whether the arena's books hold layer `layer`'s expert `id` filled:
+    /// the residency seam's answer for an id the arena serves — never the
+    /// page cache's residency.
+    #[must_use]
+    pub fn slot_filled(&self, layer: usize, id: u32) -> bool {
+        self.by_layer
+            .get(layer)
+            .and_then(|l| l.as_ref())
+            .is_some_and(|l| l.filled(id).is_some())
     }
 
     /// The arena as the leg's [`TierSlots`] handle.
@@ -500,76 +661,134 @@ impl NvTier {
         self.budget
     }
 
+    /// The arena's mapping as an address range `[start, end)`: the only
+    /// pages its evictions return.
+    #[must_use]
+    pub fn range(&self) -> (usize, usize) {
+        let start = self.map.as_ptr() as usize;
+        (start, start + self.map.bytes().len())
+    }
+
+    /// The routed-expert bytes the plan pages on the NVMe tier, which the
+    /// arena serves beside the card's victims.
+    #[must_use]
+    pub fn paged_bytes(&self) -> u64 {
+        self.paged
+    }
+
     /// Fill the slots of `layer`'s `ids` the arena does not already hold:
     /// the misses' parts read with [`DirectFile::read_span`] into their
     /// slots' windows, split over the resident pool, the victims' pages
     /// returned (`MADV_DONTNEED` on the arena's own range only). A read
     /// that fails names its file, offset and errno; a slot whose fill
-    /// failed is freed, never lent half-filled.
+    /// failed is freed, never lent half-filled. An id the plan's host
+    /// segment holds is the mapping's and is skipped ([`NvTier::serves`]).
     pub fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
+        self.fill_missing(layer, ids)?;
+        if self.audit.get().is_some() {
+            self.audit_slots(layer, ids)?;
+        }
+        Ok(())
+    }
+
+    /// Turn the audit on, once: after every [`NvTier::ensure`] each slot it
+    /// answers for is compared with a fresh buffered read of the same file
+    /// range at the six sites of [`audit_offsets`] — a torn or zeroed span is
+    /// refused by name just before the compute reads it. Opens one buffered
+    /// handle per shard the arena reads; costs the sampled bytes per pick.
+    pub fn audit_on(&self) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::audit_on";
+        let mut files: Vec<(PathBuf, std::fs::File)> = Vec::new();
+        for arena in self.by_layer.iter().flatten() {
+            for f in &arena.files {
+                if files.iter().all(|(p, _)| p != f.path()) {
+                    let open = std::fs::File::open(f.path()).map_err(|e| {
+                        GpuError::shape(WHAT, format!("open {}: {e}", f.path().display()))
+                    })?;
+                    files.push((f.path().to_path_buf(), open));
+                }
+            }
+        }
+        self.audit
+            .set(files)
+            .map_err(|_| GpuError::state(WHAT, "an arena whose audit is off"))
+    }
+
+    /// The audit of `layer`'s `ids` ([`NvTier::audit_on`]): every id the
+    /// arena serves, each part, each site.
+    fn audit_slots(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::audit";
+        let (Some(files), Some(arena)) = (
+            self.audit.get(),
+            self.by_layer.get(layer).and_then(|l| l.as_ref()),
+        ) else {
+            return Err(GpuError::state(WHAT, "the layer's arena with the audit on"));
+        };
+        let mut fresh = vec![0u8; DIRECT_ALIGN];
+        for &id in ids.iter().filter(|&&id| !arena.host.contains(&id)) {
+            let slot = arena.filled(id).ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} expert {id}: unfilled after ensure"),
+                )
+            })?;
+            for part in 0..PARTS {
+                let r = arena.parts[id as usize][part];
+                let (at, len) = window_span(arena.slot_off(slot), &arena.windows, part, r);
+                let held = &self.map.bytes()[at..at + len];
+                let path = arena.files[part].path();
+                let (_, file) = files.iter().find(|(p, _)| p == path).ok_or_else(|| {
+                    GpuError::shape(
+                        WHAT,
+                        format!("{} was not opened for the audit", path.display()),
+                    )
+                })?;
+                for off in audit_offsets(r.at, r.len) {
+                    let n = DIRECT_ALIGN.min(r.len - off);
+                    file.read_exact_at(&mut fresh[..n], r.at + off as u64)
+                        .map_err(|e| {
+                            GpuError::shape(
+                                WHAT,
+                                format!("read {} at {}: {e}", path.display(), r.at + off as u64),
+                            )
+                        })?;
+                    if fresh[..n] != held[off..off + n] {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "layer {layer} expert {id} part {part}: the slot's {n} B at +{off} \
+                                 are not the file's at {}",
+                                r.at + off as u64
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The misses of `ids` read into their slots ([`NvTier::ensure`]).
+    fn fill_missing(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
             return Err(GpuError::state(WHAT, "the layer's arena"));
         };
-        let picks = {
+        let claim = {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            if books.seen.len() != arena.n_expert as usize {
-                books.seen.clear();
-                books.seen.resize(arena.n_expert as usize, false);
-            }
-            let mut picks = Vec::new();
-            for &id in ids {
-                let Some(at) = usize::try_from(id)
-                    .ok()
-                    .filter(|&i| i < arena.n_expert as usize)
-                else {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!(
-                            "layer {layer}: expert {id} is past the {} experts",
-                            arena.n_expert
-                        ),
-                    ));
-                };
-                if std::mem::replace(&mut books.seen[at], true) {
-                    continue;
-                }
-                let held = arena.of_id[at].load(Ordering::Relaxed);
-                if held != 0
-                    && arena.slots[(held - 1) as usize]
-                        .state
-                        .load(Ordering::Relaxed)
-                        == FILLED
-                {
-                    books.tick += 1;
-                    arena.slots[(held - 1) as usize]
-                        .tick
-                        .store(books.tick, Ordering::Relaxed);
-                    continue;
-                }
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                let slot = pick_slot(&arena.slots).ok_or(GpuError::state(
-                    WHAT,
-                    "every slot is filling: two ensures raced a layer",
-                ))?;
-                if arena.slots[slot].state.load(Ordering::Relaxed) == FILLED {
-                    let gone = arena.slots[slot].id.load(Ordering::Relaxed);
-                    arena.of_id[gone as usize].store(0, Ordering::Relaxed);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .resident_bytes
-                        .fetch_sub(arena.slot_bytes as u64, Ordering::Relaxed);
-                    self.map
-                        .dontneed(slot * arena.slot_bytes, arena.slot_bytes)
-                        .map_err(|e| GpuError::plan(WHAT, e))?;
-                }
-                arena.slots[slot].state.store(FILLING, Ordering::Relaxed);
-                arena.slots[slot].id.store(id, Ordering::Relaxed);
-                arena.of_id[at].store(slot as u32 + 1, Ordering::Relaxed);
-                picks.push(Pick { slot, id });
-            }
-            picks
+            claim_slots(arena, &mut books, ids).map_err(|e| GpuError::shape(WHAT, e))?
         };
+        self.stats.misses.fetch_add(claim.misses, Ordering::Relaxed);
+        for &slot in &claim.evicted {
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .resident_bytes
+                .fetch_sub(arena.slot_bytes as u64, Ordering::Relaxed);
+            self.map
+                .dontneed(arena.slot_off(slot), arena.slot_bytes)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+        let picks = claim.picks;
         if picks.is_empty() {
             return Ok(());
         }
@@ -634,7 +853,7 @@ impl NvTier {
                         std::slice::from_raw_parts_mut(
                             self.shared
                                 .0
-                                .add(p.slot * arena.slot_bytes + arena.windows[part]),
+                                .add(arena.slot_off(p.slot) + arena.windows[part]),
                             span,
                         )
                     };
@@ -688,17 +907,9 @@ impl TierSlots for NvTier {
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
         let arena = self.by_layer.get(layer)?.as_ref()?;
         let part = *arena.part_of.get()?.get(part)?;
-        let slot = arena.of_id.get(id as usize)?.load(Ordering::Relaxed);
-        if slot == 0
-            || arena.slots[(slot - 1) as usize]
-                .state
-                .load(Ordering::Relaxed)
-                != FILLED
-        {
-            return None;
-        }
+        let slot = arena.filled(id)?;
         let r = arena.parts[id as usize][part];
-        let (at, len) = window_span(arena.slot_bytes, &arena.windows, slot as usize - 1, part, r);
+        let (at, len) = window_span(arena.slot_off(slot), &arena.windows, part, r);
         Some(&self.map.bytes()[at..at + len])
     }
 }
@@ -706,8 +917,8 @@ impl TierSlots for NvTier {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILLED, FILLING, FREE, PARTS, PartRange, SlotBook, pick_slot, slots_of, window_bytes,
-        window_span,
+        FILLED, FILLING, FREE, PARTS, PartRange, SlotBook, advice_disjoint, audit_offsets,
+        layer_bases, pick_slot, slots_of, window_bytes, window_span,
     };
     use engram::direct::{DIRECT_ALIGN, aligned_span};
     use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -780,6 +991,124 @@ mod tests {
         assert_eq!(pick_slot(&[]), None, "no slots at all");
     }
 
+    /// Disjoint arena and mapping ranges pass; an arena range that names a
+    /// model page — the mutant — does not.
+    #[test]
+    fn the_arena_never_advises_the_model_mapping() {
+        let model = [(0x1000_0000, 0x2000_0000), (0x3000_0000, 0x4000_0000)];
+        assert!(advice_disjoint(
+            &[(0x0000_1000, 0x1000_0000), (0x2000_0000, 0x3000_0000)],
+            &model
+        ));
+        assert!(!advice_disjoint(&[(0x1800_0000, 0x2800_0000)], &model));
+        assert!(!advice_disjoint(&[(0x0, 0x9000_0000)], &model));
+        assert!(advice_disjoint(&[(0x2000_0000, 0x3000_0000)], &model));
+    }
+
+    /// The audit's sites touch the span's two edge pages, its own ends and
+    /// a middle page: whatever a torn fill leaves, one site reads it.
+    #[test]
+    fn audit_sites_cover_both_edge_pages_and_the_middle() {
+        let page = DIRECT_ALIGN;
+        for (at, len) in [(0, page), (7 * page + 13, 3 * page), (page + 1, 2 * page)] {
+            let sites = audit_offsets(at as u64, len);
+            assert!(sites.iter().all(|&s| s < len), "{at}+{len}: {sites:?}");
+            assert!(sites.contains(&0) && sites.contains(&(len - 1)));
+            assert!(sites.iter().any(|&s| s < page), "{at}+{len}: {sites:?}");
+            assert!(
+                sites.iter().any(|&s| s + page >= len),
+                "{at}+{len}: {sites:?}"
+            );
+        }
+    }
+
+    /// A one-layer arena of `slots` slots over `n_expert` experts and no host
+    /// segment, its three files one scratch file the books never read.
+    fn arena_of(n_expert: u32, slots: usize) -> super::LayerArena {
+        let path = std::env::temp_dir().join(format!("nvtier-books-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 16]).unwrap();
+        let file = std::sync::Arc::new(engram::direct::DirectFile::open_buffered(&path).unwrap());
+        let part = PartRange {
+            at: 0,
+            len: 1,
+            skew: 0,
+        };
+        super::LayerArena {
+            host: 0..0,
+            n_expert,
+            windows: [0; PARTS],
+            slot_bytes: DIRECT_ALIGN,
+            base: 0,
+            part_of: std::sync::OnceLock::new(),
+            files: [file.clone(), file.clone(), file],
+            names: Default::default(),
+            parts: vec![[part; PARTS]; n_expert as usize],
+            of_id: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
+            slots: (0..slots).map(|_| book(FREE, 0)).collect(),
+        }
+    }
+
+    /// Mark what a call claimed as filled, as the fill's join does.
+    fn fill_claimed(arena: &super::LayerArena, books: &mut super::Books, c: &super::Claim) {
+        for p in &c.picks {
+            books.tick += 1;
+            arena.slots[p.slot]
+                .tick
+                .store(books.tick, std::sync::atomic::Ordering::Relaxed);
+            arena.slots[p.slot]
+                .state
+                .store(FILLED, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Two calls on one layer with an eviction between them: the second
+    /// refills the evicted id and its slot reads filled. A `seen` mark that
+    /// outlived the first call would skip it and leave the slot unfilled.
+    #[test]
+    fn an_evicted_id_is_refilled_by_a_later_call() {
+        let arena = arena_of(4, 2);
+        let mut books = super::Books {
+            tick: 0,
+            seen: Vec::new(),
+        };
+        let first = super::claim_slots(&arena, &mut books, &[0, 1]).unwrap();
+        assert_eq!((first.picks.len(), first.misses), (2, 2));
+        fill_claimed(&arena, &mut books, &first);
+        // Expert 2 takes the slot of the least recently used, expert 0.
+        let evict = super::claim_slots(&arena, &mut books, &[2]).unwrap();
+        assert_eq!(evict.evicted.len(), 1);
+        fill_claimed(&arena, &mut books, &evict);
+        assert!(arena.filled(0).is_none(), "expert 0 was evicted");
+        // The call that needs expert 0 again claims a slot for it.
+        let again = super::claim_slots(&arena, &mut books, &[0]).unwrap();
+        assert_eq!(again.picks.len(), 1, "an evicted id is refilled");
+        fill_claimed(&arena, &mut books, &again);
+        assert!(arena.filled(0).is_some(), "its slot reads filled");
+    }
+
+    /// Layers' slots sit one after the other in the mapping: no two layers'
+    /// slot ranges overlap and the last ends at `count × Σ slot sizes`.
+    #[test]
+    fn layers_slots_never_overlap() {
+        let sizes = [24_576usize, 28_672, 24_576];
+        let count = 5;
+        let bases = layer_bases(count, &sizes);
+        let ranges: Vec<(usize, usize)> = bases
+            .iter()
+            .zip(sizes)
+            .map(|(&b, s)| (b, b + count * s))
+            .collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(a.1 <= b.0 || b.1 <= a.0, "{a:?} overlaps {b:?}");
+            }
+        }
+        assert_eq!(
+            ranges.last().map(|r| r.1),
+            Some(count * sizes.iter().sum::<usize>())
+        );
+    }
+
     /// A slot's part windows sit at their own aligned bases, one part never
     /// crossing the next, and the logical bytes at the skew inside the
     /// window the fill wrote.
@@ -803,7 +1132,7 @@ mod tests {
                     len: lens[p],
                     skew: a - 1,
                 };
-                let (at, len) = window_span(slot_bytes, &windows, slot, p, r);
+                let (at, len) = window_span(slot * slot_bytes, &windows, p, r);
                 assert_eq!(at % a, r.skew % a + (windows[p] % a));
                 assert_eq!(len, lens[p]);
                 assert!(

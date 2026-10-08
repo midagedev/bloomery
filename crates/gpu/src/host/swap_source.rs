@@ -38,7 +38,7 @@
 //! ([`crate::model::GpuModel::load_placed_with`]).
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cuda_core::{CudaContext, CudaStream, sys};
@@ -50,6 +50,7 @@ use model::r8file::R8Pair;
 use runtime::swaprule::KeptRows;
 
 use super::HostExperts;
+use super::nvtier::NvTier;
 use super::swap::{
     BoundaryAt, MachineCfg, PassReport, Piece, ResetReport, Residency, SwapSource, Transform,
 };
@@ -463,6 +464,11 @@ fn one_layout(first: usize, layers: &[Option<LayerParts>]) -> Result<(), GpuErro
 /// place in the layer's stage stack, with the load's host set saying what the
 /// host can serve.
 pub struct FileSwap {
+    /// The NVMe expert tier's arena, on a paged plan, attached by the body
+    /// once it built the tier ([`FileSwap::attach_tier`]): the residency
+    /// seam answers for the ids the arena serves from its books. Unset on a
+    /// resident plan, and for every id the mapping serves.
+    tier: OnceLock<Arc<NvTier>>,
     pair: R8Pair,
     set: HostSet,
     experts: u64,
@@ -479,7 +485,8 @@ pub struct FileSwap {
 // staging thread reads (`source`, `prepare_victim`) is the split's and the
 // sidecar's read-only mappings and the set.
 unsafe impl Send for FileSwap {}
-// SAFETY: as for `Send`: no call mutates shared state.
+// SAFETY: as for `Send`: no call mutates shared state, the tier cell is set once
+// at load before the machine starts, and the arena is `Sync` by its own contract.
 unsafe impl Sync for FileSwap {}
 
 impl FileSwap {
@@ -564,6 +571,7 @@ impl FileSwap {
             one_layout(layers.start, &out)?;
         }
         Ok(FileSwap {
+            tier: OnceLock::new(),
             pair,
             set,
             experts,
@@ -571,6 +579,20 @@ impl FileSwap {
             layers: out,
             convert,
         })
+    }
+
+    /// Give the source the NVMe expert tier's arena the body built for the
+    /// plan's paged layers. Load-time only, before the machine starts and
+    /// once: a second attach is refused by name.
+    pub fn attach_tier(&self, tier: &Arc<NvTier>) -> Result<(), GpuError> {
+        self.tier
+            .set(Arc::clone(tier))
+            .map_err(|_| GpuError::state("FileSwap::attach_tier", "a source with no tier yet"))
+    }
+
+    /// The arena, when it serves layer `layer`'s expert `id` ([`NvTier::serves`]).
+    fn tier_serving(&self, layer: usize, id: u32) -> Option<&Arc<NvTier>> {
+        self.tier.get().filter(|t| t.serves(layer, id))
     }
 
     /// Whether the load converts a staged part on the card before it goes
@@ -724,6 +746,11 @@ impl SwapSource for FileSwap {
 
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "FileSwap::prepare_victim";
+        // A victim the arena serves fills its slot, never the page cache:
+        // the tier's own read, on this thread, inside the deadline.
+        if let Some(tier) = self.tier_serving(layer, id) {
+            return tier.ensure(layer, &[id]);
+        }
         let parts = self.layer(layer, WHAT)?.parts.len();
         for part in 0..parts {
             let (file, at) = self.run(layer, id, part, WHAT)?;
@@ -736,6 +763,11 @@ impl SwapSource for FileSwap {
 
     fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError> {
         const WHAT: &str = "FileSwap::host_resident";
+        // The arena's books are the answer for an id it serves — never
+        // mincore, never the page cache's residency.
+        if let Some(tier) = self.tier_serving(layer, id) {
+            return Ok(tier.slot_filled(layer, id));
+        }
         let parts = self.layer(layer, WHAT)?.parts.len();
         for part in 0..parts {
             let (file, at) = self.run(layer, id, part, WHAT)?;
@@ -823,6 +855,16 @@ impl ResidencyGlue {
     #[must_use]
     pub fn source(&self) -> Option<&FileSwap> {
         self.source.as_deref()
+    }
+
+    /// Give the machine's source the NVMe expert tier's arena, when the
+    /// load runs a machine and built a tier ([`FileSwap::attach_tier`]);
+    /// nothing otherwise. Load-time only, before [`ResidencyGlue::start`].
+    pub fn attach_tier(&self, tier: Option<&Arc<NvTier>>) -> Result<(), GpuError> {
+        match (&self.source, tier) {
+            (Some(source), Some(tier)) => source.attach_tier(tier),
+            _ => Ok(()),
+        }
     }
 
     /// Run the machine over `tier`'s slot map

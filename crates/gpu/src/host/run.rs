@@ -16,12 +16,7 @@ use model::{Tensor2, Tensor2View};
 use super::HostExperts;
 use crate::GpuError;
 
-/// The NVMe expert tier's RAM arena, declared here until the host module's
-/// own list is free to hold it: one owner, the file at its side.
-#[path = "nvtier.rs"]
-pub(crate) mod nvtier;
-
-pub use nvtier::{NvTier, NvTierStats};
+use super::nvtier::NvTier;
 
 /// The widths a host call serves: the model width, the routed experts'
 /// feed-forward width and the routed slots a token.
@@ -106,7 +101,7 @@ impl HostRun {
     }
 
     /// The run's NVMe expert tier, when the plan built one; the counters a
-    /// caller reads ([`nvtier::NvTier::stats`]).
+    /// caller reads ([`NvTier::stats`]).
     #[must_use]
     pub fn tier(&self) -> Option<&Arc<NvTier>> {
         self.tier.as_ref()
