@@ -42,8 +42,8 @@ use super::hparams::{Hparams, Variant};
 use super::place;
 use super::spec as qspec;
 use crate::fixture::{
-    Budget, CardBudget, CardExperts, DraftRules, DraftSpec, Family, FixtureError, FixtureSpec,
-    KeyRule, Kvs, Tables, Window, int_like, items, meta, unsigned,
+    Budget, CardBudget, CardExperts, DEFAULT_SHARD_BYTES, DraftRules, DraftSpec, Family,
+    FixtureError, FixtureSpec, KeyRule, Kvs, Tables, Window, int_like, items, meta, unsigned,
 };
 use crate::placement::PlanLevers;
 use crate::placement::workstation::RTX_3090;
@@ -116,6 +116,7 @@ pub fn spec() -> FixtureSpec {
         }),
         window: Window::new(D_MIN, D_MAX).expect("[2^-14, 2^-6] is inside the normal f16 values"),
         ff: None,
+        shard_bytes: DEFAULT_SHARD_BYTES,
         default_source,
         draft: Some(DraftSpec {
             arch: TARGET_ARCH,
@@ -123,6 +124,7 @@ pub fn spec() -> FixtureSpec {
             default_source: default_mtp_source,
             rules: &QwenMtp,
         }),
+        sidecar: None,
         family: &Qwen38,
     }
 }
@@ -594,7 +596,13 @@ impl DraftRules for QwenMtp {
     /// The real draft's metadata with `block_count` moved to the fixture's
     /// own MTP index and `attention.compress_ratios` to the mapped layers'
     /// pools plus the MTP layer's own.
-    fn kvs(&self, draft: &Split, n_source: usize, n_fixture: usize) -> Result<Kvs, FixtureError> {
+    fn kvs(
+        &self,
+        draft: &Split,
+        n_source: usize,
+        n_fixture: usize,
+        _ff: Option<(u64, u64)>,
+    ) -> Result<Kvs, FixtureError> {
         let map = self.map();
         if n_fixture != map.len() || map.iter().any(|&l| l >= n_source) {
             return Err(FixtureError::Mismatch {
