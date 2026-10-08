@@ -1,0 +1,66 @@
+# Round pickrule (2026-10-09): the Qwen3.8 prompt call's pick as one walk (runtime::xsplit::admit_walk) that prices
+# a pick's copies at the rate they get beside the host union and stops where the card's chain meets the union, the
+# card's tail priced per card pick (body38.rs XSTREAM_TAIL_US_PER_CARD_COL, 0.125 us on the unit's picks before the
+# pick), against v0.2.7's rule (the stream floor and its m_min fallback). The pickrule branch on 782dc6af against a
+# v0.2.7 build (the tag's tree is 782dc6af's): the two builds differ only in the pick.
+#
+# Decomposition [derived]:
+# - The triple (worker2, 2026-10-08, generate_qwen3moe, A6000, plan a, UD-Q4_K_XL, draft off, first prompt after a
+#   load, specs pickrule-impl/triple-report.md): pp4096 under v0.2.7's rule 3,112.8 ms (5,805 admits); the walk with
+#   the flat tail 2,691.0 / 2,735.7 ms (3,180 / 3,183 admits), -399 ms mean. pp512: v0.2.7's rule 480.9 ms (every
+#   pick fell back to the floor, 989 admits); the walk with the flat tail 537.7 / 539.5 ms (383 admits) — the blocker
+#   this round's tail closes.
+# - The per-card-pick tail (pickrule-redesign; walk_port.py over the triple's records, at 0.125 on the count wired):
+#   admits 3,263..3,311 at 4096 and 918..975 at 512 (the 989 class; the pick's victim guard may trim toward ~550,
+#   the victims' counts being the named unknown); walls 2,665..2,731 ms at 4096 and 480..526 ms at 512.
+# - Lever 3 (in both builds since 0.2.7, ~0.22 s off pp4096) runs in the layer's front (wide38.rs `front`: the layer
+#   up to its router), before the shadow window the walk balances against the union (the shared expert, the pick,
+#   the card route): both arms keep the whole cut, and the term is 0.
+# - pp4096 (the term): base 2,947 ms (rig-log 2026-10-08#rel027-ab, 1,390 tok/s, draft on); change the triple's
+#   -399 ms (-422 / -377 against its one control) plus the tail's co-term against the flat-tail walk, -80..+30 ms
+#   (the port's walls on the post-pick count; on the count wired the walk admits ~3 % more, where the 4096 stop is
+#   flat): -490..-350 ms, pp tok/s +13.5..+19.9 %.
+# - pp512 (read beside, a no-loss condition): base 513 ms (998 tok/s); change -1..+45 ms (the port's 480..526 against
+#   the fallback class 480.8: 0 at the 989 class, +45 where the guard trims toward 550); lever 3 is 0 below position
+#   2,048. pp tok/s -8.1..+0.2 %: the derivation cannot exclude a loss, so the window measures it.
+#
+# Resource timeline per 4096 prompt layer [derived, the triple's records]: after the front, the card's shadow ~20.8 ms
+# (the shared expert, the admits' copies at 13.8 GB/s beside the union, the ~4.8 ms tail); the host union ~18.9 ms on
+# the pool; PCIe the admits' copies (~3.1 MB each, ~69 a layer under the walk); host DRAM the union's reads; NVMe 0
+# (plan a holds every routed expert in RAM). A layer's wall is the front, then max(shadow, union), then the back; the
+# walk moves work from the union to the card until the two meet.
+#
+# Runner (the pickrule tree on the box, a v0.2.7 build as the base; the full output to a file first):
+#   BLOOMERY_REMOTE='~/repo/bloomery-pickrule' BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=4
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pickrule-ab.card BLOOMERY_GEN_CTX=4352' just depth-gpu-qwen4exp
+#     bin:/root/repo/bloomery-v027/target/release/generate_qwen3moe:prose:512
+#     bin:/root/repo/bloomery-v027/target/release/generate_qwen3moe:prose:4096
+#     prose:512 prose:4096
+# The base: the worktree /Users/hckim/repo/bloomery-v027 at the tag v0.2.7 (782dc6af), built on the box first:
+#   BLOOMERY_REMOTE='~/repo/bloomery-v027' tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates
+#   --features gpu --release --bin generate_qwen3moe'
+# Wall [derived], two parts each under 30 min: (1) the two generate_qwen3moe builds, 4..8 min each, side by side;
+# (2) the arms, 4 x 4 rounds of a fresh Qwen3.8 load (~40 s each, rel027-ab's) plus the preheat and the witness
+# blocks, 13..17 min.
+kind: ab
+question: does the prompt call's walk with the per-card-pick tail make a 4,096-token Qwen3.8 prompt faster than
+  v0.2.7's rule on the A6000 at the defaults, with the 512-token prompt no slower?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, plan a, UD-Q4_K_XL, the MTP draft at its default (on), levers unset,
+  one stream, the pickrule build against a v0.2.7 build, same lease, rounds rotated: (pickrule - v0.2.7) / v0.2.7
+unit: %
+predict: +13..+20
+rounds: 4
+condition: one runner invocation from the pickrule tree, every arm a fresh load, the order rotated each round; both
+  builds' load lines read plan a with the same card experts a layer; no FAIL row, no [cold], [cpu-busy] or
+  [other-busy] row among the counted rounds; the pp512 pair's ratio (pickrule / v0.2.7, tok/s) at or above 0.99,
+  the no-loss condition read beside the term; each load line's xstream_lane_gbs recorded as a witness, no gate
+  (the plan's admits move under 2 % over lane 19.0..21.4); the full output to a file first
+decide-in: pickrule rides the 0.2.8 train; its pp512 and pp4096 rows go to the release pass with the train's other
+  pieces
+decide-below: under +13 %, or the pp512 pair under 0.99: one functional BLOOMERY_STEP_STATS=1 pair (both builds,
+  prose 512 and 4096) reads each pick's admitted=, floor= and backlog= and each layer's card_shadow - staged_us; at
+  512 an admit count under the 989 class names the victim guard's trim (keep the floor where the walk admits under
+  it), at 4096 each layer's card_shadow against union_ms names the copies' rate (the triple's 13.8 GB/s beside the
+  union); pickrule stays off the train until that read
+decide-above: past +20 %: check both arms' plan lines (card experts a layer) and draft lines first, then read the
+  base's plan and pick lines against the triple's control (5,805 admits) before the row is written
