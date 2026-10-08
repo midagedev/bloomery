@@ -1739,6 +1739,11 @@ mod tests {
         assert_eq!(t.widths, widths);
         assert_eq!(t.kept, kept);
         assert!(t.widths[0] > 0 && t.windows > 0, "{t:?}");
+        assert_eq!(
+            t.windows,
+            t.widths.iter().skip(1).sum::<u64>(),
+            "a window is a pass of a width above the plain step: {t:?}"
+        );
     }
 
     /// After the warm-up a probe runs the width read longest ago once every

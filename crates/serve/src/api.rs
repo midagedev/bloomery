@@ -2857,6 +2857,7 @@ mod tests {
         after_accept_error, carries_media, check_slots, content_text, engine_object, id_half,
         shutdown_allowed,
     };
+    use crate::engine::{DeviceProps, PlacementProps};
     use serde_json::{Value, json};
     use std::io;
     use std::net::SocketAddr;
@@ -2953,6 +2954,50 @@ mod tests {
         assert_eq!(with["ctx_verified"], 3001, "{with}");
         let without = engine_object(&EngineProps::default());
         assert!(without.get("ctx_verified").is_none(), "{without}");
+    }
+
+    /// Each device's `bytes` is the sum of its classes, a device with none
+    /// sums to 0, and the classes and the cards' KV bytes stand beside it:
+    /// the one place the `/props` placement renders its totals.
+    #[test]
+    fn placement_bytes_are_the_class_sums() {
+        let device = |name: &str, classes: &[(&str, u64)]| DeviceProps {
+            device: name.to_owned(),
+            class_bytes: classes.iter().map(|&(k, b)| (k.to_owned(), b)).collect(),
+            ..DeviceProps::default()
+        };
+        let engine = engine_object(&EngineProps {
+            placement: Some(PlacementProps {
+                devices: vec![
+                    device("GPU0", &[("dense", 7), ("experts", 30), ("kv", 5)]),
+                    device("CPU", &[("experts", 100)]),
+                    device("GPU1", &[]),
+                ],
+                vram_kv_bytes: Some(5),
+            }),
+            ..EngineProps::default()
+        });
+        let devices = engine["placement"]["devices"].as_array().expect("devices");
+        let bytes: Vec<(&str, u64)> = devices
+            .iter()
+            .map(|d| {
+                (
+                    d["device"].as_str().expect("a name"),
+                    d["bytes"].as_u64().expect("bytes"),
+                )
+            })
+            .collect();
+        assert_eq!(bytes, [("GPU0", 42), ("CPU", 100), ("GPU1", 0)], "{engine}");
+        assert_eq!(
+            devices[0]["classes"],
+            json!({"dense": 7, "experts": 30, "kv": 5})
+        );
+        assert_eq!(engine["placement"]["vram_kv_bytes"], 5);
+        assert!(
+            engine_object(&EngineProps::default())
+                .get("placement")
+                .is_none()
+        );
     }
 
     /// A failed `accept` ends the server only when the listener no longer

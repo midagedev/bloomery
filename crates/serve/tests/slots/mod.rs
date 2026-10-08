@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use serve::{
     CacheNote, Drafted, Engine, EngineError, FATAL_LINGER, MockEngine, MockTokenizer, Park,
-    QUANTUM, SavedState, ServeError, Server, ServerConfig, SlotConfig, SlotRow, StateError,
-    SwapEngine, Tokenizer,
+    QUANTUM, SavedState, ServeError, Server, ServerConfig, SlotConfig, SlotPass, SlotRow,
+    StateError, SwapEngine, Tokenizer,
 };
 
 use super::common::{V41_TEMPLATE, call, get, post};
@@ -510,7 +510,9 @@ fn hw_slots_an_engine_does_not_declare_are_refused() {
 /// the engine thread until the other has queued and both run together. Every
 /// `select_slot`, `next` and `advance` it takes goes into `calls` in order —
 /// the engine thread's single order, the deterministic record of which slot
-/// each drafted pass ran on.
+/// each drafted pass ran on — and every `advance_slots` call with its row
+/// count (`(rows, 'w')`), the record of how many drafted passes a round put
+/// in one call.
 struct DraftGated {
     inner: Box<dyn Engine>,
     log: Arc<EntryLog>,
@@ -536,6 +538,17 @@ impl Engine for DraftGated {
     }
     fn advance_rows(&self) -> usize {
         self.inner.advance_rows()
+    }
+    /// The round's width into `calls`, then the rows as the default runs them
+    /// — a select and an `advance` each, through this engine, so those calls
+    /// are logged too.
+    fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
+        self.calls.lock().expect("calls").push((rows.len(), 'w'));
+        for row in rows {
+            self.select_slot(row.slot)?;
+            row.drafted = self.advance(row.last, row.out)?;
+        }
+        Ok(())
     }
     fn slots(&self) -> usize {
         self.inner.slots()
@@ -852,6 +865,69 @@ fn hw_drafted_passes_interleave_across_slots() {
     assert!(
         per > 1.0,
         "the requests never ran one round together: {per}"
+    );
+}
+
+/// A round of two drafted requests is one `advance_slots` call carrying both
+/// rows, not a call a row: while both run, the drafted passes the engine takes
+/// come in calls of two rows, and never in calls of more rows than slots. The
+/// mock keeps one id on every third pass of a slot and two on the others, so
+/// 40 ids take about 24 passes a request, and every round but the head's and
+/// the tail's carries both: the bound of ten is under half of them.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_drafted_round_is_one_advance_slots_call_of_every_running_slot() {
+    const N: usize = 40;
+    let log = Arc::new(EntryLog::default());
+    let calls: Arc<Mutex<Vec<(usize, char)>>> = Arc::new(Mutex::new(Vec::new()));
+    let addr = start_n(
+        Box::new(DraftGated {
+            inner: Box::new(serve::DraftMock::new(4096).with_slots(2)),
+            log: Arc::clone(&log),
+            calls: Arc::clone(&calls),
+        }),
+        2,
+        None,
+        None,
+    );
+    // Greedy and unbanned, as the interleave gate's: both requests pass.
+    let body = |p: &str| {
+        json!({"prompt": p, "n_predict": N, "temperature": 0, "cache_prompt": false,
+               "return_tokens": true})
+    };
+    let a = post_bg(addr, body(PROMPTS[0]));
+    assert!(
+        log.len_reached(1, BOUND),
+        "the first prompt never reached the engine"
+    );
+    let b = post_bg(addr, body(PROMPTS[1]));
+    wait_deferred(addr, 1, BOUND);
+    log.release();
+    for r in [a.join().expect("first"), b.join().expect("second")] {
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.json()["timings"]["draft_n"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "a request that never drafted: {}",
+            r.body
+        );
+    }
+    let widths: Vec<usize> = calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter(|(_, what)| *what == 'w')
+        .map(|(rows, _)| *rows)
+        .collect();
+    let both = widths.iter().filter(|&&w| w == 2).count();
+    assert!(
+        both >= 10,
+        "fewer than ten rounds put both slots' passes in one call: {widths:?}"
+    );
+    assert!(
+        widths.iter().all(|&w| w <= 2),
+        "a call of more rows than the engine has slots: {widths:?}"
     );
 }
 
