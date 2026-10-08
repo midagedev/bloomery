@@ -59,17 +59,27 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen38_open.rs"]
+#[allow(
+    dead_code,
+    reason = "the e2e gate prints and reads the plan's whole facts; this gate prints the counts and the context"
+)]
+mod qwen38_open;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::collections::BTreeMap;
     use std::fs::File;
     use std::os::unix::fs::FileExt;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Instant;
 
-    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model};
-    use bloomery_gpu::model::StepMode;
+    use crate::qwen38_open::Open38;
+
+    use bloomery_gpu::arch::qwen3moe::{Prompt38, Qwen38Model};
+    use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::{GgmlType, Split};
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
@@ -581,42 +591,36 @@ mod gate {
     /// and the host beyond it (`Experts::Card`), under the plan's own machine: the e2e gate's open.
     fn open() -> Result<Qwen38Model, GateError> {
         let levers = bloomery_levers::at_main(&[])?;
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        if file.architecture() != Some("qwen4exp") {
-            return Err(format!("{MODEL} is {:?}, not qwen4exp", file.architecture()).into());
-        }
+        let file = crate::qwen38_open::open_split(Path::new(MODEL))?;
         let t = Instant::now();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let inputs = PlanInputs::describe(&file)?;
-        let machine = machine_for_experts(
-            crate::gate_card::card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-            Experts::Card,
-        );
-        let plan = inputs.plan_with_slots(
-            &machine,
-            CTX as u64,
-            &PlanLevers::default(),
-            Experts::Card,
-            1,
-        )?;
+        let card = crate::gate_card::card()?;
+        let plan_levers = PlanLevers::default();
+        let planned = Open38 {
+            card,
+            ctx: CTX,
+            ub,
+            experts: Experts::Card,
+            slots: 1,
+            plan_levers: &plan_levers,
+            host: levers.host(),
+            room: None,
+            residency: Residency::Off,
+        }
+        .plan(file)?;
+        let p = planned.facts();
         println!(
             "plan card={} host_experts={} card_experts={} ctx_max={} ubatch={ub}",
-            crate::gate_card::card()?.name,
-            plan.host.experts,
-            plan.cards[0].experts,
-            plan.ctx_max
+            card.name, p.host_experts, p.card_experts, p.ctx_max
         );
-        let mut m = Body38::open_placed_slots(file, &plan, &inputs, 0, levers.host(), ub, 1)?;
-        m.set_mode(StepMode::Graph);
+        let o = planned.open()?;
         println!(
             "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
-            m.resident_bytes(),
-            m.layers().len(),
+            o.model.resident_bytes(),
+            o.model.layers().len(),
             t.elapsed().as_secs_f64()
         );
-        Ok(m)
+        Ok(o.model)
     }
 
     /// `ids` and `logits` as little-endian words, the dump the parent compares.
