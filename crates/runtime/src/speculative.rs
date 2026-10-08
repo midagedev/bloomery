@@ -130,6 +130,16 @@ pub trait Draft<T: Verify> {
     fn held(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error> {
         self.stepped(t, last, next)
     }
+
+    /// The pass about to run is a plain step of `last` at the target's
+    /// position with no proposal: a draft whose waiting rows read the arena
+    /// the step overwrites walks them now, before it runs. The width
+    /// chooser's held pass reaches the target's step without a proposal of
+    /// the draft's ([`Draft::held`]) and calls this first; a draft that
+    /// keeps nothing waiting does nothing.
+    fn before_plain(&mut self, _t: &mut T, _last: u32) -> Result<(), T::Error> {
+        Ok(())
+    }
 }
 
 /// The verify widths of a pass of at most `M` rows: 2 to `M`, the rows of a

@@ -51,9 +51,11 @@
 //! the mean nor the gate.
 //!
 //! The draft proposes its whole width whenever it proposes, and the pass
-//! verifies the front `k` ids. While closed, a plain pass asks nothing of
-//! the draft — it hears the position through [`Draft::held`] — but every
-//! [`Rule::shadow_every`]th: that proposal runs as a shadow, scored against
+//! verifies the front `k` ids. While closed, a plain pass asks the draft one
+//! thing — to walk the rows waiting for its next walk before its step
+//! overwrites their arena ([`Draft::before_plain`]) — and hears the position
+//! through [`Draft::held`], but every [`Rule::shadow_every`]th: that
+//! proposal runs as a shadow, scored against
 //! the target's own next tokens and never verified, keeping the calibration
 //! current so the chooser can open again. A proposal no row of which a pass
 //! verifies (a shadow, a cut to 0) is [`Draft::unproposed`].
@@ -334,10 +336,11 @@ fn expected(a: &[f64], k: usize) -> f64 {
 enum Kind {
     /// A verify of a proposal: a reading of that width's cost.
     Verify,
-    /// A plain step the draft walked nothing for: a reading of the step's.
+    /// A plain step: a reading of the step's, its wall holding at most the
+    /// draft's walk of the rows that waited for it ([`Draft::before_plain`]).
     Step,
     /// A plain step after the draft's proposal (a shadow, a cut to 0): its
-    /// wall holds the draft's walk, no reading.
+    /// wall holds the draft's whole chain, no reading.
     Walked,
 }
 
@@ -914,7 +917,8 @@ where
     /// One pass's proposal (the module): a turn that does not read the
     /// proposal first — a shadow in flight, the warm-up's rotation or a
     /// width's readings started over, a probe — then while closed a plain
-    /// step or a shadow, else the draft's own
+    /// step (the draft's waiting rows walked first, [`Draft::before_plain`])
+    /// or a shadow, else the draft's own
     /// proposal with its probabilities, the gate decided on the mean they
     /// move, and the front ids of the window's width ([`Choosing::cut`]) as
     /// the pass's rows.
@@ -929,6 +933,7 @@ where
         self.since_probe = self.since_probe.saturating_add(1);
         let room = out.len().min(D::WIDTH);
         if self.shadow.n > 0 {
+            self.draft.before_plain(t, last)?;
             return Ok(self.plain(Kind::Step, pos, at));
         }
         let closed = self.width == 0;
@@ -957,6 +962,7 @@ where
                 self.since_shadow >= self.rule.shadow_every
             };
             if !shadow {
+                self.draft.before_plain(t, last)?;
                 return Ok(self.plain(Kind::Step, pos, at));
             }
             self.since_shadow = 0;
@@ -1082,6 +1088,7 @@ mod tests {
         proposals: u64,
         held: u64,
         unproposed: u64,
+        plains: u64,
         /// Proposals waiting for their accept: one a proposal, dropped by
         /// `unproposed`.
         open: u64,
@@ -1099,6 +1106,7 @@ mod tests {
                 proposals: 0,
                 held: 0,
                 unproposed: 0,
+                plains: 0,
                 open: 0,
             }
         }
@@ -1195,6 +1203,17 @@ mod tests {
         fn held(&mut self, _t: &mut Mock, _last: u32, _next: u32) -> Result<(), MockError> {
             self.queued += 1;
             self.held += 1;
+            Ok(())
+        }
+
+        fn before_plain(&mut self, t: &mut Mock, _last: u32) -> Result<(), MockError> {
+            self.flush();
+            assert_eq!(
+                self.at,
+                t.pos(),
+                "the waiting rows were not walked before the step"
+            );
+            self.plains += 1;
             Ok(())
         }
     }
@@ -1653,6 +1672,42 @@ mod tests {
         assert!(d.held > 200, "the closed passes were not held: {}", d.held);
         let g = r.choosing().gains()[0];
         assert!(g < 0.9, "the calibration did not follow the shadows: {g}");
+    }
+
+    /// A plain pass the chooser holds back walks the draft's waiting rows
+    /// before its step — the draft's own check (`before_plain` seeing the
+    /// target at the pass's position) — and nothing else does: a pass that
+    /// verifies, and a plain pass whose proposal already ran (a shadow, a
+    /// cut to 0), hook nothing. Every width-0 pass is one or the other, so
+    /// over a run that closes and shadows the hook ran exactly on the held
+    /// passes.
+    #[test]
+    fn a_held_pass_hooks_the_draft_before_its_step() {
+        let mut r = Rig::with(
+            [0.40, 0.20, 0.10],
+            [0.6, 0.5, 0.4],
+            &[71_000, 95_000, 118_000],
+            Mode::Cost,
+            Rule {
+                shadow_every: 4,
+                ..Rule::DEFAULT
+            },
+        );
+        r.run(400);
+        assert_eq!(r.choosing().width(), 0, "the losing draft did not close");
+        let (plains, unproposed, held) = {
+            let d = r.spec.draft().draft();
+            (d.plains, d.unproposed, d.held)
+        };
+        let t = r.choosing().take_tally();
+        assert!(plains > 0, "no held pass hooked the draft");
+        assert!(unproposed > 0, "no shadow ran");
+        assert_eq!(
+            t.widths[0],
+            plains + unproposed,
+            "the hook ran on a pass that verifies, or a plain pass missed it: {t:?}"
+        );
+        assert_eq!(held, t.widths[0], "a plain pass the draft did not hear of");
     }
 
     /// Every pass is counted once, whatever ran it — a verify, a plain step,
