@@ -152,13 +152,20 @@
 #
 # Per item: stdout+stderr to DIR/g-<recipe>[-<n>].log (n for the n-th repeat of a recipe; each try
 # appends under a `=== try` header). rc 75 (lock contention) retries after 30 s, up to 10 times; any
-# other rc is final. DIR/run.log opens with `plan laneA=<s>s laneB=<s>s laneX=<s>s wall=<s>s
+# other rc is final —
+# except in a --round-ledger batch, where a try that ended rc 75 on a GPU hold another batch put up is
+# not retried (hold75_owner reads the line tools/gpu-gate.sh prints only at that bound, which names the
+# hold's owner): the item ends `rc=yield held by <owner>: not retried (a round batch yields to the
+# lead's hold)`, counts in the DONE line's `yielded=` and in no rc class, and writes no times row and no
+# ledger record. A plain card-lock rc 75 and the lead's --ledger batch keep today's retry.
+# DIR/run.log opens with `plan laneA=<s>s laneB=<s>s laneX=<s>s wall=<s>s
 # defaults=<n> …` (the predicted sums, derived from the times file), then gets `<recipe>[-<n>] rc=<n>
 # <s>s try=<t> lane=<A|B|X>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
 # times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> wall=<s>s laneA=<s>s laneB=<s>s`
 # (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). A fixture batch's real-only item has
-# its own line (`<item> rc=deferred <real-only|no-fixture> lane=- deferred=1`), counted in `total=` and in no other rc class. Exit 0
-# iff every rc is 0 (or deferred, or a ledger skip). DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
+# its own line (`<item> rc=deferred <real-only|no-fixture> lane=- deferred=1`), counted in `total=` and in no other rc class; a
+# yielded item (`rc=yield`, above) is counted the same way, in `yielded=` when any did. Exit 0
+# iff every rc is 0 (or deferred, yielded, or a ledger skip). DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
 # cleanup of the worktrees and neither mark a tree dirty nor reach box.sh's rsync. An explicit
 # --out is still taken: under the tree's target/ it is gitignored and accepted, a DIR inside the
@@ -218,7 +225,8 @@
 # gets `<stem> rc=skip green-at=<commit> <date> lane=<L>`. Every other item runs as without --ledger;
 # one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box
 # manifest) and found unchanged, so a tree-side input that moved while the batch ran is never recorded
-# as green. Item lines gain `ledger=<state>`: recorded, changed (an input moved during the batch), red,
+# as green. Item lines gain `ledger=<state>`: recorded, changed (an input moved during the batch), red, yield (a --round-ledger
+# item that yielded to another batch's GPU hold — nothing ran, nothing recorded),
 # never, unkeyed (no key before the batch, or a recheck that failed — named on stderr), append-failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
 # that ran. --rerun runs every item and still records. --dry-run --ledger prints each item's status and
 # why: `skip` with the green run's commit, date and tree; `run` with what moved since the item's last
@@ -265,7 +273,10 @@
 # The box calls a hold stale after 300 s without a beat (this Mac asleep or cut off), so it never outlives its batch by more than
 # that. The hold comes down on every exit — the end, a red batch, `die`, INT/TERM — by the EXIT trap, which kills only the
 # heartbeat pid written under DIR and removes the hold only if it is still this batch's. DIR/gpuhold.log holds the calls' output.
-# --no-gpu-hold (with --ledger) runs without it; --round-ledger and a plain batch never take it. --dry-run prints the hold it
+# --no-gpu-hold (with --ledger) runs without it; --round-ledger and a plain batch never take it. A --round-ledger batch's item
+# that ends rc 75 on a hold another batch put up does not wait it out try after try: it yields (rc=yield, the DONE line's
+# yielded=), so a round never starts in the first gap the lead's batch leaves — the gap the lead's own next step needs.
+# --dry-run prints the hold it
 # would take and touches nothing.
 # Stopping a batch (INT/TERM): the trap signals only the pids written at spawn under DIR (lane-*.pid,
 # lane-*.child). A box process a killed item left behind is `just box-gc`'s to clear.
@@ -353,6 +364,20 @@ try_waits() {
     on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
     on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock|batch hold)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
     END { print w + 0 }' "$1"
+}
+
+# hold75_owner <log> <try>: the owner the try's rc 75 names when it ended on a GPU hold another batch put
+# up — tools/gpu-gate.sh's `the batch hold <path> (owner <owner>) was still up after N s (CARD_BOUND M s)`
+# line, printed only at that hold's bound (its once-a-minute `[batch-hold]` wait lines say `waits:` and
+# never match) — or '' when the 75 was a plain lock queue (a card lock, the V4.1 load lock or the timing
+# lease, none of which names a hold owner).
+hold75_owner() {
+  awk -v t="=== try $2 " '
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && match($0, /the batch hold [^ ]+ \(owner [^)]+\) was still up after [0-9]+ s \(CARD_BOUND [0-9]+ s\)/) {
+      s = substr($0, RSTART, RLENGTH); sub(/.*\(owner /, "", s); sub(/\).*/, "", s); print s; exit
+    }' "$1"
 }
 
 # The disk floor, the header's «Disk floor». floor_gib resolves the floor once (the constant, or
@@ -583,6 +608,11 @@ DF
     else pass "$name"; fi
   }
   local gb=(bash "$t/tools/gate-batch.sh")
+  # The rc 75 cases below run a copy of the fixture script whose retry wait is 1 s, not 30 — a sed of
+  # the one constant, the way gpu-gate.sh's --test-locks shrinks its bounds. No BLOOMERY_* name exists
+  # for it: every such name is a row of the lever registry (tools/check-levers.sh holds tools/ to it).
+  sed 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
+  grep -q '^RETRY_WAIT=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-retry copy did not patch (RETRY_WAIT's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
   check 'classes: an any-form v41-load recipe is lane A on the 3090' 0 \
     "^v41-any	A	fixed	3090	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
@@ -674,6 +704,16 @@ while [ "$n" -lt "${FAKE_DEFER:-0}" ]; do
   echo "deferred(real) oracle: fake clause $n"
   n=$((n + 1))
 done
+# The rc 75 tools/gpu-gate.sh ends on at a bound, for the retry and yield cases: FAKE_CARD75=1 the plain
+# card-lock queue, FAKE_HOLD75=<owner> a GPU hold another batch put up (that bound's line names its owner).
+if [ -n "${FAKE_HOLD75:-}" ]; then
+  echo "gpu-gate.sh: gen_x: the batch hold /root/bloomery-batch.gpuhold (owner $FAKE_HOLD75) was still up after 4 s (CARD_BOUND 4 s) — contention, not a red gate (rc 75)"
+  exit 75
+fi
+if [ "${FAKE_CARD75:-0}" = 1 ]; then
+  echo "gpu-gate.sh: no gate lock (3090) was free within 1800 s — contention, not a red gate"
+  exit 75
+fi
 [ "${FAKE_LEASE_UP:-0}" = 1 ] && : > "$st/lease-up"
 k=0
 while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
@@ -743,8 +783,8 @@ FP
     else echo "ok $1"; fi
   }
   steal_case() { # <tag> <times rows…> -- <items…>: one real batch run on the fixture, rc printed;
-    # LEASE_UP=1 puts the fake lease up before the batch starts
-    local tag=$1 rc=0
+    # LEASE_UP=1 puts the fake lease up before the batch starts; GBFAST=1 runs the fast-retry copy above
+    local tag=$1 rc=0 runner=("${gb[@]}")
     local times=$t/times-$tag.tsv
     shift
     local rows=()
@@ -760,8 +800,9 @@ FP
       python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "$t/fake-state/batch.gpuhold" "${PRE_AGE:-0}"
     fi
     # LFLAG: the ledger flag of the batch (default the round's)
+    [ "${GBFAST:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-fast.sh")
     BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
-      "${gb[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
+      "${runner[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
   }
   rc_ok() { # <name> <tag> <want total>: the case's batch ended green
@@ -1195,6 +1236,35 @@ FP
   want '  … the takeover is named' "$t/target/c-hold-stale/gpuhold.log" 'owner otherbatch was not refreshed for 4[0-9][0-9] s: taking it over'
   if [ ! -e "$t/fake-state/batch.gpuhold" ]; then pass '  … and the hold is down at the end'
   else fail '  … and the hold is down at the end' "$(cat "$t/fake-state/batch.gpuhold")"; fi
+  # A round batch yields to a hold another batch put up (the header's GPU-hold paragraph): the item whose
+  # try ends rc 75 on it is not retried — it ends rc=yield naming the owner, the DONE line counts yielded=,
+  # no times row and no ledger record are written, and the lane moves on to its next item. The fake box's
+  # FAKE_HOLD75/FAKE_CARD75 end a call as gpu-gate.sh does at its bounds; GBFAST=1 runs the fast-retry
+  # copy, so the retries that still happen (the plain queue, the lead's batch) cost 1 s each.
+  rc=$(GBFAST=1 steal_case yield-hold "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_HOLD75=leadbatch' steal-bal)
+  printf '%s' "$rc" > "$t/rc-yield-hold"
+  rc_ok 'yield: a round batch with a hold-blocked item ends green (not red)' yield-hold 2
+  want 'yield: the item ends rc=yield naming the hold'"'"'s owner, not retried' "$t/target/c-yield-hold/run.log" \
+    "^plain-any rc=yield held by leadbatch: not retried \(a round batch yields to the lead's hold\) [0-9]+s try=1 lane=[AB] ledger=yield item=plain-any@FAKE_HOLD75=leadbatch$"
+  want 'yield: the DONE line counts it in yielded=' "$t/target/c-yield-hold/run.log" '^DONE total=2 red=0 skipped=0 yielded=1 wall=[0-9]+s'
+  want_row 'yield: one call, then no retry — it never starts in a gap the lead leaves' "$t/fake-state/box.log" \
+    '$1 ~ /FAKE_HOLD75=leadbatch/ { c++ } END { if (c == 1) print c }'
+  want '  … and the lane moved on to its next item' "$t/target/c-yield-hold/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] ledger=recorded( |$)'
+  want_not 'yield: no rc 75 line for it' "$t/target/c-yield-hold/run.log" ' rc=75 '
+  want_not 'yield: and no ledger record' "$t/rounds-yield-hold.tsv" 'plain-any'
+  want_no_row 'yield: no times row for a yielded item' "$t/times-yield-hold.tsv" '$1 ~ /^plain-any@FAKE_HOLD75/' # the seeded plain-any row is the plan's input
+  rc=$(GBFAST=1 steal_case yield-card "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_CARD75=1')
+  printf '%s' "$rc" > "$t/rc-yield-card"
+  if [ "$(cat "$t/rc-yield-card")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yield-card/run.log" \
+    && grep -Eq '^DONE total=1 red=1 skipped=0 wall=[0-9]+s' "$t/out-yield-card.log"; then
+    pass 'yield: a plain card-lock rc 75 keeps today'"'"'s retry (try=11, red)'
+  else fail 'yield: a plain card-lock rc 75 keeps today'"'"'s retry (try=11, red)' "rc=$(cat "$t/rc-yield-card") $(tail -1 "$t/out-yield-card.log")"; fi
+  rc=$(GBFAST=1 LFLAG=--ledger steal_case yield-lead "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_HOLD75=leadbatch')
+  printf '%s' "$rc" > "$t/rc-yield-lead"
+  if [ "$(cat "$t/rc-yield-lead")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yield-lead/run.log"; then
+    pass "yield: the lead's --ledger batch keeps waiting (try=11, red)"
+  else fail "yield: the lead's --ledger batch keeps waiting (try=11, red)" "rc=$(cat "$t/rc-yield-lead") $(tail -1 "$t/out-yield-lead.log")"; fi
+  want_not "yield: and its DONE line counts no yielded=" "$t/target/c-yield-lead/run.log" 'yielded='
   # Every item skips: nothing runs on the box, so no hold goes up.
   rc=$(FAKE_SKIP=1 LFLAG=--ledger steal_case hold-skip "plain-any	B	a6000	10	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hold-skip"
@@ -1234,6 +1304,14 @@ FP
   out=$(try_waits "$t/waits.log" 2)
   if [ "$out" = 122 ]; then pass 'waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try'
   else fail 'waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try' "got $out, want 122"; fi
+  # The hold a try's rc 75 names: only gpu-gate.sh's bound line, never its once-a-minute wait line, a
+  # card-lock 75 or another try's section.
+  printf '%s\n' '=== try 1 x' '[batch-hold] 2026-10-08T00:00:00Z gen_x waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner leadbatch, up 900 s, refreshed 0 s ago), holding no lock; 4 s so far' \
+    'gpu-gate.sh: no gate lock (3090) was free within 1800 s — contention, not a red gate' \
+    '=== try 2 x' 'gpu-gate.sh: gen_x: the batch hold /root/bloomery-batch.gpuhold (owner leadbatch) was still up after 4 s (CARD_BOUND 4 s) — contention, not a red gate (rc 75)' > "$t/hold75.log"
+  out="$(hold75_owner "$t/hold75.log" 1)/$(hold75_owner "$t/hold75.log" 2)/$(hold75_owner "$t/hold75.log" 3)"
+  if [ "$out" = "/leadbatch/" ]; then pass 'hold75: the owner of the try'"'"'s hold-bound line, and nothing else'
+  else fail 'hold75: the owner of the try'"'"'s hold-bound line, and nothing else' "got '$out', want '/leadbatch/'"; fi
   # The group and gpu-gate.sh's lock request must name the same recipes.
   cp "$t/justfile" "$t/justfile.good"
   sed 's/export BLOOMERY_GATE_V41_LOAD=1 \&\& BLOOMERY_GATE_CARD/BLOOMERY_GATE_CARD/' "$t/justfile.good" > "$t/justfile"
@@ -2616,7 +2694,7 @@ fi
 
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0 deferred=0
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0 deferred=0 yowner=''
   local argv=()
   eval "argv=(${P_ARGS[$i]})"
   benv=$(box_env_of "$i")
@@ -2633,22 +2711,44 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     wait $! || rc=$?
     ran=$(($(date +%s) - t1))
     waits=$(try_waits "$log" "$try")
-    if [ "$rc" -eq 75 ] && [ "$try" -lt "$TRIES_MAX" ]; then
-      echo "=== rc 75 (lock contention): retry in ${RETRY_WAIT} s" >> "$log"
-      sleep "$RETRY_WAIT"
-      continue
+    if [ "$rc" -eq 75 ]; then
+      # A round's batch yields to a GPU hold another batch put up (the header's GPU-hold paragraph): a
+      # lane that retried would park on the lead's hold for TRIES_MAX bounds and then start in the first
+      # gap the lead's own next step needs. Whatever the try count — the cause is the same at the last
+      # one. The lead's --ledger batch and a plain lock queue keep the retry below.
+      if [ "$LMODE" = round ]; then
+        yowner=$(hold75_owner "$log" "$try")
+        if [ -n "$yowner" ]; then
+          echo "=== rc 75 (the GPU hold of $yowner still up): a round batch yields to the lead's hold — not retried" >> "$log"
+          break
+        fi
+      fi
+      if [ "$try" -lt "$TRIES_MAX" ]; then
+        echo "=== rc 75 (lock contention): retry in ${RETRY_WAIT} s" >> "$log"
+        sleep "$RETRY_WAIT"
+        continue
+      fi
     fi
     break
   done
   s=$(($(date +%s) - t0))
-  line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane"
+  if [ -n "$yowner" ]; then
+    line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lane"
+  else
+    line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane"
+  fi
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
   ran=$((ran > waits ? ran - waits : 0))
   cold=$(cold_of "$log" "$try")
   [ "$cold" = 0 ] || line="$line cold=1"
   deferred=$(deferred_of "$log" "$try")
   [ "$deferred" = 0 ] || line="$line deferred=$deferred"
-  [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
+  if [ -n "$yowner" ]; then
+    # A yielded item records nothing and its rc stays 75 below, so no times row either: it ran nothing.
+    [ "$LEDGER" = 0 ] || line="$line ledger=yield"
+  else
+    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
+  fi
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
   # build's row goes to COLD_FILE, which no plan reads.
   if [ "$rc" != 75 ] && ! times_record "$i" "$lane" "$ran" "$cold"; then
@@ -2813,10 +2913,12 @@ recorded=$(grep -c ' rc=' "$RUNLOG" || true)
 [ "$recorded" -eq "$NT" ] || RC=70 die "$NT items planned, $recorded recorded in $RUNLOG"
 green=$(grep -c ' rc=0 ' "$RUNLOG" || true)
 skipped=$(grep -c ' rc=skip ' "$RUNLOG" || true)
-red=$((NT - green - skipped - ND))
+yielded=$(grep -c ' rc=yield ' "$RUNLOG" || true)
+red=$((NT - green - skipped - yielded - ND))
 lane_s() { if [ -f "$OUT/lane-$1.s" ]; then cat "$OUT/lane-$1.s"; else echo 0; fi; }
 done_line="DONE total=$NT red=$red"
 [ "$LEDGER" = 0 ] || done_line="$done_line skipped=$skipped"
+[ "$yielded" = 0 ] || done_line="$done_line yielded=$yielded"
 done_line="$done_line wall=$(($(date +%s) - T0))s laneA=$(lane_s A)s laneB=$(lane_s B)s"
 if has_lane X; then done_line="$done_line laneX=$(lane_s X)s"; fi
 for ((i = 0; i < N; i++)); do
@@ -2839,6 +2941,7 @@ fi
 echo "$done_line" >> "$RUNLOG"
 echo "$done_line"
 if [ "$red" -ne 0 ]; then
-  grep -v ' rc=0 ' "$RUNLOG" | grep ' rc=' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | while read -r stem _; do echo "red: $stem  $OUT/g-$stem.log"; done
+  grep -v ' rc=0 ' "$RUNLOG" | grep ' rc=' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | grep -v ' rc=yield ' |
+    while read -r stem _; do echo "red: $stem  $OUT/g-$stem.log"; done
   exit 1
 fi
