@@ -5,7 +5,7 @@
 //! into the image's span. A model contributes data — the placeholder its chat template carries for
 //! one image, the token that placeholder is, the separator between flattened content parts — and
 //! one prepare, which turns a decoded image into the encoder's input on the request thread. A model
-//! implements [`MediaModel`] in its own module (`arch::deepseek41v::media` for V4.1); the common
+//! implements [`MediaModel`] in its own module (`arch::<projector type>::media`); the common
 //! code holds no branch per model.
 
 use crate::{Patches, Rgb8, VisionError};
@@ -13,8 +13,8 @@ use crate::{Patches, Rgb8, VisionError};
 /// One image made ready for a model: the positions it takes in the prompt and the encoder's input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepared {
-    /// The image's span length in the prompt, delimiters included: its placeholder token is
-    /// expanded to this many positions.
+    /// The positions the image's placeholder token is expanded to: the image's rows, and the
+    /// delimiter positions too when the model's span carries them as positions of the same id.
     pub span_len: usize,
     /// The encoder's input, with the plan it was cut to.
     pub patches: Patches,
@@ -25,7 +25,9 @@ pub trait MediaModel {
     /// The placeholder text the chat template carries for one image.
     fn image_placeholder(&self) -> &str;
 
-    /// The token id that placeholder tokenizes to; every position of an image's span carries it.
+    /// The id `serve::media::expand_spans` finds in the tokenized prompt and expands to one copy
+    /// per position of the image ([`Prepared::span_len`]): the one id V4.1's placeholder
+    /// tokenizes to, and the `<|image_pad|>` between the two delimiter ids Clef's tokenizes to.
     fn image_token(&self) -> u32;
 
     /// The separator between a message's content parts when they are flattened into one text.

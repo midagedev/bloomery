@@ -13,11 +13,12 @@ mod common;
 
 use common::{Manifest, i32s, image_path, sha256_file, u16s};
 use gguf::Gguf;
+use vision::arch::deepseek41v::grid::{GridParams, num_image_tokens, plan_image_grid};
+use vision::arch::deepseek41v::media::{padded, to_patches};
+use vision::arch::deepseek41v::span::image_span;
 use vision::arch::deepseek41v::{self, Hparams, tensors};
-use vision::grid::GridParams;
-use vision::preprocess::{padded, to_patches};
 use vision::resample::PadGeometry;
-use vision::{GridPlan, Rgb8, image_span, plan_image_grid};
+use vision::{GridPlan, Rgb8};
 
 /// The reference config's resize parameters; the mmproj gate proves the file declares the same.
 const V41: GridParams = GridParams {
@@ -57,7 +58,7 @@ fn hw_plan_matches_oracle() {
             plan.n_llm_w,
             plan.best_h,
             plan.best_w,
-            plan.n_tokens(),
+            num_image_tokens(plan.n_llm_h, plan.n_llm_w),
             g.resized_w,
             g.resized_h,
             g.off_x,

@@ -7,12 +7,11 @@
 //! unfamiliar tensor, not on a shape. Each row also says where the tensor lives once loaded
 //! ([`Home`]): the encoder's card, or the host's span assembly.
 
-use std::collections::{HashMap, HashSet};
-
 use gguf::GgmlType;
 
 use super::{Hparams, names};
 use crate::VisionError;
+use crate::arch::table;
 
 /// Where a tensor of the file lives once it is loaded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,31 +24,7 @@ pub enum Home {
 }
 
 /// One tensor the file must hold, dims in ggml `ne[]` order (the contiguous axis first).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Expected {
-    pub name: String,
-    pub dims: Vec<u64>,
-    pub ty: GgmlType,
-    pub home: Home,
-}
-
-impl Expected {
-    /// The tensor's bytes, in the file and wherever it is loaded: two per bf16 value, four per
-    /// f32.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        let values: u64 = self.dims.iter().product();
-        match self.ty {
-            GgmlType::BF16 => 2 * values,
-            GgmlType::F32 => 4 * values,
-            ty => unreachable!(
-                "the {} table holds bf16 and f32 rows; {} is {ty}",
-                super::PROJECTOR_TYPE,
-                self.name
-            ),
-        }
-    }
-}
+pub type Expected = table::Expected<Home>;
 
 /// Every tensor of a file with these hyperparameters, in the table's order.
 #[must_use]
@@ -57,22 +32,9 @@ pub fn expected(hp: &Hparams) -> Vec<Expected> {
     let d = |n: usize| n as u64;
     let (dim, ff, p, out) = (d(hp.dim), d(hp.ff), d(hp.patch), d(hp.out_dim));
     let unfold = dim * d(hp.downsample * hp.downsample);
-    let mat = |name: String, dims: &[u64]| Expected {
-        name,
-        dims: dims.to_vec(),
-        ty: GgmlType::BF16,
-        home: Home::Card,
-    };
-    let vec = |name: String, n: u64| Expected {
-        name,
-        dims: vec![n],
-        ty: GgmlType::F32,
-        home: Home::Card,
-    };
-    let span = |name: String| Expected {
-        home: Home::Span,
-        ..vec(name, out)
-    };
+    let mat = |name: String, dims: &[u64]| Expected::row(name, dims, GgmlType::BF16, Home::Card);
+    let vec = |name: String, n: u64| Expected::row(name, &[n], GgmlType::F32, Home::Card);
+    let span = |name: String| Expected::row(name, &[out], GgmlType::F32, Home::Span);
     let mut all = vec![
         mat(names::patch_embd_weight(), &[p, p, 3, dim]),
         vec(names::patch_embd_bias(), dim),
@@ -109,46 +71,14 @@ pub fn check<'a>(
     hp: &Hparams,
     tensors: impl IntoIterator<Item = (&'a str, &'a [u64], GgmlType)>,
 ) -> Result<usize, VisionError> {
-    let table = expected(hp);
-    let by_name: HashMap<&str, &Expected> = table.iter().map(|e| (e.name.as_str(), e)).collect();
-    let mut seen: HashSet<&str> = HashSet::with_capacity(table.len());
-    let err = |name: &str, detail: String| VisionError::Tensor {
-        name: name.to_string(),
-        detail,
-    };
-    for (name, dims, ty) in tensors {
-        let want = by_name.get(name).ok_or_else(|| {
-            err(
-                name,
-                format!("is not a {} tensor name", super::PROJECTOR_TYPE),
-            )
-        })?;
-        if !seen.insert(want.name.as_str()) {
-            return Err(err(name, "appears twice".into()));
-        }
-        if dims != want.dims.as_slice() {
-            return Err(err(
-                name,
-                format!("has dims {dims:?}; the table gives {:?}", want.dims),
-            ));
-        }
-        if ty != want.ty {
-            return Err(err(
-                name,
-                format!("is {ty}; this crate reads it as {}", want.ty),
-            ));
-        }
-    }
-    if let Some(missing) = table.iter().find(|e| !seen.contains(e.name.as_str())) {
-        return Err(err(&missing.name, "is missing from the file".into()));
-    }
-    Ok(seen.len())
+    table::check(super::PROJECTOR_TYPE, &expected(hp), tensors)
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::{check, expected};
     use crate::arch::deepseek41v::Hparams;
+    use crate::arch::table::testing::{changes_are_refused_by_name, text, triples};
 
     /// The V4.1 file's hyperparameters.
     pub(in crate::arch::deepseek41v) fn hp() -> Hparams {
@@ -178,45 +108,12 @@ pub(super) mod tests {
     #[test]
     fn a_changed_tensor_list_is_refused_by_name() {
         let hp = hp();
-        let t = expected(&hp);
-        let list = |t: &[super::Expected]| {
-            t.iter()
-                .map(|e| (e.name.clone(), e.dims.clone(), e.ty))
-                .collect::<Vec<_>>()
-        };
-        let run = |l: &[(String, Vec<u64>, gguf::GgmlType)]| {
-            check(
-                &hp,
-                l.iter().map(|(n, d, ty)| (n.as_str(), d.as_slice(), *ty)),
-            )
-            .map_err(|e| e.to_string())
-        };
-        assert_eq!(run(&list(&t)), Ok(298));
-
-        let mut renamed = list(&t);
-        renamed[5].0 = "v.blk.0.attn_o.weight".into();
-        assert_eq!(
-            run(&renamed).unwrap_err(),
-            "tensor v.blk.0.attn_o.weight: is not a deepseek41v tensor name"
-        );
-        let mut dropped = list(&t);
-        dropped.pop();
-        assert_eq!(
-            run(&dropped).unwrap_err(),
-            "tensor v.image_newline: is missing from the file"
-        );
-        let mut doubled = list(&t);
-        doubled.push(doubled[0].clone());
-        assert_eq!(
-            run(&doubled).unwrap_err(),
-            "tensor v.patch_embd.weight: appears twice"
-        );
-        let mut reshaped = list(&t);
-        reshaped[2].1 = vec![3072, 1024];
-        assert!(
-            run(&reshaped)
-                .unwrap_err()
-                .starts_with("tensor v.blk.0.ln1.weight: has dims [3072, 1024]")
+        changes_are_refused_by_name(
+            super::super::PROJECTOR_TYPE,
+            &expected(&hp),
+            298,
+            "v.image_newline",
+            |l| text(check(&hp, triples(l))),
         );
     }
 }
