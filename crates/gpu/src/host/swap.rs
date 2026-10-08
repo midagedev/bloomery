@@ -26,19 +26,19 @@
 //!
 //! **Flips.** A flip made at boundary `b` admits an expert into a spare slot
 //! while its victim stays live; both change at boundary `b + delay`. At `b`
-//! the machine sends the staging thread the flip's job, then enqueues on its
-//! copy stream, behind the event of boundary `b` (the slot's last reader has
-//! run), a wait for the staging thread's word, per part the copy from the
-//! staging ring into the slot's place in its stack and the source's convert
-//! step ([`SwapSource::convert`]), a word back to the staging thread, and the
-//! flip's event; the staging thread prepares the victim for the host
+//! the machine sends its copy lane ([`super::lane`]) the flip's job, then
+//! enqueues on its copy stream, behind the event of boundary `b` (the slot's
+//! last reader has run), a wait for the lane's word, per part the copy from
+//! the staging ring into the slot's place in its stack and the source's
+//! convert step ([`SwapSource::convert`]), a word back to the lane, and the
+//! flip's event; a lane thread prepares the victim for the host
 //! ([`SwapSource::prepare_victim`]), then copies the source bytes into the
 //! ring, gated to the staging window ([`SwapMachine::window`]), which a step
 //! service closes only while it computes a layer's host experts.
 //!
 //! **Boundaries.** [`SwapMachine::boundary`] runs before each pass's launch,
 //! in this order: the jobs of the flips live here are made due, and the host
-//! waits until the staging thread has published each (its victim prepared,
+//! waits until the lane has published each (its victim prepared,
 //! its bytes in the ring, or its failure recorded); a staging failure is
 //! refused by name there, before anything changes, and a victim the host
 //! does not serve from resident pages goes to it all the same (**Host
@@ -56,11 +56,14 @@
 //! time under the pass before it.
 //!
 //! **No wait without a bound.** A flip landing at a boundary makes its job
-//! due: the staging thread stages a due job whatever the window says. The
-//! host's wait for it cannot close a cycle: it ends before this boundary
-//! enqueues anything on the engine stream; staging a due job waits only on
-//! its ring slot's previous copy, which waits on a boundary event recorded at
-//! or before the boundary that issued the job, and the engine stream reaches
+//! due: the lane stages a due job whatever the window says. The host's wait
+//! for it cannot close a cycle: it ends before this boundary enqueues
+//! anything on the engine stream; staging a due job waits on two things:
+//! the lane's receive lock, which a thread holds only for an earlier job —
+//! due as well — through that job's preparation, these same two waits and,
+//! for a job the window opened, its copy into the ring; and its ring slot's
+//! previous copy, which waits on a boundary event recorded at or before the
+//! boundary that issued the job, and the engine stream reaches
 //! that event having waited only on copies that landed earlier — each of
 //! which the host waited for at its own landing — and on the host words of
 //! passes this thread served before this boundary: a boundary runs after the
@@ -72,7 +75,7 @@
 //! copy and any context synchronize or card free behind that copy: the
 //! machine's owner drops it before it frees anything
 //! ([`crate::host::HostTier::stop_swap`]), and the drop releases every such
-//! copy. A panic on the staging thread is a staging failure of its job,
+//! copy. A panic on a lane thread is a staging failure of its job,
 //! published like any other.
 //!
 //! **No cycle through the card.** The copy stream's wait for a staging word
@@ -80,8 +83,8 @@
 //! driver may run every stream of the context on one hardware queue (WDDM
 //! under WSL2, or `CUDA_DEVICE_MAX_CONNECTIONS=1`), and then everything
 //! enqueued on any stream after that wait — the engine stream's next launch,
-//! its readback — waits for the word too. So the staging thread raises every
-//! word without waiting on anything the card runs after it. A job stages
+//! its readback — waits for the word too. So the lane raises every word
+//! without waiting on anything the card runs after it. A job stages
 //! once its ring slot's previous copy has drained, which sits ahead of its
 //! wait on the copy stream, and once it is open: the window open, the job
 //! due, or a flush. Due and flush are raised by host waits that need nothing
@@ -105,7 +108,7 @@
 //! picked victims and the experts its end sends back, the spare slots'
 //! experts at [`SwapMachine::new`] and the admitted experts a reset sends
 //! back. A host set the load populated and did not lock can lose a page to
-//! the page cache after the load or after the staging thread's prepare: the
+//! the page cache after the load or after a lane thread's prepare: the
 //! owner then reads the expert's pages in again on the machine's thread
 //! ([`SwapSource::prepare_victim`]), a page fault's cost paid once and
 //! counted ([`PassReport::rereads`]). An expert still not resident after it
@@ -136,9 +139,9 @@
 //! [`SwapMachine::call_pick`] moves one layer's pool — its live, unpinned
 //! residents outside the rule's flips in flight — toward the hottest experts
 //! of the counts it is given ([`SwapRule::call_pick`]), all at once: the
-//! admitted experts' jobs go to the staging thread, which stages whatever the
-//! window says for the call; the copy stream waits for the layer's reader
-//! event (the last engine stream read of the layer's slots,
+//! admitted experts' jobs go to the lane, which stages them whatever the
+//! window says for the call, on all its threads; the copy stream waits for
+//! the layer's reader event (the last engine stream read of the layer's slots,
 //! [`SwapMachine::call_reader`], or the call's start) and copies them in; the
 //! layer's landed event follows; then the host map, the rule and the card's
 //! copy of the layer's words change, the victims to the host (which serves
@@ -160,7 +163,9 @@ use std::time::{Duration, Instant};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
 use runtime::swaprule::{Flip, KeptRows, Shape, SwapParams, SwapRule};
 
-use super::lane::{self, Job, Lane, NO_FLIP_LANDING, WORD_STRIDE, dispatch, ring_ticket};
+use super::lane::{
+    self, Job, Lane, LaneStats, NO_FLIP_LANDING, WORD_STRIDE, dispatch, ring_ticket,
+};
 use super::slots::{HOST, Slot, SlotMap};
 use super::xstream::{LandBatch, LandRows, land_batch_size};
 use super::{Drain, drain_within, poll_drained};
@@ -226,8 +231,7 @@ impl Residency {
 
 // ----------------------------------------------------------------- source
 
-/// How the staging thread turns an expert's source bytes into its slot's
-/// bytes.
+/// How the lane turns an expert's source bytes into its slot's bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
     /// The slot holds the source bytes as they are.
@@ -244,8 +248,9 @@ pub struct Piece<'a> {
 
 /// A model's side of the machine: where an expert's bytes come from, where
 /// they go on the card, and whether the host can serve an expert the card
-/// gives up. The staging thread calls [`SwapSource::source`], and
-/// [`SwapSource::prepare_victim`] for a flip's victim; the thread that drives
+/// gives up. The lane's threads call [`SwapSource::source`], up to
+/// [`super::lane::LANE_THREADS`] at once, and [`SwapSource::prepare_victim`]
+/// for a flip's victim, one at a time in issue order; the thread that drives
 /// the machine calls `prepare_victim` too, at [`SwapMachine::new`] for the
 /// experts the spare slots give up and at [`SwapMachine::reset`] for the
 /// admitted experts it sends back, and makes every other call.
@@ -283,8 +288,8 @@ pub trait SwapSource: Send + Sync {
     }
 
     /// Bring layer `layer`'s expert `id` to where the host serves it from
-    /// resident pages (read its pages in). The staging thread calls it for a
-    /// flip's victim ahead of the landing; the machine's thread calls it
+    /// resident pages (read its pages in). The lane calls it for a flip's
+    /// victim ahead of the landing; the machine's thread calls it
     /// again for an expert it finds not host-resident when it sends it to
     /// the host, whose pages the page cache let go since.
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError>;
@@ -832,7 +837,7 @@ fn micros(t0: Instant) -> u64 {
 
 /// A staging failure as the machine returns it, the source of a
 /// [`GpuError::Plan`]: the job, its layer and expert, the boundary that
-/// found it (`None` at a reset), and the staging thread's own error, which
+/// found it (`None` at a reset), and the lane thread's own error, which
 /// is the chain's next link.
 #[derive(Debug)]
 pub struct StagingFailed {
@@ -1100,16 +1105,17 @@ pub struct PassReport {
     /// Host microseconds this boundary waited for its landing jobs' staging.
     pub wait_us: u64,
     /// Host microseconds this boundary spent issuing its flips' copies (the
-    /// copy stream's enqueues and the staging thread's jobs).
+    /// copy stream's enqueues and the lane's jobs).
     pub issue_us: u64,
-    /// Staging thread microseconds since the last boundary: copying experts'
-    /// bytes into the ring, and preparing victims for the host.
+    /// Lane microseconds since the last boundary, summed over the lane's
+    /// threads (thread-µs): copying experts' bytes into the ring, and
+    /// preparing victims for the host.
     pub stage_us: u64,
     pub prepare_us: u64,
     /// Experts the machine's thread found not host-resident and read in
     /// again since the last boundary (the load's, a call's and a reset's
     /// with it): a page the page cache let go after the load or after the
-    /// staging thread's prepare. Their bytes (whole experts, as the source
+    /// lane's prepare. Their bytes (whole experts, as the source
     /// holds them: the pages read are at most these), and the host
     /// microseconds the reads and their checks took on the machine's thread.
     pub rereads: usize,
@@ -1159,7 +1165,7 @@ impl BoundaryAt {
 /// Why a dropped machine leaked its shared state ([`Leak`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeakReason {
-    /// The staging thread was still inside the source past the deadline.
+    /// A lane thread was still inside the source past the deadline.
     Join,
     /// The copies waiting on staging words could not be let through.
     Release,
@@ -1279,11 +1285,11 @@ pub struct CallPick {
     /// Host microseconds the pick took: the choice, the jobs, the copy
     /// stream's enqueues and the words.
     pub pick_us: u64,
-    /// Of those, host microseconds it waited for the staging thread to take
+    /// Of those, host microseconds it waited for the lane to take
     /// in enough of the call's earlier jobs.
     pub backlog_us: u64,
-    /// Host microseconds from this pick's start to the staging thread's
-    /// staging of the layer's last outstanding pick job — the whole copy,
+    /// Host microseconds from this pick's start to the lane's staging of
+    /// the layer's last outstanding pick job — the whole copy,
     /// the backlog jobs beside the union included, so at or past `pick_us`.
     /// 0 until the call's end reads it back
     /// ([`SwapMachine::fill_staged_us`]): a pick that moved nothing, or one
@@ -1428,8 +1434,8 @@ struct Landing {
 
 /// The residency machine over one stage card's slot map.
 ///
-/// Field order is drop order: the staging thread is stopped and joined in
-/// `Drop` before the ring and the words it reads are freed.
+/// Field order is drop order: the lane's threads are stopped and joined in
+/// `Drop` before the ring and the words they read are freed.
 pub struct SwapMachine {
     rule: SwapRule,
     ledger: SlotLedger,
@@ -1622,8 +1628,8 @@ impl SwapMachine {
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
         let land = LandRows::new(ctx, layers.len(), n_expert)?;
-        // The staging thread starts last: from here the machine's drop owns
-        // it, and nothing can fail between.
+        // The lane starts last: from here the machine's drop owns it, and
+        // nothing can fail between.
         let (shared, lane) = lane::start(ctx, source, slot_bytes, cfg.deadline, layers.end)?;
         let mut m = SwapMachine {
             rule,
@@ -1759,10 +1765,10 @@ impl SwapMachine {
             .map_err(|e| rule_err("SwapMachine::new", e))
     }
 
-    /// The staging window word: the staging thread copies while it is
-    /// nonzero. The step port closes it only while a service computes a
-    /// layer's host experts, so the staging memcpy does not take DRAM from
-    /// them; a machine nobody gates leaves it at 1.
+    /// The staging window word: the lane copies while it is nonzero (a due
+    /// job and a flush aside). The step port closes it only while a service
+    /// computes a layer's host experts, so the staging memcpy does not take
+    /// DRAM from them; a machine nobody gates leaves it at 1.
     #[must_use]
     pub fn window(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.shared.window)
@@ -1781,6 +1787,14 @@ impl SwapMachine {
     #[must_use]
     pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// What the machine's copy lane did since the load: the jobs each of its
+    /// threads took, and the most that staged at once of each kind
+    /// ([`LaneStats`]).
+    #[must_use]
+    pub fn lane_stats(&self) -> LaneStats {
+        self.shared.lane_stats()
     }
 
     /// The next boundary a filling flip lands at, mirrored onto the shared
@@ -1940,7 +1954,7 @@ impl SwapMachine {
         r
     }
 
-    /// The staging thread's first failure as `what`'s error, which breaks the
+    /// The lane's first failure as `what`'s error, which breaks the
     /// machine; `boundary` names where it was found.
     fn refuse_staging_failure(
         &mut self,
@@ -2091,7 +2105,7 @@ impl SwapMachine {
     /// ([`SwapMachine::boundary_ahead`]), and a landing job not staged within
     /// the deadline. A landing flip whose victim the host does not serve from
     /// resident pages lands all the same, its copy in place: a victim whose
-    /// pages the page cache let go since the staging thread's prepare is read
+    /// pages the page cache let go since the lane's prepare is read
     /// in on this thread ([`PassReport::rereads`]), and one still not
     /// resident after it is served from the file, counted and followed
     /// ([`PassReport::unresident`], [`PassReport::faulting`]).
@@ -2220,7 +2234,7 @@ impl SwapMachine {
         let staged = || shared.staged(ring).load(Ordering::Acquire) >= ticket;
         match shared.wait_until(staged, Some(shared.deadline)) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(GpuError::protocol(what, "the staging thread has stopped")),
+            Ok(false) => Err(GpuError::protocol(what, "the lane has stopped")),
             Err(waited) => Err(GpuError::protocol(
                 what,
                 format!(
@@ -2387,7 +2401,7 @@ impl SwapMachine {
         Ok(bytes)
     }
 
-    /// Hand the staging thread layer `l`'s expert `id` as a job (preparing
+    /// Hand the lane layer `l`'s expert `id` as a job (preparing
     /// `victim` first), then enqueue on the copy stream, behind the wait for
     /// the slot's readers (`gate`) and the job's staging word, its copy into
     /// slot `spare` of each stack.
@@ -2420,7 +2434,7 @@ impl SwapMachine {
         // most the flips the rule keeps in flight (one event each); a reset
         // stages whatever the window says. Past that the call is refused. A
         // prompt call's picks stage whatever the window says too, and wait,
-        // within the deadline, until the staging thread has taken in all but
+        // within the deadline, until the lane has taken in all but
         // that many of them ([`SwapMachine::call_backlog`]).
         let waiting = self.jobs_issued - self.shared.served.load(Ordering::Acquire);
         if !self.shared.flush.load(Ordering::Acquire) && waiting >= self.events.len() as u64 {
@@ -2739,7 +2753,7 @@ impl SwapMachine {
     /// Open a prompt call on the engine stream `stream`, inside the pass the
     /// last boundary opened: the rule makes no plan and every boundary, end
     /// of pass and reset is refused until [`SwapMachine::end_call`]; the
-    /// staging thread stages every job whatever the window says; each
+    /// lane stages every job whatever the window says; each
     /// layer's reader event is recorded here, after every pass before the
     /// call. Refused by name, the machine unchanged: a call open already and
     /// no pass open (a boundary first).
@@ -2807,7 +2821,7 @@ impl SwapMachine {
         Ok(())
     }
 
-    /// The most of a call's jobs the staging thread has not taken in when a
+    /// The most of a call's jobs the lane has not taken in when a
     /// pick issues another: the flips a boundary may keep in flight, and a
     /// ring's worth at least, so the copy stream never holds so many copies
     /// behind unstaged jobs that an enqueue blocks inside the driver.
@@ -2815,7 +2829,7 @@ impl SwapMachine {
         self.events.len().max(RING_SLOTS) as u64
     }
 
-    /// Wait, within the deadline, until the staging thread has taken in all
+    /// Wait, within the deadline, until the lane has taken in all
     /// but [`SwapMachine::call_backlog`] of the jobs issued — the open
     /// call's own bound where a caller set one
     /// ([`SwapMachine::set_call_backlog`]); the boundary's issue path reads
@@ -2830,11 +2844,11 @@ impl SwapMachine {
         let fits = || issued - shared.served.load(Ordering::Acquire) < bound;
         match shared.wait_until(fits, Some(shared.deadline)) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(GpuError::protocol(what, "the staging thread has stopped")),
+            Ok(false) => Err(GpuError::protocol(what, "the lane has stopped")),
             Err(waited) => Err(GpuError::protocol(
                 what,
                 format!(
-                    "the staging thread took in no job of the call's last {bound} in {waited:?} \
+                    "the lane took in no job of the call's last {bound} in {waited:?} \
                      (deadline {:?})",
                     shared.deadline
                 ),
@@ -2846,7 +2860,7 @@ impl SwapMachine {
     /// of the call routes there (one count per expert of the layer), at most
     /// `cap` experts wanted ([`SwapRule::call_pick`], the call's floor): on
     /// the engine stream `stream` and the host map `slots`, each admitted
-    /// expert's job goes to the staging thread and its copy onto the copy
+    /// expert's job goes to the lane and its copy onto the copy
     /// stream behind the layer's reader event, the layer's landed event
     /// after the last; then each victim goes to the host and each admitted
     /// expert to its victim's slot, `Landing`, in the host map, the rule and
@@ -3039,9 +3053,9 @@ impl SwapMachine {
         order.sort_unstable_by_key(|&(_, s)| s);
         let per = land_batch_size(order.len());
         let batches = order.len().div_ceil(per);
-        // The pick's stamp counter ahead of the first job's issue: the
-        // staging thread takes one a staged copy and stamps the layer's wall
-        // at the zero crossing (`Shared::pick_left`).
+        // The pick's stamp counter ahead of the first job's issue: the lane
+        // takes one a staged copy, and the thread that finishes the last
+        // stamps the layer's wall at the zero crossing (`Shared::pick_left`).
         self.shared
             .pick_left
             .get(layer)
@@ -3099,7 +3113,7 @@ impl SwapMachine {
     /// the call, else every layer returns to the set it started the call
     /// with, the experts the call sent to the host copied back behind a
     /// boundary event of `stream` into the slots of those it admitted, which
-    /// go back to the host. The staging window gates the staging thread
+    /// go back to the host. The staging window gates the lane
     /// again. An expert the end sends back that the host does not serve from
     /// resident pages once its pages are read in again goes all the same
     /// (`send_on`), counted ([`CallReport::unresident`]) and followed from
@@ -3247,7 +3261,7 @@ impl SwapMachine {
     }
 
     /// The open call's pick path's backlog bound from its next pick on: the
-    /// most of the call's jobs the staging thread may leave unstaged when a
+    /// most of the call's jobs the lane may leave unstaged when a
     /// pick issues another. The call's own until this; the boundary's issue
     /// path keeps the machine's bound whatever this says, and the call's end
     /// drops the value with the call. Refused by name with no call open and
@@ -3258,7 +3272,7 @@ impl SwapMachine {
             return Err(GpuError::shape(
                 WHAT_B,
                 "a backlog bound of at least one job (a pick always leaves the \
-                 staging thread one to take)",
+                 lane one to take)",
             ));
         }
         match self.call.as_mut() {
@@ -3424,7 +3438,7 @@ fn rule_err(what: &'static str, e: runtime::swaprule::SwapRuleError) -> GpuError
 /// machine's thread for every expert it sends there: resident now, it does;
 /// else its pages are read in again ([`SwapSource::prepare_victim`]) and it
 /// is asked once more — a page the page cache let go since the load or the
-/// staging thread's prepare, read back at a page fault's cost once and
+/// lane's prepare, read back at a page fault's cost once and
 /// counted in `rereads`. Still not resident (the host set does not hold it,
 /// or the page cache let it go again in between), the host would serve it
 /// from the file: counted in `unresident`, and the site's to refuse or to
