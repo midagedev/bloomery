@@ -1396,7 +1396,7 @@ impl Body {
         if self.batch.is_none() {
             let b = self.make_batch(gpu)?;
             self.hybrid.prepare_batch(gpu.context(), b.ffn.cap())?;
-            self.hybrid.host_mut().prepare_union()?;
+            self.hybrid.host_mut().prepare_union(UNION_MAX_COLS)?;
             self.batch = Some(Box::new(b));
         }
         self.complete_batch_taps(gpu)
@@ -2385,7 +2385,7 @@ struct GroupCx<'a> {
     shadows: &'a mut Shadows,
     steps: &'a [LayerStep],
     slots: &'a DeviceTensor<u32>,
-    hybrid: &'a mut Hybrid<Ds41Host>,
+    hybrid: &'a mut Hybrid<HostRun>,
     ffn: &'a mut FfnPiece,
     glue: &'a mut Glue,
     tap: Option<&'a FeatureTap>,

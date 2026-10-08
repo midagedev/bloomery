@@ -77,6 +77,7 @@ use std::sync::Arc;
 use bloomery_gpu::fused::FusedKernels;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
+use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::tier::TierTarget;
 use bloomery_gpu::hybrid::{Boundary, HOST, HandoffTarget, HostExperts, Hybrid, SlotMap};
 use bloomery_gpu::q4k_sel::QuantSel;
@@ -88,9 +89,7 @@ use cuda_host::cuda_module;
 use gguf::{GgmlType, Split};
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
-use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
-use model::r8file::R8Pair;
-use model::{Tensor2, Tensor2View};
+use model::moe::UNION_MAX_COLS;
 use runtime::combine::Slots;
 
 use crate::dense::{Dense, DenseKernels};
@@ -1712,133 +1711,29 @@ fn q8act_bytes(a: &Q8Act) -> usize {
         + 4 * m * 2 * n_sb
 }
 
-/// The V4.1 host tier's computation ([`HostExperts`]): each layer's routed
-/// stacks as [`HostLayer`] reads them from the file, and the scratch every
-/// call writes, made at load — the union's for a prompt batch at its first
-/// call.
-pub struct Ds41Host {
-    /// The file and the r8 reading its layers were built from, checked
-    /// against each other at load; every call reads through this pair.
-    file: R8Pair,
-    /// Per layer of `layers`, its host view; `None` for a layer that does
-    /// not route.
-    layers: Vec<Option<HostLayer>>,
-    first: usize,
-    scratch: HostScratch,
-    /// The union's blocks for [`UNION_MAX_COLS`] columns, made by the first
-    /// batch service: a decode that never prefills a batch never holds them.
-    union: Option<UnionScratch>,
-    embd: usize,
-    ff: usize,
-    /// Routed slots a token: the union's list width.
-    n_used: usize,
-}
-
-impl Ds41Host {
-    /// The tier for layers `layers` of `file`, whose hyperparameters are
-    /// `hp`. Load-time only: every stack is found and checked here. A body
-    /// passes its own mapping, so the pages its load populated are the ones
-    /// the step reads; the routed gates and ups come from `file`'s r8 sidecar
-    /// when `r8` asks for it and there is one ([`R8Pair::at_load`] under the
-    /// load's `HostCfg::r8`: the reading and the mapping the load's host set
-    /// took).
-    pub fn build(
-        file: impl Into<Arc<Split>>,
-        hp: &Hparams,
-        layers: Range<usize>,
-        r8: bool,
-    ) -> Result<Ds41Host, GpuError> {
-        let file = R8Pair::at_load(file.into(), r8)?;
-        let first = layers.start;
-        let views = layers
-            .map(|l| host::layer(file.source(), hp, l))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Ds41Host {
-            file,
-            layers: views,
-            first,
-            scratch: HostScratch::new(hp.n_embd, hp.experts.ff, hp.experts.n_used)?,
-            union: None,
+/// The V4.1 host tier's computation over the layers `layers` of `file`, the
+/// common [`HostRun`]: its run starts at the tier's first routed layer (the
+/// dense lead's FFNs run on the card alone) and its views are
+/// [`host::layers`]'. Load-time only. A body passes its own mapping, so the
+/// pages its load populated are the ones the step reads; the routed gates and
+/// ups come from `file`'s r8 sidecar when `r8` asks for it and there is one
+/// (the load's `HostCfg::r8`).
+pub fn host_run(
+    file: Arc<Split>,
+    hp: &Hparams,
+    layers: Range<usize>,
+    r8: bool,
+) -> Result<HostRun, GpuError> {
+    let first = layers.start.max(hp.experts.dense_lead);
+    HostRun::build(
+        file,
+        first,
+        r8,
+        HostWidths {
             embd: hp.n_embd,
             ff: hp.experts.ff,
             n_used: hp.experts.n_used,
-        })
-    }
-}
-
-/// Layer `layer`'s view in `layers`, the tier's views from layer `first` on;
-/// refused for a layer outside them or one that does not route.
-fn host_view<'a>(
-    layers: &'a [Option<HostLayer>],
-    first: usize,
-    layer: usize,
-    what: &'static str,
-) -> Result<&'a HostLayer, GpuError> {
-    layer
-        .checked_sub(first)
-        .and_then(|i| layers.get(i))
-        .and_then(Option::as_ref)
-        .ok_or(GpuError::State {
-            what,
-            missing: "the layer's routed stacks: it is outside the tier or does not route",
-        })
-}
-
-impl Ds41Host {
-    /// The union's scratch for [`UNION_MAX_COLS`] columns, made now if no
-    /// batch service has made it: a prompt timed after this allocates
-    /// nothing.
-    pub fn prepare_union(&mut self) -> Result<(), GpuError> {
-        if self.union.is_none() {
-            self.union = Some(union_scratch(self.embd, self.ff, self.n_used)?);
-        }
-        Ok(())
-    }
-}
-
-/// The one shape of the tier's union scratch, for [`Ds41Host::prepare_union`]
-/// and the lazy path alike: [`UNION_MAX_COLS`] columns of the model's `n_used`
-/// routed slots; a longer list is refused by name.
-fn union_scratch(embd: usize, ff: usize, n_used: usize) -> Result<UnionScratch, GpuError> {
-    Ok(UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, n_used)?)
-}
-
-impl HostExperts for Ds41Host {
-    fn experts_into(
-        &mut self,
-        layer: usize,
-        x: &Tensor2,
-        experts: &[(u32, f32)],
-        out: &mut [f32],
-    ) -> Result<(), GpuError> {
-        let view = host_view(&self.layers, self.first, layer, "Ds41Host::experts_into")?;
-        view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
-        Ok(())
-    }
-
-    fn experts_union_into(
-        &mut self,
-        layer: usize,
-        x: Tensor2View<'_>,
-        lists: &[&[(u32, f32)]],
-        out: &mut [f32],
-    ) -> Result<(), GpuError> {
-        let Ds41Host {
-            file,
-            layers,
-            first,
-            union,
-            embd,
-            ff,
-            n_used,
-            ..
-        } = self;
-        let view = host_view(layers, *first, layer, "Ds41Host::experts_union_into")?;
-        let scratch = match union {
-            Some(s) => s,
-            None => union.insert(union_scratch(*embd, *ff, *n_used)?),
-        };
-        view.experts_union_into(file.source(), x, lists, out, scratch)?;
-        Ok(())
-    }
+        },
+        |src| host::layers(src, hp, first..layers.end),
+    )
 }
