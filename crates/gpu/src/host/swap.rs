@@ -1284,13 +1284,16 @@ pub(crate) struct Shared {
     /// before each one's ticket is published: `jobs_issued - served` copies
     /// wait for staging.
     served: AtomicU64,
-    /// Per layer of the map, the jobs of the layer's current pick the staging
-    /// thread has not stamped yet: the pick stores its count before it issues
-    /// its copies, the thread takes one a staged job.
+    /// Per layer index below the map's last layer (a job names its layer by
+    /// its index in the model, not its place in the map), the jobs of the
+    /// layer's current pick the staging thread has not stamped yet: the pick
+    /// stores its count before it issues its copies, the thread takes one a
+    /// staged job.
     pick_left: Vec<AtomicU64>,
-    /// Per layer of the map, the stamp epoch's nanoseconds at the moment the
-    /// layer's last outstanding pick job staged (0: none yet): the pick
-    /// record's `staged_us` reads against the pick's own start.
+    /// Per layer index below the map's last layer, the stamp epoch's
+    /// nanoseconds at the moment the layer's last outstanding pick job staged
+    /// (0: none yet): the pick record's `staged_us` reads against the pick's
+    /// own start.
     pick_stamp_ns: Vec<AtomicU64>,
     /// The stamp epoch, the machine's birth: every stamp and pick start is
     /// nanoseconds since it.
@@ -1501,19 +1504,20 @@ impl Shared {
                 }
             }
             self.served.fetch_add(1, Ordering::AcqRel);
-            // A max, never a store: a word the machine released past this
-            // ticket stays released.
-            self.staged(job.ring)
-                .fetch_max(job.ticket, Ordering::AcqRel);
             if job.stamp {
                 // The pick's per-layer remaining-jobs counter, one atomic a
                 // job: the thread that stages the layer's last one stamps the
-                // wall for the pick record's `staged_us`.
+                // wall for the pick record's `staged_us`, before it publishes
+                // the ticket, so a copy that landed has its stamp posted.
                 let left = self.pick_left[job.layer].fetch_sub(1, Ordering::AcqRel);
                 if left == 1 {
                     self.pick_stamp_ns[job.layer].store(nanos_since(self.epoch), Ordering::Release);
                 }
             }
+            // A max, never a store: a word the machine released past this
+            // ticket stays released.
+            self.staged(job.ring)
+                .fetch_max(job.ticket, Ordering::AcqRel);
         }
     }
 }
@@ -1719,6 +1723,12 @@ pub struct CallPick {
     pub kept: usize,
     /// Bytes the admitted experts' copies move.
     pub bytes: u64,
+    /// The admitted experts' summed counts: the columns that leave the host
+    /// union for the card.
+    pub admit_cols: u64,
+    /// The victims' summed counts: the columns that move back to the host
+    /// union, the pool residents the admits displace.
+    pub victim_cols: u64,
     /// The pick's input: FNV-1a 64 over its counts (each a little-endian
     /// `u32`, expert order). Two calls whose picks differ at a layer with
     /// equal digests differ in the card set they picked from, not the ids.
@@ -2078,7 +2088,7 @@ impl SwapMachine {
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
         let Staging { shared, tx, thread } =
-            SwapMachine::start_staging(ctx, source, slot_bytes, &cfg, rereads)?;
+            SwapMachine::start_staging(ctx, source, slot_bytes, &cfg, layers.end, rereads)?;
         let mut m = SwapMachine {
             rule,
             ledger,
@@ -2213,13 +2223,15 @@ impl SwapMachine {
             .map_err(|e| rule_err("SwapMachine::new", e))
     }
 
-    /// The ring, the staging words and the staging thread over `source`;
+    /// The ring, the staging words and the staging thread over `source`,
+    /// whose pick stamps cover the layer indices below `layers_end`;
     /// `rereads`, the load's, for the first boundary to take.
     fn start_staging(
         ctx: &Arc<CudaContext>,
         source: Arc<dyn SwapSource>,
         slot_bytes: usize,
         cfg: &MachineCfg,
+        layers_end: usize,
         rereads: Rereads,
     ) -> Result<Staging, GpuError> {
         let shared = Arc::new(Shared {
@@ -2235,8 +2247,8 @@ impl SwapMachine {
             deadline: cfg.deadline,
             flush: AtomicBool::new(false),
             served: AtomicU64::new(0),
-            pick_left: (0..cfg.pinned.len()).map(|_| AtomicU64::new(0)).collect(),
-            pick_stamp_ns: (0..cfg.pinned.len()).map(|_| AtomicU64::new(0)).collect(),
+            pick_left: (0..layers_end).map(|_| AtomicU64::new(0)).collect(),
+            pick_stamp_ns: (0..layers_end).map(|_| AtomicU64::new(0)).collect(),
             epoch: Instant::now(),
             stage_ns: AtomicU64::new(0),
             prepare_ns: AtomicU64::new(0),
@@ -3451,6 +3463,16 @@ impl SwapMachine {
         let moved = self.move_pool(stream, slots, layer, &picks, &mut report);
         let moved = self.after_change(moved, || format!("the call's pick of layer {layer}"));
         report.admitted = picks.len();
+        // The rule refused counts of another length than the layer's experts
+        // above, so every flip's ids index them.
+        report.admit_cols = picks
+            .iter()
+            .map(|f| u64::from(counts[f.admit as usize]))
+            .sum();
+        report.victim_cols = picks
+            .iter()
+            .map(|f| u64::from(counts[f.evict as usize]))
+            .sum();
         self.picks = picks;
         moved?;
         report.pick_us = micros(t0);
@@ -3807,7 +3829,9 @@ impl SwapMachine {
     /// stamped nothing past the pick's start (a pick that moved nothing). A
     /// layer the call picks again keeps one stamp cell, so an earlier pick
     /// of it reads the later crossing. The stamps are final once every copy
-    /// landed, which the call's end waited for.
+    /// landed; the call's end orders the engine stream behind the copies, not
+    /// the host, so a caller reads them after it has synchronized the engine
+    /// stream (the engine's readback of the prompt's last token).
     pub fn fill_staged_us(&self, picks: &mut [(usize, CallPick)]) {
         for (_, p) in picks.iter_mut() {
             let stamp = self
