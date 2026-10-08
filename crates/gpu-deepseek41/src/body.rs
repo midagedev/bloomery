@@ -75,12 +75,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
+use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet, TierShape};
 use bloomery_gpu::host::{PassKind, refuse_tier_count};
 use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
+    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap, refuse_expert_tiers,
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
@@ -93,14 +95,14 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
+use model::moe::UNION_MAX_COLS;
 use model::placement::{Machine, Plan, PlanLevers};
-use runtime::swaprule::KeptRows;
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
 };
 use crate::chain::ffn::{
-    CardStacks, Ds41Host, Ds41Tier, FfnIo, FfnPiece, FfnTaps, GoFront, ShadowWork, TierPiece,
+    CardStacks, Ds41Tier, FfnIo, FfnPiece, FfnTaps, GoFront, ShadowWork, TierPiece, host_run,
 };
 use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
@@ -809,7 +811,7 @@ pub struct Body {
     /// The host tier holds the host copy, and its residency machine, when it
     /// runs one, the second reference: the copy lives until both let go.
     slots: Arc<DeviceTensor<u32>>,
-    hybrid: Hybrid<Ds41Host>,
+    hybrid: Hybrid<HostRun>,
     attn: AttnChain,
     ffn: FfnPiece,
     glue: Glue,
@@ -1031,12 +1033,12 @@ impl Body {
 
     /// The host tier: the boundary and what it has served.
     #[must_use]
-    pub fn hybrid(&self) -> &Hybrid<Ds41Host> {
+    pub fn hybrid(&self) -> &Hybrid<HostRun> {
         &self.hybrid
     }
 
     /// The host tier, for a caller that attaches or marks its route trace.
-    pub fn hybrid_mut(&mut self) -> &mut Hybrid<Ds41Host> {
+    pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
         &mut self.hybrid
     }
 
@@ -1640,7 +1642,7 @@ impl Body {
     /// The body's buffers a row's launches borrow, apart from the host half,
     /// and the host tier apart from them: every row bound to the live
     /// sequence.
-    fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<Ds41Host>) {
+    fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<HostRun>) {
         let Ok(parts) = self.parts_with(|seq| Ok::<_, Infallible>(RowSeqs::One(seq)));
         parts
     }
@@ -1650,7 +1652,7 @@ impl Body {
     fn parts_with<'a, E>(
         &'a mut self,
         bind: impl FnOnce(&'a mut Seq) -> Result<RowSeqs<'a>, E>,
-    ) -> Result<(Parts<'a>, &'a mut Hybrid<Ds41Host>), E> {
+    ) -> Result<(Parts<'a>, &'a mut Hybrid<HostRun>), E> {
         let Body {
             layers,
             seq,
@@ -1833,7 +1835,7 @@ impl Parts<'_> {
         l: usize,
         row: usize,
         cur: Cursor,
-        hybrid: &mut Hybrid<Ds41Host>,
+        hybrid: &mut Hybrid<HostRun>,
     ) -> Result<GoFront<'w>, GpuError> {
         let step = self.steps[i];
         let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
@@ -1882,7 +1884,7 @@ impl Parts<'_> {
         row: usize,
         cur: Cursor,
         go: GoFront<'_>,
-        hybrid: &Hybrid<Ds41Host>,
+        hybrid: &Hybrid<HostRun>,
     ) -> Result<(), GpuError> {
         let step = self.steps[i];
         let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
@@ -1932,7 +1934,7 @@ impl Parts<'_> {
         l: usize,
         row: usize,
         cur: &mut Cursor,
-        hybrid: &mut Hybrid<Ds41Host>,
+        hybrid: &mut Hybrid<HostRun>,
     ) -> Result<(), GpuError> {
         let step = self.steps[i];
         let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
@@ -1992,7 +1994,7 @@ fn walk_pair(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
-    hybrid: &mut Hybrid<Ds41Host>,
+    hybrid: &mut Hybrid<HostRun>,
     heads: [&mut Head; PAIR_ROWS],
     what: &'static str,
 ) -> Result<(), GpuError> {
@@ -2504,7 +2506,7 @@ impl Body {
             PAIR_ROWS,
         )?;
         let file = Arc::clone(file);
-        let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
+        let host = host_run(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
         let tier_cards = tiers
             .iter()
             .enumerate()
@@ -2709,71 +2711,43 @@ impl ChainBody for Body {
     }
 }
 
-impl HostServed for Body {
+impl TierBody for Body {
+    type Experts = HostRun;
+
+    fn hybrid(&self) -> &Hybrid<HostRun> {
+        &self.hybrid
+    }
+
+    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
+    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+        Some(ResidencyParts {
+            glue: &mut self.residency_glue,
+            hybrid: &mut self.hybrid,
+            slots: &self.slots,
+        })
+    }
+
     /// The replay's engram rows delivered ([`Body::arrive`]) — row 1's for a
     /// pair, whose row 0's were delivered before the launch — then the host
     /// tier's share of the chain it submitted, served even when the rows
-    /// failed, whose error comes back after it.
-    fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
+    /// failed, whose error comes back after it. A `Cols` chain's pass of
+    /// several slots is served by the union, whose slabs are made here (the
+    /// prompt batch's first make holds them already; a decode that runs
+    /// neither never holds them), after the rows: a slab that could not be
+    /// made leaves them delivered.
+    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         let rows = self.arrive();
-        self.hybrid.serve_captured_of(chain).and(rows)
-    }
-
-    fn noted(&self, e: GpuError) -> GpuError {
-        self.hybrid.noted(e)
-    }
-
-    /// The host tier's refusal that failed the step's service, once
-    /// ([`Hybrid::take_step_refusal`]).
-    fn take_host_refusal(&mut self) -> Option<Refusal> {
-        self.hybrid.take_step_refusal()
-    }
-
-    /// The host tier's refusal poison lifted
-    /// ([`Hybrid::lift_refusal`]) — the settling a reset runs is
-    /// [`Hybrid::settle`]'s ([`Body::reset`]).
-    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.hybrid.lift_refusal(stream)
-    }
-
-    /// The refusal the host tier is poisoned by now
-    /// ([`Hybrid::refusal_poison`]).
-    fn refusal_poison(&self) -> Option<Refusal> {
-        self.hybrid.refusal_poison()
-    }
-
-    /// The host set the placed load read in and locked, which the host tier
-    /// holds ([`Hybrid::residency`]).
-    fn host_residency(&self) -> Option<&HostResidency> {
-        self.hybrid.residency()
-    }
-
-    /// The host tier's residency boundary at `at` ([`Hybrid::swap_at`]), its
-    /// report logged when a binary asked ([`Body::log_residency`]).
-    fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
-        self.residency_glue
-            .at_boundary(&mut self.hybrid, stream, at)
-    }
-
-    fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
-        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
-    }
-
-    fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
-        self.residency_glue.reset(&mut self.hybrid, stream)
-    }
-
-    fn stop_residency(&mut self) {
-        self.residency_glue.stop(&mut self.hybrid);
-    }
-
-    fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
-        self.residency_glue.start(
-            &mut self.hybrid,
-            gpu.context(),
-            gpu.stream(),
-            Arc::clone(&self.slots),
-        )
+        let slabs = if matches!(chain, Chain::Cols(_)) {
+            self.hybrid.host_mut().prepare_union(UNION_MAX_COLS)
+        } else {
+            Ok(())
+        };
+        slabs
+            .and_then(|()| self.hybrid.serve_captured_of(chain))
+            .and(rows)
     }
 }
 

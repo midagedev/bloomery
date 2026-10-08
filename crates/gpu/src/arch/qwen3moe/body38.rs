@@ -124,14 +124,13 @@ use crate::checkpoint::saved::{Identity, Lent, SeqState, Spans};
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::run::{HostRun, HostWidths};
-use crate::host::swap::{
-    BoundaryAt, CallCfg, CallPick, CallReport, PassReport, ResetReport, Residency,
-};
+use crate::host::served::{ResidencyParts, TierBody};
+use crate::host::swap::{CallCfg, CallPick, CallReport, PassReport, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
-use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
+use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows, Slots,
 };
@@ -4029,64 +4028,28 @@ impl Body38 {
     }
 }
 
-impl HostServed for Body38 {
-    fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
+impl TierBody for Body38 {
+    type Experts = HostRun;
+
+    fn hybrid(&self) -> &Hybrid<HostRun> {
+        &self.hybrid
+    }
+
+    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
+    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+        Some(ResidencyParts {
+            glue: &mut self.residency_glue,
+            hybrid: &mut self.hybrid,
+            slots: &self.slots,
+        })
+    }
+
+    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)?;
         planted(&mut self.plant, Plant::AfterLaunch)
-    }
-
-    fn noted(&self, e: GpuError) -> GpuError {
-        self.hybrid.noted(e)
-    }
-
-    fn take_host_refusal(&mut self) -> Option<Refusal> {
-        self.hybrid.take_step_refusal()
-    }
-
-    /// The host tier's refusal poison lifted
-    /// ([`Hybrid::lift_refusal`]) — the settling a reset runs is
-    /// [`Hybrid::settle`]'s ([`Body38::reset`]).
-    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.hybrid.lift_refusal(stream)
-    }
-
-    /// The refusal the host tier is poisoned by now
-    /// ([`Hybrid::refusal_poison`]).
-    fn refusal_poison(&self) -> Option<Refusal> {
-        self.hybrid.refusal_poison()
-    }
-
-    fn host_residency(&self) -> Option<&HostResidency> {
-        self.hybrid.residency()
-    }
-
-    /// The host tier's residency boundary at `at`
-    /// ([`ResidencyGlue::at_boundary`]), its report logged when a binary
-    /// asked ([`Body38::log_residency`]).
-    fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
-        self.residency_glue
-            .at_boundary(&mut self.hybrid, stream, at)
-    }
-
-    fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
-        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
-    }
-
-    fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
-        self.residency_glue.reset(&mut self.hybrid, stream)
-    }
-
-    fn stop_residency(&mut self) {
-        self.residency_glue.stop(&mut self.hybrid);
-    }
-
-    fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
-        self.residency_glue.start(
-            &mut self.hybrid,
-            gpu.context(),
-            gpu.stream(),
-            Arc::clone(&self.slots),
-        )
     }
 }
 
