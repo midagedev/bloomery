@@ -80,6 +80,10 @@ use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 /// own steps.
 #[path = "anthropic.rs"]
 mod anthropic;
+/// Per-token log-probabilities, which the generation loop collects and the
+/// completion and chat answers render.
+#[path = "logprobs.rs"]
+pub(crate) mod logprobs;
 /// OpenAI's text completion API and the chat token counts, a child of this
 /// module so they run the completion and chat paths' own steps.
 #[path = "oaicompl.rs"]
@@ -1172,7 +1176,9 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
 /// completion count), `top_logprobs > 0`, `n > 1`, `tool_choice` other than
 /// `"none"` or `"auto"` (nothing forces a call without a grammar), and a
 /// non-empty `logit_bias`. `null` counts as absent. Other unknown fields are
-/// ignored.
+/// ignored. The two routes whose answers render probabilities take their
+/// fields out of the body before this runs ([`completion_plan_logprobs`],
+/// [`chat_plan_logprobs`]); every other route keeps the refusal.
 ///
 /// The penalties take llama-server's names and defaults (`repeat_penalty` 1,
 /// `frequency_penalty` 0, `presence_penalty` 0, `repeat_last_n` 64) and
@@ -1295,6 +1301,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
         reasoning_budget: reasoning_budget(o)?,
         think_entry: ThinkEntry::Closed,
+        logprobs: None,
     };
     Ok(p)
 }
@@ -1391,7 +1398,7 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
         "ignore_eos": p.ignore_eos,
         "stream": p.stream,
         "logit_bias": [],
-        "n_probs": 0,
+        "n_probs": p.logprobs.as_ref().map_or(0, logprobs::Ask::asked),
         "min_keep": 0,
         "grammar": "",
         "samplers": ["penalties", "top_k", "top_p", "min_p", "temperature"],
@@ -1412,6 +1419,7 @@ fn default_params() -> GenParams {
         cache_prompt: true,
         reasoning_budget: None,
         think_entry: ThinkEntry::Closed,
+        logprobs: None,
     }
 }
 
@@ -2543,7 +2551,9 @@ fn carries_media(v: &Value) -> bool {
 }
 
 /// The last `/completion` object. `tokens` (the generated ids, the
-/// end-of-generation one included) is llama.cpp's `return_tokens` field.
+/// end-of-generation one included) is llama.cpp's `return_tokens` field. A
+/// whole answer that asked for probabilities carries every generated token's
+/// entry in `completion_probabilities`; a stream's came with its chunks.
 fn completion_final(
     state: &State,
     o: &Outcome,
@@ -2573,6 +2583,11 @@ fn completion_final(
     });
     if return_tokens {
         v["tokens"] = json!(o.tokens);
+    }
+    if !p.stream
+        && let Some(ask) = &p.logprobs
+    {
+        v["completion_probabilities"] = Value::Array(ask.whole(&*state.tok));
     }
     v
 }
@@ -2625,8 +2640,22 @@ fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPl
     })
 }
 
+/// [`completion_plan`] with the probabilities `/completion` renders:
+/// `n_probs`, taken out of `b` first ([`logprobs::completion_ask`]) so the
+/// shared steps' refusal stays every other route's; the plan's generation
+/// carries what was asked.
+fn completion_plan_logprobs(
+    state: &State,
+    b: &mut Map<String, Value>,
+) -> Result<CompletionPlan, ApiError> {
+    let ask = logprobs::completion_ask(b, state.info.n_vocab)?;
+    let mut plan = completion_plan(state, b)?;
+    plan.p.logprobs = ask;
+    Ok(plan)
+}
+
 fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let plan = match body(req).and_then(|b| completion_plan(state, &b)) {
+    let plan = match body(req).and_then(|mut b| completion_plan_logprobs(state, &mut b)) {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -2651,6 +2680,9 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
+    // The tokens whose entries went out with a chunk: each chunk carries the
+    // tokens its event counts past them.
+    let mut sent = 0;
     let r = {
         let mut sink = |ev: Event<'_>, slot: usize| -> io::Result<()> {
             if stream.is_none() {
@@ -2671,6 +2703,13 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
                     let mut v = json!({ "content": text, "stop": false, "id_slot": slot, "multimodal": false });
                     if tpt {
                         v["timings"] = t.to_json();
+                    }
+                    if let Some(ask) = &p.logprobs {
+                        let entries = ask.entries(sent, t.predicted_n, &*state.tok);
+                        sent = t.predicted_n;
+                        if !entries.is_empty() {
+                            v["completion_probabilities"] = Value::Array(entries);
+                        }
                     }
                     v
                 }
@@ -2898,9 +2937,21 @@ fn chat_plan(
     })
 }
 
+/// [`chat_plan`] with the probabilities the chat path renders: `logprobs` and
+/// `top_logprobs`, taken out of `b` first ([`logprobs::chat_ask`]) so the
+/// shared steps' refusal stays every other route's; the request's own
+/// `reasoning_format`; the plan's generation carries what was asked.
+fn chat_plan_logprobs(state: &State, b: &mut Map<String, Value>) -> Result<ChatPlan, ApiError> {
+    let ask = logprobs::chat_ask(b, state.info.n_vocab)?;
+    let b: &Map<String, Value> = b;
+    let mut plan = chat_plan(state, b, b.get("reasoning_format"))?;
+    plan.p.logprobs = ask;
+    Ok(plan)
+}
+
 fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let parsed = body(req).and_then(|b| {
-        let plan = chat_plan(state, &b, b.get("reasoning_format"))?;
+    let parsed = body(req).and_then(|mut b| {
+        let plan = chat_plan_logprobs(state, &mut b)?;
         Ok((b, plan))
     });
     let (b, plan) = match parsed {
@@ -2921,6 +2972,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .and_then(Value::as_str)
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
+    let vocab = &*state.tok;
     if !p.stream {
         return match run_gen(state, &input, prompt, &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
@@ -2929,7 +2981,18 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 .try_push(&o.content)
                 .and_then(|_| parser.try_finish())
             {
-                Ok(_) => send_json(w, req, 200, &chat_final(&ids_meta, &o, parser.message())),
+                Ok(_) => {
+                    let lp = p
+                        .logprobs
+                        .as_ref()
+                        .map(|a| logprobs::chat_object(a.whole(vocab)));
+                    send_json(
+                        w,
+                        req,
+                        200,
+                        &chat_final(&ids_meta, &o, parser.message(), lp),
+                    )
+                }
                 Err(e) => send_error(w, req, &tool_markup_error(&e)),
             },
         };
@@ -2940,6 +3003,10 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     // Markup that does not parse stops the generation (the sink fails) and
     // ends the stream with an error event instead of a dropped connection.
     let mut markup: Option<MarkupError> = None;
+    // The tokens whose entries went out: a chunk's last delta carries the
+    // tokens its event counts past them; an event that makes no delta leaves
+    // its tokens to the next chunk that has one, the last chunk what is left.
+    let mut sent = 0;
     let r = {
         let meta = &ids_meta;
         let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
@@ -2975,10 +3042,21 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                             return Err(io::Error::other("tool-call markup does not parse"));
                         }
                     };
-                    for delta in meta.deltas(&d) {
+                    let deltas = meta.deltas(&d);
+                    let n = deltas.len();
+                    for (i, delta) in deltas.into_iter().enumerate() {
                         let mut v = meta.chunk(json!([{
                             "finish_reason": null, "index": 0, "delta": delta,
                         }]));
+                        if i + 1 == n
+                            && let Some(ask) = &p.logprobs
+                        {
+                            let entries = ask.entries(sent, t.predicted_n, vocab);
+                            sent = t.predicted_n;
+                            if !entries.is_empty() {
+                                v["choices"][0]["logprobs"] = logprobs::chat_object(entries);
+                            }
+                        }
                         if tpt {
                             v["timings"] = t.to_json();
                         }
@@ -3016,15 +3094,31 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 );
             }
         };
-        for delta in ids_meta.deltas(&d) {
-            sse(
-                s,
-                &ids_meta.chunk(json!([{ "finish_reason": null, "index": 0, "delta": delta }])),
-            )?;
+        // The tokens no chunk carried yet go with the last delta, or with the
+        // finishing chunk when the parser releases none.
+        let mut left = p
+            .logprobs
+            .as_ref()
+            .map(|a| a.entries(sent, o.timings.predicted_n, vocab))
+            .filter(|e| !e.is_empty());
+        let deltas = ids_meta.deltas(&d);
+        let n = deltas.len();
+        for (i, delta) in deltas.into_iter().enumerate() {
+            let mut v =
+                ids_meta.chunk(json!([{ "finish_reason": null, "index": 0, "delta": delta }]));
+            if i + 1 == n
+                && let Some(e) = left.take()
+            {
+                v["choices"][0]["logprobs"] = logprobs::chat_object(e);
+            }
+            sse(s, &v)?;
         }
         let mut last = ids_meta.chunk(json!([{
             "finish_reason": chat_finish_reason(o, parser.message()), "index": 0, "delta": {},
         }]));
+        if let Some(e) = left.take() {
+            last["choices"][0]["logprobs"] = logprobs::chat_object(e);
+        }
         if include_usage {
             sse(s, &last)?;
             last = ids_meta.chunk(json!([]));
@@ -3037,8 +3131,9 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
 }
 
 /// The non-stream response. `reasoning_content` and `tool_calls` appear only when
-/// non-empty, as llama-server writes them.
-fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
+/// non-empty, as llama-server writes them; `logprobs`, the chat path's
+/// probabilities object, only when the request asked for it.
+fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message, probs: Option<Value>) -> Value {
     let mut message = json!({ "role": "assistant", "content": m.content });
     if !m.reasoning.is_empty() {
         message["reasoning_content"] = json!(m.reasoning);
@@ -3046,12 +3141,16 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
     if !m.calls.is_empty() {
         message["tool_calls"] = m.calls.iter().map(|c| meta.tool_call(c)).collect();
     }
+    let mut choice = json!({
+        "finish_reason": chat_finish_reason(o, m),
+        "index": 0,
+        "message": message,
+    });
+    if let Some(lp) = probs {
+        choice["logprobs"] = lp;
+    }
     json!({
-        "choices": [{
-            "finish_reason": chat_finish_reason(o, m),
-            "index": 0,
-            "message": message,
-        }],
+        "choices": [choice],
         "created": meta.created,
         "model": meta.model,
         "object": "chat.completion",
@@ -3352,9 +3451,11 @@ mod tests {
     }
 
     /// `logprobs` asks for probabilities as a bool on the chat path and as a
-    /// count on OpenAI's text completion path. Neither is served, so any value
-    /// but `false` is a 400 naming the field on both generation paths, the
-    /// count form too; `false` and `null` are absent.
+    /// count on OpenAI's text completion path. `/completion` reads its
+    /// probabilities from `n_probs`, so any `logprobs` but `false` is a 400
+    /// naming the field there; the chat path serves the bool
+    /// ([`super::logprobs`]'s tests) and refuses the count form by name;
+    /// `false` and `null` are absent.
     #[test]
     fn logprobs_in_either_form_is_refused_by_name() {
         let (addr, _state, _ended) = super::testserve::spawn(
@@ -3367,18 +3468,19 @@ mod tests {
             )
         };
         let completion = |lp: &str| format!(r#"{{"prompt":"ab","max_tokens":1,"logprobs":{lp}}}"#);
-        for lp in ["true", "5", "0"] {
-            for (path, body) in [
-                ("/completion", completion(lp)),
-                ("/v1/chat/completions", chat(lp)),
-            ] {
-                let (status, text) = roundtrip(addr, "POST", path, &body);
-                assert_eq!(status, 400, "{path} logprobs {lp}: {text}");
-                assert!(
-                    text.contains("logprobs"),
-                    "{path} logprobs {lp}: the 400 names the field: {text}"
-                );
-            }
+        for (lp, path, body) in [
+            ("true", "/completion", completion("true")),
+            ("5", "/completion", completion("5")),
+            ("0", "/completion", completion("0")),
+            ("5", "/v1/chat/completions", chat("5")),
+            ("0", "/v1/chat/completions", chat("0")),
+        ] {
+            let (status, text) = roundtrip(addr, "POST", path, &body);
+            assert_eq!(status, 400, "{path} logprobs {lp}: {text}");
+            assert!(
+                text.contains("logprobs"),
+                "{path} logprobs {lp}: the 400 names the field: {text}"
+            );
         }
         for (path, body) in [
             ("/completion", completion("false")),
