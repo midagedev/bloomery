@@ -6,7 +6,7 @@
 //! Per layer the gate makes the layer's dense tensors resident with
 //! `Weights::load_where` and uploads the card's routed stacks compacted in slot
 //! order; the host tier is served in-process — a `Hybrid` over the boundary
-//! with the V4.1 host computation (`Ds41Host`, the file's `HostLayer`s). Per set
+//! with the V4.1 host computation (`HostRun`, the file's `HostLayer`s). Per set
 //! it injects the streams the sub-layer reads (`hc_attn_post-L`) and its folded
 //! input (`hc_ffn_pre-L`), runs the piece eagerly (the host serves the layer as
 //! the piece hands it over) and checks three things:
@@ -112,12 +112,15 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use std::sync::Arc;
+
     use bloomery_gpu::fused::FusedKernels;
+    use bloomery_gpu::host::run::HostRun;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HOST, Hybrid, SlotMap};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, NodeInfo, Q8Act};
     use bloomery_gpu_deepseek41::chain::ffn::{
-        CardStacks, Ds41Host, FfnIo, FfnKernels, FfnPiece, Post, combine_elem,
+        CardStacks, FfnIo, FfnKernels, FfnPiece, Post, combine_elem, host_run,
     };
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
@@ -1250,7 +1253,7 @@ mod gate {
     fn run_piece(
         gpu: &Gpu,
         piece: &mut FfnPiece,
-        hybrid: &mut Hybrid<Ds41Host>,
+        hybrid: &mut Hybrid<HostRun>,
         io: &mut Io,
         lc: &LayerCx<'_>,
     ) -> Result<Out, GateError> {
@@ -1264,7 +1267,7 @@ mod gate {
     fn enqueue(
         gpu: &Gpu,
         piece: &mut FfnPiece,
-        hybrid: &mut Hybrid<Ds41Host>,
+        hybrid: &mut Hybrid<HostRun>,
         io: &mut Io,
         lc: &LayerCx<'_>,
     ) -> Result<(), bloomery_gpu::GpuError> {
@@ -1286,7 +1289,7 @@ mod gate {
     fn read_piece(
         gpu: &Gpu,
         piece: &FfnPiece,
-        hybrid: &Hybrid<Ds41Host>,
+        hybrid: &Hybrid<HostRun>,
         io: &Io,
         lc: &LayerCx<'_>,
     ) -> Result<Out, GateError> {
@@ -1875,7 +1878,7 @@ mod gate {
             n_used: N_USED,
         };
         let boundary = Boundary::new(gpu.context(), stream, shape)?;
-        let tier = Ds41Host::build(Split::open(&path)?, &hp, 0..hp.n_layer, r8)?;
+        let tier = host_run(Arc::new(Split::open(&path)?), &hp, 0..hp.n_layer, r8)?;
         let mut hybrid = Hybrid::new(boundary, map.clone(), tier, hp.n_layer)?;
         let mut piece = FfnPiece::new(&gpu, &hp, &map)?;
         let mut op = Op::new(&gpu, &hp)?;

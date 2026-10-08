@@ -19,6 +19,7 @@
 //! are enqueued; the engine's step and the pair pass observe nothing.
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Chain, Hybrid};
 use bloomery_gpu::model::Rows;
 use bloomery_gpu::weights::Weights;
@@ -27,7 +28,7 @@ use cuda_core::CudaStream;
 use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
 
 use super::{Body, Cursor, ListOf, PAIR_ROWS, Parts, Seam};
-use crate::chain::ffn::{Ds41Host, GoFront};
+use crate::chain::ffn::GoFront;
 
 /// What the walks' errors name.
 const WHAT: &str = "deepseek41 Body::enqueue_chain";
@@ -45,7 +46,7 @@ pub(super) fn walk_step(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
-    hybrid: &mut Hybrid<Ds41Host>,
+    hybrid: &mut Hybrid<HostRun>,
     heads: [Option<&mut Head>; PAIR_ROWS],
     observe: &mut Observe<'_>,
 ) -> Result<(), GpuError> {
@@ -77,7 +78,7 @@ pub(super) fn walk_step(
 /// is served as, [`Rows::CHAIN`]).
 pub(super) struct HostLeg<'a> {
     stream: &'a CudaStream,
-    hybrid: &'a mut Hybrid<Ds41Host>,
+    hybrid: &'a mut Hybrid<HostRun>,
 }
 
 impl Port for HostLeg<'_> {

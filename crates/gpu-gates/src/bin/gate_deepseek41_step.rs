@@ -231,7 +231,7 @@ mod gate {
     use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD, NodeInfo};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PrefillMode, Seam};
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
-    use bloomery_gpu_deepseek41::chain::ffn::{Ds41Host, FfnPiece};
+    use bloomery_gpu_deepseek41::chain::ffn::{FfnPiece, host_run};
     use bloomery_gpu_deepseek41::chain::glue::Glue;
     use bloomery_gpu_deepseek41::indexer::{HEAD_DIM as KEY_DIM, HEADS as KEY_HEADS};
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
@@ -4020,7 +4020,7 @@ mod gate {
         let (hc, _) = hc_pre(man, &names::hc_ffn_scale(l))?;
         let s = named(man, &format!("l_out-{l}"))?;
         let first = split.shard_path(0).ok_or("the file has no shard 0")?;
-        let mut host = Ds41Host::build(Split::open(first)?, hp, l..l + 1, r8)?;
+        let mut host = host_run(std::sync::Arc::new(Split::open(first)?), hp, l..l + 1, r8)?;
         let xt = Tensor2 {
             ne0: x.len(),
             ne1: 1,
