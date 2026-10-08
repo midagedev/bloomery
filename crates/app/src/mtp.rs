@@ -280,9 +280,10 @@ struct Refresh<A> {
     pos0: u32,
     walk: A,
     first: usize,
-    /// A store walk already wrote the rows ([`Draft::held`]'s step row): a
-    /// step after them walks nothing for them, and the next chain walks them
-    /// again for its head.
+    /// A store walk already wrote the rows (a step's row, [`Draft::stepped`]:
+    /// every step store-walks the refresh it records): a step after them
+    /// walks nothing for them, and the next chain walks them again for its
+    /// head.
     stored: bool,
 }
 
@@ -1034,9 +1035,15 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// the step's row follows them and the store must hold every position
     /// below the next chain's; then `next`, the id taken after the step, at
     /// the position after it, with the hidden row the step wrote
-    /// ([`MtpBody::STEP_ARENA`]), as the next refresh. Refused by name when
-    /// the waiting rows read the step's own arena, which the step has
-    /// overwritten, unless a store walk already wrote them ([`Draft::held`]).
+    /// ([`MtpBody::STEP_ARENA`]), as the next refresh, its store bytes
+    /// written in this same call: the next step overwrites that arena, and
+    /// a pass the width chooser holds back steps the target before the
+    /// draft hears of it ([`Draft::held`], this same call), so no later
+    /// call can be counted on to walk the row first — the next chain walks
+    /// it again for its head, and a step after it walks nothing for it. A
+    /// row past the context is left unwalked: no chain runs there. Refused
+    /// by name when the waiting rows read the step's own arena, which the
+    /// step has overwritten, unless a store walk already wrote them.
     fn stepped(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
         if self.skip.is_some() {
             return Ok(());
@@ -1073,33 +1080,27 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             if r.walk == B::STEP_ARENA {
                 return Err(SessionError::Refused(format!(
                     "{WHAT}: a step after rows whose hidden rows the step's own arena held (a \
-                     prompt fed by steps): the step overwrote them"
+                     prompt fed by steps): the step overwrote them (rows at position {})",
+                    r.pos0
                 )));
             }
             B::walk(t.model_mut(), r.feed(), self.head, self.mode)?;
         }
+        let (head, pos0, ctx) = (self.head, t.pos(), t.ctx() as usize);
         self.next = Some(Refresh {
             tokens: vec![next],
-            pos0: t.pos(),
+            pos0,
             walk: B::STEP_ARENA,
             first: 0,
             stored: false,
         });
-        Ok(())
-    }
-
-    /// [`Draft::stepped`] of a pass the width chooser held back, then the
-    /// step's own row walked into the store at once ([`WalkMode::Store`]):
-    /// the next step overwrites the arena that row reads, and the chooser
-    /// may hold that step back too. The row stays the next refresh, which
-    /// the next chain walks again for its head and a step after it skips. A
-    /// row past the context is left unwalked: no chain runs there.
-    fn held(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
-        self.stepped(t, last, next)?;
-        let (head, ctx) = (self.head, t.ctx() as usize);
-        if self.skip.is_none()
+        // The step's row reads the step's own arena, which the next step
+        // overwrites — a chooser-held pass's step reaches the draft here
+        // again with no walk between — so its store bytes are written at
+        // once; a chain walks the row again for its head. A row past the
+        // context stays unwalked: no chain runs there.
+        if (pos0 as usize) < ctx
             && let Some(r) = &mut self.next
-            && r.pos0 as usize + r.tokens.len() <= ctx
         {
             B::walk(t.model_mut(), r.feed(), head, WalkMode::Store)?;
             r.stored = true;
