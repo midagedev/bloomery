@@ -28,9 +28,10 @@
 //!
 //! `--place` set runs its word as given; unset, the common rule every
 //! serving seat takes decides (`generate::Place::choose`, by this family's
-//! `q38place::Q38_RULE`: no break-even yet, so two cards run `a` — one card `a` on
-//! the one card), its `place unset` record the first of the seat's records
-//! after a set residency lever's.
+//! `q38place::Q38_RULE`: two cards keep the offer `bp` while its plan holds the
+//! rule's break-even experts on the tier card or more and more than none —
+//! else `a`; one card `a` on the one card), its `place unset` record among
+//! the seat's first records after a set residency lever's.
 //!
 //! The positions a slot serves are the stores the load sized
 //! (`--ctx-size` names one request's context: while `--parallel` names no
@@ -992,28 +993,30 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let mut a = parse_args(args)?;
     // The placement the seat runs by: the flag's word, or unset the common
-    // rule's (`Place::choose`) on the census, read once. The kind is read by
-    // structure — the flag's when set, and unset `Bp` only where the chosen
-    // placement holds a tier card — never off the chosen word, which
-    // `Place::on` spells as card names when an alias lands on other devices.
+    // rule's (`Place::choose`) on the census, read once — chosen below, once
+    // the plan's inputs are known, the rule asking the offer's plan for its
+    // tier count. The kind is read by structure — the flag's when set, and
+    // unset `Bp` only where the chosen placement holds a tier card — never
+    // off the chosen word, which `Place::on` spells as card names when an
+    // alias lands on other devices. The draft's rule reads the placement's
+    // stage alone (`place_a`), and an unset flag's offer never names the
+    // gate card, so the flag's own place — `a`'s stage — stands for the
+    // offer until the rule chooses.
     let census = gpu_census::census()?;
-    let chosen = q38place::choose(a.flag.map(|p| p.cards), &census)?;
-    chosen.record().eprint();
-    a.place = Place38 {
-        kind: match a.flag {
-            Some(f) => f.kind,
-            None if chosen.place.tier_cards().is_empty() => Kind38::A,
-            None => Kind38::Bp,
-        },
-        cards: chosen.place,
-    };
+    let draft_at = a.flag.unwrap_or(Place38::A);
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::describe(&split)?;
     // The draft's one context condition (a window's positions) holds at any
     // context the rule grants; it is asked again at the final context below.
-    let (mtp, draft_off) = draft38(&levers, a.place, a.ctx.unwrap_or(CTX), &draft_path, &inputs)?;
+    let (mtp, draft_off) = draft38(
+        &levers,
+        draft_at,
+        a.ctx.unwrap_or(CTX),
+        &draft_path,
+        &inputs,
+    )?;
     // A draft lever set on a server that drafts nothing is refused, with why.
     if let Some(why) = &draft_off {
         if levers.mtp_head_rows().is_some() {
@@ -1104,6 +1107,37 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             a.ctx.unwrap_or_default()
         );
     }
+    // The common rule's choice (the comment at the draft's rule above): the
+    // plan of the offer at the seat's own terms — the draft the flag's stage
+    // resolved, the slots, the asked-or-default context, which the context
+    // search below asks again at the chosen placement — names the tier count
+    // the rule holds against its break-even; a refused plan of the offer
+    // runs `a`, the refusal named on stderr, and an unset flag never refuses
+    // a load that `--place a` serves.
+    let chosen = q38place::choose(a.flag.map(|p| p.cards), &census, |offer| {
+        let specs = offer.card_specs()?;
+        q38place::tier_experts(
+            &inputs,
+            (specs[0], specs[1]),
+            (
+                u64::try_from(a.ctx.unwrap_or(CTX))?,
+                u64::try_from(ubatch_for(a.ctx.unwrap_or(CTX))?)?,
+            ),
+            experts,
+            &plan_levers,
+            mtp_inputs.as_ref(),
+            slots,
+        )
+    })?;
+    chosen.record().eprint();
+    a.place = Place38 {
+        kind: match a.flag {
+            Some(f) => f.kind,
+            None if chosen.place.tier_cards().is_empty() => Kind38::A,
+            None => Kind38::Bp,
+        },
+        cards: chosen.place,
+    };
     let plans = Plans {
         inputs: &inputs,
         place: a.place,

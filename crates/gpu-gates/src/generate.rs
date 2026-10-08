@@ -1890,6 +1890,42 @@ mod tests {
         );
     }
 
+    /// The Qwen3.8 family's break-even as its rule states it
+    /// (`shared/qwen38_place.rs`'s `Q38_RULE`, mirrored here — the bins'
+    /// module is out of the lib's reach; the card file that decides it holds
+    /// the sitting and the derivation): a tier count at or past it keeps the
+    /// offer `bp`, one below it and no expert run `a`, the count named.
+    #[test]
+    fn the_q38_break_even_keeps_bp() {
+        const BREAK_EVEN: u64 = 1_152;
+        const RULE: TierRule = TierRule {
+            tiers: 1,
+            break_even: Some(BREAK_EVEN),
+            basis: "docs/cards/q38bpbug-ab.card",
+        };
+        let at = |tier: u64| {
+            let w = Place::choose(None, &census(&["3090", "A6000"]), RULE, move |_| Ok(tier))
+                .unwrap_or_else(|e| panic!("{e}"));
+            (w.place.name(), w.why, w.tier_experts)
+        };
+        for n in [BREAK_EVEN, BREAK_EVEN + 1] {
+            assert_eq!(
+                at(n),
+                ("bp", "two cards, tier at or past the break-even", Some(n)),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            at(BREAK_EVEN - 1),
+            (
+                "a",
+                "two cards, tier under the break-even",
+                Some(BREAK_EVEN - 1)
+            )
+        );
+        assert_eq!(at(0), ("a", "two cards, the tier holds no expert", Some(0)));
+    }
+
     /// The Qwen3.8 seat's break-even at its nominal reply of 277 tokens, on
     /// the seat's rates (`serve_seats/qwen38.rs`: `PLAIN_TPS`, `DRAFTED_TPS`,
     /// `PROMPT_IDS_PER_S`, and `BP_PROMPT_RATIO` for `bp`): the ubatch walk's

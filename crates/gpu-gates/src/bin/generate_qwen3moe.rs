@@ -67,9 +67,11 @@
 //! ubatch walk, not the pass) — and printed as a `plan` line. A `place unset`
 //! record, first of the run's records after a set residency lever's, names
 //! the placement and why: the common rule's
-//! (`generate::Place::choose` by `q38place::Q38_RULE`), so unset is `a` (no
-//! break-even yet) and a card list that is none of `a`, `gate` and `bp` is
-//! refused by name. Its `--prefill` is `auto` (the default: `gemm` for a prompt
+//! (`generate::Place::choose` by `q38place::Q38_RULE`), so unset keeps the
+//! cards' offer — `bp` on two cards while its plan holds the rule's
+//! break-even experts on the tier card or more and more than none, else `a`
+//! — and a card list that is none of `a`, `gate` and `bp` is refused by
+//! name. Its `--prefill` is `auto` (the default: `gemm` for a prompt
 //! of nine positions or more, `pass` below; `gemm` at every length under
 //! `bp`), `gemm` (ubatches of up to the
 //! load's size through the host tier's batch port at their width, the Q8_0
@@ -895,8 +897,21 @@ mod cli {
     /// record printed: a set word as given, `a`, `gate` or `bp` (plan (b′): the
     /// next-largest card as the largest's expert tier; a card list spelled as
     /// one of them is it, any other list has no Qwen3.8 plan and is refused by
-    /// name), else `a`.
-    fn place38(arg: Option<&str>) -> Result<Place, GateError> {
+    /// name), else the cards' offer — kept when its plan holds the rule's
+    /// break-even experts on the tier card or more and more than none. The
+    /// plan the rule asks for is the load this run would open at the offer
+    /// (the draft's MTP plan when the run drafts — the offer's stage is plan
+    /// (a)'s, the rule never offering the gate card, so the draft's rule
+    /// reads the offer's own decision — else the plain plan of the run's
+    /// slot count) at the run's context; a plan that refuses runs `a`, the
+    /// refusal named on stderr, and the load plans the chosen placement
+    /// again (planning is milliseconds).
+    fn place38(
+        arg: Option<&str>,
+        (file, levers, experts): (&Split, &Levers, Experts),
+        (ctx, logits, slots): (usize, bool, usize),
+        arms: &[Arm],
+    ) -> Result<Place, GateError> {
         let flag = match arg {
             None => None,
             Some(word) => {
@@ -912,7 +927,35 @@ mod cli {
                 Some(place)
             }
         };
-        let chosen = q38place::choose(flag, &gpu_census::census()?)?;
+        let chosen = q38place::choose(flag, &gpu_census::census()?, |offer| {
+            let inputs = PlanInputs::describe(file)?;
+            let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
+            let mtp = match draft {
+                Draft38::Off => None,
+                Draft38::Mtp => {
+                    let head = head_rows_of(levers.mtp_head_rows(), file, inputs.spec.vocab)?;
+                    let (draft_path, from) = draft_file(levers.mtp_draft(), &ref_model_path()?);
+                    let draft_split = Split::open(&draft_path).map_err(|e| {
+                        format!(
+                            "open the MTP draft {} ({}): {e}",
+                            draft_path.display(),
+                            from.describe()
+                        )
+                    })?;
+                    Some(MtpInputs::read(&draft_split, file, &inputs, head.rows)?)
+                }
+            };
+            let specs = offer.card_specs()?;
+            q38place::tier_experts(
+                &inputs,
+                (specs[0], specs[1]),
+                (u64::try_from(ctx)?, u64::try_from(ubatch_for(ctx)?)?),
+                experts,
+                &PlanLevers::from_levers(levers)?,
+                mtp.as_ref(),
+                if mtp.is_some() { 1 } else { slots },
+            )
+        })?;
         chosen.record().print();
         Ok(chosen.place)
     }
@@ -1271,7 +1314,12 @@ mod cli {
                 if let Some(d) = seed_depth {
                     return Err(no_seed38(d));
                 }
-                let place = place38(place.as_deref())?;
+                let place = place38(
+                    place.as_deref(),
+                    (&file, &levers, experts),
+                    (ctx, logits, slots),
+                    &arms,
+                )?;
                 let (draft, off) = draft38(&levers, place, logits, &arms, ctx)?;
                 if slots > 1 && draft == Draft38::Mtp {
                     return Err(format!(

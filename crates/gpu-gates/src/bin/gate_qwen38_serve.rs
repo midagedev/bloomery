@@ -430,6 +430,10 @@ mod gate {
     /// The residency clause's word: set explicitly, one the lever takes; no
     /// seed expert pinned, one spare a layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
+    /// The Qwen3.8 family's unset rule as the server names it
+    /// (`shared/qwen38_place.rs`'s `Q38_RULE`): the break-even experts and
+    /// the card file that decides them.
+    const BREAK_EVEN38: u64 = 1_152;
 
     /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule — the server's
     /// reading of the inherited environment.
@@ -2179,9 +2183,10 @@ mod gate {
         );
         // The common rule's own record on the unset flag: the pin leaves one
         // card visible, so the offer is `a` on it and the plan is never
-        // asked. FAIL-first: a seat that keeps a hard-coded default
-        // placement names `why=set`; one that runs `bp` on a one-card view
-        // never listens; a rule with a break-even names it and asks the plan.
+        // asked, the rule's break-even and basis named beside it. FAIL-first:
+        // a seat that keeps a hard-coded default placement names `why=set`;
+        // one that runs `bp` on a one-card view never listens; a rule that
+        // asks the plan on one card names a tier count.
         let placed = seat_log(&err_log)?.one(&record::PLACE_UNSET)?;
         let (place, why, tier, break_even, basis) = (
             placed.word("place")?,
@@ -2200,7 +2205,7 @@ mod gate {
             place == "a"
                 && why == "one card"
                 && tier.is_none()
-                && break_even.is_none()
+                && break_even == Some(BREAK_EVEN38)
                 && basis == "docs/cards/q38bpbug-ab.card",
         );
         check(

@@ -72,6 +72,16 @@
 //!   by the recurrent stores (the delta layers ran it already); the flag is
 //!   then raised, both streams drain, and a reset is refused by the lost
 //!   card's poison, which a reset does not lift.
+//!
+//! Before the arms' loads, one child run of `generate_qwen3moe` beside this
+//! binary with no `--place` takes the common unset rule
+//! (`generate::Place::choose`, by the Qwen3.8 family's rule): on this gate's
+//! two cards its `place unset` record keeps `bp`, the offer's tier at or
+//! past the rule's break-even, naming the tier's experts in the plan at the
+//! child's default context and the rule's break-even and basis. The clause
+//! is file-bound (a fixture's plan puts another count on the tier), and the
+//! child takes this gate's environment less the placed levers — a run with
+//! no `--place` refuses them by name.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -101,6 +111,7 @@ mod gate {
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
     use bloomery_gpu_gates::q38_fixture as q38;
+    use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::tier::Tag;
     use bloomery_gpu_gates::{
         GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
@@ -147,6 +158,16 @@ mod gate {
     const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4);
     // PIN(2026-10-06): 8 -> 9, the rows' copy out; launches storing into the page held 385 against 433.
     const _: () = assert!(TIER_LAYER_NODES == 9);
+    /// Prompt ids the unset-rule clause's child runs.
+    const UNSET_TOKENS: usize = 8;
+    /// The Qwen3.8 family's unset rule as the child names it
+    /// (`shared/qwen38_place.rs`'s `Q38_RULE`): the break-even experts and
+    /// the card file that decides them.
+    const BREAK_EVEN: u64 = 1_152;
+    const TIER_BASIS: &str = "docs/cards/q38bpbug-ab.card";
+    /// The experts the child's plan of `bp` puts on this box's 3090 at its
+    /// default context, a band for the free bytes each census reads.
+    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 7_230..=7_242;
 
     struct Args {
         union: bool,
@@ -1051,6 +1072,78 @@ mod gate {
         }
     }
 
+    /// `generate_qwen3moe`'s first record of `kind` of a short run of `ids`
+    /// under `args`: the binary beside this one, its stdout read whole by
+    /// its kinds, an error naming the run on a non-zero exit. The child takes
+    /// this gate's environment less the placed levers — a run with no
+    /// `--place` refuses them by name, and the clause holds the default run.
+    fn child_record(
+        kind: &'static record::Kind,
+        args: &[&str],
+        ids: &[u32],
+    ) -> Result<Fields, GateError> {
+        let exe = std::env::current_exe()?.with_file_name("generate_qwen3moe");
+        let tokens: Vec<String> = ids.iter().map(u32::to_string).collect();
+        let out = std::process::Command::new(&exe)
+            .args(args)
+            .arg("--tokens")
+            .arg(tokens.join(","))
+            .arg("-n")
+            .arg("2")
+            .env_remove(CARD_BUDGET)
+            .env_remove(HOST_POPULATE)
+            .env_remove(HOST_LOCK)
+            .env_remove(CARD_DONTNEED)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "generate_qwen3moe {}: {}; stderr: {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        let stdout = String::from_utf8(out.stdout)?;
+        let log = record::Log::of(&stdout, record::GENERATE_QWEN3MOE)
+            .named(format!("generate_qwen3moe {}", args.join(" ")));
+        Ok(log.one(kind)?)
+    }
+
+    /// The `place unset` record a child run with no `--place` prints: the
+    /// common rule's choice on this process's cards ([`Self::child_record`]).
+    fn unset_record(ids: &[u32]) -> Result<Fields, GateError> {
+        child_record(&record::PLACE_UNSET, &[], ids)
+    }
+
+    /// The unset-rule clause (the module header): a child run with no
+    /// `--place` keeps the offer `bp` at or past the family's break-even,
+    /// its record naming the word, why, the offer's tier count at the
+    /// child's default context, and the rule's break-even and basis.
+    /// FAIL-first: a CLI that keeps a placement of its own prints no `place
+    /// unset` line, and a rule with no break-even answers "no sitting has
+    /// shown the tier not slower" — both red here.
+    fn records_unset(ids: &[u32]) -> Result<bool, GateError> {
+        let p = unset_record(ids)?;
+        let (place, why) = (p.word("place")?, p.text("why")?);
+        let tier = p.opt_u64("tier_experts")?;
+        let ok = place == "bp"
+            && why == "two cards, tier at or past the break-even"
+            && tier.is_some_and(|t| BP_TIER_EXPERTS.contains(&t) && t >= BREAK_EVEN)
+            && p.opt_u64("break_even")? == Some(BREAK_EVEN)
+            && p.opt_word("basis")? == Some(TIER_BASIS);
+        println!(
+            "no --place: place unset place={place} why={why} tier_experts={tier:?} \
+             break_even={:?} basis={:?}: {}",
+            p.opt_u64("break_even")?,
+            p.opt_word("basis")?,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
@@ -1081,6 +1174,20 @@ mod gate {
         let tl = tier_layers(&plan);
         let ids = prose38(PROMPT + 32)?;
         let prompt_ids = prose38(PROMPT_U)?;
+        // The unset-rule clause (the module header), before this gate's own
+        // loads: the cards as empty as the clause's band holds.
+        if q38::clause(
+            "records-unset: the unset rule keeps bp at the real file's tier size",
+            Tag::FileBound,
+        )? {
+            pass &= match records_unset(&ids[..UNSET_TOKENS]) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("records-unset: {e}");
+                    false
+                }
+            };
+        }
         let mut off_prompt = None;
         let mut last: Option<Session<Body38>> = None;
         let mut off_run = None;

@@ -1583,7 +1583,7 @@ gate-gpu-qwen38-residency:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard --bin generate_qwen3moe && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's

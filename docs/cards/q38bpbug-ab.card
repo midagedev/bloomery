@@ -58,3 +58,43 @@ decide-below: bp still loses or gains under +1 %: one functional BLOOMERY_STEP_S
   gap and the leg (the A6000's shadow, not the tier, now bounds the phase) before any README change
 decide-above: bp gains past +9 %: re-derive the gap term, which then fell with the tier's lag (the A6000's join and
   front), before writing the row
+#
+# Measured 2026-10-09 (the lead's sitting; the log this card's runner names, its witness stamps
+# 2026-10-08T15:32Z; one lease, 4 interleaved rounds, prose 512 + 96 tokens, ctx 4352, draft off,
+# residency unset — both arms' load lines mid-p130-s1, the witness blocks clean, no
+# [cold]/[cpu-busy]/[other-busy] row, no Xid, the 3090 at its 250 W cap):
+#   a   61.72 tok/s (step mean 16.20 ms), pp p512 1,033.87
+#   bp  63.90 tok/s (step mean 15.65 ms), pp p512 1,427.77
+#   decode bp/a 1.0353 +- 0.0081 (paired by round, n 4); pp p512 1.3811 +- 0.0388. The sitting's bp
+# plan [derived]: the tier 7,236 experts — the BP_PLAIN/BP_DRAFTED pins at U 4,096 (the load lines'
+# ubatch=4096; crate model's qwen4exp metas), the census's free bytes and the ctx 4352 moving it
+# within a few (the residency rule's P 130 = half the plan's fewest stage experts a layer, 260
+# against the pin's 261). The release tapes read beside, not this card's conditions (MTP on, ctx
+# 8192): the code tape's decode 107 against 96.0, its prefill 1,274 against 922.
+#
+# Break-even for the census rule: the Qwen3.8 family's unset --place picks bp only when the bp plan's
+# tier holds at least E* experts, E* = 1,152 [derived] (24 a layer on the 48 card-routable layers).
+# The gain's terms per layer, from the functional fit above with the tier's count t swept — the ids
+# the tier takes come off the host's set (the A6000 keeps plan (a)'s row; both cards plan to their
+# own budgets):
+# - the host leg falls with its ids: 79.1 -> 35.3 us a layer as the host's ids fell 250 -> 99 at the
+#   sitting's tier, 0.2905 us a layer an expert [derived, the two fitted legs];
+# - the tier's leg: its signal 58 us after the go at 150.75 a layer = 44.8 us fixed (the copies in,
+#   the launches into its rows, the rows' copy out, the signal) + 0.0874 us an expert [derived: 10
+#   routed slots a layer (n_used) uniform over the 512 ids, an expert 3.13 MB at 700 GB/s]; it sits
+#   under the host's leg past t 90.7, and past it a layer-period hands 0.0808 us an expert back;
+# - the gap (the A6000's join and next front) 226.5 us under both arms; bp's step cost outside the
+#   layers +70 us over a's (the fit's c, 1.73 against 1.66 ms).
+# The fit at the sitting's tier reads +6.2 % where the lease measured +3.4 % (the functional rows
+# run hot: the probe's spin on the host thread), so the model is scaled to the lease's 552 us a step
+# at 7,236 [derived] and the sitting's ruler (same-binary paired ratio, +-0.81 % at n 4) held across
+# the sweep. Lower bound over the grid: -0.82 % at 384 (8 a layer; the mean itself ~0 there — bp's
+# fixed costs unpaid, the mean crossing 0 at 392), -0.61 at 576 (12), -0.19 at 960 (20), -0.03 at
+# 1,104 (23), +0.03 at 1,152 (24), +0.45 at 1,536 (32), +2.15 at 3,072 (64), +3.52 at 4,352 (90, the
+# sweep's peak — past it the tier's leg outlasts the host's and hands back), +2.60 at the sitting's
+# 7,236. The crossing is 1,126 [derived]; E* the first whole count a layer past it. The prompt side
+# reads the same host-id term (its host union at P 512 fell 6.59 -> 3.39 ms a layer-batch, q38tier's
+# functional rows): +4.7 % at E* against its own +-3.9 % band, its lower bound crossing at ~985
+# [derived] — under the decode's, whose fixed cost the fit separates; a sitting that needs the
+# prompt periphery re-derives both. A sitting whose lower bound reads below this band's re-derives
+# E* from the measured gain before the rule moves.
