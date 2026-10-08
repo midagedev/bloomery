@@ -444,8 +444,8 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
 
     /// The window's chain at the target's position `here` of a context of
     /// `ctx`, into `room` ids: the refresh taken, its last row `last`, the
-    /// token at `here`, and the own walks the context and the room allow;
-    /// `None` while the draft skips.
+    /// token at `here`, and the own walks the room and the verify's rows
+    /// below `ctx` allow; `None` while the draft skips.
     pub(super) fn chain(
         &mut self,
         here: u32,
@@ -474,6 +474,20 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                 here + 1
             )));
         }
+        // The verify of the proposal runs a row at every position through
+        // its last id: `here` (the refresh's last row) through
+        // `here + own + 1`, one past the last own walk, so the narrowest
+        // chain (`own` 0) verifies two rows. A chain whose narrowest verify
+        // does not fit the context is refused by name, not clamped: every
+        // caller gates its pass by the rows it runs before the draft is
+        // asked, so a chain this close to the end is that contract's breach.
+        if end >= ctx as usize {
+            return Err(Refused(format!(
+                "{WHAT}: a chain at position {here} of a context of {ctx}: its narrowest verify \
+                 would run the rows {here} and {}, past the context's end",
+                here + 1
+            )));
+        }
         let room = room.min(self.shape.width);
         if room == 0 {
             return Err(Refused(format!("{WHAT}: a proposal into no room")));
@@ -481,7 +495,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         if let Some(l) = refresh.tokens.last_mut() {
             *l = last;
         }
-        let own = (room - 1).min(ctx as usize - end);
+        let own = (room - 1).min(ctx as usize - 1 - end);
         Ok(Some(Chain {
             refresh,
             own,
@@ -1148,10 +1162,20 @@ mod tests {
 
     /// The chain takes the refresh with its last row the token at the
     /// target's position, and runs as many own walks as the room, the width
-    /// and the context allow.
+    /// and the context allow: a proposal of `own + 1` ids verifies `own + 2`
+    /// rows through `here + own + 1`, so the context's arm leaves that last
+    /// row at the context's last — one shallower a position the nearer the
+    /// target stands to the end.
     #[test]
     fn a_chain_takes_the_refresh_and_caps_its_own_walks() {
-        for (room, ctx, own) in [(8, 64, 2), (2, 64, 1), (1, 64, 0), (8, 11, 1), (8, 10, 0)] {
+        for (room, ctx, own) in [
+            (8, 64, 2),
+            (2, 64, 1),
+            (1, 64, 0),
+            (8, 13, 2),
+            (8, 12, 1),
+            (8, 11, 0),
+        ] {
             let mut rig = after_prompt(ctx);
             rig.begin().unwrap();
             let chain = rig
@@ -1202,6 +1226,35 @@ mod tests {
         rig.begin().unwrap();
         let why = refused(&mut rig, 9, 0);
         assert!(why.ends_with("a proposal into no room"), "{why}");
+    }
+
+    /// A chain whose narrowest verify does not fit the context: at the
+    /// context's last row (the refresh ends at the context, so even a
+    /// proposal of one id verifies a row past it) and at its end, refused by
+    /// name — a clamp would hand the caller a proposal it cannot verify.
+    #[test]
+    fn a_chain_past_the_contexts_last_row_is_refused() {
+        let mut rig = after_prompt(10);
+        rig.begin().unwrap();
+        let why = rig.p.chain(9, 10, 77, 3).unwrap_err().to_string();
+        assert!(
+            why.ends_with(
+                "a chain at position 9 of a context of 10: its narrowest verify would run the \
+                 rows 9 and 10, past the context's end"
+            ),
+            "{why}"
+        );
+
+        let mut rig = after_prompt(9);
+        rig.begin().unwrap();
+        let why = rig.p.chain(9, 9, 77, 3).unwrap_err().to_string();
+        assert!(
+            why.ends_with(
+                "a chain at position 9 of a context of 9: its narrowest verify would run the \
+                 rows 9 and 10, past the context's end"
+            ),
+            "{why}"
+        );
     }
 
     /// A verify that kept no row took no id: refused by name.
@@ -1296,6 +1349,15 @@ mod tests {
     /// a step with no walk before it, which is what refused here once —
     /// never follows a cut step (its steps come only after the draft's own
     /// proposal), so it is not among the calls.
+    ///
+    /// The contexts the sequences run at are one the calls cannot reach the
+    /// end of and one they can (the prompt's nine ids plus three rows):
+    /// there a drafted pass runs while its narrowest verify fits the
+    /// context — the policy's own bound, which the runtime's `Stop` and the
+    /// server's pass gate never test, both gating a pass by its widest
+    /// rows — and no call runs at the context's end, where the callers
+    /// stop, so the end-of-context chains are drawn with the calls the
+    /// callers make around them.
     #[test]
     fn no_call_sequence_leaves_the_store_past_the_target_or_refuses() {
         #[derive(Clone, Copy, Debug)]
@@ -1307,7 +1369,19 @@ mod tests {
 
         fn run(rig: &mut Rig, calls: &[Call]) -> Result<(), String> {
             for (i, call) in calls.iter().enumerate() {
-                match *call {
+                let (pos, ctx) = (rig.c.pos as usize, rig.c.ctx as usize);
+                if pos >= ctx {
+                    // The context's end: the callers stop here (`Stop`'s Ctx,
+                    // the server's truncated turn).
+                    return Ok(());
+                }
+                // A drafted pass runs while its narrowest verify fits the
+                // context; closer to the end the caller steps.
+                let call = match *call {
+                    Call::Drafted(_) if pos + 2 > ctx => Call::Plain,
+                    c => c,
+                };
+                match call {
                     Call::Plain => rig.plain_step(),
                     Call::Drafted(kept) => rig.drafted_pass(kept),
                 }
@@ -1336,27 +1410,29 @@ mod tests {
         }
 
         let mut count = 0usize;
-        for arena in [Ar::Ubatch, Ar::Pass] {
-            for begun in [true, false] {
-                let (first, len) = if begun {
-                    (&[][..], 6)
-                } else {
-                    (&[Call::Plain][..], 5)
-                };
-                each(len, &mut Vec::new(), &mut |calls| {
-                    let mut rig = Rig::new(64);
-                    rig.prompt(&IDS, 4, arena).unwrap();
-                    if begun {
-                        rig.begin().unwrap();
-                    }
-                    let all: Vec<Call> = first.iter().chain(calls).copied().collect();
-                    if let Err(why) = run(&mut rig, &all) {
-                        panic!("{arena:?} prompt, begun {begun}, {all:?}: {why}");
-                    }
-                    count += 1;
-                });
+        for ctx in [64, 12] {
+            for arena in [Ar::Ubatch, Ar::Pass] {
+                for begun in [true, false] {
+                    let (first, len) = if begun {
+                        (&[][..], 6)
+                    } else {
+                        (&[Call::Plain][..], 5)
+                    };
+                    each(len, &mut Vec::new(), &mut |calls| {
+                        let mut rig = Rig::new(ctx as u32);
+                        rig.prompt(&IDS, 4, arena).unwrap();
+                        if begun {
+                            rig.begin().unwrap();
+                        }
+                        let all: Vec<Call> = first.iter().chain(calls).copied().collect();
+                        if let Err(why) = run(&mut rig, &all) {
+                            panic!("ctx {ctx}, {arena:?} prompt, begun {begun}, {all:?}: {why}");
+                        }
+                        count += 1;
+                    });
+                }
             }
         }
-        assert_eq!(count, 2 * (1093 + 364));
+        assert_eq!(count, 2 * 2 * (1093 + 364));
     }
 }

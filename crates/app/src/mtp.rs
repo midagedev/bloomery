@@ -682,13 +682,14 @@ where
 impl<B: MtpBody> MtpDraft<B> {
     /// One chain, one readback (the module doc): the recorded refresh's
     /// walk — its last row `last`, the token at the target's position, whose
-    /// prediction is the first proposal — then own walks while the context
-    /// holds them and the proposal fits `out`: at most `out.len()` ids, so a
-    /// caller caps a window's depth by the room it hands. No room is refused
-    /// by name. The refresh's last row is `last` whatever the call that
-    /// recorded it took there: a step tells the draft its argmax, and a
-    /// sampled request feeds its draw. With `read_p`, each id's probability
-    /// as the same readback holds it, into the draft's own `p`.
+    /// prediction is the first proposal — then own walks while the verify of
+    /// the proposal fits the context and the proposal fits `out`: at most
+    /// `out.len()` ids, so a caller caps a window's depth by the room it
+    /// hands. No room is refused by name. The refresh's last row is `last`
+    /// whatever the call that recorded it took there: a step tells the draft
+    /// its argmax, and a sampled request feeds its draw. With `read_p`, each
+    /// id's probability as the same readback holds it, into the draft's own
+    /// `p`.
     fn chain(
         &mut self,
         t: &mut Session<B>,
