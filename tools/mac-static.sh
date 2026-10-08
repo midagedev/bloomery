@@ -3,7 +3,7 @@
 # it reports was a sequence (mac-check check, mac-check combos, mac-check lint, fmt-check, the eight
 # tools/check-*.sh one after another) whose walls measured 2026-10-07 (load ~5, this Mac): the cargo
 # steps 0.6-40 s each but the eight scripts ~240 s serial, `check-recipes` alone 172 s. Two lanes cut
-# it to the longer lane: the scripts lane (fmt-check and the eight checks, one job each) and the cargo
+# it to the longer lane: the scripts lane (fmt-check and the nine checks, one job each) and the cargo
 # lane (lint, then the scoped combos, serial — they share the tree's target directory, and two cargos
 # on one directory serialize on its lock anyway).
 #
@@ -40,7 +40,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
-SCRIPTS=(arch comments levers loads recipes rustflags unsafe waits)
+SCRIPTS=(arch comments defaults levers loads recipes rustflags unsafe waits)
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -84,7 +84,7 @@ run_steps() {
   wait "${pids[@]}" || true # a killed wrapper is the summary's `no rc` case, not this script's end
 }
 
-# summarize D BASE: one line a step in a fixed order (fmt-check, lint, combos, the eight checks),
+# summarize D BASE: one line a step in a fixed order (fmt-check, lint, combos, the nine checks),
 # then the verdict. Prints `mac-static: <step> rc <n> in <s> s [— the step's own closing line]`; the
 # cargo steps' closing line comes from their log. Ends 0, or prints one line naming every red step
 # and ends with the first red rc.

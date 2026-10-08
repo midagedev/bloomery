@@ -340,6 +340,7 @@ blk_pytools() {
     "tools/bloomery/rows.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
     "tools/check-comment-only.py --self-test"
+    "tools/check-defaults.py --self-test"
     "tools/flow/ds41_prefill.py --self-test"
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38width.py --self-test"
