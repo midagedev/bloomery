@@ -193,7 +193,11 @@ qdot 102 56 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
-serve 0 0 0
+# PIN(2026-10-08): serve 0 -> 6 blocks, new code, not old code relaxed: the orderly stop's signal
+# handling (api.rs, libc already the workspace's) — the handlers' pipe pair, the reader thread's read,
+# the zeroed sigaction and its registration, the handler's stderr write with _exit on a second
+# interrupt and its one-byte write on the first, each with its SAFETY line.
+serve 6 0 0
 threads 9 0 1
 tokenizer 0 0 0
 vision 0 0 0

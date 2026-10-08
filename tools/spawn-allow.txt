@@ -7,7 +7,7 @@ crates/threads/src/helper.rs 1 the owner: spawn_helper itself
 crates/threads/src/lib.rs 1 the pool's workers: each pins itself, and pool() builds them before pin_caller pins its caller
 crates/gpu-gates/src/bind.rs 3 the engine thread, spawned by the serve main, which is never pinned (the engine thread pins itself); a test's echo thread; a test's file thread (the seat's state commands)
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 1 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned
-crates/serve/src/api.rs 3 the HTTP server's threads, spawned by the serve main or its accept loop, never pinned
+crates/serve/src/api.rs 4 the HTTP server's threads and the signal handlers' reader thread, spawned by the serve main or its accept loop, never pinned
 crates/serve/src/decide.rs 1 the decision server's connection threads, spawned by its accept loop, never pinned
 crates/decision/src/pool.rs 1 the head's resident workers, one per CPU, started on first use by the decision bins, gates and server, never pinned
 crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those never pin

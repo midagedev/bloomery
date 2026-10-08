@@ -5,7 +5,9 @@
 //! path), `POST /completion`, `POST /tokenize`,
 //! `POST /detokenize`, `POST /apply-template`, `GET /v1/models`, `GET /health`,
 //! `GET /props`, `GET /slots`, `POST /slots/{id}?action=save|restore|erase`,
-//! `GET /metrics`, and `POST /residency/reset` (bloomery's own). JSON field names, defaults and stream framing are
+//! `GET /metrics`, `POST /residency/reset` and `POST /shutdown` (bloomery's
+//! own; the shutdown is the orderly stop, accepted from a loopback peer
+//! only). JSON field names, defaults and stream framing are
 //! llama-server's; see `api` for the slots, `sched` for who gets one and
 //! `worker` for the engine thread that steps them, `swap` for slots that take one engine in turns. [`decide`] is a decision model's server
 //! (`POST /v1/systemone`) on the same HTTP layer. [`preflight`] is what a

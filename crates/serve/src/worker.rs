@@ -32,13 +32,13 @@
 use std::io;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::api::{End, EngineFailure, relock};
+use crate::api::{End, EngineFailure, Stop, relock};
 use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotRow, StateError};
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
@@ -141,6 +141,12 @@ pub(crate) struct Shared {
     pub stats: Mutex<Stats>,
     /// Set by the engine error that ended the server; the reason `/health` gives.
     pub fatal: Mutex<Option<String>>,
+    /// The orderly stop's cause, once it began ([`Shared::begin_stop`]): the
+    /// reason every request that needs the engine is refused with.
+    pub stopping: Mutex<Option<String>>,
+    /// The orderly stop's order to the engine thread: read between engine
+    /// calls ([`Worker::run`], [`Worker::run_turns`]), it ends the thread.
+    stop: AtomicBool,
     /// Each slot's turn, for an engine whose slots take turns; `None` for any
     /// other.
     pub turns: Mutex<Option<Vec<Turn>>>,
@@ -160,6 +166,8 @@ impl Shared {
             work: Condvar::new(),
             stats: Mutex::new(Stats::default()),
             fatal: Mutex::new(None),
+            stopping: Mutex::new(None),
+            stop: AtomicBool::new(false),
             turns: Mutex::new(None),
             end,
             sampler,
@@ -169,6 +177,29 @@ impl Shared {
 
     pub(crate) fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Whether the engine thread was told to stop.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Begins the server's orderly stop, the one owner `POST /shutdown` and
+    /// the first signal go through: from here no request that needs the
+    /// engine is admitted (it gets a 503 naming `cause`), and the engine
+    /// thread ends between its engine calls. The first cause wins; `false`
+    /// when a stop was already under way.
+    pub(crate) fn begin_stop(&self, cause: &Stop) -> bool {
+        {
+            let mut gate = relock(&self.stopping);
+            if gate.is_some() {
+                return false;
+            }
+            *gate = Some(cause.to_string());
+        }
+        self.stop.store(true, Ordering::SeqCst);
+        self.work.notify_one();
+        true
     }
 }
 
@@ -346,12 +377,16 @@ impl Worker {
                         || !admitted.is_empty()
                         || !self.active.is_empty()
                         || !self.prompting.is_empty()
+                        || self.sh.stopped()
                     {
                         break (actions, admitted);
                     }
                     b = self.sh.work.wait(b).unwrap_or_else(|e| e.into_inner());
                 }
             };
+            if self.sh.stopped() {
+                return self.halt();
+            }
             for (what, a) in actions {
                 if self.act(what, a, false).is_err() {
                     return;
@@ -390,6 +425,19 @@ impl Worker {
     fn end(&self, f: EngineFailure) -> Dead {
         let _ = self.sh.end.send(End::Engine(f));
         Dead
+    }
+
+    /// The engine thread's orderly end, what [`Shared::begin_stop`] ordered:
+    /// every queued and running request's channel closes, so its HTTP thread
+    /// answers with the stop's cause ([`crate::api::engine_gone`]), and the
+    /// thread ends without touching the engine again. Nothing failed: no
+    /// engine error is recorded, and no end is sent — the stop's sender
+    /// already did.
+    fn halt(&self) {
+        let cause = relock(&self.sh.stopping)
+            .clone()
+            .unwrap_or_else(|| "the server is stopping".to_owned());
+        drop(relock(&self.sh.board).kill(&cause));
     }
 
     /// `off`: the action drops its slot's state while the engine holds
@@ -773,12 +821,16 @@ impl Worker {
                         || !self.active.is_empty()
                         || !t.pending.is_empty()
                         || !t.deferred.is_empty()
+                        || self.sh.stopped()
                     {
                         break (actions, admitted);
                     }
                     b = self.sh.work.wait(b).unwrap_or_else(|e| e.into_inner());
                 }
             };
+            if self.sh.stopped() {
+                return self.halt();
+            }
             let t = self.t_mut();
             t.batches += u64::from(!admitted.is_empty());
             let batch = t.batches;

@@ -304,6 +304,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-jinja",
  "bloomery-vision",
+ "libc",
  "serde_json",
  "sha2",
  "thiserror",
