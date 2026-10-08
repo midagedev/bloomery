@@ -38,7 +38,8 @@ To run or evaluate bloomery rather than develop it, read the README's "Status" s
   `tools/box.sh` defaults to the 3090, `gpu-power-limit.service` caps it at 250 W, and a compute process on it does
   not stop a timing run (recorded `[other-busy]`; abort with `BLOOMERY_OTHER_STRICT=1`).
   `BLOOMERY_CARD=a6000|both tools/box.sh …` runs functional work on the A6000 and refuses (rc 75) while that card has
-  a compute process; the pick reaches the box as `BLOOMERY_BOX_CARD`.
+  a compute process that is not ours (its gate lock and the timing lease both free); one of ours, the run waits for
+  the card's lock in `tools/gpu-gate.sh`. The pick reaches the box as `BLOOMERY_BOX_CARD`.
 - **Never start a box job longer than 30 minutes without the user's approval.** Estimate the wall first and batch long
   jobs so one approval covers one sitting. A round spec that needs one names the estimate; the lead asks the user.
   Exception: the lead's landing batch of gates through `tools/gate-batch.sh` needs none; it still prints its predicted
@@ -98,7 +99,8 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   input key (`tools/recipes.py key`) is green in `~/.cache/bloomery/gate-ledger.tsv`; `--round-ledger` (a round's)
   records only in `gate-ledger-rounds.tsv`. The lead reads the rounds' file only with `--trust-rounds`, and only for a
   change that moves no behaviour (`just ptx-scan` equal to the base). A rebase moves the key of every item the landed
-  commits touch.
+  commits touch. While the lead's `--ledger` batch runs, other tracks' GPU gates wait (a GPU-only hold,
+  `/root/bloomery-batch.gpuhold`, read by `tools/gpu-gate.sh`; `--no-gpu-hold` opts out); builds do not.
 - **Narrowing.** The graph over-selects a host-only change. When `just ptx-scan` equals the base for every bin the
   change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
   checks; `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list and why. A kernel, a launch or a byte
