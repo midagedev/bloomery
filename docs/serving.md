@@ -105,9 +105,21 @@ every term (dense, KV, context, scratch, margin) and the processes holding the c
 loading, not after. Inside a container the host's RAM is the smaller of `MemAvailable` and the cgroup's own
 memory limit (`docker run --memory`, a systemd scope's `MemoryMax`), read the same way.
 
+**When the host cannot hold its experts either.** A Qwen3.8 plan whose host need passes the host's available
+RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file: the load prints an
+`nvtier` record at load (the serve as the CLI does — the arena's budget, the paged bytes and its counters; a
+load that attached no tier prints none), and the prompt cache's default budget takes only what the tier leaves
+— its `cache ram=…` line names the arena beside the load's own host need, so the two anonymous heaps cannot
+outrun `MemAvailable` into the OOM killer. `--cache-ram` sets the budget past both.
+
 **Speculative decoding.** `BLOOMERY_DRAFT=mtp` drafts with the model's own MTP head (Qwen3.8 and GLM-5.3, on by
 default in their servers); `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's DSpark head on a second card
-(`--place bp`). The drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
+(`--place bp`). Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot
+under the base the context rule aims for (4,096 positions on Qwen3.8, 2,048 on GLM-5.3), a `draft yield` record
+naming its card bytes, the positions a slot gets either way and the base, and the context line that follows is the
+plain rule's — on a 12 GB card the Qwen3.8 draft's 2.8 GB cost 5,463 positions a slot, more than the whole base.
+`BLOOMERY_DRAFT=mtp` keeps it on whatever the context, and a set `--ctx-size`/`--ctx` keeps today's answer. The
+drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
 (the default, temperature 0.8 as in llama-server) while one request runs: each kept id is the request's own
 sampler's draw from its verified row, as llama.cpp's speculative decoding takes it. A sampled request beside
 another running one, a request that bans an id (`ignore_eos`), and a sampled request under DSpark decode one token

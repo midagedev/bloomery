@@ -162,7 +162,13 @@
 //! (`bloomery_levers::glm_unset`), its word and why a `draft unset` record
 //! before the plan: `mtp` under `--place a` and `bp` on a file of one
 //! next-token layer; the plain path under `--place gate`, on a file of other than one,
-//! and with stores too short for one window, never a refusal. Set, refused by
+//! and with stores too short for one window, never a refusal. Unset with the
+//! ctx rule's own default, the draft then yields to the context
+//! (`bloomery_levers::DraftYield::of`, qwen38's module doc, the one rule):
+//! it goes off when the plan with it leaves a slot under the base the plain
+//! rule aims for, one `draft yield` record naming its card bytes, the
+//! positions a slot gets either way and the base, the plain rule's `ctx`
+//! line following. Set, refused by
 //! name: `mtp` with stores too short for one window (`--ctx` under 3: the
 //! prompt's last id, its first token and the window's second row), and every
 //! other word.
@@ -814,13 +820,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     });
     let lever = residency_of(&levers, a.prefill, unset.residency)?;
     let draft_off = draft_of(&levers, at_ctx, unset.draft)?;
-    if let (Some(why), Some(_)) = (&draft_off, levers.mtp_width()) {
-        return Err(format!(
-            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
-             nothing ({why})"
-        )
-        .into());
-    }
     let model = model_props(&split, &inputs.model);
     let nextn = match draft_off {
         None => Some(NextnInputs::read(&inputs)?),
@@ -836,7 +835,58 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Ok(plan_place(p)?.tier_experts)
     })?;
     chosen.record().eprint();
-    let placed = plan_place(chosen.place)?;
+    let drafted = plan_place(chosen.place)?;
+    // The unset draft's yield to the context (qwen38's module doc, the one
+    // rule through `bloomery_levers::DraftYield`): the chosen placement's
+    // search is the drafted load's own — its fit is the positions a slot
+    // gets with the draft — and under [`CTX`] the plain search, the
+    // draft-off load's own, decides: it holds more, and the NextN layer's
+    // card bytes leave a slot under the base the plain rule aims for, so
+    // the draft goes off, the plain placement replaces this one and one
+    // `draft yield` record names both; a serving cap that binds the two
+    // fits together keeps the draft. A set `--ctx` or `BLOOMERY_DRAFT`
+    // never asks, and the placement's own choice (`chosen`, planned with
+    // the NextN layer) stands: a card small enough to yield holds no tier
+    // either way.
+    let (placed, draft_off) = if draft_off.is_none()
+        && a.ctx.is_none()
+        && levers.draft().is_none()
+        && drafted.rule.fit < CTX
+    {
+        let plain = Placed::of(chosen.place, &inputs, &plan_levers, None, set, slots)?;
+        let with = inputs.plan_nextn_slots(
+            &drafted.machine,
+            u64::try_from(drafted.rule.ctx)?,
+            &plan_levers,
+            nextn.as_ref().expect("a drafted load read the NextN layer"),
+            slots,
+        )?;
+        let bytes = with.nextn_card_bytes() + with.arena_bytes;
+        match bloomery_levers::DraftYield::of(
+            drafted.rule.ctx,
+            plain.rule.ctx,
+            CTX.min(plain.rule.fit),
+            bytes,
+        ) {
+            Some(y) => {
+                record::draft_yield(&y).eprint();
+                (plain, Some(y.to_string()))
+            }
+            None => (drafted, draft_off),
+        }
+    } else {
+        (drafted, draft_off)
+    };
+    // A width lever set on a server that drafts nothing is refused, with
+    // why — after the yield said its last word.
+    if let (Some(why), Some(_)) = (&draft_off, levers.mtp_width()) {
+        return Err(format!(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
+             nothing ({why})"
+        )
+        .into());
+    }
+    let nextn = if draft_off.is_none() { nextn } else { None };
     let Placed {
         place,
         tier_batch,

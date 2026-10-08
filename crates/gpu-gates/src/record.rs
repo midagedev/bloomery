@@ -2620,6 +2620,26 @@ pub static DRAFT_UNSET_GLM: Kind = Kind {
     parts: &[key("draft", Word, ""), key("why", Text, "")],
 };
 
+/// An unset MTP draft yielding to the context
+/// ([`bloomery_levers::DraftYield`]): the card bytes it reserves at the
+/// context it denied, the positions a slot gets with it and without it,
+/// and the base the ctx rule aims for. The seats print it where the
+/// decision closed, before the `ctx` line it produced; only a load that
+/// yields prints one.
+pub static DRAFT_YIELD: Kind = Kind {
+    name: "draft_yield",
+    head: "draft yield",
+    doc: "An unset MTP draft yielding to the context, before the ctx line of the plain rule it \
+          fell to: the draft's card bytes at the context it denied, the positions a slot gets \
+          with the draft and without it, and the base the ctx rule aims for.",
+    parts: &[
+        key("card_bytes", U64, "B"),
+        key("with", U64, "positions"),
+        key("without", U64, "positions"),
+        key("base", U64, "positions"),
+    ],
+};
+
 /// What `BLOOMERY_RESIDENCY` unset resolved to on the GLM seat
 /// ([`bloomery_levers::glm_unset`]).
 pub static RESIDENCY_UNSET_GLM: Kind = Kind {
@@ -2895,6 +2915,8 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &RESIDENCY_RESET,
     &SLOTS_ROUND,
     &MTP_WIDTH,
+    &DRAFT_YIELD,
+    &NVTIER,
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
@@ -2925,6 +2947,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
+    &DRAFT_YIELD,
     &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_UNSET_GLM,
@@ -3216,6 +3239,16 @@ pub fn residency_lever(pick: bloomery_levers::ResidencyPick) -> Record {
     Record::new(&RESIDENCY_LEVER)
         .w("residency", pick.word)
         .w("why", pick.why.name())
+}
+
+/// The `draft yield` record of `y` ([`bloomery_levers::DraftYield`]'s own
+/// numbers, one owner with the rule that decided them).
+pub fn draft_yield(y: &bloomery_levers::DraftYield) -> Record {
+    Record::new(&DRAFT_YIELD)
+        .u("card_bytes", y.card_bytes)
+        .u("with", y.with as u64)
+        .u("without", y.without as u64)
+        .u("base", y.base as u64)
 }
 
 /// A round of several slots' record ([`SLOTS_ROUND`]): `cmd` the command the

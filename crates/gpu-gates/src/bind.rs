@@ -378,7 +378,8 @@ pub const CACHE_RAM_CAP: u64 = 8192 << 20;
 /// [`CACHE_RAM_CAP`] and half of what the host's available bytes —
 /// `MemAvailable`, or the smaller room under a cgroup v2 limit
 /// (`workstation::host_available_read`) — leave past the plan's host need,
-/// the residency's churn pool and one sequence's checkpoints
+/// the residency's churn pool, the NVMe expert tier's arena
+/// ([`CacheRam::of_tier`]) and one sequence's checkpoints
 /// ([`checkpoint_bytes`]), 0 when nothing is left.
 pub struct CacheRam {
     pub ram: u64,
@@ -392,6 +393,11 @@ pub struct CacheRam {
     pub need: u64,
     /// The residency's churn pool, 0 without one.
     pub pool: u64,
+    /// The plan's NVMe expert tier arena, 0 without one: the anonymous
+    /// bytes the tier's slots fill beside the plan's own host need, which
+    /// [`HostNeed`] does not count (the room shaped the dial that picked
+    /// the arena, so the plan's terms already sit inside it).
+    pub tier: u64,
 }
 
 impl CacheRam {
@@ -404,13 +410,28 @@ impl CacheRam {
     }
 
     /// The budget (the type's doc): `set` in bytes as given, else the
-    /// default over `need` and `pool`.
+    /// default over `need` and `pool` — [`CacheRam::of_tier`] with no NVMe
+    /// expert tier.
     pub fn of(set: Option<u64>, need: u64, pool: u64) -> Result<CacheRam, GateError> {
+        Self::of_tier(set, need, pool, 0)
+    }
+
+    /// [`CacheRam::of`] beside an NVMe expert tier whose arena reserves
+    /// `tier` bytes: the default takes only what the host tier leaves —
+    /// the arena's pages are anonymous, so beside the cache they are the
+    /// kernel's OOM or swap, not a page it reclaims.
+    pub fn of_tier(
+        set: Option<u64>,
+        need: u64,
+        pool: u64,
+        tier: u64,
+    ) -> Result<CacheRam, GateError> {
         let (available, reading) = workstation::host_available_read()?;
         let ram = set.unwrap_or_else(|| {
             let left = i128::from(available)
                 - i128::from(need)
                 - i128::from(pool)
+                - i128::from(tier)
                 - i128::from(checkpoint_bytes(1));
             u64::try_from((left / 2).max(0)).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP))
         });
@@ -421,23 +442,25 @@ impl CacheRam {
             reading,
             need,
             pool,
+            tier,
         })
     }
 
     /// The `cache` line's terms, the seat's own fields to follow: `cache
-    /// ram=… rule=set|default available=… read=… need=… pool=…
+    /// ram=… rule=set|default available=… read=… need=… pool=… tier=…
     /// checkpoints=…`, `read` the reading that gave `available`
     /// ([`HostRead::word`]).
     #[must_use]
     pub fn line(&self) -> String {
         format!(
-            "cache ram={} rule={} available={} read={} need={} pool={} checkpoints={}",
+            "cache ram={} rule={} available={} read={} need={} pool={} tier={} checkpoints={}",
             self.ram,
             if self.set { "set" } else { "default" },
             self.available,
             self.reading.word(),
             self.need,
             self.pool,
+            self.tier,
             checkpoint_bytes(1)
         )
     }

@@ -160,7 +160,14 @@
 //! plain path runs under `--place gate`, with no file there, and with stores
 //! too short for one window (`--ctx-size` under 5), each printed as a `load
 //! draft=off (<why>)` record after the `load` line (`no file at <path>` for
-//! the missing file), never a refusal. `BLOOMERY_DRAFT=off` is the plain
+//! the missing file), never a refusal. Unset with the ctx rule's own
+//! default, the draft then yields to the context
+//! (`bloomery_levers::DraftYield::of`, below at the search): it goes off
+//! when the plan with it leaves a slot under the base the plain rule aims
+//! for, one `draft yield` record naming its card bytes, the positions a
+//! slot gets either way and the base, and the plain rule's `ctx` line
+//! following; `BLOOMERY_DRAFT=mtp` set never yields, and a set
+//! `--ctx-size` keeps today's answer. `BLOOMERY_DRAFT=off` is the plain
 //! path with the same record; `mtp` drafts wherever the draft loads. The
 //! CLI's `--logits` and route-trace conditions have no seat equivalent: a
 //! request that reads the logits row steps plainly, and the seat does not
@@ -510,8 +517,10 @@ fn experts38(levers: &bloomery_levers::Levers) -> Result<Experts, GateError> {
 /// (`bloomery_levers::draft38_unset`), then `off` when the target's matrices
 /// the draft borrows are not its format (`PlanInputs::mtp_borrows`, which
 /// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
-/// `load draft=off` record's). The V4.1 words and any other are refused by
-/// name.
+/// `load draft=off` record's). This is the rule before the plan: the unset
+/// draft's yield to the context (`bloomery_levers::DraftYield::of`, the
+/// module doc) is decided after the context search, at the caller. The V4.1
+/// words and any other are refused by name.
 ///
 /// The rule's run conditions as the seat meets them: no `--logits` (a
 /// request that reads the logits row steps plainly, the row the target's),
@@ -632,10 +641,16 @@ impl Plans<'_> {
             .expert_bytes)
     }
 
-    /// The plan's host need (`HostNeed`) at `ctx` and the churn pool the
+    /// The plan's host need (`HostNeed`) at `ctx`, the churn pool the
     /// residency it runs holds beside it (`set` the lever as `run` read it;
-    /// the rule's records unprinted).
-    fn host(&self, ctx: usize, set: Option<(Residency, &str)>) -> Result<(u64, u64), GateError> {
+    /// the rule's records unprinted), and the NVMe expert tier's arena the
+    /// load's paged experts fill beside them
+    /// (`HostTotals::nvme_arena_bytes`, 0 without one).
+    fn host(
+        &self,
+        ctx: usize,
+        set: Option<(Residency, &str)>,
+    ) -> Result<(u64, u64, u64), GateError> {
         let ub = ubatch_for(ctx)?;
         let c = u64::try_from(ctx)?;
         let machine = self.place.machine(
@@ -674,7 +689,11 @@ impl Plans<'_> {
             }
             _ => 0,
         };
-        Ok((HostNeed::of(&plan, 0).bytes(), pool))
+        Ok((
+            HostNeed::of(&plan, 0).bytes(),
+            pool,
+            plan.host.nvme_arena_bytes,
+        ))
     }
 }
 
@@ -1025,29 +1044,35 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         &draft_path,
         &inputs,
     )?;
-    // A draft lever set on a server that drafts nothing is refused, with why.
-    if let Some(why) = &draft_off {
-        if levers.mtp_head_rows().is_some() {
-            return Err(format!(
-                "BLOOMERY_MTP_HEAD_ROWS picks the MTP draft's head; the server drafts nothing \
-                 ({why})"
-            )
-            .into());
+    // A draft lever set on a server that drafts nothing is refused, with
+    // why — asked once the yield below has said its last word, so a draft
+    // the plan turns off refuses them the same as one the rule did.
+    let refuse_mtp_levers = |draft_off: &Option<Draft38Off>| -> Result<(), GateError> {
+        if let Some(why) = draft_off {
+            if levers.mtp_head_rows().is_some() {
+                return Err(format!(
+                    "BLOOMERY_MTP_HEAD_ROWS picks the MTP draft's head; the server drafts \
+                     nothing ({why})"
+                )
+                .into());
+            }
+            if levers.mtp_draft().is_some() {
+                return Err(format!(
+                    "BLOOMERY_MTP_DRAFT names the MTP draft file; the server drafts nothing \
+                     ({why})"
+                )
+                .into());
+            }
+            if levers.mtp_width().is_some() {
+                return Err(format!(
+                    "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server \
+                     drafts nothing ({why})"
+                )
+                .into());
+            }
         }
-        if levers.mtp_draft().is_some() {
-            return Err(format!(
-                "BLOOMERY_MTP_DRAFT names the MTP draft file; the server drafts nothing ({why})"
-            )
-            .into());
-        }
-        if levers.mtp_width().is_some() {
-            return Err(format!(
-                "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
-                 nothing ({why})"
-            )
-            .into());
-        }
-    }
+        Ok(())
+    };
     let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
@@ -1095,7 +1120,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             inputs.spec.vocab,
         )?),
     };
-    let mtp_inputs = match &head {
+    let mut mtp_inputs = match &head {
         None => None,
         Some(h) => {
             let draft = open_draft(&draft_path, draft_from)?;
@@ -1146,7 +1171,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         },
         cards: chosen.place,
     };
-    let plans = Plans {
+    let drafted = Plans {
         inputs: &inputs,
         place: a.place,
         experts,
@@ -1154,9 +1179,51 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         mtp: mtp_inputs.as_ref(),
         slots,
     };
-    let rule = ctx38(&plans, a.ctx)?;
-    let (need, pool) = plans.host(rule.ctx, set)?;
-    let cache = CacheRam::of(a.cache_ram, need, pool)?;
+    let mut rule = ctx38(&drafted, a.ctx)?;
+    // The unset draft's yield to the context (the module doc), judged on
+    // the drafted search the load just ran — its fit is the positions a
+    // slot gets with the draft, and a fit under [`CTX`] served the card
+    // rule's own fit exactly. One plain search, the draft-off load's own,
+    // decides the rest: it holds more, and the draft's bytes leave a slot
+    // under the base the plain rule aims for, so the draft goes off, the
+    // plain rule replaces this one and one `draft yield` record names both;
+    // a serving cap that binds the two fits together keeps the draft. A set
+    // `--ctx-size` or `BLOOMERY_DRAFT` never asks.
+    let (plans, mtp, head, draft_off) = if mtp
+        && draft_off.is_none()
+        && a.ctx.is_none()
+        && levers.draft().is_none()
+        && rule.search.is_some_and(|s| s.fit.ctx < CTX)
+    {
+        let plain_plans = Plans {
+            inputs: &inputs,
+            place: a.place,
+            experts,
+            levers: &plan_levers,
+            mtp: None,
+            slots,
+        };
+        let plain = ctx38(&plain_plans, a.ctx)?;
+        let without = plain.search.expect("an unset rule searched").fit.ctx;
+        let bytes = mtp_inputs
+            .as_ref()
+            .expect("a drafted search held the draft")
+            .card_bytes_of(u64::try_from(rule.ctx)?, slots)?;
+        match bloomery_levers::DraftYield::of(rule.ctx, plain.ctx, CTX.min(without), bytes) {
+            Some(y) => {
+                record::draft_yield(&y).eprint();
+                rule = plain;
+                mtp_inputs = None;
+                (plain_plans, false, None, Some(Draft38Off::Yield(y)))
+            }
+            None => (drafted, mtp, head, draft_off),
+        }
+    } else {
+        (drafted, mtp, head, draft_off)
+    };
+    refuse_mtp_levers(&draft_off)?;
+    let (need, pool, arena) = plans.host(rule.ctx, set)?;
+    let cache = CacheRam::of_tier(a.cache_ram, need, pool, arena)?;
     let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();
     eprintln!(
@@ -1183,7 +1250,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         );
     }
     let ctx = rule.ctx;
-    if draft38(&levers, a.place, ctx, &draft_path, &inputs)?.0 != mtp {
+    // A drafted load's window re-checked at the context the rule chose; a
+    // draft the yield turned off needs no window (the plain rule's context
+    // is the larger one it fell to).
+    if mtp && draft38(&levers, a.place, ctx, &draft_path, &inputs)?.0 != mtp {
         return Err(format!(
             "a slot's context of {ctx} leaves no positions for the MTP draft's window; \
              --ctx-size names a total one past {}",
@@ -1496,6 +1566,14 @@ impl Q38 {
             m.body(WHAT)?.card_layers(),
             t.elapsed().as_secs_f64()
         );
+        // The load's NVMe expert tier, when its plan paged routed experts
+        // and the arena was built: the same `nvtier` record
+        // `generate_qwen3moe` prints, at load — the arena's budget, the
+        // paged bytes and the counters (all zero this early). A load that
+        // attached no tier prints nothing, as the CLI's honest absence.
+        if let Some(r) = record::nvtier_of(m.body(WHAT)?.nvme_tier().map(|t| &**t)) {
+            r.eprint();
+        }
         if let Some(why) = &a.draft_off {
             Record::new(&record::LOAD_DRAFT_OFF38)
                 .w("why", why)

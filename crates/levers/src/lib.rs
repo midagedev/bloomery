@@ -1576,6 +1576,9 @@ pub enum Draft38Off {
     /// Unset on the Qwen3.8 seat, and the target's `name`, a matrix the
     /// draft borrows, is `ty` (or `absent`), not the Q8_0 the draft reads.
     Borrowed { name: String, ty: String },
+    /// Unset, and the draft yielded to the context
+    /// ([`DraftYield::of`]'s answer, the seats' plan-side rule).
+    Yield(DraftYield),
 }
 
 impl fmt::Display for Draft38Off {
@@ -1598,6 +1601,7 @@ impl fmt::Display for Draft38Off {
                 f,
                 "unset: the target's {name} is {ty}; the MTP draft reads it as Q8_0"
             ),
+            Draft38Off::Yield(y) => y.fmt(f),
         }
     }
 }
@@ -1623,6 +1627,57 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
         })
     } else {
         None
+    }
+}
+
+/// An unset draft's yield to the context, the numbers its record prints:
+/// the card bytes the draft reserves at the context it denied, the
+/// positions a slot gets with the draft and without it, and the base the
+/// ctx rule aims for — the rule's own constant, or the plan's fit when the
+/// file's serving cap holds under it (the `ctx` line's `base_at`). One
+/// owner of the comparison for Qwen3.8 and GLM-5.3's seats; its `Display`
+/// is the `load draft=off` record's why for the yield.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftYield {
+    /// The positions a slot gets with the draft: the drafted rule's own
+    /// context, its search's fit when that sits under the base.
+    pub with: usize,
+    /// The positions a slot gets without it: the plain rule's own context.
+    pub without: usize,
+    /// The base the ctx rule aims for.
+    pub base: usize,
+    /// The draft's card bytes at `with` — the plan's reserve, the number
+    /// the drafted plan counted (Qwen3.8's `MtpInputs::card_bytes_of`;
+    /// GLM-5.3's NextN card bytes with its arena).
+    pub card_bytes: u64,
+}
+
+impl DraftYield {
+    /// The unset draft yields to the context when the plan with it leaves a
+    /// slot under the base the ctx rule without it aims for: `with` under
+    /// `base`, and under `without` — a draft that denies no position (a
+    /// file whose serving cap binds both rules to the same context) stays
+    /// on. `None` keeps the draft. A set `BLOOMERY_DRAFT=mtp` never asks:
+    /// the seat runs it as given.
+    #[must_use]
+    pub fn of(with: usize, without: usize, base: usize, card_bytes: u64) -> Option<DraftYield> {
+        (with < without.min(base)).then_some(DraftYield {
+            with,
+            without,
+            base,
+            card_bytes,
+        })
+    }
+}
+
+impl fmt::Display for DraftYield {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unset: the draft's {} B on the card leave a slot {} positions, under the rule's \
+             base of {}; without the draft a slot takes {}",
+            self.card_bytes, self.with, self.base, self.without
+        )
     }
 }
 
