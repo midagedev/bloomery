@@ -98,6 +98,8 @@ crates/serve/**	weekly-gpu-ds41-serve	the server crate
 crates/jinja/**	weekly-gpu-ds41-serve	the template engine the server renders every chat with
 crates/gpu-gates/src/bin/{bloomery_serve_ds41.rs,gate_ds41_serve.rs}	weekly-gpu-ds41-serve	the V4.1 server and its gate's own bins
 crates/gpu-gates/src/bin/shared/serve_seats/ds41.rs	weekly-gpu-ds41-serve	the V4.1 server's seat (the flags, the plan, the image encoder)
+crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs	weekly-gpu-ds41-serve	the seats' drafted half: print_widths writes the V4.1 seat's mtp width record, which the gate reads under BLOOMERY_MTP_WIDTH=cost
+crates/runtime/src/width.rs	weekly-gpu-ds41-serve	the width chooser the V4.1 seat's drafts run behind: its passes and its state are the mtp width record the gate reads
 crates/gpu-gates/src/{bind*,ds41_media.rs,serve_client.rs}	weekly-gpu-ds41-serve	the server's engine binding, the V4.1 image span assembly it shares with the media gate, and the gate's HTTP client
 crates/app/**	weekly-gpu-ds41-serve	the session the server drives
 crates/gpu-glm5next/**	weekly-gpu-glm5next-e2e-long	the GLM engine: its long step sets are its only comparisons with ik past 4 positions

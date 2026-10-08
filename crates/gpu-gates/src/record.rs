@@ -2201,7 +2201,11 @@ pub static STAT_FINITE_SUMMARY: Kind = Kind {
 pub static DRAFT_SUMMARY: Kind = Kind {
     name: "draft_summary",
     head: "draft summary",
-    doc: "BLOOMERY_DRAFT: proposals, accepts, positions and passes over the run, and the kept passes' positions per second.",
+    doc: "BLOOMERY_DRAFT: proposals, accepts, positions and passes over the run, the kept passes' \
+          positions per second, the draft, and the width chooser's mode (`BLOOMERY_MTP_WIDTH`, \
+          cost or fixed); under cost the chooser's state at the run's end (the gate's width, 0 \
+          closed; each width's cost median, index 0 the plain step, `-` while unread; the mean \
+          acceptance profile it rates them by) and the passes it ran closed.",
     parts: &[
         key("proposals", U64, ""),
         key("accepts", U64, ""),
@@ -2209,6 +2213,11 @@ pub static DRAFT_SUMMARY: Kind = Kind {
         key("passes", U64, ""),
         key("tok/s(positions)", F64(2), "tok/s"),
         key("kind", Word, ""),
+        key("width", Word, ""),
+        opt("gate", U64, ""),
+        opt("costs", Csv, "ms"),
+        opt("a", Csv, ""),
+        opt("closed", U64, "passes"),
     ],
 };
 
@@ -2273,13 +2282,20 @@ pub static MTP_WIDTH: Kind = Kind {
           server, printed at the slot's next prompt call: the passes that verified a proposal \
           (windows), the windows by the rows they kept (one count a kept length, 1 to the \
           draft's width + 1), every pass by the ids it verified (one count a width, 0 the plain \
-          step: the gate closed, the warm-up's or a probe's plain turn, a shadow's pass) and E, \
-          the mean rows a window kept.",
+          step: the gate closed, the warm-up's or a probe's plain turn, a shadow's pass), E, the \
+          mean rows a window kept; then the chooser's state at the request's end (the gate's \
+          width, 0 closed; each width's cost median, index 0 the plain step, `-` while unread; \
+          the mean acceptance profile it rates them by) and the request's passes of its own the \
+          gate stood closed for (a round of several slots' windows is none).",
     parts: &[
         key("windows", U64, ""),
         key("kept", Csv, "windows"),
         key("widths", Csv, "passes"),
         key("e", F64(3), ""),
+        key("gate", U64, ""),
+        key("costs", Csv, "ms"),
+        key("a", Csv, ""),
+        key("closed", U64, "passes"),
     ],
 };
 
@@ -2976,6 +2992,22 @@ pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 
 /// The records `probe_nvread` prints: one row an arm and case.
 pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
+
+/// The width chooser's state on `r`, a `draft summary` or an `mtp width`
+/// record: the gate's width, each width's cost median in ms (`-` while
+/// unread), the mean acceptance profile, and `closed`, its own passes it
+/// ran closed over what the record covers (`runtime::width::Tally::closed`).
+#[cfg(feature = "gpu")]
+pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Record {
+    let costs = s.costs.iter().map(|c| match c {
+        Some(ms) => format!("{ms:.2}"),
+        None => "-".to_string(),
+    });
+    r.u("gate", s.width)
+        .csv("costs", costs)
+        .csv("a", s.a.iter().map(|a| format!("{a:.3}")))
+        .u("closed", closed)
+}
 
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
