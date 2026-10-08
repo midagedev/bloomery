@@ -140,7 +140,7 @@ mod gate {
     use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
@@ -212,19 +212,6 @@ mod gate {
             );
         }
         Ok(ids)
-    }
-
-    /// FNV-1a 64 of an f32 row's bits (`shared/ds41_open.rs`'s `fnv`, the
-    /// one hash of this gate's family).
-    fn fnv(row: &[f32]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for v in row {
-            for b in v.to_bits().to_le_bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0100_0000_01b3);
-            }
-        }
-        h
     }
 
     /// The machine's card plan of `inputs` on `card`.
@@ -314,7 +301,7 @@ mod gate {
         let before = s.model().reads();
         let out = s.step(next, want)?;
         if let Out::Logits { row, .. } = out {
-            h.fnvs.push(fnv(row));
+            h.fnvs.push(Fnv1a64::default().f32s(row).value());
         }
         let next = out.argmax();
         h.tokens.push(next);
