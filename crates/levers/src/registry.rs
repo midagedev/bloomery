@@ -1346,6 +1346,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          it.",
     ),
     runner(
+        "BLOOMERY_BATCH_OWNER",
+        Some("gpu-gate.sh"),
+        "The owner of the GPU hold a landing batch put up (letters, digits, `_`): \
+         `tools/gate-batch.sh --ledger` exports it into each item's box env, and \
+         `tools/gpu-gate.sh` lets a run with this owner pass the hold while every other \
+         run waits.",
+    ),
+    runner(
         "BLOOMERY_BOX",
         Some("box.sh"),
         "Mac side: the box's ssh host.",
@@ -1537,6 +1545,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_GPU_ARMS",
         Some("ref/depth-gpu.sh"),
         "`tools/ref/depth-gpu.sh`: its arms, in the order a lease runs them.",
+    ),
+    runner(
+        "BLOOMERY_GPU_HOLD_BEAT",
+        Some("gate-batch.sh"),
+        "Mac side: seconds between `tools/gate-batch.sh --ledger`'s refreshes of its GPU \
+         hold on the box (default 60; the box calls a hold stale after 300); the \
+         self-test shortens it.",
     ),
     runner(
         "BLOOMERY_HOLD_OWNER",

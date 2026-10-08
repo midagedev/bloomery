@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it)
@@ -232,6 +232,20 @@
 # $BLOOMERY_DATA/nsys/ and ncu/ are left out of the manifest: only the timing runners write them and no
 # gate reads them (recipes.py's self-test fails when a gate names one).
 #
+# The GPU hold. A --ledger batch (the lead's landing batch) puts a GPU-only hold up on the box for its whole run, so that
+# other tracks' GPU gates stop queueing on the cards between its items: /root/bloomery-batch.gpuhold, `owner=<id> since=<epoch>`,
+# written and read only by tools/gpu-gate.sh (--gpuhold; its header has the wait, the bound and the stale rule). Each item runs
+# with BLOOMERY_BATCH_OWNER=<id> in its box env — added to the call, never to the key, the times row or the ledger — so the
+# batch's own gpu-gate.sh runs pass and every other run waits at the top of its poll, holding no lock. Builds and every non-GPU
+# box command ignore it (its name does not match the sittings' /root/bloomery-<owner>-hold). The hold goes up after the start
+# check, only when some item runs on the box, and is refused (75) while another batch's fresh hold is up; a heartbeat (a
+# background job, pid in DIR/gpuhold.pid) refreshes its mtime every 60 s (BLOOMERY_GPU_HOLD_BEAT, for the self-test), through box.sh
+# with BLOOMERY_BOX_READONLY=1 and BLOOMERY_BOX_WAIT=0: no sync, no guard wait — a deliberate write of that one control file.
+# The box calls a hold stale after 300 s without a beat (this Mac asleep or cut off), so it never outlives its batch by more than
+# that. The hold comes down on every exit — the end, a red batch, `die`, INT/TERM — by the EXIT trap, which kills only the
+# heartbeat pid written under DIR and removes the hold only if it is still this batch's. DIR/gpuhold.log holds the calls' output.
+# --no-gpu-hold (with --ledger) runs without it; --round-ledger and a plain batch never take it. --dry-run prints the hold it
+# would take and touches nothing.
 # Stopping a batch (INT/TERM): the trap signals only the pids written at spawn under DIR (lane-*.pid,
 # lane-*.child). A box process a killed item left behind is `just box-gc`'s to clear.
 set -euo pipefail
@@ -252,7 +266,7 @@ MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes | --self-test"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -308,15 +322,15 @@ deferred_of() {
 }
 
 # try_waits <log> <try>: the seconds the given try spent waiting, not running — box.sh's guard for a sitting
-# (`[guard] … after N s: the command starts`) and tools/gpu-gate.sh for a gate lock and for the V4.1 load
-# lock (`gpu-gate.sh: waited N s for the …`),
+# (`[guard] … after N s: the command starts`) and tools/gpu-gate.sh for a gate lock, for the V4.1 load
+# lock and for another batch's GPU hold (`gpu-gate.sh: waited N s for the …`),
 # summed over the try's section of the item's log. A times row holds the rest: a lock queue is not a gate's cost.
 try_waits() {
   awk -v t="=== try $2 " '
     index($0, t) == 1 { on = 1; next }
     /^=== try / { on = 0 }
     on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
-    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock|batch hold)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
     END { print w + 0 }' "$1"
 }
 
@@ -480,6 +494,10 @@ steal-lib:
 JF
   # The default profile a recipe with no BLOOMERY_MODEL loads.
   mkdir -p "$t/tools/ref"
+  # The GPU hold's box-side writer is the real tools/gpu-gate.sh (with the real lease-probe.sh it sources): the fake box below runs
+  # its --gpuhold calls on the fixture, so the batch's hold is the real one end to end.
+  cp "$(dirname "$self")/gpu-gate.sh" "$t/tools/gpu-gate.sh"
+  cp "$(dirname "$self")/ref/lease-probe.sh" "$t/tools/ref/lease-probe.sh"
   printf '%s\n' ': "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"' > "$t/tools/ref/ref-paths.sh"
   # Unpinned, v41-any (50 s, balanced) would go to lane B: lane A holds v41-a's 100 s.
   printf '%s\t%s\t%s\t%s\t%s\n' v41-a A 3090 100 2026-09-27T10:00:00+0900 v41-any B a6000 50 2026-09-27T10:00:00+0900 \
@@ -578,7 +596,8 @@ DF
   # from.
   cat > "$t/tools/box.sh" << 'FB'
 #!/bin/sh
-st=$(dirname "$0")/../fake-state
+here=$(dirname "$0")/..
+st=$here/fake-state
 mkdir -p "$st"
 case "$*" in
   '. tools/ref/lease-probe.sh && lease_free')
@@ -586,9 +605,18 @@ case "$*" in
     [ -e "$st/lease-up" ] || exit 0
     echo '[guard] the fake lease is up' >&2
     exit 1 ;;
+  'bash tools/gpu-gate.sh --gpuhold '*)
+    # The hold's writer: logged with the box.sh flags the batch passed, then the real script on the fixture, its hold file under
+    # fake-state (--test-locks).
+    printf 'ro=%s wait=%s %s\n' "${BLOOMERY_BOX_READONLY:-0}" "${BLOOMERY_BOX_WAIT:-}" "$*" >> "$st/hold.log"
+    cd "$here" || exit 70
+    # shellcheck disable=SC2086 # the verb and the owner: two words
+    exec bash tools/gpu-gate.sh --test-locks "$st" ${*#bash tools/gpu-gate.sh } ;;
 esac
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+# What an item sees of the batch's hold when it starts: its owner from the env, and the hold file as it stands.
+printf '%s\t%s\t%s\n' "${BLOOMERY_BATCH_OWNER:-none}" "$(head -1 "$st/batch.gpuhold" 2> /dev/null || echo nohold)" "$*" >> "$st/seen.log"
 n=0
 while [ "$n" -lt "${FAKE_DEFER:-0}" ]; do
   echo "deferred(real) oracle: fake clause $n"
@@ -604,7 +632,9 @@ while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
   sleep 1
   k=$((k + 1))
 done
-exit 0
+# …and whether the hold is still up when it ends (a lane that finished first must not have taken it down).
+if [ -f "$st/batch.gpuhold" ]; then printf 'present\t%s\n' "$*" >> "$st/end.log"; else printf 'ABSENT\t%s\n' "$*" >> "$st/end.log"; fi
+exit "${FAKE_RC:-0}"
 FB
   chmod +x "$t/tools/box.sh"
   cat > "$t/tools/recipes.py" << 'FP'
@@ -628,8 +658,12 @@ while i < len(a):
         continue
     items.append(a[i])
     i += 1
+import os
 for k, it in enumerate(items):
-    print(f"stub-{it}\t{it}\trun\tstub")
+    if os.environ.get("FAKE_SKIP") == "1":
+        print(f"stub-{it}\t{it}\tskip\tgreen-at=abc1234 2026-10-08T00:00:00+0900 tree=/x")
+    else:
+        print(f"stub-{it}\t{it}\trun\tstub")
     if pd:
         import os
         os.makedirs(pd, exist_ok=True)
@@ -667,8 +701,15 @@ FP
     printf '%s\n' "${rows[@]}" > "$times"
     rm -rf "$t/fake-state" "$t/target/c-$tag"
     if [ "${LEASE_UP:-0}" = 1 ]; then mkdir -p "$t/fake-state" && : > "$t/fake-state/lease-up"; fi
+    # PRE_HOLD=<owner> [PRE_AGE=<s>]: another batch's GPU hold is already up on the fake box, last refreshed <s> seconds ago
+    if [ -n "${PRE_HOLD:-}" ]; then
+      mkdir -p "$t/fake-state"
+      printf 'owner=%s since=%s\n' "$PRE_HOLD" "$(date +%s)" > "$t/fake-state/batch.gpuhold"
+      python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "$t/fake-state/batch.gpuhold" "${PRE_AGE:-0}"
+    fi
+    # LFLAG: the ledger flag of the batch (default the round's)
     BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
-      "${gb[@]}" --out "$t/target/c-$tag" --round-ledger "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
+      "${gb[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
   }
   rc_ok() { # <name> <tag> <want total>: the case's batch ended green
@@ -803,6 +844,193 @@ FP
   want_no_row 'tier run: … and none of its calls names the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER/'
   want_not 'tier run: … and the DONE line counts no deferrals' "$t/target/c-tier-re/run.log" '^DONE .* deferred='
   want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] deferred=2 ledger=recorded '
+  # The GPU hold (the header). Its writer is the real tools/gpu-gate.sh on the fixture (the fake box above), so these cases cross the
+  # batch, box.sh's two flags and the box-side file. A --ledger batch puts the hold up for its whole run — two lanes here: lane B's
+  # item ends first and its lane ends, and the hold must still be up when lane A's slow item ends — with a heartbeat (1 s here),
+  # each item running with its batch's owner in the call's env only (never the key, the ledger or the times row: the caller's own
+  # box env KEEP=1 makes the key calls non-empty), and the hold down at the end.
+  local items_only='$3 != "true" && $3 !~ /box-manifest/'
+  local slow_h='steal-slow@FAKE_SLEEP=5'
+  rc=$(LFLAG=--ledger BLOOMERY_GPU_HOLD_BEAT=1 BLOOMERY_BOX_ENV=KEEP=1 steal_case hold-up "$slow_h	A	3090	30	$d" "plain-any	B	a6000	10	$d" -- "$slow_h" plain-any)
+  printf '%s' "$rc" > "$t/rc-hold-up"
+  rc_ok 'hold: a --ledger batch of two lanes ends green' hold-up 2
+  want 'hold: it names the hold up, and down' "$t/out-hold-up.log" '^gate-batch: gpu hold: up as gb_[A-Za-z0-9_]+ \(.*batch\.gpuhold, refreshed every 1 s, log .*gpuhold\.log\)'
+  want '  … and down' "$t/out-hold-up.log" '^gate-batch: gpu hold: down$'
+  want_row 'hold: both items ran, each under its own batch'"'"'s hold file' "$t/fake-state/seen.log" "$items_only"' { c++ } END { if (c == 2) print c }'
+  want_no_row '  … none without its owner in the env and the hold in place' "$t/fake-state/seen.log" "$items_only"' && index($2, "owner=" $1 " since=") != 1'
+  want_no_row '  … every item call carries BLOOMERY_BATCH_OWNER in its box env' "$t/fake-state/box.log" '$2 != "true" && $2 !~ /box-manifest/ && $1 !~ /BLOOMERY_BATCH_OWNER=gb_/'
+  want '  … and the caller'"'"'s own box env reached the key calls' "$t/fake-state/keycalls.log" '^KEEP=1$'
+  want_not '  … the owner is in no key call' "$t/fake-state/keycalls.log" 'BATCH_OWNER'
+  want '  … the ledger recorded both' "$t/lead-hold-up.tsv" '^stub-plain-any'
+  want_not '  … the owner is in no ledger line' "$t/lead-hold-up.tsv" 'BATCH_OWNER'
+  want_not '  … nor in a times row' "$t/times-hold-up.tsv" 'BATCH_OWNER'
+  want_not '  … and run.log carries no hold line' "$t/target/c-hold-up/run.log" 'gpuhold|gpu hold|BATCH_OWNER'
+  want_no_row '  … every hold call went read-only, with no guard wait' "$t/fake-state/hold.log" '$0 !~ /^ro=1 wait=0 bash tools\/gpu-gate\.sh --gpuhold /'
+  want_row '  … one up' "$t/fake-state/hold.log" '/--gpuhold up gb_/ { c++ } END { if (c == 1) print c }'
+  want_row '  … at least two beats (5 s of an item at 1 s)' "$t/fake-state/hold.log" '/--gpuhold beat gb_/ { c++ } END { if (c >= 2) print c }'
+  want_row '  … one down' "$t/fake-state/hold.log" '/--gpuhold down gb_/ { c++ } END { if (c == 1) print c }'
+  want '  … the heartbeat logged its beats' "$t/target/c-hold-up/gpuhold.log" 'beat ok$'
+  want_row '  … the hold was up when each item ended (a finished lane did not take it down)' "$t/fake-state/end.log" '$1 == "present" && $2 != "true" && $2 !~ /box-manifest/ { c++ } END { if (c == 2) print c }'
+  want_no_row '  … and absent at none of them' "$t/fake-state/end.log" '$1 != "present" && $2 != "true" && $2 !~ /box-manifest/'
+  if [ ! -e "$t/fake-state/batch.gpuhold" ]; then pass '  … and the hold file is gone once the batch ends'
+  else fail '  … and the hold file is gone once the batch ends' "$(cat "$t/fake-state/batch.gpuhold")"; fi
+  hp=$(cat "$t/target/c-hold-up/gpuhold.pid" 2> /dev/null || echo 0)
+  if [ "$hp" -gt 1 ] && ! kill -0 "$hp" 2> /dev/null; then pass '  … and the heartbeat is gone'
+  else fail '  … and the heartbeat is gone' "pid $hp answers kill -0"; fi
+  # No hold: a --round-ledger batch, and a --ledger batch that opts out. Every item ran with no owner and no hold file, no call
+  # carried an owner, and no hold call and no heartbeat pid exist.
+  rc=$(steal_case hold-round "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hold-round"
+  rc_ok 'no hold: a --round-ledger batch ends green' hold-round 1
+  want_row '  … its item ran' "$t/fake-state/seen.log" "$items_only"' { c++ } END { if (c == 1) print c }'
+  want_no_row '  … with no owner and no hold file' "$t/fake-state/seen.log" "$items_only"' && ($1 != "none" || $2 != "nohold")'
+  want_not '  … no call carries an owner' "$t/fake-state/box.log" 'BATCH_OWNER'
+  if [ ! -e "$t/fake-state/hold.log" ] && [ ! -e "$t/target/c-hold-round/gpuhold.pid" ]; then pass '  … no hold call, no heartbeat pid'
+  else fail '  … no hold call, no heartbeat pid' "hold.log or gpuhold.pid exists"; fi
+  rc=$(LFLAG=--ledger steal_case hold-off "plain-any	B	a6000	10	$d" -- --no-gpu-hold plain-any)
+  printf '%s' "$rc" > "$t/rc-hold-off"
+  rc_ok '  … and a --ledger batch with --no-gpu-hold ends green' hold-off 1
+  want_no_row '  … with no owner and no hold file' "$t/fake-state/seen.log" "$items_only"' && ($1 != "none" || $2 != "nohold")'
+  want_not '  … no call carries an owner' "$t/fake-state/box.log" 'BATCH_OWNER'
+  if [ ! -e "$t/fake-state/hold.log" ] && [ ! -e "$t/target/c-hold-off/gpuhold.pid" ]; then pass '  … no hold call, no heartbeat pid'
+  else fail '  … no hold call, no heartbeat pid' "hold.log or gpuhold.pid exists"; fi
+  # A batch that is red takes the hold down too (the EXIT trap: every exit).
+  rc=$(LFLAG=--ledger steal_case hold-red "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC=1')
+  printf '%s' "$rc" > "$t/rc-hold-red"
+  if [ "$(cat "$t/rc-hold-red")" = 1 ] && grep -Eq '^DONE total=1 red=1 ' "$t/out-hold-red.log" && [ ! -e "$t/fake-state/batch.gpuhold" ]; then
+    pass 'hold: a red batch (rc 1) takes it down'
+  else fail 'hold: a red batch (rc 1) takes it down' "rc=$(cat "$t/rc-hold-red") hold file: $(cat "$t/fake-state/batch.gpuhold" 2>&1 | head -1)"; fi
+  want_row '  … through the down call' "$t/fake-state/hold.log" '/--gpuhold down gb_/ { c++ } END { if (c == 1) print c }'
+  # INT/TERM (stop): TERM to the batch's own pid, once its item runs.
+  local slow_s='steal-slow@FAKE_SLEEP=20'
+  printf '%s\n' "$slow_s	A	3090	30	$d" > "$t/times-hold-stop.tsv"
+  rm -rf "$t/fake-state" "$t/target/c-hold-stop"
+  BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-stop.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-stop.tsv \
+    BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-stop" --ledger "$slow_s" > "$t/out-hold-stop.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_s' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  held=$(head -1 "$t/fake-state/batch.gpuhold" 2> /dev/null || echo none)
+  kill -TERM "$sp"
+  rc=0
+  wait "$sp" || rc=$?
+  hp=$(cat "$t/target/c-hold-stop/gpuhold.pid" 2> /dev/null || echo 0)
+  case $held in owner=gb_*) pass 'stop: the hold was up while the item ran' ;; *) fail 'stop: the hold was up while the item ran' "the hold file read '$held'" ;; esac
+  if [ "$rc" = 130 ] && [ ! -e "$t/fake-state/batch.gpuhold" ] && [ "$hp" -gt 1 ] && ! kill -0 "$hp" 2> /dev/null; then
+    pass '  … TERM to the batch ends it (130), takes the hold down and ends the heartbeat'
+  else fail '  … TERM to the batch ends it (130), takes the hold down and ends the heartbeat' "rc=$rc hold: $(cat "$t/fake-state/batch.gpuhold" 2>&1 | head -1) heartbeat pid $hp"; fi
+  want '  … and says it stopped' "$t/out-hold-stop.log" '^gate-batch: stopped;'
+  # die: a lane killed from outside (its pid, as written under DIR) ends the batch through die (70), and the hold still comes down.
+  rm -rf "$t/fake-state" "$t/target/c-hold-die"
+  BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-die.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-die.tsv \
+    BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-die" --ledger "$slow_s" > "$t/out-hold-die.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_s' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  kill -TERM "$(cat "$t/target/c-hold-die/lane-A.pid")"
+  rc=0
+  wait "$sp" 2> /dev/null || rc=$?
+  if [ "$rc" = 70 ] && grep -q 'ended without its sentinel' "$t/out-hold-die.log" && [ ! -e "$t/fake-state/batch.gpuhold" ]; then
+    pass 'hold: a batch that ends through die (a lane killed: 70) takes it down'
+  else fail 'hold: a batch that ends through die (a lane killed: 70) takes it down' "rc=$rc hold file: $(ls "$t/fake-state/batch.gpuhold" 2>&1)"; fi
+  if [ -f "$t/target/c-hold-die/lane-A.child" ]; then kill -TERM "$(cat "$t/target/c-hold-die/lane-A.child")" 2> /dev/null || true; fi
+  # An unclean death (KILL runs no trap): the hold is left up, but its heartbeat sees the batch gone and stops beating, so the box ages
+  # the hold out instead of it staying fresh for ever.
+  rm -rf "$t/fake-state" "$t/target/c-hold-kill"
+  BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-kill.tsv \
+    BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-kill" --ledger "$slow_s" > "$t/out-hold-kill.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_s' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  hp=$(cat "$t/target/c-hold-kill/gpuhold.pid" 2> /dev/null || echo 0)
+  kill -KILL "$sp"
+  rc=0
+  wait "$sp" 2> /dev/null || rc=$?
+  k=0
+  while [ "$hp" -gt 1 ] && kill -0 "$hp" 2> /dev/null && [ "$k" -lt 10 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  if [ "$hp" -gt 1 ] && ! kill -0 "$hp" 2> /dev/null && [ -e "$t/fake-state/batch.gpuhold" ]; then
+    pass 'stop: a batch killed outright leaves its hold up, and its heartbeat ends within a beat'
+  else fail 'stop: a batch killed outright leaves its hold up, and its heartbeat ends within a beat' "heartbeat pid $hp after ${k} s, hold file: $(ls "$t/fake-state/batch.gpuhold" 2>&1)"; fi
+  want '  … and logs why' "$t/target/c-hold-kill/gpuhold.log" 'is gone: the heartbeat stops'
+  for f in "$t"/target/c-hold-kill/lane-*.pid "$t"/target/c-hold-kill/lane-*.child; do # the killed batch's lanes: the pids it wrote
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  # A hold that vanishes (taken down by hand): the next beat finds it gone (3), logs it and the heartbeat stops — and no beat
+  # creates the file again.
+  rm -rf "$t/fake-state" "$t/target/c-hold-gone"
+  BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-gone.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-gone.tsv \
+    BLOOMERY_GPU_HOLD_BEAT=1 "${gb[@]}" --out "$t/target/c-hold-gone" --ledger "$slow_s" > "$t/out-hold-gone.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_s' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  rm -f "$t/fake-state/batch.gpuhold"
+  # The beat that finds it gone logs the stop; the count of beat calls is read after that line and again 2 s later (beats 1 s apart).
+  k=0
+  while ! grep -q 'the heartbeat stops' "$t/target/c-hold-gone/gpuhold.log" 2> /dev/null && [ "$k" -lt 15 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  b1=$(grep -c -- '--gpuhold beat' "$t/fake-state/hold.log" || true)
+  sleep 2
+  b2=$(grep -c -- '--gpuhold beat' "$t/fake-state/hold.log" || true)
+  if [ "$b1" -ge 1 ] && [ "$b1" = "$b2" ] && [ ! -e "$t/fake-state/batch.gpuhold" ]; then
+    pass 'hold: a hold taken down by hand: the heartbeat stops after the beat that finds it gone, and creates nothing'
+  else fail 'hold: a hold taken down by hand: the heartbeat stops after the beat that finds it gone, and creates nothing' "beats $b1 then $b2, hold file: $(ls "$t/fake-state/batch.gpuhold" 2>&1)"; fi
+  want '  … and logs why' "$t/target/c-hold-gone/gpuhold.log" "the hold is gone or another batch's: the heartbeat stops"
+  kill -TERM "$sp"
+  wait "$sp" 2> /dev/null || true
+  # Another batch's fresh hold: not starting (75, named), nothing ran, its hold untouched, no run.log; a stale one is taken over.
+  rc=$(PRE_HOLD=otherbatch LFLAG=--ledger steal_case hold-foreign "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hold-foreign"
+  if [ "$(cat "$t/rc-hold-foreign")" = 75 ] && grep -q "is up for owner otherbatch" "$t/out-hold-foreign.log" \
+    && grep -q "^gate-batch: another batch's GPU hold is up" "$t/out-hold-foreign.log"; then
+    pass 'hold: another batch'"'"'s fresh hold: not starting, 75, named'
+  else fail 'hold: another batch'"'"'s fresh hold: not starting, 75, named' "rc=$(cat "$t/rc-hold-foreign") $(tail -2 "$t/out-hold-foreign.log")"; fi
+  if head -1 "$t/fake-state/batch.gpuhold" | grep -q '^owner=otherbatch ' && [ ! -e "$t/target/c-hold-foreign/run.log" ]; then
+    pass '  … its hold stays, and the refused start left no run.log'
+  else fail '  … its hold stays, and the refused start left no run.log' "$(head -1 "$t/fake-state/batch.gpuhold" 2>&1)"; fi
+  want_no_row '  … and no item ran' "$t/fake-state/seen.log" "$items_only"
+  rc=$(PRE_HOLD=otherbatch PRE_AGE=400 LFLAG=--ledger steal_case hold-stale "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hold-stale"
+  rc_ok 'hold: a stale hold of another batch is taken over, and the batch ends green' hold-stale 1
+  want '  … the takeover is named' "$t/target/c-hold-stale/gpuhold.log" 'owner otherbatch was not refreshed for 4[0-9][0-9] s: taking it over'
+  if [ ! -e "$t/fake-state/batch.gpuhold" ]; then pass '  … and the hold is down at the end'
+  else fail '  … and the hold is down at the end' "$(cat "$t/fake-state/batch.gpuhold")"; fi
+  # Every item skips: nothing runs on the box, so no hold goes up.
+  rc=$(FAKE_SKIP=1 LFLAG=--ledger steal_case hold-skip "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hold-skip"
+  rc_ok 'hold: a batch whose every item skips ends green' hold-skip 1
+  if [ ! -e "$t/fake-state/hold.log" ]; then pass '  … and puts no hold up'
+  else fail '  … and puts no hold up' "$(cat "$t/fake-state/hold.log")"; fi
+  # The dry run names the hold it would take and touches nothing; the options' refusals.
+  out=$(BLOOMERY_GATE_TIMES=$t/times-hold-up.tsv BLOOMERY_GATE_LEDGER=$t/lead-dry.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-dry.tsv "${gb[@]}" --dry-run --ledger plain-any 2>&1) \
+    || fail 'hold: the dry run of a --ledger batch failed' "$out"
+  if grep -Eq '^gate-batch: gpu hold: would put .*batch\.gpuhold up on the box as gb_[A-Za-z0-9_]+, refreshed every 60 s; each item gets BLOOMERY_BATCH_OWNER=gb_' <<< "$out"; then
+    pass 'dry run: a --ledger batch prints the hold it would take'
+  else fail 'dry run: a --ledger batch prints the hold it would take' "$out"; fi
+  out=$(BLOOMERY_GATE_TIMES=$t/times-hold-up.tsv BLOOMERY_GATE_LEDGER=$t/lead-dry.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-dry.tsv "${gb[@]}" --dry-run --ledger --no-gpu-hold plain-any 2>&1) || true
+  grep -q '^gate-batch: gpu hold: off (--no-gpu-hold)$' <<< "$out" && pass '  … --no-gpu-hold says it is off' || fail '  … --no-gpu-hold says it is off' "$out"
+  out=$(BLOOMERY_GATE_TIMES=$t/times-hold-up.tsv BLOOMERY_GATE_LEDGER=$t/lead-dry.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-dry.tsv "${gb[@]}" --dry-run --round-ledger plain-any 2>&1) || true
+  grep -q '^gate-batch: gpu hold: none (only a --ledger batch takes it)$' <<< "$out" && pass '  … a --round-ledger batch says none' || fail '  … a --round-ledger batch says none' "$out"
+  check 'hold: --no-gpu-hold without --ledger: 64, named' 64 "^gate-batch: --no-gpu-hold is the lead's: only a --ledger batch takes the GPU hold" "${gb[@]}" --dry-run --no-gpu-hold host
+  check 'hold: --no-gpu-hold with --round-ledger: 64, named' 64 "^gate-batch: --no-gpu-hold is the lead's" "${gb[@]}" --dry-run --round-ledger --no-gpu-hold host
+  check 'hold: a heartbeat period that is not whole seconds: 64, named' 64 "^gate-batch: BLOOMERY_GPU_HOLD_BEAT is whole seconds from 1 .*got 'abc'" \
+    env BLOOMERY_GPU_HOLD_BEAT=abc "${gb[@]}" --dry-run host
   # Cold builds: the final try's section only; a local crate is the tree's, a registry or git one is not.
   printf '%s\n' '=== try 1 x' '   Compiling libc v0.2.155' '=== try 2 x' '   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery/crates/gpu)' > "$t/warm.log"
   printf '%s\n' '=== try 1 x' '   Compiling cuda-core v0.1.0 (https://github.com/x/cuda-oxide?branch=b#abc)' '    Finished `release`' > "$t/cold.log"
@@ -817,10 +1045,11 @@ FP
   # The waits a times row leaves out: box.sh's guard, the card lock and the V4.1 load lock, final try only.
   printf '%s\n' '=== try 1 x' 'gpu-gate.sh: waited 99 s for the gate lock (3090)' '=== try 2 x' \
     '[guard] 2026-09-27T00:00:00Z quiet on two polls in a row after 60 s: the command starts' \
+    'gpu-gate.sh: waited 7 s for the batch hold' \
     'gpu-gate.sh: waited 15 s for the gate lock (3090)' 'gpu-gate.sh: waited 40 s for the V4.1 load lock' > "$t/waits.log"
   out=$(try_waits "$t/waits.log" 2)
-  if [ "$out" = 115 ]; then pass 'waits: the guard, the card lock and the V4.1 load lock of the final try'
-  else fail 'waits: the guard, the card lock and the V4.1 load lock of the final try' "got $out, want 115"; fi
+  if [ "$out" = 122 ]; then pass 'waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try'
+  else fail 'waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try' "got $out, want 122"; fi
   # The group and gpu-gate.sh's lock request must name the same recipes.
   cp "$t/justfile" "$t/justfile.good"
   sed 's/export BLOOMERY_GATE_V41_LOAD=1 \&\& BLOOMERY_GATE_CARD/BLOOMERY_GATE_CARD/' "$t/justfile.good" > "$t/justfile"
@@ -876,7 +1105,7 @@ if [ "${1:-}" = --self-test ]; then
   self_test
   exit $?
 fi
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG=''
+OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -892,6 +1121,7 @@ while [ $# -gt 0 ]; do
     --round-ledger) [ "$LMODE" != lead ] || die "--ledger and --round-ledger are exclusive; $USAGE"
       LEDGER=1 LMODE=round; shift ;;
     --trust-rounds) TRUST=1; shift ;;
+    --no-gpu-hold) NOHOLD=1; shift ;;
     --rerun) RERUN=1; shift ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
@@ -910,6 +1140,16 @@ fi
 [ "$SRC" = smoke ] && ITEMS=("${SMOKE[@]}")
 [ "$RERUN" = 0 ] || [ "$LEDGER" = 1 ] || die "--rerun needs --ledger or --round-ledger; $USAGE"
 [ "$TRUST" = 0 ] || [ "$LMODE" = lead ] || die "--trust-rounds is the lead's: it goes with --ledger (a round's --round-ledger reads the rounds' file already); $USAGE"
+[ "$NOHOLD" = 0 ] || [ "$LMODE" = lead ] || die "--no-gpu-hold is the lead's: only a --ledger batch takes the GPU hold, so it goes with --ledger; $USAGE"
+# The GPU hold (the header): the lead's batch takes it; its owner names this batch on the box and in each item's box env.
+HOLD_ON=0 HOLD_UP=0 HOLD_OWNER='' HOLD_BEAT=${BLOOMERY_GPU_HOLD_BEAT:-60}
+case $HOLD_BEAT in
+  '' | 0 | *[!0-9]*) die "BLOOMERY_GPU_HOLD_BEAT is whole seconds from 1 (the heartbeat's period, default 60; the box calls a hold stale after 300), got '$HOLD_BEAT'" ;;
+esac
+if [ "$LMODE" = lead ] && [ "$NOHOLD" = 0 ]; then
+  HOLD_ON=1
+  HOLD_OWNER=gb_$(printf '%s' "$(basename "$ROOT")" | tr -c 'A-Za-z0-9' _)_$$_$(date +%s)
+fi
 command -v just > /dev/null || die "just is not on PATH"
 command -v python3 > /dev/null || die "python3 is not on PATH"
 
@@ -1904,6 +2144,83 @@ predicted() { # the plan's lane sums, derived from the times file
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
 }
 
+# The GPU hold (the header's «The GPU hold»). The box-side writer is tools/gpu-gate.sh --gpuhold, reached through box.sh with
+# BLOOMERY_BOX_READONLY=1 (no sync, so no rsync under a running batch) and BLOOMERY_BOX_WAIT=0 (no guard wait: a heartbeat held in a
+# sitting's guard would go stale), stdin closed (the read-only ssh is the one that reads it).
+hold_box() { # $1 = up | beat | down: the box-side writer's output and rc
+  BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" "bash tools/gpu-gate.sh --gpuhold $1 $HOLD_OWNER" < /dev/null
+}
+hold_path() { bash "$ROOT/tools/gpu-gate.sh" --gpuhold path 2> /dev/null || echo '(the path tools/gpu-gate.sh --gpuhold path prints)'; }
+hold_say() { # the dry run's line: the hold this batch would take
+  if [ "$HOLD_ON" = 1 ]; then
+    echo "gate-batch: gpu hold: would put $(hold_path) up on the box as $HOLD_OWNER, refreshed every ${HOLD_BEAT} s; each item gets BLOOMERY_BATCH_OWNER=$HOLD_OWNER, and other tracks' tools/gpu-gate.sh runs wait until the batch ends"
+  elif [ "$LMODE" = lead ]; then
+    echo "gate-batch: gpu hold: off (--no-gpu-hold)"
+  else
+    echo "gate-batch: gpu hold: none (only a --ledger batch takes it)"
+  fi
+}
+hold_beat_loop() { # the heartbeat, a background job: one refresh of the hold every HOLD_BEAT s until TERM, until the hold is gone,
+  # or until the batch is (a batch that dies uncleanly runs no trap: its heartbeat must not keep the hold fresh after it)
+  local sp='' rc
+  trap - EXIT
+  trap '[ -z "$sp" ] || kill "$sp" 2> /dev/null; exit 0' TERM
+  while :; do
+    sleep "$HOLD_BEAT" &
+    sp=$!
+    wait "$sp" || true
+    if ! kill -0 "$$" 2> /dev/null; then # $$ is the batch's own pid in this subshell too
+      echo "$(date '+%F %T') the batch (pid $$) is gone: the heartbeat stops, and the box calls the hold stale after 300 s" >> "$OUT/gpuhold.log"
+      exit 0
+    fi
+    rc=0
+    hold_box beat >> "$OUT/gpuhold.log" 2>&1 &
+    sp=$!
+    wait "$sp" || rc=$?
+    case $rc in
+      0) echo "$(date '+%F %T') beat ok" >> "$OUT/gpuhold.log" ;;
+      3) echo "$(date '+%F %T') the hold is gone or another batch's: the heartbeat stops" >> "$OUT/gpuhold.log"; exit 0 ;;
+      *) echo "$(date '+%F %T') beat failed rc=$rc: a hold nobody refreshes goes stale on the box by itself" >> "$OUT/gpuhold.log" ;;
+    esac
+  done
+}
+hold_up() { # the hold goes up (HOLD_UP=1), or the batch does not start: 75 while another batch's fresh hold is up, 70 otherwise
+  local out rc=0
+  out=$(hold_box up 2>&1) || rc=$?
+  { echo "$(date '+%F %T') up rc=$rc"; printf '%s\n' "$out"; } >> "$OUT/gpuhold.log"
+  case $rc in
+    0) HOLD_UP=1 ;;
+    75) printf '%s\n' "$out" >&2; RC=75 die "another batch's GPU hold is up (above) — not starting; wait for it, or --no-gpu-hold runs beside it" ;;
+    *) printf '%s\n' "$out" >&2; RC=70 die "the GPU hold could not be put up (rc $rc, above; tools/gpu-gate.sh --gpuhold through box.sh) — not starting; --no-gpu-hold runs without it" ;;
+  esac
+}
+hold_down() { # the EXIT trap: the heartbeat's pid from DIR, then the hold, only while it is still this batch's
+  [ "$HOLD_UP" = 1 ] || return 0
+  HOLD_UP=0
+  local p rc=0
+  if [ -f "$OUT/gpuhold.pid" ]; then
+    p=$(cat "$OUT/gpuhold.pid")
+    kill -TERM "$p" 2> /dev/null || true
+    wait "$p" 2> /dev/null || true
+  fi
+  hold_box down >> "$OUT/gpuhold.log" 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then
+    echo "gate-batch: gpu hold: down"
+  else
+    echo "gate-batch: the GPU hold was not taken down (rc $rc, $OUT/gpuhold.log): the box calls it stale after 300 s without a beat" >&2
+  fi
+}
+
+stop() {
+  local f
+  # The lanes first, so none starts its next item, then the items they were running.
+  for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  echo "gate-batch: stopped; a box process a killed item left behind is cleared by 'just box-gc'" >&2
+  exit 130
+}
+
 if [ "$DRY" = 1 ]; then
   echo "gate-batch: dry run — $N items, lanes $LANES, logs would go to $OUT"
   for i in "${ORDER[@]}"; do
@@ -1917,6 +2234,7 @@ if [ "$DRY" = 1 ]; then
     fi
   done
   predicted
+  hold_say
   exit 0
 fi
 
@@ -1935,6 +2253,18 @@ else
   echo "gate-batch: every item skips — nothing runs on the box, so no lease check"
 fi
 
+# The traps, then the GPU hold (the header): the hold goes up only when some item runs on the box, after the start check, and a
+# refusal here leaves no run.log, as the start check's does. Every exit from here on — the end, a red batch, die, INT/TERM (stop) —
+# takes it down through the EXIT trap.
+trap stop INT TERM
+trap hold_down EXIT
+if [ "$HOLD_ON" = 1 ] && [ "$SKIP_N" -lt "$N" ]; then
+  hold_up
+  hold_beat_loop &
+  echo $! > "$OUT/gpuhold.pid"
+  echo "gate-batch: gpu hold: up as $HOLD_OWNER ($(hold_path), refreshed every ${HOLD_BEAT} s, log $OUT/gpuhold.log): other tracks' GPU gates wait until this batch ends"
+fi
+
 # run.log exists from here on (a refused start leaves none, so the same --out can be retried).
 : > "$RUNLOG"
 mkdir -p "$OUT/claims" # one claim per item: the owner's start and the thief's steal agree on it
@@ -1949,6 +2279,8 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   local argv=()
   eval "argv=(${P_ARGS[$i]})"
   benv=$(box_env_of "$i")
+  # The batch's own runs pass its GPU hold: the owner joins the call's env here, never box_env_of's (which feeds the ledger key).
+  [ "$HOLD_UP" != 1 ] || benv="${benv:+$benv }BLOOMERY_BATCH_OWNER=$HOLD_OWNER"
   t0=$(date +%s)
   while :; do
     try=$((try + 1))
@@ -2115,17 +2447,6 @@ run_lane() { # $1 = lane label; runs its items in the run order (ORDER), then st
   esac
   echo $(($(date +%s) - t0)) > "$OUT/lane-$lane.s"
 }
-
-stop() {
-  local f
-  # The lanes first, so none starts its next item, then the items they were running.
-  for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
-  echo "gate-batch: stopped; a box process a killed item left behind is cleared by 'just box-gc'" >&2
-  exit 130
-}
-trap stop INT TERM
 
 has_lane() { local i; for ((i = 0; i < N; i++)); do [ "${P_LANE[$i]}" = "$1" ] && return 0; done; return 1; }
 
