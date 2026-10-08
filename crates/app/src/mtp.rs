@@ -39,6 +39,13 @@
 //! skips: it proposes nothing, every pass a plain step, until a prompt call
 //! from position 0 or a restart; the call's [`Join`] names why.
 //!
+//! Every decision of those calls — which rows wait, which walks a call runs
+//! and in which mode, the join checks, the refusals, what a park keeps — is
+//! the window's policy (`policy::Policy`), over positions, the context, token
+//! ids and arena kinds alone; [`MtpDraft`] runs its walks on the card, and the
+//! policy's unit tests run the same calls against a model of the body's
+//! records with no card.
+//!
 //! A server that switches the target between sequences parks the draft's
 //! waiting rows with the sequence's state ([`MtpDraft::park`]) and puts them
 //! back with it ([`MtpDraft::unpark`]): the returning sequence's next call
@@ -68,6 +75,10 @@ use runtime::{Draft, TapNeed, Target, accepted_rows};
 
 use crate::{Keep, Prompt, Session, SessionError};
 
+mod policy;
+
+use policy::{Exec, Fail, Policy, Refresh, Refused, Shape, Source, Walk};
+
 /// The window's name in its refusals.
 const WHAT: &str = "MTP window";
 
@@ -76,6 +87,25 @@ const WHAT: &str = "MTP window";
 impl From<runtime::WidthError> for SessionError {
     fn from(e: runtime::WidthError) -> SessionError {
         SessionError::Refused(e.to_string())
+    }
+}
+
+/// A refusal of the window's policy is the session's: the window's own
+/// refusal, by name.
+impl From<Refused> for SessionError {
+    fn from(e: Refused) -> SessionError {
+        SessionError::Refused(e.0)
+    }
+}
+
+/// A call that ran walks ends as the walk's error, or as the window's
+/// refusal.
+impl From<Fail<GpuError>> for SessionError {
+    fn from(e: Fail<GpuError>) -> SessionError {
+        match e {
+            Fail::Refused(r) => r.into(),
+            Fail::Exec(e) => e.into(),
+        }
     }
 }
 
@@ -271,36 +301,6 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     ) -> Result<usize, GpuError>;
 }
 
-/// The refresh a window's chain opens with: its rows' tokens, their first
-/// position, and where their hidden rows sit — the arena `walk`'s rows
-/// `first` on, one row a walk row.
-#[derive(Clone, Debug)]
-struct Refresh<A> {
-    tokens: Vec<u32>,
-    pos0: u32,
-    walk: A,
-    first: usize,
-    /// A store walk already wrote the rows (a step's row, [`Draft::stepped`]:
-    /// every step store-walks the refresh it records): a step after them
-    /// walks nothing for them, and the next chain walks them again for its
-    /// head.
-    stored: bool,
-}
-
-impl<A: Copy> Refresh<A> {
-    /// The refresh's feed.
-    fn feed(&self) -> Feed<'_, A> {
-        Feed {
-            tokens: &self.tokens,
-            pos0: self.pos0,
-            hidden: Hidden::Target {
-                walk: self.walk,
-                first: self.first,
-            },
-        }
-    }
-}
-
 /// One drafted window as the draft saw it ([`MtpDraft::keep_windows`]): the
 /// target's position before its verify, the proposal's ids and each one's
 /// probability among the head's rows, how many of those ids the pass
@@ -322,21 +322,6 @@ struct Windows {
     pending: Option<(Vec<u32>, Vec<f32>)>,
     kept: Vec<WindowDraft>,
 }
-
-/// A join the draft cannot make: no rows of the held sequence wait for it.
-const NOTHING_WAITS: &str = "no rows of the held sequence wait for the draft: it did not walk \
-                             the sequence the target holds";
-/// A join the draft cannot make: the waiting rows end elsewhere.
-const ENDS_ELSEWHERE: &str = "the rows waiting for the draft do not end at the call's first \
-                              position";
-/// A join the draft cannot make: the store is behind the waiting rows.
-const STORE_BEHIND: &str = "the draft's store does not hold the positions below the rows \
-                            waiting for it";
-/// A join the draft cannot make: the sequence was parked with its waiting
-/// rows in a prompt call's arena.
-const PROMPT_ARENA: &str = "the rows waiting for the draft sat in a prompt call's arena when the \
-                            sequence was parked, and a parked sequence keeps only the step's and \
-                            the verify's";
 
 /// What a draft holds of the target's sequence between two calls, kept
 /// apart while another sequence runs ([`MtpDraft::park`]) and put back with
@@ -364,30 +349,21 @@ pub struct Join {
 }
 
 /// The MTP draft over a body's loaded draft layer (the module doc): the host
-/// policy of the windows — which head the load opened, how the prompt is
-/// fed, the refresh the next chain opens with — the walks themselves on the
-/// card. A caller drives it as `Speculative<MtpDraft<B>, M>` with `M` =
+/// policy of the windows ([`Policy`]: which rows wait, which walks run, the
+/// refresh the next chain opens with) and its executor on the card — which
+/// head the load opened, how the prompt is fed, the walks themselves. A
+/// caller drives it as `Speculative<MtpDraft<B>, M>` with `M` =
 /// [`MtpBody::VERIFY_ROWS`], which [`Session::with_draft`] holds to the
 /// draft's width.
 pub struct MtpDraft<B: MtpBody> {
     /// The prompt path.
     path: B::Path,
-    /// How the walks with a head and the chains run.
-    mode: WalkMode,
     head: B::Head,
-    /// The next window's refresh; `None` between a prompt call and its
-    /// `begin`.
-    next: Option<Refresh<B::Arena>>,
-    /// The last prompt unit's arena and rows, for [`Draft::begin`]'s
-    /// anchor.
-    last_unit: Option<(B::Arena, usize)>,
+    /// What the window knows between two calls, and every decision a call
+    /// makes of it.
+    policy: Policy<B::Arena>,
     /// A zero hidden row: the row at position 0's input.
     zeros: Vec<f32>,
-    /// The last join to a held sequence a call continued, until taken.
-    joined: Option<Join>,
-    /// Why the draft proposes nothing until the next prompt call from
-    /// position 0 or restart; `None` while it drafts.
-    skip: Option<&'static str>,
     /// The windows kept under [`MtpDraft::keep_windows`]; `None`, nothing
     /// is kept.
     windows: Option<Windows>,
@@ -395,6 +371,35 @@ pub struct MtpDraft<B: MtpBody> {
     /// readback holds them ([`MtpBody::PROBS`]) behind the width chooser,
     /// or the kept windows.
     p: Vec<f32>,
+}
+
+/// The card's side of a call's walks ([`Exec`]): the model, the head the load
+/// opened and the zero row, for the length of one call.
+struct Card<'a, B: MtpBody> {
+    m: &'a mut GpuModel<B>,
+    head: B::Head,
+    zeros: &'a [f32],
+}
+
+impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
+    type Err = GpuError;
+
+    fn walk(&mut self, w: &Walk<'_, B::Arena>) -> Result<(), GpuError> {
+        let hidden = match w.hidden {
+            Source::Zero => Hidden::Host(self.zeros),
+            Source::Target { walk, first } => Hidden::Target { walk, first },
+        };
+        let feed = Feed {
+            tokens: w.tokens,
+            pos0: w.pos0,
+            hidden,
+        };
+        B::walk(self.m, feed, self.head, w.mode)
+    }
+
+    fn held(&mut self) -> Result<usize, GpuError> {
+        B::held(self.m)
+    }
 }
 
 impl<B: MtpBody> MtpDraft<B> {
@@ -408,13 +413,15 @@ impl<B: MtpBody> MtpDraft<B> {
         let zeros = vec![0.0; B::hidden_width(m)?];
         Ok(MtpDraft {
             path,
-            mode: WalkMode::from(mode),
             head,
-            next: None,
-            last_unit: None,
+            policy: Policy::new(Shape {
+                step: B::STEP_ARENA,
+                verify: B::VERIFY_ARENA,
+                mode: WalkMode::from(mode),
+                width: B::WIDTH,
+                store_rows: B::STORE_ROWS,
+            }),
             zeros,
-            joined: None,
-            skip: None,
             windows: None,
             p: vec![0.0; B::WIDTH],
         })
@@ -442,7 +449,7 @@ impl<B: MtpBody> MtpDraft<B> {
     /// The join of the last call that continued a held sequence, once: a
     /// second take is `None` until another call joins.
     pub fn take_joined(&mut self) -> Option<Join> {
-        self.joined.take()
+        self.policy.take_joined()
     }
 
     /// The head the load opened.
@@ -455,10 +462,7 @@ impl<B: MtpBody> MtpDraft<B> {
     /// model's reset having emptied the draft's store. The session's reset
     /// calls it.
     pub fn restart(&mut self) {
-        self.next = None;
-        self.last_unit = None;
-        self.joined = None;
-        self.skip = None;
+        self.policy.restart();
         if let Some(w) = &mut self.windows {
             w.pending = None;
         }
@@ -468,7 +472,7 @@ impl<B: MtpBody> MtpDraft<B> {
     /// position 0 or a restart ([`Join::skipped`] names why).
     #[must_use]
     pub fn skipping(&self) -> bool {
-        self.skip.is_some()
+        self.policy.skipping()
     }
 
     /// The next refresh recorded for a verify of `rows` that ran from
@@ -487,22 +491,7 @@ impl<B: MtpBody> MtpDraft<B> {
         out: &[u32],
         accepted: usize,
     ) -> Result<(), SessionError> {
-        let last = accepted
-            .checked_sub(1)
-            .and_then(|k| out.get(k))
-            .copied()
-            .ok_or_else(|| {
-                SessionError::Refused(format!(
-                    "{WHAT}: a verify that kept {accepted} rows took no id"
-                ))
-            })?;
-        self.next = Some(Refresh {
-            tokens: rows[1..accepted].iter().copied().chain([last]).collect(),
-            pos0: p0 + 1,
-            walk: B::VERIFY_ARENA,
-            first: 0,
-            stored: false,
-        });
+        self.policy.record(p0, rows, out, accepted)?;
         if let Some(w) = &mut self.windows {
             let (ids, p) = w.pending.take().ok_or_else(|| {
                 SessionError::Refused(format!(
@@ -532,31 +521,7 @@ impl<B: MtpBody> MtpDraft<B> {
     /// other positions must not park.
     #[must_use]
     pub fn park(&self) -> Parked<B::Arena> {
-        let kept = |walk: B::Arena| walk == B::STEP_ARENA || walk == B::VERIFY_ARENA;
-        let skipping = |why| Parked {
-            next: None,
-            last_unit: None,
-            skip: Some(why),
-        };
-        match (self.skip, &self.next, self.last_unit) {
-            (Some(why), _, _) => skipping(why),
-            (None, Some(r), _) if kept(r.walk) => Parked {
-                next: Some(r.clone()),
-                last_unit: None,
-                skip: None,
-            },
-            (None, None, Some((walk, rows))) if kept(walk) => Parked {
-                next: None,
-                last_unit: Some((walk, rows)),
-                skip: None,
-            },
-            (None, Some(_), _) | (None, None, Some(_)) => skipping(PROMPT_ARENA),
-            (None, None, None) => Parked {
-                next: None,
-                last_unit: None,
-                skip: None,
-            },
-        }
+        self.policy.park()
     }
 
     /// `p`, which [`MtpDraft::park`] took, back in place once the target's
@@ -565,10 +530,7 @@ impl<B: MtpBody> MtpDraft<B> {
     /// the waiting rows as it would have, or skips for the parked why, its
     /// [`Join`] naming it.
     pub fn unpark(&mut self, p: &Parked<B::Arena>) {
-        self.next = p.next.clone();
-        self.last_unit = p.last_unit;
-        self.skip = p.skip;
-        self.joined = None;
+        self.policy.unpark(p);
         if let Some(w) = &mut self.windows {
             w.pending = None;
         }
@@ -586,97 +548,13 @@ impl<B: MtpBody> MtpDraft<B> {
     ///
     /// The walk's.
     pub fn before_step(&mut self, t: &mut Session<B>, last: u32) -> Result<(), SessionError> {
-        if self.skip.is_some() || self.next.is_none() {
-            return Ok(());
-        }
-        let start = t.pos();
-        if let Err(why) = self.catch_up(t, last)? {
-            self.skip_from(start, why);
-        }
-        Ok(())
-    }
-
-    /// The rows an earlier call left waiting — the refresh a window or a
-    /// step recorded, or a prompt call's anchor — walked with `token` as
-    /// their last row, the row at the target's position, so the store holds
-    /// every position through it: the rows walked, or why the draft cannot
-    /// walk them. Nothing has run on the target since they were recorded
-    /// (the caller's contract), so their arena still holds their hidden rows.
-    fn catch_up(
-        &mut self,
-        t: &mut Session<B>,
-        token: u32,
-    ) -> Result<Result<usize, &'static str>, SessionError> {
-        let here = t.pos();
-        let mut r = match (self.next.take(), self.last_unit.take()) {
-            (Some(r), _) => r,
-            (None, Some((walk, rows))) => Refresh {
-                tokens: vec![token],
-                pos0: here,
-                walk,
-                first: rows - 1,
-                stored: false,
-            },
-            (None, None) => return Ok(Err(NOTHING_WAITS)),
+        let pos = t.pos();
+        let mut card = Card {
+            m: t.model_mut(),
+            head: self.head,
+            zeros: &self.zeros,
         };
-        if r.pos0 as usize + r.tokens.len() != here as usize + 1 {
-            return Ok(Err(ENDS_ELSEWHERE));
-        }
-        let held = B::held(t.model())?;
-        if r.pos0 as usize > held {
-            return Ok(Err(STORE_BEHIND));
-        }
-        if let Some(l) = r.tokens.last_mut() {
-            *l = token;
-        }
-        B::walk(t.model_mut(), r.feed(), self.head, self.mode)?;
-        Ok(Ok(r.tokens.len()))
-    }
-
-    /// The draft proposes nothing from the call at `start` on, for `why`.
-    fn skip_from(&mut self, start: u32, why: &'static str) {
-        self.next = None;
-        self.last_unit = None;
-        self.skip = Some(why);
-        self.joined = Some(Join {
-            start,
-            caught_up: 0,
-            skipped: Some(why),
-        });
-    }
-
-    /// One run of the warmup: `tokens` at `pos0`, their hidden rows the
-    /// arena `walk`'s from `first` on, walked through the store's append
-    /// alone ([`WalkMode::Store`]: a warm row's keys and values are all a
-    /// later row reads of it) in runs of [`MtpBody::STORE_ROWS`] with no
-    /// readback — a fault stays on the fault word, which the next readback
-    /// (the first chain's) names.
-    fn warm(
-        &self,
-        m: &mut GpuModel<B>,
-        walk: B::Arena,
-        pos0: u32,
-        first: usize,
-        tokens: &[u32],
-    ) -> Result<(), GpuError> {
-        for (i, run) in tokens.chunks(B::STORE_ROWS).enumerate() {
-            B::walk(
-                m,
-                Feed {
-                    tokens: run,
-                    pos0: pos0
-                        + u32::try_from(i * B::STORE_ROWS)
-                            .expect("a prompt's positions lie below its context"),
-                    hidden: Hidden::Target {
-                        walk,
-                        first: first + i * B::STORE_ROWS,
-                    },
-                },
-                self.head,
-                WalkMode::Store,
-            )?;
-        }
-        Ok(())
+        Ok(self.policy.before_step(&mut card, pos, last)?)
     }
 }
 
@@ -814,43 +692,15 @@ impl<B: MtpBody> MtpDraft<B> {
         out: &mut [u32],
         read_p: bool,
     ) -> Result<usize, SessionError> {
-        if self.skip.is_some() {
+        let Some(c) = self.policy.chain(t.pos(), t.ctx(), last, out.len())? else {
             return Ok(0);
-        }
-        let Some(mut r) = self.next.take() else {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: a proposal before the draft's refresh (its prompt call, or the accept \
-                 before it)"
-            )));
         };
-        // The refresh's last row is the token at the target's position, which
-        // the target has not run yet: the refresh ends one past it.
-        let end = r.pos0 as usize + r.tokens.len();
-        let here = t.pos() as usize;
-        if end != here + 1 {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: a refresh of {} rows ending at {end}, where the target stands at {here} \
-                 (its next token's row ends at {})",
-                r.tokens.len(),
-                here + 1
-            )));
-        }
-        let room = out.len().min(B::WIDTH);
-        if room == 0 {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: a proposal into no room"
-            )));
-        }
-        if let Some(l) = r.tokens.last_mut() {
-            *l = last;
-        }
-        let own = (room - 1).min(t.ctx() as usize - end);
         let n = B::chain(
             t.model_mut(),
-            r.feed(),
-            own,
+            c.refresh.feed(),
+            c.own,
             self.head,
-            self.mode,
+            c.mode,
             out,
             read_p.then_some(&mut self.p[..]),
         )?;
@@ -878,72 +728,23 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
         let (path, head) = (self.path, self.head);
         let start = t.pos();
         let _busy = t.model().prompt_busy();
-        let Some(&id) = ids.first() else {
+        let mut card = Card {
+            m: t.model_mut(),
+            head,
+            zeros: &self.zeros,
+        };
+        let Some(mut call) = self.policy.prompt_start(&mut card, start, ids)? else {
             return Ok(B::prompt_with(t.model_mut(), ids, path, None)?);
         };
-        if start == 0 {
-            self.next = None;
-            self.last_unit = None;
-            self.joined = None;
-            self.skip = None;
-        } else if let Some(why) = self.skip {
-            self.skip_from(start, why);
-        } else {
-            match self.catch_up(t, id)? {
-                Ok(rows) => {
-                    self.joined = Some(Join {
-                        start,
-                        caught_up: rows,
-                        skipped: None,
-                    });
-                }
-                Err(why) => self.skip_from(start, why),
-            }
-        }
-        if self.skip.is_some() {
-            return Ok(B::prompt_with(t.model_mut(), ids, path, None)?);
-        }
-        let end_of_prompt = start + ids.len() as u32;
-        let mut first_unit = start == 0;
+        let (policy, zeros) = (&mut self.policy, &self.zeros[..]);
         let mut sink = |m: &mut GpuModel<B>,
                         walk: B::Arena,
                         first: u32,
                         rows: usize|
          -> Result<(), GpuError> {
-            self.last_unit = Some((walk, rows));
-            // The row at `first + i` reads the target's hidden row at
-            // `first + i − 1`: the unit's own arena holds it from its second
-            // row on; the unit's first row was walked by the unit before (or
-            // is position 0's zero-hidden row below, or the join's last row),
-            // save the last unit's last row — the next window's anchor,
-            // `begin`'s.
-            let last = first + rows as u32 == end_of_prompt;
-            if first_unit {
-                first_unit = false;
-                B::walk(
-                    m,
-                    Feed {
-                        tokens: &ids[..1],
-                        pos0: first,
-                        hidden: Hidden::Host(&self.zeros),
-                    },
-                    head,
-                    WalkMode::Store,
-                )?;
-            }
-            let end = first + rows as u32 + 1 - u32::from(last);
-            if end > first + 1 {
-                let at = usize::try_from(first + 1 - start)
-                    .expect("a prompt's positions lie below its context");
-                let to = usize::try_from(end - start).expect("a prompt fits usize");
-                // Position first + 1 + i reads the unit's row i, the hidden
-                // row of the position before it.
-                self.warm(m, walk, first + 1, 0, &ids[at..to])?;
-            }
-            Ok(())
+            policy.unit(&mut call, &mut Card { m, head, zeros }, walk, first, rows)
         };
-        let next = B::prompt_with(t.model_mut(), ids, path, Some(&mut sink))?;
-        Ok(next)
+        Ok(B::prompt_with(t.model_mut(), ids, path, Some(&mut sink))?)
     }
 
     /// The next window's anchor: the target's own token `first` at the
@@ -953,20 +754,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// step, [`Draft::stepped`] recording the anchor the step's window
     /// proposes from).
     fn begin(&mut self, t: &Session<B>, _prompt: &[u32], first: u32) -> Result<(), SessionError> {
-        if self.skip.is_some() || self.next.is_some() {
-            return Ok(());
-        }
-        let (walk, rows) = self.last_unit.ok_or_else(|| {
-            SessionError::Refused(format!("{WHAT}: a prompt the draft never saw"))
-        })?;
-        self.next = Some(Refresh {
-            tokens: vec![first],
-            pos0: t.pos(),
-            walk,
-            first: rows - 1,
-            stored: false,
-        });
-        Ok(())
+        Ok(self.policy.begin(t.pos(), first)?)
     }
 
     /// One chain, one readback ([`MtpDraft::chain`]); each id's
@@ -1045,66 +833,12 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// by name when the waiting rows read the step's own arena, which the
     /// step has overwritten, unless a store walk already wrote them.
     fn stepped(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
-        if self.skip.is_some() {
-            return Ok(());
-        }
-        let waiting = match (self.next.take(), self.last_unit.take()) {
-            (Some(r), _) => Some(r),
-            (None, Some((walk, rows))) => Some(Refresh {
-                tokens: vec![last],
-                pos0: t.pos() - 1,
-                walk,
-                first: rows - 1,
-                stored: false,
-            }),
-            (None, None) => {
-                // A one-id prompt feeds no prompt call: the step ran position
-                // 0, whose row reads a zero hidden row, as the prompt call's
-                // first row does.
-                if t.pos() == 1 {
-                    B::walk(
-                        t.model_mut(),
-                        Feed {
-                            tokens: &[last],
-                            pos0: 0,
-                            hidden: Hidden::Host(&self.zeros),
-                        },
-                        self.head,
-                        self.mode,
-                    )?;
-                }
-                None
-            }
+        let (pos, ctx) = (t.pos(), t.ctx());
+        let mut card = Card {
+            m: t.model_mut(),
+            head: self.head,
+            zeros: &self.zeros,
         };
-        if let Some(r) = waiting.filter(|r| !r.stored) {
-            if r.walk == B::STEP_ARENA {
-                return Err(SessionError::Refused(format!(
-                    "{WHAT}: a step after rows whose hidden rows the step's own arena held (a \
-                     prompt fed by steps): the step overwrote them (rows at position {})",
-                    r.pos0
-                )));
-            }
-            B::walk(t.model_mut(), r.feed(), self.head, self.mode)?;
-        }
-        let (head, pos0, ctx) = (self.head, t.pos(), t.ctx() as usize);
-        self.next = Some(Refresh {
-            tokens: vec![next],
-            pos0,
-            walk: B::STEP_ARENA,
-            first: 0,
-            stored: false,
-        });
-        // The step's row reads the step's own arena, which the next step
-        // overwrites — a chooser-held pass's step reaches the draft here
-        // again with no walk between — so its store bytes are written at
-        // once; a chain walks the row again for its head. A row past the
-        // context stays unwalked: no chain runs there.
-        if (pos0 as usize) < ctx
-            && let Some(r) = &mut self.next
-        {
-            B::walk(t.model_mut(), r.feed(), head, WalkMode::Store)?;
-            r.stored = true;
-        }
-        Ok(())
+        Ok(self.policy.stepped(&mut card, pos, ctx, last, next)?)
     }
 }
