@@ -39,7 +39,7 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
-use crate::host::run::NvTier;
+use crate::host::nvtier::NvTier;
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};

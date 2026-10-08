@@ -556,6 +556,13 @@ mod cli {
             Ok(None)
         }
 
+        /// The `nvtier` record of a load whose plan paged routed experts:
+        /// the arena's counters since the load. `None` for a body with no
+        /// tier and for a load that attached none — never a zeroed record.
+        fn nvtier_record(_m: &GpuModel<Self>) -> Result<Option<Record>, GateError> {
+            Ok(None)
+        }
+
         /// The residency boundaries' reports since the last take, each with
         /// the kind of the pass it ended; none for a body with no residency
         /// machine.
@@ -865,6 +872,13 @@ mod cli {
             };
             let dir = t.dir().to_path_buf();
             Ok(Some((dir, t.finish()?)))
+        }
+
+        /// [`Body38::nvme_tier`]'s counters, when the load built the arena.
+        fn nvtier_record(m: &Qwen38Model) -> Result<Option<Record>, GateError> {
+            Ok(record::nvtier_of(
+                m.body("generate_qwen3moe")?.nvme_tier().map(|t| &**t),
+            ))
         }
 
         /// [`Body38::take_residency_passes`]: empty unless the load runs the
@@ -2320,6 +2334,15 @@ mod cli {
         if let Some((dir, rows)) = B::finish_trace(s.model_mut())? {
             println!("route trace {} positions={rows} complete", dir.display());
         }
+        print_nvtier(s.model())
+    }
+
+    /// The load's `nvtier` record ([`Prompted::nvtier_record`]) at the end of
+    /// a run, nothing on a load without a tier.
+    fn print_nvtier<B: Prompted>(m: &GpuModel<B>) -> Result<(), GateError> {
+        if let Some(r) = B::nvtier_record(m)? {
+            r.print();
+        }
         Ok(())
     }
 
@@ -2372,7 +2395,7 @@ mod cli {
             let ran = run_arm38_mtp(&mut s, &mut spec, path, run, arm);
             after_passes(s.model_mut(), ran)?;
         }
-        Ok(())
+        print_nvtier(s.model())
     }
 
     /// An arm's result `ran`, with the `residency pass` records of its
@@ -2874,7 +2897,7 @@ mod cli {
             after_passes(s.model_mut(), ran)
         });
         ran.map_err(|f| Box::new(f) as GateError)?;
-        Ok(())
+        print_nvtier(s.model())
     }
 
     /// One arm as `run.slots` streams in one pass, every slot from its reset

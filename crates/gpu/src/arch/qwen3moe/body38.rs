@@ -122,6 +122,7 @@ use super::wide38::{
 use crate::checkpoint::Checkpoints;
 use crate::checkpoint::saved::{Identity, Lent, SeqState, Spans};
 use crate::head::{Head, HeadNorm};
+use crate::host::nvtier::NvTier;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{
     BoundaryAt, CallCfg, CallPick, CallReport, PassReport, ResetReport, Residency,
@@ -896,6 +897,9 @@ pub struct Body38 {
     /// lever runs one, over `hybrid`'s slot map through `slots`; every call
     /// nothing without one.
     residency_glue: ResidencyGlue,
+    /// The NVMe expert tier's arena, when the plan paged routed experts
+    /// ([`Body38::nvme_tier`]).
+    nvme_tier: Option<Arc<NvTier>>,
     /// The recurrent stores on the host at chosen positions, and the PLE
     /// hash's history at each, ascending: the points a cut behind the fed
     /// positions restores. A prompt call takes them only while `marks` is on.
@@ -1374,9 +1378,13 @@ impl Body38 {
             ff: geo::FF,
             n_used: geo::N_USED,
         };
+        let arena = crate::model::nvme_tier(plan, file, host.r8)?;
         let mut experts = HostRun::build(Arc::clone(file), 0, host.r8, widths, |src| {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
+        experts.attach_tier(arena)?;
+        residency_glue.attach_tier(experts.tier())?;
+        let nvme_tier = experts.tier().cloned();
         experts.prepare_union(host_cols)?;
         // The plan reserves the tier's block scratch for blocks of the batch
         // port's columns: the block route's bytes there.
@@ -1490,6 +1498,7 @@ impl Body38 {
             plant: None,
             mtp: None,
             residency_glue,
+            nvme_tier,
             ckpt,
             ple_points: Vec::new(),
             marks: false,
@@ -1719,6 +1728,14 @@ impl Body38 {
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
         &self.hybrid
+    }
+
+    /// The NVMe expert tier's arena, on a load whose plan paged routed
+    /// experts: the counters a run reports ([`NvTier::stats`]). `None` on a
+    /// load with no tier.
+    #[must_use]
+    pub fn nvme_tier(&self) -> Option<&Arc<NvTier>> {
+        self.nvme_tier.as_ref()
     }
 
     /// The host tier, for a caller that attaches or marks its route trace.

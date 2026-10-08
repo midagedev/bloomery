@@ -37,6 +37,7 @@ pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
+pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 
@@ -61,13 +62,11 @@ pub const GEN_SLOTS_MAX: u64 = 8;
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
 const SESSION: &str = "session";
-const NVTIER: &str = "nvtier";
 
 const OPS: &str = "crates/model/src/ops.rs";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
 const HYBRID: &str = "crates/gpu/src/hybrid.rs";
 const DECODE: &str = "crates/model/src/bin/bloomery-decode.rs";
-const WORKSTATION: &str = "crates/model/src/placement/workstation.rs";
 
 /// What an unset name that is no lever means.
 const OWNERS: Unset = Unset::Means("its owner's default");
@@ -219,7 +218,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
-        name: "BLOOMERY_HOST_ROOM",
+        name: HOST_ROOM,
         class: Class::C,
         kind: Kind::Bytes,
         default: Unset::Means("the host's available bytes, read from this machine"),
@@ -230,12 +229,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Qwen3.8 plan's tiers, where the routed experts a room cannot hold are planned \
               on the NVMe tier; a room under that tier's floor is refused with the room, the \
               floor and the need.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: WORKSTATION,
-                round: NVTIER,
-            }],
-        },
+        site: Site::Parsed { left: &[] },
     },
     LeverSpec {
         name: NVTIER_BYTES,

@@ -96,6 +96,7 @@
 pub mod batch;
 pub mod handoff;
 pub mod leg;
+pub mod nvtier;
 pub mod page;
 pub mod residency;
 pub mod route_trace;

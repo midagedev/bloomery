@@ -31,8 +31,8 @@ use registry::REGISTRY;
 pub use registry::XSTREAM;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
-    HOST_LOCK, HOST_POPULATE, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
-    MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES, NVTIER_READ, PIN_MAIN, PREFILL,
+    HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT,
+    MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES, NVTIER_READ, PIN_MAIN, PREFILL,
     PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
     RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
@@ -515,9 +515,10 @@ pub(crate) enum Scope<'a> {
     /// The worker pool ([`pool_levers`]): it reads its two levers alone; the
     /// others are its binary's to read.
     Pool,
-    /// The NVMe expert tier's two levers ([`nvtier_levers`]), read where
-    /// they act — the placement dial and the tier's build, both below every
-    /// binary's `main` — like the pool's two.
+    /// The host's room and the NVMe expert tier's two levers
+    /// ([`nvtier_levers`]), read where they act — the host's reading, the
+    /// placement dial and the tier's build, all below every binary's `main`
+    /// — like the pool's two.
     NvTier,
 }
 
@@ -536,7 +537,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
             .map(|(_, v)| v.as_os_str())
     };
     let pool = |name: &str| name == THREADS || name == SPIN;
-    let nvtier = |name: &str| name == NVTIER_BYTES || name == NVTIER_READ;
+    let nvtier = |name: &str| name == HOST_ROOM || name == NVTIER_BYTES || name == NVTIER_READ;
     let mut entries = Vec::new();
     let mut refused = Vec::new();
     for row in REGISTRY {
@@ -1908,12 +1909,16 @@ pub fn pool_levers() -> Result<PoolLevers, LeverError> {
     })
 }
 
-/// The NVMe expert tier's two levers ([`NVTIER_BYTES`], [`NVTIER_READ`]),
-/// read where they act, below every binary's `main`: the placement dial
-/// reads the arena's bytes at the plan, the tier's build the read mode at
-/// the load. [`PoolLevers`] is the shape.
+/// The host's room ([`HOST_ROOM`]) and the NVMe expert tier's two levers
+/// ([`NVTIER_BYTES`], [`NVTIER_READ`]), read where they act, below every
+/// binary's `main`: the host's available bytes the room replaces, the
+/// placement dial the arena's bytes at the plan, the tier's build the read
+/// mode at the load. [`PoolLevers`] is the shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NvTierLevers {
+    /// `BLOOMERY_HOST_ROOM`: the host's room in bytes, given instead of
+    /// read from the machine; `None` unset.
+    pub host_room: Option<u64>,
     /// `BLOOMERY_NVTIER_BYTES`: the arena's bytes; `None` unset (the dial's
     /// default).
     pub bytes: Option<u64>,
@@ -1922,26 +1927,31 @@ pub struct NvTierLevers {
     pub direct: bool,
 }
 
-/// The NVMe expert tier's levers from the process environment
-/// ([`nvtier_levers`]'s two), parsed as [`at_main`] parses them, and
+/// The host room's and the NVMe expert tier's levers from the process
+/// environment ([`NvTierLevers`]'s three), parsed as [`at_main`] parses them, and
 /// refused, with every refusal at once, when one is set to a value its kind
 /// does not take and when a retired name is set. Nothing else: which levers
 /// a binary acts on, and which names it knows, is its `main`'s reading.
 pub fn nvtier_levers() -> Result<NvTierLevers, LeverError> {
     let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let levers = read(&env, Scope::NvTier)?;
-    let bytes = match &levers.entry(NVTIER_BYTES).value {
+    let bytes_of = |name: &str| match &levers.entry(name).value {
         None => None,
         Some(Value::Bytes(b)) => Some(*b),
-        v => panic!("{NVTIER_BYTES} holds {v:?}, not bytes"),
+        v => panic!("{name} holds {v:?}, not bytes"),
     };
+    let (host_room, bytes) = (bytes_of(HOST_ROOM), bytes_of(NVTIER_BYTES));
     let direct = match &levers.entry(NVTIER_READ).value {
         None => true,
         Some(Value::Word("direct")) => true,
         Some(Value::Word("buffered")) => false,
         v => panic!("{NVTIER_READ} holds {v:?}, not direct or buffered"),
     };
-    Ok(NvTierLevers { bytes, direct })
+    Ok(NvTierLevers {
+        host_room,
+        bytes,
+        direct,
+    })
 }
 
 /// The registry as a Markdown table — name, class, what it takes, what unset

@@ -443,6 +443,9 @@
 # process on either card as an arm starts is waited out (10 minutes, then rc 75). A dry run prints the
 # pre-lease checks' verdict and goes on.
 set -uo pipefail
+# The drive the model file is on and its read counter (an ours row's drive column).
+# shellcheck source=tools/ref/drive-read.sh
+source "${BASH_SOURCE[0]%/*}/drive-read.sh" || exit 2
 # Probe tag. Qwen3.8's prompt plan reads the lane rate the load probes (`xstream_lane_gbs=` on the load's
 # `xstream=` line): the pick floor m* follows it, so a load on a contended box probes a low rate and
 # admits fewer experts (7.43 GB/s: m_min 3194, 4095 experts admitted; 20.56: m_min 1216, 5805) — a
@@ -875,6 +878,12 @@ q3_self_test() {
   eq probe-mean-all-tagged "$got" 'n/a (every row tagged)'
   got=$(printf '%s\n' 'ours|512|1|1000.0| [probe-off]' 'llama|512|1|500.0|' | ROUNDS=1 T975= ratio_table "ratio pp p=" 512 llama 1 5 | grep -o 'probe-off: .*')
   eq probe-ratio-count "$got" 'probe-off: ours 1/1'
+  # An ours row's drive column: the sectors the device read between the readings, × 512, the device named;
+  # a foreign reader's sectors are in the delta; both ours rows carry the column.
+  eq drive-col "$(drive_col 1000 1008 nvme0n1)" ' | drive_read_bytes 4096 (nvme0n1)'
+  eq drive-col-foreign "$(drive_col 5 1000005 nvme0n1)" ' | drive_read_bytes 512000000 (nvme0n1)'
+  eq drive-col-quiet "$(drive_col 5 5 nvme0n1)" ' | drive_read_bytes 0 (nvme0n1)'
+  eq drive-col-rows "$(grep -c '\$PROBE_COL\$DRIVE_COL\$COLD_TAG' "$me")" 2
   rm -rf "$pt"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
@@ -1794,7 +1803,10 @@ ours_arm() {
   ours_post "$i" "$r" "$rc" "$out" "$((t1 - t0))"
 }
 # ours_pre <index> <round>: the witness block before an ours or bin arm.
-ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N ctx=$(arm_ctx "$1")"; }
+ours_pre() {
+  witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N ctx=$(arm_ctx "$1")"
+  DRV_BEFORE=$(drive_sectors "$DRIVE_DEV")
+}
 # ours_post <index> <round> <rc> <output> <wall s>: the witness block after an ours or bin arm, then its
 # row, or its FAIL row when it exited non-zero or printed no row (no SMOKE line, or one without its p50
 # and mean, no time prompt row). An output that opens with an `arm` line (an --arm list's) gives the
@@ -1802,6 +1814,9 @@ ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N ctx=$(arm_ctx "
 ours_post() {
   local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed ran mtp=''
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} ctx=$(arm_ctx "$i")
+  # The bytes the model file's drive was asked to read across the arm, every reader of it: a foreign
+  # reader shows in the arm's own delta.
+  DRIVE_COL=$(drive_col "$DRV_BEFORE" "$(drive_sectors "$DRIVE_DEV")" "$DRIVE_DEV")
   witness "post r$r $label d=$dep n=$N ctx=$ctx"
   # A mem= arm's witness names its scope's peak (the header's Mem), read inside the scope; a model=
   # arm's names its file, the profile's witness line above naming the profile's.
@@ -1941,12 +1956,12 @@ ours_post() {
     # a round's, so 1000 / mean is one stream's rate.
     local agg
     agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$COLD_TAG$PROBE_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG|$nslots")
   else
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$COLD_TAG$PROBE_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
@@ -2187,6 +2202,7 @@ if [ -n "$DRY" ]; then
 fi
 
 majflt_require depth-qwen3moe.sh
+DRIVE_DEV=$(drive_dev "$MODEL") || exit 2
 timing_cards_precheck || {
   rc=$?
   echo "depth-qwen3moe.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2

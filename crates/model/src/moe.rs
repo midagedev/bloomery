@@ -1196,9 +1196,6 @@ pub struct UnionScratch {
     /// `min(max_cols, DEFER_MAX_COLS) · per_list`, every expert such a call
     /// can list.
     claims: Vec<AtomicU8>,
-    /// The call's expert ids as the tier's `ensure` takes them, reused
-    /// across calls so a paged call allocates nothing.
-    tier_ids: Vec<u32>,
 }
 
 impl UnionScratch {
@@ -1313,7 +1310,6 @@ impl UnionScratch {
             claims: (0..cols.min(DEFER_MAX_COLS) * per_list)
                 .map(|_| AtomicU8::new(0))
                 .collect(),
-            tier_ids: Vec::new(),
         }
     }
 
@@ -1875,13 +1871,8 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         let x = x.into();
-        if let Some(tier) = &self.tier {
-            scratch.tier_ids.clear();
-            scratch
-                .tier_ids
-                .extend(lists.iter().flat_map(|l| l.iter().map(|&(e, _)| e)));
-            tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
-        }
+        // The union reads the file mapping: a prompt call touches more ids a layer than
+        // the arena holds slots, so only the one-token path lends the arena's slots.
         check_union_call(
             x,
             lists,
