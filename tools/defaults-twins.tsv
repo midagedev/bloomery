@@ -1,50 +1,52 @@
 # The defaults twins — one row a pin identity tools/check-defaults.py scans (lever,
-# where, value collapse the sites). `twin` is the path:line of the clause that runs
-# the same model path at the default; a pin whose value already is the default's word
-# may name its own clause. `none` needs a reason opening with a date, and every run of
-# the check prints the count of those rows so the open gaps stay visible.
-BLOOMERY_ATTN_BUNDLE	gate-attn	1	crates/model/tests/attn.rs:1690	the same test's in-process default (the 8-head tile) the per-head child is banded against
-BLOOMERY_CARD_BUDGET	gate-gpu-ds41-dspark-loop	13G	justfile:1538	the same sitting's first ds41 serve run loads generate_ds41 at each card's own bytes (the unset budget)
-BLOOMERY_CARD_BUDGET	gate-gpu-qwen3-serve	12G	crates/gpu-gates/src/bin/gate_qwen3_serve.rs:599	the arms table's `default` row runs the seat with no budget
-BLOOMERY_CED	records-refresh	$c	justfile:1445	the loop runs both words; `on` is the unset default
-BLOOMERY_DRAFT	gate-gpu-ds41-draft	lookup	justfile:1468	the recipe's plain arm (code-plain.log) runs the unset plain path
-BLOOMERY_DRAFT	gate-gpu-ds41-dspark-loop	dspark	justfile:1480	the recipe's plain arm (plain.log) runs the unset plain path
-BLOOMERY_DRAFT	gate-gpu-glm5next-serve	mtp	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:2429	the drafted arm pins the unset rule's own words under a/bp; the --plan unset clauses at :779 print the rule
-BLOOMERY_DRAFT	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:1054	the plain arm's server runs --place gate, where unset resolves to the plain path
-BLOOMERY_DRAFT	gate-gpu-qwen38-serve	mtp	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:2149	slots_default_residency: the seat at its own defaults, both levers unset (the user's case)
-BLOOMERY_DRAFT	gate-gpu-qwen38-serve	off	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:2149	slots_default_residency: the seat at its own defaults, both levers unset (the user's case)
-BLOOMERY_DRAFT	weekly-gpu-ds41-serve	dspark	justfile:1538	the recipe's first gate_ds41_serve run serves with BLOOMERY_DRAFT unset (the plain path)
-BLOOMERY_DSPARK_CARD	weekly-gpu-ds41-serve	A6000	justfile:1538	the bp arm's dspark runs with the lever unset (the card of the fewest usable bytes, the 3090)
-BLOOMERY_FLASH_SEGMENTS	gate-attn	1	crates/model/tests/attn.rs:1354	the same test's parent run merges the default 32 segments in this process
-BLOOMERY_FLASH_SIMD	gate-attn	0	crates/model/tests/attn.rs:627	hw_flash_simd_bands_against_scalar: the default SIMD path banded against the scalar twin
-BLOOMERY_HOST_LOCK	gate-gpu-ds41-long	${BLOOMERY_HOST_LOCK:-1}	justfile:1747	gate-ds41-load runs the same load path with the lever unset (the default 0)
-BLOOMERY_HOST_LOCK	stage-gpu-load-v41-lock	1	justfile:398	stage-gpu-load-v41 runs the same gate without --lock
-BLOOMERY_HOST_LOCK	weekly-gpu-ds41-cand	${BLOOMERY_HOST_LOCK:-1}	justfile:1747	gate-ds41-load runs the same load path with the lever unset (the default 0)
-BLOOMERY_MTP_WIDTH	gate-gpu-ds41-draft	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs:1611	width_cost: the DSpark chooser at cost across served requests
-BLOOMERY_MTP_WIDTH	gate-gpu-ds41-dspark-loop	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs:1611	width_cost: the DSpark chooser at cost across served requests
-BLOOMERY_MTP_WIDTH	gate-gpu-glm5next-serve	cost	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:2367	the pinned word is the default; this clause is the defaults twin of the arm's fixed pins
-BLOOMERY_MTP_WIDTH	gate-gpu-glm5next-serve	fixed	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:2367	the drafted arm's width_cost server runs the chooser at cost over a request sequence
-BLOOMERY_MTP_WIDTH	gate-gpu-qwen38-serve	cost	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:2278	the pinned word is the default; the width chooser's own clause (the #3 fix's)
-BLOOMERY_MTP_WIDTH	gate-gpu-qwen38-serve	fixed	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:2278	the width chooser at cost, one greedy request then a flush
-BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	cost	crates/gpu-gates/src/bin/gate_ds41_serve.rs:1611	the pinned word is the default; the chooser's own clause (the #3 fix's)
-BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs:1611	the same gate's width_cost clause runs the chooser at cost
-BLOOMERY_POISON	gate-gpu-qwen4exp-iqleg	1	justfile:834	gate-gpu-qwen4exp-e2e runs the same family's loads at the lever unset (the default 0)
-BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile:1458	the recipe's g-default run feeds the same depth at the default group (2)
-BLOOMERY_PROFILE	gate-profile	2	crates/model/tests/profile.rs:84	the same test's off child (env_remove) is the uninstrumented twin
-BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs:84	the same test's off child (env_remove) is the uninstrumented twin
-BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs:599	the pinned word is the default; the arms table's `default` row runs the f16 cache with no flag
+# where, value collapse the sites). `twin` is `path::needle` — the clause that runs
+# the same model path at the default, named by a literal substring of one of its
+# lines that occurs exactly once in the file, so a clause that moved or vanished is
+# red; a pin whose value already is the default's word may name its own clause.
+# `none` needs a reason opening with a date, and every run of the check prints the
+# count of those rows so the open gaps stay visible.
+BLOOMERY_ATTN_BUNDLE	gate-attn	1	crates/model/tests/attn.rs::fn hw_attn_bundle_bands_against_per_head	the same test's in-process default (the 8-head tile) the per-head child is banded against
+BLOOMERY_CARD_BUDGET	gate-gpu-ds41-dspark-loop	13G	justfile::bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D &&	the same sitting's first ds41 serve run loads generate_ds41 at each card's own bytes (the unset budget)
+BLOOMERY_CARD_BUDGET	gate-gpu-qwen3-serve	12G	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::("default", &["--parallel", "1"]),	the arms table's `default` row runs the seat with no budget
+BLOOMERY_CED	records-refresh	$c	justfile::records-refresh:	the loop runs both words; `on` is the unset default
+BLOOMERY_DRAFT	gate-gpu-ds41-draft	lookup	justfile::> $D/code-plain.log	the recipe's plain arm (code-plain.log) runs the unset plain path
+BLOOMERY_DRAFT	gate-gpu-ds41-dspark-loop	dspark	justfile::generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log	the recipe's plain arm (plain.log) runs the unset plain path
+BLOOMERY_DRAFT	gate-gpu-glm5next-serve	mtp	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn drafted(	the drafted arm pins the unset rule's own words under a/bp; the --plan unset clauses at :779 print the rule
+BLOOMERY_DRAFT	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &default, PLAIN)?	the plain arm's server runs --place gate, where unset resolves to the plain path
+BLOOMERY_DRAFT	gate-gpu-qwen38-serve	mtp	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	slots_default_residency: the seat at its own defaults, both levers unset (the user's case)
+BLOOMERY_DRAFT	gate-gpu-qwen38-serve	off	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	slots_default_residency: the seat at its own defaults, both levers unset (the user's case)
+BLOOMERY_DRAFT	weekly-gpu-ds41-serve	dspark	justfile::bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D &&	the recipe's first gate_ds41_serve run serves with BLOOMERY_DRAFT unset (the plain path)
+BLOOMERY_DSPARK_CARD	weekly-gpu-ds41-serve	A6000	justfile::bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D &&	the bp arm's dspark runs with the lever unset (the card of the fewest usable bytes, the 3090)
+BLOOMERY_FLASH_SEGMENTS	gate-attn	1	crates/model/tests/attn.rs::fn hw_flash_split_k_bands_against_one_segment	the same test's parent run merges the default 32 segments in this process
+BLOOMERY_FLASH_SIMD	gate-attn	0	crates/model/tests/attn.rs::fn hw_flash_simd_bands_against_scalar	hw_flash_simd_bands_against_scalar: the default SIMD path banded against the scalar twin
+BLOOMERY_HOST_LOCK	gate-gpu-ds41-long	${BLOOMERY_HOST_LOCK:-1}	justfile::gate-ds41-load:	gate-ds41-load runs the same load path with the lever unset (the default 0)
+BLOOMERY_HOST_LOCK	stage-gpu-load-v41-lock	1	justfile::stage-gpu-load-v41 *ARGS='--plan b':	stage-gpu-load-v41 runs the same gate without --lock
+BLOOMERY_HOST_LOCK	weekly-gpu-ds41-cand	${BLOOMERY_HOST_LOCK:-1}	justfile::gate-ds41-load:	gate-ds41-load runs the same load path with the lever unset (the default 0)
+BLOOMERY_MTP_WIDTH	gate-gpu-ds41-draft	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	width_cost: the DSpark chooser at cost across served requests
+BLOOMERY_MTP_WIDTH	gate-gpu-ds41-dspark-loop	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	width_cost: the DSpark chooser at cost across served requests
+BLOOMERY_MTP_WIDTH	gate-gpu-glm5next-serve	cost	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn width_cost(	the pinned word is the default; this clause is the defaults twin of the arm's fixed pins
+BLOOMERY_MTP_WIDTH	gate-gpu-glm5next-serve	fixed	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn width_cost(	the drafted arm's width_cost server runs the chooser at cost over a request sequence
+BLOOMERY_MTP_WIDTH	gate-gpu-qwen38-serve	cost	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn width_cost(	the pinned word is the default; the width chooser's own clause (the #3 fix's)
+BLOOMERY_MTP_WIDTH	gate-gpu-qwen38-serve	fixed	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn width_cost(	the width chooser at cost, one greedy request then a flush
+BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	cost	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	the pinned word is the default; the chooser's own clause (the #3 fix's)
+BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	the same gate's width_cost clause runs the chooser at cost
+BLOOMERY_POISON	gate-gpu-qwen4exp-iqleg	1	justfile::gate-gpu-qwen4exp-e2e:	gate-gpu-qwen4exp-e2e runs the same family's loads at the lever unset (the default 0)
+BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile::--depth 512 -n 2 > $D/g-default.log	the recipe's g-default run feeds the same depth at the default group (2)
+BLOOMERY_PROFILE	gate-profile	2	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
+BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
+BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::("default", &["--parallel", "1"]),	the pinned word is the default; the arms table's `default` row runs the f16 cache with no flag
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q6_0	none	2026-10-08: a refusal probe — the seat refuses the word by name before any load, so no path runs at any value
-BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q8_0	crates/gpu-gates/src/bin/gate_qwen3_serve.rs:599	the arms table's `default` row runs the f16 cache (the unset default)
-BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:2429	the drafted arm pins the unset rule's word under a/bp; the --plan unset clauses at :779 print the rule
-BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:1054	the plain arm's server at --place gate, where unset resolves off
-BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:2149	the seat at its own defaults: unset resolves mid-p<P>-s1 under the cards' rule
-BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	off	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:2149	the seat at its own defaults, both levers unset (the user's case)
-BLOOMERY_RESIDENCY	weekly-gpu-ds41-serve	off	justfile:1342	gate-gpu-ds41-twocard --union runs plan (b′) with the levers unset (the placement default mid-p0-s1)
-BLOOMERY_STEP_STATS	gate-gpu-glm5next-serve	1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs:1695	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
-BLOOMERY_STEP_STATS	gate-gpu-qwen3-serve	1	crates/gpu-gates/src/bin/gate_qwen3_serve.rs:1813	print-only lever — the slots_rounds doc says STEP_STATS moves no computation on this server
-BLOOMERY_STEP_STATS	gate-gpu-qwen38-serve	1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs:1961	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
-BLOOMERY_STEP_STATS	weekly-gpu-ds41-flowcounts	1	justfile:1458	print-only lever: the counters move no computation; the g-default run is the same path
-BLOOMERY_STEP_STATS	weekly-gpu-ds41-serve	1	crates/gpu-gates/src/bin/gate_ds41_serve.rs:1262	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
-BLOOMERY_THREADS	gate-attn	threads_env	justfile:715	gate-forward runs the same CPU engine at the default thread count (the pool's own width)
-BLOOMERY_THREADS	gate-gpu-qwen4exp-iqleg	n.to_string()	crates/gpu-gates/src/bin/gate_qwen4exp_iqleg.rs:710	the default child (env_remove) runs the pool's own width in the same clause pair
-BLOOMERY_THREADS	gate-mt	threads_env	justfile:715	gate-forward runs the same CPU engine at the default thread count (the pool's own width)
+BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q8_0	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::("default", &["--parallel", "1"]),	the arms table's `default` row runs the f16 cache (the unset default)
+BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn drafted(	the drafted arm pins the unset rule's word under a/bp; the --plan unset clauses at :779 print the rule
+BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &default, PLAIN)?	the plain arm's server at --place gate, where unset resolves off
+BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	the seat at its own defaults: unset resolves mid-p<P>-s1 under the cards' rule
+BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	off	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	the seat at its own defaults, both levers unset (the user's case)
+BLOOMERY_RESIDENCY	weekly-gpu-ds41-serve	off	justfile::gate-gpu-ds41-twocard *ARGS='--union':	gate-gpu-ds41-twocard --union runs plan (b′) with the levers unset (the placement default mid-p0-s1)
+BLOOMERY_STEP_STATS	gate-gpu-glm5next-serve	1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &dir, DRAFT_ONLY_STATS)?	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
+BLOOMERY_STEP_STATS	gate-gpu-qwen3-serve	1	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::.env(bloomery_levers::STEP_STATS, "1")	print-only lever — the slots_rounds doc says STEP_STATS moves no computation on this server
+BLOOMERY_STEP_STATS	gate-gpu-qwen38-serve	1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_flow_together(	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
+BLOOMERY_STEP_STATS	weekly-gpu-ds41-flowcounts	1	justfile::--depth 512 -n 2 > $D/g-default.log	print-only lever: the counters move no computation; the g-default run is the same path
+BLOOMERY_STEP_STATS	weekly-gpu-ds41-serve	1	crates/gpu-gates/src/bin/gate_ds41_serve.rs::cmd.env(bloomery_levers::STEP_STATS, "1")	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
+BLOOMERY_THREADS	gate-attn	threads_env	justfile::gate-forward:	gate-forward runs the same CPU engine at the default thread count (the pool's own width)
+BLOOMERY_THREADS	gate-gpu-qwen4exp-iqleg	n.to_string()	crates/gpu-gates/src/bin/gate_qwen4exp_iqleg.rs::cmd.env_remove(bloomery_levers::THREADS)	the default child (env_remove) runs the pool's own width in the same clause pair
+BLOOMERY_THREADS	gate-mt	threads_env	justfile::gate-forward:	gate-forward runs the same CPU engine at the default thread count (the pool's own width)

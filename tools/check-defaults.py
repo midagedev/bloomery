@@ -14,7 +14,9 @@ tools/defaults-twins.tsv.
 
 `check` scans every off-default lever pin the tree's gate surface sets and
 holds it to the TSV; `list` prints the pins the scanner sees (the census's one
-reader — the TSV is seeded from it, so the two cannot drift apart in shape).
+reader — the TSV is seeded from it, so the two cannot drift apart in shape)
+with each TSV row's twin resolved to its `path:line`, so a reader can still
+jump to the clause.
 
 What a pin is, and where the scanner looks:
 
@@ -49,22 +51,26 @@ The TSV, one row a pin identity (lever, where, value — sites collapse):
 
 `where` is the justfile recipe for a recipe pin, and the recipe that runs the
 file for a Rust pin (several, comma-joined, when several run it). `twin` is
-`path:line` — a clause that runs the same model path at the default — checked
-to exist in the tree with its line in range; a pin whose value already is the
-default's word may name its own clause. `twin` `none` needs a reason opening
-with a date (`YYYY-MM-DD: `); every run prints the count of those rows so the
-open gaps stay visible. Red (exit 1): a pin with no row, a row whose pin no
-longer exists, a twin not found in the tree, an undated `none`. Named error
-(exit 65): a registry row, a recipe or a TSV line the reader cannot parse, a
-lever the registry does not know, a gate file no recipe names.
+`path::needle` — a clause that runs the same model path at the default, named
+by a literal substring of one of its lines (a Rust clause's name or a unique
+string literal in it; a justfile recipe's `name:` header or the arm's log
+name); the needle must occur exactly once in `path`, so a twin whose clause
+moved or vanished is red instead of a silent pass, and a pin whose value
+already is the default's word may name its own clause. `twin` `none` needs a
+reason opening with a date (`YYYY-MM-DD: `); every run prints the count of
+those rows so the open gaps stay visible. Red (exit 1): a pin with no row, a
+row whose pin no longer exists, a twin whose path is not in the tree or whose
+needle occurs zero times or more than once in it, an undated `none`. Named
+error (exit 65): a registry row, a recipe or a TSV line the reader cannot
+parse, a lever the registry does not know, a gate file no recipe names.
 
 Blind spots, each named: lever values built in code as typed values the
 environment never carries (`Residency::Mid` consts, `set_hoststream`,
 `KvQ8::Q8`, `GLM_RESIDENCY_UNSET`, gate_hybrid's n_l, `--slots`) — the census
 in the round report lists them by hand; a lever a runner or a caller's
 environment carries (`BLOOMERY_BOX_ENV`, tools/ref/*) — measurement, not
-gates; a twin anchor is checked for existence and line range only, so a stale
-line number inside the right file passes (drift shows in `list`).
+gates; a twin whose clause is rewritten around an unchanged needle line — the
+needle pins the line's text, not the clause's behaviour.
 """
 import os
 import re
@@ -388,6 +394,30 @@ def read_tsv(root, live):
     return rows
 
 
+def resolve_twin(root, p, needle):
+    """(occurrences, line) of the needle in root/p — the line set only when it
+    occurs exactly once; occurrences None when the file is not in the tree."""
+    f = os.path.join(root, p)
+    if not os.path.isfile(f):
+        return None, None
+    text = open(f, encoding="utf-8", errors="replace").read()
+    n = text.count(needle)
+    if n != 1:
+        return n, None
+    at = text.find(needle)
+    return 1, text.count("\n", 0, at) + 1
+
+
+def split_twin(twin):
+    """(path, needle) of a `path::needle` twin; (None, None) when malformed."""
+    if "::" not in twin:
+        return None, None
+    p, needle = twin.split("::", 1)
+    if not p.strip() or not needle.strip():
+        return None, None
+    return p, needle
+
+
 def check(root):
     pins, live = scan_tree(root)
     rows = read_tsv(root, live)
@@ -406,16 +436,19 @@ def check(root):
                 bad.append(f"{TSV}:{n}: a `none` twin needs a reason opening with a date "
                            f"(YYYY-MM-DD: …): {reason!r}")
             continue
-        if not re.fullmatch(r"[^:]+:\d+", twin):
-            bad.append(f"{TSV}:{n}: a twin is `path:line` or `none`: {twin!r}")
+        p, needle = split_twin(twin)
+        if p is None:
+            bad.append(f"{TSV}:{n}: a twin is `path::needle` or `none`: {twin!r}")
             continue
-        p, ln = twin.rsplit(":", 1)
-        f = os.path.join(root, p)
-        if not os.path.isfile(f):
+        hits, _ = resolve_twin(root, p, needle)
+        if hits is None:
             bad.append(f"{TSV}:{n}: the twin {twin} is not found in the tree")
-            continue
-        if int(ln) > sum(1 for _ in open(f, encoding="utf-8", errors="replace")):
-            bad.append(f"{TSV}:{n}: the twin {twin} points past the end of {p}")
+        elif hits == 0:
+            bad.append(f"{TSV}:{n}: the twin needle of {twin} occurs zero times in {p} "
+                       "— the clause moved or is gone; re-anchor the row")
+        elif hits > 1:
+            bad.append(f"{TSV}:{n}: the twin needle of {twin} occurs {hits} times in "
+                       f"{p}, not exactly once — the anchor no longer names one clause")
     gaps = sum(1 for r in rows if r[3] == "none")
     pins.sort(key=lambda p: (p[0], p[1], p[2]))
     if bad:
@@ -433,6 +466,21 @@ def run_list(root):
     pins, live = scan_tree(root)
     for lever, where, value, kind, site in sorted(pins):
         print(f"{lever}\t{where}\t{value}\t{kind}\t{site}")
+    for lever, where, value, twin, reason, n in read_tsv(root, live):
+        if twin == "none":
+            print(f"{lever}\t{where}\t{value}\tnone\t-")
+            continue
+        p, needle = split_twin(twin)
+        at = twin
+        if p is not None:
+            hits, line = resolve_twin(root, p, needle)
+            if hits == 1:
+                at = f"{p}:{line}"
+            elif hits is None:
+                at = f"{twin} (path gone)"
+            else:
+                at = f"{twin} ({hits} hits)"
+        print(f"{lever}\t{where}\t{value}\ttwin\t{at}")
     ident = len({(p[0], p[1], p[2]) for p in pins})
     print(f"check-defaults: {len(pins)} pin sites, {ident} pin identities, {len(live)} live levers")
     return 0
@@ -532,14 +580,14 @@ fn t() {
 
 _MINI_TSV = "\n".join([
     "# lever\twhere\tvalue\ttwin\treason",
-    "BLOOMERY_HOST_LOCK\tweekly-mini\t${BLOOMERY_HOST_LOCK:-1}\tmini/justfile:11\tthe recipe's own escape arm",
-    "BLOOMERY_HOST_LOCK\tgate-mini\t1\tmini/bin.rs:3\tthe table's arm",
-    "BLOOMERY_MTP_WIDTH\tgate-mini\tcost\tmini/bin.rs:14\tset_var names the default value",
-    "BLOOMERY_MTP_WIDTH\tgate-mini\tfixed\tmini/bin.rs:11\tthe pinned arm",
-    "BLOOMERY_MTP_WIDTH\tgate-mini\tmid-p0-s1\tmini/bin.rs:3\tthe alias arm",
-    "BLOOMERY_QWEN3_KV\tgate-mini\tq8_0\tmini/bin.rs:15\tthe flag arm",
+    "BLOOMERY_HOST_LOCK\tweekly-mini\t${BLOOMERY_HOST_LOCK:-1}\tmini/justfile::eleven\tthe recipe's own escape arm",
+    "BLOOMERY_HOST_LOCK\tgate-mini\t1\tmini/bin.rs::three\tthe table's arm",
+    "BLOOMERY_MTP_WIDTH\tgate-mini\tcost\tmini/bin.rs::fourteen\tset_var names the default value",
+    "BLOOMERY_MTP_WIDTH\tgate-mini\tfixed\tmini/bin.rs::eleven\tthe pinned arm",
+    "BLOOMERY_MTP_WIDTH\tgate-mini\tmid-p0-s1\tmini/bin.rs::three\tthe alias arm",
+    "BLOOMERY_QWEN3_KV\tgate-mini\tq8_0\tmini/bin.rs::fifteen\tthe flag arm",
     "BLOOMERY_MTP_WIDTH\tweekly-mini\tfixed\tnone\t2026-10-08: fixture row for the dated-reason rule",
-    "BLOOMERY_MTP_WIDTH\tgate-mini\tfixed\tmini/test.rs:5\tthe test's pinned arm",
+    "BLOOMERY_MTP_WIDTH\tgate-mini\tfixed\tmini/test.rs::five\tthe test's pinned arm",
 ]) + "\n"
 
 
@@ -557,13 +605,17 @@ def _fixture():
     open(os.path.join(root, "crates", "gpu-gates", "src", "bin", "gate_mini.rs"), "w").write(
         _MINI_BIN.replace("@RETIRED@", _RETIRED))
     open(os.path.join(root, "crates", "model", "tests", "gate_mini.rs"), "w").write(_MINI_TEST)
-    # the fixture names its twins at mini/*: two one-line files stand in for them
+    # the fixture names its twins at mini/*: numbered-word files stand in for the
+    # clause files — a green twin's word is its line's own ("eleven" is line 11,
+    # and a word is never a substring of another, as "four" is of "fourteen");
+    # bin.rs carries "dup" on two lines (the more-than-once red) and nothing
+    # holds "seventeen" (the zero-times red)
     open(os.path.join(root, "mini", "justfile"), "w").write("one\ntwo\nthree\nfour\nfive\nsix\nseven\n"
                                                             "eight\nnine\nten\neleven\ntwelve\n"
                                                             "thirteen\nfourteen\nfifteen\nsixteen\n")
     open(os.path.join(root, "mini", "bin.rs"), "w").write("one\ntwo\nthree\nfour\nfive\nsix\nseven\n"
                                                           "eight\nnine\nten\neleven\ntwelve\n"
-                                                          "thirteen\nfourteen\nfifteen\nsixteen\n")
+                                                          "thirteen\nfourteen\nfifteen\nsixteen\ndup\ndup\n")
     open(os.path.join(root, "mini", "test.rs"), "w").write("one\ntwo\nthree\nfour\nfive\nsix\n")
     tsv = os.path.join(root, TSV)
     open(tsv, "w").write(_MINI_TSV)
@@ -593,12 +645,22 @@ def self_test():
     open(tsv, "w").write("\n".join(r for r in rows if "fixture row" not in r) + "\n")
     if rerun() != 1:
         fails.append("a deleted row (its pin stands) is not red")
-    open(tsv, "w").write(saved_tsv.replace("mini/bin.rs:3\tthe table's arm",
-                                           "mini/bin.rs:99\tthe table's arm"))
+    # the needle rule's three cases: one occurrence green (the fixture above),
+    # zero red (the clause moved or is gone), more than once red (no one clause)
+    open(tsv, "w").write(saved_tsv.replace("mini/bin.rs::three\tthe table's arm",
+                                           "mini/bin.rs::seventeen\tthe table's arm"))
     if rerun() != 1:
-        fails.append("a twin past the end of its file is not red")
-    open(tsv, "w").write(saved_tsv.replace("mini/bin.rs:3\tthe table's arm",
-                                           "mini/gone.rs:1\tthe table's arm"))
+        fails.append("a twin whose needle occurs zero times in its file is not red")
+    open(tsv, "w").write(saved_tsv.replace("mini/bin.rs::three\tthe table's arm",
+                                           "mini/bin.rs::dup\tthe table's arm"))
+    if rerun() != 1:
+        fails.append("a twin whose needle occurs more than once in its file is not red")
+    open(tsv, "w").write(saved_tsv.replace("mini/bin.rs::three\tthe table's arm",
+                                           "mini/bin.rs:3\tthe table's arm"))
+    if rerun() != 1:
+        fails.append("a `path:line` twin (the old line-number form) is not red")
+    open(tsv, "w").write(saved_tsv.replace("mini/bin.rs::three\tthe table's arm",
+                                           "mini/gone.rs::one\tthe table's arm"))
     if rerun() != 1:
         fails.append("a twin whose path is gone is not red")
     open(tsv, "w").write(saved_tsv.replace("2026-10-08: fixture row for the dated-reason rule",
@@ -638,6 +700,12 @@ def self_test():
             ("BLOOMERY_MTP_WIDTH", "fixed", "table"), ("BLOOMERY_QWEN3_KV", "q8_0", "flag")}
     if got != want:
         fails.append(f"rust pins: {sorted(got)}, expected {sorted(want)}")
+    # the twin resolver: one hit gives the line, zero and more-than-one and a
+    # missing file do not
+    got = (resolve_twin(root, "mini/bin.rs", "three"), resolve_twin(root, "mini/bin.rs", "seventeen"),
+           resolve_twin(root, "mini/bin.rs", "dup"), resolve_twin(root, "mini/gone.rs", "one"))
+    if got != ((1, 3), (0, None), (2, None), (None, None)):
+        fails.append(f"resolve_twin: {got}")
     # a gate file no recipe names is a named error
     open(os.path.join(root, "crates", "model", "tests", "orphan.rs"), "w").write(_MINI_TEST)
     try:
