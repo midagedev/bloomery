@@ -1,0 +1,10 @@
+# The 0.2.7 release pass: the candidate tarball's bloomery-serve --model qwen38 at the serving defaults (every BLOOMERY_*
+# lever unset: adaptive residency, the prompt path, the shared MTP draft with its cost-chosen width), Qwen3.8-Flash-Next
+# UD-Q4_K_XL, greedy, thinking off, on --place a and bp: the release tapes (one discarded warm-up, prompts 4, 3, 1 at
+# --ctx-size 8192), then GitHub #3's request stream at --ctx-size 40960 (three ~29.5K-token prompts in a row after 14
+# shorter ones), red on any failed request, a dead server or an engine error line. The headline numbers stay the depth
+# runners' (rel027-ab).
+kind: exclusive
+reason: four 111 GB model loads (~45 s each) and timed requests whose per-token times are the tape, so the box must be
+  quiet; why now: 0.2.7 is the GitHub #3 fix release and the user wants it out fast
+minutes: 20..35

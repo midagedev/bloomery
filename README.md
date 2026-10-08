@@ -29,12 +29,11 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.2.6)
+## Status (0.2.7)
 
-> **Known issue in 0.2.6** ([#3](https://github.com/midagedev/bloomery/issues/3)): with the MTP draft on (the default
-> for Qwen3.8 and GLM-5.3), a request can stop with `MTP window: a step after rows whose hidden rows the step's own
-> arena held` and the server exits. It is intermittent. Workaround: start the server with `BLOOMERY_MTP_WIDTH=fixed`
-> (or `BLOOMERY_DRAFT=off`). The fix ships in 0.2.7.
+> **Fixed in 0.2.7** ([#3](https://github.com/midagedev/bloomery/issues/3)): 0.2.6 could stop a request with
+> `MTP window: a step after rows whose hidden rows the step's own arena held` when the MTP draft was on (the default
+> for Qwen3.8 and GLM-5.3). On 0.2.6, `BLOOMERY_MTP_WIDTH=fixed` avoids it.
 
 | Area | State |
 |---|---|
@@ -71,12 +70,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.2.6-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.6-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.7-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.7-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.2.6](https://github.com/midagedev/bloomery/releases/tag/v0.2.6)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.2.7](https://github.com/midagedev/bloomery/releases/tag/v0.2.7)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
@@ -125,15 +124,15 @@ Two requests at once (`--parallel 2`, both busy) after a 512-token prompt, decod
 | GLM-5.3-Flash `UD-Q4_K_XL` | 35.3 | 223 |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | — ³ |
 
-**RTX A6000 48 GB, one request, Qwen3.8-Flash-Next (0.2.6, MTP on, `--place a`)**
+**RTX A6000 48 GB, one request, Qwen3.8-Flash-Next (0.2.7, MTP on, `--place a`)**
 
 | File | Prompt tok/s (P = 512) | Prompt tok/s (P = 4096) | Decode tok/s after the 4,096-token prompt |
 |---|---|---|---|
-| `UD-Q4_K_XL` | 943 | 1,258 | 89.1 |
-| `UD-Q3_K_XL` | 775 | 1,438 | 98.4 |
+| `UD-Q4_K_XL` | 998 | 1,390 | 89.3 |
+| `UD-Q3_K_XL` | 1,188 | 1,700 | 99.6 |
 
-A prose prompt, 96 tokens after it, four rounds in one window, the serving defaults; 0.2.5 read the same 4,096-token
-prompt at 733 tok/s and decoded at 73.6 ([measured](https://github.com/midagedev/rig-log/blob/main/log/2026-10-07.md#rel026-3arm)).
+A prose prompt, 96 tokens after it, four rounds in one window (Q4: rounds 2–4, the first cold), the serving defaults;
+0.2.6 read the same 4,096-token prompt at 1,253 tok/s and decoded at 88.4 ([measured](https://github.com/midagedev/rig-log/blob/main/log/2026-10-08.md#rel027-ab)).
 
 ¹ measured when Qwen3.6 ran two requests in turn (one request's rate); one pass since 0.2.3, not re-measured · ² adaptive residency off · ³ two requests in turn on two cards
 today. Qwen3.8 and GLM-5.3 ran with the MTP draft off.
