@@ -105,7 +105,13 @@ fn main() {
         });
         match Arch::detect(&probe) {
             Ok(Arch::Deepseek2) => {}
-            Ok(a @ (Arch::Deepseek41 | Arch::Qwen3moe | Arch::Qwen35moe | Arch::Glm5next)) => {
+            Ok(
+                a @ (Arch::Deepseek41
+                | Arch::Qwen3moe
+                | Arch::Qwen35moe
+                | Arch::Glm5next
+                | Arch::Mimo2),
+            ) => {
                 eprintln!("bloomery-decode: unsupported architecture {:?}", a.name());
                 std::process::exit(1);
             }

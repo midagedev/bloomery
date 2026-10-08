@@ -267,12 +267,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A mimo2 file is listed against the whole tree: the flash at its head
-    /// width and each group, the rope without a QK norm, the router at its
-    /// width, and the program itself are items; the dense block (the glm5next
-    /// body's row takes any width), the qwen2 tokenizer and the tool parser
-    /// are not. The synthetic header's stacks are F32, which every card
-    /// reads, so the routed-format item is the file gate's to pin.
+    /// A mimo2 file is listed against the mimo2 body's rows: the flash at the
+    /// synthetic header's head width and each group, the rope without a QK
+    /// norm and the router at its width are items (the body runs head 192 and
+    /// 256 experts); the program itself, the dense block (the shared dense
+    /// row takes any width), the qwen2 tokenizer and the tool parser are not.
+    /// The synthetic header's stacks are F32, which no host kernel serves, so
+    /// they are items too; the real file's stack types are the file gate's.
     #[test]
     fn the_coverage_list_is_the_work_queue() {
         let (_, items) = read("mimo2-cov", |_| true);
@@ -281,7 +282,6 @@ mod tests {
             "GQA flash, head 16, value 8, group 4",
             "rope without a QK norm",
             "router: sigmoid, 8 experts, top 2, with a selection bias",
-            "a layer program for mimo2",
         ] {
             assert!(
                 items.iter().any(|f| f.starts_with(listed)),
@@ -292,6 +292,7 @@ mod tests {
             "pre-tokenizer qwen2",
             "a tool-call parser",
             "dense SwiGLU layer",
+            "a layer program",
         ] {
             assert!(
                 !items.iter().any(|f| f.contains(covered)),

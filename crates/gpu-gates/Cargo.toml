@@ -42,6 +42,8 @@ bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
 # The GLM-5.3-Flash program, reached only through the `glm5next` feature (its generator and its
 # end-to-end gate).
 bloomery-gpu-glm5next = { path = "../gpu-glm5next", optional = true }
+# The MiMo-V2.6-Flash program, reached only through the `mimo2` feature (its end-to-end gate).
+bloomery-gpu-mimo2 = { path = "../gpu-mimo2", optional = true }
 cuda-core = { workspace = true, optional = true }
 # A gate binary's own `#[cuda_module]` (`gate_kquant`: entries no engine binary links) needs the
 # device and host halves of cuda-oxide as direct dependencies: the macros emit `::cuda_host` and
@@ -111,6 +113,7 @@ deepseek41 = [
 vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
 clef = ["gpu", "dep:bloomery-decision", "dep:bloomery-serve", "dep:serde_json"]
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
+mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 
 # A bin whose `main` sits behind a feature requires that feature: cargo refuses to build it without the
 # feature before it links anything, instead of linking the feature-off stub `main` over the working
@@ -310,6 +313,10 @@ required-features = ["glm5next"]
 [[bin]]
 name = "gate_glm5next_serve"
 required-features = ["glm5next"]
+
+[[bin]]
+name = "gate_mimo2_e2e"
+required-features = ["mimo2"]
 
 [[bin]]
 name = "cnode_probe"

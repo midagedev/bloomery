@@ -22,7 +22,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/clef'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -30,7 +30,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/clef'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef'
 
 # fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
 # 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
@@ -1922,10 +1922,27 @@ gate-glm5next-meta:
 # arrays, the two QKV forms, wrong dimensions); then the reader's description of the RL file's header is pinned: the
 # per-layer KV-head and window arrays, the two head widths (key 192, value 128), the window, sinks and value scale
 # per layer, the rope base per layer kind, the sigmoid noaux_tc router, the coverage list and the KV values per
-# layer. A doctored real shard 0 with one KV array entry cut is refused by name, and so is the MTP-only file.
-# Headers only, seconds.
+# layer. A doctored real shard 0 with one KV array entry cut is refused by name, and so is the MTP-only file. Its
+# lib run holds the program's unit tests too (`arch::mimo2::program`: the step's node and memory-operation counts, each
+# layer's attention arguments and each block's from its description, a layer or a block the kernels do not run
+# refused by name), which need no card. Headers only, seconds.
 gate-mimo2-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mimo2 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mimo2_meta -- --ignored --nocapture'
+
+# mimo2 (MiMo-V2.6-Flash) end-to-end: the program loaded once by the gate placement, the 3090's bytes on either card
+# (every routed expert on the host tier, the host set derived at about 161.5 GB), against ik's sets (refset `ik-mimo2`,
+# dumped from the MOPD file): (s) the step's node count and its memory operations, the layer kinds, each layer's
+# attention arguments against its description's and the file's pins, the stores' bytes and no routed expert on a card;
+# (p) graph = eager bit for bit on the batch set; (c) the batch set's last argmax ik's or a named tie, each layer's
+# output distance printed; (t) the argmax after each step set's prompt (the two 4-token sets, then the 1,024- and
+# 4,096-position ones) ik's or a named tie. There is no fixture file for it yet, so it is a weekly (selected by its
+# trigger rows in tools/gate-paths.tsv and its own text) and a fixture-tier run is refused by name (66). `--only
+# s|p|c|t` runs one clause on the load and `--step-sets short|long` takes (t)'s sets by length. Loads the whole host
+# set: alone in a batch, and under the big-load lock the V4.1 loads take.
+[group('solo')]
+[group('v41-load')]
+weekly-gpu-mimo2-e2e *ARGS:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features mimo2 --release --bin gate_mimo2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_e2e {{ARGS}}'
 
 # glm5next (GLM-5.3-Flash) end-to-end: the program loaded once by the gate placement on the 3090 (every routed expert
 # on the host tier, the host set of about 185 GB populated), against ik's sets (refset `ik-glm5next`): the step's

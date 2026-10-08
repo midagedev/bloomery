@@ -1,7 +1,7 @@
 //! mimo2 metadata gate: what the header reader `arch::mimo2` resolves from
 //! the MiMo-V2.6-Flash-RL file, and what the coverage check lists for it —
-//! the parts no program in this tree runs yet, the work queue of the rounds
-//! that build one. One contract, one test; it prints what it compared, then
+//! the parts no program in this tree runs; empty while `gpu-mimo2` runs the
+//! file whole. One contract, one test; it prints what it compared, then
 //! fails with the whole list of what differs.
 //!
 //! `hw_`: needs the RL shards on the box (`just gate-mimo2-meta`). Headers
@@ -76,22 +76,15 @@ const KV: &[&str] = &[
     "kv 8x320 values: 1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
 ];
 
-// PIN(2026-10-08): the coverage check's list (feature: layers). No program runs a mimo2 file yet,
-// so a need is an item unless a row of any program covers it: the dense block (Body35's dense
-// path, 16384 a multiple of its 256), the Q8_0/F32 tensors other programs' pins read and the
-// sigmoid router (the BiasedSigmoid body's 256-wide row beside GLM's 288) are not items; the flash
-// at head 192 with the value head split from it, the rope without a QK norm and the mxfp4 stacks
-// are. The flash needs name the value head, the window, the sinks and the value scale, which no
-// flash row runs.
-const COVERAGE: &[&str] = &[
-    "GQA flash, head 192, value 128, group 16, value scale: 0,5,11,17,23,29,35,41,47",
-    "GQA flash, head 192, value 128, group 8, window 128, sinks, value scale: 1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
-    "rope without a QK norm: head 192, NeoX, 64 of 192 dims: 0-47",
-    "mxfp4 routed experts on a card: 1-47",
-    "mxfp4 routed experts gate and up (the body reads q4_K): 1-47",
-    "mxfp4 routed experts down (the body reads q4_K and q6_K): 1-47",
-    "a layer program for mimo2",
-];
+// PIN(2026-10-08): the coverage check's list (feature: layers), empty. `crates/gpu-mimo2` runs the
+// file whole, so each need of its 48 layers has a row naming the program: the flashes at head 192
+// over value 128 (group 16 on the nine full layers, group 8 with window 128 and sinks on the 39
+// window layers), the rope without a QK norm at 64 of 192 dims, the BiasedSigmoid router at 256
+// experts and the dense layer 0 are rows; every tensor type is one the body reads (Q8_0 matrices,
+// F32 vectors) and the 141 mxfp4 stacks are served by the host's fused kernel at their row widths
+// (4096 and 2048). Before the program the list held seven items: the two flashes, the rope, three
+// mxfp4 rows and the program itself.
+const COVERAGE: &[&str] = &[];
 
 #[test]
 #[ignore = "needs the MiMo-V2.6-Flash-RL shards on the box (just gate-mimo2-meta)"]
@@ -145,8 +138,6 @@ fn hw_mimo2_spec() {
         &spec_view::items(&list),
         COVERAGE,
     );
-    let err = model::placement::PlacementError::Unimplemented(list);
-    let _ = writeln!(o, "as the engine refuses it: {err}");
     println!("{o}");
     assert!(
         b.is_empty(),
@@ -158,8 +149,7 @@ fn hw_mimo2_spec() {
 
 // PIN(2026-10-08): the plan of the RL file through `arch::mimo2::place::PlanInputs` on the gate
 // machine (the 3090, all 48 trunk layers and the head) at the gate context 4160, made from
-// `PlanInputs::describe` — the coverage list refuses every mimo2 file today, the program being a
-// later round's. KV a position over the trunk 222,720 B = (39 window × 8 + 9 full × 4) KV heads ×
+// `PlanInputs::describe`. KV a position over the trunk 222,720 B = (39 window × 8 + 9 full × 4) KV heads ×
 // 320 values (key 192 + value 128) × 2 B, every layer a full plane.
 // PIN(2026-10-08): the card's weights 5,839,528,704 B [derived] = attention Q8_0 9 × 94,699,520 +
 // 39 × 100,270,080 (a layer's rows: 4,096 × (64·192 + kv·(192 + 128)) of qkv + 64·128 × 4,096 of

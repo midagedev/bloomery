@@ -67,6 +67,7 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
       src/model.rs                            `GpuModel<B: ChainBody>` — 스테이지·모드·캡처/재생·pos·헤드. 공유 골격
       src/arch/deepseek2/{dispatch,scratch,names,seed,lookup,kernels,probe}.rs → `impl ChainBody`
     crates/gpu-deepseek41       새 크레이트(S0 스파이크 결과에 따라): V4.1 전용 #[cuda_module]들 + arch/deepseek41 사슬 → `impl ChainBody`
+    crates/gpu-mimo2            host-only family crate, no device code (as `gpu-glm5next`): the MiMo-V2.6-Flash chain → `impl ChainBody`; a crate of its own so `just affected` selects only the bins that link it
     crates/gpu-gates            lib.rs 하네스 공유; src/oracle/{deepseek2,deepseek41}.rs; bin은 gate_p*(deepseek2)와 gate_deepseek41_<op>
     tools/ref/models/{deepseek2,deepseek41}.sh   ref-paths.sh가 BLOOMERY_MODEL로 소스
 
