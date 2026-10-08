@@ -9,7 +9,9 @@ use std::time::Instant;
 use bloomery_gpu::GpuError;
 use bloomery_gpu_gates::flip::Flip;
 use bloomery_gpu_gates::tier;
-use bloomery_gpu_gates::{GateError, RefManifest, ik_q8_2, ref_tensor_logical_in, verdict};
+use bloomery_gpu_gates::{
+    GateError, RefManifest, data_dir, ik_q8_2, ref_tensor_logical_in, verdict,
+};
 use refset::family::Family;
 
 /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
@@ -219,7 +221,7 @@ pub fn set_open(
     (name, family): (&str, &Family),
     band: Option<(&[u32], usize)>,
 ) -> Result<(RefManifest, u32, u32, Vec<u32>, usize), GateError> {
-    let man = crate::glm5next_tier::ik_set(name, family)?;
+    let man = RefManifest::open(&data_dir().join(name), family)?;
     let (pos, step, prefill) = man.step()?;
     let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
     let [tok] = step[..] else {
