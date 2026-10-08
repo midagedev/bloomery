@@ -81,12 +81,11 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
-use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
+use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::TierOpen;
-use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
-};
+use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
 use bloomery_gpu::linear::{self, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
@@ -112,7 +111,6 @@ use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take};
-use runtime::swaprule::KeptRows;
 
 use crate::ffn::CardExperts;
 use crate::host::routed_layers;
@@ -2385,63 +2383,28 @@ impl Slots for Body {
     }
 }
 
-impl HostServed for Body {
-    fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
+impl TierBody for Body {
+    type Experts = HostRun;
+
+    fn hybrid(&self) -> &Hybrid<HostRun> {
+        &self.hybrid
+    }
+
+    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
+    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+        Some(ResidencyParts {
+            glue: &mut self.residency_glue,
+            hybrid: &mut self.hybrid,
+            slots: &self.slots,
+        })
+    }
+
+    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)?;
         self.planted(Plant::AfterLaunch)
-    }
-
-    fn noted(&self, e: GpuError) -> GpuError {
-        self.hybrid.noted(e)
-    }
-
-    fn take_host_refusal(&mut self) -> Option<Refusal> {
-        self.hybrid.take_step_refusal()
-    }
-
-    /// The host tier's refusal poison lifted
-    /// ([`Hybrid::lift_refusal`]) — the settling a reset runs is
-    /// [`Hybrid::settle`]'s ([`Body::reset`]).
-    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.hybrid.lift_refusal(stream)
-    }
-
-    /// The refusal the host tier is poisoned by now
-    /// ([`Hybrid::refusal_poison`]).
-    fn refusal_poison(&self) -> Option<Refusal> {
-        self.hybrid.refusal_poison()
-    }
-
-    fn host_residency(&self) -> Option<&HostResidency> {
-        self.hybrid.residency()
-    }
-
-    /// The host tier's residency boundary at `at` ([`Hybrid::swap_at`]), its
-    /// report logged when a binary asked ([`Body::log_residency`]).
-    fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
-        self.residency_glue
-            .at_boundary(&mut self.hybrid, stream, at)
-    }
-
-    fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
-        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
-    }
-
-    fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
-        self.residency_glue.reset(&mut self.hybrid, stream)
-    }
-
-    fn stop_residency(&mut self) {
-        self.residency_glue.stop(&mut self.hybrid);
-    }
-
-    fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
-        self.residency_glue.start(
-            &mut self.hybrid,
-            gpu.context(),
-            gpu.stream(),
-            Arc::clone(&self.slots),
-        )
     }
 }
 
