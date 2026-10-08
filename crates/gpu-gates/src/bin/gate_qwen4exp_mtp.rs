@@ -135,6 +135,12 @@
 //! - (x) a resume of a state whose draft side the load does not take (a
 //!   state of a load without the draft) is refused by name with the model
 //!   untouched: its stores, position and draft store unchanged.
+//! - (i) a pass the width chooser holds back right after the server's cut
+//!   step (the prompt call, then its last id as the seat's first step): the
+//!   held pass's step has overwritten the step's arena the anchor the cut
+//!   step recorded reads, and no walk sits between — the step store-walks
+//!   its row at once, so the pass takes the position in instead of refusing
+//!   and the drafted ids stay the plain run's.
 //! - (y) two drafted sequences resident over a plan of two
 //!   (`PlanInputs::plan_mtp_with_slots`, `Body38::open_placed_mtp_slots`),
 //!   in the server's order (`worker.rs`'s `start` → `genloop`'s `prompt`):
@@ -3757,6 +3763,41 @@ mod gate {
         Ok(vec![first, next])
     }
 
+    /// (i) the width chooser's held pass right after the server's cut step
+    /// (a request's prompt call, then its last id as the seat's first step,
+    /// [`start`]): the pass the chooser holds back steps the target and the
+    /// draft hears of it through [`Draft::held`] with no walk between, the
+    /// anchor the cut step recorded reading the step's own arena the held
+    /// pass's step has overwritten — the step store-walks its row at once,
+    /// so the held pass takes the position in instead of refusing, and the
+    /// drafted ids after it stay the plain run's.
+    fn held_after_cut(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 8;
+        let ctx = m.body("held after the cut")?.ctx() as u32;
+        let (m, plain, _) = plain_to(m, prompt, Prompt38::Auto, N)?;
+        let mut s = app::Session::from_model(m, ctx);
+        let mut d = fresh_draft(&s)?;
+        let mut out = start(&mut s, &mut d, prompt)?;
+        // The chooser-held pass: the target steps, then the draft is told
+        // through Draft::held — the chooser proposes nothing first, so no
+        // walk sits between the step and the anchor it overwrote.
+        let last = *out.last().ok_or("no token after the cut step")?;
+        let next = Target::step(&mut s, last, Want::Argmax)?.argmax();
+        Draft::held(&mut d, &mut s, last, next)?;
+        out.push(next);
+        let mut spec = Spec38::new(d);
+        while out.len() < N {
+            one_pass(&mut s, &mut spec, &mut out)?;
+        }
+        let ok = out[..N] == plain[..N];
+        println!(
+            "(i) the held pass after the cut step: {} ids, the plain run's {}",
+            out.len(),
+            verdict(ok)
+        );
+        Ok((s.into_model(), ok))
+    }
+
     /// Window `ids` alone on the selected slot, `rounds` drafted passes of
     /// proposals capped to `depth` ([`Capped`]), each verified through the
     /// session's verify of one sequence.
@@ -4363,6 +4404,9 @@ mod gate {
         sc("(p) a partial accept's records")?;
         let (model, p_ok) = kept_state(m, &prompt)?;
         ok &= p_ok;
+        sc("(i) the width chooser's held pass after the server's cut step")?;
+        let (model, i_ok) = held_after_cut(model, &prompt)?;
+        ok &= i_ok;
         sc("(x) a resume of a state without the draft's side is refused")?;
         let (model, x_ok) = resume_refused(model, &inputs, ub, &prompt)?;
         ok &= x_ok;
