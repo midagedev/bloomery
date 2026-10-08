@@ -199,7 +199,6 @@ impl GlmTier {
                     detail: format!("layer {l}: tier experts off a routed block"),
                 });
             };
-            let models::Act::SwiGlu { limit } = m.act;
             let st = CardStacks::of(w, l)?;
             for (s, rpe) in [(&st.gate, ff), (&st.up, ff), (&st.down, n_embd)] {
                 if s.w.rows() != k * rpe {
@@ -212,7 +211,7 @@ impl GlmTier {
             }
             cfg.push(Some(TierLayer {
                 k,
-                limit: limit.unwrap_or(0.0),
+                limit: m.act.swiglu_limit(),
             }));
         }
         let stream = gpu.stream();

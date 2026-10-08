@@ -62,7 +62,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlanInputs};
-use models::{Act, Ffn};
+use models::Ffn;
 use runtime::layer::{FfnKind, Layer, MixerKind};
 use runtime::sched::{At, Overlap, Port, PortKind};
 
@@ -428,7 +428,6 @@ impl Nextn {
                 "layer {index}: a routed block without its shared expert"
             ))
         })?;
-        let Act::SwiGlu { limit } = shared.act;
         let ln = LayerNames::of(index, kind)?;
         let (
             MixerNames::Latent(latent_names),
@@ -507,7 +506,7 @@ impl Nextn {
             a: Arena::new(stream, n, d.stack())?,
             pair0: DeviceBuffer::zeroed(stream, HC_STREAMS * n)?,
             head,
-            limit: limit.unwrap_or(0.0),
+            limit: shared.act.swiglu_limit(),
             bias: moe.router.bias,
             held: 0,
             ctx,

@@ -226,32 +226,6 @@ fn list(allowed: &[SiteTy]) -> String {
         .join(", ")
 }
 
-/// The resident Q8_0 planes of `name`, or a named refusal.
-fn q8<'w>(
-    w: &'w Weights,
-    what: &'static str,
-    name: &str,
-) -> Result<(&'w crate::DeviceTensor<u32>, &'w crate::DeviceTensor<u16>), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::Q8_0 { qs, d, .. }) => Ok((qs, d)),
-        Some(_) => Err(GpuError::tensor(what, name, "Q8_0 (the q8f32 planes)")),
-        None => Err(GpuError::tensor(what, name, "resident")),
-    }
-}
-
-/// The resident F32 plane of `name`, or a named refusal.
-fn f32w<'w>(
-    w: &'w Weights,
-    what: &'static str,
-    name: &str,
-) -> Result<&'w crate::DeviceTensor<f32>, GpuError> {
-    match w.get(name) {
-        Some(DevWeight::F32 { w, .. }) => Ok(w),
-        Some(_) => Err(GpuError::tensor(what, name, "F32")),
-        None => Err(GpuError::tensor(what, name, "resident")),
-    }
-}
-
 /// The resident K-quant words of `name`, or a named refusal.
 fn kq<'w>(
     w: &'w Weights,
@@ -280,7 +254,7 @@ pub fn gemv(
     let stream = gpu.stream();
     match ty {
         SiteTy::Q8_0 => {
-            let (qs, d) = q8(w, WHAT, name)?;
+            let (qs, d) = w.q8_planes(WHAT, name)?;
             let q = gpu.q8f32();
             if m == 1 {
                 q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y)
@@ -298,7 +272,7 @@ pub fn gemv(
                 )
             }
         }
-        SiteTy::F32 => g32.enqueue_f32_tile(stream, f32w(w, WHAT, name)?, x, m, y),
+        SiteTy::F32 => g32.enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, x, m, y),
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Err(GpuError::shape(
             WHAT,
             format!("{name} is {ty}: a K-quant site's gemv is `site::kgemv`, on the q8_1 rows"),
@@ -442,7 +416,7 @@ pub fn gemm(
         ),
         SiteTy::Q8_0 => {
             dense()?;
-            let (qs, d) = q8(w, WHAT, name)?;
+            let (qs, d) = w.q8_planes(WHAT, name)?;
             k.g32.enqueue_gemm32(
                 stream,
                 Gemm32Args {
@@ -459,7 +433,7 @@ pub fn gemm(
             dense()?;
             let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
             k.g32
-                .enqueue_f32_tile(stream, f32w(w, WHAT, name)?, rows, m, y)
+                .enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, rows, m, y)
         }
     }
 }

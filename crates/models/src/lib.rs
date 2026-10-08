@@ -467,6 +467,16 @@ pub enum Act {
     SwiGlu { limit: Option<f32> },
 }
 
+impl Act {
+    /// The clamp the combine kernels take: 0, the plain combine, when the
+    /// activation has no limit, else the limit.
+    #[must_use]
+    pub fn swiglu_limit(self) -> f32 {
+        let Act::SwiGlu { limit } = self;
+        limit.unwrap_or(0.0)
+    }
+}
+
 /// How a layer's outputs join the residual.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Residual {
@@ -772,4 +782,16 @@ impl ModelSpec {
 /// A count this crate holds as `u32`; the readers refuse a file past it.
 fn count_u32(n: usize) -> u32 {
     u32::try_from(n).expect("a layer count read from a u32 key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Act;
+
+    /// No limit is the plain combine's 0; a limit is itself.
+    #[test]
+    fn swiglu_limit_is_zero_without_a_limit_and_the_limit_with_one() {
+        assert_eq!(Act::SwiGlu { limit: None }.swiglu_limit(), 0.0);
+        assert_eq!(Act::SwiGlu { limit: Some(7.0) }.swiglu_limit(), 7.0);
+    }
 }

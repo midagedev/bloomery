@@ -13,7 +13,7 @@
 //! the routed block has no shared expert and no clamp; layer 0's block is
 //! dense.
 
-use models::{Act, Ffn, LayerSpec, Mixer, RopeMode, Score};
+use models::{Ffn, LayerSpec, Mixer, RopeMode, Score};
 use runtime::layer::FfnKind;
 
 /// A layer the program has no launch for, named by its layer.
@@ -168,13 +168,6 @@ pub struct BlockArgs {
     pub bias: bool,
 }
 
-/// The layer's SwiGLU limit, 0 (the plain combine) when it has none.
-#[must_use]
-pub fn swiglu_limit(act: Act) -> f32 {
-    let Act::SwiGlu { limit } = act;
-    limit.unwrap_or(0.0)
-}
-
 /// Layer `l`'s [`BlockArgs`] from its description `s`, held to the router
 /// `built` names. Refused by name: a router that is not the sigmoid one that
 /// renormalizes its picks, unhashed, at another width, count or scale than
@@ -184,7 +177,7 @@ pub fn swiglu_limit(act: Act) -> f32 {
 pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockArgs, Refusal> {
     match &s.ffn {
         Ffn::Dense { ff, act } => Ok(BlockArgs {
-            limit: swiglu_limit(*act),
+            limit: act.swiglu_limit(),
             ff: *ff as usize,
             bias: false,
         }),
@@ -219,7 +212,7 @@ pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockAr
                     "a shared expert; the routed block has none".to_string(),
                 ));
             }
-            if swiglu_limit(m.act) != 0.0 {
+            if m.act.swiglu_limit() != 0.0 {
                 return Err(refuse(
                     l,
                     "a clamp on the routed experts; the host tier runs the plain combine"

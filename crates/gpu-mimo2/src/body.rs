@@ -26,9 +26,9 @@ use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
-use bloomery_gpu::model::{ChainBody, HostServed, StepMode};
+use bloomery_gpu::model::{ChainBody, HostServed, StepMode, refuse_scratch_past};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
-use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
+use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
@@ -129,24 +129,21 @@ impl Store {
     }
 }
 
-/// One rope base's table on the card: `ROT_K192` f32 for each position below
-/// the stores', the bits `RopeTable::push` makes.
-pub(crate) struct RopeRows {
+/// One rope base's table on the card: the K192 rows at base `theta`. The full
+/// and the window layers turn by their own bases (`rope.freq_base`,
+/// `rope.freq_base_swa`), so a layer reads the table of its own.
+pub(crate) struct RopeBase {
     pub theta: f32,
-    pub table: DeviceBuffer<f32>,
+    pub rows: RopeRows,
 }
 
-impl RopeRows {
+impl RopeBase {
     /// Rows `0..ctx` of the table at base `theta`. Load-time only.
-    fn new(stream: &CudaStream, theta: f32, ctx: usize) -> Result<RopeRows, GpuError> {
+    fn new(stream: &CudaStream, theta: f32, ctx: usize) -> Result<RopeBase, GpuError> {
         let table = RopeTable::new(&RopeSpec::window(theta, ROT_K192))?;
-        let mut host = Vec::with_capacity(ctx * ROT_K192);
-        for pos in 0..ctx as u32 {
-            table.push(pos, Direction::Forward, &mut host);
-        }
-        Ok(RopeRows {
+        Ok(RopeBase {
             theta,
-            table: DeviceBuffer::from_host(stream, &host)?,
+            rows: RopeRows::new(stream, &table, ROT_K192, ctx)?,
         })
     }
 }
@@ -279,7 +276,7 @@ pub struct Body {
     s: Scratch,
     stores: Vec<Store>,
     /// One table a distinct rope base.
-    ropes: Vec<RopeRows>,
+    ropes: Vec<RopeBase>,
     /// The slot map's card copy, the host run's rows: every entry the host
     /// mark. The host tier holds the host copy.
     slots: Arc<DeviceTensor<u32>>,
@@ -298,7 +295,7 @@ pub(crate) struct Parts<'s> {
     pub names: &'s [LayerNames],
     pub s: &'s mut Scratch,
     pub stores: &'s mut [Store],
-    pub ropes: &'s [RopeRows],
+    pub ropes: &'s [RopeBase],
     pub slots: &'s DeviceTensor<u32>,
     pub taps: Option<&'s mut [DeviceBuffer<f32>]>,
     pub ctx: usize,
@@ -312,59 +309,6 @@ pub(crate) fn shape(detail: impl Into<String>) -> GpuError {
     }
 }
 
-/// The resident weight `name`.
-pub(crate) fn weight<'w>(w: &'w Weights, name: &str) -> Result<&'w DevWeight, GpuError> {
-    w.get(name).ok_or_else(|| GpuError::Tensor {
-        what: WHAT,
-        name: name.to_string(),
-        need: "a resident weight",
-    })
-}
-
-/// The resident q8_0 weight `name`'s two planes.
-pub(crate) fn q8<'w>(
-    w: &'w Weights,
-    name: &str,
-) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    match weight(w, name)? {
-        DevWeight::Q8_0 { qs, d, .. } => Ok((qs, d)),
-        _ => Err(GpuError::Tensor {
-            what: WHAT,
-            name: name.to_string(),
-            need: "a q8_0 weight",
-        }),
-    }
-}
-
-/// The resident f32 tensor `name`.
-pub(crate) fn f32t<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<f32>, GpuError> {
-    match weight(w, name)? {
-        DevWeight::F32 { w, .. } => Ok(w),
-        _ => Err(GpuError::Tensor {
-            what: WHAT,
-            name: name.to_string(),
-            need: "an f32 tensor",
-        }),
-    }
-}
-
-/// The resident f32 vector `name`, as the buffer a kernel reads.
-pub(crate) fn f32v<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GpuError> {
-    f32t(w, name).map(DeviceTensor::buf)
-}
-
-/// `y = W · x` for the q8_0 weight `name` at one column.
-pub(crate) fn gemv(
-    gpu: &Gpu,
-    w: &Weights,
-    name: &str,
-    x: &DeviceBuffer<f32>,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let (qs, d) = q8(w, name)?;
-    gpu.q8f32().enqueue_q8_0_gemv(gpu.stream(), qs, d, x, 1, y)
-}
-
 /// The resident weight `name` holds `rows` rows of `k` values, in q8_0 when
 /// `q8_0` and in f32 otherwise: a weight of other shapes would leave the
 /// rows its launch reads unwritten, so the load refuses it by name.
@@ -374,12 +318,13 @@ fn expect_weight(
     q8_0: bool,
     (rows, k): (usize, usize),
 ) -> Result<(), GpuError> {
-    let (is_q8, got_k) = match weight(w, name)? {
+    let found = w.resident(WHAT, name)?;
+    let (is_q8, got_k) = match found {
         DevWeight::Q8_0 { k, .. } => (true, *k),
         DevWeight::F32 { k, .. } => (false, *k),
         _ => (false, 0),
     };
-    let got_rows = weight(w, name)?.rows();
+    let got_rows = found.rows();
     if is_q8 != q8_0 || got_rows != rows || got_k != k {
         return Err(shape(format!(
             "{name} holds {got_rows} rows of {got_k} {}; its launch reads {rows} rows of {k} {}",
@@ -423,27 +368,6 @@ fn check_layer(w: &Weights, c: &LayerCfg, n: &LayerNames, d: &Dims) -> Result<()
                 expect_weight(w, bias, false, (1, N_EXPERT))?;
             }
         }
-    }
-    Ok(())
-}
-
-/// Refused by name when the load's scratch, `made` device bytes
-/// ([`Body::scratch_bytes`]), passes what card `card` of `plan` sets aside
-/// for it (the card's `scratch_bytes` term): the plan counts those bytes by
-/// that term alone, no formula of the body's, so the load holds them to it.
-fn refuse_scratch_past(plan: &Plan<'_>, card: usize, made: usize) -> Result<(), GpuError> {
-    let term = plan
-        .machine
-        .cards
-        .get(card)
-        .map(|c| c.scratch_bytes)
-        .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-    if made as u64 > term {
-        return Err(shape(format!(
-            "the load's scratch holds {made} device bytes (the step's buffers, the rope \
-             tables, the host boundary, the slot map's copy); card {card}'s plan sets aside \
-             {term} for it"
-        )));
     }
     Ok(())
 }
@@ -639,7 +563,7 @@ impl Body {
         // MiMo fact: only the window layers carry sinks, one per query head, file constants.
         for (l, n) in names.iter().enumerate() {
             if let Some(name) = &n.attn.sinks {
-                let sinks = f32v(w, name)?.to_host_vec(stream)?;
+                let sinks = w.f32_buf(WHAT, name)?.to_host_vec(stream)?;
                 checked_sinks(l, &sinks, dims.heads)?;
             }
         }
@@ -663,7 +587,7 @@ impl Body {
         }
         let ropes = thetas
             .iter()
-            .map(|&t| RopeRows::new(stream, t, ctx))
+            .map(|&t| RopeBase::new(stream, t, ctx))
             .collect::<Result<Vec<_>, _>>()?;
         let slots = Arc::new(DeviceTensor::upload(
             stream,
@@ -716,7 +640,13 @@ impl Body {
             taps: None,
             ctx,
         };
-        refuse_scratch_past(plan, card, body.scratch_bytes())?;
+        refuse_scratch_past(
+            WHAT,
+            plan,
+            card,
+            body.scratch_bytes(),
+            "the step's buffers, the rope tables, the host boundary, the slot map's copy",
+        )?;
         Ok(body)
     }
 
@@ -771,7 +701,7 @@ impl Body {
             + self
                 .ropes
                 .iter()
-                .map(|r| r.table.num_bytes())
+                .map(|r| r.rows.table.num_bytes())
                 .sum::<usize>()
             + self.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()

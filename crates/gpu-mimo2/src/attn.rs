@@ -23,7 +23,7 @@ use bloomery_gpu::{Gpu, GpuError};
 use model::arch::mimo2::names;
 use model::arch::mimo2::program::{self as facts, AttnArgs};
 
-use crate::body::{Parts, f32v, gemv, shape};
+use crate::body::{Parts, WHAT, shape};
 
 /// Layer `l`'s sinks as the host holds them, refused by name unless they are
 /// one per query head ([`facts::sinks_row`]) and every one finite: a device
@@ -74,19 +74,19 @@ pub(crate) fn attention(
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x,
-        f32v(w, &n.norm)?,
+        w.f32_buf(WHAT, &n.norm)?,
         d.rms_eps,
         d.embd,
         1,
         &mut s.xn,
     )?;
-    gemv(gpu, w, &n.qkv, &s.xn, &mut s.qkv)?;
+    w.q8_gemv(gpu, WHAT, &n.qkv, &s.xn, &mut s.qkv)?;
     p.k.rope.enqueue_neox_append_k192(
         stream,
         K192Args {
             qkv: &mut s.qkv,
             q: &mut s.q,
-            table: &p.ropes[c.rope].table,
+            table: &p.ropes[c.rope].rows.table,
             pos: &s.pos,
             v_scale: a.v_scale,
             n_head: d.heads,
@@ -98,7 +98,11 @@ pub(crate) fn attention(
             cache_v: &mut store.v,
         },
     )?;
-    let sinks = n.sinks.as_deref().map(|name| f32v(w, name)).transpose()?;
+    let sinks = n
+        .sinks
+        .as_deref()
+        .map(|name| w.f32_buf(WHAT, name))
+        .transpose()?;
     p.k.flash.enqueue_pass_k192(
         stream,
         GqaK192Args {
@@ -119,7 +123,7 @@ pub(crate) fn attention(
         },
         d.heads,
     )?;
-    gemv(gpu, w, &n.o, &s.y, &mut s.out)?;
+    w.q8_gemv(gpu, WHAT, &n.o, &s.y, &mut s.out)?;
     gpu.elem()
         .enqueue_add(stream, &s.x, &s.out, d.embd, &mut s.x1)
 }

@@ -30,14 +30,15 @@ use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::router::mimo2::N_EXPERT;
 use cuda_core::DeviceBuffer;
 use model::ModelError;
+use model::arch::mimo2::host;
 use model::arch::mimo2::hparams::Hparams;
 use model::arch::mimo2::names;
 use model::arch::mimo2::program::BlockArgs;
-use model::moe::{HostLayer, HostLayerSpec};
+use model::moe::HostLayer;
 use model::r8file::R8Source;
 use runtime::layer::FfnKind;
 
-use crate::body::{Parts, f32t, f32v, gemv, shape, weight};
+use crate::body::{Parts, WHAT, shape};
 
 /// The block's tensors, named once at load.
 pub(crate) enum FfnNames {
@@ -104,7 +105,7 @@ pub(crate) fn dense(
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x1,
-        f32v(w, norm)?,
+        w.f32_buf(WHAT, norm)?,
         d.rms_eps,
         d.embd,
         1,
@@ -112,13 +113,13 @@ pub(crate) fn dense(
     )?;
     p.k.experts.enqueue_shexp_gate_up(
         stream,
-        weight(w, gate)?,
-        weight(w, up)?,
+        w.resident(WHAT, gate)?,
+        w.resident(WHAT, up)?,
         &s.xn,
         c.ffn.limit,
         &mut s.h,
     )?;
-    gemv(gpu, w, down, &s.h, &mut s.out)?;
+    w.q8_gemv(gpu, WHAT, down, &s.h, &mut s.out)?;
     let dest = dest.unwrap_or(&mut s.x);
     gpu.elem().enqueue_add(stream, &s.x1, &s.out, d.embd, dest)
 }
@@ -141,19 +142,19 @@ pub(crate) fn front(
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x1,
-        f32v(w, norm)?,
+        w.f32_buf(WHAT, norm)?,
         d.rms_eps,
         d.embd,
         1,
         hybrid.boundary_mut().normed_mut(),
     )?;
     let bias = match bias {
-        Some(name) => f32v(w, name)?,
+        Some(name) => w.f32_buf(WHAT, name)?,
         None => &s.no_bias,
     };
     p.k.router.enqueue_router(
         stream,
-        f32t(w, router)?,
+        w.f32_tensor(WHAT, router)?,
         hybrid.boundary().normed(),
         bias,
         d.scale,
@@ -191,37 +192,13 @@ pub(crate) fn back(
         .enqueue_add(stream, boundary.hsum_of(0)?, &s.x1, p.d.embd, dest)
 }
 
-/// The host views of the routed layers `run`, each from `hp` and the layer's
-/// stack names; a layer of the run that does not route is refused by name.
-/// Load-time only: the stacks are checked here.
+/// The host views of the routed layers `run`, each from [`host::layer`]; a
+/// layer of the run past the trunk is refused by name. Load-time only: the
+/// stacks are checked here.
 pub(crate) fn routed_layers(
     src: R8Source<'_>,
     hp: &Hparams,
     run: Range<usize>,
 ) -> Result<Vec<HostLayer>, ModelError> {
-    run.map(|l| {
-        if l >= hp.n_trunk {
-            return Err(ModelError::MissingTensor(format!(
-                "layer {l}'s routed stacks: a layer of the host run past the trunk"
-            )));
-        }
-        let (gate, up, down) = (
-            names::ffn_gate_exps(l),
-            names::ffn_up_exps(l),
-            names::ffn_down_exps(l),
-        );
-        HostLayer::build(
-            src,
-            &HostLayerSpec {
-                gate: &gate,
-                up: &up,
-                down: &down,
-                n_expert: hp.n_expert,
-                embd: hp.n_embd,
-                ff: hp.expert_ff,
-                swiglu_limit: 0.0,
-            },
-        )
-    })
-    .collect()
+    run.map(|l| host::layer(src, hp, l)).collect()
 }

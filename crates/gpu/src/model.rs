@@ -1732,6 +1732,36 @@ fn placed_pre(
     ))
 }
 
+/// Refused by name, as `what`'s, when the load's scratch, `made` device
+/// bytes, passes what card `card` of `plan` sets aside for it (the card's
+/// `scratch_bytes` term): the plan counts those bytes by that term alone, no
+/// formula of the body's, so the load holds them to it. `parts` names what
+/// the body's scratch holds, for the message.
+pub fn refuse_scratch_past(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+    made: usize,
+    parts: &str,
+) -> Result<(), GpuError> {
+    let term = plan
+        .machine
+        .cards
+        .get(card)
+        .map(|c| c.scratch_bytes)
+        .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
+    if made as u64 > term {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the load's scratch holds {made} device bytes ({parts}); card {card}'s plan \
+                 sets aside {term} for it"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The placed load after its body, which took `built`: the output head the
 /// card carries, over the body's weights, and the model over all of it, with
 /// the load's phases.

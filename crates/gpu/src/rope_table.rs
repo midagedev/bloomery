@@ -6,10 +6,13 @@
 //! table pair `i`. Which values form pair `i` and how they turn is the
 //! kernel's: adjacent `(2i, 2i + 1)` through [`rope_pair_rn`] in NORM mode,
 //! `(i, i + n_dims/2)` through `rope_neox::neox_pair` in NEOX mode — the
-//! table is the same.
+//! table is the same. [`RopeRows`] is a table's rows for every cache position,
+//! on the card.
 
 use crate::GpuError;
+use cuda_core::{CudaStream, DeviceBuffer};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
+use std::time::{Duration, Instant};
 
 /// Which way a table turns: `Forward` is rope, `Back` its inverse — ik's
 /// `ROPE_BACK`, the same table with the sines negated.
@@ -168,6 +171,65 @@ impl RopeTable {
             out.push(s * self.mscale * sign);
             theta *= self.theta_scale;
         }
+    }
+}
+
+/// Every cache position's rope row on the card, the table every path's rope
+/// launch reads by position: row `p`, `width` f32 at `p · width` (the values
+/// a head turns), holds [`RopeTable::push`]'s bits for position `p`, for each
+/// `p` below the cache's rows — so the one check a position gets, below the
+/// cache's rows, keeps the read inside the table. Built once at load.
+pub struct RopeRows {
+    /// The rows, `ctx` of `width` f32.
+    pub table: DeviceBuffer<f32>,
+    /// f32 a row: the turned values of a head.
+    pub width: usize,
+    /// The host time the rows took at load.
+    pub build: Duration,
+}
+
+impl RopeRows {
+    /// Rows `0..ctx` of `rope` (a `width`-wide spec, else refused), one
+    /// `push` per position in order, copied to the card. Load-time only.
+    pub fn new(
+        stream: &CudaStream,
+        rope: &RopeTable,
+        width: usize,
+        ctx: usize,
+    ) -> Result<RopeRows, GpuError> {
+        const WHAT: &str = "RopeRows::new";
+        let positions = u32::try_from(ctx).map_err(|_| {
+            GpuError::shape(
+                WHAT,
+                format!("a cache of {ctx} rows: positions and live key counts are u32"),
+            )
+        })?;
+        if rope.n_dims() != width || width == 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a rope table of {} values a position; a row is {width}",
+                    rope.n_dims()
+                ),
+            ));
+        }
+        let t0 = Instant::now();
+        let mut host = Vec::with_capacity(ctx * width);
+        for pos in 0..positions {
+            rope.push(pos, Direction::Forward, &mut host);
+        }
+        let build = t0.elapsed();
+        Ok(RopeRows {
+            table: DeviceBuffer::from_host(stream, &host)?,
+            width,
+            build,
+        })
+    }
+
+    /// The positions the table holds: the cache's rows.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.table.len() / self.width
     }
 }
 

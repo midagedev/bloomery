@@ -78,7 +78,7 @@ use crate::q38::{
 use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
-use crate::weights::{DevWeight, Weights};
+use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -237,16 +237,12 @@ impl Kernels38 {
     }
 }
 
-/// The resident Q8_0 planes of `name`.
+/// The resident Q8_0 planes of `name`, as this walk's errors name them.
 pub(super) fn q8<'w>(
     w: &'w Weights,
     name: &str,
 ) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::Q8_0 { qs, d, .. }) => Ok((qs, d)),
-        Some(_) => Err(GpuError::tensor(WHAT, name, "Q8_0 (the q8f32 planes)")),
-        None => Err(GpuError::tensor(WHAT, name, "resident")),
-    }
+    w.q8_planes(WHAT, name)
 }
 
 /// What every launch of a walk reads besides the arena and the stores: the

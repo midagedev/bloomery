@@ -1,22 +1,23 @@
 //! Resident weights (package P10): every tensor of the model file uploaded
 //! once, in the device format its kernel consumes (docs/gpu-design.md
-//! decision 4 — format conversion is load-time work; nothing in this file
-//! runs per step). A [`Weights`] owns one contiguous block range plus,
+//! decision 4 — format conversion is load-time work; per step this file only
+//! finds what was uploaded, by name, and launches [`Weights::q8_gemv`] on it).
+//! A [`Weights`] owns one contiguous block range plus,
 //! optionally, the non-block tensors, so a `Stage` loads exactly its own
 //! layers — or, for a placed model, every segment its plan puts on one card
 //! ([`Weights::load_placed`]). The formats and their byte arithmetic are
 //! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
 //! pin the uploads against independent host packings bit for bit.
 
-use crate::GpuError;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
+use crate::{Gpu, GpuError};
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::{
     CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment,
 };
-use cuda_core::{CudaStream, DeviceCopy};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 use runtime::words::stream_words;
@@ -592,6 +593,60 @@ impl Weights {
             name
         };
         self.by_name.get(name)
+    }
+
+    /// The resident weight `name`, refused by name as `what`'s when absent.
+    pub fn resident(&self, what: &'static str, name: &str) -> Result<&DevWeight, GpuError> {
+        self.get(name)
+            .ok_or_else(|| GpuError::tensor(what, name, "a resident weight"))
+    }
+
+    /// The two planes (`qs`, `d`) of the resident Q8_0 weight `name`; any
+    /// other variant is refused by name as `what`'s.
+    pub fn q8_planes(
+        &self,
+        what: &'static str,
+        name: &str,
+    ) -> Result<(&DeviceTensor<u32>, &DeviceTensor<u16>), GpuError> {
+        match self.resident(what, name)? {
+            DevWeight::Q8_0 { qs, d, .. } => Ok((qs, d)),
+            _ => Err(GpuError::tensor(what, name, "a q8_0 weight")),
+        }
+    }
+
+    /// The resident F32 tensor `name` (an f32 file tensor, or a bf16 one
+    /// decoded at load); any other variant is refused by name as `what`'s.
+    pub fn f32_tensor(
+        &self,
+        what: &'static str,
+        name: &str,
+    ) -> Result<&DeviceTensor<f32>, GpuError> {
+        match self.resident(what, name)? {
+            DevWeight::F32 { w, .. } => Ok(w),
+            _ => Err(GpuError::tensor(what, name, "an f32 tensor")),
+        }
+    }
+
+    /// The resident F32 tensor `name` as the buffer a kernel reads (a norm
+    /// gain, a bias); refused as [`Weights::f32_tensor`] is.
+    pub fn f32_buf(&self, what: &'static str, name: &str) -> Result<&DeviceBuffer<f32>, GpuError> {
+        self.f32_tensor(what, name).map(DeviceTensor::buf)
+    }
+
+    /// `y = W · x` for the resident Q8_0 weight `name` at one column of `x`
+    /// (`q8_0_gemv`, the decode shape); a weight of another variant is
+    /// refused by name as `what`'s. The multi-column launches lay their
+    /// outputs out as their bodies read them ([`crate::site::gemv`]).
+    pub fn q8_gemv(
+        &self,
+        gpu: &Gpu,
+        what: &'static str,
+        name: &str,
+        x: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (qs, d) = self.q8_planes(what, name)?;
+        gpu.q8f32().enqueue_q8_0_gemv(gpu.stream(), qs, d, x, 1, y)
     }
 
     /// Every resident name, sorted.

@@ -32,7 +32,6 @@ use crate::rope_neox::{
     NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
     q8_plane_lens,
 };
-use crate::rope_table::{Direction, RopeTable};
 use crate::tensor::{Q8Act, window};
 use crate::weights::q8_0_planes;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
@@ -40,7 +39,8 @@ use gguf::quant::f32_to_f16_bits;
 use model::quant::quantize_q8_0;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
-use std::time::{Duration, Instant};
+
+pub(super) use crate::rope_table::RopeRows;
 
 /// Word offsets of a unit's input record: the position of its first row,
 /// then its ids.
@@ -136,64 +136,6 @@ impl Drop for Inbox {
         // The pinned words outlive any copy still reading them. A failure on
         // the drop path is unreportable and ignored.
         let _ = self.copied.synchronize();
-    }
-}
-
-/// Every cache position's rope row on the card, the table every path's rope
-/// launch reads by position: row `p`, `width` f32 at `p · width` (the values
-/// a head turns: [`HEAD`] for qwen3moe, 64 of Qwen3.6's 256), holds
-/// `RopeTable::push`'s bits for position `p`, for each `p` below the cache's
-/// rows — so the one check a position gets, below the cache's rows, keeps
-/// the read inside the table. Built once at load.
-pub(super) struct RopeRows {
-    pub(super) table: DeviceBuffer<f32>,
-    /// f32 a row: the turned values of a head.
-    pub(super) width: usize,
-    /// The host time the rows took at load.
-    pub(super) build: Duration,
-}
-
-impl RopeRows {
-    /// Rows `0..ctx` of `rope` (a `width`-wide spec, else refused), one
-    /// `push` per position in order, copied to the card. Load-time only.
-    pub(super) fn new(
-        stream: &CudaStream,
-        rope: &RopeTable,
-        width: usize,
-        ctx: usize,
-    ) -> Result<RopeRows, GpuError> {
-        const WHAT: &str = "qwen3moe::RopeRows::new";
-        let positions = u32::try_from(ctx).map_err(|_| {
-            GpuError::shape(
-                WHAT,
-                format!("a cache of {ctx} rows: positions and live key counts are u32"),
-            )
-        })?;
-        if rope.n_dims() != width || width == 0 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a rope table of {} values a position; a row is {width}",
-                    rope.n_dims()
-                ),
-            ));
-        }
-        let t0 = Instant::now();
-        let mut host = Vec::with_capacity(ctx * width);
-        for pos in 0..positions {
-            rope.push(pos, Direction::Forward, &mut host);
-        }
-        let build = t0.elapsed();
-        Ok(RopeRows {
-            table: DeviceBuffer::from_host(stream, &host)?,
-            width,
-            build,
-        })
-    }
-
-    /// The positions the table holds: the cache's rows.
-    pub(super) fn rows(&self) -> usize {
-        self.table.len() / self.width
     }
 }
 

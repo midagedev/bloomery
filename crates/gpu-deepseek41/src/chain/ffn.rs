@@ -747,16 +747,19 @@ impl<'w> LayerWeights<'w> {
         hc_eps: f32,
         hc_iters: u32,
     ) -> Result<LayerWeights<'w>, GpuError> {
-        let gain = f32_weight(w, &c.norm)?;
-        let router = f32_tensor(w, &c.router)?;
-        let bias = f32_weight(w, &c.bias)?;
-        let (sh_gate, sh_up) = (weight(w, &c.sh_gate)?, weight(w, &c.sh_up)?);
+        let gain = w.f32_buf(ENQUEUE, &c.norm)?;
+        let router = w.f32_tensor(ENQUEUE, &c.router)?;
+        let bias = w.f32_buf(ENQUEUE, &c.bias)?;
+        let (sh_gate, sh_up) = (
+            w.resident(ENQUEUE, &c.sh_gate)?,
+            w.resident(ENQUEUE, &c.sh_up)?,
+        );
         let sh_down = Dense::of(w, &c.sh_down, ff, n_embd)?;
         let DevWeight::KQuant {
             ty: GgmlType::Q3_K,
             w: hc_w,
             ..
-        } = weight(w, &c.hc_fn)?
+        } = w.resident(ENQUEUE, &c.hc_fn)?
         else {
             return Err(tensor_err(&c.hc_fn, "a q3_K file tensor"));
         };
@@ -769,8 +772,8 @@ impl<'w> LayerWeights<'w> {
             sh_down,
             hc: HcParams {
                 w: hc_w,
-                scale: f32_weight(w, &c.hc_scale)?,
-                base: f32_weight(w, &c.hc_base)?,
+                scale: w.f32_buf(ENQUEUE, &c.hc_scale)?,
+                base: w.f32_buf(ENQUEUE, &c.hc_base)?,
                 eps: hc_eps,
                 iters: hc_iters,
             },
@@ -1677,26 +1680,6 @@ impl FfnPiece {
         self.kernels
             .enqueue_post(gpu.stream(), &p, &mut r.y, io.streams_out, io.fold_out)
     }
-}
-
-/// The resident weight `name`.
-fn weight<'w>(w: &'w Weights, name: &str) -> Result<&'w DevWeight, GpuError> {
-    w.get(name)
-        .ok_or_else(|| tensor_err(name, "a resident weight"))
-}
-
-/// The resident f32 tensor `name` (an f32 file tensor, or bf16 decoded at
-/// load).
-fn f32_tensor<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<f32>, GpuError> {
-    match weight(w, name)? {
-        DevWeight::F32 { w, .. } => Ok(w),
-        _ => Err(tensor_err(name, "an f32 tensor")),
-    }
-}
-
-/// The resident f32 vector `name`, as the buffer a kernel reads.
-fn f32_weight<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GpuError> {
-    f32_tensor(w, name).map(DeviceTensor::buf)
 }
 
 fn tensor_err(name: &str, need: &'static str) -> GpuError {
