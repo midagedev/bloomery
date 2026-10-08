@@ -75,13 +75,17 @@ fn main() -> std::process::ExitCode {
 mod dspark;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;
 
     use app::arch::deepseek41::{CardDraft, Ds41Cfg};
-    use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
+    use app::{Loaded, OpenArgs, Session};
     use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::hybrid::PoisonKind;
     use bloomery_gpu::model::StepMode;
@@ -101,6 +105,7 @@ mod gate {
     use runtime::{Advance, Speculative, Target};
 
     use crate::dspark;
+    use crate::quiet::Quiet;
 
     const NAME: &str = "gate_deepseek41_twocard";
     /// The card budget both plans are made under: the stage's dense bytes,
@@ -258,36 +263,6 @@ mod gate {
             t.iter_mut().for_each(|n| *n = 0);
         }
         Ok(out)
-    }
-
-    /// The open's records: none; the gate prints its own lines.
-    struct Quiet;
-
-    impl OpenLog<Body> for Quiet {
-        fn plan(
-            &mut self,
-            _: &'static str,
-            _: &PlanInputs,
-            _: &Machine,
-            _: &Plan<'_>,
-        ) -> Result<bool, SessionError> {
-            Ok(true)
-        }
-        fn load(&mut self, _: &Deepseek41Model) -> Result<(), SessionError> {
-            Ok(())
-        }
-        fn capture(&mut self, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-        fn prompt_buffers(&mut self, _: &Deepseek41Model) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    impl RowsLog for Quiet {
-        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
     }
 
     type Spec = Speculative<CardDraft<DraftBody>, PAIR_ROWS>;

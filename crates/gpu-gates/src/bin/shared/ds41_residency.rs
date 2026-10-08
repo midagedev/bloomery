@@ -78,7 +78,7 @@
 //! The gate runs with the r8 sidecar (`BLOOMERY_R8` on, its default): without
 //! it no flip unpacks, and `transform` is red by name.
 
-use crate::ds41_open::{fnv, open, open_edited};
+use crate::ds41_open::{open, open_edited};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -91,7 +91,7 @@ use bloomery_gpu_deepseek41::body::{Body, OpenCfg};
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::generate::{Place, Residence, place_table};
 use bloomery_gpu_gates::record;
-use bloomery_gpu_gates::{GateError, data_dir, verdict};
+use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, verdict};
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, workstation};
 use runtime::swaprule::SwapRule;
@@ -197,7 +197,7 @@ fn history(
             let out = s.step(next, Want::Logits)?;
             walls.push(ms(t));
             if let runtime::Out::Logits { row, .. } = out {
-                h.fnvs.push(fnv(row));
+                h.fnvs.push(Fnv1a64::default().f32s(row).value());
             }
             next = out.argmax();
             h.tokens.push(next);

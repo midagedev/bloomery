@@ -204,24 +204,21 @@ pub fn hc_chain_q8_0(
 #[cfg(test)]
 mod tests {
     use super::{HC_MIX, exp_ik, exp_ours, hc_chain_q8_0, hc_pre_f32, lcg, q8_0_fixture};
+    use crate::Fnv1a64;
 
     /// FNV-1a over the bits of every output of `rule` on 256 LCG tokens at
     /// three `(eps, iters)` pairs.
     fn digest(rule: impl Fn(&[f32], [f32; 3], &[f32], f32, u32) -> [f32; HC_MIX]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut h = Fnv1a64::default();
         for (seed, (eps, iters)) in [(1u32, (1e-6f32, 20u32)), (2, (1e-3, 1)), (3, (0.0, 7))] {
             let x = lcg(256 * (2 * HC_MIX + 3), seed);
             for t in x.as_chunks::<{ 2 * HC_MIX + 3 }>().0 {
                 let (mix, rest) = t.split_at(HC_MIX);
                 let (base, sc) = rest.split_at(HC_MIX);
-                for v in rule(mix, [sc[0], sc[1], sc[2]], base, eps, iters) {
-                    for b in v.to_bits().to_le_bytes() {
-                        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-                    }
-                }
+                h = h.f32s(&rule(mix, [sc[0], sc[1], sc[2]], base, eps, iters));
             }
         }
-        h
+        h.value()
     }
 
     /// The rule's outputs on a fixed input, with each `exp`, hash to fixed
@@ -244,16 +241,13 @@ mod tests {
     /// any change to its arithmetic or its order changes it.
     #[test]
     fn hc_chain_q8_0_digest() {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut h = Fnv1a64::default();
         for (k, t, seed) in [(512usize, 3usize, 7u32), (16_384, 2, 8)] {
             let (qs, d) = q8_0_fixture(k, seed);
             let x = lcg(k * t, seed + 100);
-            for v in hc_chain_q8_0(&qs, &d, &x, k, t, 1e-5) {
-                for b in v.to_bits().to_le_bytes() {
-                    h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-                }
-            }
+            h = h.f32s(&hc_chain_q8_0(&qs, &d, &x, k, t, 1e-5));
         }
+        let h = h.value();
         println!("hc_chain_q8_0 digest {h:016x}");
         assert_eq!(h, DIGEST_Q8_0, "hc_chain_q8_0 digest");
     }

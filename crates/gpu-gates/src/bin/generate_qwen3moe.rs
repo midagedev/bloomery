@@ -362,7 +362,7 @@ mod cli {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
-    use bloomery_gpu_gates::{GateError, ref_model_path};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
         residency38_unset,
@@ -2698,11 +2698,7 @@ mod cli {
                 .enumerate()
                 .max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(&x.0)))
                 .map_or(0, |(i, _)| i);
-            let fnv = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
-                v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
-                    (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-                })
-            });
+            let fnv = Fnv1a64::default().f32s(&row).value();
             // The argmax's lead over the best other logit: how near a tie the
             // last token was.
             let top = row[argmax];

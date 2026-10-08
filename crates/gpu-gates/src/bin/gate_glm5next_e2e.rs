@@ -363,6 +363,10 @@ mod gate_card;
 mod e2e;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use crate::card;
     use crate::e2e::{
@@ -371,6 +375,7 @@ mod gate {
         refused_saying, rel, same_bits, second, set_open, tap, tap_at, tie_numbers, word_after,
         worst_off_path,
     };
+    use crate::quiet::Quiet;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -1819,15 +1824,6 @@ mod gate {
         }
     }
 
-    /// The rows-log that hears nothing.
-    struct Quiet;
-
-    impl app::RowsLog for Quiet {
-        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
     /// The window a drafted slot run drives, `PAIR` rows a verify.
     type Spec = runtime::Speculative<MtpDraft<Body>, PAIR>;
 
@@ -2465,7 +2461,7 @@ mod gate {
         m.reset()?;
         let mut run = GSolo {
             ids: vec![server_start(m, p)?],
-            logits: vec![fnv_row(&m.logits()?)],
+            logits: vec![Fnv1a64::default().f32s(&m.logits()?).value()],
             marks: Vec::new(),
         };
         for t in 0..=steps {
@@ -2474,7 +2470,8 @@ mod gate {
             }
             if t < steps {
                 run.ids.push(m.step(&[run.ids[t]])?);
-                run.logits.push(fnv_row(&m.logits()?));
+                run.logits
+                    .push(Fnv1a64::default().f32s(&m.logits()?).value());
             }
         }
         Ok(run)
@@ -2517,7 +2514,7 @@ mod gate {
         }
         for ((&s, &id), row) in order.iter().zip(&out.ids).zip(&logits) {
             runs[s].ids.push(id);
-            runs[s].logits.push(fnv_row(row));
+            runs[s].logits.push(Fnv1a64::default().f32s(row).value());
         }
         Ok(logits)
     }
@@ -2534,7 +2531,7 @@ mod gate {
         m.select_slot(slot)?;
         run.ids.push(m.step(&[last])?);
         let logits = m.logits()?;
-        run.logits.push(fnv_row(&logits));
+        run.logits.push(Fnv1a64::default().f32s(&logits).value());
         Ok(logits)
     }
 
@@ -2551,7 +2548,7 @@ mod gate {
             m.select_slot(slot)?;
             runs[slot] = GRun {
                 ids: vec![server_start(m, p)?],
-                logits: vec![fnv_row(&m.logits()?)],
+                logits: vec![Fnv1a64::default().f32s(&m.logits()?).value()],
             };
         }
         Ok(runs)
@@ -2762,7 +2759,7 @@ mod gate {
             m.reset()?;
             runs[slot] = GRun {
                 ids: vec![server_start(m, p)?],
-                logits: vec![fnv_row(&m.logits()?)],
+                logits: vec![Fnv1a64::default().f32s(&m.logits()?).value()],
             };
         }
         let mut last = [Vec::new(), Vec::new(), Vec::new()];
@@ -3127,7 +3124,11 @@ mod gate {
             );
             return Ok(false);
         }
-        let verify_logits: Vec<u64> = m.rows_logits::<2>()?.iter().map(|l| fnv_row(l)).collect();
+        let verify_logits: Vec<u64> = m
+            .rows_logits::<2>()?
+            .iter()
+            .map(|l| Fnv1a64::default().f32s(l).value())
+            .collect();
         let waits = refused_by(
             &m.step_slots(&[(0, &[sa.ids[2]]), (1, &[runs[1].ids[0]])]),
             GLM_BODY,
@@ -3136,7 +3137,11 @@ mod gate {
         m.rollback(pos + 2)?;
         let recaptured = m.capture_rows::<2>()?;
         let out = m.step_slots(&[(0, &[sa.ids[2]]), (1, &[runs[1].ids[0]])])?;
-        let pass_logits: Vec<u64> = m.slots_logits()?.iter().map(|l| fnv_row(l)).collect();
+        let pass_logits: Vec<u64> = m
+            .slots_logits()?
+            .iter()
+            .map(|l| Fnv1a64::default().f32s(l).value())
+            .collect();
         let nodes = verify_nodes == pass_nodes && recaptured == verify_nodes;
         let verify_ok = matches!(&verify, Ok(ids) if ids[..] == sa.ids[1..3])
             && verify_logits[..] == sa.logits[1..3];
@@ -3823,7 +3828,7 @@ mod gate {
         let verify_logits: Vec<u64> = m
             .rows_logits::<PAIR>()?
             .iter()
-            .map(|l| fnv_row(l))
+            .map(|l| Fnv1a64::default().f32s(l).value())
             .collect();
         m.rollback(pos + u32::try_from(PAIR)?)?;
         let recaptured = m.capture_rows::<PAIR>()?;
@@ -3838,7 +3843,11 @@ mod gate {
                 return Ok(false);
             }
         };
-        let pass_logits: Vec<u64> = m.slots_logits()?.iter().map(|l| fnv_row(l)).collect();
+        let pass_logits: Vec<u64> = m
+            .slots_logits()?
+            .iter()
+            .map(|l| Fnv1a64::default().f32s(l).value())
+            .collect();
         m.commit_slots(&[PAIR, PAIR])?;
         let nodes = pass_nodes == 2 * pair_nodes && recaptured == pair_nodes;
         let verify_ok = verify[..] == sa.ids[1..3] && verify_logits[..] == sa.logits[1..3];
@@ -4186,15 +4195,6 @@ mod gate {
             .collect()
     }
 
-    /// FNV-1a over a row's bits.
-    fn fnv_row(row: &[f32]) -> u64 {
-        row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
-            v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-            })
-        })
-    }
-
     /// What the plain steps leave after `p` positions.
     struct After {
         p: usize,
@@ -4243,12 +4243,12 @@ mod gate {
     /// its logits' digest, then every store again.
     fn after_prompt(m: &mut Glm5nextModel, argmax: u32) -> Result<Long, GateError> {
         let prompt = store_digests(m)?;
-        let logits = fnv_row(&m.logits()?);
+        let logits = Fnv1a64::default().f32s(&m.logits()?).value();
         let mut tok = argmax;
         let mut greedy = Vec::with_capacity(GREEDY);
         for _ in 0..GREEDY {
             tok = m.step(&[tok])?;
-            greedy.push((tok, fnv_row(&m.logits()?)));
+            greedy.push((tok, Fnv1a64::default().f32s(&m.logits()?).value()));
         }
         Ok(Long {
             prompt,
@@ -4340,7 +4340,10 @@ mod gate {
         for &id in &ids[LONG_TAIL..] {
             tok = m.step(&[id])?;
         }
-        let (stores, logits) = (store_digests(m)?, fnv_row(&m.logits()?));
+        let (stores, logits) = (
+            store_digests(m)?,
+            Fnv1a64::default().f32s(&m.logits()?).value(),
+        );
         m.rollback(LONG_TAIL as u32)?;
         let mut at = LONG_TAIL;
         let mut chunked = 0;
@@ -4350,7 +4353,7 @@ mod gate {
             at = to;
         }
         let diff = first_store_diff(&store_digests(m)?, &stores);
-        let same_logits = fnv_row(&m.logits()?) == logits;
+        let same_logits = Fnv1a64::default().f32s(&m.logits()?).value() == logits;
         m.reset()?;
         let pass = diff.is_none() && same_logits && chunked == tok;
         println!(
@@ -4554,14 +4557,16 @@ mod gate {
             }
             let (digests, logits) = (store_digests(m)?, m.logits()?);
             let diff = first_store_diff(&digests, &a.stores);
-            let pass = diff.is_none() && fnv_row(&logits) == a.logits && argmax == a.argmax;
+            let pass = diff.is_none()
+                && Fnv1a64::default().f32s(&logits).value() == a.logits
+                && argmax == a.argmax;
             println!(
                 "prompt batch chunks P={}: calls of at most {CHUNK} positions against the steps: \
                  stores {} logits {} argmax {argmax} (steps {}) {}",
                 a.p,
                 diff.as_deref()
                     .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
-                if fnv_row(&logits) == a.logits {
+                if Fnv1a64::default().f32s(&logits).value() == a.logits {
                     "bit for bit"
                 } else {
                     "differ"
@@ -4574,7 +4579,7 @@ mod gate {
                 after: After {
                     p: a.p,
                     stores: digests,
-                    logits: fnv_row(&logits),
+                    logits: Fnv1a64::default().f32s(&logits).value(),
                     argmax,
                 },
                 stores: if a.p >= GEMM_FROM {
@@ -4877,7 +4882,7 @@ mod gate {
             Some(After {
                 p,
                 stores: digests,
-                logits: fnv_row(&logits),
+                logits: Fnv1a64::default().f32s(&logits).value(),
                 argmax: tok,
             }),
         ))
@@ -4965,7 +4970,11 @@ mod gate {
         let got = prefill(m, &ids[..a.p]);
         let secs = t.elapsed().as_secs_f64();
         let (argmax, stores, logits) = match got {
-            Ok(tok) => (tok, store_digests(m)?, fnv_row(&m.logits()?)),
+            Ok(tok) => (
+                tok,
+                store_digests(m)?,
+                Fnv1a64::default().f32s(&m.logits()?).value(),
+            ),
             Err(e) => {
                 println!(
                     "prompt batch G={g} P={}: error \"{e}\" {}",
@@ -5020,7 +5029,7 @@ mod gate {
                 after.push(After {
                     p: i + 1,
                     stores: store_digests(m)?,
-                    logits: fnv_row(&m.logits()?),
+                    logits: Fnv1a64::default().f32s(&m.logits()?).value(),
                     argmax,
                 });
             }
@@ -5132,7 +5141,10 @@ mod gate {
         m.reset()?;
         prefill(m, &ids[..513])?;
         let want_tok = prefill(m, &ids[513..1030])?;
-        let (want_stores, want_logits) = (store_digests(m)?, fnv_row(&m.logits()?));
+        let (want_stores, want_logits) = (
+            store_digests(m)?,
+            Fnv1a64::default().f32s(&m.logits()?).value(),
+        );
         m.reset()?;
         prefill(m, &ids[..513])?;
         let before = m.body("planted group")?.checkpoints().positions();
@@ -5142,7 +5154,10 @@ mod gate {
             if missing.contains("the planted failure in a prompt group's walk"));
         let (pos, points) = (m.pos(), m.body("planted group")?.checkpoints().positions());
         let again = prefill(m, &ids[513..1030]);
-        let (stores, logits) = (store_digests(m)?, fnv_row(&m.logits()?));
+        let (stores, logits) = (
+            store_digests(m)?,
+            Fnv1a64::default().f32s(&m.logits()?).value(),
+        );
         let after_points = m.body("planted group")?.checkpoints().positions();
         m.reset()?;
         let diff = first_store_diff(&stores, &want_stores);

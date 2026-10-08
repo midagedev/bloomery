@@ -201,6 +201,10 @@ mod gate_card;
 mod q38_arch;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -237,6 +241,8 @@ mod gate {
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
     use runtime::width::Chosen as _;
     use runtime::{Advance, Committed, Draft, Out, PassSink, TapNeed, Target, Verify, Want};
+
+    use crate::quiet::Quiet;
 
     /// The gate's one reading of what the run is made from: the target file
     /// (`ref_model_path`, a whole fixture under the fixture tier), the draft
@@ -2360,15 +2366,6 @@ mod gate {
             _: &[u32],
             _: std::time::Duration,
         ) -> Result<(), GateError> {
-            Ok(())
-        }
-    }
-
-    /// The rows-log that hears nothing.
-    struct Quiet;
-
-    impl app::RowsLog for Quiet {
-        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), app::SessionError> {
             Ok(())
         }
     }
