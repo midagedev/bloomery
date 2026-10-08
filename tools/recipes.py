@@ -69,8 +69,9 @@ does not depend on which feature set a recipe picks:
   1. No device root in its dependency closure. The closure is the crate's normal, build and dev
      dependencies, the workspace ones' normal and build dependencies transitively (an optional one of a
      workspace dependency counts as enabled), and every external package's dependencies as Cargo.lock
-     resolves them. The roots are read from Cargo.lock: every package whose source is a cuda-oxide git
-     repository (NVlabs' or the fork's spelling), and cutile-rs's `cuda-core` and `cuda-bindings`. The
+     resolves them. The roots are read from Cargo.lock: every package whose source is the cuda-oxide git
+     repository (NVIDIA/cuda-rust, or our fork's midagedev/cuda-oxide spelling), and `cuda-core` and
+     `cuda-bindings` by name, from any source (the shared host crates, crates.io or that repository). The
      bloomery device crates (bloomery-gpu, -gpu-deepseek41, -gpu-vision) declare cuda-device and
      cuda-host themselves, so they are the first hop of the chain the reason prints, not a second list.
   2. No code the Mac cannot build or run, in the files `cargo test -p <crate>` compiles: the crate's own
@@ -2725,8 +2726,9 @@ _MAC_CFG_KEYS = {
     "target_endian": "little",
 }
 _MAC_CFG_NAMES = {"unix": True, "windows": False}
-DEVICE_GIT_SOURCE = "/cuda-oxide.git"
-DEVICE_REGISTRY_ROOTS = ("cuda-core", "cuda-bindings")
+# The cuda-oxide repository under its upstream name and our fork's ([patch] in Cargo.toml).
+DEVICE_GIT_SOURCES = ("/cuda-rust.git", "/cuda-oxide.git")
+DEVICE_NAMED_ROOTS = ("cuda-core", "cuda-bindings")
 _NOT_ON_MAC = [
     (re.compile(r"\b(?:std|core)::arch::x86_64\b"), "x86_64 intrinsics"),
     (re.compile(r"#\s*\[\s*target_feature\s*\("), "#[target_feature]"),
@@ -2988,7 +2990,7 @@ def load_lock(root: str) -> Lock:
     deps: dict[str, set[str]] = {}
     for p in data.get("package", []):
         name = p["name"]
-        if DEVICE_GIT_SOURCE in p.get("source", "") or name in DEVICE_REGISTRY_ROOTS:
+        if any(s in p.get("source", "") for s in DEVICE_GIT_SOURCES) or name in DEVICE_NAMED_ROOTS:
             roots.add(name)
         deps.setdefault(name, set()).update(d.split(" ", 1)[0] for d in p.get("dependencies", []))
     return Lock(roots, deps)
@@ -4021,7 +4023,7 @@ def just_version() -> str:
 
 def oxide_rev(text: str) -> str:
     """The cuda-oxide rev tools/box.sh reads: the [patch] section's cuda-device rev, else the first one."""
-    sec = re.search(r'^\[patch\."https://github\.com/NVlabs/cuda-oxide\.git"\]\s*$(.*?)(?=^\[workspace|\Z)', text, re.M | re.S)
+    sec = re.search(r'^\[patch\."https://github\.com/NVIDIA/cuda-rust\.git"\]\s*$(.*?)(?=^\[workspace|\Z)', text, re.M | re.S)
     for body in ([sec.group(1)] if sec else []) + [text]:
         m = re.search(r'^cuda-device = .*rev = "([0-9a-f]+)"', body, re.M)
         if m:
@@ -5682,6 +5684,38 @@ def box_tier_self_test(expect) -> None:
         expect(rc == 64 and sent == "" and "real or fixture" in err and "'both'" in err, f"box.sh: a tier that is neither: {rc} {sent!r} {err!r}")
 
 
+def oxide_rev_self_test(expect) -> None:
+    """The cuda-oxide rev the key (oxide_rev) and tools/box.sh (the backend directory it exports) read from this tree's
+    Cargo.toml is the [patch] section's cuda-device rev as TOML reads it — the fork's, not the upstream declaration's,
+    which both fall back to when their section header names another repository."""
+    import tomllib
+
+    with open(os.path.join(ROOT, "Cargo.toml"), "rb") as fh:
+        man = tomllib.load(fh)
+    patched = [t["cuda-device"]["rev"] for t in man.get("patch", {}).values() if "rev" in t.get("cuda-device", {})]
+    want = patched[0] if patched else man["workspace"]["dependencies"]["cuda-device"]["rev"]
+    with open(os.path.join(ROOT, "Cargo.toml"), encoding="utf-8") as fh:
+        got = oxide_rev(fh.read())
+    expect(got == want, f"oxide-rev: oxide_rev reads {got} from Cargo.toml, its cuda-device [patch] rev is {want}")
+    with tempfile.TemporaryDirectory(prefix="recipes-oxrev-") as tmp:
+        os.makedirs(os.path.join(tmp, "tools"))
+        os.makedirs(os.path.join(tmp, "stubs"))
+        shutil.copyfile(os.path.join(ROOT, "tools/box.sh"), os.path.join(tmp, "tools/box.sh"))
+        shutil.copyfile(os.path.join(ROOT, "Cargo.toml"), os.path.join(tmp, "Cargo.toml"))
+        log = os.path.join(tmp, "ssh.log")
+        for name, body in (("ssh", f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> {shlex.quote(log)}\n'), ("rsync", "#!/bin/sh\n")):
+            path = os.path.join(tmp, "stubs", name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+        e = {"PATH": f"{os.path.join(tmp, 'stubs')}:/usr/bin:/bin", "HOME": tmp, "BLOOMERY_REMOTE": "~/repo/x"}
+        r = subprocess.run(["bash", os.path.join(tmp, "tools/box.sh"), "echo hi"], env=e, capture_output=True, text=True)
+        sent = open(log, encoding="utf-8").read() if os.path.exists(log) else ""
+        m = re.search(r"cuda-oxide-bloomery/([0-9a-f]+)/librustc_codegen_cuda\.so", sent)
+        expect(r.returncode == 0 and m is not None and m.group(1) == want,
+               f"oxide-rev: tools/box.sh exports the backend of {m.group(1) if m else None}, the cuda-device [patch] rev is {want}: {r.returncode} {r.stderr!r}")
+
+
 def narrow_self_test(expect, side: Side) -> None:
     """--narrow: the scan verdicts and their refusals, the four rules of narrow() on the real tree with rows of
     the test's own, the table's checks, and the host group's guard."""
@@ -6271,10 +6305,11 @@ def self_test() -> int:
                 '[[package]]\nname = "wrapper"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\ndependencies = ["plain 1.0.0", "cuda-bindings"]\n\n'
                 '[[package]]\nname = "plain"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
                 '[[package]]\nname = "cuda-device"\nversion = "0.2.1"\nsource = "git+https://github.com/NVlabs/cuda-oxide.git?rev=b98#b98"\ndependencies = ["cuda-macros"]\n\n'
-                '[[package]]\nname = "cuda-macros"\nversion = "0.2.1"\nsource = "git+https://github.com/midagedev/cuda-oxide.git?rev=e58#e58"\n'
+                '[[package]]\nname = "cuda-macros"\nversion = "0.2.1"\nsource = "git+https://github.com/midagedev/cuda-oxide.git?rev=e58#e58"\n\n'
+                '[[package]]\nname = "cuda-async"\nversion = "0.4.0"\nsource = "git+https://github.com/NVIDIA/cuda-rust.git?rev=169#169"\n'
             )
         lock = load_lock(tmp)
-        expect(lock.roots == {"cuda-core", "cuda-bindings", "cuda-device", "cuda-macros"}, f"pure: the lock's device roots are {sorted(lock.roots)}")
+        expect(lock.roots == {"cuda-core", "cuda-bindings", "cuda-device", "cuda-macros", "cuda-async"}, f"pure: the lock's device roots are {sorted(lock.roots)}")
         meta = {
             "workspace_root": tmp,
             "workspace_members": list(srcs),
@@ -6394,6 +6429,7 @@ def self_test() -> int:
     manifest_rows_self_test(expect)
     ref_paths_self_test(expect)
     box_tier_self_test(expect)
+    oxide_rev_self_test(expect)
 
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
