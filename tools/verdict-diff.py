@@ -52,6 +52,8 @@ DROPS = [re.compile(p) for p in (
     r'^\s*\^',
     # generate_ds41's BLOOMERY_STEP_STATS lines: host-tier counters and page faults, a load reading.
     r'^stat (step|summary) ',
+    # The common unset rule's record: a tree that predates it prints none, so a base and a change differ by it.
+    r'^place unset ',
 )]
 # Fields that differ between two runs of the same binary, masked in place.
 MASKS = [
@@ -277,6 +279,8 @@ def self_test():
         ('one side an old scan', scan('ptx-scan-md5:', 'a' * 32),
          scan('ptx-scan-md5: method=decl1', 'b' * 32), 2, f'A {NO_METHOD}, B decl1'),
         ('two old scans', scan('ptx-scan-md5:', 'a' * 32), scan('ptx-scan-md5:', 'a' * 32), 0, 'identical'),
+        ('a place unset line only one side prints', 'tokens [1, 2]\n',
+         'place unset place=a why=one card\ntokens [1, 2]\n', 0, 'identical'),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         for what, ta, tb, want_rc, want_text in cases:
