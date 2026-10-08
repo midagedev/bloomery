@@ -454,6 +454,26 @@ pub fn static_clause(
     crate::residency_clauses::static_row0(&mut s, residence, p, t0.elapsed().as_secs_f64())
 }
 
+/// `c1` alone on `s`, a load under any `mid` word with nothing run on it yet:
+/// the history twice from a clear, host streaming off as for [`clauses`].
+/// The serving default's arm runs it on the word the seat resolves.
+pub fn c1_alone(s: &mut Session<Body>) -> Result<bool, GateError> {
+    {
+        let body = s.model_mut().body_parts(NAME)?.2;
+        body.set_hoststream(false)?;
+        body.log_residency(0);
+    }
+    let ids = prose_ids("engram", PROMPT)?;
+    let first = history(s, &ids, None)?;
+    let again = history(s, &ids, None)?;
+    Ok(crate::residency_clauses::c1_clause_with(
+        first.tokens.len(),
+        first.landed,
+        first == again,
+        skew()?,
+    ))
+}
+
 /// Every clause after `refuse` on `s`, the load just made under
 /// [`RESIDENCY`] by placement `place` (plan (b′) or (a)), before its first
 /// call; `flags` holds the copy stream for `c3`. Host streaming is off for

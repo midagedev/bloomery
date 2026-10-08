@@ -3,7 +3,7 @@
 //! `generate_glm5next` on the same card, as one process under the GPU gate
 //! lock.
 //!
-//!     gate_glm5next_serve --arm plain|drafted|slots --dir <out>
+//!     gate_glm5next_serve --arm plain|drafted|slots|unset --dir <out>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
 //! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp
@@ -16,10 +16,11 @@
 //! with and waits for it, then runs `generate_glm5next --place gate --ctx
 //! 2048 --tokens <those ids> -n 16` beside this binary under the same levers
 //! and holds the ids the server served against it. The loads run one after
-//! the other (four in `plain`, two in `drafted`); the recipe runs the arms
+//! the other (five in `plain`, two in `drafted`); the recipe runs the arms
 //! as two processes, each under its own bound. `slots` runs the drafted
 //! arm's (s5) alone — its server and clauses, nothing else — for a run of
-//! those clauses by name; the recipe runs them inside `drafted`.
+//! those clauses by name; the recipe runs them inside `drafted`. `unset`
+//! runs the plain arm's last server alone the same way.
 //!
 //! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after four runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
@@ -92,6 +93,14 @@
 //!   together window reading `cmd=step`, `slots=2`, `rows=2` and
 //!   `passes=ceil(rows/2)` — the body's two-row bound (FAIL-first: the seat
 //!   left on the fallback loop prints `passes=rows`);
+//! - a fifth load, the seat as a user starts it ([`unset_load`]: no
+//!   `--place`, `--ctx` or `--parallel`, no lever set; both cards in view,
+//!   so `bp`): the unset rules' words chosen at the load — `draft unset
+//!   draft=mtp` with its `load draft=mtp` record, `residency unset
+//!   residency=mid-p0-s1` with no `residency lever` record and its `residency
+//!   host` record pinned 0 — and the chat turn a 200 with completion tokens
+//!   and text in `content` or `reasoning_content`, with `residency pass`
+//!   records after it (FAIL-first: `glm_unset` picking another word);
 //!
 //! `drafted` (`BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p0-s1`, the clip's
 //! levers; the word set explicitly, one the gate plan's card slots take):
@@ -224,8 +233,9 @@
 //! Logs and the CLI's output go to `--dir`. The server and the CLI inherit
 //! this binary's environment, so the levers they act on are the seat's
 //! (`ACTS_ON`, the same list): one the seat would refuse is refused here, at
-//! `main`, before anything starts; `BLOOMERY_DRAFT` and `BLOOMERY_RESIDENCY`
-//! set in this binary's environment are refused by name (the arm sets both).
+//! `main`, before anything starts; `BLOOMERY_DRAFT`, `BLOOMERY_RESIDENCY`
+//! and `BLOOMERY_MTP_WIDTH` set in this binary's environment are refused by
+//! name (the arms set them, and the unset server leaves them to the seat).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -254,6 +264,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{
         curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
     };
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::glm5next::place::{
@@ -279,7 +290,7 @@ mod gate {
         bloomery_levers::STEP_STATS,
     ];
 
-    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots --dir <out>";
+    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset --dir <out>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
@@ -315,6 +326,9 @@ mod gate {
         "--parallel",
         "1",
     ];
+    /// The unset server's arguments: the seat as a user starts it, no
+    /// `--place`, `--ctx` or `--parallel`, so each is the seat's rule's.
+    const UNSET_ARGS: [&str; 6] = ["--model", "glm", "--host", "127.0.0.1", "--port", "0"];
     /// The load takes a minute or two; the bound is 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
@@ -361,12 +375,14 @@ mod gate {
     const BREAK_EVEN: u64 = 526;
 
     /// The arms, one a process: `slots` is the drafted arm's (s5) alone,
-    /// its server and clauses, which `drafted` runs too.
+    /// its server and clauses, which `drafted` runs too; `unset` is the plain
+    /// arm's last server alone ([`unset_load`]), which `plain` runs too.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Arm {
         Plain,
         Drafted,
         Slots,
+        Unset,
     }
 
     impl Arm {
@@ -375,7 +391,10 @@ mod gate {
                 "plain" => Ok(Arm::Plain),
                 "drafted" => Ok(Arm::Drafted),
                 "slots" => Ok(Arm::Slots),
-                other => Err(format!("--arm is plain, drafted or slots, not {other}").into()),
+                "unset" => Ok(Arm::Unset),
+                other => {
+                    Err(format!("--arm is plain, drafted, slots or unset, not {other}").into())
+                }
             }
         }
     }
@@ -625,7 +644,7 @@ mod gate {
     /// The chat turn at temperature 0, from a reset (`cache_prompt` off: a
     /// prefix kept at a checkpoint below the held sequence's end leaves the
     /// draft nothing to join, and the request would step plainly): its status
-    /// and `timings`.
+    /// and the response.
     fn chat(url: &dyn Fn(&str) -> String) -> Result<(u16, Value), GateError> {
         let body = json!({
             "messages": [{"role": "user", "content": CHAT}],
@@ -637,7 +656,7 @@ mod gate {
             "chat HTTP {st}: message {} finish_reason {} usage {} timings {}",
             v["choices"][0]["message"], v["choices"][0]["finish_reason"], v["usage"], v["timings"]
         );
-        Ok((st, v["timings"].clone()))
+        Ok((st, v))
     }
 
     /// `ids` agree with `reference`, a run that did not stop at the
@@ -2277,6 +2296,98 @@ mod gate {
         Ok(ok)
     }
 
+    /// The plain arm's last server ([`Arm::Unset`] runs it alone): the seat
+    /// as a user starts it ([`UNSET_ARGS`], every lever unset) with both
+    /// cards in view, so the unset rules choose at the load — the words
+    /// [`unset_rule`]'s run with no `--place` prints, `bp` on this box's two
+    /// cards. Holds: the `draft unset` word `mtp` and the load's `load
+    /// draft=mtp` record, no `load draft=off`; the `residency unset` word
+    /// [`RESIDENCY_WORD`], no `residency lever` record (nothing was set) and
+    /// the load's `residency host` record of that word, pinned 0; the chat
+    /// turn at temperature 0, as a default user sends it (thinking on), a 200
+    /// with `usage.completion_tokens` above 0 and text in `content` or
+    /// `reasoning_content`, whichever the seat fills (at [`N_PREDICT`] ids
+    /// the reply can still be inside the think span, `content` empty), with
+    /// the seat's `residency pass` records after it. The words are the gate's own, not the records' agreement: a
+    /// `glm_unset` that picks another word loads that word and agrees with
+    /// itself (FAIL-first). File-bound: the plan of this file on these cards
+    /// is what leaves the word room.
+    fn unset_load(dir: &Path) -> Result<bool, GateError> {
+        if !tier::run_clause(
+            "unset: the seat as a user starts it loads the unset rules' words and serves",
+            Tag::FileBound,
+        )? {
+            return Ok(true);
+        }
+        let own = dir.join("unset");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut served = Served::spawn(&UNSET_ARGS, &own, UNSET)?;
+        println!("unset server pid {}", served.child.id());
+        let addr = served.address(&err_log)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let load = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
+        let place = load.one(&record::PLACE_UNSET)?;
+        let draft = load.one(&record::DRAFT_UNSET_GLM)?;
+        let residency = load.one(&record::RESIDENCY_UNSET_GLM)?;
+        let lever = load.first(&record::RESIDENCY_LEVER)?;
+        let host = match load.first(&record::RESIDENCY_HOST)? {
+            Some(h) => Some((h.word("residency")?.to_owned(), h.u64("pinned")?)),
+            None => None,
+        };
+        let drafts = load.first(&record::LOAD_DRAFT_GLM)?;
+        let plain = load.first(&record::LOAD_DRAFT_OFF_GLM)?;
+        println!(
+            "unset records: place unset place={} why={}, draft unset {} ({}), residency unset {} \
+             ({}), residency lever {:?}, residency host (word, pinned) {host:?}, load draft=mtp \
+             {:?}, load draft=off {:?}",
+            place.word("place")?,
+            place.text("why")?,
+            draft.word("draft")?,
+            draft.text("why")?,
+            residency.word("residency")?,
+            residency.text("why")?,
+            lever.as_ref().map(record::Fields::line),
+            drafts.as_ref().map(record::Fields::line),
+            plain.as_ref().map(record::Fields::line)
+        );
+        check(
+            &mut ok,
+            "unset_load_drafts_mtp",
+            draft.word("draft")? == "mtp" && drafts.is_some() && plain.is_none(),
+        );
+        check(
+            &mut ok,
+            "unset_load_runs_mid_p0_s1",
+            residency.word("residency")? == RESIDENCY_WORD
+                && lever.is_none()
+                && host == Some((RESIDENCY_WORD.to_owned(), 0)),
+        );
+        let before = lines_from(&err_log, 0)?.len();
+        let (st, reply) = chat(&url)?;
+        let message = &reply["choices"][0]["message"];
+        let text: String = ["content", "reasoning_content"]
+            .iter()
+            .filter_map(|k| message[*k].as_str())
+            .collect();
+        let completion = reply["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+        let served_passes = passes(&seat_log(&lines_from(&err_log, before)?))?;
+        println!(
+            "unset chat: HTTP {st}, {completion} completion tokens, {} chars of content and \
+             reasoning_content, draft_n={}, passes (kind, kept, landed) {served_passes:?}",
+            text.chars().count(),
+            reply["timings"]["draft_n"]
+        );
+        check(
+            &mut ok,
+            "unset_chat_turn_served_under_the_residency",
+            st == 200 && completion > 0 && !text.is_empty() && !served_passes.is_empty(),
+        );
+        println!("unset server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// The plain arm (the module header).
     fn plain(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = unset_rule(dir)?;
@@ -2345,6 +2456,7 @@ mod gate {
         );
         ok &= draft_only(dir, &ids, &reference)?;
         ok &= slots_one_pass(dir)?;
+        ok &= unset_load(dir)?;
         Ok(ok)
     }
 
@@ -2524,11 +2636,11 @@ mod gate {
             !first.is_empty() && again == first,
         );
 
-        let (st, timings) = chat(&url)?;
+        let (st, reply) = chat(&url)?;
         check(
             &mut ok,
             "drafted_chat_turn_drafts",
-            st == 200 && timings["draft_n"].as_u64().is_some_and(|n| n > 0),
+            st == 200 && reply["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
         );
         let mut extended = ids.clone();
         extended.extend_from_slice(&first);
@@ -2578,11 +2690,13 @@ mod gate {
         for (name, set) in [
             (bloomery_levers::DRAFT, levers.draft()),
             (bloomery_levers::RESIDENCY, levers.residency()),
+            (bloomery_levers::MTP_WIDTH, levers.mtp_width()),
         ] {
             if let Some(word) = set {
                 return Err(format!(
                     "{name}={word}: the gate sets it on every process it starts (the plain arm \
-                     off, the drafted arm mtp and {RESIDENCY_WORD})"
+                     off, the drafted arm mtp, {RESIDENCY_WORD} and the fixed width), and the \
+                     unset server leaves it to the seat's rule"
                 )
                 .into());
             }
@@ -2593,6 +2707,7 @@ mod gate {
             Arm::Plain => plain(&a.dir, &levers)?,
             Arm::Drafted => drafted(&a.dir, &levers)?,
             Arm::Slots => slots_flow_together(&a.dir)?,
+            Arm::Unset => unset_load(&a.dir)?,
         };
         if ok {
             println!("gate-gpu-glm5next-serve: PASS");

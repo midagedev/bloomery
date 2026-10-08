@@ -13,7 +13,9 @@
 //! (a) on the A6000 alone (the serving plan, no tier card) instead, for the
 //! residency's clauses only: it needs `--only residency`, and the clauses
 //! below run under plan (b′). There the residency's `static` clause ends
-//! after the teardown, on a load of its own. Each clause below
+//! after the teardown, on a load of its own, and then the serving default's
+//! arm ([`default_arm`]) loads once more, at the word the V4.1 seat runs with
+//! `BLOOMERY_RESIDENCY` unset on this plan. Each clause below
 //! starts from a clear (the residency back to its seed), streaming on, and
 //! names its mutant:
 //!
@@ -126,6 +128,7 @@ mod residency_clauses;
 mod gate {
     use crate::ds41_open::open;
     use crate::residency::{self, StaticProbe};
+    use std::path::Path;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -138,11 +141,15 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
+        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, residency41,
+        verdict,
     };
-    use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_POPULATE, R8};
+    use bloomery_levers::{
+        CARD_DONTNEED, ENGRAM_HELPER, HOST_POPULATE, R8, ResidencyAt, residency_unset,
+    };
     use gguf::Split;
     use model::arch::deepseek41::place::{self, PlanInputs};
+    use model::placement::{Machine, workstation};
     use runtime::{Out, Target, Want};
 
     const NAME: &str = "gate_ds41_callstream";
@@ -590,6 +597,85 @@ mod gate {
         Ok(ok)
     }
 
+    /// The serving default's arm (`--place a --only residency`, after
+    /// `static`, on its own load: two V4.1 loads never stand at once): the
+    /// word the V4.1 seat runs with `BLOOMERY_RESIDENCY` unset on the plan
+    /// this load makes — `residency_unset` at a serving placement, then
+    /// [`residency41::at_plan`], the seat's own two calls — loaded under
+    /// `cfg` otherwise, every seed layer pinning that word's P, and `c1` on
+    /// it (`residency::c1_alone`). Where the plan's host takes the churn pool
+    /// at P 0 the word is `mid-p0-s1`; where it does not, the first P whose
+    /// pool fits. The caller's contract is the word the seat resolves, not
+    /// `mid-p0-s1` itself: at P 0 the pool is every stage card expert a layer
+    /// holds, so its bytes are the plan's card experts times one expert's
+    /// bytes, and on the real file plan (a)'s A6000 holds more of them than
+    /// its host headroom takes (a set `mid-p0-s1` is refused by name at the
+    /// load), while plan (b′)'s headroom, with the tier card's experts off the
+    /// host, takes them. A plan that leaves the word `off` is red by name:
+    /// the arm is the residency's. FAIL-first: the load forced to
+    /// `mid-p40-s1`.
+    fn default_arm(
+        path: &Path,
+        at: Place,
+        machine: impl Fn(usize) -> Machine,
+        cfg: &OpenCfg,
+    ) -> Result<bool, GateError> {
+        crate::ds41_tier::sc(
+            "default: the seat's unset word on this plan loads, pins its P and repeats its history",
+        )?;
+        let head = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&head)?;
+        drop(head);
+        let cards = machine(inputs.model.layers);
+        let plan = inputs.plan(&cards, workstation::CTX_MAX, &cfg.place)?;
+        let unset = residency_unset(ResidencyAt {
+            serving_place: true,
+            ..ResidencyAt::FIXED
+        });
+        let pick = residency41::at_plan(&plan, unset)?;
+        record::residency_lever(pick).print();
+        if let Some(d) = pick.why.detail() {
+            println!("{d}");
+        }
+        let Residency::Mid { pinned: want, .. } = Residency::parse(pick.word)? else {
+            println!(
+                "default: the seat runs {} on this plan, so the arm has no residency to load: {}",
+                pick.word,
+                verdict(false)
+            );
+            return Ok(false);
+        };
+        let mut cfg = cfg.clone();
+        cfg.body.residency = Residency::parse(pick.word)?;
+        let t0 = Instant::now();
+        let mut s = open(path, at, machine, &cfg)?;
+        println!("default: load in {:.1} s", t0.elapsed().as_secs_f64());
+        let pinned = {
+            let m = s.model();
+            let b = m.body(NAME)?;
+            let swap = b
+                .hybrid()
+                .swap()
+                .ok_or("the default's load runs no residency machine")?;
+            crate::residency_clauses::seeds(swap, b.hybrid().slots().layers())?
+                .iter()
+                .map(|(l, _)| swap.pinned(*l))
+                .collect::<Result<Vec<usize>, _>>()?
+        };
+        let pins = !pinned.is_empty() && pinned.iter().all(|&p| p == want);
+        println!(
+            "default: {} pins {want} a layer on {} seed layers, each its own count {}: {}",
+            pick.word,
+            pinned.len(),
+            pins,
+            verdict(pins)
+        );
+        let c1 = residency::c1_alone(&mut s)?;
+        s.clear()?;
+        drop(s);
+        Ok(pins && c1)
+    }
+
     /// The placement the gate loads (`--place a|bp`, plan (b′) when not
     /// given) and whether the residency's clauses run alone (`--only
     /// residency`); `--place a` without it is refused by name.
@@ -694,7 +780,10 @@ mod gate {
             (Ok((ok, Some(p))), Ok(())) => watched("static", || {
                 residency::static_clause(&path, at, machine, &cfg, &p)
             })
-            .map(|st| ok && st),
+            .and_then(|st| {
+                let default = watched("default", || default_arm(&path, at, machine, &cfg))?;
+                Ok(ok && st && default)
+            }),
             (Ok((ok, _)), _) => Ok(ok),
             (Err(e), _) => Err(e),
         };
