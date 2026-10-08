@@ -973,8 +973,14 @@ gate-r8:
 # subset files written, opened and verified end to end (under 1 GB each, removed), and the named refusals. The Qwen3.8 spec
 # (model::arch::qwen35moe::fixture) against the Qwen3.8 file's header and the shared MTP draft's, at the profile's paths:
 # the four-layer plan read back by the engine's hparams at interval 2, the planned card budget (the written file's plan
-# under it holds half the experts on every layer the card loads), and the ik-silent traps refused by name. Reads headers
-# only; writes only under this tree's target/tmp.
+# under it holds half the experts on every layer the card loads), and the ik-silent traps refused by name. The V4.1 spec's
+# ff 512 (the plan, the draft's ff, the routed stacks and the r8 sidecar's stacks), its planned budget (half the experts
+# at the gate machine, ctx 32768) and its two router biases that differ between experts (the family's header check refuses
+# zeros, equal and a constant shift); the GLM-5.3-Flash spec (model::arch::glm5next::fixture) against the GLM file's
+# header: the seven-layer plan read back by the engine's hparams (kinds, dense prefix, NextN believed), the planned budget
+# under the NextN load (half the experts on each card-eligible layer) and the traps its reader and the kernels' constants
+# fall into, refused by name; and a toy family's r8 sidecar written, checked and refused when absent, other or flipped.
+# Reads headers only; writes only under this tree's target/tmp.
 gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test fixture -- --include-ignored --nocapture --test-threads=1'
 
