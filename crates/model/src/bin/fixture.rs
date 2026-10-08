@@ -10,15 +10,17 @@
 //! fixture's, which is its source's); an architecture with no spec is refused by name.
 //! Flags of `plan` and `generate`: `--seed N`, `--card-budget B` (bytes, or `nM`/`nG` as
 //! `BLOOMERY_CARD_BUDGET` takes them; the spec's budget when absent, a fixed one or the
-//! cap its family's plan of the written file chooses), `--shard-bytes B`
-//! (tensor data a shard holds at most), and `--tensors a,b,…` / `--draft-tensors a,b,…` for a
-//! file holding only those tensors (it carries `bloomery.fixture.subset`). `plan` writes
+//! cap its family's plan of the written file chooses), `--shard-bytes B` (tensor data a shard
+//! holds at most; the spec's cap when absent), and `--tensors a,b,…` / `--draft-tensors a,b,…`
+//! for a file holding only those tensors (it carries `bloomery.fixture.subset`). `plan` writes
 //! nothing. `generate` refuses an existing `<out dir>`, writes into `<out dir>.tmp.<pid>` and
-//! renames it on success. `verify` takes the source from `--source`, else the spec's default,
-//! and checks the spec's draft fixture when it exists, against `--draft-source`, else the
-//! spec's default draft. A flag its verb does not take, a flag given twice, `--draft-tensors`
-//! without `--draft` and `--draft-source` with no draft fixture are refused. One line per
-//! tensor, a summary line, and exit status 1 with the error on any failure.
+//! renames it on success; a whole fixture of a family with an r8 sidecar then gets it, beside the
+//! directory (`r8file::sidecar_path`), and a failed sidecar takes the directory down. `verify`
+//! takes the source from `--source`, else the spec's default, and checks the spec's draft fixture
+//! when it exists, against `--draft-source`, else the spec's default draft, and a whole fixture's
+//! sidecar. A flag its verb does not take, a flag given twice, `--draft-tensors` without
+//! `--draft` and `--draft-source` with no draft fixture are refused. One line per tensor, a
+//! summary line, and exit status 1 with the error on any failure.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -26,10 +28,10 @@ use std::process::ExitCode;
 
 use gguf::Split;
 use model::arch::deepseek41::fixture as v41;
+use model::arch::glm5next::fixture as glm5;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::fixture::{
-    self, DEFAULT_SEED, DEFAULT_SHARD_BYTES, FilePlan, FixtureSpec, Options, PlannedTensor, Sample,
-    TensorStat,
+    self, DEFAULT_SEED, FilePlan, FixtureSpec, Options, PlannedTensor, Sample, TensorStat,
 };
 use model::placement::card_budget;
 
@@ -39,7 +41,7 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...";
 
 /// Every family's spec, found by the architecture it declares.
-const SPECS: [fn() -> FixtureSpec; 2] = [v41::spec, qwen38::spec];
+const SPECS: [fn() -> FixtureSpec; 3] = [v41::spec, qwen38::spec, glm5::spec];
 
 /// The flags `plan` and `generate` take.
 const PLAN_FLAGS: [&str; 6] = [
@@ -156,13 +158,14 @@ impl Args {
         Ok(a)
     }
 
-    /// The plan's options: the flags given, the generator's defaults for the
-    /// rest (`--card-budget` absent leaves the budget to the spec's).
-    fn options(&self) -> Options {
+    /// The plan's options: the flags given, the generator's and `spec`'s
+    /// defaults for the rest (`--card-budget` absent leaves the budget to the
+    /// spec's, `--shard-bytes` its cap).
+    fn options(&self, spec: &FixtureSpec) -> Options {
         Options {
             seed: self.seed.unwrap_or(DEFAULT_SEED),
             card_budget: self.card_budget,
-            shard_bytes: self.shard_bytes.unwrap_or(DEFAULT_SHARD_BYTES),
+            shard_bytes: self.shard_bytes.unwrap_or(spec.shard_bytes),
             tensors: self.tensors.clone(),
             draft_tensors: self.draft_tensors.clone(),
         }
@@ -246,7 +249,7 @@ fn print_files(what: &str, p: &FilePlan) -> Res<u64> {
 fn plan(source: &str, a: &Args) -> Res<()> {
     let split = open(source)?;
     let spec = spec_of(&split, source)?;
-    let opts = a.options();
+    let opts = a.options(&spec);
     let draft = a.draft.as_deref().map(open).transpose()?;
     let p = fixture::plan(&spec, &split, draft.as_ref(), &opts)?;
     println!(
@@ -305,7 +308,7 @@ fn peak_rss_kib() -> i64 {
 fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
     let split = open(source)?;
     let spec = spec_of(&split, source)?;
-    let opts = a.options();
+    let opts = a.options(&spec);
     let draft = a.draft.as_deref().map(open).transpose()?;
     println!(
         "fixture: generate {source} -> {out} seed={} card_budget={} draft={}",
@@ -342,6 +345,15 @@ fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
         peak_rss_kib(),
         s.out.display()
     );
+    if let Some(sc) = &s.sidecar {
+        println!(
+            "fixture: sidecar {} tensors={} file_bytes={} secs={:.2}",
+            sc.path.display(),
+            sc.tensors,
+            sc.bytes,
+            sc.secs
+        );
+    }
     Ok(())
 }
 
@@ -419,5 +431,14 @@ fn verify(first: &str, a: &Args) -> Res<()> {
             d.tensors, d.blocks, d.subset
         ))
     );
+    if let Some(sc) = &t.sidecar {
+        println!(
+            "fixture: verify sidecar {} tensors={} bytes={} secs={:.2}",
+            sc.path.display(),
+            sc.tensors,
+            sc.bytes,
+            sc.secs
+        );
+    }
     Ok(())
 }

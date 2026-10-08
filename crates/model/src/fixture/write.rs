@@ -10,6 +10,7 @@ use gguf::write::{Layout, Writer};
 use gguf::{GgmlType, Split};
 
 use super::plan::{FilePlan, plan};
+use super::sidecar::{self, SidecarStat};
 use super::spec::{FixtureSpec, Options};
 use super::{FixtureError, io_err};
 use crate::fileio;
@@ -39,6 +40,9 @@ pub struct GenerateStats {
     pub gen_secs: f64,
     pub write_secs: f64,
     pub sync_secs: f64,
+    /// The r8 sidecar written beside a whole fixture of a family that has
+    /// one ([`FixtureSpec::sidecar`]).
+    pub sidecar: Option<SidecarStat>,
     pub secs: f64,
 }
 
@@ -55,7 +59,10 @@ fn rename_new(from: &Path, to: &Path) -> Result<(), FixtureError> {
 /// Write the fixture `spec` names of `source` (and of `draft`) into
 /// directory `out`, which must not exist: the files go into
 /// `<out>.tmp.<pid>`, each synced, and the directory is renamed to `out` once
-/// every file is complete. On a failure the temporary directory is removed.
+/// every file is complete. A whole fixture of a family with an r8 sidecar then
+/// gets it, from the files in place; a sidecar that cannot be written takes
+/// the fixture down with it, so `out` is a complete fixture or nothing. On a
+/// failure the temporary directory is removed.
 pub fn generate(
     spec: &FixtureSpec,
     source: &Split,
@@ -122,6 +129,24 @@ pub fn generate(
             return Err(error);
         }
     };
+    let sidecar = match (&spec.sidecar, &opts.tensors) {
+        (Some(sc), None) => match sidecar::write(sc, &out.join(&plan.target.files[0])) {
+            Ok(stat) => Some(stat),
+            Err(error) => {
+                if let Err(cleanup) = std::fs::remove_dir_all(out)
+                    && cleanup.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(FixtureError::Abandoned {
+                        error: Box::new(error),
+                        tmp: out.to_path_buf(),
+                        cleanup,
+                    });
+                }
+                return Err(error);
+            }
+        },
+        _ => None,
+    };
     Ok(GenerateStats {
         out: out.to_path_buf(),
         tensors: w.tensors,
@@ -131,6 +156,7 @@ pub fn generate(
         gen_secs: w.gen_secs,
         write_secs: w.write_secs,
         sync_secs: w.sync_secs,
+        sidecar,
         secs: t0.elapsed().as_secs_f64(),
     })
 }

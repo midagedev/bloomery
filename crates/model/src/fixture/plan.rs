@@ -9,7 +9,7 @@ use gguf::write::{Layout, TensorDecl, file_alignment};
 use gguf::{GgmlType, Split, Value};
 use sha2::{Digest, Sha256};
 
-use super::fill::{Rule, Window, chunk_len, chunk_rng, fill_units, rule_for};
+use super::fill::{FloatTy, Rule, Window, chunk_len, chunk_rng, fill_units, rule_for};
 use super::spec::{CardBudget, DraftSpec, Family, FixtureSpec, KeyRule, Options, Tables};
 use super::{
     FIXTURE_VERSION, FixtureError, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256,
@@ -84,6 +84,9 @@ impl PlannedTensor {
     pub fn sigma(&self) -> Option<f64> {
         match self.rule {
             Rule::Const { .. } => None,
+            // A uniform draw in `±h` has standard deviation `h/√3`: a matrix's
+            // `h` is `√3/√K`, a spread vector's the family's.
+            Rule::Uniform { half_width, .. } => Some(f64::from(half_width) / 3.0f64.sqrt()),
             _ => Some(1.0 / (self.dims[0] as f64).sqrt()),
         }
     }
@@ -298,11 +301,33 @@ impl Rules<'_> {
     }
 
     /// The rule of the 1-D tensor `name` of type `ty`: the family's constant
-    /// for its name past `blk.N.`, as F32.
+    /// or spread for its name past `blk.N.`, as F32.
     fn constant(&self, name: &str, ty: GgmlType) -> Result<Rule, FixtureError> {
         let leaf = split_layer(name).map_or(name, |(_, rest)| rest);
-        match (ty, self.family.const_value(leaf)) {
-            (GgmlType::F32, Some(value)) => Ok(Rule::Const { value }),
+        let bad = |detail: String| FixtureError::Tensor {
+            name: name.to_string(),
+            detail,
+        };
+        match (
+            ty,
+            self.family.const_value(leaf),
+            self.family.spread_value(leaf),
+        ) {
+            (GgmlType::F32, Some(value), None) => Ok(Rule::Const { value }),
+            (GgmlType::F32, None, Some(half_width))
+                if half_width.is_finite() && half_width > 0.0 =>
+            {
+                Ok(Rule::Uniform {
+                    ty: FloatTy::F32,
+                    half_width,
+                })
+            }
+            (GgmlType::F32, None, Some(h)) => Err(bad(format!(
+                "the family's spread ±{h} is not a finite width above 0"
+            ))),
+            (GgmlType::F32, Some(_), Some(_)) => Err(bad(
+                "the family names both a constant and a spread for it".into(),
+            )),
             _ => Err(FixtureError::NoFillRule {
                 name: name.to_string(),
                 ty,
@@ -377,7 +402,7 @@ pub fn plan(
     let mut target = shard(spec.stem, kvs, split_keys, tensors, opts.shard_bytes)?;
     let mut draft = match (draft, &spec.draft) {
         (None, _) => None,
-        (Some(d), Some(ds)) => Some(plan_draft(spec, ds, d, n_layer, opts, &mut rules)?),
+        (Some(d), Some(ds)) => Some(plan_draft(spec, ds, d, n_layer, ff, opts, &mut rules)?),
         (Some(_), None) => return Err(FixtureError::NoDraft { arch: spec.arch }),
     };
     let mut notes = tables.lines();
@@ -570,6 +595,30 @@ fn mapped_ratios(
     ))
 }
 
+/// `dims` of tensor `name` (`leaf` its name past `blk.N.`) with the axis the
+/// family names as the routed experts' ff moved from the source's ff to the
+/// fixture's, `ff` = (source's, fixture's); whether it was. A tensor whose
+/// ff axis is not the source's ff is refused by name.
+fn narrow_ff(
+    family: &dyn Family,
+    ff: Option<(u64, u64)>,
+    name: &str,
+    leaf: &str,
+    mut dims: Vec<u64>,
+) -> Result<(Vec<u64>, bool), FixtureError> {
+    let (Some((from, to)), Some(axis)) = (ff, family.ff_axis(leaf)) else {
+        return Ok((dims, false));
+    };
+    if dims.get(axis) != Some(&from) {
+        return Err(FixtureError::Tensor {
+            name: name.to_string(),
+            detail: format!("has dims {dims:?}; its ff axis {axis} is not the source's ff {from}"),
+        });
+    }
+    dims[axis] = to;
+    Ok((dims, true))
+}
+
 /// The globals in the source's order, then each fixture layer's tensors in
 /// the source's order, renamed; dims as the family's tables set them, and
 /// with an ff override `(source, fixture)` its axis narrowed.
@@ -594,23 +643,11 @@ fn target_tensors(
         let Some(f) = spec.layers.iter().position(|&m| m == l) else {
             continue;
         };
-        let mut dims = tables
+        let dims = tables
             .dims(&t.name, Some(l), rest, &t.dims)?
             .unwrap_or_else(|| t.dims.clone());
-        if let Some((from, to)) = ff
-            && let Some(axis) = spec.family.ff_axis(rest)
-        {
-            if dims.get(axis) != Some(&from) {
-                return Err(FixtureError::Tensor {
-                    name: t.name.clone(),
-                    detail: format!(
-                        "has dims {dims:?}; its ff axis {axis} is not the source's ff {from}"
-                    ),
-                });
-            }
-            dims[axis] = to;
-            narrowed += 1;
-        }
+        let (dims, cut) = narrow_ff(spec.family, ff, &t.name, rest, dims)?;
+        narrowed += usize::from(cut);
         let name = format!("{BLK}{f}.{rest}");
         by_layer[f].push(planned(rules, name, &t.name, Some(f), dims, t.ty)?);
     }
@@ -709,6 +746,7 @@ fn plan_draft(
     ds: &DraftSpec,
     draft: &Split,
     n_layer: usize,
+    ff: Option<(u64, u64)>,
     opts: &Options,
     rules: &mut Rules,
 ) -> Result<FilePlan, FixtureError> {
@@ -721,20 +759,33 @@ fn plan_draft(
     if let Some((k, _)) = draft.iter_kv().find(|(k, _)| k.starts_with("split.")) {
         return Err(meta(k, "the draft fixture is written as one file"));
     }
-    let mut kvs = ds.rules.kvs(draft, n_layer, spec.layers.len())?;
+    let mut kvs = ds.rules.kvs(draft, n_layer, spec.layers.len(), ff)?;
     let align = file_alignment(&kvs).map_err(|source| FixtureError::Alignment {
         set: "draft",
         source,
     })?;
     kvs.extend(fixture_keys(spec, opts, header_sha256(draft)));
     let n_fixture = spec.layers.len();
-    let tensors = draft
-        .iter_tensors()
-        .map(|(_, t)| {
-            let name = ds.rules.tensor(&t.name, n_layer, n_fixture)?;
-            planned(rules, name, &t.name, None, t.dims.clone(), t.ty)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut narrowed = 0usize;
+    let mut tensors = Vec::new();
+    for (_, t) in draft.iter_tensors() {
+        let name = ds.rules.tensor(&t.name, n_layer, n_fixture)?;
+        let leaf = split_layer(&t.name).map_or(t.name.as_str(), |(_, rest)| rest);
+        let (dims, cut) = narrow_ff(spec.family, ff, &t.name, leaf, t.dims.clone())?;
+        narrowed += usize::from(cut);
+        tensors.push(planned(rules, name, &t.name, None, dims, t.ty)?);
+    }
+    if let Some((from, to)) = ff
+        && narrowed == 0
+    {
+        return Err(FixtureError::Tensor {
+            name: format!("{BLK}*"),
+            detail: format!(
+                "an ff override {from} -> {to}, and the family names no ff axis on any tensor of \
+                 the draft"
+            ),
+        });
+    }
     let tensors = apply_subset(tensors, opts.draft_tensors.as_ref(), &mut kvs)?;
     let n = tensors.len();
     Ok(FilePlan {

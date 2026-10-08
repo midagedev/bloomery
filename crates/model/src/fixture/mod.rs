@@ -32,9 +32,18 @@
 //! thread count writes the same file.
 //!
 //! A family with a draft file ([`DraftSpec`]) also gets a draft fixture: the
-//! real draft's tensors at their shapes with random weights by the same
-//! rules, its metadata as the family's [`DraftRules`] rewrite it, and the
-//! same five keys.
+//! real draft's tensors at their shapes (its ff narrowed by the same override)
+//! with random weights by the same rules, its metadata as the family's
+//! [`DraftRules`] rewrite it, and the same five keys.
+//!
+//! A family whose host tier reads an r8 sidecar ([`SidecarSpec`]) gets one
+//! beside its whole fixture, written once the fixture's files are in place
+//! ([`generate`]) and checked byte for byte by [`verify`].
+//!
+//! A 1-D F32 tensor holds the family's constant, or, for a tensor whose
+//! elements must differ (a router's selection bias), a uniform spread
+//! ([`Family::spread_value`]); each tensor's stream is keyed by its name, so
+//! two spread tensors of one shape differ.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,6 +56,7 @@ use crate::placement::PlacementError;
 mod budget;
 mod fill;
 mod plan;
+mod sidecar;
 mod spec;
 mod verify;
 mod write;
@@ -55,9 +65,10 @@ pub use budget::check as check_budget;
 pub use fill::{Band, CHUNK_TARGET, FloatTy, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
 pub(crate) use plan::{int_like, items, unsigned};
+pub use sidecar::{SidecarStat, path_of as sidecar_path};
 pub use spec::{
     Budget, CardBudget, CardExperts, DraftRules, DraftSpec, Family, FixtureSpec, KeyRule, Options,
-    Tables,
+    SidecarSpec, Tables,
 };
 pub use verify::{
     Sample, VerifyStats, check_tensor, check_units, rms_within, sample_chunks, verify,
@@ -108,6 +119,8 @@ pub enum FixtureError {
     },
     #[error("the card budget: {0}")]
     Budget(String),
+    #[error("the r8 sidecar {path}: {detail}")]
+    Sidecar { path: PathBuf, detail: String },
     #[error("the source is {got:?}, not a {want} file")]
     Architecture {
         got: Option<String>,

@@ -9,6 +9,7 @@ use super::fill::{
     Band, Q4K_MIN_PER_SCALE, Q5K_MIN_PER_SCALE, Rule, Window, q3k_scale, scale_min_k4, unit_bytes,
 };
 use super::plan::{FilePlan, PlannedTensor, header_sha256, items, plan, unsigned};
+use super::sidecar::{self, SidecarStat};
 use super::spec::{CardBudget, FixtureSpec, Options};
 use super::{
     DEFAULT_SHARD_BYTES, FIXTURE_VERSION, FixtureError, KEY_CARD_BUDGET, KEY_SEED,
@@ -328,6 +329,9 @@ pub struct VerifyStats {
     pub tensors: usize,
     pub blocks: usize,
     pub subset: bool,
+    /// The r8 sidecar checked beside a whole fixture of a family that has
+    /// one; always `None` on a draft's stats.
+    pub sidecar: Option<SidecarStat>,
 }
 
 /// The fixture keys of `split`, read back; its layer map must be `spec`'s.
@@ -445,6 +449,7 @@ fn check_file(
         tensors: plan.tensors.len(),
         blocks,
         subset: file.value(KEY_SUBSET).is_some(),
+        sidecar: None,
     })
 }
 
@@ -458,8 +463,9 @@ fn short(v: &Value) -> String {
 
 /// Verify the fixture of `spec` whose first shard `fixture` opens against
 /// `source`, and, when given, the draft fixture against the real draft. A
-/// whole target also passes the family's kinds check; a whole draft the
-/// draft's check with its inventory.
+/// whole target also passes the family's kinds check, the recorded card
+/// budget's re-plan and, for a family with an r8 sidecar, the sidecar's check;
+/// a whole draft the draft's check with its inventory.
 pub fn verify(
     spec: &FixtureSpec,
     fixture: &Split,
@@ -501,7 +507,10 @@ pub fn verify(
         // its layers hold.
         super::budget::check(&planner, fixture, plan.card_budget)?;
     }
-    let target = check_file(fixture, &plan.target, opts.seed, spec.window, progress)?;
+    let mut target = check_file(fixture, &plan.target, opts.seed, spec.window, progress)?;
+    if let (true, Some(sc)) = (whole, &spec.sidecar) {
+        target.sidecar = Some(sidecar::check(sc, fixture)?);
+    }
     let draft_stats = match (draft, &plan.draft, &spec.draft) {
         (Some((d, _)), Some(dp), Some(ds)) => {
             ds.rules

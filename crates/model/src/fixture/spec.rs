@@ -3,7 +3,7 @@
 
 use gguf::{Split, Value};
 
-use super::{DEFAULT_SEED, DEFAULT_SHARD_BYTES, FixtureError, Kvs, Window, meta};
+use super::{DEFAULT_SEED, FixtureError, Kvs, Window, meta};
 
 /// A family's fixture. Its facts are values, so a variant — a smaller map
 /// for a smaller host, a narrower ff — is the same spec with fields replaced
@@ -33,22 +33,31 @@ pub struct FixtureSpec {
     /// [`Family::ff_axis`] names on each tensor that carries it. `None`
     /// keeps the source's.
     pub ff: Option<u64>,
+    /// Tensor data a shard holds at most, unless one tensor is larger: the
+    /// cap a plan cuts the target into shards by when the caller gives none.
+    /// A family whose real file is a split set sets one below its fixture's
+    /// size, so the fixture is a split set too, with a layer across a shard
+    /// boundary.
+    pub shard_bytes: u64,
     /// The source a `verify` reads when none is named.
     pub default_source: fn() -> String,
     /// The draft fixture, for a family with a draft file.
     pub draft: Option<DraftSpec>,
+    /// The r8 sidecar written and checked beside the fixture, for a family
+    /// whose host tier reads one.
+    pub sidecar: Option<SidecarSpec>,
     /// The family's rules.
     pub family: &'static dyn Family,
 }
 
 impl FixtureSpec {
     /// The options a plan takes when the caller sets none: [`DEFAULT_SEED`],
-    /// this spec's card budget, [`DEFAULT_SHARD_BYTES`], every tensor.
+    /// this spec's card budget and shard cap, every tensor.
     pub fn options(&self) -> Options {
         Options {
             seed: DEFAULT_SEED,
             card_budget: None,
-            shard_bytes: DEFAULT_SHARD_BYTES,
+            shard_bytes: self.shard_bytes,
             tensors: None,
             draft_tensors: None,
         }
@@ -107,6 +116,19 @@ pub struct DraftSpec {
     pub rules: &'static dyn DraftRules,
 }
 
+/// A family whose host tier reads an r8 sidecar (`model::r8file`): one file
+/// beside the model that holds the routed gate and up stacks in the row-lane
+/// layout the host tile reads. The generator writes it from the written
+/// fixture, after its files are in place, and `verify` of a whole fixture
+/// checks it against them.
+#[derive(Clone, Copy)]
+pub struct SidecarSpec {
+    /// The names of the stacks the sidecar holds, in the order it holds them,
+    /// read from the written fixture (its layer kinds are the family's to
+    /// know).
+    pub stacks: fn(&Split) -> Result<Vec<String>, FixtureError>,
+}
+
 /// What the fixture does with the source's architecture key `<arch>.<suffix>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyRule {
@@ -147,6 +169,17 @@ pub trait Family: Sync {
     /// The value of every element of a 1-D F32 tensor, by its name past
     /// `blk.N.`; `None` is a 1-D tensor with no fill rule.
     fn const_value(&self, leaf: &str) -> Option<f32>;
+
+    /// The half-width of a 1-D F32 tensor whose elements are drawn
+    /// independently and uniformly in `±half_width`, by its name past
+    /// `blk.N.`: a tensor whose elements must differ from one another (a
+    /// router's selection bias, whose picks a constant never moves) and from
+    /// another tensor's of the same shape (each tensor's stream is keyed by
+    /// its name). A leaf is a constant or a spread, never both.
+    fn spread_value(&self, leaf: &str) -> Option<f32> {
+        let _ = leaf;
+        None
+    }
 
     /// The architecture keys (past `<arch>.`) every source must carry,
     /// because the fixture's header is not right without them: a key a
@@ -229,9 +262,18 @@ impl Tables for NoTables {
 /// A draft file's rules.
 pub trait DraftRules: Sync {
     /// The draft fixture's metadata, in the real draft's order, for a target
-    /// fixture of `n_fixture` layers cut from `n_source`. The draft fixture is
-    /// one file: a split key is refused before this is asked.
-    fn kvs(&self, draft: &Split, n_source: usize, n_fixture: usize) -> Result<Kvs, FixtureError>;
+    /// fixture of `n_fixture` layers cut from `n_source`, and with
+    /// [`FixtureSpec::ff`] set `ff` = (the target source's, the fixture's):
+    /// the draft's own ff key moves the same way, from the target's value
+    /// (another is refused by name). The draft fixture is one file: a split
+    /// key is refused before this is asked.
+    fn kvs(
+        &self,
+        draft: &Split,
+        n_source: usize,
+        n_fixture: usize,
+        ff: Option<(u64, u64)>,
+    ) -> Result<Kvs, FixtureError>;
 
     /// The fixture name of the real draft's tensor `name`, for a target
     /// fixture of `n_fixture` layers cut from `n_source`: the identity — a
