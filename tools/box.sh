@@ -109,8 +109,9 @@ else
 fi
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은
-# 2026-09-21에 끝났고 llm.service는 꺼져 있다). 그래도 그 카드에 이미 컴퓨트 프로세스가 있으면 — 우리 다른
-# 라운드일 것이다 — 겹쳐 올리지 않고 rc 75로 끝난다. llm.service 검사는 누가 다시 켰을 때의 안전장치다.
+# 2026-09-21에 끝났고 llm.service는 꺼져 있다). A compute process on the A6000 with its gate lock and the timing
+# lease both free is not one of ours: the command ends with rc 75 (below). llm.service 검사는 누가 다시 켰을 때의
+# 안전장치다.
 # 고른 값은 박스 쪽에 BLOOMERY_BOX_CARD로 넘어가고, tools/gpu-gate.sh가 그 카드의 게이트 락을 잡는다(both = 둘 다).
 CARD=${BLOOMERY_CARD:-3090}
 case "$CARD" in
@@ -123,8 +124,12 @@ case "$CARD" in
     [ -n "$A" ] || { echo "box.sh: A6000 lookup failed" >&2; exit 75; }
     [ "'"$CARD"'" != both ] || [ -n "$T" ] || { echo "box.sh: 3090 lookup failed (both)" >&2; exit 75; }
     if [ "$(systemctl is-active llm.service)" = active ]; then echo "box.sh: llm.service holds the A6000" >&2; exit 75; fi
-    if [ -n "$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader)" ]; then
-      echo "box.sh: the A6000 has compute processes (serving or training) — not taking it" >&2; exit 75; fi
+    # A compute process on the A6000 while its gate lock or the timing lease is held is one of our runs: the
+    # command goes on, and tools/gpu-gate.sh waits for the card lock inside its bound. One with both free is
+    # a surprise (serving or training) and ends the command with 75. Shared probes: they never hold a lock.
+    if [ -n "$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader)" ] &&
+       flock -s -n /root/bloomery-gate-a6000.lock true && flock -s -n /root/bloomery-cpu.lock true; then
+      echo "box.sh: the A6000 has compute processes and neither its gate lock nor the timing lease is held (serving or training?) — not taking it" >&2; exit 75; fi
     '"$( [ "$CARD" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )" ;;
   *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both" >&2; exit 64 ;;
 esac
