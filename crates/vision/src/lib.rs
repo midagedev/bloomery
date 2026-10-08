@@ -4,36 +4,34 @@
 //! No device code and no encoder arithmetic live here. What does:
 //!
 //! * [`image`] — decode a PNG or a JPEG into 8-bit RGB, the reference's `Image.convert("RGB")`.
-//! * [`grid`] — the resize plan (`plan_image_grid`, `safe_resize` of the reference
-//!   `image_processor.py`), integer-identical to it.
 //! * [`resample`] — Pillow's bicubic resize and `ImageOps.pad`, ported to the integer: the
-//!   reference resizes every image whose size is not already its grid through them.
-//! * [`preprocess`] — normalize the padded image to bf16 and cut it into patches in the reference's
-//!   order.
-//! * [`span`] — the token layout of one image in the prompt.
+//!   reference resizes every image whose size is not already its grid through them; and the same
+//!   resize under llama.cpp's `PAD_CEIL` pad. Both pads take the projector's fill as an argument.
+//! * [`preprocess`] — the plan of one image ([`GridPlan`]), and the normalize to bf16 and the cut
+//!   into patches that every projector type shares: row-major in V4.1's order, or in merge groups
+//!   with the patch repeated over temporal frames.
 //! * [`media`] — what a model tells the server about its image input ([`MediaModel`]): data plus
 //!   one prepare.
 //! * [`arch`] — per projector type, the names and hyperparameters of the encoder file (the mmproj
-//!   GGUF), each read once and refused by name when this crate does not run it, and the encoder's
-//!   bytes on its card.
+//!   GGUF), each read once and refused by name when this crate does not run it, and what the
+//!   projector's own image rule needs: V4.1's resize plan and span layout (`deepseek41v::grid`,
+//!   `deepseek41v::span`), its reference `load_image` and its bytes on its card; Clef's size rule
+//!   and pad colour (`qwen3vl::size`, `qwen3vl::media`).
 //!
-//! The reference is deepseek-ai/DeepSeek-V4.1-Flash `inference/image_processor.py` and
+//! The reference of V4.1 is deepseek-ai/DeepSeek-V4.1-Flash `inference/image_processor.py` and
 //! `inference/vision.py`, and Pillow's `libImaging/Resample.c` and `ImageOps.py` of the version
 //! the oracle ran; `tools/ref/vision/` dumps what they produce and the gates compare against it.
+//! The reference of `qwen3vl_merger` (Clef Flash) is llama.cpp's mtmd preprocessing.
 
 pub mod arch;
-pub mod grid;
 pub mod image;
 pub mod media;
 pub mod preprocess;
 pub mod resample;
-pub mod span;
 
-pub use grid::{GridParams, GridPlan, plan_image_grid};
 pub use image::{FileKind, Rgb8};
 pub use media::{MediaModel, Prepared};
-pub use preprocess::{Patches, preprocess};
-pub use span::{ImageSpan, SpanType, image_span};
+pub use preprocess::{GridPlan, PatchLayout, Patches, patchify};
 
 /// Everything this crate refuses, each naming what it refused.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +49,10 @@ pub enum VisionError {
         height: usize,
         detail: String,
     },
+    /// A token limit, patch or merge side, or a frame count, that this crate's size rule or patch
+    /// layout does not take.
+    #[error("image size limits: {detail}")]
+    Limits { detail: String },
     /// A metadata key of the encoder file that is absent, of another type, or holds a value this
     /// crate does not run.
     #[error("metadata {key}: {detail}")]

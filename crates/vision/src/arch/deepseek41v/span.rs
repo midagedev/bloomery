@@ -1,11 +1,12 @@
-//! One image's place in the prompt: the reference `image_token_types` and the ids beside them.
+//! One image's place in V4.1's prompt: the reference `image_token_types` and the ids beside them.
 //!
 //! The span is `[START] + ([IMAGE] * n_llm_w + [NEW_LINE]) * n_llm_h + [END]`, and every position of
 //! it carries the same input id (the image placeholder token); only the type tells the positions
 //! apart. The IMAGE positions take the aligner rows in reading order, the other three kinds take
 //! the learned delimiter rows.
 
-use crate::grid::GridPlan;
+use super::grid::num_image_tokens;
+use crate::GridPlan;
 
 /// The type of one position in an image span, with the reference's values (`TEXT = -1` outside
 /// any span).
@@ -41,7 +42,7 @@ pub struct ImageSpan {
 /// The span of an image with this plan, every position carrying `image_token_id`.
 #[must_use]
 pub fn image_span(plan: &GridPlan, image_token_id: u32) -> ImageSpan {
-    let mut types = Vec::with_capacity(plan.n_tokens());
+    let mut types = Vec::with_capacity(num_image_tokens(plan.n_llm_h, plan.n_llm_w));
     types.push(SpanType::Start);
     for _ in 0..plan.n_llm_h {
         types.extend(std::iter::repeat_n(SpanType::Image, plan.n_llm_w));

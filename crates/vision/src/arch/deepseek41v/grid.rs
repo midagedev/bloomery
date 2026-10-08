@@ -1,4 +1,4 @@
-//! The resize plan of one image: the pixel size it is brought to and the token grid that gives.
+//! V4.1's resize plan of one image: the pixel size it is brought to and the token grid that gives.
 //!
 //! A port of `plan_image_grid`, `safe_resize`, `solve_resize_ratio`, `llm_grid` and
 //! `num_image_tokens` in the reference `image_processor.py`, expression for expression. Where the
@@ -7,9 +7,11 @@
 //! `pow` (not `sqrt` — the two may differ in the last bit, and the result is truncated right after).
 //! Integer operations (`//` on ints) stay integer. The plan is a pure function of its arguments.
 
+use crate::GridPlan;
+
 /// The reference's resize parameters (`vision_patch_size`, `vision_downsample_ratio`,
 /// `vision_max_n_token`, `vision_min_pixels`). `vision_max_wh_ratio` is `None` in the reference
-/// config and the only value this plan runs; [`crate::arch`] refuses any other.
+/// config and the only value this plan runs; [`super::Hparams`] refuses any other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridParams {
     /// Pixels per patch side.
@@ -39,41 +41,8 @@ impl GridParams {
     }
 }
 
-/// The plan for one image: its pixel size before patching (`best_*`, multiples of the patch) and
-/// the token grid of the aligner (`n_llm_*`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GridPlan {
-    /// Aligner token rows.
-    pub n_llm_h: usize,
-    /// Aligner tokens per row.
-    pub n_llm_w: usize,
-    /// Pixel height the image is padded or resized to.
-    pub best_h: usize,
-    /// Pixel width the image is padded or resized to.
-    pub best_w: usize,
-}
-
-impl GridPlan {
-    /// Patch rows of the ViT.
-    #[must_use]
-    pub fn n_vit_h(&self, p: &GridParams) -> usize {
-        self.best_h / p.patch
-    }
-
-    /// Patches per row of the ViT.
-    #[must_use]
-    pub fn n_vit_w(&self, p: &GridParams) -> usize {
-        self.best_w / p.patch
-    }
-
-    /// The image's span length in the prompt, delimiters included.
-    #[must_use]
-    pub fn n_tokens(&self) -> usize {
-        num_image_tokens(self.n_llm_h, self.n_llm_w)
-    }
-}
-
-/// `num_image_tokens`: one start, one end, and a newline after every row.
+/// `num_image_tokens`: the length of V4.1's span for a token grid, one start, one end, and a
+/// newline after every row.
 #[must_use]
 pub fn num_image_tokens(n_llm_h: usize, n_llm_w: usize) -> usize {
     n_llm_h * (n_llm_w + 1) + 2
@@ -151,7 +120,7 @@ pub fn plan_image_grid(width: usize, height: usize, p: &GridParams) -> GridPlan 
 
 #[cfg(test)]
 mod tests {
-    use super::{GridParams, plan_image_grid};
+    use super::{GridParams, num_image_tokens, plan_image_grid};
 
     const V41: GridParams = GridParams {
         patch: 14,
@@ -171,7 +140,11 @@ mod tests {
         ] {
             let plan = plan_image_grid(w, h, &V41);
             assert_eq!(
-                (plan.best_w, plan.best_h, plan.n_tokens()),
+                (
+                    plan.best_w,
+                    plan.best_h,
+                    num_image_tokens(plan.n_llm_h, plan.n_llm_w)
+                ),
                 (best_w, best_h, tokens),
                 "{w}x{h}"
             );
@@ -193,9 +166,9 @@ mod tests {
             for b in 1..=side {
                 let plan = plan_image_grid(b * V41.patch, a * V41.patch, &V41);
                 let cells = plan.n_llm_h * plan.n_llm_w;
-                let patches = plan.n_vit_h(&V41) * plan.n_vit_w(&V41);
+                let patches = (plan.best_h / V41.patch) * (plan.best_w / V41.patch);
                 assert!(
-                    plan.n_tokens() <= V41.max_tokens
+                    num_image_tokens(plan.n_llm_h, plan.n_llm_w) <= V41.max_tokens
                         && cells <= V41.max_cells()
                         && patches <= V41.max_patches(),
                     "{a}x{b} patches: {plan:?}"

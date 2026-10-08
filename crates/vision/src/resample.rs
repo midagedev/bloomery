@@ -12,6 +12,12 @@
 //! preprocessing gate checks.
 //!
 //! The Python side's rounding is Python's: `round()` of a float is round-half-to-even.
+//!
+//! The other pad is llama.cpp's `PAD_CEIL` (`img_tool::resize`, mtmd): the same resize, a contain
+//! size rounded up and capped at the canvas in f32, and offsets by integer division. The fill is
+//! the projector's (llama.cpp sets `image_pad_color` per projector type), so both pads take it as
+//! an argument and no fill lives here. [`pad`] and [`pad_ceil`] differ in their geometry only; one
+//! function resizes and pastes for both.
 
 use crate::VisionError;
 use crate::image::Rgb8;
@@ -22,9 +28,6 @@ const PRECISION_BITS: u32 = 32 - 8 - 2;
 
 /// Bicubic support radius in input pixels at scale 1 (`BICUBIC = {bicubic_filter, 2.0}`).
 const BICUBIC_SUPPORT: f64 = 2.0;
-
-/// The fill of the reference's pad (`color=(127, 127, 127)`).
-pub const PAD_GREY: [u8; 3] = [127, 127, 127];
 
 /// `bicubic_filter` with `a = -0.5`, written in Resample.c's association.
 fn bicubic(x: f64) -> f64 {
@@ -196,8 +199,8 @@ pub fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
     horizontal.unwrap_or_else(|| src.clone())
 }
 
-/// Where `ImageOps.pad` puts an image of `width`×`height` on a `best_w`×`best_h` canvas: the size
-/// `ImageOps.contain` resizes it to, and the offset of the paste.
+/// Where a pad puts an image of `width`×`height` on a `best_w`×`best_h` canvas: the size it is
+/// resized to, and the offset of the paste.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PadGeometry {
     pub resized_w: usize,
@@ -259,28 +262,86 @@ impl PadGeometry {
             off_y,
         })
     }
+
+    /// llama.cpp's `PAD_CEIL` geometry for an image of `width`×`height` on a `target_w`×`target_h`
+    /// canvas: `scale = min(target_w / width, target_h / height)` in f32, each side
+    /// `min(ceil(side * scale), target)` in f32, the offset `(target - size) / 2` in integers.
+    pub fn ceil_of(
+        width: usize,
+        height: usize,
+        target_w: usize,
+        target_h: usize,
+    ) -> Result<PadGeometry, VisionError> {
+        if width == 0 || height == 0 || target_w == 0 || target_h == 0 {
+            return Err(VisionError::Size {
+                width,
+                height,
+                detail: "an empty image or canvas has no pad".to_string(),
+            });
+        }
+        let scale_w = target_w as f32 / width as f32;
+        let scale_h = target_h as f32 / height as f32;
+        // `std::min(a, b)` is `(b < a) ? b : a`.
+        let scale = if scale_h < scale_w { scale_h } else { scale_w };
+        let resized_w = ((width as f32 * scale).ceil() as usize).min(target_w);
+        let resized_h = ((height as f32 * scale).ceil() as usize).min(target_h);
+        Ok(PadGeometry {
+            resized_w,
+            resized_h,
+            off_x: (target_w - resized_w) / 2,
+            off_y: (target_h - resized_h) / 2,
+        })
+    }
+}
+
+/// Resize `src` to the geometry's size and paste it at its offset on a `canvas_w`×`canvas_h`
+/// canvas of `fill`; a size equal to the canvas is the resized image itself.
+fn paste(src: &Rgb8, g: PadGeometry, canvas_w: usize, canvas_h: usize, fill: [u8; 3]) -> Rgb8 {
+    let resized = resize_bicubic(src, g.resized_w, g.resized_h);
+    if (g.resized_w, g.resized_h) == (canvas_w, canvas_h) {
+        return resized;
+    }
+    let mut out = Rgb8::filled(canvas_w, canvas_h, fill);
+    for y in 0..g.resized_h {
+        let from = &resized.data[y * g.resized_w * 3..(y + 1) * g.resized_w * 3];
+        let at = ((y + g.off_y) * canvas_w + g.off_x) * 3;
+        out.data[at..at + from.len()].copy_from_slice(from);
+    }
+    out
 }
 
 /// `ImageOps.pad(image, (best_w, best_h), color=fill)` with the default bicubic filter and
 /// centering.
 pub fn pad(src: &Rgb8, best_w: usize, best_h: usize, fill: [u8; 3]) -> Result<Rgb8, VisionError> {
     let g = PadGeometry::of(src.width, src.height, best_w, best_h)?;
-    let resized = resize_bicubic(src, g.resized_w, g.resized_h);
-    if (g.resized_w, g.resized_h) == (best_w, best_h) {
-        return Ok(resized);
+    Ok(paste(src, g, best_w, best_h, fill))
+}
+
+/// llama.cpp's `PAD_CEIL` resize of an image to a `target_w`×`target_h` canvas: a size equal to
+/// the canvas is a plain copy, anything else is resized to [`PadGeometry::ceil_of`]'s size with
+/// the bicubic filter and pasted on a canvas of `fill`, the projector's pad colour.
+pub fn pad_ceil(
+    src: &Rgb8,
+    target_w: usize,
+    target_h: usize,
+    fill: [u8; 3],
+) -> Result<Rgb8, VisionError> {
+    if (src.width, src.height) == (target_w, target_h) {
+        return Ok(src.clone());
     }
-    let mut out = Rgb8::filled(best_w, best_h, fill);
-    for y in 0..g.resized_h {
-        let from = &resized.data[y * g.resized_w * 3..(y + 1) * g.resized_w * 3];
-        let at = ((y + g.off_y) * best_w + g.off_x) * 3;
-        out.data[at..at + from.len()].copy_from_slice(from);
-    }
-    Ok(out)
+    let g = PadGeometry::ceil_of(src.width, src.height, target_w, target_h)?;
+    Ok(paste(src, g, target_w, target_h, fill))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Axis, PRECISION_BITS, PadGeometry, bicubic};
+    use super::{Axis, PRECISION_BITS, PadGeometry, bicubic, pad, pad_ceil};
+    use crate::{Rgb8, VisionError};
+
+    /// Two pad colours of the two projector types that call the pads; the pads themselves take
+    /// whichever colour they are given.
+    const GREY: [u8; 3] = [127, 127, 127];
+    const BLACK: [u8; 3] = [0, 0, 0];
 
     /// The filter is 1 at 0, 0 at the other integers, and its taps at a half-pixel phase sum to 1.
     #[test]
@@ -316,5 +377,113 @@ mod tests {
         assert_eq!((g.resized_w, g.resized_h, g.off_y), (100, 91, 4));
         let g = PadGeometry::of(100, 93, 100, 100).expect("geometry");
         assert_eq!((g.resized_h, g.off_y), (93, 4));
+    }
+
+    /// llama.cpp's `PAD_CEIL` geometry on the sizes of the size plan's worked examples, each
+    /// computed by hand in f32 (`scale = min(w̄/w, h̄/h)`, `new = min(ceil(side · scale), target)`,
+    /// `offset = (target - new) / 2` in integers):
+    /// * 1000×700 → 992×704: scale = min(992/1000, 704/700) = 0.992; 1000 · 0.992 = 992.0 in f32
+    ///   → 992; 700 · 0.992 = 694.4 → 695; offset (0, (704 − 695) / 2 = 4).
+    /// * 777×513 → 768×512: scale = min(768/777, 512/513) = 0.98842; 777 · 0.98842 = 768.0 in f32
+    ///   → 768; 513 · 0.98842 = 507.06 → 508; offset (0, 2).
+    /// * 1000×1 → 992×32: scale = min(0.992, 32) = 0.992; 992 wide, 1 · 0.992 = 0.992 → 1; offset
+    ///   (0, (32 − 1) / 2 = 15).
+    /// * 700×1000 → 704×992: scale = min(704/700, 992/1000) = 0.992; 700 · 0.992 = 694.4 → 695,
+    ///   1000 · 0.992 = 992 → 992; offset ((704 − 695) / 2 = 4, 0).
+    #[test]
+    fn ceil_geometry_on_four_sizes() {
+        for ((w, h, tw, th), want) in [
+            ((1000, 700, 992, 704), (992, 695, 0, 4)),
+            ((777, 513, 768, 512), (768, 508, 0, 2)),
+            ((1000, 1, 992, 32), (992, 1, 0, 15)),
+            ((700, 1000, 704, 992), (695, 992, 4, 0)),
+        ] {
+            let g = PadGeometry::ceil_of(w, h, tw, th).expect("geometry");
+            assert_eq!(
+                (g.resized_w, g.resized_h, g.off_x, g.off_y),
+                want,
+                "{w}x{h} on {tw}x{th}"
+            );
+        }
+    }
+
+    /// Where the content lands is where the pixels are: every pixel outside the pasted rectangle
+    /// is the fill the caller gave and every pixel inside is the image's colour (a constant image
+    /// stays itself under the bicubic filter's normalized weights). The fill is an argument, so a
+    /// pad that ignored it and painted one colour fails on the other.
+    #[test]
+    fn ceil_pad_pastes_on_the_given_fill() {
+        let img = Rgb8::filled(1000, 700, [200, 100, 50]);
+        for fill in [BLACK, GREY, [1, 2, 3]] {
+            let out = pad_ceil(&img, 992, 704, fill).expect("pad");
+            assert_eq!((out.width, out.height), (992, 704));
+            let (y0, y1) = (4, 4 + 695);
+            for y in 0..704 {
+                for x in 0..992 {
+                    let px = &out.data[(y * 992 + x) * 3..(y * 992 + x) * 3 + 3];
+                    if (y0..y1).contains(&y) {
+                        assert_eq!(px, [200, 100, 50], "{fill:?}: inside at ({x}, {y})");
+                    } else {
+                        assert_eq!(px, fill, "{fill:?}: outside at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bands above and below a wide strip are black and the strip is the resized row.
+    #[test]
+    fn ceil_pad_of_a_strip() {
+        let out = pad_ceil(&Rgb8::filled(1000, 1, [255, 255, 255]), 992, 32, BLACK).expect("pad");
+        assert_eq!((out.width, out.height), (992, 32));
+        let row = |y: usize| &out.data[y * 992 * 3..(y + 1) * 992 * 3];
+        for y in (0..32).filter(|&y| y != 15) {
+            assert!(row(y).iter().all(|&v| v == 0), "row {y}");
+        }
+        assert!(row(15).iter().all(|&v| v == 255));
+    }
+
+    /// An image of the canvas's size is a plain copy, and one whose scaled size fills the canvas
+    /// exactly is its resize with no fill.
+    #[test]
+    fn ceil_pad_same_size_is_a_copy_and_exact_fit_has_no_fill() {
+        let img = Rgb8 {
+            width: 3,
+            height: 2,
+            data: (0..18).collect(),
+        };
+        assert_eq!(pad_ceil(&img, 3, 2, BLACK).expect("pad"), img);
+        let big = pad_ceil(&Rgb8::filled(2, 1, [9, 9, 9]), 128, 64, BLACK).expect("pad");
+        assert_eq!((big.width, big.height), (128, 64));
+        assert!(big.data.iter().all(|&v| v == 9));
+    }
+
+    /// A pad with no pixels is refused by name, not planned.
+    #[test]
+    fn ceil_pad_refuses_empty_sizes() {
+        for (w, h, tw, th) in [(0, 5, 32, 32), (5, 0, 32, 32), (5, 5, 0, 32), (5, 5, 32, 0)] {
+            assert!(
+                matches!(
+                    PadGeometry::ceil_of(w, h, tw, th),
+                    Err(VisionError::Size { .. })
+                ),
+                "{w}x{h} on {tw}x{th}"
+            );
+        }
+    }
+
+    /// Both pads resize and paste through one function: the grey pad of an image the canvas
+    /// does not fit keeps its fill, the black pad its own.
+    #[test]
+    fn the_two_pads_differ_in_geometry_and_fill_only() {
+        let img = Rgb8::filled(100, 91, [10, 20, 30]);
+        let grey = pad(&img, 100, 100, GREY).expect("pad");
+        let black = pad_ceil(&img, 100, 100, BLACK).expect("pad");
+        // ImageOps: height 91, offset round(4.5) = 4; PAD_CEIL: scale 1.0, height 91, offset 9 / 2 = 4.
+        for out in [&grey, &black] {
+            assert_eq!(&out.data[(4 * 100) * 3..(4 * 100) * 3 + 3], [10, 20, 30]);
+        }
+        assert_eq!(&grey.data[0..3], GREY);
+        assert_eq!(&black.data[0..3], BLACK);
     }
 }

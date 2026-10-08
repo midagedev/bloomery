@@ -4,12 +4,15 @@
 //! with an erf GELU between), plus the three learned span delimiters.
 
 pub mod card;
+pub mod grid;
 pub mod hparams;
 pub mod media;
 pub mod names;
+pub mod span;
 pub mod tensors;
 
 pub use hparams::Hparams;
+pub use media::preprocess;
 
 /// `projector_type` of the files this module reads.
 pub const PROJECTOR_TYPE: &str = "deepseek41v";
