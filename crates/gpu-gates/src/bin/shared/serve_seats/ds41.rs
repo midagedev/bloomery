@@ -236,7 +236,8 @@ use crate::{dspark, place};
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
                      [--cache-ram MIB] [--parallel N] [--queue-depth Q] \
-                     [--slot-save-path DIR] [--mmproj FILE]";
+                     [--slot-save-path DIR] [--mmproj FILE] [--api-key KEY] \
+                     [--api-key-file FNAME]";
 
 /// The resident sequences the seat serves when `--parallel` is not given.
 pub const SLOTS: usize = 2;
@@ -272,6 +273,9 @@ struct Args {
     /// `--mmproj`: the V4.1 encoder file whose images the seat serves;
     /// `None` serves no image.
     mmproj: Option<PathBuf>,
+    /// `--api-key`/`--api-key-file`: the keys every request is checked
+    /// against ([`serve::flag::ApiKeys`]).
+    api_keys: serve::flag::ApiKeys,
 }
 
 fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
@@ -286,6 +290,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
         queue_depth: None,
         slot_save_path: None,
         mmproj: None,
+        api_keys: serve::flag::ApiKeys::default(),
     };
     let mut park_ram = false;
     let mut place_flag = None;
@@ -308,6 +313,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             "--mmproj" => a.mmproj = Some(PathBuf::from(v)),
+            f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             "--park-ram" => {
                 mib_bytes(flag, v)?;
                 park_ram = true;
@@ -627,6 +633,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
         slot_save_path: a.slot_save_path,
+        api_keys: a.api_keys,
     };
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together, no turns and no park.
