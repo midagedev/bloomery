@@ -43,7 +43,11 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 /// The rows read below every binary's `main` — the pool's two and the NVMe
 /// tier's two ([`nvtier_levers`]) — which no `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
-    r.name == THREADS || r.name == SPIN || r.name == NVTIER_BYTES || r.name == NVTIER_READ
+    r.name == THREADS
+        || r.name == SPIN
+        || r.name == HOST_ROOM
+        || r.name == NVTIER_BYTES
+        || r.name == NVTIER_READ
 }
 
 /// Every file that reads a lever in place, with its round.
@@ -405,6 +409,7 @@ fn accessors_read_their_rows() {
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,
+            HOST_ROOM,
             NVTIER_BYTES,
             NVTIER_READ,
             PIN_MAIN,
@@ -444,6 +449,26 @@ fn mtp_width_takes_cost_and_fixed() {
         panic!("a word the row does not take is refused");
     };
     assert!(other.to_string().contains("BLOOMERY_MTP_WIDTH"), "{other}");
+}
+
+/// `BLOOMERY_HOST_ROOM` takes bytes (`M` and `G` binary units) where the
+/// host's reading is made ([`Scope::NvTier`]), unset is no room given, and a
+/// value that is not bytes is refused by name.
+#[test]
+fn host_room_takes_bytes_and_refuses_the_rest() {
+    let room = |v: &str| {
+        read(&env(&[(HOST_ROOM, v)]), Scope::NvTier).map(|l| l.entry(HOST_ROOM).value.clone())
+    };
+    assert_eq!(room("27G").unwrap(), Some(Value::Bytes(27 << 30)));
+    assert_eq!(room("24176M").unwrap(), Some(Value::Bytes(25_350_373_376)));
+    let unset = read(&env::<&str>(&[]), Scope::NvTier).unwrap();
+    assert_eq!(unset.entry(HOST_ROOM).value, None);
+    for bad in ["27GB", "lots", "", "-1"] {
+        let Err(e) = room(bad) else {
+            panic!("{bad:?} is not bytes and must be refused");
+        };
+        assert!(e.to_string().contains(HOST_ROOM), "{e}");
+    }
 }
 
 /// `BLOOMERY_QWEN3_KV` takes the two cache-format words, and unset is the

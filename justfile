@@ -1561,11 +1561,11 @@ weekly-gpu-ds41-serve:
 # 이름 붙은 거부(바닥, 직독 탐침, 한 슬롯 못 되는 예산), 그리고 레지던시 조항(풀 0의 mid, unresident·faulting 0).
 # 아레나가 모델 매핑을 결코 advise하지 않음을 조항이 지킨다(gate_nvtier.rs의 advice_disjoint). 2026-10-08에
 # 페이지드 티어의 두 이름 붙은 거부(HOST_LOCK 병행, r8 상주 사본)를 뺐다 — 커버리지 변경, 게이트 머리말에 근거.
-# 게이트 본체는 R2b(body38의 티어 build가 붙는 자리)까지 끝까지 안 돈다: 이 라운드는 컴파일과 순수 조력기 시험.
+# 계획은 gate_card의 3090 바이트로 서므로 어느 카드든 같은 핀이 선다 — 카드를 고정할 사실이 없어 any.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-nvtier:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && bash tools/gpu-gate.sh gate_nvtier'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvtier'
 
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice

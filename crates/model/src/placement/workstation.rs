@@ -3,21 +3,16 @@
 //! host-need arithmetic. What stays here is the one reading of the machine
 //! the Mac cannot do.
 
-pub use bloomery_placement::placement::host_room_given;
 pub use bloomery_placement::placement::workstation::*;
-
-/// The lever that gives the host's room instead of reading this machine: an
-/// emulation of a smaller host and an override.
-const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 
 /// The host's available bytes now ([`host_room`]): the smaller of
 /// [`mem_available`] of `/proc/meminfo` and the room under every cgroup v2
 /// memory limit above this process — inside a container (`docker run
 /// --memory`), a systemd scope (`MemoryMax`) or a pod, `/proc/meminfo`
 /// still shows the whole machine, and the limit's room is the reading that
-/// binds. `BLOOMERY_HOST_ROOM` set (bytes, `M` and `G` binary units)
-/// replaces both, read [`HostRead::Given`]; a value that is not bytes is
-/// refused by name.
+/// binds. `BLOOMERY_HOST_ROOM` set (bytes, `M` and `G` binary units, a
+/// parsed lever) replaces both, read [`HostRead::Given`]; a value that is
+/// not bytes is refused by name.
 pub fn host_available() -> Result<u64, String> {
     host_available_read().map(|(bytes, _)| bytes)
 }
@@ -25,9 +20,9 @@ pub fn host_available() -> Result<u64, String> {
 /// [`host_available`] with the reading that decided ([`HostRead`]), for
 /// every refusal and line that prints the bytes to name.
 pub fn host_available_read() -> Result<(u64, HostRead), String> {
-    let given = std::env::var_os(HOST_ROOM);
-    if let Some(room) = host_room_given(HOST_ROOM, given.as_deref())? {
-        return Ok(room);
+    let levers = bloomery_levers::nvtier_levers().map_err(|e| e.to_string())?;
+    if let Some(room) = levers.host_room {
+        return Ok((room, HostRead::Given));
     }
     let meminfo =
         std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("read /proc/meminfo: {e}"))?;

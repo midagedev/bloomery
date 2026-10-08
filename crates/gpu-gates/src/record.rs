@@ -1628,6 +1628,28 @@ pub static CLEF_ROWS: Kind = Kind {
     ],
 };
 
+/// The NVMe expert tier's arena over one paged load: its counters as the
+/// tier holds them (`NvTierStats`) — the misses `ensure` read, the slots
+/// filled and their bytes and wall, the evictions, the resident bytes (at
+/// or under the budget at every step) and the reads the page cache served.
+pub static NVTIER: Kind = Kind {
+    name: "nvtier",
+    head: "nvtier",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes and the reads the page cache served.",
+    parts: &[
+        key("budget", U64, "B"),
+        key("paged", U64, "B"),
+        key("misses", U64, ""),
+        key("fills", U64, ""),
+        key("fill_bytes", U64, "B"),
+        key("fill_ns", U64, "ns"),
+        key("evictions", U64, ""),
+        key("resident_bytes", U64, "B"),
+        key("buffered_reads", U64, ""),
+        key("buffered_bytes", U64, "B"),
+    ],
+};
+
 /// One result row of `probe_nvread`: an arm over a case of cold routed-expert
 /// runs, the batches' rate quantiles and what the run asked of the drive.
 pub static NVREAD: Kind = Kind {
@@ -2986,6 +3008,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &CALL_STREAM_END,
     &XSTREAM,
     &XSTREAM_END,
+    &NVTIER,
 ];
 
 /// The records `clef_hidden` prints: the prompt call's, then, given row ids,
@@ -3014,6 +3037,10 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
         .csv("a", s.a.iter().map(|a| format!("{a:.3}")))
         .u("closed", closed)
 }
+
+/// `gate_nvtier`'s rows: the tier's counters and the residency rule's two
+/// records of the paged plan.
+pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST];
 
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
@@ -3123,6 +3150,29 @@ pub fn load_phases(
         .f("body_s", body)
         .f("head_s", head)
         .f("other_s", other)
+}
+
+/// The `nvtier` record of a load's arena: its budget, the paged bytes it
+/// serves and the counters since the load. A load that attached no tier has
+/// no record — honest absence, never a zeroed row.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Record> {
+    let tier = tier?;
+    let s = tier.stats();
+    Some(
+        Record::new(&NVTIER)
+            .u("budget", tier.budget())
+            .u("paged", tier.paged_bytes())
+            .u("misses", s.misses)
+            .u("fills", s.fills)
+            .u("fill_bytes", s.fill_bytes)
+            .u("fill_ns", s.fill_ns)
+            .u("evictions", s.evictions)
+            .u("resident_bytes", s.resident_bytes)
+            .u("buffered_reads", s.buffered_reads)
+            .u("buffered_bytes", s.buffered_bytes),
+    )
 }
 
 /// A placed load's host-set records: the set read in, with its wall, or not;
@@ -3449,6 +3499,7 @@ mod tests {
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
+            GATE_NVTIER,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
             names.sort_unstable();
@@ -3759,6 +3810,7 @@ mod tests {
             CLEF_HIDDEN_BIN,
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
+            GATE_NVTIER,
         ] {
             for &kind in set {
                 for full in [true, false] {

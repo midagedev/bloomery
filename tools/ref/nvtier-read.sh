@@ -48,6 +48,9 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
+# The drive the model is on and its read counter.
+# shellcheck source=tools/ref/drive-read.sh
+source "${BASH_SOURCE[0]%/*}/drive-read.sh"
 
 # The O_DIRECT reference's band: `arm=drive case=range` outside REF_GBS ± REF_TOL read the drive in another
 # state than the sitting's bands were derived for, and the sitting is void (docs/cards/nvtier-read.card).
@@ -211,11 +214,7 @@ echo "[binary] $BIN sha256=$BIN_SHA mtime=$BIN_MTIME (newer than every file in i
 # is no instrument for the reconcile line, so the run ends by name.
 [ -r "$MODEL" ] || { echo "nvtier-read.sh: the model file $MODEL is not readable (profile $MODEL_NAME)" >&2; exit 2; }
 DIR=$(dirname "$MODEL")
-SRC=$(findmnt -n -o SOURCE --target "$DIR") || { echo "nvtier-read.sh: findmnt cannot name the mount of $DIR" >&2; exit 2; }
-DEV=$(lsblk -n -o PKNAME "$SRC" 2>/dev/null | head -n1 || true)
-[ -n "$DEV" ] || DEV=$(basename "$SRC")
-STAT=/sys/block/$DEV/stat
-[ -r "$STAT" ] || { echo "nvtier-read.sh: no counters at $STAT (mount source $SRC, device $DEV)" >&2; exit 2; }
+DEV=$(drive_dev "$MODEL") || exit 2
 
 WITNESS=(head loadavg pressure-cpu pressure-io table blockstat meminfo pgmajfault cpu cpu-mhz-range lock-holder binary model)
 
@@ -228,7 +227,7 @@ queue() {
   echo "${out}scheduler=$(cat "$q/scheduler" 2>/dev/null || echo '?')"
 }
 # sectors: sectors read from the drive so far (field 3 of its stat, 512 B each).
-sectors() { awk '{print $3}' "$STAT"; }
+sectors() { drive_sectors "$DEV"; }
 # reclaim: the kernel's reclaim counters so far: direct scan, direct steal, kswapd scan, kswapd steal, allocation stalls.
 reclaim() {
   awk '$1 == "pgscan_direct" {a = $2} $1 == "pgsteal_direct" {b = $2} $1 == "pgscan_kswapd" {c = $2}
