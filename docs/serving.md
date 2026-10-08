@@ -39,6 +39,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   as an expert tier, or a list (`0+1`) by CUDA index (not on the qwen38 seat, which takes `a`, `gate` or `bp`).
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for images and video, upstream's `confidence` formula).
+- **Stopping the server**: `SIGINT`/`SIGTERM` stop it as llama-server's do — no new request is admitted, the
+  engine thread ends between its calls, and the process exits 0 after one stderr line naming the cause; a second
+  signal terminates at once. `POST /shutdown` does the same over HTTP, accepted only from a loopback peer (a
+  machine on the network cannot stop your server): a WSL2 user cannot safely signal a GPU process — the host has
+  locked up when one was signalled — so the route stops the server without a signal.
 
 Where it ends today: one model a server, sm_86+ GPUs, and the seats' own defaults where llama-server has none
 (see [Limits](#limits)).
