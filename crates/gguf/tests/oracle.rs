@@ -1,22 +1,28 @@
 //! Oracle gate for stage 1, round 1-1. The tests are `hw_` (model files +
 //! box) and `#[ignore]`d: `cargo nextest` is not installed on the box
 //! so `just gate-1-1` runs them through `tools/box.sh`
-//! after `dequant_ref` has dumped V2-Lite into `$BLOOMERY_DATA/ref`, every
-//! type of V4.1's first shard into `$BLOOMERY_DATA/ref-v41_plain`, and its
-//! synthetic q2_K and i-quant rows into `$BLOOMERY_DATA/ref-synth`.
+//! against the sets `just dump-ref-dequant` wrote: V2-Lite's rows in
+//! `$BLOOMERY_DATA/ref-dequant-v2lite`, every type of V4.1's first shard in
+//! `$BLOOMERY_DATA/ref-dequant-v41_plain`, and the synthetic q2_K and i-quant
+//! rows in `$BLOOMERY_DATA/ref-synth`. Each opens through its refset family, which
+//! refuses by name a set of another harness, ggml build or model file, or a
+//! file that is not the one dumped.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use gguf::{GgmlType, Gguf, dequant_row};
+use refset::arch::dequant::{SYNTH, V2LITE, V2LITE_MODEL, V41};
+use refset::dequant::DequantSet;
+use refset::family::Family;
 
-const MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-
-fn data_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("BLOOMERY_DATA").expect("BLOOMERY_DATA must be set (run via tools/box.sh)"),
-    )
+/// The directory of the family's set, opened through the family; a refusal
+/// names the recipe that re-takes it.
+fn set_dir(f: &'static Family) -> PathBuf {
+    DequantSet::open(&f.path(f.sets[0]), f)
+        .unwrap_or_else(|e| panic!("{e}\n  re-take the set: {}", f.recipe))
+        .dir
 }
 
 /// Every tensor in the file resolves to a name, a dims vector, a type and an
@@ -25,7 +31,8 @@ fn data_dir() -> PathBuf {
 #[test]
 #[ignore = "hw: needs the model on the box plus the oracle dump in $BLOOMERY_DATA"]
 fn hw_coverage() {
-    let g = Gguf::open(MODEL).expect("open model");
+    let dir = set_dir(&V2LITE);
+    let g = Gguf::open(V2LITE_MODEL).expect("open model");
 
     let arch = g.architecture().expect("general.architecture");
     println!(
@@ -89,8 +96,7 @@ fn hw_coverage() {
     assert_eq!(total, g.tensor_count());
 
     // The oracle's manifest: "<type_num> <type_name> <count>" per type.
-    let manifest =
-        fs::read_to_string(data_dir().join("ref/manifest.txt")).expect("read ref/manifest.txt");
+    let manifest = fs::read_to_string(dir.join("manifest.txt")).expect("read ref/manifest.txt");
     let oracle: BTreeMap<u32, (String, usize)> = manifest
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
@@ -133,8 +139,8 @@ fn hw_coverage() {
 #[test]
 #[ignore = "hw: needs the model on the box plus the oracle dump in $BLOOMERY_DATA"]
 fn hw_dequant_matches_ggml() {
-    let g = Gguf::open(MODEL).expect("open model");
-    let dir = data_dir().join("ref");
+    let g = Gguf::open(V2LITE_MODEL).expect("open model");
+    let dir = set_dir(&V2LITE);
     let manifest = fs::read_to_string(dir.join("manifest.txt")).expect("read ref/manifest.txt");
 
     let mut worst: Vec<(String, f64, usize)> = Vec::new();
@@ -220,20 +226,22 @@ fn read_meta(dir: &Path, tname: &str) -> (String, usize, usize) {
 /// every one of these conversions is exact, so any difference is a bug, not
 /// rounding. Every type of the shard is checked (the public file's engram
 /// and embedding rows, its gains and scales are all decoded on the host),
-/// from the dump `ref-v41` + [`gguf::v41::set_suffix_of`]. Each type must be
+/// from the dump `ref-dequant-v41` + [`gguf::v41::set_suffix_of`]. Each type must be
 /// in the dump (a type the dump lacks fails here instead of passing with
 /// nothing compared), with ggml's tensor count for it equal to the loader's.
 #[test]
-#[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-v41[_plain]"]
+#[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-dequant-v41[_plain]"]
 fn hw_dequant_matches_ggml_v41() {
+    let dir = set_dir(&V41);
     let path = gguf::v41::model();
     let g = Gguf::open(&path).unwrap_or_else(|e| panic!("strict open of {path}: {e}"));
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for t in g.iter_tensors() {
         *counts.entry(t.ty.name().unwrap()).or_default() += 1;
     }
-    let set = format!("ref-v41{}", gguf::v41::set_suffix_of(&path));
-    let dir = data_dir().join(&set);
+    let set = dir
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into());
     let manifest = fs::read_to_string(dir.join("manifest.txt"))
         .unwrap_or_else(|e| panic!("read {set}/manifest.txt: {e}"));
     let oracle: BTreeMap<&str, (u32, usize)> = manifest
@@ -301,9 +309,10 @@ fn hw_dequant_matches_ggml_v41() {
 #[test]
 #[ignore = "hw: needs the model on the box"]
 fn hw_resident_copy_is_the_file() {
-    let mapped = Gguf::open(MODEL).expect("open model");
+    let mapped = Gguf::open(V2LITE_MODEL).expect("open model");
     for huge in [false, true] {
-        let res = Gguf::open_backed(MODEL, gguf::Weights::Resident { huge }).expect("resident");
+        let res =
+            Gguf::open_backed(V2LITE_MODEL, gguf::Weights::Resident { huge }).expect("resident");
         assert_eq!(res.tensor_count(), mapped.tensor_count());
         for i in 0..mapped.tensor_count() {
             let t = mapped.tensor(i).unwrap();
@@ -328,7 +337,7 @@ fn hw_resident_copy_is_the_file() {
 #[test]
 #[ignore = "hw: needs the synthetic oracle dump in $BLOOMERY_DATA/ref-synth"]
 fn hw_dequant_matches_ggml_synthetic() {
-    let dir = data_dir().join("ref-synth");
+    let dir = set_dir(&SYNTH);
     let manifest =
         fs::read_to_string(dir.join("manifest.txt")).expect("read ref-synth/manifest.txt");
     let mut seen: Vec<&str> = Vec::new();

@@ -42,6 +42,16 @@ pub enum Identity {
     /// dumps' identity, then the checks of [`crate::clefvis::ClefvisSet`] for the kind of set the variant names (the
     /// `# clefvis` line, the mmproj file and its sha256, the rows the kind needs).
     Clefvis(crate::clefvis::Kind),
+    /// `# vocabulary\t<path>` in a tokenizer set's `MANIFEST.tsv`
+    /// (`crates/tokenizer/tools/oracle.sh`), with `# tokenizer` and
+    /// `# libllama` naming the reference executable and library by md5: the
+    /// family's `build` pins both ([`crate::tokenizer::build_id`]).
+    Vocabulary,
+    /// `# model\t<path>` in a dequant set's `DEQUANT.tsv`
+    /// (`tools/ref/dump-dequant.sh`), with `# dequant_ref` and `# libggml`
+    /// naming the harness and ggml's library by md5: the family's `build`
+    /// pins both ([`crate::dequant::build_id`]).
+    DequantManifest,
 }
 
 /// The ik build a family's sets must name.
@@ -305,6 +315,22 @@ impl Family {
                     dumped_from: stated(set.checkpoint.as_deref()),
                     draft: None,
                     build: None,
+                })
+            }
+            Identity::Vocabulary => {
+                let set = crate::tokenizer::TokenizerSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.vocabulary.as_deref()),
+                    draft: None,
+                    build: set.build(),
+                })
+            }
+            Identity::DequantManifest => {
+                let set = crate::dequant::DequantSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: None,
+                    build: set.build(),
                 })
             }
         }

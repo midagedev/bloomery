@@ -17,3 +17,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+# The dequant oracle's sets open through their refset family; refset reads the GGUF files
+# through this crate, so the tests link the lib once and refset beside it.
+bloomery-refset = { path = "../refset" }

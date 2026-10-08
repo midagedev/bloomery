@@ -44,7 +44,6 @@ crates/gpu-gates/src/record.rs	CUDA_DEVICE_ORDER	stays: the driver's ordinal ord
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs	BLOOMERY_CHAIN_ATTN_MUTATE,BLOOMERY_CHAIN_ATTN_LAYERS	stays: the gate's FAIL-first tool
 # Harness and data paths — stay: a test binary's or a build script's own reads.
 crates/engram-lab/tests/lab.rs	BLOOMERY_DATA	stays: the data directory
-crates/gguf/tests/oracle.rs	BLOOMERY_DATA	stays: the data directory
 crates/model/tests/attn.rs	BLOOMERY_FLASH_SIMD_CHILD_DUMP,BLOOMERY_KV_PREFETCH_CHILD,BLOOMERY_SPLITK_BAND_DUMP,BLOOMERY_SPLITK_CHILD_DUMP,BLOOMERY_BUNDLE_BAND_DUMP	stays: the gate's handshakes with the children it runs
 crates/model/tests/common/model_path.rs	BLOOMERY_MODEL	stays: the model file the harnesses open
 crates/model/tests/deepseek4_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens
@@ -58,7 +57,7 @@ crates/model/tests/qwen3moe_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the
 crates/model/tests/union.rs	BLOOMERY_MODEL	stays: the model file the harness opens
 crates/qdot/tests/qdot.rs	BLOOMERY_MODEL,BLOOMERY_DATA,BLOOMERY_Q5K_MODEL,BLOOMERY_V4_MODEL	stays: the model files and the data directory
 crates/serve/build.rs	CARGO_MANIFEST_DIR,BLOOMERY_GIT_COMMIT	stays: cargo's crate directory and the synced tree's commit
-crates/tokenizer/tests/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB,BLOOMERY_DATA	stays: the vocabulary file and the data directory
+crates/refset/src/arch/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB	stays: the vocabulary file
 crates/decision/tests/clef.rs	BLOOMERY_DATA	stays: the data directory
 crates/decision/tests/lev.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set

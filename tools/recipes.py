@@ -54,8 +54,8 @@ A recipe's inputs are:
 
 Honest expectation: a change in crates/gpu or crates/model selects every GPU gate — that is the
 crate graph's true answer (a one-line enum change in the fault word selects them all, and it should).
-The saving is on leaf changes (serve, tokenizer, sampler, one gate binary, a runner, docs — which only
-gate-tokenizer reads, through its oracle's `find`); the larger
+The saving is on leaf changes (serve, tokenizer, sampler, one gate binary, a runner, docs — which no gate
+reads: the tokenizer oracle's Korean text is gathered by its dump, not by the gate); the larger
 value is the list itself: no forgotten gate, and a gate left out is a printed record, not a judgment.
 What this layer cannot see: data under $BLOOMERY_DATA and the ik trees (not in git), and a card
 dependence (BLOOMERY_GATE_CARD). The box's dep-info can be stale or missing; the walk does not depend
@@ -3816,10 +3816,12 @@ DATA_UNREAD = {
     "ncu": "profiler reports of a timing runner (tools/ref/ncu-gpu.sh); no gate reads them",
 }
 DATA_UNREAD_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/(?:nsys|ncu)\b|join\(\"(?:nsys|ncu)\"\)|\"(?:nsys|ncu)/")
-# $BLOOMERY_DATA entries left out of the manifest because only never-skip items read them: gate-tokenizer
-# rewrites tokenizer*/ on every run (crates/tokenizer/tools/oracle.sh), part of it from the tree's docs/*.md,
-# and is never-skip itself (it reads a reference tree). In the manifest they moved every item's key whenever
-# that gate ran after a docs commit. The self-test fails when a skippable gate-* recipe's inputs name one.
+# $BLOOMERY_DATA entries left out of the manifest because no current item reads them: the tokenizer*/ directories
+# of the format before the trailer, which a checkout that has not rebased past it still rewrites on every
+# gate-tokenizer run (the sets the gate reads now are ref-tokenizer-*, written by `just dump-ref-tokenizer`, and
+# are in the manifest). In the manifest the old directories would move every item's key whenever such a checkout
+# ran its gate. The self-test fails when a gate-* recipe's inputs name one; the entry goes when every checkout has
+# rebased.
 DATA_NEVER_ONLY = re.compile(r"tokenizer(?:-[a-z0-9_]+)?")
 DATA_NEVER_ONLY_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/tokenizer|TOKENIZER_SET|set:\s*\"tokenizer")
 # A cargo selector whose value is a recipe parameter (`--features {{FEATURES}}`, `--bin {{BIN}}`): just
@@ -4465,7 +4467,7 @@ def cmd_key(args: argparse.Namespace) -> int:
 
 class HashCache:
     """sha256 of files keyed by (size, mtime, ctime, inode, device), kept between batches on the box:
-    a file rewritten with the same bytes (gate-1-1 and gate-tokenizer rewrite theirs on every run) keeps
+    a file rewritten with the same bytes (the dump recipes rewrite their sets) keeps
     its hash, and only files whose stat moved are read again. A file changed within the last 2 s is
     hashed but not cached (its next write may land inside the same timestamp)."""
 
@@ -4983,8 +4985,8 @@ def key_self_test(expect, real: Side) -> None:
                     never_only_readers.append((n, hit))
     for n, hit in never_only_readers:
         expect(n in never, f"{n} reads {hit}: an entry the box manifest leaves out (DATA_NEVER_ONLY), and {n} can skip — take it out of DATA_NEVER_ONLY")
-    expect(any(n == "gate-tokenizer" for n, _ in never_only_readers), "no gate-* recipe names the tokenizer data: DATA_NEVER_ONLY_NAMED no longer sees gate-tokenizer's reads")
-    expect(never == {"gate-1-1", "gate-tokenizer"}, f"never-skip gate recipes: {sorted(never)}")
+    expect(not never_only_readers, f"{never_only_readers} name the tokenizer*/ directories of the format before the trailer: the box manifest leaves them out, and the sets gate-tokenizer reads are ref-tokenizer-*")
+    expect(never == {"gate-1-1"}, f"never-skip gate recipes: {sorted(never)}")
     expect(
         tree_scoped <= never,
         f"skippable gate-* recipes keyed on the whole tree: {sorted(tree_scoped - never)} — a script in the closure walks the tree",
@@ -5170,7 +5172,8 @@ def key_self_test(expect, real: Side) -> None:
         expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
         c3 = KeyContext(sa, mf, "BLOOMERY_DATA=/root/bloomery-data", {}, settings=settings)
         expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
-        expect(c.parts("gate-1-1")[2] is not None and c.parts("gate-tokenizer")[2] is not None, "an ik-reading gate was skippable")
+        expect(c.parts("gate-1-1")[2] is not None, "an ik-reading gate was skippable")
+        expect(c.parts("gate-tokenizer")[2] is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {c.parts('gate-tokenizer')[2]}")
         expect(c.parts("smoke")[2] is not None and c.parts("check-recipes")[2] is None, "smoke (a batch in a batch) or check-recipes has the wrong never-skip")
         expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
         expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
@@ -5779,8 +5782,8 @@ def narrow_self_test(expect, side: Side) -> None:
         n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], [row("rust-toolchain.toml", ["*"], 7)])
         expect(any(f"{GATE_PATHS}:7" in r for r in n.full), f"narrow: a `*` row does not keep the full list: {n.full}")
         n = narrow(["docs/plan.md"], side, side, [(base, same)], rows)
-        expect(not n.full and set(n.picks) == {"gate-tokenizer"} and "not a host path" in n.files[0],
-               f"narrow: docs/plan.md (walked by gate-tokenizer's oracle only), an equal-scan host change, drops the spill ratchet: "
+        expect(not n.full and not n.picks and "not a host path" in n.files[0],
+               f"narrow: docs/plan.md (read by no gate), an equal-scan host change, drops the spill ratchet and picks nothing: "
                f"full={n.full} picks={sorted(n.picks)}")
         n = narrow(["crates/vision/src/lib.rs"], side, side, [(base, same)], rows)
         expect(not n.full and {"gate-vision", "gate-gpu-vision"} <= set(n.picks) and "lib bloomery-gpu-vision not scanned" in n.files[0],
@@ -6113,15 +6116,15 @@ def self_test() -> int:
            f"a gpu lib file levers' registry names selects the gpu-linking gates only: {len(hybrid)} of {len(gates)}")
     qprof = sel("tools/ref/models/qwen3moe.sh")
     expect("gate-gpu-qwen3moe-e2e" in qprof and "gate-gpu-e2e" not in qprof, f"qwen3moe profile selects {sorted(qprof)[:5]}")
-    # oracle.sh builds its Korean corpus with `find "$ROOT/docs" -name '*.md'`: a docs change selects that
-    # gate and no other
+    # oracle.sh builds its Korean corpus with `find "$ROOT/docs" -name '*.md'`, but only `just dump-ref-tokenizer`
+    # runs it: no gate recipe names it, so a docs change selects no gate
     docs = sel("docs/plan.md")
-    expect(docs == {"gate-tokenizer"}, f"docs/plan.md (walked by oracle.sh) selects {sorted(docs)}")
-    expect(graph.inputs("gate-tokenizer").prefixes.get("docs/", "").startswith("find in crates/tokenizer/tools/oracle.sh"), f"gate-tokenizer's docs/ prefix: {graph.inputs('gate-tokenizer').prefixes}")
+    expect(docs == set(), f"docs/plan.md selects {sorted(docs)}")
+    expect(not graph.inputs("gate-tokenizer").prefixes.get("docs/"), f"gate-tokenizer's docs/ prefix: {graph.inputs('gate-tokenizer').prefixes}")
     walks = [(ln, _SCRIPT_WALK.findall(ln)) for ln in ('find "$ROOT/docs" -name x', 'find "$ROOT"/docs/cards -type f', "find crates -name '*.rs'", 'find "$REF/docs" -name x', "find . -name x", 'find "$ROOT" -name x')]
     expect([w for _, w in walks] == [["docs"], ["docs/cards"], [], [], [], []], f"find roots: {walks}")
     cases = sel("crates/tokenizer/tests/cases.txt")
-    expect(cases == {"gate-tokenizer"}, f"tokenizer cases.txt (read by oracle.sh) selects {sorted(cases)}")
+    expect(cases == {"gate-tokenizer"}, f"tokenizer cases.txt (include_bytes! of tests/tokenizer.rs) selects {sorted(cases)}")
     expect(len(sel("tools/box.sh")) == len(gates), "tools/box.sh does not select every gate")
     # a #[cfg(test)] module's includes belong to the recipes that run that lib's tests: levers' tests.rs
     # (a file module) reads levers-direct.txt, gpu-gates' record.rs (an inline one) the record schemas;
@@ -6370,7 +6373,7 @@ def self_test() -> int:
     sels, unmapped, _ = select(["justfile"], side, b2, GATE_PREFIX)
     expect([x.recipe for x in sels] == ["gate-sampler"] and not unmapped, f"recipe-text change selects {[x.recipe for x in sels]}")
     sels, _, _ = select(["crates/gpu-gates/src/bin/gate_p1.rs", "docs/plan.md"], side, side, GATE_PREFIX)
-    expect(sorted(x.recipe for x in sels) == ["gate-gpu-p1", "gate-tokenizer"], f"select() on gate_p1.rs and docs/plan.md gives {[x.recipe for x in sels]}")
+    expect(sorted(x.recipe for x in sels) == ["gate-gpu-p1"], f"select() on gate_p1.rs and docs/plan.md gives {[x.recipe for x in sels]}")
 
     # dep-info parsing
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")

@@ -21,3 +21,7 @@ bloomery-gguf = { path = "../gguf" }
 # reference does; memmem keeps that scan at memory speed.
 memchr = "=2.8.3"
 thiserror.workspace = true
+
+[dev-dependencies]
+# The oracle sets the tests compare with open through their refset family.
+bloomery-refset = { path = "../refset" }
