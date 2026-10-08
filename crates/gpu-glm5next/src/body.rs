@@ -81,9 +81,12 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
-use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
+use bloomery_gpu::host::swap::{
+    BoundaryAt, CallPick, CallReport, PassReport, ResetReport, Residency,
+};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::TierOpen;
+use bloomery_gpu::host::xstream::XMode;
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
@@ -1773,6 +1776,72 @@ impl Body {
     /// log. Nothing is kept until then.
     pub fn log_residency(&mut self, passes: usize) {
         self.residency_glue.log_passes(passes);
+    }
+
+    /// What the next prompt calls move (`BLOOMERY_XSTREAM`, [`prefill`]'s
+    /// module doc): off until set here, so one load can run every arm.
+    /// Refused by name: `Admit` on a load that runs no residency machine,
+    /// `Split` (no GLM unit lights the stream's ring: a unit holds at most
+    /// the host union's columns, under the least width the ring pays at), and
+    /// any change while a call streams.
+    pub fn set_xstream(&mut self, mode: XMode) -> Result<(), GpuError> {
+        const WHAT_S: &str = "Body::set_xstream";
+        if self.prompt.stream.on {
+            return Err(GpuError::State {
+                what: WHAT_S,
+                missing: "no prompt call streaming",
+            });
+        }
+        match mode {
+            XMode::Off => {}
+            XMode::Admit if self.hybrid.swap().is_none() => {
+                return Err(GpuError::State {
+                    what: "BLOOMERY_XSTREAM",
+                    missing: "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>) for admit",
+                });
+            }
+            XMode::Admit => {}
+            XMode::Split => {
+                return Err(GpuError::Shape {
+                    what: "BLOOMERY_XSTREAM",
+                    detail: "split: no GLM unit lights the ring: at most 512 columns, and the \
+                             ring pays from 2,747 [derived]"
+                        .to_string(),
+                });
+            }
+        }
+        self.prompt.stream.mode = mode;
+        Ok(())
+    }
+
+    /// `BLOOMERY_XSTREAM` as a load takes it, and its `xstream=` line (the
+    /// word, then why): `set` as given ([`Body::set_xstream`]'s refusals
+    /// apply); unset, `admit` on a load that runs a residency machine, `off`
+    /// on one that does not.
+    pub fn resolve_xstream(&mut self, set: Option<&str>) -> Result<String, GpuError> {
+        let (mode, why) = match set {
+            Some(word) => (XMode::parse(word)?, "set"),
+            None if self.hybrid.swap().is_some() => {
+                (XMode::Admit, "unset: a residency machine runs")
+            }
+            None => (XMode::Off, "unset: no residency machine"),
+        };
+        self.set_xstream(mode)?;
+        Ok(format!("xstream={} ({why})", mode.word()))
+    }
+
+    /// What the next prompt calls move ([`Body::set_xstream`]).
+    #[must_use]
+    pub fn xstream_mode(&self) -> XMode {
+        self.prompt.stream.mode
+    }
+
+    /// The last streaming prompt call's picks, each with its unit (the
+    /// call's batch it picked for), and its end; empty and `None` after a
+    /// call that did not stream. Taken: a second read is empty.
+    pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
+        let st = &mut self.prompt.stream;
+        (std::mem::take(&mut st.picks), st.end.take())
     }
 
     /// The residency machine's source, when the load runs one.

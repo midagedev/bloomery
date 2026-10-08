@@ -41,6 +41,31 @@
 //! The head runs after the last layer of the batch that holds the call's last
 //! position, for that position alone.
 //!
+//! Under host streaming (`BLOOMERY_XSTREAM=admit`, a residency machine,
+//! [`Body::set_xstream`]) a call of [`PICK_FLOOR`] ids or more opens the
+//! machine's call mode (`HostTier::call_begin`) inside the call's residency
+//! pass, and each unit's layer-batch picks before its card route
+//! ([`PromptProgram::shadow_rows`]): the host waits for the front's download
+//! of the unit's routed ids, counts them, and the machine's pick
+//! (`SwapMachine::call_pick`) sends the pool's coldest residents to the host
+//! and copies the unit's hottest host experts over them, in victim-slot order,
+//! a landing batch a third of them, each batch's event on the copy stream
+//! after its last copy. The serve's union then runs under the moved host map,
+//! and the card route runs the grouped pass once a landing batch, the slots no
+//! copy lands in first, each batch behind its own event
+//! ([`ffn::card_rows`]), the card sum reading the moved slot map. A unit
+//! picks on a KDA layer always and on a latent layer only in a group of one
+//! ([`pick_layer`]): the next unit's front waits behind the pick's landing
+//! waits. The route is the layer's reader of the call
+//! (`SwapMachine::call_reader`), which the layer's next pick copies behind, and
+//! it is enqueued in its own unit's shadow, before the next unit's front
+//! downloads its ids and so before that unit's pick rewrites the batch rows.
+//! The call's placement stays for the decode after it (`Body::stream_end`);
+//! a failed call's streaming ends first, each layer back at the set the call
+//! started with, then its positions are taken back. A token's bits then
+//! depend on its unit's routing too: which of its experts the pick moved sums
+//! on the card, not the host.
+//!
 //! A group's units share every buffer one item writes and the same or the
 //! next part of that item reads; what a unit's back, or its later layers,
 //! read after the next unit's front ran is the unit's own (`UnitBufs`: the
@@ -100,6 +125,8 @@ use bloomery_gpu::fault::read_cards;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::swap::{CallCfg, CallPick, CallReport};
+use bloomery_gpu::host::xstream::{LandBatch, XMode};
 use bloomery_gpu::kpool;
 use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for};
 use bloomery_gpu::linear::conv::KdaConvArgs;
@@ -117,8 +144,9 @@ use bloomery_gpu_deepseek41::hc::{
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
+use model::arch::glm5next::hparams::Kind;
 use model::arch::glm5next::names::Sub;
-use model::arch::glm5next::place::{self, FrontWidths};
+use model::arch::glm5next::place::{self, FrontWidths, pick_layer};
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -151,6 +179,17 @@ const _: () = assert!(CHUNK == HC_MAX_TOKENS);
 /// projection, a dense block): a batch of at most a chunk
 /// runs them as the step's gemv does, so it writes the step's bits.
 pub const GEMM_FROM: usize = CHUNK + 1;
+
+/// The least count an expert needs among a unit's routed ids for a prompt
+/// call's pick to admit it into the residency pool, and the least prompt that
+/// opens a call at all. A pick copies each admit's three stacks over the
+/// staging lane while the host union serves the layer-batch; the floor keeps
+/// the admits of a unit within the copies the union hides, which on a replay
+/// of the router's sets on this model's prompts is the hottest couple of
+/// dozen experts a layer-batch [derived]. It is the other families' floor
+/// (V4.1's and Qwen3.8's `STREAM_FLOOR`), the same value reached from their
+/// own lane and union costs.
+pub const PICK_FLOOR: u32 = 32;
 
 /// How a prompt is fed: in batches ([`prefill`]) or one decode step per id
 /// ([`prompt`]) — the same-binary arm, which is the decode step and not a
@@ -202,6 +241,26 @@ pub(crate) struct PromptState {
     routes: Option<RouteTaps>,
     /// The batch walks' planted routes ([`plant_prompt_routes`]).
     plant_routes: Option<RoutePlant>,
+    /// What a call's units move into the residency pool ([`Stream`]).
+    pub(crate) stream: Stream,
+}
+
+/// A prompt call's host streaming (`BLOOMERY_XSTREAM`, the residency
+/// machine's call mode, [`Body::set_xstream`]): what the next calls move,
+/// whether one streams now, the pick's count buffer and the call's pick and
+/// end records for the binary that prints them.
+pub(crate) struct Stream {
+    /// What the next prompt calls move: `Off` until set.
+    pub(crate) mode: XMode,
+    /// A call is streaming: every unit's layer-batch of it picks
+    /// ([`PromptProgram::picks`]).
+    pub(crate) on: bool,
+    /// The call's batch the walking group's first unit is, the pick
+    /// records' unit numbers from it.
+    pub(crate) unit0: usize,
+    counts: Vec<u32>,
+    pub(crate) picks: Vec<(usize, CallPick)>,
+    pub(crate) end: Option<CallReport>,
 }
 
 impl PromptState {
@@ -216,6 +275,14 @@ impl PromptState {
             timing: None,
             routes: None,
             plant_routes: None,
+            stream: Stream {
+                mode: XMode::Off,
+                on: false,
+                unit0: 0,
+                counts: Vec::new(),
+                picks: Vec::new(),
+                end: None,
+            },
         }
     }
 
@@ -1107,12 +1174,68 @@ fn prefill_units(
     r
 }
 
-/// [`prefill_units`]'s groups: the checkpoint at the call's start, then per
+/// [`prefill_units`]'s groups under the call's host streaming: the residency
+/// machine's call opened when the lever asks and the prompt reaches
+/// [`PICK_FLOOR`] ([`Body::stream_begin`]), the groups ([`call_groups_run`]),
+/// then the call ended with its placement kept for the decode after it. A
+/// call that fails has its streaming ended first, each layer back at the set
+/// the call started with, then its positions taken back.
+fn call_groups(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    from: u32,
+    to: u32,
+    sink: Option<&mut GlmPromptSink<'_>>,
+) -> Result<u32, GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    body.stream_begin(gpu, ids.len())?;
+    match call_groups_run(m, ids, from, to, sink) {
+        Ok(t) => {
+            let ended = m
+                .body_parts(WHAT)
+                .and_then(|(gpu, _, body)| body.stream_end(gpu, true));
+            match ended {
+                Ok(()) => Ok(t),
+                Err(e) => Err(take_back(m, from, e)),
+            }
+        }
+        // A failure that took the call back has ended its streaming already;
+        // one that left through a bare `?` ends it here.
+        Err(e) => Err(stream_failed(m, e)),
+    }
+}
+
+/// A call that failed with `e` under host streaming: the machine's call
+/// ended, each layer back at the set the call started with. A failure to end
+/// it is named beside `e`; a fault stays `e`. Nothing for a call that does
+/// not stream.
+fn stream_failed(m: &mut Glm5nextModel, e: GpuError) -> GpuError {
+    let ended = m
+        .body_parts(WHAT)
+        .and_then(|(gpu, _, body)| body.stream_end(gpu, false));
+    match ended {
+        Ok(()) => e,
+        Err(_) if matches!(e, GpuError::Fault { .. }) => e,
+        Err(s) => shape(format!(
+            "a prompt call failed ({e}), and ending its host streaming failed too ({s})"
+        )),
+    }
+}
+
+/// A call that failed with `e` after its groups began: its streaming ended
+/// ([`stream_failed`]) before its positions are taken back ([`take_back`]),
+/// so the checkpoint's rollback runs on the slot map the call started with.
+fn failed(m: &mut Glm5nextModel, from: u32, e: GpuError) -> GpuError {
+    let e = stream_failed(m, e);
+    take_back(m, from, e)
+}
+
+/// [`call_groups`]' groups: the checkpoint at the call's start, then per
 /// group its inner marks' takes opened, its walk ([`Body::enqueue_group`]),
 /// the takes sealed once its fault word is read, the sink per unit, and the
 /// checkpoint at its end when that is a mark. A group that fails abandons
 /// its open takes and takes the call back.
-fn call_groups(
+fn call_groups_run(
     m: &mut Glm5nextModel,
     ids: &[u32],
     from: u32,
@@ -1128,6 +1251,7 @@ fn call_groups(
     }
     let mut argmax = None;
     for gr in place::groups(batches.len(), group) {
+        let unit0 = gr.start;
         let runs = &batches[gr];
         let (Some(first), Some(end)) = (runs.first(), runs.last()) else {
             continue;
@@ -1135,9 +1259,10 @@ fn call_groups(
         let (start, end) = (first.start, end.end);
         let seg = &ids[(start - from) as usize..(end - from) as usize];
         let last = end == to;
+        m.body_parts(WHAT)?.2.prompt.stream.unit0 = unit0;
         let mut takes = match open_takes(m, runs, &marks) {
             Ok(t) => t,
-            Err(e) => return Err(take_back(m, from, e)),
+            Err(e) => return Err(failed(m, from, e)),
         };
         let ran = m.run_rows(seg.len(), WHAT, |gpu, w, body, head, pos| {
             body.enqueue_group(gpu, w, head, seg, pos, runs, last, &mut takes)
@@ -1168,7 +1293,7 @@ fn call_groups(
         });
         match ran {
             Ok(t) => argmax = t.or(argmax),
-            Err(e) => return Err(take_back(m, from, e)),
+            Err(e) => return Err(failed(m, from, e)),
         }
         if marks.contains(&end) {
             let (gpu, _, body) = m.body_parts(WHAT)?;
@@ -1531,6 +1656,58 @@ impl Body {
         Ok(more > 0)
     }
 
+    /// A call of `n` ids under host streaming: with the lever on
+    /// ([`Body::set_xstream`]) and `n` at least [`PICK_FLOOR`], the residency
+    /// machine opens its call ([`HostTier::call_begin`]) inside the pass the
+    /// call's boundary opened, and every unit's layer-batch of the call picks
+    /// ([`PromptProgram::picks`]); else it does not: a prompt of fewer ids
+    /// gives no expert a count its pick would admit. Refused by name: a call
+    /// streaming already, and the lever on with no machine.
+    ///
+    /// [`HostTier::call_begin`]: bloomery_gpu::host::HostTier::call_begin
+    fn stream_begin(&mut self, gpu: &Gpu, n: usize) -> Result<(), GpuError> {
+        const WHAT_B: &str = "glm5next prompt streaming";
+        let st = &mut self.prompt.stream;
+        if st.on {
+            return Err(GpuError::State {
+                what: WHAT_B,
+                missing: "no call streaming (stream_end)",
+            });
+        }
+        st.picks.clear();
+        st.end = None;
+        st.unit0 = 0;
+        if st.mode == XMode::Off || n < PICK_FLOOR as usize {
+            return Ok(());
+        }
+        if !self
+            .hybrid
+            .call_begin(gpu.stream(), CallCfg { floor: PICK_FLOOR })?
+        {
+            return Err(GpuError::State {
+                what: "BLOOMERY_XSTREAM",
+                missing: "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>)",
+            });
+        }
+        self.prompt.stream.on = true;
+        Ok(())
+    }
+
+    /// End the call's streaming, if it streams: the residency machine's end
+    /// ([`HostTier::call_end`]), its placement `kept` for the decode after
+    /// it, else each layer back at the set the call started with; the end's
+    /// report kept for [`Body::take_stream_records`]. Nothing for a call that
+    /// does not stream, so a second end is a no-op.
+    ///
+    /// [`HostTier::call_end`]: bloomery_gpu::host::HostTier::call_end
+    fn stream_end(&mut self, gpu: &Gpu, kept: bool) -> Result<(), GpuError> {
+        if !std::mem::take(&mut self.prompt.stream.on) {
+            return Ok(());
+        }
+        self.prompt.stream.end = self.hybrid.call_end(gpu.stream(), kept)?;
+        Ok(())
+    }
+
     /// [`Body::checkpoint`] at `pos`, its wall the timing's checkpoint wait
     /// when armed.
     fn timed_checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
@@ -1604,6 +1781,7 @@ impl Body {
             sink,
             routes,
             plant_routes,
+            stream: pick,
             ..
         } = prompt;
         let Batch { bufs, units, hsum } = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1679,6 +1857,7 @@ impl Body {
             plant,
             routes: routes.as_mut(),
             planted: plant_routes.as_ref(),
+            stream: pick,
         };
         let o = Overlap {
             units: g,
@@ -1853,6 +2032,9 @@ struct PromptProgram<'a> {
     routes: Option<&'a mut RouteTaps>,
     /// The planted routes, written over each router's picks and weights.
     planted: Option<&'a RoutePlant>,
+    /// The call's host streaming: whether this walk picks, and where its
+    /// records go.
+    stream: &'a mut Stream,
 }
 
 /// A group's open takes, one a unit ([`Body::enqueue_group`]), with what
@@ -2533,38 +2715,61 @@ impl PromptProgram<'_> {
         )
     }
 
-    /// `at`'s card experts, where the slot map puts any, and its shared
-    /// expert by chunk, under its host leg; the card sum plus the shared
-    /// expert's output after them.
-    fn shadow_rows(&mut self, at: At) -> Result<(), GpuError> {
+    /// Whether `at`'s layer-batch picks into the residency pool: the call
+    /// streams, the layer has card experts, its mixer kind picks in a group
+    /// of this many units ([`pick_layer`]) and the unit holds at least
+    /// [`PICK_FLOOR`] columns, which no count could pass in fewer.
+    fn picks(&self, at: At) -> Result<bool, GpuError> {
+        let l = at.layer;
+        if !self.stream.on || !self.p.card.has(l) {
+            return Ok(false);
+        }
+        let kind = match self.p.cfg[l].kind.mixer {
+            MixerKind::DeltaRule => Kind::Kda,
+            MixerKind::Latent => Kind::Latent,
+            MixerKind::Gqa => {
+                return Err(shape(format!(
+                    "layer {l}: a GQA mixer, which glm5next has none of"
+                )));
+            }
+        };
+        Ok(pick_layer(kind, self.t.len()) && self.t[at.unit] >= PICK_FLOOR as usize)
+    }
+
+    /// `at`'s pick: the host waits for the front's download of the unit's
+    /// routed ids, counts them, and the residency machine's pick
+    /// (`SwapMachine::call_pick`, the least count admitted [`PICK_FLOOR`])
+    /// sends the pool's coldest residents to the host and copies the unit's
+    /// hottest host experts over them, in victim-slot order, a landing batch
+    /// a third of them; the host map and the card's copy of the layer's words
+    /// are moved at once, so the serve's union and the card route run under
+    /// the moved map. The pick's record is kept under the call's unit; its
+    /// landing batches are returned for the card route.
+    fn pick(
+        &mut self,
+        port: &mut BatchLeg<'_, HostRun>,
+        at: At,
+    ) -> Result<Vec<LandBatch>, GpuError> {
+        let key = port.key(at);
+        let stream = self.gpu.stream();
+        let st = &mut *self.stream;
+        let mut pick = port
+            .hybrid()
+            .call_pick_routed(stream, key, &mut st.counts, usize::MAX)?;
+        let land = std::mem::take(&mut pick.land);
+        st.picks.push((st.unit0 + at.unit, pick));
+        Ok(land)
+    }
+
+    /// `at`'s shared expert by chunk, into `sh_y`.
+    fn shared_expert(&mut self, at: At) -> Result<(), GpuError> {
         const W: &str = "glm5next prefill shadow";
         let l = at.layer;
         let (gpu, w, t) = (self.gpu, self.w, self.t[at.unit]);
         let stream = gpu.stream();
         let c = self.p.cfg[l];
         let n = self.p.d.embd;
-        let card = self.p.card.has(l);
-        let tiered = self.p.card.tier_k(l) > 0;
         let b = &mut *self.b;
-        let ub = &self.u[at.unit];
-        if card {
-            ffn::card_rows(
-                gpu,
-                w,
-                &mut self.p,
-                l,
-                CardRows {
-                    normed: &b.normed,
-                    ids: &b.ids,
-                    weights: &ub.weights,
-                    t,
-                    sel: &mut b.sel,
-                    tiles: &mut b.tiles,
-                    acc: &mut b.acc,
-                    tiered,
-                },
-            )?;
-        }
         let nm = ffn::moe_names(&self.p, l)?;
         let (g, u) = (weight(w, nm.sh_gate)?, weight(w, nm.sh_up)?);
         for (c0, cn) in chunks(t) {
@@ -2582,7 +2787,63 @@ impl PromptProgram<'_> {
                 &mut *span_mut(W, &mut b.sh_y, c0 * n, cn * n)?,
             )?;
         }
+        Ok(())
+    }
+
+    /// `at`'s card experts, where the slot map puts any, and its shared
+    /// expert by chunk, under its host leg; the card sum plus the shared
+    /// expert's output after them. Under a streaming call the layer is the
+    /// call's reader of its slots after its card route
+    /// (`SwapMachine::call_reader`), which the layer's next pick copies
+    /// behind; and where it picks ([`PromptProgram::picks`]) the shared expert
+    /// comes first, so the card runs it while the host counts and picks, then
+    /// the pick and the card route over its landing batches, each behind the
+    /// batch's own event.
+    fn shadow_rows(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        let (gpu, t) = (self.gpu, self.t[at.unit]);
+        let stream = gpu.stream();
+        let n = self.p.d.embd;
+        let card = self.p.card.has(l);
+        let tiered = self.p.card.tier_k(l) > 0;
+        let picks = self.picks(at)?;
+        if picks {
+            self.shared_expert(at)?;
+        }
+        if card {
+            let land = if picks {
+                self.pick(port, at)?
+            } else {
+                Vec::new()
+            };
+            let b = &mut *self.b;
+            let ub = &self.u[at.unit];
+            ffn::card_rows(
+                gpu,
+                self.w,
+                &mut self.p,
+                l,
+                CardRows {
+                    normed: &b.normed,
+                    ids: &b.ids,
+                    weights: &ub.weights,
+                    t,
+                    sel: &mut b.sel,
+                    tiles: &mut b.tiles,
+                    acc: &mut b.acc,
+                    tiered,
+                    land: &land,
+                },
+            )?;
+            if self.stream.on {
+                port.hybrid().call_reader(l, stream)?;
+            }
+        }
+        if !picks {
+            self.shared_expert(at)?;
+        }
         if card && !tiered {
+            let b = &mut *self.b;
             gpu.elem()
                 .enqueue_add(stream, &b.acc, &b.sh_y, t * n, &mut b.pre)?;
         }
@@ -2750,7 +3011,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
         }
         let enq = port.part_start();
         let r = self
-            .shadow_rows(at)
+            .shadow_rows(port, at)
             .and_then(|()| port.mark(at, Mark::Shadow as usize));
         port.part_end(at, enq);
         r

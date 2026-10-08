@@ -190,6 +190,16 @@
 //! reset` record (without the residency, the server's 501). `mid-…` set is
 //! refused by name beside `--prefill steps`, as the CLI refuses it.
 //!
+//! `BLOOMERY_XSTREAM` sets what each batched prompt call moves into the
+//! residency pool (`Body::set_xstream`, as `generate_glm5next` takes it):
+//! unset, `admit` under the residency machine and `off` where the load runs
+//! none (the `residency unset` record says why); set, as given, `admit`
+//! beside no residency and `split` refused by name. The load prints an
+//! `xstream=` line (the word, then why), and a streaming call prints a `call
+//! stream` record a pick and a `call stream end` record after it, with the
+//! call's `residency pass` records. The seat's prompt calls run one at a time
+//! on the engine thread, so no two calls stream at once.
+//!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70. The levers this seat acts on ([`ACTS_ON`]) are
@@ -283,6 +293,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
+    bloomery_levers::XSTREAM,
 ];
 
 /// The drafted window's verify: the target's next token and the draft's one
@@ -917,6 +928,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         residency,
         stats: levers.step_stats(),
         width,
+        xstream: levers.xstream(),
     };
     let engine = SeatEngine::spawn(
         move || Glm::open(open),
@@ -984,6 +996,9 @@ struct SeatArgs {
     /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
     /// chooser's (`cost`) or the draft's own (`fixed`).
     width: WidthMode,
+    /// `BLOOMERY_XSTREAM` as the binary parsed it; `None` follows the
+    /// residency ([`Body::resolve_xstream`]).
+    xstream: Option<&'static str>,
 }
 
 /// The GLM session on the engine thread: the session over the model, the
@@ -1060,6 +1075,12 @@ impl Glm {
             // must, and every call takes it.
             s.model_mut().body_parts(WHAT)?.2.log_residency(0);
         }
+        let line = s
+            .model_mut()
+            .body_parts(WHAT)?
+            .2
+            .resolve_xstream(a.xstream)?;
+        eprintln!("{line}");
         // The resident sequences, parked empty: the live slot keeps the
         // chains already captured, each parked slot capturing its own on its
         // first use.
@@ -1082,19 +1103,22 @@ impl Glm {
         })
     }
 
-    /// The `residency pass` records of the boundaries the last call made, on
-    /// stderr; nothing without the residency.
+    /// The last call's `call stream` and `call stream end` records, then the
+    /// `residency pass` records of the boundaries it made, on stderr; nothing
+    /// without the residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
         if !self.residency {
             return Ok(());
         }
-        for (kind, r) in self
-            .s
-            .model_mut()
-            .body_parts(WHAT)?
-            .2
-            .take_residency_passes()
-        {
+        let body = self.s.model_mut().body_parts(WHAT)?.2;
+        let (picks, end) = body.take_stream_records();
+        for (unit, p) in &picks {
+            record::call_stream(*unit, p).eprint();
+        }
+        if let Some(r) = end {
+            record::call_report(&r).eprint();
+        }
+        for (kind, r) in body.take_residency_passes() {
             record::residency_pass_of(kind, &r).eprint();
         }
         Ok(())

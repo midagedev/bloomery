@@ -44,7 +44,10 @@
 //! every sum from 2^-42 up. The two agree bit for bit unless all eight
 //! sigmoid scores sit below that: a named difference.
 
+use std::mem::ManuallyDrop;
+
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::xstream::LandBatch;
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
     Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, SelDown, TileGather,
@@ -52,7 +55,7 @@ use bloomery_gpu::kquant::{
 };
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, window};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -586,7 +589,9 @@ fn card_slots(
 /// A prompt batch's card slots ([`card_rows`]): the batch's `t` normed rows
 /// and their routing, the places the call writes, the grouped path's scratch
 /// and the card sums, `t` rows. On a `tiered` layer no card sum is written:
-/// the back's sums the scratch's downs with the tier's rows.
+/// the back's sums the scratch's downs with the tier's rows. `land` is the
+/// layer's pick's landing batches (`HostTier::call_pick_routed`), the leading
+/// one first; empty, the stack's pass runs whole over the slot map's row.
 pub(crate) struct CardRows<'a> {
     pub normed: &'a DeviceBuffer<f32>,
     pub ids: &'a DeviceBuffer<u32>,
@@ -596,6 +601,7 @@ pub(crate) struct CardRows<'a> {
     pub tiles: &'a mut CardTiles,
     pub acc: &'a mut DeviceBuffer<f32>,
     pub tiered: bool,
+    pub land: &'a [LandBatch],
 }
 
 /// The grouped path's scratch for prompt batches of up to `cap` tokens of
@@ -605,12 +611,14 @@ pub(crate) struct CardRows<'a> {
 /// tiles — the gate·up rows by entry and their q8_1 form), the entries'
 /// gathered Walk A planes, and the downs by slot, slot-major from the
 /// batch's first slot (the tier layers' back reads them beside the tier's
-/// rows). Its bytes are [`card_tile_bytes`]'s, which the plan reserves.
+/// rows), and the places of one landing batch of a pick (`bsel`, a word a
+/// slot). Its bytes are [`card_tile_bytes`]'s, which the plan reserves.
 pub(crate) struct CardTiles {
     act_x: Q8Act,
     tile: TileScratch,
     ord: EntryPlanes,
     down: DeviceBuffer<f32>,
+    bsel: DeviceBuffer<u32>,
 }
 
 impl CardTiles {
@@ -630,6 +638,7 @@ impl CardTiles {
             tile: TileScratch::new(stream, slots, ff)?,
             ord: EntryPlanes::new(stream, slots, n_embd)?,
             down: DeviceBuffer::zeroed(stream, slots * n_embd)?,
+            bsel: DeviceBuffer::zeroed(stream, slots)?,
         };
         let want = card_tile_bytes(n_embd, ff, N_USED, cap);
         if t.bytes() != want {
@@ -651,6 +660,7 @@ impl CardTiles {
             + self.tile.device_bytes()
             + self.ord.device_bytes()
             + self.down.num_bytes()
+            + self.bsel.num_bytes()
     }
 
     /// The downs of the last batch, by slot.
@@ -670,8 +680,14 @@ impl CardTiles {
 /// rows to its slot — and the card sums (`ds41_ffn_card_acc_8`). Each slot
 /// and token is what the one-token launches write for it (the grouped
 /// entries are the `_sel`s' bit for bit), the host's slots left alone; each
-/// weight row is read once for up to eight of an expert's slots. Refused by
-/// name on a layer without card experts.
+/// weight row is read once for up to eight of an expert's slots. Under a
+/// pick (`io.land`) the table and the tile passes run once a landing batch
+/// over the batch's own places (`bsel`: the map row of the batch with every
+/// expert outside it [`HOST`](bloomery_gpu::hybrid::HOST)), each behind the
+/// batch's event on the copy stream, so the copies and the passes pipeline;
+/// an expert is in one batch only, so every slot's entry is the unbatched
+/// pass's, and the sums read the places of the slot map as the pick left it.
+/// Refused by name on a layer without card experts.
 pub(crate) fn card_rows(
     gpu: &Gpu,
     w: &Weights,
@@ -680,6 +696,17 @@ pub(crate) fn card_rows(
     io: CardRows<'_>,
 ) -> Result<(), GpuError> {
     const W: &str = "glm5next card_rows";
+    let CardRows {
+        normed,
+        ids,
+        weights,
+        t,
+        sel,
+        tiles: tl,
+        acc,
+        tiered,
+        land,
+    } = io;
     let stream = gpu.stream();
     let n = p.d.embd;
     let fault = gpu.layer_sink(l)?;
@@ -690,72 +717,103 @@ pub(crate) fn card_rows(
         missing: "card experts on the layer",
     })?;
     let st = CardStacks::of(w, l)?;
-    let t = io.t;
     let slots = t * N_USED;
-    k.batch.enqueue_places(
-        stream,
-        &Places {
-            ids: io.ids,
-            n: slots,
-            map: p.slots.buf(),
-            row_off: c.row_off,
-            n_expert: N_EXPERT,
-        },
-        fault,
-        &mut *io.sel,
-    )?;
-    let sel: &DeviceBuffer<u32> = &*io.sel;
-    let tl = &mut *io.tiles;
-    gpu.enqueue_quantize_q8_1_cols(io.normed, &mut tl.act_x, t, l)?;
-    tl.tile.enqueue_table(gpu, sel, slots, cl.n_card, fault)?;
-    let g = TileGather {
-        x: &tl.act_x,
-        cols: t,
-        slots_per_col: N_USED,
-        table: tl.tile.table(slots, cl.n_card),
+    let places = |map: &DeviceBuffer<u32>, row_off: usize, out: &mut DeviceBuffer<u32>| {
+        k.batch.enqueue_places(
+            stream,
+            &Places {
+                ids,
+                n: slots,
+                map,
+                row_off,
+                n_expert: N_EXPERT,
+            },
+            fault,
+            out,
+        )
     };
-    k.tiles
-        .enqueue_card_gather(stream, &g, fault, &mut tl.ord)?;
-    match st.gate.ty {
-        GgmlType::Q4_K | GgmlType::Q5_K => {
-            let (table, h) = tl.tile.table_and_h(slots, cl.n_card);
-            let a = TiledGateUpAct {
-                wg: st.gate.w,
-                wu: st.up.w,
-                act: &tl.ord,
-                table,
-                rows_per_expert: k.ff,
-                rule: Act::SwigluClamp { limit: cl.limit },
-            };
-            k.tiles
-                .enqueue_gate_up_tiles(stream, st.gate.ty, &a, fault, h)?;
+    places(p.slots.buf(), c.row_off, &mut *sel)?;
+    let CardTiles {
+        act_x,
+        tile,
+        ord,
+        down,
+        bsel,
+    } = &mut *tl;
+    gpu.enqueue_quantize_q8_1_cols(normed, act_x, t, l)?;
+    let act_x: &Q8Act = act_x;
+    // The table over `sel`'s places and the tile passes behind it: the whole
+    // stack's, or one landing batch's.
+    let pass = |tile: &mut TileScratch,
+                ord: &mut EntryPlanes,
+                down: &mut DeviceBuffer<f32>,
+                sel: &DeviceBuffer<u32>|
+     -> Result<(), GpuError> {
+        tile.enqueue_table(gpu, sel, slots, cl.n_card, fault)?;
+        let g = TileGather {
+            x: act_x,
+            cols: t,
+            slots_per_col: N_USED,
+            table: tile.table(slots, cl.n_card),
+        };
+        k.tiles.enqueue_card_gather(stream, &g, fault, ord)?;
+        match st.gate.ty {
+            GgmlType::Q4_K | GgmlType::Q5_K => {
+                let (table, h) = tile.table_and_h(slots, cl.n_card);
+                let a = TiledGateUpAct {
+                    wg: st.gate.w,
+                    wu: st.up.w,
+                    act: &*ord,
+                    table,
+                    rows_per_expert: k.ff,
+                    rule: Act::SwigluClamp { limit: cl.limit },
+                };
+                k.tiles
+                    .enqueue_gate_up_tiles(stream, st.gate.ty, &a, fault, h)?;
+            }
+            _ => return Err(unrun(&st.gate)),
         }
-        _ => return Err(unrun(&st.gate)),
+        tile.enqueue_quantize_h(gpu, slots, cl.n_card, fault)?;
+        let d = tile.down(st.down.w, n, slots, cl.n_card);
+        match st.down.ty {
+            GgmlType::Q5_K => k.tiles.enqueue_gemv_q5k_tiles(stream, &d, fault, down),
+            GgmlType::Q4_K => gpu
+                .q4k_sel()
+                .enqueue_gemv_q4k_tiles(stream, &d, fault, down),
+            _ => Err(unrun(&st.down)),
+        }
+    };
+    if land.is_empty() {
+        pass(tile, ord, down, &*sel)?;
+    } else {
+        let ctx = gpu.context();
+        for b in land {
+            if let Some(e) = b.event.as_deref() {
+                stream.wait(e)?;
+            }
+            // SAFETY: the batch's map row is `N_EXPERT` words of its
+            // host-mapped row (`LandBatch`), filled before this launch was
+            // enqueued and rewritten only by the layer's next pick, which
+            // waits for the reader the caller records after this route.
+            let bmap = unsafe { window::<u32>(b.map, N_EXPERT, ctx) };
+            let ran = places(&bmap, 0, &mut *bsel).and_then(|()| pass(tile, ord, down, &*bsel));
+            drop(ManuallyDrop::into_inner(bmap).into_raw_parts());
+            ran?;
+        }
     }
-    tl.tile.enqueue_quantize_h(gpu, slots, cl.n_card, fault)?;
-    let d = tl.tile.down(st.down.w, n, slots, cl.n_card);
-    match st.down.ty {
-        GgmlType::Q5_K => k
-            .tiles
-            .enqueue_gemv_q5k_tiles(stream, &d, fault, &mut tl.down)?,
-        GgmlType::Q4_K => gpu
-            .q4k_sel()
-            .enqueue_gemv_q4k_tiles(stream, &d, fault, &mut tl.down)?,
-        _ => return Err(unrun(&st.down)),
-    }
-    if io.tiered {
+    if tiered {
         return Ok(());
     }
-    let acc = CardAcc {
-        down: &tl.down,
-        w: io.weights,
-        sel,
+    let a = CardAcc {
+        down: &*down,
+        w: weights,
+        sel: &*sel,
         n,
         m: t,
         n_card: cl.n_card,
         n_used: N_USED,
     };
-    k.batch.enqueue_card_acc(stream, &acc, &mut *io.acc)
+    k.batch.enqueue_card_acc(stream, &a, acc)
 }
 
 /// A stack whose type [`card_routed`] names but no launch here runs.

@@ -156,7 +156,10 @@ gpu-deepseek41 426 48 0
 # batch rows back from their raw device addresses (one cuMemcpyDtoDAsync block, the same form as gate_xstream's),
 # with its SAFETY line.
 gpu-gates 63 5 1
-gpu-glm5next 4 0 0
+# PIN(2026-10-08): gpu-glm5next 4 -> 5 blocks, new code, not old code relaxed: ffn.rs card_rows takes a window over
+# each landing batch's host-mapped map row (the same block Qwen3.8's wide38.rs carries; O2's LandBatch::window() in
+# the owner removes both), with its SAFETY line.
+gpu-glm5next 5 0 0
 gpu-vision 48 0 0
 hf 0 0 0
 jinja 0 0 0

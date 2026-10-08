@@ -127,12 +127,27 @@
 //! the host. Refused by name beside `--pair`, the route trace and
 //! `--prefill steps`.
 //!
+//! `BLOOMERY_XSTREAM` sets what each batched prompt call moves into the
+//! residency pool (`Body::set_xstream`): `off`, the decode steps' placement,
+//! or `admit`, where each routed layer-batch of a call of 32 ids or more picks
+//! its unit's hottest host experts into the pool before its card route
+//! (`host::swap` call mode; `bloomery_gpu_glm5next::prefill`'s module doc),
+//! and the call's picks stay for the decode after it. Unset it is `admit`
+//! under a residency and `off` without one; `admit` beside no residency is
+//! refused by name, and so is `split` (no unit of this model lights the
+//! stream's ring). The run prints an `xstream=` line (the word, then why)
+//! after its load lines, and a streaming call a `call stream` record a pick
+//! (its `group` the call's batch) and a `call stream end` record after its
+//! `step 0` line.
+//!
 //! `BLOOMERY_STEP_STATS=1` reads the host tier before the first generated
 //! step and after each (`host_stats::Probe`) and prints, after `SMOKE`, a
 //! `stat step` record a step past `--warm` and one `stat summary` (kinds
 //! `stat_step_host`, `stat_summary_host`: each step's host leg, served slots, straggle and go-wait gaps). It also arms the batch walks' timing
 //! (`bloomery_gpu_glm5next::set_prompt_stats`): after a batched prompt's
-//! `step 0` line, one `stat prompt lb` a routed layer-batch and the `stat
+//! `step 0` line, one `stat prefill` (the host tier's batch services over the
+//! call: layers, columns, host slots, the union calls' wall), then one `stat
+//! prompt lb` a routed layer-batch and the `stat
 //! prompt split` over them (`record::prompt_stats`; its `fault_ms` and
 //! `ckpt_ms` the call's fault reads and checkpoint waits). Refused
 //! by name beside the MTP draft.
@@ -219,6 +234,7 @@ mod cli {
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{
         Diag, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table, dump_table,
@@ -232,7 +248,7 @@ mod cli {
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
         MTP_WIDTH, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy,
-        STEP_STATS,
+        STEP_STATS, XSTREAM,
     };
     use gguf::Split;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
@@ -255,6 +271,7 @@ mod cli {
         PREFILL_GROUP,
         LANE_PREFETCH,
         GEN_SLOTS,
+        XSTREAM,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
@@ -743,6 +760,12 @@ mod cli {
                 .2
                 .log_residency(boundaries);
         }
+        let line = s
+            .model_mut()
+            .body_parts("generate_glm5next")?
+            .2
+            .resolve_xstream(levers.xstream())?;
+        println!("{line}");
         if slots > 1 {
             s.add_slots(slots)?;
             let arm = SlotsArm {
@@ -887,6 +910,24 @@ mod cli {
         Probe::read(m.body("generate_glm5next")?.hybrid(), m.gpu(), prev)
     }
 
+    /// The host tier's batch services since `base`, the call's start, one
+    /// line: the layers served, the columns and host slots they carried and
+    /// the union calls' wall — the part of a batched feed the card waits on
+    /// the host.
+    fn print_union(m: &Glm5nextModel, base: &HybridStats) -> Result<(), GateError> {
+        let s = m.body("generate_glm5next")?.hybrid().stats();
+        Record::new(&record::STAT_PREFILL)
+            .u("union_layers", s.batch_served - base.batch_served)
+            .u("union_cols", s.batch_cols - base.batch_cols)
+            .u(
+                "union_host_slots",
+                s.batch_host_slots - base.batch_host_slots,
+            )
+            .f("union_ms", (s.batch_ns - base.batch_ns) as f64 / 1e6)
+            .print();
+        Ok(())
+    }
+
     fn fed(ids: &[u32]) {
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids
@@ -900,6 +941,24 @@ mod cli {
             .list("last", &tail)
             .u("depth_sequence_from", ids.len())
             .print();
+    }
+
+    /// The last prompt call's streaming records: a `call stream` record a
+    /// pick, its unit the call's batch, and the `call stream end` record;
+    /// none after a call that did not stream.
+    fn print_stream(s: &mut Session<Body>) -> Result<(), GateError> {
+        let (picks, end) = s
+            .model_mut()
+            .body_parts("generate_glm5next")?
+            .2
+            .take_stream_records();
+        for (unit, p) in &picks {
+            record::call_stream(*unit, p).print();
+        }
+        if let Some(r) = end {
+            record::call_report(&r).print();
+        }
+        Ok(())
     }
 
     /// The residency views of `s`'s body ([`Residence`]): its stage card's
@@ -949,6 +1008,7 @@ mod cli {
         stats: bool,
     ) -> Result<(), GateError> {
         fed(a.ids);
+        let base = s.model().body("generate_glm5next")?.hybrid().stats();
         let t_feed = Instant::now();
         if a.prefill == PrefillMode::Steps {
             let pos = s.pos();
@@ -970,11 +1030,15 @@ mod cli {
             .u("fed", a.ids.len())
             .f("feed_s", feed.as_secs_f64())
             .print();
+        if stats && a.prefill == PrefillMode::Batch {
+            print_union(s.model(), &base)?;
+        }
         if let Some(st) = bloomery_gpu_glm5next::take_prompt_stats(s.model_mut())? {
             for r in record::prompt_stats(&st) {
                 r.print();
             }
         }
+        print_stream(s)?;
         if let (true, Some(p)) = (dump_now, diag.dump_table.as_deref()) {
             dump_table(&residence(s)?, p)?.print();
         }
@@ -1181,6 +1245,7 @@ mod cli {
             .u("fed", a.ids.len())
             .f("feed_s", feed.as_secs_f64())
             .print();
+        print_stream(s)?;
         let mut sink = Windows {
             kept: Vec::with_capacity(a.n_gen + VERIFY_ROWS),
             passes: Vec::with_capacity(a.n_gen),
@@ -1320,6 +1385,7 @@ mod cli {
                 .u("fed", w.len())
                 .f("feed_s", wall.as_secs_f64())
                 .print();
+            print_stream(s)?;
             first.push(tok);
             pos0.push(s.pos());
             feeds.push((w.len(), passes, wall));

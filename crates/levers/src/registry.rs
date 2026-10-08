@@ -572,7 +572,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means(
             "Qwen3.8 (`generate_qwen3moe`): `split` under `--place a` with a residency (`admit` when \
              the card has no room for the ring), `admit` under `--place bp` with one, `off` \
-             everywhere else",
+             everywhere else; GLM-5.3-Flash (`generate_glm5next`, the GLM seat of \
+             `bloomery-serve`): `admit` under a residency, `off` without one",
         ),
         doc: "Qwen3.8 prompt calls fed by ubatches under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
@@ -592,7 +593,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               serves no expert tier), `off` everywhere else; `admit` and `split` are refused by \
               name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` on \
               a load with an expert tier. The load line prints `xstream=`, \
-              every streamed layer an `xstream` record, every call `xstream end`.",
+              every streamed layer an `xstream` record, every call `xstream end`. \
+              GLM-5.3-Flash batched prompt calls of at least 32 ids \
+              (`bloomery_gpu_glm5next::PICK_FLOOR`) under a residency take `admit` per unit of \
+              the call's batches: each KDA layer's unit picks before its card route (a latent \
+              layer's only in a group of one batch), the card route running behind each landing \
+              batch's event, and the call's picks stay for the decode after it. `split` is \
+              refused by name there (no unit of at most 512 columns lights the ring), and so is \
+              `admit` beside no residency; the load line prints `xstream=`, every pick a `call \
+              stream` record, every call `call stream end`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

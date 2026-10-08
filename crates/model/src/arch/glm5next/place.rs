@@ -198,13 +198,30 @@ pub const fn unit_bytes(n: usize, cap: usize, streams: usize, used: usize, tiere
 
 /// Card bytes of the card experts' grouped scratch for prompt batches of up
 /// to `cap` tokens of `n` values through routed experts of `ff` rows, `used`
-/// slots a token ([`workstation::walk_a_tile_scratch_bytes`]). The one
+/// slots a token ([`workstation::walk_a_tile_scratch_bytes`]), and the places
+/// of one landing batch of a call's pick, a word a slot (`bsel`). The one
 /// formula of those bytes: the card body's scratch checks its made bytes
 /// against it.
 #[must_use]
 pub fn card_tile_bytes(n: usize, ff: usize, used: usize, cap: usize) -> usize {
     let b = workstation::walk_a_tile_scratch_bytes(n as u64, ff as u64, used as u64, cap as u64);
-    usize::try_from(b).unwrap_or(usize::MAX)
+    usize::try_from(b)
+        .unwrap_or(usize::MAX)
+        .saturating_add(4 * used * cap)
+}
+
+/// Whether a routed layer of mixer `kind` picks into the residency pool in a
+/// prompt group of `units` batches: a KDA layer always, a latent layer only
+/// alone. In a group of two or more, the next unit's front is enqueued behind
+/// the landing waits of the pick's GEMM batches, and a latent front (the
+/// absorbed attention) is several times a KDA front, so a latent layer's
+/// copies would stall the pair past the union they hide under [derived].
+#[must_use]
+pub const fn pick_layer(kind: Kind, units: usize) -> bool {
+    match kind {
+        Kind::Kda => true,
+        Kind::Latent => units == 1,
+    }
 }
 
 /// The card bytes the plan reserves on the stage card for a load of `hp`'s
@@ -1032,7 +1049,7 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 mod tests {
     use super::{
         KdaLanes, Kind, KvBytes, KvLayout, NextnKv, PROMPT_GROUP, card_tile_bytes, group_sets,
-        groups, recurrent_bytes, row_bytes, seq_terms, stage_term, unit_bytes,
+        groups, pick_layer, recurrent_bytes, row_bytes, seq_terms, stage_term, unit_bytes,
     };
 
     /// A call's batches cut into groups: runs of `g`, a lone last batch
@@ -1082,13 +1099,39 @@ mod tests {
     /// columns: 4,096 slots): the rows' q8_1 6,619,136 B, the table's order
     /// 16,384, starts 4,100 and 1,409 tile words 5,636, the entries' Walk A
     /// planes 4,096 · 4,736 = 19,398,656, the SwiGLU rows 33,554,432 and their
-    /// q8_1 26,476,544, the downs 67,108,864.
+    /// q8_1 26,476,544, the downs 67,108,864, and the pick's batch places, a
+    /// word a slot, 4,096 · 4 = 16,384.
+    /// PIN(2026-10-08): the sum gained the batch places (`bsel`), 16,384 B at
+    /// these sizes, when a prompt call's pick landed on the grouped path; no
+    /// other term moved.
     #[test]
     fn card_tile_scratch_bytes() {
         assert_eq!(
             card_tile_bytes(4096, 2048, 8, 512),
-            6_619_136 + 16_384 + 4_100 + 5_636 + 19_398_656 + 33_554_432 + 26_476_544 + 67_108_864
+            6_619_136
+                + 16_384
+                + 4_100
+                + 5_636
+                + 19_398_656
+                + 33_554_432
+                + 26_476_544
+                + 67_108_864
+                + 16_384
         );
+    }
+
+    /// Which routed layers pick into the residency pool in a prompt group: a
+    /// KDA layer at any group size, a latent layer only in a group of one.
+    #[test]
+    fn pick_layers_by_group() {
+        for units in 1..=9 {
+            assert!(pick_layer(Kind::Kda, units), "a KDA layer at {units}");
+            assert_eq!(
+                pick_layer(Kind::Latent, units),
+                units == 1,
+                "latent at {units}"
+            );
+        }
     }
 
     /// GLM-5.3-Flash's sizes: a KDA layer holds one lane of 64 heads of 128

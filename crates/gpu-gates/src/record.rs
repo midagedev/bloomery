@@ -2864,8 +2864,9 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 /// `capture` lines `generate_glm5next` prints, the host set's records of a
 /// placed load, the draft's load line and its verify's capture, the
 /// listening line, the reuse records the checkpoint rule answers, the
-/// draft's joins, the residency machine's records, and the rounds of several
-/// slots a `BLOOMERY_STEP_STATS` run counts.
+/// draft's joins, a streaming prompt call's picks and end, the residency
+/// machine's records, and the rounds of several slots a `BLOOMERY_STEP_STATS`
+/// run counts.
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
@@ -2884,6 +2885,8 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &LISTENING_GLM,
     &CACHE_REUSE,
     &MTP_PROMPT,
+    &CALL_STREAM,
+    &CALL_STREAM_END,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
@@ -2908,8 +2911,11 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &ARM,
     &FED,
     &STEP0,
+    &STAT_PREFILL,
     &STAT_PROMPT_LB,
     &STAT_PROMPT_SPLIT,
+    &CALL_STREAM,
+    &CALL_STREAM_END,
     &TIME_PROMPT,
     &STEP,
     &TIME_STEP,

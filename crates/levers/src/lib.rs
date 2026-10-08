@@ -859,9 +859,10 @@ impl Levers {
         }
     }
 
-    /// `BLOOMERY_XSTREAM`: what a Qwen3.8 prompt call moves — `off`, `admit`
-    /// (the residency's pick) or `split` (the pick, then the expert stream);
-    /// `None` when unset, which the binary resolves.
+    /// `BLOOMERY_XSTREAM`: what a Qwen3.8 or GLM-5.3-Flash prompt call moves
+    /// — `off`, `admit` (the residency's pick) or `split` (the pick, then the
+    /// expert stream; Qwen3.8 only); `None` when unset, which the binary
+    /// resolves.
     #[must_use]
     pub fn xstream(&self) -> Option<&'static str> {
         self.word(XSTREAM)
