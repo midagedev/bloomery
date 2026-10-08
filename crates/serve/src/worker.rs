@@ -34,7 +34,7 @@ use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -147,6 +147,15 @@ pub(crate) struct Shared {
     /// The orderly stop's order to the engine thread: read between engine
     /// calls ([`Worker::run`], [`Worker::run_turns`]), it ends the thread.
     stop: AtomicBool,
+    /// The engine thread left its loop ([`worker::serve`], on every path that
+    /// ends its run: the stop's [`Worker::halt`], an engine failure, a caught
+    /// panic), set before the engine it holds drops: what the orderly stop
+    /// waits for ([`crate::api::exit_shutdown`]), not the thread's end, which
+    /// the engine's Drop can hold past the stop's bound while the process
+    /// exit reclaims the engine's memory anyway.
+    loop_ended: Mutex<bool>,
+    /// Wakes [`Shared::wait_loop_end`].
+    loop_ended_c: Condvar,
     /// Each slot's turn, for an engine whose slots take turns; `None` for any
     /// other.
     pub turns: Mutex<Option<Vec<Turn>>>,
@@ -168,6 +177,8 @@ impl Shared {
             fatal: Mutex::new(None),
             stopping: Mutex::new(None),
             stop: AtomicBool::new(false),
+            loop_ended: Mutex::new(false),
+            loop_ended_c: Condvar::new(),
             turns: Mutex::new(None),
             end,
             sampler,
@@ -182,6 +193,27 @@ impl Shared {
     /// Whether the engine thread was told to stop.
     pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+
+    /// The engine thread left its loop ([`Worker::run`] and
+    /// [`Worker::run_turns`] returned): what the orderly stop waits for ends
+    /// here. Called on every path that ends the thread's run, before the
+    /// engine it holds drops — its Drop can outlast the stop's bound (a host
+    /// tier's pinned pages freed, its threads joined), and the process exit
+    /// reclaims the engine's memory anyway.
+    pub(crate) fn end_loop(&self) {
+        *relock(&self.loop_ended) = true;
+        self.loop_ended_c.notify_all();
+    }
+
+    /// Whether the engine thread left its loop within `bound`.
+    pub(crate) fn wait_loop_end(&self, bound: Duration) -> bool {
+        let left = relock(&self.loop_ended);
+        let (left, _) = self
+            .loop_ended_c
+            .wait_timeout_while(left, bound, |left| !*left)
+            .unwrap_or_else(|e| e.into_inner());
+        *left
     }
 
     /// Begins the server's orderly stop, the one owner `POST /shutdown` and
@@ -323,6 +355,9 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
             w.run();
         }
     }));
+    // The stop's wait ends here: past this point the thread only books a
+    // caught panic and drops the engine it holds, which no stop waits for.
+    sh.end_loop();
     if let Err(p) = ran {
         let what = p
             .downcast_ref::<&str>()

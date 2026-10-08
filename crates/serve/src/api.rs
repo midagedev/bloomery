@@ -342,9 +342,11 @@ impl Server {
 
     /// Starts the engine thread and the accept loop, which serves connections,
     /// one thread each and at most [`MAX_CONNECTIONS`] at once, until the
-    /// listener fails; returns the server's state, what ends it and the engine
-    /// thread, which an orderly stop waits for.
-    fn start(self) -> io::Result<(Arc<State>, mpsc::Receiver<End>, thread::JoinHandle<()>)> {
+    /// listener fails; returns the server's state and what ends it. The
+    /// engine thread owns the engine from here and runs detached (its handle
+    /// dropped): an orderly stop waits for the loop it leaves
+    /// ([`Shared::wait_loop_end`]), never for the thread's end.
+    fn start(self) -> io::Result<(Arc<State>, mpsc::Receiver<End>)> {
         let Server {
             listener,
             state,
@@ -352,7 +354,7 @@ impl Server {
             slot,
         } = self;
         let shared = Arc::clone(&state.shared);
-        let engine = thread::Builder::new()
+        thread::Builder::new()
             .name("serve-engine".to_owned())
             .spawn(move || worker::serve(slot, shared))
             .map_err(|e| {
@@ -362,7 +364,7 @@ impl Server {
         accept(listener, state.shared.end.clone(), move |stream| {
             keep_alive(stream, |req, w| route(&conn_state, req, w));
         });
-        Ok((state, ended, engine))
+        Ok((state, ended))
     }
 
     /// Serves until the listener fails, the engine does, or the server is
@@ -380,14 +382,14 @@ impl Server {
                 }
             }
         });
-        let (state, ended, engine) = match self.start() {
+        let (state, ended) = match self.start() {
             Ok(s) => s,
             Err(e) => return ServeError::Io(e),
         };
         // `state` holds a sender, so the channel cannot close while we wait.
         match wait_end(&ended, state.fatal_linger) {
             Ended::Error(e) => e,
-            Ended::Stop(cause) => exit_shutdown(&cause, Some(engine)),
+            Ended::Stop(cause) => exit_shutdown(&cause, Some(&state.shared)),
         }
     }
 
@@ -664,12 +666,15 @@ pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
 
 // ---------------------------------------------------------------- orderly stop
 
-/// How long an orderly stop waits for the engine thread to end. The worker
-/// checks the stop between engine calls, so the wait covers the one call it
-/// can be inside of when the stop arrives — a whole-prompt call at a slot's
-/// full context, the longest single call the seats run — plus the booking of
-/// the requests it ends; every seat's decode step sits far under it. A thread
-/// past the bound is named on the exit line and left to the process exit.
+/// How long an orderly stop waits for the engine thread to leave its loop
+/// ([`Shared::wait_loop_end`]). The worker checks the stop between engine
+/// calls, so the wait covers the one call it can be inside of when the stop
+/// arrives — a whole-prompt call at a slot's full context, the longest single
+/// call the seats run — plus the booking of the requests it ends; every
+/// seat's decode step sits far under it. The engine's Drop after the loop is
+/// not waited for: freeing a host tier's pinned pages and joining its
+/// threads can outlast the bound, and the process exit reclaims the engine's
+/// memory anyway.
 const ENGINE_STOP: Duration = Duration::from_secs(5);
 
 /// The signal handlers' whole state, the only things a handler touches: the
@@ -776,12 +781,14 @@ extern "C" fn on_signal(sig: libc::c_int) {
 }
 
 /// The orderly stop's last act, the one owner of the process's exit: one
-/// stderr line naming the cause — and whether the engine thread ended, when
-/// there is one to wait for — then success. Called from `run`, after the
-/// stop's initiator already refused new work and told the engine thread to
-/// end, so no seat's `Ok(server.run())` return is reached by it.
-pub(crate) fn exit_shutdown(cause: &Stop, engine: Option<thread::JoinHandle<()>>) -> ! {
-    let ended = engine.map(|mut e| wait_engine_stop(&mut e));
+/// stderr line naming the cause — and whether the engine thread left its
+/// loop, when there is one to wait for — then success. Called from `run`,
+/// after the stop's initiator already refused new work and told the engine
+/// thread to end, so no seat's `Ok(server.run())` return is reached by it.
+/// The engine's Drop is left to run beside the exit: the wait ends at the
+/// loop ([`Shared::wait_loop_end`]), not at the thread's end.
+pub(crate) fn exit_shutdown(cause: &Stop, shared: Option<&Shared>) -> ! {
+    let ended = shared.map(|sh| sh.wait_loop_end(ENGINE_STOP));
     let tail = match ended {
         Some(false) => {
             format!(
@@ -793,20 +800,6 @@ pub(crate) fn exit_shutdown(cause: &Stop, engine: Option<thread::JoinHandle<()>>
     };
     eprintln!("bloomery-serve: shutdown ({cause}){tail}");
     std::process::exit(0)
-}
-
-/// Waits at most [`ENGINE_STOP`] for the engine thread to end: polling its
-/// handle, for std joins no wait but the blocking one. `false` when the bound
-/// ran out — the thread is mid-call, and the exit takes the process anyway.
-fn wait_engine_stop(engine: &mut thread::JoinHandle<()>) -> bool {
-    let until = Instant::now() + ENGINE_STOP;
-    while !engine.is_finished() {
-        if Instant::now() >= until {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    true
 }
 
 /// The message of the 503 every request that needs the engine gets once the
@@ -3108,7 +3101,8 @@ mod tests {
     /// request after it is a 503 naming the shutdown (pinned: the listener
     /// stands while the stop runs — the exit belongs to `run`, which no test
     /// enters — so the refusal the client reads is the gate's 503, not a
-    /// refused connection). The engine thread ends on its own.
+    /// refused connection). The engine thread leaves its loop on its own; its
+    /// end, the engine's Drop, is the process exit's.
     #[test]
     fn posted_shutdown_stops_the_server() {
         let config = ServerConfig {
@@ -3128,7 +3122,7 @@ mod tests {
         let server = Server::bind("127.0.0.1:0", Box::new(crate::MockEngine::new(64)), config)
             .expect("bind");
         let addr = server.local_addr().expect("addr");
-        let (_state, ended, engine) = server.start().expect("start");
+        let (state, ended) = server.start().expect("start");
 
         let (status, body) = roundtrip(addr, "POST", "/shutdown", "");
         assert_eq!(status, 200, "{body}");
@@ -3160,9 +3154,10 @@ mod tests {
             "the 503 names the shutdown: {message}"
         );
 
-        engine
-            .join()
-            .expect("the engine thread ends once the stop reaches it");
+        assert!(
+            state.shared.wait_loop_end(Duration::from_secs(5)),
+            "the engine thread leaves its loop once the stop reaches it"
+        );
     }
 
     /// The media mock whose two slots take it in turns, parked as `park`.
@@ -3218,5 +3213,201 @@ mod tests {
         assert!(check_slots(&Turned(media(), states), &slots(2)).is_ok());
         let text = Turned(crate::MockEngine::new(64), Park::Ids);
         assert!(check_slots(&text, &slots(2)).is_ok());
+    }
+
+    /// The orderly stop's wait on the engine thread — what it waits for (the
+    /// loop's end, between engine calls) and what it does not (the engine's
+    /// Drop, which can outlast it) — pinned at a small scale:
+    /// [`ENGINE_STOP`]'s policy without spending its seconds. The servers
+    /// start the way `run` starts them ([`Server::start`]); the engines are
+    /// mocks owned by these gates alone.
+    mod stop_wait {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        use crate::Engine;
+        use crate::MockTokenizer;
+        use crate::Tokenizer;
+        use crate::api::{FATAL_LINGER, Server, ServerConfig, Shared, Stop, relock};
+        use crate::genloop::Slot;
+        use crate::sched::Reserve;
+        use crate::worker::{Acted, Action};
+
+        /// The waits' bound in these gates: past it, a call the stop arrives
+        /// in is reported; the engine's Drop is made to outlast it.
+        const BOUND: Duration = Duration::from_millis(400);
+
+        /// An engine whose Drop sleeps `ms`, as a placed engine's does (a
+        /// host tier's pinned pages freed, its threads joined), then notes
+        /// that it finished: work that outlives the stop's bound with no call
+        /// running.
+        struct SlowDrop {
+            ms: u64,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Engine for SlowDrop {
+            fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+                Arc::new(MockTokenizer)
+            }
+            fn prefill(&mut self, _ids: &[u32]) -> Result<(), crate::EngineError> {
+                Ok(())
+            }
+            fn next(
+                &mut self,
+                _last: u32,
+                _out: Option<&mut [f32]>,
+            ) -> Result<u32, crate::EngineError> {
+                Ok(7)
+            }
+            fn reset(&mut self) -> Result<(), crate::EngineError> {
+                Ok(())
+            }
+            fn ctx_max(&self) -> usize {
+                4096
+            }
+            fn describe(&self) -> String {
+                "the slow-drop mock".to_owned()
+            }
+        }
+
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(self.ms));
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// An engine whose prompt call blocks until its `go` channel opens:
+        /// the call a stop arrives inside.
+        struct Blocked {
+            go: mpsc::Receiver<()>,
+        }
+
+        impl Engine for Blocked {
+            fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+                Arc::new(MockTokenizer)
+            }
+            fn prefill(&mut self, _ids: &[u32]) -> Result<(), crate::EngineError> {
+                let _ = self.go.recv();
+                Ok(())
+            }
+            fn next(
+                &mut self,
+                _last: u32,
+                _out: Option<&mut [f32]>,
+            ) -> Result<u32, crate::EngineError> {
+                Ok(7)
+            }
+            fn reset(&mut self) -> Result<(), crate::EngineError> {
+                Ok(())
+            }
+            fn ctx_max(&self) -> usize {
+                4096
+            }
+            fn describe(&self) -> String {
+                "the blocked mock".to_owned()
+            }
+        }
+
+        /// A server on `engine`, its engine thread started the way `run`
+        /// starts it; the shared its stop waits on. Nothing is asked of the
+        /// listener, and the engine thread ends detached, as there.
+        fn started(engine: Box<dyn Engine>) -> Arc<Shared> {
+            let config = ServerConfig {
+                model_alias: "mock".to_owned(),
+                model_path: "mock.gguf".to_owned(),
+                chat_template: concat!(
+                    "{%- for message in messages %}",
+                    "{{- '<' + message.role + '>\\n' + message.content }}",
+                    "{%- endfor %}",
+                    "{%- if add_generation_prompt %}{{- '<assistant>\\n' }}{%- endif %}",
+                )
+                .to_owned(),
+                sampler: None,
+                fatal_linger: FATAL_LINGER,
+                slot_save_path: None,
+            };
+            let server = Server::bind("127.0.0.1:0", engine, config).expect("bind");
+            let (state, _ended) = server.start().expect("start");
+            Arc::clone(&state.shared)
+        }
+
+        /// An idle engine thread leaves its loop at once when the stop
+        /// arrives, and the engine's Drop it leaves behind — however long —
+        /// is not waited out: the wait ends under its bound while the Drop
+        /// still runs.
+        #[test]
+        fn the_stop_waits_out_no_engine_drop() {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let sh = started(Box::new(SlowDrop {
+                ms: 900,
+                dropped: Arc::clone(&dropped),
+            }));
+            sh.begin_stop(&Stop::Sigint);
+            // A true under the bound is the loop's own leaving: the wait
+            // wakes on its signal, not on the bound running out.
+            assert!(
+                sh.wait_loop_end(BOUND),
+                "the loop left; only the engine's Drop was left to run"
+            );
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "the engine's Drop was still running when the wait ended"
+            );
+            let until = Instant::now() + Duration::from_secs(5);
+            while !dropped.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "the engine thread finished its engine's Drop"
+            );
+        }
+
+        /// The call the stop arrives inside is waited for: the loop cannot
+        /// leave until its call ends, so the bound runs out and the stop's
+        /// line reports it; released, the loop leaves at its next check
+        /// between calls.
+        #[test]
+        fn the_stop_waits_out_the_call_it_arrives_in() {
+            let (go, gate) = mpsc::channel();
+            let (entered, door) = mpsc::channel();
+            let sh = started(Box::new(Blocked { go: gate }));
+            // The action whose run makes the prompt call the stop arrives in.
+            let action = Action {
+                run: Box::new(move |slot: &mut Slot| {
+                    let _ = entered.send(());
+                    let called = slot.engine.prefill(&[1]);
+                    Acted {
+                        failure: called.err(),
+                        reply: Box::new(|| ()),
+                    }
+                }),
+                drops: false,
+            };
+            relock(&sh.board)
+                .reserve(Reserve::One(0), action)
+                .expect("the slot is free");
+            sh.work.notify_one();
+            door.recv_timeout(Duration::from_secs(5))
+                .expect("the engine thread began its call");
+            sh.begin_stop(&Stop::Sigint);
+            assert!(
+                !sh.wait_loop_end(BOUND),
+                "the loop was inside the call the stop arrived in"
+            );
+            drop(go);
+            let until = Instant::now() + Duration::from_secs(5);
+            while !sh.wait_loop_end(Duration::from_millis(50)) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                sh.wait_loop_end(Duration::from_millis(50)),
+                "the loop left at the first check after its call"
+            );
+        }
     }
 }
