@@ -101,6 +101,7 @@ pub mod page;
 pub mod residency;
 pub mod route_trace;
 pub mod run;
+pub mod served;
 pub mod slots;
 pub mod step;
 pub mod swap;
