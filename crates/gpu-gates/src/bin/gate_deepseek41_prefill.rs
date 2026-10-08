@@ -1,5 +1,5 @@
 //! GPU gate for the V4.1 prompt batch (`body::prefill`) on the gate
-//! placement (`crate::ds41_tier::plan_gate`: the 3090's bytes in the real tier, the largest
+//! placement (`crate::gate_card::plan_gate`: the 3090's bytes in the real tier, the largest
 //! visible card under the header's card budget in the fixture tier): a batched prefill of `P` ids leaves
 //! the model where `P` decode steps over the same ids leave it, bit for bit,
 //! in everything a later step or cut reads.
@@ -232,7 +232,7 @@ mod gate_card;
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the card, the path, the clause tags and the triangle's facts; the levers and the decode-step table serve the other gates"
+    reason = "the gate reads the path, the clause tags and the triangle's facts; the levers and the decode-step table serve the other gates"
 )]
 mod ds41_tier;
 
@@ -464,7 +464,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::ds41_tier::init()?;
+        crate::gate_card::init()?;
         record::at_main("gate_deepseek41_prefill", record::GATE_DEEPSEEK41_PREFILL);
         let args = parse_args()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
@@ -476,7 +476,7 @@ mod gate {
         // The draft is read for its header only, so the plan reserves nothing for it.
         cfg.place = tier::plan_levers(&head, &levers, 0)?;
         let inputs = PlanInputs::read(&head)?;
-        let plan_machine = crate::ds41_tier::plan_gate(inputs.model.layers);
+        let plan_machine = crate::gate_card::plan_gate(inputs.model.layers);
         let gate_plan = inputs.plan(&plan_machine, workstation::CTX_MAX, &cfg.place)?;
         drop(head);
         let owner = crate::ds41_tier::last_owner(&hp)?;
@@ -495,7 +495,7 @@ mod gate {
         let t = Instant::now();
         let mut m = body::open(
             file,
-            crate::ds41_tier::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;

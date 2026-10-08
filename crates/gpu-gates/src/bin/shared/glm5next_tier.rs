@@ -1,13 +1,13 @@
 //! What a GLM-5.3-Flash whole-model gate reads of the fixture tier beyond `bloomery_gpu_gates::tier`:
 //! the model file (one owner: `ref_model_path`, and in the fixture tier a whole fixture), the card
-//! the gate plan is made on, the card budget the plan runs under, the layer kinds and counts a
-//! literal used to stand for, the ids a gate reads from the oracle sets (which a fixture has no
-//! set for), and the open of an oracle set itself, which the fixture tier refuses by name.
+//! budget the plan runs under, the file's layer kinds and counts ([`Shape`]), the ids a gate reads
+//! from the oracle sets (which a fixture has no set for), and the open of an oracle set itself,
+//! which the fixture tier refuses by name. The card the gate plan is made on is `crate::gate_card`'s.
 //!
 //! Every number here is read from the header (`Hparams`, the tensors' types) or from a plan, and
-//! the gate that used its literal prints the two side by side (`tier::witness`): equal on the real
-//! file, the real file's value beside the fixture's in the fixture tier. The `REAL_*` constants
-//! are those literals, kept only as the witness's other side.
+//! a gate prints each derived value beside the literal its clause was written against
+//! (`tier::witness`): equal on the real file, the real file's value beside the fixture's in the
+//! fixture tier. The `REAL_*` constants are those literals, kept only as the witness's other side.
 
 #![allow(
     dead_code,
@@ -17,13 +17,12 @@
 use std::sync::OnceLock;
 
 use bloomery_gpu_gates::tier::{self, Tier};
-use bloomery_gpu_gates::{GateError, RefManifest, data_dir, ref_model_path};
+use bloomery_gpu_gates::{GateError, RefManifest, data_dir, prose_ids, ref_model_path};
 use gguf::{GgmlType, Split};
 use model::arch::glm5next::hparams::{Hparams, Kind};
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{PlanInputs, dense_positions};
 use model::placement::PlanLevers;
-use model::placement::workstation::CardSpec;
 use refset::arch::glm5next::{BATCH, D1K, IK, MODEL, MTP, MTP_SET};
 use refset::family::Family;
 use refset::mtpref::MtpSet;
@@ -223,19 +222,10 @@ pub fn open() -> Result<Split, GateError> {
     Split::open(&path).map_err(|e| format!("open {path}: {e}").into())
 }
 
-/// [`init_file`] after fixing the card `tier::plan_gate` plans on (`tier::init_card`: in the real
-/// tier `real_card`, the bin's `gate_card::init`).
-///
-/// # Errors
-/// `tier::init_card`'s, or [`init_file`]'s.
-pub fn init(real_card: impl FnOnce() -> Result<CardSpec, GateError>) -> Result<(), GateError> {
-    tier::init_card(real_card)?;
-    init_file()
-}
-
 /// Fixes everything a gate reads of the file once, before any load: the model file, its header's
 /// card budget, its hyperparameters and its [`Shape`], each with its move proof. A proof that
-/// fails is the error here, before the first load.
+/// fails is the error here, before the first load. The card `crate::gate_card`'s `init` fixes and
+/// `plan_gate` plans on is the bin's, called before this.
 ///
 /// # Errors
 /// A file the tier refuses, a header the reader refuses, or a real tier's value that is not the
@@ -314,6 +304,19 @@ pub fn dense_ctx(literal: usize) -> Result<usize, GateError> {
     }
 }
 
+/// The fixture tier's refusal of one of ik's oracle sets: `what` names the set, `family` the
+/// family it was dumped for. A clause that reads a set is an Oracle clause, which the fixture tier
+/// defers (`tier::run_clause`) and never opens.
+fn refuse_set(what: String, family: &Family) -> GateError {
+    format!(
+        "{what} (family {}) was dumped from {MODEL}; BLOOMERY_TIER=fixture runs on a fixture, \
+         which has no set of ik's: a clause that reads it is an Oracle clause, deferred to the \
+         real tier (crates/gpu-gates/src/tier.rs)",
+        family.name
+    )
+    .into()
+}
+
 /// An oracle set of ik's, opened: its manifest, read through its family. The sets were dumped
 /// from the real file, so a gate that reads one is an Oracle clause, which the fixture tier defers
 /// (`tier::run_clause`) and never opens: a fixture-tier open is refused by name here, whatever the
@@ -323,13 +326,7 @@ pub fn dense_ctx(literal: usize) -> Result<usize, GateError> {
 /// The fixture tier, or the family's own refusal.
 pub fn ik_set(name: &str, family: &Family) -> Result<RefManifest, GateError> {
     if Tier::from_env()? == Tier::Fixture {
-        return Err(format!(
-            "the oracle set {name} (family {}) was dumped from {MODEL}; BLOOMERY_TIER=fixture runs \
-             on a fixture, which has no set of ik's: a clause that reads it is an Oracle clause, \
-             deferred to the real tier (crates/gpu-gates/src/tier.rs)",
-            family.name
-        )
-        .into());
+        return Err(refuse_set(format!("the oracle set {name}"), family));
     }
     Ok(RefManifest::open(&data_dir().join(name), family)?)
 }
@@ -367,7 +364,7 @@ pub fn d1k_prefill() -> Result<Vec<u32>, GateError> {
     if let Some(ids) = IDS.get() {
         return Ok(ids.clone());
     }
-    let corpus = tier::prose_ids("glm5next", D1K_PREFILL)?;
+    let corpus = prose_ids("glm5next", D1K_PREFILL)?;
     let ids = match Tier::from_env()? {
         Tier::Fixture => corpus,
         Tier::Real => {
@@ -398,34 +395,28 @@ pub fn mtp_set() -> Result<&'static MtpSet, GateError> {
         return Ok(set);
     }
     if Tier::from_env()? == Tier::Fixture {
-        return Err(format!(
-            "the MTP draft set {MTP_SET} (family {}) was dumped from {MODEL}; BLOOMERY_TIER=fixture \
-             runs on a fixture, which has no set of ik's: a clause that reads it is an Oracle \
-             clause, deferred to the real tier (crates/gpu-gates/src/tier.rs)",
-            MTP.name
-        )
-        .into());
+        return Err(refuse_set(format!("the MTP draft set {MTP_SET}"), &MTP));
     }
     let set = MtpSet::open(&MTP.path(MTP_SET), &MTP)?;
     Ok(SET.get_or_init(|| set))
 }
 
-/// The MTP draft set's prompt: in the real tier the set's own, held equal to the first
-/// [`MTP_PROMPT`] ids of the prose corpus; in the fixture tier those corpus ids.
+/// The MTP draft set's prompt: in the real tier the set's own ([`mtp_set`]'s cache), held equal to
+/// the first [`MTP_PROMPT`] ids of the prose corpus; in the fixture tier those corpus ids.
 ///
 /// # Errors
 /// A set that cannot be opened or has no prompt, a corpus that is short, or a set whose prompt is
 /// not the corpus's.
 pub fn mtp_prompt() -> Result<Vec<u32>, GateError> {
-    let corpus = tier::prose_ids("glm5next", MTP_PROMPT)?;
+    let corpus = prose_ids("glm5next", MTP_PROMPT)?;
     match Tier::from_env()? {
         Tier::Fixture => Ok(corpus),
         Tier::Real => {
-            let dir = MTP.path(MTP_SET);
-            let set = MtpSet::open(&dir, &MTP)?;
+            let set = mtp_set()?;
             let tokens = set
                 .tokens
-                .ok_or_else(|| format!("{}: no # tokens line", dir.display()))?;
+                .clone()
+                .ok_or_else(|| format!("{}: no # tokens line", MTP.path(MTP_SET).display()))?;
             if tier::witness("MTP prompt = the first corpus ids", tokens == corpus, true) {
                 Ok(tokens)
             } else {
@@ -444,13 +435,5 @@ pub fn mtp_prompt() -> Result<Vec<u32>, GateError> {
 /// # Errors
 /// A `BLOOMERY_TIER` that is neither tier.
 pub fn skew() -> Result<bool, GateError> {
-    static SKEW: OnceLock<bool> = OnceLock::new();
-    if let Some(&s) = SKEW.get() {
-        return Ok(s);
-    }
-    let s = tier::run_clause(
-        "flips landed and an expert admitted (the file's routing skew)",
-        tier::Tag::FileBound,
-    )?;
-    Ok(*SKEW.get_or_init(|| s))
+    tier::premise_once("flips landed and an expert admitted (the file's routing skew)")
 }

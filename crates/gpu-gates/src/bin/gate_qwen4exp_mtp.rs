@@ -224,9 +224,9 @@ mod gate {
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip};
-    use bloomery_gpu_gates::q38_fixture::{self as q38, Shape};
+    use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
-    use bloomery_gpu_gates::tier::{Tag, Tier};
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
@@ -303,7 +303,7 @@ mod gate {
     /// whole fixture.
     fn draft_path(levers: &Levers, target: &Path) -> Result<PathBuf, GateError> {
         let (path, from) = draft_file(levers.mtp_draft(), target);
-        let tier = q38::tier()?;
+        let tier = Tier::from_env()?;
         if tier == Tier::Fixture {
             if from == DraftFrom::Family {
                 return Err(format!(
@@ -328,20 +328,25 @@ mod gate {
 
     /// The plan's levers for a load that reserves `extra` card bytes for the
     /// draft out of the same budget (0: the target alone): the real tier's
-    /// lever, or the header's budget plus `extra` (`q38_fixture::budget_levers`).
+    /// lever, or the header's budget plus `extra` (`tier::budget_levers`).
     fn plan_levers(extra: u64) -> Result<PlanLevers, GateError> {
-        q38::budget_levers(q38::tier()?, cfg().header_budget, cfg().lever_budget, extra)
+        tier::budget_levers(
+            Tier::from_env()?,
+            cfg().header_budget,
+            cfg().lever_budget,
+            extra,
+        )
     }
 
     /// The card a plan is made on: the real tier's the gate runner's (the
     /// 3090's bytes on the card in view), the fixture tier's `a`
-    /// (`q38_fixture::card`).
+    /// (`tier::card`).
     fn card() -> Result<model::placement::workstation::CardSpec, GateError> {
-        q38::card(crate::gate_card::card)
+        tier::card(crate::gate_card::card)
     }
 
     /// Read the headers once and print each derived value beside the real
-    /// file's literal it replaced ([`q38::witness`]).
+    /// file's literal it replaced ([`tier::witness`]).
     fn init() -> Result<bool, GateError> {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let path = ref_model_path()?;
@@ -349,7 +354,7 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
         let shape = crate::q38_arch::shape_of(&inputs.hp)?;
-        let header_budget = q38::header_budget(&file)?;
+        let header_budget = tier::header_budget(&file)?;
         let n_expert = inputs.hp.n_expert;
         let cfg = Cfg {
             path,
@@ -360,37 +365,27 @@ mod gate {
             shape,
             n_expert,
         };
-        let mut ok = q38::witness(
+        let mut ok = tier::witness(
             "model file",
             cfg.path.to_string_lossy().into_owned(),
             MODEL.to_string(),
         );
-        ok &= q38::witness(
+        ok &= tier::witness(
             "draft file",
             cfg.draft.to_string_lossy().into_owned(),
             DRAFT.to_string(),
         );
-        ok &= q38::witness("draft layer", cfg.shape.n_layer, REAL_DRAFT_LAYER);
-        ok &= q38::witness(
+        ok &= tier::witness("draft layer", cfg.shape.n_layer, REAL_DRAFT_LAYER);
+        ok &= tier::witness(
             "card budget",
             cfg.lever_budget,
             PlanLevers::default().card_budget_bytes,
         );
-        ok &= q38::witness_card(&card()?);
+        ok &= tier::witness_card(&card()?);
         if CFG.set(cfg).is_err() {
             return Err("the gate's configuration was read twice".into());
         }
         Ok(ok)
-    }
-
-    /// A self-consistency clause: it runs in both tiers, so a tier that
-    /// deferred it would be refused by name here, not skipped.
-    fn sc(name: &str) -> Result<(), GateError> {
-        if q38::clause(name, Tag::SelfConsistency)? {
-            Ok(())
-        } else {
-            Err(format!("the self-consistency clause {name:?} was deferred").into())
-        }
     }
 
     /// The draft layer's index in the real file's draft (the target's 48
@@ -1573,7 +1568,7 @@ mod gate {
         let ours = m.target_streams(TargetRows::Pass, rows)?;
         let at = |pos: usize| warm.pos.iter().position(|&p| p as usize == pos);
         let mut by_shift = Vec::new();
-        let vs_ik = q38::clause(
+        let vs_ik = tier::run_clause(
             "(t) the target's streams after the prompt against ik's MTP hidden rows, shifted by one",
             Tag::Oracle,
         )?;
@@ -3627,7 +3622,7 @@ mod gate {
         // one pass is a property of the draft's weights against the target's, which the
         // shipped draft has and a fixture's generated one does not (every proposal is
         // refused there).
-        let uneven = q38::clause(
+        let uneven = tier::run_clause(
             "(z) at each depth a pass keeps different counts on the two slots",
             Tag::FileBound,
         )?;
@@ -4194,7 +4189,7 @@ mod gate {
         let extra = mtp.card_bytes(CTX)?;
         let drafted =
             inputs.plan_mtp_with(&machine, CTX, &plan_levers(extra)?, mtp, Experts::Card)?;
-        let fixture = q38::tier()? == Tier::Fixture;
+        let fixture = Tier::from_env()? == Tier::Fixture;
         let want = (cfg().n_expert / 2) as u64;
         let (a, d) = (&alone.n_l, &drafted.plan.n_l);
         let held = |v: &[u64]| (v.iter().min().copied(), v.iter().max().copied());
@@ -4246,7 +4241,7 @@ mod gate {
         let (file, draft) = (open_target()?, open_draft()?);
         let t = Instant::now();
         let inputs = PlanInputs::describe(&file)?;
-        sc(
+        tier::sc(
             "(u) the unset head is the shipped list of the target's tokenizer (copied into a fixture)",
         )?;
         let shipped_ok = shipped_head(&file, inputs.spec.vocab)?;
@@ -4284,9 +4279,9 @@ mod gate {
             t.elapsed().as_secs_f64()
         );
         let mut ok = shipped_ok && witnessed;
-        sc("(d)(q) the draft's load holds its plan's bytes; Mtp38::open's refusals")?;
+        tier::sc("(d)(q) the draft's load holds its plan's bytes; Mtp38::open's refusals")?;
         ok &= draft_load(&m, plan, &inputs, &draft, &mtp, &ids)?;
-        sc("(d) the drafting load's budget keeps the target's card experts a layer")?;
+        tier::sc("(d) the drafting load's budget keeps the target's card experts a layer")?;
         ok &= draft_budget(&inputs, &mtp, ub)?;
         ok &= refused(
             "the draft's own row before any walk",
@@ -4300,8 +4295,8 @@ mod gate {
         let mut r = Replay::new();
         let mut last = None;
         let mut warm = None;
-        sc("(n) the node-local pins and (h)'s kernel on every replayed row")?;
-        let vs_ik = q38::clause(
+        tier::sc("(n) the node-local pins and (h)'s kernel on every replayed row")?;
+        let vs_ik = tier::run_clause(
             "(e)(l)(h) every graph of ik's set replayed: eh_proj, routes, l_out and the argmax against ik's",
             Tag::Oracle,
         )?;
@@ -4387,32 +4382,34 @@ mod gate {
             })
             .transpose()?
             .ok_or("the load opened no row list")?;
-        sc("(r) the row-list head against the full head")?;
+        tier::sc("(r) the row-list head against the full head")?;
         ok &= map == ids;
         ok &= list_head(&mut m, &last, &map)?;
         m.set_mtp_taps(false)?;
-        sc("(t) the pairing: the draft's walk fed the target's rows in place = from the host")?;
+        tier::sc(
+            "(t) the pairing: the draft's walk fed the target's rows in place = from the host",
+        )?;
         ok &= pairing(&mut m, &prompt, &warm)?;
-        sc("(g) a captured walk = the eager walk")?;
+        tier::sc("(g) a captured walk = the eager walk")?;
         ok &= graphs(&mut m, &warm)?;
-        sc("(f) the walk's refusals and the NaN fault")?;
+        tier::sc("(f) the walk's refusals and the NaN fault")?;
         ok &= refusals(&mut m, &warm)?;
-        sc("(w) the windows end to end: drafted ids = plain ids")?;
+        tier::sc("(w) the windows end to end: drafted ids = plain ids")?;
         let (m, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
         ok &= w_ok;
-        sc("(c) the width chooser")?;
+        tier::sc("(c) the width chooser")?;
         let (m, width_ok) = width_chooser(m, &prompt)?;
         ok &= width_ok;
         let (mut m, c_ok) = continued(m, &prompt)?;
         ok &= c_ok;
         ok &= arena_holds(&mut m, &prompt)?;
-        sc("(p) a partial accept's records")?;
+        tier::sc("(p) a partial accept's records")?;
         let (model, p_ok) = kept_state(m, &prompt)?;
         ok &= p_ok;
-        sc("(i) the width chooser's held pass after the server's cut step")?;
+        tier::sc("(i) the width chooser's held pass after the server's cut step")?;
         let (model, i_ok) = held_after_cut(model, &prompt)?;
         ok &= i_ok;
-        sc("(x) a resume of a state without the draft's side is refused")?;
+        tier::sc("(x) a resume of a state without the draft's side is refused")?;
         let (model, x_ok) = resume_refused(model, &inputs, ub, &prompt)?;
         ok &= x_ok;
         drop(model);
@@ -4420,9 +4417,9 @@ mod gate {
         // deep window read past A's whole length, so no per-sequence state
         // the two share by content can pass for one the slots exchanged.
         let deep = deep_prompt()?;
-        sc("(y)(z) two drafted sequences resident: interleaved and as one pass")?;
+        tier::sc("(y)(z) two drafted sequences resident: interleaved and as one pass")?;
         ok &= slots_windows(&inputs, &mtp, ub, &prompt, &deep[1000..])?;
-        let (ran, deferred) = q38::tally();
+        let (ran, deferred) = tier::tally();
         println!(
             "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
         );

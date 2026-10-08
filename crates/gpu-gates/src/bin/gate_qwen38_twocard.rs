@@ -110,11 +110,10 @@ mod gate {
     use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
-    use bloomery_gpu_gates::q38_fixture as q38;
     use bloomery_gpu_gates::record::{self, Fields};
-    use bloomery_gpu_gates::tier::Tag;
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
+        GREEDY_MARGIN, GateError, checks_failed, prose_ids, ref_model_path, verdict,
     };
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
@@ -198,24 +197,6 @@ mod gate {
             return Err(USAGE.into());
         }
         Ok(a)
-    }
-
-    /// The first `n` ids of `$BLOOMERY_DATA/qwen4exp/corpus-prose.ids`.
-    fn prose38(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("qwen4exp").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
     }
 
     /// The tier's device index in the plan's cards.
@@ -862,7 +843,7 @@ mod gate {
                 );
                 why.is_some()
             };
-            let witnessed = q38::witness("twocard budget GiB", gib, REAL_BUDGET_GIB);
+            let witnessed = tier::witness("twocard budget GiB", gib, REAL_BUDGET_GIB);
             return Ok(Chosen {
                 plan,
                 tight: tight && witnessed,
@@ -1042,7 +1023,7 @@ mod gate {
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
         let Chosen { plan, tight } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
-        let ids = prose38(PROMPT_4K)?;
+        let ids = prose_ids("qwen4exp", PROMPT_4K)?;
         let mut um = bp.clone();
         um.tiers.clear();
         let uplan = union_plan(&plan, &um)?;
@@ -1060,16 +1041,6 @@ mod gate {
             &got,
         );
         Ok(batch_precondition(served, Some(&tl)) && ok && tight)
-    }
-
-    /// A self-consistency clause: it runs in both tiers, so a tier that
-    /// deferred it would be refused by name here, not skipped.
-    fn sc(name: &str) -> Result<(), GateError> {
-        if q38::clause(name, Tag::SelfConsistency)? {
-            Ok(())
-        } else {
-            Err(format!("the self-consistency clause {name:?} was deferred").into())
-        }
     }
 
     /// `generate_qwen3moe`'s first record of `kind` of a short run of `ids`
@@ -1153,7 +1124,7 @@ mod gate {
         let path = path_buf.as_path();
         let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
-        let mut pass = q38::witness(
+        let mut pass = tier::witness(
             "model file",
             path.to_string_lossy().into_owned(),
             MODEL.to_string(),
@@ -1161,7 +1132,7 @@ mod gate {
         // The plans' budget is the search's ([`chosen_plan`]): a caller's budget
         // lever is not read, so one that disagrees with the fixture's header is
         // refused here as every other gate refuses it.
-        q38::plan_levers(&split, &levers, 0)?;
+        tier::plan_levers(&split, &levers, 0)?;
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
@@ -1172,11 +1143,11 @@ mod gate {
         } = chosen_plan(&inputs, &bp, CTX)?;
         pass &= tight_3k;
         let tl = tier_layers(&plan);
-        let ids = prose38(PROMPT + 32)?;
-        let prompt_ids = prose38(PROMPT_U)?;
+        let ids = prose_ids("qwen4exp", PROMPT + 32)?;
+        let prompt_ids = prose_ids("qwen4exp", PROMPT_U)?;
         // The unset-rule clause (the module header), before this gate's own
         // loads: the cards as empty as the clause's band holds.
-        if q38::clause(
+        if tier::run_clause(
             "records-unset: the unset rule keeps bp at the real file's tier size",
             Tag::FileBound,
         )? {
@@ -1192,7 +1163,7 @@ mod gate {
         let mut last: Option<Session<Body38>> = None;
         let mut off_run = None;
         if args.union {
-            sc(
+            tier::sc(
                 "--union: the tier load's history, prompt calls and structure = the union reference's",
             )?;
             let mut um = bp.clone();
@@ -1241,7 +1212,7 @@ mod gate {
             // The flips landing at all is the router's skew (the double of the router is R4's):
             // a fixture's generated router has none, so the fixture tier holds the rest of the
             // arm and prints the counts.
-            let skewed = q38::clause(
+            let skewed = tier::run_clause(
                 "--residency: flips landed under the router's skew (the double of the router is R4's)",
                 Tag::FileBound,
             )?;
@@ -1272,7 +1243,7 @@ mod gate {
             last = Some(t);
         }
         if args.lost {
-            sc("--lost: the tier's stream held behind a host flag is named as a lost card")?;
+            tier::sc("--lost: the tier's stream held behind a host flag is named as a lost card")?;
             let mut s = match last.take() {
                 Some(s) => s,
                 None => open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?,
@@ -1280,11 +1251,11 @@ mod gate {
             pass &= lost_case(s.model_mut(), &ids)?;
         }
         if args.prompt4k {
-            sc("--prompt4k: a 4,096-id prompt call, two cards = the union")?;
+            tier::sc("--prompt4k: a 4,096-id prompt call, two cards = the union")?;
             drop(last.take());
             pass &= prompt4k(path, &inputs, host)?;
         }
-        let (ran, deferred) = q38::tally();
+        let (ran, deferred) = tier::tally();
         println!(
             "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
         );

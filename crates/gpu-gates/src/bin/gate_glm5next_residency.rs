@@ -1269,11 +1269,12 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?)?;
-        glm5next_tier::init(crate::gate_card::init)?;
+        crate::gate_card::init()?;
+        glm5next_tier::init_file()?;
         let path = glm5next_tier::model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&file).map_err(|e| format!("{path}: {e}"))?;
-        let machine = tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = glm5next_tier::plan_levers(&levers, 0)?;
         let plan = inputs
             .plan(&machine, CTX as u64, &place)

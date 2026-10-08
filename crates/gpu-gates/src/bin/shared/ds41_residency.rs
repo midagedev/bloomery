@@ -97,8 +97,8 @@ use bloomery_gpu_deepseek41::body::{Body, OpenCfg};
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::generate::{Place, Residence, place_table};
 use bloomery_gpu_gates::record;
-use bloomery_gpu_gates::tier::{self, Tag};
-use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, verdict};
+use bloomery_gpu_gates::tier;
+use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, verdict};
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, workstation};
 use runtime::swaprule::SwapRule;
@@ -122,35 +122,14 @@ const HOLD: Duration = Duration::from_secs(1);
 /// A refusal before the load reads the files' headers only.
 const REFUSE_BOUND_S: f64 = 120.0;
 
-/// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-fn prose(n: usize) -> Result<Vec<u32>, GateError> {
-    let path = data_dir().join("engram").join("corpus-prose.ids");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ids = text
-        .split_whitespace()
-        .take(n)
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()?;
-    if ids.len() < n {
-        return Err(format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into());
-    }
-    Ok(ids)
-}
-
 /// The premise every flip-dependent clause shares: the history's flips land, an expert is
 /// admitted, the card's copy moves off its start, the live sets leave the seed. It is the real
 /// file's routing skew (file-bound): `true` when this tier asserts it, `false` when the fixture
 /// tier leaves it to the real one, its line printed once.
 fn skew() -> Result<bool, GateError> {
-    static SKEW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if let Some(&s) = SKEW.get() {
-        return Ok(s);
-    }
-    let s = tier::run_clause(
+    tier::premise_once(
         "c1, transform, keep, table: flips landed and an expert admitted (the file's routing skew)",
-        Tag::FileBound,
-    )?;
-    Ok(*SKEW.get_or_init(|| s))
+    )
 }
 
 /// Milliseconds since `t`.
@@ -491,7 +470,7 @@ pub fn clauses(
         body.set_hoststream(false)?;
         body.log_residency(0);
     }
-    let ids = prose(PROMPT)?;
+    let ids = prose_ids("engram", PROMPT)?;
     let mut pass = true;
     let tier_at_load = tier_entries(s)?;
     let seeds = seeds(s)?;

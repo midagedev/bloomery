@@ -82,18 +82,10 @@ mod dspark;
 mod quiet;
 
 #[cfg(feature = "deepseek41")]
-#[path = "shared/gate_card.rs"]
-#[allow(
-    dead_code,
-    reason = "the gate plans on the placement's own cards; the tier glue names the gate card"
-)]
-mod gate_card;
-
-#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the levers and the clause tags; the card and the triangle's facts serve the other gates"
+    reason = "the gate reads the levers and the clause tags; the triangle's facts serve the other gates"
 )]
 mod ds41_tier;
 
@@ -114,7 +106,7 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::draft::DraftBody;
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path};
+    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, ref_model_path};
     use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -172,24 +164,6 @@ mod gate {
             return Err(USAGE.into());
         }
         Ok(a)
-    }
-
-    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("engram").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
     }
 
     /// Plan (b′) `m` with its tier card renamed to the A6000, every figure
@@ -632,7 +606,7 @@ mod gate {
                 .into());
             }
         }
-        let prompt = prose(PROMPT.max(CALL_PROMPT))?;
+        let prompt = prose_ids("engram", PROMPT.max(CALL_PROMPT))?;
         if args.union {
             crate::ds41_tier::sc(
                 "--union: two cards (and the loopback) are the union reference, bit for bit",

@@ -139,6 +139,30 @@ pub fn ref_model_path() -> Result<PathBuf, GateError> {
 
 pub use refset::data_dir;
 
+/// The first `n` ids of `$BLOOMERY_DATA/<dir>/corpus-prose.ids`: text ids of the real tokenizer,
+/// which a fixture's embedding table holds the rows of.
+///
+/// # Errors
+/// A file that is missing, holds fewer ids, or holds a word that is not an id.
+pub fn prose_ids(dir: &str, n: usize) -> Result<Vec<u32>, GateError> {
+    let path = data_dir().join(dir).join("corpus-prose.ids");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    first_ids(&path, &text, n)
+}
+
+/// The first `n` whitespace-separated ids of `text`, read from `path`.
+fn first_ids(path: &std::path::Path, text: &str, n: usize) -> Result<Vec<u32>, GateError> {
+    let ids = text
+        .split_whitespace()
+        .take(n)
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.len() < n {
+        return Err(format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into());
+    }
+    Ok(ids)
+}
+
 pub fn open_model() -> Result<Gguf, GateError> {
     Ok(Gguf::open(ref_model_path()?)?)
 }
@@ -760,7 +784,18 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 
 #[cfg(test)]
 mod tests {
-    use super::{GateError, GgmlType, NAN_F16, dequant_row, kquant_d_at, max_rel_err};
+    use super::{GateError, GgmlType, NAN_F16, dequant_row, first_ids, kquant_d_at, max_rel_err};
+
+    /// The corpus reader takes the first `n` ids and refuses a short file and a word that is no id
+    /// by name. Mutant: a short file read as the ids it holds, or a bad word skipped.
+    #[test]
+    fn the_corpus_reader_takes_n_ids_and_refuses_the_rest() {
+        let path = std::path::Path::new("corpus-prose.ids");
+        assert_eq!(first_ids(path, "7 8\n9 10", 3).expect("ids"), [7, 8, 9]);
+        let short = first_ids(path, "7 8", 3).expect_err("short").to_string();
+        assert!(short.contains("2 ids, the gate reads 3"), "{short}");
+        assert!(first_ids(path, "7 x 9", 3).is_err());
+    }
 
     /// `f32::max` drops NaN, so a fold alone scores an all-NaN output as 0.
     #[test]

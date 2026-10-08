@@ -290,6 +290,23 @@ pub fn premise(name: &str, tag: Tag, holds: bool) -> Result<bool, GateError> {
     Ok(!run_clause(name, tag)? || holds)
 }
 
+/// A [`Tag::FileBound`] premise several clauses share, decided once per process: the first call
+/// runs the clause (printing its [`DEFERRED`] line when this tier leaves it to the real one) and
+/// caches the answer; every later call returns it without printing, so the premise counts once.
+///
+/// # Errors
+/// As [`run_clause`].
+pub fn premise_once(name: &'static str) -> Result<bool, GateError> {
+    static SEEN: std::sync::Mutex<Vec<(&'static str, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().expect("the premise cache's lock");
+    if let Some(&(_, runs)) = seen.iter().find(|(n, _)| *n == name) {
+        return Ok(runs);
+    }
+    let runs = run_clause(name, Tag::FileBound)?;
+    seen.push((name, runs));
+    Ok(runs)
+}
+
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
 /// here, never skipped.
 ///
@@ -480,67 +497,6 @@ pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
         derived.name, RTX_3090.name
     );
     ok
-}
-
-/// The card [`plan_gate`] plans on, fixed once by [`init_card`].
-#[cfg(feature = "gpu")]
-static GATE_CARD: std::sync::OnceLock<model::placement::workstation::CardSpec> =
-    std::sync::OnceLock::new();
-
-/// Fixes the card [`plan_gate`] plans on and prints its move proof ([`witness_card`]): the real
-/// tier keeps the gate plan of the card the runner put in view (`real`, a bin's `gate_card::init`:
-/// the 3090's bytes under that card's name), the fixture tier plans on [`card`]'s `a`.
-///
-/// # Errors
-/// [`card`]'s, or a real tier's card spec that is not the 3090's bytes.
-#[cfg(feature = "gpu")]
-pub fn init_card(
-    real: impl FnOnce() -> Result<model::placement::workstation::CardSpec, GateError>,
-) -> Result<model::placement::workstation::CardSpec, GateError> {
-    let derived = card(real)?;
-    let derived = *GATE_CARD.get_or_init(|| derived);
-    if !witness_card(&derived) {
-        return Err("the gate card's bytes are not RTX_3090's in the real tier".into());
-    }
-    Ok(derived)
-}
-
-/// The gate placement on the card [`init_card`] fixed: every layer and the head on it, beside the
-/// host.
-///
-/// # Panics
-/// Before [`init_card`].
-#[cfg(feature = "gpu")]
-#[must_use]
-pub fn plan_gate(layers: usize) -> model::placement::Machine {
-    let card = GATE_CARD
-        .get()
-        .expect("tier::init_card runs before the gate plan is made");
-    model::placement::workstation::plan_on(*card, layers)
-}
-
-/// The first `n` ids of `$BLOOMERY_DATA/<dir>/corpus-prose.ids`: text ids of the real tokenizer,
-/// which a fixture's embedding table holds the rows of.
-///
-/// # Errors
-/// A file that is missing, holds fewer ids, or holds a word that is not an id.
-pub fn prose_ids(dir: &str, n: usize) -> Result<Vec<u32>, GateError> {
-    let path = crate::data_dir().join(dir).join("corpus-prose.ids");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    first_ids(&path, &text, n)
-}
-
-/// The first `n` whitespace-separated ids of `text`, read from `path`.
-fn first_ids(path: &Path, text: &str, n: usize) -> Result<Vec<u32>, GateError> {
-    let ids = text
-        .split_whitespace()
-        .take(n)
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()?;
-    if ids.len() < n {
-        return Err(format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into());
-    }
-    Ok(ids)
 }
 
 #[cfg(test)]
@@ -734,16 +690,5 @@ mod tests {
         );
         assert!(b(Tier::Fixture, Some(9), Some(8), 0).is_err());
         assert!(b(Tier::Fixture, None, None, 0).is_err());
-    }
-
-    /// The corpus reader takes the first `n` ids and refuses a short file and a word that is no id
-    /// by name. Mutant: a short file read as the ids it holds, or a bad word skipped.
-    #[test]
-    fn the_corpus_reader_takes_n_ids_and_refuses_the_rest() {
-        let path = Path::new("corpus-prose.ids");
-        assert_eq!(first_ids(path, "7 8\n9 10", 3).expect("ids"), [7, 8, 9]);
-        let short = first_ids(path, "7 8", 3).expect_err("short").to_string();
-        assert!(short.contains("2 ids, the gate reads 3"), "{short}");
-        assert!(first_ids(path, "7 x 9", 3).is_err());
     }
 }

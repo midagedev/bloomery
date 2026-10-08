@@ -1,6 +1,6 @@
 //! GPU gate for the DSpark loop's target side: the feature tap
 //! (`body::attach_features`, `Body::read_features`) on the gate placement
-//! (`crate::ds41_tier::plan_gate`), its layers the draft file's `target_layers`
+//! (`crate::gate_card::plan_gate`), its layers the draft file's `target_layers`
 //! (`$BLOOMERY_DSPARK_MODEL`, header only: no draft is loaded here).
 //!
 //! - `--structure`: the step and the pair pass captured with the tap hold
@@ -70,7 +70,7 @@ mod gate_card;
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+    reason = "the gate reads the path and the clause tags; the triangle's facts serve the prefill gate"
 )]
 mod ds41_tier;
 
@@ -162,7 +162,7 @@ mod gate {
             R8,
         ])?;
         let args = parse_args()?;
-        crate::ds41_tier::init()?;
+        crate::gate_card::init()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
         let layers = dhp.target_layers.clone();
@@ -175,7 +175,7 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let mut m = body::open(
             file,
-            crate::ds41_tier::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;

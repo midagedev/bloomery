@@ -1,14 +1,14 @@
 //! Gate `gate-ds41-load`: the V4.1 body on the gate card. The model is loaded
 //! through the entry the engine opens V4.1 with
 //! (`bloomery_gpu_deepseek41::body::open`) by the gate placement
-//! (`crate::ds41_tier::plan_gate`: the 3090's bytes run every layer and the head in the real
+//! (`crate::gate_card::plan_gate`: the 3090's bytes run every layer and the head in the real
 //! tier, the largest visible card plan `a` in the fixture tier, under the header's card budget)
 //! at the serving context, and checked against the plan this binary makes from the
 //! same file. A correctness run: every time and memory figure it prints is a
 //! runtime value. Every clause is self-consistency (the engine against its own plan, KvLayout
 //! and RopeTable), so the fixture tier runs all six; the steps check (iii) builds are the decode-step
 //! sets' in the real tier and the same positions over a synthetic id sequence in the fixture
-//! tier (the ids select no plan field).
+//! tier (the ids feed the plan's engram window, as a set's do).
 //!
 //! - (i) segments: every segment the plan puts on the card is resident at the
 //!   plan's buffer bytes, nothing else is, and the total is the card's dense +
@@ -68,7 +68,7 @@ mod gate_card;
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+    reason = "the gate reads the path and the clause tags; the triangle's facts serve the prefill gate"
 )]
 mod ds41_tier;
 
@@ -118,13 +118,13 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
-        crate::ds41_tier::init()?;
+        crate::gate_card::init()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         let path = crate::ds41_tier::model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         cfg.place = tier::plan_levers(&split, &levers, 0)?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs
             .plan(&machine, CTX_MAX, &cfg.place)
             .map_err(|e| format!("the gate plan: {e}"))?;
@@ -224,7 +224,7 @@ mod gate {
         let start = Instant::now();
         let m = body::open(
             file,
-            crate::ds41_tier::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(CTX_MAX)?,
             cfg,
         )?;
@@ -732,7 +732,7 @@ mod gate {
     /// file is refused by name; the real tier prints the set's position beside
     /// `DECODE_SETS`' and requires them equal. The fixture tier has no set of
     /// its file: the same position over `pos + 1` ids of a fixed spread across
-    /// the vocabulary, which the plan reads for nothing but their count.
+    /// the vocabulary, which feed the plan's engram window as a set's ids do.
     fn step_of(set: &str, at: u32, n_vocab: usize) -> Result<(Vec<u32>, u32), GateError> {
         if tier::Tier::from_env()? == tier::Tier::Fixture {
             let ids = (0..=at)

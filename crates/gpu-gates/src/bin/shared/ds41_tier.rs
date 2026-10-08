@@ -1,9 +1,10 @@
 //! What a V4.1 whole-model gate reads of the fixture tier beyond `bloomery_gpu_gates::tier`: the
-//! model file (one owner, `gguf::v41`, and in the fixture tier a whole fixture), the card the gate
-//! plan is made on, the levers a gate parses, and the facts of the V4.1 file that a literal used to
-//! stand for — the layer the CED triangle is anchored at and the length it reaches from there.
-//! Every number here is read from the header (`Hparams`) or from a plan, and the gate that used its
-//! literal prints the two side by side (`tier::witness`), equal on the real file.
+//! model file (one owner, `gguf::v41`, and in the fixture tier a whole fixture), the levers a gate
+//! parses, the real file's decode-step sets, and the CED triangle's facts of the file — the layer
+//! it is anchored at and the length it reaches from there. The card the gate plan is made on is
+//! `crate::gate_card`'s. Every number here is read from the header (`Hparams`) or from a plan, and
+//! where a gate's clause was written against a literal it prints the two side by side
+//! (`tier::witness`), equal on the real file.
 
 use std::path::Path;
 
@@ -13,8 +14,6 @@ use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
 use bloomery_gpu_gates::tier::{self, Tier};
 use gguf::Gguf;
 use model::arch::deepseek41::hparams::Hparams;
-use model::placement::Machine;
-use model::placement::workstation::CardSpec;
 
 /// The decode-step sets of the real file's oracle (`step4`, `d1`, `d2`), each with the position of
 /// its step and the indexer `top_k` ik ran it with (`None`: the file's): `step4` at 4, where no csa
@@ -57,15 +56,6 @@ pub fn witness_set(name: &str, pos: u32, top_k: usize, file_top_k: usize) -> Res
     }
 }
 
-/// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids` (text ids of the real
-/// tokenizer, which a fixture's embedding table holds the rows of).
-///
-/// # Errors
-/// A file that is missing or holds fewer ids.
-pub fn prose_ids(n: usize) -> Result<Vec<u32>, GateError> {
-    tier::prose_ids("engram", n)
-}
-
 /// The V4.1 file a gate opens: the one `gguf::v41::model` owner's answer (a
 /// `BLOOMERY_V41_MODEL` that disagrees with `BLOOMERY_REF_MODEL` is its named error), and in the
 /// fixture tier a file proven to be a whole fixture, so a gate never runs on the real file under
@@ -81,26 +71,6 @@ pub fn model_path() -> Result<String, GateError> {
         tier.check_file(Path::new(&path), g.iter_kv().map(|(k, _)| k))?;
     }
     Ok(path)
-}
-
-/// Fixes the card [`plan_gate`] plans on and prints its move proof: the real tier keeps the gate
-/// plan of the card the runner put in view (`gate_card`: the 3090's bytes under that card's name),
-/// the fixture tier plans on `a`, the largest visible card as the device reports itself
-/// (`Place::A`).
-///
-/// # Errors
-/// A census no card is found in, or a card spec in the real tier that is not the 3090's bytes.
-pub fn init() -> Result<CardSpec, GateError> {
-    tier::init_card(crate::gate_card::init)
-}
-
-/// The gate placement on the card [`init`] fixed: every layer and the head on it, beside the host.
-///
-/// # Panics
-/// Before [`init`].
-#[must_use]
-pub fn plan_gate(layers: usize) -> Machine {
-    tier::plan_gate(layers)
 }
 
 /// The levers a gate parses: `real`, and in the fixture tier the card budget too — the fixture's
@@ -179,7 +149,8 @@ pub fn group_fault_p(hp: &Hparams, n_l: &[u64], cap: usize) -> Result<usize, Gat
         p -= CHUNK;
     }
     Err(format!(
-        "no length of at most {cap} positions starts a card layer's block inside the second of          three batches: owner layer {owner}, window {}, {} layers",
+        "no length of at most {cap} positions starts a card layer's block inside the second of \
+         three batches: owner layer {owner}, window {}, {} layers",
         hp.window, hp.n_layer
     )
     .into())
