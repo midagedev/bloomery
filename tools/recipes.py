@@ -5751,7 +5751,7 @@ def ref_paths_self_test(expect) -> None:
         os.makedirs(os.path.join(tmp, "tools/ref/models"))
         for f in ("ref-paths.sh", "gguf-ranges.py"):
             shutil.copyfile(os.path.join(src, f), os.path.join(tmp, "tools/ref", f))
-        for fam in ("qwen4exp", "deepseek2", "glm5next", "newfam"):
+        for fam in ("qwen4exp", "deepseek2", "glm5next", "mimo2", "newfam"):
             with open(os.path.join(tmp, f"tools/ref/models/{fam}.sh"), "w", encoding="utf-8") as fh:
                 fh.write(f"MODEL_NAME={fam}\nMODEL=${{BLOOMERY_REF_MODEL:-/models/real/{fam}.gguf}}\n")
         root = os.path.join(tmp, "fixtures")
@@ -5778,11 +5778,17 @@ def ref_paths_self_test(expect) -> None:
             expect(rc == 0 and out.strip() == real, f"ref-paths real tier {env}: {rc} {out!r} {err!r}")
         rc, out, err = run("qwen4exp", f"{show}; fixture_budget", BLOOMERY_TIER="fixture")
         expect(rc == 0 and out.split() == [f"{first}|{first}", "6190000000"], f"ref-paths fixture tier: {rc} {out!r} {err!r}")
+        glm_dir = os.path.join(root, "glm5next")
+        os.makedirs(glm_dir)
+        glm_first = os.path.join(glm_dir, "glm53-fixture-00001-of-00001.gguf")
+        write(glm_first, whole)
+        rc, out, err = run("glm5next", f"{show}; fixture_budget", BLOOMERY_TIER="fixture")
+        expect(rc == 0 and out.split() == [f"{glm_first}|{glm_first}", "6190000000"], f"ref-paths: glm5next resolves its own fixture directory: {rc} {out!r} {err!r}")
         rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="fixture", BLOOMERY_REF_MODEL="/x/own.gguf")
         expect(rc == 0 and out.strip() == f"/x/own.gguf|{first}", f"ref-paths: a caller's own file does not win, or the fixture is not named: {rc} {out!r}")
         rc, out, err = run("deepseek2", f"{show}; fixture_budget; echo budget-rc=$?", BLOOMERY_TIER="fixture")
         expect(rc == 0 and out.split() == ["/models/real/deepseek2.gguf|", "budget-rc=0"], f"ref-paths: a small family does not stand: {rc} {out!r} {err!r}")
-        for fam in ("glm5next", "newfam"):
+        for fam in ("mimo2", "newfam"):
             rc, out, err = run(fam, show, BLOOMERY_TIER="fixture")
             expect(rc == 66 and out == "" and f"the family '{fam}' has no fixture yet" in err and "exit 66" in err, f"ref-paths: {fam} has no fixture: {rc} {out!r} {err!r}")
         rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="both")
