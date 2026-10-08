@@ -348,6 +348,8 @@ blk_pytools() {
     "tools/ref/check-int-twins.py --self-test"
     "tools/ref/clef/e2e.py --self-test"
     "tools/ref/clef_ref.py --self-test"
+    "tools/ref/clefvis/check_hidden.py --self-test"
+    "tools/ref/clefvis/check_preproc.py --self-test"
     "tools/ref/dma-dram-share.py --self-test"
     "tools/ref/draft-accept.py --self-test"
     "tools/ref/draft-vocab.py --self-test"

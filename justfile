@@ -572,6 +572,14 @@ build-ref-hidden:
 dump-hidden-qwen35 *SETS:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/hidden.sh {{SETS}}'
 
+# Clef-Flash image input, the oracle's binary: dump_mtmd (tools/ref/clefvis/dump_mtmd.cpp) linked against llama.cpp mainline's libmtmd in the qwen35 profile's tree (tools/ref/clefvis/build-clefvis.sh).
+build-clefvis-ref:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# Clef-Flash image input, the oracle sets (tools/ref/clefvis/clefvis.sh): mainline mtmd's preprocess (ref_clefvis_preproc), tower taps (ref_clefvis_taps), hidden states of three prompts (ref_clefvis_hidden_c*, with the prose control ref_clefvis_prose_c* and the bf16-rows control ref_clefvis_bf16rows_c*) into $BLOOMERY_DATA; SETS names base sets, `--cpu-twin` writes the CPU twins (<set>.cpu) and `--ids` the prompts' ids by the release's tokenizer (both without a card), `--ref-d` set D: the release's answers on the A6000. The card runs go through the A6000's gate lock; no lease.
+dump-ref-clefvis *ARGS:
+    case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
+
 # GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
 # 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀).
