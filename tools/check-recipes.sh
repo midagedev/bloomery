@@ -37,6 +37,17 @@ if [ -n "$bare" ]; then
   echo "$bare" >&2
   exit 1
 fi
+# A recipe that reads a draft's counts (`accepts=`) pins what the draft verifies: each drafted command
+# (`BLOOMERY_DRAFT=<draft>`) carries `BLOOMERY_MTP_WIDTH=` right before it. Unpinned, the width chooser's
+# `cost` mode decides on host wall time, and under load the run verifies only its warm-up passes while
+# the counts clause still passes.
+unpinned=$(grep -nE '^[^#]*accepts=' "$JF" | grep -E '(^|[^=_[:alnum:]])BLOOMERY_DRAFT=' |
+  sed -E 's/BLOOMERY_MTP_WIDTH=[^ ]+ BLOOMERY_DRAFT=//g' | grep -E 'BLOOMERY_DRAFT=' | cut -c1-160 || true)
+if [ -n "$unpinned" ]; then
+  echo "check-recipes: a recipe reads draft counts with a drafted command whose width is not pinned — put BLOOMERY_MTP_WIDTH=fixed right before its BLOOMERY_DRAFT=:" >&2
+  echo "$unpinned" >&2
+  exit 1
+fi
 # Every recipe's cargo targets, features and runner binaries against the workspace (cargo metadata, no
 # build): a `--bin`, `--test` or `-p` that names nothing, a feature the package lacks, a gpu-gate.sh or
 # host-gate.sh name the recipe does not build, a named script that is not in the tree, a gate-* recipe
