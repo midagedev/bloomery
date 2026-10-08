@@ -24,7 +24,7 @@
 //!    layer-id list — and its fixture is planned, written and verified; the
 //!    spec's ratios one short, a layer list the map does not hold, a draft for
 //!    a family with none and another architecture are refused by name;
-//! 7. the Q5_1 and IQ4_NL rules under the V4.1 spec's window: a filled chunk
+//! 7. the Q5_1 and IQ4_NL rules under the rule window, [2^-13, 2^-10]: a filled chunk
 //!    dequantizes (`gguf::dequant_row`) to an RMS within ±10 % of 1/√K and
 //!    every block holds its rule; a K whose `d` no code choice puts in the
 //!    window is refused with `NoScale`;
@@ -47,10 +47,40 @@
 //!     a missing `full_attention_interval` are refused by name, in the source and in the written
 //!     file, as is a draft's ratios array one short of its layers.
 //!
+//! The r8 sidecar and the V4.1 spec's ff 512 (the plan's draft and routed stacks at ff 512 are
+//! contract 1's; the subset files of contract 4 are given their budget, a part of a plan having
+//! none to choose from):
+//!
+//! 12. the sidecar of a toy family is written beside the fixture, checked by `verify`, and refused
+//!     when absent, of another stack set or one flipped byte; a family naming no stack leaves no
+//!     fixture behind;
+//! 13. V4.1's budget: the plan of the written file at the gate machine and `CTX_MAX` holds half
+//!     the experts (192 of 384) on every card-eligible layer, a budget 64 MiB either side is
+//!     refused, `verify` refuses an edited record, and the plan's conditions are printed;
+//! 14. V4.1's two router biases differ between experts (a constant 0 and a uniform draw, a stream
+//!     a layer), and the family's header check refuses zeros, equal biases and a constant shift;
+//! 15. V4.1's r8 stacks are the gate and up stacks of the nine layers, Q3_K at the source's type
+//!     and width, at ff 512 on r8file's grid.
+//!
+//! The GLM-5.3-Flash spec (`model::arch::glm5next::fixture`) against the real file's header:
+//!
+//! 16. the plan: seven layers from source layers 0, 1, 4, 7, 8, 11 and 45, read back by the
+//!     engine's hparams as kinds [KDA, KDA, KDA, latent, KDA, latent, latent], a dense prefix of
+//!     two, the NextN layer believed, every (role, type) pair of the routed stacks, the routed ff
+//!     512 and the shared expert's own width untouched;
+//! 17. the budget: the plan of the written file with its NextN layer holds 144 of 288 experts on
+//!     each card-eligible layer and none on the dense and the Q6_K-down layers; a budget 64 MiB
+//!     either side and an edited record are refused, and the plan's conditions are printed;
+//! 18. what the reader and the kernels' constants take silently, refused by name: a map that
+//!     drops the NextN layer or puts a dense layer after a routed one, a changed constant in the
+//!     source or in the written file, a fixture ff and dense count off the header's, an ff off the
+//!     block grid.
+//!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -58,17 +88,21 @@ use std::time::Instant;
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::fixture::{self as v41, LAYER_MAP};
+use model::arch::deepseek41::place::PlanInputs as V41Inputs;
+use model::arch::glm5next::fixture as glm;
+use model::arch::glm5next::hparams::Kind as GlmKind;
+use model::arch::glm5next::place::{NextnInputs, PlanInputs as GlmInputs};
 use model::arch::qwen35moe::fixture as q38;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, UBATCH_PLANNED, machine_for_experts};
 use model::fileio;
 use model::fixture::{
-    self, CHUNK_TARGET, CardBudget, Family, FilePlan, FixtureError, FixtureSpec, KEY_CARD_BUDGET,
-    KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION, KeyRule, Options, Plan,
-    PlannedTensor, Rule, Sample, Tables, Window, rule_for,
+    self, CHUNK_TARGET, CardBudget, DEFAULT_SHARD_BYTES, Family, FilePlan, FixtureError,
+    FixtureSpec, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION,
+    KeyRule, Options, Plan, PlannedTensor, Rule, Sample, SidecarSpec, Tables, Window, rule_for,
 };
 use model::placement::PlanLevers;
-use model::placement::workstation::RTX_3090;
+use model::placement::workstation::{self, RTX_3090};
 use sha2::{Digest, Sha256};
 
 const ARCH: &str = "deepseek41";
@@ -129,6 +163,84 @@ fn header_only(p: &FilePlan, d: &Path) -> PathBuf {
         file.set_len(len).unwrap();
     }
     d.join(&p.files[0])
+}
+
+/// `bytes` over tensor `name` of the fixture whose first shard is `first`
+/// (a header-only file's hole, or a written one's tensor).
+fn put(first: &Path, name: &str, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let fx = Split::open(first).unwrap();
+    let (s, info) = fx.find(name).unwrap_or_else(|| panic!("no {name}"));
+    assert_eq!(bytes.len() as u64, info.nbytes, "{name}");
+    let at = fx.shard(s).unwrap().data_base() + info.offset;
+    let path = fx.shard_path(s).unwrap().to_path_buf();
+    drop(fx);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all_at(bytes, at)
+        .unwrap();
+}
+
+/// The f32 values of little-endian `bytes`.
+fn floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
+}
+
+/// The little-endian bytes of `v`.
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// The bytes the generator writes for `t` under `seed`.
+fn filled(t: &PlannedTensor, seed: u64) -> Vec<u8> {
+    let mut bytes = vec![0u8; t.nbytes as usize];
+    t.fill(seed, 1, &mut bytes);
+    bytes
+}
+
+/// A V4.1 fixture's router biases as the generator writes them, over a
+/// header-only file's holes: the file's data is zeros, which the family's
+/// bias check refuses, so a clause that reads a header-only fixture as a
+/// V4.1 file writes them first.
+fn write_biases(p: &FilePlan, first: &Path) {
+    for t in p
+        .tensors
+        .iter()
+        .filter(|t| leaf_of(&t.name).starts_with("exp_probs_b"))
+    {
+        put(first, &t.name, &filled(t, fixture::DEFAULT_SEED));
+    }
+}
+
+/// A tensor's name past `blk.N.`; empty for a global.
+fn leaf_of(name: &str) -> &str {
+    name.strip_prefix("blk.")
+        .and_then(|r| r.split_once('.'))
+        .map_or("", |(_, rest)| rest)
+}
+
+/// `dims` of the V4.1 or DSpark tensor `leaf` at the fixture's ff, written
+/// here by hand (not through the family's `ff_axis`): the routed stacks and the
+/// shared expert carry the ff in the second dim of gate and up and the first of
+/// down.
+fn ff_dims(leaf: &str, dims: &[u64]) -> Vec<u64> {
+    let mut d = dims.to_vec();
+    match leaf {
+        "ffn_gate_exps.weight"
+        | "ffn_up_exps.weight"
+        | "ffn_gate_shexp.weight"
+        | "ffn_up_shexp.weight" => d[1] = v41::FIXTURE_FF,
+        "ffn_down_exps.weight" | "ffn_down_shexp.weight" => d[0] = v41::FIXTURE_FF,
+        _ => {}
+    }
+    d
 }
 
 fn nested(v: &Value) -> bool {
@@ -199,7 +311,7 @@ fn hw_fixture_plan() {
                     x.name
                 );
             } else {
-                assert_eq!(x.dims, s.dims, "{}", x.name);
+                assert_eq!(x.dims, ff_dims(rest, &s.dims), "{}", x.name);
             }
         }
     }
@@ -228,6 +340,7 @@ fn hw_fixture_plan() {
     let key = |s: &str| format!("{ARCH}.{s}");
     let mut want_changed = vec![
         key("block_count"),
+        key("expert_feed_forward_length"),
         key("attention.compress_ratios"),
         key("swiglu_clamp_exp"),
         key("swiglu_clamp_shexp"),
@@ -321,10 +434,8 @@ fn hw_fixture_plan() {
         get(KEY_SOURCE_SHA256).as_str(),
         Some(fixture::header_sha256(&src).as_str())
     );
-    assert_eq!(
-        get(KEY_CARD_BUDGET).as_u64(),
-        Some(v41::DEFAULT_CARD_BUDGET)
-    );
+    assert_eq!(get(KEY_CARD_BUDGET).as_u64(), Some(p.card_budget));
+    assert_eq!(get(&key("expert_feed_forward_length")).as_u64(), Some(512));
     let dp = p.draft.as_ref().unwrap();
     let dtheirs: HashMap<&str, &Value> = d.iter_kv().collect();
     let dchanged: Vec<&str> = dp
@@ -333,7 +444,30 @@ fn hw_fixture_plan() {
         .filter(|(k, v)| dtheirs.get(k.as_str()).is_some_and(|s| *s != v))
         .map(|(k, _)| k.as_str())
         .collect();
-    assert_eq!(dchanged, ["dflash.target_layers"]);
+    assert_eq!(
+        dchanged,
+        ["dflash.expert_feed_forward_length", "dflash.target_layers"],
+        "the draft's overridden keys, in file order"
+    );
+    let dff = dp
+        .kvs
+        .iter()
+        .find(|(k, _)| k == "dflash.expert_feed_forward_length")
+        .unwrap();
+    assert_eq!(
+        dff.1.as_u64(),
+        Some(512),
+        "the draft's ff moves with the target's"
+    );
+    for t in &dp.tensors {
+        let (_, s) = d.find(&t.source).unwrap();
+        assert_eq!(
+            t.dims,
+            ff_dims(leaf_of(&t.name), &s.dims),
+            "{}: the draft's ff axes at 512",
+            t.name
+        );
+    }
     assert_eq!(
         unsigned_items(
             &dp.kvs
@@ -370,7 +504,7 @@ fn hw_fixture_plan() {
     assert!(!spans.is_empty(), "a layer spans a shard boundary");
     let draft_len = dp.layouts().unwrap()[0].1.file_len();
     println!(
-        "plan: total {total} B = headers {headers} + layers {layers} + globals {glob} ({:.2} GB; the design's 60.9 GB [derived]); draft {draft_len} B ({:.2} GB; the design's ≈ 8.5 GB); {} shards, layers {spans:?} span",
+        "plan: total {total} B = headers {headers} + layers {layers} + globals {glob} ({:.2} GB; 14.76 GB [derived from the header dump]); draft {draft_len} B ({:.2} GB; 2.27 GB [derived]); {} shards, layers {spans:?} span",
         total as f64 / 1e9,
         draft_len as f64 / 1e9,
         layouts.len()
@@ -380,6 +514,7 @@ fn hw_fixture_plan() {
     let guard = dir("plan");
     let dd = &guard.0;
     let first = header_only(t, dd);
+    write_biases(t, &first);
     let draft_file = header_only(dp, dd);
     let fx = Split::open(&first).unwrap();
     let spec = v41::spec();
@@ -646,6 +781,10 @@ fn flip(path: &Path, at: u64) {
     f.write_all(&[b[0] ^ 0x10]).unwrap();
 }
 
+/// The card budget a subset file records: its family plans none from a part of
+/// a plan.
+const SUBSET_BUDGET: u64 = 1 << 30;
+
 /// Contract 4: end to end.
 #[test]
 #[ignore = "needs the box, the V4.1 file and $BLOOMERY_DSPARK_MODEL (just gate-fixture)"]
@@ -670,9 +809,11 @@ fn hw_fixture_end_to_end() {
         "blk.2.ffn_down_shexp.weight",
     ];
     let spec = v41::spec();
+    // A subset file holds no whole plan to choose the budget from: it is given.
     let opts = Options {
         tensors: Some(subset.map(String::from).to_vec()),
         shard_bytes: u64::MAX,
+        card_budget: Some(SUBSET_BUDGET),
         ..spec.options()
     };
     let p = fixture::plan(&spec, &src, None, &opts).unwrap();
@@ -693,6 +834,7 @@ fn hw_fixture_end_to_end() {
     let out_s = out.to_str().unwrap();
     let list = subset.join(",");
     let cap_s = cap.to_string();
+    let budget_s = SUBSET_BUDGET.to_string();
     let t0 = Instant::now();
     let (rc, stdout, _) = run(&[
         "generate",
@@ -704,6 +846,8 @@ fn hw_fixture_end_to_end() {
         &list,
         "--shard-bytes",
         &cap_s,
+        "--card-budget",
+        &budget_s,
     ]);
     let gen_wall = t0.elapsed().as_secs_f64();
     assert_eq!(rc, Some(0));
@@ -747,6 +891,8 @@ fn hw_fixture_end_to_end() {
         "7",
         "--tensors",
         &list,
+        "--card-budget",
+        &budget_s,
     ]);
     assert_eq!(rc, Some(1));
     assert!(
@@ -792,6 +938,8 @@ fn hw_fixture_end_to_end() {
         "blk.0.attn_norm.weight",
         "--draft-tensors",
         &dlist,
+        "--card-budget",
+        &budget_s,
     ]);
     let draft_wall = t1.elapsed().as_secs_f64();
     assert_eq!(rc, Some(0));
@@ -871,7 +1019,9 @@ fn patch_alignment(path: &Path, to: u32) {
     std::fs::write(path, bytes).unwrap();
 }
 
-/// A draft's metadata: the dflash architecture, `target_layers`, and `extra`.
+/// A draft's metadata: the dflash architecture, the real draft's ff (the
+/// V4.1 spec moves it with the target's), `target_layers`, and `extra`, which
+/// replaces a key the draft already has.
 fn draft_kvs(target_layers: std::ops::Range<u32>, extra: &[(&str, Value)]) -> Vec<(String, Value)> {
     let mut kvs = vec![
         (
@@ -879,11 +1029,20 @@ fn draft_kvs(target_layers: std::ops::Range<u32>, extra: &[(&str, Value)]) -> Ve
             Value::String(model::arch::DFLASH.into()),
         ),
         (
+            format!("{}.expert_feed_forward_length", model::arch::DFLASH),
+            Value::U32(2304),
+        ),
+        (
             format!("{}.target_layers", model::arch::DFLASH),
             Value::Array(target_layers.map(Value::U32).collect()),
         ),
     ];
-    kvs.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    for (k, v) in extra {
+        match kvs.iter_mut().find(|(have, _)| have == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => kvs.push((k.to_string(), v.clone())),
+        }
+    }
     kvs
 }
 
@@ -934,17 +1093,55 @@ fn hw_fixture_refusals() {
         Ok(_) => bad.push("alignment 48: planned".to_string()),
     }
 
-    // An ff override: the V4.1 spec names no ff key, so it has no rule for one.
-    let narrow = FixtureSpec {
+    // An ff override where the family has no ff rule: the Qwen3.8 spec names no
+    // ff key (PIN(2026-10-08): this clause refused the same override on V4.1's
+    // spec until V4.1 gained its ff rule that day; the override is now V4.1's own
+    // contract, below, and the refusal for a family with no rule moved to the
+    // spec that has none).
+    let qsrc = q38_source();
+    let rowless = FixtureSpec {
         ff: Some(512),
+        ..q38::spec()
+    };
+    match fixture::plan(&rowless, &qsrc, None, &rowless.options()) {
+        Err(e @ FixtureError::Metadata { .. }) if e.to_string().contains("has no ff key") => {
+            println!("refusals: ff 512 on a spec with no ff rule: {e}");
+        }
+        Err(e) => bad.push(format!("ff 512 on Qwen3.8: refused as {e}")),
+        Ok(_) => bad.push("ff 512 on Qwen3.8: planned".to_string()),
+    }
+
+    // An ff the K-quant blocks do not tile: the down stacks' K is the ff.
+    let ragged = FixtureSpec {
+        ff: Some(500),
         ..v41::spec()
     };
-    match fixture::plan(&narrow, &src, None, &narrow.options()) {
-        Err(e @ FixtureError::Metadata { .. }) if e.to_string().contains("has no ff key") => {
-            println!("refusals: ff 512: {e}");
+    match fixture::plan(&ragged, &src, None, &ragged.options()) {
+        Err(e @ FixtureError::Tensor { .. })
+            if e.to_string().contains("not whole blocks of 256") =>
+        {
+            println!("refusals: ff 500: {e}");
         }
-        Err(e) => bad.push(format!("ff 512: refused as {e}")),
-        Ok(_) => bad.push("ff 512: planned".to_string()),
+        Err(e) => bad.push(format!("ff 500: refused as {e}")),
+        Ok(_) => bad.push("ff 500: planned".to_string()),
+    }
+
+    // A draft whose ff is not the target's: one override moves both.
+    let odd = draft_header(
+        &d.join("odd-ff.gguf"),
+        &draft_kvs(
+            n_layer - 3..n_layer,
+            &[("dflash.expert_feed_forward_length", Value::U32(1024))],
+        ),
+    );
+    match fixture::plan(&spec, &src, Some(&odd), &spec.options()) {
+        Err(e @ FixtureError::Metadata { .. })
+            if e.to_string().contains("not the target's ff 2304") =>
+        {
+            println!("refusals: a draft at ff 1024: {e}");
+        }
+        Err(e) => bad.push(format!("a draft at ff 1024: refused as {e}")),
+        Ok(_) => bad.push("a draft at ff 1024: planned".to_string()),
     }
 
     // A file of an architecture no spec covers, and the V4-Flash string the
@@ -994,12 +1191,303 @@ fn hw_fixture_refusals() {
         "not refused by name:\n  {}",
         bad.join("\n  ")
     );
-    println!("refusals: all 9 refused by name");
+    println!("refusals: all 11 refused by name");
+}
+
+/// Contract 13: V4.1's recorded card budget makes the written file's plan, at
+/// the gates' machine and context, hold half of every layer's experts on the
+/// card (192 of 384), as `verify` re-plans it. The condition table is printed:
+/// the budget is the plan of one resident sequence at [`v41::BUDGET_CTX`], and
+/// a gate that plans another sequence count or context reads another table row.
+#[test]
+#[ignore = "needs the box and the V4.1 file (just gate-fixture)"]
+fn hw_fixture_v41_budget() {
+    let src = source();
+    let spec = v41::spec();
+    let CardBudget::Planned(planner) = spec.card_budget else {
+        panic!("the V4.1 spec plans its card budget");
+    };
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let recorded = p.card_budget;
+    let mut kvs = p.target.kvs.clone();
+    assert_eq!(*kv(&mut kvs, KEY_CARD_BUDGET), Value::U64(recorded));
+
+    let guard = dir("v41budget");
+    let first = header_only(&p.target, &guard.0);
+    // The family's bias check reads the biases: a hole file has none to read.
+    write_biases(&p.target, &first);
+    let fx = Split::open(&first).unwrap();
+    let inputs = V41Inputs::describe(&fx).unwrap();
+    let (layers, experts) = (inputs.model.layers, inputs.model.experts);
+    assert_eq!((layers, experts), (9, 384));
+    let machine = workstation::plan_gate(layers);
+    let at = |budget: Option<u64>, ctx: u64, slots: usize| -> Result<Vec<u64>, String> {
+        let levers = PlanLevers {
+            card_budget_bytes: budget,
+        };
+        let slots = NonZeroUsize::new(slots).unwrap();
+        inputs
+            .plan_with_slots(&machine, ctx, &levers, slots)
+            .map(|plan| plan.n_l.clone())
+            .map_err(|e| e.to_string())
+    };
+    let ctx = v41::BUDGET_CTX;
+    // f0 and f1 are the source's first two layers, whose Q5_K down no card
+    // kernel runs: their experts stay on the host.
+    let want = |n: u64| -> Vec<u64> { (0..layers).map(|l| if l < 2 { 0 } else { n }).collect() };
+    assert_eq!(
+        at(None, ctx, 1).unwrap(),
+        want(experts),
+        "the budgetless plan holds every expert it can"
+    );
+    assert_eq!(
+        at(Some(recorded), ctx, 1).unwrap(),
+        want(experts / 2),
+        "the plan under {recorded}"
+    );
+    assert!(
+        recorded < RTX_3090.usable_bytes(),
+        "a budget {recorded} that does not bind a card of {}",
+        RTX_3090.usable_bytes()
+    );
+    fixture::check_budget(&planner, &fx, recorded).unwrap();
+
+    let mut bad: Vec<String> = Vec::new();
+    for (what, budget) in [
+        ("64 MiB below", recorded - (64 << 20)),
+        ("64 MiB above", recorded + (64 << 20)),
+    ] {
+        match fixture::check_budget(&planner, &fx, budget) {
+            Err(e @ FixtureError::Budget(_)) => println!("v41 budget: {what}: {e}"),
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(c) => bad.push(format!("{what}: holds {:?}", c.per_layer)),
+        }
+    }
+
+    // `verify` re-plans the written file under the budget its header records.
+    let mut edited = p.target.clone();
+    *kv(&mut edited.kvs, KEY_CARD_BUDGET) = Value::U64(recorded - (64 << 20));
+    let g2 = dir("v41budget-edited");
+    let first2 = header_only(&edited, &g2.0);
+    write_biases(&edited, &first2);
+    let fx2 = Split::open(&first2).unwrap();
+    match fixture::verify(&spec, &fx2, &src, None, &mut |_, _| {}) {
+        Err(e @ FixtureError::Budget(_)) if e.to_string().contains("plan under the budget") => {
+            println!(
+                "v41 budget: verify of a header recording {}: {e}",
+                recorded - (64 << 20)
+            );
+        }
+        other => bad.push(format!("verify of an edited budget: {other:?}")),
+    }
+    // The control: the recorded header passes that check and meets its holes.
+    match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+        Err(FixtureError::Budget(m)) => bad.push(format!("verify of the recorded budget: {m}")),
+        Err(e) => println!("v41 budget: control, the recorded header passes the budget check: {e}"),
+        Ok(_) => bad.push("a file of holes verified".into()),
+    }
+
+    println!(
+        "v41 budget: recorded {recorded} B ({} MiB) at ctx {ctx}, 1 slot, plan_gate({layers}); \
+         budgetless {:?}; recorded {:?}",
+        recorded / (1 << 20),
+        at(None, ctx, 1).unwrap(),
+        at(Some(recorded), ctx, 1).unwrap(),
+    );
+    for slots in [1, 2] {
+        for c in [4096, 8192, 16384, ctx] {
+            println!(
+                "v41 budget: condition ctx {c} slots {slots}: under the recorded budget {:?}, \
+                 budgetless {:?}",
+                at(Some(recorded), c, slots),
+                at(None, c, slots)
+            );
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// `bias`'s refusal is the family's, by the layer's name and the coverage
+/// clause it breaks.
+fn bias_refused(
+    bad: &mut Vec<String>,
+    what: &str,
+    got: Result<impl std::fmt::Debug, FixtureError>,
+    layer: usize,
+) {
+    match got {
+        Err(e @ FixtureError::Mismatch { .. })
+            if e.to_string()
+                .contains(&format!("layer {layer}'s router biases"))
+                && e.to_string().contains("coverage clause") =>
+        {
+            println!("v41 biases: {what}: {e}");
+        }
+        Err(e) => bad.push(format!("{what}: refused as {e}")),
+        Ok(v) => bad.push(format!("{what}: accepted, {v:?}")),
+    }
+}
+
+/// Contract 14: V4.1's routed layers carry two router biases that differ
+/// between experts, which the media gate's coverage clause needs (a constant
+/// difference moves no pick): the text bias is a constant 0, the media bias a
+/// uniform draw, each layer's its own; and the family's header check refuses a
+/// file whose biases are zeros, equal, or one a constant shift of the other.
+#[test]
+#[ignore = "needs the box and the V4.1 file (just gate-fixture)"]
+fn hw_fixture_v41_biases() {
+    let src = source();
+    let spec = v41::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let t = &p.target;
+    let find = |name: &str| {
+        t.tensors
+            .iter()
+            .find(|x| x.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let routed: Vec<usize> = (0..LAYER_MAP.len())
+        .filter(|f| {
+            t.tensors
+                .iter()
+                .any(|x| x.name == format!("blk.{f}.exp_probs_b_vl.bias"))
+        })
+        .collect();
+    assert_eq!(routed.len(), 9, "every layer of the map is routed");
+    let (text_of, media_of) = (
+        |f: usize| format!("blk.{f}.exp_probs_b.bias"),
+        |f: usize| format!("blk.{f}.exp_probs_b_vl.bias"),
+    );
+
+    let mut spreads: Vec<Vec<f32>> = Vec::new();
+    for &f in &routed {
+        assert_eq!(find(&text_of(f)).rule, Rule::Const { value: 0.0 });
+        let m = find(&media_of(f));
+        assert_eq!(
+            m.rule,
+            Rule::Uniform {
+                ty: fixture::FloatTy::F32,
+                half_width: v41::VL_BIAS_HALF_WIDTH
+            }
+        );
+        let v = floats(&filled(m, fixture::DEFAULT_SEED));
+        let (lo, hi) = v
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+        assert!(
+            v.iter().all(|x| x.abs() <= v41::VL_BIAS_HALF_WIDTH) && hi - lo >= v41::BIAS_SPREAD_MIN,
+            "layer {f}: media bias spans [{lo}, {hi}]"
+        );
+        spreads.push(v);
+    }
+    for (i, a) in spreads.iter().enumerate() {
+        for b in &spreads[i + 1..] {
+            assert!(a != b, "two layers' media biases are one stream");
+        }
+    }
+    println!(
+        "v41 biases: {} routed layers, text const 0, media uniform ±{}; spans [{:.4}, {:.4}] over {} experts",
+        routed.len(),
+        v41::VL_BIAS_HALF_WIDTH,
+        spreads
+            .iter()
+            .map(|v| v.iter().fold(f32::MAX, |a, &x| a.min(x)))
+            .fold(f32::MAX, f32::min),
+        spreads
+            .iter()
+            .map(|v| v.iter().fold(f32::MIN, |a, &x| a.max(x)))
+            .fold(f32::MIN, f32::max),
+        spreads[0].len(),
+    );
+
+    // The header check on a header-only file whose biases take each form.
+    let guard = dir("v41biases");
+    let first = header_only(t, &guard.0);
+    let check = || v41::check_kinds(&spec, &Split::open(&first).unwrap(), &src);
+    let mut bad: Vec<String> = Vec::new();
+    bias_refused(&mut bad, "biases of zeros (holes)", check(), routed[0]);
+    write_biases(t, &first);
+    if let Err(e) = check() {
+        bad.push(format!("the generated biases: {e}"));
+    }
+    let l = routed[4];
+    let (text, media) = (text_of(l), media_of(l));
+    let spread = f32_bytes(&spreads[4]);
+    let zeros = vec![0u8; spread.len()];
+    // Text and media the same non-constant draw.
+    put(&first, &text, &spread);
+    bias_refused(&mut bad, "equal biases", check(), l);
+    // Media a constant shift of text.
+    let shifted: Vec<f32> = spreads[4].iter().map(|x| x + 0.3).collect();
+    put(&first, &media, &f32_bytes(&shifted));
+    bias_refused(&mut bad, "a constant shift", check(), l);
+    // Restored.
+    put(&first, &text, &zeros);
+    put(&first, &media, &spread);
+    if let Err(e) = check() {
+        bad.push(format!("the biases restored: {e}"));
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 15: V4.1's r8 sidecar takes the gate and up stack of every layer
+/// of the fixture, in layer order, each a Q3_K stack of the source's type and
+/// width on `r8file`'s grid at the fixture's ff.
+#[test]
+#[ignore = "needs the box and the V4.1 file (just gate-fixture)"]
+fn hw_fixture_v41_r8() {
+    let src = source();
+    let spec = v41::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let guard = dir("v41r8");
+    let fx = Split::open(header_only(&p.target, &guard.0)).unwrap();
+    let sidecar = spec.sidecar.expect("V4.1 has an r8 sidecar");
+    let names = (sidecar.stacks)(&fx).unwrap();
+    let want: Vec<String> = (0..LAYER_MAP.len())
+        .flat_map(|f| {
+            [
+                format!("blk.{f}.ffn_gate_exps.weight"),
+                format!("blk.{f}.ffn_up_exps.weight"),
+            ]
+        })
+        .collect();
+    assert_eq!(names, want);
+    let mut bytes = 0;
+    for (i, n) in names.iter().enumerate() {
+        let (_, info) = fx.find(n).unwrap();
+        let source_name = format!(
+            "blk.{}.{}",
+            LAYER_MAP[i / 2],
+            n.split_once('.').unwrap().1.split_once('.').unwrap().1
+        );
+        let (_, s) = src.find(&source_name).unwrap();
+        assert_eq!(info.ty, GgmlType::Q3_K, "{n}");
+        assert_eq!(info.ty, s.ty, "{n}");
+        assert_eq!(info.dims, ff_dims(leaf_of(n), &s.dims), "{n}");
+        assert_eq!(info.dims[1], v41::FIXTURE_FF, "{n}");
+        assert!(
+            info.dims[0] % 256 == 0 && info.dims[1] % 8 == 0,
+            "{n}: r8's grid"
+        );
+        bytes += info.nbytes;
+    }
+    println!(
+        "v41 r8: {} stacks {:?}, {bytes} B of Q3_K ({:.2} GB); the sidecar's data is that many bytes",
+        names.len(),
+        fx.find(&names[0]).unwrap().1.dims,
+        bytes as f64 / 1e9
+    );
 }
 
 /// The second family's rules: every generic key rule, a constant for its
-/// norms, an ff axis on each expert stack, and a table.
-struct Toy;
+/// norms, a spread for its bias, an ff axis on each expert stack, and a table.
+/// `both` also gives the bias a constant: a family that names both is refused.
+struct Toy {
+    both: bool,
+}
+
+/// The half-width of the toy bias's spread.
+const TOY_SPREAD: f32 = 0.25;
 
 impl Family for Toy {
     fn key_rule(&self, suffix: &str) -> Option<KeyRule> {
@@ -1016,7 +1504,13 @@ impl Family for Toy {
     }
 
     fn const_value(&self, leaf: &str) -> Option<f32> {
-        matches!(leaf, "norm.weight" | "output_norm.weight").then_some(1.0)
+        (matches!(leaf, "norm.weight" | "output_norm.weight")
+            || (self.both && leaf == "bias.weight"))
+            .then_some(1.0)
+    }
+
+    fn spread_value(&self, leaf: &str) -> Option<f32> {
+        (leaf == "bias.weight").then_some(TOY_SPREAD)
     }
 
     fn ff_axis(&self, leaf: &str) -> Option<usize> {
@@ -1085,7 +1579,8 @@ impl Tables for ToyTable {
     }
 }
 
-static TOY: Toy = Toy;
+static TOY: Toy = Toy { both: false };
+static TOY_BOTH: Toy = Toy { both: true };
 
 /// A four-layer source of the second family: one file, its tensors zero.
 fn toy_source(path: &Path) -> Split {
@@ -1094,9 +1589,10 @@ fn toy_source(path: &Path) -> Split {
         ("tab.weight", vec![64, 1000], GgmlType::BF16),
         ("output_norm.weight", vec![64], GgmlType::F32),
     ];
-    let names: Vec<[String; 4]> = (0..4)
+    let names: Vec<[String; 6]> = (0..4)
         .map(|l| {
-            ["norm", "attn", "ffn_up_exps", "ffn_down_exps"].map(|n| format!("blk.{l}.{n}.weight"))
+            ["norm", "attn", "ffn_up_exps", "ffn_down_exps", "bias", "r8"]
+                .map(|n| format!("blk.{l}.{n}.weight"))
         })
         .collect();
     for n in &names {
@@ -1104,6 +1600,9 @@ fn toy_source(path: &Path) -> Split {
         tensors.push((&n[1], vec![4096, 8], GgmlType::Q8_0));
         tensors.push((&n[2], vec![64, 512, 4], GgmlType::BF16));
         tensors.push((&n[3], vec![512, 64, 4], GgmlType::BF16));
+        tensors.push((&n[4], vec![4096], GgmlType::F32));
+        // A Q3_K stack the r8 sidecar takes: 4 experts of 16 rows of 256.
+        tensors.push((&n[5], vec![256, 16, 4], GgmlType::Q3_K));
     }
     let kvs = vec![
         (
@@ -1158,8 +1657,10 @@ fn toy_spec() -> FixtureSpec {
         card_budget: CardBudget::Fixed(1 << 30),
         window: Window::new(1.0 / 16384.0, 1.0 / 64.0).unwrap(),
         ff: Some(256),
+        shard_bytes: DEFAULT_SHARD_BYTES,
         default_source: String::new,
         draft: None,
+        sidecar: None,
         family: &TOY,
     }
 }
@@ -1211,6 +1712,8 @@ fn fixture_second_family() {
             ("attn", vec![4096, 8]),
             ("ffn_up_exps", vec![64, 256, 4]),
             ("ffn_down_exps", vec![256, 64, 4]),
+            ("bias", vec![4096]),
+            ("r8", vec![256, 16, 4]),
         ] {
             want.push((
                 format!("blk.{f}.{n}.weight"),
@@ -1238,14 +1741,67 @@ fn fixture_second_family() {
     let s = fixture::generate(&spec, &src, None, &out, &opts, &mut |_| {}).unwrap();
     let fx = Split::open(out.join("toy-fixture-00001-of-00001.gguf")).unwrap();
     let (v, none) = fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
-    assert_eq!((v.tensors, v.subset, none.is_none()), (10, false, true));
+    assert_eq!((v.tensors, v.subset, none.is_none()), (14, false, true));
+    assert!(
+        s.sidecar.is_none() && v.sidecar.is_none() && !d.join("out-r8").exists(),
+        "a family with no sidecar writes and checks none"
+    );
     println!(
         "second family: wrote {} tensors, {} bytes; verify {} tensors, {} blocks",
         s.tensors, s.file_bytes, v.tensors, v.blocks
     );
 
+    // A spread tensor: a uniform draw in ±the family's half-width, never a
+    // constant, and each tensor's own (its stream is keyed by its name).
+    let bias = |l: usize| {
+        p.target
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("blk.{l}.bias.weight"))
+            .unwrap()
+    };
+    let (b0, b1) = (bias(0), bias(1));
+    assert_eq!(
+        b0.rule,
+        Rule::Uniform {
+            ty: fixture::FloatTy::F32,
+            half_width: TOY_SPREAD
+        }
+    );
+    assert!((b0.sigma().unwrap() - f64::from(TOY_SPREAD) / 3.0f64.sqrt()).abs() < 1e-9);
+    let (v0, v1) = (sample(b0, 3), sample(b1, 3));
+    let (f0, f1) = (floats(&v0), floats(&v1));
+    assert!(
+        f0.iter().all(|x| x.abs() <= TOY_SPREAD),
+        "inside ±{TOY_SPREAD}"
+    );
+    assert!(
+        f0.iter().any(|&x| x != f0[0]),
+        "a spread tensor holds more than one value"
+    );
+    assert!(f0 != f1, "two layers' biases are one stream");
+    println!(
+        "second family: bias spread ±{TOY_SPREAD}, blk.0 {} distinct of {}, blk.0 ≠ blk.1",
+        {
+            let mut d = f0.clone();
+            d.sort_by(f32::total_cmp);
+            d.dedup();
+            d.len()
+        },
+        f0.len()
+    );
+
     let mut bad: Vec<String> = Vec::new();
-    let refusals: [(&str, FixtureSpec, bool, &str); 4] = [
+    let refusals: [(&str, FixtureSpec, bool, &str); 5] = [
+        (
+            "a constant and a spread for one leaf",
+            FixtureSpec {
+                family: &TOY_BOTH,
+                ..toy_spec()
+            },
+            false,
+            "names both a constant and a spread",
+        ),
         (
             "the spec's ratios one short",
             FixtureSpec {
@@ -1296,6 +1852,139 @@ fn fixture_second_family() {
     );
 }
 
+/// The stacks the toy's sidecar holds: each layer's `r8` tensor, in file order.
+fn toy_stacks(split: &Split) -> Result<Vec<String>, FixtureError> {
+    Ok(split
+        .iter_tensors()
+        .filter(|(_, t)| t.name.ends_with(".r8.weight"))
+        .map(|(_, t)| t.name.clone())
+        .collect())
+}
+
+/// Only the first layer's stack: a family that names fewer stacks than the
+/// sidecar beside the file holds.
+fn toy_first_stack(split: &Split) -> Result<Vec<String>, FixtureError> {
+    Ok(toy_stacks(split)?.into_iter().take(1).collect())
+}
+
+/// A family that names no stack.
+fn toy_no_stacks(_: &Split) -> Result<Vec<String>, FixtureError> {
+    Ok(Vec::new())
+}
+
+fn toy_sidecar_spec(stacks: fn(&Split) -> Result<Vec<String>, FixtureError>) -> FixtureSpec {
+    FixtureSpec {
+        sidecar: Some(SidecarSpec { stacks }),
+        ..toy_spec()
+    }
+}
+
+/// `got` is the sidecar refusal whose text holds `want`, else `bad` gains why not.
+fn sidecar_refused<T: std::fmt::Debug>(
+    bad: &mut Vec<String>,
+    what: &str,
+    got: Result<T, FixtureError>,
+    want: &str,
+) {
+    match got {
+        Err(e @ FixtureError::Sidecar { .. }) if e.to_string().contains(want) => {
+            println!("sidecar: {what}: {e}");
+        }
+        Err(e) => bad.push(format!("{what}: refused as {e}")),
+        Ok(v) => bad.push(format!("{what}: accepted, {v:?}")),
+    }
+}
+
+/// Contract 12: the r8 sidecar. A family with one gets it written beside the
+/// fixture by `generate` and checked by `verify` against the fixture's own
+/// bytes: absent, another stack set and a flipped byte are refused by name,
+/// and a family that names no stack leaves no fixture behind.
+#[test]
+fn fixture_sidecar() {
+    let guard = dir("sidecar");
+    let d = &guard.0;
+    let src = toy_source(&d.join("toy-00001-of-00001.gguf"));
+    let spec = toy_sidecar_spec(toy_stacks);
+    let opts = Options {
+        seed: 3,
+        ..spec.options()
+    };
+    let out = d.join("out");
+    let s = fixture::generate(&spec, &src, None, &out, &opts, &mut |_| {}).unwrap();
+    let first = out.join("toy-fixture-00001-of-00001.gguf");
+    let side = s
+        .sidecar
+        .as_ref()
+        .expect("a family with a sidecar writes one");
+    let want = d.join("out-r8").join("toy-fixture-r8.gguf");
+    assert_eq!(side.path, want, "the sidecar's name is r8file's");
+    assert_eq!(side.path, fixture::sidecar_path(&first).unwrap());
+    assert_eq!(side.tensors, 2, "one stack a layer");
+    assert!(side.path.is_file());
+    let len = std::fs::metadata(&side.path).unwrap().len();
+    assert_eq!(side.bytes, len);
+
+    let fx = Split::open(&first).unwrap();
+    let (v, _) = fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    let checked = v.sidecar.as_ref().expect("verify checks the sidecar");
+    assert_eq!((checked.tensors, &checked.path), (2, &side.path));
+    println!(
+        "sidecar: wrote {} stacks, {len} B in {:.3} s; verify read {} stack bytes in {:.3} s",
+        side.tensors, side.secs, checked.bytes, checked.secs
+    );
+
+    let mut bad: Vec<String> = Vec::new();
+    let check = |spec: &FixtureSpec| fixture::verify(spec, &fx, &src, None, &mut |_, _| {});
+
+    // The sidecar moved away: the fixture's verify names it.
+    let aside = side.path.with_extension("moved");
+    std::fs::rename(&side.path, &aside).unwrap();
+    sidecar_refused(&mut bad, "absent", check(&spec), "is absent");
+    std::fs::rename(&aside, &side.path).unwrap();
+
+    // The sidecar of another stack set than the family names.
+    let fewer = toy_sidecar_spec(toy_first_stack);
+    sidecar_refused(
+        &mut bad,
+        "one stack named, two held",
+        check(&fewer),
+        "holds 2 stacks",
+    );
+
+    // One byte of the last stack flipped: its repack no longer unpacks to the
+    // fixture's bytes.
+    flip(&side.path, len - 3520);
+    sidecar_refused(
+        &mut bad,
+        "a flipped byte",
+        check(&spec),
+        "unpacks to other bytes",
+    );
+    flip(&side.path, len - 3520);
+    if let Err(e) = check(&spec) {
+        bad.push(format!("the byte flipped back: {e}"));
+    }
+
+    // A family that names no stack: the generate fails and the fixture is
+    // not left without its sidecar.
+    let none = toy_sidecar_spec(toy_no_stacks);
+    let out2 = d.join("out2");
+    sidecar_refused(
+        &mut bad,
+        "no stack named",
+        fixture::generate(&none, &src, None, &out2, &opts, &mut |_| {}),
+        "no tensors to convert",
+    );
+    if out2.exists() || d.join("out2-r8").exists() {
+        bad.push("a failed sidecar left files behind".into());
+    }
+    assert!(
+        bad.is_empty(),
+        "not refused by name:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
 /// A tensor of `ty` with rows of `k` values under `rule`, as many rows as one
 /// chunk holds.
 fn one_chunk(ty: GgmlType, k: u64, rule: Rule) -> PlannedTensor {
@@ -1326,11 +2015,21 @@ fn filled_ratio(t: &PlannedTensor, window: Window) -> Result<f64, FixtureError> 
     Ok(rms * (t.dims[0] as f64).sqrt())
 }
 
-/// Contract 7: the Q5_1 and IQ4_NL rules fill at σ under V4.1's window. Every
+/// The window the rule contracts below are written at: [2^-13, 2^-10], which
+/// is no longer the V4.1 spec's. The contracts test the rules' fit and refusal
+/// at this window, so they keep it as their own value. At ff 512 a Q4_K or Q5_K
+/// down stack's `dmin` passes 2^-10 at the widest scale band, so the spec's
+/// upper bound is 2^-9.
+// PIN(2026-10-08): the contracts' window, formerly the V4.1 spec's.
+fn rule_window() -> Window {
+    Window::new(1.0 / 8192.0, 1.0 / 1024.0).unwrap()
+}
+
+/// Contract 7: the Q5_1 and IQ4_NL rules fill at σ under the rule window. Every
 /// case runs; the failures are listed together.
 #[test]
 fn fixture_new_rules_fill_at_sigma() {
-    let window = v41::spec().window;
+    let window = rule_window();
     let mut bad = Vec::new();
     for (ty, k) in [
         (GgmlType::Q5_1, 16384),
@@ -1357,11 +2056,11 @@ fn fixture_new_rules_fill_at_sigma() {
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
 
-/// Contract 7: a σ whose `d` no code choice puts in V4.1's window is refused
+/// Contract 7: a σ whose `d` no code choice puts in the rule window is refused
 /// with `NoScale`, at both ends of each rule's range. Every case runs.
 #[test]
 fn fixture_new_rules_refuse_out_of_window() {
-    let window = v41::spec().window;
+    let window = rule_window();
     let mut bad = Vec::new();
     for (ty, k) in [
         (GgmlType::Q5_1, 640),
@@ -1378,14 +2077,14 @@ fn fixture_new_rules_refuse_out_of_window() {
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
 
-/// Contract 8: the second family's window, [2^-14, 2^-6], is wider than
-/// V4.1's and admits Q5_1 at K = 640 (`d = σ/√85.25 = 2^-7.87`), which V4.1's
-/// refuses; its blocks fill at σ and hold under the wide window, and V4.1's
-/// window refuses them by name.
+/// Contract 8: the second family's window, [2^-14, 2^-6], is wider than the
+/// rule window and admits Q5_1 at K = 640 (`d = σ/√85.25 = 2^-7.87`), which
+/// the rule window refuses; its blocks fill at σ and hold under the wide
+/// window, and the rule window refuses them by name.
 #[test]
 fn fixture_wider_window_admits_q5_1_at_k640() {
     let (ty, k) = (GgmlType::Q5_1, 640);
-    let narrow = v41::spec().window;
+    let narrow = rule_window();
     let wide = toy_spec().window;
     match rule_for("t", ty, k, narrow) {
         Err(e @ FixtureError::NoScale { .. }) => println!("window: {ty} K = {k}: {e}"),
@@ -1531,14 +2230,22 @@ fn edited_header(
     Split::open(&path).unwrap()
 }
 
-/// A tensor of the map's layers, or no layer's.
-fn q38_keep(name: &str) -> bool {
+/// A tensor of `map`'s layers, or no layer's.
+fn keeps(map: &[usize], name: &str) -> bool {
     match name.strip_prefix("blk.").and_then(|r| r.split_once('.')) {
-        Some((l, _)) => l
-            .parse::<usize>()
-            .is_ok_and(|l| q38::LAYER_MAP.contains(&l)),
+        Some((l, _)) => l.parse::<usize>().is_ok_and(|l| map.contains(&l)),
         None => true,
     }
+}
+
+fn q38_keep(name: &str) -> bool {
+    keeps(&q38::LAYER_MAP, name)
+}
+
+/// The integer key `key` set to `n`, in its own type.
+fn set_int(kvs: &mut [(String, Value)], key: &str, n: u64) {
+    let v = kv(kvs, key);
+    *v = retype(&v.clone(), n);
 }
 
 /// An edit of a header's metadata.
@@ -1860,6 +2567,447 @@ fn hw_fixture_q38_refusals() {
             Err(e) => bad.push(format!("{what}: refused as {e}")),
             Ok(_) => bad.push(format!("{what}: verified")),
         }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+// ------------------------------------------------------------------ GLM-5.3-Flash
+
+fn glm_source() -> Split {
+    Split::open(glm::DEFAULT_MODEL)
+        .unwrap_or_else(|e| panic!("open the GLM-5.3-Flash file {}: {e}", glm::DEFAULT_MODEL))
+}
+
+const GLM_HC: &str = "glm5next.hyper_connection.count";
+const GLM_EXPERTS: &str = "glm5next.expert_count";
+const GLM_KPOOL: &str = "glm5next.attention.indexer.kpool";
+const GLM_NEXTN: &str = "glm5next.nextn_predict_layers";
+const GLM_DENSE: &str = "glm5next.leading_dense_block_count";
+const GLM_FF: &str = "glm5next.expert_feed_forward_length";
+
+/// Contract 16: the plan of the GLM-5.3-Flash fixture, and the engine's reader
+/// reading it back: seven layers from source layers 0, 1, 4, 7, 8, 11 and 45,
+/// kinds [KDA, KDA, KDA, latent, KDA, latent, latent], a dense prefix of two,
+/// the NextN layer believed, the routed ff 512 on the three stacks and the
+/// shared expert's own width untouched, every (role, type) pair of the real
+/// file's routed stacks kept.
+#[test]
+#[ignore = "needs the box and the GLM-5.3-Flash file (just gate-fixture)"]
+fn hw_fixture_glm_plan() {
+    let src = glm_source();
+    let spec = glm::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).expect("the plan of the real file");
+    let t = &p.target;
+    let get = |k: &str| -> Value {
+        t.kvs
+            .iter()
+            .find(|(n, _)| n == k)
+            .unwrap_or_else(|| panic!("no {k}"))
+            .1
+            .clone()
+    };
+    assert_eq!(
+        unsigned_items(&get(KEY_SOURCE_LAYERS)),
+        [0, 1, 4, 7, 8, 11, 45]
+    );
+    assert_eq!(get("glm5next.block_count").as_unsigned(), Some(7));
+    assert_eq!(get(GLM_DENSE).as_unsigned(), Some(2));
+    assert_eq!(get(GLM_NEXTN).as_unsigned(), Some(1));
+    assert_eq!(get(GLM_FF).as_unsigned(), Some(glm::FIXTURE_FF));
+    let shared = "glm5next.expert_shared_feed_forward_length";
+    assert_eq!(
+        get(shared).as_unsigned(),
+        src.arch_get_u64("expert_shared_feed_forward_length"),
+        "the shared expert keeps its own width"
+    );
+
+    // Each tensor is its source's, renamed through the map, in the source's
+    // type, at the source's dims but the routed stacks' ff.
+    let mut pairs: Vec<(String, GgmlType)> = Vec::new();
+    for pt in &t.tensors {
+        let (_, info) = src
+            .find(&pt.source)
+            .unwrap_or_else(|| panic!("no source tensor {}", pt.source));
+        assert_eq!(pt.ty, info.ty, "{}", pt.name);
+        let mut dims = info.dims.clone();
+        match leaf_of(&pt.name) {
+            "ffn_gate_exps.weight" | "ffn_up_exps.weight" => dims[1] = glm::FIXTURE_FF,
+            "ffn_down_exps.weight" => dims[0] = glm::FIXTURE_FF,
+            _ => {}
+        }
+        assert_eq!(pt.dims, dims, "{}", pt.name);
+        if let Some(f) = pt.layer {
+            assert!(pt.name.starts_with(&format!("blk.{f}.")), "{}", pt.name);
+            let l = glm::LAYER_MAP[f];
+            assert!(pt.source.starts_with(&format!("blk.{l}.")), "{}", pt.source);
+        }
+        if leaf_of(&pt.name).starts_with("ffn_") && leaf_of(&pt.name).contains("_exps.") {
+            pairs.push((leaf_of(&pt.name).to_string(), pt.ty));
+        }
+    }
+    pairs.sort_by_key(|(n, ty)| (n.clone(), ty.to_string()));
+    pairs.dedup();
+    let pairs: Vec<(&str, String)> = pairs
+        .iter()
+        .map(|(n, ty)| (n.as_str(), ty.to_string()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("ffn_down_exps.weight", GgmlType::Q5_K.to_string()),
+            ("ffn_down_exps.weight", GgmlType::Q6_K.to_string()),
+            ("ffn_gate_exps.weight", GgmlType::Q4_K.to_string()),
+            ("ffn_gate_exps.weight", GgmlType::Q5_K.to_string()),
+            ("ffn_up_exps.weight", GgmlType::Q4_K.to_string()),
+            ("ffn_up_exps.weight", GgmlType::Q5_K.to_string()),
+        ],
+        "every (role, type) pair of the real file's routed stacks"
+    );
+
+    // `ssm_a` is the folded `−e^A_log`, `ssm_dt.bias` its companion: a
+    // positive `ssm_a` would grow the state every step.
+    let decays: Vec<f32> = t
+        .tensors
+        .iter()
+        .filter(|pt| leaf_of(&pt.name) == "ssm_a")
+        .map(|pt| match pt.rule {
+            Rule::Const { value } => value,
+            ref other => panic!("{}: {}, not a constant", pt.name, other.describe()),
+        })
+        .collect();
+    assert_eq!(decays.len(), 4, "the four KDA layers' ssm_a");
+    assert!(decays.iter().all(|&v| v < 0.0), "ssm_a {decays:?}");
+
+    let guard = dir("glmplan");
+    let first = header_only(t, &guard.0);
+    let fx = Split::open(&first).unwrap();
+    let hp = glm::check_kinds(&spec, &fx, &src).unwrap();
+    assert_eq!((hp.n_layer, hp.n_trunk, hp.dense_lead), (7, 6, 2));
+    assert_eq!(
+        hp.kinds,
+        [
+            GlmKind::Kda,
+            GlmKind::Kda,
+            GlmKind::Kda,
+            GlmKind::Latent,
+            GlmKind::Kda,
+            GlmKind::Latent,
+            GlmKind::Latent
+        ]
+    );
+    assert_eq!(
+        (hp.expert_ff, hp.shared_ff, hp.n_expert, hp.n_used),
+        (512, 2048, 288, 8)
+    );
+    let inputs = GlmInputs::describe(&fx).unwrap();
+    assert!(
+        inputs.unimplemented().is_empty(),
+        "the engine runs the fixture: {:?}",
+        inputs.unimplemented()
+    );
+    NextnInputs::read(&inputs).expect("the NextN layer plans");
+
+    let layouts = t.layouts().unwrap();
+    let total: u64 = layouts.iter().map(|(_, l)| l.file_len()).sum();
+    let spans = t.spanning_layers();
+    assert!(
+        layouts.len() >= 2 && !spans.is_empty(),
+        "a layer spans a shard boundary"
+    );
+    println!(
+        "glm plan: {} layers kinds {:?} dense {}; total {total} B ({:.2} GB; 8.57 GB [derived from the header dump]), {} shards, layers {spans:?} span",
+        hp.n_layer,
+        hp.kinds,
+        hp.dense_lead,
+        total as f64 / 1e9,
+        layouts.len()
+    );
+}
+
+/// Contract 17: the recorded card budget makes the plan of the written file
+/// with its NextN layer loaded, at the e2e gate's context, hold half of the
+/// experts (144 of 288) on every card-eligible layer (f2 to f4) and none on the
+/// dense layers and the Q6_K-down layer, as `verify` re-plans it. The condition
+/// table is printed: the budget is the NextN plan at [`glm::BUDGET_CTX`].
+#[test]
+#[ignore = "needs the box and the GLM-5.3-Flash file (just gate-fixture)"]
+fn hw_fixture_glm_budget() {
+    let src = glm_source();
+    let spec = glm::spec();
+    let CardBudget::Planned(planner) = spec.card_budget else {
+        panic!("the GLM spec plans its card budget");
+    };
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let recorded = p.card_budget;
+    let mut kvs = p.target.kvs.clone();
+    assert_eq!(*kv(&mut kvs, KEY_CARD_BUDGET), Value::U64(recorded));
+
+    let guard = dir("glmbudget");
+    let fx = Split::open(header_only(&p.target, &guard.0)).unwrap();
+    let inputs = GlmInputs::describe(&fx).unwrap();
+    let nextn = NextnInputs::read(&inputs).unwrap();
+    let (layers, experts) = (inputs.model.layers, inputs.model.experts);
+    assert_eq!((layers, experts), (6, 288));
+    let machine = workstation::plan_gate(layers);
+    let with_nextn = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
+        let levers = PlanLevers {
+            card_budget_bytes: budget,
+        };
+        inputs
+            .plan_nextn(&machine, ctx, &levers, &nextn)
+            .map(|plan| plan.plan.n_l.clone())
+            .map_err(|e| e.to_string())
+    };
+    let plain = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
+        let levers = PlanLevers {
+            card_budget_bytes: budget,
+        };
+        inputs
+            .plan(&machine, ctx, &levers)
+            .map(|plan| plan.n_l.clone())
+            .map_err(|e| e.to_string())
+    };
+    let ctx = glm::BUDGET_CTX;
+    // Dense f0 and f1, and f5 (a Q6_K down no card kernel runs), hold none on
+    // the card; f2 to f4 are the card-eligible layers.
+    let want = |n: u64| vec![0, 0, n, n, n, 0];
+    assert_eq!(
+        with_nextn(None, ctx).unwrap(),
+        want(experts),
+        "the budgetless plan holds every expert it can"
+    );
+    assert_eq!(
+        with_nextn(Some(recorded), ctx).unwrap(),
+        want(experts / 2),
+        "the plan under {recorded}"
+    );
+    assert!(
+        recorded < RTX_3090.usable_bytes(),
+        "a budget {recorded} that does not bind a card of {}",
+        RTX_3090.usable_bytes()
+    );
+    fixture::check_budget(&planner, &fx, recorded).unwrap();
+
+    let mut bad: Vec<String> = Vec::new();
+    for (what, budget) in [
+        ("64 MiB below", recorded - (64 << 20)),
+        ("64 MiB above", recorded + (64 << 20)),
+    ] {
+        match fixture::check_budget(&planner, &fx, budget) {
+            Err(e @ FixtureError::Budget(_)) => println!("glm budget: {what}: {e}"),
+            Err(e) => bad.push(format!("{what}: refused as {e}")),
+            Ok(c) => bad.push(format!("{what}: holds {:?}", c.per_layer)),
+        }
+    }
+
+    // `verify` re-plans the written file under the budget its header records.
+    let mut edited = p.target.clone();
+    *kv(&mut edited.kvs, KEY_CARD_BUDGET) = Value::U64(recorded - (64 << 20));
+    let g2 = dir("glmbudget-edited");
+    let fx2 = Split::open(header_only(&edited, &g2.0)).unwrap();
+    match fixture::verify(&spec, &fx2, &src, None, &mut |_, _| {}) {
+        Err(e @ FixtureError::Budget(_)) if e.to_string().contains("plan under the budget") => {
+            println!(
+                "glm budget: verify of a header recording {}: {e}",
+                recorded - (64 << 20)
+            );
+        }
+        other => bad.push(format!("verify of an edited budget: {other:?}")),
+    }
+    // The control: the recorded header passes that check and meets its holes.
+    match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+        Err(FixtureError::Budget(m)) => bad.push(format!("verify of the recorded budget: {m}")),
+        Err(e) => println!("glm budget: control, the recorded header passes the budget check: {e}"),
+        Ok(_) => bad.push("a file of holes verified".into()),
+    }
+
+    println!(
+        "glm budget: recorded {recorded} B ({} MiB) at ctx {ctx} with the NextN layer, plan_gate({layers}); \
+         budgetless {:?}; recorded {:?}",
+        recorded / (1 << 20),
+        with_nextn(None, ctx).unwrap(),
+        with_nextn(Some(recorded), ctx).unwrap(),
+    );
+    for c in [1024, 2048, 2051, ctx] {
+        println!(
+            "glm budget: condition ctx {c}: NextN loaded, under the recorded budget {:?}, budgetless {:?}; \
+             no NextN, under it {:?}, budgetless {:?}",
+            with_nextn(Some(recorded), c),
+            with_nextn(None, c),
+            plain(Some(recorded), c),
+            plain(None, c)
+        );
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// `got` is a refusal whose text holds every one of `want`, else `bad` gains
+/// why not.
+fn refused_with<T: std::fmt::Debug>(
+    bad: &mut Vec<String>,
+    what: &str,
+    got: Result<T, FixtureError>,
+    want: &[&str],
+) {
+    match got {
+        Err(e) if want.iter().all(|w| e.to_string().contains(w)) => {
+            println!("glm refusals: {what}: {e}");
+        }
+        Err(e) => bad.push(format!("{what}: refused as {e}")),
+        Ok(v) => bad.push(format!("{what}: accepted, {v:?}")),
+    }
+}
+
+/// Contract 18: what the GLM reader and the kernels take silently, refused by
+/// name: a map that drops the NextN layer (the reader then reads the file as a
+/// trunk of every layer), a dense layer after a routed one, a constant of the
+/// kernels changed in the source or in the written file, a NextN count, a dense
+/// count and an ff the written file has wrong, and an ff off the block grid.
+#[test]
+#[ignore = "needs the box and the GLM-5.3-Flash file (just gate-fixture)"]
+fn hw_fixture_glm_refusals() {
+    let src = glm_source();
+    let spec = glm::spec();
+    let guard = dir("glmrefusals");
+    let d = &guard.0;
+    let mut bad: Vec<String> = Vec::new();
+
+    // The control: the real header rewritten as a one-file set plans, to the
+    // real plan's tensors, so each refusal below is its edit's.
+    let real = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let names =
+        |p: &FilePlan| -> Vec<String> { p.tensors.iter().map(|t| t.name.clone()).collect() };
+    // Every tensor of the source is declared: the reader checks every layer's.
+    let same = edited_header(&src, d, "same.gguf", |_| true, |_| {});
+    match fixture::plan(&spec, &same, None, &spec.options()) {
+        Ok(p) if names(&p.target) == names(&real.target) => {
+            println!(
+                "glm refusals: the control plans {} tensors",
+                p.target.tensors.len()
+            );
+        }
+        Ok(_) => bad.push("the control plans other tensors".into()),
+        Err(e) => bad.push(format!("the control: {e}")),
+    }
+    std::fs::remove_file(d.join("same.gguf")).unwrap();
+
+    // Maps the spec's layers can be replaced by.
+    for (what, layers, want) in [
+        (
+            "a map that drops the NextN layer",
+            vec![0, 1, 4, 7, 8, 11],
+            vec!["does not end in the source's NextN layer 45"],
+        ),
+        (
+            "a map that ends in a trunk layer",
+            vec![0, 1, 4, 7, 11, 8, 45, 12],
+            vec!["does not end in the source's NextN layer 45"],
+        ),
+        (
+            "a dense layer after a routed one",
+            vec![0, 4, 1, 7, 8, 11, 45],
+            vec!["after a routed one"],
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers,
+            ..glm::spec()
+        };
+        refused_with(
+            &mut bad,
+            what,
+            fixture::plan(&s, &src, None, &s.options()),
+            &want,
+        );
+    }
+
+    // An ff the K-quant blocks do not tile.
+    let ragged = FixtureSpec {
+        ff: Some(500),
+        ..glm::spec()
+    };
+    refused_with(
+        &mut bad,
+        "ff 500",
+        fixture::plan(&ragged, &src, None, &ragged.options()),
+        &["not whole blocks of 256"],
+    );
+
+    // The source, with a constant of the kernels or a key the file's reader
+    // needs changed.
+    let source_rows: [(&str, Edit, &[&str]); 5] = [
+        (
+            "source hyper_connection.count 8",
+            |kvs| set_int(kvs, GLM_HC, 8),
+            &[GLM_HC, "is 8 in the source", "built for 4"],
+        ),
+        (
+            "source expert_count 256",
+            |kvs| set_int(kvs, GLM_EXPERTS, 256),
+            &[GLM_EXPERTS, "is 256 in the source", "built for 288"],
+        ),
+        (
+            "source indexer.kpool 8",
+            |kvs| set_int(kvs, GLM_KPOOL, 8),
+            &[GLM_KPOOL, "is 8 in the source", "built for 4"],
+        ),
+        (
+            "source nextn_predict_layers 0",
+            |kvs| set_int(kvs, GLM_NEXTN, 0),
+            &["blk.45.hc_attn_fn.weight", "is not in the file"],
+        ),
+        (
+            "source leading_dense_block_count missing",
+            |kvs| drop_key(kvs, GLM_DENSE),
+            &["blk.0.ffn_gate_inp.weight", "is not in the file"],
+        ),
+    ];
+    for (what, edit, want) in source_rows {
+        let file = format!("{}.gguf", what.replace(' ', "-"));
+        let edited = edited_header(&src, d, &file, |_| true, edit);
+        refused_with(
+            &mut bad,
+            what,
+            fixture::plan(&spec, &edited, None, &spec.options()),
+            want,
+        );
+        std::fs::remove_file(d.join(&file)).unwrap();
+    }
+
+    // The written file, from the real plan's header with one edit.
+    let fixture_rows: [(&str, Edit, &[&str]); 4] = [
+        (
+            "fixture indexer.kpool 8",
+            |kvs| set_int(kvs, GLM_KPOOL, 8),
+            &[GLM_KPOOL, "is 8 in the fixture", "built for 4"],
+        ),
+        (
+            "fixture nextn_predict_layers 0",
+            |kvs| set_int(kvs, GLM_NEXTN, 0),
+            &["blk.6.hc_attn_fn.weight", "is not in the file"],
+        ),
+        (
+            "fixture expert_feed_forward_length 2048",
+            |kvs| set_int(kvs, GLM_FF, 2048),
+            &["expert_ff", "2048, want 512"],
+        ),
+        (
+            "fixture leading_dense_block_count 3",
+            |kvs| set_int(kvs, GLM_DENSE, 3),
+            &["blk.2.ffn_gate.weight", "is not in the file"],
+        ),
+    ];
+    for (what, edit, want) in fixture_rows {
+        let mut plan = real.target.clone();
+        edit(&mut plan.kvs);
+        let g = dir(&format!("glmrefusals-{}", what.replace(' ', "-")));
+        let fx = Split::open(header_only(&plan, &g.0)).unwrap();
+        refused_with(
+            &mut bad,
+            what,
+            fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}),
+            want,
+        );
     }
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
