@@ -12,8 +12,8 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
    (and the MTP draft where the repo has one). The first start also compiles the kernels for the card once. The plan
    line in the log names the cards and how the experts are split. Wait until `GET /health` answers 200.
 4. **Pick the cards with `CUDA_VISIBLE_DEVICES`.** With `--place` unset the load takes the largest visible card and
-   adds the host for the experts that do not fit it; on GLM-5.3 it also adds the next card as an expert tier when
-   the plan finds that pays.
+   adds the host for the experts that do not fit it; on GLM-5.3 and Qwen3.8 it also adds the next card as an expert
+   tier when the plan finds that pays.
 5. **Warm up first.** Send one request and discard its numbers. Adaptive residency then moves the experts the model
    calls most onto the card, so the first requests run slower than later ones. `BLOOMERY_RESIDENCY=off` gives
    repeatable tokens at some speed.
