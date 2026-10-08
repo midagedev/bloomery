@@ -23,10 +23,9 @@ use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
-use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
-};
-use bloomery_gpu::model::{ChainBody, HostServed, StepMode, refuse_scratch_past};
+use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
+use bloomery_gpu::model::{ChainBody, StepMode, refuse_scratch_past};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -846,31 +845,24 @@ impl ChainBody for Body {
     }
 }
 
-impl HostServed for Body {
-    fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
+impl TierBody for Body {
+    type Experts = HostRun;
+
+    fn hybrid(&self) -> &Hybrid<HostRun> {
+        &self.hybrid
+    }
+
+    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
+    /// MiMo runs no residency machine: the load's slot map for the model's
+    /// life.
+    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+        None
+    }
+
+    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)
-    }
-
-    fn noted(&self, e: GpuError) -> GpuError {
-        self.hybrid.noted(e)
-    }
-
-    fn take_host_refusal(&mut self) -> Option<Refusal> {
-        self.hybrid.take_step_refusal()
-    }
-
-    /// The host tier's refusal poison lifted ([`Hybrid::lift_refusal`]) — the
-    /// settling a reset runs is [`Hybrid::settle`]'s ([`Body::reset`]).
-    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.hybrid.lift_refusal(stream)
-    }
-
-    /// The refusal the host tier is poisoned by now ([`Hybrid::refusal_poison`]).
-    fn refusal_poison(&self) -> Option<Refusal> {
-        self.hybrid.refusal_poison()
-    }
-
-    fn host_residency(&self) -> Option<&HostResidency> {
-        self.hybrid.residency()
     }
 }
