@@ -1,0 +1,4 @@
+# case	images (the order of the image-pad runs in the case's ids)
+c1	free-448x448
+c2	free-640x480,free-1024x768
+c3	free-448x448

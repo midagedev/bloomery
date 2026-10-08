@@ -1,0 +1,9 @@
+# name	w	h	branch of mtmd qwen3vl_merger preprocessing (align 32, 8..4096 tokens, black PAD_CEIL); the file is images/<name>.png
+free-448x448	448	448	resize-free
+free-640x480	640	480	resize-free
+free-1024x768	1024	768	resize-free
+min-96x64	96	64	below min_pixels: scaled up to 128x96
+pad-1000x700	1000	700	aligns to 992x704: resize and pad
+pad-777x513	777	513	aligns to 768x512: resize and pad
+max-2600x1800	2600	1800	above max_pixels: 2432x1696
+strip-1000x1	1000	1	aligns to 992x32: one row on black

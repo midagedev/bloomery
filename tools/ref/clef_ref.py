@@ -3,6 +3,7 @@
 
     tools/ref/clef_ref.py run --snapshot DIR --revision SHA --suite FILE --edge FILE --out DIR [--reps 5]
     tools/ref/clef_ref.py encode --snapshot DIR --edge FILE --out DIR
+    tools/ref/clef_ref.py images --snapshot DIR --revision SHA --requests FILE --images-dir DIR --out DIR [--encode-only]
     tools/ref/clef_ref.py --self-test
 
 `run` imports the snapshot's own `joint_schema_model.py` (sys.path) and loads the release with
@@ -29,6 +30,22 @@ order, options in order, positions in order) with `<id>.lexical.ids` (those ids,
 
 `encode` (and `run`, first) writes `<out>/edge.jsonl`: the edge requests' `input_ids`, spans and
 `state_render`, with no model call.
+
+`images` runs the release on requests that carry images (tools/ref/clefvis/requests.jsonl, the Clef image-input oracle's
+set D, `just dump-ref-clefvis --ids | --ref-d`):
+
+    tools/ref/clef_ref.py images --snapshot DIR --revision SHA --requests FILE --images-dir DIR --out DIR
+                                 [--encode-only] [--reps 1] [--preproc-set DIR]
+
+A request's `images` are file stems under --images-dir (PNG, opened as RGB); `state_tokens: N` in place of a `state`
+makes a deterministic filler text that the release's tokenizer counts as exactly N ids. It first prints
+`type(processor.image_processor).__name__` and writes `<out>/images.jsonl` and `<out>/<id>.ids` (the ids one per line,
+what dump_mtmd's hidden sets read): per request the `input_ids`, the image-pad spans, the processor's `image_grid_thw`,
+a summary of its `pixel_values` and, with --preproc-set (dump_mtmd's preproc set), the patches compared with the
+mtmd-preprocessed image of the same name. A request whose image the processor would resize (a grid other than
+(1, h/16, w/16)) is refused: set D runs on resize-free images, where the HF rule and llama.cpp's coincide. With
+--encode-only that is all (no card). Without it the A6000 answers each request as `run` does (same files) and writes
+`<id>.tower.f32`, the vision tower's merged output rows ([tokens, 4096] f32), and each request's facts.
 
 `render` and `question_options` below are the release's two pure functions, copied so the self-test can
 pin them without torch; `run` and `encode` check that the snapshot's own functions give the same output on
@@ -162,6 +179,177 @@ def snapshot_revision(snapshot: Path) -> str:
     return meta.read_text().splitlines()[0].strip()
 
 
+# ---- images (set D): pure helpers, pinned by the self-test ----
+
+IMAGE_PAD_TOKEN = "<|image_pad|>"
+FILLER_WORDS = (
+    "table river window garden paper silver morning engine harbor letter market bridge forest lantern copper valley "
+    "meadow signal ribbon anchor orchard pillow quartz saddle thunder velvet whistle yellow zephyr candle dragon "
+    "falcon glacier hammer island jungle kettle ladder mirror needle ocean pepper quiver rocket spider tunnel umbrella "
+    "violin walnut anvil basket cactus dolphin ember feather granite hazel iris jasmine kernel lemon maple nectar olive"
+).split()
+
+
+def filler_text(n_words: int, seed: int = 20261008) -> str:
+    """A deterministic text of n_words plain words: a linear congruential walk over FILLER_WORDS."""
+    x = seed
+    words = []
+    for _ in range(n_words):
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        words.append(FILLER_WORDS[(x >> 8) % len(FILLER_WORDS)])
+    return " ".join(words)
+
+
+def filler_state(count: Any, n_tokens: int) -> str:
+    """The longest filler text `count` (text -> number of ids) puts at n_tokens or fewer, which must be exactly n_tokens."""
+    lo, hi = 0, n_tokens + 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if count(filler_text(mid)) <= n_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    text = filler_text(lo)
+    if count(text) != n_tokens:
+        raise SystemExit(f"clef_ref: no filler text of exactly {n_tokens} ids (the nearest has {count(text)})")
+    return text
+
+
+def image_spans(ids: list[int], pad_id: int) -> list[tuple[int, int]]:
+    """(start, length) of every maximal run of pad_id in ids."""
+    spans = []
+    i = 0
+    while i < len(ids):
+        if ids[i] != pad_id:
+            i += 1
+            continue
+        j = i
+        while j < len(ids) and ids[j] == pad_id:
+            j += 1
+        spans.append((i, j - i))
+        i = j
+    return spans
+
+
+def check_resize_free(rid: str, sizes: list[tuple[int, int]], grid: list[list[int]]) -> list[int]:
+    """The processor's image_grid_thw against the images' (w, h): each must be (1, h/16, w/16), the proof that the image
+    went through unresized. Returns the merged token count of each image ((h/16)(w/16)/4)."""
+    if len(sizes) != len(grid):
+        raise SystemExit(f"clef_ref: {rid}: {len(sizes)} images, the processor returned {len(grid)} grids")
+    counts = []
+    for (w, h), (t, gh, gw) in zip(sizes, grid):
+        if w % 32 or h % 32 or (t, gh, gw) != (1, h // 16, w // 16):
+            raise SystemExit(
+                f"clef_ref: {rid}: a {w}x{h} image became grid {(t, gh, gw)}, want {(1, h // 16, w // 16)}: "
+                "the processor resized it, and set D runs on resize-free images only"
+            )
+        counts.append(gh * gw // 4)
+    return counts
+
+
+def merge_order_patches(raw: Any, gh: int, gw: int) -> Any:
+    """A planar f32 image [3, gh*16, gw*16] as the HF processor lays the patches out: [gh*gw, 3, 2, 16, 16] in merge order
+    (rows (by, bx, dy, dx)), each patch (c, t, py, px) with the two temporal halves equal."""
+    import numpy as np
+
+    a = raw.reshape(3, gh // 2, 2, 16, gw // 2, 2, 16)  # c, by, dy, py, bx, dx, px
+    a = a.transpose(1, 4, 2, 5, 0, 3, 6)  # by, bx, dy, dx, c, py, px
+    a = a.reshape(gh * gw, 3, 1, 16, 16)
+    return np.ascontiguousarray(np.repeat(a, 2, axis=2))
+
+
+def pixel_diff(pv: Any, raw: Any, gh: int, gw: int) -> dict[str, Any]:
+    """HF's pixel_values rows of one image ([gh*gw, 1536]) against the mtmd-preprocessed image: how many of the values are
+    bit-equal and the largest difference."""
+    import numpy as np
+
+    want = merge_order_patches(raw, gh, gw).reshape(gh * gw, 1536).astype(np.float32)
+    got = np.asarray(pv, dtype=np.float32).reshape(gh * gw, 1536)
+    return {
+        "values": int(got.size),
+        "bit_equal": int(np.count_nonzero(got.view(np.uint32) == want.view(np.uint32))),
+        "max_abs": float(np.max(np.abs(got.astype(np.float64) - want.astype(np.float64)))),
+    }
+
+
+def pick_tower_rows(output: Any) -> Any:
+    """The merged rows of a vision tower's forward output: `pooler_output` of a model output, else the first of a tuple."""
+    rows = getattr(output, "pooler_output", None)
+    if rows is None and isinstance(output, (tuple, list)):
+        rows = output[0]
+    if rows is None:
+        rows = output
+    return rows
+
+
+def materialize(row: dict[str, Any], images_dir: Path, tokenizer: Any) -> dict[str, Any]:
+    """A request line as the release's functions take it: the state text (a filler of `state_tokens` ids when asked) and
+    PIL images in place of the stems."""
+    from PIL import Image
+
+    request = {k: v for k, v in row.items() if k not in ("images", "state_tokens")}
+    if "state_tokens" in row:
+        request["state"] = filler_state(lambda t: len(tokenizer(t, add_special_tokens=False).input_ids), int(row["state_tokens"]))
+    request["images"] = [Image.open(images_dir / f"{stem}.png").convert("RGB") for stem in row.get("images", [])]
+    return request
+
+
+def encode_images(release: Any, processor: Any, requests: Path, images_dir: Path, out: Path, preproc: Path | None) -> list[dict[str, Any]]:
+    """Encode every request with the release's processor: <out>/images.jsonl and <out>/<id>.ids. Returns the materialized
+    requests."""
+    import hashlib
+
+    import numpy as np
+
+    tokenizer = processor.tokenizer
+    print(f"image_processor: {type(processor.image_processor).__name__}", flush=True)
+    pad_id = tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+    done = []
+    with open(out / "images.jsonl", "w", encoding="utf-8") as f:
+        for row in read_jsonl(requests):
+            request = materialize(row, images_dir, tokenizer)
+            check_pure(release, request)
+            encoded = release.encode_record(tokenizer, request, max_length=16384, processor=processor)
+            ids = list(encoded.input_ids)
+            media = encoded.media or {}
+            grid = media["image_grid_thw"].tolist() if "image_grid_thw" in media else []
+            counts = check_resize_free(row["id"], [im.size for im in request["images"]], grid)
+            spans = image_spans(ids, pad_id)
+            if [n for _, n in spans] != counts:
+                raise SystemExit(f"clef_ref: {row['id']}: image-pad runs {[n for _, n in spans]}, the grids say {counts}")
+            (out / f"{row['id']}.ids").write_text("".join(f"{i}\n" for i in ids))
+            pixels = []
+            if grid:
+                pv = media["pixel_values"].float().numpy()
+                at = 0
+                for stem, (_, gh, gw) in zip(row["images"], grid):
+                    n = gh * gw
+                    entry = {"image": stem, "rows": n, "sha256": hashlib.sha256(np.ascontiguousarray(pv[at : at + n]).tobytes()).hexdigest()}
+                    if preproc is not None:
+                        raw = np.fromfile(preproc / f"{stem}_inp_raw.0.f32", dtype="<f4").reshape(3, gh * 16, gw * 16)
+                        entry["vs_mtmd"] = pixel_diff(pv[at : at + n], raw, gh, gw)
+                    pixels.append(entry)
+                    at += n
+            line = {
+                "id": row["id"],
+                "images": row.get("images", []),
+                "image_processor": type(processor.image_processor).__name__,
+                "input_ids": ids,
+                "image_spans": spans,
+                "image_grid_thw": grid,
+                "pixel_values": pixels,
+                "state_render": render(request["state"]),
+                "questions": question_rows(encoded),
+            }
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            print(f"images {row['id']} n={len(ids)} spans={spans} grid={grid}", flush=True)
+            for entry in pixels:
+                if "vs_mtmd" in entry:
+                    print(f"  pixels {entry['image']}: {entry['vs_mtmd']}", flush=True)
+            done.append(request)
+    return done
+
+
 def encode_edges(release: Any, tokenizer: Any, processor: Any, edge: Path, out: Path) -> None:
     rows = read_jsonl(edge)
     with open(out / "edge.jsonl", "w", encoding="utf-8") as f:
@@ -201,6 +389,15 @@ def run(args: Any) -> int:
         processor = AutoProcessor.from_pretrained(snapshot)
         encode_edges(release, processor.tokenizer, processor, Path(args.edge), out)
         return 0
+    images_mode = args.command == "images"
+    if images_mode:
+        from transformers import AutoProcessor
+
+        requests = encode_images(
+            release, AutoProcessor.from_pretrained(snapshot), Path(args.requests), Path(args.images_dir), out,
+            Path(args.preproc_set) if args.preproc_set else None)
+        if args.encode_only:
+            return 0
 
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise SystemExit(f"clef_ref: needs exactly one visible card (the A6000), got {torch.cuda.device_count()}")
@@ -226,7 +423,12 @@ def run(args: Any) -> int:
     load_s = time.perf_counter() - t0
     print(f"loaded in {load_s:.1f} s on {name}", flush=True)
     tokenizer = processor.tokenizer
-    encode_edges(release, tokenizer, processor, Path(args.edge), out)
+    if images_mode:
+        facts_extra = {"image_processor": type(processor.image_processor).__name__}
+    else:
+        facts_extra = {}
+        encode_edges(release, tokenizer, processor, Path(args.edge), out)
+        requests = read_jsonl(Path(args.suite))
 
     head_path = snapshot / "joint_head.safetensors"
     with safe_open(head_path, framework="pt") as f:
@@ -257,6 +459,7 @@ def run(args: Any) -> int:
         "backbone_dtype": str(next(base.parameters()).dtype),
         "revision": revision,
         "load_s": round(load_s, 2),
+        **facts_extra,
     }
 
     captured: dict[str, Any] = {}
@@ -268,17 +471,29 @@ def run(args: Any) -> int:
         captured["logits"] = [[t.detach().float().cpu().tolist() for t in record] for record in output]
 
     lines = []
-    for request in read_jsonl(Path(args.suite)):
+    for request in requests:
         rid = request["id"]
         check_pure(release, request)
         encoded = release.encode_record(tokenizer, request, max_length=16384, processor=processor)
         input_ids = list(encoded.input_ids)
 
         hooks = [model.head.register_forward_pre_hook(pre), model.head.register_forward_hook(post)]
+        tower: list[Any] = []
+
+        def vis(_module: Any, _inputs: tuple, output: Any) -> None:
+            tower.append(pick_tower_rows(output).detach().float().cpu().numpy())
+
+        if request.get("images"):
+            visual = getattr(getattr(base, "model", None), "visual", None)
+            if visual is None:
+                raise SystemExit(f"clef_ref: {rid}: the backbone has no model.visual to hook")
+            hooks.append(visual.register_forward_hook(vis))
         captured.clear()
         response = release.systemone(model, processor, request)
         for hook in hooks:
             hook.remove()
+        if request.get("images") and not tower:
+            raise SystemExit(f"clef_ref: {rid}: the vision tower did not run")
         if response["usage"]["input_tokens"] != len(input_ids):
             raise SystemExit(f"clef_ref: {rid}: usage.input_tokens {response['usage']['input_tokens']} != {len(input_ids)} ids")
         if set(response["answers"]) != {q.question_id for q in encoded.questions}:
@@ -317,6 +532,11 @@ def run(args: Any) -> int:
             l64 = head64(hidden64, ids_remapped, mask, records, rows64)[0]
         logits_f32 = [t.cpu().tolist() for t in l32]
         logits_f64 = [t.tolist() for t in l64]
+        tower_info: dict[str, Any] = {}
+        if tower:
+            rows = np.concatenate(tower, axis=0).astype(np.float32)
+            rows.tofile(out / f"{rid}.tower.f32")
+            tower_info = {"tower": {"shape": list(rows.shape), "calls": len(tower), "file": f"{rid}.tower.f32"}}
 
         line = {
             "id": rid,
@@ -327,6 +547,7 @@ def run(args: Any) -> int:
             "logits_f32_head": logits_f32,
             "logits_f64_head": logits_f64,
             "response": response,
+            **tower_info,
             "wall_ms": {
                 "median": round(statistics.median(walls), 3),
                 "min": round(min(walls), 3),
@@ -435,6 +656,52 @@ def self_test() -> bool:
         for qid, q in request["questions"].items():
             expect(f"{rid}.{qid} type", q["type"] in ("noul", "choice", "score"), True)
             question_options(q)
+    # images (set D)
+    expect("image_spans", image_spans([1, 9, 9, 2, 9, 3], 9), [(1, 2), (4, 1)])
+    expect("image_spans none", image_spans([1, 2, 3], 9), [])
+    expect("resize-free", check_resize_free("r", [(448, 448), (640, 480)], [[1, 28, 28], [1, 30, 40]]), [196, 300])
+    for bad in ([(1000, 700)], [(448, 448), (640, 480)], [(448, 448)]):
+        grids = {1: [[1, 44, 62]], 2: [[1, 28, 28]], 3: [[1, 27, 28]]}[len(bad) if bad != [(448, 448)] else 3]
+        try:
+            check_resize_free("r", bad, grids)
+            expect(f"resize refused {bad}", "accepted", "refused")
+        except SystemExit:
+            pass
+    words = lambda text: len(text.split())  # noqa: E731
+    state = filler_state(words, 50)
+    expect("filler count", words(state), 50)
+    expect("filler deterministic", filler_state(words, 50), state)
+    expect("filler prefix grows", filler_text(7).startswith(filler_text(3)), True)
+    try:
+        filler_state(lambda text: 2 * words(text), 51)
+        expect("filler odd count refused", "accepted", "refused")
+    except SystemExit:
+        pass
+
+    import numpy as np
+
+    raw = np.random.default_rng(7).standard_normal((3, 32, 64)).astype(np.float32)
+    pv = merge_order_patches(raw, 2, 4)
+    expect("patches shape", pv.shape, (8, 3, 2, 16, 16))
+    for by in range(1):
+        for bx in range(2):
+            for dy in range(2):
+                for dx in range(2):
+                    patch = pv[(by * 2 + bx) * 4 + dy * 2 + dx]
+                    y0, x0 = (by * 2 + dy) * 16, (bx * 2 + dx) * 16
+                    for t in range(2):
+                        expect(f"patch ({by},{bx},{dy},{dx}) t{t}", bool(np.array_equal(patch[:, t], raw[:, y0 : y0 + 16, x0 : x0 + 16])), True)
+    expect("pixel_diff equal", pixel_diff(pv.reshape(8, 1536), raw, 2, 4), {"values": 8 * 1536, "bit_equal": 8 * 1536, "max_abs": 0.0})
+    other = pv.reshape(8, 1536).copy()
+    other[3, 5] += np.float32(0.25)
+    expect("pixel_diff counts", (pixel_diff(other, raw, 2, 4)["bit_equal"], pixel_diff(other, raw, 2, 4)["max_abs"]), (8 * 1536 - 1, 0.25))
+
+    class WithPooler:
+        pooler_output = "rows"
+
+    expect("tower rows pooler", pick_tower_rows(WithPooler()), "rows")
+    expect("tower rows tuple", pick_tower_rows(("a", "b")), "a")
+    expect("tower rows plain", pick_tower_rows("t"), "t")
     print("clef_ref self-test: " + ("ok" if ok else "FAILED"))
     return ok
 
@@ -446,17 +713,24 @@ def main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(prog="clef_ref.py")
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("run", "encode"):
+    for command in ("run", "encode", "images"):
         p = sub.add_parser(command)
         p.add_argument("--snapshot", required=True)
         p.add_argument("--revision", required=True)
-        p.add_argument("--edge", required=True)
         p.add_argument("--out", required=True)
+        if command != "images":
+            p.add_argument("--edge", required=True)
         if command == "run":
             p.add_argument("--suite", required=True)
             p.add_argument("--reps", type=int, default=5)
+        if command == "images":
+            p.add_argument("--requests", required=True)
+            p.add_argument("--images-dir", required=True)
+            p.add_argument("--encode-only", action="store_true")
+            p.add_argument("--preproc-set", default=None)
+            p.add_argument("--reps", type=int, default=1)
     args = parser.parse_args(argv)
-    if args.command == "run" and args.reps < 1:
+    if args.command in ("run", "images") and args.reps < 1:
         raise SystemExit("clef_ref: --reps is at least 1")
     return run(args)
 
