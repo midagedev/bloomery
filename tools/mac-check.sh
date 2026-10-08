@@ -662,6 +662,20 @@ case ${1:-} in
 esac
 MODE=$1
 [ "$MODE" != combos ] || shift
+# combos' flag words are validated before the host check: the named refusals are pure logic and hold
+# on any host (the Linux host nightly runs the self-test, whose cases call this entry); the modes
+# themselves still stop at host_triple off macOS.
+BASE= LEDGER=
+if [ "$MODE" = combos ]; then
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --base) [ $# -ge 2 ] || { say "mac-check.sh: --base needs a value"; exit 64; }; BASE=$2; shift 2 ;;
+      --ledger) [ $# -ge 2 ] || { say "mac-check.sh: --ledger needs a value"; exit 64; }; LEDGER=$2; shift 2 ;;
+      *) say "mac-check.sh: combos takes --base SPEC and --ledger FILE, not '$1'"; exit 64 ;;
+    esac
+  done
+  [ -z "$LEDGER" ] || [ -n "$BASE" ] || { say "mac-check.sh: --ledger reads the keys the --base form prints; give --base too"; exit 64; }
+fi
 HOST=$(host_triple "$(uname -s)" "$(uname -m)") || exit $?
 CHANNEL=$(channel) || exit $?
 TC=$HOME/.rustup/toolchains/$CHANNEL-$HOST/bin
@@ -697,15 +711,6 @@ if [ "$MODE" = test ]; then
   exit "$rc"
 fi
 if [ "$MODE" = combos ]; then
-  BASE= LEDGER=
-  while [ $# -gt 0 ]; do
-    case $1 in
-      --base) [ $# -ge 2 ] || { say "mac-check.sh: --base needs a value"; exit 64; }; BASE=$2; shift 2 ;;
-      --ledger) [ $# -ge 2 ] || { say "mac-check.sh: --ledger needs a value"; exit 64; }; LEDGER=$2; shift 2 ;;
-      *) say "mac-check.sh: combos takes --base SPEC and --ledger FILE, not '$1'"; exit 64 ;;
-    esac
-  done
-  [ -z "$LEDGER" ] || [ -n "$BASE" ] || { say "mac-check.sh: --ledger reads the keys the --base form prints; give --base too"; exit 64; }
   RC_ARGS=(combos)
   [ -z "$BASE" ] || RC_ARGS+=(--base "$BASE")
   [ -z "$LEDGER" ] || RC_ARGS+=(--ledger "$LEDGER")

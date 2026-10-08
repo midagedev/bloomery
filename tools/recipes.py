@@ -3104,14 +3104,7 @@ HOST_DEVICE_LINKED: dict[str, str] = {
 # A test left out by exact libtest name, per crate: (name, reason). A non-ignored test that needs a file no host has.
 HOST_TEST_SKIP: dict[str, list[tuple[str, str]]] = {}
 # A `tools/check-*.sh` left out: script file name -> reason.
-HOST_CHECK_SKIP: dict[str, str] = {
-    "check-recipes.sh": (
-        "red on a Linux host today, three of its blocks: the mac-check self-test refuses off macOS (mac-check.sh: runs on macOS; 4 of its cases); "
-        "the gate-batch self-test's default-OUT cases (4 of 153) pass on macOS only because its fake HOME sits under $TMPDIR (/var/…) while the "
-        "tree is `pwd -P` (/private/var/…) — under a symlink-free TMPDIR they fail the same way on the Mac; the Python tool self-tests need numpy and PIL (install.sh installs python3-numpy and python3-pil). "
-        "Its recipes.py self-test runs as its own unit (HOST_EXTRA_UNITS). Re-admit when those are fixed"
-    ),
-}
+HOST_CHECK_SKIP: dict[str, str] = {}
 # A unit that is no crate and no check script: name -> shell command, run from the tree's root.
 HOST_EXTRA_UNITS: dict[str, str] = {
     "recipes-self-test": "python3 tools/recipes.py --self-test",

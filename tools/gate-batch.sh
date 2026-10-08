@@ -440,12 +440,15 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # tree holding a copy of this script (no box, no ssh; `just` and python3 only). One line per case,
 # `ok <name>` or `FAIL <name>: <why>` with the output; exit 0 iff none failed. check-recipes runs it.
 self_test() {
-  local self t n=0 bad=0 out rc
+  local self t h n=0 bad=0 out rc
   unset BLOOMERY_TIER # the tier of a case is the case's own
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-test.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
-  # shellcheck disable=SC2064 # the path is fixed now
-  trap "rm -rf '$t'" EXIT
+  # The fake HOMEs sit outside the tree copy, never under $t: the default OUT is $HOME/.cache/…, and a
+  # HOME under the tree is an OUT the --out-inside-the-tree guard (rightly) refuses on a symlink-free host.
+  h=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-home.XXXXXX") || { rm -rf "$t"; echo "gate-batch: self-test: no temporary directory for the fake HOMEs" >&2; return 70; }
+  # shellcheck disable=SC2064 # the paths are fixed now
+  trap "rm -rf '$t' '$h'" EXIT
   mkdir -p "$t/tools"
   cp "$self" "$t/tools/gate-batch.sh"
   cat > "$t/justfile" << 'JF'
@@ -1334,10 +1337,10 @@ FP
     '^gate-batch: disk: [0-9.]+ GiB free on /fake/mount \(for .*\), above the [0-9]+ GiB floor$' "${gb[@]}" --dry-run host
   check 'disk: below the floor, a real run stops with 69 and the named line' 69 \
     '^gate-batch: disk: [0-9.]+ GiB free on /fake/mount .* below the [0-9]+ GiB floor' \
-    env HOME=$t/home-low DISK_KB=1024 "${gb[@]}" host
+    env HOME=$h/home-low DISK_KB=1024 "${gb[@]}" host
   check "disk: below the floor, the real run's OUT is not created" 69 '^gate-batch: disk:' \
-    env HOME=$t/home-low2 DISK_KB=1024 "${gb[@]}" host
-  [ ! -e "$t/home-low2" ] || fail "a refused run created its OUT under $t/home-low2"
+    env HOME=$h/home-low2 DISK_KB=1024 "${gb[@]}" host
+  [ ! -e "$h/home-low2" ] || fail "a refused run created its OUT under $h/home-low2"
   check 'disk: a failing df is a named 69 in a dry run too' 69 \
     '^gate-batch: disk: df -Pk .* failed \(rc 1\): df: fake failure$' env DISK_RC=1 "${gb[@]}" --dry-run host
   check 'disk: df output that does not parse is a named 69' 69 'output does not parse' \
@@ -1351,12 +1354,12 @@ FP
     env BLOOMERY_MIN_FREE_GIB=999999 "${gb[@]}" --dry-run host
   check 'disk: below the floor, --dry-run prints the verdict and exits 0' 0 'below the [0-9]+ GiB floor' \
     env DISK_KB=1024 "${gb[@]}" --dry-run host
-  out=$(env HOME=$t/home-dry "${gb[@]}" --dry-run host 2>&1) || fail "a dry run under a fake HOME failed: $out"
+  out=$(env HOME=$h/home-dry "${gb[@]}" --dry-run host 2>&1) || fail "a dry run under a fake HOME failed: $out"
   case $out in
-    *"logs would go to $t/home-dry/.cache/bloomery/batches/$(basename "$t")/"*) pass 'disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>' ;;
+    *"logs would go to $h/home-dry/.cache/bloomery/batches/$(basename "$t")/"*) pass 'disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>' ;;
     *) fail 'disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>' "the dry run says: $out" ;;
   esac
-  [ ! -e "$t/home-dry" ] || fail "the dry run created its OUT tree under $t/home-dry"
+  [ ! -e "$h/home-dry" ] || fail "the dry run created its OUT tree under $h/home-dry"
   echo "gate-batch self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }

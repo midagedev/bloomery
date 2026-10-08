@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# justfile 레시피 점검 — 맥에서 돈다(grep뿐, 빌드 없음).
+# justfile 레시피 점검 — 맥과 리눅스 호스트 나이틀리에서 돈다(grep뿐, 빌드 없음).
 # 막는 실패: 게이트 줄 뒤에 붙은 `||`가 종료 코드를 삼키는 것. ef9e579가 `cargo test … || echo "TIMED OUT"`로
 # 열세 게이트 전부를 "빨강이어도 0"으로 만들었다(2026-09-20, tools/gate.sh 머리말 참조).
 # 게이트의 종료 코드는 tools/gate.sh가 소유한다 — 시험을 돌리는 레시피 줄에 `||`가 있으면 빨강.
@@ -328,7 +328,7 @@ blk_macstatic() {
   fi
   echo "${mst##*$'\n'}"
 }
-# Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
+# Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not. The tools run as
 # parallel jobs (they are independent processes on their own temp fixtures); their failures land in one
 # file and are reported together.
@@ -380,7 +380,16 @@ blk_pytools() {
   for t in "${selftests[@]}"; do
     ( read -r f arg <<< "$t"
       if ! out=$(cd "$root" && python3 "$f" "$arg" 2>&1); then
-        printf '%s\n%s\n' "$out" "check-recipes: $f $arg failed" >> "$pf"
+        # A Python module this host lacks is one named line, never the tool's traceback: the host
+        # nightly's install puts python3-numpy and python3-pil in place for these (tools/nightly/install.sh).
+        if m=$(grep -m1 "ModuleNotFoundError: No module named" <<< "$out"); then
+          mod=$(printf '%s' "$m" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p")
+          case ${mod%%.*} in numpy) pkg=python3-numpy ;; PIL) pkg=python3-pil ;; *) pkg= ;; esac
+          printf 'check-recipes: %s %s needs the Python module %s this host lacks%s\n' \
+            "$f" "$arg" "$mod" "${pkg:+ — the host nightly installs $pkg}" >> "$pf"
+        else
+          printf '%s\n%s\n' "$out" "check-recipes: $f $arg failed" >> "$pf"
+        fi
       fi
     ) &
   done
