@@ -95,6 +95,7 @@
 
 pub mod batch;
 pub mod handoff;
+pub mod lane;
 pub mod leg;
 pub mod nvtier;
 pub mod page;
