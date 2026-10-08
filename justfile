@@ -586,13 +586,13 @@ dump-ref-clefvis *ARGS:
 # 덤프마다 199.7 GB 샤드 집합 전체를 CPU 임대 아래서 올리므로 카드가 있어야 한다
 # (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmref-dump.card').
 dump-ref-glm5next *VARIANT:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next && bash tools/ref/dump.sh {{VARIANT}}'
 
 # 같은 5개 id를 ik의 CUDA 백엔드로 $BLOOMERY_DATA/ref_cuda_glm5next/에, TF32는 끈다(NVIDIA_TF32_OVERRIDE=0: 없으면 이 모델에서
 # ik CUDA의 top-1 일치가 0.896이었다, rig-log 2026-09-15). 이대로는 돌 수 없다: dump.sh의 -ngl 99가 199.7 GB 파일을 카드 한 장에
 # 올리므로 CUDA 세트에는 배치 계획이 먼저 필요하다. GPU 소비자는 아직 없다.
 dump-ref-glm5next-cuda:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next-cuda && NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
 # The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
 # carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
@@ -895,14 +895,16 @@ gate-gpu-glm-mla:
 # GLM-5.3-Flash's k-pool selector on the card (`latent::index_pool`, `kpool::kpool_score`, `qsa::qsa_topk_high`, the
 # V4.1 attention over the list): synthetic clauses against the host rules and the exact rule's bands, then every
 # latent layer teacher-forced on ik's --dsa step sets (refset `ik-glm5next-dsa`, `just dump-ref-glm5next d3kdsa`
-# and `d16kdsa`). Reads no weight but the file's `indexer_compressor_ape`.
+# and `d16kdsa`). Reads no weight but the file's `indexer_compressor_ape`. The two --dsa sets are ik's: Oracle clauses, deferred
+# to the real tier by name in the fixture tier; the synthetic clauses run on either file.
 gate-gpu-glm-sel:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'
 
 # GLM-5.3-Flash's prompt projections on the tensor-core GEMM (`gpu-glm5next/src/gemm.rs`, no engine caller yet): a KDA
 # layer's seven and a latent layer's stack over 512 fixed-seed columns, on the file's own weights (only those tensors
 # resident, about 0.3 GB), every output bit for bit the host transcription of `gemm_q8_0p`'s contract
-# (`gpu-gates/src/gemm32.rs`); one quantize per input; the refusals by name.
+# (`gpu-gates/src/gemm32.rs`); one quantize per input; the refusals by name. Every clause is a self-consistency clause,
+# so the fixture tier runs them all on the fixture's layers.
 gate-gpu-glm5next-gemm:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_gemm'
 
@@ -1944,16 +1946,18 @@ gate-mimo2-meta:
 weekly-gpu-mimo2-e2e *ARGS:
     BLOOMERY_MODEL=mimo2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features mimo2 --release --bin gate_mimo2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_e2e {{ARGS}}'
 
-# glm5next (GLM-5.3-Flash) end-to-end: the program loaded once by the gate placement on the 3090 (every routed expert
-# on the host tier, the host set of about 185 GB populated), against ik's sets (refset `ik-glm5next`): the step's
-# node count, graph = eager bit for bit, every layer's streams on the batch set within the derived band, and the argmax
-# after each step set's prompt — here the two 4-token step sets (`--step-sets short`); the 1,024- and 3,070-position
-# sets are weekly-gpu-glm5next-e2e-long's. Right after the load, before those, the card experts (shared/glm5next_card.rs):
-# the slot map holds each layer's id prefix [0, n_l) in ascending order, only on layers whose stacks the card reads; at
-# slots 0, n/2 and n-1 each stack's `_sel` and the gate·up are that expert's own upload from the file, bit for bit; the
-# card copy of the map is the host map at its row offsets. Loads the whole model: alone in a batch, and under the
-# big-load lock the V4.1 loads take.
-[group('solo')]
+# glm5next (GLM-5.3-Flash) end-to-end: the program loaded once by the gate placement on the card the runner puts in view
+# (the 3090's bytes; every routed expert on the host tier, the host set of about 185 GB populated), against ik's sets
+# (refset `ik-glm5next`): the step's node count, graph = eager bit for bit, every layer's streams on the batch set within
+# the derived band, and the argmax after each step set's prompt — here the two 4-token step sets (`--step-sets short`);
+# the 1,024- and 3,070-position sets are weekly-gpu-glm5next-e2e-long's. Right after the load, before those, the card
+# experts (shared/glm5next_card.rs): the slot map holds each layer's id prefix [0, n_l) in ascending order, only on layers
+# whose stacks the card reads; at slots 0, n/2 and n-1 each stack's `_sel` and the gate·up are that expert's own upload
+# from the file, bit for bit; the card copy of the map is the host map at its row offsets. In the fixture tier the clauses
+# that read ik's sets (free, forced, the step sets) are Oracle clauses, deferred to the real tier by name; every other
+# clause runs on the fixture. Loads the whole model: alone in a batch in the real tier, under the big-load lock the V4.1
+# loads take; balanced over the cards in the fixture tier, which takes no lock.
+[group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-e2e:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
@@ -1963,9 +1967,9 @@ gate-gpu-glm5next-e2e:
 # `commit_slots`) against each slot's drafted run alone, in graph and eager mode; forced kept rows; the refusals while a
 # pass waits for its commit and of the passes a NextN load does not run, a pass that keeps every row
 # (`GpuModel::step_slots`) among them; the captured four-row pass against the verify pair's. The gate's run with no
-# `--only` leaves these clauses out. Loads the whole model once: alone in a batch, and under the big-load lock the V4.1
-# loads take.
-[group('solo')]
+# `--only` leaves these clauses out. Loads the whole model once: alone in a batch in the real tier, under the big-load
+# lock the V4.1 loads take; balanced over the cards in the fixture tier, which takes no lock.
+[group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-stagger:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only stagger-draft'
@@ -1973,25 +1977,31 @@ gate-gpu-glm5next-stagger:
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
 # the dense limit. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
-# tools/gate-paths.tsv match changes.
+# tools/gate-paths.tsv match changes. Real-only: the fixture has no set of ik's, so the two long sets (Oracle clauses) are
+# all this run adds to gate-gpu-glm5next-e2e's main arm, whose other clauses it repeats.
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-glm5next-e2e-long:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-e2e-long && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
 
-# glm5next (GLM-5.3-Flash) NextN draft: the target loaded twice by its NextN plan on the 3090's bytes, without the next-token
-# layer and with it (`Body::open_placed_nextn`), against ik's MTP draft set (refset `mtp-glm5next`): the set's MTP input
-# (no position mask), the walk's refusals, every graph of the set replayed from ik's inputs with each block's proposal the set's
-# draft, the two loads' plain runs bit for bit, and the drafted windows (`MtpDraft<Body>`) the plain run's ids with a
-# rejected and an accepted row, the prompt in batches and by steps. Loads the whole model twice: alone in a batch, and
-# under the big-load lock the V4.1 loads take.
-[group('solo')]
+# glm5next (GLM-5.3-Flash) NextN draft: the target loaded twice by its NextN plan on the card the runner puts in view
+# (the 3090's bytes in the real tier), without the next-token layer and with it (`Body::open_placed_nextn`), against ik's MTP
+# draft set (refset `mtp-glm5next`): the set's MTP input (no position mask), the walk's refusals, every graph of the set
+# replayed from ik's inputs with each block's proposal the set's draft, the two loads' plain runs bit for bit, and the
+# drafted windows (`MtpDraft<Body>`) the plain run's ids with a rejected and an accepted row, the prompt in batches and by
+# steps. In the fixture tier the clauses that read ik's set are Oracle clauses and the ones that need the file's trained
+# draft (a window that accepts a proposal, two slots keeping different counts) are file-bound premises, all deferred to
+# the real tier by name; the plain-run, drafted-ids, state-byte and slot clauses run on the fixture. Loads the whole model
+# twice: alone in a batch in the real tier, under the big-load lock the V4.1 loads take; balanced over the cards in the
+# fixture tier, which takes no lock.
+[group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-mtp:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_mtp'
 
 # glm5next (GLM-5.3-Flash) on plan (b′): the stage on the A6000, the expert tier on the 3090 (`app::arch::glm5next::open_pair`
-# at --place bp, two KDA lanes, under a 16 GiB card budget on both cards), against a reference load of the same plan whose
+# at --place bp, two KDA lanes, under a card budget on both cards: 16 GiB in the real tier, the header's in the fixture
+# tier), against a reference load of the same plan whose
 # A6000 holds the stage's and the tier's experts with no tier: the step leg (32 prompt steps, 48 greedy), the pair leg (16
 # verifies of two rows, a third rejected) and the call leg (one 512-position prompt batch, 4 steps after) bit for bit the
 # reference's, tokens, kept counts and logits rows; the stage's step graph of the reference's node count; every tier layer
@@ -2002,7 +2012,10 @@ gate-gpu-glm5next-mtp:
 # upload, then the drafted ids and windows on the two cards against the one-card NextN load of the union, the walk on
 # the stage card). Two loads each. Then --records: generate_glm5next's load record names the A6000 alone under --place a
 # and the A6000 then the 3090 (with the tier's experts) under bp, one child process a placement. Both cards
-# (BLOOMERY_CARD=both: both gate locks), alone in a batch.
+# (BLOOMERY_CARD=both: both gate locks), alone in a batch, in both tiers: a tier is two cards by construction. In the
+# fixture tier the clauses that need the file's trained weights (a pair that accepts a proposal, flips landed and an
+# expert admitted, the plan with no budget leaving the tier experts, the unset rule's bp at the real file's tier size)
+# are file-bound premises deferred to the real tier by name; every bit-for-bit clause runs on the fixture.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-twocard:
@@ -2011,14 +2024,15 @@ gate-gpu-glm5next-twocard:
 # GLM's adaptive expert residency on the gate placement (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P half the
 # plan's least card slots a layer): the churn pool's host refusal at load, the batch prompt one pass keeping 0 and each
 # step 1, every admitted slot byte for byte the file's on a Q4_K layer and on the Q5_K gate/up layer (per-layer parts),
-# the steps prompt refused by name, the same history twice with flips landed, and a reset back to the seed. Loads the
-# whole host set: the e2e gates' batching rule.
-[group('solo')]
+# the steps prompt refused by name, the same history twice with flips landed, and a reset back to the seed. Every clause
+# runs on the fixture but the one that needs the file's routing skew (flips landed and an expert admitted), a file-bound
+# premise deferred to the real tier by name. Loads the whole host set: the e2e gates' batching rule.
+[group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-residency:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_residency && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_residency'
 
-# The GLM seat of bloomery-serve (--model glm) on the 3090, placement gate, against generate_glm5next on the same card
+# The GLM seat of bloomery-serve (--model glm) on the gate placement, against generate_glm5next on the same card
 # (gate_glm5next_serve's header has the clauses). Two processes, each under its own gate-lock hold and bound, the loads
 # one after the other: --arm plain first runs the seat with both levers unset and --plan at --place a and gate (the
 # unset rule's records, no load), then holds the served greedy ids of one chat turn's prompt to the plain CLI's under
@@ -2027,11 +2041,14 @@ gate-gpu-glm5next-residency:
 # residency's records, its reset and the same ids after it, and the ids against the CLI under the same levers through
 # the first landed flip (two loads). Logs in target/glm-serve-gate/{plain,plain/mtp,drafted}/.
 # Loads the whole host set: alone in a batch, under the big-load lock. Both cards in view: the --plan arms' a and bp
-# plan on the largest card and the next-largest; the loads stay on the 3090 (--place gate).
+# plan on the largest card and the next-largest; the loads stay on the gate placement's card (--place gate).
+# Real-only: the gate states its clauses against the real file's numbers (the unset rule's bp pick, BP_TIER_EXPERTS and
+# BREAK_EVEN; a draft that accepts; flips landed under the drafted arm's residency; the slots' kept-row bounds) and has no
+# fixture-tier split yet, so the fixture tier defers the recipe to the real tier by name (tools/ref/real-only.sh).
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-serve:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
