@@ -1830,10 +1830,10 @@ pub(super) struct Stream38 {
     pub(super) on: bool,
     /// The streaming call runs the expert stream too (`split`).
     pub(super) split: bool,
-    /// The card tail a split pick's walk balances with, set when a streaming
-    /// call opens: the family's measured one on the Q4 kind, none on a kind
-    /// whose route no record has priced.
-    pub(super) card_tail_us: f64,
+    /// The card tail rate a split pick's walk prices its unit with [µs per
+    /// card pick], set when a streaming call opens: the family's measured
+    /// one on the Q4 kind, none on a kind whose route no record has priced.
+    pub(super) card_tail_us_per_pick: f64,
     /// The ubatch the walk runs, from 0, the pick records' group.
     pub(super) ubatch: usize,
     counts: Vec<u32>,
@@ -1928,15 +1928,13 @@ impl<'a> Gemm38<'a> {
         }
         let split = self.p.stream.split;
         // The walk only where the lane probed: its gate is the least width
-        // whose picks could pay a first admit. A load with no probe admits
-        // from the stream floor, so short prompts move what they did.
-        let mut k = port.hybrid().xstream().and_then(|x| x.constants(l));
+        // whose picks could pay a first admit, derived without the tail (the
+        // counts it prices from do not exist yet). A load with no probe
+        // admits from the stream floor, so short prompts move what they did.
+        let k = port.hybrid().xstream().and_then(|x| x.constants(l));
         let walked = split && k.is_some();
-        let gate = match k.as_mut() {
-            Some(k) if split => {
-                k.card_tail_us = self.p.stream.card_tail_us;
-                runtime::xsplit::walk_gate(k)
-            }
+        let gate = match k.as_ref() {
+            Some(k) if split => runtime::xsplit::walk_gate(k),
             _ => STREAM_FLOOR,
         };
         // A unit of fewer rows than the gate gives no expert a count the
@@ -1953,6 +1951,7 @@ impl<'a> Gemm38<'a> {
                 key,
                 &mut s.counts,
                 k,
+                s.card_tail_us_per_pick,
                 crate::host::swap::RING_SLOTS as u64,
             )?,
             _ => port

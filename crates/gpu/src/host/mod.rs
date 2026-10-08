@@ -1053,6 +1053,19 @@ impl<H: HostExperts> HostTier<H> {
         counts: &mut Vec<u32>,
         cap: usize,
     ) -> Result<swap::CallPick, GpuError> {
+        self.count_routed(key, counts, "HostTier::call_pick_routed")?;
+        self.call_pick(stream, key.layer, counts, cap)
+    }
+
+    /// `key`'s routed ids ([`HostTier::routed_ids`]) counted into `counts`,
+    /// one count per expert of the slot map, the caller's buffer, reused.
+    /// Refused by name as `what`: a routed id past the map's experts.
+    fn count_routed(
+        &mut self,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
         let n_expert = self.slots.n_expert();
         counts.clear();
         counts.resize(n_expert, 0);
@@ -1062,7 +1075,7 @@ impl<H: HostExperts> HostTier<H> {
                 .and_then(|i| counts.get_mut(i))
                 .ok_or_else(|| {
                     GpuError::shape(
-                        "HostTier::call_pick_routed",
+                        what,
                         format!(
                             "layer {}: a routed id {id} of {n_expert} experts",
                             key.layer
@@ -1071,61 +1084,41 @@ impl<H: HostExperts> HostTier<H> {
                 })?;
             *c += 1;
         }
-        self.call_pick(stream, key.layer, counts, cap)
+        Ok(())
     }
 
     /// [`HostTier::call_pick`] under the stream rule's walk: `key`'s routed
     /// ids counted into `counts` as [`HostTier::call_pick_routed`] counts
     /// them, the layer's host experts read off this tier's map, and the
-    /// walk's plan ([`runtime::xsplit::admit_walk`], at `k`'s beside-union
-    /// rate once the unit's own burst share over that inherited host set is
-    /// set into it) set on the machine — the plan's floor as the call's
-    /// floor, its backlog bound as the pick path's — before the pick runs.
-    /// `queue_floor` is the machine's own bound's floor. Refused by name by
-    /// everything the counting, the walk and the pick refuse.
+    /// walk's plan ([`runtime::xsplit::admit_walk`], at the unit's own
+    /// constants from [`runtime::xsplit::unit_constants`]: `k` with the
+    /// burst share over that inherited host set and the card tail
+    /// `card_tail_us_per_pick` µs a card pick prices) set on the machine —
+    /// the plan's floor as the call's floor, its backlog bound as the pick
+    /// path's — before the pick runs. `queue_floor` is the machine's own
+    /// bound's floor. Refused by name by everything the counting, the walk
+    /// and the pick refuse.
     pub fn call_pick_walk(
         &mut self,
         stream: &CudaStream,
         key: BatchKey,
         counts: &mut Vec<u32>,
         k: xsplit::Constants,
+        card_tail_us_per_pick: f64,
         queue_floor: u64,
     ) -> Result<swap::CallPick, GpuError> {
         const WHAT: &str = "HostTier::call_pick_walk";
-        let n_expert = self.slots.n_expert();
-        counts.clear();
-        counts.resize(n_expert, 0);
-        for &id in self.routed_ids(key)? {
-            let c = usize::try_from(id)
-                .ok()
-                .and_then(|i| counts.get_mut(i))
-                .ok_or_else(|| {
-                    GpuError::shape(
-                        WHAT,
-                        format!(
-                            "layer {}: a routed id {id} of {n_expert} experts",
-                            key.layer
-                        ),
-                    )
-                })?;
-            *c += 1;
-        }
+        self.count_routed(key, counts, WHAT)?;
         let mut host = Vec::new();
-        let mut listed = 0u64;
-        let mut cols = 0u64;
         if let Some(row) = self.slots.row(key.layer) {
             for (id, &e) in (0u32..).zip(row) {
-                if Slot::of(e) != Slot::Host {
-                    continue;
+                if Slot::of(e) == Slot::Host {
+                    host.push(id);
                 }
-                host.push(id);
-                let count = u64::from(counts[id as usize]);
-                listed += u64::from(count > 0);
-                cols += count;
             }
         }
-        let mut unit = k;
-        unit.union_burst_share = xsplit::union_burst_share(cols, listed, &unit);
+        let unit = xsplit::unit_constants(&k, card_tail_us_per_pick, counts, &host)
+            .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
         let plan = xsplit::admit_walk(counts, &host, &unit, queue_floor)
             .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
         self.call_floor(plan.floor)?;

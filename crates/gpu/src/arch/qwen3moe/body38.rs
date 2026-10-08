@@ -822,22 +822,32 @@ pub const XSTREAM_COSTS: Costs = Costs {
     card_us_per_col: 0.16,
 };
 
-/// The card route's tail past a layer's last copy [µs] — the family cost the
-/// pick's walk balances against the union — from the same Q4 prompt-union
-/// records as [`XSTREAM_COSTS`]: the per-layer shadow's remainder past its
-/// pick and its beside-union copies, which the route's own fixed cost over
-/// the card's experts corroborates. The walk alone reads it; the ring's rule
-/// never does.
-pub const XSTREAM_TAIL_US: f64 = 4690.0;
+/// The card route's tail past a layer's last copy, in µs per card pick (a
+/// routed pick the card serves before the unit's pick: the unit's picks less
+/// the inherited host experts' columns) — the family cost the pick's walk
+/// balances against the union, for the Q4 kind. The tail is a level per unit
+/// width, not a constant, so the walk prices each unit with it
+/// ([`runtime::xsplit::unit_constants`]); the walk alone reads it, the ring's
+/// rule never does. The rate sits at or under the level the Q4 prompt-union
+/// records give at the largest prompts' unit.
+///
+/// Sensitivity [derived]: the walk's balance at 4096 columns has a knife edge
+/// in this rate. Its low end loses 6 % of the admits 2 % over the last flat
+/// value and half of them 4 % further; on the count wired here, before the
+/// pick, the edge sits 12 % above the row.
+pub const XSTREAM_TAIL_US_PER_CARD_COL: f64 = 0.125;
 
-/// The stream rule's costs for a file whose common routed kind runs no tile
-/// path on the host union — the IQ files, whose experts this tree's host
-/// serves a column at a time: the row the family carried before the Q4
-/// recalibration, kept until the tiles land and their own records exist (the
-/// per-file override [`Body38::set_xstream_costs`] takes a calibrated row
-/// then). No Q4-derived tail is wired beside it: a walk on this row balances
+/// The stream rule's costs for a file whose common routed kind no record has
+/// fitted — every kind but the Q4 one — until a record of that kind's host
+/// union exists (the per-file override [`Body38::set_xstream_costs`] takes a
+/// calibrated row then). The IQ kinds of the `UD-Q3_K_XL` file (IQ3_XXS, IQ4_XS) run a
+/// multi-column tile on the host union (`qdot::has_tile`), so this row's
+/// per-column cost does not describe their union; the record that closes it
+/// is a prompt-union record of that file at 512 and 4096 columns (the
+/// per-layer `stat prompt lb` walls against their slots and listed experts).
+/// No Q4-derived tail is wired beside it: a walk on this row balances
 /// without one.
-pub const XSTREAM_COSTS_NO_TILE: Costs = Costs {
+pub const XSTREAM_COSTS_UNFITTED: Costs = Costs {
     host_us_per_col: 7.0,
     host_us_fixed: 23.36,
     card_us_fixed: 13.0,
@@ -1848,11 +1858,11 @@ impl Body38 {
         }
         if mode == XMode::Split && self.hybrid.xstream().is_none() {
             // The file's own row: the Q4 kind's recalibrated one, any other
-            // kind's the no-tile row until its tiles and their records exist.
+            // kind's the unfitted row until its record exists.
             let costs = if self.routed_gate == GgmlType::Q4_K {
                 XSTREAM_COSTS
             } else {
-                XSTREAM_COSTS_NO_TILE
+                XSTREAM_COSTS_UNFITTED
             };
             let cfg = XCfg {
                 costs,
@@ -3196,21 +3206,18 @@ impl GpuModel<Body38> {
         body.stream.xend = None;
         body.stream.ubatch = 0;
         let mode = body.xstream_mode();
-        // The file's own tail: the Q4 kind's measured one, none on a kind no
-        // record has priced — the walk then balances without it.
-        body.stream.card_tail_us = if body.routed_gate == GgmlType::Q4_K {
-            XSTREAM_TAIL_US
+        // The file's own tail rate: the Q4 kind's measured one, none on a
+        // kind no record has priced — the walk then balances without it.
+        body.stream.card_tail_us_per_pick = if body.routed_gate == GgmlType::Q4_K {
+            XSTREAM_TAIL_US_PER_CARD_COL
         } else {
             0.0
         };
         let floor = match (mode, body.hybrid.xstream()) {
             (XMode::Split, Some(x)) => (0..body.plans.len())
                 .map(|l| {
-                    x.constants(l).map_or(STREAM_FLOOR, |mut k| {
-                        k.union_burst_share = 0.0;
-                        k.card_tail_us = body.stream.card_tail_us;
-                        runtime::xsplit::walk_gate(&k)
-                    })
+                    x.constants(l)
+                        .map_or(STREAM_FLOOR, |k| runtime::xsplit::walk_gate(&k))
                 })
                 .chain([STREAM_FLOOR])
                 .min()
