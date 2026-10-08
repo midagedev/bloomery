@@ -10,14 +10,15 @@
 # 나오면 check-recipes가 빨강이다.
 #
 # 종료 코드: 게이트의 것 그대로. 124 = 상한에서 TERM으로 끝남, 137 = TERM을 무시해 --kill-after의 KILL로
-# 끝남, 75 = 30분 안에 카드 락이나 V4.1 적재 락을 못 잡음, 또는 강제한 카드(3090·a6000)가 잡힌 타이밍 임대의
+# 끝남, 75 = 30분 안에 카드 락이나 V4.1 적재 락을 못 잡음(카드 락 상한에는 배치 홀드를 기다린 시간이 든다), 또는 강제한 카드(3090·a6000)가 잡힌 타이밍 임대의
 # 타이밍 카드임(모두 경쟁이지 게이트 실패가 아니다), 70 = 카드를 강제했는데 임대를 테스트할 수 없음, 64 = 사용법, 2 = 바이너리 없음,
 # 69 = 게이트 락이나 V4.1 적재 락 파일을 열 수 없음(박스의 root 셸이 아님).
 # `--self-test`: 카드 고르기, 임대 거절, V4.1 적재 락을 임시 디렉터리의 락·임대 파일과 가짜 nvidia-smi로 시험한다(리눅스,
-# flock과 timeout이 필요하다 — 맥에는 없다). 시험만 쓰는 첫 인자 `--test-locks DIR`이 세 락을 DIR 아래로 옮기고
+# flock과 timeout이 필요하다 — 맥에는 없다). 시험만 쓰는 첫 인자 `--test-locks DIR`이 세 락과 배치 홀드 파일(batch.gpuhold)을 DIR 아래로 옮기고
 # V4.1 적재 락의 상한을 6초로, 카드 락의 상한을 4초로, 폴링을 1초로 줄인다.
 # 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버), BLOOMERY_GATE_CARD(아래 카드 고르기),
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
+# BLOOMERY_BATCH_OWNER(letters, digits, _: the owner of the batch hold this run's batch put up — the batch hold paragraph below).
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
 # BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
 # BLOOMERY_TIER=real|fixture (unset: real) and BLOOMERY_FIXTURE_MODEL: the fixture tier (tools/box.sh resolves both, see
@@ -29,9 +30,124 @@
 # Locks. A run takes its card lock(s) and, when it loads, the V4.1 load lock TOGETHER: each poll tries every lock it needs
 # without blocking, and a run that got the card but not the load lock lets the card go before it sleeps, so a loader queued behind
 # another load holds no card — an `any` gate takes it. Nothing waits while holding a lock, except the two-card order below.
+# The batch hold. While the lead's landing batch (tools/gate-batch.sh --ledger) runs, the file /root/bloomery-batch.gpuhold is up on
+# the box: `owner=<id> since=<epoch>`, its mtime refreshed by the batch's heartbeat. A run whose BLOOMERY_BATCH_OWNER (which the
+# batch puts in each of its items' box env) is not that owner WAITS at the top of every poll — before the V4.1 load lock, before any
+# card lock, so it holds none — printing `[batch-hold]` lines at once and once a minute, inside CARD_BOUND (75 at the bound, as
+# contention is today, with its seconds in a `waited N s for the batch hold` line that tools/gate-batch.sh subtracts). The batch's own
+# items pass. A hold whose mtime is 300 s old is stale (the batch or its link to the box is gone): the run ignores it, saying so once.
+# A hold that cannot be read is read as up, never as free. The name does not match tools/ref/lease-probe.sh's LEASE_HOLDS
+# (/root/bloomery-*-hold): builds and every non-GPU box command ignore it. The file has one writer, this script:
+#   gpu-gate.sh --gpuhold up|beat|down <owner>   up: put it up (75 while another owner's fresh hold is up; a stale one is taken over);
+#                                                beat: refresh its mtime, never create it (3: gone or another owner's);
+#                                                down: remove it, only if it is <owner>'s; (owner: letters, digits, _)
+#   gpu-gate.sh --gpuhold path                   print the path
+# The batch calls these through tools/box.sh with BLOOMERY_BOX_READONLY=1 (no sync, no guard wait: a heartbeat stuck behind a sitting
+# would go stale), a deliberate write of this one control file.
 set -uo pipefail
 GATE_LOCK=/root/bloomery-gate.lock A6000_LOCK=/root/bloomery-gate-a6000.lock
 V41_LOCK=/root/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
+GPU_HOLD=/root/bloomery-batch.gpuhold HOLD_STALE=300
+# shellcheck source=tools/ref/lease-probe.sh
+source "${BASH_SOURCE[0]%/*}/ref/lease-probe.sh"
+
+# batch_hold_read: HOLD_STATE none | up | stale (its mtime is HOLD_STALE s old or more), HOLD_OWNER (`?` when the file names none or
+# is not readable), HOLD_AGE (seconds since its last refresh, `?` when its mtime cannot be read — then it is up: never free) and
+# HOLD_SINCE (the epoch the batch put it up, empty when unreadable). A time in the future (a stepped clock) reads as age 0.
+HOLD_STATE=none HOLD_OWNER='' HOLD_AGE=0 HOLD_SINCE='' HOLD_STALE_SAID=0
+batch_hold_read() {
+  local m line f
+  HOLD_STATE=none HOLD_OWNER='' HOLD_AGE=0 HOLD_SINCE=''
+  [ -e "$GPU_HOLD" ] || return 0
+  HOLD_OWNER='?'
+  line=$(head -1 "$GPU_HOLD" 2> /dev/null) || line=
+  set -f
+  for f in $line; do
+    case $f in
+      owner=*) HOLD_OWNER=${f#owner=} ;;
+      since=*[!0-9]*) ;;
+      since=?*) HOLD_SINCE=${f#since=} ;;
+    esac
+  done
+  set +f
+  case $HOLD_OWNER in '' | *[!A-Za-z0-9_]*) HOLD_OWNER='?' ;; esac
+  m=$(__lease_mtime "$GPU_HOLD")
+  case $m in
+    '' | *[!0-9]*) HOLD_STATE=up HOLD_AGE='?'; return 0 ;;
+  esac
+  HOLD_AGE=$(($(date +%s) - m))
+  [ "$HOLD_AGE" -ge 0 ] || HOLD_AGE=0
+  if [ "$HOLD_AGE" -ge "$HOLD_STALE" ]; then HOLD_STATE=stale; else HOLD_STATE=up; fi
+}
+
+# batch_hold_blocks: 0 when a fresh hold of another owner is up (the run waits), else 1. A stale hold is named once, then ignored.
+batch_hold_blocks() {
+  batch_hold_read
+  case $HOLD_STATE in
+    up) [ "$HOLD_OWNER" != "${BLOOMERY_BATCH_OWNER:-}" ] ;;
+    stale)
+      if [ "$HOLD_STALE_SAID" = 0 ]; then
+        echo "[batch-hold] $(now) ${NAME:-gpu-gate.sh}: the batch hold $GPU_HOLD (owner $HOLD_OWNER) is stale — not refreshed for $HOLD_AGE s (stale at $HOLD_STALE s): its batch is gone or cut off from the box; ignoring it" >&2
+        HOLD_STALE_SAID=1
+      fi
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# gpuhold <verb> <owner>: the hold file's one writer (the header). Prints what it did; the rc is the verb's.
+gpuhold() {
+  local verb=${1:-} owner=${2:-} tmp
+  if [ "$verb" = path ]; then echo "$GPU_HOLD"; return 0; fi
+  case $verb in
+    up | beat | down) ;;
+    *) echo "gpu-gate.sh: --gpuhold takes path or up|beat|down <owner>, got '$verb'" >&2; return 64 ;;
+  esac
+  case $owner in
+    '' | *[!A-Za-z0-9_]*) echo "gpu-gate.sh: --gpuhold $verb: an owner is letters, digits and _, got '$owner'" >&2; return 64 ;;
+  esac
+  batch_hold_read
+  case $verb in
+    up)
+      case $HOLD_STATE in
+        up)
+          if [ "$HOLD_OWNER" != "$owner" ]; then
+            echo "gpu-gate.sh: the batch hold $GPU_HOLD is up for owner $HOLD_OWNER (refreshed $HOLD_AGE s ago): not taking it (rc 75)" >&2
+            return 75
+          fi ;;
+        stale)
+          echo "gpu-gate.sh: the batch hold $GPU_HOLD of owner $HOLD_OWNER was not refreshed for $HOLD_AGE s: taking it over" >&2
+          rm -f "$GPU_HOLD" ;;
+      esac
+      tmp=$GPU_HOLD.$$.new
+      printf 'owner=%s since=%s\n' "$owner" "$(date +%s)" > "$tmp" 2> /dev/null || { echo "gpu-gate.sh: cannot write $tmp — the hold is written on the box, as root" >&2; return 69; }
+      if [ "$HOLD_STATE" = up ]; then
+        mv -f "$tmp" "$GPU_HOLD"
+      elif ln "$tmp" "$GPU_HOLD" 2> /dev/null; then
+        rm -f "$tmp"
+      else
+        rm -f "$tmp"
+        echo "gpu-gate.sh: another batch put $GPU_HOLD up at the same moment: not taking it (rc 75)" >&2
+        return 75
+      fi
+      echo "gpu-gate.sh: batch hold $GPU_HOLD up: owner $owner" ;;
+    beat)
+      if [ "$HOLD_STATE" = none ] || [ "$HOLD_OWNER" != "$owner" ]; then
+        echo "gpu-gate.sh: the batch hold $GPU_HOLD is $([ "$HOLD_STATE" = none ] && echo gone || echo "owner $HOLD_OWNER's"), not $owner's: not refreshing it (rc 3)" >&2
+        return 3
+      fi
+      touch -c "$GPU_HOLD" ;;
+    down)
+      if [ "$HOLD_STATE" = none ]; then
+        echo "gpu-gate.sh: the batch hold $GPU_HOLD is already down"
+      elif [ "$HOLD_OWNER" != "$owner" ]; then
+        echo "gpu-gate.sh: the batch hold $GPU_HOLD is owner $HOLD_OWNER's, not $owner's: left up"
+      else
+        rm -f "$GPU_HOLD"
+        echo "gpu-gate.sh: batch hold $GPU_HOLD down: owner $owner"
+      fi ;;
+  esac
+}
 
 # The runner's own tests: each case runs this script with --test-locks <tmp> (the three locks under <tmp>,
 # the V4.1 load lock's bound 6 s, the card locks' 4 s, the polls 1 s), BLOOMERY_LEASE_LOCK at a file the test holds or not, a stub
@@ -101,14 +217,16 @@ PY
     echo "FAIL: the self-test's stub cards did not resolve (CARDS_ERROR: ${CARDS_ERROR:-none})"
     return 1
   }
-  # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc
+  # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
+  # batch hold live in, default the test's own)
   gate() {
     local o=$1 c=$2 l=$3
     shift 3
-    (cd "$t/tree" && env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES \
-      -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL \
+    # Under a bound of its own: a runner that hangs ends the case red (124), it does not hang the check.
+    (cd "$t/tree" && timeout --kill-after=5 60 env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES \
+      -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER \
       PATH="$t/bin:$PATH" BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
-      bash "$self" --test-locks "$t" ok) > "$o" 2>&1
+      bash "$self" --test-locks "${TL:-$t}" ok) > "$o" 2>&1
   }
   # judge <name> <rc> <want rc> <ERE that must match> [ERE that must not]
   judge() {
@@ -332,6 +450,177 @@ PY
   case_ 'the V4.1 load lock never frees: 75 after the bound, named' 75 'V4\.1 load lock .* was not free within 6 s' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1
   flock -u 6
   exec 6>&-
+  # The batch hold (the header). hold <owner> [age s] writes the file as the batch's writer leaves it, its mtime <age> seconds back
+  # (python3's utime: BSD and GNU touch share no relative form); hold_age is the mtime's age; hrun <verb> <owner> runs the writer and
+  # appends the file as it stands after (all three take a third argument, a directory: the hold of another --test-locks dir); judge_all <name> <rc> <want rc> <ERE>…: every ERE must match a line of the output, and one
+  # that starts with ! must match none.
+  hold() {
+    printf 'owner=%s since=%s\n' "$1" "$(($(date +%s) - ${2:-0}))" > "${3:-$t}/batch.gpuhold"
+    python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "${3:-$t}/batch.gpuhold" "${2:-0}"
+  }
+  hold_age() { python3 -c 'import os, sys, time; print(int(time.time() - os.stat(sys.argv[1]).st_mtime))' "$1"; }
+  hrun() {
+    rc=0
+    bash "$self" --test-locks "$t" --gpuhold "$@" > "$t/out" 2>&1 || rc=$?
+    if [ -e "$t/batch.gpuhold" ]; then
+      printf 'after: %s age=%s\n' "$(head -1 "$t/batch.gpuhold")" "$(hold_age "$t/batch.gpuhold")" >> "$t/out"
+    else
+      echo 'after: no hold' >> "$t/out"
+    fi
+  }
+  judge_all() {
+    local name=$1 got=$2 want=$3 pat miss=
+    shift 3
+    n=$((n + 1))
+    out=$(cat "$t/out")
+    for pat in "$@"; do
+      case $pat in
+        '!'*) ! printf '%s\n' "$out" | grep -Eq -- "${pat#!}" || miss="$miss /$pat/" ;;
+        *) printf '%s\n' "$out" | grep -Eq -- "$pat" || miss="$miss /$pat/" ;;
+      esac
+    done
+    if [ "$got" = "$want" ] && [ -z "$miss" ]; then
+      echo "ok $name"
+    else
+      bad=$((bad + 1))
+      echo "FAIL $name: rc $got (want $want), failed:${miss:- none}"
+      printf '%s\n' "$out" | sed 's/^/    | /'
+    fi
+  }
+  rm -f "$t/batch.gpuhold"
+  rc=0
+  gate "$t/out" 3090 "$t/lease" || rc=$?
+  judge_all 'no hold: the run goes ahead and names no hold' "$rc" 0 'ok on the 3090 \(asked 3090\)' '!batch-hold|batch hold'
+  # A fresh hold of another owner, four runs at once: no owner, a prefix of the owner (not the owner), a V4.1 loader whose load lock is
+  # held (the hold is read before the load lock's probe: the bound named is the hold's 4 s, not the load lock's 6 s), and a run of both
+  # cards.
+  hold other 0
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  gate "$t/h1" 3090 "$t/lease" &
+  p1=$!
+  gate "$t/h2" 3090 "$t/lease" BLOOMERY_BATCH_OWNER=othe &
+  p2=$!
+  gate "$t/h3" any "$t/lease" BLOOMERY_GATE_V41_LOAD=1 &
+  p3=$!
+  gate "$t/h4" both "$t/lease" BLOOMERY_BOX_CARD=both &
+  p4=$!
+  # Two more beside them, each in a directory of its own so each has its own hold: a hold that names no owner (up, never free), and a
+  # hold released while its run waits.
+  mkdir -p "$t/d2" "$t/d3"
+  : > "$t/d2/batch.gpuhold"
+  TL="$t/d2" gate "$t/h5" 3090 "$t/lease" &
+  p5=$!
+  hold other 0 "$t/d3"
+  TL="$t/d3" gate "$t/h6" 3090 "$t/lease" &
+  p6=$!
+  # And a stale hold over a 3090 lock that stays taken: the run polls for the card for the whole bound and names the stale hold once.
+  mkdir -p "$t/d4"
+  hold other 400 "$t/d4"
+  exec 5> "$t/d4/gate.lock"
+  flock -x 5 || { echo "FAIL: the test cannot hold the d4 gate lock"; return 1; }
+  TL="$t/d4" gate "$t/h7" 3090 "$t/lease" &
+  p7=$!
+  # d3's hold is released once its run is waiting on it (its first [batch-hold] line) and has polled once more — an event of the run's
+  # own clock, not a fixed time after the launch: the others wait out their 4 s bound beside it.
+  k=0
+  while ! grep -q 'batch-hold' "$t/h6" 2> /dev/null && [ "$k" -lt 50 ]; do
+    sleep 0.2
+    k=$((k + 1))
+  done
+  sleep 1
+  rm -f "$t/d3/batch.gpuhold"
+  sleep 0.5
+  # While they wait they hold no card lock: both are free for a try of their own.
+  prc3=0 prca=0
+  flock -n "$t/gate.lock" true || prc3=$?
+  flock -n "$t/gate-a6000.lock" true || prca=$?
+  echo "probe 3090 lock rc=$prc3 a6000 lock rc=$prca" > "$t/out"
+  judge_all 'runs waiting on the hold hold no card lock' 0 0 'probe 3090 lock rc=0 a6000 lock rc=0$'
+  rc=0
+  wait "$p1" || rc=$?
+  cp "$t/h1" "$t/out"
+  judge_all 'a fresh hold of another owner: the run waits, 75 at the bound, a [batch-hold] line at once naming owner and age' "$rc" 75 \
+    '\[batch-hold\] .* waits: a landing batch holds the GPUs \(.*batch\.gpuhold, owner other, up [0-9]+ s, refreshed [0-9]+ s ago\)' \
+    'the batch hold .*batch\.gpuhold \(owner other\) was still up after [4-9] s .*contention' '!ok on the'
+  rc=0
+  wait "$p2" || rc=$?
+  cp "$t/h2" "$t/out"
+  judge_all '  … an owner that is a prefix of the hold'"'"'s is not the owner' "$rc" 75 '\[batch-hold\] .* owner other' '!ok on the'
+  rc=0
+  wait "$p3" || rc=$?
+  cp "$t/h3" "$t/out"
+  judge_all '  … a V4.1 loader waits on the hold before its load lock: the hold'"'"'s bound, not the load lock'"'"'s' "$rc" 75 \
+    'the batch hold .* was still up after [4-9] s' '!V4\.1 load lock .* was not free'
+  rc=0
+  wait "$p4" || rc=$?
+  cp "$t/h4" "$t/out"
+  judge_all '  … a run of both cards waits too' "$rc" 75 '\[batch-hold\] .* owner other' '!ok on'
+  flock -u 6
+  exec 6>&-
+  rc=0
+  wait "$p5" || rc=$?
+  cp "$t/h5" "$t/out"
+  judge_all 'a hold that names no owner is up, never free: 75 at the bound, owner ?' "$rc" 75 '\[batch-hold\] .* owner \?, ' '!ok on'
+  rc=0
+  wait "$p6" || rc=$?
+  cp "$t/h6" "$t/out"
+  judge_all 'a hold released while the run waits: it goes ahead and counts the wait on its own line' "$rc" 0 \
+    'ok on the 3090 \(asked 3090\)' '^gpu-gate\.sh: waited [0-9]+ s for the batch hold$'
+  rc=0
+  wait "$p7" || rc=$?
+  flock -u 5
+  exec 5>&-
+  cp "$t/h7" "$t/out"
+  echo "hold lines: $(grep -c 'batch-hold' "$t/out")" >> "$t/out"
+  judge_all 'a stale hold over a taken card lock: the run polls on for the card, 75, and names the stale hold once' "$rc" 75 \
+    'no gate lock \(3090\) was free within 4 s' '\[batch-hold\] .* is stale' 'hold lines: 1$'
+  rc=0
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_BATCH_OWNER=other || rc=$?
+  judge_all "the hold's own batch passes: its owner runs, no hold line" "$rc" 0 'ok on the 3090 \(asked 3090\)' '!batch-hold|batch hold'
+  hold other 400
+  rc=0
+  gate "$t/out" 3090 "$t/lease" || rc=$?
+  echo "hold lines: $(grep -c 'batch-hold' "$t/out")" >> "$t/out"
+  judge_all 'a stale hold (not refreshed for 400 s): the run goes ahead, and says so once, naming the hold and its age' "$rc" 0 \
+    'ok on the 3090 \(asked 3090\)' '!waits' \
+    '\[batch-hold\] .*batch\.gpuhold \(owner other\) is stale — not refreshed for 4[0-9][0-9] s \(stale at 300 s\)' 'hold lines: 1$'
+  case_ 'BLOOMERY_BATCH_OWNER with a character other than letters, digits, _: 64, named' 64 "BLOOMERY_BATCH_OWNER is the batch hold's owner .*got 'a-b'" 3090 "$t/lease" BLOOMERY_BATCH_OWNER=a-b
+  # The writer: up, beat and down on the file, owner-checked; the wait above reads what it writes.
+  hrun up batcha
+  judge_all 'gpuhold up: puts the hold up with its owner and the box clock' "$rc" 0 'up: owner batcha$' 'after: owner=batcha since=[0-9]+ age=[0-2]$'
+  hrun up batcha
+  judge_all '  … again by the same owner: refreshed, not refused' "$rc" 0 'up: owner batcha$' 'after: owner=batcha since=[0-9]+ age=[0-2]$'
+  hrun up other
+  judge_all "  … another owner's fresh hold is refused, 75, and stays" "$rc" 75 'is up for owner batcha .*not taking it \(rc 75\)' 'after: owner=batcha ' '!owner=other'
+  hold batcha 200
+  hrun beat batcha
+  judge_all 'gpuhold beat: refreshes the mtime of its own hold' "$rc" 0 'after: owner=batcha since=[0-9]+ age=[0-2]$'
+  hold batcha 200
+  hrun beat other
+  judge_all "  … never another owner's" "$rc" 3 "owner batcha's, not other's: not refreshing it \(rc 3\)" 'after: owner=batcha since=[0-9]+ age=(199|20[0-9])$'
+  rm -f "$t/batch.gpuhold"
+  hrun beat batcha
+  judge_all '  … and never creates a hold that is gone (a beat in flight after a down)' "$rc" 3 'is gone, not batcha.s: not refreshing it \(rc 3\)' 'after: no hold$'
+  hold batcha 0
+  hrun down other
+  judge_all "gpuhold down: leaves another owner's hold" "$rc" 0 "owner batcha's, not other's: left up" 'after: owner=batcha ' '!down: owner'
+  hrun down batcha
+  judge_all '  … removes its own' "$rc" 0 'down: owner batcha$' 'after: no hold$'
+  hrun down batcha
+  judge_all '  … and is no error when it is already down' "$rc" 0 'is already down$' 'after: no hold$'
+  hold other 400
+  hrun up batcha
+  judge_all 'gpuhold up: takes over a stale hold, naming it' "$rc" 0 'owner other was not refreshed for 4[0-9][0-9] s: taking it over' 'after: owner=batcha since=[0-9]+ age=[0-2]$'
+  rm -f "$t/batch.gpuhold"
+  hrun up 'a b'
+  judge_all 'gpuhold: an owner with a space: 64, named' "$rc" 64 "an owner is letters, digits and _, got 'a b'" 'after: no hold$'
+  # The file's name stays apart from the sittings' holds (/root/bloomery-<owner>-hold): builds and every other box command ignore it.
+  out=$(bash "$self" --gpuhold path)
+  out="$out $(env -u BLOOMERY_LEASE_HOLDS bash -c '. "$1"; case /root/bloomery-03-hold in $LEASE_HOLDS) printf "sitting-hold-matches " ;; esac; case "$2" in $LEASE_HOLDS) echo MATCHES ;; *) echo apart ;; esac' _ \
+    "$(dirname "$self")/ref/lease-probe.sh" "$out")"
+  printf '%s\n' "$out" > "$t/out"
+  judge_all "the batch hold's name does not match the sittings' LEASE_HOLDS" 0 0 '^/root/bloomery-batch\.gpuhold sitting-hold-matches apart$'
   echo "gpu-gate self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -341,8 +630,13 @@ if [ "${1:-}" = --self-test ]; then
 fi
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 3 ] && [ -d "$2" ] || { echo "usage: gpu-gate.sh --test-locks <dir> <binary> [args...] (the self-test's)" >&2; exit 64; }
-  GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock V41_LOCK=$2/v41-load.lock V41_BOUND=6 POLL=1 CARD_BOUND=4
+  GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
   shift 2
+fi
+if [ "${1:-}" = --gpuhold ]; then
+  shift
+  gpuhold "$@"
+  exit $?
 fi
 NAME=${1:-}
 [ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...]" >&2; exit 64; }
@@ -365,6 +659,10 @@ TIER=${BLOOMERY_TIER:-real}
 case $TIER in
   real | fixture) ;;
   *) echo "gpu-gate.sh: BLOOMERY_TIER is real or fixture (unset: real), got '$TIER'" >&2; exit 64 ;;
+esac
+# BLOOMERY_BATCH_OWNER: the owner of the batch hold this run's batch put up (the header); the batch exports it into each item's box env.
+case ${BLOOMERY_BATCH_OWNER:-} in
+  *[!A-Za-z0-9_]*) echo "gpu-gate.sh: BLOOMERY_BATCH_OWNER is the batch hold's owner (letters, digits and _) or unset, got '$BLOOMERY_BATCH_OWNER'" >&2; exit 64 ;;
 esac
 TIER_NOTE=
 if [ "$V41" = 1 ] && [ "$TIER" = fixture ]; then
@@ -401,8 +699,6 @@ fi
 # 강제한 실행은 그 카드가 잡힌 임대의 타이밍 카드면 75로 끝난다. 임대 탐침은
 # lease-probe.sh의 lease_free(공유 잠금) 하나다 — 대기 중 5초마다 도는 이 탐침이 배타 잠금이면 다른 탐침과 부딪혀
 # 빈 임대를 잡힌 것으로 읽고, 테스트할 수 없는 임대도 비었다고 읽지 않는다.
-# shellcheck source=tools/ref/lease-probe.sh
-source "${BASH_SOURCE[0]%/*}/ref/lease-probe.sh"
 # box.sh가 보여 준 카드가 락을 정한다. BLOOMERY_BOX_CARD는 box.sh가 박스 쪽에 넘기는 그 선택이다(3090 = env
 # 파일의 핀, a6000, both = 두 카드). box.sh를 거치지 않은 실행은 핀 그대로로 읽는다. box.sh가 BLOOMERY_CARD=a6000|both로
 # 카드를 골랐으면 BLOOMERY_GATE_CARD 없이 그 카드의 락을 잡고 — both는 두 락을 함께 잡거나 하나도 안 잡는다 — 다른 카드를
@@ -624,11 +920,15 @@ drop_card() {
 # CARD_BOUND for a poll that found no card, V41_BOUND for one that found the card and not the lock, each 75 (contention, not a
 # red gate) with the lock named; the load lock's holders are named at once and once a minute.
 # Each poll's seconds go to one of the two waits, so the two `waited` lines never overlap: tools/gate-batch.sh subtracts both.
+# The batch hold (the header) is read first in every poll, before the load lock's shared probe and before any card lock: a run under
+# a hold holds nothing while it waits, and a gate already polling cannot slip in between a batch's items.
 GOT=
-CARD_W=0 LOAD_W=0 why='' said=-60 last=$SECONDS
+CARD_W=0 LOAD_W=0 HOLD_W=0 why='' said=-60 hsaid=-60 last=$SECONDS
 while :; do
   why=
-  if [ "$V41" = 1 ] && ! flock -s -n "$V41_LOCK" true 2> /dev/null; then
+  if batch_hold_blocks; then
+    why=hold
+  elif [ "$V41" = 1 ] && ! flock -s -n "$V41_LOCK" true 2> /dev/null; then
     why=load
   else
     if [ "$CARD" = both ]; then take_both; else take_card; fi
@@ -640,6 +940,12 @@ while :; do
     fi
   fi
   [ -n "$why" ] || break
+  if [ "$why" = hold ] && [ $((HOLD_W - hsaid)) -ge 60 ]; then
+    up_s='?'
+    [ -z "$HOLD_SINCE" ] || up_s=$(($(date +%s) - HOLD_SINCE))
+    echo "[batch-hold] $(now) $NAME waits: a landing batch holds the GPUs ($GPU_HOLD, owner $HOLD_OWNER, up $up_s s, refreshed $HOLD_AGE s ago), holding no lock; ${HOLD_W} s so far, at most ${CARD_BOUND} s with the lock waits" >&2
+    hsaid=$HOLD_W
+  fi
   if [ "$why" = load ] && [ $((LOAD_W - said)) -ge 60 ]; then
     echo "gpu-gate.sh: $NAME waits for the V4.1 load lock $V41_LOCK (another run is loading V4.1), holding no gate lock; ${LOAD_W} s so far, its holders:" >&2
     lease_holders "$V41_LOCK" >&2
@@ -647,9 +953,18 @@ while :; do
   fi
   sleep "$POLL"
   spent=$((SECONDS - last)) last=$SECONDS
-  if [ "$why" = card ]; then CARD_W=$((CARD_W + spent)); else LOAD_W=$((LOAD_W + spent)); fi
-  if [ "$CARD_W" -ge "$CARD_BOUND" ] && [ "$why" = card ]; then
+  case $why in
+    card) CARD_W=$((CARD_W + spent)) ;;
+    hold) HOLD_W=$((HOLD_W + spent)) ;;
+    *) LOAD_W=$((LOAD_W + spent)) ;;
+  esac
+  # The hold's seconds and the card lock's share CARD_BOUND: a batch's hold is a wait for the cards, as the card lock is.
+  if [ $((CARD_W + HOLD_W)) -ge "$CARD_BOUND" ] && [ "$why" = card ]; then
     echo "gpu-gate.sh: no gate lock ($CARD) was free within ${CARD_BOUND} s — contention, not a red gate" >&2
+    exit 75
+  fi
+  if [ $((CARD_W + HOLD_W)) -ge "$CARD_BOUND" ] && [ "$why" = hold ]; then
+    echo "gpu-gate.sh: $NAME: the batch hold $GPU_HOLD (owner $HOLD_OWNER) was still up after ${HOLD_W} s (CARD_BOUND ${CARD_BOUND} s) — contention, not a red gate (rc 75)" >&2
     exit 75
   fi
   if [ "$LOAD_W" -ge "$V41_BOUND" ] && [ "$why" = load ]; then
@@ -660,6 +975,7 @@ done
 # What the last poll spent (take_both's blocking) was a wait for the card lock.
 CARD_W=$((CARD_W + SECONDS - last))
 # The waits are not the gate's time: tools/gate-batch.sh subtracts these lines' seconds from the item's times row.
+[ "$HOLD_W" = 0 ] || echo "gpu-gate.sh: waited ${HOLD_W} s for the batch hold" >&2
 [ "$CARD_W" = 0 ] || echo "gpu-gate.sh: waited ${CARD_W} s for the gate lock ($CARD)" >&2
 [ "$LOAD_W" = 0 ] || echo "gpu-gate.sh: waited ${LOAD_W} s for the V4.1 load lock" >&2
 if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then
