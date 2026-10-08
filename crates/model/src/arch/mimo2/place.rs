@@ -81,8 +81,8 @@ impl PlanInputs {
         }
     }
 
-    /// [`PlanInputs::read`] without the refusals: the file as it is, for the
-    /// gate that plans a file no program runs yet.
+    /// [`PlanInputs::read`] without the refusals: the file as it is, for a
+    /// gate that plans or describes a file whatever the coverage list holds.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
@@ -194,8 +194,8 @@ mod tests {
     /// [`PlanInputs::read`] by the next-token count's name — the draft that
     /// reads them is a later round's, and this plan loads the trunk without
     /// them — before the coverage list; the same file without its next-token
-    /// layer is refused by that list alone, no program running a mimo2 file
-    /// yet, so the count is the named refusal.
+    /// layer is refused by that list alone (the synthetic head width is one no
+    /// row of the mimo2 body runs), so the count is the named refusal.
     #[test]
     fn next_token_layers_are_refused_at_read() {
         let err = read_inputs("mimo2-place-nextn", &keys(), &tensors())

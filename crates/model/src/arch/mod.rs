@@ -134,6 +134,7 @@ pub enum Arch {
     Qwen3moe,
     Qwen35moe,
     Glm5next,
+    Mimo2,
 }
 
 impl Arch {
@@ -157,6 +158,7 @@ impl Arch {
             "qwen3moe" => Ok(Arch::Qwen3moe),
             "qwen35moe" => Ok(Arch::Qwen35moe),
             "glm5next" => Ok(Arch::Glm5next),
+            "mimo2" => Ok(Arch::Mimo2),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -172,6 +174,7 @@ impl Arch {
             Arch::Qwen3moe => "qwen3moe",
             Arch::Qwen35moe => "qwen35moe",
             Arch::Glm5next => "glm5next",
+            Arch::Mimo2 => "mimo2",
         }
     }
 }
@@ -485,6 +488,7 @@ mod tests {
             Arch::Qwen3moe,
             Arch::Qwen35moe,
             Arch::Glm5next,
+            Arch::Mimo2,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

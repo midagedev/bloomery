@@ -470,6 +470,38 @@ pub mod step_order {
         CandMask,
     ];
 
+    /// MiMo-V2.6-Flash (`gpu-mimo2`): the token id checked on the host before
+    /// the step; a layer's cache append (position) and its flash (visible
+    /// key count); the router and the handoff's id check; the q8_0 head's
+    /// logits last. The projections and the norms read f32 rows with
+    /// nothing to raise; those sites follow the ones the step raises.
+    pub const MIMO2: &[FaultSite] = &[
+        TokenId,
+        CachePos,
+        KeyCount,
+        Router,
+        ExpertId,
+        Logit,
+        QuantColumn,
+        NormQuant,
+        Q5Quant,
+        HcQuant,
+        AttnSel,
+        AttnCount,
+        LinearConv,
+        LinearDelta,
+        LinearGate,
+        DeltaLane,
+        CacheValue,
+        PoolSelect,
+        Ple,
+        HcMix,
+        F32Product,
+        DeltaStamp,
+        CandMask,
+        KvQuant,
+    ];
+
     /// The order of `arch`'s step.
     #[must_use]
     pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
@@ -479,6 +511,7 @@ pub mod step_order {
             model::arch::Arch::Qwen3moe => QWEN3MOE,
             model::arch::Arch::Qwen35moe => QWEN35MOE,
             model::arch::Arch::Glm5next => GLM5NEXT,
+            model::arch::Arch::Mimo2 => MIMO2,
         }
     }
 }
@@ -815,13 +848,14 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 5] {
+    fn every_arch() -> [Arch; 6] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
             Arch::Qwen3moe,
             Arch::Qwen35moe,
             Arch::Glm5next,
+            Arch::Mimo2,
         ];
         for a in all {
             match a {
@@ -829,7 +863,8 @@ mod tests {
                 | Arch::Deepseek41
                 | Arch::Qwen3moe
                 | Arch::Qwen35moe
-                | Arch::Glm5next => {}
+                | Arch::Glm5next
+                | Arch::Mimo2 => {}
             }
         }
         all
@@ -851,6 +886,24 @@ mod tests {
                 assert_eq!(n, 1, "{arch:?}'s step order names {site:?} {n} times");
             }
         }
+    }
+
+    /// MiMo-V2.6-Flash's order opens with the six sites its step raises, in
+    /// the order its launches meet them: the host's token check, the append's
+    /// position, the flash's key count, the router, the handoff, the head.
+    #[test]
+    fn the_mimo2_order_leads_with_the_sites_its_step_raises() {
+        assert_eq!(
+            step_order::of(Arch::Mimo2)[..6],
+            [
+                FaultSite::TokenId,
+                FaultSite::CachePos,
+                FaultSite::KeyCount,
+                FaultSite::Router,
+                FaultSite::ExpertId,
+                FaultSite::Logit,
+            ]
+        );
     }
 
     #[test]

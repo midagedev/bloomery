@@ -17,7 +17,7 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use gguf::GgmlType;
-use models::shape::{RouterBody, gqa_row, select_router};
+use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
 use models::{
     Arch, Collapse, DeltaKind, Extra, GdnGate, HcMix, KHeadMap, LatentUp, ModelSpec, Need,
     RopeMode, needs,
@@ -42,6 +42,9 @@ pub enum Program {
     /// The qwen4exp body (`crates/gpu/src/arch/qwen3moe` `Body38`): every
     /// routed expert on the host tier.
     Qwen38Body,
+    /// The mimo2 body (`crates/gpu-mimo2`): every routed expert on the host
+    /// tier, none on a card.
+    Mimo2Body,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -53,7 +56,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen35Moe | Arch::Qwen35 => Some(Program::Qwen35Body),
         Arch::Glm5Next => Some(Program::Glm5nextBody),
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
-        Arch::MiMo2 => None,
+        Arch::MiMo2 => Some(Program::Mimo2Body),
     }
 }
 
@@ -277,8 +280,8 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Glm5nextBody],
-        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body",
+        programs: &[Program::Glm5nextBody, Program::Mimo2Body],
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256)",
         runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
     },
     Available {
@@ -295,8 +298,8 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Glm5nextBody],
-        at: "gpu-glm5next/src/ffn.rs (the dense block)",
+        programs: &[Program::Glm5nextBody, Program::Mimo2Body],
+        at: "gpu-deepseek41/src/experts.rs enqueue_shexp_gate_up (the dense block: glm5next ffn.rs, mimo2 ffn.rs)",
         runs: |n| matches!(n, Need::DenseFfn { .. }),
     },
     Available {
@@ -463,7 +466,65 @@ pub const AVAILABLE: &[Available] = &[
         at: "gpu/src/arch/qwen3moe/program38.rs (a mixer per layer's plan)",
         runs: |n| matches!(n, Need::MixedTrunk),
     },
+    Available {
+        programs: &[Program::Mimo2Body],
+        at: "models/src/shape.rs GQA, the K192 row of a full layer (gpu/src/flash_gqa.rs \
+             gqa_flash_seg_k192 and gqa_flash_merge)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head: 192,
+                    value: 128,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: true,
+                } if k192_row(*group)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Mimo2Body],
+        at: "models/src/shape.rs GQA, the K192 row of a window layer (gpu/src/flash_gqa.rs \
+             gqa_flash_seg_k192 and gqa_flash_merge_sink)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head: 192,
+                    value: 128,
+                    group,
+                    window: Some(_),
+                    sinks: true,
+                    scaled: true,
+                } if k192_row(*group)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Mimo2Body],
+        at: "gpu/src/rope_neox.rs HEAD_K192, ROT_K192 (neox_append_k192: no QK norm, 64 of 192 dims)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: false,
+                    head: 192,
+                    mode: RopeMode::Neox,
+                    dims: 64
+                }
+            )
+        },
+    },
 ];
+
+/// Whether the K192 flash row ([`gqa_row_v`] at head 192, value 128) takes
+/// `group` query heads a key head, with the window, sinks and value scale
+/// the MiMo rows above ask of it.
+fn k192_row(group: u32) -> bool {
+    gqa_row_v(192, 128, group).is_some_and(|r| r.window && r.sinks && r.value_scale)
+}
 
 /// Whether a rope of `mode` over the first `dims` values of a head turns
 /// them as NEOX does at a text-only position: NEOX itself, or IMROPE whose
@@ -767,6 +828,38 @@ const TYPE_PINS: &[TypePin] = &[
         what: "token embedding (the card reads q8_0 rows)",
         reads: &[GgmlType::Q8_0],
     },
+    TypePin {
+        program: Program::Mimo2Body,
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention matrices (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Mimo2Body,
+        role: Role::DenseFfn,
+        matrices: true,
+        names: None,
+        what: "dense block (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Mimo2Body,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output head (the head reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Mimo2Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the host reads q8_0 rows)",
+        reads: &[GgmlType::Q8_0],
+    },
 ];
 
 /// `Body35`'s projection types (`PROJ`): every attention, delta-rule and
@@ -791,16 +884,20 @@ fn routed_down(name: &str) -> bool {
     name.ends_with(".ffn_down_exps.weight")
 }
 
-/// A routed stack of a Qwen38Body file no side of a plan runs: not one
-/// [`card_routed`](crate::arch::qwen35moe::place::card_routed) loads on the
-/// card, and no fused qdot kernel serves it on the host at its row width —
+/// A routed stack no side of a plan runs: not one `card_rule` says a card
+/// loads, and no fused qdot kernel serves it on the host at its row width —
 /// `HostLayer::build`'s own admission ([`qdot::fuses`], the check the union
 /// call makes of every stack it serves), asked here at the stack's first
-/// dim, its `k`.
-fn q38_routed_unrun(t: &ModelTensor) -> bool {
+/// dim, its `k`. A program with no card expert passes `|_| false`.
+fn routed_unrun(t: &ModelTensor, card_rule: fn(GgmlType) -> bool) -> bool {
     let k = t.dims.first().copied().unwrap_or(0);
-    crate::arch::qwen35moe::place::card_routed(t.ty).is_none()
-        && !qdot::fuses(t.ty, usize::try_from(k).unwrap_or(usize::MAX))
+    !card_rule(t.ty) && !qdot::fuses(t.ty, usize::try_from(k).unwrap_or(usize::MAX))
+}
+
+/// The qwen4exp body's card rule: the types its card experts load
+/// ([`card_routed`](crate::arch::qwen35moe::place::card_routed)).
+fn qwen38_card_routed(ty: GgmlType) -> bool {
+    crate::arch::qwen35moe::place::card_routed(ty).is_some()
 }
 
 /// A qwen4exp selector's key or query projection, which `Body38` reads as
@@ -899,9 +996,16 @@ pub fn check_with(
                 // The qwen4exp body's rule: a stack passes when the program
                 // can run it — on the card by its expert rule (`card_routed`)
                 // or on the host by a qdot fused kernel at the stack's row
-                // width ([`q38_routed_unrun`], the one owner).
+                // width ([`routed_unrun`], the one owner).
                 Some(Program::Qwen38Body) => {
-                    if q38_routed_unrun(t) {
+                    if routed_unrun(t, qwen38_card_routed) {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // The mimo2 body's rule: the same, with no card expert — a
+                // stack passes only on the host by a qdot fused kernel.
+                Some(Program::Mimo2Body) => {
+                    if routed_unrun(t, |_| false) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -1218,7 +1322,7 @@ mod tests {
     // PIN(2026-10-06): the Qwen38Body routed rule widened from
     // `CardFormat::of` to card-or-host so the UD-Q3_K_XL file's stacks
     /// (iq3_xxs, iq4_xs gate and up, iq4_nl down) are no items; the host
-    /// admission is qdot's own (`q38_routed_unrun`).
+    /// admission is qdot's own (`routed_unrun`).
     #[test]
     fn a_qwen38_routed_stack_runs_on_a_card_or_the_host() {
         let routed = |ty: GgmlType, k: u64| ModelTensor {
@@ -1241,16 +1345,31 @@ mod tests {
             (GgmlType::IQ4_XS, 2560),
             (GgmlType::IQ4_NL, 640),
         ] {
-            assert!(!super::q38_routed_unrun(&routed(ty, k)), "{ty}");
+            assert!(
+                !super::routed_unrun(&routed(ty, k), super::qwen38_card_routed),
+                "{ty}"
+            );
         }
+        // The card's alone: a width no fused qdot kernel takes still runs on
+        // the card, by type.
+        assert!(
+            !super::routed_unrun(&routed(GgmlType::Q4_K, 100), super::qwen38_card_routed),
+            "q4_K at a width only the card takes"
+        );
         // The host's alone: q6_K and q3_K stacks stay host-served.
         for ty in [GgmlType::Q6_K, GgmlType::Q3_K] {
-            assert!(!super::q38_routed_unrun(&routed(ty, 2560)), "{ty}");
+            assert!(
+                !super::routed_unrun(&routed(ty, 2560), super::qwen38_card_routed),
+                "{ty}"
+            );
         }
         // No side: a type no card expert kernel reads and no fused qdot
         // kernel serves.
         for ty in [GgmlType::IQ2_S, GgmlType::F32] {
-            assert!(super::q38_routed_unrun(&routed(ty, 2560)), "{ty}");
+            assert!(
+                super::routed_unrun(&routed(ty, 2560), super::qwen38_card_routed),
+                "{ty}"
+            );
         }
     }
 
@@ -1297,6 +1416,245 @@ mod tests {
                 }
             ),
             ["q6_K token embedding (the card reads q8_0 rows)"]
+        );
+    }
+
+    /// MiMo-V2.6-Flash at the shapes `mimo2_meta` pins (48 layers, the nine
+    /// full layers at 0, 5, 11, …, 47 and window layers between, key head 192
+    /// over value head 128, 64 heads over 4 or 8 key heads, window 128 with
+    /// sinks, value scale 0.707, a dense layer 0 of 16384 and routed layers
+    /// of 256 experts, top 8, sigmoid with a selection bias), with the
+    /// types the file carries: Q8_0 attention, dense block, head and
+    /// embedding, F32 norms, sinks, routers and biases, MXFP4 stacks.
+    fn mimo2_real() -> (models::ModelSpec, crate::placement::ModelTensors) {
+        use crate::arch::mimo2::hparams::{Hparams, Kind};
+        use crate::arch::mimo2::{names, spec};
+        use crate::placement::ModelTensors;
+        let full = [0usize, 5, 11, 17, 23, 29, 35, 41, 47];
+        let kinds: Vec<Kind> = (0..48)
+            .map(|l| {
+                if full.contains(&l) {
+                    Kind::Full
+                } else {
+                    Kind::Swa
+                }
+            })
+            .collect();
+        let hp = Hparams {
+            n_layer: 48,
+            n_trunk: 48,
+            n_embd: 4096,
+            n_head: 64,
+            kv_heads: kinds
+                .iter()
+                .map(|k| if *k == Kind::Full { 4 } else { 8 })
+                .collect(),
+            head_k: 192,
+            head_v: 128,
+            window: 128,
+            kinds: kinds.clone(),
+            rope_dims: 64,
+            rope_base: 1.0e7,
+            rope_base_swa: 1.0e4,
+            value_scale: 0.707,
+            rms_eps: 1e-5,
+            n_ctx_train: 1_048_576,
+            n_vocab: 152_576,
+            n_expert: 256,
+            n_used: 8,
+            expert_ff: 2048,
+            dense_ff: Some(16384),
+            weights_scale: 1.0,
+            defaults: Vec::new(),
+        };
+        let mut tensors = Vec::new();
+        let mut add =
+            |name: String, layer: Option<usize>, role: Role, ty: GgmlType, dims: &[u64]| {
+                tensors.push(ModelTensor {
+                    name,
+                    shard: 0,
+                    layer,
+                    role,
+                    ty,
+                    dims: dims.to_vec(),
+                    file_bytes: 0,
+                    gathered_rows: None,
+                });
+            };
+        for (l, kind) in kinds.iter().enumerate() {
+            let a = Some(l);
+            let rows = match kind {
+                Kind::Full => 64 * 192 + 4 * (192 + 128),
+                Kind::Swa => 64 * 192 + 8 * (192 + 128),
+            };
+            add(
+                names::attn_norm(l),
+                a,
+                Role::Attention,
+                GgmlType::F32,
+                &[4096],
+            );
+            add(
+                names::attn_qkv(l),
+                a,
+                Role::Attention,
+                GgmlType::Q8_0,
+                &[4096, rows],
+            );
+            add(
+                names::attn_output(l),
+                a,
+                Role::Attention,
+                GgmlType::Q8_0,
+                &[8192, 4096],
+            );
+            if *kind == Kind::Swa {
+                add(
+                    names::attn_sinks(l),
+                    a,
+                    Role::Attention,
+                    GgmlType::F32,
+                    &[64],
+                );
+            }
+            add(names::ffn_norm(l), a, Role::FfnNorm, GgmlType::F32, &[4096]);
+            if l == 0 {
+                for n in [names::ffn_gate(l), names::ffn_up(l)] {
+                    add(n, a, Role::DenseFfn, GgmlType::Q8_0, &[4096, 16384]);
+                }
+                add(
+                    names::ffn_down(l),
+                    a,
+                    Role::DenseFfn,
+                    GgmlType::Q8_0,
+                    &[16384, 4096],
+                );
+            } else {
+                add(
+                    names::ffn_gate_inp(l),
+                    a,
+                    Role::Router,
+                    GgmlType::F32,
+                    &[4096, 256],
+                );
+                add(
+                    names::exp_probs_b(l),
+                    a,
+                    Role::Router,
+                    GgmlType::F32,
+                    &[256],
+                );
+                for n in [names::ffn_gate_exps(l), names::ffn_up_exps(l)] {
+                    add(
+                        n,
+                        a,
+                        Role::RoutedExperts,
+                        GgmlType::MXFP4,
+                        &[4096, 2048, 256],
+                    );
+                }
+                add(
+                    names::ffn_down_exps(l),
+                    a,
+                    Role::RoutedExperts,
+                    GgmlType::MXFP4,
+                    &[2048, 4096, 256],
+                );
+            }
+        }
+        add(
+            names::token_embd(),
+            None,
+            Role::TokenEmbedding,
+            GgmlType::Q8_0,
+            &[4096, 152_576],
+        );
+        add(
+            names::output_norm(),
+            None,
+            Role::Head,
+            GgmlType::F32,
+            &[4096],
+        );
+        add(
+            names::output(),
+            None,
+            Role::Head,
+            GgmlType::Q8_0,
+            &[4096, 152_576],
+        );
+        let model = ModelTensors {
+            tensors,
+            layers: 48,
+            experts: 256,
+            experts_used: 8,
+        };
+        let chat = models::ChatSpec {
+            pre: "qwen2".to_string(),
+            template: Some("{{ messages }}".to_string()),
+            tools: spec::TOOLS,
+            reasoning: Some(models::ReasoningFormat::ThinkSpan),
+        };
+        let spec = spec::spec_of(&hp, &model, chat).expect("the real shapes describe");
+        (spec, model)
+    }
+
+    /// The real MiMo file is run whole by the mimo2 body: each need of its
+    /// 48 layers has a row naming the program, each tensor type is one the
+    /// body reads, and no stack is one the host cannot serve — so nothing is
+    /// listed, and the plan's read does not refuse the file.
+    // PIN(2026-10-08): the mimo2 coverage list is empty once the program runs
+    // the file; before it, `mimo2_meta` pinned seven items (two flashes, the
+    // rope, three mxfp4 rows and the program itself).
+    #[test]
+    fn the_real_mimo2_file_lists_nothing() {
+        let (spec, model) = mimo2_real();
+        let items = super::check(&spec, &model);
+        assert!(items.is_empty(), "listed: {items:?}");
+    }
+
+    /// What the mimo2 body does not run is still an item, by name: a
+    /// window layer with no sinks (the K192 window row folds them), a
+    /// q4_K attention matrix (the body reads q8_0), a routed stack whose row
+    /// width no fused qdot kernel serves, and a routed stack of a type with
+    /// no host kernel at all — MiMo has no card expert, so no card rule
+    /// passes a stack the host cannot.
+    #[test]
+    fn what_the_mimo2_body_does_not_run_is_an_item() {
+        let (spec, model) = mimo2_real();
+        let mut sinkless = spec.clone();
+        let models::Mixer::Gqa(g) = &mut sinkless.layers[1].mixer else {
+            panic!("a mimo2 layer that is not GQA");
+        };
+        g.sinks = false;
+        let items = super::check(&sinkless, &model);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].feature.contains("window 128"), "{items:?}");
+
+        let mut other = model.clone();
+        for t in &mut other.tensors {
+            if t.name == "blk.3.attn_qkv.weight" {
+                t.ty = GgmlType::Q4_K;
+            }
+            if t.name == "blk.4.ffn_down_exps.weight" {
+                t.dims[0] = 2000;
+            }
+            if t.name == "blk.5.ffn_up_exps.weight" {
+                t.ty = GgmlType::IQ2_S;
+            }
+        }
+        let items: Vec<String> = super::check(&spec, &other)
+            .into_iter()
+            .map(|u| u.feature)
+            .collect();
+        assert_eq!(
+            items,
+            [
+                "q4_K attention matrices (the body reads q8_0)",
+                "mxfp4 routed experts on a card",
+                "iq2_s routed experts on a card",
+            ],
+            "{items:?}"
         );
     }
 }

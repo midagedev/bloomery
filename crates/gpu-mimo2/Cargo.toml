@@ -1,0 +1,26 @@
+[package]
+name = "bloomery-gpu-mimo2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+# The MiMo-V2.6-Flash program: host code only, no `#[cuda_module]` of its own. It composes the
+# kernels of `bloomery-gpu` (the q8_0 gemvs, the K192 rope-and-append, the K192 flash, the host
+# handoff, the head) and of `bloomery-gpu-deepseek41` (the shared-expert gate·up and the 256-expert
+# sigmoid router); it is built with `cargo oxide` because those crates are.
+[dependencies]
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41" }
+# Host only: the plan and the header read, the embedding row, the host tier's routed stacks.
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-model = { path = "../model" }
+bloomery-models = { path = "../models" }
+# Host only: the step is a walk of the schedules' overlap (`runtime::sched`) over the layers'
+# programs (`runtime::layer`).
+bloomery-runtime = { path = "../runtime" }
