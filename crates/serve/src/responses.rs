@@ -1477,7 +1477,8 @@ mod tests {
 
     /// Every input item converts as llama-server converts it, the prompt the
     /// same as its chat body renders: `instructions` first; user, system and
-    /// developer messages (a string or `input_text` parts) with their roles;
+    /// developer messages (a string or `input_text` parts) with their roles,
+    /// a developer message rendered as system (`render_chat`'s mapping);
     /// an assistant's `output_text`, its call and its reasoning joining one
     /// assistant message; a call's output as a `tool` message of its parts.
     /// Two lines are this server's reading where llama-server's differs: the
@@ -1526,7 +1527,7 @@ mod tests {
         assert_eq!(
             prompt,
             concat!(
-                "<system>\nI<system>\nS<developer>\nD1\nD2<user>\nU<assistant>\nA1\nA2",
+                "<system>\nI<system>\nS<system>\nD1\nD2<user>\nU<assistant>\nA1\nA2",
                 "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\":1}}\n</tool_call>(c1)",
                 "<tool>\nR1\nR2[c1]<assistant>\n<think>T1T2</think>A3<user>\nU2<assistant>\n",
             )
@@ -1805,7 +1806,7 @@ mod tests {
         }
         assert_eq!(
             slot["prompt"],
-            "[effort high]\n<developer>\nD<user>\nhi<assistant>\n"
+            "[effort high]\n<system>\nD<user>\nhi<assistant>\n"
         );
     }
 
