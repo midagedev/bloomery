@@ -35,8 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::api::{
-    End, JSON, accept, cors_preflight, engine_object, error_body, fatal_health, keep_alive, relock,
-    stopping, wait_end,
+    End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
+    fatal_health, install_signals, keep_alive, relock, stopping, stopping_message, wait_end,
 };
 use crate::http::{self, Request};
 use crate::{EngineFailure, EngineProps, FATAL_LINGER, ServeError};
@@ -483,6 +483,9 @@ struct Shared {
     /// The decider's failure that ends the server, the reason `/health` and every later request
     /// give; the first one is kept.
     fatal: Mutex<Option<String>>,
+    /// The orderly stop's cause, once it began ([`Shared::begin_stop`]): the reason every decide
+    /// request is refused with.
+    stopping: Mutex<Option<String>>,
     /// Where that failure goes, to end [`DecideServer::run`].
     end: mpsc::Sender<End>,
 }
@@ -490,6 +493,22 @@ struct Shared {
 impl Shared {
     fn fatal(&self) -> Option<String> {
         relock(&self.fatal).clone()
+    }
+
+    fn stopping(&self) -> Option<String> {
+        relock(&self.stopping).clone()
+    }
+
+    /// Begins the server's orderly stop, the signals' owner on this server (there is no engine
+    /// thread to tell: the decider runs on the connections' threads): every later request is a
+    /// 503 naming `cause`. The first cause wins; `false` when a stop was already under way.
+    fn begin_stop(&self, cause: &str) -> bool {
+        let mut gate = relock(&self.stopping);
+        if gate.is_some() {
+            return false;
+        }
+        *gate = Some(cause.to_owned());
+        true
     }
 
     /// Records `error` as the failure that ends the server, unless one already did, and answers
@@ -551,6 +570,9 @@ fn decide(s: &Shared, body: &str) -> Reply {
     let held = s.decider.lock();
     if let Some(reason) = s.fatal() {
         return Reply::error(503, "unavailable_error", &stopping(&reason));
+    }
+    if let Some(cause) = s.stopping() {
+        return Reply::error(503, "unavailable_error", &stopping_message(&cause));
     }
     let Ok(mut d) = held else {
         return s
@@ -619,6 +641,7 @@ impl DecideServer {
                 fixed,
                 engine: format!("the decider of {}", seated.name),
                 fatal: Mutex::new(None),
+                stopping: Mutex::new(None),
                 end,
             }),
             ended,
@@ -640,6 +663,17 @@ impl DecideServer {
             shared,
             ended,
         } = self;
+        // The signals are installed before the listener serves, the generative
+        // server's owner of them: the first SIGINT/SIGTERM is this server's
+        // orderly stop too.
+        install_signals({
+            let shared = Arc::clone(&shared);
+            move |stop| {
+                if shared.begin_stop(&stop.to_string()) {
+                    let _ = shared.end.send(End::Shutdown(stop));
+                }
+            }
+        });
         let conn = Arc::clone(&shared);
         accept(listener, shared.end.clone(), move |stream| {
             keep_alive(stream, |req, w| {
@@ -649,7 +683,11 @@ impl DecideServer {
             });
         });
         // `shared` holds a sender, so the channel cannot close while we wait.
-        wait_end(&ended, FATAL_LINGER)
+        // An orderly stop never returns: it ends the process instead.
+        match wait_end(&ended, FATAL_LINGER) {
+            Ended::Error(e) => e,
+            Ended::Stop(cause) => exit_shutdown(&cause, None),
+        }
     }
 }
 
@@ -731,6 +769,7 @@ mod tests {
             },
             engine: "the decider of m.gguf".to_owned(),
             fatal: Mutex::new(None),
+            stopping: Mutex::new(None),
             end: mpsc::channel().0,
         }
     }

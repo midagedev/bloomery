@@ -30,3 +30,6 @@ sha2.workspace = true
 # does, so a chat template's `tojson` and `.items()` see a request's objects as jinja2 does.
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 thiserror.workspace = true
+# The orderly stop's signal handlers: `sigaction`, a `write` a handler makes,
+# a `read` the reader thread blocks on. The workspace's pinned version.
+libc.workspace = true

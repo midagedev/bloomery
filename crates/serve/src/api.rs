@@ -39,12 +39,18 @@
 //! residency back to its load's placement ([`Engine::residency_reset`]), the
 //! one call that does it — a request never resets it. It runs while every slot
 //! is free and no request waits.
+//!
+//! The server stops the orderly way llama-server does: the first `SIGINT` or
+//! `SIGTERM`, or a loopback `POST /shutdown` (bloomery's own), stops admitting
+//! work, ends the engine thread between its engine calls, and exits 0 after
+//! one stderr line naming the cause; a second signal terminates at once. The
+//! stop's one owner is [`End::Shutdown`]'s path through [`wait_end`].
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -178,6 +184,31 @@ pub enum ServeError {
 pub(crate) enum End {
     Io(io::Error),
     Engine(EngineFailure),
+    /// An orderly stop was asked of the server ([`Stop`]): [`wait_end`]
+    /// performs it, the one owner of the stop.
+    Shutdown(Stop),
+}
+
+/// What asked for the server's orderly stop: the one name its stderr line and
+/// every refusal it causes carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The first `SIGINT`.
+    Sigint,
+    /// The first `SIGTERM`.
+    Sigterm,
+    /// A `POST /shutdown`, from this peer.
+    Posted(SocketAddr),
+}
+
+impl fmt::Display for Stop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stop::Sigint => write!(f, "SIGINT"),
+            Stop::Sigterm => write!(f, "SIGTERM"),
+            Stop::Posted(peer) => write!(f, "POST /shutdown from {peer}"),
+        }
+    }
 }
 
 /// A bound, not yet running server.
@@ -311,8 +342,9 @@ impl Server {
 
     /// Starts the engine thread and the accept loop, which serves connections,
     /// one thread each and at most [`MAX_CONNECTIONS`] at once, until the
-    /// listener fails; returns the server's state and what ends it.
-    fn start(self) -> io::Result<(Arc<State>, mpsc::Receiver<End>)> {
+    /// listener fails; returns the server's state, what ends it and the engine
+    /// thread, which an orderly stop waits for.
+    fn start(self) -> io::Result<(Arc<State>, mpsc::Receiver<End>, thread::JoinHandle<()>)> {
         let Server {
             listener,
             state,
@@ -320,7 +352,7 @@ impl Server {
             slot,
         } = self;
         let shared = Arc::clone(&state.shared);
-        thread::Builder::new()
+        let engine = thread::Builder::new()
             .name("serve-engine".to_owned())
             .spawn(move || worker::serve(slot, shared))
             .map_err(|e| {
@@ -330,17 +362,33 @@ impl Server {
         accept(listener, state.shared.end.clone(), move |stream| {
             keep_alive(stream, |req, w| route(&conn_state, req, w));
         });
-        Ok((state, ended))
+        Ok((state, ended, engine))
     }
 
-    /// Serves until the listener fails or the engine does, and returns why.
+    /// Serves until the listener fails, the engine does, or the server is
+    /// asked to stop, and returns why. An orderly stop never returns: it ends
+    /// the process inside [`exit_shutdown`], so every seat's
+    /// `Ok(server.run())` is the error paths' alone.
     pub fn run(self) -> ServeError {
-        let (state, ended) = match self.start() {
+        // The signals are installed before the listener serves: from the
+        // first answer on, Ctrl+C or a kill stops the server the orderly way.
+        install_signals({
+            let shared = Arc::clone(&self.state.shared);
+            move |stop| {
+                if shared.begin_stop(&stop) {
+                    let _ = shared.end.send(End::Shutdown(stop));
+                }
+            }
+        });
+        let (state, ended, engine) = match self.start() {
             Ok(s) => s,
             Err(e) => return ServeError::Io(e),
         };
         // `state` holds a sender, so the channel cannot close while we wait.
-        wait_end(&ended, state.fatal_linger)
+        match wait_end(&ended, state.fatal_linger) {
+            Ended::Error(e) => e,
+            Ended::Stop(cause) => exit_shutdown(&cause, Some(engine)),
+        }
     }
 
     /// Serves in the background and returns the address. What ends the
@@ -459,6 +507,11 @@ impl State {
 
     fn fatal(&self) -> Option<String> {
         relock(&self.shared.fatal).clone()
+    }
+
+    /// The orderly stop's cause, once it began ([`Shared::begin_stop`]).
+    fn stopping(&self) -> Option<String> {
+        relock(&self.shared.stopping).clone()
     }
 }
 
@@ -584,19 +637,182 @@ where
     });
 }
 
+/// What `wait_end` heard: the error `run` returns, or the orderly stop it
+/// performs instead of returning.
+pub(crate) enum Ended {
+    Error(ServeError),
+    Stop(Stop),
+}
+
 /// What ends a server, waited for on `ended`: the listener's failure at once,
 /// an engine's after `linger`, during which `/health` answers it
-/// ([`fatal_health`]). The caller holds a sender, so the channel cannot close
-/// while it waits.
-pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> ServeError {
+/// ([`fatal_health`]), an orderly stop at once ([`exit_shutdown`]). The caller
+/// holds a sender, so the channel cannot close while it waits.
+pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
     match ended.recv() {
-        Ok(End::Io(e)) => ServeError::Io(e),
+        Ok(End::Io(e)) => Ended::Error(ServeError::Io(e)),
         Ok(End::Engine(f)) => {
             thread::sleep(linger);
-            ServeError::Engine(f)
+            Ended::Error(ServeError::Engine(f))
         }
-        Err(mpsc::RecvError) => ServeError::Io(io::Error::other("accept loop vanished")),
+        Ok(End::Shutdown(stop)) => Ended::Stop(stop),
+        Err(mpsc::RecvError) => {
+            Ended::Error(ServeError::Io(io::Error::other("accept loop vanished")))
+        }
     }
+}
+
+// ---------------------------------------------------------------- orderly stop
+
+/// How long an orderly stop waits for the engine thread to end. The worker
+/// checks the stop between engine calls, so the wait covers the one call it
+/// can be inside of when the stop arrives — a whole-prompt call at a slot's
+/// full context, the longest single call the seats run — plus the booking of
+/// the requests it ends; every seat's decode step sits far under it. A thread
+/// past the bound is named on the exit line and left to the process exit.
+const ENGINE_STOP: Duration = Duration::from_secs(5);
+
+/// The signal handlers' whole state, the only things a handler touches: the
+/// pipe end a first signal writes one byte to, and whether a first signal was
+/// already taken — both async-signal-safe to reach (one atomic, one `write`).
+struct Signals {
+    /// The pipe's write end.
+    w: libc::c_int,
+    taken: AtomicBool,
+}
+
+static SIGNALS: OnceLock<Signals> = OnceLock::new();
+
+/// Whether the signal handlers were installed: once a process. The first
+/// server to `run` owns the signals; a later one's `run` leaves them as they
+/// are, so its own stop is not asked for by them.
+static SIGNALS_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Installs the `SIGINT`/`SIGTERM` handlers, llama-server's shape: the first
+/// signal becomes the server's orderly stop through `on_first`; a second one
+/// terminates the process at once, in case the stop hangs. The handler itself
+/// does only async-signal-safe work — one atomic and one `write` to the pipe
+/// this function owns; everything else (`begin_stop`, the channel send)
+/// happens on the reader thread spawned here, which `on_first` runs on.
+pub(crate) fn install_signals(on_first: impl Fn(Stop) + Send + 'static) {
+    if SIGNALS_ARMED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid two-int array the call may write to.
+    let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(piped, 0, "cannot make the signal handlers' pipe: {piped}");
+    let _ = SIGNALS.set(Signals {
+        w: fds[1],
+        taken: AtomicBool::new(false),
+    });
+    let reader = thread::Builder::new()
+        .name("serve-signals".to_owned())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                // SAFETY: `byte` is a valid one-byte buffer the call may write
+                // to; the fd is this pair's read end, owned until the thread
+                // ends.
+                let read = unsafe { libc::read(fds[0], byte.as_mut_ptr().cast(), 1) };
+                match read {
+                    1 => match i32::from(byte[0]) {
+                        libc::SIGINT => on_first(Stop::Sigint),
+                        libc::SIGTERM => on_first(Stop::Sigterm),
+                        _ => {}
+                    },
+                    // The pipe cannot fill (one byte a process), so a failed
+                    // read is EINTR or a broken pipe: the former reads again,
+                    // the latter leaves the signals to the default.
+                    -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                    _ => return,
+                }
+            }
+        });
+    if let Err(e) = reader {
+        panic!("cannot start the signal reader thread: {e}");
+    }
+    arm(libc::SIGINT);
+    arm(libc::SIGTERM);
+}
+
+/// Registers `on_signal` for `sig` with `SA_RESTART`, so a signal arriving
+/// mid-`accept` or mid-`read` restarts the call instead of failing it: the
+/// stop is carried by the pipe, not by an EINTR.
+fn arm(sig: libc::c_int) {
+    // SAFETY: an all-zero `sigaction` is a valid value — a null handler, an
+    // empty mask, no flags — and only the fields set below are changed.
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = on_signal as *const () as usize;
+    act.sa_flags = libc::SA_RESTART;
+    // SAFETY: `act` is fully initialized and a valid `sigaction` for the
+    // call; the old action is not asked for.
+    unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
+}
+
+/// The `SIGINT`/`SIGTERM` handler: the first signal writes its number on the
+/// pipe for the reader thread; a second terminates at once, as llama-server's
+/// does. Async-signal-safe only: two atomics and two `write`s.
+extern "C" fn on_signal(sig: libc::c_int) {
+    let Some(s) = SIGNALS.get() else {
+        return;
+    };
+    if s.taken.swap(true, Ordering::SeqCst) {
+        const LINE: &[u8] =
+            b"bloomery-serve: Received second interrupt, terminating immediately.\n";
+        // SAFETY: `write` and `_exit` are async-signal-safe; the line is a
+        // static buffer, not touched again.
+        unsafe {
+            libc::write(libc::STDERR_FILENO, LINE.as_ptr().cast(), LINE.len());
+            libc::_exit(1);
+        }
+    }
+    let byte = sig as u8;
+    // SAFETY: `byte` is a valid one-byte buffer for the write; the fd is the
+    // pipe's write end, which lives until the process ends. A failed write
+    // (the reader thread gone) leaves this signal uncarried — the stop then
+    // still has its other path, `POST /shutdown`.
+    unsafe { libc::write(s.w, &byte as *const u8 as *const libc::c_void, 1) };
+}
+
+/// The orderly stop's last act, the one owner of the process's exit: one
+/// stderr line naming the cause — and whether the engine thread ended, when
+/// there is one to wait for — then success. Called from `run`, after the
+/// stop's initiator already refused new work and told the engine thread to
+/// end, so no seat's `Ok(server.run())` return is reached by it.
+pub(crate) fn exit_shutdown(cause: &Stop, engine: Option<thread::JoinHandle<()>>) -> ! {
+    let ended = engine.map(|mut e| wait_engine_stop(&mut e));
+    let tail = match ended {
+        Some(false) => {
+            format!(
+                "; the engine thread did not end within {} s",
+                ENGINE_STOP.as_secs()
+            )
+        }
+        _ => String::new(),
+    };
+    eprintln!("bloomery-serve: shutdown ({cause}){tail}");
+    std::process::exit(0)
+}
+
+/// Waits at most [`ENGINE_STOP`] for the engine thread to end: polling its
+/// handle, for std joins no wait but the blocking one. `false` when the bound
+/// ran out — the thread is mid-call, and the exit takes the process anyway.
+fn wait_engine_stop(engine: &mut thread::JoinHandle<()>) -> bool {
+    let until = Instant::now() + ENGINE_STOP;
+    while !engine.is_finished() {
+        if Instant::now() >= until {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// The message of the 503 every request that needs the engine gets once the
+/// server's orderly stop began, whichever server of the crate it asked.
+pub(crate) fn stopping_message(cause: &str) -> String {
+    format!("the server is shutting down ({cause}); no new request is admitted")
 }
 
 /// `/health`'s 503 body once an engine failure ends the server.
@@ -806,6 +1022,7 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             return slot_action(state, req, w, &p["/slots/".len()..]);
         }
         ("POST", "/residency/reset") => return residency_reset(state, req, w),
+        ("POST", "/shutdown") => return post_shutdown(state, req, w),
         ("POST", "/completion" | "/completions") => return completion(state, req, w),
         ("POST", "/v1/chat/completions" | "/chat/completions") => return chat(state, req, w),
         ("POST", "/v1/messages") => return anthropic::messages(state, req, w),
@@ -1686,6 +1903,18 @@ fn dead_engine(reason: &str) -> ApiError {
     }
 }
 
+/// The 503 a request that needs the engine gets once the server's orderly
+/// stop began: it names the stop's cause and asks for no retry — the process
+/// is ending.
+fn stopping_gate(cause: &str) -> ApiError {
+    ApiError {
+        retry_after: false,
+        code: 503,
+        kind: "unavailable_error",
+        message: stopping_message(cause),
+    }
+}
+
 /// The answer to a request or an action the board did not take.
 fn refused(state: &State, r: Refusal, what: &str) -> ApiError {
     match r {
@@ -1709,9 +1938,13 @@ fn refused(state: &State, r: Refusal, what: &str) -> ApiError {
 }
 
 /// What a request's HTTP thread hears when the engine thread closed its
-/// channel without a last message: the failure that ended it, a 500 for a
-/// request that had started, else a 503.
+/// channel without a last message: the orderly stop's 503, when the stop
+/// closed it; else the failure that ended it, a 500 for a request that had
+/// started, a 503 otherwise.
 fn engine_gone(state: &State, started: bool) -> ApiError {
+    if let Some(cause) = state.stopping() {
+        return stopping_gate(&cause);
+    }
     let reason = state
         .fatal()
         .unwrap_or_else(|| "the engine thread ended".to_owned());
@@ -1758,6 +1991,9 @@ fn run_gen(
 ) -> Result<(Result<Outcome, GenError>, usize), ApiError> {
     if let Some(reason) = state.fatal() {
         return Err(dead_engine(&reason));
+    }
+    if let Some(cause) = state.stopping() {
+        return Err(stopping_gate(&cause));
     }
     let ids = &input.held.ids;
     if ids.is_empty() {
@@ -1837,6 +2073,9 @@ fn on_engine(
     if let Some(reason) = state.fatal() {
         return Err(dead_engine(&reason));
     }
+    if let Some(cause) = state.stopping() {
+        return Err(stopping_gate(&cause));
+    }
     let (tx, rx) = mpsc::channel();
     let action = Action {
         run: Box::new(move |slot: &mut Slot| {
@@ -1896,6 +2135,63 @@ fn residency_reset(state: &State, req: &Request, w: &mut TcpStream) -> io::Resul
         Ok(v) => send_json(w, req, 200, &v),
         Err(e) => send_error(w, req, &e),
     }
+}
+
+/// Whether `peer` may ask the server to stop over `POST /shutdown`: only a
+/// loopback peer — IPv4 loopback, `::1`, or an IPv4-mapped loopback address —
+/// so a request from another machine cannot stop a server bound wider than
+/// its operator meant. The signals need no check: the OS delivers them to
+/// this process.
+fn shutdown_allowed(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || matches!(ip.to_ipv4_mapped(), Some(v4) if v4.is_loopback())
+        }
+    }
+}
+
+/// `POST /shutdown`, bloomery's own: the same orderly stop the first
+/// `SIGINT`/`SIGTERM` begins, asked over HTTP — accepted only from a loopback
+/// peer ([`shutdown_allowed`]), else a 403 saying so. The 200 reaches the
+/// client before the stop does: the answer is sent first, then the end. A
+/// `POST /shutdown` while a stop is already under way answers 200 again and
+/// changes nothing.
+fn post_shutdown(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    let peer = match w.peer_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            return send_error(
+                w,
+                req,
+                &ApiError {
+                    retry_after: false,
+                    code: 500,
+                    kind: "server_error",
+                    message: format!("cannot read the connection's peer: {e}"),
+                },
+            );
+        }
+    };
+    if !shutdown_allowed(peer.ip()) {
+        return send_error(
+            w,
+            req,
+            &ApiError {
+                retry_after: false,
+                code: 403,
+                kind: "permission_error",
+                message: "shutdown is accepted only from this machine (a loopback peer)".to_owned(),
+            },
+        );
+    }
+    let stop = Stop::Posted(peer);
+    let began = state.shared.begin_stop(&stop);
+    send_json(w, req, 200, &json!({ "status": "shutting down" }))?;
+    if began {
+        let _ = state.shared.end.send(End::Shutdown(stop));
+    }
+    Ok(true)
 }
 
 /// `POST /slots/{id}?action=…`, checked in llama-server's order: a save
@@ -2556,12 +2852,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, Engine, EngineProps, Park,
-        ServeError, SlotConfig, SlotQueue, after_accept_error, carries_media, check_slots,
-        content_text, engine_object, id_half,
+        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps,
+        FATAL_LINGER, Park, ServeError, Server, ServerConfig, SlotConfig, SlotQueue, Stop,
+        after_accept_error, carries_media, check_slots, content_text, engine_object, id_half,
+        shutdown_allowed,
     };
     use serde_json::{Value, json};
     use std::io;
+    use std::net::SocketAddr;
     use std::time::Duration;
 
     /// Text parts join by newline, as one string `content` would carry them.
@@ -2711,6 +3009,115 @@ mod tests {
                 "seed {seed} draws a half another seed drew at the same counter"
             );
         }
+    }
+
+    /// `POST /shutdown` is accepted only from a loopback peer: IPv4 loopback,
+    /// `::1` and an IPv4-mapped loopback address pass; a LAN address, a
+    /// public one and a mapped LAN one do not.
+    #[test]
+    fn shutdown_is_looped_back_only() {
+        for ok in ["127.0.0.1", "127.255.255.254", "::1", "::ffff:127.0.0.1"] {
+            let ip: std::net::IpAddr = ok.parse().unwrap();
+            assert!(shutdown_allowed(ip), "{ip} is a loopback peer");
+        }
+        for no in [
+            "192.168.1.5",
+            "10.0.0.2",
+            "172.16.0.9",
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+            "::ffff:192.168.1.5",
+        ] {
+            let ip: std::net::IpAddr = no.parse().unwrap();
+            assert!(!shutdown_allowed(ip), "{ip} is not a loopback peer");
+        }
+    }
+
+    /// One HTTP/1.0 request over a fresh connection, the integration
+    /// harness's client shape copied in (a unit test cannot reach
+    /// `tests/common`): the server closes after its answer, so the body is
+    /// whatever arrives before that.
+    fn roundtrip(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        let req = format!(
+            "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).expect("write");
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).expect("read");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .expect("a status line");
+        (status, body.to_owned())
+    }
+
+    /// `POST /shutdown` over a real socket: the 200 with its body reaches the
+    /// client first, the end channel carries the shutdown naming a loopback
+    /// peer, a second post answers 200 and changes nothing, and a generation
+    /// request after it is a 503 naming the shutdown (pinned: the listener
+    /// stands while the stop runs — the exit belongs to `run`, which no test
+    /// enters — so the refusal the client reads is the gate's 503, not a
+    /// refused connection). The engine thread ends on its own.
+    #[test]
+    fn posted_shutdown_stops_the_server() {
+        let config = ServerConfig {
+            model_alias: "mock".to_owned(),
+            model_path: "mock.gguf".to_owned(),
+            chat_template: concat!(
+                "{%- for message in messages %}",
+                "{{- '<' + message.role + '>\\n' + message.content }}",
+                "{%- endfor %}",
+                "{%- if add_generation_prompt %}{{- '<assistant>\\n' }}{%- endif %}",
+            )
+            .to_owned(),
+            sampler: None,
+            fatal_linger: FATAL_LINGER,
+            slot_save_path: None,
+        };
+        let server = Server::bind("127.0.0.1:0", Box::new(crate::MockEngine::new(64)), config)
+            .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let (_state, ended, engine) = server.start().expect("start");
+
+        let (status, body) = roundtrip(addr, "POST", "/shutdown", "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, r#"{"status":"shutting down"}"#, "the 200's body");
+
+        match ended.recv_timeout(Duration::from_secs(5)) {
+            Ok(End::Shutdown(Stop::Posted(peer))) => {
+                assert!(peer.ip().is_loopback(), "the stop names its peer: {peer}")
+            }
+            Ok(_) => panic!("the end channel carried another end"),
+            Err(e) => panic!("the end channel carries no shutdown: {e}"),
+        }
+
+        let (status, body) = roundtrip(addr, "POST", "/shutdown", "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, r#"{"status":"shutting down"}"#);
+        assert!(
+            ended.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second post changes nothing: no second end"
+        );
+
+        let chat = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0,"max_tokens":4}"#;
+        let (status, body) = roundtrip(addr, "POST", "/v1/chat/completions", chat);
+        assert_eq!(status, 503, "{body}");
+        let v: Value = serde_json::from_str(&body).expect("the 503's body is JSON");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("shutting down") && message.contains("no new request is admitted"),
+            "the 503 names the shutdown: {message}"
+        );
+
+        engine
+            .join()
+            .expect("the engine thread ends once the stop reaches it");
     }
 
     /// The media mock whose two slots take it in turns, parked as `park`.
