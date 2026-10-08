@@ -48,15 +48,12 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, JSON, RETRY_AFTER_SECS, State, body, chat_prompt, engine_error, error_body,
-    gate_reasoning_budget, gen_params, get_i, invalid, json_type, render_chat, run_gen, send_json,
-    tool_markup_error, tool_scan,
+    ApiError, ChatPlan, JSON, RETRY_AFTER_SECS, State, body, chat_input, chat_plan, engine_error,
+    error_body, get_i, invalid, json_type, run_gen, send_json, tool_markup_error,
 };
-use crate::dsml::{ChatParser, Message, ToolCall};
-use crate::genloop::{Event, GenError, GenParams, Outcome, StopKind, Timings};
+use crate::dsml::{Message, ToolCall};
+use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
 use crate::http::{self, EventStream, Request};
-use crate::media::Prompt;
-use crate::reasoning::ReasoningFormat;
 
 /// The prefix of the system text Claude Code sends first.
 const BILLING_HEADER: &str = "x-anthropic-billing-header:";
@@ -68,7 +65,9 @@ const CCH_LEN: usize = 5;
 pub(super) fn messages(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|b| {
         let chat = to_chat(&b, true)?;
-        Ok((Ids::new(state, &b), plan(state, &chat)?))
+        // Anthropic has no `reasoning_format`: the chat path's default, which
+        // splits the think span off into the thinking block.
+        Ok((Ids::new(state, &b), chat_plan(state, &chat, None)?))
     });
     let (ids, plan) = match parsed {
         Ok(x) => x,
@@ -87,7 +86,7 @@ pub(super) fn messages(state: &State, req: &Request, w: &mut TcpStream) -> io::R
 pub(super) fn count_tokens(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let counted = body(req)
         .and_then(|b| to_chat(&b, false))
-        .and_then(|chat| prompt_of(state, &chat));
+        .and_then(|chat| chat_input(state, &chat));
     match counted {
         Ok((_, prompt)) => send_json(
             w,
@@ -527,45 +526,6 @@ fn tool_choice(v: &Value) -> Result<Value, ApiError> {
     }
 }
 
-// ---------------------------------------------------------------- the chat path
-
-/// A converted request after the chat path's own steps, in their order on
-/// `/v1/chat/completions`: its sampling fields, its rendered prompt and the
-/// prompt's ids, and the output parser of the tool-call markup the template
-/// teaches.
-struct Plan {
-    p: GenParams,
-    ids: Prompt,
-    prompt: Value,
-    parser: ChatParser,
-}
-
-fn plan(state: &State, chat: &Map<String, Value>) -> Result<Plan, ApiError> {
-    let mut p = gen_params(state, chat)?;
-    // Anthropic has no `reasoning_format`: the chat path's default, which
-    // splits the think span off into the thinking block.
-    let format = ReasoningFormat::from_request(None).map_err(invalid)?;
-    let (text, ids) = prompt_of(state, chat)?;
-    let tools = tool_scan(state, chat)?;
-    gate_reasoning_budget(&mut p, &text);
-    let parser = ChatParser::with_tools(&text, format, tools);
-    Ok(Plan {
-        p,
-        ids,
-        prompt: Value::String(text),
-        parser,
-    })
-}
-
-/// The prompt a converted request runs, rendered by the chat template, and
-/// what the engine is fed: its ids, each image expanded to its span as the
-/// chat path does ([`chat_prompt`]). Both endpoints take them from here.
-fn prompt_of(state: &State, chat: &Map<String, Value>) -> Result<(String, Prompt), ApiError> {
-    let rendered = render_chat(state, chat)?;
-    let prompt = chat_prompt(state, &rendered)?;
-    Ok((rendered.text, prompt))
-}
-
 /// The answer's names: `msg_<32 hex>`, a tool use's `toolu_<index>_<16 hex>`
 /// (the message's first 16), and the request's `model` (the server's alias
 /// when it names none), as the chat path echoes it.
@@ -597,11 +557,11 @@ fn whole(
     req: &Request,
     w: &mut TcpStream,
     ids: &Ids,
-    plan: Plan,
+    plan: ChatPlan,
 ) -> io::Result<bool> {
-    let Plan {
+    let ChatPlan {
         p,
-        ids: prompt_ids,
+        input: prompt_ids,
         prompt,
         mut parser,
     } = plan;
@@ -828,11 +788,11 @@ fn stream(
     req: &Request,
     w: &mut TcpStream,
     ids: &Ids,
-    plan: Plan,
+    plan: ChatPlan,
 ) -> io::Result<bool> {
-    let Plan {
+    let ChatPlan {
         p,
-        ids: prompt_ids,
+        input: prompt_ids,
         prompt,
         mut parser,
     } = plan;
