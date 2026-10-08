@@ -13,6 +13,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py pure-crates [--names]  # the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason
+    python3 tools/recipes.py host-nightly [--excluded]  # the units tools/nightly/run.sh runs on a Linux host with no card and no model files: name<TAB>command
     python3 tools/recipes.py combos           # every build shape a recipe compiles, one cargo check command each (tools/mac-check.sh combos)
     python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
     python3 tools/recipes.py --self-test
@@ -97,6 +98,17 @@ and both fail loudly: a doc comment's example is blanked as a comment but compil
 doctest, and a Linux-only name missing from the list above is not seen. Either way the crate is
 selected and its native build fails in `just mac-test`, which names it — a rule bug to fix here, never
 an exception list.
+
+Host nightly (`host-nightly`). The units of the nightly run on a Linux machine that is not the box (tools/nightly/run.sh): what a
+plain `cargo test` runs on x86_64 Linux with no card and no model file. One unit per workspace crate that reaches no device root
+(the same Cargo.lock reading as `pure-crates`' first condition, over every feature, so a new crate joins the set by being a member
+and is never left out by a list), plus the device-linked crates in HOST_DEVICE_LINKED — each with the reason its default-feature
+tests open no card and build as host code. The Mac's second condition (x86_64 and Linux-only code) does not apply: the host is
+x86_64 Linux. A unit runs `tools/gate.sh --release --locked -p <crate> --no-fail-fast`, so the bound and the exit code have their one
+owner; `#[ignore]`d tests (the `hw_` gates, which need a card, the model files or `$BLOOMERY_DATA`) stay ignored. A non-ignored test
+that needs such a file is HOST_TEST_SKIP's, by exact libtest name and reason, and `--excluded` prints every exclusion; the rest
+of the units are every `tools/check-*.sh` minus HOST_CHECK_SKIP, then HOST_EXTRA_UNITS (the recipes.py self-test). A skip that names no `fn` of its crate, a crate outside the set or a script that is gone is an
+error of `check` and of this command, never a silent no-op.
 
 Orphan tests (`orphan-tests`). Every `#[test]` fn of every workspace target (lib, bins, tests/*.rs) is run
 on the box by some cargo test call of a gate-* or lab-* recipe (a lab-* recipe is a lab crate's own test
@@ -2703,7 +2715,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
     problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes) + weekly_problems(recipes)
-                + host_problems(tree, recipes) + static_problems(tree, recipes))
+                + host_problems(tree, recipes) + static_problems(tree, recipes) + nightly_problems(tree, load_lock(tree.root)))
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
     return 1 if problems else 0
@@ -3073,6 +3085,159 @@ def cmd_pure_crates(args: argparse.Namespace) -> int:
         for w in why:
             print(f"rejected  {n}  {w}")
     print(f"pure-crates: {sum(1 for _, w in rows if not w)} pure, {sum(1 for _, w in rows if w)} rejected, on {MAC_TARGET} (the rule: tools/recipes.py, section «pure crates»)")
+    return 0
+
+
+# ----------------------------------------------------------------------------------------------
+# host nightly: the units a Linux host with no card and no model files runs (`host-nightly`)
+# ----------------------------------------------------------------------------------------------
+# The rule is the module docstring's «host nightly» paragraph; tools/nightly/run.sh runs what it prints.
+
+# A device-linked crate the set takes anyway, with why: crate -> reason.
+HOST_DEVICE_LINKED: dict[str, str] = {
+    "bloomery-app": (
+        "its default-feature tests open no card (gate-app is [group('host')], which host_problems reads); the device libs it links "
+        "compile as host code under plain cargo and cuda-bindings loads libcuda only at run time; the deepseek41 and glm5next features "
+        "add device crates and stay off"
+    ),
+}
+# A test left out by exact libtest name, per crate: (name, reason). A non-ignored test that needs a file no host has.
+HOST_TEST_SKIP: dict[str, list[tuple[str, str]]] = {}
+# A `tools/check-*.sh` left out: script file name -> reason.
+HOST_CHECK_SKIP: dict[str, str] = {
+    "check-recipes.sh": (
+        "red on a Linux host today, three of its blocks: the mac-check self-test refuses off macOS (mac-check.sh: runs on macOS; 4 of its cases); "
+        "the gate-batch self-test's default-OUT cases (4 of 153) pass on macOS only because its fake HOME sits under $TMPDIR (/var/…) while the "
+        "tree is `pwd -P` (/private/var/…) — under a symlink-free TMPDIR they fail the same way on the Mac; the Python tool self-tests need numpy and PIL (install.sh installs python3-numpy and python3-pil). "
+        "Its recipes.py self-test runs as its own unit (HOST_EXTRA_UNITS). Re-admit when those are fixed"
+    ),
+}
+# A unit that is no crate and no check script: name -> shell command, run from the tree's root.
+HOST_EXTRA_UNITS: dict[str, str] = {
+    "recipes-self-test": "python3 tools/recipes.py --self-test",
+}
+HOST_GATE = "bash tools/gate.sh --release --locked"
+
+
+def host_crates(tree: Tree, lock: Lock, linked: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """(crate, why it is in the set) in name order: every crate with no device root in its closure, and the admitted ones."""
+    linked = HOST_DEVICE_LINKED if linked is None else linked
+    rows = []
+    for n in sorted(tree.packages):
+        chain = device_chain(tree, lock, n)
+        if chain is None:
+            rows.append((n, "no device root in its closure"))
+        elif n in linked:
+            rows.append((n, f"{linked[n]} [{chain}]"))
+    return rows
+
+
+def host_left_out(tree: Tree, lock: Lock, linked: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """(crate, the chain to the device root) for every crate the set does not take."""
+    linked = HOST_DEVICE_LINKED if linked is None else linked
+    return [(n, c) for n in sorted(tree.packages) if (c := device_chain(tree, lock, n)) is not None and n not in linked]
+
+
+def host_check_scripts(root: str) -> list[str]:
+    return sorted(os.path.basename(p) for p in glob.glob(os.path.join(root, "tools", "check-*.sh")))
+
+
+def nightly_problems(
+    tree: Tree,
+    lock: Lock,
+    linked: dict[str, str] | None = None,
+    skips: dict[str, list[tuple[str, str]]] | None = None,
+    checks: dict[str, str] | None = None,
+    extras: dict[str, str] | None = None,
+) -> list[str]:
+    """The exclusion tables against the tree: a stale entry is a problem, never a no-op."""
+    linked = HOST_DEVICE_LINKED if linked is None else linked
+    skips = HOST_TEST_SKIP if skips is None else skips
+    checks = HOST_CHECK_SKIP if checks is None else checks
+    extras = HOST_EXTRA_UNITS if extras is None else extras
+    problems: list[str] = []
+    taken = {n for n in tree.packages} | {f[: -len(".sh")] for f in host_check_scripts(tree.root)}
+    for n in sorted(extras):
+        if n in taken:
+            problems.append(f"host nightly: HOST_EXTRA_UNITS names {n}, which a crate or a check script already is")
+    in_set = {n for n, _ in host_crates(tree, lock, linked)}
+    for n in sorted(linked):
+        if n not in tree.packages:
+            problems.append(f"host nightly: HOST_DEVICE_LINKED names {n}, which is no workspace crate")
+        elif device_chain(tree, lock, n) is None:
+            problems.append(f"host nightly: HOST_DEVICE_LINKED names {n}, which reaches no device root (the rule already takes it)")
+    for n in sorted(skips):
+        if n not in in_set:
+            problems.append(f"host nightly: HOST_TEST_SKIP names {n}, which the set does not run")
+            continue
+        text = "".join(tree.read(f) for f in sorted(_host_sources(tree, n)))
+        for name, why in skips[n]:
+            leaf = name.rsplit("::", 1)[-1]
+            if not why.strip():
+                problems.append(f"host nightly: HOST_TEST_SKIP {n} {name}: no reason")
+            if not re.search(rf"\bfn\s+{re.escape(leaf)}\b", text):
+                problems.append(f"host nightly: HOST_TEST_SKIP {n} {name}: no `fn {leaf}` in the crate's sources")
+    present = set(host_check_scripts(tree.root))
+    for n, why in sorted(checks.items()):
+        if n not in present:
+            problems.append(f"host nightly: HOST_CHECK_SKIP names {n}, which is not a tools/check-*.sh")
+        if not why.strip():
+            problems.append(f"host nightly: HOST_CHECK_SKIP {n}: no reason")
+    return problems
+
+
+def _host_sources(tree: Tree, crate: str) -> list[str]:
+    """Every .rs file under the crate's src/ and tests/ (relative to the tree root)."""
+    base = tree.packages[crate].dir
+    out = []
+    for sub in ("src", "tests"):
+        for dp, _, fs in os.walk(os.path.join(tree.root, base, sub)):
+            out += [os.path.relpath(os.path.join(dp, f), tree.root) for f in fs if f.endswith(".rs")]
+    return out
+
+
+def host_units(
+    tree: Tree,
+    lock: Lock,
+    linked: dict[str, str] | None = None,
+    skips: dict[str, list[tuple[str, str]]] | None = None,
+    checks: dict[str, str] | None = None,
+    extras: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """(unit, shell command) in run order: the crates, the check scripts, the extra units. The command runs from the tree's root."""
+    skips = HOST_TEST_SKIP if skips is None else skips
+    checks = HOST_CHECK_SKIP if checks is None else checks
+    extras = HOST_EXTRA_UNITS if extras is None else extras
+    units = []
+    for n, _ in host_crates(tree, lock, linked):
+        cmd = f"{HOST_GATE} -p {n} --no-fail-fast"
+        if skips.get(n):
+            cmd += " -- --exact" + "".join(f" --skip {shlex.quote(name)}" for name, _ in skips[n])
+        units.append((n, cmd))
+    for f in host_check_scripts(tree.root):
+        if f not in checks:
+            units.append((f[: -len(".sh")], f"bash tools/{f}"))
+    units += sorted(extras.items())
+    return units
+
+
+def cmd_host_nightly(args: argparse.Namespace) -> int:
+    tree = Tree(ROOT)
+    lock = load_lock(tree.root)
+    problems = nightly_problems(tree, lock)
+    if problems:
+        raise RecipeError("\n".join(problems))
+    if args.excluded:
+        for n, chain in host_left_out(tree, lock):
+            print(f"crate\t{n}\tdevice root: {chain}")
+        for n, rows in sorted(HOST_TEST_SKIP.items()):
+            for name, why in rows:
+                print(f"test\t{n} {name}\t{why}")
+        for n, why in sorted(HOST_CHECK_SKIP.items()):
+            print(f"check\t{n}\t{why}")
+        return 0
+    for name, cmd in host_units(tree, lock):
+        print(f"{name}\t{cmd}")
     return 0
 
 
@@ -6348,6 +6513,38 @@ def self_test() -> int:
             expect(any(want in w for w in verdict.get(n, [])), f"pure: {n} is not rejected with '{want}': {verdict.get(n)}")
         for n in ("guarded", "inner", "user"):
             expect(verdict.get(n) == [], f"pure: {n} is rejected: {verdict.get(n)}")
+        # host nightly: the same lock reading over the synthetic workspace — every crate with no device root, whatever its
+        # x86_64 or Linux-only code, and an admitted device-linked one only by name; the tables' stale entries are problems
+        every = sorted(srcs)
+        dev = ["devc", "devdep", "gitdep", "via", "wrap"]
+        got = [n for n, _ in host_crates(pt, lock, {})]
+        expect(got == [n for n in every if n not in dev], f"host nightly: the synthetic set is {got}")
+        got = [n for n, _ in host_crates(pt, lock, {"via": "reason"})]
+        expect("via" in got and "devc" not in got and len(got) == len(every) - len(dev) + 1, f"host nightly: an admitted crate is {got}")
+        expect([n for n, _ in host_left_out(pt, lock, {"via": "reason"})] == ["devc", "devdep", "gitdep", "wrap"], "host nightly: the left-out list")
+        os.makedirs(os.path.join(tmp, "tools"))
+        for f in ("check-a.sh", "check-b.sh", "other.sh"):
+            with open(os.path.join(tmp, "tools", f), "w", encoding="utf-8") as fh:
+                fh.write("")
+        units = host_units(pt, lock, {}, {"user": [("tests::one", "needs a file")], "x86": []}, {"check-b.sh": "needs a box"}, {"extra": "true"})
+        expect(units[-2] == ("check-a", "bash tools/check-a.sh") and units[-1] == ("extra", "true") and not any(u == "check-b" for u, _ in units), f"host nightly: the check units {units[-3:]}")
+        expect(dict(units)["user"].endswith("--no-fail-fast -- --exact --skip tests::one"), f"host nightly: a skip is exact: {dict(units)['user']}")
+        expect(dict(units)["x86"].endswith("--no-fail-fast") and dict(units)["guarded"].startswith(HOST_GATE + " -p guarded"), "host nightly: a crate with no skip")
+        with open(os.path.join(tmp, "user", "src", "lib.rs"), "a", encoding="utf-8") as fh:
+            fh.write("#[test]\nfn one() {}\n")
+        expect(any("HOST_EXTRA_UNITS names check-a" in g for g in nightly_problems(pt, lock, {}, {}, {}, {"check-a": "true"})), "host nightly: an extra unit that is a check script")
+        for linked, skips, checks, want in [
+            ({}, {"user": [("tests::one", "needs a file")]}, {"check-b.sh": "needs a box"}, None),
+            ({"nope": "r"}, {}, {}, "HOST_DEVICE_LINKED names nope, which is no workspace crate"),
+            ({"user": "r"}, {}, {}, "HOST_DEVICE_LINKED names user, which reaches no device root"),
+            ({}, {"devc": [("a", "r")]}, {}, "HOST_TEST_SKIP names devc, which the set does not run"),
+            ({}, {"user": [("tests::gone", "r")]}, {}, "no `fn gone` in the crate's sources"),
+            ({}, {"user": [("tests::one", " ")]}, {}, "HOST_TEST_SKIP user tests::one: no reason"),
+            ({}, {}, {"check-c.sh": "r"}, "HOST_CHECK_SKIP names check-c.sh, which is not a tools/check-*.sh"),
+            ({}, {}, {"check-a.sh": ""}, "HOST_CHECK_SKIP check-a.sh: no reason"),
+        ]:
+            got = nightly_problems(pt, lock, linked, skips, checks, {})
+            expect((not got) if want is None else any(want in g for g in got), f"host nightly: {want}: {got}")
     # the real tree: the rule's selection is the set whose native `cargo test` passes (`just mac-test`), and a
     # rejected crate names a device root or a source line
     real = dict(pure_crates(tree, load_lock(tree.root)))
@@ -6359,6 +6556,27 @@ def self_test() -> int:
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
     expect(any("bloomery-gpu -> cuda-" in w for w in real.get("bloomery-gpu", [])), f"pure: bloomery-gpu's reason {real.get('bloomery-gpu')}")
     expect(any("x86_64 intrinsics" in w for w in real.get("bloomery-qdot", [])), f"pure: qdot's reason {real.get('bloomery-qdot')}")
+    # host nightly on the real tree: the crates the set runs are the device-free ones and the admitted app; every gpu crate is left out
+    # by its chain; every check script is a unit or an excluded one; the tables hold no stale entry
+    lock_now = load_lock(tree.root)
+    host_now = [n for n, _ in host_crates(tree, lock_now)]
+    expect(
+        host_now
+        == [
+            "bloomery-app", "bloomery-decision", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
+            "bloomery-levers", "bloomery-model", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
+            "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-vision",
+        ],
+        f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",
+    )
+    left = [n for n, _ in host_left_out(tree, lock_now)]
+    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gates", "bloomery-gpu-glm5next", "bloomery-gpu-vision"], f"host nightly: left out {left}")
+    expect(not nightly_problems(tree, lock_now), f"host nightly: {nightly_problems(tree, lock_now)}")
+    ran = {u for u, _ in host_units(tree, lock_now)}
+    expect(
+        all((f[:-3] in ran) != (f in HOST_CHECK_SKIP) for f in host_check_scripts(tree.root)),
+        "host nightly: a check script is neither a unit nor excluded",
+    )
 
     # FAIL-first on a mutated justfile: a typo'd --bin, --test, -p, feature and runner name
     with open(os.path.join(ROOT, "justfile"), encoding="utf-8") as fh:
@@ -6476,6 +6694,8 @@ def main(argv: list[str]) -> int:
     ot.add_argument("--justfile")
     pc = sub.add_parser("pure-crates", help="the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason")
     pc.add_argument("--names", action="store_true", help="the pure crates' names only, one a line")
+    hn = sub.add_parser("host-nightly", help="the units tools/nightly/run.sh runs on a Linux host with no card and no model files: name<TAB>command, in run order")
+    hn.add_argument("--excluded", action="store_true", help="every crate, test and check the set leaves out, with why: kind<TAB>name<TAB>reason")
     cb = sub.add_parser("combos", help="every build shape a recipe compiles, one `cargo check` command each (tools/mac-check.sh combos): combo<TAB>label<TAB>command, skip<TAB>recipe<TAB>why, total<TAB>counts; --base scopes to shapes an input file of which changed (combo lines gain a fourth field, the input key)")
     cb.add_argument("--justfile")
     cb.add_argument("--base", help="a shape whose inputs hold no file changed since this BASE (or A..B) skips with why; with --ledger, a green key skips too")
@@ -6504,6 +6724,8 @@ def main(argv: list[str]) -> int:
             return cmd_orphan_tests(args)
         if args.cmd == "pure-crates":
             return cmd_pure_crates(args)
+        if args.cmd == "host-nightly":
+            return cmd_host_nightly(args)
         if args.cmd == "combos":
             return cmd_combos(args)
         if args.cmd == "box-manifest":

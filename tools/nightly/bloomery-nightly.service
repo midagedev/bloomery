@@ -1,0 +1,33 @@
+[Unit]
+Description=bloomery nightly host tests (off the GPU box)
+Documentation=https://github.com/midagedev/bloomery/tree/main/tools/nightly
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bnightly
+Group=bnightly
+WorkingDirectory=/srv/bloomery-nightly
+# Absent by default. The proofs set NIGHTLY_NO_FETCH=1 or NIGHTLY_INJECT_FAIL=1 here (run.sh's header).
+EnvironmentFile=-/etc/default/bloomery-nightly
+ExecStart=/usr/local/lib/bloomery-nightly/run.sh
+# `+`: root, whatever the result — a timeout or a kill of run.sh still mails. mail.sh has the reasons.
+ExecStopPost=+/usr/local/lib/bloomery-nightly/mail.sh
+TimeoutStartSec=90min
+TimeoutStopSec=60
+
+# This host also runs the user's live services (gadak, hermes, cloudflared, tailscaled, docker): the nightly may use at most
+# three of four vCPUs and 4 GB, at nice 10 and idle IO priority, and builds with two jobs.
+CPUQuota=300%
+MemoryMax=4G
+Nice=10
+IOSchedulingClass=idle
+Environment=CARGO_BUILD_JOBS=2
+
+# It runs the code of a public repository's main as an unprivileged user: that code writes only below its own home and state dir.
+ProtectSystem=strict
+ReadWritePaths=/srv/bloomery-nightly /var/lib/bloomery-nightly
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

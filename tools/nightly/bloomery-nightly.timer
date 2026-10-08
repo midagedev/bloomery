@@ -1,0 +1,12 @@
+[Unit]
+Description=bloomery nightly host tests, 03:00 Seoul time
+
+[Timer]
+# The VPS clock is Europe/Berlin; the calendar names the zone.
+OnCalendar=*-*-* 03:00:00 Asia/Seoul
+# A night the machine was off runs once when it is back.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
