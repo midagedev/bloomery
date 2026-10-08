@@ -36,7 +36,7 @@ use crate::Gpu;
 use crate::GpuError;
 use crate::fault::{Fault, FaultSink, LAYER_HEAD};
 use crate::tensor::{DeviceTensor, Q8Act};
-use crate::weights::{DevWeight, Weights};
+use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 
@@ -73,14 +73,14 @@ impl OutW<'_> {
 /// checked, not assumed — a file whose lm_head is another format needs a
 /// different gemv, and a silent plane reuse would misread its bytes.
 fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
-    match w.get("output.weight") {
+    match w.get(HEAD_TENSOR) {
         Some(DevWeight::KQuant { ty, w, k }) => match ty {
             GgmlType::Q6_K => Ok((OutW::Q6K(w), *k)),
             GgmlType::Q4_K => Ok((OutW::Q4K(w), *k)),
             _ => Err(GpuError::shape(
                 "head_out_w",
                 format!(
-                    "output.weight is {ty}, want Q6_K, Q4_K or Q8_0 (the gemvs \
+                    "{HEAD_TENSOR} is {ty}, want Q6_K, Q4_K or Q8_0 (the gemvs \
                  this head launches read those rows)"
                 ),
             )),
@@ -88,12 +88,12 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
         Some(DevWeight::Q8_0 { qs, d, k }) => Ok((OutW::Q8_0 { qs, d }, *k)),
         Some(_) => Err(GpuError::tensor(
             "head_out_w",
-            "output.weight",
+            HEAD_TENSOR,
             "a Q6_K word plane or Q8_0 planes",
         )),
         None => Err(GpuError::tensor(
             "head_out_w",
-            "output.weight",
+            HEAD_TENSOR,
             "resident — load Weights with globals",
         )),
     }
@@ -107,7 +107,7 @@ fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
         OutW::Q6K(w) => Ok(w),
         OutW::Q4K(_) | OutW::Q8_0 { .. } => Err(GpuError::tensor(
             "head_q6k_w",
-            "output.weight",
+            HEAD_TENSOR,
             "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
         )),
     }
@@ -238,14 +238,14 @@ impl Head {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "output.weight rows are {k} values wide, the norm \
+                    "{HEAD_TENSOR} rows are {k} values wide, the norm \
                  gain is {hidden}"
                 ),
             ));
         }
         let n_vocab = out_w.rows();
         if n_vocab == 0 {
-            return Err(GpuError::shape(WHAT, "output.weight has no rows"));
+            return Err(GpuError::shape(WHAT, format!("{HEAD_TENSOR} has no rows")));
         }
         let rows_done = match out_w {
             OutW::Q8_0 { .. } if m > 1 => Some(DeviceBuffer::zeroed(stream, 1)?),
