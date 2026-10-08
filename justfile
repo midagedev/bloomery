@@ -1024,16 +1024,24 @@ gate-qdot:
 gate-engram:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --lib --test engram -- --include-ignored --nocapture'
 
-# 토크나이저 게이트: 우리 id가 engram 코퍼스 텍스트 전부와 케이스 파일에서 두 parse 모드 모두
-# llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가 — V4.1 어휘(deepseek-v3), qwen3moe 어휘(qwen2), GLM-5.3-Flash 어휘(glm4) 셋 다.
-# oracle.sh가 어휘마다 오라클 파일을 먼저 다시 쓴다(어휘만 적재, 임대 없음, 1분 안).
-# qwen3moe와 GLM 어휘의 참조는 /home/user/ik-tokref(ik-idxkey와 같은 커밋 + ik#2520 tolower 수정)의 llama-tokenize로 뜬다 —
-# ik의 unicode_tolower는 정렬되지 않은 표에 lower_bound를 써서 (?i:'re) 같은 축약이 어긋나고, 그 경로는 qwen2 정규식과
-# llama3 정규식(glm4가 쓰는 분할기)이 탄다.
-# #2520이 ik에 들어가면 기본 트리로 되돌린다. V4.1 어휘의 참조도 곁가지 트리다: oracle.sh의 기본 TOKENIZE는 /home/user/ik-tilde
-# (ik main + `~`를 S에 넣는 한 줄, ik#2528)이고, 참조의 `~/`가 [71520]이 아니면 거부한다 — #2528이 들어가면 되돌린다.
+# The tokenizer gate: our ids equal `llama-tokenize`'s on every engram corpus text and every case of
+# crates/tokenizer/tests/cases.txt, in both parse modes, and the reference's ids decode back to the text, for
+# the four vocabularies the engine runs: V4.1 (deepseek-v3), Qwen3-MoE (qwen2), GLM-5.3-Flash (glm4) and
+# Qwen3.8-Flash-Next (qwen35). It only reads the sets: each opens through its refset family
+# (crates/refset/src/arch/tokenizer.rs), which refuses by name a set written by another executable or library, from
+# another vocabulary file or other cases, with a text that is not the one dumped, or never finished.
+# `just dump-ref-tokenizer` writes them.
 gate-tokenizer:
-    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf TOKENIZER_SET=tokenizer-glm5next timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+# The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
+# docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
+# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38 or all). No lease, no GPU.
+# A re-dump on a moved reference tree changes the md5 pins in crates/refset/src/arch/tokenizer.rs: the gate names which.
+# V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
+# ik#2528) and the others' is /home/user/ik-tokref (the ik-idxkey commit plus the unicode_tolower fix, ik#2520);
+# each goes back to the default tree once its fix is in ik.
+dump-ref-tokenizer VOCAB='all':
+    ./tools/box.sh 'timeout --kill-after=10 900 bash crates/tokenizer/tools/oracle.sh {{VOCAB}}'
 # Clef's request encoder, joint schema head and SystemOne answer (crates/decision, host only) against the
 # release's own Python (tools/ref/clef_ref.py's files under $BLOOMERY_DATA/clef/flash/ref): ids and spans
 # exact, f32 logits inside the derived band of the f64 referee, the body's shape and top options.
@@ -1108,15 +1116,22 @@ build-kvclear:
 kvclear-probe *ARGS:
     ./tools/box.sh 'source tools/ref/ref-paths.sh && CUDA_VISIBLE_DEVICES= /root/bloomery-scratch/ikclear/bin/kvclear_probe -m "$MODEL" --prompts tools/ref/prompts.tsv -ngl 0 -c 512 -t 32 {{ARGS}}'
 
-# 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
-# hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
-# 덤프는 둘이다: V2-Lite의 여섯 타입은 $BLOOMERY_DATA/ref에, V4.1 첫 샤드는 파일의 타입들(공개 Q3_K_M 파일이면
-# f32·q3_K·q4_K·q5_K·q6_K의 다섯)을 $BLOOMERY_DATA/ref-v41<세트 접미>에 — 공개 파일은 ref-v41_plain. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
-# 박스의 모델 파일에 없는 q2_K·iq2_xs·iq3_xxs·iq4_xs는 --synthetic이 ggml로 양자화한 행과 무작위 코드 행을
-# $BLOOMERY_DATA/ref-synth에 덤프하고, i-quant 코드북(iq_tables.rs)은 gen-iq-tables.py --check가 ik 헤더에서
-# 다시 뽑아 커밋된 파일과 바이트로 대조한다.
+# Stage 1-1 gate: the dequantization oracle's sets against the gguf crate's hw tests: types, tensors and rows of
+# the V2-Lite file and of the V4.1 file's first shard, and the synthetic rows of the types no model file on the box
+# holds (q2_K, iq2_xs, iq3_xxs, iq4_xs), each bit for bit against ggml's `to_float`; --include-ignored brings the
+# split reader's and the inventory's plain tests along. The sets open through their refset families
+# (crates/refset/src/arch/dequant.rs), which refuse by name a set written by another harness or ggml build, from
+# another model file, with a file that is not the one dumped, or never finished; `just dump-ref-dequant` writes
+# them. gen-iq-tables.py --check re-extracts the i-quant codebooks (iq_tables.rs) from ik's headers and compares
+# them with the committed file byte for byte.
 gate-1-1:
-    ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && S=$(. tools/ref/models/deepseek41.sh && printf %s "$V41_SET_SUFFIX") && "$BLOOMERY_DATA/bin/dequant_ref" "$BLOOMERY_V41_MODEL" "$BLOOMERY_DATA/ref-v41$S" && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
+    ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
+# The dequantization oracle's sets, once per change of the ggml build, dequant_ref.cpp or the model files: builds
+# the harness (tools/ref/build-dequant.sh) and dumps $BLOOMERY_DATA/ref-dequant-v2lite (V2-Lite),
+# ref-dequant-v41<suffix> (the V4.1 file) and ref-synth (`--synthetic`), each with its DEQUANT.tsv
+# (tools/ref/dump-dequant.sh). No lease, no GPU.
+dump-ref-dequant:
+    ./tools/box.sh 'bash tools/ref/dump-dequant.sh'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
 gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers

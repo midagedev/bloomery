@@ -117,6 +117,7 @@ dependencies = [
 name = "bloomery-gguf"
 version = "0.1.0"
 dependencies = [
+ "bloomery-refset",
  "libc",
  "memmap2",
  "thiserror",
@@ -321,6 +322,7 @@ name = "bloomery-tokenizer"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-refset",
  "memchr",
  "thiserror",
 ]

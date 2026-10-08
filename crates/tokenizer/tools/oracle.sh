@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # oracle.sh — reference token ids for the tokenizer gate, written next to the exact text they came
-# from.
+# from. The writer behind `just dump-ref-tokenizer`; `just gate-tokenizer` only reads the sets,
+# through refset's tokenizer families (crates/refset/src/arch/tokenizer.rs), which refuse a set that
+# this script did not finish or that another reference executable, library or vocabulary wrote.
 #
 # Not a measurement: no lease, no timing, no GPU (CUDA_VISIBLE_DEVICES is emptied; llama-tokenize
 # loads the vocabulary only). The text sets are engram-corpus.sh's, gathered the same way from the
@@ -15,41 +17,98 @@
 # plus the hand-picked cases in crates/tokenizer/tests/cases.txt (one per line, printf %b
 # escapes; an empty line is the empty string; a line starting with '#' is a comment).
 #
-# Each set is tokenized twice: with special-token parsing (llama-tokenize's default) and with
-# --no-parse-special (what engram-corpus.sh used). Output, under $BLOOMERY_DATA/tokenizer/:
+# Each text is tokenized twice: with special-token parsing (llama-tokenize's default) and with
+# --no-parse-special (what engram-corpus.sh used). Output, under $BLOOMERY_DATA/<set>/:
 #
-#   <set>.txt            the text, exactly as the reference read it
-#   <set>.ids            one id per line, special tokens parsed
-#   <set>.nps.ids        one id per line, --no-parse-special
+#   <name>.txt           the text, exactly as the reference read it
+#   <name>.ids           one id per line, special tokens parsed
+#   <name>.nps.ids       one id per line, --no-parse-special
 #   cases/<nn>.{txt,ids,nps.ids}
-#   MANIFEST.tsv         the tokenizer binary, the vocabulary file, and each set's md5s and counts
+#   MANIFEST.tsv         the executable and the libllama.so it loads (path, md5), the vocabulary
+#                        file, the cases file (path, md5), one row per text (the corpus names, then
+#                        cases/<nn>: bytes, text md5, id counts), and the `# complete` trailer
 #
-# The vocabulary is V4.1's first shard unless TOKENIZER_VOCAB names another GGUF file; its sets go
-# under $BLOOMERY_DATA/$TOKENIZER_SET (default `tokenizer`, V4.1's), so each vocabulary keeps a set
-# of its own — the swap at the end replaces the whole directory.
+# The vocabularies, each with its reference tree and its set (`profile` below owns the table;
+# crates/refset/src/arch/tokenizer.rs pins the same executables and libraries by md5):
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh
-#        TOKENIZER_VOCAB=/models/…/file.gguf TOKENIZER_SET=tokenizer-qwen3moe bash crates/tokenizer/tools/oracle.sh
+#   v41       V4.1's first shard                  ik-tilde  (`~` is a symbol, as in mainline and HF)  ref-tokenizer-v41
+#   qwen3moe  the Qwen3-MoE file                  ik-tokref (the unicode_tolower fix)                  ref-tokenizer-qwen3moe
+#   glm5next  GLM-5.3-Flash's first shard         ik-tokref                                            ref-tokenizer-glm5next
+#   qwen38    Qwen3.8-Flash-Next's first shard    ik-tokref                                            ref-tokenizer-qwen38
+#
+# The sets' directories are `ref-tokenizer-*`, not the `tokenizer*` of the format this script wrote
+# before it wrote a trailer: a checkout that still runs that format's gate rewrites those and cannot
+# touch these.
+#
+# Every vocabulary reads the same texts: the default profile's ik tree and this tree's docs/. `all`
+# takes one snapshot of docs/ per vocabulary, in turn.
+#
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|all
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-# IK (the text trees) and BLOOMERY_DATA default as in every runner here.
+CASES=$ROOT/crates/tokenizer/tests/cases.txt
+
+case ${1:-} in
+  v41 | qwen3moe | glm5next | qwen38) [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|all" >&2; exit 64; } ;;
+  all)
+    [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|all" >&2; exit 64; }
+    for v in v41 qwen3moe glm5next qwen38; do
+      echo "oracle: $v"
+      bash "${BASH_SOURCE[0]}" "$v"
+    done
+    exit 0
+    ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|all" >&2; exit 64 ;;
+esac
+VOCAB_NAME=$1
+
+# IK (the text trees) and BLOOMERY_DATA default as in every runner here. The texts are the default
+# profile's: another profile's IK tree would give this vocabulary other texts than its siblings.
 # shellcheck source=tools/ref/ref-paths.sh
 source "$ROOT/tools/ref/ref-paths.sh"
-# ik with its k_ucat_map listing `~` as a symbol, as mainline and HF do; back to the V4.1 profile's ik
-# tree once that tree carries the same list.
-TOKENIZE=${TOKENIZE:-/home/user/ik-tilde/build/bin/llama-tokenize}
-# The V4.1 file set: the deepseek41 profile's choice, exported by tools/box.sh.
-V41_DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
+[ "$BLOOMERY_MODEL" = deepseek2 ] || {
+  echo "oracle: the texts are the default profile's (deepseek2); BLOOMERY_MODEL=$BLOOMERY_MODEL would take another IK tree" >&2
+  exit 64
+}
+
+# profile <name>: TOKENIZE (the reference executable), SHARD (the vocabulary file) and SET (the
+# directory under $BLOOMERY_DATA) of one vocabulary.
+profile() {
+  case $1 in
+    v41)
+      # The V4.1 file set is the deepseek41 profile's choice, exported by tools/box.sh.
+      local dir=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
+      TOKENIZE=/home/user/ik-tilde/build/bin/llama-tokenize
+      SHARD=$(find "$dir" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
+      [ -n "$SHARD" ] || { echo "oracle: no first shard under $dir" >&2; exit 66; }
+      SET=ref-tokenizer-v41
+      ;;
+    qwen3moe)
+      TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize
+      SHARD=${BLOOMERY_QWEN3MOE_VOCAB:-/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}
+      SET=ref-tokenizer-qwen3moe
+      ;;
+    glm5next)
+      TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize
+      SHARD=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
+      SET=ref-tokenizer-glm5next
+      ;;
+    qwen38)
+      TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize
+      SHARD=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+      SET=ref-tokenizer-qwen38
+      ;;
+  esac
+}
+profile "$VOCAB_NAME"
 
 [ -x "$TOKENIZE" ] || { echo "oracle: no llama-tokenize at $TOKENIZE" >&2; exit 66; }
-if [ -n "${TOKENIZER_VOCAB:-}" ]; then
-  SHARD=$TOKENIZER_VOCAB
-  [ -f "$SHARD" ] || { echo "oracle: no vocabulary file at $SHARD" >&2; exit 66; }
-else
-  SHARD=$(find "$V41_DIR" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
-  [ -n "$SHARD" ] || { echo "oracle: no first shard under $V41_DIR" >&2; exit 66; }
+[ -f "$SHARD" ] || { echo "oracle: no vocabulary file at $SHARD" >&2; exit 66; }
+LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" { print $3 }')
+[ -f "$LIBLLAMA" ] || { echo "oracle: $TOKENIZE loads no libllama.so (ldd names '$LIBLLAMA')" >&2; exit 66; }
+if [ "$VOCAB_NAME" = v41 ]; then
   # The reference's `~` is a symbol, so `~/` is one word and one id; a tree whose `~` is in neither
   # P nor S returns [96, 17].
   probe=$(CUDA_VISIBLE_DEVICES= "$TOKENIZE" -m "$SHARD" -p '~/' --ids --log-disable)
@@ -58,10 +117,6 @@ else
     exit 65
   }
 fi
-SET=${TOKENIZER_SET:-tokenizer}
-case $SET in
-  ''|*/*|.*) echo "oracle: '$SET' cannot name a set" >&2; exit 64 ;;
-esac
 
 OUT=$BLOOMERY_DATA/$SET
 rm -rf "$OUT.new"
@@ -102,30 +157,38 @@ one() {
   rm -f "$2.raw"
 }
 
+# row <name> — the text <name>'s manifest row: bytes, text md5 and the two id counts.
+row() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$(wc -c < "$OUT.new/$1.txt")" \
+    "$(md5sum < "$OUT.new/$1.txt" | cut -d' ' -f1)" \
+    "$(wc -l < "$OUT.new/$1.ids")" "$(wc -l < "$OUT.new/$1.nps.ids")"
+}
+
 {
   printf '# tokenizer\t%s\t%s\n' "$TOKENIZE" "$(md5sum < "$TOKENIZE" | cut -d' ' -f1)"
+  printf '# libllama\t%s\t%s\n' "$LIBLLAMA" "$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)"
   printf '# vocabulary\t%s\n' "$SHARD"
   printf '# text tree\t%s\n' "$IK"
+  printf '# cases\t%s\t%s\n' "$CASES" "$(md5sum < "$CASES" | cut -d' ' -f1)"
   printf 'set\tbytes\ttext_md5\tids\tnps_ids\n'
 } > "$OUT.new/MANIFEST.tsv"
 
 for name in code prose prose-all threads korean; do
   gather "$name" > "$OUT.new/$name.txt"
   ids "$OUT.new/$name.txt" "$OUT.new/$name"
-  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$(wc -c < "$OUT.new/$name.txt")" \
-    "$(md5sum < "$OUT.new/$name.txt" | cut -d' ' -f1)" \
-    "$(wc -l < "$OUT.new/$name.ids")" "$(wc -l < "$OUT.new/$name.nps.ids")" >> "$OUT.new/MANIFEST.tsv"
+  row "$name" >> "$OUT.new/MANIFEST.tsv"
 done
 
 n=0
 while IFS= read -r line || [ -n "$line" ]; do
   case $line in '#'*) continue ;; esac
   n=$((n + 1))
-  f=$(printf '%s/cases/%02d' "$OUT.new" "$n")
-  printf '%b' "$line" > "$f.txt"
-  ids "$f.txt" "$f"
-done < "$ROOT/crates/tokenizer/tests/cases.txt"
-printf 'cases\t%s\n' "$n" >> "$OUT.new/MANIFEST.tsv"
+  name=$(printf 'cases/%02d' "$n")
+  printf '%b' "$line" > "$OUT.new/$name.txt"
+  ids "$OUT.new/$name.txt" "$OUT.new/$name"
+  row "$name" >> "$OUT.new/MANIFEST.tsv"
+done < "$CASES"
+printf '# complete\t%s\n' "$n" >> "$OUT.new/MANIFEST.tsv"
 
 rm -rf "$OUT"
 mv "$OUT.new" "$OUT"

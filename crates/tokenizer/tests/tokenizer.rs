@@ -1,12 +1,15 @@
 //! Tokenizer gates: our ids equal the reference's `llama-tokenize` ids, id for
 //! id, and the reference's ids decode back to the source bytes — for each
 //! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer),
-//! Qwen3-MoE's (`qwen2`) and GLM-5.3-Flash's (`glm4`).
+//! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`) and Qwen3.8-Flash-Next's
+//! (`qwen35`).
 //!
-//! The oracle files come from `crates/tokenizer/tools/oracle.sh` (the
-//! `gate-tokenizer` recipe runs it first, once per vocabulary) under
-//! `$BLOOMERY_DATA/tokenizer/`, `$BLOOMERY_DATA/tokenizer-qwen3moe/` and
-//! `$BLOOMERY_DATA/tokenizer-glm5next/`.
+//! The reference's sets are written once by `just dump-ref-tokenizer`
+//! (`crates/tokenizer/tools/oracle.sh`) and opened here through their refset
+//! family, which refuses by name a set written by another executable or
+//! library, from another vocabulary file than the one loaded below, with a
+//! text that is not the one dumped, or that never finished; the set's cases
+//! must be the ones in `tests/cases.txt`.
 //! Every text is checked in both of the reference's parse modes: special
 //! tokens parsed (its default) and `--no-parse-special`. Neither adds a BOS
 //! for these vocabularies (`tokenizer.ggml.add_bos_token` is false), so there
@@ -15,16 +18,19 @@
 //! that is valid UTF-8. Invalid input is not: the reference decodes it to
 //! U+FFFD first.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
+use refset::arch::tokenizer::{GLM5NEXT, QWEN3MOE, QWEN38, V41};
+use refset::family::Family;
+use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
 
-/// One vocabulary under test: its GGUF file, the oracle set its ids are in,
-/// and the special roles it leaves to the reference's hash order.
+/// One vocabulary under test: its refset family, which names the GGUF file
+/// and the set its ids are in, and the special roles it leaves to the
+/// reference's hash order.
 struct Vocabulary {
-    file: PathBuf,
-    set: &'static str,
+    family: &'static Family,
     /// Roles the reference fills by text from several candidates, picking by
     /// the iteration order of its token map. No such role enters `encode`
     /// (ids read only the partition's special texts and BOS/EOS), so the ids
@@ -36,11 +42,11 @@ struct Vocabulary {
     eog: &'static [&'static str],
 }
 
-/// V4.1's first shard, `$BLOOMERY_V41_DIR` or the served set's directory.
+/// V4.1's first shard: the family's file, `$BLOOMERY_V41_DIR` or the served
+/// set's directory.
 fn v41() -> Vocabulary {
     Vocabulary {
-        file: v41_path(),
-        set: "tokenizer",
+        family: &V41,
         ambiguous: &[],
         eog: &[],
     }
@@ -48,11 +54,8 @@ fn v41() -> Vocabulary {
 
 /// The Qwen3-MoE file, `$BLOOMERY_QWEN3MOE_VOCAB` or the one on the box.
 fn qwen3moe() -> Vocabulary {
-    let file = std::env::var("BLOOMERY_QWEN3MOE_VOCAB")
-        .unwrap_or_else(|_| "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf".into());
     Vocabulary {
-        file: PathBuf::from(file),
-        set: "tokenizer-qwen3moe",
+        family: &QWEN3MOE,
         // No `eot_token_id` key, and both `<|im_end|>` and `<|endoftext|>`
         // are CONTROL tokens on the reference's EOT list. Both are in the
         // end-of-generation set either way (every EOG text is).
@@ -64,48 +67,53 @@ fn qwen3moe() -> Vocabulary {
 /// GLM-5.3-Flash's first shard on the box, the file's identity.
 fn glm5next() -> Vocabulary {
     Vocabulary {
-        file: PathBuf::from(
-            "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
-        ),
-        set: "tokenizer-glm5next",
+        family: &GLM5NEXT,
         ambiguous: &[],
         // The header's eos, eot and eom: a generation ends on any of the three.
         eog: &["<|endoftext|>", "<|user|>", "<|observation|>"],
     }
 }
 
-fn data_dir(v: &Vocabulary) -> PathBuf {
-    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-    PathBuf::from(base).join(v.set)
+/// Qwen3.8-Flash-Next's first shard on the box.
+fn qwen38() -> Vocabulary {
+    Vocabulary {
+        family: &QWEN38,
+        // No `eot_token_id` key, as Qwen3-MoE's: `<|im_end|>` (the eos) and
+        // `<|endoftext|>` (the bos and pad) are both on the reference's EOT list.
+        ambiguous: &["eot"],
+        eog: &["<|im_end|>", "<|endoftext|>"],
+    }
 }
 
-/// V4.1's first shard: [`gguf::v41::model`], the path's owner.
-fn v41_path() -> PathBuf {
-    PathBuf::from(gguf::v41::model())
+impl Vocabulary {
+    /// The GGUF file the set was dumped from and this gate loads.
+    fn file(&self) -> PathBuf {
+        PathBuf::from(
+            self.family
+                .runs()
+                .unwrap_or_else(|e| panic!("{}: {e}", self.family.name)),
+        )
+    }
+}
+
+/// The vocabulary's set opened through its family and held to `cases.txt`;
+/// a refusal names the recipe that re-takes it.
+fn open(v: &Vocabulary) -> TokenizerSet {
+    let f = v.family;
+    let set = TokenizerSet::open(&f.path(f.sets[0]), f).unwrap_or_else(|e| refuse(f, &e));
+    // The hand-picked cases file the sets' case texts must come from.
+    set.check_cases(include_bytes!("cases.txt"))
+        .unwrap_or_else(|e| refuse(f, &e));
+    set
+}
+
+fn refuse(f: &Family, e: &refset::RefError) -> ! {
+    panic!("{e}\n  re-take the set: {}", f.recipe)
 }
 
 fn load(v: &Vocabulary) -> Tokenizer {
-    Tokenizer::from_gguf(&v.file).unwrap_or_else(|e| panic!("{}: {e}", v.file.display()))
-}
-
-fn read(path: &Path) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_else(|e| {
-        panic!(
-            "{}: {e} (run crates/tokenizer/tools/oracle.sh)",
-            path.display()
-        )
-    })
-}
-
-fn read_ids(path: &Path) -> Vec<u32> {
-    String::from_utf8(read(path))
-        .expect("ids files are ASCII")
-        .lines()
-        .map(|l| {
-            l.parse()
-                .unwrap_or_else(|e| panic!("{}: {l:?}: {e}", path.display()))
-        })
-        .collect()
+    let file = v.file();
+    Tokenizer::from_gguf(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()))
 }
 
 /// `Err` with the first difference: its position in ids and in the text's
@@ -155,16 +163,17 @@ fn stream(tok: &Tokenizer, ids: &[u32]) -> String {
 
 /// One text in both parse modes: ids equal, and the reference's ids decode
 /// (whole and streamed) to the text when it is UTF-8. Returns the failures.
-fn check(tok: &Tokenizer, name: &str, text: &[u8], stem: &Path, failures: &mut Vec<String>) {
-    for (mode, parse, suffix) in [("parse", true, "ids"), ("no-parse", false, "nps.ids")] {
-        let oracle = read_ids(&stem.with_extension(suffix));
+fn check(tok: &Tokenizer, name: &str, text: &Text, failures: &mut Vec<String>) {
+    let bytes = text.read().unwrap_or_else(|e| panic!("{e}"));
+    for (mode, parse) in [("parse", true), ("no-parse", false)] {
+        let oracle = text.ids(parse).unwrap_or_else(|e| panic!("{e}"));
         let t0 = Instant::now();
-        let ours = tok.encode(text, false, parse);
+        let ours = tok.encode(&bytes, false, parse);
         let secs = t0.elapsed().as_secs_f64();
         let verdict = compare(tok, &ours, &oracle);
-        let round = match std::str::from_utf8(text) {
+        let round = match std::str::from_utf8(&bytes) {
             Err(_) => "not UTF-8, no round trip".to_string(),
-            Ok(_) if tok.decode_bytes(&oracle, true) != text => {
+            Ok(_) if tok.decode_bytes(&oracle, true) != bytes => {
                 failures.push(format!(
                     "{name} {mode}: the reference's ids do not decode to the text"
                 ));
@@ -198,12 +207,17 @@ fn check(tok: &Tokenizer, name: &str, text: &[u8], stem: &Path, failures: &mut V
 /// Every engram corpus text: ids equal the reference's, both parse modes.
 fn corpus_ids_equal_reference(v: &Vocabulary) {
     let tok = load(v);
-    let dir = data_dir(v);
+    let set = open(v);
+    let names: Vec<&str> = set.corpora().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["code", "prose", "prose-all", "threads", "korean"],
+        "the corpus texts of {}",
+        set.dir.display()
+    );
     let mut failures = Vec::new();
-    for name in ["code", "prose", "prose-all", "threads", "korean"] {
-        let stem = dir.join(name);
-        let text = read(&stem.with_extension("txt"));
-        check(&tok, name, &text, &stem, &mut failures);
+    for text in set.corpora() {
+        check(&tok, &text.name, text, &mut failures);
     }
     assert!(
         failures.is_empty(),
@@ -214,19 +228,19 @@ fn corpus_ids_equal_reference(v: &Vocabulary) {
 }
 
 #[test]
-#[ignore = "needs the V4.1 vocabulary and the oracle files on the box"]
+#[ignore = "needs the V4.1 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_corpus_ids_equal_reference() {
     corpus_ids_equal_reference(&v41());
 }
 
 #[test]
-#[ignore = "needs the qwen3moe vocabulary and the oracle files on the box"]
+#[ignore = "needs the qwen3moe vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_qwen3moe_corpus_ids_equal_reference() {
     corpus_ids_equal_reference(&qwen3moe());
 }
 
 #[test]
-#[ignore = "needs the glm5next vocabulary and the oracle files on the box"]
+#[ignore = "needs the glm5next vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_glm5next_corpus_ids_equal_reference() {
     corpus_ids_equal_reference(&glm5next());
 }
@@ -256,34 +270,23 @@ fn cases_equal_reference(v: &Vocabulary) {
         );
     }
 
-    let dir = data_dir(v).join("cases");
-    let mut stems: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: {e} (run crates/tokenizer/tools/oracle.sh)",
-                dir.display()
-            )
-        })
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "txt"))
-        .map(|p| p.with_extension(""))
-        .collect();
-    stems.sort();
+    let set = open(v);
+    let cases: Vec<&Text> = set.cases().collect();
     assert!(
-        stems.len() >= 20,
-        "{} cases under {}",
-        stems.len(),
-        dir.display()
+        cases.len() >= 20,
+        "{} cases in {}",
+        cases.len(),
+        set.dir.display()
     );
     let mut failures = Vec::new();
-    for stem in &stems {
-        let text = read(&stem.with_extension("txt"));
+    for text in cases {
+        let bytes = text.read().unwrap_or_else(|e| panic!("{e}"));
         let name = format!(
             "case {} {:?}",
-            stem.file_name().unwrap_or_default().to_string_lossy(),
-            String::from_utf8_lossy(&text)
+            text.name.trim_start_matches("cases/"),
+            String::from_utf8_lossy(&bytes)
         );
-        check(&tok, &name, &text, stem, &mut failures);
+        check(&tok, &name, text, &mut failures);
     }
     assert!(
         failures.is_empty(),
@@ -294,19 +297,31 @@ fn cases_equal_reference(v: &Vocabulary) {
 }
 
 #[test]
-#[ignore = "needs the V4.1 vocabulary and the oracle files on the box"]
+#[ignore = "needs the V4.1 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_cases_equal_reference() {
     cases_equal_reference(&v41());
 }
 
 #[test]
-#[ignore = "needs the qwen3moe vocabulary and the oracle files on the box"]
+#[ignore = "needs the qwen3moe vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_qwen3moe_cases_equal_reference() {
     cases_equal_reference(&qwen3moe());
 }
 
 #[test]
-#[ignore = "needs the glm5next vocabulary and the oracle files on the box"]
+#[ignore = "needs the glm5next vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_glm5next_cases_equal_reference() {
     cases_equal_reference(&glm5next());
+}
+
+#[test]
+#[ignore = "needs the qwen38 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_qwen38_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&qwen38());
+}
+
+#[test]
+#[ignore = "needs the qwen38 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_qwen38_cases_equal_reference() {
+    cases_equal_reference(&qwen38());
 }

@@ -20,6 +20,9 @@
 //! - [`kld`]: ik's KL-divergence base runs (`tools/ref/ik-ppl.sh`).
 //! - [`vision`]: the vision encoder's oracle (`tools/ref/vision/dump_vision.py`).
 //! - [`visref`]: the V4.1 vision fork comparison (`tools/ref/vision/visref.sh`).
+//! - [`tokenizer`]: `llama-tokenize`'s ids per vocabulary
+//!   (`crates/tokenizer/tools/oracle.sh`).
+//! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
 //!
 //! Every manifest row is read by the column names its header line gives
 //! that kind of row, never by position.
@@ -29,12 +32,15 @@ use std::path::PathBuf;
 pub mod arch;
 pub mod clefvis;
 mod columns;
+pub mod dequant;
 pub mod dsref;
 pub mod family;
 pub mod greedy;
 pub mod ik;
 pub mod kld;
+mod md5;
 pub mod mtpref;
+pub mod tokenizer;
 pub mod vision;
 pub mod visref;
 

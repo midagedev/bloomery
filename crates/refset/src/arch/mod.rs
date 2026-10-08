@@ -8,11 +8,13 @@ use crate::family::{Family, Identity};
 
 pub mod deepseek41;
 pub mod deepseek41v;
+pub mod dequant;
 pub mod glm5next;
 pub mod mimo2;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
+pub mod tokenizer;
 
 /// Each architecture's families, by the architecture's name.
 static BY_ARCH: &[(&str, &[&Family])] = &[
@@ -23,6 +25,8 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
+    (tokenizer::ARCH, tokenizer::FAMILIES),
+    (dequant::ARCH, dequant::FAMILIES),
 ];
 
 /// The families of architecture `arch`; none for one the table does not hold.
