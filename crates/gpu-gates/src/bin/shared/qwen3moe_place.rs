@@ -766,7 +766,7 @@ pub fn whole_ctx_qwen3(
             .whole_at(u64::try_from(ctx)?, slots, Ok(QWEN3_WHOLE))?
             .fits())
     };
-    searched_ctx(file, floor, &fits)
+    placement::ctx::searched::<GateError>(trained_ctx(file), floor, CTX_GRAN, &fits)
 }
 
 /// [`whole_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
@@ -797,7 +797,7 @@ pub fn whole_ctx_qwen35(
             )?
             .fits())
     };
-    searched_ctx(file, floor, &fits)
+    placement::ctx::searched::<GateError>(trained_ctx(file), floor, CTX_GRAN, &fits)
 }
 
 /// The `--ctx` a placed load defaults to when the flag is unset: the largest
@@ -828,7 +828,7 @@ pub fn placed_ctx_qwen3(
         let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
         probe.card_experts(&machine, ctx, levers, slots, || Ok(QWEN3_WHOLE))
     };
-    searched_placed_ctx(file, floor, &experts)
+    placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
 }
 
 /// [`placed_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
@@ -855,77 +855,7 @@ pub fn placed_ctx_qwen35(
         let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
         probe.card_experts(&machine, ctx, levers, seqs.slots, || qwen35_whole(file, at))
     };
-    searched_placed_ctx(file, floor, &experts)
-}
-
-/// The search both `placed_ctx_*` run: [`searched_ctx`] over the plan's own
-/// expert split — a context whose plan keeps the floor's card experts fits,
-/// one whose plan cannot build (the card is held, a budget binds), that
-/// drops below the split, or whose plan keeps every expert while its whole
-/// load does not fit ([`PlaceQ3::card_experts`]) does not. Monotone in the
-/// context: the KV term grows with it, the expert rule's budget falls, and
-/// the rule's fill is a prefix through the allocator's granules, so more
-/// budget never holds fewer experts; the whole need grows with the cache
-/// against a fixed reading. One census and one header read serve the whole search
-/// ([`PlaceQ3::machine_at`]), so the reading cannot move between the
-/// probes the premise rides on.
-#[allow(
-    dead_code,
-    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
-)]
-fn searched_placed_ctx(
-    file: &Split,
-    floor: usize,
-    card_experts: &dyn Fn(usize) -> Result<Option<u64>, GateError>,
-) -> Result<Option<usize>, GateError> {
-    let Some(at_floor) = card_experts(floor)? else {
-        return Ok(None);
-    };
-    let fits = |ctx: usize| Ok(card_experts(ctx)?.is_some_and(|e| e >= at_floor));
-    searched_ctx(file, floor, &fits)
-}
-
-/// The search both `whole_ctx_*` run: `Some(trained)` when the trained
-/// context itself fits — probed once, after the floor — else the largest
-/// `floor + k·CTX_GRAN` below it that `fits` takes, halved between the
-/// floor, which fits, and the trained context, which does not: every
-/// caller's `fits` is monotone in the context, so the halving finds that
-/// largest one.
-#[allow(
-    dead_code,
-    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
-)]
-fn searched_ctx(
-    file: &Split,
-    floor: usize,
-    fits: &dyn Fn(usize) -> Result<bool, GateError>,
-) -> Result<Option<usize>, GateError> {
-    let Some(trained) = trained_ctx(file) else {
-        return Ok(None);
-    };
-    if trained <= floor {
-        return Ok(Some(trained));
-    }
-    if !fits(floor)? {
-        return Ok(None);
-    }
-    if fits(trained)? {
-        return Ok(Some(trained));
-    }
-    let mut lo = floor;
-    let mut hi = trained;
-    while hi - lo > CTX_GRAN {
-        let mid = lo + (hi - lo) / 2 / CTX_GRAN * CTX_GRAN;
-        if mid == lo {
-            break;
-        }
-        if fits(mid)? {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo))
+    placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
 }
 
 /// What a run with `--place` unset loads, as [`unplaced_qwen3`] decides it,

@@ -42,9 +42,3 @@ mod drafted;
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/rounds.rs"]
 pub mod rounds;
-
-// The seats' shared `--ctx` default rule, a sibling of the seat as in
-// `bloomery-serve`.
-#[cfg(feature = "gpu")]
-#[path = "shared/serve_seats/ctx.rs"]
-mod ctx;

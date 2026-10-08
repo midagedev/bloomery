@@ -55,7 +55,7 @@
 //! the largest context whose plan of every slot stands, itself never past
 //! `place::ORACLE_POSITIONS` — pulled back to the largest multiple of
 //! `CTX_STEP` that stays within the plan's `MARGIN` of stage-card expert
-//! bytes (`serve_seats::ctx`'s guard, qwen38's margin rule: more positions
+//! bytes (`placement::ctx`'s guard, qwen38's margin rule: more positions
 //! on the card push card experts to the host, and decode crawls), and never
 //! under 2048 unless the card holds less than that (qwen38's `card` rule);
 //! a `ctx` line on stderr names the rule, the chosen context, the slots and
@@ -63,7 +63,7 @@
 //! is the total and each slot takes `total / N` positions rounded down
 //! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
 //! alone it is one request's context, one slot at the whole of it
-//! (`serve_seats::ctx::slots_of`; one line on stderr says so) — a slot
+//! (`placement::ctx::slots_of`; one line on stderr says so) — a slot
 //! under the body's floor
 //! refused by name before the plan — one position, or the MTP draft's
 //! window under `BLOOMERY_DRAFT=mtp` — and the plan refusing it by name past
@@ -111,7 +111,7 @@
 //! ([`SlotDrafts`]), so each request's tokens are its solo run's;
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
 //! by name. `--parallel` naming no count, the seat serves one slot beside a
-//! set `--ctx` (the flag is one request's context, `ctx::slots_of`) and its
+//! set `--ctx` (the flag is one request's context, `placement::ctx::slots_of`) and its
 //! default two over the automatic context. The round's shape the open decided once, from the load and the
 //! body's `SlotRows::MAX_ROWS`: a plain load (no NextN draft) runs a round of
 //! steps as one pass of the busy rows
@@ -261,7 +261,7 @@ const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
 const CTX: usize = 2048;
 
 /// The default context is a multiple of this many positions
-/// (`serve_seats::ctx`'s guard rounds to it).
+/// (`placement::ctx`'s guard rounds to it).
 const CTX_STEP: usize = 256;
 
 /// The levers this seat acts on: those `generate_glm5next` reads for its load
@@ -395,7 +395,7 @@ struct GlmCtx {
     fit: usize,
     fit_bytes: u64,
     /// The largest context within the plan's margin
-    /// (`serve_seats::ctx`'s guard).
+    /// (`placement::ctx`'s guard).
     margin_ctx: usize,
     /// The plan's stage-card expert bytes at [`CTX`] and at `ctx`.
     base_bytes: u64,
@@ -438,10 +438,11 @@ fn ctx_of(
         )
         .into());
     }
-    let fit = super::ctx::largest(1, cap, fits)?;
+    let fit = model::placement::ctx::largest::<GateError>(1, cap, fits)?;
     let base_at = CTX.min(fit);
     let base_bytes = card(base_at)?;
-    let margin_ctx = super::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, &card)?;
+    let margin_ctx =
+        model::placement::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, MARGIN, &card)?;
     let (ctx, rule) = match set {
         Some(c) => (c, "set"),
         None if fit < CTX => (base_at, "card"),
@@ -645,7 +646,7 @@ struct Args {
     plan_only: bool,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
     /// one slot beside a set `--ctx`, else the default 2
-    /// ([`super::ctx::slots_of`]).
+    /// ([`model::placement::ctx::slots_of`]).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
 }
@@ -753,8 +754,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // window under `BLOOMERY_DRAFT=mtp` (unset, the rule below drafts only
     // where a window fits, and never refuses). The slot count itself: a set
     // `--ctx` with no `--parallel` is one request's context — one slot at
-    // the whole of it (`ctx::slots_of`).
-    let (slots, from) = super::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    // the whole of it (`placement::ctx::slots_of`).
+    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
     if from == "ctx" {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \

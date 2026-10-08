@@ -112,7 +112,7 @@
 //! and the open prints a line that says so. `--parallel 1` is exactly the
 //! one-sequence server, its rounds one pass a slot. `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx-size` (the flag is
-//! one request's context, `ctx::slots_of`; one line on stderr says so) and
+//! one request's context, `placement::ctx::slots_of`; one line on stderr says so) and
 //! its default two over the automatic context. Under more slots than one
 //! the context is split
 //! as llama-server splits it with
@@ -734,7 +734,7 @@ fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
         );
     }
     let most = usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?;
-    let ctx = super::ctx::largest(1, most, fits)?;
+    let ctx = model::placement::ctx::largest::<GateError>(1, most, fits)?;
     Ok(Fit38 {
         ctx,
         card_bytes: plans.card(ctx)?,
@@ -744,15 +744,17 @@ fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
 /// The largest multiple of [`CTX_STEP`] up to `fit` whose plan holds at most
 /// `MARGIN` fewer card expert bytes than the plan at `base_at` a slot
 /// (`base_bytes` there), `fit` when every context does, `base_at` when no
-/// step past it does ([`super::ctx::within_margin`], the seats' shared
-/// guard).
+/// step past it does ([`model::placement::ctx::within_margin`], the seats'
+/// shared guard).
 fn margin38(
     plans: &Plans<'_>,
     fit: usize,
     base_at: usize,
     base_bytes: u64,
 ) -> Result<usize, GateError> {
-    super::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, &|c| plans.card(c))
+    model::placement::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, MARGIN, &|c| {
+        plans.card(c)
+    })
 }
 
 /// The seat's context (the module doc), every number a slot's own: `set`
@@ -849,7 +851,7 @@ impl Ctx38 {
             )
             .into());
         }
-        let c = super::ctx::largest(1, self.ctx, |n| Ok(state(n) <= ram))?;
+        let c = model::placement::ctx::largest::<GateError>(1, self.ctx, |n| Ok(state(n) <= ram))?;
         let ctx = (c / CTX_STEP * CTX_STEP).max(c.min(CTX_STEP));
         Ok(Ctx38 {
             ctx,
@@ -911,7 +913,7 @@ struct Args {
     slot_save_path: Option<PathBuf>,
     /// `--parallel`: the resident sequences the seat serves; `None` takes
     /// one slot beside a set `--ctx-size`, else the default 2
-    /// ([`super::ctx::slots_of`]).
+    /// ([`model::placement::ctx::slots_of`]).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; set is refused by name (resident slots park
@@ -1098,8 +1100,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The slot count first: it shapes the context search itself, every plan
     // the seat asks for counting each sequence (`Plans::slots`). A set
     // `--ctx-size` with no `--parallel` is one request's context — one slot
-    // at the whole of it (`ctx::slots_of`).
-    let (slots, from) = super::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    // at the whole of it (`placement::ctx::slots_of`).
+    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
     if from == "ctx" {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \

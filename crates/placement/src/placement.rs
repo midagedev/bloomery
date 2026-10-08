@@ -35,6 +35,7 @@ use gguf::GgmlType;
 
 pub mod card_budget;
 pub mod churn;
+pub mod ctx;
 pub mod devices;
 pub mod workstation;
 
@@ -3037,6 +3038,79 @@ mod tests {
             Err(e) => panic!("{e}, not NoCardFormat"),
             Ok(n) => panic!("an f16 stack was sized as {n:?}"),
         }
+    }
+
+    /// The whole-fit search over contexts stops where the program's arena
+    /// does: the verdict's `fits` falls as the context grows, so the grid
+    /// search ([`ctx::searched`]) over it lands on the last context the
+    /// arena and its reserve leave room for. A card whose reading is under
+    /// the arena alone — `1_151_139_840` B free against the `1_642_419_556` B
+    /// arena a Qwen3.6 whole load refused on a 3090 (the gate census's
+    /// reading and the arena check's message) — holds no context: the
+    /// search says so, and the caller takes the placed plan. The same
+    /// search with the arena left out of the need finds a context past the
+    /// floor, whose load the arena check then refuses. The cache is
+    /// 16,384 B a position and the model the layered fixture's: the rows'
+    /// own terms, not a file's.
+    #[test]
+    fn the_whole_search_stops_where_the_arena_does() {
+        const KV_ROW: u64 = 16_384;
+        const RESERVE: u64 = 7_000;
+        const FLOOR: usize = 4096;
+        const GRAN: usize = 1024;
+        const TRAINED: usize = 262_144;
+        let model = layered(3);
+        let found = |free: u64, arena: u64| {
+            let at = |kv: u64| {
+                let card = Card {
+                    context_bytes: workstation::CONTEXT,
+                    scratch_bytes: workstation::SCRATCH,
+                    margin_bytes: 90_000,
+                    granule_bytes: NonZeroU64::new(4096).expect("not zero"),
+                    free_bytes: Some(free),
+                    ..bytes_card("card", u64::MAX, 0..3)
+                };
+                let load = WholeLoad::Checked {
+                    arena,
+                    reserve: RESERVE,
+                };
+                whole_need(&model, &card, kv, load).expect("every tensor has a format")
+            };
+            let fits = |c: usize| Ok::<_, std::convert::Infallible>(at(c as u64 * KV_ROW).fits());
+            ctx::searched(Some(TRAINED), FLOOR, GRAN, &fits).expect("infallible")
+        };
+        let weights = 9 * 4096;
+        let rest = weights + workstation::CONTEXT + workstation::SCRATCH + RESERVE;
+        let (free, arena) = (1_151_139_840, 1_642_419_556);
+        assert_eq!(
+            found(free, arena),
+            None,
+            "the arena alone passes the reading"
+        );
+        // The arena left out: the cache's room is the reading less the rest.
+        let room = (free - rest) / KV_ROW;
+        let want = FLOOR + (usize::try_from(room).expect("small") - FLOOR) / GRAN * GRAN;
+        assert_eq!(
+            found(free, 0),
+            Some(want),
+            "{room} positions of room without the arena"
+        );
+        assert!(want > FLOOR);
+        // A reading with room for the arena and 20,000 positions of cache.
+        let free = rest + arena + 20_000 * KV_ROW;
+        assert_eq!(found(free, arena), Some(FLOOR + 15 * GRAN), "19,456");
+        // Past the floor by the arena's own positions: 120,245 of room.
+        assert_eq!(
+            found(free, 0),
+            Some(FLOOR + (20_000 + 100_245 - FLOOR) / GRAN * GRAN)
+        );
+        // One position short of the floor's cache: no context.
+        assert_eq!(found(rest + arena + FLOOR as u64 * KV_ROW - 1, arena), None);
+        assert_eq!(
+            found(rest + arena + FLOOR as u64 * KV_ROW, arena),
+            Some(FLOOR),
+            "the floor's cache and nothing more"
+        );
     }
 
     /// Two plan cards of one name are one device: their budgets past its

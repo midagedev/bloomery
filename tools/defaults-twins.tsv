@@ -7,7 +7,7 @@
 # count of those rows so the open gaps stay visible.
 BLOOMERY_ATTN_BUNDLE	gate-attn	1	crates/model/tests/attn.rs::fn hw_attn_bundle_bands_against_per_head	the same test's in-process default (the 8-head tile) the per-head child is banded against
 BLOOMERY_CARD_BUDGET	gate-gpu-ds41-dspark-loop	13G	justfile::bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D &&	the same sitting's first ds41 serve run loads generate_ds41 at each card's own bytes (the unset budget)
-BLOOMERY_CARD_BUDGET	gate-gpu-qwen3-serve	12G	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::("default", &["--parallel", "1"]),	the arms table's `default` row runs the seat with no budget
+BLOOMERY_CARD_BUDGET	gate-gpu-qwen3-serve	12G	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::fn spawn(model: &Path, dir: &Path) -> Result<Served, GateError> {	the main server (`spawn`: --parallel 1, no budget, no cache flag) runs the seat at each card's own bytes
 BLOOMERY_CED	records-refresh	$c	justfile::records-refresh:	the loop runs both words; `on` is the unset default
 BLOOMERY_DRAFT	gate-gpu-ds41-draft	lookup	justfile::> $D/code-plain.log	the recipe's plain arm (code-plain.log) runs the unset plain path
 BLOOMERY_DRAFT	gate-gpu-ds41-dspark-loop	dspark	justfile::generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log	the recipe's plain arm (plain.log) runs the unset plain path
@@ -34,9 +34,9 @@ BLOOMERY_POISON	gate-gpu-qwen4exp-iqleg	1	justfile::gate-gpu-qwen4exp-e2e:	gate-
 BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile::--depth 512 -n 2 > $D/g-default.log	the recipe's g-default run feeds the same depth at the default group (2)
 BLOOMERY_PROFILE	gate-profile	2	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
 BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
-BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::("default", &["--parallel", "1"]),	the pinned word is the default; the arms table's `default` row runs the f16 cache with no flag
+BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the pinned word is the default; the main server's load names the f16 cache with no flag
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q6_0	none	2026-10-08: a refusal probe — the seat refuses the word by name before any load, so no path runs at any value
-BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q8_0	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::("default", &["--parallel", "1"]),	the arms table's `default` row runs the f16 cache (the unset default)
+BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q8_0	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the main server runs the f16 cache (the unset default) and its load names it
 BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::fn drafted(	the drafted arm pins the unset rule's word under a/bp; the --plan unset clauses at :779 print the rule
 BLOOMERY_RESIDENCY	gate-gpu-glm5next-serve	off	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &default, PLAIN)?	the plain arm's server at --place gate, where unset resolves off
 BLOOMERY_RESIDENCY	gate-gpu-qwen38-serve	mid-p0-s1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_default_residency(	the seat at its own defaults: unset resolves mid-p<P>-s1 under the cards' rule

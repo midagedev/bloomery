@@ -37,7 +37,11 @@
 //! - `/v1/chat/completions` of one user turn at temperature 0: the streamed
 //!   deltas concatenate to the non-streamed content, and the stream ends with
 //!   `data: [DONE]`;
-//! - `/tokenize` of `--prompt` is `--ids`;
+//! - (`/tokenize` of `--prompt` being `--ids` is held by
+//!   `crates/tokenizer/tests/tokenizer.rs`, `hw_corpus_ids_equal_reference`
+//!   and `hw_cases_equal_reference`, the `tokenizer-v41` reference set; the
+//!   handler by `crates/serve/tests/serve.rs`,
+//!   `hw_tokenize_detokenize_round_trip`;)
 //! - the same `/completion` after those requests gives the same ids (the
 //!   engine's reset between requests leaves nothing behind), and once more
 //!   right after itself it keeps at most `n − 1` positions of its `n` and at
@@ -3058,15 +3062,6 @@ mod gate {
             "chat_stream_ends_with_done",
             events.last() == Some(&"[DONE]"),
         );
-
-        let (st, body) = curl(
-            &url("/tokenize"),
-            Some(&json!({"content": a.prompt})),
-            false,
-        )?;
-        let tok = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
-        println!("tokenize {tok:?} ids {:?}", a.ids);
-        check(&mut ok, "tokenize_is_the_ids", tok == a.ids);
 
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let again = json_of("/completion", st, &body)?;

@@ -79,7 +79,7 @@
 //! `Slot35` — its K/V planes, its delta layers' recurrent states and conv
 //! rings, its held count and its checkpoints). `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx` (the flag is one
-//! request's context, `ctx::slots_of`; one line on stderr says so) and its
+//! request's context, `placement::ctx::slots_of`; one line on stderr says so) and its
 //! default two over the auto choice. Under more slots than one the context
 //! is split across them
 //! as llama-server splits it with `-np N` and no `-kvu`: the `--ctx` the
@@ -309,7 +309,7 @@ struct Args {
     cache_type_k: Option<String>,
     /// `--parallel`: the slots the server serves, resident sequences on
     /// either file's load; `None` takes one slot beside a set `--ctx`, else
-    /// the default 2 ([`super::ctx::slots_of`]).
+    /// the default 2 ([`model::placement::ctx::slots_of`]).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
 }
@@ -334,7 +334,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         place: None,
         cache_type_k: None,
-        // `None` resolves through `ctx::slots_of`: one slot beside a set
+        // `None` resolves through `placement::ctx::slots_of`: one slot beside a set
         // `--ctx` (the flag is one request's context), else the fixed
         // default 2, not an elastic one — the second slot is a resident
         // sequence the context split bounds (no byte budget to size it
@@ -944,8 +944,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .to_owned();
     // The slot count before the context it sizes: a set `--ctx` with no
     // `--parallel` is one request's context — one slot at the whole of it
-    // (`ctx::slots_of`).
-    let (slots, from) = super::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    // (`placement::ctx::slots_of`).
+    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
     if from == "ctx" {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \

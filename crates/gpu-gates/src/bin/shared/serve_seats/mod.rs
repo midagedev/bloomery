@@ -12,10 +12,10 @@
 //! single-card Qwen seat (qwen3moe, qwen35moe), opened as
 //! `generate_qwen3moe` opens them. `drafted` is the
 //! seats' shared MTP draft driver, one file a seat's per-model binary
-//! includes beside the seat; [`ctx`] the seats' shared `--ctx` rules (the
-//! search bisection, the expert-margin guard, and the slot count a set
-//! `--ctx` buys through `ctx::slots_of`: one slot at the whole context
-//! while `--parallel` names none), included the same way.
+//! includes beside the seat. The seats' shared `--ctx` rules (the search
+//! bisection, the expert-margin guard, and the slot count a set `--ctx`
+//! buys: one slot at the whole context while `--parallel` names none) are
+//! `model::placement::ctx`.
 
 #[cfg(feature = "deepseek41")]
 mod drafted;
@@ -23,10 +23,6 @@ mod drafted;
 pub mod ds41;
 #[cfg(feature = "glm5next")]
 pub mod glm;
-// The seats' shared `--ctx` default rule: the search bisection and the
-// expert-margin guard (qwen38's, which the glm seat lifts).
-#[cfg(any(feature = "deepseek41", feature = "glm5next"))]
-pub mod ctx;
 // The qwen38 seat runs no V4.1 code, but the server surface it sits on —
 // `bind` and the `serve` and `sampler` crates — is scoped to `deepseek41`,
 // as its per-model binary's doc says.
