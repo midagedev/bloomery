@@ -1841,15 +1841,11 @@ fn plan_rule<'a>(
         };
         let mut own = vec![0u64; model.layers];
         fill.run(&mut own, &held)?;
-        // Under a card format only a layer whose stacks a card can hold
-        // leaves the tier work; the planner that puts every routed stack on
-        // the host leaves its caller the tier.
-        let left = match routed {
-            Some(_) => eligible.iter().any(|&l| held[l] < model.experts),
-            None => (0..model.layers)
-                .filter(|&l| !stacks[l].is_empty())
-                .any(|l| held[l] < model.experts),
-        };
+        // Only a layer whose stacks a card can hold leaves the tier work. A
+        // planner with no card format has no tier to reach here
+        // (`plan_host_routed` refuses one), and its empty `eligible` would
+        // refuse the tier as idle.
+        let left = eligible.iter().any(|&l| held[l] < model.experts);
         if !left && own.iter().all(|&n| n == 0) {
             return Err(PlacementError::IdleTier {
                 card: tier.name.clone(),
