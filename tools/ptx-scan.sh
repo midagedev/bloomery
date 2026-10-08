@@ -210,7 +210,11 @@ done
 # queue behind the 3090's gate lock. A scan pair (tools/recipes.py) compares the capability
 # (jit-cc) and the driver (jit-cuda), never the card name.
 JITTBL=$MODS/jit
-if ! BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err"; then
+# The runner's own `gpu-gate.sh: waited …` lines go back to stderr, so a landing batch books the lock wait.
+jit_rc=0
+BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err" || jit_rc=$?
+grep '^gpu-gate\.sh: waited ' "$MODS/jit.err" >&2 || true
+if [ "$jit_rc" != 0 ]; then
   echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
   fail "$SEC $TOOLS modules=$NMOD jit=failed"
 fi
