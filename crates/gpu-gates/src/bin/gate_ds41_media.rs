@@ -1,5 +1,5 @@
 //! GPU gate for the V4.1 text-side image injection (`body::prefill_media`,
-//! `Session::prompt_media`) on the gate placement (`crate::ds41_tier::plan_gate`: the 3090's
+//! `Session::prompt_media`) on the gate placement (`crate::gate_card::plan_gate`: the 3090's
 //! bytes in the real tier, the largest visible card under the header's card budget in the
 //! fixture tier): a prompt whose media
 //! span carries bf16 rows takes those rows at its positions, picks its
@@ -92,7 +92,7 @@ mod gate_card;
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+    reason = "the gate reads the path and the clause tags; the triangle's facts serve the prefill gate"
 )]
 mod ds41_tier;
 
@@ -108,7 +108,9 @@ mod gate {
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::ds41_media;
     use bloomery_gpu_gates::tier;
-    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, split_f32, verdict};
+    use bloomery_gpu_gates::{
+        Fnv1a64, GateError, checks_failed, data_dir, prose_ids, split_f32, verdict,
+    };
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP,
         R8, STEP_STATS,
@@ -234,24 +236,6 @@ mod gate {
             .iter()
             .map(|c| u16::from_le_bytes(*c))
             .collect())
-    }
-
-    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-    fn corpus(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("engram").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
     }
 
     /// One layout: its ids, where the span sits, and each position's kind
@@ -723,7 +707,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::ds41_tier::init()?;
+        crate::gate_card::init()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         let path = crate::ds41_tier::model_path()?;
         let head = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
@@ -741,7 +725,7 @@ mod gate {
         let t = std::time::Instant::now();
         let mut m = body::open(
             file,
-            crate::ds41_tier::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
@@ -756,7 +740,7 @@ mod gate {
             text_bias.push(split_f32(&split, &names::exp_probs_b(l), N_EXPERT)?);
             vl_bias.push(split_f32(&split, &names::exp_probs_b_vl(l), N_EXPERT)?);
         }
-        let corpus = corpus(1600)?;
+        let corpus = prose_ids("engram", 1600)?;
         // The layouts: the span mid-prompt, crossing T_MAX, ending the
         // prompt.
         let mid = Layout::new(&feed, &corpus, 58, 58);

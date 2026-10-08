@@ -102,18 +102,10 @@ mod ds41_open;
 mod quiet;
 
 #[cfg(feature = "deepseek41")]
-#[path = "shared/gate_card.rs"]
-#[allow(
-    dead_code,
-    reason = "the gate plans on the placement's own cards; the tier glue names the gate card"
-)]
-mod gate_card;
-
-#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the levers and the clause tags; the card and the triangle's facts serve the other gates"
+    reason = "the gate reads the levers and the clause tags; the triangle's facts serve the other gates"
 )]
 mod ds41_tier;
 
@@ -121,11 +113,14 @@ mod ds41_tier;
 #[path = "shared/ds41_residency.rs"]
 mod residency;
 
-// `pub`: the V4.1 clauses call the `_with` forms, so a private module would count the plain forms
-// dead in this bin (the GLM and Qwen3.8 gates call those).
 #[cfg(feature = "deepseek41")]
 #[path = "shared/residency_clauses.rs"]
-pub mod residency_clauses;
+#[allow(
+    dead_code,
+    reason = "the V4.1 clauses call the `_with` forms; the plain forms serve the GLM and Qwen3.8 \
+              gates"
+)]
+mod residency_clauses;
 
 #[cfg(feature = "deepseek41")]
 mod gate {

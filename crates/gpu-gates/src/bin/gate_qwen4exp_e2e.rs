@@ -305,10 +305,10 @@ mod gate {
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
-    use bloomery_gpu_gates::q38_fixture::{self as q38, Shape};
+    use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
-    use bloomery_gpu_gates::tier::Tag;
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_model_path,
         topk_ids_logical_within, verdict,
@@ -435,7 +435,7 @@ mod gate {
     /// The gate's one reading of what the run is made from: the model file
     /// (`ref_model_path`, a whole fixture under the fixture tier), the host
     /// load config and the plan's levers (the budget the header records in
-    /// the fixture tier, [`q38::plan_levers`]), and the layer kinds the
+    /// the fixture tier, [`tier::plan_levers`]), and the layer kinds the
     /// header names. Set once, first thing in `run`, before any load.
     struct Cfg {
         path: std::path::PathBuf,
@@ -451,7 +451,7 @@ mod gate {
         CFG.get().expect("init runs before any clause")
     }
 
-    /// The layer kinds the header names ([`q38::Shape`]): never read off the
+    /// The layer kinds the header names ([`q38_fixture::Shape`]): never read off the
     /// loaded body, which the structure clause holds against them.
     fn shape() -> &'static Shape {
         &cfg().shape
@@ -504,7 +504,7 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
         let shape = crate::q38_arch::shape_of(&inputs.hp)?;
-        let plan_levers = q38::plan_levers(&file, &levers, 0)?;
+        let plan_levers = tier::plan_levers(&file, &levers, 0)?;
         let n_expert = inputs.hp.n_expert;
         let cfg = Cfg {
             path,
@@ -525,22 +525,22 @@ mod gate {
     fn witnesses() -> Result<bool, GateError> {
         let s = shape();
         let model = cfg().path.to_string_lossy().into_owned();
-        let mut ok = q38::witness("model file", model, MODEL.to_string());
-        ok &= q38::witness("N_LAYER", s.n_layer, REAL_N_LAYER);
-        ok &= q38::witness("PLE_LAYER", s.ple_layer.unwrap_or(0), REAL_PLE_LAYER);
-        ok &= q38::witness("N_QSA", s.n_qsa(), REAL_N_QSA);
-        ok &= q38::witness("N_GDN", s.n_gdn(), REAL_N_GDN);
-        ok &= q38::witness("NODES_DECODE", s.nodes_decode(), REAL_NODES_DECODE);
-        ok &= q38::witness("MEMOPS", s.memops(), REAL_MEMOPS);
-        ok &= q38::witness("NODES_VERIFY", s.nodes_verify(), REAL_NODES_VERIFY);
-        ok &= q38::witness("NODES_SLOT", s.nodes_slot(), REAL_NODES_SLOT);
-        ok &= q38::witness("IMAGE_TOKEN", s.image_token.unwrap_or(0), REAL_IMAGE_TOKEN);
-        ok &= q38::witness(
+        let mut ok = tier::witness("model file", model, MODEL.to_string());
+        ok &= tier::witness("N_LAYER", s.n_layer, REAL_N_LAYER);
+        ok &= tier::witness("PLE_LAYER", s.ple_layer.unwrap_or(0), REAL_PLE_LAYER);
+        ok &= tier::witness("N_QSA", s.n_qsa(), REAL_N_QSA);
+        ok &= tier::witness("N_GDN", s.n_gdn(), REAL_N_GDN);
+        ok &= tier::witness("NODES_DECODE", s.nodes_decode(), REAL_NODES_DECODE);
+        ok &= tier::witness("MEMOPS", s.memops(), REAL_MEMOPS);
+        ok &= tier::witness("NODES_VERIFY", s.nodes_verify(), REAL_NODES_VERIFY);
+        ok &= tier::witness("NODES_SLOT", s.nodes_slot(), REAL_NODES_SLOT);
+        ok &= tier::witness("IMAGE_TOKEN", s.image_token.unwrap_or(0), REAL_IMAGE_TOKEN);
+        ok &= tier::witness(
             "plan levers' card budget",
             cfg().plan_levers.card_budget_bytes,
             PlanLevers::default().card_budget_bytes,
         );
-        ok &= q38::witness_card(&card()?);
+        ok &= tier::witness_card(&card()?);
         Ok(ok)
     }
 
@@ -549,13 +549,13 @@ mod gate {
     /// node counts under them.
     fn card_witnesses(card_layers: usize) -> bool {
         let s = shape();
-        let mut ok = q38::witness("CARD_LAYERS", card_layers, REAL_CARD_LAYERS);
-        ok &= q38::witness(
+        let mut ok = tier::witness("CARD_LAYERS", card_layers, REAL_CARD_LAYERS);
+        ok &= tier::witness(
             "NODES_DECODE_CARD",
             s.nodes_decode_card(card_layers),
             REAL_NODES_DECODE_CARD,
         );
-        ok &= q38::witness(
+        ok &= tier::witness(
             "NODES_VERIFY_CARD",
             s.nodes_verify_card(card_layers),
             REAL_NODES_VERIFY_CARD,
@@ -649,7 +649,7 @@ mod gate {
         clause: &str,
         top: u32,
     ) -> Result<(bool, String), GateError> {
-        if !q38::clause(&format!("{clause} against ik's"), Tag::Oracle)? {
+        if !tier::run_clause(&format!("{clause} against ik's"), Tag::Oracle)? {
             return Ok((true, "not compared in this tier".to_string()));
         }
         let ik_top = argmax(&ik_last(man, vocab)?);
@@ -658,9 +658,9 @@ mod gate {
 
     /// The card a plan is made on: the real tier's the gate runner's
     /// (the 3090's bytes on the card in view), the fixture tier's `a`
-    /// (`q38_fixture::card`).
+    /// (`tier::card`).
     fn card() -> Result<model::placement::workstation::CardSpec, GateError> {
-        q38::card(crate::gate_card::card)
+        tier::card(crate::gate_card::card)
     }
 
     /// The model placed on the gate card by its plan, the routed experts
@@ -1053,7 +1053,7 @@ mod gate {
             &inconsistent[..inconsistent.len().min(8)],
             verdict(inconsistent.is_empty())
         );
-        if !q38::clause(
+        if !tier::run_clause(
             "(c) free: each layer's output, each route and the last argmax against ik's",
             Tag::Oracle,
         )? {
@@ -1151,7 +1151,7 @@ mod gate {
         path: Prompt38,
         (band, feeds): (Option<(&[u32], usize)>, bool),
     ) -> Result<Option<StepSet<'a>>, GateError> {
-        let vs_ik = q38::clause(
+        let vs_ik = tier::run_clause(
             &format!(
                 "(t) step set {name} fed by {}: argmax, layer outputs and logits against ik's",
                 path.name()
@@ -3313,7 +3313,7 @@ mod gate {
             verdict(ok)
         );
         let held = |on: &dyn Fn(u64) -> bool| plan.n_l.iter().filter(|&&n| on(n)).count();
-        let fixture = q38::tier()? == bloomery_gpu_gates::tier::Tier::Fixture;
+        let fixture = Tier::from_env()? == bloomery_gpu_gates::tier::Tier::Fixture;
         let want_each = (cfg().n_expert / 2) as u64;
         let contract = !fixture || plan.n_l.iter().all(|&n| n == want_each);
         println!(
@@ -4160,34 +4160,24 @@ mod gate {
         steps) is replaced by D1K's passes = steps and windows over the selector region's \
         boundaries from a shared GEMM prefix; D3K's ik compare is the GEMM-fed one.";
 
-    /// A self-consistency clause: it runs in both tiers, so a tier that
-    /// deferred it would be refused by name here, not skipped.
-    fn sc(name: &str) -> Result<(), GateError> {
-        if q38::clause(name, Tag::SelfConsistency)? {
-            Ok(())
-        } else {
-            Err(format!("the self-consistency clause {name:?} was deferred").into())
-        }
-    }
-
     pub fn run() -> Result<(), GateError> {
         let mut ok = init()?;
         let mut m = open(Experts::Host)?;
-        sc("(s) structure: the header's layer kinds, store bytes and node counts")?;
+        tier::sc("(s) structure: the header's layer kinds, store bytes and node counts")?;
         ok &= structure(&mut m)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
-        sc("(h) the head of m rows: finite rows, NaN faults")?;
+        tier::sc("(h) the head of m rows: finite rows, NaN faults")?;
         ok &= head_rows(&mut m, &toks)?;
-        sc("(p) one program: graph = eager = pass, reset clears")?;
+        tier::sc("(p) one program: graph = eager = pass, reset clears")?;
         let (paths_ok, eager) = paths(&mut m, &toks)?;
         ok &= paths_ok;
         let vocab = m.body("run")?.vocab();
-        sc("(c) free: every route tap the top ten of its own logits")?;
+        tier::sc("(c) free: every route tap the top ten of its own logits")?;
         let (free_ok, firsts) = free(&man, &eager, vocab)?;
         ok &= free_ok;
-        sc("(g) the ubatch walk on the batch set: taps, flips, forced arm, auto")?;
+        tier::sc("(g) the ubatch walk on the batch set: taps, flips, forced arm, auto")?;
         ok &= gemm_batch(&mut m, &man, &toks, &eager)?;
         let last = *firsts.last().ok_or("no positions")?;
         let mut ties = 0usize;
@@ -4198,33 +4188,33 @@ mod gate {
         let (d1k_ok, d1k) = step_set(&mut m, D1K, Prompt38::Step, (None, true), &mut ties)?;
         ok &= d1k_ok;
         println!("step sets: {ties} named tie(s)");
-        sc("(q1) D1K's prefill by passes = by steps: the dense region")?;
+        tier::sc("(q1) D1K's prefill by passes = by steps: the dense region")?;
         ok &= pass_selects(&mut m, D1K, &d1k)?;
         drop(d1k);
         println!("{MOVED_D3K}");
-        sc(MOVED_D3K)?;
+        tier::sc(MOVED_D3K)?;
         ok &= pass_windows(&mut m)?;
-        sc("(g) D3K by ubatches: the cut, the walk's split, the timed record")?;
+        tier::sc("(g) D3K by ubatches: the cut, the walk's split, the timed record")?;
         ok &= gemm_d3k(&mut m, &mut ties)?;
-        sc("(g) the map refusals and auto")?;
+        tier::sc("(g) the map refusals and auto")?;
         ok &= map_refusals(&mut m, &toks)?;
         ok &= gemm_auto();
         println!("step sets and the ubatch's D3K step: {ties} named tie(s)");
-        sc("(v) the verify: rows = steps, commits, structure, refusals")?;
+        tier::sc("(v) the verify: rows = steps, commits, structure, refusals")?;
         ok &= verify_clause(&mut m, &toks)?;
-        sc("(o) one owner of the position")?;
+        tier::sc("(o) one owner of the position")?;
         ok &= position_owner(&mut m, &toks)?;
-        sc("(r) refusals")?;
+        tier::sc("(r) refusals")?;
         ok &= refusals(&mut m)?;
         drop(m);
-        sc("(z) the PLE table on the NVMe tier = on the host")?;
+        tier::sc("(z) the PLE table on the NVMe tier = on the host")?;
         ok &= ple_nvme(&toks)?;
-        sc("(y) resident slots: the plan's bytes and the harness's contracts")?;
+        tier::sc("(y) resident slots: the plan's bytes and the harness's contracts")?;
         ok &= slots_plan(Experts::Host)?;
         ok &= slots_two(Experts::Host)?;
-        sc("(k) the card leg: structure, places rule, vs the host plan, rows, ubatch walk")?;
+        tier::sc("(k) the card leg: structure, places rule, vs the host plan, rows, ubatch walk")?;
         ok &= card_leg(&toks, &eager, &man)?;
-        let (ran, deferred) = q38::tally();
+        let (ran, deferred) = tier::tally();
         println!(
             "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
         );

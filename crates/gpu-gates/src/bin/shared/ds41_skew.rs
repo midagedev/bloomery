@@ -173,7 +173,7 @@ struct Ids {
 fn ids_of(split: &Split, hp: &Hparams, name: &'static str) -> Result<Ids, GateError> {
     let (at, over) = ds41_tier::decode_set(name)?;
     if Tier::from_env()? == Tier::Fixture {
-        let ids = ds41_tier::prose_ids(at as usize + 1)?;
+        let ids = bloomery_gpu_gates::prose_ids("engram", at as usize + 1)?;
         return Ok(Ids {
             before: ids[..at as usize].to_vec(),
             token: ids[at as usize],

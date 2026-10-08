@@ -155,7 +155,9 @@ mod gate {
     use bloomery_gpu_deepseek41::body::Seam;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
-    use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{
+        GREEDY_MARGIN, GateError, checks_failed, data_dir, prose_ids, verdict,
+    };
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HostCfg, R8,
     };
@@ -505,24 +507,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("engram").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
-    }
-
     /// The candidates arm (module doc): the prompt through the batch, then
     /// eager steps whose seams the candidate rule checks.
     fn candidates_arm(
@@ -534,7 +518,7 @@ mod gate {
             .candidates
             .ok_or("candidates: the file carries no candidate mask")?;
         let (blocks, block) = (mask.topk_blocks, mask.block_size);
-        let ids = prose(CAND_PROMPT)?;
+        let ids = prose_ids("engram", CAND_PROMPT)?;
         m.reset()?;
         let mut next = body::prefill(m, &ids)?;
         let top_k = m.body("candidates")?.indexer_top_k();

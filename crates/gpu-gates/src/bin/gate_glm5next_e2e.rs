@@ -647,7 +647,7 @@ mod gate {
         };
         let args = OpenArgs {
             place: "gate",
-            machine: tier::plan_gate,
+            machine: crate::gate_card::plan_gate,
             ctx,
             mode: StepMode::Graph,
             cfg,
@@ -1863,7 +1863,7 @@ mod gate {
 
         fn open(&self, slots: usize) -> Result<Glm5nextModel, GateError> {
             let file = glm5next_tier::open()?;
-            let machine = tier::plan_gate(self.inputs.model.layers);
+            let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
             let np = self.plan(&machine, slots)?;
             let t = Instant::now();
             let mut m = Body::open_placed_nextn_slots(
@@ -1983,7 +1983,7 @@ mod gate {
         let named = matches!(&past, Err(e) if e.to_string().contains(&format!(
             "of a load whose plan counted {SLOTS} resident sequences"
         )));
-        let machine = tier::plan_gate(a.inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
         let counted = |n: usize| -> Result<u64, GateError> {
             let np = a.plan(&machine, n)?;
             Ok(np.plan.cards[0].kv_bytes + np.nextn.cards[0].kv_bytes)
@@ -2598,7 +2598,7 @@ mod gate {
         slots: usize,
     ) -> Result<Glm5nextModel, GateError> {
         let file = glm5next_tier::open()?;
-        let machine = tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let plan = inputs.plan_slots(&machine, u64::try_from(SLOT_CTX)?, &place, lanes, slots)?;
         let term = plan.machine.cards[0].scratch_bytes;
@@ -4003,7 +4003,8 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&tier::acts_on(&[CARD_BUDGET])?)?;
-        glm5next_tier::init(crate::gate_card::init)?;
+        crate::gate_card::init()?;
+        glm5next_tier::init_file()?;
         glm5next_tier::dense_ctx(CTX_PP)?;
         let only = only()?;
         let sets = step_sets(only)?;

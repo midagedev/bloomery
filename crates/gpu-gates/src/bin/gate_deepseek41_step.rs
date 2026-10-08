@@ -1,6 +1,6 @@
 //! GPU gate for the assembled V4.1 decode step (`bloomery_gpu_deepseek41::body`,
 //! B5 phases 1 and 2: the indexer's selection wired in), on the gate placement
-//! (`crate::ds41_tier::plan_gate`: the 3090's bytes run every layer and the head in the real tier,
+//! (`crate::gate_card::plan_gate`: the 3090's bytes run every layer and the head in the real tier,
 //! the largest visible card under the header's card budget in the fixture tier; the host
 //! tier the experts the plan leaves off the card). The model is opened through
 //! the engine's own entry (`body::open`); what each mode pins is the chain's
@@ -206,7 +206,7 @@ mod gate_card;
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the card, the path, the clause tags and the decode-step table; the triangle's facts serve the prefill gate"
+    reason = "the gate reads the path, the clause tags and the decode-step table; the triangle's facts serve the prefill gate"
 )]
 mod ds41_tier;
 
@@ -377,7 +377,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::ds41_tier::init()?;
+        crate::gate_card::init()?;
         let args = parse_args()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         // The route trace's clauses feed their prompts through the session's
@@ -402,7 +402,7 @@ mod gate {
             println!("gate_deepseek41_step: {}", tier::tally_line());
             return r;
         }
-        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let planned = &plan.cards[0];
         println!(
@@ -414,7 +414,7 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let mut m = body::open(
             file,
-            crate::ds41_tier::plan_gate,
+            crate::gate_card::plan_gate,
             usize::try_from(CTX_MAX)?,
             &cfg,
         )?;
@@ -540,7 +540,7 @@ mod gate {
             let ctx = usize::try_from(CTX_MAX)?;
             Ok(body::open_slots(
                 file,
-                crate::ds41_tier::plan_gate,
+                crate::gate_card::plan_gate,
                 ctx,
                 self.cfg,
                 slots,
@@ -726,7 +726,7 @@ mod gate {
         cfg: &body::OpenCfg,
     ) -> Result<bool, GateError> {
         let n = slots_gate::STREAMS;
-        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let one = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let two = inputs.plan_with_slots(
             &machine,
@@ -2615,7 +2615,7 @@ mod gate {
         if fixture {
             // The sets' injected state is the ik dump's: the fixture tier steps the corpus ids to the
             // same positions and replays the next step from the engine's own saved state.
-            let ids = crate::ds41_tier::prose_ids(REPLAY_IDS)?;
+            let ids = bloomery_gpu_gates::prose_ids("engram", REPLAY_IDS)?;
             for (name, at, over) in crate::ds41_tier::DECODE_SETS {
                 let top_k = over.unwrap_or(hp.indexer.top_k);
                 all_same &= replay_from_steps(m, head, hp, &ids, (name, at as usize, top_k))?;

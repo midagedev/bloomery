@@ -1,6 +1,6 @@
 //! GPU gate for the V4.1 expert tier (`bloomery_gpu::host::tier`), on one
 //! card: the loopback. The stage and the tier both run on the gate card
-//! (`crate::ds41_tier::plan_gate`: the 3090's bytes in the real tier, the largest visible card
+//! (`crate::gate_card::plan_gate`: the 3090's bytes in the real tier, the largest visible card
 //! under the header's card budget in the fixture tier), two `Gpu`s on it. Each routed layer's card
 //! list is its id prefix `[0, n_l)`. The tiered plan moves the last `k3` ([`tier_depth`]) of
 //! them, ids `n_l - k3 .. n_l`, from card 0 to device 1 (the tier) through
@@ -107,7 +107,7 @@ mod gate_card;
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
-    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+    reason = "the gate reads the path and the clause tags; the triangle's facts serve the prefill gate"
 )]
 mod ds41_tier;
 
@@ -125,7 +125,7 @@ mod gate {
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir};
+    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
     };
@@ -228,24 +228,6 @@ mod gate {
             return Err(USAGE.into());
         }
         Ok(a)
-    }
-
-    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("engram").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
     }
 
     /// The gate plan's machine `machine` with the (b′) tier card beside its
@@ -662,7 +644,7 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::ds41_tier::init()?;
+        crate::gate_card::init()?;
         let args = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         // The batch clauses run the prompt call, so the tiered load makes its
@@ -673,7 +655,7 @@ mod gate {
         // The draft is read for its header only (B8), so the plan reserves nothing for it.
         cfg.place = bloomery_gpu_gates::tier::plan_levers(&split()?, &levers, 0)?;
         let inputs = PlanInputs::read(&split()?)?;
-        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
         for (on, name) in [
             (
@@ -777,7 +759,7 @@ mod gate {
             }
         }
 
-        let prompt = prose(PROMPT)?;
+        let prompt = prose_ids("engram", PROMPT)?;
         let long = if args.batch
             || args.batch2
             || args.bfault
@@ -785,7 +767,7 @@ mod gate {
             || args.bfirst
             || args.bfeat
         {
-            prose(BATCH_P2)?
+            prose_ids("engram", BATCH_P2)?
         } else {
             Vec::new()
         };

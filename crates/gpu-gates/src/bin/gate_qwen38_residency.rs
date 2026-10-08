@@ -140,7 +140,9 @@ mod gate {
     use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::{Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{
+        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids, verdict,
+    };
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
@@ -176,43 +178,6 @@ mod gate {
         host_us_per_col: 1000.0,
         ..XSTREAM_COSTS
     };
-
-    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("engram").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
-    }
-
-    /// The first `n` ids of `$BLOOMERY_DATA/qwen4exp/corpus-prose.ids`, the
-    /// Qwen3.8 tokenizer's prose corpus (the runner's `prose:<P>` ids).
-    fn prose38(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("qwen4exp").join("corpus-prose.ids");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let ids = text
-            .split_whitespace()
-            .take(n)
-            .map(str::parse::<u32>)
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.len() < n {
-            return Err(
-                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
-            );
-        }
-        Ok(ids)
-    }
 
     /// The machine's card plan of `inputs` on `card`.
     fn plan_of<'m>(
@@ -530,7 +495,7 @@ mod gate {
     /// `split`: the expert stream at the gate's costs, off once and split
     /// twice, from a clear each.
     fn split_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
-        let ids = prose38(SPLIT_PROMPT)?;
+        let ids = prose_ids("qwen4exp", SPLIT_PROMPT)?;
         let off = stream_run(s, &ids, XMode::Off)?;
         // `split`'s first setting starts the stream; the gate's costs then.
         set_stream(s, XMode::Split)?;
@@ -631,7 +596,7 @@ mod gate {
 
     /// `stream`: the prompt call streaming against not, from a clear each.
     fn stream_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
-        let ids = prose38(STREAM_PROMPT)?;
+        let ids = prose_ids("qwen4exp", STREAM_PROMPT)?;
         let off = stream_run(s, &ids, XMode::Off)?;
         let on = stream_run(s, &ids, XMode::Admit)?;
         if let Some(r) = &on.end {
@@ -642,7 +607,7 @@ mod gate {
         let slots_ok = on.first_slots < off.first_slots;
         let (dlogit, logits_ok, parted, ids_ok) = agree(&on, &off);
         // A prompt too short for the floor opens no call.
-        let short_ids = prose38(Body38::STREAM_FLOOR as usize - 1)?;
+        let short_ids = prose_ids("qwen4exp", Body38::STREAM_FLOOR as usize - 1)?;
         s.clear()?;
         take_passes(s)?;
         set_stream(s, XMode::Admit)?;
@@ -869,7 +834,7 @@ mod gate {
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());
         let seeds = seeds(&s)?;
 
-        let ids = prose(PROMPT)?;
+        let ids = prose_ids("engram", PROMPT)?;
         let step =
             crate::residency_clauses::rule_after(&mut s, &ids, rule_of, take_passes, |s, t| {
                 s.step(t, Want::Argmax)?;

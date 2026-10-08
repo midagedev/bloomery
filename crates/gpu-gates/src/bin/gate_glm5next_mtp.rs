@@ -1427,7 +1427,7 @@ mod gate {
         windows: [&[u32]; 2],
     ) -> Result<bool, GateError> {
         let file = glm5next_tier::open()?;
-        let machine = tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let np =
             inputs.plan_nextn_slots(&machine, u64::try_from(Z_CTX)?, &place, nextn, Z_SLOTS)?;
@@ -1547,7 +1547,8 @@ mod gate {
 
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&tier::acts_on(&[])?)?;
-        glm5next_tier::init(crate::gate_card::init)?;
+        crate::gate_card::init()?;
+        glm5next_tier::init_file()?;
         // The prompt is the prose corpus's first ids in both tiers (the set's own, held equal to
         // them, in the real tier); the set itself is read by the Oracle clauses alone.
         let prompt = glm5next_tier::mtp_prompt()?;
@@ -1575,7 +1576,7 @@ mod gate {
         let file = open()?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
-        let machine = tier::plan_gate(inputs.model.layers);
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let place = glm5next_tier::plan_levers(&levers, 0)?;
         let ctx = u64::try_from(CTX)?;
         let base = inputs.plan(&machine, ctx, &place)?;
