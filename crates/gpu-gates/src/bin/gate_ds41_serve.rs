@@ -1715,7 +1715,10 @@ mod gate {
         let file = Gguf::open(&set.mmproj)?;
         let hp = vision::arch::deepseek41v::Hparams::read(&file)?;
         let img = vision::Rgb8::from_png(&png)?;
-        let span_len = vision::grid::plan_image_grid(img.width, img.height, &hp.grid()).n_tokens();
+        let plan =
+            vision::arch::deepseek41v::grid::plan_image_grid(img.width, img.height, &hp.grid());
+        let span_len =
+            vision::arch::deepseek41v::grid::num_image_tokens(plan.n_llm_h, plan.n_llm_w);
         Ok(Scene {
             mmproj: set.mmproj,
             bytes: CardBytes::of(&hp),

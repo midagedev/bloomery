@@ -4,8 +4,9 @@
 //! its host rule.
 //!
 //! Per image, in chain order (so the first failing line names the earliest op):
-//! 1. The patches of our preprocessing (`vision::preprocess` on the committed PNG) equal the
-//!    set's bit for bit — the V1 gate's claim, re-read here because every later tap starts there.
+//! 1. The patches of our preprocessing (`vision::arch::deepseek41v::preprocess` on the committed
+//!    PNG) equal the set's bit for bit — the V1 gate's claim, re-read here because every later tap
+//!    starts there.
 //! 2. Every tap the set holds for the image — `embed`, the full-tap image's block-0 ops, the
 //!    blocks, `vit`, the aligner's hidden rows and its output — against the reference within the
 //!    tap's pinned band: `max|Δ| / max|ref|`, `rms(Δ) / rms(ref)` and the fraction of values that
@@ -64,8 +65,8 @@ mod gate {
     use gguf::Gguf;
     use refset::arch::deepseek41v::{VISION, VISION_SET};
     use refset::vision::{Image, VisionSet};
-    use vision::arch::deepseek41v::names;
-    use vision::{Patches, Rgb8, preprocess};
+    use vision::arch::deepseek41v::{names, preprocess};
+    use vision::{Patches, Rgb8};
 
     const NAME: &str = "gate_vision_encoder";
     /// The image whose every block and block-0 ops the set holds.

@@ -2449,7 +2449,7 @@ mod tests {
                 prepared: Arc::new(vision::Prepared {
                     span_len: 2,
                     patches: vision::Patches {
-                        plan: vision::grid::GridPlan {
+                        plan: vision::GridPlan {
                             n_llm_h: 1,
                             n_llm_w: 1,
                             best_h: 14,

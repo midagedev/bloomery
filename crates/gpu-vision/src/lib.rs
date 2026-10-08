@@ -1,6 +1,7 @@
 //! bloomery-gpu-vision — the image encoder on the card: DeepSeek-V4.1-Flash's ViT (32 blocks, 2D
 //! RoPE, full bidirectional attention) and its aligner, from the bf16 patch tensor of
-//! [`vision::preprocess`] to the bf16 rows the text model reads in place of an image's tokens.
+//! [`vision::arch::deepseek41v::preprocess`] to the bf16 rows the text model reads in place of an
+//! image's tokens.
 //!
 //! The device code lives in its own crate for the reason `bloomery-gpu-deepseek41` does: a
 //! compiler defect in one of these kernels breaks the builds that depend on this crate and no
