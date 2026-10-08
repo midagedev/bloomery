@@ -79,6 +79,9 @@ use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 /// own steps.
 #[path = "anthropic.rs"]
 mod anthropic;
+#[cfg(test)]
+#[path = "testserve.rs"]
+mod testserve;
 
 /// What the server says about itself and how it samples.
 pub struct ServerConfig {
@@ -1099,10 +1102,11 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
 ///
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
 /// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
-/// non-empty `grammar`, `logprobs: true`, `top_logprobs > 0`, `n > 1`,
-/// `tool_choice` other than `"none"` or `"auto"` (nothing forces a call without a
-/// grammar), and a non-empty `logit_bias`. `null` counts as absent. Other unknown
-/// fields are ignored.
+/// non-empty `grammar`, `logprobs` other than `false` (a bool, or OpenAI's text
+/// completion count), `top_logprobs > 0`, `n > 1`, `tool_choice` other than
+/// `"none"` or `"auto"` (nothing forces a call without a grammar), and a
+/// non-empty `logit_bias`. `null` counts as absent. Other unknown fields are
+/// ignored.
 ///
 /// The penalties take llama-server's names and defaults (`repeat_penalty` 1,
 /// `frequency_penalty` 0, `presence_penalty` 0, `repeat_last_n` 64) and
@@ -1125,7 +1129,12 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             "grammar",
             set("grammar").is_some_and(|v| v.as_str() != Some("")),
         ),
-        ("logprobs", get_b(o, "logprobs") == Some(true)),
+        // A bool on the chat path, a count on OpenAI's text completion path:
+        // any value but `false` asks for probabilities.
+        (
+            "logprobs",
+            set("logprobs").is_some_and(|v| v.as_bool() != Some(false)),
+        ),
         (
             "top_logprobs",
             get_i(o, "top_logprobs")?.is_some_and(|n| n > 0),
@@ -2434,28 +2443,51 @@ fn engine_error(e: &dyn fmt::Display) -> ApiError {
     }
 }
 
-fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let parsed = body(req).and_then(|b| gen_params(state, &b).map(|p| (b, p)));
-    let (b, mut p) = match parsed {
-        Ok(x) => x,
-        Err(e) => return send_error(w, req, &e),
-    };
-    let ids = match completion_prompt(state, b.get("prompt")) {
-        Ok(ids) => ids,
-        Err(e) => return send_error(w, req, &e),
-    };
+/// What a completion request runs, built by [`completion_plan`].
+struct CompletionPlan {
+    p: GenParams,
+    /// The prompt as the engine is fed it.
+    input: Prompt,
+    /// The request's `prompt`, as the answer echoes it.
+    prompt: Value,
+    /// `return_tokens`: the answer carries the generated ids.
+    return_tokens: bool,
+}
+
+/// The completion path's steps on a completion body: the sampling fields,
+/// the prompt's ids ([`completion_prompt`]) and the think-span budget, whose
+/// span check reads the prompt's text (a string prompt is its own, an id
+/// array's its decode). Every route that runs a completion builds its
+/// generation here.
+fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPlan, ApiError> {
+    let mut p = gen_params(state, b)?;
+    let ids = completion_prompt(state, b.get("prompt"))?;
     if p.reasoning_budget.is_some() {
-        // The budget's span check reads the prompt's text: a string prompt is
-        // its own, an id array's its decode.
         let text = match b.get("prompt") {
             Some(Value::String(s)) => s.clone(),
             _ => state.tok.decode(&ids),
         };
         gate_reasoning_budget(&mut p, &text);
     }
-    let return_tokens = get_b(&b, "return_tokens").unwrap_or(false);
-    let prompt = b.get("prompt").cloned().unwrap_or(Value::Null);
-    let input = Prompt::from(ids);
+    Ok(CompletionPlan {
+        p,
+        input: Prompt::from(ids),
+        prompt: b.get("prompt").cloned().unwrap_or(Value::Null),
+        return_tokens: get_b(b, "return_tokens").unwrap_or(false),
+    })
+}
+
+fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    let plan = match body(req).and_then(|b| completion_plan(state, &b)) {
+        Ok(x) => x,
+        Err(e) => return send_error(w, req, &e),
+    };
+    let CompletionPlan {
+        p,
+        input,
+        prompt,
+        return_tokens,
+    } = plan;
     if !p.stream {
         return match run_gen(state, &input, prompt.clone(), &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
@@ -2673,19 +2705,66 @@ fn usage(o: &Outcome) -> Value {
     })
 }
 
+/// What a chat request runs, built by [`chat_plan`].
+struct ChatPlan {
+    p: GenParams,
+    /// The prompt as the engine is fed it.
+    input: Prompt,
+    /// The rendered prompt's text, as the answer's `prompt` echoes it.
+    prompt: Value,
+    /// The parser the output goes through.
+    parser: ChatParser,
+}
+
+/// The prompt a chat body renders, by the chat template, and what the engine
+/// is fed: its ids, each image expanded to its span ([`chat_prompt`]). Every
+/// route that counts a chat request's input tokens counts these ids.
+fn chat_input(state: &State, b: &Map<String, Value>) -> Result<(String, Prompt), ApiError> {
+    let rendered = render_chat(state, b)?;
+    let prompt = chat_prompt(state, &rendered)?;
+    Ok((rendered.text, prompt))
+}
+
+/// The chat path's steps on a chat body, in one order, so the first error is
+/// the same whichever API sent the request: the sampling fields, the
+/// reasoning format (`format`, the request's `reasoning_format` on the chat
+/// path; `None` takes the default), the prompt ([`chat_input`]), the
+/// tool-call scan and the think-span budget. The chat path and every API
+/// converted onto it build their generation here.
+fn chat_plan(
+    state: &State,
+    b: &Map<String, Value>,
+    format: Option<&Value>,
+) -> Result<ChatPlan, ApiError> {
+    let mut p = gen_params(state, b)?;
+    let format = ReasoningFormat::from_request(format).map_err(invalid)?;
+    let (text, input) = chat_input(state, b)?;
+    let tools = tool_scan(state, b)?;
+    gate_reasoning_budget(&mut p, &text);
+    let parser = ChatParser::with_tools(&text, format, tools);
+    Ok(ChatPlan {
+        p,
+        input,
+        prompt: Value::String(text),
+        parser,
+    })
+}
+
 fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|b| {
-        let p = gen_params(state, &b)?;
-        let format = ReasoningFormat::from_request(b.get("reasoning_format")).map_err(invalid)?;
-        let rendered = render_chat(state, &b)?;
-        let tools = tool_scan(state, &b)?;
-        Ok((b, p, format, rendered, tools))
+        let plan = chat_plan(state, &b, b.get("reasoning_format"))?;
+        Ok((b, plan))
     });
-    let (b, mut p, format, rendered, tools) = match parsed {
+    let (b, plan) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
-    gate_reasoning_budget(&mut p, &rendered.text);
+    let ChatPlan {
+        p,
+        input,
+        prompt,
+        mut parser,
+    } = plan;
     let ids_meta = ChatIds {
         id: format!("chatcmpl-{}", state.random_id()),
         created: unix_now(),
@@ -2694,12 +2773,6 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .and_then(Value::as_str)
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
-    let input = match chat_prompt(state, &rendered) {
-        Ok(x) => x,
-        Err(e) => return send_error(w, req, &e),
-    };
-    let mut parser = ChatParser::with_tools(&rendered.text, format, tools);
-    let prompt = Value::String(rendered.text);
     if !p.stream {
         return match run_gen(state, &input, prompt, &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
@@ -2845,10 +2918,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps,
-        FATAL_LINGER, Park, ServeError, Server, ServerConfig, SlotConfig, SlotQueue, Stop,
-        after_accept_error, carries_media, check_slots, content_text, engine_object, id_half,
-        shutdown_allowed,
+        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps, Park,
+        ServeError, SlotConfig, SlotQueue, Stop, after_accept_error, carries_media, check_slots,
+        content_text, engine_object, id_half, shutdown_allowed,
     };
     use crate::engine::{DeviceProps, PlacementProps};
     use serde_json::{Value, json};
@@ -3076,23 +3148,7 @@ mod tests {
     /// `tests/common`): the server closes after its answer, so the body is
     /// whatever arrives before that.
     fn roundtrip(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
-        use std::io::{Read, Write};
-        let mut s = std::net::TcpStream::connect(addr).expect("connect");
-        let req = format!(
-            "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        s.write_all(req.as_bytes()).expect("write");
-        let mut raw = String::new();
-        s.read_to_string(&mut raw).expect("read");
-        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
-        let status = head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .expect("a status line");
-        (status, body.to_owned())
+        super::testserve::roundtrip(addr, method, path, &[], body)
     }
 
     /// `POST /shutdown` over a real socket: the 200 with its body reaches the
@@ -3105,24 +3161,10 @@ mod tests {
     /// end, the engine's Drop, is the process exit's.
     #[test]
     fn posted_shutdown_stops_the_server() {
-        let config = ServerConfig {
-            model_alias: "mock".to_owned(),
-            model_path: "mock.gguf".to_owned(),
-            chat_template: concat!(
-                "{%- for message in messages %}",
-                "{{- '<' + message.role + '>\\n' + message.content }}",
-                "{%- endfor %}",
-                "{%- if add_generation_prompt %}{{- '<assistant>\\n' }}{%- endif %}",
-            )
-            .to_owned(),
-            sampler: None,
-            fatal_linger: FATAL_LINGER,
-            slot_save_path: None,
-        };
-        let server = Server::bind("127.0.0.1:0", Box::new(crate::MockEngine::new(64)), config)
-            .expect("bind");
-        let addr = server.local_addr().expect("addr");
-        let (state, ended) = server.start().expect("start");
+        let (addr, state, ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
 
         let (status, body) = roundtrip(addr, "POST", "/shutdown", "");
         assert_eq!(status, 200, "{body}");
@@ -3158,6 +3200,45 @@ mod tests {
             state.shared.wait_loop_end(Duration::from_secs(5)),
             "the engine thread leaves its loop once the stop reaches it"
         );
+    }
+
+    /// `logprobs` asks for probabilities as a bool on the chat path and as a
+    /// count on OpenAI's text completion path. Neither is served, so any value
+    /// but `false` is a 400 naming the field on both generation paths, the
+    /// count form too; `false` and `null` are absent.
+    #[test]
+    fn logprobs_in_either_form_is_refused_by_name() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let chat = |lp: &str| {
+            format!(
+                r#"{{"messages":[{{"role":"user","content":"hi"}}],"max_tokens":1,"logprobs":{lp}}}"#
+            )
+        };
+        let completion = |lp: &str| format!(r#"{{"prompt":"ab","max_tokens":1,"logprobs":{lp}}}"#);
+        for lp in ["true", "5", "0"] {
+            for (path, body) in [
+                ("/completion", completion(lp)),
+                ("/v1/chat/completions", chat(lp)),
+            ] {
+                let (status, text) = roundtrip(addr, "POST", path, &body);
+                assert_eq!(status, 400, "{path} logprobs {lp}: {text}");
+                assert!(
+                    text.contains("logprobs"),
+                    "{path} logprobs {lp}: the 400 names the field: {text}"
+                );
+            }
+        }
+        for (path, body) in [
+            ("/completion", completion("false")),
+            ("/completion", completion("null")),
+            ("/v1/chat/completions", chat("false")),
+        ] {
+            let (status, text) = roundtrip(addr, "POST", path, &body);
+            assert_eq!(status, 200, "{path}: {text}");
+        }
     }
 
     /// The media mock whose two slots take it in turns, parked as `park`.
