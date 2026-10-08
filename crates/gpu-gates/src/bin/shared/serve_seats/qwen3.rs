@@ -158,7 +158,7 @@ const NAME: &str = "bloomery-serve-qwen3";
 
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--place W] [--cache-type-k f16|q8_0] \
-                     [--parallel N] [--queue-depth Q]";
+                     [--parallel N] [--queue-depth Q] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
@@ -312,6 +312,9 @@ struct Args {
     /// the default 2 ([`model::placement::ctx::slots_of`]).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
+    /// `--api-key`/`--api-key-file`: the keys every request is checked
+    /// against ([`serve::flag::ApiKeys`]).
+    api_keys: serve::flag::ApiKeys,
 }
 
 /// The K/V planes' format this run loads: `--cache-type-k`'s word when given
@@ -343,6 +346,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         // the one sequence.
         parallel: None,
         queue_depth: None,
+        api_keys: serve::flag::ApiKeys::default(),
     };
     let mut it = args.iter().map(String::as_str);
     while let Some(flag) = it.next() {
@@ -384,6 +388,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 Ok(q) => a.queue_depth = Some(q),
                 _ => return Err(format!("{flag} takes a whole number, not {v:?}").into()),
             },
+            f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             "--park-ram" => {
                 return Err(
                     "--park-ram names a budget of parked states; the qwen3 seat parks none — \
@@ -1018,6 +1023,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
         slot_save_path: None,
+        api_keys: a.api_keys,
     };
     // The seat's own slots are the engine's: the seat made them at its open,
     // and the server steps them together.

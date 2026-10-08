@@ -46,6 +46,7 @@ fn config(dir: Option<&Path>) -> ServerConfig {
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path: dir.map(Path::to_path_buf),
+        api_keys: serve::flag::ApiKeys::default(),
     }
 }
 

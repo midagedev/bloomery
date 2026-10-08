@@ -63,6 +63,7 @@ use crate::engine::{
     DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
     SamplingParams, StateError, Tokenizer,
 };
+use crate::flag::ApiKeys;
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
@@ -100,6 +101,9 @@ pub struct ServerConfig {
     /// (`--slot-save-path`); it must exist. `None` answers every slot action
     /// with 501.
     pub slot_save_path: Option<PathBuf>,
+    /// The API keys the request check asks for (`--api-key`,
+    /// `--api-key-file`); an empty set checks nothing.
+    pub api_keys: ApiKeys,
 }
 
 /// Connections served at once, each on a thread of its own. Past the requests
@@ -327,6 +331,7 @@ impl Server {
             engine_props,
             media,
             slot_save_path: config.slot_save_path,
+            api_keys: config.api_keys,
             info,
             start_unix: unix_now(),
         };
@@ -435,6 +440,9 @@ struct State {
     media: Option<SharedMediaModel>,
     /// Where slot files live; `None` refuses slot actions.
     slot_save_path: Option<PathBuf>,
+    /// The API keys every request is checked against before it dispatches;
+    /// an empty set checks nothing.
+    api_keys: ApiKeys,
     info: ModelInfo,
     start_unix: u64,
 }
@@ -1006,8 +1014,50 @@ pub(crate) fn cors_preflight() -> [(&'static str, String); 2] {
     ]
 }
 
+/// The one stderr line a request the key check refuses writes: its method,
+/// path and peer, and never the key it sent.
+fn deny_line(method: &str, path: &str, peer: &str) -> String {
+    format!("{method} {path} from {peer}: refused, no valid API key")
+}
+
+/// The key check before either server's dispatch — this server's
+/// [`route`] and the decision server's own connection handler, the one call
+/// both make. A request that passes ([`ApiKeys::allows`]) is `Ok(false)`;
+/// one that does not is answered with llama-server's 401 (`Invalid API Key`,
+/// `authentication_error`) after the one [`deny_line`], and is `Ok(true)`:
+/// answered, and the connection may carry another request.
+pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    if keys.allows(
+        &req.method,
+        &req.path,
+        req.header("Authorization"),
+        req.header("X-Api-Key"),
+    ) {
+        return Ok(false);
+    }
+    let peer = w
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|e| format!("a peer that cannot be read: {e}"));
+    eprintln!("{}", deny_line(&req.method, &req.path, &peer));
+    send_error(
+        w,
+        req,
+        &ApiError {
+            retry_after: false,
+            code: 401,
+            kind: "authentication_error",
+            message: "Invalid API Key".to_owned(),
+        },
+    )?;
+    Ok(true)
+}
+
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
 fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    if key_denied(&state.api_keys, req, w)? {
+        return Ok(true);
+    }
     let r = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health" | "/v1/health") => return health(state, req, w),
         ("GET", "/v1/models" | "/models") => Ok(models(state)),
@@ -1413,10 +1463,29 @@ fn put<T: Into<Value>>(o: &mut Map<String, Value>, key: &str, v: Option<T>) {
     }
 }
 
+/// The process's argv as `/props`' `engine.args` gives it: verbatim but for
+/// the token after `--api-key` — the key itself, which no answer may carry —
+/// replaced by `<redacted>`. The seats take the two-token spelling (a flag,
+/// its value), so that is the one replaced; `--api-key-file`'s token names a
+/// file, not a key, and stays.
+fn argv_redacted(args: impl Iterator<Item = String>) -> Vec<String> {
+    let mut redact = false;
+    args.map(|a| {
+        let out = if redact {
+            "<redacted>".to_owned()
+        } else {
+            a.clone()
+        };
+        redact = a == "--api-key";
+        out
+    })
+    .collect()
+}
+
 /// `/props`' `engine` object in toktape's shape: the server's own `name`,
-/// `version` (with the engine's note), `args` (this process's argv, verbatim)
-/// and `server_pid`, and the model, placement, draft and verified context
-/// the engine reports.
+/// `version` (with the engine's note), `args` (this process's argv, verbatim
+/// but for the key [`argv_redacted`] holds back) and `server_pid`, and the
+/// model, placement, draft and verified context the engine reports.
 pub(crate) fn engine_object(p: &EngineProps) -> Value {
     let mut o = Map::new();
     o.insert("name".into(), json!("bloomery"));
@@ -1425,8 +1494,9 @@ pub(crate) fn engine_object(p: &EngineProps) -> Value {
         None => VERSION.to_owned(),
     };
     o.insert("version".into(), Value::String(version));
-    let args = std::env::args_os()
-        .map(|a| Value::String(a.to_string_lossy().into_owned()))
+    let args = argv_redacted(std::env::args_os().map(|a| a.to_string_lossy().into_owned()))
+        .into_iter()
+        .map(Value::String)
         .collect();
     o.insert("args".into(), Value::Array(args));
     put(&mut o, "model", p.model.as_ref().map(model_object));
@@ -2981,10 +3051,11 @@ mod tests {
 
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps, Park,
-        ServeError, SlotConfig, SlotQueue, Stop, after_accept_error, carries_media, check_slots,
-        content_text, engine_object, id_half, shutdown_allowed,
+        ServeError, SlotConfig, SlotQueue, Stop, after_accept_error, argv_redacted, carries_media,
+        check_slots, content_text, deny_line, engine_object, id_half, shutdown_allowed,
     };
     use crate::engine::{DeviceProps, PlacementProps};
+    use crate::flag::ApiKeys;
     use serde_json::{Value, json};
     use std::io;
     use std::net::SocketAddr;
@@ -3303,6 +3374,384 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------- API keys
+
+    /// The key every key test sets: known bytes, so a leak is a named string.
+    const KEY: &str = "sk-this-is-the-secret-key";
+    /// `KEY` as the `Authorization` header carries it; the assert pins the
+    /// two spellings together.
+    const BEARER: &str = "Bearer sk-this-is-the-secret-key";
+
+    fn auth(v: &'static str) -> [(&'static str, &'static str); 1] {
+        [("Authorization", v)]
+    }
+
+    fn xkey(v: &'static str) -> [(&'static str, &'static str); 1] {
+        [("X-Api-Key", v)]
+    }
+
+    /// The key check over a real socket, as llama-server's security tests
+    /// drive it: the public paths answer without a key; a generation request
+    /// without one, or with a wrong one — `Bearer`-prefixed or bare — is
+    /// llama-server's 401 (`Invalid API Key`, `authentication_error`, the
+    /// JSON content type); a valid key answers 200 from either header, with
+    /// or without the `Bearer ` prefix; `OPTIONS` passes with no key at all,
+    /// as llama-server's pre-routing handler answers it before the check.
+    #[test]
+    fn the_key_check_answers_llama_servers_401_and_lets_the_keyed_through() {
+        assert_eq!(BEARER, format!("Bearer {KEY}"));
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let (addr, _state, _ended) = super::testserve::spawn_keyed(keys);
+
+        for path in ["/health", "/v1/health"] {
+            let (status, _head, body) =
+                super::testserve::roundtrip_head(addr, "GET", path, &[], "");
+            assert_eq!(status, 200, "{path}: {body}");
+        }
+        let (status, head, _body) =
+            super::testserve::roundtrip_head(addr, "OPTIONS", "/completion", &[], "");
+        assert_eq!(status, 204, "OPTIONS passes with no key: {head}");
+
+        let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":4}"#;
+        let (status, head, body) =
+            super::testserve::roundtrip_head(addr, "POST", "/completion", &[], ask);
+        assert_eq!(status, 401, "no key: {body}");
+        assert!(
+            head.contains("Content-Type: application/json; charset=utf-8"),
+            "llama-server's content type: {head}"
+        );
+        let v: Value = serde_json::from_str(&body).expect("the 401's body is JSON");
+        assert_eq!(v["error"]["type"], "authentication_error");
+        assert_eq!(v["error"]["message"], "Invalid API Key");
+        assert_eq!(v["error"]["code"], 401);
+
+        for wrong in ["Bearer sk-wrong", "sk-wrong", ""] {
+            let (status, body) =
+                super::testserve::roundtrip(addr, "POST", "/completion", &auth(wrong), ask);
+            assert_eq!(status, 401, "Authorization {wrong:?}: {body}");
+        }
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/completion", &xkey("sk-wrong"), ask);
+        assert_eq!(status, 401, "X-Api-Key wrong: {body}");
+
+        for right in [BEARER, KEY] {
+            let (status, body) =
+                super::testserve::roundtrip(addr, "POST", "/completion", &auth(right), ask);
+            assert_eq!(status, 200, "Authorization {right:?}: {body}");
+        }
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/completion", &xkey(KEY), ask);
+        assert_eq!(status, 200, "X-Api-Key: {body}");
+        assert!(body.contains("content"), "the generation answered: {body}");
+    }
+
+    /// `POST /shutdown` needs the key even from a loopback peer: without one
+    /// it is the 401 and the server keeps serving; with one it is the 200
+    /// and the stop, as without keys.
+    #[test]
+    fn shutdown_needs_the_key_even_from_loopback() {
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let (addr, state, ended) = super::testserve::spawn_keyed(keys);
+
+        let (status, body) = super::testserve::roundtrip(addr, "POST", "/shutdown", &[], "");
+        assert_eq!(status, 401, "no key: {body}");
+        assert!(
+            ended.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the 401 stops nothing"
+        );
+
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/shutdown", &auth(BEARER), "");
+        assert_eq!(status, 200, "the keyed post: {body}");
+        match ended.recv_timeout(Duration::from_secs(5)) {
+            Ok(End::Shutdown(Stop::Posted(peer))) => {
+                assert!(peer.ip().is_loopback(), "the stop names its peer: {peer}")
+            }
+            Ok(_) => panic!("the end channel carried another end"),
+            Err(e) => panic!("the end channel carries no shutdown: {e}"),
+        }
+        assert!(
+            state.shared.wait_loop_end(Duration::from_secs(5)),
+            "the engine thread leaves its loop once the stop reaches it"
+        );
+    }
+
+    /// The Anthropic Messages route takes the key the way Claude Code sends
+    /// it: `x-api-key` on both `/v1/messages` and its `count_tokens`.
+    #[test]
+    fn the_anthropic_messages_route_takes_the_x_api_key_header() {
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let (addr, _state, _ended) = super::testserve::spawn_keyed(keys);
+        let messages = r#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#;
+        let counting = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/v1/messages", &[], messages);
+        assert_eq!(status, 401, "no key: {body}");
+        for (path, body_of) in [
+            ("/v1/messages", messages),
+            ("/v1/messages/count_tokens", counting),
+        ] {
+            let (status, text) =
+                super::testserve::roundtrip(addr, "POST", path, &xkey(KEY), body_of);
+            assert_eq!(status, 200, "{path} with x-api-key: {text}");
+        }
+    }
+
+    /// A key never reaches an answer: with a known key set, a 401 (its head
+    /// and body), `/props`, `/slots`, `/metrics`, `/health` and a 400 error
+    /// body carry none of the key's bytes, and the one stderr line a
+    /// refusal writes (composed by [`deny_line`], pinned below) names the
+    /// method, path and peer only.
+    #[test]
+    fn a_key_never_reaches_an_answer() {
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let (addr, _state, _ended) = super::testserve::spawn_keyed(keys);
+
+        let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":4}"#;
+        let (status, head, body) =
+            super::testserve::roundtrip_head(addr, "POST", "/completion", &[], ask);
+        assert_eq!(status, 401, "{body}");
+        for text in [&head, &body] {
+            assert!(!text.contains(KEY), "the 401 carries no key: {text}");
+        }
+        for path in ["/props", "/slots", "/metrics", "/health"] {
+            let (status, _head, body) =
+                super::testserve::roundtrip_head(addr, "GET", path, &auth(BEARER), "");
+            assert_eq!(status, 200, "{path}: {body}");
+            assert!(!body.contains(KEY), "{path} carries no key: {body}");
+        }
+        let (status, _head, body) = super::testserve::roundtrip_head(
+            addr,
+            "POST",
+            "/tokenize",
+            &auth(BEARER),
+            "{ not json",
+        );
+        assert_eq!(status, 400, "an error body to read: {body}");
+        assert!(!body.contains(KEY), "the error body carries no key: {body}");
+
+        let line = deny_line("POST", "/completion", "127.0.0.1:54094");
+        assert!(
+            line.contains("POST /completion") && line.contains("127.0.0.1:54094"),
+            "{line}"
+        );
+        assert!(
+            !line.contains(KEY),
+            "the refusal's line carries no key: {line}"
+        );
+    }
+
+    /// A key never reaches what the process itself prints or serves: the
+    /// real binary started with `--api-key` — its startup line, the 401's
+    /// stderr line, every other line it has printed, `/props` (whose
+    /// `engine.args` is this process's own argv, the key in it, held back by
+    /// [`argv_redacted`]) and a 400 error body carry none of the key's
+    /// bytes. The real binary because the in-crate server prints no startup
+    /// line and its argv is the test runner's, not a seat's.
+    #[test]
+    fn a_key_never_reaches_what_the_process_prints_or_serves() {
+        let served = super::testserve::spawn_bin(&["--port", "0", "--api-key", KEY]);
+        let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":4}"#;
+
+        let (status, head, body) =
+            super::testserve::roundtrip_head(served.addr, "POST", "/completion", &[], ask);
+        assert_eq!(status, 401, "{body}");
+        // A wrong key, whose bytes are the client's secret: they may reach
+        // neither the answer nor a log line, exactly as the server's own key.
+        const SENT: &str = "sk-a-wrong-key-the-client-sent";
+        let (status, _head, body) = super::testserve::roundtrip_head(
+            served.addr,
+            "POST",
+            "/completion",
+            &[("Authorization", SENT)],
+            ask,
+        );
+        assert_eq!(status, 401, "the wrong key: {body}");
+        for text in [&head, &body] {
+            assert!(!text.contains(KEY), "the 401 carries no key: {text}");
+            assert!(!text.contains(SENT), "the 401 carries no sent key: {text}");
+        }
+
+        // The startup line, then the refusals' lines once they land.
+        assert!(
+            served.startup.contains("listening on"),
+            "the startup line: {}",
+            served.startup
+        );
+        assert!(
+            !served.startup.contains(KEY),
+            "the startup line carries no key"
+        );
+        let mut refusals = 0;
+        while refusals < 2 {
+            let line = served
+                .lines
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the refusals' stderr lines");
+            assert!(!line.contains(KEY), "a printed line carries no key: {line}");
+            assert!(
+                !line.contains(SENT),
+                "a printed line carries no sent key: {line}"
+            );
+            if line.contains("refused") {
+                refusals += 1;
+            }
+        }
+
+        for (method, path, headers, body_of, wants) in [
+            ("GET", "/props", auth(BEARER), "", 200),
+            ("POST", "/tokenize", auth(BEARER), "{ not json", 400),
+        ] {
+            let (status, _head, body) =
+                super::testserve::roundtrip_head(served.addr, method, path, &headers, body_of);
+            assert_eq!(status, wants, "{method} {path}: {body}");
+            assert!(
+                !body.contains(KEY),
+                "{method} {path} carries no key: {body}"
+            );
+        }
+    }
+
+    /// `/props`' `engine.args` holds back the key: the token after
+    /// `--api-key` is `<redacted>`, `--api-key-file`'s token (a file name,
+    /// not a key) and every other token stay verbatim, and an argv with no
+    /// key flag is unchanged.
+    #[test]
+    fn argv_redacted_holds_the_key_back() {
+        let argv = [
+            "bloomery-serve",
+            "--host",
+            "0.0.0.0",
+            "--api-key",
+            KEY,
+            "--api-key-file",
+            "/etc/bloomery/keys",
+            "--port",
+            "8080",
+        ];
+        assert_eq!(
+            argv_redacted(argv.into_iter().map(str::to_owned)),
+            [
+                "bloomery-serve",
+                "--host",
+                "0.0.0.0",
+                "--api-key",
+                "<redacted>",
+                "--api-key-file",
+                "/etc/bloomery/keys",
+                "--port",
+                "8080",
+            ]
+        );
+        let plain = ["bloomery-serve", "--port", "8080"];
+        let redacted = argv_redacted(plain.into_iter().map(str::to_owned));
+        assert_eq!(redacted, plain, "no key flag, nothing held back");
+        assert!(!redacted.join(" ").contains(KEY));
+    }
+
+    /// With no key set, every route answers exactly as it does with the
+    /// check passed: a server with no keys and a keyed server asked with the
+    /// valid key answer the same fixed set — every route the server has —
+    /// with the same status, content type and body. The bodies are compared
+    /// as JSON with the two leaves two server instances cannot share pinned
+    /// to a constant (`created`, the bind time) or dropped (`timings`, the
+    /// measured walls); `/metrics` is scraped before any generation for the
+    /// same reason (its counters would hold measured seconds). The stream
+    /// and `OPTIONS` bodies are text, compared whole.
+    #[test]
+    fn with_no_keys_set_every_route_answers_as_it_does_with_the_check_passed() {
+        let plain = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let keyed = super::testserve::spawn_keyed(keys);
+        let bearer = auth(BEARER);
+
+        let chat = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#;
+        let completion = r#"{"prompt":"ab","max_tokens":2}"#;
+        let stream = r#"{"prompt":"ab","max_tokens":2,"stream":true}"#;
+        let tokenize = r#"{"content":"hello"}"#;
+        // `/metrics` first: its counters hold measured seconds once a
+        // generation has run.
+        let set: &[(&str, &str, &str)] = &[
+            ("GET", "/metrics", ""),
+            ("GET", "/health", ""),
+            ("GET", "/v1/models", ""),
+            ("GET", "/props", ""),
+            ("GET", "/slots", ""),
+            ("POST", "/tokenize", tokenize),
+            ("POST", "/completion", completion),
+            ("POST", "/v1/chat/completions", chat),
+            ("POST", "/completion", stream),
+            ("OPTIONS", "/v1/chat/completions", ""),
+        ];
+        for (method, path, body) in set {
+            let (s0, h0, b0) = super::testserve::roundtrip_head(plain.0, method, path, &[], body);
+            let (s1, h1, b1) =
+                super::testserve::roundtrip_head(keyed.0, method, path, &bearer, body);
+            assert_eq!(
+                s0, s1,
+                "{method} {path}: the check must not change the status"
+            );
+            let ctype = |h: &str| {
+                h.lines()
+                    .find(|l| l.starts_with("Content-Type:"))
+                    .unwrap_or("no content type")
+                    .to_owned()
+            };
+            assert_eq!(ctype(&h0), ctype(&h1), "{method} {path}: the content type");
+            let norm = |b: &str| normalize(b);
+            assert_eq!(norm(&b0), norm(&b1), "{method} {path}: the body");
+            assert_ne!(s0, 401, "{method} {path}: no key set, no 401");
+        }
+
+        /// One body as the comparison takes it: JSON with `created` and
+        /// `id` (the bind time and the wall-clock-mixed request id) pinned
+        /// and `timings` dropped; a stream the same, chunk by chunk;
+        /// anything else (`OPTIONS`' empty body) whole.
+        fn normalize(body: &str) -> String {
+            if let Ok(v) = serde_json::from_str::<Value>(body) {
+                return pinned(v).to_string();
+            }
+            body.lines()
+                .map(|l| {
+                    let Some(payload) = l.strip_prefix("data: ") else {
+                        return l.to_owned();
+                    };
+                    let v = serde_json::from_str::<Value>(payload).expect("a stream chunk is JSON");
+                    format!("data: {v}", v = pinned(v))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// [`normalize`]'s one JSON value: the clock-bound leaves pinned, the
+        /// measured walls dropped.
+        fn pinned(mut v: Value) -> Value {
+            fn walk(v: &mut Value) {
+                let Value::Object(o) = v else { return };
+                o.remove("timings");
+                for leaf in ["created", "id"] {
+                    if let Some(c) = o.get_mut(leaf) {
+                        *c = Value::from(0);
+                    }
+                }
+                for (_k, x) in o.iter_mut() {
+                    walk(x);
+                }
+            }
+            walk(&mut v);
+            v
+        }
+    }
+
     /// The media mock whose two slots take it in turns, parked as `park`.
     struct Turned(crate::MockEngine, Park);
 
@@ -3472,6 +3921,7 @@ mod tests {
                 sampler: None,
                 fatal_linger: FATAL_LINGER,
                 slot_save_path: None,
+                api_keys: crate::flag::ApiKeys::default(),
             };
             let server = Server::bind("127.0.0.1:0", engine, config).expect("bind");
             let (state, _ended) = server.start().expect("start");

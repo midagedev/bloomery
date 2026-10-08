@@ -22,6 +22,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use serve::flag::ApiKeys;
 use serve::{
     FATAL_LINGER, MAX_CONNECTIONS, MockEngine, ServeError, Server, ServerConfig, SlotConfig,
 };
@@ -41,6 +42,7 @@ struct Args {
     slot_save_path: Option<PathBuf>,
     parallel: usize,
     queue_depth: Option<usize>,
+    api_keys: ApiKeys,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -56,6 +58,7 @@ fn parse_args() -> Result<Args, String> {
         slot_save_path: None,
         parallel: 1,
         queue_depth: None,
+        api_keys: ApiKeys::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -80,10 +83,12 @@ fn parse_args() -> Result<Args, String> {
             "--queue-depth" => {
                 a.queue_depth = Some(val()?.parse().map_err(|e| format!("--queue-depth: {e}"))?)
             }
+            f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, &val()?)?,
             "--help" | "-h" => {
                 return Err("usage: bloomery-serve [--host H] [--port P] [--model GGUF] \
                             [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template] \
-                            [--mock-fail-at K] [--slot-save-path DIR] [--parallel N] [--queue-depth Q]"
+                            [--mock-fail-at K] [--slot-save-path DIR] [--parallel N] [--queue-depth Q] \
+                            [--api-key KEY] [--api-key-file FNAME]"
                     .to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
@@ -141,6 +146,7 @@ fn main() -> ExitCode {
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path: args.slot_save_path,
+        api_keys: args.api_keys,
     };
     let engine = match args.fail_at {
         Some(k) => MockEngine::failing_at(args.ctx, k),

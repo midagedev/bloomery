@@ -8,6 +8,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, mpsc};
 
 use super::{End, Engine, FATAL_LINGER, Server, ServerConfig, State};
+use crate::flag::ApiKeys;
 
 /// The mock's chat template: each message as `<role>\n` and its content,
 /// then `<assistant>\n` when a generation prompt is asked for.
@@ -27,7 +28,16 @@ pub(super) fn mock_config() -> ServerConfig {
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path: None,
+        api_keys: ApiKeys::default(),
     }
+}
+
+/// A mock server whose key check is on, `keys` set: the server every key
+/// test asks a key of.
+pub(super) fn spawn_keyed(keys: ApiKeys) -> (SocketAddr, Arc<State>, mpsc::Receiver<End>) {
+    let mut config = mock_config();
+    config.api_keys = keys;
+    spawn(Box::new(crate::MockEngine::new(64)), config)
 }
 
 /// `engine` served on a free loopback port under `config`: the address, the
@@ -51,6 +61,20 @@ pub(super) fn roundtrip(
     headers: &[(&str, &str)],
     body: &str,
 ) -> (u16, String) {
+    let (status, _head, body) = roundtrip_head(addr, method, path, headers, body);
+    (status, body)
+}
+
+/// [`roundtrip`] with the whole reply head beside the body: the status,
+/// every header line as sent, and the body — the form a test that pins a
+/// response's headers needs.
+pub(super) fn roundtrip_head(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, String) {
     let mut s = TcpStream::connect(addr).expect("connect");
     let extra: String = headers
         .iter()
@@ -70,5 +94,62 @@ pub(super) fn roundtrip(
         .nth(1)
         .and_then(|c| c.parse().ok())
         .expect("a status line");
-    (status, body.to_owned())
+    (status, head.to_owned(), body.to_owned())
+}
+
+/// The running mock binary, killed when it drops, its bound address read
+/// from the startup line and its stderr lines gathered on a channel. The
+/// binary as `cargo test -p` builds it (the integration tests' spawns need
+/// it too); a run that has not built it (a bare `--lib` after `cargo
+/// clean`) fails by name.
+pub(super) struct BinServe {
+    child: std::process::Child,
+    /// The startup line the address was read from.
+    pub(super) startup: String,
+    pub(super) addr: SocketAddr,
+    pub(super) lines: mpsc::Receiver<String>,
+}
+
+impl Drop for BinServe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `bloomery-serve <args>` (which must bind port 0): the one server whose
+/// startup line, stderr and `/props` argv are the process's own, which a
+/// key must never reach.
+pub(super) fn spawn_bin(args: &[&str]) -> BinServe {
+    use std::io::BufRead;
+    let bin =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/bloomery-serve");
+    let mut child = std::process::Command::new(&bin)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
+    let err = child.stderr.take().expect("stderr");
+    let (tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let startup = lines
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("bloomery-serve printed no address");
+    let addr = startup
+        .rsplit_once("http://")
+        .and_then(|(_, a)| a.parse().ok())
+        .unwrap_or_else(|| panic!("no address in {startup:?}"));
+    BinServe {
+        child,
+        startup,
+        addr,
+        lines,
+    }
 }

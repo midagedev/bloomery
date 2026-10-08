@@ -46,6 +46,13 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   as an expert tier, or a list (`0+1`) by CUDA index (not on the qwen38 seat, which takes `a`, `gate` or `bp`).
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for images and video, upstream's `confidence` formula).
+- **`--api-key`/`--api-key-file`**, llama-server's authentication: a comma-separated list (a quoted item may
+  hold commas) and a file (one key per line, `#` lines comments), both flags adding to one set, carried by
+  `Authorization: Bearer <key>` or `X-Api-Key: <key>`. `/health`, `/v1/health` and `OPTIONS` stay public;
+  every other route — generation, `/props`, `/slots`, `/shutdown` — answers llama-server's 401
+  (`Invalid API Key`) without a valid one, and a flag that names no key refuses to start rather than serve
+  unlocked. The server binds `127.0.0.1` by default; `--host 0.0.0.0` without a key serves anyone who can
+  reach the port.
 - **Stopping the server**: `SIGINT`/`SIGTERM` stop it as llama-server's do — no new request is admitted, the
   engine thread ends between its calls, and the process exits 0 after one stderr line naming the cause; a second
   signal terminates at once. `POST /shutdown` does the same over HTTP, accepted only from a loopback peer (a
