@@ -32,7 +32,7 @@ use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q38::{EmbedQ8Args, OutGateArgs};
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
-use crate::weights::{DevWeight, Weights};
+use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
@@ -149,7 +149,7 @@ pub(super) fn enqueue_head(
 ) -> Result<(), GpuError> {
     if head.m() > 1
         || !matches!(
-            w.get("output.weight"),
+            w.get(HEAD_TENSOR),
             Some(DevWeight::KQuant {
                 ty: GgmlType::Q6_K,
                 ..
