@@ -311,7 +311,8 @@ pub const ACTS_ON: &[&str] = &[
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
                      [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
-                     [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]";
+                     [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
+                     [--api-key KEY] [--api-key-file FNAME]";
 
 /// The context the default's expert cost is counted against: the plan
 /// every Qwen3.8 measurement ran at, and `generate_qwen3moe`'s default.
@@ -919,6 +920,9 @@ struct Args {
     /// `--park-ram` in bytes; set is refused by name (resident slots park
     /// nothing).
     park_ram: Option<u64>,
+    /// `--api-key`/`--api-key-file`: the keys every request is checked
+    /// against ([`serve::flag::ApiKeys`]).
+    api_keys: serve::flag::ApiKeys,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -935,6 +939,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         parallel: None,
         queue_depth: None,
         park_ram: None,
+        api_keys: serve::flag::ApiKeys::default(),
     };
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
@@ -956,6 +961,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
             "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
+            f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
@@ -1290,6 +1296,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
         slot_save_path: a.slot_save_path,
+        api_keys: a.api_keys,
     };
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its

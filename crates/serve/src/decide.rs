@@ -8,7 +8,9 @@
 //! CORS answer [`crate::Server`] gives), and a 404 error object naming the routes for anything
 //! else ([`not_found`]: a chat client finds what to post instead). A refused request
 //! is a 400 carrying the decider's message, a request the engine cannot answer (an image) a 501
-//! `not_supported_error`. The decider runs one request at a time behind a mutex; connections are
+//! `not_supported_error`. Every request is checked against the API keys first
+//! ([`crate::api::key_denied`], the same call the generative server makes). The decider runs one
+//! request at a time behind a mutex; connections are
 //! accepted and kept alive by the same owner as [`crate::Server`]'s (at most
 //! [`crate::MAX_CONNECTIONS`] at once, a connection past them a 503).
 //!
@@ -26,7 +28,7 @@
 //! row, and a decision type no row serves is refused by name.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -36,8 +38,10 @@ use serde_json::{Value, json};
 
 use crate::api::{
     End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
-    fatal_health, install_signals, keep_alive, relock, stopping, stopping_message, wait_end,
+    fatal_health, install_signals, keep_alive, key_denied, relock, stopping, stopping_message,
+    wait_end,
 };
+use crate::flag::ApiKeys;
 use crate::http::{self, Request};
 use crate::{EngineFailure, EngineProps, FATAL_LINGER, ServeError};
 
@@ -478,6 +482,8 @@ fn with_timings(d: &Decided) -> Result<String, DecideError> {
 struct Shared {
     decider: Mutex<Box<dyn Decide>>,
     fixed: Fixed,
+    /// The API keys every request is checked against before the dispatch.
+    api_keys: ApiKeys,
     /// What the crash block names as the engine.
     engine: String,
     /// The decider's failure that ends the server, the reason `/health` and every later request
@@ -564,6 +570,20 @@ fn not_found(routes: &[&str]) -> String {
     )
 }
 
+/// One connection's request: the key check first — the same call the
+/// generative server's dispatch makes — then the dispatch ([`reply`]),
+/// written to `w`. `Ok(true)`: the connection may carry another request.
+/// Named, not the closure it was, so a test can drive a request through the
+/// check and the dispatch as the server does.
+fn answer(s: &Shared, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    if key_denied(&s.api_keys, req, w)? {
+        return Ok(true);
+    }
+    let a = reply(s, req);
+    http::respond(w, req, a.status, a.ctype, &a.extra, &a.body)?;
+    Ok(true)
+}
+
 /// One request body through the decider. An engine error, a panic in the decider and a lock a
 /// panic poisoned are fatal ([`Shared::fail`]); once one was, every request is a 503 naming it.
 fn decide(s: &Shared, body: &str) -> Reply {
@@ -617,6 +637,19 @@ impl DecideServer {
         seated: &Seated,
         decider: Box<dyn Decide>,
     ) -> io::Result<DecideServer> {
+        DecideServer::bind_with_keys(addr, seated, decider, ApiKeys::default())
+    }
+
+    /// [`bind`](DecideServer::bind) with the API keys every request is
+    /// checked against before the dispatch: the seat's `--api-key` and
+    /// `--api-key-file`, whose one owner is [`crate::flag`]. An empty set
+    /// checks nothing.
+    pub fn bind_with_keys(
+        addr: impl ToSocketAddrs,
+        seated: &Seated,
+        decider: Box<dyn Decide>,
+        api_keys: ApiKeys,
+    ) -> io::Result<DecideServer> {
         let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
         check_routes(seated.routes).map_err(invalid)?;
         let created = SystemTime::now()
@@ -639,6 +672,7 @@ impl DecideServer {
             shared: Arc::new(Shared {
                 decider: Mutex::new(decider),
                 fixed,
+                api_keys,
                 engine: format!("the decider of {}", seated.name),
                 fatal: Mutex::new(None),
                 stopping: Mutex::new(None),
@@ -676,11 +710,7 @@ impl DecideServer {
         });
         let conn = Arc::clone(&shared);
         accept(listener, shared.end.clone(), move |stream| {
-            keep_alive(stream, |req, w| {
-                let a = reply(&conn, req);
-                http::respond(w, req, a.status, a.ctype, &a.extra, &a.body)?;
-                Ok(true)
-            });
+            keep_alive(stream, |req, w| answer(&conn, req, w));
         });
         // `shared` holds a sender, so the channel cannot close while we wait.
         // An orderly stop never returns: it ends the process instead.
@@ -760,6 +790,10 @@ mod tests {
     const ROUTES: &[&str] = &["/v1/rerank", "/rerank"];
 
     fn shared() -> Shared {
+        shared_with(ApiKeys::default())
+    }
+
+    fn shared_with(api_keys: ApiKeys) -> Shared {
         Shared {
             decider: Mutex::new(Box::new(Echo)),
             fixed: Fixed {
@@ -767,6 +801,7 @@ mod tests {
                 props: json!({}),
                 models: crate::models::listing("m.gguf", 0, json!({}), None),
             },
+            api_keys,
             engine: "the decider of m.gguf".to_owned(),
             fatal: Mutex::new(None),
             stopping: Mutex::new(None),
@@ -1381,5 +1416,121 @@ mod tests {
                 .unwrap_err()
                 .contains("needs a value")
         );
+    }
+
+    /// A connected pair on loopback: the server side for [`answer`] to
+    /// write to, the client side to read what reached it.
+    fn pair() -> (std::net::TcpStream, TcpStream) {
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(ln.local_addr().unwrap()).unwrap();
+        let (server, _) = ln.accept().unwrap();
+        (client, server)
+    }
+
+    /// What [`answer`] wrote, read from the client side of the pair: the
+    /// status and the body.
+    fn written(mut client: &std::net::TcpStream) -> (u16, String) {
+        use std::io::Read;
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .expect("a status line");
+        (status, body.to_owned())
+    }
+
+    /// The decide server checks keys before its dispatch, the generative
+    /// server's own call: without a key a route is the 401 llama-server
+    /// sends (and `/health` still answers, and `OPTIONS` passes), with the
+    /// key — from either header — the decider answers. Driven through
+    /// [`answer`] over a real socket pair because no in-crate test can run
+    /// the socket server itself: its accept loop lives in [`DecideServer::run`],
+    /// which installs the process's signals and never returns (an orderly
+    /// stop exits the process), and the server has no background-spawn
+    /// entry.
+    #[test]
+    fn the_decide_server_checks_keys_before_its_dispatch_too() {
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", "sk-decide-key").unwrap();
+        let s = shared_with(keys);
+
+        let with = |headers: &[(&str, &str)]| {
+            let mut req = post("/v1/rerank");
+            req.headers = headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            req
+        };
+
+        let (status, body) = {
+            let (client, mut server) = pair();
+            answer(&s, &with(&[]), &mut server).unwrap();
+            drop(server);
+            written(&client)
+        };
+        assert_eq!(status, 401, "no key: {body}");
+        let v: Value = serde_json::from_str(&body).expect("the 401's body is JSON");
+        assert_eq!(
+            (v["error"]["type"].as_str(), v["error"]["message"].as_str()),
+            (Some("authentication_error"), Some("Invalid API Key"))
+        );
+
+        for wrong in [
+            ("Authorization", "Bearer sk-wrong"),
+            ("X-Api-Key", "sk-wrong"),
+        ] {
+            let (status, body) = {
+                let (client, mut server) = pair();
+                answer(&s, &with(&[wrong]), &mut server).unwrap();
+                drop(server);
+                written(&client)
+            };
+            assert_eq!(status, 401, "{wrong:?}: {body}");
+        }
+
+        for right in [
+            ("Authorization", "Bearer sk-decide-key"),
+            ("X-Api-Key", "sk-decide-key"),
+        ] {
+            let (status, body) = {
+                let (client, mut server) = pair();
+                answer(&s, &with(&[right]), &mut server).unwrap();
+                drop(server);
+                written(&client)
+            };
+            assert_eq!(status, 200, "{right:?}: {body}");
+            assert!(body.starts_with(r#"{"a":1,"timings":"#), "{body}");
+        }
+
+        // The public paths still answer, on this server as on the
+        // generative one. `/v1/health` is public to the check (llama-server's
+        // set) and unknown to this server's dispatch, so the 404 — never a
+        // 401 — is what passing through looks like.
+        for (method, path, wants) in [
+            ("GET", "/health", 200),
+            ("GET", "/v1/health", 404),
+            ("OPTIONS", "/v1/rerank", 204),
+        ] {
+            let (status, body) = {
+                let (client, mut server) = pair();
+                answer(
+                    &s,
+                    &Request {
+                        method: method.to_owned(),
+                        path: path.to_owned(),
+                        ..closing()
+                    },
+                    &mut server,
+                )
+                .unwrap();
+                drop(server);
+                written(&client)
+            };
+            assert_eq!(status, wants, "{method} {path}: {body}");
+        }
     }
 }

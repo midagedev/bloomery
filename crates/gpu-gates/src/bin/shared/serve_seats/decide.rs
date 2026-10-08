@@ -70,7 +70,8 @@ const WHAT: &str = "bloomery-serve-decide";
 static KINDS: &[&Kind] = &[&record::LISTENING_DECIDE];
 
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
-                     [--head <weights> [--head-config <file>]] [--host H] [--port P] [--ctx C]";
+                     [--head <weights> [--head-config <file>]] [--host H] [--port P] [--ctx C] \
+                     [--api-key KEY] [--api-key-file FNAME]";
 
 /// A row's own part, opened from its head's source: its weights and config files, or the model
 /// file that carries the head.
@@ -185,6 +186,9 @@ struct Args {
     host: String,
     port: u16,
     ctx: Option<usize>,
+    /// `--api-key`/`--api-key-file`: the keys every request is checked
+    /// against ([`serve::flag::ApiKeys`]).
+    api_keys: serve::flag::ApiKeys,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -192,6 +196,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         host: "127.0.0.1".to_owned(),
         port: 8080,
         ctx: None,
+        api_keys: serve::flag::ApiKeys::default(),
     };
     let mut it = args.iter().map(String::as_str);
     while let Some(flag) = it.next() {
@@ -212,6 +217,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                     );
                 }
             },
+            f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
@@ -476,8 +482,13 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         name,
         n_ctx: ctx,
     };
-    let server = DecideServer::bind(addr.as_str(), &seated, Box::new(Seat { jobs, props }))
-        .map_err(|e| format!("bind {addr}: {e}"))?;
+    let server = DecideServer::bind_with_keys(
+        addr.as_str(),
+        &seated,
+        Box::new(Seat { jobs, props }),
+        a.api_keys,
+    )
+    .map_err(|e| format!("bind {addr}: {e}"))?;
     // The bound address: `--port 0` binds a free port.
     let bound = server.local_addr()?;
     Record::new(&record::LISTENING_DECIDE)

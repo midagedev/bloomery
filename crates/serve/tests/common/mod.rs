@@ -61,6 +61,7 @@ fn start_configured(
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path,
+        api_keys: serve::flag::ApiKeys::default(),
     };
     let server =
         Server::bind("127.0.0.1:0", engine, config).unwrap_or_else(|e| panic!("bind: {e}"));
@@ -184,6 +185,7 @@ pub fn start_sampling(
         sampler: Some(sampler),
         fatal_linger: FATAL_LINGER,
         slot_save_path: None,
+        api_keys: serve::flag::ApiKeys::default(),
     };
     let slots = serve::SlotConfig {
         parallel,
