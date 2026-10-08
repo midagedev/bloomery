@@ -250,6 +250,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/e2e.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the compare, tap, layer-table and flip-accounting helpers; the clause reporting, the refusal helpers, the selector reader and the forced arm's accumulators serve the other gates"
+)]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/gate_card.rs"]
 mod gate_card;
 
@@ -260,6 +268,11 @@ mod q38_arch;
 #[cfg(feature = "gpu")]
 mod gate {
     use std::time::Instant;
+
+    use crate::e2e::{
+        argmax, first_flip_layers, flips_report, ik_last, layer_rels, layer_table, print_layers,
+        rel, same_bits, second, set_open, tap, tie_numbers, worst_off_path,
+    };
 
     use bloomery_gpu::arch::qwen3moe::{
         Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
@@ -278,7 +291,7 @@ mod gate {
     use bloomery_gpu_gates::tier::Tag;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_model_path,
-        ref_tensor_logical_in, topk_ids_logical_within, verdict,
+        topk_ids_logical_within, verdict,
     };
     use bloomery_levers::{CARD_BUDGET, HostCfg};
     use cuda_core::{DeviceBuffer, sys};
@@ -611,65 +624,6 @@ mod gate {
         n_gdn() * rec + n_qsa() * sel + ple
     }
 
-    /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
-    /// neither passes a band.
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() {
-            return f64::INFINITY;
-        }
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            num += (f64::from(x) - f64::from(y)).powi(2);
-            den += f64::from(y).powi(2);
-        }
-        let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
-        if r.is_nan() { f64::INFINITY } else { r }
-    }
-
-    /// The first index of the largest value, as the head's argmax breaks ties.
-    fn argmax(v: &[f32]) -> u32 {
-        let best = v
-            .iter()
-            .enumerate()
-            .fold(0usize, |b, (i, &x)| if x > v[b] { i } else { b });
-        best as u32
-    }
-
-    /// The runner-up's index: the largest value other than at `top`.
-    fn second(v: &[f32], top: u32) -> u32 {
-        let best = v.iter().enumerate().fold(None::<usize>, |b, (i, &x)| {
-            if i == top as usize {
-                b
-            } else {
-                match b {
-                    Some(j) if v[j] >= x => Some(j),
-                    _ => Some(i),
-                }
-            }
-        });
-        best.unwrap_or(0) as u32
-    }
-
-    /// Bit equality of two f32 rows.
-    fn same_bits(a: &[f32], b: &[f32]) -> bool {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-    }
-
-    /// A set's tap `name` in its logical order.
-    fn tap(man: &RefManifest, name: &str) -> Result<Vec<f32>, GateError> {
-        Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, 0)?)?)
-    }
-
-    /// ik's last logits row of a set.
-    fn ik_last(man: &RefManifest, vocab: usize) -> Result<Vec<f32>, GateError> {
-        let ik = tap(man, "result_output")?;
-        let at = ik
-            .len()
-            .checked_sub(vocab)
-            .ok_or("result_output holds no row")?;
-        Ok(ik[at..].to_vec())
-    }
-
     /// Whether our last argmax `top` is ik's `result_output` argmax, and
     /// ik's as the line prints it: an oracle clause, which the fixture tier
     /// leaves to the real one (true, and `not compared`).
@@ -991,63 +945,6 @@ mod gate {
         Ok((ok, eager))
     }
 
-    /// Each layer's relative distance at every position `taps` holds
-    /// against ik's `l_out-L` (`None` where ik kept no row for it).
-    fn layer_table(
-        man: &RefManifest,
-        taps: &[Vec<f32>],
-    ) -> Result<Vec<Vec<Option<f64>>>, GateError> {
-        let row = STREAMS * HIDDEN;
-        let n = taps.len();
-        (0..n_layer())
-            .map(|l| {
-                let ik = tap(man, &format!("l_out-{l}"))?;
-                let kept = ik.len() / row;
-                Ok(taps
-                    .iter()
-                    .enumerate()
-                    .map(|(t, ours)| {
-                        let i = (t + kept).checked_sub(n)?;
-                        Some(rel(
-                            ours.get(l * row..(l + 1) * row)?,
-                            &ik[i * row..(i + 1) * row],
-                        ))
-                    })
-                    .collect())
-            })
-            .collect()
-    }
-
-    /// Each row's worst entry of a [`layer_table`] and the tap it was met at.
-    fn worst_of(table: &[Vec<Option<f64>>]) -> Vec<(f64, usize)> {
-        table
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .filter_map(|(t, e)| e.map(|e| (e, t)))
-                    .fold((0.0f64, 0usize), |w, x| if x.0 > w.0 { x } else { w })
-            })
-            .collect()
-    }
-
-    /// The worst layer and the first of layers `0..held` past the band,
-    /// printed; whether every one of those is inside it.
-    fn print_layers(what: &str, rels: &[(f64, usize)], held: usize) -> bool {
-        for (l, &(e, t)) in rels.iter().enumerate() {
-            if l % 8 == 0 || l == rels.len() - 1 || (l < held && e > FREE_BAND) {
-                println!("{what} layer={l} l_out_rel={e:.3e} at tap {t}");
-            }
-        }
-        match rels.iter().take(held).position(|&(e, _)| e > FREE_BAND) {
-            Some(l) => {
-                println!("{what}: first layer past the band {FREE_BAND:.2}: {l}");
-                false
-            }
-            None => true,
-        }
-    }
-
     /// ik's routing of one layer over the set's tokens: its logits
     /// ([`N_EXPERT`] a token; the pick ranks their softmax, the same order)
     /// and its chosen ids ([`N_USED`] a token).
@@ -1122,13 +1019,6 @@ mod gate {
             .all(|e| r.logits[e] <= min_in)
     }
 
-    /// Whether a flip at `(l', t')` lies on the path of layer `l`'s output
-    /// at position `t`: every layer from `l'` on reads it at `t'`, and every
-    /// later position through the mixers' stores.
-    fn on_path(flips: &[Flip], l: usize, t: usize) -> bool {
-        flips.iter().any(|f| f.layer <= l && f.token <= t)
-    }
-
     /// The free clause's verdict, and by position the first layer a flip
     /// lies on the path of ([`n_layer`] where none does). Every route tap
     /// the top ten of its own logits is a self-consistency clause; the
@@ -1157,7 +1047,7 @@ mod gate {
         )? {
             return Ok((inconsistent.is_empty(), vec![n_layer(); eager.taps.len()]));
         }
-        let table = layer_table(man, &eager.taps)?;
+        let table = layer_table(man, &eager.taps, STREAMS * HIDDEN, n_layer())?;
         for (l, row) in table.iter().enumerate() {
             let cells: Vec<String> = row
                 .iter()
@@ -1187,28 +1077,9 @@ mod gate {
                 flips.extend(flip_at(l, t, ours, &ik));
             }
         }
-        for f in &flips {
-            println!("{}", f.line("free", FLIP_ERR_CAP));
-        }
-        let flips_ok = flips.iter().all(|f| f.allowed(FLIP_ERR_CAP));
-        let (mut held, mut hl, mut ht, mut exempt) = (0.0f64, 0usize, 0usize, 0usize);
-        for (l, row) in table.iter().enumerate() {
-            for (t, e) in row.iter().enumerate() {
-                let Some(e) = *e else { continue };
-                if on_path(&flips, l, t) {
-                    exempt += 1;
-                } else if e > held {
-                    (held, hl, ht) = (e, l, t);
-                }
-            }
-        }
-        let firsts: Vec<usize> = (0..eager.taps.len())
-            .map(|t| {
-                (0..n_layer())
-                    .find(|&l| on_path(&flips, l, t))
-                    .unwrap_or(n_layer())
-            })
-            .collect();
+        let flips_ok = flips_report(&flips, "free", FLIP_ERR_CAP);
+        let (held, hl, ht, exempt) = worst_off_path(&table, &flips, false);
+        let firsts = first_flip_layers(&flips, eager.taps.len(), n_layer());
         println!(
             "free: first layer a flip lies on the path of, by position {}; {exempt} (layer, \
              position) outputs past a flip, printed and counted",
@@ -1276,24 +1147,7 @@ mod gate {
             };
             return Ok((true, none));
         }
-        let man = RefManifest::open(&data_dir().join(name), &IK)?;
-        let (pos, step, prefill) = man.step()?;
-        let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
-        let [tok] = step[..] else {
-            return Err(format!("{name}: a step of {} tokens, not one", step.len()).into());
-        };
-        let held = match band {
-            Some((toks, first)) => {
-                if toks.split_last() != Some((&tok, &prefill[..])) {
-                    return Err(format!(
-                        "{name}: prefill {prefill:?} and step {tok} are not the batch set's {toks:?}"
-                    )
-                    .into());
-                }
-                first
-            }
-            None => 0,
-        };
+        let (man, pos, tok, prefill, held) = set_open((name, &IK), band)?;
         fresh(m)?;
         let t = Instant::now();
         if !prefill.is_empty() {
@@ -1313,18 +1167,11 @@ mod gate {
         let vocab = m.body("step_set")?.vocab();
         let ik = ik_last(&man, vocab)?;
         let ours = r.logits.last().ok_or("no logits")?;
-        let (top, ik_top) = (argmax(ours), argmax(&ik));
-        let ik_2 = second(&ik, ik_top);
-        let margin = f64::from(ik[ik_top as usize]) - f64::from(ik[ik_2 as usize]);
-        let dist = [ik_top, ik_2]
-            .iter()
-            .map(|&i| (f64::from(ours[i as usize]) - f64::from(ik[i as usize])).abs())
-            .fold(0.0, f64::max);
-        let logits_rel = rel(ours, &ik);
+        let (top, ik_top, ik_2, margin, dist, logits_rel) = tie_numbers(ours, &ik);
         let tie = top != ik_top && top == ik_2 && margin <= 2.0 * dist && logits_rel <= FREE_BAND;
         *ties += usize::from(tie);
-        let rels = worst_of(&layer_table(&man, &r.taps)?);
-        let inside = print_layers(name, &rels, held);
+        let rels = layer_rels(&man, &r.taps, STREAMS * HIDDEN, n_layer())?;
+        let inside = print_layers(name, &rels, held, FREE_BAND);
         let ok = (top == ik_top || tie) && inside;
         println!(
             "step {name}: position {pos} after {} fed by {} ({:.1} s, runtime value); argmax \
@@ -1348,12 +1195,7 @@ mod gate {
     /// D3K's prefill by passes against `steps`, its step-fed run: the step's
     /// token, logits, layer outputs and every store bit for bit.
     fn pass_selects(m: &mut Qwen38Model, steps: &Run) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
-        let (_, step, prefill) = man.step()?;
-        let (step, prefill) = (step.to_vec(), prefill.to_vec());
-        let [tok] = step[..] else {
-            return Err(format!("{D3K}: a step of {} tokens, not one", step.len()).into());
-        };
+        let (_, _, tok, prefill, _) = set_open((D3K, &IK), None)?;
         fresh(m)?;
         let t = Instant::now();
         m.prompt38(&prefill, Prompt38::Pass)?;

@@ -239,6 +239,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/e2e.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the argmax, the shape-refusal check and the selector word; the rest of the runner serves the GLM and Qwen3.8 gates"
+)]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/qwen3moe_taps.rs"]
 mod taps;
 
@@ -256,6 +264,7 @@ mod q3place;
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use super::e2e::{argmax, refused_by, word_after};
     use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
     use super::taps;
@@ -405,7 +414,7 @@ mod gate {
 
     /// PIN(2026-09-24): the teacher-forced bound on each half's error ratio
     /// — its relative error over the relative distance between the two
-    /// sides' 8-bit inputs to that half (`quant_gap`: ours q8_1 per 128
+    /// sides' 8-bit inputs to that half (`quant_gap_two_sided`: ours q8_1 per 128
     /// values against ik's q8_2 per 32, at the attention's q/k/v and
     /// attn_output inputs, the FFN's gate·up and down inputs, in
     /// quadrature). To first order a linear map carries its input's relative
@@ -429,7 +438,10 @@ mod gate {
     /// re-lottery, not a fault.
     const MARGIN_FLOOR: f32 = 0.5;
 
-    fn rel(a: &[f32], b: &[f32], base: impl Fn(usize) -> f64) -> f64 {
+    /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
+    /// values from `base`: not `e2e::rel`, which divides by `‖b‖` and is
+    /// infinite on a length mismatch or a NaN (this one has neither guard).
+    fn rel_base(a: &[f32], b: &[f32], base: impl Fn(usize) -> f64) -> f64 {
         let (mut num, mut den) = (0.0f64, 0.0f64);
         for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
             num += (f64::from(x) - f64::from(y)).powi(2);
@@ -470,10 +482,10 @@ mod gate {
         // set, is refused by name before anything loads.
         let host = bloomery_levers::at_main(&[])?.host();
         let args: Vec<String> = std::env::args().collect();
-        if let Some(i) = args.iter().position(|a| a == "--ppl") {
-            let tag = args.get(i + 1).ok_or("--ppl needs a tag")?;
+        if let Some(tag) = word_after("--ppl") {
+            let tag = tag.ok_or("--ppl needs a tag")?;
             let placed = args.iter().any(|a| a == "--placed").then_some(host);
-            return ppl(tag, placed);
+            return ppl(&tag, placed);
         }
         let dump = match args.iter().position(|a| a == "--dump") {
             Some(i) => Some(PathBuf::from(
@@ -836,11 +848,12 @@ mod gate {
 
     /// `‖x̂_ours − x̂_ik‖ / ‖x‖` over the `k`-value rows of `x`: how far apart
     /// the two sides' 8-bit activations of the same input sit (ours q8_1 per
-    /// 128 values, ik q8_2 per 32).
-    fn quant_gap(x: &[f32], k: usize) -> f64 {
+    /// 128 values, ik q8_2 per 32). Not `e2e::quant_gap`, which is ik's q8_2
+    /// against the f32 `x` our kernels read.
+    fn quant_gap_two_sided(x: &[f32], k: usize) -> f64 {
         let o = q8_1_dequant(x, k, x.len() / k);
         let i = ik_q8_2::reconstruct(x);
-        rel(&o, &i, |j| f64::from(x[j]))
+        rel_base(&o, &i, |j| f64::from(x[j]))
     }
 
     fn forced(m: &mut Qwen3moeModel, man: &RefManifest) -> Result<bool, GateError> {
@@ -915,9 +928,9 @@ mod gate {
                 if let Some(a) = at(&ik_attn[l], t, t_n) {
                     let got: Vec<f32> =
                         run.ffn_inp.iter().zip(x_in).map(|(&f, &x)| f - x).collect();
-                    let e = rel(&got, a, |i| f64::from(a[i]));
-                    let g_in = at(&ik_anorm[l], t, t_n).map_or(0.0, |x| quant_gap(x, h));
-                    let g_fa = at(&ik_fa[l], t, t_n).map_or(0.0, |x| quant_gap(x, q_len));
+                    let e = rel_base(&got, a, |i| f64::from(a[i]));
+                    let g_in = at(&ik_anorm[l], t, t_n).map_or(0.0, |x| quant_gap_two_sided(x, h));
+                    let g_fa = at(&ik_fa[l], t, t_n).map_or(0.0, |x| quant_gap_two_sided(x, q_len));
                     let pred = g_in.hypot(g_fa);
                     l_attn = l_attn.max(e);
                     l_attn_r = l_attn_r.max(e / pred.max(f64::MIN_POSITIVE));
@@ -930,7 +943,7 @@ mod gate {
                 ) else {
                     continue;
                 };
-                l_up = l_up.max(rel(&run.l_out, want, |i| {
+                l_up = l_up.max(rel_base(&run.l_out, want, |i| {
                     f64::from(want[i]) - f64::from(x_in[i])
                 }));
                 // The FFN half alone, on ik's own FFN input.
@@ -945,9 +958,9 @@ mod gate {
                     .count();
                 sites += 1;
                 let mag = at(&ik_mag[l], t, t_n).ok_or("a routed magnitude row is missing")?;
-                let e = rel(&got, r, |i| f64::from(mag[i]));
-                let g_in = at(&ik_fnorm[l], t, t_n).map_or(0.0, |x| quant_gap(x, h));
-                let g_par = at(&ik_par[l], t, t_n).map_or(0.0, |x| quant_gap(x, ff));
+                let e = rel_base(&got, r, |i| f64::from(mag[i]));
+                let g_in = at(&ik_fnorm[l], t, t_n).map_or(0.0, |x| quant_gap_two_sided(x, h));
+                let g_par = at(&ik_par[l], t, t_n).map_or(0.0, |x| quant_gap_two_sided(x, ff));
                 let pred = g_in.hypot(g_par);
                 l_ffn_p = l_ffn_p.max(pred);
                 if flipped == 0 {
@@ -1017,14 +1030,14 @@ mod gate {
                     continue;
                 };
                 let want = &ik_out[l][t_ik];
-                per_layer[l] = per_layer[l].max(rel(&taps[l], want, |i| f64::from(want[i])));
+                per_layer[l] = per_layer[l].max(rel_base(&taps[l], want, |i| f64::from(want[i])));
             }
         }
         let logits = m.logits()?;
         m.set_layer_taps(false)?;
         let want = ik_logits.last().ok_or("result_output has no row")?;
         let ik_top = argmax(want);
-        let lrel = rel(&logits, want, |i| f64::from(want[i]));
+        let lrel = rel_base(&logits, want, |i| f64::from(want[i]));
         let worst = per_layer.iter().copied().fold(0.0f64, f64::max);
         let ok = worst <= FREE_BAND && last == ik_top;
         for (l, &e) in per_layer.iter().enumerate() {
@@ -1523,16 +1536,6 @@ mod gate {
             verdict(ok)
         );
         Ok(ok)
-    }
-
-    fn argmax(v: &[f32]) -> u32 {
-        let mut best = 0usize;
-        for i in 1..v.len() {
-            if v[i] > v[best] {
-                best = i;
-            }
-        }
-        best as u32
     }
 
     // ------------------------------------------------ (g) greedy, (r) replay
@@ -2065,8 +2068,8 @@ mod gate {
                 }
                 kv_ok &= pass;
             }
-            let lrel = rel(&gemm.logits, &one.logits, |i| f64::from(one.logits[i]));
-            let lspread = rel(&alt.logits, &one.logits, |i| f64::from(one.logits[i]));
+            let lrel = rel_base(&gemm.logits, &one.logits, |i| f64::from(one.logits[i]));
+            let lspread = rel_base(&alt.logits, &one.logits, |i| f64::from(one.logits[i]));
             let lratio = lrel / lspread.max(f64::MIN_POSITIVE);
             let logits_ok = lratio <= GEMM_SPREAD_RATIO;
             let reference = GreedyRow {
@@ -2835,15 +2838,6 @@ mod gate {
         .collect()
     }
 
-    /// `r`, a call that must be refused by `what` with a detail holding
-    /// `phrase`.
-    fn refused<T>(r: Result<T, GpuError>, what: &str, phrase: &str) -> bool {
-        match r {
-            Err(GpuError::Shape { what: w, detail }) => w == what && detail.contains(phrase),
-            _ => false,
-        }
-    }
-
     /// (j) (module doc): one pass of two slots. The last clause on the main
     /// model: the model it leaves is dropped, its second sequence's planes
     /// with it.
@@ -2985,39 +2979,39 @@ mod gate {
         let refusals = [
             (
                 "nine rows",
-                refused(
-                    m.step_slots(&[(0, &ids5[..]), (1, &ids4[..])]),
+                refused_by(
+                    &m.step_slots(&[(0, &ids5[..]), (1, &ids4[..])]),
                     WHAT,
                     "9 rows in one pass",
                 ),
             ),
             (
                 "a slot twice",
-                refused(m.step_slots(&[(0, &[1]), (0, &[1])]), WHAT, "slot 0 twice"),
+                refused_by(&m.step_slots(&[(0, &[1]), (0, &[1])]), WHAT, "slot 0 twice"),
             ),
             (
                 "no slot",
-                refused(m.step_slots(&[]), WHAT, "a pass of no slot"),
+                refused_by(&m.step_slots(&[]), WHAT, "a pass of no slot"),
             ),
             (
                 "slot out of range",
                 // The add_slots sub-step left the model serving three slots,
                 // so the probe is the first slot past that count.
-                refused(
-                    m.step_slots(&[(3, &[1])]),
+                refused_by(
+                    &m.step_slots(&[(3, &[1])]),
                     WHAT,
                     "slot 3 of a model that serves 0..3",
                 ),
             ),
             (
                 "a slot of no token",
-                refused(m.step_slots(&[(1, &[])]), WHAT, "slot 1 with no token"),
+                refused_by(&m.step_slots(&[(1, &[])]), WHAT, "slot 1 with no token"),
             ),
         ];
         let still = at(m)? == before;
         m.seed_depth(CTX - 4)?;
-        let past = refused(
-            m.step_slots(&[(0, &[1; 8])]),
+        let past = refused_by(
+            &m.step_slots(&[(0, &[1; 8])]),
             WHAT,
             &format!(
                 "slot 0's 8 rows from position {} pass the resident cache's {CTX} rows",
@@ -3054,13 +3048,13 @@ mod gate {
         let raised = matches!(read, Err(GpuError::Fault { .. })) && m.poisoned().is_some();
         let set = "slots 0 and 1 are poisoned";
         m.select_slot(0)?;
-        let named0 = refused(m.step(&[1]), "GpuModel::step", set);
+        let named0 = refused_by(&m.step(&[1]), "GpuModel::step", set);
         m.select_slot(1)?;
-        let named1 = refused(m.step(&[1]), "GpuModel::step", set);
-        let named_pass = refused(m.step_slots(&[(0, &[1]), (1, &[1])]), WHAT, set);
+        let named1 = refused_by(&m.step(&[1]), "GpuModel::step", set);
+        let named_pass = refused_by(&m.step_slots(&[(0, &[1]), (1, &[1])]), WHAT, set);
         m.select_slot(0)?;
         m.reset()?;
-        let stands = refused(m.step(&[1]), "GpuModel::step", "slot 1 is poisoned");
+        let stands = refused_by(&m.step(&[1]), "GpuModel::step", "slot 1 is poisoned");
         m.select_slot(1)?;
         m.reset()?;
         let lifted = m.poisoned().is_none();
