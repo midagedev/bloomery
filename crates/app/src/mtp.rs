@@ -34,7 +34,9 @@
 //! refresh a window or a step recorded, or a prompt call's anchor — their
 //! last row the call's first id, while their arena still holds their hidden
 //! rows; a first step that feeds the next id does the same before the step
-//! overwrites the step's arena ([`MtpDraft::before_step`]). When no such rows
+//! overwrites the step's arena ([`MtpDraft::before_step`]), and so does the
+//! width chooser before each pass it holds back ([`Draft::before_plain`]).
+//! When no such rows
 //! wait, or the store does not hold the positions below them, the draft
 //! skips: it proposes nothing, every pass a plain step, until a prompt call
 //! from position 0 or a restart; the call's [`Join`] names why.
@@ -542,7 +544,9 @@ impl<B: MtpBody> MtpDraft<B> {
     /// first step that continues the held sequence joins it here. A draft
     /// that cannot walk it skips, the [`Join`] naming why
     /// ([`MtpDraft::take_joined`]). A prompt call's anchor is left for
-    /// [`Draft::stepped`]. A server seat calls it before each of its steps.
+    /// [`Draft::stepped`]. A server seat calls it before each of its steps,
+    /// and the width chooser makes the same walk through
+    /// [`Draft::before_plain`] before each pass it holds back.
     ///
     /// # Errors
     ///
@@ -823,22 +827,28 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// the step's row follows them and the store must hold every position
     /// below the next chain's; then `next`, the id taken after the step, at
     /// the position after it, with the hidden row the step wrote
-    /// ([`MtpBody::STEP_ARENA`]), as the next refresh, its store bytes
-    /// written in this same call: the next step overwrites that arena, and
-    /// a pass the width chooser holds back steps the target before the
-    /// draft hears of it ([`Draft::held`], this same call), so no later
-    /// call can be counted on to walk the row first — the next chain walks
-    /// it again for its head, and a step after it walks nothing for it. A
-    /// row past the context is left unwalked: no chain runs there. Refused
-    /// by name when the waiting rows read the step's own arena, which the
-    /// step has overwritten, unless a store walk already wrote them.
+    /// ([`MtpBody::STEP_ARENA`]), as the next refresh, its rows left for
+    /// the call that walks them — the width chooser's hook
+    /// ([`Draft::before_plain`]) or a seat's step before the next plain
+    /// step, the next chain for its head, a continuing prompt's join — so
+    /// the store never holds a position past the target's, which a
+    /// sequence state needs. Refused by name when the waiting rows read
+    /// the step's own arena, which the step has overwritten.
     fn stepped(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
-        let (pos, ctx) = (t.pos(), t.ctx());
+        let pos = t.pos();
         let mut card = Card {
             m: t.model_mut(),
             head: self.head,
             zeros: &self.zeros,
         };
-        Ok(self.policy.stepped(&mut card, pos, ctx, last, next)?)
+        Ok(self.policy.stepped(&mut card, pos, last, next)?)
+    }
+
+    /// The waiting rows walked before the chooser's held pass steps the
+    /// target ([`MtpDraft::before_step`]: the step would overwrite the
+    /// arena they read); nothing waits, and this does nothing, on every
+    /// pass that runs a proposal.
+    fn before_plain(&mut self, t: &mut Session<B>, last: u32) -> Result<(), SessionError> {
+        self.before_step(t, last)
     }
 }

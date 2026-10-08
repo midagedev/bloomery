@@ -3,8 +3,7 @@
 //! walk, the last prompt unit, why the draft skips, the last join) and decides
 //! every call from positions, the context, token ids and arena kinds alone —
 //! which waiting rows a call walks and in which mode, the anchor a step
-//! records and whether its store bytes are written in the same call, the join
-//! checks, the refusals and the sequence a park keeps.
+//! records, the join checks, the refusals and the sequence a park keeps.
 //!
 //! The walks themselves are the executor's ([`Exec`]): a call issues them one
 //! at a time, in the order the window runs them, and the state the call
@@ -107,11 +106,6 @@ pub(super) struct Refresh<A> {
     pub(super) pos0: u32,
     pub(super) walk: A,
     pub(super) first: usize,
-    /// A store walk already wrote the rows (a step's row, [`Policy::stepped`]:
-    /// every step store-walks the refresh it records): a step after them
-    /// walks nothing for them, and the next chain walks them again for its
-    /// head.
-    pub(super) stored: bool,
 }
 
 impl<A: Copy> Refresh<A> {
@@ -248,7 +242,10 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// refresh an earlier step or window left waiting reads an arena the step
     /// may overwrite (its own), so it is walked now, its last row `last`. A
     /// draft that cannot walk it skips, the join naming why. A prompt call's
-    /// anchor is left for [`Policy::stepped`].
+    /// anchor is left for [`Policy::stepped`]. A server seat calls this
+    /// before each of its steps, and the runtime's width chooser — whose
+    /// held pass steps the target with no proposal of the draft's — before
+    /// each pass it holds back.
     pub(super) fn before_step<X: Exec<A>>(
         &mut self,
         x: &mut X,
@@ -284,7 +281,6 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                 pos0: here,
                 walk,
                 first: rows - 1,
-                stored: false,
             },
             (None, None) => return Ok(Err(NOTHING_WAITS)),
         };
@@ -442,7 +438,6 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
             pos0: pos,
             walk,
             first: rows - 1,
-            stored: false,
         });
         Ok(())
     }
@@ -522,31 +517,29 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
             pos0: p0 + 1,
             walk: self.shape.verify,
             first: 0,
-            stored: false,
         });
         Ok(())
     }
 
-    /// A plain step of `last` that left the target at `pos` of a context of
-    /// `ctx`, `next` the id taken after it: the rows that waited for the next
-    /// chain — the refresh an accept recorded, after a prompt call with no
-    /// `begin` the anchor (`last` at the prompt's end), or on a first step at
-    /// position 0 its row beside a zero hidden row — walked now, since the
-    /// step's row follows them and the store must hold every position below
-    /// the next chain's; then `next` at the position after the step, with the
-    /// hidden row the step wrote, as the next refresh, its store bytes written
-    /// in this same call: the next step overwrites that arena, and a pass the
-    /// width chooser holds back steps the target before the draft hears of it,
-    /// so no later call can be counted on to walk the row first — the next
-    /// chain walks it again for its head, and a step after it walks nothing
-    /// for it. A row past the context is left unwalked: no chain runs there.
-    /// Refused by name when the waiting rows read the step's own arena, which
-    /// the step has overwritten, unless a store walk already wrote them.
+    /// A plain step of `last` that left the target at `pos`, `next` the id
+    /// taken after it: the rows that waited for the next chain — the
+    /// refresh an accept recorded, after a prompt call with no `begin` the
+    /// anchor (`last` at the prompt's end), or on a first step at position
+    /// 0 its row beside a zero hidden row — walked now, since the step's
+    /// row follows them and the store must hold every position below the
+    /// next chain's; then `next` at the position after the step, with the
+    /// hidden row the step wrote, as the next refresh, its rows left for
+    /// the call that walks them — the chooser's hook
+    /// ([`Policy::before_step`], which the runtime calls before a pass it
+    /// holds back) or a seat's step before the next plain step, the next
+    /// chain for its head, a continuing prompt's join — so the store never
+    /// holds a position past the target's, which a sequence state needs.
+    /// Refused by name when the waiting rows read the step's own arena,
+    /// which the step has overwritten.
     pub(super) fn stepped<X: Exec<A>>(
         &mut self,
         x: &mut X,
         pos: u32,
-        ctx: u32,
         last: u32,
         next: u32,
     ) -> Result<(), Fail<X::Err>> {
@@ -560,7 +553,6 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                 pos0: pos - 1,
                 walk,
                 first: rows - 1,
-                stored: false,
             }),
             (None, None) => {
                 // A one-id prompt feeds no prompt call: the step ran position
@@ -578,7 +570,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                 None
             }
         };
-        if let Some(r) = waiting.filter(|r| !r.stored) {
+        if let Some(r) = waiting {
             if r.walk == self.shape.step {
                 return Err(Fail::Refused(Refused(format!(
                     "{WHAT}: a step after rows whose hidden rows the step's own arena held (a \
@@ -588,22 +580,12 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
             }
             x.walk(&r.as_walk(self.shape.mode)).map_err(Fail::Exec)?;
         }
-        let anchor = self.next.insert(Refresh {
+        self.next = Some(Refresh {
             tokens: vec![next],
             pos0: pos,
             walk: self.shape.step,
             first: 0,
-            stored: false,
         });
-        // The step's row reads the step's own arena, which the next step
-        // overwrites — a chooser-held pass's step reaches the draft here
-        // again with no walk between — so its store bytes are written at
-        // once. A row past the context stays unwalked: no chain runs there.
-        if (pos as usize) < ctx as usize {
-            x.walk(&anchor.as_walk(WalkMode::Store))
-                .map_err(Fail::Exec)?;
-            anchor.stored = true;
-        }
         Ok(())
     }
 }
@@ -825,25 +807,17 @@ mod tests {
                 .map_err(|e| e.to_string())
         }
 
-        /// The server's step: the draft's waiting rows, the target's step,
-        /// the draft told.
-        fn seat_step(&mut self) -> Result<(), String> {
+        /// The server's step and a pass the width chooser holds back — the
+        /// same order: the draft's waiting rows walked first (the seat's
+        /// `before_step`, the chooser's `before_plain` hook), then the
+        /// target's step, then the draft told (`stepped`, `held`).
+        fn plain_step(&mut self) -> Result<(), String> {
             let (pos, last) = (self.c.pos, self.last);
             self.p.before_step(&mut self.c, pos, last)?;
-            self.held_pass()
-        }
-
-        /// A pass the width chooser holds back, or a plain pass of the
-        /// runtime's loop: the target steps and the draft is told, no walk
-        /// between the two.
-        fn held_pass(&mut self) -> Result<(), String> {
-            let last = self.last;
             self.c.ran(Ar::Step, 1);
-            let (pos, ctx) = (self.c.pos, self.c.ctx);
+            let pos = self.c.pos;
             let next = 1000 + pos;
-            self.p
-                .stepped(&mut self.c, pos, ctx, last, next)
-                .map_err(fail)?;
+            self.p.stepped(&mut self.c, pos, last, next).map_err(fail)?;
             self.last = next;
             Ok(())
         }
@@ -924,31 +898,29 @@ mod tests {
     }
 
     /// The server's cut: the prompt call, then its last id as one plain
-    /// step, then a pass the width chooser holds back (the target steps, the
-    /// draft is told with no walk between), then a drafted pass. The cut
-    /// step store-walks the anchor it records, so the held pass finds it
-    /// written, and the drafted pass walks the anchor the held step recorded.
+    /// step, then a pass the width chooser holds back (its hook walks the
+    /// anchor the cut step recorded, before its step overwrites the arena
+    /// the anchor reads), then a drafted pass. After every call the store
+    /// holds no position past the target's — what a sequence state needs.
     #[test]
     fn a_held_pass_after_the_cut_step_takes_the_position_in() {
         let mut rig = after_prompt(64);
 
-        rig.seat_step().unwrap_or_else(|e| panic!("{e}"));
+        rig.plain_step().unwrap_or_else(|e| panic!("{e}"));
         let cut = rig.c.take();
-        let anchor_stored = rig.next().stored && rig.next().walk == Ar::Step;
-        rig.held_pass().unwrap_or_else(|e| panic!("{e}"));
+        let anchor = rig.next().clone();
+        // The store never holds a position past the target's: at the cut
+        // step's end it stands exactly at it.
+        assert_eq!((rig.c.store, rig.c.pos), (10, 10));
+        rig.plain_step().unwrap_or_else(|e| panic!("{e}"));
         let held = rig.c.take();
+        assert_eq!((rig.c.store, rig.c.pos), (11, 11));
         rig.drafted_pass(None).unwrap_or_else(|e| panic!("{e}"));
         let drafted = rig.c.take();
 
-        assert_eq!(
-            cut,
-            [
-                seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0)),
-                seen(STORE, 10, &[1010], rows_of(Ar::Step, 0)),
-            ]
-        );
-        assert!(anchor_stored);
-        assert_eq!(held, [seen(STORE, 11, &[1011], rows_of(Ar::Step, 0))]);
+        assert_eq!(cut, [seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0))]);
+        assert_eq!((anchor.pos0, anchor.walk), (10, Ar::Step));
+        assert_eq!(held, [seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0))]);
         assert_eq!(drafted, [seen(HEAD, 11, &[1011], rows_of(Ar::Step, 0))]);
     }
 
@@ -965,7 +937,6 @@ mod tests {
             (&anchor.tokens[..], anchor.pos0, anchor.walk, anchor.first),
             (&[1009][..], 9, Ar::Ubatch, 0)
         );
-        assert!(!anchor.stored);
 
         rig.drafted_pass(None).unwrap();
         assert_eq!(
@@ -974,8 +945,8 @@ mod tests {
         );
         let r = rig.next();
         assert_eq!(
-            (&r.tokens[..], r.pos0, r.walk, r.stored),
-            (&[500, 501, 502, 2003][..], 10, Ar::Pass, false)
+            (&r.tokens[..], r.pos0, r.walk),
+            (&[500, 501, 502, 2003][..], 10, Ar::Pass)
         );
 
         rig.drafted_pass(Some(2)).unwrap();
@@ -995,13 +966,13 @@ mod tests {
     #[test]
     fn begin_keeps_the_cut_steps_anchor_and_refuses_an_unseen_prompt() {
         let mut rig = after_prompt(64);
-        rig.seat_step().unwrap();
+        rig.plain_step().unwrap();
         let anchor = rig.next().clone();
         rig.begin().unwrap();
         let kept = rig.next();
         assert_eq!(
-            (&kept.tokens, kept.pos0, kept.stored),
-            (&anchor.tokens, anchor.pos0, true)
+            (&kept.tokens, kept.pos0, kept.walk),
+            (&anchor.tokens, anchor.pos0, anchor.walk)
         );
 
         let mut fresh = Rig::new(64);
@@ -1011,27 +982,26 @@ mod tests {
 
     /// Two of the server's steps in a row: the second one's waiting rows
     /// (the first one's anchor, still in the step's arena) are walked before
-    /// its step, and its own anchor is store-walked after it.
+    /// its step overwrites them, and its own anchor waits for the next call.
     #[test]
     fn two_plain_steps_in_a_row() {
         let mut rig = after_prompt(64);
-        rig.seat_step().unwrap();
+        rig.plain_step().unwrap();
         rig.c.take();
-        rig.seat_step().unwrap();
+        rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [
-                seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0)),
-                seen(STORE, 11, &[1011], rows_of(Ar::Step, 0)),
-            ]
+            [seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0))]
         );
-        assert!(rig.next().stored);
+        assert_eq!(
+            (rig.next().pos0, rig.next().walk, rig.c.store, rig.c.pos),
+            (11, Ar::Step, 11, 11)
+        );
     }
 
     /// A held pass in the middle of a generation: the refresh the accept
-    /// recorded (in the verify's arena) is walked before the step, the
-    /// step's anchor is store-walked, and a second held pass in a row walks
-    /// only its own anchor.
+    /// recorded (in the verify's arena) is walked before the step, and a
+    /// second held pass in a row walks the first one's anchor the same way.
     #[test]
     fn a_held_pass_mid_generation() {
         let mut rig = after_prompt(64);
@@ -1039,34 +1009,38 @@ mod tests {
         rig.drafted_pass(None).unwrap();
         rig.c.take();
 
-        rig.held_pass().unwrap();
+        rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [
-                seen(HEAD, 10, &[500, 501, 502, 2003], rows_of(Ar::Pass, 0)),
-                seen(STORE, 14, &[1014], rows_of(Ar::Step, 0)),
-            ]
+            [seen(HEAD, 10, &[500, 501, 502, 2003], rows_of(Ar::Pass, 0))]
         );
-        rig.held_pass().unwrap();
+        rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [seen(STORE, 15, &[1015], rows_of(Ar::Step, 0))]
+            [seen(HEAD, 14, &[1014], rows_of(Ar::Step, 0))]
         );
         rig.drafted_pass(None).unwrap();
     }
 
     /// A step that ends at the context: its row is left unwalked, since no
-    /// chain runs there, and the refresh it records waits unstored.
+    /// chain runs there, and the refresh it records waits for a call that
+    /// never comes.
     #[test]
     fn a_step_past_the_context_leaves_its_row_unwalked() {
         let mut rig = after_prompt(11);
-        rig.seat_step().unwrap();
-        rig.c.take();
-        rig.held_pass().unwrap();
+        rig.plain_step().unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0))]
+        );
+        rig.plain_step().unwrap();
         assert_eq!(rig.c.pos, 11);
-        assert!(rig.c.take().is_empty());
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0))]
+        );
         let r = rig.next();
-        assert_eq!((r.pos0, r.walk, r.stored), (11, Ar::Step, false));
+        assert_eq!((r.pos0, r.walk), (11, Ar::Step));
     }
 
     /// A prompt fed by steps leaves its last row in the step's arena, which
@@ -1076,7 +1050,7 @@ mod tests {
     fn a_prompt_fed_by_steps_is_refused_at_the_first_step() {
         let mut rig = Rig::new(64);
         rig.prompt(&IDS, 1, Ar::Step).unwrap();
-        let why = rig.seat_step().unwrap_err();
+        let why = rig.plain_step().unwrap_err();
         assert!(
             why.contains(
                 "a step after rows whose hidden rows the step's own arena held (a prompt fed by \
@@ -1098,8 +1072,8 @@ mod tests {
         assert!(rig.p.skipping());
         rig.c.take();
 
-        rig.seat_step().unwrap();
-        rig.held_pass().unwrap();
+        rig.plain_step().unwrap();
+        rig.plain_step().unwrap();
         assert!(rig.c.take().is_empty());
         assert!(rig.p.next.is_none() && rig.p.last_unit.is_none());
         assert!(
@@ -1121,7 +1095,7 @@ mod tests {
     #[test]
     fn a_continuing_prompt_walks_the_waiting_rows_with_its_first_id() {
         let mut rig = after_prompt(64);
-        rig.seat_step().unwrap();
+        rig.plain_step().unwrap();
         rig.c.take();
         rig.prompt(&[20, 21, 22], 3, Ar::Ubatch).unwrap();
         assert_eq!(
@@ -1157,14 +1131,14 @@ mod tests {
         );
 
         let mut rig = after_prompt(64);
-        rig.seat_step().unwrap();
+        rig.plain_step().unwrap();
         rig.c.pos += 2;
         rig.prompt(&IDS[..2], 2, Ar::Ubatch).unwrap();
         let got = rig.p.take_joined().unwrap();
         assert_eq!((got.start, got.skipped), (12, Some(ENDS_ELSEWHERE)));
 
         let mut rig = after_prompt(64);
-        rig.seat_step().unwrap();
+        rig.plain_step().unwrap();
         rig.c.store = 5;
         rig.prompt(&IDS[..2], 2, Ar::Ubatch).unwrap();
         let got = rig.p.take_joined().unwrap();
@@ -1271,7 +1245,7 @@ mod tests {
         rig.drafted_pass(None).unwrap();
         let verify = rig.p.park();
         assert!(verify.skip.is_none() && verify.next.as_ref().unwrap().walk == Ar::Pass);
-        rig.held_pass().unwrap();
+        rig.plain_step().unwrap();
         let step = rig.p.park();
         assert!(step.skip.is_none() && step.next.as_ref().unwrap().walk == Ar::Step);
 
@@ -1280,7 +1254,7 @@ mod tests {
         rig.p.unpark(&verify);
         assert_eq!(rig.next().walk, Ar::Pass);
         rig.p.unpark(&step);
-        assert!(rig.next().stored && rig.p.joined.is_none());
+        assert!(rig.next().walk == Ar::Step && rig.p.joined.is_none());
 
         let mut by_steps = Rig::new(64);
         by_steps.prompt(&IDS, 1, Ar::Step).unwrap();
@@ -1293,61 +1267,57 @@ mod tests {
         assert_eq!(skipping.p.park().skip, Some(NOTHING_WAITS));
     }
 
-    /// A walk that fails ends the call with the state it had reached: the
-    /// anchor recorded, its store bytes not marked written.
+    /// A walk that fails ends the call with the error, the target unmoved
+    /// (the hook's walk runs before the step) and the rows it was to walk
+    /// taken without being walked: the draft holds nothing waiting, and
+    /// nothing it skips — the next chain refuses by name.
     #[test]
-    fn a_failed_anchor_walk_leaves_the_anchor_unstored() {
+    fn a_failed_waiting_rows_walk_leaves_the_target_unmoved() {
         let mut rig = after_prompt(64);
-        rig.c.fail_after = Some(1);
-        let why = rig.seat_step().unwrap_err();
+        rig.plain_step().unwrap();
+        rig.c.take();
+        rig.c.fail_after = Some(0);
+        let why = rig.plain_step().unwrap_err();
         assert_eq!(why, "the card refused the walk");
-        assert_eq!(
-            rig.c.take(),
-            [seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0))]
-        );
-        let r = rig.next();
-        assert_eq!((r.pos0, r.walk, r.stored), (10, Ar::Step, false));
+        assert_eq!(rig.c.pos, 10);
+        assert!(rig.p.next.is_none() && rig.p.last_unit.is_none());
+        assert!(!rig.p.skipping());
     }
 
-    /// No call order the seats and the generation loop can produce leaves a
-    /// refresh that reads the step's arena unwritten at a call boundary, and
-    /// none ends in a refusal: every sequence of up to five calls from the
-    /// seat's step, a held pass and a drafted pass (keeping one row or all)
-    /// over a prompt, started by `begin` or by the server's cut step, runs
-    /// without a refusal, each of its walks one the card model accepts.
+    /// No call order the seats and the generation loop can produce leaves
+    /// the draft's store holding a position at or past the target's — what
+    /// a sequence state needs to save the draft's side — and none ends in a
+    /// refusal: every sequence of up to six calls from a plain step (the
+    /// seat's step and a pass the width chooser holds back, one order) and
+    /// a drafted pass (keeping one row or all) over a prompt, started by
+    /// `begin` or by the server's cut step, runs without a refusal, each of
+    /// its walks one the card model accepts, and after every call the store
+    /// holds no position past the target's. The runtime's own plain loop —
+    /// a step with no walk before it, which is what refused here once —
+    /// never follows a cut step (its steps come only after the draft's own
+    /// proposal), so it is not among the calls.
     #[test]
-    fn no_call_sequence_leaves_a_step_row_unstored_or_refused() {
+    fn no_call_sequence_leaves_the_store_past_the_target_or_refuses() {
         #[derive(Clone, Copy, Debug)]
         enum Call {
-            Seat,
-            Held,
+            Plain,
             Drafted(Option<usize>),
         }
-        const CALLS: [Call; 4] = [
-            Call::Seat,
-            Call::Held,
-            Call::Drafted(Some(1)),
-            Call::Drafted(None),
-        ];
+        const CALLS: [Call; 3] = [Call::Plain, Call::Drafted(Some(1)), Call::Drafted(None)];
 
         fn run(rig: &mut Rig, calls: &[Call]) -> Result<(), String> {
             for (i, call) in calls.iter().enumerate() {
                 match *call {
-                    Call::Seat => rig.seat_step(),
-                    Call::Held => rig.held_pass(),
+                    Call::Plain => rig.plain_step(),
                     Call::Drafted(kept) => rig.drafted_pass(kept),
                 }
                 .map_err(|e| format!("call {} ({call:?}): {e}", i + 1))?;
-                if let Some(r) = &rig.p.next
-                    && r.walk == Ar::Step
-                    && !r.stored
-                    && (r.pos0 as usize) < rig.c.ctx as usize
-                {
+                if rig.c.store > rig.c.pos as usize {
                     return Err(format!(
-                        "call {} ({call:?}): a refresh at position {} reads the step's arena \
-                         and waits unwritten",
+                        "call {} ({call:?}): the store holds {} positions, the target at {}",
                         i + 1,
-                        r.pos0
+                        rig.c.store,
+                        rig.c.pos
                     ));
                 }
             }
@@ -1369,9 +1339,9 @@ mod tests {
         for arena in [Ar::Ubatch, Ar::Pass] {
             for begun in [true, false] {
                 let (first, len) = if begun {
-                    (&[][..], 5)
+                    (&[][..], 6)
                 } else {
-                    (&[Call::Seat][..], 4)
+                    (&[Call::Plain][..], 5)
                 };
                 each(len, &mut Vec::new(), &mut |calls| {
                     let mut rig = Rig::new(64);
@@ -1387,6 +1357,6 @@ mod tests {
                 });
             }
         }
-        assert_eq!(count, 2 * (1365 + 341));
+        assert_eq!(count, 2 * (1093 + 364));
     }
 }
