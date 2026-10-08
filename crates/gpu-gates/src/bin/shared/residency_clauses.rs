@@ -171,7 +171,14 @@ pub fn transform_check(
 /// at least one expert admitted and no part differing (a gate whose clause
 /// reads more of the source than the check does prints its own line).
 pub fn transform_verdict(checked: usize, bad: &[String]) -> bool {
-    let ok = checked > 0 && bad.is_empty();
+    transform_verdict_with(checked, bad, true)
+}
+
+/// [`transform_verdict`] where the admitted expert is required only when `admitted_required`: a
+/// file whose routing has no skew admits none (the fixture's), and the parts that differ from a
+/// static load are the clause there.
+pub fn transform_verdict_with(checked: usize, bad: &[String], admitted_required: bool) -> bool {
+    let ok = (checked > 0 || !admitted_required) && bad.is_empty();
     println!(
         "transform: {checked} admitted experts, {} parts differ from a static load{}: {}",
         bad.len(),
@@ -195,6 +202,18 @@ pub fn table_clause(
     landed: usize,
     what: &str,
 ) -> Result<bool, GateError> {
+    table_clause_with(r, start, landed, what, true)
+}
+
+/// [`table_clause`] where the copy must be off `start` by at least one entry only when
+/// `moved_required` (a history that landed no flip leaves the copy at its start).
+pub fn table_clause_with(
+    r: &Residence<'_>,
+    start: &[u32],
+    landed: usize,
+    what: &str,
+    moved_required: bool,
+) -> Result<bool, GateError> {
     let t = r.table()?;
     let c = r.check(&t)?;
     let vs_start = t.differ(start)?;
@@ -202,7 +221,7 @@ pub fn table_clause(
     let ok = c.vs_map == 0
         && c.vs_ledger == Some(0)
         && c.doubled == 0
-        && vs_start > 0
+        && (vs_start > 0 || !moved_required)
         && vs_start <= 2 * landed;
     println!(
         "table: the card's copy after {what}: {} entries off the host map, {:?} off the \
@@ -379,7 +398,13 @@ pub fn static_row0<B: Prompt + Keep>(
 /// flips land (`landed` of them; `tokens` the history's token count for the
 /// line).
 pub fn c1_clause(tokens: usize, landed: usize, same: bool) -> bool {
-    let c1 = same && landed > 0;
+    c1_clause_with(tokens, landed, same, true)
+}
+
+/// [`c1_clause`] where a flip must land only when `flips_required` (the router's skew is a
+/// property of the file; the histories' equality is the clause where it has none).
+pub fn c1_clause_with(tokens: usize, landed: usize, same: bool, flips_required: bool) -> bool {
+    let c1 = same && (landed > 0 || !flips_required);
     println!(
         "c1: the history twice, {} tokens, {} flips landed: same {}: {}",
         tokens,

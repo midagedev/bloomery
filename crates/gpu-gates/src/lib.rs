@@ -110,13 +110,22 @@ pub fn checks_failed() -> GateError {
 /// so the printed name is the file that was opened. Under `BLOOMERY_TIER=fixture`
 /// ([`tier`]) the file must be a whole fixture: a path that is not one is a
 /// named error here, never a gate that ran on a real file under the fixture's
-/// name. The real tier, and no tier, return the path unread.
+/// name. The real tier, and no tier, return the path unread. A command that
+/// runs the V4.1 profile reads the file's other owner too (`gguf::v41`, which
+/// the engine's placement, the oracle sets and the tokenizer read): the two
+/// naming different files is that owner's named error, raised here before any
+/// gate opens either.
 pub fn ref_model_path() -> Result<PathBuf, GateError> {
     let path = if let Some(p) = model_file::model_file() {
         p.clone()
     } else {
         match std::env::var_os("BLOOMERY_REF_MODEL") {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
+            Some(p) if !p.is_empty() => {
+                if gguf::v41::PathEnv::from_env().runs_v41() {
+                    gguf::v41::try_model()?;
+                }
+                PathBuf::from(p)
+            }
             _ => return Err(hf::source::NONE.into()),
         }
     };

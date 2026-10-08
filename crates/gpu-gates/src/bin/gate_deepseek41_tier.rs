@@ -1,8 +1,9 @@
 //! GPU gate for the V4.1 expert tier (`bloomery_gpu::host::tier`), on one
 //! card: the loopback. The stage and the tier both run on the gate card
-//! (`crate::gate_card::plan_gate`), two `Gpu`s on it. Each routed layer's card
-//! list is its id prefix `[0, n_l)`. The tiered plan moves the last [`K3`] of
-//! them, ids `n_l - K3 .. n_l`, from card 0 to device 1 (the tier) through
+//! (`crate::ds41_tier::plan_gate`: the 3090's bytes in the real tier, the largest visible card
+//! under the header's card budget in the fixture tier), two `Gpu`s on it. Each routed layer's card
+//! list is its id prefix `[0, n_l)`. The tiered plan moves the last `k3` ([`tier_depth`]) of
+//! them, ids `n_l - k3 .. n_l`, from card 0 to device 1 (the tier) through
 //! the placement's own split (`placement::routed_row`): the (b′) shape, the
 //! stage the first ids and the tier the next ones, on the gate machine
 //! with (b′)'s tier card and its prompt-batch reserves beside the stage card
@@ -72,6 +73,10 @@
 //!   positions and every row bit for bit. Preconditions: the calls ran two
 //!   batches as one group of [`BATCH_GROUP`], the wide call handed rows over
 //!   from both batches, and it sent every tier layer a routed slot.
+//!
+//! Every clause is self-consistency (the tiered load against the reference load or against the
+//! same file fed another way), so the fixture tier runs all of them; each names its tag once
+//! through `crate::ds41_tier::sc` before it runs, and the closing line counts them.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -99,6 +104,14 @@ mod dspark;
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the card, the path and the clause tags; the triangle's facts serve the prefill gate"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::time::Instant;
 
@@ -111,6 +124,7 @@ mod gate {
         self, Body, BodyMeta, DECODE_INPUT, Deepseek41Model, FeatureRows, OpenCfg, PrefillMode,
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
@@ -125,12 +139,10 @@ mod gate {
     use crate::dspark;
 
     const NAME: &str = "gate_deepseek41_tier";
-    /// Experts per routed layer the tier takes from the cold end of the gate
-    /// plan's card list: the (b′) plan's tier depth, 873 tier experts over
-    /// its 38 hybrid layers ≈ 23 a layer [derived]. A carve from the
-    /// gate plan's own card list costs no card bytes, so the 3090's free
-    /// bytes after the load bound nothing here.
-    const K3: usize = 23;
+    /// The real file's tier depth, as the literal this gate carried before [`tier_depth`] derived
+    /// it: the (b′) plan's 881 tier experts over its 38 hybrid layers are 23.2 a layer, which
+    /// rounds to 23. The real tier prints the derived depth beside it and requires them equal.
+    const REAL_K3: usize = 23;
     /// Prompt positions, fed one decode step each.
     const PROMPT: usize = 16;
     /// Greedy steps after the prompt.
@@ -275,6 +287,46 @@ mod gate {
         }
         out.host = bp.host;
         Ok(out)
+    }
+
+    /// Experts per routed layer the tier takes from the cold end of the gate plan's card list: the
+    /// (b′) plan's tier depth — the mean of its tier experts over the layers that have any, rounded
+    /// down after a half added, read from `workstation::plan_bp` planned over the same file with
+    /// the DSpark draft's reserve (`reserve`, from the draft's header) under `place`, the levers
+    /// of that plan. A carve from the gate plan's own card list costs no card bytes, so the 3090's
+    /// free bytes after the load bound nothing here; a depth the gate plan's lists cannot give is
+    /// [`tiered`]'s named error. The real tier prints the derived depth beside [`REAL_K3`].
+    fn tier_depth(
+        inputs: &PlanInputs,
+        place: &model::placement::PlanLevers,
+        reserve: u64,
+    ) -> Result<usize, GateError> {
+        let bp = workstation::plan_bp(inputs.hp.n_layer, Some(reserve), tier_batch(&inputs.hp));
+        let plan = inputs.plan(&bp, workstation::CTX_MAX, place)?;
+        let per: Vec<u64> = plan
+            .tier_n_l
+            .first()
+            .ok_or("plan (b′) has no tier card")?
+            .iter()
+            .copied()
+            .filter(|&n| n > 0)
+            .collect();
+        let layers = per.len() as u64;
+        if layers == 0 {
+            return Err("plan (b′) puts no expert on its tier card".into());
+        }
+        let total: u64 = per.iter().sum();
+        let depth = usize::try_from((total + layers / 2) / layers)?;
+        println!(
+            "tier depth: plan (b′) with the draft's reserve of {reserve} B puts {total} experts on \
+             its tier over {layers} layers: {depth} a layer"
+        );
+        if !bloomery_gpu_gates::tier::witness("tier depth K3", depth, REAL_K3) {
+            return Err(
+                format!("the derived tier depth {depth} is not the literal {REAL_K3}").into(),
+            );
+        }
+        Ok(depth)
     }
 
     /// Whether `r` is the host tier's refusal ([`GpuError::HostPoisoned`])
@@ -610,17 +662,62 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::gate_card::init()?;
+        crate::ds41_tier::init()?;
         let args = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         // The batch clauses run the prompt call, so the tiered load makes its
         // buffers (`Body::open_placed_tiered`).
         cfg.body.prefill = PrefillMode::Batch;
-        let path = workstation::model_v41();
+        let path = crate::ds41_tier::model_path()?;
         let split = || Split::open(&path).map_err(|e| format!("open {path}: {e}"));
+        // The draft is read for its header only (B8), so the plan reserves nothing for it.
+        cfg.place = bloomery_gpu_gates::tier::plan_levers(&split()?, &levers, 0)?;
         let inputs = PlanInputs::read(&split()?)?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let machine = crate::ds41_tier::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
+        for (on, name) in [
+            (
+                args.union,
+                "T1: the tiered load is the reference load, step, pairs, eager",
+            ),
+            (
+                args.fault,
+                "T2: a fault on the tier card's word is the step's error and poison",
+            ),
+            (
+                args.lost,
+                "T3: the held tier stream is named as a lost card",
+            ),
+            (
+                args.two,
+                "T7: an expert on two devices is refused before any upload",
+            ),
+            (args.batch, "B7: one batch is the steps"),
+            (
+                args.batch2,
+                "B7 group: two batches as one group are the reference's call",
+            ),
+            (
+                args.bfault,
+                "B2: a tier fault before a prompt call is the call's error",
+            ),
+            (
+                args.blost,
+                "B3: the held tier stream fails a prompt call by name",
+            ),
+            (
+                args.bfirst,
+                "B3f: the first prompt call of a fresh load fails by name",
+            ),
+            (
+                args.bfeat,
+                "B8: the feature tap through a tiered prompt call is the steps'",
+            ),
+        ] {
+            if on {
+                crate::ds41_tier::sc(name)?;
+            }
+        }
         let meta = BodyMeta {
             hp: inputs.hp.clone(),
             levers: cfg.body,
@@ -633,21 +730,29 @@ mod gate {
             device,
         };
         let tmachine = tier_machine(&machine, &inputs.hp)?;
-        let tplan = tiered(&plan, &tmachine, K3, false)?;
+        let draft = dspark::draft_hparams()?;
+        let reserve = dspark::draft_reserve(Place::Bp, &draft.0, std::path::Path::new(&path))?
+            .ok_or("plan (b′) made no draft reserve")?;
+        let k3 = tier_depth(
+            &inputs,
+            &bloomery_gpu_gates::tier::plan_levers(&split()?, &levers, reserve)?,
+            reserve,
+        )?;
+        let tplan = tiered(&plan, &tmachine, k3, false)?;
         let tier_layers: Vec<usize> = (0..inputs.model.layers)
             .filter(|&l| tplan.n_l.get(l) != plan.n_l.get(l))
             .collect();
         println!(
-            "plan: gate card {card}, {} experts on it by the id prefix; tier: the last {K3} of each \
+            "plan: gate card {card}, {} experts on it by the id prefix; tier: the last {k3} of each \
              routed layer's list on {} layers ({} experts), stage keeps the rest",
             plan.cards[0].experts,
             tier_layers.len(),
-            K3 * tier_layers.len()
+            k3 * tier_layers.len()
         );
         let mut pass = true;
 
         if args.two {
-            let bad = tiered(&plan, &tmachine, K3, true)?;
+            let bad = tiered(&plan, &tmachine, k3, true)?;
             let t0 = Instant::now();
             match open(split()?, &bad, Some(tier_open()), &meta) {
                 Err(e @ GpuError::Plan { what, .. })
@@ -844,6 +949,7 @@ mod gate {
     }
 
     fn verdict(pass: bool) -> Result<(), GateError> {
+        println!("{NAME}: {}", bloomery_gpu_gates::tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }

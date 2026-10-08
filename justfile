@@ -1342,6 +1342,8 @@ gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfea
 # --lost: the tier's stream held behind a host flag, the step named as a lost card within the deadline, no token,
 # CardLost, the next step refused; not in the landing run: weekly-gpu-ds41-lost runs it. Two loads, one after the
 # other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a batch.
+# Group solo, reason r2 (both cards: the plan (b′) holds the stage on the A6000 and the tier and the draft on the 3090 at once): a
+# fixture-tier run keeps it, so it stays `solo`, not `solo-real`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-twocard *ARGS='--union':
@@ -1353,10 +1355,11 @@ gate-gpu-ds41-twocard *ARGS='--union':
 # the step fails within the go deadline and its grace naming the lost card, the host tier is poisoned as a lost card
 # (CardLost), the next call or step is refused by that poison and a reset by name. Weekly: `just weekly` runs it, and
 # `just affected` names it when a file its triggers in tools/gate-paths.tsv match changes. Alone in a batch.
+# Group solo, reason r2 (the twocard leg holds both cards): a fixture-tier run keeps it, so it stays `solo`, not `solo-real`.
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-lost:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard --lost'
 
 # 상주 교체의 r8 → Q3_K 풀기(`ds41_r8_q3k_groups`, 그룹 하나를 블록 하나가 제자리에서): 무작위 r8 워드를 V4.1 파트
@@ -1377,6 +1380,7 @@ gate-gpu-ds41-unpack:
 # nothing and gives the same argmax and logits), s1 (a 1,536-id call and 8 steps free and with the copy stream held 1 s:
 # the same picks per group and layer, tokens and logits), s3 (4 prose and 4 code windows of 512 ids, streaming off and
 # on: where they first differ, on's top-1 margin below 1.5). Both cards, alone in a batch.
+# Group solo, reason r2 (both cards: plan (b′) on the A6000 and the 3090 at once): a fixture-tier run keeps it, so it stays `solo`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-callstream *ARGS:
@@ -1386,6 +1390,8 @@ gate-gpu-ds41-callstream *ARGS:
 # (gate_ds41_callstream --place a --only residency; the tier clause asks that the host map holds no tier entry), and
 # the static clause, whose load of the dumped card table follows the residency load's teardown. The A6000 alone, the
 # host set locked, one load at a time, alone in a batch.
+# Group solo, reason r2 (box.sh picks its card, `BLOOMERY_CARD=a6000`; its host set is locked too, r1 on the real file, ~15 GB on
+# a fixture): `solo-real` takes no box.sh card pick (gate-batch refuses it), so it stays `solo` in both tiers.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-residency-a:
@@ -1474,16 +1480,20 @@ gate-gpu-ds41-draft:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/draft-gate && rm -rf $D && mkdir -p $D && C=$(head -n 128 "$BLOOMERY_DATA/engram/corpus-code.ids" | paste -sd, -) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=lookup bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-draft.log && grep -h "^draft summary " $D/code-draft.log && grep "^tokens " $D/code-plain.log > $D/code-plain.tok && grep "^tokens " $D/code-draft.log > $D/code-draft.tok && echo "code plain $(cat $D/code-plain.tok)" && echo "code draft $(cat $D/code-draft.tok)" && cmp $D/code-plain.tok $D/code-draft.tok && echo "code: tokens identical" && S=$(grep "^draft summary " $D/code-draft.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "code: accepts $A of $P proposals: both branches ran" && echo "gate-gpu-ds41-draft: PASS"'
 
 # The DSpark loop (3090, placement gate). gate_deepseek41_dsloop: the target's feature tap of the draft's target_layers
-# (header only) — node counts pinned, each mean right after the MoE join before its tapped layer, and its features
-# equal, bit for bit, the host mean of the eagerly read streams for the eager step, the graph step and both rows of
-# a pair pass. Then generate_ds41 prompt row 0, -n 64, plain and BLOOMERY_DRAFT=dspark, both under the same card
-# budget so the 8.5 GB draft fits beside the target on the 3090: red unless the tokens lines are identical and the
-# draft summary's proposals equal its passes (the draft arm runs at BLOOMERY_MTP_WIDTH=fixed: the gate pins the draft's
-# tokens on every pass, not the width chooser, whose `cost` mode decides on host wall time) and its accepts are neither
-# 0 nor every proposal. Logs in target/dsloop-gate/.
+# (header only) — node counts equal the step's predicted nodes plus the taps, each mean right after the MoE join before
+# its tapped layer, and its features equal, bit for bit, the host mean of the eagerly read streams for the eager step,
+# the graph step and both rows of a pair pass. Then generate_ds41 prompt row 0, -n 64, plain and BLOOMERY_DRAFT=dspark,
+# both under the same card budget so the 8.5 GB draft fits beside the target on the 3090: red unless the tokens lines
+# are identical and the draft summary's proposals equal its passes (the draft arm runs at BLOOMERY_MTP_WIDTH=fixed: the
+# gate pins the draft's tokens on every pass, not the width chooser, whose `cost` mode decides on host wall time) and
+# its accepts are neither 0 nor every proposal. Logs in target/dsloop-gate/.
+# Fixture tier (BLOOMERY_TIER=fixture): every step runs on the one card the runner takes, generate_ds41 at --place a under
+# the fixture's header budget (the one box.sh exports, the draft beside the target on that card), and the draft's accept
+# rate, which the fixture's random draft does not have, is left to the real tier by a deferred line.
+# Lane A (fixed 3090) in both tiers: the real tier's generate_ds41 calls are --place gate, which opens the 3090 by name.
 [group('v41-load')]
 gate-gpu-ds41-dspark-loop:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin gate_deepseek41_dsloop && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_dsloop --structure --tap && D=target/dsloop-gate && rm -rf $D && mkdir -p $D && export BLOOMERY_CARD_BUDGET=13G && bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log && grep -h "^load draft=\|^draft summary " $D/dspark.log && grep "^tokens " $D/plain.log > $D/plain.tok && grep "^tokens " $D/dspark.log > $D/dspark.tok && echo "plain $(cat $D/plain.tok)" && echo "dspark $(cat $D/dspark.tok)" && cmp $D/plain.tok $D/dspark.tok && echo "tokens identical" && S=$(grep "^draft summary " $D/dspark.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && N=$(echo "$S" | sed -n "s/.* passes=\([0-9]*\).*/\1/p") && [ -n "$N" ] && [ "$P" = "$N" ] && echo "proposals $P = passes $N: every pass verified a proposal" && [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "accepts $A of $P proposals: both branches ran" && echo "gate-gpu-ds41-dspark-loop: PASS"'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin gate_deepseek41_dsloop && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_dsloop --structure --tap && D=target/dsloop-gate && rm -rf $D && mkdir -p $D && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; else export BLOOMERY_CARD_BUDGET=13G && bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; fi && grep -h "^load draft=\|^draft summary " $D/dspark.log && grep "^tokens " $D/plain.log > $D/plain.tok && grep "^tokens " $D/dspark.log > $D/dspark.tok && echo "plain $(cat $D/plain.tok)" && echo "dspark $(cat $D/dspark.tok)" && cmp $D/plain.tok $D/dspark.tok && echo "tokens identical" && S=$(grep "^draft summary " $D/dspark.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && N=$(echo "$S" | sed -n "s/.* passes=\([0-9]*\).*/\1/p") && [ -n "$N" ] && [ "$P" = "$N" ] && echo "proposals $P = passes $N: every pass verified a proposal" && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then echo "deferred(real) file-bound: accepts $A of $P proposals (the real draft accept rate)"; else [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "accepts $A of $P proposals: both branches ran"; fi && echo "gate-gpu-ds41-dspark-loop: PASS"'
 
 # V4.1 배치 프리필(`body::prefill`)을 게이트 배치에서: corpus-prose.ids 앞부분으로 4096스텝 디코드 오라클을 한 번 뜨고(DSpark
 # 드래프트의 특징 탭 포함), P ∈ {1, 127, 128, 129, 511, 512, 513, 2300, 4096}과 분할 700+400·1800+1000·300+2700마다 모든 층의 창 링·

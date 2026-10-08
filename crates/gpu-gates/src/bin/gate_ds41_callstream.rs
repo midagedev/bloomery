@@ -1,5 +1,6 @@
 //! GPU gate for V4.1's host streaming in a prompt call (`body::prefill`,
-//! `BLOOMERY_HOSTSTREAM=on`) on the real model: plan (b′) on both cards
+//! `BLOOMERY_HOSTSTREAM=on`) on the real model (the fixture in the fixture tier, planned under
+//! its header's card budget): plan (b′) on both cards
 //! (`--place bp`), the residency machine over the stage card's routed stacks
 //! at `mid-p40-s1`, groups of [`GROUP`] batches, streaming on at the load
 //! (set here; the lever itself is refused, so the environment cannot move
@@ -72,6 +73,11 @@
 //!
 //! `off` keeps a prompt call bit for bit the decode steps' (the prefill
 //! gate); this gate judges `on`, whose bits are the band's.
+//!
+//! Tiers: every equality and structure clause is self-consistency and runs on a fixture. What the
+//! real file's routing skew makes true — a call admits an expert, a later group admits, every
+//! `on` call admits — is a file-bound premise (`tier::premise`) the fixture tier defers: its
+//! generated router has no skew, and the arms' equalities hold the rest of each clause.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -96,12 +102,30 @@ mod ds41_open;
 mod quiet;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gate_card.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate plans on the placement's own cards; the tier glue names the gate card"
+)]
+mod gate_card;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the levers and the clause tags; the card and the triangle's facts serve the other gates"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_residency.rs"]
 mod residency;
 
+// `pub`: the V4.1 clauses call the `_with` forms, so a private module would count the plain forms
+// dead in this bin (the GLM and Qwen3.8 gates call those).
 #[cfg(feature = "deepseek41")]
 #[path = "shared/residency_clauses.rs"]
-mod residency_clauses;
+pub mod residency_clauses;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
@@ -117,6 +141,7 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
     };
@@ -350,7 +375,14 @@ mod gate {
         let b = call(s, &ids, 0)?;
         let after_b = card_sets(s)?;
         let premises = [
-            ("A admitted an expert", a.admitted() > 0),
+            (
+                "A admitted an expert",
+                tier::premise(
+                    "s2: call A admitted an expert (the file's routing skew)",
+                    Tag::FileBound,
+                    a.admitted() > 0,
+                )?,
+            ),
             ("B admitted none", b.admitted() == 0),
             ("the card sets after B are A's", after_a == after_b),
         ];
@@ -423,11 +455,12 @@ mod gate {
         }
         let later = free.picks.iter().any(|p| p.0 >= 1 && p.2 > 0);
         let kept = free.end.is_some_and(|r| r.kept && r.restored == 0);
-        let ok = free.picks == held.picks
-            && free.out == held.out
-            && free.admitted() > 0
-            && later
-            && kept;
+        let skewed = tier::premise(
+            "s1: the free call admitted an expert, in a group past the first (the file's routing skew)",
+            Tag::FileBound,
+            free.admitted() > 0 && later,
+        )?;
+        let ok = free.picks == held.picks && free.out == held.out && skewed && kept;
         println!(
             "s1: {} picks, {} experts admitted (a group past the first admitting {later}, the \
              placement kept {kept}); held {HOLD:?} ({held_ms:.0} ms): same picks {}, same call \
@@ -457,7 +490,14 @@ mod gate {
         let c = c?;
         let after_c = card_sets(s)?;
         let premises = [
-            ("A admitted an expert", a.admitted() > 0),
+            (
+                "A admitted an expert",
+                tier::premise(
+                    "s4: call A admitted an expert (the file's routing skew)",
+                    Tag::FileBound,
+                    a.admitted() > 0,
+                )?,
+            ),
             ("B admitted none", b.admitted() == 0),
             ("the card sets after C are B's", after_b == after_c),
         ];
@@ -540,7 +580,11 @@ mod gate {
                 );
             }
         }
-        ok &= idle == 0;
+        ok &= tier::premise(
+            "s3: every on call admitted an expert (the file's routing skew)",
+            Tag::FileBound,
+            idle == 0,
+        )?;
         println!(
             "{clause}: {} windows of {p} ids, {differ} differ from off within the call and \
              {S3_STEPS} steps, {idle} calls admitted nothing; every difference a near tie below \
@@ -578,7 +622,12 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOST_POPULATE, CARD_DONTNEED, R8])?;
+        let levers = bloomery_levers::at_main(&crate::ds41_tier::acts_on(&[
+            ENGRAM_HELPER,
+            HOST_POPULATE,
+            CARD_DONTNEED,
+            R8,
+        ])?)?;
         let (at, only_residency) = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.body.residency = RESIDENCY;
@@ -594,12 +643,16 @@ mod gate {
         // next pass (a job not yet due) until the machine drops.
         let flags: HostFlags;
         let path = ref_model_path()?;
-        let inputs = PlanInputs::read(
-            &Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
-        )?;
+        let head = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // The fixture tier plans under its header's card budget, the lever held equal to it; the
+        // real tier sets none, as before.
+        cfg.place = tier::plan_levers(&head, &levers, 0)?;
+        let inputs = PlanInputs::read(&head)?;
+        drop(head);
         // Plan (b′)'s tier reserves the prompt batch's bytes; plan (a) has no tier.
         let batch = (at == Place::Bp).then(|| place::tier_batch(&inputs.hp));
         let machine = at.machine(None, batch)?;
+        crate::ds41_tier::sc("refuse: a host one byte short of the churn pool is refused by name")?;
         let refused = residency::refuse_clause(&path, &inputs, &cfg, at, &machine)?;
         let t0 = Instant::now();
         let mut s = open(&path, at, machine, &cfg)?;
@@ -612,9 +665,15 @@ mod gate {
                 return Ok((pass, probe));
             }
             set_stream(s, true)?;
+            crate::ds41_tier::sc(
+                "s2: a streamed call, then the same call on its placement, give the same bits",
+            )?;
             pass &= watched("s2", || s2(s))?;
+            crate::ds41_tier::sc("s1: the picks and bits do not depend on when the copies land")?;
             pass &= watched("s1", || s1(s, &flags))?;
+            crate::ds41_tier::sc("s3: on against off, a difference is a near tie")?;
             pass &= watched("s3", || on_off(s, "s3", S3_P, S3_WINDOWS))?;
+            crate::ds41_tier::sc("s4: a group that admits nothing is the plain pass, bit for bit")?;
             pass &= watched("s4", || s4(s))?;
             Ok((pass, probe))
         };
@@ -644,6 +703,7 @@ mod gate {
             (Ok((ok, _)), _) => Ok(ok),
             (Err(e), _) => Err(e),
         };
+        println!("{NAME}: {}", tier::tally_line());
         match (pass, down) {
             (Ok(true), Ok(())) => {
                 println!("{NAME}: every clause passed");

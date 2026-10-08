@@ -32,7 +32,8 @@
 //!   row 1's layer 0 up to its go: each row carries its sites' work once, in
 //!   its own shadow.
 //! - `--skew-api`: the engine's own entry from a reset, graph mode and eager
-//!   mode: `step_pair(t, t1)` after the set's prompt against `step(t)`,
+//!   mode, the sets read for their ids alone ([`ids_of`]: the set's, or in the fixture tier the
+//!   same positions of the prose corpus at the same `top_k`): `step_pair(t, t1)` after the set's prompt against `step(t)`,
 //!   `step(t1)`, and `step_pair` + `rollback` + `step(t2)` against `step(t)`,
 //!   `step(t2)`: logits and tokens bit for bit, the two captured graphs
 //!   (one-token and pair) replayed in one process. Then deep cuts: from a
@@ -68,7 +69,9 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::workstation;
 
+use crate::ds41_tier;
 use crate::finite;
+use bloomery_gpu_gates::tier::{self, Tag, Tier};
 
 /// The sets the pair pass runs on: one whose lists are the identity and
 /// one whose indexer layers select.
@@ -128,18 +131,62 @@ pub fn clauses(
     };
     let mut pass = true;
     if c.structure {
+        ds41_tier::sc(
+            "--skew-structure: the pair pass is twice the step's nodes, its order and shadows",
+        )?;
         pass &= structure(m, &mut heads, split, hp)?;
     }
-    if c.sets {
+    // The pair against two steps on each set's injected state: the state is the ik dump's, so the
+    // fixture tier leaves it to the real one; `--skew-api` runs the same equalities through the
+    // engine's own entry.
+    if c.sets
+        && tier::run_clause(
+            "--skew-sets: the pair pass on the decode-step sets' injected state (the dump's state)",
+            Tag::FileBound,
+        )?
+    {
         for name in SETS {
             pass &= set_arms(m, &mut heads, split, hp, name)?;
         }
     }
     if c.api {
+        ds41_tier::sc(
+            "--skew-api: step_pair, rollback and the deep cuts through the engine's entry",
+        )?;
         pass &= api(m, split, hp)?;
         pass &= cuts(m, &mut heads[0], split, hp)?;
     }
     Ok(pass)
+}
+
+/// What the clauses that read a decode-step set for its ids alone take: the set's prompt, its
+/// token and the indexer's `top_k` ik ran it with.
+struct Ids {
+    before: Vec<u32>,
+    token: u32,
+    top_k: usize,
+}
+
+/// [`Ids`] of the set `name`: the set's own in the real tier, printed beside the position and
+/// `top_k` of `ds41_tier::DECODE_SETS`; in the fixture tier the ids at that position of the prose
+/// corpus and the table's `top_k`.
+fn ids_of(split: &Split, hp: &Hparams, name: &'static str) -> Result<Ids, GateError> {
+    let (at, over) = ds41_tier::decode_set(name)?;
+    if Tier::from_env()? == Tier::Fixture {
+        let ids = ds41_tier::prose_ids(at as usize + 1)?;
+        return Ok(Ids {
+            before: ids[..at as usize].to_vec(),
+            token: ids[at as usize],
+            top_k: over.unwrap_or(hp.indexer.top_k),
+        });
+    }
+    let set = open_set(split, hp, name)?;
+    ds41_tier::witness_set(name, set.pos, set.top_k, hp.indexer.top_k)?;
+    Ok(Ids {
+        before: set.before,
+        token: set.token,
+        top_k: set.top_k,
+    })
 }
 
 // ------------------------------------------------------- the set's state
@@ -948,7 +995,7 @@ fn structure(
 /// prompt, then the pair against two steps, and the pair + rollback +
 /// step against two steps.
 fn api(m: &mut Deepseek41Model, split: &Split, hp: &Hparams) -> Result<bool, GateError> {
-    let set = open_set(split, hp, STEP4)?;
+    let set = ids_of(split, hp, STEP4)?;
     let prompt = &set.before;
     let t = set.token;
     let p = u32::try_from(prompt.len())?;
@@ -1089,7 +1136,7 @@ fn cuts(
 ) -> Result<bool, GateError> {
     // The d1 set's ids of text, then greedy ids, at d1's top_k, so every
     // indexer layer selects once its stream holds more rows than that.
-    let set = open_set(split, hp, D1)?;
+    let set = ids_of(split, hp, D1)?;
     let w = hp.window;
     let total = 4 * w + 7;
     m.set_mode(StepMode::Graph);

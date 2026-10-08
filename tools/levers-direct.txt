@@ -18,7 +18,7 @@ crates/model/src/bin/bloomery-decode.rs	BLOOMERY_PROFILE,BLOOMERY_PIN_MAIN,BLOOM
 crates/gpu/src/flash.rs	BLOOMERY_FLASH_SEG,BLOOMERY_FLASH_MMA	v2fence
 crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_CARD	session
 # Paths and profile facts (audit TL-6).
-crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL	gatestoml
+crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL,BLOOMERY_REF_MODEL,BLOOMERY_REF_MODEL_PROFILE,BLOOMERY_FIXTURE_MODEL	gatestoml
 crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
 crates/model/src/bin/bloomery-decode.rs	BLOOMERY_REF_MODEL	gatestoml

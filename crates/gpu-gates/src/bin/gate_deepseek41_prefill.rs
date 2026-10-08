@@ -1,5 +1,6 @@
 //! GPU gate for the V4.1 prompt batch (`body::prefill`) on the gate
-//! placement (`crate::gate_card::plan_gate`): a batched prefill of `P` ids leaves
+//! placement (`crate::ds41_tier::plan_gate`: the 3090's bytes in the real tier, the largest
+//! visible card under the header's card budget in the fixture tier): a batched prefill of `P` ids leaves
 //! the model where `P` decode steps over the same ids leave it, bit for bit,
 //! in everything a later step or cut reads.
 //!
@@ -88,8 +89,11 @@
 //!   a reset `P` clean steps give the oracle's logits. A quantizer that
 //!   reads a column its call did not write — a slot the host serves, or one
 //!   outside the batch's block — finds the faulted call's NaN there.
-//! - **Group fault.** A clean prefill of [`GROUP_FAULT_P`] ids (four
-//!   batches) names, through its needs, a layer with card experts whose
+//! - **Group fault.** A clean prefill of `group_fault_p` ids (the most, up to
+//!   [`GROUP_FAULT_P`] = four whole batches on the real file, at which the call's even batch
+//!   split (`body::batches`) has at least three batches and the header's triangle starts a
+//!   card layer's block inside the second batch: 2048 there, 1168 on the fixture)
+//!   names, through its needs, a layer with card experts whose
 //!   block starts inside the second batch; with that layer's card experts
 //!   poisoned alone, the same prefill returns the fault at that layer as the
 //!   named error — through the host tier's check at a later serve of the
@@ -119,9 +123,13 @@
 //!   cut `0 < k <= P` that `keep_point` grants restores only written rows;
 //!   then one decode step with `ids[P]`, its logits against the oracle's
 //!   position `P`. The splits are 700 + 400, and two whose second call sits
-//!   on either side of the length where the triangle starts to cut layer 20's
-//!   block (8 + 128 · 19 = 2440 positions from an aligned end): 1800 + 1000
-//!   (the total past it, the second call short of it) and 300 + 2700.
+//!   on either side of the length where the triangle starts to cut the last
+//!   compressor owner's block (`ced_reach`: `CHUNK + window · (layers above the owner)` =
+//!   8 + 128 · 19 = 2440 positions from an aligned end on the real file, layer 20 of 40;
+//!   8 + 128 · 3 = 392 on the fixture, its layer 5 of 9): on the real file 1800 + 1000
+//!   (the total past it, the second call short of it) and 300 + 2700, on the fixture
+//!   300 + 200 and 100 + 700. A split list that does not straddle the derived reach is a named
+//!   error, and one case measures the engine's block start at the owner against it.
 //! - **Wide taps.** `P` = 1100 keeping the features of 300 positions: the
 //!   tapped layers' blocks widen past the window the triangle gives them.
 //! - **Rollback.** After a prefill of 1100 ids: a cut inside the call is
@@ -221,6 +229,14 @@ mod split;
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the card, the path, the clause tags and the triangle's facts; the levers and the decode-step table serve the other gates"
+)]
+mod ds41_tier;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::BTreeMap;
     use std::ops::Range;
@@ -265,10 +281,12 @@ mod gate {
     use gguf::quant::GgmlType;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
+    use model::arch::deepseek41::place::PlanInputs;
     use model::placement::workstation;
     use runtime::{Target, Want};
 
     use crate::{dspark, finite, split};
+    use bloomery_gpu_gates::tier;
 
     const NAME: &str = "gate_deepseek41_prefill";
     /// Positions the oracle steps at most: the longest case and one more.
@@ -285,8 +303,15 @@ mod gate {
     // held by 1 and 127/129, 1100 by the wide-taps case on the same ids,
     // 2600 by the 1800 + 1000 split and 4096.
     const CASES: [usize; 9] = [1, 127, 128, 129, 511, 512, 513, 2300, 4096];
-    /// The splits: `ids[.. a + b]` as two prefill calls (module doc).
+    /// The splits on the real file: `ids[.. a + b]` as two prefill calls (module doc).
     const SPLITS: [(usize, usize); 3] = [(700, 400), (1800, 1000), (300, 2700)];
+    /// The splits on a fixture. PIN(2026-10-08): the real list straddles the real file's reach of
+    /// 2440 positions (1800 + 1000: the second call short of it and the total past it; 300 +
+    /// 2700: the second call past it); the fixture's reach is 8 + 128 · 3 = 392 (its owner is
+    /// layer 5 of 9), where 300 + 200 puts the second call short of it and the total past it,
+    /// 100 + 700 the second call past it, and 700 + 400 stays (take-back and snapshot read the
+    /// first). [`splits`] holds either list to the derived reach.
+    const SPLITS_FIXTURE: [(usize, usize); 3] = [(700, 400), (300, 200), (100, 700)];
     /// The wide-taps case: `P` and the features it keeps.
     const WIDE: (usize, usize) = (1100, 300);
     /// The rollback case's `P` and the refused cut inside it.
@@ -297,8 +322,9 @@ mod gate {
     /// The fault-reset case's poisoned prefill: one whole batch, every column
     /// of the batch's scratch.
     const FAULT_P: usize = body::T_MAX;
-    /// The group-fault case's prefill: four whole batches, two groups of two
-    /// under the default group.
+    /// The group-fault case's prefill on the real file, as the literal it was: four whole
+    /// batches, two groups of two under the default group. The gate's length is
+    /// `ds41_tier::group_fault_p` of the header and the plan under this cap, printed beside it.
     const GROUP_FAULT_P: usize = 4 * body::T_MAX;
     /// What a raise case's outputs hold before the launch, so an output the
     /// kernel leaves alone reads back as these bits.
@@ -438,19 +464,38 @@ mod gate {
             CARD_DONTNEED,
             R8,
         ])?;
-        crate::gate_card::init()?;
+        crate::ds41_tier::init()?;
         record::at_main("gate_deepseek41_prefill", record::GATE_DEEPSEEK41_PREFILL);
         let args = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
         let layers = dhp.target_layers.clone();
-        let path = workstation::model_v41();
-        let hp = Hparams::read(&Split::open(&path).map_err(|e| format!("open {path}: {e}"))?)?;
+        let path = crate::ds41_tier::model_path()?;
+        let head = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let hp = Hparams::read(&head)?;
+        // The draft is read for its header only, so the plan reserves nothing for it.
+        cfg.place = tier::plan_levers(&head, &levers, 0)?;
+        let inputs = PlanInputs::read(&head)?;
+        let plan_machine = crate::ds41_tier::plan_gate(inputs.model.layers);
+        let gate_plan = inputs.plan(&plan_machine, workstation::CTX_MAX, &cfg.place)?;
+        drop(head);
+        let owner = crate::ds41_tier::last_owner(&hp)?;
+        let reach = crate::ds41_tier::ced_reach(&hp)?;
+        let group_p = crate::ds41_tier::group_fault_p(&hp, &gate_plan.n_l, GROUP_FAULT_P)?;
+        println!(
+            "{NAME}: derived from the header: the triangle's last owner is layer {owner} of {}, \
+             its reach {reach} positions from an aligned end; the group-fault prefill {group_p} ids",
+            hp.n_layer
+        );
+        let mut pass = tier::witness("the triangle's last owner layer", owner, 20)
+            & tier::witness("the triangle's reach (positions)", reach, 8 + 128 * 19)
+            & tier::witness("the group-fault prefill (ids)", group_p, GROUP_FAULT_P);
+        let split_list = splits(reach)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let t = Instant::now();
         let mut m = body::open(
             file,
-            crate::gate_card::plan_gate,
+            crate::ds41_tier::plan_gate,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
@@ -477,16 +522,31 @@ mod gate {
         }
         let clear_t = Instant::now();
         let mut s = Session::from_model(m, u32::try_from(workstation::CTX_MAX)?);
-        let mut pass = clear_case(&mut s, &hp)?;
+        crate::ds41_tier::sc(
+            "clear: A after B and a clear is A right after the load, every field",
+        )?;
+        pass &= clear_case(&mut s, &hp)?;
         let clear_wall = clear_t.elapsed();
         let m = s.model_mut();
         let ced = m.body(NAME)?.ced();
         let (group, group_bytes) = m.body(NAME)?.prefill_group().unwrap_or_default();
+        crate::ds41_tier::sc(
+            "attention count: a count past its source's rows raises the fault word",
+        )?;
         pass &= count_cases(m)?;
+        crate::ds41_tier::sc("router: the batch shape is the decode shape, a bad row raises")?;
         pass &= router_cases(m)?;
+        crate::ds41_tier::sc(
+            "raise sites: ids past the stack raise expert_id, the 8 and 10 slot entries",
+        )?;
         pass &= raise_cases(m, &hp)?;
+        crate::ds41_tier::sc("projections: the batch-wide launches are the chunk launches")?;
         pass &= proj_cases(m, &hp)?;
-        let splits: Vec<(usize, usize)> = if args.split { SPLITS.to_vec() } else { vec![] };
+        let splits: Vec<(usize, usize)> = if args.split {
+            split_list.to_vec()
+        } else {
+            vec![]
+        };
         let top = args
             .cases
             .iter()
@@ -516,6 +576,10 @@ mod gate {
             println!("{NAME}: the triangle is {ced}; the gate pins it on: FAIL");
             pass = false;
         }
+        crate::ds41_tier::sc(
+            "the CED triangle: the last owner's block starts the header's reach from the end",
+        )?;
+        pass &= ced_reach_case(m, &ids, owner, reach)?;
         let mut wanted: Vec<usize> = args.cases.clone();
         wanted.extend(splits.iter().map(|&(a, b)| a + b));
         if args.extra {
@@ -546,6 +610,9 @@ mod gate {
                 WIDE.1,
             ));
         }
+        crate::ds41_tier::sc(
+            "cases: a prompt call (and its splits) is the P decode steps, every cache and the logits",
+        )?;
         for (what, parts, window) in &runs {
             let t = Instant::now();
             m.reset()?;
@@ -560,21 +627,95 @@ mod gate {
                 println!("{NAME}: {what} {}", split::split(&stats, counts)?.line());
             }
             let p: usize = parts.iter().sum();
-            pass &= compare(what, &case, &oracle[&p], &rows, t);
+            pass &= compare(what, &case, &oracle[&p], &rows, t, owner);
         }
         let p_clean = args.cases.iter().copied().min().unwrap_or(1);
+        crate::ds41_tier::sc(
+            "fault, reset, clean: a poisoned prefill faults, the reset gives the oracle's numbers",
+        )?;
         pass &= fault_reset_case(m, &hp, &ids, &oracle, &rows, p_clean, dhp.window)?;
-        pass &= group_fault_case(m, &hp, &ids)?;
+        crate::ds41_tier::sc(
+            "group fault: a fault in a group is the call's named error and poison",
+        )?;
+        pass &= group_fault_case(m, &hp, &ids, group_p)?;
         if args.extra {
+            crate::ds41_tier::sc(
+                "rollback: a cut inside the call is refused, the tail is granted",
+            )?;
             pass &= rollback_case(m, &ids, &oracle)?;
+            crate::ds41_tier::sc("take back: a failed call is taken back to its start")?;
             pass &= take_back_case(m, &ids, &oracle)?;
+            crate::ds41_tier::sc("snapshot: a saved state put back is the call's")?;
             pass &= resume_case(m, &hp, &ids, &oracle)?;
         }
+        println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
         println!("PASSED: {NAME}");
         Ok(())
+    }
+
+    /// The split list of this tier, held to the derived reach `reach` (module doc): `[1]` has its
+    /// second call short of it and its total past it, `[2]` its second call past it.
+    fn splits(reach: usize) -> Result<[(usize, usize); 3], GateError> {
+        let list = match tier::Tier::from_env()? {
+            tier::Tier::Real => SPLITS,
+            tier::Tier::Fixture => SPLITS_FIXTURE,
+        };
+        let (short, past) = (list[1], list[2]);
+        if !(short.1 < reach && reach < short.0 + short.1 && past.1 > reach) {
+            return Err(format!(
+                "{NAME}: the splits {list:?} do not straddle the triangle's reach of {reach}: {}+{} \
+                 wants its second call short of it and its total past it, {}+{} its second call \
+                 past it",
+                short.0, short.1, past.0, past.1
+            )
+            .into());
+        }
+        Ok(list)
+    }
+
+    /// The triangle's anchor, measured: one prefill of the aligned `P_MAX` ids from a reset runs
+    /// the last owner's block from `P_MAX` less the header's reach (`ds41_tier::ced_reach`) and its
+    /// latent part from 0, and the last layer's block from the last chunk.
+    fn ced_reach_case(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        owner: usize,
+        reach: usize,
+    ) -> Result<bool, GateError> {
+        let p = P_MAX;
+        if !p.is_multiple_of(body::CHUNK) || p <= reach {
+            return Err(format!(
+                "{NAME}: the reach case's {p} ids are not chunk-aligned past the reach {reach}"
+            )
+            .into());
+        }
+        m.reset()?;
+        body::prefill(m, &ids[..p])?;
+        let need = m
+            .body(NAME)?
+            .prefill_need()
+            .cloned()
+            .ok_or_else(|| format!("{NAME}: a clean prefill of {p} left no needs"))?;
+        let last = need.layers.len() - 1;
+        let at = |l: usize| need.layers.get(l).map(|n| (n.part, n.full));
+        let ok =
+            at(owner) == Some((0, p - reach)) && at(last).map(|(_, f)| f) == Some(p - body::CHUNK);
+        println!(
+            "{NAME}: ced reach: after a prefill of {p} ids layer {owner} (the last owner) runs its \
+             latent part from {:?} and its block from {:?} (want 0 and {} = {p} − {reach}), layer \
+             {last} its block from {:?} (want {}): {}",
+            at(owner).map(|n| n.0),
+            at(owner).map(|n| n.1),
+            p - reach,
+            at(last).map(|n| n.1),
+            p - body::CHUNK,
+            verdict(ok)
+        );
+        m.reset()?;
+        Ok(ok)
     }
 
     /// What one arm of the clear clause leaves: every field but its time.
@@ -2227,6 +2368,7 @@ mod gate {
                 &oracle[&p],
                 rows,
                 t,
+                crate::ds41_tier::last_owner(hp)?,
             ),
             Err(e) => {
                 println!(
@@ -2285,9 +2427,9 @@ mod gate {
         m: &mut Deepseek41Model,
         hp: &Hparams,
         ids: &[u32],
+        p: usize,
     ) -> Result<bool, GateError> {
         let t = Instant::now();
-        let p = GROUP_FAULT_P;
         let runs = body::batches(0, p);
         let (Some(b1), Some(b2)) = (runs.get(1).cloned(), runs.get(2)) else {
             return Err(format!("{NAME}: group fault: {p} ids cut into {runs:?}").into());
@@ -2876,7 +3018,14 @@ mod gate {
     }
 
     /// Every field of `got` against `want` and the oracle's rows: one line.
-    fn compare(what: &str, case: &Case, want: &Snap, rows: &Rows, t: Instant) -> bool {
+    fn compare(
+        what: &str,
+        case: &Case,
+        want: &Snap,
+        rows: &Rows,
+        t: Instant,
+        owner: usize,
+    ) -> bool {
         let got = &case.snap;
         let field = |name: &str, g: &[Digest], w: &[Digest]| -> (bool, String) {
             let same = g.iter().zip(w).filter(|(a, b)| a == b).count();
@@ -2924,10 +3073,10 @@ mod gate {
         let claimed = case.unclaimed.is_none();
         let ok = shape_ok && parts.iter().all(|(o, _)| *o) && taps && claimed && logits && next;
         let text: Vec<String> = parts.into_iter().map(|(_, s)| s).collect();
-        let reach = |n: &Need| n.layers.get(20).map_or(0, |l| l.full - n.first);
+        let reach = |n: &Need| n.layers.get(owner).map_or(0, |l| l.full - n.first);
         println!(
             "{NAME}: case {what}: {} | taps {} rows from {} {} | granted cuts claimed {} | \
-             logits[P-1] {} | next step logits {} | layer 20 block cut by {:?} | {:.1} s: {}",
+             logits[P-1] {} | next step logits {} | layer {owner} block cut by {:?} | {:.1} s: {}",
             text.join(" | "),
             kept.len(),
             kept.first().map_or("-".to_string(), ToString::to_string),
