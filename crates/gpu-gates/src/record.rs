@@ -1631,11 +1631,12 @@ pub static CLEF_ROWS: Kind = Kind {
 /// The NVMe expert tier's arena over one paged load: its counters as the
 /// tier holds them (`NvTierStats`) — the misses `ensure` read, the slots
 /// filled and their bytes and wall, the evictions, the resident bytes (at
-/// or under the budget at every step) and the reads the page cache served.
+/// or under the budget at every step), the reads the page cache served, and
+/// the drops of the mapping's pages a read brought in, their bytes and wall.
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes and the reads the page cache served.",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, and the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread).",
     parts: &[
         key("budget", U64, "B"),
         key("paged", U64, "B"),
@@ -1647,6 +1648,9 @@ pub static NVTIER: Kind = Kind {
         key("resident_bytes", U64, "B"),
         key("buffered_reads", U64, ""),
         key("buffered_bytes", U64, "B"),
+        key("drops", U64, ""),
+        key("drop_bytes", U64, "B"),
+        key("drop_ns", U64, "ns"),
     ],
 };
 
@@ -3213,7 +3217,10 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("evictions", s.evictions)
             .u("resident_bytes", s.resident_bytes)
             .u("buffered_reads", s.buffered_reads)
-            .u("buffered_bytes", s.buffered_bytes),
+            .u("buffered_bytes", s.buffered_bytes)
+            .u("drops", s.drops)
+            .u("drop_bytes", s.drop_bytes)
+            .u("drop_ns", s.drop_ns),
     )
 }
 
