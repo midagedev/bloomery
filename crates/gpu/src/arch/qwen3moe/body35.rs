@@ -470,7 +470,7 @@ fn joint(l: usize, part: &str) -> String {
 /// The types each site launches (`crate::site`): a projection of the normed
 /// rows or an output projection, a K-quant or Q8_0; β and α also F32; a
 /// routed layer's stacks, the Q4_K gate and up and a K-quant down the routed
-/// launches take; the embedding Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
+/// launches take; the embedding Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
 /// Q4_K or Q8_0 (`Head`).
 const PROJ: &[SiteTy] = &[
     SiteTy::Q3K,
@@ -489,7 +489,13 @@ const BETA_ALPHA: &[SiteTy] = &[
 ];
 const ROUTED: &[SiteTy] = &[SiteTy::Q4K];
 const ROUTED_DOWN: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q6K];
-const EMBED: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K, SiteTy::Q8_0];
+const EMBED: &[SiteTy] = &[
+    SiteTy::Q3K,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+];
 const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q4K, SiteTy::Q8_0];
 
 /// The type of site `name` (`rows` rows of `k`) from `file`'s header.

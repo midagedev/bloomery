@@ -684,8 +684,9 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
-        what: "token embedding (the card reads q4_K, q5_K and q6_K rows and q8_0 planes)",
+        what: "token embedding (the card reads q3_K, q4_K, q5_K and q6_K rows and q8_0 planes)",
         reads: &[
+            GgmlType::Q3_K,
             GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
