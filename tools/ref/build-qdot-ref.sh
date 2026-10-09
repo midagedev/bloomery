@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the harnesses that link ik's own kernel tables, and run the ten
+# Build the harnesses that link ik's own kernel tables, and run the eleven
 # reference ones (on the box). Runs under tools/box.sh (toolchain env already
 # sourced).
 #
@@ -27,13 +27,15 @@
 # which holds the one IQ4_XS layer's experts) — until that file's .done sentinel
 # exists iq4xs_ref dumps synthetic blocks under the name synthetic-iq4_xs and
 # says so. q8f0_ref reads no model: its synthetic block set is written into its
-# own dump.
+# own dump. iq3s_ref reads no model either: there is no IQ3_S file on the box, so it
+# quantizes seeded random rows through ggml and adds random-code rows (every grid index
+# and sign byte), and dumps them under the name synthetic-iq3_s.
 #
 # mxfp4_ref links libggml alone and dumps ggml's to_float of the first rows of one MXFP4 expert
 # tensor of the DSpark draft (BLOOMERY_DSPARK_MODEL, default the tl37 file) to
 # mxfp4-dspark-dequant.raw/.meta for gate-dspark-read; the .meta names the ik tree and commit.
 #
-# The nine *_rate harnesses are built but NOT run: each is a timed kernel-rate
+# The ten *_rate harnesses are built but NOT run: each is a timed kernel-rate
 # bench over a synthetic shape, and a measurement belongs to a quiet machine and
 # a lease, never to a build recipe. Building them here is what keeps them
 # compiling with the rest.
@@ -58,8 +60,8 @@ QWEN_Q4_MODEL=${BLOOMERY_QWEN_Q4_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash
 QWEN_Q3_MODEL=${BLOOMERY_QWEN_Q3_MODEL:-/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
-DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq4xs_ref"
-RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate iq4nl_rate iq4xs_rate"
+DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq4xs_ref iq3s_ref"
+RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate iq4nl_rate iq4xs_rate iq3s_rate"
 
 # Same flags for both sets: the rate harnesses include the same ik headers under
 # the same IQK_IMPLEMENT as their _ref twins.
@@ -92,5 +94,6 @@ ls -l "$BLOOMERY_DATA"/ref/q4k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q6k-x4-ik-dot.
       "$BLOOMERY_DATA"/ref/iq3xxs-ik-dot.txt "$BLOOMERY_DATA"/ref/mxfp4-x4-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q8f0-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/iq4nl-ik-dot.txt "$BLOOMERY_DATA"/ref/iq4xs-ik-dot.txt \
+      "$BLOOMERY_DATA"/ref/iq3s-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5k-v41-dequant.meta \
       "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.raw "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.meta

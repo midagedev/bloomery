@@ -327,12 +327,12 @@ fn hw_resident_copy_is_the_file() {
     }
 }
 
-/// The types no model file on the box holds — q2_K, iq2_xs, iq3_xxs, iq4_xs —
+/// The types no model file on the box holds — q2_K, iq2_xs, iq3_xxs, iq3_s, iq4_xs —
 /// from `dequant_ref --synthetic`: ggml-quantized rows plus rows of random
 /// codes, decoded by our `dequant_row` and compared with ggml's `to_float` bit
 /// for bit. Every product in these decodes is exact (quant.rs's
 /// `iq_products_are_exact`), so any difference is a bug, not rounding. The
-/// dump must hold exactly these four types; the codebook coverage the rows
+/// dump must hold exactly these five types; the codebook coverage the rows
 /// reached is printed, and a set that misses a grid entry is refused.
 #[test]
 #[ignore = "hw: needs the synthetic oracle dump in $BLOOMERY_DATA/ref-synth"]
@@ -400,7 +400,7 @@ fn hw_dequant_matches_ggml_synthetic() {
     seen.sort_unstable();
     assert_eq!(
         seen,
-        ["iq2_xs", "iq3_xxs", "iq4_xs", "q2_K"],
+        ["iq2_xs", "iq3_s", "iq3_xxs", "iq4_xs", "q2_K"],
         "ref-synth type set"
     );
 }
@@ -442,11 +442,33 @@ fn codebook_coverage(ty: GgmlType, blocks: &[u8]) -> String {
                 .collect();
             (grid, signs)
         }
+        GgmlType::IQ3_S => {
+            let blks = blocks.as_chunks::<110>().0;
+            let grid = blks
+                .iter()
+                .flat_map(|b| {
+                    (0..64).map(|m| {
+                        usize::from(b[2 + m]) | (usize::from((b[66 + m / 8] >> (m % 8)) & 1) << 8)
+                    })
+                })
+                .collect();
+            let signs = blks
+                .iter()
+                .flat_map(|b| b[74..106].iter().map(|&s| usize::from(s)))
+                .collect();
+            (grid, signs)
+        }
         _ => return String::new(),
     };
-    let n_grid = if ty == GgmlType::IQ2_XS { 512 } else { 256 };
+    let n_grid = if matches!(ty, GgmlType::IQ2_XS | GgmlType::IQ3_S) {
+        512
+    } else {
+        256
+    };
+    // IQ3_S keeps its sign bits as bytes, every one of 256 patterns a legal sign set.
+    let n_signs = if ty == GgmlType::IQ3_S { 256 } else { 128 };
     let distinct = |v: &[usize]| v.iter().collect::<HashSet<_>>().len();
     let (g, s) = (distinct(&grid), distinct(&signs));
-    assert_eq!((g, s), (n_grid, 128), "{ty}: codebook entries reached");
-    format!("grid {g}/{n_grid} signs {s}/128")
+    assert_eq!((g, s), (n_grid, n_signs), "{ty}: codebook entries reached");
+    format!("grid {g}/{n_grid} signs {s}/{n_signs}")
 }

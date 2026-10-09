@@ -38,6 +38,13 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
             b[1] &= 0x7b;
         }
     }
+    // IQ3_S carries an f16 d per block as well (its first two bytes): the same mask, as
+    // iq3s_rate.cpp does — raw bytes give an infinity or NaN scale in one block of 32.
+    if ty == GgmlType::IQ3_S {
+        for b in w.as_chunks_mut::<110>().0 {
+            b[1] &= 0x7b;
+        }
+    }
     let col: Vec<f32> = (0..k)
         .map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0)
         .collect();
@@ -82,6 +89,9 @@ fn main() {
     bench(GgmlType::Q5_K, 2304, (2304 / 256) * 176, rows);
     // V4-Flash ffn_gate/up_exps shape: k = 4096 (16 x 98 B = 1568 B/row).
     bench(GgmlType::IQ3_XXS, 4096, (4096 / 256) * 98, rows);
+    // GLM-5.3-Flash UD-IQ4_XS ffn_gate/up_exps shape: k = 4096 (16 x 110 B = 1760 B/row),
+    // beside the IQ3_XXS row at the same k.
+    bench(GgmlType::IQ3_S, 4096, (4096 / 256) * 110, rows);
     // V4-Flash and MiMo-V2.6-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
     bench(GgmlType::MXFP4, 2048, (2048 / 32) * 17, rows);
     // MiMo-V2.6-Flash ffn_gate/up_exps shape: k = 4096 (128 x 17 B = 2176 B/row).
