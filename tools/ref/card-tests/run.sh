@@ -656,6 +656,7 @@ if command -v just > /dev/null; then
   W=$tmp/wtree
   mkdir -p "$W/tools/sub" "$W/tools/x-tests"
   cp "$ROOT/tools/gate-batch.sh" "$W/tools/"
+  : > "$W/tools/gate-batch-resources.tsv" # the pack's table, which every plan reads: no solo recipe here, no row
   printf '#!/usr/bin/env bash\necho "usage: gpu-gate.sh — the runner; its own text is not followed"\n' > "$W/tools/gpu-gate.sh"
   printf 'bash tools/sub/b-any.sh\n' > "$W/tools/a-any.sh"
   printf '# a comment naming tools/gpu-gate.sh is no call\nBLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh x\n' > "$W/tools/sub/b-any.sh"
