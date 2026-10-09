@@ -116,8 +116,9 @@
 //! and the open prints a line that says so. `--parallel 1` is exactly the
 //! one-sequence server, its rounds one pass a slot. `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx-size` (the flag is
-//! one request's context, `placement::ctx::slots_of`; one line on stderr says so) and
-//! its default two over the automatic context. Under more slots than one
+//! one request's context, `placement::ctx::slots_of`; one line on stderr says so),
+//! one under the route trace (below), and its default two over the automatic
+//! context. Under more slots than one
 //! the context is split
 //! as llama-server splits it with
 //! `-np N` and no `-kvu`: the total (the `--ctx-size` the flags named, or
@@ -133,7 +134,8 @@
 //! refused by name — resident slots hold their state on the card, in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
 //! the split they serve and what set the count (`from`: the `--parallel`
-//! flag, a set `--ctx-size`, the default, or `paged`, the rule below).
+//! flag, a set `--ctx-size`, the default, `route-trace`, or `paged`, the rule
+//! below).
 //! `--queue-depth Q` bounds the requests that wait for a slot.
 //!
 //! A plan that pages host experts through the NVMe tier's RAM arena (a room
@@ -206,9 +208,9 @@
 //! following; `BLOOMERY_DRAFT=mtp` set never yields, and a set
 //! `--ctx-size` keeps today's answer. `BLOOMERY_DRAFT=off` is the plain
 //! path with the same record; `mtp` drafts wherever the draft loads. The
-//! CLI's `--logits` and route-trace conditions have no seat equivalent: a
-//! request that reads the logits row steps plainly, and the seat does not
-//! take the route trace.
+//! CLI's `--logits` condition has no seat equivalent: a request that reads
+//! the logits row steps plainly. The route trace's condition is the seat's
+//! own (the paragraph on `BLOOMERY_ROUTE_TRACE` below).
 //!
 //! Drafting, the seat drives the session through the runtime's speculative
 //! loop with the shared window `app::mtp::MtpDraft` (the shared draft file
@@ -248,8 +250,30 @@
 //! /residency/reset` moves it back to its seed on a free slot and prints a
 //! `residency reset` record (without the residency, the server's 501). The
 //! seat's prompt path is `auto` — passes below nine ids, ubatches from nine
-//! on, never one step an id — so the body's refusal of a step-fed prompt
-//! beside the machine is never reached.
+//! on, never one step an id — unless `BLOOMERY_PREFILL=steps` feeds one step
+//! an id (below), which the machine does not run beside: the unset word
+//! resolves `off`, and a set word other than `off` is refused by name before
+//! the load, where the body would refuse the first prompt.
+//!
+//! `BLOOMERY_PREFILL` is `batch` (unset), the `auto` path above, or `steps`,
+//! which feeds a prompt call one captured step an id (`Prompt38::Step`; the
+//! `load` line prints `prefill=step`) and cuts no prompt call at a message
+//! start ([`Seat::splits`]: each cut would be a call of its own). It is
+//! refused by name beside the MTP draft, whose prompt call walks the draft
+//! over the target's ubatches: `BLOOMERY_DRAFT=off` is the way out.
+//!
+//! `BLOOMERY_ROUTE_TRACE=<dir>` writes a route trace
+//! (`bloomery_gpu::host::route_trace`) of every position the engine runs
+//! into `<dir>`, which `main` creates as a new directory before the load: a
+//! `call` row for each request's prompt call, the routed ids and slot kinds
+//! of every position after it. `tools/ref/route-trace-chat.py` drives the
+//! server and seals the set, since a TERM runs no drop. The trace records one
+//! sequence's one-row steps under a fixed placement, so it needs
+//! `BLOOMERY_PREFILL=steps` and is refused by name beside a set
+//! `BLOOMERY_DRAFT`, a `BLOOMERY_RESIDENCY` word other than `off` and a
+//! `--parallel` past one; unset, the draft and the residency resolve `off`
+//! with their records (`load draft=off`, `residency unset`) and the slots
+//! count one (`parallel … from=route-trace`).
 //!
 //! `BLOOMERY_XSTREAM` resolves by the rule `generate_qwen3moe` runs
 //! (`shared/xstream38.rs`): set as given; unset `split` under `--place a`
@@ -273,8 +297,9 @@
 //! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
 //! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
 //! tier's load settings, `BLOOMERY_PIN_MAIN`, the draft's levers,
-//! `BLOOMERY_RESIDENCY`, `BLOOMERY_XSTREAM` and `BLOOMERY_STEP_STATS` (the
-//! `slots round` record a round of several slots prints); the ubatch size
+//! `BLOOMERY_RESIDENCY`, `BLOOMERY_XSTREAM`, `BLOOMERY_PREFILL`,
+//! `BLOOMERY_ROUTE_TRACE` and `BLOOMERY_STEP_STATS` (the `slots round` record
+//! a round of several slots prints); the ubatch size
 //! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
 //! stderr lines named above are records of the kinds
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
@@ -290,6 +315,7 @@ use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
 use bloomery_gpu::host::census::TierCensus;
+use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
@@ -332,30 +358,15 @@ use super::drafted::{ParkedDraft, SlotDrafts};
 
 #[path = "../qwen38_place.rs"]
 mod q38place;
+#[path = "../qwen38_levers.rs"]
+mod qwen38_levers;
+pub(crate) use qwen38_levers::ACTS_ON;
+#[path = "../route_trace38.rs"]
+mod route_trace38;
+use route_trace38::{TraceRun, experts_name};
 #[path = "../xstream38.rs"]
 mod xstream38;
 use xstream38::{Stage38, xstream38};
-
-/// The levers `bloomery-serve-qwen38` acts on, for its own `main` and for
-/// `gate_qwen38_serve`'s (the gate starts the server with its own
-/// environment, so a lever the server would refuse is refused by the gate
-/// first; the two lists must stay one).
-pub const ACTS_ON: &[&str] = &[
-    bloomery_levers::QWEN38_EXPERTS,
-    bloomery_levers::CARD_BUDGET,
-    bloomery_levers::PIN_MAIN,
-    bloomery_levers::HOST_POPULATE,
-    bloomery_levers::HOST_LOCK,
-    bloomery_levers::CARD_DONTNEED,
-    bloomery_levers::R8,
-    bloomery_levers::DRAFT,
-    bloomery_levers::MTP_HEAD_ROWS,
-    bloomery_levers::MTP_DRAFT,
-    bloomery_levers::MTP_WIDTH,
-    bloomery_levers::RESIDENCY,
-    bloomery_levers::XSTREAM,
-    bloomery_levers::STEP_STATS,
-];
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
                      [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
@@ -575,6 +586,108 @@ fn window_positions(slots: usize) -> usize {
     (<Body38 as MtpBody>::VERIFY_ROWS + 1).saturating_mul(slots)
 }
 
+/// How the run feeds a prompt and whether it records the routing
+/// (`BLOOMERY_PREFILL`, `BLOOMERY_ROUTE_TRACE`): the inputs the unset
+/// residency's rule reads beside the placement, and what [`refuse_feed`]
+/// holds the rest of the run to.
+#[derive(Clone, Copy)]
+pub(crate) struct Feed38 {
+    /// [`Prompt38::Step`] under `BLOOMERY_PREFILL=steps`, else
+    /// [`Prompt38::Auto`]: the ubatch walk, passes below nine ids.
+    pub(crate) prompt: Prompt38,
+    /// `BLOOMERY_ROUTE_TRACE` is set.
+    pub(crate) traced: bool,
+}
+
+impl Feed38 {
+    fn of(levers: &bloomery_levers::Levers) -> Result<Feed38, GateError> {
+        let prompt = match levers.prefill() {
+            "steps" => Prompt38::Step,
+            "batch" => Prompt38::Auto,
+            other => return Err(format!("BLOOMERY_PREFILL={other}: batch or steps").into()),
+        };
+        Ok(Feed38 {
+            prompt,
+            traced: levers.route_trace().is_some(),
+        })
+    }
+
+    /// Each prompt id is a step.
+    fn stepped(self) -> bool {
+        self.prompt == Prompt38::Step
+    }
+
+    /// What decides `BLOOMERY_RESIDENCY` unset before the plan, at `place`.
+    fn residency_at(self, place: Place38) -> Residency38At {
+        Residency38At {
+            qwen38_file: true,
+            dump_taps: false,
+            place_a: place.stage_a(),
+            route_trace: self.traced,
+            prefill_step: self.stepped(),
+        }
+    }
+}
+
+/// What the feed and the trace refuse of the run, each by name before the
+/// load, with `slots` resident sequences, `mtp` the draft on and `residency`
+/// the set residency word when it is not `off`. The trace records one
+/// sequence's one-row steps under a fixed placement: it takes no prompt path
+/// but the step feed, no MTP draft, no slot beyond the first and no
+/// residency machine. The step feed itself runs no MTP draft (its prompt
+/// call walks the draft over the target's ubatches) and no residency machine
+/// (each prompt id would end a decode pass the rule counts, where a prompt
+/// call keeps 0).
+pub(crate) fn refuse_feed(
+    feed: Feed38,
+    (slots, mtp): (usize, bool),
+    residency: Option<&str>,
+) -> Result<(), GateError> {
+    if feed.traced {
+        if !feed.stepped() {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records one-row steps: set BLOOMERY_PREFILL=steps (a \
+                 pass runs a multi-row service and a ubatch a prompt batch, which the trace \
+                 does not record)"
+                    .into(),
+            );
+        }
+        if mtp {
+            return Err(route_trace38::draft_refusal());
+        }
+        if slots > 1 {
+            return Err(format!(
+                "BLOOMERY_ROUTE_TRACE records one sequence's steps after its call row; \
+                 --parallel {slots} puts another sequence's steps between them"
+            )
+            .into());
+        }
+        if let Some(word) = residency {
+            return Err(route_trace38::residency_refusal(word));
+        }
+    }
+    if feed.stepped() {
+        if mtp {
+            return Err(
+                "BLOOMERY_PREFILL=steps feeds a prompt one step an id, and the MTP draft's \
+                 prompt call walks the draft over the target's ubatches: set \
+                 BLOOMERY_DRAFT=off"
+                    .into(),
+            );
+        }
+        if let Some(word) = residency {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={word} beside BLOOMERY_PREFILL=steps: each prompt id would \
+                 end a decode pass the residency rule counts, where a prompt call keeps 0; \
+                 unset BLOOMERY_RESIDENCY (or set it to off), or feed the prompt in batches \
+                 (BLOOMERY_PREFILL=batch)"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions
 /// in all, split among `slots` resident sequences, `file` the MTP draft file
 /// the load would open, `inputs` the target's: `mtp` the draft, `off` the
@@ -589,8 +702,8 @@ fn window_positions(slots: usize) -> usize {
 ///
 /// The rule's run conditions as the seat meets them: no `--logits` (a
 /// request that reads the logits row steps plainly, the row the target's),
-/// no route trace (the seat does not act on `BLOOMERY_ROUTE_TRACE`, so
-/// `at_main` refuses it set), and the positions of one window a slot
+/// no route trace (`BLOOMERY_ROUTE_TRACE` records one-row steps; a set `mtp`
+/// beside it is [`refuse_feed`]'s), and the positions of one window a slot
 /// ([`window_positions`]). A set `mtp` meets that condition at the caller,
 /// where the context the rule chose is known.
 fn draft38(
@@ -612,7 +725,7 @@ fn draft38(
             let at = Draft38At {
                 place_a: place.stage_a(),
                 logits: false,
-                route_trace: false,
+                route_trace: levers.route_trace().is_some(),
                 file,
                 file_is_there: file.is_file(),
                 need: window_positions(slots),
@@ -671,27 +784,17 @@ fn floor_fallback(
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
 /// its parse) as given; unset, the Qwen3.8 rule's
-/// ([`residency38`]: before the plan `off` under `--place gate`, else on plan
-/// (a) from it), its records on stderr.
+/// ([`residency38`]: before the plan `off` under `--place gate`, beside the
+/// route trace and under the step feed, else on plan (a) from it), its
+/// records on stderr.
 fn residency38_at(
     plan: &Plan<'_>,
-    place: Place38,
+    (place, feed): (Place38, Feed38),
     set: Option<(Residency, &str)>,
 ) -> Result<Residency, GateError> {
     let lever = match set {
         Some((r, word)) => Lever38::Set(r, word),
-        None => {
-            // The seat feeds no prompt by steps (its path is `auto`) and
-            // takes no route trace.
-            let at = Residency38At {
-                qwen38_file: true,
-                dump_taps: false,
-                place_a: place.stage_a(),
-                route_trace: false,
-                prefill_step: false,
-            };
-            Lever38::Unset(residency38_unset(at))
-        }
+        None => Lever38::Unset(residency38_unset(feed.residency_at(place))),
     };
     residency38(plan, lever, Record::eprint)
 }
@@ -709,6 +812,8 @@ struct Plans<'a> {
     /// The resident sequences every plan counts; 1 is the one-sequence plan
     /// itself.
     slots: usize,
+    /// The prompt feed and the trace, which the unset residency's pool reads.
+    feed: Feed38,
 }
 
 impl Plans<'_> {
@@ -779,13 +884,7 @@ impl Plans<'_> {
         };
         let lever = match set {
             Some((r, word)) => Lever38::Set(r, word),
-            None => Lever38::Unset(residency38_unset(Residency38At {
-                qwen38_file: true,
-                dump_taps: false,
-                place_a: self.place.stage_a(),
-                route_trace: false,
-                prefill_step: false,
-            })),
+            None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
         };
         let pool = match residency38(&plan, lever, |_| {})? {
             Residency::Mid { pinned, .. } => {
@@ -1156,6 +1255,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Some(word) => Some((Residency::parse(word)?, word)),
         None => None,
     };
+    let feed = Feed38::of(&levers)?;
     let mut a = parse_args(args)?;
     // The placement the seat runs by: the flag's word, or unset the common
     // rule's (`Place::choose`) on the census, read once — chosen below, once
@@ -1184,7 +1284,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
     // `--parallel` is one request's context — one slot at the whole of it
     // (`placement::ctx::slots_of`).
-    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    // The route trace records one sequence's steps, so its default is one.
+    let (slots, from) = match model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)? {
+        (_, "default") if feed.traced => (1, "route-trace"),
+        given => given,
+    };
     // The draft's one context condition (a window's positions a slot) holds
     // at any context the default rule grants, which each slot gets [`CTX`]
     // of; a set `--ctx-size` is the total the slots split. It is asked again
@@ -1380,6 +1484,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 levers: &plan_levers,
                 mtp: None,
                 slots,
+                feed,
             };
             if plain.card(ctx).is_ok() {
                 plain.host(ctx, set)?.2
@@ -1410,6 +1515,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             levers: &plan_levers,
             mtp: mtp_inputs.as_ref(),
             slots,
+            feed,
         };
         floor_fallback(&asked, set)?
     } else {
@@ -1433,6 +1539,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         levers: &plan_levers,
         mtp: mtp_inputs.as_ref(),
         slots,
+        feed,
     };
     let mut rule = ctx38(&drafted, a.ctx)?;
     // The unset draft's yield to the context (the module doc), judged on
@@ -1457,6 +1564,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             levers: &plan_levers,
             mtp: None,
             slots,
+            feed,
         };
         let plain = ctx38(&plain_plans, a.ctx)?;
         let without = plain.search.expect("an unset rule searched").fit.ctx;
@@ -1493,6 +1601,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     refuse_mtp_levers(&draft_off)?;
+    let residency_word = set.filter(|&(r, _)| r != Residency::Off).map(|(_, w)| w);
+    refuse_feed(feed, (slots, mtp), residency_word)?;
     let (need, pool, arena, checkpoints, paged) = host;
     let cache = CacheRam::of_tier(a.cache_ram, need, pool, (arena, paged), checkpoints)?
         .holding(seq38_state(&inputs, 1, mtp));
@@ -1593,14 +1703,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let line = Record::new(&record::PLAN38)
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())
-        .w(
-            "experts",
-            if experts == Experts::Card {
-                "card"
-            } else {
-                "host"
-            },
-        )
+        .w("experts", experts_name(experts))
         .u("ctx_max", plan.ctx_max)
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts);
@@ -1617,7 +1720,24 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     line.csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order())
         .eprint();
-    let residency = residency38_at(&plan, a.place, set)?;
+    let residency = residency38_at(&plan, (a.place, feed), set)?;
+    // Made last among the refusals, so a load that stops before the engine
+    // leaves no directory behind.
+    let trace = levers
+        .route_trace()
+        .map(|dir| {
+            let build = format!("bloomery-serve-qwen38 {}", serve::VERSION);
+            let run = TraceRun {
+                model: &path,
+                build: &build,
+                place: a.place.name(),
+                experts,
+                prefill: feed.prompt,
+                chunk: None,
+            };
+            route_trace38::create(dir, &inputs, &run)
+        })
+        .transpose()?;
     let gpu = machine
         .all_cards()
         .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
@@ -1651,6 +1771,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_bytes,
         draft_off,
         residency,
+        feed: feed.prompt,
+        trace,
         xstream: levers.xstream(),
         stats: levers.step_stats(),
         width,
@@ -1794,6 +1916,12 @@ struct SeatArgs {
     draft_off: Option<Draft38Off>,
     /// The residency the load runs ([`residency38`]).
     residency: Residency,
+    /// How the session feeds a prompt call: [`Prompt38::Step`] (one captured
+    /// step an id) or [`Prompt38::Auto`].
+    feed: Prompt38,
+    /// The route trace the host tier records into, its directory made by the
+    /// main thread.
+    trace: Option<RouteTrace>,
     /// `BLOOMERY_XSTREAM` as set, or unset for the shared rule
     /// ([`xstream38`]).
     xstream: Option<&'static str>,
@@ -1817,6 +1945,8 @@ struct Q38 {
     /// with no select between. Empty without a draft.
     drafts: SlotDrafts<Body38, { <Body38 as MtpBody>::VERIFY_ROWS }>,
     ctx: usize,
+    /// How a prompt call is fed ([`SeatArgs::feed`]).
+    feed: Prompt38,
     /// The plan's draft card bytes and arena, for `/props`' `draft` class.
     draft_bytes: u64,
     /// The MTP draft file, which `/props`' `draft` names.
@@ -1939,7 +2069,7 @@ impl Q38 {
         eprintln!(
             "load arch=qwen4exp resident_bytes={} ctx={} slots={} slot_ctx={} ctx_max={cap} \
              ctx_train={} verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} \
-             prefill=auto ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+             prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             a.ctx,
             a.slots,
@@ -1947,6 +2077,7 @@ impl Q38 {
             inputs.hp.n_ctx_train,
             m.layers().len(),
             m.body(WHAT)?.store_bytes(),
+            a.feed.name(),
             m.body(WHAT)?.ubatch_rows(),
             a.place.name(),
             m.body(WHAT)?.card_layers(),
@@ -2020,6 +2151,13 @@ impl Q38 {
         // step and verify chains stay with it, each parked slot capturing on
         // its first use.
         s.add_slots(a.slots)?;
+        if let Some(t) = a.trace {
+            s.model_mut()
+                .body_parts(WHAT)?
+                .2
+                .hybrid_mut()
+                .attach_route_trace(t)?;
+        }
         // One draft a resident slot ([`SlotDrafts`]): every busy slot's
         // draft reachable in one round with no select between.
         let drafts = match a.mtp {
@@ -2065,6 +2203,7 @@ impl Q38 {
             s,
             drafts,
             ctx: a.ctx,
+            feed: a.feed,
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
             residency,
@@ -2075,6 +2214,25 @@ impl Q38 {
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
         })
+    }
+
+    /// The prompt call of `ids` one captured step an id
+    /// ([`Prompt38::Step`]) with one readback after the last, the host tier's
+    /// route trace told the call's positions first (`Hybrid::route_prompt`).
+    /// The session has no call of this path, so the call is the model's own,
+    /// under the engine watchdog's prompt mark as the session's is; the open
+    /// refuses the draft beside this feed ([`refuse_feed`]), so none is
+    /// told.
+    fn prefill_steps(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        const WHAT: &str = "bloomery-serve-qwen38";
+        let _busy = self.s.model().prompt_busy();
+        let pos = self.s.pos();
+        let m = self.s.model_mut();
+        m.body_parts(WHAT)?
+            .2
+            .hybrid_mut()
+            .route_prompt(pos, ids.len())?;
+        Ok(m.prompt38(ids, Prompt38::Step)?)
     }
 
     /// The drafted seat's keep rule, its one owner: a prefix of `at`
@@ -2179,6 +2337,28 @@ impl Q38 {
     }
 }
 
+/// The cuts of a prompt call of the positions `first..end` fed by `feed`: the
+/// message starts (`marks`) inside the call where both runs keep at least
+/// `Prompt38::GEMM_FROM` ids, so each run is a ubatch walk and the bits are
+/// the uncut call's; under the MTP draft the draft's prompt call joins each
+/// run where the one before left it. None under the step feed, which leaves
+/// no hole and needs none: a cut would be a prompt call of its own, which
+/// the route trace marks as a call row.
+pub(crate) fn prompt_cuts(feed: Prompt38, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+    if feed == Prompt38::Step {
+        return Vec::new();
+    }
+    let mut at = Vec::new();
+    let mut last = first;
+    for &u in marks {
+        if u >= last + Prompt38::GEMM_FROM && u + Prompt38::GEMM_FROM <= end {
+            at.push(u);
+            last = u;
+        }
+    }
+    at
+}
+
 /// The line that says the MTP draft proposes nothing from `pos` on, for
 /// `what` (a cut or a state put back).
 fn draft_off(pos: u32, what: &str) {
@@ -2255,11 +2435,16 @@ impl Seat for Q38 {
     /// The prompt through the ubatch walk `--prefill auto` takes: `gemm`
     /// from nine positions on, `pass` below — never one step per id;
     /// under the draft the draft's own prompt call, its store walked over
-    /// the prompt's units.
+    /// the prompt's units. Under `BLOOMERY_PREFILL=steps` one step per id
+    /// ([`Q38::prefill_steps`]).
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         self.before_call();
         let sel = self.s.selected();
-        let next = self.drafts.prefill(&mut self.s, sel, ids)?;
+        let next = if self.feed == Prompt38::Step {
+            self.prefill_steps(ids)?
+        } else {
+            self.drafts.prefill(&mut self.s, sel, ids)?
+        };
         self.print_passes()?;
         Ok(next)
     }
@@ -2468,20 +2653,9 @@ impl Seat for Q38 {
         Ok(())
     }
 
-    /// The message starts inside the call where both runs keep at least
-    /// `Prompt38::GEMM_FROM` ids, so each run is a ubatch walk and the bits
-    /// are the uncut call's; under the MTP draft the draft's prompt call
-    /// joins each run where the one before left it.
+    /// [`prompt_cuts`] under the seat's feed.
     fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
-        let mut at = Vec::new();
-        let mut last = first;
-        for &u in marks {
-            if u >= last + Prompt38::GEMM_FROM && u + Prompt38::GEMM_FROM <= end {
-                at.push(u);
-                last = u;
-            }
-        }
-        at
+        prompt_cuts(self.feed, first, end, marks)
     }
 
     /// `/props`' `engine.draft` under the MTP draft: its kind, the draft

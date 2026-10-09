@@ -1244,6 +1244,14 @@ gate-gpu-ds41-lib:
 gate-ds41-bind:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- bind::'
 
+# The Qwen3.8 serve seat's feed rules (bloomery-serve-qwen38's own unit tests, behind the deepseek41 feature like bind):
+# the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes
+# no MTP draft and no such word; a step-fed prompt is never cut at a message start; the one levers list the server and its
+# gate parse (shared/qwen38_levers.rs) holds exactly the levers the seat reads. Host only, no card or gate lock.
+[group('host')]
+gate-q38-serve-rules:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --bin bloomery-serve-qwen38'
+
 # The V4.1 binaries' `--place` word (`generate::Place`, behind the deepseek41 feature like bind): each alias and its card
 # list (`a6000+3090` is `bp`) planning the machine its plan function makes, a list word planning its own cards, and every
 # refusal by name before any plan. Host only, no card or gate lock.
@@ -2095,6 +2103,22 @@ gate-qwen4exp-meta:
 # and every request under an HTTP timeout, so the driver ends when the server does.
 route-trace-chat OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2-prompts-en-code.tsv':
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh route-trace-chat && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-ds41 --out {{OUT}} --prompts {{PROMPTS}}'
+
+# The chat route trace of Qwen3.8 (D2's input for the second family, not a gate, lead-only, in the lead's A6000 window):
+# route-trace-chat with one bloomery-serve-qwen38 process (one load, plan (a) on the A6000) instead of the V4.1 server.
+# The server takes BLOOMERY_ROUTE_TRACE=OUT and BLOOMERY_PREFILL=steps from the driver (the trace records the step feed),
+# serves one slot with the draft and the residency off under the trace, and the driver, its prompts, its join and its
+# seal are route-trace-chat's (tools/ref/route-trace-chat.py's header has the contract; OUT is an absolute path or
+# target/…). Wall: at most 48 × 256 generated and about 4,300 prompt ids, 16.6k positions, each a step. ~~About 5-6 min
+# of requests at 18.9 ms a step (the plain step on plan (a) with the residency off, prose:512, docs/cards/q38res-ab.card)
+# [derived]~~ missed: the three-prompt run took 800 positions in 55.7 s, 101, 77 and 30 ms a position per request, falling
+# (a cold host set is the likely cause; majflt was not read), and the load 102 s from spawn to listening. The 48 prompts
+# take about 8 min at the last request's 30 ms and 19 min at the run's 70 ms mean, plus the build [derived from that one
+# run]. It takes neither the A6000 gate lock nor the V4.1 load lock (the driver is not a target/release binary
+# tools/gpu-gate.sh can run): run it inside a hold. The server runs under the driver's own bound (--bound, 1800 s), and every request under an
+# HTTP timeout, so the driver ends when the server does.
+route-trace-chat-q38 OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2-prompts-en-code.tsv':
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh route-trace-chat-q38 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-qwen38 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-qwen38 --out {{OUT}} --prompts {{PROMPTS}}'
 
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.

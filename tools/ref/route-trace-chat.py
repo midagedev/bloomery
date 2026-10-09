@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""The chat route trace: one bloomery-serve-ds41 process (one load) writes a route trace
-(crates/gpu/src/host/route_trace.rs) of the model's greedy replies to a list of chat prompts.
+"""The chat route trace: one server process (one load) writes a route trace
+(crates/gpu/src/host/route_trace.rs) of the model's greedy replies to a list of chat prompts. The server is
+bloomery-serve-ds41 or bloomery-serve-qwen38 (SERVERS: the `listening` record each prints).
 
     tools/ref/route-trace-chat.py run --server BIN --out DIR --prompts FILE[,FILE...]
                                       [--place a] [--n-predict 256] [--bound 1800]
@@ -12,7 +13,8 @@ run    DIR is an absolute path or one under the repository's target/: a path els
        Starts `timeout --kill-after=10 BOUND BIN --host 127.0.0.1 --port 0 --place PLACE --cache-ram 0`
        with BLOOMERY_ROUTE_TRACE=DIR and BLOOMERY_PREFILL=steps (the trace records the step feed; the
        server creates DIR at main and refuses an existing one), its stderr in DIR.serve.log, and waits for
-       its `listening` record (tools/bloomery/records.py). Then, for every prompt row of the files in file
+       its `listening` record (tools/bloomery/records.py; BIN's file name picks the program and the kind,
+       SERVERS). Then, for every prompt row of the files in file
        order: POST /apply-template (one user message), /tokenize of that text (add_special false: the ids
        /v1/chat/completions runs), and /completion of those ids — temperature 0 (the engine's argmax),
        n_predict N, cache_prompt false (each request from an empty cache, so no request keeps the template
@@ -58,6 +60,10 @@ def _load(name, rel):
 rt = _load("route_trace", "../bloomery/route_trace.py")
 
 ROOT = os.path.realpath(os.path.join(_here, "..", ".."))
+
+# The servers the driver runs: the program name its records carry (tools/bloomery/schema/<name>.jsonl) and the
+# kind of its `listening` record.
+SERVERS = {"bloomery-serve-ds41": "listening", "bloomery-serve-qwen38": "listening38"}
 
 REQUEST_COLUMNS = ("request", "prompt_id", "domain", "genre", "split", "prompt_ids", "cache", "prompt_n",
                    "generated", "stop")
@@ -171,10 +177,19 @@ class Server:
         return json.loads(data)
 
 
-def listening_port(log, records):
+def server_name(binary):
+    """The server `binary` is, by its file name; any other is refused by name."""
+    name = os.path.basename(binary)
+    if name not in SERVERS:
+        raise DriverError(f"--server {binary}: the driver runs {' or '.join(SERVERS)}, not {name!r}")
+    return name
+
+
+def listening_port(log, records, name):
+    """The port of server `name`'s `listening` record in `log`; None while there is none."""
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
-            rec = records.first(records.read(f.read().splitlines(), "bloomery-serve-ds41"), "listening")
+            rec = records.first(records.read(f.read().splitlines(), name), SERVERS[name])
     except OSError:
         return None
     if rec is None:
@@ -199,6 +214,7 @@ def out_paths(out, root=ROOT):
 
 def run(a):
     records = _load("records", "../bloomery/records.py")
+    name = server_name(a.server)
     prompts = read_prompts(a.prompts.split(","))
     out, log = out_paths(a.out)
     if os.path.exists(out):
@@ -219,7 +235,7 @@ def run(a):
             if time.monotonic() - t0 > a.bound:
                 raise DriverError(f"the server did not listen within {a.bound} s")
             time.sleep(2)
-            port = listening_port(log, records)
+            port = listening_port(log, records, name)
         load_s = time.monotonic() - t0
         s = Server(port)
         version = (s.call("GET", "/props").get("engine") or {}).get("version", "unknown")
@@ -281,6 +297,28 @@ def self_test():
             assert ok and got == (out, out + ".serve.log"), (out, got)
         except DriverError as e:
             assert not ok and "inside the repository tree /r/bloomery" in str(e), (out, str(e))
+    # Each server's `listening` record is read by its own program's schema; no record, no port.
+    records = _load("records", "../bloomery/records.py")
+    lines = {"bloomery-serve-ds41": "bloomery-serve-ds41: place=a ctx=4096 listening on http://127.0.0.1:41001",
+             "bloomery-serve-qwen38": "bloomery-serve-qwen38: place=a ctx=4096 slots=1 slot_ctx=4096 listening "
+                                      "on http://127.0.0.1:41002"}
+    assert set(lines) == set(SERVERS), (set(lines), set(SERVERS))
+    with tempfile.TemporaryDirectory() as d:
+        for name, line in lines.items():
+            assert server_name(f"target/release/{name}") == name
+            log = os.path.join(d, name + ".log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write("load arch=x layers=1\n")
+            assert listening_port(log, records, name) is None, name
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            assert listening_port(log, records, name) == int(line.rsplit(":", 1)[1]), name
+        assert listening_port(log, records, "bloomery-serve-ds41") is None, "a qwen38 log read as ds41's"
+    try:
+        server_name("target/release/bloomery-serve")
+        raise AssertionError("an unknown server was taken")
+    except DriverError as e:
+        assert "not 'bloomery-serve'" in str(e), e
     rows = read_prompts([os.path.join(_here, "data", "d2-prompts-ko.tsv"),
                          os.path.join(_here, "data", "d2-prompts-en-code.tsv")])
     genres = [r["genre"] for r in rows]

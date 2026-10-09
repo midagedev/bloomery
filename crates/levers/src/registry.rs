@@ -145,7 +145,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("batch"),
         doc: "V4.1: how a binary feeds a prompt, in batches (`body::prefill`) or one \
               decode step per id, the feed the batches are bit for bit equal to. The \
-              `load` line prints `prefill=`.",
+              `load` line prints `prefill=`. `bloomery-serve-qwen38`: `batch` is the \
+              seat's `auto` path (passes below nine ids, ubatches from nine), and `steps` \
+              one captured step per id (`prefill=step`); a prompt of nine ids or more \
+              leaves other bits under the ubatch walk than under steps. Steps are \
+              refused by name beside the MTP draft and a `BLOOMERY_RESIDENCY` word other \
+              than `off` (unset resolves `off`).",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
@@ -412,15 +417,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::D,
         kind: Kind::Path,
         default: Unset::Means("no trace"),
-        doc: "`bloomery-serve-ds41`, `generate_qwen3moe` (a qwen4exp file) and \
-              `generate_glm5next`: the directory, created at `main` as a new directory \
-              (an existing path or a missing parent is refused by name), the host tier \
-              writes a route trace into (`crates/gpu/src/host/route_trace.rs`): every \
-              position's routed ids per layer and the slot each ran in, as a router set, \
-              a `call` row per prompt call. The server needs `BLOOMERY_PREFILL=steps` \
-              and no `BLOOMERY_DRAFT`; the generators need their step feed \
-              (`--prefill step` / `--prefill steps`) and refuse `--time`, each refused \
-              by name otherwise.",
+        doc: "`bloomery-serve-ds41`, `bloomery-serve-qwen38`, `generate_qwen3moe` (a \
+              qwen4exp file) and `generate_glm5next`: the directory, created at `main` as \
+              a new directory (an existing path or a missing parent is refused by name), \
+              the host tier writes a route trace into \
+              (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per \
+              layer and the slot each ran in, as a router set, a `call` row per prompt \
+              call. The servers need `BLOOMERY_PREFILL=steps`, no `BLOOMERY_DRAFT` set, \
+              and one resident slot (`--parallel` past 1 is refused; unset serves one); \
+              `bloomery-serve-qwen38` also refuses a `BLOOMERY_RESIDENCY` word other than \
+              `off`, and its unset draft and residency resolve `off`. The generators \
+              need their step feed (`--prefill step` / `--prefill steps`) and refuse \
+              `--time`, each refused by name otherwise.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
