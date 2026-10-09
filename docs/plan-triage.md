@@ -105,6 +105,106 @@ through R4 (worker1's train 2 carries R3a and the lifts), then the user-facing p
   host-leg bytes) trades pp4096 610–700 → 390–430 for decode 13–19 → 26–29 [derived]: the landing states that cost in
   the coverage table and the README limits.
 
+## After 0.2.8 (10-09, leader — the post-tag train: paged2, bpslots, levphase, loadchain + packsched, roomneed, stepunion2, binslots)
+
+### What paged1 and pagedoff left
+- nvtier columns: the step port's multi-column union (`crates/gpu/src/host/step.rs`, `serve_cols`) reads a paged
+  plan's tier ids through the file mapping, not the arena, so a paged plan serves one slot with the draft off and
+  refuses a set `--parallel ≥ 2` or draft by name (paged1). Lift: `ExpertStack::matrix` (`crates/model/src/ops.rs`)
+  gains the arena lookup, `HostLayer::experts_union_into` (`crates/model/src/moe.rs`) ensures the union's distinct
+  tier ids first, `HostRun` passes the arena; bits equal by construction, a MockTier union case against the mapping.
+  Part of the 0.2.9 unitier design; then paged1's refusals go. M.
+
+### With rrroom
+- `BOX_ROOM` (`crates/gpu-gates/src/qwen38_cards.rs`) and `tools/ref/plan-room.sh` both derive HOST_USABLE − OS_OTHER
+  from `crates/placement/src/workstation.rs`: one `pub const` there. XS.
+
+### The paged1 and pagedoff reviews
+- nvtier middle band: a room over half the host leg and under its need pages experts with no arena (R1's mapping split; a
+  64 GB machine's 58 GiB room). Residency and the column rule both stay as asked there; neither mid vs off nor two
+  columns is measured on it. One sihyung or box pair under BLOOMERY_HOST_ROOM. S.
+- paged-plan box pin: gate_qwen38_serve's paged clause stops at the `parallel` line at `--place gate`, where the draft
+  is already off by Gate; the user's case (one small card, place unset → a, the draft turned off by Paged, `load
+  draft=off`) has only sihyung's log. A box clause at `--place a`, a ~14 GiB room, on the A6000. S.
+- paged1 outside items: bp's slot half may over-restrict a paged bp plan (S); generate_qwen3moe drafts unset with no
+  arena check (S); the Qwen3.6 seat can page on a small host and should ask paged_columns (S–M); LOAD_DRAFT_OFF38's
+  kind doc lists no yield, borrowed or paged reason (XS, next records-refresh).
+
+### The unitier review (worker2)
+- `crates/gpu/src/host/swap_source.rs`: `FileSwap::card_bytes` has no caller. XS.
+- The serve path prints the nvtier record only at load; a per-call nvtier record (or stats()) for long-lived servers. S.
+- The xstream probe prices copies beside union bursts ~1.7× cheap (unitier design). S, measure first.
+- `HOST_USABLE` duplicates `HostNeed::check`'s room; one owner. XS–S.
+- replan (worker1, design `specs/worker1/replan/design.md` + `levers-census.md`; parked): paste worker1's paragraph verbatim at landing.
+
+### The 0.2.8 release pass
+- The #3 fix's pool return costs time where it gains little: on the full A6000 the `call stream end` record times it
+  at 0.87 s of a 5,536-token prompt's 4.4 s first token at `--ctx-size 16384` (0.21 s at 538 tokens; `bp` 0.56 s),
+  0.19–0.35 s at 40960, where decode stayed in the pre-fix build's ranges; the gain was measured at the RTX 5090's
+  card budget. A smaller context leaves the card more experts, so a prompt moves (and returns) more of them. Restore only when the call moved a
+  share of the card pool the decode would read (a threshold from the pool's size against the decode's routed set), or
+  overlap the return with the first token's step. Release notes and rig-log 10-09#rel028-pass hold the numbers. S–M.
+
+### The Fable reviews of 8f5001a6 (host, plan, serve), routed after the tag
+
+- **nvtier arena floor (host #1a).**
+  - The defect: `slots_of` (`crates/gpu/src/host/nvtier.rs:87-99`) refuses only 0 slots. An arena of 1..top_k−1 slots a layer passes the load. Then the first decode step's `ensure` overflows ("every slot is filling: two ensures raced a layer", which is the wrong cause) and poisons the tier `Failed`.
+  - When it hits: Qwen3.8 at top_k 10. The band is MemAvailable ≈ floor + 1..10 slot-sets, about 5.7–7.3 GB on the 3090 gate plan [derived], or a small `BLOOMERY_NVTIER_BYTES`.
+  - Owner fix:
+    - a count floor (top_k, plus the lanes when the machine can run) in `slots_of`/`of_paged`, refused by name at load;
+    - `nvme_arena_of` (`placement.rs:2479`) knows the floor;
+    - `claim_slots` names "misses > slots in one call" apart from "raced";
+    - `NvTierStats` gains slots_per_layer;
+    - FAIL-first: a gate_nvtier clause at arena = (top_k−1)·Σslot.
+  - Gates: 95 (crates/gpu) or 125 (placement). The paged2 train.
+- **nvtier fill vs a reading step (host #1b, structural).**
+  - The defect: a lane's victim fill can evict a slot the step is reading when count ≤ the step's ids + lanes. Nothing pins a read slot.
+  - 0.2.8 closes the trigger in the seat: a set residency on a paged plan is refused.
+  - Structural fix: reading refcount or pin on ensure'd ids.
+- **Lane victim fill through the pool's dispatch mutex (host #2).**
+  - `NvTier::fill` → `threads::pool().for_each_chunk` runs under the lane's receive lock, so the decode's next dispatch waits on an NVMe read.
+  - Fix: read_span on the lane thread, or a lane pool.
+  - Add `Pool::stats().dispatch_wait_ns`.
+- **Small host-tier items (host #3, #4).**
+  - #3: `Body38::stream_begin` drops `call_end`'s error (`body38.rs:3243-3250`).
+  - #4: `SwapMachine::boundary`'s early returns consume `end_us` and `call_picked` (`swap.rs:2159-2192`).
+- **Checkpoint accounting, one owner (plan F3, serve F6).**
+  - Today it is drawn four ways:
+    - qwen3/qwen35: a plan reserve;
+    - Qwen3.8 (seat reserve since 0.2.8) and GLM: one slot in `CacheRam::of_tier`;
+    - V4.1: subtracts 4 GiB it never allocates.
+  - Fix:
+    - lift to the machine's host reserve row with (slots, has_checkpoints);
+    - `CacheRam::of_tier(.., slots)`;
+    - the residency38.rs:32-37 doc made true;
+    - drop the Qwen3.8 double count in bind.rs:435 once the seat reserve is there.
+- **Load check without the arena (plan S4).** Worker2's roomneed (50c71e9c) closes it.
+- **Plan S1–S3.**
+  - S1: tier `kv_bytes += rows` leaves `headroom_bytes` high by `rows` (`place.rs:408,712,722`).
+  - S2: the census context's host bytes vs the room reads.
+  - S3: `nvme_arena_of`'s dial is discontinuous at held/2 (0 ↔ room−floor).
+- **Serve: ENGINE_STOP vs long prompt calls (serve F4, behaviour).** The prompt walk should read the stop between calls. 0.2.8 fixes only the doc.
+- **Serve: halt's error event (serve F5, behaviour).** A stream at SIGTERM ends without an error event or `[DONE]`. 0.2.8 fixes only the doc.
+- **Serve: V4.1's `--ctx-size` meaning (serve F8, decision).** ds41 gives 2 slots × the whole ctx; the others give 1 slot. Its `slot_count` should go through `placement::ctx::slots_of`. The user decides.
+- **Serve: wrong-type fields ignored (serve F10).** `"stop": 5` and `"stream": "true"` are ignored. max_tokens vs max_completion_tokens precedence: check against llama-server.
+- **Sampler factory's Err arm falls back to argmax (`bind.rs:215-224`).** 0.2.8 refuses non-finite input at the API. The arm itself should be a named error.
+- **Serve suspects.**
+  - S2: GLM's set-ctx refusal does not name NextN bytes.
+  - S3: assistant `tool_calls[].function.arguments` reach the template as strings.
+  - S4: a mixed round's single pass row bypasses the width chooser (`worker.rs:748-750`).
+- **Release check (serve §4).** `tools/release/build.sh` asserts every bug-class commit is an ancestor of the tag, by `git merge-base --is-ancestor`. This catches the paged2-not-in-RC class.
+- **bp paged plan (serve F1).** 0.2.8 serves one slot on a bp paged plan. paged2's 9c34cd76/bee691d1 (PagedAt.together) lift it.
+  - Note: R1 stepunion2 (worker2) already carries the claim_slots split: a call asking more distinct ids than slots is refused by name before any claim. Still open: the load-time floor and nvme_arena_of.
+- **Slots: one KV pool (user, 10-09).**
+  - Today the seats split `--ctx-size` statically among the slots: 2 by default, 1 on a paged plan and on a set ctx with no `--parallel`.
+  - llama-server's unset `--parallel` is auto: 4 slots over one unified KV pool, its log reading "setting n_parallel = 4 and kv_unified = true" (llama.cpp #17989).
+  - Ollama is reported to pick 4, or 1 under memory pressure.
+  - A shared pool would drop the static split's loss. It is a candidate after 0.2.9, needing a design round.
+- **The 2-slot plan's floor fallback (0.2.8 seatfix):**
+  - with the default slots, a HostRoomFloor at 2 slots re-plans at 1 (from=paged);
+  - qwen38_place.rs's offer plan has no checkpoint reserve, so on a floor-edge host the offer passes and the load refuses (seatfix out-of-scope #1, 95–129 keys);
+  - CacheRam/residency38 still double-count checkpoint_bytes(1) beside the seat's reserve (seatfix #2).
+
 ## Top priority: the common-machine gap (GitHub #1, the user, 2026-10-07)
 
 A user measured bloomery 0.2.5 against Strata on one machine and one file: RTX 5090 32 GB, Core Ultra 9 285K (AVX2 +
