@@ -570,8 +570,9 @@ struct TypePin {
 /// the V4.1 chain's attention gemvs, whose
 /// head-split sites in `chain/attn.rs` take q3_K or q8_0, the same head, and
 /// the hyper-connection fn `hc.rs` reads as q3_K words, `hc_f32.rs` as f32;
-/// the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the head's
-/// q8_0 arm, and the embedding row the host dequantizes).
+/// the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the common
+/// head's q8_0, q6_K and q4_K arms, and the embedding row the host
+/// dequantizes).
 const TYPE_PINS: &[TypePin] = &[
     TypePin {
         program: Program::Qwen3moeBody,
@@ -770,8 +771,9 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the head reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "output head (the head reads q8_0 planes, q6_K or q4_K word planes)",
+        // The common head's own set (`head_out_w` in `gpu/src/head.rs`).
+        reads: &[GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K],
     },
     TypePin {
         program: Program::Glm5nextBody,
@@ -901,6 +903,12 @@ fn qwen38_card_routed(ty: GgmlType) -> bool {
     crate::arch::qwen35moe::place::card_routed(ty).is_some()
 }
 
+/// The glm5next body's card rule: the types its card experts load
+/// ([`card_routed`](crate::arch::glm5next::place::card_routed)).
+fn glm5next_card_routed(ty: GgmlType) -> bool {
+    crate::arch::glm5next::place::card_routed(ty).is_some()
+}
+
 /// A qwen4exp selector's key or query projection, which `Body38` reads as
 /// bf16 widened to f32 (`plan38::plans`), where it reads every other
 /// attention matrix as q8_0.
@@ -985,12 +993,23 @@ pub fn check_with(
     for t in &model.tensors {
         if t.role == Role::RoutedExperts {
             match program {
-                // The V4.1 chain's and the glm5next body's rule: a stack of a
-                // type no card format loads. A layer whose stacks the program's
-                // card experts do not read keeps them on the host, whose load
-                // refuses a type with no host kernel.
-                Some(Program::Deepseek41Chain | Program::Glm5nextBody) => {
+                // The V4.1 chain's rule: a stack of a type no card format
+                // loads. A layer whose stacks the chain's card experts do not
+                // read keeps them on the host, whose load refuses a type with
+                // no host kernel.
+                Some(Program::Deepseek41Chain) => {
                     if CardFormat::of(t.ty).is_none() {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // The glm5next body's rule: a stack passes when the program
+                // can run it — on the card by its expert rule (`card_routed`)
+                // or on the host by a qdot fused kernel at the stack's row
+                // width ([`routed_unrun`], the one owner). A layer with a
+                // stack the card experts do not read keeps all its experts on
+                // the host.
+                Some(Program::Glm5nextBody) => {
+                    if routed_unrun(t, glm5next_card_routed) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -1057,10 +1076,10 @@ pub fn check_with(
 #[cfg(test)]
 mod tests {
     use gguf::GgmlType;
-    use models::{Arch, Need};
+    use models::{Arch, ChatSpec, ModelSpec, Need};
 
     use super::{Program, program_of, weight_formats};
-    use crate::placement::{ModelTensor, Role};
+    use crate::placement::{ModelTensor, ModelTensors, Role};
 
     /// A layer-0 matrix `name` of role `role` and type `ty`.
     fn matrix(name: &str, role: Role, ty: GgmlType) -> ModelTensor {
@@ -1372,6 +1391,183 @@ mod tests {
                 "{ty}"
             );
         }
+    }
+
+    /// The items [`super::check`] lists for a glm5next file holding
+    /// `tensors` whose text holds `needle`: each its layer and text. A spec
+    /// with no layers and no chat surface stands for the rest of the file,
+    /// and `needle` leaves its items out. The check reads the CPU's features
+    /// (`qdot::fuses`), so the host leg's answer is the x86-64-v3 host the
+    /// engine itself requires.
+    fn glm5next_items(tensors: Vec<ModelTensor>, needle: &str) -> Vec<(Option<usize>, String)> {
+        let spec = ModelSpec {
+            arch: Arch::Glm5Next,
+            hidden: 4096,
+            vocab: 154_880,
+            ctx_train: 1_048_576,
+            rms_eps: 1e-5,
+            layers: Vec::new(),
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            chat: ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        };
+        let model = ModelTensors {
+            tensors,
+            layers: 5,
+            experts: 288,
+            experts_used: 8,
+        };
+        super::check(&spec, &model)
+            .into_iter()
+            .filter(|u| u.feature.contains(needle))
+            .map(|u| (u.layer, u.feature))
+            .collect()
+    }
+
+    /// The routed items for a glm5next file whose layers 3 and 4 hold
+    /// routed stacks of `gate_up` (gate and up) and `down`, at
+    /// GLM-5.3-Flash's widths (the gate and up map 4,096 to 2,048 values,
+    /// the down 2,048 to 4,096, 288 experts).
+    fn glm5next_routed_items(gate_up: GgmlType, down: GgmlType) -> Vec<(Option<usize>, String)> {
+        let stack = |layer: usize, stem: &str, ty: GgmlType| {
+            let (k, n) = if stem == "ffn_down_exps" {
+                (2048, 4096)
+            } else {
+                (4096, 2048)
+            };
+            ModelTensor {
+                name: format!("blk.{layer}.{stem}.weight"),
+                shard: 0,
+                layer: Some(layer),
+                role: Role::RoutedExperts,
+                ty,
+                dims: vec![k, n, 288],
+                file_bytes: 0,
+                gathered_rows: None,
+            }
+        };
+        let tensors = [3, 4]
+            .into_iter()
+            .flat_map(|l| {
+                [
+                    stack(l, "ffn_gate_exps", gate_up),
+                    stack(l, "ffn_up_exps", gate_up),
+                    stack(l, "ffn_down_exps", down),
+                ]
+            })
+            .collect();
+        glm5next_items(tensors, "routed experts on a card")
+    }
+
+    /// The items of the model-level tensor `name` of role `role` and type
+    /// `ty` (GLM-5.3-Flash's 4,096 by 154,880 matrix) whose text holds
+    /// `needle`.
+    fn glm5next_whole_items(
+        name: &str,
+        role: Role,
+        ty: GgmlType,
+        needle: &str,
+    ) -> Vec<(Option<usize>, String)> {
+        let t = ModelTensor {
+            name: name.to_string(),
+            shard: 0,
+            layer: None,
+            role,
+            ty,
+            dims: vec![4096, 154_880],
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        glm5next_items(vec![t], needle)
+    }
+
+    /// A routed stack of a glm5next file passes when the program can run it
+    /// — on the card by the card experts' types (q4_K, q5_K) or on the host
+    /// by a fused qdot kernel at its row width, so a layer with a stack the
+    /// card does not read keeps its experts on the host — and a type neither
+    /// side runs is an item for each layer that holds it, named by its type,
+    /// whether it is a gate, up or down.
+    // PIN(2026-10-09): the glm5next routed rule widened from `CardFormat::of`
+    // to card-or-host so a file's i-quant stacks (iq3_xxs, iq4_xs gate and
+    // up or down) are no items; a bf16 stack, which `CardFormat::of` took but
+    // no host kernel reads, is an item.
+    #[test]
+    fn a_glm5next_routed_stack_runs_on_a_card_or_the_host() {
+        let none = Vec::<(Option<usize>, String)>::new();
+        let item = |ty: GgmlType| -> Vec<(Option<usize>, String)> {
+            [3, 4]
+                .into_iter()
+                .map(|l| (Some(l), Need::RoutedFormat(ty).to_string()))
+                .collect()
+        };
+        let cases = [
+            // The card's: q4_K gate and up with a q5_K down.
+            (GgmlType::Q4_K, GgmlType::Q5_K, none.clone()),
+            // The card's gate and up with a down only the host reads: the
+            // layer's experts stay on the host.
+            (GgmlType::Q4_K, GgmlType::Q6_K, none.clone()),
+            // The host's alone: the i-quants of a layer no card expert reads.
+            (GgmlType::IQ3_XXS, GgmlType::IQ4_XS, none.clone()),
+            // The host's alone too, and no change: `CardFormat::of` takes
+            // q3_K, so this passed before the card-or-host rule as well.
+            (GgmlType::Q3_K, GgmlType::Q4_K, none.clone()),
+            // No side: bf16 has no card expert and no fused qdot kernel, as
+            // a gate and up or as a down.
+            (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),
+            (GgmlType::Q4_K, GgmlType::BF16, item(GgmlType::BF16)),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .map(|(gate_up, down, want)| {
+                (gate_up, down, want, glm5next_routed_items(*gate_up, *down))
+            })
+            .filter(|(_, _, want, got)| want != &got)
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "(gate and up, down, want, got) of the cases off the rule: {wrong:#?}"
+        );
+    }
+
+    /// The glm5next head's pin reads the set the head kernel reads
+    /// (`gpu::head`'s `head_out_w`, which every head the body runs goes
+    /// through): q8_0 planes, a q6_K or q4_K word plane; another type of
+    /// `output` is an item, and the embedding's pin stays q8_0 alone.
+    // PIN(2026-10-09): q6_K (and q4_K, which the same gemv reads) joined the
+    // head's set so a file with a q6_K output loads.
+    #[test]
+    fn the_glm5next_head_pin_reads_the_head_kernels_set() {
+        let head =
+            |ty: GgmlType| glm5next_whole_items("output.weight", Role::Head, ty, "output head");
+        for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K] {
+            assert_eq!(head(ty), Vec::<(Option<usize>, String)>::new(), "{ty}");
+        }
+        assert_eq!(
+            head(GgmlType::Q5_K),
+            [(
+                None,
+                "q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes)"
+                    .to_string()
+            )]
+        );
+        assert_eq!(
+            glm5next_whole_items(
+                "token_embd.weight",
+                Role::TokenEmbedding,
+                GgmlType::Q6_K,
+                "token embedding"
+            ),
+            [(
+                None,
+                "q6_K token embedding (the host reads q8_0 rows)".to_string()
+            )]
+        );
     }
 
     /// The qwen4exp head's pin reads the set the head kernel reads
