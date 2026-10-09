@@ -1,0 +1,63 @@
+# M1 of the discovery search's refutation (specs/leader/discover/refute-report.md section 4): the one term the paper cannot fix
+# for the RTX 3090 at --place gate. No single-request 3090 Qwen3.8 decode row exists (resit-q38-3090.card has no outcome), and
+# the slot lanes (D1), the pair-chain verify (miss-1), the L3 prefetch's window (D4) and the card-latency round all turn on K1',
+# the card's own chain as the step waits on it: K1' = step - leg_us.
+#
+# Decomposition [derived], one request, plain path, residency off, no draft (the gate defaults: levers/src/lib.rs:1459-1475 and
+# xstream38.rs:42-45 leave both off at --place gate; BLOOMERY_DRAFT unset is off there, levers draft38_unset):
+#   step   = K1' + leg_us
+#   leg_us = the sum over the step's served layers of the host service, go seen -> signal (crates/gpu/src/host/step.rs:946-951,
+#            gpu-gates host_stats.rs:91), = host_slots x W + 48 x fixed
+#   W      = 23.6 us a host slot, the slope of host time on slots (rig-log 09-30#q38res-hit, measured; the 32 x 1 bench's W is
+#            23.36 us); the host is the same machine whatever the card
+#   slots  = 480 routed slots a token (48 layers x top-10) x (1 - hit); the gate plan holds 4,269 card experts, hit 0.191 =
+#            388 slots (evaluator q38_step.py --machine box-3090 --config gate); the README row's 357 slots (hit 0.256) come
+#            from its set residency (mid-p32-s1), which this arm lacks, so 357 is the low edge and ~388 the expected value
+#   leg_us = 357..388 x 23.6 us = 8.43..9.16 ms, plus the per-service fixed part 48 x 0..15 us = 0..0.72 ms: 8.4..9.9 ms
+#   step   = 20.5..21.2 ms (47.1 tok/s at G: the bytes lens' 47.1 and the evaluator's 21.23 ms; 20.5 ms is the README row's
+#            one-request step, derived from its two-request 60.71 tok/s at 357 slots, rig-log 10-06#num3090, through lanes.out)
+#   K1'    = 20.5 - 9.9 = 10.6 to 21.2 - 8.4 = 12.8 ms; the evaluator's gate config 21.23 - 9.65 = 11.58 ms (its card chain
+#            13.75 ms, of which 2.17 ms hides under the host leg). The band keeps the refutation's edges: 10.3..12.9 ms.
+# Read beside the band, not decided on it: leg_us_mean 8.4..9.9 ms, host slots a token 357..388 (this arm is G: ~388, the 357
+# is R's and needs the residency set), step 20.5..21.2 ms (47.1..48.8 tok/s).
+# Wall [derived]: 2 arms x 2 rounds = 4 loads of a Qwen3.8 file (~40 s each with the host set warm) + a PRIME and a counted run
+# of 96 steps (~7 s) + the witness blocks: 5..8 min.
+kind: baseline
+question: on the RTX 3090 at --place gate, one request, how much of a plain Qwen3.8 decode step is the card's chain (the step
+  less the host tier's service time)?
+term: K1' = the step's mean ms less the host service's mean ms (stat summary leg_us_mean / 1000), per round then the mean of
+  the rounds, @ n=96 (95 counted steps), depth 512 (prose:512, the first 512 ids of corpus-prose.ids after a same-id PRIME),
+  ctx 4352 (BLOOMERY_GEN_CTX=4352), generate_qwen3moe --place gate on qwen4exp, RTX 3090 at 250 W, residency off, no draft
+unit: ms
+predict: 10.3..12.9
+condition: one lease, two rounds, BLOOMERY_WARM_ROWS=1, BLOOMERY_GEN_PLACE=gate, the 3090 as BLOOMERY_TIMING_GPU, the arms
+  prose:512 and prose:512@BLOOMERY_STEP_STATS=1 (the registry's lever is load-time, so each arm is a load of its own: one
+  binary, ctx 4352 and --place gate in both; 4352 is the ctx the P=4096 arms of the later config card plan at, so the plan is
+  theirs). Inside the measured window: each ours row's place gate and its load line's place=gate on the 3090 (else a FAIL row);
+  the two arms' `load` lines equal and their `capture` graph_nodes equal (else leg_us comes from another plan or graph and K1'
+  is void: read the difference first);
+  the `tokens` lines of the two arms equal; no counted row [cold], [cpu-busy] or [other-busy]; the stats arm's `stat step`
+  records number 95 with served=48 each, and its `stat summary` steps=95. The full output to a file first. Read K1' as: for
+  each round r, the plain arm's `ROW r<r> ours@prose` row's `mean <ms> ms` less the `leg_us_mean` of the `stat summary` line
+  printed just above the `ROW r<r> ours@prose@BLOOMERY_STEP_STATS=1` row (the PRIME run before it prints a summary too: take
+  the one above the ROW, not the PRIME row); `grep -E '^(stat summary|ROW r[0-9]+ ours@prose)' <log>` lists them in order.
+  The stats arm's own step ms is not used (it carries the probe's tax, q38step-stats.card); the ratio line
+  `ours@prose/ours@prose@BLOOMERY_STEP_STATS=1` is that tax, read beside. The 3090's UUID: BLOOMERY_BOX_READONLY=1
+  tools/box.sh 'nvidia-smi --query-gpu=name,uuid --format=csv,noheader'. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-3090-k1.card BLOOMERY_WARM_ROWS=1 BLOOMERY_GEN_PLACE=gate
+  BLOOMERY_GEN_CTX=4352 BLOOMERY_TIMING_GPU=<the 3090's UUID>' just depth-gpu-qwen4exp prose:512
+  prose:512@BLOOMERY_STEP_STATS=1 > <log> 2>&1
+reason: sets the 3090's one-request Qwen3.8 K1' and host leg, the cell no lens could derive (the resit's one-request 3090 row has
+  no outcome); why now: the slot-lanes design (D1), the pair-chain verify (miss-1) and the L3 prefetch's window (D4) are priced
+  on K1' alone, and M2's nsys splits it
+decide-in: K1' at or under 12.9 ms: open the slot-lanes design round (D1 with miss-1, the pair-chain verify: lanes.out gives
+  +7..+35 % on R at K1' 12.9..9.7); write the 3090 G one-request cell (tok/s, K1', leg_us_mean, host slots) into rig-log beside
+  the README row, naming this arm as the gate defaults (the README row's residency is set); M2 splits K1' into bytes and gaps
+decide-below: K1' under 10.3 ms: the lanes gain more than priced and the host leg binds sooner; before opening anything read
+  leg_us_mean against 8.4..9.9 ms and the host slots against 357..388: a smaller leg or fewer slots means the plan holds more
+  card experts than the 4,269 the bands assume (the `plan` record's card_experts is in M2's profile-A log, which lease-hold.sh
+  keeps whole; this run's log echoes only the `load` and `capture` lines), and the bands are re-derived from that plan first
+decide-above: K1' over 12.9 ms: between 12.9 and 14.55 the lanes' gain falls under +7 % on R (+13 % on G), so hold the lanes
+  round and let M2's per-layer gaps say whether the card chain can shorten first; at 14.55 or more drop the lanes (no gain on R
+  or G) and use M2 to split the chain; if leg_us_mean is over 9.9 ms read the host slots before K1' (more than 388 slots is the
+  plan, not the card)
