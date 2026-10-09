@@ -1,6 +1,7 @@
 use super::{
-    Admit, Layout, RefManifest, RowKind, find_int_row, find_ref_row_in, mask_bits_in, refused,
-    topk_ids_logical_within, widened_f16_bits_in, widened_f16_rows_in,
+    Admit, FileElem, Layout, PrefillRoutes, RefManifest, RowKind, dump_file_name, find_int_row,
+    find_ref_row_in, mask_bits_in, refused, topk_ids_logical_within, widened_f16_bits_in,
+    widened_f16_rows_in,
 };
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -500,4 +501,713 @@ fn a_masked_row_admits_minus_inf_past_its_finite_slots_only() {
         refused(&[f32::NAN, 2.0, inf], 3, Admit::MaskedPast(2)),
         Some(0)
     );
+}
+
+const GLM_LAST: &str = "ffn_moe_weights_scaled";
+const QWEN_LAST: &str = "ffn_moe_weights_norm";
+const ROUTE_HEADER: &str = "# prefill_routes\tik's routing of the prefill's positions: the nodes \
+    ffn_moe_topk-<layer>, ffn_moe_weights-<layer>, ffn_moe_weights_scaled-<layer> of each ubatch \
+    of the quiet prefill (n_ubatch 512) are tensor rows named prefill.<node>, one occurrence a \
+    ubatch in prefill order, their positions following in order from 0";
+/// The experts a position picks in every synthetic route set.
+const N_USED: usize = 2;
+
+/// The value of cell `j` of position `g` of `layer` in a route set; the picks
+/// of a position are distinct and below 7.
+fn route_pick(layer: u32, g: usize, j: usize) -> i32 {
+    ((layer as usize + g + j) % 7) as i32
+}
+
+fn route_raw(layer: u32, g: usize, j: usize) -> f32 {
+    (layer as usize * 100 + g * 10 + j + 1) as f32 / 7.0
+}
+
+fn route_last(layer: u32, g: usize, j: usize) -> f32 {
+    route_raw(layer, g, j) * 2.5 / 3.0
+}
+
+fn bits(vals: &[f32]) -> Vec<u32> {
+    vals.iter().map(|v| v.to_bits()).collect()
+}
+
+/// A route row of the v2 columns; `bytes` is the f32 read of `ne`'s elements.
+fn route_row(name: &str, occ: u32, ty: &str, ne: [usize; 4], op: &str, view: bool) -> String {
+    let (contig, logical) = if view { (0, 1) } else { (1, 0) };
+    let bytes = 4 * ne.iter().product::<usize>();
+    format!(
+        "tensor\t{name}\t{occ}\t{ty}\t{}\t{}\t{}\t{}\t{bytes}\t0.000000\t{op}\t{contig}\t{logical}\t-\t-",
+        ne[0], ne[1], ne[2], ne[3]
+    )
+}
+
+/// The `int` row of `name`/`occ`'s twin of `ids` in the layout `logical`
+/// says, and the file it names, written.
+fn int_row(dir: &Path, name: &str, occ: u32, logical: bool, ids: &[i32]) -> String {
+    let layout = if logical {
+        Layout::Logical
+    } else {
+        Layout::Flat
+    };
+    let file = dump_file_name(name, occ, RowKind::Tensor, layout, FileElem::I32);
+    write(
+        &dir.join(&file),
+        &ids.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let sum: i64 = ids.iter().map(|&v| i64::from(v)).sum();
+    let absmax = ids.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+    format!(
+        "int\t{name}\t{occ}\ttensor\ti32\ti32\t{}\t{}\t{}\t{sum}\t{absmax}\t{file}",
+        layout.as_str(),
+        ids.len(),
+        4 * ids.len()
+    )
+}
+
+/// The row of a weights file written to `dir`.
+fn weights_row(dir: &Path, name: &str, occ: u32, ne: [usize; 4], op: &str, vals: &[f32]) -> String {
+    let file = dump_file_name(name, occ, RowKind::Tensor, Layout::Flat, FileElem::F32);
+    f32_file(&dir.join(file), vals);
+    route_row(name, occ, "f32", ne, op, false)
+}
+
+/// The manifest lines of a decode-step set with ik's routing of the prefill
+/// in ubatches of `widths` positions, `layers` written in that order, and
+/// its files in `dir`. The picks' flat twin is the first position's ids over
+/// and over, as the flat read of the view is only a parent's elements. The
+/// normalised weights of `QWEN_LAST` are `[n_used, positions]`, the gathered
+/// and scaled ones `[1, n_used, positions]`.
+fn route_set(dir: &Path, widths: &[usize], layers: &[u32], last_stem: &str) -> Vec<String> {
+    let mut lines = vec![
+        format!("# prefill\t{}", widths.iter().sum::<usize>()),
+        ROUTE_HEADER.to_string(),
+        KIND_V2.to_string(),
+        INT.to_string(),
+    ];
+    let mut first = 0;
+    for (u, &w) in (0u32..).zip(widths) {
+        for &layer in layers {
+            let cells = || (first..first + w).flat_map(|g| (0..N_USED).map(move |j| (g, j)));
+            let name = format!("prefill.ffn_moe_topk-{layer}");
+            let ids: Vec<i32> = cells().map(|(g, j)| route_pick(layer, g, j)).collect();
+            let flat: Vec<i32> = ids[..N_USED]
+                .iter()
+                .cycle()
+                .take(ids.len())
+                .copied()
+                .collect();
+            lines.push(route_row(&name, u, "i32", [N_USED, w, 1, 1], "VIEW", true));
+            lines.push(int_row(dir, &name, u, false, &flat));
+            lines.push(int_row(dir, &name, u, true, &ids));
+            let raw: Vec<f32> = cells().map(|(g, j)| route_raw(layer, g, j)).collect();
+            lines.push(weights_row(
+                dir,
+                &format!("prefill.ffn_moe_weights-{layer}"),
+                u,
+                [1, N_USED, w, 1],
+                "GET_ROWS",
+                &raw,
+            ));
+            let last: Vec<f32> = cells().map(|(g, j)| route_last(layer, g, j)).collect();
+            let (ne, op) = if last_stem == QWEN_LAST {
+                ([N_USED, w, 1, 1], "DIV")
+            } else {
+                ([1, N_USED, w, 1], "SCALE")
+            };
+            lines.push(weights_row(
+                dir,
+                &format!("prefill.{last_stem}-{layer}"),
+                u,
+                ne,
+                op,
+                &last,
+            ));
+        }
+        first += w;
+    }
+    lines
+}
+
+fn routes_manifest(dir: &Path, lines: &[String]) -> Result<RefManifest, RefError> {
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    manifest(dir, &lines)
+}
+
+/// The routes of the set `lines` with the stems of `last_stem`'s family.
+fn routes_of(dir: &Path, lines: &[String], last_stem: &str) -> Result<PrefillRoutes, RefError> {
+    routes_manifest(dir, lines)?.prefill_routes("ffn_moe_topk", "ffn_moe_weights", last_stem)
+}
+
+/// What reading the set `lines` (GLM's stems) refuses with.
+fn refusal(dir: &Path, lines: &[String]) -> Result<RefError, RefError> {
+    match routes_of(dir, lines, GLM_LAST) {
+        Err(e) => Ok(e),
+        Ok(r) => panic!("the set was read: {r:?}"),
+    }
+}
+
+/// `e` is a `Missing` (`missing`) or a `Malformed` refusal whose text holds
+/// every one of `parts`.
+fn assert_refusal(e: &RefError, missing: bool, parts: &[&str]) {
+    let kind = if missing {
+        matches!(e, RefError::Missing { .. })
+    } else {
+        matches!(e, RefError::Malformed { .. })
+    };
+    assert!(kind, "wrong kind of refusal: {e:?}");
+    let text = e.to_string();
+    for part in parts {
+        assert!(text.contains(part), "{part:?} is not in {text}");
+    }
+}
+
+/// The one line of `lines` that opens with `prefix`.
+fn line_at<'a>(lines: &'a mut [String], prefix: &str) -> &'a mut String {
+    let mut hits = lines.iter_mut().filter(|l| l.starts_with(prefix));
+    let hit = hits.next().unwrap_or_else(|| panic!("no line {prefix:?}"));
+    assert!(hits.next().is_none(), "two lines {prefix:?}");
+    hit
+}
+
+/// Row `name`/`occ` of `lines` with the dims `ne` and the bytes they hold.
+fn set_ne(lines: &mut [String], name: &str, occ: u32, ne: [usize; 4]) {
+    let row = line_at(lines, &format!("tensor\t{name}\t{occ}\t"));
+    let mut fields: Vec<String> = row.split('\t').map(str::to_string).collect();
+    for (field, dim) in fields[4..8].iter_mut().zip(ne) {
+        *field = dim.to_string();
+    }
+    fields[8] = (4 * ne.iter().product::<usize>()).to_string();
+    *row = fields.join("\t");
+}
+
+/// ik's routing of a prefill of two ubatches (3 and 2 positions) in layers 5
+/// and 2, written in that order: the accessor returns the layers ascending,
+/// each with the five positions in order and every pick and weight exactly
+/// as written. The picks come from the logical twin: the flat twin the set
+/// also holds differs.
+#[test]
+fn prefill_routes_hold_every_layer_over_the_ubatches_in_order() -> Result<(), RefError> {
+    let dir = set_dir("routes-read")?;
+    let lines = route_set(&dir, &[3, 2], &[5, 2], GLM_LAST);
+    let routes = routes_of(&dir, &lines, GLM_LAST)?;
+    let mut reversed = lines.clone();
+    reversed[4..].reverse();
+    assert_eq!(routes_of(&dir, &reversed, GLM_LAST)?, routes);
+    assert_eq!(
+        (routes.positions, routes.ubatches, routes.n_used),
+        (5, 2, 2)
+    );
+    assert_eq!(
+        routes.layers.iter().map(|l| l.layer).collect::<Vec<_>>(),
+        [2, 5]
+    );
+    for l in &routes.layers {
+        let cells = || (0..5).flat_map(|g| (0..N_USED).map(move |j| (g, j)));
+        let picks: Vec<u32> = cells()
+            .map(|(g, j)| route_pick(l.layer, g, j) as u32)
+            .collect();
+        let raw: Vec<f32> = cells().map(|(g, j)| route_raw(l.layer, g, j)).collect();
+        let last: Vec<f32> = cells().map(|(g, j)| route_last(l.layer, g, j)).collect();
+        assert_eq!(l.picks, picks, "layer {}", l.layer);
+        assert_eq!(bits(&l.raw), bits(&raw), "layer {}", l.layer);
+        assert_eq!(bits(&l.last), bits(&last), "layer {}", l.layer);
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// Qwen3.8's final weights are the normalised ones, `[n_used, positions]`,
+/// where the gathered ones are `[1, n_used, positions]`; a ubatch of one
+/// position reads the same.
+#[test]
+fn prefill_routes_take_the_normalised_shape_and_a_ubatch_of_one() -> Result<(), RefError> {
+    let dir = set_dir("routes-norm")?;
+    let lines = route_set(&dir, &[2, 1], &[0, 1], QWEN_LAST);
+    let routes = routes_of(&dir, &lines, QWEN_LAST)?;
+    assert_eq!((routes.positions, routes.ubatches), (3, 2));
+    for l in &routes.layers {
+        let last: Vec<f32> = (0..3 * N_USED)
+            .map(|i| route_last(l.layer, i / N_USED, i % N_USED))
+            .collect();
+        assert_eq!(bits(&l.last), bits(&last), "layer {}", l.layer);
+        assert_eq!(l.picks.len(), 3 * N_USED);
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A set dumped without `--prefill-routes` has no `# prefill_routes` line,
+/// and a caller tests for that before planting: the error is `Missing` and
+/// names the line and the set.
+#[test]
+fn a_set_without_the_routes_header_is_missing_by_name() -> Result<(), RefError> {
+    let dir = set_dir("routes-header")?;
+    let step = [
+        "# prefill\t5",
+        KIND_V2,
+        "tensor\tffn_moe_topk-2\t0\ti32\t2\t1\t1\t1\t8\t0.000000\tVIEW\t0\t1\t-\t-",
+    ];
+    let man = manifest(&dir, &step)?;
+    let e = man
+        .prefill_routes("ffn_moe_topk", "ffn_moe_weights", GLM_LAST)
+        .expect_err("a step set without routes");
+    assert_refusal(
+        &e,
+        true,
+        &["has no # prefill_routes line", &dir.display().to_string()],
+    );
+
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    lines.retain(|l| !l.starts_with("# prefill_routes\t"));
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(&e, true, &["has no # prefill_routes line"]);
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A route set without its `# prefill` line is `Missing` by name: the
+/// positions of the prefill are not stated.
+#[test]
+fn a_route_set_without_the_prefill_line_is_missing_by_name() -> Result<(), RefError> {
+    let dir = set_dir("routes-prefill")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    lines.retain(|l| !l.starts_with("# prefill\t"));
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        true,
+        &["has no # prefill line", &dir.display().to_string()],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A stem with no row at all is `Missing`, naming the stem, whichever of
+/// the three it is.
+#[test]
+fn a_stem_with_no_row_is_missing_by_name() -> Result<(), RefError> {
+    let dir = set_dir("routes-stem")?;
+    for stem in ["ffn_moe_topk", "ffn_moe_weights", GLM_LAST] {
+        let mut lines = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+        lines.retain(|l| !l.contains(&format!("\tprefill.{stem}-")));
+        let e = refusal(&dir, &lines)?;
+        assert_refusal(
+            &e,
+            true,
+            &[
+                &format!("has no tensor row prefill.{stem}-<layer>"),
+                &dir.display().to_string(),
+            ],
+        );
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// The three stems name the same layers: one lacking a layer, or holding
+/// another, is refused naming both sets of layers.
+#[test]
+fn stems_naming_different_layers_are_refused() -> Result<(), RefError> {
+    let dir = set_dir("routes-layers")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+    let whole = lines.clone();
+    lines.retain(|l| !l.starts_with("tensor\tprefill.ffn_moe_weights-5\t"));
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[
+            "different layers",
+            "ffn_moe_topk has [2, 5]",
+            "ffn_moe_weights has [2]",
+            &dir.display().to_string(),
+        ],
+    );
+
+    let mut lines = whole;
+    let extra: Vec<String> = lines
+        .iter()
+        .filter(|l| l.starts_with(&format!("tensor\tprefill.{GLM_LAST}-2\t")))
+        .map(|l| l.replace("-2\t", "-9\t"))
+        .collect();
+    lines.extend(extra);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["different layers", &format!("{GLM_LAST} has [2, 5, 9]")],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A row's occurrences run 0..U: a gap, a start at 1 and a row written twice
+/// are each refused naming the row.
+#[test]
+fn occurrences_must_run_from_zero_without_a_gap_or_a_repeat() -> Result<(), RefError> {
+    let dir = set_dir("routes-occ")?;
+    let whole = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let head = "tensor\tprefill.ffn_moe_topk-2\t";
+
+    let mut lines = whole.clone();
+    let row = line_at(&mut lines, &format!("{head}1\t"));
+    *row = row.replacen("topk-2\t1\t", "topk-2\t2\t", 1);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-2 has occurrences [0, 2], want 0..2"],
+    );
+
+    let mut lines = whole.clone();
+    lines.retain(|l| !l.starts_with(&format!("{head}0\t")));
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-2 has occurrences [1], want 0..1"],
+    );
+
+    let mut lines = whole;
+    let twice = line_at(&mut lines, &format!("{head}0\t")).clone();
+    lines.push(twice);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-2 has occurrences [0, 0, 1], want 0..3"],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// Every row of every stem and layer has the same number of occurrences: a
+/// stem short of a ubatch, though its own occurrences run from 0, is refused.
+#[test]
+fn every_row_has_the_same_ubatches() -> Result<(), RefError> {
+    let dir = set_dir("routes-ubatches")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+    lines.retain(|l| !l.starts_with(&format!("tensor\tprefill.{GLM_LAST}-5\t1\t")));
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[&format!(
+            "prefill.{GLM_LAST}-5 has 1 occurrences, prefill.ffn_moe_topk-2 has 2"
+        )],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// The ubatches' widths sum to `# prefill`.
+#[test]
+fn ubatch_widths_must_sum_to_the_prefill() -> Result<(), RefError> {
+    let dir = set_dir("routes-sum")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    *line_at(&mut lines, "# prefill\t") = "# prefill\t6".to_string();
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[
+            "count [3, 2] positions, # prefill says 6",
+            &dir.display().to_string(),
+        ],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// The stems count the same positions at one occurrence, each from its own
+/// row's ne.
+#[test]
+fn the_stems_must_count_the_same_positions_at_an_occurrence() -> Result<(), RefError> {
+    let dir = set_dir("routes-agree")?;
+    let whole = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let last = format!("prefill.{GLM_LAST}-2");
+    let mut lines = whole.clone();
+    set_ne(&mut lines, &last, 0, [1, N_USED, 2, 1]);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[&format!(
+            "{last}/0 counts 2 positions where prefill.ffn_moe_topk-2/0 counts 3"
+        )],
+    );
+
+    let mut lines = whole;
+    set_ne(
+        &mut lines,
+        "prefill.ffn_moe_weights-2",
+        1,
+        [1, N_USED, 3, 1],
+    );
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_weights-2/1 counts 3 positions where prefill.ffn_moe_topk-2/1 counts 2"],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// Every layer cuts the prefill into the same ubatches, even when each
+/// layer's own stems agree and its widths sum to `# prefill`.
+#[test]
+fn every_layer_must_cut_the_same_ubatches() -> Result<(), RefError> {
+    let dir = set_dir("routes-cut")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+    set_ne(&mut lines, "prefill.ffn_moe_topk-5", 0, [N_USED, 2, 1, 1]);
+    set_ne(
+        &mut lines,
+        "prefill.ffn_moe_weights-5",
+        0,
+        [1, N_USED, 2, 1],
+    );
+    set_ne(
+        &mut lines,
+        &format!("prefill.{GLM_LAST}-5"),
+        0,
+        [1, N_USED, 2, 1],
+    );
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-5/0 counts 2 positions, layer 2 counts 3"],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// Every row picks the same number of experts a position.
+#[test]
+fn n_used_must_not_change_between_rows() -> Result<(), RefError> {
+    let dir = set_dir("routes-nused")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+    set_ne(&mut lines, "prefill.ffn_moe_topk-5", 0, [3, 3, 1, 1]);
+    set_ne(&mut lines, "prefill.ffn_moe_weights-5", 0, [1, 3, 3, 1]);
+    set_ne(
+        &mut lines,
+        &format!("prefill.{GLM_LAST}-5"),
+        0,
+        [1, 3, 3, 1],
+    );
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-5/0 picks 3 experts a position, an earlier row 2"],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A picks row is `[n_used, positions]` and a weights row of the same
+/// `n_used` is `[n_used, positions]` or `[1, n_used, positions]`; any other
+/// ne is refused naming the row and its ne.
+#[test]
+fn a_row_of_another_shape_is_refused() -> Result<(), RefError> {
+    let dir = set_dir("routes-shape")?;
+    let whole = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let mut lines = whole.clone();
+    set_ne(&mut lines, "prefill.ffn_moe_topk-2", 0, [N_USED, 3, 2, 1]);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-2/0 has ne [2, 3, 2, 1], want [n_used, positions, 1, 1]"],
+    );
+
+    let mut lines = whole.clone();
+    set_ne(&mut lines, "prefill.ffn_moe_topk-2", 1, [N_USED, 0, 1, 1]);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_topk-2/1 has ne [2, 0, 1, 1], want [n_used, positions, 1, 1]"],
+    );
+
+    let mut lines = whole;
+    set_ne(&mut lines, "prefill.ffn_moe_weights-2", 1, [4, 2, 1, 1]);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[
+            "prefill.ffn_moe_weights-2/1 has ne [4, 2, 1, 1], want [2, positions, 1, 1] or [1, 2, positions, 1]",
+        ],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// The ids of the picks twin are expert numbers: a negative one is refused
+/// naming the row and the prefill position.
+#[test]
+fn a_pick_that_is_no_expert_number_is_refused() -> Result<(), RefError> {
+    let dir = set_dir("routes-negative")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let name = "prefill.ffn_moe_topk-2";
+    let mut ids: Vec<i32> = (0..3 * N_USED).map(|i| i as i32).collect();
+    ids[2 * N_USED + 1] = -1;
+    *line_at(
+        &mut lines,
+        &format!("int\t{name}\t0\ttensor\ti32\ti32\tlogical\t"),
+    ) = int_row(&dir, name, 0, true, &ids);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[
+            &format!("{name}/0 position 2 picks expert -1, not a u32"),
+            &dir.display().to_string(),
+        ],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A position's picks are distinct: an expert picked twice is refused
+/// naming the row and the prefill position (here the second ubatch's first,
+/// position 3).
+#[test]
+fn a_pick_repeated_within_a_position_is_refused() -> Result<(), RefError> {
+    let dir = set_dir("routes-twice")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let name = "prefill.ffn_moe_topk-2";
+    *line_at(
+        &mut lines,
+        &format!("int\t{name}\t1\ttensor\ti32\ti32\tlogical\t"),
+    ) = int_row(&dir, name, 1, true, &[4, 5, 6, 6]);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[&format!("{name}/1 position 4 picks expert 6 twice")],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// The picks twin holds one id per cell of its row.
+#[test]
+fn the_picks_twin_must_hold_a_pick_for_every_cell_of_its_row() -> Result<(), RefError> {
+    let dir = set_dir("routes-twinlen")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let name = "prefill.ffn_moe_topk-2";
+    *line_at(
+        &mut lines,
+        &format!("int\t{name}\t0\ttensor\ti32\ti32\tlogical\t"),
+    ) = int_row(&dir, name, 0, true, &[0, 1, 2, 3]);
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &[&format!("{name}/0 has 6 picks, its integer twin 4")],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A reader's own refusal names the set and the row: a picks row with no
+/// logical integer twin is `Missing`, a weights file with a NaN or an
+/// infinity is `Malformed`, in either weights stem.
+#[test]
+fn a_reader_refusal_is_named_by_set_and_row() -> Result<(), RefError> {
+    let dir = set_dir("routes-reader")?;
+    let whole = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+    let mut lines = whole.clone();
+    lines.retain(|l| {
+        !l.starts_with("int\tprefill.ffn_moe_topk-2\t0\t") || !l.contains("\tlogical\t")
+    });
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        true,
+        &[
+            "prefill.ffn_moe_topk-2/0",
+            "no logical integer twin",
+            &dir.display().to_string(),
+        ],
+    );
+
+    for (stem, bad) in [("ffn_moe_weights", f32::NAN), (GLM_LAST, f32::INFINITY)] {
+        let whole = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+        let name = format!("prefill.{stem}-5");
+        let file = dump_file_name(&name, 1, RowKind::Tensor, Layout::Flat, FileElem::F32);
+        let mut vals = vec![1.0; 2 * N_USED];
+        vals[3] = bad;
+        f32_file(&dir.join(&file), &vals);
+        let e = refusal(&dir, &whole)?;
+        assert_refusal(
+            &e,
+            false,
+            &[
+                &format!("{name}/1"),
+                "non-finite value at index 3",
+                &file,
+                &dir.display().to_string(),
+            ],
+        );
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// The picks are below the model's expert count when the caller says it:
+/// the first pick at or past it is refused naming its layer and position.
+#[test]
+fn check_experts_names_the_first_pick_past_the_models_count() -> Result<(), RefError> {
+    let dir = set_dir("routes-experts")?;
+    let lines = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
+    let routes = routes_of(&dir, &lines, GLM_LAST)?;
+    routes.check_experts(7)?;
+    let e = routes.check_experts(6).expect_err("picks up to 6");
+    assert_refusal(
+        &e,
+        false,
+        &[
+            "layer 2 position 3 picks expert 6, the model has 6",
+            &dir.display().to_string(),
+        ],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
+}
+
+/// A row the dumper does not write as a routing node is no route row: the
+/// whole name is a stem, a dash and digits. The step's own `ffn_moe_topk-2`,
+/// a name with a suffix and a name with no layer change nothing; a layer too
+/// large for a `u32` is refused naming the row.
+#[test]
+fn only_the_whole_name_of_a_routing_node_is_a_route_row() -> Result<(), RefError> {
+    let dir = set_dir("routes-decoys")?;
+    let mut lines = route_set(&dir, &[3, 2], &[2], GLM_LAST);
+    let clean = routes_of(&dir, &lines, GLM_LAST)?;
+    for name in [
+        "ffn_moe_topk-2",
+        "prefill.ffn_moe_weights-2 (view)",
+        "prefill.ffn_moe_weights-",
+        "prefill.ffn_moe_weights-x",
+    ] {
+        lines.push(format!(
+            "tensor\t{name}\t0\tf32\t1\t1\t1\t1\t4\t0.000000\tNONE\t1\t0\t-\t-"
+        ));
+    }
+    assert_eq!(routes_of(&dir, &lines, GLM_LAST)?, clean);
+
+    lines.push("tensor\tprefill.ffn_moe_weights-99999999999\t0\tf32\t1\t1\t1\t1\t4\t0.000000\tNONE\t1\t0\t-\t-".to_string());
+    let e = refusal(&dir, &lines)?;
+    assert_refusal(
+        &e,
+        false,
+        &["prefill.ffn_moe_weights-99999999999: layer 99999999999"],
+    );
+    std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    Ok(())
 }
