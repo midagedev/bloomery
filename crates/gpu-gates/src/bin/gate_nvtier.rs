@@ -20,12 +20,15 @@
 //! - `refuse` (clause 4): the room under the tier's floor
 //!   (`HostRoomFloor`), an arena budget under one slot's span, and the
 //!   direct-read probe of a mount without direct IO, each by name.
-//! - `residency` (clause 5): the paged plan's unset rule resolves `mid`
-//!   with an empty churn pool (`ChurnPool::of` leaves the paged stacks
-//!   out: the arena serves their victims), flips land on the
-//!   paged arm, and its `unresident` and `faulting` are 0 and its `late`
-//!   flips 0 — bug catchers, structurally unreachable once the seam serves
-//!   the victims the arena holds from its books.
+//! - `residency` (clause 5): the paged plan's unset rule resolves `off`
+//!   ([`residency38`]: the plan pages through the tier's arena, and a
+//!   promotion would copy a paged expert through the file mapping, cold
+//!   after the tier's drops), and both arms run a set
+//!   `mid-p0-s1` with an empty churn pool (`ChurnPool::of` leaves the paged
+//!   stacks out: the arena serves their victims): flips land on the paged
+//!   arm, and its `unresident` and `faulting` are 0 — bug catchers,
+//!   structurally unreachable once the seam serves the victims the arena
+//!   holds from its books. Its `late` flips are printed.
 //! - `room` (clause 6): the loaded tier's arena, the plan's host need and
 //!   the churn pool the residency holds fit the room together, and the
 //!   plan's headroom is what the room leaves past the arena and the need.
@@ -62,6 +65,12 @@
 //!   reads 128 KiB, 32 pages at 4 KiB, so a band of 64 pages and 240 a flip.
 //!   The line also prints each read's band pages, and the prompt's drops and
 //!   their wall against the prompt's.
+//!
+//! PIN(2026-10-09): clause 5's `late` is printed, not judged — a set `mid`
+//! on a paged plan promotes a paged expert through the file mapping, read
+//! cold from the drive after the tier's drops, so its copy can miss its
+//! landing; the unset rule runs such a plan `off`, and `late` returns to a
+//! judged 0 with the tiers whose promotions read the arena.
 //!
 //! PIN(2026-10-09): clause 7 judges the runs' interiors, the `2R` bands at
 //! their ends printed — the base read held a few pages at the runs' edges
@@ -106,7 +115,7 @@ use bloomery_gpu::host::swap::{PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
-use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
+use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg, RESIDENCY38_SPARES};
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::placement::churn::ChurnPool;
@@ -602,9 +611,29 @@ fn run() -> Result<(), GateError> {
     let plan = inputs.plan_with(&machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
     let mut pass = true;
 
-    // The residency word both arms run: the unset rule's answer on the
-    // paged plan, which resolves `mid` with the churn pool 0.
-    let residency = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    // `residency` (clause 5): the unset rule on the paged plan resolves
+    // `off`.
+    let unset = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    let unset_off = matches!(unset, Residency::Off);
+    println!(
+        "residency: the unset rule on the paged plan resolves {}: {}",
+        if unset_off { "off" } else { "mid" },
+        verdict(unset_off)
+    );
+    pass &= unset_off;
+    // The residency word both arms run: a set `mid-p0-s1`, so the paged
+    // arm's flips, the seam and a lane's drops stay held.
+    let residency = residency38(
+        &plan,
+        Lever38::Set(
+            Residency::Mid {
+                pinned: 0,
+                spares: RESIDENCY38_SPARES,
+            },
+            "mid-p0-s1",
+        ),
+        Record::print,
+    )?;
     // `room`'s plan terms: the host need, the churn pool the residency
     // holds beside it, and the headroom the split left.
     let need = HostNeed::of(&plan, 0).bytes();
@@ -617,10 +646,6 @@ fn run() -> Result<(), GateError> {
         Residency::Off => 0,
     };
     let headroom = plan.host.headroom_bytes;
-    let Residency::Mid { pinned, spares } = residency else {
-        return Err("the paged plan's unset residency rule did not resolve mid".into());
-    };
-    println!("residency: mid-p{pinned}-s{spares} (the unset rule on the paged plan): PASS");
     println!(
         "plan: room {ROOM} B pages {} B on the NVMe tier, arena {} B",
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
@@ -805,14 +830,15 @@ fn run() -> Result<(), GateError> {
     pass &= seam_ok;
 
     let flips = paged.landed > 0;
-    let residency_ok = flips && paged.unresident == 0 && paged.faulting == 0 && paged.late == 0;
+    let residency_ok = flips && paged.unresident == 0 && paged.faulting == 0;
     println!(
-        "residency: flips landed {} (the seam ran: {flips}), unresident {}, faulting {}, late {}: {}",
+        "residency: under the set mid-p0-s1, flips landed {} (the seam ran: {flips}), unresident \
+         {}, faulting {}: {}; late {} (printed, not judged)",
         paged.landed,
         paged.unresident,
         paged.faulting,
-        paged.late,
-        verdict(residency_ok)
+        verdict(residency_ok),
+        paged.late
     );
     pass &= residency_ok;
 

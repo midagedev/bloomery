@@ -1850,8 +1850,8 @@ pub static RESIDENCY_UNSET: Kind = Kind {
     doc: "What BLOOMERY_RESIDENCY unset resolved to in generate_qwen3moe: the word the load runs \
           by (off, or mid-p<P>-s1 on plan (a), P half the plan's fewest card experts a layer) \
           and why, the condition that picked it (the placement, the flags, the file, or the plan: \
-          no card expert, no room, or the churn pool past the plan's host headroom or past what \
-          MemAvailable leaves).",
+          routed experts paged through the NVMe tier's RAM arena, no card expert, no room, or the \
+          churn pool past the plan's host headroom or past what MemAvailable leaves).",
     parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 
@@ -3280,6 +3280,21 @@ pub fn residency_unset(pick: &bloomery_levers::Residency38Pick) -> Record {
     Record::new(&RESIDENCY_UNSET)
         .w("residency", pick.word())
         .w("why", pick.why)
+}
+
+/// [`residency_unset`] of a plan that pages `nvme_bytes` of routed experts
+/// through the NVMe tier's RAM arena of `arena_bytes`: `off`, since a
+/// promotion would copy those experts through the file mapping, read cold
+/// from the drive after the tier's drops.
+pub fn residency_unset_paged(nvme_bytes: u64, arena_bytes: u64) -> Record {
+    Record::new(&RESIDENCY_UNSET).w("residency", "off").w(
+        "why",
+        format_args!(
+            "unset: the plan pages {nvme_bytes} B of routed experts through the NVMe tier's RAM \
+             arena ({arena_bytes} B), whose promotions would read them cold through the file \
+             mapping"
+        ),
+    )
 }
 
 /// The churn pool's record under the residency word `residency`, against

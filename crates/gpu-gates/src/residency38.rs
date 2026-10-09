@@ -56,15 +56,19 @@ pub enum Lever38<'a> {
 }
 
 /// The residency a load of `plan` runs under `lever`: a set word as given;
-/// unset, the rule's before the plan or on plan (a) from it
-/// (`residency38_at_plan`: P half the fewest card experts a layer, `off`
-/// with why where the plan has no room, or the plan's host headroom or
-/// `MemAvailable` none for the churn pool), its `residency unset` record
-/// handed to `emit`. Under `mid`, the `residency host` record of `plan`
-/// follows: the churn pool (card [`CARD38`]'s experts past the pinned ones)
-/// the load's host set holds beside the plan's host segments, which the
-/// load refuses by name for a set word when the plan's host headroom cannot
-/// take it. `emit` is where the binary prints its records.
+/// unset, the rule's before the plan or on plan (a) from it — `off` on a
+/// plan that pages routed experts through the NVMe tier's RAM arena (the
+/// arena the tier attaches on), whose promotions would copy those experts
+/// through the file mapping, read cold from the drive after the tier's
+/// drops; else `residency38_at_plan` (P half the fewest
+/// card experts a layer, `off` with why where the plan has no room, or the
+/// plan's host headroom or `MemAvailable` none for the churn pool) — its
+/// `residency unset` record handed to `emit`. Under `mid`, the `residency
+/// host` record of `plan` follows: the churn pool (card [`CARD38`]'s
+/// experts past the pinned ones) the load's host set holds beside the
+/// plan's host segments, which the load refuses by name for a set word
+/// when the plan's host headroom cannot take it. `emit` is where the binary
+/// prints its records.
 pub fn residency38(
     plan: &Plan<'_>,
     lever: Lever38<'_>,
@@ -72,6 +76,13 @@ pub fn residency38(
 ) -> Result<Residency, GateError> {
     let (residency, word) = match lever {
         Lever38::Set(r, word) => (r, word.to_owned()),
+        Lever38::Unset(None) if plan.host.nvme_arena_bytes > 0 => {
+            emit(record::residency_unset_paged(
+                plan.host.nvme_expert_bytes,
+                plan.host.nvme_arena_bytes,
+            ));
+            (Residency::Off, "off".to_owned())
+        }
         Lever38::Unset(pre) => {
             let pick = match pre {
                 Some(off) => off,
