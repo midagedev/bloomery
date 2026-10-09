@@ -248,6 +248,35 @@
 //!   its slot); the passes after it give the unpaced arm's values, clean
 //!   (its mutant: the drain after the end's last copy dropped, so the slots
 //!   go live while their copies still stage).
+//! - s10 closed: the same return, paced, with the staging window closed over
+//!   the call's end as a step service closes it (no real path does: a
+//!   prompt's batch walk never closes the window and a call refuses every
+//!   boundary), whole at the end and finished there after a walk's return:
+//!   every expert where the return's rule puts it, slot for slot, and the
+//!   passes after give the unpaced end's values, clean — the end's copies
+//!   stage under the call's flush (its mutant: the flush put back before the
+//!   end's copies).
+//! - s11 return in the walk: a call not kept whose last step returns every
+//!   layer after its readers and its serve (`SwapMachine::return_layer`,
+//!   the queue pumped empty, or paced with its copies slowed and a ring's
+//!   worth pumped, the rest left to the end) makes the end's picks pick for
+//!   pick and copies back as many, ends with every expert where the return's
+//!   rule puts it and at the end's own places, slot for slot, and the
+//!   passes after give the end's values, clean; a third arm, paced, leaves a
+//!   ring's worth of copies to the end behind a hold on the copy stream: the
+//!   engine stream is still waiting for them when the arm looks, a settle
+//!   after the end (its mutant: the words v → s written with no engine
+//!   stream wait on the layers' return-landed events — the engine stream
+//!   idle at the look).
+//! - s12 return reader: a one-step call, the engine stream held over the
+//!   step's probe, every layer returned behind it: the copy stream is still
+//!   waiting when the arm looks, and the step reads no stale sum and gives
+//!   the unheld twin's value (its mutant: the return's copies not waiting on
+//!   the layer's reader event).
+//! - s13 pick after return: a layer returned after a call's first step: the
+//!   next pick of it is refused by name, the machine whole, and the end
+//!   lands it with the layers it returns itself, every layer back at its
+//!   start set, the passes after clean (its mutant: the refusal dropped).
 //!
 //! Evicted (a host set populated and not locked, whose pages the page cache
 //! lets go): a victim not host-resident when the machine decides is read
@@ -2982,9 +3011,22 @@ mod gate {
         sets: Vec<Vec<Vec<u32>>>,
         picks: Vec<CallPick>,
         start: Vec<Vec<u32>>,
-        /// Every expert's place in the host map just before the call's end.
+        /// Every expert's place in the host map just before the call's end,
+        /// or, for a call whose walk returned, just before the first return.
         before_end: Vec<Vec<Option<Slot>>>,
         held_waited: Option<bool>,
+        /// A walk's engine hold ([`Walk::hold`]): whether the copy stream was
+        /// still waiting when the arm looked, before the release.
+        copy_waited: Option<bool>,
+        /// Right after a walk's end (under [`Walk::copy_hold`], a settle
+        /// after it): whether the engine stream and the copy stream were
+        /// still busy (the end's last copies running or held, the engine
+        /// stream waiting for them).
+        end_waited: Option<(bool, bool)>,
+        /// Under [`Walk::copy_hold`]: the return copies left to the end.
+        end_left: Option<usize>,
+        /// The refusal of a pick of a layer the walk returned early.
+        refused: Option<String>,
         report: Option<CallReport>,
         err: Option<String>,
     }
@@ -3813,6 +3855,525 @@ mod gate {
         Ok(ok)
     }
 
+    /// How a call's walk returns ([`call_walk`]).
+    #[derive(Clone, Copy, Default)]
+    struct Walk<'a> {
+        /// The last step returns every layer it has not returned
+        /// (`SwapMachine::return_layer`) after its readers and its serve;
+        /// else the end returns them.
+        last: bool,
+        /// After the last step's returns, the queue pumped
+        /// (`SwapMachine::return_pump`) until this many copies are issued.
+        pump: Option<usize>,
+        /// The engine stream held from before the last step's probe until
+        /// the arm has looked after the returns.
+        hold: Option<&'a HostFlags>,
+        /// A layer returned after a step's readers: (step, layer).
+        early: Option<(usize, usize)>,
+        /// The staging window closed over the call's end, as a step service
+        /// closes it.
+        closed: bool,
+        /// Before the call's end: the queue pumped until at most a ring's
+        /// worth of return copies is left (a ring stages them whole under a
+        /// held copy stream), then the copy stream held until the arm has
+        /// looked after the end.
+        copy_hold: Option<&'a HostFlags>,
+    }
+
+    /// Copy stream commands a part in the walk arms that look at the end
+    /// ([`Faults::inflate`]): a copy runs long past its staging, so the end's
+    /// last copies still run when it returns.
+    const SLOW_COPY: usize = 128;
+
+    /// One call on `run`'s machine over `steps`, not kept, its return in the
+    /// walk as `w` says, in the prefill's order: a boundary opens the call's
+    /// pass; per step the ids refreshed, each layer's pick from the step's
+    /// counts (floor 1), the engine stream's wait for each layer's landed
+    /// event and the probe. A step before the last is read back, then each
+    /// layer's reader; the last records each layer's reader right behind the
+    /// probe (the walk's order: the route, then the reader), takes the host
+    /// map the step's host side serves from (its serve), then returns each
+    /// layer, and is read back against that map. The call ends not kept, its
+    /// pass with no row kept.
+    fn call_walk(
+        gpu: &Gpu,
+        run: &mut Run,
+        steps: &[(Vec<[[u32; K]; L]>, usize)],
+        w: Walk<'_>,
+    ) -> Result<CallSeen, GateError> {
+        let window = run.machine.as_ref().map(SwapMachine::window);
+        let r = call_walk_held(gpu, run, steps, w);
+        for flags in [w.hold, w.copy_hold].into_iter().flatten() {
+            flags.raise(0)?;
+        }
+        if let Some(window) = window {
+            window.store(1, Ordering::Release);
+        }
+        r
+    }
+
+    /// The counts of one step's ids at map layer index `i`.
+    fn step_counts(rows: &[[[u32; K]; L]], i: usize) -> Vec<u32> {
+        let mut counts = vec![0u32; E];
+        for row in rows {
+            for &id in &row[i] {
+                counts[id as usize] += 1;
+            }
+        }
+        counts
+    }
+
+    /// [`call_walk`]'s steps; `call_walk` raises the hold and opens the
+    /// window after.
+    fn call_walk_held(
+        gpu: &Gpu,
+        run: &mut Run,
+        steps: &[(Vec<[[u32; K]; L]>, usize)],
+        w: Walk<'_>,
+    ) -> Result<CallSeen, GateError> {
+        let stream = gpu.stream();
+        let mut seen = CallSeen {
+            start: card_sets(&run.slots),
+            ..CallSeen::default()
+        };
+        let m = run.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let fail = |seen: &mut CallSeen, e: String| seen.err = Some(e);
+        if let Err(e) = m.boundary(stream, &mut run.slots) {
+            fail(&mut seen, format!("the call's boundary: {e}"));
+            return Ok(seen);
+        }
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let last = steps.len() - 1;
+        let mut returned: Vec<usize> = Vec::new();
+        for (step, (rows, _)) in steps.iter().enumerate() {
+            run.card.refresh(gpu, rows)?;
+            for (i, l) in LAYERS.enumerate() {
+                let counts = step_counts(rows, i);
+                let r = m.call_pick(stream, &mut run.slots, l, &counts, usize::MAX);
+                match (returned.contains(&l), r) {
+                    (false, Ok(p)) => seen.picks.push(p),
+                    (true, Err(e)) => seen.refused = Some(e.to_string()),
+                    (true, Ok(_)) => {
+                        fail(
+                            &mut seen,
+                            format!("step {step} layer {l}: a pick of a returned layer passed"),
+                        );
+                        return Ok(seen);
+                    }
+                    (false, Err(e)) => {
+                        fail(&mut seen, format!("step {step} layer {l}: {e}"));
+                        return Ok(seen);
+                    }
+                }
+            }
+            let held = step == last && w.hold.is_some();
+            if step == last
+                && let Some(flags) = w.hold
+            {
+                flags.clear(0)?;
+                flags.enqueue_wait(stream, 0)?;
+            }
+            for l in LAYERS {
+                if !returned.contains(&l) {
+                    stream.wait(m.call_landed(l)?)?;
+                }
+            }
+            run.card.launch(gpu)?;
+            let served = if step == last && w.last {
+                for l in LAYERS {
+                    m.call_reader(l, stream)?;
+                }
+                let served = run.slots.clone();
+                seen.before_end = places(&run.slots);
+                for l in LAYERS {
+                    if returned.contains(&l) {
+                        continue;
+                    }
+                    if let Err(e) = m.return_layer(stream, &mut run.slots, l) {
+                        fail(&mut seen, format!("the return of layer {l}: {e}"));
+                        return Ok(seen);
+                    }
+                }
+                if let Some(n) = w.pump
+                    && let Err(e) = m.return_pump(&run.slots, |k| Ok(k >= n))
+                {
+                    fail(&mut seen, format!("the return pump: {e}"));
+                    return Ok(seen);
+                }
+                Some(served)
+            } else {
+                None
+            };
+            if held && let Some(flags) = w.hold {
+                std::thread::sleep(HOLD_SETTLE);
+                seen.copy_waited = Some(m.copy_stream().query() == Ok(false));
+                flags.raise(0)?;
+            }
+            if let Err(e) = drain(gpu) {
+                fail(&mut seen, format!("step {step}: {e}"));
+                return Ok(seen);
+            }
+            let out = run.card.read(gpu)?;
+            let map = served.as_ref().unwrap_or(&run.slots);
+            seen.values.push(value(rows, &out, map));
+            seen.sets.push(card_sets(map));
+            if served.is_none() {
+                for l in LAYERS {
+                    if !returned.contains(&l) {
+                        m.call_reader(l, stream)?;
+                    }
+                }
+            }
+            if let Some((at, l)) = w.early
+                && at == step
+            {
+                if let Err(e) = m.return_layer(stream, &mut run.slots, l) {
+                    fail(&mut seen, format!("the early return of layer {l}: {e}"));
+                    return Ok(seen);
+                }
+                returned.push(l);
+            }
+        }
+        if !w.last {
+            seen.before_end = places(&run.slots);
+        }
+        if let Some(flags) = w.copy_hold {
+            let owed = m.returns_owed();
+            if let Err(e) = m.return_pump(&run.slots, |k| Ok(k + RING_SLOTS >= owed)) {
+                fail(&mut seen, format!("the return pump before the end: {e}"));
+                return Ok(seen);
+            }
+            seen.end_left = Some(m.returns_owed());
+            flags.clear(0)?;
+            flags.enqueue_wait(m.copy_stream(), 0)?;
+        }
+        if w.closed {
+            m.window().store(0, Ordering::Release);
+        }
+        match m.end_call(stream, &mut run.slots, false) {
+            Ok(rep) => {
+                if w.copy_hold.is_some() {
+                    std::thread::sleep(HOLD_SETTLE);
+                }
+                seen.end_waited = Some((
+                    stream.query() == Ok(false),
+                    m.copy_stream().query() == Ok(false),
+                ));
+                if let Some(flags) = w.copy_hold {
+                    flags.raise(0)?;
+                }
+                seen.report = Some(rep);
+            }
+            Err(e) => {
+                fail(&mut seen, format!("end_call: {e}"));
+                return Ok(seen);
+            }
+        }
+        m.window().store(1, Ordering::Release);
+        let mut tally = m.tally();
+        m.end_pass(&mut tally, KeptRows::prefix(0))?;
+        Ok(seen)
+    }
+
+    /// A walk arm: every expert host-resident, `CALL_BEFORE` passes of the
+    /// trace, then a call over `steps` returning as `w` says.
+    fn walk_arm(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        faults: Faults,
+        steps: Range<usize>,
+        w: Walk<'_>,
+    ) -> Result<(Run, CallSeen), GateError> {
+        let faults = Faults {
+            all_resident: true,
+            ..faults
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..CALL_BEFORE,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: the walk arm before its call: {e}").into());
+        }
+        let seen = call_walk(gpu, &mut r, &trace.passes[steps], w)?;
+        Ok((r, seen))
+    }
+
+    /// Each pick's layer, admits and counts digest: what two calls over the
+    /// same steps must agree on pick for pick.
+    fn pick_keys(seen: &CallSeen) -> Vec<(usize, usize, u64)> {
+        seen.picks
+            .iter()
+            .map(|p| (p.layer, p.admitted, p.counts))
+            .collect()
+    }
+
+    /// s10 closed: the end's return with the staging window closed over the
+    /// end, as a step service closes it — no real path does (a prompt's
+    /// batch walk never closes the window, and a call refuses every
+    /// boundary), so this pins the order the end's copies rely on, not a
+    /// case the engine meets: they stage under the call's flush, which the
+    /// end puts back only after it has seen every job staged. Both the end's
+    /// whole return and a walk's return finished at the end, paced, end with
+    /// every expert where the return's rule puts it, slot for slot, and the
+    /// passes after give the unpaced end's values, clean (its mutant: the
+    /// call's flush put back before the end's copies — the backlog's wait
+    /// then names its deadline).
+    fn s10_closed(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
+        let (mut n, _) = call_arm(gpu, pm, trace, Faults::default(), usize::MAX, false, None)?;
+        let before_n = n.values.len();
+        drive(gpu, &mut n, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let want = fnvs(&n.values[before_n..]);
+        let mut ok = n.err.is_none();
+        for (name, last) in [("the end's", false), ("the walk's", true)] {
+            let pace = Arc::new(Pace::new(true));
+            let faults = Faults {
+                pace: Some(Arc::clone(&pace)),
+                ..Faults::default()
+            };
+            let w = Walk {
+                last,
+                closed: true,
+                ..Walk::default()
+            };
+            let (mut p, seen) = walk_arm(gpu, pm, trace, faults, CALL_STEPS, w)?;
+            pace.set(false);
+            let slot_for_slot = places(&p.slots) == returned(&seen.before_end, &seen.start);
+            let before_p = p.values.len();
+            drive(gpu, &mut p, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+            let restored = seen.report.map_or(0, |rep| rep.restored);
+            let after = &p.values[before_p..];
+            let same = fnvs(after) == want;
+            let arm = seen.err.is_none()
+                && p.err.is_none()
+                && restored > RING_SLOTS
+                && slot_for_slot
+                && same
+                && clean(after);
+            println!(
+                "s10 closed, {name} return: the window closed over the end, every job's staging \
+                 paced {PACE:?}: {restored} experts copied back (want more than {RING_SLOTS}), \
+                 every expert where the return's rule puts it, slot for slot, {slot_for_slot}; {} \
+                 passes after it (stale, double, miss) {:?}, their values = the unpaced end's \
+                 {same}; errors {} / {} {}",
+                after.len(),
+                errs(after),
+                show(&seen.err),
+                show(&p.err),
+                verdict(arm)
+            );
+            ok &= arm;
+        }
+        Ok(ok)
+    }
+
+    /// s11 return in the walk: a call not kept whose last step returns
+    /// every layer after its readers and its serve, against the same call
+    /// returned whole at its end. Unpaced, the queue pumped empty in the
+    /// walk; paced and its copies slowed ([`SLOW_COPY`]), a ring's worth
+    /// pumped and the rest left to the end. Each makes the end's picks, pick
+    /// for pick (layer, admits, counts), and copies back as many; each ends
+    /// with every expert where the return's rule puts it, slot for slot, the
+    /// end's own places; the passes after give the end's values, clean; the
+    /// walk spent host time in the return. A third arm, paced, pumps until a
+    /// ring's worth of copies is left to the end and holds the copy stream
+    /// before the end ([`Walk::copy_hold`]): a settle after the end, the
+    /// engine stream is still waiting for the held copies when the arm looks
+    /// (its mutant: the end's words v → s written with no engine stream wait
+    /// on the layers' return-landed events — the engine stream idle at the
+    /// look). The look right after the slowed arm's end is printed, not
+    /// judged: the words the end just enqueued keep the engine stream busy
+    /// for a moment either way.
+    fn s11(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        let (mut c, cs) = call_arm(gpu, pm, trace, Faults::default(), usize::MAX, false, None)?;
+        let end_places = places(&c.slots);
+        let before_c = c.values.len();
+        drive(gpu, &mut c, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let want = fnvs(&c.values[before_c..]);
+        let c_restored = cs.report.map_or(0, |rep| rep.restored);
+        let mut ok = c.err.is_none() && cs.err.is_none() && c_restored > RING_SLOTS;
+        let flags = HostFlags::new(gpu.context(), 1)?;
+        for (name, paced, slowed, held) in [
+            ("unpaced, pumped empty", false, false, false),
+            ("paced and slowed, a ring pumped", true, true, false),
+            (
+                "paced, a ring left to the end behind a held copy stream",
+                true,
+                false,
+                true,
+            ),
+        ] {
+            let pace = Arc::new(Pace::new(paced));
+            let faults = Faults {
+                pace: Some(Arc::clone(&pace)),
+                inflate: if slowed { SLOW_COPY } else { 0 },
+                ..Faults::default()
+            };
+            let w = Walk {
+                last: true,
+                pump: match (held, slowed) {
+                    (true, _) => None,
+                    (false, true) => Some(RING_SLOTS),
+                    (false, false) => Some(usize::MAX),
+                },
+                copy_hold: held.then_some(&flags),
+                ..Walk::default()
+            };
+            let (mut p, seen) = walk_arm(gpu, pm, trace, faults, CALL_STEPS, w)?;
+            pace.set(false);
+            if let Some(rep) = seen.report {
+                record::call_report(&rep).print();
+            }
+            let picks = pick_keys(&seen) == pick_keys(&cs);
+            let restored = seen.report.map_or(0, |rep| rep.restored);
+            let rule = places(&p.slots) == returned(&seen.before_end, &seen.start);
+            let as_end = places(&p.slots) == end_places;
+            let walked = seen
+                .report
+                .is_some_and(|rep| rep.return_us > 0 && !rep.kept);
+            let before_p = p.values.len();
+            drive(gpu, &mut p, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+            let after = &p.values[before_p..];
+            let same = fnvs(after) == want;
+            let waited = !held
+                || (seen.end_waited == Some((true, true)) && seen.end_left.is_some_and(|n| n > 0));
+            let arm = seen.err.is_none()
+                && p.err.is_none()
+                && picks
+                && restored == c_restored
+                && rule
+                && as_end
+                && walked
+                && waited
+                && same
+                && clean(after)
+                && clean(&seen.values);
+            println!(
+                "s11 return in the walk, {name}: the end's picks pick for pick {picks}, {restored} \
+                 experts copied back (the end's {c_restored}), every expert where the return's \
+                 rule puts it, slot for slot, {rule} and at the end's places {as_end}, the walk's \
+                 return time {:?} us; after the end (engine stream waiting, copies running) {:?}, \
+                 copies left to the end {:?} (judged under the hold: {waited}); the call's steps \
+                 (stale, double, miss) {:?}; {} passes after it {:?}, their values = the end's \
+                 {same}; errors {} / {} {}",
+                seen.report.map(|rep| rep.return_us),
+                seen.end_waited,
+                seen.end_left,
+                errs(&seen.values),
+                after.len(),
+                errs(after),
+                show(&seen.err),
+                show(&p.err),
+                verdict(arm)
+            );
+            ok &= arm;
+        }
+        Ok(ok)
+    }
+
+    /// s12 return reader: a one-step call not kept, the engine stream held
+    /// from before the step's probe; the step's readers, its serve and every
+    /// layer's return issued behind the hold. Every expert the step admitted
+    /// is one it routes, so every return copy writes a slot the held probe
+    /// reads: the copy stream is still waiting (behind the layers' reader
+    /// events) when the arm looks, and after the release the step reads no
+    /// stale sum and gives the unheld twin's value (its mutant: the return's
+    /// copies not waiting on the layer's reader event — they land under the
+    /// held probe, which reads the experts they bring back).
+    fn s12(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        let one = CALL_STEPS.start..CALL_STEPS.start + 1;
+        let w = Walk {
+            last: true,
+            ..Walk::default()
+        };
+        let (t, twin) = walk_arm(gpu, pm, trace, Faults::default(), one.clone(), w)?;
+        let flags = HostFlags::new(gpu.context(), 1)?;
+        let held = Walk {
+            hold: Some(&flags),
+            ..w
+        };
+        let (h, seen) = walk_arm(gpu, pm, trace, Faults::default(), one, held)?;
+        let restored = seen.report.map_or(0, |rep| rep.restored);
+        let same = fnvs(&seen.values) == fnvs(&twin.values);
+        let ok = seen.err.is_none()
+            && twin.err.is_none()
+            && h.err.is_none()
+            && t.err.is_none()
+            && restored > 0
+            && seen.copy_waited == Some(true)
+            && clean(&seen.values)
+            && same;
+        println!(
+            "s12 return reader: a one-step call, the engine stream held over its probe, {restored} \
+             experts returned behind it: copy stream still waiting {:?}; the held step (stale, \
+             double, miss) {:?}, its value = the unheld twin's {same}; errors {} / {} {}",
+            seen.copy_waited,
+            errs(&seen.values),
+            show(&seen.err),
+            show(&twin.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// s13 pick after return: a two-step call not kept whose walk returns
+    /// layer 2 after the first step's readers: the second step's pick of
+    /// layer 2 is refused by name, the machine whole; its probe serves layer
+    /// 2 from the host, clean; the end returns the other layers itself and
+    /// lands layer 2's with them, every layer back at its start set, and the
+    /// passes after run clean (its mutant: the refusal dropped — the pick runs on
+    /// the rule's unsettled set, whose admitted experts the host map already
+    /// sent back).
+    fn s13(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        let two = CALL_STEPS.start..CALL_STEPS.start + 2;
+        let w = Walk {
+            early: Some((0, LAYERS.start)),
+            ..Walk::default()
+        };
+        let (mut r, seen) = walk_arm(gpu, pm, trace, Faults::default(), two, w)?;
+        let named = seen
+            .refused
+            .as_deref()
+            .is_some_and(|e| e.contains("returned to the call's start already"));
+        let back = card_sets(&r.slots) == seen.start;
+        let restored = seen.report.map_or(0, |rep| rep.restored);
+        let before = r.values.len();
+        drive(gpu, &mut r, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let after = &r.values[before..];
+        let ok = seen.err.is_none()
+            && r.err.is_none()
+            && named
+            && restored > 0
+            && back
+            && clean(&seen.values)
+            && clean(after);
+        println!(
+            "s13 pick after return: layer {} returned after the first step: the second step's \
+             pick of it refused by name {named} ({}); {restored} experts copied back, every layer \
+             at its start set {back}; the steps (stale, double, miss) {:?}, {} passes after it \
+             {:?}; errors {} / {} {}",
+            LAYERS.start,
+            show(&seen.refused),
+            errs(&seen.values),
+            after.len(),
+            errs(after),
+            show(&seen.err),
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// A real [`HostTier`] over `stacks`, as `dropq_tier` builds one, its
     /// machine started over a source with `faults`: the engine's caller of
     /// the machine. The caller declares `stacks` first, so they drop after
@@ -4594,6 +5155,10 @@ mod gate {
         ok &= s8(&gpu, &pm)?;
         ok &= s9(&gpu, &pm)?;
         ok &= s10(&gpu, &pm, &trace)?;
+        ok &= s10_closed(&gpu, &pm, &trace)?;
+        ok &= s11(&gpu, &pm, &trace)?;
+        ok &= s12(&gpu, &pm, &trace)?;
+        ok &= s13(&gpu, &pm, &trace)?;
         ok &= s7_pick(&gpu, &trace)?;
         ok &= s7_boundary(&gpu, &pm, &trace, &a)?;
         ok &= s7_load(&gpu, &pm)?;
@@ -4620,7 +5185,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a call's end copies its way back under the same bound and waits for its last copy; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a call's end copies its way back under the same bound and waits for its last copy, its copies staging under the call's flush whatever the window says; a call's walk returns each layer after its last read, its copies behind that read, its words back to the call's start only once the engine stream has waited for them, with the end's picks and end state, and no pick or read of a layer after its return; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
             );
             Ok(())
         } else {

@@ -1,0 +1,91 @@
+# prefill1: a returning prompt call's last unit returns each layer to the call's start inside the walk (the
+# copies issued in the host's wait for the next layer's download, the end landing only the deficit), on top of
+# poolret's (c) (58d7b619), this tree against the train tip fd8e0bff, both on the A6000 (specs-prefill1/design.md).
+# Between 0.2.8's tag 6579c4f0 (an ancestor of fd8e0bff) and fd8e0bff: the paged rules and the floor fallback
+# (b884cef1, d58d993f, a2cfb825) act only on a plan the NVMe tier pages, and these shapes' plans page nothing (plan a,
+# every host expert in RAM); one room ledger, the checkpoints' one owner and the prompt cache's default (0410d5b8,
+# 46e9bb48, 4144b1d8) leave a plan with no arena its need and its cache budget; the step port's union through the
+# arena (19db1c36) is the plain union on a load with no tier; d5dbb3c8 adds one clock read a lane job, the pool's
+# dispatch counter and a tier census line per call; the rest are cards, triage, schema and runners. Both arms carry
+# all of them, so the arms differ by 58d7b619 and this diff alone; the base arm's tape-4 TTFT is rel028-pass's
+# 4.40 s (0.87 s of it the return) within those stamps [derived < 1 ms a call].
+# Two configurations a round, a fresh server per arm each, arm order rotated by round: the tape (term) and the
+# 5090-budget stream (the condition's rows). Wall [derived, poolret's]: tape run ~1 min (load 23.8 s, two warm-ups,
+# tape 4), stream run ~3.1 min (load 16.2 s, drive 161 s): ~8.2 min a round, 3 rounds ~25 min; the base binary built
+# by the lead in an aux remote dir before the sitting (not in the window).
+# Drivers (draft; none exists in tools/ref):
+#   specs-prefill1/drive/tape-arm.sh ARM BIN  — tape-cand.sh's shape at --place a --ctx-size 16384, every
+#     BLOOMERY_* lever unset, two 64-token warm-ups, tape 4 only; prints the toktape `Prefill … TTFT … ms` and
+#     `Decode` lines, then from the serve log the `plan`, `residency unset`, `xstream=` and cache lines and every
+#     `call stream end` record (picks, admitted, restored, end_us, return_us); red on a failed request or an error.
+#   specs-prefill1/drive/stream-arm.sh ARM BIN — longfix's srv-stream.sh + stream-drive.py +
+#     bloomery_replay_stream.py: BLOOMERY_CARD_BUDGET=32368M, BLOOMERY_DRAFT=off, --place a --parallel 1
+#     --ctx-size 40960, GitHub #3's stream; prints per request tag, prompt tokens, ttft_s, srv_pp, srv_tg, the
+#     pinned check line, and each call's `call stream end` record beside its tag.
+#   specs-prefill1/drive/round.sh N — under tools/ref/lease-hold.sh --card docs/cards/prefill1-ab.card: for round
+#     r, both arms' tape runs then both arms' stream runs, the first arm r mod 2; a per-round ratio line
+#     (changed / base) for the term and each stream row's median.
+# Against the discovery search's Phase B (specs/leader/discover/synth-prefill-B.md §3, +12..+41 % at P 512 and
+# +4..+14 % at P 4096 on box-3090): its rate (17.2-19.4 GB/s) is this card's base term (0.177-0.184 ms an expert).
+# Its count is the evaluator's admits (high end) or x0.3 (low end, B6l/B6k); this card's count is each shape's
+# measured `restored`, which on the one-unit calls equals the call's admits (a-fix 335/335, 2,386/2,386): the high
+# end's premise. x0.3 fits the unbudgeted A6000 at 40960 (B6l/B6k, 3.5K-3.8K calls restoring 0.19-0.22 s, ~1,100
+# experts), a shape with more card room per layer, not a row here. Its "only the last layer exposed" holds for the
+# one-unit rows (short, 4k) and not for a narrow last unit (tape 4, 32k), where the carried deficit stays.
+kind: ab
+question: does a returning call's first-token cost fall from the whole pool return to the deficit the walk's
+  download windows cannot hide, the decode's end state unchanged?
+term: TTFT ms of toktape tape 4 (5,536 prompt tokens, greedy, thinking off) on a fresh bloomery-serve --model
+  qwen38 --place a --ctx-size 16384 after its two warm-ups, every BLOOMERY_* lever unset (split, residency
+  mid-p0-s1), UD-Q4_K_XL, A6000; per arm and round the call's `call stream end` record beside it
+unit: %
+predict: -16.0..-11.7 %
+rounds: 3
+sd: 0.78 % derived from rig-log 10-09#rel028-ab: the P 4096 prompt-rate ratio 1.193 +- 0.021 (a 1.76 %
+  relative 95 % half-interval) at 4 paired rounds, t(0.975, 3) 3.18, paired SD 1.11 %, over sqrt(2) for one
+  run (poolret-ab.card's derivation); a TTFT's own scatter is unmeasured, and the band's near edge stays
+  outside the 3-round ruler up to an sd of 5.1 %
+condition: each round starts a fresh server per arm per configuration and plays the same requests. The term:
+  the base returns R ~4,800 at the end (rel028-pass 0.87 s); the changed arm's last unit is 1,440 rows, whose
+  download window W 9.3 ms [derived, pickrule-q0's lb fit] hides H = W / 0.136..0.146 ms = 64..68 copies a layer
+  of R/layer ~100 (H calibrated on the functional pf1-multiunit run, below; the design's first H = W / t_c + 8
+  gave 77..86 and is struck), so the end lands 1,604..1,792 copies at the end's own rate 0.134..0.141 ms
+  (gate_qwen38_residency's end-return twins, 543.6 ms / 4,067 and 102.3 ms / 723): 0.22..0.25 s; less rule 5's
+  wait (the next pick's copies behind at most 8 return copies, 0..0.05 s over 48 layers) and the restore-aware
+  price's margin (it may drop last-unit admits whose host cost equals their chain cost; the narrow last units
+  admit 0-2 a layer in pf1-multiunit, so +-0.05 s is generous): a saving of 0.52..0.71 s on 4.40 s. The H
+  calibration: pf1-multiunit (this tree's bloomery-serve-qwen38, --place a --ctx-size 16384, levers unset, a
+  32-token history, then a 9,016-token prompt: units 4096 + 4096 + 824; functional, under the gate lock, no
+  lease, so a count fact, not a timed number) read kept=0 restored=4,270 end_us=348.0 ms return_us=327.5 ms:
+  2,468..2,597 copies at the end's rate, so the 824-row windows (W 5.2 ms) hid 35.6..38.3 a layer over 47
+  layers, W / 0.136..0.146 ms. Each call's
+  end_us is the exposed part; return_us is the walk's host time in its return calls, the pump's turns inside
+  the download wait included (time the host spins through anyway: gate_qwen38_residency's split arm read
+  1.21 s of it at 4,067 restored with end_us 14.7 ms against the end-return twin's 543.6 ms), so it is
+  recorded, not judged. The 5090-budget stream on both arms in the same lease and rounds:
+  BLOOMERY_CARD_BUDGET=32368M, BLOOMERY_DRAFT=off, every other lever unset, GitHub #3's stream (longfix's
+  drive: two warm-ups, short-0..7, 4k-0..2, 32k-0..2, short-x, reset, 32k-x) at --ctx-size 40960; per row the
+  median of its requests' srv_pp, TTFT and srv_tg (the decode after it). Predicted against a-fix's base
+  (longfix box-out/a-fix drive.log and srv.log; another sitting and build, so the absolute values are
+  indicative and the ratios are the prediction): short (76 rows, one unit) srv_pp 269.6 up 14.6..21.6 %
+  (restored 241-253, end_us 44.2-50.0 ms to 1-7 ms: R/layer ~5 inside H >= 5), TTFT 0.39 s down 37..49 ms;
+  4k (one unit of ~3,700 rows) srv_pp 1446.1 up 18..21 % (end_us 423-442 ms to 6-7 ms: H 189-213 hides every
+  layer's ~50 but the last card layer's), TTFT 2.76 s down 0.41..0.45 s; 32k (last unit 782..1,095 rows)
+  srv_pp 1690.0 up 1.9..3.5 % (end_us 749-834 ms to 0.25..0.42 s with H = W / 0.136..0.146 ms, rule 5's wait
+  in), TTFT 17.90 s down 0.33..0.59 s; decode
+  after each row unchanged (the call ends at its start set slot for slot on both arms) and a bar: at least
+  60.4 tok/s at 32k on both arms. The 32k cells sit near the 3-round ruler: recorded, not judged. The price
+  moves a split pick only in the changed arm, so restored may differ between arms by the last unit's marginal
+  admits (read per arm, not matched), and a greedy body may part at a near tie on the changed arm: the base
+  arm's pinned check reads 16/16, the changed arm's parted tags are listed with their restored; a failed
+  request, a dead server or an engine error line voids the round
+decide-in: land prefill-1 with (c); record both arms' rows as the shipped trade's corrected numbers, and take
+  the end's remainder (the last card layer's return and the carried deficit, R_47 + sum max(0, R_l - H)) to
+  the triage as the next term: the next call's first windows or a wider last unit are where it can hide
+decide-below: the windows hide more than H(m): the lane's copies run faster than t_c alone in W, or staged
+  copies overlap the landing; re-fit t_c from end_us against restored minus the hidden count on both arms, land
+decide-above: the walk's returns did not hide or slowed the walk: read the changed arm's end_us against
+  the deficit's 0.22..0.25 s (above it the windows hid fewer than H(m) copies: the lane staged slower than t_c
+  inside them) and, with BLOOMERY_STEP_STATS=1 on a rerun, the last unit's per-layer `stat prompt lb` against
+  the base's (a longer card shadow is rule 5's wait, the pick's copies behind the window's returns, past
+  1 ms a layer); do not land, bound the pump or its stop and re-run the gate clauses before another sitting

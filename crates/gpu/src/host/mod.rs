@@ -1163,11 +1163,12 @@ impl<H: HostExperts> HostTier<H> {
     /// walk's plan ([`runtime::xsplit::admit_walk`], at the unit's own
     /// constants from [`runtime::xsplit::unit_constants`]: `k` with the
     /// burst share over that inherited host set and the card tail
-    /// `card_tail_us_per_pick` µs a card pick prices) set on the machine —
-    /// the plan's floor as the call's floor, its backlog bound as the pick
-    /// path's — before the pick runs. `queue_floor` is the machine's own
-    /// bound's floor. Refused by name by everything the counting, the walk
-    /// and the pick refuse.
+    /// `card_tail_us_per_pick` µs a card pick prices, each admit's return
+    /// priced at `ret`) set on the machine — the plan's floor as the call's
+    /// floor, its backlog bound as the pick path's, never under the
+    /// machine's queue floor of a ring's worth — before the pick runs.
+    /// Refused by name by everything the counting, the walk and the pick
+    /// refuse.
     pub fn call_pick_walk(
         &mut self,
         stream: &CudaStream,
@@ -1175,7 +1176,7 @@ impl<H: HostExperts> HostTier<H> {
         counts: &mut Vec<u32>,
         k: xsplit::Constants,
         card_tail_us_per_pick: f64,
-        queue_floor: u64,
+        ret: xsplit::ReturnCost,
     ) -> Result<swap::CallPick, GpuError> {
         const WHAT: &str = "HostTier::call_pick_walk";
         self.count_routed(key, counts, WHAT)?;
@@ -1189,7 +1190,7 @@ impl<H: HostExperts> HostTier<H> {
         }
         let unit = xsplit::unit_constants(&k, card_tail_us_per_pick, counts, &host)
             .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
-        let plan = xsplit::admit_walk(counts, &host, &unit, queue_floor)
+        let plan = xsplit::admit_walk(counts, &host, &unit, swap::RING_SLOTS as u64, ret)
             .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
         self.call_floor(plan.floor)?;
         if plan.backlog > 0 {
@@ -1245,6 +1246,57 @@ impl<H: HostExperts> HostTier<H> {
             Some(m) => m.call_reader(layer, stream),
             None => Ok(()),
         }
+    }
+
+    /// Layer `layer`'s return to the open call's start, on `stream`
+    /// ([`swap::SwapMachine::return_layer`]), once the layer's host service
+    /// of the walk has run: the host map's admitted experts go back to the
+    /// host only after the serve has read it, or the serve would take their
+    /// columns the card route already summed. Refused by name: no machine,
+    /// a layer whose download the batch port has not served, and the
+    /// machine's refusals.
+    pub fn call_return(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::call_return";
+        let m = self.swap.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "a residency machine (HostTier::start_swap)",
+        ))?;
+        if self.port.as_ref().is_some_and(|p| p.unserved(layer)) {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {layer}'s download is not served yet: its return comes after the \
+                     layer's host service"
+                ),
+            ));
+        }
+        m.return_layer(stream, &mut self.slots, layer)
+    }
+
+    /// The open call's queued return copies issued while the host waits for
+    /// `key`'s download ([`swap::SwapMachine::return_pump`]), until it lands;
+    /// the copies issued. Refused by name: no machine, no batch port, and
+    /// the pump's and the landing's refusals.
+    pub fn call_return_pump(&mut self, key: BatchKey) -> Result<usize, GpuError> {
+        const WHAT: &str = "HostTier::call_return_pump";
+        let m = self.swap.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "a residency machine (HostTier::start_swap)",
+        ))?;
+        let port = self.port.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch port's sets (HostTier::prepare_batch)",
+        })?;
+        m.return_pump(&self.slots, |_| port.routed_landed(key))
+    }
+
+    /// The open call's return copies queued and not issued yet
+    /// ([`swap::SwapMachine::returns_owed`]); 0 without a machine.
+    #[must_use]
+    pub fn call_returns_owed(&self) -> usize {
+        self.swap
+            .as_ref()
+            .map_or(0, swap::SwapMachine::returns_owed)
     }
 
     /// Whether the residency machine's rule holds any decode history

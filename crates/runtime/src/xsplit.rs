@@ -40,7 +40,9 @@
 //! experts hottest first, admitting while the card chain stays under the
 //! union, and returns the floor (the coldest admit's count, a
 //! rank-contiguous set) and the backlog bound: exactly the jobs whose copies
-//! fit inside the union's shadow, the rest staging alone ahead of it.
+//! fit inside the union's shadow, the rest staging alone ahead of it. In a
+//! call not kept, an admit in its last unit whose way back the lane cannot
+//! take inside the walk is priced at two copies ([`ReturnCost`]).
 //! [`walk_gate`] is the least unit width whose picks could pay the walk's
 //! first admit: a prompt narrower than it admits nothing whatever its
 //! counts, so a caller gates on it before it counts.
@@ -196,6 +198,24 @@ pub fn rank_key(count: u32, id: u32) -> (Reverse<u32>, u32) {
     (Reverse(count), id)
 }
 
+/// What an admit's way back costs the walk ([`admit_walk`]): a call not kept
+/// copies, at its end or in its last unit's walk, each expert the call sent to
+/// the host back into the slot of the one admitted in its place, so an admit
+/// in that call's last unit puts a second copy on the lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnCost {
+    /// No return copy the walk pays: a call that keeps its placement, an
+    /// earlier unit's admit (its return runs in the last unit), or a last
+    /// unit whose lane keeps up with its returns inside the walk's waits for
+    /// the card's fronts.
+    Hidden,
+    /// The return copy lands at the call's end, alone on the lane: the walk
+    /// owes returns it has not issued, or no front follows this layer's.
+    /// The admit is priced at two copies: its own beside the union, its
+    /// return's at the lane's measured rate alone.
+    Exposed,
+}
+
 /// A split pick's plan from [`admit_walk`]: the floor its admits come from
 /// and the backlog bound its copies leave the staging thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,7 +243,9 @@ pub struct AdmitPlan {
 /// layer. The floor is the coldest admit's count; the backlog bound leaves
 /// beside the union exactly the jobs whose copies fit inside its shadow,
 /// `⌈(U − τ)·r/b⌉` clamped to the caller's queue floor and to the admits
-/// there are.
+/// there are. Under [`ReturnCost::Exposed`] each admit's card chain carries
+/// its return copy too, `b / lane_b_per_us`; the shadow bound counts the
+/// pick's own jobs, as before.
 ///
 /// Refused by name: the constants the derivations cannot read, counts of
 /// another length than the layer's experts, and a host list naming an
@@ -236,11 +258,16 @@ pub fn admit_walk(
     host: &[u32],
     k: &Constants,
     queue_floor: u64,
+    ret: ReturnCost,
 ) -> Result<AdmitPlan, SplitError> {
     check_constants(k)?;
     check_counts(counts, k)?;
     check_host(host, k, &mut Vec::new())?;
     let copy_us = k.expert_b as f64 / beside_b_per_us(k);
+    let admit_us = match ret {
+        ReturnCost::Hidden => copy_us,
+        ReturnCost::Exposed => copy_us + k.expert_b as f64 / k.lane_b_per_us,
+    };
     let host_us = |m: u32| k.host_us_fixed.max(k.host_us_per_col * f64::from(m));
     let mut ranked: Vec<u32> = host.to_vec();
     ranked.retain(|&id| counts[id as usize] > 0);
@@ -258,7 +285,7 @@ pub fn admit_walk(
     };
     for &id in &ranked {
         let count = counts[id as usize];
-        let card_next = card + copy_us;
+        let card_next = card + admit_us;
         let left_next = left - host_us(count);
         if card_next > left_next {
             break;
@@ -1240,8 +1267,8 @@ mod tests {
         let mut alone = a6000();
         alone.union_burst_share = 0.0;
         let beside = a6000();
-        let fast = admit_walk(&counts, &host, &alone, 4).unwrap();
-        let slow = admit_walk(&counts, &host, &beside, 4).unwrap();
+        let fast = admit_walk(&counts, &host, &alone, 4, ReturnCost::Hidden).unwrap();
+        let slow = admit_walk(&counts, &host, &beside, 4, ReturnCost::Hidden).unwrap();
         assert!(
             fast.floor < slow.floor,
             "the alone rate admits past the balance: {} against {}",
@@ -1274,12 +1301,12 @@ mod tests {
         };
         let counts = [30, 30, 30, 30, 0, 0, 0, 0];
         let host: Vec<u32> = (0..8).collect();
-        let none = admit_walk(&counts, &host, &k, 1).unwrap();
+        let none = admit_walk(&counts, &host, &k, 1, ReturnCost::Hidden).unwrap();
         assert_eq!(none.floor, 30);
         assert_eq!(none.backlog, 3, "the bound rides to the admits");
         let mut tailed = k;
         tailed.card_tail_us = 200.0;
-        let some = admit_walk(&counts, &host, &tailed, 1).unwrap();
+        let some = admit_walk(&counts, &host, &tailed, 1, ReturnCost::Hidden).unwrap();
         assert_eq!(some.floor, 30);
         assert_eq!(some.backlog, 2, "the tail's weight refuses the third admit");
         // The shadow's own tail term: at a stop the union the walk leaves
@@ -1298,7 +1325,7 @@ mod tests {
             let mut k = a6000();
             k.union_burst_share = bad;
             assert_eq!(
-                admit_walk(&counts, &host, &k, 4),
+                admit_walk(&counts, &host, &k, 4, ReturnCost::Hidden),
                 Err(SplitError::Param {
                     name: "union_burst_share",
                     range: "finite, 0 or more, under 1"
@@ -1331,10 +1358,50 @@ mod tests {
         };
         let counts = [40, 40, 4, 4, 4, 4, 4, 4];
         let host: Vec<u32> = (0..8).collect();
-        let plan = admit_walk(&counts, &host, &k, 1).unwrap();
+        let plan = admit_walk(&counts, &host, &k, 1, ReturnCost::Hidden).unwrap();
         // A copy is 100, the union 2 x 400 + 6 x 50 = 1100: the third
         // admit's 300 passes 250 only under the sum form's 90-a-cold.
         assert_eq!(plan.floor, 40, "the two hottest alone");
+    }
+
+    /// An admit whose return lands at the call's end costs the walk two
+    /// copies: its own beside the union and its return's at the lane's rate
+    /// alone. Five host experts of 1000, 800, 600, 400 and 200 against a copy
+    /// of 120: the hidden walk admits three (360 <= 600, then 480 > 200), the
+    /// exposed one two (720 > 600). At a burst share of 0.5 the copy beside
+    /// the union is 200 and the return alone 100: one admit of 1000 against a
+    /// union of 1350 fits at 300 <= 350, where a return priced beside the
+    /// union (400) would admit nothing (mutants: the exposed return priced as
+    /// a hidden one, today's price; the return at the beside-union rate).
+    #[test]
+    fn an_exposed_return_prices_an_admit_at_two_copies() {
+        let k = Constants {
+            lane_b_per_us: 1000.0,
+            host_us_per_col: 10.0,
+            host_us_fixed: 50.0,
+            card_us_fixed: 13.0,
+            card_us_per_col: 0.16,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
+            expert_b: 120000,
+            experts: 8,
+            top_k: 2,
+        };
+        let counts = [100, 80, 60, 40, 20, 0, 0, 0];
+        let host: Vec<u32> = (0..8).collect();
+        let hidden = admit_walk(&counts, &host, &k, 1, ReturnCost::Hidden).unwrap();
+        let exposed = admit_walk(&counts, &host, &k, 1, ReturnCost::Exposed).unwrap();
+        assert_eq!(hidden.floor, 60, "three admits when the return is hidden");
+        assert_eq!(exposed.floor, 80, "two when each admit carries its return");
+        assert_eq!((hidden.backlog, exposed.backlog), (3, 2));
+        let shared = Constants {
+            union_burst_share: 0.5,
+            expert_b: 100000,
+            ..k
+        };
+        let counts = [100, 35, 0, 0, 0, 0, 0, 0];
+        let one = admit_walk(&counts, &host, &shared, 1, ReturnCost::Exposed).unwrap();
+        assert_eq!(one.floor, 100, "the return priced at the lane's rate alone");
     }
 
     /// The walk's gate is the first admit's copy over a pick's worth of the
@@ -1394,7 +1461,7 @@ mod tests {
                 // The gate's copy is at no share, the walk's best case: a
                 // unit's own share only slows the copy.
                 unit.union_burst_share = 0.0;
-                let plan = admit_walk(&counts, &host, &unit, 1).unwrap();
+                let plan = admit_walk(&counts, &host, &unit, 1, ReturnCost::Hidden).unwrap();
                 let admits = plan.floor != u32::MAX;
                 if m < gate as usize {
                     assert!(
@@ -1498,7 +1565,7 @@ mod tests {
     /// The admits the walk makes over `unit512`'s host set at constants `k`:
     /// the host experts at or over its floor.
     fn walk_admits(counts: &[u32], host: &[u32], k: &Constants) -> usize {
-        let plan = admit_walk(counts, host, k, 1).unwrap();
+        let plan = admit_walk(counts, host, k, 1, ReturnCost::Hidden).unwrap();
         host.iter()
             .filter(|&&id| counts[id as usize] >= plan.floor)
             .count()

@@ -1966,7 +1966,8 @@ pub static CALL_STREAM_END: Kind = Kind {
           experts admitted and their bytes, the host's microseconds in the picks and of them \
           waiting for the staging thread, whether the call's placement stays for the passes \
           after it (1) or went back to the call's start (0) with the experts copied back, the \
-          host's microseconds in the end, and the experts found not host-resident even once read \
+          host's microseconds in the end and, of a return the walk ran before the end, in the \
+          walk's return calls, and the experts found not host-resident even once read \
           in again in the call (a pick's victim, whose pick admitted nothing, or an expert the \
           end sent back all the same, served from the file) and the last of them as \
           layer:expert:site.",
@@ -1981,6 +1982,7 @@ pub static CALL_STREAM_END: Kind = Kind {
         key("end_us", U64, "us"),
         opt("unresident", U64, ""),
         opt("unresident_last", Csv, ""),
+        opt("return_us", U64, "us"),
     ],
 };
 
@@ -3572,6 +3574,7 @@ pub fn call_report(r: &CallReport) -> Record {
         .u("end_us", r.end_us)
         .u("unresident", r.unresident.count())
         .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
+        .u("return_us", r.return_us)
 }
 
 /// A prompt unit's stream record at one layer, of ubatch `ubatch`.

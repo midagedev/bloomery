@@ -14,7 +14,8 @@
 //! and each layer has `spares` free slots; the first `pinned` seed experts
 //! are never a victim. A slot is in one state of its layer's [`SlotLedger`]:
 //! `Live(e)`, `Spare`, `Filling` — being written for a flip made at an
-//! earlier boundary — or `Reserved(e)`, being written by a reset. No map
+//! earlier boundary — or `Reserved(e)`, being written by a reset or a call's
+//! return. No map
 //! entry names a `Filling` or `Reserved` slot, so no kernel reads it and
 //! neither device view shows it.
 //!
@@ -154,6 +155,21 @@
 //! ends with every landing slot waited for and live, and either keeps its
 //! placement for the passes after it or returns each layer to the set it
 //! started with.
+//!
+//! **Returns.** A call not kept may return a layer before its end, once the
+//! call has read the layer for the last time and its host service has run
+//! ([`SwapMachine::return_layer`]): the admitted experts go to the host and
+//! their slots are `Reserved` for the experts the call sent away, whose
+//! copies wait on the copy stream for the layer's reader event and join one
+//! queue the walk pumps while it waits for a later layer's front
+//! ([`SwapMachine::return_pump`]), never more than [`RETURN_AHEAD`] jobs
+//! ahead of the lane, so a later pick's copies queue behind no more than
+//! that. Nothing reads the layer again in the call (a pick or a reader of it
+//! is refused by name). The end issues what is left, waits on the host
+//! within the deadline until the lane has staged every job — a staging
+//! failure is refused before any slot goes live — and the engine stream
+//! waits for each layer's return-landed event before the words v → s: the
+//! end state of a return made whole at the end, slot for slot.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1524,6 +1540,11 @@ pub struct CallReport {
     pub restored: usize,
     /// Host microseconds the end took.
     pub end_us: u64,
+    /// Host microseconds the walk spent in the call's return before the end
+    /// ([`SwapMachine::return_layer`], [`SwapMachine::return_pump`]): the
+    /// pairing, the words and the copies' enqueues, and the pump's waits for
+    /// the lane; 0 when the whole return ran at the end.
+    pub return_us: u64,
     /// Experts found not host-resident once their pages were read in again
     /// in the call (`host_serves`): a pick's victim, whose pick was refused
     /// and admitted nothing, or an admitted expert the end sent back all
@@ -1547,6 +1568,48 @@ struct Call {
     flush_was: bool,
 }
 
+/// The return of a call not kept, layer by layer, as the walk asks for it
+/// ([`SwapMachine::return_layer`]) and the end finishes it: per layer of the
+/// map whether its return was asked, its copies not yet issued and whether
+/// its return-landed event was recorded; the copies not yet issued in the
+/// order asked; every returned copy and the rule's undo flips, for the end.
+#[derive(Default)]
+struct Returns {
+    asked: Vec<bool>,
+    left: Vec<usize>,
+    recorded: Vec<bool>,
+    pending: std::collections::VecDeque<(usize, u32, u32, Gate)>,
+    back: Vec<(usize, u32, u32)>,
+    undo: Vec<Flip>,
+    us: u64,
+}
+
+impl Returns {
+    /// A call's empty return over `layers` layers of the map.
+    fn open(&mut self, layers: usize) {
+        for v in [&mut self.asked, &mut self.recorded] {
+            v.clear();
+            v.resize(layers, false);
+        }
+        self.left.clear();
+        self.left.resize(layers, 0);
+        self.pending.clear();
+        self.back.clear();
+        self.undo.clear();
+        self.us = 0;
+    }
+
+    /// Whether the walk asked for any layer's return.
+    fn any(&self) -> bool {
+        self.asked.iter().any(|&a| a)
+    }
+}
+
+/// The most of a call's jobs the lane may hold unstaged when the walk issues
+/// another return copy ([`SwapMachine::return_pump`]): the layer's pick
+/// issues its own copies behind at most this many.
+const RETURN_AHEAD: u64 = RING_SLOTS as u64;
+
 /// Where a copy's wait for the readers of its slot comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
@@ -1555,6 +1618,10 @@ enum Gate {
     /// Enqueued by the caller already (a call's pick: the layer's reader
     /// event).
     Waited,
+    /// Enqueued already by the call's return of the layer
+    /// ([`SwapMachine::return_layer`]: the layer's last reader event); a
+    /// return's job carries no pick stamp.
+    Returned,
 }
 
 /// The shape a machine is built for.
@@ -1665,6 +1732,11 @@ pub struct SwapMachine {
     /// the call's last read of the layer's slots); the open call.
     call_landed: Vec<CudaEvent>,
     call_read: Vec<CudaEvent>,
+    /// Per layer of the map, the open call's return-landed event: on the copy
+    /// stream after the last copy of the layer's return.
+    call_returned: Vec<CudaEvent>,
+    /// The open call's return as the walk asked for it.
+    ret: Returns,
     call: Option<Call>,
     /// The prompt call that ended since the boundary last reported one: the
     /// flips it picked, for that boundary's pass report.
@@ -1813,6 +1885,9 @@ impl SwapMachine {
         let call_read = (0..layers.len())
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
+        let call_returned = (0..layers.len())
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<Vec<_>, _>>()?;
         let land = LandRows::new(ctx, layers.len(), n_expert)?;
         // The lane starts last: from here the machine's drop owns it, and
         // nothing can fail between.
@@ -1849,6 +1924,8 @@ impl SwapMachine {
             faulted,
             call_landed,
             call_read,
+            call_returned,
+            ret: Returns::default(),
             call: None,
             call_picked: None,
             picks: Vec::new(),
@@ -2659,10 +2736,11 @@ impl SwapMachine {
         // stream's queue fills and the enqueue blocks. A boundary issues at
         // most the flips the rule keeps in flight (one event each); a reset
         // stages whatever the window says. Past that the call is refused. A
-        // prompt call's picks and its end's return to the call's start stage
-        // whatever the window says too, and wait, within the deadline, until
-        // the lane has taken in all but that many of them
-        // ([`SwapMachine::call_backlog`]).
+        // prompt call's picks, its walk's return copies and its end's return
+        // to the call's start stage whatever the window says too (the call's
+        // flush, on until the end has seen every job staged), and are issued
+        // only once the lane has taken in all but a bound of the jobs before
+        // them ([`SwapMachine::call_backlog`], [`RETURN_AHEAD`]).
         let waiting = self.jobs_issued - self.shared.served.load(Ordering::Acquire);
         if !self.shared.flush.load(Ordering::Acquire) && waiting >= self.events.len() as u64 {
             return Err(GpuError::protocol(
@@ -3015,6 +3093,7 @@ impl SwapMachine {
         for ev in &self.call_read {
             ev.record(stream)?;
         }
+        self.ret.open(self.layers.len());
         let flush_was = self.shared.flush.swap(true, Ordering::AcqRel);
         self.call = Some(Call {
             cfg,
@@ -3038,7 +3117,9 @@ impl SwapMachine {
     /// the engine stream `stream`: the stream waits for the layer's landed
     /// event, which turns its landing slots `Live`, and records the layer's
     /// reader event, which the layer's next pick's copies wait for. Refused
-    /// by name: no call open, a layer outside the map.
+    /// by name: no call open, a layer outside the map, a layer the call
+    /// returned ([`SwapMachine::return_layer`]: its slots take the call's
+    /// start set back, and nothing reads them until the end).
     pub fn call_reader(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
         const WHAT: &str = "SwapMachine::call_reader";
         self.refuse_if_broken(WHAT)?;
@@ -3046,6 +3127,7 @@ impl SwapMachine {
             return Err(GpuError::state(WHAT, "a prompt call open (begin_call)"));
         }
         let i = self.rule_layer(layer, WHAT)?;
+        self.refuse_returned(i, layer, WHAT)?;
         let r = self.land_layer(layer, stream);
         self.after_change(r, || format!("the call's reader of layer {layer}"))?;
         let r = self.call_read[i].record(stream).map_err(GpuError::from);
@@ -3109,7 +3191,9 @@ impl SwapMachine {
     /// the card's copy of the layer's words (written on `stream`). Refused by
     /// name, the machine unchanged: no call open, a layer outside the map,
     /// counts of another length, a layer whose last pick no reader has
-    /// waited for ([`SwapMachine::call_reader`]), and a victim the host
+    /// waited for ([`SwapMachine::call_reader`]), a layer the call returned
+    /// ([`SwapMachine::return_layer`]: only the call's last unit returns,
+    /// after the layer's last pick), and a victim the host
     /// cannot serve from resident pages once its pages are read in again —
     /// [`GpuError::Unresident`], counted in the call's report, which a
     /// caller can do without ([`crate::host::HostTier::call_pick`]: the pick
@@ -3131,6 +3215,7 @@ impl SwapMachine {
             None => return Err(GpuError::state(WHAT, "a prompt call open (begin_call)")),
         };
         let i = self.rule_layer(layer, WHAT)?;
+        self.refuse_returned(i, layer, WHAT)?;
         if let Some((s, st)) = self.ledger.landing(layer) {
             return Err(GpuError::protocol(
                 WHAT,
@@ -3360,16 +3445,20 @@ impl SwapMachine {
     /// `slots`: every landing slot's landed event waited for and the slot
     /// `Live`; then, when `kept`, the placement stays for the passes after
     /// the call, else every layer returns to the set it started the call
-    /// with, the experts the call sent to the host copied back behind a
-    /// boundary event of `stream` into the slots of those it admitted, which
-    /// go back to the host. The staging window gates the lane
+    /// with, the experts the call sent to the host copied back into the slots
+    /// of those it admitted, which go back to the host. A call whose walk
+    /// returned no layer copies them behind a boundary event of `stream`
+    /// (`restore`); one whose walk returned layers
+    /// ([`SwapMachine::return_layer`]) returns the rest the same way and
+    /// lands them all (`land_returns`). The staging window gates the lane
     /// again. An expert the end sends back that the host does not serve from
     /// resident pages once its pages are read in again goes all the same
     /// (`send_on`), counted ([`CallReport::unresident`]) and followed from
     /// the next boundary on ([`PassReport::faulting`]). The flips the call
     /// picked wait here for the boundary after it ([`PassReport::picked`]).
     /// Refused by name, the machine unchanged: no call open. Any error after
-    /// the first change breaks the machine.
+    /// the first change breaks the machine, and so does a call kept whose
+    /// walk returned a layer.
     pub fn end_call(
         &mut self,
         stream: &CudaStream,
@@ -3390,6 +3479,7 @@ impl SwapMachine {
             kept,
             restored,
             end_us: micros(t0),
+            return_us: self.ret.us,
             unresident: std::mem::take(&mut self.unresident),
             ..call.report
         })
@@ -3408,12 +3498,77 @@ impl SwapMachine {
             self.land_layer(l, stream)?;
         }
         if kept {
+            if self.ret.any() {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    "a call kept whose walk returned layers to the call's start",
+                ));
+            }
             for l in self.layers.clone() {
                 self.agree(l, slots, WHAT)?;
             }
             return Ok(0);
         }
-        self.restore(stream, slots, &call.start)
+        if !self.ret.any() {
+            return self.restore(stream, slots, &call.start);
+        }
+        self.land_returns(stream, slots, &call.start)
+    }
+
+    /// Layer `l`'s (rule layer `i`) pairs back to `was`, its card set at the
+    /// call's start: the experts the call admitted and the ones it sent to
+    /// the host, ascending ids, zipped; per pair the admitted one `a` to the
+    /// host (`send_on`), its slot `s` `Reserved` for the other `v` and the
+    /// word a → HOST queued. Each copy `(l, v, s)` is appended to `back`, the
+    /// rule's undo flip to `undo`. Refused by name: an unequal count, an
+    /// admitted expert off the stage card.
+    fn pair_back(
+        &mut self,
+        slots: &mut SlotMap,
+        (i, l): (usize, usize),
+        was: &[u32],
+        back: &mut Vec<(usize, u32, u32)>,
+        undo: &mut Vec<Flip>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::end_call";
+        let now: Vec<u32> = self.rule.live(i).map_err(|e| rule_err(WHAT, e))?.collect();
+        let came: Vec<u32> = now.iter().copied().filter(|id| !was.contains(id)).collect();
+        let went: Vec<u32> = was.iter().copied().filter(|id| !now.contains(id)).collect();
+        if came.len() != went.len() {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {l}: the call admitted {came:?} and sent {went:?} to the host, not one \
+                     for one"
+                ),
+            ));
+        }
+        for (&a, &v) in came.iter().zip(&went) {
+            send_on(
+                &*self.shared.source,
+                &self.rereads,
+                (&mut self.unresident, &mut self.faulted),
+                l,
+                a,
+                HostSite::Restore,
+            )?;
+            let Slot::Card(s) = slots.evict(l, a)? else {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!("layer {l}: expert {a} the call admitted is off the stage card"),
+                ));
+            };
+            self.ledger.row_mut(l)[s as usize] = SlotState::Reserved(v);
+            self.changed.push((l, a, HOST));
+            back.push((l, v, s));
+            undo.push(Flip {
+                layer: i,
+                admit: v,
+                evict: a,
+                live_at: self.rule.passes(),
+            });
+        }
+        Ok(())
     }
 
     /// Every layer back to `start`, its card set at the call's start (the
@@ -3438,44 +3593,7 @@ impl SwapMachine {
         let mut back = Vec::new();
         let mut undo = Vec::new();
         for (i, l) in self.layers.clone().enumerate() {
-            let now: Vec<u32> = self.rule.live(i).map_err(|e| rule_err(WHAT, e))?.collect();
-            let was = &start[i];
-            let came: Vec<u32> = now.iter().copied().filter(|id| !was.contains(id)).collect();
-            let went: Vec<u32> = was.iter().copied().filter(|id| !now.contains(id)).collect();
-            if came.len() != went.len() {
-                return Err(GpuError::protocol(
-                    WHAT,
-                    format!(
-                        "layer {l}: the call admitted {came:?} and sent {went:?} to the host, \
-                         not one for one"
-                    ),
-                ));
-            }
-            for (&a, &v) in came.iter().zip(&went) {
-                send_on(
-                    &*self.shared.source,
-                    &self.rereads,
-                    (&mut self.unresident, &mut self.faulted),
-                    l,
-                    a,
-                    HostSite::Restore,
-                )?;
-                let Slot::Card(s) = slots.evict(l, a)? else {
-                    return Err(GpuError::protocol(
-                        WHAT,
-                        format!("layer {l}: expert {a} the call admitted is off the stage card"),
-                    ));
-                };
-                self.ledger.row_mut(l)[s as usize] = SlotState::Reserved(v);
-                self.changed.push((l, a, HOST));
-                back.push((l, v, s));
-                undo.push(Flip {
-                    layer: i,
-                    admit: v,
-                    evict: a,
-                    live_at: self.rule.passes(),
-                });
-            }
+            self.pair_back(slots, (i, l), &start[i], &mut back, &mut undo)?;
         }
         self.write_changed(stream)?;
         self.boundary_event.record(stream)?;
@@ -3497,6 +3615,272 @@ impl SwapMachine {
             self.agree(l, slots, WHAT)?;
         }
         Ok(back.len())
+    }
+
+    /// Layer `layer`'s return to the call's start, inside the call: the
+    /// walk asks once the call has read the layer for the last time and its
+    /// host service has run — only the call's last unit returns, a call not
+    /// kept. On the engine stream `stream` and the host map `slots`, the
+    /// layer's pairs ([`SwapMachine::end_call`]'s, ascending ids zipped):
+    /// each admitted expert to the host, its slot `Reserved` for the expert
+    /// it took the place of, the layer's words a → HOST written; the copy
+    /// stream waits for the layer's reader event (its last read of the call,
+    /// [`SwapMachine::call_reader`]), and the layer's copies join the call's
+    /// queue of returns, those the lane has room for issued now
+    /// ([`SwapMachine::return_pump`] issues the rest; the end whatever is
+    /// left). The rule, the words v → s and the slots' `Live` wait for the
+    /// end: a pick or a reader of the layer is refused by name from here
+    /// on. Refused by name, the machine unchanged: no call open, a layer
+    /// outside the map, a layer returned already, a layer whose last pick no
+    /// reader has waited for. Any error after the first change breaks the
+    /// machine.
+    pub fn return_layer(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::return_layer";
+        let t0 = Instant::now();
+        self.refuse_if_broken(WHAT)?;
+        let Some(call) = self.call.as_ref() else {
+            return Err(GpuError::state(WHAT, "a prompt call open (begin_call)"));
+        };
+        let i = self.rule_layer(layer, WHAT)?;
+        let was = call.start[i].clone();
+        self.refuse_returned(i, layer, WHAT)?;
+        if let Some((s, st)) = self.ledger.landing(layer) {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {layer}: slot {s} is {st:?} from its last pick, which no reader has \
+                     waited for (call_reader)"
+                ),
+            ));
+        }
+        let (mut back, mut undo) = (Vec::new(), Vec::new());
+        let r = self
+            .pair_back(slots, (i, layer), &was, &mut back, &mut undo)
+            .and_then(|()| self.write_changed(stream))
+            .and_then(|()| match back.is_empty() {
+                true => Ok(()),
+                false => self.copy.wait(&self.call_read[i]).map_err(GpuError::from),
+            });
+        self.after_change(r, || format!("the call's return of layer {layer}"))?;
+        let ret = &mut self.ret;
+        ret.asked[i] = true;
+        ret.left[i] = back.len();
+        ret.pending
+            .extend(back.iter().map(|&(l, v, s)| (l, v, s, Gate::Returned)));
+        ret.back.extend(back);
+        ret.undo.extend(undo);
+        let r = self.issue_returns(slots, None);
+        self.after_change(r, || format!("the call's return of layer {layer}"))?;
+        self.ret.us += micros(t0);
+        Ok(())
+    }
+
+    /// Issue the call's queued return copies ([`SwapMachine::return_layer`])
+    /// while the lane holds fewer than [`RETURN_AHEAD`] of the machine's jobs
+    /// unstaged; past that, wait for the lane until `stop` (given the copies
+    /// this pump issued) says to stop or the queue is empty. `stop` is the
+    /// caller's moment: the walk's is the next layer's download landing, so
+    /// the copies fill the host's wait for the card's front and the layer's
+    /// pick issues its own behind at most [`RETURN_AHEAD`] of them. The
+    /// copies issued. Refused by name: no call open; a lane that stages no
+    /// job within the deadline while copies wait, which breaks the machine,
+    /// as does any error after the first copy.
+    pub fn return_pump(
+        &mut self,
+        slots: &SlotMap,
+        mut stop: impl FnMut(usize) -> Result<bool, GpuError>,
+    ) -> Result<usize, GpuError> {
+        const WHAT: &str = "SwapMachine::return_pump";
+        let t0 = Instant::now();
+        self.refuse_if_broken(WHAT)?;
+        if self.call.is_none() {
+            return Err(GpuError::state(WHAT, "a prompt call open (begin_call)"));
+        }
+        let r = self.issue_returns(slots, Some(&mut stop));
+        let r = self.after_change(r, || "the call's return pump".to_string());
+        self.ret.us += micros(t0);
+        r
+    }
+
+    /// The call's return copies queued and not issued yet: what the walk's
+    /// price reads to know the lane fell behind
+    /// ([`runtime::xsplit::ReturnCost`]).
+    #[must_use]
+    pub fn returns_owed(&self) -> usize {
+        self.ret.pending.len()
+    }
+
+    /// The call's queued return copies issued while the lane holds fewer
+    /// than [`RETURN_AHEAD`] of the machine's jobs unstaged: with no `stop`,
+    /// those that fit now and no wait ([`SwapMachine::return_layer`]); with
+    /// one, `stop` asked (given the copies issued) before every copy and
+    /// every turn of the wait for the lane, until it says so or the queue is
+    /// empty ([`SwapMachine::return_pump`]). The copies issued.
+    fn issue_returns(
+        &mut self,
+        slots: &SlotMap,
+        mut stop: Option<&mut dyn FnMut(usize) -> Result<bool, GpuError>>,
+    ) -> Result<usize, GpuError> {
+        const WHAT: &str = "SwapMachine::return_pump";
+        let mut issued = 0usize;
+        let (mut turns, mut since) = (0u32, Instant::now());
+        while !self.ret.pending.is_empty() {
+            if let Some(stop) = stop.as_mut()
+                && stop(issued)?
+            {
+                break;
+            }
+            let waiting = self.jobs_issued - self.shared.served.load(Ordering::Acquire);
+            if waiting < RETURN_AHEAD {
+                self.issue_return(slots)?;
+                issued += 1;
+                (turns, since) = (0, Instant::now());
+                continue;
+            }
+            if stop.is_none() {
+                break;
+            }
+            if since.elapsed() > self.shared.deadline {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!(
+                        "the lane took in no job of the call's last {RETURN_AHEAD} in {:?} \
+                         (deadline {:?}) with {} return copies waiting",
+                        since.elapsed(),
+                        self.shared.deadline,
+                        self.ret.pending.len()
+                    ),
+                ));
+            }
+            if turns < 256 {
+                std::hint::spin_loop();
+                turns += 1;
+            } else {
+                std::thread::sleep(Duration::from_micros(20));
+            }
+        }
+        Ok(issued)
+    }
+
+    /// The call's next queued return copy issued ([`SwapMachine::copy_into`],
+    /// its gate the one it was queued with), and its layer's return-landed
+    /// event recorded on the copy stream after the layer's last.
+    fn issue_return(&mut self, slots: &SlotMap) -> Result<(), GpuError> {
+        let Some((l, v, s, gate)) = self.ret.pending.pop_front() else {
+            return Ok(());
+        };
+        self.copy_into(slots, l, v, s, None, gate)?;
+        let i = l - self.layers.start;
+        self.ret.left[i] -= 1;
+        if self.ret.left[i] == 0 {
+            self.call_returned[i].record(&self.copy)?;
+            self.ret.recorded[i] = true;
+        }
+        Ok(())
+    }
+
+    /// The end of a call whose walk returned layers
+    /// ([`SwapMachine::return_layer`]): the layers it did not return paired
+    /// back to `start` as `restore` pairs them, behind a boundary event of
+    /// `stream`; every copy not issued yet issued against the machine's
+    /// backlog bound; a host wait, within the deadline, until the lane has
+    /// staged every job (so a staging failure is refused by name before any
+    /// slot goes live); then the engine stream waits for each layer's
+    /// return-landed event — the one order between the copies still running
+    /// and the words — and the words v → s, the slots `Live` and the rule's
+    /// undo: `restore`'s end state, slot for slot. The experts copied back.
+    fn land_returns(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        start: &[Vec<u32>],
+    ) -> Result<usize, GpuError> {
+        const WHAT: &str = "SwapMachine::end_call";
+        let (mut rest, mut undo) = (Vec::new(), Vec::new());
+        for (i, l) in self.layers.clone().enumerate() {
+            if self.ret.asked[i] {
+                continue;
+            }
+            let from = rest.len();
+            self.pair_back(slots, (i, l), &start[i], &mut rest, &mut undo)?;
+            self.ret.left[i] = rest.len() - from;
+        }
+        if !rest.is_empty() {
+            self.write_changed(stream)?;
+            self.boundary_event.record(stream)?;
+            self.copy_waits_boundary = false;
+        }
+        self.ret
+            .pending
+            .extend(rest.iter().map(|&(l, v, s)| (l, v, s, Gate::Boundary)));
+        self.ret.back.extend(rest);
+        self.ret.undo.extend(undo);
+        while !self.ret.pending.is_empty() {
+            self.wait_backlog(WHAT)?;
+            self.issue_return(slots)?;
+        }
+        self.wait_staged_all(WHAT)?;
+        self.refuse_staging_failure(WHAT, None)?;
+        for (i, &recorded) in self.ret.recorded.iter().enumerate() {
+            if recorded {
+                stream.wait(&self.call_returned[i])?;
+            }
+        }
+        let back = std::mem::take(&mut self.ret.back);
+        for &(l, v, s) in &back {
+            slots.admit(l, v, Slot::Card(s))?;
+            self.ledger.row_mut(l)[s as usize] = SlotState::Live(v);
+            self.changed.push((l, v, s));
+        }
+        self.write_changed(stream)?;
+        let undo = std::mem::take(&mut self.ret.undo);
+        self.rule.settle(&undo).map_err(|e| rule_err(WHAT, e))?;
+        for l in self.layers.clone() {
+            self.agree(l, slots, WHAT)?;
+        }
+        Ok(back.len())
+    }
+
+    /// Wait, within the deadline, until the lane has finished (staged, or
+    /// failed) every job issued; past it the refusal of `what` names the
+    /// count.
+    fn wait_staged_all(&self, what: &'static str) -> Result<(), GpuError> {
+        let issued = self.jobs_issued;
+        let shared = &self.shared;
+        let staged = || shared.served.load(Ordering::Acquire) >= issued;
+        match shared.wait_until(staged, Some(shared.deadline)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(GpuError::protocol(what, "the lane has stopped")),
+            Err(waited) => Err(GpuError::protocol(
+                what,
+                format!(
+                    "the lane finished {} of the {issued} jobs issued in {waited:?} (deadline \
+                     {:?})",
+                    shared.served.load(Ordering::Acquire),
+                    shared.deadline
+                ),
+            )),
+        }
+    }
+
+    /// Refuse `what` at rule layer `i` (`layer` in the map) when the open
+    /// call returned it ([`SwapMachine::return_layer`]).
+    fn refuse_returned(&self, i: usize, layer: usize, what: &'static str) -> Result<(), GpuError> {
+        if self.ret.asked.get(i).copied().unwrap_or(false) {
+            return Err(GpuError::protocol(
+                what,
+                format!(
+                    "layer {layer} returned to the call's start already (return_layer): no pick \
+                     or read of it until the call's end"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The open call's floor from its next pick on: the least count an

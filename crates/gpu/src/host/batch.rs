@@ -514,6 +514,32 @@ impl BatchPort {
         Ok(&set.ids[at * s..u * s])
     }
 
+    /// Whether `key`'s routed copies have landed, asked once, no wait: what
+    /// a host wait for the download can do beside it stops at. Refused by
+    /// name when the oldest unserved set is not `key`'s.
+    pub fn routed_landed(&self, key: BatchKey) -> Result<bool, GpuError> {
+        let set = &self.sets[self.serve];
+        if set.stage != Stage::Routed(key) {
+            return Err(GpuError::Shape {
+                what: PORT,
+                detail: format!(
+                    "the landing of {key:?}; the oldest unserved exchange set holds {:?}",
+                    set.stage
+                ),
+            });
+        }
+        Ok(set.routed.query()?)
+    }
+
+    /// Whether a set holds a download of `layer` the port has not served
+    /// yet: the layer's host service is still to run.
+    #[must_use]
+    pub fn unserved(&self, layer: usize) -> bool {
+        self.sets
+            .iter()
+            .any(|s| matches!(s.stage, Stage::Routed(k) if k.layer == layer))
+    }
+
     /// Wait for the oldest unserved set's copies, which must be `key`'s,
     /// then have `serve` compute its layer's host sums for its tokens: the
     /// layer, the activations as a view, the routing, and the set's sums the
