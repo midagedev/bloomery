@@ -235,7 +235,7 @@ use bloomery_levers::{
 };
 use gguf::Split;
 use model::arch::glm5next::place::{
-    KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs,
+    KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlaceError, PlanInputs, refusal_text,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::slots::{SplitError, split_ctx};
@@ -414,7 +414,8 @@ struct GlmCtx {
 /// plan counting `slots` sequences ([`plan_of`]): `set`, a slot's
 /// share of the flag ([`split_ctx`]), as given — the plan the load runs
 /// refuses it by name past [`ORACLE_POSITIONS`] and when the card cannot
-/// hold every slot, so does this, with the plan's own words; unset, [`CTX`]
+/// hold every slot, so does this, with the plan's own words and, with the
+/// draft, the NextN layer's bytes the plan counted ([`refusal_text`]); unset, [`CTX`]
 /// or the trained context capped to what the plan takes within its
 /// [`MARGIN`] of stage-card expert bytes. The searches are planning-time
 /// only: one plan a probe of the bisection, none past the cap. A card whose
@@ -467,7 +468,15 @@ fn ctx_of(
         fit_bytes: card(fit)?,
         margin_ctx,
         base_bytes,
-        card_bytes: card(ctx)?,
+        card_bytes: card(ctx).map_err(|e| match (nextn, e.downcast_ref::<PlaceError>()) {
+            (Some(n), Some(refusal)) => {
+                let bytes = u64::try_from(ctx)
+                    .ok()
+                    .and_then(|ctx| n.card_bytes(ctx, slots).ok());
+                GateError::from(refusal_text(refusal, bytes, ctx, slots))
+            }
+            _ => e,
+        })?,
     })
 }
 

@@ -325,6 +325,25 @@ fn refuse_front(card: &Card, total: u64, limit: u64, front: u64) -> Result<(), P
     }
 }
 
+/// A plan's refusal `e` of a context set for a load with the NextN layer, as
+/// text: the plan's own words and, for a refusal of bytes
+/// ([`PlaceError::Broken`], [`PlaceError::FrontOver`]), the `nextn_bytes` the
+/// plan counted for the layer beside the trunk ([`NextnInputs::card_bytes`]),
+/// in the same line, so a context that fits without the draft is not refused
+/// with it unexplained. Any other refusal, and a plan without the draft
+/// (`nextn_bytes` is `None`), is `e`'s text as it is.
+#[must_use]
+pub fn refusal_text(e: &PlaceError, nextn_bytes: Option<u64>, ctx: usize, slots: usize) -> String {
+    match (e, nextn_bytes) {
+        (PlaceError::Broken(_) | PlaceError::FrontOver { .. }, Some(n)) => format!(
+            "{e}; the plan counts {n} B for the NextN layer the draft holds on the card beside \
+             the trunk (its tensors, its store of {slots} slots at {ctx} positions a slot, and \
+             its {NEXTN_ARENA_BYTES} B arena)"
+        ),
+        _ => e.to_string(),
+    }
+}
+
 /// A plan's terms on a card: its granules, cache, scratch, context and
 /// reserves.
 fn card_terms(t: &CardTotals) -> u64 {
@@ -980,6 +999,24 @@ impl NextnInputs {
         }
         .slots_of(slots)
     }
+
+    /// The card bytes the NextN layer holds for `slots` sequences at
+    /// `ctx_max` positions, its arena counted: the term
+    /// [`PlanInputs::plan_nextn_slots`] reserves out of the stage card's
+    /// budget ([`NextnPlan::nextn_card_bytes`] plus
+    /// [`NextnPlan::arena_bytes`]), read from the layer's own plan, which the
+    /// stage card does not bound — so a plan the card refuses still names it.
+    pub fn card_bytes(&self, ctx_max: u64, slots: usize) -> Result<u64, PlaceError> {
+        let n = slots as u64;
+        let draft = placement::plan_host_routed(
+            &self.model,
+            &self.machine,
+            ctx_max,
+            &self.slots_of(n),
+            &PlanLevers::default(),
+        )?;
+        Ok(nextn_card_bytes(&draft.cards[0]) + NEXTN_ARENA_BYTES)
+    }
 }
 
 /// [`PlanInputs::seq_terms`] from its parts: the trunk's layers in `kv`
@@ -1031,9 +1068,65 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        KdaLanes, Kind, KvBytes, KvLayout, NextnKv, PROMPT_GROUP, card_tile_bytes, group_sets,
-        groups, recurrent_bytes, row_bytes, seq_terms, stage_term, unit_bytes,
+        KdaLanes, Kind, KvBytes, KvLayout, NEXTN_ARENA_BYTES, NextnKv, PROMPT_GROUP, PlaceError,
+        card_tile_bytes, group_sets, groups, recurrent_bytes, refusal_text, row_bytes, seq_terms,
+        stage_term, unit_bytes,
     };
+    use crate::placement::Violation;
+
+    fn over() -> PlaceError {
+        PlaceError::Broken(vec![Violation::CardOver {
+            card: "A6000".to_owned(),
+            total: 52_000_000_000,
+            limit: 51_000_000_000,
+        }])
+    }
+
+    /// A set context the plan refuses on bytes, with the draft, says how many
+    /// bytes of the plan are the NextN layer the draft holds, in the one line
+    /// that carries the plan's arithmetic; without the draft the refusal is
+    /// the plan's, word for word.
+    #[test]
+    fn a_context_refused_with_the_draft_names_the_nextn_bytes() {
+        let plain = over().to_string();
+        assert_eq!(refusal_text(&over(), None, 8192, 2), plain);
+        let named = refusal_text(&over(), Some(300 << 20), 8192, 2);
+        assert_eq!(
+            named,
+            format!(
+                "{plain}; the plan counts 314572800 B for the NextN layer the draft holds on the \
+                 card beside the trunk (its tensors, its store of 2 slots at 8192 positions a \
+                 slot, and its {NEXTN_ARENA_BYTES} B arena)"
+            )
+        );
+        assert!(!named.contains('\n'), "one line: {named}");
+    }
+
+    /// The prompt batch's reserve is a refusal of bytes the NextN layer's
+    /// share explains too; a refusal that is no matter of bytes (the context
+    /// past what the selector is checked at) is the plan's as it came.
+    #[test]
+    fn only_a_refusal_of_bytes_names_the_nextn_bytes() {
+        let front = PlaceError::FrontOver {
+            card: "A6000".to_owned(),
+            front: 3,
+            left: 1,
+            short: 2,
+        };
+        let named = refusal_text(&front, Some(1 << 20), 4096, 1);
+        assert!(
+            named.starts_with(&front.to_string()) && named.contains("1048576 B"),
+            "{named}"
+        );
+        let past = PlaceError::PastOracle {
+            ctx_max: 20_000,
+            served: 16_384,
+        };
+        assert_eq!(
+            refusal_text(&past, Some(1 << 20), 20_000, 1),
+            past.to_string()
+        );
+    }
 
     /// A call's batches cut into groups: runs of `g`, a lone last batch
     /// joining the run before it (never at a lever of 1, never a call of one
