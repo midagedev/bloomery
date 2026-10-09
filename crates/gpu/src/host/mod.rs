@@ -34,8 +34,8 @@
 //! A boundary of several columns a row ([`step::Boundary::with_cols`])
 //! carries a chain of one row of `m` consecutive positions
 //! ([`Chain::Cols`]): one handoff image of `m` columns, one go, one union
-//! call over every column ([`HostExperts::experts_union_into`]) and one wait
-//! a layer.
+//! call over every column ([`HostExperts::experts_step_union_into`]) and one
+//! wait a layer.
 //!
 //! A boundary of two rows carries a pass whose two tokens run one layer
 //! apart, so a row's go can land while the other row's wait is pending: each
@@ -231,13 +231,28 @@ pub trait HostExperts {
         ))
     }
 
+    /// The step port's form of [`HostExperts::experts_union_into`]: a decode
+    /// step's union, whose ids the next step reads again, the same bits. A
+    /// host with an NVMe tier reads the tier's ids from its arena, as
+    /// [`HostExperts::experts_into`] does, so the step leaves no page of them
+    /// in the page cache; by default the batch form.
+    fn experts_step_union_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        self.experts_union_into(layer, x, lists, out)
+    }
+
     /// A prompt call's union over `lists` ([`HostExperts::experts_union_into`]
     /// from the batch port) has consumed what it read of layer `layer`: the
     /// host lets go of the pages those reads brought in that it does not
     /// keep (the NVMe tier's ids, [`nvtier::NvTier::release_union`]). The
-    /// step port's union does not call it: a decode step's ids are read
-    /// again by the next step. Nothing by default: a host whose reads leave
-    /// nothing behind.
+    /// step port's union does not call it: it reads the tier's ids from the
+    /// arena ([`HostExperts::experts_step_union_into`]). Nothing by default:
+    /// a host whose reads leave nothing behind.
     fn release_union(&mut self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
         let _ = (layer, lists);
         Ok(())
@@ -283,7 +298,7 @@ pub struct HybridStats {
     pub pair_row1_slots: u64,
     /// Calls into the host experts by step services, one a service: a
     /// one-column service's `experts_into`, a `Cols` service's one
-    /// `experts_union_into` over all its columns.
+    /// `experts_step_union_into` over all its columns.
     pub host_calls: u64,
     /// Services of a one-row chain of several columns ([`Chain::Cols`]),
     /// each one go, one union call and one wait for every column, and the
