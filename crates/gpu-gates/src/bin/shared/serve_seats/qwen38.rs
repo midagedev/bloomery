@@ -735,11 +735,13 @@ impl Plans<'_> {
             .expert_bytes)
     }
 
-    /// The plan's host need (`HostNeed`) at `ctx`, the churn pool the
-    /// residency it runs holds beside it (`set` the lever as `run` read it;
-    /// the rule's records unprinted), and the NVMe expert tier's arena the
-    /// load's paged experts fill beside them
-    /// (`HostTotals::nvme_arena_bytes`, 0 without one).
+    /// The plan's host need (`HostNeed::bytes`, the NVMe expert tier's
+    /// arena inside it) at `ctx`, the churn pool the residency it runs
+    /// holds beside it (`set` the lever as `run` read it; the rule's
+    /// records unprinted), and the arena itself
+    /// (`HostTotals::nvme_arena_bytes`, 0 without one) for the `cache`
+    /// line's `tier` term — [`CacheRam::of_tier`] counts it once, inside
+    /// the need.
     fn host(
         &self,
         ctx: usize,
