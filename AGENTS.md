@@ -69,7 +69,8 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
     just weekly               # every weekly-* recipe in one sitting on the lead's ledger
     just box-gc / box-tracks  # orphans under this track's remote dir / remote dirs vs local worktrees
     just mac-check / mac-lint / mac-fmt-check / mac-test   # the Mac's static tier (above)
-    just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan change
+    just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan
+                              # change, each plan at the plan room (tools/ref/plan-room.sh)
     just lab-engram           # the engram IO lab's tests; lab-, not gate-, so no engine landing selects it
     just gate-refset / refset-check   # the reference-set readers and every family's sets in place
 
