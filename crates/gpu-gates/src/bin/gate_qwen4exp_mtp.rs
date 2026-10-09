@@ -28,14 +28,14 @@
 //! - (l) each row's routed set is ik's (`ffn_moe_topk-48`), but where it is
 //!   not: such a flip is allowed only when each exchanged pair's gap in
 //!   ik's router logits lies within our two logits' error, that error
-//!   within [`flip_cap`] and the gap within [`margin_cap`] of the router
+//!   within [`flip::flip_cap`] and the gap within [`flip::margin_cap`] of the router
 //!   input's band ([`router_band`]). The layer's output's distance from
 //!   ik's `l_out-48` on the other rows is printed, not held: our f32
 //!   activations against ik's q8 ones move each projection by its own
 //!   rounding term, which the node-local pins (n) hold instead.
 //! - (h) each row's draft token the argmax of our full head's logits, first
 //!   index on a tie; on each row ik computes a head for (its `inp_out_ids`)
-//!   that argmax is ik's wherever ik's top-2 margin clears [`margin_cap`] at
+//!   that argmax is ik's wherever ik's top-2 margin clears [`flip::margin_cap`] at
 //!   [`logits_band`], and ik's runner-up otherwise. The logits' distance
 //!   from ik's `result_output` is printed, not held.
 //! - (n) the node-local pins, on every row: each node the walk taps against
@@ -185,6 +185,19 @@
 //!
 //! (l) and (h) hold at least one row each off a flip: a run that excuses
 //! every row as a flip fails.
+//!
+//! Tiers (`BLOOMERY_TIER`, `crates/gpu-gates/src/tier.rs`): the fixture tier runs the
+//! self-consistency clauses, replays the real set's rows as the feed (the fixture copies the
+//! vocabulary, and ik's hidden rows are finite inputs) and leaves every comparison with the real
+//! set's output to the real tier (`deferred(real)`). Beside them it runs the two fixture-oracle
+//! clauses against ik's MTP set dumped on the fixture (`refset::arch::qwen4exp::fixture`, each
+//! opened by `tier::fixture_set`), declared in [`FX_ORACLE`] and held to the gate's end:
+//! - (elhfx) the fixture set's graphs replayed as (e), (l) and (h) replay the real one, at the
+//!   bands [`fx_bands`] counts over the draft file's site types, the layer's output held where
+//!   the real clause prints it, the argmax a tie band ([`flip::head_tie`]) in place of ik's
+//!   runner-up;
+//! - (tfx) the pairing of (t) against the fixture set's warmup hidden rows: the shift 1 reads
+//!   closer than 0 and 2, its distance printed (the prompt's last rows lie on a flip's path).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -223,6 +236,7 @@ mod gate {
     };
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::weights::DevWeight;
+    use bloomery_gpu_gates::act_rule::{Arm, site_rel};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
@@ -242,6 +256,7 @@ mod gate {
     use model::placement::PlanLevers;
     use refset::arch::qwen4exp::IK;
     use refset::arch::qwen4exp::MODEL;
+    use refset::arch::qwen4exp::fixture;
     use refset::arch::qwen4exp::mtp::{DRAFT, DraftFrom, MTP, MTP_SET, draft_file};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
@@ -502,37 +517,6 @@ mod gate {
         if r.is_nan() { f64::INFINITY } else { r }
     }
 
-    /// The RMS of `v`.
-    fn rms(v: &[f32]) -> f64 {
-        (v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt()
-    }
-
-    /// The deviation of `v` about its mean: the spread a ranking reads.
-    fn spread(v: &[f32]) -> f64 {
-        let n = v.len().max(1) as f64;
-        let mean = v.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
-        (v.iter()
-            .map(|&x| (f64::from(x) - mean).powi(2))
-            .sum::<f64>()
-            / n)
-            .sqrt()
-    }
-
-    /// The most error two of a row's values may carry at an excused flip:
-    /// each value moves by about `band` times the row's RMS (a dot of an
-    /// input carrying `band` of relative error), three deviations each —
-    /// the e2e gate's `flip_cap`.
-    fn flip_cap(band: f64, v: &[f32]) -> f64 {
-        6.0 * band * rms(v)
-    }
-
-    /// The widest gap between two of a row's values the errors can cross:
-    /// `band` times the row's spread (a common offset moves no rank), three
-    /// deviations each — the e2e gate's `margin_cap`.
-    fn margin_cap(band: f64, v: &[f32]) -> f64 {
-        6.0 * band * spread(v)
-    }
-
     /// The first index of the largest value, and the largest value of the
     /// rest: the head's tie rule.
     fn top2(v: &[f32]) -> (usize, usize) {
@@ -576,6 +560,8 @@ mod gate {
     struct IkGraph {
         block: i32,
         graph: Graph,
+        /// The draft layer's index in ik's node names.
+        layer: usize,
         tokens: Vec<u32>,
         pos: Vec<u32>,
         states: Vec<f32>,
@@ -588,7 +574,12 @@ mod gate {
     }
 
     impl IkGraph {
-        fn read(set: &MtpSet, block: i32, graph: Graph) -> Result<IkGraph, GateError> {
+        fn read(
+            set: &MtpSet,
+            block: i32,
+            graph: Graph,
+            layer: usize,
+        ) -> Result<IkGraph, GateError> {
             let find = |name: &str| set.find(block, graph, name, 0);
             let ints = |name: &str| -> Result<Vec<i32>, GateError> {
                 Ok(set.i32s(find(name)?, Layout::Flat)?)
@@ -622,16 +613,17 @@ mod gate {
                 .into_iter()
                 .map(|v| v as usize)
                 .collect::<Vec<_>>();
-            let topk_row = find(&format!("ffn_moe_topk-{IK_LAYER}"))?;
+            let topk_row = find(&format!("ffn_moe_topk-{layer}"))?;
             let topk = set.i32s(topk_row, Layout::Logical)?;
             let g = IkGraph {
                 block,
                 graph,
+                layer,
                 states: f32s("inp_mtp_states")?,
-                eh: f32s(&format!("mtp_eh_proj-{IK_LAYER}"))?,
-                l_out: f32s(&format!("l_out-{IK_LAYER}"))?,
+                eh: f32s(&format!("mtp_eh_proj-{layer}"))?,
+                l_out: f32s(&format!("l_out-{layer}"))?,
                 logits: f32s("result_output")?,
-                router: f32s(&format!("ffn_moe_logits-{IK_LAYER}"))?,
+                router: f32s(&format!("ffn_moe_logits-{layer}"))?,
                 topk,
                 tokens,
                 pos,
@@ -668,6 +660,31 @@ mod gate {
 
         fn label(&self) -> String {
             format!("block {} {}", self.block, self.graph.as_str())
+        }
+    }
+
+    /// The draft layer's index in a set's node names: the one `N` of its `mtp_eh_proj-N` rows
+    /// ([`IK_LAYER`] on the real file's set, the target's layer count on the fixture's).
+    fn ik_layer(set: &MtpSet) -> Result<usize, GateError> {
+        let mut found: Vec<usize> = Vec::new();
+        for r in &set.rows {
+            let layer = r
+                .name
+                .strip_prefix("mtp_eh_proj-")
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(n) = layer
+                && !found.contains(&n)
+            {
+                found.push(n);
+            }
+        }
+        match found[..] {
+            [n] => Ok(n),
+            _ => Err(format!(
+                "{}: the mtp_eh_proj rows name the draft layers {found:?}, one is wanted",
+                set.dir.display()
+            )
+            .into()),
         }
     }
 
@@ -1293,6 +1310,8 @@ mod gate {
         flips_bad: usize,
         argmax_same: usize,
         l_out_held: usize,
+        /// Held rows whose layer output is past the fixture's band ([`Vs::Fixture`]).
+        l_out_bad: usize,
         heads_held: usize,
         argmax_tie: usize,
         argmax_bad: usize,
@@ -1316,6 +1335,7 @@ mod gate {
                 flips_bad: 0,
                 argmax_same: 0,
                 l_out_held: 0,
+                l_out_bad: 0,
                 heads_held: 0,
                 argmax_tie: 0,
                 argmax_bad: 0,
@@ -1326,19 +1346,49 @@ mod gate {
         }
     }
 
+    /// What a replay compares with ik's output.
+    #[derive(Clone, Copy)]
+    enum Vs {
+        /// Nothing: the node-local pins (n) and (h)'s kernel against our own full head only.
+        Nothing,
+        /// The real set, the oracle clauses: (e), (l) and (h) at [`eh_band`], [`router_band`] and
+        /// [`logits_band`], the argmax ik's or, under the cap, ik's runner-up, the layer's
+        /// output printed.
+        Real,
+        /// The fixture set, (elhfx): the bands counted over the draft file's sites
+        /// ([`fx_bands`]), the argmax a tie band ([`flip::head_tie`]), the layer's output held.
+        Fixture(FxBands),
+    }
+
+    /// The fixture's bands against ik on the draft layer's rows: `eh_proj`, the router's input,
+    /// the layer's output and the logits, as the real clause's PINs count them over the draft
+    /// file's own site types ([`fx_bands`]).
+    #[derive(Clone, Copy)]
+    struct FxBands {
+        eh: f64,
+        router: f64,
+        l_out: f64,
+        logits: f64,
+    }
+
     /// Replay graph `g` in runs of up to [`MTP_ROWS`] rows, the full head,
     /// the taps armed, into `r`. ik's rows are the feed in both tiers (the
     /// fixture copies the vocabulary and the hidden rows are finite inputs);
-    /// `vs_ik` is the oracle clauses: (e), (l) and (h)'s comparison with ik's
-    /// output are made only when it holds, and the node-local pins (n) and
-    /// (h)'s kernel against our own full head are made always.
+    /// `vs` is what the oracle clauses compare: (e), (l) and (h)'s comparison
+    /// with ik's output are made only when it names a set, and the node-local
+    /// pins (n) and (h)'s kernel against our own full head are made always.
     fn replay(
         m: &mut Qwen38Model,
         g: &IkGraph,
         host: &Host<'_>,
         r: &mut Replay,
-        vs_ik: bool,
+        vs: Vs,
     ) -> Result<(), GateError> {
+        let vs_ik = !matches!(vs, Vs::Nothing);
+        let (eh_b, router_b, logits_b) = match vs {
+            Vs::Fixture(b) => (b.eh, b.router, b.logits),
+            Vs::Nothing | Vs::Real => (eh_band(), router_band(), logits_band()),
+        };
         let n = g.tokens.len();
         let vocab = m.body("replay")?.vocab();
         if g.logits.len() != g.out_ids.len() * vocab {
@@ -1374,7 +1424,7 @@ mod gate {
                     0.0
                 };
                 r.eh_worst = r.eh_worst.max(e);
-                if e > eh_band() {
+                if e > eh_b {
                     r.eh_fail += 1;
                     println!("(e) {} row {at}: eh_proj {e:.3e} FAIL", g.label());
                 }
@@ -1386,7 +1436,7 @@ mod gate {
                 if let Some(f) = vs_ik
                     .then(|| {
                         Flip::between(
-                            (IK_LAYER, at),
+                            (g.layer, at),
                             (&ours_ids, ours_v),
                             (ik_ids, ik_v),
                             flip::margin(ik_v, ik_ids),
@@ -1396,8 +1446,8 @@ mod gate {
                 {
                     flipped[t] = true;
                     r.flips += 1;
-                    let cap = flip_cap(router_band(), ik_v);
-                    let gap_cap = margin_cap(router_band(), ik_v);
+                    let cap = flip::flip_cap(router_b, ik_v);
+                    let gap_cap = flip::margin_cap(router_b, ik_v);
                     let ok = f.allowed(cap) && f.pairs.iter().all(|&(_, _, gap, _)| gap <= gap_cap);
                     if !ok {
                         r.flips_bad += 1;
@@ -1413,7 +1463,19 @@ mod gate {
                 pin_row(host, g, at, &taps, t, l_out, &mut r.pins);
                 if vs_ik && !flipped[t] {
                     r.l_out_held += 1;
-                    r.l_out_worst = r.l_out_worst.max(rel(l_out, &g.l_out[span]));
+                    let d = rel(l_out, &g.l_out[span]);
+                    r.l_out_worst = r.l_out_worst.max(d);
+                    let held_band = match vs {
+                        Vs::Fixture(b) => Some(b.l_out),
+                        Vs::Nothing | Vs::Real => None,
+                    };
+                    if let Some(band) = held_band.filter(|&band| d > band) {
+                        r.l_out_bad += 1;
+                        println!(
+                            "(l) {} row {at}: l_out {d:.3e} past its band {band:.3e} FAIL",
+                            g.label()
+                        );
+                    }
                 }
             }
             r.rows += rows;
@@ -1450,7 +1512,7 @@ mod gate {
                 let (top, _) = top2(&ours);
                 let (ik_top, ik_2) = top2(ik);
                 let margin = f64::from(ik[ik_top]) - f64::from(ik[ik_2]);
-                let clears = margin > margin_cap(logits_band(), ik);
+                let clears = margin > flip::margin_cap(logits_b, ik);
                 if flipped[c] {
                     println!(
                         "(h) {} row {o}: argmax {top} ik {ik_top} on a flip, not held",
@@ -1460,22 +1522,31 @@ mod gate {
                 }
                 r.heads_held += 1;
                 r.logits_worst = r.logits_worst.max(rel(&ours, ik));
-                let cap = margin_cap(logits_band(), ik);
+                let cap = flip::margin_cap(logits_b, ik);
                 if r.margin_min
                     .as_ref()
                     .is_none_or(|(_, q, _)| margin / cap < *q)
                 {
                     r.margin_min = Some((margin, margin / cap, format!("{} row {o}", g.label())));
                 }
+                let tie = match vs {
+                    Vs::Fixture(_) => flip::head_tie(ik, top as u32, logits_b),
+                    Vs::Nothing | Vs::Real => !clears && top == ik_2,
+                };
                 if top == ik_top {
                     r.argmax_same += 1;
-                } else if !clears && top == ik_2 {
+                } else if tie {
                     r.argmax_tie += 1;
+                    let (shown, why) = match vs {
+                        Vs::Fixture(_) => {
+                            (flip::head_cap(logits_b, ik), "within the head's tie cap")
+                        }
+                        Vs::Nothing | Vs::Real => (cap, "ik's runner-up"),
+                    };
                     println!(
                         "(h) {} row {o}: argmax {top}, ik's {ik_top} by {margin:.3e} under the cap \
-                         {:.3e}: ik's runner-up, a tie",
-                        g.label(),
-                        margin_cap(logits_band(), ik)
+                         {shown:.3e}: {why}, a tie",
+                        g.label()
                     );
                 } else {
                     r.argmax_bad += 1;
@@ -1483,7 +1554,7 @@ mod gate {
                         "(h) {} row {o}: argmax {top}, ik's {ik_top} (runner-up {ik_2}) by \
                          {margin:.3e}, cap {:.3e} FAIL",
                         g.label(),
-                        margin_cap(logits_band(), ik)
+                        flip::margin_cap(logits_b, ik)
                     );
                 }
             }
@@ -1555,6 +1626,242 @@ mod gate {
             all &= ok;
         }
         Ok(all)
+    }
+
+    /// The word a fixture clause prints for its outcome where it holds the rows off every flip:
+    /// `unexercised` when none was (which rows a flip leaves off its path moves with the engine's
+    /// rounding, so none is neither a pass nor a fail), else [`verdict`].
+    fn outcome(ok: bool, held: usize) -> &'static str {
+        if ok && held == 0 {
+            "unexercised"
+        } else {
+            verdict(ok)
+        }
+    }
+
+    /// The fixture-oracle clauses a run declares, held by `tier::expect_fixture_oracle` at the
+    /// gate's end in both tiers: (tfx)'s shift pairing ([`pairing_fx`]) and (elhfx) ([`elh_fx`]).
+    const FX_ORACLE: usize = 2;
+
+    /// The fixture's bands against ik on the draft layer's rows ([`FxBands`]), counted as the
+    /// real clause's PINs count them ([`eh_band`], [`router_band`], [`logits_band`]: one term a
+    /// site, an expert stack's gate and up as one) over the sites the files' types name. A site's
+    /// term is `site_rel(ty, Arm::Gemv).joint()`: the draft walk reads each projection's input as
+    /// f32 rows (the gemvs and `q8_0_gemv_sel_f32`) and ik quantizes it to the weight type's
+    /// activation form, at the worst crest ([`site_rel`]); a stack's gate and up and the attention's
+    /// q, k and v are one term each, the worst of the two or three; the terms add in quadrature.
+    /// The router's input reads `eh_proj`, the attention's input and its output projection; the
+    /// layer's output beside them the routed and the shared expert's gate·up and down; the
+    /// logits beside those the head (`output`, the target's). Printed beside the real clause's.
+    fn fx_bands(target: &Split, draft: &Split) -> Result<FxBands, GateError> {
+        let site = |file: &Split, tensor: &str| -> Result<f64, GateError> {
+            let ty = file
+                .find(tensor)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| format!("fx bands: {tensor} is not in the file"))?;
+            let rel = site_rel(ty, Arm::Gemv).ok_or_else(|| {
+                format!(
+                    "fx bands: {tensor} is {ty:?}, which no launch reads as the gemv \
+                     (act_rule::site_rel)"
+                )
+            })?;
+            Ok(rel.joint())
+        };
+        let named = |stem: &str| format!("blk.{}.{stem}.weight", draft_layer());
+        let worst = |stems: &[&str]| -> Result<f64, GateError> {
+            let mut w = 0.0f64;
+            for stem in stems {
+                w = w.max(site(draft, &named(stem))?);
+            }
+            Ok(w)
+        };
+        let eh = site(draft, &named("nextn.eh_proj"))?;
+        let attn_in = worst(&["attn_q", "attn_k", "attn_v"])?;
+        let attn_out = site(draft, &named("attn_output"))?;
+        let routed_gate_up = worst(&["ffn_gate_exps", "ffn_up_exps"])?;
+        let routed_down = site(draft, &named("ffn_down_exps"))?;
+        let shared_gate_up = worst(&["ffn_gate_shexp", "ffn_up_shexp"])?;
+        let shared_down = site(draft, &named("ffn_down_shexp"))?;
+        let head = site(target, "output.weight")?;
+        let quadrature = |terms: &[f64]| terms.iter().map(|q| q * q).sum::<f64>().sqrt();
+        let router = quadrature(&[eh, attn_in, attn_out]);
+        let l_out = quadrature(&[
+            eh,
+            attn_in,
+            attn_out,
+            routed_gate_up,
+            routed_down,
+            shared_gate_up,
+            shared_down,
+        ]);
+        let logits = quadrature(&[l_out, head]);
+        println!(
+            "fx bands: eh {eh:.4e} router {router:.4e} l_out {l_out:.4e} logits {logits:.4e} from \
+             the terms eh_proj {eh:.3e}, attention in {attn_in:.3e} and out {attn_out:.3e}, routed \
+             gate·up {routed_gate_up:.3e} and down {routed_down:.3e}, shared gate·up \
+             {shared_gate_up:.3e} and down {shared_down:.3e}, head {head:.3e}; the real clause's \
+             PINs eh {:.4e} router {:.4e} logits {:.4e}",
+            eh_band(),
+            router_band(),
+            logits_band()
+        );
+        Ok(FxBands {
+            eh,
+            router,
+            l_out,
+            logits,
+        })
+    }
+
+    /// (elhfx): every graph of ik's MTP set dumped on the fixture, replayed teacher-forced on
+    /// ik's own inputs (the fixture set's tokens, positions and hidden rows) as the real set is:
+    /// (e) `eh_proj` within [`FxBands::eh`] of ik's, a row at a time; (l) each row's routed set
+    /// ik's, but where it is not, allowed only under the pair cap and margin bound at
+    /// [`FxBands::router`]; the layer's output of each row off a flip within [`FxBands::l_out`];
+    /// (h) each row's argmax ik's or within the head's tie cap of ik's top at
+    /// [`FxBands::logits`] ([`flip::head_tie`]); the node-local pins (n) and the draft's token
+    /// against our full head's argmax on the same rows. Where every row of (l) or (h) lies on a
+    /// flip no row is held: the clause holds what it can and prints `unexercised` in place of its
+    /// verdict ([`outcome`]).
+    fn elh_fx(
+        m: &mut Qwen38Model,
+        host: &Host<'_>,
+        (target, draft): (&Split, &Split),
+    ) -> Result<bool, GateError> {
+        const CLAUSE: &str = "(elhfx) every graph of ik's fixture set replayed: eh_proj, routes, \
+                              l_out and the argmax against ik's";
+        if !tier::run_clause(CLAUSE, Tag::FixtureOracle)? {
+            return Ok(true);
+        }
+        let dir = tier::fixture_set(CLAUSE, &fixture::MTP, fixture::MTP_SET)?;
+        let set = MtpSet::open(&dir, &fixture::MTP)?;
+        let bands = fx_bands(target, draft)?;
+        let layer = ik_layer(&set)?;
+        let mut r = Replay::new();
+        for (b, g) in graphs_of(&set) {
+            let ig = IkGraph::read(&set, b, g, layer)?;
+            replay(m, &ig, host, &mut r, Vs::Fixture(bands))?;
+        }
+        let e_ok = r.eh_fail == 0 && r.rows > 0;
+        println!(
+            "(elhfx e) {} rows: eh_proj worst {:.3e} (band {:.3e}, {:.3} of it), {} past {}",
+            r.rows,
+            r.eh_worst,
+            bands.eh,
+            r.eh_worst / bands.eh,
+            r.eh_fail,
+            verdict(e_ok)
+        );
+        let l_ok = r.flips_bad == 0 && r.l_out_bad == 0;
+        if r.l_out_held == 0 {
+            println!(
+                "(elhfx l) unexercised past the flips (l_out held 0 of {} rows)",
+                r.rows
+            );
+        }
+        println!(
+            "(elhfx l) {} rows, {} on flips, {} flips not allowed; l_out's distance from ik's on \
+             the {} rows held, worst {:.3e} (band {:.3e}, {:.3} of it), {} past it {}",
+            r.rows,
+            r.flips,
+            r.flips_bad,
+            r.l_out_held,
+            r.l_out_worst,
+            bands.l_out,
+            r.l_out_worst / bands.l_out,
+            r.l_out_bad,
+            outcome(l_ok, r.l_out_held)
+        );
+        let h_ok = r.argmax_bad == 0 && r.kernel_bad == 0;
+        if r.heads_held == 0 {
+            println!(
+                "(elhfx h) unexercised past the flips (heads held 0 of {} head rows)",
+                r.heads
+            );
+        }
+        println!(
+            "(elhfx h) {} head rows, {} held: argmax = ik's {}, ties {}, wrong {}; the draft's \
+             token = our argmax but {}; the logits' distance from ik's {:.3e} (printed, band \
+             {:.3e}) {}",
+            r.heads,
+            r.heads_held,
+            r.argmax_same,
+            r.argmax_tie,
+            r.argmax_bad,
+            r.kernel_bad,
+            r.logits_worst,
+            bands.logits,
+            outcome(h_ok, r.heads_held)
+        );
+        let mut n_ok = true;
+        for p in r.pins.all() {
+            println!("(elhfx n) {}", p.line());
+            n_ok &= p.ok();
+        }
+        Ok(e_ok && l_ok && h_ok && n_ok)
+    }
+
+    /// (tfx): the target's streams after the prompt against the hidden rows of ik's fixture MTP
+    /// set's warmup graph: ours at `q` lies closest to ik's at `q + 1` — ik's row `p` reads the
+    /// target's hidden of `p − 1`, and the fixture's rows at other positions are near orthogonal —
+    /// closer than at `q` and at `q + 2`. The distance itself is printed: a free walk of the
+    /// prompt's last rows sits on a flip's path, which no band covers. `ours` are the last
+    /// `rows` positions' streams from `first` on.
+    fn pairing_fx(
+        ours: &[f32],
+        (rows, first): (usize, usize),
+        prompt: &[u32],
+    ) -> Result<bool, GateError> {
+        const CLAUSE: &str = "(tfx) the target's streams after the prompt against ik's fixture MTP \
+                              hidden rows, shifted by one";
+        if !tier::run_clause(CLAUSE, Tag::FixtureOracle)? {
+            return Ok(true);
+        }
+        let dir = tier::fixture_set(CLAUSE, &fixture::MTP, fixture::MTP_SET)?;
+        let set = MtpSet::open(&dir, &fixture::MTP)?;
+        if set.tokens.as_deref() != Some(prompt) {
+            return Err(format!(
+                "{}: its tokens are not the prompt the target ran ({} ids)",
+                dir.display(),
+                prompt.len()
+            )
+            .into());
+        }
+        let (block, graph) = graphs_of(&set)
+            .into_iter()
+            .find(|&(_, g)| g == Graph::Warmup)
+            .ok_or_else(|| format!("{}: the set has no warmup graph", dir.display()))?;
+        let warm = IkGraph::read(&set, block, graph, ik_layer(&set)?)?;
+        let at = |pos: usize| warm.pos.iter().position(|&p| p as usize == pos);
+        let mut by_shift = [f64::INFINITY; 3];
+        for (s, slot) in by_shift.iter_mut().enumerate() {
+            let mut worst = 0.0f64;
+            let mut pairs = 0;
+            for t in 0..rows {
+                if let Some(r) = at(first + t + s) {
+                    worst = worst.max(rel(
+                        &ours[t * WIDE..(t + 1) * WIDE],
+                        &warm.states[r * WIDE..(r + 1) * WIDE],
+                    ));
+                    pairs += 1;
+                }
+            }
+            println!(
+                "(tfx) the target's streams at q against ik's fixture MTP hidden at q + {s}: \
+                 {pairs} rows, worst {worst:.3e}"
+            );
+            if pairs > 0 {
+                *slot = worst;
+            }
+        }
+        let ok = by_shift[1] < by_shift[0] && by_shift[1] < by_shift[2];
+        println!(
+            "(tfx) ik's fixture row p reads the target's hidden of p − 1: the shift 1 reads closer \
+             than 0 and 2 (worst {:.3e} at 1, printed); a flip's path lies under the last rows {}",
+            by_shift[1],
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// (t): the target's streams after the prompt against ik's warmup hidden
@@ -1642,7 +1949,8 @@ mod gate {
             host.err().map_or(String::new(), |e| format!(" ({e})")),
             place.err().map_or(String::new(), |e| format!(" ({e})")),
         );
-        Ok(shift_ok && same)
+        let fx_ok = pairing_fx(&ours, (rows, first), prompt)?;
+        Ok(shift_ok && same && fx_ok)
     }
 
     /// (g): captured walks against eager ones.
@@ -4296,13 +4604,17 @@ mod gate {
         let mut last = None;
         let mut warm = None;
         tier::sc("(n) the node-local pins and (h)'s kernel on every replayed row")?;
+        // The fixture set's replay comes first: the real set's, which every later clause starts from,
+        // then rewrites every row of the draft's store.
+        ok &= elh_fx(&mut m, &host, (&head_file, &draft))?;
         let vs_ik = tier::run_clause(
             "(e)(l)(h) every graph of ik's set replayed: eh_proj, routes, l_out and the argmax against ik's",
             Tag::Oracle,
         )?;
+        let vs = if vs_ik { Vs::Real } else { Vs::Nothing };
         for &(b, g) in &order {
-            let ig = IkGraph::read(&set, b, g)?;
-            replay(&mut m, &ig, &host, &mut r, vs_ik)?;
+            let ig = IkGraph::read(&set, b, g, IK_LAYER)?;
+            replay(&mut m, &ig, &host, &mut r, vs)?;
             if g == Graph::Warmup {
                 warm = Some(ig);
             } else {
@@ -4419,10 +4731,8 @@ mod gate {
         let deep = deep_prompt()?;
         tier::sc("(y)(z) two drafted sequences resident: interleaved and as one pass")?;
         ok &= slots_windows(&inputs, &mtp, ub, &prompt, &deep[1000..])?;
-        let (ran, deferred) = tier::tally();
-        println!(
-            "clauses: {ran} ran, {deferred} left to the real tier (deferred(real) lines above)"
-        );
+        println!("{}", tier::tally_line());
+        tier::expect_fixture_oracle("gate_qwen4exp_mtp", FX_ORACLE)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }
