@@ -51,7 +51,9 @@
 //! (`place::serve_ctx`: YaRN scaling past it is not built), then one whose
 //! N-slot plan the card cannot hold beside the plan's dense weights — the
 //! largest slot context any N-slot plan of the file and the placement takes
-//! up to that cap ([`fit38`]) — is refused by name before the load. The
+//! up to that cap ([`fit38`]) — is refused by name before the load; a set
+//! context keeps the MTP draft, so that refusal names the draft's card bytes
+//! and the context a slot holds without it. The
 //! `load` line prints the stores' `ctx` (a slot's rows) with the slot count
 //! and each slot's context, the cap as `ctx_max`, `ctx_train` and
 //! `verified`, the deepest context the reference sets hold our numbers to
@@ -806,18 +808,40 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
             }),
             Err(refused) => {
                 let fit = fit38(plans)?;
-                if ctx > fit.ctx {
-                    Err(format!(
-                        "--ctx-size {c}: with --parallel {n} each slot takes {ctx} positions and \
-                         the card holds at most {} a slot beside the plan's dense weights \
-                         (`--place {}`)",
-                        fit.ctx,
-                        plans.place.name()
-                    )
-                    .into())
-                } else {
-                    Err(refused)
+                if ctx <= fit.ctx {
+                    return Err(refused);
                 }
+                let head = format!(
+                    "--ctx-size {c}: with --parallel {n} each slot takes {ctx} positions and the \
+                     card holds at most {} a slot beside the plan's dense weights",
+                    fit.ctx
+                );
+                let place = plans.place.name();
+                // A set context keeps the MTP draft (the unset one yields to
+                // the context): the refusal names it, and what a slot holds
+                // without it.
+                let Some(m) = plans.mtp else {
+                    return Err(format!("{head} (`--place {place}`)").into());
+                };
+                let bytes = m.card_bytes_of(u64::try_from(ctx)?, n)?;
+                let without = fit38(&Plans {
+                    mtp: None,
+                    ..*plans
+                })?
+                .ctx;
+                let tail = if ctx <= without {
+                    format!(
+                        "; without the draft a slot holds {without}: set BLOOMERY_DRAFT=off to serve \
+                         {ctx} a slot, or leave --ctx-size unset (the unset context turns the draft \
+                         off when it costs positions)"
+                    )
+                } else {
+                    format!(", and {without} without the draft")
+                };
+                Err(
+                    format!("{head} and the MTP draft's {bytes} B (`--place {place}`){tail}")
+                        .into(),
+                )
             }
         };
     }
