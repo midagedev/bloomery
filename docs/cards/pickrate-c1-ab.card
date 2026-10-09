@@ -1,0 +1,44 @@
+# pickrate C1 (worker2, 2026-10-09): the landing A/B, the C1 build against the BASE build (the train-2 tip, which
+# carries pickrule), Qwen3.8 at the defaults. Run only after c1.card's functional pair read inside its band.
+#
+# Decomposition [derived], specs/worker2/pickrate-impl/c1_band.py over pickrule's Q0 records (draft off):
+# - pp4096: the shadow term's card-over-host slack is 116.9 ms over 48 layers (46 card-bound); 4 lane threads at the
+#   DMA path take all of it, -116.9 ms of 2,439.2, +5.0 %; at the DRAM-burst rate -101..-115 ms, +4.3..+4.9 %. The
+#   walk is unchanged, so the admits and the bits are the base's.
+# - The A/B runs at the defaults (the MTP draft on): Q1's draft-on calls admitted 3,660..3,688 against Q0's 3,403, so
+#   the copies grow ~8 % a layer while the union loses those admits' columns; the slack grows and the top of the band
+#   with it. Not re-derived from records (Q1 ran without BLOOMERY_STEP_STATS): predict +4..+6.
+# - pp512 (read beside, a no-loss condition): 10 of 48 layers card-bound, slack 5.9 ms of 483.4, +1.2 % at most; the
+#   max model over-counts 512's walk by 39 ms (517.2 against 477.9), so the read is beside, not judged.
+# - Decode: a window-opened job stages inside the receive lock, one at a time, as today; the decode noninf A/B is its
+#   own card.
+#
+# Runner (the C1 tree on the box, a BASE build as the base; the full output to a file first):
+#   BLOOMERY_REMOTE='~/repo/bloomery-pickrate' BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=6
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pickrate-c1-ab.card BLOOMERY_GEN_CTX=4352 BLOOMERY_AB_LOAD=arm'
+#   just depth-gpu-qwen4exp
+#     bin:/root/repo/bloomery-pickrule/target/release/generate_qwen3moe:prose:512
+#     bin:/root/repo/bloomery-pickrule/target/release/generate_qwen3moe:prose:4096
+#     prose:512 prose:4096
+# The BASE build is the pickrule worktree's, detached at b3a73bfd (remote ~/repo/bloomery-pickrule).
+# Wall [derived]: the BASE build 3..6 min beside nothing; 4 arms x 6 rounds of a fresh Qwen3.8 load (~40 s each,
+# Q1's 6m29s for 4 rounds) plus the preheat and the witness blocks, 10..13 min.
+kind: ab
+question: do 4 lane threads for the residency machine's staging make a 4,096-token Qwen3.8 prompt faster than the
+  one staging thread on the A6000 at the defaults, with the 512-token prompt no slower?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, plan a, UD-Q4_K_XL, the MTP draft at its default (on), levers unset,
+  one stream, the C1 build against the BASE build, same lease, every arm a fresh load (BLOOMERY_AB_LOAD=arm), rounds
+  rotated: (C1 - BASE) / BASE
+unit: %
+predict: +4..+6
+rounds: 6
+condition: one runner invocation from the C1 tree; both builds' load lines read plan a with the same card experts a
+  layer and the same xstream_lane_gbs band (19.0..21.4); no FAIL row, no [cold], [cpu-busy] or [other-busy] row
+  among the counted rounds; the pp512 pair's ratio (C1 / BASE, tok/s) at or above 0.99, read beside the term; the
+  full output to a file first
+decide-in: C1 rides the next train; open step 2 (the walk's beside rate from the machine's measured copier)
+decide-below: under +4 %: one functional BLOOMERY_STEP_STATS=1 pair at the defaults reads each layer's
+  card_shadow - staged_us and the copier's wall rate; C1 stays off the train until that read names the term that
+  missed
+decide-above: past +6 %: check both arms' plan and draft lines and the admits (the walk must not have moved) before
+  the row is written

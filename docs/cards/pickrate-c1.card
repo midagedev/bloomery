@@ -1,0 +1,54 @@
+# pickrate C1 (worker2, 2026-10-09): the residency machine's staging on N = 4 lane threads against the one
+# swap-staging thread, at pickrule's admits, the walk unchanged (its constants read the XStream lane's probe, not the
+# machine's copier, so the same counts give the same admits and bytes in both builds).
+#
+# Decomposition [derived] from pickrule's Q0 records (specs/worker2/pickrule-q0/q0.log: generate_qwen3moe at 516580c0,
+# A6000, plan a, UD-Q4_K_XL, draft off, BLOOMERY_STEP_STATS=1, prose:4096 first after the load; the reader is
+# specs/worker2/pickrate-impl/c1_band.py):
+# - The pick: 3,403 admits, 10,664 MB over 48 layers. The walk's backlog bound covers 3,383 of the jobs, so nearly
+#   every copy stages beside the host union: one thread, 13.52 GB/s wall (bytes / staged_us), 13.79 busy
+#   (residency pass stage_us 773,444).
+# - A layer's shadow term is max(card chain, host chain): the card chain is card_shadow (the copies, then a 4.8 ms
+#   median tail), the host chain 0.25 + pick + issue + serve. Their sum over the layers plus front, down, upload and
+#   back is 2,412.5 ms against walk_ms 2,405.1. 46 of 48 layers are card-bound; sum(card - host)+ = 116.9 ms, the
+#   ceiling of any copier change at these admits: pp4096 ratio 1.050.
+# - The rate 4 threads reach beside the union is the one term derivation cannot fix. One thread alone stages at
+#   24.7 GB/s (the reset's copy_back of the same 3,403 experts, 431 ms, nothing beside it), so the beside-union loss
+#   (24.7 -> 13.8) is not the union's DRAM bursts alone (burst share s 0.21 median would leave 19.5). Per-thread (SMT,
+#   the staging thread on worker 0's sibling): 4 threads reach the DMA path, 20.4..22 GB/s, -116.9 ms. DRAM-burst
+#   bound: r' = DMA x (1 - s), 16.1..17.4 at the median, -101..-115 ms. A shared resource (DRAM contention past the
+#   bursts): r' stays 13.5, 0 ms.
+# - Ring: RING_SLOTS stays 4. A slot's cycle is its staging (3.135 MB at a thread's rate) plus its copy (0.153 ms at
+#   20.5 GB/s); 4 slots pass 4 / cycle experts a ms, at or above the DMA path while a thread stages at >= 6.8 GB/s.
+#
+# Resource timeline per 4096 layer [derived]: after the front, the card shadow ~21.3 ms (copies 16.4 at 13.5, tail
+# 4.8) against the host chain ~18.8 (pick 0.9, serve 17.7); the staging thread is the card chain's own resource, the
+# DMA path (>= 20.5 GB/s, the load probe 20.41) runs at ~66 % duty, host DRAM ~76 GB/s average (union weights 34.5,
+# memcpy read + write 27.6, DMA read 13.8) under its 147.7 GB/s read ceiling, NVMe 0.
+#
+# Wall [derived]: the BASE and the C1 generate_qwen3moe builds side by side, 3..6 min each; two fresh Qwen3.8 loads
+# (~28 s each) and one 4096 prompt each through tools/gpu-gate.sh on the A6000, functional, no lease: ~10 min.
+kind: profile
+question: do 4 lane threads raise the Qwen3.8 prompt pick's copy rate beside the host union to the DMA path, to the
+  DRAM-burst band, or not at all?
+term: the C1 build's copier wall rate beside the union, sum of the 48 picks' bytes over the sum of their staged_us
+  (`call stream group=0 layer=L` records), GB/s; generate_qwen3moe, the first prompt after a load, prose:4096,
+  ctx 4352, A6000, --place a, UD-Q4_K_XL, BLOOMERY_DRAFT=off, BLOOMERY_STEP_STATS=1, levers otherwise unset
+unit: GB/s
+predict: 16.1..22
+condition: the BASE build and the C1 build run back to back in one window through tools/gpu-gate.sh
+  generate_qwen3moe --place a on the A6000; the two runs' `call stream end` lines read equal admitted= and bytes= to
+  each other, else the plan differs between the builds and the pair is rerun once, then reported; where they differ
+  from Q0's (3,403 and 10,664,038,400), the band is re-derived from the BASE run's own records with c1_band.py before
+  the term is read; the BASE run's own rate reads 13.0..14.0 (Q0's 13.52) or the re-derived band says why; no other
+  compute process on the A6000 in either run; the shadow-term sum max(card_shadow, 0.25 + pick + issue + serve) is
+  read beside the term for both builds
+decide-in: the copier gains: land C1 after the same-lease pp4096 A/B (c1-ab.card) and a decode noninf A/B; open step 2
+  (the walk's beside rate from the machine's measured copier) as the next round
+decide-below: under the DRAM band: at 13.0..14.0 the loss is a shared resource and 4 threads buy nothing — do not
+  land C1 for speed; open the walk's beside-rate correction on one thread instead (the walk prices the copies at
+  20.41 x (1 - s), 16.1 at the median, against the 13.5 they get; at the true rate it admits fewer and the balance
+  takes back ~0.65 of the 116.9 ms slack, ~-76 ms [derived, rough: the 125 us net union marginal a 4096 admit, the
+  copy 0.232 ms]); between 14.0 and 16.1, re-derive the A/B band at the measured rate first
+decide-above: past the DMA path: the load probe's 20.41 under-reads the path; re-measure it (nvread's drive probe
+  or a lane probe at 4 threads) before the A/B band is written
