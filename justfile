@@ -598,6 +598,17 @@ dump-ref-glm5next *VARIANT:
 dump-ref-glm5next-cuda:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next-cuda && NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# ik's node dump of a family's fixture file (glm5next, qwen4exp, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
+# (refset's fixture families): the same dumper and profile as the family's real recipe, the fixture first shard as the model,
+# the fixture file's `# fixture` line in the header (refset-check --fixture-line), and in the long variants (d1k, d3k, d3kdsa,
+# d16kdsa) ik's routes for the prefill's positions (dump_ref --prefill-routes). No VARIANT is the batch set; a VARIANT is the
+# real recipe's (step4, step4-every-node, d1k, d3k, d3kdsa, d16kdsa; deepseek41: step4-every-node, d1n-every-node,
+# d1-every-node, d2-every-node). BLOOMERY_TIER=fixture is required (in the real tier: exit 64; the real sets have their own
+# recipes). Under the CPU lease and a card (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/fxoracle-dump.card'); DUMP_DRY=1 in
+# that variable prints the dump and stops before the lease.
+dump-ref-fixture FAMILY *VARIANT:
+    BLOOMERY_MODEL={{FAMILY}} ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = fixture ] || { echo "dump-ref-fixture: this recipe needs BLOOMERY_TIER=fixture, got ${BLOOMERY_TIER:-real}; it dumps the fixture files, and the real sets have their own recipes (exit 64)" >&2; exit 64; } && bash tools/ref/dump.sh {{VARIANT}}'
+
 # The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
 # carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
 # clean); `cmake --build` of its libllama and libcommon first (nothing to do when current). Under the CPU lease:
@@ -619,6 +630,15 @@ dump-ref-mtp-glm5next:
 # `# complete` trailer.
 dump-ref-mtp-qwen4exp:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/dump-mtp.sh'
+
+# The MTP draft oracle of a family's fixture file (glm5next, qwen4exp), into $BLOOMERY_DATA/ref-mtp/fx_<the real twin's set>:
+# dump-mtp.sh with the fixture first shard as the target, the fixture file's `# fixture` line in the header and, for qwen4exp, the
+# draft file beside the fixture target (GLM's draft is the target itself). Needs dump_mtp built from this tree
+# (`just build-ref-dump-mtp`). BLOOMERY_TIER=fixture is required (in the real tier: exit 64; `just dump-ref-mtp-glm5next` and
+# `dump-ref-mtp-qwen4exp` are the real sets'). Under the CPU lease and a card, as every dump; DUMP_DRY=1 in BLOOMERY_BOX_ENV
+# prints the dump and stops before the lease.
+dump-ref-mtp-fixture FAMILY:
+    BLOOMERY_MODEL={{FAMILY}} ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = fixture ] || { echo "dump-ref-mtp-fixture: this recipe needs BLOOMERY_TIER=fixture, got ${BLOOMERY_TIER:-real}; it dumps the fixture files, and the real sets have their own recipes (exit 64)" >&2; exit 64; } && bash tools/ref/dump-mtp.sh'
 
 # Qwen3.8-Flash-Next(qwen4exp) 오라클: 같은 덤프 도구를 qwen4exp 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_qwen4exp/에 뜬다. VARIANT(step4, d1k, d3k와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을

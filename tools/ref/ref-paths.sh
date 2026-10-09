@@ -154,3 +154,50 @@ if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
 print(budget)
 PY
 }
+
+# fixture_dump_tier <script>: what a dump script (dump.sh, dump-mtp.sh) takes of the tier, before it names a set. Sets
+# SET_PREFIX: `fx_` under the fixture tier, where a set is the fixture file's and carries its real twin's name behind that
+# prefix (the fixture families of crates/refset name them), and nothing in the real tier. In the fixture tier it refuses, by
+# name: a family whose real file stands (no fixture file, 66), and a model that is not the fixture first shard (64) — a caller's
+# own BLOOMERY_REF_MODEL wins over the fixture in ref-paths.sh above, and an `fx_` set of another file would be a wrong answer
+# under a right name. The model string is the one refset's `fixture::first_shard` returns, so the dumper's `# model` line is
+# the string the fixture family checks.
+fixture_dump_tier() {
+  SET_PREFIX=
+  [ "${BLOOMERY_TIER:-real}" = fixture ] || return 0
+  if [ -z "$FIXTURE_FILE" ]; then
+    echo "$1: BLOOMERY_TIER=fixture, but the $MODEL_NAME profile's real file stands in the fixture tier (it has no fixture file of its own), so there is no fixture set to dump; run it in the real tier (exit 66)" >&2
+    exit 66
+  fi
+  if [ "$MODEL" != "$FIXTURE_FILE" ]; then
+    echo "$1: BLOOMERY_TIER=fixture, but the model is $MODEL, not the fixture $FIXTURE_FILE (a BLOOMERY_REF_MODEL of the caller's?): an fx_ set is the fixture file's, never another file's (exit 64)" >&2
+    exit 64
+  fi
+  SET_PREFIX=fx_
+}
+
+# fixture_line <script>: the `# fixture` header line of the fixture file, on stdout; nothing in the real tier. It is what
+# `refset-check --fixture-line` prints (crates/refset/src/bin/refset_check.rs), the one owner of the line, and the dumpers write
+# it verbatim beside `# model`. The binary is built the way `just refset-check` builds it; cargo is the staleness rule, so a
+# binary older than its sources is rebuilt here, never run.
+fixture_line() {
+  [ "${BLOOMERY_TIER:-real}" = fixture ] || return 0
+  local root line
+  root=$(cd "$REF_PATHS_DIR/../.." && pwd)
+  (cd "$root" && cargo build --release -p bloomery-refset --bin refset-check >&2) || {
+    echo "$1: cargo build of refset-check failed (exit 65)" >&2
+    exit 65
+  }
+  line=$("$root/target/release/refset-check" --fixture-line "$FIXTURE_FILE") || {
+    echo "$1: refset-check --fixture-line refused $FIXTURE_FILE (exit 65)" >&2
+    exit 65
+  }
+  case $line in
+    "# fixture"$'\t'?*) ;;
+    *) echo "$1: refset-check --fixture-line printed '$line', not a '# fixture<TAB>key=value ...' line (exit 65)" >&2; exit 65 ;;
+  esac
+  case $line in
+    *$'\n'*) echo "$1: refset-check --fixture-line printed more than one line (exit 65)" >&2; exit 65 ;;
+  esac
+  printf '%s\n' "$line"
+}
