@@ -74,7 +74,7 @@ use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::swap::Park;
-use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
+use crate::worker::{self, Acted, Action, Msg, Shared, Submit, Waited};
 
 /// Anthropic's Messages API, a child of this module so it runs the chat path's
 /// own steps.
@@ -364,8 +364,9 @@ impl Server {
     /// one thread each and at most [`MAX_CONNECTIONS`] at once, until the
     /// listener fails; returns the server's state and what ends it. The
     /// engine thread owns the engine from here and runs detached (its handle
-    /// dropped): an orderly stop waits for the loop it leaves
-    /// ([`Shared::wait_loop_end`]), never for the thread's end.
+    /// dropped): an orderly stop waits for the loop it leaves and then for
+    /// every answer a connection is writing ([`Shared::wait_stop`]), never
+    /// for the thread's end.
     fn start(self) -> io::Result<(Arc<State>, mpsc::Receiver<End>)> {
         let Server {
             listener,
@@ -382,7 +383,10 @@ impl Server {
             })?;
         let conn_state = Arc::clone(&state);
         accept(listener, state.shared.end.clone(), move |stream| {
-            keep_alive(stream, |req, w| route(&conn_state, req, w));
+            keep_alive(stream, |req, w| {
+                let _answering = conn_state.shared.answering();
+                route(&conn_state, req, w)
+            });
         });
         Ok((state, ended))
     }
@@ -689,16 +693,19 @@ pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
 
 // ---------------------------------------------------------------- orderly stop
 
-/// How long an orderly stop waits for the engine thread to leave its loop
-/// ([`Shared::wait_loop_end`]). The worker checks the stop only between its
-/// rounds, so the wait covers the round it is in when the stop arrives, plus
-/// the booking of the requests the stop ends. A decode step sits far under
-/// the bound; a prompt call has none of its own, so a long one can outlast
-/// it, and the process then exits with the engine thread still inside the
-/// call, its stop line saying so. The engine's Drop after the loop is not
-/// waited for: freeing a host tier's pinned pages and joining its threads
-/// can outlast the bound, and the process exit reclaims the engine's memory
-/// anyway.
+/// How long an orderly stop waits, in all, for the engine thread to leave its
+/// loop and then for every answer in flight to be written
+/// ([`Shared::wait_stop`]). The worker reads the stop before each action,
+/// start, planned prompt call and decode round of its rounds (at each round's
+/// top when its slots take turns), so the wait covers the one it is in when
+/// the stop arrives, then the halted requests' booking and their last
+/// messages written. A decode step sits far under the bound; a prompt run as
+/// one engine call has none of its own, so a long one can outlast it, and
+/// the process then exits with the engine thread still inside the call, its
+/// stop line saying so, as it says when answers were still being written.
+/// The engine's Drop after the loop is not waited for: freeing a host tier's
+/// pinned pages and joining its threads can outlast the bound, and the
+/// process exit reclaims the engine's memory anyway.
 const ENGINE_STOP: Duration = Duration::from_secs(5);
 
 /// The signal handlers' whole state, the only things a handler touches: the
@@ -804,26 +811,32 @@ extern "C" fn on_signal(sig: libc::c_int) {
     unsafe { libc::write(s.w, &byte as *const u8 as *const libc::c_void, 1) };
 }
 
-/// The orderly stop's last act, the one owner of the process's exit: one
-/// stderr line naming the cause — and whether the engine thread left its
-/// loop, when there is one to wait for — then success. Called from `run`,
-/// after the stop's initiator already refused new work and told the engine
-/// thread to end, so no seat's `Ok(server.run())` return is reached by it.
-/// The engine's Drop is left to run beside the exit: the wait ends at the
-/// loop ([`Shared::wait_loop_end`]), not at the thread's end.
+/// The orderly stop's last act, the one owner of the process's exit: when
+/// there is an engine thread, the wait for it to leave its loop and for the
+/// answers in flight to be written ([`Shared::wait_stop`]); then one stderr
+/// line ([`stop_line`]) and success. Called from `run`, after the stop's
+/// initiator already refused new work and told the engine thread to end, so
+/// no seat's `Ok(server.run())` return is reached by it. The engine's Drop is
+/// left to run beside the exit: the wait ends at the loop and the answers,
+/// not at the thread's end.
 pub(crate) fn exit_shutdown(cause: &Stop, shared: Option<&Shared>) -> ! {
-    let ended = shared.map(|sh| sh.wait_loop_end(ENGINE_STOP));
-    let tail = match ended {
-        Some(false) => {
-            format!(
-                "; the engine thread did not end within {} s",
-                ENGINE_STOP.as_secs()
-            )
-        }
-        _ => String::new(),
-    };
-    eprintln!("bloomery-serve: shutdown ({cause}){tail}");
+    let waited = shared.map(|sh| sh.wait_stop(ENGINE_STOP));
+    eprintln!("{}", stop_line(cause, waited));
     std::process::exit(0)
+}
+
+/// The stop's stderr line: its cause, and what the wait left undone when
+/// [`ENGINE_STOP`] ran out first.
+pub(crate) fn stop_line(cause: &Stop, waited: Option<Waited>) -> String {
+    let s = ENGINE_STOP.as_secs();
+    let tail = match waited {
+        Some(Waited::Loop) => format!("; the engine thread did not end within {s} s"),
+        Some(Waited::Answers(n)) => {
+            format!("; {n} answer(s) were still being written at the {s} s bound")
+        }
+        Some(Waited::Done) | None => String::new(),
+    };
+    format!("bloomery-serve: shutdown ({cause}){tail}")
 }
 
 /// The message of the 503 every request that needs the engine gets once the
@@ -4185,24 +4198,33 @@ mod tests {
     }
 
     /// The orderly stop's wait on the engine thread — what it waits for (the
-    /// loop's end, between engine calls) and what it does not (the engine's
-    /// Drop, which can outlast it) — pinned at a small scale:
-    /// [`ENGINE_STOP`]'s policy without spending its seconds. The servers
-    /// start the way `run` starts them ([`Server::start`]); the engines are
-    /// mocks owned by these gates alone.
+    /// loop's end, between engine calls, every request the thread held
+    /// answered by then, and the answers in flight written) and what it does
+    /// not (the engine's Drop, which can outlast it) — pinned at a small
+    /// scale: [`ENGINE_STOP`]'s policy without spending its seconds. The
+    /// servers start the way `run` starts them ([`Server::start`]); the
+    /// engines are mocks owned by these gates alone.
     mod stop_wait {
-        use std::sync::Arc;
+        use std::io::Read;
+        use std::net::{SocketAddr, TcpStream};
+        use std::path::PathBuf;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex, mpsc};
         use std::time::{Duration, Instant};
 
-        use crate::Engine;
-        use crate::MockTokenizer;
-        use crate::Tokenizer;
-        use crate::api::{FATAL_LINGER, Server, ServerConfig, Shared, Stop, relock};
+        use serde_json::{Value, json};
+
+        use crate::api::{
+            FATAL_LINGER, Server, ServerConfig, Shared, State, Stop, relock, stop_line,
+            stopping_message, testserve,
+        };
         use crate::genloop::Slot;
-        use crate::sched::Reserve;
-        use crate::worker::{Acted, Action};
+        use crate::sched::{Reserve, Use};
+        use crate::swap::Turn;
+        use crate::worker::{Acted, Action, Waited};
+        use crate::{
+            Engine, EngineError, MockEngine, MockTokenizer, Park, SlotConfig, SwapEngine, Tokenizer,
+        };
 
         /// The waits' bound in these gates: past it, a call the stop arrives
         /// in is reported; the engine's Drop is made to outlast it.
@@ -4421,9 +4443,15 @@ mod tests {
             door.recv_timeout(Duration::from_secs(5))
                 .expect("the engine thread began its call");
             sh.begin_stop(&Stop::Sigint);
-            assert!(
-                !sh.wait_loop_end(BOUND),
+            let waited = sh.wait_stop(BOUND);
+            assert_eq!(
+                waited,
+                Waited::Loop,
                 "the loop was inside the call the stop arrived in"
+            );
+            assert_eq!(
+                stop_line(&Stop::Sigint, Some(waited)),
+                "bloomery-serve: shutdown (SIGINT); the engine thread did not end within 5 s"
             );
             drop(go);
             let until = Instant::now() + Duration::from_secs(5);
@@ -4434,6 +4462,547 @@ mod tests {
                 sh.wait_loop_end(Duration::from_millis(50)),
                 "the loop left at the first check after its call"
             );
+        }
+
+        /// How long a halted request's answer may take to reach its client;
+        /// the engine's Drop is held past it.
+        const READ: Duration = Duration::from_secs(2);
+        /// The longest a [`Paced`] Drop waits for its gate, and a wait for
+        /// the engine thread waits: a test that fails ends without hanging.
+        const HOLD: Duration = Duration::from_secs(10);
+        /// The quantum of the planned prompts.
+        const Q: usize = 4;
+        /// 21 ids, so a prompt call of 20: five quanta.
+        const LONG: &str = "bcdefghijklmnopqrstub";
+
+        /// An engine call as [`Paced`] logs it, on the slot it was made on.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Call {
+            Pre(usize),
+            Next(usize),
+            Reset(usize),
+        }
+
+        /// The mock as built (its slots, its quantum), every call logged in
+        /// order, each call in `hold` waiting once logged for a permit the
+        /// test sends. Its Drop waits until the test closes its gate (at most
+        /// [`HOLD`]), as a placed engine's Drop runs past the stop's wait.
+        struct Paced {
+            inner: MockEngine,
+            cur: usize,
+            log: Arc<Mutex<Vec<Call>>>,
+            hold: Vec<Call>,
+            permits: mpsc::Receiver<()>,
+            gate: mpsc::Receiver<()>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Paced {
+            fn call(&mut self, c: Call) -> Result<(), EngineError> {
+                relock(&self.log).push(c);
+                if self.hold.contains(&c) {
+                    self.permits
+                        .recv()
+                        .map_err(|_| EngineError("the test's gate closed".to_owned()))?;
+                }
+                Ok(())
+            }
+        }
+
+        impl Engine for Paced {
+            fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+                self.inner.tokenizer()
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+                self.call(Call::Pre(self.cur))?;
+                self.inner.prefill(ids)
+            }
+            fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+                self.call(Call::Next(self.cur))?;
+                self.inner.next(last, out)
+            }
+            fn reset(&mut self) -> Result<(), EngineError> {
+                self.call(Call::Reset(self.cur))?;
+                self.inner.reset()
+            }
+            fn keepable(&self, n: usize) -> usize {
+                self.inner.keepable(n)
+            }
+            fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+                self.inner.cut(n)
+            }
+            fn ctx_max(&self) -> usize {
+                self.inner.ctx_max()
+            }
+            fn describe(&self) -> String {
+                "the paced mock".to_owned()
+            }
+            fn slots(&self) -> usize {
+                self.inner.slots()
+            }
+            fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+                self.inner.select_slot(slot)?;
+                self.cur = slot;
+                Ok(())
+            }
+            fn prompt_quantum(&self) -> Option<std::num::NonZeroUsize> {
+                self.inner.prompt_quantum()
+            }
+        }
+
+        impl Drop for Paced {
+            fn drop(&mut self) {
+                let _ = self.gate.recv_timeout(HOLD);
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// A served [`Paced`] mock and the test's handles on it: its call
+        /// log, its permits, and its Drop's gate, closed when the rig drops.
+        struct Rig {
+            addr: SocketAddr,
+            state: Arc<State>,
+            log: Arc<Mutex<Vec<Call>>>,
+            permit: mpsc::Sender<()>,
+            dropped: Arc<AtomicBool>,
+            _gate: mpsc::Sender<()>,
+        }
+
+        impl Rig {
+            /// `inner` paced, the calls in `hold` held, served on `parallel`
+            /// slots — its own, or taking it in turns parked as ids
+            /// (`turns`) — with slot files in `save`, if any.
+            fn new(
+                inner: MockEngine,
+                hold: &[Call],
+                parallel: usize,
+                turns: bool,
+                save: Option<PathBuf>,
+            ) -> Rig {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let (permit, permits) = mpsc::channel();
+                let (closer, gate) = mpsc::channel();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let paced = Paced {
+                    inner,
+                    cur: 0,
+                    log: Arc::clone(&log),
+                    hold: hold.to_vec(),
+                    permits,
+                    gate,
+                    dropped: Arc::clone(&dropped),
+                };
+                let engine: Box<dyn Engine> = if turns {
+                    Box::new(
+                        SwapEngine::new(Box::new(paced), parallel, Park::Ids)
+                            .unwrap_or_else(|e| panic!("swap engine: {e}")),
+                    )
+                } else {
+                    Box::new(paced)
+                };
+                let config = ServerConfig {
+                    slot_save_path: save,
+                    ..testserve::mock_config()
+                };
+                let slots = SlotConfig {
+                    parallel,
+                    ..SlotConfig::default()
+                };
+                let server = Server::bind_with("127.0.0.1:0", engine, config, slots).expect("bind");
+                let addr = server.local_addr().expect("addr");
+                let (state, _ended) = server.start().expect("start");
+                Rig {
+                    addr,
+                    state,
+                    log,
+                    permit,
+                    dropped,
+                    _gate: closer,
+                }
+            }
+
+            fn sh(&self) -> &Shared {
+                &self.state.shared
+            }
+
+            /// How many times `c` was called.
+            fn count(&self, c: Call) -> usize {
+                relock(&self.log).iter().filter(|&&x| x == c).count()
+            }
+
+            /// Waits until `c` was called `k` times: a held `c` then stands
+            /// at its `k`-th call.
+            fn reach(&self, c: Call, k: usize) {
+                until(&format!("{c:?} #{k}: {:?}", relock(&self.log)), || {
+                    self.count(c) >= k
+                });
+            }
+
+            /// Lets the held call run.
+            fn permit(&self) {
+                self.permit.send(()).expect("the engine holds its gate");
+            }
+
+            /// `body` posted to `path` on a connection of its own, its answer
+            /// unread.
+            fn post(&self, path: &str, body: &str) -> TcpStream {
+                testserve::send_request(self.addr, "POST", path, &[], body)
+            }
+
+            /// Waits until `n` requests wait for a slot.
+            fn queued(&self, n: usize) {
+                until(&format!("{n} requests waiting"), || {
+                    relock(&self.sh().board).waiting() == n
+                });
+            }
+
+            /// Waits until an action holds slot `i`.
+            fn reserved(&self, i: usize) {
+                until(&format!("an action on slot {i}"), || {
+                    relock(&self.sh().board).slots()[i].state == Use::Held
+                });
+            }
+        }
+
+        /// Polls `ok` until it holds; a wait that never ends fails by name.
+        fn until(what: &str, mut ok: impl FnMut() -> bool) {
+            let deadline = Instant::now() + HOLD;
+            while !ok() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// The answer `s` reads to its connection's end, which must come
+        /// within [`READ`]: its status and body.
+        fn answer(mut s: TcpStream) -> (u16, String) {
+            s.set_read_timeout(Some(READ)).expect("timeout");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!(
+                        "the answer did not end within {READ:?} ({e}); so far: {}",
+                        String::from_utf8_lossy(&raw)
+                    ),
+                }
+            }
+            let raw = String::from_utf8(raw).expect("the answer is UTF-8");
+            let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+            let status = head
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .expect("a status line");
+            (status, body.to_owned())
+        }
+
+        /// What the stop answers a request it ended, the queued requests'
+        /// 503 naming its cause: a whole answer's body, a stream's last
+        /// event.
+        fn stop_answer() -> Value {
+            json!({ "error": {
+                "code": 503,
+                "message": stopping_message("SIGINT"),
+                "type": "unavailable_error",
+            } })
+        }
+
+        fn json_of(body: &str) -> Value {
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+        }
+
+        /// The last event of a stream's body.
+        fn last_event(body: &str) -> Value {
+            let ev = body
+                .split("\n\n")
+                .filter(|e| !e.is_empty())
+                .last()
+                .unwrap_or_else(|| panic!("no event: {body}"));
+            json_of(
+                ev.strip_prefix("data: ")
+                    .unwrap_or_else(|| panic!("not a data event: {ev}")),
+            )
+        }
+
+        /// A directory of its own for a test's slot files.
+        fn fresh_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("bloomery-stop-wait-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("the slot files' directory");
+            dir
+        }
+
+        /// Every request the worker holds when the stop arrives is answered
+        /// before the loop's end, the engine's Drop still running: a stream
+        /// mid-generation ends with the stop's error event and its end, no
+        /// `[DONE]` (the end an engine failure gives a stream); a request
+        /// between its prompt's calls — a quantum's plan beside the busy
+        /// stream — gets the stop's 503, the queued requests' answer. Both
+        /// are answers in flight, and the stop's wait ends once they are
+        /// written. The stop is read before the next planned call and before
+        /// the decode round: neither runs after it. The halted requests'
+        /// counters are booked; their slots stay as the stop found them, so
+        /// `/slots` and `/health` show what they showed before it.
+        #[test]
+        fn the_halt_answers_every_request_it_holds_before_the_loop_ends() {
+            let rig = Rig::new(
+                MockEngine::new(4096).with_slots(2).with_prompt_quantum(Q),
+                &[Call::Next(0)],
+                2,
+                false,
+                None,
+            );
+            // A streams on slot 0: its prompt's step, then its first decode
+            // step held, its first token's event sent.
+            let a = rig.post(
+                "/completion",
+                r#"{"prompt":"abab","temperature":0,"stream":true}"#,
+            );
+            rig.reach(Call::Next(0), 1);
+            rig.permit();
+            rig.reach(Call::Next(0), 2);
+            // B takes slot 1 beside the busy stream: its prompt is planned as
+            // five calls, one a round; two run.
+            let b = rig.post(
+                "/completion",
+                &format!(r#"{{"prompt":"{LONG}","temperature":0,"n_predict":4}}"#),
+            );
+            rig.queued(1);
+            rig.permit();
+            rig.reach(Call::Next(0), 3);
+            rig.permit();
+            rig.reach(Call::Next(0), 4);
+            assert_eq!(rig.count(Call::Pre(1)), 2, "B is between its calls");
+            assert_eq!(rig.sh().answers_in_flight(), 2, "A's and B's answers");
+
+            rig.sh().begin_stop(&Stop::Sigint);
+            rig.permit();
+            assert_eq!(
+                rig.sh().wait_stop(BOUND),
+                Waited::Done,
+                "the loop left and both answers were written"
+            );
+            assert!(
+                !rig.dropped.load(Ordering::SeqCst),
+                "the engine's Drop was still running when the wait ended"
+            );
+            let (status, body) = answer(a);
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""content":"#), "A was generating: {body}");
+            assert_eq!(last_event(&body), stop_answer(), "{body}");
+            assert!(!body.contains("[DONE]"), "{body}");
+            let (status, body) = answer(b);
+            assert_eq!(status, 503, "{body}");
+            assert_eq!(json_of(&body), stop_answer());
+
+            assert_eq!(
+                rig.count(Call::Pre(1)),
+                2,
+                "a planned call ran after the stop"
+            );
+            assert_eq!(
+                rig.count(Call::Next(0)),
+                4,
+                "a decode round ran after the stop"
+            );
+            assert_eq!(
+                relock(&rig.sh().stats).n_prompt_total,
+                (4 + 2 * Q) as u64,
+                "A's prompt and B's two calls are booked"
+            );
+            let (status, slots) = testserve::roundtrip(rig.addr, "GET", "/slots", &[], "");
+            assert_eq!(status, 200, "{slots}");
+            let slots = json_of(&slots);
+            for s in 0..2 {
+                assert_eq!(slots[s]["is_processing"], true, "slot {s}: {slots}");
+            }
+            let (status, health) = testserve::roundtrip(rig.addr, "GET", "/health", &[], "");
+            assert_eq!(status, 200, "{health}");
+            assert_eq!(json_of(&health)["slots_processing"], 2, "{health}");
+        }
+
+        /// The stop's wait covers the answers in flight: with the loop left
+        /// and an answer still being written, the wait runs out on it and the
+        /// stop line says so; once it is written, the wait ends and the line
+        /// names the cause alone.
+        #[test]
+        fn the_stop_waits_for_the_answers_in_flight() {
+            let sh = started(Box::new(SlowDrop {
+                ms: 0,
+                dropped: Arc::new(AtomicBool::new(false)),
+            }));
+            let writing = sh.answering();
+            sh.begin_stop(&Stop::Sigint);
+            let waited = sh.wait_stop(BOUND);
+            assert_eq!(waited, Waited::Answers(1), "an answer was being written");
+            assert_eq!(
+                stop_line(&Stop::Sigint, Some(waited)),
+                "bloomery-serve: shutdown (SIGINT); 1 answer(s) were still being written at \
+                 the 5 s bound"
+            );
+            drop(writing);
+            let waited = sh.wait_stop(BOUND);
+            assert_eq!(waited, Waited::Done, "the answer was written");
+            assert_eq!(
+                stop_line(&Stop::Sigint, Some(waited)),
+                "bloomery-serve: shutdown (SIGINT)"
+            );
+        }
+
+        /// The stop is read before each action and each start of a round:
+        /// two actions the round took together, the stop arriving inside the
+        /// first, leave the second unrun, its client answered with the stop;
+        /// two requests the round admitted together, the stop arriving inside
+        /// the first's prompt, leave the second unstarted, answered the same.
+        /// The round's decode step runs neither time.
+        #[test]
+        fn the_stop_is_read_before_each_action_and_start_of_a_round() {
+            let dir = fresh_dir("actions");
+            let rig = Rig::new(
+                MockEngine::new(4096).with_slots(3),
+                &[Call::Next(0), Call::Reset(1)],
+                3,
+                false,
+                Some(dir.clone()),
+            );
+            let a = rig.post("/completion", r#"{"prompt":"abab","temperature":0}"#);
+            rig.reach(Call::Next(0), 1);
+            rig.permit();
+            rig.reach(Call::Next(0), 2);
+            let first = rig.post("/slots/1?action=erase", "");
+            rig.reserved(1);
+            let second = rig.post("/slots/2?action=erase", "");
+            rig.reserved(2);
+            rig.permit();
+            rig.reach(Call::Reset(1), 1);
+            rig.sh().begin_stop(&Stop::Sigint);
+            rig.permit();
+            assert_eq!(rig.sh().wait_stop(BOUND), Waited::Done);
+            let (status, body) = answer(first);
+            assert_eq!(status, 200, "the action the stop arrived in: {body}");
+            let (status, body) = answer(second);
+            assert_eq!((status, json_of(&body)), (503, stop_answer()), "{body}");
+            assert_eq!(
+                rig.count(Call::Reset(2)),
+                0,
+                "the second action ran after the stop"
+            );
+            assert_eq!(
+                rig.count(Call::Next(0)),
+                2,
+                "a decode round ran after the stop"
+            );
+            let (status, body) = answer(a);
+            assert_eq!((status, json_of(&body)), (503, stop_answer()), "{body}");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let rig = Rig::new(
+                MockEngine::new(4096).with_slots(3),
+                &[Call::Next(0), Call::Pre(1)],
+                3,
+                false,
+                None,
+            );
+            let a = rig.post("/completion", r#"{"prompt":"abab","temperature":0}"#);
+            rig.reach(Call::Next(0), 1);
+            rig.permit();
+            rig.reach(Call::Next(0), 2);
+            let b = rig.post("/completion", r#"{"prompt":"bcbc","temperature":0}"#);
+            rig.queued(1);
+            let c = rig.post("/completion", r#"{"prompt":"cdcd","temperature":0}"#);
+            rig.queued(2);
+            rig.permit();
+            rig.reach(Call::Pre(1), 1);
+            rig.sh().begin_stop(&Stop::Sigint);
+            rig.permit();
+            assert_eq!(rig.sh().wait_stop(BOUND), Waited::Done);
+            let log = relock(&rig.log).clone();
+            assert!(
+                !log.contains(&Call::Pre(2)) && !log.contains(&Call::Next(2)),
+                "the second start ran after the stop: {log:?}"
+            );
+            assert_eq!(
+                rig.count(Call::Next(0)),
+                2,
+                "a decode round ran after the stop"
+            );
+            for (name, s) in [("A", a), ("B", b), ("C", c)] {
+                let (status, body) = answer(s);
+                assert_eq!(
+                    (status, json_of(&body)),
+                    (503, stop_answer()),
+                    "{name}: {body}"
+                );
+            }
+        }
+
+        /// Under turns the halt answers every request it holds too, before
+        /// the loop's end and with the engine's Drop still running: the
+        /// parked stream ends with the stop's error event, and the running
+        /// request, the one waiting for its prompt's turn and the slot action
+        /// deferred while they live each get the stop's 503.
+        #[test]
+        fn under_turns_the_halt_answers_the_parked_the_pending_and_the_deferred() {
+            let dir = fresh_dir("turns");
+            let rig = Rig::new(
+                MockEngine::new(4096),
+                &[Call::Next(0)],
+                4,
+                true,
+                Some(dir.clone()),
+            );
+            let a = rig.post(
+                "/completion",
+                r#"{"prompt":"abab","temperature":0,"stream":true}"#,
+            );
+            rig.reach(Call::Next(0), 1);
+            rig.permit();
+            rig.reach(Call::Next(0), 2);
+            // B and C take slots together: B preempts A, whose state parks;
+            // C waits for B's turn to end.
+            let b = rig.post("/completion", r#"{"prompt":"bcbc","temperature":0}"#);
+            rig.queued(1);
+            let c = rig.post("/completion", r#"{"prompt":"cdcd","temperature":0}"#);
+            rig.queued(2);
+            rig.permit();
+            rig.reach(Call::Next(0), 3);
+            rig.permit();
+            rig.reach(Call::Next(0), 4);
+            // An action on the free slot waits while requests live.
+            let erase = rig.post("/slots/3?action=erase", "");
+            rig.reserved(3);
+            rig.permit();
+            rig.reach(Call::Next(0), 5);
+            assert_eq!(
+                relock(&rig.sh().turns).clone(),
+                Some(vec![Turn::Parked, Turn::Running, Turn::Queued, Turn::Idle]),
+                "A parked, B running, C pending"
+            );
+
+            rig.sh().begin_stop(&Stop::Sigint);
+            rig.permit();
+            assert_eq!(rig.sh().wait_stop(BOUND), Waited::Done);
+            assert!(
+                !rig.dropped.load(Ordering::SeqCst),
+                "the engine's Drop was still running when the wait ended"
+            );
+            let (status, body) = answer(a);
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(last_event(&body), stop_answer(), "{body}");
+            for (name, s) in [("B", b), ("C", c), ("the erase", erase)] {
+                let (status, body) = answer(s);
+                assert_eq!(
+                    (status, json_of(&body)),
+                    (503, stop_answer()),
+                    "{name}: {body}"
+                );
+            }
+            assert_eq!(rig.count(Call::Next(0)), 5, "a step ran after the stop");
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
