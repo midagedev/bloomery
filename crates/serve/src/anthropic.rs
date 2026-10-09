@@ -49,7 +49,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ApiError, ChatPlan, JSON, RETRY_AFTER_SECS, State, body, chat_input, chat_plan, engine_error,
-    error_body, get_i, invalid, json_type, run_gen, send_json, tool_markup_error,
+    error_body, get_i, invalid, json_type, run_gen, run_whole, send_json, tool_markup_error,
 };
 use crate::dsml::{Message, ToolCall};
 use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
@@ -565,10 +565,9 @@ fn whole(
         prompt,
         mut parser,
     } = plan;
-    let o = match run_gen(state, &prompt_ids, prompt, &p, &mut |_, _| Ok(())) {
+    let (o, _) = match run_whole(state, &prompt_ids, prompt, &p, w)? {
         Err(e) => return send_error(w, req, &e),
-        Ok((Err(e), _)) => return send_error(w, req, &engine_error(&e)),
-        Ok((Ok(o), _)) => o,
+        Ok(done) => done,
     };
     if let Err(e) = parser
         .try_push(&o.content)

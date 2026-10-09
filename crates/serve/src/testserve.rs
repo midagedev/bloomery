@@ -65,16 +65,16 @@ pub(super) fn roundtrip(
     (status, body)
 }
 
-/// [`roundtrip`] with the whole reply head beside the body: the status,
-/// every header line as sent, and the body — the form a test that pins a
-/// response's headers needs.
-pub(super) fn roundtrip_head(
+/// One HTTP/1.0 request with `headers` past the JSON content type, written
+/// over a fresh connection that is returned with its answer unread: the form
+/// a test that closes the connection, or reads it a piece at a time, needs.
+pub(super) fn send_request(
     addr: SocketAddr,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: &str,
-) -> (u16, String, String) {
+) -> TcpStream {
     let mut s = TcpStream::connect(addr).expect("connect");
     let extra: String = headers
         .iter()
@@ -86,6 +86,20 @@ pub(super) fn roundtrip_head(
         body.len()
     );
     s.write_all(req.as_bytes()).expect("write");
+    s
+}
+
+/// [`roundtrip`] with the whole reply head beside the body: the status,
+/// every header line as sent, and the body — the form a test that pins a
+/// response's headers needs.
+pub(super) fn roundtrip_head(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, String) {
+    let mut s = send_request(addr, method, path, headers, body);
     let mut raw = String::new();
     s.read_to_string(&mut raw).expect("read");
     let (head, body) = raw.split_once("\r\n\r\n").expect("a head");

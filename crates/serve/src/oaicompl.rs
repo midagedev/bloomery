@@ -47,8 +47,8 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, CompletionPlan, State, body, chat_input, completion_plan, engine_error,
-    finish_stream, get_i, invalid, progress, run_gen, send_error, send_json, sse, unix_now, usage,
+    ApiError, CompletionPlan, State, body, chat_input, completion_plan, finish_stream, get_i,
+    invalid, progress, run_gen, run_whole, send_error, send_json, sse, unix_now, usage,
 };
 use crate::genloop::{Event, Outcome};
 use crate::http::{EventStream, Request};
@@ -71,10 +71,9 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
     } = plan;
     let ids = Ids::new(state, &b);
     if !p.stream {
-        return match run_gen(state, &input, prompt, &p, &mut |_, _| Ok(())) {
+        return match run_whole(state, &input, prompt, &p, w)? {
             Err(e) => send_error(w, req, &e),
-            Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
-            Ok((Ok(o), _)) => send_json(w, req, 200, &answer(&ids, &o, &o.content)),
+            Ok((o, _)) => send_json(w, req, 200, &answer(&ids, &o, &o.content)),
         };
     }
     let mut stream: Option<EventStream<'_>> = None;

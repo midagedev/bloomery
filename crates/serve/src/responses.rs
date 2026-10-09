@@ -147,8 +147,8 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, ChatPlan, State, body, chat_input, chat_plan, engine_error, error_body,
-    finish_stream, get_i, invalid, json_type, progress, run_gen, send_error, send_json, sse,
+    ApiError, ChatPlan, State, body, chat_input, chat_plan, error_body, finish_stream, get_i,
+    invalid, json_type, progress, run_gen, run_whole, send_error, send_json, sse,
     tool_markup_error, unix_now,
 };
 use crate::dsml::{Message, ToolCall};
@@ -981,10 +981,9 @@ fn whole(
         prompt,
         mut parser,
     } = plan;
-    let o = match run_gen(state, &input, prompt, &p, &mut |_, _| Ok(())) {
+    let (o, _) = match run_whole(state, &input, prompt, &p, w)? {
         Err(e) => return send_error(w, req, &e),
-        Ok((Err(e), _)) => return send_error(w, req, &engine_error(&e)),
-        Ok((Ok(o), _)) => o,
+        Ok(done) => done,
     };
     if let Err(e) = parser
         .try_push(&o.content)

@@ -690,14 +690,15 @@ pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
 // ---------------------------------------------------------------- orderly stop
 
 /// How long an orderly stop waits for the engine thread to leave its loop
-/// ([`Shared::wait_loop_end`]). The worker checks the stop between engine
-/// calls, so the wait covers the one call it can be inside of when the stop
-/// arrives — a whole-prompt call at a slot's full context, the longest single
-/// call the seats run — plus the booking of the requests it ends; every
-/// seat's decode step sits far under it. The engine's Drop after the loop is
-/// not waited for: freeing a host tier's pinned pages and joining its
-/// threads can outlast the bound, and the process exit reclaims the engine's
-/// memory anyway.
+/// ([`Shared::wait_loop_end`]). The worker checks the stop only between its
+/// rounds, so the wait covers the round it is in when the stop arrives, plus
+/// the booking of the requests the stop ends. A decode step sits far under
+/// the bound; a prompt call has none of its own, so a long one can outlast
+/// it, and the process then exits with the engine thread still inside the
+/// call, its stop line saying so. The engine's Drop after the loop is not
+/// waited for: freeing a host tier's pinned pages and joining its threads
+/// can outlast the bound, and the process exit reclaims the engine's memory
+/// anyway.
 const ENGINE_STOP: Duration = Duration::from_secs(5);
 
 /// The signal handlers' whole state, the only things a handler touches: the
@@ -1123,8 +1124,19 @@ fn body(req: &Request) -> Result<Map<String, Value>, ApiError> {
 
 // ---------------------------------------------------------------- field helpers
 
-fn get_f(o: &Map<String, Value>, k: &str) -> Option<f64> {
-    o.get(k).and_then(Value::as_f64)
+/// A real field as `f32`. Absent, `null` or not a number is `None`, a field of
+/// another type read as absent as llama-server reads it; a number whose `f32`
+/// is not finite (`1e39`) is a 400 naming the field, as a penalty's is, where
+/// the sampler would refuse it and the request would run greedy.
+fn get_f32(o: &Map<String, Value>, k: &str) -> Result<Option<f32>, ApiError> {
+    let Some(v) = o.get(k).filter(|v| v.is_number()) else {
+        return Ok(None);
+    };
+    v.as_f64()
+        .map(|x| x as f32)
+        .filter(|x| x.is_finite())
+        .map(Some)
+        .ok_or_else(|| invalid(format!("{k} must be a finite number, not {v}")))
 }
 
 /// An integer field. Absent, `null` or not a number is `None`; a number that is
@@ -1186,7 +1198,9 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
 /// `repeat_penalty` that is not `> 0` with a finite reciprocal, is a 400
 /// naming it. `repeat_last_n` outside llama-server's `0..=i32::MAX` is a 400. A
 /// greedy request takes the engine's argmax, which no penalty reaches, so
-/// penalties that change a logit with `temperature <= 0` are a 400.
+/// penalties that change a logit with `temperature <= 0` are a 400. A
+/// `temperature`, `top_p` or `min_p` whose `f32` is not finite (`1e39`) is a
+/// 400 naming it; the sampler's other ranges stay as it takes them.
 fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiError> {
     let set = |k: &str| o.get(k).filter(|v| !v.is_null());
     let refused = [
@@ -1260,10 +1274,10 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             })?,
     };
     let sampling = SamplingParams {
-        temperature: get_f(o, "temperature").map_or(d.temperature, |t| t as f32),
+        temperature: get_f32(o, "temperature")?.unwrap_or(d.temperature),
         top_k: top_k.map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
-        top_p: get_f(o, "top_p").map_or(d.top_p, |t| t as f32),
-        min_p: get_f(o, "min_p").map_or(d.min_p, |t| t as f32),
+        top_p: get_f32(o, "top_p")?.unwrap_or(d.top_p),
+        min_p: get_f32(o, "min_p")?.unwrap_or(d.min_p),
         repeat_penalty: penalty(
             "repeat_penalty",
             d.repeat_penalty,
@@ -2210,6 +2224,58 @@ fn run_gen(
     }
 }
 
+/// What a request's generation fails with once its client is gone: the sink's
+/// error, the one the engine thread's channel send fails with as well.
+pub(crate) fn client_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "the client went away")
+}
+
+/// Whether the client of `w` is still there, asked at the generation's
+/// events: a one-byte peek with the socket in non-blocking mode, so nothing
+/// waits and no byte of a pipelined next request is consumed. Readable bytes
+/// and nothing to read are a client; no bytes at all (`Ok(0)`), a reset or an
+/// abort are [`client_gone`]; any other failure is returned as it is. The
+/// socket is blocking again on return, on every path: the connection's reader
+/// shares it, and the answer is written to it.
+fn probe_client(w: &TcpStream) -> io::Result<()> {
+    w.set_nonblocking(true)?;
+    let peeked = w.peek(&mut [0u8; 1]);
+    w.set_nonblocking(false)?;
+    match peeked {
+        Ok(0) => Err(client_gone()),
+        Ok(_) => Ok(()),
+        Err(e) => match e.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(()),
+            io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected => Err(client_gone()),
+            _ => Err(e),
+        },
+    }
+}
+
+/// [`run_gen`] for a request that answers once the generation is whole: it
+/// sends nothing while the generation runs, so its sink only watches the
+/// client of `w` ([`probe_client`]), and a client that closed ends the request
+/// at the next event, as a stream's failed write does. The outer error is that
+/// client's, whose connection ends with no answer; the inner one the request's
+/// answer, an engine error a 500.
+fn run_whole(
+    state: &State,
+    input: &Prompt,
+    prompt: Value,
+    p: &GenParams,
+    w: &TcpStream,
+) -> io::Result<Result<(Outcome, usize), ApiError>> {
+    match run_gen(state, input, prompt, p, &mut |_, _| probe_client(w)) {
+        Err(e) => Ok(Err(e)),
+        Ok((Err(GenError::Client(e)), _)) => Err(e),
+        Ok((Err(e), _)) => Ok(Err(engine_error(&e))),
+        Ok((Ok(o), slot)) => Ok(Ok((o, slot))),
+    }
+}
+
 // ---------------------------------------------------------------- slot actions
 
 enum SlotAction {
@@ -2666,10 +2732,9 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         return_tokens,
     } = plan;
     if !p.stream {
-        return match run_gen(state, &input, prompt.clone(), &p, &mut |_, _| Ok(())) {
+        return match run_whole(state, &input, prompt.clone(), &p, w)? {
             Err(e) => send_error(w, req, &e),
-            Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
-            Ok((Ok(o), slot)) => send_json(
+            Ok((o, slot)) => send_json(
                 w,
                 req,
                 200,
@@ -2974,10 +3039,9 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     };
     let vocab = &*state.tok;
     if !p.stream {
-        return match run_gen(state, &input, prompt, &p, &mut |_, _| Ok(())) {
+        return match run_whole(state, &input, prompt, &p, w)? {
             Err(e) => send_error(w, req, &e),
-            Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
-            Ok((Ok(o), _)) => match parser
+            Ok((o, _)) => match parser
                 .try_push(&o.content)
                 .and_then(|_| parser.try_finish())
             {
@@ -3492,6 +3556,39 @@ mod tests {
         }
     }
 
+    /// A `temperature`, `top_p` or `min_p` whose `f32` is not finite (`1e39`
+    /// is a finite JSON number and an infinite `f32`) is a 400 naming the
+    /// field and "a finite number", where the sampler would refuse it and the
+    /// request would run greedy. A finite value, whatever its range, is taken
+    /// as it was, and a field of another type reads as absent.
+    #[test]
+    fn non_finite_sampling_fields_are_refused_by_name() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let ask = |field: &str, value: &str| {
+            let body = format!(r#"{{"prompt":"ab","n_predict":1,"{field}":{value}}}"#);
+            roundtrip(addr, "POST", "/completion", &body)
+        };
+        for field in ["temperature", "top_p", "min_p"] {
+            for value in ["1e39", "-1e39"] {
+                let (status, text) = ask(field, value);
+                assert_eq!(status, 400, "{field} {value}: {text}");
+                let v: Value = serde_json::from_str(&text).expect("the 400's body is JSON");
+                let message = v["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains(field) && message.contains("a finite number"),
+                    "{field} {value}: the 400 names the field and the rule: {message}"
+                );
+            }
+            for value in ["0.5", "-1", "3e38", "\"hot\"", "null"] {
+                let (status, text) = ask(field, value);
+                assert_eq!(status, 200, "{field} {value}: {text}");
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- API keys
 
     /// The key every key test sets: known bytes, so a leak is a named string.
@@ -3925,6 +4022,168 @@ mod tests {
         assert!(check_slots(&text, &slots(2)).is_ok());
     }
 
+    /// A request that answers once the generation is whole sends nothing while
+    /// it runs, so a client that left is found by the probe its sink runs at
+    /// each event ([`probe_client`], [`run_whole`]): over real sockets, and
+    /// with an engine the test paces a step at a time.
+    mod gone_client {
+        use std::io::{self, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        use crate::api::{probe_client, relock, testserve};
+        use crate::sched::Use;
+        use crate::{Engine, EngineError, MockEngine, Tokenizer};
+
+        /// The mock engine with every `next` held at a gate: the call is
+        /// counted, then waits for a permit the test sends, so the test
+        /// decides how many steps the generation takes.
+        struct Gated {
+            inner: MockEngine,
+            calls: Arc<AtomicUsize>,
+            permits: mpsc::Receiver<()>,
+        }
+
+        impl Engine for Gated {
+            fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+                self.inner.tokenizer()
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+                self.inner.prefill(ids)
+            }
+            fn next(
+                &mut self,
+                last: u32,
+                logits_out: Option<&mut [f32]>,
+            ) -> Result<u32, EngineError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.permits
+                    .recv()
+                    .map_err(|_| EngineError("the test's gate closed".to_owned()))?;
+                self.inner.next(last, logits_out)
+            }
+            fn reset(&mut self) -> Result<(), EngineError> {
+                self.inner.reset()
+            }
+            fn ctx_max(&self) -> usize {
+                self.inner.ctx_max()
+            }
+            fn describe(&self) -> String {
+                "the gated mock".to_owned()
+            }
+        }
+
+        /// Polls `ok` until it holds; a test that waits on a thread that never
+        /// answers fails by name instead of hanging.
+        fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !ok() {
+                assert!(Instant::now() < until, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Whether `s`, which has nothing to read, is in blocking mode: a peek
+        /// waits out the read timeout there and fails at once in non-blocking
+        /// mode. A correct socket never answers early, so this does not flake.
+        fn blocking(s: &TcpStream) -> bool {
+            let wait = Duration::from_millis(100);
+            s.set_read_timeout(Some(wait)).expect("timeout");
+            let t = Instant::now();
+            let e = s.peek(&mut [0u8; 1]).expect_err("nothing to read");
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+            t.elapsed() >= wait / 2
+        }
+
+        /// The probe over a real socket pair: a quiet peer and a peer with
+        /// bytes pending are clients (the bytes are still there to read, the
+        /// next request's among them), a peer that closed is gone, and the
+        /// socket is blocking again after a probe that found a client — the
+        /// connection's reader shares it.
+        #[test]
+        fn the_probe_tells_a_client_from_a_gone_one_and_leaves_the_socket_blocking() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let mut client =
+                TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (mut server, _) = listener.accept().expect("accept");
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+
+            probe_client(&server).expect("a quiet client is present");
+            assert!(blocking(&server), "blocking after a quiet probe");
+
+            client.write_all(b"hi").expect("write");
+            server.peek(&mut [0u8; 1]).expect("the bytes arrive");
+            probe_client(&server).expect("pending bytes are a client");
+            let mut got = [0u8; 2];
+            server.read_exact(&mut got).expect("read");
+            assert_eq!(&got, b"hi", "the probe consumed nothing");
+            assert!(blocking(&server), "blocking after a probe that saw bytes");
+
+            drop(client);
+            assert_eq!(server.read(&mut got).expect("the end of the stream"), 0);
+            let gone = probe_client(&server).expect_err("a closed client is gone");
+            assert_eq!(gone.kind(), io::ErrorKind::BrokenPipe, "{gone}");
+            assert_eq!(gone.to_string(), "the client went away");
+        }
+
+        /// A whole-answer request whose client closes its socket after the
+        /// generation started ends at the next event and frees its slot. The
+        /// engine is held at a gate and given one step at a time: a
+        /// generation that is not cancelled takes every step the test gives,
+        /// to a context the mock never ends, and the slot is still running.
+        #[test]
+        fn a_whole_answer_whose_client_closed_ends_at_the_next_event() {
+            const STEPS: usize = 24;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let engine = Gated {
+                inner: MockEngine::new(1 << 16),
+                calls: Arc::clone(&calls),
+                permits,
+            };
+            let (addr, state, _ended) =
+                testserve::spawn(Box::new(engine), testserve::mock_config());
+            let free = || relock(&state.shared.board).slots()[0].state == Use::Free;
+            let called = || calls.load(Ordering::SeqCst);
+
+            // The mock continues "abab" as `a`, `b`, `a`, `b` and never ends.
+            let client = testserve::send_request(
+                addr,
+                "POST",
+                "/completion",
+                &[],
+                r#"{"prompt":"abab","temperature":0}"#,
+            );
+            wait_for("the generation's first step", || called() >= 1);
+            assert!(!free(), "the request holds the slot");
+            drop(client);
+
+            for step in 1..=STEPS {
+                permit.send(()).expect("the engine holds its gate");
+                wait_for("the engine's next step or the slot's release", || {
+                    called() > step || free()
+                });
+                if free() {
+                    break;
+                }
+            }
+            assert!(
+                free(),
+                "the slot still runs the request of a closed client after {STEPS} steps"
+            );
+            assert!(
+                called() <= 8,
+                "the request ended after {} steps, not within a few events",
+                called()
+            );
+        }
+    }
+
     /// The orderly stop's wait on the engine thread — what it waits for (the
     /// loop's end, between engine calls) and what it does not (the engine's
     /// Drop, which can outlast it) — pinned at a small scale:
@@ -4075,6 +4334,62 @@ mod tests {
             assert!(
                 dropped.load(Ordering::SeqCst),
                 "the engine thread finished its engine's Drop"
+            );
+        }
+
+        /// The stop is stored and signalled under the board lock, the lock the
+        /// engine thread reads it and waits on its condvar with. Stored
+        /// outside the lock, it could land between the thread's read and its
+        /// wait and be lost, the stop then waiting out [`ENGINE_STOP`]. An
+        /// action holds the board lock on the engine thread for a window while
+        /// the stop begins from this thread: it must not be published within
+        /// the window, and is published once the lock is released, the engine
+        /// thread then leaving its loop.
+        #[test]
+        fn the_stop_is_published_under_the_board_lock() {
+            let sh = started(Box::new(SlowDrop {
+                ms: 0,
+                dropped: Arc::new(AtomicBool::new(false)),
+            }));
+            let (locked, door) = mpsc::channel();
+            let (seen, verdict) = mpsc::channel();
+            let held = Arc::clone(&sh);
+            let action = Action {
+                run: Box::new(move |_: &mut Slot| {
+                    let board = relock(&held.board);
+                    let _ = locked.send(());
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = seen.send(held.stopped());
+                    drop(board);
+                    Acted {
+                        failure: None,
+                        reply: Box::new(|| ()),
+                    }
+                }),
+                drops: false,
+            };
+            relock(&sh.board)
+                .reserve(Reserve::One(0), action)
+                .expect("the slot is free");
+            sh.work.notify_one();
+            door.recv_timeout(Duration::from_secs(5))
+                .expect("the engine thread holds the board lock");
+            assert!(sh.begin_stop(&Stop::Sigint), "first cause");
+            let stored = verdict
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the engine thread read the stop");
+            assert!(
+                !stored,
+                "the stop was stored with the board lock held: a check and wait of the \
+                 engine thread under that lock can miss it"
+            );
+            assert!(
+                sh.stopped(),
+                "the stop was published once the lock was free"
+            );
+            assert!(
+                sh.wait_loop_end(BOUND),
+                "the engine thread left its loop on the stop"
             );
         }
 

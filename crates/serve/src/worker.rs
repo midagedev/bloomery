@@ -17,8 +17,10 @@
 //! A request's events reach its HTTP thread over a channel of its own. Its
 //! counters, its `/slots` view and its slot's release are booked before its
 //! last event is sent, so the response a client reads finds the slot free
-//! and the counters final. A client gone (its channel closed) ends its request
-//! at the next event; the slot is released.
+//! and the counters final. A client gone ends its request at the next event,
+//! a stream's or a whole answer's alike: its HTTP thread's sink fails (a
+//! stream's write, a whole answer's socket reading closed), the thread drops
+//! its channel, the engine thread's send fails, and the slot is released.
 //!
 //! An engine whose slots take it in turns ([`Engine::turns`]) is run by the
 //! rules of [`crate::swap`] instead: one request on the engine at a time, the
@@ -38,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::api::{End, EngineFailure, Stop, relock};
+use crate::api::{End, EngineFailure, Stop, client_gone, relock};
 use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotRow, StateError};
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
@@ -229,6 +231,11 @@ impl Shared {
             }
             *gate = Some(cause.to_string());
         }
+        // The engine thread reads `stop` and then waits on `work` with the
+        // board locked ([`Worker::run`], [`Worker::run_turns`]): stored and
+        // notified under that lock, the stop lands before its read or finds
+        // it waiting, never between the two.
+        let _board = relock(&self.board);
         self.stop.store(true, Ordering::SeqCst);
         self.work.notify_one();
         true
@@ -384,9 +391,7 @@ fn sink_of(events: &mpsc::Sender<Msg>) -> impl FnMut(Event<'_>) -> io::Result<()
             Event::Prompt(t) => Msg::Prompt(t.clone()),
             Event::Text(text, t) => Msg::Text(text.to_owned(), t.clone()),
         };
-        events
-            .send(m)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the client went away"))
+        events.send(m).map_err(|_| client_gone())
     }
 }
 
@@ -463,11 +468,15 @@ impl Worker {
     }
 
     /// The engine thread's orderly end, what [`Shared::begin_stop`] ordered:
-    /// every queued and running request's channel closes, so its HTTP thread
+    /// every queued request's and action's channel closes, so its HTTP thread
     /// answers with the stop's cause ([`crate::api::engine_gone`]), and the
-    /// thread ends without touching the engine again. Nothing failed: no
-    /// engine error is recorded, and no end is sent — the stop's sender
-    /// already did.
+    /// thread ends without touching the engine again. A request the worker
+    /// already took keeps its channel in the worker (`active`, `prompting`,
+    /// and `pending` under turns), which closes it when the worker drops at
+    /// the end of [`serve`]: after [`Shared::end_loop`] and after the engine's
+    /// Drop, so the process exit the stop's wait ends in can come first.
+    /// Nothing failed: no engine error is recorded, and no end is sent — the
+    /// stop's sender already did.
     fn halt(&self) {
         let cause = relock(&self.sh.stopping)
             .clone()
