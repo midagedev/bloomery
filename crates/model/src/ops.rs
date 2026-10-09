@@ -4,6 +4,7 @@
 //! the last bit, which is what lets the gates stay tight.
 
 use crate::ffn::swiglu_timed;
+use crate::moe::TierSlots;
 use crate::profile;
 use crate::r8file::{R8Error, R8Source, Sidecar};
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row, quantize_activations};
@@ -1132,7 +1133,10 @@ impl R8Stack {
 /// A stacked expert tensor `{k, n, n_expert}` as a union call reads it,
 /// resolved once per call: matrix `e` is the `e`-th of the stack's `n_expert`
 /// equal byte runs — the cut [`ShardTensor::expert`] and `moe::expert_view`
-/// make — so every matrix has the stack's type, shape and row layout.
+/// make — so every matrix has the stack's type, shape and row layout. With
+/// a [`StackTier`] lent ([`ExpertStack::with_tier`]), the matrix of an id
+/// outside the plan's host segment is the NVMe tier's slot instead, the same
+/// bytes in the arena.
 #[derive(Clone, Copy)]
 pub(crate) struct ExpertStack<'w> {
     name: &'w str,
@@ -1144,6 +1148,43 @@ pub(crate) struct ExpertStack<'w> {
     per: usize,
     bytes: &'w [u8],
     layout: RowLayout,
+    tier: Option<StackTier<'w>>,
+}
+
+/// The NVMe tier's arena as one stack of a union call reads it
+/// ([`ExpertStack::matrix`]): part `part` of layer `layer`'s ids outside the
+/// plan's host segment `host_start..host_end` comes from the arena's slot,
+/// every id inside it from the stack's own bytes. Copy, so a stack stays one.
+#[derive(Clone, Copy)]
+pub(crate) struct StackTier<'w> {
+    slots: &'w dyn TierSlots,
+    layer: usize,
+    host_start: u32,
+    host_end: u32,
+    part: usize,
+}
+
+impl<'w> StackTier<'w> {
+    /// `slots`' part `part` of layer `layer` for every id outside `host`.
+    pub(crate) fn new(
+        slots: &'w dyn TierSlots,
+        layer: usize,
+        host: &Range<u32>,
+        part: usize,
+    ) -> StackTier<'w> {
+        StackTier {
+            slots,
+            layer,
+            host_start: host.start,
+            host_end: host.end,
+            part,
+        }
+    }
+
+    /// Whether expert `e` is the arena's: outside the plan's host segment.
+    fn lends(&self, e: u32) -> bool {
+        !(self.host_start..self.host_end).contains(&e)
+    }
 }
 
 impl<'w> ExpertStack<'w> {
@@ -1160,6 +1201,7 @@ impl<'w> ExpertStack<'w> {
             per,
             bytes,
             layout: RowLayout::Rows,
+            tier: None,
         })
     }
 
@@ -1168,9 +1210,35 @@ impl<'w> ExpertStack<'w> {
         ExpertStack::of(info, gguf.data(info)?)
     }
 
-    /// Expert `e`'s matrix bytes. `e` is one of the stack's experts: a union
-    /// call checks its ids against the stack by name before any pass.
-    fn matrix(&self, e: usize) -> &'w [u8] {
+    /// The stack with the NVMe tier's slots lent for every id outside the
+    /// plan's host segment. The caller has filled the slot of every such id
+    /// the call reads and checked that each lends one matrix, `per` bytes
+    /// (`moe::HostLayer::experts_step_union_into`).
+    pub(crate) fn with_tier(self, tier: StackTier<'w>) -> ExpertStack<'w> {
+        ExpertStack {
+            tier: Some(tier),
+            ..self
+        }
+    }
+
+    /// Bytes of one expert's matrix.
+    pub(crate) fn per(&self) -> usize {
+        self.per
+    }
+
+    /// Expert `e`'s matrix bytes: the tier's slot for an id the tier lends,
+    /// else the stack's own. `e` is one of the stack's experts: a union call
+    /// checks its ids against the stack by name before any pass.
+    fn matrix(&self, e: u32) -> &'w [u8] {
+        if let Some(t) = self.tier
+            && t.lends(e)
+        {
+            return t.slots.slot(t.layer, e, t.part).expect(
+                "host union: a tier id's slot is filled and checked before the call \
+                 (HostLayer::experts_step_union_into)",
+            );
+        }
+        let e = e as usize;
         &self.bytes[e * self.per..(e + 1) * self.per]
     }
 }
@@ -4117,7 +4185,7 @@ impl RowSet for UnionRows<'_, '_> {
             UnionClaims::Combine(c) => c.wait(d),
         }
         let st = &self.stacks[s];
-        let bytes = self.sources[s].matrix(self.plan.ids[d] as usize);
+        let bytes = self.sources[s].matrix(self.plan.ids[d]);
         let (o, m) = (self.plan.off[d], self.plan.off[d + 1] - self.plan.off[d]);
         let (src, first) = match self.pass {
             UnionPass::GateUp => (
@@ -4992,6 +5060,7 @@ mod tests {
             per,
             bytes,
             layout: RowLayout::Rows,
+            tier: None,
         }
     }
 

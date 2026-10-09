@@ -30,8 +30,8 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupInput, R8Stack, RowLayout, ShardTensor, Tensor2,
-    Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q,
+    self, DEFER_MAX_COLS, ExpertStack, GroupInput, R8Stack, RowLayout, ShardTensor, StackTier,
+    Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q,
     matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
 };
 use crate::profile;
@@ -1196,6 +1196,9 @@ pub struct UnionScratch {
     /// `min(max_cols, DEFER_MAX_COLS) · per_list`, every expert such a call
     /// can list.
     claims: Vec<AtomicU8>,
+    /// A step union's distinct ids the NVMe tier lends, ascending
+    /// ([`HostLayer::experts_step_union_into`]): room for every slot.
+    tier_ids: Vec<u32>,
 }
 
 impl UnionScratch {
@@ -1310,6 +1313,7 @@ impl UnionScratch {
             claims: (0..cols.min(DEFER_MAX_COLS) * per_list)
                 .map(|_| AtomicU8::new(0))
                 .collect(),
+            tier_ids: Vec::with_capacity(cols * per_list),
         }
     }
 
@@ -1612,6 +1616,19 @@ pub enum TierError {
         id: u32,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// A filled slot lends a part of another length than the stack's one
+    /// matrix: the arena carved it for another stack.
+    #[error(
+        "the NVMe tier's slot for layer {layer} expert {id} part {part} lends {got} B; the \
+         stack's matrix is {want} B"
+    )]
+    SlotLength {
+        layer: usize,
+        id: u32,
+        part: usize,
+        got: usize,
+        want: usize,
+    },
 }
 
 /// The RAM arena a host layer's routed experts read from beside the file
@@ -1871,8 +1888,10 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         let x = x.into();
-        // The union reads the file mapping: a prompt call touches more ids a layer than
-        // the arena holds slots, so only the one-token path lends the arena's slots.
+        // Every id from the file mapping, the NVMe tier's too: a prompt call
+        // touches more ids a layer than the arena holds slots, and its reader
+        // lets the tier's pages go after the call. A decode step's union reads
+        // the tier's ids from the arena ([`HostLayer::experts_step_union_into`]).
         check_union_call(
             x,
             lists,
@@ -1888,6 +1907,94 @@ impl HostLayer {
             out,
             scratch,
         )
+    }
+
+    /// [`HostLayer::experts_union_into`] with every id outside the plan's
+    /// host segment read from the NVMe tier's arena, as
+    /// [`HostLayer::experts_into`] reads it — a decode step's union, whose
+    /// ids the next step reads again. The call's distinct tier ids, ascending,
+    /// are filled first ([`TierSlots::ensure`]); each one's three parts must
+    /// then lend one matrix of its stack, refused by name when a slot is
+    /// unfilled ([`TierError::Unfilled`]) or of another length
+    /// ([`TierError::SlotLength`]); and the union reads them from their slots,
+    /// the same bytes as the mapping's, so column `j` is still
+    /// [`HostLayer::experts_into`] of column `j` bit for bit. A layer with no
+    /// tier reads the mapping alone, as [`HostLayer::experts_union_into`].
+    /// Refused by name before any fill: an id past the layer's experts.
+    pub fn experts_step_union_into<'x>(
+        &self,
+        src: R8Source<'_>,
+        x: impl Into<Tensor2View<'x>>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        scratch: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        let Some(tier) = &self.tier else {
+            return self.experts_union_into(src, x, lists, out, scratch);
+        };
+        self.read_beside(src)?;
+        let split = src.split();
+        let x = x.into();
+        check_union_call(
+            x,
+            lists,
+            out,
+            self.gate.source().info().dims[1] as usize,
+            scratch,
+        )?;
+        // The plan's ids are the call's distinct ids, ascending; the union
+        // builds the same plan again.
+        scratch.plan.build(lists, scratch.per_list)?;
+        if let Some(&e) = scratch.plan.ids.last()
+            && e as usize >= self.n_expert
+        {
+            return Err(ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                self.gate.source().info().name
+            )));
+        }
+        scratch.tier_ids.clear();
+        scratch.tier_ids.extend(
+            scratch
+                .plan
+                .ids
+                .iter()
+                .copied()
+                .filter(|e| !tier.host.contains(e)),
+        );
+        let mut stacks = self.stacks_of(split)?;
+        if !scratch.tier_ids.is_empty() {
+            tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
+            for &id in &scratch.tier_ids {
+                for (part, stack) in stacks.iter().enumerate() {
+                    match tier.slots.slot(tier.layer, id, part) {
+                        None => {
+                            return Err(TierError::Unfilled {
+                                layer: tier.layer,
+                                id,
+                            }
+                            .into());
+                        }
+                        Some(bytes) if bytes.len() != stack.per() => {
+                            return Err(TierError::SlotLength {
+                                layer: tier.layer,
+                                id,
+                                part,
+                                got: bytes.len(),
+                                want: stack.per(),
+                            }
+                            .into());
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            for (part, stack) in stacks.iter_mut().enumerate() {
+                *stack =
+                    stack.with_tier(StackTier::new(&*tier.slots, tier.layer, &tier.host, part));
+            }
+        }
+        serve_union(stacks, Some(self.limit), x, lists, out, scratch)
     }
 }
 
@@ -2389,12 +2496,13 @@ mod tests {
     /// A [`super::TierSlots`] for the accessor tests: it owns every expert's
     /// three parts as its slots' bytes (read from the layer's own file, so a
     /// filled slot lends exactly the mapping's bytes), records the ids
-    /// `ensure` saw, and with `filled` off lends nothing — every slot
-    /// unfilled.
+    /// `ensure` saw and the `(layer, id, part)` every `slot` call asked for,
+    /// and with `filled` off lends nothing — every slot unfilled.
     struct MockTier {
         parts: Vec<Vec<u8>>,
         filled: bool,
         ensured: std::sync::Mutex<Vec<(usize, Vec<u32>)>>,
+        asked: std::sync::Mutex<Vec<(usize, u32, usize)>>,
     }
 
     impl MockTier {
@@ -2417,11 +2525,16 @@ mod tests {
                 parts,
                 filled,
                 ensured: std::sync::Mutex::new(Vec::new()),
+                asked: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn ensured(&self) -> Vec<(usize, Vec<u32>)> {
             self.ensured.lock().unwrap().clone()
+        }
+
+        fn asked(&self) -> Vec<(usize, u32, usize)> {
+            self.asked.lock().unwrap().clone()
         }
     }
 
@@ -2431,7 +2544,8 @@ mod tests {
             Ok(())
         }
 
-        fn slot(&self, _layer: usize, id: u32, part: usize) -> Option<&[u8]> {
+        fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
+            self.asked.lock().unwrap().push((layer, id, part));
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
     }
@@ -2531,6 +2645,102 @@ mod tests {
             a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "a tier-bearing union call writes the plain path's values"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A decode step's union reads the tier's ids from their slots: the
+    /// call's distinct ids outside the host segment, ascending, go to
+    /// `ensure` once; an unfilled slot is refused by name with its layer and
+    /// the first such id; a filled one gives the bits of the mapping's union
+    /// — a layer with no tier and the same layer's mapping reader alike —
+    /// and the tier is asked for every tier id's three parts and never for
+    /// an id of the host segment.
+    #[test]
+    fn a_step_union_reads_the_tier_from_its_slots() {
+        let (embd, ff, n_expert) = (256, 256, 6);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("stepunion", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let cols = 3;
+        let xw = Tensor2::from_vec(
+            embd,
+            cols,
+            (0..embd * cols)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        // Host id 1 in two columns; tier ids 5, 2, 0 and 3, id 5 in two.
+        let lists: [&[(u32, f32)]; 3] = [
+            &[(5, 0.3), (1, 0.7)],
+            &[(2, 0.5), (1, 0.25), (0, 0.25)],
+            &[(5, 0.6), (3, 0.4)],
+        ];
+        let tier_ids = [0u32, 2, 3, 5];
+        let src = R8Source::rows(&split);
+        let mut us = UnionScratch::new_routed(embd, ff, 8, 3).unwrap();
+
+        let empty = std::sync::Arc::new(MockTier::of(&split, &layer, false));
+        layer.attach_tier(4, 1..2, empty.clone());
+        match layer.experts_step_union_into(src, &xw, &lists, &mut vec![0.0; embd * cols], &mut us)
+        {
+            Err(crate::ModelError::Tier(e @ super::TierError::Unfilled { layer: 4, id: 0 })) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unfilled") && msg.contains("layer 4") && msg.contains("expert 0"),
+                    "{msg}"
+                );
+            }
+            other => panic!("not the unfilled refusal by name: {other:?}"),
+        }
+        assert_eq!(
+            empty.ensured(),
+            vec![(4, tier_ids.to_vec())],
+            "ensure saw the call's distinct tier ids once, ascending, at the tier's layer"
+        );
+
+        let full = std::sync::Arc::new(MockTier::of(&split, &layer, true));
+        layer.attach_tier(4, 1..2, full.clone());
+        let mut got = vec![f32::NAN; embd * cols];
+        layer
+            .experts_step_union_into(src, &xw, &lists, &mut got, &mut us)
+            .unwrap();
+        let asked = full.asked();
+        assert!(
+            asked.iter().all(|&(l, id, _)| l == 4 && id != 1),
+            "the tier was asked for a host-segment id or another layer: {asked:?}"
+        );
+        let asked: std::collections::BTreeSet<(u32, usize)> =
+            asked.iter().map(|&(_, id, part)| (id, part)).collect();
+        let want_asked: std::collections::BTreeSet<(u32, usize)> = tier_ids
+            .iter()
+            .flat_map(|&id| (0..3).map(move |part| (id, part)))
+            .collect();
+        assert_eq!(
+            asked, want_asked,
+            "every tier id's three parts, from the tier"
+        );
+
+        let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let mut mapped = vec![f32::NAN; embd * cols];
+        layer
+            .experts_union_into(src, &xw, &lists, &mut mapped, &mut us)
+            .unwrap();
+        let plain = build_layer(&split, embd, ff, n_expert).unwrap();
+        let mut want = vec![f32::NAN; embd * cols];
+        plain
+            .experts_union_into(src, &xw, &lists, &mut want, &mut us)
+            .unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "the step union writes a tier-less union's bits"
+        );
+        assert_eq!(
+            bits(&mapped),
+            bits(&want),
+            "the same layer's mapping reader writes a tier-less union's bits"
         );
         std::fs::remove_file(&path).unwrap();
     }
