@@ -1,0 +1,25 @@
+# The fixes a release must carry. `just release-build` runs tools/release/carry.sh over this file before it
+# touches the box, and refuses a commit that lacks any row, so a candidate is never cut while a fix it needs
+# sits on a branch.
+#
+# One row a fix, three tab-separated columns:  commit<TAB>name<TAB>why
+#   commit  a hash on main (12 hex digits or the full 40; a shorter one can turn ambiguous as the repository grows),
+#           that must be an ancestor of the commit being released; or the
+#           word `pending` for a fix known and not landed yet, which refuses every release until its row holds
+#           a hash.
+#   name    one word: the round or the fix.
+#   why     one line: what the release is wrong without.
+# Lines that start with `#` and empty lines are ignored. Any other line that is not three columns, with a
+# commit that is neither a hash nor `pending`, or with an empty name or why, is refused with its line number.
+#
+# A row is added when a correctness fix lands (its hash), and when one is known and not yet landed (`pending`,
+# replaced by its hash at landing). Rows stay after the release that needed them: a landed fix stays an
+# ancestor. The lead rewrites a row's hash when a rebase moves the commit, before landing.
+#
+# commit	name	why
+160fef7ae2f0	seatfix	the Qwen3.8 seat loads the plan it ruled and recorded, counts its slots' checkpoints in the room, and refuses a set residency on a paged plan
+b884cef18cb3	paged2	generate_qwen3moe asks the paged one-column rule too, and a set BLOOMERY_GEN_SLOTS past one is refused under its own name
+d58d993f4baf	paged2	the paged one-column rule counts a slot column only where the slots step as one pass, so a paged bp plan serves every slot asked
+a2cfb825a7d2	paged2	the floor fallback's one slot is the room's on --place bp too
+0410d5b82286	roomneed	one room ledger: HostNeed carries the NVMe tier's arena, so the load's check and every finished-plan reader count it
+46e9bb48eb8c	roomneed	the checkpoints beside a plan's need have one owner, residency38::checkpoints_beside
