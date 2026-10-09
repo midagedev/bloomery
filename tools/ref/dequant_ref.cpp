@@ -16,7 +16,7 @@
 //        $BLOOMERY_DATA/bin/dequant_ref --synthetic [out_dir]
 //
 // --synthetic covers the types no model file on the box holds (q2_K, iq2_xs,
-// iq3_xxs, iq4_xs): per type, kSynthQuant rows of kSynthLen pseudo-random
+// iq3_xxs, iq3_s, iq4_xs): per type, kSynthQuant rows of kSynthLen pseudo-random
 // values quantized by ggml itself (ggml_quantize_chunk with a synthetic
 // importance matrix, as the community files are made), then kSynthRandom rows
 // whose code bytes are random and whose f16 scales are set to finite values,
@@ -82,6 +82,7 @@ static std::vector<size_t> scale_offsets(enum ggml_type t) {
         case GGML_TYPE_Q2_K:    return {80, 82};
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_XS:  return {0};
         default: fail("no synthetic layout for this type");
     }
@@ -89,7 +90,7 @@ static std::vector<size_t> scale_offsets(enum ggml_type t) {
 }
 
 static int synthetic(const std::string & out_dir) {
-    const enum ggml_type types[] = {GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS};
+    const enum ggml_type types[] = {GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS};
     std::filesystem::create_directories(out_dir);
     std::string manifest;
     for (const enum ggml_type type : types) {

@@ -24,11 +24,12 @@
 //! multiply, a power of two times an int8 of magnitude at most 12, is exact
 //! (the subnormal scales included), so no fusion question arises.
 //!
-//! Q2_K, IQ2_XS, IQ3_XXS, IQ4_NL and IQ4_XS are ports of the same-named
+//! Q2_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS are ports of the same-named
 //! functions in that file, whose bodies are identical in mainline ggml. None has a product
 //! that rounds, so the order of their multiplies does not decide the bits:
 //! the scale factors (`d · (0.5 + s) · 0.25`, `d · (0.5 + s) · 0.5`,
-//! `d · (ls − 32)`, `d · sc`) are an f16 significand times at most five bits,
+//! `d · (1 + 2s)`, `d · (ls − 32)`, `d · sc`) are an f16 significand times at
+//! most five bits,
 //! and a codebook or code value adds at most seven more (IQ4_XS's
 //! `kvalues_iq4nl` reaches 127), 23 bits in the worst case; IQ4_NL's
 //! `d · kvalues_iq4nl[code]` is 11 + 7 bits. Q2_K's
@@ -38,7 +39,9 @@
 
 use std::fmt;
 
-use crate::iq_tables::{IQ2XS_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
+use crate::iq_tables::{
+    IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+};
 
 /// GGUF v3 / ggml tensor type tags, values from `enum ggml_type`
 /// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, IQ2_XXS=16 … IQ4_XS=23
@@ -317,11 +320,11 @@ impl GgmlType {
             | GgmlType::MXFP4
             | GgmlType::IQ2_XS
             | GgmlType::IQ3_XXS
+            | GgmlType::IQ3_S
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS => true,
             GgmlType::IQ2_XXS
             | GgmlType::IQ1_S
-            | GgmlType::IQ3_S
             | GgmlType::IQ2_S
             | GgmlType::I8
             | GgmlType::I16
@@ -420,11 +423,11 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::MXFP4 => dequant_mxfp4(&src[..need], dst),
         GgmlType::IQ2_XS => dequant_iq2_xs(&src[..need], dst),
         GgmlType::IQ3_XXS => dequant_iq3_xxs(&src[..need], dst),
+        GgmlType::IQ3_S => dequant_iq3_s(&src[..need], dst),
         GgmlType::IQ4_NL => dequant_iq4_nl(&src[..need], dst),
         GgmlType::IQ4_XS => dequant_iq4_xs(&src[..need], dst),
         GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
-        | GgmlType::IQ3_S
         | GgmlType::IQ2_S
         | GgmlType::I8
         | GgmlType::I16
@@ -977,6 +980,43 @@ fn dequant_iq3_xxs(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Port of `dequantize_row_iq3_s` (ggml-quants.c:3811). Block geometry
+/// (block_iq3_s, ggml-common.h:503-510, 110 bytes / 256 values): d f16 @0,
+/// qs[64] @2, qh[8] @66, signs[32] @74, scales[4] @106.
+///
+/// Sub-block ib32 (32 values, eight grid words of four magnitudes) reads
+/// `qs[8·ib32 + m]` for m in 0..8, extended to a 9-bit [`IQ3S_GRID`] index by
+/// bit m of `qh[ib32]` (value 256). Word m holds values 4m..4m+4, and its
+/// sign is bit `(4m + j) % 8` of `signs[4·ib32 + m / 2]`, set meaning negative.
+/// The scale is nibble `ib32 & 1` of `scales[ib32 / 2]`, low nibble first,
+/// and the value `db·grid[j]·(±1)` has `db = d·(1 + 2s)`.
+fn dequant_iq3_s(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<110>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<256>().0)
+    {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..66];
+        let qh = &blk[66..74];
+        let signs = &blk[74..106];
+        let scales = &blk[106..110];
+        for (ib32, o32) in out.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+            let s = (scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0f;
+            let db = d * (1 + 2 * i32::from(s)) as f32;
+            for (m, o4) in o32.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let hi = usize::from((qh[ib32] >> m) & 1) << 8;
+                let g = IQ3S_GRID[usize::from(qs[8 * ib32 + m]) | hi].to_le_bytes();
+                let sg = signs[4 * ib32 + m / 2];
+                for (j, o) in o4.iter_mut().enumerate() {
+                    *o = db * f32::from(g[j]) * iq_sign(sg, 4 * (m % 2) + j);
+                }
+            }
+        }
+    }
+}
+
 /// Port of `dequantize_row_iq4_nl` (ggml-quants.c:3931). Block geometry
 /// (block_iq4_nl, ggml-common.h:585-589, 18 bytes / 32 values): d f16 @0,
 /// qs[16] @2. Value j < 16 is `d·kvalues_iq4nl[qs[j] & 0xf]` and value j + 16
@@ -1130,7 +1170,9 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 ///
 /// MXFP4 takes Q8_2_X4 (ggml.c:1316 on this AVX2 IQK build; ik's
 /// `iqk_set_kernels_legacy_quants` pairs it with `mul_mat_qX_1_q8_2_T`) and IQ3_XXS takes
-/// Q8_K (ggml.c:1116; `iqk_set_kernels_iquants` refuses any other activation type). Q8_0
+/// Q8_K (ggml.c:1116; `iqk_set_kernels_iquants` refuses any other activation type), as does
+/// IQ3_S (ggml.c:1142, the same entry; a single column never takes ik's Q8_K_R8 repack,
+/// which `is_dequant_better`, iqk_mul_mat.cpp:252, allows from 32 columns). Q8_0
 /// takes Q8_2_X4 too (ggml.c:831 on this AVX2 IQK build; the legacy-quants entry pairs it
 /// with `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, _, block_q8_2>`), the column qdot's Q8_0 kernel
 /// reads. IQ4_NL takes Q8_2_X4 on AVX2 (ggml.c:1286-1288; the legacy-quants entry pairs it
@@ -1144,7 +1186,9 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// either.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
-        GgmlType::Q3_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS => Ok(Some(ActivationFormat::Q8K)),
+        GgmlType::Q3_K | GgmlType::IQ3_XXS | GgmlType::IQ3_S | GgmlType::IQ4_XS => {
+            Ok(Some(ActivationFormat::Q8K))
+        }
         GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -1159,7 +1203,6 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
         | GgmlType::IQ1_S
-        | GgmlType::IQ3_S
         | GgmlType::IQ2_S
         | GgmlType::I8
         | GgmlType::I16
@@ -1333,6 +1376,7 @@ mod tests {
         for (ty, want) in [
             (GgmlType::Q3_K, Some(Q8K)),
             (GgmlType::IQ3_XXS, Some(Q8K)),
+            (GgmlType::IQ3_S, Some(Q8K)),
             (GgmlType::Q4_K, Some(Q8_2X4)),
             (GgmlType::Q5_K, Some(Q8_2X4)),
             (GgmlType::Q6_K, Some(Q8_2X4)),
@@ -1351,19 +1395,22 @@ mod tests {
         );
     }
 
-    /// Every product the five i-quant/Q2_K ports form is exact in f32 — the
+    /// Every product the six i-quant/Q2_K ports form is exact in f32 — the
     /// module doc's claim that the multiply order cannot decide the bits —
     /// checked for every finite f16 scale `d` against every scale factor and
     /// code value the format can hold: the f32 product equals the f64 one.
     #[test]
     fn iq_products_are_exact() {
-        use crate::iq_tables::{IQ2XS_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
+        use crate::iq_tables::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
         let mut g2: Vec<u8> = IQ2XS_GRID.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut g3: Vec<u8> = IQ3XXS_GRID.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut g3s: Vec<u8> = IQ3S_GRID.iter().flat_map(|w| w.to_le_bytes()).collect();
         g2.sort_unstable();
         g2.dedup();
         g3.sort_unstable();
         g3.dedup();
+        g3s.sort_unstable();
+        g3s.dedup();
         let exact = |a: f32, b: f32| f64::from(a * b) == f64::from(a) * f64::from(b);
         for bits in (0u16..0x7c00).chain(0x8000..0xfc00) {
             let d = super::half_to_f32(bits);
@@ -1384,6 +1431,15 @@ mod tests {
                     g3.iter().all(|&g| exact(db3, f32::from(g))),
                     "iq3_xxs {bits:#06x}"
                 );
+                let db3s = d * (1 + 2 * s as i32) as f32;
+                assert!(
+                    exact(d, (1 + 2 * s as i32) as f32),
+                    "d·(1+2s) at {bits:#06x}"
+                );
+                assert!(
+                    g3s.iter().all(|&g| exact(db3s, f32::from(g))),
+                    "iq3_s {bits:#06x}"
+                );
                 // q2_K: d·sc and min·m, then dl·q for the 2-bit codes.
                 assert!(exact(d, s));
                 assert!(
@@ -1403,12 +1459,12 @@ mod tests {
     }
 
     /// The codebooks' structure, as ggml builds them: every IQ2_XS grid byte
-    /// is one of 8, 25, 43; every IQ3_XXS grid byte is 4 + 8k or 62; a
-    /// `ksigns_iq2xs` entry is its index with bit 7 set to the parity of the
+    /// is one of 8, 25, 43; every IQ3_XXS grid byte is 4 + 8k or 62; every
+    /// IQ3_S grid byte is odd and at most 15; a `ksigns_iq2xs` entry is its index with bit 7 set to the parity of the
     /// seven, so the eight signs of a group always flip an even number.
     #[test]
     fn iq_tables_have_ggml_structure() {
-        use crate::iq_tables::{IQ2XS_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+        use crate::iq_tables::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
         for w in IQ2XS_GRID {
             assert!(
                 w.to_le_bytes().iter().all(|b| [8, 25, 43].contains(b)),
@@ -1420,6 +1476,12 @@ mod tests {
                 w.to_le_bytes()
                     .iter()
                     .all(|&b| b == 62 || (b >= 4 && b % 8 == 4 && b <= 52)),
+                "{w:#x}"
+            );
+        }
+        for w in IQ3S_GRID {
+            assert!(
+                w.to_le_bytes().iter().all(|&b| b % 2 == 1 && b <= 15),
                 "{w:#x}"
             );
         }
