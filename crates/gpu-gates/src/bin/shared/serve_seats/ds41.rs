@@ -199,6 +199,7 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::residency38::checkpoints_beside;
 use bloomery_gpu_gates::{GateError, ref_model_path, residency41};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
@@ -791,7 +792,12 @@ fn print_plan(
         }
         pool_bytes = pool.bytes;
     }
-    let cache = CacheRam::of(cache_ram, HostNeed::of(&plan, 0).bytes(), pool_bytes)?;
+    let cache = CacheRam::of(
+        cache_ram,
+        HostNeed::of(&plan, 0).bytes(),
+        pool_bytes,
+        checkpoints_beside(plan.machine),
+    )?;
     let gpus: Result<Vec<String>, String> = machine
         .all_cards()
         .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))

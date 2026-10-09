@@ -223,7 +223,9 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
+use bloomery_gpu_gates::residency38::{
+    GLM_CARD, checkpoints_beside, residency_room, residency_set,
+};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
     Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_resume, seq_save,
@@ -928,7 +930,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
         Residency::Off => 0,
     };
-    let cache = CacheRam::of(a.cache_ram, HostNeed::of(&plan, beside).bytes(), pool)?;
+    let cache = CacheRam::of(
+        a.cache_ram,
+        HostNeed::of(&plan, beside).bytes(),
+        pool,
+        checkpoints_beside(plan.machine),
+    )?;
     eprintln!("{}", cache.line());
     eprintln!(
         "parallel rule=slots slots={slots} slot_ctx={} total={} from={from} pass={}",
