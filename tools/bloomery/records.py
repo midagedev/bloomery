@@ -24,7 +24,9 @@ it). A reader names a kind and a field; the syntax is this file's and record.rs'
                                                  after a `#> <path> <what>` line the generate_ds41
                                                  records that follow into <path> (from the repository
                                                  root) under a `# just records-refresh: <what>` line;
-                                                 every other line skipped
+                                                 every other line skipped; a marker no record follows
+                                                 (or a schema that miscounts its kinds) refuses the
+                                                 whole stdin before any file is written
 
 A line is matched by its head, the longest first (`stat prefill split` before `stat prefill`), then by
 its kind's whole pattern; kinds that share a head are told apart by the pattern (`load` and `load
@@ -37,6 +39,8 @@ a runner's own) is not a record; `check` passes over the ones that open a kind's
 Exit status: 0; 1 `check` found a line; 2 a named refusal (a schema file missing or of another
 version); 64 a usage error.
 """
+import contextlib
+import io
 import json
 import re
 import shlex
@@ -374,13 +378,12 @@ def cmd_check(argv):
     return 1 if found else 0
 
 
-def cmd_refresh(argv):
-    if argv:
-        usage()
-    root = SCHEMA_DIR.parent.parent.parent
+def refresh_writes(lines, gen, root):
+    """`refresh`'s files from `lines` as (path, text, note), every one checked before any is written:
+    stdin with no schema, a schema whose header miscounts its kinds and a marker no record follows
+    refuse the whole refresh, each named, so a red refresh leaves the tree as it was."""
     schemas, files, cur = {}, {}, None
-    gen = load(DEFAULT_BIN)
-    for line in sys.stdin:
+    for line in lines:
         line = line.rstrip("\n")
         if line.startswith('{"records":'):
             cur = ("schema", json.loads(line)["bin"])
@@ -393,20 +396,30 @@ def cmd_refresh(argv):
             files[path] = [f"# just records-refresh: {what}"]
         elif cur is not None and cur[0] == "file" and gen.read_line(line) is not None:
             files[cur[1]].append(line)
-    if not schemas:
-        refuse("no --records-schema output on stdin")
-    for name, lines in schemas.items():
-        head = json.loads(lines[0])
-        if head["kinds"] != len(lines) - 1:
-            refuse(f"{name}: the header counts {head['kinds']} kinds, stdin held {len(lines) - 1}")
+    problems = [] if schemas else ["no --records-schema output on stdin"]
+    for name, got in schemas.items():
+        head = json.loads(got[0])
+        if head["kinds"] != len(got) - 1:
+            problems.append(f"{name}: the header counts {head['kinds']} kinds, stdin held {len(got) - 1}")
+    problems += [f"{rel}: no record followed its marker" for rel, got in files.items() if len(got) < 2]
+    if problems:
+        refuse(f"nothing written: {'; '.join(problems)}")
+    writes = []
+    for name, got in schemas.items():
         path = SCHEMA_DIR / f"{name}.jsonl"
-        path.write_text("\n".join(lines) + "\n")
-        print(f"{path.relative_to(root)}: {len(lines) - 1} kinds")
-    for rel, lines in files.items():
-        if len(lines) < 2:
-            refuse(f"{rel}: no record followed its marker")
-        (root / rel).write_text("\n".join(lines) + "\n")
-        print(f"{rel}: {len(lines) - 1} records")
+        writes.append((path, "\n".join(got) + "\n", f"{path.relative_to(root)}: {len(got) - 1} kinds"))
+    for rel, got in files.items():
+        writes.append((root / rel, "\n".join(got) + "\n", f"{rel}: {len(got) - 1} records"))
+    return writes
+
+
+def cmd_refresh(argv):
+    if argv:
+        usage()
+    root = SCHEMA_DIR.parent.parent.parent
+    for path, text, note in refresh_writes(sys.stdin, load(DEFAULT_BIN), root):
+        path.write_text(text)
+        print(note)
     return 0
 
 
@@ -454,6 +467,28 @@ def self_test():
     recs = read([reset, step, "a line of no kind", reset, reset], schema=schema)
     assert [r.line for r in tail(recs, "residency_reset")] == [reset, reset], recs
     assert tail(read([reset, step], schema=schema), "residency_reset") == []
+    # refresh checks every file before it writes one: a marker no record follows refuses the whole
+    # stdin by name, the schema and the earlier marker's file included, and nothing is returned
+    root = SCHEMA_DIR.parent.parent.parent
+    plan = ["#> tools/flow/plans/a.rec generate_ds41 --plan --depth 1", reset, "a line of no kind"]
+    good = ['{"records":1,"bin":"generate_ds41","kinds":1}', '{"kind":"residency_reset"}'] + plan
+    writes = refresh_writes(good, schema, root)
+    assert [(str(p.relative_to(root)), n) for p, _, n in writes] == [
+        ("tools/bloomery/schema/generate_ds41.jsonl", "tools/bloomery/schema/generate_ds41.jsonl: 1 kinds"),
+        ("tools/flow/plans/a.rec", "tools/flow/plans/a.rec: 1 records"),
+    ], writes
+    assert writes[1][1] == f"# just records-refresh: generate_ds41 --plan --depth 1\n{reset}\n", writes[1][1]
+    bad = good + ["#> tools/flow/plans/b.rec generate_ds41 --plan --depth 2", "a line of no kind"]
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(said):
+            refresh_writes(bad, schema, root)
+        raise AssertionError("a marker with no record was written")
+    except SystemExit as e:
+        assert e.code == 2, e.code
+    assert said.getvalue() == (
+        "records.py: nothing written: tools/flow/plans/b.rec: no record followed its marker\n"
+    ), said.getvalue()
     print(f"records: self-test ok ({len(schema.kinds)} kinds)")
     return 0
 
