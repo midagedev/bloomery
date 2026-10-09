@@ -46,8 +46,8 @@ pub use api::{
 };
 pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps,
-    ModelProps, PlacementProps, ResidencyReset, Sampler, SamplerFactory, SamplingParams, Saved,
-    SavedState, SlotPass, SlotRow, StateError, Tokenizer,
+    ModelProps, PlacementProps, ResidencyReset, Sampler, SamplerFactory, SamplerRefused,
+    SamplingParams, Saved, SavedState, SlotPass, SlotRow, StateError, Tokenizer,
 };
 pub use jinja::{ChatTemplate, TemplateError};
 pub use mock::{DraftMock, MockEngine, MockTokenizer, ScriptedEngine};

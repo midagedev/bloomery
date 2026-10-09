@@ -17,7 +17,8 @@ use common::{get, post, start_sampling};
 use serde_json::{Value, json};
 use serve::mock::MockCall;
 use serve::{
-    DraftMock, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Tokenizer,
+    DraftMock, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplerRefused,
+    SamplingParams, Tokenizer,
 };
 
 /// A prompt whose `a` has four followers, so the sampler branches at every
@@ -31,20 +32,22 @@ const BOUND: Duration = Duration::from_secs(10);
 /// one multiplied, once an occurrence).
 fn penalised() -> SamplerFactory {
     let inner = serve::sampling::reference_factory();
-    Arc::new(move |p: &SamplingParams| -> Sampler {
-        let mut draw = inner(p);
-        let mut row: Vec<f32> = Vec::new();
-        Box::new(move |logits: &[f32], history: &[u32]| {
-            row.clear();
-            row.extend_from_slice(logits);
-            for &id in history.iter().rev().take(8) {
-                if let Some(l) = row.get_mut(id as usize) {
-                    *l = if *l > 0.0 { *l / 1.3 } else { *l * 1.3 };
+    Arc::new(
+        move |p: &SamplingParams| -> Result<Sampler, SamplerRefused> {
+            let mut draw = inner(p)?;
+            let mut row: Vec<f32> = Vec::new();
+            Ok(Box::new(move |logits: &[f32], history: &[u32]| {
+                row.clear();
+                row.extend_from_slice(logits);
+                for &id in history.iter().rev().take(8) {
+                    if let Some(l) = row.get_mut(id as usize) {
+                        *l = if *l > 0.0 { *l / 1.3 } else { *l * 1.3 };
+                    }
                 }
-            }
-            draw(&row, history)
-        })
-    })
+                draw(&row, history)
+            }))
+        },
+    )
 }
 
 type Log = Arc<Mutex<Vec<MockCall>>>;
