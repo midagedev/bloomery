@@ -14,6 +14,7 @@ use model::r8file::{R8Pair, R8Source};
 use model::{Tensor2, Tensor2View};
 
 use super::HostExperts;
+use super::census::HostReads;
 use crate::GpuError;
 
 use super::nvtier::NvTier;
@@ -44,6 +45,8 @@ pub struct HostRun {
     /// [`HostRun::attach_tier`] gave it: every paged layer's ids outside
     /// its host segment read from it.
     tier: Option<Arc<NvTier>>,
+    /// The picks the calls read, by source, for the tier census.
+    reads: HostReads,
 }
 
 impl HostRun {
@@ -75,6 +78,7 @@ impl HostRun {
             widths,
             union: None,
             tier: None,
+            reads: HostReads::default(),
         })
     }
 
@@ -223,6 +227,11 @@ impl HostExperts for HostRun {
                 missing: "the layer's routed stacks: it is outside the host run",
             })?;
         view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
+        self.reads.arena_or_file(
+            self.tier.as_deref(),
+            layer,
+            experts.iter().map(|&(id, _)| id),
+        );
         Ok(())
     }
 
@@ -235,6 +244,7 @@ impl HostExperts for HostRun {
     ) -> Result<(), GpuError> {
         let (view, src, scratch) = self.union_of(layer, "HostRun::experts_union_into")?;
         view.experts_union_into(src, x, lists, out, scratch)?;
+        self.reads.file(lists.iter().map(|l| l.len()).sum());
         Ok(())
     }
 
@@ -250,6 +260,11 @@ impl HostExperts for HostRun {
     ) -> Result<(), GpuError> {
         let (view, src, scratch) = self.union_of(layer, "HostRun::experts_step_union_into")?;
         view.experts_step_union_into(src, x, lists, out, scratch)?;
+        self.reads.arena_or_file(
+            self.tier.as_deref(),
+            layer,
+            lists.iter().flat_map(|l| l.iter().map(|&(id, _)| id)),
+        );
         Ok(())
     }
 
@@ -258,5 +273,9 @@ impl HostExperts for HostRun {
             Some(tier) if tier.covers(layer) => tier.release_union(layer, lists),
             _ => Ok(()),
         }
+    }
+
+    fn reads(&self) -> Option<HostReads> {
+        Some(self.reads)
     }
 }

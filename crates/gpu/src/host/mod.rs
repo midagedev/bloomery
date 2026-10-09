@@ -94,6 +94,7 @@
 //! lost card, which no reset lifts.
 
 pub mod batch;
+pub mod census;
 pub mod handoff;
 pub mod lane;
 pub mod leg;
@@ -256,6 +257,13 @@ pub trait HostExperts {
     fn release_union(&mut self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
         let _ = (layer, lists);
         Ok(())
+    }
+
+    /// The host's routed picks since load by where it read their bytes
+    /// ([`census::HostReads`]), for the tier census; `None` for a host that
+    /// does not count them, whose census is not taken.
+    fn reads(&self) -> Option<census::HostReads> {
+        None
     }
 }
 
@@ -945,6 +953,16 @@ impl<H: HostExperts> HostTier<H> {
     #[must_use]
     pub fn swap(&self) -> Option<&swap::SwapMachine> {
         self.swap.as_ref()
+    }
+
+    /// The residency machine's late-flip debug ring, taken
+    /// ([`swap::SwapMachine::take_late_flips`]): the late flips its
+    /// boundaries noted and how many a full ring dropped. Empty without a
+    /// machine.
+    pub fn take_late_flips(&mut self) -> swap::LateLog {
+        self.swap
+            .as_mut()
+            .map_or_else(swap::LateLog::default, swap::SwapMachine::take_late_flips)
     }
 
     /// `e` with what the residency machine holds now when it is a
@@ -2200,6 +2218,27 @@ impl<H: HostExperts> HostTier<H> {
             resets: t.resets,
             last_poison: t.last_poison,
         }
+    }
+
+    /// The tier census since load ([`census::TierCensus`]) of a load that
+    /// pages its host experts through `tier`, the NVMe tier's arena: the
+    /// services' picks, the host's reads by source, the arena's counters,
+    /// the residency machine's moves (none without one) and the pool's
+    /// dispatch waits. `None` with no tier or a host that does not count its
+    /// reads.
+    pub fn census(&self, tier: Option<&nvtier::NvTier>) -> Option<census::TierCensus> {
+        let (tier, reads) = (tier?, self.experts.reads()?);
+        Some(census::TierCensus::of(
+            &self.stats(),
+            self.step.boundary.layout.handoff().n_used,
+            self.slots.layers().len(),
+            reads,
+            &tier.stats(),
+            self.swap
+                .as_ref()
+                .map_or((0, 0), swap::SwapMachine::moved_bytes),
+            &threads::pool().stats(),
+        ))
     }
 
     /// The host experts, for a caller that prepares their scratch ahead of a

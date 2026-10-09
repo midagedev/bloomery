@@ -288,6 +288,7 @@ use std::time::Instant;
 use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
+use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
@@ -1820,6 +1821,10 @@ struct Q38 {
     step_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
+    /// The load's tier census as the last call left it, on a load whose plan
+    /// pages through the NVMe tier: each call prints its span
+    /// ([`Q38::print_census`]). `None` on a load with no tier.
+    census: Option<TierCensus>,
     /// The branch the last keep query took ([`Q38::draft_keep`]), one a
     /// slot, printed at that slot's next call; a `RefCell` because the keep
     /// query runs on `&self` (the engine thread owns the seat, so the borrow
@@ -2029,6 +2034,10 @@ impl Q38 {
         let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
         let line = xstream38(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
         eprintln!("{line}");
+        let census = {
+            let b = s.model().body(WHAT)?;
+            b.hybrid().census(b.nvme_tier().map(|t| &**t))
+        };
         Ok(Q38 {
             s,
             drafts,
@@ -2040,6 +2049,7 @@ impl Q38 {
             one_pass: pass_of_slots && a.mtp,
             step_pass: pass_of_slots && !a.mtp,
             stats: a.stats,
+            census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
         })
     }
@@ -2088,10 +2098,12 @@ impl Q38 {
         }
     }
 
-    /// The `call stream` records of the last prompt call — each of its
-    /// picks, then its end — and the `residency pass` records of the
-    /// boundaries since, on stderr; nothing without the residency.
+    /// The call's `tier census` record ([`Q38::print_census`]); then the
+    /// `call stream` records of the last prompt call — each of its picks,
+    /// then its end — and the `residency pass` records of the boundaries
+    /// since, on stderr, nothing of them without the residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
+        self.print_census()?;
         if !self.residency {
             return Ok(());
         }
@@ -2116,6 +2128,30 @@ impl Q38 {
         {
             record::residency_pass_of(kind, &r).eprint();
         }
+        Ok(())
+    }
+
+    /// The `tier census` record of the span since the last call's, phase
+    /// `call`, on stderr: its picks by where they were served and the bytes
+    /// it moved between the tiers, the dropper's calls and wall and the
+    /// pool's dispatch waits. Nothing on a load with no tier.
+    fn print_census(&mut self) -> Result<(), GateError> {
+        let Some(last) = self.census else {
+            return Ok(());
+        };
+        let b = self.s.model().body("bloomery-serve-qwen38")?;
+        let Some(now) = b.hybrid().census(b.nvme_tier().map(|t| &**t)) else {
+            return Ok(());
+        };
+        now.since(&last)
+            .fields()
+            .iter()
+            .fold(
+                Record::new(&record::TIER_CENSUS).w("phase", "call"),
+                |r, &(k, v)| r.u(k, v),
+            )
+            .eprint();
+        self.census = Some(now);
         Ok(())
     }
 }

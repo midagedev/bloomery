@@ -1967,6 +1967,14 @@ impl Body38 {
         self.residency_glue.take_passes()
     }
 
+    /// The residency machine's late-flip debug ring, taken
+    /// ([`HostTier::take_late_flips`]): one entry a flip whose copy the
+    /// boundary that lands it waited for, with the terms of its wait that
+    /// name the mechanism. Empty without a machine.
+    pub fn take_late_flips(&mut self) -> crate::host::swap::LateLog {
+        self.hybrid.take_late_flips()
+    }
+
     /// Arm (or disarm) the per-layer taps ([`GpuModel::set_layer_taps`], the
     /// one caller, drops the captures first). Load-time allocation.
     fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {

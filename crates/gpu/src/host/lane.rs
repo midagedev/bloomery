@@ -53,6 +53,134 @@ fn nanos_since(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Whole nanoseconds of `t` since the epoch `t0`, saturated: a stamp's own
+/// clock read (an already-taken `Instant` against the epoch — no new one).
+pub(super) fn since_epoch(t0: Instant, t: Instant) -> u64 {
+    u64::try_from(t.duration_since(t0).as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// How many jobs the stamp ring holds cells for: a job's cell is the next
+/// job's but this many on. A flip's stamps are read at the boundary that
+/// lands it, a boundary or two after its issue; a late flip whose cell a
+/// later job took first (a prompt call's picks issue a copy a pick) is noted
+/// with its identities alone ([`super::swap::LateAt::Gone`]).
+const STAMP_SLOTS: usize = 1024;
+
+/// One job's staging stamps, one cell a job modulo [`STAMP_SLOTS`]: the
+/// machine writes the issue stamp ([`JobStamps::issue`]), the lane the serve
+/// stamps ([`JobStamps::note_prepare_at`], [`JobStamps::note_prepare`],
+/// [`JobStamps::note_staged`]), each field an atomic word — the late-flip
+/// ring's reader ([`super::swap::SwapMachine::take_late_flips`]) reads a
+/// field or a 0, never a torn word, and a cell whose job tag is not the job
+/// it asks for ([`JobStamps::of`]) answers nothing. A cell a cache line, so
+/// two lane threads stamping neighbouring jobs never share one.
+#[derive(Default)]
+#[repr(align(64))]
+pub(super) struct StampCell {
+    job: AtomicU64,
+    queued: AtomicU64,
+    ahead: AtomicU64,
+    prepare_at: AtomicU64,
+    prepare: AtomicU64,
+    read: AtomicU64,
+    staged: AtomicU64,
+}
+
+/// One job's stamps as the late-flip ring reads them, copied, each in
+/// nanoseconds since the stamp epoch but `prepare` and `read`, which are
+/// lengths: 0 in `prepare_at` names a job whose victim's preparation had not
+/// begun, 0 in `prepare` one whose preparation had not ended, and 0 in
+/// `staged` one that had not staged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Stamp {
+    pub(super) queued: u64,
+    pub(super) ahead: u64,
+    pub(super) prepare_at: u64,
+    pub(super) prepare: u64,
+    pub(super) read: u64,
+    pub(super) staged: u64,
+}
+
+/// The per-job staging stamps ([`StampCell`]), a cell a job modulo
+/// [`STAMP_SLOTS`]: what the late-flip ring decomposes a late copy's
+/// issue→boundary time with ([`super::swap::LateFlip`]) — the queue wait
+/// before the job's preparation (`prepare_at` − `queued`), the victim's
+/// preparation, the source read, and the staging word's publish.
+pub(super) struct JobStamps {
+    cells: Vec<StampCell>,
+}
+
+impl JobStamps {
+    pub(super) fn new() -> JobStamps {
+        JobStamps {
+            cells: (0..STAMP_SLOTS).map(|_| StampCell::default()).collect(),
+        }
+    }
+
+    fn cell(&self, job: u64) -> &StampCell {
+        &self.cells[(job % STAMP_SLOTS as u64) as usize]
+    }
+
+    /// The machine at job `job`'s issue: `queued` the issue stamp, `ahead`
+    /// the lane's backlog then — the copies already issued and not yet
+    /// staged, each of which the copy stream waits for ahead of this one.
+    /// The serve stamps are cleared here and the job tag written last.
+    pub(super) fn issue(&self, job: u64, queued: u64, ahead: u64) {
+        let c = self.cell(job);
+        c.queued.store(queued, Ordering::Relaxed);
+        c.ahead.store(ahead, Ordering::Relaxed);
+        c.prepare_at.store(0, Ordering::Relaxed);
+        c.prepare.store(0, Ordering::Relaxed);
+        c.read.store(0, Ordering::Relaxed);
+        c.staged.store(0, Ordering::Relaxed);
+        c.job.store(job, Ordering::Release);
+    }
+
+    /// The lane as the job's preparation begins: the stamp the queue wait
+    /// reads against.
+    pub(super) fn note_prepare_at(&self, job: u64, at: u64) {
+        self.cell(job).prepare_at.store(at, Ordering::Relaxed);
+    }
+
+    /// The lane once the job's victim is prepared: how long the preparation
+    /// took, published over the preparation's start.
+    pub(super) fn note_prepare(&self, job: u64, took: u64) {
+        self.cell(job).prepare.store(took, Ordering::Release);
+    }
+
+    /// The lane as the job's staging word is published: the read's length
+    /// and the stamp the issue→staged and staged→boundary terms read
+    /// against, written last so a `staged` a reader sees covers the read.
+    pub(super) fn note_staged(&self, job: u64, at: u64, took: u64) {
+        let c = self.cell(job);
+        c.read.store(took, Ordering::Relaxed);
+        c.staged.store(at, Ordering::Release);
+    }
+
+    /// The job's stamps, or `None` when the cell it would use holds another
+    /// job, before or after the read: its stamps are gone. Each publishing
+    /// word is read before the words it covers: a `staged` seen carries its
+    /// `read`, a `prepare` seen its `prepare_at`.
+    pub(super) fn of(&self, job: u64) -> Option<Stamp> {
+        let c = self.cell(job);
+        if c.job.load(Ordering::Acquire) != job {
+            return None;
+        }
+        let staged = c.staged.load(Ordering::Acquire);
+        let read = c.read.load(Ordering::Relaxed);
+        let prepare = c.prepare.load(Ordering::Acquire);
+        let stamp = Stamp {
+            queued: c.queued.load(Ordering::Relaxed),
+            ahead: c.ahead.load(Ordering::Relaxed),
+            prepare_at: c.prepare_at.load(Ordering::Relaxed),
+            prepare,
+            read,
+            staged,
+        };
+        (c.job.load(Ordering::Acquire) == job).then_some(stamp)
+    }
+}
+
 /// Where lane thread `t` runs: the SMT sibling of the pool's worker
 /// [`FILL_THREADS`]` + t`, past the expert stream's fill threads on the
 /// first workers' siblings. The copies are DRAM streams that sweep a ring
@@ -284,6 +412,9 @@ pub(crate) struct Shared {
     /// The stamp epoch, the machine's birth: every stamp and pick start is
     /// nanoseconds since it.
     pub(super) epoch: Instant,
+    /// The per-job staging stamps ([`JobStamps`]), for the machine's
+    /// late-flip ring.
+    pub(super) stamps: JobStamps,
     stop: AtomicBool,
     /// The first staging failure, which the next boundary or reset returns.
     failed: Mutex<Option<StagingFailure>>,
@@ -476,9 +607,12 @@ impl Shared {
     ) -> Result<bool, GpuError> {
         if let Some(v) = job.victim {
             let t0 = Instant::now();
+            self.stamps
+                .note_prepare_at(job.n, since_epoch(self.epoch, t0));
             self.source.prepare_victim(job.layer, v)?;
-            self.prepare_ns
-                .fetch_add(super::nanos(t0.elapsed()), Ordering::Relaxed);
+            let took = super::nanos(t0.elapsed());
+            self.prepare_ns.fetch_add(took, Ordering::Relaxed);
+            self.stamps.note_prepare(job.n, took);
         }
         let forced =
             || self.flush.load(Ordering::Acquire) || job.n < self.due.load(Ordering::Acquire);
@@ -518,8 +652,15 @@ impl Shared {
         };
         let t0 = Instant::now();
         self.stage(job)?;
-        self.stage_ns
-            .fetch_add(super::nanos(t0.elapsed()), Ordering::Relaxed);
+        let took = super::nanos(t0.elapsed());
+        self.stage_ns.fetch_add(took, Ordering::Relaxed);
+        // The staging stamp is the stage's own clock reads against the
+        // epoch — no new one.
+        self.stamps.note_staged(
+            job.n,
+            since_epoch(self.epoch, t0).saturating_add(took),
+            took,
+        );
         Ok(true)
     }
 
@@ -671,6 +812,7 @@ pub(super) fn start(
         pick_left: (0..layers_end).map(|_| AtomicU64::new(0)).collect(),
         pick_stamp_ns: (0..layers_end).map(|_| AtomicU64::new(0)).collect(),
         epoch: Instant::now(),
+        stamps: JobStamps::new(),
         stage_ns: AtomicU64::new(0),
         prepare_ns: AtomicU64::new(0),
         stop: AtomicBool::new(false),
@@ -745,5 +887,50 @@ fn spawn(
                 "a lane thread ended before it bound the context",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JobStamps, STAMP_SLOTS};
+
+    /// A job's stamps read back as they were written — the issue stamp and
+    /// the copies ahead from the machine, the preparation and staging stamps
+    /// from the lane — and a cell reused by a later job answers nothing for
+    /// the earlier one, its serve stamps cleared for the later one; a job
+    /// whose staging word is unpublished reads `staged` 0.
+    #[test]
+    fn a_jobs_stamps_read_back_until_its_cell_is_reused() {
+        let stamps = JobStamps::new();
+        stamps.issue(5, 1_000, 2);
+        assert_eq!(
+            stamps.of(5).map(|s| (s.queued, s.ahead, s.staged)),
+            Some((1_000, 2, 0)),
+            "issued, never served: staged 0"
+        );
+        stamps.note_prepare_at(5, 1_400);
+        stamps.note_prepare(5, 700);
+        stamps.note_staged(5, 2_900, 800);
+        assert_eq!(
+            stamps
+                .of(5)
+                .map(|s| (s.prepare_at, s.prepare, s.read, s.staged)),
+            Some((1_400, 700, 800, 2_900)),
+            "the serve stamps over the issue one"
+        );
+        assert_eq!(stamps.of(4), None, "a cell no job wrote answers nothing");
+        stamps.issue(5 + STAMP_SLOTS as u64, 9_000, 0);
+        assert_eq!(
+            stamps.of(5),
+            None,
+            "the reused cell holds the later job, not the earlier one's stamps"
+        );
+        assert_eq!(
+            stamps
+                .of(5 + STAMP_SLOTS as u64)
+                .map(|s| (s.queued, s.staged)),
+            Some((9_000, 0)),
+            "the reuse clears the serve stamps"
+        );
     }
 }

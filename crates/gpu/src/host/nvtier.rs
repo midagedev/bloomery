@@ -126,33 +126,60 @@ struct Claim {
     misses: u64,
 }
 
-/// The books' pass of one `ensure` over `layer`'s `ids`: ids the plan's host
-/// segment holds are skipped, a filled one's tick is refreshed, every other
+/// The books' pass of one `ensure` over layer `layer`'s `ids`: ids the plan's
+/// host segment holds are skipped, a filled one's tick is refreshed, every other
 /// takes a slot — the first free, else the least recently used filled one,
 /// which it evicts — and is marked filling. Pure over the books: no read, no
 /// page returned. The `seen` marks are this call's alone; a mark that
 /// outlived its call would skip an expert evicted since, and its slot would
-/// read unfilled.
-fn claim_slots(arena: &LayerArena, books: &mut Books, ids: &[u32]) -> Result<Claim, String> {
-    if books.seen.len() != arena.n_expert as usize {
-        books.seen.resize(arena.n_expert as usize, false);
+/// read unfilled. Refused by name before any slot is claimed, the books and
+/// the slots as they were: an id past the layer's experts, and a call naming
+/// more distinct ids of the arena than the layer's slots
+/// ([`TierError::TooManyIds`], the seam's own refusal) — a union reads every
+/// id it names at once, so a claim past the slots would evict one of the
+/// call's own ids before the call reads it. A miss that finds every slot
+/// filling is the race refusal: two ensures raced the layer.
+fn claim_slots(
+    layer: usize,
+    arena: &LayerArena,
+    books: &mut Books,
+    ids: &[u32],
+) -> Result<Claim, GpuError> {
+    const WHAT: &str = "NvTier::ensure";
+    let n = arena.n_expert as usize;
+    if books.seen.len() != n {
+        books.seen.resize(n, false);
     }
     books.seen.fill(false);
+    let mut distinct = 0usize;
+    for &id in ids {
+        if id as usize >= n {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("expert {id} is past the {n} experts"),
+            ));
+        }
+        if !arena.host.contains(&id) && !std::mem::replace(&mut books.seen[id as usize], true) {
+            distinct += 1;
+        }
+    }
+    books.seen.fill(false);
+    if distinct > arena.slots.len() {
+        return Err(GpuError::from(model::ModelError::Tier(
+            TierError::TooManyIds {
+                layer,
+                ids: distinct,
+                slots: arena.slots.len(),
+            },
+        )));
+    }
     let mut claim = Claim {
         picks: Vec::new(),
         evicted: Vec::new(),
         misses: 0,
     };
     for &id in ids {
-        let Some(at) = usize::try_from(id)
-            .ok()
-            .filter(|&i| i < arena.n_expert as usize)
-        else {
-            return Err(format!(
-                "expert {id} is past the {} experts",
-                arena.n_expert
-            ));
-        };
+        let at = id as usize;
         if arena.host.contains(&id) || std::mem::replace(&mut books.seen[at], true) {
             continue;
         }
@@ -162,8 +189,9 @@ fn claim_slots(arena: &LayerArena, books: &mut Books, ids: &[u32]) -> Result<Cla
             continue;
         }
         claim.misses += 1;
-        let slot = pick_slot(&arena.slots)
-            .ok_or("every slot is filling: two ensures raced a layer".to_string())?;
+        let slot = pick_slot(&arena.slots).ok_or_else(|| {
+            GpuError::shape(WHAT, "every slot is filling: two ensures raced a layer")
+        })?;
         if arena.slots[slot].state.load(Ordering::Relaxed) == FILLED {
             let gone = arena.slots[slot].id.load(Ordering::Relaxed);
             arena.of_id[gone as usize].store(0, Ordering::Relaxed);
@@ -1277,7 +1305,7 @@ impl NvTier {
         };
         let claim = {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            claim_slots(arena, &mut books, ids).map_err(|e| GpuError::shape(WHAT, e))?
+            claim_slots(layer, arena, &mut books, ids)?
         };
         self.stats.misses.fetch_add(claim.misses, Ordering::Relaxed);
         for &slot in &claim.evicted {
@@ -1396,13 +1424,28 @@ fn note(fail: &Mutex<Option<GpuError>>, e: GpuError) {
     cell.get_or_insert(e);
 }
 
+/// An `ensure` of layer `layer`'s `ids` refused with `e`, as the seam names
+/// it to the model side: the books' refusal of a call past the layer's slots
+/// passed on whole ([`TierError::TooManyIds`]), any other a fill's failure
+/// naming the call's first id.
+fn seam_error(layer: usize, ids: &[u32], e: GpuError) -> TierError {
+    let fill = |e: GpuError| TierError::Fill {
+        layer,
+        id: ids.first().copied().unwrap_or(u32::MAX),
+        source: Box::new(e),
+    };
+    match e {
+        GpuError::Model(m) => match *m {
+            model::ModelError::Tier(t @ TierError::TooManyIds { .. }) => t,
+            other => fill(GpuError::Model(Box::new(other))),
+        },
+        e => fill(e),
+    }
+}
+
 impl TierSlots for NvTier {
     fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), TierError> {
-        NvTier::ensure(self, layer, ids).map_err(|e| TierError::Fill {
-            layer,
-            id: ids.first().copied().unwrap_or(u32::MAX),
-            source: Box::new(e),
-        })
+        NvTier::ensure(self, layer, ids).map_err(|e| seam_error(layer, ids, e))
     }
 
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
@@ -1604,19 +1647,99 @@ mod tests {
             tick: 0,
             seen: Vec::new(),
         };
-        let first = super::claim_slots(&arena, &mut books, &[0, 1]).unwrap();
+        let first = super::claim_slots(0, &arena, &mut books, &[0, 1]).unwrap();
         assert_eq!((first.picks.len(), first.misses), (2, 2));
         fill_claimed(&arena, &mut books, &first);
         // Expert 2 takes the slot of the least recently used, expert 0.
-        let evict = super::claim_slots(&arena, &mut books, &[2]).unwrap();
+        let evict = super::claim_slots(0, &arena, &mut books, &[2]).unwrap();
         assert_eq!(evict.evicted.len(), 1);
         fill_claimed(&arena, &mut books, &evict);
         assert!(arena.filled(0).is_none(), "expert 0 was evicted");
         // The call that needs expert 0 again claims a slot for it.
-        let again = super::claim_slots(&arena, &mut books, &[0]).unwrap();
+        let again = super::claim_slots(0, &arena, &mut books, &[0]).unwrap();
         assert_eq!(again.picks.len(), 1, "an evicted id is refilled");
         fill_claimed(&arena, &mut books, &again);
         assert!(arena.filled(0).is_some(), "its slot reads filled");
+    }
+
+    /// A call naming more distinct ids of the arena than the layer's slots
+    /// is refused by name with the layer, the count asked and the slot
+    /// count, before any slot is claimed — not the race refusal a failed
+    /// pick would name — and the books and slots stand as they were; the
+    /// seam passes the refusal on whole. The race refusal keeps its own
+    /// case: a miss with every slot filling.
+    #[test]
+    fn a_call_past_the_slots_is_refused_before_any_claim() {
+        use model::moe::TierError;
+        let arena = arena_of(4, 1);
+        let mut books = super::Books {
+            tick: 0,
+            seen: Vec::new(),
+        };
+        // One slot, id 1 already filled; the call names three distinct ids
+        // of the arena (id 2 twice, counted once), one of them the filled
+        // one — the union reads them all at once.
+        let first = super::claim_slots(7, &arena, &mut books, &[1]).unwrap();
+        fill_claimed(&arena, &mut books, &first);
+        let tick = books.tick;
+        let e = super::claim_slots(7, &arena, &mut books, &[1, 0, 2, 2])
+            .map(|_| ())
+            .unwrap_err();
+        match &e {
+            crate::GpuError::Model(m) => assert!(
+                matches!(
+                    **m,
+                    model::ModelError::Tier(TierError::TooManyIds {
+                        layer: 7,
+                        ids: 3,
+                        slots: 1
+                    })
+                ),
+                "{e}"
+            ),
+            other => panic!("the seam's named refusal, got {other}"),
+        }
+        let text = e.to_string();
+        assert!(
+            text.contains("layer 7") && text.contains("3 distinct ids") && text.contains("1 slots"),
+            "{text}"
+        );
+        assert_eq!(arena.filled(1), Some(0), "the filled id's book stands");
+        assert_eq!(arena.filled(0), None, "no id was claimed");
+        assert_eq!(books.tick, tick, "the books' tick stands");
+        assert_eq!(
+            arena.slots[0]
+                .state
+                .load(std::sync::atomic::Ordering::Relaxed),
+            FILLED,
+            "the slot is not left filling"
+        );
+        // The seam hands the model side the refusal itself, not a fill's
+        // failure of the call's first id.
+        assert!(
+            matches!(
+                super::seam_error(7, &[1, 0, 2, 2], e),
+                TierError::TooManyIds {
+                    layer: 7,
+                    ids: 3,
+                    slots: 1
+                }
+            ),
+            "the seam passes the books' refusal on whole"
+        );
+
+        // The race refusal keeps its case: a miss with every slot filling.
+        arena.slots[0]
+            .state
+            .store(FILLING, std::sync::atomic::Ordering::Relaxed);
+        let raced = super::claim_slots(7, &arena, &mut books, &[3])
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            raced.contains("raced") && raced.contains("filling"),
+            "{raced}"
+        );
     }
 
     /// Layers' slots sit one after the other in the mapping: no two layers'
