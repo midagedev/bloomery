@@ -176,6 +176,37 @@ impl HostRun {
     }
 }
 
+impl HostRun {
+    /// Layer `layer`'s host view, the run's byte source and the union's
+    /// slabs, for a union call refused by name as `what`: a layer outside
+    /// the run, and slabs never made ([`HostRun::prepare_union`]).
+    fn union_of(
+        &mut self,
+        layer: usize,
+        what: &'static str,
+    ) -> Result<(&HostLayer, R8Source<'_>, &mut UnionScratch), GpuError> {
+        let HostRun {
+            file,
+            layers,
+            first,
+            union,
+            ..
+        } = self;
+        let view = layer
+            .checked_sub(*first)
+            .and_then(|i| layers.get(i))
+            .ok_or(GpuError::State {
+                what,
+                missing: "the layer's routed stacks: it is outside the host run",
+            })?;
+        let scratch = union.as_mut().ok_or(GpuError::State {
+            what,
+            missing: "the union's slabs (HostRun::prepare_union)",
+        })?;
+        Ok((view, file.source(), scratch))
+    }
+}
+
 impl HostExperts for HostRun {
     fn experts_into(
         &mut self,
@@ -202,25 +233,23 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        let HostRun {
-            file,
-            layers,
-            first,
-            union,
-            ..
-        } = self;
-        let view = layer
-            .checked_sub(*first)
-            .and_then(|i| layers.get(i))
-            .ok_or(GpuError::State {
-                what: "HostRun::experts_union_into",
-                missing: "the layer's routed stacks: it is outside the host run",
-            })?;
-        let scratch = union.as_mut().ok_or(GpuError::State {
-            what: "HostRun::experts_union_into",
-            missing: "the union's slabs (HostRun::prepare_union)",
-        })?;
-        view.experts_union_into(file.source(), x, lists, out, scratch)?;
+        let (view, src, scratch) = self.union_of(layer, "HostRun::experts_union_into")?;
+        view.experts_union_into(src, x, lists, out, scratch)?;
+        Ok(())
+    }
+
+    /// The union with the NVMe tier's ids read from the arena
+    /// ([`HostLayer::experts_step_union_into`]): a decode step's reads leave
+    /// no page of them in the page cache, so no drop follows.
+    fn experts_step_union_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let (view, src, scratch) = self.union_of(layer, "HostRun::experts_step_union_into")?;
+        view.experts_step_union_into(src, x, lists, out, scratch)?;
         Ok(())
     }
 

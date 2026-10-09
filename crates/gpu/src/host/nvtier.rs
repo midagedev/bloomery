@@ -22,10 +22,11 @@
 //! pages; the tier's dropper thread makes the syscalls, a layer's request
 //! replacing one still queued, so the freeing of the pages runs beside the
 //! next layer's work rather than on the reader's thread
-//! ([`NvTier::flush`] waits for the queue). A decode step's union of several columns
-//! (the step port) keeps what it read: its ids are the decode's hot set,
-//! which the next step reads again, and a drop would send each step back to
-//! the drive for them. Which pages go is the books' ([`drop_runs`]), never `mincore`'s, and no
+//! ([`NvTier::flush`] waits for the queue). A decode step reads the arena's
+//! ids from their slots, one column or a union of several (the step port,
+//! `HostLayer::experts_step_union_into`), so its reads bring in no page of
+//! the mapping to drop: its ids are the decode's hot set, which the next
+//! step reads again from the arena. Which pages go is the books' ([`drop_runs`]), never `mincore`'s, and no
 //! page that holds a byte of the plan's host segment, of an id a lane has
 //! open, or of the tensors beside a stack is named. The books
 //! are one atomic hint an id and a per-slot state word a pick reads without
