@@ -1629,6 +1629,19 @@ pub enum TierError {
         got: usize,
         want: usize,
     },
+    /// One call names more distinct ids of the arena than the layer's slots:
+    /// a union call reads every id it names at once, so they can never sit
+    /// resident together, and the tier's books refuse the call before they
+    /// claim any slot.
+    #[error(
+        "layer {layer}'s arena holds {slots} slots; one call names {ids} distinct ids of it, \
+         which can never sit resident together"
+    )]
+    TooManyIds {
+        layer: usize,
+        ids: usize,
+        slots: usize,
+    },
 }
 
 /// The RAM arena a host layer's routed experts read from beside the file

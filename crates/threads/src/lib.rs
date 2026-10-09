@@ -26,8 +26,9 @@ pub mod helper;
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, TryLockError};
+use std::time::Instant;
 
 thread_local! {
     /// Set on any thread that is inside `for_each_chunk` — the dispatching
@@ -152,6 +153,13 @@ pub struct Pool {
     /// decode step this is the number that separates a futex-wake dispatch
     /// from a spin-only one.
     worker_parks: AtomicUsize,
+    /// Dispatches that found the `dispatch` mutex held by another caller,
+    /// and the nanoseconds they waited for it, summed: the time callers on
+    /// two threads (a decode chain and a fill or a lane on another) spend
+    /// queued behind each other's jobs. An uncontended dispatch takes the
+    /// lock on its first try and reads no clock.
+    dispatch_waits: AtomicUsize,
+    dispatch_wait_ns: AtomicU64,
 }
 
 /// Snapshot of the pool's protocol counters, cumulative since process start.
@@ -162,6 +170,10 @@ pub struct PoolStats {
     pub dispatches: u64,
     pub dispatcher_parks: u64,
     pub worker_parks: u64,
+    /// Dispatches that waited for another caller's job to end, and how long
+    /// they waited, summed (ns).
+    pub dispatch_waits: u64,
+    pub dispatch_wait_ns: u64,
 }
 
 /// What one dispatched job consists of: the closure, lifetime-erased as a
@@ -243,6 +255,8 @@ impl Pool {
             dispatches: self.dispatches.load(Ordering::Relaxed) as u64,
             dispatcher_parks: self.dispatcher_parks.load(Ordering::Relaxed) as u64,
             worker_parks: self.worker_parks.load(Ordering::Relaxed) as u64,
+            dispatch_waits: self.dispatch_waits.load(Ordering::Relaxed) as u64,
+            dispatch_wait_ns: self.dispatch_wait_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -263,7 +277,22 @@ impl Pool {
             f(0..n);
             return;
         }
-        let _dispatch = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        // The first try is the uncontended path's one CAS; a dispatch that
+        // finds the lock held times its wait.
+        let _dispatch = match self.dispatch.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let t0 = Instant::now();
+                let g = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+                self.dispatch_waits.fetch_add(1, Ordering::Relaxed);
+                self.dispatch_wait_ns.fetch_add(
+                    u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                g
+            }
+        };
 
         // SAFETY: we hold the dispatch lock and the previous job (if any)
         // completed — its `remaining` reached zero before that call returned,
@@ -384,6 +413,8 @@ impl Pool {
             dispatches: AtomicUsize::new(0),
             dispatcher_parks: AtomicUsize::new(0),
             worker_parks: AtomicUsize::new(0),
+            dispatch_waits: AtomicUsize::new(0),
+            dispatch_wait_ns: AtomicU64::new(0),
         }
     }
 

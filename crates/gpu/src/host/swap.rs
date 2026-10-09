@@ -1107,7 +1107,9 @@ pub struct PassReport {
     pub landed: usize,
     /// Of those, the ones whose copy had not completed when the host reached
     /// the boundary, before it made them due: the engine stream waited for
-    /// them.
+    /// them. Each one is also noted in the machine's debug ring with the
+    /// terms of its wait, or counted by a full ring
+    /// ([`SwapMachine::take_late_flips`]).
     pub late: usize,
     /// Flips the rule made here.
     pub made: usize,
@@ -1181,6 +1183,154 @@ impl BoundaryAt {
     pub fn reads(self) -> u64 {
         match self {
             BoundaryAt::Launch { reads } | BoundaryAt::Ahead { reads } => reads,
+        }
+    }
+}
+
+// ------------------------------------------------------------ late flips
+
+/// Where a late flip's job stood when the boundary that lands it found its
+/// copy incomplete ([`LateFlip`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LateAt {
+    /// In the lane's queue: its victim's preparation had not begun.
+    #[default]
+    Queued,
+    /// Its victim's preparation had begun and not ended.
+    Preparing,
+    /// Prepared and not staged: the staging window, its ring slot's drain or
+    /// the source read held it.
+    Staging,
+    /// Staged: the copy stream held it — its own copy, or the copies ahead
+    /// of it.
+    Staged,
+    /// Its stamp cell holds a later job: only its identities are known.
+    Gone,
+}
+
+/// One flip whose copy's event — the copy stream's host-to-device copy
+/// included — had not completed when the host reached the boundary that
+/// lands it ([`PassReport::late`]): the flip's identities, where its job
+/// stood ([`LateAt`]) and the five terms its issue→boundary time `budget_ns`
+/// splits into, held in the machine's debug ring
+/// ([`SwapMachine::take_late_flips`]). The terms sum to the budget
+/// ([`LateFlip::of`]): `queue_ns` from the issue to the victim's
+/// preparation, `prepare_ns` the preparation, `wait_ns` from its end to the
+/// source read (the staging window and the ring slot's drain), `read_ns` the
+/// source read of the admit's parts into staging, and `copy_ns` from the
+/// staging word to the boundary — the copy stream's, the copy itself and
+/// the copies ahead of it. A term the job had not reached is 0, and the one
+/// it stood in runs to the boundary: so the largest names the mechanism —
+/// the lane queue, the drive (the preparation or the read), staging, or the
+/// copy stream. `Gone` holds 0 in every term.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LateFlip {
+    pub layer: usize,
+    /// The expert the flip copies onto the stage card.
+    pub admit: u32,
+    /// The expert it displaces to the host.
+    pub victim: u32,
+    /// The boundary whose rule made the flip and issued its copy.
+    pub issued_at: u64,
+    /// The boundary that found the copy incomplete and lands it.
+    pub landed_at: u64,
+    pub at: LateAt,
+    pub budget_ns: u64,
+    pub queue_ns: u64,
+    pub prepare_ns: u64,
+    pub wait_ns: u64,
+    pub read_ns: u64,
+    pub copy_ns: u64,
+    /// The lane's backlog at its issue: copies issued and not yet staged,
+    /// each of which the copy stream waits for ahead of this one.
+    pub ahead: u64,
+}
+
+impl LateFlip {
+    /// The terms of a late flip from its job's stamps `stamp` (`None`: the
+    /// cell holds a later job) at `now`, the boundary's start, both in
+    /// nanoseconds since the stamp epoch; the identities are the caller's.
+    /// `wait_ns` is the remainder of the budget past the four stamped terms,
+    /// so the five always sum to it.
+    pub(super) fn of(stamp: Option<lane::Stamp>, now: u64) -> LateFlip {
+        let Some(s) = stamp else {
+            return LateFlip {
+                at: LateAt::Gone,
+                ..LateFlip::default()
+            };
+        };
+        let budget = now.saturating_sub(s.queued);
+        let at = if s.staged != 0 {
+            LateAt::Staged
+        } else if s.prepare != 0 {
+            LateAt::Staging
+        } else if s.prepare_at != 0 {
+            LateAt::Preparing
+        } else {
+            LateAt::Queued
+        };
+        let queue = match at {
+            LateAt::Queued => budget,
+            _ if s.prepare_at != 0 => s.prepare_at.saturating_sub(s.queued),
+            // A job with no victim prepares nothing: its queue wait sits in
+            // the wait term.
+            _ => 0,
+        };
+        let prepare = match at {
+            LateAt::Preparing => now.saturating_sub(s.prepare_at),
+            _ => s.prepare,
+        };
+        let (read, copy) = match at {
+            LateAt::Staged => (s.read, now.saturating_sub(s.staged)),
+            _ => (0, 0),
+        };
+        LateFlip {
+            at,
+            budget_ns: budget,
+            queue_ns: queue,
+            prepare_ns: prepare,
+            wait_ns: budget.saturating_sub(queue + prepare + read + copy),
+            read_ns: read,
+            copy_ns: copy,
+            ahead: s.ahead,
+            ..LateFlip::default()
+        }
+    }
+}
+
+/// The late-flip debug ring, taken ([`SwapMachine::take_late_flips`]): the
+/// flips the boundaries noted since the last take, and how many a full ring
+/// dropped — counted, never dropped silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LateLog {
+    pub flips: Vec<LateFlip>,
+    pub dropped: u64,
+}
+
+/// The most late flips the ring holds; past it the ring counts.
+const LATE_RING: usize = 64;
+
+/// The boundaries' late flips ([`PassReport::late`]): the first
+/// [`LATE_RING`] of them since the last take, a full ring counting the rest.
+#[derive(Default)]
+struct LateRing {
+    flips: Vec<LateFlip>,
+    dropped: u64,
+}
+
+impl LateRing {
+    fn note(&mut self, f: LateFlip) {
+        if self.flips.len() >= LATE_RING {
+            self.dropped += 1;
+        } else {
+            self.flips.push(f);
+        }
+    }
+
+    fn take(&mut self) -> LateLog {
+        LateLog {
+            flips: std::mem::take(&mut self.flips),
+            dropped: std::mem::take(&mut self.dropped),
         }
     }
 }
@@ -1478,6 +1628,16 @@ pub struct SwapMachine {
     /// `free` lists the idle.
     events: Vec<CudaEvent>,
     event_job: Vec<u64>,
+    /// Per flip in flight, the boundary that issued it, for the late-flip
+    /// ring ([`LateFlip::issued_at`]).
+    event_at: Vec<u64>,
+    /// The boundaries' late flips ([`PassReport::late`]), for
+    /// [`SwapMachine::take_late_flips`].
+    late: LateRing,
+    /// The bytes of the experts the map words put on the stage card and
+    /// sent back to the host since the machine's start
+    /// ([`SwapMachine::moved_bytes`]).
+    moved: (u64, u64),
     free: Vec<usize>,
     /// Jobs issued: job `n` stages through [`ring_ticket`]`(n)`.
     jobs_issued: u64,
@@ -1673,6 +1833,9 @@ impl SwapMachine {
             copy_waits_boundary: false,
             free: (0..events.len()).rev().collect(),
             event_job: vec![0; events.len()],
+            event_at: vec![0; events.len()],
+            late: LateRing::default(),
+            moved: (0, 0),
             events,
             jobs_issued: 0,
             planned: None,
@@ -2167,6 +2330,7 @@ impl SwapMachine {
         for f in &landing {
             if !self.events[f.event].query()? {
                 report.late += 1;
+                self.note_late(b, f, start);
             }
             self.shared.due.fetch_max(f.job + 1, Ordering::AcqRel);
         }
@@ -2252,6 +2416,39 @@ impl SwapMachine {
         }
         self.ahead = None;
         Ok(b)
+    }
+
+    /// The bytes of the experts the map words put on the stage card
+    /// (promotions) and sent back to the host (demotions) since the
+    /// machine's start, an expert counted at its map word's change — its
+    /// layer's parts, which every expert of the layer shares.
+    #[must_use]
+    pub fn moved_bytes(&self) -> (u64, u64) {
+        self.moved
+    }
+
+    /// The late-flip debug ring, taken ([`LateLog`]): the flips the
+    /// boundaries noted since the last take — their identities and the
+    /// staging stamps that decompose each one's issue→boundary time — and
+    /// how many a full ring dropped. A take empties it.
+    pub fn take_late_flips(&mut self) -> LateLog {
+        self.late.take()
+    }
+
+    /// Flip `f`, found late at boundary `b`, into the debug ring: its
+    /// identities and issuing boundary from the machine's books, its terms
+    /// from its job's stamps against this boundary's own start
+    /// ([`LateFlip::of`]).
+    fn note_late(&mut self, b: u64, f: &Landing, start: Instant) {
+        let now = lane::since_epoch(self.shared.epoch, start);
+        self.late.note(LateFlip {
+            layer: f.layer,
+            admit: f.admit,
+            victim: f.victim,
+            issued_at: self.event_at[f.event],
+            landed_at: b,
+            ..LateFlip::of(self.shared.stamps.of(f.job), now)
+        });
     }
 
     /// Wait, within the deadline, until landing flip `f`'s job is staged or
@@ -2391,7 +2588,7 @@ impl SwapMachine {
             let made: Vec<Flip> = self.rule.plan(b).map_err(|e| rule_err(WHAT, e))?.to_vec();
             let t0 = Instant::now();
             for f in &made {
-                report.bytes += self.issue(slots, f)?;
+                report.bytes += self.issue(b, slots, f)?;
             }
             report.issue_us = micros(t0);
             report.made = made.len();
@@ -2405,10 +2602,10 @@ impl SwapMachine {
         Ok(())
     }
 
-    /// Issue flip `f`, made at this boundary, into its layer's lowest spare
+    /// Issue flip `f`, made at boundary `b`, into its layer's lowest spare
     /// slot, with an event for its landing ([`SwapMachine::copy_into`]). The
     /// bytes it copies.
-    fn issue(&mut self, slots: &SlotMap, f: &Flip) -> Result<u64, GpuError> {
+    fn issue(&mut self, b: u64, slots: &SlotMap, f: &Flip) -> Result<u64, GpuError> {
         const WHAT: &str = "SwapMachine::issue";
         let l = f.layer_of(self.layers.start);
         let spare = self.ledger.spare(l).ok_or_else(|| {
@@ -2419,6 +2616,7 @@ impl SwapMachine {
             .pop()
             .ok_or_else(|| GpuError::protocol(WHAT, "more flips in flight than spares"))?;
         self.event_job[event] = self.jobs_issued;
+        self.event_at[event] = b;
         let bytes = self.copy_into(slots, l, f.admit, spare, Some(f.evict), Gate::Boundary)?;
         self.events[event].record(&self.copy)?;
         self.ledger.row_mut(l)[spare as usize] = SlotState::Filling {
@@ -2482,6 +2680,13 @@ impl SwapMachine {
             .collect::<Result<Vec<_>, _>>()?;
         let n = self.jobs_issued;
         let (ring, ticket) = ring_ticket(n)?;
+        // The job's issue stamp — the one clock read a job adds — written
+        // before the lane can take it, with the copies already ahead.
+        self.shared.stamps.issue(
+            n,
+            lane::since_epoch(self.shared.epoch, Instant::now()),
+            waiting,
+        );
         let job = Job {
             n,
             layer: l,
@@ -2573,6 +2778,14 @@ impl SwapMachine {
     fn write_changed(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         let (view, n) = (self.view, self.n_expert);
         let start = self.layers.start;
+        for &(l, _, entry) in &self.changed {
+            let bytes: usize = self.shared.source.part_bytes(l).iter().sum();
+            if entry == HOST {
+                self.moved.1 += bytes as u64;
+            } else {
+                self.moved.0 += bytes as u64;
+            }
+        }
         for chunk in self.changed.chunks(BATCH_OPS) {
             self.ops.clear();
             self.ops.extend(chunk.iter().map(|&(l, id, entry)| {
@@ -3540,9 +3753,11 @@ fn send_on(
 
 #[cfg(test)]
 mod tests {
+    use super::super::lane::Stamp;
     use super::super::slots::{HOST, Slot, SlotMap};
     use super::{
-        CardTable, Residency, SetDiff, SlotLedger, SlotState, TableCheck, TableOff, Tally,
+        CardTable, LATE_RING, LateAt, LateFlip, LateRing, Residency, SetDiff, SlotLedger,
+        SlotState, TableCheck, TableOff, Tally,
     };
 
     /// A card table against its map and ledger: the map's own copy is off
@@ -3719,5 +3934,100 @@ mod tests {
             Some(&[SlotState::Live(0), SlotState::Live(3)][..])
         );
         assert!(!ledger.land(3) && !ledger.land(9));
+    }
+
+    /// The late-flip ring holds what the boundaries noted and counts what a
+    /// full ring drops — never dropping a line silently — and a take empties
+    /// both. A ring that overwrote or dropped silently would answer fewer
+    /// than the passes counted late.
+    #[test]
+    fn the_late_ring_counts_what_a_full_ring_drops() {
+        let mut ring = LateRing::default();
+        let flip = |layer: usize| LateFlip {
+            layer,
+            ..LateFlip::default()
+        };
+        for layer in 0..LATE_RING {
+            ring.note(flip(layer));
+        }
+        assert_eq!(ring.flips.len(), LATE_RING, "the ring holds its bound");
+        assert_eq!(ring.dropped, 0);
+        ring.note(flip(LATE_RING));
+        assert_eq!(ring.flips.len(), LATE_RING, "a full ring keeps its bound");
+        assert_eq!(ring.dropped, 1, "the dropped line is counted");
+        let log = ring.take();
+        assert_eq!(
+            (log.flips.len(), log.dropped),
+            (LATE_RING, 1),
+            "the take answers the ring's whole count"
+        );
+        assert_eq!(log.flips.first().map(|f| f.layer), Some(0));
+        let again = ring.take();
+        assert!(
+            again.flips.is_empty() && again.dropped == 0,
+            "the take empties the ring"
+        );
+    }
+
+    /// A late flip's five terms sum to its issue→boundary budget wherever
+    /// its job stood, and the one it stood in runs to the boundary: queued,
+    /// preparing, prepared and not staged, staged; a job whose cell a later
+    /// one took holds no term.
+    #[test]
+    fn a_late_flips_terms_close_its_budget() {
+        let now = 10_000;
+        let terms = |f: &LateFlip| f.queue_ns + f.prepare_ns + f.wait_ns + f.read_ns + f.copy_ns;
+        let queued = Stamp {
+            queued: 1_000,
+            ahead: 3,
+            ..Stamp::default()
+        };
+        let cases = [
+            (queued, LateAt::Queued, [9_000, 0, 0, 0, 0]),
+            (
+                Stamp {
+                    prepare_at: 2_000,
+                    ..queued
+                },
+                LateAt::Preparing,
+                [1_000, 8_000, 0, 0, 0],
+            ),
+            (
+                Stamp {
+                    prepare_at: 2_000,
+                    prepare: 3_000,
+                    ..queued
+                },
+                LateAt::Staging,
+                [1_000, 3_000, 5_000, 0, 0],
+            ),
+            (
+                Stamp {
+                    prepare_at: 2_000,
+                    prepare: 3_000,
+                    read: 1_500,
+                    staged: 7_500,
+                    ..queued
+                },
+                LateAt::Staged,
+                [1_000, 3_000, 1_000, 1_500, 2_500],
+            ),
+        ];
+        for (stamp, at, want) in cases {
+            let f = LateFlip::of(Some(stamp), now);
+            assert_eq!(f.at, at, "{stamp:?}");
+            assert_eq!(
+                [f.queue_ns, f.prepare_ns, f.wait_ns, f.read_ns, f.copy_ns],
+                want,
+                "{at:?}"
+            );
+            assert_eq!(terms(&f), f.budget_ns, "{at:?}: the terms close the budget");
+            assert_eq!((f.budget_ns, f.ahead), (9_000, 3), "{at:?}");
+        }
+        let gone = LateFlip::of(None, now);
+        assert_eq!(
+            (gone.at, gone.budget_ns, terms(&gone)),
+            (LateAt::Gone, 0, 0)
+        );
     }
 }

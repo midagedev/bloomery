@@ -1,5 +1,6 @@
 //! Gate tests for the resident pool: partition exactness, coverage,
-//! repeated-call barrier health, panic propagation, and (hw_) topology.
+//! repeated-call barrier health, panic propagation, the count of a contended
+//! dispatch's wait, and (hw_) topology.
 //!
 //! The pure tests (everything but `hw_topology`) run in the default loop:
 //! they need no pinning to be correct — an unpinned pool must produce
@@ -154,6 +155,48 @@ fn nested_dispatch_asserts_instead_of_hanging() {
             panic!("nested for_each_chunk deadlocked for 30 s — the reentrancy assert is gone")
         }
     }
+}
+
+/// A dispatch that finds another caller's job holding the pool is counted
+/// with its wait: a job on another thread holds the dispatch for its chunks'
+/// sleep, and this thread's dispatch, started once that job is inside its
+/// chunks, waits for it — `dispatch_waits` moves by at least one and
+/// `dispatch_wait_ns` by at least part of the sleep. A pool of one thread
+/// takes no lock and counts nothing.
+#[test]
+fn a_contended_dispatch_counts_its_wait() {
+    let p = pool();
+    let before = p.stats();
+    let (inside, entered) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        pool().for_each_chunk(pool().threads(), |c: Range<usize>| {
+            if c.start == 0 {
+                inside.send(()).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+    });
+    entered
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the holding job entered its chunks");
+    p.for_each_chunk(1, |_: Range<usize>| {});
+    holder.join().expect("the holding job");
+    let after = p.stats();
+    if p.threads() == 1 {
+        assert_eq!(
+            after.dispatch_waits, before.dispatch_waits,
+            "one thread: no lock"
+        );
+        return;
+    }
+    assert!(
+        after.dispatch_waits > before.dispatch_waits,
+        "the contended dispatch was counted: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.dispatch_wait_ns - before.dispatch_wait_ns >= 10_000_000,
+        "its wait covers part of the holder's 50 ms: {before:?} -> {after:?}"
+    );
 }
 
 /// Reads the real /sys topology. Asserted strongly but portably: at least one
