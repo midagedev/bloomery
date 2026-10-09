@@ -228,7 +228,7 @@ use bloomery_gpu_gates::residency38::{
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
-    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_resume, seq_save,
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_bytes, seq_resume, seq_save,
 };
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -930,12 +930,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
         Residency::Off => 0,
     };
+    // A default too small for one saved state (one position, the KDA
+    // layers' two recurrent copies whole, `seq_bytes`) is off.
     let cache = CacheRam::of(
         a.cache_ram,
         HostNeed::of(&plan, beside).bytes(),
         pool,
         checkpoints_beside(plan.machine),
-    )?;
+    )?
+    .holding(seq_bytes(&inputs, 1, nextn.is_some()));
     eprintln!("{}", cache.line());
     eprintln!(
         "parallel rule=slots slots={slots} slot_ctx={} total={} from={from} pass={}",

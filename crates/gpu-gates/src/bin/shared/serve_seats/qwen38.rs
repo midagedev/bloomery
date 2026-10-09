@@ -91,9 +91,11 @@
 //! whole, and its checkpoints are those two points. Its default is the
 //! lesser of `bind::CACHE_RAM_CAP` and half of what `MemAvailable` leaves at
 //! load past the plan's host need, the residency's churn pool and the
-//! checkpoints' host budget; a `cache` line on stderr prints it with each
-//! term. A state of another model, card, context or store layout (a load
-//! with the draft beside one without it) is refused by name; every save,
+//! checkpoints' host budget, and 0 on a plan the NVMe tier split (the split
+//! fills the room) or one too small for a one-position state; a `cache` line
+//! on stderr prints it with each term. A state of another model, card,
+//! context or store layout (a load with the draft beside one without it) is
+//! refused by name; every save,
 //! load, eviction and skip prints as a line.
 //!
 //! `--parallel N` (`-np N`) serves N resident sequences inside the one
@@ -737,13 +739,15 @@ impl Plans<'_> {
     /// records unprinted), and the arena itself
     /// (`HostTotals::nvme_arena_bytes`, 0 without one) for the `cache`
     /// line's `tier` term — [`CacheRam::of_tier`] counts it once, inside
-    /// the need — and the checkpoint bytes beside the need
-    /// ([`checkpoints_beside`]: none, the machine reserving every slot's).
+    /// the need — the checkpoint bytes beside the need
+    /// ([`checkpoints_beside`]: none, the machine reserving every slot's),
+    /// and the routed-expert bytes the host leg reads from the NVMe tier
+    /// (`HostTotals::nvme_expert_bytes`, 0 on a plan it did not split).
     fn host(
         &self,
         ctx: usize,
         set: Option<(Residency, &str)>,
-    ) -> Result<(u64, u64, u64, u64), GateError> {
+    ) -> Result<(u64, u64, u64, u64, u64), GateError> {
         let ub = ubatch_for(ctx)?;
         let c = u64::try_from(ctx)?;
         let machine = self.place.machine(
@@ -787,8 +791,23 @@ impl Plans<'_> {
             pool,
             plan.host.nvme_arena_bytes,
             checkpoints_beside(&machine),
+            plan.host.nvme_expert_bytes,
         ))
     }
+}
+
+/// The host bytes a sequence state of `positions` positions holds on the
+/// file `inputs` describes ([`Seq38`]: its positional rows and two recurrent
+/// copies, the draft's side under `drafts`, [`seq38_bytes`]) — at one
+/// position the least one saved state of the prompt cache holds.
+fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
+    let gdn = inputs
+        .spec
+        .layers
+        .iter()
+        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+        .count();
+    seq38_bytes(gdn, inputs.spec.layers.len() - gdn, positions, drafts)
 }
 
 /// The context the seat loads ([`ctx38`]) and what decided it: every number
@@ -962,21 +981,15 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
 
 impl Ctx38 {
     /// A default bounded by the prompt cache too: one session's state at its
-    /// slot's context ([`Seq38`: its positional rows and two recurrent
-    /// copies, the draft's side under `drafts`](seq38_bytes)) fits `ram`
-    /// bytes, when the cache is on. A set context keeps its value.
+    /// slot's context ([`seq38_state`]) fits `ram` bytes, when the cache is
+    /// on. A set context keeps its value; a set budget too small for one
+    /// position's state is refused by name (a default one is 0 already,
+    /// [`CacheRam::holding`]).
     fn host_bound(self, inputs: &PlanInputs, ram: u64, drafts: bool) -> Result<Ctx38, GateError> {
         if self.rule == "set" || ram == 0 {
             return Ok(self);
         }
-        let gdn = inputs
-            .spec
-            .layers
-            .iter()
-            .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
-            .count();
-        let qsa = inputs.spec.layers.len() - gdn;
-        let state = |n: usize| seq38_bytes(gdn, qsa, n, drafts);
+        let state = |n: usize| seq38_state(inputs, n, drafts);
         if state(self.ctx) <= ram {
             return Ok(self);
         }
@@ -1456,8 +1469,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     refuse_mtp_levers(&draft_off)?;
-    let (need, pool, arena, beside) = host;
-    let cache = CacheRam::of_tier(a.cache_ram, need, pool, arena, beside)?;
+    let (need, pool, arena, beside, paged) = host;
+    let cache = CacheRam::of_tier(a.cache_ram, need, pool, (arena, paged), beside)?
+        .holding(seq38_state(&inputs, 1, mtp));
     let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();
     eprintln!(
