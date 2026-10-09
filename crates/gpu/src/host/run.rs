@@ -82,8 +82,19 @@ impl HostRun {
     /// covers its own handle: the plan's host segment and the arena, the
     /// parts resolved by the layer's stack names. Load-time only, once,
     /// after the build; a run with no tier keeps reading the file mapping
-    /// alone.
+    /// alone. Refused by name: a tier over another open of the model file,
+    /// whose drops would not reach the pages the run's union reads.
     pub fn attach_tier(&mut self, tier: Option<Arc<NvTier>>) -> Result<(), GpuError> {
+        if tier
+            .as_ref()
+            .is_some_and(|t| !t.drops_reach(self.file.split()))
+        {
+            return Err(GpuError::shape(
+                "HostRun::attach_tier",
+                "the NVMe tier was built over another open of the model file than the run reads: \
+                 its drops would leave the run's pages cached",
+            ));
+        }
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let Some(tier) = tier.as_ref() else {
                 break;

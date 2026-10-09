@@ -265,6 +265,25 @@ pub trait SwapSource: Send + Sync {
     /// [`SwapSource::part_bytes`]`(layer)[part]` bytes once transformed.
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError>;
 
+    /// A lane is about to read layer `layer`'s expert `id` through
+    /// [`SwapSource::source`], part after part: the bytes stay until its
+    /// [`SwapSource::release_read`], which every lane makes after an open,
+    /// its copy failed or not. Nothing by default.
+    fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+        let _ = (layer, id);
+        Ok(())
+    }
+
+    /// The lane that opened layer `layer`'s expert `id`
+    /// ([`SwapSource::open_read`]) is done with the pieces
+    /// [`SwapSource::source`] lent: the source lets go of what those reads
+    /// brought in. Nothing by default: a source whose reads leave nothing
+    /// behind.
+    fn release_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+        let _ = (layer, id);
+        Ok(())
+    }
+
     /// The device address slot `slot` of layer `layer`'s stack `part` starts
     /// at. The stacks stay allocated and in place until the machine's copy
     /// stream has drained: its owner stops the machine before it frees them

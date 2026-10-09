@@ -412,28 +412,35 @@ impl Shared {
     }
 
     /// Copy `job`'s expert from its source into its ring slot, part after
-    /// part, at the offsets its layer's parts lay out.
+    /// part, at the offsets its layer's parts lay out, between the source's
+    /// open of the read and its release, which follows the copy whether it
+    /// failed or not ([`SwapSource::open_read`]).
     fn stage(&self, job: &Job) -> Result<(), GpuError> {
-        let mut at = 0usize;
-        for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
-            let piece = self.source.source(job.layer, job.id, part)?;
-            if piece.bytes.len() != want {
-                return Err(GpuError::shape(
-                    "SwapMachine staging",
-                    format!(
-                        "layer {} expert {} part {part}: {} source bytes for a slot of {want}",
-                        job.layer,
-                        job.id,
-                        piece.bytes.len()
-                    ),
-                ));
+        self.source.open_read(job.layer, job.id)?;
+        let copied = (|| {
+            let mut at = 0usize;
+            for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
+                let piece = self.source.source(job.layer, job.id, part)?;
+                if piece.bytes.len() != want {
+                    return Err(GpuError::shape(
+                        "SwapMachine staging",
+                        format!(
+                            "layer {} expert {} part {part}: {} source bytes for a slot of {want}",
+                            job.layer,
+                            job.id,
+                            piece.bytes.len()
+                        ),
+                    ));
+                }
+                match piece.transform {
+                    Transform::Identity => self.ring.write(job.ring, at, piece.bytes)?,
+                }
+                at += want;
             }
-            match piece.transform {
-                Transform::Identity => self.ring.write(job.ring, at, piece.bytes)?,
-            }
-            at += want;
-        }
-        Ok(())
+            Ok(())
+        })();
+        let released = self.source.release_read(job.layer, job.id);
+        copied.and(released)
     }
 
     /// What the lane did since the load ([`LaneStats`]).

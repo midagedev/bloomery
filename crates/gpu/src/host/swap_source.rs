@@ -585,11 +585,24 @@ impl FileSwap {
 
     /// Give the source the NVMe expert tier's arena the body built for the
     /// plan's paged layers. Load-time only, before the machine starts and
-    /// once: a second attach is refused by name.
+    /// once: a second attach is refused by name, and so is a tier over
+    /// another open of the model file (its drops would not reach the pages
+    /// the lanes read) and a load whose host set holds a page the tier drops
+    /// after each read — a churn pool on a paged stack, whose pages the
+    /// drops would take from under the host ([`NvTier::refuse_held_pages`]).
     pub fn attach_tier(&self, tier: &Arc<NvTier>) -> Result<(), GpuError> {
+        const WHAT: &str = "FileSwap::attach_tier";
+        if !tier.drops_reach(self.pair.split()) {
+            return Err(GpuError::shape(
+                WHAT,
+                "the NVMe tier was built over another open of the model file than the source \
+                 reads: its drops would leave the lanes' pages cached",
+            ));
+        }
+        tier.refuse_held_pages(&self.set)?;
         self.tier
             .set(Arc::clone(tier))
-            .map_err(|_| GpuError::state("FileSwap::attach_tier", "a source with no tier yet"))
+            .map_err(|_| GpuError::state(WHAT, "a source with no tier yet"))
     }
 
     /// The arena, when it serves layer `layer`'s expert `id` ([`NvTier::serves`]).
@@ -713,6 +726,27 @@ impl SwapSource for FileSwap {
             bytes,
             transform: Transform::Identity,
         })
+    }
+
+    /// An id the arena serves is open on the tier while a lane reads it
+    /// ([`NvTier::open_read`]): no union's drop of its layer takes the pages
+    /// the lane has yet to copy out. An id the mapping serves needs nothing.
+    fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+        match self.tier_serving(layer, id) {
+            Some(tier) => tier.open_read(layer, id),
+            None => Ok(()),
+        }
+    }
+
+    /// An id the arena serves leaves the mapping and the page cache once a
+    /// lane is done with it ([`NvTier::end_read`]): its pages were the
+    /// read's alone, and the next read faults them in again. An id the
+    /// mapping serves keeps its pages: the host set's.
+    fn release_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+        match self.tier_serving(layer, id) {
+            Some(tier) => tier.end_read(layer, id),
+            None => Ok(()),
+        }
     }
 
     fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError> {
