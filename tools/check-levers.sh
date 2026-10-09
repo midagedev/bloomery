@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lever check — runs on the Mac (text only, no build). Three holds:
+# Lever check — runs on the Mac (text only, no build). Five holds:
 #
 # 1. Every environment read in the crates — crates/*/src outside the lever registry
 #    (crates/levers/src), crates/*/tests and crates/*/build.rs — is a line of
@@ -24,6 +24,11 @@
 #    associated function of an inherent impl as `Type::name` (or `Self::name` in its file), a method
 #    as `.name(` or `Type::name`, a free function as its name anywhere but its own `fn`. By name it
 #    can take another item of the same name for a caller, never miss one.
+# 5. A Phase::Runtime row's setter resolves: the row names, inline, the file from the repository
+#    root and the fn — a free function or a method — that changes the lever between calls of one
+#    loaded model (crates/levers/src/lib.rs's Phase), and that file is in the tree and defines
+#    `fn <item>` in code, not in a comment or a string. A Phase::Runtime stated any other way, a
+#    file that is not there or a fn that file does not define is red, naming the row.
 # The registry's in-place rows and the list are held to each other by the levers crate's test
 # registry_and_allow_list_agree (just gate-levers), which reads this list at build time.
 set -euo pipefail
@@ -421,6 +426,41 @@ for rel in sorted(reads):
                        'without a word; call the reader, or make the row Parsed so every binary '
                        'refuses it by name until one acts on it')
 
+# 5. A Phase::Runtime row's setter resolves: the file is in the tree and defines `fn <item>` in
+#    code (not in a comment or a string), and the row's lever is named with the failure.
+RUNTIME = re.compile(
+    r'Phase::Runtime\s*\{\s*setter\s*:\s*Setter\s*\{\s*file\s*:\s*"([^"]*)"\s*,\s*'
+    r'item\s*:\s*"([^"]*)"')
+ROW_NAME = re.compile(r'\bname\s*:\s*("[^"]*"|[A-Za-z_][A-Za-z0-9_]*)')
+registry_rel = os.path.relpath(registry_path, root)
+consts = dict(CONST.findall(registry))
+runtime_rows = 0
+for m in re.finditer(r'\bPhase::Runtime\b', registry):
+    n = registry.count('\n', 0, m.start()) + 1
+    shape = RUNTIME.match(registry, m.start())
+    if shape is None:
+        bad.append(f'{registry_rel}:{n}: a Phase::Runtime stated any other way than '
+                   'Phase::Runtime { setter: Setter { file: "…", item: "…" } }')
+        continue
+    file, item = shape.groups()
+    bindings = list(ROW_NAME.finditer(registry, 0, m.start()))
+    binding = bindings[-1].group(1) if bindings else None
+    if binding is None:
+        bad.append(f'{registry_rel}:{n}: a Phase::Runtime whose row names no lever')
+        continue
+    lever = binding.strip('"') if binding.startswith('"') else consts.get(binding, binding)
+    setter_path = os.path.join(root, file)
+    if not os.path.isfile(setter_path):
+        bad.append(f'{registry_rel}:{n}: {lever} is Phase::Runtime; its setter names {file}, '
+                   'which is no file under the repository root')
+        continue
+    if not re.search(r'\bfn\s+' + re.escape(item) + r'(?![A-Za-z0-9_])',
+                     code_only(open(setter_path, encoding='utf-8').read())):
+        bad.append(f'{registry_rel}:{n}: {lever} is Phase::Runtime; its setter {file} defines '
+                   f'no fn {item} in code')
+        continue
+    runtime_rows += 1
+
 if bad:
     for b in bad:
         print(b, file=sys.stderr)
@@ -433,5 +473,6 @@ count = sum(len(v) for v in reads.values())
 print(f'check-levers: ok ({count} reads in place in {len(reads)} files, all listed; '
       f'{len(names)} BLOOMERY_* names in tools/, the justfile and .cargo/, all rows; '
       f'{len(env_rows)} rows that are no lever, each named by its owner; {lever_reads} lever '
-      'reads in crates/*/src, each in a function something calls)')
+      'reads in crates/*/src, each in a function something calls; '
+      f'{runtime_rows} Phase::Runtime rows, each setter a fn in the tree)')
 PY
