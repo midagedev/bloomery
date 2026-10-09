@@ -1046,12 +1046,14 @@ mod cli {
             arena,
             slots,
             slots_by: (slots > 1).then_some(SlotsBy::GenSlots),
+            // `BLOOMERY_GEN_SLOTS` decodes its streams as one pass.
+            together: true,
             draft: mtp,
             draft_set: levers.draft().is_some(),
         };
         Ok(match paged_columns(&at)? {
             Paged::AsAsked => (draft, off),
-            Paged::OneColumn => (Draft38::Off, paged_draft(mtp, off, arena).1),
+            Paged::OneColumn { .. } => (Draft38::Off, paged_draft(mtp, off, arena).1),
         })
     }
 

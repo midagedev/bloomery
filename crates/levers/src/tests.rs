@@ -1101,6 +1101,7 @@ fn a_paged_plan_steps_one_column() {
         arena,
         slots,
         slots_by: slots_set.then_some(SlotsBy::Parallel),
+        together: true,
         draft,
         draft_set,
     };
@@ -1119,10 +1120,22 @@ fn a_paged_plan_steps_one_column() {
         (at(arena, 1, false, false, false), Ok(Paged::AsAsked)),
         (at(arena, 1, true, false, true), Ok(Paged::AsAsked)),
         // The unset counts fall to one column.
-        (at(arena, 2, false, false, false), Ok(Paged::OneColumn)),
-        (at(arena, 1, false, true, false), Ok(Paged::OneColumn)),
-        (at(arena, 2, false, true, false), Ok(Paged::OneColumn)),
-        (at(arena, 1, true, true, false), Ok(Paged::OneColumn)),
+        (
+            at(arena, 2, false, false, false),
+            Ok(Paged::OneColumn { slots: 1 }),
+        ),
+        (
+            at(arena, 1, false, true, false),
+            Ok(Paged::OneColumn { slots: 1 }),
+        ),
+        (
+            at(arena, 2, false, true, false),
+            Ok(Paged::OneColumn { slots: 1 }),
+        ),
+        (
+            at(arena, 1, true, true, false),
+            Ok(Paged::OneColumn { slots: 1 }),
+        ),
         // A set value that steps several columns is refused, each named.
         (at(arena, 2, true, false, false), refused(Some(2), false)),
         (at(arena, 2, true, true, false), refused(Some(2), false)),
@@ -1145,11 +1158,33 @@ fn a_paged_plan_steps_one_column() {
          kernel swaps the arena out); serve --parallel 1 or leave --parallel unset; set \
          BLOOMERY_DRAFT=off or leave it unset"
     );
+    // Beside an expert tier card each slot steps alone: slots add no
+    // column, so they are served as asked, set or not, and only the draft —
+    // its verify still steps several — goes off, every slot kept.
+    let bp = |slots, slots_set: bool, draft, draft_set| PagedAt {
+        arena,
+        slots,
+        slots_by: slots_set.then_some(SlotsBy::Parallel),
+        together: false,
+        draft,
+        draft_set,
+    };
+    for (at, want) in [
+        (bp(2, false, false, false), Ok(Paged::AsAsked)),
+        (bp(3, true, false, false), Ok(Paged::AsAsked)),
+        (bp(2, false, true, false), Ok(Paged::OneColumn { slots: 2 })),
+        (bp(3, true, true, false), Ok(Paged::OneColumn { slots: 3 })),
+        (bp(1, false, true, false), Ok(Paged::OneColumn { slots: 1 })),
+        (bp(2, true, true, true), refused(None, true)),
+    ] {
+        assert_eq!(paged_columns(&at), want, "{at:?}");
+    }
     // The CLI's own count, named as it is set.
     let cli = PagedAt {
         arena,
         slots: 2,
         slots_by: Some(SlotsBy::GenSlots),
+        together: true,
         draft: false,
         draft_set: false,
     };
