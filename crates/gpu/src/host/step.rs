@@ -1066,7 +1066,7 @@ impl StepPort {
     /// check it, build each column's host list in slot order from the
     /// image's routing (`n_used` a column), and run the layer's host experts
     /// for every column in one union call
-    /// ([`HostExperts::experts_union_into`]), each column's sum bit for bit
+    /// ([`HostExperts::experts_step_union_into`]), each column's sum bit for bit
     /// what a one-column service writes for it, into the row's sum; then
     /// signal. A column the card should already have refused runs nothing:
     /// every column's sum is NaN and the service fails by name.
@@ -1163,7 +1163,7 @@ impl StepPort {
                 .enumerate()
                 .map(|(j, &len)| &self.lists[j * n..][..len]),
         );
-        let r = experts.experts_union_into(layer, x, &lists, out);
+        let r = experts.experts_step_union_into(layer, x, &lists, out);
         self.stats.host_calls += 1;
         self.slices = reuse_slices(lists);
         r?;
