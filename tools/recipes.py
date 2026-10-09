@@ -4186,6 +4186,461 @@ def recipe_closure(recipes: dict[str, Recipe], name: str) -> list[str]:
     return sorted(seen)
 
 
+# ----------------------------------------------------------------------------------------------
+# opens: the recipes whose cargo targets reach the fixture fence (tools/gate-batch.sh's real-file deferral)
+# ----------------------------------------------------------------------------------------------
+# The fixture tier's fence is the fn `check_file` of FENCE_PKG (Tier::check_file, crates/gpu-gates/src/tier.rs): a run under
+# BLOOMERY_TIER=fixture that opens a model file ends in a named refusal unless the file is a fixture. A family whose fixture-table
+# row is `self` (tools/ref/ref-paths.sh) runs on its real file, so a recipe of such a family whose targets reach the fence is
+# refused at run time; `opens RECIPE…` says which, from the code.
+#
+#   - The fence is the fn FENCE_FN defined in FENCE_PKG's own files. None found is a named error (70), never "reaches nothing".
+#     Only FENCE_PKG's files are read: a workspace package that depends on it would reach the fence through it, which this
+#     reader does not follow, so such a package is a named error too.
+#   - The openers are the fns of FENCE_PKG's lib module tree (test-only items left out, the definer's file left out) whose body
+#     calls the fence or another opener, closed to a fixpoint. A call is matched by the fn's identity, not its bare name: a free
+#     fn by `name(` or `path::name(`; a fn of an `impl T` or `trait T` block by `T::name(` (generics between the segments
+#     allowed) or `Self::name(` inside that block, and by `.name(` only when its first parameter is `self`. `File::open(` is
+#     therefore not a call of `Generator::open`.
+#   - A target reaches the fence when its own module tree has a call of the fence or of an opener on a non-comment line. What
+#     the tree is depends on what the command does with the target. A bin, example or bench that is built (`cargo build`, `run`;
+#     a runner executes it, or a process of the recipe spawns it) is its module tree, the files `Tree.walk` gives. The same under
+#     `cargo test` or tools/gate.sh runs its tests only: the files only a test build reads. An integration test target under
+#     `cargo test` is its whole tree; the lib under `cargo test` is the files only its test build reads; a built test or lib is
+#     not executed. Comments and string and char literals are blanked first (`rust_lex`).
+#   - The targets are those of the recipe and its dependencies that a command builds or runs. `check`, `clippy` and `doc` compile
+#     and run nothing, so a recipe none of whose commands runs a target (`cargo test|run|bench`, tools/gate.sh, a bin runner)
+#     reaches nothing, whatever it compiles.
+#
+# What the scan cannot see: a macro body or a call spelt by a macro; a call through a type alias, a `use … as` rename, a trait
+# object or a generic parameter (`B::open(`); a fn stored in a variable or a closure and called elsewhere; a test run through an
+# inline `#[cfg(test)]` module, which a test run reads no more than its test files; a process the target spawns that is not
+# built by the same recipe; a feature or target `cfg` (every `mod` the tree names is read).
+
+FENCE_PKG = "bloomery-gpu-gates"
+FENCE_FN = "check_file"
+OPENS_RUNS = frozenset({"test", "run", "bench"})
+OPENS_BUILDS = frozenset({"build", "test", "run", "bench", "rustc"})
+_ITEM_BLOCK = re.compile(rf"^{_VIS}(?:unsafe\s+)?(impl|trait)\b")
+_SELF_PARAM = re.compile(r"\(\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?(?:mut\s+)?self\b")
+_CALL = re.compile(
+    r"(?P<dot>\.\s*)?(?:(?P<q>[A-Za-z_]\w*)\s*(?:::\s*<[^()]*?>\s*)?::\s*)?(?P<n>[A-Za-z_]\w*)\s*(?:::\s*<[^()]*?>\s*)?\("
+)
+_AFTER_FN = re.compile(r"\bfn\s*$")
+
+
+class OpensError(Exception):
+    """A failure of `opens`, named, with the exit code it ends the command with."""
+
+    def __init__(self, code: int, msg: str):
+        super().__init__(msg)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class FnDef:
+    name: str
+    owner: str | None  # the type of the `impl` block (the name of the `trait` block) the fn sits in; None for a free fn
+    method: bool  # its first parameter is a `self` receiver
+    path: str
+    line: int
+    body: tuple[int, int]  # the braces' inside, as offsets in the file's `shape`
+
+
+def _line_at(shape: str, at: int) -> int:
+    return shape.count("\n", 0, at) + 1
+
+
+def _angle_close(text: str, at: int) -> int:
+    """The index of the `>` that closes the `<` at `at` (`->` does not close), or -1."""
+    depth = 0
+    for j in range(at, len(text)):
+        c = text[j]
+        if c == "<":
+            depth += 1
+        elif c == ">" and text[j - 1] != "-":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _is_method(rest: str) -> bool:
+    """Whether the parameters after a fn's name (`rest`: its generics, then `(…)`) open with a `self` receiver."""
+    rest = rest.lstrip()
+    if rest.startswith("<"):
+        end = _angle_close(rest, 0)
+        rest = rest[end + 1 :].lstrip() if end >= 0 else ""
+    return _SELF_PARAM.match(rest) is not None
+
+
+def _block_owner(head: str) -> str | None:
+    """The type an `impl` header implements (after `for` when it has one), the name of a `trait` header."""
+    m = _ITEM_BLOCK.match(head)
+    rest = head[m.end() :].strip()
+    if m.group(1) == "trait":
+        t = re.match(r"([A-Za-z_]\w*)", rest)
+        return t.group(1) if t else None
+    if rest.startswith("<"):
+        end = _angle_close(rest, 0)
+        rest = rest[end + 1 :].strip() if end >= 0 else ""
+    rest = re.split(r"\bwhere\b", rest)[0]
+    for f in re.finditer(r"\bfor\b", rest):
+        if rest.count("<", 0, f.start()) == rest.count(">", 0, f.start()):
+            rest = rest[f.end() :]
+            break
+    t = re.match(r"[&*\s]*(?:'[A-Za-z_]\w*\s+)?(?:(?:mut|const|dyn)\s+)*([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)", rest)
+    return re.split(r"\s*::\s*", t.group(1))[-1] if t else None
+
+
+def _scan_items(rel: str, code: str, shape: str, pos: int, end: int, owner: str | None, tests: bool, out: list[FnDef]) -> None:
+    """The fns with a body among the items of `shape[pos:end]`, each with the `impl` or `trait` block it sits in; modules are
+    entered, fn bodies are not (a nested fn's calls are its parent's). Items that only a test build compiles (`#[cfg(test)]`,
+    `#[test]`) are left out unless `tests`. A brace or an attribute with no close is a named error (70)."""
+    test_attr = False
+    while True:
+        pos = _WS.match(shape, pos).end()
+        if pos >= end:
+            return
+        m = _ATTR_OPEN.match(shape, pos)
+        if m:
+            close = _close(shape, m.end() - 1)
+            if close is None or close >= end:
+                raise OpensError(70, f"{rel}:{_line_at(shape, pos)}: an attribute with no closing bracket")
+            text = " ".join(code[m.end() : close].split())
+            is_test = text == "test" or Tree.cfg_test(f"#[{text}]")
+            if m.group(1):
+                if is_test and not tests:
+                    return
+            else:
+                test_attr = test_attr or is_test
+            pos = close + 1
+            continue
+        j, depth, body, semi = pos, 0, None, False
+        while j < end:
+            c = shape[j]
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth -= 1
+            elif c == "{":
+                if depth == 0:
+                    close = _close(shape, j)
+                    if close is None or close >= end:
+                        raise OpensError(70, f"{rel}:{_line_at(shape, j)}: a brace with no close")
+                    body = (j + 1, close)
+                    j = close + 1
+                    break
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            elif c == ";" and depth == 0:
+                semi = True
+                j += 1
+                break
+            j += 1
+        head_end = body[0] - 1 if body else (j - 1 if semi else j)
+        head = " ".join(code[pos:head_end].split())
+        if head and body and (tests or not test_attr):
+            fm = _ITEM_FN.match(head)
+            if fm:
+                out.append(FnDef(fm.group(1), owner, _is_method(head[fm.end() :]), rel, _line_at(shape, pos), body))
+            elif _ITEM_BLOCK.match(head):
+                _scan_items(rel, code, shape, body[0], body[1], _block_owner(head), tests, out)
+            elif _ITEM_MOD.match(head):
+                _scan_items(rel, code, shape, body[0], body[1], None, tests, out)
+        test_attr = False
+        pos = j
+
+
+def _fn_defs(tree: Tree, rel: str, tests: bool) -> list[FnDef]:
+    code, shape = rust_lex(tree.read(rel))
+    out: list[FnDef] = []
+    _scan_items(rel, code, shape, 0, len(shape), None, tests, out)
+    return out
+
+
+def _calls(shape: str, a: int, b: int):
+    """(offset, name, form, qualifier) of each call in `shape[a:b]`: form `bare` (`n(`), `path` (`q::n(`, the last two segments) or
+    `method` (`.n(`); the definition `fn n(` is no call. `shape` has its comments and literals blanked (`rust_lex`)."""
+    for m in _CALL.finditer(shape, a, b):
+        if _AFTER_FN.search(shape, max(a, m.start() - 16), m.start()):
+            continue
+        form = "method" if m.group("dot") else ("path" if m.group("q") else "bare")
+        yield m.start("n"), m.group("n"), form, m.group("q")
+
+
+def _opener_called(o: FnDef, form: str, qual: str | None, caller: str | None) -> bool:
+    if form == "method":
+        return o.method
+    if form == "path":
+        return o.owner is None or qual == o.owner or (qual == "Self" and caller is not None and caller == o.owner)
+    return o.owner is None
+
+
+@dataclass
+class Fence:
+    definers: list[FnDef]
+    openers: dict[tuple[str, int], tuple[FnDef, str]]  # (path, line) -> (fn, the callee it reaches the fence through)
+
+    def reaches(self, name: str, form: str, qual: str | None, caller: str | None) -> bool:
+        if name == FENCE_FN:
+            return True
+        return any(_opener_called(o, form, qual, caller) for (o, _) in self.openers.values() if o.name == name)
+
+
+def opens_fence(tree: Tree) -> Fence:
+    """The fence, its definers and the openers of FENCE_PKG's lib (the rule above); the named errors (70) when it cannot be read."""
+    pkg = tree.packages.get(FENCE_PKG)
+    if pkg is None or pkg.lib() is None:
+        raise OpensError(70, f"no workspace package {FENCE_PKG} with a lib: the fixture fence is read there")
+    users = sorted(p.name for p in tree.packages.values() if p.name != FENCE_PKG and any(d.pkg == FENCE_PKG for d in p.deps))
+    if users:
+        raise OpensError(70, f"{', '.join(users)} depend on {FENCE_PKG}: a target of theirs reaches the fence through it, and this reader scans {FENCE_PKG}'s files only")
+    lib_files = sorted(f for f in tree.tree_of(pkg.lib().src)[0] if f.endswith(".rs"))
+    definers = [d for f in lib_files for d in _fn_defs(tree, f, False) if d.name == FENCE_FN]
+    if not definers:
+        raise OpensError(70, f"no `fn {FENCE_FN}` in {FENCE_PKG}'s lib: the fixture fence is gone or renamed, and this reader would call every recipe clear")
+    skip = {d.path for d in definers}
+    fns = [(d, rust_lex(tree.read(d.path))[1]) for f in lib_files if f not in skip for d in _fn_defs(tree, f, False)]
+    fence = Fence(definers, {})
+    while True:
+        found = {}
+        for d, shape in fns:
+            if (d.path, d.line) in fence.openers:
+                continue
+            for _, name, form, qual in _calls(shape, *d.body):
+                if fence.reaches(name, form, qual, d.owner):
+                    found[(d.path, d.line)] = (d, name)
+                    break
+        if not found:
+            return fence
+        fence.openers.update(found)
+
+
+def opens_targets(tree: Tree, recipes: dict[str, Recipe], name: str) -> list[tuple[str, str, str | None, str]]:
+    """(package, kind, target, mode) of FENCE_PKG that `name` and its dependencies build or run, mode `test` for a `cargo test` or
+    `bench` command (tools/gate.sh) and `run` for the others; [] when no command of them runs a target."""
+    runs, invs = False, []
+    for n in recipe_closure(recipes, name):
+        try:
+            rc = recipe_commands(recipes[n])
+        except RecipeError as err:
+            raise OpensError(70, f"recipe {n}: {err}") from err
+        runs = runs or bool(rc.runs) or any(i.sub in OPENS_RUNS for i in rc.invocations)
+        invs += [i for i in rc.invocations if i.sub in OPENS_BUILDS]
+    out: set[tuple[str, str, str | None, str]] = set()
+    for inv in invs if runs else []:
+        targets, errs = tree.resolve(inv)
+        if errs:
+            raise OpensError(70, f"recipe {name}: {errs[0]}")
+        mode = "test" if inv.sub in ("test", "bench") else "run"
+        out |= {(p, k, t, mode) for (p, k, t, _) in targets if p == FENCE_PKG}
+    return sorted(out, key=lambda x: (x[0], x[1], x[2] or "", x[3]))
+
+
+def opens_hit(tree: Tree, fence: Fence, kind: str, tname: str | None, mode: str) -> tuple[str, int, str] | None:
+    """(path, line, called name) of the first call of the fence or of an opener in the files of one FENCE_PKG target that the
+    command's mode executes (the rule above)."""
+    pkg = tree.packages[FENCE_PKG]
+    if kind in ("lib", "doctest") or (kind in ("libtest", "test") and mode == "run"):
+        return None
+    src = pkg.lib().src if kind == "libtest" else pkg.find(kind, tname or "").src
+    own = tree.tree_of(src)[0]
+    files = own if kind == "test" or mode == "run" else tree.tree_of(src, True)[0] - own
+    best = None
+    for f in sorted(x for x in files if x.endswith(".rs")):
+        shape = rust_lex(tree.read(f))[1]
+        for at, name, form, qual in _calls(shape, 0, len(shape)):
+            if fence.reaches(name, form, qual, None):
+                hit = (f, _line_at(shape, at), name)
+                best = hit if best is None or hit < best else best
+                break
+    return best
+
+
+def opens(tree: Tree, recipes: dict[str, Recipe], names: list[str], explain=None, fence: Fence | None = None) -> list[str]:
+    """One line a name: `opens<TAB>recipe<TAB>pkg:kind:target<TAB>path:line<TAB>called` or `none<TAB>recipe`; `explain`, when
+    given, is called with the fence, the openers and each recipe's targets, one line at a time; `fence` is `opens_fence(tree)`
+    when the caller has it."""
+    missing = [n for n in names if n not in recipes]
+    if missing:
+        raise OpensError(65, f"not a recipe of the justfile: {', '.join(missing)}")
+    fence = fence or opens_fence(tree)
+    if explain:
+        for d in fence.definers:
+            explain(f"fence: fn {FENCE_FN} of {FENCE_PKG} at {d.path}:{d.line}")
+        for (path, line), (d, via) in sorted(fence.openers.items()):
+            explain(f"opener: {(d.owner + '::') if d.owner else ''}{d.name}{' (method)' if d.method else ''} at {path}:{line}, through {via}")
+    cache: dict[tuple[str, str | None, str], tuple[str, int, str] | None] = {}
+    rows = []
+    for n in names:
+        found = None
+        targets = opens_targets(tree, recipes, n)
+        if explain:
+            explain(f"recipe {n}: {len(targets)} target(s) of {FENCE_PKG}: " + ", ".join(f"{k}:{t or tree.packages[FENCE_PKG].lib().name} ({m})" for _, k, t, m in targets))
+        for pkg, kind, tname, mode in targets:
+            if (kind, tname, mode) not in cache:
+                cache[(kind, tname, mode)] = opens_hit(tree, fence, kind, tname, mode)
+            hit = cache[(kind, tname, mode)]
+            if hit:
+                shown = tname or tree.packages[pkg].lib().name
+                found = f"opens\t{n}\t{pkg}:{kind}:{shown}\t{hit[0]}:{hit[1]}\t{hit[2]}"
+                break
+        rows.append(found or f"none\t{n}")
+    return rows
+
+
+def cmd_opens(args: argparse.Namespace) -> int:
+    if not args.items and not args.explain:
+        print("recipes.py opens: name a recipe, or --explain", file=sys.stderr)
+        return 64
+    side = make_side(ROOT)
+    try:
+        rows = opens(side.tree, side.recipes, args.items, (lambda s: print("explain: " + s, file=sys.stderr)) if args.explain else None)
+    except OpensError as err:
+        print(f"recipes.py opens: {err}", file=sys.stderr)
+        return err.code
+    for row in rows:
+        print(row)
+    return 0
+
+
+def opens_self_test(expect) -> None:
+    """`opens` on synthetic workspaces: FENCE_PKG with a lib (tier.rs defines the fence), bins and test modules, one recipe a case;
+    then the rule's mutants, each of which must turn its case red."""
+    lib = (
+        "mod tier;\n"
+        "pub fn first() {\n    second();\n}\n"
+        "pub fn second() {\n    tier::check_file();\n}\n"
+        "pub struct Generator;\n"
+        "impl<B> Generator<B> {\n    pub fn open(a: u8) {\n        second();\n    }\n}\n"
+        "pub struct Rig;\n"
+        "impl Rig {\n    pub fn go(&self) {\n        second();\n    }\n}\n"
+        "#[cfg(test)]\nmod tests {\n    fn probe() {\n        super::second();\n    }\n}\n"
+    )
+    tier = "pub fn check_file() {}\npub fn run() {\n    check_file();\n}\n"
+    bins = {
+        "b1": "fn main() {\n    bloomery_gpu_gates::first();\n}\n",
+        "b2": '// first() and second() in a comment\nfn main() {\n    let s = "second(1)";\n    /* first() */\n    println!("{s}");\n}\n',
+        "b3": "fn main() {\n    let t = 0;\n    t.check_file();\n}\n",
+        "b4": "fn main() {\n    bloomery_gpu_gates::tier::run();\n}\n",
+        "bq1": "fn main() {\n    File::open(p);\n    Split::open(p);\n    x.open(p);\n    open(p);\n    go(1);\n}\n",
+        "bq2": "fn main() {\n    Generator::<u8>::open(1);\n}\n",
+        "bq3": "fn main() {\n    rig.go();\n}\n",
+        "bp": "fn main() {\n    probe();\n}\n",
+        "bt": "fn main() {}\n#[cfg(test)]\nmod tt;\n",
+    }
+    inner = {"tt.rs": "fn t() {\n    bloomery_gpu_gates::first();\n}\n"}
+    dep = {"name": FENCE_PKG, "kind": None, "optional": False, "features": [], "uses_default_features": True}
+
+    def world(tmp: str, lib_text: str, tier_text: str, bin_texts: dict[str, str], extra: dict[str, str] | None = None, user: bool = False) -> Tree:
+        files = {"crates/g/Cargo.toml": "", "crates/g/src/lib.rs": lib_text, "crates/g/src/tier.rs": tier_text}
+        files.update({f"crates/g/src/bin/{n}.rs": t for n, t in bin_texts.items()})
+        files.update({f"crates/g/src/{n}": t for n, t in (extra or {}).items()})
+        if "bt" in bin_texts:
+            files.update({f"crates/g/src/bin/{n}": t for n, t in inner.items()})
+        if user:
+            files.update({"crates/u/Cargo.toml": "", "crates/u/src/main.rs": "fn main() {}\n"})
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        targets = [{"kind": ["lib"], "name": "bloomery_gpu_gates", "src_path": os.path.join(tmp, "crates/g/src/lib.rs")}]
+        targets += [{"kind": ["bin"], "name": n, "src_path": os.path.join(tmp, f"crates/g/src/bin/{n}.rs")} for n in bin_texts]
+        pkgs = [{"id": FENCE_PKG, "name": FENCE_PKG, "manifest_path": os.path.join(tmp, "crates/g/Cargo.toml"), "features": {}, "dependencies": [], "targets": targets}]
+        if user:
+            pkgs.append({"id": "user", "name": "user", "manifest_path": os.path.join(tmp, "crates/u/Cargo.toml"), "features": {}, "dependencies": [dep],
+                         "targets": [{"kind": ["bin"], "name": "user", "src_path": os.path.join(tmp, "crates/u/src/main.rs")}]})
+        return Tree(tmp, {"workspace_root": tmp, "workspace_members": [p["id"] for p in pkgs], "packages": pkgs})
+
+    def box(*cmds: str, deps: list[str] | None = None) -> Recipe:
+        return Recipe("x", [f"./tools/box.sh '{c}'" for c in cmds], deps or [], "")
+
+    def run_bin(b: str) -> Recipe:
+        return box(f"cargo build -p {FENCE_PKG} --bin {b} && bash tools/gpu-gate.sh {b}")
+
+    def ask(tree: Tree, recipes: dict[str, Recipe], name: str, **kw) -> str:
+        return opens(tree, recipes, [name], **kw)[0]
+
+    def refused(tree: Tree, recipes: dict[str, Recipe], names: list[str]) -> OpensError | None:
+        try:
+            opens(tree, recipes, names)
+        except OpensError as err:
+            return err
+        return None
+
+    def row(recipe: str, target: str, site: str, called: str) -> str:
+        return f"opens\t{recipe}\t{FENCE_PKG}:{target}\t{site}\t{called}"
+
+    with tempfile.TemporaryDirectory(prefix="recipes-opens-") as tmp:
+        t1 = world(os.path.join(tmp, "w1"), lib, tier, bins)
+        recipes = {f"r{n}": run_bin(n) for n in bins}
+        recipes.update({
+            "outer": Recipe("outer", [], ["rb1"], ""),
+            "checked": box(f"cargo check -p {FENCE_PKG} --all-targets", f"cargo clippy -p {FENCE_PKG} --bin b1 && bash tools/gpu-gate.sh b1"),
+            "built": box(f"cargo build -p {FENCE_PKG} --bin b1"),
+            "tested": box(f"cargo test -p {FENCE_PKG} --bin b1 --lib"),
+            "testbt": box(f"cargo test -p {FENCE_PKG} --bin bt"),
+            "runbt": run_bin("bt"),
+        })
+        c = "crates/g/src/bin"
+        got = sorted(f"{d.owner}::{d.name}" if d.owner else d.name for d, _ in opens_fence(t1).openers.values())
+        expect(got == ["Generator::open", "Rig::go", "first", "second"], f"opens: the openers are {got}")
+        expect(ask(t1, recipes, "rb1") == row("rb1", "bin:b1", f"{c}/b1.rs:2", "first"), f"opens r1: a bin calling a lib fn that calls a lib fn that calls the fence: {ask(t1, recipes, 'rb1')}")
+        expect(ask(t1, recipes, "rb2") == "none\trb2", f"opens r2: an opener named in a comment and a string is no call: {ask(t1, recipes, 'rb2')}")
+        expect(ask(t1, recipes, "rb3") == row("rb3", "bin:b3", f"{c}/b3.rs:3", "check_file"), f"opens r3: a bin calling the fence itself: {ask(t1, recipes, 'rb3')}")
+        expect(ask(t1, recipes, "rb4") == "none\trb4", f"opens r5: the fence called only inside its definer's file: {ask(t1, recipes, 'rb4')}")
+        expect(ask(t1, recipes, "rbq1") == "none\trbq1", f"opens: File::open, Split::open, .open and a bare open are no call of Generator::open, nor go( of Rig::go: {ask(t1, recipes, 'rbq1')}")
+        expect(ask(t1, recipes, "rbq2") == row("rbq2", "bin:bq2", f"{c}/bq2.rs:2", "open"), f"opens: Generator::<u8>::open( is a call of the opener: {ask(t1, recipes, 'rbq2')}")
+        expect(ask(t1, recipes, "rbq3") == row("rbq3", "bin:bq3", f"{c}/bq3.rs:2", "go"), f"opens: .go( is a call of a method opener: {ask(t1, recipes, 'rbq3')}")
+        expect(ask(t1, recipes, "rbp") == "none\trbp", f"opens: a fn of an inline #[cfg(test)] module is no opener: {ask(t1, recipes, 'rbp')}")
+        expect(ask(t1, recipes, "outer") == row("outer", "bin:b1", f"{c}/b1.rs:2", "first"), f"opens: a recipe's dependency's targets count: {ask(t1, recipes, 'outer')}")
+        expect(ask(t1, recipes, "checked") == "none\tchecked", f"opens: check and clippy run nothing: {ask(t1, recipes, 'checked')}")
+        expect(ask(t1, recipes, "built") == "none\tbuilt", f"opens: a recipe that builds and runs nothing: {ask(t1, recipes, 'built')}")
+        expect(ask(t1, recipes, "tested") == "none\ttested", f"opens: a test run of a bin reads its test files, not its main: {ask(t1, recipes, 'tested')}")
+        expect(ask(t1, recipes, "testbt") == row("testbt", "bin:bt", f"{c}/tt.rs:2", "first"), f"opens: a test run of a bin reads its test-only files: {ask(t1, recipes, 'testbt')}")
+        expect(ask(t1, recipes, "runbt") == "none\trunbt", f"opens: a run of a bin does not read its test-only files: {ask(t1, recipes, 'runbt')}")
+        why = refused(t1, recipes, ["rb1", "nothere"])
+        expect(why is not None and why.code == 65 and "nothere" in str(why), f"opens: an item that is no recipe is 65, named: {why}")
+        lines: list[str] = []
+        opens(t1, recipes, ["rb1"], explain=lines.append)
+        expect(any(x.startswith("fence: fn check_file") for x in lines) and any("opener: first" in x for x in lines) and any("recipe rb1: 1 target(s)" in x for x in lines), f"opens: --explain names the fence, the openers and the targets: {lines}")
+
+        # r4: the lib's test files, under `cargo test --lib`
+        t2 = world(os.path.join(tmp, "w2"), lib + "#[cfg(test)]\nmod t;\n", tier, {"b1": bins["b1"]}, {"t.rs": "fn x() {\n    super::first();\n}\n"})
+        lt = {"lt": box(f"cargo test -p {FENCE_PKG} --lib")}
+        expect(ask(t2, lt, "lt") == row("lt", "libtest:bloomery_gpu_gates", "crates/g/src/t.rs:2", "first"), f"opens r4: a lib's #[cfg(test)] module calling an opener: {ask(t2, lt, 'lt')}")
+        t3 = world(os.path.join(tmp, "w3"), lib + "pub fn third() {\n    first();\n}\n", tier, {"b1": bins["b1"]})
+        expect(ask(t3, lt, "lt") == "none\tlt", f"opens r4: the same call in the lib's non-test code reaches nothing under `cargo test --lib`: {ask(t3, lt, 'lt')}")
+        # r6, and the dependent package
+        t4 = world(os.path.join(tmp, "w4"), lib, "pub fn other() {}\n", {"b1": bins["b1"]})
+        why = refused(t4, recipes, ["rb1"])
+        expect(why is not None and why.code == 70 and "check_file" in str(why), f"opens r6: no fn check_file is a named 70: {why}")
+        t5 = world(os.path.join(tmp, "w5"), lib, tier, {"b1": bins["b1"]}, user=True)
+        why = refused(t5, recipes, ["rb1"])
+        expect(why is not None and why.code == 70 and "user depend on" in str(why), f"opens: a package that depends on {FENCE_PKG} is a named 70: {why}")
+
+        # the mutants: each must turn its case red
+        real_reaches, real_lex, real_called = Fence.reaches, rust_lex, _opener_called
+        try:
+            Fence.reaches = lambda self, name, form, qual, caller: name == FENCE_FN
+            one_level = opens_fence(t1)
+        finally:
+            Fence.reaches = real_reaches
+        expect(ask(t1, recipes, "rb1", fence=one_level) != ask(t1, recipes, "rb1"), "opens mutant: with the fixpoint cut to one level, r1 stays green")
+        try:
+            globals()["rust_lex"] = lambda text: (text, text)
+            expect(ask(t1, recipes, "rb2") != "none\trb2", "opens mutant: with comment skipping off, r2 stays green")
+        finally:
+            globals()["rust_lex"] = real_lex
+        try:
+            globals()["_opener_called"] = lambda o, form, qual, caller: True
+            expect(ask(t1, recipes, "rbq1", fence=opens_fence(t1)) != "none\trbq1", "opens mutant: matching an opener by its bare name, the File::open control stays green")
+        finally:
+            globals()["_opener_called"] = real_called
+
+
 def scan_lines(text: str, pat: re.Pattern, where: str, numbered: bool = True) -> str | None:
     """The first non-comment line of `text` that `pat` matches, as `where[:line] (match)`."""
     if not pat.search(text):
@@ -6728,6 +7183,9 @@ def self_test() -> int:
     box_tier_self_test(expect)
     oxide_rev_self_test(expect)
 
+    # opens: the targets that reach the fixture fence
+    opens_self_test(expect)
+
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     print(f"self-test: {'FAIL' if fails else 'ok'} ({len(gates)} gate recipes, {len(fails)} failures)")
@@ -6780,6 +7238,9 @@ def main(argv: list[str]) -> int:
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
     b.add_argument("--workers", type=int, default=8)
+    op = sub.add_parser("opens", help="per RECIPE, whether a cargo target it builds or runs reaches the fixture fence (Tier::check_file): opens<TAB>recipe<TAB>pkg:kind:target<TAB>path:line<TAB>called, or none<TAB>recipe (tools/gate-batch.sh's real-file deferral)")
+    op.add_argument("items", nargs="*", metavar="RECIPE")
+    op.add_argument("--explain", action="store_true", help="the fence, the openers and each recipe's targets, on stderr")
     args = ap.parse_args(argv)
     try:
         if args.self_test:
@@ -6806,6 +7267,8 @@ def main(argv: list[str]) -> int:
             return cmd_combos(args)
         if args.cmd == "box-manifest":
             return cmd_box_manifest(args)
+        if args.cmd == "opens":
+            return cmd_opens(args)
         ap.print_help()
         return 64
     except RecipeError as err:
