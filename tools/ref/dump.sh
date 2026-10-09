@@ -48,6 +48,15 @@
 # only a decode step writes: a gate of the batch set would read a one-token graph, a gate of the
 # step a batch one. A variant that reads its ids from a file names the file's sha256, and a file
 # that no longer has it is refused before the lease.
+#
+# BLOOMERY_TIER=fixture dumps ik's sets on the family's fixture file (ref-paths.sh: the model is its first shard, any other
+# is refused). Each set is its real twin's name behind `fx_`, put on at one place below (SET_PREFIX; the fixture families of
+# crates/refset name them), and carries the fixture file's `# fixture` line, which refset-check prints and dump_ref writes
+# verbatim beside `# model` (--fixture-line). A profile adds --prefill-routes to its long variants in this tier only. The
+# real tier's dumps are as they were, byte for byte: no `# fixture` line, no prefix, no prefill rows. `just dump-ref-fixture`.
+#
+# DUMP_DRY=1 prints what the dump would do (the set, `# model`, `# fixture`, `# build`, the dumper and its arguments) and
+# stops with 0: after every refusal, the stale-binary one included, and before the lease and anything on disk.
 set -euo pipefail
 # MODEL, BLOOMERY_DATA and IK default in ref-paths.sh (BLOOMERY_REF_MODEL, BLOOMERY_DATA and IK
 # override them).
@@ -56,12 +65,19 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
+case ${DUMP_DRY:-0} in
+  0|1) ;;
+  *) echo "dump.sh: DUMP_DRY is 1 (print the dump and stop) or 0 or unset, got '$DUMP_DRY'" >&2; exit 2 ;;
+esac
+fixture_dump_tier dump.sh
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 case $BACKEND in
   cpu)  SET=$REF_SET_CPU;  NGL=0;  HIDE_CUDA=1 ;;
   cuda) SET=$REF_SET_CUDA; NGL=99; HIDE_CUDA=0 ;;
   *) echo "dump.sh: BLOOMERY_REF_BACKEND must be cpu or cuda, got '$BACKEND'" >&2; exit 2 ;;
 esac
+[ -z "$SET_PREFIX" ] || [ "$BACKEND" = cpu ] ||
+  { echo "dump.sh: BLOOMERY_TIER=fixture has no CUDA sets (its families are CPU dumps): unset BLOOMERY_REF_BACKEND" >&2; exit 2; }
 VARIANT=${1:-}
 CTX=$REF_CTX
 # A profile whose oracle tree is not the shared one names its own dump_ref directory under
@@ -117,7 +133,8 @@ if [ "$THREADS" != 32 ]; then SET=${SET}_t$THREADS; fi
 case $SET in
   bin|*/*|.*|*.staging|*.old|'') echo "dump.sh: '$SET' cannot name a set" >&2; exit 2 ;;
 esac
-if [ -n "$VARIANT" ] && { [ "$SET" = "$REF_SET_CPU" ] || [ "$SET" = "$REF_SET_CUDA" ]; }; then
+SET=$SET_PREFIX$SET
+if [ -n "$VARIANT" ] && { [ "$SET" = "$SET_PREFIX$REF_SET_CPU" ] || [ "$SET" = "$SET_PREFIX$REF_SET_CUDA" ]; }; then
   echo "dump.sh: '$SET' is the $MODEL_NAME profile's batch set; a decode step goes into a set of its own" >&2
   exit 2
 fi
@@ -174,6 +191,49 @@ if [ ${#stale[@]} -gt 0 ]; then
 fi
 echo "[binary] $BIN sha256=$BIN_SHA mtime=$BIN_MTIME (dump_ref.cpp sha256 ${SRC_SHA:0:12})"
 
+# Which ik build this set is the output of — recorded in the manifest, because the
+# reference is that build's answer and nothing else's.
+# $IK comes from ref-paths.sh, the file build-dump.sh reads too — the tree this binary was
+# linked against. Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
+# The tree belongs to the serving user and may be a worktree, so root's git needs safe.directory to
+# read it; `-dirty` marks a build from uncommitted changes.
+ikgit() { git -c safe.directory='*' -C "$IK" "$@"; }
+BUILD=$(ikgit rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+if [ "$BUILD" != unknown ] && ! ikgit diff --quiet HEAD 2>/dev/null; then BUILD="$BUILD-dirty"; fi
+
+# What the dumper is handed, once: the fixture tier's `# fixture` line (empty in the real tier: no line, no argument), and the
+# dumper's arguments. The dry run below prints these very values, so what it shows is what runs. refset-check is built here,
+# after the stale-binary refusal and before the lease.
+FIXTURE_LINE=$(fixture_line dump.sh)
+FIXTURE_ARGS=()
+[ -z "$FIXTURE_LINE" ] || FIXTURE_ARGS=(--fixture-line "$FIXTURE_LINE")
+DUMP_ARGS=(-m "$MODEL" --expect-arch "$MODEL_NAME" "${TOKEN_ARGS[@]}" -ngl "$NGL" -c "$CTX" -t "$THREADS"
+  "${REF_DUMP_ARGS[@]}" "${STEP_ARGS[@]}" "${FIXTURE_ARGS[@]}")
+
+# DUMP_DRY=1: print the dump and stop. Everything that refuses has run above; the lease, the staging directory and the dumper
+# come below, and none of them may run in a dry run — the profiles set REF_DUMP_LEASE=1 for every dump, so a dry exit that
+# came after lease_take would hold the machine lease for a print.
+if [ "${DUMP_DRY:-0}" = 1 ]; then
+  printf '[dry] tier\t%s\tprofile %s%s\n' "${BLOOMERY_TIER:-real}" "$MODEL_NAME" "${VARIANT:+ variant $VARIANT}"
+  printf '[dry] set\t%s\n' "$SET"
+  printf '[dry] # model\t%s\n' "$MODEL"
+  if [ -n "$FIXTURE_LINE" ]; then printf '[dry] %s\n' "$FIXTURE_LINE"; else echo "[dry] no # fixture line: the real tier writes none"; fi
+  echo "[dry] no # draft_model line: dump_ref writes none"
+  printf '[dry] # build\t%s\n' "$BUILD"
+  printf '[dry] ik\t%s\n[dry] dumper\t%s\n' "$IK" "$BIN"
+  shown=()
+  for a in "${DUMP_ARGS[@]}"; do
+    case $a in "# fixture"*) a='<the # fixture line>' ;; esac
+    shown+=("$a")
+  done
+  printf '[dry] argv\t%q' "$BIN"
+  printf ' %q' "${shown[@]}"
+  printf '\n[dry] env\tBLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR=%s.staging BLOOMERY_REF_BUILD=%s BLOOMERY_REF_TOKENS_SHA256=%s\n' \
+    "$BLOOMERY_DATA/$SET" "$BUILD" "$TOKENS_SHA256"
+  printf '[dry] lease\tREF_DUMP_LEASE=%s (a dry run takes none)\n' "$LEASE"
+  exit 0
+fi
+
 # The machine state the lease is supposed to guarantee: read-sectors is the model file's device, so
 # the difference between the two blocks is what this dump paged in.
 WITNESS=(head-epoch loadavg pressure-io mem pgmajfault read-sectors lock-holder model)
@@ -204,20 +264,9 @@ trap drop_incomplete_stage EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Which ik build this set is the output of — recorded in the manifest, because the
-# reference is that build's answer and nothing else's.
-# $IK comes from ref-paths.sh, the file build-dump.sh reads too — the tree this binary was
-# linked against. Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
-# The tree belongs to the serving user and may be a worktree, so root's git needs safe.directory to
-# read it; `-dirty` marks a build from uncommitted changes.
-ikgit() { git -c safe.directory='*' -C "$IK" "$@"; }
-BUILD=$(ikgit rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
-if [ "$BUILD" != unknown ] && ! ikgit diff --quiet HEAD 2>/dev/null; then BUILD="$BUILD-dirty"; fi
-
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 lease_bounded "$DUMP_BOUND" env BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
-  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" "${TOKEN_ARGS[@]}" -ngl "$NGL" -c "$CTX" -t "$THREADS" \
-    "${REF_DUMP_ARGS[@]}" "${STEP_ARGS[@]}"
+  "$BIN" "${DUMP_ARGS[@]}"
 if [ "$LEASE" = 1 ]; then witness post-dump; fi
 
 # The trailer is the dumper's completion proof; without it the staged set is not installed.

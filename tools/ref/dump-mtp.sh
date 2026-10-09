@@ -27,9 +27,25 @@
 # profile on the Mac side: BLOOMERY_MODEL=glm5next|qwen4exp ./tools/box.sh 'bash tools/ref/dump-mtp.sh'.
 #   MTP_SET_NAME     the set's name under ref-mtp (default prose64_n64_k1, qwen4exp_prose64_n64_k1)
 #   REF_THREADS      ik's -t (default 32)
+#   DUMP_MTP_OUT     the directory holding the dump_mtp to run (default $BLOOMERY_DATA/bin; build-dump-mtp.sh's own name)
+#   DUMP_DRY         1: print what the dump would do (the set, `# model`, `# fixture`, `# draft_model`, `# build`, the dumper
+#                    and its arguments) and stop with 0, after every refusal below (the stale-binary one included) and
+#                    before the lease and anything on disk
+#
+# BLOOMERY_TIER=fixture dumps the same sets on the family's fixture file (`just dump-ref-mtp-fixture`): the model is its first
+# shard (ref-paths.sh refuses any other), the set is its real twin's name behind `fx_` (SET_PREFIX, put on at one place below),
+# and it carries the fixture file's `# fixture` line (refset-check --fixture-line, written verbatim by dump_mtp beside
+# `# model`). The Qwen3.8 draft is then the file beside the fixture target under the real draft's name, which is where
+# refset's fixture family looks for it; GLM's draft is the target itself, so its set has no `# draft_model` line. The real
+# tier's dumps are as they were: no `# fixture` line, no prefix.
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+case ${DUMP_DRY:-0} in
+  0|1) ;;
+  *) echo "dump-mtp.sh: DUMP_DRY is 1 (print the dump and stop) or 0 or unset, got '$DUMP_DRY'" >&2; exit 2 ;;
+esac
+fixture_dump_tier dump-mtp.sh
 DRAFT_ARGS=()
 case $MODEL_NAME in
   glm5next)
@@ -45,6 +61,8 @@ case $MODEL_NAME in
     TOKENS_FILE=$STEP_TOKENS_FILE TOKENS_SHA256=$STEP_TOKENS_SHA256
     # The refset family's DRAFT (crates/refset/src/arch/qwen4exp/mtp.rs): the set's `# draft_model` must name it.
     QWEN38_MTP_DRAFT=/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+    # The fixture's is beside the fixture target under that name (refset's fixture family: the target's directory, `{dir}/{name}`).
+    [ -z "$SET_PREFIX" ] || QWEN38_MTP_DRAFT=${FIXTURE_FILE%/*}/${QWEN38_MTP_DRAFT##*/}
     [ -f "$QWEN38_MTP_DRAFT" ] || { echo "dump-mtp.sh: no draft file at $QWEN38_MTP_DRAFT" >&2; exit 2; }
     DRAFT_ARGS=(-md "$QWEN38_MTP_DRAFT")
     SET=${MTP_SET_NAME:-qwen4exp_prose64_n64_k1} ;;
@@ -63,11 +81,12 @@ THREADS=${REF_THREADS:-32}
 case $SET in
   */*|.*|*.staging|*.old|'') echo "dump-mtp.sh: '$SET' cannot name a set" >&2; exit 2 ;;
 esac
+SET=$SET_PREFIX$SET
 case $THREADS in
   ''|*[!0-9]*|0*) echo "dump-mtp.sh: REF_THREADS must be a positive integer, got '$THREADS'" >&2; exit 2 ;;
 esac
 
-BIN=$BLOOMERY_DATA/bin/dump_mtp
+BIN=${DUMP_MTP_OUT:-$BLOOMERY_DATA/bin}/dump_mtp
 [ -x "$BIN" ] || { echo "no dump_mtp at $BIN — run: just build-ref-dump-mtp" >&2; exit 2; }
 # The binary must load ik from the MTP tree's build, be this tree's dump_mtp.cpp (by the sha256 its
 # build record names; box.sh gives every file the box's "now", so mtimes cannot say), and be no older
@@ -111,6 +130,43 @@ got=$(sha256sum "$TOKENS_FILE" | cut -d' ' -f1)
 [ "$got" = "$TOKENS_SHA256" ] ||
   { echo "dump-mtp.sh: $TOKENS_FILE has sha256 $got, the profile names $TOKENS_SHA256" >&2; exit 2; }
 
+# What the dumper is handed, once: the fixture tier's `# fixture` line (empty in the real tier: no line, no argument; refset-check
+# is built here, after the stale-binary refusal and before the lease) and the dumper's arguments. The dry run below prints these
+# very values, so what it shows is what runs.
+FIXTURE_LINE=$(fixture_line dump-mtp.sh)
+FIXTURE_ARGS=()
+[ -z "$FIXTURE_LINE" ] || FIXTURE_ARGS=(--fixture-line "$FIXTURE_LINE")
+DUMP_ARGS=(-m "$MODEL" "${DRAFT_ARGS[@]}" --expect-arch "$MODEL_NAME" --tokens-file "$TOKENS_FILE"
+  --tokens-count "$N_PROMPT" -n "$N_PREDICT" --spec-type "$SPEC" -ngl 0 -c "$CTX" -t "$THREADS" "${FIXTURE_ARGS[@]}")
+
+# DUMP_DRY=1: print the dump and stop. Everything that refuses has run above; the lease, the staging directory and the dumper
+# come below, and none of them may run in a dry run — this script takes the lease for every dump, so a dry exit that came after
+# lease_take would hold the machine lease for a print.
+if [ "${DUMP_DRY:-0}" = 1 ]; then
+  printf '[dry] tier\t%s\tprofile %s\n' "${BLOOMERY_TIER:-real}" "$MODEL_NAME"
+  printf '[dry] set\tref-mtp/%s\n' "$SET"
+  printf '[dry] # model\t%s\n' "$MODEL"
+  if [ -n "$FIXTURE_LINE" ]; then printf '[dry] %s\n' "$FIXTURE_LINE"; else echo "[dry] no # fixture line: the real tier writes none"; fi
+  if [ ${#DRAFT_ARGS[@]} -gt 0 ]; then
+    printf '[dry] # draft_model\t%s\n' "${DRAFT_ARGS[1]}"
+  else
+    echo "[dry] no # draft_model line: the target carries the NextN block"
+  fi
+  printf '[dry] # build\t%s\n' "$BUILD"
+  printf '[dry] ik\t%s\n[dry] dumper\t%s\n' "$IK" "$BIN"
+  shown=()
+  for a in "${DUMP_ARGS[@]}"; do
+    case $a in "# fixture"*) a='<the # fixture line>' ;; esac
+    shown+=("$a")
+  done
+  printf '[dry] argv\t%q' "$BIN"
+  printf ' %q' "${shown[@]}"
+  printf '\n[dry] env\tBLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR=%s.staging BLOOMERY_REF_BUILD=%s BLOOMERY_REF_TOKENS_SHA256=%s\n' \
+    "$BLOOMERY_DATA/ref-mtp/$SET" "$BUILD" "$TOKENS_SHA256"
+  printf '[dry] lease\ttaken by every dump of this script (a dry run takes none)\n'
+  exit 0
+fi
+
 WITNESS=(head-epoch loadavg pressure-io mem pgmajfault read-sectors lock-holder model)
 lease_take
 witness pre-dump
@@ -136,8 +192,7 @@ t0=$(date +%s)
 # than hold the lease.
 lease_bounded "${BLOOMERY_DUMP_BOUND:-1800}" env -u IK_PREGATE CUDA_VISIBLE_DEVICES= \
   BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
-  "$BIN" -m "$MODEL" "${DRAFT_ARGS[@]}" --expect-arch "$MODEL_NAME" --tokens-file "$TOKENS_FILE" \
-    --tokens-count "$N_PROMPT" -n "$N_PREDICT" --spec-type "$SPEC" -ngl 0 -c "$CTX" -t "$THREADS"
+  "$BIN" "${DUMP_ARGS[@]}"
 echo "dump-mtp.sh: dump in $(($(date +%s) - t0)) s"
 witness post-dump
 

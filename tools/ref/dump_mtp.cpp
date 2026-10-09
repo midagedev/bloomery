@@ -52,6 +52,11 @@
 // node, no fusion. Their arithmetic is the dumped schedule's and the proposals and accept counts in this
 // set are that schedule's; the target's are ik's serving path.
 //
+// `--fixture-line <line>` (the fixture tier, tools/ref/dump-mtp.sh) is the one `# fixture<TAB>key=value ...` line that
+// `refset-check --fixture-line` prints for the fixture target; it is written verbatim beside `# model` (before `# draft_model`),
+// and left out of `# flags`, whose own line carries it. A line that is not one line of that shape is refused. Without the flag
+// no such line exists, and the header is as it was.
+//
 // Build: tools/ref/build-dump-mtp.sh   Run: tools/ref/dump-mtp.sh (never by hand)
 
 #include "common.h"
@@ -583,14 +588,27 @@ static bool decode_tokens(llama_context * ctx, const llama_tokens & toks, int n_
     return true;
 }
 
+// `# fixture`, a tab, at least one character, and no line break.
+static bool is_fixture_line(const std::string & s) {
+    static const std::string head = "# fixture\t";
+    return s.size() > head.size() && s.compare(0, head.size(), head) == 0 && s.find_first_of("\r\n") == std::string::npos;
+}
+
 int main(int argc, char ** argv) {
     std::string flags;
-    for (int i = 1; i < argc; ++i) flags += (i > 1 ? " " : "") + std::string(argv[i]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--fixture-line") == 0 && i + 1 < argc) {
+            ++i;  // the `# fixture` line has a header line of its own
+            continue;
+        }
+        flags += (flags.empty() ? "" : " ") + std::string(argv[i]);
+    }
 
-    // Ours: --tokens-file, --tokens-count, --expect-arch. The rest is gpt_params.
+    // Ours: --tokens-file, --tokens-count, --expect-arch, --fixture-line. The rest is gpt_params.
     std::string tokens_file;
     long long   tokens_count = 0;
     std::string expect_arch;
+    std::string fixture_line;
     std::vector<char *> passthrough;
     passthrough.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -600,9 +618,16 @@ int main(int argc, char ** argv) {
             tokens_count = atoll(argv[++i]);
         } else if (strcmp(argv[i], "--expect-arch") == 0 && i + 1 < argc) {
             expect_arch = argv[++i];
+        } else if (strcmp(argv[i], "--fixture-line") == 0 && i + 1 < argc) {
+            fixture_line = argv[++i];
         } else {
             passthrough.push_back(argv[i]);
         }
+    }
+    if (!fixture_line.empty() && !is_fixture_line(fixture_line)) {
+        fprintf(stderr, "dump_mtp: --fixture-line wants the one '# fixture<TAB>key=value ...' line that refset-check "
+                        "--fixture-line prints, got '%s'\n", fixture_line.c_str());
+        return 2;
     }
     if (tokens_file.empty() || tokens_count <= 0) {
         fprintf(stderr, "dump_mtp: --tokens-file <ids> --tokens-count <n> are required; this tool does not tokenize\n");
@@ -748,6 +773,7 @@ int main(int argc, char ** argv) {
     if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) snprintf(arch, sizeof arch, "unknown");
     fprintf(d.manifest, "# dump_mtp — ik_llama.cpp MTP (NextN) draft tensors, raw f32, little-endian\n");
     fprintf(d.manifest, "# model\t%s\n", params.model.c_str());
+    if (!fixture_line.empty()) fprintf(d.manifest, "%s\n", fixture_line.c_str());
     if (companion) fprintf(d.manifest, "# draft_model\t%s\n", params.speculative.model.c_str());
     if (const char * b = getenv("BLOOMERY_REF_BUILD")) fprintf(d.manifest, "# build\t%s\n", b);
     fprintf(d.manifest, "# arch\t%s\n", arch);

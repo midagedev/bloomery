@@ -84,6 +84,22 @@
 // `--tokens-count` of them; the header names the file, its sha256 (BLOOMERY_REF_TOKENS_SHA256,
 // which dump.sh computes) and the count.
 //
+// `--fixture-line <line>` (the fixture tier, tools/ref/dump.sh) is the one `# fixture<TAB>key=value ...` line that
+// `refset-check --fixture-line` prints for the fixture file; it is written verbatim beside `# model`, and left out of `# flags`
+// (its own header line carries it). A line that is not one line of that shape is refused. Without the flag no such line exists.
+//
+// `--prefill-routes <stem,stem,...>` (a --decode-step option, the fixture tier's long sets; the model profile names the stems,
+// an architecture's own facts) also writes ik's routing of the prefill's positions, and nothing else of the prefill: the
+// nodes `<stem>-<layer>` of each ubatch of the quiet prefill, as `tensor` rows under the names `prefill.<stem>-<layer>`, one
+// occurrence a ubatch in prefill order (a ubatch's tokens are its row's ne1 for the picks and the normalized weights, ne2 for the
+// gathered and scaled ones; positions follow in order from 0), written through the same dump_one as the step's rows, so the
+// reader that takes the step's rows takes these. The step's rows keep their names and their occurrence counters from zero.
+// A stem that names no node of the graph is not skipped: after each prefill call every stem must have been written, as often as
+// the others, or the dump ends by name with no trailer (a graph without a scale node has no `_scaled` stem to ask for).
+// Asking for those nodes splits a fused prefill's graph into groups that end at them (the scheduler computes up to a wanted
+// node, then calls back), so the header says so; under --prefill-every-node every node is asked for already. Without the flag
+// nothing of the prefill is written, as before.
+//
 // Build: tools/ref/build-dump.sh   Run: $BLOOMERY_DATA/bin/dump_ref -m <gguf> --tokens 1,2,3
 
 #include "common.h"
@@ -121,6 +137,8 @@ struct dump_ctx {
     // Decode step only.
     bool                             quiet        = false;  // the prefill: nothing written
     bool                             quiet_every_node = false;  // ... and every node computed alone
+    std::vector<std::string>         route_stems;           // ... except these routing nodes (--prefill-routes)
+    std::map<std::string, int>       route_written;         // stem -> rows written for it in the prefill
     bool                             state_inputs = false;  // persistent leaves are input rows too
     std::set<ggml_backend_buffer_t>  node_bufs;             // buffers the step's own nodes live in
     int                              state   = 0;           // leaves written as input rows by that rule
@@ -232,9 +250,10 @@ static bool write_twin(dump_ctx * d, const ggml_tensor * t, const char * name, i
 // Write one node (`input` false) or one graph input: the f32 file, the logical twin of a view
 // or non-contiguous tensor, the integer twins, and the manifest rows. False only when a file
 // cannot be written.
-static bool dump_one(dump_ctx * d, const ggml_tensor * t, bool input) {
-    const char * name       = t->name[0] ? t->name : "(unnamed)";
-    const int    occurrence = (input ? d->seen_input : d->seen)[name]++;
+static bool dump_one(dump_ctx * d, const ggml_tensor * t, bool input, const char * prefix = "") {
+    const std::string name_s     = std::string(prefix) + (t->name[0] ? t->name : "(unnamed)");
+    const char *      name       = name_s.c_str();
+    const int         occurrence = (input ? d->seen_input : d->seen)[name_s]++;
     const char * skip_kind  = input ? "skip-input" : "skip";
 
     if (ggml_is_quantized(t->type)) {
@@ -356,12 +375,36 @@ static bool dump_state(dump_ctx * d, const ggml_tensor * s) {
     return true;
 }
 
+// The routing node --prefill-routes keeps of the prefill, if `name` is one: the graph builder names a node `<stem>-<layer>`
+// (`ffn_moe_topk-3`). The match is the whole name — a stem, a dash and digits — so `ffn_moe_weights_norm-3` is not a
+// `ffn_moe_weights` and a `(reshaped)` or `(view)` of a node is not the node. The stem, or "" for no match.
+static std::string route_stem_of(const std::vector<std::string> & stems, const char * name) {
+    for (const std::string & stem : stems) {
+        const size_t n = stem.size();
+        if (strncmp(name, stem.c_str(), n) != 0 || name[n] != '-' || !name[n + 1]) continue;
+        const char * p = name + n + 1;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (!*p) return stem;
+    }
+    return "";
+}
+
 static int on_tensor(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * d = (dump_ctx *) user_data;
     if (d->quiet) {
         // Fused: no node is wanted, so the scheduler runs each split as one graph and never calls
-        // back after a compute. Every node: each is wanted, computed alone, and let pass.
-        return d->quiet_every_node ? 1 : 0;
+        // back after a compute. Every node: each is wanted, computed alone, and let pass. With
+        // --prefill-routes the routing nodes are wanted in either mode, and written when computed.
+        const std::string stem = d->route_stems.empty() ? std::string() : route_stem_of(d->route_stems, t->name);
+        const bool route = !stem.empty();
+        if (route && !ask) {
+            if (d->failed || !dump_one(d, t, false, "prefill.")) {
+                d->failed = true;
+                return 0;  // stop the graph: run_decode_step ends the dump
+            }
+            d->route_written[stem]++;
+        }
+        return (d->quiet_every_node || route) ? 1 : 0;
     }
     if (d->failed) {
         // Asked: yes, so the scheduler computes this node and calls back, and that call
@@ -452,6 +495,25 @@ static int run_decode_step(llama_context * ctx, std::vector<llama_token> & token
             fprintf(stderr, "dump_ref: the quiet prefill failed at token %d (llama_decode returned %d)\n", p0, rc);
             return rc;
         }
+        if (d.failed) {
+            fprintf(stderr, "dump_ref: a prefill route file could not be written at token %d — no trailer\n", p0);
+            return 1;
+        }
+        // Every stem asked for is a node of every routed layer's graph: written, and as often as the others.
+        for (const std::string & stem : d.route_stems) {
+            const int n = d.route_written[stem], first = d.route_written[d.route_stems[0]];
+            if (n == 0 || n != first) {
+                if (n == 0) {
+                    fprintf(stderr, "dump_ref: --prefill-routes asks for %s-<layer>, and the prefill wrote none: the graph has no "
+                                    "such node for this architecture — no trailer\n", stem.c_str());
+                } else {
+                    fprintf(stderr, "dump_ref: --prefill-routes: %s-<layer> was written %d times where %s-<layer> was written "
+                                    "%d: a stem is not a node of every routed layer — no trailer\n",
+                            stem.c_str(), n, d.route_stems[0].c_str(), first);
+                }
+                return 1;
+            }
+        }
     }
     d.quiet = false;
     fprintf(stderr, "dump_ref: quiet prefill of %d tokens in %.1f s\n", n_prefill, seconds_since(t0));
@@ -462,13 +524,25 @@ static int run_decode_step(llama_context * ctx, std::vector<llama_token> & token
     return rc;
 }
 
+// `# fixture`, a tab, at least one character, and no line break.
+static bool is_fixture_line(const std::string & s) {
+    static const std::string head = "# fixture\t";
+    return s.size() > head.size() && s.compare(0, head.size(), head) == 0 && s.find_first_of("\r\n") == std::string::npos;
+}
+
 int main(int argc, char ** argv) {
     // The whole command line for the manifest, taken before the --tokens list is split in place.
     std::string flags;
-    for (int i = 1; i < argc; ++i) flags += (i > 1 ? " " : "") + std::string(argv[i]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--fixture-line") == 0 && i + 1 < argc) {
+            ++i;  // the `# fixture` line has a header line of its own
+            continue;
+        }
+        flags += (flags.empty() ? "" : " ") + std::string(argv[i]);
+    }
 
-    // --tokens, --tokens-file, --tokens-count, --decode-step, --prefill-every-node,
-    // --no-fused-idx-topk and --expect-arch are ours; everything else is gpt_params. Pull them out
+    // --tokens, --tokens-file, --tokens-count, --decode-step, --prefill-every-node, --prefill-routes,
+    // --no-fused-idx-topk, --fixture-line and --expect-arch are ours; everything else is gpt_params. Pull them out
     // before the parser sees them.
     std::vector<llama_token> tokens;
     std::string              expect_arch;
@@ -476,7 +550,9 @@ int main(int argc, char ** argv) {
     long long                tokens_count = -1;
     bool                     decode_step  = false;
     bool                     prefill_every_node = false;
+    std::vector<std::string> route_stems;
     bool                     unfused_topk = false;
+    std::string              fixture_line;
     std::vector<char *>      passthrough;
     passthrough.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -493,6 +569,17 @@ int main(int argc, char ** argv) {
             decode_step = true;
         } else if (strcmp(argv[i], "--prefill-every-node") == 0) {
             prefill_every_node = true;
+        } else if (strcmp(argv[i], "--prefill-routes") == 0 && i + 1 < argc) {
+            std::string rest = argv[++i];
+            for (size_t at = 0; at <= rest.size();) {
+                const size_t comma = rest.find(',', at);
+                const std::string stem = rest.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                route_stems.push_back(stem);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+        } else if (strcmp(argv[i], "--fixture-line") == 0 && i + 1 < argc) {
+            fixture_line = argv[++i];
         } else if (strcmp(argv[i], "--no-fused-idx-topk") == 0) {
             unfused_topk = true;
         } else if (strcmp(argv[i], "--expect-arch") == 0 && i + 1 < argc) {
@@ -529,6 +616,27 @@ int main(int argc, char ** argv) {
     }
     if (prefill_every_node && !decode_step) {
         fprintf(stderr, "dump_ref: --prefill-every-node is a --decode-step option\n");
+        return 2;
+    }
+    if (!route_stems.empty() && !decode_step) {
+        fprintf(stderr, "dump_ref: --prefill-routes is a --decode-step option\n");
+        return 2;
+    }
+    for (size_t i = 0; i < route_stems.size(); ++i) {
+        const std::string & stem = route_stems[i];
+        bool ok = !stem.empty() && stem.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") == std::string::npos;
+        for (size_t j = 0; j < i; ++j) ok = ok && route_stems[j] != stem;
+        if (!ok) {
+            fprintf(stderr, "dump_ref: --prefill-routes wants distinct node stems of lower-case letters, digits and '_' "
+                            "(ffn_moe_topk,ffn_moe_weights,...), got '%s'\n", stem.c_str());
+            return 2;
+        }
+    }
+    // The line refset-check --fixture-line prints, whole: `# fixture`, a tab, the keys; one line. Anything else would put an
+    // unreadable or a second header line into a set.
+    if (!fixture_line.empty() && !is_fixture_line(fixture_line)) {
+        fprintf(stderr, "dump_ref: --fixture-line wants the one '# fixture<TAB>key=value ...' line that refset-check "
+                        "--fixture-line prints, got '%s'\n", fixture_line.c_str());
         return 2;
     }
 
@@ -612,6 +720,7 @@ int main(int argc, char ** argv) {
     }
     fprintf(d.manifest, "# dump_ref — ik_llama.cpp intermediate tensors, raw f32, little-endian\n");
     fprintf(d.manifest, "# model\t%s\n", params.model.c_str());
+    if (!fixture_line.empty()) fprintf(d.manifest, "%s\n", fixture_line.c_str());
     if (const char * b = getenv("BLOOMERY_REF_BUILD")) {
         // Which ik build produced this set. The reference IS that build's output, so a
         // set whose build is unknown cannot be reasoned about after the fact.
@@ -657,10 +766,19 @@ int main(int argc, char ** argv) {
         const size_t n_prefill = tokens.size() - 1;
         fprintf(d.manifest, "# prefill\t%zu\n", n_prefill);
         fprintf(d.manifest, "# decode_pos\t%zu\n", n_prefill);
+        std::string route_list;
+        for (const std::string & stem : route_stems) route_list += (route_list.empty() ? "" : ", ") + stem + "-<layer>";
         if (prefill_every_node) {
             fprintf(d.manifest, "# prefill_schedule\tevery-node — each node was asked for and computed alone, the "
-                                "dumped schedule, and nothing was written: the caches the step reads carry a dumped "
-                                "prefill's arithmetic\n");
+                                "dumped schedule, and nothing was written%s: the caches the step reads carry a dumped "
+                                "prefill's arithmetic\n", route_stems.empty() ? "" : " but the routing nodes' rows (# prefill_routes)");
+        } else if (!route_stems.empty()) {
+            fprintf(d.manifest, "# prefill_schedule\tfused except at the routing nodes — only %s were asked for, so each "
+                                "split ran in groups that end at them, with ik's serving fusions inside a group, and their "
+                                "rows are the only thing written of the prefill (# prefill_routes): it rounds differently from "
+                                "a dumped prefill, the router's top-k turns that into other expert choices, and the caches "
+                                "the step reads drift from a dumped prefill's with depth; this set's rows are consistent "
+                                "with those caches\n", route_list.c_str());
         } else {
             fprintf(d.manifest, "# prefill_schedule\tfused — no node was asked for, so each split ran as one graph "
                                 "with ik's serving fusions: it rounds differently from a dumped prefill, the router's "
@@ -670,6 +788,13 @@ int main(int argc, char ** argv) {
         fprintf(d.manifest, "# state_inputs\tpersistent leaves the step reads (caches, compressor states) are "
                             "input rows, written at their first reader before the step changes them; graph "
                             "scratch leaves are skip-input rows\n");
+        if (!route_stems.empty()) {
+            fprintf(d.manifest, "# prefill_routes\tik's routing of the prefill's positions: the nodes %s of each ubatch of the "
+                                "quiet prefill (n_ubatch %u) are tensor rows named prefill.<node>, one occurrence a ubatch in "
+                                "prefill order, their positions following in order from 0; they come before the step's rows, "
+                                "which keep their names and their occurrences from 0; nothing else of the prefill is written\n",
+                    route_list.c_str(), llama_n_ubatch(init.context));
+        }
     }
     if (decode_step || unfused_topk) fprintf(d.manifest, "# fused_idx_topk\t%d\n", params.fused_idx_topk ? 1 : 0);
     fprintf(d.manifest, "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
@@ -677,6 +802,7 @@ int main(int argc, char ** argv) {
     fprintf(d.manifest, "# input\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
 
     d.quiet_every_node = prefill_every_node;
+    d.route_stems      = route_stems;
     const int rc = decode_step
         ? run_decode_step(init.context, tokens, d)
         : llama_decode(init.context, llama_batch_get_one(tokens.data(), (int) tokens.size(), 0, 0));

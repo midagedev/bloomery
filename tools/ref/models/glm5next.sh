@@ -236,6 +236,14 @@ ref_step_variant() {
     d1k|d3kdsa|d16kdsa) STEP_TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE
                         STEP_TOKENS_SHA256=$GLM_PROSE_SHA256 ;;
   esac
+  # The fixture tier's long sets also hold ik's routes of the prefill's positions (dump_ref --prefill-routes): the picks, the raw
+  # gathered scores and the final weights a gate plants into a batch-fed run of the same ids. This graph passes a routed scale
+  # (build_glm5next.cpp:505, hparams.expert_weights_scale), so the final node is ffn_moe_weights_scaled; the builder names the
+  # three nodes at llama-build-context.cpp:1536, 1539 and 1569 (ik-idxkey db517b69). A stem the graph does not build ends the dump
+  # by name. The real tier's sets are as they were.
+  if [ "${BLOOMERY_TIER:-real}" = fixture ]; then
+    case $name in d1k|d3kdsa|d16kdsa) STEP_ARGS+=(--prefill-routes "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_scaled") ;; esac
+  fi
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node
     STEP_ARGS+=(--prefill-every-node)

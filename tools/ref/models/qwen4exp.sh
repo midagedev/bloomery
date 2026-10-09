@@ -156,6 +156,15 @@ ref_step_variant() {
     d1k|d3k) STEP_TOKENS_FILE=$BLOOMERY_DATA/qwen4exp/corpus-prose.ids
              STEP_TOKENS_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be ;;
   esac
+  # The fixture tier's long sets also hold ik's routes of the prefill's positions (dump_ref --prefill-routes): the picks, the raw
+  # gathered scores and the final weights a gate plants into a batch-fed run of the same ids. This graph normalizes and does not
+  # scale (build_qwen4exp.cpp:671, `LLM_FFN_SILU, true, false, 0.0f`, through llm_build_std_moe_ffn, which hands them to
+  # llm_build_moe_ffn at llama-build-context.cpp:1760-1767), so the final node is ffn_moe_weights_norm; the builder names the
+  # three nodes at llama-build-context.cpp:1536, 1539 and 1563 (ik-idxkey db517b69). A stem the graph does not build ends the
+  # dump by name. The real tier's sets are as they were.
+  if [ "${BLOOMERY_TIER:-real}" = fixture ]; then
+    case $name in d1k|d3k) STEP_ARGS+=(--prefill-routes "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_norm") ;; esac
+  fi
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node
     STEP_ARGS+=(--prefill-every-node)

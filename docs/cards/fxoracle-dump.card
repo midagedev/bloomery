@@ -1,0 +1,46 @@
+# Round fxoracle R2 (card for the dump sitting): ik's CPU node dumps on the three fixture files
+# (/models/fixtures/{glm5next,qwen38,v41}), so the fixture tier's FixtureOracle clauses have their 17 sets. Each dump is one
+# `BLOOMERY_TIER=fixture just dump-ref-fixture <family> [variant]` (or `dump-ref-mtp-fixture <family>`) under this card, one
+# lease each, family by family so each fixture file is read from the device once. Nothing is timed.
+# The dumpers are this tree's, not main's: they live in the private dir /root/bloomery-data/bin-fxr2 (dump.sh reads it through
+# REF_BIN_NAME=bin-fxr2, dump-mtp.sh through DUMP_MTP_OUT=/root/bloomery-data/bin-fxr2) and the shared bin/ stays as main's real-tier
+# dumps need it: a command that forgets the override is refused as stale (rc 3) before any lease, and writes nothing.
+# Minutes [derived]; the batch rows are fxprobe's measured walls (specs/worker2/fxprobe/out-*.txt: GLM 4.3 s,
+# Qwen3.8 4.4 s, V4.1 1.4 s, each with the file cold or warm as the probe found it, CPU, -t 32):
+#   rebuild   `bash tools/ref/build-dump.sh` under the glm5next profile with DUMP_OUT=/root/bloomery-data/bin-fxr2 (g++ of dump_ref.cpp,
+#             no lease) and `just build-ref-dump-mtp` with DUMP_MTP_OUT set to the same dir (the lease, a cmake no-op 5-30 s
+#             [derived: glmmtpref-dump.card], g++ of dump_mtp.cpp): the two compiles measured 3.4 s and 3.8 s whole box
+#             commands on 2026-10-09 (round fxr2's tree, not 20-60 s): 0.2-0.7 min in all
+#   fixed     lease, witnesses, metadata, context: 3-15 s a lease take (glmref-dump.card); 18 takes, the 15 dump.sh runs
+#             (GLM 6, Qwen3.8 5, V4.1 4), the 2 dump-mtp.sh runs and build-ref-dump-mtp's: 0.9-4.5 min
+#   GLM       batch, step4, step4-every-node ~0.1 min each; d1k 1,024 x 1.5-3.8 ms = 1.5-3.9 s; d3kdsa 3,070 x
+#             1.5-3.8 ms + 2/11 of glmdsaref's 1.5-3 min attention = 0.4-0.8 min; d16kdsa 16,382 x 1.5-3.8 ms +
+#             2/11 of 3-6 min = 1.0-2.1 min; MTP 64 ids + ~62 rejected rounds 0.1-0.2 min
+#             (per-token 1.5-3.8 ms: glmref's 29 ms a token x 6/46 layers, the narrowed experts dropped)
+#   Qwen3.8   batch, step4, step4-every-node ~0.1 min each; d1k ~0.1 min; d3k 0.2-0.5 min; MTP with the fixture
+#             draft beside the target 0.1-0.2 min
+#   V4.1      step4, d1n, d1 (P 301), d2 (P 1,025) every-node: 0.05-0.3 min each; the d2 dump runs first (the step
+#             path at the pinned ik build has not run on a fixture: refusal, if any, names the check)
+#   R2b       --prefill-routes <stems> on GLM d1k, d3kdsa, d16kdsa and Qwen3.8 d1k, d3k: the quiet prefill is asked for ik's
+#             ffn_moe_topk-<layer>, the raw ffn_moe_weights-<layer> and the architecture's final planted weights only
+#             (GLM ffn_moe_weights_scaled, Qwen3.8 ffn_moe_weights_norm; the profile names the stems, a stem the graph does
+#             not build ends the dump by name), so a fused prefill runs in groups that end at them (12 syncs a ubatch of 512
+#             on 4 routed layers, 32 ubatches at d16kdsa: ~384, tens of us each) and the rows are written: a top-k pick view
+#             is 4 files (flat and logical, f32 and i32), the raw and the final weights 1 each (measured on the real sets'
+#             manifests: GET_ROWS, DIV and SCALE nodes, contiguous), so 24 x k bytes a token a routed layer, k = 8 (GLM) and
+#             10 (Qwen3.8). Measured by the smoke of round fxr2 (dump_ref direct, -t 4, fixture d1k, 2026-10-10): 4 routed
+#             layers each (GLM fixture layers 2-5, Qwen3.8 0-3), 24 route rows and 48 files a set, 786,432 B (GLM) and 983,040 B
+#             (Qwen3.8), equal to the derivation below; whole dump_ref wall 11 s (GLM) and 5 s (Qwen3.8) at -t 4, the model load
+#             and the decode step included. Per set [derived from the measured d1k, 1,024 x 192 B and 240 B x 4 layers]:
+#             GLM d1k 0.79 MB, d3kdsa 2.36 MB, d16kdsa 12.6 MB; Qwen3.8 d1k 0.98 MB, d3k 2.88 MB, of which the final
+#             weights are 4 x k bytes a token a layer: GLM 131 KB, 393 KB, 2.10 MB; Qwen3.8 164 KB, 480 KB. Tensor rows a set:
+#             3 stems x 4 layers x ubatches, GLM 24, 72, 384; Qwen3.8 24, 72. At the 0.5 GB/s glmref wrote, <= 26 ms a set,
+#             against sets of 0.2-0.5 GB. The five sets' wall moves by under 0.1 s each: the term is 0 against 4-12 min
+#   sitting   the terms add (the phases run one after the other): lows 0.2 + 0.9 + 2.0 + 0.7 + 0.4 = 4.2 min, highs
+#             0.7 + 4.5 + 3.8 + 1.2 + 1.0 = 11.2 min; the design's draft said 5-12 with a 1-2 min rebuild on 15 takes,
+#             the recount is 18 takes and the measured rebuild
+kind: exclusive
+reason: dump_ref and dump_mtp run ik on 32 CPU threads (CUDA hidden, no card); beside a timed run or a gate batch
+  they would take their cores and memory bandwidth, and the profiles and dump-mtp.sh take the lease for every dump; why
+  now: the fixture tier's FixtureOracle clauses need ik's sets on the fixture files (round fxoracle)
+minutes: 4..12
