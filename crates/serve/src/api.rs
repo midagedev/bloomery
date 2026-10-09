@@ -306,7 +306,9 @@ impl Server {
     /// take it in turns ([`Engine::turns`]) or it keeps its draft per slot
     /// ([`Engine::slot_drafts`]), several slots that take an engine of images
     /// ([`Engine::media_model`]) in turns parked as ids, and a depth no queue
-    /// can reach are refused by name ([`ServeError::Slots`]).
+    /// can reach are refused by name ([`ServeError::Slots`]), as is a chat
+    /// template that does not parse or whose thinking probe does not render
+    /// ([`ServeError::Template`]).
     pub fn bind_with(
         addr: impl ToSocketAddrs,
         engine: Box<dyn Engine>,
@@ -314,6 +316,7 @@ impl Server {
         slots: SlotConfig,
     ) -> Result<Self, ServeError> {
         let template = ChatTemplate::parse(&config.chat_template)?;
+        let thinking_off = probe_thinking_off(&template)?;
         if let Some(dir) = config.slot_save_path.as_ref().filter(|d| !d.is_dir()) {
             return Err(ServeError::SlotSavePath(dir.clone()));
         }
@@ -338,6 +341,9 @@ impl Server {
             end_tx,
             config.sampler.unwrap_or_else(sampling::reference_factory),
         );
+        if let Some(note) = thinking_off.note() {
+            eprintln!("bloomery-serve: {note}");
+        }
         let state = State {
             shared: Arc::new(shared),
             parallel,
@@ -345,6 +351,7 @@ impl Server {
             fatal_linger: config.fatal_linger,
             tool_format: ToolFormat::of_chat_template(&template),
             object_arguments: needs_object_arguments(&template),
+            thinking_off,
             template,
             alias: config.model_alias,
             model_path: config.model_path,
@@ -456,6 +463,9 @@ struct State {
     /// Whether the template reads a tool call's `arguments` as an object
     /// ([`needs_object_arguments`]), decided once.
     object_arguments: bool,
+    /// How the template answers `reasoning_effort: "none"`
+    /// ([`probe_thinking_off`]), decided once.
+    thinking_off: ThinkingOff,
     alias: String,
     model_path: String,
     /// `/props`' `engine` object, built when the server binds.
@@ -1596,6 +1606,7 @@ fn props(state: &State) -> Value {
         "default_generation_settings": generation_settings(state, &default_params()),
         "total_slots": state.parallel,
         "chat_template": state.template.source(),
+        "thinking_off": state.thinking_off.word(),
         "chat_template_caps": {},
         "bos_token": state.info.bos_text,
         "eos_token": state.info.eos_text,
@@ -2121,7 +2132,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         }
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     }
-    thinking_vars(b, &mut vars)?;
+    thinking_vars(b, &mut vars, state.thinking_off)?;
     let text = state.template.render(&vars).map_err(|e| ApiError {
         retry_after: false,
         code: 500,
@@ -2177,6 +2188,83 @@ fn needs_object_arguments(t: &ChatTemplate) -> bool {
         && !(as_string.contains(PROBE_ARGUMENT) && !as_string.contains(&escaped))
 }
 
+/// How a chat template answers a request for no thinking
+/// (`reasoning_effort: "none"`), read from its renders once at bind
+/// ([`probe_thinking_off`]), never from its name or the model's family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinkingOff {
+    /// `enable_thinking` changes the generation prompt: `"none"` sets it
+    /// `false`, as llama-server does.
+    Switch,
+    /// The template has no switch but `reasoning_effort` changes the
+    /// generation prompt: `"none"` is sent as the template's lowest effort,
+    /// `"low"`, the closest to no thinking it has.
+    LowEffort,
+    /// Neither knob changes the prompt: `"none"` sets `enable_thinking`
+    /// `false`, as llama-server does, and there is nothing to map it to.
+    Neither,
+}
+
+impl ThinkingOff {
+    /// The word `/props`' `thinking_off` carries.
+    fn word(self) -> &'static str {
+        match self {
+            ThinkingOff::Switch => "switch",
+            ThinkingOff::LowEffort => "low_effort",
+            ThinkingOff::Neither => "neither",
+        }
+    }
+
+    /// The line the server prints at bind when `"none"` is not what the
+    /// client asked for; `None` for the two ways that keep llama-server's
+    /// meaning.
+    fn note(self) -> Option<&'static str> {
+        match self {
+            ThinkingOff::LowEffort => Some(
+                "chat template: no thinking switch; reasoning_effort \"none\" is sent as \"low\"",
+            ),
+            ThinkingOff::Switch | ThinkingOff::Neither => None,
+        }
+    }
+}
+
+/// Reads the template's [`ThinkingOff`] from the generation prompt of one
+/// user message `"hi"`: a template where `enable_thinking: false` and `true`
+/// render differently has a [`Switch`](ThinkingOff::Switch); otherwise one
+/// where `reasoning_effort: "low"` renders differently from no effort is
+/// [`LowEffort`](ThinkingOff::LowEffort); otherwise
+/// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
+/// error, naming the probe: the answer is never guessed.
+fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
+    let render = |extra: Option<(&str, Value)>| {
+        let mut vars = Map::new();
+        vars.insert(
+            "messages".into(),
+            json!([{"role": "user", "content": "hi"}]),
+        );
+        vars.insert("add_generation_prompt".into(), json!(true));
+        vars.insert("bos_token".into(), json!(""));
+        vars.insert("eos_token".into(), json!(""));
+        if let Some((k, v)) = extra {
+            vars.insert(k.into(), v);
+        }
+        t.render(&vars)
+            .map_err(|e| TemplateError(format!("thinking probe: {}", e.0)))
+    };
+    let off = render(Some(("enable_thinking", json!(false))))?;
+    let on = render(Some(("enable_thinking", json!(true))))?;
+    if off != on {
+        return Ok(ThinkingOff::Switch);
+    }
+    let unset = render(None)?;
+    let low = render(Some(("reasoning_effort", json!("low"))))?;
+    Ok(if low != unset {
+        ThinkingOff::LowEffort
+    } else {
+        ThinkingOff::Neither
+    })
+}
+
 /// The tool calls of message `at` with each string `arguments` parsed as JSON,
 /// as llama-server's template application does for a template that reads
 /// objects (`func_args_not_string`, `common/chat.cpp`); a string that is not
@@ -2211,7 +2299,16 @@ fn tool_call_arguments(at: usize, message: &mut Map<String, Value>) -> Result<()
 /// something asked: a template that tells an undefined `enable_thinking` from
 /// `true` (V4.1's takes its `thinking` from it) keeps its own default when
 /// nothing did.
-fn thinking_vars(b: &Map<String, Value>, vars: &mut Map<String, Value>) -> Result<(), ApiError> {
+///
+/// A template with no thinking switch but an effort knob
+/// ([`ThinkingOff::LowEffort`]) has nothing `enable_thinking: false` could
+/// turn off, so there `"none"` is the effort `"low"`: it sets no
+/// `enable_thinking` of its own and replaces a kwargs `reasoning_effort`.
+fn thinking_vars(
+    b: &Map<String, Value>,
+    vars: &mut Map<String, Value>,
+    how: ThinkingOff,
+) -> Result<(), ApiError> {
     let kwargs = match b.get("chat_template_kwargs") {
         None | Some(Value::Null) => None,
         Some(Value::Object(kw)) => Some(kw),
@@ -2234,11 +2331,17 @@ fn thinking_vars(b: &Map<String, Value>, vars: &mut Map<String, Value>) -> Resul
         Some(v @ Value::String(_)) => Some(v),
         Some(other) => return Err(wrong_type("reasoning_effort", "a string", other)),
     };
-    let off = effort.and_then(Value::as_str) == Some("none");
-    if off {
-        thinking = Some(false);
-    } else if let Some(v) = effort {
-        vars.insert("reasoning_effort".into(), v.clone());
+    let none = effort.and_then(Value::as_str) == Some("none");
+    match (none, how) {
+        (true, ThinkingOff::LowEffort) => {
+            vars.insert("reasoning_effort".into(), Value::String("low".to_owned()));
+        }
+        (true, ThinkingOff::Switch | ThinkingOff::Neither) => thinking = Some(false),
+        (false, _) => {
+            if let Some(v) = effort {
+                vars.insert("reasoning_effort".into(), v.clone());
+            }
+        }
     }
     if let Some(on) = thinking {
         vars.insert("enable_thinking".into(), Value::Bool(on));
@@ -2251,7 +2354,7 @@ fn thinking_vars(b: &Map<String, Value>, vars: &mut Map<String, Value>) -> Resul
             kw.iter()
                 .filter(|(k, _)| {
                     !(thinking.is_some() && k.as_str() == "enable_thinking")
-                        && !(off && k.as_str() == "reasoning_effort")
+                        && !(none && k.as_str() == "reasoning_effort")
                 })
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
@@ -3462,9 +3565,9 @@ mod tests {
 
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps, Park,
-        ServeError, SlotConfig, SlotQueue, Stop, after_accept_error, argv_redacted, carries_media,
-        check_slots, content_text, deny_line, engine_object, id_half, needs_object_arguments,
-        shutdown_allowed,
+        ServeError, SlotConfig, SlotQueue, Stop, ThinkingOff, after_accept_error, argv_redacted,
+        carries_media, check_slots, content_text, deny_line, engine_object, id_half,
+        needs_object_arguments, probe_thinking_off, shutdown_allowed,
     };
     use crate::engine::{DeviceProps, PlacementProps, SamplerRefused, SamplingParams};
     use crate::flag::ApiKeys;
@@ -4267,6 +4370,105 @@ mod tests {
         ];
         for (name, source, want) in cases {
             assert_eq!(needs_object_arguments(&parsed(source)), want, "{name}");
+        }
+    }
+
+    /// How each fixture chat template answers `reasoning_effort: "none"`
+    /// ([`probe_thinking_off`]), read from its renders: Qwen3's, Qwen3.6's,
+    /// Qwen3.8's and V4.1's generation prompts change with `enable_thinking`
+    /// ([`ThinkingOff::Switch`]); GLM's always opens `<think>` and changes
+    /// only its effort header ([`ThinkingOff::LowEffort`]); the mock's reads
+    /// neither ([`ThinkingOff::Neither`]). Only the second prints a line at
+    /// bind.
+    #[test]
+    fn the_fixture_templates_name_how_they_turn_thinking_off() {
+        let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
+        let cases = [
+            (
+                "qwen3",
+                include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
+                ThinkingOff::Switch,
+            ),
+            (
+                "qwen36",
+                include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
+                ThinkingOff::Switch,
+            ),
+            (
+                "qwen38",
+                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
+                ThinkingOff::Switch,
+            ),
+            (
+                "glm5",
+                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
+                ThinkingOff::LowEffort,
+            ),
+            (
+                "v41",
+                include_str!("../tests/fixtures/v41-chat-template.jinja"),
+                ThinkingOff::Switch,
+            ),
+            ("mock", super::testserve::TEMPLATE, ThinkingOff::Neither),
+        ];
+        for (name, source, want) in cases {
+            let got = probe_thinking_off(&parsed(source)).expect("the probe renders");
+            assert_eq!(got, want, "{name}");
+            assert_eq!(
+                got.note().is_some(),
+                want == ThinkingOff::LowEffort,
+                "{name}: the bind line"
+            );
+        }
+    }
+
+    /// A template that cannot render the probe's one-message conversation is
+    /// the bind's error naming the probe, never a guess: the probe and
+    /// [`Server::bind`] both end in [`ServeError::Template`].
+    #[test]
+    fn a_template_the_thinking_probe_cannot_render_refuses_the_bind() {
+        let refuses = "{{- raise_exception('nothing renders') }}";
+        let e = probe_thinking_off(&ChatTemplate::parse(refuses).expect("a template"))
+            .expect_err("the probe fails");
+        assert!(
+            e.to_string().contains("thinking probe") && e.to_string().contains("nothing renders"),
+            "{e}"
+        );
+        match super::Server::bind(
+            "127.0.0.1:0",
+            Box::new(crate::MockEngine::new(64)),
+            templated(refuses),
+        ) {
+            Err(ServeError::Template(e)) => {
+                assert!(e.to_string().contains("thinking probe"), "{e}");
+            }
+            Err(other) => panic!("not a template error: {other}"),
+            Ok(_) => panic!("the bind served a template nothing renders"),
+        }
+    }
+
+    /// `/props` names how the template turns thinking off, in the words of
+    /// [`ThinkingOff::word`].
+    #[test]
+    fn props_names_how_the_template_turns_thinking_off() {
+        let cases = [
+            (
+                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
+                "switch",
+            ),
+            (
+                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
+                "low_effort",
+            ),
+            (super::testserve::TEMPLATE, "neither"),
+        ];
+        for (template, want) in cases {
+            let (addr, _state, _ended) =
+                super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(template));
+            let (status, body) = roundtrip(addr, "GET", "/props", "");
+            assert_eq!(status, 200, "{body}");
+            let props: Value = serde_json::from_str(&body).expect("/props is JSON");
+            assert_eq!(props["thinking_off"], want, "{body}");
         }
     }
 
@@ -6088,38 +6290,56 @@ mod tests {
         assert!(p.ends_with("<think>\n"), "its span stays open: {p}");
     }
 
-    /// `reasoning_effort: "none"` on GLM-5's template renders as
-    /// `chat_template_kwargs: {"enable_thinking": false}` does: no
-    /// `reasoning_effort` reaches the template (its effort header keeps its
-    /// default; it reads `reasoning_effort`, not `enable_thinking`), and
-    /// another effort still reaches it.
+    /// `reasoning_effort: "none"` on GLM-5's template, which has no thinking
+    /// switch (its generation prompt always opens `<think>`) and an effort
+    /// header that takes `low` or `high`, is sent as `"low"`, the template's
+    /// lowest effort: it renders as `"low"` does, a kwargs `reasoning_effort`
+    /// beside it is replaced, and another effort reaches the template as it
+    /// came. A kwargs `enable_thinking: false` is no effort and leaves the
+    /// header at the template's default.
     #[test]
-    fn reasoning_effort_none_turns_thinking_off_on_glm5() {
+    fn reasoning_effort_none_is_the_low_effort_on_glm5() {
         let (addr, _state, _ended) = super::testserve::spawn(
             Box::new(crate::MockEngine::new(64)),
             templated(include_str!("../tests/fixtures/glm5-chat-template.jinja")),
         );
         let messages = || json!([{ "role": "user", "content": "Hi" }]);
-        let (status, off) = applied(
+        let header = |effort: &str| {
+            format!(
+                "[gMASK]<sop><|system|>Reasoning Effort: {effort}<|user|>Hi<|assistant|><think>"
+            )
+        };
+        let (status, low) = applied(
             addr,
-            &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": false } }),
+            &json!({ "messages": messages(), "reasoning_effort": "low" }),
         );
-        assert_eq!(status, 200, "{off}");
-        let (status, none) = applied(
-            addr,
-            &json!({ "messages": messages(), "reasoning_effort": "none" }),
-        );
-        assert_eq!(status, 200, "{none}");
-        assert_eq!(none, off, "none turns thinking off");
+        assert_eq!(status, 200, "{low}");
+        assert_eq!(applied_prompt(&low), header("Low"));
+        for body in [
+            json!({ "messages": messages(), "reasoning_effort": "none" }),
+            json!({
+                "messages": messages(),
+                "reasoning_effort": "none",
+                "chat_template_kwargs": { "reasoning_effort": "high" },
+            }),
+        ] {
+            let (status, none) = applied(addr, &body);
+            assert_eq!(status, 200, "{none}");
+            // PIN(2026-10-10): user decision — a template that cannot turn thinking off gets "none" as its lowest effort, "low".
+            assert_eq!(none, low, "none is the template's lowest effort: {body}");
+        }
         let (status, high) = applied(
             addr,
             &json!({ "messages": messages(), "reasoning_effort": "high" }),
         );
         assert_eq!(status, 200, "{high}");
-        assert_eq!(
-            applied_prompt(&high),
-            "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>"
+        assert_eq!(applied_prompt(&high), header("High"));
+        let (status, switch) = applied(
+            addr,
+            &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": false } }),
         );
+        assert_eq!(status, 200, "{switch}");
+        assert_eq!(applied_prompt(&switch), header("Max"));
     }
 
     /// `chat_template_kwargs.enable_thinking` as a string is a 400 naming it,
