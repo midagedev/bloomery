@@ -38,7 +38,8 @@
 //! (`shared/state_back.rs`): the position back at 0, no poison, each card's
 //! free device bytes within a fixed slack of the load's own reading — so a
 //! state one run leaks into the next ends the process instead of quietly
-//! feeding it. Each run runs its own sampler (one a run, from its own
+//! feeding it, and a run it passes is named on stderr (`state back at run
+//! <i>: ok`). Each run runs its own sampler (one a run, from its own
 //! params, built before the load), its own decoder and its own history, and
 //! ends with its own `ids`, `text_consistent` and `chat:` lines; stdout gets
 //! each run's text followed by a newline. A run list brackets what it must:
