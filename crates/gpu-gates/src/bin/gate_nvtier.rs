@@ -18,8 +18,11 @@
 //!   range at the six sampled offsets of `nvtier::audit_offsets`
 //!   ([`NvTier::audit_on`]) — a torn or zeroed span refuses by name.
 //! - `refuse` (clause 4): the room under the tier's floor
-//!   (`HostRoomFloor`), an arena budget under one slot's span, and the
-//!   direct-read probe of a mount without direct IO, each by name.
+//!   (`HostRoomFloor`), an arena budget under the arena's floor at load
+//!   (`ArenaFloor`: one byte, `(k − 1)` slot sets, the floor's own slots
+//!   less the lane claim's, each by name), the floor's own budget loading
+//!   with exactly its slots and the placement's slot set, and the
+//!   direct-read probe of a mount without direct IO, by name.
 //! - `residency` (clause 5): the paged plan's unset rule resolves `off`
 //!   ([`residency38`]: the plan pages through the tier's arena, and a
 //!   promotion would copy a paged expert through the file mapping, cold
@@ -164,7 +167,7 @@ use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{HostNeed, HostRead};
-use model::placement::{Machine, PlanLevers};
+use model::placement::{ARENA_COLUMNS, ArenaFloor, Machine, PlanLevers};
 use runtime::{Out, Target, Want};
 
 const NAME: &str = "gate_nvtier";
@@ -588,9 +591,11 @@ struct StepRun {
 /// slots' tokens as one two-column step ([`Session::step_slots`], the step
 /// port's union), then each slot reset, prompted again and fed the recorded
 /// tokens one column a step on the same load. Refused by name: a two-slot
-/// plan that pages nothing or builds no arena (with the plan's numbers), and
-/// an unset rule that picks `mid` on it (with its pick: the clause judges the
-/// `off` default, never a forced one).
+/// plan that pages nothing or builds no arena (with the plan's numbers), an
+/// arena whose carve falls under the two-column floor (`ArenaFloor::of` at
+/// two columns: the arm's call is wider than the served one the dial sizes
+/// for), and an unset rule that picks `mid` on it (with its pick: the clause
+/// judges the `off` default, never a forced one).
 /// The footprint is read before and after the passes, the prompts' residue
 /// dropped twice first (the second drop takes the pages the first found
 /// busy); `band` `None` (under `--audit`) reads none.
@@ -645,6 +650,18 @@ fn stepunion_arm(
         .nvme_tier()
         .cloned()
         .ok_or("the stepunion arm's two-slot plan built no arena")?;
+    // The arena serves the arm's widest call, two columns a step: the
+    // placement's floor at two columns against the slots the tier carved.
+    let wide = ArenaFloor::of(&plan, 2)?;
+    let carved = tier.stats().slots_per_layer;
+    if carved < wide.slots {
+        return Err(format!(
+            "the stepunion arm's arena carves {carved} slots a paged layer, under its two-column \
+             floor of {wide}"
+        )
+        .into());
+    }
+    println!("stepunion floor: {carved} slots a paged layer serve two columns ({wide})");
     let regions = (0..plan.model.layers)
         .filter(|&l| tier.covers(l))
         .map(|l| Ok((l, tier.drop_region(l)?)))
@@ -1436,11 +1453,13 @@ fn run() -> Result<(), GateError> {
 }
 
 /// `refuse` (clause 4): each refusal by name before any load. The room
-/// under the tier's floor is the plan's; the arena budget under one slot is
-/// the tier's own build over the paged plan with a one-byte arena; the
-/// direct-read probe is `DirectFile::open` on a tmpfs file when the mount
-/// refuses direct IO (a mount that accepts it names that fact and the clause
-/// holds nothing there).
+/// under the tier's floor is the plan's; the arena budgets under the
+/// arena's floor — one byte, the routed width less one slot sets, the
+/// floor's own slots less one — are the tier's own build over the paged
+/// plan with that arena, beside the floor's own budget, which loads with
+/// its slots; the direct-read probe is `DirectFile::open` on a tmpfs file
+/// when the mount refuses direct IO (a mount that accepts it names that
+/// fact and the clause holds nothing there).
 fn refuse_clauses(
     path: &Path,
     machine: &Machine,
@@ -1457,16 +1476,77 @@ fn refuse_clauses(
         verdict(floor)
     );
 
-    let mut tiny = plan.clone();
-    tiny.host.nvme_arena_bytes = 1;
     let split = Arc::new(Split::open(path)?);
-    let slot = match NvTier::of_paged(&tiny, &split, true) {
-        Err(e) => e.to_string().contains("under one slot"),
+    let with_arena = |bytes: u64| {
+        let mut p = plan.clone();
+        p.host.nvme_arena_bytes = bytes;
+        NvTier::of_paged(&p, &split, true)
+    };
+    let slot = match with_arena(1) {
+        Err(e) => e.to_string().contains("carves 0 slots"),
         Ok(_) => false,
     };
     println!(
-        "refuse slot: an arena of 1 B is refused by name (under one slot): {}",
+        "refuse slot: an arena of 1 B is refused by name (carves 0 slots): {}",
         verdict(slot)
+    );
+    // The arena's floor at load (`slots_of`, the placement's `ArenaFloor`):
+    // an arena of the routed width less one slot sets, and of the floor's
+    // own slots less one (the lane claim's), each refused by name with the
+    // floor's terms; the floor's own bytes load, carve exactly its slots,
+    // and carve the slot set the placement counts — the window geometry's
+    // one owner.
+    let least = ArenaFloor::of(plan, ARENA_COLUMNS)?;
+    let named = |slots: u64| match with_arena(slots * least.slot_set) {
+        Err(e) => {
+            let text = e.to_string();
+            let named = text.contains(&format!("carves {slots} slots a paged layer"))
+                && text.contains(&format!(
+                    "under the floor of {} slots ({} × {} ids a call + {} lane claims",
+                    least.slots, least.k, least.columns, least.lanes
+                ));
+            println!("refuse floor: {} B: {text}", slots * least.slot_set);
+            named
+        }
+        Ok(_) => false,
+    };
+    let floor_k = named(least.k - 1);
+    println!(
+        "refuse floor-k: an arena of {} × {} B (the routed width less one) is refused at load \
+         by name: {}",
+        least.k - 1,
+        least.slot_set,
+        verdict(floor_k)
+    );
+    let floor_lane = named(least.slots - 1);
+    println!(
+        "refuse floor-lane: an arena of {} × {} B (the floor less its lane claim) is refused at \
+         load by name: {}",
+        least.slots - 1,
+        least.slot_set,
+        verdict(floor_lane)
+    );
+    let accepted = match with_arena(least.bytes) {
+        Ok(Some(t)) => {
+            let s = t.stats();
+            println!(
+                "accept floor: an arena of {} B carves {} slots a paged layer over {} B a slot \
+                 set (the floor: {least})",
+                least.bytes,
+                s.slots_per_layer,
+                t.slot_set()
+            );
+            s.slots_per_layer == least.slots && t.slot_set() == least.slot_set
+        }
+        Ok(None) => false,
+        Err(e) => {
+            println!("accept floor: the floor's own arena was refused: {e}");
+            false
+        }
+    };
+    println!(
+        "accept floor: the floor's arena loads with its slots and the placement's slot set: {}",
+        verdict(accepted)
     );
 
     let shm = Path::new("/dev/shm").join(format!("{NAME}-probe-{}", std::process::id()));
@@ -1490,5 +1570,5 @@ fn refuse_clauses(
             true
         }
     };
-    Ok(floor && slot && probe)
+    Ok(floor && slot && floor_k && floor_lane && accepted && probe)
 }

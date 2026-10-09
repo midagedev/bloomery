@@ -49,7 +49,9 @@ use gguf::Split;
 use model::moe::{TierError, TierSlots};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
-use model::placement::{Device, Plan, Role};
+use model::placement::{
+    ARENA_ALIGN, ARENA_COLUMNS, ArenaFloor, Device, Plan, Role, arena_window_bytes,
+};
 
 use crate::GpuError;
 
@@ -73,27 +75,44 @@ struct PartRange {
     skew: usize,
 }
 
+// The placement's slot geometry is the arena's: its windows align to the
+// pages the direct reads land in.
+const _: () = assert!(ARENA_ALIGN as usize == DIRECT_ALIGN);
+
 /// The bytes a part's window takes in its slot: the part's own bytes and
-/// the two partial pages an aligned read of them can span — the same shape
-/// the staging swap's ring slot uses.
+/// the two partial pages an aligned read of them can span — the
+/// placement's one shape of a window ([`arena_window_bytes`]), the same
+/// shape the staging swap's ring slot uses.
 pub(crate) fn window_bytes(len: usize) -> usize {
-    (len + 2 * DIRECT_ALIGN).div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN
+    arena_window_bytes(len as u64) as usize
 }
 
 /// The slots a layer holds for the arena's `budget` bytes over the paged
 /// layers' slot sizes: the same count a layer, so every layer warms alike
-/// and the carved total stays under the budget. A budget under one slot of
-/// every layer is the named refusal — the arena would hold nothing and
-/// every read refuse.
-pub(crate) fn slots_of(budget: u64, slot_bytes: &[usize]) -> Result<usize, String> {
+/// and the carved total stays under the budget. A count under the arena's
+/// floor (`least`, the placement's [`ArenaFloor`]: one call's distinct ids
+/// and the lane claims beside them), or under one slot, is the named
+/// refusal — a call would evict its own ids, or every read refuse.
+pub(crate) fn slots_of(
+    budget: u64,
+    slot_bytes: &[usize],
+    least: &ArenaFloor,
+) -> Result<usize, String> {
     let total: usize = slot_bytes.iter().sum();
     if total == 0 {
         return Err("the plan pages no routed stack".to_string());
     }
     let n = (budget as usize) / total;
-    if n == 0 {
+    let want = least.slots.max(1);
+    if (n as u64) < want {
         return Err(format!(
-            "the arena's budget {budget} B is under one slot of every paged layer ({total} B)"
+            "the arena's budget {budget} B carves {n} slots a paged layer over the paged layers' \
+             {total} B a slot set, under the floor of {want} slots ({} × {} ids a call + {} lane \
+             claims, {} B over these layers): a call would evict its own ids",
+            least.k,
+            least.columns,
+            least.lanes,
+            want.saturating_mul(total as u64)
         ));
     }
     Ok(n)
@@ -455,6 +474,8 @@ pub struct NvTierStats {
     /// Wall those drops took, summed (ns): the syscalls and the kernel's
     /// freeing of the pages, on the reader's thread.
     pub drop_ns: u64,
+    /// The slots each paged layer holds: at least the arena's floor.
+    pub slots_per_layer: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -559,6 +580,10 @@ pub struct NvTier {
     books: Mutex<Books>,
     stats: Stats,
     budget: u64,
+    /// The slots each paged layer holds.
+    slots: usize,
+    /// One slot of every paged layer, the carve's bytes.
+    slot_set: u64,
     /// The routed-expert bytes the plan pages on the NVMe tier.
     paged: u64,
     /// One buffered handle per shard, once [`NvTier::audit_on`] turned the
@@ -622,7 +647,9 @@ impl NvTier {
     /// not one run, whose routed stacks are not three rows the split holds,
     /// a stack whose experts do not cut its bytes evenly, a stack in a shard
     /// that is not its file's mapping ([`gguf::Gguf::file_backed`]: a drop
-    /// would zero a copy), and a budget under one slot.
+    /// would zero a copy), and a budget whose carve falls under the
+    /// arena's floor ([`ArenaFloor::of`] at the served column: a plan whose
+    /// arena was not the split dial's).
     pub fn of_paged(
         plan: &Plan<'_>,
         split: &Arc<Split>,
@@ -807,7 +834,8 @@ impl NvTier {
                 slots: Vec::new(),
             });
         }
-        let count = slots_of(plan.host.nvme_arena_bytes, &slot_sizes)
+        let least = ArenaFloor::of(plan, ARENA_COLUMNS).map_err(|e| GpuError::plan(WHAT, e))?;
+        let count = slots_of(plan.host.nvme_arena_bytes, &slot_sizes, &least)
             .map_err(|e| GpuError::shape(WHAT, e))?;
         let page = page_bytes().map_err(|e| GpuError::plan(WHAT, e))?;
         let bytes = count * slot_sizes.iter().sum::<usize>();
@@ -856,6 +884,8 @@ impl NvTier {
             }),
             stats: Stats::default(),
             budget: plan.host.nvme_arena_bytes,
+            slots: count,
+            slot_set: slot_sizes.iter().sum::<usize>() as u64,
             paged: plan.host.nvme_expert_bytes,
             audit: OnceLock::new(),
             split: Arc::clone(split),
@@ -969,6 +999,7 @@ impl NvTier {
             drops: self.drops.drops.load(Ordering::Relaxed),
             drop_bytes: self.drops.drop_bytes.load(Ordering::Relaxed),
             drop_ns: self.drops.drop_ns.load(Ordering::Relaxed),
+            slots_per_layer: self.slots as u64,
         }
     }
 
@@ -976,6 +1007,14 @@ impl NvTier {
     #[must_use]
     pub fn budget(&self) -> u64 {
         self.budget
+    }
+
+    /// One slot of every paged layer as the arena carved it: the bytes
+    /// each slot a layer adds, the placement's slot set over the layers
+    /// this plan pages.
+    #[must_use]
+    pub fn slot_set(&self) -> u64 {
+        self.slot_set
     }
 
     /// The arena's mapping as an address range `[start, end)`: the only
@@ -1498,6 +1537,12 @@ mod tests {
         }
     }
 
+    /// A floor of `slots` slots over the slot set `sizes` sums to.
+    fn floor_of(k: u64, lanes: u64, sizes: &[usize]) -> model::placement::ArenaFloor {
+        let set = sizes.iter().sum::<usize>() as u64;
+        model::placement::ArenaFloor::new(k, 1, lanes, set).expect("a floor")
+    }
+
     /// The slots a budget holds: the same count a layer, the carve under
     /// the budget; a budget under one slot of every layer is the named
     /// refusal, and so is a plan that pages nothing.
@@ -1505,20 +1550,50 @@ mod tests {
     fn the_budget_carves_the_same_count_a_layer() {
         let sizes = [1_000_000, 1_200_000, 900_000];
         let total: u64 = sizes.iter().sum::<usize>() as u64;
-        let n = slots_of(10 * total, &sizes).expect("ten tiers of slots");
+        let one = floor_of(1, 0, &sizes);
+        let n = slots_of(10 * total, &sizes, &one).expect("ten tiers of slots");
         assert_eq!(n, 10);
         assert!(n as u64 * total <= 10 * total);
-        assert_eq!(slots_of(total, &sizes), Ok(1));
-        let under = slots_of(total - 1, &sizes).unwrap_err();
+        assert_eq!(slots_of(total, &sizes, &one), Ok(1));
+        let under = slots_of(total - 1, &sizes, &one).unwrap_err();
         assert!(
-            under.contains("under one slot") && under.contains(&(total - 1).to_string()),
+            under.contains("carves 0 slots")
+                && under.contains("under the floor of 1 slots")
+                && under.contains(&(total - 1).to_string()),
             "{under}"
         );
+        // A floor of no slot still refuses a carve of none.
+        let none = floor_of(0, 0, &sizes);
+        assert!(slots_of(total - 1, &sizes, &none).is_err());
         assert!(
-            slots_of(total, &[])
+            slots_of(total, &[], &one)
                 .unwrap_err()
                 .contains("no routed stack")
         );
+    }
+
+    /// A budget that carves one slot a layer fewer than the arena's floor —
+    /// ten ids a call and one lane claim, eleven slots — is refused by name,
+    /// naming the carve, the floor's slots, its ids a call, its lane claims
+    /// and its bytes over the paged layers; the floor's own budget carves
+    /// exactly its slots.
+    #[test]
+    fn a_carve_under_the_floor_is_refused_by_name() {
+        let sizes = [3_133_440, 3_137_536, 3_133_440];
+        let total: u64 = sizes.iter().sum::<usize>() as u64;
+        let least = floor_of(10, 1, &sizes);
+        assert_eq!(least.slots, 11);
+        let under = slots_of(11 * total - 1, &sizes, &least).unwrap_err();
+        for part in [
+            "carves 10 slots a paged layer".to_string(),
+            "under the floor of 11 slots".to_string(),
+            "10 × 1 ids a call + 1 lane claims".to_string(),
+            format!("{} B over these layers", 11 * total),
+        ] {
+            assert!(under.contains(&part), "{part:?} in {under}");
+        }
+        assert!(slots_of(9 * total, &sizes, &least).is_err(), "k − 1 slots");
+        assert_eq!(slots_of(11 * total, &sizes, &least), Ok(11));
     }
 
     /// The slot a miss takes: the first free one, else the least recently
