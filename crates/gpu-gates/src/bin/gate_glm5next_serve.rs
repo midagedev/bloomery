@@ -261,6 +261,7 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu_gates::record::{self, Log};
+    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
         curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
     };
@@ -770,7 +771,8 @@ mod gate {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
         let nextn = NextnInputs::read(&inputs)?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let mut machine = workstation::plan_gate(inputs.model.layers);
+        reserve_checkpoints(&mut machine, glm_seqs(1));
         let plan = inputs.plan_nextn(
             &machine,
             u64::try_from(CTX)?,
@@ -1002,6 +1004,7 @@ mod gate {
         free: Option<u64>,
     ) -> Result<Option<u64>, GateError> {
         let mut machine = workstation::plan_gate(inputs.model.layers);
+        reserve_checkpoints(&mut machine, glm_seqs(1));
         machine.cards[0].free_bytes = free;
         Ok(inputs
             .plan(&machine, u64::try_from(ctx)?, levers)

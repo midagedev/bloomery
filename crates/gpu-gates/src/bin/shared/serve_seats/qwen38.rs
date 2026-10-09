@@ -157,7 +157,7 @@
 //! the terms the records and rules read (`PlanKey`: the card's and the tiers'
 //! experts, the host's experts, resident bytes and tables, the NVMe tier's
 //! bytes and arena) or the load is refused by name. The plan's host reserves
-//! every slot's checkpoints (`HOST_BUDGET` a slot, [`CHECKPOINTS_RESERVE`]),
+//! every slot's checkpoints (`HOST_BUDGET` a slot, [`reserve_checkpoints`]),
 //! so the host need, the split's floor and the arena count them, so a default
 //! count whose plan the room leaves under the floor is planned at one slot
 //! with no draft where that plan pages, under `--place bp` too: that one slot
@@ -286,6 +286,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use app::mtp::{MtpBody, MtpDraft};
+use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
 use bloomery_gpu::host::census::TierCensus;
@@ -299,7 +300,7 @@ use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
-    CARD38, CHECKPOINTS_RESERVE, Lever38, checkpoint_bytes, checkpoints_beside, residency38,
+    CARD38, Lever38, Seqs, checkpoints_reserved, reserve_checkpoints, residency38,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
@@ -315,7 +316,7 @@ use model::arch::qwen35moe::place::{
     tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN};
+use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
@@ -504,8 +505,8 @@ impl Place38 {
     /// (`MtpInputs::card_bytes_of`, the reserve `plan_mtp_with_slots`
     /// checks; `place::machine_bp_on`), the one-card plans count them in
     /// `plan_mtp_with_slots`. The host reserves every slot's checkpoints
-    /// ([`CHECKPOINTS_RESERVE`]), which the plan's host need, the NVMe
-    /// tier's floor and its arena then count.
+    /// ([`seqs38`] through [`reserve_checkpoints`]), which the plan's host
+    /// need, the NVMe tier's floor and its arena then count.
     fn machine(
         self,
         inputs: &PlanInputs,
@@ -529,11 +530,18 @@ impl Place38 {
                 )
             }
         };
-        machine
-            .host
-            .reserves
-            .push((CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(slots)));
+        reserve_checkpoints(&mut machine, seqs38(slots));
         Ok(machine)
+    }
+}
+
+/// What the seat's load of `slots` resident sequences declares
+/// ([`reserve_checkpoints`]): every slot takes checkpoints, the seat turning
+/// them on (`set_checkpoints`), up to `HOST_BUDGET` of host a slot.
+fn seqs38(slots: usize) -> Seqs {
+    Seqs {
+        slots,
+        checkpoints: true,
     }
 }
 
@@ -633,7 +641,7 @@ fn draft38(
 /// — and the arena of the one-slot plan with no draft, which the rule loads
 /// (`one`), when that plan pages (an arena past 0: the rule's own condition;
 /// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
-/// name). The floor counts every slot's checkpoints ([`CHECKPOINTS_RESERVE`]),
+/// name). The floor counts every slot's checkpoints ([`reserve_checkpoints`]),
 /// so a room between the one-slot floor and the asked slots' is one only the
 /// one-slot plan clears. That one slot is the room's, so it holds under
 /// `--place bp` too, where the one-column rule alone keeps every slot. Any
@@ -740,9 +748,9 @@ impl Plans<'_> {
     /// records unprinted), and the arena itself
     /// (`HostTotals::nvme_arena_bytes`, 0 without one) for the `cache`
     /// line's `tier` term — [`CacheRam::of_tier`] counts it once, inside
-    /// the need — the checkpoint bytes beside the need
-    /// ([`checkpoints_beside`]: none, the machine reserving every slot's),
-    /// and the routed-expert bytes the host leg reads from the NVMe tier
+    /// the need — the checkpoint bytes the machine reserves
+    /// ([`checkpoints_reserved`]: every slot's, inside the need), and the
+    /// routed-expert bytes the host leg reads from the NVMe tier
     /// (`HostTotals::nvme_expert_bytes`, 0 on a plan it did not split).
     fn host(
         &self,
@@ -791,7 +799,7 @@ impl Plans<'_> {
             HostNeed::of(&plan, 0).bytes(),
             pool,
             plan.host.nvme_arena_bytes,
-            checkpoints_beside(&machine),
+            checkpoints_reserved(&machine),
             plan.host.nvme_expert_bytes,
         ))
     }
@@ -1164,7 +1172,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let inputs = PlanInputs::describe(&split)?;
+    // The stage card's first open is made before the room is read
+    // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
+    // lost its host bytes as the load's check after its open has; plan
+    // (b′)'s tier card is held once chosen, below.
+    let stage = draft_at.cards.on(&census)?.card_specs()?[0];
+    Gpu::hold_card(stage.name, stage.device)?;
+    let mut inputs = PlanInputs::describe(&split)?;
     // The slot count first: it shapes the draft's window condition, the
     // context search itself, and every plan the seat asks for, each counting
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
@@ -1292,7 +1306,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             experts,
             &plan_levers,
             mtp_inputs.as_ref(),
-            slots,
+            seqs38(slots),
         )
     })?;
     chosen.record().eprint();
@@ -1304,6 +1318,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         },
         cards: chosen.place,
     };
+    // Plan (b′)'s tier cards held too, and the room read again: every plan
+    // below and the engine thread's take it.
+    let tiers = &a.place.cards.card_specs()?[1..];
+    if !tiers.is_empty() {
+        for t in tiers {
+            Gpu::hold_card(t.name, t.device)?;
+        }
+        inputs.room = host_available_read()?;
+    }
     // The paged tier's one-column rule (`bloomery_levers::paged_columns`,
     // the module doc), asked once of the plan the flags name: a set
     // context's slot is known before any search, so its plain plan's arena
@@ -1470,8 +1493,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     refuse_mtp_levers(&draft_off)?;
-    let (need, pool, arena, beside, paged) = host;
-    let cache = CacheRam::of_tier(a.cache_ram, need, pool, (arena, paged), beside)?
+    let (need, pool, arena, checkpoints, paged) = host;
+    let cache = CacheRam::of_tier(a.cache_ram, need, pool, (arena, paged), checkpoints)?
         .holding(seq38_state(&inputs, 1, mtp));
     let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();

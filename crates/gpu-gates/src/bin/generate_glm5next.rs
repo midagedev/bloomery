@@ -226,7 +226,7 @@ mod cli {
     };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
+    use bloomery_gpu_gates::residency38::{GLM_CARD, glm_machine, residency_room, residency_set};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
@@ -629,7 +629,7 @@ mod cli {
         let placement = chosen.place;
         let place = placement.name();
         let tier_batch = glm_place::tier_batch(placement, &inputs.hp);
-        let machine = placement.machine(None, tier_batch)?;
+        let machine = glm_machine(placement, tier_batch, slots)?;
         let trace = trace_of(
             &levers,
             &file,

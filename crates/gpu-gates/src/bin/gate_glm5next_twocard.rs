@@ -172,6 +172,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
+    use bloomery_gpu_gates::residency38::glm_machine;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{
@@ -745,7 +746,7 @@ mod gate {
     /// The bits arm (no flag): the union reference, then the two cards.
     fn bits(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
         let cfg = cfg.clone();
-        let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let bp = glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1)?;
         let layers = inputs.model.layers;
         let two = bp(layers);
         let plan = inputs.plan_lanes(&two, u64::try_from(CTX)?, &cfg.place, KdaLanes::Two)?;
@@ -1102,7 +1103,7 @@ mod gate {
     /// The `--residency` arm (module header).
     fn residency_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
         let lever = Residency::parse(GLM_RESIDENCY_UNSET)?;
-        let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let bp = glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1)?;
         let prompt = prompt()?;
         let ids = &prompt[..PROMPT];
         let open_args = || OpenArgs {
@@ -1320,7 +1321,7 @@ mod gate {
     /// The `--nextn` arm (module header).
     fn nextn_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
         let nextn = NextnInputs::read(inputs)?;
-        let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let bp = glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1)?;
         let two = bp(inputs.model.layers);
         let np = inputs.plan_nextn(&two, u64::try_from(CTX)?, &cfg.place, &nextn)?;
         println!(

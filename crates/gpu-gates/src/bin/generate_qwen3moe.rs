@@ -381,7 +381,7 @@ mod cli {
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
+    use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, residency38};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, Paged, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
@@ -960,7 +960,11 @@ mod cli {
                 experts,
                 &PlanLevers::from_levers(levers)?,
                 mtp.as_ref(),
-                if mtp.is_some() { 1 } else { slots },
+                // The CLI's load leaves checkpoints off (`set_checkpoints`).
+                Seqs {
+                    slots: if mtp.is_some() { 1 } else { slots },
+                    checkpoints: false,
+                },
             )
         })?;
         chosen.record().print();

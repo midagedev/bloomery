@@ -174,6 +174,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{Residence, place_table};
     use bloomery_gpu_gates::record;
+    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{Body, PrefillMode, feed, set_prefill};
@@ -1274,7 +1275,8 @@ mod gate {
         let path = glm5next_tier::model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&file).map_err(|e| format!("{path}: {e}"))?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
+        reserve_checkpoints(&mut machine, glm_seqs(1));
         let place = glm5next_tier::plan_levers(&levers, 0)?;
         let plan = inputs
             .plan(&machine, CTX as u64, &place)

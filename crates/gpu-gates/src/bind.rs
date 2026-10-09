@@ -376,18 +376,17 @@ pub const CACHE_RAM_CAP: u64 = 8192 << 20;
 /// it off), and its terms: set, as given; else the lesser of
 /// [`CACHE_RAM_CAP`] and half of what the host's available bytes —
 /// `MemAvailable`, or the smaller room under a cgroup v2 limit
-/// (`workstation::host_available_read`) — leave past the plan's host need,
-/// the residency's churn pool, the NVMe expert tier's arena
-/// ([`CacheRam::of_tier`]) and the checkpoints the load holds beside the
-/// need (`residency38::checkpoints_beside`: none where the plan's machine
-/// reserves them, one sequence's otherwise), 0 when nothing is left — a zero the line's `why`
-/// names ([`CacheRam::why`]), since a load with no prompt cache still
-/// serves correctly, every state recomputed. A plan the NVMe expert tier
-/// split defaults to 0 too: the split fills the room past the tier's floor
-/// with its arena and the host experts it keeps, so what the reading leaves
-/// past the need is the split's rounding or the reading's drift, never room
-/// the plan left. A default too small for one saved state is 0
-/// ([`CacheRam::holding`]).
+/// (`workstation::host_available_read`) — leave past the plan's host need
+/// and the residency's churn pool, the need holding the NVMe expert tier's
+/// arena ([`CacheRam::of_tier`]) and the checkpoints the load's sequences
+/// pin (`residency38::reserve_checkpoints`, the machine's host reserve), 0
+/// when nothing is left — a zero the line's `why` names ([`CacheRam::why`]),
+/// since a load with no prompt cache still serves correctly, every state
+/// recomputed. A plan the NVMe expert tier split defaults to 0 too: the
+/// split fills the room past the tier's floor with its arena and the host
+/// experts it keeps, so what the reading leaves past the need is the split's
+/// rounding or the reading's drift, never room the plan left. A default too
+/// small for one saved state is 0 ([`CacheRam::holding`]).
 pub struct CacheRam {
     pub ram: u64,
     /// `--cache-ram` given, or the default's terms.
@@ -409,14 +408,15 @@ pub struct CacheRam {
     /// tier (`HostTotals::nvme_expert_bytes`), 0 on a plan the tier did not
     /// split; above 0 the default budget is 0 (the type's doc).
     pub paged: u64,
-    /// The checkpoint bytes beside `need` the default takes out
-    /// (`residency38::checkpoints_beside`), 0 where the need holds them.
+    /// The checkpoint bytes the plan's machine reserves
+    /// (`residency38::checkpoints_reserved`), 0 for a load that pins none.
+    /// Inside `need` already; kept here for the line.
     pub checkpoints: u64,
     /// Why the default budget is 0, named for the line's `why=` term: the
-    /// reading left nothing past the need, the pool and the checkpoints
-    /// beside them; the NVMe tier's split took the room; or the budget was
-    /// under one saved state. `None` for a budget above 0 and for a set one
-    /// (`--cache-ram 0` is the caller's own ask).
+    /// reading left nothing past the need and the pool; the NVMe tier's
+    /// split took the room; or the budget was under one saved state. `None`
+    /// for a budget above 0 and for a set one (`--cache-ram 0` is the
+    /// caller's own ask).
     pub why: Option<String>,
 }
 
@@ -430,8 +430,8 @@ impl CacheRam {
     }
 
     /// The budget (the type's doc): `set` in bytes as given, else the
-    /// default over `need`, `pool` and the `checkpoints` beside the need
-    /// (`residency38::checkpoints_beside` of the plan's machine) —
+    /// default over `need` and `pool`, `need` holding the `checkpoints` the
+    /// plan's machine reserves (`residency38::checkpoints_reserved`) —
     /// [`CacheRam::of_tier`] with no NVMe expert tier.
     pub fn of(
         set: Option<u64>,
@@ -467,8 +467,9 @@ impl CacheRam {
     }
 
     /// [`CacheRam::of_tier`] at a host reading already taken. A `need`
-    /// under the `tier` it holds is refused by name: it is a need read
-    /// without the arena, and the budget would take the arena's bytes.
+    /// under the `tier` and `checkpoints` it holds is refused by name: it is
+    /// a need read without the arena or of a machine with no checkpoint
+    /// reserve, and the budget would take their bytes.
     fn at(
         set: Option<u64>,
         (available, reading): (u64, HostRead),
@@ -491,6 +492,14 @@ impl CacheRam {
             )
             .into());
         }
+        if checkpoints > need - tier {
+            return Err(format!(
+                "the prompt cache's need {need} B is under the NVMe tier arena {tier} B and the \
+                 checkpoints {checkpoints} B it holds: a need read of a machine with no \
+                 checkpoint reserve (residency38::reserve_checkpoints)"
+            )
+            .into());
+        }
         let (ram, why) = match set {
             Some(ram) => (ram, None),
             None if paged > 0 => (
@@ -501,7 +510,7 @@ impl CacheRam {
                      no prompt cache, every state recomputed"
                 )),
             ),
-            None => Self::default_of(available, need, pool, checkpoints),
+            None => Self::default_of(available, need, pool),
         };
         Ok(CacheRam {
             ram,
@@ -540,20 +549,19 @@ impl CacheRam {
     }
 
     /// The default budget ([`CacheRam`]'s doc): half of what `available`
-    /// leaves past `need`, `pool` and the `checkpoints` beside them, capped at
-    /// [`CACHE_RAM_CAP`]. A leftover of nothing is a named record, not a
-    /// silent zero: the seat serves correctly without a prompt cache (every
-    /// state recomputed), so the line states the arithmetic that left
-    /// nothing instead of the load refusing.
-    fn default_of(available: u64, need: u64, pool: u64, checkpoints: u64) -> (u64, Option<String>) {
-        let left =
-            i128::from(available) - i128::from(need) - i128::from(pool) - i128::from(checkpoints);
+    /// leaves past `need` and `pool`, capped at [`CACHE_RAM_CAP`]. A
+    /// leftover of nothing is a named record, not a silent zero: the seat
+    /// serves correctly without a prompt cache (every state recomputed), so
+    /// the line states the arithmetic that left nothing instead of the load
+    /// refusing.
+    fn default_of(available: u64, need: u64, pool: u64) -> (u64, Option<String>) {
+        let left = i128::from(available) - i128::from(need) - i128::from(pool);
         if left / 2 <= 0 {
             return (
                 0,
                 Some(format!(
-                    "the reading {available} B leaves {left} B past need {need} B + pool {pool} B \
-                     + checkpoints {checkpoints} B: no prompt cache, every state recomputed"
+                    "the reading {available} B leaves {left} B past need {need} B + pool {pool} B: \
+                     no prompt cache, every state recomputed"
                 )),
             );
         }
@@ -2508,9 +2516,9 @@ mod tests {
         assert!(!e.contains("--cache-ram"), "{e}");
     }
 
-    /// The checkpoints a load holds beside the plan's need grow one
-    /// [`HOST_BUDGET`] a sequence ([`checkpoint_bytes`]), the count every
-    /// room and cache budget that subtracts them uses.
+    /// The checkpoints a load's sequences pin grow one [`HOST_BUDGET`] a
+    /// sequence ([`checkpoint_bytes`]), the bytes the machine's checkpoint
+    /// reserve carries.
     #[test]
     fn checkpoint_bytes_grow_a_budget_a_sequence() {
         use crate::residency38::checkpoint_bytes;
@@ -2521,14 +2529,17 @@ mod tests {
         assert_eq!(checkpoint_bytes(usize::MAX), u64::MAX);
     }
 
-    /// The unset residency rule's room subtracts the checkpoints the load
-    /// holds ([`mem_left_38`]): a plan whose churn pool fits what the host
-    /// leaves past the plan's need alone, and does not fit it once the
-    /// checkpoints are counted, turns `MemShort` whose `leaves` is the
-    /// room — the checkpoint bytes named in it.
+    /// The unset residency rule's room is what the reading leaves past the
+    /// plan's host need ([`mem_left_38`]), the need holding the checkpoints
+    /// the load's machine reserves ([`reserve_checkpoints`]) once: a churn
+    /// pool that fits past the need of a load that declares none does not
+    /// fit past the same plan's need on a machine that reserves two slots',
+    /// and the pick turns `MemShort`, naming the room the reserve leaves.
     #[test]
-    fn the_residency38_room_subtracts_the_checkpoints() {
-        use crate::residency38::{checkpoint_bytes, mem_left_38};
+    fn the_residency38_room_reads_the_reserved_need() {
+        use crate::residency38::{Seqs, checkpoints_reserved, mem_left_38, reserve_checkpoints};
+        use model::placement::{Host, Machine};
+        use runtime::seqstate::HOST_BUDGET;
         // A plan of one card layer of 100 experts, its host the rest: the
         // unset rule pins none (P 0), the pool a fixed 10 GiB whatever P is.
         let pick = |mem_left: i128| {
@@ -2541,20 +2552,36 @@ mod tests {
             )
             .expect("the pick")
         };
-        let (available, need, slots) = (24 << 30, 12 << 30, 1usize);
-        // Without the checkpoints the pool fits: the word runs at P.
-        assert_eq!(
-            pick(i128::from(available) - i128::from(need)).pinned,
-            Some(0)
-        );
-        // With them it does not (12 − 4 GiB < 10 GiB): off, MemShort naming
-        // the pool's bytes and the room the checkpoints leave.
-        let short = pick(mem_left_38(available, need, checkpoint_bytes(slots)));
+        let declared = |checkpoints: bool| {
+            let mut machine = Machine {
+                cards: Vec::new(),
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: 0,
+                    reserves: Vec::new(),
+                },
+            };
+            reserve_checkpoints(
+                &mut machine,
+                Seqs {
+                    slots: 2,
+                    checkpoints,
+                },
+            );
+            checkpoints_reserved(&machine)
+        };
+        // The plan's own terms, 12 GiB, and the reserve the need adds.
+        let (available, terms) = (24u64 << 30, 12u64 << 30);
+        let none = terms + declared(false);
+        assert_eq!(pick(mem_left_38(available, none)).pinned, Some(0));
+        let two = terms + declared(true);
+        assert_eq!(two - none, 2 * HOST_BUDGET);
+        let short = pick(mem_left_38(available, two));
         assert_eq!(
             short.why,
             bloomery_levers::Residency38Why::MemShort {
                 needs: 10u64 << 30,
-                leaves: mem_left_38(available, need, checkpoint_bytes(slots)),
+                leaves: i128::from(available) - i128::from(terms) - i128::from(2 * HOST_BUDGET),
             }
         );
         assert_eq!(
@@ -2563,18 +2590,9 @@ mod tests {
                 "unset: the churn pool needs {} B, MemAvailable leaves {} B past the plan's host \
                  need",
                 10u64 << 30,
-                i128::from(available) - i128::from(need) - i128::from(checkpoint_bytes(slots))
+                i128::from(available) - i128::from(two)
             )
         );
-        // Two sequences hold twice the budget: the room shrinks by it.
-        assert_eq!(
-            mem_left_38(available, need, checkpoint_bytes(2)),
-            i128::from(available) - i128::from(need) - i128::from(2 * checkpoint_bytes(1))
-        );
-        assert!(matches!(
-            pick(mem_left_38(available, need, checkpoint_bytes(2))).why,
-            bloomery_levers::Residency38Why::MemShort { .. }
-        ));
     }
 
     mod media {
@@ -3192,34 +3210,48 @@ mod tests {
 
     mod cache_ram {
         use super::super::{CacheRam, HostRead};
-        use crate::residency38::{CHECKPOINTS_RESERVE, checkpoint_bytes, checkpoints_beside};
+        use crate::generate::Place;
+        use crate::residency38::{
+            CHECKPOINTS_RESERVE, Seqs, checkpoint_bytes, checkpoints_reserved, glm_machine,
+            reserve_checkpoints,
+        };
         use model::placement::{Host, Machine};
+        use runtime::seqstate::HOST_BUDGET;
+
+        /// A machine of `os` reserved bytes on the host and nothing else.
+        fn machine(os: u64) -> Machine {
+            Machine {
+                cards: Vec::new(),
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: 0,
+                    reserves: vec![("os".to_owned(), os)],
+                },
+            }
+        }
 
         /// The default budget's zero is a named record, not a silent one: a
-        /// reading that leaves nothing past the need, the pool and one
-        /// sequence's checkpoints gives `ram=0` with a `why=` naming the
-        /// arithmetic, and the `cache` line carries it; a leftover halves
-        /// under the cap with no why, and one byte left halves to a named
-        /// zero too.
+        /// reading that leaves nothing past the need and the pool gives
+        /// `ram=0` with a `why=` naming the arithmetic, and the `cache` line
+        /// carries it; a leftover halves under the cap with no why, and one
+        /// byte left halves to a named zero too.
         #[test]
         fn a_default_budget_of_zero_names_its_terms() {
-            let checkpoints = checkpoint_bytes(1);
-            let (ram, why) = CacheRam::default_of(10_000 + checkpoints, 6_000, 1_000, checkpoints);
+            let (ram, why) = CacheRam::default_of(10_000, 6_000, 1_000);
             assert_eq!((ram, why.is_none()), (1_500, true));
-            for available in [6_000 + 1_000 + checkpoints, 6_000 + 1_000 + checkpoints + 1] {
-                let (ram, why) = CacheRam::default_of(available, 6_000, 1_000, checkpoints);
+            for available in [6_000 + 1_000, 6_000 + 1_000 + 1] {
+                let (ram, why) = CacheRam::default_of(available, 6_000, 1_000);
                 assert_eq!(ram, 0, "nothing left at {available} B");
                 let why = why.expect("the zero is named");
                 for part in [
                     format!("the reading {available} B leaves"),
                     "past need 6000 B + pool 1000 B".to_owned(),
-                    format!("checkpoints {checkpoints} B"),
                     "no prompt cache".to_owned(),
                 ] {
                     assert!(why.contains(&part), "{part:?} in {why}");
                 }
             }
-            let (_, why) = CacheRam::default_of(6_000, 6_000, 1_000, checkpoints);
+            let (_, why) = CacheRam::default_of(6_000, 6_000, 1_000);
             let line = CacheRam {
                 ram: 0,
                 set: false,
@@ -3229,7 +3261,7 @@ mod tests {
                 pool: 1_000,
                 tier: 0,
                 paged: 0,
-                checkpoints,
+                checkpoints: 0,
                 why,
             }
             .line();
@@ -3255,7 +3287,7 @@ mod tests {
                 let c = CacheRam::at(
                     None,
                     (available, HostRead::Given),
-                    plan + tier,
+                    plan + tier + checkpoints,
                     pool,
                     (tier, paged),
                     checkpoints,
@@ -3279,7 +3311,7 @@ mod tests {
                 let set = CacheRam::at(
                     Some(4_096),
                     (available, HostRead::Given),
-                    plan + tier,
+                    plan + tier + checkpoints,
                     pool,
                     (tier, paged),
                     checkpoints,
@@ -3348,31 +3380,106 @@ mod tests {
             assert_eq!((still.ram, still.why), (0, why));
         }
 
-        /// The checkpoints count once: a machine that reserves them
-        /// (`CHECKPOINTS_RESERVE`, the Qwen3.8 seat's) has them in the
-        /// plan's need, so nothing is beside it and the budget is half of
-        /// what the reading leaves past the need and the pool alone; a
-        /// machine with no such row (the CLI's, V4.1's, GLM's) leaves one
-        /// sequence's beside the need, as the unset residency room does.
+        /// The checkpoint reserve is each load's declaration
+        /// (`reserve_checkpoints`): V4.1's body makes no checkpoints, so its
+        /// seat declares none and its machine carries no row and reserves 0;
+        /// the Qwen3.8 seat's two slots, taking them, carry one row of
+        /// `HOST_BUDGET` a slot; a second declaration on one machine is a
+        /// panic by name.
         #[test]
-        fn a_reserved_need_takes_no_checkpoints_beside_it() {
-            let machine = |reserves: Vec<(String, u64)>| Machine {
-                cards: Vec::new(),
-                tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: 0,
-                    reserves,
-                },
+        fn the_checkpoint_reserve_is_each_loads_declaration() {
+            let declared = |seqs: Seqs| {
+                let mut m = machine(1_000);
+                reserve_checkpoints(&mut m, seqs);
+                m
             };
-            let slots = checkpoint_bytes(2);
-            let reserved = machine(vec![
-                ("os".to_owned(), 1_000),
-                (CHECKPOINTS_RESERVE.to_owned(), slots),
-            ]);
-            let bare = machine(vec![("os".to_owned(), 1_000)]);
-            assert_eq!(checkpoints_beside(&reserved), 0);
-            assert_eq!(checkpoints_beside(&bare), checkpoint_bytes(1));
-            let (need, pool) = (6_000 + slots, 1_000u64);
+            let v41 = declared(Seqs {
+                slots: 2,
+                checkpoints: false,
+            });
+            assert_eq!(v41.host.reserves, vec![("os".to_owned(), 1_000)]);
+            assert_eq!(checkpoints_reserved(&v41), 0);
+            let q38 = declared(Seqs {
+                slots: 2,
+                checkpoints: true,
+            });
+            assert_eq!(
+                q38.host.reserves,
+                vec![
+                    ("os".to_owned(), 1_000),
+                    (CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(2))
+                ]
+            );
+            assert_eq!(checkpoints_reserved(&q38), checkpoint_bytes(2));
+            let twice = std::panic::catch_unwind(|| {
+                let mut m = declared(Seqs {
+                    slots: 2,
+                    checkpoints: true,
+                });
+                reserve_checkpoints(&mut m, Seqs::ONE);
+            })
+            .expect_err("a second declaration panics");
+            let said = twice
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| twice.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(said.contains("reserves its checkpoints already"), "{said}");
+        }
+
+        /// A GLM load's machine (`glm_machine`, the one its offer, plans and
+        /// open take) reserves every slot's checkpoints, since the GLM body
+        /// takes them on every load: one `HOST_BUDGET` at one slot and three
+        /// at three. At one slot the prompt cache's default budget is the one
+        /// the load's single sequence left when the term sat beside the need
+        /// (half of the reading past need, pool and one `HOST_BUDGET`); at
+        /// three the two further slots' come off it too.
+        #[test]
+        fn a_glm_load_reserves_every_slots_checkpoints() {
+            let layers = 4;
+            let (need, pool) = (6_000u64, 1_000u64);
+            let available = need + pool + 4 * HOST_BUDGET + 100_000;
+            for slots in [1usize, 3] {
+                let m = glm_machine(Place::A, None, slots).expect("plan (a)'s machine")(layers);
+                let reserved = checkpoints_reserved(&m);
+                assert_eq!(reserved, checkpoint_bytes(slots), "{slots} slots");
+                let c = CacheRam::at(
+                    None,
+                    (available, HostRead::Given),
+                    need + reserved,
+                    pool,
+                    (0, 0),
+                    reserved,
+                )
+                .expect("the budget");
+                let beside_one = (available - need - pool - HOST_BUDGET) / 2;
+                let slots_u64 = u64::try_from(slots).expect("a slot count fits u64");
+                assert_eq!(
+                    c.ram,
+                    beside_one - (slots_u64 - 1) * HOST_BUDGET / 2,
+                    "{slots} slots"
+                );
+            }
+        }
+
+        /// The default budget reads the checkpoints once, inside the need:
+        /// a machine that reserves two slots' has them in the plan's need,
+        /// so the budget is half of what the reading leaves past that need
+        /// and the pool alone, the line printing the reserve as
+        /// `checkpoints`; a need under the checkpoints it says it holds (a
+        /// need of a machine with no reserve) is refused by name.
+        #[test]
+        fn a_default_budget_takes_the_reserved_checkpoints_once() {
+            let mut m = machine(1_000);
+            reserve_checkpoints(
+                &mut m,
+                Seqs {
+                    slots: 2,
+                    checkpoints: true,
+                },
+            );
+            let checkpoints = checkpoints_reserved(&m);
+            let (need, pool) = (6_000 + checkpoints, 1_000u64);
             let available = need + pool + 100_000;
             let c = CacheRam::at(
                 None,
@@ -3380,16 +3487,29 @@ mod tests {
                 need,
                 pool,
                 (0, 0),
-                checkpoints_beside(&reserved),
+                checkpoints,
             )
             .expect("the budget");
             assert_eq!((c.ram, c.why.as_deref()), (50_000, None));
-            assert!(c.line().contains(" checkpoints=0"), "{}", c.line());
-            let left = |beside: u64| crate::residency38::mem_left_38(available, need, beside);
-            assert_eq!(left(checkpoints_beside(&reserved)), 101_000);
-            assert_eq!(
-                left(checkpoints_beside(&bare)),
-                101_000 - i128::from(checkpoint_bytes(1))
+            assert!(
+                c.line().ends_with(&format!(" checkpoints={checkpoints}")),
+                "{}",
+                c.line()
+            );
+            let Err(e) = CacheRam::at(
+                None,
+                (available, HostRead::Given),
+                6_000,
+                pool,
+                (0, 0),
+                checkpoints,
+            ) else {
+                panic!("a need without its machine's checkpoints is refused");
+            };
+            let e = e.to_string();
+            assert!(
+                e.contains(&format!("and the checkpoints {checkpoints} B it holds")),
+                "{e}"
             );
         }
     }

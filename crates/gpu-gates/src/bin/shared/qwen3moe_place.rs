@@ -38,6 +38,7 @@ use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::residency38::{checkpoint_bytes, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
@@ -170,41 +171,16 @@ pub struct PlaceQ3 {
     machine: Machine,
 }
 
-/// The sequences a load holds and what they pin besides the plan's
-/// one-sequence terms: `slots` resident sequences, the context split across
-/// them, each taking checkpoints when `checkpoints` (a qwen35moe file's seat
-/// load: its prompt calls take the points a kept prefix comes back to).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Seqs {
-    pub slots: usize,
-    pub checkpoints: bool,
-}
-
-impl Seqs {
-    /// One sequence taking no checkpoints: the CLI's loads and a qwen3moe
-    /// file's, whose rows are none.
-    pub const ONE: Seqs = Seqs {
-        slots: 1,
-        checkpoints: false,
-    };
-}
+/// The sequences a load holds and whether they take checkpoints (the
+/// lib's declaration, `residency38::Seqs`): `slots` resident sequences, the
+/// context split across them, each taking checkpoints when `checkpoints` (a
+/// qwen35moe file's seat load: its prompt calls take the points a kept
+/// prefix comes back to).
+pub use bloomery_gpu_gates::residency38::Seqs;
 
 /// The card reserve of a load's resident sequences past the live one
 /// ([`laid`]): each one's stores that no position moves.
 pub const SLOTS_RESERVE: &str = "resident slots";
-
-/// The host reserve of a load's sequences' checkpoints ([`laid`]): the
-/// lib's name, which `residency38::checkpoints_beside` reads.
-pub use bloomery_gpu_gates::residency38::CHECKPOINTS_RESERVE;
-
-/// The host bytes the checkpoints of `slots` sequences pin at most: each
-/// sequence's own pinned slots, made as its prompt calls take points, up to
-/// [`HOST_BUDGET`] (`Slots::seq_bytes`'s doc on `Body35`); `u64::MAX` past
-/// u64, which no host holds.
-#[must_use]
-pub fn checkpoint_bytes(slots: usize) -> u64 {
-    u64::try_from(slots).map_or(u64::MAX, |n| n.saturating_mul(HOST_BUDGET))
-}
 
 /// The file's layers.
 fn layers_of(inputs: &Inputs) -> usize {
@@ -232,8 +208,8 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// resident sequence's fixed stores ([`fixed_seq_bytes`]) but the live one's
 /// — the plan's KV term at the total counts the per-position rows of every
 /// slot's share and the fixed stores once — none where they are 0; on the
-/// host, a [`CHECKPOINTS_RESERVE`] of every sequence's checkpoints
-/// ([`checkpoint_bytes`]) when they take them. The one owner of a placed
+/// host, every sequence's checkpoints when they take them, through the lib's
+/// one owner ([`reserve_checkpoints`]). The one owner of a placed
 /// load's machine, so a relaid machine ([`PlaceQ3::machine_at`]) keeps the
 /// rows.
 fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
@@ -245,12 +221,7 @@ fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
             .reserves
             .push((SLOTS_RESERVE.to_owned(), past));
     }
-    if seqs.checkpoints {
-        machine
-            .host
-            .reserves
-            .push((CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(seqs.slots)));
-    }
+    reserve_checkpoints(&mut machine, seqs);
     machine
 }
 
@@ -1073,7 +1044,7 @@ fn open_slots<B: Slots>(
 
 /// The checkpoints `seqs` pin on the host held against what the load counts
 /// them in, one stderr line either way: a placed load's plan carries them as
-/// its host's [`CHECKPOINTS_RESERVE`] ([`laid`]), which its own check holds
+/// its host's checkpoint reserve ([`laid`]), which its own check holds
 /// against the host's usable bytes and refuses by name; a whole-card load has
 /// no host plan, so the host's available bytes now
 /// ([`workstation::host_available`]) must hold them, else they are refused

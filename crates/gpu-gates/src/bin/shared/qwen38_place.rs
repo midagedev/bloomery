@@ -6,6 +6,7 @@
 
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule};
+use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use model::arch::qwen35moe::place::{Experts, MtpInputs, PlanInputs, machine_bp_on, tier_batch};
 use model::placement::PlanLevers;
 use model::placement::workstation::{CardSpec, DeviceInfo};
@@ -37,12 +38,14 @@ pub fn choose(
 /// The experts `cards`' plan (b′) holds on its tier card at `ctx` positions
 /// and ubatches of `ub` under `experts` and `levers` — the load `mtp` names
 /// planning the file's MTP draft beside the target, else the plain plan of
-/// `slots` resident sequences — the unset rule's `tier_of`. The plan is the
-/// model crate's one owner of both (`machine_bp_on`,
+/// `seqs`' resident sequences, the machine's host reserving the checkpoints
+/// the load declares (`residency38::reserve_checkpoints`, as the load's own
+/// machine does) — the unset rule's `tier_of`. The plan is the model crate's
+/// one owner of both (`machine_bp_on`,
 /// `PlanInputs::plan_with_slots`/`plan_mtp_with_slots`); a plan that refuses
 /// (a host expert rule on a tier machine, an idle tier card, a context past
-/// the card's) is the caller's error, which `Place::choose` answers with
-/// `a`.
+/// the card's, a host room under the NVMe tier's floor) is the caller's
+/// error, which `Place::choose` answers with `a`.
 pub fn tier_experts(
     inputs: &PlanInputs,
     cards: (CardSpec, CardSpec),
@@ -50,15 +53,17 @@ pub fn tier_experts(
     experts: Experts,
     levers: &PlanLevers,
     mtp: Option<&MtpInputs>,
-    slots: usize,
+    seqs: Seqs,
 ) -> Result<u64, GateError> {
-    let machine = machine_bp_on(
+    let slots = seqs.slots;
+    let mut machine = machine_bp_on(
         cards,
         inputs.spec.layers.len(),
         ub,
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
         tier_batch(&inputs.hp, ub),
     );
+    reserve_checkpoints(&mut machine, seqs);
     let plan = match mtp {
         None => inputs.plan_with_slots(&machine, ctx, levers, experts, slots)?,
         Some(mi) => {

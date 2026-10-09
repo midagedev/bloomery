@@ -4,69 +4,106 @@
 //! `generate_glm5next`, the GLM serve seat), and a qwen4exp load's lever, set or unset by the
 //! Qwen3.8 rule (`bloomery_levers::residency38_unset` before the plan,
 //! `residency38_at_plan` on it; `generate_qwen3moe`, the Qwen3.8 serve seat).
+//! It also owns what a load's resident sequences pin on the host for their
+//! checkpoints ([`reserve_checkpoints`]): every seat declares its load's
+//! ([`Seqs`]) as a host reserve row of the machine it plans on, so the plan's
+//! host need holds them and the rooms read from it (the unset rule's,
+//! `CacheRam`'s) take them once.
 
 use crate::GateError;
+use crate::generate::Place;
 use crate::record::{self, Record};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_levers::{RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{HostNeed, host_available};
+use model::placement::workstation::{HostNeed, TierBatchBytes, host_available};
 use model::placement::{Machine, Plan};
 use runtime::seqstate::HOST_BUDGET;
 
-/// The host bytes the checkpoints of `slots` sequences hold at most,
-/// beside the plan's own need: one [`HOST_BUDGET`] a sequence — every
-/// resident sequence's state carries its own `Checkpoints` with the full
-/// budget (a `Slot38` of the Qwen3.8 body; a GLM sequence the same), its
-/// pinned buffers made as its prompt calls take points — so the rooms a
-/// load's host memory must leave ([`mem_left_38`], `CacheRam::of`'s
-/// prompt-cache budget) count them, once: a machine that reserves them
-/// ([`CHECKPOINTS_RESERVE`]) has them in the plan's need, and
-/// [`checkpoints_beside`] says what is left beside it. The bin-shared
-/// `q3place::checkpoint_bytes` holds the same rule for the qwen3 and
-/// qwen35moe seats, which reserve their checkpoints in a placed plan; this
-/// is the lib's own, the bins' module being out of its reach.
+/// The sequences a load holds and whether they take checkpoints: `slots`
+/// resident sequences, each pinning host slots for the checkpoints its prompt
+/// calls take when `checkpoints` — a load's declaration of what its body
+/// does ([`reserve_checkpoints`]). Every GLM load takes them
+/// ([`glm_seqs`]: its prompt call takes a point at each mark with no
+/// switch); a Qwen3.6 or Qwen3.8 load takes them where its seat turns them
+/// on (`set_checkpoints`), and a CLI's leaves them off; V4.1's body makes no
+/// checkpoints, nor does a qwen3moe file's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seqs {
+    pub slots: usize,
+    pub checkpoints: bool,
+}
+
+impl Seqs {
+    /// One sequence taking no checkpoints: the CLI's loads and a qwen3moe
+    /// file's.
+    pub const ONE: Seqs = Seqs {
+        slots: 1,
+        checkpoints: false,
+    };
+}
+
+/// The host bytes the checkpoints of `slots` sequences pin at most: one
+/// [`HOST_BUDGET`] a sequence, each sequence's state carrying its own
+/// `Checkpoints` with the full budget, its pinned slots made as its prompt
+/// calls take points; `u64::MAX` past u64, which no host holds.
 #[must_use]
 pub fn checkpoint_bytes(slots: usize) -> u64 {
     u64::try_from(slots).map_or(u64::MAX, |n| n.saturating_mul(HOST_BUDGET))
 }
 
-/// The host reserve row ([`Machine::host`]'s `reserves`) under which a
-/// placed plan counts every resident sequence's checkpoints
-/// ([`checkpoint_bytes`] of its slots), so [`HostNeed::bytes`] holds them:
-/// the Qwen3.8 seat's machine and the bin-shared `q3place` plans push it.
+/// The host reserve row ([`Machine::host`]'s `reserves`) that carries a
+/// load's checkpoints ([`reserve_checkpoints`]).
 pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
 
-/// The checkpoint bytes a load of a plan on `machine` holds beside the
-/// plan's host need: none where the machine reserves them
-/// ([`CHECKPOINTS_RESERVE`], inside the need already), else the load's own
-/// live sequence's, [`checkpoint_bytes`] of one. The one owner of that term
-/// for the unset residency rule's room ([`mem_left_38`]) and the prompt
-/// cache's default budget (`CacheRam::of`).
-#[must_use]
-pub fn checkpoints_beside(machine: &Machine) -> u64 {
-    if machine
-        .host
-        .reserves
-        .iter()
-        .any(|(name, _)| name == CHECKPOINTS_RESERVE)
-    {
-        0
-    } else {
-        checkpoint_bytes(1)
+/// `machine`'s host with the checkpoints `seqs` pin reserved: a
+/// [`CHECKPOINTS_RESERVE`] row of [`checkpoint_bytes`] of its slots when
+/// they take checkpoints, nothing when they take none. The one owner of a
+/// load's checkpoint bytes: the plan's host need ([`HostNeed::bytes`]
+/// counts every reserve) holds them, so the load's host check, the NVMe
+/// tier's floor and arena, the unset residency rule's room ([`mem_left_38`])
+/// and the prompt cache's default budget (`CacheRam`) count them once, and a
+/// load that declares none counts none. A machine reserves them once: a
+/// second declaration is a panic by name.
+pub fn reserve_checkpoints(machine: &mut Machine, seqs: Seqs) {
+    assert!(
+        !machine
+            .host
+            .reserves
+            .iter()
+            .any(|(name, _)| name == CHECKPOINTS_RESERVE),
+        "the machine reserves its checkpoints already: a load declares them once \
+         (residency38::reserve_checkpoints)"
+    );
+    if seqs.checkpoints {
+        machine
+            .host
+            .reserves
+            .push((CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(seqs.slots)));
     }
 }
 
-/// What the host's available bytes leave the unset residency rule's room:
-/// past the plan's own host need and the `beside` checkpoint bytes the load
-/// holds outside it ([`checkpoints_beside`]): [`residency38`] reads the
-/// plan only, and a seat whose machine does not reserve its slots'
-/// checkpoints counts its further sequences in its cache budget
-/// (`CacheRam::of`) and its `checkpoints_fit` check, which know the seat's
-/// slot count.
+/// The checkpoint bytes `machine`'s host reserves
+/// ([`reserve_checkpoints`]), 0 for a load that declares none: inside the
+/// plan's host need, read for the lines that print the term (`CacheRam`'s
+/// `checkpoints`).
 #[must_use]
-pub fn mem_left_38(available: u64, need: u64, beside: u64) -> i128 {
-    i128::from(available) - i128::from(need) - i128::from(beside)
+pub fn checkpoints_reserved(machine: &Machine) -> u64 {
+    machine
+        .host
+        .reserves
+        .iter()
+        .filter(|(name, _)| name == CHECKPOINTS_RESERVE)
+        .map(|&(_, b)| b)
+        .sum()
+}
+
+/// What the host's available bytes leave the unset residency rule's room
+/// past the plan's host `need` ([`HostNeed::bytes`]), the load's
+/// checkpoints inside it ([`reserve_checkpoints`]).
+#[must_use]
+pub fn mem_left_38(available: u64, need: u64) -> i128 {
+    i128::from(available) - i128::from(need)
 }
 
 /// The plan's card a qwen4exp open loads: its one card.
@@ -74,6 +111,36 @@ pub const CARD38: usize = 0;
 
 /// The plan's card GLM's residency machine runs over: plan (a)'s one card.
 pub const GLM_CARD: usize = 0;
+
+/// What a GLM load of `slots` resident sequences declares
+/// ([`reserve_checkpoints`]): every slot takes checkpoints, the GLM body's
+/// prompt call taking a point at each mark with no switch and every
+/// sequence it makes carrying its own `Checkpoints` of `HOST_BUDGET`.
+#[must_use]
+pub fn glm_seqs(slots: usize) -> Seqs {
+    Seqs {
+        slots,
+        checkpoints: true,
+    }
+}
+
+/// `place`'s machine of a layer count (`Place::machine`, `batch` the expert
+/// tier's prompt-batch bytes) for a GLM load of `slots` resident sequences,
+/// every machine it makes declaring them ([`glm_seqs`]): the machine a GLM
+/// load's offer, plans and open take, so each counts the checkpoints its
+/// sequences pin.
+pub fn glm_machine(
+    place: Place,
+    batch: Option<TierBatchBytes>,
+    slots: usize,
+) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+    let base = place.machine(None, batch)?;
+    Ok(move |layers| {
+        let mut machine = base(layers);
+        reserve_checkpoints(&mut machine, glm_seqs(slots));
+        machine
+    })
+}
 
 /// `BLOOMERY_RESIDENCY` as a qwen4exp load takes it: a set word and its
 /// parse, or unset and what the rule decided before the plan — `None` when
@@ -118,9 +185,8 @@ pub fn residency38(
                 None => {
                     // The load refuses a host set past the host's available
                     // bytes before any upload; the default leaves the pool
-                    // out instead, but counts the checkpoints the load holds
-                    // beside the plan's need ([`checkpoints_beside`]), as
-                    // `CacheRam::of` counts the same term.
+                    // out instead. The need holds the load's checkpoints
+                    // ([`reserve_checkpoints`]), as `CacheRam`'s does.
                     let available = host_available()?;
                     let need = HostNeed::of(plan, 0).bytes();
                     residency38_at_plan(
@@ -128,7 +194,7 @@ pub fn residency38(
                         plan.host.experts,
                         |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
                         plan.host.headroom_bytes,
-                        mem_left_38(available, need, checkpoints_beside(plan.machine)),
+                        mem_left_38(available, need),
                     )
                     .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
                 }

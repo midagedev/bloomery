@@ -2261,6 +2261,22 @@ impl Gpu {
         Gpu::with_device(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
     }
 
+    /// Open the visible device a plan's card is ([`Gpu::open_card`]) and
+    /// drop the handle, before the host's room is read for the plan: what a
+    /// device's first open takes of the host — its primary context, held as
+    /// the process's anchor ([`anchor`]), and this crate's bundle, loaded
+    /// once on it ([`bundle_module`]), both outliving every `Gpu` — is then
+    /// gone from that reading as it is from the load's reading after its own
+    /// open, which finds both in place (the census's retain and release leave
+    /// neither).
+    pub fn hold_card(
+        name: &str,
+        device: Option<::model::placement::workstation::DeviceId>,
+    ) -> Result<(), GpuError> {
+        drop(Gpu::open_card(name, device)?);
+        Ok(())
+    }
+
     /// This context's device as the census names it: ordinal and UUID.
     pub fn device_id(&self) -> Result<::model::placement::workstation::DeviceId, GpuError> {
         let ordinal = self.ctx.ordinal();
@@ -2902,6 +2918,93 @@ mod context_tests {
             "a Gpu after the first two dropped got another driver context"
         );
     }
+
+    /// A card held before the host's room is read leaves the room its load
+    /// reads after the open: in a fresh process (no other test's `Gpu`
+    /// holding the device), `Gpu::hold_card` brings more than
+    /// [`HELD_FLOOR`] of the process's own anonymous and shared pages — the
+    /// first open's, its context and the bundle — and the room read after
+    /// `Gpu::open_card` on the held card is the held one, and its pages the
+    /// held ones, to within [`OPEN_BAND`]. The hold's floor is read off the
+    /// process's pages, which no other process moves over the bundle's load;
+    /// the open's band off the room too, over a window of a few calls.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_held_card_leaves_the_room_its_open_reads() {
+        const NAME: &str = "context_tests::hw_a_held_card_leaves_the_room_its_open_reads";
+        // The fresh process's own argument: a filter no test's name is.
+        const FRESH: &str = "a-fresh-process-for-the-held-card";
+        if !std::env::args().any(|a| a == FRESH) {
+            let exe = std::env::current_exe().expect("the test binary");
+            let status = std::process::Command::new(exe)
+                .args(["--exact", NAME, FRESH, "--include-ignored", "--nocapture"])
+                .args(["--test-threads", "1"])
+                .status()
+                .expect("the fresh process");
+            assert!(status.success(), "the fresh process: {status}");
+            return;
+        }
+        let room = || {
+            let (bytes, read) =
+                ::model::placement::workstation::host_available_read().expect("the host's room");
+            assert!(
+                !matches!(read, ::model::placement::workstation::HostRead::Given),
+                "a given room (BLOOMERY_HOST_ROOM): every reading is the same"
+            );
+            i128::from(bytes)
+        };
+        // The process's anonymous and shared pages (`RssAnon`, `RssShmem`).
+        let pages = || -> i128 {
+            let status = std::fs::read_to_string("/proc/self/status").expect("the process status");
+            status
+                .lines()
+                .filter_map(|l| {
+                    let (key, kib) = l.split_once(':')?;
+                    let kib = kib.trim().strip_suffix(" kB")?.parse::<i128>().ok()?;
+                    matches!(key, "RssAnon" | "RssShmem").then_some(kib << 10)
+                })
+                .sum()
+        };
+        let seen = super::census().expect("the census");
+        let card = seen.first().expect("a visible device");
+        let id = ::model::placement::workstation::DeviceId {
+            ordinal: card.ordinal,
+            uuid: card.uuid,
+        };
+        let (room_before, pages_before) = (room(), pages());
+        Gpu::hold_card(&card.name, Some(id)).expect("the card held");
+        let (room_held, pages_held) = (room(), pages());
+        let gpu = Gpu::open_card(&card.name, Some(id)).expect("the card opened");
+        let (room_opened, pages_opened) = (room(), pages());
+        println!(
+            "{}: the hold took {} B of the room and brought {} B of pages; the open after it \
+             took {} B of the room and brought {} B of pages",
+            card.name,
+            room_before - room_held,
+            pages_held - pages_before,
+            room_held - room_opened,
+            pages_opened - pages_held
+        );
+        drop(gpu);
+        assert!(
+            pages_held - pages_before > HELD_FLOOR,
+            "the hold brought {} B of pages, not the first open's",
+            pages_held - pages_before
+        );
+        assert!(
+            (room_held - room_opened).abs() < OPEN_BAND
+                && (pages_opened - pages_held).abs() < OPEN_BAND,
+            "the open took {} B of the room and brought {} B of pages past the held card's",
+            room_held - room_opened,
+            pages_opened - pages_held
+        );
+    }
+
+    /// Under the host pages a card's context alone holds.
+    const HELD_FLOOR: i128 = 32 << 20;
+
+    /// The open's own host bytes past a held card, and a reading's drift.
+    const OPEN_BAND: i128 = 16 << 20;
 
     /// A device loads this crate's bundle once per process: two `Gpu`s on
     /// device 0 bind to one module, and with the families a model opens

@@ -775,6 +775,17 @@ pub struct CardTotals {
     pub headroom_bytes: i128,
 }
 
+impl CardTotals {
+    /// `bytes` more in the card's KV class, out of its headroom: the one way
+    /// a model's plan adds a term to a card after the totals (the bytes its
+    /// resident sequences hold beside their stores, reserved out of the
+    /// expert budget), so the headroom stays usable less every term.
+    pub fn grow_kv(&mut self, bytes: u64) {
+        self.kv_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
+}
+
 /// The host's side of the plan.
 #[derive(Clone, Debug)]
 pub struct HostTotals {
@@ -807,9 +818,11 @@ pub struct HostTotals {
     /// reads from the NVMe tier ([`row_table_tier`]); 0 when none lies
     /// there. Inside [`HostTotals::reserve_bytes`].
     pub row_reserve_bytes: u64,
-    /// usable − experts − tables − shadows − reserves; on a plan the NVMe
-    /// expert tier split ([`expert_nvme_tier`]), the room the split read
-    /// less the arena and the plan's host need ([`workstation::HostNeed`]),
+    /// The room the machine's figure leaves
+    /// ([`workstation::HostNeed::machine_room`]) less the plan's host need
+    /// ([`workstation::HostNeed`]): usable − experts − tables − shadows −
+    /// reserves; on a plan the NVMe expert tier split ([`expert_nvme_tier`]),
+    /// the room the split read less the arena and the plan's host need,
     /// since the room binds there.
     pub headroom_bytes: i128,
 }
@@ -1072,8 +1085,11 @@ pub enum Violation {
         total: u64,
         limit: u64,
     },
-    /// The host's tensors, the cards' ring shadows and the reserves pass its
-    /// usable bytes.
+    /// The plan's own host terms (the host's tensors, the cards' ring
+    /// shadows and the machine's reserves, as a [`workstation::HostNeed`])
+    /// pass the room the machine's figure leaves
+    /// ([`workstation::HostNeed::machine_room`]): `total` is them with the
+    /// OS reserve in it, beside the host's usable bytes.
     HostOver { total: u64, usable: u64 },
 }
 
@@ -2750,7 +2766,7 @@ fn totals<'a>(
     let reserve_bytes: u64 =
         machine.host.reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
     let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow)| shadow).sum();
-    let host = HostTotals {
+    let mut host = HostTotals {
         expert_bytes: host_experts,
         experts: (0..model.layers)
             .filter(|&l| routing[l])
@@ -2762,9 +2778,15 @@ fn totals<'a>(
         shadow_bytes,
         reserve_bytes,
         row_reserve_bytes: row_reserve,
-        headroom_bytes: i128::from(machine.host.usable_bytes)
-            - i128::from(host_experts + host_tables + shadow_bytes + reserve_bytes),
+        headroom_bytes: 0,
     };
+    // The room the machine's figure leaves past the plan's host need, the
+    // need's own arithmetic (`HostNeed`).
+    host.headroom_bytes = i128::from(workstation::HostNeed::machine_room(&machine.host))
+        - i128::from(
+            workstation::HostNeed::of_totals(&machine.host, &host, card_budget.is_some(), 0)
+                .bytes(),
+        );
     Plan {
         model,
         machine,
@@ -2795,8 +2817,10 @@ impl Plan<'_> {
     /// only routed experts; the granules of its uploads + KV + scratch +
     /// context + reserves ≤ usable − margin on each card, usable capped by the
     /// card budget;
-    /// the host's tensors, the cards' ring shadows and the reserves ≤ its
-    /// usable bytes.
+    /// the plan's own host terms within the room its machine's figure leaves
+    /// ([`workstation::HostNeed::check`] at
+    /// [`workstation::HostNeed::machine_room`]), the NVMe tier's arena and
+    /// window held to the room its split read instead.
     pub fn violations(&self) -> Vec<Violation> {
         let model = self.model;
         let cards: Vec<&Card> = self.machine.all_cards().collect();
@@ -2860,14 +2884,24 @@ impl Plan<'_> {
                 });
             }
         }
+        // The host's bound is the load's own check (`HostNeed::check`) at
+        // the room the machine's figure leaves, over the plan's own terms:
+        // the rows' resident bytes, the ring shadows and the machine's
+        // reserves. The NVMe tier's arena and run-ahead window are the
+        // split's, sized to the room it read and held to that room
+        // ([`expert_nvme_tier`]), not to the machine's figure.
         let host = &self.machine.host;
-        let total = host_resident
-            + self.host.shadow_bytes
-            + host.reserves.iter().map(|(_, b)| b).sum::<u64>()
-            + self.host.row_reserve_bytes;
-        if total > host.usable_bytes {
+        let need = workstation::HostNeed {
+            experts: host_resident,
+            tables: 0,
+            reserves: host.reserves.iter().map(|(_, b)| b).sum::<u64>()
+                + self.host.row_reserve_bytes,
+            arena: 0,
+            ..workstation::HostNeed::of(self, 0)
+        };
+        if let Err(short) = need.check(workstation::HostNeed::machine_room(host)) {
             out.push(Violation::HostOver {
-                total,
+                total: short.need.bytes() + short.need.os,
                 usable: host.usable_bytes,
             });
         }
@@ -3541,5 +3575,113 @@ mod tests {
         );
         assert!(!total.fits(), "the total does not fit: {total}");
         assert!(share.fits(), "a slot's share of it does: {share}");
+    }
+
+    /// A card's KV class grown after the totals (`CardTotals::grow_kv`: the
+    /// bytes a model's resident sequences hold beside their stores, reserved
+    /// out of the expert budget) leaves its headroom the usable bytes less
+    /// every term, the KV it gained among them.
+    #[test]
+    fn grown_kv_leaves_the_headroom_usable_less_every_term() {
+        let model = layered(3);
+        let machine = Machine {
+            cards: vec![Card {
+                context_bytes: 1_000,
+                scratch_bytes: 2_000,
+                reserves: vec![("draft".to_string(), 3_000)],
+                ..bytes_card("stage", HEAD + 12 * EXPERT + 6_000 + 5_000, 0..3)
+            }],
+            tiers: Vec::new(),
+            host: host(),
+        };
+        let mut plan = plan_routed_reserving(
+            &model,
+            &machine,
+            4096,
+            &NoKv,
+            &PlanLevers::default(),
+            CardFormat::of_routed,
+            5_000,
+        )
+        .expect("the plan");
+        let rest = |p: &Plan<'_>| {
+            let t = &p.cards[0];
+            i128::from(p.usable_bytes(&machine.cards[0]))
+                - i128::from(
+                    t.dense_bytes
+                        + t.expert_bytes
+                        + t.rounding_bytes
+                        + t.kv_bytes
+                        + t.scratch_bytes
+                        + t.context_bytes
+                        + t.reserve_bytes,
+                )
+        };
+        assert_eq!(plan.cards[0].headroom_bytes, rest(&plan));
+        plan.cards[0].grow_kv(5_000);
+        assert_eq!(plan.cards[0].kv_bytes, 5_000);
+        assert_eq!(plan.cards[0].headroom_bytes, rest(&plan));
+    }
+
+    /// The plan's host bound is the load's own check at the room the
+    /// machine's figure leaves (`HostNeed::check` at
+    /// `HostNeed::machine_room`): a host whose usable bytes hold the plan's
+    /// host tensors and reserves to the byte passes and one byte under is a
+    /// `HostOver` naming both, the headroom the usable bytes less those terms
+    /// — whether the OS reserve carries the name a reading leaves out or
+    /// another — and the NVMe tier's arena and run-ahead window, sized to
+    /// the room the split read and held to it, stay out of the bound.
+    #[test]
+    fn the_host_bound_is_the_needs_check_at_the_machine_room() {
+        let model = layered(3);
+        for os in [workstation::OS_RESERVE, "other"] {
+            let machine = |usable: u64| Machine {
+                cards: vec![bytes_card("stage", HEAD + 12 * EXPERT, 0..3)],
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: usable,
+                    reserves: vec![(os.to_string(), 7_000), ("pool".to_string(), 1_000)],
+                },
+            };
+            let probe = machine(1 << 40);
+            let plan = plan_with(&model, &probe, 4096, &NoKv, None).expect("the plan");
+            assert!(plan.host.expert_bytes > 0, "{os}: the host holds experts");
+            let terms =
+                plan.host.expert_bytes + plan.host.table_bytes + plan.host.shadow_bytes + 8_000;
+            let over = |p: &Plan<'_>| {
+                p.violations()
+                    .iter()
+                    .filter(|v| matches!(v, Violation::HostOver { .. }))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            };
+            for usable in [terms, terms - 1] {
+                let m = machine(usable);
+                let plan = plan_with(&model, &m, 4096, &NoKv, None).expect("the plan");
+                let want = if usable < terms {
+                    vec![format!(
+                        "host: tensors + ring shadows + reserves = {terms} B pass usable {usable} \
+                         B by 1 B"
+                    )]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(over(&plan), want, "{os} at usable {usable}");
+                assert_eq!(
+                    plan.host.headroom_bytes,
+                    i128::from(usable) - i128::from(terms),
+                    "{os} at usable {usable}"
+                );
+            }
+            let m = machine(terms);
+            let mut plan = plan_with(&model, &m, 4096, &NoKv, None).expect("the plan");
+            plan.host.nvme_arena_bytes = 1;
+            plan.host.reserve_bytes += 1;
+            assert_eq!(
+                over(&plan),
+                Vec::<String>::new(),
+                "{os}: the split's arena and window are held to its room"
+            );
+        }
     }
 }

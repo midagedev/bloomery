@@ -462,7 +462,7 @@ impl PlanInputs {
         // The bytes beside the stores ride the stage card's KV term, out of
         // the budget reserved above, so the card's bound holds them.
         if let Some(t) = plan.cards.first_mut() {
-            t.kv_bytes += beside;
+            t.grow_kv(beside);
         }
         let plan = checked(plan).map_err(PlaceError::Broken)?;
         if let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) {
@@ -792,7 +792,7 @@ impl PlanInputs {
         )?;
         // The bytes beside the stores ride the stage card's KV term, as
         // [`PlanInputs::plan_slots`] counts them.
-        plan.cards[0].kv_bytes += beside;
+        plan.cards[0].grow_kv(beside);
         let total = card_terms(&plan.cards[0]) + nextn_card_bytes(&draft.cards[0]) + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
@@ -1173,5 +1173,199 @@ mod tests {
             2 * (34 * 9_469_960 + 11 * 1024 * 1600) + 4 + 3 * 65_536
         );
         assert_eq!(stage, 680_198_692);
+    }
+
+    /// The multi-slot plans ([`super::PlanInputs::plan_slots`],
+    /// [`super::PlanInputs::plan_nextn_slots`]) on a synthetic file of four
+    /// trunk layers (three KDA, one latent) at GLM-5.3-Flash's widths, a norm
+    /// a layer, beside a next-token layer of one latent store: the stage
+    /// card's headroom past the bytes the plans add to its kv class after the
+    /// totals.
+    mod slots {
+        use std::num::NonZeroU64;
+
+        use gguf::GgmlType;
+        use models::{Arch, ChatSpec, ModelSpec};
+
+        use super::super::super::hparams::{Hc, Hparams, Indexer};
+        use super::super::{KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlanInputs, row_bytes};
+        use crate::placement::{
+            Card, Host, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role,
+        };
+
+        const LAYERS: usize = 4;
+        const CTX: u64 = 4096;
+
+        /// GLM-5.3-Flash's widths on four trunk layers and one next-token
+        /// layer; the rest no plan reads.
+        fn hparams() -> Hparams {
+            Hparams {
+                n_layer: LAYERS + 1,
+                n_trunk: LAYERS,
+                n_embd: 4096,
+                n_head: 64,
+                n_vocab: 151_552,
+                n_ctx_train: 131_072,
+                rms_eps: 1e-6,
+                norm_eps: 1e-6,
+                q_lora: 1536,
+                kv_lora: 512,
+                head_k: 192,
+                head_v: 128,
+                conv: 4,
+                kda_head_dim: 128,
+                gate_lower_bound: 0.0,
+                indexer: Indexer {
+                    n_head: 32,
+                    head_dim: 128,
+                    top_k: 2048,
+                    kpool: 4,
+                },
+                index_share_mtp: None,
+                hc: Hc {
+                    streams: 4,
+                    sinkhorn: 20,
+                    eps: 1e-6,
+                },
+                n_expert: 288,
+                n_used: 8,
+                expert_ff: 2048,
+                n_shared: 1,
+                shared_ff: 2048,
+                dense_lead: 0,
+                dense_ff: 0,
+                weights_norm: true,
+                weights_scale: 1.0,
+                limit_exp: vec![0.0; LAYERS + 1],
+                limit_shexp: vec![0.0; LAYERS + 1],
+                kinds: vec![Kind::Kda, Kind::Kda, Kind::Kda, Kind::Latent, Kind::Latent],
+                defaults: Vec::new(),
+            }
+        }
+
+        /// One norm a layer, `n` layers.
+        fn norms(n: usize) -> ModelTensors {
+            ModelTensors {
+                tensors: (0..n)
+                    .map(|l| ModelTensor {
+                        name: format!("blk.{l}.attn_norm.weight"),
+                        shard: 0,
+                        layer: Some(l),
+                        role: Role::Attention,
+                        ty: GgmlType::F32,
+                        dims: vec![4096],
+                        file_bytes: 4096 * 4,
+                        gathered_rows: None,
+                    })
+                    .collect(),
+                layers: n,
+                experts: 288,
+                experts_used: 8,
+            }
+        }
+
+        /// A machine of one card running `layers` with room for every plan
+        /// here, and a host with no bound.
+        fn machine(layers: usize) -> Machine {
+            Machine {
+                cards: vec![Card {
+                    name: "card".to_string(),
+                    device: None,
+                    usable_bytes: 1 << 40,
+                    context_bytes: 1 << 20,
+                    scratch_bytes: 2 << 20,
+                    margin_bytes: 0,
+                    granule_bytes: NonZeroU64::new(2 << 20).expect("2 MiB"),
+                    free_bytes: None,
+                    held_by: None,
+                    layers: 0..layers,
+                    head: true,
+                    token_embedding: false,
+                    reserves: vec![("draft".to_string(), 3 << 20)],
+                }],
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: u64::MAX,
+                    reserves: Vec::new(),
+                },
+            }
+        }
+
+        fn inputs() -> PlanInputs {
+            let hp = hparams();
+            let kv = KvLayout::of(&hp);
+            PlanInputs {
+                hp,
+                model: norms(LAYERS),
+                spec: ModelSpec {
+                    arch: Arch::Glm5Next,
+                    hidden: 4096,
+                    vocab: 151_552,
+                    ctx_train: 131_072,
+                    rms_eps: 1e-6,
+                    layers: Vec::new(),
+                    mtp: Vec::new(),
+                    hc: None,
+                    engram: None,
+                    chat: ChatSpec {
+                        pre: String::new(),
+                        template: None,
+                        tools: None,
+                        reasoning: None,
+                    },
+                },
+                kv,
+            }
+        }
+
+        /// A card's headroom and its terms: the plan's `headroom_bytes`, and
+        /// the card's usable bytes less every term the plan counts on it,
+        /// written from the fields.
+        fn headroom(p: &Plan<'_>) -> (i128, i128) {
+            let t = &p.cards[0];
+            let terms = t.dense_bytes
+                + t.expert_bytes
+                + t.rounding_bytes
+                + t.kv_bytes
+                + t.scratch_bytes
+                + t.context_bytes
+                + t.reserve_bytes;
+            (
+                t.headroom_bytes,
+                i128::from(p.usable_bytes(&p.machine.cards[0])) - i128::from(terms),
+            )
+        }
+
+        /// The stage card's headroom past the bytes beside every slot's
+        /// stores, which the plans add to its kv class after the totals, is
+        /// its usable bytes less every term: on the plain plan and on the
+        /// plan with the next-token layer, at two and three slots.
+        #[test]
+        fn slot_plans_keep_the_headroom_usable_less_every_term() {
+            let (inputs, machine) = (inputs(), machine(LAYERS));
+            let levers = PlanLevers::default();
+            let nextn = NextnInputs {
+                index: LAYERS,
+                model: norms(1),
+                machine: self::machine(1),
+                kv: NextnKv {
+                    row: row_bytes(512, 128),
+                    pool_row: 256,
+                    kpool: 4,
+                },
+            };
+            for n in [2, 3] {
+                let plain = inputs
+                    .plan_slots(&machine, CTX, &levers, KdaLanes::One, n)
+                    .expect("the plan");
+                let (got, want) = headroom(&plain);
+                assert_eq!(got, want, "{n} slots: the plain plan");
+                let with = inputs
+                    .plan_nextn_slots(&machine, CTX, &levers, &nextn, n)
+                    .expect("the plan with the next-token layer");
+                let (got, want) = headroom(&with.plan);
+                assert_eq!(got, want, "{n} slots: the plan with the next-token layer");
+            }
+        }
     }
 }

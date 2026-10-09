@@ -2,10 +2,10 @@
 # The plan room: the one owner of the host room `just records-refresh` plans V4.1's placement (a) under.
 #
 # generate_ds41 --plan resolves the unset residency word against two bounds (crates/gpu-gates/src/residency41.rs): the
-# plan's host headroom, HOST_USABLE − (experts + tables + shadows + reserves), and mem_left, the host's room less the
-# plan's host need, experts + tables + shadows + reserves − OS_OTHER. At the room R = HOST_USABLE − OS_OTHER mem_left is
-# the headroom exactly, so the headroom alone decides; at any larger room mem_left passes the headroom, and the pick and
-# every record --plan prints stay the same. A plan whose records differ between R and R + 64 GiB moves with the room.
+# plan's host headroom, the workstation's plan room less the plan's host need (HostNeed::machine_room), and mem_left, the
+# host's room less the same need. At the room R = PLAN_ROOM mem_left is the headroom exactly, so the headroom alone
+# decides; at any larger room mem_left passes the headroom, and the pick and every record --plan prints stay the same. A
+# plan whose records differ between R and R + 64 GiB moves with the room.
 #
 #   bash tools/ref/plan-room.sh --room   R in bytes on stdout; any machine, no binary
 #   bash tools/ref/plan-room.sh P C      on the box, the tree's built target/release/generate_ds41 --plan --depth P
@@ -15,8 +15,8 @@
 #                                        stderr naming P, C, both rooms and the first line that differs, or the run that
 #                                        failed and its exit code.
 #
-# R comes from the two `pub const` lines of crates/placement/src/placement/workstation.rs, underscores dropped; this
-# file holds no copy of either number.
+# R is the `pub const PLAN_ROOM` line of crates/placement/src/placement/workstation.rs, underscores dropped (the crate
+# holds it to HOST_USABLE − OS_OTHER at compile time); this file holds no copy of the number.
 # Exit codes: 0 R or the plan printed; 1 the two rooms' plans differ or a run failed; 64 a usage error, a
 # BLOOMERY_HOST_ROOM already set (the room is this script's), or a constant that is missing, given twice or not a
 # whole number.
@@ -56,10 +56,7 @@ const() {
   echo $((10#$value))
 }
 
-usable=$(const HOST_USABLE) || exit $?
-os=$(const OS_OTHER) || exit $?
-[ "$usable" -gt "$os" ] || refuse "$SRC: HOST_USABLE $usable is not past OS_OTHER $os"
-ROOM=$((usable - os))
+ROOM=$(const PLAN_ROOM) || exit $?
 
 if [ $# = 1 ] && [ "$1" = --room ]; then
   echo "$ROOM"
