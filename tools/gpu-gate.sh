@@ -316,6 +316,7 @@ PY
   case_ 'BLOOMERY_GATE_V41_LOAD other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_V41_LOAD is 1' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=yes
   case_ 'BLOOMERY_GATE_STACKS not whole seconds: 64, named' 64 'BLOOMERY_GATE_STACKS is whole seconds' 3090 "$t/lease" BLOOMERY_GATE_STACKS=soon
   case_ 'BLOOMERY_GATE_STACKS set: the binary runs under the watch, its output through' 0 'ran on $' 3090 "$t/lease" BLOOMERY_GATE_STACKS=5
+  case_ "a run closes with its own wall and exit" 0 '^gpu-gate\.sh: ok ran [0-9]+ s \(exit 0\)$' 3090 "$t/lease"
   case_ 'BLOOMERY_GATE_GDB other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_GDB is 1' 3090 "$t/lease" BLOOMERY_GATE_GDB=yes
   case_ 'BLOOMERY_GATE_GDB with BLOOMERY_GATE_STACKS: 64, named' 64 'set one' 3090 "$t/lease" BLOOMERY_GATE_GDB=1 BLOOMERY_GATE_STACKS=5
   # Two V4.1 loads at once, on the two cards: the second waits for the first, names it, and counts the wait.
@@ -984,6 +985,9 @@ if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then
   export CUDA_VISIBLE_DEVICES=$U
 fi
 echo "gpu-gate.sh: $NAME on $([ "$GOT" = both ] && echo 'both cards, both gate locks' || echo "the $GOT") (asked $CARD)$([ "$V41" = 0 ] || echo ', V4.1 load lock')$TIER_NOTE" >&2
+# The run's own wall, its locks' waits outside it, is the closing line: a recipe that runs several
+# binaries, or one binary several times, is read per run.
+RUN_T0=$SECONDS
 if [ -n "$STACKS" ]; then
   bash "${BASH_SOURCE[0]%/*}/ref/stack-watch.sh" "$STACKS" "$NAME" -- timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 elif [ "$GDB" = 1 ]; then
@@ -1008,6 +1012,7 @@ else
   timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 fi
 rc=$?
+echo "gpu-gate.sh: $NAME ran $((SECONDS - RUN_T0)) s (exit $rc)" >&2
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
   echo "GPU GATE TIMED OUT: $NAME after the ${BOUND}s bound (exit $rc) — a gate that hangs is a red gate, not a silent one" >&2
 elif [ "$rc" -ne 0 ]; then
