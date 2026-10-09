@@ -178,8 +178,12 @@
 //!   `cmd=step` record of the window `slots=2` and `passes=rows` (one with `rows=2`) and no `cmd=pass`
 //!   record; then the greedy [`TURN_A`] beside the sampled [`TURN_C`] — the
 //!   greedy one's ids and draft counts its alone run's, the sampled one's
-//!   ids its alone run's, every `cmd=pass` record of the window `slots=2`,
-//!   `rows=1`, `passes=1` (at least one). These pin today's shape: a
+//!   ids its alone run's, no `slots round` record in the window, its `slot
+//!   call` records (`slots=2`) on the two requests' slots alone (each
+//!   answer's `id_slot`, two slots), and among them a `cmd=step` on the
+//!   sampled request's slot followed at once by a `cmd=pass` on the greedy
+//!   one's: a round's two calls of one slot, the sampled row's `next` and
+//!   the greedy row's `advance`. These pin today's shape: a
 //!   sampled row is a select and a step, its round the server's call apart
 //!   from the drafted passes', because the drafted pass cannot carry a
 //!   window that proposes nothing (`app::mtp::pass_slots` refuses depth 0,
@@ -1856,11 +1860,13 @@ mod gate {
     /// A sampled request alone drafts (`Engine::advance_sampled`, its
     /// sampler drawing each kept id from the verified rows), so its alone run
     /// carries draft counts. Beside another busy slot it steps — a `next` a
-    /// token, its row read for the sampler — and its round of steps is the
-    /// server's call apart from the drafted passes' (`Engine::step_slots`
-    /// beside `Engine::advance_slots`); a slot left alone drafts again on the
-    /// one-slot path, which prints no `slots round` record. The default seat
-    /// runs neither as one pass
+    /// token, its row read for the sampler — and its round's steps are the
+    /// server's call apart from the drafted passes': two step rows or more
+    /// one `Engine::step_slots`, one a select and a `next`; the drafted rows
+    /// likewise, two or more one `Engine::advance_slots`, one a select and
+    /// an `advance` (the pass a request alone makes, its width chooser
+    /// included). A slot left alone drafts again on the one-slot path. The
+    /// default seat runs neither as one pass
     /// with the drafted rows: a sampled row would be a window that proposes
     /// nothing, which `app::mtp::pass_slots` refuses (depth 0, and every
     /// window's draft proposes), the body's NextN pass of several slots
@@ -1868,8 +1874,10 @@ mod gate {
     /// server carries (the drafted row lends no logits row, `SlotPassRow`).
     /// So the clauses pin today's shape: two sampled slots' round is a
     /// select and a step a row (`cmd=step`, `passes=rows`), and a round of a
-    /// greedy and a sampled slot is two calls — the sampled row's step and
-    /// the greedy row's pass of one window (`cmd=pass`, `rows=1`).
+    /// greedy and a sampled slot is two calls of one slot — the sampled
+    /// row's `next`, then the greedy row's `advance` — which print no `slots
+    /// round` record and one `slot call` record each (`cmd=step` on the
+    /// sampled request's slot, then `cmd=pass` on the greedy one's).
     fn slots_sampled(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -1922,14 +1930,50 @@ mod gate {
                 && of_cmd(&window, "pass").is_empty(),
         );
 
-        let before = round_count(err_log)?;
+        // The window opens past the stderr's last line: the engine thread
+        // printed every record of the requests before it ahead of their
+        // answers.
+        let after = lines_from(err_log, 0)?.len();
         let mixed = both_at_once(
             url,
             [greedy_body(ids[0]), sampled_body(ids[1], SEEDS[1])],
             ["mixed greedy A", "mixed sampled C"],
         )?;
-        let window = rounds_from(err_log, before)?;
-        let passes = of_cmd(&window, "pass");
+        let window = records_past(err_log, after)?;
+        let rounds: Vec<&record::Fields> = window
+            .iter()
+            .filter(|r| std::ptr::eq(r.kind(), &record::SLOTS_ROUND))
+            .collect();
+        let calls: Vec<&record::Fields> = window
+            .iter()
+            .filter(|r| std::ptr::eq(r.kind(), &record::SLOT_CALL))
+            .collect();
+        // Each request's slot, as its answer names it.
+        let slot_of = |v: &Option<Value>| v.as_ref().and_then(|v| v["id_slot"].as_u64());
+        let (greedy_slot, sampled_slot) = (slot_of(&mixed[0]), slot_of(&mixed[1]));
+        let mut call_slots = calls
+            .iter()
+            .map(|r| r.u64("slot"))
+            .collect::<Result<Vec<u64>, _>>()?;
+        call_slots.sort_unstable();
+        call_slots.dedup();
+        let call_on = |r: &record::Fields, cmd: &str, slot: Option<u64>| {
+            r.word("cmd") == Ok(cmd) && slot.is_some_and(|s| r.u64("slot") == Ok(s))
+        };
+        // A round's two calls back to back among the window's records: the
+        // sampled row's step, then the greedy row's pass.
+        let apart = window
+            .windows(2)
+            .filter(|w| call_on(&w[0], "step", sampled_slot) && call_on(&w[1], "pass", greedy_slot))
+            .count();
+        let mut tally: Vec<(String, usize)> = Vec::new();
+        for r in &calls {
+            let key = format!("{} on {}", r.word("cmd")?, r.u64("slot")?);
+            match tally.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, n)) => *n += 1,
+                None => tally.push((key, 1)),
+            }
+        }
         let counts = |v: &Value| {
             (
                 ids_of_v(v),
@@ -1944,7 +1988,26 @@ mod gate {
             (greedy_alone.0.len(), greedy_alone.1, greedy_alone.2),
             mixed[1].as_ref().map(|v| ids_of_v(v).len()),
         );
-        print_rounds("slots mixed", &window, &passes);
+        println!(
+            "slots mixed: {} slots round record(s) in the window: {}",
+            rounds.len(),
+            rounds
+                .iter()
+                .map(|r| r.line().to_owned())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        println!(
+            "slots mixed: greedy slot {greedy_slot:?}, sampled slot {sampled_slot:?}; {} slot \
+             call record(s) on the slots {call_slots:?} ({}); a sampled step then a greedy pass \
+             {apart} time(s)",
+            calls.len(),
+            tally
+                .iter()
+                .map(|(k, n)| format!("{k} ×{n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         check(
             &mut ok,
             "slots_mixed_together_ids_are_alone",
@@ -1953,13 +2016,22 @@ mod gate {
                     .as_ref()
                     .is_some_and(|v| ids_of_v(v) == ids_of_v(&alone[1])),
         );
+        // A round holds one step row (the sampled request's) and one pass row
+        // (the greedy one's), each a call of one slot: neither call of
+        // several runs, so the window holds no `slots round` record, and its
+        // calls are the two requests' alone, a step on the sampled slot
+        // followed at once by a pass on the greedy one.
+        // PIN(2026-10-10): a mixed round's pass row is an advance, read by `slot call` records.
         check(
             &mut ok,
             "slots_mixed_rounds_run_apart",
-            !passes.is_empty()
-                && passes.iter().all(|r| {
-                    r.u64("slots") == Ok(2) && r.u64("rows") == Ok(1) && r.u64("passes") == Ok(1)
-                }),
+            rounds.is_empty()
+                && calls.iter().all(|r| r.u64("slots") == Ok(2))
+                && match (greedy_slot, sampled_slot) {
+                    (Some(g), Some(s)) => g != s && call_slots == [g.min(s), g.max(s)],
+                    _ => false,
+                }
+                && apart > 0,
         );
         Ok(ok)
     }
@@ -2191,6 +2263,20 @@ mod gate {
     fn rounds_from(err_log: &Path, before: usize) -> Result<Vec<record::Fields>, GateError> {
         let mut rounds = seat_log(&lines_from(err_log, 0)?).all(&record::SLOTS_ROUND)?;
         Ok(rounds.split_off(before.min(rounds.len())))
+    }
+
+    /// The `slots round` and `slot call` records past line `after` of the
+    /// server's stderr, in the order the engine thread printed them.
+    fn records_past(err_log: &Path, after: usize) -> Result<Vec<record::Fields>, GateError> {
+        let log = seat_log(&lines_from(err_log, 0)?);
+        let mut past: Vec<record::Fields> = log
+            .all(&record::SLOTS_ROUND)?
+            .into_iter()
+            .chain(log.all(&record::SLOT_CALL)?)
+            .filter(|r| r.at() > after)
+            .collect();
+        past.sort_by_key(record::Fields::at);
+        Ok(past)
     }
 
     /// The records of `window` whose command is `cmd`.

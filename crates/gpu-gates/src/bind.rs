@@ -847,9 +847,11 @@ pub trait Seat: 'static {
         false
     }
     /// Whether the seat counts its rounds of several slots — a `slots round`
-    /// record a round (`record::slots_round`), under `BLOOMERY_STEP_STATS`:
-    /// the lever's value the binary's `main` parsed, carried by a seat whose
-    /// binary names the lever among those it acts on. The default counts
+    /// record a round (`record::slots_round`), and while it serves several
+    /// a `slot call` record a call of one (`record::slot_call`, the engine
+    /// thread's) — under `BLOOMERY_STEP_STATS`: the lever's value the
+    /// binary's `main` parsed, carried by a seat whose binary names the
+    /// lever among those it acts on. The default counts
     /// nothing: a binary that does not name the lever refuses it set, so its
     /// seats never count.
     fn step_stats(&self) -> bool {
@@ -1061,8 +1063,19 @@ impl SeatEngine {
                 {
                     return;
                 }
+                // The slot the server's last select named: slot 0 from the
+                // start, none after a round of several, which leaves the
+                // seat's selection unspecified until the server selects again
+                // (`serve::Engine::step_slots`).
+                let mut selected = Some(0);
                 for cmd in cmds {
-                    let (result, logits, extra) = match cmd {
+                    let call = one_slot_call(&cmd);
+                    let select = match &cmd {
+                        Cmd::Select(slot) => Some(*slot),
+                        _ => None,
+                    };
+                    let round = matches!(cmd, Cmd::StepSlots(_) | Cmd::PassSlots(_));
+                    let (mut result, logits, extra) = match cmd {
                         Cmd::Keep(n, reply) => {
                             let (k, why) = g.keep_for(n.min(g.pos()), reply);
                             (
@@ -1150,6 +1163,18 @@ impl SeatEngine {
                             (result, logits, Extra::None)
                         }
                     };
+                    if let Some(slot) = select {
+                        selected = result.is_ok().then_some(slot);
+                    }
+                    if round {
+                        selected = None;
+                    }
+                    if let Some(call) = call
+                        && result.is_ok()
+                        && let Err(e) = count_call(&g, call, selected)
+                    {
+                        result = Err(e);
+                    }
                     if replies
                         .send(Reply {
                             result,
@@ -1764,6 +1789,41 @@ pub fn pass_rows_in_turn<S: Seat + ?Sized>(
         crate::record::slots_round("pass", rows.len(), rows.len(), g.slots()).eprint();
     }
     failed.map_or(Ok(()), Err)
+}
+
+/// The server's call of one slot `cmd` is, as its `slot call` record names
+/// it ([`crate::record::slot_call`]): `step` its `next`, `pass` its
+/// `advance`, `sampled` its `advance_sampled`; `None` for every other
+/// command.
+fn one_slot_call(cmd: &Cmd) -> Option<&'static str> {
+    match cmd {
+        Cmd::Next { .. } => Some("step"),
+        Cmd::Pass { .. } => Some("pass"),
+        Cmd::PassSampled { .. } => Some("sampled"),
+        _ => None,
+    }
+}
+
+/// A seat that counts its rounds ([`Seat::step_stats`]) and serves several
+/// slots prints the `slot call` record of each call of one slot it ran,
+/// `call` ([`one_slot_call`]), on `selected`, the slot the server's last
+/// select named: beside the `slots round` record of a round of several, the
+/// log shows how each of the server's rows ran. A call with no slot named
+/// since a round of several breaks the server's select contract
+/// (`serve::Engine::step_slots`) and is refused by name: the record would
+/// guess its slot.
+fn count_call<S: Seat + ?Sized>(g: &S, call: &str, selected: Option<usize>) -> Result<(), String> {
+    if !g.step_stats() || g.slots() < 2 {
+        return Ok(());
+    }
+    let slot = selected.ok_or_else(|| {
+        format!(
+            "a {call} of one slot after a round of several slots with no select since: the \
+             server selects before its next call of one slot"
+        )
+    })?;
+    crate::record::slot_call(call, slot, g.slots()).eprint();
+    Ok(())
 }
 
 /// The selected slot's state as a value ([`Seat::snapshot`]), on the engine
