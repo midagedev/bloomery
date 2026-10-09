@@ -2706,6 +2706,23 @@ pub static SLOTS_ROUND: Kind = Kind {
     ],
 };
 
+/// A call of one slot the server made on a seat that serves several, under
+/// `BLOOMERY_STEP_STATS`.
+pub static SLOT_CALL: Kind = Kind {
+    name: "slot call",
+    head: "slot call",
+    doc: "BLOOMERY_STEP_STATS: one call of one slot the server made on a seat that \
+          serves several — its command (step: the server's next, one step; pass: its \
+          advance, one drafted pass; sampled: its advance_sampled, one sampled drafted \
+          pass), the slot the server selected for it, and the resident sequences the \
+          seat serves. A round of several slots is one slots round record instead.",
+    parts: &[
+        key("cmd", Word, ""),
+        key("slot", U64, ""),
+        key("slots", U64, ""),
+    ],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {
@@ -2905,7 +2922,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 ];
 
 /// What `bloomery-serve-ds41` prints, all on stderr, and the rounds of
-/// several slots a `BLOOMERY_STEP_STATS` run counts.
+/// several slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &PLACE_UNSET,
     &PLAN,
@@ -2933,6 +2950,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &RESIDENCY_LEAK,
     &MTP_WIDTH,
     &SLOTS_ROUND,
+    &SLOT_CALL,
 ];
 
 /// What `bloomery-serve-qwen38` prints, all on stderr.
@@ -2953,6 +2971,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &SLOTS_ROUND,
+    &SLOT_CALL,
     &MTP_WIDTH,
     &DRAFT_YIELD,
     &NVTIER,
@@ -2975,6 +2994,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &LISTENING_QWEN3,
     &CACHE_REUSE,
     &SLOTS_ROUND,
+    &SLOT_CALL,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
@@ -2983,7 +3003,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 /// placed load, the draft's load line and its verify's capture, the
 /// listening line, the reuse records the checkpoint rule answers, the
 /// draft's joins, the residency machine's records, and the rounds of several
-/// slots a `BLOOMERY_STEP_STATS` run counts.
+/// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
@@ -3007,6 +3027,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
     &SLOTS_ROUND,
+    &SLOT_CALL,
     &MTP_WIDTH,
 ];
 
@@ -3303,6 +3324,17 @@ pub fn slots_round(cmd: &str, rows: usize, passes: usize, slots: usize) -> Recor
         .w("cmd", cmd)
         .u("rows", rows)
         .u("passes", passes)
+        .u("slots", slots)
+}
+
+/// A call of one slot's record ([`SLOT_CALL`]): `cmd` the call (`step`, the
+/// server's `next`; `pass`, its `advance`; or `sampled`, its
+/// `advance_sampled`), `slot` the slot the server selected for it, and
+/// `slots` the resident sequences the seat serves.
+pub fn slot_call(cmd: &str, slot: usize, slots: usize) -> Record {
+    Record::new(&SLOT_CALL)
+        .w("cmd", cmd)
+        .u("slot", slot)
         .u("slots", slots)
 }
 
