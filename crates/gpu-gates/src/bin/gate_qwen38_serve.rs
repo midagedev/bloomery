@@ -281,8 +281,11 @@
 //!   split fills — the server's arena is the gate's own plan's (no host
 //!   reserve for them) less `checkpoint_bytes(slots)`, and its host need that
 //!   plan's plus the same (`paged_checkpoints_sit_outside_the_arena`, read
-//!   off the `cache` line); a residency word set to `off` reaches the `plan`
-//!   record (`paged_set_off_residency_is_accepted`), and one set to
+//!   off the `cache` line); the prompt cache's default takes nothing beside
+//!   the room the split fills (`paged_default_cache_is_off_by_the_split`:
+//!   `ram=0`, the split named in `why=`); a residency word set to `off`
+//!   reaches the `plan` record (`paged_set_off_residency_is_accepted`), and
+//!   one set to
 //!   `mid-p0-s1` is refused by name before it (`paged_set_residency_is_refused_by_name`:
 //!   the residency machine's fills share the arena with the step). The
 //!   floor counts every slot's checkpoints, so between the one-slot plan's
@@ -3499,8 +3502,10 @@ mod gate {
     /// split fills (`paged_checkpoints_sit_outside_the_arena`: the `cache`
     /// line's arena (`tier`) is the gate's own plan's, which holds no
     /// checkpoint reserve, less `checkpoint_bytes(slots)`, and its `need` that
-    /// plan's plus the same); a residency word set to `off` reaches the
-    /// `plan` record (`paged_set_off_residency_is_accepted`), and one set to
+    /// plan's plus the same); the prompt cache's default is 0 beside the room
+    /// the split fills (`paged_default_cache_is_off_by_the_split`); a
+    /// residency word set to `off` reaches the `plan` record
+    /// (`paged_set_off_residency_is_accepted`), and one set to
     /// `mid-p0-s1` is refused by name before it
     /// (`paged_set_residency_is_refused_by_name`: the machine's fills share
     /// the arena with the step). The floor counts the checkpoints too: at the
@@ -3642,6 +3647,26 @@ mod gate {
             &mut ok,
             "paged_set_off_residency_is_accepted",
             planned && !text.contains(&refusal("off")),
+        );
+        // The split fills the room past the tier's floor, so the prompt
+        // cache's default takes nothing beside it: `ram=0`, the split named
+        // in `why=`, the arena and the drive's bytes on the line
+        // (`CacheRam::of_tier`).
+        let cache_off = text
+            .lines()
+            .find(|l| l.starts_with("cache "))
+            .is_some_and(|l| {
+                let n = |k: &str| field(l, k).and_then(|v| v.parse::<u64>().ok());
+                n("ram") == Some(0)
+                    && field(l, "rule").as_deref() == Some("default")
+                    && n("tier").is_some_and(|t| t > 0)
+                    && n("paged").is_some_and(|b| b > 0)
+                    && l.contains(" why=the NVMe tier's split fills the room past its floor")
+            });
+        check(
+            &mut ok,
+            "paged_default_cache_is_off_by_the_split",
+            cache_off,
         );
         let free = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
             .first(&record::PLAN38)?
