@@ -328,6 +328,25 @@ blk_macstatic() {
   fi
   echo "${mst##*$'\n'}"
 }
+# carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
+# pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
+# its box command: a recipe that stops calling it ends the check silently, so the call is held here.
+blk_carry() {
+  local recipe carry_at box_at
+  if ! cy=$(bash "$(dirname "$0")/release/carry.sh" --self-test 2>&1); then
+    echo "$cy" >&2
+    echo "check-recipes: the carry self-test failed" >&2
+    return 1
+  fi
+  recipe=$(awk '/^release-build /{f=1; next} f && /^[^ ]/{exit} f' "$JF")
+  carry_at=$(grep -n 'tools/release/carry\.sh' <<< "$recipe" | head -n1 | cut -d: -f1 || true)
+  box_at=$(grep -n 'tools/box\.sh' <<< "$recipe" | head -n1 | cut -d: -f1 || true)
+  if [ -z "$carry_at" ] || [ -z "$box_at" ] || [ "$carry_at" -gt "$box_at" ]; then
+    echo "check-recipes: the release-build recipe must run tools/release/carry.sh before its tools/box.sh line (carry line '${carry_at:-none}', box line '${box_at:-none}')" >&2
+    return 1
+  fi
+  echo "${cy##*$'\n'}"
+}
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not. The tools run as
 # parallel jobs (they are independent processes on their own temp fixtures); their failures land in one
@@ -414,7 +433,7 @@ blk_orphan() {
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic pytools orphan)
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools orphan)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
