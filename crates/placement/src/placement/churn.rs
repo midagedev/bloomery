@@ -6,7 +6,8 @@
 //! (`HostSet::of_with`, `bloomery-model`'s `placement::host_lock`) beside the
 //! plan's host segments, and the plan's host headroom
 //! ([`super::HostTotals::headroom_bytes`], the one budget) must take the
-//! pool's bytes.
+//! pool's bytes. A stack the plan pages to the NVMe tier adds nothing: its
+//! victims are the tier's arena's ([`super::expert_nvme_tier`]).
 
 use super::{Device, ExpertList, PlacementError, Plan, Role, per_expert};
 
@@ -28,7 +29,7 @@ impl ChurnPool {
     /// The pool of `plan`'s card `card` (an index of
     /// [`super::Machine::all_cards`]) with `pinned` seed experts a layer kept
     /// on the card. A layer whose card holds `pinned` experts or fewer adds
-    /// nothing.
+    /// nothing, and neither does a stack with a segment on the NVMe tier.
     pub fn of(plan: &Plan<'_>, card: usize, pinned: usize) -> Result<ChurnPool, PlacementError> {
         let model = plan.model;
         let mut per_layer = vec![0u64; model.layers];
@@ -42,7 +43,11 @@ impl ChurnPool {
             let t = model.tensors.get(row.tensor).ok_or_else(|| {
                 PlacementError::Experts(format!("plan row {} names no tensor", row.tensor))
             })?;
-            if t.role != Role::RoutedExperts {
+            // A paged stack's victims are the NVMe tier's arena's, not the
+            // host's pages.
+            if t.role != Role::RoutedExperts
+                || row.segments.iter().any(|s| s.device == Device::Nvme)
+            {
                 continue;
             }
             for seg in &row.segments {

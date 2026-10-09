@@ -21,7 +21,8 @@
 //!   (`HostRoomFloor`), an arena budget under one slot's span, and the
 //!   direct-read probe of a mount without direct IO, each by name.
 //! - `residency` (clause 5): the paged plan's unset rule resolves `mid`
-//!   with no churn pool ([`residency38`]'s paged branch), flips land on the
+//!   with an empty churn pool (`ChurnPool::of` leaves the paged stacks
+//!   out: the arena serves their victims), flips land on the
 //!   paged arm, and its `unresident` and `faulting` are 0 and its `late`
 //!   flips 0 — bug catchers, structurally unreachable once the seam serves
 //!   the victims the arena holds from its books.

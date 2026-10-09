@@ -900,11 +900,39 @@ fn a_split_plans_pool_fits_the_room_past_the_arena() {
             pick.word()
         );
     }
+    // The pool of every card expert, as the unsplit plan holds it.
     let split = plan_at(&q4, &gate, 4096, 1, 27 << 30).expect("the split plan");
-    let all = ChurnPool::of(&split, 0, 0).expect("the pool of every card expert");
+    let twin = plan_with(&q4, &gate, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+    let all = ChurnPool::of(&twin, 0, 0).expect("the pool of every card expert");
     match all.check(&split) {
         Err(PlacementError::ResidencyOverHost(_)) => {}
         other => panic!("mid-p0's pool of {} B is not refused: {other:?}", all.bytes),
+    }
+}
+
+/// A churn pool leaves out the stacks the plan pages to the NVMe tier, whose
+/// victims the tier's arena serves: on both paged gate plans every layer
+/// pages, the pool is empty and the unset rule resolves `mid-p0-s1`, while
+/// the unsplit twin keeps its whole pool.
+#[test]
+fn a_paged_stack_adds_nothing_to_the_churn_pool() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    for room in [27u64 << 30, 58 << 30] {
+        let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
+        let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
+        assert!(
+            (0..LAYERS).all(|l| layer_split(&split, l).1 > 0),
+            "room {room}: every layer pages"
+        );
+        let pool = |p: &Plan<'_>| ChurnPool::of(p, 0, 0).expect("the pool").bytes;
+        assert_eq!(pool(&split), 0, "room {room}: the paged plan's pool");
+        assert!(pool(&twin) > 0, "room {room}: the unsplit twin's pool");
+        let (pick, bytes) = residency(&split);
+        assert_eq!(
+            (pick.word(), bytes),
+            ("mid-p0-s1".to_string(), 0),
+            "room {room}: the unset rule on the paged plan"
+        );
     }
 }
 
