@@ -33,7 +33,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **`reasoning_effort: "none"`** turns thinking off before the template, as llama-server does: the template reads
   `enable_thinking: false` (`chat_template_kwargs` sets it too — a bool, a quoted string is a 400 naming it, and
   `"none"` wins over a kwargs `true`), no `reasoning_effort` reaches the template, and the whole output lands in
-  `content`.
+  `content`. A template with no thinking switch but an effort header (GLM-5.3's: its generation prompt always opens
+  `<think>`) has nothing to turn off, so there `"none"` is sent as `reasoning_effort: "low"`, the template's lowest
+  effort, replacing a kwargs `reasoning_effort`; the server prints one line at start saying so. `/props` names which
+  case the template is in: `thinking_off` is `"switch"`, `"low_effort"` or `"neither"` (neither knob changes the
+  prompt, so `"none"` is `enable_thinking: false` as above).
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`.
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched

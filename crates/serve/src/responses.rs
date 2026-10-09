@@ -1809,6 +1809,26 @@ mod tests {
         );
     }
 
+    /// `reasoning.effort: "none"` takes the chat path's rule on a template
+    /// with no thinking switch but an effort header (GLM-5's): it reaches the
+    /// template as `"low"`, the template's lowest effort.
+    #[test]
+    fn reasoning_effort_none_is_the_low_effort_on_a_template_with_no_thinking_switch() {
+        let mut config = testserve::mock_config();
+        config.chat_template =
+            include_str!("../tests/fixtures/glm5-chat-template.jinja").to_owned();
+        let addr = testserve::spawn(Box::new(ScriptedEngine::new(4096, "ok")), config).0;
+        answered(
+            addr,
+            "/v1/responses",
+            &json!({"input": "hi", "reasoning": {"effort": "none"}}),
+        );
+        assert_eq!(
+            last_prompt(addr),
+            "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>hi<|assistant|><think>"
+        );
+    }
+
     /// What needs a store is refused by name — `previous_response_id`,
     /// `conversation`, `store: true`, `background: true`, a stored `prompt`,
     /// an `item_reference` item — on both routes; `store: false`, an empty or
