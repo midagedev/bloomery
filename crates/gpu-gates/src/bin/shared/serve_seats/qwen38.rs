@@ -131,8 +131,21 @@
 //! refused by name — resident slots hold their state on the card, in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
 //! the split they serve and what set the count (`from`: the `--parallel`
-//! flag, a set `--ctx-size`, the default). `--queue-depth Q` bounds the
-//! requests that wait for a slot.
+//! flag, a set `--ctx-size`, the default, or `paged`, the rule below).
+//! `--queue-depth Q` bounds the requests that wait for a slot.
+//!
+//! A plan that pages host experts through the NVMe tier's RAM arena (a room
+//! under half the host leg's experts, or `BLOOMERY_NVTIER_BYTES` set:
+//! `placement::nvme_arena_of`) steps one column (`bloomery_levers::paged_columns`): a step of several — two
+//! slots' rows, or a drafted verify's window — reads the paged experts
+//! through the file mapping, whose page cache grows until the kernel swaps
+//! the arena out. The unset counts fall to one slot (`from=paged`) and the
+//! draft off (`load draft=off (unset: the plan pages …)`), one `paged` line
+//! on stderr naming the arena and what was asked; a `--parallel` past one
+//! or `BLOOMERY_DRAFT=mtp` is refused by name before the load, with the way
+//! out. The rule reads the plan the flags name — a set context's plain plan
+//! before any search, else the plan the default's search and the draft's
+//! yield chose — and the load's own plan is held to it.
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
@@ -265,7 +278,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
-    Draft38At, Draft38Off, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
+    Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
     residency38_unset,
 };
 use cuda_core::sys;
@@ -1195,6 +1208,60 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         },
         cards: chosen.place,
     };
+    // The paged tier's one-column rule (`bloomery_levers::paged_columns`,
+    // the module doc), asked once of the plan the flags name: a set
+    // context's slot is known before any search, so its plain plan's arena
+    // decides ahead of the drafted plan, whose refusal would name a draft
+    // the rule turns off; the default's is asked below, of the plan its
+    // search and the draft's yield chose. Under the rule the plan serves one
+    // slot (`from=paged` when the count was the default's) and no draft.
+    let paged = |arena: u64, slots: usize, mtp: bool| {
+        bloomery_levers::paged_columns(&bloomery_levers::PagedAt {
+            arena,
+            slots,
+            slots_set: from == "flag",
+            draft: mtp,
+            draft_set: levers.draft().is_some(),
+        })
+    };
+    let one_column = |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>| {
+        eprintln!(
+            "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} slots=1 \
+             draft=off (the plan pages host experts through the NVMe tier's RAM arena: a step \
+             of several columns reads them through the file mapping)",
+            if mtp { "on" } else { "off" }
+        );
+        (
+            if slots > 1 { "paged" } else { from },
+            draft_off.or(mtp.then_some(Draft38Off::Paged { arena })),
+        )
+    };
+    let early = match a.ctx.map(|c| c / slots) {
+        Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
+            let plain = Plans {
+                inputs: &inputs,
+                place: a.place,
+                experts,
+                levers: &plan_levers,
+                mtp: None,
+                slots,
+            };
+            if plain.card(ctx).is_ok() {
+                plain.host(ctx, set)?.2
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp)? {
+        Paged::AsAsked => (slots, from, mtp, head, draft_off),
+        Paged::OneColumn => {
+            mtp_inputs = None;
+            let (from, draft_off) = one_column(early, slots, mtp, draft_off);
+            (1, from, false, None, draft_off)
+        }
+    };
     let drafted = Plans {
         inputs: &inputs,
         place: a.place,
@@ -1245,8 +1312,24 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     } else {
         (drafted, mtp, head, draft_off)
     };
+    let host = plans.host(rule.ctx, set)?;
+    let (slots, from, mtp, head, draft_off, host) = match paged(host.2, slots, mtp)? {
+        Paged::AsAsked => (slots, from, mtp, head, draft_off, host),
+        Paged::OneColumn => {
+            let one = Plans {
+                mtp: None,
+                slots: 1,
+                ..plans
+            };
+            rule = ctx38(&one, a.ctx)?;
+            let (from, draft_off) = one_column(host.2, slots, mtp, draft_off);
+            let host = one.host(rule.ctx, set)?;
+            mtp_inputs = None;
+            (1, from, false, None, draft_off, host)
+        }
+    };
     refuse_mtp_levers(&draft_off)?;
-    let (need, pool, arena) = plans.host(rule.ctx, set)?;
+    let (need, pool, arena) = host;
     let cache = CacheRam::of_tier(a.cache_ram, need, pool, arena)?;
     let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();
@@ -1311,6 +1394,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             (with.plan, bytes)
         }
     };
+    // The one-column rule holds at the plan the load runs: the cache's
+    // bound only lowers the context the rule read, which leaves the card
+    // more experts and the host fewer, so a paged load of several columns
+    // is the seat's own breach.
+    if plan.host.nvme_arena_bytes > 0 && (slots > 1 || mtp) {
+        return Err(format!(
+            "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
+             {slots} slots, the draft {}: the one-column rule read another plan",
+            plan.host.nvme_arena_bytes,
+            if mtp { "on" } else { "off" }
+        )
+        .into());
+    }
     let line = Record::new(&record::PLAN38)
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())

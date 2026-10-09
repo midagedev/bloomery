@@ -1579,6 +1579,9 @@ pub enum Draft38Off {
     /// Unset, and the draft yielded to the context
     /// ([`DraftYield::of`]'s answer, the seats' plan-side rule).
     Yield(DraftYield),
+    /// Unset on the Qwen3.8 seat, and the plan pages host experts through
+    /// the NVMe tier's RAM arena of `arena` bytes ([`paged_columns`]).
+    Paged { arena: u64 },
 }
 
 impl fmt::Display for Draft38Off {
@@ -1602,6 +1605,11 @@ impl fmt::Display for Draft38Off {
                 "unset: the target's {name} is {ty}; the MTP draft reads it as Q8_0"
             ),
             Draft38Off::Yield(y) => y.fmt(f),
+            Draft38Off::Paged { arena } => write!(
+                f,
+                "unset: the plan pages host experts through the NVMe tier's {arena} B RAM arena, \
+                 and a paged plan steps one column; a verify steps several"
+            ),
         }
     }
 }
@@ -1679,6 +1687,91 @@ impl fmt::Display for DraftYield {
             self.card_bytes, self.with, self.base, self.without
         )
     }
+}
+
+/// What decides the columns a serving seat steps on a plan whose host
+/// experts page through the NVMe tier's RAM arena ([`paged_columns`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagedAt {
+    /// The plan's RAM arena (`HostTotals::nvme_arena_bytes`); 0 is a plan
+    /// the tier does not page through an arena.
+    pub arena: u64,
+    /// The resident slots the plan counts, and whether `--parallel` named
+    /// the count.
+    pub slots: usize,
+    pub slots_set: bool,
+    /// Whether the plan drafts, and whether [`DRAFT`] named the draft.
+    pub draft: bool,
+    pub draft_set: bool,
+}
+
+/// What a seat serves on the plan [`paged_columns`] read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paged {
+    /// The plan as asked: no arena, or one column a step already.
+    AsAsked,
+    /// One column a step: one slot, no draft.
+    OneColumn,
+}
+
+/// A paged plan's refusal of the set values that step several columns: the
+/// `--parallel` count past one, and a set draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagedRefused {
+    pub arena: u64,
+    pub parallel: Option<usize>,
+    pub draft: bool,
+}
+
+impl fmt::Display for PagedRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut what = Vec::new();
+        let mut ways = Vec::new();
+        if let Some(n) = self.parallel {
+            what.push(format!("--parallel {n}"));
+            ways.push("serve --parallel 1 or leave --parallel unset".to_owned());
+        }
+        if self.draft {
+            what.push(format!("{DRAFT}=mtp"));
+            ways.push(format!("set {DRAFT}=off or leave it unset"));
+        }
+        write!(
+            f,
+            "{}: the plan pages host experts through the NVMe tier's {} B RAM arena, and a \
+             paged plan steps one column (a step of several reads the paged experts through the \
+             file mapping, whose page cache grows until the kernel swaps the arena out); {}",
+            what.join(" and "),
+            self.arena,
+            ways.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for PagedRefused {}
+
+/// A plan that pages host experts through the NVMe tier's RAM arena steps
+/// one column: several slots or a drafted verify read the paged experts
+/// through the file mapping, and its page cache pushes the arena to swap. A
+/// plan with no arena, or one slot and no draft, serves as asked; else the
+/// unset counts fall to one slot and no draft, and a `--parallel` past one or
+/// a set draft is refused by name.
+///
+/// # Errors
+/// [`PagedRefused`], naming each set value that steps several columns.
+pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
+    if at.arena == 0 || (at.slots <= 1 && !at.draft) {
+        return Ok(Paged::AsAsked);
+    }
+    let parallel = (at.slots_set && at.slots > 1).then_some(at.slots);
+    let draft = at.draft_set && at.draft;
+    if parallel.is_some() || draft {
+        return Err(PagedRefused {
+            arena: at.arena,
+            parallel,
+            draft,
+        });
+    }
+    Ok(Paged::OneColumn)
 }
 
 /// The word the GLM seat of `bloomery-serve` drafts by with [`DRAFT`]
