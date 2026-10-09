@@ -14,8 +14,10 @@
 //! right size with no such marker is read and checked once; one whose
 //! content is not the listing's (the repo moved it on) is removed and
 //! fetched again (`stale`); one shorter than the listing's is moved back to
-//! `.part` and resumed; one longer, or a `.part` longer than the file, is
-//! not the listing's either: removed and fetched again (`stale`). A `.part`
+//! `.part` and resumed, unless its marker names another digest: then it is
+//! the repo's earlier version (an upload that grew), removed and fetched
+//! again (`stale`); one longer, or a `.part` longer than the file, is not
+//! the listing's either: removed and fetched again (`stale`). A `.part`
 //! whose check fails is removed, and the refusal names both digests.
 //!
 //! A listing that fails at the network — curl cannot resolve the host,
@@ -382,11 +384,17 @@ impl Client {
         let file = entry.path.as_str();
         let mut state = State::Fetch;
         if let Some(len) = size_of(dest)? {
-            if len > entry.size {
+            let marked = fs::read_to_string(&marker).ok();
+            // A file takes its name only after its check, so a marker naming
+            // another digest makes a shorter file an earlier version, not a cut
+            // download.
+            let earlier = marked
+                .as_deref()
+                .is_some_and(|m| m.trim() != entry.digest.as_str());
+            if len > entry.size || (len < entry.size && earlier) {
                 remove(dest)?;
                 state = State::Stale;
             } else if len == entry.size {
-                let marked = fs::read_to_string(&marker).ok();
                 if marked.as_deref().map(str::trim) == Some(entry.digest.as_str()) {
                     events(&Event::File {
                         file,
@@ -901,6 +909,26 @@ mod tests {
             ]
         );
         assert_eq!(fs::read(&p).expect("file"), body);
+    }
+
+    /// A cached file shorter than the repo's whose marker names another
+    /// digest is the repo's earlier version (an upload that grew), not a cut
+    /// download: fetched again whole, never resumed onto the earlier bytes,
+    /// which ends in a digest refusal on the first start after the upload.
+    #[test]
+    fn a_shorter_file_of_an_earlier_version_is_fetched_again() {
+        let d = scratch("earlier");
+        let earlier = content();
+        let (c, e) = served(&d, "a/b", "m.gguf", &earlier);
+        let p = run(&c, "a/b", &e).0.expect("fetch");
+        let mut grown = earlier.clone();
+        grown[5] ^= 1;
+        grown.extend_from_slice(b"grown");
+        let (c, e) = served(&d, "a/b", "m.gguf", &grown);
+        let (r, seen) = run(&c, "a/b", &e);
+        r.expect("the grown upload fetched whole, not resumed onto the earlier version");
+        assert_eq!(states(&seen), ["file stale 0"]);
+        assert_eq!(fs::read(&p).expect("file"), grown);
     }
 
     #[test]
