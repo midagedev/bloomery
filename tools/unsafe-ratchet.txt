@@ -138,7 +138,10 @@ gguf 9 2 0
 # tier's arena fills its slots from the resident pool (host/nvtier.rs, the memcpy_pool idiom) — one
 # block building the pick's window slice, SharedArena's Send and Sync impls owning its disjoint-slot
 # argument, each with its SAFETY line.
-gpu 1621 177 8
+# PIN(2026-10-09): gpu 1621 -> 1623 blocks, 177 -> 178 fns, a new kernel entry, not old code relaxed: elem.rs's
+# embed_rows_q3k (one block) over embed_rows_sb, and the EmbedSb trait's value for Q3_K (Q3kRows::value, one unsafe
+# fn and one block into the V2-Lite embedding's q3k_embed_value core), each with its SAFETY line.
+gpu 1623 178 8
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

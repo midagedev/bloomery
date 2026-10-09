@@ -1,6 +1,7 @@
 //! GPU gate for qwen3moe's three chain kernels beside the phase-2 set: the
-//! Q4_K embedding row, the routed experts' gate·up·SwiGLU `_sel`, and the
-//! combine (`bloomery_gpu::arch::qwen3moe::experts`).
+//! embedding rows (Q4_K and the other K-quant tables the body35 seat reads),
+//! the routed experts' gate·up·SwiGLU `_sel`, and the combine
+//! (`bloomery_gpu::arch::qwen3moe::experts`).
 //!
 //! 1. Embedding: `embed_rows_q4k` against `gguf::quant::dequant_row` on the
 //!    same rows, bit for bit, for ids 0, 1, the last row and 61 spread
@@ -10,7 +11,16 @@
 //!    dequantizer), bit for bit; an id past the table raises
 //!    `FaultSite::TokenId` and its row is NaN, every value, the other rows
 //!    unchanged and every row's position written; a position past a u32
-//!    reads `u32::MAX`, a count too, never a wrapped value.
+//!    reads `u32::MAX`, a count too, never a wrapped value. And
+//!    `enqueue_embed_rows_kquant` on a seeded synthetic table of each type it
+//!    takes (Q3_K, Q4_K, Q5_K, Q6_K: random codes and scales, normal f16
+//!    `d`/`dmin`, rows of an even count of super-blocks), ids on the first,
+//!    a middle and the last row among others: every value bit for bit
+//!    against `dequant_row` on the same row, each row's position and count
+//!    as above; a Q3_K table whose rows are an odd count of super-blocks
+//!    (not whole words) is refused by name. `gate-1-1` holds `dequant_row` to
+//!    ggml's `to_float` on rows of all four types (its V2-Lite and V4.1 sets),
+//!    so the card, ours and ggml agree on each.
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
 //!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; a rerun is
@@ -66,8 +76,8 @@ mod gate {
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
         GateError, Layout, RowKind, bits_equal, bytes_to_words, checks_failed, ik_q8_2, open_model,
-        q8_1_dequant, ref_ints, ref_tensor_logical_in, tensor_bytes_as, topk_ids_logical_within,
-        verdict,
+        q8_1_dequant, ref_ints, ref_tensor_logical_in, same_bits, tensor_bytes_as,
+        topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{GgmlType, dequant_row};
@@ -133,6 +143,7 @@ mod gate {
         let sets = sets()?;
         let mut ok = true;
         ok &= embed(&gpu, &gguf, &sets)?;
+        ok &= embed_kquant(&gpu)?;
         ok &= gate_up_body(&gpu, &gguf, &ex)?;
         ok &= gate_up_tap(&gpu, &gguf, &ex, &sets)?;
         ok &= combine(&gpu, &ex, &sets, stream)?;
@@ -155,11 +166,12 @@ mod gate {
 
     /// `ids` gathered from `table` (`k` values a row), the rows' positions
     /// from `pos0` and offset `first`: eagerly, or captured as a graph and
-    /// replayed once, which also returns its node count.
+    /// replayed once, which also returns its node count. `ty` `None` takes
+    /// the Q4_K entry directly, `Some(t)` the K-quant entry of type `t`.
     #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
     fn gather(
         gpu: &Gpu,
-        table: &DeviceTensor<u32>,
+        (table, ty): (&DeviceTensor<u32>, Option<GgmlType>),
         ids: &[u32],
         pos0: u32,
         first: usize,
@@ -173,18 +185,19 @@ mod gate {
         let mut pos = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
         let mut n_keys = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
         let mut enqueue = |s: &CudaStream| {
-            gpu.elem().enqueue_embed_rows_q4k(
-                s,
-                EmbedRowsArgs {
-                    w: table,
-                    ids: &idb,
-                    pos0: &p0,
-                    first,
-                    y: &mut y,
-                    pos: &mut pos,
-                    n_keys: &mut n_keys,
-                },
-            )
+            let args = EmbedRowsArgs {
+                w: table,
+                ids: &idb,
+                pos0: &p0,
+                first,
+                y: &mut y,
+                pos: &mut pos,
+                n_keys: &mut n_keys,
+            };
+            match ty {
+                None => gpu.elem().enqueue_embed_rows_q4k(s, args),
+                Some(ty) => gpu.elem().enqueue_embed_rows_kquant(s, ty, args),
+            }
         };
         let nodes = if graph {
             let g = gpu.capture(&mut enqueue)?;
@@ -229,7 +242,7 @@ mod gate {
         let mut ids: Vec<u32> = vec![0, 1, (n_rows - 1) as u32];
         ids.extend((1..62u64).map(|i| ((i * 2_654_435_761) % n_rows as u64) as u32));
         let run = |ids: &[u32]| -> Result<Embedded, GateError> {
-            Ok(gather(gpu, &table, ids, POS0, FIRST, k, false)?.0)
+            Ok(gather(gpu, (&table, None), ids, POS0, FIRST, k, false)?.0)
         };
         let got = run(&ids)?;
         let mut want = vec![0.0f32; ids.len() * k];
@@ -263,7 +276,7 @@ mod gate {
             ok &= same;
         }
         // The graph: one node, replay = eager, rows and positions.
-        let (replayed, nodes) = gather(gpu, &table, &ids, POS0, FIRST, k, true)?;
+        let (replayed, nodes) = gather(gpu, (&table, None), &ids, POS0, FIRST, k, true)?;
         let g_same = bits_equal(&replayed.y, &got.y)
             && replayed.pos == got.pos
             && replayed.n_keys == got.n_keys;
@@ -294,7 +307,7 @@ mod gate {
         );
         // Positions past a u32: u32::MAX, never a wrapped value.
         let top = u32::MAX - 1;
-        let sat = gather(gpu, &table, &ids[..3], top, 0, k, false)?.0;
+        let sat = gather(gpu, (&table, None), &ids[..3], top, 0, k, false)?.0;
         let sat_ok = positions_ok(&sat, 3, top, 0);
         println!(
             "embed positions from {top}: {:?} counts {:?} (want {top}, then u32::MAX past it) {}",
@@ -303,6 +316,107 @@ mod gate {
             verdict(sat_ok)
         );
         Ok(ok && pass && oor_ok && sat_ok)
+    }
+
+    /// The K-quant types `enqueue_embed_rows_kquant` gathers, each with the
+    /// byte offsets of its f16 fields (`d`, and `dmin` where it has one) in a
+    /// super-block.
+    const EMBED_TYPES: [(GgmlType, &[usize]); 4] = [
+        (GgmlType::Q3_K, &[108]),
+        (GgmlType::Q4_K, &[0, 2]),
+        (GgmlType::Q5_K, &[0, 2]),
+        (GgmlType::Q6_K, &[208]),
+    ];
+
+    /// Rows of a synthetic table, and the super-blocks (an even count: every
+    /// type's row is then whole words) a row of it holds.
+    const SYN_ROWS: usize = 101;
+    const SYN_SB: usize = 4;
+
+    /// `rows` synthetic rows of `n_sb` super-blocks of `ty` as bytes, from a
+    /// fixed-seed xorshift64: every byte random except the f16 fields at
+    /// `halves`, positive normal (sign 0, exponent field 8..=20, random
+    /// mantissa), so no NaN or Inf enters. Every pattern of the code and
+    /// scale bytes is a valid K-quant block. `seed` must be nonzero.
+    fn synthetic_rows(
+        (ty, halves): (GgmlType, &[usize]),
+        (rows, n_sb): (usize, usize),
+        seed: u64,
+    ) -> Result<Vec<u8>, GateError> {
+        let block = ty
+            .type_size()
+            .ok_or_else(|| format!("{ty:?} has no size"))? as usize;
+        let mut s = seed;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut bytes = Vec::with_capacity(rows * n_sb * block);
+        for _ in 0..rows * n_sb {
+            let at = bytes.len();
+            bytes.extend((0..block).map(|_| (next() >> 32) as u8));
+            for &h in halves {
+                let r = next();
+                let half = (((8 + r % 13) as u16) << 10) | ((r >> 32) as u16 & 0x3ff);
+                bytes[at + h..at + h + 2].copy_from_slice(&half.to_le_bytes());
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// `enqueue_embed_rows_kquant` on a synthetic table of each type it
+    /// takes against `dequant_row`, and the whole-word refusal of a Q3_K
+    /// table of an odd count of super-blocks.
+    fn embed_kquant(gpu: &Gpu) -> Result<bool, GateError> {
+        let k = 256 * SYN_SB;
+        let mut ok = true;
+        for (i, &(ty, halves)) in EMBED_TYPES.iter().enumerate() {
+            let bytes = synthetic_rows((ty, halves), (SYN_ROWS, SYN_SB), 0x2545_f491 + i as u64)?;
+            let rb = bytes.len() / SYN_ROWS;
+            let table = upload(gpu, &bytes, SYN_ROWS)?;
+            let mut ids: Vec<u32> = vec![0, (SYN_ROWS / 2) as u32, (SYN_ROWS - 1) as u32];
+            ids.extend((1..30u64).map(|i| ((i * 2_654_435_761) % SYN_ROWS as u64) as u32));
+            let got = gather(gpu, (&table, Some(ty)), &ids, POS0, FIRST, k, false)?.0;
+            let mut want = vec![0.0f32; ids.len() * k];
+            for (t, &id) in ids.iter().enumerate() {
+                let row = &bytes[id as usize * rb..(id as usize + 1) * rb];
+                dequant_row(ty, row, &mut want[t * k..(t + 1) * k])?;
+            }
+            let mismatches = want.len() - same_bits(&got.y, &want);
+            let pos_ok = positions_ok(&got, ids.len(), POS0, FIRST);
+            let pass = got.y.len() == want.len() && mismatches == 0 && pos_ok;
+            println!(
+                "clause enqueue_embed_rows_kquant type={ty:?} rows={SYN_ROWS} values={} \
+                 mismatches={mismatches} positions={pos_ok} — {}",
+                want.len(),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        // Three super-blocks of 110 bytes are not whole words: no launch.
+        let odd = synthetic_rows(EMBED_TYPES[0], (4, 3), 0x2545_f491)?;
+        let table = upload(gpu, &odd, 4)?;
+        let refused = match gather(
+            gpu,
+            (&table, Some(GgmlType::Q3_K)),
+            &[0, 3],
+            POS0,
+            FIRST,
+            768,
+            false,
+        ) {
+            Err(e) => e
+                .to_string()
+                .contains("whole 110-byte super-blocks in whole words"),
+            Ok(_) => false,
+        };
+        println!(
+            "clause enqueue_embed_rows_kquant type=Q3_K n_sb=3 refused_by_name={refused} — {}",
+            verdict(refused)
+        );
+        Ok(ok && refused)
     }
 
     // ---------------------------------------------------- 2. gate·up body

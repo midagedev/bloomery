@@ -95,6 +95,7 @@ generate_ds41   ds41_shexp_gate_up_q3k_mcol              0           0
 generate_ds41   ds41_shexp_gate_up_q8_0_mcol             0           0
 generate_ds41   ds41_tap_means                           0           0
 generate_ds41   embed_rows                               0           0
+generate_ds41   embed_rows_q3k                           0           0
 generate_ds41   embed_rows_q4k                           0           0
 generate_ds41   embed_rows_q5k                           0           0
 generate_ds41   embed_rows_q6k                           0           0
@@ -311,6 +312,7 @@ gate_e2e   ds41_ffn_handoff_8                       0           0
 gate_e2e   ds41_ffn_handoff_8_tier                  0           0
 gate_e2e   ds41_ffn_places_10_cols                  0           0
 gate_e2e   embed_rows                               0           0
+gate_e2e   embed_rows_q3k                           0           0
 gate_e2e   embed_rows_q4k                           0           0
 gate_e2e   embed_rows_q5k                           0           0
 gate_e2e   embed_rows_q6k                           0           0

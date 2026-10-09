@@ -12,7 +12,7 @@
 //! v`, the layout of the reference dump's `q_rope`/`k_rope` views);
 //! `weighted_sum` on `[rows, n_exp, m]` down-projections with `[n_exp, m]`
 //! weights; the embedding table is Q3_K rows of 2048 values (880 bytes = 220
-//! u32 words each) or Q4_K, Q5_K or Q6_K rows of whole super-blocks.
+//! u32 words each) or Q3_K, Q4_K, Q5_K or Q6_K rows of whole super-blocks.
 //! Extents are launch arguments, never buffer lengths: scratch buffers may
 //! be larger than the shape in flight.
 
@@ -300,6 +300,26 @@ impl EmbedSb for Q6kRows {
         let q = (nib | (((qh >> (2 * a)) & 3) << 4)) as i32;
         let d = half_to_f32((d0 | (d1 << 8)) as u16);
         (d * (sc as u8 as i8) as f32) * (q - 32) as f32
+    }
+}
+
+/// Q3_K (110 bytes: 32 `hmask` bytes, 64 `qs` bytes, 12 scale bytes, the f16
+/// `d`; a super-block starts 0 or 2 mod 4 in a row of an even count of them,
+/// so [`q3k_embed_value`] funnels both): value `128c + 32a + 16h + l` takes
+/// the 2-bit code at field `2a` of qs byte `32c + 16h + l`, the high bit
+/// `hmask[16h + l]` bit `4c + a` (clear subtracts 4), and sub-block scale
+/// `8c + 2a + h` of the aux shuffle minus 32; the value is `(d · (sc − 32)) ·
+/// (q − hv)`, two roundings in the reference's order.
+pub(crate) struct Q3kRows;
+
+impl EmbedSb for Q3kRows {
+    const BYTES: usize = 110;
+
+    #[inline(always)]
+    unsafe fn value(w: &[u32], base: usize, v: usize) -> f32 {
+        // SAFETY: `base + 110 <= 4 * w.len()` and `v < 256` by this fn's
+        // `# Safety`, the core's.
+        unsafe { q3k_embed_value(w, base, v) }
     }
 }
 
@@ -761,6 +781,54 @@ mod elem_kernels {
         // SAFETY: the launch contract is the body's (210 = Q6kRows::BYTES).
         unsafe {
             embed_rows_sb::<Q6kRows>(
+                i,
+                (w, ids, pos0),
+                (first, n_rows, n_sb),
+                fault,
+                &mut y,
+                &mut pos,
+                &mut n_keys,
+            );
+        }
+    }
+
+    /// Dequantize `ids.len()` rows of the Q3_K embedding table `w` (`110 ·
+    /// n_sb` bytes per row, an even count of super-blocks so a row is whole
+    /// words) into `y` with their positions and live key counts
+    /// ([`embed_rows_sb`] over [`Q3kRows`]), as `embed_rows_q4k`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= 110 * n_sb * n_rows,
+            y.len() >= 256 * n_sb * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
+        )
+    )]
+    pub fn embed_rows_q3k(
+        w: &[u32],
+        ids: &[u32],
+        pos0: &[u32],
+        first: u32,
+        n_rows: u32,
+        n_sb: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract is the body's (110 = Q3kRows::BYTES).
+        unsafe {
+            embed_rows_sb::<Q3kRows>(
                 i,
                 (w, ids, pos0),
                 (first, n_rows, n_sb),
@@ -1578,8 +1646,9 @@ impl ElemKernels {
     /// rows dequantized token-major into `args.y`, bit-identical to
     /// `gguf::quant::dequant_row`, with each row's position and live key
     /// count. Q4_K runs `embed_rows_q4k`, Q5_K `embed_rows_q5k` (44 words a
-    /// super-block), Q6_K `embed_rows_q6k` (210 bytes a super-block, an even
-    /// count of them a row so a row is whole words); any other type, or a
+    /// super-block), Q3_K `embed_rows_q3k` (110 bytes a super-block) and Q6_K
+    /// `embed_rows_q6k` (210 bytes a super-block), each of those two with an
+    /// even count of them a row so a row is whole words; any other type, or a
     /// table whose rows are not whole super-blocks of it, is refused by name.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_embed_rows_kquant(
@@ -1592,12 +1661,15 @@ impl ElemKernels {
         let what = "enqueue_embed_rows_kquant";
         let sb_bytes = match ty {
             GgmlType::Q4_K => return self.enqueue_embed_rows_q4k(stream, args),
+            GgmlType::Q3_K => Q3kRows::BYTES,
             GgmlType::Q5_K => Q5kRows::BYTES,
             GgmlType::Q6_K => Q6kRows::BYTES,
             other => {
                 return Err(GpuError::shape(
                     what,
-                    format!("a {other} table: the embedding lookups read Q4_K, Q5_K and Q6_K rows"),
+                    format!(
+                        "a {other} table: the embedding lookups read Q3_K, Q4_K, Q5_K and Q6_K rows"
+                    ),
                 ));
             }
         };
@@ -1653,38 +1725,64 @@ impl ElemKernels {
         let n_rows = launch_u32(what, "w.rows()", w.rows())?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let fault = crate::sink_over(&self.fault, LAYER_NONE);
-        if ty == GgmlType::Q5_K {
-            let prep = self.module.prepare_embed_rows_q5k(cfg)?;
-            self.module.embed_rows_q5k(
-                stream,
-                &prep,
-                w.buf(),
-                ids,
-                pos0,
-                first,
-                n_rows,
-                n_sb,
-                fault,
-                y,
-                pos,
-                n_keys,
-            )?;
-        } else {
-            let prep = self.module.prepare_embed_rows_q6k(cfg)?;
-            self.module.embed_rows_q6k(
-                stream,
-                &prep,
-                w.buf(),
-                ids,
-                pos0,
-                first,
-                n_rows,
-                n_sb,
-                fault,
-                y,
-                pos,
-                n_keys,
-            )?;
+        match ty {
+            GgmlType::Q3_K => {
+                let prep = self.module.prepare_embed_rows_q3k(cfg)?;
+                self.module.embed_rows_q3k(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    ids,
+                    pos0,
+                    first,
+                    n_rows,
+                    n_sb,
+                    fault,
+                    y,
+                    pos,
+                    n_keys,
+                )?;
+            }
+            GgmlType::Q5_K => {
+                let prep = self.module.prepare_embed_rows_q5k(cfg)?;
+                self.module.embed_rows_q5k(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    ids,
+                    pos0,
+                    first,
+                    n_rows,
+                    n_sb,
+                    fault,
+                    y,
+                    pos,
+                    n_keys,
+                )?;
+            }
+            GgmlType::Q6_K => {
+                let prep = self.module.prepare_embed_rows_q6k(cfg)?;
+                self.module.embed_rows_q6k(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    ids,
+                    pos0,
+                    first,
+                    n_rows,
+                    n_sb,
+                    fault,
+                    y,
+                    pos,
+                    n_keys,
+                )?;
+            }
+            other => {
+                return Err(GpuError::shape(
+                    what,
+                    format!("a {other} table: no embedding entry launches it"),
+                ));
+            }
         }
         Ok(())
     }
