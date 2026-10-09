@@ -134,7 +134,9 @@ a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
-decode starts warm (on by default, with `--place` unset, `a` or `bp`).
+decode starts warm (on by default, with `--place` unset, `a` or `bp`). On Qwen3.8 a call that arrives once the
+decode has routed experts of its own puts the pool back where it found it at its end, so a long prompt does not
+reset the placement its reply decodes from; a fresh server's calls keep it.
 
 **Image input (V4.1).** The V4.1 seat reads images when it is started with `--mmproj <file>`, llama-server's
 flag, naming the model's vision-encoder GGUF: `mmproj-DeepSeek-V4.1-Flash-BF16.gguf` (a file of another encoder

@@ -1730,11 +1730,24 @@ impl Q38 {
         }
     }
 
-    /// The `residency pass` records of the boundaries the last call made, on
-    /// stderr; nothing without the residency.
+    /// The `call stream` records of the last prompt call — each of its
+    /// picks, then its end — and the `residency pass` records of the
+    /// boundaries since, on stderr; nothing without the residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
         if !self.residency {
             return Ok(());
+        }
+        let (picks, end) = self
+            .s
+            .model_mut()
+            .body_parts("bloomery-serve-qwen38")?
+            .2
+            .take_stream_records();
+        for (ubatch, p) in &picks {
+            record::call_stream(*ubatch, p).eprint();
+        }
+        if let Some(r) = end {
+            record::call_report(&r).eprint();
         }
         for (kind, r) in self
             .s

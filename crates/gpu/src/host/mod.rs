@@ -1179,6 +1179,14 @@ impl<H: HostExperts> HostTier<H> {
         }
     }
 
+    /// Whether the residency machine's rule holds any decode history
+    /// ([`swap::SwapMachine::has_history`]): what a prompt call's end reads
+    /// to keep its placement only when the decode has none of its own.
+    /// False without a machine.
+    pub fn call_history(&self) -> bool {
+        self.swap.as_ref().is_some_and(|m| m.has_history())
+    }
+
     /// End the open call ([`swap::SwapMachine::end_call`]), its placement
     /// `kept` for the passes after it or returned to the call's start; its
     /// report. `None` without a machine.

@@ -1799,7 +1799,8 @@ pub static RESIDENCY_PASS: Kind = Kind {
           file) and the last of them as layer:expert:site; and the experts sent so that this \
           boundary found still on the host and not resident, which the pass it opens serves from \
           the file, and the first of them as layer:expert:site:passes, the passes each has been \
-          served from the file so far.",
+          served from the file so far; and, when a prompt call ended in the pass before the boundary, the \
+          flips it picked (its admits over every layer and unit of the call).",
     parts: &[
         key("pass", Word, ""),
         key("boundary", U64, ""),
@@ -1823,6 +1824,7 @@ pub static RESIDENCY_PASS: Kind = Kind {
         opt("unresident_last", Csv, ""),
         opt("faulting", U64, ""),
         opt("faulting_first", Csv, ""),
+        opt("picked", U64, ""),
     ],
 };
 
@@ -2911,6 +2913,8 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &PLACE_UNSET,
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
+    &CALL_STREAM,
+    &CALL_STREAM_END,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &SLOTS_ROUND,
@@ -3313,7 +3317,7 @@ pub fn residency_pass(r: &PassReport) -> Record {
 /// A residency boundary's record, ending a pass of `kind`.
 #[cfg(feature = "gpu")]
 pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
-    Record::new(&RESIDENCY_PASS)
+    let rec = Record::new(&RESIDENCY_PASS)
         .w("pass", kind.word())
         .u("boundary", r.boundary)
         .u("kept", r.kept)
@@ -3335,7 +3339,11 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("unresident", r.unresident.count())
         .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
         .u("faulting", r.faulting.count())
-        .csv("faulting_first", r.faulting.first().map(|f| f.mark()))
+        .csv("faulting_first", r.faulting.first().map(|f| f.mark()));
+    match r.picked {
+        Some(picked) => rec.u("picked", picked),
+        None => rec,
+    }
 }
 
 /// A helper thread's record: `name`, where it asked to run, the cpu it is

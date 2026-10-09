@@ -1238,6 +1238,16 @@ impl SwapRule {
         r
     }
 
+    /// Whether the rule holds any decode history: a count over 0, which only
+    /// a kept row's fold writes ([`SwapRule::end_pass`]; a prompt call's rows
+    /// are not counted, and its picks move no count) and a reset clears. What
+    /// a prompt call's end reads: with history the decode has been routing
+    /// experts of its own, so the call puts the pool back where it found it;
+    /// without one (a fresh server) the call's placement stays for the decode.
+    pub fn has_history(&self) -> bool {
+        self.counts.iter().any(|&c| c > 0.0)
+    }
+
     /// Back to the seed: every layer's card set, its away experts away, no
     /// count, no flip in flight, no observed row, boundary 0.
     pub fn reset(&mut self) {
@@ -2481,6 +2491,23 @@ mod tests {
         assert_eq!(r, fresh(), "a pick moves nothing");
         // A cap of three keeps resident 3 (the tie at 0 goes to the lower id).
         assert_eq!(a, [flip(1, 6, 4, 0), flip(1, 7, 5, 0)]);
+    }
+
+    /// A rule holds history once a kept row's routes are folded into its
+    /// counts, and a reset clears it: what a prompt call's end reads to put
+    /// the pool back for the decode that follows (mutants: the predicate
+    /// always false — every call then keeps its placement; always true — a
+    /// fresh server's call restores, losing its gain).
+    #[test]
+    fn history_is_any_count_and_a_reset_clears_it() {
+        let seed: [&[u32]; 1] = [&[0, 1, 2]];
+        let mut r = rule(params(4, 24, 3.0, 2.0, 0.9), 8, 1, &seed);
+        assert!(!r.has_history(), "a fresh rule holds none");
+        r.observe(0, 0, &[1]).unwrap();
+        r.end_pass(KeptRows::prefix(1)).unwrap();
+        assert!(r.has_history(), "one kept row is history");
+        r.reset();
+        assert!(!r.has_history(), "a reset clears the history");
     }
 
     /// Settled flips move the card set at once and nothing else; a flip

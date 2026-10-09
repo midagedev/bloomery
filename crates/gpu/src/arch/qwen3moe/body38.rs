@@ -3170,8 +3170,14 @@ impl GpuModel<Body38> {
             .and_then(|()| self.feed_marked(tokens, resolved, sink));
         // The call's own error first: an end or a keep refused after a
         // failed call is its echo. A failed call's streaming ends with each
-        // layer back at the set it started with.
-        let ended = self.stream_end(r.is_ok());
+        // layer back at the set it started with. So does a successful one
+        // before a decode history: the decode has been routing experts of
+        // its own, and the call's picks — the prompt's hottest — put the
+        // pool back where they found it rather than leave the decode to
+        // churn back at the flip cap. Without a history (a fresh server) the
+        // call's placement stays, the gain it was run for.
+        let history = self.body(WHAT_P)?.hybrid().call_history();
+        let ended = self.stream_end(r.is_ok() && !history);
         let kept = self.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
         let next = r?;
         ended?;
@@ -3253,6 +3259,9 @@ impl GpuModel<Body38> {
     /// each layer back at the set the call started with; the ends' reports
     /// kept for [`Body38::take_stream_records`] and
     /// [`Body38::take_xstream_records`]. The first error is returned.
+    /// [`Body38::prompt38_with`]'s call passes `kept` false before a decode
+    /// history ([`crate::host::HostTier::call_history`]): the decode's
+    /// experts go back on the card.
     fn stream_end(&mut self, kept: bool) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen4exp prompt streaming")?;
         if !std::mem::take(&mut body.stream.on) {

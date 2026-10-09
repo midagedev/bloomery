@@ -72,6 +72,12 @@
 //!   while the union reads the moved map, so an admitted expert's columns
 //!   run nowhere and the logits part); the short prompt's guard removed (its
 //!   call opens and ends, admitting nothing).
+//! - `history`: a prompt call before a decode history does not keep its
+//!   placement — the decode has been routing experts of its own, so the
+//!   call's end puts every layer back at the live set it started from and
+//!   sends the experts it admitted to the host again — while a fresh
+//!   server's call keeps (the `stream` clause's gain) (mutants: the end
+//!   keeps before a history too; the end always restores).
 //! - `split` (the expert stream, `Body38::set_xstream`'s `split`, its rule
 //!   at the gate's [`SPLIT_COSTS`]: a host column dear enough that the
 //!   balance streams nearly every routed host expert the pick leaves, so the
@@ -650,6 +656,75 @@ mod gate {
         Ok(ok)
     }
 
+    /// Every layer's live ids, ascending, as the machine's ledger holds
+    /// them: a placement to compare across a prompt call.
+    fn live_sets(s: &Session<Body38>) -> Result<Vec<Vec<u32>>, GateError> {
+        let m = s.model();
+        let b = m.body(NAME)?;
+        let machine = b
+            .hybrid()
+            .swap()
+            .ok_or("the load runs no residency machine")?;
+        let mut sets = Vec::new();
+        for l in b.hybrid().slots().layers() {
+            let mut live: Vec<u32> = machine
+                .ledger()
+                .row(l)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|st| match st {
+                    SlotState::Live(e) => Some(*e),
+                    _ => None,
+                })
+                .collect();
+            live.sort_unstable();
+            sets.push(live);
+        }
+        Ok(sets)
+    }
+
+    /// `history`: a prompt call before a decode history does not keep its
+    /// placement: the decode has been routing experts of its own, so the
+    /// call's end puts every layer back at the live set it started from and
+    /// sends the experts it admitted to the host again, while a fresh
+    /// server's call keeps its placement (the `stream` clause's gain). From
+    /// a clear: a 64-id prompt streaming off, eight greedy steps (the
+    /// history), then the corpus prompt as one call under `admit` (mutants:
+    /// the end keeps before a history too — the restore red here; the end
+    /// always restores — the `stream` clause's fresh gain red).
+    fn history_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        let ids = prose_ids("qwen4exp", STREAM_PROMPT)?;
+        let warm = prose_ids("qwen4exp", 64)?;
+        s.clear()?;
+        take_passes(s)?;
+        set_stream(s, XMode::Off)?;
+        let mut next = s.prompt(&warm, Want::Argmax)?.argmax();
+        for _ in 0..8 {
+            next = s.step(next, Want::Argmax)?.argmax();
+        }
+        take_passes(s)?;
+        let before = live_sets(s)?;
+        set_stream(s, XMode::Admit)?;
+        s.prompt(&ids, Want::Argmax)?;
+        let (_, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        take_passes(s)?;
+        set_stream(s, XMode::Off)?;
+        let after = live_sets(s)?;
+        let end = end.ok_or("the prompt opened no call")?;
+        record::call_report(&end).print();
+        let back = before == after;
+        let ok = !end.kept && end.restored > 0 && end.admitted > 0 && back;
+        println!(
+            "history: a call after 8 greedy steps: {} experts admitted, the end kept {} and \
+             restored {}, every layer's live set back where the history left it {back}: {}",
+            end.admitted,
+            end.kept,
+            end.restored,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// The load the slots clauses share: planned for the two slots it serves
     /// ([`PlanInputs::plan_with_slots`]; the gate's own load plans one, and
     /// a pass of several slots on it is refused by name), opened after the
@@ -917,6 +992,7 @@ mod gate {
         );
 
         pass &= stream_clause(&mut s)?;
+        pass &= history_clause(&mut s)?;
         pass &= split_clause(&mut s)?;
         // The gate's load is done: the card holds one load, and the slots
         // clauses bring their own.

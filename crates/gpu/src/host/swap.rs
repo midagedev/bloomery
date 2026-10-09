@@ -1136,6 +1136,10 @@ pub struct PassReport {
     /// The engine's step and pass readbacks before this boundary, as its
     /// caller stamps it ([`BoundaryAt`]); 0 from a driver of the machine.
     pub reads: u64,
+    /// The flips the prompt call that ended in the pass before this boundary
+    /// picked — its admits over every layer and unit of the call — when one
+    /// ended before it.
+    pub picked: Option<usize>,
 }
 
 /// Where a residency boundary runs in the engine's pass order, with the
@@ -1483,6 +1487,9 @@ pub struct SwapMachine {
     call_landed: Vec<CudaEvent>,
     call_read: Vec<CudaEvent>,
     call: Option<Call>,
+    /// The prompt call that ended since the boundary last reported one: the
+    /// flips it picked, for that boundary's pass report.
+    call_picked: Option<usize>,
     picks: Vec<Flip>,
     /// The pick's landing batches' map rows and events ([`LandRows`]).
     land: LandRows,
@@ -1661,6 +1668,7 @@ impl SwapMachine {
             call_landed,
             call_read,
             call: None,
+            call_picked: None,
             picks: Vec::new(),
             land,
             rereads,
@@ -2134,6 +2142,7 @@ impl SwapMachine {
             kept: if b == 0 { 0 } else { self.kept.count() },
             rows: if b == 0 { 0 } else { self.kept.mask() },
             end_us: std::mem::take(&mut self.end_us),
+            picked: self.call_picked.take(),
             ..PassReport::default()
         };
         for f in &landing {
@@ -3107,6 +3116,13 @@ impl SwapMachine {
         self.agree(layer, slots, WHAT)
     }
 
+    /// Whether the rule holds any decode history ([`SwapRule::has_history`]):
+    /// what a caller reads to keep a call's placement only when the decode
+    /// has none of its own.
+    pub fn has_history(&self) -> bool {
+        self.rule.has_history()
+    }
+
     /// End the open call on the engine stream `stream` with the host map
     /// `slots`: every landing slot's landed event waited for and the slot
     /// `Live`; then, when `kept`, the placement stays for the passes after
@@ -3117,9 +3133,10 @@ impl SwapMachine {
     /// again. An expert the end sends back that the host does not serve from
     /// resident pages once its pages are read in again goes all the same
     /// (`send_on`), counted ([`CallReport::unresident`]) and followed from
-    /// the next boundary on ([`PassReport::faulting`]). Refused by name, the machine
-    /// unchanged: no call open. Any error after the first change breaks the
-    /// machine.
+    /// the next boundary on ([`PassReport::faulting`]). The flips the call
+    /// picked wait here for the boundary after it ([`PassReport::picked`]).
+    /// Refused by name, the machine unchanged: no call open. Any error after
+    /// the first change breaks the machine.
     pub fn end_call(
         &mut self,
         stream: &CudaStream,
@@ -3134,6 +3151,7 @@ impl SwapMachine {
         };
         let r = self.close_call(stream, slots, &call, kept);
         let restored = self.after_change(r, || "the end of a call".to_string())?;
+        self.call_picked = Some(call.report.admitted);
         self.shared.flush.store(call.flush_was, Ordering::Release);
         Ok(CallReport {
             kept,
