@@ -1,8 +1,11 @@
 //! What a GLM-5.3-Flash whole-model gate reads of the fixture tier beyond `bloomery_gpu_gates::tier`:
 //! the model file (one owner: `ref_model_path`, and in the fixture tier a whole fixture), the card
 //! budget the plan runs under, the file's layer kinds and counts ([`Shape`]), the ids a gate reads
-//! from the oracle sets (which a fixture has no set for), and the open of an oracle set itself,
-//! which the fixture tier refuses by name. The card the gate plan is made on is `crate::gate_card`'s.
+//! from the oracle sets (which a fixture has no set for), the open of an oracle set itself, which
+//! the fixture tier refuses by name, and the open of the fixture's own sets of ik's
+//! ([`fx_set`], [`fx_mtp_set`]) with the error bands their clauses hold ([`SiteTerm`]: one
+//! projection of the file, counted by what both engines do to its activation). The card the gate
+//! plan is made on is `crate::gate_card`'s.
 //!
 //! Every number here is read from the header (`Hparams`, the tensors' types) or from a plan, and
 //! a gate prints each derived value beside the literal its clause was written against
@@ -16,6 +19,7 @@
 
 use std::sync::OnceLock;
 
+use bloomery_gpu_gates::act_rule::{Arm, SiteRel, site_rel};
 use bloomery_gpu_gates::tier::{self, Tier};
 use bloomery_gpu_gates::{GateError, RefManifest, data_dir, prose_ids, ref_model_path};
 use gguf::{GgmlType, Split};
@@ -23,9 +27,11 @@ use model::arch::glm5next::hparams::{Hparams, Kind};
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{PlanInputs, dense_positions};
 use model::placement::PlanLevers;
+use refset::arch::glm5next::fixture as fx;
 use refset::arch::glm5next::{BATCH, D1K, IK, MODEL, MTP, MTP_SET};
 use refset::family::Family;
 use refset::mtpref::MtpSet;
+use runtime::layer::{FfnKind, MixerKind};
 
 /// The tokens of the batch set (`REF_TOKENS` of `tools/ref/models/glm5next.sh`): the ids the
 /// fixture tier runs where the real tier reads them from ik's set.
@@ -436,4 +442,236 @@ pub fn mtp_prompt() -> Result<Vec<u32>, GateError> {
 /// A `BLOOMERY_TIER` that is neither tier.
 pub fn skew() -> Result<bool, GateError> {
     tier::premise_once("flips landed and an expert admitted (the file's routing skew)")
+}
+
+// ------------------------------------------------- the fixture's sets of ik's
+
+/// A set of ik's dumped on the fixture, opened for the fixture-oracle clause `clause`: through
+/// `tier::fixture_set` (the family's check: the fixture file it was dumped from, its generation,
+/// the ik build, the trailer), then through the family's reader. A set that is missing or that the
+/// check refuses is the error here, by name.
+///
+/// # Errors
+/// The tier's refusal of the set, or the reader's.
+pub fn fx_set(clause: &str, family: &Family, set: &str) -> Result<RefManifest, GateError> {
+    let path = tier::fixture_set(clause, family, set)?;
+    Ok(RefManifest::open(&path, family)?)
+}
+
+/// The fixture's MTP draft set of ik's, opened for the fixture-oracle clause `clause` as
+/// [`fx_set`] opens a node set.
+///
+/// # Errors
+/// The tier's refusal of the set, or the reader's.
+pub fn fx_mtp_set(clause: &str) -> Result<MtpSet, GateError> {
+    let path = tier::fixture_set(clause, &fx::MTP, fx::MTP_SET)?;
+    Ok(MtpSet::open(&path, &fx::MTP)?)
+}
+
+/// The trunk's latent-attention layers of the file `split`, from its header.
+///
+/// # Errors
+/// A header the reader refuses.
+pub fn latent_layers(split: &Split) -> Result<Vec<usize>, GateError> {
+    let hp = Hparams::read(split)?;
+    Ok(Shape::read(&hp, split)?.latent)
+}
+
+/// The model's expert count, from the header read at [`init_file`].
+///
+/// # Panics
+/// Before [`init_file`].
+#[must_use]
+pub fn n_expert() -> usize {
+    facts().hp.n_expert
+}
+
+// ------------------------------------------------- the fixture's error bands
+
+/// The log-slope of `silu` at its worst, squared: a gate projection's relative error reaches
+/// `silu(g)` times at most 1.28 of it (the e2e gate's `gemm_bands`: 1.28² = 1.64).
+pub const SILU_SLOPE_SQ: f64 = 1.64;
+
+/// A sigmoid's slope is at most 1/4 of its value's scale, squared: the weight of a projection whose
+/// output goes through one (KDA's β, the output gate's pair).
+pub const SIGMOID_SLOPE_SQ: f64 = 1.0 / 16.0;
+
+/// One projection of the file in an error band: the weight `name`, the arm that reads its
+/// activation, the squared slope `weight` its error reaches the band through, and how both engines
+/// round that activation ([`site_rel`], at the worst crest of each side's block).
+#[derive(Clone, Debug)]
+pub struct SiteTerm {
+    pub name: String,
+    pub ty: GgmlType,
+    pub arm: Arm,
+    pub weight: f64,
+    pub rel: SiteRel,
+}
+
+impl SiteTerm {
+    /// The variance the site adds to the band: `weight · (√(ik² + ours²))²`.
+    #[must_use]
+    pub fn var(&self) -> f64 {
+        self.weight * self.rel.joint().powi(2)
+    }
+
+    /// The site as a band's terms print it.
+    #[must_use]
+    pub fn text(&self) -> String {
+        format!(
+            "{} {:?}/{:?} {:.4}x{:.3e}",
+            self.name,
+            self.ty,
+            self.arm,
+            self.weight,
+            self.rel.joint()
+        )
+    }
+}
+
+/// The site of tensor `name`, its type read from the file.
+///
+/// # Errors
+/// A tensor the file lacks, or a type no activation rule covers on `arm`
+/// (`act_rule::site_rel`), each by name: a band is never made from a site it cannot count.
+pub fn site(split: &Split, name: &str, arm: Arm, weight: f64) -> Result<SiteTerm, GateError> {
+    let (_, info) = split
+        .find(name)
+        .ok_or_else(|| format!("fixture band: {name} is not in the file"))?;
+    let rel = site_rel(info.ty, arm).ok_or_else(|| {
+        format!(
+            "fixture band: {name} is {:?} on arm {arm:?}, which act_rule has no rule for",
+            info.ty
+        )
+    })?;
+    Ok(SiteTerm {
+        name: name.to_string(),
+        ty: info.ty,
+        arm,
+        weight,
+        rel,
+    })
+}
+
+/// The variance of independent sites added: each site's error reaches the band as its own.
+#[must_use]
+pub fn var(terms: &[SiteTerm]) -> f64 {
+    terms.iter().map(SiteTerm::var).sum()
+}
+
+/// The sites as a band's terms print them.
+#[must_use]
+pub fn terms_text(terms: &[SiteTerm]) -> String {
+    terms
+        .iter()
+        .map(SiteTerm::text)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The sites of layer `l`'s mixer that carry an activation's rounding to the layer's output, each
+/// with the squared slope it reaches the stream through. `dense` is the arm of the dense
+/// projections (`Arm::Gemv` below [`crate::glm5next_tier`]'s batch columns, `Arm::Gemm` above).
+/// A KDA layer: the q, k and v projections (1 each: outputs of one input through different
+/// weights' rows are independent, so their variances add), β through σ (1/16), the decay pair (1
+/// each: the decay does not amplify), the output gate's pair through σ (1/16 each) and the output
+/// projection (1). A latent layer: the joined projection of the normed input (1: the keys' and the
+/// query's error reach the scores as one), the query's up projection (1), the absorbed key and
+/// value projections (1 each) and the output projection (1).
+///
+/// # Errors
+/// As [`site`], and a GQA mixer, which no GLM-5.3 layer has.
+pub fn mixer_terms(
+    split: &Split,
+    l: usize,
+    mixer: MixerKind,
+    dense: Arm,
+) -> Result<Vec<SiteTerm>, GateError> {
+    let at = |name: String, w: f64| site(split, &name, dense, w);
+    match mixer {
+        MixerKind::DeltaRule => Ok(vec![
+            at(names::attn_q(l), 1.0)?,
+            at(names::attn_k(l), 1.0)?,
+            at(names::attn_v(l), 1.0)?,
+            at(names::ssm_beta(l), SIGMOID_SLOPE_SQ)?,
+            at(names::ssm_f_a(l), 1.0)?,
+            at(names::ssm_f_b(l), 1.0)?,
+            at(names::ssm_g_a(l), SIGMOID_SLOPE_SQ)?,
+            at(names::ssm_g_b(l), SIGMOID_SLOPE_SQ)?,
+            at(names::attn_output(l), 1.0)?,
+        ]),
+        MixerKind::Latent => Ok(vec![
+            at(names::attn_kv_a_mqa(l), 1.0)?,
+            at(names::attn_q_b(l), 1.0)?,
+            at(names::attn_k_b(l), 1.0)?,
+            at(names::attn_v_b(l), 1.0)?,
+            at(names::attn_output(l), 1.0)?,
+        ]),
+        MixerKind::Gqa => Err(format!("layer {l}: a GQA mixer").into()),
+    }
+}
+
+/// A feed-forward block's sites: the block's own (a dense block's projections, a routed block's
+/// experts) and a routed block's shared expert, which adds to the block's output apart from them.
+#[derive(Clone, Debug)]
+pub struct BlockTerms {
+    pub main: Vec<SiteTerm>,
+    pub shared: Vec<SiteTerm>,
+}
+
+impl BlockTerms {
+    /// The block's variance: the larger of its two parts. The routed sum and the shared expert's
+    /// output are independent on random weights, so the relative error of their sum is their
+    /// energy-weighted mean, at most the larger one.
+    #[must_use]
+    pub fn var(&self) -> f64 {
+        var(&self.main).max(var(&self.shared))
+    }
+}
+
+/// Layer `l`'s feed-forward block's sites: a SwiGLU's gate through `silu` ([`SILU_SLOPE_SQ`]), up
+/// (1) and down (1) — a dense block's on `dense`, a routed block's experts on `Arm::Expert` and
+/// its shared expert on `dense`. The router reads f32 on both sides: its input rounds nowhere.
+///
+/// # Errors
+/// As [`site`].
+pub fn block_terms(
+    split: &Split,
+    l: usize,
+    ffn: FfnKind,
+    dense: Arm,
+) -> Result<BlockTerms, GateError> {
+    let swiglu =
+        |gate: String, up: String, down: String, arm: Arm| -> Result<Vec<SiteTerm>, GateError> {
+            Ok(vec![
+                site(split, &gate, arm, SILU_SLOPE_SQ)?,
+                site(split, &up, arm, 1.0)?,
+                site(split, &down, arm, 1.0)?,
+            ])
+        };
+    match ffn {
+        FfnKind::Dense => Ok(BlockTerms {
+            main: swiglu(
+                names::ffn_gate(l),
+                names::ffn_up(l),
+                names::ffn_down(l),
+                dense,
+            )?,
+            shared: Vec::new(),
+        }),
+        FfnKind::Moe => Ok(BlockTerms {
+            main: swiglu(
+                names::ffn_gate_exps(l),
+                names::ffn_up_exps(l),
+                names::ffn_down_exps(l),
+                Arm::Expert,
+            )?,
+            shared: swiglu(
+                names::ffn_gate_shexp(l),
+                names::ffn_up_shexp(l),
+                names::ffn_down_shexp(l),
+                dense,
+            )?,
+        }),
+    }
 }
