@@ -223,4 +223,11 @@ impl HostExperts for HostRun {
         view.experts_union_into(file.source(), x, lists, out, scratch)?;
         Ok(())
     }
+
+    fn release_union(&mut self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
+        match &self.tier {
+            Some(tier) if tier.covers(layer) => tier.release_union(layer, lists),
+            _ => Ok(()),
+        }
+    }
 }

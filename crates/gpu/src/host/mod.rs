@@ -230,6 +230,18 @@ pub trait HostExperts {
             "a batched host path: this architecture's host tier serves one column a call",
         ))
     }
+
+    /// A prompt call's union over `lists` ([`HostExperts::experts_union_into`]
+    /// from the batch port) has consumed what it read of layer `layer`: the
+    /// host lets go of the pages those reads brought in that it does not
+    /// keep (the NVMe tier's ids, [`nvtier::NvTier::release_union`]). The
+    /// step port's union does not call it: a decode step's ids are read
+    /// again by the next step. Nothing by default: a host whose reads leave
+    /// nothing behind.
+    fn release_union(&mut self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
+        let _ = (layer, lists);
+        Ok(())
+    }
 }
 
 /// What the host side has done since load. Counted by the decode thread

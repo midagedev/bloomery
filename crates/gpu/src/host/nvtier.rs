@@ -12,12 +12,15 @@
 //! evicted slot's windows, which frees an anonymous range's pages — that is
 //! why the arena is anonymous and not the page cache, whose warm set nothing
 //! else can flush. The model file's mapping is its readers': a read of the
-//! ids the arena serves through it (a union call, a lane's copy) faults
-//! their pages in from the drive, and once the reader has consumed them the
-//! tier drops them from the mapping and the page cache — a union's whole
-//! layer ([`NvTier::drop_layer`]) but the ids a lane has open, a lane's own
-//! id ([`NvTier::end_read`]) — so nothing a read brought in stays past it.
-//! Which pages go is the books' ([`drop_runs`]), never `mincore`'s, and no
+//! ids the arena serves through it (a prompt call's union, a lane's copy)
+//! faults their pages in from the drive, and once the reader has consumed
+//! them the tier drops them from the mapping and the page cache — a prompt
+//! union's whole layer ([`NvTier::release_union`]) but the ids a lane has
+//! open, a lane's own id ([`NvTier::end_read`]) — so nothing a prompt or a
+//! lane brought in stays past it. A decode step's union of several columns
+//! (the step port) keeps what it read: its ids are the decode's hot set,
+//! which the next step reads again, and a drop would send each step back to
+//! the drive for them. Which pages go is the books' ([`drop_runs`]), never `mincore`'s, and no
 //! page that holds a byte of the plan's host segment, of an id a lane has
 //! open, or of the tensors beside a stack is named. The books
 //! are one atomic hint an id and a per-slot state word a pick reads without
@@ -888,6 +891,21 @@ impl NvTier {
         self.drop_marked(layer, arena, &arena.layer_marks(), WHAT)
     }
 
+    /// A prompt call's union over `lists` has read layer `layer`'s experts
+    /// through the model file's mapping and consumed them: when it listed an
+    /// id the arena serves, the whole layer's go ([`NvTier::drop_layer`]);
+    /// one that listed only the host segment's ids read none of them. The
+    /// batch port's alone ([`super::HostExperts::release_union`]).
+    pub fn release_union(&self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
+        if !lists
+            .iter()
+            .any(|l| l.iter().any(|&(id, _)| self.serves(layer, id)))
+        {
+            return Ok(());
+        }
+        self.drop_layer(layer)
+    }
+
     /// The pages [`drop_runs`] names over each stack row of `layer` under
     /// `marks`, out of the mapping and the page cache, and the drop counted;
     /// nothing when no id is read.
@@ -1236,22 +1254,6 @@ impl TierSlots for NvTier {
         let r = arena.parts[id as usize][part];
         let (at, len) = window_span(arena.slot_off(slot), &arena.windows, part, r);
         Some(&self.map.bytes()[at..at + len])
-    }
-
-    /// A call that listed an id the arena serves read the mapping's pages of
-    /// the layer: the whole layer's go ([`NvTier::drop_layer`]). One that
-    /// listed only the host segment's ids read none of them.
-    fn release(&self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), TierError> {
-        if !lists
-            .iter()
-            .any(|l| l.iter().any(|&(id, _)| self.serves(layer, id)))
-        {
-            return Ok(());
-        }
-        self.drop_layer(layer).map_err(|e| TierError::Release {
-            layer,
-            source: Box::new(e),
-        })
     }
 }
 

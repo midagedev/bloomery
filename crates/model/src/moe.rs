@@ -1612,14 +1612,6 @@ pub enum TierError {
         id: u32,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// The drop of the pages a union call read through the file mapping
-    /// failed ([`TierSlots::release`]): the tier's own error, naming the
-    /// range and the errno.
-    #[error("layer {layer}: dropping the pages the union read: {source}")]
-    Release {
-        layer: usize,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 /// The RAM arena a host layer's routed experts read from beside the file
@@ -1636,15 +1628,6 @@ pub trait TierSlots: Send + Sync {
     /// Layer `layer`, expert `id`, part `part`'s bytes as the tier holds
     /// them; `None` when its slot is unfilled.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
-    /// A union call over `lists` has read `layer`'s experts through the file
-    /// mapping and consumed them ([`HostLayer::experts_union_into`]): when
-    /// it listed an id the tier serves (one outside the plan's host
-    /// segment), drop from the mapping and the page cache the layer's pages
-    /// of every id the tier serves — what the call read and what the kernel
-    /// read around it — but the ones another reader still reads, never a
-    /// page that holds a byte of the host segment's experts or of the
-    /// tensors beside a stack.
-    fn release(&self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), TierError>;
 }
 
 /// One layer's tier handle: the layer's own index (the arena's books are
@@ -1904,13 +1887,7 @@ impl HostLayer {
             lists,
             out,
             scratch,
-        )?;
-        // The call has consumed what it read: the tier's ids leave the
-        // mapping and the page cache.
-        if let Some(tier) = &self.tier {
-            tier.slots.release(tier.layer, lists)?;
-        }
-        Ok(())
+        )
     }
 }
 
@@ -2456,10 +2433,6 @@ mod tests {
 
         fn slot(&self, _layer: usize, id: u32, part: usize) -> Option<&[u8]> {
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
-        }
-
-        fn release(&self, _layer: usize, _lists: &[&[(u32, f32)]]) -> Result<(), super::TierError> {
-            Ok(())
         }
     }
 
