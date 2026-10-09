@@ -30,6 +30,13 @@
 //! An engine error is fatal: every request in the failed call gets the error,
 //! every waiting one is refused, and the server ends ([`crate::api::End`]). A
 //! panic on this thread ends the server the same way, by name.
+//!
+//! An orderly stop ([`Shared::begin_stop`]) is read before each action,
+//! start, planned prompt call and decode round of a round (at each round's
+//! top when the slots take turns): the thread ends without calling the
+//! engine again, and every request it holds or the board queues is answered
+//! with the stop's cause before the loop's end, which the stop waits for
+//! ([`Shared::wait_stop`]).
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -152,12 +159,19 @@ pub(crate) struct Shared {
     /// The engine thread left its loop ([`worker::serve`], on every path that
     /// ends its run: the stop's [`Worker::halt`], an engine failure, a caught
     /// panic), set before the engine it holds drops: what the orderly stop
-    /// waits for ([`crate::api::exit_shutdown`]), not the thread's end, which
+    /// waits for first ([`Shared::wait_stop`]), not the thread's end, which
     /// the engine's Drop can hold past the stop's bound while the process
     /// exit reclaims the engine's memory anyway.
     loop_ended: Mutex<bool>,
     /// Wakes [`Shared::wait_loop_end`].
     loop_ended_c: Condvar,
+    /// The answers in flight: requests a connection dispatched whose answer
+    /// is not yet written ([`Shared::answering`]). What the orderly stop
+    /// waits for once the loop left, so the answers the halt ended reach
+    /// their clients before the process exits.
+    answers: Mutex<usize>,
+    /// Wakes [`Shared::wait_stop`] when the last answer in flight is written.
+    answers_c: Condvar,
     /// Each slot's turn, for an engine whose slots take turns; `None` for any
     /// other.
     pub turns: Mutex<Option<Vec<Turn>>>,
@@ -181,6 +195,8 @@ impl Shared {
             stop: AtomicBool::new(false),
             loop_ended: Mutex::new(false),
             loop_ended_c: Condvar::new(),
+            answers: Mutex::new(0),
+            answers_c: Condvar::new(),
             turns: Mutex::new(None),
             end,
             sampler,
@@ -218,6 +234,42 @@ impl Shared {
         *left
     }
 
+    /// One answer in flight, from a request's dispatch until the guard drops:
+    /// taken around a connection's whole answer, so it drops once the answer
+    /// is written, its client gone or its thread panicked.
+    pub(crate) fn answering(&self) -> Answering<'_> {
+        *relock(&self.answers) += 1;
+        Answering(self)
+    }
+
+    /// The answers in flight now.
+    #[cfg(test)]
+    pub(crate) fn answers_in_flight(&self) -> usize {
+        *relock(&self.answers)
+    }
+
+    /// The orderly stop's wait, inside one `bound`: the engine thread leaves
+    /// its loop ([`Shared::wait_loop_end`]) — the halt closed every request's
+    /// channel by then ([`Worker::halt`]) — and then every answer in flight
+    /// is written, the halted requests' last events among them.
+    pub(crate) fn wait_stop(&self, bound: Duration) -> Waited {
+        let until = Instant::now() + bound;
+        if !self.wait_loop_end(bound) {
+            return Waited::Loop;
+        }
+        let n = relock(&self.answers);
+        let (n, _) = self
+            .answers_c
+            .wait_timeout_while(n, until.saturating_duration_since(Instant::now()), |n| {
+                *n > 0
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        match *n {
+            0 => Waited::Done,
+            n => Waited::Answers(n),
+        }
+    }
+
     /// Begins the server's orderly stop, the one owner `POST /shutdown` and
     /// the first signal go through: from here no request that needs the
     /// engine is admitted (it gets a 503 naming `cause`), and the engine
@@ -240,6 +292,33 @@ impl Shared {
         self.work.notify_one();
         true
     }
+}
+
+/// An answer in flight ([`Shared::answering`]); its drop counts it written.
+pub(crate) struct Answering<'a>(&'a Shared);
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        let mut n = relock(&self.0.answers);
+        *n -= 1;
+        if *n == 0 {
+            self.0.answers_c.notify_all();
+        }
+    }
+}
+
+/// How the orderly stop's wait ended ([`Shared::wait_stop`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Waited {
+    /// The engine thread left its loop and every answer in flight was
+    /// written.
+    Done,
+    /// The bound ran out with the engine thread still in its loop, inside
+    /// the work the stop arrived in, the requests it holds not yet answered.
+    Loop,
+    /// The loop was left, but this many answers were still being written
+    /// when the bound ran out.
+    Answers(usize),
 }
 
 /// The engine thread failed; nothing more runs.
@@ -362,8 +441,9 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
             w.run();
         }
     }));
-    // The stop's wait ends here: past this point the thread only books a
-    // caught panic and drops the engine it holds, which no stop waits for.
+    // The stop's wait on the loop ends here, every request the halt held
+    // already answered: past this point the thread only books a caught panic
+    // and drops the engine it holds, which no stop waits for.
     sh.end_loop();
     if let Err(p) = ran {
         let what = p
@@ -406,6 +486,12 @@ fn tick_of(sh: &Shared, slot: usize) -> impl FnMut(&Timings) + '_ {
 }
 
 impl Worker {
+    /// The rounds: the actions, the starts, one call of each planned prompt
+    /// and one decode round. The stop is read before each of the round's
+    /// actions, starts and planned calls and before its decode round, so the
+    /// thread leaves within the one the stop arrives in (a start runs its
+    /// prompt in one go unless it is planned); what the round had not run
+    /// yet ends with the halt.
     fn run(&mut self) {
         loop {
             let (actions, admitted) = {
@@ -424,21 +510,27 @@ impl Worker {
                     b = self.sh.work.wait(b).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            if self.sh.stopped() {
-                return self.halt();
-            }
             for (what, a) in actions {
+                if self.sh.stopped() {
+                    return self.halt();
+                }
                 if self.act(what, a, false).is_err() {
                     return;
                 }
             }
             for (slot, held, sub) in admitted {
+                if self.sh.stopped() {
+                    return self.halt();
+                }
                 if self.start(slot, &held, sub).is_err() {
                     return;
                 }
             }
             if self.prompts().is_err() {
                 return;
+            }
+            if self.sh.stopped() {
+                return self.halt();
             }
             if self.step().is_err() {
                 return;
@@ -467,21 +559,34 @@ impl Worker {
         Dead
     }
 
-    /// The engine thread's orderly end, what [`Shared::begin_stop`] ordered:
-    /// every queued request's and action's channel closes, so its HTTP thread
-    /// answers with the stop's cause ([`crate::api::engine_gone`]), and the
-    /// thread ends without touching the engine again. A request the worker
-    /// already took keeps its channel in the worker (`active`, `prompting`,
-    /// and `pending` under turns), which closes it when the worker drops at
-    /// the end of [`serve`]: after [`Shared::end_loop`] and after the engine's
-    /// Drop, so the process exit the stop's wait ends in can come first.
+    /// The engine thread's orderly end, what [`Shared::begin_stop`] ordered,
+    /// without touching the engine again. Every request and action the
+    /// thread holds or the board queues has its channel closed here, before
+    /// the loop's end ([`Shared::end_loop`]) the stop waits for: the queued
+    /// ones, the running ones, those between their prompt's calls, and under
+    /// turns the parked, the pending and the deferred actions. Each HTTP
+    /// thread then answers with the stop's cause ([`crate::api::engine_gone`]),
+    /// the queued requests' answer: a stream already open ends with its error
+    /// event, any other request is the 503. The requests that ran have their
+    /// counters booked, as an ended request's are; their slots stay as they
+    /// stood, so `/health` and `/slots` show the server as the stop found it.
     /// Nothing failed: no engine error is recorded, and no end is sent — the
     /// stop's sender already did.
-    fn halt(&self) {
+    fn halt(&mut self) {
         let cause = relock(&self.sh.stopping)
             .clone()
             .unwrap_or_else(|| "the server is stopping".to_owned());
         drop(relock(&self.sh.board).kill(&cause));
+        let mut held = std::mem::take(&mut self.active);
+        held.extend(std::mem::take(&mut self.prompting).into_iter().map(|p| p.a));
+        for a in &held {
+            self.book(a.job.timings());
+        }
+        drop(held);
+        if let Some(t) = &mut self.turns {
+            t.pending.clear();
+            t.deferred.clear();
+        }
     }
 
     /// `off`: the action drops its slot's state while the engine holds
@@ -620,10 +725,14 @@ impl Worker {
     /// ([`Worker::step`]), so a prompt's consecutive calls have a round of
     /// the busy slots between them. A prompt whose last call ran joins the
     /// running requests; a request whose client left ends, its slot freed;
-    /// an engine error is fatal, as at a start.
+    /// an engine error is fatal, as at a start. A stop read before a call
+    /// leaves the calls not yet run to the halt ([`Worker::run`]).
     fn prompts(&mut self) -> Result<(), Dead> {
         let mut k = 0;
         while k < self.prompting.len() {
+            if self.sh.stopped() {
+                return Ok(());
+            }
             let Prompting { a, plan } = &mut self.prompting[k];
             let r = match self.slot.select(a.slot) {
                 Ok(()) => a
@@ -789,30 +898,34 @@ impl Worker {
         self.end(f)
     }
 
+    /// Books an ending request's counters, `/metrics`' totals, from its
+    /// timings `t`; touches no engine and no slot.
+    fn book(&self, t: &Timings) {
+        let mut s = relock(&self.sh.stats);
+        let (pn, dn) = (t.prompt_n as u64, t.predicted_n as u64);
+        s.n_prompt_total += pn;
+        s.n_prompt_cached_total += t.cache_n as u64;
+        s.n_tokens_max = s.n_tokens_max.max(t.n_past as u64);
+        s.t_prompt_ms_total += t.prompt_ms;
+        s.t_cache_ms_total += t.cache_ms;
+        s.n_predicted_total += dn;
+        s.t_predicted_ms_total += t.predicted_ms;
+        // The prompt's engine call, whose logits give the first generated
+        // token; the steps were booked as they ran.
+        if pn > 0 {
+            s.n_decode_total += 1;
+            s.n_busy_slots_total += 1;
+        }
+        s.n_draft_total += t.draft_n as u64;
+        s.n_draft_accepted_total += t.draft_n_accepted as u64;
+        s.n_draft_passes_total += t.draft_passes as u64;
+    }
+
     /// Books a request's counters and view, releases its slot, and sends its
     /// last message.
     fn end_request(&mut self, a: Active, r: Result<Outcome, GenError>) {
         let t = a.job.timings();
-        {
-            let mut s = relock(&self.sh.stats);
-            let (pn, dn) = (t.prompt_n as u64, t.predicted_n as u64);
-            s.n_prompt_total += pn;
-            s.n_prompt_cached_total += t.cache_n as u64;
-            s.n_tokens_max = s.n_tokens_max.max(t.n_past as u64);
-            s.t_prompt_ms_total += t.prompt_ms;
-            s.t_cache_ms_total += t.cache_ms;
-            s.n_predicted_total += dn;
-            s.t_predicted_ms_total += t.predicted_ms;
-            // The prompt's engine call, whose logits give the first generated
-            // token; the steps were booked as they ran.
-            if pn > 0 {
-                s.n_decode_total += 1;
-                s.n_busy_slots_total += 1;
-            }
-            s.n_draft_total += t.draft_n as u64;
-            s.n_draft_accepted_total += t.draft_n_accepted as u64;
-            s.n_draft_passes_total += t.draft_passes as u64;
-        }
+        self.book(t);
         {
             let mut b = relock(&self.sh.board);
             let v = b.view_mut(a.slot);
