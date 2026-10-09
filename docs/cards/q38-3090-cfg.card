@@ -1,0 +1,104 @@
+# M5 of the discovery search's refutation (specs/leader/discover/refute-report.md section 4, synth-prefill Finding 0): the
+# prompt path the README's 3090 rows are measured on (--place gate, residency off, no stream, no draft) against what a lone-3090
+# server runs (plan a: residency mid-p0-s1, the expert stream split, the MTP draft). Same binary, same lease, lever arms.
+#
+# Why now: the discovery search prices the prompt ideas (#5, #6, #25-#29, #31) on the server column, the README's 3090 row is
+# measured on the plain path, and the 3090's own des3 is unvalidated: one lease sets both cells.
+#
+# Which arm is closest to the lone-3090 server. The depth runner refuses a placement whose card is not the timing card
+# (arm-place.sh place_check): place=a with the 3090 as the timing card is refused by name, so the server's own placement
+# cannot run here. At gate the Qwen3.8 defaults are unset-only: xstream38.rs:42-45 turns the stream off at Stage38::Other when
+# BLOOMERY_XSTREAM is UNSET; a SET split goes to Body38::set_xstream (body38.rs:1840), which refuses only three cases: no
+# residency machine, a load with an expert tier card (the gate plan has none), and a card with no room for the ring (free bytes
+# less KEEP_FREE 512 MiB under 8 slots a half, xstream.rs:336-340,660-676). So the set arm runs at gate with the lever pair.
+#   arm 1  unset            the README's protocol (G): residency off, xstream off, no draft
+#   arm 2  mid-p0-s1 + split  the server's prompt path less the draft: the card set is gate's 4,269 experts
+#   arm 3  arm 2 + BLOOMERY_DRAFT=mtp   the server's card set: the draft's card bytes (933 experts, the evaluator's) leave the
+#          plan, 3,336 card experts, and spec.prompt (generate_qwen3moe.rs:2499) runs the draft's prompt call inside `time
+#          prompt`, as the server's prompt does. The gate plan is plan_on(RTX_3090), the same usable - KV - context - scratch -
+#          margin arithmetic as plan a's card (placement/workstation.rs:466-471), so the arm differs from a lone-3090 server
+#          by the placement word, the `place unset` record, and the context (4352 here, the server's own there; M4 prints the
+#          server's `plan` record to compare card_experts). MTP_WIDTH stays unset (cost), as in the server.
+# Arm 3 is read beside, not judged; the card's term is arm 2 against arm 1.
+# No restore inside the timed prompt. A prompt call restores its admits at its end only when the swap rule holds decode history
+# (body38.rs:3179: stream_end(r.is_ok() && !history); has_history is any count over 0, runtime/src/swaprule.rs:1241-1250). Every
+# counted arm starts after Session::clear (app/src/lib.rs:422-444: the residency machine goes back to its seed, SwapMachine::
+# commit's rule.reset(), host/swap.rs:2764), with the PRIME run of BLOOMERY_WARM_ROWS=1 and the P 512 arm before it each their
+# own arm of the load, so the P 4096 call of arm 2 and 3 is a call with no history: its placement stays, `time prompt` carries
+# no restore, and the evaluator's restore_ms 0 holds. A server's second turn does restore (M4 reads it): that is why the
+# server's measured pp at a second turn is under this bench column.
+#
+# Prediction [derived]. Evaluator q38_step.py --machine box-3090 (the lead's tool, run on the Mac), prompt a layer = card front,
+# down, up, back + max(card chain, host chain), 48 layers:
+#   arm 1  (--config gate)              P 512: 439 tok/s, a layer 24.20 ms = 3.71 + max(0.12, 20.49); P 4096: 521 tok/s, a layer
+#          163.13 ms = 31.73 + max(0.98, 131.40). des3 445 / 525, the bytes lens ~475 at 4096. The README row's measured 486 at
+#          pp512 (0.2.1, plain path, 3,428 card experts) is 1.18x the evaluator's 413 for that row, the evaluator's one 3090
+#          backtest row: the evaluator may under-predict the plain path by ~15 %, so arm 1 is taken as 439..520 at P 512 and
+#          475..615 at P 4096.
+#   arm 2  (--config server --set mtp=0) P 512: 721 tok/s, a layer 14.71 ms = 3.71 + max(7.86, 11.00); P 4096: 1,236 tok/s, a
+#          layer 68.35 ms = 31.73 + max(23.75, 36.62). The ring is not binding above ~60 slots a half (ring_half 97 and 60 both
+#          give 1,236; 30 gives 1,089), and the refutation's band for the server's prompt is 678..766 and 1,192..1,322.
+#   arm 3  (--config server)            P 512: 678, P 4096: 1,192 (3,336 card experts).
+#   effect P 4096, arm 2 / arm 1: 1,192 / 615 - 1 = +94 % to 1,322 / 475 - 1 = +178 %, the model's 1,236 / 521 - 1 = +137 %.
+#   effect P 512 (read beside): 678 / 520 - 1 = +30 % to 766 / 439 - 1 = +74 %, the model's 721 / 439 - 1 = +64 %.
+# des3 is not validated on the 3090 (its one backtest row, B10, is the README's pp512 at 0.85), so the band is wide on purpose.
+# Functional pre-check, no lease, before the sitting (the box is shared, the 3090's gate lock; BLOOMERY_STEP_STATS=1 prints the
+# stream's `stat prompt` lines): the set split must load at gate and its lane must read at least 18.5 GB/s, because the
+# runner's probe tag PROBE_QUIET_LO = 18.5 was pinned from A6000 loads only (depth-qwen3moe.sh:458-464) and a 3090 lane under
+# it tags every split row [probe-off] and leaves the untagged means n/a. For arm 2 and arm 3 each:
+#   BLOOMERY_MODEL=qwen4exp tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin
+#   generate_qwen3moe && env BLOOMERY_RESIDENCY=mid-p0-s1 BLOOMERY_XSTREAM=split BLOOMERY_STEP_STATS=1 [BLOOMERY_DRAFT=mtp] bash
+#   tools/gpu-gate.sh generate_qwen3moe --tokens "$(head -n 4100 $BLOOMERY_DATA/qwen4exp/corpus-prose.ids | paste -sd, -)" -n 4
+#   --ctx 4352 --place gate' > <log> 2>&1
+# Expected [derived]: `load ... place=gate`, `xstream=split xstream_half=<N> ... xstream_lane_gbs=<G> xstream_m_min=<M> (set)` with
+# N 60..100 (free bytes after the plan less 512 MiB over 2 x ~3.1 MB a slot, the 3090's own half) and G 19..21.4 (the
+# refutation's M4 band, from the A6000 loads' 18.9..20.94 GB/s; both cards are PCIe 4.0 x16, docs/facts.md:66, but the 3090's
+# lane is unmeasured: that is why this is read first), one `xstream` record a card layer, `call stream end` and `xstream end`.
+# A refusal (XStream ring room) there means arm 2 cannot run at gate: the lever pair is then not the arm, say so and stop.
+# Wall [derived]: 3 loads a round x 2 rounds, each ~40 s (host set warm) plus its arms' PRIME and counted runs (P 512: ~6 s; P
+# 4096: arm 1 ~20 s, arm 2 and 3 ~12 s) and ~15 s of witness a arm: ~4.5 min a round, 10..16 min; the pre-check ~4 min more.
+kind: ab
+question: at --place gate on the RTX 3090, how much does the server's prompt path (residency mid-p0-s1 with the expert stream
+  split) lift pp4096 over the README protocol's plain path?
+term: pp tok/s @ prose:4096 (the first 4096 ids of corpus-prose.ids, one ubatch), ctx 4352 (BLOOMERY_GEN_CTX=4352), --place
+  gate on the RTX 3090 at 250 W, the draft off in both arms; BLOOMERY_RESIDENCY=mid-p0-s1 with BLOOMERY_XSTREAM=split against
+  both unset, same binary, paired by round
+unit: %
+predict: 94..178
+rounds: 2
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one lease, two rounds, BLOOMERY_WARM_ROWS=1, BLOOMERY_GEN_PLACE=gate, BLOOMERY_GEN_CTX=4352 (every arm one ctx,
+  so one plan's byte budget), the 3090 as BLOOMERY_TIMING_GPU, the arms prose:512 prose:4096 and each with
+  @BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_XSTREAM=split (arm 2) and with ,BLOOMERY_DRAFT=mtp added (arm 3): three loads a round.
+  Inside the window, read from what the depth runner's log carries (its `[load]` echo holds the `load` and `capture` lines
+  only, an arm's block `load|capture|step 0|time prompt|stat prompt|stat step|stat summary|residency pass|mtp summary|time
+  pass|tokens`, and each row its columns): every ours row's place gate and its load line's place=gate on the 3090 (else a
+  FAIL row); the `load` lines' card_layers equal in every arm and resident_bytes of arms 1 and 2 within 1 % (the residency's
+  spare slot a layer may take up to 48 experts, ~0.15 GB, so equal is not asserted), arm 3's below them by about its `load
+  draft=mtp` card_bytes; arm 1's rows carry no residency column and no lane_gbs, arms 2 and 3 the residency column
+  `residency mid-p0-s1` and ` | lane_gbs=<G> m_min=<M> admitted=<n> bytes=<b>`; arm 3 prints `load draft=mtp`; each P 4096
+  `time prompt ... passes=1`; no counted row [cold], [cpu-busy] or [other-busy]; no [probe-off] (the pre-check's lane, read
+  first, at least 18.5; the tag does not drop a row from the ratio line, it only counts it, and leaves the untagged means n/a).
+  What the log does not carry (the `plan` record's card_experts, `xstream=split ... xstream_half=`, each layer's `xstream`
+  record, `call stream end`, `xstream end`) is read from the pre-check's own log, which gpu-gate.sh prints whole, with its
+  numbers written down first. The full output to a file first. Read the effect from the `mean pp` lines (arm 2's mean over arm
+  1's, less 1) and per round from the ratio line `ratio pp prose p=4096 ours@prose/ours@prose@BLOOMERY_RESIDENCY=mid-p0-s1,
+  BLOOMERY_XSTREAM=split`, which prints BASE / CHANGED (arm 1 over arm 2: a +137 % effect reads 0.42): the effect is 1 / r - 1;
+  arm 3 from its own line. The 3090's UUID: BLOOMERY_BOX_READONLY=1 tools/box.sh 'nvidia-smi --query-gpu=name,uuid
+  --format=csv,noheader'. Command: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-3090-cfg.card
+  BLOOMERY_WARM_ROWS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_GEN_CTX=4352 BLOOMERY_TIMING_GPU=<the 3090's UUID>' just
+  depth-gpu-qwen4exp prose:512 prose:4096
+  prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_XSTREAM=split prose:4096@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_XSTREAM=split
+  prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_XSTREAM=split,BLOOMERY_DRAFT=mtp
+  prose:4096@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_XSTREAM=split,BLOOMERY_DRAFT=mtp > <log> 2>&1
+decide-in: the effect is inside +94..+178 %: the README 3090 row's protocol (gate unset) goes to the lead and the user, since a
+  lone-3090 server runs the stream; write both cells and arm 3's draft cost into rig-log with the conditions; the prompt ideas
+  are then priced on arm 3's column (the server's), not on gate's
+decide-below: two cases. Between +30 % and +94 %: the protocol still goes to the lead and the user (the effect clears the +30 %
+  bar) but the model overstated the stream: read the pre-check log's `xstream` records (streamed a layer, the half's use) and
+  `xstream end` lane_gbs, and re-derive the evaluator's ring and lane terms for the 3090 before it prices anything else on this
+  column. Under +30 %: the README protocol stands; read why before concluding (a lane under 18.5 GB/s, a half under 30 slots,
+  or a plain arm faster than 615 tok/s)
+decide-above: over +178 %: check arm 1 first: a plain pp4096 under 475 tok/s is a plain path that regressed since the README's
+  0.2.1 row (its pp512 486), read its `time prompt` passes and `stat prompt` host columns and re-derive the baseline before the
+  ratio goes anywhere

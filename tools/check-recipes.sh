@@ -237,6 +237,17 @@ blk_lcppwarm() {
   fi
   echo "${lw##*$'\n'}"
 }
+# q38-3090-server.sh is the lone-3090 Qwen3.8 server run (the discovery search's M4): its refusals (a set lever, a card that
+# is not the one 3090, a relative or existing out dir), the chats' records and the stop by the server's own pid, against a stub
+# gate runner and server (python3, curl, 127.0.0.1), are tested here, no box.
+blk_q38srv() {
+  if ! q38s=$(bash "$(dirname "$0")/ref/q38-3090-server.sh" --self-test 2>&1); then
+    echo "$q38s" >&2
+    echo "check-recipes: the q38-3090-server self-test failed" >&2
+    return 1
+  fi
+  echo "${q38s##*$'\n'}"
+}
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 blk_maccheck() {
@@ -379,6 +390,7 @@ blk_pytools() {
     "tools/ref/gguf-ranges.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
     "tools/ref/lev_ref.py --self-test"
+    "tools/ref/nsys-bridge.py --self-test"
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"
@@ -433,7 +445,7 @@ blk_orphan() {
   echo "${ot##*$'\n'}"
 }
 
-BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm
+BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools orphan)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc

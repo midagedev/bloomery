@@ -1,0 +1,105 @@
+# M2 of the discovery search's refutation (specs/leader/discover/refute-report.md section 4): where the 3090's plain Qwen3.8
+# step spends its card chain, and what a 4-row verify adds. M1 (q38-3090-k1.card) gives K1' = step - leg_us as one number; this
+# profile splits it into kernel bytes and the gaps between kernels, and prices the verify window's extra rows (delta).
+#
+# Decomposition [derived], plain step at --place gate, ctx 4352, the 512 prose ids, residency off, no draft:
+#   K1'    = 48 x (bytes + gap) + inter-step, with K1' 10.3..12.9 ms (M1's band)
+#   bytes  = 101..116 us a layer (refutation M2: the card's kernel time a layer, 4.85..5.57 ms a step at the 3090's 936 GB/s)
+#   inter  = 0.3..0.6 ms between one replay's last kernel and the next replay's first (refutation M2; the launch thread
+#            it would hide measured +0.96 +- 2.1 % there and is retired, registry.rs:975-984, so the boundary is the host's
+#            turnaround)
+#   gap    = (K1' - inter) / 48 - bytes: low (10.3 - 0.6) / 48 - 0.116 = 86 us, high (12.9 - 0.3) / 48 - 0.101 = 162 us, so
+#            86..162 us a layer; the refutation's "about 100 us" sits inside it. The decision edge, 80 us, is under the band:
+#            the run is predicted to open the card-latency round, and a value under 80 would be the surprise.
+#   router = 7..12 us a layer (refutation M2; the gated router's 32-deep body, qwen3moe/router.rs:24,62)
+#   delta  = the per-added-row cost of the verify window: a 4-row verify's card time = K1' + 3 delta = 10.3 + 3 x 1.5 = 14.8
+#            to 12.9 + 3 x 3.9 = 24.6 ms (the refutation printed 24.9; its own edges give 24.6), delta 1.5..3.9 ms
+# Terms and their reader. The tracer's microseconds are the tracer's (a replay's period runs a little long under nsys: compare
+# it with M1's step before reading any ratio).
+# One reader reads all four terms: tools/ref/nsys-bridge.py (its header has the columns; --self-test is its check), run on each
+# trace's sqlite where the exports are, python3, no lease. Its summary line, the last line it prints, is the one to quote.
+#   plain trace   python3 tools/ref/nsys-bridge.py $BLOOMERY_DATA/nsys/q38-3090-plain.sqlite --handoff ds41_ffn_handoff_10
+#                   --post q38_card_shared_add,q38_shared_add --kernel qwen35moe_router_fused
+#   verify trace  python3 tools/ref/nsys-bridge.py $BLOOMERY_DATA/nsys/q38-3090-verify.sqlite \
+#                   --handoff ds41_ffn_handoff_10_cols --post q38_card_shared_add,q38_shared_add \
+#                   --kernel qwen35moe_router_fused --joins 48
+#   The verify's handoff is the m-column launch, not the plain step's: the plain name would cut the draft's walks and read the
+#   verifies as 0 joins.
+#   Names, from the code: handoff ds41_ffn_handoff_10 (crates/gpu/src/host/handoff.rs:382, launched at :1011; the step,
+#   program38.rs:1503) and ds41_ffn_handoff_10_cols (handoff.rs:458, launched at :1145; the verify at m > 1,
+#   program38.rs:1595-1598); posts q38_shared_add (crates/gpu/src/q38.rs:319) on a layer without card experts and
+#   q38_card_shared_add (q38.rs:449) on one with (chosen at program38.rs:764-781; the shadow's q38_card_acc starts neither);
+#   router qwen35moe_router_fused_512 (crates/gpu/src/arch/qwen3moe/router.rs:2923, launched at :3243-3245 for the 512 experts,
+#   plan38.rs:50, from program38.rs:618; a 256-expert load would run qwen35moe_router_fused, router.rs:2520, which the same
+#   pattern finds). The reader's first line lists the boundary kernels it saw: the handoff and both posts, and no `_tier` kernel
+#   (a tier layer's handoff and post are ds41_ffn_handoff_10_cols_tier and q38_card_tier_shared_add, program38.rs:679, 739-754
+#   and card38.rs:701-713; a load without the NVMe tier has none).
+#   gap a layer    the critical segments' wall less the kernel time inside them, / 48 layers, mean over the steady replays: the
+#                  plain trace's summary `gaps_ms` x 1000 / 48 (the term's own divisor and its 80 us edge). Its
+#                  `gap_us_per_join` is the same sum over the replay's 49 critical segments (joins + 1), 2 % lower; where the
+#                  two straddle an edge, the /48 decides. The summary is over every replay from the first with the modal join
+#                  count: read the per-replay table, and when replay 0 is an outlier (a first-launch cost) rerun with --from 1.
+#   inter-step gap the plain trace's summary `idle_ms_p50` (last kernel end -> the next replay's first kernel, the median over
+#                  the selected replays), x 1000 in us; the per-replay `idle` column holds each one.
+#   router         the plain trace's summary `kernel[qwen35moe_router_fused]_us`, the mean us of one router launch; its
+#                  `n/replay` must read 48.00 (one a layer).
+#   verify delta   (crit_ms of the verify trace's summary at --joins 48 - crit_ms of the plain trace's) / 3, in ms. At fixed
+#                  width 4 the draft's walks (0 or 1 joins) outnumber the verifies, so the modal count would be the draft's;
+#                  --joins 48 keeps the verifies, and its summary `replays=` must read 6 or more. The 3 holds when every 48-join
+#                  pass is the whole 4-row proposal: under BLOOMERY_MTP_WIDTH=fixed every pass verifies the draft's whole width
+#                  (gpu-gates record.rs:2285-2290; runtime/src/width.rs:67), which the run's `mtp summary` `widths` shows as no
+#                  pass below 3 ids and `nsys-table.py <verify.sqlite> --pattern ds41_ffn_handoff_10_cols` as one geometry row
+#                  (its grid follows the row count, handoff.rs:1143); a second row means narrower verifies are in the mean.
+#                  Arithmetic [derived]: a 4-row verify's card time is K1' + 3 delta (the decomposition above), so crit(verify,
+#                  48 joins) - crit(plain) = 3 delta = 3 x 1.5 .. 3 x 3.9 = 4.5 .. 11.7 ms; a delta at or under the edge 3.9 ms
+#                  is a difference at or under 11.7 ms.
+#   first-read checks: with K1' = 10.59 ms (M1) and the 0.3..0.6 ms boundary above, the plain trace's crit_ms is expected at
+#                  9.99 .. 10.29 [derived]; a replay period (crit plus idle) over 1.1 x M1's step is the tracer's stretch (the
+#                  decide-above clause). A router n/replay other than 48.00, or a boundary kernel missing from the reader's
+#                  first line, is a reader or trace fault, not a finding.
+# Wall [derived]: two profiles of one Qwen3.8 load each (~40 s) + the 512-id prompt (~1.2 s) + 24 or 40 steps under the tracer
+# (~1..3 s) + the report write (~10..20 s) = about 1.5..2.5 min each, then the exports (~10 s each, off the lease): 5..8 min.
+kind: profile
+question: on the RTX 3090 at --place gate, how many microseconds a layer does the plain step's card chain spend between its
+  kernels, and what do the router, the step boundary and a 4-row verify's extra rows cost?
+term: the card chain's gap a layer, us (the critical segments' wall less the kernel time inside them, / 48, mean over the
+  steady replays), in the 23 graph replays of generate_qwen3moe --tokens <the 512 prose ids> -n 24 --ctx 4352 --place gate
+  --mode graph --time under nsys, RTX 3090 at 250 W, residency off, no draft
+unit: us
+predict: 86..162
+condition: one lease per profile through tools/ref/lease-hold.sh with this card, the 3090 the one visible and timing card:
+  lease-hold.sh does not source timing-card.sh, so its take waits for no compute process unless TIMING_GPU is in the
+  environment (lease.sh lease_gpu_idle) and records the timing card as none otherwise; BLOOMERY_BOX_ENV therefore carries
+  TIMING_GPU=<the 3090's UUID> and CUDA_VISIBLE_DEVICES=<the same UUID>, and each profile's witness `gpu-apps` lines name no
+  compute process before and after (else void). The nsys flags are nsys-gpu.sh's: -t cuda --cuda-graph-trace=node
+  --cuda-event-trace=false --sample=none --cpuctxsw=none. Profile A (plain, M1's load key: no lever set) and profile B (the
+  4-row verify: BLOOMERY_DRAFT=mtp, a set draft is taken at gate, generate_qwen3moe.rs draft38; BLOOMERY_MTP_WIDTH=fixed, which
+  verifies every proposal whole, because the unset `cost` chooser may never verify 4 rows; the draft's card bytes leave the
+  plan, so B is a load key of its own, its load line `load draft=mtp`). Inside each window: the run exits 0 and prints its
+  `time step` rows; profile A holds about 23 cuGraphLaunch calls, each replay 48 joins; profile B at least 6 replays with 48
+  joins and its `mtp summary` positions/passes between 2.2 and 3.5; profile A's `load` line names place=gate and the same
+  card_layers and resident_bytes as M1's plain arm (its `plan` record's card_experts is read here, whole in this log). Commands (the 3090's UUID: BLOOMERY_BOX_READONLY=1 tools/box.sh 'nvidia-smi
+  --query-gpu=name,uuid --format=csv,noheader'; the full output to a file first): BLOOMERY_MODEL=qwen4exp
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-3090-nsys.card TIMING_GPU=<UUID> CUDA_VISIBLE_DEVICES=<UUID>'
+  tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe &&
+  mkdir -p $BLOOMERY_DATA/nsys && bash tools/ref/lease-hold.sh --card docs/cards/q38-3090-nsys.card -- timeout
+  --kill-after=10 600 /usr/local/cuda/bin/nsys profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false --sample=none
+  --cpuctxsw=none -o $BLOOMERY_DATA/nsys/q38-3090-plain --force-overwrite true target/release/generate_qwen3moe --tokens
+  "$(head -n 512 $BLOOMERY_DATA/qwen4exp/corpus-prose.ids | paste -sd, -)" -n 24 --ctx 4352 --place gate --mode graph --time
+  && bash tools/ref/lease-hold.sh --card docs/cards/q38-3090-nsys.card -- env BLOOMERY_DRAFT=mtp BLOOMERY_MTP_WIDTH=fixed
+  timeout --kill-after=10 600 /usr/local/cuda/bin/nsys profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+  --sample=none --cpuctxsw=none -o $BLOOMERY_DATA/nsys/q38-3090-verify --force-overwrite true target/release/generate_qwen3moe
+  --tokens "$(head -n 512 $BLOOMERY_DATA/qwen4exp/corpus-prose.ids | paste -sd, -)" -n 40 --ctx 4352 --place gate --mode graph
+  --time' > <log> 2>&1; then, off the lease, per trace: tools/box.sh 'timeout --kill-after=10 300 /usr/local/cuda/bin/nsys
+  export --type sqlite --force-overwrite true -o $BLOOMERY_DATA/nsys/<name>.sqlite $BLOOMERY_DATA/nsys/<name>.nsys-rep'
+decide-in: the gaps are 80 us a layer or more (the whole predicted band): open the card-latency round (overlap-5: the launches
+  and waits ahead of the router and the handoff; +1..+3 % alone, +4..+6 % on top of lanes), and read the other three terms
+  from the same traces: an inter-step gap of 0.4 ms or more opens the step-boundary round (overlap-6, size M-L, +1..+2.5 %), a
+  router of 10 us or more opens the BF16 router planes (bytes-1, size S, +0.5..+1.2 %), a delta of 3.9 ms or under puts the
+  2x2 verify lanes (D2) positive unseated; write the per-layer table into rig-log beside M1
+decide-below: the gaps are under 80 us a layer: the card chain is bytes, not latency; drop the card-latency round (overlap-5)
+  and its lane stack bonus, keep the lanes on K1' alone, and re-read M1's K1' against 48 x bytes before pricing anything on
+  the card side; the router and boundary terms are read as above, each on its own edge
+decide-above: the gaps are over 162 us a layer: first compare the trace's replay period with M1's step (a period over 1.1x
+  M1's step means the tracer inflated the gaps: read only the ratio of gap to bytes); if the period matches, the latency is
+  larger than priced and the card-latency round goes ahead of the lanes (the unexposed latency is the bigger lever)
