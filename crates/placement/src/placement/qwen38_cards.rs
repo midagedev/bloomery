@@ -756,15 +756,21 @@ fn nvme_arm(room: u64) -> NvmeArm {
 
     let need = HostNeed::of(&split, 0).bytes();
     let moved = split.host.nvme_expert_bytes;
-    let overflow = old_need - (room - arena);
+    // The split plan reserves the prompt run-ahead's window, two of the
+    // heaviest layer's host bytes, beside its host experts.
+    let window = 2 * layer_bytes;
+    let overflow = old_need + window - (room - arena);
     let max_unit = (0..LAYERS)
         .map(|l| layer_unit(&q4, l))
         .max()
         .expect("layers");
-    assert!(need <= room, "need {need} B passes the room {room} B");
-    assert_eq!(need + moved, old_need);
-    // The NVMe segments are the overflow the arena grew, to within the one
-    // expert a layer's whole experts leave.
+    assert!(
+        need + arena <= room,
+        "need {need} B and arena {arena} B pass the room {room} B"
+    );
+    assert_eq!(need + moved, old_need + window);
+    // The NVMe segments are the overflow the arena and the window grew, to
+    // within the one expert a layer's whole experts leave.
     assert!(
         overflow <= moved && moved < overflow + max_unit,
         "moved {moved} B for an overflow of {overflow} B (arena {arena} B)"
@@ -907,6 +913,37 @@ fn a_split_plans_pool_fits_the_room_past_the_arena() {
     match all.check(&split) {
         Err(PlacementError::ResidencyOverHost(_)) => {}
         other => panic!("mid-p0's pool of {} B is not refused: {other:?}", all.bytes),
+    }
+}
+
+/// The split leaves the prompt run-ahead's `2 W` page-cache window, a host
+/// reserve of the split plan, and keeps the host experts in what the room
+/// leaves past the arena and the window: on both rooms the reserve grows by
+/// the window and the need stays inside the room past the arena, and at the
+/// largest arena (27 GiB) the host keeps at most `1 W` of experts.
+#[test]
+fn a_split_leaves_the_run_ahead_window() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    for room in [27u64 << 30, 58 << 30] {
+        let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
+        let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
+        let w = (0..LAYERS)
+            .map(|l| layer_split(&twin, l).2)
+            .max()
+            .expect("layers");
+        assert_eq!(
+            split.host.reserve_bytes,
+            twin.host.reserve_bytes + 2 * w,
+            "room {room}: the window is the split plan's reserve"
+        );
+        assert!(HostNeed::of(&split, 0).bytes() + split.host.nvme_arena_bytes <= room);
+        if room == 27 << 30 {
+            assert!(
+                split.host.expert_bytes <= w,
+                "the largest arena's host keeps {} B of experts, past 1 W = {w} B",
+                split.host.expert_bytes
+            );
+        }
     }
 }
 
