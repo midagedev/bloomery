@@ -2,7 +2,11 @@
 
 여기는 **아직 할 일만** 있다. 2026-09-25 새벽에 다시 썼다 — 그 전 판(라운드 보고 절 스무 개와 09-23 GPU 선 목록의 원문, 155 KB)은 [`plan-ledger.md`](plan-ledger.md) 「plan-triage.md 2026-09-25 이전 판」에 원문 그대로 있고, 항목의 근거·수치·기제가 필요하면 거기서 찾는다. 항목은 받을 라운드별로 한 줄씩이고 크기는 XS·S·M·L이다. 착륙한 줄은 지운다(원문은 장부, 결과는 커밋 메시지와 rig-log). 수치는 `[유도]`가 아니면 실측이다.
 
-## Release 0.2.10 — orchestration (the user, 2026-10-10 ~08:40: "worker들과 협력해서 릴리즈를 위한 오케스트레이션 가속")
+## Release 0.3.0 (or 0.2.10) — orchestration (the user, 2026-10-10 ~08:40: "worker들과 협력해서 릴리즈를 위한 오케스트레이션 가속")
+
+**The version** (the user, ~09:20, "이게 다 되고 나면 0.3.0 갈만하지"): 0.3.0 if the cut carries all three pillars —
+vision on the Qwen3-VL family's three seats, the unified tier with V4.1 and GLM attached, quantwide's Qwen3.6 and
+Qwen3-30B ports — beside T1; if a pillar slips, 0.2.10. MiMo and Kolibri move to 0.3.x. The trains keep their names.
 
 Scope (user, 10-10, memory release-0210-scope): T1 pulled in (the prompt headline), vision beyond V4.1, a stepwise promo
 video from 0.2.6. Plus what is already queued: T3 (decode), r4glm + k1iq3s (GLM UD-IQ4_XS loads on big hosts),
