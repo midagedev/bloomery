@@ -18,8 +18,10 @@
 #
 # commit	name	why
 160fef7ae2f0	seatfix	the Qwen3.8 seat loads the plan it ruled and recorded, counts its slots' checkpoints in the room, and refuses a set residency on a paged plan
-b884cef18cb3	paged2	generate_qwen3moe asks the paged one-column rule too, and a set BLOOMERY_GEN_SLOTS past one is refused under its own name
-d58d993f4baf	paged2	the paged one-column rule counts a slot column only where the slots step as one pass, so a paged bp plan serves every slot asked
-a2cfb825a7d2	paged2	the floor fallback's one slot is the room's on --place bp too
-0410d5b82286	roomneed	one room ledger: HostNeed carries the NVMe tier's arena, so the load's check and every finished-plan reader count it
-46e9bb48eb8c	roomneed	the checkpoints beside a plan's need have one owner, residency38::checkpoints_beside
+d9e8badb9a4c	paged2	generate_qwen3moe asks the paged one-column rule too, and a set BLOOMERY_GEN_SLOTS past one is refused under its own name
+f007455de229	paged2	the paged one-column rule counts a slot column only where the slots step as one pass, so a paged bp plan serves every slot asked
+4ecedca58426	paged2	the floor fallback's one slot is the room's on --place bp too
+03961735cb4e	roomneed	one room ledger: HostNeed carries the NVMe tier's arena, so the load's check and every finished-plan reader count it
+68949754467d	roomneed	the checkpoints a plan's need holds are counted once
+d0d7512c71f2	roomneed	a paged plan's default prompt cache is off rather than refusing the load, and so is a default under one saved state
+477cbdbf8387	roomone	GLM machines reserve slots × HOST_BUDGET of checkpoints, where they counted 0 or one slot
