@@ -20,14 +20,20 @@
 //! - `refuse` (clause 4): the room under the tier's floor
 //!   (`HostRoomFloor`), an arena budget under one slot's span, and the
 //!   direct-read probe of a mount without direct IO, each by name.
-//! - `residency` (clause 5): the paged plan's unset rule resolves `mid`
-//!   with no churn pool ([`residency38`]'s paged branch), flips land on the
-//!   paged arm, and its `unresident` and `faulting` are 0 and its `late`
-//!   flips 0 — bug catchers, structurally unreachable once the seam serves
-//!   the victims the arena holds from its books.
+//! - `residency` (clause 5): the paged plan's unset rule ([`residency38`])
+//!   resolves `off`, and the churn pool of `mid-p0` is refused by name by
+//!   the check the load runs (`ChurnPool::check_beside`): the split leaves
+//!   its room no space beside the host need, the window and the arena.
 //! - `room` (clause 6): the loaded tier's arena, the plan's host need and
 //!   the churn pool the residency holds fit the room together, and the
 //!   plan's headroom is what the room leaves past the arena and the need.
+//!
+//! PIN(2026-10-09): clause 5's flips on the paged arm (`unresident`,
+//! `faulting` and `late` 0) and the `seam` clause (`host_resident` answered
+//! from the arena's books) are dropped: a churn pool's host pages back every
+//! promotion (`FileSwap::source` reads the file mapping), no pool fits a
+//! split plan's room, so no residency machine runs on a paged load. They
+//! return with the tiers whose promotions read the arena.
 //!
 //! PIN(2026-10-08): the page-cache design's two named refusals are dropped
 //! — a paged tier under `BLOOMERY_HOST_LOCK=1` (the lock walk pins model
@@ -51,7 +57,7 @@ use app::Session;
 use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::host::nvtier::{NvTier, NvTierStats, advice_disjoint};
-use bloomery_gpu::host::swap::{PassReport, Residency, SwapSource};
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
@@ -60,7 +66,7 @@ use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, HostRead};
-use model::placement::{Machine, PlanLevers};
+use model::placement::{Machine, PlacementError, PlanLevers};
 use runtime::{Out, Target, Want};
 
 const NAME: &str = "gate_nvtier";
@@ -98,28 +104,15 @@ fn prose38(n: usize) -> Result<Vec<u32>, GateError> {
 }
 
 /// What one arm saw: every call's argmax, the prompt's and each step's
-/// logits digest, the residency boundaries' counts the paged arm holds to
-/// 0, the flips that landed, the arena's counters at the end and the most
-/// resident bytes it held at any step, and the arena itself when the load
-/// attached one.
+/// logits digest, the arena's counters at the end and the most resident
+/// bytes it held at any step, and the arena itself when the load attached
+/// one.
 struct ArmRun {
     tokens: Vec<u32>,
     digests: Vec<u64>,
-    unresident: usize,
-    faulting: usize,
-    late: usize,
-    landed: usize,
     resident_max: u64,
     stats: Option<NvTierStats>,
     tier: Option<Arc<NvTier>>,
-    seam: Option<Seam>,
-}
-
-/// The residency seam's answers over the ids the arena serves, against the arena's own books.
-struct Seam {
-    checked: usize,
-    filled: usize,
-    wrong: usize,
 }
 
 /// The plan of `file` on `machine` with `room` given, or the machine's own
@@ -134,7 +127,7 @@ fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
 
 /// One arm: the model loaded under `residency` with `room` given (or the
 /// machine's reading), its [`PROMPT`] ids as one prompt call and [`STEPS`]
-/// greedy steps, the residency boundaries' reports summed.
+/// greedy steps.
 fn arm(
     path: &Path,
     machine: &Machine,
@@ -170,30 +163,17 @@ fn arm(
             .ok_or("--audit on a load that built no arena")?
             .audit_on()?;
     }
-    take_passes(&mut s)?;
     let mut run = ArmRun {
         tokens: Vec::with_capacity(STEPS + 1),
         digests: Vec::with_capacity(STEPS + 1),
-        unresident: 0,
-        faulting: 0,
-        late: 0,
-        landed: 0,
         resident_max: 0,
         stats: None,
         tier: tier.clone(),
-        seam: None,
     };
-    let note = |s: &mut Session<Body38>, run: &mut ArmRun| -> Result<(), GateError> {
-        for (_, r) in take_passes(s)? {
-            run.unresident += r.unresident.count();
-            run.faulting += r.faulting.count();
-            run.late += r.late;
-            run.landed += r.landed;
-        }
+    let note = |run: &mut ArmRun| {
         if let Some(t) = &tier {
             run.resident_max = run.resident_max.max(t.stats().resident_bytes);
         }
-        Ok(())
     };
     let out = s.prompt(ids, Want::Logits)?;
     let Out::Logits { argmax, row } = out else {
@@ -202,7 +182,7 @@ fn arm(
     run.digests.push(Fnv1a64::default().f32s(row).value());
     let mut next = argmax;
     run.tokens.push(next);
-    note(&mut s, &mut run)?;
+    note(&mut run);
     for _ in 0..STEPS {
         let out = s.step(next, Want::Logits)?;
         if let Out::Logits { row, .. } = out {
@@ -210,51 +190,15 @@ fn arm(
         }
         next = out.argmax();
         run.tokens.push(next);
-        note(&mut s, &mut run)?;
+        note(&mut run);
     }
     run.stats = tier.as_ref().map(|t| t.stats());
-    run.seam = seam_of(&s, plan.model.layers, plan.model.experts as u32)?;
     if record::nvtier_of(tier.as_deref()).is_some() != room.is_some() {
         return Err(
             "the nvtier record is printed on a load with no tier or missing on one with it".into(),
         );
     }
     Ok(run)
-}
-
-/// The seam's answer `host_resident` gives for every id the arena serves, held to the arena's
-/// books (`slot_filled`): the file mapping's page cache residency never answers for it, however
-/// warm the mapping is. `None` on a load with no arena or no residency machine.
-fn seam_of(s: &Session<Body38>, layers: usize, experts: u32) -> Result<Option<Seam>, GateError> {
-    let b = s.model().body(NAME)?;
-    let (Some(tier), Some(source)) = (b.nvme_tier(), b.residency_source()) else {
-        return Ok(None);
-    };
-    let mut seam = Seam {
-        checked: 0,
-        filled: 0,
-        wrong: 0,
-    };
-    for l in 0..layers {
-        for id in 0..experts {
-            if !tier.serves(l, id) {
-                continue;
-            }
-            let held = tier.slot_filled(l, id);
-            seam.checked += 1;
-            seam.filled += usize::from(held);
-            seam.wrong += usize::from(source.host_resident(l, id)? != held);
-        }
-    }
-    Ok(Some(seam))
-}
-
-/// The boundaries' reports since the last take.
-fn take_passes(
-    s: &mut Session<Body38>,
-) -> Result<Vec<(bloomery_gpu::host::PassKind, PassReport)>, GateError> {
-    let (_, _, b) = s.model_mut().body_parts(NAME)?;
-    Ok(b.take_residency_passes())
 }
 
 fn run() -> Result<(), GateError> {
@@ -276,7 +220,7 @@ fn run() -> Result<(), GateError> {
     let mut pass = true;
 
     // The residency word both arms run: the unset rule's answer on the
-    // paged plan, which resolves `mid` with the churn pool 0.
+    // paged plan, which resolves `off`.
     let residency = residency38(&plan, Lever38::Unset(None), Record::print)?;
     // `room`'s plan terms: the host need, the churn pool the residency
     // holds beside it, and the headroom the split left.
@@ -290,10 +234,20 @@ fn run() -> Result<(), GateError> {
         Residency::Off => 0,
     };
     let headroom = plan.host.headroom_bytes;
-    let Residency::Mid { pinned, spares } = residency else {
-        return Err("the paged plan's unset residency rule did not resolve mid".into());
-    };
-    println!("residency: mid-p{pinned}-s{spares} (the unset rule on the paged plan): PASS");
+    // `residency` (clause 5): the unset rule resolves `off`, and the load's
+    // own check refuses the pool `mid-p0` holds by name.
+    let refused = matches!(
+        ChurnPool::of(&plan, CARD38, 0).map(|p| p.check(&plan)),
+        Ok(Err(PlacementError::ResidencyOverHost(_)))
+    );
+    let off = matches!(residency, Residency::Off);
+    println!(
+        "residency: the unset rule on the paged plan resolves {}, mid-p0's pool refused by name \
+         {refused}: {}",
+        if off { "off" } else { "mid" },
+        verdict(off && refused)
+    );
+    pass &= off && refused;
     println!(
         "plan: room {ROOM} B pages {} B on the NVMe tier, arena {} B",
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
@@ -376,32 +330,6 @@ fn run() -> Result<(), GateError> {
         },
         audit
     );
-
-    let seam = paged.seam.as_ref().ok_or("the paged arm read no seam")?;
-    let seam_ok =
-        seam.checked > 0 && seam.filled > 0 && seam.filled < seam.checked && seam.wrong == 0;
-    println!(
-        "seam: host_resident answered the arena's books on {} ids ({} filled, {} unfilled), {} \
-         wrong: {}",
-        seam.checked,
-        seam.filled,
-        seam.checked - seam.filled,
-        seam.wrong,
-        verdict(seam_ok)
-    );
-    pass &= seam_ok;
-
-    let flips = paged.landed > 0;
-    let residency_ok = flips && paged.unresident == 0 && paged.faulting == 0 && paged.late == 0;
-    println!(
-        "residency: flips landed {} (the seam ran: {flips}), unresident {}, faulting {}, late {}: {}",
-        paged.landed,
-        paged.unresident,
-        paged.faulting,
-        paged.late,
-        verdict(residency_ok)
-    );
-    pass &= residency_ok;
 
     if pass {
         println!("{NAME}: every clause passed");
