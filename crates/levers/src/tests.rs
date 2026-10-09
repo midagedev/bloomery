@@ -53,8 +53,8 @@ fn pool(r: &LeverSpec) -> bool {
 /// Every file that reads a lever in place, with its round.
 fn in_place(site: Site) -> &'static [InPlace] {
     match site {
-        Site::Parsed { left } | Site::Retired { left, .. } => left,
-        Site::Direct { at } => at,
+        Site::Parsed { left, .. } | Site::Retired { left, .. } => left,
+        Site::Direct { at, .. } => at,
         Site::Env { .. } => &[],
     }
 }
@@ -179,7 +179,7 @@ fn lane_prefetch_row_is_an_on_off_arm() {
         class: Class::A,
         kind: Kind::OnOff,
         default: Unset::Is(d),
-        site: Site::Parsed { left },
+        site: Site::Parsed { left, .. },
         ..
     }) = row
     else {
@@ -1577,7 +1577,7 @@ fn a_binary_refuses_the_levers_it_does_not_act_on() {
                 .lines()
                 .find(|l| l.split_whitespace().next() == Some(p.name))
                 .unwrap_or_else(|| panic!("no line for {}", p.name));
-            let dash = line.split_whitespace().nth(3) == Some("-");
+            let dash = line.split_whitespace().nth(4) == Some("-");
             assert_eq!(dash, p.name != r.name && !pool(p), "{line}");
         }
     }
@@ -1825,9 +1825,10 @@ fn markdown_is_a_line_per_row() {
     println!("{md}");
 }
 
-/// `--levers` prints a line per lever with the reading's value: as set, the
-/// default, or `-` for a lever the reading does not parse; a name that is no
-/// lever has no line.
+/// `--levers` prints a line per lever with the phase and the reading's value:
+/// the phase as the row states it (`load`, `runtime`) or `-` for a retired
+/// row, which states none; the value as set, the default, or `-` for a lever
+/// the reading does not parse; a name that is no lever has no line.
 #[test]
 fn table_is_a_line_per_lever() {
     let r = parsed().find(|r| !pool(r)).expect("a Parsed lever");
@@ -1847,9 +1848,14 @@ fn table_is_a_line_per_lever() {
     for (line, row) in t.lines().zip(levers) {
         let mut cells = line.split_whitespace();
         assert_eq!(cells.next(), Some(row.name), "{line}");
+        let phase = match row.site {
+            Site::Parsed { phase, .. } | Site::Direct { phase, .. } => phase.word(),
+            Site::Retired { .. } | Site::Env { .. } => "-",
+        };
+        assert_eq!(cells.nth(2), Some(phase), "{line}");
         let value = line
             .split_whitespace()
-            .skip(3)
+            .skip(4)
             .collect::<Vec<_>>()
             .join(" ");
         let want = if row.name == r.name {
