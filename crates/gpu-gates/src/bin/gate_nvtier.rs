@@ -50,11 +50,19 @@
 //!   begins — a held expert, or a tensor beside the stack — and the host's
 //!   own reads of those bytes reach that far into it, reads the tier does
 //!   not govern. The band's pages are printed, not judged. The interior is
-//!   judged: (a) 0 pages after the tier's own drop of every run before the
-//!   prompt — the premise: no other process maps the file (every gate that
-//!   maps it holds the V4.1 load lock this one holds), and the drop takes
-//!   every page it names. (b) After the prompt call, at most the readahead
-//!   its readers had in flight when each layer's drop ran: `2R` pages a
+//!   judged: (a) after the tier's own drop of every run before the prompt,
+//!   no page held through a second drop — the premise: no other process
+//!   maps the file (every gate that maps it holds the V4.1 load lock this
+//!   one holds), and this process maps no page of a run once the drop ran
+//!   (`MADV_DONTNEED` goes first). The kernel's drop passes over a page it
+//!   holds busy at that instant (one it cannot lock, or one holding a
+//!   reference past the page cache's own), and the next drop takes it; a
+//!   page held through both is the defect: another mapper, or a page the
+//!   drop cannot take. The first read's interior pages are printed, each
+//!   with its layer, stack row, expert and the expert's class (a card id,
+//!   an NVMe-tier id) and its distance to its run's nearer end. (b) After
+//!   the prompt call, at most the readahead its readers had in flight when
+//!   each layer's drop ran: `2R` pages a
 //!   reading thread a paged layer, the readers no more than the host's
 //!   CPUs. (c) With the residue dropped again so the two readers stay
 //!   apart, after the [`STEPS`] steps, at most the readahead spill of the
@@ -73,8 +81,9 @@
 //! judged 0 with the tiers whose promotions read the arena.
 //!
 //! PIN(2026-10-09): clause 7 judges the runs' interiors, the `2R` bands at
-//! their ends printed — the base read held a few pages at the runs' edges
-//! after the tier's own drop.
+//! their ends printed, and its base judges the interior pages held through
+//! a second drop, the first drop's residue printed: a drop takes no page
+//! the kernel holds busy at its instant, and the next drop takes it.
 //!
 //! PIN(2026-10-08): the page-cache design's two named refusals are dropped
 //! — a paged tier under `BLOOMERY_HOST_LOCK=1` (the lock walk pins model
@@ -187,13 +196,57 @@ struct Pages {
     total: u64,
 }
 
+/// The first base read's interior pages `footprint` checks one by one
+/// against a second drop; a page past them counts held.
+const HELD_CHECKED: usize = 1 << 16;
+
+/// The first base read's interior pages `footprint` prints, one line each.
+const PAGES_SHOWN: usize = 32;
+
+/// One resident page of a drop run's interior: its layer, the plan's stack
+/// row, the shard, the page's file offset, and its distance in pages to its
+/// run's nearer end.
+#[derive(Clone, Copy)]
+struct Page {
+    layer: usize,
+    row: usize,
+    shard: usize,
+    at: u64,
+    from_end: u64,
+}
+
+/// The interior pages a read found: the first [`HELD_CHECKED`] of them, and
+/// how many came past those.
+#[derive(Default)]
+struct Interior {
+    pages: Vec<Page>,
+    past: u64,
+}
+
+impl Interior {
+    fn note(&mut self, page: Page) {
+        if self.pages.len() < HELD_CHECKED {
+            self.pages.push(page);
+        } else {
+            self.past += 1;
+        }
+    }
+}
+
 /// The paged arm's footprint: after the tier's own drop before the prompt,
 /// after the prompt and after the steps, over its paged layers, read with
-/// an edge band of `band` pages; and the prompt's drops (calls, wall)
+/// an edge band of `band` pages; the base read's interior pages, which of
+/// them a second drop of the tier's left (`held`) and which the prompt's
+/// read found (`at_prompt`); each layer's card experts, the plan's first
+/// ids of its stacks (`card`); and the prompt's drops (calls, wall)
 /// against the prompt's wall.
 struct Footprint {
     band: u64,
     base: Pages,
+    first: Interior,
+    held: Vec<bool>,
+    at_prompt: Vec<bool>,
+    card: Vec<u64>,
     prompt: Pages,
     steps: Pages,
     layers: usize,
@@ -243,6 +296,7 @@ fn arm(
     let inputs = inputs_of(&file, room)?;
     let ub = ubatch_for(CTX)?;
     let plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    let card = plan.n_l.clone();
     if (plan.host.nvme_expert_bytes > 0) != room.is_some() {
         return Err(format!(
             "the {} arm's plan pages {} B on the NVMe tier: {}",
@@ -280,9 +334,16 @@ fn arm(
         }
         _ => None,
     };
-    let base = match &foot {
-        Some((_, regions, band)) => resident(probe, regions, *band)?,
-        None => Pages::default(),
+    // The base read's interior pages, then the tier's drop once more: a
+    // page it leaves too is held, one it takes was busy at the first drop.
+    let mut first = Interior::default();
+    let (base, held) = match &foot {
+        Some((t, regions, band)) => {
+            let base = resident(probe, regions, *band, Some(&mut first))?;
+            drop_all(t, regions)?;
+            (base, still_resident(probe, &first.pages)?)
+        }
+        None => (Pages::default(), Vec::new()),
     };
     let drops0 = tier.as_ref().map(|t| t.stats());
     let mut run = ArmRun {
@@ -328,13 +389,14 @@ fn arm(
     let drops1 = tier.as_ref().map(|t| t.stats());
     // The prompt's residue dropped through the tier, so the steps' read
     // names only what the steps' own readers left.
-    let prompt_pages = match &foot {
+    let (prompt_pages, at_prompt) = match &foot {
         Some((t, regions, band)) => {
-            let p = resident(probe, regions, *band)?;
+            let p = resident(probe, regions, *band, None)?;
+            let at = still_resident(probe, &first.pages)?;
             drop_all(t, regions)?;
-            p
+            (p, at)
         }
-        None => Pages::default(),
+        None => (Pages::default(), Vec::new()),
     };
     for _ in 0..STEPS {
         let out = s.step(next, Want::Logits)?;
@@ -353,8 +415,12 @@ fn arm(
         run.footprint = Some(Footprint {
             band: *band,
             base,
+            first,
+            held,
+            at_prompt,
+            card,
             prompt: prompt_pages,
-            steps: resident(probe, regions, *band)?,
+            steps: resident(probe, regions, *band, None)?,
             layers: regions.len(),
             prompt_drops: d1.drops - d0.drops,
             prompt_drop_ns: d1.drop_ns - d0.drop_ns,
@@ -409,14 +475,20 @@ fn drop_all(tier: &NvTier, regions: &[(usize, DropRuns)]) -> Result<(), GateErro
 /// `mincore` through `probe`'s mapping of each shard (the gate's own open of
 /// the file: a file page's residency is the page cache's, whichever mapping
 /// asks): the resident pages in each run's interior and in the `band` pages
-/// at either of its ends ([`edge_band`]), and the runs' pages.
-fn resident(probe: &Split, regions: &[(usize, DropRuns)], band: u64) -> Result<Pages, GateError> {
+/// at either of its ends ([`edge_band`]), and the runs' pages; each interior
+/// page noted in `list` when one is given.
+fn resident(
+    probe: &Split,
+    regions: &[(usize, DropRuns)],
+    band: u64,
+    mut list: Option<&mut Interior>,
+) -> Result<Pages, GateError> {
     let page = page_bytes().map_err(|e| format!("the page size: {e}"))?;
     let band = usize::try_from(band)?;
     let mut pages = Pages::default();
     let mut vec = Vec::new();
     for (layer, rows) in regions {
-        for (shard, runs) in rows {
+        for (row, (shard, runs)) in rows.iter().enumerate() {
             let map = probe
                 .shard(*shard)
                 .ok_or_else(|| format!("layer {layer}: shard {shard} is not in the probe"))?
@@ -433,34 +505,24 @@ fn resident(probe: &Split, regions: &[(usize, DropRuns)], band: u64) -> Result<P
                             map.len()
                         )
                     })?;
-                let n = span.len().div_ceil(page as usize);
-                vec.clear();
-                vec.resize(n, 0u8);
-                // SAFETY: `span` lies inside the probe's live read-only
-                // mapping of the shard and starts on a page boundary (the
-                // mapping starts on one, and a drop run is whole pages of
-                // file offsets); `vec` holds one byte for each of its pages.
-                // mincore reads the page tables and the page cache and
-                // writes only `vec`.
-                let rc = unsafe {
-                    libc::mincore(
-                        span.as_ptr().cast_mut().cast(),
-                        span.len(),
-                        vec.as_mut_ptr(),
-                    )
-                };
-                if rc != 0 {
-                    return Err(format!(
-                        "mincore over layer {layer} shard {shard} bytes {run:?}: {}",
-                        std::io::Error::last_os_error()
-                    )
-                    .into());
-                }
+                mincore_into(span, &mut vec, page as usize).map_err(|e| {
+                    format!("mincore over layer {layer} shard {shard} bytes {run:?}: {e}")
+                })?;
+                let n = vec.len();
                 for (i, _) in vec.iter().enumerate().filter(|&(_, &v)| v & 1 != 0) {
                     if i < band || i + band >= n {
                         pages.edge += 1;
                     } else {
                         pages.interior += 1;
+                        if let Some(list) = list.as_deref_mut() {
+                            list.note(Page {
+                                layer: *layer,
+                                row,
+                                shard: *shard,
+                                at: run.start + i as u64 * page,
+                                from_end: i.min(n - 1 - i) as u64,
+                            });
+                        }
                     }
                 }
                 pages.total += n as u64;
@@ -468,6 +530,92 @@ fn resident(probe: &Split, regions: &[(usize, DropRuns)], band: u64) -> Result<P
         }
     }
     Ok(pages)
+}
+
+/// Whether each of `pages` is in the page cache now: `mincore` over its one
+/// page through `probe`'s mapping of its shard.
+fn still_resident(probe: &Split, pages: &[Page]) -> Result<Vec<bool>, GateError> {
+    let page = usize::try_from(page_bytes().map_err(|e| format!("the page size: {e}"))?)?;
+    let mut vec = Vec::with_capacity(1);
+    let mut out = Vec::with_capacity(pages.len());
+    for p in pages {
+        let map = probe
+            .shard(p.shard)
+            .ok_or_else(|| format!("layer {}: shard {} is not in the probe", p.layer, p.shard))?
+            .mapping();
+        let at = usize::try_from(p.at)?;
+        let span = map.get(at..at + page).ok_or_else(|| {
+            format!(
+                "layer {} shard {}: the page at {} is past the mapping's {} B",
+                p.layer,
+                p.shard,
+                p.at,
+                map.len()
+            )
+        })?;
+        mincore_into(span, &mut vec, page).map_err(|e| {
+            format!(
+                "mincore over layer {} shard {} at {}: {e}",
+                p.layer, p.shard, p.at
+            )
+        })?;
+        out.push(vec[0] & 1 != 0);
+    }
+    Ok(out)
+}
+
+/// The page cache's residency of `span`'s pages into `vec`, one byte a
+/// page, bit 0 set for a resident one: `mincore`, which reads the page
+/// tables and the page cache and faults nothing in. `span` starts on a page
+/// boundary inside the probe's live read-only mapping of a shard.
+fn mincore_into(span: &[u8], vec: &mut Vec<u8>, page: usize) -> std::io::Result<()> {
+    vec.clear();
+    vec.resize(span.len().div_ceil(page), 0u8);
+    // SAFETY: `span` lies inside the probe's live read-only mapping of a
+    // shard and starts on a page boundary (the mapping starts on one, and a
+    // drop run and each of its pages are whole pages of file offsets); `vec`
+    // holds one byte for each of its pages. mincore reads the page tables and
+    // the page cache and writes only `vec`.
+    let rc = unsafe {
+        libc::mincore(
+            span.as_ptr().cast_mut().cast(),
+            span.len(),
+            vec.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The expert whose bytes hold `page`: its offset in the routed stack of
+/// its layer that holds it (a `blk.<l>.` tensor whose name holds `_exps`)
+/// in the probe's own tensor table, the stack cut into `experts` equal
+/// parts. Refused by name: an offset in no routed stack of the layer.
+fn expert_at(probe: &Split, page: &Page, experts: u32) -> Result<u32, GateError> {
+    let g = probe.shard(page.shard).ok_or_else(|| {
+        format!(
+            "layer {}: shard {} is not in the probe",
+            page.layer, page.shard
+        )
+    })?;
+    let base = g.mapping().as_ptr() as usize;
+    let prefix = format!("blk.{}.", page.layer);
+    for t in g.iter_tensors() {
+        let Ok(d) = g.data(t) else { continue };
+        let t0 = (d.as_ptr() as usize - base) as u64;
+        let t1 = t0 + d.len() as u64;
+        if t.name.starts_with(&prefix) && t.name.contains("_exps") && (t0..t1).contains(&page.at) {
+            let per = (t1 - t0) / u64::from(experts);
+            return Ok(u32::try_from((page.at - t0) / per)?);
+        }
+    }
+    Err(format!(
+        "layer {} shard {}: the page at {} lies in no routed stack of the layer",
+        page.layer, page.shard, page.at
+    )
+    .into())
 }
 
 /// The readahead window of the device that holds `path`, in pages: its
@@ -732,14 +880,47 @@ fn run() -> Result<(), GateError> {
         let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
         let prompt_bound = f.layers as u64 * cpus * 2 * ra;
         let steps_bound = paged.landed as u64 * 15 * ra / 2;
-        let base_ok = f.base.total > 0 && f.base.interior == 0;
+        // A page past the ones checked one by one counts held.
+        let held = f.held.iter().filter(|&&h| h).count() as u64 + f.first.past;
+        let base_ok = f.base.total > 0 && held == 0;
         let prompt_ok = f.prompt.interior <= prompt_bound;
         let steps_ok = f.steps.interior <= steps_bound;
         let footprint = base_ok && prompt_ok && steps_ok;
+        for ((p, h), at) in f
+            .first
+            .pages
+            .iter()
+            .zip(&f.held)
+            .zip(&f.at_prompt)
+            .take(PAGES_SHOWN)
+        {
+            let id = expert_at(&probe, p, experts)?;
+            let class = if u64::from(id) < f.card.get(p.layer).copied().unwrap_or(0) {
+                "a card id"
+            } else if tier.serves(p.layer, id) {
+                "an NVMe-tier id"
+            } else {
+                "a host id"
+            };
+            println!(
+                "footprint base page: layer {} row {} shard {} offset {} expert {id} ({class}), \
+                 {} pages from its run's nearer end; held through the second drop {h}, \
+                 resident at the prompt's read {at}",
+                p.layer, p.row, p.shard, p.at, p.from_end
+            );
+        }
+        if f.first.pages.len() > PAGES_SHOWN {
+            println!(
+                "footprint base pages: {} more checked, not shown",
+                f.first.pages.len() - PAGES_SHOWN
+            );
+        }
         println!(
             "footprint: {} pages in the drop runs over {} paged layers, R {ra} pages \
              (read_ahead_kb), an edge band of {} pages at each run end (printed, not judged); \
-             in the interiors {} after the tier's own drop (want 0: {}), {} after the prompt \
+             in the interiors {} after the tier's own drop (printed), {held} of them held \
+             through a second drop ({} past the {HELD_CHECKED} checked one by one, counted \
+             held; want 0: {}), {} after the prompt \
              (at most {} layers x {cpus} readers x 2R = {prompt_bound}: {}), {} after {STEPS} \
              steps (at most {} flips x 15R/2 = {steps_bound}: {}); in the bands {} / {} / {}; \
              the prompt's drops {} calls, {:.1} ms on the dropper's thread beside the \
@@ -748,6 +929,7 @@ fn run() -> Result<(), GateError> {
             f.layers,
             f.band,
             f.base.interior,
+            f.first.past,
             if base_ok {
                 "ok"
             } else {
