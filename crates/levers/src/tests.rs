@@ -1097,17 +1097,17 @@ fn draft_yields_to_the_context_only_under_the_base() {
 #[test]
 fn a_paged_plan_steps_one_column() {
     let arena = 23_434_203_136_u64;
-    let at = |arena, slots, slots_set, draft, draft_set| PagedAt {
+    let at = |arena, slots, slots_set: bool, draft, draft_set| PagedAt {
         arena,
         slots,
-        slots_set,
+        slots_by: slots_set.then_some(SlotsBy::Parallel),
         draft,
         draft_set,
     };
-    let refused = |parallel, draft| {
+    let refused = |parallel: Option<usize>, draft| {
         Err(PagedRefused {
             arena,
-            parallel,
+            slots: parallel.map(|n| (SlotsBy::Parallel, n)),
             draft,
         })
     };
@@ -1135,7 +1135,7 @@ fn a_paged_plan_steps_one_column() {
     assert_eq!(
         PagedRefused {
             arena,
-            parallel: Some(3),
+            slots: Some((SlotsBy::Parallel, 3)),
             draft: true
         }
         .to_string(),
@@ -1145,6 +1145,55 @@ fn a_paged_plan_steps_one_column() {
          kernel swaps the arena out); serve --parallel 1 or leave --parallel unset; set \
          BLOOMERY_DRAFT=off or leave it unset"
     );
+    // The CLI's own count, named as it is set.
+    let cli = PagedAt {
+        arena,
+        slots: 2,
+        slots_by: Some(SlotsBy::GenSlots),
+        draft: false,
+        draft_set: false,
+    };
+    assert_eq!(
+        paged_columns(&cli).map_err(|e| e.to_string()),
+        Err(
+            "BLOOMERY_GEN_SLOTS=2: the plan pages host experts through the NVMe tier's \
+             23434203136 B RAM arena, and a paged plan steps one column (a step of several \
+             reads the paged experts through the file mapping, whose page cache grows until \
+             the kernel swaps the arena out); leave BLOOMERY_GEN_SLOTS unset"
+                .to_owned()
+        )
+    );
+    // The one-column load's draft: a draft that ran, or that only its yield
+    // to the context turned off (judged on the plan of several slots the
+    // load abandons), is off by the paged rule; every other reason holds
+    // whatever the plan, and stays.
+    let paged = Some(Draft38Off::Paged { arena });
+    let y = DraftYield::of(702, 6165, 4096, 2_842_413_228).expect("the 3060's yield");
+    assert_eq!(paged_draft(true, None, arena), (true, paged.clone()));
+    assert_eq!(
+        paged_draft(false, Some(Draft38Off::Yield(y)), arena),
+        (true, paged.clone()),
+        "a yield judged on the abandoned plan"
+    );
+    let file = Path::new("/models/q/mtp.gguf");
+    for stays in [
+        Draft38Off::Set,
+        Draft38Off::Gate,
+        Draft38Off::Logits,
+        Draft38Off::RouteTrace,
+        Draft38Off::NoFile(file.to_path_buf()),
+        Draft38Off::Ctx { need: 5, ctx: 4 },
+        Draft38Off::Borrowed {
+            name: "output.weight".to_string(),
+            ty: "q6_K".to_string(),
+        },
+    ] {
+        assert_eq!(
+            paged_draft(false, Some(stays.clone()), arena),
+            (false, Some(stays.clone())),
+            "{stays:?}"
+        );
+    }
     assert_eq!(
         Draft38Off::Paged { arena }.to_string(),
         "unset: the plan pages host experts through the NVMe tier's 23434203136 B RAM arena, \
