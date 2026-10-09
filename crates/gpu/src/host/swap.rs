@@ -3352,7 +3352,7 @@ impl SwapMachine {
     fn drain_copies(&self, what: &'static str) -> Result<(), GpuError> {
         let was = self.shared.flush.swap(true, Ordering::AcqRel);
         let r = poll_drained(&self.copy, self.shared.deadline).map_err(|e| match e {
-            Drain::Driver(e) => e,
+            Drain::Driver(e) | Drain::Exit(e) => e,
             Drain::Late(waited) => GpuError::protocol(
                 what,
                 format!(
@@ -3427,6 +3427,13 @@ impl Drop for SwapMachine {
         } else {
             match poll_drained(&self.copy, deadline) {
                 Ok(()) => None,
+                // The process's exit takes the ring, the words and the
+                // source with it: nothing is freed under the driver, and
+                // nothing is named.
+                Err(Drain::Exit(_)) => {
+                    std::mem::forget(Arc::clone(&self.shared));
+                    return;
+                }
                 Err(Drain::Late(_)) => Some(Leak {
                     reason: LeakReason::Drain,
                     code: None,

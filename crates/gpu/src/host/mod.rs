@@ -340,6 +340,11 @@ pub fn nanos(d: Duration) -> u64 {
 pub(crate) enum Drain {
     /// The query returned a driver error.
     Driver(GpuError),
+    /// The driver was deinitialized (`CUDA_ERROR_DEINITIALIZED`): the process
+    /// is exiting, and its exit takes every resource the stream used. A drop
+    /// leaves them to it and names no leak; any other caller returns the
+    /// error.
+    Exit(GpuError),
     /// The stream was still running past the deadline, after this long.
     Late(Duration),
 }
@@ -347,9 +352,27 @@ pub(crate) enum Drain {
 /// Poll `stream` until it has drained, at most `deadline`, sleeping
 /// between polls from the first.
 pub(crate) fn poll_drained(stream: &CudaStream, deadline: Duration) -> Result<(), Drain> {
-    match await_within("poll_drained", deadline, Duration::ZERO, || stream.query()) {
+    drain_of(await_within(
+        "poll_drained",
+        deadline,
+        Duration::ZERO,
+        || stream.query(),
+    ))
+}
+
+/// [`poll_drained`]'s reading of its wait: a stall past the deadline, the
+/// driver deinitialized under it, or another driver error.
+fn drain_of(waited: Result<(), GpuError>) -> Result<(), Drain> {
+    match waited {
         Ok(()) => Ok(()),
         Err(GpuError::Stalled { waited, .. }) => Err(Drain::Late(waited)),
+        Err(
+            e @ GpuError::Driver {
+                source:
+                    cuda_core::DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_DEINITIALIZED),
+                ..
+            },
+        ) => Err(Drain::Exit(e)),
         Err(e) => Err(Drain::Driver(e)),
     }
 }
@@ -441,7 +464,7 @@ pub(crate) fn drain_within(
     what: &'static str,
 ) -> Result<(), GpuError> {
     poll_drained(stream, deadline).map_err(|e| match e {
-        Drain::Driver(e) => e,
+        Drain::Driver(e) | Drain::Exit(e) => e,
         Drain::Late(waited) => GpuError::protocol(
             what,
             format!("the stream did not drain in {waited:?} (deadline {deadline:?})"),
@@ -2705,9 +2728,35 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PassKind, SERVED_TIERS, await_within, pass_kept, refuse_tier_count};
+    use super::{
+        Drain, PassKind, SERVED_TIERS, await_within, drain_of, pass_kept, refuse_tier_count,
+    };
     use crate::GpuError;
     use std::time::Duration;
+
+    /// A drain's wait reads as drained, late past its deadline, the process's
+    /// exit when the driver was deinitialized under it (a drop's no-leak
+    /// case), and any other driver error as itself.
+    #[test]
+    fn a_drain_tells_the_exit_from_a_fault() {
+        use cuda_core::{DriverError, sys};
+        let driver = |code| GpuError::Driver {
+            op: None,
+            source: DriverError(code),
+        };
+        assert!(drain_of(Ok(())).is_ok());
+        let late = drain_of(Err(GpuError::Stalled {
+            what: "poll_drained",
+            waited: Duration::from_secs(2),
+            bound: Duration::from_secs(1),
+            note: String::new(),
+        }));
+        assert!(matches!(late, Err(Drain::Late(w)) if w == Duration::from_secs(2)));
+        let exit = drain_of(Err(driver(sys::cudaError_enum_CUDA_ERROR_DEINITIALIZED)));
+        assert!(matches!(exit, Err(Drain::Exit(_))));
+        let fault = drain_of(Err(driver(sys::cudaError_enum_CUDA_ERROR_LAUNCH_FAILED)));
+        assert!(matches!(fault, Err(Drain::Driver(_))));
+    }
 
     /// A bounded engine wait returns once its query says done, and past its
     /// bound is a named stall that carries the wait, its time and the bound.
