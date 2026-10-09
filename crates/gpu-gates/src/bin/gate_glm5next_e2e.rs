@@ -343,6 +343,28 @@
 //! random weights cannot meet (`Tag::FileBound`: the solo run's proposals). The layer, node and memory-operation
 //! counts and the Q6_K layers are read from the opened file (`shared/glm5next_tier.rs`); the real tier prints a
 //! witness line that each equals the literal it replaced.
+//!
+//! The fixture tier holds the model against ik's sets dumped on the fixture file too
+//! (`Tag::FixtureOracle`, each set opened through `tier::fixture_set`; the real tier leaves each such clause to the
+//! fixture tier by name). Random weights leave a near-flat head and a router whose margins are the real file's, so
+//! these clauses take bands derived for the fixture ([`FxBands`]: every projection site of the file, counted by how
+//! both engines round its activation) in place of the real file's measured ones, and an argmax is held as a tie band
+//! ([`flip::head_tie`]), not as equality or as ik's runner-up:
+//! - (cfx) the free run of the batch set: the layer outputs off every flip's path within each layer's band, the flips
+//!   first on their path under the pair rule at `route_cap`'s form, the last argmax as a tie band.
+//! - (crx) the batch set as one batch call with ik's picks and weights planted (`plant_prompt_routes`), so no route
+//!   differs: the last logits within the head's band, the argmax as a tie band. A batch call exposes no layer's
+//!   output, so the head's band holds the chain.
+//! - (ffx) the forced arm on the fixture's set: each tap's ratio within [`RATIO_BAND`], and the head's ratio, the
+//!   quantities (t) feeds [`HEAD_RATIO`] with, within `√(1 + (q_head / input)²)` widened by 6 deviations of the
+//!   ratio's own spread, on the free chain's last position.
+//! - (tfx) each step set: the two 4-token sets as (t) runs them, their layer outputs within the bands below the first
+//!   flip's layer of (cfx) and the argmax as a tie band; the long sets with ik's routes of the prefill planted (and
+//!   the step's own, in a second run), the logits and the argmax held, the layers before the first routed one held.
+//!
+//! A run that takes the load at [`CTX`]'s clauses declares one fixture-oracle clause for each of (cfx), (crx) and
+//! (ffx) and one for each step set it takes (`tier::expect_fixture_oracle`, [`declared_fixture_oracle`], which reads
+//! the same step-set table and selection the clauses do); every other arm declares none.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -382,9 +404,9 @@ mod gate {
     use crate::card;
     use crate::e2e::{
         Worst, argmax, clause, clause_timed, elapsed, first_flip_layers, flips_report, ik_last,
-        layer_rels, layer_table, minus, normed, outcome, pick, print_layers, quant_gap, refused_by,
-        refused_saying, rel, same_bits, second, set_open, tap, tap_at, tie_numbers, word_after,
-        worst_off_path,
+        layer_rels, layer_table, minus, normed, on_path, outcome, pick, print_layers, quant_gap,
+        refused_by, refused_saying, rel, same_bits, second, set_open, tap, tap_at, tie_numbers,
+        word_after, worst_off_path,
     };
     use crate::glm5next_tier;
     use crate::quiet::Quiet;
@@ -402,6 +424,7 @@ mod gate {
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
     use bloomery_gpu::model::{SlotsOut, StepMode};
     use bloomery_gpu::weights::DevWeight;
+    use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
@@ -426,6 +449,7 @@ mod gate {
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, NextnPlan, PlanInputs};
     use model::placement::{Machine, Plan};
+    use refset::arch::glm5next::fixture as fx;
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::{FfnKind, Layer, MixerKind};
@@ -1074,13 +1098,16 @@ mod gate {
     /// the mixer sub-layer on ik's layer input (`hc_init`, then `l_out-(L−1)`),
     /// the feed-forward sub-layer on ik's streams after the mixer
     /// (`attn_out-L`); each tap's error over its input's gap within
-    /// [`RATIO_BAND`], every flip allowed ([`Flip::allowed`]). Returns the
-    /// verdict and each layer's error on the streams (the mixer's and the
-    /// block's in quadrature), the input [`FREE_BAND`] is derived from.
+    /// [`RATIO_BAND`], every flip allowed ([`Flip::allowed`]) under [`FLIP_ERR_CAP`], or, on the
+    /// fixture (`fx`), under `route_cap`'s form on ik's router logits at the cell at the band the
+    /// ratio test holds the router's logits to: [`RATIO_BAND`] times the fold's own gap. Returns
+    /// the verdict and each layer's error on the streams (the mixer's and the block's in
+    /// quadrature), the input [`FREE_BAND`] is derived from.
     fn forced(
         m: &mut Glm5nextModel,
         man: &RefManifest,
         routes: &[Option<IkRoute>],
+        fx: bool,
     ) -> Result<(bool, Vec<f64>), GateError> {
         let file = glm5next_tier::open()?;
         let kinds = m.body("forced")?.kinds();
@@ -1169,19 +1196,24 @@ mod gate {
                     return Err(format!("layer {l}: ik routes {} tokens", ik.tokens()).into());
                 }
                 let logits: Vec<f32> = rs.iter().flat_map(|r| r.logits.clone()).collect();
-                w.add(
-                    "ffn_moe_logits",
-                    rel(&logits, &tap(man, &format!("ffn_moe_logits-{l}"))?),
-                    gap_hcf,
-                );
+                let ik_logits = tap(man, &format!("ffn_moe_logits-{l}"))?;
+                w.add("ffn_moe_logits", rel(&logits, &ik_logits), gap_hcf);
                 let ranked: Vec<f32> = rs.iter().flat_map(|r| ours_ranked(r)).collect();
                 w.add("ffn_moe_probs_biased", rel(&ranked, &ik.biased), gap_hcf);
                 let ik_w = tap(man, &format!("ffn_moe_weights_scaled-{l}"))?;
                 let (mut w_ours, mut w_ik) = (Vec::new(), Vec::new());
                 for (t, r) in rs.iter().enumerate() {
                     if let Some(fl) = flip_at(l, t, r, ik) {
-                        println!("{}", fl.line("forced", FLIP_ERR_CAP));
-                        flips_ok &= fl.allowed(FLIP_ERR_CAP);
+                        let cap = if fx {
+                            let z = ik_logits
+                                .get(t * N_EXPERT..(t + 1) * N_EXPERT)
+                                .ok_or_else(|| format!("layer {l}: no router logits row at {t}"))?;
+                            fx_route_cap(RATIO_BAND * gap_hcf, z)
+                        } else {
+                            FLIP_ERR_CAP
+                        };
+                        println!("{}", fl.line("forced", cap));
+                        flips_ok &= fl.allowed(cap);
                         flips_all += 1;
                         kept.retain(|&k| k != t);
                         continue;
@@ -1256,6 +1288,532 @@ mod gate {
         Ok((ok, errs))
     }
 
+    // ------------------------------------------ the fixture's oracle clauses
+
+    /// The fixture-oracle clauses of the load at [`CTX`] besides the step sets', which the run
+    /// decides when it takes that load's clauses.
+    const FX_CLAUSES: usize = FX_BATCH_CLAUSES.len();
+    const FX_BATCH_CLAUSES: &[&str] = &[CFX, CRX, FFX];
+
+    const CFX: &str = "(cfx) free: layer outputs, routes and the last argmax against ik's batch set on the fixture";
+    const CRX: &str = "(crx) ik-routed: ik's picks and weights planted, the logits and the argmax \
+                       against ik's batch set on the fixture";
+    const FFX: &str = "(ffx) forced: each sub-layer teacher-forced on ik's taps of the fixture's \
+                       batch set";
+
+    /// One step set of (t) and (tfx): the real file's name and family, the fixture's, and whether
+    /// it is a 4-token set, whose band reads (cfx)'s first flip.
+    type StepSetRow = (
+        (&'static str, &'static Family),
+        (&'static str, &'static Family),
+        bool,
+    );
+
+    /// The four step sets: the one list (t), (tfx), the selection [`StepSets::takes`] makes and
+    /// the declared count read.
+    fn step_set_table() -> [StepSetRow; 4] {
+        [
+            ((STEP4, &IK), (fx::STEP4, &fx::IK), true),
+            (
+                (STEP4_EVERY_NODE, &IK),
+                (fx::STEP4_EVERY_NODE, &fx::IK),
+                true,
+            ),
+            ((D1K, &IK), (fx::D1K, &fx::IK), false),
+            ((D3K_DSA, &IK_DSA), (fx::D3K_DSA, &fx::IK_DSA), false),
+        ]
+    }
+
+    /// The fixture-oracle clauses a run decides: [`FX_CLAUSES`] and one a step set the run takes,
+    /// when it takes the load at [`CTX`]'s clauses, none otherwise.
+    fn declared_fixture_oracle(only: Only, sets: StepSets) -> usize {
+        if !only.runs_main() {
+            return 0;
+        }
+        FX_CLAUSES
+            + step_set_table()
+                .iter()
+                .filter(|row| sets.takes(row.0.0))
+                .count()
+    }
+
+    /// The fixture's error bands, counted as [`gemm_bands`] counts, over every projection site of
+    /// the file, with each site's rounding the two engines' own (`act_rule::site_rel` at the worst
+    /// crest of each side's block, the two as independent errors): the mixer's sites and the
+    /// block's ([`glm5next_tier::mixer_terms`], [`glm5next_tier::block_terms`]) add as variances,
+    /// layers adding independently, where ik rounds a projection's activation to its weight
+    /// type's format and we read the form each launch reads. `router[l]` is the band of layer
+    /// `l`'s router input (the layers before it and its own mixer), `stream[l]` of the streams
+    /// after the layer, and `head` of the logits: the last stream and the head's own input,
+    /// which ik rounds and we read as f32.
+    struct FxBands {
+        router: Vec<f64>,
+        stream: Vec<f64>,
+        head: f64,
+        /// The head's own input's rounding.
+        q_head: f64,
+        /// Each layer's sites and bands, as printed.
+        lines: Vec<String>,
+    }
+
+    /// The bands of the file `split` whose layers are `kinds`, its dense projections read on `dense`
+    /// (`Arm::Gemv` below [`GEMM_FROM`] columns, `Arm::Gemm` from it).
+    fn ik_bands(split: &Split, kinds: &[Layer], dense: Arm) -> Result<FxBands, GateError> {
+        let (mut acc, mut router, mut stream, mut lines) =
+            (0.0f64, Vec::new(), Vec::new(), Vec::new());
+        for (l, k) in kinds.iter().enumerate() {
+            let mixer = glm5next_tier::mixer_terms(split, l, k.mixer, dense)?;
+            let block = glm5next_tier::block_terms(split, l, k.ffn, dense)?;
+            let mix = glm5next_tier::var(&mixer);
+            router.push((acc + mix).sqrt());
+            acc += mix + block.var();
+            stream.push(acc.sqrt());
+            lines.push(format!(
+                "layer={l} {:?}/{:?}: mixer var {mix:.4e} [{}]; block var {:.4e} [{} | shared {}]; \
+                 router band {:.4e} stream band {:.4e}",
+                k.mixer,
+                k.ffn,
+                glm5next_tier::terms_text(&mixer),
+                block.var(),
+                glm5next_tier::terms_text(&block.main),
+                glm5next_tier::terms_text(&block.shared),
+                router[l],
+                stream[l]
+            ));
+        }
+        let head = glm5next_tier::site(split, &names::output(), Arm::Gemv, 1.0)?;
+        let q_head = head.rel.joint();
+        lines.push(format!(
+            "head: input rounding [{}] var {:.4e}",
+            head.text(),
+            head.var()
+        ));
+        Ok(FxBands {
+            router,
+            stream,
+            head: (acc + head.var()).sqrt(),
+            q_head,
+            lines,
+        })
+    }
+
+    impl FxBands {
+        /// Every layer's terms and the head's band.
+        fn print(&self, clause: &str) {
+            for line in &self.lines {
+                println!("{clause} ik_bands {line}");
+            }
+            println!(
+                "{clause} ik_bands head band {:.4e} (the {} layers' variances and the head's own \
+                 input {:.4e}, in quadrature)",
+                self.head,
+                self.stream.len(),
+                self.q_head
+            );
+        }
+    }
+
+    /// The most error two ranked values may carry at an excused flip, `route_cap`'s form on ik's
+    /// router logits `z` at the cell: each ranked value (a sigmoid score plus the bias) moves by at
+    /// most 1/4 of its logit's move, which is `band` times the logits' RMS; two values, three
+    /// deviations each.
+    fn fx_route_cap(band: f64, z: &[f32]) -> f64 {
+        flip::flip_cap(band / 4.0, z)
+    }
+
+    /// The error a fixture-oracle clause ended in, printed as its FAIL, never the gate's end: a set
+    /// the tier refused is that clause's named failure and the other clauses still run.
+    fn fx_clause<T>(what: &str, r: Result<T, GateError>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                println!("e2e {what}: ended in error \"{e}\" {}", verdict(false));
+                None
+            }
+        }
+    }
+
+    // ------------------------------------------------ (cfx) free, on the fixture
+
+    /// (cfx), the free-running clause on the fixture's batch set: [`free`]'s arms under bands
+    /// derived for the fixture. A flip first on its path (no flip at a lower layer at the same or
+    /// an earlier position) is held to the pair rule under `route_cap`'s form at the layer's
+    /// router band ([`FxBands::router`]); a flip past an earlier one reads an input no band
+    /// covers, and is counted against its cap and printed. Each layer output off every flip's path
+    /// is held within the layer's stream band, those past a flip printed and counted; the last
+    /// position's argmax is held as a tie band ([`flip::head_tie`]) at the head's band, which
+    /// excuses the rounding of two engines on a near-flat row, not a run that picks another
+    /// token. Void, a named FAIL, when (l) is red: the picks are the layered run's. Returns the
+    /// verdict and, by position, the first layer a flip lies on the path of.
+    fn free_fx(
+        man: &RefManifest,
+        eager: &Run,
+        (layered, layered_ok): (&[Vec<ForcedRow>], bool),
+        routes: &[Option<IkRoute>],
+        bands: &FxBands,
+    ) -> Result<(bool, Vec<usize>), GateError> {
+        bands.print("cfx");
+        let table = layer_table(man, &eager.taps, STREAMS * HIDDEN, n_layer())?;
+        for (l, row) in table.iter().enumerate() {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|e| e.map_or("-".to_string(), |e| format!("{e:.3e}")))
+                .collect();
+            println!(
+                "cfx table layer={l} l_out_rel by tap {} (stream band {:.3e})",
+                cells.join(" "),
+                bands.stream[l]
+            );
+        }
+        print_margins(routes);
+        let logits: Vec<Option<Vec<f32>>> = routes
+            .iter()
+            .enumerate()
+            .map(|(l, r)| {
+                r.as_ref()
+                    .map(|_| tap(man, &format!("ffn_moe_logits-{l}")))
+                    .transpose()
+            })
+            .collect::<Result<_, _>>()?;
+        let mut flips = Vec::new();
+        for (l, (rows, ik)) in layered.iter().zip(routes).enumerate() {
+            let Some(ik) = ik else { continue };
+            for (t, r) in rows.iter().enumerate() {
+                let route = r
+                    .route
+                    .as_ref()
+                    .ok_or_else(|| format!("layer {l}: a routed layer with no route"))?;
+                flips.extend(flip_at(l, t, route, ik));
+            }
+        }
+        // The earliest position a flip lies at below each layer.
+        let mut below = vec![usize::MAX; n_layer() + 1];
+        for f in &flips {
+            for e in below.iter_mut().skip(f.layer + 1) {
+                *e = (*e).min(f.token);
+            }
+        }
+        let (mut first, mut refused, mut past, mut past_over) = (0usize, 0usize, 0usize, 0usize);
+        let mut first_worst = 0.0f64;
+        for f in &flips {
+            let z = logits
+                .get(f.layer)
+                .and_then(Option::as_deref)
+                .and_then(|z| z.get(f.token * N_EXPERT..(f.token + 1) * N_EXPERT))
+                .ok_or_else(|| format!("layer {}: no router logits at {}", f.layer, f.token))?;
+            let cap = fx_route_cap(bands.router[f.layer], z);
+            let prior = below[f.layer] <= f.token;
+            let err = f.pairs.iter().map(|p| p.3).fold(0.0f64, f64::max);
+            let allowed = f.allowed(cap);
+            println!(
+                "{} ({})",
+                f.line("cfx", cap),
+                if prior {
+                    "past an earlier flip on its path: printed, not held"
+                } else {
+                    "first on its path: held"
+                }
+            );
+            if prior {
+                past += 1;
+                past_over += usize::from(!allowed);
+            } else {
+                first += 1;
+                refused += usize::from(!allowed);
+                first_worst = first_worst.max(err / cap);
+            }
+        }
+        let cells: usize = routes.iter().flatten().map(IkRoute::tokens).sum();
+        println!(
+            "cfx flips: {} of {cells} routed cells, {first} first on their path ({refused} past the \
+             pair rule or its cap; worst error {first_worst:.3} of its cap), {past} past an earlier \
+             flip ({past_over} past their cap, printed)",
+            flips.len()
+        );
+        let (mut worst, mut wl, mut wt, mut exempt) = (0.0f64, 0usize, 0usize, 0usize);
+        for (l, row) in table.iter().enumerate() {
+            for (t, e) in row.iter().enumerate() {
+                let Some(e) = *e else { continue };
+                if on_path(&flips, l, t, false) {
+                    exempt += 1;
+                    continue;
+                }
+                let r = e / bands.stream[l];
+                if r > worst || r.is_nan() {
+                    (worst, wl, wt) = (r, l, t);
+                }
+            }
+        }
+        let firsts = first_flip_layers(&flips, eager.taps.len(), n_layer());
+        println!(
+            "cfx: the bands hold before the first flip on a position's path; first such layer by \
+             position {}; {exempt} (layer, position) outputs past a flip, printed and counted",
+            firsts
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let ik_last = ik_last(man, N_VOCAB)?;
+        let ours = eager.logits.last().ok_or("no logits")?;
+        let top = argmax(ours);
+        let tie = flip::head_tie(&ik_last, top, bands.head);
+        if !layered_ok {
+            println!(
+                "cfx: FAIL: void — the layered run is not the chain's ((l) is red), so the picks it \
+                 read and the flips they excuse are another chain's"
+            );
+        }
+        let ok = layered_ok && worst <= 1.0 && refused == 0 && tie;
+        println!(
+            "cfx: {} tokens, {} flips, worst l_out_rel off every flip's path {:.3} of its band at \
+             layer {wl} position {wt}; last position argmax ours={top} ik={} ({:.3e} below ik's top, \
+             tie cap {:.3e} at the head band {:.3e}) {}; logits_rel={:.3e} (printed) {}",
+            eager.tokens.len(),
+            flips.len(),
+            worst,
+            argmax(&ik_last),
+            flip::head_gap(&ik_last, top),
+            flip::head_cap(bands.head, &ik_last),
+            bands.head,
+            if tie { "held" } else { "past the tie band" },
+            rel(ours, &ik_last),
+            verdict(ok)
+        );
+        Ok((ok, firsts))
+    }
+
+    // ------------------------------------------------ (crx) ik-routed
+
+    /// ik's picks and weights of the batch set, laid as the batch walk's plant takes them: each
+    /// routed layer's picks (`ffn_moe_topk-L`) and the weights its experts' outputs are summed
+    /// with (`ffn_moe_weights_scaled-L`), [`N_USED`] a position, `None` for a dense layer. The
+    /// weights are ik's, as dumped.
+    fn planted_rows(
+        man: &RefManifest,
+        routes: &[Option<IkRoute>],
+        positions: usize,
+    ) -> Result<Vec<Option<RouteTapRows>>, GateError> {
+        routes
+            .iter()
+            .enumerate()
+            .map(|(l, r)| {
+                let Some(r) = r else { return Ok(None) };
+                let weights = tap(man, &format!("ffn_moe_weights_scaled-{l}"))?;
+                if r.ids.len() != positions * N_USED || weights.len() != positions * N_USED {
+                    return Err(format!(
+                        "layer {l}: {} picks and {} weights for {positions} positions",
+                        r.ids.len(),
+                        weights.len()
+                    )
+                    .into());
+                }
+                let ids = r
+                    .ids
+                    .iter()
+                    .map(|&e| {
+                        u32::try_from(e)
+                            .map_err(|_| GateError::from(format!("layer {l}: pick {e}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(RouteTapRows {
+                    probs: Vec::new(),
+                    ids,
+                    weights,
+                }))
+            })
+            .collect()
+    }
+
+    /// (crx), the ik-routed clause on the fixture's batch set: the set's tokens as one batch call
+    /// from a reset (at most a chunk, so the step's gemvs) with ik's picks and weights planted at
+    /// every routed layer and position ([`plant_prompt_routes`], as [`gemm_forced`] plants), so no
+    /// route can differ from ik's. The last logits are held within the head's band
+    /// ([`FxBands::head`], both engines' rounding at every site of the chain) and the argmax as a
+    /// tie band. The picks the router made before the plant wrote over them are read back
+    /// ([`prompt_route_taps`]) and the cells where they differ from ik's counted: what the
+    /// plant held the run to. A batch call exposes no layer's output, so the layers are held
+    /// through the head's.
+    fn ik_routed(
+        m: &mut Glm5nextModel,
+        man: &RefManifest,
+        routes: &[Option<IkRoute>],
+        toks: &[u32],
+        bands: &FxBands,
+    ) -> Result<bool, GateError> {
+        let n = toks.len();
+        let planted = planted_rows(man, routes, n)?;
+        m.reset()?;
+        set_prompt_route_taps(m, n)?;
+        plant_prompt_routes(m, Some((&planted, n)))?;
+        let run = prefill(m, toks);
+        let unplanted = plant_prompt_routes(m, None);
+        let natural = prompt_route_taps(m, n);
+        let disarmed = set_prompt_route_taps(m, 0);
+        let tok = run?;
+        unplanted?;
+        let natural = natural?;
+        disarmed?;
+        let logits = m.logits()?;
+        m.reset()?;
+        let mut differ = 0usize;
+        for (nat, plan) in natural.iter().zip(&planted) {
+            let (Some(nat), Some(plan)) = (nat, plan) else {
+                continue;
+            };
+            for t in 0..n {
+                let (a, b) = (
+                    &nat.ids[t * N_USED..(t + 1) * N_USED],
+                    &plan.ids[t * N_USED..(t + 1) * N_USED],
+                );
+                differ += usize::from(!a.iter().all(|e| b.contains(e)));
+            }
+        }
+        let cells: usize = routes.iter().flatten().map(IkRoute::tokens).sum();
+        let ik_last = ik_last(man, N_VOCAB)?;
+        let logits_rel = rel(&logits, &ik_last);
+        let logits_ok = logits_rel <= bands.head;
+        let tie = flip::head_tie(&ik_last, tok, bands.head);
+        let ok = logits_ok && tie;
+        println!(
+            "crx: ik's picks and weights planted at {cells} routed cells ({differ} of them where \
+             our router's own picks differed); logits_rel {logits_rel:.3e} of the head band {:.3e} \
+             ({:.3} of it {}); argmax ours={tok} ik={} ({:.3e} below ik's top, tie cap {:.3e}) {} {}",
+            bands.head,
+            logits_rel / bands.head,
+            if logits_ok { "held" } else { "past it" },
+            argmax(&ik_last),
+            flip::head_gap(&ik_last, tok),
+            flip::head_cap(bands.head, &ik_last),
+            if tie { "held" } else { "past the tie band" },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    // ------------------------------------------------ (ffx) forced, on the fixture
+
+    /// The deviations the head ratio's bound sits above its expectation by: the count
+    /// [`flip::head_cap`] and [`flip::margin_cap`] hold their caps at.
+    const RATIO_SIGMAS: f64 = 6.0;
+
+    /// The relative sd of the head ratio's estimate. A norm over `n` independent entries has
+    /// relative sd `1/√(2n)`: the sum of squares of `n` Gaussian entries has relative sd `√(2/n)`,
+    /// its root half of it. The ratio's two numerators, the logits' error over `n_logits` entries
+    /// and the streams' over `n_in`, are counted as independent, which over-states the spread, as
+    /// both read the same stream error: `√(1/(2·n_in) + 1/(2·n_logits))`.
+    fn ratio_spread(n_in: usize, n_logits: usize) -> f64 {
+        (0.5 / n_in as f64 + 0.5 / n_logits as f64).sqrt()
+    }
+
+    /// The head's ratio on the free chain's last position, from the quantities (t)'s [`step_set`]
+    /// feeds [`HEAD_RATIO`] with: the logits row's relative distance from ik's (`tie_numbers`'
+    /// last value) over the last layer's own streams' (`layer_rels`' last row), here read at the
+    /// batch set's last position off the free run's eager taps and logits. The head is the
+    /// streams' mean, a norm and a linear map; on a random head its output carries its input's
+    /// relative error, scaled by `ρ ≤ 1` (the mean's error over the four streams' own), and ik's
+    /// rounding of the head's own input adds `q_head` in quadrature:
+    /// `ratio² = ρ² + (q_head / input_rel)²`. At `ρ = 1` that is the expectation, which a
+    /// measured ratio sits on and so exceeds about half the time; the ratio is held to it widened
+    /// by [`RATIO_SIGMAS`] of its own spread ([`ratio_spread`], over `STREAMS · HIDDEN` stream
+    /// and `N_VOCAB` logit entries). The distance of ik's head input from its 8-bit form is
+    /// printed beside the bound's `q_head`, and the ratio's reading against [`HEAD_RATIO`], which
+    /// (t) holds a named tie to.
+    fn head_ratio(man: &RefManifest, eager: &Run, bands: &FxBands) -> Result<bool, GateError> {
+        let ik_last = ik_last(man, N_VOCAB)?;
+        let ours = eager.logits.last().ok_or("no logits")?;
+        let table = layer_table(man, &eager.taps, STREAMS * HIDDEN, n_layer())?;
+        let input_rel = table
+            .last()
+            .and_then(|row| row.last().copied().flatten())
+            .ok_or("no last layer output at the last position")?;
+        let logits_rel = rel(ours, &ik_last);
+        let ratio = logits_rel / input_rel;
+        let expected = (1.0 + (bands.q_head / input_rel).powi(2)).sqrt();
+        let spread = ratio_spread(STREAMS * HIDDEN, N_VOCAB);
+        let bound = expected * (1.0 + RATIO_SIGMAS * spread);
+        let ok = ratio <= bound;
+        let crest = tap(man, "result_norm").map_or_else(
+            |_| "no result_norm row".to_string(),
+            |x| format!("{:.3e}", quant_gap(&x)),
+        );
+        println!(
+            "ffx head: logits_rel {logits_rel:.3e} over the last layer's {input_rel:.3e} = ratio \
+             {ratio:.3}; expectation {expected:.3} = sqrt(1 + (q_head {:.3e} / input)^2) at rho = \
+             1, spread {:.3e} of the ratio over {} stream and {N_VOCAB} logit entries [derived], \
+             bound {bound:.3} = expectation x (1 + {RATIO_SIGMAS:.0} spread); ik's head input at its \
+             actual crest {crest}; {:.3} of (t)'s tie bound {HEAD_RATIO:.1}x {}",
+            bands.q_head,
+            spread,
+            STREAMS * HIDDEN,
+            ratio / HEAD_RATIO,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (ffx): [`forced`] on the fixture's batch set, flips allowed under `route_cap`'s form at the
+    /// band the ratio test holds the router to, and the head's ratio ([`head_ratio`]).
+    fn forced_fixture(m: &mut Glm5nextModel, eager: &Run) -> Result<bool, GateError> {
+        let bands = fx_bands(m, Arm::Gemv)?;
+        let man = glm5next_tier::fx_set(FFX, &fx::IK, fx::BATCH)?;
+        let routes = ik_routes(&man)?;
+        let (forced_ok, _) = forced(m, &man, &routes, true)?;
+        let head_ok = head_ratio(&man, eager, &bands)?;
+        Ok(forced_ok && head_ok)
+    }
+
+    /// The fixture's bands of the model `m` has loaded, its dense projections on `arm`.
+    fn fx_bands(m: &mut Glm5nextModel, arm: Arm) -> Result<FxBands, GateError> {
+        let kinds = m.body("fixture bands")?.kinds();
+        ik_bands(&glm5next_tier::open()?, &kinds, arm)
+    }
+
+    /// (cfx) on the fixture's batch set, its bands printed with their terms.
+    fn free_fixture(
+        m: &mut Glm5nextModel,
+        eager: &Run,
+        layered: (&[Vec<ForcedRow>], bool),
+    ) -> Result<(bool, Vec<usize>), GateError> {
+        let bands = fx_bands(m, Arm::Gemv)?;
+        let man = glm5next_tier::fx_set(CFX, &fx::IK, fx::BATCH)?;
+        let routes = ik_routes(&man)?;
+        free_fx(&man, eager, layered, &routes, &bands)
+    }
+
+    /// (crx) on the fixture's batch set, `toks` its tokens.
+    fn routed_fixture(m: &mut Glm5nextModel, toks: &[u32]) -> Result<bool, GateError> {
+        let bands = fx_bands(m, Arm::Gemv)?;
+        let man = glm5next_tier::fx_set(CRX, &fx::IK, fx::BATCH)?;
+        let routes = ik_routes(&man)?;
+        ik_routed(m, &man, &routes, toks, &bands)
+    }
+
+    /// (tfx) on one fixture step set, opened for `clause` through the tier: the 4-token sets with
+    /// `band` the batch set's tokens and the first layer a flip lies on the path of at its last
+    /// position (cfx's), the long sets with none.
+    fn step_fixture(
+        m: &mut Glm5nextModel,
+        clause: &str,
+        (name, family): (&str, &Family),
+        band: Option<(&[u32], Option<usize>)>,
+    ) -> Result<bool, GateError> {
+        tier::fixture_set(clause, family, name)?;
+        match band {
+            Some((toks, last)) => {
+                let last = last
+                    .ok_or("(tfx)'s band reads the first flip of (cfx), which did not complete")?;
+                let bands = fx_bands(m, Arm::Gemv)?;
+                step_set_fx(m, (name, family), (toks, last), &bands)
+            }
+            None => {
+                let bands = fx_bands(m, Arm::Gemm)?;
+                bands.print(&format!("tfx {name}"));
+                step_long_fx(m, (name, family), &bands)
+            }
+        }
+    }
+
     // --------------------------------------------------- (t) step sets
 
     /// The step of set `name` after its prefill fed by our steps; its
@@ -1327,6 +1885,203 @@ mod gate {
         set_taps(m, false)?;
         m.set_mode(StepMode::Graph);
         Ok((taps, logits))
+    }
+
+    /// A step's layer outputs against their stream bands ([`FxBands::stream`]): every layer's
+    /// printed, the layers `0..held` held.
+    fn held_layers(what: &str, rels: &[(f64, usize)], held: usize, bands: &FxBands) -> bool {
+        let mut ok = true;
+        for (l, &(e, t)) in rels.iter().enumerate() {
+            let band = bands.stream[l];
+            let past = e > band || e.is_nan();
+            let on = l < held;
+            ok &= !(on && past);
+            println!(
+                "{what} layer={l} l_out_rel={e:.3e} at tap {t}, {:.3} of the stream band {band:.3e} \
+                 ({})",
+                e / band,
+                if on { "held" } else { "printed" }
+            );
+        }
+        ok
+    }
+
+    /// (tfx) on one of the two 4-token sets, which the batch set's tokens are the prefill and the
+    /// step of: [`step_set`]'s run — the prefill fed by our steps, then the step — with the step's
+    /// layer outputs held within their stream bands below the first layer a flip lies on the
+    /// path of at the batch set's last position (cfx's, as our steps route them as the free arm
+    /// did), and the step's argmax as a tie band at the head's band.
+    fn step_set_fx(
+        m: &mut Glm5nextModel,
+        (name, family): (&str, &Family),
+        (toks, last): (&[u32], usize),
+        bands: &FxBands,
+    ) -> Result<bool, GateError> {
+        let (man, pos, tok, ids, held) = set_open((name, family), Some((toks, last)))?;
+        m.reset()?;
+        let t = Instant::now();
+        if !ids.is_empty() {
+            m.step(&ids)?;
+        }
+        let r = run_last(m, tok)?;
+        let ik_last = ik_last(&man, N_VOCAB)?;
+        let rels = layer_rels(
+            &man,
+            std::slice::from_ref(&r.0),
+            STREAMS * HIDDEN,
+            n_layer(),
+        )?;
+        let inside = held_layers(&format!("tfx {name}"), &rels, held, bands);
+        let top = argmax(&r.1);
+        let tie = flip::head_tie(&ik_last, top, bands.head);
+        let ok = tie && inside;
+        println!(
+            "step {name}: logits digest {:016x} (FNV-1a over the f32 bits)",
+            Fnv1a64::default().f32s(&r.1).value()
+        );
+        println!(
+            "step {name}: position {pos} after {} fed ({:.1} s, runtime value); argmax ours={top} \
+             ik={} ({:.3e} below ik's top, tie cap {:.3e} at the head band {:.3e}) {}; logits_rel \
+             {:.3e} (printed); layers 0..{held} held within their stream bands, the rest printed {}",
+            ids.len(),
+            t.elapsed().as_secs_f64(),
+            argmax(&ik_last),
+            flip::head_gap(&ik_last, top),
+            flip::head_cap(bands.head, &ik_last),
+            bands.head,
+            if tie { "held" } else { "past the tie band" },
+            rel(&r.1, &ik_last),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (tfx) on one of the long sets (1,024 positions, and the 3,070-position `--dsa` set): ik's
+    /// routes of the prefill (`--prefill-routes`: [`RefManifest::prefill_routes`]) planted into
+    /// our batch prefill of the set's ids from a reset, so no route of the prefill can differ, and
+    /// the bands at the GEMM's arm (`bands`, from `Arm::Gemm`: the state the prefill carries was
+    /// written by batches past a chunk). Two runs, each from a reset:
+    /// - the prefill, then the step eagerly with the taps armed, as [`step_set`] runs it: its
+    ///   layer outputs against ik's `l_out-L`, the layers before the first routed one held within
+    ///   their stream bands (the step's own router is free, and its flips lie on the path of
+    ///   every layer after it), the rest printed;
+    /// - the prefill and then the step's id as a call of one, with the step's own picks and
+    ///   weights (the set's `ffn_moe_topk-L`, `ffn_moe_weights_scaled-L`) planted at its position
+    ///   too, a call of at most a chunk that is the step's bits: no route differs anywhere, so
+    ///   the last logits are held within the head's band and the argmax as a tie band.
+    ///
+    /// The plant is taken back on every exit.
+    fn step_long_fx(
+        m: &mut Glm5nextModel,
+        (name, family): (&str, &Family),
+        bands: &FxBands,
+    ) -> Result<bool, GateError> {
+        let (man, pos, tok, ids, _) = set_open((name, family), None)?;
+        let n = ids.len();
+        if pos as usize != n {
+            return Err(format!("{name}: the step at position {pos} after {n} prefill ids").into());
+        }
+        let routes =
+            man.prefill_routes("ffn_moe_topk", "ffn_moe_weights", "ffn_moe_weights_scaled")?;
+        routes.check_experts(u32::try_from(glm5next_tier::n_expert())?)?;
+        let n_dense = glm5next_tier::shape().n_dense;
+        let want: Vec<usize> = (n_dense..n_layer()).collect();
+        let got: Vec<usize> = routes.layers.iter().map(|r| r.layer as usize).collect();
+        if routes.positions != n || got != want {
+            return Err(format!(
+                "{name}: prefill routes of layers {got:?} over {} positions, want {want:?} over {n}",
+                routes.positions
+            )
+            .into());
+        }
+        // The plant's rows: ik's prefill routes, the step's own after them when asked.
+        let planted = |with_step: bool| -> Result<Vec<Option<RouteTapRows>>, GateError> {
+            let mut out: Vec<Option<RouteTapRows>> = vec![None; n_layer()];
+            for r in &routes.layers {
+                let l = r.layer as usize;
+                let (mut picks, mut weights) = (r.picks.clone(), r.last.clone());
+                if with_step {
+                    let row = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
+                    let step = topk_ids_logical_within(&man, row, N_EXPERT as u32)?;
+                    let w = tap(&man, &format!("ffn_moe_weights_scaled-{l}"))?;
+                    if step.len() != N_USED || w.len() != N_USED {
+                        return Err(format!(
+                            "{name} layer {l}: the step's {} picks and {} weights, want {N_USED}",
+                            step.len(),
+                            w.len()
+                        )
+                        .into());
+                    }
+                    for e in step {
+                        picks.push(u32::try_from(e).map_err(|_| {
+                            GateError::from(format!("{name} layer {l}: the step's pick {e}"))
+                        })?);
+                    }
+                    weights.extend(w);
+                }
+                out[l] = Some(RouteTapRows {
+                    probs: Vec::new(),
+                    ids: picks,
+                    weights,
+                });
+            }
+            Ok(out)
+        };
+        let ik_last = ik_last(&man, N_VOCAB)?;
+        // The prefill planted, the step free.
+        m.reset()?;
+        plant_prompt_routes(m, Some((&planted(false)?, n)))?;
+        let fed = prefill(m, &ids);
+        plant_prompt_routes(m, None)?;
+        fed?;
+        let t = Instant::now();
+        let r = run_last(m, tok)?;
+        let rels = layer_rels(
+            &man,
+            std::slice::from_ref(&r.0),
+            STREAMS * HIDDEN,
+            n_layer(),
+        )?;
+        let inside = held_layers(&format!("tfx {name}"), &rels, n_dense, bands);
+        println!(
+            "step {name}: logits digest {:016x} (FNV-1a over the f32 bits); the prefill planted, \
+             the step free: argmax ours={} ik={} (printed), logits_rel {:.3e} (printed), {:.1} s \
+             (runtime value)",
+            Fnv1a64::default().f32s(&r.1).value(),
+            argmax(&r.1),
+            argmax(&ik_last),
+            rel(&r.1, &ik_last),
+            t.elapsed().as_secs_f64()
+        );
+        // The prefill and the step both planted.
+        m.reset()?;
+        plant_prompt_routes(m, Some((&planted(true)?, n + 1)))?;
+        let fed = prefill(m, &ids).and_then(|_| prefill(m, &[tok]));
+        let unplanted = plant_prompt_routes(m, None);
+        let ours = fed?;
+        unplanted?;
+        let logits = m.logits()?;
+        m.reset()?;
+        let logits_rel = rel(&logits, &ik_last);
+        let logits_ok = logits_rel <= bands.head;
+        let tie = flip::head_tie(&ik_last, ours, bands.head);
+        let ok = inside && logits_ok && tie;
+        println!(
+            "step {name}: ik's routes planted at {} positions, the step's included: logits_rel \
+             {logits_rel:.3e} of the head band {:.3e} ({:.3} of it {}); argmax ours={ours} ik={} \
+             ({:.3e} below ik's top, tie cap {:.3e}) {}; layers 0..{n_dense} of the free step held \
+             {}",
+            n + 1,
+            bands.head,
+            logits_rel / bands.head,
+            if logits_ok { "held" } else { "past it" },
+            argmax(&ik_last),
+            flip::head_gap(&ik_last, ours),
+            flip::head_cap(bands.head, &ik_last),
+            if tie { "held" } else { "past the tie band" },
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     // ------------------------------------- (h) head fault, (a) taps, (o) owner
@@ -3926,6 +4681,13 @@ mod gate {
         StaggerDraft,
     }
 
+    impl Only {
+        /// Whether the run takes the load at [`CTX`]'s clauses.
+        fn runs_main(self) -> bool {
+            matches!(self, Only::All | Only::Main)
+        }
+    }
+
     /// Which of (t)'s step sets the load at [`CTX`] runs.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum StepSets {
@@ -3948,7 +4710,7 @@ mod gate {
 
         /// Whether the set is taken: the 4-token sets are the short ones.
         fn takes(self, name: &str) -> bool {
-            let short = name == STEP4 || name == STEP4_EVERY_NODE;
+            let short = step_set_table().iter().any(|row| row.2 && row.0.0 == name);
             match self {
                 StepSets::All => true,
                 StepSets::Short => short,
@@ -3971,7 +4733,7 @@ mod gate {
                 }
             },
         };
-        if !matches!(only, Only::All | Only::Main) {
+        if !only.runs_main() {
             return Err(
                 "--step-sets names the step sets of the load at CTX: it goes with \
                         --only main or no --only"
@@ -4013,7 +4775,7 @@ mod gate {
         let only = only()?;
         let sets = step_sets(only)?;
         let mut ok = true;
-        if matches!(only, Only::All | Only::Main) {
+        if only.runs_main() {
             let t = Instant::now();
             ok &= main_clauses(&levers, sets)?;
             elapsed("arm main", &t);
@@ -4078,6 +4840,7 @@ mod gate {
             elapsed("arm stagger-draft", &t);
         }
         println!("gate_glm5next_e2e: {}", tier::tally_line());
+        tier::expect_fixture_oracle("gate_glm5next_e2e", declared_fixture_oracle(only, sets))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 
@@ -4129,7 +4892,8 @@ mod gate {
         let layered_ok = layered_is_chain(&layered, &eager);
         ok &= layered_ok;
         elapsed("(l)", &t);
-        // The first layer a flip lies on the path of, at the last position: what (t)'s band reads.
+        // The first layer a flip lies on the path of, at the last position: what (t)'s and
+        // (tfx)'s bands read.
         let mut last = None;
         if tier::run_clause(
             "(c) free: layer outputs, routes and the last argmax against ik's batch set",
@@ -4142,6 +4906,20 @@ mod gate {
             last = Some(*firsts.last().ok_or("no positions")?);
             elapsed("(c)", &t);
         }
+        if tier::run_clause(CFX, Tag::FixtureOracle)? {
+            let t = Instant::now();
+            let got = fx_clause("(cfx)", free_fixture(m, &eager, (&layered, layered_ok)));
+            ok &= got.as_ref().is_some_and(|(free_ok, _)| *free_ok);
+            if let Some((_, firsts)) = got {
+                last = firsts.last().copied();
+            }
+            elapsed("(cfx)", &t);
+        }
+        if tier::run_clause(CRX, Tag::FixtureOracle)? {
+            let t = Instant::now();
+            ok &= fx_clause("(crx)", routed_fixture(m, &toks)).unwrap_or(false);
+            elapsed("(crx)", &t);
+        }
         drop(layered);
         if tier::run_clause(
             "(f) forced: each sub-layer teacher-forced on ik's taps",
@@ -4149,47 +4927,69 @@ mod gate {
         )? {
             let t = Instant::now();
             let (man, routes) = batch_oracle()?;
-            let (forced_ok, _) = forced(m, &man, &routes)?;
+            let (forced_ok, _) = forced(m, &man, &routes, false)?;
             ok &= forced_ok;
             elapsed("(f)", &t);
         }
+        if tier::run_clause(FFX, Tag::FixtureOracle)? {
+            let t = Instant::now();
+            ok &= fx_clause("(ffx)", forced_fixture(m, &eager)).unwrap_or(false);
+            elapsed("(ffx)", &t);
+        }
         let mut ties = 0usize;
         let mut ran = Vec::new();
-        for (set, banded) in [
-            ((STEP4, &IK), true),
-            ((STEP4_EVERY_NODE, &IK), true),
-            ((D1K, &IK), false),
-            ((D3K_DSA, &IK_DSA), false),
-        ] {
+        let mut ran_fixture = Vec::new();
+        for (set, fx_set, banded) in step_set_table() {
             if !sets.takes(set.0) {
                 continue;
             }
-            if !tier::run_clause(
+            if tier::run_clause(
                 &format!(
                     "(t) {}: the step's argmax and layer outputs against ik's",
                     set.0
                 ),
                 Tag::Oracle,
             )? {
-                continue;
+                let band = if banded {
+                    let last =
+                        last.ok_or("(t)'s band reads the first flip of (c), which did not run")?;
+                    Some((&toks[..], last))
+                } else {
+                    None
+                };
+                let t = Instant::now();
+                ok &= step_set(m, set, band, &mut ties)?;
+                elapsed(&format!("(t) {}", set.0), &t);
+                ran.push(set.0);
             }
-            let band = if banded {
-                let last =
-                    last.ok_or("(t)'s band reads the first flip of (c), which did not run")?;
-                Some((&toks[..], last))
-            } else {
-                None
-            };
-            let t = Instant::now();
-            ok &= step_set(m, set, band, &mut ties)?;
-            elapsed(&format!("(t) {}", set.0), &t);
-            ran.push(set.0);
+            let clause_name = format!(
+                "(tfx) {}: the step's argmax and layer outputs against ik's on the fixture",
+                fx_set.0
+            );
+            if tier::run_clause(&clause_name, Tag::FixtureOracle)? {
+                let t = Instant::now();
+                let band = banded.then_some((&toks[..], last));
+                ok &= fx_clause(
+                    &format!("(tfx) {}", fx_set.0),
+                    step_fixture(m, &clause_name, fx_set, band),
+                )
+                .unwrap_or(false);
+                elapsed(&format!("(tfx) {}", fx_set.0), &t);
+                ran_fixture.push(fx_set.0);
+            }
         }
         println!(
             "step sets ({}): {} ran, {ties} named tie(s)",
             sets.name(),
             ran.join(" ")
         );
+        if !ran_fixture.is_empty() {
+            println!(
+                "step sets on the fixture ({}): {} ran",
+                sets.name(),
+                ran_fixture.join(" ")
+            );
+        }
         let t = Instant::now();
         tier::sc("(k) checkpoints and cuts")?;
         ok &= keep_groups(&mut s)?;

@@ -44,7 +44,7 @@ mod tier;
 
 pub use body::nextn::{
     GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, WALK_ROWS, nextn_chain,
-    nextn_hidden, nextn_logits, nextn_store, nextn_target_streams, nextn_walk,
+    nextn_hidden, nextn_logits, nextn_router, nextn_store, nextn_target_streams, nextn_walk,
 };
 pub use body::prefill::{
     CHUNK, GEMM_FROM, GlmPromptSink, PrefillMode, PromptBytes, RouteTapRows, StoreDigest,

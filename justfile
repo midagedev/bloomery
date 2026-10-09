@@ -2023,10 +2023,13 @@ weekly-gpu-mimo2-e2e *ARGS:
 # the 1,024- and 3,070-position sets are weekly-gpu-glm5next-e2e-long's. Right after the load, before those, the card
 # experts (shared/glm5next_card.rs): the slot map holds each layer's id prefix [0, n_l) in ascending order, only on layers
 # whose stacks the card reads; at slots 0, n/2 and n-1 each stack's `_sel` and the gate·up are that expert's own upload
-# from the file, bit for bit; the card copy of the map is the host map at its row offsets. In the fixture tier the clauses
-# that read ik's sets (free, forced, the step sets) are Oracle clauses, deferred to the real tier by name; every other
-# clause runs on the fixture. Loads the whole model: alone in a batch in the real tier, under the big-load lock the V4.1
-# loads take; balanced over the cards in the fixture tier, which takes no lock.
+# from the file, bit for bit; the card copy of the map is the host map at its row offsets. In the fixture tier the real
+# file's clauses that read ik's sets (free, forced, the step sets) are Oracle clauses, deferred to the real tier by name,
+# and ik's sets dumped on the fixture file (`fx_ref_glm5next*`) take their place: free, ik-routed (ik's picks and weights
+# planted), forced and the two 4-token step sets, each a fixture-oracle clause the gate declares, held to bands counted
+# for the fixture's random weights, an argmax as a tie band; every other clause runs on the fixture. Loads the whole
+# model: alone in a batch in the real tier, under the big-load lock the V4.1 loads take; balanced over the cards in the
+# fixture tier, which takes no lock.
 # PIN(2026-10-09): its own bound, 1200 s. The measured median is 773 s (train028b/028c/028f's times rows), past 0.75 x
 # the default 900 the batch's budget refusal names; the gate's arms admit no smaller split (`--only` takes one arm, so
 # one item per arm: main 293 s, pp 313 s, slots 162 s, stagger 69 s, each plus its own ~50 s load — 936 s of chain time,
@@ -2052,12 +2055,14 @@ gate-gpu-glm5next-stagger:
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
 # the dense limit. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
-# tools/gate-paths.tsv match changes. Real-only: the fixture has no set of ik's, so the two long sets (Oracle clauses) are
-# all this run adds to gate-gpu-glm5next-e2e's main arm, whose other clauses it repeats.
+# tools/gate-paths.tsv match changes. In the fixture tier the same load runs ik's sets dumped on the fixture file
+# (`fx_ref_glm5next_d1k`, `fx_ref_glm5next_d3kdsa`) as fixture-oracle clauses, the prefill and the step planted with ik's
+# routes and held to bands counted for the fixture's random weights: those two clauses are all this run adds to
+# gate-gpu-glm5next-e2e's main arm, whose other clauses it repeats.
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-glm5next-e2e-long:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-e2e-long && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
 
 # glm5next (GLM-5.3-Flash) NextN draft: the target loaded twice by its NextN plan on the card the runner puts in view
 # (the 3090's bytes in the real tier), without the next-token layer and with it (`Body::open_placed_nextn`), against ik's MTP

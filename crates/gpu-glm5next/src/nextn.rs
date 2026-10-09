@@ -1415,6 +1415,22 @@ pub fn nextn_logits(m: &mut GpuModel<Body>) -> Result<Vec<f32>, GpuError> {
     nx.head.logits_to_host(gpu)
 }
 
+/// The last full walk's router as the card holds it: the layer's router logits, one per expert
+/// (`N_EXPERT` f32, before the sigmoid and the selection bias), and the `N_USED` experts it picked,
+/// in the router's slot order. They are the full row's, the one the head read. Blocking; gate use.
+pub fn nextn_router(m: &mut GpuModel<Body>) -> Result<(Vec<f32>, Vec<u32>), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let nx = body
+        .nextn
+        .as_deref()
+        .ok_or_else(|| shape("a router on a load without the NextN layer".to_string()))?;
+    let stream = gpu.stream();
+    Ok((
+        nx.s.rout.logits.to_host_vec(stream)?,
+        nx.s.rout.ids.to_host_vec(stream)?,
+    ))
+}
+
 /// The NextN layer's store as the card holds it: its latent rows and index
 /// rows, `n` positions of each. Blocking; gate use.
 pub fn nextn_store(m: &mut GpuModel<Body>, n: usize) -> Result<(Vec<u16>, Vec<u16>), GpuError> {

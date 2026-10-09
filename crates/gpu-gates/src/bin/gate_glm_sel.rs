@@ -76,7 +76,12 @@
 //! file, build and architecture checks cannot tell a dense set from one.
 //!
 //! Tiers (`BLOOMERY_TIER`): clauses 1-6 are synthetic (`tier::sc`) and run on either file; clauses 7-10 read ik's `--dsa`
-//! sets and are `Tag::Oracle` clauses the fixture tier defers to the real tier by name, a set at a time.
+//! sets and are `Tag::Oracle` clauses the fixture tier defers to the real tier by name, a set at a time. The fixture
+//! tier runs clauses 7-10 on ik's `--dsa` sets dumped on the fixture file (`Tag::FixtureOracle`, a clause a set, each
+//! opened through `tier::fixture_set`; the real tier leaves each to the fixture tier by name), every latent layer of the
+//! fixture file teacher-forced on ik's own inputs, with the bands unchanged: they are derived per value from ik's inputs
+//! and our rules, not from the weights. The gate declares one such clause for each of those sets
+//! (`tier::expect_fixture_oracle`).
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -114,6 +119,7 @@ mod gate {
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
     use model::arch::Arch;
     use model::arch::glm5next::names;
+    use refset::arch::glm5next::fixture as fx;
     use refset::arch::glm5next::{D3K_DSA, D16K_DSA, IK_DSA};
     use refset::ik::{Layout, plain_is_logical, ref_ints, ref_tensor_logical_masked_in};
     use runtime::qsa::{Qsa, Tie, select_by};
@@ -128,6 +134,20 @@ mod gate {
     const CTX: usize = 16_384;
     /// The latent layers (`l % 4 == 3` of 45).
     const LAYERS: [usize; 11] = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43];
+    /// The fixture's `--dsa` sets, each with the recipe that dumps it: clauses 7–10 run on each.
+    const FIXTURE_SETS: &[(&str, &str)] = &[
+        (
+            fx::D3K_DSA,
+            "BLOOMERY_TIER=fixture just dump-ref-fixture glm5next d3kdsa",
+        ),
+        (
+            fx::D16K_DSA,
+            "BLOOMERY_TIER=fixture just dump-ref-fixture glm5next d16kdsa",
+        ),
+    ];
+    /// The fixture-oracle clauses this gate declares (`tier::expect_fixture_oracle`): one a set of
+    /// [`FIXTURE_SETS`].
+    const FIXTURE_ORACLE: usize = FIXTURE_SETS.len();
     /// The attention's query heads and scale `1/√key_length_mla`.
     const ATT_HEADS: usize = 64;
     const ATT_SCALE: f32 = 0.0625;
@@ -431,8 +451,39 @@ mod gate {
                 split = Some(open_split(Arch::Glm5next, "just gate-gpu-glm-sel")?);
             }
             if let Some(split) = &split {
-                for pass in ik_set(&cx, split, set)? {
+                let man = glm5next_tier::ik_set(set, &IK_DSA)?;
+                let hint = format!(
+                    "just dump-ref-glm5next {}",
+                    set.trim_start_matches("ref_glm5next_")
+                );
+                for pass in ik_set(&cx, split, (&man, set), (&LAYERS, &hint))? {
                     tally(pass);
+                }
+            }
+        }
+        // The same clauses on the fixture's `--dsa` sets of ik's, every latent layer of the fixture
+        // file teacher-forced on ik's own inputs: the bands are derived per value from ik's inputs
+        // and our rules, not from the weights, so they carry over unchanged.
+        for &(set, hint) in FIXTURE_SETS {
+            let name = format!(
+                "7-10 ik: every latent layer of the fixture teacher-forced on the --dsa set {set}"
+            );
+            if !tier::run_clause(&name, Tag::FixtureOracle)? {
+                continue;
+            }
+            let passes = fixture_passes(&cx, &name, set, hint);
+            match passes {
+                Ok(passes) => {
+                    for pass in passes {
+                        tally(pass);
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "gate_glm_sel: {set}: ended in error \"{e}\" {}",
+                        verdict(false)
+                    );
+                    tally(false);
                 }
             }
         }
@@ -442,6 +493,7 @@ mod gate {
             verdict(pass)
         );
         println!("gate_glm_sel: {}", tier::tally_line());
+        tier::expect_fixture_oracle("gate_glm_sel", FIXTURE_ORACLE)?;
         if !pass {
             return Err(checks_failed());
         }
@@ -999,31 +1051,43 @@ mod gate {
         2f64.powi(a.log2().floor() as i32 - 11)
     }
 
-    /// Clauses 7–10 on set `set`, every latent layer.
-    fn ik_set(cx: &Ctx<'_>, split: &Split, set: &str) -> Result<Vec<bool>, GateError> {
-        let man = glm5next_tier::ik_set(set, &IK_DSA)?;
+    /// The fixture's clauses 7–10 on the `--dsa` set `set`, opened for the clause `clause` through
+    /// the tier: every latent layer of the fixture file, from its header. `hint` is the recipe a
+    /// set that is not a `--dsa` dump names.
+    fn fixture_passes(
+        cx: &Ctx<'_>,
+        clause: &str,
+        set: &str,
+        hint: &str,
+    ) -> Result<Vec<bool>, GateError> {
+        let man = glm5next_tier::fx_set(clause, &fx::IK_DSA, set)?;
+        let split = open_split(Arch::Glm5next, "just gate-gpu-glm-sel")?;
+        let layers = glm5next_tier::latent_layers(&split)?;
+        ik_set(cx, &split, (&man, set), (&layers, hint))
+    }
+
+    /// Clauses 7–10 on the opened `--dsa` set `set` (`man`), every latent layer in `layers`; `hint`
+    /// is the recipe a set that is not a `--dsa` dump names.
+    fn ik_set(
+        cx: &Ctx<'_>,
+        split: &Split,
+        (man, set): (&RefManifest, &str),
+        (layers, hint): (&[usize], &str),
+    ) -> Result<Vec<bool>, GateError> {
+        let first = *layers.first().ok_or("the file has no latent layer")?;
+        let score = format!("dsa_indexer_score-{first}");
         let flags = man.header.flags.as_deref().unwrap_or("");
+        let scored = man
+            .find(bloomery_gpu_gates::RowKind::Tensor, &score, 0)
+            .is_some();
         if !flags
             .split_whitespace()
             .any(|f| f == "--dsa" || f == "-dsa")
-            || man
-                .find(
-                    bloomery_gpu_gates::RowKind::Tensor,
-                    "dsa_indexer_score-3",
-                    0,
-                )
-                .is_none()
+            || !scored
         {
             return Err(format!(
-                "{set}: not a --dsa dump (flags \"{flags}\"; a dsa_indexer_score-3 row: {}) — \
-                 dump it with `just dump-ref-glm5next {}`",
-                man.find(
-                    bloomery_gpu_gates::RowKind::Tensor,
-                    "dsa_indexer_score-3",
-                    0
-                )
-                .is_some(),
-                set.trim_start_matches("ref_glm5next_")
+                "{set}: not a --dsa dump (flags \"{flags}\"; a {score} row: {scored}) — dump it \
+                 with `{hint}`"
             )
             .into());
         }
@@ -1039,11 +1103,11 @@ mod gate {
         let v = c / POOL;
         let mut out = Vec::new();
         let mut separated = 0usize;
-        for l in LAYERS {
+        for &l in layers {
             let ape = split_f32(split, &names::indexer_compressor_ape(l), POOL * INDEX_HEAD)?;
-            let pk = tap(&man, &format!("dsa_pool_k-{l}"))?;
-            let pg = tap(&man, &format!("dsa_pool_g-{l}"))?;
-            let pooled = tap(&man, &format!("dsa_indexer_k_pooled-{l}"))?;
+            let pk = tap(man, &format!("dsa_pool_k-{l}"))?;
+            let pg = tap(man, &format!("dsa_pool_g-{l}"))?;
+            let pooled = tap(man, &format!("dsa_indexer_k_pooled-{l}"))?;
             let n_pool = pooled.len() / DIM;
             if pk.len() != n_pool * POOL * DIM || pg.len() != pk.len() || n_pool < v {
                 return Err(format!(
@@ -1064,10 +1128,10 @@ mod gate {
             }
             let cache = exact_f16(&format!("{set} dsa_pool_k/g-{l}"), &rows_f)?;
             out.push(ik_pool(cx, set, l, (&cache, &ape), &pooled, v)?);
-            let (pass, ours) = ik_score(cx, &man, set, l, &pooled, (c, n_pool, v))?;
+            let (pass, ours) = ik_score(cx, man, set, l, &pooled, (c, n_pool, v))?;
             out.push(pass);
-            out.push(ik_select(cx, &man, set, l, &ours, (c, n_pool, v))?);
-            let (pass, apart) = ik_attn(cx, &man, set, l, c)?;
+            out.push(ik_select(cx, man, set, l, &ours, (c, n_pool, v))?);
+            let (pass, apart) = ik_attn(cx, man, set, l, c)?;
             out.push(pass);
             separated += usize::from(apart);
         }
@@ -1077,7 +1141,7 @@ mod gate {
         println!(
             "ik attn {set} mutant every position: past twice the band on {separated} of {} \
              layers (>= 1) {}",
-            LAYERS.len(),
+            layers.len(),
             verdict(pass)
         );
         out.push(pass);
