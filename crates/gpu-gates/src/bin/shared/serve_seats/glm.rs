@@ -278,8 +278,9 @@ const CTX_STEP: usize = 256;
 /// `BLOOMERY_STEP_STATS`, which the seat reads to count its rounds of several
 /// slots (a `slots round` record each); a lever set outside this list is
 /// refused by name at `main`, with `BLOOMERY_PIN_MAIN` for the engine
-/// thread's cpu slot, as every serving seat reads it; `gate_glm5next_serve`
-/// holds the same list.
+/// thread's cpu slot, as every serving seat reads it, and `BLOOMERY_HOST_LANES`
+/// for the lanes of the host tier's legs on that thread's CCD map;
+/// `gate_glm5next_serve` holds the same list.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::HOST_POPULATE,
@@ -287,6 +288,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_DONTNEED,
     bloomery_levers::R8,
     bloomery_levers::PIN_MAIN,
+    bloomery_levers::HOST_LANES,
     bloomery_levers::DRAFT,
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
@@ -739,6 +741,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 /// carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
+    model::ops::set_host_lanes(levers.host_lanes());
     let width = WidthMode::of(levers.mtp_width())?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     let a = parse_args(args)?;

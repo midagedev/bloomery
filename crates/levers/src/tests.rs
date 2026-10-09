@@ -201,6 +201,48 @@ fn lane_prefetch_row_is_an_on_off_arm() {
     assert!(!at(Some("off")));
 }
 
+/// `BLOOMERY_HOST_LANES`'s row is a parsed same-binary arm taking `flat` and
+/// `ccd`, its default [`HOST_LANES_DEFAULT`] (what the host tier's dispatch
+/// holds in a binary that does not act on it), and its accessor reads unset
+/// as that default, `flat` as flat and `ccd` as ccd; any other word is refused
+/// by name.
+#[test]
+fn host_lanes_row_is_a_flat_ccd_arm() {
+    let row = REGISTRY.iter().find(|r| r.name == HOST_LANES);
+    let Some(LeverSpec {
+        class: Class::A,
+        kind: Kind::Words(words),
+        default: Unset::Is(d),
+        site: Site::Parsed { left, .. },
+        ..
+    }) = row
+    else {
+        panic!("{HOST_LANES} is not a parsed word arm with a default: {row:?}");
+    };
+    assert_eq!(*words, ["flat", "ccd"]);
+    assert!(left.is_empty(), "{HOST_LANES} is read in place: {left:?}");
+    assert_eq!(
+        *d,
+        match HOST_LANES_DEFAULT {
+            HostLanes::Flat => "flat",
+            HostLanes::Ccd => "ccd",
+        }
+    );
+    let at = |v: Option<&str>| {
+        let e = v.map_or_else(Vec::new, |v| env(&[(HOST_LANES, v)]));
+        read(&e, Scope::Every)
+            .expect("flat, ccd and unset are taken")
+            .host_lanes()
+    };
+    assert_eq!(at(None), HOST_LANES_DEFAULT);
+    assert_eq!(at(Some("flat")), HostLanes::Flat);
+    assert_eq!(at(Some("ccd")), HostLanes::Ccd);
+    let Err(other) = read(&env(&[(HOST_LANES, "numa")]), Scope::Every) else {
+        panic!("a word the row does not take is refused");
+    };
+    assert!(other.to_string().contains(HOST_LANES), "{other}");
+}
+
 /// Every name is a `BLOOMERY_*` variable, and no two rows share one.
 #[test]
 fn names_are_unique() {
@@ -317,6 +359,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.residency(), None);
     assert_eq!(unset.hoststream(), None);
     assert_eq!(unset.lane_prefetch(), LANE_PREFETCH_DEFAULT);
+    assert_eq!(unset.host_lanes(), HOST_LANES_DEFAULT);
     assert_eq!(unset.gen_slots(), 1);
     assert_eq!(
         unset.host(),
@@ -355,6 +398,7 @@ fn accessors_read_their_rows() {
             (XSTREAM, "split"),
             (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
+            (HOST_LANES, "flat"),
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
         ]),
@@ -386,6 +430,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.hoststream(), Some(true));
     assert_eq!(set.xstream(), Some("split"));
     assert!(set.lane_prefetch());
+    assert_eq!(set.host_lanes(), HostLanes::Flat);
     assert_eq!(set.gen_slots(), 2);
     assert_eq!(
         set.host(),
@@ -430,6 +475,7 @@ fn accessors_read_their_rows() {
             XSTREAM,
             QWEN3_KV,
             LANE_PREFETCH,
+            HOST_LANES,
             GEN_SLOTS
         ]
     );

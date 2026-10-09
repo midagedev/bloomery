@@ -273,7 +273,19 @@ fn ccd_map_places_participants_by_the_pinning_rule() {
 /// many: 30 threads on four CCDs are 8/8/7/7, so 300 units cut 80/80/70/70
 /// (four equal quarters would give every CCD 75), 8 threads on three CCDs
 /// are 3/3/2, so 80 units cut 30/30/20. Every span count partitions `0..n`
-/// in CCD order, and a span is the pool's own chunks of its CCD's lanes.
+/// in CCD order, its edges at `n · first_lane(c) / threads` rounded down.
+///
+/// PIN(2026-10-10): the share was the sum of the pool's own chunks of the
+/// CCD's lanes, which hands the `n % threads` remainder units to the first
+/// lanes — CCD 0's, then CCD 1's — of every matrix of a dispatch: 80 units on
+/// 32 threads and four CCDs were 24/24/16/16 (3/3/2/2 a participant, CCD 0 and
+/// 1 +50 % of the least), 80 on 30 threads 24/24/18/14. A floor of a
+/// proportional edge is within one unit of the ideal: for `x = n · w / T`,
+/// `floor(a + x) − floor(a)` is `floor(x)` or `ceil(x)`, so a CCD of `w` of
+/// the `T` participants holds `len` units with `|len · T − n · w| < T`, and a
+/// participant `len / w` units within `1 / w` of the mean `n / T`. FAIL-first:
+/// the chunk-sum share reads 24 units for CCD 0 at `n = 80`, `T = 32`, where
+/// the bound allows 20 ± 1.
 #[test]
 fn ccd_spans_follow_the_participants_per_ccd() {
     let lens =
@@ -282,9 +294,26 @@ fn ccd_spans_follow_the_participants_per_ccd() {
     assert_eq!(lens(CcdMap::new(8, 3, 0), 80), [30, 30, 20]);
     assert_eq!(lens(CcdMap::new(32, 4, 0), 2048), [512; 4]);
     assert_eq!(lens(CcdMap::new(3, 4, 0), 30), [10, 10, 10, 0]);
-    for (threads, ccds) in [(1, 1), (8, 3), (30, 4), (32, 4), (7, 5), (64, 16), (3, 8)] {
+    // The shapes of a routed expert's matrices that no thread count divides:
+    // 80 row-lane groups (640 rows of Q3_K gates and ups) on 32 threads are
+    // 2.5 groups a participant on every CCD, not 3/3/2/2; 640 rows, 256 and 80
+    // groups on 30 threads stay within the bound.
+    assert_eq!(lens(CcdMap::new(32, 4, 0), 80), [20; 4]);
+    assert_eq!(lens(CcdMap::new(30, 4, 0), 640), [170, 171, 149, 150]);
+    assert_eq!(lens(CcdMap::new(30, 4, 0), 256), [68, 68, 60, 60]);
+    assert_eq!(lens(CcdMap::new(30, 4, 0), 80), [21, 21, 19, 19]);
+    for (threads, ccds) in [
+        (1, 1),
+        (8, 3),
+        (24, 4),
+        (30, 4),
+        (32, 4),
+        (7, 5),
+        (64, 16),
+        (3, 8),
+    ] {
         let m = CcdMap::new(threads, ccds, 0);
-        for n in 0..=300usize {
+        for n in 0..=700usize {
             let mut at = 0;
             for c in 0..ccds {
                 let s = m.span(n, c);
@@ -293,29 +322,22 @@ fn ccd_spans_follow_the_participants_per_ccd() {
                     "threads={threads} ccds={ccds} n={n} ccd {c}: contiguous"
                 );
                 at = s.end;
+                assert_eq!(
+                    s.start,
+                    n * m.first_lane(c) / threads,
+                    "threads={threads} ccds={ccds} n={n} ccd {c}: the proportional edge"
+                );
+                let w = m.width(c);
+                assert!(
+                    (s.len() * threads).abs_diff(n * w) < threads,
+                    "threads={threads} ccds={ccds} n={n} ccd {c}: {} units for {w} of {threads} participants",
+                    s.len()
+                );
             }
             assert_eq!(
                 at, n,
                 "threads={threads} ccds={ccds} n={n}: the spans cover 0..n"
             );
-            // The span is the pool's own chunks of the CCD's lanes, joined.
-            let cs = chunks(n, threads);
-            for c in 0..ccds {
-                let lanes = m.first_lane(c)..m.first_lane(c + 1);
-                let span = m.span(n, c);
-                for lane in lanes.clone() {
-                    let chunk = &cs[lane];
-                    assert!(
-                        chunk.is_empty() || (span.start <= chunk.start && chunk.end <= span.end)
-                    );
-                }
-                let joined: usize = lanes.map(|lane| cs[lane].len()).sum();
-                assert_eq!(
-                    joined,
-                    span.len(),
-                    "threads={threads} ccds={ccds} n={n} ccd {c}"
-                );
-            }
         }
     }
 }

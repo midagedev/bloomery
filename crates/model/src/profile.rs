@@ -237,15 +237,23 @@ pub fn reset() {
     }
 }
 
-/// Level 2: row-dispatch busy time per chunk index (chunk `i` is worker `i`'s, the
-/// last is the caller's). A flat line means skew is noise; a slope or a step at a
-/// CCD boundary means it is the machine, and a weighted split would buy it back.
+/// Levels 1 and 2: row-dispatch busy time per participant (index `i` is worker
+/// `i`'s, the last is the caller's) — under a CCD-major or tile cut; a flat byte
+/// cut counts its chunks in the order of their first rows. A flat line means skew
+/// is noise; a slope or a step at a CCD boundary means it is the machine, and a
+/// weighted split would buy it back.
 static CHUNK_BUSY: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 
 pub(crate) fn add_chunk_busy(idx: usize, ns: u64) {
     if let Some(c) = CHUNK_BUSY.get(idx) {
         c.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Chunk index `idx`'s busy time so far, for the tests that read the table.
+#[cfg(test)]
+pub(crate) fn chunk_busy_ns(idx: usize) -> u64 {
+    CHUNK_BUSY[idx].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Typed row for the gate. The gate asserts on calls and coverage; parsing the

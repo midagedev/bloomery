@@ -389,6 +389,11 @@ thread_local! {
 /// `out` via `out_ptr`; crosses threads in one mutex take per chunk.
 struct RowChunk {
     start: usize,
+    /// The participant the profile's per-chunk busy table counts this chunk
+    /// under, when the dispatch knows it: a CCD-major dispatch's participant
+    /// `t`, a flat tile cut's lane. `None`: the chunk's place in `start`
+    /// order, the flat byte cut's.
+    who: Option<usize>,
     /// The chunk's own wall, profiled runs only.
     busy_ns: u64,
     acc: profile::CallAcc,
@@ -1228,7 +1233,10 @@ impl<'w> ExpertStack<'w> {
         self.per
     }
 
-    /// The units of one matrix's row pass: its rows, or its row-lane groups.
+    /// The units of one matrix's row pass of a call of at most
+    /// [`DEFER_MAX_COLS`] columns: its rows, or its r8 groups of rows (a wider
+    /// union call's row-lane passes cut [`qdot::LANE_ROWS`] rows a unit,
+    /// [`UnionRows::grain`]).
     pub(crate) fn units(&self) -> usize {
         self.n / self.layout.grain()
     }
@@ -3268,6 +3276,20 @@ impl Lane {
             block,
         }
     }
+
+    /// The next block of the lane — its positions — for this caller alone, or
+    /// `None` once the lane is done. A cheap look comes first: a finished lane
+    /// costs a read, not a write.
+    #[inline]
+    fn claim(&self) -> Option<Range<usize>> {
+        if self.next.load(std::sync::atomic::Ordering::Relaxed) >= self.end {
+            return None;
+        }
+        let from = self
+            .next
+            .fetch_add(self.block, std::sync::atomic::Ordering::Relaxed);
+        (from < self.end).then(|| from..self.end.min(from + self.block))
+    }
 }
 
 /// `BLOOMERY_STEAL`: `1` (or unset) lets a participant take blocks off other
@@ -3453,8 +3475,12 @@ impl RowSet for GroupRows<'_, '_> {
 
 /// The unprofiled dispatch's error channel: no chunk collector, no
 /// allocation — a clean chunk touches nothing, and the mutex only locks when
-/// an error exists. The winning error is the lowest failing row's, exactly
-/// what the sorted scan decided on the profiled path.
+/// an error exists. The winning error is the one the profiled path's sorted
+/// scan picks: the lowest `start` among the chunks that failed. A chunk's
+/// `start` is the first row of its lane, and under [`Lanes::Ccd`] the first
+/// row of the run that failed; with nothing stealing that is the lowest failing
+/// row's, and a participant that steals may have a failing run below the one
+/// its error names.
 pub(crate) struct ErrGate {
     any: std::sync::atomic::AtomicBool,
     slot: std::sync::Mutex<Option<(usize, crate::ModelError)>>,
@@ -3505,32 +3531,36 @@ pub enum Lanes {
     Ccd(CcdMap),
 }
 
-/// What [`set_host_lanes`] forced: `0` nothing, `1` flat, `n + 1` a spread
-/// over `n` CCDs.
-static HOST_LANES_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether `BLOOMERY_HOST_LANES` is `ccd` ([`Lanes::host_tier`]'s reading): the
+/// registry's default until a binary's `main` sets its parsed lever
+/// ([`set_host_lanes`]).
+static HOST_LANES_CCD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(matches!(
+        bloomery_levers::HOST_LANES_DEFAULT,
+        bloomery_levers::HostLanes::Ccd
+    ));
 
-/// The lanes tests' switch: `Some(0)` runs the host tier flat, `Some(n)` over
-/// `n` CCDs of the pool's participants whatever the machine's topology, `None`
-/// the pool's own map ([`Lanes::host_tier`]). The values are the same under
-/// every one.
-#[doc(hidden)]
-pub fn set_host_lanes(mode: Option<usize>) {
-    HOST_LANES_OVERRIDE.store(
-        mode.map_or(0, |n| n + 1),
+/// `BLOOMERY_HOST_LANES` as a binary's `main` parsed it
+/// (`bloomery_levers::Levers::host_lanes`), set once before the first step
+/// leg; a binary that does not act on the lever keeps the registry's default.
+pub fn set_host_lanes(lanes: bloomery_levers::HostLanes) {
+    HOST_LANES_CCD.store(
+        matches!(lanes, bloomery_levers::HostLanes::Ccd),
         std::sync::atomic::Ordering::Relaxed,
     );
 }
 
 impl Lanes {
-    /// The lanes the host tier's step legs run on: the pool's CCD map, or flat
-    /// where the pool has none — its caller or a worker is unpinned.
+    /// The lanes the host tier's step legs run on: the pool's CCD map when
+    /// `BLOOMERY_HOST_LANES` is `ccd` (the default) and the pool has one, flat
+    /// otherwise — the lever says `flat`, or the pool's caller or a worker is
+    /// unpinned.
     #[must_use]
     pub fn host_tier() -> Lanes {
-        let pool = threads::pool();
-        match HOST_LANES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => pool.ccd_map().map_or(Lanes::Flat, Lanes::Ccd),
-            1 => Lanes::Flat,
-            n => Lanes::Ccd(CcdMap::new(pool.threads(), n - 1, 0)),
+        if HOST_LANES_CCD.load(std::sync::atomic::Ordering::Relaxed) {
+            threads::pool().ccd_map().map_or(Lanes::Flat, Lanes::Ccd)
+        } else {
+            Lanes::Flat
         }
     }
 }
@@ -3623,7 +3653,7 @@ fn run_row_pool_with<S: RowSet>(
         }
         if lvl >= 1 {
             for (i, c) in chunks.iter().enumerate() {
-                profile::add_chunk_busy(i, c.busy_ns);
+                profile::add_chunk_busy(c.who.unwrap_or(i), c.busy_ns);
             }
         }
         if let Some(span_ns) = span_ns {
@@ -3730,6 +3760,7 @@ fn dispatch_flat<S: RowSet>(
         let mut chunk = RowChunk {
             // A tile participant's errors are ordered by its lane's first row.
             start: if tile { lane_bounds[r.start] } else { r.start },
+            who: tile.then_some(r.start),
             busy_ns: 0,
             acc: profile::CallAcc::new(),
             err: None,
@@ -3775,19 +3806,9 @@ fn dispatch_flat<S: RowSet>(
         };
         'lanes: for off in 0..span {
             let lane = &lanes[(origin + off) % nlanes];
-            loop {
-                // A cheap look first: a finished lane costs a read, not a write.
-                if lane.next.load(std::sync::atomic::Ordering::Relaxed) >= lane.end {
-                    break;
-                }
-                let from = lane
-                    .next
-                    .fetch_add(lane.block, std::sync::atomic::Ordering::Relaxed);
-                if from >= lane.end {
-                    break;
-                }
-                let to = lane.end.min(from + lane.block);
-                let mut gr = from;
+            while let Some(block) = lane.claim() {
+                let to = block.end;
+                let mut gr = block.start;
                 let mut p = set.pair_at(gr, 0);
                 while gr < to {
                     let sub_end = to.min(set.start(p + 1));
@@ -3812,10 +3833,51 @@ fn dispatch_flat<S: RowSet>(
     });
 }
 
+/// Where participant `t` sits among a CCD-major dispatch's lanes, and the order
+/// it visits them in.
+#[derive(Clone, Copy, Debug)]
+struct Seat {
+    /// Its CCD's first lane, and how many lanes the CCD has.
+    first: usize,
+    width: usize,
+    /// Its place among its CCD's lanes: its home lane is `first + rank`.
+    rank: usize,
+    /// Every lane of the dispatch.
+    lanes: usize,
+}
+
+impl Seat {
+    fn of(map: CcdMap, t: usize) -> Seat {
+        let c = map.ccd_of(t);
+        Seat {
+            first: map.first_lane(c),
+            width: map.width(c),
+            rank: map.rank_of(t),
+            lanes: map.threads(),
+        }
+    }
+
+    /// The lane of the `off`-th visit, `off < lanes`: its CCD's lanes from the
+    /// home lane on, then every other CCD's, the ones after its own in
+    /// CCD-major order and wrapping, entered `rank` lanes in so the
+    /// participants of a CCD begin their steals on different lanes and not all
+    /// on one lane's cache line. Over `off in 0..lanes` every lane once, and
+    /// the first visit (the only one with nothing stealing) is the home lane,
+    /// one participant's each.
+    fn visit(self, off: usize) -> usize {
+        if off < self.width {
+            self.first + (self.rank + off) % self.width
+        } else {
+            let others = self.lanes - self.width;
+            (self.first + self.width + (off - self.width + self.rank) % others) % self.lanes
+        }
+    }
+}
+
 /// The CCD-major dispatch ([`Lanes::Ccd`]): participant `t` starts on its
 /// CCD's lane `rank(t)` and, stealing, walks its CCD's other lanes and then
-/// the other CCDs'. The cut is [`CcdCut`]'s, one lane an index of the pool
-/// as the tile cut hands them out.
+/// the other CCDs' ([`Seat::visit`]). The cut is [`CcdCut`]'s, one lane an
+/// index of the pool as the tile cut hands them out.
 fn dispatch_ccd<S: RowSet>(
     set: &S,
     lvl: u8,
@@ -3846,47 +3908,37 @@ fn dispatch_ccd<S: RowSet>(
     threads::pool().for_each_chunk(nlanes, |r| {
         let t_busy = if lvl >= 1 { Some(Instant::now()) } else { None };
         let t = r.start;
-        let (c, rank) = (map.ccd_of(t), map.rank_of(t));
+        let seat = Seat::of(map, t);
         let mut chunk = RowChunk {
-            // Errors are ordered by the first row of the participant's lane.
-            start: cut.first_unit(set, cut.firsts[c] + rank, total_rows + t),
+            // Errors are ordered by the first row of the participant's lane,
+            // then by the first row of the run that failed.
+            start: cut.first_unit(set, seat.first + seat.rank, total_rows + t),
+            who: Some(t),
             busy_ns: 0,
             acc: profile::CallAcc::new(),
             err: None,
         };
         // Claims come first, before any row and any wait.
         set.claim_pass(lvl, &mut chunk.acc);
-        let (first, width) = (cut.firsts[c], cut.firsts[c + 1] - cut.firsts[c]);
         let visits = if steal { nlanes } else { 1 };
         'lanes: for off in 0..visits {
-            // Its own CCD's lanes from its own on, then every other CCD's.
-            let id = if off < width {
-                first + (rank + off) % width
-            } else {
-                (first + off) % nlanes
-            };
+            let id = seat.visit(off);
             let lane = &lanes[id];
             let lane_ccd = usize::from(cut.lane_ccd[id]);
-            loop {
-                if lane.next.load(std::sync::atomic::Ordering::Relaxed) >= lane.end {
-                    break;
-                }
-                let from = lane
-                    .next
-                    .fetch_add(lane.block, std::sync::atomic::Ordering::Relaxed);
-                if from >= lane.end {
-                    break;
-                }
-                let to = lane.end.min(from + lane.block);
-                let done = cut.for_each_run(set, lane_ccd, from..to, |p, units| {
-                    // SAFETY: the runs of `from..to` are units of the lane's CCD
-                    // region, which the lane's `fetch_add` handed to this
+            while let Some(block) = lane.claim() {
+                let mut failed_at = chunk.start;
+                let done = cut.for_each_run(set, lane_ccd, block, |p, units| {
+                    let at = set.start(p) + units.start;
+                    // SAFETY: the runs of `block` are units of the lane's CCD
+                    // region, which the lane's claim handed to this
                     // participant alone; the walk maps its positions one to one
-                    // onto the units of every pair; the join precedes every read.
+                    // onto the units of every pair, and `p < set.pairs()`; the
+                    // join precedes every read.
                     unsafe { set.compute(p, units, lvl, &mut chunk.acc) }
+                        .inspect_err(|_| failed_at = at)
                 });
                 if let Err(e) = done {
-                    chunk.err = Some(e);
+                    (chunk.start, chunk.err) = (failed_at, Some(e));
                     break 'lanes;
                 }
             }
@@ -4052,8 +4104,8 @@ impl CcdCut {
     }
 
     /// The walk's positions `block`, which lie in CCD `c`'s region, as the
-    /// runs of one pair's units they are, in order — `run(pair, units)` each —
-    /// ending at the first error.
+    /// runs of one pair's units they are, in order — `run(pair, units)` each,
+    /// never an empty one, none for an empty block — ending at the first error.
     fn for_each_run<S: RowSet, E>(
         &self,
         set: &S,
@@ -4061,12 +4113,17 @@ impl CcdCut {
         block: Range<usize>,
         mut run: impl FnMut(usize, Range<usize>) -> Result<(), E>,
     ) -> Result<(), E> {
+        if block.is_empty() {
+            return Ok(());
+        }
         let (mut p, mut u) = self.locate(set, c, block.start);
         let mut left = block.len();
         while left > 0 {
             let span = self.map.span(set.start(p + 1) - set.start(p), c);
             let take = left.min(span.end - u);
-            run(p, u..u + take)?;
+            if take > 0 {
+                run(p, u..u + take)?;
+            }
             left -= take;
             p += 1;
             if left > 0 {
@@ -5361,11 +5418,15 @@ const PAGE_LINES: usize = 4096 / LINE;
 const STOP_POLL_LINES: usize = 16;
 
 /// One matrix a warm routine fills into the CCDs' L3s: its bytes, and the
-/// units — its rows, or its row-lane groups — of the row pass that reads it
+/// units — its rows, or its r8 groups of rows — of the row pass that reads it
 /// (`n / grain`, [`ExpertStack::units`]). A matrix is split over CCDs by
 /// [`CcdMap::span`] of `units`, the rule the pass cuts its walk by
 /// ([`Lanes::Ccd`]), so the CCD that computes a unit is the CCD that warms
-/// its bytes.
+/// its bytes — for the pass of a call of at most [`DEFER_MAX_COLS`] columns,
+/// the step legs'. A wider union call runs row-lane passes whose unit is a
+/// group of [`qdot::LANE_ROWS`] rows, so its CCD cut falls on other rows than
+/// these units' when the two grains differ: the warm still fills the bytes, in
+/// some rows of another CCD's L3 than the one that computes them.
 #[derive(Clone, Copy, Debug)]
 pub struct WarmSpan<'a> {
     pub bytes: &'a [u8],
@@ -5451,19 +5512,22 @@ fn warm_walk(
     done
 }
 
-/// One line of a warm walk: a paced line is read, so the walk waits for it
-/// and issues no faster than the memory fills; every other line of its page is
-/// prefetched into the cache the reads fill, without a wait.
+/// One line of a warm walk: a paced line is read, a demand load the walk's
+/// later lines are issued behind, so the issue rate follows the memory's fill
+/// rate within the core's reorder window instead of running past it; every
+/// other line of its page is prefetched into the cache the reads fill, with no
+/// load to wait for. An `off` outside `bytes` is an index panic.
 #[inline(always)]
 fn warm_touch(bytes: &[u8], off: usize, paced: bool) {
+    let line = &bytes[off];
     if paced {
-        std::hint::black_box(bytes[off]);
+        std::hint::black_box(*line);
     } else {
-        // SAFETY: `off` is inside `bytes`, so the address is one of the
-        // matrix's own; a prefetch reads nothing into the program.
+        // SAFETY: a prefetch of the address of `line`, a byte of the matrix,
+        // which reads nothing into the program.
         unsafe {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                bytes.as_ptr().add(off).cast::<i8>(),
+                std::ptr::from_ref(line).cast::<i8>(),
             );
         }
     }
@@ -5472,11 +5536,11 @@ fn warm_touch(bytes: &[u8], off: usize, paced: bool) {
 /// Participant `t`'s share of a warm of `spans`, in priority order: of each
 /// matrix, the lines of its rank's share of CCD `ccd_of(t)`'s span ([`CcdMap`]),
 /// so the lines land in the L3 of the CCD whose participants compute those
-/// rows ([`Lanes::Ccd`]). Paced: the first line of each 4 KB page is a load
-/// the walk waits for, the page's other lines prefetched behind it, so the
-/// walk issues at the memory's fill rate instead of past it. `stop` is looked
-/// at before every 16th line (a flag the go sets, say); the walk then ends
-/// and says so. A walk writes nothing and takes no lock.
+/// rows ([`Lanes::Ccd`]). Paced: the first line of each 4 KB page is a demand
+/// load, the page's other lines prefetched behind it, so the walk issues at the
+/// memory's fill rate within the core's reorder window instead of past it.
+/// `stop` is looked at before every 16th line (a flag the go sets, say); the
+/// walk then ends and says so. A walk writes nothing and takes no lock.
 pub fn warm_share(
     spans: &[WarmSpan<'_>],
     map: &CcdMap,
@@ -5971,12 +6035,13 @@ mod tests {
 #[cfg(test)]
 mod ccd_tests {
     use super::{
-        CcdCut, Lanes, RowSet, WarmSpan, profile, run_row_pool_with, warm_lines, warm_share,
-        warm_walk,
+        CcdCut, Lanes, RowSet, Seat, WarmSpan, profile, run_row_pool_with, warm_lines, warm_share,
+        warm_touch, warm_walk,
     };
     use std::cell::Cell;
     use std::ops::Range;
     use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
     use threads::CcdMap;
 
     /// Pairs by unit count and per-unit cost, as a [`RowSet`] that records
@@ -5989,6 +6054,10 @@ mod ccd_tests {
         say_uniform: bool,
         seen: Vec<AtomicU32>,
         cpu: Vec<AtomicI32>,
+        /// Flat units whose compute fails, by name.
+        fail: Vec<usize>,
+        /// A flat unit whose compute spins for the duration first.
+        heavy: Option<(usize, Duration)>,
     }
 
     impl Pairs {
@@ -6005,6 +6074,8 @@ mod ccd_tests {
                 say_uniform,
                 seen: (0..total).map(|_| AtomicU32::new(0)).collect(),
                 cpu: (0..total).map(|_| AtomicI32::new(-1)).collect(),
+                fail: Vec::new(),
+                heavy: None,
             }
         }
 
@@ -6052,8 +6123,20 @@ mod ccd_tests {
         ) -> Result<(), crate::ModelError> {
             let cpu = running_cpu();
             for u in units {
-                self.seen[self.starts[p] + u].fetch_add(1, Ordering::Relaxed);
-                self.cpu[self.starts[p] + u].store(cpu, Ordering::Relaxed);
+                let flat = self.starts[p] + u;
+                if let Some((at, spin)) = self.heavy
+                    && at == flat
+                {
+                    let t0 = Instant::now();
+                    while t0.elapsed() < spin {
+                        std::hint::spin_loop();
+                    }
+                }
+                if self.fail.contains(&flat) {
+                    return Err(crate::ModelError::MissingTensor(format!("unit {flat}")));
+                }
+                self.seen[flat].fetch_add(1, Ordering::Relaxed);
+                self.cpu[flat].store(cpu, Ordering::Relaxed);
             }
             Ok(())
         }
@@ -6145,6 +6228,21 @@ mod ccd_tests {
                             hits[set.start(p) + u] += 1;
                             lowest = lowest.min(set.start(p) + u);
                         }
+                        // The runs a lane's block is handed to the compute in
+                        // are never empty — a pair whose span of this CCD is
+                        // empty is stepped over, not computed — and add up to
+                        // the block's positions.
+                        let mut walked = 0;
+                        cut.for_each_run(&set, c, from..to, |p, units| {
+                            assert!(
+                                !units.is_empty(),
+                                "{what}: lane {lane} of CCD {c} was handed an empty run of pair {p}"
+                            );
+                            walked += units.len();
+                            Ok::<(), ()>(())
+                        })
+                        .unwrap();
+                        assert_eq!(walked, to - from, "{what}: lane {lane}'s runs");
                         assert_eq!(
                             cut.first_unit(&set, lane, usize::MAX),
                             lowest,
@@ -6196,6 +6294,65 @@ mod ccd_tests {
         assert_eq!(lanes, [8, 8, 7, 7]);
     }
 
+    /// A participant visits every lane once, its CCD's lanes first and its home
+    /// lane — the lane `CcdMap::lane_of` gives it, one participant's each —
+    /// before them all, so with nothing stealing every lane has its one owner,
+    /// whatever the widths of the CCDs (8/8/7/7 of 30 threads: CCD 2 starts at
+    /// lane 16, not at twice a width). The participants of a CCD enter the
+    /// other CCDs' lanes on different lanes, as many different ones as there
+    /// are lanes outside their CCD.
+    #[test]
+    fn a_seat_visits_every_lane_once_its_own_ccd_first() {
+        // The spread the uneven widths were first read in (30 threads on four
+        // CCDs, 8/8/7/7), then every spread up to 64 threads on 16 CCDs.
+        let every = (1..=64usize).flat_map(|threads| (1..=16usize).map(move |c| (threads, c)));
+        for (threads, ccds) in std::iter::once((30, 4)).chain(every) {
+            let map = CcdMap::new(threads, ccds, 0);
+            let what = format!("threads={threads} ccds={ccds}");
+            let mut homes = vec![0u32; threads];
+            let mut foreign: Vec<Vec<usize>> = vec![Vec::new(); ccds];
+            for t in 0..threads {
+                let (c, seat) = (map.ccd_of(t), Seat::of(map, t));
+                let order: Vec<usize> = (0..threads).map(|off| seat.visit(off)).collect();
+                assert_eq!(
+                    order[0],
+                    map.lane_of(t),
+                    "{what}: participant {t}'s first visit"
+                );
+                homes[order[0]] += 1;
+                let own = map.first_lane(c)..map.first_lane(c + 1);
+                assert!(
+                    order[..own.len()].iter().all(|l| own.contains(l)),
+                    "{what}: participant {t} leaves its CCD's lanes {own:?} early: {order:?}"
+                );
+                if own.len() < threads {
+                    foreign[c].push(order[own.len()]);
+                }
+                let mut once = order;
+                once.sort_unstable();
+                assert!(
+                    once.iter().copied().eq(0..threads),
+                    "{what}: participant {t} does not visit every lane once"
+                );
+            }
+            assert!(
+                homes.iter().all(|&h| h == 1),
+                "{what}: a lane is no one's home or two's"
+            );
+            for (c, entries) in foreign.iter_mut().enumerate() {
+                let others = threads - map.width(c);
+                let ranks = entries.len();
+                entries.sort_unstable();
+                entries.dedup();
+                assert_eq!(
+                    entries.len(),
+                    ranks.min(others),
+                    "{what}: CCD {c}'s participants enter the other lanes on {entries:?}"
+                );
+            }
+        }
+    }
+
     /// A dispatch visits every unit once under either stealing arm, and with
     /// nothing stealing each unit of CCD `c`'s span runs on a cpu of CCD `c`.
     /// The flat dispatch is the control: with nothing stealing it puts units on
@@ -6241,6 +6398,20 @@ mod ccd_tests {
                         }
                     }
                 }
+                // Over any spread of the participants, uneven ones too, nothing
+                // stealing still computes every unit once: each participant
+                // starts on a lane of its own, so no lane is left unowned.
+                for ccds in [1, 2, 3, 5, 12] {
+                    set.forget();
+                    let spread = CcdMap::new(pool.threads(), ccds, 0);
+                    let mut acc = profile::CallAcc::new();
+                    run_row_pool_with(&set, 0, &mut acc, true, Lanes::Ccd(spread), false).unwrap();
+                    assert!(
+                        set.seen.iter().all(|h| h.load(Ordering::Relaxed) == 1),
+                        "units {:?} over {ccds} CCDs, nothing stealing: a unit missed or twice",
+                        set.units
+                    );
+                }
                 // The control: the flat cut, nothing stealing.
                 if map.active() < 2 || total < 4 * map.threads() {
                     continue;
@@ -6261,6 +6432,122 @@ mod ccd_tests {
                     set.units
                 );
             }
+        }
+    }
+
+    /// The host tier's lanes are the pool's own CCD map by default, and flat
+    /// when the lever says so.
+    #[test]
+    #[ignore = "hw: pins the calling thread and reads the box's CCD topology"]
+    fn hw_host_tier_lanes_follow_the_lever() {
+        let pool = threads::pool();
+        assert!(pool.pin_caller(), "pinning must succeed on the box");
+        let map = pool.ccd_map().expect("every participant is pinned");
+        assert!(
+            matches!(Lanes::host_tier(), Lanes::Ccd(m) if m == map),
+            "the default lanes are the pool's own map"
+        );
+        super::set_host_lanes(bloomery_levers::HostLanes::Flat);
+        let flat = matches!(Lanes::host_tier(), Lanes::Flat);
+        super::set_host_lanes(bloomery_levers::HOST_LANES_DEFAULT);
+        assert!(flat, "`flat` runs the host tier flat on a pinned pool");
+        assert!(matches!(Lanes::host_tier(), Lanes::Ccd(m) if m == map));
+    }
+
+    /// Over CCDs the winning error is the failing run with the lowest first
+    /// unit in the set's order, not the lowest first unit of the lane it was
+    /// in: a lane holds the CCD's share of several pairs, so the first unit of
+    /// a lane that also fails far above it must not outrank another lane's
+    /// failure in between. Nothing steals; both error channels.
+    #[test]
+    fn a_ccd_dispatch_returns_the_error_of_the_lowest_failing_run() {
+        let pool = threads::pool();
+        assert!(pool.threads() >= 4, "needs a pool of 4 or more threads");
+        let map = CcdMap::new(pool.threads(), 2, 0);
+        // A lane of CCD 0 that crosses from one pair into the next, and the
+        // first unit of CCD 1's first lane, which lies between the lane's
+        // first unit and its second run.
+        let found = (30..200usize).find_map(|n| {
+            let set = Pairs::new(&[n; 3], &[1; 3], true);
+            let cut = CcdCut::of(&set, map, true);
+            let low = cut.first_unit(&set, map.first_lane(1), 0);
+            (0..map.first_lane(1)).find_map(|lane| {
+                let mut runs = Vec::new();
+                cut.for_each_run(&set, 0, cut.bounds[lane]..cut.bounds[lane + 1], |p, u| {
+                    runs.push(set.start(p) + u.start);
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+                (runs.len() >= 2 && runs[0] < low && low < runs[1]).then(|| (n, runs[1], low))
+            })
+        });
+        let (n, high, low) = found.expect("some lane of CCD 0 crosses a pair");
+        for lvl in [0, 1] {
+            let mut set = Pairs::new(&[n; 3], &[1; 3], true);
+            set.fail = vec![high, low];
+            let mut acc = profile::CallAcc::new();
+            let err = run_row_pool_with(&set, lvl, &mut acc, true, Lanes::Ccd(map), false)
+                .expect_err("two units fail");
+            assert_eq!(
+                err.to_string(),
+                crate::ModelError::MissingTensor(format!("unit {low}")).to_string(),
+                "level {lvl}: units {low} and {high} fail, in lanes of CCD 1 and CCD 0"
+            );
+        }
+    }
+
+    /// The profile's per-chunk busy table is by participant: with one slow
+    /// unit, the index that holds the time is the participant that owns the
+    /// unit's lane. The chunks sorted by their first unit are in lane order,
+    /// which is not participant order, so a table by sorted position puts the
+    /// time under another index.
+    #[test]
+    fn a_profiled_ccd_dispatch_counts_busy_time_by_participant() {
+        let pool = threads::pool();
+        let ccds = 4;
+        assert!(
+            pool.threads() >= 2 * ccds,
+            "needs a pool of 8 or more threads"
+        );
+        let map = CcdMap::new(pool.threads(), ccds, 0);
+        let mut set = Pairs::new(&[8 * pool.threads()], &[1], true);
+        let cut = CcdCut::of(&set, map, true);
+        // The lane of CCD 1's second rank, and the participant that owns it.
+        let lane = map.first_lane(1) + 1;
+        let t = (0..map.threads())
+            .find(|&t| map.lane_of(t) == lane)
+            .expect("a lane is some participant's");
+        assert_ne!(t, lane, "in lane order and in participant order apart");
+        let slow = cut.first_unit(&set, lane, 0);
+        set.heavy = Some((slow, Duration::from_millis(40)));
+        profile::reset();
+        let mut acc = profile::CallAcc::new();
+        run_row_pool_with(&set, 1, &mut acc, true, Lanes::Ccd(map), false).unwrap();
+        let busy: Vec<u64> = (0..map.threads()).map(profile::chunk_busy_ns).collect();
+        let most = (0..busy.len()).max_by_key(|&i| busy[i]).unwrap();
+        assert_eq!(
+            most, t,
+            "unit {slow} spins 40 ms in lane {lane}, participant {t}'s: busy ns by index {busy:?}"
+        );
+        assert!(busy[t] >= 40_000_000, "{busy:?}");
+        assert!(
+            busy.iter()
+                .enumerate()
+                .all(|(i, &b)| i == t || b < 20_000_000),
+            "no other participant ran long: {busy:?}"
+        );
+    }
+
+    /// A line past the end of its matrix is an index panic by name, whether the
+    /// walk loads it or prefetches it: a prefetch of a stray address reads
+    /// nothing and would pass without a word.
+    #[test]
+    fn a_warm_touch_past_its_matrix_panics() {
+        let buf = vec![0u8; 256];
+        for paced in [true, false] {
+            let caught = std::panic::catch_unwind(|| warm_touch(&buf[..128], 128, paced));
+            assert!(caught.is_err(), "paced={paced}: a line past the matrix");
+            warm_touch(&buf[..128], 127, paced);
         }
     }
 

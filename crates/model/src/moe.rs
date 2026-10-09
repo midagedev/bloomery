@@ -1884,6 +1884,20 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
     ) -> Result<(), ModelError> {
+        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch)
+    }
+
+    /// [`HostLayer::experts_into`] with its two row dispatches laid over the
+    /// pool as `lanes` says: the same values, bit for bit, whichever lanes.
+    pub fn experts_into_on(
+        &self,
+        lanes: Lanes,
+        src: R8Source<'_>,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+        scratch: &mut HostScratch,
+    ) -> Result<(), ModelError> {
         self.read_beside(src)?;
         let split = src.split();
         check_host_call(x, experts, out, scratch.n_used)?;
@@ -1911,7 +1925,7 @@ impl HostLayer {
         };
         let run = LegRun {
             limit: Some(self.limit),
-            lanes: Lanes::host_tier(),
+            lanes,
         };
         serve(weights, run, x, experts, out, scratch)
     }
@@ -1988,7 +2002,21 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
-        let lanes = Lanes::host_tier();
+        self.experts_step_union_into_on(Lanes::host_tier(), src, x, lists, out, scratch)
+    }
+
+    /// [`HostLayer::experts_step_union_into`] with its two row passes laid
+    /// over the pool as `lanes` says: the same values, bit for bit, whichever
+    /// lanes.
+    pub fn experts_step_union_into_on<'x>(
+        &self,
+        lanes: Lanes,
+        src: R8Source<'_>,
+        x: impl Into<Tensor2View<'x>>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        scratch: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
         let Some(tier) = &self.tier else {
             return self.union_on(lanes, src, x, lists, out, scratch);
         };
@@ -2067,11 +2095,26 @@ impl HostLayer {
     /// from the file mapping or the r8 sidecar, or — an id outside the plan's
     /// host segment — from its arena slot. An id whose slot is unfilled is
     /// left out whole: a warm never fills a slot ([`TierSlots::ensure`]).
-    /// Each span carries the units of the pass that reads it, so the CCD that
-    /// computes a row is the CCD that warms it ([`ops::warm_share`]). Refused
-    /// by name: an id past the layer's experts, and a slot of another length
-    /// ([`TierError::SlotLength`]).
+    /// Each span carries the units of the step legs' pass that reads it, so
+    /// the CCD that computes a row is the CCD that warms it
+    /// ([`ops::warm_share`]); a union call wider than [`ops::DEFER_MAX_COLS`]
+    /// columns cuts other units ([`ops::WarmSpan`]). Refused by name: an id
+    /// past the layer's experts, and a slot of another length
+    /// ([`TierError::SlotLength`]); on a refusal `out` is as it was.
     pub fn warm_spans<'a>(
+        &'a self,
+        src: R8Source<'a>,
+        ids: &[u32],
+        out: &mut Vec<WarmSpan<'a>>,
+    ) -> Result<(), ModelError> {
+        let before = out.len();
+        self.push_warm_spans(src, ids, out)
+            .inspect_err(|_| out.truncate(before))
+    }
+
+    /// [`HostLayer::warm_spans`]'s walk of the ids, which leaves the spans of
+    /// the ids before a refusal in `out`.
+    fn push_warm_spans<'a>(
         &'a self,
         src: R8Source<'a>,
         ids: &[u32],
@@ -2121,8 +2164,8 @@ mod tests {
         Buckets, HostLayer, HostLayerSpec, HostScratch, TOUCHED, UnionScratch, check_host_call,
         gather_expert_inputs, last_touched_experts, relist, reset_touched,
     };
-    use crate::ops::{self, Tensor2};
-    use crate::r8file::R8Source;
+    use crate::ops::{self, RowLayout, Tensor2};
+    use crate::r8file::{HostR8, R8Source, Sidecar};
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
 
@@ -2723,6 +2766,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("expert 6"), "{err}");
+        // A refusal after some ids' spans were pushed leaves `out` as it was.
+        let mut kept = Vec::new();
+        layer.warm_spans(src, &[1], &mut kept).unwrap();
+        layer.warm_spans(src, &[4, 6], &mut kept).unwrap_err();
+        assert_eq!(kept.len(), 3, "a refused call leaves what `out` held");
         let mut short = MockTier::of(&split, &layer, true);
         short.parts[3 * 3 + 1].pop();
         layer.attach_tier(4, 1..2, std::sync::Arc::new(short));
@@ -2736,6 +2784,80 @@ mod tests {
             other => panic!("not the slot-length refusal by name: {other:?}"),
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A layer read from the r8 sidecar warms the gate's and the up's copies
+    /// of an expert — the sidecar's bytes, not the source's rows — as units of
+    /// eight rows, the grain the pass cuts them by, and the down's source
+    /// bytes as rows.
+    #[test]
+    fn a_warm_of_a_sidecar_layer_carries_the_groups_of_the_pass() {
+        let (embd, ff, n_expert) = (256, 512, 4);
+        let tys = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K];
+        // The sidecar lands in a directory beside the source's: give the
+        // source a directory of its own.
+        let dir = std::env::temp_dir().join(format!("bloomery-moe-{}-warmr8", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let path = dir.join("src").join("layer.gguf");
+        std::fs::rename(layer_file("warmr8", tys, embd, ff, n_expert), &path).unwrap();
+        let split = gguf::Split::open(&path).unwrap();
+        let sidecar = crate::r8file::sidecar_path(&path).unwrap();
+        crate::r8file::convert(
+            &split,
+            &["gate_exps".to_string(), "up_exps".to_string()],
+            &sidecar,
+            &mut |_| {},
+        )
+        .unwrap();
+        let side = HostR8::On(std::sync::Arc::new(
+            Sidecar::open(&sidecar, &split, gguf::Weights::Mapped { populate: false }).unwrap(),
+        ));
+        let src = R8Source::of(&split, &side).unwrap();
+        let layer = HostLayer::build(
+            src,
+            &HostLayerSpec {
+                gate: "gate_exps",
+                up: "up_exps",
+                down: "down_exps",
+                n_expert,
+                embd,
+                ff,
+                swiglu_limit: 0.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            layer.layouts(),
+            [RowLayout::R8, RowLayout::R8, RowLayout::Rows]
+        );
+        let mut out = Vec::new();
+        layer.warm_spans(src, &[2, 1], &mut out).unwrap();
+        assert_eq!(out.len(), 6, "three spans an id");
+        let held = side.sidecar().expect("a sidecar layer");
+        for (i, id) in [2usize, 1].into_iter().enumerate() {
+            for (part, name) in ["gate_exps", "up_exps"].into_iter().enumerate() {
+                let span = out[3 * i + part];
+                assert_eq!(span.units, ff / 8, "id {id} {name}: groups of eight rows");
+                let stack = held.data(name).unwrap();
+                let per = stack.len() / n_expert;
+                assert_eq!(
+                    span.bytes,
+                    &stack[id * per..(id + 1) * per],
+                    "id {id} {name}"
+                );
+                let source = ops::ShardTensor::find(&split, name).unwrap();
+                assert_ne!(
+                    span.bytes,
+                    source.expert(&split, id).unwrap().bytes(),
+                    "id {id} {name}: the sidecar's copy, not the source's rows"
+                );
+            }
+            let down = out[3 * i + 2];
+            let want = ops::ShardTensor::expert(layer.stacks()[2], &split, id).unwrap();
+            assert_eq!(down.bytes, want.bytes(), "id {id} down");
+            assert_eq!(down.units, embd, "id {id} down: rows");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The host segment's ids read the mapping and every other id the tier's

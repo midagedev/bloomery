@@ -673,22 +673,17 @@ impl CcdMap {
     }
 
     /// CCD `c`'s share of `n` units — the one rule that splits a matrix over
-    /// CCDs: the pool's own split of `n` into `threads()` chunks
-    /// ([`chunk_bounds`]), each CCD taking the chunks of its participants, so
-    /// a CCD's span is as wide as its participants are many (8/8/7/7 of 30
-    /// threads on four CCDs, not four quarters). The spans of CCDs `0..ccds()`
+    /// CCDs: its edge sits `first_lane(c) / threads` of the way through the
+    /// units, `n · first_lane(c) / threads` rounded down, so a CCD's share is
+    /// as wide as its participants are many (8/8/7/7 of 30 threads on four
+    /// CCDs, not four quarters) to within one unit, whatever `n` is — no CCD
+    /// is handed the remainders of every matrix. The spans of CCDs `0..ccds()`
     /// partition `0..n`, in order; a CCD with no participant has an empty
     /// one.
     #[must_use]
     pub fn span(&self, n: usize, c: usize) -> Range<usize> {
-        let edge = |lane: usize| {
-            if lane >= self.threads {
-                n
-            } else {
-                chunk_bounds(n, self.threads, lane).0
-            }
-        };
-        edge(self.first_lane(c))..edge(self.first_lane(c + 1))
+        let edge = |c: usize| n * self.first_lane(c) / self.threads;
+        edge(c)..edge(c + 1)
     }
 }
 
@@ -768,6 +763,20 @@ fn parse_cache_size(s: &str) -> Option<u64> {
     digits.parse::<u64>().ok()?.checked_mul(unit)
 }
 
+/// The L3 size `read` found at `path`, a `cache/index3/size`: 0 where there is
+/// no such file (the topology does not say — a container, a VM). A file that is
+/// there and holds no size, or cannot be read, panics by name: a cap taken from
+/// it must not be a 0 that looks like an absent L3.
+fn l3_size(path: &str, read: std::io::Result<String>) -> u64 {
+    match read {
+        Ok(text) => parse_cache_size(&text).unwrap_or_else(|| {
+            panic!("{path} holds {text:?}, not a cache size (K, M, G or a byte count)")
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => panic!("{path}: {e}"),
+    }
+}
+
 /// Detect the L3 (CCD) topology: one group per shared L3 — its primaries,
 /// siblings and size — sorted by primary core id. The primary hyperthread of
 /// each core is its lowest sibling id. Ported from
@@ -812,12 +821,11 @@ fn detect_topology() -> Vec<CcdGroup> {
     groups
         .into_iter()
         .map(|(_, primaries)| {
-            let l3_bytes = read_sys(&format!(
+            let path = format!(
                 "/sys/devices/system/cpu/cpu{}/cache/index3/size",
                 primaries[0]
-            ))
-            .and_then(|s| parse_cache_size(&s))
-            .unwrap_or(0);
+            );
+            let l3_bytes = l3_size(&path, std::fs::read_to_string(&path));
             let mut siblings = Vec::new();
             for &p in &primaries {
                 let sib = parse_cpu_list(
@@ -858,7 +866,7 @@ fn pin(cpu: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pool, parse_cache_size};
+    use super::{Pool, l3_size, parse_cache_size};
     use std::sync::atomic::Ordering;
 
     /// `cache/index3/size` reads K, M and G suffixes and a bare count, and
@@ -873,6 +881,33 @@ mod tests {
             assert_eq!(parse_cache_size(bad), None, "{bad:?}");
         }
         assert_eq!(parse_cache_size("18446744073709551615K"), None);
+    }
+
+    /// An L3 size reads as written, is 0 only where the file is absent, and
+    /// a file that is there and holds no size or cannot be read is refused by
+    /// name.
+    #[test]
+    fn an_l3_size_is_absent_or_read_or_refused() {
+        let no_file = || Err(std::io::ErrorKind::NotFound.into());
+        assert_eq!(l3_size("p", Ok("32768K\n".into())), 32 << 20);
+        assert_eq!(l3_size("p", no_file()), 0);
+        for (read, named) in [
+            (Ok("lots\n".to_string()), "\"lots\\n\""),
+            (Ok(String::new()), "\"\""),
+            (Err(std::io::ErrorKind::PermissionDenied.into()), "denied"),
+        ] {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                l3_size("sys/index3/size", read)
+            }));
+            let msg = caught
+                .expect_err("a size that is not one is refused")
+                .downcast::<String>()
+                .expect("a formatted panic");
+            assert!(
+                msg.contains("sys/index3/size") && msg.contains(named),
+                "{msg}"
+            );
+        }
     }
 
     /// A pool has a CCD map only once every participant is pinned: the

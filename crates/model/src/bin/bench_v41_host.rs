@@ -231,7 +231,8 @@ const R8_CHECKS: [(usize, usize, usize); 8] = [
 /// Pool dispatches of the engine shape per layer: the gate+up group and the
 /// down group.
 const ENGINE_DISPATCHES: usize = 2;
-/// The refusal of a warm shape on a pool with no CCD map.
+/// The refusal of a warm shape, or of a plain `--check` (it runs the warm
+/// arms), on a pool with no CCD map.
 const NO_CCD_MAP: &str = "a warm arm needs the pool's CCD map: a worker's pin failed or the caller \
                           is not pinned (BLOOMERY_PIN_MAIN=0)";
 /// The warm arms a plain `--check` runs on the checked layers: a warm of two
@@ -4574,7 +4575,11 @@ fn run(mode: Mode) -> Result<(), BenchError> {
             threads::pool().caller_pinned()
         ),
     }
-    if ccd.is_none() && arms.iter().any(|a| a.shape.warms()) {
+    // A plain `--check` runs the warm arms too: with no CCD map it is refused
+    // by name before the load, as an explicit warm arm is, not passed green
+    // with the clause unrun.
+    let plain_check = matches!(&mode, Mode::Check(arms) if arms.is_empty());
+    if ccd.is_none() && (plain_check || arms.iter().any(|a| a.shape.warms())) {
         return Err(NO_CCD_MAP.into());
     }
     print_affinity()?;
@@ -4660,18 +4665,11 @@ fn run(mode: Mode) -> Result<(), BenchError> {
                 .map(|a| Arm::parse(a, None))
                 .collect::<Result<Vec<_>, _>>()?;
             check_r8_arms(&bench, &arms, &covered_layers(&bench.layers, &family))?;
-            if bench.ccd.is_some() {
-                let warm_arms = WARM_CHECK_ARMS
-                    .split(',')
-                    .map(|a| Arm::parse(a, None))
-                    .collect::<Result<Vec<_>, _>>()?;
-                check_warm_arms(&bench, &warm_arms, &covered_layers(&bench.layers, &family))?;
-            } else {
-                println!(
-                    "check warm arms skipped: {WARM_CHECK_ARMS} need the pool's CCD map, which \
-                     this run has none of"
-                );
-            }
+            let warm_arms = WARM_CHECK_ARMS
+                .split(',')
+                .map(|a| Arm::parse(a, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            check_warm_arms(&bench, &warm_arms, &covered_layers(&bench.layers, &family))?;
             let card_arms = CARD_CHECK_ARMS
                 .split(',')
                 .map(|a| Arm::parse(a, None))
