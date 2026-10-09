@@ -34,21 +34,38 @@
 //!   holds of the tier's drop runs ([`NvTier::drop_region`]), read with
 //!   `mincore` over the probe's own open of the file, not the engine's
 //!   mapping, three times, each after the tier's dropper has run what its
-//!   readers queued ([`NvTier::flush`]). (a) 0 pages after the tier's own drop of every run
-//!   before the prompt — the premise: no other process maps the file (every
-//!   gate that maps it holds the V4.1 load lock this one holds). (b) After
-//!   the prompt call, at most the readahead its readers had in flight when
-//!   each layer's drop ran: a window of `R` pages a reading thread a paged
-//!   layer, the readers no more than the host's CPUs. (c) With the residue
-//!   dropped again so the two readers stay apart, after the [`STEPS`] steps,
-//!   at most the readahead spill of the flips' copies, which a lane's drop
-//!   of its own id does not name: a copy reads an expert's three parts in
-//!   order through the mapping, and the kernel's read-around opens `R/2`
-//!   pages before a part's first fault and its async window may run
-//!   `R/4 + R` past the part's end — `7R/4` a part, `21R/4` a flip. `R` is
-//!   the model file's device's `read_ahead_kb` (sysfs) in pages: the box
-//!   reads 128 KiB, 32 pages at 4 KiB, so 168 pages a flip. The line also
-//!   prints the prompt's drops and their wall against the prompt's.
+//!   readers queued ([`NvTier::flush`]). Every page-cache read of the file
+//!   in a run is a fault through a mapping (the tier's fills bypass the
+//!   cache, `O_DIRECT`), and a fault's readahead stays within `R` pages a
+//!   window: the fault path asks for `R`, so the device's larger IO size
+//!   never widens it. The read-around opens `R/2` pages before a reader's
+//!   first fault; once the reader runs on, each window's marker sits on its
+//!   first page, so a reader at page `p` has the cache read through
+//!   `p + 2R - 1` — `R/2` before a reader and `2R` past it. Each read splits
+//!   a run's pages into its interior and an edge band of `2R` pages at each
+//!   of its two ends ([`edge_band`]): a run ends where a byte the host keeps
+//!   begins — a held expert, or a tensor beside the stack — and the host's
+//!   own reads of those bytes reach that far into it, reads the tier does
+//!   not govern. The band's pages are printed, not judged. The interior is
+//!   judged: (a) 0 pages after the tier's own drop of every run before the
+//!   prompt — the premise: no other process maps the file (every gate that
+//!   maps it holds the V4.1 load lock this one holds), and the drop takes
+//!   every page it names. (b) After the prompt call, at most the readahead
+//!   its readers had in flight when each layer's drop ran: `2R` pages a
+//!   reading thread a paged layer, the readers no more than the host's
+//!   CPUs. (c) With the residue dropped again so the two readers stay
+//!   apart, after the [`STEPS`] steps, at most the readahead spill of the
+//!   flips' copies, which a lane's drop of its own id does not name: a copy
+//!   reads an expert's three parts in order through the mapping, each with
+//!   `R/2` before it and `2R` past it — `5R/2` a part, `15R/2` a flip. `R`
+//!   is the model file's device's `read_ahead_kb` (sysfs) in pages: the box
+//!   reads 128 KiB, 32 pages at 4 KiB, so a band of 64 pages and 240 a flip.
+//!   The line also prints each read's band pages, and the prompt's drops and
+//!   their wall against the prompt's.
+//!
+//! PIN(2026-10-09): clause 7 judges the runs' interiors, the `2R` bands at
+//! their ends printed — the base read held a few pages at the runs' edges
+//! after the tier's own drop.
 //!
 //! PIN(2026-10-08): the page-cache design's two named refusals are dropped
 //! — a paged tier under `BLOOMERY_HOST_LOCK=1` (the lock walk pins model
@@ -151,18 +168,22 @@ struct ArmRun {
     footprint: Option<Footprint>,
 }
 
-/// Resident pages over the tier's drop runs (`footprint`), and the runs'
+/// Resident pages over the tier's drop runs (`footprint`): those in a run's
+/// interior and those in the edge band at either of its ends, and the runs'
 /// pages.
 #[derive(Clone, Copy, Default)]
 struct Pages {
-    resident: u64,
+    interior: u64,
+    edge: u64,
     total: u64,
 }
 
 /// The paged arm's footprint: after the tier's own drop before the prompt,
-/// after the prompt and after the steps, over its paged layers; and the
-/// prompt's drops (calls, wall) against the prompt's wall.
+/// after the prompt and after the steps, over its paged layers, read with
+/// an edge band of `band` pages; and the prompt's drops (calls, wall)
+/// against the prompt's wall.
 struct Footprint {
+    band: u64,
     base: Pages,
     prompt: Pages,
     steps: Pages,
@@ -192,8 +213,8 @@ fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
 /// One arm: the model loaded under `residency` with `room` given (or the
 /// machine's reading), its [`PROMPT`] ids as one prompt call and [`STEPS`]
 /// greedy steps, the residency boundaries' reports summed; on a load with a
-/// tier and no `--audit`, the footprint read through `probe`, the gate's own
-/// open of the file.
+/// tier and a `band` (none under `--audit`), the footprint read through
+/// `probe`, the gate's own open of the file, with that edge band.
 #[allow(
     clippy::too_many_arguments,
     reason = "one arm's load, its inputs and its instrument, each named"
@@ -207,6 +228,7 @@ fn arm(
     ids: &[u32],
     audit: bool,
     probe: &Split,
+    band: Option<u64>,
 ) -> Result<ArmRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, room)?;
@@ -238,19 +260,19 @@ fn arm(
     // `footprint`: the tier's drop runs, its own definition; the page cache
     // emptied of them by the tier's own drop first, so a page an earlier run
     // left warm is not this one's.
-    let foot = match &tier {
-        Some(t) if !audit => {
+    let foot = match (&tier, band) {
+        (Some(t), Some(band)) if !audit => {
             let regions = (0..plan.model.layers)
                 .filter(|&l| t.covers(l))
                 .map(|l| Ok((l, t.drop_region(l)?)))
                 .collect::<Result<Vec<_>, GateError>>()?;
             drop_all(t, &regions)?;
-            Some((Arc::clone(t), regions))
+            Some((Arc::clone(t), regions, band))
         }
         _ => None,
     };
     let base = match &foot {
-        Some((_, regions)) => resident(probe, regions)?,
+        Some((_, regions, band)) => resident(probe, regions, *band)?,
         None => Pages::default(),
     };
     let drops0 = tier.as_ref().map(|t| t.stats());
@@ -291,15 +313,15 @@ fn arm(
     note(&mut s, &mut run)?;
     // The readers queue their drops for the tier's dropper: every read
     // below waits for the queue first.
-    if let Some((t, _)) = &foot {
+    if let Some((t, ..)) = &foot {
         t.flush()?;
     }
     let drops1 = tier.as_ref().map(|t| t.stats());
     // The prompt's residue dropped through the tier, so the steps' read
     // names only what the steps' own readers left.
     let prompt_pages = match &foot {
-        Some((t, regions)) => {
-            let p = resident(probe, regions)?;
+        Some((t, regions, band)) => {
+            let p = resident(probe, regions, *band)?;
             drop_all(t, regions)?;
             p
         }
@@ -314,15 +336,16 @@ fn arm(
         run.tokens.push(next);
         note(&mut s, &mut run)?;
     }
-    if let Some((t, _)) = &foot {
+    if let Some((t, ..)) = &foot {
         t.flush()?;
     }
     run.stats = tier.as_ref().map(|t| t.stats());
-    if let (Some((_, regions)), Some(d0), Some(d1)) = (&foot, drops0, drops1) {
+    if let (Some((_, regions, band)), Some(d0), Some(d1)) = (&foot, drops0, drops1) {
         run.footprint = Some(Footprint {
+            band: *band,
             base,
             prompt: prompt_pages,
-            steps: resident(probe, regions)?,
+            steps: resident(probe, regions, *band)?,
             layers: regions.len(),
             prompt_drops: d1.drops - d0.drops,
             prompt_drop_ns: d1.drop_ns - d0.drop_ns,
@@ -376,9 +399,11 @@ fn drop_all(tier: &NvTier, regions: &[(usize, DropRuns)]) -> Result<(), GateErro
 /// The page cache's residency over the runs of `regions`, read with
 /// `mincore` through `probe`'s mapping of each shard (the gate's own open of
 /// the file: a file page's residency is the page cache's, whichever mapping
-/// asks): the resident pages and the runs' pages.
-fn resident(probe: &Split, regions: &[(usize, DropRuns)]) -> Result<Pages, GateError> {
+/// asks): the resident pages in each run's interior and in the `band` pages
+/// at either of its ends ([`edge_band`]), and the runs' pages.
+fn resident(probe: &Split, regions: &[(usize, DropRuns)], band: u64) -> Result<Pages, GateError> {
     let page = page_bytes().map_err(|e| format!("the page size: {e}"))?;
+    let band = usize::try_from(band)?;
     let mut pages = Pages::default();
     let mut vec = Vec::new();
     for (layer, rows) in regions {
@@ -394,7 +419,8 @@ fn resident(probe: &Split, regions: &[(usize, DropRuns)]) -> Result<Pages, GateE
                     .and_then(|(a, b)| map.get(a..b))
                     .ok_or_else(|| {
                         format!(
-                            "layer {layer} shard {shard}: the run {run:?} is past the mapping's                              {} B",
+                            "layer {layer} shard {shard}: the run {run:?} is past the \
+                             mapping's {} B",
                             map.len()
                         )
                     })?;
@@ -421,7 +447,13 @@ fn resident(probe: &Split, regions: &[(usize, DropRuns)]) -> Result<Pages, GateE
                     )
                     .into());
                 }
-                pages.resident += vec.iter().filter(|&&v| v & 1 != 0).count() as u64;
+                for (i, _) in vec.iter().enumerate().filter(|&(_, &v)| v & 1 != 0) {
+                    if i < band || i + band >= n {
+                        pages.edge += 1;
+                    } else {
+                        pages.interior += 1;
+                    }
+                }
                 pages.total += n as u64;
             }
         }
@@ -461,6 +493,14 @@ fn readahead_pages(path: &Path) -> Result<u64, GateError> {
     })?;
     let page = page_bytes().map_err(|e| format!("the page size: {e}"))?;
     Ok(kb * 1024 / page)
+}
+
+/// The edge band at each end of a drop run, in pages, for a readahead
+/// window of `ra` pages: the kernel's reach from a reader of the kept bytes
+/// a run ends at into the run, `2R` pages (the module doc's clause 7). The
+/// footprint prints its pages and judges the interior.
+fn edge_band(ra: u64) -> u64 {
+    2 * ra
 }
 
 /// The drop runs against the probe's own tensor table (`advice` (b) and
@@ -590,6 +630,14 @@ fn run() -> Result<(), GateError> {
     drop(plan);
 
     let ids = prose38(PROMPT)?;
+    // `footprint`'s instrument: the model file's device's readahead window
+    // and the edge band it gives; `--audit` reads no footprint.
+    let window = if audit {
+        None
+    } else {
+        Some(readahead_pages(path)?)
+    };
+    let band = window.map(edge_band);
     let paged = arm(
         path,
         &machine,
@@ -599,8 +647,11 @@ fn run() -> Result<(), GateError> {
         &ids,
         audit,
         &probe,
+        band,
     )?;
-    let ram = arm(path, &machine, None, residency, host, &ids, false, &probe)?;
+    let ram = arm(
+        path, &machine, None, residency, host, &ids, false, &probe, None,
+    )?;
 
     let tokens_eq = paged.tokens == ram.tokens;
     let digests_eq = paged.digests == ram.digests;
@@ -645,51 +696,55 @@ fn run() -> Result<(), GateError> {
         verdict(advice)
     );
     pass &= advice;
-    // `footprint` (clause 7): what the drop runs keep in the page cache once
-    // their readers are done, held to the readahead the header derives.
-    if audit {
-        println!("footprint: off (--audit reads the file through the page cache by design)");
-    } else {
+    // `footprint` (clause 7): what the drop runs' interiors keep in the page
+    // cache once their readers are done, held to the readahead the header
+    // derives; the edge bands are printed.
+    if let Some(ra) = window {
         let f = paged
             .footprint
             .as_ref()
             .ok_or("the paged arm read no footprint")?;
-        let ra = readahead_pages(path)?;
         let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
-        let prompt_bound = f.layers as u64 * cpus * ra;
-        let steps_bound = paged.landed as u64 * 21 * ra / 4;
-        let base_ok = f.base.total > 0 && f.base.resident == 0;
-        let prompt_ok = f.prompt.resident <= prompt_bound;
-        let steps_ok = f.steps.resident <= steps_bound;
+        let prompt_bound = f.layers as u64 * cpus * 2 * ra;
+        let steps_bound = paged.landed as u64 * 15 * ra / 2;
+        let base_ok = f.base.total > 0 && f.base.interior == 0;
+        let prompt_ok = f.prompt.interior <= prompt_bound;
+        let steps_ok = f.steps.interior <= steps_bound;
         let footprint = base_ok && prompt_ok && steps_ok;
         println!(
             "footprint: {} pages in the drop runs over {} paged layers, R {ra} pages \
-             (read_ahead_kb); resident {} after the tier's own drop (want 0: {}), {} after the \
-             prompt (at most {} layers x {cpus} readers x R = {prompt_bound}: {}), {} after {STEPS} \
-             steps (at most {} flips x 21R/4 = {steps_bound}: {}); the prompt's drops {} calls, \
-             {:.1} ms on the dropper's thread beside the prompt's {:.1} ms ({:.2} %): {}",
+             (read_ahead_kb), an edge band of {} pages at each run end (printed, not judged); \
+             in the interiors {} after the tier's own drop (want 0: {}), {} after the prompt \
+             (at most {} layers x {cpus} readers x 2R = {prompt_bound}: {}), {} after {STEPS} \
+             steps (at most {} flips x 15R/2 = {steps_bound}: {}); in the bands {} / {} / {}; \
+             the prompt's drops {} calls, {:.1} ms on the dropper's thread beside the \
+             prompt's {:.1} ms ({:.2} %): {}",
             f.base.total,
             f.layers,
-            f.base.resident,
+            f.band,
+            f.base.interior,
             if base_ok {
                 "ok"
             } else {
-                "another process maps the file"
+                "held after the tier's own drop: another mapper, or a page the drop cannot take"
             },
-            f.prompt.resident,
+            f.prompt.interior,
             f.layers,
             if prompt_ok {
                 "ok"
             } else {
                 "the union's pages stay"
             },
-            f.steps.resident,
+            f.steps.interior,
             paged.landed,
             if steps_ok {
                 "ok"
             } else {
                 "a promotion's pages stay"
             },
+            f.base.edge,
+            f.prompt.edge,
+            f.steps.edge,
             f.prompt_drops,
             f.prompt_drop_ns as f64 / 1e6,
             f.prompt_ns as f64 / 1e6,
@@ -697,6 +752,8 @@ fn run() -> Result<(), GateError> {
             verdict(footprint)
         );
         pass &= footprint;
+    } else {
+        println!("footprint: off (--audit reads the file through the page cache by design)");
     }
     if let Some(r) = record::nvtier_of(Some(tier)) {
         r.print();
