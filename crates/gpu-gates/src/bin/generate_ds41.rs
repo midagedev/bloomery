@@ -29,8 +29,9 @@
 //! name a lever set outside them and a `BLOOMERY_*` name no registry row
 //! names; `--levers` prints them with this process's values and exits.
 //! Every line the binary writes is a record of a kind
-//! `bloomery_gpu_gates::record` declares, but the `arms in order` line of an
-//! `--arm` list (below), plain text on stderr; `--records-schema` prints those
+//! `bloomery_gpu_gates::record` declares, but an `--arm` list's `arms in
+//! order` and `state back at arm <i>: ok` lines (below), plain text on
+//! stderr; `--records-schema` prints those
 //! kinds (fields, types, units) and exits. Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
@@ -179,7 +180,8 @@
 //! prints in a fresh process. Before each arm after the first, the state-back
 //! check (`shared/state_back.rs`) asserts the model came back to its load —
 //! position 0, not poisoned, each card's free device bytes within a fixed
-//! slack of the load's own reading — before the arm's `arm` record, so
+//! slack of the load's own reading, and says `state back at arm <i>: ok` on
+//! stderr when it does — before the arm's `arm` record, so
 //! `--arm-sync`'s wait stays where it was. The since-load counters (`stat prefill`'s
 //! `union_*`) count from the arm's start. The load-time lines (`plan`,
 //! `load`, `capture`, `prefill`) print once, before arm 0. A list of more

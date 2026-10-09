@@ -3,7 +3,9 @@
 //! once after the load and assert it back before every config after the
 //! first — the position, the fault word and each card's free device bytes —
 //! so a state that leaks across the boundary ends the process by name
-//! instead of quietly feeding the next config.
+//! instead of quietly feeding the next config. A boundary that passes says
+//! so on one plain stderr line, `state back at arm 1: ok` (`run 1` in the
+//! chat), so a log shows each check ran; the gate recipes count them.
 //!
 //! What checks: `generate_ds41`'s one-slot plain path, before each arm after
 //! the first of an `--arm` list — before the arm's `arm` record, so
@@ -62,10 +64,11 @@ impl StateBack {
     }
 
     /// Whether `now` is the state the load left (`self`) within the rules:
-    /// the position and the poison word exactly, each card's free bytes
-    /// within [`CARD_FREE_SLACK`] — free bytes above the load's are fine. A
-    /// refusal names `at` (the arm or run it guards), the field, the card
-    /// and both readings.
+    /// the position and the poison word exactly, as many cards as the load
+    /// read, each card's free bytes within [`CARD_FREE_SLACK`] — free bytes
+    /// above the load's are fine. A refusal names `at` (the arm or run it guards), the field,
+    /// the card and both readings; a pass prints `state back at <at>: ok` on
+    /// stderr.
     pub fn check(&self, now: &StateBack, at: &str) -> Result<(), GateError> {
         if now.pos != self.pos {
             return Err(format!(
@@ -80,6 +83,14 @@ impl StateBack {
             )
             .into());
         }
+        if now.cards.len() != self.cards.len() {
+            return Err(format!(
+                "state back at {at}: the load read {} cards, this read {}",
+                self.cards.len(),
+                now.cards.len()
+            )
+            .into());
+        }
         for (b, n) in self.cards.iter().zip(&now.cards) {
             if n.1 + CARD_FREE_SLACK < b.1 {
                 return Err(format!(
@@ -90,6 +101,7 @@ impl StateBack {
                 .into());
             }
         }
+        eprintln!("state back at {at}: ok");
         Ok(())
     }
 }
