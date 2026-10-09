@@ -1,0 +1,42 @@
+# 0.2.7 against the 0.2.8 candidate, the user's defaults, one lease on the A6000: v0.2.7's build and the candidate's
+# on UD-Q4_K_XL and UD-Q3_K_XL; the MTP draft at each build's default (on), P = 512 and 4096, ctx 4352. The 0.2.8
+# release notes and README's A6000 rows take these numbers.
+#
+# Decomposition [derived]: pickrule's own A/B against v0.2.7 (docs/cards/pickrule-ab.card, the same runner, the same
+# corpus slice, Q4) read pp4096 1,600.74 against 1,403.68 (1.1404 ± 0.0096) and pp512 1,017.69 against 977.82 (the
+# fair first-slot read +2.0..+2.3 %). The candidate adds on the prompt path only what no measurement priced since:
+# - train028 (q38d3k, placerule, the fixture tier, m2lift): the q38d3k scratch/program38 changes move decode depth
+#   terms, not the prompt walk; placerule changes only --place unset (this card pins plan a through the runner's
+#   default, which runs no --place: the A6000 alone is the only visible card under BLOOMERY_CARD=a6000);
+# - nvtier: no tier on a 256 GB host (the room holds the routed experts);
+# - mtpctx: a bound at the context's end, never reached at ctx 4352 with 96 tokens after 4,096.
+# - pickrate (the copy lane on four threads): its own A/B read pp4096 +4.56 % ± 0.25 % over pickrule's build, pp512
+#   unmoved (docs/cards/pickrate-c1-ab.card); this card's earlier window on the pre-pickrate candidate read 1,607;
+# - longfix, paghead, pagedrop, pagedoff, paged1, xdeinit: a fresh process's one prompt call has no decode history
+#   (longfix restores nothing), and a 256 GB host plans no NVMe tier, so none of them is on this card's path.
+# Q4: pp4096 1,607 x 1.0456 = 1,680, ± the window: 1,640..1,720; pp512 980..1,060. Q3: the walk re-prices on Q3 too,
+# but XSTREAM_COSTS keeps the no-tile row for Q3, so stage 1 does not move it: pp4096 1,700 x 1.00..1.12. Decode
+# after 4K: no lever; 0.2.7's 89.3 / 99.6 ± the window.
+# Wall [derived]: 8 arms x 4 rounds of a fresh Qwen3.8 load (~40 s each; rel027-ab's 8 x 4 took 22..28 min), 22..28 min.
+# Runner (the rel028 tree, the full output to a file first):
+# BLOOMERY_HOLD_OWNER=sit028 BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=4
+# BLOOMERY_BOX_ENV='BLOOMERY_AB_LOAD=arm BLOOMERY_LEASE_CARD=docs/cards/rel028-ab.card BLOOMERY_GEN_CTX=4352' just depth-gpu-qwen4exp
+#   bin:/root/repo/bloomery-v027/target/release/generate_qwen3moe:prose:512
+#   bin:/root/repo/bloomery-v027/target/release/generate_qwen3moe:prose:4096
+#   bin:/root/repo/bloomery-v027/target/release/generate_qwen3moe:prose:512@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+#   bin:/root/repo/bloomery-v027/target/release/generate_qwen3moe:prose:4096@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+#   prose:512 prose:4096 prose:512@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf prose:4096@model=/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+kind: baseline
+question: what does a user's 0.2.8 read against 0.2.7 on the A6000 for a 512- and a 4,096-token prompt and the decode
+  after it, on UD-Q4_K_XL and UD-Q3_K_XL, at the defaults?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, the 0.2.8 UD-Q4_K_XL arm at its defaults (MTP draft on)
+unit: tok/s
+predict: 1640..1720
+condition: one lease, four rounds, a fresh process per arm (BLOOMERY_AB_LOAD=arm), no [cold] row on the candidate's
+  arms, no [cpu-busy] or [other-busy] row; the v0.2.7 Q4 arm within 1 % of 1,403.7 (pickrule-ab's window), else the
+  rows carry this window's ratio, not 0.2.7's published number
+reason: the 0.2.8 release notes' measured headline (the user, 2026-10-08: a visible gain every release)
+decide-in: the notes and README's 0.2.8 rows take this window's numbers
+decide-below: read the candidate arm's call stream records (admitted, staged_us, backlog) against pickrule-ab's Q1
+  rows: which of train028's changes moved the walk
+decide-above: check the plan line (card experts a layer) and the draft line before believing it

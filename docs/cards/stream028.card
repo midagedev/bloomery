@@ -1,0 +1,10 @@
+# The 0.2.8 release pass, sitting 2 of 2 (GitHub #3's stream and the orderly stop; sitting 1 is tape028.card): the candidate tarball's bloomery-serve --model qwen38 at the serving defaults (every BLOOMERY_*
+# lever unset: adaptive residency, the prompt path, the shared MTP draft with its cost-chosen width), Qwen3.8-Flash-Next
+# UD-Q4_K_XL, greedy, thinking off, on --place a and bp (and unset on both cards, which must pick bp): the release tapes (one discarded warm-up, prompts 4, 3, 1 at
+# --ctx-size 8192), then GitHub #3's request stream at --ctx-size 40960 (three ~29.5K-token prompts in a row after 14
+# shorter ones), red on any failed request, a dead server or an engine error line. The headline numbers stay the depth
+# runners' (the pickrule and q38bpbug sittings).
+kind: exclusive
+reason: two 111 GB model loads (~45 s each) and timed requests whose per-token times are the tape, so the box must be
+  quiet; why now: 0.2.8 is the speed release (pickrule pp4096, the two-card default) and its candidate needs the user-facing pass before the tag
+minutes: 15..25
