@@ -52,3 +52,10 @@ decide-below: under the DRAM band: at 13.0..14.0 the loss is a shared resource a
   copy 0.232 ms]); between 14.0 and 16.1, re-derive the A/B band at the measured rate first
 decide-above: past the DMA path: the load probe's 20.41 under-reads the path; re-measure it (nvread's drive probe
   or a lane probe at 4 threads) before the A/B band is written
+#
+# Note (2026-10-09, after the run): the condition's equal-admits premise was wrong. The walk's constants read the
+# load-time XStream lane probe, which moves per load (20.94 against 20.58 GB/s in run 2), so the admits move with
+# it: BASE alone read 3398 and 3432 over two loads, a same-build scatter of about +-1 %. The builds' gaps (5 and 16
+# admits) sat inside it, and the term is per byte. The condition that holds the plan is the lane probe's band
+# (19.0..21.4, as pickrate-c1-ab.card states), not equal admits. The term read C1 21.17 and 21.09 GB/s, BASE 13.54
+# and 13.77: inside the band.
