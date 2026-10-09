@@ -311,8 +311,8 @@ fn rows_are_read_by_their_column_names() -> Result<(), RefError> {
 }
 
 /// The file a family's test runs.
-fn runs() -> String {
-    "/models/P/M-00001-of-00009.gguf".to_string()
+fn runs() -> Result<String, RefError> {
+    Ok("/models/P/M-00001-of-00009.gguf".to_string())
 }
 
 /// A family of the ik node dumps' shape, pinned to build `b0` and

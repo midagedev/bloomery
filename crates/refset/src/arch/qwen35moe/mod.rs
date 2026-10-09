@@ -2,6 +2,7 @@
 //! Q4_K_M file, [`MODEL`], by the ik tree [`IK_BUILD`]
 //! (`tools/ref/models/qwen35moe.sh`).
 
+use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 /// The file every qwen35moe set is dumped from and the tree runs. The
@@ -29,8 +30,8 @@ pub const D1K: &str = "ref_qwen35moe_d1k";
 pub const STEP_SETS: &[&str] = &[STEP4, D1K];
 
 /// [`MODEL`], as a family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 /// ik's node dumps: the batch set and the decode-step sets.

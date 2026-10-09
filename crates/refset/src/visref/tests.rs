@@ -3,8 +3,10 @@ use crate::RefError;
 use crate::family::{Build, Family, Identity};
 use std::path::{Path, PathBuf};
 
-fn runs() -> String {
-    "/models/v41/m-00001-of-00009.gguf".to_string()
+const RUNS: &str = "/models/v41/m-00001-of-00009.gguf";
+
+fn runs() -> Result<String, RefError> {
+    Ok(RUNS.to_string())
 }
 
 static FAMILY: Family = Family {
@@ -36,7 +38,7 @@ struct Set {
 impl Default for Set {
     fn default() -> Set {
         Set {
-            model: runs(),
+            model: RUNS.to_string(),
             build: "f00d",
             rows: "org/model@r1",
             complete: true,

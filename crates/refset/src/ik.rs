@@ -270,6 +270,10 @@ pub struct RefHeader {
     pub tokens_count: Option<u64>,
     /// `# model_file`: the name of the model file the set was dumped from.
     pub model_file: Option<String>,
+    /// `# fixture`: in a set dumped on a fixture file, that file's
+    /// `bloomery.fixture.*` keys, the text after the tab
+    /// ([`crate::fixture::keys`]).
+    pub fixture: Option<String>,
     /// `# flags`: the dumper's command line.
     pub flags: Option<String>,
     /// `-c` in `# flags`: the context the dumper ran at.
@@ -495,6 +499,7 @@ impl RefManifest {
 
     /// This set against its family's row: the completion trailer
     /// ([`RefError::Unfinished`]), then the model file its `# model` line
+    /// states and, for a fixture family, the generation its `# fixture` line
     /// states ([`RefError::Stale`]), its `# arch` and its `# build`
     /// ([`RefError::Foreign`]).
     pub fn check_family(&self, family: &Family) -> Result<(), RefError> {
@@ -504,6 +509,7 @@ impl RefManifest {
             });
         }
         family.check_file(&self.dir, "# model", self.header.model())?;
+        family.check_fixture(&self.dir, self.header.fixture.as_deref())?;
         family.check_arch(&self.dir, self.arch.as_deref())?;
         family.check_build(&self.dir, self.build.as_deref())
     }
@@ -544,6 +550,7 @@ impl RefManifest {
             "tokens_file_sha256" => once(&mut h.tokens_file_sha256, text(), key, at),
             "tokens_count" => once(&mut h.tokens_count, parse_u64(v, at)?, key, at),
             "model_file" => once(&mut h.model_file, text(), key, at),
+            "fixture" => once(&mut h.fixture, text(), key, at),
             "flags" => {
                 h.ctx = flag_value(v, "-c").map_err(|e| bad(&e))?;
                 h.threads = flag_value(v, "-t").map_err(|e| bad(&e))?;

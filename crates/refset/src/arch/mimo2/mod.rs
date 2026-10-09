@@ -2,6 +2,7 @@
 //! checkpoint's MXFP4 split set, [`MODEL`], by the ik tree [`IK_BUILD`]
 //! (`tools/ref/models/mimo2.sh`).
 
+use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 /// The first shard of the split set every mimo2 set is dumped from and
@@ -40,8 +41,8 @@ pub const D4096: &str = "ref_mimo2_d4096";
 pub const STEP_SETS: &[&str] = &[STEP4, STEP4_EVERY_NODE, D1K, D4096];
 
 /// [`MODEL`], as a family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 /// ik's node dumps: the batch set and the decode-step sets, which the MiMo
