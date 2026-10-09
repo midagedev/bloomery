@@ -17,8 +17,9 @@ use super::workstation::{
     census_usable, host, resolve, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use super::{
-    Card, CardFormat, Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
-    PlanLevers, Role, plan_routed_reserving,
+    ARENA_ALIGN, ARENA_COLUMNS, ArenaDial, ArenaFloor, Card, CardFormat, Device, KvBytes, Machine,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
+    plan_routed_reserving,
 };
 use crate::slots::{SeqTerms, Stores};
 
@@ -694,6 +695,25 @@ fn layer_unit(model: &ModelTensors, layer: usize) -> u64 {
         .sum()
 }
 
+/// The split dial's terms at `room` as [`super::expert_nvme_tier`] reads
+/// them off `twin`, the plan before the split: the host terms beside the
+/// routed experts, the heaviest layer's host bytes, the host leg, the need
+/// and the arena's floor at the served column.
+fn dial_of(twin: &Plan<'_>, room: u64) -> ArenaDial {
+    let need = HostNeed::of(twin, 0);
+    ArenaDial {
+        room,
+        base: HostNeed { experts: 0, ..need }.bytes(),
+        heavy: (0..LAYERS)
+            .map(|l| layer_split(twin, l).2)
+            .max()
+            .expect("layers"),
+        held: twin.host.expert_bytes,
+        need: need.bytes(),
+        least: ArenaFloor::of(twin, ARENA_COLUMNS).expect("the arena's floor"),
+    }
+}
+
 /// What the tests derive of a plan on the gate card beside a room: the plan
 /// with the NVMe expert tier, its unsplit twin at the same room, and the
 /// numbers of the table.
@@ -744,8 +764,7 @@ fn nvme_arm(room: u64) -> NvmeArm {
     }
     .bytes();
     let floor = base + 3 * layer_bytes;
-    let arena = super::nvme_arena_of(room, twin.host.expert_bytes, floor, None)
-        .expect("the dial's default");
+    let arena = super::nvme_arena_of(&dial_of(&twin, room), None).expect("the dial's default");
     assert_eq!(
         split.host.nvme_arena_bytes, arena,
         "the plan states the arena the dial chose"
@@ -1110,56 +1129,267 @@ fn a_room_that_holds_the_need_keeps_the_plan_unchanged() {
     assert!(HostNeed::of(&under, 0).bytes() < need);
 }
 
-/// A room under the floor is refused by name, with the room, the floor and
-/// the need; the floor itself is planned.
+/// A room under the floor is refused by name, with the room, the floor, the
+/// need and the arena's least the floor counts; the floor itself is planned,
+/// with the least arena.
+// PIN(2026-10-09): the floor is `base + 3 W` plus the arena's least on a
+// plan with a deep side (was `base + 3 W` alone, which planned arenas of one
+// to ten slots a paged layer at the rooms just above it, overflowed by the
+// first decode call's ten ids): `ArenaDial::room_floor`.
 #[test]
 fn a_room_under_the_floor_is_refused_by_name() {
     let arm = nvme_arm(27 << 30);
     let q4 = model(false);
     let gate = machine_a(RTX_3090);
-    match plan_at(&q4, &gate, 4096, 1, arm.floor - 1) {
+    let twin = plan_with(&q4, &gate, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+    let least = dial_of(&twin, 0).least;
+    let floor = arm.floor + least.bytes;
+    match plan_at(&q4, &gate, 4096, 1, floor - 1) {
         Err(PlacementError::HostRoomFloor {
-            room, floor, need, ..
+            room,
+            floor: f,
+            need,
+            arena,
+            ..
         }) => assert_eq!(
-            (room, floor, need),
-            (arm.floor - 1, arm.floor, arm.old_need)
+            (room, f, need, arena),
+            (floor - 1, floor, arm.old_need, Some(least))
         ),
         other => panic!("not refused by name: {:?}", other.map(|p| p.host)),
     }
-    let msg = plan_at(&q4, &gate, 4096, 1, arm.floor - 1)
+    let msg = plan_at(&q4, &gate, 4096, 1, floor - 1)
         .map(|_| ())
         .unwrap_err()
         .to_string();
-    assert!(msg.contains(&(arm.floor - 1).to_string()) && msg.contains(&arm.floor.to_string()));
-    let at = nvme_arm(arm.floor);
+    assert!(msg.contains(&(floor - 1).to_string()) && msg.contains(&floor.to_string()));
+    let at = nvme_arm(floor);
     assert!(at.r_min <= at.r_max && at.moved > 0);
     assert!(at.max_unit > 0);
+    assert_eq!(
+        at.arena, least.bytes,
+        "the floor's room plans the least arena"
+    );
 }
 
-/// The split dial's own rule ([`super::nvme_arena_of`]): the default is the
-/// largest arena the room leaves above the floor on a room that cannot hold
-/// half the host leg's bytes, 0 on one that covers it; a value the lever
-/// gives is taken as it is and one that pushes the host segments under the
-/// floor is refused by name, with the room, the floor and the value.
+/// The arena's floor on the gate plan: ten ids a call (the routed width, one
+/// column) and the residency machine's one lane claim beside them, over one
+/// slot of each of the 48 layers — every part of the Q4 file a whole number
+/// of pages, so a slot set is the experts' bytes and two pages a part. A
+/// room that leaves the arena fewer slots a paged layer — `k − 1`, or the
+/// floor's own count less one — is refused at plan time by name, naming the
+/// slots, the ids a call, the lane claims and the bytes, where the old dial
+/// planned both and the first decode call overflowed them. The floor's own
+/// room plans an arena that carves exactly its slots.
+#[test]
+fn a_room_that_leaves_under_the_floors_slots_is_refused_by_name() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let twin = plan_with(&q4, &gate, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+    let dial = dial_of(&twin, 0);
+    let least = dial.least;
+    assert_eq!(
+        (least.k, least.columns, least.lanes, least.slots),
+        (10, 1, 1, 11)
+    );
+    let units: u64 = (0..LAYERS).map(|l| layer_unit(&q4, l)).sum();
+    assert_eq!(least.slot_set, units + LAYERS as u64 * 3 * 2 * ARENA_ALIGN);
+    assert_eq!(least.bytes, 11 * least.slot_set);
+    let floor = dial.floor().expect("the floor");
+    for slots in [least.k - 1, least.slots - 1] {
+        let room = floor + slots * least.slot_set;
+        let planned = plan_at(&q4, &gate, 4096, 1, room).map(|p| p.host.nvme_arena_bytes);
+        let e = match planned {
+            Err(e) => e,
+            Ok(arena) => panic!("{slots} slots' room planned an arena of {arena} B"),
+        };
+        match &e {
+            PlacementError::HostRoomFloor {
+                room: r,
+                floor: f,
+                arena: Some(a),
+                ..
+            } => assert_eq!((*r, *f, *a), (room, floor + least.bytes, least)),
+            other => panic!("{slots} slots: not the floor's refusal: {other}"),
+        }
+        let text = e.to_string();
+        for part in [
+            "11 slots a paged layer".to_string(),
+            "10 × 1 ids a call + 1 lane claims".to_string(),
+            format!("= {} B", least.bytes),
+            "BLOOMERY_NVTIER_BYTES=0".to_string(),
+        ] {
+            assert!(text.contains(&part), "{part:?} in {text}");
+        }
+    }
+    let at = plan_at(&q4, &gate, 4096, 1, floor + least.bytes).expect("the floor's own room");
+    let carve = ArenaFloor::of(&at, ARENA_COLUMNS).expect("the split plan's floor");
+    assert_eq!(at.host.nvme_arena_bytes, least.bytes);
+    assert_eq!(
+        carve, least,
+        "every layer pages: the split plan's floor is the twin's"
+    );
+    assert_eq!(at.host.nvme_arena_bytes / carve.slot_set, least.slots);
+}
+
+/// A given `BLOOMERY_NVTIER_BYTES` under the arena's floor is refused by
+/// name with the value and the floor; the floor itself and 0 are taken. A
+/// given 0 pages through the file mapping at a room the dial refuses
+/// unset (between the tier's floor and its least arena above it), and under
+/// the tier's floor even a given 0 is refused, the floor then holding no
+/// arena term.
+#[test]
+fn a_given_arena_under_the_floor_is_refused_by_name() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let twin = plan_with(&q4, &gate, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+    let dial = dial_of(&twin, 27 << 30);
+    let least = dial.least;
+    let floor = dial.floor().expect("the floor");
+    let e = nvme_arena_of(&dial, Some(least.bytes - 1)).expect_err("under the floor");
+    match &e {
+        PlacementError::NvTierArenaUnder { arena, least: l } => {
+            assert_eq!((*arena, *l), (least.bytes - 1, least));
+        }
+        other => panic!("not refused by name: {other}"),
+    }
+    let text = e.to_string();
+    for part in [
+        format!("{} B (BLOOMERY_NVTIER_BYTES)", least.bytes - 1),
+        format!("set at least {} B", least.bytes),
+        "11 slots a paged layer".to_string(),
+    ] {
+        assert!(text.contains(&part), "{part:?} in {text}");
+    }
+    let take = |d: &ArenaDial, given| nvme_arena_of(d, given).expect("taken");
+    assert_eq!(take(&dial, Some(least.bytes)), least.bytes);
+    assert_eq!(take(&dial, Some(0)), 0);
+    let low = ArenaDial {
+        room: floor + least.bytes - 1,
+        ..dial
+    };
+    assert_eq!(take(&low, Some(0)), 0, "a given 0: the mapping path");
+    assert!(matches!(
+        nvme_arena_of(&low, None),
+        Err(PlacementError::HostRoomFloor { arena: Some(_), .. })
+    ));
+    let under = ArenaDial {
+        room: floor - 1,
+        ..dial
+    };
+    match nvme_arena_of(&under, Some(0)) {
+        Err(PlacementError::HostRoomFloor {
+            floor: f,
+            arena: None,
+            ..
+        }) => assert_eq!(f, floor),
+        other => panic!("under the tier's floor: {other:?}"),
+    }
+}
+
+/// The dial's one step on the gate plan, through the planner: the last room
+/// with an arena is `H/2 − 1`, where the arena is the deep side's largest,
+/// `H/2 − 1 − F`, and at `H/2` the plan pages through the file mapping with
+/// none.
+#[test]
+fn the_dials_one_step_is_at_half_the_host_leg() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let twin = plan_with(&q4, &gate, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+    let dial = dial_of(&twin, 0);
+    let floor = dial.floor().expect("the floor");
+    let last = dial
+        .step_room()
+        .expect("the step")
+        .expect("the gate plan has a deep side");
+    assert_eq!(last, twin.host.expert_bytes / 2 - 1);
+    let at = |room| {
+        let plan = plan_at(&q4, &gate, 4096, 1, room).expect("the plan");
+        assert!(plan.host.nvme_expert_bytes > 0, "room {room} pages");
+        plan.host.nvme_arena_bytes
+    };
+    assert_eq!(at(last), last - floor);
+    assert_eq!(at(last + 1), 0);
+    assert!(last - floor >= dial.least.bytes);
+}
+
+/// The dial at the gate plan's and the A6000 plan's terms (one slot, 4,096
+/// positions), every room from the floor to the need on a 64 MiB grid and at
+/// each breakpoint and its neighbours: refused only under the floor and its
+/// least arena; never an arena under the least; on the deep side a byte of
+/// room moves the arena by one byte, and the one step is at `H/2`, the deep
+/// side's largest to none; the deep side's room the room past the floor
+/// (27 GiB on the gate plan), and the A6000 at 27 GiB none.
+#[test]
+fn the_dial_moves_a_byte_a_byte_but_at_its_step() {
+    let q4 = model(false);
+    for (name, spec) in [("3090", RTX_3090), ("A6000", A6000)] {
+        let m = machine_a(spec);
+        let twin = plan_with(&q4, &m, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+        let dial = dial_of(&twin, 0);
+        let least = dial.least;
+        let floor = dial.floor().expect("the floor");
+        let half = dial.held / 2;
+        let last = dial.step_room().expect("the step").expect("a deep side");
+        let arena = |room| nvme_arena_of(&ArenaDial { room, ..dial }, None).ok();
+        let mut rooms: Vec<u64> = (floor..dial.need).step_by(64 << 20).collect();
+        for at in [floor, floor + least.bytes, half, last] {
+            rooms.extend([at - 1, at, at + 1]);
+        }
+        for room in rooms {
+            let (here, next) = (arena(room), arena(room + 1));
+            assert_eq!(
+                here.is_none(),
+                room < floor + least.bytes,
+                "{name}: room {room} refused"
+            );
+            let Some(a) = here else { continue };
+            assert!(a == 0 || a >= least.bytes, "{name}: room {room}: {a} B");
+            let b = next.expect("a room past a planned one plans");
+            if room == last {
+                assert_eq!((a, b), (last - floor, 0), "{name}: the step");
+            } else if room < last {
+                assert_eq!(b, a + 1, "{name}: room {room}: {a} → {b}");
+            } else {
+                assert_eq!((a, b), (0, 0), "{name}: room {room} past the step");
+            }
+        }
+        let gib27 = arena(27 << 30).expect("27 GiB plans");
+        match name {
+            "3090" => assert_eq!(gib27, (27 << 30) - floor),
+            _ => assert_eq!(gib27, 0),
+        }
+    }
+}
+
+/// The split dial's own rule ([`super::nvme_arena_of`]) on round terms: the
+/// room past the floor up to half the host leg, none from there; a value
+/// the lever gives is taken as it is, one that pushes the host segments
+/// under the floor is refused by name with the room, the floor and the
+/// value.
 #[test]
 fn the_split_dial_picks_its_arena_or_refuses_a_too_large_one() {
-    use super::nvme_arena_of;
-    let of = |room, held, floor, given| {
-        nvme_arena_of(room, held, floor, given).expect("the dial picks an arena")
+    const G: u64 = 1 << 30;
+    let least = ArenaFloor::new(10, 1, 1, G / 8).expect("the floor");
+    let dial = |room| ArenaDial {
+        room,
+        base: G,
+        heavy: G,
+        held: 60 * G,
+        need: 61 * G,
+        least,
     };
-    let (room, held, floor) = (27 << 30, 63_166_000_000u64, 5_560_000_000);
+    let of = |room, given| nvme_arena_of(&dial(room), given).expect("the dial picks an arena");
+    let floor = 4 * G;
     // The default: the deep split takes the largest arena that fits.
-    assert_eq!(of(room, held, floor, None), room - floor);
-    // A room that covers over half the host leg keeps R1's split.
-    assert_eq!(of(58 << 30, held, floor, None), 0);
+    assert_eq!(of(27 * G, None), 23 * G);
     // The boundary itself: exactly half the host leg takes no arena.
-    assert_eq!(of(held / 2, held, floor, None), 0);
-    assert_eq!(of(held / 2 - 1, held, floor, None), held / 2 - 1 - floor);
+    assert_eq!(of(30 * G - 1, None), 26 * G - 1);
+    assert_eq!(of(30 * G, None), 0);
+    // A room that covers over half the host leg keeps the split's segments.
+    assert_eq!(of(58 * G, None), 0);
     // A given arena is taken as it is, up to the largest that fits.
-    assert_eq!(of(room, held, floor, Some(1 << 30)), 1 << 30);
-    assert_eq!(of(room, held, floor, Some(room - floor)), room - floor);
+    assert_eq!(of(27 * G, Some(G << 1)), 2 * G);
+    assert_eq!(of(27 * G, Some(23 * G)), 23 * G);
     // One that pushes the host segments under the floor is refused by name.
-    match nvme_arena_of(room, held, floor, Some(room - floor + 1)) {
+    let room = 27 * G;
+    match nvme_arena_of(&dial(room), Some(room - floor + 1)) {
         Err(PlacementError::NvTierArena {
             arena,
             room: r,
@@ -1169,7 +1399,7 @@ fn the_split_dial_picks_its_arena_or_refuses_a_too_large_one() {
         }
         other => panic!("not refused by name: {:?}", other),
     }
-    let msg = nvme_arena_of(room, held, floor, Some(u64::MAX))
+    let msg = nvme_arena_of(&dial(room), Some(u64::MAX))
         .unwrap_err()
         .to_string();
     assert!(msg.contains(&room.to_string()) && msg.contains(&floor.to_string()));

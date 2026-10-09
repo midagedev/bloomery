@@ -801,10 +801,9 @@ pub struct HostTotals {
     pub nvme_expert_bytes: u64,
     /// The RAM arena the NVMe expert tier fills for the experts
     /// [`HostTotals::nvme_expert_bytes`] counts — the split dial's choice
-    /// for this plan's room ([`nvme_arena_of`]): the largest arena the room
-    /// leaves above the tier's floor on a room that must move over half the
-    /// host leg's bytes, else 0. Beside the plan's own bytes: the arena is
-    /// the tier's memory, not a segment.
+    /// for this plan's room ([`nvme_arena_of`]): 0, or at least the
+    /// arena's floor ([`ArenaFloor`]). Beside the plan's own bytes: the
+    /// arena is the tier's memory, not a segment.
     pub nvme_arena_bytes: u64,
     /// Row-gathered tables held on the host.
     pub table_bytes: u64,
@@ -891,13 +890,17 @@ pub enum PlacementError {
     Experts(String),
     /// A host room under the floor of the NVMe expert tier: the plan's host
     /// terms outside the routed experts, and the transient reads of two
-    /// layers' NVMe-tier experts and one layer's host experts beside them.
+    /// layers' NVMe-tier experts and one layer's host experts beside them —
+    /// and, where the split dial would give the room an arena, the arena's
+    /// least ([`ArenaFloor`]): a room between the two is the one the dial
+    /// refuses rather than page through the file mapping.
     #[error(
         "the host room {room} B is under the NVMe expert tier's floor {floor} B (the host terms \
          beside the routed experts {base} B + 3 × the heaviest layer's host-served experts \
-         {layer} B: two layers' transient reads and one layer's resident experts), the plan's \
-         need being {need} B: free host memory, or load by a placement whose cards hold more of \
-         the model"
+         {layer} B: two layers' transient reads and one layer's resident experts{least}), the \
+         plan's need being {need} B: free host memory, or load by a placement whose cards hold \
+         more of the model",
+        least = least_term(.arena.as_ref())
     )]
     HostRoomFloor {
         room: u64,
@@ -905,6 +908,10 @@ pub enum PlacementError {
         base: u64,
         layer: u64,
         need: u64,
+        /// The arena's least, counted in `floor`; `None` where the floor
+        /// holds none (a set `BLOOMERY_NVTIER_BYTES`, or a plan the dial
+        /// gives no arena).
+        arena: Option<ArenaFloor>,
     },
     /// An arena the lever `BLOOMERY_NVTIER_BYTES` names that the room cannot
     /// take: the host segments it leaves fall under the NVMe expert tier's
@@ -914,6 +921,16 @@ pub enum PlacementError {
          (the arena takes at most room − floor): lower the arena, or free host memory"
     )]
     NvTierArena { arena: u64, room: u64, floor: u64 },
+    /// An arena the lever `BLOOMERY_NVTIER_BYTES` names under the arena's
+    /// floor ([`ArenaFloor`]): a call would name more distinct ids of a
+    /// paged layer than it has slots.
+    #[error(
+        "the NVMe tier's arena {arena} B (BLOOMERY_NVTIER_BYTES) is under its floor, {least}: one \
+         call's ids would evict each other; set at least {bytes} B, or 0 to page through the \
+         file mapping",
+        bytes = .least.bytes
+    )]
+    NvTierArenaUnder { arena: u64, least: ArenaFloor },
     /// A routed stack's expert on two cards at once, by their index in
     /// [`Machine::all_cards`]: an expert lives on one device.
     #[error("tensor {tensor}: expert {expert} is on card #{first} and on card #{second}")]
@@ -2482,28 +2499,260 @@ impl HostLayer {
 /// its two layers of transient reads from the room beside the plan's need
 /// ([`PlacementError::HostRoomFloor`] keeps the room for them).
 ///
-/// The arena bytes the split dial gives this plan's room: the lever
-/// `BLOOMERY_NVTIER_BYTES` (`given`) when set — refused by name where it
-/// pushes the host segments the room leaves under the tier's `floor` — else
-/// the largest arena the room leaves above the floor (`room − floor`) when
-/// the room cannot hold half the host leg's `held` routed-expert bytes (a
-/// deep split: the prompt is NVMe-bound either way, so prefill loses little
-/// while decode's warm set doubles), else 0 (a room that covers the host
-/// leg: the split keeps every host expert it can and the arena is the
-/// lever's alone). The one owner of the arena's bytes; the plan states what
-/// it chose in [`HostTotals::nvme_arena_bytes`].
-pub fn nvme_arena_of(
-    room: u64,
-    held: u64,
-    floor: u64,
-    given: Option<u64>,
-) -> Result<u64, PlacementError> {
-    let max = room - floor;
-    match given {
-        Some(arena) if arena > max => Err(PlacementError::NvTierArena { arena, room, floor }),
-        Some(arena) => Ok(arena),
-        None => Ok(u64::from(room < held / 2) * max),
+/// The page every window of an NVMe-tier arena slot is aligned to: the
+/// `O_DIRECT` alignment the slot's fills read at (engram's `DIRECT_ALIGN`,
+/// which the arena's crate holds equal to it at compile time).
+pub const ARENA_ALIGN: u64 = 4096;
+
+/// The columns of the widest call a load steps on a plan whose host experts
+/// page through the arena: one, the one-column rule's
+/// (`bloomery_levers::paged_columns`). A path that steps more columns asks
+/// [`ArenaFloor::of`] for its own.
+pub const ARENA_COLUMNS: u64 = 1;
+
+/// The residency machine's slot claims that can land in a paged layer while
+/// one call of the step reads it: one. A lane prepares a flip's victim (the
+/// arena's fill of that one id) under the lane's receive lock, one lane
+/// thread at a time, and a job the staging window gates then waits for the
+/// window under the same lock; the step port closes the window for each
+/// service's compute, and every due job's victim is prepared before the
+/// pass launches. A count, not a pin: nothing holds a read slot.
+pub const ARENA_LANE_CLAIMS: u64 = 1;
+
+/// The bytes one part of `len` bytes takes in an arena slot: the part and
+/// the two partial pages an aligned read of it can span, in whole
+/// [`ARENA_ALIGN`] pages. The one shape of a slot's window, which the
+/// arena carves and its floor counts.
+#[must_use]
+pub fn arena_window_bytes(len: u64) -> u64 {
+    (len + 2 * ARENA_ALIGN).div_ceil(ARENA_ALIGN) * ARENA_ALIGN
+}
+
+/// The NVMe tier arena's floor: the slots a paged layer needs so that one
+/// call reads every distinct id it names from its own slot while the lane
+/// claims beside it take others — the call's `k × columns` ids and the
+/// lanes — and their bytes over one slot of every layer the arena may page.
+/// The one owner of the floor: the split dial gives no arena under it
+/// ([`nvme_arena_of`]), and the arena's carve at load refuses a budget
+/// under its slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaFloor {
+    /// The routed width: the ids one column names.
+    pub k: u64,
+    /// The widest call's columns.
+    pub columns: u64,
+    /// The lane claims beside the call: [`ARENA_LANE_CLAIMS`] where a
+    /// stage card holds a routed expert (the residency machine can run),
+    /// else none.
+    pub lanes: u64,
+    /// One slot of every layer the host leg serves routed experts of, each
+    /// part in its window ([`arena_window_bytes`]).
+    pub slot_set: u64,
+    /// `k × columns + lanes`.
+    pub slots: u64,
+    /// `slots × slot_set`.
+    pub bytes: u64,
+}
+
+impl ArenaFloor {
+    /// The floor of calls of `columns` columns of `k` ids beside `lanes`
+    /// lane claims, over a slot set of `slot_set` bytes. Refused by name: a
+    /// count or a byte total past u64.
+    pub fn new(
+        k: u64,
+        columns: u64,
+        lanes: u64,
+        slot_set: u64,
+    ) -> Result<ArenaFloor, PlacementError> {
+        let past = || PlacementError::Metadata {
+            key: "the NVMe tier arena's floor".to_string(),
+            detail: format!(
+                "{k} × {columns} ids + {lanes} lane claims over a {slot_set} B slot set pass u64"
+            ),
+        };
+        let slots = k
+            .checked_mul(columns)
+            .and_then(|ids| ids.checked_add(lanes))
+            .ok_or_else(past)?;
+        let bytes = slots.checked_mul(slot_set).ok_or_else(past)?;
+        Ok(ArenaFloor {
+            k,
+            columns,
+            lanes,
+            slot_set,
+            slots,
+            bytes,
+        })
     }
+
+    /// `plan`'s floor for calls of `columns` columns: `k` the model's
+    /// routed width, the lane claims where a stage card holds a routed
+    /// expert, and the slot set over every layer whose routed stacks the
+    /// host leg serves (a host or an NVMe segment) — on a plan the split
+    /// has not run on yet, the layers it can page, a bound over the ones it
+    /// does, so the arena's carve at load never falls under the slots the
+    /// dial sized it for.
+    pub fn of(plan: &Plan<'_>, columns: u64) -> Result<ArenaFloor, PlacementError> {
+        let model = plan.model;
+        let mut slot_set = 0u64;
+        for r in &plan.rows {
+            let t = &model.tensors[r.tensor];
+            if t.role != Role::RoutedExperts
+                || t.layer.is_none()
+                || !r
+                    .segments
+                    .iter()
+                    .any(|s| matches!(s.device, Device::Host | Device::Nvme))
+            {
+                continue;
+            }
+            let (_, per) = per_expert(t, model.experts)?;
+            slot_set = slot_set
+                .checked_add(arena_window_bytes(per))
+                .ok_or_else(|| PlacementError::tensor(t, "the arena's slot set passes u64"))?;
+        }
+        let lanes = if plan.n_l.iter().any(|&n| n > 0) {
+            ARENA_LANE_CLAIMS
+        } else {
+            0
+        };
+        ArenaFloor::new(model.experts_used, columns, lanes, slot_set)
+    }
+}
+
+impl fmt::Display for ArenaFloor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} slots a paged layer ({} × {} ids a call + {} lane claims) × {} B a slot of every \
+             paged layer = {} B",
+            self.slots, self.k, self.columns, self.lanes, self.slot_set, self.bytes
+        )
+    }
+}
+
+/// [`PlacementError::HostRoomFloor`]'s term for the arena's least, when
+/// the floor counts it.
+fn least_term(least: Option<&ArenaFloor>) -> String {
+    least.map_or_else(String::new, |a| {
+        format!(
+            " + the RAM arena's least, {a}, which BLOOMERY_NVTIER_BYTES=0 leaves out to page \
+             through the file mapping"
+        )
+    })
+}
+
+/// What the split dial reads of a plan the NVMe expert tier splits
+/// ([`expert_nvme_tier`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaDial {
+    /// The host's room the split reads.
+    pub room: u64,
+    /// The plan's host terms beside the routed experts.
+    pub base: u64,
+    /// `W`: the host-served expert bytes of the layer with the most.
+    pub heavy: u64,
+    /// `H`: the host leg's routed-expert bytes before the split.
+    pub held: u64,
+    /// The plan's host need before the split.
+    pub need: u64,
+    /// The arena's floor.
+    pub least: ArenaFloor,
+}
+
+impl ArenaDial {
+    /// The tier's room floor, `base + 3 W` ([`expert_nvme_tier`]'s terms).
+    /// Refused by name past u64.
+    pub fn floor(&self) -> Result<u64, PlacementError> {
+        3u64.checked_mul(self.heavy)
+            .and_then(|w| w.checked_add(self.base))
+            .ok_or_else(|| PlacementError::Metadata {
+                key: "the NVMe expert tier's floor".to_string(),
+                detail: "passes u64 bytes".to_string(),
+            })
+    }
+
+    /// What the room leaves above the floor where it reaches half the host
+    /// leg, `H/2 − floor` (the deep side's arenas lie under it), when the
+    /// arena's least fits under it; `None` on a plan the dial gives no
+    /// arena.
+    fn peak(&self, floor: u64) -> Option<u64> {
+        (self.held / 2)
+            .checked_sub(floor)
+            .filter(|&peak| peak >= self.least.bytes)
+    }
+
+    /// The least room the dial plans at under the lever's `given` arena:
+    /// the floor, and with the lever unset on a plan with a deep side, the
+    /// arena's least above it.
+    pub fn room_floor(&self, given: Option<u64>) -> Result<u64, PlacementError> {
+        let floor = self.floor()?;
+        Ok(match (given, self.peak(floor)) {
+            (None, Some(_)) => floor + self.least.bytes,
+            _ => floor,
+        })
+    }
+
+    /// The last room the dial gives an arena, `H/2 − 1` — the deep side's
+    /// largest, `H/2 − 1 − F`, its one step to none at `H/2` — or `None` on
+    /// a plan with no deep side.
+    pub fn step_room(&self) -> Result<Option<u64>, PlacementError> {
+        let floor = self.floor()?;
+        Ok(self.peak(floor).map(|_| self.held / 2 - 1))
+    }
+}
+
+/// The arena bytes the split dial gives `dial`'s room: the lever
+/// `BLOOMERY_NVTIER_BYTES` (`given`) when set, else the default. The one
+/// owner of the arena's bytes; the plan states what it chose in
+/// [`HostTotals::nvme_arena_bytes`].
+///
+/// The default, with `F` the floor, `H` the host leg and `M` the arena's
+/// least ([`ArenaFloor`]): the room above the floor, `room − F`, while the
+/// room is under `H/2` (a deep split: the prompt is NVMe-bound whatever the
+/// split, so the arena's warm set costs prefill little); from `H/2` on,
+/// none (the split keeps every host expert it can and pages through the
+/// file mapping, which serves several columns and the draft). No room gets
+/// an arena under `M`: a room under `F + M` on a plan with a deep side is
+/// refused. The one step is at `H/2`, from `H/2 − 1 − F` to none; a byte of
+/// room moves the arena by one byte everywhere else. A plan whose deep side
+/// cannot hold `M` gets none at any room.
+///
+/// Refused by name: a room under [`ArenaDial::room_floor`]
+/// ([`PlacementError::HostRoomFloor`], naming the arena's least when it
+/// counts it); a given arena under `M` ([`PlacementError::NvTierArenaUnder`])
+/// or past `room − F` ([`PlacementError::NvTierArena`]). A given 0 pages
+/// through the file mapping at any room the floor holds.
+pub fn nvme_arena_of(dial: &ArenaDial, given: Option<u64>) -> Result<u64, PlacementError> {
+    let floor = dial.floor()?;
+    let room_floor = dial.room_floor(given)?;
+    let room = dial.room;
+    if room < room_floor {
+        return Err(PlacementError::HostRoomFloor {
+            room,
+            floor: room_floor,
+            base: dial.base,
+            layer: dial.heavy,
+            need: dial.need,
+            arena: (room_floor > floor).then_some(dial.least),
+        });
+    }
+    let least = dial.least;
+    match given {
+        Some(0) => return Ok(0),
+        Some(arena) if arena < least.bytes => {
+            return Err(PlacementError::NvTierArenaUnder { arena, least });
+        }
+        Some(arena) if arena > room - floor => {
+            return Err(PlacementError::NvTierArena { arena, room, floor });
+        }
+        Some(arena) => return Ok(arena),
+        None => {}
+    }
+    if dial.peak(floor).is_none() || room >= dial.held / 2 {
+        return Ok(0);
+    }
+    Ok(room - floor)
 }
 
 /// The floor is `base + 3 W`: `base` the need with no routed expert on the
@@ -2512,8 +2761,10 @@ pub fn nvme_arena_of(
 /// segments, `2 W` of the prompt run-ahead's page-cache window (a host
 /// reserve of the split plan) and the RAM arena [`nvme_arena_of`] picks:
 /// `1 W + 2 W + arena = room − base` at the largest arena,
-/// `room − base − 3 W`. A room under it is refused by name; the plan's
-/// `host.experts` counts the experts the host leg serves, on either tier.
+/// `room − base − 3 W`. A room under it, or under it and the arena's least
+/// where the dial would give the room an arena, is refused by name
+/// ([`ArenaDial::room_floor`]); the plan's `host.experts` counts the
+/// experts the host leg serves, on either tier.
 /// The split plan's headroom is what the room leaves past the arena and the
 /// host need, the budget a churn pool beside them must fit.
 pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
@@ -2594,29 +2845,21 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
     }
     let base = workstation::HostNeed { experts: 0, ..need }.bytes();
     let heavy = layers.iter().map(HostLayer::bytes).max().unwrap_or(0);
-    let floor = 3u64
-        .checked_mul(heavy)
-        .and_then(|w| w.checked_add(base))
-        .ok_or_else(|| PlacementError::Metadata {
-            key: "the NVMe expert tier's floor".to_string(),
-            detail: "passes u64 bytes".to_string(),
-        })?;
-    if room < floor {
-        return Err(PlacementError::HostRoomFloor {
-            room,
-            floor,
-            base,
-            layer: heavy,
-            need: need.bytes(),
-        });
-    }
     // The split dial: the arena's bytes come out of the host segments the
     // room holds, the split running on the room that remains.
     let held = plan.host.expert_bytes;
+    let dial = ArenaDial {
+        room,
+        base,
+        heavy,
+        held,
+        need: need.bytes(),
+        least: ArenaFloor::of(plan, ARENA_COLUMNS)?,
+    };
     let given = bloomery_levers::nvtier_levers()
         .map_err(|e| PlacementError::HostRoom(format!("BLOOMERY_NVTIER_BYTES: {e}")))?
         .bytes;
-    let arena = nvme_arena_of(room, held, floor, given)?;
+    let arena = nvme_arena_of(&dial, given)?;
     let room = room - arena;
     plan.host.nvme_arena_bytes = arena;
     // The prompt run-ahead's page-cache window, `2 W`, is a host reserve of
