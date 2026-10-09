@@ -1449,5 +1449,8 @@ pub fn topk_ids_logical_within(
         .collect()
 }
 
+mod routes;
+pub use routes::{PrefillRoutes, RouteLayer};
+
 #[cfg(test)]
 mod tests;
