@@ -169,7 +169,11 @@
 //! file there, and when an arm's last window would pass `--ctx` (depth + n +
 //! 2 positions), with a `load draft=off (<why>)` record after the `load`
 //! line — `no file at <path>` for the missing file — never a refusal.
-//! `BLOOMERY_DRAFT=off` is the plain path with the same record.
+//! `BLOOMERY_DRAFT=off` is the plain path with the same record. A plan that
+//! pages host experts through the NVMe tier's RAM arena steps one column
+//! (`bloomery_levers::paged_columns`, asked of the plan the run loads): an
+//! unset draft goes off there (`unset: the plan pages …`), and
+//! `BLOOMERY_DRAFT=mtp` or `BLOOMERY_GEN_SLOTS` past one is refused by name.
 //!
 //! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
 //! every other family and word refused by name) the decode runs through the runtime's
@@ -380,8 +384,8 @@ mod cli {
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
-        Draft38At, Draft38Off, Levers, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
-        residency38_unset,
+        Draft38At, Draft38Off, Levers, Paged, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
+        SlotsBy, draft38_unset, paged_columns, paged_draft, residency38_unset,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -946,18 +950,7 @@ mod cli {
             let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
             let mtp = match draft {
                 Draft38::Off => None,
-                Draft38::Mtp => {
-                    let head = head_rows_of(levers.mtp_head_rows(), file, inputs.spec.vocab)?;
-                    let (draft_path, from) = draft_file(levers.mtp_draft(), &ref_model_path()?);
-                    let draft_split = Split::open(&draft_path).map_err(|e| {
-                        format!(
-                            "open the MTP draft {} ({}): {e}",
-                            draft_path.display(),
-                            from.describe()
-                        )
-                    })?;
-                    Some(MtpInputs::read(&draft_split, file, &inputs, head.rows)?)
-                }
+                Draft38::Mtp => Some(mtp_inputs38(levers, file, &inputs)?),
             };
             let specs = offer.card_specs()?;
             q38place::tier_experts(
@@ -977,6 +970,89 @@ mod cli {
     /// The placement holds an expert tier card: plan (b′).
     fn tiered(place: Place) -> bool {
         !place.tier_cards().is_empty()
+    }
+
+    /// The MTP draft's plan inputs: the draft file `draft_file` picks, its
+    /// head `head_list::head_rows_of`'s.
+    fn mtp_inputs38(
+        levers: &Levers,
+        file: &Split,
+        inputs: &PlanInputs,
+    ) -> Result<MtpInputs, GateError> {
+        let head = head_rows_of(levers.mtp_head_rows(), file, inputs.spec.vocab)?;
+        let (draft_path, from) = draft_file(levers.mtp_draft(), &ref_model_path()?);
+        let draft_split = Split::open(&draft_path).map_err(|e| {
+            format!(
+                "open the MTP draft {} ({}): {e}",
+                draft_path.display(),
+                from.describe()
+            )
+        })?;
+        Ok(MtpInputs::read(&draft_split, file, inputs, head.rows)?)
+    }
+
+    /// The NVMe tier's RAM arena (`HostTotals::nvme_arena_bytes`) of the
+    /// plan a run at `place` loads at the host's `room` (the run's one
+    /// reading, which the open plans by too): the drafted plan when `mtp`
+    /// ([`open_qwen38_mtp`]'s), else the plain one counting `slots`
+    /// sequences ([`open_qwen38`]'s).
+    fn arena38(
+        file: &Split,
+        levers: &Levers,
+        (place, experts, room): (Place, Experts, &(u64, HostRead)),
+        (ctx, slots): (usize, usize),
+        mtp: bool,
+    ) -> Result<u64, GateError> {
+        let mut inputs = PlanInputs::describe(file)?;
+        inputs.room = room.clone();
+        let ub = u64::try_from(ubatch_for(ctx)?)?;
+        let ctx_max = u64::try_from(ctx)?;
+        let plan_levers = PlanLevers::from_levers(levers)?;
+        if !mtp {
+            let machine = machine38(place, &inputs, ub, experts, None)?;
+            let plan = inputs.plan_with_slots(&machine, ctx_max, &plan_levers, experts, slots)?;
+            return Ok(plan.host.nvme_arena_bytes);
+        }
+        let mtp = mtp_inputs38(levers, file, &inputs)?;
+        let reserve = if tiered(place) {
+            Some(mtp.card_bytes(ctx_max)?)
+        } else {
+            None
+        };
+        let machine = machine38(place, &inputs, ub, experts, reserve)?;
+        let plan = inputs.plan_mtp_with(&machine, ctx_max, &plan_levers, &mtp, experts)?;
+        Ok(plan.plan.host.nvme_arena_bytes)
+    }
+
+    /// The paged tier's one-column rule ([`bloomery_levers::paged_columns`])
+    /// asked once of the plan the run loads ([`arena38`]): on a plan that
+    /// pages host experts through the NVMe tier's RAM arena an unset draft
+    /// goes off (`Draft38Off::Paged`, the `load draft=off` record's why), and
+    /// `BLOOMERY_GEN_SLOTS` past one or `BLOOMERY_DRAFT=mtp` is refused by
+    /// name. The run's slots are the lever's alone: unset, one.
+    fn paged38(
+        file: &Split,
+        levers: &Levers,
+        (place, experts, room): (Place, Experts, &(u64, HostRead)),
+        (ctx, slots): (usize, usize),
+        (draft, off): (Draft38, Option<Draft38Off>),
+    ) -> Result<(Draft38, Option<Draft38Off>), GateError> {
+        let mtp = draft == Draft38::Mtp;
+        if slots <= 1 && !mtp {
+            return Ok((draft, off));
+        }
+        let arena = arena38(file, levers, (place, experts, room), (ctx, slots), mtp)?;
+        let at = PagedAt {
+            arena,
+            slots,
+            slots_by: (slots > 1).then_some(SlotsBy::GenSlots),
+            draft: mtp,
+            draft_set: levers.draft().is_some(),
+        };
+        Ok(match paged_columns(&at)? {
+            Paged::AsAsked => (draft, off),
+            Paged::OneColumn => (Draft38::Off, paged_draft(mtp, off, arena).1),
+        })
     }
 
     /// The stage card is the A6000: the placement the Qwen3.8 defaults
@@ -1344,11 +1420,22 @@ mod cli {
                     )
                     .into());
                 }
-                (Chosen::Qwen38(Body38::path(prefill)?, place, draft), off)
+                let room = model::placement::workstation::host_available_read()?;
+                let (draft, off) = paged38(
+                    &file,
+                    &levers,
+                    (place, experts, &room),
+                    (ctx, slots),
+                    (draft, off),
+                )?;
+                (
+                    Chosen::Qwen38(Body38::path(prefill)?, place, draft, room),
+                    off,
+                )
             }
         };
         let draft = match chosen {
-            Chosen::Qwen38(_, _, d) => d,
+            Chosen::Qwen38(_, _, d, _) => d,
             Chosen::Qwen3(..) | Chosen::Qwen35(..) => Draft38::Off,
         };
         if last_step && (family == Family::Qwen38 || timed || seed_depth.is_some()) {
@@ -1445,7 +1532,7 @@ mod cli {
             .into());
         }
         let (place_a, prefill_step) = match chosen {
-            Chosen::Qwen38(path, place, _) => (stage_a(place), path == Prompt38::Step),
+            Chosen::Qwen38(path, place, ..) => (stage_a(place), path == Prompt38::Step),
             Chosen::Qwen3(..) | Chosen::Qwen35(..) => (false, false),
         };
         let at = Residency38At {
@@ -1472,7 +1559,7 @@ mod cli {
                     .into(),
             );
         }
-        if matches!(chosen, Chosen::Qwen38(.., Draft38::Mtp)) && logits {
+        if matches!(chosen, Chosen::Qwen38(_, _, Draft38::Mtp, _)) && logits {
             return Err(
                 "--logits with BLOOMERY_DRAFT=mtp: the drafted run's last call is a verify of \
                  several rows into one head, and --logits reads the step head's row"
@@ -1528,7 +1615,7 @@ mod cli {
                     drive(m, &run, path, &arms, listed, sync)
                 }
             }
-            Chosen::Qwen38(path, place, draft) => match draft {
+            Chosen::Qwen38(path, place, draft, room) => match draft {
                 Draft38::Off => {
                     let trace = trace38(
                         &levers,
@@ -1541,7 +1628,7 @@ mod cli {
                         file,
                         &levers,
                         (ctx, mode, slots),
-                        (path, place, experts),
+                        (path, place, experts, room),
                         (lever38, draft_off.as_ref()),
                         t,
                     )?;
@@ -1572,7 +1659,7 @@ mod cli {
                         file,
                         &levers,
                         (ctx, mode),
-                        (path, place, experts),
+                        (path, place, experts, room),
                         lever38,
                         t,
                     )?;
@@ -1780,11 +1867,12 @@ mod cli {
     /// The engine and its `--prefill` path (and, for qwen4exp, its card and
     /// draft), chosen before the load; a qwen4exp plan's expert rule is
     /// `BLOOMERY_QWEN38_EXPERTS`'s.
-    #[derive(Clone, Copy)]
     enum Chosen {
         Qwen3(PrefillPath, Option<Place>),
         Qwen35(PrefillPath, Option<Place>),
-        Qwen38(Prompt38, Place, Draft38),
+        /// The host's room as the run read it once: the one-column rule
+        /// ([`paged38`]) and the load plan by the same reading.
+        Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
@@ -2058,11 +2146,12 @@ mod cli {
         file: Split,
         levers: &Levers,
         (ctx, mode, slots): (usize, StepMode, usize),
-        (path, place, experts): (Prompt38, Place, Experts),
+        (path, place, experts, room): (Prompt38, Place, Experts, (u64, HostRead)),
         (lever, draft_off): (Lever38<'static>, Option<&Draft38Off>),
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
-        let inputs = PlanInputs::describe(&file)?;
+        let mut inputs = PlanInputs::describe(&file)?;
+        inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
         let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, None)?;
@@ -2074,6 +2163,15 @@ mod cli {
             experts,
             slots,
         )?;
+        // The one-column rule ([`paged38`]) read this plan.
+        if plan.host.nvme_arena_bytes > 0 && slots > 1 {
+            return Err(format!(
+                "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
+                 {slots} slots: the one-column rule read another plan",
+                plan.host.nvme_arena_bytes
+            )
+            .into());
+        }
         println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
         let residency = residency38(&plan, lever, Record::print)?;
         let mut m = Body38::open_placed_residency(
@@ -2125,11 +2223,12 @@ mod cli {
         file: Split,
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
-        (path, place, experts): (Prompt38, Place, Experts),
+        (path, place, experts, room): (Prompt38, Place, Experts, (u64, HostRead)),
         lever: Lever38<'static>,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
-        let inputs = PlanInputs::describe(&file)?;
+        let mut inputs = PlanInputs::describe(&file)?;
+        inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
         let head = head_rows_of(levers.mtp_head_rows(), &file, inputs.spec.vocab)?;
@@ -2157,6 +2256,15 @@ mod cli {
             &mtp,
             experts,
         )?;
+        // The one-column rule ([`paged38`]) read this plan.
+        if plan.plan.host.nvme_arena_bytes > 0 {
+            return Err(format!(
+                "the drafted load's plan pages host experts through the NVMe tier's {} B RAM \
+                 arena: the one-column rule read another plan",
+                plan.plan.host.nvme_arena_bytes
+            )
+            .into());
+        }
         println!(
             "{}",
             plan38_line(place, experts, &plan.plan, &inputs.room.1)?

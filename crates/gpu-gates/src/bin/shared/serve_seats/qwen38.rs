@@ -623,24 +623,6 @@ fn draft38(
     }
 }
 
-/// The draft a one-column load ([`Paged::OneColumn`]) runs without, as its
-/// `load draft=off` record names it, and whether it was asked: a draft that
-/// ran (`drafts`), or that only its yield to the context turned off — a
-/// verdict on the plan of several slots the load abandons — was asked, and
-/// the paged rule is why it is off; any other reason (set, the placement,
-/// the file, a window past the context) holds whatever the plan, and stays.
-fn paged_draft(drafts: bool, off: Option<Draft38Off>, arena: u64) -> (bool, Option<Draft38Off>) {
-    let asked = drafts || matches!(off, Some(Draft38Off::Yield(_)));
-    (
-        asked,
-        if asked {
-            Some(Draft38Off::Paged { arena })
-        } else {
-            off
-        },
-    )
-}
-
 /// The default slot count's plan, refused because the host room is under the
 /// NVMe expert tier's floor, answered by the one-column rule's own plan: the
 /// first plan the context search asks, at one position (`fit38`), is the
@@ -1315,17 +1297,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         bloomery_levers::paged_columns(&bloomery_levers::PagedAt {
             arena,
             slots,
-            slots_set: from == "flag",
+            slots_by: (from == "flag").then_some(bloomery_levers::SlotsBy::Parallel),
             draft: mtp,
             draft_set: levers.draft().is_some(),
         })
     };
     // The draft a one-column load runs without names the paged rule when
     // the draft was asked — on, or off only by its yield to the context on
-    // the plan this load abandons ([`paged_draft`]) — at either point.
+    // the plan this load abandons (`bloomery_levers::paged_draft`) — at
+    // either point.
     let one_column =
         |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>, floor: bool| {
-            let (asked, draft_off) = paged_draft(mtp, draft_off, arena);
+            let (asked, draft_off) = bloomery_levers::paged_draft(mtp, draft_off, arena);
             eprintln!(
                 "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} slots=1 \
                  draft=off (the plan pages host experts through the NVMe tier's RAM arena: a \
