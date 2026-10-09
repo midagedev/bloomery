@@ -37,7 +37,9 @@
 #   a fixture directory    the first shard `*-00001-of-*.gguf` of the one directory under $BLOOMERY_FIXTURE_ROOT
 #                          (default /models/fixtures), one a family; MODEL becomes it unless BLOOMERY_REF_MODEL names a file
 #                          already (a caller's own wins), and FIXTURE_FILE names it either way. Not one file there: 66.
-#   self                   the family's real file is small: it stands, FIXTURE_FILE stays empty.
+#   self                   the family has no fixture file: FIXTURE_FILE stays empty and a command runs on the profile's file, and
+#                          one that opens no model runs as in the real tier; the gate fence (Tier::check_file, crates/gpu-gates/src/tier.rs)
+#                          refuses that file as not a fixture, so tools/gate-batch.sh defers, as real-file, a recipe whose targets reach it.
 #   none                   the family has no fixture yet — and so does a profile the table does not name: 66, naming the
 #                          family. Never a run on the real file.
 # Exit codes: 64 a BLOOMERY_TIER that is neither, 65 a fixture whose header is not a whole fixture (`fixture_budget`), 66 no

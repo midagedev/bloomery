@@ -1595,21 +1595,24 @@ weekly-gpu-ds41-serve:
 # 아레나가 모델 매핑을 결코 advise하지 않음을 조항이 지킨다(gate_nvtier.rs의 advice_disjoint). 2026-10-08에
 # 페이지드 티어의 두 이름 붙은 거부(HOST_LOCK 병행, r8 상주 사본)를 뺐다 — 커버리지 변경, 게이트 머리말에 근거.
 # 계획은 gate_card의 3090 바이트로 서므로 어느 카드든 같은 핀이 선다 — 카드를 고정할 사실이 없어 any.
+# Real-only (no fixture conversion): under the fixture tier box.sh exports the qwen4exp fixture's BLOOMERY_CARD_BUDGET, and
+# gate_nvtier refuses it as a lever it does not act on.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-nvtier:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvtier'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nvtier && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvtier'
 
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice
 # with flips landed, every admitted slot byte for byte a static load's, the passes' kinds and kept rows (the prompt one
 # pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Plan (a) on the A6000 (the
 # gate plans with the A6000 machine). Loads the whole host set: alone in a batch, under the big-load lock.
-# Stays solo on the A6000 (no conversion): the fixture tier refuses it (66), the binary opens the real file whatever the tier names.
+# Stays solo on the A6000 (no conversion). Real-only: no fixture tier yet (the router double, R4); it opens the real file whatever the
+# tier names.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-residency:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = real ] || { echo "gate-gpu-qwen38-residency: no fixture tier yet (the router double, R4): it opens the real file whatever the tier names (exit 66)" >&2; exit 66; } && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-residency && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
 
 # Qwen3.8 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier on the 3090, its decode walks (a
 # step and the 2-, 3- and 4-row verifies) and its ubatch prompt walk serving the tier. The reference is the same plan
