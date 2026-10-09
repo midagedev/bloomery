@@ -55,8 +55,8 @@
 //! holds the body's saved sequence states in host RAM. Its default is the
 //! shared [`CacheRam::of`] budget: the lesser of the cap
 //! (`bind::CACHE_RAM_CAP`) and half of what `MemAvailable` leaves past the
-//! plan's host need, the residency's churn pool and the checkpoints' host
-//! budget; the `cache` record prints
+//! plan's host need and the residency's churn pool (V4.1's body pins no
+//! checkpoints); the `cache` record prints
 //! it, and the token a prompt call is cut at so a
 //! later request keeps the start of a user message ([`USER_START`], with
 //! whether the chat template writes it). Every cache event and every prefix
@@ -199,7 +199,7 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::checkpoints_beside;
+use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
 use bloomery_gpu_gates::{GateError, ref_model_path, residency41};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
@@ -763,6 +763,14 @@ fn print_plan(
             .reserves
             .push((VISION_RESERVE.to_owned(), bytes));
     }
+    // V4.1's body makes no checkpoints: its slots pin none.
+    reserve_checkpoints(
+        &mut machine,
+        Seqs {
+            slots: slots.get(),
+            checkpoints: false,
+        },
+    );
     let plan = inputs
         .plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)
         .map_err(|e| {
@@ -796,7 +804,7 @@ fn print_plan(
         cache_ram,
         HostNeed::of(&plan, 0).bytes(),
         pool_bytes,
-        checkpoints_beside(plan.machine),
+        checkpoints_reserved(plan.machine),
     )?;
     let gpus: Result<Vec<String>, String> = machine
         .all_cards()
