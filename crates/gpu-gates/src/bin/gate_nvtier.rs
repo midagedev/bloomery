@@ -25,6 +25,9 @@
 //!   paged arm, and its `unresident` and `faulting` are 0 and its `late`
 //!   flips 0 — bug catchers, structurally unreachable once the seam serves
 //!   the victims the arena holds from its books.
+//! - `room` (clause 6): the loaded tier's arena, the plan's host need and
+//!   the churn pool the residency holds fit the room together, and the
+//!   plan's headroom is what the room leaves past the arena and the need.
 //!
 //! PIN(2026-10-08): the page-cache design's two named refusals are dropped
 //! — a paged tier under `BLOOMERY_HOST_LOCK=1` (the lock walk pins model
@@ -50,12 +53,13 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::host::nvtier::{NvTier, NvTierStats, advice_disjoint};
 use bloomery_gpu::host::swap::{PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{Lever38, residency38};
+use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
 use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
-use model::placement::workstation::HostRead;
+use model::placement::churn::ChurnPool;
+use model::placement::workstation::{HostNeed, HostRead};
 use model::placement::{Machine, PlanLevers};
 use runtime::{Out, Target, Want};
 
@@ -274,6 +278,18 @@ fn run() -> Result<(), GateError> {
     // The residency word both arms run: the unset rule's answer on the
     // paged plan, which resolves `mid` with the churn pool 0.
     let residency = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    // `room`'s plan terms: the host need, the churn pool the residency
+    // holds beside it, and the headroom the split left.
+    let need = HostNeed::of(&plan, 0).bytes();
+    let pool = match residency {
+        Residency::Mid { pinned, .. } => {
+            ChurnPool::of(&plan, CARD38, pinned)
+                .map_err(|e| format!("the churn pool: {e}"))?
+                .bytes
+        }
+        Residency::Off => 0,
+    };
+    let headroom = plan.host.headroom_bytes;
     let Residency::Mid { pinned, spares } = residency else {
         return Err("the paged plan's unset residency rule did not resolve mid".into());
     };
@@ -301,6 +317,18 @@ fn run() -> Result<(), GateError> {
     pass &= bits;
 
     let tier = paged.tier.as_ref().ok_or("the paged arm built no arena")?;
+    // `room`: the loaded tier's arena, the plan's host need and the churn
+    // pool fit the room together, and the plan's headroom is what the room
+    // leaves past the arena and the need.
+    let arena = tier.budget();
+    let room = headroom == i128::from(ROOM) - i128::from(arena) - i128::from(need)
+        && need + arena + pool <= ROOM;
+    println!(
+        "room: need {need} B + arena {arena} B + churn pool {pool} B in the room {ROOM} B, \
+         headroom {headroom} B: {}",
+        verdict(room)
+    );
+    pass &= room;
     // `advice` (the PIN above): the arena's pages and the mapped shards' are disjoint.
     let mapped: Vec<(usize, usize)> = (0..probe.shard_count())
         .filter_map(|i| probe.shard(i))
