@@ -355,10 +355,15 @@ mod gen_slots;
 mod xstream38;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/route_trace38.rs"]
+mod route_trace38;
+
+#[cfg(feature = "gpu")]
 mod cli {
     use super::gen_slots;
     use super::q3place::{self, PlaceQ3};
     use super::q38place;
+    use super::route_trace38::{self, TraceRun, experts_name};
     use super::taps;
     use super::xstream38::{Stage38, xstream38};
     use app::Session;
@@ -371,7 +376,7 @@ mod cli {
         Qwen35moeModel, Qwen38Model,
     };
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
+    use bloomery_gpu::host::route_trace::RouteTrace;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
@@ -1494,11 +1499,7 @@ mod cli {
         // seed; under the machine its slot files would record the machine's
         // own moves.
         if residency != Residency::Off && levers.route_trace().is_some() {
-            return Err(format!(
-                "BLOOMERY_ROUTE_TRACE records a fixed placement's routing; \
-                 BLOOMERY_RESIDENCY={word_set} moves the slot map under it"
-            )
-            .into());
+            return Err(route_trace38::residency_refusal(word_set));
         }
         // Why the run drafts nothing, as a refusal of a draft lever names it.
         let no_draft = |need: &str| match &draft_off {
@@ -1651,11 +1652,7 @@ mod cli {
                 }
                 Draft38::Mtp => {
                     if levers.route_trace().is_some() {
-                        return Err(
-                            "BLOOMERY_ROUTE_TRACE records the plain run's routing, one step a \
-                                    position; it is refused beside BLOOMERY_DRAFT=mtp"
-                                .into(),
-                        );
+                        return Err(route_trace38::draft_refusal());
                     }
                     let (mut m, cfg, residency) = open_qwen38_mtp(
                         file,
@@ -2046,14 +2043,6 @@ mod cli {
         }
     }
 
-    /// The name the `plan` line prints for `experts`.
-    fn experts_name(experts: Experts) -> &'static str {
-        match experts {
-            Experts::Host => "host",
-            Experts::Card => "card",
-        }
-    }
-
     /// The positions every arm of the run writes — its prompt's ids one
     /// step each, then its generated tokens less the first, which the
     /// prompt's last step already answered — when they all write the same
@@ -2100,26 +2089,16 @@ mod cli {
             );
         }
         let inputs = PlanInputs::describe(file)?;
-        let hp = &inputs.hp;
-        let mut extra = vec![
-            ("place".to_owned(), place.name().to_owned()),
-            ("experts".to_owned(), experts_name(experts).to_owned()),
-            ("prefill".to_owned(), path.name().to_owned()),
-        ];
-        if let Some(n) = chunk {
-            extra.push(("chunk".to_owned(), n.to_string()));
-        }
-        let header = TraceHeader {
-            model: ref_model_path()?,
-            arch: "qwen4exp".to_owned(),
-            build: "generate_qwen3moe".to_owned(),
-            n_expert: hp.n_expert,
-            n_used: hp.n_used,
-            first_layer: 0,
-            n_layer: inputs.spec.layers.len(),
-            extra,
+        let model = ref_model_path()?;
+        let run = TraceRun {
+            model: &model,
+            build: "generate_qwen3moe",
+            place: place.name(),
+            experts,
+            prefill: path,
+            chunk,
         };
-        Ok(Some(RouteTrace::create(dir, header)?))
+        Ok(Some(route_trace38::create(dir, &inputs, &run)?))
     }
 
     /// The cards `m` loaded at `place`, its `load` line's `cards=` field:
