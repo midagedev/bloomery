@@ -1087,6 +1087,71 @@ fn draft_yields_to_the_context_only_under_the_base() {
     );
 }
 
+/// A paged plan steps one column ([`paged_columns`]): with no arena, or one
+/// slot and no draft, the plan serves as asked; else the unset counts fall
+/// to one slot and no draft, and a `--parallel` past one or a set draft is
+/// refused by name, each set value named with its way out.
+///
+/// The arena is the 3090 gate plan's at a 27 GiB room [derived on the Mac:
+/// `crates/placement` `a_27_gib_room_puts_the_overflow_on_the_nvme_tier`].
+#[test]
+fn a_paged_plan_steps_one_column() {
+    let arena = 23_434_203_136_u64;
+    let at = |arena, slots, slots_set, draft, draft_set| PagedAt {
+        arena,
+        slots,
+        slots_set,
+        draft,
+        draft_set,
+    };
+    let refused = |parallel, draft| {
+        Err(PagedRefused {
+            arena,
+            parallel,
+            draft,
+        })
+    };
+    for (at, want) in [
+        // No arena: every count as asked, set or not.
+        (at(0, 2, false, true, false), Ok(Paged::AsAsked)),
+        (at(0, 4, true, true, true), Ok(Paged::AsAsked)),
+        // One column already.
+        (at(arena, 1, false, false, false), Ok(Paged::AsAsked)),
+        (at(arena, 1, true, false, true), Ok(Paged::AsAsked)),
+        // The unset counts fall to one column.
+        (at(arena, 2, false, false, false), Ok(Paged::OneColumn)),
+        (at(arena, 1, false, true, false), Ok(Paged::OneColumn)),
+        (at(arena, 2, false, true, false), Ok(Paged::OneColumn)),
+        (at(arena, 1, true, true, false), Ok(Paged::OneColumn)),
+        // A set value that steps several columns is refused, each named.
+        (at(arena, 2, true, false, false), refused(Some(2), false)),
+        (at(arena, 2, true, true, false), refused(Some(2), false)),
+        (at(arena, 1, false, true, true), refused(None, true)),
+        (at(arena, 2, false, true, true), refused(None, true)),
+        (at(arena, 3, true, true, true), refused(Some(3), true)),
+    ] {
+        assert_eq!(paged_columns(&at), want, "{at:?}");
+    }
+    assert_eq!(
+        PagedRefused {
+            arena,
+            parallel: Some(3),
+            draft: true
+        }
+        .to_string(),
+        "--parallel 3 and BLOOMERY_DRAFT=mtp: the plan pages host experts through the NVMe \
+         tier's 23434203136 B RAM arena, and a paged plan steps one column (a step of several \
+         reads the paged experts through the file mapping, whose page cache grows until the \
+         kernel swaps the arena out); serve --parallel 1 or leave --parallel unset; set \
+         BLOOMERY_DRAFT=off or leave it unset"
+    );
+    assert_eq!(
+        Draft38Off::Paged { arena }.to_string(),
+        "unset: the plan pages host experts through the NVMe tier's 23434203136 B RAM arena, \
+         and a paged plan steps one column; a verify steps several"
+    );
+}
+
 /// The GLM seat's levers unset: under a serving placement (`--place a` or
 /// `bp`, both `serving_place`) the NextN draft and the
 /// residency's default word; `off`, the first condition that holds named,

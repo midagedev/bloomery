@@ -973,6 +973,42 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
     }
 }
 
+/// The serving seats' one-column rule reads the plan's RAM arena
+/// (`bloomery_levers::paged_columns`): the 3090 gate plan at a 27 GiB room
+/// pages its host experts through an arena at the seat's default two slots
+/// and at one, so the default falls to one column and `--parallel 2` is
+/// refused; at 40 GiB (over half the host leg, under its need) the tier
+/// pages experts with no arena (the mapping path), and the plan serves as
+/// asked — the serve gate's two rooms.
+#[test]
+fn the_one_column_rule_reads_the_arena() {
+    use bloomery_levers::{Paged, PagedAt, paged_columns};
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let arena = |slots: u64, room: u64| {
+        let plan = plan_at(&q4, &gate, 4096, slots, room).expect("the plan");
+        (plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes)
+    };
+    let at = |arena, slots, slots_set| PagedAt {
+        arena,
+        slots,
+        slots_set,
+        draft: false,
+        draft_set: false,
+    };
+    let (moved2, deep2) = arena(2, 27 << 30);
+    let (moved1, deep1) = arena(1, 27 << 30);
+    println!("27 GiB: two slots arena {deep2} B, one slot arena {deep1} B");
+    assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
+    assert_eq!(paged_columns(&at(deep2, 2, false)), Ok(Paged::OneColumn));
+    assert_eq!(paged_columns(&at(deep1, 1, false)), Ok(Paged::AsAsked));
+    assert!(paged_columns(&at(deep2, 2, true)).is_err());
+    let (moved, shallow) = arena(2, 40 << 30);
+    println!("40 GiB: two slots NVMe experts {moved} B, arena {shallow} B");
+    assert!(moved > 0, "the 40 GiB room pages experts");
+    assert_eq!(shallow, 0, "through the mapping, no arena");
+    assert_eq!(paged_columns(&at(shallow, 2, true)), Ok(Paged::AsAsked));
+}
+
 /// A host of 58 GiB (a 64 GB machine's room): the room covers over half the
 /// host leg, so the dial keeps R1's split — no arena — and the overflow is
 /// the smaller one.

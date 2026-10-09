@@ -234,9 +234,10 @@
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for — the drafted arm ends here — and, on the plain arm, more
-//! servers start on the card, one at a time: the `ctx` clause's three and the
-//! residency word's one (they stop before the load), then the slots clause's
-//! two and the sampled rounds' one (above).
+//! servers start on the card, one at a time: the `ctx` clause's three, the
+//! `paged` clause's four and the residency word's one (they stop before the
+//! load, or are refused before it), then the slots clause's two and the
+//! sampled rounds' one (above).
 //!
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
 //!   (the margin rule's answer — or the largest the card holds when that is
@@ -253,6 +254,17 @@
 //!   buys, the bisection, the margin guard — are held by
 //!   `bloomery_placement::placement::ctx`'s tests; these servers hold the
 //!   seat's composition and its lines;
+//! - `paged` ([`paged`]): the NVMe tier's one-column rule at two rooms
+//!   (`BLOOMERY_HOST_ROOM`): at 27 GiB, where the gate plan pages its host
+//!   experts through the tier's RAM arena, the flagless server serves one
+//!   slot (`from=paged`, its `paged` line naming the arena and the two
+//!   slots asked; `paged_default_serves_one_column`), and `--parallel 2`
+//!   and `BLOOMERY_DRAFT=mtp` are refused by name before the load
+//!   (`paged_parallel_is_refused_by_name`, `paged_draft_is_refused_by_name`);
+//!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
+//!   serves its two slots (`unpaged_parallel_serves_as_asked`). FAIL-first:
+//!   the seat with no rule serves two slots at 27 GiB and refuses neither;
+//!   a rule on the paged experts' bytes refuses the 40 GiB server;
 //! - `residency_loads_the_word` ([`residency_loads_the_word`]): a server of
 //!   the main arguments under `BLOOMERY_RESIDENCY=mid-p0-s1`, stopped before
 //!   its load, prints the `residency lever` record of that word with why
@@ -3214,6 +3226,165 @@ mod gate {
         Ok(ok)
     }
 
+    /// The NVMe tier's one-column rule (the seat's module doc,
+    /// `bloomery_levers::paged_columns`) on the gate plan at two rooms
+    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena), each server
+    /// stopped at its `parallel` line, before its load, or refused before it
+    /// prints one. At 27 GiB the plan pages its host experts through the
+    /// tier's RAM arena (`bloomery_placement`'s
+    /// `the_one_column_rule_reads_the_arena` derives both rooms on the Mac):
+    /// the flagless server serves one slot (`from=paged`), its `paged` line
+    /// naming the arena and the two slots asked; `--parallel 2` and
+    /// `BLOOMERY_DRAFT=mtp` are each refused by name (`PagedRefused`'s own
+    /// text at the arena the refusal names, its own plan's). At 40 GiB the tier
+    /// pages experts with no arena (the mapping path), and `--parallel 2`
+    /// serves its two slots (`from=flag`, no `paged` line). FAIL-first: the
+    /// seat before the rule serves the default's two slots at 27 GiB and
+    /// refuses neither; a rule that reads the paged experts' bytes rather
+    /// than the arena refuses the 40 GiB `--parallel 2`.
+    fn paged(dir: &Path) -> Result<bool, GateError> {
+        let own = dir.join("paged");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        // One server under `env` (the room, and the draft where it is set)
+        // to its `parallel` line or its exit: the line, whether it exited
+        // unsuccessfully, and its log.
+        let run = |env: &[(&str, &str)],
+                   flags: &[&str]|
+         -> Result<(Option<String>, bool, String), GateError> {
+            let mut cmd = Command::new(Served38::exe()?);
+            cmd.env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::DRAFT)
+                .env_remove(bloomery_levers::NVTIER_BYTES)
+                .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT)
+                .env_remove(bloomery_levers::MTP_WIDTH)
+                .envs(env.iter().copied());
+            let args: Vec<&str> = DEFAULT_ARGS.iter().chain(flags).copied().collect();
+            let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+            let mut status = None;
+            for _ in 0..POLLS {
+                status = served.child.try_wait()?;
+                if status.is_some() || parallel_line(&err_log)?.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let line = parallel_line(&err_log)?;
+            let text = std::fs::read_to_string(&err_log)?;
+            let failed = status.is_some_and(|s| !s.success());
+            println!(
+                "paged: {env:?} {flags:?}: exit {status:?}, {}",
+                line.as_deref().unwrap_or("no parallel line")
+            );
+            if status.is_none() {
+                println!("paged: the server stopped: {}", served.stop()?);
+            }
+            Ok((line, failed, text))
+        };
+        let field = |line: &str, k: &str| -> Option<String> {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+                .map(str::to_owned)
+        };
+        let paged_line = |text: &str| {
+            text.lines()
+                .find(|l| l.starts_with("paged "))
+                .map(str::to_owned)
+        };
+        let listened = |text: &str| -> Result<bool, GateError> {
+            Ok(record::Log::of(text, record::BLOOMERY_SERVE_QWEN38)
+                .first(&record::LISTENING38)?
+                .is_some())
+        };
+        let mut ok = true;
+
+        let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "27G")], &[])?;
+        let paged = paged_line(&text);
+        println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
+        let arena = paged
+            .as_deref()
+            .and_then(|l| field(l, "arena"))
+            .and_then(|v| v.parse::<u64>().ok());
+        let one = line.as_deref().is_some_and(|l| {
+            let n = |k: &str| field(l, k).and_then(|v| v.parse::<usize>().ok());
+            n("slots") == Some(1)
+                && field(l, "from").as_deref() == Some("paged")
+                && n("slot_ctx").is_some_and(|c| c > 0 && n("total") == Some(c))
+        });
+        let named = paged.as_deref().is_some_and(|l| {
+            field(l, "rule").as_deref() == Some("one-column")
+                && field(l, "asked_slots").as_deref() == Some("2")
+                && field(l, "slots").as_deref() == Some("1")
+                && field(l, "draft").as_deref() == Some("off")
+        });
+        check(
+            &mut ok,
+            "paged_default_serves_one_column",
+            one && named && arena.is_some_and(|a| a > 0),
+        );
+
+        // A refusal's arena, read off its own line (the plan the refused
+        // server read, whose context rides the card's free bytes at its
+        // start), and whether the line is `PagedRefused`'s text at it.
+        let refused = |text: &str, head: &str, parallel, draft| {
+            let arena = text.lines().find_map(|l| {
+                let tail = &l[l.find(head)? + head.len()..];
+                tail.split_once(" B RAM arena")?.0.parse::<u64>().ok()
+            });
+            let named = arena.is_some_and(|arena| {
+                let want = bloomery_levers::PagedRefused {
+                    arena,
+                    parallel,
+                    draft,
+                }
+                .to_string();
+                arena > 0 && text.contains(&want)
+            });
+            println!("paged: refused at arena {arena:?}, by name {named}");
+            named
+        };
+        let tier = ": the plan pages host experts through the NVMe tier's ";
+
+        let (line, failed, text) =
+            run(&[(bloomery_levers::HOST_ROOM, "27G")], &["--parallel", "2"])?;
+        check(
+            &mut ok,
+            "paged_parallel_is_refused_by_name",
+            failed
+                && line.is_none()
+                && refused(&text, &format!("--parallel 2{tier}"), Some(2), false)
+                && !listened(&text)?,
+        );
+
+        let (line, failed, text) = run(
+            &[
+                (bloomery_levers::HOST_ROOM, "27G"),
+                (bloomery_levers::DRAFT, "mtp"),
+            ],
+            &[],
+        )?;
+        check(
+            &mut ok,
+            "paged_draft_is_refused_by_name",
+            failed
+                && line.is_none()
+                && refused(&text, &format!("BLOOMERY_DRAFT=mtp{tier}"), None, true)
+                && !listened(&text)?,
+        );
+
+        let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "40G")], &["--parallel", "2"])?;
+        let asked = line.as_deref().is_some_and(|l| {
+            field(l, "slots").as_deref() == Some("2") && field(l, "from").as_deref() == Some("flag")
+        });
+        check(
+            &mut ok,
+            "unpaged_parallel_serves_as_asked",
+            asked && paged_line(&text).is_none(),
+        );
+        Ok(ok)
+    }
+
     /// The plain arm (the module header): the main server with the draft
     /// off — every clause that needs no draft — then, one at a time, the
     /// clauses' own servers: `ctx`, the slots pair and the sampled rounds.
@@ -3315,6 +3486,7 @@ mod gate {
 
         println!("server stopped: {}", served.stop()?);
         ok &= ctx(dir, levers)?;
+        ok &= paged(dir)?;
         ok &= residency_loads_the_word(dir)?;
         // The resident slots together (the module header): its own servers,
         // the first with the draft on, the second the seat's own defaults.
