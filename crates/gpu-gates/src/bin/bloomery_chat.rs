@@ -24,9 +24,13 @@
 //! `generate_ds41 --tokens <the prompt's ids>` prints on its `tokens` line.
 //! It refuses the sampling flags beside it. A run's refusal names its run.
 //!
-//! `--then` starts another run on the same load. Every prompt is tokenized
-//! before the load (an empty encode refused there, naming the run); run 0
-//! prints its `prompt_ids` line where a lone run does, before the plan, and
+//! `--then` starts another run on the same load. A list of more than one run
+//! names its order after the load, before run 0 draws, on one plain stderr
+//! line built from the list the process runs: `runs in order: sampled seed
+//! 7 -n 16 (5 prompt ids), greedy -n 16 (5 prompt ids), …`. Every prompt is
+//! tokenized before the load (an empty encode refused there, naming the
+//! run); run 0 prints its `prompt_ids` line where a lone run does, before
+//! the plan, and
 //! each later run prints its own at its start, after the clear. The clear
 //! between runs is this bin's: a model a fault poisoned is refused by name
 //! (a fault ends the load), then [`GpuModel::reset`], then
@@ -401,6 +405,14 @@ mod drive {
         // The state the load left, asserted back before each run after the
         // first, after its clear.
         let base = StateBack::read(g.model())?;
+        if runs.len() > 1 {
+            let order: Vec<String> = runs
+                .iter()
+                .zip(&ids)
+                .map(|(a, ids)| run_label(a, ids.len()))
+                .collect();
+            eprintln!("runs in order: {}", order.join(", "));
+        }
         for (i, a) in runs.iter().enumerate() {
             if i > 0 {
                 if let Some(fault) = g.model().poisoned() {
@@ -421,6 +433,17 @@ mod drive {
             chat(&mut g, a, &tok, &mut samplers[i], &ids[i])?;
         }
         Ok(())
+    }
+
+    /// A run as the order line names it: how it draws (`greedy`, or `sampled
+    /// seed S`), its `-n` and its prompt's id count.
+    fn run_label(a: &Args, prompt_ids: usize) -> String {
+        let draw = if a.greedy {
+            "greedy".to_string()
+        } else {
+            format!("sampled seed {}", a.sampling.seed)
+        };
+        format!("{draw} -n {} ({prompt_ids} prompt ids)", a.n_gen)
     }
 
     /// The plan the engine is about to load under the placement's `levers`
