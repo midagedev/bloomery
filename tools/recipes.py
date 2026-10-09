@@ -2538,9 +2538,12 @@ def weekly_triggers(changed: list[str], a: Side | None, b: Side, rows: list[Path
 # records-refresh runs only on the box, so a plan it lists can be missing from the tree while every Mac
 # check passes and the box gate that reads it goes red. The rule below checks presence only: whether a
 # plan's contents are the engine's is the box's to say (the recipe rewrites them from generate_ds41).
+# The plans are printed at the plan room (PLAN_ROOM): a bare `generate_ds41 --plan` would read the box's
+# live memory, and the files would move with whatever else holds RAM there.
 
 REFRESH_RECIPE = "records-refresh"
 PLAN_MARKER = "#> "  # tools/bloomery/records.py refresh: the records after this line go to its path
+PLAN_ROOM = "tools/ref/plan-room.sh"  # generate_ds41 --plan at a pinned host room, refused when it moves with it
 COUNTS_TOOL = "tools/flow/ds41_prefill.py"
 _SHELL_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
@@ -2656,17 +2659,47 @@ def counts_depths(recipe: Recipe) -> list[int]:
     return depths
 
 
+def plan_room_problems(recipe: Recipe) -> list[str]:
+    """records-refresh prints every plan at the plan room: each `#> ` marker's echo is followed by `bash
+    tools/ref/plan-room.sh D C`, D the marker's `--depth` word and C its `BLOOMERY_CED=` value as the text spells
+    them (the loop's `$P` and `$c`), so the file a marker names holds the plan it names. A `generate_ds41 --plan`
+    anywhere in the box command is refused by name: it plans at the box's live MemAvailable."""
+    out: list[str] = []
+    for remote in _box_remotes(recipe):
+        cmds = [strip_wrappers(c)[1] for c in simple_commands(shell_words(remote))]
+        bare = {k for k, c in enumerate(cmds) if c and os.path.basename(c[0]) == "generate_ds41" and "--plan" in c}
+        for k in sorted(bare):
+            out.append(f"justfile:{recipe.line} {recipe.name}: runs a bare `{' '.join(cmds[k])}`, which plans at the box's "
+                       f"live MemAvailable: print each plan through `bash {PLAN_ROOM} $P $c` (the room pinned)")
+        for k, c in enumerate(cmds):
+            if c[:1] != ["echo"] or len(c) < 2 or not c[1].startswith(PLAN_MARKER):
+                continue
+            path, _, what = c[1][len(PLAN_MARKER):].partition(" ")
+            ws = what.split()
+            depth = ws[ws.index("--depth") + 1] if "--depth" in ws[:-1] else "<no --depth>"
+            ced = next((w.split("=", 1)[1] for w in ws if w.startswith("BLOOMERY_CED=")), "<no BLOOMERY_CED=>")
+            want = ["bash", PLAN_ROOM, depth, ced]
+            nxt = cmds[k + 1] if k + 1 < len(cmds) else []
+            if k + 1 in bare or [_norm(w) if i == 1 else w for i, w in enumerate(nxt)] == want:
+                continue
+            out.append(f"justfile:{recipe.line} {recipe.name}: the marker of {path} is followed by `{' '.join(nxt) or 'nothing'}`, "
+                       f"not `{' '.join(want)}`: the plan its file holds is printed at the plan room, at the depth and CED "
+                       f"its marker names")
+    return out
+
+
 def plan_problems(root: str, recipes: dict[str, Recipe]) -> list[str]:
-    """Every plan records-refresh writes, present in the tree at `root`; every depth a --counts reader needs,
-    written by it. Presence only."""
+    """Every plan records-refresh writes, present in the tree at `root` and printed at the plan room
+    (`plan_room_problems`); every depth a --counts reader needs, written by it. Presence only, of the files."""
     if REFRESH_RECIPE not in recipes:
         return [f"no `{REFRESH_RECIPE}` recipe: the plans in tools/flow/plans/ have no writer"]
     try:
         plans = refresh_plans(recipes[REFRESH_RECIPE])
     except RecipeError as err:
         return [f"justfile:{recipes[REFRESH_RECIPE].line} {err}"]
-    problems = [f"{p.path} is not in the tree ({REFRESH_RECIPE}: {p.what}) — run just {REFRESH_RECIPE} on the box and commit it"
-                for p in plans if not os.path.isfile(os.path.join(root, p.path))]
+    problems = plan_room_problems(recipes[REFRESH_RECIPE])
+    problems += [f"{p.path} is not in the tree ({REFRESH_RECIPE}: {p.what}) — run just {REFRESH_RECIPE} on the box and commit it"
+                 for p in plans if not os.path.isfile(os.path.join(root, p.path))]
     written = {p.depth for p in plans}
     for name in sorted(recipes, key=lambda n: recipes[n].line):
         try:
@@ -6159,9 +6192,8 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="recipes-plans-") as tmp:
         refresh = ("records-refresh:\n    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates "
                    "--features deepseek41 --release --bin generate_ds41 >&2 && for P in 8 16; do for c in on off; do echo \"#> "
-                   "tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c\" && "
-                   "BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 "
-                   "tools/bloomery/records.py refresh\n")
+                   "tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c at the "
+                   "plan room\" && bash tools/ref/plan-room.sh $P $c; done; done' | python3 tools/bloomery/records.py refresh\n")
         reader = ("gate-x:\n    ./tools/box.sh 'D=t && BLOOMERY_STEP_STATS=1 bash tools/gpu-gate.sh generate_ds41 --place gate "
                   "--depth {d} -n 2 > $D/a.log && python3 tools/flow/ds41_prefill.py --counts $D/a.log > $D/a.counts'\n")
         jp = os.path.join(tmp, "justfile")
@@ -6190,7 +6222,22 @@ def self_test() -> int:
         expect(len(got) == 1 and "no loop around it sets" in got[0], f"plans: a marker variable no loop sets not refused: {got}")
         got = plan_probs(refresh.replace("for P in 8 16", "for P in 8 8"))
         expect(len(got) == 1 and "two markers write" in got[0], f"plans: a path written twice not refused: {got}")
+        # the plan room: a bare generate_ds41 --plan (the box's live MemAvailable) refused by name, once; the script
+        # with the marker's depth and CED swapped refused; the script as the marker names it passes (got == [] above)
+        script = "bash tools/ref/plan-room.sh $P $c"
+        got = plan_probs(refresh.replace(script, "BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a"))
+        expect(len(got) == 1 and "bare `target/release/generate_ds41 --plan --depth $P --place a`" in got[0]
+               and "MemAvailable" in got[0] and f"bash {PLAN_ROOM} $P $c" in got[0],
+               f"plans: a bare generate_ds41 --plan in records-refresh not refused by name, once: {got}")
+        got = plan_probs(refresh.replace(script, "bash tools/ref/plan-room.sh $c $P"))
+        expect(len(got) == 1 and "followed by `bash tools/ref/plan-room.sh $c $P`" in got[0]
+               and f"not `bash {PLAN_ROOM} $P $c`" in got[0],
+               f"plans: the plan-room script with the marker's depth and CED swapped not refused: {got}")
+        got = plan_probs(refresh.replace(f" && {script}", ""))
+        expect(len(got) == 1 and "followed by `nothing`" in got[0], f"plans: a marker with no plan after it not refused: {got}")
     real = refresh_plans(jf["records-refresh"]) if "records-refresh" in jf else []
+    got = plan_room_problems(jf["records-refresh"]) if "records-refresh" in jf else ["no records-refresh recipe"]
+    expect(got == [], f"plans: records-refresh on the real justfile does not print every plan at the plan room: {got}")
     depths = {p.depth for p in real}
     expect({512, 1536, 16384} <= depths, f"plans: records-refresh on the real justfile writes depths {sorted(depths)}")
     expect(all(d in depths for n in jf for d in counts_depths(jf[n])), "plans: a real --counts reader's depth that records-refresh does not write")
