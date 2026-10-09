@@ -70,6 +70,26 @@
 #   slots-leak   kind=slots records from the plain arm 6 (STUB_GEN_SLOTS_LEAK=2): a FAIL row naming it, rc 1.
 #   slots-none   the 2-slot arm printing the plain lines (STUB_GEN_SLOTS_NOPASS=1, a binary that ignored the
 #                lever): a FAIL row naming the missing records, rc 1.
+#   bin-slots    bin:<stub base>:prose:3@BLOOMERY_GEN_SLOTS=2 prose:3@BLOOMERY_GEN_SLOTS=2, two rounds: the bin:
+#                arm an aggregate arm as ours' is, fed the corpus's first 6 ids (every process 6 ids), no FAIL row,
+#                both rows `tok/s(aggregate) 250.00` with `slots 2`, the bin: label in the slots table (no plain
+#                twin) and one `ratio slots bin d=3 ours@prose@BLOOMERY_GEN_SLOTS=2/bin:base@prose@…` line, mean
+#                1.0000; rc 0. Red on the runner before it, which fed the bin: arm 3 ids and read its kind=slots
+#                records as a FAIL row (an arm that names no N), rc 1.
+# The capped arms (the runner's Mem; red on the runner before them, which refused a bin: arm's mem= by name and
+# evicted nothing). A stub systemd-run in the tree's PATH starts no scope: it records its -p items and runs the
+# command. The two-shard split set evict and evict-held read sits under this tree's target/ (disk-backed on the
+# box; a tmpfs one fails both cases by name, its pages being ones posix_fadvise does not evict):
+#   bin-mem      bin:<stub base>:6@mem=29G 6, two rounds: two systemd-run calls `MemoryMax=29G MemorySwapMax=0` (the
+#                bin: arm's processes), its rows `capped mem=29G` after the card field, the scope's witness line, the
+#                evict line over the profile's file (empty: pages=0 resident before=0 after=0), the plain arm's rows
+#                uncapped; rc 0.
+#   evict        bin:<stub base>:6@mem=29G,model=<set> 6@mem=29G,model=<set>, two rounds, each process reading the
+#                set back in (STUB_GEN_READ_MODEL=1): four evict lines `shards=2 pages=2·SP resident before=2·SP
+#                after=0`, every row capped; rc 0.
+#   evict-held   a holder process with the first shard mapped and every page touched, 6@mem=29G,model=<set>, one
+#                round: the evict line's `after=SP`, `FAIL r1 … rc=evict | evict: SP of the 2·SP pages …`, no process
+#                started, no row; rc 1.
 #   res-sums     generate_qwen3moe's schema with the residency kinds (the stub tree's copy, its own residency
 #                rows replaced by generate_ds41's), STUB_GEN_RES=mid-p148-s1, 6@BLOOMERY_RESIDENCY=mid-p148-s1: the row's
 #                `residency mid-p148-s1 (set) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288` (the none and
@@ -146,7 +166,9 @@ ROOT=$(cd "$HERE/../.." && pwd)
 RUNNER=${DEPTH_QWEN3MOE_RUNNER:-$ROOT/tools/ref/depth-qwen3moe.sh}
 tmp=${TMPDIR:-/tmp}
 tmp=$(mktemp -d "${tmp%/}/depth-qwen3moe-stub.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+# On any exit: evict-held's holder stopped (its pid from its own file) and the capped arms' shard directory
+# (SH, below) removed with the temporary tree.
+trap '[ ! -s "$tmp/holder.pid" ] || kill "$(cat "$tmp/holder.pid")" 2> /dev/null; rm -rf "$tmp" ${SH:+"$SH"}' EXIT
 T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/base/target/release" "$T/bin" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-qwen3moe.sh"
@@ -320,7 +342,8 @@ touch "$T/Cargo.toml"
 # STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes and the MTP form of the SMOKE line (steps= the
 # summary's positions, passes= its passes, no seeded=): STUB_GEN_PASSES=5 is 10 positions in 5 passes, 0 none
 # in none, any other value an error. Every process appends its --place to $TMPDIR/stub-gen-place (`-` when
-# none). A variable named `place` in its environment ends it at rc 9. Its load line names no cards unless
+# none). A variable named `place` or `mem` in its environment ends it at rc 9; under STUB_GEN_READ_MODEL=1 it
+# first reads every shard of BLOOMERY_REF_MODEL's split set. Its load line names no cards unless
 # STUB_GEN_CARDS_ON=1 (twocard-nocards keeps a load line without them); under it the line names the cards
 # its --place loads, as generate_qwen3moe's does (`cards=`: the A6000 under a or none, STUB_GEN_CARDS_A in
 # their stead; the 3090 under gate; both under bp).
@@ -330,9 +353,16 @@ touch "$T/Cargo.toml"
 # footer; STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead.
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
-if printenv place > /dev/null; then
-  echo "error: a variable named place reached the binary (place=$(printenv place)): the runner passed an arm's place= item as a variable" >&2
-  exit 9
+for v in place mem; do
+  if printenv "$v" > /dev/null; then
+    echo "error: a variable named $v reached the binary ($v=$(printenv "$v")): the runner passed an arm's $v= item as a variable" >&2
+    exit 9
+  fi
+done
+# STUB_GEN_READ_MODEL=1: the process reads every shard of BLOOMERY_REF_MODEL's split set, as a load faults them in.
+if [ -n "${STUB_GEN_READ_MODEL:-}" ]; then
+  m=${BLOOMERY_REF_MODEL:?STUB_GEN_READ_MODEL reads BLOOMERY_REF_MODEL}
+  cat "${m%-0*-of-*}"-*-of-"${m##*-of-}" > /dev/null || exit 8
 fi
 tokens='' n=32 ctx=0 sync='' arms=() place=''
 while [ $# -gt 0 ]; do
@@ -424,8 +454,35 @@ EOF
 cp "$T/target/release/generate_qwen3moe" "$T/base/target/release/generate_qwen3moe"
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers and the cases).
 cp "$ROOT/tools/ref/stub-llama-server.py" "$T/bin/llama-server"
+# The stub systemd-run: a mem= arm's scope (the runner's Mem) starts none; it appends its -p items to
+# $TMPDIR/stub-systemd-run, one line a call, and runs the command after its options.
+cat > "$T/bin/systemd-run" << 'EOF'
+#!/usr/bin/env bash
+p=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --scope | --quiet) ;;
+    -p) p+=("$2"); shift ;;
+    *) break ;;
+  esac
+  shift
+done
+echo "${p[*]}" >> "${TMPDIR:-/tmp}/stub-systemd-run"
+exec "$@"
+EOF
 chmod +x "$T/bin/"* "$T/target/release/generate_qwen3moe" "$T/base/target/release/generate_qwen3moe"
 BASEBIN=$T/base/target/release/generate_qwen3moe
+# The capped arms' two-shard split set (evict, evict-held): in a directory under this tree's target/, cargo's
+# build directory and disk-backed on the box, not under the temporary tree: posix_fadvise(DONTNEED) evicts no
+# tmpfs page, so on a tmpfs /tmp every page would stay resident and evict would be red for that reason. SH_FS
+# names its filesystem, checked by the cases that read it. Each shard is 1 MiB of random bytes synced to disk,
+# so its cached pages are clean; SP is a shard's pages.
+mkdir -p "$ROOT/target"
+SH=$(mktemp -d "$ROOT/target/depth-qwen3moe-stub-shards.XXXXXX") || exit 2
+SH_FS=$(stat -f -c %T "$SH")
+SHARD=$SH/q-00001-of-00002.gguf
+for k in 1 2; do dd if=/dev/urandom of="$SH/q-0000$k-of-00002.gguf" bs=1M count=1 conv=fsync status=none || exit 2; done
+SP=$((1048576 / $(getconf PAGESIZE)))
 
 n=0 failed=0
 pass() { n=$((n + 1)); echo "ok $1"; }
@@ -441,7 +498,7 @@ stub_run() {
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
   rm -f "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-*
-  rm -f "$tmp/tmp/stub-xid"
+  rm -f "$tmp/tmp/stub-xid" "$tmp/tmp/stub-systemd-run"
   echo 0 > "$tmp/tmp/stub-majflt"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
     STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 STUB_MAJFLT="$tmp/tmp/stub-majflt" \
@@ -1204,6 +1261,95 @@ elif want slots-none "$L" 1 '^FAIL r1 ours@BLOOMERY_GEN_SLOTS=2 d=6 rc=0 \| the 
   want slots-none "$L" 0 '^ROW '; then
   pass slots-none
 fi
+# Two builds' aggregate arms on one prompt and list: the bin: arm's one process and ours' load each fed the
+# corpus's first 2 · 3 ids, both at 2 positions a round over 3 rounds at 8 ms (250 tok/s): 250 / 250 a round.
+L=$tmp/bin-slots.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_DATA="$T/data" -- "bin:$BASEBIN:prose:3@BLOOMERY_GEN_SLOTS=2" prose:3@BLOOMERY_GEN_SLOTS=2
+if [ "$RC" != 0 ]; then
+  fail bin-slots "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$tmp/tmp/stub-gen-loads")" != "6 |6 |6 |6 " ]; then
+  fail bin-slots "the processes' id counts: $(paste -sd'|' - < "$tmp/tmp/stub-gen-loads"), want 6 |6 |6 |6 " "$L"
+elif want bin-slots "$L" 0 '^FAIL ' &&
+  want bin-slots "$L" 2 '^ROW r[12] bin:base@prose@BLOOMERY_GEN_SLOTS=2 d=3 n=4 ctx=256 \| tok/s\(aggregate\) 250\.00 @ n=2·3, depth 3, [^|]* \| slots 2 \| ' &&
+  want bin-slots "$L" 2 '^ROW r[12] ours@prose@BLOOMERY_GEN_SLOTS=2 d=3 n=4 ctx=256 \| tok/s\(aggregate\) 250\.00 @ n=2·3, depth 3, [^|]* \| slots 2 \| ' &&
+  want bin-slots "$L" 1 '^mean bin:base@prose@BLOOMERY_GEN_SLOTS=2 d=3 +250\.00 tok/s  \[250\.00\.\.250\.00, spread 0\.00%\]  \(aggregate of 2 slots\) \(n=2\)' &&
+  want bin-slots "$L" 1 '^ratio slots: bin:base@prose@BLOOMERY_GEN_SLOTS=2 has no plain twin bin:base@prose among the arms: no ratio$' &&
+  want bin-slots "$L" 1 '^ratio slots bin ' &&
+  want bin-slots "$L" 1 '^ratio slots bin d=3 +ours@prose@BLOOMERY_GEN_SLOTS=2/bin:base@prose@BLOOMERY_GEN_SLOTS=2 +mean 1\.0000 ± 0\.0000 \(n=2\)  of means 1\.0000  per round: r1 1\.0000 r2 1\.0000 ' &&
+  want bin-slots "$L" 0 '^ratio (d|prose d)='; then
+  pass bin-slots
+fi
+
+# The capped arms (the runner's Mem). A bin: arm's mem= in the scope an ours arm's takes: the stub systemd-run's
+# -p items once a capped process, the scope's witness, the evict line over the profile's (empty) file, the row's
+# capped field; the plain arm beside it unscoped.
+L=$tmp/bin-mem.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 -- "bin:$BASEBIN:6@mem=29G" 6
+if [ "$RC" != 0 ]; then
+  fail bin-mem "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$tmp/tmp/stub-systemd-run")" != "MemoryMax=29G MemorySwapMax=0|MemoryMax=29G MemorySwapMax=0" ]; then
+  fail bin-mem "the stub systemd-run's calls: $(paste -sd'|' - < "$tmp/tmp/stub-systemd-run"), want two of MemoryMax=29G MemorySwapMax=0" "$L"
+elif want bin-mem "$L" 2 '^ROW r[12] bin:base@mem=29G d=6 n=4 ctx=256 \| tok/s\(mean\) 200\.00 @ n=4, depth 6, [^|]* \| capped mem=29G \| p50 ' &&
+  want bin-mem "$L" 2 '^ROW r[12] ours d=6 ' &&
+  want bin-mem "$L" 0 '^ROW r[12] ours d=6 .*capped' &&
+  want bin-mem "$L" 2 '^    mem scope: MemoryMax=29G MemorySwapMax=0 peak=' &&
+  want bin-mem "$L" 2 '^    evict: [^ ]*/model-00001-of-00001\.gguf shards=1 pages=0 resident before=0 after=0 ' &&
+  want bin-mem "$L" 1 '^\[config\] mem: bin:[^ ]*@mem=29G 29G — ' &&
+  want bin-mem "$L" 0 '^FAIL '; then
+  pass bin-mem
+fi
+# evict: every capped process's eviction over the two-shard set on disk, each process (STUB_GEN_READ_MODEL=1)
+# reading the shards back in, so every eviction finds all 2·SP pages resident and leaves none.
+L=$tmp/evict.log
+cat "$SH"/q-*-of-00002.gguf > /dev/null
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 STUB_GEN_READ_MODEL=1 -- "bin:$BASEBIN:6@mem=29G,model=$SHARD" "6@mem=29G,model=$SHARD"
+if [ "$SH_FS" = tmpfs ] || [ "$SH_FS" = ramfs ]; then
+  fail evict "the shard directory $SH is on $SH_FS, whose pages posix_fadvise does not evict" "$L"
+elif [ "$RC" != 0 ]; then
+  fail evict "rc $RC, want 0" "$L"
+elif want evict "$L" 4 '^    evict: ' &&
+  want evict "$L" 4 "^    evict: $SHARD shards=2 pages=$((2 * SP)) resident before=$((2 * SP)) after=0 \(posix_fadvise DONTNEED, then mincore\)$" &&
+  want evict "$L" 2 '^ROW r[12] bin:base@mem=29G,model=[^ ]* d=6 .* \| capped mem=29G \| ' &&
+  want evict "$L" 2 '^ROW r[12] ours@mem=29G,model=[^ ]* d=6 .* \| capped mem=29G \| ' &&
+  want evict "$L" 4 '^    mem scope: MemoryMax=29G '; then
+  pass evict
+fi
+# evict-held: a holder process maps the first shard and touches every page, so posix_fadvise leaves its SP pages
+# resident: the capped arm a FAIL row naming the count, its process never started, rc 1.
+L=$tmp/evict-held.log
+rm -f "$tmp/holder.ready"
+python3 -c 'import mmap, sys, time
+f = open(sys.argv[1], "rb")
+m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+s = sum(m[i] for i in range(0, len(m), mmap.PAGESIZE))
+open(sys.argv[2], "w").write("held %d\n" % s)
+time.sleep(600)' "$SHARD" "$tmp/holder.ready" &
+echo "$!" > "$tmp/holder.pid"
+hp=$(cat "$tmp/holder.pid") w=0
+while [ ! -s "$tmp/holder.ready" ] && kill -0 "$hp" 2> /dev/null && [ "$w" -lt 100 ]; do
+  sleep 0.1
+  w=$((w + 1))
+done
+if [ "$SH_FS" = tmpfs ] || [ "$SH_FS" = ramfs ]; then
+  fail evict-held "the shard directory $SH is on $SH_FS, whose pages posix_fadvise does not evict"
+elif [ ! -s "$tmp/holder.ready" ]; then
+  fail evict-held "the holder never mapped $SHARD (no ready file after $w polls)"
+else
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_READ_MODEL=1 -- "6@mem=29G,model=$SHARD"
+  if [ "$RC" != 1 ]; then
+    fail evict-held "rc $RC, want 1" "$L"
+  elif [ -s "$tmp/tmp/stub-gen-loads" ]; then
+    fail evict-held "the capped arm's process started: $(paste -sd'|' - < "$tmp/tmp/stub-gen-loads")" "$L"
+  elif want evict-held "$L" 1 "^    evict: $SHARD shards=2 pages=$((2 * SP)) resident before=[0-9]+ after=$SP " &&
+    want evict-held "$L" 1 "^FAIL r1 ours@mem=29G,model=[^ ]* d=6 rc=evict \| evict: $SP of the $((2 * SP)) pages of $SHARD's 2 shard\(s\) stay resident after posix_fadvise\(DONTNEED\) " &&
+    want evict-held "$L" 0 '^ROW ' &&
+    want evict-held "$L" 1 '^failed arms: r1 ours@mem=29G,model=[^ ]* d=6 rc=evict; $'; then
+    pass evict-held
+  fi
+fi
+kill "$hp" 2> /dev/null
+wait "$hp" 2> /dev/null
+rm -f "$tmp/holder.pid"
 
 L=$tmp/warm.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_COLD_GEN=4:2 'STUB_COLD_BENCH=tg4 @ d6:2' -- 6 4 lcpp:6
@@ -1233,7 +1379,8 @@ if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
-    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
+    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/bin-slots.log "$tmp"/bin-mem.log \
+    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done
