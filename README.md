@@ -29,7 +29,7 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.2.8)
+## Status (0.2.9)
 
 | Area | State |
 |---|---|
@@ -67,12 +67,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.2.8-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.8-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.9-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.9-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.2.8](https://github.com/midagedev/bloomery/releases/tag/v0.2.8)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.2.9](https://github.com/midagedev/bloomery/releases/tag/v0.2.9)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
