@@ -162,7 +162,11 @@ gpu-deepseek41 426 48 0
 # PIN(2026-10-07): gpu-gates 62 -> 63 blocks, new code, not old code relaxed: gate_swap's s6 reads a pick's landing
 # batch rows back from their raw device addresses (one cuMemcpyDtoDAsync block, the same form as gate_xstream's),
 # with its SAFETY line.
-gpu-gates 61 5 1
+# PIN(2026-10-09): gpu-gates 61 -> 62 blocks, new code, not old code relaxed: gate_nvtier's footprint clause reads
+# the page cache over the NVMe tier's drop runs with libc's mincore through the gate's own open of the file (one
+# block, its SAFETY line) — the model crate's mincore reader is private to the lock walk, and the clause's
+# instrument must not be the engine's own mapping.
+gpu-gates 62 5 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 gpu-vision 48 0 0

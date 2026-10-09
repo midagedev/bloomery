@@ -29,6 +29,18 @@
 //! - `room` (clause 6): the loaded tier's arena, the plan's host need and
 //!   the churn pool the residency holds fit the room together, and the
 //!   plan's headroom is what the room leaves past the arena and the need.
+//! - `footprint` (clause 7, the paged arm, off under `--audit`, whose
+//!   buffered reads fill the page cache by design): the page cache holds no
+//!   page of the tier's drop runs ([`NvTier::drop_region`]) past a folio
+//!   from a run's ends ([`FOLIO_MAX`]) — after the tier's own drop of every
+//!   run before the prompt (the premise: no other process maps the file;
+//!   every gate that maps it holds the V4.1 load lock this one holds), after
+//!   the prompt call (its union and its lanes dropped what they read), and,
+//!   with the residue dropped again so the two readers stay apart, after the
+//!   [`STEPS`] steps (the promotions' lanes dropped theirs). The page cache
+//!   is read with `mincore` over the probe's own open of the file, not the
+//!   engine's mapping. The line also prints the prompt's drops and their
+//!   wall against the prompt's.
 //!
 //! PIN(2026-10-08): the page-cache design's two named refusals are dropped
 //! — a paged tier under `BLOOMERY_HOST_LOCK=1` (the lock walk pins model
@@ -39,6 +51,18 @@
 //! model mapping's are disjoint ranges, and a mutant that madvises a model
 //! page turns the check red.
 //!
+//! PIN(2026-10-09): the arena still never advises the model mapping; the
+//! tier now drops the model mapping's pages of the ids it serves after each
+//! prompt union and each lane copy (pagedrop: on a small host a long
+//! prompt's union filled the page cache and pushed the arena to swap). The
+//! `advice` line holds both: the arena's range disjoint from the mapped
+//! tensors, and every drop run inside one routed stack of its layer and
+//! disjoint from every byte of an id the tier does not serve (the plan's
+//! host segment) — a run is built from whole pages inward of those bytes, so
+//! the check holds by construction, and a mutant that rounds a run outward
+//! at a held id turns it red. The HOST_LOCK note above stays true: the lock
+//! pins the host segment's pages, which no drop names.
+//!
 //! The FAIL-first mutants of each clause are named in the design's §7.6
 //! table.
 
@@ -47,11 +71,12 @@ mod gate_card;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use app::Session;
 use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-use bloomery_gpu::host::nvtier::{NvTier, NvTierStats, advice_disjoint};
+use bloomery_gpu::host::nvtier::{DropRuns, NvTier, NvTierStats, advice_disjoint};
 use bloomery_gpu::host::swap::{PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
@@ -60,6 +85,7 @@ use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::placement::churn::ChurnPool;
+use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{HostNeed, HostRead};
 use model::placement::{Machine, PlanLevers};
 use runtime::{Out, Target, Want};
@@ -77,6 +103,12 @@ const PROMPT: usize = 512;
 const STEPS: usize = 96;
 /// The paged arm's room, a 32 GB machine's.
 const ROOM: u64 = 27 << 30;
+/// The largest page-cache folio, in bytes: x86-64 builds them up to PMD
+/// order (2 MiB), and `POSIX_FADV_DONTNEED` skips a folio that reaches past
+/// the range it is given, so a run's first and last folio may keep pages a
+/// correct drop named. `footprint` judges the pages past it from a run's
+/// ends and prints the rest.
+const FOLIO_MAX: u64 = 2 << 20;
 
 fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
@@ -114,6 +146,29 @@ struct ArmRun {
     stats: Option<NvTierStats>,
     tier: Option<Arc<NvTier>>,
     seam: Option<Seam>,
+    footprint: Option<Footprint>,
+}
+
+/// Resident pages over the tier's drop runs (`footprint`): those past
+/// [`FOLIO_MAX`] from a run's ends (the interior, judged), those nearer
+/// (the edges, printed), and the runs' pages.
+#[derive(Clone, Copy, Default)]
+struct Pages {
+    interior: u64,
+    edge: u64,
+    total: u64,
+}
+
+/// The paged arm's footprint: after the tier's own drop before the prompt,
+/// after the prompt and after the steps; and the prompt's drops (calls,
+/// wall) against the prompt's wall.
+struct Footprint {
+    base: Pages,
+    prompt: Pages,
+    steps: Pages,
+    prompt_drops: u64,
+    prompt_drop_ns: u64,
+    prompt_ns: u64,
 }
 
 /// The residency seam's answers over the ids the arena serves, against the arena's own books.
@@ -135,7 +190,13 @@ fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
 
 /// One arm: the model loaded under `residency` with `room` given (or the
 /// machine's reading), its [`PROMPT`] ids as one prompt call and [`STEPS`]
-/// greedy steps, the residency boundaries' reports summed.
+/// greedy steps, the residency boundaries' reports summed; on a load with a
+/// tier and no `--audit`, the footprint read through `probe`, the gate's own
+/// open of the file.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one arm's load, its inputs and its instrument, each named"
+)]
 fn arm(
     path: &Path,
     machine: &Machine,
@@ -144,6 +205,7 @@ fn arm(
     host: HostCfg,
     ids: &[u32],
     audit: bool,
+    probe: &Split,
 ) -> Result<ArmRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, room)?;
@@ -172,6 +234,25 @@ fn arm(
             .audit_on()?;
     }
     take_passes(&mut s)?;
+    // `footprint`: the tier's drop runs, its own definition; the page cache
+    // emptied of them by the tier's own drop first, so a page an earlier run
+    // left warm is not this one's.
+    let foot = match &tier {
+        Some(t) if !audit => {
+            let regions = (0..plan.model.layers)
+                .filter(|&l| t.covers(l))
+                .map(|l| Ok((l, t.drop_region(l)?)))
+                .collect::<Result<Vec<_>, GateError>>()?;
+            drop_all(t, &regions)?;
+            Some((Arc::clone(t), regions))
+        }
+        _ => None,
+    };
+    let base = match &foot {
+        Some((_, regions)) => resident(probe, regions)?,
+        None => Pages::default(),
+    };
+    let drops0 = tier.as_ref().map(|t| t.stats());
     let mut run = ArmRun {
         tokens: Vec::with_capacity(STEPS + 1),
         digests: Vec::with_capacity(STEPS + 1),
@@ -183,6 +264,7 @@ fn arm(
         stats: None,
         tier: tier.clone(),
         seam: None,
+        footprint: None,
     };
     let note = |s: &mut Session<Body38>, run: &mut ArmRun| -> Result<(), GateError> {
         for (_, r) in take_passes(s)? {
@@ -196,7 +278,9 @@ fn arm(
         }
         Ok(())
     };
+    let t0 = Instant::now();
     let out = s.prompt(ids, Want::Logits)?;
+    let prompt_ns = t0.elapsed().as_nanos() as u64;
     let Out::Logits { argmax, row } = out else {
         return Err("a prompt asked for its logits answered an argmax".into());
     };
@@ -204,6 +288,17 @@ fn arm(
     let mut next = argmax;
     run.tokens.push(next);
     note(&mut s, &mut run)?;
+    let drops1 = tier.as_ref().map(|t| t.stats());
+    // The prompt's residue dropped through the tier, so the steps' read
+    // names only what the steps' own readers left.
+    let prompt_pages = match &foot {
+        Some((t, regions)) => {
+            let p = resident(probe, regions)?;
+            drop_all(t, regions)?;
+            p
+        }
+        None => Pages::default(),
+    };
     for _ in 0..STEPS {
         let out = s.step(next, Want::Logits)?;
         if let Out::Logits { row, .. } = out {
@@ -214,6 +309,16 @@ fn arm(
         note(&mut s, &mut run)?;
     }
     run.stats = tier.as_ref().map(|t| t.stats());
+    if let (Some((_, regions)), Some(d0), Some(d1)) = (&foot, drops0, drops1) {
+        run.footprint = Some(Footprint {
+            base,
+            prompt: prompt_pages,
+            steps: resident(probe, regions)?,
+            prompt_drops: d1.drops - d0.drops,
+            prompt_drop_ns: d1.drop_ns - d0.drop_ns,
+            prompt_ns,
+        });
+    }
     run.seam = seam_of(&s, plan.model.layers, plan.model.experts as u32)?;
     if record::nvtier_of(tier.as_deref()).is_some() != room.is_some() {
         return Err(
@@ -248,6 +353,153 @@ fn seam_of(s: &Session<Body38>, layers: usize, experts: u32) -> Result<Option<Se
         }
     }
     Ok(Some(seam))
+}
+
+/// The tier's own drop of every run of `regions` ([`NvTier::drop_layer`]).
+fn drop_all(tier: &NvTier, regions: &[(usize, DropRuns)]) -> Result<(), GateError> {
+    for &(layer, _) in regions {
+        tier.drop_layer(layer)?;
+    }
+    Ok(())
+}
+
+/// The page cache's residency over the runs of `regions`, read with
+/// `mincore` through `probe`'s mapping of each shard (the gate's own open of
+/// the file: a file page's residency is the page cache's, whichever mapping
+/// asks): the pages past [`FOLIO_MAX`] from a run's ends, those nearer, and
+/// the runs' pages.
+fn resident(probe: &Split, regions: &[(usize, DropRuns)]) -> Result<Pages, GateError> {
+    let page = page_bytes().map_err(|e| format!("the page size: {e}"))?;
+    let band = FOLIO_MAX / page;
+    let mut pages = Pages::default();
+    let mut vec = Vec::new();
+    for (layer, rows) in regions {
+        for (shard, runs) in rows {
+            let map = probe
+                .shard(*shard)
+                .ok_or_else(|| format!("layer {layer}: shard {shard} is not in the probe"))?
+                .mapping();
+            for run in runs {
+                let span = usize::try_from(run.start)
+                    .ok()
+                    .zip(usize::try_from(run.end).ok())
+                    .and_then(|(a, b)| map.get(a..b))
+                    .ok_or_else(|| {
+                        format!(
+                            "layer {layer} shard {shard}: the run {run:?} is past the mapping's                              {} B",
+                            map.len()
+                        )
+                    })?;
+                let n = span.len().div_ceil(page as usize);
+                vec.clear();
+                vec.resize(n, 0u8);
+                // SAFETY: `span` lies inside the probe's live read-only
+                // mapping of the shard and starts on a page boundary (the
+                // mapping starts on one, and a drop run is whole pages of
+                // file offsets); `vec` holds one byte for each of its pages.
+                // mincore reads the page tables and the page cache and
+                // writes only `vec`.
+                let rc = unsafe {
+                    libc::mincore(
+                        span.as_ptr().cast_mut().cast(),
+                        span.len(),
+                        vec.as_mut_ptr(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(format!(
+                        "mincore over layer {layer} shard {shard} bytes {run:?}: {}",
+                        std::io::Error::last_os_error()
+                    )
+                    .into());
+                }
+                let n = n as u64;
+                for (i, _) in vec.iter().enumerate().filter(|&(_, &v)| v & 1 != 0) {
+                    let i = i as u64;
+                    if i < band || i + band >= n {
+                        pages.edge += 1;
+                    } else {
+                        pages.interior += 1;
+                    }
+                }
+                pages.total += n;
+            }
+        }
+    }
+    Ok(pages)
+}
+
+/// The drop runs against the probe's own tensor table (`advice` (b) and
+/// (c)): every run of every paged layer lies inside one routed stack of its
+/// layer (a `blk.<l>.` tensor whose name holds `_exps`), so it names no byte
+/// of another tensor, and meets no byte of an id the tier does not serve
+/// (the plan's host segment: an id's bytes are its stack's `experts`-th part,
+/// in id order). The runs checked, and the first breach by name.
+fn drop_advice(
+    probe: &Split,
+    tier: &NvTier,
+    layers: usize,
+    experts: u32,
+) -> Result<(usize, Option<String>), GateError> {
+    let mut checked = 0;
+    for l in (0..layers).filter(|&l| tier.covers(l)) {
+        for (shard, runs) in tier.drop_region(l)? {
+            let g = probe
+                .shard(shard)
+                .ok_or_else(|| format!("layer {l}: shard {shard} is not in the probe"))?;
+            let base = g.mapping().as_ptr() as usize;
+            let spans: Vec<(&str, u64, u64)> = g
+                .iter_tensors()
+                .filter_map(|t| {
+                    let d = g.data(t).ok()?;
+                    let at = (d.as_ptr() as usize - base) as u64;
+                    Some((t.name.as_str(), at, at + d.len() as u64))
+                })
+                .collect();
+            for run in &runs {
+                checked += 1;
+                let Some(&(name, t0, t1)) =
+                    spans.iter().find(|s| s.1 <= run.start && run.start < s.2)
+                else {
+                    return Ok((
+                        checked,
+                        Some(format!(
+                            "layer {l} shard {shard}: the run {run:?} starts in no tensor"
+                        )),
+                    ));
+                };
+                if run.end > t1
+                    || !name.starts_with(&format!("blk.{l}."))
+                    || !name.contains("_exps")
+                {
+                    return Ok((
+                        checked,
+                        Some(format!(
+                            "layer {l}: the run {run:?} is not inside one routed stack of the layer                              ({name}, bytes {t0}..{t1})"
+                        )),
+                    ));
+                }
+                if (t1 - t0) % u64::from(experts) != 0 {
+                    return Err(
+                        format!("{name}: {} B do not cut into {experts} experts", t1 - t0).into(),
+                    );
+                }
+                let per = (t1 - t0) / u64::from(experts);
+                for id in (0..experts).filter(|&id| !tier.serves(l, id)) {
+                    let (a, b) = (t0 + u64::from(id) * per, t0 + u64::from(id + 1) * per);
+                    if a < run.end && run.start < b {
+                        return Ok((
+                            checked,
+                            Some(format!(
+                                "layer {l}: a drop run names a held byte — {run:?} meets expert                                  {id}'s bytes {a}..{b} of {name}"
+                            )),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok((checked, None))
 }
 
 /// The boundaries' reports since the last take.
@@ -300,11 +552,21 @@ fn run() -> Result<(), GateError> {
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
+    let (layers, experts) = (plan.model.layers, plan.model.experts as u32);
     drop(plan);
 
     let ids = prose38(PROMPT)?;
-    let paged = arm(path, &machine, Some(ROOM), residency, host, &ids, audit)?;
-    let ram = arm(path, &machine, None, residency, host, &ids, false)?;
+    let paged = arm(
+        path,
+        &machine,
+        Some(ROOM),
+        residency,
+        host,
+        &ids,
+        audit,
+        &probe,
+    )?;
+    let ram = arm(path, &machine, None, residency, host, &ids, false, &probe)?;
 
     let tokens_eq = paged.tokens == ram.tokens;
     let digests_eq = paged.digests == ram.digests;
@@ -330,19 +592,60 @@ fn run() -> Result<(), GateError> {
         verdict(room)
     );
     pass &= room;
-    // `advice` (the PIN above): the arena's pages and the mapped shards' are disjoint.
+    // `advice` (the PINs above): the arena's pages and the mapped shards'
+    // are disjoint, and every drop run is inside one routed stack of its
+    // layer and clear of every held byte.
     let mapped: Vec<(usize, usize)> = (0..probe.shard_count())
         .filter_map(|i| probe.shard(i))
         .flat_map(|g| g.iter_tensors().filter_map(|t| g.data(t).ok()))
         .map(|d| (d.as_ptr() as usize, d.as_ptr() as usize + d.len()))
         .collect();
-    let advice = !mapped.is_empty() && advice_disjoint(&[tier.range()], &mapped);
+    let arena_clear = !mapped.is_empty() && advice_disjoint(&[tier.range()], &mapped);
+    let (runs, breach) = drop_advice(&probe, tier, layers, experts)?;
+    let advice = arena_clear && runs > 0 && breach.is_none();
     println!(
-        "advice: the arena's range is disjoint from {} mapped tensors: {}",
+        "advice: the arena's range is disjoint from {} mapped tensors {arena_clear}; {runs} drop runs          each inside one routed stack of its layer and clear of every held byte {}: {}",
         mapped.len(),
+        breach.as_deref().unwrap_or("true"),
         verdict(advice)
     );
     pass &= advice;
+    // `footprint` (clause 7): no page of the drop runs past a folio from a
+    // run's ends stays in the page cache once its reader is done.
+    if audit {
+        println!("footprint: off (--audit reads the file through the page cache by design)");
+    } else {
+        let f = paged
+            .footprint
+            .as_ref()
+            .ok_or("the paged arm read no footprint")?;
+        let why = if f.base.interior > 0 {
+            "the runs stay resident after the tier's own drop: another process maps the file"
+        } else if f.prompt.interior > 0 {
+            "the union's pages stay"
+        } else if f.steps.interior > 0 {
+            "a promotion's pages stay"
+        } else {
+            "none stay"
+        };
+        let footprint = f.base.total > 0 && why == "none stay";
+        println!(
+            "footprint: {} pages in the drop runs; resident past {FOLIO_MAX} B of a run's ends {}              after the tier's own drop, {} after the prompt, {} after {STEPS} steps (at the edges {} /              {} / {}); the prompt's drops {} calls, {:.1} ms of its {:.1} ms ({:.2} %); {why}: {}",
+            f.base.total,
+            f.base.interior,
+            f.prompt.interior,
+            f.steps.interior,
+            f.base.edge,
+            f.prompt.edge,
+            f.steps.edge,
+            f.prompt_drops,
+            f.prompt_drop_ns as f64 / 1e6,
+            f.prompt_ns as f64 / 1e6,
+            100.0 * f.prompt_drop_ns as f64 / f.prompt_ns.max(1) as f64,
+            verdict(footprint)
+        );
+        pass &= footprint;
+    }
     if let Some(r) = record::nvtier_of(Some(tier)) {
         r.print();
     }
