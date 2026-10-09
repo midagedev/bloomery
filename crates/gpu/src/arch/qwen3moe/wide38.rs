@@ -91,7 +91,13 @@
 //! together; the serve's union leaves the streamed experts out. The route is
 //! then the layer's reader of the call ([`Gemm38::stream_read`]), which the
 //! next ubatch's pick and the ring's next use of the half copy behind. The
-//! call's placement stays for the decode after it; the stream's does not. A
+//! call's placement stays for the decode after it, unless the call returns to
+//! its start (a decode history before it): then the call's last unit returns
+//! each layer once its host service has run, asked at the next layer's
+//! shadow, whose download wait the call's queued return copies fill
+//! ([`Gemm38::stream_return`]); a split pick there prices an admit's way back
+//! when the lane fell behind ([`runtime::xsplit::ReturnCost`]), and the
+//! call's end issues what is left. The stream's placement never stays. A
 //! token's bits then depend on its ubatch's routing too — which of its
 //! experts the pick moved or the stream sent sums on the card, not the host
 //! — so the numeric class above holds for an unstreamed walk only.
@@ -134,6 +140,7 @@ use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
+use runtime::xsplit::ReturnCost;
 
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
@@ -1836,6 +1843,18 @@ pub(super) struct Stream38 {
     pub(super) card_tail_us_per_pick: f64,
     /// The ubatch the walk runs, from 0, the pick records' group.
     pub(super) ubatch: usize,
+    /// The streaming call returns to its start ([`Gemm38::returns_here`]):
+    /// decided at its begin, where the decode history is read.
+    pub(super) returning: bool,
+    /// The streaming call's end position: the walk of the unit that ends
+    /// there is the call's last.
+    pub(super) call_end: usize,
+    /// The layer of the last unit whose host service ran and whose return the
+    /// walk asks for at the next layer's shadow.
+    pub(super) owed: Option<usize>,
+    /// The call's return runs whole at its end instead of in the walk: the
+    /// twin a gate holds the walk's return to (`Body38::set_return_at_end`).
+    pub(super) return_at_end: bool,
     counts: Vec<u32>,
     pub(super) picks: Vec<(usize, CallPick)>,
     pub(super) end: Option<CallReport>,
@@ -1890,6 +1909,11 @@ impl<'a> Gemm38<'a> {
         let layers = self.p.plans.len();
         leg.begin_walk(1)?;
         sched::walk(o, layers, leg, self)?;
+        // The last layer's return: no front follows it in the walk, so its
+        // copies are the end's.
+        if let Some(l) = self.p.stream.owed.take() {
+            leg.hybrid().call_return(l, gpu.stream())?;
+        }
         leg.end_walk()?;
         if let Some(t) = self.p.x.taps.as_mut() {
             t.walked = Some((self.p.pos0, m));
@@ -1944,6 +1968,7 @@ impl<'a> Gemm38<'a> {
         }
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
+        let ret = self.return_cost(port, l);
         let s = &mut *self.p.stream;
         let mut pick = match (split, k) {
             (true, Some(k)) => port.hybrid().call_pick_walk(
@@ -1952,7 +1977,7 @@ impl<'a> Gemm38<'a> {
                 &mut s.counts,
                 k,
                 s.card_tail_us_per_pick,
-                crate::host::swap::RING_SLOTS as u64,
+                ret,
             )?,
             _ => port
                 .hybrid()
@@ -1972,6 +1997,50 @@ impl<'a> Gemm38<'a> {
             .xstream_layer(stream, key, self.p.m, &s.counts, admitted)?;
         s.layers.push((s.ubatch, x));
         Ok((port.hybrid().xstream_ring(l), land))
+    }
+
+    /// Whether this unit is the last of a call that returns to its start:
+    /// its walk returns each layer once the layer's host service has run.
+    fn returns_here(&self) -> bool {
+        let s = &*self.p.stream;
+        s.on && s.returning && self.p.pos0 + self.p.m == s.call_end
+    }
+
+    /// In the returning call's last unit, at a layer's shadow — its front
+    /// already enqueued, so the card never waits on this — the return of the
+    /// layer whose host service ran last
+    /// ([`crate::host::HostTier::call_return`]), then the call's queued
+    /// return copies pumped while the host waits for this layer's download
+    /// ([`crate::host::HostTier::call_return_pump`]): the copies fill the
+    /// host's idle wait for the card's front, and the layer's pick issues its
+    /// own behind a ring's worth of them at most. Nothing else.
+    fn stream_return(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if !self.returns_here() {
+            return Ok(());
+        }
+        if let Some(l) = self.p.stream.owed.take() {
+            port.hybrid().call_return(l, self.p.c.gpu.stream())?;
+        }
+        let key = port.key(at);
+        port.hybrid().call_return_pump(key)?;
+        Ok(())
+    }
+
+    /// The return cost of an admit at layer `l`'s pick
+    /// ([`runtime::xsplit::ReturnCost`]): exposed in the returning call's
+    /// last unit while the call owes return copies the walk has not issued
+    /// (the lane fell behind the fronts), and at the unit's last card layer,
+    /// whose return no front follows; hidden otherwise.
+    fn return_cost(&self, port: &mut BatchLeg<'a, HostRun>, l: usize) -> ReturnCost {
+        if !self.returns_here() {
+            return ReturnCost::Hidden;
+        }
+        let last = !(l + 1..self.p.plans.len()).any(|j| self.p.card.has(j));
+        if last || port.hybrid().call_returns_owed() > 0 {
+            ReturnCost::Exposed
+        } else {
+            ReturnCost::Hidden
+        }
     }
 
     /// Under host streaming, on a layer with card experts, the layer's last
@@ -2070,6 +2139,7 @@ impl<'a> LayerProgram for Gemm38<'a> {
         let r = if self.p.stream.on {
             self.p
                 .shared(at.layer)
+                .and_then(|()| self.stream_return(port, at))
                 .and_then(|()| self.stream_pick(port, at))
                 .and_then(|(ring, land)| self.p.route_card(at.layer, ring.as_ref(), &land))
                 .and_then(|()| self.stream_read(port, at.layer))
@@ -2100,6 +2170,11 @@ impl<'a> LayerProgram for Gemm38<'a> {
         let r = joined
             .and_then(|()| self.p.shared_add(l, port.hsum()))
             .and_then(|()| port.mark(at, Mark::Back as usize));
+        // The layer's host service has run: in the returning call's last unit
+        // its return is due, asked at the next layer's shadow.
+        if r.is_ok() && self.returns_here() && self.p.card.has(l) {
+            self.p.stream.owed = Some(l);
+        }
         port.part_end(at, enq);
         r
     }

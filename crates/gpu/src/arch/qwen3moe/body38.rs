@@ -1892,6 +1892,21 @@ impl Body38 {
         Ok(())
     }
 
+    /// Whether a returning prompt call ([`super::wide38`]'s module doc) runs
+    /// its whole return at its end instead of in its last unit's walk: the
+    /// twin a gate holds the walk's return to, the same end state slot for
+    /// slot. Off at the load. Gate use. Refused by name while a call streams.
+    pub fn set_return_at_end(&mut self, on: bool) -> Result<(), GpuError> {
+        if self.stream.on {
+            return Err(GpuError::state(
+                "Body38::set_return_at_end",
+                "no prompt call streaming",
+            ));
+        }
+        self.stream.return_at_end = on;
+        Ok(())
+    }
+
     /// The expert stream's rule costs in place of [`XSTREAM_COSTS`]
     /// ([`crate::host::xstream::XStream::set_costs`]). Refused by name before
     /// `split` started the stream and while a call streams.
@@ -3173,18 +3188,22 @@ impl GpuModel<Body38> {
             ));
         }
         self.pass_boundary()?;
+        // A successful call before a decode history ends with each layer
+        // back at the set it started with: the decode has been routing
+        // experts of its own, and the call's picks — the prompt's hottest —
+        // put the pool back where they found it rather than leave the decode
+        // to churn back at the flip cap. Without a history (a fresh server)
+        // the call's placement stays, the gain it was run for. The history
+        // is read once, here: the call keeps no row, so it does not move
+        // until the end, and the walk returns each layer in the call's last
+        // unit on it.
+        let history = self.body(WHAT_P)?.hybrid().call_history();
         let r = self
-            .stream_begin(resolved, tokens.len())
+            .stream_begin(resolved, tokens.len(), history)
             .and_then(|()| self.feed_marked(tokens, resolved, sink));
         // The call's own error first: an end or a keep refused after a
         // failed call is its echo. A failed call's streaming ends with each
-        // layer back at the set it started with. So does a successful one
-        // before a decode history: the decode has been routing experts of
-        // its own, and the call's picks — the prompt's hottest — put the
-        // pool back where they found it rather than leave the decode to
-        // churn back at the flip cap. Without a history (a fresh server) the
-        // call's placement stays, the gain it was run for.
-        let history = self.body(WHAT_P)?.hybrid().call_history();
+        // layer back at the set it started with too.
         let ended = self.stream_end(r.is_ok() && !history);
         let kept = self.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
         let next = r?;
@@ -3204,11 +3223,15 @@ impl GpuModel<Body38> {
     /// routes an expert once at most, so a prompt of fewer ids than the
     /// gate — and every pass, of at most [`PASS_ROWS`] rows — gives no
     /// expert a count its pick would admit, and its walks would only wait
-    /// on each layer's download for nothing. Refused by name: a call
+    /// on each layer's download for nothing. A call that `returns` to its
+    /// start (a decode history) returns each layer in the walk of its last
+    /// unit, the one ending at the call's end position, unless the gate's
+    /// twin is set ([`Body38::set_return_at_end`]). Refused by name: a call
     /// streaming already, and a mode with no machine.
-    fn stream_begin(&mut self, path: Prompt38, n: usize) -> Result<(), GpuError> {
+    fn stream_begin(&mut self, path: Prompt38, n: usize, returns: bool) -> Result<(), GpuError> {
         const _: () = assert!(PASS_ROWS < STREAM_FLOOR as usize);
         const WHAT_B: &str = "qwen4exp prompt streaming";
+        let end = self.pos() as usize + n;
         let (gpu, _, body) = self.body_parts(WHAT_B)?;
         if body.stream.on {
             return Err(GpuError::state(WHAT_B, "no call streaming (stream_end)"));
@@ -3218,6 +3241,9 @@ impl GpuModel<Body38> {
         body.stream.layers.clear();
         body.stream.xend = None;
         body.stream.ubatch = 0;
+        body.stream.owed = None;
+        body.stream.returning = returns && !body.stream.return_at_end;
+        body.stream.call_end = end;
         let mode = body.xstream_mode();
         // The file's own tail rate: the Q4 kind's measured one, none on a
         // kind no record has priced — the walk then balances without it.

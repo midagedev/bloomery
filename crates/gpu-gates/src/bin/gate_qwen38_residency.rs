@@ -76,8 +76,13 @@
 //!   placement — the decode has been routing experts of its own, so the
 //!   call's end puts every layer back at the live set it started from and
 //!   sends the experts it admitted to the host again — while a fresh
-//!   server's call keeps (the `stream` clause's gain) (mutants: the end
-//!   keeps before a history too; the end always restores).
+//!   server's call keeps (the `stream` clause's gain). The call's last unit
+//!   returns each layer in its walk; against the same history with the
+//!   return whole at the call's end (`Body38::set_return_at_end`, the twin)
+//!   it admits and copies back as many, and the prompt's last logits row and
+//!   the first step's after it are the twin's bit for bit (mutants: the end
+//!   keeps before a history too; the end always restores; the walk's return
+//!   asked before the layer's serve, refused by name).
 //! - `split` (the expert stream, `Body38::set_xstream`'s `split`, its rule
 //!   at the gate's [`SPLIT_COSTS`]: a host column dear enough that the
 //!   balance streams nearly every routed host expert the pick leaves, so the
@@ -98,6 +103,15 @@
 //!   reads another expert's weights: the band); the floor in the stream's
 //!   way back dropped is `xstream`'s unit test's (here every routed host
 //!   expert clears the gate's floor).
+//! - `history_split`: the `history` call under `split` at [`SPLIT_COSTS`],
+//!   [`SPLIT_PROMPT`] ids, its return in the walk against the twin's at the
+//!   call's end. The walk's last unit prices an admit of a layer that still
+//!   owes return copies at two copies, so a pick may part from the twin's:
+//!   where every pick is the twin's the logits are the twin's bit for bit,
+//!   where one parts the prompt's last row and the first step's stay within
+//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN); either way the
+//!   call returns in its walk, admits, sends its admits back and leaves every
+//!   live set where the history left it.
 //! - `slots_drafted`: a drafted pass of two slots' verify rows folds each
 //!   slot's accepted rows — slot 0 keeping one of its three rows, slot 1
 //!   two of theirs — so the boundary that ends it reports 3 kept rows as
@@ -143,7 +157,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, XSTREAM_COSTS};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState};
+    use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{
@@ -683,43 +697,217 @@ mod gate {
         Ok(sets)
     }
 
-    /// `history`: a prompt call before a decode history does not keep its
-    /// placement: the decode has been routing experts of its own, so the
-    /// call's end puts every layer back at the live set it started from and
-    /// sends the experts it admitted to the host again, while a fresh
-    /// server's call keeps its placement (the `stream` clause's gain). From
-    /// a clear: a 64-id prompt streaming off, eight greedy steps (the
-    /// history), then the corpus prompt as one call under `admit` (mutants:
-    /// the end keeps before a history too — the restore red here; the end
-    /// always restores — the `stream` clause's fresh gain red).
-    fn history_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
-        let ids = prose_ids("qwen4exp", STREAM_PROMPT)?;
+    /// One `history` run's facts: the call's end record and its picks,
+    /// whether every layer's live set is back where the history left it,
+    /// the prompt's last logits row and the first step's after it.
+    struct HistoryRun {
+        end: CallReport,
+        picks: Vec<(usize, CallPick)>,
+        back: bool,
+        prompt: Vec<f32>,
+        step: Vec<f32>,
+    }
+
+    /// One `history` run from a clear: a 64-id prompt streaming off, eight
+    /// greedy steps (the history), then the first `n` corpus ids as one call
+    /// streaming `mode`, its return in the walk or, `at_end`, whole at the
+    /// call's end (`Body38::set_return_at_end`), then one greedy step.
+    fn history_run(
+        s: &mut Session<Body38>,
+        mode: XMode,
+        n: usize,
+        at_end: bool,
+    ) -> Result<HistoryRun, GateError> {
+        let ids = prose_ids("qwen4exp", n)?;
         let warm = prose_ids("qwen4exp", 64)?;
         s.clear()?;
         take_passes(s)?;
         set_stream(s, XMode::Off)?;
+        s.model_mut()
+            .body_parts(NAME)?
+            .2
+            .set_return_at_end(at_end)?;
         let mut next = s.prompt(&warm, Want::Argmax)?.argmax();
         for _ in 0..8 {
             next = s.step(next, Want::Argmax)?.argmax();
         }
         take_passes(s)?;
         let before = live_sets(s)?;
-        set_stream(s, XMode::Admit)?;
-        s.prompt(&ids, Want::Argmax)?;
-        let (_, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        set_stream(s, mode)?;
+        let out = s.prompt(&ids, Want::Logits)?;
+        let next = out.argmax();
+        let Out::Logits { row, .. } = out else {
+            return Err("the prompt call returned no logits row".into());
+        };
+        let prompt = row.to_vec();
+        let (picks, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        s.model_mut().body_parts(NAME)?.2.take_xstream_records();
         take_passes(s)?;
         set_stream(s, XMode::Off)?;
         let after = live_sets(s)?;
+        let step = match s.step(next, Want::Logits)? {
+            Out::Logits { row, .. } => row.to_vec(),
+            _ => return Err("the step after the call returned no logits row".into()),
+        };
+        take_passes(s)?;
+        s.model_mut().body_parts(NAME)?.2.set_return_at_end(false)?;
         let end = end.ok_or("the prompt opened no call")?;
         record::call_report(&end).print();
-        let back = before == after;
-        let ok = !end.kept && end.restored > 0 && end.admitted > 0 && back;
+        Ok(HistoryRun {
+            end,
+            picks,
+            back: before == after,
+            prompt,
+            step,
+        })
+    }
+
+    /// Whether two rows are equal bit for bit.
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// The largest |diff| between two rows of one length; infinite for two
+    /// lengths.
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() {
+            return f32::INFINITY;
+        }
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// A call's picks as the facts that name what each moved: unit, layer,
+    /// admitted, kept, the admits' and the victims' columns, the counts'
+    /// digest.
+    fn pick_keys(picks: &[(usize, CallPick)]) -> Vec<(usize, usize, usize, usize, u64, u64, u64)> {
+        picks
+            .iter()
+            .map(|(u, p)| {
+                (
+                    *u,
+                    p.layer,
+                    p.admitted,
+                    p.kept,
+                    p.admit_cols,
+                    p.victim_cols,
+                    p.counts,
+                )
+            })
+            .collect()
+    }
+
+    /// `history`: a prompt call before a decode history does not keep its
+    /// placement: the decode has been routing experts of its own, so the
+    /// call's end puts every layer back at the live set it started from and
+    /// sends the experts it admitted to the host again, while a fresh
+    /// server's call keeps its placement (the `stream` clause's gain). The
+    /// call's last unit returns each layer in the walk; the same history
+    /// with the return whole at the call's end (the twin) admits and copies
+    /// back as many, and the prompt's last logits row and the first step's
+    /// after it are the twin's bit for bit — the same picks, the same reads
+    /// and serves in the call, the same end state slot for slot ([`history_run`])
+    /// (mutants: the end keeps before a history too — the restore red here;
+    /// the end always restores — the `stream` clause's fresh gain red; the
+    /// walk's return asked before the layer's serve — refused by name).
+    fn history_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        let walk = history_run(s, XMode::Admit, STREAM_PROMPT, false)?;
+        let twin = history_run(s, XMode::Admit, STREAM_PROMPT, true)?;
+        let (end, back) = (&walk.end, walk.back);
+        let twin_back = twin.back;
+        let walked = end.return_us > 0 && twin.end.return_us == 0;
+        let prompt_same = same_bits(&walk.prompt, &twin.prompt);
+        let step_same = same_bits(&walk.step, &twin.step);
+        let as_twin = end.admitted == twin.end.admitted
+            && end.restored == twin.end.restored
+            && prompt_same
+            && step_same;
+        let ok = !end.kept
+            && end.restored > 0
+            && end.admitted > 0
+            && back
+            && !twin.end.kept
+            && twin_back
+            && walked
+            && as_twin;
         println!(
-            "history: a call after 8 greedy steps: {} experts admitted, the end kept {} and \
-             restored {}, every layer's live set back where the history left it {back}: {}",
+            "history: a call after 8 greedy steps, its return in the walk / at its end: {} / {} \
+             experts admitted, the end kept {} / {} and restored {} / {}, the walk's return time \
+             {} / {} us, every layer's live set back where the history left it {back} / \
+             {twin_back}; the prompt's last logits and the first step's after it bit for bit \
+             the end's {prompt_same} / {step_same}: {}",
             end.admitted,
+            twin.end.admitted,
             end.kept,
+            twin.end.kept,
             end.restored,
+            twin.end.restored,
+            end.return_us,
+            twin.end.return_us,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `history_split`: the `history` call under `split` at the gate's
+    /// [`SPLIT_COSTS`], [`SPLIT_PROMPT`] ids, its return in the walk against
+    /// the twin's at the call's end. The walk's last unit prices an admit
+    /// whose layer still owes return copies at two copies
+    /// (`xsplit::ReturnCost::Exposed`), so its picks may part from the
+    /// twin's; where every pick is the twin's, the logits are the twin's bit
+    /// for bit, and where one parts, the prompt's last logits row and the
+    /// first step's stay within [`GREEDY_MARGIN`] of the twin's (a streamed
+    /// or admitted expert sums its columns in another split). Either way the
+    /// call returns in its walk, admits, sends its admits back and leaves
+    /// every layer's live set where the history left it.
+    fn history_split_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        // `split`'s first setting starts the stream; the gate's costs then.
+        set_stream(s, XMode::Split)?;
+        s.model_mut()
+            .body_parts(NAME)?
+            .2
+            .set_xstream_costs(SPLIT_COSTS)?;
+        set_stream(s, XMode::Off)?;
+        let walk = history_run(s, XMode::Split, SPLIT_PROMPT, false)?;
+        let twin = history_run(s, XMode::Split, SPLIT_PROMPT, true)?;
+        let same_picks = pick_keys(&walk.picks) == pick_keys(&twin.picks);
+        let dprompt = max_diff(&walk.prompt, &twin.prompt);
+        let dstep = max_diff(&walk.step, &twin.step);
+        let bits = same_bits(&walk.prompt, &twin.prompt) && same_bits(&walk.step, &twin.step);
+        let values_ok = if same_picks {
+            bits
+        } else {
+            dprompt < GREEDY_MARGIN && dstep < GREEDY_MARGIN
+        };
+        let ok = !walk.end.kept
+            && !twin.end.kept
+            && walk.end.admitted > 0
+            && walk.end.restored > 0
+            && twin.end.restored > 0
+            && walk.end.return_us > 0
+            && twin.end.return_us == 0
+            && walk.back
+            && twin.back
+            && values_ok;
+        println!(
+            "history_split: a {SPLIT_PROMPT}-id split call after 8 greedy steps, its return in \
+             the walk / at its end: {} / {} experts admitted, restored {} / {}, kept {} / {}, the \
+             walk's return time {} / {} us, every layer's live set back {} / {}; the picks the \
+             twin's {same_picks}, the prompt's last logits and the first step's max|diff| \
+             {dprompt} / {dstep} (bit for bit {bits}; under {GREEDY_MARGIN} where a pick parts) \
+             {values_ok}: {}",
+            walk.end.admitted,
+            twin.end.admitted,
+            walk.end.restored,
+            twin.end.restored,
+            walk.end.kept,
+            twin.end.kept,
+            walk.end.return_us,
+            twin.end.return_us,
+            walk.back,
+            twin.back,
             verdict(ok)
         );
         Ok(ok)
@@ -994,6 +1182,7 @@ mod gate {
         pass &= stream_clause(&mut s)?;
         pass &= history_clause(&mut s)?;
         pass &= split_clause(&mut s)?;
+        pass &= history_split_clause(&mut s)?;
         // The gate's load is done: the card holds one load, and the slots
         // clauses bring their own.
         drop(s);
