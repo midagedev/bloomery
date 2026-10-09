@@ -8,18 +8,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::engine::{Sampler, SamplerFactory, SamplingParams};
+use crate::engine::{Sampler, SamplerFactory, SamplerRefused, SamplingParams};
 
-/// The factory the server uses when none is given.
+/// The factory the server uses when none is given. It takes every parameter
+/// the API lets through, so it refuses none.
 #[must_use]
 pub fn reference_factory() -> SamplerFactory {
-    Arc::new(|p: &SamplingParams| -> Sampler {
+    Arc::new(|p: &SamplingParams| -> Result<Sampler, SamplerRefused> {
         let p = p.clone();
         let mut rng = SplitMix64(p.seed);
         let mut cand: Vec<(u32, f32)> = Vec::new();
-        Box::new(move |logits: &[f32], history: &[u32]| {
+        Ok(Box::new(move |logits: &[f32], history: &[u32]| {
             sample(&p, &mut rng, &mut cand, logits, history)
-        })
+        }))
     })
 }
 
@@ -167,7 +168,8 @@ mod tests {
             seed: 7,
             ..SamplingParams::default()
         };
-        let f = reference_factory();
+        let factory = reference_factory();
+        let f = |p: &SamplingParams| factory(p).expect("the reference refuses none");
         let a: Vec<u32> = {
             let mut s = f(&p);
             (0..32).map(|_| s(&logits, &[])).collect()

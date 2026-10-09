@@ -264,7 +264,10 @@ pub trait Engine: Send {
     /// pass keeps appended to its `out` in position order and what it drafted
     /// set in its `drafted`, as [`Engine::advance`] does for one. Afterwards
     /// the selected slot is unspecified: the server selects before its next
-    /// per-slot call. The default is a select and an `advance` a row.
+    /// per-slot call. The server calls this only with two rows or more (one
+    /// row is an `advance`, which an engine may run another way than a round:
+    /// a width chooser that cuts the window). The default is a select and an
+    /// `advance` a row.
     fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
         for row in rows {
             self.select_slot(row.slot)?;
@@ -765,6 +768,15 @@ impl SamplingParams {
 /// prompt's tail then the generated ids, oldest first.
 pub type Sampler = Box<dyn FnMut(&[f32], &[u32]) -> u32 + Send>;
 
-/// Builds a sampler per request. The real one comes from the sampler crate; the
-/// server ships [`crate::sampling::reference_factory`] so it runs without it.
-pub type SamplerFactory = Arc<dyn Fn(&SamplingParams) -> Sampler + Send + Sync>;
+/// A sampler factory's refusal of a request's sampling parameters, in the
+/// sampler's own words. The request fails with it, a 400, and is never run
+/// with another sampler.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct SamplerRefused(pub String);
+
+/// Builds a sampler per request, or refuses its parameters. The real one comes
+/// from the sampler crate; the server ships [`crate::sampling::reference_factory`]
+/// so it runs without it.
+pub type SamplerFactory =
+    Arc<dyn Fn(&SamplingParams) -> Result<Sampler, SamplerRefused> + Send + Sync>;

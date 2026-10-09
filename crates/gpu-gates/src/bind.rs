@@ -53,8 +53,8 @@ use sampler::{Sampler, SamplerParams};
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
-    PlacementProps, ResidencyReset, SamplerFactory, SamplingParams, Saved, SavedState, StateError,
-    Tokenizer,
+    PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused, SamplingParams, Saved,
+    SavedState, StateError, Tokenizer,
 };
 
 use crate::GateError;
@@ -212,14 +212,17 @@ pub fn sampler_params(p: &SamplingParams) -> SamplerParams {
 }
 
 /// A factory of sampler-crate samplers. A parameter the chain still refuses
-/// (a non-finite value) falls back to the argmax.
+/// (a non-finite value) refuses the request, in the chain's own words.
 pub fn sampler_factory() -> SamplerFactory {
-    Arc::new(|p: &SamplingParams| -> serve::Sampler {
-        match Sampler::new(sampler_params(p)) {
-            Ok(mut s) => Box::new(move |logits: &[f32], recent: &[u32]| s.sample(logits, recent)),
-            Err(_) => Box::new(|logits: &[f32], _: &[u32]| serve::sampling::argmax(logits)),
-        }
-    })
+    Arc::new(
+        |p: &SamplingParams| -> Result<serve::Sampler, SamplerRefused> {
+            let mut s =
+                Sampler::new(sampler_params(p)).map_err(|e| SamplerRefused(e.to_string()))?;
+            Ok(Box::new(move |logits: &[f32], recent: &[u32]| {
+                s.sample(logits, recent)
+            }))
+        },
+    )
 }
 
 /// The class toktape files a placement role's bytes under: the buckets of its
@@ -2226,6 +2229,33 @@ mod tests {
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
+
+    /// The factory's sampler is the sampler crate's chain over the request's
+    /// parameters, and a parameter the chain refuses (a non-finite
+    /// temperature) is the request's refusal in the chain's own words: no
+    /// sampler that draws something else stands in for it.
+    #[test]
+    fn the_sampler_factory_refuses_what_the_chain_refuses() {
+        use serve::SamplingParams;
+        let factory = super::sampler_factory();
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            repeat_penalty: 1.0,
+            ..SamplingParams::default()
+        };
+        let mut draw = factory(&greedy).unwrap_or_else(|e| panic!("refused: {e}"));
+        assert_eq!(draw(&[0.0, 3.0, 1.0], &[]), 1, "the chain's argmax");
+        let Err(refused) = factory(&SamplingParams {
+            temperature: f32::NAN,
+            ..greedy
+        }) else {
+            panic!("a NaN temperature built a sampler");
+        };
+        assert!(
+            refused.0.contains("temperature") && refused.0.contains("a finite number"),
+            "{refused}"
+        );
+    }
 
     /// A link to a thread that answers every `Next` as the engine thread does:
     /// it fills the lent row and hands it back with the argmax. A

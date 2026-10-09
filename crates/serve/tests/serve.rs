@@ -1703,11 +1703,28 @@ fn hw_qwen3_template_renders_as_jinja2() {
     }
 }
 
+/// `body` with each tool call's `arguments` that is a JSON string parsed to the
+/// object it encodes: the body a template that walks `arguments` as an object
+/// renders, as the server hands it to one.
+fn arguments_parsed(body: &Value) -> Value {
+    let mut body = body.clone();
+    for message in body["messages"].as_array_mut().expect("messages") {
+        for call in message["tool_calls"].as_array_mut().into_iter().flatten() {
+            let text = call["function"]["arguments"].as_str().map(str::to_owned);
+            if let Some(text) = text {
+                call["function"]["arguments"] = serde_json::from_str(&text).expect("JSON");
+            }
+        }
+    }
+    body
+}
+
 /// GLM-5.3-Flash's chat template renders as jinja2 does: every case of the
 /// fixture through `/apply-template` equals its reference render byte for
-/// byte, and the case jinja2 refuses (tool-call `arguments` given as a JSON
-/// string, which the template walks with `.items()`) is refused by name. The
-/// cases reach the template's twelve macros (called in output, in `+`, in
+/// byte. The case jinja2 refuses (tool-call `arguments` given as a JSON
+/// string, which the template walks with `.items()`) renders as the same body
+/// with the string parsed does, as llama-server hands such a template the
+/// object. The cases reach the template's twelve macros (called in output, in `+`, in
 /// `==` and as conditions), `break` in three loops, `| capitalize` on the
 /// reasoning effort, `tojson(ensure_ascii=False)`, `clear_thinking`, and the
 /// tool-result reordering by call id.
@@ -1725,12 +1742,23 @@ fn hw_glm5_template_renders_as_jinja2() {
     for case in cases {
         let r = post(addr, "/apply-template", &case["body"]);
         if case["error"].is_string() {
-            assert_eq!(r.status, 500, "{}: {}", case["name"], r.body);
-            let message = r.json()["error"]["message"].clone();
-            assert!(
-                message.as_str().is_some_and(|m| m.contains("items()")),
-                "{}: {message} does not name items()",
+            // PIN(2026-10-09): a string `arguments` is parsed for a template that walks it, no longer refused by name.
+            assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+            let parsed = post(addr, "/apply-template", &arguments_parsed(&case["body"]));
+            assert_eq!(parsed.status, 200, "{}: {}", case["name"], parsed.body);
+            assert_eq!(
+                r.json()["prompt"],
+                parsed.json()["prompt"],
+                "{}",
                 case["name"]
+            );
+            assert!(
+                r.json()["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("get_time")),
+                "{}: {}",
+                case["name"],
+                r.body
             );
             continue;
         }
@@ -1740,9 +1768,10 @@ fn hw_glm5_template_renders_as_jinja2() {
 }
 
 /// Qwen3.8's chat template renders as jinja2 does: every case of the fixture
-/// through `/apply-template` equals its reference render byte for byte, and
-/// the case the template refuses (tool-call `arguments` given as a JSON
-/// string) is refused by name. The cases reach `reasoning_effort|default`
+/// through `/apply-template` equals its reference render byte for byte. The
+/// case the template refuses (tool-call `arguments` given as a JSON string)
+/// renders as the same body with the string parsed does, as llama-server hands
+/// such a template the object. The cases reach `reasoning_effort|default`
 /// against a tuple, the reasoning effort's system turn, and the tool calls.
 #[test]
 #[ignore = "gate: just gate-serve"]
@@ -1758,14 +1787,23 @@ fn hw_qwen38_template_renders_as_jinja2() {
     for case in cases {
         let r = post(addr, "/apply-template", &case["body"]);
         if case["error"].is_string() {
-            assert_eq!(r.status, 500, "{}: {}", case["name"], r.body);
-            let message = r.json()["error"]["message"].clone();
-            assert!(
-                message
-                    .as_str()
-                    .is_some_and(|m| m.contains("passed as a JSON string")),
-                "{}: {message} does not name the JSON string",
+            // PIN(2026-10-09): a string `arguments` is parsed for a template that walks it, no longer refused by name.
+            assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+            let parsed = post(addr, "/apply-template", &arguments_parsed(&case["body"]));
+            assert_eq!(parsed.status, 200, "{}: {}", case["name"], parsed.body);
+            assert_eq!(
+                r.json()["prompt"],
+                parsed.json()["prompt"],
+                "{}",
                 case["name"]
+            );
+            assert!(
+                r.json()["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("get_time")),
+                "{}: {}",
+                case["name"],
+                r.body
             );
             continue;
         }
