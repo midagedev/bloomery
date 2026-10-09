@@ -461,9 +461,11 @@ mac-disk *ARGS:
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 # The prebuilt Linux release (tools/release/build.sh's header: the checks it runs on the binaries before it packs):
 # built on the box from a committed tree, with this commit as the binaries' --version. The tarball lands in the box
-# remote dir's target/release-dist/.
+# remote dir's target/release-dist/. Before the box is touched, tools/release/carry.sh refuses a commit that lacks a
+# fix tools/release/carry.tsv lists (here, where .git is).
 release-build VERSION:
     test -z "$(git status --porcelain --untracked-files=no)" || { echo "release-build: the tree has uncommitted changes" >&2; exit 1; }
+    ./tools/release/carry.sh
     ./tools/box.sh "bash tools/release/build.sh {{VERSION}} $(git rev-parse --short=12 HEAD)"
 
 build-decode:
