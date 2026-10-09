@@ -295,7 +295,9 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{CARD38, Lever38, checkpoint_bytes, residency38};
+use bloomery_gpu_gates::residency38::{
+    CARD38, CHECKPOINTS_RESERVE, Lever38, checkpoint_bytes, checkpoints_beside, residency38,
+};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
     Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
@@ -371,12 +373,6 @@ const MESSAGE_START: &str = "<|im_start|>";
 /// ([`SlotDrafts::turn_off`]).
 const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
                              and it holds no rows at the kept position";
-
-/// The host reserve of every resident sequence's checkpoints
-/// ([`Place38::machine`]), under the name `q3place::CHECKPOINTS_RESERVE`
-/// (`shared/qwen3moe_place.rs`) gives the same reserve on the qwen3 seat,
-/// whose module this seat does not include.
-const CHECKPOINTS_RESERVE: &str = "checkpoints";
 
 /// The reply the break-even weighs ([`Q38::draft_keep`]) when a request
 /// bounds nothing, and the most it weighs: the mean greedy reply of the
@@ -741,12 +737,13 @@ impl Plans<'_> {
     /// records unprinted), and the arena itself
     /// (`HostTotals::nvme_arena_bytes`, 0 without one) for the `cache`
     /// line's `tier` term — [`CacheRam::of_tier`] counts it once, inside
-    /// the need.
+    /// the need — and the checkpoint bytes beside the need
+    /// ([`checkpoints_beside`]: none, the machine reserving every slot's).
     fn host(
         &self,
         ctx: usize,
         set: Option<(Residency, &str)>,
-    ) -> Result<(u64, u64, u64), GateError> {
+    ) -> Result<(u64, u64, u64, u64), GateError> {
         let ub = ubatch_for(ctx)?;
         let c = u64::try_from(ctx)?;
         let machine = self.place.machine(
@@ -789,6 +786,7 @@ impl Plans<'_> {
             HostNeed::of(&plan, 0).bytes(),
             pool,
             plan.host.nvme_arena_bytes,
+            checkpoints_beside(&machine),
         ))
     }
 }
@@ -1458,8 +1456,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     refuse_mtp_levers(&draft_off)?;
-    let (need, pool, arena) = host;
-    let cache = CacheRam::of_tier(a.cache_ram, need, pool, arena)?;
+    let (need, pool, arena, beside) = host;
+    let cache = CacheRam::of_tier(a.cache_ram, need, pool, arena, beside)?;
     let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();
     eprintln!(

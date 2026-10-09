@@ -193,8 +193,9 @@ impl Seqs {
 /// ([`laid`]): each one's stores that no position moves.
 pub const SLOTS_RESERVE: &str = "resident slots";
 
-/// The host reserve of a load's sequences' checkpoints ([`laid`]).
-pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
+/// The host reserve of a load's sequences' checkpoints ([`laid`]): the
+/// lib's name, which `residency38::checkpoints_beside` reads.
+pub use bloomery_gpu_gates::residency38::CHECKPOINTS_RESERVE;
 
 /// The host bytes the checkpoints of `slots` sequences pin at most: each
 /// sequence's own pinned slots, made as its prompt calls take points, up to
