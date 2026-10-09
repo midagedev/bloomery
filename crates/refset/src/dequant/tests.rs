@@ -11,12 +11,12 @@ const MODEL: &str = "/models/small/M.gguf";
 const PIN: &str = "dequant_ref e265fd2f62e16c4f8c5ebc5d28705f41 \
                    libggml.so 75ce969e36e0fd4d520b5086a16c8b57";
 
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
-fn synthetic() -> String {
-    SYNTHETIC.to_string()
+fn synthetic() -> Result<String, RefError> {
+    Ok(SYNTHETIC.to_string())
 }
 
 static FAMILY: Family = Family {
