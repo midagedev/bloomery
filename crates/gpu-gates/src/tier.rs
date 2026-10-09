@@ -30,7 +30,9 @@
 //! [`FIXTURE_ORACLE`] line) and defers the other three, each deferral a
 //! [`DEFERRED`] line; the batch runner (`tools/gate-batch.sh`) counts the
 //! deferral lines. A clause with no tag in the fixture tier is a named error,
-//! never a clause that quietly ran or quietly did not.
+//! never a clause that quietly ran or quietly did not. A gate that declares
+//! fixture-oracle clauses closes with [`expect_fixture_oracle`], which holds
+//! the count its tier decided to the count the gate declares.
 
 use std::fmt::{self, Debug};
 use std::path::{Path, PathBuf};
@@ -320,11 +322,13 @@ pub fn fixture_oracle_line(clause: &str) -> String {
 }
 
 /// How many clauses were decided to run, to be left to the real tier and to
-/// be left to the fixture tier.
+/// be left to the fixture tier, and how many of those that ran are
+/// [`Tag::FixtureOracle`] clauses.
 struct Tally {
     ran: AtomicUsize,
     left_to_real: AtomicUsize,
     left_to_fixture: AtomicUsize,
+    fixture_oracle_ran: AtomicUsize,
 }
 
 impl Tally {
@@ -333,6 +337,7 @@ impl Tally {
             ran: AtomicUsize::new(0),
             left_to_real: AtomicUsize::new(0),
             left_to_fixture: AtomicUsize::new(0),
+            fixture_oracle_ran: AtomicUsize::new(0),
         }
     }
 
@@ -343,6 +348,20 @@ impl Tally {
             Decision::FixtureOnly => &self.left_to_fixture,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Tally::record`] of the decision on a clause that declares `tag`; a fixture-oracle clause
+    /// that runs is counted in its own term as well.
+    fn record_clause(&self, decision: Decision, tag: Tag) {
+        self.record(decision);
+        if decision == Decision::Run && tag == Tag::FixtureOracle {
+            self.fixture_oracle_ran.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The fixture-oracle clauses decided to run.
+    fn fixture_oracle_ran(&self) -> usize {
+        self.fixture_oracle_ran.load(Ordering::Relaxed)
     }
 
     /// `(ran, left to the real tier, left to the fixture tier)`.
@@ -389,7 +408,7 @@ fn run_clause_in(
     if let Some(line) = decision.line(name, Some(tag)) {
         writeln!(out, "{line}")?;
     }
-    tally.record(decision);
+    tally.record_clause(decision, tag);
     Ok(decision == Decision::Run)
 }
 
@@ -647,6 +666,47 @@ pub fn tally() -> (usize, usize) {
 #[must_use]
 pub fn fixture_only() -> usize {
     TALLY.counts().2
+}
+
+/// The check that every [`Tag::FixtureOracle`] clause a gate declares was decided: `declared` is
+/// the count the gate states beside its clauses. In the fixture tier it is held equal to the
+/// fixture-oracle clauses that ran (their [`FIXTURE_ORACLE`] lines), in the real tier to the
+/// clauses left to the fixture tier ([`fixture_only`], the [`FIXTURE_ONLY`] lines), so a clause
+/// that did not run, or one the gate does not declare, ends the gate by name instead of passing
+/// as one clause fewer or more. Equal counts print nothing; the gate prints its [`tally_line`]
+/// as it does without the check.
+///
+/// # Errors
+/// A count that differs from `declared`, naming the gate and both counts; a `BLOOMERY_TIER` that
+/// is neither tier.
+pub fn expect_fixture_oracle(gate: &str, declared: usize) -> Result<(), GateError> {
+    expect_fixture_oracle_in(Tier::from_env()?, gate, declared, &TALLY)
+}
+
+/// [`expect_fixture_oracle`] of its inputs: the tier, the gate's name, its declared count and the
+/// tally the decisions were counted in.
+fn expect_fixture_oracle_in(
+    tier: Tier,
+    gate: &str,
+    declared: usize,
+    tally: &Tally,
+) -> Result<(), GateError> {
+    let (counted, which) = match tier {
+        Tier::Fixture => (tally.fixture_oracle_ran(), "ran in the fixture tier"),
+        Tier::Real => (tally.counts().2, "left to the fixture tier"),
+    };
+    if counted == declared {
+        return Ok(());
+    }
+    let cause = if counted < declared {
+        "a clause did not run"
+    } else {
+        "a clause is not declared"
+    };
+    Err(format!(
+        "{gate}: {counted} fixture-oracle clauses {which}, the gate declares {declared} — {cause}"
+    )
+    .into())
 }
 
 /// The gate's closing line of the tally: `clauses: N ran, M left to the real tier`, and
@@ -1006,6 +1066,111 @@ mod tests {
             tally_text(3, 2, 2),
             "clauses: 3 ran, 2 left to the real tier, 2 left to the fixture tier"
         );
+    }
+
+    /// A tally of the clauses `tier` decides, one per tag, each through a gate's call.
+    fn tally_of(tier: Tier, tags: &[Tag]) -> Tally {
+        let (tally, mut out) = (Tally::new(), Vec::new());
+        for (i, &tag) in tags.iter().enumerate() {
+            run_clause_in(tier, &format!("g: clause {i}"), tag, &tally, &mut out)
+                .expect("a tagged clause");
+        }
+        tally
+    }
+
+    /// The error text of the check, for a count that differs.
+    fn mismatch(tier: Tier, declared: usize, tally: &Tally) -> String {
+        expect_fixture_oracle_in(tier, "gate_x", declared, tally)
+            .expect_err("a count that differs from the declared one")
+            .to_string()
+    }
+
+    /// The fixture tier counts the fixture-oracle clauses that ran, and not the other clauses that
+    /// ran (3 fixture-oracle and 2 self-consistency runs make `ran` 5 and the fixture-oracle term
+    /// 3; the one oracle deferral is `left_to_real` 1). The declared count equal is `Ok`; one more
+    /// is a clause that did not run, one fewer a clause the gate does not declare, each naming the
+    /// gate, both counts and the tier. The same tally read as the real tier's holds no clause left
+    /// to the fixture tier.
+    /// Mutant: every `Run` counted in the fixture-oracle term (`Ok` at 3 reads 5), the tier's
+    /// terms swapped, or the two causes swapped.
+    #[test]
+    fn the_fixture_tier_holds_its_fixture_oracle_runs_to_the_declared_count() {
+        let tally = tally_of(
+            Tier::Fixture,
+            &[
+                Tag::FixtureOracle,
+                Tag::FixtureOracle,
+                Tag::FixtureOracle,
+                Tag::SelfConsistency,
+                Tag::SelfConsistency,
+                Tag::Oracle,
+            ],
+        );
+        assert_eq!(
+            expect_fixture_oracle_in(Tier::Fixture, "gate_x", 3, &tally).map_err(|e| e.to_string()),
+            Ok(())
+        );
+        assert_eq!(tally.counts(), (5, 1, 0));
+        assert_eq!(tally.fixture_oracle_ran(), 3);
+        assert_eq!(
+            mismatch(Tier::Fixture, 4, &tally),
+            "gate_x: 3 fixture-oracle clauses ran in the fixture tier, the gate declares 4 \
+             — a clause did not run"
+        );
+        assert_eq!(
+            mismatch(Tier::Fixture, 2, &tally),
+            "gate_x: 3 fixture-oracle clauses ran in the fixture tier, the gate declares 2 \
+             — a clause is not declared"
+        );
+        assert!(expect_fixture_oracle_in(Tier::Real, "gate_x", 0, &tally).is_ok());
+        assert_eq!(
+            mismatch(Tier::Real, 3, &tally),
+            "gate_x: 0 fixture-oracle clauses left to the fixture tier, the gate declares 3 \
+             — a clause did not run"
+        );
+    }
+
+    /// The real tier counts the clauses left to the fixture tier: 2 fixture-oracle clauses are
+    /// decided `FixtureOnly`, and the oracle and self-consistency clauses that run beside them
+    /// are not counted (`ran` 2, the fixture-oracle term 0). Declared 2 is `Ok`; 3 is a clause that
+    /// did not run, 1 a clause the gate does not declare. The same tally read as the fixture
+    /// tier's holds no fixture-oracle run, and a gate that declares none passes on a tally with none.
+    /// Mutant: the real tier reading the fixture-oracle term, or `FixtureOnly` not counted.
+    #[test]
+    fn the_real_tier_holds_its_fixture_only_clauses_to_the_declared_count() {
+        let tally = tally_of(
+            Tier::Real,
+            &[
+                Tag::FixtureOracle,
+                Tag::FixtureOracle,
+                Tag::Oracle,
+                Tag::SelfConsistency,
+            ],
+        );
+        assert_eq!(tally.counts(), (2, 0, 2));
+        assert_eq!(tally.fixture_oracle_ran(), 0);
+        assert_eq!(
+            expect_fixture_oracle_in(Tier::Real, "gate_x", 2, &tally).map_err(|e| e.to_string()),
+            Ok(())
+        );
+        assert_eq!(
+            mismatch(Tier::Real, 3, &tally),
+            "gate_x: 2 fixture-oracle clauses left to the fixture tier, the gate declares 3 \
+             — a clause did not run"
+        );
+        assert_eq!(
+            mismatch(Tier::Real, 1, &tally),
+            "gate_x: 2 fixture-oracle clauses left to the fixture tier, the gate declares 1 \
+             — a clause is not declared"
+        );
+        assert_eq!(
+            mismatch(Tier::Fixture, 2, &tally),
+            "gate_x: 0 fixture-oracle clauses ran in the fixture tier, the gate declares 2 \
+             — a clause did not run"
+        );
+        for tier in [Tier::Real, Tier::Fixture] {
+            assert!(expect_fixture_oracle_in(tier, "gate_x", 0, &Tally::new()).is_ok());
+        }
     }
 
     /// A clause with no tag in the fixture tier is an error that names the
