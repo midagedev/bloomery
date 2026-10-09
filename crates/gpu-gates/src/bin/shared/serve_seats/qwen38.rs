@@ -1300,15 +1300,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // the count was the default's); beside an expert tier card each slot
     // steps alone ([`Place38::tiered`], the rounds' own rule below), and the
     // slots stay.
+    let paged_at = |arena: u64, slots: usize, mtp: bool| bloomery_levers::PagedAt {
+        arena,
+        slots,
+        slots_by: (from == "flag").then_some(bloomery_levers::SlotsBy::Parallel),
+        together: !a.place.tiered(),
+        draft: mtp,
+        draft_set: levers.draft().is_some(),
+    };
     let paged = |arena: u64, slots: usize, mtp: bool| {
-        bloomery_levers::paged_columns(&bloomery_levers::PagedAt {
-            arena,
-            slots,
-            slots_by: (from == "flag").then_some(bloomery_levers::SlotsBy::Parallel),
-            together: !a.place.tiered(),
-            draft: mtp,
-            draft_set: levers.draft().is_some(),
-        })
+        bloomery_levers::paged_columns(&paged_at(arena, slots, mtp))
     };
     // The draft a one-column load runs without names the paged rule when
     // the draft was asked — on, or off only by its yield to the context on
@@ -1363,8 +1364,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // ([`floor_fallback`]) falls to one slot, and no draft, where that plan
     // pages. The one slot is the room's, not a column's, so it holds beside
     // a tier card too, where each slot steps alone and the column rule keeps
-    // them: the rule is asked of the one-slot plan the fallback loads, for
-    // its draft alone (a set one is refused by name).
+    // them (`bloomery_levers::paged_floor`; a set draft is refused by name).
     let floor = if from == "default" && slots > 1 {
         let asked = Plans {
             inputs: &inputs,
@@ -1379,12 +1379,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         None
     };
     let (slots, from, mtp, head, draft_off) = match floor {
-        Some(arena) => {
-            paged(arena, 1, mtp)?;
-            mtp_inputs = None;
-            let (from, draft_off) = one_column(arena, (slots, 1), mtp, draft_off, true);
-            (1, from, false, None, draft_off)
-        }
+        Some(arena) => match bloomery_levers::paged_floor(&paged_at(arena, slots, mtp))? {
+            Paged::AsAsked => (slots, from, mtp, head, draft_off),
+            Paged::OneColumn { slots: served } => {
+                mtp_inputs = None;
+                let (from, draft_off) = one_column(arena, (slots, served), mtp, draft_off, true);
+                (served, from, false, None, draft_off)
+            }
+        },
         None => (slots, from, mtp, head, draft_off),
     };
     let drafted = Plans {

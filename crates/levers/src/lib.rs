@@ -1807,6 +1807,27 @@ pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
     })
 }
 
+/// The rule asked of a default slot count whose plan the host room leaves
+/// under the NVMe tier's floor, where the one-slot plan pages: that plan
+/// serves one slot, and its draft is [`paged_columns`]'s on it. The one slot
+/// is the room's, not a column's, so it holds where the slots step alone too
+/// ([`PagedAt::together`] is not read). With no arena the asked plan stands,
+/// for the floor's own refusal to name.
+///
+/// # Errors
+/// [`PagedRefused`] for a set draft, as [`paged_columns`] names it.
+pub fn paged_floor(at: &PagedAt) -> Result<Paged, PagedRefused> {
+    if at.arena == 0 {
+        return Ok(Paged::AsAsked);
+    }
+    paged_columns(&PagedAt {
+        slots: 1,
+        slots_by: None,
+        ..*at
+    })?;
+    Ok(Paged::OneColumn { slots: 1 })
+}
+
 /// The draft a one-column load ([`Paged::OneColumn`]) runs without, as its
 /// `load draft=off` record names it, and whether it was asked: a draft that
 /// ran (`drafts`), or that only its yield to the context turned off — a
