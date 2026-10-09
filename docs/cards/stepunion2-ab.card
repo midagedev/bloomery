@@ -1,0 +1,94 @@
+# Round stepunion2 (R1 of the 0.2.9 unitier plan), the F6 A/B: AGENTS.md says a round that touches the dispatch path
+# ends with a same-lease A/B. This tree changes serve_cols' callee (crates/gpu/src/host/step.rs:1166):
+# HostExperts::experts_step_union_into. That callee ensures a call's distinct NVMe-tier ids and reads them from the
+# arena's slots. The base (8f5001a6) reads them through the model file's mapping.
+# Shape: Qwen3.8-Flash-Next (qwen4exp, UD-Q4_K_XL), the A6000, plan a, BLOOMERY_HOST_ROOM=27G (the paged plan
+# gate_nvtier pins). Two slots in one plain pass (BLOOMERY_GEN_SLOTS=2, prose 512 a slot); the draft off; residency
+# and host streaming unset (both off on a paged plan, the unset rule's paged answer).
+# What this measures: R1's reader cost on a shape that the 0.2.8 serve (paged_columns) and the CLI after paged2
+# (bee691d1) refuse — a two-slot plain pass on a paged plan — not a serving path. So it runs on the measuring tree
+# bloomery-su2ab (branch su2ab: R1 8b71a6ad + binslots, on 8f5001a6), before R1's rebase onto the train; R1's
+# landing evidence is its gates on the rebased train.
+#
+# [derived] Per tier id per pass, the arena slot read against the mapping read:
+#   hit:  both arms read DRAM. That is the same bytes and the same union compute (bit for bit, gate_nvtier
+#         clause 8), at W = 23.6 us an expert slot on this host ([nvtier] report: rig-log 09-30#q38res-hit). 0.
+#   miss, the arm: ensure's O_DIRECT fill, which the pool splits over the call's misses, before the compute.
+#         1.118 ms a filled id is the mean of measured fill wall per id:
+#         fill_ns 9514369857 / fills 8508, from the nvtier record of pagedrop w3's clean gate_nvtier run (the
+#         one-column paged arm, about 1.8 misses a layer a call).
+#         At m misses a call, the wall per id falls toward 3.13 MB / 6.12 GB/s = 0.51 ms (rig-log 09-29#odmax).
+#   miss, the base: a page fault through the mapping at about 1.33 GB/s (rig-log 09-23), 2.35 ms an expert on
+#         one faulting thread. Only on an id's first touch: the box's page cache keeps every page the base's
+#         step union reads (the step port drops none), however many ids it reads.
+#   So the box gives the base an unbounded RAM tier, the page cache. The arm is bounded by its arena (23.5 GB at
+#   this room), and an id the LRU let go is filled again.
+# Per pass (layer-pass = one paged layer of one pass):
+#   - The base's pass, warm, is 29..36 ms:
+#     - the two-row plain pass is 19.3..26.4 ms (slots-qwen38-ab.card: S1 + its sum);
+#     - residency off adds the host slots the card no longer holds: card hit 0.198 against 0.715 ([nvtier] report),
+#       12.8 against 4.6 host slots a layer-pass, so 8.2 x 23.6 us x 48 = +9.3 ms when the host leg passes the
+#       card's shadow.
+#   - The arm's fills: m = 5..10 misses a layer-pass (the one-column arm's 1.8 at its 2.3 host slots, scaled to
+#     12.8 host slots at a miss share of 0.4..0.75 in a cold window). That is m x 0.51..1.12 ms x 48 layers =
+#     123..538 ms on the chain: the host leg waits for its fills and the card waits for the host.
+# Effect: arm/base = 29/(29+538) .. 36/(36+123) = 0.051..0.226, so -95..-77 %.
+# The term the derivation cannot fix is m, the arena's misses a layer-pass in the measured window. Before the
+# sitting, read it from the clean failfirst run: gate_nvtier's stepunion line prints misses and fills over its
+# 24 two-column passes (functional, not admissible as a rate), and its tier census lines print them a token.
+# Narrow the band from it.
+#
+# What the band says: on this box, the arena reader costs the fills that a bounded RAM tier pays and an unbounded
+# page cache does not. On a small host the base's page cache is the swap the 0.2.8 stopgap
+# (bloomery_levers::paged_columns) blocks, and the swap is the mechanism this round removes. So this A/B prices the
+# change on a host with RAM to spare. It is not the landing verdict for small hosts.
+#   - That verdict is the sihyung p2 re-run at --parallel 2 (design Q15: pswpout about 0 across two queued streams)
+#     or a MemoryMax-scoped box run (design Q13, the user's approval).
+#   - A plan that pages nothing reads no tier id. There the change is one Option check a union call: 0 per the
+#     change-class table, no A/B.
+#
+# Runner (the lead; full output to a file first). The base is 8f5001a6 in the worktree bloomery-su2ab-base, built
+# into its own remote dir with the arm's features (the depth recipe builds the arm's the same way):
+#   cd /Users/hckim/repo/bloomery-su2ab-base && BLOOMERY_REMOTE='~/repo/bloomery-su2ab-base' BLOOMERY_MODEL=qwen4exp \
+#     tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe'
+# then, from the measuring tree:
+#   cd /Users/hckim/repo/bloomery-su2ab && BLOOMERY_REMOTE='~/repo/bloomery-su2ab' \
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/stepunion2-ab.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DRAFT=off' \
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_AB_WARMUP=1 just depth-gpu-qwen4exp \
+#     bin:/root/repo/bloomery-su2ab-base/target/release/generate_qwen3moe:prose:512@BLOOMERY_GEN_SLOTS=2,BLOOMERY_HOST_ROOM=27G \
+#     prose:512@BLOOMERY_GEN_SLOTS=2,BLOOMERY_HOST_ROOM=27G > <log> 2>&1
+# The base comes first, so the one discarded warm-up run is the base's. Every measured base row then reads a warm
+# page cache, which is the box regime the band assumes.
+# The runner is this tree's (binslots: bin: aggregate arms and `ratio slots bin d=`). The verdict reads that line's
+#   mean:
+#     ratio slots bin d=512  ours@prose@<list>/bin:<tree>@prose@<list>  mean ...
+#   Ours is the changed arm, so the band -95..-77 % is a mean of 0.05..0.23 [derived].
+# Wall [derived]: 4 rounds x 2 loads + the warm-up, 9 Qwen3.8 processes. The paged plan's
+# 2 x 512 prompt and its 96 passes take 0.5..1.5 min a process at the band's pass times, so 5..14 min in all.
+kind: ab
+question: on this box, does the step port's union reading the NVMe tier's ids from the arena cost a two-slot plain
+  decode on the paged plan the arena's fills (-95..-77 %) against the base reading them through the box's page
+  cache?
+term: tok/s(aggregate) @ n=96, two slots in one plain pass, prose 512 a slot (the corpus's first 1,024 ids), ctx
+  3072, A6000, plan a, BLOOMERY_HOST_ROOM=27G (paged plan, arena 23.5 GB), residency and host streaming unset (off on
+  a paged plan), BLOOMERY_DRAFT=off; this tree's generate_qwen3moe against 8f5001a6's, paired by round
+unit: %
+predict: -95..-77
+rounds: 4
+sd: 2.6 % rig-log 09-30#q38seed-ab, Qwen3.8's paired decode scatter over 4 rounds (slots-qwen38-ab.card); the paged
+  plan's fills scatter more, which the band's width already exceeds
+condition: one lease, both builds with their Cargo.lock current, the base arm first and its warm-up discarded. The
+  base's measured rows then read a warm page cache: every row's majflt shows the base near 0 and the arm's misses
+  as O_DIRECT reads, not faults. No [cpu-busy], [other-busy] or [cold] row on the arm the band names. Each row's
+  echoed plan line names a paged plan with an arena, and its residency word is off. Both arms feed the same ids.
+  Not checked by the runner: the arm's nvtier record after each run (misses, fills, fill_ns), read by hand against
+  the m the band assumes.
+decide-in: write the row with its conditions as the arena reader's cost on a host with RAM to spare. Land R1 on its
+  gates, and keep the served paged plan at one column (paged_columns) until the sihyung p2 re-run or a MemoryMax
+  box run shows the small host's verdict. Price R2's exclusive tiers and Q8's prefetch against the measured m
+decide-below: the arm pays more than its fills. Read its nvtier record's fill_ns per fill against 0.51..1.12 ms,
+  and the census lines' dispatch wait (pool dispatch_wait_ns): a fill that contends with the chain for the pool's
+  dispatch lock is the next term to split. No serving change before that split
+decide-above: the arena's misses are fewer, or its fills cheaper, than the band assumes, or the base's warm page
+  cache did not hold. Re-derive m from the arm's nvtier record and the base's majflt column, then re-band before any
+  claim
