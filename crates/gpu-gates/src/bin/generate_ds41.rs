@@ -29,7 +29,8 @@
 //! name a lever set outside them and a `BLOOMERY_*` name no registry row
 //! names; `--levers` prints them with this process's values and exits.
 //! Every line the binary writes is a record of a kind
-//! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
+//! `bloomery_gpu_gates::record` declares, but the `arms in order` line of an
+//! `--arm` list (below), plain text on stderr; `--records-schema` prints those
 //! kinds (fields, types, units) and exits. Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
@@ -181,7 +182,10 @@
 //! slack of the load's own reading — before the arm's `arm` record, so
 //! `--arm-sync`'s wait stays where it was. The since-load counters (`stat prefill`'s
 //! `union_*`) count from the arm's start. The load-time lines (`plan`,
-//! `load`, `capture`, `prefill`) print once, before arm 0. `--arm` does not
+//! `load`, `capture`, `prefill`) print once, before arm 0. A list of more
+//! than one arm names its order first, on one plain stderr line built from
+//! the list the session runs — `arms in order: 512/2, 1536/2, 512/2`, each
+//! arm `D/N` or `<corpus>:P/N` with the `-n` it runs. `--arm` does not
 //! mix with `--prompt-id`, `--tokens`, `--depth` or `--plan`, and a list of
 //! more than one arm is refused beside `BLOOMERY_DRAFT` (a draft's state has
 //! no clear) and `BLOOMERY_CHECK_FINITE`. `--arm-sync` makes each arm wait,
@@ -973,6 +977,7 @@ mod drive {
             arms: runs.len(),
             slots,
         };
+        print_arm_order(&runs);
         if slots > 1 {
             return s
                 .arms(&runs, |s, i, r| {
@@ -1311,7 +1316,27 @@ mod drive {
             .collect()
     }
 
+    /// An `--arm` list's order, before its first arm: one plain stderr line
+    /// naming the arms as the session runs them, for a list of more than
+    /// one arm; nothing for one arm or a run of the prompt flags.
+    fn print_arm_order(runs: &[ArmRun]) {
+        let arms: Option<Vec<String>> = runs.iter().map(ArmRun::label).collect();
+        if let Some(arms) = arms.filter(|a| a.len() > 1) {
+            eprintln!("arms in order: {}", arms.join(", "));
+        }
+    }
+
     impl ArmRun {
+        /// The arm as its `--arm` reads, with the `-n` it runs: `D/N` or
+        /// `<corpus>:P/N`; `None` for a run of the prompt flags.
+        fn label(&self) -> Option<String> {
+            let n = self.a.n_gen;
+            self.spec.map(|s| match s.feed {
+                ArmFeed::Lcg(d) => format!("{d}/{n}"),
+                ArmFeed::Corpus(name, p) => format!("{name}:{p}/{n}"),
+            })
+        }
+
         /// The arm's feed under `mode`, with the needs of its call's printed
         /// plan, and the host tier's counters at its start: the zero its
         /// since-load counters are read from.
