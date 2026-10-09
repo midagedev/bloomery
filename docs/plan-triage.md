@@ -37,10 +37,10 @@ the lead's. Before W1 starts T3 R2, it checks its files against R1a's `host/mod.
 
 ### Release cut
 0210b green → `just release-build 0.2.10` → user-facing pass (candidate tarball's `bloomery-serve`, both cards, `a` and
-`bp`, a short and a ≥ 4K prompt, levers unset) → dogfood pass (candidate serve + one outsource round) → the promo sitting
-(Qwen3.8 UD-Q4_K_XL, one card, release tarballs 0.2.6 → 0.2.10, levers unset, MTP off or prompts under #3's trigger,
-one lease; first a functional check that each old tarball loads the file) → notes (thank @avlp12) → tag with the user's
-OK → opus video round.
+`bp`, a short and a ≥ 4K prompt, levers unset) → dogfood pass (candidate serve + one outsource round) → notes (thank
+@avlp12) → tag with the user's OK → opus release-clip round. The clip measures only 0.2.10; its "since 0.2.6" climb is
+one part of the clip, drawn from derived values for the older releases (labelled derived), with no old-tarball sitting
+and no digging through old records (the user, 10-10).
 
 ### Box queue (the lead orders it; a sitting holds `/root/bloomery-<owner>-hold`)
 1. W1 gp2box phase 3 (12–20 min) — now.
@@ -48,7 +48,7 @@ OK → opus video round.
 3. Rounds' `--round-ledger` batches (yield to a hold).
 4. 0210a fixture + real tier (lead).
 5. W1 T3 c_hot + A/Bs; W2 T1 R1c A/B (A6000, card `t1-split-pp`).
-6. Vision gates; release pass; promo sitting.
+6. Vision gates; release pass.
 The GLM download (idle IO priority) ends ~09:00; a lease sitting waits on its IO pressure until then.
 
 ## Release 0.2.7 — orchestration (the user, 2026-10-07 evening)
