@@ -160,11 +160,12 @@ use model::arch::qwen35moe::hparams::Hparams;
 use model::arch::qwen35moe::{host as qwen4exp_host, names as qwen4exp_names};
 use model::moe::{HostLayer, HostLayerSpec, UNION_MAX_COLS, UnionScratch, expert_view};
 use model::ops::{
-    DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Weight, matmul_q,
-    matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
-    matmul_q_group_swiglu_into,
+    DEFER_MAX_COLS, GroupInput, Lanes, QuantizedCols, ShardTensor, Tensor2, WarmSpan, Weight,
+    matmul_q, matmul_q_group_cols_into, matmul_q_group_into_on, matmul_q_group_swiglu,
+    matmul_q_group_swiglu_into_on, warm_share,
 };
 use model::r8file::R8Source;
+use threads::CcdMap;
 
 type BenchError = Box<dyn std::error::Error>;
 
@@ -230,6 +231,12 @@ const R8_CHECKS: [(usize, usize, usize); 8] = [
 /// Pool dispatches of the engine shape per layer: the gate+up group and the
 /// down group.
 const ENGINE_DISPATCHES: usize = 2;
+/// The refusal of a warm shape on a pool with no CCD map.
+const NO_CCD_MAP: &str = "a warm arm needs the pool's CCD map: a worker's pin failed or the caller \
+                          is not pinned (BLOOMERY_PIN_MAIN=0)";
+/// The warm arms a plain `--check` runs on the checked layers: a warm of two
+/// experts of the engine shape's three, and of two of the union call's six.
+const WARM_CHECK_ARMS: &str = "engine-warm:3w2,union5-warm:3x4u0.5w2";
 
 const USAGE: &str = "usage: bench_v41_host --check [--arms A,B,...]
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
@@ -1927,13 +1934,14 @@ fn r8_gate_up(
 /// Its outputs land in the prefix of `b`: gate and up of expert `i` in
 /// `b.gu[2i]` and `b.gu[2i + 1]`, down and combine in `b.down[i]`, `b.par[i]`.
 fn engine_layer(
+    lanes: Lanes,
     l: &Layer<'_>,
     slots: &[usize],
     x: &Tensor2,
     b: &mut Blocks,
     tally: &mut Tally,
 ) -> Result<(), ModelError> {
-    engine_rows_layer(l, slots, &[x], b, tally)
+    engine_rows_layer(lanes, l, slots, &[x], b, tally)
 }
 
 /// Probe shape for a k-token step: `xs.len()` rows, row `i` owning the
@@ -1941,6 +1949,7 @@ fn engine_layer(
 /// `xs[i]`. Every row's gate and up in one group, every row's down in one
 /// group — the dispatches a tier that takes k tokens per call would issue.
 fn engine_rows_layer(
+    lanes: Lanes,
     l: &Layer<'_>,
     slots: &[usize],
     xs: &[&Tensor2],
@@ -1957,7 +1966,7 @@ fn engine_rows_layer(
         .flat_map(|&s| [l.weight(s, GATE), l.weight(s, UP)])
         .collect();
     let t0 = Instant::now();
-    matmul_q_group_into("host_gate_up", &ws, &xin, &mut b.gu[..2 * n])?;
+    matmul_q_group_into_on(lanes, "host_gate_up", &ws, &xin, &mut b.gu[..2 * n])?;
     tally.add("gate+up", bytes_of(&ws), t0);
     let dw: Vec<Weight<'_>> = slots.iter().map(|&s| l.weight(s, DOWN)).collect();
     let (pairs, _) = b.gu[..2 * n].as_chunks::<2>();
@@ -1966,8 +1975,114 @@ fn engine_rows_layer(
         .map(|[g, u]| GroupInput::Swiglu(g, u))
         .collect();
     let t0 = Instant::now();
-    matmul_q_group_swiglu_into("host_down", &dw, &srcs, &mut b.down[..n], &mut b.par[..n])?;
+    matmul_q_group_swiglu_into_on(
+        lanes,
+        "host_down",
+        &dw,
+        &srcs,
+        &mut b.down[..n],
+        &mut b.par[..n],
+    )?;
     tally.add("down", bytes_of(&dw), t0);
+    Ok(())
+}
+
+/// A warm job: every participant's [`warm_share`] of `spans` over `map`, one
+/// pool dispatch of an index a participant, run to the end (no stop). Tallied
+/// as the `warm` kind under the bytes its walks reached, so that dispatch
+/// line's rate is the warm's; returns those bytes.
+fn warm_job(spans: &[WarmSpan<'_>], map: CcdMap, tally: &mut Tally) -> u64 {
+    let reached = AtomicU64::new(0);
+    let t0 = Instant::now();
+    threads::pool().for_each_chunk(map.threads(), |r| {
+        let done = warm_share(spans, &map, r.start, || false);
+        reached.fetch_add(done.bytes, Ordering::Relaxed);
+    });
+    let bytes = reached.into_inner();
+    tally.add("warm", bytes, t0);
+    bytes
+}
+
+/// The matrices of the first `k` of `slots`' experts as the engine shape's
+/// dispatches read them: each expert's gate, up and down, with their rows as
+/// the units.
+fn engine_spans<'a>(l: &Layer<'a>, slots: &[usize], k: usize) -> Vec<WarmSpan<'a>> {
+    slots
+        .iter()
+        .take(k)
+        .flat_map(|&s| {
+            [GATE, UP, DOWN].map(|m| {
+                let w = l.weight(s, m);
+                WarmSpan {
+                    bytes: w.bytes(),
+                    units: w.n(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// The `engine-warm` shape: the first `k` experts of the token warmed, then
+/// the engine shape's two dispatches on CCD-major lanes.
+fn engine_warm_layer(
+    map: CcdMap,
+    l: &Layer<'_>,
+    slots: &[usize],
+    k: usize,
+    x: &Tensor2,
+    b: &mut Blocks,
+    tally: &mut Tally,
+) -> Result<(), ModelError> {
+    if k > 0 {
+        warm_job(&engine_spans(l, slots, k), map, tally);
+    }
+    engine_layer(Lanes::Ccd(map), l, slots, x, b, tally)
+}
+
+/// The first `k` distinct expert ids of `lists`' first `n_host` entries.
+fn first_distinct_ids(lists: &[Vec<(u32, f32)>], n_host: usize, k: usize) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::with_capacity(k);
+    for &(id, _) in lists.iter().flat_map(|r| &r[..n_host]) {
+        if ids.len() < k && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// The `union5-warm` shape: the first `k` distinct experts of the token's lists
+/// warmed ([`HostLayer::warm_spans`]), then the union call on the host tier's
+/// CCD-major lanes ([`HostLayer::experts_step_union_into`]), tallied whole as
+/// `union5` is.
+#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its lists' parts, the warm, the blocks and the tally
+fn union5_warm_layer(
+    map: CcdMap,
+    host: &HostLayer,
+    split: &Split,
+    l: &Layer<'_>,
+    slots: &[usize],
+    (n_host, distinct, k): (usize, usize, usize),
+    u: &mut UnionBlocks,
+    x: usize,
+    tally: &mut Tally,
+) -> Result<(), BenchError> {
+    fill_lists(&mut u.lists, l, slots, n_host)?;
+    if k > 0 {
+        let ids = first_distinct_ids(&u.lists, n_host, k);
+        let mut spans = Vec::new();
+        host.warm_spans(R8Source::rows(split), &ids, &mut spans)?;
+        warm_job(&spans, map, tally);
+    }
+    let lists: Vec<&[(u32, f32)]> = u.lists.iter().map(|r| &r[..n_host]).collect();
+    let t0 = Instant::now();
+    host.experts_step_union_into(
+        R8Source::rows(split),
+        &u.xs[x],
+        &lists,
+        &mut u.out,
+        &mut u.scratch,
+    )?;
+    tally.add("union5", distinct as u64 * l.expert_bytes(), t0);
     Ok(())
 }
 
@@ -3042,7 +3157,7 @@ fn check_union(
     let (mut same, mut same5) = (true, true);
     for (i, run) in rows.chunks_exact(n).enumerate() {
         let mut b = Blocks::new(std::slice::from_ref(l), n)?;
-        engine_layer(l, run, &xs[(x0 + i) % N_X], &mut b, &mut tally)?;
+        engine_layer(Lanes::Flat, l, run, &xs[(x0 + i) % N_X], &mut b, &mut tally)?;
         let mut want = vec![0.0f32; embd];
         for d in &b.down[..n] {
             for (o, &dv) in want.iter_mut().zip(d.col(0)) {
@@ -3074,7 +3189,7 @@ fn check_layer(
     let mut tally = Tally::default();
     let n = slots.len();
     let mut b = Blocks::new(std::slice::from_ref(l), n)?;
-    engine_layer(l, slots, x, &mut b, &mut tally)?;
+    engine_layer(Lanes::Flat, l, slots, x, &mut b, &mut tally)?;
     let pm = per_matrix_layer(l, slots, x, &mut tally)?;
     let gate: Vec<&Tensor2> = b.gu.iter().step_by(2).collect();
     let up: Vec<&Tensor2> = b.gu.iter().skip(1).step_by(2).collect();
@@ -3403,6 +3518,112 @@ fn check_card_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<
     Ok(())
 }
 
+/// Before any timing (every layer), and under `--check` (the checked layers, or
+/// every layer for `--arms`): one token of every warm arm over `layers`, held
+/// to two things. Its warm job reaches exactly `w<k>` experts' bytes — the sum
+/// of every participant's [`warm_share`] is `k` times the layer's expert bytes,
+/// so a CCD that warms nothing, or a line walked twice or never, is red — and
+/// its CCD-major leg writes the flat leg's output bit for bit. A miss is the
+/// named error.
+fn check_warm_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<(), BenchError> {
+    let embd = bench.xs.first().ok_or("no activation columns")?.ne0;
+    for arm in arms.iter().filter(|a| a.shape.warms()) {
+        let map = bench.ccd.ok_or(NO_CCD_MAP)?;
+        let ids = bench.draw(*arm, 0, 0);
+        let (mut short, mut differ) = (Vec::new(), Vec::new());
+        for &l in layers {
+            let layer = &bench.layers[l];
+            let slots = &ids[l];
+            let want = arm.warm as u64 * layer.expert_bytes();
+            let x = l % N_X;
+            let mut tally = Tally::default();
+            let (reached, same) = if arm.shape == Shape::EngineWarm {
+                let spans = engine_spans(layer, slots, arm.warm);
+                let reached = warm_job(&spans, map, &mut tally);
+                let mut flat = Blocks::new(std::slice::from_ref(layer), arm.n_host)?;
+                let mut ccd = Blocks::new(std::slice::from_ref(layer), arm.n_host)?;
+                let xc = &bench.xs[x];
+                engine_layer(Lanes::Flat, layer, slots, xc, &mut flat, &mut tally)?;
+                engine_layer(Lanes::Ccd(map), layer, slots, xc, &mut ccd, &mut tally)?;
+                let n = arm.n_host;
+                let eq = |f: &[Tensor2], c: &[Tensor2]| {
+                    f.iter().zip(c).all(|(f, c)| bits_equal(&f.data, &c.data))
+                };
+                let same = eq(&flat.gu[..2 * n], &ccd.gu[..2 * n])
+                    && eq(&flat.down[..n], &ccd.down[..n])
+                    && eq(&flat.par[..n], &ccd.par[..n]);
+                (reached, same)
+            } else {
+                let host = bench
+                    .hosts
+                    .get(l)
+                    .ok_or("no host layer for the union arm")?;
+                let ff = layer.weight(0, GATE).n();
+                let mut u = UnionBlocks::new(&bench.xs, arm.rows, embd, ff, bench.n_used)?;
+                fill_lists(&mut u.lists, layer, slots, arm.n_host)?;
+                let warm_ids = first_distinct_ids(&u.lists, arm.n_host, arm.warm);
+                let mut spans = Vec::new();
+                host.warm_spans(R8Source::rows(bench.split), &warm_ids, &mut spans)?;
+                let reached = warm_job(&spans, map, &mut tally);
+                let mut flat = UnionBlocks::new(&bench.xs, arm.rows, embd, ff, bench.n_used)?;
+                let call = (arm.n_host, arm.union);
+                union5_layer(
+                    host,
+                    bench.split,
+                    layer,
+                    slots,
+                    call.0,
+                    call.1,
+                    &mut flat,
+                    x,
+                    &mut tally,
+                )?;
+                union5_warm_layer(
+                    map,
+                    host,
+                    bench.split,
+                    layer,
+                    slots,
+                    (arm.n_host, arm.union, 0),
+                    &mut u,
+                    x,
+                    &mut tally,
+                )?;
+                (reached, bits_equal(&flat.out, &u.out))
+            };
+            if reached != want {
+                short.push(format!("{} ({reached} of {want})", layer.index));
+            }
+            if !same {
+                differ.push(layer.index);
+            }
+        }
+        println!(
+            "check arm={} layers={} warm_bytes_equal_k_experts={} outputs_bits_equal_flat={}",
+            arm.label(),
+            layers.len(),
+            short.is_empty(),
+            differ.is_empty()
+        );
+        if !short.is_empty() {
+            return Err(format!(
+                "arm {}: the warm reached other than {} experts' bytes on layers {short:?}",
+                arm.label(),
+                arm.warm
+            )
+            .into());
+        }
+        if !differ.is_empty() {
+            return Err(format!(
+                "arm {}: its CCD-major leg differs from the flat leg on layers {differ:?}",
+                arm.label()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// The layers the check covers: 0, 1, 2, the last and every layer whose
 /// stacks span more than one shard; for a `qwen4exp` file also the first
 /// layer of every routed type triple (gate, up, down) those lack.
@@ -3501,6 +3722,15 @@ enum Shape {
     UnionCard,
     /// One dispatch per expert matrix.
     PerMatrix,
+    /// The `engine` shape on CCD-major lanes ([`Lanes::Ccd`]) after the engine's
+    /// warm routine ([`warm_share`]) filled the first `w<k>` of its experts
+    /// into the L3s of the CCDs that compute them: the one-column leg of a
+    /// layer whose predicted experts were warmed. The warm is its own pool job,
+    /// tallied apart from the two dispatches of the leg.
+    EngineWarm,
+    /// The `union5` call on CCD-major lanes after the same warm of the first
+    /// `w<k>` of its distinct experts ([`HostLayer::warm_spans`]).
+    Union5Warm,
     /// The engine shape's dispatches reading the file mapping, no kernel.
     ReadMmap,
     /// The same reads from the anonymous huge-page copy ([`ThpCopy`]).
@@ -3508,7 +3738,7 @@ enum Shape {
 }
 
 impl Shape {
-    const ALL: [Shape; 10] = [
+    const ALL: [Shape; 12] = [
         Shape::Engine,
         Shape::EngineSep,
         Shape::Union,
@@ -3517,6 +3747,8 @@ impl Shape {
         Shape::UnionQ,
         Shape::UnionCard,
         Shape::PerMatrix,
+        Shape::EngineWarm,
+        Shape::Union5Warm,
         Shape::ReadMmap,
         Shape::ReadThp,
     ];
@@ -3531,6 +3763,8 @@ impl Shape {
             Shape::UnionQ => "unionq",
             Shape::UnionCard => "unioncard",
             Shape::PerMatrix => "per-matrix",
+            Shape::EngineWarm => "engine-warm",
+            Shape::Union5Warm => "union5-warm",
             Shape::ReadMmap => "read-mmap",
             Shape::ReadThp => "read-thp",
         }
@@ -3538,14 +3772,27 @@ impl Shape {
 
     /// The shape runs one row per step only.
     fn one_row(self) -> bool {
-        matches!(self, Shape::PerMatrix | Shape::ReadMmap | Shape::ReadThp)
+        matches!(
+            self,
+            Shape::PerMatrix | Shape::EngineWarm | Shape::ReadMmap | Shape::ReadThp
+        )
+    }
+
+    /// The shape warms the first `w<k>` of its experts before its leg.
+    fn warms(self) -> bool {
+        matches!(self, Shape::EngineWarm | Shape::Union5Warm)
     }
 
     /// One union call per layer: each distinct expert read once.
     fn is_union(self) -> bool {
         matches!(
             self,
-            Shape::Union | Shape::Union5 | Shape::UnionR8 | Shape::UnionQ | Shape::UnionCard
+            Shape::Union
+                | Shape::Union5
+                | Shape::Union5Warm
+                | Shape::UnionR8
+                | Shape::UnionQ
+                | Shape::UnionCard
         )
     }
 
@@ -3571,6 +3818,9 @@ struct Arm {
     /// Units a claim of the gate/up dispatch takes (`b<B>`, the `unionr8` and
     /// `unionq` shapes; 1 otherwise).
     claim_block: usize,
+    /// Experts the warm shapes warm before the leg (`w<k>`, at most the arm's
+    /// distinct experts; 0 otherwise).
+    warm: usize,
 }
 
 impl Arm {
@@ -3579,13 +3829,33 @@ impl Arm {
     fn parse(s: &str, union: Option<f64>) -> Result<Arm, String> {
         let (name, n) = s.split_once(':').ok_or_else(|| {
             format!(
-                "arm {s:?}: want <engine|engine-sep|union|union5|unionr8|unionq|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]][b<B>]"
+                "arm {s:?}: want <engine|engine-sep|union|union5|unionr8|unionq|per-matrix|engine-warm|union5-warm|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]][b<B>][w<k>]"
             )
         })?;
         let shape = Shape::ALL
             .into_iter()
             .find(|sh| sh.name() == name)
             .ok_or_else(|| format!("arm {s:?}: unknown shape {name:?}"))?;
+        let (n, warm) = match n.split_once('w') {
+            Some((n, k)) => {
+                if !shape.warms() {
+                    return Err(format!(
+                        "arm {s:?}: w<k> is the engine-warm and union5-warm warm count"
+                    ));
+                }
+                let k = k
+                    .parse::<usize>()
+                    .map_err(|_| format!("arm {s:?}: warm count {k:?} is not a count"))?;
+                (n, Some(k))
+            }
+            None => (n, None),
+        };
+        if shape.warms() && warm.is_none() {
+            return Err(format!(
+                "arm {s:?}: the {name} shape names how many experts it warms: ...w<k>"
+            ));
+        }
+        let warm = warm.unwrap_or(0);
         let (n, claim_block) = match n.split_once('b') {
             Some((n, b)) => {
                 let b = b.parse::<usize>().ok().filter(|&b| b > 0).ok_or_else(|| {
@@ -3653,6 +3923,11 @@ impl Arm {
                 "arm {s:?}: {union} distinct experts per layer, the working set holds {WORKING_SET}"
             ));
         }
+        if warm > union {
+            return Err(format!(
+                "arm {s:?}: it warms {warm} of its {union} distinct experts"
+            ));
+        }
         Ok(Arm {
             shape,
             n_host,
@@ -3660,6 +3935,7 @@ impl Arm {
             ratio,
             union,
             claim_block,
+            warm,
         })
     }
 
@@ -3670,10 +3946,15 @@ impl Arm {
         } else {
             format!("b{}", self.claim_block)
         };
+        let warm = if self.shape.warms() {
+            format!("w{}", self.warm)
+        } else {
+            String::new()
+        };
         match (self.rows, self.ratio) {
-            (1, _) => format!("{shape}:{}{block}", self.n_host),
-            (rows, None) => format!("{shape}:{}x{rows}{block}", self.n_host),
-            (rows, Some(r)) => format!("{shape}:{}x{rows}u{r}{block}", self.n_host),
+            (1, _) => format!("{shape}:{}{block}{warm}", self.n_host),
+            (rows, None) => format!("{shape}:{}x{rows}{block}{warm}", self.n_host),
+            (rows, Some(r)) => format!("{shape}:{}x{rows}u{r}{block}{warm}", self.n_host),
         }
     }
 
@@ -3722,6 +4003,16 @@ impl Arm {
             Shape::EngineSep => ENGINE_DISPATCHES * self.rows * layers.len(),
             Shape::Union5 if self.rows > DEFER_MAX_COLS => 5 * layers.len(),
             Shape::Union5 => ENGINE_DISPATCHES * layers.len(),
+            // The call's own dispatches and, when it warms, the warm's one.
+            Shape::Union5Warm => {
+                let call = if self.rows > DEFER_MAX_COLS {
+                    5
+                } else {
+                    ENGINE_DISPATCHES
+                };
+                (call + usize::from(self.warm > 0)) * layers.len()
+            }
+            Shape::EngineWarm => (ENGINE_DISPATCHES + usize::from(self.warm > 0)) * layers.len(),
             Shape::UnionCard => 5 * layers.iter().filter(|l| self.runs(l)).count(),
             Shape::Union | Shape::UnionR8 | Shape::UnionQ => {
                 ENGINE_DISPATCHES * self.union.div_ceil(UNION_CHUNK) * layers.len()
@@ -3815,6 +4106,9 @@ struct Bench<'a> {
     /// The file's routed width: every union scratch is made for it, as the
     /// engine's is.
     n_used: usize,
+    /// The pool's CCD map, present once every participant is pinned; the warm
+    /// shapes need it.
+    ccd: Option<CcdMap>,
 }
 
 /// One arm's round: the timed tokens and the page state around them.
@@ -3882,14 +4176,32 @@ impl Bench<'_> {
                     per_matrix_layer(layer, slots, xs()[0], tally)?;
                 }
                 Shape::Engine | Shape::EngineSep if arm.rows == 1 => {
-                    engine_layer(layer, slots, xs()[0], b, tally)?;
+                    engine_layer(Lanes::Flat, layer, slots, xs()[0], b, tally)?;
                 }
                 Shape::EngineSep => {
                     for (row, x) in slots.chunks_exact(arm.n_host).zip(&xs()) {
-                        engine_layer(layer, row, x, b, tally)?;
+                        engine_layer(Lanes::Flat, layer, row, x, b, tally)?;
                     }
                 }
-                Shape::Engine => engine_rows_layer(layer, slots, &xs(), b, tally)?,
+                Shape::Engine => engine_rows_layer(Lanes::Flat, layer, slots, &xs(), b, tally)?,
+                Shape::EngineWarm => {
+                    let map = self.ccd.ok_or(NO_CCD_MAP)?;
+                    engine_warm_layer(map, layer, slots, arm.warm, xs()[0], b, tally)?;
+                }
+                Shape::Union5Warm => {
+                    let map = self.ccd.ok_or(NO_CCD_MAP)?;
+                    let u = b
+                        .union
+                        .as_mut()
+                        .ok_or("union5-warm arm without its blocks")?;
+                    let host = self
+                        .hosts
+                        .get(l)
+                        .ok_or("union5-warm arm without host layers")?;
+                    let x = (t + l) % N_X;
+                    let call = (arm.n_host, arm.union, arm.warm);
+                    union5_warm_layer(map, host, self.split, layer, slots, call, u, x, tally)?;
+                }
                 Shape::Union => {
                     let u = b.chunks.as_mut().ok_or("union arm without its blocks")?;
                     let host = self.hosts.get(l).ok_or("union arm without host layers")?;
@@ -3945,7 +4257,7 @@ impl Bench<'_> {
                     blocks.chunks =
                         Some(ChunkBlocks::new(&self.xs, arm.rows, embd, ff, self.n_used))
                 }
-                Shape::Union5 => {
+                Shape::Union5 | Shape::Union5Warm => {
                     blocks.union =
                         Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff, self.n_used)?);
                 }
@@ -4009,6 +4321,42 @@ fn spread(v: &[f64]) -> (f64, f64, f64) {
     (min, v.iter().sum::<f64>() / v.len() as f64, max)
 }
 
+/// A warm arm's two numbers from the dispatch rows of its rounds, as `key=value`
+/// fields: the warm job's rate in GB/s (the bytes its walks reached over its
+/// wall) and the leg's cost per expert in µs (the leg's dispatches' wall over
+/// the experts they ran, the warm left out). Empty for an arm that does not warm.
+fn warm_fields<'r>(arm: &Arm, rows: impl Iterator<Item = &'r TallyRow>) -> String {
+    if !arm.shape.warms() {
+        return String::new();
+    }
+    let (mut warm_bytes, mut warm_ns, mut leg_ns, mut calls) = (0u64, 0u64, 0u64, 0u64);
+    for r in rows {
+        match r.kind {
+            "warm" => {
+                warm_bytes += r.bytes * r.count;
+                warm_ns += r.ns;
+            }
+            "gate+up" | "union5" => {
+                leg_ns += r.ns;
+                calls += r.count;
+            }
+            "down" => leg_ns += r.ns,
+            _ => {}
+        }
+    }
+    let experts = if arm.shape == Shape::Union5Warm {
+        arm.union
+    } else {
+        arm.n_host
+    };
+    let rate = warm_bytes as f64 / warm_ns.max(1) as f64;
+    let leg = leg_ns as f64 / calls.max(1) as f64 / experts as f64 / 1e3;
+    format!(
+        " warm_k={} warm_gbps={rate:.2} leg_us_per_expert={leg:.2}",
+        arm.warm
+    )
+}
+
 /// `--time` (see the module doc): every round, every arm, a line each, then
 /// one summary line per arm.
 fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchError> {
@@ -4033,7 +4381,7 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
                 "time threads={threads} round={}/{} arm={} tokens={} warmup={} ms_min={min:.3} ms_mean={mean:.3} ms_max={max:.3} \
                  host_bytes_per_token={bytes} union_per_layer={} union_bytes_per_token={union_bytes} \
                  gbps_mean={:.2} gbps_best={:.2} dispatches_per_token={:.2} expected={} \
-                 minflt={} majflt={} resident_before={}/{total} resident_after={}/{total} lease={} admissible={}",
+                 minflt={} majflt={} resident_before={}/{total} resident_after={}/{total} lease={} admissible={}{}",
                 round + 1,
                 opts.rounds,
                 arm.label(),
@@ -4049,7 +4397,8 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
                 r.resident_before,
                 r.resident_after,
                 if lease { "held" } else { "none" },
-                if ok { "yes" } else { "no" }
+                if ok { "yes" } else { "no" },
+                warm_fields(&arm, r.tally.rows.iter())
             );
             for d in &r.tally.rows {
                 let us = d.ns as f64 / d.count as f64 / 1e3;
@@ -4097,6 +4446,7 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
         } else {
             String::new()
         };
+        let warm = warm_fields(arm, rs.iter().flat_map(|r| r.tally.rows.iter()));
         let per_expert = if arm.shape.is_union() {
             let calls = (bench.layers.len() * arm.union) as f64;
             format!(
@@ -4110,7 +4460,7 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
         };
         println!(
             "summary threads={threads} arm={} rounds={} tokens={} ms_min={min:.3} ms_mean={mean:.3} round_means=[{}] \
-             gbps_mean={:.2} gbps_best={:.2} admissible={}{per_expert}{thp}",
+             gbps_mean={:.2} gbps_best={:.2} admissible={}{per_expert}{thp}{warm}",
             arm.label(),
             rs.len(),
             all.len(),
@@ -4209,6 +4559,24 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         threads::pool().threads(),
         threads::pool().pin_failed()
     );
+    let ccd = threads::pool().ccd_map();
+    match ccd {
+        Some(m) => println!(
+            "v41host ccd_map threads={} ccds={} widths={:?} l3_bytes={}",
+            m.threads(),
+            m.ccds(),
+            (0..m.ccds()).map(|c| m.width(c)).collect::<Vec<_>>(),
+            m.l3_bytes()
+        ),
+        None => println!(
+            "v41host ccd_map=off pin_failed={} caller_pinned={}",
+            threads::pool().pin_failed(),
+            threads::pool().caller_pinned()
+        ),
+    }
+    if ccd.is_none() && arms.iter().any(|a| a.shape.warms()) {
+        return Err(NO_CCD_MAP.into());
+    }
     print_affinity()?;
     let mapped = mapped_bytes(&layers);
     // The copy is made before the working set is paged in: filling it can
@@ -4278,6 +4646,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         thp: copy.as_ref().map(ThpCopy::bytes),
         sink: AtomicU64::new(0),
         n_used: meta.n_used,
+        ccd,
     };
     match mode {
         Mode::Check(arms) if arms.is_empty() => {
@@ -4291,6 +4660,18 @@ fn run(mode: Mode) -> Result<(), BenchError> {
                 .map(|a| Arm::parse(a, None))
                 .collect::<Result<Vec<_>, _>>()?;
             check_r8_arms(&bench, &arms, &covered_layers(&bench.layers, &family))?;
+            if bench.ccd.is_some() {
+                let warm_arms = WARM_CHECK_ARMS
+                    .split(',')
+                    .map(|a| Arm::parse(a, None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                check_warm_arms(&bench, &warm_arms, &covered_layers(&bench.layers, &family))?;
+            } else {
+                println!(
+                    "check warm arms skipped: {WARM_CHECK_ARMS} need the pool's CCD map, which \
+                     this run has none of"
+                );
+            }
             let card_arms = CARD_CHECK_ARMS
                 .split(',')
                 .map(|a| Arm::parse(a, None))
@@ -4309,6 +4690,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
             check(&bench, meta.n_used, true)?;
             let every: Vec<usize> = (0..bench.layers.len()).collect();
             check_r8_arms(&bench, &arms, &every)?;
+            check_warm_arms(&bench, &arms, &every)?;
             check_card_arms(&bench, &arms, &every)
         }
         Mode::Time(opts) => {
@@ -4321,6 +4703,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
             check(&bench, meta.n_used, false)?;
             let every: Vec<usize> = (0..bench.layers.len()).collect();
             check_r8_arms(&bench, &opts.arms, &every)?;
+            check_warm_arms(&bench, &opts.arms, &every)?;
             check_card_arms(&bench, &opts.arms, &every)?;
             time(&bench, &opts, lease)
         }

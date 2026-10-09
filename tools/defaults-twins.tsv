@@ -35,6 +35,7 @@ BLOOMERY_MTP_WIDTH	gate-gpu-qwen38-serve	fixed	crates/gpu-gates/src/bin/gate_qwe
 BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	cost	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	the pinned word is the default; the chooser's own clause (the #3 fix's)
 BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	the same gate's width_cost clause runs the chooser at cost
 BLOOMERY_POISON	gate-gpu-qwen4exp-iqleg	1	justfile::gate-gpu-qwen4exp-e2e:	gate-gpu-qwen4exp-e2e runs the same family's loads at the lever unset (the default 0)
+BLOOMERY_POISON	gate-mt	1	crates/model/tests/mt.rs::fn ccd_child(	hw_ccd_lanes_gate: its last child runs the same legs at the machine's width with the lever unset (the default 0)
 BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile::--arm 512/2 --arm 1536/2 --arm 512/2	the recipe's --arm list feeds the same depth 512 (arm 0, and arm 2 again) at the default group (2)
 BLOOMERY_PROFILE	gate-profile	2	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
 BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin

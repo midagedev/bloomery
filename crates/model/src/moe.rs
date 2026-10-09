@@ -30,9 +30,10 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupInput, R8Stack, RowLayout, ShardTensor, StackTier,
-    Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q,
-    matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
+    self, DEFER_MAX_COLS, ExpertStack, GroupInput, Lanes, R8Stack, RowLayout, ShardTensor,
+    StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, WarmSpan,
+    Weight, matmul_q, matmul_q_group, matmul_q_group_into_on, matmul_q_group_swiglu,
+    matmul_q_group_swiglu_into_on,
 };
 use crate::profile;
 use crate::r8file::{R8Error, R8Source};
@@ -794,7 +795,7 @@ pub fn experts_into(
             view(&plan.down_views, e)?,
         ])
     };
-    serve(weights, None, x, experts, out, scratch)
+    serve(weights, LegRun::flat(None), x, experts, out, scratch)
 }
 
 /// Expert `e`'s view in one of a block plan's per-expert view lists; an id
@@ -947,6 +948,24 @@ impl HostScratch {
     }
 }
 
+/// How one host leg of one token runs: the experts' SwiGLU clamp (`None`: the
+/// plain combine) and how the leg's rows are laid over the pool.
+#[derive(Clone, Copy)]
+struct LegRun {
+    limit: Option<f32>,
+    lanes: Lanes,
+}
+
+impl LegRun {
+    /// The leg with rows in the pool's flat lanes.
+    fn flat(limit: Option<f32>) -> LegRun {
+        LegRun {
+            limit,
+            lanes: Lanes::Flat,
+        }
+    }
+}
+
 /// The host leg of one token: each listed expert's `[gate, up, down]` from
 /// `weights`, resolved in list order into the scratch's view lists, then
 /// [`serve_resolved`]. The lists go back to the scratch, emptied, whether the
@@ -954,7 +973,7 @@ impl HostScratch {
 /// scratch's width, so no push grows a list.
 fn serve<'w>(
     weights: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
-    limit: Option<f32>,
+    run: LegRun,
     x: &Tensor2,
     experts: &[(u32, f32)],
     out: &mut [f32],
@@ -970,7 +989,7 @@ fn serve<'w>(
             down.push(d);
             Ok(())
         })
-        .and_then(|()| serve_resolved(&gu, &down, limit, x, experts, out, s));
+        .and_then(|()| serve_resolved(&gu, &down, run, x, experts, out, s));
     s.gu_w = relist(gu);
     s.down_w = relist(down);
     r
@@ -988,7 +1007,7 @@ fn serve<'w>(
 fn serve_resolved(
     gu: &[Weight<'_>],
     down: &[Weight<'_>],
-    limit: Option<f32>,
+    run: LegRun,
     x: &Tensor2,
     experts: &[(u32, f32)],
     out: &mut [f32],
@@ -1006,7 +1025,7 @@ fn serve_resolved(
     } = s;
     let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
     xl.extend(std::iter::repeat_n(x, 2 * n));
-    let gt = matmul_q_group_into("host_gate_up", gu, &xl, &mut gate_up[..2 * n]);
+    let gt = matmul_q_group_into_on(run.lanes, "host_gate_up", gu, &xl, &mut gate_up[..2 * n]);
     *xs = relist(xl);
     let gt = gt?;
     let mut sl: Vec<GroupInput<'_>> = relist(std::mem::take(srcs));
@@ -1015,12 +1034,19 @@ fn serve_resolved(
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|[gate, up]| match limit {
+            .map(|[gate, up]| match run.limit {
                 Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
                 None => GroupInput::Swiglu(gate, up),
             }),
     );
-    let dt = matmul_q_group_swiglu_into("host_down", down, &sl, &mut downs[..n], &mut pars[..n]);
+    let dt = matmul_q_group_swiglu_into_on(
+        run.lanes,
+        "host_down",
+        down,
+        &sl,
+        &mut downs[..n],
+        &mut pars[..n],
+    );
     *srcs = relist(sl);
     let dt = dt?;
     let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
@@ -1423,7 +1449,7 @@ fn check_union_call(
 /// checked against `x`, `out` and the scratch.
 fn serve_union(
     stacks: [ExpertStack<'_>; 3],
-    limit: Option<f32>,
+    run: LegRun,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1431,7 +1457,7 @@ fn serve_union(
 ) -> Result<(), ModelError> {
     s.plan.build(lists, s.per_list)?;
     if s.plan.fits(s.max_slots) {
-        return serve_planned(stacks, limit, x, lists, out, s);
+        return serve_planned(stacks, run, x, lists, out, s);
     }
     s.cut_calls += 1;
     let embd = x.ne0();
@@ -1446,7 +1472,7 @@ fn serve_union(
         );
         serve_planned(
             stacks,
-            limit,
+            run,
             part,
             &lists[c0..c1],
             &mut out[c0 * embd..c1 * embd],
@@ -1462,7 +1488,7 @@ fn serve_union(
 /// scratch.
 fn serve_planned(
     stacks: [ExpertStack<'_>; 3],
-    limit: Option<f32>,
+    run: LegRun,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1472,7 +1498,7 @@ fn serve_planned(
         out.fill(0.0);
         return Ok(());
     }
-    let call = UnionCall::new(s.plan.view(), stacks, x, limit, s.ff)?;
+    let call = UnionCall::new(s.plan.view(), stacks, x, run.limit, s.ff)?.spread_over(run.lanes);
     let slabs = UnionSlabs {
         xq: &mut s.xq,
         xq_up: &mut s.xq_up,
@@ -1514,7 +1540,7 @@ pub fn experts_union_into<'x>(
         ExpertStack::in_file(gguf, up)?,
         ExpertStack::in_file(gguf, down)?,
     ];
-    serve_union(stacks, None, x, lists, out, scratch)
+    serve_union(stacks, LegRun::flat(None), x, lists, out, scratch)
 }
 
 /// What a host tier needs to serve one layer's routed experts, in the
@@ -1847,7 +1873,9 @@ impl HostLayer {
     /// the shard that holds it, or the sidecar. `src` is the pair the layer
     /// was built from. `scratch` is the caller's, made for this layer's
     /// widths and the model's routed width, and a list past that width is
-    /// refused by name; after the call it holds what the call computed.
+    /// refused by name; after the call it holds what the call computed. The
+    /// leg's two row dispatches are laid over the pool's CCDs
+    /// ([`Lanes::host_tier`]), which changes no value.
     pub fn experts_into(
         &self,
         src: R8Source<'_>,
@@ -1881,7 +1909,11 @@ impl HostLayer {
                 })?,
             ])
         };
-        serve(weights, Some(self.limit), x, experts, out, scratch)
+        let run = LegRun {
+            limit: Some(self.limit),
+            lanes: Lanes::host_tier(),
+        };
+        serve(weights, run, x, experts, out, scratch)
     }
 
     /// [`experts_union_into`] for this layer: up to the columns `scratch`
@@ -1892,6 +1924,21 @@ impl HostLayer {
     /// is the pair the layer was built from.
     pub fn experts_union_into<'x>(
         &self,
+        src: R8Source<'_>,
+        x: impl Into<Tensor2View<'x>>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        scratch: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        self.union_on(Lanes::Flat, src, x, lists, out, scratch)
+    }
+
+    /// [`HostLayer::experts_union_into`] with the two row passes laid over
+    /// the pool as `lanes` says: the same values, bit for bit, whichever
+    /// lanes.
+    fn union_on<'x>(
+        &self,
+        lanes: Lanes,
         src: R8Source<'_>,
         x: impl Into<Tensor2View<'x>>,
         lists: &[&[(u32, f32)]],
@@ -1912,14 +1959,11 @@ impl HostLayer {
             self.gate.source().info().dims[1] as usize,
             scratch,
         )?;
-        serve_union(
-            self.stacks_of(split)?,
-            Some(self.limit),
-            x,
-            lists,
-            out,
-            scratch,
-        )
+        let run = LegRun {
+            limit: Some(self.limit),
+            lanes,
+        };
+        serve_union(self.stacks_of(split)?, run, x, lists, out, scratch)
     }
 
     /// [`HostLayer::experts_union_into`] with every id outside the plan's
@@ -1933,7 +1977,9 @@ impl HostLayer {
     /// the same bytes as the mapping's, so column `j` is still
     /// [`HostLayer::experts_into`] of column `j` bit for bit. A layer with no
     /// tier reads the mapping alone, as [`HostLayer::experts_union_into`].
-    /// Refused by name before any fill: an id past the layer's experts.
+    /// Refused by name before any fill: an id past the layer's experts. Its
+    /// two row passes are laid over the pool's CCDs ([`Lanes::host_tier`]), as
+    /// the one-column [`HostLayer::experts_into`]'s are.
     pub fn experts_step_union_into<'x>(
         &self,
         src: R8Source<'_>,
@@ -1942,8 +1988,9 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
+        let lanes = Lanes::host_tier();
         let Some(tier) = &self.tier else {
-            return self.experts_union_into(src, x, lists, out, scratch);
+            return self.union_on(lanes, src, x, lists, out, scratch);
         };
         self.read_beside(src)?;
         let split = src.split();
@@ -2007,7 +2054,64 @@ impl HostLayer {
                     stack.with_tier(StackTier::new(&*tier.slots, tier.layer, &tier.host, part));
             }
         }
-        serve_union(stacks, Some(self.limit), x, lists, out, scratch)
+        let run = LegRun {
+            limit: Some(self.limit),
+            lanes,
+        };
+        serve_union(stacks, run, x, lists, out, scratch)
+    }
+
+    /// The matrices a warm routine fills for `ids`, pushed to `out` in `ids`'
+    /// order, each id's gate, up and down as the leg reads them
+    /// ([`HostLayer::experts_into`], [`HostLayer::experts_step_union_into`]):
+    /// from the file mapping or the r8 sidecar, or — an id outside the plan's
+    /// host segment — from its arena slot. An id whose slot is unfilled is
+    /// left out whole: a warm never fills a slot ([`TierSlots::ensure`]).
+    /// Each span carries the units of the pass that reads it, so the CCD that
+    /// computes a row is the CCD that warms it ([`ops::warm_share`]). Refused
+    /// by name: an id past the layer's experts, and a slot of another length
+    /// ([`TierError::SlotLength`]).
+    pub fn warm_spans<'a>(
+        &'a self,
+        src: R8Source<'a>,
+        ids: &[u32],
+        out: &mut Vec<WarmSpan<'a>>,
+    ) -> Result<(), ModelError> {
+        self.read_beside(src)?;
+        let mut stacks = self.stacks_of(src.split())?;
+        if let Some(tier) = &self.tier {
+            for (part, stack) in stacks.iter_mut().enumerate() {
+                *stack =
+                    stack.with_tier(StackTier::new(&*tier.slots, tier.layer, &tier.host, part));
+            }
+        }
+        'ids: for &id in ids {
+            if id as usize >= self.n_expert {
+                return Err(ModelError::MissingTensor(format!(
+                    "expert {id} of {}",
+                    self.gate.source().info().name
+                )));
+            }
+            let mut parts = [None; 3];
+            for (part, stack) in stacks.iter().enumerate() {
+                let Some(span) = stack.warm_span(id) else {
+                    continue 'ids;
+                };
+                if span.bytes.len() != stack.per() {
+                    return Err(TierError::SlotLength {
+                        layer: self.tier.as_ref().map_or(0, |t| t.layer),
+                        id,
+                        part,
+                        got: span.bytes.len(),
+                        want: stack.per(),
+                    }
+                    .into());
+                }
+                parts[part] = Some(span);
+            }
+            out.extend(parts.into_iter().flatten());
+        }
+        Ok(())
     }
 }
 
@@ -2561,6 +2665,77 @@ mod tests {
             self.asked.lock().unwrap().push((layer, id, part));
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
+    }
+
+    /// A warm lists each id's gate, up and down as the leg reads them — the
+    /// mapping's bytes for an id of the host segment or a layer with no tier,
+    /// the arena slot's for any other — in `ids`' order, each with its pass's
+    /// units; a tier id whose slot is unfilled is left out whole; the tier is
+    /// never asked to fill a slot; an id past the layer's experts is refused
+    /// by name, and so is a slot of another length.
+    #[test]
+    fn a_warm_lists_what_the_leg_reads_and_never_fills() {
+        let (embd, ff, n_expert) = (256, 512, 6);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("warmspans", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let src = R8Source::rows(&split);
+        let units = [ff, ff, embd];
+        let check = |layer: &HostLayer, out: &[super::WarmSpan<'_>], ids: &[usize]| {
+            assert_eq!(out.len(), 3 * ids.len(), "three spans an id");
+            for (i, &id) in ids.iter().enumerate() {
+                for (part, stack) in layer.stacks().iter().enumerate() {
+                    let want = ops::ShardTensor::expert(stack, &split, id).unwrap();
+                    let span = out[3 * i + part];
+                    assert_eq!(span.bytes, want.bytes(), "id {id} part {part}");
+                    assert_eq!(span.units, units[part], "id {id} part {part}'s units");
+                }
+            }
+        };
+
+        let mut out = Vec::new();
+        layer.warm_spans(src, &[4, 1], &mut out).unwrap();
+        check(&layer, &out, &[4, 1]);
+
+        // Host id 1; tier ids 3 and 2.
+        let empty = std::sync::Arc::new(MockTier::of(&split, &layer, false));
+        layer.attach_tier(4, 1..2, empty.clone());
+        let mut out = Vec::new();
+        layer.warm_spans(src, &[3, 1, 2], &mut out).unwrap();
+        check(&layer, &out, &[1]);
+        assert!(empty.ensured().is_empty(), "a warm fills nothing");
+
+        let full = std::sync::Arc::new(MockTier::of(&split, &layer, true));
+        layer.attach_tier(4, 1..2, full.clone());
+        let mut out = Vec::new();
+        layer.warm_spans(src, &[3, 1, 2], &mut out).unwrap();
+        check(&layer, &out, &[3, 1, 2]);
+        assert!(full.ensured().is_empty(), "a warm fills nothing");
+        let asked: Vec<u32> = full.asked().iter().map(|&(_, id, _)| id).collect();
+        assert!(
+            asked.iter().all(|&id| id != 1),
+            "the host segment's id was not the tier's: {asked:?}"
+        );
+
+        let err = layer
+            .warm_spans(src, &[6], &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expert 6"), "{err}");
+        let mut short = MockTier::of(&split, &layer, true);
+        short.parts[3 * 3 + 1].pop();
+        layer.attach_tier(4, 1..2, std::sync::Arc::new(short));
+        match layer.warm_spans(src, &[3], &mut Vec::new()) {
+            Err(crate::ModelError::Tier(super::TierError::SlotLength {
+                layer: 4,
+                id: 3,
+                part: 1,
+                ..
+            })) => {}
+            other => panic!("not the slot-length refusal by name: {other:?}"),
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The host segment's ids read the mapping and every other id the tier's

@@ -9,11 +9,25 @@
 //! `hw_` prefix: needs the box and the model file, not the oracle.
 #[path = "common/model_path.rs"]
 mod model_path;
+#[allow(
+    dead_code,
+    reason = "this gate renders one layer; the sidecar and the salted writer serve the union gates"
+)]
+#[path = "common/r8layer.rs"]
+mod r8layer;
 
+use gguf::{GgmlType, Split};
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{new_cache, step};
+use model::moe::{HostLayer, HostScratch, UnionScratch};
+use model::ops::{self, Tensor2};
+use model::r8file::R8Source;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// The counters are the process's: one gate counts at a time.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -96,6 +110,7 @@ const LIMIT: u64 = 660;
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_steady_step_allocations_bounded() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let mut cache = new_cache(&g).unwrap();
     let derived = Derived::new(&g).unwrap();
@@ -129,5 +144,73 @@ fn hw_steady_step_allocations_bounded() {
     assert!(
         worst <= LIMIT,
         "steady decode step made {worst} allocator calls, limit {LIMIT}"
+    );
+}
+
+/// Allocator calls of the host tier's legs over a synthetic routed layer —
+/// the one-column leg and a three-column step union, each a pair of pool
+/// dispatches — in a steady state, under flat lanes and under CCD-major lanes
+/// ([`ops::set_host_lanes`]): the CCD-major dispatch keeps its tables on the
+/// stack, so its calls make no more than the flat ones' (a table made per
+/// dispatch is two allocations a call). Each arm's count is the least of three
+/// repeats of eight calls after twenty that fill the pools, so a worker's
+/// first touch of a scratch is not read as a table.
+#[test]
+#[ignore = "hw: needs the box; reads no model file"]
+fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let layer = r8layer::Layer::write("alloc-ccd", 512, 256, 16, GgmlType::Q4_K);
+    let (embd, ff) = (layer.embd, layer.ff);
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let host = HostLayer::build(src, &layer.spec()).unwrap();
+    let mut hs = HostScratch::new(embd, ff, 4).unwrap();
+    let mut us = UnionScratch::new_routed(embd, ff, 3, 4).unwrap();
+    let x = Tensor2::from_vec(
+        embd,
+        1,
+        (0..embd).map(|i| (i % 17) as f32 / 9.0 - 0.9).collect(),
+    );
+    let x3 = Tensor2::from_vec(
+        embd,
+        3,
+        (0..3 * embd)
+            .map(|i| (i % 23) as f32 / 11.0 - 1.0)
+            .collect(),
+    );
+    let list =
+        |j: u32| -> Vec<(u32, f32)> { (0..4).map(|i| ((j * 5 + i * 3) % 16, 0.25)).collect() };
+    let lists = [list(0), list(1), list(2)];
+    let refs: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+    let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
+    let mut calls = |n: usize| {
+        for _ in 0..n {
+            host.experts_into(src, &x, &lists[0], &mut out1, &mut hs)
+                .unwrap();
+            host.experts_step_union_into(src, &x3, &refs, &mut out3, &mut us)
+                .unwrap();
+        }
+    };
+    IS_MAIN.with(|m| m.set(true));
+    let mut least = [u64::MAX; 2];
+    for (arm, lanes) in [(0, Some(0)), (1, Some(4))] {
+        ops::set_host_lanes(lanes);
+        calls(20);
+        for _ in 0..3 {
+            let c0 = CALLS.load(Relaxed);
+            calls(8);
+            least[arm] = least[arm].min(CALLS.load(Relaxed) - c0);
+        }
+    }
+    ops::set_host_lanes(None);
+    eprintln!(
+        "host legs, 8 calls of one-column + 3-column step union: {} allocator calls flat, {} CCD-major",
+        least[0], least[1]
+    );
+    assert!(
+        least[1] <= least[0],
+        "CCD-major lanes made {} allocator calls over 8 calls, the flat lanes {}",
+        least[1],
+        least[0]
     );
 }

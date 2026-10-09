@@ -1013,9 +1013,10 @@ gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test fixture -- --include-ignored --nocapture --test-threads=1'
 
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
-# hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.
+# hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다. The pool's own unit tests (--lib: the L3 size
+# reading, the CCD map's pin condition) run with it.
 gate-threads:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --test pool --test helper -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --lib --test pool --test helper -- --include-ignored --nocapture'
 
 # 레버 레지스트리 게이트(crates/levers, 호스트만): 모든 행이 형식에 맞는가, 종류가 받지 않는 값과 은퇴한 이름을
 # 이름을 대고 거부하는가, 제자리 행과 tools/levers-direct.txt가 서로 맞는가. 레지스트리를 마크다운 표로 찍는다.

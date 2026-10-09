@@ -94,7 +94,12 @@ pub struct Pool {
     /// One Vec per CCD (shared L3), logical cpu ids, primaries before
     /// siblings — as detected, see `detect_topology`.
     topo: Vec<Vec<u32>>,
+    /// Each CCD's L3 in bytes, parallel to `topo`; 0 where sysfs does not
+    /// say.
+    l3: Vec<u64>,
     pin_failed: AtomicBool,
+    /// Whether [`Pool::pin_caller`] pinned its thread.
+    caller_pinned: AtomicBool,
 
     // --- dispatch state -------------------------------------------------
     // `dispatch` serializes `for_each_chunk` calls; the job slot is handed to
@@ -204,8 +209,8 @@ impl Copy for JobSlot {}
 // which requires every worker to have finished calling the closure. A worker
 // reads the slot only between its acquire-observation of a new `seq` and its
 // `remaining` decrement. `dispatch` serializes dispatchers, `panic` is
-// behind a mutex, `pin_failed` is atomic, and everything else is immutable
-// after construction.
+// behind a mutex, `pin_failed` and `caller_pinned` are atomic, and everything
+// else is immutable after construction.
 unsafe impl Sync for Pool {}
 
 impl Pool {
@@ -245,7 +250,33 @@ impl Pool {
     /// owns its main thread calls it once. Unpinned, the dispatcher floats onto
     /// an SMT sibling of a spinning worker and every barrier waits for it.
     pub fn pin_caller(&self) -> bool {
-        pin(self.cpu_for(self.nthreads - 1))
+        let pinned = pin(self.cpu_for(self.nthreads - 1));
+        if pinned {
+            self.caller_pinned.store(true, Ordering::Relaxed);
+        }
+        pinned
+    }
+
+    /// Whether a [`Pool::pin_caller`] call succeeded. The pool does not know
+    /// which thread it was, only that the dispatcher's slot is taken.
+    #[must_use]
+    pub fn caller_pinned(&self) -> bool {
+        self.caller_pinned.load(Ordering::Relaxed)
+    }
+
+    /// Where each participant sits, for the dispatches and warms that place
+    /// work by CCD: `None` unless every participant is pinned — a worker's
+    /// pin failed, or [`Pool::pin_caller`] has not succeeded — because an
+    /// unpinned participant is on no CCD in particular. A host with one L3 is
+    /// one CCD.
+    #[must_use]
+    pub fn ccd_map(&self) -> Option<CcdMap> {
+        if self.pin_failed() || !self.caller_pinned() {
+            return None;
+        }
+        let map = CcdMap::new(self.nthreads, self.topo.len(), 0);
+        let l3_bytes = self.l3.iter().take(map.active()).sum();
+        Some(CcdMap { l3_bytes, ..map })
     }
 
     /// Protocol counters since process start. Diagnostic only — nothing in
@@ -369,12 +400,14 @@ impl Pool {
     fn build() -> Pool {
         let groups = detect_topology();
         let mut topo = Vec::with_capacity(groups.len());
+        let mut l3 = Vec::with_capacity(groups.len());
         let mut physical = 0;
-        for (primaries, siblings) in &groups {
-            physical += primaries.len();
-            let mut full = primaries.clone();
-            full.extend_from_slice(siblings);
+        for g in &groups {
+            physical += g.primaries.len();
+            let mut full = g.primaries.clone();
+            full.extend_from_slice(&g.siblings);
             topo.push(full);
+            l3.push(g.l3_bytes);
         }
         // The pool is process-wide, so it reads its own two levers
         // (`bloomery_levers::pool_levers`: a binary that parses at `main`
@@ -392,7 +425,9 @@ impl Pool {
             nthreads: nthreads.max(1),
             spin,
             topo,
+            l3,
             pin_failed: AtomicBool::new(false),
+            caller_pinned: AtomicBool::new(false),
             dispatch: Mutex::new(()),
             job: UnsafeCell::new(JobSlot {
                 data: std::ptr::null(),
@@ -435,13 +470,13 @@ impl Pool {
         }
     }
 
-    /// Worker `t` is spread across CCDs: CCD `t % nccd`, slot `t / nccd` of
-    /// that CCD's cpu list (physical cores first). Beyond the detected cpu
+    /// Worker `t` is spread across CCDs ([`ccd_slot`]): slot `t / nccd` of
+    /// its CCD's cpu list (physical cores first). Beyond the detected cpu
     /// count the last slot is shared rather than panicking.
     fn cpu_for(&self, t: usize) -> u32 {
-        let nccd = self.topo.len();
-        let g = &self.topo[t % nccd];
-        g[(t / nccd).min(g.len() - 1)]
+        let (ccd, slot) = ccd_slot(t, self.topo.len());
+        let g = &self.topo[ccd];
+        g[slot.min(g.len() - 1)]
     }
 
     /// Every worker's mark equals `cur`: `remaining == 0`.
@@ -525,6 +560,138 @@ impl Pool {
 #[repr(align(64))]
 struct DoneMark(AtomicUsize);
 
+/// Participant `t`'s place when the pool spreads over `nccd` CCDs: its CCD
+/// `t % nccd` and its slot `t / nccd` in that CCD's cpu list. The one owner of
+/// the rule: the pool pins by it ([`Pool`]) and [`CcdMap`] answers by it.
+const fn ccd_slot(t: usize, nccd: usize) -> (usize, usize) {
+    (t % nccd, t / nccd)
+}
+
+/// How the pool's participants sit on the CCDs, for the work that places
+/// itself by CCD — a row dispatch visiting a matrix CCD-major, a warm routine
+/// filling a CCD's L3 with the rows that CCD will compute. Participant `t`
+/// (`threads()` of them, the calling thread the last) runs on CCD
+/// `t % ccds()` as that CCD's `t / ccds()`-th participant, the rule
+/// [`Pool`] pins by, so a CCD holds `threads / ccds` participants and the
+/// first `threads % ccds` CCDs one more.
+///
+/// A value only answers by arithmetic: it is `Copy` and a call allocates
+/// nothing. The pool's own is [`Pool::ccd_map`]; [`CcdMap::new`] names a
+/// grouping a test wants to run the same work under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcdMap {
+    threads: usize,
+    ccds: usize,
+    l3_bytes: u64,
+}
+
+impl CcdMap {
+    /// `threads` participants over `ccds` CCDs whose L3s hold `l3_bytes` in
+    /// all (0: not known).
+    #[must_use]
+    pub fn new(threads: usize, ccds: usize, l3_bytes: u64) -> CcdMap {
+        assert!(
+            threads > 0 && ccds > 0,
+            "a CCD map needs a participant and a CCD: {threads} threads, {ccds} CCDs"
+        );
+        CcdMap {
+            threads,
+            ccds,
+            l3_bytes,
+        }
+    }
+
+    /// Participants, the pool's `threads()`.
+    #[must_use]
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// CCDs the participants are spread over (L3 groups of the topology).
+    #[must_use]
+    pub fn ccds(&self) -> usize {
+        self.ccds
+    }
+
+    /// CCDs that hold a participant: `min(ccds, threads)`, the first ones.
+    #[must_use]
+    pub fn active(&self) -> usize {
+        self.ccds.min(self.threads)
+    }
+
+    /// The L3 bytes of the active CCDs, summed; 0 when the topology does not
+    /// say (`cache/index3/size`).
+    #[must_use]
+    pub fn l3_bytes(&self) -> u64 {
+        self.l3_bytes
+    }
+
+    /// Participant `t`'s CCD.
+    #[must_use]
+    pub fn ccd_of(&self, t: usize) -> usize {
+        assert!(t < self.threads, "participant {t} of {}", self.threads);
+        ccd_slot(t, self.ccds).0
+    }
+
+    /// Participant `t`'s rank among its CCD's participants.
+    #[must_use]
+    pub fn rank_of(&self, t: usize) -> usize {
+        assert!(t < self.threads, "participant {t} of {}", self.threads);
+        ccd_slot(t, self.ccds).1
+    }
+
+    /// Participants on CCD `c`; 0 past the active CCDs.
+    #[must_use]
+    pub fn width(&self, c: usize) -> usize {
+        self.first_lane(c + 1) - self.first_lane(c)
+    }
+
+    /// Participants on the CCDs before `c`: CCD `c`'s first lane in the
+    /// CCD-major order of participants (CCD 0's ranks, then CCD 1's, ...).
+    /// `first_lane(ccds())` is `threads()`.
+    #[must_use]
+    pub fn first_lane(&self, c: usize) -> usize {
+        let c = c.min(self.ccds);
+        let (q, r) = (self.threads / self.ccds, self.threads % self.ccds);
+        q * c + c.min(r)
+    }
+
+    /// Participant `t`'s place in the CCD-major order.
+    #[must_use]
+    pub fn lane_of(&self, t: usize) -> usize {
+        self.first_lane(self.ccd_of(t)) + self.rank_of(t)
+    }
+
+    /// The CCD of lane `lane` of the CCD-major order (the inverse of
+    /// [`CcdMap::lane_of`]'s CCD part).
+    #[must_use]
+    pub fn lane_ccd(&self, lane: usize) -> usize {
+        assert!(lane < self.threads, "lane {lane} of {}", self.threads);
+        (0..self.active())
+            .find(|&c| lane < self.first_lane(c + 1))
+            .expect("a lane below `threads` is some active CCD's")
+    }
+
+    /// CCD `c`'s share of `n` units — the one rule that splits a matrix over
+    /// CCDs: the pool's own split of `n` into `threads()` chunks
+    /// ([`chunk_bounds`]), each CCD taking the chunks of its participants, so
+    /// a CCD's span is as wide as its participants are many (8/8/7/7 of 30
+    /// threads on four CCDs, not four quarters). The spans of CCDs `0..ccds()`
+    /// partition `0..n`, in order; a CCD with no participant has an empty
+    /// one.
+    #[must_use]
+    pub fn span(&self, n: usize, c: usize) -> Range<usize> {
+        let edge = |lane: usize| {
+            if lane >= self.threads {
+                n
+            } else {
+                chunk_bounds(n, self.threads, lane).0
+            }
+        };
+        edge(self.first_lane(c))..edge(self.first_lane(c + 1))
+    }
+}
+
 /// The partition `for_each_chunk` uses, exposed so it can be tested without
 /// threads. Deterministic: the same `(n, threads)` always yields the same
 /// split. Contiguous chunks (not interleaved) so each worker streams a
@@ -579,13 +746,35 @@ fn read_sys(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Detect the L3 (CCD) topology: one `(primaries, siblings)` pair per shared
-/// L3, groups sorted by primary core id. The primary hyperthread of each
-/// core is its lowest sibling id. Ported from
+/// One shared L3 as the topology reads it.
+struct CcdGroup {
+    primaries: Vec<u32>,
+    siblings: Vec<u32>,
+    /// The L3's size in bytes; 0 where sysfs does not say.
+    l3_bytes: u64,
+}
+
+/// `cache/index3/size` as bytes: `32768K`, `32M`, `1G` or a bare count;
+/// `None` for anything else.
+fn parse_cache_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (digits, unit) = match s.char_indices().last()? {
+        (i, 'K' | 'k') => (&s[..i], 1u64 << 10),
+        (i, 'M' | 'm') => (&s[..i], 1 << 20),
+        (i, 'G' | 'g') => (&s[..i], 1 << 30),
+        (_, c) if c.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    digits.parse::<u64>().ok()?.checked_mul(unit)
+}
+
+/// Detect the L3 (CCD) topology: one group per shared L3 — its primaries,
+/// siblings and size — sorted by primary core id. The primary hyperthread of
+/// each core is its lowest sibling id. Ported from
 /// `crates/q3k-cpu/src/main.rs:324` (`ccd_topology`), restructured so the
 /// physical-core count is recoverable — the bench binary's return shape
 /// (primaries then siblings, flat) cannot say where the split is.
-fn detect_topology() -> Vec<(Vec<u32>, Vec<u32>)> {
+fn detect_topology() -> Vec<CcdGroup> {
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new(); // (l3 key, primaries)
     let mut cpu = 0u32;
     while let Some(sib) = read_sys(&format!(
@@ -613,12 +802,22 @@ fn detect_topology() -> Vec<(Vec<u32>, Vec<u32>)> {
         } else {
             (0..cpu).collect()
         };
-        return vec![(cpus, Vec::new())];
+        return vec![CcdGroup {
+            primaries: cpus,
+            siblings: Vec::new(),
+            l3_bytes: 0,
+        }];
     }
     groups.sort_by_key(|(_, v)| v[0]);
     groups
         .into_iter()
         .map(|(_, primaries)| {
+            let l3_bytes = read_sys(&format!(
+                "/sys/devices/system/cpu/cpu{}/cache/index3/size",
+                primaries[0]
+            ))
+            .and_then(|s| parse_cache_size(&s))
+            .unwrap_or(0);
             let mut siblings = Vec::new();
             for &p in &primaries {
                 let sib = parse_cpu_list(
@@ -633,7 +832,11 @@ fn detect_topology() -> Vec<(Vec<u32>, Vec<u32>)> {
                     }
                 }
             }
-            (primaries, siblings)
+            CcdGroup {
+                primaries,
+                siblings,
+                l3_bytes,
+            }
         })
         .collect()
 }
@@ -650,5 +853,41 @@ fn pin(cpu: u32) -> bool {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu as usize, &mut set);
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pool, parse_cache_size};
+    use std::sync::atomic::Ordering;
+
+    /// `cache/index3/size` reads K, M and G suffixes and a bare count, and
+    /// refuses a unit or digits it does not know.
+    #[test]
+    fn cache_sizes_parse() {
+        assert_eq!(parse_cache_size("32768K\n"), Some(32 << 20));
+        assert_eq!(parse_cache_size("32M"), Some(32 << 20));
+        assert_eq!(parse_cache_size("1G"), Some(1 << 30));
+        assert_eq!(parse_cache_size("4096"), Some(4096));
+        for bad in ["", "K", "12T", "x32M", "-1K", "1.5M"] {
+            assert_eq!(parse_cache_size(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_cache_size("18446744073709551615K"), None);
+    }
+
+    /// A pool has a CCD map only once every participant is pinned: the
+    /// caller by `pin_caller`, the workers by their own pins.
+    #[test]
+    fn ccd_map_needs_every_participant_pinned() {
+        let p = Pool::build();
+        assert!(p.ccd_map().is_none(), "the caller has not pinned");
+        p.caller_pinned.store(true, Ordering::Relaxed);
+        let map = p.ccd_map().expect("a pinned caller and no failed pin");
+        assert_eq!(
+            (map.threads(), map.ccds()),
+            (p.threads(), p.topology().len())
+        );
+        p.pin_failed.store(true, Ordering::Relaxed);
+        assert!(p.ccd_map().is_none(), "a worker failed to pin");
     }
 }

@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
+use threads::CcdMap;
 
 /// A 2-D activation block in ggml's layout: `ne0` contiguous, `ne1` strides by
 /// `ne0`; token `t` lives at `data[t*ne0..(t+1)*ne0]` (oracle, `docs/oracle.md`).
@@ -886,6 +887,7 @@ pub fn matmul_q_group_swiglu(
             pars: &mut pars,
         },
         Entry::Plain,
+        Lanes::Flat,
     )?;
     Ok((outs, pars))
 }
@@ -1226,6 +1228,30 @@ impl<'w> ExpertStack<'w> {
         self.per
     }
 
+    /// The units of one matrix's row pass: its rows, or its row-lane groups.
+    pub(crate) fn units(&self) -> usize {
+        self.n / self.layout.grain()
+    }
+
+    /// Expert `e`'s matrix as a warm fills it: its bytes and the units a row
+    /// pass over it cuts them in. `None` when `e` is a tier id whose slot is
+    /// unfilled — a warm never fills one.
+    pub(crate) fn warm_span(&self, e: u32) -> Option<WarmSpan<'w>> {
+        if let Some(t) = self.tier
+            && t.lends(e)
+        {
+            let bytes = t.slots.slot(t.layer, e, t.part)?;
+            return Some(WarmSpan {
+                bytes,
+                units: self.units(),
+            });
+        }
+        Some(WarmSpan {
+            bytes: self.matrix(e),
+            units: self.units(),
+        })
+    }
+
     /// Expert `e`'s matrix bytes: the tier's slot for an id the tier lends,
     /// else the stack's own. `e` is one of the stack's experts: a union call
     /// checks its ids against the stack by name before any pass.
@@ -1329,6 +1355,18 @@ pub fn matmul_q_group_into(
     xs: &[&Tensor2],
     outs: &mut [Tensor2],
 ) -> Result<GroupTimes, crate::ModelError> {
+    matmul_q_group_into_on(Lanes::Flat, site, ws, xs, outs)
+}
+
+/// [`matmul_q_group_into`] with its rows laid over the pool's participants as
+/// `lanes` says: the same values, bit for bit, whichever lanes.
+pub fn matmul_q_group_into_on(
+    lanes: Lanes,
+    site: &'static str,
+    ws: &[Weight<'_>],
+    xs: &[&Tensor2],
+    outs: &mut [Tensor2],
+) -> Result<GroupTimes, crate::ModelError> {
     group_core(
         Weights::Resolved(ws),
         Inputs::Ready(xs),
@@ -1338,6 +1376,7 @@ pub fn matmul_q_group_into(
             pars: &mut [],
         },
         Entry::Plain,
+        lanes,
     )
 }
 
@@ -1352,11 +1391,26 @@ pub fn matmul_q_group_swiglu_into(
     outs: &mut [Tensor2],
     pars: &mut [Tensor2],
 ) -> Result<GroupTimes, crate::ModelError> {
+    matmul_q_group_swiglu_into_on(Lanes::Flat, site, ws, srcs, outs, pars)
+}
+
+/// [`matmul_q_group_swiglu_into`] with its rows laid over the pool's
+/// participants as `lanes` says: the same values, bit for bit, whichever
+/// lanes.
+pub fn matmul_q_group_swiglu_into_on(
+    lanes: Lanes,
+    site: &'static str,
+    ws: &[Weight<'_>],
+    srcs: &[GroupInput<'_>],
+    outs: &mut [Tensor2],
+    pars: &mut [Tensor2],
+) -> Result<GroupTimes, crate::ModelError> {
     group_core(
         Weights::Resolved(ws),
         Inputs::Mixed(srcs),
         Dest::Into { site, outs, pars },
         Entry::Plain,
+        lanes,
     )
 }
 
@@ -1392,6 +1446,7 @@ pub fn matmul_q_group_cols_into(
         Inputs::Mixed(srcs),
         Dest::Into { site, outs, pars },
         Entry::Cols,
+        Lanes::Flat,
     )
 }
 
@@ -1548,6 +1603,7 @@ fn group_core(
     inputs: Inputs<'_, '_>,
     dest: Dest<'_>,
     entry: Entry,
+    lanes: Lanes,
 ) -> Result<GroupTimes, crate::ModelError> {
     let n_pairs = ws.len();
     if n_pairs != inputs.len() {
@@ -1876,6 +1932,7 @@ fn group_core(
         Arm {
             defer_cols: defer.then_some(entry.defer_cols()),
             tile_lanes: wide,
+            lanes,
         },
     )?;
     // What the rows leave out: the combines, which the allocating entry's
@@ -2965,6 +3022,8 @@ struct Arm {
     /// Lanes cut by the tile kernel's cost, participant `t` on lane `t`
     /// ([`run_row_pool`]) — a wide group of [`Entry::Cols`].
     tile_lanes: bool,
+    /// How the rows are laid over the participants.
+    lanes: Lanes,
 }
 
 /// Quantize `slots` and run every pair's rows over one pool dispatch — the
@@ -3049,6 +3108,7 @@ fn run_group(
         lvl,
         pacc,
         arm.tile_lanes,
+        arm.lanes,
     )?;
     quantized.release_all();
     Ok(match deferred {
@@ -3191,6 +3251,25 @@ struct Lane {
 }
 const MAX_LANES: usize = 64;
 
+impl Lane {
+    /// The lane over the walk's positions `start..end`: its steal block a
+    /// quarter of it ([`STEAL_BLOCKS`]), capped by the set's
+    /// [`RowSet::block_cap`]; with stealing off the whole lane is one block.
+    fn of(start: usize, end: usize, steal: bool, total_rows: usize, cap: Option<usize>) -> Lane {
+        let block = if steal {
+            let block = ((end - start) / STEAL_BLOCKS).max(1);
+            cap.map_or(block, |cap| block.min(cap))
+        } else {
+            total_rows.max(1)
+        };
+        Lane {
+            next: std::sync::atomic::AtomicUsize::new(start),
+            end,
+            block,
+        }
+    }
+}
+
 /// `BLOOMERY_STEAL`: `1` (or unset) lets a participant take blocks off other
 /// lanes once its own are done; `0` is the A/B lever, whole-lane blocks on
 /// home lanes only. Any other value panics by name.
@@ -3248,6 +3327,9 @@ trait RowSet: Sync {
     /// The pair whose units hold unit `r`, searched from pair `from` (at or
     /// before it) on.
     fn pair_at(&self, r: usize, from: usize) -> usize;
+    /// The units of every pair when they are all the same count, so a unit's
+    /// pair is a division; `None` when the pairs differ.
+    fn uniform_units(&self) -> Option<usize>;
     /// Pair `p`'s per-unit lane cost: the tile's with `tile` ([`tile_cost`]),
     /// else its weight bytes once per input column ([`row_cost`]).
     fn cost(&self, p: usize, tile: bool) -> u64;
@@ -3279,6 +3361,8 @@ trait RowSet: Sync {
 struct GroupRows<'g, 'a> {
     pairs: &'g Flex<PairWork<'a>>,
     starts: Flex<usize>,
+    /// The units of every pair, when they are all the same count.
+    uniform: Option<usize>,
     deferred: Option<&'g DeferredSlots<'a>>,
 }
 
@@ -3287,14 +3371,22 @@ impl<'g, 'a> GroupRows<'g, 'a> {
         let mut starts: Flex<usize> = Flex::new();
         let mut total_units = 0usize;
         starts.push(0);
+        let mut uniform = None;
         for p in 0..pairs.len() {
             let w = pairs.get(p);
-            total_units += w.n / w.layout.grain();
+            let units = w.n / w.layout.grain();
+            uniform = match (p, uniform) {
+                (0, _) => Some(units),
+                (_, Some(first)) if first == units => Some(first),
+                _ => None,
+            };
+            total_units += units;
             starts.push(total_units);
         }
         GroupRows {
             pairs,
             starts,
+            uniform,
             deferred,
         }
     }
@@ -3315,6 +3407,10 @@ impl RowSet for GroupRows<'_, '_> {
             p += 1;
         }
         p
+    }
+
+    fn uniform_units(&self) -> Option<usize> {
+        self.uniform
     }
 
     fn cost(&self, p: usize, tile: bool) -> u64 {
@@ -3395,6 +3491,50 @@ impl ErrGate {
     }
 }
 
+/// How a row dispatch lays its units over the pool's participants.
+#[derive(Clone, Copy, Debug)]
+pub enum Lanes {
+    /// The units of every pair end to end in one space, cut into one lane a
+    /// participant: any participant may meet any unit.
+    Flat,
+    /// The units visited CCD-major: each pair's units are cut over the CCDs
+    /// ([`CcdMap::span`]) and a CCD's participants take its CCD's share of
+    /// every pair, taking from the other CCDs' lanes only once their own are
+    /// done. A participant's reads of a row are then on the CCD that a warm
+    /// routine ([`warm_share`]) filled with it.
+    Ccd(CcdMap),
+}
+
+/// What [`set_host_lanes`] forced: `0` nothing, `1` flat, `n + 1` a spread
+/// over `n` CCDs.
+static HOST_LANES_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The lanes tests' switch: `Some(0)` runs the host tier flat, `Some(n)` over
+/// `n` CCDs of the pool's participants whatever the machine's topology, `None`
+/// the pool's own map ([`Lanes::host_tier`]). The values are the same under
+/// every one.
+#[doc(hidden)]
+pub fn set_host_lanes(mode: Option<usize>) {
+    HOST_LANES_OVERRIDE.store(
+        mode.map_or(0, |n| n + 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+impl Lanes {
+    /// The lanes the host tier's step legs run on: the pool's CCD map, or flat
+    /// where the pool has none — its caller or a worker is unpinned.
+    #[must_use]
+    pub fn host_tier() -> Lanes {
+        let pool = threads::pool();
+        match HOST_LANES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => pool.ccd_map().map_or(Lanes::Flat, Lanes::Ccd),
+            1 => Lanes::Flat,
+            n => Lanes::Ccd(CcdMap::new(pool.threads(), n - 1, 0)),
+        }
+    }
+}
+
 /// The row dispatch and its gather: one pool job over the concatenated rows
 /// of every pair (a chunk may straddle pair boundaries; the walker hands each
 /// pair its own sub-range), then the sort, error scan and accumulator fold.
@@ -3418,6 +3558,11 @@ impl ErrGate {
 /// home lanes, as below. A lane's steal block is a quarter of it
 /// ([`STEAL_BLOCKS`]), capped by the set's [`RowSet::block_cap`].
 ///
+/// With [`Lanes::Ccd`] the same cost rules cut each CCD's region of the walk
+/// into a lane for each of its participants ([`CcdCut`]); participant `t`
+/// starts on its CCD's lane `rank(t)` and walks its CCD's other lanes before
+/// any other CCD's.
+///
 /// A profiled dispatch pays the chunk collector (one `Vec` of pool-width
 /// slots); an unprofiled one runs the error channel above and allocates
 /// nothing unless a chunk fails. A set with claims runs them as the
@@ -3428,9 +3573,21 @@ fn run_row_pool<S: RowSet>(
     lvl: u8,
     pacc: &mut profile::CallAcc,
     tile_lanes: bool,
+    lanes: Lanes,
 ) -> Result<(), crate::ModelError> {
-    let npairs = set.pairs();
-    let total_rows = set.start(npairs);
+    run_row_pool_with(set, lvl, pacc, tile_lanes, lanes, steal_enabled())
+}
+
+/// [`run_row_pool`] with `BLOOMERY_STEAL`'s reading ([`steal_enabled`]) an
+/// argument, so a gate can run both arms in one process.
+fn run_row_pool_with<S: RowSet>(
+    set: &S,
+    lvl: u8,
+    pacc: &mut profile::CallAcc,
+    tile_lanes: bool,
+    lanes: Lanes,
+    steal: bool,
+) -> Result<(), crate::ModelError> {
     let collected = if lvl > 0 {
         Some(profile::ChunkSlots::<RowChunk>::new())
     } else {
@@ -3438,6 +3595,79 @@ fn run_row_pool<S: RowSet>(
     };
     let gate = ErrGate::new();
     let t_span = if lvl >= 1 { Some(Instant::now()) } else { None };
+    match lanes {
+        Lanes::Flat => dispatch_flat(set, lvl, tile_lanes, steal, collected.as_ref(), &gate),
+        Lanes::Ccd(map) => dispatch_ccd(
+            set,
+            lvl,
+            tile_lanes && set.tile_costs(),
+            map,
+            steal,
+            collected.as_ref(),
+            &gate,
+        ),
+    }
+
+    let span_ns = t_span.map(|t| t.elapsed().as_nanos() as u64);
+    if let Some(collected) = collected {
+        // Arrival order is nondeterministic; sorting by `start` keeps the first
+        // error the lowest failing row's, as a sequential `?` would return.
+        let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
+        let mut chunks = collected.into_vec();
+        chunks.sort_by_key(|c| c.start);
+        if let Some(e) = chunks.iter_mut().find_map(|c| c.err.take()) {
+            return Err(e);
+        }
+        for c in &chunks {
+            pacc.add_acc(&c.acc);
+        }
+        if lvl >= 1 {
+            for (i, c) in chunks.iter().enumerate() {
+                profile::add_chunk_busy(i, c.busy_ns);
+            }
+        }
+        if let Some(span_ns) = span_ns {
+            pacc.add_span(span_ns, chunks.iter().map(|c| c.busy_ns).max().unwrap_or(0));
+        }
+        if let Some(t_gather) = t_gather {
+            pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
+        }
+    } else if let Some(e) = gate.take() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// A participant's last act in a dispatch: its chunk to the collector of a
+/// profiled one, or its error to the gate of an unprofiled one — a clean
+/// unprofiled chunk has nothing to report.
+fn finish_chunk(
+    mut chunk: RowChunk,
+    t_busy: Option<Instant>,
+    collected: Option<&profile::ChunkSlots<RowChunk>>,
+    gate: &ErrGate,
+) {
+    if let Some(t_busy) = t_busy {
+        chunk.busy_ns = t_busy.elapsed().as_nanos() as u64;
+    }
+    if let Some(collected) = collected {
+        collected.push(chunk);
+    } else if let Some(e) = chunk.err {
+        gate.offer(chunk.start, e);
+    }
+}
+
+/// The flat dispatch ([`Lanes::Flat`]).
+fn dispatch_flat<S: RowSet>(
+    set: &S,
+    lvl: u8,
+    tile_lanes: bool,
+    steal: bool,
+    collected: Option<&profile::ChunkSlots<RowChunk>>,
+    gate: &ErrGate,
+) {
+    let npairs = set.pairs();
+    let total_rows = set.start(npairs);
     // Lanes: the pool's own static split, one cursor each. A participant walks
     // its home lanes front to back in blocks, then takes blocks off the front of
     // whatever lanes are still unfinished. The slowest chunk of a dispatch runs
@@ -3483,7 +3713,6 @@ fn run_row_pool<S: RowSet>(
         lane_bounds[nlanes] = total_rows;
     }
     // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lanes only.
-    let steal = steal_enabled();
     let cap = set.block_cap();
     let lanes: [Lane; MAX_LANES] = std::array::from_fn(|t| {
         let (start, end) = if t < nlanes {
@@ -3491,17 +3720,7 @@ fn run_row_pool<S: RowSet>(
         } else {
             (0, 0)
         };
-        let block = if steal {
-            let block = ((end - start) / STEAL_BLOCKS).max(1);
-            cap.map_or(block, |cap| block.min(cap))
-        } else {
-            total_rows.max(1)
-        };
-        Lane {
-            next: std::sync::atomic::AtomicUsize::new(start),
-            end,
-            block,
-        }
+        Lane::of(start, end, steal, total_rows, cap)
     });
     // The tile cut hands participant `t` the index `t` (`nlanes` is the pool's
     // width, so each chunk is one index); the byte cut hands it rows.
@@ -3589,45 +3808,273 @@ fn run_row_pool<S: RowSet>(
                 }
             }
         }
-        if let Some(t_busy) = t_busy {
-            chunk.busy_ns = t_busy.elapsed().as_nanos() as u64;
-        }
-        // A clean unprofiled chunk has nothing to report.
-        if let Some(collected) = &collected {
-            collected.push(chunk);
-        } else if let Some(e) = chunk.err {
-            gate.offer(chunk.start, e);
-        }
+        finish_chunk(chunk, t_busy, collected, gate);
     });
+}
 
-    let span_ns = t_span.map(|t| t.elapsed().as_nanos() as u64);
-    if let Some(collected) = collected {
-        // Arrival order is nondeterministic; sorting by `start` keeps the first
-        // error the lowest failing row's, as a sequential `?` would return.
-        let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
-        let mut chunks = collected.into_vec();
-        chunks.sort_by_key(|c| c.start);
-        if let Some(e) = chunks.iter_mut().find_map(|c| c.err.take()) {
-            return Err(e);
-        }
-        for c in &chunks {
-            pacc.add_acc(&c.acc);
-        }
-        if lvl >= 1 {
-            for (i, c) in chunks.iter().enumerate() {
-                profile::add_chunk_busy(i, c.busy_ns);
+/// The CCD-major dispatch ([`Lanes::Ccd`]): participant `t` starts on its
+/// CCD's lane `rank(t)` and, stealing, walks its CCD's other lanes and then
+/// the other CCDs'. The cut is [`CcdCut`]'s, one lane an index of the pool
+/// as the tile cut hands them out.
+fn dispatch_ccd<S: RowSet>(
+    set: &S,
+    lvl: u8,
+    tile: bool,
+    map: CcdMap,
+    steal: bool,
+    collected: Option<&profile::ChunkSlots<RowChunk>>,
+    gate: &ErrGate,
+) {
+    let nlanes = threads::pool().threads();
+    assert_eq!(
+        map.threads(),
+        nlanes,
+        "a CCD map names the pool's participants"
+    );
+    assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
+    let total_rows = set.start(set.pairs());
+    let cut = CcdCut::of(set, map, tile);
+    let cap = set.block_cap();
+    let lanes: [Lane; MAX_LANES] = std::array::from_fn(|l| {
+        let (start, end) = if l < nlanes {
+            (cut.bounds[l], cut.bounds[l + 1])
+        } else {
+            (0, 0)
+        };
+        Lane::of(start, end, steal, total_rows, cap)
+    });
+    threads::pool().for_each_chunk(nlanes, |r| {
+        let t_busy = if lvl >= 1 { Some(Instant::now()) } else { None };
+        let t = r.start;
+        let (c, rank) = (map.ccd_of(t), map.rank_of(t));
+        let mut chunk = RowChunk {
+            // Errors are ordered by the first row of the participant's lane.
+            start: cut.first_unit(set, cut.firsts[c] + rank, total_rows + t),
+            busy_ns: 0,
+            acc: profile::CallAcc::new(),
+            err: None,
+        };
+        // Claims come first, before any row and any wait.
+        set.claim_pass(lvl, &mut chunk.acc);
+        let (first, width) = (cut.firsts[c], cut.firsts[c + 1] - cut.firsts[c]);
+        let visits = if steal { nlanes } else { 1 };
+        'lanes: for off in 0..visits {
+            // Its own CCD's lanes from its own on, then every other CCD's.
+            let id = if off < width {
+                first + (rank + off) % width
+            } else {
+                (first + off) % nlanes
+            };
+            let lane = &lanes[id];
+            let lane_ccd = usize::from(cut.lane_ccd[id]);
+            loop {
+                if lane.next.load(std::sync::atomic::Ordering::Relaxed) >= lane.end {
+                    break;
+                }
+                let from = lane
+                    .next
+                    .fetch_add(lane.block, std::sync::atomic::Ordering::Relaxed);
+                if from >= lane.end {
+                    break;
+                }
+                let to = lane.end.min(from + lane.block);
+                let done = cut.for_each_run(set, lane_ccd, from..to, |p, units| {
+                    // SAFETY: the runs of `from..to` are units of the lane's CCD
+                    // region, which the lane's `fetch_add` handed to this
+                    // participant alone; the walk maps its positions one to one
+                    // onto the units of every pair; the join precedes every read.
+                    unsafe { set.compute(p, units, lvl, &mut chunk.acc) }
+                });
+                if let Err(e) = done {
+                    chunk.err = Some(e);
+                    break 'lanes;
+                }
             }
         }
-        if let Some(span_ns) = span_ns {
-            pacc.add_span(span_ns, chunks.iter().map(|c| c.busy_ns).max().unwrap_or(0));
+        finish_chunk(chunk, t_busy, collected, gate);
+    });
+}
+
+/// Each active CCD's span length of a pair of `n` units, found again only
+/// when `n` differs from the last pair's — a group's pairs mostly share it.
+struct PairSpans {
+    map: CcdMap,
+    n: usize,
+    lens: [usize; MAX_LANES],
+}
+
+impl PairSpans {
+    fn new(map: CcdMap) -> PairSpans {
+        PairSpans {
+            map,
+            n: usize::MAX,
+            lens: [0; MAX_LANES],
         }
-        if let Some(t_gather) = t_gather {
-            pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
-        }
-    } else if let Some(e) = gate.take() {
-        return Err(e);
     }
-    Ok(())
+
+    fn of(&mut self, n: usize) -> &[usize; MAX_LANES] {
+        if n != self.n {
+            for c in 0..self.map.active() {
+                self.lens[c] = self.map.span(n, c).len();
+            }
+            self.n = n;
+        }
+        &self.lens
+    }
+}
+
+/// The geometry of a CCD-major dispatch ([`Lanes::Ccd`]): the order its units
+/// are walked in and where each lane's share begins and ends. Pure — the pool
+/// is never asked, so a test cuts a set by any map.
+///
+/// The walk is CCD 0's region, then CCD 1's, and so on; CCD `c`'s region holds
+/// the units of each pair's span of CCD `c` ([`CcdMap::span`]) pair by pair.
+/// A region is cut into one lane for each participant of its CCD by
+/// cumulative cost, as the flat dispatch cuts its lanes, and the lanes are
+/// numbered CCD-major: CCD `c`'s are `firsts[c]..firsts[c + 1]`. Every unit of
+/// every pair is one position of the walk, so the lanes partition the units.
+struct CcdCut {
+    map: CcdMap,
+    /// Lane `l` is the walk's positions `bounds[l]..bounds[l + 1]`.
+    bounds: [usize; MAX_LANES + 1],
+    /// `map.first_lane(c)` for every CCD up to and past the active ones.
+    firsts: [usize; MAX_LANES + 1],
+    /// Each lane's CCD.
+    lane_ccd: [u8; MAX_LANES],
+}
+
+impl CcdCut {
+    /// The cut of `set` over `map`, lanes weighed by the tile's cost when
+    /// `tile`, else by bytes ([`RowSet::cost`]).
+    fn of<S: RowSet>(set: &S, map: CcdMap, tile: bool) -> CcdCut {
+        let (active, npairs) = (map.active(), set.pairs());
+        assert!(
+            map.threads() <= MAX_LANES,
+            "row pool lanes: {} threads",
+            map.threads()
+        );
+        let mut firsts = [map.threads(); MAX_LANES + 1];
+        let mut lane_ccd = [0u8; MAX_LANES];
+        for c in 0..active {
+            firsts[c] = map.first_lane(c);
+            firsts[c + 1] = map.first_lane(c + 1);
+            let id = u8::try_from(c).expect("a CCD below the lane count fits a byte");
+            lane_ccd[firsts[c]..firsts[c + 1]].fill(id);
+        }
+        let rows = |p: usize| set.start(p + 1) - set.start(p);
+        let mut spans = PairSpans::new(map);
+        let (mut cost_of, mut units_of) = ([0u64; MAX_LANES], [0usize; MAX_LANES]);
+        for p in 0..npairs {
+            let lens = spans.of(rows(p));
+            let cost = set.cost(p, tile);
+            for c in 0..active {
+                cost_of[c] += lens[c] as u64 * cost;
+                units_of[c] += lens[c];
+            }
+        }
+        let mut bounds = [0usize; MAX_LANES + 1];
+        let mut region = [0usize; MAX_LANES];
+        let mut at = 0usize;
+        for c in 0..active {
+            (region[c], bounds[firsts[c]]) = (at, at);
+            at += units_of[c];
+        }
+        bounds[map.threads()] = at;
+        // The cost rule per region: lane `k` of CCD `c` starts at the first
+        // position where `width · cost so far` reaches `k · region cost`.
+        let (mut before, mut walked, mut k) =
+            ([0u64; MAX_LANES], [0usize; MAX_LANES], [1usize; MAX_LANES]);
+        let mut spans = PairSpans::new(map);
+        for p in 0..npairs {
+            let lens = spans.of(rows(p));
+            let cost = set.cost(p, tile);
+            for c in 0..active {
+                let (width, len) = ((firsts[c + 1] - firsts[c]) as u64, lens[c] as u64);
+                while cost > 0
+                    && (k[c] as u64) < width
+                    && (before[c] + len * cost) * width >= k[c] as u64 * cost_of[c]
+                {
+                    let target = k[c] as u64 * cost_of[c];
+                    let j = target
+                        .saturating_sub(before[c] * width)
+                        .div_ceil(cost * width)
+                        .min(len);
+                    bounds[firsts[c] + k[c]] = region[c] + walked[c] + j as usize;
+                    k[c] += 1;
+                }
+                before[c] += len * cost;
+                walked[c] += lens[c];
+            }
+        }
+        // A boundary no pair's cost crossed — a region that costs nothing —
+        // is the region's end.
+        for c in 0..active {
+            while firsts[c] + k[c] < firsts[c + 1] {
+                bounds[firsts[c] + k[c]] = region[c] + units_of[c];
+                k[c] += 1;
+            }
+        }
+        CcdCut {
+            map,
+            bounds,
+            firsts,
+            lane_ccd,
+        }
+    }
+
+    /// The first unit, in `set`'s flat order, that lane `lane` holds; `none`
+    /// for an empty lane.
+    fn first_unit<S: RowSet>(&self, set: &S, lane: usize, none: usize) -> usize {
+        let at = self.bounds[lane];
+        if at >= self.bounds[lane + 1] {
+            return none;
+        }
+        let (p, u) = self.locate(set, usize::from(self.lane_ccd[lane]), at);
+        set.start(p) + u
+    }
+
+    /// The pair and the unit of it that the walk's position `pos` is, `pos`
+    /// being in CCD `c`'s region.
+    fn locate<S: RowSet>(&self, set: &S, c: usize, pos: usize) -> (usize, usize) {
+        let mut left = pos - self.bounds[self.firsts[c]];
+        if let Some(units) = set.uniform_units() {
+            let span = self.map.span(units, c);
+            return (left / span.len(), span.start + left % span.len());
+        }
+        for p in 0..set.pairs() {
+            let span = self.map.span(set.start(p + 1) - set.start(p), c);
+            if left < span.len() {
+                return (p, span.start + left);
+            }
+            left -= span.len();
+        }
+        unreachable!("a position of CCD {c}'s region is a unit of one of its pairs")
+    }
+
+    /// The walk's positions `block`, which lie in CCD `c`'s region, as the
+    /// runs of one pair's units they are, in order — `run(pair, units)` each —
+    /// ending at the first error.
+    fn for_each_run<S: RowSet, E>(
+        &self,
+        set: &S,
+        c: usize,
+        block: Range<usize>,
+        mut run: impl FnMut(usize, Range<usize>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let (mut p, mut u) = self.locate(set, c, block.start);
+        let mut left = block.len();
+        while left > 0 {
+            let span = self.map.span(set.start(p + 1) - set.start(p), c);
+            let take = left.min(span.end - u);
+            run(p, u..u + take)?;
+            left -= take;
+            p += 1;
+            if left > 0 {
+                u = self.map.span(set.start(p + 1) - set.start(p), c).start;
+            }
+        }
+        Ok(())
+    }
 }
 
 // Per-thread combine scratch of the union's passes: a slot's `silu(gate) · up`
@@ -4139,6 +4586,10 @@ impl RowSet for UnionRows<'_, '_> {
         if p == self.pairs() { p - 1 } else { p }
     }
 
+    fn uniform_units(&self) -> Option<usize> {
+        Some(self.units())
+    }
+
     fn cost(&self, p: usize, tile: bool) -> u64 {
         let (d, s) = self.split(p);
         let m = self.plan.off[d + 1] - self.plan.off[d];
@@ -4308,6 +4759,8 @@ pub(crate) struct UnionCall<'c, 'w> {
     gate: UnionStack,
     up: UnionStack,
     down: UnionStack,
+    /// How the two row passes lay their units over the participants.
+    spread: Lanes,
 }
 
 impl<'c, 'w> UnionCall<'c, 'w> {
@@ -4340,7 +4793,14 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             gate,
             up,
             down,
+            spread: Lanes::Flat,
         })
+    }
+
+    /// The call with its row passes laid over the participants as `spread`
+    /// says (flat by default): the same values, bit for bit, whichever lanes.
+    pub(crate) fn spread_over(self, spread: Lanes) -> Self {
+        UnionCall { spread, ..self }
     }
 
     /// The call's passes, in order, through `slabs` into `out`: column `j`
@@ -4502,7 +4962,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         };
         let mut pacc = profile::CallAcc::new();
         let t0 = if lvl > 0 { Some(Instant::now()) } else { None };
-        run_row_pool(&set, lvl, &mut pacc, true)?;
+        run_row_pool(&set, lvl, &mut pacc, true, self.spread)?;
         let claim_ns = claims.claim_ns.into_inner();
         if let Some(t0) = t0 {
             let wall = t0.elapsed().as_nanos() as u64;
@@ -4616,7 +5076,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         };
         let mut pacc = profile::CallAcc::new();
         let t0 = if lvl > 0 { Some(Instant::now()) } else { None };
-        run_row_pool(&set, lvl, &mut pacc, true)?;
+        run_row_pool(&set, lvl, &mut pacc, true, self.spread)?;
         let claim_ns = claims.claim_ns.into_inner();
         if let Some(t0) = t0 {
             let wall = t0.elapsed().as_nanos() as u64;
@@ -4734,6 +5194,7 @@ fn matmul_q_one(
         Arm {
             defer_cols: defer_quant().then_some(1),
             tile_lanes: false,
+            lanes: Lanes::Flat,
         },
     )?;
 
@@ -4883,8 +5344,146 @@ fn matmul_q_multi(
             pars: &mut pars,
         },
         Entry::Plain,
+        Lanes::Flat,
     )?;
     Ok(outs)
+}
+
+// ------------------------------------------------------------------- warm
+
+/// Bytes of a cache line.
+const LINE: usize = 64;
+
+/// Lines of a 4 KB page: a warm walk's paced load is the first of each.
+const PAGE_LINES: usize = 4096 / LINE;
+
+/// Lines a warm walk touches between two looks at its stop.
+const STOP_POLL_LINES: usize = 16;
+
+/// One matrix a warm routine fills into the CCDs' L3s: its bytes, and the
+/// units — its rows, or its row-lane groups — of the row pass that reads it
+/// (`n / grain`, [`ExpertStack::units`]). A matrix is split over CCDs by
+/// [`CcdMap::span`] of `units`, the rule the pass cuts its walk by
+/// ([`Lanes::Ccd`]), so the CCD that computes a unit is the CCD that warms
+/// its bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct WarmSpan<'a> {
+    pub bytes: &'a [u8],
+    pub units: usize,
+}
+
+/// What one participant's [`warm_share`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WarmDone {
+    /// Bytes of the matrices its walk reached, each line counted for the bytes
+    /// of it that lie in its matrix.
+    pub bytes: u64,
+    /// Whether the stop cut the walk short.
+    pub cut: bool,
+}
+
+/// The cache lines participant `t` warms of `span`: absolute line numbers
+/// (address / 64), each line of the matrix exactly once over every
+/// participant. A line belongs to the share that holds its first byte inside
+/// the matrix; CCD `c`'s bytes are its span of units, and its participants
+/// split the lines of them by rank ([`threads::chunk_bounds`]).
+fn warm_lines(span: WarmSpan<'_>, map: &CcdMap, t: usize) -> Range<usize> {
+    let WarmSpan { bytes, units } = span;
+    if units == 0 || bytes.is_empty() {
+        return 0..0;
+    }
+    assert!(
+        bytes.len().is_multiple_of(units),
+        "a warm span's {} bytes are not whole units of {units}",
+        bytes.len()
+    );
+    let (c, rank) = (map.ccd_of(t), map.rank_of(t));
+    let row = bytes.len() / units;
+    let units_of_c = map.span(units, c);
+    let (b0, b1) = (units_of_c.start * row, units_of_c.end * row);
+    if b0 == b1 {
+        return 0..0;
+    }
+    // The first line of the matrix holds its first byte whatever its
+    // alignment; every later share starts at the first line that begins
+    // inside its bytes.
+    let base = bytes.as_ptr() as usize;
+    let lo = if b0 == 0 {
+        base / LINE
+    } else {
+        (base + b0).div_ceil(LINE)
+    };
+    let hi = (base + b1).div_ceil(LINE);
+    let (from, to) = threads::chunk_bounds(hi.saturating_sub(lo), map.width(c), rank);
+    lo + from..lo + to
+}
+
+/// Participant `t`'s walk of its share of `spans`, in order, calling
+/// `touch(bytes, offset, paced)` once for the first byte of each line it owns
+/// that lies in its matrix: `paced` is the first line of its share in a 4 KB
+/// page, the others follow it without waiting. `stop` is looked at before
+/// every 16th line, so a walk ends within 16 lines of the stop.
+fn warm_walk(
+    spans: &[WarmSpan<'_>],
+    map: &CcdMap,
+    t: usize,
+    stop: impl Fn() -> bool,
+    touch: &mut impl FnMut(&[u8], usize, bool),
+) -> WarmDone {
+    let mut done = WarmDone::default();
+    let mut lines = 0usize;
+    for &span in spans {
+        let base = span.bytes.as_ptr() as usize;
+        let mine = warm_lines(span, map, t);
+        let first = mine.start;
+        for l in mine {
+            if lines.is_multiple_of(STOP_POLL_LINES) && stop() {
+                done.cut = true;
+                return done;
+            }
+            lines += 1;
+            let at = (l * LINE).max(base) - base;
+            let end = ((l + 1) * LINE).min(base + span.bytes.len()) - base;
+            touch(span.bytes, at, l == first || l.is_multiple_of(PAGE_LINES));
+            done.bytes += (end - at) as u64;
+        }
+    }
+    done
+}
+
+/// One line of a warm walk: a paced line is read, so the walk waits for it
+/// and issues no faster than the memory fills; every other line of its page is
+/// prefetched into the cache the reads fill, without a wait.
+#[inline(always)]
+fn warm_touch(bytes: &[u8], off: usize, paced: bool) {
+    if paced {
+        std::hint::black_box(bytes[off]);
+    } else {
+        // SAFETY: `off` is inside `bytes`, so the address is one of the
+        // matrix's own; a prefetch reads nothing into the program.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                bytes.as_ptr().add(off).cast::<i8>(),
+            );
+        }
+    }
+}
+
+/// Participant `t`'s share of a warm of `spans`, in priority order: of each
+/// matrix, the lines of its rank's share of CCD `ccd_of(t)`'s span ([`CcdMap`]),
+/// so the lines land in the L3 of the CCD whose participants compute those
+/// rows ([`Lanes::Ccd`]). Paced: the first line of each 4 KB page is a load
+/// the walk waits for, the page's other lines prefetched behind it, so the
+/// walk issues at the memory's fill rate instead of past it. `stop` is looked
+/// at before every 16th line (a flag the go sets, say); the walk then ends
+/// and says so. A walk writes nothing and takes no lock.
+pub fn warm_share(
+    spans: &[WarmSpan<'_>],
+    map: &CcdMap,
+    t: usize,
+    stop: impl Fn() -> bool,
+) -> WarmDone {
+    warm_walk(spans, map, t, stop, &mut warm_touch)
 }
 
 #[cfg(test)]
@@ -5366,5 +5965,428 @@ mod tests {
             "first_non_finite_col: {n_cases} cases over {ne1} columns, {t} pool threads, chunk \
              {s}..{e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ccd_tests {
+    use super::{
+        CcdCut, Lanes, RowSet, WarmSpan, profile, run_row_pool_with, warm_lines, warm_share,
+        warm_walk,
+    };
+    use std::cell::Cell;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    use threads::CcdMap;
+
+    /// Pairs by unit count and per-unit cost, as a [`RowSet`] that records
+    /// who computed every unit: how often, and on which cpu.
+    struct Pairs {
+        units: Vec<usize>,
+        cost: Vec<u64>,
+        starts: Vec<usize>,
+        /// Whether the set says its pairs are all one size, when they are.
+        say_uniform: bool,
+        seen: Vec<AtomicU32>,
+        cpu: Vec<AtomicI32>,
+    }
+
+    impl Pairs {
+        fn new(units: &[usize], cost: &[u64], say_uniform: bool) -> Pairs {
+            let mut starts = vec![0];
+            for &u in units {
+                starts.push(starts.last().unwrap() + u);
+            }
+            let total = *starts.last().unwrap();
+            Pairs {
+                units: units.to_vec(),
+                cost: cost.to_vec(),
+                starts,
+                say_uniform,
+                seen: (0..total).map(|_| AtomicU32::new(0)).collect(),
+                cpu: (0..total).map(|_| AtomicI32::new(-1)).collect(),
+            }
+        }
+
+        fn forget(&self) {
+            for h in &self.seen {
+                h.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl RowSet for Pairs {
+        fn pairs(&self) -> usize {
+            self.units.len()
+        }
+        fn start(&self, p: usize) -> usize {
+            self.starts[p]
+        }
+        fn pair_at(&self, r: usize, from: usize) -> usize {
+            let mut p = from;
+            while p + 1 < self.units.len() && r >= self.starts[p + 1] {
+                p += 1;
+            }
+            p
+        }
+        fn uniform_units(&self) -> Option<usize> {
+            let first = *self.units.first()?;
+            (self.say_uniform && self.units.iter().all(|&u| u == first)).then_some(first)
+        }
+        fn cost(&self, p: usize, _tile: bool) -> u64 {
+            self.cost[p]
+        }
+        fn tile_costs(&self) -> bool {
+            true
+        }
+        fn block_cap(&self) -> Option<usize> {
+            None
+        }
+        fn claim_pass(&self, _lvl: u8, _acc: &mut profile::CallAcc) {}
+        unsafe fn compute(
+            &self,
+            p: usize,
+            units: Range<usize>,
+            _lvl: u8,
+            _acc: &mut profile::CallAcc,
+        ) -> Result<(), crate::ModelError> {
+            let cpu = running_cpu();
+            for u in units {
+                self.seen[self.starts[p] + u].fetch_add(1, Ordering::Relaxed);
+                self.cpu[self.starts[p] + u].store(cpu, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    /// The cpu the calling thread runs on: field 39 of its
+    /// `/proc/thread-self/stat`, counted from the fields after `comm`'s closing
+    /// parenthesis, which may itself hold spaces.
+    fn running_cpu() -> i32 {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("a Linux thread");
+        let rest = stat.rsplit_once(')').expect("comm is parenthesised").1;
+        let field = rest
+            .split_whitespace()
+            .nth(36)
+            .expect("the processor field");
+        field.parse().expect("a cpu number")
+    }
+
+    /// The sets the cut is held to: pairs of one size with costs that differ
+    /// (a union pass), pairs of many sizes (a group), and the thin cases.
+    fn shapes(say_uniform: bool) -> Vec<Pairs> {
+        let mixed: Vec<u64> = (0..12).map(|p| 7 * (p % 3 + 1)).collect();
+        vec![
+            Pairs::new(&[300; 12], &mixed, say_uniform),
+            Pairs::new(&[300; 12], &[5; 12], say_uniform),
+            Pairs::new(
+                &[300, 300, 37, 301, 0, 5, 1024],
+                &[3, 9, 4, 4, 8, 1, 2],
+                say_uniform,
+            ),
+            Pairs::new(&[1], &[11], say_uniform),
+            Pairs::new(&[0, 0], &[2, 2], say_uniform),
+            Pairs::new(&[7; 40], &[1; 40], say_uniform),
+        ]
+    }
+
+    /// The (threads, CCDs) the cut is held at: one CCD, an uneven spread
+    /// (3/3/2, 8/8/7/7), the box's even four, fewer participants than CCDs.
+    const MAPS: [(usize, usize); 8] = [
+        (1, 1),
+        (2, 1),
+        (8, 3),
+        (30, 4),
+        (32, 4),
+        (5, 8),
+        (64, 16),
+        (1, 4),
+    ];
+
+    /// The CCD whose span of `n` units holds unit `u`.
+    fn span_ccd(map: &CcdMap, n: usize, u: usize) -> usize {
+        (0..map.ccds())
+            .find(|&c| map.span(n, c).contains(&u))
+            .expect("the spans cover every unit")
+    }
+
+    /// The cut partitions the units — each (pair, unit) one position of one
+    /// lane — and puts every unit of CCD `c`'s lanes inside the pair's span
+    /// of CCD `c` ([`CcdMap::span`]): the locality the CCD-major dispatch
+    /// exists for, with nothing stealing. The lanes of a CCD hold its cost to
+    /// within one unit of an even share, a lane's first unit is the lowest
+    /// of its units, and a set that says its pairs are one size and one that
+    /// does not agree on every position.
+    #[test]
+    fn a_ccd_cut_gives_each_unit_to_one_lane_of_its_span_ccd() {
+        for (threads, ccds) in MAPS {
+            let map = CcdMap::new(threads, ccds, 0);
+            for say_uniform in [true, false] {
+                for set in shapes(say_uniform) {
+                    let cut = CcdCut::of(&set, map, true);
+                    let total = set.start(set.pairs());
+                    let what = format!("threads={threads} ccds={ccds} units={:?}", set.units);
+                    assert_eq!(cut.bounds[0], 0, "{what}");
+                    assert_eq!(cut.bounds[threads], total, "{what}");
+                    let mut hits: Vec<u32> = vec![0; total];
+                    for lane in 0..threads {
+                        let (from, to) = (cut.bounds[lane], cut.bounds[lane + 1]);
+                        assert!(from <= to, "{what}: lane {lane} runs backwards");
+                        let c = usize::from(cut.lane_ccd[lane]);
+                        assert_eq!(c, map.lane_ccd(lane), "{what}: lane {lane}'s CCD");
+                        let mut lowest = usize::MAX;
+                        for pos in from..to {
+                            let (p, u) = cut.locate(&set, c, pos);
+                            let span = map.span(set.units[p], c);
+                            assert!(
+                                span.contains(&u),
+                                "{what}: lane {lane} of CCD {c} holds unit {u} of pair {p}, outside {span:?}"
+                            );
+                            hits[set.start(p) + u] += 1;
+                            lowest = lowest.min(set.start(p) + u);
+                        }
+                        assert_eq!(
+                            cut.first_unit(&set, lane, usize::MAX),
+                            lowest,
+                            "{what}: lane {lane}'s first unit"
+                        );
+                    }
+                    assert!(
+                        hits.iter().all(|&h| h == 1),
+                        "{what}: a unit missed or twice"
+                    );
+                    // Each CCD's lanes share its cost evenly, to one unit's.
+                    let top = set.cost.iter().copied().max().unwrap_or(0);
+                    for c in 0..map.active() {
+                        let lanes = map.first_lane(c)..map.first_lane(c + 1);
+                        let costs: Vec<u64> = lanes
+                            .clone()
+                            .map(|l| {
+                                (cut.bounds[l]..cut.bounds[l + 1])
+                                    .map(|pos| set.cost[cut.locate(&set, c, pos).0])
+                                    .sum()
+                            })
+                            .collect();
+                        let region: u64 = costs.iter().sum();
+                        let w = lanes.len() as u64;
+                        for &lc in &costs {
+                            assert!(
+                                lc * w <= region + w * top && lc * w + w * top >= region,
+                                "{what}: CCD {c}'s lane costs {costs:?} are not an even share"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 30 threads on four CCDs are 8/8/7/7: the regions of a pass of twelve
+    /// pairs of 300 units hold 960/960/840/840 units, not four equal quarters.
+    #[test]
+    fn a_ccd_cut_weighs_a_region_by_its_participants() {
+        let map = CcdMap::new(30, 4, 0);
+        let set = Pairs::new(&[300; 12], &[5; 12], true);
+        let cut = CcdCut::of(&set, map, true);
+        let regions: Vec<usize> = (0..4)
+            .map(|c| cut.bounds[cut.firsts[c + 1]] - cut.bounds[cut.firsts[c]])
+            .collect();
+        assert_eq!(regions, [960, 960, 840, 840]);
+        let lanes: Vec<usize> = (0..4).map(|c| cut.firsts[c + 1] - cut.firsts[c]).collect();
+        assert_eq!(lanes, [8, 8, 7, 7]);
+    }
+
+    /// A dispatch visits every unit once under either stealing arm, and with
+    /// nothing stealing each unit of CCD `c`'s span runs on a cpu of CCD `c`.
+    /// The flat dispatch is the control: with nothing stealing it puts units on
+    /// CCDs that are not their span's, which is what a locality read has to see
+    /// go wrong.
+    #[test]
+    #[ignore = "hw: pins the calling thread and reads the box's CCD topology"]
+    fn hw_a_ccd_dispatch_runs_each_unit_on_its_ccd_when_nothing_steals() {
+        let pool = threads::pool();
+        assert!(pool.pin_caller(), "pinning must succeed on the box");
+        let map = pool.ccd_map().expect("every participant is pinned");
+        let ccd_of_cpu = |cpu: i32| {
+            let cpu = u32::try_from(cpu).expect("a unit was computed");
+            pool.topology()
+                .iter()
+                .position(|g| g.contains(&cpu))
+                .expect("a cpu of some CCD")
+        };
+        for say_uniform in [true, false] {
+            for set in shapes(say_uniform) {
+                let total = set.start(set.pairs());
+                for steal in [true, false] {
+                    set.forget();
+                    let mut acc = profile::CallAcc::new();
+                    run_row_pool_with(&set, 0, &mut acc, true, Lanes::Ccd(map), steal).unwrap();
+                    assert!(
+                        set.seen.iter().all(|h| h.load(Ordering::Relaxed) == 1),
+                        "units {:?}, steal {steal}: a unit missed or twice",
+                        set.units
+                    );
+                    if steal {
+                        continue;
+                    }
+                    for p in 0..set.pairs() {
+                        for u in 0..set.units[p] {
+                            let on = ccd_of_cpu(set.cpu[set.start(p) + u].load(Ordering::Relaxed));
+                            assert_eq!(
+                                on,
+                                span_ccd(&map, set.units[p], u),
+                                "units {:?}: unit {u} of pair {p}",
+                                set.units
+                            );
+                        }
+                    }
+                }
+                // The control: the flat cut, nothing stealing.
+                if map.active() < 2 || total < 4 * map.threads() {
+                    continue;
+                }
+                set.forget();
+                let mut acc = profile::CallAcc::new();
+                run_row_pool_with(&set, 0, &mut acc, true, Lanes::Flat, false).unwrap();
+                let misplaced = (0..set.pairs())
+                    .flat_map(|p| (0..set.units[p]).map(move |u| (p, u)))
+                    .filter(|&(p, u)| {
+                        let on = ccd_of_cpu(set.cpu[set.start(p) + u].load(Ordering::Relaxed));
+                        on != span_ccd(&map, set.units[p], u)
+                    })
+                    .count();
+                assert!(
+                    misplaced > 0,
+                    "units {:?}: the flat cut is no control",
+                    set.units
+                );
+            }
+        }
+    }
+
+    /// A buffer's slice at an offset, so the matrix starts anywhere in a line.
+    fn matrix(buf: &[u8], off: usize, units: usize, row: usize) -> WarmSpan<'_> {
+        WarmSpan {
+            bytes: &buf[off..off + units * row],
+            units,
+        }
+    }
+
+    /// Every line of a matrix is touched exactly once over every participant
+    /// and every matrix of a warm, the bytes counted are the matrices' own, the
+    /// lines of CCD `c`'s participants lie in CCD `c`'s span of the units, a
+    /// CCD's participants take shares of its lines in rank order that differ by
+    /// at most one line, and the paced lines of a participant's walk are the
+    /// first of its share and the first of each page after it.
+    #[test]
+    fn a_warm_touches_every_line_of_a_matrix_once() {
+        let buf = vec![0u8; 1 << 22];
+        for (threads, ccds) in [(1, 1), (8, 3), (30, 4), (32, 4), (3, 8)] {
+            let map = CcdMap::new(threads, ccds, 0);
+            // Starts inside a line and across them; rows that are no multiple of a line.
+            for (off, units, row) in [
+                (0, 64, 1152),
+                (1, 100, 880),
+                (37, 17, 4096),
+                (64, 9, 100),
+                (100, 2, 1),
+            ] {
+                let spans = [
+                    matrix(&buf, off, units, row),
+                    matrix(&buf, 1 << 21, 33, 3000),
+                ];
+                let what = format!("threads={threads} ccds={ccds} off={off} {units}x{row}");
+                let mut lines: Vec<(usize, usize, bool)> = Vec::new();
+                let mut bytes = 0u64;
+                for t in 0..threads {
+                    let mut mine = Vec::new();
+                    let done = warm_walk(&spans, &map, t, || false, &mut |b: &[u8], off, paced| {
+                        mine.push(((b.as_ptr() as usize + off) / 64, paced));
+                    });
+                    assert!(!done.cut, "{what}");
+                    bytes += done.bytes;
+                    lines.extend(mine.into_iter().map(|(l, paced)| (l, t, paced)));
+                }
+                assert_eq!(
+                    bytes,
+                    spans.iter().map(|s| s.bytes.len() as u64).sum::<u64>(),
+                    "{what}: the bytes counted"
+                );
+                let mut want: Vec<usize> = Vec::new();
+                for s in &spans {
+                    let base = s.bytes.as_ptr() as usize;
+                    want.extend(base / 64..(base + s.bytes.len()).div_ceil(64));
+                }
+                let mut got: Vec<usize> = lines.iter().map(|&(l, _, _)| l).collect();
+                got.sort_unstable();
+                want.sort_unstable();
+                assert_eq!(got, want, "{what}: every line once");
+                for span in &spans {
+                    let base = span.bytes.as_ptr() as usize;
+                    let row = span.bytes.len() / span.units;
+                    for t in 0..threads {
+                        let c = map.ccd_of(t);
+                        let share = warm_lines(*span, &map, t);
+                        let units_c = map.span(span.units, c);
+                        for l in share.clone() {
+                            let at = (l * 64).max(base) - base;
+                            assert!(
+                                (units_c.start * row..units_c.end * row).contains(&at),
+                                "{what}: participant {t}'s line {l} (byte {at}) is outside CCD {c}'s units {units_c:?}"
+                            );
+                        }
+                        // The next rank's share follows, at most a line shorter.
+                        if map.rank_of(t) + 1 < map.width(c) {
+                            let next = warm_lines(*span, &map, t + ccds);
+                            if !share.is_empty() || !next.is_empty() {
+                                assert_eq!(share.end, next.start, "{what}: ranks of {t}");
+                                assert!(
+                                    share.len() >= next.len() && share.len() <= next.len() + 1,
+                                    "{what}: ranks of {t}"
+                                );
+                            }
+                        }
+                        let paced = lines
+                            .iter()
+                            .filter(|&&(l, who, p)| who == t && p && share.contains(&l))
+                            .count();
+                        let want_paced = share
+                            .clone()
+                            .filter(|&l| l == share.start || l % 64 == 0)
+                            .count();
+                        assert_eq!(paced, want_paced, "{what}: participant {t}'s paced lines");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A walk stops within 16 lines of its stop: with the stop raised after
+    /// 100 touches it ends having touched at least those and at most 16 more,
+    /// says it was cut and counts the bytes of the lines it reached.
+    #[test]
+    fn a_warm_stops_within_sixteen_lines_of_its_stop() {
+        let buf = vec![0u8; 8 << 20];
+        let map = CcdMap::new(4, 2, 0);
+        let spans = [matrix(&buf, 0, 2048, 4096)];
+        let touched = Cell::new(0usize);
+        let done = warm_walk(
+            &spans,
+            &map,
+            0,
+            || touched.get() >= 100,
+            &mut |_: &[u8], _, _| touched.set(touched.get() + 1),
+        );
+        assert!(done.cut);
+        let n = touched.get();
+        assert!(
+            (100..=116).contains(&n),
+            "{n} lines touched after a stop at 100"
+        );
+        assert!(done.bytes <= 64 * n as u64 && done.bytes + 64 >= 64 * n as u64);
+        // Never raised: not cut, and the routine itself walks the same bytes.
+        let full = warm_walk(&spans, &map, 1, || false, &mut |_: &[u8], _, _| {});
+        assert!(!full.cut);
+        assert_eq!(warm_share(&spans, &map, 1, || false), full);
     }
 }

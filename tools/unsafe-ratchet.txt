@@ -182,7 +182,11 @@ levers 0 0 0
 # PIN(2026-10-06): model 114 -> 117 blocks, 11 -> 13 impls, new code, not old code relaxed: bench_v41_host's
 # unioncard arm hands its pool chunks disjoint cells through ChunkPtr (the Send and Sync impls; write, read and
 # with_mut, one block each), each with its SAFETY line.
-model 117 30 13
+# PIN(2026-10-09): model 117 -> 119 blocks, 30 -> 31 fns, new code, not old code relaxed: the CCD-major dispatch's
+# compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
+# with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
+# makes unsafe).
+model 119 31 13
 models 0 0 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
