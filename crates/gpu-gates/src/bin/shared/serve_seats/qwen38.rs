@@ -272,7 +272,8 @@
 //! with this process's values and exits. The Qwen3.8 levers are
 //! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
 //! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
-//! tier's load settings, `BLOOMERY_PIN_MAIN`, the draft's levers,
+//! tier's load settings, `BLOOMERY_PIN_MAIN` with `BLOOMERY_HOST_LANES`, the
+//! draft's levers,
 //! `BLOOMERY_RESIDENCY`, `BLOOMERY_XSTREAM` and `BLOOMERY_STEP_STATS` (the
 //! `slots round` record a round of several slots prints); the ubatch size
 //! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
@@ -343,6 +344,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::QWEN38_EXPERTS,
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::PIN_MAIN,
+    bloomery_levers::HOST_LANES,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,
@@ -1134,6 +1136,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 /// `Ok` carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
+    model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
     // Set, the word runs as given; unset, the Qwen3.8 rule picks it once the
     // placement and the plan are known (`residency unset`).

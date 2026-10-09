@@ -31,7 +31,7 @@
 //! the one-column leg, the step union at 1, 3 and 9 columns under both
 //! deferral arms and a heterogeneous group each equal their flat-lane value
 //! bit for bit, under every spread of the pool's participants over 1, 2, 3, 4
-//! and 12 CCDs ([`ops::set_host_lanes`]) — in children at 8 and 30 threads too,
+//! and 12 CCDs (the legs' `_on` forms take the lanes) — in children at 8 and 30 threads too,
 //! where 8 over three CCDs is 3/3/2 and 30 over four is 8/8/7/7 — with
 //! `BLOOMERY_POISON=1`, so a cell no lane computed is a NaN the compare sees.
 #[path = "common/manifest.rs"]
@@ -170,10 +170,10 @@ fn seeded(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// What every leg of the layer computes, under whichever lanes are set: the
-/// one-column leg of each column's list, the step union at each width, and a
-/// group of three matrices of two row counts.
-fn legs(layer: &r8layer::Layer, split: &Split) -> Vec<Vec<f32>> {
+/// What every leg of the layer computes under `lanes`: the one-column leg of
+/// each column's list, the step union at each width, and a group of three
+/// matrices of two row counts.
+fn legs(layer: &r8layer::Layer, split: &Split, lanes: Lanes) -> Vec<Vec<f32>> {
     let (embd, ff, n_expert) = (layer.embd, layer.ff, layer.n_expert);
     let src = R8Source::rows(split);
     let host = HostLayer::build(src, &layer.spec()).unwrap();
@@ -193,7 +193,7 @@ fn legs(layer: &r8layer::Layer, split: &Split) -> Vec<Vec<f32>> {
     for j in 0..COLS {
         let xj = Tensor2::from_vec(embd, 1, x[j * embd..(j + 1) * embd].to_vec());
         let mut out = vec![f32::NAN; embd];
-        host.experts_into(src, &xj, &lists[j], &mut out, &mut hs)
+        host.experts_into_on(lanes, src, &xj, &lists[j], &mut out, &mut hs)
             .unwrap();
         all.push(out);
     }
@@ -203,7 +203,7 @@ fn legs(layer: &r8layer::Layer, split: &Split) -> Vec<Vec<f32>> {
             let refs: Vec<&[(u32, f32)]> = lists[..k].iter().map(Vec::as_slice).collect();
             let mut out = vec![f32::NAN; embd * k];
             let view = Tensor2::from_vec(embd, k, x[..embd * k].to_vec());
-            let done = host.experts_step_union_into(src, &view, &refs, &mut out, &mut us);
+            let done = host.experts_step_union_into_on(lanes, src, &view, &refs, &mut out, &mut us);
             ops::set_defer_quant(None);
             done.unwrap();
             all.push(out);
@@ -234,7 +234,6 @@ fn legs(layer: &r8layer::Layer, split: &Split) -> Vec<Vec<f32>> {
         Tensor2::zeros(ff, 1),
         Tensor2::zeros(embd, 1),
     ];
-    let lanes = Lanes::host_tier();
     matmul_q_group_into_on(lanes, "mt", &ws, &[&xe, &xe, &xf], &mut outs).unwrap();
     all.extend(outs.map(|o| o.data.clone()));
     all
@@ -253,17 +252,14 @@ fn hw_ccd_lanes_child() {
     let layer = r8layer::Layer::write("mt-ccd", 512, 256, 16, GgmlType::Q4_K);
     let split = Split::open(&layer.source).unwrap();
     let threads = threads::pool().threads();
-    ops::set_host_lanes(Some(0));
-    let want = legs(&layer, &split);
+    let want = legs(&layer, &split, Lanes::Flat);
     assert!(
         want.iter().flatten().all(|v| v.is_finite()),
         "the flat legs are finite, or the compare below sees nothing"
     );
     for ccds in [1, 2, 3, 4, 12] {
-        ops::set_host_lanes(Some(ccds));
-        let got = legs(&layer, &split);
-        ops::set_host_lanes(None);
         let map = CcdMap::new(threads, ccds, 0);
+        let got = legs(&layer, &split, Lanes::Ccd(map));
         let widths: Vec<usize> = (0..ccds).map(|c| map.width(c)).collect();
         assert_eq!(got.len(), want.len());
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {

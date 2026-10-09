@@ -20,11 +20,12 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{new_cache, step};
 use model::moe::{HostLayer, HostScratch, UnionScratch};
-use model::ops::{self, Tensor2};
+use model::ops::{Lanes, Tensor2};
 use model::r8file::R8Source;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use threads::CcdMap;
 
 /// The counters are the process's: one gate counts at a time.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -150,7 +151,7 @@ fn hw_steady_step_allocations_bounded() {
 /// Allocator calls of the host tier's legs over a synthetic routed layer —
 /// the one-column leg and a three-column step union, each a pair of pool
 /// dispatches — in a steady state, under flat lanes and under CCD-major lanes
-/// ([`ops::set_host_lanes`]): the CCD-major dispatch keeps its tables on the
+/// (the legs' `_on` forms take them): the CCD-major dispatch keeps its tables on the
 /// stack, so its calls make no more than the flat ones' (a table made per
 /// dispatch is two allocations a call). Each arm's count is the least of three
 /// repeats of eight calls after twenty that fill the pools, so a worker's
@@ -183,26 +184,25 @@ fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
     let lists = [list(0), list(1), list(2)];
     let refs: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
     let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
-    let mut calls = |n: usize| {
+    let mut calls = |lanes: Lanes, n: usize| {
         for _ in 0..n {
-            host.experts_into(src, &x, &lists[0], &mut out1, &mut hs)
+            host.experts_into_on(lanes, src, &x, &lists[0], &mut out1, &mut hs)
                 .unwrap();
-            host.experts_step_union_into(src, &x3, &refs, &mut out3, &mut us)
+            host.experts_step_union_into_on(lanes, src, &x3, &refs, &mut out3, &mut us)
                 .unwrap();
         }
     };
     IS_MAIN.with(|m| m.set(true));
     let mut least = [u64::MAX; 2];
-    for (arm, lanes) in [(0, Some(0)), (1, Some(4))] {
-        ops::set_host_lanes(lanes);
-        calls(20);
+    let ccd = Lanes::Ccd(CcdMap::new(threads::pool().threads(), 4, 0));
+    for (arm, lanes) in [(0, Lanes::Flat), (1, ccd)] {
+        calls(lanes, 20);
         for _ in 0..3 {
             let c0 = CALLS.load(Relaxed);
-            calls(8);
+            calls(lanes, 8);
             least[arm] = least[arm].min(CALLS.load(Relaxed) - c0);
         }
     }
-    ops::set_host_lanes(None);
     eprintln!(
         "host legs, 8 calls of one-column + 3-column step union: {} allocator calls flat, {} CCD-major",
         least[0], least[1]

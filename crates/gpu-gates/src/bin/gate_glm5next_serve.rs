@@ -284,6 +284,7 @@ mod gate {
         bloomery_levers::CARD_DONTNEED,
         bloomery_levers::R8,
         bloomery_levers::PIN_MAIN,
+        bloomery_levers::HOST_LANES,
         bloomery_levers::DRAFT,
         bloomery_levers::MTP_WIDTH,
         bloomery_levers::RESIDENCY,

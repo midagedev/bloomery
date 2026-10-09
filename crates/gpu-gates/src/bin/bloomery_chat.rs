@@ -71,7 +71,8 @@ mod drive {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PIN_MAIN, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LANES, HOST_LOCK, HOST_POPULATE, PIN_MAIN,
+        R8,
     };
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
@@ -246,11 +247,13 @@ mod drive {
             ENGRAM_HELPER,
             CARD_BUDGET,
             PIN_MAIN,
+            HOST_LANES,
             HOST_POPULATE,
             HOST_LOCK,
             CARD_DONTNEED,
             R8,
         ])?;
+        model::ops::set_host_lanes(levers.host_lanes());
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let (a, placed) = parse_args()?;
         placed.record().eprint();
