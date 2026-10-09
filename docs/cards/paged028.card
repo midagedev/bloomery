@@ -1,0 +1,10 @@
+# The 0.2.8 release pass, the NVMe tier's paged path on the final tarball: bloomery-serve --model qwen38 at --place gate
+# with BLOOMERY_HOST_ROOM=27G (the gate plan pages its host experts through the tier's RAM arena there), every other
+# lever unset, --ctx-size 16384 and no --parallel; tapes 1 and 4 (short, 5,536 tokens), greedy, thinking off. Expected:
+# the load serves one slot (`parallel … from=paged` or from=ctx), the `paged` line names the arena, the draft is off,
+# both tapes answer and decode; red on a refused load, a failed request, a dead server or an engine error line.
+kind: exclusive
+reason: one 111 GB model load and two timed requests whose tier reads must not share the NVMe or the card; why now:
+  the seat fixes changed the paged plan (the checkpoint reserve, the engine's room) after the last paged run, and the
+  tag waits on this
+minutes: 5..12
