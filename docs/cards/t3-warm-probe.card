@@ -1,0 +1,27 @@
+# T3's one term the paper cannot close: what a Qwen3.8 host expert costs the leg once the step port's warm routine has
+# pulled its CCD quarters into the computing CCDs' L3 (c_hot), and how a warmed expert's cost combines with the cold
+# ones' DRAM stream in one dispatch (linear against overlap). Derived band: compute at one column = a + c, a scaled from
+# V4.1's a by bytes (28.1 us x 3.134 / 16.8 = 5.2) and c by MACs (4.92 M a column x 32 threads at 1.31 TMAC/s = 3.75),
+# so c_hot ~ 9 us; the tournament's 4..10 from the same model. W cold 23.4..26.6 us (bench 32x1, M1).
+kind: profile
+question: on the box's host, what does one Qwen3.8 host expert cost the one-column leg (engine shape, n_host 8) when k of
+  its 8 experts were warmed by the engine's own warm routine onto the engine's own CCD map, and is that cost linear in k?
+term: c_hot = the slope of us_per_expert over k of bench_v41_host's engine-warm:8w<k> arms (k = 0, 3, 8; 32 threads,
+  qwen4exp profile, the engine's CCD map and in-CCD-first stealing), W(8) / 8 at k = 8; the k = 3 point read against the
+  line through k = 0 and k = 8; the k = 0 arm against today's engine:8 arm (the split's own price) as a recorded row
+unit: us
+predict: 5..12
+condition: the lead runs BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/t3-warm-probe.card BLOOMERY_MODEL=qwen4exp'
+  just time-cpu-v41-host --threads 32 --rounds 4 --arms engine:8,engine-warm:8w0,engine-warm:8w3,engine-warm:8w8
+  on the R1 tree (its build log shows Compiling model); the warm rate (bytes the warm loaded / the warm job's wall,
+  printed per warm arm) within 110..140 GB/s — above 160 the walk timed issue, not fill, and the sweep is void; every
+  arm admissible=yes (mincore residency 100 %, majflt 0 in the
+  timed window); the pool's pin record names every worker's CCD and the caller pinned; no other compute on the box
+decide-in: open R2 (the step port's warm and the predictor); the A/B cards take c_hot as measured and the linear form if
+  the k = 3 point sits within 1.5 us of the line, else the overlap form
+decide-below: c_hot under 5 us: the warmed rows run near the compute floor; open R2 with the overlap form as the band's
+  upper edge and re-derive a (the per-expert unpack) from the arm's perf stat
+decide-above: c_hot over 12 us: profile engine-warm:8w8 (perf stat IPC and L3 misses) before R2 — a miss count near the
+  cold arm's means the lines left L3 or landed on another CCD (map, or prefetches dropped behind the one paced load a page:
+  try a demand load a line); open R2 at the measured band while c_hot stays under 18 us; at 18 us or more drop T3
+  (server +3 % or less, gate +5.5 % or less [derived, design-t3 price2])
