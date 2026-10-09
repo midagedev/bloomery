@@ -43,8 +43,10 @@
 #             rows of that depth. Beside a plain `<D>` arm it is the same-binary A/B, paired by round in
 #             the ratio table's `ours/ours@…` line, e.g. `6 6@BLOOMERY_QWEN38_EXPERTS=host`. A lever arm is
 #             compared only with ours arms of the same binary, never with a bin: arm or a reference: under
-#             1 % two builds differ by link layout alone (AGENTS.md). The label is what its witness blocks
-#             and its row print, so both name the variables. The variables are load-time
+#             1 % two builds differ by link layout alone (AGENTS.md). One table is the two builds' A/B, not
+#             the lever's: `ratio slots bin d=` sets an aggregate arm beside a bin: arm of the same list
+#             (<D>@BLOOMERY_GEN_SLOTS=N below). The label is what its witness blocks and its row print, so
+#             both name the variables. The variables are load-time
 #             (tools/ref/load-groups.sh), so the load key holds them: a lever arm is a load of its own, a
 #             unit the round's rotation (Order) moves like any other. BLOOMERY_AB_LOAD=arm in the list runs
 #             the arm alone and stays in the label; the binary never sees it. Refused by name before
@@ -73,28 +75,36 @@
 #             `depth-qwen3moe.sh --parse-arms [--registry <registry.rs>] <arms...>` parses the arms as a
 #             run does and prints each arm's kind, depth, label, variables and load key — a prose arm's
 #             line also its corpus path and the file's first three ids (`-` when the file is not readable
-#             where it runs: the box's path, read on the Mac — a run refuses it) — each round's
+#             where it runs: the box's path, read on the Mac — a run refuses it) — each `ratio slots bin`
+#             pair (<D>@BLOOMERY_GEN_SLOTS=N below), each round's
 #             order and round 1's load command lines (`env NAME=VALUE ...` first), then exits 0 before the card, the binaries and the lease (it runs on the Mac);
 #             `--self-test` runs it on fixed arms, on the Mac. check-recipes does not run it: a script it
 #             names that calls lease_take makes gate-batch.sh refuse the check as a timed recipe.
-#   <D>@BLOOMERY_GEN_SLOTS=N[,NAME=VALUE...]  (and prose:<P>@BLOOMERY_GEN_SLOTS=N…) a lever arm read
-#             as an aggregate row: generate_qwen3moe decodes N streams in one pass (the lever's row in
+#   <D>@BLOOMERY_GEN_SLOTS=N[,NAME=VALUE...]  (and prose:<P>@BLOOMERY_GEN_SLOTS=N…, and a bin: arm whose
+#             list names it, bin:<path>:<D|prose:<P>>@BLOOMERY_GEN_SLOTS=N…) a lever arm read as an
+#             aggregate row: generate_qwen3moe decodes N streams in one pass (the lever's row in
 #             crates/levers/src/registry.rs). The arm feeds N·D ids — lcg_prompt N·D, whose first D are
 #             the <D> arm's prompt and the rest the walk's next ids, or the corpus's first N·P — which the
-#             binary cuts into N windows of D, window j prefilled into slot j; its `[parse]` line ends in
+#             binary cuts into N windows of D, window j prefilled into slot j (a bin: arm's one-arm command
+#             line takes them as its --tokens); its `[parse]` line ends in
 #             `slots=N feed=N·D`. Its row reads the counted (`warm` left out) `time pass … kind=slots`
 #             records through records.py: `tok/s(aggregate) <Σ positions · 1000 / Σ ms> @ n=N·<rounds>,
 #             depth D, <card>`, then `slots N`, the per stream rate and the SMOKE footer's p50 and mean
 #             ms a pass; `nodes` is the captured pass's (`capture slots=`). The per-arm means hold it
 #             beside the plain arm, `(aggregate of N slots)`; it stays out of the `ratio d=` and prose
 #             tables, and `ratio slots d=` is its aggregate over its plain twin's tok/s per round — the
-#             twin is its label less the BLOOMERY_GEN_SLOTS item (ours, ours@prose, ours@<the rest>) — so
-#             above 1 N streams in one pass outrun one stream. Refused by name before anything runs: an N
-#             that is not a whole number, N·D past the 20000 ids one argument holds, N·P past the corpus,
-#             and BLOOMERY_GEN_SLOTS in the runner's own environment (an arm names its own). A FAIL row: a
-#             slots arm with no counted kind=slots record or one whose positions is not N, and a kind=slots
-#             record from an arm that names no N. N = 1 is a plain lever arm. The binary refuses N past a
-#             pass's rows and a placed qwen3moe or qwen35moe load by name (a FAIL row here).
+#             twin is its label less the BLOOMERY_GEN_SLOTS item (ours, ours@prose, ours@<the rest>,
+#             bin:<tree>[@prose][@<the rest>]) — so above 1 N streams in one pass outrun one stream.
+#             `ratio slots bin d=` is an ours aggregate arm's over a bin: aggregate arm's per round, for each
+#             pair whose labels are the same after `ours@` and after `bin:<tree>@` (`prose@` when the arm
+#             feeds the corpus, then the list as given, model= in it: the same prompt, N and file, so the
+#             same ids): the same-lease A/B of two builds' N streams in one pass, above 1 this build's
+#             faster; a bin: aggregate arm with no such ours arm says so there. Refused by name before
+#             anything runs: an N that is not a whole number, N·D past the 20000 ids one argument holds, N·P
+#             past the corpus, and BLOOMERY_GEN_SLOTS in the runner's own environment (an arm names its
+#             own). A FAIL row: a slots arm with no counted kind=slots record or one whose positions is not
+#             N, and a kind=slots record from an arm that names no N. N = 1 is a plain lever arm. The binary
+#             refuses N past a pass's rows and a placed qwen3moe or qwen35moe load by name (a FAIL row here).
 #   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
 #            $BLOOMERY_DATA/$MODEL_NAME/corpus-prose.ids (the profile's own prose corpus, one id a line —
 #            the file its d1k reference set is cut from) through --tokens instead of the LCG prompt, the
@@ -121,10 +131,13 @@
 #             grammar and refusals as an ours lever arm's — the registry is this tree's, and an older
 #             binary that refuses a lever ends the arm a FAIL row (Failures below) — with the model=
 #             item among them (`bin:<tree>@prose@BLOOMERY_HOSTSTREAM=off`,
-#             `bin:<tree>@model=<path>,BLOOMERY_HOSTSTREAM=off`: the label keeps the list); place= and
-#             mem= are an ours arm's items and are refused on it. It is a base by construction, so its freshness is not asked; its tree line
-#             (sha256, HEAD, dirty files) is printed with the references'. Every label is its own
-#             engine in the per-arm means and in the ratio table (ours / each other label).
+#             `bin:<tree>@model=<path>,BLOOMERY_HOSTSTREAM=off`: the label keeps the list); place= is an
+#             ours arm's item and is refused on it, and mem= runs it capped (Mem below). A list naming
+#             BLOOMERY_GEN_SLOTS=N (N ≥ 2) makes it an aggregate arm, as an ours arm's, with its refusals
+#             (<D>@BLOOMERY_GEN_SLOTS=N above). It is a base by construction, so its freshness is not
+#             asked; its tree line (sha256, HEAD, dirty files) is printed with the references'. Every
+#             label is its own engine in the per-arm means and in the ratio table (ours / each other
+#             label; an aggregate label in the slots tables instead).
 #   ik:<D>    ik: llama-bench -p 0 -n 0 -gp D,N -r 1 $IK_GPU_FLAGS (D = 0: plain tg N). The D-token
 #             prefill runs first and untimed: ik restarts its clock after it.
 #   ikdef:<D> the same at $IK_GPU_DEFAULT_FLAGS: llama-bench's own defaults with every layer on the
@@ -406,21 +419,30 @@
 # card is not the timing card is refused (64), bp too; every row of an arm with a --place names it (`place
 # <p>`), and one whose load line names another placement is a FAIL row.
 #
-# Mem. An ours arm's own list may name the host memory it runs under, `mem=<N>G` among its NAME=VALUE
-# items (`6@mem=61G`, `prose:512@mem=61G,BLOOMERY_QWEN38_EXPERTS=host`, N ≥ 1): that arm's process runs in
-# `systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0` (the box has no swap), the arm bound's
-# timeout outside the scope, its TERM forwarded by systemd-run and by the shell inside it to the binary.
-# The item is the runner's, never a variable the binary sees; the label keeps it (`ours@mem=61G`), and the
-# arm runs in a process of its own — no load key, as a bin: arm — so the scope is one arm's. The arm's
-# witness prints the scope's `memory.peak` after it, read inside the scope before systemd takes the
-# cgroup back. The engine's host guard reads the scope's room (host_available: memory.max −
-# memory.current + the file pages), so the model's shards in the page cache do not eat the limit whether
-# the scope or an earlier arm outside one faulted them in; the pages another arm cached stay charged
-# where that arm ran, so the scope simulates the small host for the guard's arithmetic, not the cold
-# reads of one. mem= on a reference or server arm rides the '@' refusal those arms take, and on a bin:
-# arm is refused by name (its list holds the build's levers and model=); an empty
-# value, one with no G, a value that is not a whole number of GiB and mem given twice are refused by
-# name before anything runs.
+# Mem. An ours or bin: arm's own list may name the host memory it runs under, `mem=<N>G` among its NAME=VALUE
+# items (`6@mem=61G`, `prose:512@mem=61G,BLOOMERY_QWEN38_EXPERTS=host`, `bin:<path>:prose:512@mem=29G,…`,
+# N ≥ 1): that arm's process runs in `systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0` (the box has
+# no swap), the arm bound's timeout outside the scope, its TERM forwarded by systemd-run and by the shell
+# inside it to the binary.
+# The item is the runner's, never a variable the binary sees; the label keeps it (`ours@mem=61G`,
+# `bin:<tree>@mem=29G`), and the arm runs in a process of its own — no load key — so the scope is one arm's.
+# The arm's witness prints the scope's `memory.peak` after it, read inside the scope before systemd takes the
+# cgroup back. Before each of its processes (every round, the warm-up and a block's discard included) the
+# runner evicts the arm's model file: posix_fadvise(POSIX_FADV_DONTNEED) over every shard of its split set
+# (the profile's file or the arm's model=), then a mincore count of their resident pages, one witness line
+# (`evict: <file> shards=<n> pages=<p> resident before=<b> after=<a>`); a page still resident (one another
+# process holds mapped is not evicted) ends the arm unrun as a FAIL row naming the count, `rc=evict`. It
+# advises those files alone: never drop_caches, another file or a system setting; --parse-arms names it
+# (`[parse] evict …`) and runs nothing. So each capped process faults its shards itself, inside its scope,
+# and the page cache it reads is bounded by its cap. The engine's host guard reads the scope's room
+# (host_available: memory.max − memory.current + the file pages). Every row of a mem= arm carries
+# `capped mem=<N>G` as a field of its own, after its card (and place) field. A capped row reproduces a small
+# host's page-cache bound and its cold re-reads, after the per-arm eviction; it does not reproduce swap
+# (MemorySwapMax=0, and the box has no swap), and it is never a substitute for a small host's own row.
+# mem= on a reference or server arm rides the '@' refusal those arms take; an empty value, one with no G, a
+# value that is not a whole number of GiB, mem given twice, a shard of the arm's split set that is not there
+# (before the lease) and a mem= arm under BLOOMERY_WARM_ROWS=1 (its eviction drops what the prime warmed)
+# are refused by name before anything runs.
 #
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
 # the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table (AGENTS.md, user
@@ -570,6 +592,39 @@ ratio_table() {
     printf "%s%-5s %s/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s%s\n", prefix, d[i], base, ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy, cold
   }
 }'
+}
+# slots_bin_pairs: `<kind>|<label>` lines on stdin, the aggregate arms (kind ours or bin); for each bin:
+# label in the order given, a line `<ours label>|<bin label>` for every ours label whose rest after its first
+# `@` is the bin: label's (after `ours@` and `bin:<tree>@`: `prose@` when the arm feeds the corpus, then its
+# list as given, the model= item in it, so the same prompt, N and file: at one depth the same ids), or
+# `|<bin label>` when none is.
+slots_bin_pairs() {
+  awk -F'|' '!seen[$0]++ {
+    r = $2; sub(/^[^@]*@/, "", r)
+    if ($1 == "ours") { no++; o[no] = $2; orest[no] = r }
+    if ($1 == "bin") { nb++; b[nb] = $2; brest[nb] = r }
+  } END {
+    for (j = 1; j <= nb; j++) {
+      hit = 0
+      for (i = 1; i <= no; i++) if (orest[i] == brest[j]) { print o[i] "|" b[j]; hit = 1 }
+      if (!hit) print "|" b[j]
+    }
+  }'
+}
+# slots_bin_table <depths> <pairs>: the decode records on stdin (sums' `label|depth|round|tok/s|…|tags|N`) as
+# `ratio slots bin d=` lines, one ratio_table a pair of slots_bin_pairs' <pairs> (ours over bin), and a line
+# for a bin: label with none.
+slots_bin_table() {
+  local recs ol bl
+  recs=$(cat)
+  while IFS='|' read -r ol bl; do
+    [ -n "$bl" ] || continue
+    if [ -n "$ol" ]; then
+      printf '%s\n' "$recs" | ratio_table "ratio slots bin d=" "$1" "$bl" 0 6 "$ol"
+    else
+      echo "ratio slots bin: $bl has no ours aggregate arm on its prompt with its list among the arms: no ratio"
+    fi
+  done <<< "$2"
 }
 
 # q3_self_test: `depth-qwen3moe.sh --self-test`, the lever arms' parse and refusals (the header's
@@ -834,8 +889,25 @@ q3_self_test() {
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:6@model=/m/q3.gguf,BLOOMERY_HOSTSTREAM=off: kind=bin depth=6 label=bin:t@model=/m/q3.gguf,BLOOMERY_HOSTSTREAM=off env=BLOOMERY_HOSTSTREAM=off load=(a process of its own) model=/m/q3.gguf"
   run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@place=a
   want bin-place 64 "place= is an ours arm's item here"
-  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@mem=61G
-  want bin-mem 64 "mem= is an ours arm's item here"
+  # A bin: arm's mem= is an ours arm's (the header's Mem): its scope, label and refusals, its eviction named
+  # under --parse-arms over every shard of its file's split set; the warm rows refused beside a capped arm, and
+  # a run with a shard of the split set missing refused before the lease.
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@mem=29G,model=/m/q-00002-of-00003.gguf,BLOOMERY_THREADS=8 6@mem=61G,model=/m/q.gguf
+  want bin-mem 0 \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:6@mem=29G,model=/m/q-00002-of-00003.gguf,BLOOMERY_THREADS=8: kind=bin depth=6 label=bin:t@mem=29G,model=/m/q-00002-of-00003.gguf,BLOOMERY_THREADS=8 env=BLOOMERY_THREADS=8 load=(a process of its own) mem=29G model=/m/q-00002-of-00003.gguf" \
+    "[parse] evict bin:/root/r/t/target/release/generate_qwen3moe:6@mem=29G,model=/m/q-00002-of-00003.gguf,BLOOMERY_THREADS=8: 3 shard(s) of /m/q-00002-of-00003.gguf (/m/q-00001-of-00003.gguf .. /m/q-00003-of-00003.gguf), posix_fadvise(DONTNEED) then a mincore count before each of its processes (not run under --parse-arms)" \
+    "[parse] evict 6@mem=61G,model=/m/q.gguf: 1 shard(s) of /m/q.gguf (/m/q.gguf .. /m/q.gguf), posix_fadvise(DONTNEED) then a mincore count before each of its processes (not run under --parse-arms)"
+  for ex in 'no-g|mem=29|mem=29: the item is mem=<N>G' 'not-num|mem=abcG|mem=abcG: the item is mem=<N>G' \
+    'zero|mem=0G|mem=0G: the item is mem=<N>G' 'twice|mem=29G,mem=30G|mem is given twice'; do
+    run_parse -- "bin:/root/r/t/target/release/generate_qwen3moe:6@$(cut -d'|' -f2 <<< "$ex")"
+    want "bin-mem-$(cut -d'|' -f1 <<< "$ex")" 64 "$(cut -d'|' -f3 <<< "$ex")"
+  done
+  run_parse BLOOMERY_WARM_ROWS=1 -- 6 bin:/root/r/t/target/release/generate_qwen3moe:6@mem=29G
+  want mem-warm-rows 64 "arm 'bin:/root/r/t/target/release/generate_qwen3moe:6@mem=29G': BLOOMERY_WARM_ROWS=1 primes an arm's file pages before its row, and a mem= arm's process evicts them first"
+  : > "$pt/m-00001-of-00002.gguf"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen3moe BLOOMERY_DATA="$pt/data" "$BASH" "$me" "6@mem=61G,model=$pt/m-00001-of-00002.gguf" 2>&1)
+  rc=$?
+  want mem-shard-missing 2 "no shard $pt/m-00002-of-00002.gguf of its model file $pt/m-00001-of-00002.gguf"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
   want prose-bin 0 \
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
@@ -843,6 +915,26 @@ q3_self_test() {
   want prose-bin-nop 64 "bin:<path>:prose:<P> takes a prompt length P after prose:"
   run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/release/generate_qwen3moe:prose:900
   want prose-bin-past 64 "a prose prompt of 900 ids"
+  # A bin: arm whose list names BLOOMERY_GEN_SLOTS=N is an aggregate arm as an ours arm is (the header's
+  # <D>@BLOOMERY_GEN_SLOTS=N): N·D lcg ids or the corpus's first N·P, N = 1 a plain lever arm, and its
+  # `ratio slots bin` pair with ours' (none for the lcg one); each refusal by name, the corpus's at
+  # 2 · 351 = 702 ids past its 701 and not at 2 · 350.
+  local bq=bin:/root/r/t/target/release/generate_qwen3moe
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4@BLOOMERY_GEN_SLOTS=2 "$bq:prose:4@BLOOMERY_GEN_SLOTS=2" \
+    "$bq:6@BLOOMERY_GEN_SLOTS=2" "$bq:6@BLOOMERY_GEN_SLOTS=1" "$bq:prose:350@BLOOMERY_GEN_SLOTS=2"
+  want bin-slots 0 \
+    "[parse] $bq:prose:4@BLOOMERY_GEN_SLOTS=2: kind=bin depth=4 label=bin:t@prose@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102 slots=2 feed=8" \
+    "[parse] $bq:6@BLOOMERY_GEN_SLOTS=2: kind=bin depth=6 label=bin:t@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=(a process of its own) slots=2 feed=12" \
+    "[parse] $bq:6@BLOOMERY_GEN_SLOTS=1: kind=bin depth=6 label=bin:t@BLOOMERY_GEN_SLOTS=1 env=BLOOMERY_GEN_SLOTS=1 load=(a process of its own)" \
+    "[parse] $bq:prose:350@BLOOMERY_GEN_SLOTS=2: kind=bin depth=350 label=bin:t@prose@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102 slots=2 feed=700" \
+    "[parse] ratio slots bin: ours@prose@BLOOMERY_GEN_SLOTS=2/bin:t@prose@BLOOMERY_GEN_SLOTS=2" \
+    "[parse] ratio slots bin: (no ours aggregate arm on its prompt with its list)/bin:t@BLOOMERY_GEN_SLOTS=2"
+  run_parse BLOOMERY_DATA="$pt/data" -- "$bq:prose:351@BLOOMERY_GEN_SLOTS=2"
+  want bin-slots-past 64 "a prose prompt of 702 ids (2 slots × 351); $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
+  run_parse -- "$bq:6@BLOOMERY_GEN_SLOTS=x"
+  want bin-slots-count 64 "BLOOMERY_GEN_SLOTS=x is no slot count"
+  run_parse -- "$bq:10001@BLOOMERY_GEN_SLOTS=2"
+  want bin-slots-cap 64 "feeds 2 slots × 10001 = 20002 ids, past the 20000"
   # The probe tag (the header's probe tag) on fixed arm outputs: the row's fields and tag from probe_row,
   # the summary's counts and untagged mean from the mean functions.
   local ld_q ld_c call_q call_c got
@@ -878,6 +970,20 @@ q3_self_test() {
   eq probe-mean-all-tagged "$got" 'n/a (every row tagged)'
   got=$(printf '%s\n' 'ours|512|1|1000.0| [probe-off]' 'llama|512|1|500.0|' | ROUNDS=1 T975= ratio_table "ratio pp p=" 512 llama 1 5 | grep -o 'probe-off: .*')
   eq probe-ratio-count "$got" 'probe-off: ours 1/1'
+  # The two builds' aggregate table (the header's ratio slots bin): each bin: aggregate arm with every ours one
+  # whose label is the same after its first `@` (the prompt, the list as given, model= in it), then the table on
+  # fixed rows, ours over bin.
+  got=$(printf '%s\n' 'bin|bin:t@prose@BLOOMERY_GEN_SLOTS=2' 'ours|ours@BLOOMERY_GEN_SLOTS=2' 'ours|ours@prose@BLOOMERY_GEN_SLOTS=2' \
+    'bin|bin:t@BLOOMERY_GEN_SLOTS=2' 'bin|bin:u@prose@BLOOMERY_GEN_SLOTS=2' 'ours|ours@prose@model=/m/q.gguf,BLOOMERY_GEN_SLOTS=2' \
+    'bin|bin:t@prose@BLOOMERY_GEN_SLOTS=3' 'bin|bin:t@prose@BLOOMERY_GEN_SLOTS=2' 'ours|ours@X=1,BLOOMERY_GEN_SLOTS=2' \
+    'bin|bin:t@BLOOMERY_GEN_SLOTS=2,X=1' | slots_bin_pairs | paste -sd' ' -)
+  eq slots-bin-pairs "$got" 'ours@prose@BLOOMERY_GEN_SLOTS=2|bin:t@prose@BLOOMERY_GEN_SLOTS=2 ours@BLOOMERY_GEN_SLOTS=2|bin:t@BLOOMERY_GEN_SLOTS=2 ours@prose@BLOOMERY_GEN_SLOTS=2|bin:u@prose@BLOOMERY_GEN_SLOTS=2 |bin:t@prose@BLOOMERY_GEN_SLOTS=3 |bin:t@BLOOMERY_GEN_SLOTS=2,X=1'
+  got=$(printf '%s\n' 'ours@prose@BLOOMERY_GEN_SLOTS=2|3|1|250.00||  [cpu-busy]|2' 'ours@prose@BLOOMERY_GEN_SLOTS=2|3|2|250.00|||2' \
+    'bin:t@prose@BLOOMERY_GEN_SLOTS=2|3|1|200.00|| [cold]|2' 'bin:t@prose@BLOOMERY_GEN_SLOTS=2|3|2|200.00|||2' 'ours@prose|3|1|9.00||' |
+    ROUNDS=2 T975="$(python3 "${me%/*}/tdist.py" 2)" slots_bin_table 3 \
+      "$(printf '%s\n' 'ours@prose@BLOOMERY_GEN_SLOTS=2|bin:t@prose@BLOOMERY_GEN_SLOTS=2' '|bin:t@BLOOMERY_GEN_SLOTS=2')")
+  eq slots-bin-table "$got" 'ratio slots bin d=3     ours@prose@BLOOMERY_GEN_SLOTS=2/bin:t@prose@BLOOMERY_GEN_SLOTS=2  mean 1.2500 ± 0.0000 (n=2)  of means 1.2500  per round: r1 1.2500 r2 1.2500  cpu-busy: ours@prose@BLOOMERY_GEN_SLOTS=2 1/2, bin:t@prose@BLOOMERY_GEN_SLOTS=2 0/2  cold: ours@prose@BLOOMERY_GEN_SLOTS=2 0/2, bin:t@prose@BLOOMERY_GEN_SLOTS=2 1/2  probe-off: ours@prose@BLOOMERY_GEN_SLOTS=2 0/2
+ratio slots bin: bin:t@BLOOMERY_GEN_SLOTS=2 has no ours aggregate arm on its prompt with its list among the arms: no ratio'
   # An ours row's drive column: the sectors the device read between the readings, × 512, the device named;
   # a foreign reader's sectors are in the delta; both ours rows carry the column.
   eq drive-col "$(drive_col 1000 1008 nvme0n1)" ' | drive_read_bytes 4096 (nvme0n1)'
@@ -1023,6 +1129,12 @@ corpus_check() {
 corpus_ids() {
   if [ -n "$PARSE_ONLY" ]; then echo "<prose_prompt $1>"; else head -n "$1" "$(corpus_file)" | paste -sd, -; fi
 }
+# corpus_feed <arm> <P>: a prose or bin:<path>:prose:<P> arm's prompt into tok, the corpus's first P ids, N·P
+# for an aggregate arm (ASLOTS: arm_slots runs first); corpus_check's refusals first.
+corpus_feed() {
+  corpus_check "$1" "$(($2 * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $2}"
+  tok=$(corpus_ids "$(($2 * ${ASLOTS:-1}))")
+}
 # The lever arms' list checks (the header's <D>@NAME=VALUE): tools/ref/lever-arms.sh, shared with
 # depth-glm5next.sh. BLOOMERY_AB_LOAD=arm is the load driver's solo marker (load-groups.sh), never the
 # binary's.
@@ -1109,6 +1221,75 @@ arm_has_model() { [[ ,$1 == *,model=* ]]; }
 model_ref_refuse() {
   arm_refuse "$1" "model= sets the arm's BLOOMERY_REF_MODEL, and $2 is a reference engine's arm, which opens the profile's file"
 }
+# model_shards <file>: every shard of <file>'s split set, one a line (`<stem>-0000k-of-0000n.gguf`, k = 1..n,
+# whichever shard <file> names), or <file> alone when its name is no shard's.
+model_shards() {
+  local f=$1 n k
+  if [[ ${f##*/} =~ -([0-9]{5})-of-([0-9]{5})\.gguf$ ]]; then
+    n=${BASH_REMATCH[2]} f=${f%-"${BASH_REMATCH[1]}"-of-"${BASH_REMATCH[2]}".gguf}
+    for ((k = 1; k <= 10#$n; k++)); do printf '%s-%05d-of-%s.gguf\n' "$f" "$k" "$n"; done
+  else
+    echo "$f"
+  fi
+}
+# A capped arm's eviction (the header's Mem), over the shards in argv: each one's resident pages (mincore over a
+# mapping of the file that faults nothing), posix_fadvise(DONTNEED) over the whole file, its resident pages again;
+# prints `<shards> <pages> <resident before> <resident after>`. Linux only: it runs on the box, never under
+# --parse-arms. It advises these files alone: no other file, no drop_caches, no system setting.
+EVICT_PY='
+import ctypes, mmap, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+page = os.sysconf("SC_PAGE_SIZE")
+low = bytes(b & 1 for b in range(256))
+def resident(fd, size):
+    if size == 0:
+        return 0
+    addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
+    if addr is None or addr == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_errno(), "mmap")
+    try:
+        n = (size + page - 1) // page
+        vec = ctypes.create_string_buffer(n)
+        if libc.mincore(addr, size, vec) != 0:
+            raise OSError(ctypes.get_errno(), "mincore")
+        return n - vec.raw.translate(low).count(0)
+    finally:
+        libc.munmap(addr, size)
+pages = before = after = 0
+for path in sys.argv[1:]:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        pages += (size + page - 1) // page
+        before += resident(fd, size)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        after += resident(fd, size)
+    finally:
+        os.close(fd)
+print(len(sys.argv) - 1, pages, before, after)
+'
+# evict_arm <i>: a capped arm's eviction before one of its processes: EVICT_PY over every shard of its model file
+# (its model=, else the profile's), the witness line, and 1 with FAIL_WHY when a page stays resident or the
+# advice did not run.
+evict_arm() {
+  local f=${A_MODEL[$1]:-$MODEL} s out n pages before after
+  local -a shards=()
+  while IFS= read -r s; do shards+=("$s"); done < <(model_shards "$f")
+  if ! out=$(python3 -c "$EVICT_PY" "${shards[@]}" 2>&1); then
+    echo "    evict: $f shards=${#shards[@]} failed: $(tail -n 1 <<< "$out")"
+    FAIL_WHY="evict: the advice over $f's ${#shards[@]} shard(s) did not run: $(tail -n 1 <<< "$out")"
+    return 1
+  fi
+  read -r n pages before after <<< "$out"
+  echo "    evict: $f shards=$n pages=$pages resident before=$before after=$after (posix_fadvise DONTNEED, then mincore)"
+  [ "$after" != 0 ] || return 0
+  FAIL_WHY="evict: $after of the $pages pages of $f's $n shard(s) stay resident after posix_fadvise(DONTNEED) (a page another process holds mapped is not evicted): the capped row would read them warm"
+  return 1
+}
 # split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
 # by lever-arms.sh), APLACE (its place= word, empty without one), AMEM (its mem= N, empty without one) and
 # AMODEL (its model= path, empty without one); place= only a qwen4exp file takes.
@@ -1173,8 +1354,8 @@ for a in "${ARMS[@]}"; do
     bin:*)
       kind=bin eng=bin bin=${a#bin:}
       # `@` opens the build's own variable list (the header's bin:): the same grammar and refusals as an
-      # ours lever arm's — the registry is this tree's — with the model= item among it. place= and mem=
-      # are an ours arm's items here and are refused by name.
+      # ours lever arm's — the registry is this tree's — with the model= and mem= items among it (mem= the
+      # header's Mem, as an ours arm's). place= is an ours arm's item here and is refused by name.
       case $bin in
         *@*) blist=${bin#*@} bin=${bin%%@*} ;;
         *) blist='' ;;
@@ -1193,19 +1374,21 @@ for a in "${ARMS[@]}"; do
       label=bin:${tree##*/}
       if [ -n "$corpus" ]; then
         case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
-        corpus_check "$a" "$dep"
-        tok=$(corpus_ids "$dep")
         label+=@prose
       fi
       if [ -n "$blist" ]; then
         label+=@$blist
         arm_model_split "$a" "$blist"
-        blist=$ARM_MODEL_REST
-        ! arm_has_place "$blist" || arm_refuse "$a" "place= is an ours arm's item here (this runner's --place over BLOOMERY_GEN_PLACE); a bin: arm's list holds the build's levers and model="
-        [[ ",$blist," != *",mem="* ]] || arm_refuse "$a" "mem= is an ours arm's item here (this runner's systemd-run scope); a bin: arm's list holds the build's levers and model="
+        arm_mem_split "$a" "$ARM_MODEL_REST"
+        blist=$ARM_MEM_REST
+        ! arm_has_place "$blist" || arm_refuse "$a" "place= is an ours arm's item here (this runner's --place over BLOOMERY_GEN_PLACE); a bin: arm's list holds the build's levers, model= and mem="
         [ -z "$blist" ] || arm_envs_ok "$a" "$blist"
-        envs=$blist AMODEL=$ARM_MODEL
+        envs=$blist AMODEL=$ARM_MODEL AMEM=$ARM_MEM
       fi
+      # A list naming BLOOMERY_GEN_SLOTS=N makes it an aggregate arm, as an ours arm's: fed N·D lcg ids
+      # (arm_feed) or the corpus's first N·P, through its one-arm command line.
+      arm_slots "$a" "$envs"
+      [ -z "$corpus" ] || corpus_feed "$a" "$dep"
       ;;
     prose:*)
       # prose:<P>[@NAME=VALUE,...]: ours on the corpus's first P ids (the header's prose:<P>).
@@ -1216,8 +1399,7 @@ for a in "${ARMS[@]}"; do
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
       # An aggregate arm feeds the corpus's first N·P ids, slot j the window j.
       arm_slots "$a" "$envs"
-      corpus_check "$a" "$((dep * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $dep}"
-      tok=$(corpus_ids "$((dep * ${ASLOTS:-1}))")
+      corpus_feed "$a" "$dep"
       ours=1
       ;;
     *@*)
@@ -1274,6 +1456,13 @@ for a in "${ARMS[@]}"; do
   # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
+# A capped arm's process evicts its file's pages first (the header's Mem), so the warm rows' prime would warm
+# nothing and every capped row would end FAIL rc=cold: the two are refused together, by name.
+if [ "$WARM_ROWS" = 1 ]; then
+  for i in "${!ARMS[@]}"; do
+    [ -z "${A_MEM[$i]}" ] || arm_refuse "${ARMS[$i]}" "BLOOMERY_WARM_ROWS=1 primes an arm's file pages before its row, and a mem= arm's process evicts them first (the header's Mem): run a capped arm without the warm rows"
+  done
+fi
 # The load keys (tools/ref/load-groups.sh): an ours arm's binary and its --ctx, the cache height and the
 # flash grid the load fixes, so ours arms share a load when they share C (BLOOMERY_GEN_CTX, or one D).
 # shellcheck source=tools/ref/load-groups.sh
@@ -1334,6 +1523,9 @@ lg_cmd() {
 srv_ctx_of() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
 # shellcheck disable=SC2034 # read by lcpp-warm.sh's srv_cmd_of
 SRV_CTX_SRC="ours' --ctx at that D or P: ${GEN_CTX:+BLOOMERY_GEN_CTX }${GEN_CTX:-D + N rounded up to 256}"
+# The aggregate arms of two builds (the header's <D>@BLOOMERY_GEN_SLOTS=N): the `ratio slots bin d=` pairs,
+# empty when no bin: arm is an aggregate arm.
+SB_PAIRS=$(for i in "${!ARMS[@]}"; do [ -z "${A_SLOTS[$i]}" ] || echo "${A_KIND[$i]}|${A_LABEL[$i]}"; done | slots_bin_pairs)
 # --parse-arms: the arms as parsed and each round's order, then exit before the card, the binaries and
 # the lease.
 if [ -n "$PARSE_ONLY" ]; then
@@ -1350,6 +1542,17 @@ if [ -n "$PARSE_ONLY" ]; then
     [ -z "${A_MEM[$i]}" ] || extra+=" mem=${A_MEM[$i]}G"
     [ -z "${A_MODEL[$i]}" ] || extra+=" model=${A_MODEL[$i]}"
     echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}$extra"
+  done
+  # Each pair a run's `ratio slots bin d=` lines read, ours over bin, and a bin: aggregate arm with none.
+  while IFS='|' read -r ol bl; do
+    [ -n "$bl" ] || continue
+    echo "[parse] ratio slots bin: ${ol:-(no ours aggregate arm on its prompt with its list)}/$bl"
+  done <<< "$SB_PAIRS"
+  # Each capped arm's eviction (the header's Mem), named and not run: it is the box's.
+  for i in "${!ARMS[@]}"; do
+    [ -n "${A_MEM[$i]}" ] || continue
+    f=${A_MODEL[$i]:-$MODEL}
+    echo "[parse] evict ${ARMS[$i]}: $(model_shards "$f" | grep -c .) shard(s) of $f ($(model_shards "$f" | head -n 1) .. $(model_shards "$f" | tail -n 1)), posix_fadvise(DONTNEED) then a mincore count before each of its processes (not run under --parse-arms)"
   done
   echo "[parse] order: $ORDER"
   if [ "$ORDER" = rotate ]; then
@@ -1385,6 +1588,17 @@ for i in "${!ARMS[@]}"; do
     echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no model file at ${A_MODEL[$i]} (model= names the file its process opens as BLOOMERY_REF_MODEL, the first shard of a family)" >&2
     exit 2
   }
+done
+# A capped arm evicts every shard of its model file's split set (the header's Mem): a shard that is not there is
+# refused before the lease.
+for i in "${!ARMS[@]}"; do
+  [ -n "${A_MEM[$i]}" ] || continue
+  while IFS= read -r s; do
+    [ -f "$s" ] || {
+      echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no shard $s of its model file ${A_MODEL[$i]:-$MODEL} (a mem= arm evicts every shard of the split set before each of its processes)" >&2
+      exit 2
+    }
+  done < <(model_shards "${A_MODEL[$i]:-$MODEL}")
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
 # has the two-card mode (the header's Two cards).
@@ -1784,6 +1998,11 @@ exit $rc
 ours_arm() {
   local i=$1 r=$2 out rc t0 t1 f0 f1
   ours_pre "$i" "$r"
+  # A capped arm's model file is evicted first (the header's Mem); a page still resident fails the arm unrun.
+  if [ -n "${A_MEM[$i]}" ] && ! evict_arm "$i"; then
+    arm_fail "$(fail_round "$r")" "${A_LABEL[$i]}" "d=${A_DEP[$i]}" evict "$FAIL_WHY"
+    return 0
+  fi
   arm_envs "$i"
   t0=$(date +%s)
   f0=$(majflt_now)
@@ -1956,12 +2175,12 @@ ours_post() {
     # a round's, so 1000 / mean is one stream's rate.
     local agg
     agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace}${A_MEM[$i]:+ | capped mem=${A_MEM[$i]}G} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG|$nslots")
   else
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace}${A_MEM[$i]:+ | capped mem=${A_MEM[$i]}G} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
@@ -2157,7 +2376,7 @@ dry_cmd() {
     facts=", $(arm_feed "$i") of the file's ${PROSE_N:-?} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
   fi
   [ -z "${A_SLOTS[$i]}" ] || facts+=", ${A_SLOTS[$i]} slots of $dep ids in one pass (an aggregate row)"
-  [ -z "${A_MEM[$i]}" ] || facts+=", the arm's process in systemd-run --scope -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 (its peak in the arm's witness)"
+  [ -z "${A_MEM[$i]}" ] || facts+=", the arm's process in systemd-run --scope -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 (its peak in the arm's witness), after posix_fadvise(DONTNEED) and a mincore count over the $(model_shards "${A_MODEL[$i]:-$MODEL}" | grep -c .) shard(s) of ${A_MODEL[$i]:-$MODEL}"
   if lg_grouped "$i"; then
     arm_envs "$i"
     echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
@@ -2214,7 +2433,7 @@ timing_cards_start
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}${PLACE:+ --place $PLACE}"
 [ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
-[ "$MEM_ARMS" = 0 ] || echo "[config] mem: $(mem_arms_line) — each arm's process in systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0, its peak in the arm's witness"
+[ "$MEM_ARMS" = 0 ] || echo "[config] mem: $(mem_arms_line) — each arm's process in systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0, its peak in the arm's witness, after posix_fadvise(DONTNEED) over its model file's shards and a mincore count in the witness (a page resident is a FAIL row); its rows capped mem=<N>G"
 [ "$MODEL_ARMS" = 0 ] || echo "[config] model: $(model_arms_line) — each arm's process opens its file as BLOOMERY_REF_MODEL, the profile's $MODEL otherwise"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
@@ -2290,7 +2509,8 @@ if [ -n "$prose_refs" ]; then
   printf '%s\n' "${sums[@]}" | ratio_table "ratio prose d=" "$deps" "$prose_refs" 0 6 ours@prose
 fi
 # The aggregate arms: each one's aggregate over its plain twin's tok/s, the label less its
-# BLOOMERY_GEN_SLOTS item (ours, ours@prose, ours@<the rest of its list>), the same statistics.
+# BLOOMERY_GEN_SLOTS item (ours, ours@prose, ours@<the rest of its list>, bin:<tree>[@prose][@<the rest>]),
+# the same statistics.
 if [ -n "$SLOT_LABELS" ]; then
   echo
   echo "=== N slots in one pass: each aggregate arm's tok/s (Σ positions / Σ ms of its rounds) over its plain"
@@ -2305,6 +2525,15 @@ if [ -n "$SLOT_LABELS" ]; then
     fi
     printf '%s\n' "${sums[@]}" | ratio_table "ratio slots d=" "$deps" "$twin" 0 6 "$sl"
   done < <(printf '%s' "$SLOT_LABELS" | sort -u)
+fi
+# The aggregate arms of two builds: each ours aggregate arm over each bin: aggregate arm on its prompt with its
+# list (SB_PAIRS, slots_bin_pairs), the same statistics; nothing when no bin: arm is an aggregate arm.
+if [ -n "$SB_PAIRS" ]; then
+  echo
+  echo "=== N slots in one pass, two builds: each ours aggregate arm's tok/s over the bin: aggregate arm's on the"
+  echo "    same prompt with the same list (so the same N and ids) per depth, the same statistics; above 1 this"
+  echo "    build's N streams outrun the other build's ==="
+  printf '%s\n' "${sums[@]}" | slots_bin_table "$deps" "$SB_PAIRS"
 fi
 # The pass time of the MTP rows: a row's tok/s is its pass time over E(4), and E(4) moves with the text
 # two builds generate, so a code change is read on the pass time. The records hold passes a second
