@@ -140,10 +140,12 @@
 //! slots' rows, or a drafted verify's window — reads the paged experts
 //! through the file mapping, whose page cache grows until the kernel swaps
 //! the arena out. The unset counts fall to one slot (`from=paged`) and the
-//! draft off (`load draft=off (unset: the plan pages …)`), one `paged` line
-//! on stderr naming the arena and what was asked; a `--parallel` past one
-//! or `BLOOMERY_DRAFT=mtp` is refused by name before the load, with the way
-//! out. The rule reads the plan the flags name — a set context's plain plan
+//! draft off (`load draft=off (unset: the plan pages …)` — also for a draft
+//! whose yield to the context, judged on the plan of several slots the load
+//! abandons, had turned it off), one `paged` line on stderr naming the arena
+//! and what was asked (`asked_draft` the draft before that yield); a
+//! `--parallel` past one or `BLOOMERY_DRAFT=mtp` is refused by name before
+//! the load, with the way out. The rule reads the plan the flags name — a set context's plain plan
 //! before any search, else the plan the default's search and the draft's
 //! yield chose — and the load's own plan is held to it.
 //!
@@ -581,6 +583,24 @@ fn draft38(
             })
         }
     }
+}
+
+/// The draft a one-column load ([`Paged::OneColumn`]) runs without, as its
+/// `load draft=off` record names it, and whether it was asked: a draft that
+/// ran (`drafts`), or that only its yield to the context turned off — a
+/// verdict on the plan of several slots the load abandons — was asked, and
+/// the paged rule is why it is off; any other reason (set, the placement,
+/// the file, a window past the context) holds whatever the plan, and stays.
+fn paged_draft(drafts: bool, off: Option<Draft38Off>, arena: u64) -> (bool, Option<Draft38Off>) {
+    let asked = drafts || matches!(off, Some(Draft38Off::Yield(_)));
+    (
+        asked,
+        if asked {
+            Some(Draft38Off::Paged { arena })
+        } else {
+            off
+        },
+    )
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
@@ -1224,17 +1244,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             draft_set: levers.draft().is_some(),
         })
     };
+    // The draft a one-column load runs without names the paged rule when
+    // the draft was asked — on, or off only by its yield to the context on
+    // the plan this load abandons ([`paged_draft`]) — at either point.
     let one_column = |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>| {
+        let (asked, draft_off) = paged_draft(mtp, draft_off, arena);
         eprintln!(
             "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} slots=1 \
              draft=off (the plan pages host experts through the NVMe tier's RAM arena: a step \
              of several columns reads them through the file mapping)",
-            if mtp { "on" } else { "off" }
+            if asked { "on" } else { "off" }
         );
-        (
-            if slots > 1 { "paged" } else { from },
-            draft_off.or(mtp.then_some(Draft38Off::Paged { arena })),
-        )
+        (if slots > 1 { "paged" } else { from }, draft_off)
     };
     let early = match a.ctx.map(|c| c / slots) {
         Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
