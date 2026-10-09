@@ -1725,6 +1725,9 @@ pub struct PagedAt {
     /// the binary's own default.
     pub slots: usize,
     pub slots_by: Option<SlotsBy>,
+    /// Whether the slots step as one pass of their rows. Where each steps
+    /// alone (beside an expert tier card), slots add no column.
+    pub together: bool,
     /// Whether the plan drafts, and whether [`DRAFT`] named the draft.
     pub draft: bool,
     pub draft_set: bool,
@@ -1735,8 +1738,9 @@ pub struct PagedAt {
 pub enum Paged {
     /// The plan as asked: no arena, or one column a step already.
     AsAsked,
-    /// One column a step: one slot, no draft.
-    OneColumn,
+    /// One column a step: no draft, and `slots` — one where the slots step
+    /// together, every one asked where each steps alone.
+    OneColumn { slots: usize },
 }
 
 /// A paged plan's refusal of the set values that step several columns: a
@@ -1775,22 +1779,21 @@ impl fmt::Display for PagedRefused {
 impl std::error::Error for PagedRefused {}
 
 /// A plan that pages host experts through the NVMe tier's RAM arena steps
-/// one column: several slots or a drafted verify read the paged experts
-/// through the file mapping, and its page cache pushes the arena to swap. A
-/// plan with no arena, or one slot and no draft, serves as asked; else the
-/// unset counts fall to one slot and no draft, and a set slot count past one
-/// or a set draft is refused by name.
+/// one column: slots stepped together or a drafted verify read the paged
+/// experts through the file mapping, and its page cache pushes the arena to
+/// swap. A plan with no arena, or no draft and slots that add no column (one,
+/// or several that each step alone), serves as asked; else the unset counts
+/// fall to no draft and, where the slots step together, one slot, and a set
+/// slot count that adds columns or a set draft is refused by name.
 ///
 /// # Errors
 /// [`PagedRefused`], naming each set value that steps several columns.
 pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
-    if at.arena == 0 || (at.slots <= 1 && !at.draft) {
+    let slot_cols = at.slots > 1 && at.together;
+    if at.arena == 0 || (!slot_cols && !at.draft) {
         return Ok(Paged::AsAsked);
     }
-    let slots = at
-        .slots_by
-        .filter(|_| at.slots > 1)
-        .map(|by| (by, at.slots));
+    let slots = at.slots_by.filter(|_| slot_cols).map(|by| (by, at.slots));
     let draft = at.draft_set && at.draft;
     if slots.is_some() || draft {
         return Err(PagedRefused {
@@ -1799,7 +1802,9 @@ pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
             draft,
         });
     }
-    Ok(Paged::OneColumn)
+    Ok(Paged::OneColumn {
+        slots: if at.together { 1 } else { at.slots },
+    })
 }
 
 /// The draft a one-column load ([`Paged::OneColumn`]) runs without, as its

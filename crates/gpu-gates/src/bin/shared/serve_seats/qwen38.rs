@@ -145,19 +145,22 @@
 //! abandons, had turned it off), one `paged` line on stderr naming the arena
 //! and what was asked (`asked_draft` the draft before that yield); a
 //! `--parallel` past one or `BLOOMERY_DRAFT=mtp` is refused by name before
-//! the load, with the way out. The rule reads the plan the flags name — a set context's plain plan
-//! before any search, else the plan the default's search and the draft's
-//! yield chose — and the load's own plan is held to it: the engine thread
-//! plans from the room the main thread read (`PlanInputs::room`, never a
-//! reading of its own), and its plan must have the terms the records and
-//! rules read (`PlanKey`: the card's and the tiers' experts, the host's
-//! experts, resident bytes and tables, the NVMe tier's bytes and arena) or
-//! the load is refused by name. The plan's host reserves every slot's
-//! checkpoints (`HOST_BUDGET` a slot, [`CHECKPOINTS_RESERVE`]), so the host
-//! need, the split's floor and the arena count them, so a default count
-//! whose plan the room leaves under the floor is planned at one slot with no
-//! draft where that plan pages (the same `paged` line, the floor named at its
-//! end); a set `--parallel` there is refused by the floor, by name. The
+//! the load, with the way out. Under `--place bp` each slot steps alone (the
+//! rounds below), so slots add no column there: they are served as asked, and
+//! only the draft goes off. The rule reads the plan the flags name — a set
+//! context's plain plan before any search, else the plan the default's search
+//! and the draft's yield chose — and the load's own plan is held to it: the
+//! engine thread plans from the room the main thread read
+//! (`PlanInputs::room`, never a reading of its own), and its plan must have
+//! the terms the records and rules read (`PlanKey`: the card's and the tiers'
+//! experts, the host's experts, resident bytes and tables, the NVMe tier's
+//! bytes and arena) or the load is refused by name. The plan's host reserves
+//! every slot's checkpoints (`HOST_BUDGET` a slot, [`CHECKPOINTS_RESERVE`]),
+//! so the host need, the split's floor and the arena count them, so a default
+//! count whose plan the room leaves under the floor is planned at one slot
+//! with no draft where that plan pages, under `--place bp` too: that one slot
+//! is the room's, not a column's (the same `paged` line, the floor named at
+//! its end); a set `--parallel` there is refused by the floor, by name. The
 //! residency machine's fills share the arena with the step: a
 //! `BLOOMERY_RESIDENCY` word set to other than `off` on such a plan is
 //! refused by name (unset resolves `off`).
@@ -633,9 +636,10 @@ fn draft38(
 /// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
 /// name). The floor counts every slot's checkpoints ([`CHECKPOINTS_RESERVE`]),
 /// so a room between the one-slot floor and the asked slots' is one only the
-/// one-slot plan clears. Any other refusal of the asked plan is `ctx38`'s,
-/// and a one-slot plan that is refused too is named by the context search of
-/// `one`.
+/// one-slot plan clears. That one slot is the room's, so it holds under
+/// `--place bp` too, where the one-column rule alone keeps every slot. Any
+/// other refusal of the asked plan is `ctx38`'s, and a one-slot plan that is
+/// refused too is named by the context search of `one`.
 fn floor_fallback(
     asked: &Plans<'_>,
     set: Option<(Residency, &str)>,
@@ -1291,13 +1295,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // context's slot is known before any search, so its plain plan's arena
     // decides ahead of the drafted plan, whose refusal would name a draft
     // the rule turns off; the default's is asked below, of the plan its
-    // search and the draft's yield chose. Under the rule the plan serves one
-    // slot (`from=paged` when the count was the default's) and no draft.
+    // search and the draft's yield chose. Under the rule the plan serves no
+    // draft and, where the slots step together, one slot (`from=paged` when
+    // the count was the default's); beside an expert tier card each slot
+    // steps alone ([`Place38::tiered`], the rounds' own rule below), and the
+    // slots stay.
     let paged = |arena: u64, slots: usize, mtp: bool| {
         bloomery_levers::paged_columns(&bloomery_levers::PagedAt {
             arena,
             slots,
             slots_by: (from == "flag").then_some(bloomery_levers::SlotsBy::Parallel),
+            together: !a.place.tiered(),
             draft: mtp,
             draft_set: levers.draft().is_some(),
         })
@@ -1306,22 +1314,25 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // the draft was asked — on, or off only by its yield to the context on
     // the plan this load abandons (`bloomery_levers::paged_draft`) — at
     // either point.
-    let one_column =
-        |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>, floor: bool| {
-            let (asked, draft_off) = bloomery_levers::paged_draft(mtp, draft_off, arena);
-            eprintln!(
-                "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} slots=1 \
-                 draft=off (the plan pages host experts through the NVMe tier's RAM arena: a \
-                 step of several columns reads them through the file mapping{})",
-                if asked { "on" } else { "off" },
-                if floor {
-                    "; the asked slots' plan leaves the room under the tier's floor"
-                } else {
-                    ""
-                }
-            );
-            (if slots > 1 { "paged" } else { from }, draft_off)
-        };
+    let one_column = |arena: u64,
+                      (slots, served): (usize, usize),
+                      mtp: bool,
+                      draft_off: Option<Draft38Off>,
+                      floor: bool| {
+        let (asked, draft_off) = bloomery_levers::paged_draft(mtp, draft_off, arena);
+        eprintln!(
+            "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} \
+             slots={served} draft=off (the plan pages host experts through the NVMe tier's RAM \
+             arena: a step of several columns reads them through the file mapping{})",
+            if asked { "on" } else { "off" },
+            if floor {
+                "; the asked slots' plan leaves the room under the tier's floor"
+            } else {
+                ""
+            }
+        );
+        (if served < slots { "paged" } else { from }, draft_off)
+    };
     let early = match a.ctx.map(|c| c / slots) {
         Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
             let plain = Plans {
@@ -1342,15 +1353,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let (slots, from, mtp, head, draft_off) = match paged(early, slots, mtp)? {
         Paged::AsAsked => (slots, from, mtp, head, draft_off),
-        Paged::OneColumn => {
+        Paged::OneColumn { slots: served } => {
             mtp_inputs = None;
-            let (from, draft_off) = one_column(early, slots, mtp, draft_off, false);
-            (1, from, false, None, draft_off)
+            let (from, draft_off) = one_column(early, (slots, served), mtp, draft_off, false);
+            (served, from, false, None, draft_off)
         }
     };
     // A default count whose plan the room leaves under the tier's floor
-    // ([`floor_fallback`]) is the one-column rule's too: the load plans one
-    // slot, and no draft, where that plan pages.
+    // ([`floor_fallback`]) falls to one slot, and no draft, where that plan
+    // pages. The one slot is the room's, not a column's, so it holds beside
+    // a tier card too, where each slot steps alone and the column rule keeps
+    // them: the rule is asked of the one-slot plan the fallback loads, for
+    // its draft alone (a set one is refused by name).
     let floor = if from == "default" && slots > 1 {
         let asked = Plans {
             inputs: &inputs,
@@ -1365,14 +1379,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         None
     };
     let (slots, from, mtp, head, draft_off) = match floor {
-        Some(arena) => match paged(arena, slots, mtp)? {
-            Paged::AsAsked => (slots, from, mtp, head, draft_off),
-            Paged::OneColumn => {
-                mtp_inputs = None;
-                let (from, draft_off) = one_column(arena, slots, mtp, draft_off, true);
-                (1, from, false, None, draft_off)
-            }
-        },
+        Some(arena) => {
+            paged(arena, 1, mtp)?;
+            mtp_inputs = None;
+            let (from, draft_off) = one_column(arena, (slots, 1), mtp, draft_off, true);
+            (1, from, false, None, draft_off)
+        }
         None => (slots, from, mtp, head, draft_off),
     };
     let drafted = Plans {
@@ -1428,17 +1440,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let host = plans.host(rule.ctx, set)?;
     let (slots, from, mtp, head, draft_off, host) = match paged(host.2, slots, mtp)? {
         Paged::AsAsked => (slots, from, mtp, head, draft_off, host),
-        Paged::OneColumn => {
+        Paged::OneColumn { slots: served } => {
             let one = Plans {
                 mtp: None,
-                slots: 1,
+                slots: served,
                 ..plans
             };
             rule = ctx38(&one, a.ctx)?;
-            let (from, draft_off) = one_column(host.2, slots, mtp, draft_off, false);
+            let (from, draft_off) = one_column(host.2, (slots, served), mtp, draft_off, false);
             let host = one.host(rule.ctx, set)?;
             mtp_inputs = None;
-            (1, from, false, None, draft_off, host)
+            (served, from, false, None, draft_off, host)
         }
     };
     refuse_mtp_levers(&draft_off)?;
@@ -1511,8 +1523,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The one-column rule holds at the plan the load runs: the cache's
     // bound only lowers the context the rule read, which leaves the card
     // more experts and the host fewer, so a paged load of several columns
-    // is the seat's own breach.
-    if plan.host.nvme_arena_bytes > 0 && (slots > 1 || mtp) {
+    // — slots stepped together, or a draft — is the seat's own breach.
+    if plan.host.nvme_arena_bytes > 0 && ((slots > 1 && !a.place.tiered()) || mtp) {
         return Err(format!(
             "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
              {slots} slots, the draft {}: the one-column rule read another plan",

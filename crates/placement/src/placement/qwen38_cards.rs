@@ -992,6 +992,7 @@ fn the_one_column_rule_reads_the_arena() {
         arena,
         slots,
         slots_by: slots_set.then_some(SlotsBy::Parallel),
+        together: true,
         draft: false,
         draft_set: false,
     };
@@ -999,7 +1000,10 @@ fn the_one_column_rule_reads_the_arena() {
     let (moved1, deep1) = arena(1, 27 << 30);
     println!("27 GiB: two slots arena {deep2} B, one slot arena {deep1} B");
     assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
-    assert_eq!(paged_columns(&at(deep2, 2, false)), Ok(Paged::OneColumn));
+    assert_eq!(
+        paged_columns(&at(deep2, 2, false)),
+        Ok(Paged::OneColumn { slots: 1 })
+    );
     assert_eq!(paged_columns(&at(deep1, 1, false)), Ok(Paged::AsAsked));
     assert!(paged_columns(&at(deep2, 2, true)).is_err());
     let (moved, shallow) = arena(2, 40 << 30);
