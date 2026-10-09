@@ -208,6 +208,9 @@ V41_MODEL=${BLOOMERY_V41_MODEL:-$V41_PUBLIC}
 V41_DIR=${V41_MODEL%/*}
 V41_SET_SUFFIX=
 [ "$V41_MODEL" != "$V41_PUBLIC" ] || V41_SET_SUFFIX=_plain
+# The fixture tier runs the one fixture file, never the public one, so its sets take no per-file suffix (gguf::v41::set_suffix_of's
+# rule; the fixture family names them `fx_ref_deepseek41_…`, tools/ref/dump.sh puts the prefix on).
+[ "${BLOOMERY_TIER:-real}" != fixture ] || V41_SET_SUFFIX=
 MODEL=${BLOOMERY_REF_MODEL:-$V41_MODEL}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 : "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
