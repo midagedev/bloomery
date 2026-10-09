@@ -9,8 +9,10 @@
 //! and `drafted`, the main server with the draft on and its drafted clauses
 //! alone (the bullets that name it), stopped before any other server. The
 //! servers a run loads are those two mains, the slots clause's two, the
-//! width chooser's one and the sampled rounds' one; the `ctx` clause's three starts and the residency
-//! word's one stop before the load. Each arm starts the server beside this binary (`--host 127.0.0.1
+//! width chooser's one, the sampled rounds' one and the draft share clause's
+//! unset-draft one (stopped at its `load draft=off` record); the `ctx`
+//! clause's three starts and the residency word's one stop before the load.
+//! Each arm starts the server beside this binary (`--host 127.0.0.1
 //! --port 0 --place gate --ctx-size 4096`), reads its address from its
 //! stderr, waits for `/health`, then checks:
 //!
@@ -235,10 +237,11 @@
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for — the drafted arm ends here — and, on the plain arm, more
 //! servers start on the card, one at a time: the `ctx` clause's three, the
-//! `paged` clause's five and the residency word's one (they stop before the
-//! load, or are refused before it, but the `paged` clause's small card,
-//! stopped at its load's draft record), then the slots clause's two and the
-//! sampled rounds' one (above).
+//! `paged` clause's eight, the draft share clause's two and the residency
+//! word's one (they stop before the load, or are refused before it, but the
+//! `paged` clause's small card and the draft share clause's unset-draft
+//! server, stopped at their load's draft record), then the slots clause's two
+//! and the sampled rounds' one (above).
 //!
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
 //!   (the margin rule's answer — or the largest the card holds when that is
@@ -272,10 +275,40 @@
 //!   (`paged_small_card_yields_on_one_card`, the premise), the plan pages,
 //!   and the one-slot load's `load draft=off` record names the paged rule,
 //!   never the yield judged on the plan it abandoned
-//!   (`paged_small_card_load_names_the_rule`). FAIL-first: the seat with no
+//!   (`paged_small_card_load_names_the_rule`). Beside them, at 27 GiB: the
+//!   checkpoints every resident sequence may pin sit outside the room the
+//!   split fills — the server's arena is the gate's own plan's (no host
+//!   reserve for them) less `checkpoint_bytes(slots)`, and its host need that
+//!   plan's plus the same (`paged_checkpoints_sit_outside_the_arena`, read
+//!   off the `cache` line); a residency word set to `off` reaches the `plan`
+//!   record (`paged_set_off_residency_is_accepted`), and one set to
+//!   `mid-p0-s1` is refused by name before it (`paged_set_residency_is_refused_by_name`:
+//!   the residency machine's fills share the arena with the step). The
+//!   floor counts every slot's checkpoints, so between the one-slot plan's
+//!   floor and the asked two slots' lies a band of rooms only the one-slot
+//!   plan clears: the gate reads both floors off its own plans
+//!   (`paged_floor_band_is_between_the_slot_floors`), and at the band's
+//!   middle the flagless server serves one slot, `from=paged`, its `paged`
+//!   line naming the floor (`paged_floor_fallback_serves_one_column`), while
+//!   `--parallel 2` there is refused by the floor, by name
+//!   (`paged_floor_set_parallel_is_refused_by_the_floor`).
+//!   FAIL-first: the seat with no
 //!   rule serves two slots at 27 GiB and refuses neither; a rule on the
 //!   paged experts' bytes refuses the 40 GiB server; a one-column load that
-//!   keeps the yield's reason names it on the small card;
+//!   keeps the yield's reason names it on the small card; a machine with no
+//!   checkpoint reserve gives the arena of the gate's own plan; a seat that
+//!   takes the set word on a paged plan prints its `plan` record and loads;
+//!   one that refuses `off` too never reaches the 27 GiB `plan` record; a
+//!   seat that plans the asked two slots with no fallback refuses the
+//!   flagless band server by the floor, red on the fallback clause;
+//! - `draft_slot_share` ([`draft_slot_share`]): the unset draft judged on a
+//!   slot's share of `--ctx-size`: at `--ctx-size 8 --parallel 2` (four
+//!   positions a slot, a window needs five) an unset draft turns off, its
+//!   `load draft=off` record naming the ten positions of the two slots past
+//!   the eight (`draft_unset_yields_to_the_slot_share`), and a set one is
+//!   refused by name before its plan (`draft_set_is_refused_by_name`); the
+//!   fixture tier defers the clause by name (the draft file is the real
+//!   file's);
 //! - `residency_loads_the_word` ([`residency_loads_the_word`]): a server of
 //!   the main arguments under `BLOOMERY_RESIDENCY=mid-p0-s1`, stopped before
 //!   its load, prints the `residency lever` record of that word with why
@@ -354,8 +387,9 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
+    use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
+    use bloomery_gpu::arch::qwen3moe::{Body38, checkpoint_bytes, seq_positional_bytes};
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
@@ -367,10 +401,10 @@ mod gate {
     use model::arch::models::Mixer;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_for_experts, serve_ctx,
+        Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx,
     };
-    use model::placement::PlanLevers;
-    use model::placement::workstation::RTX_3090;
+    use model::placement::workstation::{HostNeed, HostRead, RTX_3090};
+    use model::placement::{PlacementError, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
     use serde_json::{Value, json};
@@ -2840,6 +2874,69 @@ mod gate {
             .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
     }
 
+    /// The gate's own plan of the file on the gate card (`free` bytes free,
+    /// as the server's `plan` record names them) at a slot's `ctx` positions
+    /// for `slots` resident sequences, plain, under the host room `room`
+    /// (given, not read), handed to `then` — the server's plan but for its
+    /// machine's host reserve of the checkpoints, which this machine, the
+    /// OS's alone, does not hold.
+    fn gate_plan_at<T>(
+        levers: &bloomery_levers::Levers,
+        (ctx, slots): (usize, usize),
+        free: u64,
+        room: u64,
+        then: impl FnOnce(Result<model::placement::Plan<'_>, PlaceError>) -> Result<T, GateError>,
+    ) -> Result<T, GateError> {
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut inputs = PlanInputs::describe(&split)?;
+        inputs.room = (room, HostRead::Given);
+        let experts = experts38(levers)?;
+        let mut machine = machine_for_experts(
+            RTX_3090,
+            inputs.spec.layers.len(),
+            u64::try_from(ubatch_for(ctx)?)?,
+            experts,
+        );
+        machine.cards[0].free_bytes = Some(free);
+        then(inputs.plan_with_slots(
+            &machine,
+            u64::try_from(ctx)?,
+            &PlanLevers::from_levers(levers)?,
+            experts,
+            slots,
+        ))
+    }
+
+    /// The NVMe tier's RAM arena and the host's need ([`HostNeed`]) of
+    /// [`gate_plan_at`]'s plan at the host room `room`.
+    fn host_split_at(
+        levers: &bloomery_levers::Levers,
+        shape: (usize, usize),
+        free: u64,
+        room: u64,
+    ) -> Result<(u64, u64), GateError> {
+        gate_plan_at(levers, shape, free, room, |plan| {
+            let plan = plan?;
+            Ok((plan.host.nvme_arena_bytes, HostNeed::of(&plan, 0).bytes()))
+        })
+    }
+
+    /// The NVMe expert tier's floor of [`gate_plan_at`]'s plan: the one
+    /// `HostRoomFloor` names for a room of one byte (the planner's one owner
+    /// of the floor), read by type.
+    fn host_floor(
+        levers: &bloomery_levers::Levers,
+        shape: (usize, usize),
+        free: u64,
+    ) -> Result<u64, GateError> {
+        gate_plan_at(levers, shape, free, 1, |plan| match plan {
+            Err(PlaceError::Placement(PlacementError::HostRoomFloor { floor, .. })) => Ok(floor),
+            Err(e) => Err(e.into()),
+            Ok(_) => Err("a host room of one byte planned: no floor to read".into()),
+        })
+    }
+
     /// The `ctx` clause: a plain server with no `--ctx-size` (and no
     /// `--parallel`, so the seat's default two resident slots) prints its
     /// `ctx` line before its load (it is stopped there), against this gate's
@@ -3238,6 +3335,147 @@ mod gate {
         Ok(ok)
     }
 
+    /// The MTP draft's window condition judged on a slot's share of the total
+    /// context (the seat's module doc): `--ctx-size 8 --parallel 2` gives
+    /// each slot four positions, one short of the window's (`VERIFY_ROWS` +
+    /// 1 = five a slot, ten for the two). With `BLOOMERY_DRAFT` unset and no
+    /// `--place` (the box pin's one card, `a`, whose stage runs the draft
+    /// where its file is) the draft turns off: the server prints no `draft
+    /// keep` line, refuses nothing and loads, its `load draft=off` record
+    /// naming the ten positions past the flag's eight
+    /// (`draft_unset_yields_to_the_slot_share`); with `BLOOMERY_DRAFT=mtp`
+    /// set the server is refused by name before its plan record, the
+    /// message's total the same ten positions (`draft_set_is_refused_by_name`).
+    /// FAIL-first: a seat that judges the window on the total `--ctx-size`
+    /// (eight, past five) keeps the unset draft and refuses it at the context
+    /// the rule chose, so the first clause's server exits with the refusal
+    /// before its load; a refusal whose total is one window short (the
+    /// `VERIFY_ROWS` a slot) turns the second clause red; a seat whose check
+    /// passes a set draft loads it, so its server prints a `plan` record and
+    /// no refusal. The fixture tier defers the clause by name: the draft file
+    /// is the real file's.
+    fn draft_slot_share(dir: &Path) -> Result<bool, GateError> {
+        // The draft is the real file's: its draft file sits beside the target,
+        // which a fixture's directory is not known to hold.
+        if !tier::run_clause("draft_slot_share", Tag::FileBound)? {
+            return Ok(true);
+        }
+        const FLAGS: [&str; 4] = ["--ctx-size", "8", "--parallel", "2"];
+        let own = dir.join("draft-share");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let positions = (<Body38 as MtpBody>::VERIFY_ROWS + 1) * 2;
+        let mut ok = true;
+
+        // The set draft: refused before the plan record and any load.
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        let args: Vec<&str> = DEFAULT_ARGS.iter().chain(&FLAGS).copied().collect();
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let mut status = None;
+        for _ in 0..POLLS {
+            status = served.child.try_wait()?;
+            let text = std::fs::read_to_string(&err_log)?;
+            let planned = matches!(
+                record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38).first(&record::PLAN38),
+                Ok(Some(_))
+            );
+            if status.is_some() || planned {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let text = std::fs::read_to_string(&err_log)?;
+        println!("draft-share: set draft: exit {status:?}");
+        if status.is_none() {
+            println!(
+                "draft-share: the set-draft server stopped: {}",
+                served.stop()?
+            );
+        }
+        let want = format!(
+            "a slot's context of 4 leaves no positions for the MTP draft's window; --ctx-size \
+             names a total of at least {positions}"
+        );
+        let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+            .first(&record::PLAN38)?
+            .is_some();
+        if !text.contains(&want) {
+            println!("draft-share: the set-draft server's last lines:");
+            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
+                println!("  {l}");
+            }
+        }
+        check(
+            &mut ok,
+            "draft_set_is_refused_by_name",
+            status.is_some_and(|s| !s.success()) && text.contains(&want) && !planned,
+        );
+
+        // The unset draft: off, and the load's record names why.
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::RESIDENCY, "off")
+            .env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        let args: Vec<&str> = DEFAULT_ARGS[..4].iter().chain(&FLAGS).copied().collect();
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let mut off = None;
+        for _ in 0..POLLS {
+            let text = std::fs::read_to_string(&err_log)?;
+            off = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                .first(&record::LOAD_DRAFT_OFF38)
+                .ok()
+                .flatten()
+                .map(|f| f.text("why").map(str::to_owned))
+                .transpose()?;
+            if off.is_some() || served.child.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        let text = std::fs::read_to_string(&err_log)?;
+        if served.child.try_wait()?.is_none() {
+            println!(
+                "draft-share: the unset-draft server stopped: {}",
+                served.stop()?
+            );
+        }
+        let split = parallel_line(&err_log)?;
+        println!(
+            "draft-share: unset draft: {}; load draft=off ({})",
+            split.as_deref().unwrap_or("no parallel line"),
+            off.as_deref().unwrap_or("none")
+        );
+        if off.is_none() {
+            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
+                println!("  {l}");
+            }
+        }
+        let why = bloomery_levers::Draft38Off::Ctx {
+            need: positions,
+            ctx: 8,
+        }
+        .to_string();
+        let two_slots = split
+            .as_deref()
+            .is_some_and(|l| l.contains(" slots=2 ") && l.contains(" slot_ctx=4 "));
+        check(
+            &mut ok,
+            "draft_unset_yields_to_the_slot_share",
+            two_slots
+                && off.as_deref() == Some(why.as_str())
+                && !text.contains("leaves no positions for the MTP draft's window")
+                && !text.lines().any(|l| l.starts_with("draft keep ")),
+        );
+        Ok(ok)
+    }
+
     /// The NVMe tier's one-column rule (the seat's module doc,
     /// `bloomery_levers::paged_columns`) on the gate plan at two rooms
     /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena), each server
@@ -3250,14 +3488,37 @@ mod gate {
     /// `BLOOMERY_DRAFT=mtp` are each refused by name (`PagedRefused`'s own
     /// text at the arena the refusal names, its own plan's). At 40 GiB the tier
     /// pages experts with no arena (the mapping path), and `--parallel 2`
-    /// serves its two slots (`from=flag`, no `paged` line). Last, the small
-    /// card's case (below, at its server). The fixture tier defers the
-    /// clause by name: its rooms and budget are the real file's shapes.
+    /// serves its two slots (`from=flag`, no `paged` line). At 27 GiB too,
+    /// the checkpoints of the resident sequences sit outside the room the
+    /// split fills (`paged_checkpoints_sit_outside_the_arena`: the `cache`
+    /// line's arena (`tier`) is the gate's own plan's, which holds no
+    /// checkpoint reserve, less `checkpoint_bytes(slots)`, and its `need` that
+    /// plan's plus the same); a residency word set to `off` reaches the
+    /// `plan` record (`paged_set_off_residency_is_accepted`), and one set to
+    /// `mid-p0-s1` is refused by name before it
+    /// (`paged_set_residency_is_refused_by_name`: the machine's fills share
+    /// the arena with the step). The floor counts the checkpoints too: at the
+    /// middle of the band of rooms between the one-slot plan's floor and the
+    /// asked two slots' (the gate's own plans' floors, read off
+    /// `HostRoomFloor`, plus `checkpoint_bytes(slots)`) the flagless server
+    /// serves one slot, `from=paged`, its `paged` line naming the floor, with
+    /// the arena the gate's own plan has less `checkpoint_bytes(1)`
+    /// (`paged_floor_fallback_serves_one_column`), and `--parallel 2` is
+    /// refused by the floor, by name
+    /// (`paged_floor_set_parallel_is_refused_by_the_floor`). Last, the small
+    /// card's case (below, at its server). The fixture tier defers the clause by name: its rooms and
+    /// budget are the real file's shapes.
     /// FAIL-first: the seat before the rule serves the default's two slots
     /// at 27 GiB and refuses neither; a rule that reads the paged experts'
     /// bytes rather than the arena refuses the 40 GiB `--parallel 2`; a
     /// one-column load that keeps the yield's reason names it on the small
-    /// card.
+    /// card; a machine with no checkpoint reserve gives the arena the gate's
+    /// own plan has, red on the checkpoint clause; a seat that takes a set
+    /// word on the paged plan prints its `plan` record, red on the refusal
+    /// clause; one that refuses `off` as well never reaches that record, red
+    /// on the acceptance clause; a seat that plans the asked two slots with
+    /// no floor fallback refuses the flagless band server by the floor, red
+    /// on the fallback clause.
     fn paged(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         // The rooms and the budget are the real file's shapes: a fixture's
         // host set pages nothing at them.
@@ -3354,10 +3615,75 @@ mod gate {
             "paged_default_serves_one_column",
             one && named && arena.is_some_and(|a| a > 0),
         );
+        // A set residency word on a plan that pages through the arena is
+        // refused by name (`paged_set_residency_is_refused_by_name`
+        // below); `off`, set on every server of this clause, is not: the
+        // 27 GiB server reaches its `plan` record.
+        let refusal = |word: &str| {
+            format!(
+                "BLOOMERY_RESIDENCY={word}: the plan pages host experts through the NVMe \
+                 tier's "
+            )
+        };
+        let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+            .first(&record::PLAN38)?
+            .is_some();
+        check(
+            &mut ok,
+            "paged_set_off_residency_is_accepted",
+            planned && !text.contains(&refusal("off")),
+        );
         let free = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
             .first(&record::PLAN38)?
             .ok_or("the 27 GiB server printed no `plan` record")?
             .u64("card_free")?;
+
+        // The checkpoints every resident sequence may pin sit outside the
+        // room the split fills: the host reserves them, so the plan's need
+        // counts them and the arena is the room less the floor they raise.
+        // The gate's own plan at the same room, slots and context, whose
+        // machine holds no such reserve, differs from the server's by exactly
+        // `checkpoint_bytes(slots)` in each — the split keeps the same host
+        // experts (its kept bytes are the need less the room past the
+        // arena, both moved by the reserve) — read off the `cache` line's
+        // `need` and `tier`, the seat's own terms of the plan it loads.
+        let cache = text
+            .lines()
+            .find(|l| l.starts_with("cache "))
+            .map(str::to_owned);
+        let term = |l: Option<&str>, k: &str| -> Option<u64> {
+            l.and_then(|l| field(l, k)).and_then(|v| v.parse().ok())
+        };
+        let shape = term(line.as_deref(), "slots")
+            .zip(term(line.as_deref(), "slot_ctx"))
+            .map(|(slots, ctx)| {
+                Ok::<_, GateError>((usize::try_from(ctx)?, usize::try_from(slots)?))
+            })
+            .transpose()?;
+        let held =
+            bloomery_gpu_gates::residency38::checkpoint_bytes(shape.map_or(1, |(_, slots)| slots));
+        let seat = (
+            term(cache.as_deref(), "tier"),
+            term(cache.as_deref(), "need"),
+        );
+        let bare = shape
+            .map(|shape| host_split_at(levers, shape, free, 27 << 30))
+            .transpose()?;
+        println!(
+            "paged: the seat's arena {:?} and need {:?}, the gate's plan with no checkpoint \
+             reserve {bare:?}, the checkpoints {held} B",
+            seat.0, seat.1
+        );
+        check(
+            &mut ok,
+            "paged_checkpoints_sit_outside_the_arena",
+            match (seat, bare) {
+                ((Some(arena), Some(need)), Some((bare_arena, bare_need))) => {
+                    arena > 0 && arena + held == bare_arena && need == bare_need + held
+                }
+                _ => false,
+            },
+        );
 
         // A refusal's arena, read off its own line (the plan the refused
         // server read, whose context rides the card's free bytes at its
@@ -3408,6 +3734,29 @@ mod gate {
                 && !listened(&text)?,
         );
 
+        // The residency machine's fills share the arena with the step: a
+        // set word other than `off` on a plan that pages through the arena
+        // is refused by name, after the slot rule's lines and before the
+        // plan's record.
+        let (line, failed, text) = run(
+            &[
+                (bloomery_levers::HOST_ROOM, "27G"),
+                (bloomery_levers::RESIDENCY, RESIDENCY_WORD),
+            ],
+            &[],
+        )?;
+        check(
+            &mut ok,
+            "paged_set_residency_is_refused_by_name",
+            failed
+                && line.is_some()
+                && text.contains(&refusal(RESIDENCY_WORD))
+                && !record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                    .first(&record::PLAN38)?
+                    .is_some()
+                && !listened(&text)?,
+        );
+
         let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "40G")], &["--parallel", "2"])?;
         let asked = line.as_deref().is_some_and(|l| {
             field(l, "slots").as_deref() == Some("2") && field(l, "from").as_deref() == Some("flag")
@@ -3416,6 +3765,89 @@ mod gate {
             &mut ok,
             "unpaged_parallel_serves_as_asked",
             asked && paged_line(&text).is_none(),
+        );
+
+        // The default count's floor fallback. The floor counts every slot's
+        // checkpoints: the gate's own floors (the planner's, read off
+        // `HostRoomFloor` at a room of one byte, with no checkpoint reserve)
+        // plus `checkpoint_bytes(slots)` are the server's, so the one-slot
+        // plan's floor sits `checkpoint_bytes(1)` above the two-slot plan's
+        // less its own extra checkpoints — a band of rooms the one-slot plan
+        // clears and the two the flagless server asks first does not. The
+        // server's first plan, at one position (the context search's first),
+        // is the asked slots', so the band is [one slot's floor, two slots'
+        // floor at one position); its middle is the room. A flagless server
+        // there serves one slot (`from=paged`, its `paged` line naming the
+        // floor), and `--parallel 2` is refused by the floor, by name (the
+        // context search's first plan fails before the `paged` rule).
+        let held = bloomery_gpu_gates::residency38::checkpoint_bytes(1);
+        let one_floor = host_floor(levers, (CTX, 1), free)? + held;
+        let two_floor = host_floor(levers, (1, 2), free)? + 2 * held;
+        let band = one_floor < two_floor;
+        let room = one_floor + two_floor.saturating_sub(one_floor) / 2;
+        println!(
+            "paged: floors with the checkpoints: one slot at {CTX} positions {one_floor} B, two \
+             slots at one position {two_floor} B; the band's middle {room} B"
+        );
+        check(&mut ok, "paged_floor_band_is_between_the_slot_floors", band);
+        let room_arg = room.to_string();
+        let (line, failed, text) = run(&[(bloomery_levers::HOST_ROOM, &room_arg)], &[])?;
+        let paged = paged_line(&text);
+        println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
+        if paged.is_none() {
+            println!("paged: the flagless server's last lines:");
+            for l in text.lines().rev().take(12).collect::<Vec<_>>().iter().rev() {
+                println!("  {l}");
+            }
+        }
+        let cache = text
+            .lines()
+            .find(|l| l.starts_with("cache "))
+            .map(str::to_owned);
+        let shape = term(line.as_deref(), "slots")
+            .zip(term(line.as_deref(), "slot_ctx"))
+            .map(|(slots, ctx)| {
+                Ok::<_, GateError>((usize::try_from(ctx)?, usize::try_from(slots)?))
+            })
+            .transpose()?;
+        let arena = term(cache.as_deref(), "tier");
+        let bare = shape
+            .map(|shape| host_split_at(levers, shape, free, room))
+            .transpose()?;
+        let one = line.as_deref().is_some_and(|l| {
+            field(l, "slots").as_deref() == Some("1")
+                && field(l, "from").as_deref() == Some("paged")
+        });
+        let named = paged.as_deref().is_some_and(|l| {
+            field(l, "rule").as_deref() == Some("one-column")
+                && field(l, "asked_slots").as_deref() == Some("2")
+                && field(l, "slots").as_deref() == Some("1")
+                && l.ends_with("; the asked slots' plan leaves the room under the tier's floor)")
+        });
+        println!("paged: the seat's arena {arena:?}, the gate's plan with no reserve {bare:?}");
+        check(
+            &mut ok,
+            "paged_floor_fallback_serves_one_column",
+            !failed
+                && one
+                && named
+                && arena.zip(bare).is_some_and(|(arena, (bare_arena, _))| {
+                    arena > 0 && arena + held == bare_arena
+                }),
+        );
+        let (line, failed, text) = run(
+            &[(bloomery_levers::HOST_ROOM, &room_arg)],
+            &["--parallel", "2"],
+        )?;
+        check(
+            &mut ok,
+            "paged_floor_set_parallel_is_refused_by_the_floor",
+            failed
+                && line.is_none()
+                && text.contains(&format!(
+                    "the host room {room} B is under the NVMe expert tier's floor"
+                ))
+                && !listened(&text)?,
         );
 
         // The small card's case: a flagless server — no `--place`, so the
@@ -3685,6 +4117,7 @@ mod gate {
         println!("server stopped: {}", served.stop()?);
         ok &= ctx(dir, levers)?;
         ok &= paged(dir, levers)?;
+        ok &= draft_slot_share(dir)?;
         ok &= residency_loads_the_word(dir)?;
         // The resident slots together (the module header): its own servers,
         // the first with the draft on, the second the seat's own defaults.

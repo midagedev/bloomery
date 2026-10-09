@@ -147,7 +147,20 @@
 //! `--parallel` past one or `BLOOMERY_DRAFT=mtp` is refused by name before
 //! the load, with the way out. The rule reads the plan the flags name — a set context's plain plan
 //! before any search, else the plan the default's search and the draft's
-//! yield chose — and the load's own plan is held to it.
+//! yield chose — and the load's own plan is held to it: the engine thread
+//! plans from the room the main thread read (`PlanInputs::room`, never a
+//! reading of its own), and its plan must have the terms the records and
+//! rules read (`PlanKey`: the card's and the tiers' experts, the host's
+//! experts, resident bytes and tables, the NVMe tier's bytes and arena) or
+//! the load is refused by name. The plan's host reserves every slot's
+//! checkpoints (`HOST_BUDGET` a slot, [`CHECKPOINTS_RESERVE`]), so the host
+//! need, the split's floor and the arena count them, so a default count
+//! whose plan the room leaves under the floor is planned at one slot with no
+//! draft where that plan pages (the same `paged` line, the floor named at its
+//! end); a set `--parallel` there is refused by the floor, by name. The
+//! residency machine's fills share the arena with the step: a
+//! `BLOOMERY_RESIDENCY` word set to other than `off` on such a plan is
+//! refused by name (unset resolves `off`).
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
@@ -175,9 +188,11 @@
 //! runs when a regular file is where it would be opened
 //! (`BLOOMERY_MTP_DRAFT`, else the shared draft file beside the target); the
 //! plain path runs under `--place gate`, with no file there, and with stores
-//! too short for one window (`--ctx-size` under 5), each printed as a `load
-//! draft=off (<why>)` record after the `load` line (`no file at <path>` for
-//! the missing file), never a refusal. Unset with the ctx rule's own
+//! too short for one window (a slot's share of `--ctx-size` under 5: the
+//! total under 5 a slot), each printed as a `load draft=off (<why>)` record
+//! after the `load` line (`no file at <path>` for the missing file), never a
+//! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
+//! name before the plan. Unset with the ctx rule's own
 //! default, the draft then yields to the context
 //! (`bloomery_levers::DraftYield::of`, below at the search): it goes off
 //! when the plan with it leaves a slot under the base the plain rule aims
@@ -277,7 +292,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
+use bloomery_gpu_gates::residency38::{CARD38, Lever38, checkpoint_bytes, residency38};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
     Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
@@ -292,7 +307,7 @@ use model::arch::qwen35moe::place::{
     tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{CardSpec, HostNeed, MARGIN};
+use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
@@ -353,6 +368,12 @@ const MESSAGE_START: &str = "<|im_start|>";
 /// ([`SlotDrafts::turn_off`]).
 const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
                              and it holds no rows at the kept position";
+
+/// The host reserve of every resident sequence's checkpoints
+/// ([`Place38::machine`]), under the name `q3place::CHECKPOINTS_RESERVE`
+/// (`shared/qwen3moe_place.rs`) gives the same reserve on the qwen3 seat,
+/// whose module this seat does not include.
+const CHECKPOINTS_RESERVE: &str = "checkpoints";
 
 /// The reply the break-even weighs ([`Q38::draft_keep`]) when a request
 /// bounds nothing, and the most it weighs: the mean greedy reply of the
@@ -480,7 +501,9 @@ impl Place38 {
     /// draft's card bytes at `ctx` for every slot on its stage card
     /// (`MtpInputs::card_bytes_of`, the reserve `plan_mtp_with_slots`
     /// checks; `place::machine_bp_on`), the one-card plans count them in
-    /// `plan_mtp_with_slots`.
+    /// `plan_mtp_with_slots`. The host reserves every slot's checkpoints
+    /// ([`CHECKPOINTS_RESERVE`]), which the plan's host need, the NVMe
+    /// tier's floor and its arena then count.
     fn machine(
         self,
         inputs: &PlanInputs,
@@ -490,7 +513,7 @@ impl Place38 {
         slots: usize,
     ) -> Result<Machine, GateError> {
         let layers = inputs.spec.layers.len();
-        Ok(match self.kind {
+        let mut machine = match self.kind {
             Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
             Kind38::Bp => {
                 let cards = self.cards.card_specs()?;
@@ -503,7 +526,12 @@ impl Place38 {
                     tier_batch(&inputs.hp, ub),
                 )
             }
-        })
+        };
+        machine
+            .host
+            .reserves
+            .push((CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(slots)));
+        Ok(machine)
     }
 }
 
@@ -528,9 +556,19 @@ fn experts38(levers: &bloomery_levers::Levers) -> Result<Experts, GateError> {
     }
 }
 
-/// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions,
-/// `file` the MTP draft file the load would open, `inputs` the target's:
-/// `mtp` the draft, `off` the plain path; unset, `generate_qwen3moe`'s rule
+/// The positions in all that give each of `slots` resident sequences one MTP
+/// window: the server's loop takes one only while its rows fit, the first at
+/// a one-id prompt's first generated token — 1 + 1 + rows − 1 positions a
+/// slot — and a total split among the slots gives each the floor of its
+/// share, so a total of this many or more holds a window a slot.
+fn window_positions(slots: usize) -> usize {
+    (<Body38 as MtpBody>::VERIFY_ROWS + 1).saturating_mul(slots)
+}
+
+/// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions
+/// in all, split among `slots` resident sequences, `file` the MTP draft file
+/// the load would open, `inputs` the target's: `mtp` the draft, `off` the
+/// plain path; unset, `generate_qwen3moe`'s rule
 /// (`bloomery_levers::draft38_unset`), then `off` when the target's matrices
 /// the draft borrows are not its format (`PlanInputs::mtp_borrows`, which
 /// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
@@ -542,13 +580,13 @@ fn experts38(levers: &bloomery_levers::Levers) -> Result<Experts, GateError> {
 /// The rule's run conditions as the seat meets them: no `--logits` (a
 /// request that reads the logits row steps plainly, the row the target's),
 /// no route trace (the seat does not act on `BLOOMERY_ROUTE_TRACE`, so
-/// `at_main` refuses it set), and the positions the server's loop needs for
-/// one window — it takes one only while its rows fit, the first at a one-id
-/// prompt's first generated token: 1 + 1 + rows − 1.
+/// `at_main` refuses it set), and the positions of one window a slot
+/// ([`window_positions`]). A set `mtp` meets that condition at the caller,
+/// where the context the rule chose is known.
 fn draft38(
     levers: &bloomery_levers::Levers,
     place: Place38,
-    ctx: usize,
+    (ctx, slots): (usize, usize),
     file: &Path,
     inputs: &PlanInputs,
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
@@ -567,7 +605,7 @@ fn draft38(
                 route_trace: false,
                 file,
                 file_is_there: file.is_file(),
-                need: <Body38 as MtpBody>::VERIFY_ROWS + 1,
+                need: window_positions(slots),
                 ctx,
             };
             Ok(match draft38_unset(&at) {
@@ -601,6 +639,41 @@ fn paged_draft(drafts: bool, off: Option<Draft38Off>, arena: u64) -> (bool, Opti
             off
         },
     )
+}
+
+/// The default slot count's plan, refused because the host room is under the
+/// NVMe expert tier's floor, answered by the one-column rule's own plan: the
+/// first plan the context search asks, at one position (`fit38`), is the
+/// asked slots' — its refusal, [`PlacementError::HostRoomFloor`], matched by
+/// type through the [`PlaceError`] that [`Plans::card`] hands back as it came
+/// — and the arena of the one-slot plan with no draft, which the rule loads
+/// (`one`), when that plan pages (an arena past 0: the rule's own condition;
+/// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
+/// name). The floor counts every slot's checkpoints ([`CHECKPOINTS_RESERVE`]),
+/// so a room between the one-slot floor and the asked slots' is one only the
+/// one-slot plan clears. Any other refusal of the asked plan is `ctx38`'s,
+/// and a one-slot plan that is refused too is named by the context search of
+/// `one`.
+fn floor_fallback(
+    asked: &Plans<'_>,
+    set: Option<(Residency, &str)>,
+) -> Result<Option<u64>, GateError> {
+    let Err(refused) = asked.card(1) else {
+        return Ok(None);
+    };
+    let Some(PlaceError::Placement(PlacementError::HostRoomFloor { .. })) =
+        refused.downcast_ref::<PlaceError>()
+    else {
+        return Ok(None);
+    };
+    let one = Plans {
+        mtp: None,
+        slots: 1,
+        ..*asked
+    };
+    let rule = ctx38(&one, None)?;
+    let arena = one.host(rule.ctx, set)?.2;
+    Ok((arena > 0).then_some(arena))
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
@@ -1092,12 +1165,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::describe(&split)?;
-    // The draft's one context condition (a window's positions) holds at any
-    // context the rule grants; it is asked again at the final context below.
+    // The slot count first: it shapes the draft's window condition, the
+    // context search itself, and every plan the seat asks for, each counting
+    // every sequence (`Plans::slots`). A set `--ctx-size` with no
+    // `--parallel` is one request's context — one slot at the whole of it
+    // (`placement::ctx::slots_of`).
+    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
+    // The draft's one context condition (a window's positions a slot) holds
+    // at any context the default rule grants, which each slot gets [`CTX`]
+    // of; a set `--ctx-size` is the total the slots split. It is asked again
+    // at the final context below.
     let (mtp, draft_off) = draft38(
         &levers,
         draft_at,
-        a.ctx.unwrap_or(CTX),
+        (a.ctx.unwrap_or(CTX.saturating_mul(slots)), slots),
         &draft_path,
         &inputs,
     )?;
@@ -1185,11 +1266,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     drop(split);
-    // The slot count first: it shapes the context search itself, every plan
-    // the seat asks for counting each sequence (`Plans::slots`). A set
-    // `--ctx-size` with no `--parallel` is one request's context — one slot
-    // at the whole of it (`placement::ctx::slots_of`).
-    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
     if from == "ctx" {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
@@ -1247,16 +1323,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The draft a one-column load runs without names the paged rule when
     // the draft was asked — on, or off only by its yield to the context on
     // the plan this load abandons ([`paged_draft`]) — at either point.
-    let one_column = |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>| {
-        let (asked, draft_off) = paged_draft(mtp, draft_off, arena);
-        eprintln!(
-            "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} slots=1 \
-             draft=off (the plan pages host experts through the NVMe tier's RAM arena: a step \
-             of several columns reads them through the file mapping)",
-            if asked { "on" } else { "off" }
-        );
-        (if slots > 1 { "paged" } else { from }, draft_off)
-    };
+    let one_column =
+        |arena: u64, slots: usize, mtp: bool, draft_off: Option<Draft38Off>, floor: bool| {
+            let (asked, draft_off) = paged_draft(mtp, draft_off, arena);
+            eprintln!(
+                "paged rule=one-column arena={arena} asked_slots={slots} asked_draft={} slots=1 \
+                 draft=off (the plan pages host experts through the NVMe tier's RAM arena: a \
+                 step of several columns reads them through the file mapping{})",
+                if asked { "on" } else { "off" },
+                if floor {
+                    "; the asked slots' plan leaves the room under the tier's floor"
+                } else {
+                    ""
+                }
+            );
+            (if slots > 1 { "paged" } else { from }, draft_off)
+        };
     let early = match a.ctx.map(|c| c / slots) {
         Some(ctx) if ctx > 0 && (slots > 1 || mtp) => {
             let plain = Plans {
@@ -1279,9 +1361,36 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Paged::AsAsked => (slots, from, mtp, head, draft_off),
         Paged::OneColumn => {
             mtp_inputs = None;
-            let (from, draft_off) = one_column(early, slots, mtp, draft_off);
+            let (from, draft_off) = one_column(early, slots, mtp, draft_off, false);
             (1, from, false, None, draft_off)
         }
+    };
+    // A default count whose plan the room leaves under the tier's floor
+    // ([`floor_fallback`]) is the one-column rule's too: the load plans one
+    // slot, and no draft, where that plan pages.
+    let floor = if from == "default" && slots > 1 {
+        let asked = Plans {
+            inputs: &inputs,
+            place: a.place,
+            experts,
+            levers: &plan_levers,
+            mtp: mtp_inputs.as_ref(),
+            slots,
+        };
+        floor_fallback(&asked, set)?
+    } else {
+        None
+    };
+    let (slots, from, mtp, head, draft_off) = match floor {
+        Some(arena) => match paged(arena, slots, mtp)? {
+            Paged::AsAsked => (slots, from, mtp, head, draft_off),
+            Paged::OneColumn => {
+                mtp_inputs = None;
+                let (from, draft_off) = one_column(arena, slots, mtp, draft_off, true);
+                (1, from, false, None, draft_off)
+            }
+        },
+        None => (slots, from, mtp, head, draft_off),
     };
     let drafted = Plans {
         inputs: &inputs,
@@ -1343,7 +1452,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 ..plans
             };
             rule = ctx38(&one, a.ctx)?;
-            let (from, draft_off) = one_column(host.2, slots, mtp, draft_off);
+            let (from, draft_off) = one_column(host.2, slots, mtp, draft_off, false);
             let host = one.host(rule.ctx, set)?;
             mtp_inputs = None;
             (1, from, false, None, draft_off, host)
@@ -1378,14 +1487,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         );
     }
     let ctx = rule.ctx;
-    // A drafted load's window re-checked at the context the rule chose; a
-    // draft the yield turned off needs no window (the plain rule's context
+    // A drafted load's window checked at the context the rule chose — the
+    // unset draft's own condition at the default's, the set draft's at any;
+    // a draft the yield turned off needs no window (the plain rule's context
     // is the larger one it fell to).
-    if mtp && draft38(&levers, a.place, ctx, &draft_path, &inputs)?.0 != mtp {
+    if mtp && slots.saturating_mul(ctx) < window_positions(slots) {
         return Err(format!(
             "a slot's context of {ctx} leaves no positions for the MTP draft's window; \
-             --ctx-size names a total one past {}",
-            <Body38 as MtpBody>::VERIFY_ROWS * slots
+             --ctx-size names a total of at least {}",
+            window_positions(slots)
         )
         .into());
     }
@@ -1425,6 +1535,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
              {slots} slots, the draft {}: the one-column rule read another plan",
             plan.host.nvme_arena_bytes,
             if mtp { "on" } else { "off" }
+        )
+        .into());
+    }
+    // The residency machine's lane threads fill victims through the arena
+    // the step reads its paged experts from: a fill can evict the slot a
+    // step is reading. The unset rule resolves `off` there; a set word
+    // other than `off` is refused.
+    if let Some((r, word)) = set
+        && r != Residency::Off
+        && plan.host.nvme_arena_bytes > 0
+    {
+        return Err(format!(
+            "BLOOMERY_RESIDENCY={word}: the plan pages host experts through the NVMe tier's {} B \
+             RAM arena, and the residency machine's fills share that arena with the step, whose \
+             slots a fill can evict; unset BLOOMERY_RESIDENCY (or set it to off) to serve this \
+             plan",
+            plan.host.nvme_arena_bytes
         )
         .into());
     }
@@ -1477,6 +1604,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         slots,
         experts,
         plan_levers,
+        room: inputs.room.clone(),
+        plan: PlanKey::of(&plan)?,
         host: levers.host(),
         pin_main: levers.pin_main(),
         path: path.clone(),
@@ -1533,6 +1662,69 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     Ok(server.run())
 }
 
+/// The terms of a plan that the seat's records and rules read: the stage
+/// card's experts a layer and in all, the host leg's experts, the routed
+/// bytes it holds resident and on the NVMe tier, that tier's RAM arena (the
+/// one-column rule's term), the tables the host holds and the experts the
+/// tier cards hold. The main thread records them from the plan it ruled by;
+/// the engine thread holds the plan it loads by to them ([`Q38::open`]).
+#[derive(Clone, Debug)]
+struct PlanKey {
+    n_l: Vec<u64>,
+    card_experts: u64,
+    tier_experts: u64,
+    host_experts: u64,
+    host_expert_bytes: u64,
+    host_table_bytes: u64,
+    nvme_expert_bytes: u64,
+    nvme_arena_bytes: u64,
+}
+
+impl PlanKey {
+    /// `plan`'s terms.
+    fn of(plan: &Plan<'_>) -> Result<PlanKey, GateError> {
+        Ok(PlanKey {
+            n_l: plan.n_l.clone(),
+            card_experts: plan.cards.first().ok_or("a plan with no card")?.experts,
+            tier_experts: plan.tier_n_l.iter().flatten().sum(),
+            host_experts: plan.host.experts,
+            host_expert_bytes: plan.host.expert_bytes,
+            host_table_bytes: plan.host.table_bytes,
+            nvme_expert_bytes: plan.host.nvme_expert_bytes,
+            nvme_arena_bytes: plan.host.nvme_arena_bytes,
+        })
+    }
+
+    /// Every term by name, in the order [`PlanKey::hold`] reads them.
+    fn terms(&self) -> [(&'static str, String); 8] {
+        [
+            ("n_l", format!("{:?}", self.n_l)),
+            ("cards[0].experts", self.card_experts.to_string()),
+            ("tiers.experts", self.tier_experts.to_string()),
+            ("host.experts", self.host_experts.to_string()),
+            ("host.expert_bytes", self.host_expert_bytes.to_string()),
+            ("host.table_bytes", self.host_table_bytes.to_string()),
+            ("host.nvme_expert_bytes", self.nvme_expert_bytes.to_string()),
+            ("host.nvme_arena_bytes", self.nvme_arena_bytes.to_string()),
+        ]
+    }
+
+    /// `Ok` when `engine`, the plan the load runs by, has every term of
+    /// this one; else the first term that differs, named with both values.
+    fn hold(&self, engine: &PlanKey) -> Result<(), GateError> {
+        for ((name, seat), (_, load)) in self.terms().into_iter().zip(engine.terms()) {
+            if seat != load {
+                return Err(format!(
+                    "the engine's plan differs from the plan the seat recorded: {name} {seat} \
+                     vs {load}"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place38,
@@ -1543,6 +1735,13 @@ struct SeatArgs {
     slots: usize,
     experts: Experts,
     plan_levers: PlanLevers,
+    /// The host's room and its reading as the main thread's plans took them
+    /// (`PlanInputs::room`): the engine thread plans from it, not from a
+    /// reading of its own.
+    room: (u64, HostRead),
+    /// The plan the main thread's rules and records read, which the load's
+    /// plan is held to.
+    plan: PlanKey,
     host: bloomery_levers::HostCfg,
     pin_main: bool,
     path: PathBuf,
@@ -1633,7 +1832,12 @@ impl Q38 {
         }
         let t = Instant::now();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
-        let inputs = PlanInputs::describe(&file)?;
+        // The room is the main thread's: a reading of the host's available
+        // bytes of its own would plan the load from another room than the
+        // plan the seat ruled by, and the paged tier's arena is that room's
+        // difference.
+        let mut inputs = PlanInputs::describe(&file)?;
+        inputs.room = a.room.clone();
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
         let ub = ubatch_for(a.ctx)?;
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
@@ -1647,6 +1851,7 @@ impl Q38 {
                     a.experts,
                     a.slots,
                 )?;
+                a.plan.hold(&PlanKey::of(&plan)?)?;
                 Body38::open_placed_residency(
                     file,
                     &plan,
@@ -1676,6 +1881,7 @@ impl Q38 {
                     a.experts,
                     a.slots,
                 )?;
+                a.plan.hold(&PlanKey::of(&plan.plan)?)?;
                 Body38::open_placed_mtp_residency(
                     file,
                     &plan,
