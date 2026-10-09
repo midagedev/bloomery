@@ -32,8 +32,12 @@
 //! one product `(Σ sc·dot) · (d8·d)` added into the lane, then the warp's
 //! butterfly; ik: [`dot_q3k`]'s order), which is `γ(n)`-small beside the
 //! rounding of the codes.
+//!
+//! [`site_rel`] reads both sides' worst-case rounding per weight type for
+//! the projections of the GLM-5.3 and Qwen3.8 bodies; the table above and
+//! [`Rule::of`] are the V4.1 dense gemv's.
 
-use gguf::quant::{GgmlType, half_to_f32};
+use gguf::quant::{ActivationFormat, GgmlType, activation_format, half_to_f32};
 
 /// Values per ik q8_K block and per K-quant super-block.
 pub const QK_K: usize = 256;
@@ -158,6 +162,90 @@ impl Rule {
             .map(|(e, s)| e * e + s)
             .collect()
     }
+}
+
+/// Values per block of our q8 activation of the 32-value weights (`GemmAct32` and `Q8Blocks32`,
+/// the forms under Q8_0, Q5_1 and IQ4_NL).
+pub const Q8_32_BLOCK: usize = 32;
+
+/// Which launch of the card reads a projection's activation (`crates/gpu/src/site.rs` splits the
+/// dense arms; the expert launches are `kquant`'s, `q5_1_sel`'s, `q8_0_sel32`'s, `iq_sel`'s and
+/// the grouped GEMMs').
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arm {
+    /// A dense projection of at most eight columns: the gemv, which reads the f32 rows under a
+    /// Q8_0 or F32 weight.
+    Gemv,
+    /// A dense projection of a wide unit through a route table: the GEMM, which quantizes the
+    /// rows under a Q8_0 weight.
+    Gemm,
+    /// A routed expert's projection, a `_sel` gemv or a route GEMM, which read one form per type.
+    Expert,
+}
+
+/// The worst-case relative rounding of a q8 activation of `block`-value blocks: scale
+/// `d = amax/127`, codes rounded to nearest, so each value moves by at most `d/2`, uniformly,
+/// and by `d/√12` in RMS; the block's RMS error over its RMS is `crest/(127·√12)`, and the crest
+/// (largest magnitude over RMS) is at most `√block`, a block of one nonzero value. For 32 values
+/// this is [`crate::rounding::q8_32_rel`].
+#[must_use]
+pub fn q8_rel(block: usize) -> f64 {
+    (block as f64).sqrt() / (127.0 * 12f64.sqrt())
+}
+
+/// Both sides' worst-case relative rounding of the activation of one projection
+/// ([`site_rel`]); 0 for a side that reads f32.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SiteRel {
+    pub ik: f64,
+    pub ours: f64,
+}
+
+impl SiteRel {
+    /// The two roundings as independent errors: `√(ik² + ours²)`.
+    #[must_use]
+    pub fn joint(self) -> f64 {
+        self.ik.hypot(self.ours)
+    }
+}
+
+/// How both engines round the activation of a projection whose weight is `ty`, as [`q8_rel`] of
+/// each side's block (0 for f32): ik's on a batch of at most 31 columns, and our launch `arm`'s.
+/// `None` for a type or an arm no launch of the GLM-5.3 and Qwen3.8 bodies reads.
+///
+/// - ik: `gguf::quant::activation_format`'s table, the weight type's `vec_dot_type` — Q3_K,
+///   IQ3_XXS and IQ4_XS read q8_K blocks of [`QK_K`] values, Q4_K, Q5_K, Q6_K, Q8_0, Q5_1 and
+///   IQ4_NL q8_2 blocks of [`crate::ik_q8_2::QK`], F32 f32 — which ggml applies whatever the
+///   column count. The iqk matmul's `is_dequant_better` changes the weight's form, not the
+///   activation's, and only from 32 columns up (64 for Q6_K), so a batch under 32 columns runs
+///   the weight's own dot on that form.
+/// - Ours: the form each launch reads. A dense site is `crates/gpu/src/site.rs`'s
+///   `SiteTy::reads`: a K-quant reads q8_1 blocks of [`Q8_1_BLOCK`] values on both arms, Q8_0 the
+///   f32 rows on the gemv and q8 blocks of [`Q8_32_BLOCK`] on the GEMM, F32 f32. An expert reads
+///   q8_1 blocks of [`Q8_1_BLOCK`] under a K-quant, IQ3_XXS or IQ4_XS (the gate·up's `Q8Act` and
+///   the grouped GEMM's `GemmAct`) and q8 blocks of [`Q8_32_BLOCK`] under Q8_0, Q5_1 or IQ4_NL
+///   (`Q8Blocks32` and `GemmAct32`). For Q5_K this differs from [`Rule::of`], which names the
+///   V4.1 gemv's f32.
+#[must_use]
+pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
+    let ours = match (ty, arm) {
+        (GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K, _)
+        | (GgmlType::IQ3_XXS | GgmlType::IQ4_XS, Arm::Expert) => Some(Q8_1_BLOCK),
+        (GgmlType::Q8_0, Arm::Gemm | Arm::Expert)
+        | (GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert) => Some(Q8_32_BLOCK),
+        (GgmlType::Q8_0, Arm::Gemv) | (GgmlType::F32, Arm::Gemv | Arm::Gemm) => None,
+        _ => return None,
+    };
+    let ik = match activation_format(ty).ok()? {
+        Some(ActivationFormat::Q8K) => Some(QK_K),
+        Some(ActivationFormat::Q8_2X4) => Some(crate::ik_q8_2::QK),
+        None => None,
+    };
+    let rel = |block: Option<usize>| block.map_or(0.0, q8_rel);
+    Some(SiteRel {
+        ik: rel(ik),
+        ours: rel(ours),
+    })
 }
 
 /// The variance of a q8 quantizer's rounding of each value of `x`, blocks
@@ -787,5 +875,142 @@ mod ffnmoe_tests {
                 "{ty:?}: {got} vs {exact}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::{Arm, Q8_1_BLOCK, QK_K, Rule, SiteRel, q8_rel, site_rel};
+    use gguf::quant::GgmlType;
+
+    /// The model's q8 rounding at 32 values is the one every band starts from, and a block of
+    /// `n` values scales it by `√(n / 32)`.
+    #[test]
+    fn q8_rel_is_the_32_value_model_scaled_by_the_root_of_the_block() {
+        assert!((q8_rel(32) - crate::rounding::q8_32_rel()).abs() < 1e-15);
+        for n in [128usize, 256] {
+            assert!(
+                (q8_rel(n) / q8_rel(32) - (n as f64 / 32.0).sqrt()).abs() < 1e-12,
+                "{n}"
+            );
+        }
+    }
+
+    /// The table: each type's ik block, and ours per arm, as the doc derives them; a type or an
+    /// arm no launch of the bodies reads is `None`.
+    /// Mutant: a block moved, or Q8_0's gemv read as a quantizer.
+    #[test]
+    fn site_rel_is_the_table() {
+        let q = |ik: Option<usize>, ours: Option<usize>| {
+            Some(SiteRel {
+                ik: ik.map_or(0.0, q8_rel),
+                ours: ours.map_or(0.0, q8_rel),
+            })
+        };
+        let (q32, q128, q256) = (Some(32), Some(Q8_1_BLOCK), Some(QK_K));
+        for arm in [Arm::Gemv, Arm::Gemm, Arm::Expert] {
+            assert_eq!(site_rel(GgmlType::Q3_K, arm), q(q256, q128), "Q3_K {arm:?}");
+            for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+                assert_eq!(site_rel(ty, arm), q(q32, q128), "{ty} {arm:?}");
+            }
+        }
+        for ty in [GgmlType::IQ3_XXS, GgmlType::IQ4_XS] {
+            assert_eq!(site_rel(ty, Arm::Expert), q(q256, q128), "{ty}");
+        }
+        assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemv), q(q32, None));
+        assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemm), q(q32, q32));
+        assert_eq!(site_rel(GgmlType::Q8_0, Arm::Expert), q(q32, q32));
+        for ty in [GgmlType::Q5_1, GgmlType::IQ4_NL] {
+            assert_eq!(site_rel(ty, Arm::Expert), q(q32, q32), "{ty}");
+        }
+        for arm in [Arm::Gemv, Arm::Gemm] {
+            assert_eq!(site_rel(GgmlType::F32, arm), q(None, None));
+            for ty in [
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ4_XS,
+                GgmlType::Q5_1,
+                GgmlType::IQ4_NL,
+            ] {
+                assert_eq!(
+                    site_rel(ty, arm),
+                    None,
+                    "{ty} {arm:?}: no dense launch reads it"
+                );
+            }
+        }
+        assert_eq!(site_rel(GgmlType::F32, Arm::Expert), None);
+        let s = site_rel(GgmlType::Q8_0, Arm::Gemm).expect("a Q8_0 site");
+        assert!((s.ik - crate::rounding::q8_32_rel()).abs() < 1e-15);
+        assert!((s.joint() - std::f64::consts::SQRT_2 * s.ik).abs() < 1e-15);
+        for ty in [
+            GgmlType::F16,
+            GgmlType::BF16,
+            GgmlType::MXFP4,
+            GgmlType::Q2_K,
+        ] {
+            for arm in [Arm::Gemv, Arm::Gemm, Arm::Expert] {
+                assert_eq!(site_rel(ty, arm), None, "{ty} {arm:?}");
+            }
+        }
+    }
+
+    /// Ours is the form the launches read, as their sources say it: the text of `site.rs`'s
+    /// `SiteTy::reads` and of the 32-value GEMM family's module doc, so a launch that moves to
+    /// another form is red here until the table follows it.
+    #[test]
+    fn site_rel_reads_the_forms_the_launches_name() {
+        let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");
+        let read = |file: &str| {
+            std::fs::read_to_string(gpu.join(file))
+                .unwrap_or_else(|e| panic!("crates/gpu/src/{file}: {e}"))
+        };
+        let (site, gemm, grouped) = (
+            read("site.rs"),
+            read("gemm/mod.rs"),
+            read("gemm/grouped.rs"),
+        );
+        for line in [
+            "SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => Form::Q8x128",
+            "SiteTy::Q8_0 => Form::Q8x32",
+            "SiteTy::F32 => Form::F32",
+            "q8_1 blocks of 128 values",
+        ] {
+            assert!(site.contains(line), "site.rs no longer says {line:?}");
+        }
+        assert!(
+            gemm.contains("(Q8_0, IQ4_NL, Q5_1), over [`GemmAct32`]"),
+            "gemm/mod.rs no longer names the 32-value family"
+        );
+        for variant in ["Iq3Xxs", "Iq4Xs"] {
+            assert!(
+                grouped.contains(variant),
+                "the grouped GEMM no longer decodes {variant}"
+            );
+        }
+    }
+
+    /// ik's side of the table is the transcription this module already holds for the K-quants
+    /// ([`Rule::of`]), and so is ours for Q3_K and Q4_K; Q5_K's ours differs from it by design (the
+    /// V4.1 gemv reads f32, the bodies' site reads q8_1).
+    #[test]
+    fn site_rel_agrees_with_the_k_quant_rule_where_both_speak() {
+        for ty in [GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K] {
+            let rule = Rule::of(ty).expect("a K-quant rule");
+            let s = site_rel(ty, Arm::Gemm).expect("a K-quant site");
+            assert_eq!(s.ik, q8_rel(rule.ik.block()), "{ty}");
+        }
+        for ty in [GgmlType::Q3_K, GgmlType::Q4_K] {
+            let rule = Rule::of(ty).expect("a K-quant rule");
+            let s = site_rel(ty, Arm::Gemm).expect("a K-quant site");
+            assert_eq!(s.ours, q8_rel(rule.ours.block()), "{ty}");
+        }
+        let q5 = Rule::of(GgmlType::Q5_K).expect("Q5_K's rule");
+        assert_eq!(q5.ours.block(), 1, "the V4.1 gemv reads f32");
+        assert_ne!(
+            site_rel(GgmlType::Q5_K, Arm::Gemm)
+                .expect("a Q5_K site")
+                .ours,
+            0.0
+        );
     }
 }
