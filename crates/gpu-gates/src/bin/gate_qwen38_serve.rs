@@ -358,8 +358,8 @@
 //! Logs and the raw stream go to `--dir`.
 //!
 //! The server inherits this binary's environment, so the levers it acts on
-//! are the server's (`ACTS_ON`, the same list): one the server would refuse
-//! is refused here, at `main`, before the server starts. The gate sets two of
+//! are the server's (`qwen38_levers::ACTS_ON`, the one list): one the server
+//! would refuse is refused here, at `main`, before the server starts. The gate sets two of
 //! them itself on every server it starts, so neither the placement's defaults
 //! nor the environment move what a clause means: `BLOOMERY_DRAFT` (`mtp` on
 //! the drafted arm's main server and the drafting clauses' own servers, `off`
@@ -385,8 +385,15 @@ fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen38_serve", gate::run())
 }
 
+// The levers the server acts on: the one list the server's `main` parses, so a lever
+// it would refuse is refused here first.
+#[cfg(feature = "gpu")]
+#[path = "shared/qwen38_levers.rs"]
+mod qwen38_levers;
+
 #[cfg(feature = "gpu")]
 mod gate {
+    use super::qwen38_levers::ACTS_ON;
     use std::fs::File;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -417,26 +424,6 @@ mod gate {
     use refset::arch::qwen4exp::mtp::draft_file;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
-
-    /// The levers the server acts on — the same list
-    /// `bloomery_serve_qwen38` parses, kept one with it: this gate starts the
-    /// server with its own environment, so a lever the server would refuse is
-    /// refused here first.
-    const ACTS_ON: &[&str] = &[
-        bloomery_levers::QWEN38_EXPERTS,
-        bloomery_levers::CARD_BUDGET,
-        bloomery_levers::PIN_MAIN,
-        bloomery_levers::HOST_POPULATE,
-        bloomery_levers::HOST_LOCK,
-        bloomery_levers::CARD_DONTNEED,
-        bloomery_levers::R8,
-        bloomery_levers::DRAFT,
-        bloomery_levers::MTP_HEAD_ROWS,
-        bloomery_levers::MTP_DRAFT,
-        bloomery_levers::MTP_WIDTH,
-        bloomery_levers::RESIDENCY,
-        bloomery_levers::XSTREAM,
-    ];
 
     const USAGE: &str = "usage: gate_qwen38_serve --arm plain|drafted --gen <generate_qwen3moe log> \
                          --prompt <text> --ids <a,b,…> --dir <out>";
