@@ -2659,9 +2659,10 @@ impl SwapMachine {
         // stream's queue fills and the enqueue blocks. A boundary issues at
         // most the flips the rule keeps in flight (one event each); a reset
         // stages whatever the window says. Past that the call is refused. A
-        // prompt call's picks stage whatever the window says too, and wait,
-        // within the deadline, until the lane has taken in all but
-        // that many of them ([`SwapMachine::call_backlog`]).
+        // prompt call's picks and its end's return to the call's start stage
+        // whatever the window says too, and wait, within the deadline, until
+        // the lane has taken in all but that many of them
+        // ([`SwapMachine::call_backlog`]).
         let waiting = self.jobs_issued - self.shared.served.load(Ordering::Acquire);
         if !self.shared.flush.load(Ordering::Acquire) && waiting >= self.events.len() as u64 {
             return Err(GpuError::protocol(
@@ -3419,7 +3420,13 @@ impl SwapMachine {
     /// rule's layer numbering, ascending ids): per layer the experts the call
     /// admitted and the ones it sent to the host pair up in ascending ids;
     /// each admitted one goes to the host, and its slot takes the other,
-    /// copied behind a boundary event of `stream` a ring's worth at a time.
+    /// copied behind a boundary event of `stream`. The copies go out as a
+    /// pick's do: the call's flush still on, the lane stages them whatever
+    /// the window says, and each is issued once the lane has taken in all
+    /// but the backlog bound of the jobs before it
+    /// ([`SwapMachine::wait_backlog`]), so the next copies stage while the
+    /// copy stream runs the current ones and the copy stream never holds
+    /// more than that bound behind unstaged jobs; one drain after the last.
     /// The experts copied back.
     fn restore(
         &mut self,
@@ -3473,10 +3480,8 @@ impl SwapMachine {
         self.write_changed(stream)?;
         self.boundary_event.record(stream)?;
         self.copy_waits_boundary = false;
-        for (n, &(l, v, s)) in back.iter().enumerate() {
-            if n > 0 && n % RING_SLOTS == 0 {
-                self.drain_copies(WHAT)?;
-            }
+        for &(l, v, s) in &back {
+            self.wait_backlog(WHAT)?;
             self.copy_into(slots, l, v, s, None, Gate::Boundary)?;
         }
         self.drain_copies(WHAT)?;

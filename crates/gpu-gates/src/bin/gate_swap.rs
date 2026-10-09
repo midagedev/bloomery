@@ -239,6 +239,15 @@
 //!   (its mutants: the stamp posted at the layer's first job, which the
 //!   hold leaves under the settle time; the stamp read from another layer's
 //!   cell, which gives the pick that moved nothing a wall).
+//! - s10 return paced: a call not kept with every job's staging paced from
+//!   the load on: its end copies back more experts than the ring holds,
+//!   issued against the lane's backlog with no drain between them, and
+//!   returns, paced and unpaced, with every expert where the return's rule
+//!   puts it, slot for slot (per layer the call's admitted and sent experts
+//!   paired in ascending ids, each admitted one on the host, the other in
+//!   its slot); the passes after it give the unpaced arm's values, clean
+//!   (its mutant: the drain after the end's last copy dropped, so the slots
+//!   go live while their copies still stage).
 //!
 //! Evicted (a host set populated and not locked, whose pages the page cache
 //! lets go): a victim not host-resident when the machine decides is read
@@ -1252,6 +1261,38 @@ mod gate {
         machine: Option<SwapMachine>,
         slots: SlotMap,
         card: Card,
+    }
+
+    /// Every expert's place in `slots`, per layer by id.
+    fn places(slots: &SlotMap) -> Vec<Vec<Option<Slot>>> {
+        LAYERS
+            .map(|l| (0..E as u32).map(|e| slots.slot(l, e)).collect())
+            .collect()
+    }
+
+    /// The places a call's end not kept leaves, from the places `before` it
+    /// and each layer's card set at the call's start: per layer the experts
+    /// the call admitted and the ones it sent to the host pair up in
+    /// ascending ids, each admitted one goes to the host and the other takes
+    /// its slot (`SwapMachine::end_call`'s return).
+    fn returned(before: &[Vec<Option<Slot>>], start: &[Vec<u32>]) -> Vec<Vec<Option<Slot>>> {
+        before
+            .iter()
+            .zip(start)
+            .map(|(row, was)| {
+                let now: Vec<u32> = (0..E as u32)
+                    .filter(|&e| matches!(row[e as usize], Some(Slot::Card(_))))
+                    .collect();
+                let came = now.iter().filter(|e| !was.contains(e));
+                let went = was.iter().filter(|e| !now.contains(e));
+                let mut out = row.clone();
+                for (&a, &v) in came.zip(went) {
+                    out[v as usize] = row[a as usize];
+                    out[a as usize] = Some(Slot::Host);
+                }
+                out
+            })
+            .collect()
     }
 
     fn card_sets(slots: &SlotMap) -> Vec<Vec<u32>> {
@@ -2941,6 +2982,8 @@ mod gate {
         sets: Vec<Vec<Vec<u32>>>,
         picks: Vec<CallPick>,
         start: Vec<Vec<u32>>,
+        /// Every expert's place in the host map just before the call's end.
+        before_end: Vec<Vec<Option<Slot>>>,
         held_waited: Option<bool>,
         report: Option<CallReport>,
         err: Option<String>,
@@ -3035,6 +3078,7 @@ mod gate {
                 m.call_reader(l, stream)?;
             }
         }
+        seen.before_end = places(&run.slots);
         match m.end_call(stream, &mut run.slots, kept) {
             Ok(rep) => seen.report = Some(rep),
             Err(e) => {
@@ -3702,6 +3746,68 @@ mod gate {
             busy_pick.pick_us,
             idle_pick.admitted,
             idle_pick.staged_us,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// s10 return paced: a call not kept, every job's staging paced from the
+    /// load on, so the end's copies back to the call's start — more than the
+    /// ring holds, issued against the lane's backlog with no drain between
+    /// them — still stage when the end has issued its last. Both that arm
+    /// and its unpaced twin end with every expert where the return's rule
+    /// puts it, slot for slot: per layer the experts the call admitted and
+    /// the ones it sent to the host paired in ascending ids, each admitted
+    /// one on the host and the other in its slot, from the host map just
+    /// before the end; and the passes after the paced end give the twin's
+    /// values, clean. Its mutant: the drain after the end's last copy
+    /// dropped (the slots go live while their copies still stage, so the
+    /// passes after read stale sums).
+    fn s10(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        let (mut n, twin) = call_arm(gpu, pm, trace, Faults::default(), usize::MAX, false, None)?;
+        let twin_slots = places(&n.slots) == returned(&twin.before_end, &twin.start);
+        let before_n = n.values.len();
+        drive(gpu, &mut n, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let pace = Arc::new(Pace::new(true));
+        let faults = Faults {
+            pace: Some(Arc::clone(&pace)),
+            ..Faults::default()
+        };
+        let (mut p, seen) = call_arm(gpu, pm, trace, faults, usize::MAX, false, None)?;
+        pace.set(false);
+        let paced_slots = places(&p.slots) == returned(&seen.before_end, &seen.start);
+        let back = card_sets(&p.slots) == seen.start;
+        let before_p = p.values.len();
+        drive(gpu, &mut p, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let restored = seen.report.map_or(0, |rep| rep.restored);
+        if let Some(rep) = seen.report {
+            record::call_report(&rep).print();
+        }
+        let after = &p.values[before_p..];
+        let same = fnvs(after) == fnvs(&n.values[before_n..]);
+        let ok = seen.err.is_none()
+            && p.err.is_none()
+            && n.err.is_none()
+            && twin.err.is_none()
+            && seen.report.is_some_and(|rep| !rep.kept)
+            && restored > RING_SLOTS
+            && back
+            && paced_slots
+            && twin_slots
+            && same
+            && clean(after);
+        println!(
+            "s10 return paced: a call not kept, every job's staging paced {PACE:?}: {restored} \
+             experts copied back (want more than the ring's {RING_SLOTS}), every layer at its \
+             start set {back}, every expert where the return's rule puts it, slot for slot, \
+             paced {paced_slots} and unpaced {twin_slots}; {} passes after it (stale, double, \
+             miss) {:?}, their values = the unpaced arm's {same}; errors {} / {} / {} / {} {}",
+            after.len(),
+            errs(after),
+            show(&seen.err),
+            show(&p.err),
+            show(&twin.err),
+            show(&n.err),
             verdict(ok)
         );
         Ok(ok)
@@ -4487,6 +4593,7 @@ mod gate {
         ok &= s6(&gpu, &pm)?;
         ok &= s8(&gpu, &pm)?;
         ok &= s9(&gpu, &pm)?;
+        ok &= s10(&gpu, &pm, &trace)?;
         ok &= s7_pick(&gpu, &trace)?;
         ok &= s7_boundary(&gpu, &pm, &trace, &a)?;
         ok &= s7_load(&gpu, &pm)?;
@@ -4513,7 +4620,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a call's end copies its way back under the same bound and waits for its last copy; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
             );
             Ok(())
         } else {
