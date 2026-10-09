@@ -33,7 +33,8 @@
 //!   buffered reads fill the page cache by design): what the page cache
 //!   holds of the tier's drop runs ([`NvTier::drop_region`]), read with
 //!   `mincore` over the probe's own open of the file, not the engine's
-//!   mapping, three times. (a) 0 pages after the tier's own drop of every run
+//!   mapping, three times, each after the tier's dropper has run what its
+//!   readers queued ([`NvTier::flush`]). (a) 0 pages after the tier's own drop of every run
 //!   before the prompt — the premise: no other process maps the file (every
 //!   gate that maps it holds the V4.1 load lock this one holds). (b) After
 //!   the prompt call, at most the readahead its readers had in flight when
@@ -288,6 +289,11 @@ fn arm(
     let mut next = argmax;
     run.tokens.push(next);
     note(&mut s, &mut run)?;
+    // The readers queue their drops for the tier's dropper: every read
+    // below waits for the queue first.
+    if let Some((t, _)) = &foot {
+        t.flush()?;
+    }
     let drops1 = tier.as_ref().map(|t| t.stats());
     // The prompt's residue dropped through the tier, so the steps' read
     // names only what the steps' own readers left.
@@ -307,6 +313,9 @@ fn arm(
         next = out.argmax();
         run.tokens.push(next);
         note(&mut s, &mut run)?;
+    }
+    if let Some((t, _)) = &foot {
+        t.flush()?;
     }
     run.stats = tier.as_ref().map(|t| t.stats());
     if let (Some((_, regions)), Some(d0), Some(d1)) = (&foot, drops0, drops1) {
@@ -658,7 +667,7 @@ fn run() -> Result<(), GateError> {
              (read_ahead_kb); resident {} after the tier's own drop (want 0: {}), {} after the \
              prompt (at most {} layers x {cpus} readers x R = {prompt_bound}: {}), {} after {STEPS} \
              steps (at most {} flips x 21R/4 = {steps_bound}: {}); the prompt's drops {} calls, \
-             {:.1} ms of its {:.1} ms ({:.2} %): {}",
+             {:.1} ms on the dropper's thread beside the prompt's {:.1} ms ({:.2} %): {}",
             f.base.total,
             f.layers,
             f.base.resident,

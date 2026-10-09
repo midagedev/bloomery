@@ -14,10 +14,15 @@
 //! else can flush. The model file's mapping is its readers': a read of the
 //! ids the arena serves through it (a prompt call's union, a lane's copy)
 //! faults their pages in from the drive, and once the reader has consumed
-//! them the tier drops them from the mapping and the page cache — a prompt
-//! union's whole layer ([`NvTier::release_union`]) but the ids a lane has
-//! open, a lane's own id ([`NvTier::end_read`]) — so nothing a prompt or a
-//! lane brought in stays past it. A decode step's union of several columns
+//! them the tier drops them from the mapping and the page cache — the
+//! layer's every id but the ones a lane has open, after a prompt union
+//! ([`NvTier::release_union`]) and after a lane's copy ([`NvTier::end_read`],
+//! so the kernel's readahead past the copied id goes too) — so nothing a
+//! prompt or a lane brought in stays past it. The reader only names the
+//! pages; the tier's dropper thread makes the syscalls, a layer's request
+//! replacing one still queued, so the freeing of the pages runs beside the
+//! next layer's work rather than on the reader's thread
+//! ([`NvTier::flush`] waits for the queue). A decode step's union of several columns
 //! (the step port) keeps what it read: its ids are the decode's hot set,
 //! which the next step reads again, and a drop would send each step back to
 //! the drive for them. Which pages go is the books' ([`drop_runs`]), never `mincore`'s, and no
@@ -34,7 +39,8 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
@@ -433,9 +439,84 @@ struct Stats {
     resident_bytes: AtomicU64,
     buffered_reads: AtomicU64,
     buffered_bytes: AtomicU64,
+}
+
+/// What the tier's dropper thread shares with the tier: the split whose
+/// shards' mappings it advises, the queue (one request a layer: the runs a
+/// reader named, a later request replacing it), the first failure, and the
+/// drops' counters.
+struct DropShared {
+    split: Arc<Split>,
+    queue: Mutex<DropQueue>,
+    /// Signalled when a request arrives or the tier stops.
+    work: Condvar,
+    /// Signalled when a request is done.
+    done: Condvar,
     drops: AtomicU64,
     drop_bytes: AtomicU64,
     drop_ns: AtomicU64,
+}
+
+struct DropQueue {
+    /// Per layer: the runs a request named, until the dropper takes them.
+    pending: Vec<Option<DropRuns>>,
+    queued: usize,
+    running: bool,
+    /// The first drop the kernel refused, named; every later request and
+    /// flush returns it.
+    failed: Option<String>,
+    stop: bool,
+}
+
+impl DropShared {
+    fn queue(&self) -> MutexGuard<'_, DropQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Out of the mapping and the page cache: `runs`, layer `layer`'s, and
+    /// the drop counted.
+    fn release(&self, layer: usize, runs: &DropRuns) -> Result<(), String> {
+        let t0 = Instant::now();
+        let mut pages = PageDrop::new(&self.split);
+        for (shard, runs) in runs {
+            for run in runs {
+                pages
+                    .release(*shard, run.clone())
+                    .map_err(|e| format!("layer {layer} shard {shard}: {e}"))?;
+            }
+        }
+        self.drops.fetch_add(1, Ordering::Relaxed);
+        self.drop_bytes.fetch_add(pages.bytes(), Ordering::Relaxed);
+        self.drop_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The dropper thread: take a queued layer's runs, release them, until
+    /// the tier stops.
+    fn run(&self) {
+        let mut q = self.queue();
+        loop {
+            if q.stop {
+                return;
+            }
+            let Some(layer) = q.pending.iter().position(Option::is_some) else {
+                q = self.work.wait(q).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let runs = q.pending[layer].take().expect("the position found it");
+            q.queued -= 1;
+            q.running = true;
+            drop(q);
+            let r = self.release(layer, &runs);
+            q = self.queue();
+            q.running = false;
+            if let Err(e) = r {
+                q.failed.get_or_insert(e);
+            }
+            self.done.notify_all();
+        }
+    }
 }
 
 /// The RAM arena of the NVMe expert tier ([`NvTier::of_paged`]).
@@ -463,6 +544,26 @@ pub struct NvTier {
     split: Arc<Split>,
     /// The host's page in bytes, the unit a drop's runs round to.
     page: u64,
+    /// The dropper thread's shared state, and the thread, joined on drop.
+    drops: Arc<DropShared>,
+    dropper: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for NvTier {
+    fn drop(&mut self) {
+        self.drops.queue().stop = true;
+        self.drops.work.notify_all();
+        let handle = self
+            .dropper
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(h) = handle {
+            // A dropper that panicked has nothing left to release: the
+            // mapping goes with the split.
+            let _ = h.join();
+        }
+    }
 }
 
 struct Books {
@@ -694,6 +795,28 @@ impl NvTier {
                 })
                 .collect();
         }
+        let drops = Arc::new(DropShared {
+            split: Arc::clone(split),
+            queue: Mutex::new(DropQueue {
+                pending: vec![None; arenas.len()],
+                queued: 0,
+                running: false,
+                failed: None,
+                stop: false,
+            }),
+            work: Condvar::new(),
+            done: Condvar::new(),
+            drops: AtomicU64::new(0),
+            drop_bytes: AtomicU64::new(0),
+            drop_ns: AtomicU64::new(0),
+        });
+        let dropper = std::thread::Builder::new()
+            .name("nvtier-drop".into())
+            .spawn({
+                let drops = Arc::clone(&drops);
+                move || drops.run()
+            })
+            .map_err(|e| GpuError::shape(WHAT, format!("the dropper thread: {e}")))?;
         Ok(Some(NvTier {
             shared: SharedArena(map.as_ptr() as *mut u8),
             map,
@@ -708,6 +831,8 @@ impl NvTier {
             audit: OnceLock::new(),
             split: Arc::clone(split),
             page,
+            drops,
+            dropper: Mutex::new(Some(dropper)),
         }))
     }
 
@@ -812,9 +937,9 @@ impl NvTier {
             resident_bytes: s.resident_bytes.load(Ordering::Relaxed),
             buffered_reads: s.buffered_reads.load(Ordering::Relaxed),
             buffered_bytes: s.buffered_bytes.load(Ordering::Relaxed),
-            drops: s.drops.load(Ordering::Relaxed),
-            drop_bytes: s.drop_bytes.load(Ordering::Relaxed),
-            drop_ns: s.drop_ns.load(Ordering::Relaxed),
+            drops: self.drops.drops.load(Ordering::Relaxed),
+            drop_bytes: self.drops.drop_bytes.load(Ordering::Relaxed),
+            drop_ns: self.drops.drop_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -854,11 +979,12 @@ impl NvTier {
     }
 
     /// The lane that opened layer `layer`'s expert `id`
-    /// ([`NvTier::open_read`]) has copied it out: the id leaves the mapping
-    /// and the page cache, unless another lane still has it open, whose own
-    /// end drops it ([`NvTier::drop_layer`]'s rule for the rest). Refused by
-    /// name: an end with no open, besides [`NvTier::open_read`]'s refusals
-    /// and a drop the kernel refuses.
+    /// ([`NvTier::open_read`]) has copied it out: the layer's ids the arena
+    /// serves leave the mapping and the page cache, the copied id and what
+    /// the kernel read around it alike, but the ones a lane still has open,
+    /// whose own end asks again ([`NvTier::drop_layer`]'s rule, queued for
+    /// the dropper). Refused by name: an end with no open, a dropper that
+    /// failed, besides [`NvTier::open_read`]'s refusals.
     pub fn end_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::end_read";
         let arena = self.arena_of(layer, WHAT)?;
@@ -866,25 +992,20 @@ impl NvTier {
             return Ok(());
         }
         arena.close(layer, id, WHAT)?;
-        let mut marks = arena.live_marks();
-        let mark = &mut marks[id as usize];
-        if *mark == Mark::Rest {
-            *mark = Mark::Read;
-            self.drop_marked(layer, arena, &marks, WHAT)?;
-        }
-        Ok(())
+        self.queue_drop(layer, arena, WHAT)
     }
 
-    /// A union call has read layer `layer`'s experts through the model
-    /// file's mapping and consumed them: every id the arena serves
+    /// Layer `layer`'s drop, on this thread: every id the arena serves
     /// ([`NvTier::serves`]) leaves this process's page tables, then the page
-    /// cache ([`PageDrop`]) — the ids the call read, the ones the kernel read
+    /// cache ([`PageDrop`]) — the ids a reader read, the ones the kernel read
     /// around them, and the ones nobody read, at no cost but the walk —
     /// except the ids a lane has open ([`NvTier::open_read`]), whose own end
-    /// drops them. The pages are the whole ones [`drop_runs`] names: never
+    /// asks again. The pages are the whole ones [`drop_runs`] names: never
     /// one that holds a byte of the plan's host segment, of an id a lane has
-    /// open, or of the tensors beside a stack. Refused by name: a layer the
-    /// arena does not cover, and a drop the kernel refuses.
+    /// open, or of the tensors beside a stack. The readers queue the same
+    /// drop for the dropper ([`NvTier::release_union`], [`NvTier::end_read`]).
+    /// Refused by name: a layer the arena does not cover, and a drop the
+    /// kernel refuses.
     pub fn drop_layer(&self, layer: usize) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::drop_layer";
         let arena = self.arena_of(layer, WHAT)?;
@@ -893,22 +1014,71 @@ impl NvTier {
 
     /// A prompt call's union over `lists` has read layer `layer`'s experts
     /// through the model file's mapping and consumed them: when it listed an
-    /// id the arena serves, the whole layer's go ([`NvTier::drop_layer`]);
-    /// one that listed only the host segment's ids read none of them. The
-    /// batch port's alone ([`super::HostExperts::release_union`]).
+    /// id the arena serves, the whole layer's go ([`NvTier::drop_layer`]'s
+    /// rule, queued for the dropper); one that listed only the host
+    /// segment's ids read none of them. The batch port's alone
+    /// ([`super::HostExperts::release_union`]). Refused by name: a dropper
+    /// that failed.
     pub fn release_union(&self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::release_union";
         if !lists
             .iter()
             .any(|l| l.iter().any(|&(id, _)| self.serves(layer, id)))
         {
             return Ok(());
         }
-        self.drop_layer(layer)
+        let arena = self.arena_of(layer, WHAT)?;
+        self.queue_drop(layer, arena, WHAT)
+    }
+
+    /// Wait until every queued drop has run. Refused by name: a dropper
+    /// that failed.
+    pub fn flush(&self) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::flush";
+        let mut q = self.drops.queue();
+        while q.queued > 0 || q.running {
+            q = self.drops.done.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+        match &q.failed {
+            Some(e) => Err(GpuError::protocol(WHAT, format!("the tier's dropper: {e}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Queue layer `layer`'s drop of every id the arena serves but the ones
+    /// a lane has open, as the books stand now: the runs replace a request
+    /// of the layer still queued. Refused by name as `what`: a dropper that
+    /// failed, and books a drop cannot be planned from.
+    fn queue_drop(
+        &self,
+        layer: usize,
+        arena: &LayerArena,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        let marks = arena.layer_marks();
+        if !marks.contains(&Mark::Read) {
+            return Ok(());
+        }
+        let runs = self.runs_of(arena, &marks, what)?;
+        let mut q = self.drops.queue();
+        if let Some(e) = &q.failed {
+            return Err(GpuError::protocol(what, format!("the tier's dropper: {e}")));
+        }
+        let slot = q
+            .pending
+            .get_mut(layer)
+            .ok_or(GpuError::state(what, "the layer's queue slot"))?;
+        if slot.replace(runs).is_none() {
+            q.queued += 1;
+        }
+        drop(q);
+        self.drops.work.notify_one();
+        Ok(())
     }
 
     /// The pages [`drop_runs`] names over each stack row of `layer` under
-    /// `marks`, out of the mapping and the page cache, and the drop counted;
-    /// nothing when no id is read.
+    /// `marks`, out of the mapping and the page cache on this thread, and the
+    /// drop counted; nothing when no id is read.
     fn drop_marked(
         &self,
         layer: usize,
@@ -919,23 +1089,10 @@ impl NvTier {
         if !marks.contains(&Mark::Read) {
             return Ok(());
         }
-        let t0 = Instant::now();
-        let mut pages = PageDrop::new(&self.split);
-        for (shard, runs) in self.runs_of(arena, marks, what)? {
-            for run in runs {
-                pages.release(shard, run).map_err(|e| {
-                    GpuError::plan(what, format!("layer {layer} shard {shard}: {e}"))
-                })?;
-            }
-        }
-        self.stats.drops.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .drop_bytes
-            .fetch_add(pages.bytes(), Ordering::Relaxed);
-        self.stats
-            .drop_ns
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Ok(())
+        let runs = self.runs_of(arena, marks, what)?;
+        self.drops
+            .release(layer, &runs)
+            .map_err(|e| GpuError::shape(what, e))
     }
 
     /// Layer `layer`'s arena, refused by name as `what` on a layer the arena
