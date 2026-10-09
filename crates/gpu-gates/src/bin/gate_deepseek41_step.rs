@@ -96,6 +96,27 @@
 //!   reader's list are our own step's, and the bands against ik's nodes
 //!   are conditioned on the measured distance of the fold the layer reads,
 //!   not on a distance carried along ik's path.
+//! - `--sets` and `--select` on the fixture file (the fixture tier): the same
+//!   steps from ik's dumps of the fixture, `fx_ref_deepseek41_{step4, d1n, d1,
+//!   d2}_every_node` (`refset::arch::deepseek41::fixture`), one fixture-oracle
+//!   clause a set, each opened through `tier::fixture_set` (missing, stale,
+//!   foreign, unfinished and malformed sets end the gate by name). The seams,
+//!   the selection pins and the router's tie rule are the real clauses':
+//!   their bounds read ik's inputs and our rules, not the weights, so they
+//!   hold on any weights. The head's argmax is a tie band (`flip::head_tie`)
+//!   where the real clause reads `a == ka`: the fixture's random head leaves
+//!   ik's top logits near flat, so a strict equality re-rolls on any rounding
+//!   change. The band is `hypot(r_in, joint)`, `r_in` the relative distance
+//!   the streams carry into the head and `joint` both sides' worst-case
+//!   activation rounding under the head's weight type
+//!   (`act_rule::site_rel`), and the cap `6 · band ·` the RMS of ik's row
+//!   (`flip::head_cap`); the `logits_rel` pin is unchanged. Past the first
+//!   routing tie the step is off ik's path as on the real file, so the head is
+//!   held only on a set whose layers all route as ik's do; on another it
+//!   prints as a diagnostic, and a `fixture head:` line counts the sets that
+//!   held it (it is no verdict). The run closes with
+//!   `tier::expect_fixture_oracle` against the clauses it declares (a clause
+//!   that did not run, or one it does not declare, ends it by name).
 //! - `--ppl TAG` (G4): ik's KL-divergence base file `$BLOOMERY_DATA/ikppl/
 //!   TAG.kld` — refused by name unless its run (`TAG.log` beside it) read
 //!   the model file the tree runs with the family's ik tree
@@ -235,6 +256,8 @@ mod gate {
     use bloomery_gpu_deepseek41::chain::glue::Glue;
     use bloomery_gpu_deepseek41::indexer::{HEAD_DIM as KEY_DIM, HEADS as KEY_HEADS};
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
+    use bloomery_gpu_gates::act_rule::{Arm, SiteRel, site_rel};
+    use bloomery_gpu_gates::flip::{head_cap, head_gap, head_tie};
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::kld::KldBase;
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order, count_kinds, kind_name};
@@ -254,7 +277,7 @@ mod gate {
     };
     use cuda_core::sys;
     use gguf::Split;
-    use gguf::quant::half_to_f32;
+    use gguf::quant::{GgmlType, half_to_f32};
     use model::Tensor2;
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -262,16 +285,27 @@ mod gate {
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
     use model::placement::{KvBytes, workstation};
+    use refset::arch::deepseek41::fixture as fx;
 
     // ------------------------------------------------------------ constants
 
     /// The decode-step sets of phase 1.
     const SETS: [&str; 2] = [STEP4, D1N];
+    /// The fixture file's twins of [`SETS`]: ik's dumps of the same steps on the fixture, each the
+    /// subject of one fixture-oracle clause.
+    const FX_SETS: [&str; 2] = [fx::STEP4, fx::D1N];
+    /// The fixture-oracle clauses `--sets` decides (the count of [`FX_SETS`], declared beside it for
+    /// `tier::expect_fixture_oracle`).
+    const FIXTURE_ORACLE_SETS: usize = 2;
     /// The ids the fixture tier steps to each of `ds41_tier::DECODE_SETS`' positions: the prose
     /// corpus, whose first 1,026 ids reach the longest.
     const REPLAY_IDS: usize = 1026;
     /// The decode-step sets whose streams select (phase 2).
     const SELECT_SETS: [&str; 2] = [D1, D2];
+    /// The fixture file's twins of [`SELECT_SETS`].
+    const FX_SELECT_SETS: [&str; 2] = [fx::D1, fx::D2];
+    /// The fixture-oracle clauses `--select` decides (the count of [`FX_SELECT_SETS`]).
+    const FIXTURE_ORACLE_SELECT: usize = 2;
     /// f32's unit roundoff.
     const U: f64 = f32::EPSILON as f64 / 2.0;
     /// The score band's width in derived deviations: one row's score against
@@ -399,6 +433,7 @@ mod gate {
                 "--slots: the slot harness's contracts on a load of two sequences",
             )?;
             let r = slots_run(&path, &hp, &inputs, &cfg);
+            tier::expect_fixture_oracle("gate_deepseek41_step", fixture_oracle_declared(&args))?;
             println!("gate_deepseek41_step: {}", tier::tally_line());
             return r;
         }
@@ -452,29 +487,67 @@ mod gate {
             pass &= route_trace_recover_case(&mut m, &hp, &path)?;
         }
         // The sets' clauses compare the engine with ik's dump of the real file, which the
-        // fixture's weights are not: the oracle's, deferred in the fixture tier.
-        if args.sets
-            && tier::run_clause(
+        // fixture's weights are not: the oracle's, deferred in the fixture tier. There ik's dump of
+        // the fixture file answers them, one fixture-oracle clause a set.
+        let mut fixture_head = FixtureHead::default();
+        if args.sets {
+            if tier::run_clause(
                 "--sets: the step's seams against ik's dump on the decode-step sets (step4, d1n)",
                 Tag::Oracle,
-            )?
-        {
-            pass &= sets(&mut m, &mut head, &split, &hp, cfg.body.host.r8, &SETS)?;
-        }
-        if args.select
-            && tier::run_clause(
-                "--select: the indexer's selection against ik's lists on the decode-step sets (d1, d2)",
-                Tag::Oracle,
-            )?
-        {
-            pass &= sets(
+            )? {
+                pass &= sets(
+                    &mut m,
+                    &mut head,
+                    &split,
+                    &hp,
+                    cfg.body.host.r8,
+                    &SETS,
+                    Dump::Real,
+                )?
+                .0;
+            }
+            let (ok, ran) = fixture_sets(
                 &mut m,
                 &mut head,
                 &split,
                 &hp,
                 cfg.body.host.r8,
-                &SELECT_SETS,
+                "--sets: the step's seams against ik's dump on the fixture file",
+                &FX_SETS,
             )?;
+            pass &= ok;
+            fixture_head.add(ran);
+        }
+        if args.select {
+            if tier::run_clause(
+                "--select: the indexer's selection against ik's lists on the decode-step sets (d1, d2)",
+                Tag::Oracle,
+            )? {
+                pass &= sets(
+                    &mut m,
+                    &mut head,
+                    &split,
+                    &hp,
+                    cfg.body.host.r8,
+                    &SELECT_SETS,
+                    Dump::Real,
+                )?
+                .0;
+            }
+            let (ok, ran) = fixture_sets(
+                &mut m,
+                &mut head,
+                &split,
+                &hp,
+                cfg.body.host.r8,
+                "--select: the indexer's selection against ik's lists on the fixture file",
+                &FX_SELECT_SETS,
+            )?;
+            pass &= ok;
+            fixture_head.add(ran);
+        }
+        if let Some(line) = fixture_head.line() {
+            println!("{line}");
         }
         if let Some(tag) = &args.ppl
             && tier::run_clause(
@@ -487,12 +560,20 @@ mod gate {
         if args.skew.any() {
             pass &= skew::clauses(&mut m, &split, &hp, &args.skew)?;
         }
+        tier::expect_fixture_oracle("gate_deepseek41_step", fixture_oracle_declared(&args))?;
         println!("gate_deepseek41_step: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
         println!("PASSED: gate_deepseek41_step");
         Ok(())
+    }
+
+    /// The fixture-oracle clauses the run's flags decide: one for each fixture set of `--sets` and of
+    /// `--select`.
+    fn fixture_oracle_declared(args: &Args) -> usize {
+        usize::from(args.sets) * FIXTURE_ORACLE_SETS
+            + usize::from(args.select) * FIXTURE_ORACLE_SELECT
     }
 
     // ----------------------------------------------------------- the slots
@@ -2203,8 +2284,28 @@ mod gate {
         Ok(found)
     }
 
-    fn open_set(split: &Split, hp: &Hparams, name: &'static str) -> Result<Set, GateError> {
-        let man = for_arch(Arch::Deepseek41)?.open_named(name)?;
+    /// Whose dump of a decode step a `sets` run compares the engine with.
+    #[derive(Clone, Copy)]
+    enum Dump<'a> {
+        /// ik's dump of the real file, opened by the oracle table; the head's argmax is ik's.
+        Real,
+        /// ik's dump of the fixture file, opened through `tier::fixture_set` for the
+        /// fixture-oracle clause named; the head's argmax is excused as a tie band.
+        Fixture(&'a str),
+    }
+
+    fn open_set(
+        split: &Split,
+        hp: &Hparams,
+        name: &'static str,
+        dump: Dump<'_>,
+    ) -> Result<Set, GateError> {
+        let man = match dump {
+            Dump::Real => for_arch(Arch::Deepseek41)?.open_named(name)?,
+            Dump::Fixture(clause) => {
+                RefManifest::open(&tier::fixture_set(clause, &fx::IK, name)?, &fx::IK)?
+            }
+        };
         let (pos, tokens, before) = man.step()?;
         let (tokens, before) = (tokens.to_vec(), before.to_vec());
         let ctx = man
@@ -2622,7 +2723,7 @@ mod gate {
             }
         }
         for name in [STEP4, D1, D2].into_iter().filter(|_| !fixture) {
-            let set = open_set(split, hp, name)?;
+            let set = open_set(split, hp, name, Dump::Real)?;
             crate::ds41_tier::witness_set(name, set.pos, set.top_k, hp.indexer.top_k)?;
             let state = set_state(&set, hp)?;
             let (gpu, w, body) = m.body_parts("structure")?;
@@ -3189,6 +3290,61 @@ mod gate {
         }
     }
 
+    /// One fixture-oracle clause for each of `names`, `what` naming the comparison it is the fixture
+    /// file's twin of: a tier that leaves the clause to the other (the real tier) prints its line and
+    /// runs nothing.
+    fn fixture_sets(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        split: &Split,
+        hp: &Hparams,
+        r8: bool,
+        what: &str,
+        names: &[&'static str],
+    ) -> Result<(bool, FixtureHead), GateError> {
+        let mut pass = true;
+        let mut held = FixtureHead::default();
+        for &name in names {
+            let clause = format!("{what}, set {name}");
+            if tier::run_clause(&clause, Tag::FixtureOracle)? {
+                let (ok, n) = sets(m, head, split, hp, r8, &[name], Dump::Fixture(&clause))?;
+                pass &= ok;
+                held.add(FixtureHead { sets: 1, held: n });
+            }
+        }
+        Ok((pass, held))
+    }
+
+    /// The fixture sets that ran and on how many the step stayed on ik's path to the head, so the
+    /// head's tie rule ran; its line names a head that never ran and is no verdict.
+    #[derive(Default)]
+    struct FixtureHead {
+        sets: usize,
+        held: usize,
+    }
+
+    impl FixtureHead {
+        fn add(&mut self, other: FixtureHead) {
+            self.sets += other.sets;
+            self.held += other.held;
+        }
+
+        /// The `fixture head:` line; `None` when no fixture set ran (the real tier).
+        fn line(&self) -> Option<String> {
+            (self.sets > 0).then(|| {
+                let mut line = format!(
+                    "fixture head: held on {} of {} sets (the rest left ik's path before the head)",
+                    self.held, self.sets
+                );
+                if self.held == 0 {
+                    line.push_str(" — unexercised: the head_tie rule did not run");
+                }
+                line
+            })
+        }
+    }
+
+    /// Returns whether every pin passed and on how many of `names` the head was held.
     fn sets(
         m: &mut Deepseek41Model,
         head: &mut Head,
@@ -3196,12 +3352,18 @@ mod gate {
         hp: &Hparams,
         r8: bool,
         names: &[&'static str],
-    ) -> Result<bool, GateError> {
+        dump: Dump<'_>,
+    ) -> Result<(bool, usize), GateError> {
         let mut pass = true;
+        let mut held = 0usize;
         let mut worst = 0.0f64;
         let indexer: Vec<bool> = hp.layers.iter().map(|k| k.indexer).collect();
+        let argmax = match dump {
+            Dump::Real => Argmax::Ik,
+            Dump::Fixture(_) => Argmax::Tie(head_formats(split)?),
+        };
         for &name in names {
-            let set = open_set(split, hp, name)?;
+            let set = open_set(split, hp, name, dump)?;
             let state = set_state(&set, hp)?;
             let (gpu, w, body) = m.body_parts("sets")?;
             body.set_indexer_top_k(gpu, set.top_k)?;
@@ -3213,10 +3375,16 @@ mod gate {
             let (ok, ratio, acc) = check_seams(&set, split, hp, r8, &seams)?;
             pass &= ok;
             worst = worst.max(ratio);
-            pass &= check_head(&set, &head.logits_to_host(gpu)?, acc)?;
+            let (ok, on_path) = check_head(&set, &head.logits_to_host(gpu)?, acc, argmax)?;
+            pass &= ok;
+            held += usize::from(on_path);
         }
-        println!("sets: largest measured/bound ratio pinned over both sets {worst:.3} (pin {Z})");
-        Ok(pass)
+        let over = match dump {
+            Dump::Real => "both sets".to_string(),
+            Dump::Fixture(_) => names.join(", "),
+        };
+        println!("sets: largest measured/bound ratio pinned over {over} {worst:.3} (pin {Z})");
+        Ok((pass, held))
     }
 
     /// Each engram site's host row ids against the set's `engram_rows-L`.
@@ -4057,11 +4225,53 @@ mod gate {
         (best, v[best], second, v[second])
     }
 
-    /// The head end: the argmax equals `result_output`'s, and the logits sit
+    /// How `check_head` reads the argmax.
+    #[derive(Clone, Copy)]
+    enum Argmax {
+        /// Ours is ik's argmax.
+        Ik,
+        /// Ours is ik's argmax, or ik's own logit at ours lies within `flip::head_cap` of its top,
+        /// the band built from the head's weight type.
+        Tie(HeadForm),
+    }
+
+    /// The head's weight type and both engines' worst-case rounding of the activation it reads.
+    #[derive(Clone, Copy)]
+    struct HeadForm {
+        ty: GgmlType,
+        rel: SiteRel,
+    }
+
+    /// The head's [`HeadForm`], read from the file: `output.weight`'s type, whose activation both
+    /// engines round (`act_rule::site_rel`).
+    fn head_formats(split: &Split) -> Result<HeadForm, GateError> {
+        let name = names::output();
+        let (_, info) = split
+            .find(&name)
+            .ok_or_else(|| format!("the file has no {name}"))?;
+        let rel = site_rel(info.ty, Arm::Gemv).ok_or_else(|| {
+            format!(
+                "{name} is {}: act_rule::site_rel names no activation rule for it, so the head's \
+                 tie band has no terms",
+                info.ty
+            )
+        })?;
+        Ok(HeadForm { ty: info.ty, rel })
+    }
+
+    /// The head end: the argmax equals `result_output`'s (`argmax`), and the logits sit
     /// inside the envelope carried one step on — the last streams' collapse
     /// keeps their relative error (`acc`, the envelope's variance there), and
-    /// the head's Q6_K reads our norm's q8_1 per 128 against ik's q8_2.
-    fn check_head(set: &Set, logits: &[f32], carried: Option<f64>) -> Result<bool, GateError> {
+    /// the head's Q6_K reads our norm's q8_1 per 128 against ik's q8_2. A tie band replaces the
+    /// strict argmax where ik's top logits are near flat: its band is the carried distance and the
+    /// head's two roundings at their worst crest as independent errors. Returns whether the head
+    /// passed and whether it was held (the step stayed on ik's path to it) rather than a diagnostic.
+    fn check_head(
+        set: &Set,
+        logits: &[f32],
+        carried: Option<f64>,
+        argmax: Argmax,
+    ) -> Result<(bool, bool), GateError> {
         let want = named(&set.man, "result_output")?;
         let norm = named(&set.man, "result_norm")?;
         let r_in = carried.unwrap_or(f64::NAN);
@@ -4069,10 +4279,32 @@ mod gate {
         let r = rel(logits, &want);
         let (a, av, b, bv) = top2(logits);
         let (ka, kav, kb, kbv) = top2(&want);
-        let ok = a == ka && r.is_finite() && r <= Z * bound;
+        let (argmax_ok, tie) = match argmax {
+            Argmax::Ik => (a == ka, String::new()),
+            Argmax::Tie(form) => {
+                let ours = u32::try_from(a)?;
+                let joint = form.rel.joint();
+                let band = r_in.hypot(joint);
+                let rms = (sumsq(&want) / want.len() as f64).sqrt();
+                (
+                    head_tie(&want, ours, band),
+                    format!(
+                        ", argmax tie band: ik's logit at ours {:.3e} below its top, cap {:.3e} = \
+                         6 · band {band:.3e} · rms {rms:.3e} (band = hypot(carried {r_in:.3e}, \
+                         joint {joint:.3e}); the head's {} activation: ik {:.3e}, ours {:.3e})",
+                        head_gap(&want, ours),
+                        head_cap(band, &want),
+                        form.ty,
+                        form.rel.ik,
+                        form.rel.ours
+                    ),
+                )
+            }
+        };
+        let ok = argmax_ok && r.is_finite() && r <= Z * bound;
         println!(
             "head set={}: top1 {a} (margin {:.4} over {b}) ik top1 {ka} (margin {:.4} over {kb}), \
-             logits_rel={r:.3e} carried={r_in:.3e} bound={bound:.3e} ratio={:.3}: {}",
+             logits_rel={r:.3e} carried={r_in:.3e} bound={bound:.3e} ratio={:.3}{tie}: {}",
             set.name,
             av - bv,
             kav - kbv,
@@ -4083,7 +4315,7 @@ mod gate {
                 "diagnostic (the step left ik's path)"
             }
         );
-        Ok(ok || carried.is_none())
+        Ok((ok || carried.is_none(), carried.is_some()))
     }
 
     // ------------------------------------------------------------------ ppl
