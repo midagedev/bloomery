@@ -9,9 +9,11 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...]
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
+    python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
+    python3 tools/recipes.py opens [RECIPE...] [--explain]  # per recipe, whether a target it builds or runs reaches the fixture fence (tools/gate-batch.sh's real-file deferral)
     python3 tools/recipes.py pure-crates [--names]  # the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason
     python3 tools/recipes.py host-nightly [--excluded]  # the units tools/nightly/run.sh runs on a Linux host with no card and no model files: name<TAB>command
     python3 tools/recipes.py combos           # every build shape a recipe compiles, one cargo check command each (tools/mac-check.sh combos)
@@ -794,6 +796,8 @@ class ModuleTree:
     literals: list[tuple[str, str]]
     test_files: set[str]
     test_literals: list[tuple[str, str]]
+    mods: dict[tuple[str, ...], str] = field(default_factory=dict)  # module path below the root -> its file, inline modules too
+    test_mods: dict[tuple[str, ...], str] = field(default_factory=dict)
 
 
 def _kind_of(kinds: list[str]) -> str:
@@ -908,9 +912,12 @@ class Tree:
         acc = ModuleTree(set(), [], set(), [])
         self._walk(src, os.path.dirname(src), acc, False)
         acc.test_files -= acc.files
+        for m in set(acc.test_mods) & set(acc.mods):
+            del acc.test_mods[m]
         return acc
 
-    def _walk(self, rel: str, moddir: str, acc: ModuleTree, test: bool) -> None:
+    def _walk(self, rel: str, moddir: str, acc: ModuleTree, test: bool, modpath: tuple[str, ...] = ()) -> None:
+        (acc.test_mods if test else acc.mods).setdefault(modpath, rel)
         if rel in acc.files or (test and rel in acc.test_files):
             return
         (acc.test_files if test else acc.files).add(rel)
@@ -956,9 +963,11 @@ class Tree:
                 if hit is None:
                     self.unresolved.append(err)
                     continue
-                self._walk(hit, child_dir, acc, child_test)
+                self._walk(hit, child_dir, acc, child_test, modpath + tuple(inner) + (name,))
                 continue
             if im:
+                inner = [n for (i, n, _) in inline if i < indent]
+                (acc.test_mods if here or pending_test else acc.mods).setdefault(modpath + tuple(inner) + (im.group(2),), rel)
                 inline.append((len(im.group(1)), im.group(2), here or pending_test))
                 pending_path = None
                 pending_test = False
@@ -998,6 +1007,12 @@ class Tree:
         if test:
             return w.files | w.test_files, w.literals + w.test_literals
         return w.files, w.literals
+
+    def mods_of(self, src: str, test: bool = False) -> dict[tuple[str, ...], str]:
+        """`src`'s modules as `tree_of` sees them: module path below the root -> the file that holds it."""
+        self.tree_of(src)
+        w = self._walk_cache[src]
+        return {**w.mods, **w.test_mods} if test else w.mods
 
     # ---------------- features and dependencies ----------------
 
@@ -1845,6 +1860,47 @@ def cmd_why(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reach(args: argparse.Namespace) -> int:
+    """`why`'s files through the derivation (Reach): the gate-* recipes whose targets can run code of each file through
+    a dependency edge, each with one chain, and the readers the derivation leaves out by count. `why` lists every
+    recipe that links a file (the crate-grain bound narrow() reads); `reach` is the subset a row must name."""
+    side = make_side(ROOT)
+    tree, graph = side.tree, side.graph
+    gates = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
+    union: dict[str, None] = {}
+    for f in args.files:
+        f = _norm(f)
+        reads = [(n, graph.inputs(n).match(f)) for n in gates]
+        reads = [(n, w) for n, w in reads if w]
+        own = [n for n, w in reads if _own_origin(w)]
+        dep = [n for n, w in reads if not _own_origin(w)]
+        if not tree.exists(f):
+            print(f"{f}: not a file of the tree")
+            continue
+        if not reads:
+            print(f"{f}: no gate-* recipe reads it")
+            continue
+        if f in tree.manifest_paths or f in CARGO_GLOBALS or f in BOX_GLOBALS:
+            print(f"{f}: read by table or as a global ({len(dep)} recipes through a dependency): the derivation places no "
+                  f"manifest or global; the rows do not map it")
+            continue
+        got = dep_reach(tree, graph, gates, f)
+        held = [n for n in gates if n in got and n not in NARROW_ALWAYS]
+        print(f"{f}: {len(held)} gates reach it through a dependency, of {len(dep)} that link it through one; "
+              f"{len(own)} read it as their own target's (narrow() picks those without a row)")
+        for n in held:
+            union[n] = None
+            print(f"  {n}" + ("" if args.brief else f"  {reach_chain(tree, graph, n, got[n])}"))
+        left = [n for n in dep if n not in got and n not in NARROW_ALWAYS]
+        if left:
+            print(f"  not reached ({len(left)}): {' '.join(left)}")
+    if args.row:
+        names = [n for n in gates if n in union]
+        glob = args.files[0] if len(args.files) == 1 else "{" + ",".join(_norm(f) for f in args.files) + "}"
+        print(f"{glob}\t{' '.join(names) if names else '-'}\t({len(names)} gates)")
+    return 0
+
+
 def cmd_box_command(args: argparse.Namespace) -> int:
     recipes = load_justfile(os.path.join(ROOT, "justfile"))
     if args.recipe not in recipes:
@@ -2008,6 +2064,7 @@ class PathRow:
     recipes: list[str]  # ["*"]: every gate
     why: str
     pattern: re.Pattern
+    exceptions: dict[str, str] = field(default_factory=dict)  # gate the derivation says reaches a file of the row -> why it is left out
 
     def every(self) -> bool:
         return self.recipes == ["*"]
@@ -2055,9 +2112,27 @@ def _glob_one(glob: str) -> str:
     return "".join(out)
 
 
+_EXCEPT_CLAUSE = re.compile(r"^except ((?:gate-[A-Za-z0-9_-]+ )*gate-[A-Za-z0-9_-]+): (\S.*)$")
+
+
+def parse_exceptions(text: str) -> dict[str, str]:
+    """A row's fourth column: `except GATE…: reason`, clauses joined by ` | `; gate -> reason. Anything else, or a
+    gate named twice, is a named error."""
+    out: dict[str, str] = {}
+    for clause in text.split(" | "):
+        m = _EXCEPT_CLAUSE.match(clause)
+        if m is None:
+            raise RecipeError(f"not `except gate-… gate-…: reason`: {clause[:80]!r}")
+        for n in m.group(1).split(" "):
+            if n in out:
+                raise RecipeError(f"{n} named twice in the exceptions")
+            out[n] = m.group(2)
+    return out
+
+
 def load_gate_paths(root: str = ROOT) -> list[PathRow]:
-    """The table: `glob<TAB>recipes<TAB>why`, recipes space-separated or the literal `*`; `#` lines and
-    blank lines skipped. Anything else is a named error."""
+    """The table: `glob<TAB>recipes<TAB>why[<TAB>exceptions]`, recipes space-separated or the literal `*`, the
+    exceptions as parse_exceptions reads them; `#` lines and blank lines skipped. Anything else is a named error."""
     path = os.path.join(root, GATE_PATHS)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -2069,8 +2144,8 @@ def load_gate_paths(root: str = ROOT) -> list[PathRow]:
         if not ln.strip() or ln.startswith("#"):
             continue
         f = ln.split("\t")
-        if len(f) != 3 or not all(x.strip() == x and x for x in f):
-            raise RecipeError(f"{GATE_PATHS}:{n}: not glob<TAB>recipes<TAB>why with three non-empty fields: {ln[:120]!r}")
+        if len(f) not in (3, 4) or not all(x.strip() == x and x for x in f):
+            raise RecipeError(f"{GATE_PATHS}:{n}: not glob<TAB>recipes<TAB>why[<TAB>exceptions] with non-empty fields: {ln[:120]!r}")
         names = f[1].split(" ")
         if "*" in names and names != ["*"]:
             raise RecipeError(f"{GATE_PATHS}:{n}: `*` stands alone — it means every gate")
@@ -2080,9 +2155,15 @@ def load_gate_paths(root: str = ROOT) -> list[PathRow]:
             raise RecipeError(f"{GATE_PATHS}:{n}: the glob {f[0]} is not a path relative to the tree")
         try:
             pattern = glob_regex(f[0])
+            exceptions = parse_exceptions(f[3]) if len(f) == 4 else {}
         except RecipeError as err:
             raise RecipeError(f"{GATE_PATHS}:{n}: {err}") from err
-        rows.append(PathRow(n, f[0], names, f[2], pattern))
+        both = sorted(set(exceptions) & set(names))
+        if both:
+            raise RecipeError(f"{GATE_PATHS}:{n}: {both[0]} is both in the row and left out of it")
+        if exceptions and names == ["*"]:
+            raise RecipeError(f"{GATE_PATHS}:{n}: a `*` row leaves no gate out")
+        rows.append(PathRow(n, f[0], names, f[2], pattern, exceptions))
     if not rows:
         raise RecipeError(f"{GATE_PATHS}: no rows")
     return rows
@@ -2106,14 +2187,21 @@ def _own_origin(why: str) -> bool:
 
 def _use_paths(stmt: str) -> list[tuple[str, ...]]:
     """The paths of one `use` tree (`a::b::{c, d::{e as f}, self, *}`), each a tuple of segments."""
+    return [p for p, _ in _use_bindings(stmt)]
+
+
+def _use_bindings(stmt: str) -> list[tuple[tuple[str, ...], str]]:
+    """(path, the name it binds) of each leaf of one `use` tree: the `as` alias, else the last segment (`self`
+    binds its parent's); a glob leaf ends in `*` and binds `*`."""
     toks = re.findall(r"::|[{},*]|(?:r#)?[A-Za-z_][A-Za-z0-9_]*", stmt)
 
-    def tree(i: int, prefix: tuple[str, ...]) -> tuple[list[tuple[str, ...]], int]:
+    def tree(i: int, prefix: tuple[str, ...]) -> tuple[list[tuple[tuple[str, ...], str]], int]:
         segs = list(prefix)
+        alias = ""
         while i < len(toks):
             t = toks[i]
             if t == "{":
-                out: list[tuple[str, ...]] = []
+                out: list[tuple[tuple[str, ...], str]] = []
                 i += 1
                 while i < len(toks) and toks[i] != "}":
                     if toks[i] == ",":
@@ -2125,14 +2213,15 @@ def _use_paths(stmt: str) -> list[tuple[str, ...]]:
             if t in (",", "}"):
                 break
             if t == "as":
+                alias = toks[i + 1] if i + 1 < len(toks) else ""
                 i += 2
                 continue
             if t != "::" and t != "self":
                 segs.append(t[2:] if t.startswith("r#") else t)
             i += 1
-        return [tuple(segs)], i
+        return [(tuple(segs), alias or (segs[-1] if segs else ""))], i
 
-    return [p for p in tree(0, ())[0] if p]
+    return [(p, n) for p, n in tree(0, ())[0] if p]
 
 
 _USE_STMT = re.compile(r"\buse\s+([^;]*);")
@@ -2208,12 +2297,1039 @@ def crate_idents(tree: Tree, pkg: str) -> set[str]:
     return out
 
 
-def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None) -> list[str]:
+# ---- which gates reach a file: the item graph across the workspace ----
+
+_UNIT_HEAD = re.compile(
+    r"(?:pub\s*(?:\([^)]*\))?\s*)?(?:(?:unsafe|async|const|default|safe)\s+|extern\s+(?:\"[^\"]*\"\s*)?)*"
+    r"(fn|struct|enum|union|trait|impl|mod|type|const|static|use|macro_rules\s*!|extern\s+crate)(?![A-Za-z0-9_])\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)?"
+)
+_SEMI_KINDS = frozenset({"use", "const", "static", "type", "extern crate"})
+_DOC_RUST = frozenset({"rust", "compile_fail", "should_panic", "no_run", "allow_fail", "test_harness"})
+_ITEM_DEF = re.compile(r"\b(?:fn|struct|enum|union|trait|type|const|static)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
+_FN_NAME = re.compile(r"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
+_MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*macro_rules\s*!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
+_MACRO_CALL = re.compile(r"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[(\[{]")
+_WORD = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+_PUB_BEFORE = re.compile(r"\bpub\b(?:\s*\([^)]*\))?\s*$")
+_TYPE_PATH = re.compile(r"(?<![A-Za-z0-9_'])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)")
+_TYPE_HEAD = re.compile(r"\s*!?\s*(?:&\s*(?:'[A-Za-z_][A-Za-z0-9_]*\s*)?(?:mut\s+)?)?(?:dyn\s+)?((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)")
+_NOT_A_TYPE = frozenset({"dyn", "mut", "const", "for", "impl", "where", "Self", "self", "crate", "super", "unsafe", "extern", "fn", "as"})
+
+
+@dataclass(frozen=True)
+class ImplHead:
+    """One `impl` block's header: its generic parameters, the self type's head path and the paths in its
+    arguments, the trait's head path and the paths in its arguments, as written."""
+
+    params: frozenset[str]
+    self_head: tuple[str, ...] | None
+    self_args: tuple[tuple[str, ...], ...]
+    trait: tuple[str, ...] | None
+    trait_args: tuple[tuple[str, ...], ...]
+    text: str
+
+
+@dataclass(frozen=True)
+class Unit:
+    """One item of a module (an inline module's items are units of their own, `ctx` below the file's module), or
+    one associated item of an impl block (`assoc`, with the block's header in `impl`; an impl with no items is one
+    unit named None): the paths, identifiers and macros its code names, the header's included. `kind` is the
+    item's keyword, `anon` for an item-level macro call or anything else no keyword starts; `names` are the items an
+    `anon` unit's text declares (`thread_local! { static X … }`), `methods` a trait's fn names."""
+
+    kind: str
+    ctx: tuple[str, ...]
+    name: str | None
+    line: int
+    sites: tuple[tuple[str, ...], ...]
+    idents: frozenset[str]
+    macro_calls: frozenset[str]
+    includes: tuple[str, ...]
+    literals: tuple[str, ...]
+    impl: ImplHead | None
+    names: frozenset[str] = frozenset()
+    methods: frozenset[str] = frozenset()
+    test: bool = False  # under a test attribute (`#[test]`, `#[rstest]`, `#[test_case]`): an entry of a test harness
+
+
+class RustFacts:
+    """What the reach reads from one file: its units, its `use` leaves (ctx, path, bound name, pub; a glob ends in
+    `*`), and its `#[macro_export]` macros (items of the crate root)."""
+
+    def __init__(self, units: list[Unit], binds: list[tuple[tuple[str, ...], tuple[str, ...], str, bool]], exported: frozenset[str]):
+        # the last unit stands for the file's `use` declarations: a path that passes through one of its re-exports
+        # reaches it, since a change of the leaf changes the item the path names
+        self.uses = len(units)
+        self.units = tuple(units) + (Unit("use", (), None, 0, (), frozenset(), frozenset(), (), (), None),)
+        self.binds = tuple(binds)
+        self.scoped: dict[tuple[tuple[str, ...], str], list[tuple[str, ...]]] = {}
+        for c, p, n, _ in self.binds:
+            if p[-1] != "*":
+                self.scoped.setdefault((c, n), []).append(p)
+        self.exported = exported
+        self.named: dict[tuple[tuple[str, ...], str], list[int]] = {}
+        self.macro_named: dict[str, list[int]] = {}
+        for i, u in enumerate(self.units):
+            for name in ([u.name] if u.name is not None and u.kind != "assoc" else []) + sorted(u.names):
+                self.named.setdefault((u.ctx, name), []).append(i)
+            if u.kind == "macro_rules!" and u.name is not None:
+                self.macro_named.setdefault(u.name, []).append(i)
+        self.bound = frozenset(n for _, p, n, _ in self.binds if p[-1] != "*")
+        self.globs = tuple((c, p) for c, p, _, _ in self.binds if p[-1] == "*")
+        self.anon = tuple(i for i, u in enumerate(self.units) if u.kind == "anon")
+        self.traits = tuple(i for i, u in enumerate(self.units) if u.kind == "trait")
+
+
+def _angle_close(text: str, at: int) -> int | None:
+    """The index of the `>` closing the `<` at `at`, every bracket kind counted (`->` and `=>` are not brackets)."""
+    depth = 0
+    for j in range(at, len(text)):
+        c = text[j]
+        if c in "<([{":
+            depth += 1
+        elif c in ")]}" or (c == ">" and text[j - 1] not in "-="):
+            depth -= 1
+        if depth == 0:
+            return j
+    return None
+
+
+def _split_angles(text: str) -> list[str]:
+    """`text` split at its commas outside every bracket kind, `<…>` included."""
+    out, depth, start = [], 0, 0
+    for j, c in enumerate(text):
+        if c in "<([{":
+            depth += 1
+        elif c in ")]}" or (c == ">" and j and text[j - 1] not in "-="):
+            depth -= 1
+        elif c == "," and depth == 0:
+            out.append(text[start:j])
+            start = j + 1
+    out.append(text[start:])
+    return [x.strip() for x in out if x.strip()]
+
+
+def _type_names(text: str, params: frozenset[str]) -> tuple[tuple[str, ...] | None, tuple[tuple[str, ...], ...]]:
+    """(head path, the other paths) of a type or trait as an impl header writes it; a generic parameter, a lifetime
+    or a keyword is no path, and a head that is one leaves the head None."""
+
+    def split(p: str) -> tuple[str, ...]:
+        return tuple(re.split(r"\s*::\s*", p))
+
+    def path(p: tuple[str, ...]) -> bool:
+        # `crate::`, `self::` and `super::` open a path; alone, they and the other keywords name no type
+        if len(p) > 1 and p[0] in ("crate", "self", "super"):
+            return True
+        return p[0] not in _NOT_A_TYPE and not (len(p) == 1 and p[0] in params)
+
+    paths = [p for p in (split(m.group(1)) for m in _TYPE_PATH.finditer(text)) if path(p)]
+    head = None
+    m = _TYPE_HEAD.match(text)
+    if m and path(split(m.group(1))):
+        head = split(m.group(1))
+    rest, dropped = [], False
+    for p in paths:
+        if p == head and not dropped:
+            dropped = True
+            continue
+        rest.append(p)
+    return head, tuple(rest)
+
+
+def _impl_head(shape: str, i: int, end: int) -> ImplHead:
+    """The header of the impl item whose `impl` keyword ends at `i` (the item ends at `end`)."""
+    while i < end and shape[i].isspace():
+        i += 1
+    params: set[str] = set()
+    if i < end and shape[i] == "<":
+        close = _angle_close(shape, i)
+        if close is not None:
+            for item in _split_angles(shape[i + 1 : close]):
+                if item.startswith("'"):
+                    continue
+                w = re.match(r"(?:const\s+)?([A-Za-z_][A-Za-z0-9_]*)", item)
+                if w:
+                    params.add(w.group(1))
+            i = close + 1
+    stop, depth = i, 0
+    while stop < end:
+        c = shape[stop]
+        if c in "<([":
+            depth += 1
+        elif c in ")]" or (c == ">" and shape[stop - 1] not in "-="):
+            depth -= 1
+        elif depth == 0 and (c in "{;" or (shape.startswith("where", stop) and not _IDENT_CH.match(shape[stop - 1]) and not _IDENT_CH.match(shape[stop + 5 : stop + 6] or " "))):
+            break
+        stop += 1
+    hdr = shape[i:stop]
+    cut, depth = None, 0
+    for k, c in enumerate(hdr):
+        if c in "<([":
+            depth += 1
+        elif c in ")]" or (c == ">" and k and hdr[k - 1] not in "-="):
+            depth -= 1
+        elif depth == 0 and hdr.startswith("for", k) and (k == 0 or not _IDENT_CH.match(hdr[k - 1])) and not _IDENT_CH.match(hdr[k + 3 : k + 4] or " "):
+            if not hdr[k + 3 :].lstrip().startswith("<"):
+                cut = k
+                break
+    p = frozenset(params)
+    if cut is None:
+        th, ta = None, ()
+        sh, sa = _type_names(hdr, p)
+    else:
+        th, ta = _type_names(hdr[:cut], p)
+        sh, sa = _type_names(hdr[cut + 3 :], p)
+    return ImplHead(p, sh, sa, th, ta, " ".join(("impl " + hdr).split())[:96])
+
+
+def _unit_end(shape: str, i: int, end: int, semi: bool) -> int:
+    """Where the item starting at `i` ends: after its `;` at its own depth, or (unless `semi`: a use, const,
+    static or type, which a `;` ends) after the brace block opened at its own depth."""
+    depth = 0
+    for j in range(i, end):
+        c = shape[j]
+        if c == "{" and depth == 0 and not semi:
+            close = _close(shape, j)
+            return end if close is None else min(close + 1, end)
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return j + 1
+    return end
+
+
+def _module_units(shape: str, a: int, b: int, ctx: tuple[str, ...], out: list, spans: list) -> None:
+    """The items of the module region [a, b) of a file's shape: (kind, ctx, name, start, end, impl header, under a
+    test attribute) into `out`, each inline module's region (start, end, ctx) into `spans` and its items under its
+    name."""
+    i = a
+    test = False
+    while i < b:
+        while i < b and shape[i].isspace():
+            i += 1
+        if i >= b:
+            break
+        c = shape[i]
+        if c == ";":
+            i += 1
+            continue
+        if c == "#":
+            j = i + 1
+            while j < b and shape[j] in " !\t\n":
+                j += 1
+            close = _close(shape, j) if j < b and shape[j] == "[" else None
+            test = test or (close is not None and _TEST_ATTR.match(shape, i, close + 1) is not None)
+            i = (close + 1) if close is not None else i + 1
+            continue
+        start = len(out)
+        m = _UNIT_HEAD.match(shape, i, b)
+        if m is None:
+            end = max(_unit_end(shape, i, b, False), i + 1)
+            out.append(("anon", ctx, None, i, end, None, test))
+            i, test = end, False
+            continue
+        kind = re.sub(r"\s+", " ", m.group(1)).replace(" !", "!")
+        name = m.group(2)
+        if kind == "mod" and name is not None:
+            j = m.end()
+            while j < b and shape[j].isspace():
+                j += 1
+            if j < b and shape[j] == "{":
+                close = _close(shape, j)
+                close = b - 1 if close is None else close
+                spans.append((j, close, ctx + (name,)))
+                _module_units(shape, j + 1, close, ctx + (name,), out, spans)
+                i = close + 1
+            else:
+                i = _unit_end(shape, i, b, True)
+            test = False
+            continue
+        if kind == "impl":
+            j, depth, open_at = m.end(1), 0, None
+            while j < b:
+                c = shape[j]
+                if c == "{" and depth == 0:
+                    open_at = j
+                    break
+                if c in "([":
+                    depth += 1
+                elif c in ")]":
+                    depth -= 1
+                elif c == ";" and depth == 0:
+                    break
+                j += 1
+            if open_at is None:
+                i = j + 1
+                continue
+            close = _close(shape, open_at)
+            close = b - 1 if close is None else close
+            hdr = (m.end(1), i, open_at)
+            _assoc_units(shape, open_at + 1, close, ctx, hdr, out)
+            if len(out) == start:
+                out.append(("assoc", ctx, None, i, close + 1, hdr, False))
+            i, test = close + 1, False
+            continue
+        end = _unit_end(shape, i, b, kind in _SEMI_KINDS)
+        if kind != "use":
+            out.append((kind, ctx, name if kind != "mod" and name != "_" else None, i, end, None, test))
+        i, test = max(end, i + 1), False
+
+
+def _assoc_units(shape: str, a: int, b: int, ctx: tuple[str, ...], hdr: tuple[int, int, int], out: list) -> None:
+    """The associated items of the impl body [a, b): ("assoc", ctx, name, start, end, hdr) each; a macro call there
+    has no name."""
+    i = a
+    while i < b:
+        while i < b and shape[i].isspace():
+            i += 1
+        if i >= b:
+            break
+        if shape[i] == ";":
+            i += 1
+            continue
+        if shape[i] == "#":
+            j = i + 1
+            while j < b and shape[j] in " !\t\n":
+                j += 1
+            close = _close(shape, j) if j < b and shape[j] == "[" else None
+            i = (close + 1) if close is not None else i + 1
+            continue
+        m = _UNIT_HEAD.match(shape, i, b)
+        semi = m is not None and re.sub(r"\s+", " ", m.group(1)) in _SEMI_KINDS
+        end = max(_unit_end(shape, i, b, semi), i + 1)
+        out.append(("assoc", ctx, m.group(2) if m is not None and m.group(2) != "_" else None, i, end, hdr, False))
+        i = end
+
+
+@functools.cache
+def rust_facts(text: str, test: bool) -> RustFacts:
+    """The facts the reach reads from one file, as a build with cfg(test) = `test` compiles it (build_view)."""
+    code, shape = build_view(text, test)
+    raw: list = []
+    spans: list = []
+    _module_units(shape, 0, len(shape), (), raw, spans)
+
+    def ctx(pos: int) -> tuple[str, ...]:
+        best: tuple[str, ...] = ()
+        for a, b, c in spans:
+            if a <= pos < b and len(c) > len(best):
+                best = c
+        return best
+
+    binds = []
+    body = list(shape)
+    for m in _USE_STMT.finditer(shape):
+        pub = bool(_PUB_BEFORE.search(shape, max(0, m.start() - 48), m.start()))
+        c = ctx(m.start())
+        for path, name in _use_bindings(m.group(1)):
+            binds.append((c, path, name, pub))
+        _blank(body, m.start(), m.end())
+    rest = "".join(body)
+    starts = [r[3] for r in raw]
+
+    def owner(pos: int) -> int | None:
+        k = bisect.bisect_right(starts, pos) - 1
+        return k if k >= 0 and raw[k][3] <= pos < raw[k][4] else None
+
+    sites: list[list] = [[] for _ in raw]
+    calls: list[set] = [set() for _ in raw]
+    incs: list[list] = [[] for _ in raw]
+    lits: list[list] = [[] for _ in raw]
+    for m in _PATH_EXPR.finditer(rest):
+        k = owner(m.start())
+        if k is not None:
+            sites[k].append(tuple(re.split(r"\s*::\s*", m.group(1))))
+    for m in _MACRO_CALL.finditer(rest):
+        k = owner(m.start())
+        if k is not None and m.group(1) != "macro_rules":
+            calls[k].add(m.group(1))
+    for pat, acc in ((Tree._INCLUDE, incs), (Tree._LITERAL, lits)):
+        for m in pat.finditer(code):
+            k = owner(m.start())
+            if k is not None:
+                acc[k].append(m.group(1))
+    heads: dict[tuple[int, int, int], tuple[ImplHead, tuple, frozenset[str]]] = {}
+    units = []
+    for k, (kind, c, name, a, b, hdr, test) in enumerate(raw):
+        hsites: tuple = ()
+        hidents: frozenset[str] = frozenset()
+        head = None
+        if hdr is not None:
+            if hdr not in heads:
+                kw_end, h0, h1 = hdr
+                heads[hdr] = (_impl_head(shape, kw_end, h1),
+                              tuple(tuple(re.split(r"\s*::\s*", x.group(1))) for x in _PATH_EXPR.finditer(rest, h0, h1)),
+                              frozenset(_WORD.findall(rest, h0, h1)))
+            head, hsites, hidents = heads[hdr]
+        text = shape[a:b]
+        units.append(Unit(kind, c, name, shape.count("\n", 0, a) + 1, tuple(sites[k]) + hsites,
+                          frozenset(_WORD.findall(rest, a, b)) | hidents, frozenset(calls[k]), tuple(incs[k]), tuple(lits[k]), head,
+                          frozenset(_ITEM_DEF.findall(text)) if kind == "anon" else frozenset(),
+                          frozenset(_FN_NAME.findall(text)) if kind == "trait" else frozenset(), test))
+    return RustFacts(units, binds, frozenset(_MACRO_EXPORT.findall(shape)))
+
+
+RootKey = tuple[str, str, bool]  # (package, target root file, cfg(test))
+Hit = tuple[RootKey, str, int]  # (the root a file is compiled in, the file, the unit's index; -1: a data file)
+
+
+class RuleSet:
+    """Rule 1's associated items and their indexes: by a unit their header names, by the name a reached unit must
+    say, and the items that need neither."""
+
+    def __init__(self, rules: list[tuple[int, str, str, list[list[int]], str | None]]):
+        self.rules = rules
+        self.by_node: dict[int, list[int]] = {}
+        self.by_name: dict[str, list[int]] = {}
+        for i, (_, _, _, groups, name) in enumerate(rules):
+            for g in groups:
+                for x in g:
+                    self.by_node.setdefault(x, []).append(i)
+            if name is not None:
+                self.by_name.setdefault(name, []).append(i)
+        self.free = [i for i, r in enumerate(rules) if not r[3] and r[4] is None]
+        self.names = frozenset(self.by_name)
+
+
+class Reach:
+    """Which gates' targets can run code of a file: the item graph across the workspace, closed from each gate
+    target's own items. A unit is one item of a module (a fn, a type, a trait, a const or static, a macro, an
+    item-level macro call) or one associated item of an impl block. A gate reaches file F when one of its targets'
+    own units reaches a unit of F by a chain of these edges, every file on it linked by the target (Graph.inputs,
+    feature-aware at crate grain):
+
+    - a path. A unit's code names a path (a path expression `a::b::c`, a `name!` macro by path, an identifier a
+      `use` leaf of its file binds, an identifier its own module defines) that resolves to item N of module M: N is
+      reached when M defines it; when M only imports it (a `use`, a re-export), the import is followed instead and
+      M is a namespace on the way. A path's first segment resolves as rustc's: `crate`, `self`, `super`, a child
+      module, a name a `use` leaf of the file binds, a workspace crate's name (crate_idents); any other (std, an
+      external crate, a local variable, a generic) names nothing of the workspace. A name M neither defines nor
+      imports by name (an item a macro writes) reaches every unit of M. A path that ends at a module is a
+      namespace, and a `mod` declaration no edge: declaring a module runs none of its code.
+    - a method. Method syntax names no path but always the method's name: a trait in scope in a unit's file (a
+      private `use` of it, its own definition, a glob-imported module's) is reached by a unit that names one of the
+      trait's fns, and an associated item by the rule for impls below.
+    - an item-level macro call (`thread_local!`, a macro that writes fns) is reached with every unit of its file,
+      and answers to the names its text declares.
+
+    The six cases the table's rule has to decide:
+    1. Trait and inherent impls. An associated item is reached when its impl's self type is reached (a value of the
+       type exists only where some reached code names the type) and, when that type is generic over concrete
+       workspace types (`impl GpuModel<Body>`), each of those types too (the impl runs only on that instantiation:
+       the qwen3moe row's stated form), and some reached unit names the item (`x.m()`, `T::m`, `Self::C`) — except
+       in an impl of a trait outside the workspace (Drop, Display, Deref, From, an operator), whose items std calls
+       without naming them. An impl for a generic parameter or a foreign type (a blanket impl) is reached with its
+       trait the same way, and one with neither side in the workspace whenever its file is linked. A trait's
+       default methods are in the trait's unit, which the method rule above reaches.
+    2. Generics. A generic fn runs in the binary that monomorphizes it, and its caller names it: the path edge
+       covers it, and nothing is added for monomorphization.
+    3. `#[cfg(test)]`. Items and modules under cfg(test) exist only in their own lib's test build: a dependent's
+       view of a lib blanks them (build_view), and only the lib's own libtest target reads them.
+    4. Constants, statics and types. Naming one reaches its unit even when the value folds into the caller and no
+       code of it runs: a change of it changes the caller.
+    5. Macros. A `name!` call reaches the `macro_rules! name` units of the same root (textual scope, `#[macro_use]`
+       modules included); a `#[macro_export]` macro is an item of its crate's root, so a path to it or a `use` of
+       it reaches it; the macro's body is that unit's code, and its `$crate::` paths resolve in its crate.
+    6. Run-time dispatch by value (an `Arch` match). Every arm's path is named, so every arm is reached: the static
+       reach over-selects there, and a row that leaves such a gate out says so as a named exception
+       (gate_paths_problems).
+
+    The seeds: a test harness (a lib's own tests, a test file) runs its `#[test]` fns, and its own impls follow rule 1
+    in its own root; any other target (a bin, `cargo test --bin` too) and a test file with no `#[test]` fn is
+    reached whole (every unit of its own module tree); a doctest run reaches what its examples name; a build script
+    is reached by every gate that reaches its crate's code. Unclear cases resolve wide: a name a glob import could
+    bring takes every candidate, a file reached in two module contexts both, a name read in a comment-free code text
+    whether or not it is the method's receiver."""
+
+    def __init__(self, tree: Tree):
+        self.tree = tree
+        self.idents: dict[str, set[str]] = {}
+        self.lib_root: dict[str, RootKey] = {}
+        for p in tree.packages.values():
+            lib = p.lib()
+            if lib is None:
+                continue
+            self.lib_root[p.name] = (p.name, lib.src, False)
+            for ident in crate_idents(tree, p.name):
+                self.idents.setdefault(ident, set()).add(p.name)
+        self.lib_roots = set(self.lib_root.values())
+        self._mods: dict[RootKey, dict[tuple[str, ...], str]] = {}
+        self._bases: dict[RootKey, dict[str, list[tuple[str, ...]]]] = {}
+        self._macros: dict[RootKey, dict[str, list[tuple[str, int]]]] = {}
+        self._exported: dict[str, dict[str, list[tuple[str, int]]]] = {}
+        self._text: dict[str, str] = {}
+        self._resolved: dict[tuple, list] = {}
+        self._active: set[tuple] = set()
+        self._cut = 0
+        # the item graph, numbered as it is discovered
+        self.ids: dict[Hit, int] = {}
+        self.nodes: list[Hit] = []
+        self.adj: list[list[tuple[int, str]] | None] = []
+        self._gates: dict[tuple[str, str], dict[int, tuple[int, str]]] = {}
+        self._gate_files: dict[tuple[str, str], dict[str, int]] = {}
+        self.file_root: dict[str, RootKey] = {}
+        for rk in self.lib_root.values():
+            for f in self.mods(rk).values():
+                self.file_root.setdefault(f, rk)
+        self.builds = {t.src: p.name for p in tree.packages.values() for t in p.targets if t.kind == "build"}
+        self._traits: dict[tuple, list[tuple[Hit, frozenset[str], str]]] = {}
+        self._rules: RuleSet | None = None
+        self._own_rules: dict[RootKey, RuleSet] = {}
+
+    def text(self, f: str) -> str:
+        if f not in self._text:
+            self._text[f] = self.tree.read(f)
+        return self._text[f]
+
+    def facts(self, rk: RootKey, f: str) -> RustFacts:
+        return rust_facts(self.text(f), rk[2])
+
+    def mods(self, rk: RootKey) -> dict[tuple[str, ...], str]:
+        if rk not in self._mods:
+            self._mods[rk] = self.tree.mods_of(rk[1], rk[2])
+        return self._mods[rk]
+
+    def bases(self, rk: RootKey, f: str) -> list[tuple[str, ...]]:
+        """The module paths whose file module `f` is in root `rk` (an inline module of `f` is below one of them)."""
+        if rk not in self._bases:
+            mods = self.mods(rk)
+            by: dict[str, list[tuple[str, ...]]] = {}
+            for m, g in mods.items():
+                if not m or mods.get(m[:-1]) != g:
+                    by.setdefault(g, []).append(m)
+            self._bases[rk] = by
+        return self._bases[rk].get(f, [])
+
+    def node(self, h: Hit) -> int:
+        i = self.ids.get(h)
+        if i is None:
+            i = self.ids[h] = len(self.nodes)
+            self.nodes.append(h)
+            self.adj.append(None)
+        return i
+
+    def doctests(self, pkg: str) -> str:
+        """The pseudo file of package `pkg`'s doctests: every Rust code block of its lib's `///` and `//!` comments
+        (hidden `# ` lines included), each as the body of a fn, so a doctest run reaches what its examples name."""
+        path = f"{self.tree.packages[pkg].dir}/<doctests>.rs"
+        if path not in self._text:
+            blocks: list[str] = []
+            rk = self.lib_root.get(pkg)
+            for f in sorted(set(self.mods(rk).values())) if rk is not None else []:
+                cur: list[str] | None = None
+                for line in self.text(f).split("\n"):
+                    m = re.match(r"\s*//[/!] ?(.*)$", line)
+                    if m is None:
+                        cur = None
+                        continue
+                    body = m.group(1)
+                    fence = re.match(r"\s*```\s*(.*)$", body)
+                    if fence is not None:
+                        if cur is None:
+                            info = {t.strip() for t in fence.group(1).split(",") if t.strip()}
+                            rust = all(t in _DOC_RUST or re.match(r"^(?:edition\d+|E\d+)$", t) for t in info)
+                            cur = [] if rust else ["<skip>"]
+                        else:
+                            if cur[:1] != ["<skip>"]:
+                                blocks.append("fn __doctest() {\n" + "\n".join(cur) + "\n}\n")
+                            cur = None
+                        continue
+                    if cur is not None:
+                        cur.append(re.sub(r"^\s*# ?", "", body) if re.match(r"^\s*#(?: |$)", body) else body)
+            self._text[path] = "".join(blocks)
+        return path
+
+    def units(self, rk: RootKey, f: str) -> list[Hit]:
+        """Every unit of file `f` in root `rk`; a file with no Rust items (a data file, an empty module) as -1."""
+        if not f.endswith(".rs"):
+            return [(rk, f, -1)]
+        n = len(self.facts(rk, f).units)
+        return [(rk, f, i) for i in range(n)] or [(rk, f, -1)]
+
+    def macros(self, rk: RootKey) -> dict[str, list[tuple[str, int]]]:
+        """`macro_rules!` name -> its (file, unit) in root `rk`."""
+        if rk not in self._macros:
+            out: dict[str, list[tuple[str, int]]] = {}
+            for f in sorted(set(self.mods(rk).values())):
+                for name, idx in self.facts(rk, f).macro_named.items():
+                    out.setdefault(name, []).extend((f, i) for i in idx)
+            self._macros[rk] = out
+        return self._macros[rk]
+
+    def exported(self, pkg: str) -> dict[str, list[tuple[str, int]]]:
+        """`#[macro_export]` name -> its (file, unit) in package `pkg`'s lib: items of its crate root."""
+        if pkg not in self._exported:
+            out: dict[str, list[tuple[str, int]]] = {}
+            rk = self.lib_root.get(pkg)
+            if rk is not None:
+                for name, at in self.macros(rk).items():
+                    out[name] = [(f, i) for f, i in at if name in self.facts(rk, f).exported]
+            self._exported[pkg] = out
+        return self._exported[pkg]
+
+    # -- paths --
+
+    def _once(self, key: tuple, fn) -> list:
+        """`fn()` memoized by `key`; a key met again inside its own computation (a cycle of imports) gives nothing
+        there, and a result computed under such a cut is not kept."""
+        if key in self._resolved:
+            return self._resolved[key]
+        if key in self._active:
+            self._cut += 1
+            return []
+        self._active.add(key)
+        cut = self._cut
+        try:
+            out = fn()
+        finally:
+            self._active.discard(key)
+        if self._cut == cut:
+            self._resolved[key] = out
+        return out
+
+    def resolve(self, rk: RootKey, mod: tuple[str, ...], path: tuple[str, ...], strict: bool = False, skip: str = "") -> list[Hit]:
+        """The units `path`, named in module `mod` of root `rk`, reaches. `strict` (a name looked up through a glob
+        import): only what the module defines or imports by name, never every item of a module for a name it does
+        not account for. `skip`: a `use` leaf's own name, which its path's first segment never means (`use models;`,
+        `use foo::foo;`)."""
+        if not path or len(path) > 32:
+            return []
+        return self._once(("path", rk, mod, path, strict, skip), lambda: self._resolve(rk, mod, path, strict, skip))
+
+    def _resolve(self, rk: RootKey, mod: tuple[str, ...], path: tuple[str, ...], strict: bool, skip: str) -> list[Hit]:
+        s0 = path[0]
+        if s0 == "crate":
+            return self.walk(rk, (), path[1:], strict)
+        if s0 == "self":
+            return self.walk(rk, mod, path[1:], strict)
+        if s0 == "super":
+            i, base = 0, mod
+            while i < len(path) and path[i] == "super":
+                if not base:
+                    return []
+                base, i = base[:-1], i + 1
+            return self.walk(rk, base, path[i:], strict)
+        if s0 == "Self":
+            return []
+        mods = self.mods(rk)
+        if mod not in mods:
+            return []
+        # a name in scope (a child module, a `use` leaf) shadows a glob import's, and both an extern crate's
+        out: list[Hit] = []
+        child = mod + (s0,) in mods
+        if child:
+            out += self.walk(rk, mod, path, strict)
+        fm = mods[mod]
+        facts = self.facts(rk, fm)
+        # the `use` leaves of this module (a leaf of another module of the file binds nothing here)
+        base = max((b for b in self.bases(rk, fm) if mod[: len(b)] == b), key=len, default=mod)
+        leaves = facts.scoped.get((mod[len(base):], s0), []) if s0 != skip else []
+        for bp in leaves:
+            out += self.resolve(rk, mod, bp + path[1:], strict, s0 if bp[0] == s0 else "")
+        if child or leaves:
+            return out
+        for c, bp in facts.globs:
+            if c == mod[len(base):]:
+                for grk, gmod in self.module(rk, mod, bp[:-1]):
+                    out += self.walk(grk, gmod, path, True)
+        for pkg in sorted(self.idents.get(s0, ())):
+            out += self.walk(self.lib_root[pkg], (), path[1:], strict)
+        return out
+
+    def walk(self, rk: RootKey, mod: tuple[str, ...], rest: tuple[str, ...], strict: bool) -> list[Hit]:
+        """Down the module path from `mod` while `rest` names child modules, then the item it names. A path that
+        ends at a module is a namespace: no unit."""
+        mods = self.mods(rk)
+        if mod not in mods:
+            return []
+        for i, s in enumerate(rest):
+            if mod + (s,) in mods:
+                mod = mod + (s,)
+                continue
+            return self.item(rk, mod, s, rest[i + 1 :], strict)
+        return []
+
+    def item(self, rk: RootKey, mod: tuple[str, ...], name: str, rest: tuple[str, ...], strict: bool) -> list[Hit]:
+        return self._once(("item", rk, mod, name, rest, strict), lambda: self._item(rk, mod, name, rest, strict))
+
+    def _item(self, rk: RootKey, mod: tuple[str, ...], name: str, rest: tuple[str, ...], strict: bool) -> list[Hit]:
+        fm = self.mods(rk)[mod]
+        facts = self.facts(rk, fm)
+        bases = [b for b in self.bases(rk, fm) if mod[: len(b)] == b] or [mod]
+        ctx = mod[len(max(bases, key=len)) :]
+        own = facts.named.get((ctx, name))
+        if own:
+            return [(rk, fm, i) for i in own]
+        if not mod and rk in self.lib_roots and name in self.exported(rk[0]):
+            return [(rk, g, i) for g, i in self.exported(rk[0])[name]]
+        out: list[Hit] = []
+        for bp in facts.scoped.get((ctx, name), []):
+            out += self.resolve(rk, mod, bp + rest, strict, name if bp[0] == name else "")
+        if out:
+            return out + [(rk, fm, facts.uses)]
+        for c, bp in facts.globs:
+            if c == ctx:
+                for grk, gmod in self.module(rk, mod, bp[:-1]):
+                    out += self.walk(grk, gmod, (name,) + rest, True)
+        if out:
+            return out + [(rk, fm, facts.uses)]
+        if strict:
+            return out
+        return [(rk, fm, i) for i, u in enumerate(facts.units) if u.ctx == ctx] or [(rk, fm, -1)]
+
+    def module(self, rk: RootKey, mod: tuple[str, ...], path: tuple[str, ...]) -> list[tuple[RootKey, tuple[str, ...]]]:
+        """The module a glob import's path names, from module `mod`: (root, module path) per candidate; none for a
+        glob of an enum's variants or of an external crate's module."""
+        if not path:
+            return []
+        return self._once(("module", rk, mod, path), lambda: self._module(rk, mod, path))
+
+    def _module(self, rk: RootKey, mod: tuple[str, ...], path: tuple[str, ...]) -> list[tuple[RootKey, tuple[str, ...]]]:
+        mods = self.mods(rk)
+        s0 = path[0]
+        if s0 in ("crate", "self", "super"):
+            base, i = ((), 1) if s0 == "crate" else (mod, 1 if s0 == "self" else 0)
+            while i < len(path) and path[i] == "super":
+                if not base:
+                    return []
+                base, i = base[:-1], i + 1
+            target = base + path[i:]
+            return [(rk, target)] if target in mods else []
+        out: list[tuple[RootKey, tuple[str, ...]]] = []
+        if mod + path in mods:
+            out.append((rk, mod + path))
+        fm = mods.get(mod)
+        leaves: list[tuple[str, ...]] = []
+        if fm is not None and not out:
+            base = max((b for b in self.bases(rk, fm) if mod[: len(b)] == b), key=len, default=mod)
+            leaves = [bp for bp in self.facts(rk, fm).scoped.get((mod[len(base):], s0), []) if bp[0] != s0]
+            for bp in leaves:
+                out += self.module(rk, mod, bp + path[1:])
+        if not out and not leaves and (mod + (s0,) not in mods):
+            for pkg in sorted(self.idents.get(s0, ())):
+                lrk = self.lib_root[pkg]
+                if path[1:] in self.mods(lrk):
+                    out.append((lrk, path[1:]))
+        return out
+
+    # -- edges --
+
+    def traits(self, rk: RootKey, f: str) -> list[tuple[Hit, frozenset[str], str]]:
+        """The traits in scope in file `f` by its own text: the ones its `use` leaves import and the ones it defines,
+        each (unit, its fn names, how)."""
+        key = (rk, f)
+        if key in self._traits:
+            return self._traits[key]
+        out: list[tuple[Hit, frozenset[str], str]] = []
+        facts = self.facts(rk, f)
+        for b in self.bases(rk, f) or [()]:
+            for c, bp, name, pub in facts.binds:
+                if bp[-1] == "*":
+                    continue
+                for h in self.resolve(rk, b + c, bp):
+                    if h[2] >= 0:
+                        u = self.facts(h[0], h[1]).units[h[2]]
+                        if u.kind == "trait":
+                            out.append((h, u.methods, f"use {'::'.join(bp)}"))
+        out += [((rk, f, i), facts.units[i].methods, "a trait of the file") for i in facts.traits]
+        self._traits[key] = out
+        return out
+
+    def in_scope(self, rk: RootKey, f: str) -> list[tuple[Hit, frozenset[str], str]]:
+        """`traits` of `f`, and those of each other file a glob import of `f` names a module of."""
+        key = ("scope", rk, f)
+        if key in self._traits:
+            return self._traits[key]
+        out = list(self.traits(rk, f))
+        facts = self.facts(rk, f)
+        for b in self.bases(rk, f) or [()]:
+            for c, bp in facts.globs:
+                for grk, gmod in self.module(rk, b + c, bp[:-1]):
+                    g = self.mods(grk)[gmod]
+                    if g != f:
+                        out += [(h, ms, f"{how} (glob use {'::'.join(bp)})") for h, ms, how in self.traits(grk, g)]
+        self._traits[key] = out
+        return out
+
+    def edges(self, n: int) -> list[tuple[int, str]]:
+        """The units node `n` reaches, with each step's label."""
+        got = self.adj[n]
+        if got is not None:
+            return got
+        rk, f, k = self.nodes[n]
+        hits: list[tuple[Hit, str]] = []
+        if k >= 0:
+            facts = self.facts(rk, f)
+            u = facts.units[k]
+            sites, idents = list(u.sites), set(u.idents)
+            # a macro_rules body is unhygienic for items: its names resolve where it expands, here too
+            seen_macros: set[Hit] = set()
+            todo = [h for name in u.macro_calls for h in ((rk, g, i) for g, i in self.macros(rk).get(name, ()))]
+            for b in self.bases(rk, f) or [()]:
+                todo += [h for path in u.sites for h in self.resolve(rk, b + u.ctx, path) if h[2] >= 0
+                         and self.facts(h[0], h[1]).units[h[2]].kind == "macro_rules!"]
+            while todo:
+                h = todo.pop()
+                if h in seen_macros or h == (rk, f, k):
+                    continue
+                seen_macros.add(h)
+                mu = self.facts(h[0], h[1]).units[h[2]]
+                sites += mu.sites
+                idents |= mu.idents
+                todo += [(h[0], g, i) for name in mu.macro_calls for g, i in self.macros(h[0]).get(name, ())]
+            for ident in sorted(idents):
+                hits += [((rk, f, i), ident) for i in facts.named.get((u.ctx, ident), ())]
+            for b in self.bases(rk, f) or [()]:
+                mod = b + u.ctx
+                for path in sites:
+                    hits += [(h, "::".join(path)) for h in self.resolve(rk, mod, path)]
+                for c, bp, name, _ in facts.binds:
+                    if bp[-1] != "*" and name in idents:
+                        hits += [(h, f"{name} (use {'::'.join(bp)})") for h in self.resolve(rk, b + c, bp)]
+                for c, bp in facts.globs:
+                    for grk, gmod in self.module(rk, b + c, bp[:-1]):
+                        for ident in sorted(idents):
+                            hits += [(h, f"{ident} (use {'::'.join(bp)})") for h in self.walk(grk, gmod, (ident,), True)]
+            for h, methods, how in self.in_scope(rk, f):
+                named = idents & methods
+                if named:
+                    hits.append((h, f"{min(named)}() of a trait in scope, {how}"))
+            macros = self.macros(rk)
+            for name in sorted(u.macro_calls):
+                hits += [((rk, g, i), f"{name}!") for g, i in macros.get(name, ())]
+            fdir = os.path.dirname(f)
+            for inc in u.includes:
+                p = os.path.normpath(os.path.join(fdir, inc))
+                if self.tree.exists(p):
+                    hits += [(h, f"include {inc}") for h in self.units(rk, p)]
+            pkg = self.tree.packages.get(rk[0])
+            if pkg is not None and u.literals:
+                for p in self.tree._resolve_literals(pkg, [(f, lit) for lit in u.literals]):
+                    if not p.endswith("/"):
+                        hits.append(((rk, p, -1), "path literal"))
+            hits += [((rk, f, i), "an item-level macro call of the file") for i in facts.anon]
+        out, seen = [], {n}
+        for h, how in hits:
+            m = self.node(h)
+            if m not in seen:
+                seen.add(m)
+                out.append((m, how))
+        self.adj[n] = out
+        return out
+
+    def root_rules(self, rk: RootKey, files: list[str]) -> list[tuple[int, str, str, list[list[int]], str | None]]:
+        """Every associated item of root `rk`'s `files`: (its node, its file, its impl's header, the units that must
+        all be reached for it to run — one list per type the header names, any unit of a list reaching it — and the
+        name some reached unit must say, None for an item std calls unnamed; rule 1)."""
+        out = []
+        for f in files:
+            if not f.endswith(".rs"):
+                continue
+            facts = self.facts(rk, f)
+            bases = self.bases(rk, f) or [()]
+            sides: dict[ImplHead, tuple[list[list[int]], bool]] = {}
+            for k, u in enumerate(facts.units):
+                if u.impl is None:
+                    continue
+                ih = u.impl
+                if ih not in sides:
+
+                    def nodes(p: tuple[str, ...], u: Unit = u) -> list[int]:
+                        local = facts.named.get((u.ctx, p[0]), []) if len(p) == 1 else []
+                        hits = [(rk, f, i) for i in local] or [h for b in bases for h in self.resolve(rk, b + u.ctx, p)]
+                        # a re-export on the way is not the type: only the defining unit stands for it
+                        return sorted({self.node(h) for h in hits if h[2] >= 0 and h[2] != self.facts(h[0], h[1]).uses})
+
+                    head = nodes(ih.self_head) if ih.self_head else []
+                    trait = nodes(ih.trait) if ih.trait else []
+                    args = [g for g in (nodes(a) for a in ih.self_args) if g]
+                    # a workspace trait's items run only through the trait, whose unit its callers reach (the method rule)
+                    if head:
+                        groups = [head, *args] + ([trait] if trait else [])
+                    else:
+                        groups = ([trait] if trait else []) + args + [g for g in (nodes(a) for a in ih.trait_args) if g]
+                    # an inherent impl's items and a workspace trait's are called by name; a foreign trait's by std
+                    sides[ih] = (groups, ih.trait is None or bool(trait))
+                groups, by_name = sides[ih]
+                out.append((self.node((rk, f, k)), f, ih.text, groups, u.name if by_name else None))
+        return out
+
+    def rules(self) -> RuleSet:
+        """The lib roots' rules, shared by every gate."""
+        if self._rules is None:
+            self._rules = RuleSet([r for f in sorted(self.file_root) for r in self.root_rules(self.file_root[f], [f])])
+        return self._rules
+
+    def own_rules(self, rk: RootKey) -> RuleSet:
+        """The rules of a target's own root that is not a lib's (a test crate, a bin, a lib's test build): its own
+        impls run only in that target."""
+        if rk not in self._own_rules:
+            self._own_rules[rk] = RuleSet(self.root_rules(rk, sorted(set(self.mods(rk).values()))))
+        return self._own_rules[rk]
+
+    # -- gates --
+
+    def gate(self, graph: Graph, n: str) -> dict[int, tuple[int, str]]:
+        """Every unit gate `n`'s targets reach: node -> (the node it was reached from, the step); a target's own
+        unit -> (-1, the target)."""
+        key = (n, graph.recipes[n].text)
+        if key in self._gates:
+            return self._gates[key]
+        ri = graph.inputs(n)
+        linked = set(ri.files)
+        sets = [self.rules()]
+        par: dict[int, tuple[int, str]] = {}
+        said: set[str] = set()
+        work: list[int] = []
+        nodes = self.nodes
+
+        def seed(h: Hit, label: str) -> None:
+            m = self.node(h)
+            if m not in par:
+                par[m] = (-1, label)
+                work.append(m)
+
+        def fire(rs: RuleSet, i: int) -> None:
+            m, f, text, groups, name = rs.rules[i]
+            if m in par or f not in linked or (name is not None and name not in said):
+                return
+            if all(any(x in par for x in g) for g in groups):
+                via = next((x for x in groups[0] if x in par), -1) if groups else -1
+                par[m] = (via, f"{text}, {name} named" if name else text) if via >= 0 else (-1, f"{text} (its file linked)")
+                work.append(m)
+
+        for pname, kind, tname, _ in ri.targets:
+            pkg = self.tree.packages[pname]
+            t = pkg.lib() if kind in ("lib", "doctest", "libtest") else pkg.find(kind, tname or "")
+            if t is None:
+                continue
+            label = f"{pname} {kind}" + (f" {tname}" if tname else "")
+            if kind == "doctest":
+                # a doctest run compiles the lib and runs its examples: what they name is reached
+                rk = (pname, t.src, False)
+                for h in self.units(rk, self.doctests(pname)):
+                    if h[2] >= 0:
+                        seed(h, label)
+                continue
+            test = kind not in ("lib", "doctest")
+            rk = (pname, t.src, test)
+            if rk not in self.lib_roots:
+                own_set = self.own_rules(rk)
+                if own_set.rules and own_set not in sets:
+                    sets.append(own_set)
+            own = [h for f in sorted(self.tree.tree_of(t.src, test)[0]) for h in self.units(rk, f)]
+            # a test harness runs its #[test] fns, and they reach the rest; a target with none runs its main
+            entries = [h for h in own if kind in ("libtest", "test") and h[2] >= 0 and self.facts(h[0], h[1]).units[h[2]].test]
+            for h in entries or own:
+                seed(h, label)
+        builds = {self.tree.packages[bpkg].name: src for src, bpkg in self.builds.items() if src in linked}
+        names = frozenset().union(*(rs.names for rs in sets))
+        for rs in sets:
+            for i in rs.free:
+                fire(rs, i)
+        while True:
+            while work:
+                m = work.pop()
+                for rs in sets:
+                    for i in rs.by_node.get(m, ()):
+                        fire(rs, i)
+                rk, f, k = nodes[m]
+                if k >= 0:
+                    for name in self.facts(rk, f).units[k].idents & names:
+                        if name not in said:
+                            said.add(name)
+                            for rs in sets:
+                                for i in rs.by_name.get(name, ()):
+                                    fire(rs, i)
+                for x, how in self.edges(m):
+                    if x not in par and nodes[x][1] in linked:
+                        par[x] = (m, how)
+                        work.append(x)
+            # a build script's output (its env, cfgs and OUT_DIR files) reaches only its own crate's code
+            reached = {self.file_root[nodes[m][1]][0] for m in par if nodes[m][1] in self.file_root}
+            for bpkg in sorted(reached & set(builds)):
+                src = builds.pop(bpkg)
+                brk = (bpkg, src, False)
+                for f in sorted(self.tree.tree_of(src)[0]):
+                    for h in self.units(brk, f):
+                        seed(h, f"build script of {bpkg}, its crate reached")
+            if not work:
+                break
+        self._gates[key] = par
+        return par
+
+    def gate_files(self, graph: Graph, n: str) -> dict[str, int]:
+        """file -> the first unit of it gate `n`'s reach holds."""
+        key = (n, graph.recipes[n].text)
+        if key not in self._gate_files:
+            out: dict[str, int] = {}
+            for m in self.gate(graph, n):
+                out.setdefault(self.nodes[m][1], m)
+            self._gate_files[key] = out
+        return self._gate_files[key]
+
+    def label(self, m: int) -> str:
+        rk, f, k = self.nodes[m]
+        if k < 0:
+            return f
+        u = self.facts(rk, f).units[k]
+        what = u.impl.text if u.impl is not None else f"{u.kind} {'::'.join((*u.ctx, u.name or '_'))}"
+        return f"{f}:{u.line} ({what})"
+
+    def chain(self, par: dict[int, tuple[int, str]], m: int) -> str:
+        """Node `m`'s chain in one gate's reach: the target and its own unit first, each step's label before the unit
+        it reaches."""
+        steps: list[tuple[str, int]] = []
+        at = m
+        while par[at][0] >= 0 and len(steps) < len(par):
+            src, how = par[at]
+            steps.append((how, at))
+            at = src
+        head = par[at][1]
+        return f"{head}: {self.label(at)}" + "".join(f" -[{how}]-> {self.label(x)}" for how, x in reversed(steps))
+
+
+def reach_of(tree: Tree) -> Reach:
+    """The tree's one Reach: its item graph and per-gate closures are kept across calls (the self-test checks the
+    table several times on one tree)."""
+    r = getattr(tree, "_reach", None)
+    if r is None:
+        r = Reach(tree)
+        tree._reach = r
+    return r
+
+
+def dep_reach(tree: Tree, graph: Graph, gates: list[str], f: str) -> dict[str, int]:
+    """gate -> the first unit of `f` its reach holds, for each gate that reaches `f` through a dependency edge: its
+    reach holds a unit of `f`, and its read of `f` is not its own target's (narrow() picks those without a row)."""
+    r = reach_of(tree)
+    out = {}
+    for n in gates:
+        w = graph.inputs(n).match(f)
+        if w is None or _own_origin(w):
+            continue
+        hit = r.gate_files(graph, n).get(f)
+        if hit is not None:
+            out[n] = hit
+    return out
+
+
+def reach_chain(tree: Tree, graph: Graph, n: str, node: int) -> str:
+    """How gate `n` reaches unit `node`: its target and own unit, then each step."""
+    r = reach_of(tree)
+    return r.chain(r.gate(graph, n), node)
+
+def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None, stats: dict[str, int] | None = None) -> list[str]:
     """The table against the tree: each row's recipes are gate recipes; its glob matches a file; each file it
     matches that a gate reads through a dependency edge is in the inputs of every recipe the row names
-    (a row cannot claim a gate runs code it does not link); and every gate whose own target names the
-    module the glob stands for is in the row (a gate that calls into the module directly is never left
-    out)."""
+    (a row cannot claim a gate runs code it does not link); every gate the derivation (Reach) says reaches a
+    file the glob matches through a dependency edge is in the row or named by the row's exceptions, each
+    exception naming such a gate (a gate that reaches the file through another lib's code is never left out
+    silently); and every gate whose own target names the module the glob stands for is in the row (a gate
+    that calls into the module directly is never left out). `stats`, when given, gains the counts the
+    summary prints: rows held to the derivation, exceptions, the gates they name."""
     try:
         rows = rows if rows is not None else load_gate_paths(tree.root)
     except RecipeError as err:
@@ -2258,6 +3374,27 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
         for n, fs in unread.items():
             problems.append(f"{at}: {n} does not read {fs[0]}{f' and {len(fs) - 1} more files the glob matches' if len(fs) > 1 else ''} "
                             "(its targets do not link them) — take it out of the row")
+        # the derivation: a gate whose targets can run code of a file the glob matches, through another lib's code
+        held = set(r.gates()) | set(NARROW_ALWAYS)
+        missing: dict[str, tuple[str, int]] = {}
+        used: set[str] = set()
+        for f in matched:
+            for n, node in dep_reach(tree, graph, gates, f).items():
+                if n in held:
+                    continue
+                if n in r.exceptions:
+                    used.add(n)
+                    continue
+                missing.setdefault(n, (f, node))
+        for n, (f, node) in missing.items():
+            problems.append(f"{at}: {n} reaches {f} — add it to the row, or name it in the row's exceptions with the reason; "
+                            f"the chain: {reach_chain(tree, graph, n, node)}")
+        for n in sorted(set(r.exceptions) - used):
+            problems.append(f"{at}: the exception names {n}, which reaches no file the glob matches through a dependency — take it out")
+        if stats is not None:
+            stats["rows"] = stats.get("rows", 0) + 1
+            stats["exceptions"] = stats.get("exceptions", 0) + (1 if r.exceptions else 0)
+            stats["excepted"] = stats.get("excepted", 0) + len(r.exceptions)
         mods = [m for m in (module_of(tree, alt) for alt in glob_alternatives(r.glob)) if m is not None]
         paths = [((ident, *rest), kids) for pkg, rest, kids in mods for ident in sorted(crate_idents(tree, pkg))]
         pkgs = {m[0] for m in mods}
@@ -2765,10 +3902,13 @@ def static_problems(tree: Tree, recipes: dict[str, Recipe], names: tuple[str, ..
 def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
-    problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes) + weekly_problems(recipes)
+    held: dict[str, int] = {}
+    problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes, stats=held) + weekly_problems(recipes)
                 + host_problems(tree, recipes) + static_problems(tree, recipes) + nightly_problems(tree, load_lock(tree.root)))
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
+    print(f"check-recipes: {GATE_PATHS}: {held.get('rows', 0)} gate rows held to the derivation, {held.get('exceptions', 0)} rows "
+          f"with exceptions naming {held.get('excepted', 0)} gates")
     return 1 if problems else 0
 
 
@@ -2985,8 +4125,44 @@ def _item_end(shape: str, start: int) -> int:
 def mac_view(text: str, test: bool | None) -> str:
     """`text` as aarch64-apple-darwin compiles it: comments blanked, and every item or statement under a
     `#[cfg(…)]` false there (a file under a false `#![cfg(…)]`) blanked; newlines kept, so line numbers hold."""
+    return _cfg_blanked(text, test, _MAC_CFG_KEYS, _MAC_CFG_NAMES)[0]
+
+
+@functools.cache
+def build_view(text: str, test: bool) -> tuple[str, str]:
+    """(code, shape) of `text` as any target compiles it with cfg(test) set to `test`: the items under a
+    `#[cfg(…)]` that `test` alone makes false blanked, every other predicate (a target, a feature) kept —
+    the reach reads what some build of the file can hold, so an unknown predicate stays in."""
+    return _cfg_blanked(text, test, {}, {}, items=True)
+
+
+def _cfg_item_end(shape: str, at: int) -> int | None:
+    """The end of the item a cfg attribute that ends at `at` stands on, when one starts there (after any further
+    attributes): after its `;` or its brace block (`_unit_end`); None for a field, an arm or a statement."""
+    i, n = at, len(shape)
+    while True:
+        while i < n and shape[i].isspace():
+            i += 1
+        if i < n and shape[i] == "#":
+            j = i + 1
+            while j < n and shape[j] in " !\t\n":
+                j += 1
+            close = _close(shape, j) if j < n and shape[j] == "[" else None
+            if close is None:
+                return None
+            i = close + 1
+            continue
+        break
+    m = _UNIT_HEAD.match(shape, i)
+    if m is None:
+        return None
+    kind = re.sub(r"\s+", " ", m.group(1))
+    return _unit_end(shape, i, n, kind in _SEMI_KINDS)
+
+
+def _cfg_blanked(text: str, test: bool | None, keys: dict[str, str], names: dict[str, bool], items: bool = False) -> tuple[str, str]:
     code, shape = rust_lex(text)
-    out = list(code)
+    out, out_shape = list(code), list(shape)
     pos = 0
     while True:
         m = _CFG_ATTR.search(shape, pos)
@@ -3009,17 +4185,20 @@ def mac_view(text: str, test: bool | None) -> str:
             pos = close + 1
             continue
         attr_end = rb.end()
-        val = eval_cfg(parse_cfg(code[open_at + 1 : close]), test)
+        val = eval_cfg(parse_cfg(code[open_at + 1 : close]), test, keys, names)
         if val is False:
             if m.group(1):
                 _blank(out, 0, len(out))
+                _blank(out_shape, 0, len(out_shape))
                 break
-            end = _item_end(shape, attr_end)
+            # `items`: an item's own end (`Result<A, B>` in a signature holds a `,` that _item_end stops at)
+            end = (_cfg_item_end(shape, attr_end) if items else None) or _item_end(shape, attr_end)
             _blank(out, m.start(), end)
+            _blank(out_shape, m.start(), end)
             pos = end
         else:
             pos = attr_end
-    return "".join(out)
+    return "".join(out), "".join(out_shape)
 
 
 @functools.cache
@@ -6389,6 +7568,117 @@ def oxide_rev_self_test(expect) -> None:
                f"oxide-rev: tools/box.sh exports the backend of {m.group(1) if m else None}, the cuda-device [patch] rev is {want}: {r.returncode} {r.stderr!r}")
 
 
+def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
+    """The derivation (Reach) on a synthetic workspace, one file per rule it decides, and the table's check of it on
+    the real tree: a draft row that leaves out a gate reaching its files through another lib, and the exceptions."""
+    with tempfile.TemporaryDirectory(prefix="recipes-reach-") as tmp:
+        files = {
+            "base/Cargo.toml": "",
+            # each of a.rs … h.rs holds one fn, reached (or not) by one rule
+            "base/src/lib.rs": (
+                "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\nmod imp;\nmod inner;\n"
+                "pub use inner::{T, U};\n"
+                "pub struct S;\n"
+                "impl S {\n    pub fn used(&self) {\n        c::run()\n    }\n    pub fn idle(&self) {\n        d::run()\n    }\n}\n"
+                "impl Drop for S {\n    fn drop(&mut self) {\n        e::run()\n    }\n}\n"
+                "#[cfg(test)]\nimpl Drop for U {\n    fn drop(&mut self) {\n        f::run()\n    }\n}\n"
+                "#[macro_export]\nmacro_rules! mk {\n    () => {\n        $crate::h::run()\n    };\n}\n"
+            ),
+            "base/src/inner.rs": "pub struct T;\npub struct U;\n",
+            # an impl whose type path passes through lib.rs's re-export, as U's does
+            "base/src/imp.rs": "impl crate::T {\n    pub fn go(&self) {\n        crate::a::run()\n    }\n}\n",
+            "base/src/g.rs": "pub const K: u32 = 1;\n",
+            "mid/Cargo.toml": "",
+            "mid/src/lib.rs": "pub fn call() -> u32 {\n    base::b::run();\n    base::mk!();\n    base::g::K\n}\n",
+            "app/Cargo.toml": "",
+            "app/src/lib.rs": "",
+            "app/tests/it.rs": (
+                "mod common;\n#[test]\nfn t() {\n    let h = common::H;\n    h.make();\n"
+                "    let s = base::S;\n    s.used();\n    let u = base::U;\n    u.go();\n}\n"
+            ),
+            "app/tests/common/mod.rs": "pub struct H;\nimpl H {\n    pub fn make(&self) {\n        mid::call();\n    }\n}\n",
+        }
+        for x in "abcdefh":
+            files[f"base/src/{x}.rs"] = "pub fn run() {}\n"
+        for rel, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        def pkg(name: str, targets: list[tuple[str, str, str]], deps: list[str]) -> dict:
+            return {
+                "id": name,
+                "name": name,
+                "manifest_path": os.path.join(tmp, name, "Cargo.toml"),
+                "features": {},
+                "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in deps],
+                "targets": [{"kind": [k], "name": n, "src_path": os.path.join(tmp, name, s)} for k, n, s in targets],
+            }
+
+        meta = {
+            "workspace_root": tmp,
+            "workspace_members": ["base", "mid", "app"],
+            "packages": [
+                pkg("base", [("lib", "base", "src/lib.rs")], []),
+                pkg("mid", [("lib", "mid", "src/lib.rs")], ["base"]),
+                pkg("app", [("lib", "app", "src/lib.rs"), ("test", "it", "tests/it.rs")], ["mid", "base"]),
+            ],
+        }
+        st = Tree(tmp, meta)
+        rs = {"gate-app": Recipe("gate-app", ["./tools/box.sh 'bash tools/gate.sh -p app --test it'"], [], "")}
+        sg = Graph(st, rs)
+        got = {f for f in (f"base/src/{x}.rs" for x in "abcdefgh") if dep_reach(st, sg, ["gate-app"], f)}
+        want = {
+            "base/src/b.rs": "through mid's call, which only the test crate's own impl (H::make, rule 1 in its own root) runs",
+            "base/src/c.rs": "S::used, named by the test (rule 1)",
+            "base/src/e.rs": "S's Drop, a foreign trait's impl std calls unnamed (rule 1)",
+            "base/src/g.rs": "the const mid names (rule 4)",
+            "base/src/h.rs": "the #[macro_export] macro mid calls, its $crate path (rule 5)",
+        }
+        for f, why in want.items():
+            expect(f in got, f"reach: {f} not reached — {why}")
+        for f, why in {
+            "base/src/a.rs": "T::go: the test names U, whose re-export T shares, and T itself is never named",
+            "base/src/d.rs": "S::idle: no reached unit says its name (rule 1)",
+            "base/src/f.rs": "U's Drop is #[cfg(test)] in base: a dependent's build has no such impl (rule 3)",
+        }.items():
+            expect(f not in got, f"reach: {f} reached — {why}")
+        expect(bool(dep_reach(st, sg, ["gate-app"], "mid/src/lib.rs")), "reach: mid's call not reached through the test crate's own impl")
+
+    # the table's check on the real tree: the held rows, and the derivation's own lines
+    tree, recipes, graph = side.tree, side.recipes, side.graph
+    expect(stats.get("rows", 0) > 0, f"gate-paths: the summary counts no row held to the derivation: {stats}")
+    # a hand-written row that leaves out a gate reaching its files through another lib: gate-gpu-ds41-step runs
+    # moe.rs's experts_step_union_into through bloomery_gpu's host tier, and its bin names no model module
+    draft = ("gate-attn gate-ffn gate-moe gate-head gate-forward gate-kv gate-alloc gate-derived gate-mt gate-profile gate-union "
+             "gate-ds41-host gate-r8 gate-gpu-hybrid gate-gpu-ds41-tier gate-gpu-nvtier gate-gpu-qwen4exp-e2e gate-gpu-glm5next-e2e "
+             "gate-gpu-qwen38-serve gate-gpu-ds41-chain-ffn gate-gpu-qwen4exp-iqleg gate-gpu-p8b gate-gpu-glm5next-twocard "
+             "gate-gpu-glm5next-serve").split(" ")
+    got = gate_paths_problems(tree, recipes, [row("crates/model/src/{ops.rs,moe.rs}", draft)])
+    step = [p for p in got if p.split(": ")[1].startswith("gate-gpu-ds41-step reaches crates/model/src/")]
+    expect(len(step) == 1 and "the chain: " in step[0], f"gate-paths: the draft row's missing gate-gpu-ds41-step not named with its chain: {got[:2]}")
+    expect(not any("gate-gpu-ds41-step runs" in p for p in got), "gate-paths: the direct-name rule, not the derivation, named gate-gpu-ds41-step")
+    excepted = PathRow(1, "crates/model/src/{ops.rs,moe.rs}", draft, "why", glob_regex("crates/model/src/{ops.rs,moe.rs}"), {"gate-gpu-ds41-step": "a reason"})
+    got = gate_paths_problems(tree, recipes, [excepted])
+    expect(not any("gate-gpu-ds41-step" in p for p in got) and any(" reaches crates/model/src/" in p for p in got),
+           f"gate-paths: an exception does not hold its gate out, or holds out the others: {[p for p in got if 'ds41-step' in p][:1]}")
+    # an exception naming a gate that reaches no file of the glob is stale
+    full = list(dep_reach(tree, graph, [n for n in recipes if n.startswith(GATE_PREFIX)], "crates/threads/src/lib.rs"))
+    stale = PathRow(1, "crates/threads/src/lib.rs", full, "why", glob_regex("crates/threads/src/lib.rs"), {"gate-refset": "a reason"})
+    got = gate_paths_problems(tree, recipes, [stale])
+    expect(any(p.endswith("the exception names gate-refset, which reaches no file the glob matches through a dependency — take it out") for p in got)
+           and not any(" reaches crates/" in p for p in got), f"gate-paths: a stale exception: {got[:2]}")
+    # the fourth column's form
+    expect(parse_exceptions("except gate-a gate-b: one | except gate-c: two") == {"gate-a": "one", "gate-b": "one", "gate-c": "two"},
+           "gate-paths: two exception clauses")
+    for bad, why in [("gate-a: no except", "not `except"), ("except gate-a:", "not `except"), ("except gate-a: x | except gate-a: y", "gate-a named twice")]:
+        try:
+            parse_exceptions(bad)
+            expect(False, f"gate-paths: exceptions {bad!r} not refused")
+        except RecipeError as err:
+            expect(why in str(err), f"gate-paths: exceptions {bad!r} refused as {err}")
+
+
 def narrow_self_test(expect, side: Side) -> None:
     """--narrow: the scan verdicts and their refusals, the four rules of narrow() on the real tree with rows of
     the test's own, the table's checks, and the host group's guard."""
@@ -6532,7 +7822,7 @@ def narrow_self_test(expect, side: Side) -> None:
     got = gate_paths_problems(tree, recipes, [row("crates/nothing/**", ["gate-nope"])])
     expect(any("gate-nope is not a gate-* recipe" in p for p in got) and any("matches no file" in p for p in got),
            f"gate-paths: an unknown recipe or a glob matching nothing not refused: {got}")
-    got = gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["gate-ds41-bind", "gate-gpu-p1"])])
+    got = [p for p in gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["gate-ds41-bind", "gate-gpu-p1"])]) if " does not read " in p]
     expect(len(got) == 1 and "gate-gpu-p1 does not read crates/serve/src/" in got[0], f"gate-paths: a recipe that does not link the row's files: {got}")
     # the weekly tier's triggers: a name the justfile lacks, and a trigger whose recipe reads none of the glob's files,
     # each refused by name; a trigger-only row is held to no gate's module (it maps nothing for --narrow)
@@ -6550,14 +7840,16 @@ def narrow_self_test(expect, side: Side) -> None:
     got = gate_paths_problems(tree, recipes, [row("crates/gpu-deepseek41/src/{body.rs,body/**}", ["gate-gpu-ds41-step"])])
     expect(any("gate-gpu-ds41-long runs bin gate_deepseek41_long" in p and "names bloomery_gpu_deepseek41::body" in p for p in got),
            f"gate-paths: a gate whose bin names the module, left out of its row: {got[:2]}")
-    got = gate_paths_problems(tree, recipes, [row("crates/refset/src/arch/mod.rs", ["gate-refset"])])
+    got = [p for p in gate_paths_problems(tree, recipes, [row("crates/refset/src/arch/mod.rs", ["gate-refset"])]) if " names " in p and p.endswith("to the row")]
     expect([p.split(": ")[1].split(" ")[0] for p in got] == ["gate-gpu-linear"],
            f"gate-paths: arch/mod.rs's row asks for exactly the gates that call its own items (gate_linear's node_dumps), not its submodules' users: {got}")
     expect(names_module(named_paths("use a::b::{self, C};"), ("a", "b")) and not names_module(named_paths("// a::b::c\nlet s = \"a::b\";"), ("a", "b")),
            "gate-paths: a module named in a use tree, or only in a comment or a string")
     expect(glob_regex("x/{a.rs,b/**}").match("x/b/c/d.rs") and not glob_regex("x/*.rs").match("x/b/c.rs"), "gate-paths: glob `**`, `*` and braces")
-    got = gate_paths_problems(tree, recipes)
+    stats: dict[str, int] = {}
+    got = gate_paths_problems(tree, recipes, stats=stats)
     expect(not got, f"gate-paths: the real table: {got[:3]}")
+    reach_self_test(expect, side, row, stats)
     # the host group: the real host recipes pass; gate-gpu-lib, whose hw_ tests use the card, is refused by name
     expect(not host_problems(tree, recipes), f"host: the real justfile: {host_problems(tree, recipes)[:2]}")
     import copy
@@ -7211,6 +8503,11 @@ def main(argv: list[str]) -> int:
     w = sub.add_parser("why")
     w.add_argument("files", nargs="+")
     w.add_argument("--all-recipes", action="store_true")
+    rh = sub.add_parser("reach", help="the gate-* recipes whose targets can run code of each FILE through a dependency (the derivation "
+                        f"{GATE_PATHS}'s rows are held to), each with one chain")
+    rh.add_argument("files", nargs="+")
+    rh.add_argument("--brief", action="store_true", help="the gates' names without their chains")
+    rh.add_argument("--row", action="store_true", help="last, the union of the files' gates as a row's first two columns")
     k = sub.add_parser("key", help="each ITEM's ledger key: key<TAB>item<TAB>status<TAB>detail")
     k.add_argument("items", nargs="+", metavar="ITEM", help="NAME[@K=V,…][:ARGS], as tools/gate-batch.sh runs it (its lane's card in the env)")
     k.add_argument("--manifest", help="the box manifest (box-manifest's output)")
@@ -7253,6 +8550,8 @@ def main(argv: list[str]) -> int:
             return cmd_affected(args)
         if args.cmd == "why":
             return cmd_why(args)
+        if args.cmd == "reach":
+            return cmd_reach(args)
         if args.cmd == "key":
             return cmd_key(args)
         if args.cmd == "box-command":
