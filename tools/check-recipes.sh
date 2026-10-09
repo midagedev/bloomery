@@ -345,6 +345,7 @@ blk_pytools() {
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38width.py --self-test"
     "tools/flow/routes.py --self-test"
+    "tools/hf-arch-check.py --self-test"
     "tools/mac-disk.py --self-test"
     "tools/ref/check-int-twins.py --self-test"
     "tools/ref/clef/e2e.py --self-test"

@@ -102,14 +102,17 @@ class Refusal(Exception):
         self.code = code
 
 
-def header(path):
-    """(metadata, tensors, data_start, file_size) of one GGUF file; tensors are (name, type, dims, offset)."""
+def header(path, size=None):
+    """(metadata, tensors, data_start, file_size) of one GGUF file; tensors are (name, type, dims, offset).
+    `size` is the real file's size when `path` holds only its first bytes: the size checks then compare
+    against it, and a header that runs past the bytes is the refusal "the header ends at byte N, inside a field"."""
     try:
         f = open(path, "rb")
     except OSError as e:
         raise Refusal(2, f"{path}: {e.strerror}") from e
     with f:
-        size = os.fstat(f.fileno()).st_size
+        if size is None:
+            size = os.fstat(f.fileno()).st_size
 
         def take(n):
             b = f.read(n)
