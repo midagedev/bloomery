@@ -798,7 +798,9 @@ pub struct HostTotals {
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
     pub shadow_bytes: u64,
-    /// The machine's host reserves and [`HostTotals::row_reserve_bytes`].
+    /// The machine's host reserves and [`HostTotals::row_reserve_bytes`],
+    /// and on a plan the NVMe expert tier split, the prompt run-ahead's
+    /// page-cache window ([`expert_nvme_tier`]).
     pub reserve_bytes: u64,
     /// What the host sets aside for the row-gathered tables the program
     /// reads from the NVMe tier ([`row_table_tier`]); 0 when none lies
@@ -2490,9 +2492,10 @@ pub fn nvme_arena_of(
 /// The floor is `base + 3 W`: `base` the need with no routed expert on the
 /// host, `W` the host bytes of the layer with the most — the room's host
 /// terms beside the routed experts hold `1 W` of host-served expert
-/// segments, `2 W` of the prompt run-ahead's page-cache window and the RAM
-/// arena [`nvme_arena_of`] picks: `1 W + 2 W + arena = room − base − 3 W` at
-/// the largest arena. A room under it is refused by name; the plan's
+/// segments, `2 W` of the prompt run-ahead's page-cache window (a host
+/// reserve of the split plan) and the RAM arena [`nvme_arena_of`] picks:
+/// `1 W + 2 W + arena = room − base` at the largest arena,
+/// `room − base − 3 W`. A room under it is refused by name; the plan's
 /// `host.experts` counts the experts the host leg serves, on either tier.
 /// The split plan's headroom is what the room leaves past the arena and the
 /// host need, the budget a churn pool beside them must fit.
@@ -2599,9 +2602,13 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
     let arena = nvme_arena_of(room, held, floor, given)?;
     let room = room - arena;
     plan.host.nvme_arena_bytes = arena;
-    // The host keeps `keep` of its `held` expert bytes; the floor leaves it
-    // at least three layers' worth.
-    let keep = held - (need.bytes() - room);
+    // The prompt run-ahead's page-cache window, `2 W`, is a host reserve of
+    // the split plan: the host keeps `keep` of its `held` expert bytes in
+    // what the room leaves past the arena and the window, which the floor
+    // keeps at least one layer's worth.
+    let window = 2 * heavy;
+    plan.host.reserve_bytes += window;
+    let keep = held - (need.bytes() + window - room);
     let share = |l: &HostLayer| u128::from(keep) * u128::from(l.bytes()) / u128::from(held);
     let mut r: Vec<u64> = layers
         .iter()
