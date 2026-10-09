@@ -482,8 +482,9 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 /// available bytes must cover ([`HostNeed::check`]) — `MemAvailable`, or
 /// the smaller room under a cgroup v2 limit ([`host_room`]): the plan's
 /// host experts and tables, the
-/// cards' ring shadows, the host's reserves and `extra` (a residency churn
-/// pool the host set also holds), less the reserve named [`OS_RESERVE`] —
+/// cards' ring shadows, the host's reserves, `extra` (a residency churn
+/// pool the host set also holds) and the NVMe expert tier's RAM arena
+/// ([`HostNeed::arena`]), less the reserve named [`OS_RESERVE`] —
 /// `MemAvailable` already leaves out what the OS and every other process
 /// hold. The page cache the host set will reuse is inside `MemAvailable`
 /// already, as reclaimable file pages, so no term adds it.
@@ -494,6 +495,11 @@ pub struct HostNeed {
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
+    /// The plan's NVMe expert tier arena (`HostTotals::nvme_arena_bytes`):
+    /// the anonymous bytes the tier's slots fill beside these terms, 0
+    /// without one. [`HostNeed::bytes`] counts it;
+    /// [`HostNeed::plan_bytes`] leaves it to the split dial that shapes it.
+    pub arena: u64,
     pub os: u64,
     /// The plan was made under a card budget.
     pub card_budget: bool,
@@ -518,14 +524,26 @@ impl HostNeed {
             shadows: plan.host.shadow_bytes,
             reserves: plan.host.reserve_bytes,
             extra,
+            arena: plan.host.nvme_arena_bytes,
             os,
             card_budget: plan.card_budget.is_some(),
         }
     }
 
-    /// The bytes `MemAvailable` must cover.
+    /// The bytes `MemAvailable` must cover: the plan's host terms, `extra`
+    /// and the arena — what a placed load of this plan holds.
     #[must_use]
     pub fn bytes(&self) -> u64 {
+        (self.experts + self.tables + self.shadows + self.reserves + self.extra + self.arena)
+            .saturating_sub(self.os)
+    }
+
+    /// [`HostNeed::bytes`] with the arena out: the plan's own host terms
+    /// and `extra` — the sum the plan-time room arithmetic of
+    /// `expert_nvme_tier` shapes, the arena being its own dial beside it
+    /// (the room that arithmetic splits has already lost the arena).
+    #[must_use]
+    pub fn plan_bytes(&self) -> u64 {
         (self.experts + self.tables + self.shadows + self.reserves + self.extra)
             .saturating_sub(self.os)
     }
@@ -573,6 +591,9 @@ impl fmt::Display for HostShort {
         if n.extra > 0 {
             write!(f, " + residency churn pool {} B", n.extra)?;
         }
+        if n.arena > 0 {
+            write!(f, " + NVMe tier arena {} B", n.arena)?;
+        }
         write!(
             f,
             " − the OS reserve {} B, which MemAvailable leaves out already. Free host memory, or \
@@ -582,6 +603,12 @@ impl fmt::Display for HostShort {
         )?;
         if n.extra > 0 {
             write!(f, "; BLOOMERY_RESIDENCY=off drops the churn pool")?;
+        }
+        if n.arena > 0 {
+            write!(
+                f,
+                "; BLOOMERY_NVTIER_BYTES=0 plans the split with no arena (the mapping reads)"
+            )?;
         }
         if n.card_budget {
             write!(
@@ -1171,6 +1198,7 @@ mod tests {
             shadows: 10,
             reserves: 500,
             extra: 50,
+            arena: 0,
             os: 400,
             card_budget: true,
         };

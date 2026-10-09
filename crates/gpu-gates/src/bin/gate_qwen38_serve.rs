@@ -2913,8 +2913,9 @@ mod gate {
         ))
     }
 
-    /// The NVMe tier's RAM arena and the host's need ([`HostNeed`]) of
-    /// [`gate_plan_at`]'s plan at the host room `room`.
+    /// The NVMe tier's RAM arena and the host's need ([`HostNeed::bytes`],
+    /// the arena inside it) of [`gate_plan_at`]'s plan at the host room
+    /// `room`.
     fn host_split_at(
         levers: &bloomery_levers::Levers,
         shape: (usize, usize),
@@ -3655,7 +3656,10 @@ mod gate {
         // `checkpoint_bytes(slots)` in each — the split keeps the same host
         // experts (its kept bytes are the need less the room past the
         // arena, both moved by the reserve) — read off the `cache` line's
-        // `need` and `tier`, the seat's own terms of the plan it loads.
+        // `need` and `tier`, the seat's own terms of the plan it loads. The
+        // need holds the arena (`HostNeed::bytes`), so the reserve's move is
+        // in the need beside the arena (`need − tier`); the need itself, the
+        // room the split fills, stays where it was.
         let cache = text
             .lines()
             .find(|l| l.starts_with("cache "))
@@ -3688,7 +3692,10 @@ mod gate {
             "paged_checkpoints_sit_outside_the_arena",
             match (seat, bare) {
                 ((Some(arena), Some(need)), Some((bare_arena, bare_need))) => {
-                    arena > 0 && arena + held == bare_arena && need == bare_need + held
+                    arena > 0
+                        && arena + held == bare_arena
+                        && need.checked_sub(arena)
+                            == bare_need.checked_sub(bare_arena).map(|b| b + held)
                 }
                 _ => false,
             },

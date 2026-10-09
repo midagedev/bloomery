@@ -754,7 +754,7 @@ fn nvme_arm(room: u64) -> NvmeArm {
         "the plan states the arena the dial chose"
     );
 
-    let need = HostNeed::of(&split, 0).bytes();
+    let need = HostNeed::of(&split, 0).plan_bytes();
     let moved = split.host.nvme_expert_bytes;
     // The split plan reserves the prompt run-ahead's window, two of the
     // heaviest layer's host bytes, beside its host experts.
@@ -891,7 +891,7 @@ fn a_split_plans_pool_fits_the_room_past_the_arena() {
     let (q4, gate) = (model(false), machine_a(RTX_3090));
     for room in [27u64 << 30, 58 << 30] {
         let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
-        let need = HostNeed::of(&split, 0).bytes();
+        let need = HostNeed::of(&split, 0).plan_bytes();
         let arena = split.host.nvme_arena_bytes;
         assert!(split.host.nvme_expert_bytes > 0, "room {room} splits");
         assert_eq!(
@@ -916,6 +916,74 @@ fn a_split_plans_pool_fits_the_room_past_the_arena() {
     }
 }
 
+/// The load's check counts the arena (`HostNeed::bytes`): a paged plan made
+/// at a room that holds its need and arena, checked at load against an
+/// available reading the room shrank to — above the need without the arena,
+/// under it with — refuses by name with the arena's bytes as a term, the
+/// reading that holds both passes, and a plan with no arena checks exactly
+/// as before (the two sums one).
+#[test]
+fn a_paged_plans_load_check_counts_the_arena() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    let deep = plan_at(&q4, &gate, 4096, 1, 27 << 30).expect("the split plan");
+    let need = HostNeed::of(&deep, 0);
+    assert!(need.arena > 0, "the deep split's dial gives an arena");
+    assert_eq!(need.arena, deep.host.nvme_arena_bytes);
+    // The shrunk room: the need without the arena fits, the load's bytes do
+    // not.
+    let shrunk = need.bytes() - 1;
+    assert!(
+        need.plan_bytes() <= shrunk,
+        "the shrunk reading {shrunk} B is past the arena-free {} B",
+        need.plan_bytes()
+    );
+    let text = need
+        .check(shrunk)
+        .expect_err("the load refuses")
+        .to_string();
+    for part in [
+        format!("the {} B this load needs", need.bytes()),
+        format!("+ NVMe tier arena {} B", need.arena),
+        "BLOOMERY_NVTIER_BYTES=0".to_string(),
+    ] {
+        assert!(text.contains(&part), "{part:?} in {text}");
+    }
+    assert_eq!(need.check(need.bytes()), Ok(()));
+    // A plan with no arena checks exactly as before: the two sums are one.
+    let wide = plan_at(&q4, &gate, 4096, 1, 58 << 30).expect("the wide split plan");
+    let need = HostNeed::of(&wide, 0);
+    assert_eq!(need.arena, 0, "the wide room's dial gives no arena");
+    assert_eq!(need.bytes(), need.plan_bytes());
+    assert_eq!(need.check(need.bytes()), Ok(()));
+    let text = need
+        .check(need.bytes() - 1)
+        .expect_err("one byte short")
+        .to_string();
+    assert!(!text.contains("NVMe tier arena"), "{text}");
+}
+
+/// The seat's prompt-cache budget counts the arena once: `HostNeed::bytes`
+/// carries it, and `CacheRam::of_tier` no longer subtracts it by hand, so
+/// the budget's terms are the same bytes as the old by-hand subtraction —
+/// `available − the arena-free need − pool − arena − checkpoints` — on
+/// every plan, paged or not. (The budget itself lives in gpu-gates'
+/// `CacheRam`, a device crate the Mac cannot test whose reading of the
+/// host's available bytes has no unit-test seam; this pins the identity its
+/// terms rest on.)
+#[test]
+fn the_seats_cache_budget_counts_the_arena_once() {
+    let (q4, gate) = (model(false), machine_a(RTX_3090));
+    for room in [27u64 << 30, 58 << 30] {
+        let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
+        let need = HostNeed::of(&split, 0);
+        assert_eq!(
+            need.bytes(),
+            need.plan_bytes() + need.arena,
+            "room {room}: the arena rides in bytes, once"
+        );
+    }
+}
+
 /// The split leaves the prompt run-ahead's `2 W` page-cache window, a host
 /// reserve of the split plan, and keeps the host experts in what the room
 /// leaves past the arena and the window: on both rooms the reserve grows by
@@ -936,7 +1004,7 @@ fn a_split_leaves_the_run_ahead_window() {
             twin.host.reserve_bytes + 2 * w,
             "room {room}: the window is the split plan's reserve"
         );
-        assert!(HostNeed::of(&split, 0).bytes() + split.host.nvme_arena_bytes <= room);
+        assert!(HostNeed::of(&split, 0).plan_bytes() + split.host.nvme_arena_bytes <= room);
         if room == 27 << 30 {
             assert!(
                 split.host.expert_bytes <= w,
