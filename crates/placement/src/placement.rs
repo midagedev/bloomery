@@ -804,7 +804,10 @@ pub struct HostTotals {
     /// reads from the NVMe tier ([`row_table_tier`]); 0 when none lies
     /// there. Inside [`HostTotals::reserve_bytes`].
     pub row_reserve_bytes: u64,
-    /// usable − experts − tables − shadows − reserves.
+    /// usable − experts − tables − shadows − reserves; on a plan the NVMe
+    /// expert tier split ([`expert_nvme_tier`]), the room the split read
+    /// less the arena and the plan's host need ([`workstation::HostNeed`]),
+    /// since the room binds there.
     pub headroom_bytes: i128,
 }
 
@@ -2491,6 +2494,8 @@ pub fn nvme_arena_of(
 /// arena [`nvme_arena_of`] picks: `1 W + 2 W + arena = room − base − 3 W` at
 /// the largest arena. A room under it is refused by name; the plan's
 /// `host.experts` counts the experts the host leg serves, on either tier.
+/// The split plan's headroom is what the room leaves past the arena and the
+/// host need, the budget a churn pool beside them must fit.
 pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
@@ -2650,7 +2655,10 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
     plan.host.expert_bytes -= moved;
     plan.host.nvme_expert_bytes += moved;
     plan.nvme_bytes += moved;
-    plan.host.headroom_bytes += i128::from(moved);
+    // The room binds a split plan: its headroom is what the room leaves
+    // past the arena (`room` here) and the plan's host need.
+    plan.host.headroom_bytes =
+        i128::from(room) - i128::from(workstation::HostNeed::of(plan, 0).bytes());
     Ok(())
 }
 

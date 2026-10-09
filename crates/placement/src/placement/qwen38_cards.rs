@@ -873,24 +873,39 @@ fn a_27_gib_room_puts_the_overflow_on_the_nvme_tier() {
     // takes what the floor leaves — and the host segments shrink to it.
     assert!(arm.arena > 0, "the dial gives the deep split an arena");
     assert_eq!(arm.arena, arm.room - arm.floor);
+}
 
-    // On the paged plan the unset residency rule resolves mid with no churn
-    // pool: the arena serves the victims (residency38's paged branch).
+/// A split plan's headroom is what the room leaves past the arena and the
+/// host need, so a churn pool is priced against the bytes the load really
+/// holds: on the 27 GiB room the pool of every card expert (`mid-p0`) is
+/// refused by name, and on both rooms the unset rule's pick keeps the host
+/// need, the arena and its pool inside the room.
+#[test]
+fn a_split_plans_pool_fits_the_room_past_the_arena() {
     let (q4, gate) = (model(false), machine_a(RTX_3090));
+    for room in [27u64 << 30, 58 << 30] {
+        let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
+        let need = HostNeed::of(&split, 0).bytes();
+        let arena = split.host.nvme_arena_bytes;
+        assert!(split.host.nvme_expert_bytes > 0, "room {room} splits");
+        assert_eq!(
+            split.host.headroom_bytes,
+            i128::from(room) - i128::from(arena) - i128::from(need),
+            "room {room}: the headroom is the room's past the arena and the need"
+        );
+        let (pick, pool) = residency(&split);
+        assert!(
+            need + arena + pool <= room,
+            "room {room}: {} holds need {need} B + arena {arena} B + pool {pool} B",
+            pick.word()
+        );
+    }
     let split = plan_at(&q4, &gate, 4096, 1, 27 << 30).expect("the split plan");
-    let pick = residency38_at_plan(
-        split.n_l.iter().copied(),
-        split.host.experts,
-        |_: usize| -> Result<u64, PlacementError> { Ok(0) },
-        split.host.headroom_bytes,
-        i128::MAX,
-    )
-    .expect("the paged plan's rule");
-    assert_eq!(
-        (pick.pinned, pick.word()),
-        (Some(0), "mid-p0-s1".to_string()),
-        "a paged plan's unset rule is mid with no churn pool"
-    );
+    let all = ChurnPool::of(&split, 0, 0).expect("the pool of every card expert");
+    match all.check(&split) {
+        Err(PlacementError::ResidencyOverHost(_)) => {}
+        other => panic!("mid-p0's pool of {} B is not refused: {other:?}", all.bytes),
+    }
 }
 
 /// A host of 58 GiB (a 64 GB machine's room): the room covers over half the
