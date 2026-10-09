@@ -1654,6 +1654,35 @@ pub static NVTIER: Kind = Kind {
     ],
 };
 
+/// One span's tier census on a paged load (`bloomery_gpu::host::census`): the
+/// span's phase, its tokens, the routed picks its host services saw and where
+/// each was served — the stage card (or a tier card), the NVMe tier's arena,
+/// the model file's mapping — the bytes it moved between the tiers (the
+/// arena's fills, the residency machine's promotions onto the card and its
+/// demotions to the host), the tier's drops of the mapping's pages and
+/// their wall, and the pool's dispatches that waited for another caller's
+/// job and their wait.
+pub static TIER_CENSUS: Kind = Kind {
+    name: "tier_census",
+    head: "tier census",
+    doc: "One span of a paged load: its phase (a gate's prompt, steps or slots phase; a server's call), the tokens its host services carried, the routed picks they saw and of them those served by a card (the stage card, a tier card, or a prompt's host slots left to the card route), read from the NVMe tier's RAM arena, or read through the model file's mapping (card + arena + file = picks when every host slot was read once); the bytes the arena's fills read, the bytes of the experts the residency machine put on the stage card and sent back to the host; the tier's drops of the mapping's pages and their wall on the dropper's thread; and the worker pool's dispatches that waited for another caller's job, with their wait.",
+    parts: &[
+        key("phase", Word, ""),
+        key("tokens", U64, ""),
+        key("picks", U64, ""),
+        key("card", U64, ""),
+        key("arena", U64, ""),
+        key("file", U64, ""),
+        key("fill_bytes", U64, "B"),
+        key("promote_bytes", U64, "B"),
+        key("demote_bytes", U64, "B"),
+        key("drops", U64, ""),
+        key("drop_ns", U64, "ns"),
+        key("dispatch_waits", U64, ""),
+        key("dispatch_wait_ns", U64, "ns"),
+    ],
+};
+
 /// One result row of `probe_nvread`: an arm over a case of cold routed-expert
 /// runs, the batches' rate quantiles and what the run asked of the drive.
 pub static NVREAD: Kind = Kind {
@@ -2925,6 +2954,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &MTP_WIDTH,
     &DRAFT_YIELD,
     &NVTIER,
+    &TIER_CENSUS,
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
@@ -3084,9 +3114,9 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
         .u("closed", closed)
 }
 
-/// `gate_nvtier`'s rows: the tier's counters and the residency rule's two
-/// records of the paged plan.
-pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST];
+/// `gate_nvtier`'s rows: the tier's counters, the residency rule's two
+/// records of the paged plan and the tier census of each phase.
+pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS];
 
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
