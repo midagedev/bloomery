@@ -1,6 +1,6 @@
 //! qdot — fused quantized row dots for host CPU: Q3_K x Q8_K, Q4_K/Q5_K x Q8_2_X4,
 //! Q6_K x Q8_2_X4, Q5_0 x Q8_2_X4, Q5_1 x Q8_2_X4, Q8_0 x Q8_2_X4, IQ3_XXS x Q8_K,
-//! MXFP4 x Q8_2_X4, IQ4_NL x Q8_2_X4, IQ4_XS x Q8_K, and Q8_0 x act cell kernels.
+//! IQ3_S x Q8_K, MXFP4 x Q8_2_X4, IQ4_NL x Q8_2_X4, IQ4_XS x Q8_K, and Q8_0 x act cell kernels.
 //!
 //! Dots quantized weight rows directly against quantized activation columns without
 //! materializing f32 weights, scaling once per block:
@@ -12,6 +12,8 @@
 //! - Q5_1 x Q8_2_X4: port of ik's `mul_mat_qX_1_q8_2_T<Q5_1_Unpacker>` (iqk_gemm_legacy_quants.cpp:804).
 //! - IQ3_XXS x Q8_K: port of ik's `mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3XXS, 1>`
 //!   (iqk_gemm_iquants.cpp:787, :494), the body its AVX2 (non-AVX512) build runs.
+//! - IQ3_S x Q8_K: port of ik's `mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3S, 1>`
+//!   (iqk_gemm_iquants.cpp:787, :624), the body its AVX2 (non-AVX512) build runs.
 //! - MXFP4 x Q8_2_X4: port of ik's `mul_mat_qX_1_q8_2_T<MXFP4_Unpacker>` (iqk_gemm_legacy_quants.cpp:779).
 //! - IQ4_NL x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<IQ4_NL_UnpackerS, _, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:407, :2596), the body its AVX2 (non-AVX512) build runs.
@@ -20,7 +22,7 @@
 //! - Q8_0 x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:404, :753), the body its AVX2 (no AVX512-VNNI) build runs.
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
-//! - Q3_K, Q4_K, Q5_K, Q5_1, Q8_0, IQ3_XXS, IQ4_XS and IQ4_NL tiles: one weight row against up
+//! - Q3_K, Q4_K, Q5_K, Q5_1, Q8_0, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL tiles: one weight row against up
 //!   to [`TILE_COLS`] columns, each block unpacked once, every column bit-identical to its
 //!   one-column kernel ([`dot_row_cols`]); the Q5_1 and Q8_0 tiles are ik's `AccumT::compute` at `nrc_y` = the
 //!   column count (iqk_gemm_legacy_quants.cpp:302).
@@ -43,7 +45,7 @@ use std::arch::x86_64::*;
 use std::fmt;
 
 use gguf::GgmlType;
-use gguf::iq_tables::{IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL};
+use gguf::iq_tables::{IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL};
 use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, half_to_f32};
 
 /// `sizeof(block_q3_K)` (ggml-common.h): 110 bytes / 256 values.
@@ -171,6 +173,7 @@ fn has_kernel(w: GgmlType) -> bool {
             | GgmlType::Q8_0
             | GgmlType::Q6_K
             | GgmlType::IQ3_XXS
+            | GgmlType::IQ3_S
             | GgmlType::MXFP4
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS
@@ -207,7 +210,8 @@ fn has_features(w: GgmlType) -> bool {
         // dot_mxfp4_q82x4_avx2: enable = "avx2", "fma"
         GgmlType::MXFP4 => avx2() && fma(),
         // dot_q4k/q5k/q6k_q82x4_avx2, dot_q5f0/q5f1/q8f0_q82x4_avx2, dot_iq3xxs_q8k_avx2,
-        // dot_iq4nl_q82x4_avx2, dot_iq4xs_q8k_avx2: enable = "avx2", "fma", "f16c"
+        // dot_iq3s_q8k_avx2, dot_iq4nl_q82x4_avx2, dot_iq4xs_q8k_avx2:
+        // enable = "avx2", "fma", "f16c"
         GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -215,6 +219,7 @@ fn has_features(w: GgmlType) -> bool {
         | GgmlType::Q5_1
         | GgmlType::Q8_0
         | GgmlType::IQ3_XXS
+        | GgmlType::IQ3_S
         | GgmlType::IQ4_NL
         | GgmlType::IQ4_XS => avx2() && fma() && f16c(),
         _ => false,
@@ -222,7 +227,7 @@ fn has_features(w: GgmlType) -> bool {
 }
 
 /// The `k` contract: `k` must be a multiple of the weight format's block size
-/// (256 for K-quants, IQ3_XXS and IQ4_XS, 32 for Q5_0, Q5_1, Q8_0, MXFP4 and IQ4_NL).
+/// (256 for K-quants, IQ3_XXS, IQ3_S and IQ4_XS, 32 for Q5_0, Q5_1, Q8_0, MXFP4 and IQ4_NL).
 pub fn k_granularity(w: GgmlType) -> usize {
     match w {
         GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::MXFP4 | GgmlType::IQ4_NL => 32,
@@ -263,7 +268,7 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 
 /// Quantize one activation column into the block format `w` implies.
 ///
-/// Q3_K, IQ3_XXS and IQ4_XS use `block_q8_K` (296 B/256 values); Q4_K, Q5_K, Q5_0, Q5_1,
+/// Q3_K, IQ3_XXS, IQ3_S and IQ4_XS use `block_q8_K` (296 B/256 values); Q4_K, Q5_K, Q5_0, Q5_1,
 /// Q8_0, Q6_K, MXFP4 and IQ4_NL use `block_q8_2_x4` (144 B/128 values), with 36-byte
 /// `block_q8_2` tails for Q5_0/Q5_1/Q8_0/MXFP4/IQ4_NL.
 /// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise, and by
@@ -394,6 +399,10 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
             // SAFETY: AVX2+FMA+F16C were just detected; lengths validated above.
             Ok(unsafe { dot_iq3xxs_q8k_avx2(wrow, acol, nb) })
         }
+        (GgmlType::IQ3_S, true) => {
+            // SAFETY: AVX2+FMA+F16C were just detected; lengths validated above.
+            Ok(unsafe { dot_iq3s_q8k_avx2(wrow, acol, nb) })
+        }
         (GgmlType::MXFP4, true) => {
             // SAFETY: AVX2+FMA were just detected; lengths validated above.
             Ok(unsafe { dot_mxfp4_q82x4_avx2(wrow, acol, nb) })
@@ -426,6 +435,7 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         GgmlType::Q5_1 => dot_q5f1_q82x4_emul(wrow, acol, nb),
         GgmlType::Q8_0 => dot_q8f0_q82x4_emul(wrow, acol, nb),
         GgmlType::IQ3_XXS => dot_iq3xxs_q8k_emul(wrow, acol, nb),
+        GgmlType::IQ3_S => dot_iq3s_q8k_emul(wrow, acol, nb),
         GgmlType::MXFP4 => dot_mxfp4_q82x4_emul(wrow, acol, nb),
         GgmlType::IQ4_NL => dot_iq4nl_q82x4_emul(wrow, acol, nb),
         GgmlType::IQ4_XS => dot_iq4xs_q8k_emul(wrow, acol, nb),
@@ -470,6 +480,10 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_iq3xxs_q8k_avx2(wrow, acol, nb) })
         }
+        GgmlType::IQ3_S => {
+            // SAFETY: asserted just above; lengths validated by check_row.
+            Ok(unsafe { dot_iq3s_q8k_avx2(wrow, acol, nb) })
+        }
         GgmlType::MXFP4 => {
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_mxfp4_q82x4_avx2(wrow, acol, nb) })
@@ -503,6 +517,7 @@ enum TileKind {
     Q51,
     Q80,
     Iq3Xxs,
+    Iq3S,
     Iq4Xs,
     Iq4Nl,
 }
@@ -517,6 +532,7 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
         GgmlType::Q5_1 => TileKind::Q51,
         GgmlType::Q8_0 => TileKind::Q80,
         GgmlType::IQ3_XXS => TileKind::Iq3Xxs,
+        GgmlType::IQ3_S => TileKind::Iq3S,
         GgmlType::IQ4_XS => TileKind::Iq4Xs,
         GgmlType::IQ4_NL => TileKind::Iq4Nl,
         _ => return None,
@@ -525,7 +541,7 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
 }
 
 /// Whether [`dot_row_cols`] runs a tile kernel for `w` on this machine
-/// (Q3_K, Q4_K, Q5_K, Q5_1, Q8_0, IQ3_XXS, IQ4_XS and IQ4_NL with their ISA); otherwise it dots each column
+/// (Q3_K, Q4_K, Q5_K, Q5_1, Q8_0, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL with their ISA); otherwise it dots each column
 /// through [`dot_row`].
 #[must_use]
 pub fn has_tile(w: GgmlType) -> bool {
@@ -606,6 +622,8 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         // SAFETY: tile_kind saw AVX2+FMA+F16C; check_row sized the row for nb
         // blocks and every column for nb Q8_K blocks.
         TileKind::Iq3Xxs => unsafe { dot_iq3xxs_q8k_tile_avx2::<C>(wrow, &cols, nb) },
+        // SAFETY: as the IQ3_XXS arm.
+        TileKind::Iq3S => unsafe { dot_iq3s_q8k_tile_avx2::<C>(wrow, &cols, nb) },
         // SAFETY: as the IQ3_XXS arm.
         TileKind::Iq4Xs => unsafe { dot_iq4xs_q8k_tile_avx2::<C>(wrow, &cols, nb) },
         // SAFETY: as the Q5_1 arm.
@@ -1074,6 +1092,7 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
         GgmlType::Q4_K => (k / 256, (k / 256) * Q4K_BLOCK),
         GgmlType::Q5_K => (k / 256, (k / 256) * Q5K_BLOCK),
         GgmlType::IQ3_XXS => (k / 256, (k / 256) * IQ3XXS_BLOCK),
+        GgmlType::IQ3_S => (k / 256, (k / 256) * IQ3S_BLOCK),
         GgmlType::MXFP4 => (k / 32, (k / 32) * MXFP4_BLOCK),
         GgmlType::IQ4_NL => (k / 32, (k / 32) * IQ4NL_BLOCK),
         GgmlType::IQ4_XS => (k / 256, (k / 256) * IQ4XS_BLOCK),
@@ -6071,7 +6090,7 @@ unsafe fn dot_iq3xxs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     }
 }
 
-/// One column's block step of the IQ3_XXS and IQ4_XS kernels (their steps are
+/// One column's block step of the IQ3_XXS, IQ3_S and IQ4_XS kernels (their steps are
 /// the same past the weight decode): the bsums fold's fmadd, the eight
 /// sub-blocks' `madd(scale, maddubs(values, q8))` summed in ik's order, then
 /// the codes' fmadd, onto `accd`. `values` are the block's 32-code vectors
@@ -6254,6 +6273,293 @@ fn dot_iq3xxs_q8k_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
                     mag
                 };
                 let u = i32::from(v.wrapping_add(IQ3XXS_MIN) as u8);
+                let a = i32::from(col[8 + 32 * b + n] as i8);
+                sumi[n / 4] += s * u * a;
+            }
+        }
+        for (a, &si) in accd.iter_mut().zip(&sumi) {
+            *a = (d * dy).mul_add(si as f32, *a);
+        }
+    }
+    let t = [
+        accd[0] + accd[4],
+        accd[1] + accd[5],
+        accd[2] + accd[6],
+        accd[3] + accd[7],
+    ];
+    (t[0] + t[2]) + (t[1] + t[3])
+}
+
+// ------------------------------------------------------------ IQ3_S x Q8_K
+
+/// `block_iq3_s` (ggml-common.h): f16 d @0, qs[64] @2, qh[8] @66, signs[32] @74,
+/// scales[4] @106. Sub-block b (32 values) is eight grid words: word m is
+/// [`IQ3S_GRID`] entry `qs[8b + m] | (bit m of qh[b]) << 8` (four magnitudes), and
+/// its value n takes bit `n % 8` of `signs[4b + n / 8]`, set meaning negative. The
+/// scale is nibble `b & 1` of `scales[b / 2]`, weight 2s + 1.
+const IQ3S_BLOCK: usize = 110;
+
+/// ik's `DequantizerIQ3S::minv`: the offset that puts the signed grid values
+/// (magnitudes 1..15) on maddubs' unsigned side, 1..31.
+const IQ3S_MIN: i8 = 16;
+
+/// ik's `DequantizerIQ3S::make_scales`: the eight sub-block weights `2s + 1` on i16
+/// lanes in sub-block order (the four low nibbles interleaved with the four high).
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
+/// `blk` must point at a whole IQ3_S block.
+#[inline(always)]
+unsafe fn iq3s_scales(blk: *const u8) -> __m128i {
+    // SAFETY: one unaligned u32 read of the four scale bytes inside the block.
+    unsafe {
+        let aux = (blk.add(106) as *const u32).read_unaligned();
+        let lo = aux & 0x0f0f_0f0f;
+        let hi = (aux >> 4) & 0x0f0f_0f0f;
+        let both = _mm_set_epi32(0, 0, hi as i32, lo as i32);
+        let s8 = _mm_shuffle_epi8(both, _mm_set1_epi64x(0x0703_0602_0501_0400));
+        _mm_or_si128(
+            _mm_slli_epi16::<1>(_mm_cvtepi8_epi16(s8)),
+            _mm_set1_epi16(1),
+        )
+    }
+}
+
+/// One IQ3_S sub-block's 32 values on maddubs' unsigned side: ik's
+/// `IndexHelperIQ3S::make2` (the nine-bit indices built in SIMD and stored, then
+/// eight scalar grid loads), `SignHelper::sign_4_values` (the sign bytes' bits to
+/// ±1 per value through `sign_epi8`) and the offset [`IQ3S_MIN`].
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
+/// `blk` must point at a whole IQ3_S block and `b` be below 8.
+#[inline(always)]
+unsafe fn iq3s_values(blk: *const u8, b: usize) -> __m256i {
+    // SAFETY: sub-block b's eight index bytes, its qh byte and its four sign bytes,
+    // inside the block.
+    unsafe {
+        let idx_l = _mm256_cvtepu8_epi32(_mm_loadl_epi64(blk.add(2 + 8 * b) as *const __m128i));
+        let qh = _mm256_set1_epi32(i32::from(*blk.add(66 + b)));
+        // Lane l shifts bit l of qh up to bit 8.
+        let idx_h = _mm256_and_si256(
+            _mm256_sllv_epi32(qh, _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8)),
+            _mm256_set1_epi32(256),
+        );
+        let mut ix = [0u32; 8];
+        _mm256_storeu_si256(
+            ix.as_mut_ptr() as *mut __m256i,
+            _mm256_or_si256(idx_h, idx_l),
+        );
+        // SAFETY: each index is a byte, or a byte and 256: below 512.
+        let q = _mm256_set_epi32(
+            *IQ3S_GRID.get_unchecked(ix[7] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[6] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[5] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[4] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[3] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[2] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[1] as usize) as i32,
+            *IQ3S_GRID.get_unchecked(ix[0] as usize) as i32,
+        );
+        // Value n of the 32 selects sign byte n / 8, bit n % 8.
+        let mask1 = _mm256_set_epi64x(
+            0x0303_0303_0303_0303,
+            0x0202_0202_0202_0202,
+            0x0101_0101_0101_0101,
+            0,
+        );
+        let mask2 = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let sign_bytes = (blk.add(74 + 4 * b) as *const u32).read_unaligned();
+        let bits = _mm256_and_si256(
+            _mm256_shuffle_epi8(_mm256_set1_epi32(sign_bytes as i32), mask1),
+            mask2,
+        );
+        let signs = _mm256_or_si256(_mm256_cmpeq_epi8(bits, mask2), _mm256_set1_epi8(1));
+        _mm256_add_epi8(_mm256_sign_epi8(q, signs), _mm256_set1_epi8(IQ3S_MIN))
+    }
+}
+
+/// AVX2+FMA+F16C row dot: IQ3_S weights against a Q8_K column.
+///
+/// ik's form, as [`dot_iq3xxs_q8k_avx2`]'s: a sub-block's 32 grid values take
+/// their signs through `sign_epi8`, then +16; the offset comes back out through the
+/// column's 16-value sums, `(-16·d)·dy · Σ s·bsum`, one fmadd per block ahead of the
+/// codes' fmadd, with `d` the f16 scale undivided. i16: a maddubs pair peaks at
+/// 2·31·128 = 7936 on any column bytes, so saturation is unreachable. i32: a lane
+/// sums 8 sub-blocks × 31 × 2 × 7936 < 2^24, so its f32 conversion is exact.
+///
+/// TWIN of [`dot_iq3s_q8k_tile_avx2`], its column tile, and of
+/// [`dot_iq3xxs_q8k_avx2`] past the weight decode: any edit to the float or integer
+/// steps of one is made in all three.
+///
+/// # Safety
+/// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_iq3s_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
+    unsafe {
+        // Scales8KBase::shuffle: scale b onto the two 16-value sums of sub-block b.
+        let mins_lo = _mm_set_epi32(0x0706_0706, 0x0504_0504, 0x0302_0302, 0x0100_0100);
+        let mins_hi = _mm_set_epi32(0x0f0e_0f0e, 0x0d0c_0d0c, 0x0b0a_0b0a, 0x0908_0908);
+        let mut accd = _mm256_setzero_ps();
+
+        for i in 0..nb {
+            let blk = wrow.as_ptr().add(IQ3S_BLOCK * i);
+            // SAFETY: one unaligned u16 read inside the block.
+            let d = f16c_to_f32((blk as *const u16).read_unaligned());
+            let sc16 = iq3s_scales(blk);
+            let mins = _mm256_set_m128i(
+                _mm_shuffle_epi8(sc16, mins_hi),
+                _mm_shuffle_epi8(sc16, mins_lo),
+            );
+            let all_scales = _mm256_set_m128i(sc16, sc16);
+            let dmin = -d * f32::from(IQ3S_MIN);
+
+            let col = acol.as_ptr().add(Q8K_STRIDE * i);
+            // SAFETY: the column block's f32 d @0 and its i16 bsums[16] @264.
+            let dy = (col as *const f32).read_unaligned();
+            let bsums = _mm256_loadu_si256(col.add(264) as *const __m256i);
+            accd = _mm256_fmadd_ps(
+                _mm256_set1_ps(dmin * dy),
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(mins, bsums)),
+                accd,
+            );
+
+            let mut sumi = _mm256_setzero_si256();
+            for j in 0..2 {
+                let mut p = [_mm256_setzero_si256(); 4];
+                for (k, pk) in p.iter_mut().enumerate() {
+                    let b = 4 * j + k;
+                    let values = iq3s_values(blk, b);
+                    // set_scales_8: sub-block b's scale on every i16 lane.
+                    let sc = _mm256_shuffle_epi8(
+                        all_scales,
+                        _mm256_set1_epi16(((2 * b) | ((2 * b + 1) << 8)) as i16),
+                    );
+                    // SAFETY: 32 codes of sub-block b inside the column block.
+                    let q8 = _mm256_loadu_si256(col.add(8 + 32 * b) as *const __m256i);
+                    *pk = _mm256_madd_epi16(sc, _mm256_maddubs_epi16(values, q8));
+                }
+                // multiply_add: exact i32 sums, so the order is free; ik's is kept.
+                if j == 0 {
+                    sumi = _mm256_add_epi32(
+                        _mm256_add_epi32(p[0], p[2]),
+                        _mm256_add_epi32(p[1], p[3]),
+                    );
+                } else {
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p[0], p[2]));
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p[1], p[3]));
+                }
+            }
+            accd = _mm256_fmadd_ps(_mm256_set1_ps(d * dy), _mm256_cvtepi32_ps(sumi), accd);
+        }
+
+        hsum_float_8(accd)
+    }
+}
+
+/// The IQ3_S tile: one row's blocks against up to [`TILE_COLS`] Q8_K columns. Per
+/// block the weight side once — the eight sub-blocks' values with their signs and
+/// the offset, each sub-block's scale vector, the bsums fold's `mins`, `d` — then per
+/// column [`q8k_block_step`], the one-column kernel's float and integer steps (shared
+/// with the IQ3_XXS and IQ4_XS tiles). Each column keeps its own `accd` and ends in
+/// `hsum_float_8`, so column `c` sees the one-column kernel's operations in its order.
+///
+/// TWIN of [`dot_iq3s_q8k_avx2`]: any edit to the float or integer steps of one is
+/// made in both.
+///
+/// # Safety
+/// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ3_S blocks and each
+/// `acols[c]` point at `nb` Q8_K blocks.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_iq3s_q8k_tile_avx2<const C: usize>(
+    wrow: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [f32; C] {
+    const { assert!(C != 0 && C <= TILE_COLS) };
+    // SAFETY: AVX2+FMA+F16C present, `wrow` holds nb blocks and every column
+    // nb Q8_K blocks per contract.
+    unsafe {
+        // Scales8KBase::shuffle: scale b onto the two 16-value sums of sub-block b.
+        let mins_lo = _mm_set_epi32(0x0706_0706, 0x0504_0504, 0x0302_0302, 0x0100_0100);
+        let mins_hi = _mm_set_epi32(0x0f0e_0f0e, 0x0d0c_0d0c, 0x0b0a_0b0a, 0x0908_0908);
+        let mut accd = [_mm256_setzero_ps(); C];
+
+        for i in 0..nb {
+            let blk = wrow.as_ptr().add(IQ3S_BLOCK * i);
+            // SAFETY: one unaligned u16 read inside the block.
+            let d = f16c_to_f32((blk as *const u16).read_unaligned());
+            let sc16 = iq3s_scales(blk);
+            let mins = _mm256_set_m128i(
+                _mm_shuffle_epi8(sc16, mins_hi),
+                _mm_shuffle_epi8(sc16, mins_lo),
+            );
+            let all_scales = _mm256_set_m128i(sc16, sc16);
+            let dmin = -d * f32::from(IQ3S_MIN);
+
+            let mut values = [_mm256_setzero_si256(); 8];
+            let mut scales = [_mm256_setzero_si256(); 8];
+            for b in 0..8 {
+                values[b] = iq3s_values(blk, b);
+                // set_scales_8: sub-block b's scale on every i16 lane.
+                scales[b] = _mm256_shuffle_epi8(
+                    all_scales,
+                    _mm256_set1_epi16(((2 * b) | ((2 * b + 1) << 8)) as i16),
+                );
+            }
+
+            for (col, a) in acols.iter().zip(accd.iter_mut()) {
+                // SAFETY: the column's block i, inside the validated column.
+                *a = q8k_block_step(&values, &scales, mins, d, dmin, col.add(Q8K_STRIDE * i), *a);
+            }
+        }
+
+        // Reduction order is load-bearing: the one-column kernel's, per column.
+        let mut out = [0.0f32; C];
+        for (o, a) in out.iter_mut().zip(&accd) {
+            *o = hsum_float_8(*a);
+        }
+        out
+    }
+}
+
+/// Mirror of `dot_iq3s_q8k_avx2`, bit-identical: the integer lanes are exact sums
+/// (no saturation, no wrap — the kernel's bounds), so they are computed directly; the
+/// two fmadds per block and the final reduction are the kernel's.
+fn dot_iq3s_q8k_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    let mut accd = [0.0f32; 8];
+    for i in 0..nb {
+        let blk = &wrow[IQ3S_BLOCK * i..IQ3S_BLOCK * (i + 1)];
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..66];
+        let qh = &blk[66..74];
+        let signs = &blk[74..106];
+        let scales = &blk[106..110];
+        let sc: [i32; 8] =
+            std::array::from_fn(|b| 2 * i32::from((scales[b / 2] >> (4 * (b % 2))) & 0x0f) + 1);
+        let dmin = -d * f32::from(IQ3S_MIN);
+
+        let col = &acol[Q8K_STRIDE * i..Q8K_STRIDE * (i + 1)];
+        let dy = f32::from_le_bytes(col[0..4].try_into().unwrap());
+        let bsum = |t: usize| i32::from(i16::from_le_bytes([col[264 + 2 * t], col[265 + 2 * t]]));
+        for (l, a) in accd.iter_mut().enumerate() {
+            let m = sc[l] * bsum(2 * l) + sc[l] * bsum(2 * l + 1);
+            *a = (dmin * dy).mul_add(m as f32, *a);
+        }
+
+        let mut sumi = [0i32; 8];
+        for (b, &s) in sc.iter().enumerate() {
+            for n in 0..32 {
+                let word = n / 4;
+                let idx = usize::from(qs[8 * b + word]) | (usize::from((qh[b] >> word) & 1) << 8);
+                let mag = IQ3S_GRID[idx].to_le_bytes()[n % 4] as i8;
+                let v = if (signs[4 * b + n / 8] >> (n % 8)) & 1 != 0 {
+                    -mag
+                } else {
+                    mag
+                };
+                let u = i32::from(v.wrapping_add(IQ3S_MIN) as u8);
                 let a = i32::from(col[8 + 32 * b + n] as i8);
                 sumi[n / 4] += s * u * a;
             }
@@ -7025,7 +7331,7 @@ unsafe fn dot_iq4xs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// columns. Per block the weight side once — the six-bit scales, the kvalues
 /// codes of the eight sub-blocks, `mins`, `d` — then per column
 /// [`q8k_block_step`], the one-column kernel's steps (shared with the IQ3_XXS
-/// tile). Each column keeps its own `accd` and ends in `hsum_float_8`. The
+/// and IQ3_S tiles). Each column keeps its own `accd` and ends in `hsum_float_8`. The
 /// maddubs saturation of 241-weighted codes happens inside the per-column
 /// step, on the column's own bytes, as in the one-column kernel.
 ///

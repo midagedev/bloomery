@@ -1,0 +1,79 @@
+# The IQ3_S x Q8_K single-core rate, never measured: the k1iq3s round's kernel
+# (dot_iq3s_q8k_avx2, the port of ik's mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3S, 1>) against
+# its derivation, with ik's own iq3s_rate beside it, in one qdot-rate sitting.
+# Anchors [measured, rig-log 2026-10-08 #mxfp4-core-rate]: our IQ3_XXS 5.0-5.2 GB/s at
+# k = 4096 (98 B a block, so 19.2 ns a block), ik's IQ3_XXS 3.2, Q3_K 10.7-11.0 at k = 2048.
+# Census of the per-block loop in the release disassembly [counted at build time, objdump -d
+# of target/release/qdot-rate built from this tree on the box; not a runtime number]:
+#   IQ3_XXS: 309 instructions, 183 with a memory source (64 index-byte loads, 64 grid words,
+#     32 sign words, the aux words), 96 shuffle-class (48 vpinsrd of the grid words, 16
+#     vpunpcklqdq, 16 vinserti128, 8 vpbroadcastw ...), no xmm<->gpr transfer.
+#   IQ3_S:   333 instructions, 109 with a memory source (64 grid words, 8 qs, 8 qh, 8 sign
+#     words), 145 shuffle-class (49 vpinsrd of the grid words, 48 vpextrd + 8 vextracti128
+#     that take the index vector apart, 9 vpshufb of the signs, 8 vinserti128, 8 vpbroadcastw
+#     ...), 30 xmm<->gpr vmovd. The compiler folded the source's index store and reload
+#     (ik's union, 64 reloads) into those extractions, so the 128 scalar table loads of the
+#     source are 64 grid loads plus 72 shuffle-port extractions. A build that kept the
+#     round trip (volatile reads) left the j loop rolled and spilled: 425 instructions a
+#     block, so it was not taken.
+# Rate R = R_IQ3_XXS x (110 B / 98 B = 1.122) / cost ratio, three bounds [derived]:
+#   instruction count (same IPC as the XXS kernel): ratio 333/309 = 1.08, R = 5.2-5.4;
+#   shuffle-port work (2 pipes assumed, the XXS kernel not bound by it: 48 cycles against
+#     its ~86 at 4.5 GHz; the IQ3_S kernel at (145 + 30)/2 = 88 cycles): R = 5.6 at 4.5 GHz
+#     and 4.5 at 3.6 GHz, since the XXS anchor's clock is not in the record;
+#   load slots (3 a cycle, 109 against 183): the XXS kernel's bound, not this one's.
+# The band is 4.6-6.2 with the point near 5.3 [derived]. The design's 5.6-7.6 (quantwide
+# design 4.2) counted ik's 128 table loads against our 168 and did not see the extraction.
+# ik's IQ3_S [derived from ik's IQ3_XXS 3.2, the same ratio]: 3.2 x 1.122 / (0.76..1.08) =
+# 3.3-4.7 GB/s, recorded, not ruled — the gap between ik's IQ3_XXS and ours is not in the
+# counts.
+# Resource timeline of one 256-value block of one row, one thread [derived]: host CPU
+# 17.7-23.9 ns at R = 6.2-4.6 (the decode, 333 instructions), DRAM 110 B at the thread's
+# 1/32 share of ~135-145 GB/s (4.2-4.5 GB/s) = 24-26 ns, at the one thread alone (this
+# sitting) 110 B at its stream rate (>= 12 GB/s) <= 9.2 ns; card, PCIe and NVMe 0. The decode
+# wall is max(CPU, DRAM): at 32 threads DRAM's 24-26 ns shadows the CPU term for R >= 4.4,
+# so the rate matters only where the union model's fixed term a = 40.4 us is added to the
+# compute (quantwide design 4.2: the break-even R* = 6.2-8.6 there, 4.3-4.6 per layer).
+# Per expert gate/up (7.21 MB, 4096 rows x 1760 B): c = 7.21 MB / (32 R) = 36.3-49.0 us
+# at R = 6.2-4.6, against the union model's W - a = 40.0-46.0 us.
+kind: calibration
+question: does the IQ3_S x Q8_K dot's single-core rate at k = 4096 (GLM-5.3-Flash UD-IQ4_XS
+  gate/up) hold the host leg DRAM-bound — per core at or above the 8.6 GB/s break-even
+  of the union model, or at least the 4.6 GB/s of the per-layer model — and is it inside
+  the derived band?
+term: qdot-rate single-thread GB/s of IQ3_S rows at k = 4096 (1760 B/row), 360,448 rows x
+  6 passes, one pinned core (BLOOMERY_RATE_CORE), the runner's rounds alternating with
+  ik's iq3s_rate in one lease; the same log's IQ3_XXS@4096 row is the same-run anchor
+  (ratio R_IQ3_S / R_IQ3_XXS predicted 0.9-1.2 [derived]: the band over the anchor's
+  5.0-5.2, 1.04 at the instruction ratio)
+unit: GB/s
+predict: 4.6..6.2
+condition: the lead runs, after just build-ref (so iq3s_rate exists and iq3s-ik-dot.txt is
+  dumped), BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/iq3s-rate.card'
+  just measure-qdot-rate 3 on this tree, about 10-12 minutes [derived from the 10-08
+  sitting's shape, two rows more]; the recipe builds qdot-rate itself, the runner pins
+  one core and reverses arm order every round, the witness shows no other compute on
+  the box. The rows of docs/cards/iqhost-rate.card ride in the same log — IQ4_NL@640,
+  Q5_1@640, IQ4_XS@2560, Q4_K@2560 — and are ruled by that card's own verdict
+  (card.py verdict docs/cards/iqhost-rate.card over their per-round ratios), not here
+reason: sets the IQ3_S per-core cost c in docs/plan.md:77's host-union row (t(m) =
+  max(W, a + c·m)) for GLM-5.3-Flash UD-IQ4_XS (82 of its routed IQ3_S gate/up stacks),
+  and decides whether a decode-leg kernel round or the fixed-term read (quantwide design
+  4.4 item 2) comes next; why now: the kernel is written and gated, and the engine can
+  load an IQ3_S stack on the host the moment it lands, so its rate is the price of that load
+decide-in: the leg is compute-bound only under the union model (4.6 <= R < 8.6): do not
+  touch the kernel; read the decode host leg's fixed term per expert off a GLM or V4.1
+  profile at BLOOMERY_PROFILE level 1 (design 4.4 item 2) and price the step with it; if
+  the leg runs within 10 % of bytes/BW the per-layer model holds (R* = 4.3-4.6) and R is
+  enough as it stands; a kernel round (the index extraction, below) only if that read
+  shows the leg compute-bound
+decide-below: under 4.6 the per-layer break-even is missed and the leg is compute-bound
+  under both models: profile qdot-rate (perf record -e cpu-clock, core pinned) before any
+  change; the suspects are the 48 vpextrd and 8 vextracti128 that take the index vector
+  apart and the 49 vpinsrd grid builds; price each candidate by the disassembly census
+  before coding it — the index round trip kept with the j loop unrolled by hand, 64-bit
+  extracts (vpextrq, two indices each), a gather (_mm256_i32gather_epi32) per sub-block;
+  from 4.3 to 4.6 do the fixed-term read first as well
+decide-above: over 6.2 the extraction costs less than the shuffle-port bound says: the
+  fixed-term read as for the band; from 8.6 the kernel is done (DRAM-bound under both
+  models): record the rate in docs/plan.md's host-union row and stop
