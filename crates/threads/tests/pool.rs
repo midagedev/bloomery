@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
-use threads::{chunks, pool};
+use threads::{CcdMap, chunks, pool};
 
 /// Exhaustive partition check: every `n` in 0..=257 against every `threads`
 /// in 1..=64 — chunks are contiguous, ascending, non-overlapping, their union
@@ -227,4 +227,132 @@ fn hw_topology() {
     all.dedup();
     assert_eq!(all.len(), n, "no duplicate cpu ids across CCD groups");
     assert!(!p.pin_failed(), "pinning must succeed on the box");
+}
+
+/// The map's rule, restated: participant `t` is on CCD `t % ccds` as that
+/// CCD's `t / ccds`-th participant. Over every thread and CCD count up to
+/// 64 the participants fill each CCD's ranks exactly once, a CCD holds
+/// `threads / ccds` participants (the first `threads % ccds` CCDs one more),
+/// the CCD-major lanes run CCD 0's ranks first, and the lane's CCD is the
+/// participant's.
+#[test]
+fn ccd_map_places_participants_by_the_pinning_rule() {
+    for threads in 1..=64usize {
+        for ccds in 1..=16usize {
+            let m = CcdMap::new(threads, ccds, 0);
+            let mut seen = vec![false; threads];
+            for t in 0..threads {
+                assert_eq!(m.ccd_of(t), t % ccds, "threads={threads} ccds={ccds} t={t}");
+                assert_eq!(
+                    m.rank_of(t),
+                    t / ccds,
+                    "threads={threads} ccds={ccds} t={t}"
+                );
+                assert!(m.rank_of(t) < m.width(m.ccd_of(t)));
+                let lane = m.lane_of(t);
+                assert!(
+                    !std::mem::replace(&mut seen[lane], true),
+                    "lane {lane} twice"
+                );
+                assert_eq!(m.lane_ccd(lane), m.ccd_of(t));
+            }
+            let widths: Vec<usize> = (0..ccds).map(|c| m.width(c)).collect();
+            assert_eq!(widths.iter().sum::<usize>(), threads);
+            for (c, &w) in widths.iter().enumerate() {
+                let want = threads / ccds + usize::from(c < threads % ccds);
+                assert_eq!(w, want, "threads={threads} ccds={ccds} ccd {c}");
+                assert_eq!(m.first_lane(c), widths[..c].iter().sum::<usize>());
+            }
+            assert_eq!(m.first_lane(ccds), threads);
+            assert_eq!(m.active(), ccds.min(threads));
+        }
+    }
+}
+
+/// A CCD's share of a matrix's units is as wide as its participants are
+/// many: 30 threads on four CCDs are 8/8/7/7, so 300 units cut 80/80/70/70
+/// (four equal quarters would give every CCD 75), 8 threads on three CCDs
+/// are 3/3/2, so 80 units cut 30/30/20. Every span count partitions `0..n`
+/// in CCD order, and a span is the pool's own chunks of its CCD's lanes.
+#[test]
+fn ccd_spans_follow_the_participants_per_ccd() {
+    let lens =
+        |m: CcdMap, n: usize| -> Vec<usize> { (0..m.ccds()).map(|c| m.span(n, c).len()).collect() };
+    assert_eq!(lens(CcdMap::new(30, 4, 0), 300), [80, 80, 70, 70]);
+    assert_eq!(lens(CcdMap::new(8, 3, 0), 80), [30, 30, 20]);
+    assert_eq!(lens(CcdMap::new(32, 4, 0), 2048), [512; 4]);
+    assert_eq!(lens(CcdMap::new(3, 4, 0), 30), [10, 10, 10, 0]);
+    for (threads, ccds) in [(1, 1), (8, 3), (30, 4), (32, 4), (7, 5), (64, 16), (3, 8)] {
+        let m = CcdMap::new(threads, ccds, 0);
+        for n in 0..=300usize {
+            let mut at = 0;
+            for c in 0..ccds {
+                let s = m.span(n, c);
+                assert_eq!(
+                    s.start, at,
+                    "threads={threads} ccds={ccds} n={n} ccd {c}: contiguous"
+                );
+                at = s.end;
+            }
+            assert_eq!(
+                at, n,
+                "threads={threads} ccds={ccds} n={n}: the spans cover 0..n"
+            );
+            // The span is the pool's own chunks of the CCD's lanes, joined.
+            let cs = chunks(n, threads);
+            for c in 0..ccds {
+                let lanes = m.first_lane(c)..m.first_lane(c + 1);
+                let span = m.span(n, c);
+                for lane in lanes.clone() {
+                    let chunk = &cs[lane];
+                    assert!(
+                        chunk.is_empty() || (span.start <= chunk.start && chunk.end <= span.end)
+                    );
+                }
+                let joined: usize = lanes.map(|lane| cs[lane].len()).sum();
+                assert_eq!(
+                    joined,
+                    span.len(),
+                    "threads={threads} ccds={ccds} n={n} ccd {c}"
+                );
+            }
+        }
+    }
+}
+
+/// The map against the machine: on the box every worker's pinned cpu is in
+/// the L3 group of the CCD the map names for it, the caller's too once it is
+/// pinned, the L3 bytes are read, and a spread over the pool's own groups is
+/// what the pool reports. An independent path from the rule's restatement
+/// above: the cpus come from `sched_setaffinity`'s arguments.
+#[test]
+#[ignore = "hw: pins the calling thread and reads /sys/devices/system/cpu topology, meaningful on the box"]
+fn hw_ccd_map_matches_the_pins() {
+    let p = pool();
+    assert!(p.pin_caller(), "pinning must succeed on the box");
+    let map = p.ccd_map().expect("every participant is pinned");
+    let topo = p.topology();
+    assert_eq!(map.threads(), p.threads());
+    assert_eq!(map.ccds(), topo.len());
+    for t in 0..p.threads() {
+        let cpu = if t + 1 < p.threads() {
+            p.worker_cpu(t).expect("a pinned worker has a cpu") as u32
+        } else {
+            u32::try_from(p.caller_cpu()).unwrap()
+        };
+        assert!(
+            topo[map.ccd_of(t)].contains(&cpu),
+            "participant {t} is pinned to cpu {cpu}, outside CCD {} {:?}",
+            map.ccd_of(t),
+            topo[map.ccd_of(t)]
+        );
+    }
+    println!(
+        "hw_ccd_map: threads={} ccds={} widths={:?} l3_bytes={}",
+        map.threads(),
+        map.ccds(),
+        (0..map.ccds()).map(|c| map.width(c)).collect::<Vec<_>>(),
+        map.l3_bytes()
+    );
+    assert!(map.l3_bytes() > 0, "the box's sysfs names its L3 size");
 }
