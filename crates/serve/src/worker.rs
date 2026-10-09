@@ -32,8 +32,9 @@
 //! panic on this thread ends the server the same way, by name.
 //!
 //! An orderly stop ([`Shared::begin_stop`]) is read before each action,
-//! start, planned prompt call and decode round of a round (at each round's
-//! top when the slots take turns): the thread ends without calling the
+//! start, planned prompt call and decode round of a round (when the slots
+//! take turns, at each round's top and before the running request's step):
+//! the thread ends without calling the
 //! engine again, and every request it holds or the board queues is answered
 //! with the stop's cause before the loop's end, which the stop waits for
 //! ([`Shared::wait_stop`]).
@@ -47,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::api::{End, EngineFailure, Stop, client_gone, relock};
+use crate::api::{Answers, End, EngineFailure, Stop, Waited, client_gone, relock};
 use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotRow, StateError};
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
@@ -165,13 +166,11 @@ pub(crate) struct Shared {
     loop_ended: Mutex<bool>,
     /// Wakes [`Shared::wait_loop_end`].
     loop_ended_c: Condvar,
-    /// The answers in flight: requests a connection dispatched whose answer
-    /// is not yet written ([`Shared::answering`]). What the orderly stop
-    /// waits for once the loop left, so the answers the halt ended reach
-    /// their clients before the process exits.
-    answers: Mutex<usize>,
-    /// Wakes [`Shared::wait_stop`] when the last answer in flight is written.
-    answers_c: Condvar,
+    /// The answers the connections are writing ([`crate::api::keep_alive`]
+    /// counts them): what the orderly stop waits for once the loop left, so
+    /// the answers the halt ended reach their clients before the process
+    /// exits.
+    pub answers: Answers,
     /// Each slot's turn, for an engine whose slots take turns; `None` for any
     /// other.
     pub turns: Mutex<Option<Vec<Turn>>>,
@@ -195,8 +194,7 @@ impl Shared {
             stop: AtomicBool::new(false),
             loop_ended: Mutex::new(false),
             loop_ended_c: Condvar::new(),
-            answers: Mutex::new(0),
-            answers_c: Condvar::new(),
+            answers: Answers::default(),
             turns: Mutex::new(None),
             end,
             sampler,
@@ -234,20 +232,6 @@ impl Shared {
         *left
     }
 
-    /// One answer in flight, from a request's dispatch until the guard drops:
-    /// taken around a connection's whole answer, so it drops once the answer
-    /// is written, its client gone or its thread panicked.
-    pub(crate) fn answering(&self) -> Answering<'_> {
-        *relock(&self.answers) += 1;
-        Answering(self)
-    }
-
-    /// The answers in flight now.
-    #[cfg(test)]
-    pub(crate) fn answers_in_flight(&self) -> usize {
-        *relock(&self.answers)
-    }
-
     /// The orderly stop's wait, inside one `bound`: the engine thread leaves
     /// its loop ([`Shared::wait_loop_end`]) — the halt closed every request's
     /// channel by then ([`Worker::halt`]) — and then every answer in flight
@@ -257,17 +241,7 @@ impl Shared {
         if !self.wait_loop_end(bound) {
             return Waited::Loop;
         }
-        let n = relock(&self.answers);
-        let (n, _) = self
-            .answers_c
-            .wait_timeout_while(n, until.saturating_duration_since(Instant::now()), |n| {
-                *n > 0
-            })
-            .unwrap_or_else(|e| e.into_inner());
-        match *n {
-            0 => Waited::Done,
-            n => Waited::Answers(n),
-        }
+        self.answers.wait(until)
     }
 
     /// Begins the server's orderly stop, the one owner `POST /shutdown` and
@@ -292,33 +266,6 @@ impl Shared {
         self.work.notify_one();
         true
     }
-}
-
-/// An answer in flight ([`Shared::answering`]); its drop counts it written.
-pub(crate) struct Answering<'a>(&'a Shared);
-
-impl Drop for Answering<'_> {
-    fn drop(&mut self) {
-        let mut n = relock(&self.0.answers);
-        *n -= 1;
-        if *n == 0 {
-            self.0.answers_c.notify_all();
-        }
-    }
-}
-
-/// How the orderly stop's wait ended ([`Shared::wait_stop`]).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Waited {
-    /// The engine thread left its loop and every answer in flight was
-    /// written.
-    Done,
-    /// The bound ran out with the engine thread still in its loop, inside
-    /// the work the stop arrived in, the requests it holds not yet answered.
-    Loop,
-    /// The loop was left, but this many answers were still being written
-    /// when the bound ran out.
-    Answers(usize),
 }
 
 /// The engine thread failed; nothing more runs.
@@ -573,9 +520,10 @@ impl Worker {
     /// Nothing failed: no engine error is recorded, and no end is sent — the
     /// stop's sender already did.
     fn halt(&mut self) {
-        let cause = relock(&self.sh.stopping)
-            .clone()
-            .unwrap_or_else(|| "the server is stopping".to_owned());
+        let cause = relock(&self.sh.stopping).clone().expect(
+            "the stop's cause: Shared::begin_stop sets it before it stores the stop flag this \
+             halt was read from",
+        );
         drop(relock(&self.sh.board).kill(&cause));
         let mut held = std::mem::take(&mut self.active);
         held.extend(std::mem::take(&mut self.prompting).into_iter().map(|p| p.a));
@@ -1031,7 +979,8 @@ impl Worker {
 
     /// One step boundary: the running request's tokens in hand go out, the
     /// engine changes hands where a rule says so, and the request on it takes
-    /// one engine call.
+    /// one engine call — unless the stop was read after the change of hands,
+    /// which leaves the call to the halt at the next round's top.
     fn turn(&mut self) -> Result<(), Dead> {
         if let Some(i) = self.t().running.and_then(|r| self.index_of(r))
             && self.active[i].need.is_none()
@@ -1063,6 +1012,9 @@ impl Worker {
             }
         }
         self.show_turns();
+        if self.sh.stopped() {
+            return Ok(());
+        }
         self.step_running()
     }
 
@@ -1408,5 +1360,43 @@ impl Worker {
             })
             .collect();
         *relock(&self.sh.turns) = Some(turns);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use super::{Shared, serve};
+    use crate::api::relock;
+    use crate::genloop::Slot;
+    use crate::sched::{Board, FifoPicker};
+    use crate::{MockEngine, sampling};
+
+    /// The halt reads the stop's cause, which [`Shared::begin_stop`] sets
+    /// before it stores the stop flag: a stop flag with no cause is that
+    /// order broken, and the engine thread ends on a panic naming it — a
+    /// defect by name, never a halt under a cause made up for it.
+    #[test]
+    fn a_stop_with_no_cause_is_a_named_panic() {
+        let sh = Arc::new(Shared::new(
+            Board::new(1, 4, Box::new(FifoPicker)),
+            mpsc::channel().0,
+            sampling::reference_factory(),
+        ));
+        sh.stop.store(true, Ordering::SeqCst);
+        // The engine loop on this thread: it reads the stop at once and halts.
+        serve(
+            Slot::with_slots(Box::new(MockEngine::new(64)), 1),
+            Arc::clone(&sh),
+        );
+        assert!(sh.wait_loop_end(Duration::ZERO), "the engine loop ended");
+        let fatal = relock(&sh.fatal).clone().unwrap_or_default();
+        assert!(
+            fatal.starts_with("the engine thread panicked: the stop's cause:"),
+            "the panic names the broken order: {fatal:?}"
+        );
     }
 }

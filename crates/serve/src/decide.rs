@@ -32,12 +32,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
 use crate::api::{
-    End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
+    Answers, End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
     fatal_health, install_signals, keep_alive, key_denied, relock, stopping, stopping_message,
     wait_end,
 };
@@ -492,6 +492,9 @@ struct Shared {
     /// The orderly stop's cause, once it began ([`Shared::begin_stop`]): the reason every decide
     /// request is refused with.
     stopping: Mutex<Option<String>>,
+    /// The answers the connections are writing: what the orderly stop waits for before the
+    /// process exits, a decision in the decider when the stop began among them.
+    answers: Answers,
     /// Where that failure goes, to end [`DecideServer::run`].
     end: mpsc::Sender<End>,
 }
@@ -676,6 +679,7 @@ impl DecideServer {
                 engine: format!("the decider of {}", seated.name),
                 fatal: Mutex::new(None),
                 stopping: Mutex::new(None),
+                answers: Answers::default(),
                 end,
             }),
             ended,
@@ -710,13 +714,16 @@ impl DecideServer {
         });
         let conn = Arc::clone(&shared);
         accept(listener, shared.end.clone(), move |stream| {
-            keep_alive(stream, |req, w| answer(&conn, req, w));
+            keep_alive(stream, &conn.answers, |req, w| answer(&conn, req, w));
         });
         // `shared` holds a sender, so the channel cannot close while we wait.
-        // An orderly stop never returns: it ends the process instead.
+        // An orderly stop never returns: it ends the process once the answers
+        // in flight are written.
         match wait_end(&ended, FATAL_LINGER) {
             Ended::Error(e) => e,
-            Ended::Stop(cause) => exit_shutdown(&cause, None),
+            Ended::Stop(cause) => {
+                exit_shutdown(&cause, |bound| shared.answers.wait(Instant::now() + bound))
+            }
         }
     }
 }
@@ -805,6 +812,7 @@ mod tests {
             engine: "the decider of m.gguf".to_owned(),
             fatal: Mutex::new(None),
             stopping: Mutex::new(None),
+            answers: Answers::default(),
             end: mpsc::channel().0,
         }
     }
@@ -922,8 +930,11 @@ mod tests {
     }
 
     /// A decide server over `decider`, its lock poisoned first when `poison`, run on a free port;
-    /// what `run` returns arrives on the receiver.
-    fn serving(decider: Box<dyn Decide>, poison: bool) -> (SocketAddr, mpsc::Receiver<ServeError>) {
+    /// what `run` returns arrives on the receiver, beside the state its connections share.
+    fn serving(
+        decider: Box<dyn Decide>,
+        poison: bool,
+    ) -> (SocketAddr, mpsc::Receiver<ServeError>, Arc<Shared>) {
         let seated = Seated {
             routes: ROUTES,
             name: "m.gguf".to_owned(),
@@ -939,9 +950,10 @@ mod tests {
             assert!(held.is_err() && lock.is_poisoned());
         }
         let addr = server.local_addr().expect("addr");
+        let shared = Arc::clone(&server.shared);
         let (tx, ran) = mpsc::channel();
         std::thread::spawn(move || tx.send(server.run()));
-        (addr, ran)
+        (addr, ran, shared)
     }
 
     /// A decider that cannot answer any more ends the server, as an engine ends
@@ -961,7 +973,7 @@ mod tests {
         // The servers linger at once.
         let mut lingering = Vec::new();
         for (decider, poison, why) in cases {
-            let (addr, ran) = serving(decider, poison);
+            let (addr, ran, _) = serving(decider, poison);
             let since = std::time::Instant::now();
             let (status, body) = call(addr, "POST", "/rerank");
             assert!(
@@ -995,6 +1007,72 @@ mod tests {
             let f = f.to_string();
             assert!(f.contains(why), "{f}");
         }
+    }
+
+    /// A decider whose every decision says it began, then waits for the test's permit: the
+    /// decision in flight when the stop begins.
+    struct Held {
+        began: mpsc::Sender<()>,
+        permits: mpsc::Receiver<()>,
+    }
+
+    impl Decide for Held {
+        fn decide(&mut self, _: &str) -> Result<Decided, DecideError> {
+            let _ = self.began.send(());
+            let _ = self.permits.recv();
+            Ok(Decided {
+                body: r#"{"a":1}"#.to_owned(),
+                prompt_n: 3,
+                prompt_ms: 1.0,
+                head_ms: 2.0,
+            })
+        }
+
+        fn props(&self) -> Value {
+            json!({})
+        }
+    }
+
+    /// The decision server's stop waits for its answers in flight, the owner the generative
+    /// server's stop waits on too ([`Answers`]): a decision in the decider when the stop begins
+    /// holds the wait until its answer is written, and its client reads that answer whole.
+    #[test]
+    fn the_stop_waits_for_a_decision_in_flight() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let (began, started) = mpsc::channel();
+        let (permit, permits) = mpsc::channel();
+        let (addr, _ran, shared) = serving(Box::new(Held { began, permits }), false);
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write!(
+            client,
+            "POST /rerank HTTP/1.0\r\nContent-Length: 2\r\n\r\n{{}}"
+        )
+        .expect("write");
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the decision began");
+        assert!(shared.begin_stop("SIGINT"), "first cause");
+        let bound = Duration::from_millis(400);
+        assert_eq!(
+            shared.answers.wait(Instant::now() + bound),
+            crate::api::Waited::Answers(1),
+            "the decision's answer was in flight"
+        );
+        permit.send(()).expect("the decider holds its gate");
+        assert_eq!(
+            shared
+                .answers
+                .wait(Instant::now() + Duration::from_secs(10)),
+            crate::api::Waited::Done,
+            "the answer was written"
+        );
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).expect("read");
+        assert!(
+            raw.starts_with("HTTP/1.0 200") && raw.contains(r#"{"a":1,"#),
+            "the decision's answer: {raw}"
+        );
     }
 
     #[test]
