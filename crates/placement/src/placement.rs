@@ -2666,7 +2666,7 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
     // The room binds a split plan: its headroom is what the room leaves
     // past the arena (`room` here) and the plan's host need.
     plan.host.headroom_bytes =
-        i128::from(room) - i128::from(workstation::HostNeed::of(plan, 0).bytes());
+        i128::from(room) - i128::from(workstation::HostNeed::of(plan, 0).plan_bytes());
     Ok(())
 }
 

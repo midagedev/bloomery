@@ -784,7 +784,13 @@ fn run() -> Result<(), GateError> {
     )?;
     // `room`'s plan terms: the host need, the churn pool the residency
     // holds beside it, and the headroom the split left.
-    let need = HostNeed::of(&plan, 0).bytes();
+    // PIN(2026-10-09): `HostNeed::bytes` counts the plan's NVMe tier arena,
+    // so the clause reads `plan_bytes` — the need with the arena out — and
+    // adds the arena beside it: need + arena + pool fits the room, and the
+    // headroom is what the room leaves past the arena and the need. Reading
+    // `bytes` here counts the arena twice, once inside the need and once as
+    // the clause's own term.
+    let need = HostNeed::of(&plan, 0).plan_bytes();
     let pool = match residency {
         Residency::Mid { pinned, .. } => {
             ChurnPool::of(&plan, CARD38, pinned)

@@ -380,7 +380,9 @@ pub const CACHE_RAM_CAP: u64 = 8192 << 20;
 /// (`workstation::host_available_read`) — leave past the plan's host need,
 /// the residency's churn pool, the NVMe expert tier's arena
 /// ([`CacheRam::of_tier`]) and one sequence's checkpoints
-/// ([`checkpoint_bytes`]), 0 when nothing is left.
+/// ([`checkpoint_bytes`]), 0 when nothing is left — a zero the line's `why`
+/// names ([`CacheRam::why`]), since a load with no prompt cache still
+/// serves correctly, every state recomputed.
 pub struct CacheRam {
     pub ram: u64,
     /// `--cache-ram` given, or the default's terms.
@@ -394,10 +396,15 @@ pub struct CacheRam {
     /// The residency's churn pool, 0 without one.
     pub pool: u64,
     /// The plan's NVMe expert tier arena, 0 without one: the anonymous
-    /// bytes the tier's slots fill beside the plan's own host need, which
-    /// [`HostNeed`] does not count (the room shaped the dial that picked
-    /// the arena, so the plan's terms already sit inside it).
+    /// bytes the tier's slots fill beside the plan's own host terms. Inside
+    /// `need` already ([`HostNeed::bytes`] counts the arena); kept here for
+    /// the line.
     pub tier: u64,
+    /// Why the default budget is 0, its arithmetic named for the line's
+    /// `why=` term: the reading left nothing past the need, the pool and
+    /// one sequence's checkpoints. `None` for a budget above 0 and for a
+    /// set one (`--cache-ram 0` is the caller's own ask).
+    pub why: Option<String>,
 }
 
 impl CacheRam {
@@ -417,7 +424,8 @@ impl CacheRam {
     }
 
     /// [`CacheRam::of`] beside an NVMe expert tier whose arena reserves
-    /// `tier` bytes: the default takes only what the host tier leaves —
+    /// `tier` bytes — inside `need` already ([`HostNeed::bytes`] counts the
+    /// arena), so the default takes only what `need` and the pool leave:
     /// the arena's pages are anonymous, so beside the cache they are the
     /// kernel's OOM or swap, not a page it reclaims.
     pub fn of_tier(
@@ -427,14 +435,30 @@ impl CacheRam {
         tier: u64,
     ) -> Result<CacheRam, GateError> {
         let (available, reading) = workstation::host_available_read()?;
-        let ram = set.unwrap_or_else(|| {
-            let left = i128::from(available)
-                - i128::from(need)
-                - i128::from(pool)
-                - i128::from(tier)
-                - i128::from(checkpoint_bytes(1));
-            u64::try_from((left / 2).max(0)).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP))
-        });
+        Self::at(set, (available, reading), need, pool, tier)
+    }
+
+    /// [`CacheRam::of_tier`] at a host reading already taken. A `need`
+    /// under the `tier` it holds is refused by name: it is a need read
+    /// without the arena, and the budget would take the arena's bytes.
+    fn at(
+        set: Option<u64>,
+        (available, reading): (u64, HostRead),
+        need: u64,
+        pool: u64,
+        tier: u64,
+    ) -> Result<CacheRam, GateError> {
+        if tier > need {
+            return Err(format!(
+                "the prompt cache's need {need} B is under the NVMe tier arena {tier} B it holds: \
+                 a need read without the arena (HostNeed::bytes counts it)"
+            )
+            .into());
+        }
+        let (ram, why) = match set {
+            Some(ram) => (ram, None),
+            None => Self::default_of(available, need, pool),
+        };
         Ok(CacheRam {
             ram,
             set: set.is_some(),
@@ -443,16 +467,43 @@ impl CacheRam {
             need,
             pool,
             tier,
+            why,
         })
+    }
+
+    /// The default budget ([`CacheRam`]'s doc): half of what `available`
+    /// leaves past `need`, `pool` and one sequence's checkpoints, capped at
+    /// [`CACHE_RAM_CAP`]. A leftover of nothing is a named record, not a
+    /// silent zero: the seat serves correctly without a prompt cache (every
+    /// state recomputed), so the line states the arithmetic that left
+    /// nothing instead of the load refusing.
+    fn default_of(available: u64, need: u64, pool: u64) -> (u64, Option<String>) {
+        let checkpoints = checkpoint_bytes(1);
+        let left =
+            i128::from(available) - i128::from(need) - i128::from(pool) - i128::from(checkpoints);
+        if left / 2 <= 0 {
+            return (
+                0,
+                Some(format!(
+                    "the reading {available} B leaves {left} B past need {need} B + pool {pool} B \
+                     + checkpoints {checkpoints} B: no prompt cache, every state recomputed"
+                )),
+            );
+        }
+        (
+            u64::try_from(left / 2).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP)),
+            None,
+        )
     }
 
     /// The `cache` line's terms, the seat's own fields to follow: `cache
     /// ram=… rule=set|default available=… read=… need=… pool=… tier=…
     /// checkpoints=…`, `read` the reading that gave `available`
-    /// ([`HostRead::word`]).
+    /// ([`HostRead::word`]); a default budget of 0 carries `why=…`, the
+    /// arithmetic that left nothing ([`CacheRam::why`]).
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
+        let line = format!(
             "cache ram={} rule={} available={} read={} need={} pool={} tier={} checkpoints={}",
             self.ram,
             if self.set { "set" } else { "default" },
@@ -462,7 +513,11 @@ impl CacheRam {
             self.pool,
             self.tier,
             checkpoint_bytes(1)
-        )
+        );
+        match &self.why {
+            Some(why) => format!("{line} why={why}"),
+            None => line,
+        }
     }
 }
 
@@ -3063,6 +3118,85 @@ mod tests {
                 link.tx = None;
                 worker.join().expect("the file thread");
             }
+        }
+    }
+
+    mod cache_ram {
+        use super::super::{CacheRam, HostRead, checkpoint_bytes};
+
+        /// The default budget's zero is a named record, not a silent one: a
+        /// reading that leaves nothing past the need, the pool and one
+        /// sequence's checkpoints gives `ram=0` with a `why=` naming the
+        /// arithmetic, and the `cache` line carries it; a leftover halves
+        /// under the cap with no why, and one byte left halves to a named
+        /// zero too.
+        #[test]
+        fn a_default_budget_of_zero_names_its_terms() {
+            let checkpoints = checkpoint_bytes(1);
+            let (ram, why) = CacheRam::default_of(10_000 + checkpoints, 6_000, 1_000);
+            assert_eq!((ram, why.is_none()), (1_500, true));
+            for available in [6_000 + 1_000 + checkpoints, 6_000 + 1_000 + checkpoints + 1] {
+                let (ram, why) = CacheRam::default_of(available, 6_000, 1_000);
+                assert_eq!(ram, 0, "nothing left at {available} B");
+                let why = why.expect("the zero is named");
+                for part in [
+                    format!("the reading {available} B leaves"),
+                    "past need 6000 B + pool 1000 B".to_owned(),
+                    format!("checkpoints {checkpoints} B"),
+                    "no prompt cache".to_owned(),
+                ] {
+                    assert!(why.contains(&part), "{part:?} in {why}");
+                }
+            }
+            let (_, why) = CacheRam::default_of(6_000, 6_000, 1_000);
+            let line = CacheRam {
+                ram: 0,
+                set: false,
+                available: 6_000,
+                reading: HostRead::Given,
+                need: 6_000,
+                pool: 1_000,
+                tier: 0,
+                why,
+            }
+            .line();
+            assert!(line.contains("ram=0"), "{line}");
+            assert!(line.contains(" why=the reading 6000 B leaves"), "{line}");
+        }
+
+        /// A paged plan's budget counts the arena once: the need carries it
+        /// (`HostNeed::bytes`), so the budget is the old by-hand
+        /// subtraction's — the reading less the arena-free need, the pool,
+        /// the arena and one sequence's checkpoints, halved — and the line
+        /// still prints the arena as `tier`. A need under the arena it
+        /// holds, read without it, is refused by name.
+        #[test]
+        fn a_paged_budget_counts_the_arena_once() {
+            let checkpoints = checkpoint_bytes(1);
+            let (plan, pool, arena) = (6_000u64, 1_000u64, 2_000u64);
+            let available = 100_000 + checkpoints;
+            let old = (available - plan - pool - arena - checkpoints) / 2;
+            let c = CacheRam::at(
+                None,
+                (available, HostRead::Given),
+                plan + arena,
+                pool,
+                arena,
+            )
+            .expect("the budget");
+            assert_eq!((c.ram, c.tier, c.need), (old, arena, plan + arena));
+            assert!(c.line().contains(" tier=2000 "), "{}", c.line());
+            let Err(e) = CacheRam::at(
+                None,
+                (available, HostRead::Given),
+                plan - 5_000,
+                pool,
+                arena,
+            ) else {
+                panic!("a need without its arena is refused");
+            };
+            let e = e.to_string();
+            assert!(e.contains("under the NVMe tier arena 2000 B"), "{e}");
         }
     }
 }
