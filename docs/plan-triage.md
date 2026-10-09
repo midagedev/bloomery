@@ -2,6 +2,55 @@
 
 여기는 **아직 할 일만** 있다. 2026-09-25 새벽에 다시 썼다 — 그 전 판(라운드 보고 절 스무 개와 09-23 GPU 선 목록의 원문, 155 KB)은 [`plan-ledger.md`](plan-ledger.md) 「plan-triage.md 2026-09-25 이전 판」에 원문 그대로 있고, 항목의 근거·수치·기제가 필요하면 거기서 찾는다. 항목은 받을 라운드별로 한 줄씩이고 크기는 XS·S·M·L이다. 착륙한 줄은 지운다(원문은 장부, 결과는 커밋 메시지와 rig-log). 수치는 `[유도]`가 아니면 실측이다.
 
+## Release 0.2.10 — orchestration (the user, 2026-10-10 ~08:40: "worker들과 협력해서 릴리즈를 위한 오케스트레이션 가속")
+
+Scope (user, 10-10, memory release-0210-scope): T1 pulled in (the prompt headline), vision beyond V4.1, a stepwise promo
+video from 0.2.6. Plus what is already queued: T3 (decode), r4glm + k1iq3s (GLM UD-IQ4_XS loads on big hosts),
+effortlow (GLM `reasoning_effort: "none"` → low), the gate tools. Release-quality rules hold: same-lease A/B for every
+speed piece, the user-facing pass, the dogfood pass, issue reporters thanked (@avlp12, #3).
+
+### Tracks (one owner each; file boundaries decide who edits what)
+
+| Track | Owner | Owner files | Pieces, in order |
+|---|---|---|---|
+| L — orchestration, prompt T1 (common + windows), vision, release | leader (Sonnet rounds + opus reviews) | `crates/runtime/src/{sched,splitwalk}.rs`, `crates/gpu/src/host/{leg,xstream}.rs` and `host/mod.rs`'s pick entries (R1a); `crates/gpu/src/arch/qwen3moe/wide38.rs` (R1b, until R1b lands); `crates/vision`, `crates/gpu-vision`, `serve_seats/decide.rs`, `crates/serve/src/{api,media}.rs`, README, release tools | T1 R1a + R1b (running) → opus review → hand the reviewed tips to W2 (T1 lands as one piece with R1c). effortlow (running). Vision: design (running) → R0′ refs (mmproj F16 of all four fetched to `/models/mmproj/`) → R2 tower → R3 injection → R4 seats; Clef and Qwen3.6 first; Qwen3.8's injection after T1 R1c unless the design keeps it out of `wide38.rs`/`body38.rs`. GLM NVMe tier: a Mac design round only (0.2.11). Trains, landings, release pass, video sitting + opus video round |
+| W1 — decode T3, gate tools | worker1 | `crates/threads`, `crates/model/src/{ops,moe}.rs`'s warm/dispatch, `crates/gpu/src/host/step.rs` (`wait_go`), `tools/gpu-gate.sh`, `tools/gate-paths.tsv`, `tools/recipes.py` | gp2box phase 3 (box, now) → C1 finish_keep → steps-reference pricing (#4, the lead picks from the table) → **T3 R2, stacked on t3r1's rebased tip 2ca6c2f0 now (not after 0210a)**: the step calls the warm (design-t3 §R2) + the c_hot term + the same-binary `BLOOMERY_HOST_LANES` A/B and a warm on/off A/B on the 3090 server shape |
+| W2 — prompt T1 integration, quant, fixture tier | worker2 | after R1a/R1b land: `wide38.rs`, `body38.rs`, `crates/gpu/src/host/{swap,batch}.rs`, `crates/runtime/src/xsplit.rs`, `record.rs`'s prompt kinds; now: r4glm/k1iq3s files, `crates/gpu-gates` fixture-tier files | fxr4 + fxr5 (box, after W1's phase 3) → r4glm + k1iq3s Mac-green on main (functional GLM UD-IQ4_XS load once the download ends, ~09:00) → **T1 R1c, stacked on the reviewed R1a + R1b tips as soon as the lead hands them over** (split walk on, A/B card `t1-split-pp`) → R2 (price, only if R1c's records show the A-chain binding) → R3 (return beside the union) |
+
+Shared files: `crates/levers/src/registry.rs` and `crates/gpu-gates/src/record.rs` take one owner per round; the
+second editor re-reads fresh and edits last. **No round runs `just records-refresh` or commits regenerated
+schema/plans**: the lead runs it once at each train cut, after applying the diffs in order. `docs/plan-triage.md` is
+the lead's. Before W1 starts T3 R2, it checks its files against R1a's `host/mod.rs` pick entries (`HostTier`).
+
+### Trains
+- **Tiers** (user-approved 10-09: a clean calibration moves trains to fixture A; releases keep the real tier). The
+  train029a calibration found 0 items green in fixture and red in real. 0210a carries fxstack (the fixture oracle
+  sets, item 9), so it runs **fixture + the deferred real-only list** (~61 min); 0210b runs **fixture A** (~27 min);
+  the release batch runs the real tier.
+- **0210a (cut time set from the workers' ETAs):** t3r1 2ca6c2f0, r4glm, k1iq3s, fxstack/fxr6, gatepaths2, gpuwall, C1, effortlow, T1 R1a + R1b.
+  gpuwall moves every GPU key, so the union runs the full `just affected` list. A piece not Mac-green at the cut waits
+  for 0210b. T1 and T3 R2 are not gated on 0210a: they land as whole pieces in whichever train they make. Express before it: anything whose gate set is small and disjoint
+  (effortlow if serve-only).
+- **0210b (cut when each speed piece has its A/B):** T1 (R1a–R1c, +R2/R3 if opened), T3 R2, vision R2–R4. Then the
+  release. **Vision is a cut criterion:** by the time the vision design returns its round plan, the lead tells the user
+  which family (Qwen3-VL: Clef, Qwen3.6, Qwen3.8; GLM-ViT) will not make 0.2.10, and why.
+
+### Release cut
+0210b green → `just release-build 0.2.10` → user-facing pass (candidate tarball's `bloomery-serve`, both cards, `a` and
+`bp`, a short and a ≥ 4K prompt, levers unset) → dogfood pass (candidate serve + one outsource round) → the promo sitting
+(Qwen3.8 UD-Q4_K_XL, one card, release tarballs 0.2.6 → 0.2.10, levers unset, MTP off or prompts under #3's trigger,
+one lease; first a functional check that each old tarball loads the file) → notes (thank @avlp12) → tag with the user's
+OK → opus video round.
+
+### Box queue (the lead orders it; a sitting holds `/root/bloomery-<owner>-hold`)
+1. W1 gp2box phase 3 (12–20 min) — now.
+2. W2 fxr4 (~10) + fxr5 (~8).
+3. Rounds' `--round-ledger` batches (yield to a hold).
+4. 0210a fixture + real tier (lead).
+5. W1 T3 c_hot + A/Bs; W2 T1 R1c A/B (A6000, card `t1-split-pp`).
+6. Vision gates; release pass; promo sitting.
+The GLM download (idle IO priority) ends ~09:00; a lease sitting waits on its IO pressure until then.
+
 ## Release 0.2.7 — orchestration (the user, 2026-10-07 evening)
 
 Scope, from the user: vision input, the prefill levers, a second decision model, Xiaomi MiMo-V2.6-Flash. Models are
