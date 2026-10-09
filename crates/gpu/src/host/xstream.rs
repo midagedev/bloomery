@@ -1351,13 +1351,17 @@ impl Drop for XStream {
         }
         if let Err(e) = poll_drained(&self.copy, self.cfg.deadline) {
             let why = match e {
-                Drain::Driver(e) => e.to_string(),
-                Drain::Late(w) => format!("still running after {w:?}"),
+                Drain::Driver(e) => Some(e.to_string()),
+                Drain::Exit(_) => None,
+                Drain::Late(w) => Some(format!("still running after {w:?}")),
             };
-            eprintln!(
-                "XStream drop: the copy stream did not drain ({why}); the ring and the staging \
-                 are leaked"
-            );
+            // The process's exit takes the ring and the staging with it.
+            if let Some(why) = why {
+                eprintln!(
+                    "XStream drop: the copy stream did not drain ({why}); the ring and the \
+                     staging are leaked"
+                );
+            }
             std::mem::forget(std::mem::take(&mut self.ring.parts));
             if let Lane::Pinned { shared, .. } = &self.lane {
                 std::mem::forget(Arc::clone(shared));
