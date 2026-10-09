@@ -266,7 +266,7 @@ else
 fi
 echo "BLOOMERY_RESIDENCY         C setting unset: follows the plan          parsed"
 echo "BLOOMERY_XSTREAM           A arm     unset: split under a             parsed"
-if [ -n "${BLOOMERY_BOGUS+x}" ]; then echo "bloomery-levers: BLOOMERY_BOGUS names no registry row" >&2; exit 2; fi
+if [ -n "${STUB_LEVERS_REFUSE+x}" ]; then echo "bloomery-levers: $STUB_LEVERS_REFUSE names no registry row" >&2; exit 2; fi
 SH
   cat > "$t/tree/tools/gpu-gate.sh" << 'SH'
 #!/bin/bash
@@ -369,7 +369,7 @@ PY
   out=$served st_has passage-tokens 'B2 passage 120 tokens'
   st_run plan-card 1 'plan record names another card than the 3090' STUB_PLAN_CARD=A6000 -- "$t/out12" --p1 40 --p2 120
   st_run lever-set 64 'lever\(s\) set in the environment: BLOOMERY_DRAFT' BLOOMERY_DRAFT=mtp -- "$t/out6"
-  st_run unknown-name 64 'BLOOMERY_BOGUS names no registry row' BLOOMERY_BOGUS=1 -- "$t/out7"
+  st_run unknown-name 64 'STUB_UNREGISTERED names no registry row' STUB_LEVERS_REFUSE=STUB_UNREGISTERED -- "$t/out7"
   st_run two-cards 64 'must be an RTX 3090' CUDA_VISIBLE_DEVICES=GPU-3090-STUB,GPU-A6000-STUB -- "$t/out8"
   st_run a6000-visible 64 'must be an RTX 3090' CUDA_VISIBLE_DEVICES=GPU-A6000-STUB -- "$t/out9"
   st_run relative-out 64 'absolute path' -- out10

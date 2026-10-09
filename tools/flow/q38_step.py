@@ -1028,7 +1028,7 @@ ROWS = [
      "specs/worker2/pickrule-impl/triple-report.md: stage 1 alone mean -3 ms (+95 / -100) on s0b's 3,112.8"),
     # The primary target (the 2026-10-09 amendment): the README's 3090 row.
     ("B10", B3, "abs", "prompt", 512, CONFIGS["box-3090"]["readme"][1], None, 486.0, 0, 0, "",
-     "rig-log 10-06#num3090 / README.md:106-113: pp512 486.0, --place gate, mid-p32-s1, draft off, 0.2.1 b83f1269 "
+     "rig-log 10-06#num3090 / README.md 'Numbers', the 'One RTX 3090 24 GB' table: pp512 486.0, --place gate, mid-p32-s1, draft off, 0.2.1 b83f1269 "
      "(its decode row, two requests 60.71, is the pair pass: out of scope)"),
 ]
 
