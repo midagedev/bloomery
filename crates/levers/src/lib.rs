@@ -19,8 +19,10 @@
 //! reads it: this crate; a file that still reads it in place, and the round
 //! that converts that read; nobody, for a retired name, which every reading
 //! here refuses when it is set; or, for a name that is no lever, the script
-//! or harness that owns it. A value the kind does not take is a refusal that
-//! names the lever, the value and what it takes — never the default.
+//! or harness that owns it. A lever's row also says its [`Phase`]: fixed
+//! when the model is loaded or the process starts, or changeable between
+//! calls of one loaded model. A value the kind does not take is a refusal
+//! that names the lever, the value and what it takes — never the default.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
@@ -288,15 +290,72 @@ pub(crate) struct InPlace {
     pub(crate) round: &'static str,
 }
 
+/// When a lever's effect can change: with the load (or the process start)
+/// that reads it, or between calls of one loaded model.
+///
+/// The definition: a lever is [`Phase::Runtime`] when a binary can change
+/// its effect between calls of one loaded model, with no reload, through a
+/// named API — a setter function or a per-call argument the engine takes —
+/// and the environment value is only the initial one. Every other lever row
+/// is [`Phase::Load`]: its effect is fixed when the model is loaded or the
+/// process starts — it shapes the plan, the bytes, the buffers, the captured
+/// graphs or the process's pools — or it is read once at `main` and handed
+/// down with no way to change it later; a diagnostic read once at `main`
+/// (`BLOOMERY_STEP_STATS`) is Load.
+///
+/// A lever that several model families parse is Runtime only when every
+/// family that parses it has the setter: `BLOOMERY_PREFILL_GROUP` is Load
+/// today — GLM-5.3's `set_prefill_group` beside a V4.1 load that fixes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// The effect is fixed when the model is loaded or the process starts.
+    Load,
+    /// Changeable between calls of one loaded model, no reload, through the
+    /// named API `setter`; the environment value is the initial one.
+    ///
+    /// No row constructs it today: the registry holds no Runtime lever, so
+    /// the dead-code lint is expected here until the first one lands.
+    #[expect(dead_code)]
+    Runtime { setter: Setter },
+}
+
+/// The named API a [`Phase::Runtime`] lever changes through: the function a
+/// binary calls between calls of one loaded model. `tools/check-levers.sh`'s
+/// fifth hold checks the file is in the tree and defines `fn <item>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Setter {
+    /// The file the function is defined in, from the repository root.
+    pub(crate) file: &'static str,
+    /// The function's name — a free function or a method — as `fn <item>`
+    /// is defined in that file.
+    pub(crate) item: &'static str,
+}
+
+impl Phase {
+    /// The `--levers` table's word for the phase.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Phase::Load => "load",
+            Phase::Runtime { .. } => "runtime",
+        }
+    }
+}
+
 /// Who reads a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
     /// This crate parses it: at a binary's `main` ([`at_main`]), or where the
     /// worker pool is built ([`pool_levers`]). `left` names the files that
     /// still read it in place besides.
-    Parsed { left: &'static [InPlace] },
+    Parsed {
+        left: &'static [InPlace],
+        phase: Phase,
+    },
     /// Read in place in the files of `at` only; no reading here parses it.
-    Direct { at: &'static [InPlace] },
+    Direct {
+        at: &'static [InPlace],
+        phase: Phase,
+    },
     /// Not a lever: every reading here refuses it when it is set, with any
     /// value, saying `why`. `left` names the files that refuse it in place
     /// too.
@@ -327,9 +386,9 @@ impl Site {
             list.join(", ")
         };
         match self {
-            Site::Parsed { left: [] } => "parsed".to_string(),
-            Site::Parsed { left } => format!("parsed; in place in {}", places(left)),
-            Site::Direct { at } => format!("in place in {}", places(at)),
+            Site::Parsed { left: [], .. } => "parsed".to_string(),
+            Site::Parsed { left, .. } => format!("parsed; in place in {}", places(left)),
+            Site::Direct { at, .. } => format!("in place in {}", places(at)),
             Site::Retired { why, left: [] } => format!("retired: {why}"),
             Site::Retired { why, left } => {
                 format!("retired: {why}; refused in place in {}", places(left))
@@ -904,10 +963,11 @@ impl Levers {
         }
     }
 
-    /// Every lever row of [`REGISTRY`], one line each: the value this
-    /// reading has — as set, or the default — or `-` for a lever it does not
-    /// parse or its binary does not act on, and who reads it. What `--levers`
-    /// prints ([`at_main`]); a name that is no lever has no line.
+    /// Every lever row of [`REGISTRY`], one line each: the phase — `load`,
+    /// `runtime`, or `-` for a retired row, which states none — the value
+    /// this reading has — as set, or the default — or `-` for a lever it
+    /// does not parse or its binary does not act on, and who reads it. What
+    /// `--levers` prints ([`at_main`]); a name that is no lever has no line.
     pub(crate) fn table(&self) -> String {
         let mut out = String::new();
         for row in REGISTRY.iter().filter(|r| r.is_lever()) {
@@ -921,11 +981,17 @@ impl Levers {
                     Unset::Means(m) => format!("unset: {m}"),
                 },
             };
+            // A retired row is no lever to set; the phase cell is `-`.
+            let phase = match row.site {
+                Site::Parsed { phase, .. } | Site::Direct { phase, .. } => phase.word(),
+                Site::Retired { .. } | Site::Env { .. } => "-",
+            };
             let _ = writeln!(
                 out,
-                "{:<26} {:<9} {:<32} {}",
+                "{:<26} {:<9} {:<8} {:<32} {}",
                 row.name,
                 row.class.describe(),
+                phase,
                 value,
                 row.site.describe()
             );

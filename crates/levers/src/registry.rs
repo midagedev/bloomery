@@ -8,7 +8,7 @@
 //! every `BLOOMERY_*` name under `tools/`, in the justfile and in `.cargo/` to
 //! a row.
 
-use crate::{Class, InPlace, Kind, LeverSpec, Site, Unset};
+use crate::{Class, InPlace, Kind, LeverSpec, Phase, Site, Unset};
 
 pub const THREADS: &str = "BLOOMERY_THREADS";
 pub const SPIN: &str = "BLOOMERY_SPIN";
@@ -112,7 +112,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("the physical core count"),
         doc: "Threads of the process-wide worker pool, the calling thread among them; 1 \
               runs every range inline and spawns nothing. Read when the pool is built.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: SPIN,
@@ -125,7 +128,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("20000"),
         doc: "Spin iterations a waiting pool thread makes before it parks. Read when the \
               pool is built.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: CED,
@@ -136,7 +142,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               needs (the CED triangle, `body/ced.rs`), where the file allows it; `off` runs \
               every layer at every position, the same-binary arm. The `load` line prints \
               `ced=on` or `ced=off (<reason>)`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: PREFILL,
@@ -151,7 +160,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               leaves other bits under the ubatch walk than under steps. Steps are \
               refused by name beside the MTP draft and a `BLOOMERY_RESIDENCY` word other \
               than `off` (unset resolves `off`).",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: PREFILL_GROUP,
@@ -168,8 +180,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `load` line prints `group=`. GLM-5.3's plan reserves the units a group of 2 \
               holds (each about two stream buffers); a group past 2 takes its further units \
               out of the card's margin, refused by name past its free bytes; the `prefill \
-              units` line prints what they took and what stayed free.",
-        site: Site::Parsed { left: &[] },
+              units` line prints what they took and what stayed free. GLM-5.3 changes it \
+              between calls through `set_prefill_group`; V4.1 fixes it at load, so the row's \
+              phase is `load` until both families carry a setter.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: ENGRAM_HELPER,
@@ -178,7 +195,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("1"),
         doc: "V4.1 `StepRows`: a helper thread reads a step's engram rows while the step \
               thread reads its embedding row; `0` has the step thread read them itself.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: STEP_STATS,
@@ -195,7 +215,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               prompt lb`; the qwen3 seat of `bloomery-serve`: a `slots round` record \
               a round of several slots (its command, rows, the passes the seat ran \
               them as, the slots it serves). Off, nothing is read.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: "BLOOMERY_HOT_LIST",
@@ -220,7 +243,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               bytes, so a large card stands in for a smaller one; a budget below a card's \
               floor is refused with each term. `M` and `G` are binary units. The `plan` \
               line prints `card_budget=`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: HOST_ROOM,
@@ -234,7 +260,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Qwen3.8 plan's tiers, where the routed experts a room cannot hold are planned \
               on the NVMe tier; a room under that tier's floor is refused with the room, the \
               floor and the need.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: NVTIER_BYTES,
@@ -251,7 +280,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               pushes the host segments under the tier's floor is refused by name with the room, \
               the floor and the value. A room the plan's host need already holds plans no \
               arena. Read where the plan is made, beside `BLOOMERY_HOST_ROOM`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: NVTIER_READ,
@@ -264,7 +296,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               page cache serves, exact at the same bytes and counted by the tier's stats as \
               buffered — the fallback the probe's refusal names, not a preference. Read where \
               the tier is built.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: PIN_MAIN,
@@ -284,6 +319,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                     round: R03,
                 },
             ],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -336,7 +372,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               (<why>)`; `mtp` set is refused by name with stores too short for one window. Every \
               other binary and \
               family refuses each word by name, `off` included.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: MTP_HEAD_ROWS,
@@ -363,7 +402,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               full head's. One exception: a running residency (`BLOOMERY_RESIDENCY`) counts by \
               pass, so a list that moves the acceptance moves the passes, the experts' flips \
               with them, and the target's bits at a near tie.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: MTP_DRAFT,
@@ -379,7 +421,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               which starts that server). A path with no regular file is refused at `main`, and \
               the lever set on a run that drafts nothing by each of them, naming why. The MTP \
               draft gate opens the file its reference set states and does not act on it.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: MTP_WINDOWS,
@@ -393,7 +438,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               which holds them either way) and how many the target kept. Refused by name on a \
               run that drafts nothing. Off, nothing is kept; the tokens are the same either \
               way.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: MTP_WIDTH,
@@ -409,8 +457,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               still proposes its whole width, and only the rows a pass runs change, never a \
               token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
               server prints an `mtp width` record a request under `cost`. Refused by name on a \
-              run that drafts nothing.",
-        site: Site::Parsed { left: &[] },
+              run that drafts nothing. Read once at `main`, the policy every window of the \
+              process runs by; no setter changes it between calls.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: ROUTE_TRACE,
@@ -429,7 +481,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `off`, and its unset draft and residency resolve `off`. The generators \
               need their step feed (`--prefill step` / `--prefill steps`) and refuse \
               `--time`, each refused by name otherwise.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: CHECK_FINITE,
@@ -441,7 +496,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the engine; a `stat finite` line per step names the first non-finite \
               `(layer, site)`. Refused beside `--time`, `BLOOMERY_DRAFT` and \
               `BLOOMERY_STEP_STATS=1`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: HOST_POPULATE,
@@ -450,7 +508,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("1"),
         doc: "Placed load: the plan's host set is read in with `MADV_POPULATE_READ`; `0` \
               leaves it to fault in, the fresh-fault arm.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: HOST_LOCK,
@@ -459,7 +520,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("0"),
         doc: "Placed load: after populating, `mlock` the host set for the model's life; an \
               `RLIMIT_MEMLOCK` refusal is an error that names the limit.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: CARD_DONTNEED,
@@ -469,7 +533,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Placed load: each uploaded card segment's file pages are dropped right after \
               its upload (`token_embd` and the engram table excepted); `0` keeps them in \
               the page cache.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: R8,
@@ -484,7 +551,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `off` reads the source, the same-binary arm; both write the same bits. The load \
               prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
               (no sidecar at <path>: just r8-sidecar)`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: RESIDENCY,
@@ -584,7 +654,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               prints its `residency pass` records, a request's reset keeps the residency, and \
               `POST /residency/reset` moves it back to the seed with a `residency reset` record. \
               Every other binary refuses it set, by name.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: QWEN38_EXPERTS,
@@ -598,7 +671,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               host tier, the same-binary arm. Unset is `card` on a qwen4exp file; set to \
               `card`, a qwen3moe or qwen35moe file refuses it by name. The `plan` line prints \
               `experts=`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: HOSTSTREAM,
@@ -618,7 +694,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
               stream`, every call `call stream end`. A Qwen3.8 load refuses it set by name and \
               reads `BLOOMERY_XSTREAM`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: XSTREAM,
@@ -648,7 +727,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` on \
               a load with an expert tier. The load line prints `xstream=`, \
               every streamed layer an `xstream` record, every call `xstream end`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: QWEN3_KV,
@@ -667,7 +749,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               wins over the lever; `--cache-type-v` does not exist — both planes quantize \
               together. Refused by name on a qwen4exp (Qwen3.8) file, whose stores carry \
               no q8_0 form. The `load` line prints `cache=`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: LANE_PREFETCH,
@@ -681,7 +766,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Both write the same bits. `generate_glm5next` acts on it and prints the value \
               the union holds as its `load` record's `lane_prefetch`; every other binary \
               runs the default and refuses the name set.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: GEN_SLOTS,
@@ -709,7 +797,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               resident sequences, runs each slot's window as the plain run's prompt call, prints \
               each slot's records in slot order, and refuses N ≥ 2 beside `BLOOMERY_DRAFT`, \
               `BLOOMERY_CHECK_FINITE`, `BLOOMERY_STEP_STATS` and `--logits`.",
-        site: Site::Parsed { left: &[] },
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
     },
     LeverSpec {
         name: "BLOOMERY_POISON",
@@ -723,6 +814,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: OPS,
                 round: R03,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -750,6 +842,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: OPS,
                 round: R03,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -780,6 +873,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: "crates/model/src/moe.rs",
                 round: R03,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -804,6 +898,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                     round: V2FENCE,
                 },
             ],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -818,6 +913,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: ATTN,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -831,6 +927,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: ATTN,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -848,6 +945,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: ATTN,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -867,6 +965,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: ATTN,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -881,6 +980,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: ATTN,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -895,6 +995,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: ATTN,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -909,6 +1010,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: "crates/gpu/src/flash.rs",
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -965,6 +1067,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: HYBRID,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -1007,6 +1110,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: "crates/gpu/src/arch/qwen3moe/ubatch.rs",
                 round: R03,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -1021,6 +1125,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: DECODE,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -1036,6 +1141,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: DECODE,
                 round: V2FENCE,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
@@ -1056,6 +1162,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 file: "crates/gpu-gates/src/bin/shared/ds41_dspark.rs",
                 round: SESSION,
             }],
+            phase: Phase::Load,
         },
     },
     LeverSpec {
