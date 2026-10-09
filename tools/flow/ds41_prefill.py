@@ -69,16 +69,20 @@ plan of it (plans/, `generate_ds41 --plan` records).
                        per cell of the lcg prompt (frequency list or not), the frequency-list prose prompt, and the real texts at
                        today's default placement, the id prefix: prose, code and korean (routes-idprefix.tsv)
     --counts LOG       a generate_ds41 run's queue-entry counter (BLOOMERY_STEP_STATS=1: `stat prefill front`,
-                       `stat prefill lb`) against this model's counts for the same call, layer-batch by layer-batch
+                       `stat prefill lb`) against this model's counts for the same call, layer-batch by layer-batch;
+                       an `--arm` list's log arm by arm, a repeated arm held to the arm it repeats
 
 Python 3 standard library only; the t table is tools/gpu-ab.py's.
 """
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import math
 import os
 import sys
+import tempfile
 from bisect import bisect_right
 from functools import lru_cache
 
@@ -3329,44 +3333,102 @@ def counts(P, cname="PG2", ced=True):
     return front, lbs
 
 
-def check_counts(path):
-    """--counts LOG: a generate_ds41 run's counter (`stat prefill front` a batch, `stat prefill lb` a layer-batch,
-    printed under BLOOMERY_STEP_STATS=1) against counts() for the same call, which its `call plan` record names (P,
-    CED, G: CW1 or CW2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
-    cannot be compared."""
-    recs = records.read(path)
+def _check_call(path, recs, label):
+    """One call's counter (the records of one arm, or of a log with no arms) against counts() for the call its
+    `call plan` record names, layer-batch by layer-batch — check_counts's one comparison, prefixed `label`. 0 when
+    every count is equal, 1 when one is not, 64 when the records cannot be compared."""
     cp = records.first(recs, "call_plan")
     front = {r["b"]: r["entries"] for r in records.of_kind(recs, "stat_prefill_front")}
     got = {(r["b"], r["layer"]): (r["entries_route"], r["entries_shadow"])
            for r in records.of_kind(recs, "stat_prefill_lb")}
     if cp is None or not got:
-        print(f"{path}: no `call plan` or no `stat prefill lb` record (a batched run under BLOOMERY_STEP_STATS=1 "
+        print(f"{label}{path}: no `call plan` or no `stat prefill lb` record (a batched run under BLOOMERY_STEP_STATS=1 "
               f"prints both)")
         return 64
     P, ced, G = cp["end"] - cp["first"], cp["ced"] == "on", cp["group"]
     if cp["first"] != 0 or G not in (1, 2):
-        print(f"{path}: a call at {cp['first']}..{cp['end']} under G {G}; the model's configs run a call from position 0 "
-              f"under G 1 (CW1) or 2 (CW2)")
+        print(f"{label}{path}: a call at {cp['first']}..{cp['end']} under G {G}; the model's configs run a call from "
+              f"position 0 under G 1 (CW1) or 2 (CW2)")
         return 64
     cname = "CW2" if G == 2 else "CW1"
     want_front, want = counts(P, cname, ced)
     df = {b: front.get(b, 0) - want_front.get(b, 0) for b in sorted(set(front) | set(want_front))}
     rows = [(k, got.get(k, (0, 0)), want.get(k, (0, 0))) for k in sorted(set(got) | set(want))]
     bad = [(k, g, w) for k, g, w in rows if g != w]
-    print(f"{path}: P {P}, CED {'on' if ced else 'off'}, {cname}: {len(want_front)} batches and {len(want)} layer-batches "
-          f"in the model, {len(front)} and {len(got)} in the log")
-    print(f"  first steps, counted - model, by batch: {df}")
+    print(f"{label}{path}: P {P}, CED {'on' if ced else 'off'}, {cname}: {len(want_front)} batches and {len(want)} "
+          f"layer-batches in the model, {len(front)} and {len(got)} in the log")
+    print(f"{label}  first steps, counted - model, by batch: {df}")
     for side, i in (("route", 0), ("shadow", 1)):
         d = {}
         for _, g, w in rows:
             d[g[i] - w[i]] = d.get(g[i] - w[i], 0) + 1
-        print(f"  {side}: counted - model on each layer-batch, by value: {dict(sorted(d.items()))}")
+        print(f"{label}  {side}: counted - model on each layer-batch, by value: {dict(sorted(d.items()))}")
     for (b, l), g, w in bad:
-        print(f"  batch {b} layer {l:2d}: route {g[0]} against {w[0]} ({g[0] - w[0]:+d}), "
+        print(f"{label}  batch {b} layer {l:2d}: route {g[0]} against {w[0]} ({g[0] - w[0]:+d}), "
               f"shadow {g[1]} against {w[1]} ({g[1] - w[1]:+d})")
     ok = not bad and not any(df.values())
-    print(f"counts: {'equal' if ok else 'DIFFER'}")
+    print(f"{label}counts: {'equal' if ok else 'DIFFER'}")
     return 0 if ok else 1
+
+
+def _counted(seg):
+    """One arm's own counted records: its `stat prefill front` entries, its `stat prefill lb` entries and its
+    `tokens` lines, to hold a repeated arm to the arm it repeats."""
+    return (
+        {r["b"]: r["entries"] for r in records.of_kind(seg, "stat_prefill_front")},
+        {(r["b"], r["layer"]): (r["entries_route"], r["entries_shadow"])
+         for r in records.of_kind(seg, "stat_prefill_lb")},
+        [r.raw["tokens"] for r in records.of_kind(seg, "tokens")],
+    )
+
+
+def _first_diff(earlier, later):
+    """What first differs between a repeated arm's counted records and the arm it repeats: None when equal."""
+    for b in sorted(set(earlier[0]) | set(later[0])):
+        if earlier[0].get(b) != later[0].get(b):
+            return f"stat prefill front b {b}: {later[0].get(b)} against {earlier[0].get(b)}"
+    for k in sorted(set(earlier[1]) | set(later[1])):
+        if earlier[1].get(k) != later[1].get(k):
+            w, g = earlier[1].get(k, (0, 0)), later[1].get(k, (0, 0))
+            side, i = ("route", 0) if w[0] != g[0] else ("shadow", 1)
+            return f"stat prefill lb b {k[0]} layer {k[1]}: {side} {g[i]} against {w[i]}"
+    if earlier[2] != later[2]:
+        return "tokens {} against {}".format(" | ".join(earlier[2]) or "(none)",
+                                             " | ".join(later[2]) or "(none)")
+    return None
+
+
+def check_counts(path):
+    """--counts LOG: a generate_ds41 run's counter (`stat prefill front` a batch, `stat prefill lb` a layer-batch,
+    printed under BLOOMERY_STEP_STATS=1) against counts() for the same call, which its `call plan` record names (P,
+    CED, G: CW1 or CW2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
+    cannot be compared.
+
+    A log of an `--arm` list (each arm opens with an `arm` record) is checked arm by arm: segment k is the records
+    from arm k's `arm` record to the next, each its own call, its report prefixed `arm <k>: ` and ending in its own
+    `counts:` line. An arm whose (feed, ids, n) repeats an earlier arm's must print the same counts and the same
+    `tokens` record: `repeat of arm <j>: equal`, or `repeat of arm <j>: DIFFER (<what>)` and rc 1. A log with no
+    `arm` record is checked as one call, byte for byte as before."""
+    recs = records.read(path)
+    starts = [i for i, r in enumerate(recs) if r.kind == "arm"]
+    if not starts:
+        return _check_call(path, recs, "")
+    rc = 0
+    seen = {}  # an arm's (feed, ids, n) -> (its index, its counted records)
+    bounds = starts + [len(recs)]
+    for k in range(len(starts)):
+        seg = recs[bounds[k]:bounds[k + 1]]
+        c = _check_call(path, seg, f"arm {k}: ")
+        rc = rc or c
+        key = (seg[0]["feed"], seg[0]["ids"], seg[0]["n"])
+        if key in seen:
+            j, was = seen[key]
+            what = _first_diff(was, _counted(seg))
+            print(f"repeat of arm {j}: {'equal' if what is None else f'DIFFER ({what})'}")
+            rc = rc or (0 if what is None else 1)
+        else:
+            seen[key] = (k, _counted(seg))
+    return rc
 
 
 # ============================================================================ self-test
@@ -3643,6 +3705,67 @@ def self_test():
     except SystemExit:
         refused = True
     check("code and korean have no frequency-list arm: asked for one, the routing is refused by name", refused)
+    # --counts over an --arm list: each arm's counter checked on its own records, a repeated arm held to
+    # the arm it repeats — counts and tokens both — and a segment that cannot be compared refused naming
+    # its arm; a log with no `arm` record checked as one call, unprefixed
+    cp512 = records.first(call_records(512, True), "call_plan").line
+    wf512, w512 = counts(512, "CW2")
+
+    def counts_log(arms, arm_records=True):
+        """The lines of a generate_ds41 log, one segment an arm: (feed, ids, n, first-step deltas, layer-batch
+        deltas, tokens, whether its `call plan` prints)."""
+        out = ["load resident_bytes=1 ctx=32768"]
+        for i, (feed, ids, n, dfront, dlbs, tok, plan) in enumerate(arms):
+            if arm_records:
+                out.append(f"arm i={i} arms={len(arms)} feed={feed} ids={ids} n={n}")
+            if plan:
+                out.append(cp512)
+            for b in sorted(wf512):
+                out.append(f"stat prefill front b={b} entries={wf512[b] + dfront.get(b, 0)}")
+            for (b, l) in sorted(w512):
+                r, s = w512[(b, l)]
+                dr, ds = dlbs.get((b, l), (0, 0))
+                out.append(f"stat prefill lb b={b} layer={l} block=true entries_route={r + dr} "
+                           f"entries_shadow={s + ds}")
+            out.append(f"tokens {tok}")
+        return out
+
+    with tempfile.TemporaryDirectory(prefix="counts-arms-") as tmp:
+        def run_counts(lines):
+            p = os.path.join(tmp, "arm.log")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = check_counts(p)
+            return rc, buf.getvalue()
+
+        same = ("lcg", 512, 2, {}, {}, "[7, 8]", True)
+        rc, out = run_counts(counts_log([same, same, same]))
+        check("--counts over a three-arm log: rc 0, a `counts: equal` line an arm and the repeat verdict",
+              rc == 0 and [x for x in out.splitlines() if x.endswith("counts: equal")]
+              == ["arm 0: counts: equal", "arm 1: counts: equal", "arm 2: counts: equal"]
+              and "repeat of arm 0: equal" in out, out.splitlines()[-1])
+        differ = ("lcg", 512, 2, {min(wf512): 1}, {}, "[7, 8]", True)
+        rc, out = run_counts(counts_log([same, differ, same]))
+        check("--counts over a three-arm log whose arm 1 differs: rc 1, arm 1's own report red",
+              rc == 1 and "arm 1: counts: DIFFER" in out and "arm 0: counts: equal" in out
+              and "arm 2: counts: equal" in out and "repeat of arm 0: equal" in out,
+              out.splitlines()[-1])
+        other_tok = ("lcg", 512, 2, {}, {}, "[7, 9]", True)
+        rc, out = run_counts(counts_log([same, same, other_tok]))
+        check("--counts over a repeated arm whose tokens differ: rc 1, the repeat verdict names the tokens",
+              rc == 1 and "repeat of arm 0: DIFFER (tokens [7, 8] against [7, 9])" in out
+              and out.count("counts: equal") == 3, out.splitlines()[-1])
+        rc, out = run_counts(counts_log([same], arm_records=False))
+        check("--counts over a log with no `arm` record: one call, today's unprefixed report",
+              rc == 0 and out.splitlines()[-1] == "counts: equal" and not any(x.startswith("arm ") for x in out.splitlines()),
+              out.splitlines()[-1])
+        no_plan = ("lcg", 512, 2, {}, {}, "[7, 8]", False)
+        rc, out = run_counts(counts_log([same, no_plan, same]))
+        check("--counts over a segment with no `call plan`: rc 64 naming its arm",
+              rc == 64 and any(x.startswith("arm 1: ") and "no `call plan`" in x for x in out.splitlines()),
+              out.splitlines()[-1])
     print(f"self-test: {len(fails)} failed")
     return fails
 
