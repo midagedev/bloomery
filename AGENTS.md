@@ -97,10 +97,13 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   never moves, and a moved item's key, times row and `lane=` name the card it ran on. `--tier real|fixture` (default
   real) runs the batch on each family's fixture files: `[group('solo-real')]` is alone in the real tier and balanced in the
   fixture tier (one with a one-card pick is fixed to lane B there). A recipe whose gate has no fixture conversion opens its
-  box command with `bash tools/ref/real-only.sh <recipe>`; it and a recipe of a family with no fixture are deferred by
-  name, never run on a file they were not written for, and listed in `DIR/deferred.list` for a real-tier `--list`. The
-  keys and times keep the tiers apart, and the DONE line counts the clauses a fixture run left to the real tier
-  (`deferred=`, with `real_only=` and `no_fixture=`). It refuses to
+  box command with `bash tools/ref/real-only.sh <recipe>` (an inline `BLOOMERY_TIER` test ending in `exit 66` instead is a
+  named error, 65, nothing ran); it, a recipe of a family with no fixture and a `real-file` recipe (its family's
+  fixture-table row is `self`, so it runs on the profile's real file, and a target it builds or runs reaches the gate
+  fence `Tier::check_file`, which `python3 tools/recipes.py opens` reads from the code) are deferred by name, never run
+  on a file they were not written for, and listed in `DIR/deferred.list` for a real-tier `--list`. The keys and times
+  keep the tiers apart, and the DONE line counts the clauses a fixture run left to the real tier (`deferred=`, with
+  `real_only=`, `no_fixture=` and `real_file=`). It refuses to
   start while the timing lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose
   input key (`tools/recipes.py key`) is green in `~/.cache/bloomery/gate-ledger.tsv`; `--round-ledger` (a round's)
   records only in `gate-ledger-rounds.tsv`. The lead reads the rounds' file only with `--trust-rounds`, and only for a
