@@ -105,6 +105,312 @@ through R4 (worker1's train 2 carries R3a and the lifts), then the user-facing p
   host-leg bytes) trades pp4096 610–700 → 390–430 for decode 13–19 → 26–29 [derived]: the landing states that cost in
   the coverage table and the README limits.
 
+## After 0.2.9 (10-10, leader — train029a: worker2's binslots chain, w1train, hostfloor, poolret, packsched2, prefill1, stepsim, sit3090, hfarch, nofixture, mixfix)
+
+### What servestop left (worker1)
+- servestop F4 design (a′): each seat names q = its checkpoint spacing (4096 on Qwen3.8/GLM), a quantum grid at
+  absolute multiples, a cut-vs-whole gate per seat; GLM first, Qwen3.8 second, V4.1 excluded (CED holes). A decision for
+  later.
+- `keep_alive`'s own 400 for an unreadable request is outside `api::Answers` (~3 lines).
+- `tools/spawn-allow.txt:12`'s reason for `decide.rs` is stale (1 line).
+
+### The unitier R1 probe (worker2)
+- Unified tier (0.2.9), worker2's R1 probe (10-09, functional, A6000 plan a 27G, arena 23.5e9): the paged plan's 72–74
+  ms pass against 31.7 ms arena-0 is first-touch NVMe fills (5,194 fills, 16.3 GB, 1.0–1.1 ms each, O_DIRECT, ≈ 55
+  ms a pass), not the drops (drop-off −3..−4 % p50, ≈ 0 mean). On a host with RAM to spare an arena fill could
+  come from the page cache (`BLOOMERY_NVTIER_READ=buffered` exists; `buffered_reads=0` there). Price it on the depth
+  runner's fresh-process window. S–M.
+
+### What loadonce2 left (worker1)
+- `check-recipes` rule: a recipe that redirects `gpu-gate.sh`'s stderr copies its `waited N s` line (loadonce2 found
+  `gate-gpu-ds41-chat`'s 418 s row held 329 s of hidden V4.1 load-lock wait; that row dropped from `gate-times.tsv`
+  10-09, backup `gate-times.tsv.bak-20261009-chatwait`).
+- Load-once follow-ups: V4.1 `PREFILL_GROUP` has no runtime setter (`body.rs:275`), the lookup draft has no detach
+  (`drop_captures` `pub(crate)`); each ~15 s a load.
+- `state_back.rs:94` compares card counts, not names (a swapped card at the same index passes); `:79` the
+  poisoned-mismatch text names one direction. XS each.
+
+### What q38rtrace left (worker1)
+- `route-trace-chat` / `route-trace-chat-q38` take no card gate lock (the driver is not `gpu-gate.sh`); worker1 held the
+  A6000 lock by hand for the 10-09 recordings. Route them through `gpu-gate.sh`'s lock. XS–S.
+- The `route-trace-chat` driver, a witness: at place a the host set is unpinned, and a concurrent big load evicts it
+  silently (10-09 q38-stream3-4k: RSS 64 → 20 GB, majflt 590K → 953K, shard residency 53 % → 6.8 %, req
+  ms/position 62.2/28.0/56.0 against d2's flat 18.7). Print shard residency and majflt at start and end of each request
+  in the driver; its routes stay valid (greedy), its walls do not.
+- `route-trace-chat`'s driver applies the template without `chat_template_kwargs` (thinking stays the template default)
+  and a prompt row is one TSV line ("\n\n" becomes one space): a recorded trace of a thinking-off stream is not that
+  stream. S.
+
+### The stepsim evaluator (lead)
+- stepsim evaluator: the `readme` preset's default hit 0.645 contradicts the README row (86.3 predicted vs 60.71); hit
+  0.20–0.25 matches (synth-inversion Phase B). Fix the preset after Phase B; `server` 0.655 is a prose replay,
+  unmeasured.
+- stepsim evaluator, found by three Phase B synths (bytes, overlap F3, residency): `calibrate()` (`q38_step.py:812-834`)
+  re-solves anchors (verify_row_frac on every machine; layer_extra_us, union_c_us on common-5090) under a scenario's
+  `--set` unless the anchor itself is set, so byte/union/draft overrides get absorbed (5090 b1/L1 read −0.5/−2.6 %
+  instead of +0.7/+4.2 %); and lat = anchor − bytes/bw_a6000 makes a byte cut alone read as a slowdown. Fix: a
+  scenario-vs-correction flag (anchors solved once at today's constants). S.
+- stepsim evaluator: the `readme` preset is a one-request model of a two-request row (README decode 60.71 = 2 requests
+  summed; reproduced only at hit ≈ 0.24). S.
+- stepsim evaluator: measured A6000 verify cost(k) 16.8/25.5/29.8/33.7 ms (`tape028/stream-a.log:57-59`) is
+  front-loaded, the model is 2.7 ms short at w2; one hit for all depths; no fresh/chain per-request rows. S.
+- stepsim evaluator: the lowhost preset (core_dram_gbs 12 assumed) is not a weak host. S.
+
+### The expfast probe program (shelved)
+- `discover/expfast-report.md` §7, the expfast probe program (shelved, open after the cut): R1 probe lever rows
+  (`Class::X`, `at_main_probing`; only with R4), R2 `STEP_TRACE` (M, after q38rtrace), R3 runtime arms + `Body38`
+  `StateBack` (M, after loadonce2/levphase2), R4 `probe.rs` injectors/idealizers (M–L, `crates/gpu` → its own
+  train), R5 `card.py` probe/batch/look (S–M, Mac, no collision), R6 `exp-batch.sh` v1 (M, after packsched2), R7 pool
+  honours affinity (S), R8 ROUTE+PRETOUCH (M+M), R9 remote fixture runner (S; fixture routers are random, so E3 decides
+  no routing term), R10 scoped leases + A/A (M; the user's decision, after R4).
+
+### What serveapi left (worker1)
+- serveapi tracker rows (worker1 10-09): llama-server sampling fields we cannot honour (samplers, `typical_p`,
+  `mirostat`, `dry_*`, `xtc_*`, `top_n_sigma`, `dynatemp_*`) are still silently ignored — a refusal-rule violation. M.
+- `n_predict` < -1 silently → -1 where llama-server 400s. XS.
+- tokenize's `content` of another type read as "" (1 line).
+- `anthropic.rs:163-170` dead arm (3 lines).
+- `tests/sampdraft.rs` Hold/Held duplicates `mock::Hold` (~60 lines).
+- `anthropic.rs/responses.rs` native fields not swept by the typed reads. S.
+
+### What quantwide, r4glm and k1iq3s left (worker2)
+- GLM-5.3-Flash `UD-IQ4_XS` (157 GB, the file of a 10-09 X post: 5090 + 128 GB) does not load: routed gate/up are IQ3_S
+  in 41 of 43 layers (IQ4_XS 1, Q3_K 1), down IQ4_XS 39 / Q6_K 3 / Q4_K 1, output Q6_K; every other tensor equals
+  UD-Q4_K_XL (headers read 10-09 from the HF shards). IQ3_S has no activation format (`crates/gguf/src/quant.rs:1162`
+  → NoActivationFormat), and GLM's card expert dispatch takes only Q4_K/Q5_K
+  (`crates/gpu-glm5next/src/ffn.rs:536-570`). Needs: an IQ3_S host qdot kernel + activation format (S–M), card sel
+  kernels behind one common iq dispatch (lift Qwen3.8's, M), and the prompt GEMM rows; on a 128 GB host also a GLM NVMe
+  tier (unified tier, L). Expert bytes a token 0.77× UD-Q4_K_XL [derived: (2·3.44+4.25)/(2·4.5+5.5) bpw].
+- `docs/models.md:40` says `UD-Q3_K_XL` does not run yet; README:45 and the 0.2.8 A6000 table run it. Stale line. XS.
+- quantwide1 (worker2, opus, `specs/worker2/quantwide/report.md`): 35 of 489 serving files load (repo-weighted 17.0 %).
+  Family ports alone → 42.7 %. Order R0 (hotfix) → R2 qwen3moe port → R3 qwen35 port + nextn Unused + shexp join
+  → R4 GLM card-or-host rule → K1 IQ3_S host (with R4 loads GLM UD-IQ4_XS = the X post's file) → K2..K10. Next
+  round after tag: R4+K1 first, R3 parallel.
+- `README.md:45` "BF16 tensors are not loaded" is stale.
+- gguf `lib.rs:781` q8_K 296 B (ik) vs mainline 292.
+- gguf `lib.rs:898-910` `strict_tensors` ignores type sizing for Q4_0/Q4_1 (opens 24 bartowski GLM files, draft off).
+- qdot `lib.rs:2126-3180` ~1,050 lines of V4.1 card-rule twins only gates call (wire or delete).
+- Four duplicate type lists (`swap38.rs:32-38`, `qwen35moe/place.rs:114-125`, `card38.rs:301-380`, `TYPE_PINS`).
+- Type id 41 clash: ik Q1_0_G128 vs mainline Q1_0.
+- quantwide next (worker2, Sonnet, base main `eb41626d`): r4glm (`coverage.rs` GLM routed arm →
+  `routed_unrun(card_routed)`) express first; k1iq3s (IQ3_S host: gguf grid + dequant, qdot AVX2 + mirror, ik refs,
+  `iq3s-rate.card`) in parallel; R3 after r4glm. X-post file (GLM UD-IQ4_XS 156.8 GB, 50–65 min download) needs the
+  user's OK (box job > 30 min) — ask in the morning; cheap shard-head --plan first.
+- r4glm: GLM `UD-IQ4_XS` is host-only in every trunk MoE layer and GLM has no NVMe tier (`expert_nvme_tier` only in
+  qwen35moe/qwen38 seats) → 156.8 GB must sit in host RAM: loads on the box (263 GB avail), refused by name on the
+  X-post 128 GB machine → the X reply also needs the GLM NVMe tier (placement, roomone's area; unified tier goal).
+- r4glm docs drift: `gpu-glm5next/src/swap.rs:16-19,38-43` (no Q3_K stack — false), `models/src/need.rs:298`
+  `RoutedFormat` wording, `coverage.rs:39-40` `Glm5nextBody` doc, `shared/glm5next_tier.rs:106` `Shape::read` Q6_K-only
+  host downs.
+- r4glm next blockers: BoldingBuilds IQ3_XXS and ggml-org Q4_K on BF16 attention/hc pins.
+- k1iq3s (worker2, done 00:1x): `29e05499` on `eb41626d` — gguf `IQ3S_GRID` + `dequant_iq3_s` + activation
+  IQ3_S→Q8_K; qdot AVX2 dot + mirror + tiles + dispatch; `tools/ref` `iq3s_ref`/`iq3s_rate` + `dequant_ref` `types[]`;
+  unsafe-ratchet qdot 102/56→109/60 PIN; Gate A = mirror (m1 red), Gate B = ik `DequantizerIQ3S` 0 ULP 64/64 (m2 red,
+  A green), tile m3 red; ptx-scan `gate_e2e` identical. Landing step (worker2): refset `arch/dequant.rs` BUILD pin
+  move + `just dump-ref-dequant` + `gate-1-1` + m4, together (`gate-1-1`/`gpu-gemm`/`gpu-iq`/`gpu-iq-sel` refuse
+  between). Engine reach: IQ3_S routed stacks pass Qwen3.8/MiMo coverage (AtomicChat, mradermacher i1-IQ3_M) → host
+  union; card `CardFormat::of(IQ3_S)=None`. Next train.
+- k1iq3s measurement 1 (`iq3s-rate` + `iqhost-rate` rows, ~10–12 min lease) after the binary is on the box: card
+  `iq3s-rate.card` predicts 4.6–6.2 GB/s/core at k=4096 (moved down from 5.6–7.6 before any timed run: 48 vpextrd +
+  8 vextracti128, 333 instr/block) — under the union break-even 6.2–8.6 → read the fixed term first.
+
+### What packsched2 left (worker2)
+- `switch_candidate` rewrites `P_ENV` before its pos check (root of blocker 3, ~3 lines). S.
+- `PYBAL` reads `f[8]`/`f[11]`/`f[12]`/`f[16]` positionally (pass `REC_FIELDS`, ~10). S.
+- `rec_get` inside `$(…)` dies only its subshell (static name check, ~10). S.
+- `mutant_of` does not syntax-check mutants (`bash -n` + py compile, ~15). S.
+- ~25 `steal_case` times rows use bare keys. S.
+- `fail()` dumps a stale `$out`. S.
+- `/tmp/stkeep` + ~60 stray `gate-batch-*` dirs in the real `TMPDIR`. S.
+
+### What hostfloor's window A left (worker2)
+- `gate-gpu-nvtier`'s stepunion page-footprint clause counts any mapper's pages: worker2's hostfloor window A (10-09
+  20:57–21:04) went red (+8,303 interior pages, at most 0 allowed) while worker1's q38rtrace serve (`--place a
+  --cache-ram 0`) mapped the same Qwen3.8 file. Solo (X) in a landing batch, so trains do not see it; a round-ledger run
+  beside another Qwen3.8 track goes red. Count only the gate's own mapping (mincore over its own VMAs) or refuse to
+  start beside a mapper by name. S.
+
+### The Mac (lead, 10-09)
+- `tools/ref/lcpp-warm.sh`'s self-test leaks its Python llama-server stub: 21 alive on the Mac on 10-09
+  (`/var/folders/…/lcpp-warm-self-test.*/llama-server -m /m.gguf …`, oldest 1 d 13 h). Kill the stub on exit (trap
+  on the captured pid) and add a no-leftover check to the self-test. S. The lead does not kill the 21 by pattern; their
+  pids go to a file first.
+- Worktree cleanup after the cut: 147 worktrees remain. The Mac disk was 98 % (19 GiB free) on 10-09 ~21:20; the lead
+  removed `target/` of 20 finished worktrees (clefvis*, defgaps, fxgen2, gatefix, levphase, loadonce1, nvbase, nvplan,
+  paged2r, pagedoff, paghead*, roomneed, serve029*, stepunion, stepunion2, visseat, xdeinit) → 108 GiB free.
+
+### What loadlock left (worker1)
+- `visref.sh:56` / `justfile:1896-1897` `dump-ref-visref` takes the lock without `[group('v41-load')]`. XS–S.
+- The 16 non-V4.1 `v41-load` recipes carry no reason comment (only `gate_nvtier.rs:54-56` states one). XS–S.
+- `gpu-gate.sh:649-650/912-913` comments read V4.1-only. XS–S.
+- `gate-batch.sh:1763-1776` checks group↔export but not model↔group. XS–S.
+- packsched2's `CHAIN_SOLO_REAL` (`gate-batch.sh:362`) omits the two Qwen3.8 solo-real items with no reason. XS–S.
+
+### What fxoracle left (worker2)
+- `flip.rs:139` `tie_allowed` margin ≤ 2·dist always true at top == runner-up; `flip.rs:78-84` gap ≤ err always
+  true on a top-k swap (only the cap decides; doc fix).
+- `gate_qwen38_serve.rs:3364-3369` FileBound reason contradicts `qwen35moe/fixture.rs:84-89`; `ds41_skew.rs:143-146`
+  mistagged FileBound.
+- `margin_cap`/`flip_cap` copied (`gate_glm5next_mtp.rs:194`, `gate_qwen4exp_e2e.rs:2405/2432`); tally format copied in
+  three gates.
+- Refset `family.rs` `runs: Option<fn() -> String>` cannot fail. S–M.
+- `dump-mtp.sh:47` hardcodes the real Qwen draft; `gguf-ranges.py` skips array keys.
+- `gate_qwen4exp_e2e.rs:606-609` borrows `FREE_BAND` 0.10 underived.
+- Refset real-file families identify by path only. M.
+- fxr1 (worker2, Sonnet, base `fd8e0bff`, uncommitted): Mac-green; one CPU box job (~5 min) for the fill-digest `PINS`
+  row approved 23:0x; then commit on `fxr1`. Lands red on `gate-refset`'s in-place test and `refset-check` until R2's
+  dump sitting, as designed (not masked).
+- Box handed to mixfix (worker1) first, then worker2's `fxtally` lib gate and fxr4/5/6 phase B.
+
+### What lanex left (worker1; the tracker rows go to the packsched2 owner)
+- RT rows wrong — nvtier 92 GB vs measured arena 23.49 GB, `qwen4exp-e2e` ~11 GB low, `iqleg` "both resident" but
+  children sequential.
+- `PACK_BUDGET` 299,000 B under its stated formula.
+- Lane B idles 815 s in phase A (real-tier v41-load fixed to lane A, `gate-batch.sh:2103-2106`).
+- The glm serve recipe comment self-contradicts.
+- `qwen38-residency`'s `BLOOMERY_CARD=a6000` pin has no recorded fact.
+- `gate-batch.sh:357-358` comment names a non-existent `PlanInputs::of` (it is `describe()`).
+- lanex dropped (worker1 re-derivation 04:4x): packsched2 already took it; wall = chain 2,348 + X 2,056; the host-byte
+  guard closes almost every pair. Wall levers in order: (a) shorten chain items, `glm5next-e2e` (773 s) first; (b)
+  fixture tier; (c) X both-card + m items. worker1 next: (a) paper decomposition, then the room round.
+
+### The 3090 sittings (sit3090, nsysgap)
+- 3090 M1 (10-09 21:41): K1' 10.59 ms (in band) → slot-lanes design round opens; `leg_us` 10.40 ms above its 8.4..9.9
+  band (391 slots) — host leg 5–12 % heavier than modelled; 47.6 tok/s one request at gate
+  (`discover/m1-result.md`). rig-log cell to write.
+- nsysgap (10-09 22:18, Sonnet, `discover/nsysgap-report.md`): `nsys-bridge.py` gains --post a,b / busy (union) / gaps /
+  --joins N / --kernel / summary line / --self-test (22 assertions; 3 mutants each red on exactly its check), registered
+  in check-recipes; `q38-3090-nsys.card` reader block rewritten (verify handoff is `ds41_ffn_handoff_10_cols`, router
+  `qwen35moe_router_fused_512`; gap term = gaps_ms×1000/48). M2 sitting is now runnable.
+
+### What the 0.2.9 hotfix left (glmarch, clefq3, hfarch)
+- glmarch out-of-scope (worker2 10-09): `fetch_to` (`fetch.rs:386-431`) resumes a shorter cached file as a partial
+  download instead of checking the `.verified` digest. S.
+- glmarch out-of-scope: gate-side `expect_arch` (`lib.rs:196`) needs an Arch-level alias predicate so glm5-next passes
+  without letting deepseek4 into ds41 gates. S.
+- glmarch out-of-scope: the HF arch check of README `--hf` files. S, after the hotfix.
+- glmarch out-of-scope: ik's arch table lacks "glm5-next" (`src/llama-arch.cpp:89`) — keep the old shard 1 for ik
+  paths.
+- Prevention (hotfix layer ②): a weekly/release check that each README `--hf` file's live listing (size+digest) equals
+  the box's /models copy — the stale box copy hid both re-uploads. worker1's hfarch tool is the start; widen it from
+  arch to size+digest.
+- clefq3 out-of-scope: no test holds body35 `EMBED` = coverage pin (`coverage.rs:1058`, ~15 lines).
+- clefq3 out-of-scope: odd-`n_sb` Q3_K/Q6_K embedding passes load, fails at first step (`body35.rs:870`).
+- clefq3 out-of-scope: `ubatch.rs:341` calls `enqueue_embed_rows_q4k` directly for qwen3.
+- clefq3 out-of-scope: `agreement.md` measured on the old Clef files.
+- clefq3 out-of-scope: `elem.rs` and `crates/model/src/arch/mod.rs` have no gate-paths narrowing rows (raw affected
+  125–127, S).
+- clefq3 out-of-scope, box leftovers after release: `~/repo/bloomery-{glmarch,clefq3,clefq3-base,hotfix,fetchstale?}`,
+  `/models/clef-flash-1005`, `/root/glmarch-ff`, `/root/clefq3-out`.
+- `gate_clef_serve` loads the 10-02 qwen35-layout Q5_K_M + safetensors `--head`; move it to `/models/clef-flash-1005/`
+  Q5_K_M (clef layout, no `--head`), pins re-derived (worker2, after the train). Keep `/models/clef-flash-1005`.
+
+### What nsysgap left
+- Mac self-test flakes under load avg 40–84 (nsysgap saw 3 of 5 `check-recipes` runs red on unrelated blocks):
+  `q38-3090-server.sh` `B2: prompt_tokens=`, `lcpp-warm` `port0`, `gpu-gate.sh:235` `grep -q` early-exit Broken pipe,
+  `stack-watch`/`lease-hold` "is gone". Stub-server waits need a condition, not a sleep; the grep -q pipe needs
+  `grep >/dev/null`. S each. Logs: `scratchpad/nsysgap/check-recipes.run{2..5}-flake.out` (copy before the scratchpad
+  goes). t3r1fix saw it too: `gpu-gate.sh` self-test flaked 3 of 6 under Mac load (`printf` Broken pipe at `:235`).
+
+### What design-t3 and t3r1 left
+- design-t3 (opus, 10-09 22:48, `discover/design-t3-report.md`): L3 warm of the next layer's predicted host experts in
+  `wait_go`, CCD-major lanes (`threads::Pool::ccd_map`, `ops::Lanes{Flat,Ccd}`, both `run_group` and `UnionCall`),
+  predictor pure in `crates/runtime/src/warm.rs` (reset per request; engine-shaped recall +9–11 pt over the finals').
+  Predict 3090 server decode +8.5 % [+5.6, +14.0], --place gate one request +15.7 % [+11.6, +26.5] [derived from Mac
+  replays]. Band set by c_hot. Rounds: R1 CCD map + warm routine (M, on fd8e0bff; A/B none, predicted 0) → S-T3a probe
+  c_hot (6–8 box min, card `cards/t3-warm-probe.card`; 5–12 µs → R2) → R2 step-port warm + predictor (M–L;
+  S-T3b gate predict 10..22 %, S-T3c server 5..12 %) → R3 table in host ledger (S, after roomone/hostfloor). R2 lands
+  after levphase2. = the 0.2.10 decode candidate.
+- t3r1 committed `959bced6` on branch `t3r1` (base `fd8e0bff`; rebase onto main after this train). 10 files
+  +2352/−119; owning 5 gates green (round ledger), 3 ptx-scan pairs identical, 8 mutants red; mac-static/mac-test ok;
+  unsafe-ratchet model 117→119/30→31 PIN(2026-10-09); gate-threads gains `--lib`. Report
+  `specs/leader/t3r1/report.md`. Then S-T3a probe (6–8 min lease, card `specs/leader/t3r1/cards/t3-warm-probe.card`
+  → copy into `docs/cards`) on the R1 bench binary.
+- t3r1fix committed `642790eb` on `t3r1` (over `959bced6`): S1–S5 + N1–N11 closed (report
+  `specs/leader/t3r1/fix-report.md`); 14 mutants killed; ptx-scan ×3 identical; mac-static ok, mac-test 716/0; round
+  batch red=0. New lever `BLOOMERY_HOST_LANES` flat|ccd (default ccd) → R1 can be judged by a same-binary A/B (ccd vs
+  flat arms) — required by AGENTS (dispatch path touched; S3/N5 move the split).
+- Tracker (R27): the lever reaches `host_tier` through a process-global `AtomicBool` set at main (`set_host_lanes`)
+  instead of the `HostRun`/pool constructor — thread it through when R2 touches the step port.
+
+### What roomone left (worker1)
+- roomone tip `863614cc` (worker1, branch `roomone` on `ee53e7c6` + rrroom `e772219e`/`84d59d2d`): affected 125/141 + 2
+  weekly; needs records-refresh. FAIL-first done (bind glm reserve, declaration, hw hold_card A6000). Pending after
+  rebase: anchor-only mutant, `gate-gpu-lib` hold test, qwen38-serve past `46e9bb48` red, GLM e2e/mtp/twocard/serve.
+  merge-tree vs `fd8e0bff` conflicts `bind.rs/qwen38.rs/glm.rs` (`4144b1d8`).
+- roomone rebased on `fd8e0bff` (worker1 22:5x): tip `a562e31b` (`f1fc06f2`, `014cf537` rrroom; `a562e31b` roomone),
+  backup `roomone-pre-fd8=863614cc`. CacheRam keeps `4144b1d8` whole + roomone's checkpoints-inside-need; removed only
+  `46e9bb48`'s `a_reserved_need_takes_no_checkpoints_beside_it` (replaced). mac-static `fd8e0bff` ok; box
+  `gate-ds41-bind` 19/0 with Compiling. Items 1,2,4,5 → worker1 post-cut round.
+- roomone open decision (1): `HostNeed::check` no margin vs `nvme_arena_of` filling room−floor (M, design call).
+- roomone open decision (2): other seats/CLIs read room before any hold (ds41 `CacheRam`/`residency41`, `glm.rs:617`,
+  `qwen3moe_place.rs:316`, `generate_qwen3moe`/`glm5next`; S each).
+- roomone open decision (3): Qwen3.8 seat `--plan` now opens its card (~9 s JIT + ctx VRAM) — behaviour change.
+- roomone open decision (4): GLM `Place::machine` public → enforce by type (S–M).
+- roomone open decision (5): `gate_qwen38_serve` lacks plan room = load room clause (S).
+
+### What design-t1 left
+- design-t1 (opus, 10-09 22:50, `discover/design-t1-report.md`): the tournament's 'h' order breaks a data dependency
+  (A's back needs UN(B)); the dependency-correct split re-prices 3090 server pp4096 1,192 → 1,783…2,016 (centre
+  ≈1,880) [derived]. `ahead` has no V4.1 caller (GLM's group uses it); `wide38.rs:1942` does not darken a half unit
+  (the ring's width test does); no expert-subset union needed. Rounds, all on the train tip after prefill1 lands: R1a
+  common pieces no caller (S–M; BatchOrder::Fronts in `sched.rs`, leg unit rows, count scale, xstream share, runtime
+  splitwalk rule) → R1b wide38 unit windows, move class (M, ~60 sites) → R1c split walk on (M–L; A/B card
+  t1-split-pp predict +36..+47 % prose:4096 A6000) → R2 the walk's price (S–M, only if R1c's untimed arm says
+  A-chain binds; +4..+8 %) → R3 T1 with prefill1's return (M). Collides with prefill1 (wide38/xsplit/body38/record)
+  and levphase2 (registry phase). = the prompt-side candidate after T3.
+
+### What prefill1 left (worker2)
+- `gate_swap.rs:810/715` `staging_threads`/`tids` ENOENT false red (skip NotFound, S): `staging_threads` scans
+  `/proc/self/task` and races with exiting threads (ENOENT, rc 1 before s11 on prefill1's m2; base has the same scan)
+  — flaky-gate class.
+- `swap.rs:3760-3765` pump 256 spins + 20 µs sleep → lane `wait_until` (S–M).
+- `lane.rs:400` one `served` counter makes `wait_backlog` count return jobs (per-kind counters, M).
+- `body38.rs:3207` first token handed after `stream_end` — overlap the deficit with the handoff (idea, M).
+
+### The tarball pass B (10-09 23:10)
+- GLM-5.3-Flash keeps thinking under `reasoning_effort: "none"` (tarball pass B, 10-09 23:10; cause found 10-10 00:15).
+  Cause is the model's own template (unsloth shard 1, identical old/new and to
+  `crates/serve/tests/fixtures/glm5-chat-template.jinja`): it has NO enable_thinking switch — `<|assistant|><think>`
+  always (template line 256) — and its effort header takes low/high, else 'max'. Our `api.rs:2016-2024` maps "none"
+  → enable_thinking=false and drops reasoning_effort (llama-server's resolution), so GLM renders "Reasoning Effort:
+  Max" + `<think>`: the user asked for no thinking and silently gets max effort. The unit test
+  `reasoning_effort_none_turns_thinking_off_on_glm5` (`api.rs:4607`) pins only "none" == enable_thinking:false, which on
+  this template is the default. USER DECISION (morning): (a) 400 naming that this template has no off switch (no silent
+  failure; may break clients sending "none"), (b) map "none" → the template's lowest effort ("low") with a
+  record/warning, (c) leave as llama-server does. Lead recommends (b)+(a)-style warning line.
+
+### The next train (train029b?)
+- Next train (train029b?): r4glm `c96d06e0` (`coverage.rs` GLM routed arm → `routed_unrun(card_routed)`; Head pin
+  q8_0/q6_K/q4_K; UD-Q3_K_XL passes coverage; 9 CPU/meta gates 9/0; ptx-scan serve identical) + k1iq3s + t3r1 +
+  fxr1/fxr2/fxr3 (fxoracle R1–R3 land with R2's sets; fxr3 `314d155b` `site_rel` text-drift test to replace) +
+  whatever lands from T1.
+
+### Train shortening: gate-paths (gatepaths2)
+- `tools/gate-paths.tsv` lacks narrowing rows for many core files (tracker → worker slot, train shortening):
+  `elem.rs`, `crates/model/src/arch/mod.rs` (hotfix: raw 125–127), gpu-gates `tier.rs/flip.rs/act_rule.rs` (fxr3: 98
+  for a lib-only add), `crates/model/src/{ops,moe}.rs` + threads `lib.rs` (t3r1: 128, 5,085 s for a ptx-equal move). One
+  round derives rows from module trees + which gates exercise each file, FAIL-first by mutation (a row that drops a gate
+  catching a planted defect is red). t3r1's drafted rows go to it.
+- gatepaths2 (worker1, `6309aac3` on nofixture `490908c5`): reach derivation (`recipes.py` reach), `check-recipes` holds
+  every row to it; found 336 gates missing from existing rows (refset clefvis +78, placement +45, `generate.rs` +24,
+  serve `build.rs` unmapped); 186 hand-narrowings → named exceptions; 37 new rows. Wall effect 0 [derived] (V4.1 chain
+  2,348 + solo pack 2,056 set the 4,577 s wall). Lands after its B sitting (instrument cross-check, ~17 min), in the
+  landing after this train.
+
+### The fixture-tier calibration (10-10)
+- Calibration finding 2: `crates/model` host tests (`gate-forward`/`attn`/`alloc`) bypass the fence — they opened the
+  real V2-Lite in the fixture tier and went green → those greens are real-file greens, not fixture coverage (count
+  them so in the comparison). Route `crates/model` tests through the fence or mark them real-file.
+- The fence refuses `lev-serve`'s gate-written mock files (`target/lev-serve-gate/{kev,no-decision}.gguf`) → T2 mock
+  files cannot live in the fixture tier.
+- `gate-gpu-nvtier`, fixture tier: `box.sh` exports the qwen4exp fixture `CARD_BUDGET`, `gate_nvtier` refuses
+  `NotActedOn` — pre-existing → worker2 nofixture. The fixture tier run (DONE 00:30): total=136 red=32 (31 logs)
+  deferred=78 real_only=30 no_fixture=2, wall 1,080 s (laneA 844, laneB 841, laneX 236). All 31 reds are
+  tier-classification gaps, no train regression: 29 NotFixture (real-file kind; list `fx-reds.txt`),
+  `gate-gpu-qwen38-residency` (inline exit-66 guard instead of `real-only.sh`), and this one. Next after the fixture
+  tier: fxr2 sitting (worker2, started 00:30:54).
+
 ## After 0.2.8 (10-09, leader — the post-tag train: paged2, bpslots, levphase, loadchain + packsched, roomneed, stepunion2, binslots)
 
 ### What paged1 and pagedoff left
