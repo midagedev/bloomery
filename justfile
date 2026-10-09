@@ -2032,10 +2032,15 @@ weekly-gpu-mimo2-e2e *ARGS:
 # model: alone in a batch in the real tier, under the big-load lock the V4.1 loads take; balanced over the cards in the
 # fixture tier, which takes no lock.
 # PIN(2026-10-09): its own bound, 1200 s. The measured median is 773 s (train028b/028c/028f's times rows), past 0.75 x
-# the default 900 the batch's budget refusal names; the gate's arms admit no smaller split (`--only` takes one arm, so
-# one item per arm: main 293 s, pp 313 s, slots 162 s, stagger 69 s, each plus its own ~50 s load — 936 s of chain time,
-# +163 s on the critical path). 1200 keeps the kill at 1.55 x the median while the budget check reads 900 s, the default
-# bound itself.
+# the default 900 the batch's budget refusal names; the gate's arms admit no smaller split (`--only` takes one arm and
+# `--only slots` runs the stagger's loads too, so main, pp and slots are three items). A split pays no cold load per
+# item: the cold first load, 50.7 s, is the batch's first GLM process's alone (train029a's 3090 log, inside its main
+# arm of 316 s); a later process's first load there took 18.2-24.9 s (residency, stagger) against 16.0-18.9 s for a warm
+# load inside one process, so the two added items cost at most 2 x (24.9 - 16.0) = 17.8 s [derived] of load plus their
+# process starts, and the chain, which runs one item at a time under the V4.1 load lock, takes nothing back: one item
+# stays. The slots arm's (sd) and (s3) run on the harness's load, 16.4 s of load less (the same log), so about
+# 773 - 16.4 = 757 s [derived], still past 675 s. 1200 keeps the kill at 1.55 x the median while the budget check reads
+# 900 s, the default bound itself.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-e2e:

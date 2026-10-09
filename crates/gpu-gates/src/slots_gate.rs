@@ -52,9 +52,14 @@
 //! there, moving at most the last slot off its path and reading any other
 //! slot's continuation through [`Interleaved::continues`];
 //! [`Interleaved::finish`] runs H4, then H5 — both its resets move both
-//! slots off their paths, so nothing may read a path behind it. A call that
-//! fails inside a contract is that contract's red with the error printed,
-//! so every contract prints its line whatever an earlier one left.
+//! slots off their paths, so nothing may read a path behind it — and then
+//! H5's one-slot clause on a load of its own. [`Interleaved::finish_keep`]
+//! runs H4 and H5 alone and hands the model back, for clauses of the body
+//! gate that reset every slot they use before they read it; H5's one-slot
+//! clause waits in the [`OneSlot`] it returns, which takes the model back
+//! and drops it before the clause's load opens. A call that fails inside a
+//! contract is that contract's red with the error printed, so every
+//! contract prints its line whatever an earlier one left.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -269,6 +274,27 @@ pub struct Interleaved<'a, A: SlotsAdapter> {
     ok: bool,
 }
 
+/// H5's one-slot clause, left to the caller by [`Interleaved::finish_keep`]:
+/// it opens a load of its own, so it takes the harness's model back and drops
+/// it first, and the card holds one load at a time.
+#[must_use = "H5's one-slot clause runs only through OneSlot::run"]
+pub struct OneSlot<'a, A: SlotsAdapter> {
+    a: &'a A,
+}
+
+impl<A, B> OneSlot<'_, A>
+where
+    A: SlotsAdapter<Body = B>,
+    B: Slots<Seq: 'static>,
+{
+    /// `model` dropped, then H5's one-slot clause on a load of its own: its
+    /// verdict.
+    pub fn run(self, model: GpuModel<A::Body>) -> bool {
+        drop(model);
+        check(H5R, one_slot(self.a))
+    }
+}
+
 /// H3, H6, H1 and H7 over `a`'s body loaded for [`STREAMS`] slots: every
 /// stream's solo run on the load's one sequence first, then the slots added
 /// and interleaved (module doc). Each contract prints its `check` line; the
@@ -301,7 +327,7 @@ where
     })
 }
 
-impl<A, B> Interleaved<'_, A>
+impl<'a, A, B> Interleaved<'a, A>
 where
     A: SlotsAdapter<Body = B>,
     B: Slots<Seq: 'static>,
@@ -340,17 +366,24 @@ where
         Ok(stream.given[from..] == *want)
     }
 
-    /// H4, H5, and the harness's verdict over every contract it ran. The
-    /// model drops here, its added sequences with it.
-    pub fn finish(mut self) -> Result<bool, GateError> {
+    /// H4, H5, H5's one-slot clause, and the harness's verdict over every
+    /// contract it ran. The model drops before the one-slot clause's load
+    /// opens, its added sequences with it.
+    pub fn finish(self) -> Result<bool, GateError> {
+        let (ok, model, one_slot) = self.finish_keep();
+        Ok(one_slot.run(model) && ok)
+    }
+
+    /// H4 and H5 as [`Interleaved::finish`] runs them, the model handed back
+    /// instead of dropped, and the verdict over every contract run so far.
+    /// Every slot stands where H5's last prompts and steps left it; a caller
+    /// reads a slot only after resetting it. H5's one-slot clause is the
+    /// returned [`OneSlot`]'s to run.
+    pub fn finish_keep(mut self) -> (bool, GpuModel<A::Body>, OneSlot<'a, A>) {
         let reset = check(H4, self.reset_isolation());
         let poison = check(H5, self.poisons());
         let Interleaved { a, model, ok, .. } = self;
-        // H5's one-slot clause opens a load of its own: the harness's goes
-        // first, so the card holds one load at a time.
-        drop(model);
-        let one_slot = check(H5R, one_slot(a));
-        Ok(reset && poison && one_slot && ok)
+        (reset && poison && ok, model, OneSlot { a })
     }
 
     /// H5 (module doc), on the harness's model after H4: a round of both

@@ -220,8 +220,10 @@
 //!   stood: its last id, position and stores bit for bit as before the cut —
 //!   the pending cut travels with its slot.
 //!
-//! Then, on a load of their own (the MTP draft drives a session, which owns
-//! its model; the harness lends its own by reference only), three prompts:
+//! Then, on the harness's own load once its H4 and H5 have run (the MTP draft
+//! drives a session, which owns its model: the harness hands its model over,
+//! and each clause resets every slot it uses before it reads it), three
+//! prompts:
 //! - (sd) drafted: under the MTP draft (each slot's side of it parked and put
 //!   back around a select, as the seat's table does), the two prompts on
 //!   slots 0 and 1, a select between every pass, [`SLOT_PASSES`] passes and
@@ -233,6 +235,9 @@
 //!   between, then slot 1 put back (`seq_resume`): both slots'
 //!   [`SLOT_RESUMED`] passes and a step bit for bit, counts included, their
 //!   solo runs'.
+//!
+//! The harness's last clause, H5's one-slot case, runs after them on a load
+//! of one sequence of its own, the card holding one load at a time.
 //!
 //! A pass of two slots (`GpuModel::step_slots`: the pair's walk, each row a
 //! plain step of its own slot), residency off, the first two prompts. On the
@@ -310,16 +315,21 @@
 //!
 //! An error inside a clause body of (sp), (sc), (sd), (s3), (g1)-(g5) or
 //! (h1)-(h4) is that clause's FAIL, not the gate's end; one in a load, a
-//! solo run or the draft's open ends the gate.
+//! solo run or the draft's open ends the gate, but (sd) and (s3), which run
+//! on the harness's load, take theirs as a FAIL too: a harness that left that
+//! model unusable does not end the gate before H5's one-slot case and the
+//! stagger.
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
 //! at [`CTX`] of one lane, `--only verify` (s) and (v) alone on a load at
 //! [`CTX`] of two (the plain graph run of the batch set they compare against
 //! included), `--only keep` (k) alone on a load at [`CTX`] of two, `--only
-//! slots` the resident slots' clauses alone on their four loads, `--only
-//! stagger` (g1)-(g5) alone on their two plain loads, `--only stagger-draft`
-//! (h1)-(h4), which no other run takes, on the drafted slots' NextN load.
+//! slots` the resident slots' clauses and the stagger's on their four loads
+//! (the NextN load of two slots, H5's load of one sequence, the stagger's two
+//! plain loads), `--only stagger` (g1)-(g5) alone on their two plain loads,
+//! `--only stagger-draft` (h1)-(h4), which no other run takes, on the drafted
+//! slots' NextN load.
 //! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
@@ -3030,19 +3040,47 @@ mod gate {
         ok &= clause_timed("slots", "(g5) on the NextN load", || g5_nextn(s.model()));
         let t = Instant::now();
         tier::sc("(slots) harness finish: H4 reset, H5 refusals")?;
-        ok &= s.finish()?;
-        elapsed("(slots) harness finish (H4, H5, H5R)", &t);
-        // (sd) and (s3) drive the MTP draft through a session, which owns
-        // its model; the harness lends its own by reference only.
-        let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
+        let (finished, model, one_slot) = s.finish_keep();
+        ok &= finished;
+        elapsed("(slots) harness finish (H4, H5)", &t);
+        // (sd) and (s3) drive the MTP draft through a session, which owns its
+        // model: the harness's, handed over whole. Their error is their FAIL,
+        // so a harness that left the model unusable still reaches H5's
+        // one-slot case and the stagger.
+        let mut s = Session::from_model(model, u32::try_from(SLOT_CTX)?);
+        ok &= clause(
+            "slots",
+            "(sd) and (s3) on the harness's load",
+            drafted_clauses(&mut s, (a, b, c)),
+        );
+        // H5's one-slot case opens a load of its own, and so do the stagger's:
+        // each takes the card with the one before it dropped.
+        let t = Instant::now();
+        ok &= one_slot.run(s.into_model());
+        elapsed("(slots) H5 one-slot", &t);
+        let t = Instant::now();
+        ok &= stagger(levers, &body.inputs, (a, b))?;
+        elapsed("arm stagger", &t);
+        Ok(ok)
+    }
+
+    /// (sd) and (s3) on `s`, which holds the harness's model after its H4 and
+    /// H5: slot 0 selected as a load leaves it, every slot reset before its
+    /// first step in them, the draft opened over the model and each slot's
+    /// side of it parked fresh.
+    fn drafted_clauses(
+        s: &mut Session<Body>,
+        (a, b, c): (&[u32], &[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        s.select_slot(0)?;
         s.model_mut().set_mode(StepMode::Graph);
         s.add_slots(SLOTS)?;
         let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let mut parked = vec![spec.draft().park(); SLOTS];
         let t = Instant::now();
-        let solo_a = drafted_solo(&mut s, &mut spec, &mut parked, 0, a)?;
-        let solo_b = drafted_solo(&mut s, &mut spec, &mut parked, 0, b)?;
+        let solo_a = drafted_solo(s, &mut spec, &mut parked, 0, a)?;
+        let solo_b = drafted_solo(s, &mut spec, &mut parked, 0, b)?;
         let solo_passes = || solo_a[1].passes.iter().chain(&solo_b[1].passes);
         // The runs' coverage is the file's draft: the NextN layer of a fixture is random, whose
         // proposals the target refuses, so the coverage premise is the real tier's.
@@ -3057,25 +3095,18 @@ mod gate {
             "slots: the solo drafted runs accept and reject a proposal: {proposed} {}",
             verdict(held)
         );
-        ok &= held;
+        let mut ok = held;
         elapsed("(sd) solo runs", &t);
         let solos = (&solo_a[0], &solo_b[0]);
         let t = Instant::now();
         tier::sc("(sd) drafted: two slots under the draft, each its solo run")?;
-        let sd = slots_drafted(&mut s, &mut spec, &mut parked, (a, b), solos);
+        let sd = slots_drafted(s, &mut spec, &mut parked, (a, b), solos);
         elapsed("(sd) drafted", &t);
         match sd {
             Ok((sd, runs)) => {
                 ok &= sd;
                 ok &= clause_timed("slots", "(s3) park/resume", || {
-                    slots_resume(
-                        &mut s,
-                        &mut spec,
-                        &mut parked,
-                        c,
-                        runs,
-                        (&solo_a[1], &solo_b[1]),
-                    )
+                    slots_resume(s, &mut spec, &mut parked, c, runs, (&solo_a[1], &solo_b[1]))
                 });
             }
             Err(e) => {
@@ -3087,11 +3118,6 @@ mod gate {
                 );
             }
         }
-        // The stagger's loads hold the card next: the drafted load goes first.
-        drop((spec, parked, s));
-        let t = Instant::now();
-        ok &= stagger(levers, &body.inputs, (a, b))?;
-        elapsed("arm stagger", &t);
         Ok(ok)
     }
 
