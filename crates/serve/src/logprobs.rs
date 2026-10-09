@@ -496,7 +496,7 @@ pub(super) fn completion_ask(
                 "n_probs {n} is past the {MAX_TOP} alternatives a token this server returns"
             ))
         })?;
-    if get_b(b, "post_sampling_probs") == Some(true) {
+    if get_b(b, "post_sampling_probs")? == Some(true) {
         return Err(post_sampling());
     }
     Ok(Some(Ask::new(n, n_vocab)))
@@ -527,7 +527,7 @@ pub(super) fn chat_ask(
                 .get("tools")
                 .and_then(Value::as_array)
                 .is_some_and(|a| !a.is_empty());
-            if tools && get_b(b, "stream") == Some(true) {
+            if tools && get_b(b, "stream")? == Some(true) {
                 return Err(invalid("logprobs is not supported with tools + stream"));
             }
             let n = match (top_set, top) {
@@ -541,7 +541,7 @@ pub(super) fn chat_ask(
                     )));
                 }
             };
-            if get_b(b, "post_sampling_probs") == Some(true) {
+            if get_b(b, "post_sampling_probs")? == Some(true) {
                 return Err(post_sampling());
             }
             Ok(Some(Ask::new(n, n_vocab)))

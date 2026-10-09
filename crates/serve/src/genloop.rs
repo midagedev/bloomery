@@ -58,8 +58,8 @@ use serde_json::{Value, json};
 
 use crate::api::logprobs::{Ask, Collector, RowError};
 use crate::engine::{
-    CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams,
-    Saved, SlotPass, SlotRow, StateError, Tokenizer,
+    CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplerRefused,
+    SamplingParams, Saved, SlotPass, SlotRow, StateError, Tokenizer,
 };
 use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
 use crate::promptcache::PromptCache;
@@ -1228,14 +1228,23 @@ pub(crate) struct Gen {
     probs: Option<Collector>,
 }
 
+/// The sampler a request of `p` draws with, `None` for a greedy one, or the
+/// factory's refusal of its parameters. A penalized request at temperature 0
+/// takes the sampler's argmax after the penalties, as llama-server's chain
+/// does; only an unpenalized one is greedy.
+pub(crate) fn sampler_of(
+    factory: &SamplerFactory,
+    p: &GenParams,
+) -> Result<Option<Sampler>, SamplerRefused> {
+    (p.sampling.temperature > 0.0 || p.sampling.penalizes())
+        .then(|| factory(&p.sampling))
+        .transpose()
+}
+
 impl Gen {
-    /// A generation of `p` for a prompt of `n` ids on `slot`'s engine; nothing
-    /// runs yet.
-    pub(crate) fn new(slot: &Slot, factory: &SamplerFactory, n: usize, p: &GenParams) -> Gen {
-        // A penalized request at temperature 0 takes the sampler's argmax after
-        // the penalties, as llama-server's chain does; only an unpenalized one is greedy.
-        let sampler =
-            (p.sampling.temperature > 0.0 || p.sampling.penalizes()).then(|| factory(&p.sampling));
+    /// A generation of `p` for a prompt of `n` ids on `slot`'s engine, drawing
+    /// with `sampler` ([`sampler_of`]); nothing runs yet.
+    pub(crate) fn new(slot: &Slot, sampler: Option<Sampler>, n: usize, p: &GenParams) -> Gen {
         let stops = slot.vocab.stops();
         let banned = if p.ignore_eos {
             stops.clone()
@@ -1784,7 +1793,8 @@ pub(crate) fn generate(
     tick: &mut dyn FnMut(&Timings),
     timings_out: &mut Timings,
 ) -> Result<Outcome, GenError> {
-    let mut g = Gen::new(slot, factory, ids.len(), p);
+    let sampler = sampler_of(factory, p).expect("the test's factory takes the request");
+    let mut g = Gen::new(slot, sampler, ids.len(), p);
     let r = g.run(slot, &Held::from(ids.to_vec()), &[], p, sink, tick);
     timings_out.clone_from(g.timings());
     r
@@ -2452,7 +2462,7 @@ mod media_tests {
 
     use vision::{GridPlan, Patches};
 
-    use super::{Gen, GenParams, Slot};
+    use super::{Gen, GenParams, Slot, sampler_of};
     use crate::engine::{Engine, EngineError, SamplingParams, Tokenizer};
     use crate::media::{Held, ImageKey, MediaFeed, MediaSpan, Prepared, Prompt};
     use crate::mock::{IMAGE_ID, MediaCall, MediaTokenizer, MockEngine};
@@ -2514,7 +2524,8 @@ mod media_tests {
             logprobs: None,
         };
         let factory = sampling::reference_factory();
-        let mut g = Gen::new(slot, &factory, p.held.len(), &params);
+        let sampler = sampler_of(&factory, &params).expect("the reference refuses none");
+        let mut g = Gen::new(slot, sampler, p.held.len(), &params);
         let o = g
             .run(
                 slot,

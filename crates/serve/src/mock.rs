@@ -49,13 +49,13 @@
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use vision::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 
 use crate::engine::{
     Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Sampler,
-    SavedState, StateError, Tokenizer,
+    SavedState, SlotPass, StateError, Tokenizer,
 };
 use crate::media::{MediaFeed, MediaSpan, SharedMediaModel};
 use crate::slotfile;
@@ -628,6 +628,57 @@ pub struct DraftMock {
     /// Every step and pass the server asked for, in order, when
     /// [`DraftMock::logged`].
     log: Option<Arc<Mutex<Vec<MockCall>>>>,
+    /// Blocks every `prefill` until it opens, when [`DraftMock::holding`].
+    hold: Option<Arc<Hold>>,
+}
+
+/// A hold on a mock's prompt calls: until it opens, every `prefill` blocks,
+/// so a test queues requests behind the one the engine thread is in.
+#[derive(Default)]
+pub struct Hold {
+    /// The prompt calls that reached it, and whether it is open.
+    state: Mutex<(usize, bool)>,
+    cv: Condvar,
+}
+
+impl Hold {
+    fn enter(&self) {
+        let mut g = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.0 += 1;
+        self.cv.notify_all();
+        while !g.1 {
+            g = self
+                .cv
+                .wait(g)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Whether `n` prompt calls reached the hold within `bound`.
+    #[must_use]
+    pub fn reached(&self, n: usize, bound: std::time::Duration) -> bool {
+        let g = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, bound, |s| s.0 < n)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.0 >= n
+    }
+
+    /// Lets every prompt call through, now and later.
+    pub fn open(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = true;
+        self.cv.notify_all();
+    }
 }
 
 /// A step or pass a [`DraftMock`] was asked for ([`DraftMock::logged`]).
@@ -639,6 +690,9 @@ pub enum MockCall {
     Advance,
     /// [`Engine::advance_sampled`].
     Sampled,
+    /// [`Engine::advance_slots`], with its row count; each row also logs the
+    /// [`MockCall::Advance`] it runs.
+    AdvanceSlots(usize),
 }
 
 impl DraftMock {
@@ -655,6 +709,7 @@ impl DraftMock {
             of: 3,
             proposals: vec![0],
             log: None,
+            hold: None,
         }
     }
 
@@ -710,6 +765,15 @@ impl DraftMock {
     pub fn logged(self, log: Arc<Mutex<Vec<MockCall>>>) -> Self {
         DraftMock {
             log: Some(log),
+            ..self
+        }
+    }
+
+    /// The same drafting mock whose every `prefill` waits for `hold` to open.
+    #[must_use]
+    pub fn holding(self, hold: Arc<Hold>) -> Self {
+        DraftMock {
+            hold: Some(hold),
             ..self
         }
     }
@@ -783,6 +847,9 @@ impl Engine for DraftMock {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        if let Some(hold) = &self.hold {
+            hold.enter();
+        }
         self.inner.prefill(ids)
     }
 
@@ -852,6 +919,17 @@ impl Engine for DraftMock {
 
     fn slot_drafts(&self) -> bool {
         true
+    }
+
+    /// The default's select and `advance` a row, logged as one call of its
+    /// row count.
+    fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
+        self.record(MockCall::AdvanceSlots(rows.len()));
+        for row in rows {
+            self.select_slot(row.slot)?;
+            row.drafted = self.advance(row.last, row.out)?;
+        }
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {

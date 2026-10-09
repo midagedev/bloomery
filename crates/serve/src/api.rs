@@ -35,6 +35,13 @@
 //! `{"filename": "<base name>"}` under [`ServerConfig::slot_save_path`]; the
 //! file is [`crate::slotfile`]'s.
 //!
+//! A field sent with a type it does not take is a 400 naming the field and the
+//! type it takes, never read as unset (`null` is the one unset spelling beside
+//! absence; the typed getters `get_i`, `get_f32`, `get_b` and `stop_list` own
+//! the reads): llama-server falls back to the field's default on a wrong type
+//! in its OpenAI pre-parse and ignores a `stop` that is neither a string nor
+//! an array, and this server does neither.
+//!
 //! `POST /residency/reset` is bloomery's own: the engine's adaptive expert
 //! residency back to its load's placement ([`Engine::residency_reset`]), the
 //! one call that does it — a request never resets it. It runs while every slot
@@ -337,6 +344,7 @@ impl Server {
             tok,
             fatal_linger: config.fatal_linger,
             tool_format: ToolFormat::of_chat_template(&template),
+            object_arguments: needs_object_arguments(&template),
             template,
             alias: config.model_alias,
             model_path: config.model_path,
@@ -445,6 +453,9 @@ struct State {
     template: ChatTemplate,
     /// The tool-call markup the template teaches, read from its source once.
     tool_format: ToolFormat,
+    /// Whether the template reads a tool call's `arguments` as an object
+    /// ([`needs_object_arguments`]), decided once.
+    object_arguments: bool,
     alias: String,
     model_path: String,
     /// `/props`' `engine` object, built when the server binds.
@@ -1209,28 +1220,40 @@ fn body(req: &Request) -> Result<Map<String, Value>, ApiError> {
 
 // ---------------------------------------------------------------- field helpers
 
-/// A real field as `f32`. Absent, `null` or not a number is `None`, a field of
-/// another type read as absent as llama-server reads it; a number whose `f32`
-/// is not finite (`1e39`) is a 400 naming the field, as a penalty's is, where
-/// the sampler would refuse it and the request would run greedy.
+/// A field of another type than it takes: a 400 naming the field, the type it
+/// takes and the type it got.
+fn wrong_type(k: &str, takes: &str, v: &Value) -> ApiError {
+    invalid(format!("{k} must be {takes}, not {}", json_type(v)))
+}
+
+/// A real field as `f32`. Absent or `null` is `None`, any other type than a
+/// number a 400; a number whose `f32` is not finite (`1e39`) is a 400 naming
+/// the field, as a penalty's is, where the sampler would refuse it and the
+/// request would run greedy.
 fn get_f32(o: &Map<String, Value>, k: &str) -> Result<Option<f32>, ApiError> {
-    let Some(v) = o.get(k).filter(|v| v.is_number()) else {
+    let Some(v) = o.get(k).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    v.as_f64()
-        .map(|x| x as f32)
+    let Some(x) = v.as_f64() else {
+        return Err(wrong_type(k, "a number", v));
+    };
+    Some(x as f32)
         .filter(|x| x.is_finite())
         .map(Some)
         .ok_or_else(|| invalid(format!("{k} must be a finite number, not {v}")))
 }
 
-/// An integer field. Absent, `null` or not a number is `None`; a number that is
-/// not an integer (`2.5`, or past `i64`) is a 400 naming the field, where
-/// llama-server would truncate it. An integer-valued float (`2.0`) passes.
+/// An integer field. Absent or `null` is `None`, any other type than a number
+/// a 400; a number that is not an integer (`2.5`, or past `i64`) is a 400
+/// naming the field, where llama-server would truncate it. An integer-valued
+/// float (`2.0`) passes.
 fn get_i(o: &Map<String, Value>, k: &str) -> Result<Option<i64>, ApiError> {
-    let Some(v) = o.get(k).filter(|v| v.is_number()) else {
+    let Some(v) = o.get(k).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if !v.is_number() {
+        return Err(wrong_type(k, "an integer", v));
+    }
     if let Some(i) = v.as_i64() {
         return Ok(Some(i));
     }
@@ -1242,14 +1265,22 @@ fn get_i(o: &Map<String, Value>, k: &str) -> Result<Option<i64>, ApiError> {
     }
 }
 
-fn get_b(o: &Map<String, Value>, k: &str) -> Option<bool> {
-    o.get(k).and_then(Value::as_bool)
+/// A boolean field. Absent or `null` is `None`, any other type than a boolean
+/// a 400.
+fn get_b(o: &Map<String, Value>, k: &str) -> Result<Option<bool>, ApiError> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(wrong_type(k, "a boolean", v)),
+    }
 }
 
-/// `stop` as a string or an array of strings; an array element that is not a
-/// string is a 400 naming the field.
+/// `stop` as a string or an array of strings; absent or `null` holds none, an
+/// array element that is not a string and any other type is a 400 naming the
+/// field.
 fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
     match v {
+        None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::String(s)) => Ok(vec![s.clone()]),
         Some(Value::Array(a)) => a
             .iter()
@@ -1259,11 +1290,14 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
                     .ok_or_else(|| invalid(format!("stop must hold strings, not {x}")))
             })
             .collect(),
-        _ => Ok(Vec::new()),
+        Some(other) => Err(wrong_type("stop", "a string or an array of strings", other)),
     }
 }
 
-/// Knobs shared by both generation endpoints. `n_predict` wins over the OpenAI names.
+/// Knobs shared by both generation endpoints. The token limit is the first set
+/// of `n_predict`, `max_completion_tokens` and `max_tokens`, llama-server's
+/// order on both routes (`n_predict` first, the OpenAI names its aliases in that
+/// order); every one that is set must be an integer, the shadowed ones too.
 /// `cache_prompt` (default `true`, as llama-server) keeps the longest prefix the
 /// engine's cache already holds; `false` resets it first.
 ///
@@ -1332,10 +1366,12 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         Some(s) if s >= 0 => s as u64,
         _ => mix(state.next_id() ^ unix_now().rotate_left(17)) & u64::from(u32::MAX),
     };
-    let n_predict = get_i(o, "n_predict")?
-        .or(get_i(o, "max_tokens")?)
-        .or(get_i(o, "max_completion_tokens")?)
-        .unwrap_or(-1);
+    let limits = [
+        get_i(o, "n_predict")?,
+        get_i(o, "max_completion_tokens")?,
+        get_i(o, "max_tokens")?,
+    ];
+    let n_predict = limits.into_iter().flatten().next().unwrap_or(-1);
     let top_k = get_i(o, "top_k")?;
     let penalty = |k: &str, d: f32, ok: fn(f32) -> bool, rule: &str| match set(k) {
         None => Ok(d),
@@ -1388,16 +1424,16 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         n_predict: if n_predict < 0 { -1 } else { n_predict },
         sampling,
         stop: stop_list(o.get("stop"))?,
-        ignore_eos: get_b(o, "ignore_eos").unwrap_or(false),
-        stream: get_b(o, "stream").unwrap_or(false),
-        timings_per_token: get_b(o, "timings_per_token").unwrap_or(false),
-        return_progress: get_b(o, "return_progress").unwrap_or(false),
+        ignore_eos: get_b(o, "ignore_eos")?.unwrap_or(false),
+        stream: get_b(o, "stream")?.unwrap_or(false),
+        timings_per_token: get_b(o, "timings_per_token")?.unwrap_or(false),
+        return_progress: get_b(o, "return_progress")?.unwrap_or(false),
         include_usage: o
             .get("stream_options")
             .and_then(|s| s.get("include_usage"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
+        cache_prompt: get_b(o, "cache_prompt")?.unwrap_or(true),
         reasoning_budget: reasoning_budget(o)?,
         think_entry: ThinkEntry::Closed,
         logprobs: None,
@@ -1946,8 +1982,8 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
 
 fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let content = b.get("content").and_then(Value::as_str).unwrap_or("");
-    let add_special = get_b(b, "add_special").unwrap_or(false);
-    let with_pieces = get_b(b, "with_pieces").unwrap_or(false);
+    let add_special = get_b(b, "add_special")?.unwrap_or(false);
+    let with_pieces = get_b(b, "with_pieces")?.unwrap_or(false);
     let t = &*state.tok;
     let mut ids = Vec::new();
     if add_special && t.add_bos() {
@@ -2003,9 +2039,12 @@ struct Rendered {
 /// becomes one text: on an engine that takes images, its parts flattened by
 /// the model's rule ([`media::flatten`]), each image the model's placeholder;
 /// on one that takes none, its text parts joined, any other part refused by
-/// name ([`content_text`]). Nothing is dropped. A `developer` message reaches
-/// the template as `system`, as llama-server maps it, and the thinking vars
-/// ([`thinking_vars`]) reach it in llama-server's order.
+/// name ([`content_text`]); a content that is neither a string, an array nor
+/// `null` is refused too, as is a `tools` that is not an array. Nothing is
+/// dropped. A `developer` message reaches the template as `system`, as
+/// llama-server maps it, a tool call's string `arguments` reach a template
+/// that reads them as an object parsed ([`tool_call_arguments`]), and the
+/// thinking vars ([`thinking_vars`]) reach it in llama-server's order.
 fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiError> {
     let Some(Value::Array(msgs)) = b.get("messages") else {
         return Err(invalid("'messages' is required and must be an array"));
@@ -2015,7 +2054,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     let gpt_oss = state.template.source().contains("<|channel|>");
     let mut messages = Vec::with_capacity(msgs.len());
     let mut images = Vec::new();
-    for m in msgs {
+    for (i, m) in msgs.iter().enumerate() {
         let Value::Object(m) = m else {
             return Err(invalid("each message must be an object"));
         };
@@ -2034,16 +2073,30 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         };
         let mut flat = m.clone();
         flat.insert("role".into(), Value::String(role.to_owned()));
-        if let Some(Value::Array(parts)) = m.get("content") {
-            let text = match &state.media {
-                None => content_text(parts)?,
-                Some(model) => {
-                    let f = media::flatten(role, parts, &**model).map_err(|e| media_error(&e))?;
-                    images.extend(f.images.into_iter().map(str::to_owned));
-                    f.text
-                }
-            };
-            flat.insert("content".into(), Value::String(text));
+        match m.get("content") {
+            Some(Value::Array(parts)) => {
+                let text = match &state.media {
+                    None => content_text(parts)?,
+                    Some(model) => {
+                        let f =
+                            media::flatten(role, parts, &**model).map_err(|e| media_error(&e))?;
+                        images.extend(f.images.into_iter().map(str::to_owned));
+                        f.text
+                    }
+                };
+                flat.insert("content".into(), Value::String(text));
+            }
+            None | Some(Value::Null | Value::String(_)) => {}
+            Some(other) => {
+                return Err(wrong_type(
+                    &format!("messages[{i}].content"),
+                    "a string or an array of parts",
+                    other,
+                ));
+            }
+        }
+        if state.object_arguments {
+            tool_call_arguments(i, &mut flat)?;
         }
         messages.push(Value::Object(flat));
     }
@@ -2051,7 +2104,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     vars.insert("messages".into(), Value::Array(messages));
     vars.insert(
         "add_generation_prompt".into(),
-        Value::Bool(get_b(b, "add_generation_prompt").unwrap_or(true)),
+        Value::Bool(get_b(b, "add_generation_prompt")?.unwrap_or(true)),
     );
     vars.insert(
         "bos_token".into(),
@@ -2061,8 +2114,12 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         "eos_token".into(),
         Value::String(state.info.eos_text.clone()),
     );
-    if let Some(v) = b.get("tools").filter(|v| !v.is_null()) {
-        vars.insert("tools".into(), v.clone());
+    match b.get("tools") {
+        None | Some(Value::Null) => {}
+        Some(v @ Value::Array(_)) => {
+            vars.insert("tools".into(), v.clone());
+        }
+        Some(other) => return Err(wrong_type("tools", "an array", other)),
     }
     thinking_vars(b, &mut vars)?;
     let text = state.template.render(&vars).map_err(|e| ApiError {
@@ -2074,8 +2131,78 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     Ok(Rendered { text, images })
 }
 
+/// The argument a template's probe call carries.
+const PROBE_ARGUMENT: &str = "argument_needle";
+
+/// Whether the chat template needs a tool call's `arguments` as an object
+/// rather than the JSON string the OpenAI API carries: a probe call renders
+/// with its arguments as an object and as that object's JSON string, and the
+/// template needs the object when the object's render shows the argument and
+/// the string's does not — it fails on the string (`.items()`, a
+/// `raise_exception`), drops it, or prints it as a quoted JSON string. That is
+/// minja's `requires_object_arguments`; llama-server now decides by what the
+/// template touches of the object (`supports_object_arguments`,
+/// `common/jinja/caps.cpp`), which this engine cannot observe, and parses as
+/// well for a template that takes a string and an object alike but renders an
+/// object through `tojson`, which this server passes as it came.
+fn needs_object_arguments(t: &ChatTemplate) -> bool {
+    let object = json!({ PROBE_ARGUMENT: "print('Hello, World!')" });
+    let render = |arguments: Value| {
+        let mut vars = Map::new();
+        vars.insert(
+            "messages".into(),
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_0", "type": "function", "function": {
+                        "name": "probe", "arguments": arguments,
+                    }},
+                ]},
+            ]),
+        );
+        vars.insert("add_generation_prompt".into(), json!(false));
+        vars.insert("bos_token".into(), json!(""));
+        vars.insert("eos_token".into(), json!(""));
+        vars.insert(
+            "tools".into(),
+            json!([{"type": "function", "function": {
+                "name": "probe", "parameters": {"type": "object"},
+            }}]),
+        );
+        t.render(&vars).unwrap_or_default()
+    };
+    let escaped = format!("\\\"{PROBE_ARGUMENT}");
+    let as_string = render(Value::String(object.to_string()));
+    render(object).contains(PROBE_ARGUMENT)
+        && !(as_string.contains(PROBE_ARGUMENT) && !as_string.contains(&escaped))
+}
+
+/// The tool calls of message `at` with each string `arguments` parsed as JSON,
+/// as llama-server's template application does for a template that reads
+/// objects (`func_args_not_string`, `common/chat.cpp`); a string that is not
+/// JSON is a 400 naming the message, the call and the field.
+fn tool_call_arguments(at: usize, message: &mut Map<String, Value>) -> Result<(), ApiError> {
+    let Some(Value::Array(calls)) = message.get_mut("tool_calls") else {
+        return Ok(());
+    };
+    for (j, call) in calls.iter_mut().enumerate() {
+        let Some(Value::String(text)) = call.get("function").and_then(|f| f.get("arguments"))
+        else {
+            continue;
+        };
+        let parsed = serde_json::from_str::<Value>(text).map_err(|e| {
+            invalid(format!(
+                "messages[{at}].tool_calls[{j}].function.arguments is not valid JSON: {e}"
+            ))
+        })?;
+        call["function"]["arguments"] = parsed;
+    }
+    Ok(())
+}
+
 /// The thinking vars a chat body carries, in llama-server's order: the kwargs
-/// `enable_thinking` first — a bool sets it, a string is a 400 naming it —
+/// (`chat_template_kwargs`, an object) `enable_thinking` first — a bool sets
+/// it, a string is a 400 naming it —
 /// then the OpenAI `reasoning_effort`, whose `"none"` turns thinking off and
 /// does not reach the template as itself (a kwargs `reasoning_effort` is
 /// erased with it). The resolved `enable_thinking` replaces the kwargs entry,
@@ -2085,7 +2212,11 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
 /// `true` (V4.1's takes its `thinking` from it) keeps its own default when
 /// nothing did.
 fn thinking_vars(b: &Map<String, Value>, vars: &mut Map<String, Value>) -> Result<(), ApiError> {
-    let kwargs = b.get("chat_template_kwargs").and_then(Value::as_object);
+    let kwargs = match b.get("chat_template_kwargs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(kw)) => Some(kw),
+        Some(other) => return Err(wrong_type("chat_template_kwargs", "an object", other)),
+    };
     let mut thinking: Option<bool> = None;
     if let Some(kw) = kwargs {
         match kw.get("enable_thinking") {
@@ -2098,7 +2229,11 @@ fn thinking_vars(b: &Map<String, Value>, vars: &mut Map<String, Value>) -> Resul
             _ => {}
         }
     }
-    let effort = b.get("reasoning_effort").filter(|v| !v.is_null());
+    let effort = match b.get("reasoning_effort") {
+        None | Some(Value::Null) => None,
+        Some(v @ Value::String(_)) => Some(v),
+        Some(other) => return Err(wrong_type("reasoning_effort", "a string", other)),
+    };
     let off = effort.and_then(Value::as_str) == Some("none");
     if off {
         thinking = Some(false);
@@ -2238,8 +2373,9 @@ fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
     media::expand_prompt(&ids, &urls, &**model).map_err(|e| media_error(&e))
 }
 
-/// Validates the prompt, hands the request to the engine thread, and passes
-/// its events to `sink` with the slot it took. `input` is what the engine is
+/// Validates the prompt and builds the request's sampler (its factory's
+/// refusal is a 400), hands the request to the engine thread, and passes its
+/// events to `sink` with the slot it took. `input` is what the engine is
 /// fed: the ids, and the images' spans and feeds of a chat that carries any.
 /// Returns the outcome and the slot; an error before any event is the
 /// request's answer. A sink that fails ends the request: the engine thread
@@ -2273,12 +2409,17 @@ fn run_gen(
             ),
         });
     }
+    // A sampler its factory refuses ends the request here, before it takes a
+    // slot, as any refused sampling field does.
+    let sampler = genloop::sampler_of(&state.shared.sampler, p)
+        .map_err(|e| invalid(format!("the sampler refuses the sampling parameters: {e}")))?;
     let (events, rx) = mpsc::channel();
     let submit = Submit {
         p: p.clone(),
         prompt,
         settings: generation_settings(state, p),
         media: input.feeds.clone(),
+        sampler,
         events,
     };
     relock(&state.shared.board)
@@ -2792,7 +2933,7 @@ fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPl
         p,
         input: Prompt::from(ids),
         prompt: b.get("prompt").cloned().unwrap_or(Value::Null),
-        return_tokens: get_b(b, "return_tokens").unwrap_or(false),
+        return_tokens: get_b(b, "return_tokens")?.unwrap_or(false),
     })
 }
 
@@ -3317,18 +3458,21 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message, probs: Option<Value>) ->
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps, Park,
         ServeError, SlotConfig, SlotQueue, Stop, after_accept_error, argv_redacted, carries_media,
-        check_slots, content_text, deny_line, engine_object, id_half, shutdown_allowed,
+        check_slots, content_text, deny_line, engine_object, id_half, needs_object_arguments,
+        shutdown_allowed,
     };
-    use crate::engine::{DeviceProps, PlacementProps};
+    use crate::engine::{DeviceProps, PlacementProps, SamplerRefused, SamplingParams};
     use crate::flag::ApiKeys;
+    use jinja::ChatTemplate;
     use serde_json::{Value, json};
-    use std::io;
+    use std::io::{self, Read};
     use std::net::SocketAddr;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Text parts join by newline, as one string `content` would carry them.
     /// Every other part is refused by name, wherever it stands in the array:
@@ -3650,7 +3794,8 @@ mod tests {
     /// is a finite JSON number and an infinite `f32`) is a 400 naming the
     /// field and "a finite number", where the sampler would refuse it and the
     /// request would run greedy. A finite value, whatever its range, is taken
-    /// as it was, and a field of another type reads as absent.
+    /// as it was, and a field of another type is a 400 naming it
+    /// ([`a_field_of_another_type_is_a_400_naming_the_type_it_takes`]).
     #[test]
     fn non_finite_sampling_fields_are_refused_by_name() {
         let (addr, _state, _ended) = super::testserve::spawn(
@@ -3672,11 +3817,621 @@ mod tests {
                     "{field} {value}: the 400 names the field and the rule: {message}"
                 );
             }
-            for value in ["0.5", "-1", "3e38", "\"hot\"", "null"] {
+            // PIN(2026-10-09): a field of another type (`"hot"`) is a 400, no longer read as absent.
+            for value in ["0.5", "-1", "3e38", "null"] {
                 let (status, text) = ask(field, value);
                 assert_eq!(status, 200, "{field} {value}: {text}");
             }
         }
+    }
+
+    /// The error message of a 400 answer.
+    fn message_of(text: &str) -> String {
+        serde_json::from_str::<Value>(text).expect("the answer is JSON")["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// A field sent with a type it does not take is a 400 naming the field,
+    /// the type it takes and the type it got, on every route that reads it; a
+    /// `null` is unset and a value of the right type is read, never refused.
+    /// The cases are the fields `gen_params`, the completion and chat
+    /// halves, `/apply-template` and `/tokenize` read through the typed
+    /// getters.
+    #[test]
+    fn a_field_of_another_type_is_a_400_naming_the_type_it_takes() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let completion = json!({"prompt": "ab", "n_predict": 1});
+        let chat = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1});
+        let tokenize = json!({"content": "ab"});
+        let cases = [
+            (
+                "/completion",
+                &completion,
+                "stop",
+                json!(5),
+                "a string or an array of strings",
+                "a number",
+            ),
+            (
+                "/completion",
+                &completion,
+                "stop",
+                json!({"a": 1}),
+                "a string or an array of strings",
+                "an object",
+            ),
+            (
+                "/completion",
+                &completion,
+                "stream",
+                json!("true"),
+                "a boolean",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "stream",
+                json!(1),
+                "a boolean",
+                "a number",
+            ),
+            (
+                "/completion",
+                &completion,
+                "ignore_eos",
+                json!("yes"),
+                "a boolean",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "timings_per_token",
+                json!(0),
+                "a boolean",
+                "a number",
+            ),
+            (
+                "/completion",
+                &completion,
+                "return_progress",
+                json!([]),
+                "a boolean",
+                "an array",
+            ),
+            (
+                "/completion",
+                &completion,
+                "cache_prompt",
+                json!("no"),
+                "a boolean",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "return_tokens",
+                json!(1),
+                "a boolean",
+                "a number",
+            ),
+            (
+                "/completion",
+                &completion,
+                "n_predict",
+                json!("8"),
+                "an integer",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "max_tokens",
+                json!(true),
+                "an integer",
+                "a boolean",
+            ),
+            (
+                "/completion",
+                &completion,
+                "max_completion_tokens",
+                json!({}),
+                "an integer",
+                "an object",
+            ),
+            (
+                "/completion",
+                &completion,
+                "top_k",
+                json!("40"),
+                "an integer",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "seed",
+                json!("1"),
+                "an integer",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "temperature",
+                json!("hot"),
+                "a number",
+                "a string",
+            ),
+            (
+                "/completion",
+                &completion,
+                "top_p",
+                json!([]),
+                "a number",
+                "an array",
+            ),
+            (
+                "/completion",
+                &completion,
+                "min_p",
+                json!(false),
+                "a number",
+                "a boolean",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "stop",
+                json!(false),
+                "a string or an array of strings",
+                "a boolean",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "stream",
+                json!("true"),
+                "a boolean",
+                "a string",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "n",
+                json!("2"),
+                "an integer",
+                "a string",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "tools",
+                json!({"type": "function"}),
+                "an array",
+                "an object",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "chat_template_kwargs",
+                json!(5),
+                "an object",
+                "a number",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "reasoning_effort",
+                json!(5),
+                "a string",
+                "a number",
+            ),
+            (
+                "/v1/chat/completions",
+                &chat,
+                "add_generation_prompt",
+                json!("yes"),
+                "a boolean",
+                "a string",
+            ),
+            (
+                "/apply-template",
+                &chat,
+                "add_generation_prompt",
+                json!(0),
+                "a boolean",
+                "a number",
+            ),
+            (
+                "/tokenize",
+                &tokenize,
+                "add_special",
+                json!("true"),
+                "a boolean",
+                "a string",
+            ),
+            (
+                "/tokenize",
+                &tokenize,
+                "with_pieces",
+                json!(1),
+                "a boolean",
+                "a number",
+            ),
+        ];
+        for (path, base, field, value, takes, got) in cases {
+            let mut body = base.clone();
+            body[field] = value.clone();
+            let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+            assert_eq!(status, 400, "{path} {field} {value}: {text}");
+            assert_eq!(
+                message_of(&text),
+                format!("{field} must be {takes}, not {got}"),
+                "{path} {field} {value}"
+            );
+            // The same field `null` is unset.
+            body[field] = Value::Null;
+            let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+            assert_eq!(status, 200, "{path} {field} null: {text}");
+        }
+        // A message content that is no string, array or `null` names its place.
+        let body = json!({"messages": [{"role": "user", "content": 5}], "max_tokens": 1});
+        let (status, text) = roundtrip(addr, "POST", "/v1/chat/completions", &body.to_string());
+        assert_eq!(status, 400, "{text}");
+        assert_eq!(
+            message_of(&text),
+            "messages[0].content must be a string or an array of parts, not a number"
+        );
+        // Values of the types the fields take are read.
+        let ok = json!({
+            "prompt": "ab", "n_predict": 1, "stop": ["zz"], "stream": false, "ignore_eos": false,
+            "cache_prompt": true, "return_tokens": true, "top_k": 40, "seed": 7,
+            "temperature": 0.5, "top_p": 0.9, "min_p": 0.1,
+        });
+        let (status, text) = roundtrip(addr, "POST", "/completion", &ok.to_string());
+        assert_eq!(status, 200, "{text}");
+    }
+
+    /// The token limit is the first set of `n_predict`, `max_completion_tokens`
+    /// and `max_tokens`, on the completion and the chat routes alike, as
+    /// llama-server's task parameters read them (`n_predict` with the other two
+    /// as aliases in that order); `null` is unset, and a shadowed alias of the
+    /// wrong type is still a 400.
+    #[test]
+    fn the_token_limit_is_the_first_set_of_llama_servers_names() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let cases = [
+            (
+                json!({"n_predict": 2, "max_completion_tokens": 3, "max_tokens": 4}),
+                2,
+            ),
+            (json!({"max_completion_tokens": 3, "max_tokens": 4}), 3),
+            (json!({"max_tokens": 4}), 4),
+            (json!({"n_predict": null, "max_tokens": 4}), 4),
+            (json!({"max_completion_tokens": null, "max_tokens": 4}), 4),
+            (json!({"max_tokens": 4, "max_completion_tokens": 3}), 3),
+        ];
+        for (limits, want) in cases {
+            let mut completion = json!({"prompt": "abcabc", "temperature": 0});
+            let mut chat =
+                json!({"messages": [{"role": "user", "content": "abcabc"}], "temperature": 0});
+            for (k, v) in limits.as_object().expect("an object") {
+                completion[k] = v.clone();
+                chat[k] = v.clone();
+            }
+            let (status, text) = roundtrip(addr, "POST", "/completion", &completion.to_string());
+            assert_eq!(status, 200, "{limits}: {text}");
+            let v: Value = serde_json::from_str(&text).expect("JSON");
+            assert_eq!(v["generation_settings"]["n_predict"], want, "{limits}: {v}");
+            assert_eq!(v["tokens_predicted"], want, "{limits}: {v}");
+            let (status, text) = roundtrip(addr, "POST", "/v1/chat/completions", &chat.to_string());
+            assert_eq!(status, 200, "{limits}: {text}");
+            let v: Value = serde_json::from_str(&text).expect("JSON");
+            assert_eq!(v["usage"]["completion_tokens"], want, "{limits}: {v}");
+        }
+        let shadowed = json!({"prompt": "ab", "n_predict": 2, "max_tokens": "4"});
+        let (status, text) = roundtrip(addr, "POST", "/completion", &shadowed.to_string());
+        assert_eq!(status, 400, "{text}");
+        assert_eq!(
+            message_of(&text),
+            "max_tokens must be an integer, not a string"
+        );
+    }
+
+    /// The address of a mock server whose chat template is `template`.
+    fn served_with(template: &str) -> SocketAddr {
+        super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(template)).0
+    }
+
+    /// A body whose assistant message calls `get_weather` with `arguments`.
+    fn tool_call_body(arguments: Value) -> Value {
+        json!({"messages": [
+            {"role": "user", "content": "w?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": arguments}},
+            ]},
+        ]})
+    }
+
+    /// Templates that read a tool call's `arguments` three ways: walking it as
+    /// an object, printing `tojson` of it, and printing it as it came.
+    const WALKS_ARGUMENTS: &str = concat!(
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}",
+        "{%- for tc in m.tool_calls or [] %}[{{ tc.function.name }}",
+        "{%- for k, v in tc.function.arguments.items() %} {{ k }}={{ v }}{%- endfor %}]",
+        "{%- endfor %}{%- endfor %}",
+    );
+    const TOJSONS_ARGUMENTS: &str = concat!(
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}",
+        "{%- for tc in m.tool_calls or [] %}[{{ tc.function.name }} ",
+        "{{ tc.function.arguments | tojson }}]{%- endfor %}{%- endfor %}",
+    );
+    const PRINTS_ARGUMENTS: &str = concat!(
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}",
+        "{%- for tc in m.tool_calls or [] %}[{{ tc.function.name }} ",
+        "{{ tc.function.arguments }}]{%- endfor %}{%- endfor %}",
+    );
+
+    /// An assistant tool call's `arguments` is a JSON string in the OpenAI
+    /// API. A template that needs it as an object (it walks it with
+    /// `.items()`, or prints `tojson` of it, which a string would quote twice)
+    /// gets it parsed, so the string renders as the object does; a string
+    /// that is not JSON is a 400 naming the message, the call and the field. A
+    /// template that takes the string as it came gets it so, whatever it
+    /// holds.
+    #[test]
+    fn tool_call_arguments_reach_a_template_that_needs_objects_as_objects() {
+        let args = json!({"city": "Seoul", "n": 3});
+        for template in [WALKS_ARGUMENTS, TOJSONS_ARGUMENTS] {
+            let addr = served_with(template);
+            let (status, as_object) = applied(addr, &tool_call_body(args.clone()));
+            assert_eq!(status, 200, "{as_object}");
+            let want = applied_prompt(&as_object);
+            assert!(want.contains("get_weather"), "{want}");
+            let (status, as_string) =
+                applied(addr, &tool_call_body(Value::String(args.to_string())));
+            assert_eq!(status, 200, "{as_string}");
+            assert_eq!(applied_prompt(&as_string), want, "{template}");
+            for bad in ["not json", "", "{\"city\":"] {
+                let (status, text) = applied(addr, &tool_call_body(json!(bad)));
+                assert_eq!(status, 400, "{bad:?}: {text}");
+                assert!(
+                    message_of(&text).starts_with(
+                        "messages[1].tool_calls[0].function.arguments is not valid JSON: "
+                    ),
+                    "{bad:?}: {text}"
+                );
+            }
+        }
+        let want = "<user>w?<assistant>[get_weather city=Seoul n=3]";
+        let (_, text) = applied(served_with(WALKS_ARGUMENTS), &tool_call_body(args.clone()));
+        assert_eq!(applied_prompt(&text), want);
+        // A template that prints the string takes it as it came, valid JSON or not.
+        let addr = served_with(PRINTS_ARGUMENTS);
+        let (status, text) = applied(addr, &tool_call_body(json!("{\"city\":\"Seoul\"}")));
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(
+            applied_prompt(&text),
+            "<user>w?<assistant>[get_weather {\"city\":\"Seoul\"}]"
+        );
+        let (status, text) = applied(addr, &tool_call_body(json!("not json")));
+        assert_eq!(status, 200, "{text}");
+    }
+
+    /// Which of the fixture chat templates need a tool call's `arguments` as
+    /// an object ([`needs_object_arguments`]): the ones that walk it
+    /// (Qwen3.6's and Qwen3.8's `|items`, GLM's `.items()`) do, and the ones
+    /// that take a string (Qwen3's `is string` branch, V4.1's `from_json`) do
+    /// not, nor does a template that prints no arguments.
+    #[test]
+    fn the_fixture_templates_that_need_object_arguments_are_named() {
+        let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
+        let cases = [
+            (
+                "qwen3",
+                include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
+                false,
+            ),
+            (
+                "qwen36",
+                include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
+                true,
+            ),
+            (
+                "qwen38",
+                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
+                true,
+            ),
+            (
+                "glm5",
+                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
+                true,
+            ),
+            (
+                "v41",
+                include_str!("../tests/fixtures/v41-chat-template.jinja"),
+                false,
+            ),
+            ("mock", super::testserve::TEMPLATE, false),
+        ];
+        for (name, source, want) in cases {
+            assert_eq!(needs_object_arguments(&parsed(source)), want, "{name}");
+        }
+    }
+
+    /// A sampler factory that refuses a request's parameters ends that request
+    /// with a 400 carrying the refusal, on every route and stream or not, before
+    /// the request takes a slot: a greedy request builds no sampler and runs, a
+    /// sampled one that is not refused runs, and the one slot is free after
+    /// each.
+    #[test]
+    fn a_refusing_sampler_factory_is_the_requests_400() {
+        let inner = crate::sampling::reference_factory();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut config = super::testserve::mock_config();
+        config.sampler = Some({
+            let asked = Arc::clone(&asked);
+            Arc::new(move |p: &SamplingParams| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                if p.top_k == 7 {
+                    return Err(SamplerRefused("top_k 7 is not takeable".to_owned()));
+                }
+                inner(p)
+            })
+        });
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let completion = |extra: Value| {
+            let mut b = json!({"prompt": "ab", "n_predict": 1});
+            b.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            b
+        };
+        let chat = |extra: Value| {
+            let mut b = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1});
+            b.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            b
+        };
+        let refusal = "the sampler refuses the sampling parameters: top_k 7 is not takeable";
+        for (path, body) in [
+            ("/completion", completion(json!({"top_k": 7}))),
+            (
+                "/completion",
+                completion(json!({"top_k": 7, "stream": true})),
+            ),
+            ("/v1/chat/completions", chat(json!({"top_k": 7}))),
+            (
+                "/v1/chat/completions",
+                chat(json!({"top_k": 7, "stream": true})),
+            ),
+            ("/v1/completions", completion(json!({"top_k": 7}))),
+        ] {
+            let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+            assert_eq!(status, 400, "{path} {body}: {text}");
+            assert_eq!(message_of(&text), refusal, "{path} {body}");
+        }
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            5,
+            "each refused request asked once"
+        );
+        // Greedy: no sampler is built, so the factory is not asked.
+        let (status, text) = roundtrip(
+            addr,
+            "POST",
+            "/completion",
+            &completion(json!({"top_k": 7, "temperature": 0})).to_string(),
+        );
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            5,
+            "a greedy request asks nothing"
+        );
+        let (status, text) = roundtrip(
+            addr,
+            "POST",
+            "/completion",
+            &completion(json!({})).to_string(),
+        );
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(asked.load(Ordering::SeqCst), 6);
+        let (status, text) = roundtrip(addr, "GET", "/health", "");
+        assert_eq!(status, 200, "{text}");
+        let v: Value = serde_json::from_str(&text).expect("JSON");
+        assert_eq!(v["slots_idle"], 1, "{v}");
+    }
+
+    /// A round of two slots whose rows split into one step and one drafted
+    /// pass — a request that needs its logits row (`ignore_eos` bans an id)
+    /// steps beside a greedy one that passes — runs the pass as the engine's
+    /// `advance`, the call a request alone makes, not as a round of one row
+    /// ([`crate::Engine::advance_slots`] is called with two rows or more). The
+    /// long greedy request holds the engine thread in its prompt call until
+    /// the short stepping one waits behind it, so the two share rounds, which
+    /// the call log shows as a pass, a step and a pass in a row.
+    #[test]
+    fn a_mixed_rounds_single_pass_is_an_advance() {
+        use crate::mock::{DraftMock, Hold, MockCall};
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let hold = Arc::new(Hold::default());
+        let mock = DraftMock::new(4096)
+            .with_slots(2)
+            .logged(Arc::clone(&log))
+            .holding(Arc::clone(&hold));
+        let server = super::Server::bind_with(
+            "127.0.0.1:0",
+            Box::new(mock),
+            super::testserve::mock_config(),
+            SlotConfig {
+                parallel: 2,
+                ..SlotConfig::default()
+            },
+        )
+        .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let (_state, _ended) = server.start().expect("start");
+        // Each request is written and its answer read once the engine thread
+        // is free, so the two share rounds without a thread of the test's own.
+        let ask = |body: Value| {
+            super::testserve::send_request(addr, "POST", "/completion", &[], &body.to_string())
+        };
+        let long = ask(
+            json!({"prompt": "abcabcabc", "n_predict": 60, "temperature": 0,
+                   "cache_prompt": false}),
+        );
+        assert!(
+            hold.reached(1, Duration::from_secs(10)),
+            "the long prompt never reached the engine"
+        );
+        let short = ask(
+            json!({"prompt": "abacadae", "n_predict": 12, "temperature": 0,
+                   "ignore_eos": true, "cache_prompt": false}),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !roundtrip(addr, "GET", "/metrics", "")
+            .1
+            .contains("llamacpp:requests_deferred 1")
+        {
+            assert!(Instant::now() < deadline, "the short request never queued");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        hold.open();
+        for (name, mut stream) in [("long", long), ("short", short)] {
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).expect(name);
+            assert_eq!(
+                answer.split_whitespace().nth(1),
+                Some("200"),
+                "{name}: {answer}"
+            );
+        }
+        let calls = log.lock().expect("the call log").clone();
+        assert!(
+            !calls.contains(&MockCall::AdvanceSlots(1)),
+            "a pass of one row went through advance_slots: {calls:?}"
+        );
+        assert!(
+            calls
+                .windows(3)
+                .any(|w| w == [MockCall::Advance, MockCall::Next, MockCall::Advance]),
+            "no round carried a step and a pass: {calls:?}"
+        );
     }
 
     // ---------------------------------------------------------------- API keys

@@ -49,7 +49,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::api::{Answers, End, EngineFailure, Stop, Waited, client_gone, relock};
-use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotRow, StateError};
+use crate::engine::{
+    Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError,
+};
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
 };
@@ -109,6 +111,9 @@ pub(crate) struct Submit {
     /// The prompt's images, in the order of their spans: each rides the
     /// prompt call that holds its span.
     pub media: Vec<MediaFeed>,
+    /// The sampler the request draws with, `None` for a greedy one
+    /// ([`crate::genloop::sampler_of`]).
+    pub sampler: Option<Sampler>,
     pub events: mpsc::Sender<Msg>,
 }
 
@@ -584,6 +589,7 @@ impl Worker {
             prompt,
             settings,
             media,
+            sampler,
             events,
         } = sub;
         let _ = events.send(Msg::Started(slot));
@@ -600,7 +606,7 @@ impl Worker {
             self.show_turns();
         }
         let n = held.ids.len();
-        let mut job = Gen::new(&self.slot, &self.sh.sampler, n, &p);
+        let mut job = Gen::new(&self.slot, sampler, n, &p);
         let kept = match self.slot.select(slot) {
             Ok(()) => job.open(&mut self.slot, held, &p),
             Err(e) => Err(GenError::Engine(e)),
@@ -772,8 +778,11 @@ impl Worker {
             // One engine round, its rows split by what they need: the steps
             // of two slots or more in one call (one step is a select and a
             // `next`, as `step_slots`' doc requires), then the drafted passes
-            // in one. Within each call the rows keep `active`'s order. A
-            // sampled request passes only alone in its round: here it steps.
+            // of two slots or more in one (one pass is a select and an
+            // `advance`, as `advance_slots`' doc requires: the engine's pass
+            // of one slot is the pass a request alone makes). Within each call
+            // the rows keep `active`'s order. A sampled request passes only
+            // alone in its round: here it steps.
             let mut steps: Vec<SlotRow<'_>> = Vec::new();
             let mut step_at: Vec<usize> = Vec::new();
             let mut passes: Vec<SlotPass<'_>> = Vec::new();
@@ -811,8 +820,17 @@ impl Worker {
             } else {
                 Ok(())
             };
-            if called.is_ok() && !passes.is_empty() {
-                called = self.slot.advance_slots(&mut passes);
+            if called.is_ok() {
+                called = if passes.len() > 1 {
+                    self.slot.advance_slots(&mut passes)
+                } else if let [row] = passes.as_mut_slice() {
+                    self.slot
+                        .select(row.slot)
+                        .and_then(|()| self.slot.advance(row.last, row.out))
+                        .map(|d| row.drafted = d)
+                } else {
+                    Ok(())
+                };
             }
             if called.is_ok() {
                 let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
