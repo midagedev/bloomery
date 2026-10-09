@@ -25,7 +25,9 @@
 #                order and loads as they were, and no warm-up line.
 #   majflt       the rotate run: every row ends in its majflt column — ours timed from its prompt_ids
 #                line, lcpp, lcpppp, mrs and mrspp timed from their progress lines, ik and the bin: arm
-#                the whole process — and the closing summary counts the cold rows.
+#                the whole process — and the ours and bin: rows then carry ` | drive_read_bytes <n> (<dev>)`
+#                before the cold tag, the others no such column; the closing summary counts the cold rows
+#                and the means line carries the cold and probe-off counts.
 #   mrs-noiter   a mistralrs that prints no `Iteration 1/1...`: the row names it (`timed ? (no progress
 #                line: …)`), never a count from nowhere.
 #   progress-dry the same dry run: the lcpp and lcpppp lines carry --progress and their measured window.
@@ -576,17 +578,19 @@ fi
 
 L=$tmp/rotate.log
 MAJ='\| majflt [0-9]+ \('
+DRV=' \| drive_read_bytes [0-9]+ \([^)]+\)'
 if want majflt "$L" 14 "$END" &&
-  want majflt "$L" 14 "^ROW .*\| wall [0-9]+s $MAJ.*; ≤ [0-9.]+ % of W [0-9.]+ s\)( \[cold\])?$" &&
-  want majflt "$L" 2 "^ROW r[12] ours d=6 .*${MAJ}timed [0-9]+; ≤ [0-9.]+ % of W 0.1200 s\)" &&
+  want majflt "$L" 14 "^ROW .*\| wall [0-9]+s $MAJ.*; ≤ [0-9.]+ % of W [0-9.]+ s\)(${DRV})?( \[cold\])?$" &&
+  want majflt "$L" 2 "^ROW r[12] ours d=6 .*${MAJ}timed [0-9]+; ≤ [0-9.]+ % of W 0.1200 s\)${DRV}( \[cold\])?$" &&
   want majflt "$L" 4 "^ROW r[12] lcpp(pp)? [dp]=[46] .*${MAJ}timed [0-9]+; " &&
   want majflt "$L" 4 "^ROW r[12] mrs(pp)? [dp]=[46] .*${MAJ}timed [0-9]+; " &&
   want majflt "$L" 2 "^ROW r[12] ik d=6 .*${MAJ}whole process; ≤ [0-9.]+ % of W 0.2000 s\)" &&
-  want majflt "$L" 2 "^ROW r[12] bin:base d=6 .*${MAJ}timed \? \(a one-arm run prints its prompt ids before its load: the whole process\); " &&
+  want majflt "$L" 2 "^ROW r[12] bin:base d=6 .*${MAJ}timed \? \(a one-arm run prints its prompt ids before its load: the whole process\); ≤ [0-9.]+ % of W 0.1200 s\)${DRV}( \[cold\])?$" &&
   want majflt "$L" 2 "^ROW r[12] mrs d=6 .*of W 0.0600 s\)" &&
+  want majflt "$L" 4 '^ROW .*\| drive_read_bytes ' &&
   want majflt "$L" 1 '^cold rows: [0-9]+ of 14 ' &&
   want majflt "$L" 1 '^\[config\] cold tag: ' &&
-  want majflt "$L" 1 '^mean ours d=6 .*\(n=2\)  \[cold [0-9]/2\]$'; then
+  want majflt "$L" 1 '^mean ours d=6 .*\(n=2\)  \[cold [0-9]/2\] \[probe-off 0/2\]  untagged mean ([0-9.]+ tok/s \(n=[12]\)|n/a \(every row tagged\))$'; then
   pass majflt
 fi
 
@@ -1203,10 +1207,10 @@ elif want mtp-pass-ratio "$L" 2 '^ROW r[12] ours d=6 .* \| ms/pass 12\.5000 \(me
   want mtp-pass-ratio "$L" 2 '^ROW r[12] ours@STUB_GEN_PASSES=5 d=6 .* \| mtp E\(4\) 2\.000 = positions 10 / passes 5, kept \[2, 2, 0, 1\] \| ms/pass 10\.0000 \(mean_ms × steps 10 / passes 5\) \| ' &&
   want mtp-pass-ratio "$L" 1 '^=== pass time per arm ' &&
   want mtp-pass-ratio "$L" 2 '^mean pass ' &&
-  want mtp-pass-ratio "$L" 1 '^mean pass ours d=6 +12\.5000 ms/pass  \[12\.5000\.\.12\.5000\]  \(n=2\)  \[cold [0-2]/2\]$' &&
-  want mtp-pass-ratio "$L" 1 '^mean pass ours@STUB_GEN_PASSES=5 d=6 +10\.0000 ms/pass  \[10\.0000\.\.10\.0000\]  \(n=2\)  \[cold [0-2]/2\]$' &&
+  want mtp-pass-ratio "$L" 1 '^mean pass ours d=6 +12\.5000 ms/pass  \[12\.5000\.\.12\.5000\]  \(n=2\)  \[cold [0-2]/2\] \[probe-off 0/2\]  untagged mean (12\.5000 ms/pass \(n=[12]\)|n/a \(every row tagged\))$' &&
+  want mtp-pass-ratio "$L" 1 '^mean pass ours@STUB_GEN_PASSES=5 d=6 +10\.0000 ms/pass  \[10\.0000\.\.10\.0000\]  \(n=2\)  \[cold [0-2]/2\] \[probe-off 0/2\]  untagged mean (10\.0000 ms/pass \(n=[12]\)|n/a \(every row tagged\))$' &&
   want mtp-pass-ratio "$L" 1 '^ratio pass ' &&
-  want mtp-pass-ratio "$L" 1 '^ratio pass d=6 +ours/ours@STUB_GEN_PASSES=5 +mean 0\.8000 ± 0\.0000 \(n=2\)  of means 0\.8000  per round: r1 0\.8000 r2 0\.8000  cpu-busy: ours 0/2, ours@STUB_GEN_PASSES=5 0/2  cold: ours [0-2]/2, ours@STUB_GEN_PASSES=5 [0-2]/2$' &&
+  want mtp-pass-ratio "$L" 1 '^ratio pass d=6 +ours/ours@STUB_GEN_PASSES=5 +mean 0\.8000 ± 0\.0000 \(n=2\)  of means 0\.8000  per round: r1 0\.8000 r2 0\.8000  cpu-busy: ours 0/2, ours@STUB_GEN_PASSES=5 0/2  cold: ours [0-2]/2, ours@STUB_GEN_PASSES=5 [0-2]/2  probe-off: ours 0/2$' &&
   want mtp-pass-ratio "$L" 1 '^ratio d=6 +ours/ours@STUB_GEN_PASSES=5 +mean 1\.0000 '; then
   pass mtp-pass-ratio
 fi
