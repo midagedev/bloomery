@@ -493,6 +493,7 @@ fn vision_of(a: &Args, prefill: body::PrefillMode) -> Result<(), GateError> {
 /// `Ok` carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
+    model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();

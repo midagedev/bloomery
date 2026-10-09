@@ -354,9 +354,9 @@ mod drive {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency41};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LOCK,
-        HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP, R8,
-        RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
+        HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP,
+        R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -723,6 +723,7 @@ mod drive {
         STEP_STATS,
         CARD_BUDGET,
         PIN_MAIN,
+        HOST_LANES,
         DRAFT,
         MTP_WIDTH,
         CHECK_FINITE,
@@ -737,6 +738,7 @@ mod drive {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
+        model::ops::set_host_lanes(levers.host_lanes());
         record::at_main("generate_ds41", record::GENERATE_DS41);
         let (a, placed) = parse_args(&levers)?;
         placed.record().print();

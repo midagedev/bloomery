@@ -8,7 +8,7 @@
 //! every `BLOOMERY_*` name under `tools/`, in the justfile and in `.cargo/` to
 //! a row.
 
-use crate::{Class, InPlace, Kind, LeverSpec, Phase, Site, Unset};
+use crate::{Class, HostLanes, InPlace, Kind, LeverSpec, Phase, Site, Unset};
 
 pub const THREADS: &str = "BLOOMERY_THREADS";
 pub const SPIN: &str = "BLOOMERY_SPIN";
@@ -36,6 +36,7 @@ pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
+pub const HOST_LANES: &str = "BLOOMERY_HOST_LANES";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
 pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
@@ -53,6 +54,11 @@ pub const PREFILL_GROUP_DEFAULT: u64 = 2;
 /// union holds in a binary that does not act on the lever
 /// (`model::ops::lane_prefetch`).
 pub const LANE_PREFETCH_DEFAULT: bool = false;
+
+/// `BLOOMERY_HOST_LANES` unset: the row's default, which the host tier's row
+/// dispatch holds in a binary that does not act on the lever
+/// (`model::ops::Lanes::host_tier`).
+pub const HOST_LANES_DEFAULT: HostLanes = HostLanes::Ccd;
 
 /// The largest `BLOOMERY_GEN_SLOTS`: one row a slot in a pass of several
 /// slots, which holds at most the pass's eight rows.
@@ -766,6 +772,29 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Both write the same bits. `generate_glm5next` acts on it and prints the value \
               the union holds as its `load` record's `lane_prefetch`; every other binary \
               runs the default and refuses the name set.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: HOST_LANES,
+        class: Class::A,
+        kind: Kind::Words(&["flat", "ccd"]),
+        default: Unset::Is("ccd"),
+        doc: "Host tier, the decode step's one-column leg and the verify leg's step union: \
+              `ccd` lays each pass's units over the pool's CCDs (each CCD's participants \
+              take that CCD's share of every matrix, and take from the other CCDs' lanes \
+              only once their own are done) where the pool has a CCD map, which takes the \
+              calling thread pinned (`BLOOMERY_PIN_MAIN`, default on) and every worker \
+              pinned — an unpinned run has none and runs flat whatever this says. `flat` \
+              cuts every matrix's units end to end into one lane a participant, the \
+              same-binary arm. Both write the same bits. Acted on by the binaries that pin \
+              their main thread: `generate_ds41`, `bloomery-chat`, and the ds41, qwen38 and \
+              glm seats of `bloomery-serve` (`bloomery-serve-ds41`, \
+              `bloomery-serve-qwen38`); every other binary that parses its levers runs \
+              the default and refuses the name set, and `bloomery-decode` and \
+              `bench_v41_host`, which do not read it, run the default.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

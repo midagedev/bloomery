@@ -33,10 +33,10 @@ use registry::REGISTRY;
 pub use registry::XSTREAM;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
-    HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT,
-    MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES, NVTIER_READ, PIN_MAIN, PREFILL,
-    PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
-    RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH,
+    LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES,
+    NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
+    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -941,6 +941,17 @@ impl Levers {
     #[must_use]
     pub fn lane_prefetch(&self) -> bool {
         self.flag(LANE_PREFETCH)
+    }
+
+    /// `BLOOMERY_HOST_LANES`: how the host tier's row dispatch lays its units
+    /// over the pool.
+    #[must_use]
+    pub fn host_lanes(&self) -> HostLanes {
+        match self.word(HOST_LANES) {
+            Some("flat") => HostLanes::Flat,
+            Some("ccd") => HostLanes::Ccd,
+            w => panic!("{HOST_LANES} holds {w:?}, not flat or ccd"),
+        }
     }
 
     /// `BLOOMERY_GEN_SLOTS`: the streams `generate_qwen3moe` decodes in one
@@ -2148,6 +2159,17 @@ pub struct HostCfg {
     /// sidecar when there is one; `false` reads the source's, the
     /// same-binary arm.
     pub r8: bool,
+}
+
+/// How the host tier's row dispatch lays its units over the pool
+/// ([`HOST_LANES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostLanes {
+    /// Every matrix's units end to end in one space, one lane a participant.
+    Flat,
+    /// Each matrix's units laid over the pool's CCDs where the pool has a CCD
+    /// map, flat where it has none.
+    Ccd,
 }
 
 /// A binary's one reading of the levers, first thing in `main`. `acts_on`
