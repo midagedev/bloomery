@@ -467,6 +467,16 @@ impl Gguf {
         &self.map
     }
 
+    /// Whether [`Gguf::mapping`] is the file's own read-only mapping
+    /// ([`Weights::Mapped`]) rather than an anonymous copy
+    /// ([`Weights::Resident`]): only on the file's mapping does
+    /// `MADV_DONTNEED` drop page-table entries the next touch re-reads from
+    /// the file — on the copy it zeroes the bytes.
+    #[must_use]
+    pub fn file_backed(&self) -> bool {
+        matches!(self.map, Backing::File(_))
+    }
+
     /// The file's bytes before its data base: the header and its padding. A
     /// file that ends inside that padding (it holds no tensors) gives every
     /// byte it has.

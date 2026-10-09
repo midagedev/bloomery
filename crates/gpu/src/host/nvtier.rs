@@ -8,10 +8,18 @@
 //! reads — the NVMe segment's, and the card's victims once they flip — is
 //! this arena's, its slot refused by name while unfilled.
 //!
-//! The arena never advises the model mapping: the only pages it returns are
-//! its own slots', `MADV_DONTNEED` on an evicted slot's windows, which
-//! frees an anonymous range's pages — that is why the arena is anonymous
-//! and not the page cache, whose warm set nothing else can flush. The books
+//! The arena's own pages leave on an eviction alone, `MADV_DONTNEED` on the
+//! evicted slot's windows, which frees an anonymous range's pages — that is
+//! why the arena is anonymous and not the page cache, whose warm set nothing
+//! else can flush. The model file's mapping is its readers': a read of the
+//! ids the arena serves through it (a union call, a lane's copy) faults
+//! their pages in from the drive, and once the reader has consumed them the
+//! tier drops them from the mapping and the page cache — a union's whole
+//! layer ([`NvTier::drop_layer`]) but the ids a lane has open, a lane's own
+//! id ([`NvTier::end_read`]) — so nothing a read brought in stays past it.
+//! Which pages go is the books' ([`drop_runs`]), never `mincore`'s, and no
+//! page that holds a byte of the plan's host segment, of an id a lane has
+//! open, or of the tensors beside a stack is named. The books
 //! are one atomic hint an id and a per-slot state word a pick reads without
 //! the lock; the LRU and the fills' slot ownership live under one lock
 //! taken per `ensure`, never per pick. The engine serves a model's host leg
@@ -29,6 +37,8 @@ use std::time::Instant;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
 use model::moe::{TierError, TierSlots};
+use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
+use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::{Device, Plan, Role};
 
 use crate::GpuError;
@@ -205,15 +215,35 @@ pub fn audit_offsets(at: u64, len: usize) -> [usize; 6] {
 }
 
 /// Whether the arena's own address ranges (`[start, end)`, the spans its
-/// evictions return) and the model mapping's are disjoint: the arena never
-/// advises the model mapping, so a lock's pinned pages and an r8 copy's
-/// pages stay theirs. A mutant that madvises a model page names an arena
-/// range that overlaps the mapping's, and this turns false.
+/// evictions return) and the model mapping's are disjoint: an eviction
+/// never advises the model mapping, so a lock's pinned pages and an r8
+/// copy's pages stay theirs — the tier's drops of the mapping's pages are
+/// [`NvTier::drop_layer`]'s and [`NvTier::end_read`]'s, inside
+/// [`NvTier::drop_region`]. A mutant whose
+/// eviction madvises a model page names an arena range that overlaps the
+/// mapping's, and this turns false.
 #[must_use]
 pub fn advice_disjoint(arena: &[(usize, usize)], model: &[(usize, usize)]) -> bool {
     arena
         .iter()
         .all(|&(a0, a1)| model.iter().all(|&(m0, m1)| a1 <= m0 || m1 <= a0))
+}
+
+/// What a drop names over one paged layer ([`NvTier::drop_region`]): per
+/// stack row of the plan, the split's shard and the whole-page byte runs
+/// (file offsets) there.
+pub type DropRuns = Vec<(usize, Vec<Range<u64>>)>;
+
+/// `marks` with every id the books neither hold nor read marked read: a
+/// drop of all of them.
+fn read_all(marks: Vec<Mark>) -> Vec<Mark> {
+    marks
+        .into_iter()
+        .map(|m| match m {
+            Mark::Rest => Mark::Read,
+            kept => kept,
+        })
+        .collect()
 }
 
 /// One layer of the arena: its slots and their books.
@@ -233,12 +263,18 @@ struct LayerArena {
     part_of: OnceLock<[usize; PARTS]>,
     /// The file each of the plan's stack rows reads.
     files: [Arc<DirectFile>; PARTS],
+    /// The split's shard each of the plan's stack rows lies in, whose
+    /// mapping a drop advises.
+    shards: [usize; PARTS],
     /// The plan's stack-row tensors' names, for the attach's mapping.
     names: [String; PARTS],
     /// Per id: its parts' ranges, by stack row.
     parts: Vec<[PartRange; PARTS]>,
     /// Per id: the slot that holds it, + 1; 0 when none does.
     of_id: Vec<AtomicU32>,
+    /// Per id: the lanes reading it through the model file's mapping now
+    /// ([`NvTier::open_read`]); a drop keeps its pages while it is nonzero.
+    reading: Vec<AtomicU32>,
     /// Per slot: its state (a pick's read), its id and LRU tick (the
     /// lock's alone).
     slots: Vec<SlotBook>,
@@ -257,6 +293,82 @@ impl LayerArena {
         let held = self.of_id.get(id as usize)?.load(Ordering::Relaxed);
         let slot = (held as usize).checked_sub(1)?;
         (self.slots[slot].state.load(Ordering::Relaxed) == FILLED).then_some(slot)
+    }
+
+    /// A drop's books with nothing read yet: the host segment's ids held,
+    /// every other id the arena's.
+    fn marks(&self) -> Vec<Mark> {
+        (0..self.n_expert)
+            .map(|id| {
+                if self.host.contains(&id) {
+                    Mark::Held
+                } else {
+                    Mark::Rest
+                }
+            })
+            .collect()
+    }
+
+    /// [`LayerArena::marks`] with the ids a lane has open held too: no drop
+    /// names a page of bytes a lane has yet to copy out.
+    fn live_marks(&self) -> Vec<Mark> {
+        let mut marks = self.marks();
+        for (mark, open) in marks.iter_mut().zip(&self.reading) {
+            if open.load(Ordering::Acquire) > 0 {
+                *mark = Mark::Held;
+            }
+        }
+        marks
+    }
+
+    /// The books of a whole layer's drop ([`NvTier::drop_layer`]): every id
+    /// the arena serves read, but the ones a lane has open.
+    fn layer_marks(&self) -> Vec<Mark> {
+        read_all(self.live_marks())
+    }
+
+    /// Open a lane's read of expert `id` (layer `layer`, for the refusals):
+    /// refused by name as `what` past the layer's experts.
+    fn open(&self, layer: usize, id: u32, what: &'static str) -> Result<(), GpuError> {
+        self.reading(layer, id, what)?
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Close a lane's read of expert `id` ([`LayerArena::open`]): refused by
+    /// name as `what` past the layer's experts and with no read open — never
+    /// a count wrapped past zero.
+    fn close(&self, layer: usize, id: u32, what: &'static str) -> Result<(), GpuError> {
+        self.reading(layer, id, what)?
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| {
+                GpuError::protocol(
+                    what,
+                    format!("layer {layer} expert {id}: a read ended that no lane opened"),
+                )
+            })
+    }
+
+    /// Expert `id`'s open-read count, refused by name as `what` past the
+    /// layer's experts.
+    fn reading(&self, layer: usize, id: u32, what: &'static str) -> Result<&AtomicU32, GpuError> {
+        self.reading.get(id as usize).ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!(
+                    "layer {layer} expert {id} is past the {} experts",
+                    self.n_expert
+                ),
+            )
+        })
+    }
+
+    /// The expert whose bytes of stack row `row` hold byte `at` of the file,
+    /// for a refusal to name: the experts' count for a byte past them.
+    fn id_at(&self, row: usize, at: u64) -> usize {
+        self.parts
+            .partition_point(|p| p[row].at + p[row].len as u64 <= at)
     }
 }
 
@@ -295,6 +407,16 @@ pub struct NvTierStats {
     /// Reads served by the page cache ([`DirectFile::open_buffered`]).
     pub buffered_reads: u64,
     pub buffered_bytes: u64,
+    /// Drops of the mapping's pages reads brought in
+    /// ([`NvTier::drop_layer`], [`NvTier::end_read`]): the calls that named
+    /// an id of the arena's.
+    pub drops: u64,
+    /// Bytes those drops named to the kernel, whole pages — the pages the
+    /// reads faulted and the ones they did not alike.
+    pub drop_bytes: u64,
+    /// Wall those drops took, summed (ns): the syscalls and the kernel's
+    /// freeing of the pages, on the reader's thread.
+    pub drop_ns: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -308,6 +430,9 @@ struct Stats {
     resident_bytes: AtomicU64,
     buffered_reads: AtomicU64,
     buffered_bytes: AtomicU64,
+    drops: AtomicU64,
+    drop_bytes: AtomicU64,
+    drop_ns: AtomicU64,
 }
 
 /// The RAM arena of the NVMe expert tier ([`NvTier::of_paged`]).
@@ -330,6 +455,11 @@ pub struct NvTier {
     /// writes its own slot's own window, disjoint by the books' slot
     /// ownership.
     shared: SharedArena,
+    /// The split whose shards' mappings the readers read and the drops
+    /// advise.
+    split: Arc<Split>,
+    /// The host's page in bytes, the unit a drop's runs round to.
+    page: u64,
 }
 
 struct Books {
@@ -357,8 +487,9 @@ impl NvTier {
     /// The slots' budget is the arena the dial reserved, the same count a
     /// paged layer. Refused by name: a layer whose host segment's ids are
     /// not one run, whose routed stacks are not three rows the split holds,
-    /// a stack whose experts do not cut its bytes evenly, and a budget
-    /// under one slot.
+    /// a stack whose experts do not cut its bytes evenly, a stack in a shard
+    /// that is not its file's mapping ([`gguf::Gguf::file_backed`]: a drop
+    /// would zero a copy), and a budget under one slot.
     pub fn of_paged(
         plan: &Plan<'_>,
         split: &Arc<Split>,
@@ -457,6 +588,7 @@ impl NvTier {
             let mut parts: Vec<Vec<PartRange>> = vec![Vec::new(); n];
             let mut lens = [0usize; PARTS];
             let mut rows_files = [0usize; PARTS];
+            let mut rows_shards = [0usize; PARTS];
             for (p, name) in rows.iter().enumerate() {
                 let (shard, info) = split
                     .find(name)
@@ -465,6 +597,17 @@ impl NvTier {
                     WHAT,
                     format!("{name}: shard {shard} is not there"),
                 ))?;
+                if !gguf.file_backed() {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{name}: shard {shard} is an anonymous copy, not its file's mapping: \
+                             the tier drops a paged stack's pages after each read, which would \
+                             zero the copy"
+                        ),
+                    ));
+                }
+                rows_shards[p] = shard;
                 let path = split.shard_path(shard).ok_or(GpuError::shape(
                     WHAT,
                     format!("{name}: shard {shard} has no path"),
@@ -517,6 +660,7 @@ impl NvTier {
                 base: 0,
                 part_of: OnceLock::new(),
                 files: rows_files.map(|i| Arc::clone(&files[i])),
+                shards: rows_shards,
                 names: rows.clone().try_into().expect("three rows"),
                 parts: parts
                     .into_iter()
@@ -526,11 +670,13 @@ impl NvTier {
                     })
                     .collect(),
                 of_id: (0..n).map(|_| AtomicU32::new(0)).collect(),
+                reading: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 slots: Vec::new(),
             });
         }
         let count = slots_of(plan.host.nvme_arena_bytes, &slot_sizes)
             .map_err(|e| GpuError::shape(WHAT, e))?;
+        let page = page_bytes().map_err(|e| GpuError::plan(WHAT, e))?;
         let bytes = count * slot_sizes.iter().sum::<usize>();
         let map = AnonMap::new(bytes)
             .map_err(|e| GpuError::shape(WHAT, format!("the arena's {bytes} B: {e}")))?;
@@ -557,11 +703,22 @@ impl NvTier {
             budget: plan.host.nvme_arena_bytes,
             paged: plan.host.nvme_expert_bytes,
             audit: OnceLock::new(),
+            split: Arc::clone(split),
+            page,
         }))
     }
 
+    /// Whether `split` is the open of the model file whose mapping the
+    /// tier's drops advise: a reader of another open maps pages of its own,
+    /// which a drop would leave cached.
+    #[must_use]
+    pub fn drops_reach(&self, split: &Arc<Split>) -> bool {
+        Arc::ptr_eq(&self.split, split)
+    }
+
     /// Whether the arena covers `layer` (a paged layer with slots).
-    pub(crate) fn covers(&self, layer: usize) -> bool {
+    #[must_use]
+    pub fn covers(&self, layer: usize) -> bool {
         self.by_layer.get(layer).is_some_and(|l| l.is_some())
     }
 
@@ -652,6 +809,9 @@ impl NvTier {
             resident_bytes: s.resident_bytes.load(Ordering::Relaxed),
             buffered_reads: s.buffered_reads.load(Ordering::Relaxed),
             buffered_bytes: s.buffered_bytes.load(Ordering::Relaxed),
+            drops: s.drops.load(Ordering::Relaxed),
+            drop_bytes: s.drop_bytes.load(Ordering::Relaxed),
+            drop_ns: s.drop_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -674,6 +834,171 @@ impl NvTier {
     #[must_use]
     pub fn paged_bytes(&self) -> u64 {
         self.paged
+    }
+
+    /// A lane is about to read layer `layer`'s expert `id` through the model
+    /// file's mapping: until [`NvTier::end_read`] no drop names a page of it
+    /// — the bytes it faults in stay until it has copied them out. Nothing
+    /// for an id the arena does not serve. Refused by name: a layer the
+    /// arena does not cover and an id past its experts.
+    pub fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::open_read";
+        let arena = self.arena_of(layer, WHAT)?;
+        if arena.host.contains(&id) {
+            return Ok(());
+        }
+        arena.open(layer, id, WHAT)
+    }
+
+    /// The lane that opened layer `layer`'s expert `id`
+    /// ([`NvTier::open_read`]) has copied it out: the id leaves the mapping
+    /// and the page cache, unless another lane still has it open, whose own
+    /// end drops it ([`NvTier::drop_layer`]'s rule for the rest). Refused by
+    /// name: an end with no open, besides [`NvTier::open_read`]'s refusals
+    /// and a drop the kernel refuses.
+    pub fn end_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::end_read";
+        let arena = self.arena_of(layer, WHAT)?;
+        if arena.host.contains(&id) {
+            return Ok(());
+        }
+        arena.close(layer, id, WHAT)?;
+        let mut marks = arena.live_marks();
+        let mark = &mut marks[id as usize];
+        if *mark == Mark::Rest {
+            *mark = Mark::Read;
+            self.drop_marked(layer, arena, &marks, WHAT)?;
+        }
+        Ok(())
+    }
+
+    /// A union call has read layer `layer`'s experts through the model
+    /// file's mapping and consumed them: every id the arena serves
+    /// ([`NvTier::serves`]) leaves this process's page tables, then the page
+    /// cache ([`PageDrop`]) — the ids the call read, the ones the kernel read
+    /// around them, and the ones nobody read, at no cost but the walk —
+    /// except the ids a lane has open ([`NvTier::open_read`]), whose own end
+    /// drops them. The pages are the whole ones [`drop_runs`] names: never
+    /// one that holds a byte of the plan's host segment, of an id a lane has
+    /// open, or of the tensors beside a stack. Refused by name: a layer the
+    /// arena does not cover, and a drop the kernel refuses.
+    pub fn drop_layer(&self, layer: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::drop_layer";
+        let arena = self.arena_of(layer, WHAT)?;
+        self.drop_marked(layer, arena, &arena.layer_marks(), WHAT)
+    }
+
+    /// The pages [`drop_runs`] names over each stack row of `layer` under
+    /// `marks`, out of the mapping and the page cache, and the drop counted;
+    /// nothing when no id is read.
+    fn drop_marked(
+        &self,
+        layer: usize,
+        arena: &LayerArena,
+        marks: &[Mark],
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        if !marks.contains(&Mark::Read) {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        let mut pages = PageDrop::new(&self.split);
+        for (shard, runs) in self.runs_of(arena, marks, what)? {
+            for run in runs {
+                pages.release(shard, run).map_err(|e| {
+                    GpuError::plan(what, format!("layer {layer} shard {shard}: {e}"))
+                })?;
+            }
+        }
+        self.stats.drops.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .drop_bytes
+            .fetch_add(pages.bytes(), Ordering::Relaxed);
+        self.stats
+            .drop_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Layer `layer`'s arena, refused by name as `what` on a layer the arena
+    /// does not cover.
+    fn arena_of(&self, layer: usize, what: &'static str) -> Result<&LayerArena, GpuError> {
+        self.by_layer
+            .get(layer)
+            .and_then(|l| l.as_ref())
+            .ok_or(GpuError::state(what, "the layer's arena"))
+    }
+
+    /// The runs a drop of every id the arena serves in layer `layer` names
+    /// — the most of the layer's stacks the tier ever drops: per stack row
+    /// of the plan, its shard and the whole-page byte runs (file offsets)
+    /// [`drop_runs`] writes. The one definition the drops, the attach's check
+    /// ([`NvTier::refuse_held_pages`]) and a gate that reads the pages share.
+    /// Refused by name: a layer the arena does not cover.
+    pub fn drop_region(&self, layer: usize) -> Result<DropRuns, GpuError> {
+        const WHAT: &str = "NvTier::drop_region";
+        let arena = self.arena_of(layer, WHAT)?;
+        self.runs_of(arena, &read_all(arena.marks()), WHAT)
+    }
+
+    /// Refuse by name a host set that holds a page some drop of the arena's
+    /// ids names ([`NvTier::drop_region`]): a churn pool on a paged stack —
+    /// or any run the host keeps there — whose pages the drops would take
+    /// from under it. Load-time only, where a load's residency source
+    /// takes the tier ([`super::swap_source::FileSwap::attach_tier`]).
+    pub fn refuse_held_pages(&self, set: &HostSet) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::refuse_held_pages";
+        let held = set.runs();
+        for (layer, arena) in self.by_layer.iter().enumerate() {
+            let Some(arena) = arena else { continue };
+            for (row, (shard, runs)) in self.drop_region(layer)?.into_iter().enumerate() {
+                let Some((_, pages)) = held.iter().find(|(f, _)| *f == HostFile::Shard(shard))
+                else {
+                    continue;
+                };
+                if let Some(at) = overlap_of(&runs, pages, self.page) {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "layer {layer}: the host set holds bytes {}..{} of {} (expert {}), \
+                             which the NVMe tier drops after each read: a churn pool on a paged \
+                             stack would lose its pages under the host",
+                            at.start,
+                            at.end,
+                            arena.names[row],
+                            arena.id_at(row, at.start)
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per stack row of `arena`, its shard and the runs [`drop_runs`] names
+    /// under `marks`; a refusal of the books names `what` and the row.
+    fn runs_of(
+        &self,
+        arena: &LayerArena,
+        marks: &[Mark],
+        what: &'static str,
+    ) -> Result<DropRuns, GpuError> {
+        let mut ranges = Vec::with_capacity(arena.parts.len());
+        let mut out = Vec::with_capacity(PARTS);
+        for row in 0..PARTS {
+            ranges.clear();
+            ranges.extend(
+                arena
+                    .parts
+                    .iter()
+                    .map(|p| p[row].at..p[row].at + p[row].len as u64),
+            );
+            let mut runs = Vec::new();
+            drop_runs(&ranges, marks, self.page, &mut runs)
+                .map_err(|e| GpuError::shape(what, format!("{}: {e}", arena.names[row])))?;
+            out.push((arena.shards[row], runs));
+        }
+        Ok(out)
     }
 
     /// Fill the slots of `layer`'s `ids` the arena does not already hold:
@@ -912,6 +1237,22 @@ impl TierSlots for NvTier {
         let (at, len) = window_span(arena.slot_off(slot), &arena.windows, part, r);
         Some(&self.map.bytes()[at..at + len])
     }
+
+    /// A call that listed an id the arena serves read the mapping's pages of
+    /// the layer: the whole layer's go ([`NvTier::drop_layer`]). One that
+    /// listed only the host segment's ids read none of them.
+    fn release(&self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), TierError> {
+        if !lists
+            .iter()
+            .any(|l| l.iter().any(|&(id, _)| self.serves(layer, id)))
+        {
+            return Ok(());
+        }
+        self.drop_layer(layer).map_err(|e| TierError::Release {
+            layer,
+            source: Box::new(e),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1041,9 +1382,11 @@ mod tests {
             base: 0,
             part_of: std::sync::OnceLock::new(),
             files: [file.clone(), file.clone(), file],
+            shards: [0; PARTS],
             names: Default::default(),
             parts: vec![[part; PARTS]; n_expert as usize],
             of_id: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
+            reading: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
             slots: (0..slots).map(|_| book(FREE, 0)).collect(),
         }
     }
@@ -1059,6 +1402,36 @@ mod tests {
                 .state
                 .store(FILLED, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// A layer's drop keeps the pages of an id a lane has open: its mark is
+    /// held while the read is open and read again once it closes, the host
+    /// segment's held throughout; an end with no open is refused by name,
+    /// never a count wrapped past zero, and so is an id past the experts. A
+    /// layer's drop that read the books without the open counts would name
+    /// the open id's pages.
+    #[test]
+    fn an_open_read_keeps_its_id_out_of_the_layers_drop() {
+        use model::placement::paged_drop::Mark::{Held, Read};
+        let mut arena = arena_of(4, 1);
+        arena.host = 0..1;
+        assert_eq!(arena.layer_marks(), vec![Held, Read, Read, Read]);
+        arena.open(7, 2, "test").expect("an id of the layer");
+        arena.open(7, 2, "test").expect("a second lane on the id");
+        assert_eq!(arena.layer_marks(), vec![Held, Read, Held, Read]);
+        arena.close(7, 2, "test").expect("the first lane's end");
+        assert_eq!(arena.layer_marks()[2], Held, "the second lane reads on");
+        arena.close(7, 2, "test").expect("the second lane's end");
+        assert_eq!(arena.layer_marks(), vec![Held, Read, Read, Read]);
+        match arena.close(7, 2, "test") {
+            Err(crate::GpuError::Protocol { what, detail }) => {
+                assert_eq!(what, "test");
+                assert!(detail.contains("layer 7 expert 2"), "{detail}");
+            }
+            other => panic!("an end with no open is refused, got {other:?}"),
+        }
+        assert_eq!(arena.layer_marks()[2], Read, "the refusal moved no count");
+        assert!(arena.open(7, 4, "test").is_err(), "an id past the experts");
     }
 
     /// Two calls on one layer with an eviction between them: the second

@@ -438,7 +438,9 @@ impl LaneShared {
     }
 
     /// Copy `job`'s expert from its source into its staging slot, part
-    /// after part, once the slot's last copy has drained.
+    /// after part, once the slot's last copy has drained, between the
+    /// source's open of the read and its release, which follows the copy
+    /// whether it failed or not ([`SwapSource::open_read`]).
     fn serve(&self, job: &Job) -> Result<bool, GpuError> {
         const WHAT: &str = "XStream staging";
         let prev = job.ticket - 1;
@@ -450,40 +452,46 @@ impl LaneShared {
         if delay > 0 {
             std::thread::sleep(Duration::from_micros(delay));
         }
-        let mut at = job.slot * self.slot_bytes;
-        let end = at + self.slot_bytes;
-        for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
-            let piece = self.source.source(job.layer, job.id, part)?;
-            if piece.bytes.len() != want || at + want > end {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "layer {} expert {} part {part}: {} source bytes for a part of {want} in \
-                         a staging slot of {}",
-                        job.layer,
-                        job.id,
-                        piece.bytes.len(),
-                        self.slot_bytes
-                    ),
-                ));
+        self.source.open_read(job.layer, job.id)?;
+        let copied = (|| {
+            let mut at = job.slot * self.slot_bytes;
+            let end = at + self.slot_bytes;
+            for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
+                let piece = self.source.source(job.layer, job.id, part)?;
+                if piece.bytes.len() != want || at + want > end {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "layer {} expert {} part {part}: {} source bytes for a part of \
+                             {want} in a staging slot of {}",
+                            job.layer,
+                            job.id,
+                            piece.bytes.len(),
+                            self.slot_bytes
+                        ),
+                    ));
+                }
+                match piece.transform {
+                    // SAFETY: [at, at + want) lies inside the staging page
+                    // (the slot's span, checked above); no copy reads the
+                    // slot until its staged word publishes this use, and
+                    // this thread holds the slot's only job until then. The
+                    // word's Release store follows these stores in program
+                    // order.
+                    Transform::Identity => unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            piece.bytes.as_ptr(),
+                            self.staging.host_at(at),
+                            want,
+                        );
+                    },
+                }
+                at += want;
             }
-            match piece.transform {
-                // SAFETY: [at, at + want) lies inside the staging page (the
-                // slot's span, checked above); no copy reads the slot until
-                // its staged word publishes this use, and this thread holds
-                // the slot's only job until then. The word's Release store
-                // follows these stores in program order.
-                Transform::Identity => unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        piece.bytes.as_ptr(),
-                        self.staging.host_at(at),
-                        want,
-                    );
-                },
-            }
-            at += want;
-        }
-        Ok(true)
+            Ok(())
+        })();
+        let released = self.source.release_read(job.layer, job.id);
+        copied.and(released).map(|()| true)
     }
 
     fn fail(&self, job: &Job, e: &str) {
@@ -1163,33 +1171,42 @@ impl XStream {
                 )?;
             }
             Lane::Pageable { .. } => {
-                for (p, (&len, &d)) in parts.iter().zip(&dst).enumerate() {
-                    let piece = source.source(layer, id, p)?;
-                    if piece.bytes.len() != len || piece.transform != Transform::Identity {
-                        return Err(GpuError::shape(
-                            WHAT,
-                            format!(
-                                "layer {layer} expert {id} part {p}: {} source bytes ({:?}) for a \
-                                 part of {len}",
-                                piece.bytes.len(),
-                                piece.transform
-                            ),
-                        ));
+                source.open_read(layer, id)?;
+                let copied = (|| {
+                    for (p, (&len, &d)) in parts.iter().zip(&dst).enumerate() {
+                        let piece = source.source(layer, id, p)?;
+                        if piece.bytes.len() != len || piece.transform != Transform::Identity {
+                            return Err(GpuError::shape(
+                                WHAT,
+                                format!(
+                                    "layer {layer} expert {id} part {p}: {} source bytes ({:?}) \
+                                     for a part of {len}",
+                                    piece.bytes.len(),
+                                    piece.transform
+                                ),
+                            ));
+                        }
+                        // SAFETY: the source's bytes stay mapped for the
+                        // source's life, which outlives the copy stream's
+                        // drain (the drop drains it); `d` is a ring slot's
+                        // part, `len` bytes inside the ring.
+                        let rc = unsafe {
+                            sys::cuMemcpyHtoDAsync_v2(
+                                d,
+                                piece.bytes.as_ptr().cast(),
+                                len,
+                                copy.cu_stream(),
+                            )
+                        };
+                        cu(rc, "cuMemcpyHtoDAsync_v2 (xstream slot, pageable)")?;
                     }
-                    // SAFETY: the source's bytes stay mapped for the
-                    // source's life, which outlives the copy stream's drain
-                    // (the drop drains it); `d` is a ring slot's part, `len`
-                    // bytes inside the ring.
-                    let rc = unsafe {
-                        sys::cuMemcpyHtoDAsync_v2(
-                            d,
-                            piece.bytes.as_ptr().cast(),
-                            len,
-                            copy.cu_stream(),
-                        )
-                    };
-                    cu(rc, "cuMemcpyHtoDAsync_v2 (xstream slot, pageable)")?;
-                }
+                    Ok(())
+                })();
+                // The pieces are the file's own mapping: a page the driver
+                // still reads after the release faults in again, the same
+                // bytes.
+                let released = source.release_read(layer, id);
+                copied.and(released)?;
             }
         }
         Ok(parts.iter().map(|&b| b as u64).sum())

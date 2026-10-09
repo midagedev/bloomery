@@ -37,6 +37,7 @@ pub mod card_budget;
 pub mod churn;
 pub mod ctx;
 pub mod devices;
+pub mod paged_drop;
 pub mod workstation;
 
 #[cfg(test)]
