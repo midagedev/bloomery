@@ -175,7 +175,11 @@
 //! its counts), then its call's plan under a batched feed, then every line a
 //! one-arm run prints after its capture; each arm after the first starts
 //! from the session's clear, so it prints the tokens, logits and counters it
-//! prints in a fresh process. The since-load counters (`stat prefill`'s
+//! prints in a fresh process. Before each arm after the first, the state-back
+//! check (`shared/state_back.rs`) asserts the model came back to its load —
+//! position 0, not poisoned, each card's free device bytes within a fixed
+//! slack of the load's own reading — before the arm's `arm` record, so
+//! `--arm-sync`'s wait stays where it was. The since-load counters (`stat prefill`'s
 //! `union_*`) count from the arm's start. The load-time lines (`plan`,
 //! `load`, `capture`, `prefill`) print once, before arm 0. `--arm` does not
 //! mix with `--prompt-id`, `--tokens`, `--depth` or `--plan`, and a list of
@@ -315,6 +319,10 @@ mod place;
 mod gen_slots;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/state_back.rs"]
+mod state_back;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::num::NonZeroUsize;
     use std::ops::Range;
@@ -355,6 +363,7 @@ mod drive {
     };
 
     use crate::draft::{Draft, open_dspark};
+    use crate::state_back::StateBack;
     use crate::{dspark, finite, gen_slots, place, split};
 
     /// The usage line: the prompt flags with the shared diagnosis flags
@@ -1005,7 +1014,19 @@ mod drive {
                     each(s, i, r)
                 })?;
             } else {
-                s.arms(&runs, each).map_err(|f| Box::new(f) as GateError)?;
+                // The state the load left, asserted back before each arm
+                // after the first, before anything else the arm prints (the
+                // `--repeat` path above keeps the residency by design and
+                // does not check).
+                let base = StateBack::read(s.model())?;
+                s.arms(&runs, |s, i, r| {
+                    if i > 0 {
+                        let now = StateBack::read(s.model())?;
+                        base.check(&now, &format!("arm {i}"))?;
+                    }
+                    each(s, i, r)
+                })
+                .map_err(|f| Box::new(f) as GateError)?;
             }
             if let Some(v) = at_load {
                 let r = residence(&s)?;

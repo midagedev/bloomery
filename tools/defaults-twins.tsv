@@ -35,7 +35,7 @@ BLOOMERY_MTP_WIDTH	gate-gpu-qwen38-serve	fixed	crates/gpu-gates/src/bin/gate_qwe
 BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	cost	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	the pinned word is the default; the chooser's own clause (the #3 fix's)
 BLOOMERY_MTP_WIDTH	weekly-gpu-ds41-serve	fixed	crates/gpu-gates/src/bin/gate_ds41_serve.rs::fn width_cost(	the same gate's width_cost clause runs the chooser at cost
 BLOOMERY_POISON	gate-gpu-qwen4exp-iqleg	1	justfile::gate-gpu-qwen4exp-e2e:	gate-gpu-qwen4exp-e2e runs the same family's loads at the lever unset (the default 0)
-BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile::--depth 512 -n 2 > $D/g-default.log	the recipe's g-default run feeds the same depth at the default group (2)
+BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile::--arm 512/2 --arm 1536/2 --arm 512/2	the recipe's --arm list feeds the same depth 512 (arm 0, and arm 2 again) at the default group (2)
 BLOOMERY_PROFILE	gate-profile	2	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
 BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the pinned word is the default; the main server's load names the f16 cache with no flag
@@ -49,7 +49,7 @@ BLOOMERY_RESIDENCY	weekly-gpu-ds41-serve	off	justfile::gate-gpu-ds41-twocard *AR
 BLOOMERY_STEP_STATS	gate-gpu-glm5next-serve	1	crates/gpu-gates/src/bin/gate_glm5next_serve.rs::Served::spawn(&args, &dir, DRAFT_ONLY_STATS)?	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
 BLOOMERY_STEP_STATS	gate-gpu-qwen3-serve	1	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::.env(bloomery_levers::STEP_STATS, "1")	print-only lever — the slots_rounds doc says STEP_STATS moves no computation on this server
 BLOOMERY_STEP_STATS	gate-gpu-qwen38-serve	1	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::fn slots_flow_together(	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
-BLOOMERY_STEP_STATS	weekly-gpu-ds41-flowcounts	1	justfile::--depth 512 -n 2 > $D/g-default.log	print-only lever: the counters move no computation; the g-default run is the same path
+BLOOMERY_STEP_STATS	weekly-gpu-ds41-flowcounts	1	justfile::> $D/g-arms.log	print-only lever: the counters move no computation; the g-arms run is the same path
 BLOOMERY_STEP_STATS	weekly-gpu-ds41-serve	1	crates/gpu-gates/src/bin/gate_ds41_serve.rs::cmd.env(bloomery_levers::STEP_STATS, "1")	print-only lever (the registry row: off, nothing is read); the clause's runs are the default path
 BLOOMERY_THREADS	gate-attn	threads_env	justfile::gate-forward:	gate-forward runs the same CPU engine at the default thread count (the pool's own width)
 BLOOMERY_THREADS	gate-gpu-qwen4exp-iqleg	n.to_string()	crates/gpu-gates/src/bin/gate_qwen4exp_iqleg.rs::cmd.env_remove(bloomery_levers::THREADS)	the default child (env_remove) runs the pool's own width in the same clause pair

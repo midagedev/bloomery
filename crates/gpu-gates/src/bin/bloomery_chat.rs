@@ -1,9 +1,13 @@
 //! `bloomery-chat` — text in, text out, on the V4.1 engine.
 //!
-//!     bloomery-chat (--prompt <text> | --prompt-file <path> | --prompt-stdin)
-//!                   [-n N] [--place a|gate|bp] [--ctx C] [--no-special]
-//!                   [--greedy | [--temp T] [--top-k K] [--top-p P] [--min-p M]
-//!                    [--repeat-penalty R] [--repeat-last-n L] [--seed S]]
+//!     bloomery-chat RUN [--then RUN ...]
+//!
+//! One RUN is (--prompt <text> | --prompt-file <path> | --prompt-stdin)
+//! [-n N] [--no-special] [--greedy | [--temp T] [--top-k K] [--top-p P]
+//! [--min-p M] [--repeat-penalty R] [--repeat-last-n L] [--seed S]], and the
+//! load's own flags — [--place a|gate|bp] [--ctx C] — come before the first
+//! run only: a run list shares one load, and `--place` or `--ctx` after a
+//! `--then` is refused by name.
 //!
 //! The prompt is tokenized with the vocabulary of `$BLOOMERY_REF_MODEL`'s
 //! first shard, with the file's own BOS/EOS rule (`add_special`); special
@@ -18,7 +22,26 @@
 //! `--greedy` is the argmax, and the run checks every choice against the
 //! engine's own argmax of the same step: the generated ids are then the ones
 //! `generate_ds41 --tokens <the prompt's ids>` prints on its `tokens` line.
-//! It refuses the sampling flags beside it.
+//! It refuses the sampling flags beside it. A run's refusal names its run.
+//!
+//! `--then` starts another run on the same load. Every prompt is tokenized
+//! before the load (an empty encode refused there, naming the run); run 0
+//! prints its `prompt_ids` line where a lone run does, before the plan, and
+//! each later run prints its own at its start, after the clear. The clear
+//! between runs is this bin's: a model a fault poisoned is refused by name
+//! (a fault ends the load), then [`GpuModel::reset`], then
+//! [`GpuModel::residency_reset`], then the state-back check
+//! (`shared/state_back.rs`): the position back at 0, no poison, each card's
+//! free device bytes within a fixed slack of the load's own reading — so a
+//! state one run leaks into the next ends the process instead of quietly
+//! feeding it. Each run runs its own sampler (one a run, from its own
+//! params, built before the load), its own decoder and its own history, and
+//! ends with its own `ids`, `text_consistent` and `chat:` lines; stdout gets
+//! each run's text followed by a newline. A run list brackets what it must:
+//! a repeated run (same prompt, same flags) after other runs prints the same
+//! ids only when nothing carried, so a list ordered
+//! repeat-then-others-then-repeat turns a carried state or a reused sampler
+//! red.
 //!
 //! `--place` is `generate_ds41`'s: `bp` loads plan (a) on the A6000 with the
 //! 3090 as its expert tier (the `load` line's `cards=` names both, with the
@@ -60,6 +83,10 @@ fn main() -> std::process::ExitCode {
 mod place;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/state_back.rs"]
+mod state_back;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::io::{Read, Write};
 
@@ -81,22 +108,32 @@ mod drive {
     use tokenizer::{Decoder, Tokenizer};
 
     use crate::place;
+    use crate::state_back::StateBack;
 
     const USAGE: &str = "usage: bloomery-chat (--prompt <text> | --prompt-file <path> | \
-                         --prompt-stdin) [-n N] [--place a|gate|bp] [--ctx C] [--no-special] \
-                         [--greedy | [--temp T] [--top-k K] [--top-p P] [--min-p M] \
-                         [--repeat-penalty R] [--repeat-last-n L] [--seed S]]";
+                         --prompt-stdin) [-n N] [--no-special] [--greedy | [--temp T] [--top-k K] \
+                         [--top-p P] [--min-p M] [--repeat-penalty R] [--repeat-last-n L] \
+                         [--seed S]] [--then <another run> ...] [--place a|gate|bp] [--ctx C]";
 
+    /// One run's own flags: what it prompts, how far it runs, how it samples.
     struct Args {
         prompt: Vec<u8>,
         n_gen: usize,
-        /// The placement the run loads by, resolved against this process's
-        /// devices by the common unset rule ([`place::choose`]).
-        place: Place,
-        ctx: usize,
         parse_special: bool,
         sampling: SamplerParams,
         greedy: bool,
+        /// How many prompt sources the run named (exactly one is the rule).
+        sources: usize,
+        /// The sampling flags it named, which `--greedy` refuses.
+        sampling_flags: Vec<String>,
+    }
+
+    /// What every run of one process shares: the load it serves.
+    struct Load {
+        /// The placement the load takes, resolved against this process's
+        /// devices by the common unset rule ([`place::choose`]).
+        place: Place,
+        ctx: usize,
     }
 
     /// Why the run stopped.
@@ -120,34 +157,51 @@ mod drive {
         }
     }
 
-    fn parse_args() -> Result<(Args, PlaceWhy), GateError> {
-        let mut a = Args {
+    /// A run's flags as the argument list left them, defaults first.
+    fn new_run() -> Args {
+        Args {
             prompt: Vec::new(),
             n_gen: 256,
-            place: Place::A,
-            ctx: usize::try_from(workstation::CTX_MAX)?,
             parse_special: true,
             sampling: SamplerParams::default(),
             greedy: false,
+            sources: 0,
+            sampling_flags: Vec::new(),
+        }
+    }
+
+    fn parse_args() -> Result<(Vec<Args>, Load, PlaceWhy), GateError> {
+        let mut runs = vec![new_run()];
+        let mut load = Load {
+            place: Place::A,
+            ctx: usize::try_from(workstation::CTX_MAX)?,
         };
-        let (mut sources, mut sampling_flags) = (0, Vec::new());
         let mut place_flag = None;
         let mut it = std::env::args_os().skip(1);
         while let Some(flag) = it.next() {
             let flag = flag.to_string_lossy().into_owned();
             match flag.as_str() {
                 "--greedy" => {
-                    a.greedy = true;
+                    runs.last_mut()
+                        .expect("the first run precedes every flag")
+                        .greedy = true;
                     continue;
                 }
                 "--no-special" => {
-                    a.parse_special = false;
+                    runs.last_mut()
+                        .expect("the first run precedes every flag")
+                        .parse_special = false;
                     continue;
                 }
                 "--prompt-stdin" => {
-                    sources += 1;
+                    let a = runs.last_mut().expect("the first run precedes every flag");
+                    a.sources += 1;
                     a.prompt.clear();
                     std::io::stdin().read_to_end(&mut a.prompt)?;
+                    continue;
+                }
+                "--then" => {
+                    runs.push(new_run());
                     continue;
                 }
                 _ => {}
@@ -156,15 +210,18 @@ mod drive {
                 .next()
                 .ok_or_else(|| format!("{flag} needs a value, or is unknown: {USAGE}"))?;
             if flag == "--prompt" {
-                sources += 1;
+                let a = runs.last_mut().expect("the first run precedes every flag");
+                a.sources += 1;
                 a.prompt = os_bytes(v);
                 continue;
             }
             let v = v.to_string_lossy().into_owned();
+            let later_run = runs.len() > 1;
+            let a = runs.last_mut().expect("the first run precedes every flag");
             let s = &mut a.sampling;
             let sampling = match flag.as_str() {
                 "--prompt-file" => {
-                    sources += 1;
+                    a.sources += 1;
                     a.prompt = std::fs::read(&v).map_err(|e| format!("{v}: {e}"))?;
                     false
                 }
@@ -172,12 +229,17 @@ mod drive {
                     a.n_gen = v.parse()?;
                     false
                 }
+                "--place" | "--ctx" if later_run => {
+                    return Err(
+                        format!("{flag} sets the load: give it before the first --then").into(),
+                    );
+                }
                 "--place" => {
                     place_flag = Some(place::parse(&v)?);
                     false
                 }
                 "--ctx" => {
-                    a.ctx = v.parse()?;
+                    load.ctx = v.parse()?;
                     false
                 }
                 "--temp" => {
@@ -211,28 +273,31 @@ mod drive {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             };
             if sampling {
-                sampling_flags.push(flag);
+                a.sampling_flags.push(flag);
             }
         }
-        if sources != 1 {
-            return Err(format!("name the prompt once: {USAGE}").into());
-        }
-        if a.greedy {
-            if !sampling_flags.is_empty() {
-                return Err(format!(
-                    "--greedy is the argmax; it takes no sampling flag, got {}",
-                    sampling_flags.join(" ")
-                )
-                .into());
+        for (i, a) in runs.iter_mut().enumerate() {
+            let run = format!("run {i}");
+            if a.sources != 1 {
+                return Err(format!("{run}: name the prompt once: {USAGE}").into());
             }
-            a.sampling = SamplerParams::greedy();
-        }
-        if a.n_gen == 0 {
-            return Err("-n wants at least one generated token".into());
+            if a.greedy {
+                if !a.sampling_flags.is_empty() {
+                    return Err(format!(
+                        "{run}: --greedy is the argmax; it takes no sampling flag, got {}",
+                        a.sampling_flags.join(" ")
+                    )
+                    .into());
+                }
+                a.sampling = SamplerParams::greedy();
+            }
+            if a.n_gen == 0 {
+                return Err(format!("{run}: -n wants at least one generated token").into());
+            }
         }
         let placed = place::choose(place_flag)?;
-        a.place = placed.place;
-        Ok((a, placed))
+        load.place = placed.place;
+        Ok((runs, load, placed))
     }
 
     /// An argument's bytes as given (the prompt need not be UTF-8).
@@ -252,7 +317,7 @@ mod drive {
             R8,
         ])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
-        let (a, placed) = parse_args()?;
+        let (runs, load, placed) = parse_args()?;
         placed.record().eprint();
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         // The chat feeds its prompt one step per id (`Generator::prefill`), so
@@ -263,25 +328,40 @@ mod drive {
             open: cfg,
             card_timing: false,
         };
-        let mut sampler = Sampler::new(a.sampling)?;
+        // One sampler a run, each from its own params, built before the load:
+        // a run with params the sampler refuses names them before the card
+        // holds anything.
+        let mut samplers = runs
+            .iter()
+            .map(|a| Sampler::new(a.sampling))
+            .collect::<Result<Vec<_>, _>>()?;
         let path = ref_model_path()?;
         let tok = Tokenizer::from_gguf(&path)?;
-        let ids = tok.encode(&a.prompt, true, a.parse_special);
-        Record::new(&record::PROMPT_IDS).list("ids", &ids).eprint();
-        if ids.is_empty() {
-            return Err("the prompt encodes to no token".into());
+        // Every run's prompt is tokenized before the load, so a run that
+        // cannot run at all refuses before the card holds anything.
+        let ids: Vec<Vec<u32>> = runs
+            .iter()
+            .map(|a| tok.encode(&a.prompt, true, a.parse_special))
+            .collect();
+        for (i, ids) in ids.iter().enumerate() {
+            if ids.is_empty() {
+                return Err(format!("run {i}: the prompt encodes to no token").into());
+            }
         }
+        Record::new(&record::PROMPT_IDS)
+            .list("ids", &ids[0])
+            .eprint();
 
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let tier_batch = place::tier_batch(a.place, &inputs.hp);
+        let tier_batch = place::tier_batch(load.place, &inputs.hp);
         drop(split);
-        print_plan(&inputs, a.place, tier_batch, a.ctx, &ds41.open.place)?;
+        print_plan(&inputs, load.place, tier_batch, load.ctx, &ds41.open.place)?;
         let want_top_k = inputs.hp.indexer.top_k;
         let open = OpenArgs {
-            place: a.place,
+            place: load.place,
             tier_batch,
-            ctx: a.ctx,
+            ctx: load.ctx,
             mode: StepMode::Graph,
             pin_main: levers.pin_main(),
         };
@@ -297,7 +377,7 @@ mod drive {
                 model.note_load_plan(planned);
                 Ok(model)
             },
-            |m: &Deepseek41Model, load: Record| {
+            |m: &Deepseek41Model, rec: Record| {
                 let body = m.body("bloomery-chat")?;
                 let top_k = body.indexer_top_k();
                 let shadow = body.shadow_host();
@@ -308,17 +388,39 @@ mod drive {
                     )
                     .into());
                 }
-                let load = load
+                let rec = rec
                     .u("layers", inputs.hp.n_layer)
                     .u("top_k", top_k)
                     .w("shadow", "host")
                     .u("shadow_bytes", shadow.bytes)
                     .u("unified_addressing", shadow.unified_addressing);
-                place::with_cards(m, a.place, "bloomery-chat", load)
+                place::with_cards(m, load.place, "bloomery-chat", rec)
             },
             &mut std::io::stderr(),
         )?;
-        chat(&mut g, &a, &tok, &mut sampler, &ids)
+        // The state the load left, asserted back before each run after the
+        // first, after its clear.
+        let base = StateBack::read(g.model())?;
+        for (i, a) in runs.iter().enumerate() {
+            if i > 0 {
+                if let Some(fault) = g.model().poisoned() {
+                    return Err(format!(
+                        "run {i}: the clear on a model a fault poisoned ({fault}): the fault \
+                         ends the load"
+                    )
+                    .into());
+                }
+                g.model_mut().reset()?;
+                g.model_mut().residency_reset()?;
+                let now = StateBack::read(g.model())?;
+                base.check(&now, &format!("run {i}"))?;
+                Record::new(&record::PROMPT_IDS)
+                    .list("ids", &ids[i])
+                    .eprint();
+            }
+            chat(&mut g, a, &tok, &mut samplers[i], &ids[i])?;
+        }
+        Ok(())
     }
 
     /// The plan the engine is about to load under the placement's `levers`

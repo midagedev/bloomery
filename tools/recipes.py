@@ -2638,10 +2638,26 @@ def refresh_plans(recipe: Recipe) -> list[PlanFile]:
     return out
 
 
+def arm_depth(recipe: Recipe, value: str) -> int:
+    """The prompt length one generate_ds41 `--arm` value feeds: D and D/N are depth D, corpus:P (prose or
+    code, with or without /N) depth P — the depth whose engine plan a --counts reader needs."""
+    feed, _, n = value.partition("/")
+    if n and not n.isdigit():
+        raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts on a generate_ds41 --arm it cannot read "
+                          f"(D, D/N, prose:P or code:P): {value}")
+    name, sep, p = feed.partition(":")
+    depth = p if sep else name
+    if (sep and name not in ("prose", "code")) or not depth.isdigit():
+        raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts on a generate_ds41 --arm it cannot read "
+                          f"(D, D/N, prose:P or code:P): {value}")
+    return int(depth)
+
+
 def counts_depths(recipe: Recipe) -> list[int]:
     """The prompt lengths whose engine plan a recipe's `ds41_prefill.py --counts` reads: every generate_ds41
-    `--depth` in a box command that runs it (the tool reads the plan of each log's call). Empty for a recipe
-    that does not run it; refused by name when it does and no integer depth is found."""
+    `--depth` and `--arm` in a box command that runs it (the tool reads the plan of each log's call, an arm
+    list's each arm its own). Empty for a recipe that does not run it; refused by name when it does and no
+    depth this parser can read is found."""
     cmds = [strip_wrappers(c)[1] for r in _box_remotes(recipe) for c in simple_commands(shell_words(r))]
     if not any(COUNTS_TOOL in map(_norm, c) and "--counts" in c for c in cmds):
         return []
@@ -2654,8 +2670,10 @@ def counts_depths(recipe: Recipe) -> list[int]:
                 if not c[k + 1].isdigit():
                     raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts on a generate_ds41 --depth that is not an integer: {c[k + 1]}")
                 depths.append(int(c[k + 1]))
+            elif w == "--arm":
+                depths.append(arm_depth(recipe, c[k + 1]))
     if not depths:
-        raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts and no generate_ds41 --depth this parser can read")
+        raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts and no generate_ds41 --depth or --arm this parser can read")
     return depths
 
 
@@ -6218,6 +6236,18 @@ def self_test() -> int:
         got = plan_probs(refresh + reader.format(d=32))
         expect(len(got) == 1 and "gate-x reads the engine's plan of P = 32" in got[0] and "add 32 to its P list" in got[0],
                f"plans: a --counts depth no marker writes not named: {got}")
+        arms = ("gate-arms:\n    ./tools/box.sh 'D=t && BLOOMERY_STEP_STATS=1 bash tools/gpu-gate.sh generate_ds41 "
+                "--place gate --arm {a} > $D/b.log && python3 tools/flow/ds41_prefill.py --counts $D/b.log > $D/b.counts'\n")
+        got = plan_probs(refresh + arms.format(a="16 --arm prose:8/2 --arm code:8 --arm 16/2"))
+        expect(got == [], f"plans: every --arm form's depth written (D, D/N, prose:P/N, code:P): {got}")
+        for c in ("on", "off"):
+            open(os.path.join(tmp, "tools/flow/plans", f"ds41-p512-ced-{c}.rec"), "w").close()
+        got = plan_probs(refresh.replace("for P in 8 16", "for P in 512") + arms.format(a="512/2 --arm 1536/2"))
+        expect(len(got) == 1 and "gate-arms reads the engine's plan of P = 1536" in got[0] and "add 1536" in got[0],
+               f"plans: a --counts --arm depth no marker writes not named: {got}")
+        got = plan_probs(refresh + arms.format(a="512/2 --arm prose:x"))
+        expect(len(got) == 1 and "gate-arms" in got[0] and "--arm it cannot read" in got[0] and "prose:x" in got[0],
+               f"plans: an --arm this parser cannot read not refused by name: {got}")
         got = plan_probs(refresh.replace("-ced-$c.rec", "-ced-$c-$Q.rec"))
         expect(len(got) == 1 and "no loop around it sets" in got[0], f"plans: a marker variable no loop sets not refused: {got}")
         got = plan_probs(refresh.replace("for P in 8 16", "for P in 8 8"))
