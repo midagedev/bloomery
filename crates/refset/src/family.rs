@@ -9,6 +9,8 @@
 //! The identity every writer emits is the full path of the model's first
 //! shard, as the dumper was given it. The two V4.1 files name their shards
 //! alike, so a basename cannot tell them apart; their directories differ.
+//! A fixture file is regenerated in place at one path, so the sets dumped from
+//! it carry a second identity line, `# fixture` ([`crate::fixture`]).
 
 use crate::RefError;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,15 @@ pub enum Identity {
     /// `# draft_model\t<path>` too for a family whose draft is a file of its
     /// own (`Family::draft_runs`).
     MtpManifest,
+    /// [`Identity::Manifest`] of a set dumped on a fixture file: `# model\t<path>`
+    /// names [`crate::fixture::first_shard`], and `# fixture` equals
+    /// [`crate::fixture::line`] of that file.
+    FixtureManifest,
+    /// [`Identity::MtpManifest`] of a set dumped on a fixture file: `# model`
+    /// and `# fixture` as [`Identity::FixtureManifest`]'s, and
+    /// `# draft_model\t<path>` too for a family whose draft is a file of its
+    /// own.
+    FixtureMtpManifest,
     /// `model=<path>` in the `# argmax_ref` line heading the tsv (`argmax_ref`).
     ArgmaxHeader,
     /// `  model <path>` in the run's log, `<tag>.log` beside `<tag>.kld`
@@ -109,9 +120,12 @@ pub struct Family {
     /// family the fork's commit.
     pub build: Option<Build>,
     /// The model file the tree runs, for a family whose identity is a file.
-    pub runs: Option<fn() -> String>,
+    /// It can fail: a fixture family's file is found by a directory listing,
+    /// which finds none or several.
+    pub runs: Option<fn() -> Result<String, RefError>>,
     /// The draft file the tree runs, for [`Identity::ManifestAndDraft`] and
-    /// an [`Identity::MtpManifest`] family whose draft is its own file.
+    /// an [`Identity::MtpManifest`] or [`Identity::FixtureMtpManifest`] family
+    /// whose draft is its own file.
     pub draft_runs: Option<fn() -> Result<String, RefError>>,
     /// The gate recipes that read the family.
     pub consumers: &'static [&'static str],
@@ -133,10 +147,13 @@ impl Family {
 
     /// The model file the tree runs, for a family whose identity is a file.
     pub fn runs(&self) -> Result<String, RefError> {
-        self.runs.map(|f| f()).ok_or_else(|| RefError::Missing {
-            path: PathBuf::new(),
-            what: format!("the {} family names no model file", self.name),
-        })
+        match self.runs {
+            Some(f) => f(),
+            None => Err(RefError::Missing {
+                path: PathBuf::new(),
+                what: format!("the {} family names no model file", self.name),
+            }),
+        }
     }
 
     /// `dumped_from`, the model file set `set` states in its `line`, against
@@ -159,6 +176,33 @@ impl Family {
             what: format!("the {} family names no draft file", self.name),
         })?()?;
         check_same(set, "# draft_model", dumped_from, &runs)
+    }
+
+    /// `stated`, the text after the tab of the `# fixture` line set `set`
+    /// carries, against the fixture file the tree runs
+    /// ([`crate::fixture::line`] of [`Family::runs`]): [`RefError::Stale`]
+    /// unless the two lines are the same string, naming both. A set that states
+    /// none is stale too — nothing says which generation of the fixture it came
+    /// from. A family whose identity is not a fixture one takes any set.
+    pub fn check_fixture(&self, set: &Path, stated: Option<&str>) -> Result<(), RefError> {
+        if !matches!(
+            self.identity,
+            Identity::FixtureManifest | Identity::FixtureMtpManifest
+        ) {
+            return Ok(());
+        }
+        let runs = crate::fixture::line(Path::new(&self.runs()?))?;
+        let dumped_from = stated.map(|s| format!("{}{s}", crate::fixture::LINE_PREFIX));
+        if dumped_from.as_deref() == Some(runs.as_str()) {
+            return Ok(());
+        }
+        Err(RefError::Stale {
+            set: set.display().to_string(),
+            dumped_from: dumped_from.unwrap_or_else(|| {
+                "an unstated fixture (the set has no # fixture line)".to_string()
+            }),
+            runs,
+        })
     }
 
     /// `build`, the ik build set `set` names, against the family's
@@ -240,7 +284,7 @@ impl Family {
     pub fn check_set(&self, path: &Path) -> Result<Provenance, RefError> {
         let stated = |s: Option<&str>| s.unwrap_or("-").to_string();
         match self.identity {
-            Identity::Manifest => {
+            Identity::Manifest | Identity::FixtureManifest => {
                 let man = crate::ik::RefManifest::open(path, self)?;
                 Ok(Provenance {
                     dumped_from: stated(man.header.model()),
@@ -256,7 +300,7 @@ impl Family {
                     build: set.build,
                 })
             }
-            Identity::MtpManifest => {
+            Identity::MtpManifest | Identity::FixtureMtpManifest => {
                 let set = crate::mtpref::MtpSet::open(path, self)?;
                 Ok(Provenance {
                     dumped_from: stated(set.model.as_deref()),

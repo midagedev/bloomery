@@ -12,6 +12,9 @@
 //!   checks its readers run.
 //! - [`arch`]: each architecture's families, reached by the architecture's
 //!   name, and the table of all of them.
+//! - [`fixture`]: the fixture tier's identity — the path of each
+//!   architecture's fixture file and the `# fixture` line a set dumped from it
+//!   carries.
 //! - [`ik`]: ik's node dumps (`tools/ref/dump_ref.cpp`), the v1 and v2
 //!   `MANIFEST.tsv` and the files its rows name.
 //! - [`dsref`]: ik's DSpark draft sets (`tools/ref/dump_draft.cpp`).
@@ -35,6 +38,7 @@ mod columns;
 pub mod dequant;
 pub mod dsref;
 pub mod family;
+pub mod fixture;
 pub mod greedy;
 pub mod ik;
 pub mod kld;

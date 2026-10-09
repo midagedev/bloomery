@@ -2522,10 +2522,7 @@ mod gate {
             .find(|s| **s == IK_KDA_SET)
             .ok_or_else(|| format!("family {} has no set {IK_KDA_SET}", fam.name))?;
         let man = RefManifest::open(&fam.path(set), fam)?;
-        let runs = fam
-            .runs
-            .ok_or_else(|| format!("family {} names no model file", fam.name))?;
-        let model = runs();
+        let model = fam.runs()?;
         let split = Split::open(&model).map_err(|e| format!("open {model}: {e}"))?;
         let n_layer = split
             .arch_get_u64("block_count")

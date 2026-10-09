@@ -106,6 +106,10 @@ pub struct MtpSet {
     pub draft_model: Option<String>,
     /// `# build`: the ik tree's commit.
     pub build: Option<String>,
+    /// `# fixture`: in a set dumped on a fixture file, that file's
+    /// `bloomery.fixture.*` keys, the text after the tab
+    /// ([`crate::fixture::keys`]).
+    pub fixture: Option<String>,
     /// `# arch`.
     pub arch: Option<String>,
     /// `# tokens`: the prompt's ids, the target's warmup.
@@ -187,6 +191,7 @@ impl MtpSet {
             model: None,
             draft_model: None,
             build: None,
+            fixture: None,
             arch: None,
             tokens: None,
             complete: None,
@@ -219,9 +224,10 @@ impl MtpSet {
     }
 
     /// This set against its family's row: the completion trailer
-    /// ([`RefError::Unfinished`]), the file it states and, for a family
-    /// with a draft file, the draft file ([`RefError::Stale`]), then its
-    /// `# arch` and `# build` ([`RefError::Foreign`]). A set that states a
+    /// ([`RefError::Unfinished`]), the file it states, for a fixture family
+    /// the generation its `# fixture` line states and, for a family with a
+    /// draft file, the draft file ([`RefError::Stale`]), then its `# arch` and
+    /// `# build` ([`RefError::Foreign`]). A set that states a
     /// draft file for a family without one is foreign by its `draft_model`.
     pub fn check_family(&self, family: &Family) -> Result<(), RefError> {
         if self.complete.is_none() {
@@ -230,6 +236,7 @@ impl MtpSet {
             });
         }
         family.check_file(&self.dir, "# model", self.model.as_deref())?;
+        family.check_fixture(&self.dir, self.fixture.as_deref())?;
         match (family.draft_runs, &self.draft_model) {
             (Some(_), stated) => family.check_draft(&self.dir, stated.as_deref())?,
             (None, Some(stated)) => {
@@ -326,6 +333,7 @@ impl MtpSet {
             "model" => once(&mut self.model),
             "draft_model" => once(&mut self.draft_model),
             "build" => once(&mut self.build),
+            "fixture" => once(&mut self.fixture),
             "arch" => once(&mut self.arch),
             "tokens" => {
                 let ids = if v == "-" {

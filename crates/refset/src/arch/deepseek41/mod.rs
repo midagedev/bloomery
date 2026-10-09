@@ -1,10 +1,13 @@
 //! The DeepSeek-V4.1-Flash families. Every one is dumped from the V4.1 file
 //! the tree runs ([`gguf::v41::model`]); the node dumps, the draft set and the
 //! KLD bases by the sink-fixed ik tree, [`IK_BUILD`], the candidate-mask sets
-//! by the tree with ik's separate V4.1 graph, [`CAND_BUILD`].
+//! by the tree with ik's separate V4.1 graph, [`CAND_BUILD`]. The fixture
+//! tier's mirror of the node dumps is in [`fixture`].
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
+
+pub mod fixture;
 
 /// The ik tree every V4.1 oracle family is dumped from, and the one place a
 /// re-take of the oracle changes it.
@@ -15,6 +18,13 @@ pub const IK_BUILD: &str = "db517b69";
 
 /// The architecture every V4.1 manifest names in its `# arch` line.
 pub const ARCH: &str = "deepseek41";
+
+/// The V4.1 file the tree runs ([`gguf::v41::try_model`]), as a family's
+/// `runs`: the refusal of variables that name two files is the family's
+/// error, not a panic.
+pub fn model() -> Result<String, RefError> {
+    gguf::v41::try_model().map_err(|e| RefError::missing(std::path::PathBuf::new(), e.to_string()))
+}
 
 /// The 5-token prefill, ik on the CPU.
 pub const BATCH: &str = "ref_deepseek41";
@@ -59,7 +69,7 @@ pub static IK: Family = Family {
     identity: Identity::Manifest,
     arch: Some(ARCH),
     build: Some(Build::Is(IK_BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(model),
     draft_runs: None,
     consumers: &[
         "gate-ds41-oracle",
@@ -112,7 +122,7 @@ pub static CAND: Family = Family {
     identity: Identity::Manifest,
     arch: Some(ARCH),
     build: Some(Build::Is(CAND_BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(model),
     draft_runs: None,
     consumers: &["gate-gpu-ds41-index"],
 };
@@ -131,7 +141,7 @@ pub static DSREF: Family = Family {
     identity: Identity::ManifestAndDraft,
     arch: Some(ARCH),
     build: Some(Build::Patched(IK_BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(model),
     draft_runs: Some(dspark_model),
     consumers: &[
         "gate-gpu-dspark-graph",
@@ -170,7 +180,7 @@ pub static GREEDY: Family = Family {
     identity: Identity::ArgmaxHeader,
     arch: None,
     build: None,
-    runs: Some(gguf::v41::model),
+    runs: Some(model),
     draft_runs: None,
     consumers: &["gate-gpu-ds41-long"],
 };
@@ -190,13 +200,13 @@ pub static KLD: Family = Family {
     identity: Identity::RunLog,
     arch: None,
     build: Some(Build::Is(IK_BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(model),
     draft_runs: None,
     consumers: &["gate-ds41-kld", "run-ds41-ppl"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK, &CAND, &DSREF, &GREEDY, &KLD];
+pub static FAMILIES: &[&Family] = &[&IK, &CAND, &DSREF, &GREEDY, &KLD, &fixture::IK];
 
 #[cfg(test)]
 mod tests;

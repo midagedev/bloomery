@@ -50,7 +50,7 @@ pub static VISREF: Family = Family {
     },
     arch: Some(crate::arch::deepseek41::ARCH),
     build: Some(Build::Is(FORK_BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(super::deepseek41::model),
     draft_runs: None,
     // No gate reads it: its reader is the driver tools/ref/vision/visref_ds41.rs,
     // which needs the engine's media prompt call and has no recipe in this tree.

@@ -12,8 +12,8 @@ pub(crate) const VOCABULARY: &str = "/models/V/V-00001-of-00009.gguf";
 const PIN: &str = "llama-tokenize d03083b01a24f6a9e5c2190abf7d38c6 \
                    libllama.so f855ad0b949f0b7d871973be1fcc419f";
 
-fn vocabulary() -> String {
-    VOCABULARY.to_string()
+fn vocabulary() -> Result<String, RefError> {
+    Ok(VOCABULARY.to_string())
 }
 
 pub(crate) static FAMILY: Family = Family {

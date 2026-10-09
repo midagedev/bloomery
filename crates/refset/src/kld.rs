@@ -68,8 +68,8 @@ mod tests {
     use crate::RefError;
     use crate::family::{Build, Family, Identity};
 
-    fn runs() -> String {
-        "/models/P/M-00001-of-00009.gguf".to_string()
+    fn runs() -> Result<String, RefError> {
+        Ok("/models/P/M-00001-of-00009.gguf".to_string())
     }
 
     static FAMILY: Family = Family {

@@ -4,9 +4,12 @@
 //! within the positions a latent layer attends whole ([`IK`]), and the DSA
 //! sets past them, dumped with ik's k-pool indexer on ([`IK_DSA`]); the MTP
 //! draft set from the same file by the ik tree that carries the MTP graph,
-//! [`MTP_BUILD`].
+//! [`MTP_BUILD`]. The fixture tier's mirror of each is in [`fixture`].
 
+use crate::RefError;
 use crate::family::{Build, Family, Identity};
+
+pub mod fixture;
 
 /// The first shard of the split set every glm5next set is dumped from and
 /// the tree runs: the identity each set's `# model` line states. The family
@@ -49,8 +52,8 @@ pub const D16K_DSA: &str = "ref_glm5next_d16kdsa";
 pub const DSA_SETS: &[&str] = &[D3K_DSA, D16K_DSA];
 
 /// [`MODEL`], as a family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 /// ik's node dumps: the batch set and the decode-step sets, which the
@@ -112,7 +115,14 @@ pub static IK_DSA: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK, &MTP, &IK_DSA];
+pub static FAMILIES: &[&Family] = &[
+    &IK,
+    &MTP,
+    &IK_DSA,
+    &fixture::IK,
+    &fixture::MTP,
+    &fixture::IK_DSA,
+];
 
 #[cfg(test)]
 mod tests;

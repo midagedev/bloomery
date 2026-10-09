@@ -14,6 +14,7 @@
 //! loads by md5 ([`crate::tokenizer::build_id`]): the tokenizer is the
 //! library's code, the executable only calls it.
 
+use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 /// The key of these families in the table of all of them.
@@ -46,7 +47,7 @@ pub static V41: Family = Family {
     identity: Identity::Vocabulary,
     arch: None,
     build: Some(Build::Is(TILDE_BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(super::deepseek41::model),
     draft_runs: None,
     consumers: &["gate-tokenizer"],
 };
@@ -95,19 +96,19 @@ pub static QWEN38: Family = Family {
 
 /// The Qwen3-MoE vocabulary file: `$BLOOMERY_QWEN3MOE_VOCAB`, else
 /// [`QWEN3MOE_MODEL`]. An empty value counts as unset.
-fn qwen3moe_model() -> String {
-    match std::env::var("BLOOMERY_QWEN3MOE_VOCAB") {
+fn qwen3moe_model() -> Result<String, RefError> {
+    Ok(match std::env::var("BLOOMERY_QWEN3MOE_VOCAB") {
         Ok(p) if !p.is_empty() => p,
         _ => QWEN3MOE_MODEL.to_string(),
-    }
+    })
 }
 
-fn glm5next_model() -> String {
-    super::glm5next::MODEL.to_string()
+fn glm5next_model() -> Result<String, RefError> {
+    Ok(super::glm5next::MODEL.to_string())
 }
 
-fn qwen38_model() -> String {
-    super::qwen4exp::MODEL.to_string()
+fn qwen38_model() -> Result<String, RefError> {
+    Ok(super::qwen4exp::MODEL.to_string())
 }
 
 /// The families, in the order `refset-check` lists them.

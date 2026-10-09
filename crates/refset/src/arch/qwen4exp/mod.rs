@@ -2,10 +2,12 @@
 //! unsloth's UD-Q4_K_XL split set, [`MODEL`], by the ik tree [`IK_BUILD`]
 //! (`tools/ref/models/qwen4exp.sh`); the MTP draft set from the same file
 //! and the shared draft file by the ik tree that carries the MTP graph
-//! ([`mtp`]).
+//! ([`mtp`]). The fixture tier's mirror of each is in [`fixture`].
 
+use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
+pub mod fixture;
 pub mod mtp;
 
 /// The first shard of the split set every qwen4exp set is dumped from and
@@ -47,8 +49,8 @@ pub const VERIFIED_POSITIONS: u64 = 3001;
 pub const STEP_SETS: &[&str] = &[STEP4, STEP4_EVERY_NODE, D1K, D3K];
 
 /// [`MODEL`], as a family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 /// ik's node dumps: the batch set and the decode-step sets.
@@ -66,7 +68,7 @@ pub static IK: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK, &mtp::MTP];
+pub static FAMILIES: &[&Family] = &[&IK, &mtp::MTP, &fixture::IK, &fixture::MTP];
 
 #[cfg(test)]
 mod tests;

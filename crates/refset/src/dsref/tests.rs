@@ -46,8 +46,10 @@ fn write_set(dir: &Path, model: &str, draft: &str, rows: &[&str]) {
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
 }
 
-fn runs() -> String {
-    "/models/P/M-00001-of-00009.gguf".to_string()
+const RUNS: &str = "/models/P/M-00001-of-00009.gguf";
+
+fn runs() -> Result<String, RefError> {
+    Ok(RUNS.to_string())
 }
 
 fn draft_runs() -> Result<String, RefError> {
@@ -85,7 +87,7 @@ fn a_draft_set_reads_by_its_column_lines() {
         "plain\t95\t7",
         "skip\tx\t0\tq8_0\tquantized",
     ];
-    write_set(&dir, &runs(), "/models/D/draft.gguf", &rows);
+    write_set(&dir, RUNS, "/models/D/draft.gguf", &rows);
     let set = Dsref::open(&dir, &FAMILY).unwrap_or_else(|e| panic!("{e}"));
     let mix = set
         .find(0, Graph::Block, "hc_pre_mixes-0", 0)
@@ -167,17 +169,17 @@ fn a_draft_set_of_another_file_is_stale() {
         }) => {
             assert_eq!(
                 (dumped_from.as_str(), r),
-                ("/models/Q/M-00001-of-00009.gguf", runs())
+                ("/models/Q/M-00001-of-00009.gguf", RUNS.to_string())
             );
         }
         other => panic!("another target: {other:?}"),
     }
-    write_set(&dir, &runs(), "/models/E/draft.gguf", &[TENSOR]);
+    write_set(&dir, RUNS, "/models/E/draft.gguf", &[TENSOR]);
     assert!(matches!(
         Dsref::open(&dir, &FAMILY),
         Err(RefError::Stale { .. })
     ));
-    write_set(&dir, &runs(), "/models/D/draft.gguf", &[TENSOR]);
+    write_set(&dir, RUNS, "/models/D/draft.gguf", &[TENSOR]);
     let text = std::fs::read_to_string(dir.join("MANIFEST.tsv")).unwrap_or_default();
     for build in ["# build\tb1", "# build\tb0", "# build\tb0+"] {
         std::fs::write(
@@ -206,7 +208,7 @@ fn garbage(row: &str, columns: &str, field: &str) {
     f[at] = "x7";
     let bad = f.join("\t");
     let dir = set_dir(&format!("garbage-{field}-{}", &row[..3]));
-    write_set(&dir, &runs(), "/models/D/draft.gguf", &[&bad]);
+    write_set(&dir, RUNS, "/models/D/draft.gguf", &[&bad]);
     match Dsref::read(&dir) {
         Err(RefError::Malformed { what, .. }) => {
             assert!(what.starts_with(&format!("{field} \"x7\"")), "{what}");
@@ -250,7 +252,7 @@ fn a_garbage_int_count_is_malformed() {
 #[test]
 fn an_integer_file_of_another_length_is_malformed() {
     let dir = set_dir("i32-len");
-    write_set(&dir, &runs(), "/models/D/draft.gguf", &[INPUT]);
+    write_set(&dir, RUNS, "/models/D/draft.gguf", &[INPUT]);
     let set = Dsref::read(&dir).unwrap_or_else(|e| panic!("{e}"));
     let pos = set
         .find(0, Graph::Block, "CUDA0#inp_pos#0", 0)

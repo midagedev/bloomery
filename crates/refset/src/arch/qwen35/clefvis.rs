@@ -9,6 +9,7 @@
 //! (R1 onward), so `consumers` is empty.
 
 use super::{ARCH, LCPP_BUILD, MODEL_FLASH_Q8};
+use crate::RefError;
 use crate::clefvis::{Kind, MMPROJ_BF16};
 use crate::family::{Build, Family, Identity};
 
@@ -49,13 +50,13 @@ pub const BF16ROWS_SETS: &[&str] = &[
 ];
 
 /// [`MMPROJ_BF16`], as a tower family's `runs`.
-fn mmproj() -> String {
-    MMPROJ_BF16.to_string()
+fn mmproj() -> Result<String, RefError> {
+    Ok(MMPROJ_BF16.to_string())
 }
 
 /// [`MODEL_FLASH_Q8`], as a prompt family's `runs`.
-fn model() -> String {
-    MODEL_FLASH_Q8.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL_FLASH_Q8.to_string())
 }
 
 /// Set A: mtmd's preprocessed images, the tower's graph input.

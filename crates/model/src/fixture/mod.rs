@@ -54,6 +54,8 @@ use gguf::{GgmlType, LoadError};
 use crate::placement::PlacementError;
 
 mod budget;
+#[cfg(test)]
+mod digest;
 mod fill;
 mod plan;
 mod sidecar;

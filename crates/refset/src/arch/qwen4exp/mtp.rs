@@ -78,8 +78,8 @@ pub const MTP_BUILD: &str = "425a2c1d";
 pub const MTP_SET: &str = "ref-mtp/qwen4exp_prose64_n64_k1";
 
 /// [`MODEL`], as the family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 /// [`DRAFT`], as the family's `draft_runs`.

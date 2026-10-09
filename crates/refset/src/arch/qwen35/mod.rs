@@ -7,6 +7,7 @@
 //! [`MODEL_LEV`] (Qwen3.5-4B, its head tied to the token embedding) — one
 //! family a file, so a set of one is refused by name where another is read.
 
+use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 pub mod clefvis;
@@ -59,18 +60,18 @@ pub const LEV_P4096: &str = "ref_qwen35_lev_hidden_p4096";
 pub const LEV_SETS: &[&str] = &[LEV_P64, LEV_P600, LEV_P4096];
 
 /// [`MODEL`], as a family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 /// [`MODEL_FLASH_Q8`], as a family's `runs`.
-fn model_flash_q8() -> String {
-    MODEL_FLASH_Q8.to_string()
+fn model_flash_q8() -> Result<String, RefError> {
+    Ok(MODEL_FLASH_Q8.to_string())
 }
 
 /// [`MODEL_LEV`], as a family's `runs`.
-fn model_lev() -> String {
-    MODEL_LEV.to_string()
+fn model_lev() -> Result<String, RefError> {
+    Ok(MODEL_LEV.to_string())
 }
 
 /// llama.cpp mainline's final-norm hidden states.

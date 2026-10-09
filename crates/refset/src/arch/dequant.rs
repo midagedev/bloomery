@@ -5,6 +5,7 @@
 //! it loads by md5 ([`crate::dequant::build_id`]): `to_float` is the
 //! library's code.
 
+use crate::RefError;
 use crate::dequant::SYNTHETIC;
 use crate::family::{Build, Family, Identity};
 
@@ -48,7 +49,7 @@ pub static V41: Family = Family {
     identity: Identity::DequantManifest,
     arch: None,
     build: Some(Build::Is(BUILD)),
-    runs: Some(gguf::v41::model),
+    runs: Some(super::deepseek41::model),
     draft_runs: None,
     consumers: &["gate-1-1"],
 };
@@ -74,12 +75,12 @@ pub static SYNTH: Family = Family {
     ],
 };
 
-fn v2lite_model() -> String {
-    V2LITE_MODEL.to_string()
+fn v2lite_model() -> Result<String, RefError> {
+    Ok(V2LITE_MODEL.to_string())
 }
 
-fn synthetic() -> String {
-    SYNTHETIC.to_string()
+fn synthetic() -> Result<String, RefError> {
+    Ok(SYNTHETIC.to_string())
 }
 
 /// The families, in the order `refset-check` lists them.
