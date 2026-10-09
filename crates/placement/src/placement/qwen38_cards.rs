@@ -12,10 +12,9 @@ use gguf::GgmlType;
 
 use super::churn::ChurnPool;
 use super::workstation::{
-    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_USABLE, HostNeed,
-    HostRead, MARGIN, MIB, OS_OTHER, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
-    TIER_BATCH_RESERVE, census_usable, host, resolve, tier_batch_host_bytes,
-    tier_batch_staging_bytes,
+    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HostNeed, HostRead,
+    MARGIN, MIB, PLAN_ROOM, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
+    census_usable, host, resolve, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use super::{
     Card, CardFormat, Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
@@ -335,7 +334,7 @@ fn plan_with<'a>(
     if experts_to_nvme {
         super::expert_nvme_tier(&mut plan, room)?;
     }
-    plan.cards[0].kv_bytes += rows;
+    plan.cards[0].grow_kv(rows);
     let broken = plan.violations();
     assert!(broken.is_empty(), "ctx {ctx} slots {slots}: {broken:?}");
     Ok(plan)
@@ -345,11 +344,9 @@ fn plan_with<'a>(
 /// the largest ubatch a load runs).
 const UBATCH_PLANNED: u64 = 4096;
 
-/// The box's room with nothing loaded [derived from the measured `free -b`
-/// figures: `HOST_USABLE` less `OS_OTHER`], and the room of the 64 GiB host
-/// the sitting holds a Qwen3.8 arm to (`depth-qwen3moe`'s `mem=61G` scope:
-/// `MemoryMax` 61 GiB, nothing charged yet).
-const BOX_ROOM: u64 = HOST_USABLE - OS_OTHER;
+/// The room of the 64 GiB host the sitting holds a Qwen3.8 arm to
+/// (`depth-qwen3moe`'s `mem=61G` scope: `MemoryMax` 61 GiB, nothing charged
+/// yet); the box's own is [`PLAN_ROOM`].
 const SCOPE_61G: u64 = 61 << 30;
 
 /// The unset residency rule on `plan` with `MemAvailable` ample
@@ -401,7 +398,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
         .sum();
     assert_eq!(routed, Q4_ROUTED);
     let m = machine_a(A6000);
-    let a6000 = plan_at(&q4, &m, 4096, 1, BOX_ROOM).expect("the A6000 plan");
+    let a6000 = plan_at(&q4, &m, 4096, 1, PLAN_ROOM).expect("the A6000 plan");
     let want: Vec<u64> = (0..LAYERS)
         .map(|l| if l < 40 { 262 } else { 261 })
         .collect();
@@ -424,7 +421,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
         )
     );
     let m = machine_a(one);
-    let plan = plan_at(&q4, &m, 4096, 1, BOX_ROOM).expect("the 96 GB plan");
+    let plan = plan_at(&q4, &m, 4096, 1, PLAN_ROOM).expect("the 96 GB plan");
     assert_eq!(plan.n_l, vec![EXPERTS; LAYERS]);
     assert_eq!(
         (
@@ -489,7 +486,7 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     assert_eq!(routed, 55_823_564_800);
     let cards = picked("bp", &census_96(2));
     let m = machine_a(cards[0]);
-    let plan = plan_at(&q3, &m, 4096, 1, BOX_ROOM).expect("the Q3 plan");
+    let plan = plan_at(&q3, &m, 4096, 1, PLAN_ROOM).expect("the Q3 plan");
     assert_eq!(plan.n_l, vec![EXPERTS; LAYERS]);
     assert_eq!(
         (plan.cards[0].experts, plan.cards[0].expert_bytes),
@@ -512,7 +509,7 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     );
     let gate = machine_a(RTX_3090);
     let at = |room: u64| plan_at(&q3, &gate, 8192, 1, room).expect("the gate card's Q3 plan");
-    let host = at(BOX_ROOM);
+    let host = at(PLAN_ROOM);
     let host_need = HostNeed::of(&host, 0).bytes();
     assert_eq!(
         (
@@ -555,9 +552,9 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     );
     // A table the rule already moved is not the NVMe tier's to place again,
     // and a table on no tier a reader takes is refused by name.
-    let mut moved = at(BOX_ROOM);
+    let mut moved = at(PLAN_ROOM);
     assert!(matches!(
-        super::row_table_tier(&mut moved, BOX_ROOM, UBATCH_PLANNED),
+        super::row_table_tier(&mut moved, PLAN_ROOM, UBATCH_PLANNED),
         Err(PlacementError::Tensor { .. })
     ));
     let ple = moved
@@ -575,12 +572,12 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // every layer. The stage holds all 512 experts of every layer, so no
     // expert is left for the tier.
     assert!(matches!(
-        plan_at(&q3, &bp, 4096, 1, BOX_ROOM),
+        plan_at(&q3, &bp, 4096, 1, PLAN_ROOM),
         Err(PlacementError::IdleTier { tier: 0, .. })
     ));
     let q4 = model(false);
     assert!(matches!(
-        plan_at(&q4, &bp, 4096, 1, BOX_ROOM),
+        plan_at(&q4, &bp, 4096, 1, PLAN_ROOM),
         Err(PlacementError::IdleTier { tier: 0, .. })
     ));
 }
@@ -618,7 +615,7 @@ fn both_files_lend_the_draft_their_output_matrices() {
 fn two_slots(ctx: u64) -> (u64, Vec<u64>, u64) {
     let q4 = model(false);
     let m = machine_a(picked("a", &census_96(1))[0]);
-    let p = plan_at(&q4, &m, ctx, 2, BOX_ROOM).expect("a two-slot plan");
+    let p = plan_at(&q4, &m, ctx, 2, PLAN_ROOM).expect("a two-slot plan");
     (p.cards[0].expert_bytes, p.n_l.clone(), p.host.experts)
 }
 
@@ -720,7 +717,7 @@ struct NvmeArm {
 fn nvme_arm(room: u64) -> NvmeArm {
     let q4 = model(false);
     let gate = machine_a(RTX_3090);
-    let box_plan = plan_at(&q4, &gate, 4096, 1, BOX_ROOM).expect("the box plan");
+    let box_plan = plan_at(&q4, &gate, 4096, 1, PLAN_ROOM).expect("the box plan");
     assert_eq!(
         box_plan.host.nvme_expert_bytes, 0,
         "the box room splits nothing"
@@ -965,8 +962,8 @@ fn a_paged_plans_load_check_counts_the_arena() {
 /// The seat's prompt-cache budget counts the arena once: `HostNeed::bytes`
 /// carries it, and `CacheRam::of_tier` no longer subtracts it by hand, so
 /// the budget's terms are the same bytes as the old by-hand subtraction —
-/// `available − the arena-free need − pool − arena − checkpoints` — on
-/// every plan, paged or not. (The budget itself lives in gpu-gates'
+/// `available − the arena-free need − pool − arena`, the need holding the
+/// checkpoints its machine reserves — on every plan, paged or not. (The budget itself lives in gpu-gates'
 /// `CacheRam`, a device crate the Mac cannot test whose reading of the
 /// host's available bytes has no unit-test seam; this pins the identity its
 /// terms rest on.)
@@ -1101,9 +1098,9 @@ fn a_58_gib_room_puts_the_overflow_on_the_nvme_tier() {
 fn a_room_that_holds_the_need_keeps_the_plan_unchanged() {
     let q4 = model(false);
     let gate = machine_a(RTX_3090);
-    let box_plan = plan_at(&q4, &gate, 4096, 1, BOX_ROOM).expect("the box plan");
+    let box_plan = plan_at(&q4, &gate, 4096, 1, PLAN_ROOM).expect("the box plan");
     let need = HostNeed::of(&box_plan, 0).bytes() - PLE_TABLE + ROW_ROOM;
-    for room in [BOX_ROOM, need + 1, need] {
+    for room in [PLAN_ROOM, need + 1, need] {
         let kept = plan_at(&q4, &gate, 4096, 1, room).expect("the plan");
         let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
         assert_eq!(format!("{kept:?}"), format!("{twin:?}"), "room {room}");

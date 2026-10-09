@@ -405,7 +405,7 @@ impl PlanInputs {
         // The bytes a sequence holds beside its stores ride the card's kv
         // class, out of the budget `rows` reserved above, so
         // [`Plan::violations`] holds the card's bound against them.
-        plan.cards[0].kv_bytes += rows;
+        plan.cards[0].grow_kv(rows);
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -709,7 +709,7 @@ impl PlanInputs {
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
-            plan.cards[0].kv_bytes += rows;
+            plan.cards[0].grow_kv(rows);
             let broken: Vec<Violation> = plan
                 .violations()
                 .into_iter()
@@ -728,7 +728,7 @@ impl PlanInputs {
         }
         check_draft_reserve(machine, None)?;
         let mut plan = self.target_of(machine, ctx_max, levers, experts, reserve + rows, &kv)?;
-        plan.cards[0].kv_bytes += rows;
+        plan.cards[0].grow_kv(rows);
         let t = &plan.cards[0];
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
         // reserve the expert rule spread within.
@@ -3139,7 +3139,7 @@ mod tests {
             let mut plan = inputs
                 .target_of(machine, CTX, &levers, Experts::Host, reserve + rows, &kv)
                 .expect("the target's plan");
-            plan.cards[0].kv_bytes += rows;
+            plan.cards[0].grow_kv(rows);
             plan
         }
 
@@ -3209,6 +3209,87 @@ mod tests {
                     drafted.plan.cards[0].kv_bytes + drafted.draft.cards[0].kv_bytes,
                     inputs.seq_terms(Some(&mtp)).plan_kv(CTX, slots),
                     "{n} slots"
+                );
+            }
+        }
+
+        /// A card's headroom and its terms: the plan's `headroom_bytes`, and
+        /// the card's usable bytes (capped as the plan capped them) less
+        /// every term the plan counts on it, written from the fields.
+        fn headroom(p: &Plan<'_>) -> (i128, i128) {
+            let t = &p.cards[0];
+            let terms = t.dense_bytes
+                + t.expert_bytes
+                + t.rounding_bytes
+                + t.kv_bytes
+                + t.scratch_bytes
+                + t.context_bytes
+                + t.reserve_bytes;
+            (
+                t.headroom_bytes,
+                i128::from(p.usable_bytes(&p.machine.cards[0])) - i128::from(terms),
+            )
+        }
+
+        /// `inputs` with a routed Q4_K stack on every layer, 512 experts of
+        /// 24,576 rows of 2,560 values (35,389,440 B an expert, 72.5 GB in
+        /// all): more than plan (b′)'s two cards hold, so the stage card,
+        /// the tier card and the host each keep some.
+        fn routed(mut inputs: PlanInputs) -> PlanInputs {
+            for l in 0..LAYERS {
+                inputs.model.tensors.push(ModelTensor {
+                    name: format!("blk.{l}.ffn_gate_exps.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty: GgmlType::Q4_K,
+                    dims: vec![2560, 24_576, 512],
+                    file_bytes: 512 * 24_576 * 10 * 144,
+                    gathered_rows: None,
+                });
+            }
+            inputs
+        }
+
+        /// The stage card's headroom past the bytes a plan of several slots
+        /// adds to its kv class after the totals (the bytes beside every
+        /// slot's stores) is the card's usable bytes less every term: on the
+        /// plain plan, the drafted plan on one card, and the drafted plan
+        /// (b′) whose `MtpPlan::headroom_bytes` is that card's.
+        #[test]
+        fn slot_plans_keep_the_headroom_usable_less_every_term() {
+            let (inputs, machine) = (inputs(), machine());
+            let mtp =
+                MtpInputs::from_parts(draft(HeadRows::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            let tiered = routed(self::inputs());
+            let batch = tier_batch_of(2560, 10, 4096);
+            for n in [2, 4] {
+                let plain = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Host, n)
+                    .expect("the plan");
+                let (got, want) = headroom(&plain);
+                assert_eq!(got, want, "{n} slots: the plain plan");
+                let drafted = inputs
+                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .expect("the drafted plan");
+                let (got, want) = headroom(&drafted.plan);
+                assert_eq!(got, want, "{n} slots: the drafted plan on one card");
+                let reserve = mtp.card_bytes_of(CTX, n).expect("the draft's card bytes");
+                let bp = machine_bp(LAYERS, 4096, Some(reserve), batch);
+                let drafted = tiered
+                    .plan_mtp_with_slots(&bp, CTX, &levers, &mtp, Experts::Card, n)
+                    .expect("the drafted plan (b′)");
+                assert!(
+                    drafted.plan.tier_n_l[0].iter().sum::<u64>() > 0
+                        && drafted.plan.host.experts > 0,
+                    "{n} slots: the tier card and the host both hold experts"
+                );
+                let (got, want) = headroom(&drafted.plan);
+                assert_eq!(
+                    (got, drafted.headroom_bytes),
+                    (want, want),
+                    "{n} slots: the drafted plan (b′)"
                 );
             }
         }

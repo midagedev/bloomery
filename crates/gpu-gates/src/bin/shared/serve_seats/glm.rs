@@ -94,8 +94,8 @@
 //! its draft joining where it left (`SlotDrafts::unpark`); the residency is
 //! the model's and stays where use has taken it, the state carrying no slot
 //! map. Its default is the lesser of `bind::CACHE_RAM_CAP` and half of what
-//! `MemAvailable` leaves at load past the plan's host need, the residency's
-//! churn pool and the checkpoints' host budget (`bind::CacheRam`); a `cache`
+//! `MemAvailable` leaves at load past the plan's host need, every slot's
+//! checkpoints in it, and the residency's churn pool (`bind::CacheRam`); a `cache`
 //! line on stderr after the `residency host` record (`--plan` too) prints it
 //! with each term. A state of another model, card, context or store layout
 //! is refused by name; every save, load, eviction and skip prints as a line.
@@ -224,7 +224,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
-    GLM_CARD, checkpoints_beside, residency_room, residency_set,
+    GLM_CARD, checkpoints_reserved, glm_machine, residency_room, residency_set,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
@@ -541,7 +541,7 @@ impl Placed {
         slots: usize,
     ) -> Result<Placed, GateError> {
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
-        let machine = place.machine(None, tier_batch)?(inputs.model.layers);
+        let machine = glm_machine(place, tier_batch, slots)?(inputs.model.layers);
         let rule = ctx_of(inputs, &machine, levers, nextn, set, slots)?;
         let ctx = u64::try_from(rule.ctx)?;
         let tier_experts =
@@ -936,7 +936,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         a.cache_ram,
         HostNeed::of(&plan, beside).bytes(),
         pool,
-        checkpoints_beside(plan.machine),
+        checkpoints_reserved(plan.machine),
     )?
     .holding(seq_bytes(&inputs, 1, nextn.is_some()));
     eprintln!("{}", cache.line());
@@ -1109,7 +1109,7 @@ impl Glm {
         let prefill = a.cfg.prefill;
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine(None, a.tier_batch)?,
+            machine: glm_machine(a.place, a.tier_batch, a.slots)?,
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: a.cfg,

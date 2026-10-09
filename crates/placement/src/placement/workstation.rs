@@ -14,7 +14,7 @@ pub use super::devices::{
     census_usable, device_on_host, label, listed_index, resolve, spec_of_device, visible,
     word_picks, workstation_spec,
 };
-use super::{Card, Host, Machine, PlacementError, Plan};
+use super::{Card, Host, HostTotals, Machine, PlacementError, Plan};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -111,6 +111,15 @@ pub const GRANULE: NonZeroU64 = NonZeroU64::new(2 * MIB).expect("2 MiB is not ze
 /// `free -b`].
 pub const HOST_USABLE: u64 = 270_071_001_088;
 pub const OS_OTHER: u64 = 6_694_629_376;
+
+/// The plan room of this workstation: the host room a load has with nothing
+/// loaded, [`HOST_USABLE`] less [`OS_OTHER`] [derived] — the room
+/// [`HostNeed::check`] holds a plan of [`host`] to ([`HostNeed::machine_room`]),
+/// and the one a plan that must not move with the host's reading is made at
+/// (`tools/ref/plan-room.sh` reads this line, a literal, and nothing else).
+pub const PLAN_ROOM: u64 = 263_376_371_712;
+
+const _: () = assert!(PLAN_ROOM == HOST_USABLE - OS_OTHER);
 
 /// The engram row cache: the hot rows a reader of row-gathered tables keeps
 /// beside the drive, which a plan sets aside on the host while such a table
@@ -488,6 +497,12 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 /// `MemAvailable` already leaves out what the OS and every other process
 /// hold. The page cache the host set will reuse is inside `MemAvailable`
 /// already, as reclaimable file pages, so no term adds it.
+///
+/// The one owner of a plan's host bound: the load holds the need to the
+/// host's reading, and the plan its own terms to its machine's figure
+/// ([`HostNeed::machine_room`]: `Plan::violations`' host check and a plan's
+/// host headroom); the NVMe tier's arena and window, sized to the reading
+/// the split took, are held to that reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostNeed {
     pub experts: u64,
@@ -510,24 +525,39 @@ impl HostNeed {
     /// them.
     #[must_use]
     pub fn of(plan: &Plan<'_>, extra: u64) -> HostNeed {
-        let os = plan
-            .machine
-            .host
-            .reserves
-            .iter()
-            .filter(|(name, _)| name == OS_RESERVE)
-            .map(|(_, b)| b)
-            .sum();
-        HostNeed {
-            experts: plan.host.expert_bytes,
-            tables: plan.host.table_bytes,
-            shadows: plan.host.shadow_bytes,
-            reserves: plan.host.reserve_bytes,
+        HostNeed::of_totals(
+            &plan.machine.host,
+            &plan.host,
+            plan.card_budget.is_some(),
             extra,
-            arena: plan.host.nvme_arena_bytes,
-            os,
-            card_budget: plan.card_budget.is_some(),
+        )
+    }
+
+    /// The host terms `totals` hold on `host`, a plan made under a card
+    /// budget or not, with `extra` beside them: [`HostNeed::of`]'s, before
+    /// the plan that carries them is built.
+    #[must_use]
+    pub fn of_totals(host: &Host, totals: &HostTotals, card_budget: bool, extra: u64) -> HostNeed {
+        HostNeed {
+            experts: totals.expert_bytes,
+            tables: totals.table_bytes,
+            shadows: totals.shadow_bytes,
+            reserves: totals.reserve_bytes,
+            extra,
+            arena: totals.nvme_arena_bytes,
+            os: os_reserve(host),
+            card_budget,
         }
+    }
+
+    /// The room `host`'s own figure leaves a load: its usable bytes less
+    /// the reserve named [`OS_RESERVE`], which a reading of the host leaves
+    /// out already — the room a plan is held to before any reading
+    /// ([`HostNeed::check`] in `Plan::violations`, and the plan's host
+    /// headroom); [`PLAN_ROOM`] on this workstation's [`host`].
+    #[must_use]
+    pub fn machine_room(host: &Host) -> u64 {
+        host.usable_bytes.saturating_sub(os_reserve(host))
     }
 
     /// The bytes `MemAvailable` must cover: the plan's host terms, `extra`
@@ -561,6 +591,15 @@ impl HostNeed {
             })
         }
     }
+}
+
+/// The bytes of `host`'s reserves named [`OS_RESERVE`].
+fn os_reserve(host: &Host) -> u64 {
+    host.reserves
+        .iter()
+        .filter(|(name, _)| name == OS_RESERVE)
+        .map(|(_, b)| b)
+        .sum()
 }
 
 /// A placed load whose host need passes the host's available bytes
@@ -836,11 +875,36 @@ pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, Host
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, CardSpec, CgroupLevel, DRAFT_RESERVE, HostNeed, HostRead, Machine, PlacementError,
-        RTX_3090, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, card,
-        cgroup_room, cgroup_v2_path, host, host_room, mem_available, plan_a, plan_bp, plan_gate,
-        plan_tiers, tier, tier_batch_bytes,
+        A6000, CardSpec, CgroupLevel, DRAFT_RESERVE, HostNeed, HostRead, Machine, PLAN_ROOM,
+        PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes,
+        TierDraft, card, cgroup_room, cgroup_v2_path, host, host_room, mem_available, plan_a,
+        plan_bp, plan_gate, plan_tiers, tier, tier_batch_bytes,
     };
+
+    /// One plan room: `tools/ref/plan-room.sh --room`, the room
+    /// `records-refresh` makes V4.1's plans at, prints [`PLAN_ROOM`], and
+    /// the workstation's host leaves a load that room
+    /// ([`HostNeed::machine_room`]), the room a plan of it is held to.
+    #[test]
+    fn the_plan_room_is_one_const() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/ref/plan-room.sh");
+        let out = std::process::Command::new("bash")
+            .args([script, "--room"])
+            .output()
+            .expect("bash runs plan-room.sh");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "plan-room.sh --room: {}: {stderr}",
+            out.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            PLAN_ROOM.to_string(),
+            "plan-room.sh --room ({stderr})"
+        );
+        assert_eq!(HostNeed::machine_room(&host()), PLAN_ROOM);
+    }
 
     /// Plan (a), the gate plan and plan (b′) as their own bodies built them
     /// before [`plan_tiers`]: the references the refactored plans must equal

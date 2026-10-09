@@ -404,6 +404,7 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag};
@@ -1863,7 +1864,8 @@ mod gate {
 
         fn open(&self, slots: usize) -> Result<Glm5nextModel, GateError> {
             let file = glm5next_tier::open()?;
-            let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
+            let mut machine = crate::gate_card::plan_gate(self.inputs.model.layers);
+            reserve_checkpoints(&mut machine, glm_seqs(slots));
             let np = self.plan(&machine, slots)?;
             let t = Instant::now();
             let mut m = Body::open_placed_nextn_slots(
@@ -1983,8 +1985,9 @@ mod gate {
         let named = matches!(&past, Err(e) if e.to_string().contains(&format!(
             "of a load whose plan counted {SLOTS} resident sequences"
         )));
-        let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
         let counted = |n: usize| -> Result<u64, GateError> {
+            let mut machine = crate::gate_card::plan_gate(a.inputs.model.layers);
+            reserve_checkpoints(&mut machine, glm_seqs(n));
             let np = a.plan(&machine, n)?;
             Ok(np.plan.cards[0].kv_bytes + np.nextn.cards[0].kv_bytes)
         };
@@ -2598,7 +2601,8 @@ mod gate {
         slots: usize,
     ) -> Result<Glm5nextModel, GateError> {
         let file = glm5next_tier::open()?;
-        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
+        reserve_checkpoints(&mut machine, glm_seqs(slots));
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let plan = inputs.plan_slots(&machine, u64::try_from(SLOT_CTX)?, &place, lanes, slots)?;
         let term = plan.machine.cards[0].scratch_bytes;
