@@ -1236,6 +1236,47 @@ fn a_paged_plan_steps_one_column() {
     );
 }
 
+/// A default count whose plan the room leaves under the NVMe tier's floor
+/// ([`paged_floor`]) serves one slot where the one-slot plan pages, beside
+/// an expert tier card too, where [`paged_columns`] keeps every slot: the
+/// one slot is the room's. Its draft goes off unset and is refused set; with
+/// no arena the asked plan stands.
+#[test]
+fn a_floor_fallback_serves_one_slot_where_slots_step_alone() {
+    let arena = 23_434_203_136_u64;
+    let at = |arena, slots, together, draft, draft_set| PagedAt {
+        arena,
+        slots,
+        slots_by: None,
+        together,
+        draft,
+        draft_set,
+    };
+    for together in [true, false] {
+        for (at, want) in [
+            (
+                at(arena, 2, together, false, false),
+                Ok(Paged::OneColumn { slots: 1 }),
+            ),
+            (
+                at(arena, 3, together, true, false),
+                Ok(Paged::OneColumn { slots: 1 }),
+            ),
+            (
+                at(arena, 2, together, true, true),
+                Err(PagedRefused {
+                    arena,
+                    slots: None,
+                    draft: true,
+                }),
+            ),
+            (at(0, 2, together, true, false), Ok(Paged::AsAsked)),
+        ] {
+            assert_eq!(paged_floor(&at), want, "{at:?}");
+        }
+    }
+}
+
 /// The GLM seat's levers unset: under a serving placement (`--place a` or
 /// `bp`, both `serving_place`) the NextN draft and the
 /// residency's default word; `off`, the first condition that holds named,
