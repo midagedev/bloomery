@@ -35,7 +35,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some("qwen3moe") => qwen3moe::spec::read(split)?,
         Some("qwen35moe" | "qwen4exp") => qwen35moe::spec::read(split)?,
         Some(a) if is_qwen35_body(a) => qwen35moe::spec::read(split)?,
-        Some("glm5next") => glm5next::spec::read(split)?,
+        Some("glm5next" | GLM5_NEXT_LLAMA_CPP) => glm5next::spec::read(split)?,
         Some("mimo2") => mimo2::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
@@ -66,6 +66,11 @@ pub fn is_dflash(split: &Split) -> bool {
 /// The architecture string of a DeepSeek-V4-Flash file, which the
 /// [`deepseek41`] module reads as its [`deepseek41::hparams::Model::Deepseek4`].
 pub const DEEPSEEK4: &str = "deepseek4";
+
+/// llama.cpp's spelling of GLM-5.3-Flash's architecture, which unsloth's
+/// current shards carry: the same model and keys as ik's `glm5next`, read by
+/// the [`glm5next`] module under either string.
+pub const GLM5_NEXT_LLAMA_CPP: &str = "glm5-next";
 
 /// Which of the [`deepseek41`] module's models `split` holds, by its
 /// `general.architecture`; any other string is an error naming it.
@@ -149,24 +154,28 @@ impl Arch {
 
     /// The string → variant step on its own, so it can be tested without a file.
     /// `deepseek4` (DeepSeek-V4-Flash) is read by the `deepseek41` module as
-    /// one of its two models ([`deepseek41_model`]): the one variant whose
-    /// name is not the only string it stands for.
+    /// one of its two models ([`deepseek41_model`]), and `glm5-next`
+    /// ([`GLM5_NEXT_LLAMA_CPP`]) is `glm5next` under llama.cpp's spelling:
+    /// the variants whose name is not the only string they stand for.
     pub fn from_name(name: &str) -> Result<Arch, ModelError> {
         match name {
             "deepseek2" => Ok(Arch::Deepseek2),
             "deepseek41" | DEEPSEEK4 => Ok(Arch::Deepseek41),
             "qwen3moe" => Ok(Arch::Qwen3moe),
             "qwen35moe" => Ok(Arch::Qwen35moe),
-            "glm5next" => Ok(Arch::Glm5next),
+            "glm5next" | GLM5_NEXT_LLAMA_CPP => Ok(Arch::Glm5next),
             "mimo2" => Ok(Arch::Mimo2),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
 
     /// The module's name: the `general.architecture` string of its first
-    /// model. A `deepseek4` file detects as [`Arch::Deepseek41`], so what names
-    /// a file (a log line, an oracle directory) takes the file's own string
-    /// (`Split::architecture`, or [`deepseek41::hparams::Model::name`]).
+    /// model, which keys the reference-set families (`refset::arch::families`)
+    /// and the oracle tables. A `deepseek4` file detects as
+    /// [`Arch::Deepseek41`] and a `glm5-next` file as [`Arch::Glm5next`], so
+    /// what names a file (a log line, an oracle directory) takes the file's
+    /// own string (`Split::architecture`, or
+    /// [`deepseek41::hparams::Model::name`]).
     pub fn name(&self) -> &'static str {
         match self {
             Arch::Deepseek2 => "deepseek2",
@@ -500,6 +509,17 @@ mod tests {
         assert_eq!(Arch::from_name(super::DEEPSEEK4).unwrap(), Arch::Deepseek41);
     }
 
+    /// A file that spells GLM-5.3-Flash's architecture as llama.cpp does is
+    /// read by the glm5next module, which stays the name of the module.
+    #[test]
+    fn glm5_next_is_the_glm5next_architecture() {
+        assert_eq!(
+            Arch::from_name(super::GLM5_NEXT_LLAMA_CPP).unwrap(),
+            Arch::Glm5next
+        );
+        assert_eq!(Arch::Glm5next.name(), "glm5next");
+    }
+
     /// An architecture no reader reads is refused by its name before any key
     /// is read.
     #[test]
@@ -522,6 +542,19 @@ mod tests {
             .to_string();
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("glm5next.block_count"), "{err}");
+    }
+
+    /// A `glm5-next` header goes to the glm5next reader, which names its keys
+    /// under the file's own prefix.
+    #[test]
+    fn a_glm5_next_header_goes_to_the_glm5next_reader() {
+        let path = super::synthetic::header("glm5-next-spec", super::GLM5_NEXT_LLAMA_CPP, &[], &[]);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = super::spec(&split)
+            .expect_err("a header without keys")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("glm5-next.block_count"), "{err}");
     }
 
     /// A `qwen4exp` header goes to the qwen35moe reader, which names its keys

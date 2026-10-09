@@ -169,8 +169,8 @@ mod tests {
 
     use super::super::hparams::tests::{keys, shaped, tensors};
     use super::super::roles::SELECTION_BIAS;
-    use crate::arch::coverage;
     use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::{GLM5_NEXT_LLAMA_CPP, coverage};
 
     /// The small header of the `hparams` tests, with `tokenizer.ggml.pre`
     /// `glm4` and a chat template, and the tensors `keep` keeps; its read
@@ -206,6 +206,36 @@ mod tests {
                 "{covered:?} listed: {items:?}"
             );
         }
+    }
+
+    /// A file that spells the architecture as llama.cpp does, with the share
+    /// key its converter writes, is the same model: the description and the
+    /// defaults are the glm5next file's, and the reader lists no key unread.
+    #[test]
+    fn the_llama_cpp_spelling_reads_as_the_same_model() {
+        let (base, _) = read("glm5next-spelling-base", |_| true);
+        let names = tensors();
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("glm4")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let mut kv = keys();
+        kv.push(("attention.indexer.index_share_mtp", V::Bool(true)));
+        let path = header_shaped(
+            "glm5-next-spelling",
+            GLM5_NEXT_LLAMA_CPP,
+            &kv,
+            &global,
+            &shaped(&names),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = crate::arch::spec(&split).map_err(|e| e.to_string());
+        let unread = super::super::hparams::unread_keys(&split);
+        let _ = std::fs::remove_file(&path);
+        let read = read.expect("the header reads");
+        assert_eq!(read.spec, base.spec);
+        assert_eq!(read.defaults, base.defaults);
+        assert!(unread.is_empty(), "{unread:?}");
     }
 
     /// The selection bias is optional, as ik loads it: a file without it

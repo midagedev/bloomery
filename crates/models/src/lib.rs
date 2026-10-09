@@ -62,7 +62,9 @@ pub enum Arch {
 }
 
 impl Arch {
-    /// The `general.architecture` string.
+    /// The `general.architecture` string the architecture is named by. A file
+    /// may spell it otherwise: a `glm5-next` file reads as [`Arch::Glm5Next`],
+    /// whose name is `glm5next`.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

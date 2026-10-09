@@ -81,6 +81,13 @@ pub struct Hparams {
     /// `kda.gate_lower_bound`: the decay's lower bound, below 0.
     pub gate_lower_bound: f32,
     pub indexer: Indexer,
+    /// `attention.indexer.index_share_mtp`: whether a draft chain's later
+    /// iterations reuse the first one's selection; `None`: the key is absent,
+    /// which takes no default. A proposal is one id (the app's GLM
+    /// `MtpBody::WIDTH`, held at 1 by a const assertion beside it; the NextN
+    /// chain refuses a second walk), so no iteration follows the first and
+    /// the value changes nothing; a wider proposal reads it first.
+    pub index_share_mtp: Option<bool>,
     pub hc: Hc,
     /// `expert_count`.
     pub n_expert: usize,
@@ -139,6 +146,7 @@ const READ: &[&str] = &[
     "attention.indexer.key_length",
     "attention.indexer.top_k",
     "attention.indexer.kpool",
+    "attention.indexer.index_share_mtp",
     "hyper_connection.count",
     "hyper_connection.sinkhorn_iterations",
     "hyper_connection.epsilon",
@@ -250,6 +258,11 @@ impl Hparams {
             ));
         }
         let indexer = indexer(split)?;
+        // llama.cpp's draft chain reuses its first iteration's selection in the
+        // later ones when this is true; ik reads no such key. No lever or flag
+        // here runs a second iteration (the field's doc names the width), so
+        // either value runs the same walk: the key is kept, not acted on.
+        let index_share_mtp = optional_bool(split, "attention.indexer.index_share_mtp")?;
         let hc = Hc {
             streams: positive(split, "hyper_connection.count")?,
             sinkhorn: positive(split, "hyper_connection.sinkhorn_iterations")?,
@@ -364,6 +377,7 @@ impl Hparams {
             kda_head_dim,
             gate_lower_bound,
             indexer,
+            index_share_mtp,
             hc,
             n_expert,
             n_used,
@@ -686,6 +700,14 @@ fn optional_f32(split: &Split, suffix: &str) -> Result<Option<f32>, PlacementErr
     }
 }
 
+/// `<architecture>.<suffix>` as a bool, `None` when absent.
+fn optional_bool(split: &Split, suffix: &str) -> Result<Option<bool>, PlacementError> {
+    match split.value(&split.arch_key(suffix)) {
+        None => Ok(None),
+        Some(_) => meta_bool(split, suffix).map(Some),
+    }
+}
+
 /// `read`, else `default`, recorded in `defaults` with `why` (ik's line).
 fn or_default<T: std::fmt::Display>(
     suffix: &str,
@@ -844,6 +866,51 @@ pub(super) mod tests {
         assert_eq!(hp.kinds, KINDS);
         assert_eq!((hp.n_layer, hp.n_trunk, hp.dense_lead), (5, 4, 1));
         assert_eq!(hp.defaults, Vec::<String>::new());
+    }
+
+    /// A file without the share key reads as before: no value, and no
+    /// default taken.
+    #[test]
+    fn an_absent_index_share_mtp_is_none_and_takes_no_default() {
+        let hp = read("glm5next-noshare", &keys(), &tensors()).expect("the header reads");
+        assert_eq!(hp.index_share_mtp, None);
+        assert_eq!(hp.defaults, Vec::<String>::new());
+    }
+
+    /// The share key is read as the bool it is, whichever value: a proposal
+    /// of one id runs the same walk under both, and the key is not listed
+    /// among those the reader does not read.
+    #[test]
+    fn an_index_share_mtp_of_either_value_is_read() {
+        for want in [true, false] {
+            let mut kv = keys();
+            kv.push(("attention.indexer.index_share_mtp", V::Bool(want)));
+            let path = header_shaped("glm5next-share", "glm5next", &kv, &[], &shaped(&tensors()));
+            let split = gguf::Split::open(&path).expect("the synthetic header opens");
+            let hp = Hparams::read(&split).map_err(|e| e.to_string());
+            let unread = super::unread_keys(&split);
+            let _ = std::fs::remove_file(&path);
+            let hp = hp.expect("the header reads");
+            assert_eq!(hp.index_share_mtp, Some(want));
+            assert_eq!(hp.defaults, Vec::<String>::new());
+            assert!(
+                !unread.iter().any(|k| k.ends_with("index_share_mtp")),
+                "{unread:?}"
+            );
+        }
+    }
+
+    /// A share key of another type is refused by its name.
+    #[test]
+    fn a_non_bool_index_share_mtp_is_refused() {
+        let mut kv = keys();
+        kv.push(("attention.indexer.index_share_mtp", V::U32(1)));
+        refused(
+            "glm5next-share-u32",
+            &kv,
+            &tensors(),
+            "glm5next.attention.indexer.index_share_mtp: is absent or not a bool",
+        );
     }
 
     #[test]

@@ -125,7 +125,7 @@ fn default_source() -> String {
 /// not cover. The copy list is every key [`Hparams::read`] reads that is not a
 /// function of the map.
 pub fn key_rule(suffix: &str) -> Option<KeyRule> {
-    const COPY: [&str; 36] = [
+    const COPY: [&str; 37] = [
         "context_length",
         "embedding_length",
         "feed_forward_length",
@@ -150,6 +150,7 @@ pub fn key_rule(suffix: &str) -> Option<KeyRule> {
         "attention.indexer.key_length",
         "attention.indexer.top_k",
         "attention.indexer.kpool",
+        "attention.indexer.index_share_mtp",
         "hyper_connection.count",
         "hyper_connection.sinkhorn_iterations",
         "hyper_connection.epsilon",

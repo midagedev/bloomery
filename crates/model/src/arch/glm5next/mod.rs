@@ -1,4 +1,6 @@
-//! `glm5next` — GLM-5.3-Flash. The file's keys (`hparams`), every tensor's
+//! `glm5next` — GLM-5.3-Flash, which a file declares as `glm5next` (ik) or
+//! `glm5-next` (llama.cpp, [`crate::arch::GLM5_NEXT_LLAMA_CPP`]); its keys sit
+//! under the file's own string. The file's keys (`hparams`), every tensor's
 //! role (`roles`), the typed description (`spec`), the tensor names the
 //! program reads (`names`), the host tier's view of a routed layer (`host`)
 //! and the plan from the headers (`place`); the program is `gpu-glm5next`.

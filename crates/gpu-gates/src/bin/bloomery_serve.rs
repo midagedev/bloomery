@@ -35,8 +35,9 @@
 //! `--model` is refused by name, and so is `--model decide` with no head,
 //! and a file whose decision type no row serves (`kev`).
 //! Otherwise, with no `--model`, the architecture of the file's first shard
-//! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next the glm
-//! seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe the qwen3 seat;
+//! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next and
+//! glm5-next the glm seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe
+//! the qwen3 seat;
 //! a file of a decision row's backbone (qwen35) with no head is refused by
 //! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
 //! that carries its head); a
@@ -124,7 +125,7 @@ mod drive {
     use bloomery_gpu_gates::{GateError, exit_with, model_file, ref_model_path};
     use cuda_core::sys;
     use gguf::Split;
-    use model::arch::DEEPSEEK4;
+    use model::arch::{Arch, DEEPSEEK4};
     use serve::ServeError;
     use serve::decide::Ask;
     use serve::preflight::Driver;
@@ -216,12 +217,13 @@ models (the --model word is optional with a model file: the file's architecture 
 
         /// Whether a file of architecture `arch` (its `general.architecture`
         /// string) is this seat's. `qwen4exp` is not an `Arch` name, which
-        /// is why the seat of a file is read from the string.
+        /// is why the seat of a file is read from the string; the glm seat
+        /// takes both spellings of its architecture through [`Arch::from_name`].
         fn serves(self, arch: &str) -> bool {
             match self {
                 Model::Ds41 => matches!(arch, "deepseek41" | DEEPSEEK4),
                 Model::Qwen38 => arch == "qwen4exp",
-                Model::Glm => arch == "glm5next",
+                Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
                 Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe"),
             }
         }

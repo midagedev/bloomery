@@ -98,6 +98,12 @@ impl MtpBody for Body {
 // widest, is one walk.
 const _: () = <Body as MtpBody>::FITS;
 const _: () = assert!(<Body as MtpBody>::VERIFY_ROWS == <Body as Rows>::MAX_ROWS);
+// A proposal of one id has no second draft iteration; a wider one reads the
+// file's `index_share_mtp` (`Hparams::index_share_mtp`) first.
+const _: () = assert!(
+    <Body as MtpBody>::WIDTH == 1,
+    "a GLM proposal wider than one id needs the index_share_mtp rule (Hparams::index_share_mtp)"
+);
 
 /// The shared feed as the NextN program's, field for field.
 fn nextn_feed(f: Feed<'_, GlmArena>) -> NextnFeed<'_> {
