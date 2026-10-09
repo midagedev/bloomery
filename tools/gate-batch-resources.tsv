@@ -1,0 +1,41 @@
+# The pack's resource table (packsched, 2026-10-09): one row per [group('solo')]/[group('solo-real')] recipe —
+# tools/gate-batch.sh's lane X packs those, and a recipe with no row is a named error there: a recipe that runs in the
+# pack declares its bytes. A row for a recipe the justfile does not hold is ignored; a row for one that holds neither
+# group is a named error (the table serves the pack alone).
+#   <recipe>\t<flags>\t<bytes>
+# flags: m — a clause measures the host (page-fault pins, or a plan-time room read its clauses' premises follow): the
+#        item starts with nothing else running and nothing starts beside it.
+# bytes: the plan's HostNeed — the bytes the engine's own load check (crates/gpu/src/model.rs, host_available) reserves
+#        — plus a locked or anonymous pool the recipe sets beside it; the real tier's number. The fixture tier's loads
+#        are the tree's small fixture files and reserve nothing: the pack reads 0 bytes there.
+# Derivations (loadchain's D5 N2, from train028b's logs; [derived] where rounded):
+#   deepseek41 --place gate: CPU 239,830,005,760 B + ROW_CACHE 4 GiB − OS reserve 6,694,629,376 B ≈ 237.6e9 [derived]
+#   glm5next   --place gate: need=173,015,891,968 B (the glm5next serve log's cache line)
+#   qwen4exp   --place gate: need=92,054,154,240 B (the qwen38 serve log's cache line); the serve/residency seats add
+#              the churn pool 35.6e9 B beside it; iqleg loads the file twice (both resident): 2 x.
+#   mimo2: resident_bytes 6,771,848,948 (train028's log) + scratch, rounded up [derived].
+gate-gpu-ds41-callstream	-	237600000000
+gate-gpu-ds41-long	m	237600000000
+gate-gpu-ds41-twocard	-	237600000000
+gate-gpu-glm5next-serve	-	173015891968
+gate-gpu-glm5next-twocard	-	173015891968
+gate-gpu-nvtier	-	92054154240
+gate-gpu-qwen38-residency	-	127700000000
+gate-gpu-qwen38-serve	-	127654154240
+gate-gpu-qwen38-twocard	-	92054154240
+gate-gpu-qwen4exp-e2e	m	92054154240
+gate-gpu-qwen4exp-iqleg	-	184108308480
+gate-gpu-qwen4exp-mtp	m	92054154240
+soak-ds41	-	237600000000
+stage-gpu-load-v41	-	237600000000
+stage-gpu-load-v41-lock	-	237600000000
+weekly-gpu-ds41-cand	-	237600000000
+weekly-gpu-ds41-lost	-	237600000000
+weekly-gpu-ds41-serve	-	237600000000
+weekly-gpu-glm5next-e2e-long	-	173015891968
+weekly-gpu-mimo2-e2e	-	8000000000
+gate-gpu-ds41-residency-a	-	237600000000
+gate-gpu-glm5next-e2e	-	173015891968
+gate-gpu-glm5next-mtp	-	173015891968
+gate-gpu-glm5next-residency	-	173015891968
+gate-gpu-glm5next-stagger	-	173015891968

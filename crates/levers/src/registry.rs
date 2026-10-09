@@ -1934,6 +1934,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          only mark its row.",
     ),
     runner(
+        "BLOOMERY_PACK_BUDGET",
+        Some("gate-batch.sh"),
+        "Mac side: the host byte budget `tools/gate-batch.sh` gives the pack of lane X (bytes, a \
+         positive integer); unset means the script's `PACK_BUDGET` constant; the self-test \
+         shrinks it.",
+    ),
+    runner(
         "BLOOMERY_PLACEMENT_TABLE",
         None,
         "The placement gate: `1` prints the per-tensor table too.",

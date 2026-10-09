@@ -202,12 +202,14 @@ gate-gpu-e2e *ARGS:
 
 # 하이브리드 MoE 경계 게이트: V2-Lite를 n_l 32와 0(n_l 밖 expert는 호스트)으로 올려 전부 카드인 모델과 대조한다.
 # 캡처 노드 수, eager = 재생, 층별 카드 슬롯 비트 동일·호스트 합 밴드, argmax 뒤집힘 밴드, 겹침 레버는 순서만 바꾸는지.
+[group('pool')]
 gate-gpu-hybrid *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hybrid && bash tools/gpu-gate.sh gate_hybrid {{ARGS}}'
 
 # 적응형 residency 기계 게이트(모델 파일 없음, 합성 스택): 같은 이력 = 같은 값(복사 시점과 무관), 정적 재배치와 비트 동일,
 # 늦은 복사는 스트림이 기다림, 호스트·카드 맵이 한 id를 두 번 또는 0번 서비스하지 않음, reset은 시드로, 호스트 비상주
 # 희생자는 이름으로 거부, 고정 시드는 움직이지 않음(adaptres §4 c1–c5·c7).
+[group('pool')]
 gate-gpu-swap *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_swap {{ARGS}}'
 
@@ -785,6 +787,7 @@ gate-gpu-qwen35moe-moe *ARGS:
 # Qwen3.6-35B-A3B 전 체인 게이트(한 장): 노드 수 핀(디코드 520, 패스 537 + 4m), 디코드 다섯 스텝 = 다섯 행 패스 = eager
 # = 리셋 뒤 반복(logits·저장소 비트 동일), 층별 teacher-forced 탭(GDN·어텐션·MoE)과 자유 주행 l_out을 ik 배치 세트에,
 # step4·d1k 세트는 ik의 프리필 상태(cache_s·cache_k·cache_v)를 실어 한 스텝을 댄다.
+[group('pool')]
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
@@ -926,6 +929,7 @@ gate-gpu-qwen3moe-experts:
 
 # qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
 # 파일), graph = eager. 텐서 코어 플래시(엔진 경로)로 한 번 돈다. 스칼라 패스는 (u)의 자로 eager 안에서만 돈다.
+[group('pool')]
 gate-gpu-qwen3moe-e2e:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
@@ -1662,6 +1666,7 @@ gate-gpu-qwen38-serve:
 # eight ids a pass takes) gives generate_qwen3moe --tokens <those ids> -n 64 --last-step's ids, and its
 # /v1/chat/completions of the same turn is those ids (gate_qwen3_serve's header has the clauses). Logs in
 # target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device bundle.
+[group('pool')]
 gate-gpu-qwen3-serve:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin generate_qwen3moe --bin gate_qwen3_serve && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D'
 
@@ -1999,10 +2004,15 @@ weekly-gpu-mimo2-e2e *ARGS:
 # that read ik's sets (free, forced, the step sets) are Oracle clauses, deferred to the real tier by name; every other
 # clause runs on the fixture. Loads the whole model: alone in a batch in the real tier, under the big-load lock the V4.1
 # loads take; balanced over the cards in the fixture tier, which takes no lock.
+# PIN(2026-10-09): its own bound, 1200 s. The measured median is 773 s (train028b/028c/028f's times rows), past 0.75 x
+# the default 900 the batch's budget refusal names; the gate's arms admit no smaller split (`--only` takes one arm, so
+# one item per arm: main 293 s, pp 313 s, slots 162 s, stagger 69 s, each plus its own ~50 s load — 936 s of chain time,
+# +163 s on the critical path). 1200 keeps the kill at 1.55 x the median while the budget check reads 900 s, the default
+# bound itself.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-e2e:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_BOUND=1200 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
 
 # The same gate's drafted slots pass (`--only stagger-draft`, (h1)-(h4)) on a NextN load of its own at SLOT_CTX, its plan
 # counting two slots: each slot's verify rows, two a slot, as one pass of four (`GpuModel::verify_slots` and

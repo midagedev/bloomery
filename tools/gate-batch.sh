@@ -70,6 +70,52 @@
 #      anyway, so lane sums that ran them in parallel would be wrong. In the fixture tier the group pins
 #      nothing: a fixture load takes no V4.1 load lock (tools/gpu-gate.sh), so a member is placed by its
 #      gpu-gate.sh form like any recipe, and a 3090-only call still keeps it in lane A.
+#   C  the chain (the real tier, --lanes 2 only; loadchain, 2026-10-09): the v41-load lock is the
+#      batch's critical path, so its members are one serial resource both lanes feed, not a lane.
+#      Members: every v41-load recipe that is not solo and takes no BLOOMERY_CARD=both pick (the
+#      recipes lane A held), plus each solo-real recipe CHAIN_SOLO_REAL (below) names. One member at
+#      a time, batch-wide: a mutex (a directory under DIR) around each member's run, whatever its rc —
+#      a batch-side mirror of gpu-gate.sh's box-wide lock, so a lane never parks on it with its card
+#      idle; a lane that dies holding it ends the batch by name, never a wait without end. A member's
+#      card candidates, from its forms and its box pick: both cards when every gpu-gate.sh call takes
+#      the `any` form (one ledger key per candidate, as a balanced item); the 3090 when a call does
+#      not or it runs device code with no gate lock; the A6000 alone for a BLOOMERY_CARD=a6000 pick,
+#      with no card forced (box.sh picks, as the recipe's own key keeps). A member green on one
+#      candidate's key skips there at 0 s; green on both, it takes the 3090's. Order, by model family
+#      (family() below): the family lane X opens with goes last, so X starts on a warm host set; the
+#      chain's other families in the reverse of X's family order, then families X does not hold in
+#      first-appearance order; within a family, record order. A lane takes the first unclaimed member
+#      in that order whose candidates include its card, within the family of the first unclaimed
+#      member — it never opens the next family while the current one holds an unclaimed member, even
+#      one only the other lane's card can run. In the fixture tier and --lanes 1 the class does not
+#      exist: a member is placed as the v41-load paragraph says. The dry run lists the members as
+#      `lane C` with their candidates; the lane and card of each are decided at run time.
+#   pool: a recipe (or a dependency) that carries `[group('pool')]` — its host tier spins a worker
+#      pool on the cores a big load's pool is pinned to (crates/threads: the pool is process-wide and
+#      pins its workers; crates/gpu/src/host/step.rs: the host tier's service is a pool job) — never
+#      starts beside a chain item. It changes no placement: the recipe's calls and other groups place
+#      it as without the attribute.
+#   big-host: a recipe (or a dependency) that carries `[group('big-host')]` — it locks or allocates
+#      more host memory than fits beside a chain item's host set — is held to the same rule as pool.
+#      No byte table lives here: the group is the one owner of the fact.
+#   pack (the X phase, --lanes 2; packsched, 2026-10-09): lane X's items no longer run one at a
+#      time. The phase is a pack: an item starts when a card is free, the summed host bytes of the
+#      running items fit PACK_BUDGET (below: loadchain's B, a lower bound on the reading every
+#      load's own HostNeed check takes), no two [group('pool')] items run at once (batch-wide: the
+#      lanes' takes and the pack hold one pool mutex, two pools spinning on the same pinned cores),
+#      and an item the resource table flags m — a clause that measures the host: page-fault pins, or
+#      a plan-time room read its clauses' premises follow — starts with nothing else running, and
+#      nothing starts beside it. A both-cards item still needs both cards free (nothing else runs);
+#      a one-card item takes a free card, and a solo item whose gpu-gate.sh call takes the `any`
+#      form now has both cards as candidates, its ledger key and times row following the card it
+#      took. The table (tools/gate-batch-resources.tsv) holds one row per solo/solo-real recipe:
+#      its flags and its host bytes, the plan's HostNeed derived per family (the fixture tier's
+#      loads are the tree's small files and reserve nothing — the pack reads 0 bytes there). A solo
+#      recipe with no row, or a row for a recipe that is not solo, is a named error: a recipe that
+#      runs in the pack declares its bytes. Launches take the longest-est eligible item; a single
+#      item always starts (the budget bounds pairs, and one load's own check is its own); the dry
+#      run simulates the pack from the expected seconds and the predicted line's laneX= is that
+#      wall. --lanes 1 keeps today's serial lane.
 #   deferred (the fixture tier only; class D): a recipe the fixture tier cannot run, which the batch defers to the real tier instead
 #      of running it or counting it red. Two kinds, two owners. (1) real-only: the gate has no fixture-tier conversion. Its box
 #      command opens with `bash tools/ref/real-only.sh <its own name> && …` (every box.sh command of the recipe does), and that call
@@ -182,6 +228,14 @@
 # lock and V4.1 load lock), which the item line prints as `waited=<s>s`. --dry-run validates, prints each item's lane, command and
 # plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
 # neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
+#
+# Budget refusal. Before anything runs (after the plan validates): every item whose expected
+# seconds pass 0.75 × the bound that would kill it — the BLOOMERY_GATE_BOUND of its one bounded
+# call (tools/gate.sh, tools/gpu-gate.sh, tools/host-gate.sh; unset 900, tools/gate-bound.sh) — is
+# a named refusal, exit 65: a slower gate is a red gate in the making, and a suite whose slowest
+# item overflows its bound is an error, not an overflow. --over-budget-ok passes them (the dry run
+# names both the refused and the unchecked — no single bounded call, or a bound the text does not
+# spell: several calls, an arithmetic, no runner at all).
 #
 # Disk floor. Before anything starts — after argument parsing, before the log directory and the first
 # lane — the free space of the volume that holds the tree's target/ and of the volume that holds OUT
@@ -297,8 +351,24 @@ DEFAULT_S=45 # the expected seconds of an item with no row in the times file (th
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/ (tools/mac-check.sh), rounded up to a whole GiB
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
+# The solo-real recipes that join the chain (class C, the header). Each one's own reason was read
+# (loadchain's D5 N3, 2026-10-09): the stated reason is the host set under the big-load lock — not
+# two cards, not a host-memory pin — and no clause or plan of its gate reads a host-memory value a
+# neighbour moves. The Qwen3.8 e2e gates stay out by name: their plan reads the host's room
+# (crates/model/src/arch/qwen35moe/place.rs, PlanInputs::of) and its PLE table's tier follows that
+# reading. A name here must carry solo-real and v41-load wherever the justfile holds it (a member
+# loads under the lock); a name the justfile does not hold is ignored — the self-test's fixture
+# justfile holds its own recipes.
+CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5next-stagger gate-gpu-glm5next-mtp gate-gpu-glm5next-residency'
+# The pack's host budget (the header's «pack»): the bytes the running X items' loads may sum to.
+# Loadchain's B (its D5 N2): the box's lowest observed MemAvailable 263,259,930,624 B (train028b's
+# serve logs) less a 1 GiB margin for a reading lower than train028b's lowest = 262,185,889,800 B.
+# A set of loads whose HostNeeds sum within it each pass their own check (crates/gpu/src/model.rs,
+# host_available: a neighbour's populated page cache counts as available; its locked bytes do not).
+# BLOOMERY_PACK_BUDGET overrides it (bytes, a positive integer; the self-test's numbers).
+PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] | --classes | --self-test"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -558,7 +628,93 @@ ro-glm:
 [group('solo-real')]
 sr-a6000:
     BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/gpu-gate.sh gen_sa --place a'
+
+# The chain's cases (class C): two members CHAIN_SOLO_REAL names in the real tree — a both-cards
+# one and an A6000 pick — plus two same-family members on one card each, and the neighbour groups.
+[group('solo-real')]
+[group('v41-load')]
+gate-gpu-glm5next-e2e:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_ge'
+
+[group('solo-real')]
+[group('v41-load')]
+gate-gpu-ds41-residency-a:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh gen_ra --place a'
+
+[group('v41-load')]
+v41-d41-a:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh gen_da'
+
+[group('pool')]
+pool-any:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pl'
+
+[group('big-host')]
+big-any:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_bh'
+
+# The pack's cases (the header's «pack»): one-card items that fit the budget, a pair that does not,
+# an m-flagged item, a both-cards one; a second pool item beside pool-any; and a recipe whose bound
+# lives two scripts deep (the budget scan follows the calls).
+[group('solo')]
+pk-a:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pa'
+
+[group('solo')]
+pk-b:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pb'
+
+[group('solo')]
+pk-big:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pg'
+
+[group('solo')]
+pk-big2:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pg2'
+
+[group('solo')]
+pk-m:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_pm'
+
+[group('solo')]
+pk-both:
+    BLOOMERY_CARD=both ./tools/box.sh 'bash tools/gpu-gate.sh gen_pt'
+
+[group('pool')]
+pool-two:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_p2'
+
+bt-deep:
+    ./tools/box.sh 'bash tools/bt-one.sh'
 JF
+  # The pack's resource table: a row per solo/solo-real recipe of the fixture justfile above (a
+  # recipe the justfile does not hold — sr-arm arrives in a case below — is ignored), and the pack
+  # case rows the cases below read (BLOOMERY_PACK_BUDGET shrinks the budget per case).
+  cat > "$t/tools/gate-batch-resources.tsv" << 'RT'
+v41-solo	-	1000
+weekly-b	-	1000
+sr-any	-	1000
+sr-v41	-	1000
+x-glm	-	1000
+x-q	-	1000
+x-v41	-	1000
+x-none	-	1000
+x-v41b	-	1000
+ro-solo	-	1000
+sr-a6000	-	1000
+sr-arm	-	1000
+gate-gpu-glm5next-e2e	-	1000
+gate-gpu-ds41-residency-a	-	1000
+pk-a	-	100
+pk-b	-	100
+pk-big	-	9000
+pk-big2	-	9000
+pk-m	m	100
+pk-both	-	100
+RT
+  # A bound two scripts deep: bt-deep -> bt-one.sh -> bt-two.sh holds the bounded call.
+  printf '%s\n' '#!/usr/bin/env bash' 'bash tools/bt-two.sh' > "$t/tools/bt-one.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'BLOOMERY_GATE_BOUND=100 bash tools/gpu-gate.sh gen_bt' > "$t/tools/bt-two.sh"
   # The default profile a recipe with no BLOOMERY_MODEL loads.
   mkdir -p "$t/tools/ref"
   # The GPU hold's box-side writer is the real tools/gpu-gate.sh (with the real lease-probe.sh it sources): the fake box below runs
@@ -617,17 +773,17 @@ DF
   sed 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
   grep -q '^RETRY_WAIT=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-retry copy did not patch (RETRY_WAIT's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
-  check 'classes: an any-form v41-load recipe is lane A on the 3090' 0 \
-    "^v41-any	A	fixed	3090	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
+  check 'classes: an any-form v41-load recipe is a chain member over both cards' 0 \
+    "^v41-any	C	chain	3090,a6000	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
   check 'classes: an any-form recipe outside the group stays balanced' 0 '^plain-any	F	balanced	3090,a6000	' "${gb[@]}" --classes
   check 'classes: solo wins over v41-load' 0 '^v41-solo	X	solo	3090	' "${gb[@]}" --classes
   check 'classes: a host recipe with device code is balanced with no card forced' 0 "^hostdev	F	balanced	-	hostdev: \[group\('host'\)\]" "${gb[@]}" --classes
   check 'classes: a timed name in a comment of the body is not a timed recipe' 0 '^commented	F	balanced	-	no device code$' "${gb[@]}" --classes
   check 'classes: a timed script in command position is' 0 '^timedrun	T	timed	-	timedrun runs tools/ref/timing-card\.sh' "${gb[@]}" --classes
   check 'classes: a recipe that runs a batch is refused' 0 '^nested	R	refused	-	nested runs tools/gate-batch\.sh' "${gb[@]}" --classes
-  check 'dry run: the v41-load member runs in lane A with the 3090 forced' 0 \
-    "^lane A  v41-any +BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=3090' just v41-any$" "${gb[@]}" --dry-run v41-a v41-any plain-any host
-  check 'dry run: lane A holds both V4.1 loads' 0 'predicted laneA=150s laneB=15s laneX=0s wall=150s' \
+  check 'dry run: the chain member pins no card — the lane that takes it decides' 0 \
+    "^lane C  v41-any +just v41-any$" "${gb[@]}" --dry-run v41-a v41-any plain-any host
+  check 'dry run: both V4.1 loads are the chain' 0 'predicted laneA=5s laneB=10s laneX=0s chain=150s wall=150s' \
     "${gb[@]}" --dry-run v41-a v41-any plain-any host
   # Lane X by model family, V4.1 first, then each family in the order its first item is listed; a
   # dependency's profile is the recipe's, a recipe with none loads ref-paths.sh's default.
@@ -636,14 +792,14 @@ DF
   if [ "$got" = 'x-v41 x-v41b x-glm x-glm-2 x-none x-q ' ]; then pass 'order: lane X by family, V4.1 first, then first appearance'
   else fail 'order: lane X by family, V4.1 first, then first appearance' "got '$got'"; fi
   # Lane B runs longest first (the Mac-only check-recipes heads it in a landing batch), not in list order.
-  out=$("${gb[@]}" --dry-run v41-a host plain-any 2>&1) || fail 'order: lane B longest first' "the dry run failed"
+  out=$("${gb[@]}" --dry-run steal-fix host plain-any 2>&1) || fail 'order: lane B longest first' "the dry run failed"
   got=$(printf '%s\n' "$out" | sed -n 's/^lane B  \([^ ]*\) .*/\1/p' | tr '\n' ' ')
   if [ "$got" = 'plain-any host ' ]; then pass 'order: lane B longest first, not in list order'
   else fail 'order: lane B longest first, not in list order' "got '$got'"; fi
   check 'items: a batch as an item is refused by name' 65 'nested runs tools/gate-batch\.sh' "${gb[@]}" --dry-run host nested
   check "items: a solo recipe's arm through another recipe is refused, naming the solo recipe" 65 \
     "'v41-a:--faults' hands gen_y --faults, the arm of the solo recipe v41-solo" "${gb[@]}" --dry-run 'v41-a:--faults'
-  check 'items: other ARGS of the same binary pass' 0 "^lane A  v41-a-2 " "${gb[@]}" --dry-run v41-a 'v41-a:--sets'
+  check 'items: other ARGS of the same binary pass' 0 "^lane C  v41-a-2 " "${gb[@]}" --dry-run v41-a 'v41-a:--sets'
   # `just affected … 2>&1` output: just's echoed recipe line, then the `affected:` header and the recipe lines.
   printf '%s\n' './tools/affected-gates.sh main --no-box' 'affected: a..b — 2 changed files, 2 of 6 gate-recipes selected' \
     '  gate-x                      crates/x/src/lib.rs (+1)' 'unmapped: none' > "$t/aff-echo.txt"
@@ -718,6 +874,7 @@ if [ "${FAKE_CARD75:-0}" = 1 ]; then
   exit 75
 fi
 [ "${FAKE_LEASE_UP:-0}" = 1 ] && : > "$st/lease-up"
+s0=$(date +%s)
 k=0
 while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
   if [ -n "${FAKE_UNTIL:-}" ] && cat "$st/box.log" "$st/probe.log" 2> /dev/null | grep -q "${FAKE_UNTIL}\$"; then
@@ -727,6 +884,7 @@ while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
   sleep 1
   k=$((k + 1))
 done
+echo "$s0 $(date +%s) $*" >> "$st/ran.log"
 # …and whether the hold is still up when it ends (a lane that finished first must not have taken it down).
 if [ -f "$st/batch.gpuhold" ]; then printf 'present\t%s\n' "$*" >> "$st/end.log"; else printf 'ABSENT\t%s\n' "$*" >> "$st/end.log"; fi
 exit "${FAKE_RC:-0}"
@@ -754,8 +912,12 @@ while i < len(a):
     items.append(a[i])
     i += 1
 import os
+green = set()
+if os.environ.get("FAKE_GREEN_FILE"):
+    with open(os.environ["FAKE_GREEN_FILE"]) as fh:
+        green = {ln.strip() for ln in fh if ln.strip()}
 for k, it in enumerate(items):
-    if os.environ.get("FAKE_SKIP") == "1":
+    if os.environ.get("FAKE_SKIP") == "1" or f"stub-{it}" in green:
         print(f"stub-{it}\t{it}\tskip\tgreen-at=abc1234 2026-10-08T00:00:00+0900 tree=/x")
     else:
         print(f"stub-{it}\t{it}\trun\tstub")
@@ -802,8 +964,9 @@ FP
       printf 'owner=%s since=%s\n' "$PRE_HOLD" "$(date +%s)" > "$t/fake-state/batch.gpuhold"
       python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "$t/fake-state/batch.gpuhold" "${PRE_AGE:-0}"
     fi
-    # LFLAG: the ledger flag of the batch (default the round's)
+    # LFLAG: the ledger flag of the batch (default the round's); MTAG: a mutant copy's tag
     [ "${GBFAST:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-fast.sh")
+    [ -z "${MTAG:-}" ] || runner=(bash "$t/tools/gate-batch-$MTAG.sh")
     BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
       "${runner[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
@@ -857,18 +1020,517 @@ FP
   else fail 'steal: the dry run names the balanced item movable' "no movable line under steal-bal"; fi
   if grep -A3 '^lane A  steal-slow' <<< "$out" | grep -q 'movable'; then fail 'steal: the dry run leaves a fixed item unmarked' "a movable line under steal-slow"
   else pass 'steal: the dry run leaves a fixed item unmarked'; fi
+  # The chain (class C). A mutant copy per rule: the sed applies (its line greps the copy), the
+  # batch runs against the mutant and the defect shows, then the same batch runs green here.
+  mutant_of() { # <tag> <sed expr> <ERE proving the sed applied>
+    local tag=$1 expr=$2 proof=$3
+    n=$((n + 1))
+    sed "$expr" "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-$tag.sh"
+    if grep -Eq -- "$proof" "$t/tools/gate-batch-$tag.sh"; then echo "mutant $tag: $expr"
+    else bad=$((bad + 1)); echo "FAIL mutant $tag: the sed did not apply: $expr"; fi
+  }
+  # no_overlap <ran.log> <cmd-a> <cmd-b>: the two items' run intervals do not overlap; a batch's
+  # chain members run one at a time, so their intervals never cross. A command with no line in the log
+  # (or no log) is a FAIL line and status 2, never a pass or a defined answer for the pair.
+  no_overlap() {
+    local arc=0
+    awk -v a="$2" -v b="$3" '
+      $0 ~ (" " a "[ ]*$") { as = $1; ae = $2 }
+      $0 ~ (" " b "[ ]*$") { bs = $1; be = $2 }
+      END { if (as == "" || bs == "") exit 2; exit !(as < bs ? ae <= bs : be <= as) }' "$1" || arc=$?
+    [ "$arc" != 2 ] || { n=$((n + 1)) bad=$((bad + 1)); echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
+    return "$arc"
+  }
+  # ran_before <ran.log> <cmd-a> <cmd-b>: prints yes (a ended before b started), no, or absent (either never
+  # ran, or there is no log); a mutant twin passes on `no` only.
+  ran_before() {
+    awk -v a="$2" -v b="$3" '
+      $0 ~ (" " a "[ ]*$") { ae = $2 }
+      $0 ~ (" " b "[ ]*$") { bs = $1 }
+      END { print (ae == "" || bs == "" ? "absent" : ae <= bs ? "yes" : "no") }' "$1" || echo absent
+  }
+  # (1) chain exclusion: two any-form members and both lanes free — the mutex keeps them one at a
+  # time, whichever lane takes each.
+  rc=$(steal_case ch-excl "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	B	a6000	5	$d" "gate-gpu-glm5next-e2e	B	a6000	5	$d" \
+    -- steal-fix 'plain-any@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=5' 'gate-gpu-glm5next-e2e@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-excl"
+  rc_ok 'chain: two any-form members end green' ch-excl 4
+  if no_overlap "$t/fake-state/ran.log" gen_x gen_ge; then pass 'chain: no two members overlap (the mutex)'
+  else fail 'chain: no two members overlap (the mutex)' "$(awk '$0 ~ /gen_x$|gen_ge$/' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
+  mutant_of ch-nomutex 's|^  mkdir "$CHAIN_MUTEX" 2> /dev/null \|\| return 1$|  true # MUTANT ch-nomutex|' '# MUTANT ch-nomutex$'
+  rc=$(MTAG=ch-nomutex steal_case ch-exclm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	B	a6000	5	$d" "gate-gpu-glm5next-e2e	B	a6000	5	$d" \
+    -- steal-fix 'plain-any@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=5' 'gate-gpu-glm5next-e2e@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-exclm"
+  if no_overlap "$t/fake-state/ran.log" gen_x gen_ge; then fail 'chain mutant: without the mutex the members overlap' "the intervals did not cross"
+  else pass 'chain mutant: without the mutex the members overlap'; fi
+  # (2) a lane-B chain run: the pick member (A6000) holds lane B first, so lane A opens its own slow
+  # item; when the pick ends lane B takes the any-form member at once, on the A6000 — its row, its
+  # key and its call name that card.
+  rc=$(steal_case ch-laneb "steal-slow	A	3090	15	$d" "plain-any	B	a6000	5	$d" "gate-gpu-ds41-residency-a	B	a6000	3	$d" "v41-any	A	3090	2	$d" \
+    -- 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=2' x-q)
+  printf '%s' "$rc" > "$t/rc-ch-laneb"
+  rc_ok 'chain: a lane-B chain run ends green' ch-laneb 5
+  want 'chain: the any-form member ran in lane B' "$t/target/c-ch-laneb/run.log" '^v41-any rc=0 [0-9]+s try=1 lane=B( |$)'
+  want 'chain: its times row names lane B and the A6000' "$t/times-ch-laneb.tsv" "$(printf '^v41-any@FAKE_SLEEP=2\tB\ta6000\t')"
+  want 'chain: the ledger records it under the A6000 key' "$t/rounds-ch-laneb.tsv" "$(printf '^stub-v41-any@FAKE_SLEEP=2,BLOOMERY_GATE_CARD=a6000\tv41-any\t')"
+  want_row 'chain: its box call carries the A6000 card' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_x$/'
+  mutant_of ch-pina 's|^  local lane=\$1 i card cards$|  local lane=$1 i card cards; [ "$lane" = B ] \&\& return 1 # MUTANT ch-pina|' '# MUTANT ch-pina$'
+  rm -rf "$t/fake-state" "$t/target/c-ch-lanebm"
+  BLOOMERY_GATE_TIMES=$t/times-ch-laneb.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-lanebm.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-lanebm.tsv \
+    bash "$t/tools/gate-batch-ch-pina.sh" --out "$t/target/c-ch-lanebm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=2' x-q > "$t/out-ch-lanebm.log" 2>&1 &
+  sp=$!
+  k=0
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  if kill -0 "$sp" 2> /dev/null; then hung=1; else hung=0; fi
+  kill -TERM "$sp" 2> /dev/null || true
+  wait "$sp" 2> /dev/null || true
+  for f in "$t"/target/c-ch-lanebm/lane-*.pid "$t"/target/c-ch-lanebm/lane-*.child; do
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  n=$((n + 1))
+  if [ "$hung" = 1 ] && ! grep -q '^v41-any rc=' "$t/target/c-ch-lanebm/run.log" 2> /dev/null; then
+    echo 'ok chain mutant: members pinned to lane A never reach lane B (the batch waits without end)'
+  else
+    bad=$((bad + 1)); echo "FAIL chain mutant: members pinned to lane A never reach lane B (the batch waits without end): $(grep '^v41-any ' "$t/target/c-ch-lanebm/run.log" 2>&1 | tr '\n' ' ')"
+  fi
+  # (3) the card rule: the pick member goes to lane B, the 3090-only one waits for lane A; no card
+  # of the batch reaches the pick member (box.sh picks).
+  rc=$(steal_case ch-cards "steal-slow	A	3090	15	$d" "plain-any	B	a6000	5	$d" "gate-gpu-ds41-residency-a	B	a6000	2	$d" "v41-a	A	3090	4	$d" \
+    -- 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=4' x-q)
+  printf '%s' "$rc" > "$t/rc-ch-cards"
+  rc_ok 'chain: a 3090-only and an A6000-pick member end green' ch-cards 5
+  want 'chain: the 3090-only member runs in lane A' "$t/target/c-ch-cards/run.log" '^v41-a rc=0 [0-9]+s try=1 lane=A( |$)'
+  want 'chain: the A6000-pick member runs in lane B' "$t/target/c-ch-cards/run.log" '^gate-gpu-ds41-residency-a rc=0 [0-9]+s try=1 lane=B( |$)'
+  want_no_row 'chain: no card of the batch reached the pick member' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD/ && $2 ~ /gen_ra/'
+  mutant_of ch-anywant 's|^  want=$(lane_card "$1")$|  want=3090 # MUTANT ch-anywant|' '# MUTANT ch-anywant$'
+  rm -rf "$t/fake-state" "$t/target/c-ch-cardsm"
+  BLOOMERY_GATE_TIMES=$t/times-ch-cards.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-cardsm.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-cardsm.tsv \
+    bash "$t/tools/gate-batch-ch-anywant.sh" --out "$t/target/c-ch-cardsm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=4' x-q > "$t/out-ch-cardsm.log" 2>&1 &
+  sp=$!
+  k=0
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 25 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  kill -TERM "$sp" 2> /dev/null || true
+  wait "$sp" 2> /dev/null || true
+  for f in "$t"/target/c-ch-cardsm/lane-*.pid "$t"/target/c-ch-cardsm/lane-*.child; do
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  want_not 'chain mutant: every card reading 3090 lets a lane take a member it may not' "$t/target/c-ch-cardsm/run.log" '^v41-a rc=0 [0-9]+s try=1 lane=A( |$)'
+  # (4) solo and both-cards members stay X, and a solo-real the pass list does not name stays X in
+  # the real tier and balanced in the fixture tier — the tier cases below hold all of that.
+  # (5) the chain's family order: lane X's first family (deepseek41, of x-v41) goes last, the
+  # other families in the reverse of X's family order — so v41-any and v41-a (deepseek2) run
+  # before glm5next's member although the list names it first, and deepseek41's member (gen_da)
+  # ends the chain.
+  rc=$(steal_case ch-order "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" "gate-gpu-glm5next-e2e	B	a6000	2	$d" "v41-a	A	3090	2	$d" "v41-d41-a	A	3090	2	$d" \
+    -- steal-fix 'plain-any@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=2' 'gate-gpu-glm5next-e2e@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=2' 'v41-d41-a@FAKE_SLEEP=2' x-v41)
+  printf '%s' "$rc" > "$t/rc-ch-order"
+  rc_ok 'chain: a two-family chain with lane X ends green' ch-order 7
+  if [ "$(ran_before "$t/fake-state/ran.log" gen_y gen_ge)" = yes ] && [ "$(ran_before "$t/fake-state/ran.log" gen_ge gen_da)" = yes ]; then
+    pass 'chain: the families group (X'"'"'s first family last, the record order inside one only)'
+  else
+    fail 'chain: the families group (X'"'"'s first family last, the record order inside one only)' "$(grep -E 'gen_y$|gen_ge$|gen_da$' "$t/fake-state/ran.log" | tr '\n' ' ')"
+  fi
+  mutant_of ch-recorder 's|key=lambda k: (fam_order.index(fams\[k\]), k))|key=lambda k: k)  # MUTANT ch-recorder|' '^cs = sorted\(ck, key=lambda k: k\)  # MUTANT ch-recorder$'
+  rc=$(MTAG=ch-recorder steal_case ch-orderm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" "gate-gpu-glm5next-e2e	B	a6000	2	$d" "v41-a	A	3090	2	$d" "v41-d41-a	A	3090	2	$d" \
+    -- steal-fix 'plain-any@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=2' 'gate-gpu-glm5next-e2e@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=2' 'v41-d41-a@FAKE_SLEEP=2' x-v41)
+  printf '%s' "$rc" > "$t/rc-ch-orderm"
+  if [ "$(ran_before "$t/fake-state/ran.log" gen_y gen_ge)" = no ]; then pass 'chain mutant: record order interleaves the families'
+  else fail 'chain mutant: record order interleaves the families' "gen_y still ran before gen_ge, or a member never ran: $(grep -E 'gen_y$|gen_ge$' "$t/fake-state/ran.log" 2>&1 | tr '\n' ' ')"; fi
+  # The family gate: the chain's first member is the pick (A6000, deepseek41), the second the
+  # 3090-only one of the same family; lane A, busy on its own item once the pick ends, must not
+  # open deepseek2's member (v41-any) while the 3090-only one is unclaimed — it waits for lane B.
+  rc=$(steal_case ch-famgate "steal-slow	A	3090	15	$d" "plain-any	B	a6000	5	$d" "gate-gpu-ds41-residency-a	B	a6000	2	$d" "v41-d41-a	A	3090	2	$d" "v41-any	A	3090	2	$d" \
+    -- 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=2' 'v41-d41-a@FAKE_SLEEP=2' 'v41-any@FAKE_SLEEP=2' x-q)
+  printf '%s' "$rc" > "$t/rc-ch-famgate"
+  rc_ok 'chain: a family held by one-card members ends green' ch-famgate 6
+  if [ "$(ran_before "$t/fake-state/ran.log" 'gen_ra --place a' gen_x)" = yes ]; then pass 'chain: a lane does not open the next family while the current one holds an unclaimed member'
+  else fail 'chain: a lane does not open the next family while the current one holds an unclaimed member' "gen_x started before gen_ra ended, or a member never ran: $(grep -E 'gen_ra|gen_x$' "$t/fake-state/ran.log" 2>&1 | tr '\n' ' ')"; fi
+  # The family gate's runtime half has no deterministic mutant at the fixture's 1 s granularity
+  # (the mutex race decides which lane meets the boundary); the order mutant ch-recorder above is
+  # the family rule's FAIL-first, and the good case above pins the runtime wait.
+  # (6) a pool item never overlaps a member; an untagged one runs beside one.
+  rc=$(steal_case ch-pool "steal-fix	A	3090	5	$d" "pool-any	B	a6000	3	$d" "plain-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+    -- steal-fix 'pool-any@FAKE_SLEEP=3' 'plain-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-pool"
+  rc_ok 'chain: a pool item and a plain one end green' ch-pool 4
+  if no_overlap "$t/fake-state/ran.log" gen_x gen_pl; then pass 'chain: a pool item never overlaps a member'
+  else fail 'chain: a pool item never overlaps a member' "the intervals crossed"; fi
+  if no_overlap "$t/fake-state/ran.log" gen_x other; then fail 'chain: an untagged item runs beside a member'
+  else pass 'chain: an untagged item runs beside a member' "plain-any never overlapped gen_x"; fi
+  mutant_of ch-nopool 's|^tagged_neighbour() { #.*$|tagged_neighbour() { return 1 # MUTANT ch-nopool|' '# MUTANT ch-nopool$'
+  rc=$(MTAG=ch-nopool steal_case ch-poolm "steal-fix	A	3090	5	$d" "pool-any	B	a6000	3	$d" "plain-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+    -- steal-fix 'pool-any@FAKE_SLEEP=3' 'plain-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-poolm"
+  if no_overlap "$t/fake-state/ran.log" gen_x gen_pl; then fail 'chain mutant: without the pool rule the item overlaps a member' "the intervals did not cross"
+  else pass 'chain mutant: without the pool rule the item overlaps a member'; fi
+  # (7) a big-host item never overlaps a member.
+  rc=$(steal_case ch-big "steal-fix	A	3090	5	$d" "big-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+    -- steal-fix 'big-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-big"
+  rc_ok 'chain: a big-host item ends green' ch-big 3
+  if no_overlap "$t/fake-state/ran.log" gen_x gen_bh; then pass 'chain: a big-host item never overlaps a member'
+  else fail 'chain: a big-host item never overlaps a member' "the intervals crossed"; fi
+  rc=$(MTAG=ch-nopool steal_case ch-bigm "steal-fix	A	3090	5	$d" "big-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+    -- steal-fix 'big-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-bigm"
+  if no_overlap "$t/fake-state/ran.log" gen_x gen_bh; then fail 'chain mutant: without the rule a big-host item overlaps a member' "the intervals did not cross"
+  else pass 'chain mutant: without the rule a big-host item overlaps a member'; fi
+  # (8) the gap: the pick member (A6000) runs first; the 3090-only member waits for lane A, inside
+  # its own 15 s item — and while it is unclaimed the big-host item must not start in the gap,
+  # though the mutex is free and lane B has nothing else.
+  rc=$(steal_case ch-gap "steal-slow	A	3090	15	$d" "plain-any	B	a6000	1	$d" "big-any	B	a6000	3	$d" "gate-gpu-ds41-residency-a	B	a6000	2	$d" "v41-a	A	3090	2	$d" \
+    -- 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'big-any@FAKE_SLEEP=3' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=2' x-q)
+  printf '%s' "$rc" > "$t/rc-ch-gap"
+  rc_ok 'chain: a gap between two members ends green' ch-gap 6
+  if [ "$(ran_before "$t/fake-state/ran.log" gen_y gen_bh)" = yes ]; then pass 'chain: a big-host item ready in the gap does not start there'
+  else fail 'chain: a big-host item ready in the gap does not start there' "gen_bh started before gen_y ended"; fi
+  mutant_of ch-noclaim 's|^    claimed "\$i" \|\| return 1$|    true # MUTANT ch-noclaim|' '# MUTANT ch-noclaim$'
+  rc=$(MTAG=ch-noclaim steal_case ch-gapm "steal-slow	A	3090	15	$d" "plain-any	B	a6000	1	$d" "big-any	B	a6000	3	$d" "gate-gpu-ds41-residency-a	B	a6000	2	$d" "v41-a	A	3090	2	$d" \
+    -- 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'big-any@FAKE_SLEEP=3' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=2' 'v41-a@FAKE_SLEEP=2' x-q)
+  printf '%s' "$rc" > "$t/rc-ch-gapm"
+  if [ "$(ran_before "$t/fake-state/ran.log" gen_y gen_bh)" = no ]; then pass 'chain mutant: without the unstarted half the item starts in the gap'
+  else fail 'chain mutant: without the unstarted half the item starts in the gap' "gen_bh still waited, or an item never ran: $(grep -E 'gen_y$|gen_bh$' "$t/fake-state/ran.log" 2>&1 | tr '\n' ' ')"; fi
+  # (9) a ledger skip: green on the 3090's key only, the member skips there and never runs on the
+  # A6000. The stub's FAKE_GREEN_FILE names the one key.
+  printf 'stub-v41-any@FAKE_SLEEP=2,BLOOMERY_GATE_CARD=a6000\n' > "$t/green-a6000.tsv"
+  rc=$(FAKE_GREEN_FILE=$t/green-a6000.tsv steal_case ch-skip "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" \
+    -- steal-fix plain-any 'v41-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-ch-skip"
+  rc_ok 'chain: a member green on one key ends green' ch-skip 3
+  want 'chain: it skips at 0 s, at its green key' "$t/target/c-ch-skip/run.log" '^v41-any rc=skip green-at=abc1234 2026-10-08T00:00:00\+0900 lane=C( |$)'
+  want_no_row 'chain: and nothing ran on the 3090' "$t/fake-state/box.log" '$2 ~ /gen_x$/'
+  mutant_of ch-noskip 's|green = \[j for j, s in enumerate(states) if s == "skip"\]|green = [] # MUTANT ch-noskip|' '# MUTANT ch-noskip$'
+  rc=$(FAKE_GREEN_FILE=$t/green-a6000.tsv MTAG=ch-noskip steal_case ch-skipm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" \
+    -- steal-fix plain-any 'v41-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-ch-skipm"
+  want_not 'chain mutant: without the skip placement the member runs although it is green' "$t/target/c-ch-skipm/run.log" '^v41-any rc=skip '
+  # (10) a lane killed while it holds the mutex: the batch ends by name inside a bound, never a
+  # wait without end. The deaf-watch mutant hangs instead and the case kills it.
+  rm -rf "$t/fake-state" "$t/target/c-ch-kill"
+  BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
+    "${gb[@]}" --out "$t/target/c-ch-kill" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_y' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  kill -TERM "$(cat "$t/target/c-ch-kill/lane-A.pid")"
+  k=0
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 30 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  if ! kill -0 "$sp" 2> /dev/null; then
+    wait "$sp" 2> /dev/null || true
+    if grep -q 'lane A ended without its sentinel' "$t/out-ch-kill.log"; then pass 'chain: a lane killed with the mutex ends the batch by name'
+    else fail 'chain: a lane killed with the mutex ends the batch by name' "$(tail -2 "$t/out-ch-kill.log")"; fi
+  else
+    kill -TERM "$sp" 2> /dev/null || true
+    wait "$sp" 2> /dev/null || true
+    fail 'chain: a lane killed with the mutex ends the batch by name' "the batch was still running after ${k} s"
+  fi
+  for f in "$t"/target/c-ch-kill/lane-*.pid "$t"/target/c-ch-kill/lane-*.child; do
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  mutant_of ch-deaf "s|^      \*) dead_now=\"\\\$dead_now \\\$lane\"; continue ;;\$|      *) continue ;; # MUTANT ch-deaf|" '# MUTANT ch-deaf$'
+  rm -rf "$t/fake-state" "$t/target/c-ch-killm"
+  BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
+    bash "$t/tools/gate-batch-ch-deaf.sh" --out "$t/target/c-ch-killm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-killm.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_y' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  kill -TERM "$(cat "$t/target/c-ch-killm/lane-A.pid")"
+  k=0
+  hung=0
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 15 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  if kill -0 "$sp" 2> /dev/null; then hung=1; fi
+  kill -TERM "$sp" 2> /dev/null || true
+  wait "$sp" 2> /dev/null || true
+  for f in "$t"/target/c-ch-killm/lane-*.pid "$t"/target/c-ch-killm/lane-*.child; do
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  if [ "$hung" = 1 ]; then pass 'chain mutant: a deaf watch leaves the batch waiting without end'
+  else fail 'chain mutant: a deaf watch leaves the batch waiting without end' "the mutant batch ended within ${k} s"; fi
+  # (10b) both lanes killed at once: each lane's sighting is its own, so the batch still ends by
+  # name inside the bound. A watch that kept one list of sightings for both lanes would see them
+  # alternate and never twice in a row, and wait without end.
+  rm -rf "$t/fake-state" "$t/target/c-ch-kill2"
+  BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill2.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill2.tsv \
+    "${gb[@]}" --out "$t/target/c-ch-kill2" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'v41-a@FAKE_SLEEP=20' 'big-any@FAKE_SLEEP=1' > "$t/out-ch-kill2.log" 2>&1 &
+  sp=$!
+  k=0
+  while ! grep -q 'gen_y' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 20 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  kill -TERM "$(cat "$t/target/c-ch-kill2/lane-A.pid")" "$(cat "$t/target/c-ch-kill2/lane-B.pid")"
+  k=0
+  while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 30 ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  if ! kill -0 "$sp" 2> /dev/null; then
+    wait "$sp" 2> /dev/null || true
+    if grep -Eq 'lane [AB] ended without its sentinel' "$t/out-ch-kill2.log"; then pass 'chain: both lanes killed at once end the batch by name'
+    else fail 'chain: both lanes killed at once end the batch by name' "$(tail -2 "$t/out-ch-kill2.log")"; fi
+  else
+    kill -TERM "$sp" 2> /dev/null || true
+    wait "$sp" 2> /dev/null || true
+    fail 'chain: both lanes killed at once end the batch by name' "the batch was still running after ${k} s"
+  fi
+  for f in "$t"/target/c-ch-kill2/lane-*.pid "$t"/target/c-ch-kill2/lane-*.child; do
+    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+  done
+  # (11) the predicted line carries chain= and its phase-1 term.
+  check 'chain: the predicted line carries chain= and the phase-1 derivation' 0 \
+    'predicted laneA=[0-9]+s laneB=[0-9]+s laneX=0s chain=100s wall=[0-9]+s.*phase 1 = max\(the chain' \
+    "${gb[@]}" --dry-run v41-a
+  mutant_of ch-nopred 's| chain=\${SUM_C}s||' 'laneX=\$\{SUM_X\}s wall='
+  out=$(bash "$t/tools/gate-batch-ch-nopred.sh" --dry-run v41-a 2>&1) || true
+  if grep -q 'chain=' <<< "$out"; then fail 'chain mutant: the predicted line without chain=' "chain= is still there"
+  else pass 'chain mutant: the predicted line without chain='; fi
+  # The take (the free lane's longest-est choice): the balanced item (60 s) goes before the short
+  # no-card one (5 s), on whichever lane is free beside the chain's member. The member outlasts the
+  # balanced item, so whichever lane the mutex race gives it, the short item can start only after the
+  # balanced one ended (the other lane takes the fixed 3090 item first, the longer of the two it may
+  # take); the times rows are keyed by the items as written.
+  rc=$(steal_case ch-lpt "steal-slow@FAKE_SLEEP=3	A	3090	15	$d" "steal-bal@FAKE_SLEEP=1	A	3090	60	$d" "host@FAKE_SLEEP=1	B	none	5	$d" \
+    "v41-any@FAKE_SLEEP=5	B	a6000	1	$d" -- 'steal-slow@FAKE_SLEEP=3' 'steal-bal@FAKE_SLEEP=1' 'host@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-lpt"
+  rc_ok 'chain: a longest-first take ends green' ch-lpt 4
+  if [ "$(ran_before "$t/fake-state/ran.log" gen_b 'bash tools/gate.sh -p x')" = yes ]; then pass 'chain: the free lane takes the longest-est item first'
+  else fail 'chain: the free lane takes the longest-est item first' "$(grep -E 'gen_b|gate.sh -p x' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
+  # The twin: the take reversed (the shortest-est item first) starts the short item at once, so the balanced
+  # one cannot have ended before it.
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  mutant_of ch-lptrev 's|^    if \[ "\$exp" -gt "\$be" \]; then best=\$j be=\$exp; fi$|    if [ "$be" -lt 0 ] \|\| [ "$exp" -lt "$be" ]; then best=$j be=$exp; fi # MUTANT ch-lptrev|' '# MUTANT ch-lptrev$'
+  rc=$(MTAG=ch-lptrev steal_case ch-lptm "steal-slow@FAKE_SLEEP=3	A	3090	15	$d" "steal-bal@FAKE_SLEEP=1	A	3090	60	$d" "host@FAKE_SLEEP=1	B	none	5	$d" \
+    "v41-any@FAKE_SLEEP=5	B	a6000	1	$d" -- 'steal-slow@FAKE_SLEEP=3' 'steal-bal@FAKE_SLEEP=1' 'host@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=5')
+  printf '%s' "$rc" > "$t/rc-ch-lptm"
+  if [ "$(ran_before "$t/fake-state/ran.log" gen_b 'bash tools/gate.sh -p x')" = no ]; then pass 'chain mutant: a reversed take starts the short item first'
+  else fail 'chain mutant: a reversed take still starts the longest-est item first, or an item never ran' "$(grep -E 'gen_b|gate.sh -p x' "$t/fake-state/ran.log" 2>&1 | tr '\n' ' ')"; fi
+  # The take's card and lease semantics are the steal cases' above and below.
+  # The pack (the header's «pack»). overlap is no_overlap's inverse: the two items' intervals cross (a command
+  # with no line is a FAIL line and status 2, as there).
+  overlap() {
+    local arc=0
+    awk -v a="$2" -v b="$3" '
+      $0 ~ (" " a "[ ]*$") { as = $1; ae = $2 }
+      $0 ~ (" " b "[ ]*$") { bs = $1; be = $2 }
+      END { if (as == "" || bs == "") exit 2; exit !(as < bs ? ae > bs : be > as) }' "$1" || arc=$?
+    [ "$arc" != 2 ] || { n=$((n + 1)) bad=$((bad + 1)); echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
+    return "$arc"
+  }
+  ivals() { # <ran.log> <cmd-a> <cmd-b>: the two items' ran.log lines (start, end, command), a red's detail
+    awk -v a="$2" -v b="$3" '$0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")' "$1" | tr '\n' ' '
+  }
+  # The times rows are keyed by the item as written (its @FAKE_SLEEP env included), so each case's
+  # expected seconds, and the longest-est launch order the case names, are the rows' own.
+  # (1) two one-card items whose bytes fit run side by side, one a card; the second take names the
+  # free card and its row, key and call follow it.
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-pair "pk-a@FAKE_SLEEP=5	A	3090	5	$d" "pk-b@FAKE_SLEEP=5	B	a6000	5	$d" \
+    -- pk-a@FAKE_SLEEP=5 pk-b@FAKE_SLEEP=5)
+  printf '%s' "$rc" > "$t/rc-pk-pair"
+  rc_ok 'pack: two one-card items that fit end green' pk-pair 2
+  if overlap "$t/fake-state/ran.log" gen_pa gen_pb; then pass 'pack: the two items ran side by side, one a card'
+  else fail 'pack: the two items ran side by side, one a card' "$(awk '$0 ~ /gen_p[ab]$/' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
+  want_row 'pack: the second take ran on the free card (the 3090)' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_p[ab]$/'
+  want_row 'pack: both rows name lane X and the card each took' "$t/times-pk-pair.tsv" '$2 == "X" && ($3 == "3090" || $3 == "a6000") { c++ } END { if (c == 2) print c }'
+  # (2) a pair over the budget never overlaps; without the check it does.
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-budget "pk-big@FAKE_SLEEP=3	A	3090	3	$d" "pk-big2@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-pk-budget"
+  rc_ok 'pack: a pair over the budget ends green (serially)' pk-budget 2
+  if no_overlap "$t/fake-state/ran.log" gen_pg gen_pg2; then pass 'pack: the pair over the budget never overlapped'
+  else fail 'pack: the pair over the budget never overlapped' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pg gen_pg2)"; fi
+  mutant_of pk-nobudget 's|^      sumb=\$((sumb + R_BYTES\[i\]))$|      sumb=0 # MUTANT pk-nobudget|' '# MUTANT pk-nobudget$'
+  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nobudget steal_case pk-budgetm "pk-big@FAKE_SLEEP=3	A	3090	3	$d" "pk-big2@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-pk-budgetm"
+  if overlap "$t/fake-state/ran.log" gen_pg gen_pg2; then pass 'pack mutant: without the budget the pair overlaps'
+  else fail 'pack mutant: without the budget the pair overlaps' "the intervals did not cross"; fi
+  # (3) an m item runs with nothing else beside it, first (it is the longest) or after a running item.
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-m1 "pk-m@FAKE_SLEEP=5	A	3090	5	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- pk-m@FAKE_SLEEP=5 pk-a@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-pk-m1"
+  rc_ok 'pack: an m item first ends green' pk-m1 2
+  if no_overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack: nothing ran beside the m item'
+  else fail 'pack: nothing ran beside the m item' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pm gen_pa)"; fi
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-m2 "pk-m@FAKE_SLEEP=3	B	a6000	3	$d" "pk-a@FAKE_SLEEP=5	A	3090	5	$d" \
+    -- pk-m@FAKE_SLEEP=3 pk-a@FAKE_SLEEP=5)
+  printf '%s' "$rc" > "$t/rc-pk-m2"
+  rc_ok 'pack: an m item behind a longer one ends green' pk-m2 2
+  if no_overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack: the m item waited for the host alone'
+  else fail 'pack: the m item waited for the host alone' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pm gen_pa)"; fi
+  mutant_of pk-nom 's|^          \[ "\$mrun" = 0 \] \|\| continue # and nothing starts beside one$|          true # MUTANT pk-nom|' '# MUTANT pk-nom$'
+  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nom steal_case pk-m1m "pk-m@FAKE_SLEEP=5	A	3090	5	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- pk-m@FAKE_SLEEP=5 pk-a@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-pk-m1m"
+  if overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack mutant: without the m rule an item runs beside it'
+  else fail 'pack mutant: without the m rule an item runs beside it' "the intervals did not cross"; fi
+  mutant_of pk-nomw 's|^          \[ "\$nrun" = 0 \] \|\| continue # an m item starts with nothing else running$|          true # MUTANT pk-nomw|' '# MUTANT pk-nomw$'
+  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nomw steal_case pk-m2m "pk-m@FAKE_SLEEP=3	B	a6000	3	$d" "pk-a@FAKE_SLEEP=5	A	3090	5	$d" \
+    -- pk-m@FAKE_SLEEP=3 pk-a@FAKE_SLEEP=5)
+  printf '%s' "$rc" > "$t/rc-pk-m2m"
+  if overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack mutant: without the wait the m item starts beside a running one'
+  else fail 'pack mutant: without the wait the m item starts beside a running one' "the intervals did not cross: $(ivals "$t/fake-state/ran.log" gen_pm gen_pa)"; fi
+  # (4) a both-cards item runs alone (both cards busy for the pack).
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-bothc "pk-both@FAKE_SLEEP=4	X	both	4	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- pk-both@FAKE_SLEEP=4 pk-a@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-pk-bothc"
+  rc_ok 'pack: a both-cards item ends green' pk-bothc 2
+  if no_overlap "$t/fake-state/ran.log" gen_pt gen_pa; then pass 'pack: a both-cards item ran alone'
+  else fail 'pack: a both-cards item ran alone' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pt gen_pa)"; fi
+  # (4b) a box-pick item (its recipe names the card: the plan's cards field is `-`, its label the card) takes no
+  # card from the pack: its call carries no BLOOMERY_GATE_CARD, so its key holds and its line ends recorded. The
+  # twin is the guard removed — the pack switches whatever card its label names, the old behaviour.
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-pick "sr-a6000@FAKE_SLEEP=2	B	a6000	2	$d" -- sr-a6000@FAKE_SLEEP=2)
+  printf '%s' "$rc" > "$t/rc-pk-pick"
+  rc_ok 'pack: a box-pick item ends green' pk-pick 1
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  want_row 'pack: the box-pick item ran' "$t/fake-state/box.log" '$2 ~ /gen_sa/'
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  want_no_row 'pack: the box-pick item took no card env from the pack' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=/ && $2 ~ /gen_sa/'
+  want 'pack: the box-pick item'"'"'s line ends ledger=recorded' "$t/target/c-pk-pick/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X ledger=recorded( |$)'
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  mutant_of pk-noguard 's|^      case " \$cards " in \*" \$card "\*) switch_candidate "\$i" "\$card" ;; esac$|      case $card in 3090 \| a6000) switch_candidate "$i" "$card" ;; esac # MUTANT pk-noguard|' '# MUTANT pk-noguard$'
+  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-noguard steal_case pk-pickm "sr-a6000@FAKE_SLEEP=2	B	a6000	2	$d" -- sr-a6000@FAKE_SLEEP=2)
+  printf '%s' "$rc" > "$t/rc-pk-pickm"
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  want_row 'pack mutant: without the guard the box-pick item takes a card env' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_sa/'
+  want 'pack mutant: … and its line ends ledger=changed' "$t/target/c-pk-pickm/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X ledger=changed( |$)'
+  # (5) the predicted line's laneX= is the pack's own wall (two fits beside each other, a pair over
+  # the budget serial); the dry run names each item's simulated take.
+  printf '%s\n' "pk-a	A	3090	5	$d" "pk-b	B	a6000	5	$d" > "$t/times-pkpred.tsv"
+  check 'pack: the predicted laneX= is the pack wall (a fitting pair)' 0 \
+    'predicted laneA=0s laneB=0s laneX=5s chain=0s wall=5s' env BLOOMERY_GATE_TIMES=$t/times-pkpred.tsv BLOOMERY_PACK_BUDGET=10000 "${gb[@]}" --dry-run pk-a pk-b
+  printf '%s\n' "pk-big	A	3090	3	$d" "pk-big2	B	a6000	3	$d" > "$t/times-pkpred2.tsv"
+  check 'pack: … and a pair over the budget serializes (laneX=6s)' 0 \
+    'predicted laneA=0s laneB=0s laneX=6s chain=0s wall=6s' env BLOOMERY_GATE_TIMES=$t/times-pkpred2.tsv BLOOMERY_PACK_BUDGET=10000 "${gb[@]}" --dry-run pk-big pk-big2
+  out=$(env BLOOMERY_GATE_TIMES=$t/times-pkpred.tsv BLOOMERY_PACK_BUDGET=10000 "${gb[@]}" --dry-run pk-a pk-b 2>&1) || fail 'pack: the dry run names the takes' "$out"
+  if [ "$(grep -c 'the pack takes it at [0-9]*s' <<< "$out")" = 2 ]; then pass 'pack: the dry run names each X item'"'"'s simulated take'
+  else fail 'pack: the dry run names each X item'"'"'s simulated take' "$(grep 'lane X' <<< "$out")"; fi
+  # (6) the fixture tier reads no bytes: a pair over any budget packs there.
+  rc=$(BLOOMERY_PACK_BUDGET=1 steal_case pk-fx "pk-big	A	3090	3	$d" "pk-big2	B	a6000	3	$d" \
+    -- --tier fixture pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-pk-fx"
+  rc_ok 'pack: a fixture pair over the budget ends green' pk-fx 2
+  if overlap "$t/fake-state/ran.log" gen_pg gen_pg2; then pass 'pack: the fixture tier sums no bytes (its loads are the small fixtures)'
+  else fail 'pack: the fixture tier sums no bytes (its loads are the small fixtures)' "the intervals did not cross"; fi
+  # (7) the table's own errors: a solo recipe with no row, a row for a recipe that is not solo.
+  cp "$t/justfile" "$t/justfile.pk"
+  printf '%s\n' '' "[group('solo')]" 'pk-norow:' "    ./tools/box.sh 'bash tools/gpu-gate.sh gen_pn'" >> "$t/justfile"
+  check 'pack: a solo recipe with no resource row is a named error' 65 \
+    'recipe pk-norow: no resource table row in tools/gate-batch-resources.tsv' "${gb[@]}" --classes
+  cp "$t/justfile.pk" "$t/justfile"
+  cp "$t/tools/gate-batch-resources.tsv" "$t/tools/gate-batch-resources.pk"
+  printf 'host\t-\t1000\n' >> "$t/tools/gate-batch-resources.tsv"
+  check 'pack: a row for a recipe that is not solo is a named error' 65 \
+    'recipe host: a resource table row for a recipe that is not \[group' "${gb[@]}" --classes
+  cp "$t/tools/gate-batch-resources.pk" "$t/tools/gate-batch-resources.tsv"
+  # (8) the pool mutex (batch-wide): two pool items the balance puts in two lanes never overlap.
+  rc=$(steal_case pool-lanes "pool-any	A	3090	4	$d" "pool-two	B	a6000	4	$d" \
+    -- pool-any@FAKE_SLEEP=4 pool-two@FAKE_SLEEP=4)
+  printf '%s' "$rc" > "$t/rc-pool-lanes"
+  rc_ok 'pool: two pool items in two lanes end green' pool-lanes 2
+  if no_overlap "$t/fake-state/ran.log" gen_pl gen_p2; then pass 'pool: two pool items never overlap (the mutex)'
+  else fail 'pool: two pool items never overlap (the mutex)' "the intervals crossed"; fi
+  mutant_of pk-nopool 's|^pool_take() { until mkdir "\$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|' '# MUTANT pk-nopool$'
+  rc=$(MTAG=pk-nopool steal_case pool-lanesm "pool-any	A	3090	4	$d" "pool-two	B	a6000	4	$d" \
+    -- pool-any@FAKE_SLEEP=4 pool-two@FAKE_SLEEP=4)
+  printf '%s' "$rc" > "$t/rc-pool-lanesm"
+  if overlap "$t/fake-state/ran.log" gen_pl gen_p2; then pass 'pool mutant: without the mutex the two pool items overlap'
+  else fail 'pool mutant: without the mutex the two pool items overlap' "the intervals did not cross"; fi
+  # (9) the budget scan follows the calls: a bound two scripts deep refuses the item; one hop deep
+  # (the mutant) it reads unchecked and the batch runs it.
+  printf '%s\n' 'bt-deep	A	3090	80	2026-09-27T10:00:00+0900' > "$t/times-bt.tsv"
+  check 'budget: a bound two scripts deep is read (the refusal names it)' 65 \
+    'gate-batch: budget: bt-deep=80s>past-0.75xBLOOMERY_GATE_BOUND=100s' \
+    env BLOOMERY_GATE_TIMES=$t/times-bt.tsv "${gb[@]}" bt-deep
+  mutant_of bt-nohind 's|^    follow_scripts = True$|    follow_scripts = False # MUTANT bt-nohind|' '# MUTANT bt-nohind$'
+  rc=0
+  out=$(env BLOOMERY_GATE_TIMES=$t/times-bt.tsv BLOOMERY_PACK_BUDGET=10000 bash "$t/tools/gate-batch-bt-nohind.sh" --dry-run bt-deep 2>&1) || rc=$?
+  if [ "$rc" = 0 ] && grep -q 'budget: 1 item(s) unchecked' <<< "$out"; then pass 'budget mutant: one hop deep, the bound is invisible (unchecked)'
+  else fail 'budget mutant: one hop deep, the bound is invisible (unchecked)' "rc=$rc $(grep budget <<< "$out")"; fi
+  # The budget refusal: an item past 0.75x its bound is a named 65 before anything runs; the flag
+  # passes it; the dry run names both lists (budget-two holds two bounded calls — unchecked).
+  cp "$t/justfile" "$t/justfile.good"
+  printf '%s\n' '' 'budget-long:' "    ./tools/box.sh 'BLOOMERY_GATE_BOUND=100 bash tools/gpu-gate.sh gen_bl'" \
+    'budget-two:' "    ./tools/box.sh 'bash tools/gpu-gate.sh gen_t1 && bash tools/gpu-gate.sh gen_t2'" >> "$t/justfile"
+  printf '%s\n' 'budget-long	A	3090	80	2026-09-27T10:00:00+0900' 'budget-two	A	3090	10	2026-09-27T10:00:00+0900' > "$t/times-budget.tsv"
+  check 'budget: an item past 0.75x its bound is a named 65' 65 \
+    'gate-batch: budget: budget-long=80s>past-0.75xBLOOMERY_GATE_BOUND=100s' \
+    env BLOOMERY_GATE_TIMES=$t/times-budget.tsv "${gb[@]}" budget-long budget-two
+  check 'budget: --over-budget-ok passes it' 0 '^DONE total=2 red=0' \
+    env BLOOMERY_GATE_TIMES=$t/times-budget.tsv "${gb[@]}" --over-budget-ok budget-long budget-two
+  printf '%s\n' 'budget-long	A	3090	80	2026-09-27T10:00:00+0900' 'budget-two	A	3090	10	2026-09-27T10:00:00+0900' > "$t/times-budget.tsv" # the run above appended its row
+  out=$(env BLOOMERY_GATE_TIMES=$t/times-budget.tsv "${gb[@]}" --dry-run budget-long budget-two 2>&1) || fail 'budget: the dry run names both lists' "$out"
+  if grep -q 'gate-batch: budget: 1 item(s) past 0.75x' <<< "$out" && grep -q 'unchecked (no single bounded call, or a bound the text does not spell): budget-two' <<< "$out"; then
+    pass 'budget: the dry run names the refused and the unchecked'
+  else fail 'budget: the dry run names the refused and the unchecked' "$(grep budget <<< "$out")"; fi
+  mutant_of ch-nobudget 's|if len(calls) == 1 and calls\[0\]\[1\] > 0 and exp \* 4 > calls\[0\]\[1\] \* 3:|if False: # MUTANT ch-nobudget|' '^    if False: # MUTANT ch-nobudget$'
+  printf '%s\n' 'budget-long	A	3090	80	2026-09-27T10:00:00+0900' 'budget-two	A	3090	10	2026-09-27T10:00:00+0900' > "$t/times-budget.tsv"
+  rc=0
+  out=$(env BLOOMERY_GATE_TIMES=$t/times-budget.tsv bash "$t/tools/gate-batch-ch-nobudget.sh" budget-long budget-two 2>&1) || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^budget-long rc=0 ' <<< "$out"; then pass 'budget mutant: without the check the over-budget item runs'
+  else fail 'budget mutant: without the check the over-budget item runs' "rc=$rc $(tail -1 <<< "$out")"; fi
+  cp "$t/justfile.good" "$t/justfile"
+  # The plan record (REC_FIELDS, rec_get): a writer that gains or loses a field, or a call site that names a
+  # field the list does not hold, ends the batch by name (70) at the first read — never a field read one place
+  # late. A copy of the script per fault; each twin has the check that meets its fault removed, and the
+  # case's own assertion must then fail (the count's fault is met later, by the balance, under another name;
+  # the name's fault is an unset variable read under set -u, an unbound-variable error that names no field).
+  rec_dies() { # <script> <ERE the output must hold>: the dry run of `host` ends 70 and its output names the fault
+    rc=0
+    out=$(bash "$1" --dry-run host 2>&1) || rc=$?
+    [ "$rc" = 70 ] && grep -Eq -- "$2" <<< "$out"
+  }
+  mutant_of rec-more 's|else "", held,$|else "", held, "extra",  # MUTANT rec-more|' '# MUTANT rec-more$'
+  if rec_dies "$t/tools/gate-batch-rec-more.sh" 'rec_get: plan record 0 has 17 fields, REC_FIELDS names 16'; then pass 'record: a writer that gains a field is a named 70 at the first read'
+  else fail 'record: a writer that gains a field is a named 70 at the first read' "rc=$rc"; fi
+  mutant_of rec-less 's|else "", held,$|else "",  # MUTANT rec-less|' '# MUTANT rec-less$'
+  if rec_dies "$t/tools/gate-batch-rec-less.sh" 'rec_get: plan record 0 has 15 fields, REC_FIELDS names 16'; then pass 'record: a writer that loses a field is a named 70 at the first read'
+  else fail 'record: a writer that loses a field is a named 70 at the first read' "rc=$rc"; fi
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  mutant_of rec-nocount 's|^  \[ \$((\${#_d} + 1)) = .*$|  true # MUTANT rec-nocount|;s|else "", held,$|else "", held, "extra",  # MUTANT rec-more|' '# MUTANT rec-nocount$'
+  want 'record mutant: the no-count copy carries the gaining writer' "$t/tools/gate-batch-rec-nocount.sh" '# MUTANT rec-more$'
+  if rec_dies "$t/tools/gate-batch-rec-nocount.sh" 'rec_get: plan record 0 has 17 fields, REC_FIELDS names 16'; then fail 'record mutant: without the count, rec_get still names the gained field' "$out"
+  else pass 'record mutant: without the count, rec_get does not name the gained field'; fi
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  mutant_of rec-name 's|^      rec_get "\$i" cls$|      rec_get "$i" clss # MUTANT rec-name|' '# MUTANT rec-name$'
+  if rec_dies "$t/tools/gate-batch-rec-name.sh" "rec_get: 'clss' is no field of the plan record"; then pass 'record: a field name the list does not hold is a named 70'
+  else fail 'record: a field name the list does not hold is a named 70' "rc=$rc"; fi
+  # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
+  mutant_of rec-noname 's|^      rec_get "\$i" cls$|      rec_get "$i" clss # MUTANT rec-name|;s|^    \[ "\$_k" -lt .*$|    true # MUTANT rec-noname|' '# MUTANT rec-noname$'
+  want 'record mutant: the no-name-check copy carries the misnamed call' "$t/tools/gate-batch-rec-noname.sh" '# MUTANT rec-name$'
+  if rec_dies "$t/tools/gate-batch-rec-noname.sh" "rec_get: 'clss' is no field of the plan record"; then fail 'record mutant: without the name check, rec_get still names the field' "$out"
+  else pass 'record mutant: without the name check the misnamed read names no field'; fi
   # The tier. solo-real is solo in the real tier and balanced in the fixture tier; `v41-load` pins lane A in the real tier only.
-  check 'tier: a solo-real recipe is alone in the real tier' 0 "^sr-any	X	solo	a6000	sr-any: \[group\('solo-real'\)\]" "${gb[@]}" --classes
+  check 'tier: a solo-real recipe is alone in the real tier (the pack takes either card)' 0 \
+    "^sr-any	X	solo	3090,a6000	sr-any: \[group\('solo-real'\)\]; pack: -, 1000 B" "${gb[@]}" --classes
   check 'tier: … and balanced over both cards in the fixture tier' 0 "^sr-any	F	balanced	3090,a6000	sr-any: \[group\('solo-real'\)\]" \
     "${gb[@]}" --tier fixture --classes
-  check 'tier: a solo-real v41-load recipe is alone in the real tier (solo wins)' 0 '^sr-v41	X	solo	a6000	' "${gb[@]}" --classes
+  check 'tier: a solo-real v41-load recipe is alone in the real tier (solo wins)' 0 '^sr-v41	X	solo	3090,a6000	' "${gb[@]}" --classes
   check 'tier: … and balanced in the fixture tier, the v41-load group pinning no lane' 0 '^sr-v41	F	balanced	3090,a6000	' "${gb[@]}" --tier fixture --classes
-  check 'tier: a plain v41-load recipe stays in lane A in the real tier' 0 '^v41-any	A	fixed	3090	' "${gb[@]}" --classes
+  check 'tier: a plain v41-load recipe is a chain member in the real tier' 0 '^v41-any	C	chain	3090,a6000	' "${gb[@]}" --classes
   check 'tier: … and is balanced in the fixture tier, which takes no load lock' 0 '^v41-any	F	balanced	3090,a6000	' "${gb[@]}" --tier fixture --classes
   check 'tier: a 3090-only v41-load recipe stays in lane A in the fixture tier' 0 '^v41-a	A	fixed	3090	' "${gb[@]}" --tier fixture --classes
   check 'tier: a solo recipe is alone in both tiers' 0 '^v41-solo	X	solo	3090	' "${gb[@]}" --tier fixture --classes
-  check 'tier: the real tier names nothing in the box env: lane X, no BLOOMERY_TIER' 0 \
-    "^lane X  sr-any +BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=a6000' just sr-any$" "${gb[@]}" --dry-run sr-any host
+  check 'tier: the real tier names nothing in the box env: lane X, no BLOOMERY_TIER, no card (the pack decides)' 0 \
+    "^lane X  sr-any +just sr-any$" "${gb[@]}" --dry-run sr-any host
   check 'tier: the fixture tier passes BLOOMERY_TIER=fixture to the item, which lane A or B runs' 0 \
     "^lane [AB]  sr-any +BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=(3090|a6000)' just sr-any$" "${gb[@]}" --tier fixture --dry-run sr-any host
   out=$("${gb[@]}" --dry-run sr-any host plain-any 2>&1) || fail 'tier: the real dry run failed' "$out"
@@ -954,7 +1616,7 @@ FP
     && grep -q '2 item(s) deferred to the real tier (2 real-only, 0 of a family with no fixture), in no lane (DONE: deferred=+2, and the list .*/deferred.list): ro-any ro-solo' <<< "$out" \
     && grep -q 'dry run — 1 items (and 2 deferred to the real tier: 2 real-only, 0 of a family with no fixture)' <<< "$out"; then pass 'real-only: the fixture dry run names both deferred items beside the one that runs'
   else fail 'real-only: the fixture dry run names both deferred items beside the one that runs' "$out"; fi
-  check 'real-only: a deferred item adds nothing to the lane sums (plain-any alone: its 45 s default, no fixture row)' 0 'predicted laneA=0s laneB=45s laneX=0s wall=45s' \
+  check 'real-only: a deferred item adds nothing to the lane sums (plain-any alone: its 45 s default, no fixture row)' 0 'predicted laneA=0s laneB=45s laneX=0s chain=0s wall=45s' \
     env "BLOOMERY_GATE_TIMES=$t/times.tsv" "${gb[@]}" --tier fixture --dry-run ro-any ro-solo plain-any
   check "real-only: an item's ARGS are still checked by just" 65 'takes no arguments' "${gb[@]}" --tier fixture --dry-run 'ro-any:--x'
   rc=$(steal_case ro-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any 'steal-bal@FAKE_DEFER=2' ro-solo)
@@ -1370,7 +2032,7 @@ if [ "${1:-}" = --self-test ]; then
   self_test
   exit $?
 fi
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0
+OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1388,6 +2050,7 @@ while [ $# -gt 0 ]; do
     --trust-rounds) TRUST=1; shift ;;
     --no-gpu-hold) NOHOLD=1; shift ;;
     --rerun) RERUN=1; shift ;;
+    --over-budget-ok) BUDGET_OK=1; shift ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
     --tier) [ $# -ge 2 ] || die "--tier needs real or fixture; $USAGE"
@@ -1411,6 +2074,12 @@ HOLD_ON=0 HOLD_UP=0 HOLD_OWNER='' HOLD_BEAT=${BLOOMERY_GPU_HOLD_BEAT:-60}
 case $HOLD_BEAT in
   '' | 0 | *[!0-9]*) die "BLOOMERY_GPU_HOLD_BEAT is whole seconds from 1 (the heartbeat's period, default 60; the box calls a hold stale after 300), got '$HOLD_BEAT'" ;;
 esac
+if [ -n "${BLOOMERY_PACK_BUDGET+x}" ]; then
+  case $BLOOMERY_PACK_BUDGET in
+    '' | 0 | *[!0-9]*) die "BLOOMERY_PACK_BUDGET is the pack's byte budget, a positive integer (the header's «pack»), got '$BLOOMERY_PACK_BUDGET'" ;;
+  esac
+  PACK_BUDGET=$BLOOMERY_PACK_BUDGET
+fi
 if [ "$LMODE" = lead ] && [ "$NOHOLD" = 0 ]; then
   HOLD_ON=1
   HOLD_OWNER=gb_$(printf '%s' "$(basename "$ROOT")" | tr -c 'A-Za-z0-9' _)_$$_$(date +%s)
@@ -1448,16 +2117,19 @@ fi
 # item, fields split by \x1f — class (A fixed, F balanced, X alone), log stem, recipe, the item's env
 # (space separated, no card), ARGS (shell-quoted for eval), the item as written, the reason, the kind
 # (fixed, balanced, solo, both-cards, one-lane), the expected seconds and their source, the times key,
-# the card candidates (`-` for no card forced; a balanced gpu-gate item has two, 3090 and a6000) and
-# the times file's card label of each. The second (PYBAL, once the ledger has keyed every candidate)
-# picks each item's lane and card.
+# the card candidates (`-` for no card forced; a balanced gpu-gate item has two, 3090 and a6000), the
+# times file's card label of each, the family (X and C items), the neighbour tags (pool, big-host) and
+# the pack's resource field (X items): `<flag> <bytes>`. REC_FIELDS (below the writer) names the sixteen
+# in order, and rec_get is the one reader of a record. The second pass (PYBAL, once the ledger has keyed
+# every candidate) picks each item's lane and card.
 # (The sources sit in variables: bash 3.2 misparses a heredoc inside $(…) that holds quotes.)
 IFS= read -r -d '' PYPLAN << 'PY' || true
 import fcntl, json, os, re, shlex, statistics, subprocess, sys
 from datetime import datetime
 
-root, lanes, src, listfile, caller_env, times_path, default_s, tier = sys.argv[1:9]
-raw_items = sys.argv[9:]
+root, lanes, src, listfile, caller_env, times_path, default_s, tier, chain_list = sys.argv[1:10]
+raw_items = sys.argv[10:]
+chain_solo_real = frozenset(chain_list.split())
 just = ["just", "--justfile", root + "/justfile", "--working-directory", root]
 
 
@@ -1745,8 +2417,10 @@ def classify(name):
 GROUPS = {
     "solo": "alone in lane X, after both lanes",
     "solo-real": "alone in lane X in the real tier, balanced over lanes A and B in the fixture tier",
-    "v41-load": "lane A, one after another (solo wins)",
+    "v41-load": "the chain (class C): one member at a time, batch-wide (solo wins)",
     "host": "balanced over lanes A and B, no card forced: device-crate tests that open no card",
+    "pool": "never beside a chain item: its host tier spins a worker pool on the cores a big load's pool is pinned to",
+    "big-host": "never beside a chain item: it locks or allocates more host memory than fits beside a chain item's host set",
 }
 unknown = [
     f"recipe {n}: [group({a['group']!r})] is not a group this runner knows ({', '.join(GROUPS)}) — "
@@ -1791,6 +2465,81 @@ def group_of(name, group):
 REAL_ONLY = "tools/ref/real-only.sh"
 REAL_ONLY_CALL = re.compile(r"\bbash " + re.escape(REAL_ONLY) + r"\s+(\S+)")
 BOX_OPEN = "tools/box.sh '"
+
+
+# The budget refusal (a suite whose slowest single item is past 0.75 × the bound that kills it is a
+# named refusal, not an overflow): the plan reads each recipe's bounded calls — a command segment
+# of its closure's text, or of a tree script that text names, holding tools/gate.sh,
+# tools/gpu-gate.sh or tools/host-gate.sh — with the segment's BLOOMERY_GATE_BOUND (a literal, or
+# the literal inside ${BLOOMERY_GATE_BOUND:-n}; unset is the runners' 900, gate-bound.sh). One
+# bounded call with a parsed bound: the item is checked against 0.75 × that bound. No call, several
+# calls, or a bound the text does not spell (an arithmetic): unchecked, named in the dry run.
+BOUND_SET = re.compile(r"BLOOMERY_GATE_BOUND=(?:([1-9][0-9]*)|\$\{BLOOMERY_GATE_BOUND:-([1-9][0-9]*)\})")
+_budget_texts = {}
+
+
+def budget_text(path):
+    if path not in _budget_texts:
+        try:
+            with open(os.path.join(root, path), encoding="utf-8", errors="replace") as fh:
+                _budget_texts[path] = fh.read()
+        except OSError:
+            _budget_texts[path] = ""
+    return _budget_texts[path]
+
+
+def bounded_calls(name):
+    """[(where, bound)] of the bounded runner calls in name's closure and the scripts it names,
+    followed transitively (script_refs, WALK_DEPTH hops — a bound two scripts deep is as killing as
+    one in the recipe's text): the segment's BLOOMERY_GATE_BOUND literal, the runners' 900 when the
+    call sets none, or -1 when it sets one the text does not spell (an arithmetic) — the item is
+    then unchecked."""
+    follow_scripts = True
+
+    def bound_of(seg):
+        m = BOUND_SET.search(seg)
+        if m:
+            return int(m.group(1) or m.group(2))
+        return -1 if "BLOOMERY_GATE_BOUND" in seg else 900
+
+    head = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+|\./)?")
+    box = re.compile(r"^[^']*?tools/box\.sh\s+'")
+
+    def calls_of(text, where):
+        for line in text.split("\n"):
+            for seg in SEGMENT.split(line.split("#", 1)[0]):
+                if MESSAGE.match(seg):
+                    continue
+                stripped = head.sub("", box.sub("", seg.strip()))
+                if stripped.startswith(("tools/gpu-gate.sh", "tools/gate.sh", "tools/host-gate.sh")):
+                    yield where, bound_of(seg)
+
+    out = []
+    for n in closure(name, set()):
+        text = body(n)
+        out += calls_of(text, n)
+        if not follow_scripts:
+            continue
+        seen, queue = {}, {}
+        for s in dict.fromkeys(os.path.normpath(q) for q in SCRIPT.findall(text)):
+            if os.path.isfile(os.path.join(root, s)) and s not in seen:
+                seen[s] = 1
+                queue[s] = 0
+        while queue:
+            s = next(iter(queue))
+            del queue[s]
+            if s in RUNNER_SELF or s.endswith("tools/box.sh"):
+                continue  # box.sh is the transport, not a runner of gates
+            stext = budget_text(s)
+            out += calls_of(stext, s)
+            for q in script_refs(s, stext):
+                if q in seen:
+                    continue
+                if seen[s] >= WALK_DEPTH:
+                    fail(f"{n}: the scripts it runs go deeper than WALK_DEPTH = {WALK_DEPTH} hops ({q} <- {s}) "
+                         "in the budget scan: raise WALK_DEPTH in tools/gate-batch.sh")
+                seen[q], queue[q] = seen[s] + 1, 0
+    return out
 
 
 def defer_tags(name):
@@ -1844,6 +2593,88 @@ if host_bad:
     fail(f"{len(host_bad)} host recipe(s) that open a card or run alone; nothing ran")
 
 
+# pool and big-host (the header): they hold a lane item off the chain's side, so they cannot sit on
+# a recipe whose class owns its placement — solo, solo-real (lane X) or v41-load (the chain itself,
+# whose members spin the very pools and hold the very host sets the rule guards).
+pb_bad = []
+for n in sorted(recipes):
+    held = [g for g in ("pool", "big-host") if {"group": g} in recipes[n]["attributes"]]
+    if not held:
+        continue
+    why = [f"[group('{g}')]" for g in ("solo", "solo-real", "v41-load") if group_of(n, g)]
+    if why:
+        pb_bad.append(f"recipe {n}: [group('{held[0]}')] with {' and '.join(why)} — the group holds a lane item off a chain item's side")
+if pb_bad:
+    for e in pb_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(pb_bad)} pool/big-host recipe(s) the class could not hold; nothing ran")
+
+
+# CHAIN_SOLO_REAL (the shell constant above): the solo-real recipes that join the chain. A name the
+# justfile holds must carry the groups the chain needs; a name it does not hold is ignored (the
+# self-test's fixture justfile holds its own recipes).
+csr_bad = []
+for n in chain_solo_real:
+    if n not in recipes:
+        continue
+    why = []
+    if {"group": "solo-real"} not in recipes[n]["attributes"]:
+        why.append("no [group('solo-real')] — the list names the recipes whose own reason let them join the chain")
+    if not group_of(n, "v41-load"):
+        why.append("no [group('v41-load')] — a chain member loads the whole model under the V4.1 lock")
+    if why:
+        csr_bad.append(f"recipe {n}: CHAIN_SOLO_REAL names it with {' and '.join(why)}")
+if csr_bad:
+    for e in csr_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(csr_bad)} CHAIN_SOLO_REAL recipe(s) the class could not hold; nothing ran")
+
+
+# The pack's resource table (the header's «pack»): one row per solo/solo-real recipe — its flags
+# (m: a clause measures the host) and its host bytes (the plan's HostNeed, derived). Read before
+# anything is placed: a solo recipe with no row is a named error (a recipe that runs in the pack
+# declares its bytes), and so is a row for a recipe that is not solo (stale rows must not linger).
+RES_TABLE = "tools/gate-batch-resources.tsv"
+
+
+def load_resources():
+    """{name: (flags, bytes)} of the resource table; a row that does not parse is a named error."""
+    path = os.path.join(root, RES_TABLE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        fail(f"{RES_TABLE} cannot be read ({e.strerror}) — the pack's rows are the solo recipes' bytes and flags")
+    got, bad = {}, []
+    for n, ln in enumerate(text.split("\n"), 1):
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        f = ln.split("\t")
+        if len(f) != 3 or not re.fullmatch(r"[A-Za-z0-9_-]+", f[0]) or f[1] not in ("m", "-") \
+                or not re.fullmatch(r"[0-9]+", f[2]):
+            bad.append(f"{RES_TABLE}:{n}: a row is '<recipe>\\t<m|->\\t<bytes>', not {ln!r}")
+            continue
+        got[f[0]] = (f[1], int(f[2]))
+    if bad:
+        for e in bad:
+            print("gate-batch: " + e, file=sys.stderr)
+        fail(f"{len(bad)} malformed resource row(s); nothing ran")
+    return got
+
+
+RESOURCES = load_resources()
+
+
+def chain_member(name, box):
+    """Whether the recipe joins the chain (class C): a v41-load recipe that is not solo and takes no
+    both-cards pick, or a solo-real recipe CHAIN_SOLO_REAL names. box is its box.sh pick, if any."""
+    if box == "both" or group_of(name, "solo"):
+        return False
+    if group_of(name, "solo-real"):
+        return name in chain_solo_real
+    return bool(group_of(name, "v41-load"))
+
+
 def solo_any(name):
     """Whether the recipe is solo or solo-real, whatever the tier: what its own arms are judged by."""
     return group_of(name, "solo") or group_of(name, "solo-real")
@@ -1890,6 +2721,26 @@ if sr_bad:
     for e in sr_bad:
         print("gate-batch: " + e, file=sys.stderr)
     fail(f"{len(sr_bad)} solo-real recipe(s) the fixture tier could not place; nothing ran")
+
+
+# The pack's table validation (the header's «pack»; after the solo-real placement checks above, so
+# a recipe several checks could name fails by its placement error first): every row's recipe is a
+# solo one, and every solo recipe holds a row — a recipe that runs in the pack declares its bytes.
+res_bad = [f"recipe {n}: a resource table row for a recipe that is not [group('solo')]/[group('solo-real')] — "
+           "the table serves the pack, whose items are the solo ones"
+           for n in sorted(RESOURCES)
+           if n in recipes
+           and {"group": "solo"} not in recipes[n]["attributes"]
+           and {"group": "solo-real"} not in recipes[n]["attributes"]]
+res_bad += [f"recipe {n}: no resource table row in {RES_TABLE} — a solo recipe runs in the pack and declares "
+            "its bytes (<recipe>\\t<m|->\\t<bytes>)"
+            for n in sorted(recipes)
+            if ({"group": "solo"} in recipes[n]["attributes"] or {"group": "solo-real"} in recipes[n]["attributes"])
+           and n not in RESOURCES]
+if res_bad:
+    for e in res_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(res_bad)} resource table row(s) the pack could not hold; nothing ran")
 
 
 # A solo recipe's arm run through another recipe: a non-solo item whose ARGS hand a solo recipe's
@@ -2090,11 +2941,25 @@ def placement(name, lane, lanes):
     if tier == "fixture" and box == "a6000" and group_of(name, "solo-real"):
         # One card by box.sh's pick: the fixture tier fixes it to the A6000's lane (class B; no lane steals it).
         return "B", "fixed", ["-"], [box]
+    if tier == "real" and lanes == "2" and chain_member(name, box):
+        # Class C (the header): the chain, one member at a time batch-wide. The card candidates are
+        # decided here; which lane runs the member, on which candidate, is the run's.
+        if box == "a6000":
+            return "C", "chain", ["-"], ["a6000"]  # box.sh picks the card; no card forced (the recipe's own key)
+        if not uses_gpu_gate:
+            return "C", "chain", ["-"], ["3090"]  # device code with no gate lock: the box env's 3090 pin
+        if GATE_FORMS[name] == {"any"}:
+            return "C", "chain", ["3090", "a6000"], ["3090", "a6000"]  # one ledger key per candidate
+        return "C", "chain", ["3090"], ["3090"]  # a call without the any form: gpu-gate.sh's default 3090
     if solo_of(name) or lane == "X":
         kind = "solo" if solo_of(name) else "both-cards"
         if box:
             return "X", kind, ["-"], [box]
         if uses_gpu_gate:
+            if "any" in GATE_FORMS[name]:
+                # The pack takes a free card (the header's «pack»): both cards are candidates, one
+                # ledger key each, the item's key and times row following the card it took.
+                return "X", kind, ["3090", "a6000"], ["3090", "a6000"]
             return "X", kind, ["3090" if lane == "A" else "a6000"], ["3090" if lane == "A" else "a6000"]
         return "X", kind, ["-"], ["3090" if lane == "A" else "none"]
     if group_of(name, "host"):
@@ -2122,13 +2987,21 @@ if src == "classes":
         if lane in ("T", "R"):
             print("\t".join([name, lane, "timed" if lane == "T" else "refused", "-", reason]))
         else:
-            cls, kind, cards, _ = placement(name, lane, "2")
-            tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host") for n in group_of(name, g)]
+            cls, kind, cards, labels = placement(name, lane, "2")
+            tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host", "pool", "big-host") for n in group_of(name, g)]
             tags += defer_tags(name)
+            if cls == "C":
+                cards = labels  # a chain member's candidates are its labels (a pick forces no card)
+            if cls == "X":
+                rflags, rbytes = RESOURCES.get(name, ("-", 0))
+                if tier == "fixture":
+                    rbytes = 0
+                tags.append(f"pack: {rflags}, {rbytes} B")
             print("\t".join([name, cls, kind, ",".join(cards), "; ".join(tags + [reason])]))
     sys.exit(0)
 
 counts, errors, out, fams = {}, [], [], []
+budget_over, budget_unchecked = [], []
 for item, at in zip(raw_items, where):
     m = ITEM.match(item)
     if not m:
@@ -2179,7 +3052,7 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} hands {b} {flag}, the arm of the solo recipe {solo_n} — it runs alone in "
                       f"lane X with what that recipe sets around it; list {solo_n} instead")
         continue
-    tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host") for n in group_of(name, g)]
+    tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host", "pool", "big-host") for n in group_of(name, g)]
     tags += defer_tags(name)
     if tags:
         reason = "; ".join(tags + [reason])
@@ -2192,11 +3065,28 @@ for item, at in zip(raw_items, where):
         continue
     exp, esrc = expected(tkey)
     cls, kind, cards, labels = placement(name, lane, lanes)
+    rflags, rbytes = RESOURCES.get(name, ("-", 0))
+    if tier == "fixture":
+        rbytes = 0  # the fixture tier's loads are the tree's small files: the pack sums nothing there
+    if cls == "X":
+        reason += f"; pack: {rflags}, {rbytes} B"
     counts[name] = counts.get(name, 0) + 1
     stem = name if counts[name] == 1 else f"{name}-{counts[name]}"
     shown = item if (env is not None or args is not None) else ""
-    out.append("\x1f".join([cls, stem, name, " ".join(envs), qargs, shown, reason, kind, str(exp), esrc, tkey, " ".join(cards), " ".join(labels)]))
-    fams.append(family(name) if cls == "X" else "")
+    calls = bounded_calls(name)
+    if len(calls) == 1 and calls[0][1] > 0 and exp * 4 > calls[0][1] * 3:
+        budget_over.append(f"{shown or name}={exp}s>past-0.75xBLOOMERY_GATE_BOUND={calls[0][1]}s")
+    elif len(calls) != 1 or calls[0][1] < 0:
+        budget_unchecked.append(shown or name)
+    # The neighbour tags (pool, big-host) the run-time rule reads, and the family of a chain member
+    # (class C: the chain's order is by family). The pack's resource field (X items only): the
+    # table's flags and host bytes, read by the shell side's driver and PYBAL's pack simulation.
+    held = " ".join(g for g in ("pool", "big-host") if group_of(name, g))
+    # The fields below are the shell side's REC_FIELDS, in this order.
+    out.append("\x1f".join([cls, stem, name, " ".join(envs), qargs, shown, reason, kind, str(exp), esrc, tkey, " ".join(cards), " ".join(labels),
+                            family(name) if cls in ("X", "C") else "", held,
+                            " ".join([rflags, str(rbytes)]) if cls == "X" else ""]))
+    fams.append(family(name) if cls in ("X", "C") else "")
 if errors:
     for e in errors:
         print("gate-batch: " + e, file=sys.stderr)
@@ -2209,10 +3099,53 @@ for f in fams:
     if f:
         rank.setdefault(f, len(rank))
 xs = sorted((k for k, rec in enumerate(out) if rec.startswith("X\x1f")), key=lambda k: (rank[fams[k]], k))
+# The chain's order (class C, D3): by family, the family lane X opens with LAST (X then starts on a
+# warm host set), the chain's other families in the reverse of X's family order, then families X
+# does not hold in first-appearance order; within a family, record order. Computed on the pre-sort
+# indices, like xs; the K record names each member's final index after the X records move to the tail.
+ck = [k for k, rec in enumerate(out) if rec.startswith("C\x1f")]
+chain_fams = list(dict.fromkeys(fams[k] for k in ck))
+x_fams = list(dict.fromkeys(fams[k] for k in xs))
+x_first = x_fams[0] if x_fams else FIRST_FAMILY
+fam_order = ([f for f in reversed(x_fams) if f != x_first and f in chain_fams]
+             + [f for f in chain_fams if f not in x_fams and f != x_first]
+             + ([x_first] if x_first in chain_fams else []))
+cs = sorted(ck, key=lambda k: (fam_order.index(fams[k]), k))
+final_of = {k: i for i, k in enumerate(k2 for k2 in range(len(out)) if not out[k2].startswith("X\x1f"))}
 out = [rec for rec in out if not rec.startswith("X\x1f")] + [out[k] for k in xs]
 print("\n".join(out))
+if cs:
+    print("\x1f".join(["K", " ".join(str(final_of[k]) for k in cs), " ".join(fams[k] for k in cs)]))
+if budget_over or budget_unchecked:
+    print("\x1f".join(["W", " ".join(budget_over), " ".join(budget_unchecked)]))  # W, not B: a class-B record starts with B
 PY
-PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" ${ITEMS[@]+"${ITEMS[@]}"}) \
+# The plan record's fields, in the order the writer above joins them (its `out.append`): the one list
+# the shell side reads a record by. A writer that gains or loses a field without this list is a named
+# error at the first read (rec_get counts), never a field read one place late.
+REC_FIELDS=(cls stem name env args item why kind exp esrc tkey cards labels fam held res)
+rec_get() { # $1 = plan index, then field names (REC_FIELDS): each name is set, as a variable of that
+  # name in the caller's scope, to that field of R_REC[$1]; an unknown name, an index with no record or a
+  # record whose field count is not the list's is a named error (70). Pure bash: the lanes call it often.
+  local _i=$1 _rec _d _k _n _f
+  local -a _vals
+  shift
+  case $_i in '' | *[!0-9]*) RC=70 die "rec_get: '$_i' is no plan index" ;; esac
+  [ "$_i" -lt "${#R_REC[@]}" ] || RC=70 die "rec_get: no plan record $_i (the plan has ${#R_REC[@]})"
+  _rec=${R_REC[$_i]}
+  _d=${_rec//[!$'\x1f']/}
+  [ $((${#_d} + 1)) = "${#REC_FIELDS[@]}" ] || RC=70 die "rec_get: plan record $_i has $((${#_d} + 1)) fields, REC_FIELDS names ${#REC_FIELDS[@]} (${REC_FIELDS[*]})"
+  IFS=$'\x1f' read -r -a _vals <<< "$_rec"
+  for _n in "$@"; do
+    _k=0
+    for _f in "${REC_FIELDS[@]}"; do
+      [ "$_f" = "$_n" ] && break
+      _k=$((_k + 1))
+    done
+    [ "$_k" -lt "${#REC_FIELDS[@]}" ] || RC=70 die "rec_get: '$_n' is no field of the plan record (${REC_FIELDS[*]})"
+    printf -v "$_n" '%s' "${_vals[$_k]-}"
+  done
+}
+PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" "$CHAIN_SOLO_REAL" ${ITEMS[@]+"${ITEMS[@]}"}) \
   || RC=$? die "the list did not validate (above)"
 if [ "$SRC" = classes ]; then
   printf '%s\n' "$PLAN0"
@@ -2234,14 +3167,34 @@ R_REC=() R_C0=() C_ITEM=() C_KEY=() C_LST=() C_LDET=()
 # no lane, no key, no claim, no times row. They are kept apart, named in the dry run and in run.log, listed in DIR/deferred.list and
 # counted in the DONE line (the header's deferred paragraph).
 DP_STEM=() DP_NAME=() DP_ENV=() DP_ARGS=() DP_ITEM=() DP_WHY=() DP_KIND=()
+# The chain's order (PYPLAN's `K` record): plan indices in the order the lanes take them (D3), each
+# with its model family. CHAIN_ACTIVE names the batches it exists in: the real tier, two lanes.
+CHAIN_ORDER=() CHAIN_FAMS=() CHAIN_ACTIVE=0 CHAIN_K=''
+[ "$TIER" = real ] && [ "$LANES" = 2 ] && CHAIN_ACTIVE=1
+BUDGET_OVER=() BUDGET_UNCHECKED=() # the plan's B record: items past 0.75x their bound, and unchecked ones
 while IFS= read -r rec; do
   case $rec in
     D$'\x1f'*)
       IFS=$'\x1f' read -r _ stem name env args item why kind _ <<< "$rec"
       DP_STEM+=("$stem"); DP_NAME+=("$name"); DP_ENV+=("$env"); DP_ARGS+=("$args"); DP_ITEM+=("$item"); DP_WHY+=("$why"); DP_KIND+=("$kind") ;;
+    K$'\x1f'*)
+      IFS=$'\x1f' read -r _ ord fams <<< "$rec"
+      read -r -a CHAIN_ORDER <<< "$ord"
+      read -r -a CHAIN_FAMS <<< "$fams"
+      CHAIN_K=$rec ;;
+    W$'\x1f'*)
+      IFS=$'\x1f' read -r _ bover bunc <<< "$rec"
+      read -r -a BUDGET_OVER <<< "$bover"
+      read -r -a BUDGET_UNCHECKED <<< "$bunc" ;;
     *) R_REC+=("$rec") ;;
   esac
 done <<< "$PLAN0"
+# The budget refusal (the header's B record): an item past 0.75 × the bound that kills it is a named
+# refusal before anything runs, unless --over-budget-ok passes it.
+if [ "${#BUDGET_OVER[@]}" -gt 0 ] && [ "$DRY" = 0 ] && [ "$BUDGET_OK" = 0 ]; then
+  for b in "${BUDGET_OVER[@]}"; do echo "gate-batch: budget: $b" >&2; done
+  RC=65 die "${#BUDGET_OVER[@]} item(s) past 0.75x the bound that kills them — a slower gate is a red gate in the making; pass --over-budget-ok to run them anyway"
+fi
 N=${#R_REC[@]}
 ND=${#DP_STEM[@]}
 NT=$((N + ND)) # every item of the batch: the ones that run and the ones deferred
@@ -2252,7 +3205,7 @@ done
 DEFER_NOTE=''
 [ "$ND" = 0 ] || DEFER_NOTE=" (and $ND deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture)"
 for ((i = 0; i < N; i++)); do
-  IFS=$'\x1f' read -r _ _ name env args _ _ _ _ _ _ cards _ <<< "${R_REC[$i]}"
+  rec_get "$i" name env args cards
   R_C0+=("${#C_ITEM[@]}")
   for c in $cards; do
     e=$env
@@ -2265,8 +3218,8 @@ NC=${#C_ITEM[@]}
 # The second pass: each record, then the ledger state of each of its candidates. It prints per item
 # the lane, stem, recipe, env with the card, ARGS, the item as written, the reason, the plan line
 # (kind, expected seconds, placement), the seconds it counts in its lane, the times key and card
-# label, and the candidate it took; then one `=` record: the lane sums, the wall, and the items
-# whose expectation is the default.
+# label, the candidate it took and the neighbour tags (pool, big-host); then one `=` record: the
+# lane sums, the chain's, the wall, and the items whose expectation is the default.
 IFS= read -r -d '' PYBAL << 'PY' || true
 import sys
 
@@ -2288,14 +3241,33 @@ def lane_cand(cards):
 
 
 recs = [ln.split("\x1f") for ln in sys.stdin.read().split("\n") if ln]
-sums, placed, flex = {"A": 0, "B": 0, "X": 0}, {}, []
+k_order = []
+if recs and recs[0][0] == "K":  # the chain's order (PYPLAN's K record), fed first by the shell
+    k_order = [int(x) for x in recs.pop(0)[1].split()]
+sums, placed, flex = {"A": 0, "B": 0, "X": 0, "C": 0}, {}, []
 for i, f in enumerate(recs):
-    if len(f) != 14:
-        fail(f"a plan record has {len(f)} fields, not 14: {f!r}")
-    cls, stem, exp, cards, labels, states = f[0], f[1], int(f[8]), f[11].split(), f[12].split(), f[13].split()
+    if len(f) != 17:
+        fail(f"a plan record has {len(f)} fields, not 17: {f!r}")
+    cls, stem, exp, cards, labels, states = f[0], f[1], int(f[8]), f[11].split(), f[12].split(), f[16].split()
     if not cards or not len(cards) == len(labels) == len(states):
         fail(f"{stem}: {len(cards)} card candidates, {len(labels)} labels, {len(states)} ledger states")
-    if cls in ("A", "B", "X") and len(cards) == 1:
+    if cls == "C" and lanes == "2":
+        # The chain (the header): not a lane's work — its seconds are the chain's own sum. A member
+        # green on one candidate's key skips there at 0 s (green on both, it takes the 3090's); a
+        # member with both candidates live runs on whichever lane's card takes it, so no candidate
+        # is fixed here.
+        green = [j for j, s in enumerate(states) if s == "skip"]
+        if green:
+            c = green[0] if len(green) == 1 else 0
+            placed[i] = ("C", c, 0, f"skips at its {labels[c]} key, counted 0 s")
+        else:
+            placed[i] = ("C", 0, exp, "")
+        sums["C"] += placed[i][2]
+    elif cls == "X":
+        # The pack's item (the header's «pack»): no lane places it — its seconds are the pack
+        # simulation's below. A skip on any candidate costs 0 (the pack skips at the green key).
+        placed[i] = ("X", 0, 0 if any(s == "skip" for s in states) else exp, "")
+    elif cls in ("A", "B") and len(cards) == 1:
         placed[i] = (cls, 0, 0 if states[0] == "skip" else exp, "")
         sums[cls] += placed[i][2]
     elif cls == "F" and lanes == "2" and lane_cand(cards):
@@ -2305,7 +3277,7 @@ for i, f in enumerate(recs):
 # The ledger first: an item green on one lane's card only skips there, so it goes there at 0 s.
 rest, seq = [], []
 for i in flex:
-    lc, states = lane_cand(recs[i][11].split()), recs[i][13].split()
+    lc, states = lane_cand(recs[i][11].split()), recs[i][16].split()
     green = [ln for ln in ("A", "B") if states[lc[ln]] == "skip"]
     if len(green) == 1:
         placed[i] = (green[0], lc[green[0]], 0, f"to {green[0]}, the one lane whose card has it green")
@@ -2323,22 +3295,146 @@ for i in sorted(rest, key=lambda i: (-int(recs[i][8]), i)):
     sums[ln] += exp
     seq.append(i)
 defaults = []
+# The take order a chain batch's lanes would run, for the dry run (the run decides: the free lane
+# takes the chain's next member its card may run — the K order, the mutex's race approximated —
+# else the longest-est item its card may run; the neighbour rule holds while a member is unclaimed,
+# and skips cost 0 s). Each simulated take names the lane and its start, "A@123".
+sim = {}
+if k_order:
+    def fits(i, lane):
+        labels = recs[i][12].split()
+        return labels == ["none"] or (lane == "A" and "3090" in labels) or (lane == "B" and "a6000" in labels)
+
+    clock = {"A": 0, "B": 0}
+    chain = [i for i in k_order if placed[i][2] > 0]
+    rest = sorted((i for i, f in enumerate(recs) if f[0] in ("A", "B", "F") and placed[i][2] > 0),
+                  key=lambda i: (-placed[i][2], i))
+    left = len(chain) + len(rest)
+    while left:
+        lane = "A" if clock["A"] <= clock["B"] else "B"
+        pick = next((i for i in chain if i not in sim), None)
+        if pick is not None and not fits(pick, lane):
+            pick = None  # only the other lane's card runs it; this lane works beside the chain
+        if pick is None:
+            tagged_hold = bool([i for i in chain if i not in sim])
+            pick = next((i for i in rest if i not in sim and fits(i, lane)
+                         and not (tagged_hold and recs[i][14])), None)
+        if pick is None:
+            clock[lane] = 1 << 60  # this lane has nothing it may run
+            if clock["A" if lane == "B" else "B"] >= (1 << 60) and left:
+                break  # both lanes done; the remainder is not simulatable (should not happen)
+            continue
+        sim[pick] = f"{lane}@{clock[lane]}"
+        clock[lane] += placed[pick][2]
+        left -= 1
+# The pack's simulation (the header's «pack»): the X items placed onto the two cards by the driver's
+# own rule — the longest-est eligible item first (a one-card item takes a free card, the A6000 first
+# of the two), the running items' bytes within the budget (a lone item always starts), an m-flagged
+# item alone. Its wall is the predicted line's laneX=; each item's simulated take joins the chain's.
+budget = int(sys.argv[2])
+pack_wall = 0
+free, busy = {"3090", "a6000"}, []
+left = [i for i, f in enumerate(recs) if f[0] == "X" and placed[i][2] > 0]
+while left or busy:
+    launched = True
+    while launched:
+        launched = False
+        sumb = sum(b[2] for b in busy)
+        mrun = any(b[3] for b in busy)
+        for i in sorted(left, key=lambda i: (-placed[i][2], i)):
+            rflags, rbytes = recs[i][15].split()
+            mflag = rflags == "m"
+            if busy and (mflag or mrun or sumb + int(rbytes) > budget):
+                continue  # alone when m; nothing beside an m item; pairs within the budget
+            lab = recs[i][12].split()
+            if lab == ["none"]:
+                cards = set()
+            elif lab == ["both"]:
+                if free != {"3090", "a6000"}:
+                    continue
+                cards = {"3090", "a6000"}
+            elif lab == ["a6000"]:
+                if "a6000" not in free:
+                    continue
+                cards = {"a6000"}
+            elif lab == ["3090"]:
+                if "3090" not in free:
+                    continue
+                cards = {"3090"}
+            else:
+                if not free & {"3090", "a6000"}:
+                    continue
+                cards = {"a6000"} if "a6000" in free else {"3090"}
+            sim[i] = f"X@{pack_wall}"
+            busy.append((pack_wall + placed[i][2], cards, int(rbytes), mflag))
+            free -= cards
+            left.remove(i)
+            launched = True
+            break
+    if not busy:
+        break
+    pack_wall = min(b[0] for b in busy)
+    for b in [b for b in busy if b[0] == pack_wall]:
+        busy.remove(b)
+        free |= b[1]
 for i, f in enumerate(recs):
-    cls, stem, name, env, args, shown, why, kind, exp, esrc, tkey, cards, labels, states = f
+    cls, stem, name, env, args, shown, why, kind, exp, esrc, tkey, cards, labels, fam, tag, res, states = f
     ln, c, cost, how = placed[i]
     card, label, state = cards.split()[c], labels.split()[c], states.split()[c]
-    if card != "-":
+    # A chain member or a pack item with both candidates live pins no card here: the lane that takes
+    # the member, or the pack the item, rewrites its placement (switch_candidate) at run time.
+    if card != "-" and not (ln in ("C", "X") and len(cards.split()) > 1 and state != "skip"):
         env = (env + " " if env else "") + "BLOOMERY_GATE_CARD=" + card
-    if state == "skip":
+    if state == "skip" and ln not in ("C", "X"):
         told = "skips (the ledger has it green), counted 0 s"
+    elif ln == "C":
+        told = how or f"expected {exp} s ({esrc}), family {fam}"
+        told += "; the lane and card are decided at run time (one at a time, batch-wide)"
+        if not how and esrc == "default":
+            defaults.append(stem)
+    elif ln == "X":
+        if state == "skip" or any(s == "skip" for s in states.split()):
+            told = "skips at its green candidate, counted 0 s"
+        else:
+            told = f"expected {exp} s ({esrc}), {res.split()[0]} flag, {res.split()[1]} B"
+            told += "; the pack decides the card" if len(cards.split()) > 1 else "; the pack"
+            if esrc == "default":
+                defaults.append(stem)
     else:
         told = f"expected {exp} s ({esrc})"
         if esrc == "default":
             defaults.append(stem)
-    plan = f"{kind}, {told}" + (f", {how}" if how else "")
-    print("\x1f".join([ln, stem, name, env, args, shown, why, plan, str(cost), tkey, label, str(c)]))
-wall = max(sums["A"], sums["B"]) + sums["X"]
-print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(sums["X"]), str(wall), str(len(defaults)), " ".join(defaults)]))
+    plan = f"{kind}, {told}"
+    print("\x1f".join([ln, stem, name, env, args, shown, why, plan, str(cost), tkey, label, str(c), tag, sim.get(i, "")]))
+# The wall. Without a chain it is today's: the longer lane, then the pack. With one, phase 1 is the
+# largest of the chain's own sum (one member at a time batch-wide), the whole work over two cards (a
+# member lands on either), each card's own-only sum, and the chain plus the tail of the pool and
+# big-host items — they wait for the chain's end (the run-time rule) and then pack onto the two
+# cards; then the pack.
+pinned = {"3090": 0, "a6000": 0}
+pool = {"3090": 0, "a6000": 0, "bal": 0}
+work = sums["C"]
+for i, f in enumerate(recs):
+    if f[0] in ("C", "X"):
+        continue  # the chain has its own term; the pack runs after phase 1
+    cost, cards, labels, tag = placed[i][2], f[11].split(), f[12].split(), f[14]
+    work += cost
+    if cards == ["3090"] or (cards == ["-"] and labels == ["3090"]):
+        pinned["3090"] += cost
+    elif cards == ["a6000"] or (cards == ["-"] and labels == ["a6000"]):
+        pinned["a6000"] += cost
+    if tag and cost:
+        if labels == ["3090"]:
+            pool["3090"] += cost
+        elif labels == ["a6000"]:
+            pool["a6000"] += cost
+        else:
+            pool["bal"] += cost
+tail = max(pool["3090"], pool["a6000"], -(-pool["bal"] // 2),
+           -(-(pool["3090"] + pool["a6000"] + pool["bal"]) // 2))
+phase1 = max(sums["C"], -(-work // 2), pinned["3090"], pinned["a6000"], sums["C"] + tail)
+wall = max(phase1, sums["A"], sums["B"]) + pack_wall
+print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(pack_wall), str(sums["C"]), str(wall), str(len(defaults)), " ".join(defaults)]))
 # The run order: lanes A and X in record order, lane B's fixed items (class B: a solo-real recipe that picks the A6000 in the
 # fixture tier) first in record order, then its balanced items in the order the balance placed them — its skips, then
 # longest first. Every lane-A item opens with a release build, and cargo holds one build lock per target
@@ -2346,15 +3442,18 @@ print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(sums["X"]), str(wall
 # for ~100 s) makes lane A's first build wait for it. When the longest balanced item runs on the Mac
 # (check-recipes, ~130 s, in a narrowed landing list), longest first starts the long builds behind it,
 # while lane A runs its first binaries; when it is a box build, lane B opens with that build as before.
+# The chain's items are in no lane's order: the lanes take them at run time, one at a time.
 order = ([i for i in range(len(recs)) if placed[i][0] == "A"] + [i for i in range(len(recs)) if recs[i][0] == "B"]
          + [i for i in seq if placed[i][0] == "B"] + [i for i in range(len(recs)) if placed[i][0] == "X"])
-if sorted(order) != list(range(len(recs))):
-    fail(f"the run order is not a permutation of the {len(recs)} items: {order}")
+nchain = sum(1 for f in recs if f[0] == "C")
+if sorted(order) != sorted(i for i, f in enumerate(recs) if f[0] != "C"):
+    fail(f"the run order is not a permutation of the {len(recs)} items ({nchain} of them the chain's): {order}")
 print("\x1f".join(["O", " ".join(map(str, order))]))
 PY
 
 balance() { # PYBAL over the records and their candidates' ledger states: the P_* arrays and SUM_*
-  local i j k st feed='' lane stem name env args item why plan tkey tcard cand plan_out
+  local i j k st feed='' lane stem name env args item why plan tkey tcard cand tag sim plan_out
+  [ -z "$CHAIN_K" ] || feed="$CHAIN_K"$'\n'
   for ((i = 0; i < N; i++)); do
     j=${R_C0[$i]}
     if [ $((i + 1)) -lt "$N" ]; then k=${R_C0[$((i + 1))]}; else k=$NC; fi
@@ -2362,11 +3461,11 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
     for ((; j < k; j++)); do st="${st:+$st }${C_LST[$j]}"; done
     feed="$feed${R_REC[$i]}"$'\x1f'"$st"$'\n'
   done
-  plan_out=$(printf '%s' "$feed" | python3 -c "$PYBAL" "$LANES") || RC=70 die "the lane balance failed (above)"
+  plan_out=$(printf '%s' "$feed" | python3 -c "$PYBAL" "$LANES" "$PACK_BUDGET") || RC=70 die "the lane balance failed (above)"
   i=0 SUM_W=''
-  while IFS=$'\x1f' read -r lane stem name env args item why plan _ tkey tcard cand; do
+  while IFS=$'\x1f' read -r lane stem name env args item why plan _ tkey tcard cand tag sim; do
     if [ "$lane" = "=" ]; then
-      SUM_A=$stem SUM_B=$name SUM_X=$env SUM_W=$args SUM_NDEF=$item SUM_DEF=$why
+      SUM_A=$stem SUM_B=$name SUM_X=$env SUM_C=$args SUM_W=$item SUM_NDEF=$why SUM_DEF=$plan
       continue
     fi
     if [ "$lane" = O ]; then
@@ -2376,15 +3475,18 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
     P_LANE+=("$lane"); P_STEM+=("$stem"); P_NAME+=("$name"); P_ENV+=("$env"); P_ARGS+=("$args")
     P_ITEM+=("$item"); P_WHY+=("$why"); P_PLAN+=("$plan"); P_TKEY+=("$tkey"); P_TCARD+=("$tcard")
     j=$((${R_C0[$i]} + cand))
-    P_CI+=("$j"); P_KEY+=("${C_KEY[$j]}"); P_LST+=("${C_LST[$j]}"); P_LDET+=("${C_LDET[$j]}")
+    P_CI+=("$j"); P_KEY+=("${C_KEY[$j]}"); P_LST+=("${C_LST[$j]}"); P_LDET+=("${C_LDET[$j]}"); P_TAG+=("$tag"); P_SIM+=("$sim")
     i=$((i + 1))
   done <<< "$plan_out"
-  [ "$i" = "$N" ] && [ -n "$SUM_W" ] && [ "${#ORDER[@]}" = "$N" ] || RC=70 die "the lane balance returned $i of $N items and an order of ${#ORDER[@]}"
+  [ "$i" = "$N" ] && [ -n "$SUM_W" ] && [ "${#ORDER[@]}" = "$((N - ${#CHAIN_ORDER[@]}))" ] || RC=70 die "the lane balance returned $i of $N items and an order of ${#ORDER[@]}"
 }
 ORDER=() # the run order (PYBAL's `O` record): plan indices, each lane's items in the order they run
 P_LANE=() P_STEM=() P_NAME=() P_ENV=() P_ARGS=() P_ITEM=() P_WHY=() P_PLAN=() P_TKEY=() P_TCARD=()
-P_CI=() P_KEY=() P_LST=() P_LDET=() # the candidate taken, its ledger key, status and detail
-SUM_A=0 SUM_B=0 SUM_X=0 SUM_W=0 SUM_NDEF=0 SUM_DEF=''
+P_CI=() P_KEY=() P_LST=() P_LDET=() P_TAG=() P_SIM=() # the candidate taken, its key, status, detail, tags, simulated take
+# P_FAM: a chain member's model family (aligned with CHAIN_ORDER), for the run-time order.
+P_FAM=()
+for ((i = 0; i < ${#CHAIN_ORDER[@]}; i++)); do P_FAM[${CHAIN_ORDER[$i]}]=${CHAIN_FAMS[$i]}; done
+SUM_A=0 SUM_B=0 SUM_X=0 SUM_C=0 SUM_W=0 SUM_NDEF=0 SUM_DEF=''
 
 box_env_of() { # the item's full BLOOMERY_BOX_ENV: the caller's, then the item's and the lane's
   local e="${BLOOMERY_BOX_ENV:-}"
@@ -2527,12 +3629,18 @@ fi
 if [ "$LANES" = 1 ]; then
   PREDICTED="laneA=${SUM_A}s wall=${SUM_W}s"
 else
-  PREDICTED="laneA=${SUM_A}s laneB=${SUM_B}s laneX=${SUM_X}s wall=${SUM_W}s"
+  PREDICTED="laneA=${SUM_A}s laneB=${SUM_B}s laneX=${SUM_X}s chain=${SUM_C}s wall=${SUM_W}s"
 fi
 predicted() { # the plan's lane sums, derived from the times file
   local how="the median of each item's last 5 rows in $TIMES_FILE"
   [ "$LEDGER" = 0 ] || how="$how, a skipped item 0 s"
-  [ "$LANES" = 1 ] || how="$how; wall = the longer of A and B, then X"
+  if [ "$LANES" = 1 ]; then
+    how="$how; wall = the lane, then nothing"
+  elif [ "$CHAIN_ACTIVE" = 1 ] && [ "${#CHAIN_ORDER[@]}" -gt 0 ]; then
+    how="$how; phase 1 = max(the chain, ⌈the lanes' work with the chain over two cards⌉, the 3090-only sum, the A6000-only sum, the chain plus the pool/big-host tail), then the pack (laneX=: the cards, the ${PACK_BUDGET} B host budget, m items alone)"
+  else
+    how="$how; wall = the longer of A and B, then the pack (laneX=: the cards, the ${PACK_BUDGET} B host budget, m items alone)"
+  fi
   echo "gate-batch: predicted $PREDICTED (derived: $how)"
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
   [ "$ND" = 0 ] || echo "gate-batch: $ND item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
@@ -2617,15 +3725,31 @@ stop() {
 
 if [ "$DRY" = 1 ]; then
   echo "gate-batch: dry run — $N items$DEFER_NOTE, lanes $LANES, logs would go to $OUT"
-  for i in "${ORDER[@]}"; do
-    printf 'lane %s  %-28s %s\n        %s — %s\n' "${P_LANE[$i]}" "${P_STEM[$i]}" "$(cmd_of "$i")" "${P_PLAN[$i]}" "${P_WHY[$i]}"
+  [ "${#BUDGET_OVER[@]}" = 0 ] || echo "gate-batch: budget: ${#BUDGET_OVER[@]} item(s) past 0.75x the bound that kills them (a real run refuses them, 65, unless --over-budget-ok): ${BUDGET_OVER[*]}"
+  [ "${#BUDGET_UNCHECKED[@]}" = 0 ] || echo "gate-batch: budget: ${#BUDGET_UNCHECKED[@]} item(s) unchecked (no single bounded call, or a bound the text does not spell): ${BUDGET_UNCHECKED[*]}"
+  if [ "${#CHAIN_ORDER[@]}" -gt 0 ]; then
+    echo "gate-batch: the lanes' items below are simulated from the expected seconds (the chain first, then longest-est); each lane is chosen at run time"
+  fi
+  for i in ${ORDER[@]+"${ORDER[@]}"}; do
+    where=${P_LANE[$i]}
+    plan=${P_PLAN[$i]}
+    case ${P_SIM[$i]:-} in
+      '') ;;
+      X@*) plan="$plan; the pack takes it at ${P_SIM[$i]#X@}s" ;; # the lane label stays X: the listing is the record order
+      *) where="${P_SIM[$i]}s (simulated)" ;;
+    esac
+    printf 'lane %s  %-28s %s\n        %s — %s\n' "$where" "${P_STEM[$i]}" "$(cmd_of "$i")" "$plan" "${P_WHY[$i]}"
     [ "$LEDGER" = 0 ] || printf '        ledger: %s — %s\n' "${P_LST[$i]}" "${P_LDET[$i]}"
     if [ "$LANES" = 2 ]; then
-      IFS=$'\x1f' read -r cls _ _ _ _ _ _ _ _ _ _ _ _ <<< "${R_REC[$i]}"
+      rec_get "$i" cls
       if [ "$cls" = F ] && [ "${P_LST[$i]}" != skip ]; then
-        printf '        movable — an idle lane may take it on its card (never a fixed, solo or v41-load item)\n'
+        printf '        movable — a free lane takes it on its card, longest-est first (never a fixed, solo or v41-load item)\n'
       fi
     fi
+  done
+  for i in ${CHAIN_ORDER[@]+"${CHAIN_ORDER[@]}"}; do
+    printf 'lane C  %-28s %s\n        %s — %s\n' "${P_STEM[$i]}" "$(cmd_of "$i")" "${P_PLAN[$i]}" "${P_WHY[$i]}"
+    [ "$LEDGER" = 0 ] || printf '        ledger: %s — %s\n' "${P_LST[$i]}" "${P_LDET[$i]}"
   done
   for ((i = 0; i < ND; i++)); do
     printf 'lane -  %-28s %s\n        deferred to the real tier (%s), never run in the fixture tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
@@ -2710,7 +3834,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     rc=0
     t1=$(date +%s)
     BLOOMERY_BOX_ENV="$benv" "${JUST[@]}" "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null &
-    echo $! > "$OUT/lane-$lane.child"
+    [ "$lane" = X ] || echo $! > "$OUT/lane-$lane.child" # the pack's driver owns its children's pids
     wait $! || rc=$?
     ran=$(($(date +%s) - t1))
     waits=$(try_waits "$log" "$try")
@@ -2787,7 +3911,7 @@ claimed() { [ -e "$OUT/claims/$1" ]; }
 steal_card() { # $1 = plan index, $2 = lane
   local cards want
   want=$([ "$2" = A ] && printf 3090 || printf a6000)
-  IFS=$'\x1f' read -r _ _ _ _ _ _ _ _ _ _ _ cards _ <<< "${R_REC[$1]}"
+  rec_get "$1" cards
   case " $cards " in
     ' - ') printf -- '-' ;;
     *" $want "*) printf '%s' "$want" ;;
@@ -2795,16 +3919,166 @@ steal_card() { # $1 = plan index, $2 = lane
 }
 
 # movable: the other lane's item this lane may take — class F (the plan's own word that either
-# card, or no card, runs it), not a ledger skip, not yet claimed.
+# card, or no card, runs it), not a ledger skip, not yet claimed, and held to the same neighbour
+# rule as its own items (below).
 stealable() { # $1 = plan index, $2 = lane
   local i=$1 cls other
   other=$([ "$2" = A ] && printf B || printf A)
   [ "${P_LANE[$i]}" = "$other" ] || return 1
-  IFS=$'\x1f' read -r cls _ _ _ _ _ _ _ _ _ _ _ _ <<< "${R_REC[$i]}"
+  rec_get "$i" cls
   [ "$cls" = F ] || return 1
   [ "${P_LST[$i]}" != skip ] || return 1
   ! claimed "$i" || return 1
+  ! tagged_neighbour "$i" || chain_quiet
+  ! pool_tagged "$i" || [ ! -e "$POOL_MUTEX" ]
   [ -n "$(steal_card "$i" "$2")" ]
+}
+
+# The chain (class C, the header): one member at a time batch-wide, both lanes feeding it.
+CHAIN_MUTEX=$OUT/chain.lock # taken (mkdir) before a member's run, released (rmdir) when it returns
+lane_card() { [ "$1" = A ] && printf 3090 || printf a6000; }
+tagged_neighbour() { # $1 = plan index: a pool or big-host item (D5's groups)
+  case " ${P_TAG[$1]:-} " in *' pool '*|*' big-host '*) return 0 ;; *) return 1 ;; esac
+}
+# The pack's pool mutex (the header's «pack»): two [group('pool')] items spin worker pools pinned to
+# the same cores, so at most one runs at a time, batch-wide — the lanes' takes and the pack hold it
+# around a pool item's run. A directory mutex like the chain's; a lane that finds it up takes its
+# next item instead, and one that claimed a pool item just before the mutex went up waits it out
+# (bounded by the running item's BLOOMERY_GATE_BOUND).
+POOL_MUTEX=$OUT/pool.lock
+pool_tagged() { case " ${P_TAG[$1]:-} " in *' pool '*) return 0 ;; *) return 1 ;; esac; }
+pool_take() { until mkdir "$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }
+pool_rel() { rmdir "$POOL_MUTEX" 2> /dev/null || true; }
+run_pooled() { # $1 = plan index, $2..: run the item under the pool mutex when it is pool-tagged
+  local i=$1
+  shift
+  if pool_tagged "$i"; then
+    pool_take
+    "$@"
+    pool_rel
+  else
+    "$@"
+  fi
+}
+chain_quiet() { # no chain item runs (the mutex is free) and none is unstarted: the neighbour rule's
+  # second half — an item a neighbour could start in a gap between two members would hold the next
+  # one off for its whole run, on the critical path
+  [ "$CHAIN_ACTIVE" = 1 ] || return 0
+  [ -e "$CHAIN_MUTEX" ] && return 1
+  local i
+  for i in ${CHAIN_ORDER[@]+"${CHAIN_ORDER[@]}"}; do
+    claimed "$i" || return 1
+  done
+  return 0
+}
+neighbour_blocked() { # $1 = plan index: a tagged item starts only once the whole chain is done
+  [ "$CHAIN_ACTIVE" = 1 ] || return 1
+  tagged_neighbour "$1" || return 1
+  ! chain_quiet
+}
+card_ok() { # $1 = plan index, $2 = a card: one of the item's candidate labels names it (a pick's
+  # label is the card box.sh gives it; no card is forced)
+  local labels
+  rec_get "$1" labels
+  case " $labels " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+}
+chain_next() { # $1 = lane: the first unclaimed member, in the K order, whose candidates include
+  # this lane's card — within the family of the first unclaimed member: a lane never opens the next
+  # family while the current one holds an unclaimed member, even one only the other card can run (D3)
+  local i fam='' want
+  want=$(lane_card "$1")
+  for i in ${CHAIN_ORDER[@]+"${CHAIN_ORDER[@]}"}; do
+    claimed "$i" && continue
+    [ -n "$fam" ] || fam=${P_FAM[$i]}
+    [ "${P_FAM[$i]}" = "$fam" ] || break
+    if card_ok "$i" "$want"; then
+      printf '%s' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+chain_skip_take() { # $1 = lane: a member green on a candidate's key skips at 0 s — no mutex, it runs nothing
+  local i
+  for i in ${CHAIN_ORDER[@]+"${CHAIN_ORDER[@]}"}; do
+    [ "${P_LST[$i]}" = skip ] || continue
+    claimed "$i" && continue
+    claim_item "$i" "chain-$1" || continue
+    skip_item "$i" C
+    return 0
+  done
+  return 1
+}
+chain_take() { # $1 = lane: the mutex first (a lane that loses it holds no claim it must honour), then
+  # the member D3 gives this lane's card, its placement rewritten onto it (as a steal's is), run, release
+  local lane=$1 i card cards
+  mkdir "$CHAIN_MUTEX" 2> /dev/null || return 1
+  i=''
+  i=$(chain_next "$lane") || { rmdir "$CHAIN_MUTEX" 2> /dev/null || true; return 1; }
+  claim_item "$i" "chain-$lane" || { rmdir "$CHAIN_MUTEX" 2> /dev/null || true; return 1; }
+  card=$(lane_card "$lane")
+  rec_get "$i" cards
+  case " $cards " in *" $card "*) switch_candidate "$i" "$card" ;; esac
+  run_item "$i" "$lane"
+  rmdir "$CHAIN_MUTEX" 2> /dev/null || true
+  return 0
+}
+takeable() { # $1 = plan index, $2 = lane: a lane item (class A, B or F — never the chain's C or
+  # lane X's) whose card candidates allow this lane's card, or no card at all
+  local cls labels
+  rec_get "$1" cls labels
+  case $cls in
+    A | B | F) ;;
+    *) return 1 ;;
+  esac
+  case " $labels " in
+    ' none ') return 0 ;;
+    *" $(lane_card "$2") "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+take_next() { # $1 = lane, $2 = the variable for the index: a green skip first (it costs 0 s), then
+  # the longest-est unclaimed item this lane may take — its card's fixed items and any balanced one,
+  # longest first, the free lane's own choice (no static assignment) — that passes the neighbour
+  # rule; an item the rule or the lease holds is skipped for now, not dropped
+  local lane=$1 var=$2 j best=-1 be=-1 exp labels cls cards card
+  for j in ${ORDER[@]+"${ORDER[@]}"}; do
+    claimed "$j" && continue
+    takeable "$j" "$lane" || continue
+    if [ "${P_LST[$j]}" = skip ]; then
+      printf -v "$var" '%s' "$j"
+      return 0
+    fi
+    if neighbour_blocked "$j"; then continue; fi
+    if pool_tagged "$j" && [ -e "$POOL_MUTEX" ]; then continue; fi # another pool item runs (the pack's mutex)
+    rec_get "$j" exp labels
+    if [ "$exp" -gt "$be" ]; then best=$j be=$exp; fi
+  done
+  [ "$best" -ge 0 ] || return 1
+  rec_get "$best" cls cards labels
+  # A balanced item taken onto this lane's card is today's steal: the timing lease is probed first
+  # (never a card while it is held) and the placement moves with it. A fixed item is its lane's own.
+  if [ "$cls" = F ] && [ "$labels" != none ]; then
+    lease_free_for_steal || return 1
+    card=$(lane_card "$lane")
+    case " $cards " in
+      *" $card "*) switch_candidate "$best" "$card" ;;
+    esac
+  fi
+  printf -v "$var" '%s' "$best"
+  return 0
+}
+lane_blocked() { # $1 = lane: something this lane still waits for — a chain member its card could
+  # run, or any unclaimed item it may take (the neighbour rule or the lease holds it for now)
+  local lane=$1 i
+  [ "$CHAIN_ACTIVE" = 1 ] || return 1
+  for i in ${CHAIN_ORDER[@]+"${CHAIN_ORDER[@]}"}; do
+    if ! claimed "$i" && card_ok "$i" "$(lane_card "$lane")"; then return 0; fi
+  done
+  for i in ${ORDER[@]+"${ORDER[@]}"}; do
+    if ! claimed "$i" && takeable "$i" "$lane"; then return 0; fi
+  done
+  return 1
 }
 
 # Rewrite a stolen item's placement onto this lane's card: the env, the times label and the ledger
@@ -2812,7 +4086,7 @@ stealable() { # $1 = plan index, $2 = lane
 # card it ran on. A no-card item needs none of it (its one candidate runs anywhere).
 switch_candidate() { # $1 = plan index, $2 = the lane's card (or -)
   local i=$1 card=$2 env cards labels c pos=-1 k=0 l='' lc=0 j
-  IFS=$'\x1f' read -r _ _ _ env _ _ _ _ _ _ _ cards labels _ <<< "${R_REC[$i]}"
+  rec_get "$i" env cards labels
   [ "$card" = - ] || env="${env:+$env }BLOOMERY_GATE_CARD=$card"
   P_ENV[$i]=$env
   for c in $cards; do
@@ -2851,7 +4125,7 @@ steal_pass() { # $1 = lane
   local lane=$1 i j card k
   while :; do
     i=-1
-    for j in "${ORDER[@]}"; do
+    for j in ${ORDER[@]+"${ORDER[@]}"}; do
       if stealable "$j" "$lane"; then i=$j; break; fi
     done
     [ "$i" -ge 0 ] || return 0
@@ -2860,7 +4134,7 @@ steal_pass() { # $1 = lane
       for ((k = 0; k < STEAL_WAIT; k++)); do
         sleep 1
         i=-1
-        for j in "${ORDER[@]}"; do
+        for j in ${ORDER[@]+"${ORDER[@]}"}; do
           if stealable "$j" "$lane"; then i=$j; break; fi
         done
         [ "$i" -ge 0 ] || return 0
@@ -2869,26 +4143,178 @@ steal_pass() { # $1 = lane
     fi
     claim_item "$i" "steal-$lane" || continue
     switch_candidate "$i" "$card"
-    run_item "$i" "$lane"
+    run_pooled "$i" run_item "$i" "$lane"
   done
 }
 
-run_lane() { # $1 = lane label; runs its items in the run order (ORDER), then steals the other
-  # lane's unstarted movable items (above), then writes lane-<lane>.s
+# The pack (the header's «pack»): the X items placed onto the free cards. The driver runs in the
+# main process — its death is the batch's — and launches items as background children whose pids go
+# to lane-X-<i>.child (the stop trap's lane-*.child glob). One item a card; the running items' bytes
+# within PACK_BUDGET (a lone item always starts: the budget bounds pairs, and one load's own check is
+# its own); an m-flagged item alone; a both-cards item needs both cards. Launches take the
+# longest-est eligible item (the lanes' own rule), a two-candidate item the free card (the A6000
+# first). Green skips claim and record at once at the green candidate's key. The loop always ends:
+# every turn launches, reaps, or sleeps a second.
+run_pack() {
+  local t0 i j k labels exp res card best be bc launched alldone p cards
+  t0=$(date +%s)
+  local -a XP=()
+  for i in ${ORDER[@]+"${ORDER[@]}"}; do [ "${P_LANE[$i]}" = X ] && XP+=("$i"); done
+  local -a R_PID=() R_CARD=() R_BYTES=() R_M=()
+  for i in "${XP[@]}"; do
+    rec_get "$i" res
+    # Every X record ends in its resource field, `<flag> <bytes>`; anything else is a misread record,
+    # never an item of 0 bytes and no m flag free to run beside anything.
+    case $res in
+      [-m]' '[0-9]*) ;;
+      *) RC=70 die "the pack: ${P_STEM[$i]}'s resource field reads '$res', not '<flag> <bytes>' (the plan record's res field)" ;;
+    esac
+    R_PID[$i]='' R_CARD[$i]='' R_M[$i]=0
+    # shellcheck disable=SC2086 # the resource field: a flag and a byte count, no spaces inside
+    set -- $res
+    [ "$1" = m ] && R_M[$i]=1
+    R_BYTES[$i]=$2
+  done
+  local nrun=0 mrun=0 sumb=0 b3090=0 ba6000=0
+  while :; do
+    # the green skips first: at the green candidate's key (the pack runs nothing for them)
+    for i in "${XP[@]}"; do
+      [ -z "${R_PID[$i]}" ] || continue
+      claimed "$i" && continue
+      j=${R_C0[$i]}
+      if [ $((i + 1)) -lt "$N" ]; then k=${R_C0[$((i + 1))]}; else k=$NC; fi
+      card=''
+      for ((; j < k; j++)); do
+        if [ "${C_LST[$j]}" = skip ]; then
+          rec_get "$i" cards
+          p=$((j - R_C0[i] + 1))
+          # shellcheck disable=SC2086 # the candidates, one word each
+          set -- $cards
+          eval "card=\${$p}"
+          break
+        fi
+      done
+      [ -n "$card" ] || continue # not green anywhere: the launch pass below decides
+      [ "$card" = - ] || switch_candidate "$i" "$card"
+      claim_item "$i" pack || continue
+      skip_item "$i" X
+      R_PID[$i]=x
+    done
+    # launches: the longest-est eligible item, again and again while one fits
+    launched=1
+    while [ "$launched" = 1 ]; do
+      launched=0 best=-1 be=-1 bc=''
+      for i in "${XP[@]}"; do
+        [ -z "${R_PID[$i]}" ] || continue
+        claimed "$i" && continue
+        if [ "${R_M[$i]}" = 1 ]; then
+          [ "$nrun" = 0 ] || continue # an m item starts with nothing else running
+        else
+          [ "$mrun" = 0 ] || continue # and nothing starts beside one
+          [ "$nrun" = 0 ] || [ $((sumb + ${R_BYTES[$i]})) -le "$PACK_BUDGET" ] || continue
+        fi
+        rec_get "$i" labels
+        case $labels in
+          none) card=- ;;
+          both)
+            [ "$b3090" = 0 ] && [ "$ba6000" = 0 ] || continue
+            card=both ;;
+          3090)
+            [ "$b3090" = 0 ] || continue
+            card=3090 ;;
+          a6000)
+            [ "$ba6000" = 0 ] || continue
+            card=a6000 ;;
+          '3090 a6000')
+            if [ "$ba6000" = 0 ]; then card=a6000; elif [ "$b3090" = 0 ]; then card=3090; else continue; fi ;;
+          *) continue ;;
+        esac
+        rec_get "$i" exp
+        if [ "$exp" -gt "$be" ]; then best=$i be=$exp bc=$card; fi # the card this item would take
+      done
+      [ "$best" -ge 0 ] || break
+      i=$best card=$bc
+      claim_item "$i" pack || continue
+      rec_get "$i" cards
+      case " $cards " in *" $card "*) switch_candidate "$i" "$card" ;; esac
+      R_CARD[$i]=$card
+      run_item "$i" X &
+      R_PID[$i]=$!
+      echo "${R_PID[$i]}" > "$OUT/lane-X-$i.child"
+      case $card in
+        3090) b3090=1 ;;
+        a6000) ba6000=1 ;;
+        both) b3090=1 ba6000=1 ;;
+      esac
+      sumb=$((sumb + R_BYTES[i]))
+      [ "${R_M[$i]}" = 1 ] && mrun=1
+      nrun=$((nrun + 1))
+      launched=1
+    done
+    # reaping: a dead child releases its card, its bytes and the m hold
+    for i in "${XP[@]}"; do
+      case ${R_PID[$i]} in '' | x) continue ;; esac
+      kill -0 "${R_PID[$i]}" 2> /dev/null && continue
+      wait "${R_PID[$i]}" 2> /dev/null || true
+      case ${R_CARD[$i]} in
+        3090) b3090=0 ;;
+        a6000) ba6000=0 ;;
+        both) b3090=0 ba6000=0 ;;
+      esac
+      sumb=$((sumb - R_BYTES[i]))
+      [ "${R_M[$i]}" = 1 ] && mrun=0
+      nrun=$((nrun - 1))
+      R_PID[$i]=x
+      rm -f "$OUT/lane-X-$i.child"
+    done
+    # the end: every item claimed and done, nothing running
+    alldone=1
+    for i in "${XP[@]}"; do case ${R_PID[$i]} in x) ;; *) alldone=0 ;; esac; done
+    if [ "$alldone" = 1 ] && [ "$nrun" = 0 ]; then break; fi
+    sleep 1
+  done
+  echo $(($(date +%s) - t0)) > "$OUT/lane-X.s"
+}
+
+run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class C): when free it
+  # takes, in order, a green member's skip, the member D3 gives its card (under the mutex), or the
+  # longest-est item it may take (its card's fixed items and any balanced one, the free lane's own
+  # choice — today's steal is that take, so the pass is gone here); then it waits in 1 s slices
+  # while a member it could run or an item the rule or the lease holds remains, and else ends.
+  # Without a chain (lane X, --lanes 1, the fixture tier, a chainless list) it is today's loop: its
+  # items in ORDER, then the steal pass.
   local lane=$1 t0 i
   t0=$(date +%s)
-  for i in "${ORDER[@]}"; do
-    [ "${P_LANE[$i]}" = "$lane" ] || continue
-    if [ "${P_LST[$i]}" = skip ]; then
-      skip_item "$i" "$lane"
-    else
-      claim_item "$i" "$lane" || continue # the other lane stole it while this one was busy
-      run_item "$i" "$lane"
-    fi
-  done
-  case $lane in
-    A | B) [ "$LANES" = 2 ] && steal_pass "$lane" ;;
-  esac
+  if [ "$CHAIN_ACTIVE" = 1 ] && [ "${#CHAIN_ORDER[@]}" -gt 0 ] && { [ "$lane" = A ] || [ "$lane" = B ]; }; then
+    while :; do
+      chain_skip_take "$lane" && continue
+      chain_take "$lane" && continue
+      if take_next "$lane" i; then
+        if [ "${P_LST[$i]}" = skip ]; then
+          skip_item "$i" "$lane"
+        else
+          claim_item "$i" "$lane" || continue # the other lane took it while this one was busy
+          run_pooled "$i" run_item "$i" "$lane"
+        fi
+        continue
+      fi
+      lane_blocked "$lane" || break
+      sleep 1
+    done
+  else
+    for i in ${ORDER[@]+"${ORDER[@]}"}; do
+      [ "${P_LANE[$i]}" = "$lane" ] || continue
+      if [ "${P_LST[$i]}" = skip ]; then
+        skip_item "$i" "$lane"
+      else
+        claim_item "$i" "$lane" || continue # the other lane stole it while this one was busy
+        run_pooled "$i" run_item "$i" "$lane"
+      fi
+    done
+    case $lane in
+      A | B) [ "$LANES" = 2 ] && steal_pass "$lane" ;;
+    esac
+  fi
   echo $(($(date +%s) - t0)) > "$OUT/lane-$lane.s"
 }
 
@@ -2902,6 +4328,35 @@ for lane in A B; do
     LANES_RUN="$LANES_RUN $lane"
   fi
 done
+# Every lane is watched until its sentinel exists: a lane that dies — with the chain's mutex held,
+# or anywhere else — must not leave the other spinning on what it holds. A dead-but-unreaped lane
+# reads as state Z to ps, and a pid ps itself cannot find reads as ps's own rc (`wait` would block on
+# the survivor instead); the sentinel is each lane's last act, so a lane that wrote it is only waiting
+# to be reaped below. A lane is declared dead on two sweeps in a row, a second apart, that each
+# found it gone: a busy machine can make one ps read fail, and a false death would kill a working
+# lane. Each lane's sighting is its own (two lanes that die together are each declared), and a
+# sweep that finds a lane alive forgets its last sighting.
+dead_prev=''
+while :; do
+  miss=0
+  for lane in $LANES_RUN; do [ -f "$OUT/lane-$lane.s" ] || miss=1; done
+  [ "$miss" = 0 ] && break
+  dead_now=''
+  for lane in $LANES_RUN; do
+    [ -f "$OUT/lane-$lane.s" ] && continue
+    st=$(ps -o state= -p "$(cat "$OUT/lane-$lane.pid" 2>/dev/null)" 2>/dev/null) && [ -n "$st" ] && [ "$st" != Z ] && continue
+    case " $dead_prev " in
+      *" $lane "*) ;;
+      *) dead_now="$dead_now $lane"; continue ;;
+    esac
+    for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
+      if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+    done
+    RC=70 die "lane $lane ended without its sentinel ($OUT/lane-$lane.s) — see run.log"
+  done
+  dead_prev=$dead_now
+  sleep 1
+done
 for lane in $LANES_RUN; do
   wait "$(cat "$OUT/lane-$lane.pid")" || true
 done
@@ -2909,7 +4364,7 @@ done
 for lane in $LANES_RUN; do
   [ -f "$OUT/lane-$lane.s" ] || RC=70 die "lane $lane ended without its sentinel ($OUT/lane-$lane.s) — see run.log"
 done
-if has_lane X; then run_lane X; fi
+if has_lane X; then run_pack; fi
 trap - INT TERM
 
 recorded=$(grep -c ' rc=' "$RUNLOG" || true)
