@@ -42,8 +42,10 @@ mod tests {
     use crate::RefError;
     use crate::family::{Family, Identity};
 
-    fn runs() -> String {
-        "/models/P/M-00001-of-00009.gguf".to_string()
+    const RUNS: &str = "/models/P/M-00001-of-00009.gguf";
+
+    fn runs() -> Result<String, RefError> {
+        Ok(RUNS.to_string())
     }
 
     static FAMILY: Family = Family {
@@ -73,10 +75,7 @@ mod tests {
             std::fs::write(&path, text).unwrap_or_else(|e| panic!("{e}"));
         };
         file("model=/models/P/M-00001-of-00009.gguf");
-        assert_eq!(
-            dumped_from(&path).ok().flatten().as_deref(),
-            Some(runs().as_str())
-        );
+        assert_eq!(dumped_from(&path).ok().flatten().as_deref(), Some(RUNS));
         check(&path, &FAMILY).unwrap_or_else(|e| panic!("{e}"));
         file("model=/models/Q/M-00001-of-00009.gguf");
         match check(&path, &FAMILY) {

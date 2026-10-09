@@ -9,8 +9,8 @@ const MODEL: &str = "/models/P/M-00001-of-00006.gguf";
 const ARCH: &str = "a";
 const MTP_BUILD: &str = "b0";
 
-fn runs() -> String {
-    MODEL.to_string()
+fn runs() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 static MTP: Family = Family {

@@ -21,6 +21,7 @@ crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_CARD	session
 crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL,BLOOMERY_REF_MODEL,BLOOMERY_REF_MODEL_PROFILE,BLOOMERY_FIXTURE_MODEL	gatestoml
 crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
+crates/refset/src/fixture.rs	BLOOMERY_FIXTURE_ROOT	gatestoml
 crates/model/src/bin/bloomery-decode.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/arch/deepseek41/fixture.rs	BLOOMERY_DSPARK_MODEL	gatestoml
