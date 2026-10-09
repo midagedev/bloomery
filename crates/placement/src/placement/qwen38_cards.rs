@@ -982,16 +982,16 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
 /// asked — the serve gate's two rooms.
 #[test]
 fn the_one_column_rule_reads_the_arena() {
-    use bloomery_levers::{Paged, PagedAt, paged_columns};
+    use bloomery_levers::{Paged, PagedAt, SlotsBy, paged_columns};
     let (q4, gate) = (model(false), machine_a(RTX_3090));
     let arena = |slots: u64, room: u64| {
         let plan = plan_at(&q4, &gate, 4096, slots, room).expect("the plan");
         (plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes)
     };
-    let at = |arena, slots, slots_set| PagedAt {
+    let at = |arena, slots, slots_set: bool| PagedAt {
         arena,
         slots,
-        slots_set,
+        slots_by: slots_set.then_some(SlotsBy::Parallel),
         draft: false,
         draft_set: false,
     };

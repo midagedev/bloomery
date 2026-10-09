@@ -237,8 +237,9 @@
 //! servers start on the card, one at a time: the `ctx` clause's three, the
 //! `paged` clause's five and the residency word's one (they stop before the
 //! load, or are refused before it, but the `paged` clause's small card,
-//! stopped at its load's draft record), then the slots clause's two and the
-//! sampled rounds' one (above).
+//! stopped at its load's draft record), the `paged` clause's
+//! `generate_qwen3moe` run (whole, two tokens), then the slots clause's two
+//! and the sampled rounds' one (above).
 //!
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
 //!   (the margin rule's answer — or the largest the card holds when that is
@@ -272,10 +273,14 @@
 //!   (`paged_small_card_yields_on_one_card`, the premise), the plan pages,
 //!   and the one-slot load's `load draft=off` record names the paged rule,
 //!   never the yield judged on the plan it abandoned
-//!   (`paged_small_card_load_names_the_rule`). FAIL-first: the seat with no
+//!   (`paged_small_card_load_names_the_rule`). Then `generate_qwen3moe`
+//!   with no `--place` at 27 GiB: its unset draft at `a` falls to the same
+//!   rule, and the run's `load draft=off` record names it
+//!   (`paged_cli_drafts_nothing_by_the_rule`). FAIL-first: the seat with no
 //!   rule serves two slots at 27 GiB and refuses neither; a rule on the
 //!   paged experts' bytes refuses the 40 GiB server; a one-column load that
-//!   keeps the yield's reason names it on the small card;
+//!   keeps the yield's reason names it on the small card; a CLI with no rule
+//!   drafts on the paged plan;
 //! - `residency_loads_the_word` ([`residency_loads_the_word`]): a server of
 //!   the main arguments under `BLOOMERY_RESIDENCY=mid-p0-s1`, stopped before
 //!   its load, prints the `residency lever` record of that word with why
@@ -3258,7 +3263,11 @@ mod gate {
     /// bytes rather than the arena refuses the 40 GiB `--parallel 2`; a
     /// one-column load that keeps the yield's reason names it on the small
     /// card.
-    fn paged(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+    fn paged(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+        prompt: &str,
+    ) -> Result<bool, GateError> {
         // The rooms and the budget are the real file's shapes: a fixture's
         // host set pages nothing at them.
         if !tier::run_clause("paged", Tag::Scale)? {
@@ -3362,7 +3371,7 @@ mod gate {
         // A refusal's arena, read off its own line (the plan the refused
         // server read, whose context rides the card's free bytes at its
         // start), and whether the line is `PagedRefused`'s text at it.
-        let refused = |text: &str, head: &str, parallel, draft| {
+        let refused = |text: &str, head: &str, parallel: Option<usize>, draft| {
             let arena = text.lines().find_map(|l| {
                 let tail = &l[l.find(head)? + head.len()..];
                 tail.split_once(" B RAM arena")?.0.parse::<u64>().ok()
@@ -3370,7 +3379,7 @@ mod gate {
             let named = arena.is_some_and(|arena| {
                 let want = bloomery_levers::PagedRefused {
                     arena,
-                    parallel,
+                    slots: parallel.map(|n| (bloomery_levers::SlotsBy::Parallel, n)),
                     draft,
                 }
                 .to_string();
@@ -3513,6 +3522,72 @@ mod gate {
             &mut ok,
             "paged_small_card_load_names_the_rule",
             one && asked && arena.is_some_and(|a| a > 0) && why.is_some() && off == why,
+        );
+
+        // `generate_qwen3moe` under the same rule: with no `--place` (the
+        // box pin's one card, `a`) at 27 GiB, the unset draft runs at `a`
+        // with its file there, its plan pages, and the run drafts nothing —
+        // its `load draft=off` record names the paged rule at the arena it
+        // names, and no `load draft=mtp` line prints. The residency is pinned
+        // off, as at the small card. It runs whole: `-n 2` past its load.
+        let mut cmd = Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));
+        cmd.env(bloomery_levers::HOST_ROOM, "27G")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::NVTIER_BYTES)
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        let mut run = Served38::spawn_with(&["--prompt", prompt, "-n", "2"], &own, &mut cmd)?;
+        let mut status = None;
+        for _ in 0..POLLS {
+            status = run.child.try_wait()?;
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        if status.is_none() {
+            println!(
+                "paged: generate_qwen3moe stopped at the bound: {}",
+                run.stop()?
+            );
+        }
+        let out = std::fs::read_to_string(own.join("server.out"))?;
+        let head = "load draft=off (unset: the plan pages host experts through the NVMe tier's ";
+        let arena = out.lines().find_map(|l| {
+            l.strip_prefix(head)?
+                .split_once(" B RAM arena")?
+                .0
+                .parse::<u64>()
+                .ok()
+        });
+        let off = record::Log::of(&out, record::GENERATE_QWEN3MOE)
+            .first(&record::LOAD_DRAFT_OFF38)?
+            .map(|f| f.text("why").map(str::to_owned))
+            .transpose()?;
+        let drafted = out.lines().any(|l| l.starts_with("load draft=mtp"));
+        println!(
+            "paged: generate_qwen3moe exit {status:?}: load draft=off ({}), load draft=mtp {drafted}",
+            off.as_deref().unwrap_or("none")
+        );
+        if off.is_none() {
+            let err = std::fs::read_to_string(own.join("server.err")).unwrap_or_default();
+            let tail: Vec<&str> = err.lines().rev().take(20).collect();
+            println!("paged: generate_qwen3moe's last stderr lines:");
+            for l in tail.iter().rev() {
+                println!("  {l}");
+            }
+        }
+        let why = arena.map(|arena| bloomery_levers::Draft38Off::Paged { arena }.to_string());
+        check(
+            &mut ok,
+            "paged_cli_drafts_nothing_by_the_rule",
+            status.is_some_and(|s| s.success())
+                && arena.is_some_and(|a| a > 0)
+                && why.is_some()
+                && off == why
+                && !drafted,
         );
         Ok(ok)
     }
@@ -3684,7 +3759,7 @@ mod gate {
 
         println!("server stopped: {}", served.stop()?);
         ok &= ctx(dir, levers)?;
-        ok &= paged(dir, levers)?;
+        ok &= paged(dir, levers, prompt)?;
         ok &= residency_loads_the_word(dir)?;
         // The resident slots together (the module header): its own servers,
         // the first with the draft on, the second the seat's own defaults.

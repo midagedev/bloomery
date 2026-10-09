@@ -1689,17 +1689,42 @@ impl fmt::Display for DraftYield {
     }
 }
 
-/// What decides the columns a serving seat steps on a plan whose host
-/// experts page through the NVMe tier's RAM arena ([`paged_columns`]).
+/// How a binary names the slot count a user sets ([`PagedAt::slots_by`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotsBy {
+    /// A server's `--parallel N`.
+    Parallel,
+    /// `generate_qwen3moe`'s [`GEN_SLOTS`].
+    GenSlots,
+}
+
+impl SlotsBy {
+    fn named(self, n: usize) -> String {
+        match self {
+            SlotsBy::Parallel => format!("--parallel {n}"),
+            SlotsBy::GenSlots => format!("{GEN_SLOTS}={n}"),
+        }
+    }
+
+    fn way_out(self) -> String {
+        match self {
+            SlotsBy::Parallel => "serve --parallel 1 or leave --parallel unset".to_owned(),
+            SlotsBy::GenSlots => format!("leave {GEN_SLOTS} unset"),
+        }
+    }
+}
+
+/// What decides the columns a binary steps on a plan whose host experts
+/// page through the NVMe tier's RAM arena ([`paged_columns`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagedAt {
     /// The plan's RAM arena (`HostTotals::nvme_arena_bytes`); 0 is a plan
     /// the tier does not page through an arena.
     pub arena: u64,
-    /// The resident slots the plan counts, and whether `--parallel` named
-    /// the count.
+    /// The resident slots the plan counts, and what set the count: `None`
+    /// the binary's own default.
     pub slots: usize,
-    pub slots_set: bool,
+    pub slots_by: Option<SlotsBy>,
     /// Whether the plan drafts, and whether [`DRAFT`] named the draft.
     pub draft: bool,
     pub draft_set: bool,
@@ -1714,12 +1739,12 @@ pub enum Paged {
     OneColumn,
 }
 
-/// A paged plan's refusal of the set values that step several columns: the
-/// `--parallel` count past one, and a set draft.
+/// A paged plan's refusal of the set values that step several columns: a
+/// slot count past one, as the binary names it, and a set draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagedRefused {
     pub arena: u64,
-    pub parallel: Option<usize>,
+    pub slots: Option<(SlotsBy, usize)>,
     pub draft: bool,
 }
 
@@ -1727,9 +1752,9 @@ impl fmt::Display for PagedRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut what = Vec::new();
         let mut ways = Vec::new();
-        if let Some(n) = self.parallel {
-            what.push(format!("--parallel {n}"));
-            ways.push("serve --parallel 1 or leave --parallel unset".to_owned());
+        if let Some((by, n)) = self.slots {
+            what.push(by.named(n));
+            ways.push(by.way_out());
         }
         if self.draft {
             what.push(format!("{DRAFT}=mtp"));
@@ -1753,8 +1778,8 @@ impl std::error::Error for PagedRefused {}
 /// one column: several slots or a drafted verify read the paged experts
 /// through the file mapping, and its page cache pushes the arena to swap. A
 /// plan with no arena, or one slot and no draft, serves as asked; else the
-/// unset counts fall to one slot and no draft, and a `--parallel` past one or
-/// a set draft is refused by name.
+/// unset counts fall to one slot and no draft, and a set slot count past one
+/// or a set draft is refused by name.
 ///
 /// # Errors
 /// [`PagedRefused`], naming each set value that steps several columns.
@@ -1762,16 +1787,43 @@ pub fn paged_columns(at: &PagedAt) -> Result<Paged, PagedRefused> {
     if at.arena == 0 || (at.slots <= 1 && !at.draft) {
         return Ok(Paged::AsAsked);
     }
-    let parallel = (at.slots_set && at.slots > 1).then_some(at.slots);
+    let slots = at
+        .slots_by
+        .filter(|_| at.slots > 1)
+        .map(|by| (by, at.slots));
     let draft = at.draft_set && at.draft;
-    if parallel.is_some() || draft {
+    if slots.is_some() || draft {
         return Err(PagedRefused {
             arena: at.arena,
-            parallel,
+            slots,
             draft,
         });
     }
     Ok(Paged::OneColumn)
+}
+
+/// The draft a one-column load ([`Paged::OneColumn`]) runs without, as its
+/// `load draft=off` record names it, and whether it was asked: a draft that
+/// ran (`drafts`), or that only its yield to the context turned off — a
+/// verdict on the plan of several slots the load abandons — was asked, and
+/// the paged rule is why it is off; any other reason (set, the placement,
+/// the file, a window past the context) holds whatever the plan, and stays.
+/// The Qwen3.8 seat's and `generate_qwen3moe`'s one owner.
+#[must_use]
+pub fn paged_draft(
+    drafts: bool,
+    off: Option<Draft38Off>,
+    arena: u64,
+) -> (bool, Option<Draft38Off>) {
+    let asked = drafts || matches!(off, Some(Draft38Off::Yield(_)));
+    (
+        asked,
+        if asked {
+            Some(Draft38Off::Paged { arena })
+        } else {
+            off
+        },
+    )
 }
 
 /// The word the GLM seat of `bloomery-serve` drafts by with [`DRAFT`]
