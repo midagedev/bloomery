@@ -1,8 +1,30 @@
 //! `gate_mimo2_serve` — the MiMo seat of `bloomery-serve` against the session
-//! it serves, on the model file of the mimo2 profile (`BLOOMERY_REF_MODEL`),
-//! on the one card the runner puts in view.
+//! it serves, on the model file of the mimo2 profile (`BLOOMERY_REF_MODEL`).
 //!
-//!     gate_mimo2_serve --dir <dir>
+//!     gate_mimo2_serve --dir <dir> [--after-refusals]
+//!
+//! Two clauses need different censuses, and every clause runs on the census
+//! the recipe gives (both cards in view, `BLOOMERY_CARD=both`):
+//!
+//! - `refusals_before_any_load`'s `--place bp` half needs two visible cards.
+//! - `server_ids_are_the_session_ids` and `ids_see_an_id_short` need one: the
+//!   session opens on the gate card (`shared/gate_card.rs`).
+//!
+//! On a census of two or more this process runs `plan_only_names_its_default`
+//! and `refusals_before_any_load` (both halves), then runs every later clause
+//! in a child of itself (`--after-refusals`, logs in `<dir>/child/`) whose
+//! `CUDA_VISIBLE_DEVICES` names the A6000 alone, taken by name from the census
+//! and passed by the UUID the driver reports for it. A census with no A6000 is
+//! a named error. The child prints one line saying the parent ran the two
+//! clauses; its exit code and a `check <clause>: PASS` line for each clause it
+//! owes are the verdict, and the final `PASS` needs this process's clauses and
+//! the child's.
+//!
+//! On a census of one (a hand run) every clause runs in this process except
+//! the `--place bp` half, which prints `deferred(two cards) …`, and the check
+//! of the clause then names what ran (`--parallel 2 only`). A child started by
+//! hand on a census of two prints `deferred(one card) …` for the two session
+//! clauses. A `deferred(…)` line is a half that did not run, never a pass.
 //!
 //! The seat serves one slot, every routed expert on the host tier, the prompt
 //! fed one decode step an id, and a later request keeps any prefix it shares
@@ -28,7 +50,7 @@
 //!   [`REFUSE_WITHIN`], its stderr names the one-slot refusal and no `load`
 //!   record is printed. On a census of two cards, `--place bp` exits
 //!   non-zero the same way with the plan's tier-card refusal; on one card
-//!   the `bp` half is a named skip. FAIL-first: a seat that accepts
+//!   the `bp` half is a `deferred(two cards)` line. FAIL-first: a seat that accepts
 //!   `--parallel 2` is still running at the bound and the clause is red.
 //!
 //! One server, `--ctx` [`CTX`], `--parallel 1`, `--port 0`:
@@ -77,8 +99,9 @@
 //!   the last, then `N − 1` steps at argmax — answers the server's ids bit for
 //!   bit; the batch prompt's first id is ik's argmax at the set's last
 //!   position or a named tie inside the e2e gate's rule (`ik_last`,
-//!   `tie_allowed`). On a census of two cards the clause is a named skip: the
-//!   gate plan (`shared/gate_card.rs`) runs on one visible card.
+//!   `tie_allowed`). On a census of two or more cards (a child started by
+//!   hand) the two session clauses are a `deferred(one card)` line: the gate
+//!   plan (`shared/gate_card.rs`) runs on one visible card.
 //! - `ids_see_an_id_short`: the same session fed a prompt one id short does
 //!   not answer the server's ids for at least one prompt, so the clause above
 //!   can see a seat that feeds one id short. FAIL-first: a server fed one id
@@ -116,6 +139,7 @@ mod mimo2_open;
 
 #[cfg(all(feature = "mimo2", feature = "glm5next"))]
 mod gate {
+    use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
     use std::time::{Duration, Instant};
@@ -134,7 +158,7 @@ mod gate {
     use crate::e2e::ik_last;
     use crate::mimo2_open::{N_VOCAB, last_argmax, open};
 
-    const USAGE: &str = "usage: gate_mimo2_serve --dir <dir>";
+    const USAGE: &str = "usage: gate_mimo2_serve --dir <dir> [--after-refusals]";
 
     /// The tokens each request makes.
     const N: usize = 16;
@@ -157,6 +181,19 @@ mod gate {
     /// The seat's context floor and the step its default context searches in.
     const CTX_FLOOR: u64 = 4096;
     const CTX_STEP: u64 = 1024;
+
+    /// The clauses the child of a census of two or more owes: each prints its
+    /// own `check` line, and the parent's verdict needs every one.
+    const CHILD_CLAUSES: [&str; 8] = [
+        "load_and_listen",
+        "completion_ids",
+        "chat_is_those_ids",
+        "edit_resend_keeps_the_row_where_it_diverges",
+        "edit_resend_ids_are_a_fresh_runs",
+        "extension_keeps_every_held_position",
+        "server_ids_are_the_session_ids",
+        "ids_see_an_id_short",
+    ];
 
     /// How long a refused server may take to exit: it refuses before any
     /// load.
@@ -202,12 +239,19 @@ mod gate {
 
     struct Args {
         dir: PathBuf,
+        /// The parent ran the two clauses before the server's.
+        after_refusals: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let mut dir = None;
+        let mut after_refusals = false;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
+            if flag == "--after-refusals" {
+                after_refusals = true;
+                continue;
+            }
             let v = it
                 .next()
                 .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
@@ -218,6 +262,7 @@ mod gate {
         }
         Ok(Args {
             dir: dir.ok_or(USAGE)?,
+            after_refusals,
         })
     }
 
@@ -304,6 +349,80 @@ mod gate {
     /// names a holder in its refusal text and reads the free bytes.
     fn visible_cards() -> Result<usize, GateError> {
         Ok(bloomery_gpu::census()?.len())
+    }
+
+    /// The `CUDA_VISIBLE_DEVICES` of the child that runs the clauses after
+    /// the refusals: the A6000, found by its name in the census and named by
+    /// the UUID the driver reports for it, the form `nvidia-smi` lists.
+    ///
+    /// # Errors
+    /// A census with no A6000.
+    fn a6000_entry() -> Result<String, GateError> {
+        let census = bloomery_gpu::census()?;
+        let device = census
+            .iter()
+            .find(|d| d.name.contains("A6000"))
+            .ok_or_else(|| {
+                format!(
+                    "the child that runs the clauses after the refusals takes the A6000 and the \
+                     census has none: {}",
+                    census
+                        .iter()
+                        .map(|d| d.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        Ok(bloomery_gpu_gates::gpu_census::gpu_uuid(&device.uuid))
+    }
+
+    /// This binary again with `--after-refusals` and the A6000 alone in view
+    /// ([`a6000_entry`]): the clauses after the refusals. Its output goes to
+    /// this process's streams; its exit status is the verdict of the clauses
+    /// it ran.
+    fn child_clauses(dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let entry = a6000_entry()?;
+        let child_dir = dir.join("child");
+        println!(
+            "child: the clauses after the refusals run in a child on the A6000 \
+             (CUDA_VISIBLE_DEVICES {entry}), logs in {}",
+            child_dir.display()
+        );
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .arg("--dir")
+            .arg(&child_dir)
+            .arg("--after-refusals")
+            .env("CUDA_VISIBLE_DEVICES", &entry)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut seen = Vec::new();
+        let out = child
+            .stdout
+            .take()
+            .ok_or("the child's stdout is not piped")?;
+        for line in BufReader::new(out).lines() {
+            let line = line?;
+            println!("{line}");
+            seen.push(line);
+        }
+        let status = child.wait()?;
+        println!("child: {status}");
+        // An exit 0 is not the verdict until every clause it owes printed its PASS: a
+        // child that ran nothing exits 0 too.
+        let missing: Vec<&str> = CHILD_CLAUSES
+            .iter()
+            .copied()
+            .filter(|c| !seen.iter().any(|l| *l == format!("check {c}: PASS")))
+            .collect();
+        if !missing.is_empty() {
+            println!("child: no `check <clause>: PASS` line for {missing:?}");
+        }
+        check(
+            ok,
+            "clauses_after_the_refusals_in_the_a6000_child",
+            status.success() && missing.is_empty(),
+        );
+        Ok(())
     }
 
     /// `plan_only_names_its_default` (the module header).
@@ -420,13 +539,14 @@ mod gate {
                 &["--place", "bp", "--port", "0"],
                 &TIER_REFUSAL,
             )?;
+            check(ok, "refusals_before_any_load", pass);
         } else {
             println!(
-                "skip refusals_before_any_load (--place bp): {cards} card in view; the tier-card \
-                 refusal needs a census of two"
+                "deferred(two cards) refusals_before_any_load (--place bp): {cards} card in view; \
+                 the tier-card refusal needs a census of two"
             );
+            check(ok, "refusals_before_any_load (--parallel 2 only)", pass);
         }
-        check(ok, "refusals_before_any_load", pass);
         Ok(())
     }
 
@@ -639,6 +759,31 @@ mod gate {
         Ok(())
     }
 
+    /// The clauses after the refusals, in this process: the server's, then
+    /// the session's on a census of one.
+    fn after_refusals(
+        dir: &Path,
+        file: &Path,
+        levers: &bloomery_levers::Levers,
+        cards: usize,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let (_, toks, _) = man.step()?;
+        let batch = toks.to_vec();
+        match served(dir, file, batch, ok)? {
+            Some(answers) if cards == 1 => {
+                server_ids_are_the_session_ids(file, levers, &answers, &man, ok)?;
+            }
+            Some(_) => println!(
+                "deferred(one card) server_ids_are_the_session_ids, ids_see_an_id_short: {cards} \
+                 cards in view; the gate plan runs on one (shared/gate_card.rs)"
+            ),
+            None => {}
+        }
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let a = parse_args()?;
@@ -648,21 +793,20 @@ mod gate {
         let cards = visible_cards()?;
         let mut ok = true;
 
-        plan_only_names_its_default(&a.dir, &file, &mut ok)?;
-        refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
-
-        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
-        let (_, toks, _) = man.step()?;
-        let batch = toks.to_vec();
-        match served(&a.dir, &file, batch, &mut ok)? {
-            Some(answers) if cards == 1 => {
-                server_ids_are_the_session_ids(&file, &levers, &answers, &man, &mut ok)?;
+        if a.after_refusals {
+            println!(
+                "plan_only_names_its_default, refusals_before_any_load: run by the parent of this \
+                 child"
+            );
+            after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
+        } else {
+            plan_only_names_its_default(&a.dir, &file, &mut ok)?;
+            refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
+            if cards >= 2 {
+                child_clauses(&a.dir, &mut ok)?;
+            } else {
+                after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
             }
-            Some(_) => println!(
-                "skip server_ids_are_the_session_ids: {cards} cards in view; the gate plan runs on \
-                 one (shared/gate_card.rs)"
-            ),
-            None => {}
         }
         if ok {
             println!("PASS");

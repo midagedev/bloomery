@@ -2152,12 +2152,14 @@ gate-gpu-glm5next-serve:
 # target/mimo2-serve-gate/<server>/. Loads the whole host set twice (the server, then the session): alone in a batch, and
 # under the big-load lock the V4.1 loads take. Real-only: there is no fixture file for it yet, so a fixture-tier run is
 # refused by name (66) and the recipe is a weekly, selected by its trigger rows in tools/gate-paths.tsv and its own text.
-# The bound is 28 min (the default 900 s is under two cold loads); `--place bp`'s refusal runs only on a census of two
-# cards, the id clause only on one.
+# The bound is 28 min (the default 900 s is under two cold loads). Both cards in view (BLOOMERY_CARD=both: both gate
+# locks, alone in a batch): the process runs the plan and refusal clauses, `--place bp`'s tier-card refusal included,
+# then the rest in a child of itself that sees the A6000 alone, where the id clause's gate plan runs on one card; the
+# gate's module doc has the census rules.
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-mimo2-serve:
-    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
+    BLOOMERY_MODEL=mimo2 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
