@@ -157,13 +157,13 @@ impl Hparams {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::Hparams;
     use crate::arch::header::testing::{Table, expect_refusals};
     use gguf::Value;
 
     /// The keys this module reads, with the values of smalinin's mmproj header.
-    fn v41() -> Table {
+    pub(crate) fn v41() -> Table {
         let half = || Value::Array(vec![Value::F32(0.5); 3]);
         Table(vec![
             ("clip.projector_type", Value::String("deepseek41v".into())),

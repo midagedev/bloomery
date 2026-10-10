@@ -13,14 +13,21 @@ use super::size::{SizeRule, TokenLimits};
 use crate::VisionError;
 use crate::arch::header::{
     KEY_HAS_VISION, Meta, check_architecture, check_eps, check_mean_std, check_projector,
-    check_true, counts, need, refusal,
+    check_true, count_multiple, counts, need, refusal,
 };
 
 const KEY_GELU: &str = "clip.use_gelu";
 const KEY_DEEPSTACK: &str = "clip.vision.is_deepstack_layers";
 
-/// `(key, the value the module runs, where that value comes from)` for the counts.
-const COUNTS: [(&str, u64, &str); 8] = [
+const KEY_PROJECTION_DIM: &str = "clip.vision.projection_dim";
+
+/// The tile width of the encoder's GEMM (`gpu_vision`'s `gemm_bf16`): every output width of a
+/// linear layer is a multiple of it, the merger's included.
+pub const TILE_N: u64 = 64;
+
+/// `(key, the value the module runs, where that value comes from)` for the counts. The
+/// projection width is not among them: it is the text model's width ([`Hparams::check_text_width`]).
+const COUNTS: [(&str, u64, &str); 7] = [
     (
         "clip.vision.block_count",
         27,
@@ -52,11 +59,6 @@ const COUNTS: [(&str, u64, &str); 8] = [
         "config.json vision_config.spatial_merge_size",
     ),
     (
-        "clip.vision.projection_dim",
-        4096,
-        "config.json vision_config.out_hidden_size",
-    ),
-    (
         "clip.vision.image_size",
         768,
         "the converter's warm-up size",
@@ -81,7 +83,7 @@ pub struct Hparams {
     pub patch: usize,
     /// Patches per merge group side: the merger folds `merge`² patches into one token.
     pub merge: usize,
-    /// The merger's output width, the text model's embedding width.
+    /// The merger's output width: the embedding width of the text model the file pairs with.
     pub out_dim: usize,
     /// LayerNorm epsilon.
     pub eps: f32,
@@ -92,6 +94,22 @@ impl Hparams {
     pub fn read(gguf: &Gguf) -> Result<Hparams, VisionError> {
         check_architecture(gguf)?;
         Hparams::from_meta(gguf)
+    }
+
+    /// The file pairs with a text model of embedding width `n_embd`: the merger's output rows
+    /// are that model's input rows, so any other width is refused by name.
+    pub fn check_text_width(&self, n_embd: usize) -> Result<(), VisionError> {
+        if self.out_dim == n_embd {
+            return Ok(());
+        }
+        Err(refusal(
+            KEY_PROJECTION_DIM,
+            format!(
+                "is {}; the text model's embedding width is {n_embd}, so this encoder file is \
+                 not its own",
+                self.out_dim
+            ),
+        ))
     }
 
     /// The size rule an image is planned with, at `limits` image tokens.
@@ -105,8 +123,13 @@ impl Hparams {
         for key in [KEY_HAS_VISION, KEY_GELU] {
             check_true(m, key, why)?;
         }
-        let [n_layer, dim, n_head, ff, patch, merge, out_dim, _warm_up] =
-            counts(m, PROJECTOR_TYPE, COUNTS)?;
+        let [n_layer, dim, n_head, ff, patch, merge, _warm_up] = counts(m, PROJECTOR_TYPE, COUNTS)?;
+        let out_dim = count_multiple(
+            m,
+            KEY_PROJECTION_DIM,
+            TILE_N,
+            "the merger's output width is a GEMM tile count: it must be",
+        )?;
         let eps = check_eps(m, EPS, "the vision tower's LayerNorm")?;
         check_mean_std(
             m,
@@ -163,13 +186,13 @@ fn check_no_deepstack(m: &impl Meta, n_layer: usize) -> Result<(), VisionError> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::Hparams;
     use crate::arch::header::testing::{Table, expect_refusals};
     use gguf::Value;
 
     /// The keys this module reads, with the values of Clef Flash's mmproj header.
-    fn clef() -> Table {
+    pub(crate) fn clef() -> Table {
         let half = || Value::Array(vec![Value::F32(0.5); 3]);
         Table(vec![
             (
@@ -201,6 +224,38 @@ mod tests {
         let mut a = vec![Value::Bool(false); 27];
         a[i] = Value::Bool(true);
         Value::Array(a)
+    }
+
+    /// The three Qwen3-VL files differ in the merger's output width only, each the embedding width
+    /// of its text model: Clef Flash 4096, Qwen3.6-35B-A3B 2048, Qwen3.8-Flash-Next 2560.
+    #[test]
+    fn the_three_files_read_at_their_own_width() {
+        for width in [4096, 2048, 2560] {
+            let hp =
+                Hparams::from_meta(&clef().with("clip.vision.projection_dim", Value::U32(width)))
+                    .expect("header reads");
+            assert_eq!(hp.out_dim, width as usize);
+            assert_eq!((hp.dim, hp.ff, hp.n_layer), (1152, 4304, 27));
+        }
+    }
+
+    /// The merger's rows are the text model's input rows: a file whose width is not the model's is
+    /// refused by the key and both widths, and the model's own width passes.
+    #[test]
+    fn the_text_models_width_is_the_check() {
+        let at = |width| {
+            Hparams::from_meta(&clef().with("clip.vision.projection_dim", Value::U32(width)))
+                .expect("header reads")
+        };
+        let err = at(4096).check_text_width(2048).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "metadata clip.vision.projection_dim: is 4096; the text model's embedding width is \
+             2048, so this encoder file is not its own"
+        );
+        at(2048).check_text_width(2048).expect("same width");
+        at(2560).check_text_width(2560).expect("same width");
+        assert!(at(2560).check_text_width(2048).is_err());
     }
 
     #[test]
@@ -262,9 +317,24 @@ mod tests {
                 clef().with("clip.vision.spatial_merge_size", Value::U32(3)),
                 "metadata clip.vision.spatial_merge_size: is 3;",
             ),
+            // PIN(2026-10-10): the projection_dim 5120 refusal case is removed. The tower is not
+            // bound to an output width: any multiple of 64 runs, and the text model's width is the
+            // check (`Hparams::check_text_width`). The cases below are the widths it cannot run.
             (
-                clef().with("clip.vision.projection_dim", Value::U32(5120)),
-                "metadata clip.vision.projection_dim: is 5120;",
+                clef().with("clip.vision.projection_dim", Value::U32(4000)),
+                "metadata clip.vision.projection_dim: is 4000; the merger's output width is a GEMM tile count: it must be a positive multiple of 64",
+            ),
+            (
+                clef().with("clip.vision.projection_dim", Value::U32(0)),
+                "metadata clip.vision.projection_dim: is 0;",
+            ),
+            (
+                clef().with("clip.vision.projection_dim", Value::String("4096".into())),
+                "metadata clip.vision.projection_dim: is String(\"4096\"), not a count",
+            ),
+            (
+                clef().without("clip.vision.projection_dim"),
+                "metadata clip.vision.projection_dim: is absent",
             ),
             (
                 clef().with("clip.vision.image_size", Value::U32(448)),

@@ -4,7 +4,7 @@
 
 use super::IMAGE_TOKEN_ID;
 use super::grid::{GridParams, num_image_tokens, plan_image_grid};
-use crate::media::{MediaModel, Prepared};
+use crate::media::{MediaModel, PartJoin, Prepared};
 use crate::preprocess::{PatchLayout, Patches, patchify};
 use crate::resample::pad;
 use crate::{GridPlan, Rgb8, VisionError};
@@ -63,6 +63,10 @@ impl MediaModel for Media {
         PART_SEPARATOR
     }
 
+    fn part_join(&self) -> PartJoin {
+        PartJoin::Uniform(PART_SEPARATOR)
+    }
+
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
         let patches = preprocess(image, &self.grid)?;
         Ok(Prepared {
@@ -77,7 +81,7 @@ mod tests {
     use super::{IMAGE_PLACEHOLDER, Media, PAD_GREY, padded, preprocess, to_patches};
     use crate::arch::deepseek41v::grid::{GridParams, plan_image_grid};
     use crate::arch::deepseek41v::span::image_span;
-    use crate::media::MediaModel;
+    use crate::media::{MediaModel, PartJoin};
     use crate::preprocess::{PatchLayout, patchify};
     use crate::{GridPlan, Rgb8};
 
@@ -96,6 +100,7 @@ mod tests {
         assert_eq!(m.image_placeholder(), "<\u{FF5C}deepseek_image\u{FF5C}>");
         assert_eq!(m.image_token(), 129_264);
         assert_eq!(m.part_separator(), "\n\n");
+        assert_eq!(m.part_join(), PartJoin::Uniform("\n\n"));
     }
 
     /// A 448×448 image is scaled up to the 546×546 grid: 13×13 aligner tokens, 184 positions with

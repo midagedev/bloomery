@@ -104,6 +104,27 @@ pub(crate) fn counts<const N: usize>(
     Ok(out)
 }
 
+/// A count key that may hold any positive multiple of `unit`: the width a kernel's tile takes.
+/// `why` is the refusal's lead-in, ending where "a positive multiple of `unit`" continues it.
+pub(crate) fn count_multiple(
+    m: &impl Meta,
+    key: &str,
+    unit: u64,
+    why: &str,
+) -> Result<usize, VisionError> {
+    let v = need(m, key)?;
+    let got = v
+        .as_unsigned()
+        .ok_or_else(|| refusal(key, format!("is {v:?}, not a count")))?;
+    if got == 0 || !got.is_multiple_of(unit) {
+        return Err(refusal(
+            key,
+            format!("is {got}; {why} a positive multiple of {unit}"),
+        ));
+    }
+    usize::try_from(got).map_err(|_| refusal(key, format!("{got} does not fit usize")))
+}
+
 /// The layer-norm epsilon, an f32 key that must equal `want`; `source` names what uses it.
 pub(crate) fn check_eps(m: &impl Meta, want: f32, source: &str) -> Result<f32, VisionError> {
     let eps = need_f32(m, KEY_EPS)?;
@@ -149,7 +170,38 @@ pub(crate) mod testing {
         }
     }
 
+    /// A GGUF file of a table's keys that is deleted when dropped.
+    pub(crate) struct TempFile(pub(crate) std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     impl Table {
+        /// The table as a file with no tensor, under `general.architecture` `arch`.
+        pub(crate) fn write(&self, arch: &str) -> TempFile {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let mut kvs = vec![(
+                gguf::GENERAL_ARCHITECTURE.to_string(),
+                Value::String(arch.into()),
+            )];
+            kvs.extend(self.0.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+            let layout = gguf::write::Layout::new(&kvs, Vec::new()).expect("layout");
+            let path = std::env::temp_dir().join(format!(
+                "bloomery-vision-{}-{}.gguf",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let file = std::fs::File::create(&path).expect("create");
+            gguf::write::Writer::new(file, layout)
+                .and_then(gguf::write::Writer::finish)
+                .expect("write");
+            TempFile(path)
+        }
+
         /// The table with `key` set to `v`, added when absent.
         pub(crate) fn with(mut self, key: &'static str, v: Value) -> Table {
             match self.0.iter_mut().find(|(k, _)| *k == key) {
