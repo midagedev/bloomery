@@ -2,7 +2,10 @@
 # bloomery — the static tier on the Mac. `check` and `lint` run the `check` and `lint` recipes' own
 # box command (`tools/recipes.py box-command`: the recipe is the one owner of its flags) with
 # `--target x86_64-unknown-linux-gnu` after the cargo subcommand: a cross check that type-checks and
-# lints the Linux build and links no target code, so no x86_64 linker is needed. `fmt-check` runs
+# lints the Linux build and links no target code, so no x86_64 linker is needed. BLOOMERY_CHECK_TARGET
+# names another Linux triple for `check` and `combos` (aarch64-unknown-linux-gnu, a DGX Spark's, its
+# pieces in «How each piece is made» below); `lint` refuses it (64), since tools/lint-ratchet.txt counts
+# the x86_64 lint, and so does `combos --ledger`, whose keys do not carry the target. `fmt-check` runs
 # `fmt-check`'s command and `fmt` the same command without its `-- --check` (it writes the tree), both
 # with the pinned toolchain's rustfmt. `test` runs `cargo test -p <crate>` natively (no --target: the
 # host is aarch64-apple-darwin) for each pure crate, the list `tools/recipes.py pure-crates` derives
@@ -26,12 +29,13 @@
 # recipes.py prints only the shapes an input file of which changed since SPEC, or whose input key is
 # not green in the ledger, each combo line carrying its 64-hex key; a shape that checks green is
 # appended to the ledger as `<key>\tgreen\t<date>\t<tree>`, so the next run at the same inputs skips
-# it. The full `combos` (no flags) stays the lead's landing form. --ledger without --base is a named 64.
+# it. The full `combos` (no flags) stays the lead's landing form. --ledger without --base, or under another
+# BLOOMERY_CHECK_TARGET, is a named 64.
 #
 # Exit: cargo's own code (`test`: the first crate's that is not 0; `combos`: the first red shape's).
 # `lint` also ends 1 when its `^warning:` count (the box's ruler, one per target a warning appears in)
 # is above the ratchet, the one number in tools/lint-ratchet.txt. 64: a mode or a box command this
-# script does not run, a malformed `recipes.py combos` line, or not on macOS. 69: a prerequisite is missing (named, with how it is made), or the volume that holds target/ is below the disk floor (the `mac-check: disk:` line). 70: no ratchet in
+# script does not run, a malformed `recipes.py combos` line, not on macOS, or a BLOOMERY_CHECK_TARGET that is not a Linux triple or that lint or a combos ledger refuses. 69: a prerequisite is missing (named, with how it is made), or the volume that holds target/ is below the disk floor (the `mac-check: disk:` line). 70: no ratchet in
 # tools/lint-ratchet.txt (missing, or not exactly one number line), no pure crate to test, or no build shape (`combos`).
 #
 # The toolchain is this script's: the channel rust-toolchain.toml pins, at
@@ -43,6 +47,7 @@
 # repository, $HOME/opt/bloomery-mac-env.sh (a fake HOME moves it; the self-test does), which sets
 #   CUDA_TOOLKIT_PATH   a directory whose include/cuda.h bindgen reads (headers only)
 #   BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu   `--sysroot=<dir>` with <dir>/usr/include/stdlib.h
+#                       (under BLOOMERY_CHECK_TARGET, the variable of that triple, `-` written `_`)
 #   LIBCLANG_PATH       the directory of libclang.dylib
 # The build goes to the tree's own target/ (the workspace root's, as on the box), set here after the
 # env file: cargo's metadata hash of a workspace member leaves its absolute path out, so two trees in
@@ -64,9 +69,13 @@
 #   libclang   xcode-select --install             (/Library/Developer/CommandLineTools/usr/lib)
 #   env file   export CUDA_TOOLKIT_PATH=$HOME/opt/cuda-13.3 LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib
 #              export BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu="--sysroot=$HOME/opt/linux-sysroot -I$HOME/opt/linux-sysroot/usr/include/x86_64-linux-gnu"
+#   aarch64    for BLOOMERY_CHECK_TARGET=aarch64-unknown-linux-gnu: rustup target add --toolchain <channel>-<host> \
+#                aarch64-unknown-linux-gnu; an aarch64 Linux host's /usr/include under ~/opt/linux-sysroot-aarch64/usr;
+#              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--sysroot=$HOME/opt/linux-sysroot-aarch64 -I$HOME/opt/linux-sysroot-aarch64/usr/include/aarch64-linux-gnu"
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-TARGET=x86_64-unknown-linux-gnu
+BOX_TARGET=x86_64-unknown-linux-gnu # the box's triple, whose lint tools/lint-ratchet.txt counts
+TARGET=${BLOOMERY_CHECK_TARGET:-$BOX_TARGET}
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/, rounded up to a whole GiB
 
 say() { printf '%s\n' "$*" >&2; }
@@ -285,7 +294,7 @@ load_env() {
 # prereqs MODE TOOLCHAIN_BIN: every piece the mode needs, with the toolchain already first on PATH.
 # Each missing one is named with how it is made; the return is 69 when any is.
 prereqs() {
-  local mode=$1 tc=$2 miss=0 t got rlib sysroot
+  local mode=$1 tc=$2 miss=0 t got rlib sysroot how bindgen=BINDGEN_EXTRA_CLANG_ARGS_${TARGET//-/_}
   local tcname=${tc%/bin}
   tcname=${tcname##*/}
   if [ ! -x "$tc/cargo" ] || [ ! -x "$tc/rustc" ]; then
@@ -327,9 +336,11 @@ prereqs() {
     say "mac-check.sh: missing cuda.h under CUDA_TOOLKIT_PATH='${CUDA_TOOLKIT_PATH:-}': mkdir -p ~/opt/cuda-13.3 && rsync -a ws:/usr/local/cuda-13.3/include ~/opt/cuda-13.3/"
     miss=1
   fi
-  sysroot=$(printf '%s\n' "${BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu:-}" | tr ' ' '\n' | sed -n 's/^--sysroot=//p' | head -1)
+  sysroot=$(printf '%s\n' "${!bindgen:-}" | tr ' ' '\n' | sed -n 's/^--sysroot=//p' | head -1)
   if [ -z "$sysroot" ] || [ ! -f "$sysroot/usr/include/stdlib.h" ]; then
-    say "mac-check.sh: missing the Linux sysroot's usr/include/stdlib.h (--sysroot='$sysroot' in BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu): mkdir -p ~/opt/linux-sysroot/usr && rsync -a ws:/usr/include ~/opt/linux-sysroot/usr/"
+    how="mkdir -p ~/opt/linux-sysroot/usr && rsync -a ws:/usr/include ~/opt/linux-sysroot/usr/"
+    [ "$TARGET" = "$BOX_TARGET" ] || how="the /usr/include of a $TARGET host under <dir>/usr (the header's «How each piece is made»)"
+    say "mac-check.sh: missing the Linux sysroot's usr/include/stdlib.h (--sysroot='$sysroot' in $bindgen): $how"
     miss=1
   fi
   if [ -z "${LIBCLANG_PATH:-}" ] || [ ! -f "$LIBCLANG_PATH/libclang.dylib" ]; then
@@ -387,7 +398,9 @@ verdict() {
 }
 
 self_test() {
-  local fails=0 out t m cmd fake tc ch host a b tab why drc
+  # the cases are written for the default target, whatever BLOOMERY_CHECK_TARGET the caller exported
+  local fails=0 out t m cmd fake tc ch host a b tab why drc TARGET=$BOX_TARGET
+  unset BLOOMERY_CHECK_TARGET
   fail() { say "mac-check self-test FAIL: $*"; fails=$((fails + 1)); }
 
   # the derivation from the real justfile: each mode's recipe gives `cargo <verb> …`, the cross
@@ -641,6 +654,32 @@ EOF
   done
   mv "$fake/env.away" "$fake/opt/bloomery-mac-env.sh"
   mv "$fake/cuda.h.away" "$fake/opt/cuda-13.3/include/cuda.h"
+  # BLOOMERY_CHECK_TARGET: the sysroot comes from that triple's own variable; lint refuses it, since its
+  # ratchet counts the x86_64 lint, and so does a combos ledger, whose keys do not carry the target
+  a=aarch64-unknown-linux-gnu
+  mkdir -p "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$a/lib"
+  touch "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$a/lib/libstd-0.rlib"
+  out=$(TARGET=$a; unset BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu; probe check) && fail "check for $a passed with only the x86_64 sysroot variable" || {
+    [ $? = 69 ] || fail "check for $a without its sysroot variable ended with another rc: $out"
+    case $out in *"in BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu"*) ;; *) fail "check for $a does not name its sysroot variable: $out" ;; esac
+    case $out in *"of a $a host"*) ;; *) fail "check for $a gives the box's sysroot recipe: $out" ;; esac
+  }
+  echo 'export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--sysroot=$HOME/opt/linux-sysroot"' >> "$fake/opt/bloomery-mac-env.sh"
+  out=$(TARGET=$a; probe check) || fail "check for $a fails with its own sysroot variable: $out"
+  out=$(HOME=$fake BLOOMERY_CHECK_TARGET=$a "$HERE/tools/mac-check.sh" lint 2>&1) && fail "lint for $a passed" || {
+    [ $? = 64 ] || fail "lint for $a ended with another rc: $out"
+    case $out in *"lint-ratchet.txt"*) ;; *) fail "lint for $a does not name the ratchet: $out" ;; esac
+  }
+  out=$(HOME=$fake BLOOMERY_CHECK_TARGET=$a "$HERE/tools/mac-check.sh" combos --base HEAD --ledger "$fake/ledger" 2>&1) && fail "a combos ledger for $a passed" || {
+    [ $? = 64 ] || fail "a combos ledger for $a ended with another rc: $out"
+    case $out in *"does not carry the target"*) ;; *) fail "a combos ledger for $a does not say why: $out" ;; esac
+  }
+  for t in aarch64-apple-darwin "aarch64 unknown-linux-gnu" aarch64.unknown-linux-gnu; do
+    out=$(HOME=$fake BLOOMERY_CHECK_TARGET=$t "$HERE/tools/mac-check.sh" check 2>&1) && fail "BLOOMERY_CHECK_TARGET='$t' passed" || {
+      [ $? = 64 ] || fail "BLOOMERY_CHECK_TARGET='$t' ended with another rc: $out"
+      case $out in *"is not a Linux triple"*) ;; *) fail "BLOOMERY_CHECK_TARGET='$t' is not named: $out" ;; esac
+    }
+  done
   write_env /opt/other/rustc
   out=$(probe check) && fail "another RUSTC passed" || {
     case $out in *"RUSTC is /opt/other/rustc"*) ;; *) fail "another RUSTC is not named: $out" ;; esac
@@ -661,6 +700,11 @@ case ${1:-} in
   *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test|combos | --self-test"; exit 64 ;;
 esac
 MODE=$1
+[[ $TARGET =~ ^[a-z0-9_]+(-[a-z0-9_]+)*-linux-gnu$ ]] || { say "mac-check.sh: BLOOMERY_CHECK_TARGET='$TARGET' is not a Linux triple (<arch>-unknown-linux-gnu)"; exit 64; }
+if [ "$MODE" = lint ] && [ "$TARGET" != "$BOX_TARGET" ]; then
+  say "mac-check.sh: lint's ratchet (tools/lint-ratchet.txt) counts the $BOX_TARGET lint; BLOOMERY_CHECK_TARGET=$TARGET takes check or combos"
+  exit 64
+fi
 [ "$MODE" != combos ] || shift
 # combos' flag words are validated before the host check: the named refusals are pure logic and hold
 # on any host (the Linux host nightly runs the self-test, whose cases call this entry); the modes
@@ -675,6 +719,8 @@ if [ "$MODE" = combos ]; then
     esac
   done
   [ -z "$LEDGER" ] || [ -n "$BASE" ] || { say "mac-check.sh: --ledger reads the keys the --base form prints; give --base too"; exit 64; }
+  [ -z "$LEDGER" ] || [ "$TARGET" = "$BOX_TARGET" ] ||
+    { say "mac-check.sh: a ledger key does not carry the target, so a green x86_64 shape would skip its $TARGET check; BLOOMERY_CHECK_TARGET=$TARGET runs combos without --ledger"; exit 64; }
 fi
 HOST=$(host_triple "$(uname -s)" "$(uname -m)") || exit $?
 CHANNEL=$(channel) || exit $?

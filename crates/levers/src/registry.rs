@@ -1617,6 +1617,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          breaks.",
     ),
     runner(
+        "BLOOMERY_CHECK_TARGET",
+        Some("mac-check.sh"),
+        "Mac side: the Linux triple `tools/mac-check.sh`'s `check` and `combos` cross-check \
+         for, `x86_64-unknown-linux-gnu` when unset; its `lint` and a `combos` ledger refuse \
+         another.",
+    ),
+    runner(
         "BLOOMERY_CPU_BUSY_COMMS",
         Some("ref/lease.sh"),
         "The process names the lease's cpu guard counts as another tenant's work.",
