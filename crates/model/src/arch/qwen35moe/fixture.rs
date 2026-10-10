@@ -490,10 +490,10 @@ pub fn check_kinds(
             format!("{:?}, the source's {:?}", fx.variant, src.variant),
         ));
     }
-    if fx.n_layer != spec.layers.len() {
+    if fx.n_trunk != spec.layers.len() {
         return Err(bad(
             "layer count".into(),
-            format!("{}, not {}", fx.n_layer, spec.layers.len()),
+            format!("{}, not {}", fx.n_trunk, spec.layers.len()),
         ));
     }
     if fx.interval as u64 != FIXTURE_INTERVAL {
@@ -720,5 +720,44 @@ impl DraftRules for QwenMtp {
                 what: "the MTP draft".into(),
                 detail: e.to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FIXTURE_INTERVAL, check_kinds, spec};
+    use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+    use crate::arch::synthetic::{V, header_shaped};
+
+    /// The map's layers are the fixture's trunk: a fixture that declares a
+    /// next-token layer in its four blocks would read its last mapped layer
+    /// as unused, and is refused by the layer count.
+    #[test]
+    fn a_fixture_whose_trunk_is_not_the_map_is_refused() {
+        let mut spec = spec();
+        spec.layers = vec![0, 1, 2, 3];
+        let fixture_keys = |nextn: Option<u32>| {
+            let mut kv: Vec<(&str, V)> = keys()
+                .into_iter()
+                .filter(|(k, _)| *k != "full_attention_interval")
+                .collect();
+            kv.push(("full_attention_interval", V::U32(FIXTURE_INTERVAL as u32)));
+            kv.push(("attention.recurrent_layers", V::I32s(vec![1, 1, 1, 0])));
+            kv.extend(nextn.map(|n| ("nextn_predict_layers", V::U32(n))));
+            kv
+        };
+        let check = |tag: &str, nextn: Option<u32>| {
+            let source = header_shaped("qfx-src", "qwen4exp", &keys(), &[], &tensors());
+            let fixture = header_shaped(tag, "qwen4exp", &fixture_keys(nextn), &[], &tensors());
+            let src = gguf::Split::open(&source).expect("the synthetic header opens");
+            let fx = gguf::Split::open(&fixture).expect("the synthetic header opens");
+            let checked = check_kinds(&spec, &fx, &src);
+            let _ = std::fs::remove_file(&source);
+            let _ = std::fs::remove_file(&fixture);
+            checked
+        };
+        check("qfx-ok", None).expect("a fixture of the map's four layers");
+        let err = check("qfx-nextn", Some(1)).expect_err("its trunk is three layers");
+        assert!(err.to_string().contains("layer count: 3, not 4"), "{err}");
     }
 }

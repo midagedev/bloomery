@@ -4,7 +4,10 @@
 //! is qwen35moe's mixer and norm stems with a dense FFN's in place of the
 //! routed ones, and its file may carry a decision head's tensors, which are
 //! never loaded). A name the table does not hold fails the file with every
-//! such name listed.
+//! such name listed. A layer at or past the trunk (`nextn_predict_layers`
+//! next-token layers close the file) is never loaded: any of its variant's
+//! layer stems or next-token stems is [`Role::Unused`], and a trunk layer
+//! carrying a next-token stem is unclassified.
 
 use gguf::Split;
 
@@ -102,6 +105,38 @@ fn qwen4exp_role(stem: &str) -> Option<Role> {
     }
 }
 
+/// A next-token layer's own stems in every variant's file: the input join and
+/// its two norms, and the head's norm (ik's tensor tables,
+/// `src/llama-model.cpp:667-670` for qwen35moe, :699-702 for qwen35).
+const NEXTN: &[&str] = &[
+    "nextn.eh_proj.weight",
+    "nextn.enorm.weight",
+    "nextn.hnorm.weight",
+    "nextn.shared_head_norm.weight",
+];
+
+/// The gated-residual head a qwen4exp next-token layer carries beside
+/// [`NEXTN`] (`src/llama-model.cpp:549-555`).
+const NEXTN_HC: &[&str] = &[
+    "nextn.hc_head_norm.weight",
+    "nextn.hc_head_down.weight",
+    "nextn.hc_head_up.weight",
+];
+
+/// Whether `stem` is one of a next-token layer's own in `variant`'s file.
+fn nextn_stem(stem: &str, variant: Variant) -> bool {
+    NEXTN.contains(&stem) || (variant == Variant::Qwen4Exp && NEXTN_HC.contains(&stem))
+}
+
+/// The role of a trunk layer's `stem` in `variant`'s file.
+fn layer_role(stem: &str, variant: Variant) -> Option<Role> {
+    match variant {
+        Variant::Qwen35Moe => qwen35moe_role(stem),
+        Variant::Qwen35 => qwen35_role(stem),
+        Variant::Qwen4Exp => qwen4exp_role(stem),
+    }
+}
+
 /// Whether `name` is a tensor of the decision head a Clef-layout file
 /// (`clef`, llama.cpp) carries beside the trunk: the head's blocks, its
 /// `decision.*` tensors and its token types. `crates/decision` reads them; the
@@ -111,8 +146,9 @@ fn decision_head(name: &str) -> bool {
 }
 
 /// A tensor's role and layer by its name; `None` when the table does not
-/// hold it, or its layer is past `n_layer`. The PLE table has no layer in
-/// its name and belongs to the site's.
+/// hold it, its layer is past `n_layer`, or a trunk layer carries a
+/// next-token stem. The PLE table has no layer in its name and belongs to the
+/// site's.
 fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
     let exp = hp.variant == Variant::Qwen4Exp;
     if hp.variant == Variant::Qwen35 && decision_head(name) {
@@ -133,11 +169,11 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
     }
     let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
     let layer: usize = layer.parse().ok().filter(|&l| l < hp.n_layer)?;
-    let role = match hp.variant {
-        Variant::Qwen35Moe => qwen35moe_role(stem),
-        Variant::Qwen35 => qwen35_role(stem),
-        Variant::Qwen4Exp => qwen4exp_role(stem),
-    };
+    let role = layer_role(stem, hp.variant);
+    if layer >= hp.n_trunk {
+        return (role.is_some() || nextn_stem(stem, hp.variant))
+            .then_some((Role::Unused, Some(layer)));
+    }
     role.map(|r| (r, Some(layer)))
 }
 
@@ -155,7 +191,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
         split,
         |name| role(name, hp),
         Counts {
-            layers: hp.n_layer,
+            layers: hp.n_trunk,
             experts: hp.n_expert as u64,
             experts_used: hp.n_used as u64,
         },

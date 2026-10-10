@@ -13,7 +13,9 @@
 //! qwen4exp wraps every layer in gated-residual hyper-connections, selects an
 //! attention layer's positions by a mean-pool top-k, and adds a per-layer
 //! n-gram embedding (PLE) on one GDN layer. A qwen4exp MTP draft file is read
-//! against its target by `mtp`. The line numbers cited are
+//! against its target by `mtp`. A file that carries next-token layers after
+//! its trunk (`nextn_predict_layers`) reads the trunk and ignores them
+//! (`hparams`, `roles`). The line numbers cited are
 //! llama.cpp's `src/models/qwen35moe.cpp`, `src/models/qwen35.cpp`,
 //! `src/models/qwen4exp.cpp` and
 //! `src/llama-hparams.cpp` unless another file is named.

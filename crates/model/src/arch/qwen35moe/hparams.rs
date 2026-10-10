@@ -5,7 +5,10 @@
 //! with the line that sets it. The expert keys are read when a layer routes,
 //! the dense width when a layer is dense. The qwen4exp keys ([`Exp`]) are read
 //! for that variant only, and its tensors are checked against its layers'
-//! kinds ([`Hparams::read`]).
+//! kinds ([`Hparams::read`]). A file that carries next-token layers after its
+//! trunk (`nextn_predict_layers`) reads the trunk alone: every per-layer value
+//! below spans the trunk, and the next-token layers' tensors are never
+//! loaded (`roles`).
 
 use gguf::{Split, Value};
 
@@ -97,8 +100,8 @@ pub struct Exp {
     pub idx_dim: usize,
     /// `attention.indexer.top_k`: tokens kept, whole blocks of every ratio.
     pub idx_top_k: usize,
-    /// `attention.compress_ratios`, per layer: an attention layer's tokens per
-    /// pooled key, 0 on a GDN layer.
+    /// `attention.compress_ratios`, per trunk layer: an attention layer's
+    /// tokens per pooled key, 0 on a GDN layer.
     pub ratios: Vec<usize>,
     /// `None`: the file lists no PLE site.
     pub ple: Option<Ple>,
@@ -135,8 +138,12 @@ impl Ple {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {
     pub variant: Variant,
-    /// `block_count`.
+    /// `block_count`: the trunk's layers and the next-token layers after them.
     pub n_layer: usize,
+    /// `block_count` less `nextn_predict_layers` (absent: 0): the layers the
+    /// description runs. [`Hparams::kinds`], [`Hparams::ffns`] and
+    /// [`Exp::ratios`] hold one value per trunk layer.
+    pub n_trunk: usize,
     /// `embedding_length`.
     pub n_embd: usize,
     /// `attention.head_count`.
@@ -179,9 +186,9 @@ pub struct Hparams {
     pub k_heads: usize,
     /// `full_attention_interval`.
     pub interval: usize,
-    /// Every layer's kind, in order.
+    /// Every trunk layer's kind, in order.
     pub kinds: Vec<Kind>,
-    /// Every layer's feed-forward kind, in order.
+    /// Every trunk layer's feed-forward kind, in order.
     pub ffns: Vec<FfnKind>,
     /// `Some` for a qwen4exp file, `None` for a qwen35moe one.
     pub exp: Option<Exp>,
@@ -197,15 +204,7 @@ impl Hparams {
         let variant = qwen35moe_variant(split)?;
         let mut defaults = Vec::new();
         let n_layer = meta_usize(split, "block_count")?;
-        if let Some(n) = optional_usize(split, "nextn_predict_layers")?
-            && n > 0
-        {
-            return Err(metadata(
-                split,
-                "nextn_predict_layers",
-                format!("is {n}; this reader reads no next-token layer"),
-            ));
-        }
+        let n_trunk = trunk_layers(split, n_layer)?;
         let n_embd = meta_usize(split, "embedding_length")?;
         let n_head = meta_usize(split, "attention.head_count")?;
         let n_head_kv = match optional_usize(split, "attention.head_count_kv")? {
@@ -292,8 +291,8 @@ impl Hparams {
         if interval == 0 {
             return Err(metadata(split, "full_attention_interval", "is 0"));
         }
-        let kinds = kinds(split, n_layer, interval)?;
-        let ffns = ffn_kinds(split, n_layer, variant)?;
+        let kinds = kinds(split, n_trunk, n_layer, interval)?;
+        let ffns = ffn_kinds(split, n_trunk, variant)?;
         let (n_expert, n_used, expert_ff) = if ffns.contains(&FfnKind::Routed) {
             let n_expert = meta_usize(split, "expert_count")?;
             let n_used = meta_usize(split, "expert_used_count")?;
@@ -329,11 +328,12 @@ impl Hparams {
         let n_vocab = n_vocab(split)?;
         let exp = match variant {
             Variant::Qwen35Moe | Variant::Qwen35 => None,
-            Variant::Qwen4Exp => Some(exp(split, n_embd, n_vocab, &kinds, &mut defaults)?),
+            Variant::Qwen4Exp => Some(exp(split, n_embd, n_vocab, &kinds, n_layer, &mut defaults)?),
         };
         let hp = Hparams {
             variant,
             n_layer,
+            n_trunk,
             n_embd,
             n_head,
             n_head_kv,
@@ -407,16 +407,16 @@ fn dense_ff(split: &Split) -> Result<usize, PlacementError> {
     }
 }
 
-/// Every layer's feed-forward kind from its tensors — `ffn_gate_inp` routes,
-/// `ffn_gate` is dense, exactly one of the two — held to the kind `variant`'s
-/// builder asserts on every layer ([`Variant::ffn`]); the first layer that
-/// disagrees is refused by name.
+/// Every trunk layer's feed-forward kind from its tensors — `ffn_gate_inp`
+/// routes, `ffn_gate` is dense, exactly one of the two — held to the kind
+/// `variant`'s builder asserts on every layer ([`Variant::ffn`]); the first
+/// layer that disagrees is refused by name.
 fn ffn_kinds(
     split: &Split,
-    n_layer: usize,
+    n_trunk: usize,
     variant: Variant,
 ) -> Result<Vec<FfnKind>, PlacementError> {
-    (0..n_layer)
+    (0..n_trunk)
         .map(|l| {
             let router = format!("blk.{l}.ffn_gate_inp.weight");
             let gate = format!("blk.{l}.ffn_gate.weight");
@@ -452,12 +452,14 @@ fn ffn_kinds(
 }
 
 /// The qwen4exp keys (qwen4exp.cpp:26-147), each required where that loader
-/// requires it, cross-checked with the layers' `kinds`.
+/// requires it, cross-checked with the trunk layers' `kinds` (`n_layer`: the
+/// file's, for the per-layer arrays that may cover its next-token layers).
 fn exp(
     split: &Split,
     n_embd: usize,
     n_vocab: usize,
     kinds: &[Kind],
+    n_layer: usize,
     defaults: &mut Vec<String>,
 ) -> Result<Exp, PlacementError> {
     let hc_streams = meta_usize(split, "hyper_connection.count")?;
@@ -484,7 +486,7 @@ fn exp(
     let idx_heads = positive(split, "attention.indexer.head_count")?;
     let idx_dim = positive(split, "attention.indexer.key_length")?;
     let idx_top_k = positive(split, "attention.indexer.top_k")?;
-    let ratios = ratios(split, kinds, idx_top_k)?;
+    let ratios = ratios(split, kinds, n_layer, idx_top_k)?;
     let ple = ple(split, n_embd, n_vocab, kinds, defaults)?;
     Ok(Exp {
         hc_streams,
@@ -497,16 +499,26 @@ fn exp(
     })
 }
 
-/// `attention.compress_ratios`, required as a per-layer array: above 0 on an
-/// attention layer (its pool), 0 on a GDN layer, and dividing `top_k`.
-fn ratios(split: &Split, kinds: &[Kind], top_k: usize) -> Result<Vec<usize>, PlacementError> {
+/// `attention.compress_ratios`, required as a per-layer array of the trunk's
+/// or the file's layers ([`covers_trunk`]): above 0 on an attention layer (its
+/// pool), 0 on a GDN layer, and dividing `top_k`.
+fn ratios(
+    split: &Split,
+    kinds: &[Kind],
+    n_layer: usize,
+    top_k: usize,
+) -> Result<Vec<usize>, PlacementError> {
     let key = "attention.compress_ratios";
     let items = meta_arr(split, key)?;
-    if items.len() != kinds.len() {
+    if !covers_trunk(items.len(), kinds.len(), n_layer) {
         return Err(metadata(
             split,
             key,
-            format!("has {} values for {} layers", items.len(), kinds.len()),
+            format!(
+                "has {} values for {}",
+                items.len(),
+                layers_text(kinds.len(), n_layer)
+            ),
         ));
     }
     items
@@ -843,23 +855,36 @@ pub(super) fn sections(split: &Split) -> Result<[u32; 4], PlacementError> {
     Ok(out)
 }
 
-/// Every layer's kind from its tensors, cross-checked with the key that also
-/// says it: `attention.recurrent_layers` when the file carries it, else every
-/// `interval`-th layer attends (qwen35moe.cpp:18-26).
-fn kinds(split: &Split, n_layer: usize, interval: usize) -> Result<Vec<Kind>, PlacementError> {
+/// Every trunk layer's kind from its tensors, cross-checked with the key that
+/// also says it: `attention.recurrent_layers` when the file carries it (an
+/// array of the trunk's or the file's layers, [`covers_trunk`]), else every
+/// `interval`-th layer attends (qwen35moe.cpp:18-26). A next-token layer is an
+/// attention layer whatever the interval says (`src/llama-hparams.cpp`
+/// :736-739 for qwen4exp, :837-843 for qwen35moe) and is no trunk layer.
+fn kinds(
+    split: &Split,
+    n_trunk: usize,
+    n_layer: usize,
+    interval: usize,
+) -> Result<Vec<Kind>, PlacementError> {
     let recurrent = match split.arch_get_arr("attention.recurrent_layers") {
         None => None,
         Some(items) => {
-            if items.len() != n_layer {
+            if !covers_trunk(items.len(), n_trunk, n_layer) {
                 return Err(metadata(
                     split,
                     "attention.recurrent_layers",
-                    format!("has {} values for {n_layer} layers", items.len()),
+                    format!(
+                        "has {} values for {}",
+                        items.len(),
+                        layers_text(n_trunk, n_layer)
+                    ),
                 ));
             }
             Some(
                 items
                     .iter()
+                    .take(n_trunk)
                     .enumerate()
                     .map(|(l, v)| {
                         v.as_bool()
@@ -876,7 +901,7 @@ fn kinds(split: &Split, n_layer: usize, interval: usize) -> Result<Vec<Kind>, Pl
             )
         }
     };
-    (0..n_layer)
+    (0..n_trunk)
         .map(|l| {
             let qkv = format!("blk.{l}.attn_qkv.weight");
             let q = format!("blk.{l}.attn_q.weight");
@@ -912,6 +937,39 @@ fn kinds(split: &Split, n_layer: usize, interval: usize) -> Result<Vec<Kind>, Pl
         .collect()
 }
 
+/// The layers the description runs: `block_count` less
+/// `nextn_predict_layers`, absent as 0. A count that leaves no trunk layer is
+/// refused by name, as qwen4exp's loader refuses it
+/// (`src/llama-hparams.cpp:726-728`).
+fn trunk_layers(split: &Split, n_layer: usize) -> Result<usize, PlacementError> {
+    match optional_usize(split, "nextn_predict_layers")? {
+        Some(n) if n > 0 && n >= n_layer => Err(metadata(
+            split,
+            "nextn_predict_layers",
+            format!("is {n} for {n_layer} layers; the trunk keeps at least one"),
+        )),
+        Some(n) => Ok(n_layer - n),
+        None => Ok(n_layer),
+    }
+}
+
+/// Whether a per-layer array of `len` values covers the trunk: one value per
+/// layer of the file, next-token layers last (the trunk's are the first
+/// `n_trunk`), or one per trunk layer.
+fn covers_trunk(len: usize, n_trunk: usize, n_layer: usize) -> bool {
+    len == n_trunk || len == n_layer
+}
+
+/// What a per-layer array that [`covers_trunk`] has values for, as a refusal
+/// names it.
+fn layers_text(n_trunk: usize, n_layer: usize) -> String {
+    if n_layer == n_trunk {
+        format!("{n_trunk} layers")
+    } else {
+        format!("{n_trunk} trunk layers or the file's {n_layer}")
+    }
+}
+
 /// `<architecture>.<suffix>` as a count, `None` when absent.
 fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, PlacementError> {
     match split.value(&split.arch_key(suffix)) {
@@ -945,6 +1003,8 @@ pub(super) mod tests {
         NORM_STEMS, PLE_STEMS, Ple, Variant,
     };
     use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::{coverage, qwen35moe::roles};
+    use crate::placement::Role;
 
     /// Four layers: three GDN (1 the PLE site), then attention.
     const KINDS: [Kind; 4] = [
@@ -1185,18 +1245,7 @@ pub(super) mod tests {
     /// hyper-connection tensor fails as unclassified, named.
     #[test]
     fn a_qwen35moe_file_with_a_qwen4exp_stem_is_unclassified() {
-        let kv: Vec<(&str, V)> = keys()
-            .into_iter()
-            .filter(|(k, _)| {
-                !k.starts_with("hyper_connection.")
-                    && !k.starts_with("attention.indexer.")
-                    && !k.starts_with("ple.")
-                    && !matches!(
-                        *k,
-                        "attention.compress_ratios" | "embedding_length_per_layer_input"
-                    )
-            })
-            .collect();
+        let kv = qwen35moe_keys();
         let mut t: Vec<(String, Vec<u64>)> =
             ["token_embd.weight", "output_norm.weight", "output.weight"]
                 .iter()
@@ -1223,21 +1272,29 @@ pub(super) mod tests {
         );
     }
 
-    /// The qwen35 keys: qwen35moe's trunk keys, no expert key, and the dense
-    /// width.
-    fn qwen35_keys() -> Vec<(&'static str, V)> {
+    /// The qwen35moe keys: [`keys`] without qwen4exp's hyper-connection,
+    /// indexer, PLE and compress-ratio keys.
+    fn qwen35moe_keys() -> Vec<(&'static str, V)> {
         keys()
             .into_iter()
             .filter(|(k, _)| {
                 !k.starts_with("hyper_connection.")
                     && !k.starts_with("attention.indexer.")
                     && !k.starts_with("ple.")
-                    && !k.starts_with("expert_")
                     && !matches!(
                         *k,
                         "attention.compress_ratios" | "embedding_length_per_layer_input"
                     )
             })
+            .collect()
+    }
+
+    /// The qwen35 keys: qwen35moe's trunk keys, no expert key, and the dense
+    /// width.
+    fn qwen35_keys() -> Vec<(&'static str, V)> {
+        qwen35moe_keys()
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("expert_"))
             .chain([("feed_forward_length", V::U32(48))])
             .collect()
     }
@@ -1424,5 +1481,347 @@ pub(super) mod tests {
         let err =
             read("clef-other", "clef2", &qwen35_keys(), &qwen35_tensors()).expect_err("refused");
         assert!(err.contains("clef2") && err.contains("\"clef\""), "{err}");
+    }
+
+    /// `kv` with `key` set to `v` (added when `kv` has none).
+    fn set(mut kv: Vec<(&'static str, V)>, key: &'static str, v: V) -> Vec<(&'static str, V)> {
+        kv.retain(|(k, _)| *k != key);
+        kv.push((key, v));
+        kv
+    }
+
+    /// `kv` of a file of `KINDS.len() + 1` layers whose last is a next-token
+    /// layer.
+    fn with_next_token_layer(kv: Vec<(&'static str, V)>) -> Vec<(&'static str, V)> {
+        set(
+            set(kv, "block_count", V::U32(KINDS.len() as u32 + 1)),
+            "nextn_predict_layers",
+            V::U32(1),
+        )
+    }
+
+    /// A qwen35moe file's trunk: the model's tensors and, per layer of
+    /// [`KINDS`], its mixer's marker and its router (`attn_q` writes the 4
+    /// heads' 16 values and the gate beside them).
+    fn qwen35moe_tensors() -> Vec<(String, Vec<u64>)> {
+        let mut t: Vec<(String, Vec<u64>)> =
+            ["token_embd.weight", "output_norm.weight", "output.weight"]
+                .iter()
+                .map(|n| ((*n).to_string(), vec![1]))
+                .collect();
+        for (l, kind) in KINDS.iter().enumerate() {
+            t.push(match kind {
+                Kind::DeltaRule => (format!("blk.{l}.attn_qkv.weight"), vec![1]),
+                Kind::Attention => (format!("blk.{l}.attn_q.weight"), vec![64, 128]),
+            });
+            t.push((format!("blk.{l}.ffn_gate_inp.weight"), vec![1]));
+        }
+        t
+    }
+
+    /// The tensors of a qwen35moe next-token layer `l`: what unsloth's and
+    /// bartowski's Qwen3.6 files carry on their last block — an attention
+    /// layer whatever the interval says, with the layer's own four stems.
+    fn qwen35moe_next_token_layer(l: usize) -> Vec<(String, Vec<u64>)> {
+        const STEMS: [&str; 20] = [
+            "attn_norm.weight",
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+            "post_attention_norm.weight",
+            "ffn_gate_inp.weight",
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+            "ffn_gate_inp_shexp.weight",
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+            "nextn.eh_proj.weight",
+            "nextn.enorm.weight",
+            "nextn.hnorm.weight",
+            "nextn.shared_head_norm.weight",
+        ];
+        STEMS
+            .iter()
+            .map(|s| (format!("blk.{l}.{s}"), vec![1]))
+            .collect()
+    }
+
+    /// The tensors of a qwen4exp next-token layer `l`: an attention layer's
+    /// stems, the layer stems every qwen4exp layer has, and the seven
+    /// next-token stems of ik's table (antirez's Qwen3.8 file carries six of
+    /// them, the gated-residual head's three among them).
+    fn qwen4exp_next_token_layer(l: usize) -> Vec<(String, Vec<u64>)> {
+        const NEXTN: [&str; 7] = [
+            "nextn.eh_proj.weight",
+            "nextn.enorm.weight",
+            "nextn.hnorm.weight",
+            "nextn.shared_head_norm.weight",
+            "nextn.hc_head_norm.weight",
+            "nextn.hc_head_down.weight",
+            "nextn.hc_head_up.weight",
+        ];
+        ATTN_STEMS
+            .iter()
+            .chain(EXP_LAYER_STEMS)
+            .chain(&NEXTN)
+            .map(|s| (format!("blk.{l}.{s}"), vec![1]))
+            .collect()
+    }
+
+    /// The description of a header of `kv` and `tensors`, or its error's text.
+    fn described(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> Result<crate::arch::Read, String> {
+        let path = header_shaped(
+            tag,
+            arch,
+            kv,
+            &[("tokenizer.ggml.pre", V::Str("qwen35"))],
+            tensors,
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = crate::arch::spec(&split).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&path);
+        read
+    }
+
+    /// A qwen35moe file whose last block is a next-token layer reads its
+    /// trunk: `n_trunk` is the block count less the layer, the layer's
+    /// tensors are `Unused`, and the description and the coverage list are the
+    /// file's without the layer. Layer 4 carries `attn_q` where the interval
+    /// 4 says a delta layer, so a read of the layer as a trunk layer is
+    /// refused by its kind.
+    #[test]
+    fn a_qwen35moe_next_token_layer_reads_as_unused() {
+        let without = described(
+            "q35n-base",
+            "qwen35moe",
+            &qwen35moe_keys(),
+            &qwen35moe_tensors(),
+        )
+        .expect("the file without the layer reads");
+        let kv = with_next_token_layer(qwen35moe_keys());
+        let mut t = qwen35moe_tensors();
+        t.extend(qwen35moe_next_token_layer(4));
+        let hp = read("q35n-hp", "qwen35moe", &kv, &t).expect("the header reads");
+        assert_eq!((hp.n_layer, hp.n_trunk), (5, 4));
+        assert_eq!(hp.kinds, KINDS);
+        assert_eq!(hp.ffns, [FfnKind::Routed; 4]);
+        let with = described("q35n-spec", "qwen35moe", &kv, &t).expect("the description reads");
+        assert_eq!(with.spec, without.spec, "the layer is no layer of the spec");
+        assert_eq!(with.spec.layers.len(), 4);
+        assert_eq!(with.tensors.layers, 4);
+        assert_eq!(with.defaults, without.defaults);
+        let rows = &with.tensors.tensors;
+        let last: Vec<_> = rows.iter().filter(|r| r.layer == Some(4)).collect();
+        assert_eq!(last.len(), 20, "every tensor of the layer is a row");
+        assert!(last.iter().all(|r| r.role == Role::Unused), "{last:?}");
+        assert!(
+            rows.iter()
+                .filter(|r| r.layer.is_some_and(|l| l < 4))
+                .all(|r| r.role != Role::Unused),
+            "a trunk row is never unused"
+        );
+        assert_eq!(
+            coverage::check(&with.spec, &with.tensors),
+            coverage::check(&without.spec, &without.tensors),
+            "the layer adds no item to the coverage list"
+        );
+    }
+
+    /// The same for qwen4exp, whose ratio array covers the file's layers (the
+    /// layer's own entry is not read) and whose layer carries the
+    /// gated-residual head's stems beside the others.
+    #[test]
+    fn a_qwen4exp_next_token_layer_reads_as_unused() {
+        let kv = set(
+            with_next_token_layer(keys()),
+            "attention.compress_ratios",
+            V::I32s(vec![0, 0, 0, 4, 7]),
+        );
+        let mut t = tensors();
+        t.extend(qwen4exp_next_token_layer(4));
+        let path = header_shaped("q4x-nextn", "qwen4exp", &kv, &[], &t);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let hp = Hparams::read(&split).expect("the header reads");
+        let model = roles::classify(&split, &hp).expect("every tensor has a role");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((hp.n_layer, hp.n_trunk), (5, 4));
+        assert_eq!(hp.kinds, KINDS);
+        let exp = hp.exp.expect("the qwen4exp keys");
+        assert_eq!(exp.ratios, [0, 0, 0, 4]);
+        assert!(exp.ple.is_some_and(|p| p.layer == 1));
+        assert_eq!(hp.defaults.len(), 3, "{:?}", hp.defaults);
+        assert_eq!(model.layers, 4);
+        let last: Vec<_> = model
+            .tensors
+            .iter()
+            .filter(|r| r.layer == Some(4))
+            .collect();
+        assert_eq!(last.len(), ATTN_STEMS.len() + EXP_LAYER_STEMS.len() + 7);
+        assert!(last.iter().all(|r| r.role == Role::Unused), "{last:?}");
+        let table = model
+            .tensors
+            .iter()
+            .find(|r| r.name == "per_layer_token_embd.weight")
+            .expect("the PLE table");
+        assert_eq!((table.role, table.layer), (Role::EngramTable, Some(1)));
+    }
+
+    /// A per-layer array covers the trunk or the file: the next-token layer's
+    /// own value is not read, and any other length is refused with both
+    /// counts (the plain count when the file has no such layer).
+    #[test]
+    fn a_per_layer_array_covers_the_trunk_or_the_file() {
+        let mut t = qwen35moe_tensors();
+        t.extend(qwen35moe_next_token_layer(4));
+        let recurrent = |v: Vec<i32>| {
+            set(
+                with_next_token_layer(qwen35moe_keys()),
+                "attention.recurrent_layers",
+                V::I32s(v),
+            )
+        };
+        for (tag, v) in [
+            ("q35n-r5", vec![1, 1, 1, 0, -1]),
+            ("q35n-r4", vec![1, 1, 1, 0]),
+        ] {
+            let hp = read(tag, "qwen35moe", &recurrent(v), &t).expect("the header reads");
+            assert_eq!(hp.kinds, KINDS, "{tag}");
+        }
+        let err = read("q35n-r3", "qwen35moe", &recurrent(vec![1, 1, 1]), &t)
+            .expect_err("three values cover neither");
+        assert!(
+            err.contains(
+                "qwen35moe.attention.recurrent_layers: has 3 values for 4 trunk layers or the file's 5"
+            ),
+            "{err}"
+        );
+        let kv = set(
+            qwen35moe_keys(),
+            "attention.recurrent_layers",
+            V::I32s(vec![1, 1, 1]),
+        );
+        let err = read("q35n-r3p", "qwen35moe", &kv, &qwen35moe_tensors())
+            .expect_err("three values for four layers");
+        assert!(
+            err.contains("qwen35moe.attention.recurrent_layers: has 3 values for 4 layers"),
+            "{err}"
+        );
+        let mut t = tensors();
+        t.extend(qwen4exp_next_token_layer(4));
+        let ratios = |v: Vec<i32>| {
+            set(
+                with_next_token_layer(keys()),
+                "attention.compress_ratios",
+                V::I32s(v),
+            )
+        };
+        for (tag, v) in [
+            ("q4x-c5", vec![0, 0, 0, 4, 0]),
+            ("q4x-c4", vec![0, 0, 0, 4]),
+        ] {
+            let hp = read(tag, "qwen4exp", &ratios(v), &t).expect("the header reads");
+            assert_eq!(hp.exp.map(|e| e.ratios), Some(vec![0, 0, 0, 4]), "{tag}");
+        }
+        let err = read("q4x-c3", "qwen4exp", &ratios(vec![0, 0, 0]), &t)
+            .expect_err("three values cover neither");
+        assert!(
+            err.contains(
+                "qwen4exp.attention.compress_ratios: has 3 values for 4 trunk layers or the file's 5"
+            ),
+            "{err}"
+        );
+    }
+
+    /// A next-token count the trunk cannot lose is refused by name: the whole
+    /// file, or more.
+    #[test]
+    fn next_token_layers_covering_the_file_are_refused() {
+        for n in [4u32, 5] {
+            let kv = set(qwen35moe_keys(), "nextn_predict_layers", V::U32(n));
+            let err = read("q35n-all", "qwen35moe", &kv, &qwen35moe_tensors())
+                .expect_err("no trunk layer is left");
+            assert!(
+                err.contains(&format!(
+                    "qwen35moe.nextn_predict_layers: is {n} for 4 layers; the trunk keeps at least one"
+                )),
+                "{err}"
+            );
+            let kv = set(keys(), "nextn_predict_layers", V::U32(n));
+            let err =
+                read("q4x-all", "qwen4exp", &kv, &tensors()).expect_err("no trunk layer is left");
+            assert!(
+                err.contains(&format!(
+                    "qwen4exp.nextn_predict_layers: is {n} for 4 layers; the trunk keeps at least one"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// A next-token stem is the next-token layer's alone: on a trunk layer, or
+    /// in a file with no such layer, it is unclassified by name, as is a
+    /// stem of the other variant and one ik's tables for these architectures
+    /// do not hold (`embed_tokens`, `shared_head_head`).
+    #[test]
+    fn a_next_token_stem_off_the_next_token_layer_is_refused() {
+        let refused = |tag: &str,
+                       kv: &[(&str, V)],
+                       mut t: Vec<(String, Vec<u64>)>,
+                       extra: &[&str],
+                       want: &str| {
+            t.extend(extra.iter().map(|n| ((*n).to_string(), vec![1])));
+            let err = described(tag, "qwen35moe", kv, &t).expect_err("the stem has no role");
+            assert!(err.contains(want), "want {want:?} in: {err}");
+        };
+        let with_layer = || {
+            let mut t = qwen35moe_tensors();
+            t.extend(qwen35moe_next_token_layer(4));
+            t
+        };
+        refused(
+            "q35n-trunk",
+            &with_next_token_layer(qwen35moe_keys()),
+            with_layer(),
+            &["blk.1.nextn.eh_proj.weight"],
+            "1 tensors have no role: blk.1.nextn.eh_proj.weight",
+        );
+        refused(
+            "q35n-other",
+            &with_next_token_layer(qwen35moe_keys()),
+            with_layer(),
+            &[
+                "blk.4.nextn.hc_head_norm.weight",
+                "blk.4.hc_attn_norm.weight",
+            ],
+            "2 tensors have no role: blk.4.nextn.hc_head_norm.weight, blk.4.hc_attn_norm.weight",
+        );
+        refused(
+            "q35n-head",
+            &with_next_token_layer(qwen35moe_keys()),
+            with_layer(),
+            &[
+                "blk.4.nextn.embed_tokens.weight",
+                "blk.4.nextn.shared_head_head.weight",
+            ],
+            "2 tensors have no role: blk.4.nextn.embed_tokens.weight, blk.4.nextn.shared_head_head.weight",
+        );
+        // No next-token count: the stem sits on the last of four trunk layers.
+        refused(
+            "q35n-none",
+            &qwen35moe_keys(),
+            qwen35moe_tensors(),
+            &["blk.3.nextn.enorm.weight"],
+            "1 tensors have no role: blk.3.nextn.enorm.weight",
+        );
     }
 }
