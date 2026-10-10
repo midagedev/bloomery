@@ -11,7 +11,7 @@ request, never landing evidence: the maintainers' box record still decides (`AGE
 
 - **Pure crates:** `python3 tools/recipes.py pure-crates` derives the list (today `bloomery-decision`, `-hf`, `-jinja`,
   `-levers`, `-models`, `-placement`, `-refset`, `-runtime`, `-sampler`, `-serve`, `-tokenizer`, `-vision`);
-  `just mac-test` runs `cargo test -p` on each natively on a Mac (`tools/mac-check.sh:1-12`).
+  `just mac-test` runs `cargo test -p` on each natively on a Mac (`tools/mac-check.sh:1-15`).
 - **The Mac static tier:** `just mac-static [BASE]` runs fmt-check, clippy as an x86_64-linux cross check, the scoped
   build shapes (`recipes.py combos`) and every `tools/check-*.sh` in two lanes (`tools/mac-static.sh:1-15`).
 - **The host tier, x86_64 Linux, no card, no model file:** `python3 tools/recipes.py host-nightly` prints one unit a
@@ -47,7 +47,7 @@ ran and what was skipped and why (`T2 skipped: no nvidia-smi`). It writes `targe
 unit's log and a `report.txt` that opens with the commit, `uname -a`, the CPU model, RAM, the toolchain, and the card,
 driver and `--version` when there is one: the block a pull request pastes. Exit: 0 every unit that ran is green, 1 a
 unit failed, 64 usage, 69 a prerequisite is missing or a tier named by `--require` could not run (the code
-`tools/mac-check.sh:31-35` uses for a missing prerequisite; 75 stays contention, which a retry is for: the standing rule
+`tools/mac-check.sh:35-39` uses for a missing prerequisite; 75 stays contention, which a retry is for: the standing rule
 is `AGENTS.md`'s rc 75, so a missing card must not use it). An opt-in
 `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, as `NIGHTLY_INJECT_FAIL` does (`run.sh:33`), so the red path
 is shown to fail first. aarch64 Linux runs T0 only until the host compiles there (`docs/contrib/dgx-spark.md`).

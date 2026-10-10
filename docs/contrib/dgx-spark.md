@@ -14,7 +14,7 @@ citations here are re-read. Related: [`new-model.md`](new-model.md) (the other c
 
 | Round (memo name) | What | In the tree today |
 |---|---|---|
-| `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | not done: `crates/qdot/src/lib.rs:44` is an unconditional `use std::arch::x86_64::*;` |
+| `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
 | `sparkprep` S2: per-triple `extra-rustflags` | fork patch | not done: `.cargo/cuda-oxide.toml:5` is a flat list; ledger row 32 (`docs/upstream/nvlabs-ledger.md:42`) is open and the fork still reads a flat `Vec` (`cargo-oxide/src/commands/context.rs:19,311` at fork rev `4da6c13`) |
 | `sparkprep` S3 / `archkey`: one owner of `--arch` | 136 recipe lines | not done: `grep -c -- '--arch sm_86' justfile` is 136, plus `tools/gate.sh:35` |
 | `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | not done: `tools/ref/cards.sh:31-35` names two cards |
@@ -263,7 +263,7 @@ must exist before a contributor can start; "contributor" is what the Spark's own
 
 | Phase | Done when | Files | Size | Who |
 |---|---|---|---|---|
-| **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux (on a Spark, or the cross check of 3.1 from any machine), then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; and on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | `crates/qdot/src/lib.rs`, `crates/model/src/arch/deepseek2/attn.rs`, `crates/model/src/ops.rs:5529`, `markov-accept.rs`, the two test files; `tools/mac-check.sh` triple; a local `.cargo/cuda-oxide.toml` | M | **Contributor** writes it. **Maintainers first**: decide Q1 (R or S) and answer Q5; **maintainers after**: run the x86 landing batch on the PR (the box is the only x86 judge) |
+| **P0** compiles on aarch64 (done, [#14](https://github.com/midagedev/bloomery/pull/14)) | `cargo check` of the host chain passes on aarch64 Linux (on a Spark, or the cross check of 3.1 from any machine), then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; and on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | `crates/qdot/src/lib.rs`, `crates/model/src/arch/deepseek2/attn.rs`, `crates/model/src/ops.rs:5529`, `markov-accept.rs`, the two test files; `tools/mac-check.sh` triple; a local `.cargo/cuda-oxide.toml` | M | **Contributor** writes it. **Maintainers first**: decide Q1 (R or S) and answer Q5; **maintainers after**: run the x86 landing batch on the PR (the box is the only x86 judge) |
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | `crates/qdot/src/lib.rs` (design S), `gpu-gate.sh`, `box.sh`, `lease*.sh`, `cards.sh` (3.4); the spin sites if a red points there | L | **Maintainers first**: local runner mode (M), reference sets and fixture recipe published (S–M, box time already exists), the contributor gate list (Q4), the fixture path rule (Q2). **Contributor**: run, triage, fix Arm-only defects; leaves `gate-ptx-spill` out |
 | **P2** a real model runs | Clef-Flash, then Qwen3-30B-A3B and Qwen3.6-35B-A3B, answer from `bloomery-serve` on the Spark; a placement unit gate holds Σ card + host ≤ pool | `crates/placement/src/placement.rs` (a pool field), `workstation.rs` (a Spark instance, `ROW_PAGE`), `crates/gpu/src/lib.rs:1974-2000` (free bytes from `MemAvailable` on a unified machine) | M | **Contributor** (`bloomery-placement` is a pure crate: the invariant is testable off the box); **maintainers first**: agree the `MachineSpec { unified }` shape (memo M4) and the golden to compare against (Q6) |
 | **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `--arch sm_121` rows | `justfile` + `tools/gate.sh` arch owner (S3), `ptx-shapes.tsv` per-arch rows, the fork's per-triple key (S2), `crates/threads` P/E split, NEON `qdot` kernels only for models above the pool, `timing-card.sh` single-card mode | L | **Maintainers**: `archkey` and S2 (they touch every recipe and the fork pin). **Contributor**: the measurement, the table, the NEON work if the NVMe tier matters |
@@ -293,7 +293,8 @@ before any Spark run.
 
 ## 6. Not verified
 
-Compile on aarch64 (nothing was built; the Mac's toolchain has no aarch64-linux std); the ISA beyond Armv9.2-A (NEON, SVE2,
+The aarch64 build of P0 is the contributor's record on a DGX Spark ([#14](https://github.com/midagedev/bloomery/pull/14));
+the maintainers' checks of it ran on x86_64. Beyond it: the ISA beyond Armv9.2-A (NEON, SVE2,
 dot-product, i8mm); a 13.3 aarch64 toolkit and LLVM 21 `sm_121`; PTX 8.7 JIT on the R580 driver for cc 12.1; DGX OS page
 size; `nvidia-smi` fields on GB10; `cuMemGetInfo`/`MemAvailable` readings on a booted Spark; sysfs `cache/index3` on GB10;
 host-tier protocol correctness on Arm; whether `fixture generate` needs only a source header; fixture fill determinism on
