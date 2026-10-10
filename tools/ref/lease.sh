@@ -22,6 +22,7 @@
 #   share, so a load group's engine between its arms is not read as a co-tenant;
 #   the bound on every process a runner starts under the lease (lease_bounded);
 #   the card every lease needs (tools/ref/card.py, at lease_take below): no card, no lease;
+#   the lease's trace (lease_trace_take, lease_trace_let_go): who took the lease and when it was free;
 #   the witness block: its four header forms and every field a runner can list, each spelled once;
 #   the CPU-contention guard between arms (guard_cpu), the CPU side of timing-card.sh's guard_other;
 #   the two arm helpers the depth and A/B runners share: the LCG prompt of a depth and the
@@ -271,6 +272,117 @@ lease_gpu_idle() {
     done
   done
 }
+# The lease's trace: one line per event in a file that outlives every runner, so a sitting can be
+# read back with its owner, card and pid. /var/log/netdata-lease-gate.log stays the timing source
+# (take and free at 0.5-2 s); this file adds who. The file is BLOOMERY_LEASE_TRACE, else
+# /root/bloomery-sittings.log under the machine lease; under any other lock file (the stub tests) no
+# trace is written unless BLOOMERY_LEASE_TRACE names one. A line that cannot be written is one named
+# `[lease] trace not written` line on stderr and the lease goes on, as the timing-card record does.
+#   take    lease_take, once the lease is held: its id (<epoch>.<pid>), the runner, the owner (the
+#           tree's directory), the queue job when BLOOMERY_Q_JOB is set, the timing card(s), the card file
+#   free    when the lease file turns free: a detached waiter probes it every 0.5 s (never a blocking
+#           shared flock, which would fail the next take's `flock -n` for the probe's ms), so a runner
+#           that died with a child holding descriptor 9 is still paired; held_s runs from the take to
+#           the probe
+#   free ... by=next-take   written by the next take when the last take has no free: the waiter died,
+#           or it had not probed yet when the lease was free for less than a probe interval between
+#           two takes; held_s is an upper bound
+#   let_go  tools/ref/lease-hold.sh's exit: its descriptor is closed, the lease may be held on by
+#           what the command left running (still_held=1; `?` when the probe could not tell)
+LEASE_TRACE_ID=
+LEASE_TRACE_FILE=
+# __lease_trace_file: the trace's path for this lease, or nothing.
+__lease_trace_file() {
+  if [ -n "${BLOOMERY_LEASE_TRACE:-}" ]; then
+    printf '%s' "$BLOOMERY_LEASE_TRACE"
+  elif [ "$LEASE_LOCK" = /root/bloomery-cpu.lock ]; then
+    printf '%s' /root/bloomery-sittings.log
+  fi
+}
+# __lease_trace_header: the lines that open a new trace file.
+__lease_trace_header() {
+  cat << 'EOF'
+# The machine lease's trace (tools/ref/lease.sh). /var/log/netdata-lease-gate.log stays the timing source
+# (take and free at 0.5-2 s); this file adds the owner, the card and the pid.
+# <utc> take id=<epoch>.<pid> epoch=<s> pid=<runner pid> owner=<tree> [job=<queue job>] runner=<script> timing_gpu=<uuid[,uuid]|none> card_file=<card>
+# <utc> free id=<id> epoch=<s> held_s=<s> by=waiter|next-take   (next-take: no waiter line came first, the waiter died or the lease was free for less than one 0.5 s probe; held_s is an upper bound)
+# <utc> let_go id=<id> still_held=0|1|?   (tools/ref/lease-hold.sh exited; the lease may be held on by what it left running)
+EOF
+}
+# __lease_trace_write <file> <lines>: the lines appended in one write; one named line on stderr and 1
+# when the write fails.
+__lease_trace_write() {
+  local err
+  if err=$({ printf '%s' "$2" >> "$1"; } 2>&1); then return 0; fi
+  echo "[lease] trace not written: ${err##*: } ($1); the lease goes on" >&2
+  return 1
+}
+# __lease_trace_waiter <lease file> <trace file> <id> <take epoch>: runs detached (lease_trace_take):
+# probes the lease file every 0.5 s and, when it is free, appends the `free` line of <id>, unless the
+# next take already closed it (a probe can miss a short gap between two runs of a sitting). It ends
+# without a line on a lease file it cannot test 20 probes in a row: the next take pairs the line.
+__lease_trace_waiter() {
+  local rc bad=0 e
+  while :; do
+    rc=0
+    flock -s -n -E 75 "$1" true 2> /dev/null || rc=$?
+    case $rc in
+      0) break ;;
+      75) bad=0 ;;
+      *)
+        bad=$((bad + 1))
+        [ "$bad" -lt 20 ] || return 1
+        ;;
+    esac
+    sleep 0.5
+  done
+  e=$(date +%s)
+  ! grep -q " free id=$3 " "$2" 2> /dev/null || return 0
+  printf '%s free id=%s epoch=%s held_s=%s by=waiter\n' "$(now)" "$3" "$e" "$((e - $4))" >> "$2" 2> /dev/null
+}
+# lease_trace_take: the take's line, after the lease is held; the previous take's `free` first when it
+# has none. Starts the waiter. Sets LEASE_TRACE_ID and LEASE_TRACE_FILE (empty when nothing was written).
+lease_trace_take() {
+  local f epoch id last lid lt payload line gpu
+  LEASE_TRACE_ID='' LEASE_TRACE_FILE=''
+  f=$(__lease_trace_file)
+  [ -n "$f" ] || return 0
+  epoch=$(date +%s)
+  id=$epoch.$$
+  gpu=${TIMING_GPU:-none}${TIMING_GPU2:+,$TIMING_GPU2}
+  payload=''
+  if [ -e "$f" ]; then
+    last=$(grep -E '^[^#].* take id=' "$f" 2> /dev/null | tail -n 1) || true
+    if [ -n "$last" ]; then
+      lid=${last#* take id=}
+      lid=${lid%% *}
+      if ! grep -q " free id=$lid " "$f" 2> /dev/null; then
+        lt=${lid%%.*}
+        case $lt in '' | *[!0-9]*) lt=$epoch ;; esac
+        payload="$(now) free id=$lid epoch=$epoch held_s=$((epoch - lt)) by=next-take"$'\n'
+      fi
+    fi
+  else
+    payload=$(__lease_trace_header)$'\n'
+  fi
+  line="$(now) take id=$id epoch=$epoch pid=$$ owner=${LEASE_TREE##*/}${BLOOMERY_Q_JOB:+ job=$BLOOMERY_Q_JOB} runner=${0##*/} timing_gpu=$gpu card_file=${BLOOMERY_LEASE_CARD:--}"
+  __lease_trace_write "$f" "$payload${line:0:399}"$'\n' || return 0
+  LEASE_TRACE_ID=$id LEASE_TRACE_FILE=$f
+  if ! command -v setsid > /dev/null 2>&1; then
+    echo "[lease] trace waiter not started: setsid is not on PATH, so the free line is left to the next take" >&2
+    return 0
+  fi
+  # Detached: a subshell that exits at once, so no `wait` of the runner meets it; its own session; no
+  # descriptor 9, or it would hold the lease it waits for; no stdin, stdout or stderr, or an ssh
+  # session never ends; its directory is /, so it pins no track's directory while it waits.
+  (setsid bash -c "$(declare -f now __lease_trace_waiter)"$'\n''cd / && __lease_trace_waiter "$@"' _ "$LEASE_LOCK" "$f" "$id" "$epoch" 9>&- < /dev/null > /dev/null 2>&1 &)
+}
+# lease_trace_let_go <0|1|?>: lease-hold.sh's `let_go` line for the lease this process took.
+lease_trace_let_go() {
+  [ -n "$LEASE_TRACE_ID" ] || return 0
+  __lease_trace_write "$LEASE_TRACE_FILE" "$(now) let_go id=$LEASE_TRACE_ID still_held=$1"$'\n' || true
+}
+
 lease_take() {
   if [ -n "${BLOOMERY_LEASE_HELD:-}" ]; then
     echo "[lease] refused: this run is inside tools/ref/lease-hold.sh (pid $BLOOMERY_LEASE_HELD), which holds the lease; a second lease would wait on it" >&2
@@ -315,6 +427,7 @@ lease_take() {
   # cards in the two-card mode, the A6000 first), `none` for one that times no GPU.
   { printf 'pid=%s timing_gpu=%s\n' "$$" "${TIMING_GPU:-none}${TIMING_GPU2:+,$TIMING_GPU2}" > "$LEASE_LOCK.card.$$" && mv -f "$LEASE_LOCK.card.$$" "$LEASE_LOCK.card"; } ||
     echo "[lease] the timing-card record $LEASE_LOCK.card was not written: forced GPU gates refuse (75) while this lease is held" >&2
+  lease_trace_take
   echo "[lease] held by pid $$ at $(now)"
   lease_netdata
 }
@@ -727,7 +840,8 @@ decode_bin() { echo "$HOME/repo/$1/$DECODE_BIN"; }
 # first on PATH in a temp dir (the made-up UUIDs the stub tests use, never the box's), with no
 # card, no lock and no /proc — the holder lines name a pid that does not resolve. The waits scale
 # to seconds (LEASE_GPU_POLL/REPORT/WAIT of 1/1/2), and the four lease_gpu_idle cases sleep 4 s
-# between them. just check-recipes runs this on the Mac.
+# between them; the trace cases (a temp lease and trace, no /root) follow. just check-recipes runs this
+# on the Mac.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   fails=0
   check() {
@@ -850,6 +964,117 @@ EOF
   unset LEASE_OWNER_PID BLOOMERY_LEASE_PROC
   exec 9>&-
   # ---- end lease_pid_is_ours ----
+  # ---- the trace ----
+  # Real flock(1) and setsid(1) where the machine has them (the box); on the Mac the flock stand-in
+  # of tools/ref/card-tests/bin and a setsid that only execs (a runner is never taken on the Mac, so
+  # the session it starts is not what the cases read). The lease is a temp file, never the machine's.
+  mkdir "$t/tbin"
+  command -v flock > /dev/null 2>&1 || ln -s "$LEASE_TREE/tools/ref/card-tests/bin/flock" "$t/tbin/flock"
+  command -v setsid > /dev/null 2>&1 || printf '#!/bin/sh\nexec "$@"\n' > "$t/tbin/setsid"
+  chmod +x "$t/tbin/"* 2> /dev/null || true
+  PATH="$t/tbin:$PATH"
+  if ! command -v flock > /dev/null 2>&1; then
+    echo "skip trace: no flock(1) and no tools/ref/card-tests/bin/flock stand-in"
+  else
+    unset BLOOMERY_LEASE_TRACE BLOOMERY_Q_JOB TIMING_GPU TIMING_GPU2
+    LEASE_LOCK=$t/tlock
+    # trace_free_wait <trace> <id>: the `free` line of <id> within 2 s, else the empty string.
+    trace_free_wait() {
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        grep " free id=$2 " "$1" 2> /dev/null && return 0
+        sleep 0.1
+      done
+      return 0
+    }
+    # A take in a subshell that holds descriptor 9 as a runner does, and ends: its output in OUT.
+    trace_take() {
+      OUT=$(exec 9>"$LEASE_LOCK" && flock -n 9 && lease_trace_take 2>&1; echo "id=$LEASE_TRACE_ID")
+    }
+    BLOOMERY_LEASE_TRACE=$t/trace1.log BLOOMERY_LEASE_CARD=docs/cards/x.card
+    export BLOOMERY_LEASE_TRACE BLOOMERY_LEASE_CARD
+    trace_take
+    id=${OUT##*id=}
+    tlines=$(grep -vc '^#' "$t/trace1.log")
+    check trace-take-one-line "$tlines" 1
+    matches trace-header '^# The machine lease.s trace' "$(head -n 1 "$t/trace1.log")"
+    take=$(grep ' take id=' "$t/trace1.log")
+    matches trace-take-fields "^[0-9T:Z-]+ take id=$id epoch=[0-9]+ pid=$$ owner=${LEASE_TREE##*/} runner=lease.sh timing_gpu=none card_file=docs/cards/x.card\$" "$take"
+    check trace-take-size "$([ "${#take}" -le 400 ] && echo le400 || echo "${#take}")" le400
+    # The waiter: the runner (the subshell above) is gone, the lease file turns free, the pair closes.
+    free=$(trace_free_wait "$t/trace1.log" "$id")
+    matches trace-free-by-waiter "^[0-9T:Z-]+ free id=$id epoch=[0-9]+ held_s=[0-9]+ by=waiter\$" "$free"
+    # The waiter holds no descriptor 9: the lease is free right after the runner exits, not when the
+    # waiter does (it lives until it has probed and written; a held lease here is its descriptor).
+    (exec 9>"$t/tlock2" && flock -n 9 && LEASE_LOCK=$t/tlock2 lease_trace_take)
+    RC=0
+    lease_free "$t/tlock2" 2> /dev/null || RC=$?
+    check trace-waiter-frees-lease "$RC" 0
+    # A take whose runner took a queue job and two cards names them.
+    BLOOMERY_LEASE_TRACE=$t/trace2.log BLOOMERY_Q_JOB=q42 TIMING_GPU=GPU-a TIMING_GPU2=GPU-b
+    export BLOOMERY_LEASE_TRACE BLOOMERY_Q_JOB TIMING_GPU TIMING_GPU2
+    trace_take
+    id=${OUT##*id=}
+    matches trace-take-job-cards " take id=$id .* owner=${LEASE_TREE##*/} job=q42 runner=lease.sh timing_gpu=GPU-a,GPU-b card_file=" "$(cat "$t/trace2.log")"
+    trace_free_wait "$t/trace2.log" "$id" > /dev/null
+    unset BLOOMERY_Q_JOB TIMING_GPU TIMING_GPU2
+    # An unpaired take (its waiter died) is closed by the next take, before that take's own line.
+    BLOOMERY_LEASE_TRACE=$t/trace3.log
+    export BLOOMERY_LEASE_TRACE
+    printf '# header\n2000-01-01T00:00:00Z take id=100.7 epoch=100 pid=7 owner=x runner=r timing_gpu=none card_file=-\n' > "$t/trace3.log"
+    trace_take
+    id=${OUT##*id=}
+    trace_free_wait "$t/trace3.log" "$id" > /dev/null
+    order=$(grep -v '^#' "$t/trace3.log" | awk '{print $2 " " $3}' | tr '\n' ',')
+    check trace-next-take-order "$order" "take id=100.7,free id=100.7,take id=$id,free id=$id,"
+    matches trace-next-take-line '^[0-9T:Z-]+ free id=100\.7 epoch=[0-9]+ held_s=[0-9]+ by=next-take$' "$(cat "$t/trace3.log")"
+    # A waiter that finds its `free` already written (the next take closed it) adds none.
+    printf '2000-01-01T00:00:00Z free id=100.7 epoch=200 held_s=100 by=next-take\n' >> "$t/trace3.log"
+    __lease_trace_waiter "$t/tlock4" "$t/trace3.log" 100.7 100
+    check trace-waiter-no-duplicate "$(grep -c ' free id=100.7 ' "$t/trace3.log")" 2
+    # A write that fails: one named line, the take goes on (rc 0, no id, no waiter).
+    BLOOMERY_LEASE_TRACE=$t/no-such-dir/trace.log
+    export BLOOMERY_LEASE_TRACE
+    RC=0
+    (exec 9>"$t/tlock3" && flock -n 9 && lease_trace_take 2> "$t/err" && echo "id=[$LEASE_TRACE_ID]" > "$t/out") || RC=$?
+    check trace-write-fail-rc "$RC" 0
+    matches trace-write-fail-line '^\[lease\] trace not written: .*No such file or directory \(.*/no-such-dir/trace.log\); the lease goes on$' "$(cat "$t/err")"
+    check trace-write-fail-no-id "$(cat "$t/out")" 'id=[]'
+    # No trace file and a lock that is not the machine's: nothing written, nothing named.
+    unset BLOOMERY_LEASE_TRACE
+    check trace-file-other-lock "$(__lease_trace_file)" ''
+    check trace-file-machine-lock "$(LEASE_LOCK=/root/bloomery-cpu.lock __lease_trace_file)" /root/bloomery-sittings.log
+    # let_go: the line of the id this process took; none when nothing was written.
+    LEASE_TRACE_ID=9.9 LEASE_TRACE_FILE=$t/trace4.log
+    lease_trace_let_go 1
+    matches trace-let-go '^[0-9T:Z-]+ let_go id=9\.9 still_held=1$' "$(cat "$t/trace4.log")"
+    LEASE_TRACE_ID='' LEASE_TRACE_FILE=$t/trace5.log
+    lease_trace_let_go 0
+    check trace-let-go-none "$([ -e "$t/trace5.log" ] && echo written || echo none)" none
+    # lease_take and lease-hold.sh write them. The machine's own lease refuses a lock override
+    # (lease_take, exit 64), so these two take a lock of their own only where there is no machine lease.
+    if [ -e /root/bloomery-cpu.lock ]; then
+      echo "skip trace wiring: /root/bloomery-cpu.lock exists, a lease_take under another lock is refused; these two cases run off the box"
+    else
+      wenv=(env -u BLOOMERY_LEASE_HELD -u ROUNDS -u BLOOMERY_AB_ROUNDS BLOOMERY_LEASE_CARD=docs/cards/selftest-lease-hold.card
+        BLOOMERY_LEASE_LOCK="$t/wlock" BLOOMERY_LEASE_TRACE="$t/wtrace.log")
+      OUT=$("${wenv[@]}" bash -c 'source "$1" && lease_take 2>&1' _ "$LEASE_TREE/tools/ref/lease.sh")
+      id=$(grep -v '^#' "$t/wtrace.log" | grep ' take id=' | sed 's/.* take id=\([^ ]*\) .*/\1/')
+      matches wiring-take-card "^[0-9T:Z-]+ take id=[0-9]+\.[0-9]+ .* card_file=docs/cards/selftest-lease-hold\.card\$" "$(cat "$t/wtrace.log")"
+      matches wiring-free-by-waiter " free id=$id .* by=waiter\$" "$(trace_free_wait "$t/wtrace.log" "$id")"
+      # The runner's name is built, not written: tools/gate-batch.sh's script walk follows a script a
+      # file names, and tools/check-recipes.sh, which runs this self-test, must not read as a taker.
+      hold=lease-hold
+      OUT=$("${wenv[@]}" BLOOMERY_LEASE_LOCK="$t/hlock" BLOOMERY_LEASE_TRACE="$t/htrace.log" "$LEASE_TREE/tools/ref/$hold.sh" --card docs/cards/selftest-lease-hold.card -- true 2>&1)
+      id=$(grep -v '^#' "$t/htrace.log" | grep ' take id=' | sed 's/.* take id=\([^ ]*\) .*/\1/')
+      trace_free_wait "$t/htrace.log" "$id" > /dev/null
+      # let_go and the waiter's free race by a few ms: the set of kinds, not their order.
+      check wiring-hold-kinds "$(grep -v '^#' "$t/htrace.log" | awk '{print $2}' | sort | tr '\n' ,)" free,let_go,take,
+      matches wiring-hold-let-go " let_go id=$id still_held=0\$" "$(cat "$t/htrace.log")"
+    fi
+    unset BLOOMERY_LEASE_TRACE BLOOMERY_LEASE_CARD
+  fi
+  # ---- end the trace ----
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]
   exit

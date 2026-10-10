@@ -54,10 +54,16 @@ export BLOOMERY_LEASE_CARD=$card
 WITNESS=(head-epoch indent loadavg pressure-cpu pressure-io meminfo pgmajfault gpu-apps busiest lock-holder)
 lease_take
 # The release line says whether the lease is free: a process the command left running still holds it.
+# The trace (lease.sh) gets the same answer as a `let_go` line; its `free` line is the waiter's.
 trap 'lease_release; lease_hold_released' EXIT
 lease_hold_released() {
   local rc=0
   lease_free || rc=$?
+  case $rc in
+    0) lease_trace_let_go 0 ;;
+    1) lease_trace_let_go 1 ;;
+    *) lease_trace_let_go '?' ;;
+  esac
   case $rc in
     0) echo "[lease] released at $(now)" ;;
     1)
