@@ -1,7 +1,7 @@
 //! The server's media part, the same for every model: a message's image parts, the checks an image
 //! file passes before it is decoded, its cache key, and the expansion of each image's placeholder
 //! token into the image's span. What a model contributes is a [`MediaModel`] (`crates/vision`):
-//! the placeholder text and its token, the separator between flattened parts, and one prepare.
+//! the placeholder text and its token, how flattened parts join ([`PartJoin`]), and one prepare.
 //!
 //! What a prompt, a slot or a cached state holds is a [`Held`]: the ids and the spans of the
 //! images among them. [`common_prefix`] reads both, so two prompts that differ only in their
@@ -20,6 +20,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub use vision::media::PartJoin;
 pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
 
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
@@ -37,7 +38,7 @@ pub enum Part<'a> {
 /// A message's content array flattened for the chat template.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Flat<'a> {
-    /// The parts in order, joined by the model's separator, each image as the model's placeholder.
+    /// The parts in order, joined by the model's [`PartJoin`], each image as the model's placeholder.
     pub text: String,
     /// The images' URLs, in the order of their placeholders in `text`.
     pub images: Vec<&'a str>,
@@ -337,7 +338,9 @@ pub fn parse_part(part: &Value) -> Result<Part<'_>, MediaError> {
 }
 
 /// A message's content array as the chat template's text: text parts as they are, each image as
-/// the model's placeholder, joined by the model's separator. Only a `user` message carries images:
+/// the model's placeholder, joined by the model's [`PartJoin`]: the same separator between every
+/// two parts, or llama-server's rule (a `\n` before a text part unless it is the first text or
+/// follows a placeholder, and none around a placeholder). Only a `user` message carries images:
 /// the template may move other roles' text (V4.1's gathers system messages first), and the i-th
 /// placeholder of the prompt must be the i-th image.
 pub fn flatten<'a>(
@@ -345,25 +348,33 @@ pub fn flatten<'a>(
     parts: &'a [Value],
     model: &dyn MediaModel,
 ) -> Result<Flat<'a>, MediaError> {
-    let mut texts = Vec::with_capacity(parts.len());
+    let join = model.part_join();
+    let mut text = String::new();
     let mut images = Vec::new();
-    for part in parts {
-        match parse_part(part)? {
-            Part::Text(text) => {
-                check_text(text, model)?;
-                texts.push(text);
+    let mut after_image = false;
+    for (i, part) in parts.iter().enumerate() {
+        let (piece, is_image) = match parse_part(part)? {
+            Part::Text(t) => {
+                check_text(t, model)?;
+                (t, false)
             }
             Part::Image(_) if role != "user" => return Err(MediaError::ImageRole(short(role))),
             Part::Image(url) => {
-                texts.push(model.image_placeholder());
                 images.push(url);
+                (model.image_placeholder(), true)
             }
+        };
+        match join {
+            PartJoin::Uniform(sep) if i > 0 => text.push_str(sep),
+            PartJoin::LlamaServer if !is_image && !after_image && !text.is_empty() => {
+                text.push('\n');
+            }
+            _ => {}
         }
+        text.push_str(piece);
+        after_image = is_image;
     }
-    Ok(Flat {
-        text: texts.join(model.part_separator()),
-        images,
-    })
+    Ok(Flat { text, images })
 }
 
 /// Refuse message text that carries the model's image placeholder: only an image part makes one.
@@ -609,9 +620,9 @@ mod tests {
     use vision::{GridPlan, Patches};
 
     use super::{
-        Expanded, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Part, Prepared,
-        Rgb8, VisionError, common_prefix, expand_prompt, expand_spans, flatten, keep_whole_spans,
-        load, parse_part, prepare,
+        Expanded, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Part, PartJoin,
+        Prepared, Rgb8, VisionError, common_prefix, expand_prompt, expand_spans, flatten,
+        keep_whole_spans, load, parse_part, prepare,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -619,10 +630,10 @@ mod tests {
     /// Its sha256 (hashlib).
     const PNG_SHA256: &str = "29f48d50a7db2b049176bebb2523c066f97d61b7aac0ee54d826f916bd22ccb6";
 
-    /// A model of data only: a placeholder, its token, a separator, and a prepare that gives one
+    /// A model of data only: a placeholder, its token, a join rule, and a prepare that gives one
     /// span position per pixel.
     struct Stub {
-        separator: Option<&'static str>,
+        join: PartJoin,
     }
 
     impl MediaModel for Stub {
@@ -634,8 +645,8 @@ mod tests {
             7
         }
 
-        fn part_separator(&self) -> &str {
-            self.separator.unwrap_or("\n")
+        fn part_join(&self) -> PartJoin {
+            self.join
         }
 
         fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
@@ -658,7 +669,12 @@ mod tests {
         }
     }
 
-    const PLAIN: Stub = Stub { separator: None };
+    const PLAIN: Stub = Stub {
+        join: PartJoin::Uniform("\n"),
+    };
+    const LLAMA: Stub = Stub {
+        join: PartJoin::LlamaServer,
+    };
 
     fn data(mime: &str, b64: &str) -> String {
         format!("data:{mime};base64,{b64}")
@@ -752,7 +768,7 @@ mod tests {
         assert_eq!(flat.text, "look\n<img>\nand\n<img>");
         assert_eq!(flat.images, ["data:a", "data:b"]);
         let wide = Stub {
-            separator: Some("\n\n"),
+            join: PartJoin::Uniform("\n\n"),
         };
         assert_eq!(
             flatten("user", &parts, &wide).unwrap().text,
@@ -764,6 +780,118 @@ mod tests {
         ];
         let flat = flatten("system", &text_only, &PLAIN).unwrap();
         assert_eq!((flat.text.as_str(), flat.images.len()), ("a\nb", 0));
+    }
+
+    /// llama-server's join rule edge by edge (`concat_content_parts` in `common/chat.cpp`): a `\n`
+    /// before a text part once any text has been written and the part before it is not a
+    /// placeholder, none before or after a placeholder; an empty text part writes nothing but is
+    /// still text.
+    #[test]
+    fn flatten_follows_llama_servers_rule() {
+        let part = |p: &str| match p {
+            "<img>" => json!({"type": "image_url", "image_url": "data:a"}),
+            t => json!({"type": "text", "text": t}),
+        };
+        for (parts, want) in [
+            (vec!["a", "b"], "a\nb"),
+            (vec!["a", "<img>", "b"], "a<img>b"),
+            (vec!["<img>", "a", "b"], "<img>a\nb"),
+            (vec!["a", "b", "<img>"], "a\nb<img>"),
+            (vec!["<img>", "<img>"], "<img><img>"),
+            (vec!["a", "<img>", "<img>", "b"], "a<img><img>b"),
+            (vec!["", "b"], "b"),
+            (vec!["a", "", "b"], "a\n\nb"),
+            (vec!["a", "<img>", "", "b"], "a<img>\nb"),
+            (vec!["<img>", "", "b"], "<img>\nb"),
+        ] {
+            let json: Vec<Value> = parts.iter().map(|p| part(p)).collect();
+            let flat = flatten("user", &json, &LLAMA).unwrap();
+            assert_eq!(flat.text, want, "{parts:?}");
+            let n = parts.iter().filter(|&&p| p == "<img>").count();
+            assert_eq!(flat.images.len(), n, "{parts:?}");
+        }
+    }
+
+    /// A toy template and tokenizer for the hand cases: a message is `role:content;`, the stub's
+    /// placeholder is its token 7, every other character is its own code.
+    fn chat(messages: &[(&str, Value)], model: &Stub) -> (String, Vec<u32>, Vec<String>) {
+        let (mut text, mut urls) = (String::new(), Vec::new());
+        for (role, content) in messages {
+            let body = match content {
+                Value::String(t) => t.clone(),
+                Value::Array(parts) => {
+                    let flat = flatten(role, parts, model).unwrap();
+                    urls.extend(flat.images.iter().map(|u| (*u).to_owned()));
+                    flat.text
+                }
+                other => panic!("{other}"),
+            };
+            text.push_str(&format!("{role}:{body};"));
+        }
+        (text.clone(), tokens(&text), urls)
+    }
+
+    fn tokens(text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (i, chunk) in text.split("<img>").enumerate() {
+            if i > 0 {
+                out.push(7);
+            }
+            out.extend(chunk.chars().map(|c| c as u32));
+        }
+        out
+    }
+
+    /// J1: the prompts of llama-server's chat path, by hand. A chat is flattened by the model's
+    /// join rule, rendered, tokenized and expanded: the ids are the text's ids with each placeholder
+    /// replaced by its image's span (the PNG is 2 by 1, a span of 2).
+    #[test]
+    fn j1_flatten_then_expand_on_hand_cases() {
+        let png = data("image/png", PNG_B64);
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let text = |t: &str| json!({"type": "text", "text": t});
+        let cases: [(Vec<(&str, Value)>, &str); 3] = [
+            (
+                vec![("user", json!([text("look"), image(&png), text("and")]))],
+                "user:look<img>and;",
+            ),
+            (
+                vec![
+                    ("system", json!([text("You are brief.")])),
+                    ("user", json!([image(&png)])),
+                ],
+                "system:You are brief.;user:<img>;",
+            ),
+            (
+                vec![
+                    ("user", json!([image(&png), text("what is it?")])),
+                    ("assistant", json!("a cat")),
+                    ("user", json!([text("and this"), image(&png)])),
+                ],
+                "user:<img>what is it?;assistant:a cat;user:and this<img>;",
+            ),
+        ];
+        for (messages, want) in cases {
+            let (rendered, ids, urls) = chat(&messages, &LLAMA);
+            assert_eq!(rendered, want);
+            let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+            let p = expand_prompt(&ids, &urls, &LLAMA).unwrap();
+            let mut expect = Vec::new();
+            for (i, chunk) in want.split("<img>").enumerate() {
+                if i > 0 {
+                    expect.extend([7, 7]);
+                }
+                expect.extend(chunk.chars().map(|c| c as u32));
+            }
+            assert_eq!(p.held.ids, expect, "{want}");
+            assert_eq!(p.feeds.len(), want.matches("<img>").count(), "{want}");
+        }
+        // The same chats under a uniform join differ where a part follows a part.
+        let (rendered, _, _) = chat(
+            &[("user", json!([text("look"), image(&png), text("and")]))],
+            &PLAIN,
+        );
+        assert_eq!(rendered, "user:look\n<img>\nand;");
     }
 
     #[test]
