@@ -593,8 +593,11 @@ mod qsa_kernels {
         }
     }
 
-    /// The score pass: block `b` takes pools `[32b, 32b + 32)` for every row
-    /// `t < m` that is [`scored`] and sees that tile complete. Warp `w` is
+    /// The score pass: block `b` is pool tile `b % tiles` of row group `b /
+    /// tiles` (`tiles = ⌈pools/32⌉`, a group [`MAX_ROWS`] rows, so a launch of
+    /// `m` rows has `tiles · ⌈m/8⌉` blocks): it takes pools `[32·tile, 32·tile
+    /// + 32)` for every row of its group that is [`scored`] and sees that tile
+    /// complete. A row's work does not depend on its group. Warp `w` is
     /// indexer head `w`. First every row's query heads are normed by `gain`
     /// and turned by the table's row `c − 1` into shared memory (block 0
     /// writes them to `q_out`, `[m][HEADS][DIM]`; a refused count's heads are
@@ -607,7 +610,6 @@ mod qsa_kernels {
         domain = 1,
         block = (128, 1, 1),
         requires = (
-            m <= 8,
             n_keys.len() >= m,
             q.len() >= m * 512,
             gain.len() >= 128,
@@ -645,19 +647,26 @@ mod qsa_kernels {
         static mut KS: SharedArray<u32, { POOL_TILE * K_STRIDE }> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { HEADS * POOL_TILE }> = SharedArray::UNINIT;
 
-        let b = thread::blockIdx_x() as usize;
+        // Block `blk` is pool tile `blk % tiles` of row group `blk / tiles`:
+        // rows `rbase ..` (at most MAX_ROWS) of the launch's `m`.
+        let tiles = (pools as usize).div_ceil(POOL_TILE);
+        let b = thread::blockIdx_x() as usize % tiles;
+        let rbase = thread::blockIdx_x() as usize / tiles * MAX_ROWS;
+        if rbase >= m as usize {
+            return; // block-uniform
+        }
         let tid = thread::threadIdx_x() as usize;
         let w = tid / 32;
         let lane = warp::lane_id() as usize;
-        let rows = m as usize;
+        let rows = (m as usize - rbase).min(MAX_ROWS);
         let p0 = b * POOL_TILE;
         // The largest complete pool count among the rows this tile serves;
         // the same in every thread.
         let mut live_max = 0usize;
         let mut t = 0usize;
         while t < rows {
-            // SAFETY: t < m <= n_keys.len() by the launch contract.
-            let c = unsafe { *n_keys.get_unchecked(t) };
+            // SAFETY: rbase + t < m <= n_keys.len() by the launch contract.
+            let c = unsafe { *n_keys.get_unchecked(rbase + t) };
             if scored(c, ctx, kept) {
                 live_max = live_max.max(c as usize / POOL);
             }
@@ -689,15 +698,16 @@ mod qsa_kernels {
         }
         let mut t = 0usize;
         while t < rows {
-            // SAFETY: t < m <= n_keys.len().
-            let c = unsafe { *n_keys.get_unchecked(t) };
+            // SAFETY: rbase + t < m <= n_keys.len().
+            let c = unsafe { *n_keys.get_unchecked(rbase + t) };
             let base = (t * HEADS + w) * DIM;
+            let gbase = ((rbase + t) * HEADS + w) * DIM;
             let y = if c >= 1 && c <= ctx {
                 let mut x = [0.0f32; 4];
                 for i in 0..4 {
                     thread::__unroll_config::<0>();
-                    // SAFETY: base + d[i] < m·HEADS·DIM <= q.len().
-                    x[i] = unsafe { *q.get_unchecked(base + d[i]) };
+                    // SAFETY: gbase + d[i] < m·HEADS·DIM <= q.len().
+                    x[i] = unsafe { *q.get_unchecked(gbase + d[i]) };
                 }
                 let p = c as usize - 1;
                 // SAFETY: p < ctx and 2·lane + 1 < ROT: inside the table.
@@ -716,9 +726,9 @@ mod qsa_kernels {
                 // SAFETY: base + d[i] < MAX_ROWS·HEADS·DIM; this lane's own.
                 unsafe { *qs.add(base + d[i]) = y[i] };
                 if b == 0 {
-                    // SAFETY: base + d[i] < m·HEADS·DIM <= q_out.len();
-                    // block 0 alone writes it, each value by one lane.
-                    unsafe { *q_out.get_unchecked_mut(base + d[i]) = y[i] };
+                    // SAFETY: gbase + d[i] < m·HEADS·DIM <= q_out.len(); the
+                    // group's tile 0 alone writes it, each value by one lane.
+                    unsafe { *q_out.get_unchecked_mut(gbase + d[i]) = y[i] };
                 }
             }
             t += 1;
@@ -751,8 +761,8 @@ mod qsa_kernels {
 
         let mut t = 0usize;
         while t < rows {
-            // SAFETY: t < m <= n_keys.len().
-            let c = unsafe { *n_keys.get_unchecked(t) };
+            // SAFETY: rbase + t < m <= n_keys.len().
+            let c = unsafe { *n_keys.get_unchecked(rbase + t) };
             let nb = c as usize / POOL;
             // Block-uniform: c is the row's.
             if scored(c, ctx, kept) && p0 < nb {
@@ -793,10 +803,12 @@ mod qsa_kernels {
                             + *ws.add(3 * POOL_TILE + lane)
                     };
                     let pool = p0 + lane;
-                    // SAFETY: pool < nb <= ctx/4 <= pools and t < m, so
-                    // t·pools + pool < m·pools <= scores.len(); one lane
-                    // writes each score.
-                    unsafe { *scores.get_unchecked_mut(t * pools as usize + pool) = s };
+                    // SAFETY: pool < nb <= ctx/4 <= pools and rbase + t < m, so
+                    // (rbase + t)·pools + pool < m·pools <= scores.len(); one
+                    // lane writes each score.
+                    unsafe {
+                        *scores.get_unchecked_mut((rbase + t) * pools as usize + pool) = s
+                    };
                 }
                 thread::sync_threads();
             }
@@ -999,6 +1011,177 @@ mod qsa_kernels {
         if tid == 0 {
             // SAFETY: t < m <= n_sel.len().
             unsafe { *n_sel.get_unchecked_mut(t) = (kept_tokens + tail) as u32 };
+        }
+    }
+
+    /// [`qsa_topk`]'s selection as a bitmap: block `t` writes row `t`'s kept
+    /// pools into `bits[t·words ..]`, `words` u32, bit `p % 32` of word `p /
+    /// 32` set for each pool `p` the row keeps — every pool above the `kept`-th
+    /// order key and the first pools equal to it in pool order, the list's
+    /// pools — and every word of the row is written (the words past its pools
+    /// are zero). A row that is not [`scored`] has every bit set: it sees all
+    /// its keys, and the attention's count refuses a row whose count is not
+    /// accepted. The row's tail is not in the bitmap: the attention takes the
+    /// keys at or past `4·(count / 4)` itself.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys.len() >= m,
+            pools * 4 >= ctx,
+            words * 32 >= pools,
+            scores.len() >= m * pools,
+            bits.len() >= m * words
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    pub fn qsa_topk_bits(
+        n_keys: &[u32],
+        scores: &[f32],
+        ctx: u32,
+        pools: u32,
+        kept: u32,
+        words: u32,
+        m: u32,
+        mut bits: DisjointSlice<u32>,
+    ) {
+        static mut FINE: SharedArray<u32, FINE_BINS> = SharedArray::UNINIT;
+        static mut WSUM: SharedArray<u32, TOPK_WARPS> = SharedArray::UNINIT;
+        static mut WTOT: SharedArray<u32, TOPK_WARPS> = SharedArray::UNINIT;
+        static mut PICK: SharedArray<u32, 2> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id();
+        let wid = tid / 32;
+        let wbase = t * words as usize;
+        // SAFETY: t < m <= n_keys.len() by the launch contract.
+        let c = unsafe { *n_keys.get_unchecked(t) };
+        if !scored(c, ctx, kept) {
+            let mut i = tid;
+            while i < words as usize {
+                // SAFETY: wbase + i < m·words <= bits.len(); thread tid alone
+                // writes words tid + 512·r.
+                unsafe { *bits.get_unchecked_mut(wbase + i) = u32::MAX };
+                i += TOPK_THREADS as usize;
+            }
+            return; // block-uniform
+        }
+        // SAFETY: block-shared statics; the raw forms reach them without a
+        // reference, and every access below is bounded and barrier-ordered.
+        let (fine, wsum, wtot, pick) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut FINE),
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                SharedArray::as_raw_mut_ptr(&raw mut WTOT),
+                SharedArray::as_raw_mut_ptr(&raw mut PICK),
+            )
+        };
+        let n = c as usize / POOL;
+        let sbase = t * pools as usize;
+        let need = kept;
+
+        // ---- the `kept`-th order key, `qsa_topk`'s three passes.
+        // SAFETY: n <= ctx/4 <= pools, so sbase + n <= m·pools <= scores.len();
+        // FINE is this pass's alone.
+        let hc = unsafe { coarse(scores, sbase, n, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b1, above1) = unsafe {
+            pick_bin::<COARSE_PER>(hc, HIST_BINS as u32 - 1, need, lane, tid, wsum, pick)
+        };
+        let need2 = need - above1;
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, b1, 11, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b2, above2) =
+            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need2, lane, tid, wsum, pick) };
+        let need3 = need2 - above2;
+        let prefix = (b1 << 11) | b2;
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, prefix, 0, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b3, above3) =
+            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need3, lane, tid, wsum, pick) };
+        let thr = (prefix << 11) | b3;
+        let take_eq = need - (above1 + above2 + above3);
+
+        // ---- the bitmap, in pool order: warp `wid` owns pools `c0 .. c1` (whole
+        // words), counts the pools equal to the cut it holds, the block scans
+        // the counts, and the warp walks its pools again, writing one word of
+        // kept-pool bits per 32 pools.
+        let chunk = n.div_ceil(32 * TOPK_WARPS) * 32;
+        let c0 = (wid * chunk).min(n);
+        let c1 = (c0 + chunk).min(n);
+        let l = lane as usize;
+        let mut te = 0u32;
+        let mut base = c0;
+        while base < c1 {
+            // SAFETY: c1 <= n, so sbase + c1 <= scores.len().
+            let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
+            for r in 0..LANE_ROWS {
+                thread::__unroll_config::<0>();
+                let live = base + 32 * r + l < c1;
+                te += warp::ballot(live && kk[r] == thr).count_ones();
+            }
+            base += 32 * LANE_ROWS;
+        }
+        if lane == 0 {
+            // SAFETY: wid < TOPK_WARPS; lane 0 of warp wid is the slot's only
+            // writer, before the barrier.
+            unsafe { *wtot.add(wid) = te };
+        }
+        thread::sync_threads();
+        let mut oe = 0u32;
+        for w in 0..TOPK_WARPS {
+            thread::__unroll_config::<0>();
+            if w < wid {
+                // SAFETY: w < TOPK_WARPS; published by the barrier above.
+                oe += unsafe { *wtot.add(w) };
+            }
+        }
+        let lt = warp::lanemask_lt();
+        let mut base = c0;
+        while base < c1 {
+            // SAFETY: c1 <= n, so sbase + c1 <= scores.len().
+            let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
+            for r in 0..LANE_ROWS {
+                thread::__unroll_config::<0>();
+                let at = base + 32 * r;
+                let live = at + l < c1;
+                let me = warp::ballot(live && kk[r] == thr);
+                let eq_before = oe + (me & lt).count_ones();
+                let is_eq = (me >> lane) & 1 != 0;
+                let keep = live && (kk[r] > thr || (is_eq && eq_before < take_eq));
+                let word = warp::ballot(keep);
+                if lane == 0 && at < c1 {
+                    // SAFETY: at < c1 <= n, so at / 32 < ⌈n/32⌉ <= words and
+                    // the word is inside row t's `words`; at is a multiple of
+                    // 32 (the warp's chunk is), so one warp writes each word.
+                    unsafe { *bits.get_unchecked_mut(wbase + at / 32) = word };
+                }
+                oe += me.count_ones();
+            }
+            base += 32 * LANE_ROWS;
+        }
+        // ---- the words past the row's pools.
+        let mut i = n.div_ceil(32) + tid;
+        while i < words as usize {
+            // SAFETY: wbase + i < m·words <= bits.len(); thread tid alone
+            // writes words past ⌈n/32⌉ congruent to tid mod 512.
+            unsafe { *bits.get_unchecked_mut(wbase + i) = 0 };
+            i += TOPK_THREADS as usize;
         }
     }
 
@@ -1268,6 +1451,85 @@ impl QsaScratch {
     }
 }
 
+/// Device bytes one whole-unit selection's scratch may take: the query heads
+/// and scores of its rows and their bitmaps ([`QsaMaskScratch`]).
+pub const MASK_BYTES: usize = 16 << 20;
+
+/// u32 words of one row's pool bitmap over a `ctx`-row cache: a bit a pool.
+#[must_use]
+pub fn mask_words(ctx: usize) -> usize {
+    pools_for(ctx).div_ceil(32)
+}
+
+/// Rows one whole-unit selection takes over a `ctx`-row cache, for a unit of
+/// `rows` rows: as many as [`MASK_BYTES`] holds (a multiple of [`MAX_ROWS`],
+/// at least one group), at most `rows`.
+#[must_use]
+pub fn mask_rows(ctx: usize, rows: usize) -> usize {
+    let per_row = 4 * (pools_for(ctx) + HEADS * DIM + mask_words(ctx));
+    (MASK_BYTES / per_row / MAX_ROWS * MAX_ROWS)
+        .max(MAX_ROWS)
+        .min(rows)
+}
+
+/// What a whole-unit selection leaves ([`QsaKernels::enqueue_select_mask`]):
+/// up to `rows` rows' query heads and scores, and each row's kept pools as a
+/// bitmap ([`qsa_kernels::qsa_topk_bits`]) the masked flash reads. Allocated
+/// once and reused by every launch.
+pub struct QsaMaskScratch {
+    /// `[rows][HEADS][DIM]`: the query heads the scores used.
+    pub q_out: DeviceBuffer<f32>,
+    /// `[rows][pools]`: each scored row's pool scores.
+    pub scores: DeviceBuffer<f32>,
+    /// `[rows][words]`: each row's kept pools, bit `p % 32` of word `p / 32`.
+    pub bits: DeviceBuffer<u32>,
+    rows: usize,
+    pools: usize,
+    words: usize,
+}
+
+impl QsaMaskScratch {
+    /// Allocate for `rows` rows over a `ctx`-row cache. Load-time only.
+    ///
+    /// # Errors
+    /// [`GpuError::Shape`] for no row or no cache; an allocation error.
+    pub fn new(stream: &CudaStream, rows: usize, ctx: usize) -> Result<QsaMaskScratch, GpuError> {
+        if rows == 0 || ctx == 0 {
+            return Err(GpuError::shape(
+                "qsa::mask_scratch",
+                format!("need rows and ctx >= 1, got rows={rows} ctx={ctx}"),
+            ));
+        }
+        let (pools, words) = (pools_for(ctx), mask_words(ctx));
+        Ok(QsaMaskScratch {
+            q_out: DeviceBuffer::zeroed(stream, rows * HEADS * DIM)?,
+            scores: DeviceBuffer::zeroed(stream, rows * pools)?,
+            bits: DeviceBuffer::zeroed(stream, rows * words)?,
+            rows,
+            pools,
+            words,
+        })
+    }
+
+    /// Rows one launch takes.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The bitmap stride: [`mask_words`] of the scratch's cache.
+    #[must_use]
+    pub fn words(&self) -> usize {
+        self.words
+    }
+
+    /// Device bytes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.q_out.num_bytes() + self.scores.num_bytes() + self.bits.num_bytes()
+    }
+}
+
 /// Pooled rows a `ctx`-row cache needs: one per pool, the last one
 /// incomplete when `ctx` is not a multiple of [`POOL`].
 #[must_use]
@@ -1309,6 +1571,22 @@ pub struct SelectArgs<'a> {
     pub m: usize,
     pub fault: FaultSink,
     pub scratch: &'a mut QsaScratch,
+}
+
+/// [`QsaKernels::enqueue_select_mask`]'s arguments: [`SelectArgs`]' with the
+/// whole-unit scratch.
+pub struct MaskArgs<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub table: &'a DeviceBuffer<f32>,
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub pooled: &'a DeviceBuffer<u16>,
+    pub eps: f32,
+    pub ctx: usize,
+    pub kept: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub scratch: &'a mut QsaMaskScratch,
 }
 
 /// [`QsaKernels::enqueue_topk_high`]'s arguments: the `m` rows' live counts,
@@ -1474,6 +1752,92 @@ impl QsaKernels {
             m,
             &mut s.list,
             &mut s.n_sel,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the selection of a whole unit's `m` rows: one score launch
+    /// (`⌈pools/32⌉ · ⌈m/8⌉` blocks of 128, [`MAX_ROWS`] rows a block) and one
+    /// top-k launch (`m` blocks of 512, [`qsa_kernels::qsa_topk_bits`]), each
+    /// row's kept pools left as a bitmap in `a.scratch.bits`. `m` is 1 to the
+    /// scratch's rows, and the cache the scratch's; any other shape is refused
+    /// by name. Two launches, in order, on one stream. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_select_mask(
+        &self,
+        stream: &CudaStream,
+        a: MaskArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "qsa::enqueue_select_mask";
+        let s = a.scratch;
+        let pools = pools_for(a.ctx);
+        if a.m == 0 || a.m > s.rows || a.kept == 0 || s.pools != pools {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need 1..={} rows, kept >= 1 and the scratch's {} pools; got m={} kept={} \
+                     pools={pools}",
+                    s.rows, s.pools, a.m, a.kept
+                ),
+            ));
+        }
+        let lens = [
+            ("q", a.q.len(), a.m * HEADS * DIM),
+            ("gain", a.gain.len(), DIM),
+            ("table", a.table.len(), a.ctx * ROT),
+            ("n_keys", a.n_keys.len(), a.m),
+            ("pooled", a.pooled.len(), pools * DIM),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let ctx = launch_u32(what, "ctx", a.ctx)?;
+        let pools_u = launch_u32(what, "pools", pools)?;
+        let kept = launch_u32(what, "kept", a.kept)?;
+        let words = launch_u32(what, "words", s.words)?;
+        let m = launch_u32(what, "m", a.m)?;
+        let grid = launch_u32(
+            what,
+            "score grid",
+            pools.div_ceil(POOL_TILE) * a.m.div_ceil(MAX_ROWS),
+        )?;
+        let prep = self
+            .module
+            .prepare_qsa_score(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.qsa_score(
+            stream,
+            &prep,
+            a.q,
+            a.gain,
+            a.table,
+            a.n_keys,
+            a.pooled,
+            a.eps,
+            ctx,
+            pools_u,
+            kept,
+            m,
+            a.fault,
+            &mut s.q_out,
+            &mut s.scores,
+        )?;
+        let prep = self
+            .module
+            .prepare_qsa_topk_bits(LaunchConfig1D::new(m, TOPK_THREADS, 0))?;
+        self.module.qsa_topk_bits(
+            stream,
+            &prep,
+            a.n_keys,
+            &s.scores,
+            ctx,
+            pools_u,
+            kept,
+            words,
+            m,
+            &mut s.bits,
         )?;
         Ok(())
     }

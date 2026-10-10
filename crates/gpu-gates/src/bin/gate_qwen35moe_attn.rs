@@ -181,6 +181,28 @@
 //!     [`SEED_Q8`]: bit for bit the f16 twin, a rerun, each row its one-row
 //!     launch, the fault, the captured launch (one node), a head count
 //!     refused.
+//! 17. The whole-unit selection (`qsa::enqueue_select_mask`) and the masked
+//!     prefill flash (`flash_gqa_prefill::enqueue_256_p4_sel`), in three parts.
+//!     The selection over three row groups of 8, 8 and 5 rows, each group
+//!     holding scored rows, rows of at most 2,051 keys and refused counts, on
+//!     the seeded plane and on the tied plane (pools 100..700 scoring +0, the
+//!     tied count 4,097 in every group), over a bitmap the launch finds full
+//!     of a sentinel: each row's query heads and its scored pools' scores bit
+//!     for bit its one-row `enqueue_select` launch, its bitmap exactly the
+//!     one-row list's 512 kept pools (the lowest of the tied zeros) and zero
+//!     past them, every word of a row that is not scored or is refused all
+//!     ones, no word left at the sentinel and the rows past `m` untouched. An
+//!     all-ones bitmap on `enqueue_256_p4_sel` the bits of `enqueue_256_p4`, on
+//!     the seeded grid and [`SEED_Q38`] (counts to 2,051) and on launches
+//!     crossing 2,051 and at 4K and deeper. A bitmap that clears pools — the
+//!     first pools, both sides of a tile edge inside a word and of a word edge,
+//!     and the pools about each row's count, the tail's among them — each row
+//!     within the prefill band of the exact attention over `k < count` and (a
+//!     kept pool or the tail), the walked `⌈count / 64⌉` tiles in the band's
+//!     tile terms, the cleared pools' cache rows a finite 4,096 (a hidden row's
+//!     weight is 0 and 0 · NaN is NaN, so NaN would fail a correct kernel) and
+//!     the all-visible launch on the same cache at least ten bounds away on
+//!     every row.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -209,8 +231,8 @@ mod gate {
     use bloomery_gpu::gated_quant::{GateLayout, GatedQuantKernels};
     use bloomery_gpu::gemm::GemmAct;
     use bloomery_gpu::qsa::{
-        DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, POOL, PoolArgs, QsaKernels, QsaScratch,
-        ROT as IDX_ROT, SelectArgs, list_width, pools_for,
+        DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, MaskArgs, POOL, PoolArgs, QsaKernels,
+        QsaMaskScratch, QsaScratch, ROT as IDX_ROT, SelectArgs, list_width, mask_words, pools_for,
     };
     use bloomery_gpu::rope_neox::{
         PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, owned_pair, q8_plane_lens,
@@ -794,6 +816,13 @@ mod gate {
     /// `gate_qwen3moe_flash`'s model at a head of [`HEAD`] (module doc):
     /// `q` one head's query, `kh`/`vh` its key head's first `n` rows.
     fn exact(q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32) -> Exact {
+        exact_walked(q, kh, vh, n, n, scale)
+    }
+
+    /// [`exact`] over `n` gathered keys that the prefill kernel reaches by
+    /// walking `walk >= n` keys: the rows a mask hides are walked but add no
+    /// weight, so the prefill bound's tile and chain terms read `walk`.
+    fn exact_walked(q: &[f32], kh: &[f32], vh: &[f32], n: usize, walk: usize, scale: f32) -> Exact {
         let sc = f64::from(scale);
         let dot = |j: usize, abs: bool| -> f64 {
             let k = &kh[j * HEAD..(j + 1) * HEAD];
@@ -835,7 +864,8 @@ mod gate {
         // Each half's tensor-core chain, their sum, and the query's f16.
         let es_m = 2f64.powi(-11) + 2.0 * gamma(HEAD + 2);
         let acc_o = gamma(span + segs + 8);
-        let r_pref = n.div_ceil(PREF_TILE) as f64;
+        // PIN(2026-10-11): the prefill bound's tile and chain terms count the keys the block walks, `walk`, not the keys it attends: a masked key adds an exact 0 to a sum, but its tile is still walked, the running maximum rescales per walked tile, and the k16 and l chains step across it; at `walk == n` every term is the dense bound's.
+        let r_pref = walk.div_ceil(PREF_TILE) as f64;
         let w16: Vec<f64> = pb
             .iter()
             .zip(&p)
@@ -849,8 +879,8 @@ mod gate {
             })
             .collect();
         let dbar: f64 = w16.iter().sum();
-        let acc_pv = 2.0 * gamma(n.div_ceil(16) + 16);
-        let acc_l = gamma(n.div_ceil(4) + n.div_ceil(PREF_TILE) + 2);
+        let acc_pv = 2.0 * gamma(walk.div_ceil(16) + 16);
+        let acc_l = gamma(walk.div_ceil(4) + walk.div_ceil(PREF_TILE) + 2);
         let mut o = vec![0.0f64; HEAD];
         for (j, &w) in pb.iter().enumerate() {
             for (d, od) in o.iter_mut().enumerate() {
@@ -4162,6 +4192,438 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------ masked selection
+
+    /// The word [`QsaMaskScratch::bits`] holds before a masked selection:
+    /// neither zero nor all ones, and (asserted per row) no kept-pool word, so
+    /// a word the launch leaves unwritten reads as itself.
+    const MASK_SENT: u32 = 0xa5a5_a5a5;
+    /// The scratch's rows: three groups of [`MAX_ROWS`], the launches' last
+    /// group short.
+    const MASK_ROWS: usize = 3 * MAX_ROWS;
+    /// The rows of the masked selection over the seeded plane: 21 rows in
+    /// groups of 8, 8 and 5, each group holding scored rows, rows that are not
+    /// scored (at most 2,051 keys) and refused rows (zero, past the cache).
+    const MASK_COUNTS: [usize; 21] = [
+        8193, 0, 2052, 4097, 1, 2051, 8201, 4096, 3000, 0, 8192, 2052, 512, 6001, 8193, 4097, 2053,
+        8201, 8000, 2051, 4101,
+    ];
+    /// The rows of the masked selection over the tie plane (counts at most
+    /// [`TIE_COUNT`]): 19 rows, the tied count in every group.
+    const MASK_TIE_COUNTS: [usize; 19] = [
+        4097, 4096, 3000, 4097, 2052, 4097, 2051, 4097, 4097, 4097, 3500, 4097, 0, 4097, 4097,
+        1000, 4097, 2500, 4097,
+    ];
+    /// A selected-flash bound's multiple the all-visible launch must move the
+    /// output of every row by, once the cleared pools hide their keys.
+    const MASK_MOVE: f64 = 10.0;
+
+    /// What one masked selection leaves: the whole scratch read back.
+    struct MaskOut {
+        q_out: Vec<f32>,
+        scores: Vec<f32>,
+        bits: Vec<u32>,
+    }
+
+    /// One whole-unit selection of the rows `counts` (raw queries `q`) over a
+    /// fresh scratch of [`MASK_ROWS`] rows, its bitmap holding [`MASK_SENT`]
+    /// before the launch: [`QsaMaskScratch::new`] zero-fills, which would
+    /// pass "every word is written" for the words that are zero.
+    fn run_mask(
+        qk: &QsaKernels,
+        stream: &CudaStream,
+        fault: FaultSink,
+        idx: &Idx,
+        pooled: &DeviceBuffer<u16>,
+        q: &[f32],
+        counts: &[u32],
+    ) -> Result<MaskOut, GateError> {
+        let mut scratch = QsaMaskScratch::new(stream, MASK_ROWS, idx.ctx)?;
+        scratch.bits =
+            DeviceBuffer::from_host(stream, &vec![MASK_SENT; MASK_ROWS * scratch.words()])?;
+        let qd = DeviceBuffer::from_host(stream, q)?;
+        let nk = DeviceBuffer::from_host(stream, counts)?;
+        qk.enqueue_select_mask(
+            stream,
+            MaskArgs {
+                q: &qd,
+                gain: &idx.gq_d,
+                table: &idx.table_d,
+                n_keys: &nk,
+                pooled,
+                eps: EPS,
+                ctx: idx.ctx,
+                kept: KEPT,
+                m: counts.len(),
+                fault,
+                scratch: &mut scratch,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(MaskOut {
+            q_out: scratch.q_out.to_host_vec(stream)?,
+            scores: scratch.scores.to_host_vec(stream)?,
+            bits: scratch.bits.to_host_vec(stream)?,
+        })
+    }
+
+    /// Part 1: one masked selection of `counts` over `idx`'s plane against each
+    /// row's one-row [`QsaKernels::enqueue_select`] launch: the query heads and
+    /// the scored rows' scores bit for bit, the bitmap exactly the one-row
+    /// list's kept pools (all ones for a row that is not scored or is
+    /// refused), every word of every row written and no row past `m` touched.
+    /// `tie` adds the tied cut's straddle: the kept zero-score pools the
+    /// lowest of the zeros.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the kernels, the stream and sink, the inputs and plane, the rows, the seed and the label"
+    )]
+    fn mask_select_rows(
+        qk: &QsaKernels,
+        stream: &CudaStream,
+        fault: FaultSink,
+        (idx, pooled): (&Idx, &DeviceBuffer<u16>),
+        counts: &[usize],
+        seed: u32,
+        name: &str,
+        tie: bool,
+    ) -> Result<bool, GateError> {
+        let (m, w) = (counts.len(), IDX_HEADS * IDX_DIM);
+        let (pools, words) = (pools_for(idx.ctx), mask_words(idx.ctx));
+        let cu: Vec<u32> = counts
+            .iter()
+            .map(|&c| u32::try_from(c))
+            .collect::<Result<_, _>>()?;
+        let q = idx_queries(m, seed);
+        let out = run_mask(qk, stream, fault, idx, pooled, &q, &cu)?;
+        let mut one_scratch = QsaScratch::new(stream, MAX_ROWS, idx.ctx, KEPT)?;
+        let (mut heads, mut scores, mut bitmap, mut sent_free, mut straddle) =
+            (true, true, true, true, true);
+        let mut kinds = [0usize; 3];
+        for (t, &c) in counts.iter().enumerate() {
+            let one = run_select(
+                qk,
+                stream,
+                fault,
+                idx,
+                pooled,
+                &q[t * w..(t + 1) * w],
+                &cu[t..=t],
+                &mut one_scratch,
+            )?;
+            heads &= bits_equal(&out.q_out[t * w..(t + 1) * w], &one.q_out[..w]);
+            let got = &out.bits[t * words..(t + 1) * words];
+            let want: Vec<u32> = if qsa_shape().scored(c, idx.ctx) {
+                kinds[0] += 1;
+                let n = c / POOL;
+                scores &= bits_equal(&out.scores[t * pools..t * pools + n], &one.scores[..n]);
+                let mut row = vec![0u32; words];
+                for &v in &row_list(&one, 0)[..KEPT * POOL] {
+                    let p = v as usize / POOL;
+                    row[p / 32] |= 1 << (p % 32);
+                }
+                bitmap &= row.iter().map(|x| x.count_ones() as usize).sum::<usize>() == KEPT;
+                if tie {
+                    let zeros: Vec<usize> = (0..n)
+                        .filter(|&j| out.scores[t * pools + j] == 0.0)
+                        .collect();
+                    let kept = |j: usize| got[j / 32] >> (j % 32) & 1 != 0;
+                    let kept_zero = zeros.iter().filter(|&&j| kept(j)).count();
+                    straddle &= kept_zero > 0
+                        && kept_zero < zeros.len()
+                        && zeros[..kept_zero].iter().all(|&j| kept(j));
+                }
+                row
+            } else {
+                kinds[1 + usize::from(c == 0 || c > idx.ctx)] += 1;
+                vec![u32::MAX; words]
+            };
+            sent_free &= want.iter().all(|&x| x != MASK_SENT);
+            bitmap &= got == want.as_slice();
+        }
+        // Every group holds a scored row: a launch that left a group's rows
+        // unscored would pass the group vacuously.
+        let grouped = counts
+            .chunks(MAX_ROWS)
+            .all(|g| g.iter().any(|&c| qsa_shape().scored(c, idx.ctx)));
+        let rest = out.bits[m * words..].iter().all(|&x| x == MASK_SENT)
+            && out.q_out[m * w..].iter().all(|v| v.to_bits() == 0)
+            && out.scores[m * pools..].iter().all(|v| v.to_bits() == 0);
+        let pass = heads && scores && bitmap && sent_free && straddle && grouped && rest;
+        println!(
+            "qsa mask select {name} m={m} counts={counts:?}: rows scored/unscored/refused \
+             {kinds:?}, every group scored={grouped}, heads = one-row launches={heads} scores \
+             (the scored rows' first count/4) = one-row launches={scores} bitmap = the one-row \
+             list's kept pools (all ones: unscored and refused), every word written over the \
+             sentinel={bitmap} sentinel-free={sent_free} rows past m untouched={rest}{} {}",
+            if tie {
+                format!(" tie straddles the cut={straddle}")
+            } else {
+                String::new()
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// One masked prefill launch of the rows `counts` (their raw queries `q`)
+    /// through `enqueue_256_p4_sel` at Qwen3.8's layout, `bits` their `words`-wide
+    /// bitmaps, read back.
+    fn run_pref_sel(
+        kp: &FlashGqaPrefill,
+        gpu: &Gpu,
+        q: &[f32],
+        counts: &[u32],
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        ctx: usize,
+        (bits, words): (&DeviceBuffer<u32>, usize),
+    ) -> Result<Vec<f32>, GateError> {
+        let stream = gpu.stream();
+        let t = counts.len();
+        let qd = DeviceBuffer::from_host(stream, q)?;
+        let nk = DeviceBuffer::from_host(stream, counts)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, t * Q38.width())?;
+        kp.enqueue_256_p4_sel(
+            stream,
+            GqaPrefillArgs {
+                q: &qd,
+                kc,
+                vc,
+                n_keys: &nk,
+                scale: scale(),
+                n_head: N_HEAD_Q38,
+                n_kv: N_KV,
+                ctx,
+                t,
+                fault: gpu.unlabelled_sink(),
+                y: &mut y,
+            },
+            bits,
+            words,
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    }
+
+    /// Part 2's launches beyond the seeded grid and [`SEED_Q38`]: `(p0, T)`
+    /// crossing the dense edge (counts 2,041..=2,064), at 4K and deeper.
+    const MASK_PAIRS: [(usize, usize); 3] = [(2040, 24), (4090, 70), (6100, 17)];
+
+    /// Part 2: an all-ones bitmap on `enqueue_256_p4_sel` gives `enqueue_256_p4`'s
+    /// bits, on the seeded grid, [`SEED_Q38`] (counts to 2,051) and
+    /// [`MASK_PAIRS`] (past it): the masked softmax over every key is the
+    /// dense body's, and a key past a row's count stays hidden.
+    fn mask_ones_check(gpu: &Gpu, kp: &FlashGqaPrefill) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let grid = SEED_P0
+            .iter()
+            .flat_map(|&p0| SEED_T.iter().map(move |&t| (p0, t)))
+            .chain(SEED_Q38.iter().copied())
+            .chain(MASK_PAIRS.iter().copied());
+        let (mut ok, mut seed) = (true, 800u32);
+        for (p0, t) in grid {
+            seed += 7;
+            let ctx = p0 + t + PAD;
+            let c = cache(stream, ctx, p0 + t, seed)?;
+            let q: Vec<f32> = activations(HEAD, t * N_HEAD_Q38, seed + 3)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let counts: Vec<u32> = (0..t)
+                .map(|i| u32::try_from(p0 + i + 1))
+                .collect::<Result<_, _>>()?;
+            let words = mask_words(ctx);
+            let ones = DeviceBuffer::from_host(stream, &vec![u32::MAX; t * words])?;
+            let dense = run_pref(kp, gpu, Q38, &q, &counts, (&c.kc, &c.vc), ctx)?;
+            let masked = run_pref_sel(kp, gpu, &q, &counts, (&c.kc, &c.vc), ctx, (&ones, words))?;
+            let same = bits_equal(&dense, &masked);
+            println!(
+                "qsa mask all ones T={t} p0={p0} counts {}..={} ctx={ctx}: _p4_sel = _p4 bit for \
+                 bit {same} {}",
+                p0 + 1,
+                p0 + t,
+                verdict(same)
+            );
+            ok &= same;
+        }
+        Ok(ok)
+    }
+
+    /// Part 3's launch: `CLR_T` rows at counts `CLR_P0 + 1 ..`, crossing the
+    /// 64-key tile at 4,096 and the pools 1,021..=1,027 each row's last.
+    const CLR_P0: usize = 4084;
+    const CLR_T: usize = 24;
+    /// The pools part 3 clears in some rows and gives large values: the first
+    /// pools, both sides of a tile edge inside a word (15|16, 47|48) and of a
+    /// word edge (31|32, 63|64), and the pools about every row's count (the
+    /// last complete pool, the tail's, the word edge 1,023|1,024).
+    const CLR_POOLS: [std::ops::Range<usize>; 6] =
+        [0..2, 14..18, 30..34, 46..50, 62..66, 1006..1031];
+    /// The value of every cache row of a [`CLR_POOLS`] pool: f16 exact, far
+    /// outside the seeded rows' [-1, 1), its sign alternating with the pool.
+    const CLR_V: f32 = 4096.0;
+
+    fn in_clr(p: usize) -> bool {
+        CLR_POOLS.iter().any(|r| r.contains(&p))
+    }
+
+    /// Whether row `i`'s bitmap clears pool `p`: a third of [`CLR_POOLS`] a
+    /// row, every pool cleared in some rows and visible in the others.
+    fn cleared(i: usize, p: usize) -> bool {
+        in_clr(p) && (i + p).is_multiple_of(3)
+    }
+
+    /// The exact attention of every (row, head) of a masked prefill launch
+    /// over the row's visible keys (`vis[t]`, cache rows in order) at Qwen3.8's
+    /// layout, [`exact_walked`] with the row's whole count walked.
+    fn exact_visible(
+        q: &[f32],
+        vis: &[Vec<u32>],
+        counts: &[usize],
+        cache: &HostCache,
+    ) -> Vec<Exact> {
+        par_map(vis.len() * N_HEAD_Q38, |i| {
+            let (t, h) = (i / N_HEAD_Q38, i % N_HEAD_Q38);
+            let plane = (h / Q38.group()) * cache.ctx * HEAD;
+            let gather = |src: &[f32]| -> Vec<f32> {
+                vis[t]
+                    .iter()
+                    .flat_map(|&r| src[plane + r as usize * HEAD..][..HEAD].iter().copied())
+                    .collect()
+            };
+            let (kh, vh) = (gather(&cache.kf), gather(&cache.vf));
+            exact_walked(
+                &q[i * HEAD..(i + 1) * HEAD],
+                &kh,
+                &vh,
+                vis[t].len(),
+                counts[t],
+                scale(),
+            )
+        })
+    }
+
+    /// Part 3: a cleared pool drops exactly that pool. Rows' bitmaps clear a
+    /// third of [`CLR_POOLS`], the pools' cache rows hold [`CLR_V`] (finite:
+    /// the masked kernel gives a hidden row weight 0, and 0 · NaN is NaN), so a
+    /// kernel that keeps a cleared pool, or drops a visible neighbour, moves
+    /// the output far outside the band. Each row within the prefill bound of
+    /// the exact attention over `k < count` and (kept pool or tail) — and the
+    /// all-visible launch, the same cache, at least [`MASK_MOVE`] bounds
+    /// away, the proof the clears are seen.
+    fn mask_clear_check(gpu: &Gpu, kp: &FlashGqaPrefill) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (p0, t) = (CLR_P0, CLR_T);
+        let ctx = p0 + t + PAD;
+        let words = mask_words(ctx);
+        let kb = to16(&activations(HEAD, N_KV * ctx, 840));
+        let mut vb = to16(&activations(HEAD, N_KV * ctx, 841));
+        let big = [f32_to_f16_bits(CLR_V), f32_to_f16_bits(-CLR_V)];
+        for plane in 0..N_KV {
+            for k in (0..ctx).filter(|&k| in_clr(k / POOL)) {
+                vb[(plane * ctx + k) * HEAD..][..HEAD].fill(big[(k / POOL) % 2]);
+            }
+        }
+        let host = HostCache {
+            kf: from16(&kb),
+            vf: from16(&vb),
+            ctx,
+        };
+        let (kc, vc) = (
+            DeviceBuffer::from_host(stream, &kb)?,
+            DeviceBuffer::from_host(stream, &vb)?,
+        );
+        let q: Vec<f32> = activations(HEAD, t * N_HEAD_Q38, 843)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        let counts: Vec<usize> = (0..t).map(|i| p0 + i + 1).collect();
+        let cu: Vec<u32> = counts
+            .iter()
+            .map(|&c| u32::try_from(c))
+            .collect::<Result<_, _>>()?;
+        // Row i's bitmap as the selection writes a scored row's: a bit a kept
+        // pool below `count / 4`, none at or past it.
+        let mut bits = vec![0u32; t * words];
+        let mut vis: Vec<Vec<u32>> = Vec::new();
+        let mut clears = usize::MAX;
+        for (i, &c) in counts.iter().enumerate() {
+            let n = c / POOL;
+            let row = &mut bits[i * words..(i + 1) * words];
+            for p in (0..n).filter(|&p| !cleared(i, p)) {
+                row[p / 32] |= 1 << (p % 32);
+            }
+            clears = clears.min((0..n).filter(|&p| cleared(i, p)).count());
+            // The kernel's rule: below the count, and in a kept pool or the tail.
+            vis.push(
+                (0..c)
+                    .filter(|&k| row[k / POOL / 32] >> (k / POOL % 32) & 1 != 0 || k >= POOL * n)
+                    .map(|k| k as u32)
+                    .collect(),
+            );
+        }
+        let bits_d = DeviceBuffer::from_host(stream, &bits)?;
+        let ones = DeviceBuffer::from_host(stream, &vec![u32::MAX; t * words])?;
+        let y = run_pref_sel(kp, gpu, &q, &cu, (&kc, &vc), ctx, (&bits_d, words))?;
+        let all = run_pref_sel(kp, gpu, &q, &cu, (&kc, &vc), ctx, (&ones, words))?;
+        let exacts = exact_visible(&q, &vis, &counts, &host);
+        let (band, worst) = judge(&exacts, &y, Pass::Prefill);
+        let mut moved = f64::INFINITY;
+        for r in 0..t {
+            let mut row = 0.0f64;
+            for h in 0..N_HEAD_Q38 {
+                let i = r * N_HEAD_Q38 + h;
+                for d in 0..HEAD {
+                    let dy = (f64::from(y[i * HEAD + d]) - f64::from(all[i * HEAD + d])).abs();
+                    row = row.max(dy / exacts[i].bound_pref[d]);
+                }
+            }
+            moved = moved.min(row);
+        }
+        let seen = moved >= MASK_MOVE && clears >= 1;
+        let pass = band && seen;
+        println!(
+            "qsa mask cleared pools T={t} p0={p0} ctx={ctx}: every row clears >= {clears} pools, \
+             measured/bound {worst:.3e} band={band}, the all-visible launch moves every row by >= \
+             {moved:.3e} bounds (>= {MASK_MOVE}) {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The masked selection and the masked flash (module doc, 17).
+    fn mask_check(gpu: &Gpu, kp: &FlashGqaPrefill, qk: &QsaKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let idx = idx_inputs(stream, SEL_CTX, 701, false)?;
+        let (pooled, _) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
+        let tie = idx_inputs(stream, SEL_CTX, 721, true)?;
+        let (tie_pooled, _) = pool_plane(qk, stream, &tie, TIE_COUNT, TIE_COUNT, unl)?;
+        let mut ok = mask_select_rows(
+            qk,
+            stream,
+            unl,
+            (&idx, &pooled),
+            &MASK_COUNTS,
+            711,
+            "seeded plane",
+            false,
+        )?;
+        ok &= mask_select_rows(
+            qk,
+            stream,
+            unl,
+            (&tie, &tie_pooled),
+            &MASK_TIE_COUNTS,
+            722,
+            "tie plane",
+            true,
+        )?;
+        ok &= mask_ones_check(gpu, kp)?;
+        ok &= mask_clear_check(gpu, kp)?;
+        Ok(ok)
+    }
+
     /// The new entries compile with no local depot (module doc, 14).
     fn sel_shapes() -> Result<bool, GateError> {
         no_local_depot(&[
@@ -4231,6 +4693,9 @@ mod gate {
         ok &= s;
         let s = deep_check(&gpu, &k, &qk)?;
         println!("qsa deep {}", verdict(s));
+        ok &= s;
+        let s = mask_check(&gpu, &kp, &qk)?;
+        println!("qsa masked select and flash {}", verdict(s));
         ok &= s;
         let (p, win36) = prefill_check(&gpu, &kp, Q36, &[])?;
         println!("prefill flash 256 {}", verdict(p));

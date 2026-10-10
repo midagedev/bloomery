@@ -1,0 +1,31 @@
+# qsamask's same-lease A/B: Qwen3.8's selecting rows (QSA unit B, rows whose count is past 2,051 keys and at most
+# MASK_KEYS = 16,384) as one whole-unit selection into a pool bitmap (qsa_score over row groups, qsa_topk_bits) and one
+# masked dense flash (gqa_prefill_flash_256_p4_sel), against the same walk's runs of 8 rows (four launches a run: score,
+# top-k, segment pass, merge; 1,024 launches a 2,048-row unit). Derived on the Mac, per 2,048-row unit B of a QSA layer
+# on the A6000 at P 4096 (design t1front C1, rounds qsamask): the front 32.40 ms = 9.06 (shared with unit A) + 23.34
+# (select + p12_sel + merge - D_A); after: 9.06 - D_A (0.70-1.03) + D_B (154.6 GF at 50-74 TF x 1.10-1.20 per-key mask =
+# 2.3-3.7) + select (score 0.15-0.3 + topk_bits ~0.5) = 10.6-14.3 ms, -18..-22 ms a QSA layer, 12 layers: card -217..-262 ms
+# a prompt of 1,950 ms wall at pass-through 0.78..0.90 -> pp 2,300..2,390 tok/s (+9..+14 %) from 2,100.4. 0 % at
+# P <= 2,048 (no row selects). The base binary is built at 61039d6e and kept on the box at /root/qsamask-base.
+# Runner (the lead's): BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_LOAD=arm BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/qsamask-pp.card'
+#   just depth-gpu-qwen4exp prose:4096 bin:/root/qsamask-base/generate_qwen3moe:prose:4096 prose:512 bin:/root/qsamask-base/generate_qwen3moe:prose:512
+#   and an untimed functional run of the bare arm under BLOOMERY_STEP_STATS=1 for the condition's records.
+kind: ab
+question: does one whole-unit selection and one masked dense flash replace the runs of 8 selecting rows in a P 4096 prompt's second unit on the A6000?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, plan (a), every lever unset (residency mid-p0-s1, split walk, MTP draft),
+  UD-Q4_K_XL, the masked selecting rows against the 61039d6e binary, paired by round
+unit: %
+predict: +9..+14
+rounds: 2
+sd: 0.78 % derived from rig-log 10-09#rel028-ab (P 4096 ratio 1.193 +- 0.021 at 4 paired rounds, paired SD 1.11 %,
+  over sqrt(2) for one run), prefill1-ab.card's derivation
+condition: one lease, BLOOMERY_AB_LOAD=arm, BLOOMERY_STEP_STATS=1 on a third untimed arm only; on that arm unit 1's
+  card_front_ms on each of the 12 QSA layers is 10.6-14.3 (today 32.40); both arms' plan lines are printed and the
+  card-expert delta between them stated (the new arm's whole-unit scratch, 16 MiB at most, is net arena growth); prose:512
+  rides beside at 0 % (no row selects); no [cold], [cpu-busy] or [other-busy] row
+decide-in: land: the masked path is the walk's default for rows of at most MASK_KEYS keys; read the P 8192 row beside
+  (more rows select, so more gain) before MASK_KEYS moves
+decide-below: ncu one masked gqa_prefill_flash_256_p4_sel launch before any retune: the band's top assumed D_A 2.0 ms
+  and a 1.20 mask factor; a front above 14.3 ms with the flash at the band is the select's term (topk_bits at 1 block an SM)
+decide-above: the front below 10.6 ms: D_A was nearer its 0.70 floor and the mask cost under 1.10; re-fit MASK_KEYS (the
+  crossover against the runs of 8 moves up)

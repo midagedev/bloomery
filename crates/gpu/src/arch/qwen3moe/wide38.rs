@@ -28,8 +28,11 @@
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
 //!   selected flash in runs of [`SELECT_ROWS`] from the first row that
-//!   selects; the pool pass over every row first, so a pool some row of the
-//!   unit completes is written before any row selects;
+//!   selects; the rows of at most [`MASK_KEYS`] keys instead in whole-unit
+//!   launches, one selection into a pool bitmap and one masked dense flash
+//!   (`qsa::qsa_topk_bits`, `enqueue_256_p4_sel`); the pool pass over every
+//!   row first, so a pool some row of the unit completes is written before
+//!   any row selects;
 //! - the conv, the delta step (the committed lane, in place), the gated
 //!   norm, the PLE gate and conv, the key append, the rope with the cache
 //!   append, the out gate and the gated sum the launches the other walks
@@ -171,7 +174,7 @@ use crate::q38::{
     CardAccArgs, CardSharedAddArgs, CardTierAccArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs,
     SharedAddArgs,
 };
-use crate::qsa::{self, PoolArgs, SelectArgs};
+use crate::qsa::{self, MaskArgs, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::{DeviceTensor, Window};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
@@ -184,6 +187,11 @@ use std::mem::ManuallyDrop;
 
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
+
+/// The most keys a selecting row may see for the masked flash to take it: its
+/// cost is the dense walk of every key below the row's count, so past this
+/// count the runs of [`SELECT_ROWS`] rows over the listed keys are cheaper.
+const MASK_KEYS: usize = 16_384;
 
 /// The indexer keys a select keeps, as `qsa::scored` takes them.
 const KEPT_U32: u32 = geo::KEPT as u32;
@@ -2207,6 +2215,62 @@ fn qsa(
     let width = q.sel.width();
     let idx = geo::IDX_HEADS * geo::IDX_DIM;
     let mut t0 = dense;
+    // The selecting rows with at most MASK_KEYS keys (the leading ones: the
+    // count grows with the row): one selection over them and one masked
+    // flash, a whole unit's rows in each launch the scratch holds.
+    if let Some(mask) = q.mask.as_mut() {
+        let end = MASK_KEYS.saturating_sub(u.pos0).clamp(dense, m);
+        while t0 < end {
+            let n = mask.rows().min(end - t0);
+            // SAFETY: rows t0 .. t0 + n <= m of the indexer queries, the
+            // queries and the flash's output (`rows` rows each) and of the
+            // unit's counts (`m` rows); they stay in place for this chunk's
+            // launches.
+            let (qi, nw, qw, mut yw) = unsafe {
+                (
+                    f32_view(&q.qi, t0 * idx, n * idx),
+                    param_view::<u32>(&u.n_keys, t0, n),
+                    f32_view(&q.q, t0 * geo::ATTN, n * geo::ATTN),
+                    f32_view(flash, t0 * geo::ATTN, n * geo::ATTN),
+                )
+            };
+            c.k.qsa.enqueue_select_mask(
+                stream,
+                MaskArgs {
+                    q: &qi,
+                    gain: f32_gain(w, &qp.idx_q_norm)?,
+                    table: c.table,
+                    n_keys: &nw,
+                    pooled: &*pooled,
+                    eps: c.eps,
+                    ctx,
+                    kept: geo::KEPT,
+                    m: n,
+                    fault: sink,
+                    scratch: &mut *mask,
+                },
+            )?;
+            c.k.prefill.enqueue_256_p4_sel(
+                stream,
+                GqaPrefillArgs {
+                    q: &qw,
+                    kc: kcache,
+                    vc: vcache,
+                    n_keys: &nw,
+                    scale: ATTN_SCALE_256,
+                    n_head: geo::N_HEAD,
+                    n_kv: geo::N_KV,
+                    ctx,
+                    t: n,
+                    fault: sink,
+                    y: &mut yw,
+                },
+                &mask.bits,
+                mask.words(),
+            )?;
+            t0 += n;
+        }
+    }
     while t0 < m {
         let n = SELECT_ROWS.min(m - t0);
         // SAFETY: rows t0 .. t0 + n <= m of the indexer queries, the queries

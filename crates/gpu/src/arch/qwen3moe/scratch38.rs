@@ -22,7 +22,7 @@ use crate::flash_gqa::{listed_partials_ms_len, listed_partials_v_len_256};
 use crate::hc_gated::HcScratch;
 use crate::linear::{self, LinearShape};
 use crate::ple;
-use crate::qsa::{self, QsaScratch};
+use crate::qsa::{self, QsaMaskScratch, QsaScratch};
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
 use runtime::stores;
@@ -254,6 +254,9 @@ pub(super) struct Qsa38 {
     pub(super) qi: DeviceBuffer<f32>,
     /// The selection's queries, scores and lists.
     pub(super) sel: QsaScratch,
+    /// A whole unit's selection (query heads, scores, bitmaps) for the masked
+    /// flash: held by a ubatch walk's arena of more than [`SELECT_ROWS`] rows.
+    pub(super) mask: Option<QsaMaskScratch>,
 }
 
 /// The PLE site's intermediates: the rows the host gathered (`e`), the key
@@ -403,6 +406,9 @@ impl Arena38 {
                 qr: f(geo::IDX_HEADS * geo::IDX_DIM)?,
                 qi: f(geo::IDX_HEADS * geo::IDX_DIM)?,
                 sel: QsaScratch::new(stream, sel, ctx, geo::KEPT)?,
+                mask: (rows > SELECT_ROWS)
+                    .then(|| QsaMaskScratch::new(stream, qsa::mask_rows(ctx, rows), ctx))
+                    .transpose()?,
             },
             ple: Ple38 {
                 e: f(h)?,
@@ -488,6 +494,7 @@ impl Arena38 {
             .iter()
             .map(|b| b.num_bytes())
             .sum::<usize>()
+            + q.mask.as_ref().map_or(0, QsaMaskScratch::bytes)
             + self.route.bytes()
     }
 }

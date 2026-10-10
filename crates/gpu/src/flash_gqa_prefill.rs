@@ -664,10 +664,11 @@ const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
+unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const SEL: bool, S: KvSrc>(
     q: &[f32],
     src: S,
     n_keys_buf: &[u32],
+    (bits, words): (&[u32], usize),
     scale: f32,
     n_kv: u32,
     ctx: u32,
@@ -782,6 +783,18 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     }
     if lane == 0 && dh == 0 && any_bad {
         fault.raise(FaultSite::KeyCount);
+    }
+    // A selecting block's two rows' bitmaps (`SEL`): the word of row `t` that
+    // holds a key tile's sixteen pools is `bits[t·words + kb/2]`.
+    let mut brow = [usize::MAX; 2];
+    if SEL {
+        for h in 0usize..2 {
+            cuda_device::thread::__unroll_config::<0>();
+            let t = t0 + pps * rs + row_pos::<PACK>(g, h);
+            if t < rows {
+                brow[h] = t * words;
+            }
+        }
     }
 
     // The block's query rows, rounded to f16 pairs, into the key tile:
@@ -1052,6 +1065,21 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     let mut kb = 0u32;
     while kb < tiles {
         let end = KEY_TILE_U32 * (kb + 1);
+        // The sixteen pool bits of each of this lane's two rows for tile `kb`
+        // (`SEL`), loaded ahead of the scores; a row past `t_rows` has none.
+        let mut mw = [0u32; 2];
+        if SEL {
+            for h in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                if brow[h] != usize::MAX {
+                    // SAFETY: brow[h] = t·words with t < t_rows, and kb/2 <
+                    // words (64·kb < hi <= ctx, words·128 >= ctx): below
+                    // t_rows·words <= bits.len() (launch contract).
+                    mw[h] = unsafe { *bits.get_unchecked(brow[h] + (kb >> 1) as usize) };
+                }
+            }
+        }
+        let sh = 16 * (kb & 1);
         // Key tile kb has landed, and every warp is done reading the
         // value tile of kb − 1 and the exchange of kb − 1.
         // SAFETY: waits for this thread's outstanding groups; the barrier
@@ -1124,6 +1152,18 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                 }
             }
 
+            // Whether key `$key` of lane row `$h`, in key group `$nt`, is one the
+            // row attends: below its count, and under `SEL` in a kept pool or in
+            // the tail. A lane's two keys of a group share a pool (`2·t4` is even
+            // and the pool is four keys).
+            macro_rules! visible {
+                ($h:expr, $nt:expr, $key:expr) => {
+                    $key < cnt[$h]
+                        && (!SEL
+                            || (mw[$h] >> (sh + 2 * ($nt as u32) + (t4 >> 1) as u32)) & 1 != 0
+                            || $key >= (cnt[$h] & !3))
+                };
+            }
             // The softmax over the tile's scores, the 128 body's.
             macro_rules! softmax {
                 ($masked:literal) => {{
@@ -1134,7 +1174,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                         for j in 0usize..4 {
                             cuda_device::thread::__unroll_config::<0>();
                             let key = kb0 + (8 * nt + j % 2) as u32;
-                            let v = if !$masked || key < cnt[j / 2] {
+                            let v = if !$masked || visible!(j / 2, nt, key) {
                                 mul_rn_f32(sc[nt][j], scale)
                             } else {
                                 f32::NEG_INFINITY
@@ -1169,12 +1209,12 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                             let j0 = 2 * (e % 2);
                             let h = e % 2;
                             let key = kb0 + (8 * nt) as u32;
-                            let p0 = if !$masked || key < cnt[h] {
+                            let p0 = if !$masked || visible!(h, nt, key) {
                                 exp_weight(sc[nt][j0] - mn[h])
                             } else {
                                 0.0
                             };
-                            let p1 = if !$masked || key + 1 < cnt[h] {
+                            let p1 = if !$masked || visible!(h, nt, key + 1) {
                                 exp_weight(sc[nt][j0 + 1] - mn[h])
                             } else {
                                 0.0
@@ -1187,7 +1227,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                     }
                 }};
             }
-            if end <= warp_lo {
+            if !SEL && end <= warp_lo {
                 softmax!(false);
             } else {
                 softmax!(true);
@@ -2293,10 +2333,74 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, _>(
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _>(
                 q,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
+                (&[], 0),
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                packs as usize,
+                fault,
+                y,
+            )
+        };
+    }
+
+    /// [`gqa_prefill_flash_256_p4`] over a selecting row's visible keys
+    /// ([`prefill_256_p`] at `SEL`): row `t` attends key `k < n_keys_buf[t]`
+    /// when pool `k / 4` is set in its bitmap (`bits[t·words ..]`, `words` u32
+    /// a row, bit `p % 32` of word `p / 32`) or `k` is in its tail, `k >=
+    /// 4·(n_keys_buf[t] / 4)` — the keys the selection's list names
+    /// ([`crate::qsa::qsa_kernels::qsa_topk_bits`]), at every tile, in key
+    /// order, one running softmax: no partials and no merge.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 98304,
+        requires = (
+            n_keys_buf.len() >= t_rows,
+            words * 128 >= ctx,
+            bits.len() >= t_rows * words,
+            q.len() >= t_rows * n_kv * packs * 4 * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            y.len() >= t_rows * n_kv * packs * 4 * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p4_sel(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        bits: &[u32],
+        words: u32,
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        t_rows: u32,
+        packs: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `prefill_256_p`'s at `packs · PACK_4`
+        // heads per key head plus the bitmap's bound, and the block is
+        // THREADS_256 threads with DYN_BYTES_256 bytes of dynamic shared
+        // memory.
+        unsafe {
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, true, _>(
+                q,
+                F16Kv { k: kc, v: vc },
+                n_keys_buf,
+                (bits, words as usize),
                 scale,
                 n_kv,
                 ctx,
@@ -2346,10 +2450,11 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, _>(
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, false, _>(
                 q,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
+                (&[], 0),
                 scale,
                 n_kv,
                 ctx,
@@ -2403,10 +2508,11 @@ mod flash_gqa_prefill_kernels {
         // THREADS_256 threads with DYN_BYTES_256_Q8 bytes of dynamic shared
         // memory.
         unsafe {
-            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, _>(
+            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, false, _>(
                 q,
                 Q8Kv { kq, kd, vq, vd },
                 n_keys_buf,
+                (&[], 0),
                 scale,
                 n_kv,
                 ctx,
@@ -3206,7 +3312,31 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p4", stream, args, PACK_4)
+        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p4", stream, args, PACK_4, None)
+    }
+
+    /// [`FlashGqaPrefill::enqueue_256_p4`] over each row's visible keys
+    /// (`gqa_prefill_flash_256_p4_sel`): `bits` is `args.t` rows of `words` u32
+    /// (`words · 128 >= ctx`), row `t`'s kept pools as the selection's
+    /// `qsa_topk_bits` wrote them; a row attends its tail and the keys of its
+    /// kept pools, every other key is masked. The refusals are `enqueue_256_p4`'s
+    /// and the bitmap's (shorter than `t · words`, or `words` short of the
+    /// cache), by name before any launch. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_256_p4_sel(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+        bits: &DeviceBuffer<u32>,
+        words: usize,
+    ) -> Result<(), GpuError> {
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p4_sel",
+            stream,
+            args,
+            PACK_4,
+            Some((bits, words)),
+        )
     }
 
     /// [`FlashGqaPrefill::enqueue_256_p4`] in blocks of [`PACK_2`]: `n_head` a
@@ -3218,7 +3348,7 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p2", stream, args, PACK_2)
+        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p2", stream, args, PACK_2, None)
     }
 
     /// The packed entries' one launcher: the group refused unless a nonzero
@@ -3230,6 +3360,7 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
         pack: usize,
+        sel: Option<(&DeviceBuffer<u32>, usize)>,
     ) -> Result<(), GpuError> {
         let GqaPrefillArgs {
             q,
@@ -3260,6 +3391,18 @@ impl FlashGqaPrefill {
             ));
         }
         let packs = n_head / (n_kv * pack);
+        if let Some((bits, words)) = sel {
+            if pack != PACK_4 || words * 128 < ctx || bits.len() < t * words {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "the bitmap form is the p4 entry's, over words*128 >= ctx and t*words \
+                         bits; got pack={pack} words={words} ctx={ctx} bits.len()={} t={t}",
+                        bits.len()
+                    ),
+                ));
+            }
+        }
         let lens = [
             ("q", q.len(), t * n_head * HEAD_256),
             ("kc", kc.len(), n_kv * ctx * HEAD_256),
@@ -3308,12 +3451,34 @@ impl FlashGqaPrefill {
                     stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
                 )?;
             }
-            PACK_4 => {
-                let prep = self.module.prepare_gqa_prefill_flash_256_p4(cfg)?;
-                self.module.gqa_prefill_flash_256_p4(
-                    stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
-                )?;
-            }
+            PACK_4 => match sel {
+                Some((bits, words)) => {
+                    let prep = self.module.prepare_gqa_prefill_flash_256_p4_sel(cfg)?;
+                    self.module.gqa_prefill_flash_256_p4_sel(
+                        stream,
+                        &prep,
+                        q,
+                        kc,
+                        vc,
+                        n_keys,
+                        bits,
+                        launch_u32(what, "words", words)?,
+                        scale,
+                        n_kv,
+                        ctx,
+                        t,
+                        packs,
+                        fault,
+                        y,
+                    )?;
+                }
+                None => {
+                    let prep = self.module.prepare_gqa_prefill_flash_256_p4(cfg)?;
+                    self.module.gqa_prefill_flash_256_p4(
+                        stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
+                    )?;
+                }
+            },
             _ => {
                 return Err(GpuError::shape(
                     what,
