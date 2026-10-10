@@ -1,7 +1,7 @@
 # AGENTS.md — bloomery
 
 An LLM inference engine for one workstation: Rust host, CUDA-Rust kernels (cuda-oxide today, cutile-rs later), AVX2
-kernels for the CPU expert tier. The plan lives in `docs/plan.md`. This file is the working contract, and it holds only
+kernels for the CPU expert tier. The plan lives in rig-log's `docs/bloomery/plan.md` (`~/repo/rig-log`, public). This file is the working contract, and it holds only
 rules in force; their history is in rig-log, the commit log, and this file at `4e7fa8af`.
 
 To run or evaluate bloomery rather than develop it, read the README's "Status" section and
@@ -135,7 +135,7 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
 
 ## Derive first, measure the gap
 
-A round opens with a prediction: the value and band derived from the cost and error models in `docs/plan.md`
+A round opens with a prediction: the value and band derived from the cost and error models in rig-log `docs/bloomery/plan.md`
 (「모델」), and the proof its change class needs. When the measurement misses, which term was wrong is the finding.
 
 | Change class | Proof | Runtime gate | Timed A/B |
@@ -160,7 +160,7 @@ lease (fd 9) until it exits; the waiter names every holder within seconds, and e
 **Draw the resource timeline:** per unit of work, how long the host CPU, card SMs, PCIe, host DRAM and NVMe are each
 busy, and whether the wall is their sum or one resource's max; ask whether the flow should change (asynchrony, bulk,
 SIMD, SIMT) before a term is shortened. A term under another resource's shadow is worth 0
-(worked example: `docs/plan.md` 「흐름 모델」).
+(worked example: rig-log `docs/bloomery/plan.md` 「흐름 모델」).
 
 The busiest unit is not the bound until the step's cycles are its demand: write every unit's demand next to the step's
 cycles in the same unit; when the largest is well under the step, the step is latency the resident warps do not hide,
@@ -240,7 +240,7 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
 
 ## Sessions, tracking and delegation
 
-- **Open work has one owner, `docs/plan-triage.md`.** The self-hosted tracker's **MUL** project holds only stage
+- **Open work has one owner, rig-log `docs/bloomery/plan-triage.md`.** The self-hosted tracker's **MUL** project holds only stage
   milestones (MUL-1 to MUL-5), machine changes (MUL-6) and upstream work (MUL-7), never a copy of a triage item:
   `GADAK_HOME=$HOME/.gadak gadak --workspace gdk` (on the Mac `/opt/homebrew/bin/gadak`); comments are
   `gadak --workspace gdk comment <KEY> "<body>"` (not `issue comment`). Do not open `TODO.md`.
@@ -252,7 +252,7 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
 - **Delegation.** Spec-able rounds go to GLM-5.3 through the `outsource` skill (`--effort max`, claude-code harness, one
   worktree per track); investigation-only rounds may go to agy; opus subagents (`model:"opus"` stated) are the
   exceptions: vision, multi-turn cause narrowing, re-judging a verdict that disagrees with its instrument. Round
-  operation is `docs/plan.md` 「라운드 운영」. Copy the relevant clauses of this file into the spec. A delegate's report
+  operation is rig-log `docs/bloomery/plan.md` 「라운드 운영」. Copy the relevant clauses of this file into the spec. A delegate's report
   is not evidence: count the tool calls in its transcript and read its worktree's `git status`, then re-run the gates
   under the lead's ownership. Commits and pushes are lead-only.
 
@@ -272,8 +272,10 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile; excluded from the workspace
     tools/ref/          C++ harnesses linking ggml, and the lease runners
     tools/bloomery/     the Python side's one reader per fact: records.py, manifest.py
-    docs/plan.md        what is live; docs/facts.md machine and toolchain facts; docs/plan-triage.md open items;
-                        docs/plan-ledger.md what is closed; docs/research/ sourced surveys
+    docs/research/      the design docs code cites, and the v41-placement scripts
+    rig-log docs/bloomery/   plan.md what is live, facts.md machine and toolchain facts, plan-triage.md open items,
+                        plan-ledger.md what is closed, research/ sourced surveys (`~/repo/rig-log`, public: its
+                        CLAUDE.md's privacy grep before a push)
 
 ## Conventions
 

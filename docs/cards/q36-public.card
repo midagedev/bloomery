@@ -4,7 +4,7 @@
 # LLM_ARCH_QWEN35MOE). The file is lmstudio's Q4_K_M (tools/ref/models/qwen35moe.sh).
 #
 # Every row's prediction [derived; nothing of Qwen3.6 has been timed on the A6000 yet]:
-#   ours decode, depth 6       183..205 tok/s  (docs/research/qwennext-lit-report.md: 1,975.7 MB a
+#   ours decode, depth 6       183..205 tok/s  (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwennext-lit-report.md: 1,975.7 MB a
 #                                               step at 426..455 GB/s, the rate Qwen3's 4.728 ms
 #                                               step leaves after its nodes, + 520 nodes x
 #                                               0.37..0.85 us + the GDN state and conv 0.31 ms)

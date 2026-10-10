@@ -324,7 +324,7 @@ bench-gpu-kernels *ARGS:
 # The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_gemm --bench-kernels --bench-arm ARM (default
 # gemm_q4k_moe_t4096: 128 experts of 768 x 2048 Q4_K, top-8, T = 4096) runs that one arm, and ncu takes 16 of its eager
 # gemm_q4k launches after the 64-launch warm-up burst; the form and its levers are in the header of tools/ref/ncu-gpu.sh.
-# Expected on main [derived, docs/research/q3next-design-report.md sections 3 and 6; not numbers of record]: L1TEX
+# Expected on main [derived, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3next-design-report.md sections 3 and 6; not numbers of record]: L1TEX
 # 55-65 % and the top unit, about 1.29e8 LSU data-pipe wavefronts a launch, issue-active 35-40 %, tensor 22-26 %, DRAM
 # 10-15 %. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
 ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
@@ -346,7 +346,7 @@ ncu-gpu-ds41-pp P='512':
 # tensor pipe's HMMA count, which depends on the ubatch's rows and position (34,078,720). Then the clock, the step's
 # cycles and each unit's demand beside them, and the stall composition. BLOOMERY_NCU_BIN=<absolute path> profiles
 # another tree's generate_qwen3moe instead (nothing is built). Expected on main for gqa_prefill_flash at P = 4096 [derived,
-# docs/research/q3tail-design-report.md 3.2 and 4; not numbers of record]: SM clock 1.46-1.55 GHz, tensor pipe 56-60 %,
+# https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3tail-design-report.md 3.2 and 4; not numbers of record]: SM clock 1.46-1.55 GHz, tensor pipe 56-60 %,
 # issue 0.36-0.40 a scheduler, 3,400-3,620 SM cycles a block-step. The header of tools/ref/ncu-gpu.sh has the form.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints the derivation and its command line.
 ncu-gpu-qwen3-pp P='4096' LAYER='24' KERNEL='gqa_prefill_flash':
@@ -360,7 +360,7 @@ time-gpu-cnode:
     ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin cnode_probe && bash tools/ref/time-gate.sh cnode_probe'
 
 # 호스트 → 카드 링크(리드 전용): `nvidia-smi topo -m`과 카드마다 PCI 주소·sysfs 경로·링크를 찍고, A6000에서 1 GiB pinned와
-# pageable(facts.md의 교정값), 1.6 GB pinned 복사 48회 연속(복사마다 GB/s의 퍼짐, 복사 중에 읽은 링크)을 잰다.
+# pageable(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md의 교정값), 1.6 GB pinned 복사 48회 연속(복사마다 GB/s의 퍼짐, 복사 중에 읽은 링크)을 잰다.
 # BLOOMERY_CARD=both면 3090 단독과 두 카드 동시 복사(카드별 율과 합)도 잰다. 임대·증인·Xid 수는 tools/ref/h2d-pcie.sh가
 # 쥐고, 카드는 docs/cards/pcie-a6000.card다. 예: `BLOOMERY_CARD=both BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pcie-a6000.card' just time-gpu-h2d`.
 time-gpu-h2d:
@@ -500,7 +500,7 @@ build-decode:
 measure-decode: build-decode
     ./tools/box.sh 'bash tools/ref/decode-measure.sh'
 
-# 스레드 스윕. 같은 임대 안에서 1/8/16/32를 연달아 돌린다 — plan.md의 "스레드 수는
+# 스레드 스윕. 같은 임대 안에서 1/8/16/32를 연달아 돌린다 — https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md의 "스레드 수는
 # 재서 정한다"가 이것이고, 답은 이 티어가 대역폭에 닿는 지점이다.
 measure-sweep: build-decode
     ./tools/box.sh 'NOCACHE=0 SWEEP="1 8 16 32 64" bash tools/ref/decode-measure.sh'
@@ -1217,7 +1217,7 @@ dump-ref-dequant:
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
 gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
-# The smoke tier (docs/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
+# The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
 # through tools/gate-batch.sh (its header: the list, lanes, logs, DONE line); ARGS go to it (--dry-run, --out DIR,
 # --lanes 1). It refuses to start while the timing lease is held.
@@ -1232,9 +1232,12 @@ weekly *ARGS:
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.
-inventory-v41:
+# 회수한 표는 OUT(기본 target/v41-inventory.md)에 놓인다. 문서 사본(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/v41-inventory.md)은 rig-log docs/bloomery/에 있고
+# 이 트리에 쓰지 않는다.
+inventory-v41 OUT='target/v41-inventory.md':
     ./tools/box.sh 'cargo run --release -p bloomery-gguf --bin gguf-inventory -- --markdown /tmp/v41-inventory.md "$BLOOMERY_V41_DIR"/*-0000*-of-00009.gguf'
-    scp "${BLOOMERY_BOX:-ws}:/tmp/v41-inventory.md" docs/v41-inventory.md
+    mkdir -p "$(dirname {{OUT}})"
+    scp "${BLOOMERY_BOX:-ws}:/tmp/v41-inventory.md" {{OUT}}
 
 # GPU 헤드(P8의 head 조각): result_norm → lm_head(Q6_K) → argmax를 그래프 하나로 잡아
 # 덤프의 마지막 토큰과 대조(정확성 실행, 핀된 헤드 밴드 안).
@@ -1856,7 +1859,7 @@ nsys-gpu-qwen3moe *DEPTHS:
 # depth runner's `<P>` arm) at each length P (default 4096, one ubatch at the default ubatch size), then
 # BLOOMERY_NSYS_N - 1 replays; the table is the prompt's window, its units and the head, per kernel, with the grouped
 # GEMM summed. The header of tools/ref/nsys-gpu.sh has the boundary. Expected at P = 4096 on main [derived,
-# docs/research/q3next-design-report.md; not numbers of record]: gemm_q4k + gemm_q6k about 62 % of the prompt,
+# https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3next-design-report.md; not numbers of record]: gemm_q4k + gemm_q6k about 62 % of the prompt,
 # qwen3moe_router_logits 0.36-0.54 ms a launch. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe-prefill *PROMPTS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'

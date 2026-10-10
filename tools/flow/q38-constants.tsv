@@ -3,24 +3,24 @@
 # (no record; the tornado's inputs). anchor: the backtest row or anchor set a value was taken from; that row is not scored against it.
 # Rows tagged prose come from the one Qwen3.8 route trace there is (prose); no chat trace exists.
 name	value	lo	hi	unit	kind	conditions	source	anchor	note
-n_layer	48	48	48	layers	derived	Qwen3.8-Flash-Next	crates/gpu/src/arch/qwen3moe/plan38.rs geo; docs/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
-n_qsa	12	12	12	layers	derived	the selecting-attention layers (compress_ratios > 0), the rest gated DeltaNet	docs/research/qwen4arch-design.md §2 compress row, §4 coverage list (12 QSA layers)		
-n_expert	512	512	512	experts/layer	derived		crates/gpu/src/arch/qwen3moe/plan38.rs geo; docs/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
-top_k	10	10	10	slots/token	derived		crates/gpu/src/arch/qwen3moe/plan38.rs geo; docs/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
-hidden	2560	2560	2560	values	derived		crates/gpu/src/arch/qwen3moe/plan38.rs geo; docs/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
-expert_b	3133867	3072000	3368000	B	derived	the mean routed expert of UD-Q4_K_XL: 77,017,907,200 B over 24,576	docs/research/qwen4arch-design.md §5 bytes table; lo the common Q4_K/Q5_1 layer, hi a Q8_0-down layer		
-expert_b_q4	3072000	3072000	3072000	B	derived	the common layer kind (Q4_K gate, up 921,600 each + Q5_1 down 1,228,800), the walk's expert_b	crates/runtime/src/xsplit.rs tests a6000(); qwen4arch-design.md §5		
-dense_front_b	81334347	81334347	81334347	B/layer	derived	a layer's card dense bytes but the shared expert: (4,830,154,240 - head 675,430,400 - 48 x 5,222,400) / 48	docs/research/qwen4arch-design.md §5 '카드 dense 바이트/토큰' (incl. the F32 router)		
-shared_b	5222400	5222400	5222400	B/layer	derived	Q8_0 3 x 2560 x 640 x 34/32	qwen4arch-design.md §4 '공유 expert ... 5.22 MB/층'		
-head_b	675430400	675430400	675430400	B	derived	Q8_0 output 248,320 x 2560	qwen4arch-design.md §5		
-kv_b_pos	2048	2048	2048	B/position/QSA layer	derived	K and V f16, 2 kv heads x 256	qwen4arch-design.md §4 GQA row (24,576 n B a token over 12 layers)		
-idx_b_pos	64	64	64	B/position/QSA layer	derived	the pooled indexer key f16, 128 values a 4-token block	qwen4arch-design.md §4 '풀링 캐시 768 n B/토큰(f16)' over 12 layers		
-qsa_select	2051	2051	2051	positions	derived	top 512 blocks + tail: positions 0..2050 select every key	qwen4arch-design.md §3 C		
+n_layer	48	48	48	layers	derived	Qwen3.8-Flash-Next	crates/gpu/src/arch/qwen3moe/plan38.rs geo; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
+n_qsa	12	12	12	layers	derived	the selecting-attention layers (compress_ratios > 0), the rest gated DeltaNet	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §2 compress row, §4 coverage list (12 QSA layers)		
+n_expert	512	512	512	experts/layer	derived		crates/gpu/src/arch/qwen3moe/plan38.rs geo; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
+top_k	10	10	10	slots/token	derived		crates/gpu/src/arch/qwen3moe/plan38.rs geo; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
+hidden	2560	2560	2560	values	derived		crates/gpu/src/arch/qwen3moe/plan38.rs geo; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §2 (UD-Q4_K_XL header)		
+expert_b	3133867	3072000	3368000	B	derived	the mean routed expert of UD-Q4_K_XL: 77,017,907,200 B over 24,576	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §5 bytes table; lo the common Q4_K/Q5_1 layer, hi a Q8_0-down layer		
+expert_b_q4	3072000	3072000	3072000	B	derived	the common layer kind (Q4_K gate, up 921,600 each + Q5_1 down 1,228,800), the walk's expert_b	crates/runtime/src/xsplit.rs tests a6000(); https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §5		
+dense_front_b	81334347	81334347	81334347	B/layer	derived	a layer's card dense bytes but the shared expert: (4,830,154,240 - head 675,430,400 - 48 x 5,222,400) / 48	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §5 '카드 dense 바이트/토큰' (incl. the F32 router)		
+shared_b	5222400	5222400	5222400	B/layer	derived	Q8_0 3 x 2560 x 640 x 34/32	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §4 '공유 expert ... 5.22 MB/층'		
+head_b	675430400	675430400	675430400	B	derived	Q8_0 output 248,320 x 2560	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §5		
+kv_b_pos	2048	2048	2048	B/position/QSA layer	derived	K and V f16, 2 kv heads x 256	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §4 GQA row (24,576 n B a token over 12 layers)		
+idx_b_pos	64	64	64	B/position/QSA layer	derived	the pooled indexer key f16, 128 values a 4-token block	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §4 '풀링 캐시 768 n B/토큰(f16)' over 12 layers		
+qsa_select	2051	2051	2051	positions	derived	top 512 blocks + tail: positions 0..2050 select every key	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md §3 C		
 mtp_dense_b	8532140	8532140	8532140	B	derived	the draft layer's own card bytes but its experts and head list: 2,860,658,860 - 512 x 5,222,400 - 178,257,920	rig-log specs/leader/tape028/cand-a.log 'load draft=mtp ... card_bytes=2860658860' (0.2.8 serve, A6000)		
 mtp_expert_b	5222400	5222400	5222400	B	derived	a Q8_0 draft expert, ten a walk	rig-log 2026-09-30 #q38mtp-wide ('드래프트의 expert 512개(Q8_0, 2.67 GB)')		
-draft_experts	933	913	933	experts	derived	target card experts the draft's 2.86..2.91 GB displaces	docs/plan-triage.md 'The draft holds 933 card experts'; lo 2,860,658,860 / 3,133,867		
+draft_experts	933	913	933	experts	derived	target card experts the draft's 2.86..2.91 GB displaces	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md 'The draft holds 933 card experts'; lo 2,860,658,860 / 3,133,867		
 ubatch_max	4096	4096	4096	rows	derived	prefill=auto ubatch=4096 on every plan a/bp load	tape028/cand-a.log load line; issue1-comments.md 5090 load line		
-bw_a6000_gbs	674	674	674	GB/s	measured	A6000 large launches, the rate the anchors' byte parts are taken at	tools/flow/constants.tsv bw_card (docs/plan.md 비용 모델 BW(큰 런치))	Adec	
+bw_a6000_gbs	674	674	674	GB/s	measured	A6000 large launches, the rate the anchors' byte parts are taken at	tools/flow/constants.tsv bw_card (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md 비용 모델 BW(큰 런치))	Adec	
 front_us_a6000	194	180	205	us/layer	derived	A6000 decode, depth ~6..512: the mixes, the mixer, the router, the handoff and go (C_front / 48)	docs/cards/q38legs-tg.card ('card front 194 us'); docs/cards/q38bpbug-ab.card resource timeline ('A6000 front ~194 us')	Adec	
 shared_us_a6000	24	20	28	us/layer	derived	A6000, the shared expert's four launches at one row	docs/cards/q38legs-tg.card ('shared expert 24 us')	Adec	
 leg_launch_us_a6000	14	10	18	us/layer	derived	A6000, the card leg's five launches beside its experts' bytes	docs/cards/q38legs-tg.card ('the leg's five launches 14 us')	Adec	
@@ -123,22 +123,22 @@ a6000.hit_chat	0.9	0.85	0.95	of slots	assumed	chat on the full A6000 (no chat tr
 3090.hit_chat	0.62	0.5	0.72	of slots	assumed	chat on a lone 3090's server, 3,336 card experts (no Qwen3.8 chat trace exists)	the prose replay's 0.655 less the 5090 band's chat derate		
 5090.hit_chat	0.86	0.78	0.91	of slots	assumed	chat at 5,482 card experts (no Qwen3.8 chat trace exists)	lo the prose mid replay; hi the #3 stream's off-converged pool (42.4 slots at ~6,800, specs/leader/longgap/report2.md §4) scaled by the prose replay's misses 6,810 -> 5,482		
 E_prose	3.3	3.06	3.69	positions/window	measured	A6000 prose, 4-row windows	rig-log 2026-09-30 #q38res-hit (3.46 P 512, 3.06 P 4096); 2026-10-01 #q38hol-ab (3.69, 3.10)		
-E_chat	2.4	2.17	2.65	positions/window	measured	English chat greedy (ours) and the user's 5090 chat (acceptance 0.44..0.55 x 3 drafts)	docs/plan-triage.md G section (2.17-2.46); specs/leader/chatarm/report.md (en 2.52-2.58); issue3-thread.md comment 6056301837		
+E_chat	2.4	2.17	2.65	positions/window	measured	English chat greedy (ours) and the user's 5090 chat (acceptance 0.44..0.55 x 3 drafts)	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md G section (2.17-2.46); specs/leader/chatarm/report.md (en 2.52-2.58); issue3-thread.md comment 6056301837		
 a6000.host_threads_base	32	32	32	threads	derived	the host pool's expert threads the measured W and c ran at	rig-log 2026-09-28 #q38-union (32 threads)		
-a6000.core_dram_gbs	12.0	8.0	20.0	GB/s/thread	assumed	one Zen 3 core's share of a streaming read when the pool is capped below the channels' rate	no record; the thread-cap ruler (docs/plan-triage.md G5) measures it		
+a6000.core_dram_gbs	12.0	8.0	20.0	GB/s/thread	assumed	one Zen 3 core's share of a streaming read when the pool is capped below the channels' rate	no record; the thread-cap ruler (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md G5) measures it		
 a6000.card_bw_gbs	674	567	701	GB/s	measured	A6000 large launches	tools/flow/constants.tsv bw_card; datasheet 768 GB/s (NVIDIA RTX A6000 datasheet, fetched 2026-10-09: 'Memory bandwidth 768 GB/s')		
 a6000.lat_ratio	1.0	1.0	1.0	x A6000	derived	the anchors' own card	definition		
 a6000.layer_extra_us	0.0	0.0	0.0	us/layer	derived	native Linux	definition		
 a6000.host_w_us	23.36	22.9	23.6	us/slot	measured	one host expert at one column, 32 threads, Q4	rig-log 2026-09-28 #q38-union (32 x 1: 23.36); 2026-09-30 #q38res-hit (in-arm slope 23.6)		
-a6000.host_w_eff	0.908	0.85	0.95	of DRAM	derived	the pool's share of host DRAM on one expert: 3.134 MB / 23.36 us / 147.7 GB/s	rig-log 2026-09-28 #q38-union; docs/facts.md 147.7		
+a6000.host_w_eff	0.908	0.85	0.95	of DRAM	derived	the pool's share of host DRAM on one expert: 3.134 MB / 23.36 us / 147.7 GB/s	rig-log 2026-09-28 #q38-union; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md 147.7		
 a6000.host_svc_us	8.0	5.0	18.0	us/layer	derived	a layer's service outside its experts (list, dispatch, sum write)	specs/leader/ppgap/func-arm2-stepstats.log (leg_us over 15 steps: 7.3 + 23.4 a slot); docs/cards/q38bpbug-ab.card bp leg 35.3 at 0.7 slots (18)		
 a6000.union_c_us	3.67	3.4	4.0	us/column	measured	the host union's per-column cost, Q4, 32 threads, beside the pick's copies	crates/gpu/src/arch/qwen3moe/body38.rs:817 XSTREAM_COSTS (the pickrule fit of q0's stat prompt lb walls)	Aq0	
 a6000.union_W_us	19.95	18.0	23.36	us/expert	measured	the host union's per-expert floor (weight listing), 32 threads	body38.rs:817 XSTREAM_COSTS	Aq0	
 a6000.union_copy_slow	0.0	0.0	0.0057	per GB/s of copy	derived	the union's loss per GB/s of staging beside it past the 13.5 the fit ran beside	rig-log 2026-09-28 #q38-dram-share (43.32 -> 38.12 GB/s beside 21.19: 0.0057); 0 at the fit's own rate		B2 reads its upper end
-a6000.host_dram_gbs	147.7	140	155	GB/s	measured	Threadripper PRO 5975WX, 8 channels, 32 threads	docs/facts.md (147.7)		
-a6000.pcie_h2d_gbs	26.28	26.28	26.28	GB/s	measured	A6000 H2D pinned, PCIe 4.0 x16	docs/facts.md; rig-log 2025-09-25 #m2-h2d-a6000; PCIe 4.0 x16 31.508 GB/s (Wikipedia PCI Express table, fetched 2026-10-09)		
+a6000.host_dram_gbs	147.7	140	155	GB/s	measured	Threadripper PRO 5975WX, 8 channels, 32 threads	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md (147.7)		
+a6000.pcie_h2d_gbs	26.28	26.28	26.28	GB/s	measured	A6000 H2D pinned, PCIe 4.0 x16	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md; rig-log 2025-09-25 #m2-h2d-a6000; PCIe 4.0 x16 31.508 GB/s (Wikipedia PCI Express table, fetched 2026-10-09)		
 a6000.pcie_d2h_gbs	22.1	20.0	26.28	GB/s	derived	the prompt front's D2H of 10,328 B a row	specs/worker2/pickrule-q0/q0.log card_down_ms 91.6 over 48 x 4096 rows	Aq0	
-a6000.tier_pcie_gbs	24.0	20.0	26.28	GB/s	assumed	the 3090's PCIe 4.0 link for the tier's rows	docs/facts.md (both cards PCIe 4.0 x16)		
+a6000.tier_pcie_gbs	24.0	20.0	26.28	GB/s	assumed	the 3090's PCIe 4.0 link for the tier's rows	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md (both cards PCIe 4.0 x16)		
 a6000.lane_gbs	20.41	19.0	21.4	GB/s	measured	the load's lane probe the walk prices copies with, and the staging path's rate alone (checked: s0b's copies ahead of the union 229 MB in 10.72 ms = 21.4)	q0.log 'xstream_lane_gbs=20.41'; pickrate-c1-ab.card band 19.0..21.4		
 a6000.copy_thread_beside_gbs	17.05	16.0	18.0	GB/s	derived	one staging thread's rate beside a union of no burst share: q0's 13.52 GB/s wall at its median share 0.208	docs/cards/pickrate-c1.card (13.52; 'burst share s 0.21 median'); checked on the triple's v0.2.7-rule arm s0b (11.4 predicted at its share 0.33, 11.1 read: specs/worker2/pickrule-impl/box/arm-gq_s0b.log 150 MB beside in 13.5 ms)	Aq0	
 a6000.copy_thread_alone_gbs	24.7	21.0	24.7	GB/s	measured	one thread staging with nothing beside it (the reset's copy_back)	docs/cards/pickrate-c1.card ('24.7 GB/s ... nothing beside it')		
@@ -157,10 +157,10 @@ a6000.flip_crit	0.05	0.0	0.15	of flip_cpu_us	derived	the share on the step's pat
 3090.union_c_us	3.67	3.4	4.0	us/column	measured	the box's host	a6000.union_c_us	Aq0	
 3090.union_W_us	19.95	18.0	23.36	us/expert	measured	the box's host	a6000.union_W_us	Aq0	
 3090.union_copy_slow	0.0	0.0	0.0057	per GB/s of copy	derived	the box's host	a6000.union_copy_slow		
-3090.host_dram_gbs	147.7	140	155	GB/s	measured	the box's host	docs/facts.md (147.7)		
+3090.host_dram_gbs	147.7	140	155	GB/s	measured	the box's host	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md (147.7)		
 3090.host_threads_base	32	32	32	threads	derived	the box's host	a6000.host_threads_base		
 3090.core_dram_gbs	12.0	8.0	20.0	GB/s/thread	assumed	the box's host	a6000.core_dram_gbs		
-3090.pcie_h2d_gbs	26.28	24.0	26.5	GB/s	derived	the 3090's PCIe 4.0 x16 link on the box: the A6000's measured pinned rate (both cards 16 GT/s x16; no 3090 probe recorded)	docs/facts.md (both PCIe 4.0 x16; A6000 pinned 26.28)		
+3090.pcie_h2d_gbs	26.28	24.0	26.5	GB/s	derived	the 3090's PCIe 4.0 x16 link on the box: the A6000's measured pinned rate (both cards 16 GT/s x16; no 3090 probe recorded)	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md (both PCIe 4.0 x16; A6000 pinned 26.28)		
 3090.pcie_d2h_gbs	22.1	20.0	26.28	GB/s	derived	the A6000's prompt-front download rate	a6000.pcie_d2h_gbs		
 3090.tier_pcie_gbs	24.0	20.0	26.28	GB/s	assumed	no tier on a lone 3090	unused		
 3090.lane_gbs	20.41	17.0	21.4	GB/s	derived	the load's lane probe: the A6000's on the same host and link generation	a6000.lane_gbs		
@@ -191,7 +191,7 @@ a6000.flip_crit	0.05	0.0	0.15	of flip_cpu_us	derived	the share on the step's pat
 5090.copy_thread_beside_gbs	17.05	12.0	22.0	GB/s	assumed	one P-core's staging beside a union of no burst share	the box's 17.05; band for the core's memcpy rate		
 5090.copy_thread_alone_gbs	24.7	15.0	30.0	GB/s	assumed	one thread alone	the box's measured 24.7		
 5090.front_ratio	2.5	2.0	2.9	x A6000	derived	the prompt front's GEMMs and attention: SMs x clock 170 x 2.41 / (84 x 1.80) = 2.71, bandwidth 1792/768 = 2.33	NVIDIA RTX 5090 page (fetched 2026-10-09: 'Memory Interface Width 512-bit', 'PCI Express Gen 5'); Wikipedia GeForce RTX 50 series (fetched 2026-10-09: 5090 '1792' GB/s, '28' Gbit/s, '170' SMs, '2.41' GHz); A6000 datasheet (fetched: 10,752 CUDA cores, 38.7 TFLOPS FP32 -> 1.80 GHz [derived])		
-5090.card_experts	6415	5482	6415	experts	derived	the user's plan at ctx 40960: 5,482 with the draft + its 933	issue1-comments.md v0.2.4 log 'plan ... card_experts=5482'; docs/plan-triage.md (933)		
+5090.card_experts	6415	5482	6415	experts	derived	the user's plan at ctx 40960: 5,482 with the draft + its 933	issue1-comments.md v0.2.4 log 'plan ... card_experts=5482'; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md (933)		
 5090.flips_steady	0.87	0.5	1.5	flips/token	assumed	the box's converged-pool rate on the same stream	a6000.flips_steady		
 5090.flip_cpu_us	335	250	500	us/flip	assumed	the box's staging time a flip	a6000.flip_cpu_us		
 5090.flip_crit	1.0	0.3	1.0	of flip_cpu_us	assumed	no SMT: the staging thread takes a core the spinning pool holds	longgap report2 §1 (c') (xstream.rs:1502, threads/src/helper.rs:115)		

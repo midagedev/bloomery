@@ -35,7 +35,7 @@ The corpus is held out: it is read from --corpus starting at token K (--corpus-s
 tail can serve its own head), at most M tokens (--corpus-tokens, default 1,000,000), cut into
 documents of D tokens (--corpus-doc; default: the whole read is one document). A corpus that holds
 more than OVERLAP_MAX of a scored stream's 16-grams is refused by name: it would score the text
-against itself (prose-all's head is the prose set, draft-accept-e5-report.md section 4).
+against itself (prose-all's head is the prose set, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/draft-accept-e5-report.md section 4).
 k=2 (lookup-recent and sam): where position i was proposed from a match whose follower sits at j, the
 second draft token is t[j + 1] (the drafted token itself when j + 1 = i; for a corpus match the corpus
 token after the follower, none past the document's end). The table counts it only where position i was

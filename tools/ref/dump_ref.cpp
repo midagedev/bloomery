@@ -322,7 +322,7 @@ static bool dump_one(dump_ctx * d, const ggml_tensor * t, bool input, const char
     };
 
     // ne[] in ggml order, verbatim — bloomery's tensors carry the same order by decision
-    // (docs/plan.md), so a shape mismatch in the gate is a real mismatch, not a convention.
+    // (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md), so a shape mismatch in the gate is a real mismatch, not a convention.
     // The four trailing columns are v2 additions; the first eleven fields are byte-for-byte
     // what earlier sets carry (the flat `sum` included: it is the flat read's sum).
     fprintf(d->manifest, "%s\t%s\t%d\t%s\t%lld\t%lld\t%lld\t%lld\t%zu\t%.6f\t%s\t%d\t%d\t%s\t%s\n",

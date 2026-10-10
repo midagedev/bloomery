@@ -4,9 +4,9 @@ A map of what stands between this tree and "builds and passes the fixture-tier g
 person who owns one. Every claim about the code cites `path:line` as of main `6b630e5e`; a thing that was not seen is
 marked `[unverified]`, a number that is computed here is marked `[derived]`. Nothing in this file was run on a Spark.
 
-Two earlier documents already sized this work: [`docs/research/machine-axes.md`](../research/machine-axes.md) (the
+Two earlier documents already sized this work: [machine-axes.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md) (the
 `machineaxes` memo, 2026-09-27; its round names `sparkprep` S1–S4, `archkey`, `isarefuse` and "M1–M3" are used below) and
-[`docs/rebuild.md`](../rebuild.md) (the "machineaxes" result bullets, lines 197–200). Their line numbers are stale; the
+[rebuild.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md) (the "machineaxes" result bullets, lines 197–200). Their line numbers are stale; the
 citations here are re-read. Related: [`new-model.md`](new-model.md) (the other contribution track),
 [`local-check.md`](local-check.md) (the off-box check design; this file keeps only what is Spark-specific).
 
@@ -68,7 +68,7 @@ cap: 193.9 tok/s, one request's rate (`README.md:111` and footnote 1), which is 
 
 **Prediction [derived]:** a step of 8.3 ms (bytes hide the rest) to 12.7 ms (bytes plus an SM-scaled rest), so 79–120 tok/s,
 point 92 tok/s (bytes plus latency, 10.9 ms). That is 0.4–0.6 of the 3090's rate, and the byte term is 2.6–3.2 times
-longer than on the box. The `machineaxes` round reached 2.47× for the A6000 (`docs/rebuild.md:200`).
+longer than on the box. The `machineaxes` round reached 2.47× for the A6000 (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L200).
 
 **Resource timeline per decode token (whole on card, Spark).** Host CPU: a graph launch and the sampler, off the critical
 path (no host tier), cost `[unmeasured]`. Card SMs: the 2.6–4.4 ms rest, overlapped with the byte stream. Card DRAM and
@@ -151,7 +151,7 @@ irrelevant to a whole-on-card run that never starts a host service.
   the maintainers add per-arch rows (`archkey`, memo M1). A Spark contributor leaves them out.
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
   files) and names two residual risks: `ptxas` contracting `.rn`-less mul-then-add differently, and the `ex2.approx`-class
-  approximate instructions in about 30 places (`docs/rebuild.md:198`, `docs/research/machine-axes.md:10-16`). The proof is
+  approximate instructions in about 30 places (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L198, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md#L10-L16). The proof is
   one bit-gate pass on the Spark (`gate-gpu-e2e`'s count pin and the card family gates). The repo has only ever run
   cc 8.6 (`tools/recipes.py:1960`: "both cards here are sm_86").
 - **Device pick.** The real-tier gate plan opens the card by the names in `CARDS` and refuses any other card by name
@@ -193,7 +193,7 @@ opens "CUDA device 0" (`crates/gpu/src/lib.rs:2124`, `docs/BUILD.md:88`). `--pla
 
 Models by size, in the order to try them (`docs/models.md:12,31-34`, `docs/BUILD.md` table): Clef-Flash 4.8–9.7 GB,
 Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash
-`UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", `docs/plan-ledger.md:359`) if the first `MemAvailable` reading
+`UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
 allows. A 64 GB Spark (section 1; announced, not yet shipping) holds only the first three.
 
 ### 3.4 Running the gates off our machine

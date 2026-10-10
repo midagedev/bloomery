@@ -53,7 +53,7 @@
 #      serializes them. The chain's fills read 3.1 GB/s of the drive's 4.6-6 GB/s at k=2..3 (design [price]:93), and the
 #      lane adds 0.19 GB/s, so a 0..3 % slower chain fill [assumption], 0..2.4 ms of the chain's 80 ms of fills.
 #   Net -0.35..+8.8 ms, central +4.8, of a base token of 72..92 ms (the print's three passes average 92; worker2's R1
-#   probe, residency off, read 72-74 a pass, docs/plan-triage.md:167): central +6 %, corners -0.4..+12.2 %. The card's band
+#   probe, residency off, read 72-74 a pass, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L167): central +6 %, corners -0.4..+12.2 %. The card's band
 #   is central +-2 sigma, sigma = the RSS of the terms' ranges over sqrt(12) = 1.64 ms = 2.05 %: +2..+10.
 # Priced 0 on purpose: the dropper's thread time (5.178 ms a token on a thread of its own; its cost on the chain is
 # unmeasured) and the lane's stage read (about 2.7 ms cold through the mapping to 0.35 ms from the slot, 3.134 MB at the

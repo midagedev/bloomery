@@ -112,7 +112,7 @@ Put each model's download in a directory of its own. The r8 sidecar of V4.1 is w
 
 ## DeepSeek-V4.1-Flash
 
-The engine runs the published Q3_K_M upload as it is. Every tensor keeps the upload's type: the attention, shared expert and engram tensors and the token embedding are K-quants like the routed experts (Q3_K, Q4_K, Q5_K; the output head Q6_K), and each kernel is picked by the type the file gives the tensor (`docs/facts.md` has the type table). A second set, the same upload with the attention and shared expert tensors and the engram tables in Q8_0 and the token embedding in BF16, is the file the engine was first developed against; its reference dumps are kept and `BLOOMERY_V41_MODEL` still selects it in the maintainers' tools; the engine does not need it.
+The engine runs the published Q3_K_M upload as it is. Every tensor keeps the upload's type: the attention, shared expert and engram tensors and the token embedding are K-quants like the routed experts (Q3_K, Q4_K, Q5_K; the output head Q6_K), and each kernel is picked by the type the file gives the tensor (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md has the type table). A second set, the same upload with the attention and shared expert tensors and the engram tables in Q8_0 and the token embedding in BF16, is the file the engine was first developed against; its reference dumps are kept and `BLOOMERY_V41_MODEL` still selects it in the maintainers' tools; the engine does not need it.
 
 ```sh
 hf download vcruz305/DeepSeek-V4.1-Flash-GGUF --include 'DeepSeek-V4.1-Flash-Q3_K_M-*' \

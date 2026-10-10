@@ -1,4 +1,4 @@
-# The control row for q3ncu-flash (docs/research/q3flashlit-design-report.md): mistral.rs's FA2
+# The control row for q3ncu-flash (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3flashlit-design-report.md): mistral.rs's FA2
 # flash_fwd_kernel (hdim 128, 64 x 64, 4 warps, causal, bf16) does the same work as our
 # gqa_prefill_flash — the same HMMA count, block-tiles and bytes [derived + SASS] — in 1.276 ms a launch
 # against our 1.854 (rig-log 09-26#mrs-nsys). The design reads its step as tensor-bound at 86-96 %

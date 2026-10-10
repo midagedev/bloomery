@@ -186,7 +186,7 @@ mod gate {
     /// The per-layer band over the error model's prediction.
     const BAND_FACTOR: f64 = 3.0;
     /// σ of the default path's margins against the exact truth: the error
-    /// model's scale for the margin difference (`docs/plan.md` 「오차 모델」).
+    /// model's scale for the margin difference (<https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md> 「오차 모델」).
     const SIGMA_OURS: f64 = 0.367;
     /// The flip band over the σ bound: measured tails of two of our own
     /// rounding variants reached about nine RMS.

@@ -7,14 +7,14 @@
 증명이 "V2-Lite 게이트 전부 초록"이 되고, 두 모델의 불변식이 한 함수 안에서 `if`로 갈린다.
 
 이 문서는 **무엇을 어디에 두는가**를 정하고, 그 이동을 라운드로 자른다. V4.1 코드는 여기서 한 줄도 쓰지 않는다.
-op 목록은 [`research/v41-ops.md`](research/v41-ops.md), 파일 내용은 [`v41-inventory.md`](v41-inventory.md),
+op 목록은 [`research/v41-ops.md`](research/v41-ops.md), 파일 내용은 [v41-inventory.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/v41-inventory.md),
 GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 그 결정들 위의 여덟째다.
 
 ## 원칙 셋
 
 1. **타입이 다른 것은 아키텍처 타입으로, 값만 다른 것은 표로.** 두 모델 사이에 *타입*이 다른 것은 넷이다 —
    KV 토폴로지, 스텝 입력, 로드 시 계획, 층 사슬. 텐서 이름·메타데이터 키·전문가 수·양자화 타입은 *값*만 다르다.
-   값은 표 한 장으로 끝내고(`plan.md` 규칙: "이름 표는 표로, arch마다 여섯 파일에 흩뿌리지 않는다"), 타입은
+   값은 표 한 장으로 끝내고(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md 규칙: "이름 표는 표로, arch마다 여섯 파일에 흩뿌리지 않는다"), 타입은
    아키텍처 모듈이 소유한다. 토큰 경로에 `dyn`은 두지 않는다(같은 규칙: "1단계 디스패치는 monomorphic").
 2. **커널은 모델을 모른다.** 결정 6 그대로 — 형상(K, 행 수, 행 바이트)은 런치 인자이고 커널 파일은 형상의 이름을
    가진다. 모델을 아는 호스트 코드는 세 층뿐이다: **계획**(로드 시 — 어떤 텐서·어떤 키·어떤 파생 가중치),
@@ -39,7 +39,7 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
 | 블록 골격 | pre-norm 잔차: `attn_norm → attn → add → ffn_norm → ffn → add` (`forward::block_common`) | 하이퍼커넥션: 스트림 4벌, `pre`로 접어 들어가고 `post`·Sinkhorn `comb`으로 섞으며 믹스는 한 서브층 늦게 소비 | **아키텍처 사슬** |
 | 어텐션 | MLA — 잠재 K, rope 꼬리 64, `wk_b` 흡수, 헤드별 `wv_b`; flash는 `[k_rope ; kv_compressed]` 576행 | MLA 아님 — 512차원 잠재 하나가 K=V, 64헤드 직접 내적, 헤드별 sink, 출력 꼬리 역-rope, 블록 대각 `wo_a`→`wo_b`; 윈도우 128행 + 고른 512행 = 최대 640행 | **아키텍처 사슬** + deepseek41 전용 커널(sink 어텐션·역-rope·그룹 출력 투영·압축기·인덱서·hc·engram 게이트) |
 | KV 토폴로지 | 층마다 `[ctx_max, 576]` f16 평면 하나(`Vec<DeviceTensor<u16>>`), 슬롯 표는 하나 | 층마다 128행 링(윈도우) + **비율 그룹 넷이 공유**하는 압축 행(2–7·8–13·14–19·20–39) + 인덱서 키 | **아키텍처 타입** — 결정 2의 `(seq, pos)` 슬롯 표는 공유, **행 저장소**만 아키텍처 것. 그룹 공유 캐시는 "층 슬롯당 버퍼 하나"로는 표현이 안 된다 — 이것이 타입이 갈리는 첫 자리다 |
-| 스텝 입력 | 토큰 id, 위치(`step_params` 1버퍼) | 토큰 id, 위치, **engram 48행(13,056 B, ~~한 스텝 앞서 발행~~ 현재 토큰을 안 뒤에 발행 — 행 id 해시가 현재 토큰에서 시작한다, ik `llama_set_engram_rows`의 `ctx[0]`; 정정 09-23 b5plan)**, 압축 층의 **호스트 색인 계획**(`v41-ports.md`: 비율 기계는 그래프 분기가 아니라 스텝마다 호스트가 세우는 계획) | **아키텍처 타입** — `ChainBody::Input` |
+| 스텝 입력 | 토큰 id, 위치(`step_params` 1버퍼) | 토큰 id, 위치, **engram 48행(13,056 B, ~~한 스텝 앞서 발행~~ 현재 토큰을 안 뒤에 발행 — 행 id 해시가 현재 토큰에서 시작한다, ik `llama_set_engram_rows`의 `ctx[0]`; 정정 09-23 b5plan)**, 압축 층의 **호스트 색인 계획**(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ports.md: 비율 기계는 그래프 분기가 아니라 스텝마다 호스트가 세우는 계획) | **아키텍처 타입** — `ChainBody::Input` |
 | MoE | 라우터 softmax → top-6 → 정규화·스케일, **64 → 6 핀**(`MoeDims::read`가 전문가 수·슬롯 수·텐서별 양자화 타입을 핀) | `√softplus` + 선택 편향 → top-6 → 재정규화 ×1.5, 384 → 6, SwiGLU ±10, 합 `Σ+1e-20` | 라우터·점수는 **아키텍처 커널**; 전문가 `_sel` 본체는 형상이 같으니 **공유**되되 타입이 갈린다 — gate/up은 q3_K(있음), down은 **q5_K(커널도 디퀀트도 없다**, `quant.rs:198`, `weights.rs`의 `resident_size`·`upload_file_tensor`), shared 전문가는 q8_0(우리 융합 gate/up은 q3_K 전용); 전문가 **배치와 호스트 티어는 공유 서비스**(아래 「직교」) |
 | 헤드 | `output_norm` + `output`, eps는 `mla.eps` | 같음 + 마지막 FFN의 `pre`로 스트림을 접는 마지막 접기 | **거의 공유** — 접기는 사슬 끝에서, `Head`는 eps를 계획에서 받는다 |
 | 파생 가중치 | `wk_b`의 Q8_0 재양자화(`Derived`, 로드 시 CPU) | 알려진 것 없음(hc `comb`·층 종류별 rope 표는 후보 — B4가 정한다) | **아키텍처 계획** |
@@ -161,7 +161,7 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
 `(seq, pos)` 두 차원 키의 슬롯 표는 공유 타입이다. 갈리는 것은 그 슬롯이 가리키는 **행 저장소**: deepseek2는
 층 슬롯마다 평면 하나, deepseek41은 층마다 링 128행 + 그룹 넷이 공유하는 압축 행 + 인덱서 층의 키. 그룹 공유는
 "층 l의 캐시"가 아니라 "그룹 g의 캐시"이므로 `kv[slot]`으로는 표현이 안 되고, 그래서 `ChainBody`가 자기 저장소를
-소유한다. 두 모델이 같은 슬롯 표를 쓰면 추측 디코딩의 되감기(C4)는 한 곳에서 한 번만 짓는다 — `v41-ports.md`가
+소유한다. 두 모델이 같은 슬롯 표를 쓰면 추측 디코딩의 되감기(C4)는 한 곳에서 한 번만 짓는다 — https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ports.md가
 셋 포트에서 본 "되감기 소유자가 둘이라 죽은" 사례가 이 결정의 근거다.
 
 ## 직교인 것 — 아키텍처 축이 아니다

@@ -1,6 +1,6 @@
 # Round probes38, P1: how the two cards attach and what their host-to-card links give together.
 # Measured on one link (rig-log 09-25#m2-h2d-a6000, 1 GiB x 8 on the A6000): pinned 26.28, pageable
-# 21.16 GB/s; READ_ONLY registration of the file map refused (801). facts.md's sysfs line puts the 3090
+# 21.16 GB/s; READ_ONLY registration of the file map refused (801). https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md's sysfs line puts the 3090
 # at 41:00.0 under 40:01.1 and the A6000 at 61:00.0 under 60:01.1, both PCIe 4.0 x16; a peer's reading
 # of that as two root ports was retracted, so this run prints nvidia-smi topo -m, each card's sysfs path
 # (which names the port above it) and each link read while the copies run.
@@ -26,9 +26,9 @@ condition: BLOOMERY_CARD=both BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/p
   GB/s on the A6000, and each card's `h2d link` line during its copies must read 16.0 GT/s x16 on most
   samples, or the sum is not read
 reason: the two-card plan (b), a two-card streaming lever and the two-card public table price the link
-  sum, and nothing has measured it; facts.md has no topo -m line and a retracted root-port reading
+  sum, and nothing has measured it; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md has no topo -m line and a retracted root-port reading
 decide-in: price two-card fills and streams at the measured sum; write topo -m, both sysfs paths and
-  the sum into docs/facts.md beside the single-link row
+  the sum into https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md beside the single-link row
 decide-below: a shared hop or DRAM-side contention caps the pair: read topo -m and the two sysfs paths
   for the shared hop, price every two-card stream at the measured sum, and re-run dma-dram-share with
   both copies before any two-card streaming design

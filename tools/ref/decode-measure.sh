@@ -44,7 +44,7 @@ if [ "${NOCACHE:-1}" != 0 ]; then
   witness post-nocache
 fi
 
-# 스레드 스윕. plan.md가 "스레드 수는 재서 정한다"고 쓴 그 측정이고, 이 티어가
+# 스레드 스윕. https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md가 "스레드 수는 재서 정한다"고 쓴 그 측정이고, 이 티어가
 # 대역폭 바운드가 되는 지점이 어디인지가 답이다 — SMT 64가 32보다 나을 이유는
 # 미리 없고 ik는 26.7코어를 썼다. 한 임대 안에서 연달아 돌려야 비교가 된다.
 # tests/mt.rs가 스레드 수와 로짓이 무관함을 비트로 못박고 있으므로 갈리는 것은 시간뿐이다.

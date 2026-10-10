@@ -16,7 +16,7 @@
 # affected …` (first line `affected:`, or just's echoed `./tools/affected-gates.sh …` line and then it): then
 # only lines starting with two spaces and `gate-` or `weekly-` (a weekly recipe a trigger named) count, the
 # first word is the recipe, everything else is ignored — the `always:` checks are not taken from it.
-# --smoke: the fixed smoke list (SMOKE below; docs/gates-plan.md 3.1). --weekly: every `weekly-*` recipe in
+# --smoke: the fixed smoke list (SMOKE below; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1). --weekly: every `weekly-*` recipe in
 # `just --dump`, in its order (`just weekly`; a justfile with none is a named error). An unknown recipe, a malformed
 # item, ARGS given to a recipe with no parameters, or an empty list is a named error before anything
 # runs.
@@ -213,7 +213,7 @@
 # Only this script appends, each row with one write(2) on an O_APPEND descriptor under an exclusive
 # flock; the plan reads the file under a shared one. A malformed row is a named error before anything
 # runs. An item with no row expects DEFAULT_S (45 s, derived: the fixup5 batch's mean item, 2,167 s
-# over 48 recipes, docs/gates-plan.md §1); --dry-run names the items that used it. With --ledger an
+# over 48 recipes, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md §1); --dry-run names the items that used it. With --ledger an
 # item that skips counts 0 s, and a balanced gpu-gate item whose key is green on one card only goes to
 # that card's lane, where it skips: the key carries the lane's card, so an item placed by time alone
 # would run again on the other card although nothing it reads moved.

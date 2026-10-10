@@ -7284,8 +7284,8 @@ def key_self_test(expect, real: Side) -> None:
         expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
         m = edit("tools/gpu-gate.sh", append("\n# key probe\n"))
         expect(m == {"gpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
-        m = edit("docs/plan.md", append("\nkey probe\n"))
-        expect(m == {"mac", "fmt"}, f"docs/plan.md moves {sorted(m)}, not only the whole-tree keys")
+        m = edit("docs/HARDWARE.md", append("\nkey probe\n"))
+        expect(m == {"mac", "fmt"}, f"docs/HARDWARE.md moves {sorted(m)}, not only the whole-tree keys")
         cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
         m = edit(cpu_lib[0], append("\n// key probe\n"))
         expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
@@ -7424,8 +7424,8 @@ def key_self_test(expect, real: Side) -> None:
         expect(c.parts("smoke")[2] is not None and c.parts("check-recipes")[2] is None, "smoke (a batch in a batch) or check-recipes has the wrong never-skip")
         expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
         expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
-        argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/plan.md"
-        plan = os.path.join(roots[0], "docs/plan.md")
+        argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/HARDWARE.md"
+        plan = os.path.join(roots[0], "docs/HARDWARE.md")
         with open(plan, encoding="utf-8") as fh:
             plan_text = fh.read()
         before = one(argpath)
@@ -8242,9 +8242,9 @@ def narrow_self_test(expect, side: Side) -> None:
                f"narrow: an unmatched changed file does not keep the full list, naming it: {n.full}")
         n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], [row("rust-toolchain.toml", ["*"], 7)])
         expect(any(f"{GATE_PATHS}:7" in r for r in n.full), f"narrow: a `*` row does not keep the full list: {n.full}")
-        n = narrow(["docs/plan.md"], side, side, [(base, same)], rows)
+        n = narrow(["docs/HARDWARE.md"], side, side, [(base, same)], rows)
         expect(not n.full and not n.picks and "not a host path" in n.files[0],
-               f"narrow: docs/plan.md (read by no gate), an equal-scan host change, drops the spill ratchet and picks nothing: "
+               f"narrow: docs/HARDWARE.md (read by no gate), an equal-scan host change, drops the spill ratchet and picks nothing: "
                f"full={n.full} picks={sorted(n.picks)}")
         n = narrow(["crates/vision/src/lib.rs"], side, side, [(base, same)], rows)
         expect(not n.full and {"gate-vision", "gate-gpu-vision"} <= set(n.picks) and "lib bloomery-gpu-vision not scanned" in n.files[0],
@@ -8644,8 +8644,8 @@ def self_test() -> int:
     expect("gate-gpu-qwen3moe-e2e" in qprof and "gate-gpu-e2e" not in qprof, f"qwen3moe profile selects {sorted(qprof)[:5]}")
     # oracle.sh builds its Korean corpus with `find "$ROOT/docs" -name '*.md'`, but only `just dump-ref-tokenizer`
     # runs it: no gate recipe names it, so a docs change selects no gate
-    docs = sel("docs/plan.md")
-    expect(docs == set(), f"docs/plan.md selects {sorted(docs)}")
+    docs = sel("docs/HARDWARE.md")
+    expect(docs == set(), f"docs/HARDWARE.md selects {sorted(docs)}")
     expect(not graph.inputs("gate-tokenizer").prefixes.get("docs/"), f"gate-tokenizer's docs/ prefix: {graph.inputs('gate-tokenizer').prefixes}")
     walks = [(ln, _SCRIPT_WALK.findall(ln)) for ln in ('find "$ROOT/docs" -name x', 'find "$ROOT"/docs/cards -type f', "find crates -name '*.rs'", 'find "$REF/docs" -name x', "find . -name x", 'find "$ROOT" -name x')]
     expect([w for _, w in walks] == [["docs"], ["docs/cards"], [], [], [], []], f"find roots: {walks}")
@@ -8952,8 +8952,8 @@ def self_test() -> int:
     b2.recipes["gate-sampler"] = r
     sels, unmapped, _ = select(["justfile"], side, b2, GATE_PREFIX)
     expect([x.recipe for x in sels] == ["gate-sampler"] and not unmapped, f"recipe-text change selects {[x.recipe for x in sels]}")
-    sels, _, _ = select(["crates/gpu-gates/src/bin/gate_p1.rs", "docs/plan.md"], side, side, GATE_PREFIX)
-    expect(sorted(x.recipe for x in sels) == ["gate-gpu-p1"], f"select() on gate_p1.rs and docs/plan.md gives {[x.recipe for x in sels]}")
+    sels, _, _ = select(["crates/gpu-gates/src/bin/gate_p1.rs", "docs/HARDWARE.md"], side, side, GATE_PREFIX)
+    expect(sorted(x.recipe for x in sels) == ["gate-gpu-p1"], f"select() on gate_p1.rs and docs/HARDWARE.md gives {[x.recipe for x in sels]}")
 
     # dep-info parsing
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")

@@ -518,7 +518,7 @@ def cmd_summary(argv):
 
     inst = met("smsp__inst_executed.sum")
     t_act = met("smsp__pipe_tensor_op_hmma_cycles_active.avg")
-    print("--- the two readings of the tail design (docs/research/q3tail-design-report.md 3.2): per block-step")
+    print("--- the two readings of the tail design (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3tail-design-report.md 3.2): per block-step")
     if inst is not None:
         tens, rest = hmma * 16 / (4 * bs), (inst - hmma) / (4 * bs)
         print(f"    sum model  (tensor at full rate + the non-HMMA issue) {tens + rest:8.1f} cycles  "

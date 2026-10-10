@@ -520,7 +520,7 @@ mod gate {
             && LONG_TAIL + 512 > LONG
     );
 
-    /// The file's shape the kernels fix, as the header states it (glmops-design §1): what the
+    /// The file's shape the kernels fix, as the header states it (<https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/glmops-design.md> §1): what the
     /// derivations below are written against. The counts of layers by kind are the file's
     /// ([`glm5next_tier::Shape`], read from its header).
     const HIDDEN: usize = 4096;

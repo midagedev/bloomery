@@ -1,4 +1,4 @@
-# The one term the q3tail design leaves open (docs/research/q3tail-design-report.md 3.2 and 4): which
+# The one term the q3tail design leaves open (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3tail-design-report.md 3.2 and 4): which
 # of its two readings holds for gqa_prefill_flash's step. One sitting, two runs of the q3pp form
 # (main's binary, then q3fa's through BLOOMERY_NCU_BIN). The band is the tail design's tensor demand
 # at full rate over the step it measured [derived]; the stall composition then names the reading.

@@ -6,7 +6,7 @@
 #
 #   step 1  attach       nvidia-smi topo -m and every card in view: name, PCI address, the sysfs path
 #                        (which names the root port), max and idle link
-#   step 2  pinned,pageable   1 GiB x 8 on the timing card: the calibration against docs/facts.md's
+#   step 2  pinned,pageable   1 GiB x 8 on the timing card: the calibration against https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md's
 #                        A6000 row (pinned 26.28, pageable 21.16 GB/s)
 #   step 3  sustained    48 back-to-back copies of 1.6 GB on the timing card: per-copy GB/s min,
 #                        median, max and the mean, the link sampled while they run

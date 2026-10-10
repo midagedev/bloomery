@@ -4,7 +4,7 @@
 # for two converts, two multiplies and two FMAs over the same integer adds kept in two registers: -5..+10 %
 # of the gate/up compute; the Q4_K down's eight sub-block terms fit one vector, about 6 ops against 8:
 # -10..+10 %. The x quantizer adds a true divide per value (q8_1, 128-value blocks) against a multiply by
-# the inverse. At m = 1 the union is bound by W (a + c = 67.4 us under W 126.4 us, docs/plan.md host-union
+# the inverse. At m = 1 the union is bound by W (a + c = 67.4 us under W 126.4 us, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md host-union
 # row), so the decode term is 0 [derived]; the prefill term is c, predicted within -5..+10 %, and a moves by
 # +0..+5 us [derived]. Small at prefill only if c lands within +3 % (the eqdesign verdict's threshold).
 kind: noninf
@@ -21,7 +21,7 @@ margin: 10 % <the derivation allows a 9 % loss at m = 16; the sitting sorts the 
 condition: the lead runs BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/eqa1-host-rate.card'
   just time-cpu-v41-host --threads 32 --rounds 6 --arms union5:4,unioncard:4,union5:4x8u0.125,unioncard:4x8u0.125,union5:4x16u0.0625,unioncard:4x16u0.0625
   on the eqA1 tree; arm order rotates every round; netdata frozen under the lease; no other compute on the box
-decide-in: the band holds: under a 3 % loss record a and c of the card-rule union beside the engine's in docs/plan.md's host-union row, and
+decide-in: the band holds: under a 3 % loss record a and c of the card-rule union beside the engine's in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md's host-union row, and
   open the wiring round (eqA2: the V4.1 host tier on the card rule, the e2e A/64B/A gate, run13 FAIL-first);
   a loss of 3..9 % goes to the user with the prefill price [derived from it] before eqA2
 decide-below: the loss passes 9 %, a term the derivation missed: profile the arm (perf -e cpu-clock on

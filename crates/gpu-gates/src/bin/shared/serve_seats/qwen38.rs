@@ -186,7 +186,7 @@
 //! break-even (`Q38::draft_keep`): the prefix whose re-prefill costs what the
 //! draft saves over the reply — the request's tokens through passes, at most
 //! `NOMINAL_REPLY`, that when it bounds nothing — at the placement's prompt
-//! rate (`docs/plan.md`, Qwen3.8 serve). Below it the server resets, the draft
+//! rate (<https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>, Qwen3.8 serve). Below it the server resets, the draft
 //! on again, and prefills the whole prompt. A `draft keep` line after the
 //! `cache` line prints the break-even, and each such request an `mtp keep`
 //! record (`kept` or `reset`, the prefix, the break-even, the reply).
@@ -390,13 +390,13 @@ const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last ca
 
 /// The reply the break-even weighs ([`Q38::draft_keep`]) when a request
 /// bounds nothing, and the most it weighs: the mean greedy reply of the
-/// Korean chat prompts the shipped head list was chosen on (`docs/plan.md`,
+/// Korean chat prompts the shipped head list was chosen on (<https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>,
 /// Qwen3.8 serve).
 const NOMINAL_REPLY: usize = 277;
 
 /// The plain step's and the drafted decode's positions per second, and the
 /// drafted prompt's ids per second under plan (a), that the break-even
-/// weighs (`docs/plan.md`, Qwen3.8 serve).
+/// weighs (<https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>, Qwen3.8 serve).
 const PLAIN_TPS: f64 = 57.88;
 const DRAFTED_TPS: f64 = 79.33;
 const PROMPT_IDS_PER_S: f64 = 1224.1;
@@ -1618,7 +1618,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         eprintln!(
             "draft keep place={} break_even={} reply={NOMINAL_REPLY} per_reply_token={} (the \
              kept prefix below which a request that would leave the MTP draft off resets; \
-             docs/plan.md, Qwen3.8 serve)",
+             https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md, Qwen3.8 serve)",
             a.place.name(),
             be.at(NOMINAL_REPLY),
             be.per_token

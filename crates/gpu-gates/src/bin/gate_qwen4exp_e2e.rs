@@ -364,7 +364,7 @@ mod gate {
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
 
-    /// The file's widths, as the header states them (qwen4arch-design §1) and
+    /// The file's widths, as the header states them (<https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwen4arch-design.md> §1) and
     /// the engine's kernels fix them (`plan38.rs` refuses a file that differs,
     /// the fixture keeps them): what the derivations below are written
     /// against. The layer counts are not here: they come from the header

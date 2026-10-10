@@ -7,7 +7,7 @@ long. A reader and a placement you can finish alone; the card body, the serve se
 maintainers' box today, and the last section says where they take over.
 
 Open an issue before you start so two people do not take the same model. MiMo-V2.6-Flash is in progress and Kolibri-1
-is next (`docs/plan-triage.md:23`, `:696-700`); Mistral Large 4 waits for open weights.
+is next (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L23, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L696-L700); Mistral Large 4 waits for open weights.
 
 ## Two shapes of attach
 
@@ -24,7 +24,7 @@ is next (`docs/plan-triage.md:23`, `:696-700`); Mistral Large 4 waits for open w
 A new family still touches common files. MiMo's reader commit (`554f1d69`) changed 21 files, 15 of them outside the
 `mimo2` module and its own meta test: `crates/models/src/{lib,need,shape}.rs`, `crates/model/src/arch/coverage.rs`,
 `arch/mod.rs`, the `qwen35moe` reader, `crates/runtime`. Each such edit is a fact the new model forces into a common
-owner. That is the cost we want to shrink (`docs/plan-triage.md:687`).
+owner. That is the cost we want to shrink (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L687).
 
 ## The ladder
 

@@ -1,6 +1,6 @@
 # V4.1 B4 op 계획 — b4plan 원문 보고
 
-읽기 전용 계획 라운드 b4plan(opus, 2026-09-23)의 보고를 그대로 옮겼다. 결정과 라운드 순서는 [`plan.md`](../plan.md)의 B4 카드가 정본이고, op 라운드의 스펙은 여기 §1의 블록을 복사해 간다. 보고 안의 스크래치 경로는 세션 스크래치라 남아 있지 않을 수 있다.
+읽기 전용 계획 라운드 b4plan(opus, 2026-09-23)의 보고를 그대로 옮겼다. 결정과 라운드 순서는 [plan.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md)의 B4 카드가 정본이고, op 라운드의 스펙은 여기 §1의 블록을 복사해 간다. 보고 안의 스크래치 경로는 세션 스크래치라 남아 있지 않을 수 있다.
 
 `b4plan` 보고. 읽기 전용 라운드라 저장소와 박스 데이터는 바꾸지 않았다. 표시: **[측정]** 이번 라운드에 덤프 파일을 맥으로 복사해 numpy로 재계산한 값 또는 rig-log의 측정값, **[읽음]** GGUF 헤더·매니페스트·문서에서 읽은 값, **[유도]** 계산한 값, **[가정]** 가정.
 
@@ -345,19 +345,19 @@
 4. **라우터**: 사슬 전부(√softplus·편향·top-6/384·모으기·f64 합·나눗셈·×1.5)가 우리 설계에서 GPU 그래프 안에서 돈다. id가 `_sel`을 몬다. 로짓은 B8이 맡는다. **`router.rs`는 어느 것도 덮지 않는다**(64 고정, softmax, 편향 없음, 반대 동률). 형태만 재사용한다.
 
 ## 5. 문서와 그래프의 모순
-- `docs/research/v41-op-map.md:37`, `v41-op-map-report.md:54,130`: "앞 64" → **꼬리 64**(`ggml.c:21154-21155`) [측정].
-- `v41-op-map.md:43`과 ik 주석 `build_deepseek4.cpp:719`: 인덱스 키는 rope 전 잠재 → 그래프는 **rope 뒤 잠재**를 쓴다 [측정].
-- `v41-op-map.md:37`, `v41-ops.md:43`, `v41-placement.md` §4: 층마다 "128행 링" → ik raw는 n_ctx행 셀이고 창은 SWA 마스크다(`llama-dsv4.cpp:376-417`, `llama.cpp:6010`).
-- `v41-op-map.md:40`: `weighted_sum` → `GGML_OP_MUL_MULTI_ADD`의 FMA 사슬.
-- `v41-op-map.md:42-43`: top-k → 기본은 융합 INDEXER_TOPK(`llama.cpp:8469`)이고 산술과 동률이 다르다.
-- `v41-op-map.md:72`, `v41-ops.md:77`: 조용한 기본값 → 파일에 20과 1e-6이 있다 [읽음].
-- `v41-op-map.md:95`: n_swa 미확인 → 파일에 128 [읽음].
-- `v41-op-map.md:94`: 본체 다섯을 안 읽었다 → 이번에 읽었다(위 인용).
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L37, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map-report.md#L54, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map-report.md#L130: "앞 64" → **꼬리 64**(`ggml.c:21154-21155`) [측정].
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L43과 ik 주석 `build_deepseek4.cpp:719`: 인덱스 키는 rope 전 잠재 → 그래프는 **rope 뒤 잠재**를 쓴다 [측정].
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L37, `v41-ops.md:43`, `v41-placement.md` §4: 층마다 "128행 링" → ik raw는 n_ctx행 셀이고 창은 SWA 마스크다(`llama-dsv4.cpp:376-417`, `llama.cpp:6010`).
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L40: `weighted_sum` → `GGML_OP_MUL_MULTI_ADD`의 FMA 사슬.
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L42-L43: top-k → 기본은 융합 INDEXER_TOPK(`llama.cpp:8469`)이고 산술과 동률이 다르다.
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L72, `v41-ops.md:77`: 조용한 기본값 → 파일에 20과 1e-6이 있다 [읽음].
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L95: n_swa 미확인 → 파일에 128 [읽음].
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map.md#L94: 본체 다섯을 안 읽었다 → 이번에 읽었다(위 인용).
 - `v41-ops.md:36`: 라우터·전문가 융합 "그대로" → 라우터는 새로 만들고, 클램프와 q8_0 shared가 빠져 있다.
-- `v41-ops-report.md:210`: `silu(clamp_max(g))` → ik는 `min(silu(g),10)`(`iqk_mul_mat.cpp:155-157`)이고 이 이탈은 어디에도 기록돼 있지 않다.
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md#L210: `silu(clamp_max(g))` → ik는 `min(silu(g),10)`(`iqk_mul_mat.cpp:155-157`)이고 이 이탈은 어디에도 기록돼 있지 않다.
 - `docs/oracle.md:62`: "top-k 노드" → 인덱서 호출 전체, get_rows_ext, mask_to_idx까지 없다.
 - `docs/v41-placement.md:117`: 1,048,576은 헤더 값이 아니다 → `deepseek41.context_length`=1048576 [읽음].
-- plan.md B4 카드, rig-log 09-23: "묶음 wo_a 커널은 없다" → `model/kernels.rs:94`가 그 모양이다.
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md B4 카드, rig-log 09-23: "묶음 wo_a 커널은 없다" → `model/kernels.rs:94`가 그 모양이다.
 - FA의 f16 누산(`ggml.c:23177-23206`)은 어느 문서에도 없다.
 
 ## 6. 범위 밖 개선 기회
@@ -371,7 +371,7 @@
 - `bench_v41.rs`: `q8_0_gemv_heads` 사이트 추가(b4-woa). XS–S
 - `docs/oracle.md`: 파일 이름 규칙과 "세트의 FA는 f16 누산 generic" 한 문장씩(한국어라 리드). XS
 - `ik llama-cparams.h:47`, `common/common.h:433`: "off by default" 주석이 실제 값 true와 모순. 업스트림 XS
-- `ik llama-build-context.cpp:1554-1562`: DEEPSEEK41에 1e-20(이미 `v41-ports.md:85`에 있음). XS
+- `ik llama-build-context.cpp:1554-1562`: DEEPSEEK41에 1e-20(이미 https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ports.md#L85에 있음). XS
 - skelectric `build_deepseek4.cpp:898-906`: 같은 패턴 가능성(재지 않음). 알림만. XS
 
 ## 7. 실행 모델

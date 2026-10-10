@@ -58,7 +58,7 @@ condition: the lead runs, on this tree's remote dir, two runs back to back under
   expected rc 0). Each log names its binary and md5 (`rust-bin:`). About 4 minutes [derived: the
   2026-10-09 sitting's 74 s for three rounds, the base arm 3 x 6 s longer, two builds and the guards]
 decide-in: the fix holds: land the -sse4a flag with the floor table, record the IQ3_S rate in
-  docs/plan.md's host-union row (c per core), and re-run the GLM-5.3-Flash UD-IQ4_XS decode card
+  https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md's host-union row (c per core), and re-run the GLM-5.3-Flash UD-IQ4_XS decode card
   (docs/cards/glmiq4xs-decode.card) on a build with the flag
 decide-below: the faults are gone (counted) but the loop runs under the band: perf stat the changed
   binary's IQ3_S row alone (qdot-rate --only IQ3_S@4096) for ymm faults and IPC, then price the

@@ -66,7 +66,7 @@ pub const KERNEL_BAND: f32 = 1e-5;
 
 /// The V4.1 greedy rule of the long gate's free arm: at the first generated
 /// id that differs from ik's, our top-1 margin must be below this — a near
-/// tie [derived, plan.md: ≈ 3 σ_rel].
+/// tie [derived, <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>: ≈ 3 σ_rel].
 pub const GREEDY_MARGIN: f32 = 1.5;
 
 pub type GateError = Box<dyn std::error::Error>;

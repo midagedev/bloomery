@@ -26,7 +26,7 @@
 #   - The tier takes ~11 % of the host's routed mass (1,392 tier experts, 34.8 of 384 a layer, v41bp-ab.card:9-10):
 #     H -0.9..-1.5 ms (a share of 0.08..0.13).
 #   - The 3090's service of those slots, ~1..2 ms a step, runs under the reduced host leg.
-#   - c_two, the two-card fixed cost, adds 0.5..2.5 ms. Its source is open, and docs/plan-triage.md carries
+#   - c_two, the two-card fixed cost, adds 0.5..2.5 ms. Its source is open, and https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md carries
 #     +1.9..+2.5 ms. The window-apart pair at the defaults (rig-log 09-30, the on arms: 44.28 against 43.30 tok/s,
 #     -0.51 ms a step) fits c_two ≈ 0.8 ms beside a -1.31 ms tier term.
 # Decode Δ = -1.0..+1.6 ms on the 23.09 ms step (tok/s -6.5..+4.5 %): no sign on paper. The decode question is

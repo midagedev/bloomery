@@ -175,8 +175,8 @@ shared logic, no second copy, no silent failure.
 | [`docs/models.md`](docs/models.md) | Recommended files and what each model needs |
 | [`docs/performance.md`](docs/performance.md) | Number conditions, why it is fast, verification, recorded sessions |
 | [`docs/BUILD.md`](docs/BUILD.md), [`docs/cuda-oxide.md`](docs/cuda-oxide.md) | Building from source; the kernels in Rust |
-| [`docs/upstream/`](docs/upstream/) | Pull requests to ik_llama.cpp, cuda-oxide, llama.cpp and others |
-| [`docs/README.md`](docs/README.md) | Every other page and the working records |
+| [`docs/upstream/`](docs/upstream/) | The toolchain-defect ledger; our upstream pull-request drafts are in [rig-log](https://github.com/midagedev/rig-log/tree/main/docs/bloomery/upstream) |
+| [`docs/README.md`](docs/README.md) | Every other page and the design records |
 
 Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean). Working contract:
 [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md). AI-assisted pull requests are welcome, and pull

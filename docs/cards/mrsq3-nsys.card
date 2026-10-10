@@ -1,4 +1,4 @@
-# The one term the mrsq3 decomposition leaves open (docs/research/mrsq3-design-report.md section 3):
+# The one term the mrsq3 decomposition leaves open (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/mrsq3-design-report.md section 3):
 # mistral.rs's MMQ sum in a P = 4096 Qwen3 prompt forward. Structure model 260-363 ms, the wall
 # minus the other terms 312-363 ms [derived]; the band is their union trimmed to the wall.
 kind: profile

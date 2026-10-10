@@ -332,7 +332,7 @@ mod gate {
     const BAND_SIGMAS: f64 = 4.5;
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
-    /// G4: red above this Δ_PPL [derived, plan.md].
+    /// G4: red above this Δ_PPL [derived, <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>].
     const PPL_RED: f64 = 0.015;
     /// Selection-band terms the MoE chain gate's `tie_margin` takes
     /// (`gate_deepseek41_chain_ffn.rs`): the device's `expf`/`logf` ulps and

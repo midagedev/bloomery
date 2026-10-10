@@ -1,12 +1,12 @@
 # ModelSpec design — the types, the family readers and the coverage check
 
 The design memo of round `specdesign` (rebuild wave 2, read-only), kept as it reported, under the
-lead's dispositions below. Wave 3's `modelspec` round is specified from it; `docs/rebuild.md` §2-1
+lead's dispositions below. Wave 3's `modelspec` round is specified from it; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md §2-1
 principle 3 and §2-2 are its frame.
 
 ## Lead's dispositions (2026-09-27)
 
-- **§0.2 item 1 is not a correction.** `docs/rebuild.md` and `modelvocab-report.md` speak of
+- **§0.2 item 1 is not a correction.** https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md and https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/modelvocab-report.md speak of
   GLM-5.3-Flash **UD-Q4_K_XL** (the quant that fits the host tier); this memo read the box's
   **UD-Q2_K_XL**, whose routed stacks are IQ2_XS, IQ3_XXS and IQ4_XS. The lead read the UD-Q4_K_XL
   shard headers (Hugging Face range requests of each shard's first 2 MB, 09-27): routed down is Q5_K
@@ -14,13 +14,13 @@ principle 3 and §2-2 are its frame.
   except layer 11's Q5_K. So the plan's routed Q5_K holds for the quant that fits, and Qwen3.6-35B-A3B
   UD-Q4_K_XL carries it too (this memo's header). The format owner (§5) must name it.
 - **§0.2 item 2 holds.** The V4.1 Q3_K_M header carries no `nextn.*` or `mtp.*` tensor;
-  `docs/rebuild.md` §2-2 is corrected.
+  https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md §2-2 is corrected.
 - **L4 landed as a refusal, not a cap** (`ef80083`): every entry that advances V4.1 positions
   refuses past 16,384 by name (`Hparams::candidate_free_positions`, `Body::check_defined`); the
   serving plan keeps its 32,768-position caches. ~~Building the candidate mask is a triage item.~~ The
-  mask is designed in `docs/research/candmask-design.md`: kernels in wave 3 `opslib`, wiring in wave 4 `layerprog`.
+  mask is designed in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/candmask-design.md: kernels in wave 3 `opslib`, wiring in wave 4 `layerprog`.
 - **L1, L2, L3, L5, L6, L7, L8: accepted as recommended.** K1–K6 go to 03's `kernelshape`.
-- **§8** is disposed in `docs/plan-triage.md`.
+- **§8** is disposed in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md.
 
 ## Round memo
 
@@ -54,7 +54,7 @@ principle 3 and §2-2 are its frame.
 - **Byte counts** are [derived] and show their factors.
 
 **The one term arithmetic could not settle** was what the GLM and Qwen3.6 GGUFs actually say. I predicted it before the dump:
-- GLM: arch `glm5next`, `block_count` 46, a per-layer `head_count_kv` array of 0/1, `kpool` 4, `rope.dimension_count` 0, hc fn Q8_0, and routed experts including Q5_K (taken from rebuild.md:159).
+- GLM: arch `glm5next`, `block_count` 46, a per-layer `head_count_kv` array of 0/1, `kpool` 4, `rope.dimension_count` 0, hc fn Q8_0, and routed experts including Q5_K (taken from https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L159).
 - Qwen3.6: arch `qwen35moe`, `block_count` 40 with no nextn, sections [11,11,10,0], `full_attention_interval` 4.
 
 **Outcome.** Everything held except two things:
@@ -79,10 +79,10 @@ The actions for both outcomes were fixed in advance: the keys go into the reader
 
 So the move needs no timed A/B. Its proof is structural (§6). The flow levers (async, bulk, SIMD, SIMT) have nothing to act on in a one-shot header read.
 
-#### 0.2 Corrections to rebuild.md and modelvocab
+#### 0.2 Corrections to https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md and modelvocab
 
 1. **The "Q5_K routed (card)" item belongs to Qwen3.6, not GLM.**
-   - rebuild.md:159 and modelvocab §5(d) put it on GLM-5.3-Flash.
+   - https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L159 and modelvocab §5(d) put it on GLM-5.3-Flash.
    - In our GLM file the trunk routed stacks are:
      - IQ2_XS: gate/up on 3-10 and 12-44;
      - IQ3_XXS: gate/up on 11; down on 3-10 and 13-43;
@@ -90,11 +90,11 @@ So the move needs no timed A/B. Its proof is structural (§6). The flow levers (
    - Q2_K and Q3_K appear only on the nextn layer 45.
    - Q5_K routed stacks are in Qwen3.6 UD-Q4_K_XL: down on 0, 2-33 and 35-37; gate/up on 1.
 2. **V4.1's three MTP layers are not in our file.**
-   - rebuild.md:156 says they are `Role::Unused` today.
+   - https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L156 says they are `Role::Unused` today.
    - The Q3_K_M file has no `nextn.*` or `mtp.*` tensor and no `nextn_predict_layers` key.
    - `compress_ratios` has 43 entries. The 3 entries past `block_count` 40 describe blocks the file does not carry.
    - `roles.rs:39-41` matches nothing in it.
-3. **GLM's hc fn is Q8_0 (rebuild.md:129): confirmed.** `hc_{attn,ffn}_fn` are Q8_0 [16384, 24] on layers 0-44.
+3. **GLM's hc fn is Q8_0 (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L129): confirmed.** `hc_{attn,ffn}_fn` are Q8_0 [16384, 24] on layers 0-44.
 4. **exllamav3's `deepseek_v4.py` is a V4 reader, not a V4.1 reader.**
    - `_RATIO_TO_TYPE = {0: "sliding", 4: "csa", 128: "hca"}` (:19) has no entry for V4.1's ratios 2 and 1.
    - It has no engram and no source sharing.
@@ -103,8 +103,8 @@ So the move needs no timed A/B. Its proof is structural (§6). The flow levers (
    - Kernel, `ggml/src/ggml-cuda/unary.cu:80-82`: `g = silu(x); g = min(g, limit)`, which clamps after the SiLU.
    - Our `crates/gpu-deepseek41/src/experts.rs:19-22` documents the kernel's rule.
 6. **V4.1's candidate pool is not in the GGUF, not implemented, and not capped.**
-   - The HF config has `candidate_source_layer_id 20, candidate_topk_blocks 2048, candidate_block_size 8` (v41-ops-report.md:72-74).
-   - The pool is inert up to 2,048 · 8 = 16,384 compressed rows on layer 20's ratio-1 stream, i.e. 16,384 positions [derived; v41-ports-report.md:249-250].
+   - The HF config has `candidate_source_layer_id 20, candidate_topk_blocks 2048, candidate_block_size 8` (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md#L72-L74).
+   - The pool is inert up to 2,048 · 8 = 16,384 compressed rows on layer 20's ratio-1 stream, i.e. 16,384 positions [derived; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ports-report.md#L249-L250].
    - llama.cpp caps the context there (`src/models/deepseek41.cpp:32-34`).
    - A grep of `crates/gpu-deepseek41/src`, `crates/model/src/arch/deepseek41` and `generate_ds41` finds no cap.
    - So above 16,384 positions our engine departs from the reference without saying so. This is a lead/user decision outside the move (§7 L4).
@@ -121,12 +121,12 @@ So the move needs no timed A/B. Its proof is structural (§6). The flow levers (
 | GLM SwiGLU clamp | kernel clamps silu(g) (unary.cu:80-82) | `act_limit` (rule not read) | — | ik's kernel rule (the oracle) |
 | GLM required keys | ik: most optional, with defaults. PR: required | asserts n_group 1, sigmoid, noaux_tc, norm_topk, qk_rope 0 | — | the PR's required set (§2c) |
 | MTP presence | probe the tensors (ik GLM5NEXT; llama.cpp deepseek4.cpp:20-26) | count = `len(compress_ratios) − num_hidden_layers`, built only if the tensors exist (deepseek_v4.py:97-105) | — | tensors decide; the ratio tail only cross-checks |
-| DSpark block width | — | `block_size = dspark_block_size + 1`, "counts the seed position" (deepseek_v4.py:91-96): a convention of exllamav3's generator | — | `dflash.block_size` 5 = the pass width with the seed (`[id_last, mask × (w−1)]`, draft/mod.rs:4). The reference block is `[t, noise×4]` with `dspark_block_size` 5 (v41-ops-report.md:229) |
+| DSpark block width | — | `block_size = dspark_block_size + 1`, "counts the seed position" (deepseek_v4.py:91-96): a convention of exllamav3's generator | — | `dflash.block_size` 5 = the pass width with the seed (`[id_last, mask × (w−1)]`, draft/mod.rs:4). The reference block is `[t, noise×4]` with `dspark_block_size` 5 (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md#L229) |
 | Missing-item error | one error at a time | assert on the first | `validate` returns the first missing item (normal_registry.rs:861-919) | ours: every item in one error (roles.rs:5-6, placement.rs:764-769) |
 
 ### 1. The Rust types
 
-These refine the draft in rebuild.md:135-137:
+These refine the draft in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L135-L137:
 - **Sources live inside the latent mixer.** They are `Compress.rows` and `StreamTopK.{keys, list}`, typed as `Source<T>`, instead of a `LayerSpec.sources` block.
   - A GQA or delta-rule layer cannot carry a source, by type.
   - `From(l)` always points below its reader, which is CED fact 1.
@@ -344,7 +344,7 @@ Derived as methods, not fields:
 They stay because the deepseek reader reads V4-Flash today, and `crates/model/tests/deepseek4_meta.rs:480-508` pins V4's refusal: ten features from `PlanInputs::unimplemented()` (deepseek41/place.rs:77-124), checked against `tests/common/deepseek4_pins.rs:184-204`.
 - With these fields, the coverage check derives that refusal from the spec, and V4 becomes the check's FAIL-first specimen (§6).
 - Without them, the reader needs a second output, `unsupported: Vec<Unimplemented>`. That is a second refusal channel next to the coverage check.
-- Recommendation: keep the fields. V4-Flash is the planned next model (rebuild.md:310). §7 L3.
+- Recommendation: keep the fields. V4-Flash is the planned next model (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L310). §7 L3.
 
 **gpt-oss-120b does not fit without additions.** From the header: `gpt-oss`, 36 layers, hidden 2880, GQA 64/8 × 64, `sliding_window` 128, yarn 32/4096 at base 150,000, 128 experts top-4, expert ff 2880.
 - It needs five fields:
@@ -651,7 +651,7 @@ It also matches the reader's own `served()` test (hparams.rs:1270-1282).
 2. `q_head_norm` = false (hparams.rs:467).
 3. The lagged mix and the LastMix collapse. They are inferred from the absence of `output_hc_*` plus the architecture (hparams.rs:1136-1159; llama.cpp deepseek41.cpp:17-23).
 4. The rope rule: a NORM-mode tail; window-only layers use plain rope at `rope.freq_base`, stream layers use YaRN at `compress_rope_freq_base` (hparams.rs:512-570).
-5. The DSpark tap reads a target layer's input (draft/mod.rs:12-15). The key only names the layers; plan-triage.md:203 records a converter that shifts this by one.
+5. The DSpark tap reads a target layer's input (draft/mod.rs:12-15). The key only names the layers; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L203 records a converter that shifts this by one.
 6. The kernel sizes (the [const] rows of §3).
 7. The engram hash-key prefix `deepseek41.` (engram/src/hash.rs:41).
 8. `exp_probs_b_vl` is marked `Unread` by name (roles.rs:50).
@@ -833,7 +833,7 @@ Not items:
 - **L1: crate placement.**
   - Recommendation: `crates/models` depends only on `gguf`, so plain cargo builds it.
   - The readers stay in `crates/model` for wave 3, because they wrap `Hparams`.
-  - rebuild.md:62 puts the layer programs in `models`, but they need `ops`. Put them in their own crate or in `runtime` so that `models` stays host-only.
+  - https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L62 puts the layer programs in `models`, but they need `ops`. Put them in their own crate or in `runtime` so that `models` stays host-only.
 - **L2: wrap or rewrite.**
   - Recommendation: wrap in wave 3 and rewrite in wave 4.
   - The ≤ 300-line target fits new readers; qwen3moe is already 280 lines.
@@ -899,14 +899,14 @@ Not items:
 |---|---|---|
 | generate_ds41 / gpu-deepseek41 (no cap found) | V4.1 above 16,384 positions departs from the reference without saying so (the candidate pool) | cap XS, build M |
 | crates/serve/src/api.rs:1550-1555, reasoning.rs:32 | DSML and DeepSeek reasoning are applied to every template. The first non-DeepSeek binding (and the mock with `--model <qwen.gguf>` today) returns tool calls as plain content | S |
-| crates/engram/src/hash.rs:41 | `KEY_PREFIX = "deepseek41."` hard-codes the architecture; use `split.arch_key`. plan-triage.md:290 lists the `RowTypes::engram()` twin | XS |
+| crates/engram/src/hash.rs:41 | `KEY_PREFIX = "deepseek41."` hard-codes the architecture; use `split.arch_key`. https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L290 lists the `RowTypes::engram()` twin | XS |
 | crates/gpu-deepseek41/src/router.rs:280, 389 | the kernels return without writing when `n_expert ≠ N_EXPERT`. The host checks (:717, :780) make it unreachable, but it is a silent path by AGENTS' rule; raise the fault word instead | XS |
 | gpu-deepseek41: chain/attn.rs:801-813, chain/ffn.rs:841-852, chain/glue.rs:611, body.rs:2346, indexer.rs:1006, attn.rs:951-955 and 1024-1030, hc.rs:1526-1531, draft/load.rs:274-280, draft/block.rs:188 | ten file-vs-const checks, each stopping at its first mismatch. `pins()` (qwen3moe/body.rs:120-155) collects all of its mismatches. The coverage check replaces both | S (waves 3-4) |
 | crates/model/src/arch/qwen3moe/hparams.rs:102-140 | `feed_forward_length` 6144 is neither read nor reported | XS |
-| crates/model/src/arch/deepseek41/roles.rs:39-41; docs/rebuild.md:156, :159 | the nextn rules match nothing in our file; the plan says the three layers are `Unused` today; "Q5_K routed" belongs to Qwen3.6 | XS doc |
+| crates/model/src/arch/deepseek41/roles.rs:39-41; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L156, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L159 | the nextn rules match nothing in our file; the plan says the three layers are `Unused` today; "Q5_K routed" belongs to Qwen3.6 | XS doc |
 | crates/model/src/arch/deepseek41/hparams.rs:426 | `hash_layer_count` is required; llama.cpp makes it optional because V4.1 files may omit it | XS |
 | ik src/llama-hparams.cpp:2423 | the comment says the clamp is before the SiLU; the kernel clamps after (unary.cu:80-82). Upstream comment fix; check for duplicates first | XS upstream |
-| tools (plan-triage.md:290) | this round again needed a header dumper that prints tensor types by layer range. Promote it to `gguf-inventory --keys --layers` | S |
+| tools (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L290) | this round again needed a header dumper that prints tensor types by layer range. Promote it to `gguf-inventory --keys --layers` | S |
 | tools/box.sh:63 | READONLY still rsyncs (already in the boxlease triage) | XS |
 
 ### 9. What I could not read

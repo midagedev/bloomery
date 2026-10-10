@@ -18,7 +18,7 @@ condition: this tree's generate_qwen3moe and the base's (the q3fix3 landing it r
   bin:<base>:512 4096 bin:<base>:4096, the order rotated every round; no row carries
   [other-busy]. The P = 512 rows are read against their own band, +30..+38 %, by the same decisions;
   the decode rows (tg96 at depth 512 and 4096) are a screen for 0 (decode reads no GEMM)
-decide-in: land q3gemmb; queue FA next (docs/research/mrsq3-design-report.md: the 1.10x line over
+decide-in: land q3gemmb; queue FA next (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/mrsq3-design-report.md: the 1.10x line over
   mistral.rs holds)
 decide-below: if the effect is still past the ruler, land it and take one ncu source page of
   gemm_q4k (BLOOMERY_NCU_SOURCE=1) to find the term the model overstated (the loop's i-cache, the

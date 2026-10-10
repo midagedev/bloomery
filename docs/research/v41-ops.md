@@ -1,10 +1,10 @@
 # V4.1-Flash 디코드 그래프 — 무엇이 같고 무엇이 새로운가
 
-2026-09-21. 원문은 [`v41-ops-report.md`](v41-ops-report.md)(영문, 위임 조사, 주장마다 `file:line`)이고
+2026-09-21. 원문은 [v41-ops-report.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md)(영문, 위임 조사, 주장마다 `file:line`)이고
 이 파일은 그 보고서를 읽고 우리 설계에 남는 것만 추린 것이다. 수식의 1차 출처는 DeepSeek 공식 참조
 구현(`model.py`·`kernel.py`·`config.json`, fp8 체크포인트에 동봉)이고, GGUF 텐서 이름은 mainline 포크
 (`models/deepseek41.cpp`, `conversion/deepseek.py`)를 따랐다. 파일에 실제로 무엇이 들어 있는지는
-[`../v41-inventory.md`](../v41-inventory.md)가 잰 값이다 — 둘이 어긋나면 인벤토리가 이긴다
+[`../v41-inventory.md`](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/v41-inventory.md)가 잰 값이다 — 둘이 어긋나면 인벤토리가 이긴다
 (보고서는 `engram_wkv`를 Q3_K로 추정했지만 파일에서는 q8_0이다).
 
 ## 전제 정정 둘
@@ -15,7 +15,7 @@
 `v41-on-vision`(`llama-engram.cpp`, KV 양자화 작업 포함, 2026-09-21에도 갱신), 닫힌 초안 #2449의 Phylliida `v41-flash`
 (전문가 캐시 + engram을 SSD에서 서빙, 3090 한 장에서 6–8 tok/s 보고). 위임 스펙이 `main`을 가리킨 것이 리드의 실수다.
 아래 본문에서 "ik"라고 쓴 것은 전부 `main`의 V4 코드에 대한 말로 읽는다. 세 포트를 나란히 읽은 결과는
-[`v41-ports.md`](v41-ports.md)(조사 중)에 둔다. 셋은 `~/repo/upstream/v41-ports/{mine,skelectric,phylliida}`에 체크아웃돼 있다.
+[v41-ports.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ports.md)(조사 중)에 둔다. 셋은 `~/repo/upstream/v41-ports/{mine,skelectric,phylliida}`에 체크아웃돼 있다.
 
 공식 참조에는 `engram.py`가 빠져 있다. 해시 구성은 포크의 변환기와 런타임이 유일한 출처다. 다만
 상수(승수·소수·오프셋·토큰 맵·pad id)는 **GGUF 메타데이터에 들어 있다**

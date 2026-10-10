@@ -14,8 +14,8 @@
 #                              0 when the table's pages are cached)
 #   host DRAM    48 x h       (h: one layer's routed service, 18.4 MB gate-up + 12.3 MB down)
 # h is the one term the derivation cannot fix: 390 us expected, 350..460 (the per-dispatch byte law,
-# facts.md:108, at ~77 / ~62 GB/s for the two dispatches, +10..20 us fixed; ik's Qwen3.6 host tier
-# 0.20 ms for 14.4 MB a layer, facts.md:64). So decode 30..38 tok/s at depth 6 and 1024, the same
+# https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md#L108, at ~77 / ~62 GB/s for the two dispatches, +10..20 us fixed; ik's Qwen3.6 host tier
+# 0.20 ms for 14.4 MB a layer, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md#L64). So decode 30..38 tok/s at depth 6 and 1024, the same
 # band at 3000 (the selected flash reads a fixed 2,051 rows: +12 x 2.1 MB).
 # The prompt rows [derived]: --prefill step = decode, 30..37 tok/s at P = 512 and 4096; --prefill
 # pass (passes of 8 through the batch port: the host union 74.8 distinct experts a layer, 23..32 us

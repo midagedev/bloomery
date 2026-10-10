@@ -1,7 +1,7 @@
 # V4.1-Flash를 이 기계에 놓는 법 — 배치 설계(B1이 대조할 표)
 
 2026-09-23 새벽. 읽기 전용 유도 라운드 `b1d`(opus)가 인벤토리·로더 코드·기록된 V2-Lite 수치에서 끌어낸 것을 리드가
-정리했다. 원문 보고와 유도 스크립트는 [`research/v41-placement/`](research/v41-placement/)에 있다. 이 문서의 숫자는
+정리했다. 원문 보고와 단독 스크립트는 [`research/v41-placement/`](https://github.com/midagedev/rig-log/tree/main/docs/bloomery/research/v41-placement)에 있고, 서로를 `./`로 읽는 유도 스크립트(`derive.py`, `spread.py`, `place.py`, `inv.py`, `grid.py`, `final.py`, `tables.py`와 `inv.json`, `roles.json`)는 [`research/v41-placement/`](research/v41-placement/)에 남았다. 이 문서의 숫자는
 거의 전부 **유도**다. 칸마다 **[측정]**(출처 명시)·**[유도]**(산수 또는 스크립트)·**[가정]**을 붙였다. tok/s는
 전부 n=1(한 스트림), ctx_max 32,768, engram 조회는 스텝 스레드 밖이라는 조건의 값이다. 다른 조건이면 그 행에 적었다.
 
@@ -39,7 +39,7 @@
 
 **기록된 V2-Lite 수치와 대조했고 어긋나는 곳은 없다** [유도]:
 
-- `plan.md` 「GPU 선 트리아지」(지금은 장부 「GPU 선 트리아지 원문」)의 Q5_0: 26텐서 × 131,072행 × 2,224 B = **7,579,107,328 B** 상주, 파일 968 B/행 =
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md 「GPU 선 트리아지」(지금은 장부 「GPU 선 트리아지 원문」)의 Q5_0: 26텐서 × 131,072행 × 2,224 B = **7,579,107,328 B** 상주, 파일 968 B/행 =
   **3,298,820,096 B**. 둘 다 맞는다. 행당 차이 1,256 B는 창 패딩 640 B(1024·2 − 1408), 코드 펼침 528 B(1408 − 880),
   스케일 f32화 88 B로 나뉜다. 트리아지가 "파생"이라고 적어 둔 창 패딩 2.18 GB가 그중 첫 몫이다.
 - 장부의 "파일 8.12 GB → 상주 12.45 GB": 공식은 파일 8,122,610,688 B, 상주 12,446,610,432 B(파일 텐서
@@ -99,7 +99,7 @@ q4_K의 rb는 1,296, q6_K는 129,280행 × 4,200 B. expert 조각(expert당 2,30
 
 ## 4. KV와 scratch
 
-**누가 무엇을 갖는가**(`research/v41-ops-report.md:386-400`, `:195`):
+**누가 무엇을 갖는가**(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md#L386-L400, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md#L195):
 
 - 40층 전부가 자기 128행 링(512차원 행)을 갖는다. 층마다 131,072 B, 합 5,242,880 B. 링은 우리 설계다 — ik는 n_ctx행 셀에 쓰고 창을 SWA 마스크로 만든다. 보이는 키 집합은 같다[유도].
 - 압축 행과 128차원 인덱스 키는 2·8·14·20층이 갖는다. 3–7은 2를, 9–13은 8을, 15–19는 14를, 21–39는 20을 별칭한다.
@@ -138,7 +138,7 @@ id로 가려야 한다. 고르게 펴는 쪽은 R1(그래프 안에서 두 다�
 n_l ≤ ~281이면 GPU 다리가 호스트 다리 밑에 숨는다(575·147.7 GB/s에서) [유도]. 아래 안은 전부 그 밑이다.
 
 **대역폭**: A6000 575 GB/s [가정 — 「모델」의 `BW` 700은 3090에서 보정한 값, × 768/936]; 3090 700 GB/s [3090에서
-보정, 「모델」]; 호스트 147.7 GB/s [측정, `facts.md` 「이 기계에 맞춘다는 것」].
+보정, 「모델」]; 호스트 147.7 GB/s [측정, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md 「이 기계에 맞춘다는 것」].
 
 ### (a) A6000 + DDR4 — 3090 미사용
 
@@ -182,7 +182,7 @@ n_l ≤ ~281이면 GPU 다리가 호스트 다리 밑에 숨는다(575·147.7 GB
 | 호스트 | 나머지 expert | ~~194.527~~ 194.627(b11c) | ~~3.039~~ 3.041 | ~~20.58~~ 20.59 |
 | 링크 | h 스트림 4개 + `ffn_pre`, A6000 → 호스트 → 3090 | — | 81,936 B | ≈0.02 |
 
-건너가는 크기는 4 × 5120 × 4 + 16 = 81,936 B다(`research/v41-ops-report.md:213`, "block returns (h_next, ffn_pre)").
+건너가는 크기는 4 × 5120 × 4 + 16 = 81,936 B다(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-ops-report.md#L213, "block returns (h_next, ffn_pre)").
 `gpu-design.md`의 "8 KB"는 V2-Lite 값이다. **두 카드 사이에 P2P가 없다** [측정: `nvidia-smi topo -p2p r` = GNS] — 호스트를
 거친다. 전송은 27.1·25.5 GB/s에서 3.0 + 3.2 µs [측정, rig-log 2026-09-18, 3090] + 동기 2 × 7 µs [가정].
 
@@ -201,7 +201,7 @@ A6000 여유 1,085,775,872, 3090 ~~1,081,602,048~~ 1,081,606,144, 호스트 63,1
 
 - 직렬 = Σ 장치 다리 + 1,284노드 × 0.80 µs + 호스트 층마다 14 µs [가정] + KV / 195 GB/s [유도: A6000의 V2-Lite MMA
   기본값, 127.2 MB / 0.653 ms, 「GPU 선」 깊이 표].
-- R1 = 층마다 max(shared expert + GPU expert, 호스트 다리) — [`research/hybrid-engines.md`](research/hybrid-engines.md) R1.
+- R1 = 층마다 max(shared expert + GPU expert, 호스트 다리) — [`research/hybrid-engines.md`](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/hybrid-engines.md) R1.
 
 tok/s @ n=1, 머리 대역폭, 깊이 6 / 1024 / 4096 [유도]:
 
@@ -224,7 +224,7 @@ tok/s @ n=1, 머리 대역폭, 깊이 6 / 1024 / 4096 [유도]:
 
 GPU 낮음은 A6000 400 GB/s [유도: V2-Lite 스텝 1,533,695,856 B ÷ (4.3565 − 648 × 0.80 µs) ms]와 3090 433 GB/s [유도,
 장부 A3d 행: 스텝 4.1006 ms, 701노드 × 0.80 µs를 뺀 시간], 중간은 머리 값 575·700, 높음은 피크의 85 % [가정]. 호스트 122.6 GB/s는 qdot 다중 스레드 커널 상한의
-아래 끝 [측정, `facts.md` 「법칙과 교훈」의 디스패치당 바이트 법칙: 122.6–136.3 GB/s], 230.4 GB/s는 물리 천장이자 WKS-36 기울기가 가리키는 값이다. `roofline.md:91`의 모순(WKS-36 기울기
+아래 끝 [측정, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md 「법칙과 교훈」의 디스패치당 바이트 법칙: 122.6–136.3 GB/s], 230.4 GB/s는 물리 천장이자 WKS-36 기울기가 가리키는 값이다. `roofline.md:91`의 모순(WKS-36 기울기
 대 147.7 GB/s)은 아직 열려 있다. 호스트 실제 속도가 높으면 (a)/(b)의 간격은 ms로는 준다(147.7에서 3.5 ms, 230.4에서
 2.6 ms). 비로는 ~10 %에 머물고, GPU 밀집 항이 가장 긴 장대가 된다.
 
@@ -244,7 +244,7 @@ ik 선이 그 안에 있다. 우리 GPU 밀집 경로가 ik의 유효 247 GB/s(`
 위 표의 호스트 항은 STREAM 147.7 GB/s 가정이었다. b2h가 V4.1 모양 그대로 잰 호스트 다리는 16–32스레드에서
 127.7–129.9 GB/s였다(호스트 바이트는 b1b가 다시 핀한 n_l 62–63의 3.418 GB, rig-log [09-23#v41-host-leg](https://github.com/midagedev/rig-log/blob/main/log/2026-09-23.md#v41-host-leg)).
 (a) 표의 호스트 ms를 이 값으로 고쳤다. GPU 쪽도 가정 대신 B11b 뒤 A6000에서 잰 토큰 그래프를 쓴다. 입력과 출처는 전부
-[`research/v41-placement/measured.py`](research/v41-placement/measured.py)에 있다(이 표는 그 스크립트의 `6bcf8a7` 판 출력이다 — 아래 「다시 센 표」). 줄마다 레버를 하나씩 더했다. 범위의
+[`research/v41-placement/measured.py`](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-placement/measured.py)에 있다(이 표는 그 스크립트의 `6bcf8a7` 판 출력이다 — 아래 「다시 센 표」). 줄마다 레버를 하나씩 더했다. 범위의
 앞은 불리한 끝, 뒤는 유리한 끝이고 괄호는 중심값이다. 깊이 4096, n = 1, (a)안 [유도]:
 
 | 경우 | 호스트 ms | 직렬 tok/s | R1 tok/s |
@@ -269,7 +269,7 @@ ik 선이 그 안에 있다. 우리 GPU 밀집 경로가 ik의 유효 247 GB/s(`
 비교선 ik 20.4–20.7 tok/s는 A6000 전환 전에 잰 값이고, B5에서 A6000으로 다시 잰다. 중심값으로 보면 합친 정적 목록의
 R1(~~30.6–33.3~~ 29.8–32.3)은 그 선의 약 1.5–1.6배다.
 
-**다시 센 표(2026-09-23 낮, B5 노드 표).** b5plan이 스텝의 노드 1,068개를 하나씩 세었다([`research/v41-b5-plan/nodes.py`](research/v41-b5-plan/nodes.py)). 그 결과 위 표의 가정 둘이 바뀌었다.
+**다시 센 표(2026-09-23 낮, B5 노드 표).** b5plan이 스텝의 노드 1,068개를 하나씩 세었다([`research/v41-b5-plan/nodes.py`](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-b5-plan/nodes.py)). 그 결과 위 표의 가정 둘이 바뀌었다.
 - gemv가 아닌 GPU 노드: 0.9–1.4 ms → 임계 경로 1.89 ± 0.3 ms.
 - KV: 0.16 ms(195 GB/s) → attention 0.39–0.57 ms + merge 0.11 ms. 64헤드가 512 잠재 하나를 K와 V로 같이 읽어 키당 131 kFLOP이라, 이 항은 바이트가 아니라 연산에 묶인다.
 

@@ -1,5 +1,5 @@
 # The V4.1 gate fixture's full generation (crates/model/src/bin/v41fixture.rs, round fxgen; the design
-# is docs/research/fixture-design-report.md): nine real-shaped layers and the DSpark draft, random
+# is https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/fixture-design-report.md): nine real-shaped layers and the DSpark draft, random
 # weights at derived scales, into /models. The round's estimate [derived]: 60,854,838,208 B of target
 # and 7,972,960,256 B of draft, gen 2.4 s + page-cache write 18-20 s + NVMe flush 16-17 s, 38-40 s
 # at 3.19 GB peak RSS; then `v41fixture verify` reads it back. Approved by the user 2026-09-26 (the

@@ -1,4 +1,4 @@
-# The implementation round q3swz (docs/research q3fstep report): gqa_prefill_flash's K/V tiles in a
+# The implementation round q3swz (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3fstep-design-report.md): gqa_prefill_flash's K/V tiles in a
 # 256-byte row with the 16-byte chunks XOR-swizzled by row & 7 instead of the 272-byte padded row,
 # on q3fa's kernel, plus the prologue diet (32 query loads in flight, cvt.rn.f16x2.f32 with a NaN
 # select). Sitting 16 measured 102,959,116 L2->SM read sectors for q3fa against 69,337,088 of K/V and

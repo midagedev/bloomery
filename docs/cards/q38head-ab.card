@@ -1,4 +1,4 @@
-# Round q38draft (idea A, docs/plan-triage.md idea ledger, TensorFold): Qwen3.8's MTP draft with a reduced head
+# Round q38draft (idea A, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md idea ledger, TensorFold): Qwen3.8's MTP draft with a reduced head
 # (BLOOMERY_MTP_HEAD_ROWS) against the full head, same binary, the shipped default otherwise (residency, the MTP
 # draft and host streaming unset: mid-p121-s1, mtp, on).
 # The lists are tools/ref/draft-vocab.py's, from text disjoint from the measured prompt (corpus-prose.ids is not a

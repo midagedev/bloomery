@@ -79,7 +79,7 @@ RR = os.path.join(HERE, "..", "ref", "router-residency.py")
 KINDS = ("measured", "derived", "assumed")
 MACHINES = {"box-3090": "3090.", "box-3090-lowhost": "3090.", "box-a6000": "a6000.", "common-5090": "5090."}
 DEFAULT_MACHINE = "box-3090"
-# A preset that is another's rows with terms set: the weak-host emulation the box can run (docs/plan-triage.md G5),
+# A preset that is another's rows with terms set: the weak-host emulation the box can run (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md G5),
 # the host's expert threads capped (host_threads; what it moves: host_scale()).
 PRESET_SETS = {"box-3090-lowhost": ["host_threads=12"]}
 # The configurations a preset runs today, by name (--config), the first its default. Each is a list of --set terms.

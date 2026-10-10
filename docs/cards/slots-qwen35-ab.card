@@ -11,7 +11,7 @@
 #
 # [derived] One row, the plain step S1, is measured: 204.4 tok/s at depth 6 and 195.8 at depth 4096
 # (rig-log 09-28#q36-release, A6000, 3 rounds, no tags), so S1 = 4.89 and 5.11 ms. The step's byte classes
-# (qwennext-lit-report.md's step table, q36-public.card): the routed and shared experts 40 layers x (8
+# (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/qwennext-lit-report.md's step table, q36-public.card): the routed and shared experts 40 layers x (8
 # used + 1 shared) = 360 slots x 1.77..2.04 MB = 637..734 MB; the GDN projections 633 MB (30 layers x
 # 21.1); the head 417 MB (Q6_K, once); the GDN state read and written 131.7 MB + the conv 0.09 ms; the GQA
 # projections, routers and norms the remainder. At the step's effective 426..455 GB/s the experts are

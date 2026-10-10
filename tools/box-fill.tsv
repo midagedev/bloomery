@@ -1,5 +1,5 @@
 # The box's idle-fill list: the work a card takes when nothing of ours is queued for it. One owner: this file.
-# tools/boxq-check.py fill-list parses it and refuses a row whose recipe is not in the justfile; docs/plan-triage.md points here.
+# tools/boxq-check.py fill-list parses it and refuses a row whose recipe is not in the justfile; https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md points here.
 # Tab-separated, four columns, blank and `#` lines skipped:
 #   item      a justfile recipe name, or `cmd:<command>` for work that is not a recipe
 #   lane      3090 | a6000 | both | any | none — the card the item holds, read from the recipe's own box.sh/gpu-gate.sh

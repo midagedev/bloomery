@@ -52,7 +52,7 @@
 #   --ctx 4352 --place gate' > <log> 2>&1
 # Expected [derived]: `load ... place=gate`, `xstream=split xstream_half=<N> ... xstream_lane_gbs=<G> xstream_m_min=<M> (set)` with
 # N 60..100 (free bytes after the plan less 512 MiB over 2 x ~3.1 MB a slot, the 3090's own half) and G 19..21.4 (the
-# refutation's M4 band, from the A6000 loads' 18.9..20.94 GB/s; both cards are PCIe 4.0 x16, docs/facts.md:66, but the 3090's
+# refutation's M4 band, from the A6000 loads' 18.9..20.94 GB/s; both cards are PCIe 4.0 x16, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md#L66, but the 3090's
 # lane is unmeasured: that is why this is read first), one `xstream` record a card layer, `call stream end` and `xstream end`.
 # A refusal (XStream ring room) there means arm 2 cannot run at gate: the lever pair is then not the arm, say so and stop.
 # Wall [derived]: 3 loads a round x 2 rounds, each ~40 s (host set warm) plus its arms' PRIME and counted runs (P 512: ~6 s; P

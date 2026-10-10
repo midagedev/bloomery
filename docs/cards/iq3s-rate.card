@@ -56,7 +56,7 @@ condition: the lead runs, after just build-ref (so iq3s_rate exists and iq3s-ik-
   the box. The rows of docs/cards/iqhost-rate.card ride in the same log — IQ4_NL@640,
   Q5_1@640, IQ4_XS@2560, Q4_K@2560 — and are ruled by that card's own verdict
   (card.py verdict docs/cards/iqhost-rate.card over their per-round ratios), not here
-reason: sets the IQ3_S per-core cost c in docs/plan.md:77's host-union row (t(m) =
+reason: sets the IQ3_S per-core cost c in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L77's host-union row (t(m) =
   max(W, a + c·m)) for GLM-5.3-Flash UD-IQ4_XS (82 of its routed IQ3_S gate/up stacks),
   and decides whether a decode-leg kernel round or the fixed-term read (quantwide design
   4.4 item 2) comes next; why now: the kernel is written and gated, and the engine can
@@ -76,4 +76,4 @@ decide-below: under 4.6 the per-layer break-even is missed and the leg is comput
   from 4.3 to 4.6 do the fixed-term read first as well
 decide-above: over 6.2 the extraction costs less than the shuffle-port bound says: the
   fixed-term read as for the band; from 8.6 the kernel is done (DRAM-bound under both
-  models): record the rate in docs/plan.md's host-union row and stop
+  models): record the rate in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md's host-union row and stop

@@ -12,7 +12,7 @@
 # - bp: the tier takes 564.8 slots (544..596 over the contexts) and 33.3 touched experts a layer: -6.1 ms of slot
 #   term and -2.4 of expert term, -8.5 ms (8.3..8.6 over the contexts; 7.7..9.4 with the law's own +-10 %) on 39
 #   layers; the Q6_K layers 11, 12, 44, the dense layers and the NextN layer have no tier.
-# - the tier's service a layer-batch on the 3090: x in, 8.4 MB f32 (0.32 ms at 26.28 GB/s, docs/facts.md:66); 64
+# - the tier's service a layer-batch on the 3090: x in, 8.4 MB f32 (0.32 ms at 26.28 GB/s, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md#L66); 64
 #   chunks of 8 tokens x 4 launches (gpu-glm5next/src/tier.rs:281) reading ~8.6 GB of tier experts (11..13.5 ms at
 #   650..800 GB/s); the Staged rows back (host/tier.rs:831: every slot's row, 67.1 MB, 2.6..3.4 ms): 14..17 ms,
 #   under the bp union's ~40 ms with 22..26 ms to spare.

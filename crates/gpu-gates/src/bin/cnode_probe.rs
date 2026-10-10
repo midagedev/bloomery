@@ -1,5 +1,5 @@
 //! The per-node price of a captured graph, `c_node` of the step cost model in
-//! `docs/plan.md`: graphs of N empty `touch` kernels (`Probe::enqueue_touch`,
+//! <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>: graphs of N empty `touch` kernels (`Probe::enqueue_touch`,
 //! one 32-thread block each), one node per launch, at the node counts of
 //! [`NODES`].
 //!

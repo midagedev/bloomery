@@ -6,7 +6,7 @@
 # Band [derived]: at --n-cpu-moe 34 the host keeps layers 0-33's experts, 2 x 7,007,109,120 B + 32 x
 # 6,440,878,080 B = 220,120,317,440 B (models/deepseek41.sh's per-layer bytes). With op offload on, a
 # host-resident expert tensor of an op with a batch >= 32 is copied to the card whole per ubatch; one
-# ubatch of 4096 copies all of it once, from the pageable mapping at 21.16 GB/s (facts.md, the A6000's
+# ubatch of 4096 copies all of it once, from the pageable mapping at 21.16 GB/s (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md, the A6000's
 # pageable H2D): 220.12 / 21.16 = 10.40 s, pp4096 <= 4096 / 10.40 = 393.8 tok/s, the copy alone. The low
 # edge 250 (16.4 s) leaves 6.0 s for everything the copy does not price: the routed MMQ over the copied
 # weights (34 layers x 6.44 GB at ~3.79 bits a weight = 13.6e9 weights a layer, 6 of 384 experts a

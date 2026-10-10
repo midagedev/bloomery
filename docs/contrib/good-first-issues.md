@@ -1,6 +1,6 @@
 # Good first issues
 
-Ten open rows taken from the open-work board (`docs/plan-triage.md`, mixed Korean and English) and **re-checked
+Ten open rows taken from the open-work board (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md, mixed Korean and English) and **re-checked
 against the code at `6b630e5e` on 2026-10-10**. The board is a notebook and many of its rows have since been closed, so
 every row below cites the code as it is now, not the board's line numbers. Sizes are the board's (XS, S, M, L); where my
 reading differs the row says so. "Verify" is a command you can run on your own machine.
@@ -34,7 +34,7 @@ no card and no model (the pure crates, `python3 tools/recipes.py pure-crates`; `
   a client that sets them gets a plain sample with no warning. The refusal list has the pattern (`n_probs`, `grammar`,
   `logprobs`, `logit_bias` are refused by name); add rows that refuse a non-neutral value. The neutral values are the
   ones the server already reports (`api.rs:1522-1537`). Use llama-server's field names and its
-  `tools/server/tests/unit/test_*.py` cases as the oracle (`docs/plan-triage.md`, "llama-server parity").
+  `tools/server/tests/unit/test_*.py` cases as the oracle (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md, "llama-server parity").
 - **Files:** `crates/serve/src/api.rs:1337-1370` (`refused`), tests in the same file.
 - **Verify:** `cargo test --release -p bloomery-serve`.
 

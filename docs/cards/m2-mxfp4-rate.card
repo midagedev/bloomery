@@ -1,5 +1,5 @@
 # The MXFP4 x Q8_2_X4 single-core rate, never measured: the v4host round's
-# prediction (docs/plan-ledger.md:1285, "미측정") read against its measured
+# prediction (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L1285, "미측정") read against its measured
 # anchor. Anchor (measured): Q3_K x Q8_K single-core qdot-rate 10.8 GB/s
 # (rig-log log/2026-09-20.md:8, MUL-26, 360,448 rows x 880 B). Low edge
 # [derived]: the instruction-ratio scaling 10.8 x (136/110) x (130/136) ~ 12.8
@@ -33,16 +33,16 @@ condition: the lead runs, after just build-ref (so mxfp4_x4_rate exists),
   just measure-qdot-rate 3 on this tree — the recipe builds qdot-rate itself,
   the runner pins one core and reverses arm order every round, and the witness
   shows no other compute on the box
-reason: sets qdot's MXFP4 per-column cost c in docs/plan.md:77's host-union row
-  (t(m) = max(W, a + c·m)) and closes plan-ledger.md:1285's "미측정" (MXFP4
+reason: sets qdot's MXFP4 per-column cost c in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L77's host-union row
+  (t(m) = max(W, a + c·m)) and closes https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L1285's "미측정" (MXFP4
   12.8-14.6); why now: the rate decides whether MiMo's card-expert round (R5)
   or an MXFP4 decode kernel round comes first, and it is the prompt-path round
   (R8)'s first lever
-decide-in: the decode leg is DRAM-bound; record the rate in plan-ledger.md's
-  v4host line and in plan.md's host-union row; R5 (card experts) next; an
+decide-in: the decode leg is DRAM-bound; record the rate in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md's
+  v4host line and in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md's host-union row; R5 (card experts) next; an
   MXFP4 tile only in the R8 prompt-path round
 decide-below: under 7.8 GB/s the decode leg is ALU-bound and an MXFP4 decode
   kernel round comes before R5; between 7.8 and 12.8 a term the derivation
   missed: profile qdot-rate (perf -e cpu-clock) before deciding
-decide-above: rewrite the MXFP4 c in plan.md's host-union row and re-derive
+decide-above: rewrite the MXFP4 c in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md's host-union row and re-derive
   MiMo's prompt-path (R8) prediction

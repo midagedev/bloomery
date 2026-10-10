@@ -25,12 +25,12 @@
 #   slots at 0.025..0.035): 0.70..1.10 ms. The front is C1 = S1 47.7 - h 29.6..31.4 - F (glmpair-probe.card) less
 #   the dense layers and the head, over 42 layers. In the host's shadow on (a) (0..5 layers card-bound); 0..27
 #   card-bound layers on bp, where the card caps the tier's slots.
-# - c_two (V4.1's bp steps sit 1.9..2.5 ms over its plan (a) calibration, docs/plan-triage.md:355, rig-log
+# - c_two (V4.1's bp steps sit 1.9..2.5 ms over its plan (a) calibration, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L355, rig-log
 #   09-29#chatlist-dspark; source open): card-side a tiered row-layer (0.050..0.066 ms, in the card term above, hidden
 #   where the host leads), or once a pass (1.9..2.5 ms on the wall). Not both: one term fit V4.1's rows.
 # - the 3090: ~1.1 tier slots a row-layer, ~0.04..0.06 ms, inside the row's 0.47..0.58 ms host leg. PCIe a row-layer:
 #   16 KB of activation to the 3090, ~18 KB of rows back, read by the A6000's join through the mapping: ~2.7 MB a pass
-#   on each link, under 0.1 ms at 26.28 GB/s (docs/facts.md:66). Host DRAM: nothing new (~4 MB a pass).
+#   on each link, under 0.1 ms at 26.28 GB/s (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/facts.md#L66). Host DRAM: nothing new (~4 MB a pass).
 # - unchanged: the Q6_K layers (6.0..6.5 ms a pass), the dense lead and heads (3..5), the NextN walk (2.4..2.7,
 #   layer 45 host-only), the commit (0.3..1.0), the residency's landing waits (0..12 ms a pass,
 #   glmresmtp-stage.card's 8..51 ms a landing).

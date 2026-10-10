@@ -72,7 +72,7 @@
 //! `--plan a|b` picks design §5's plan, b by default: plan (b) splits the
 //! layers over both cards (`workstation::plan_b`), and this gate is the tree's
 //! one run of that two-card staging, the exercise ahead of the two-card tier
-//! (T2 of `docs/plan.md`'s target profile). The engine itself opens one card:
+//! (T2 of <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>'s target profile). The engine itself opens one card:
 //! `body::open` in `bloomery_gpu_deepseek41` refuses a placement on more than
 //! one. Plan (a) is the one-card plan.
 

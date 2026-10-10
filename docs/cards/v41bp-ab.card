@@ -8,7 +8,7 @@
 # layer: the card's front, then max(host leg, card experts + tier), then the join, 22.6-26.7 ms. The host leg is
 # 130 slots a step x 126 us = 16.41 ms (rig-log 09-29#odswap-ab). The tier holds 1,392 experts (34.8 of 384 a layer,
 # 09-29#chatlist-clip) and takes about 11 % of the host's routed mass, so the share on the path is 0.13..1.0. The
-# two-card fixed term c_two is +1.9..+2.5 ms a step (docs/plan-triage.md:228; its source is unknown). Window-apart
+# two-card fixed term c_two is +1.9..+2.5 ms a step (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md#L228; its source is unknown). Window-apart
 # rows read +2.3 % / +1.8 % at P 512 / 4096 (09-30#callstream-pp-bp against callstream-pp-a), inside the ~5 %
 # swing between windows, so they are no verdict. Band: -1..+5 %.
 #

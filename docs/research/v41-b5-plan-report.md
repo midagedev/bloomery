@@ -1,6 +1,6 @@
 # V4.1 B5 설계와 라운드 절단 — b5plan 원문 보고
 
-읽기 전용 설계 라운드 b5plan(opus, 2026-09-23)의 보고를 그대로 옮겼다. 결정과 라운드 순서는 [`plan.md`](../plan.md)의 「B5 라운드」가 정본이고, B5 라운드의 스펙은 여기의 노드 표(§1), 상태·파라미터 표(§2), 게이트(§4.1)를 복사해 간다. 노드 모델은 [`v41-b5-plan/nodes.py`](v41-b5-plan/nodes.py)(`python3 nodes.py <깊이>`)와 `bykind.py`(§1.3의 층 종류별 합)로 다시 돌릴 수 있다 — 저장소로 옮기면서 임계 표시 두 줄을 §1.3의 B5 기준 배치(`engram_wkv`는 0층 그늘, HC_PRE(attn)는 임계)에 맞췄다. 보고 안의 `b5plan/`·`lead-b11b/`·`wave-m3/` 경로는 세션 스크래치라 남아 있지 않을 수 있다.
+읽기 전용 설계 라운드 b5plan(opus, 2026-09-23)의 보고를 그대로 옮겼다. 결정과 라운드 순서는 [plan.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md)의 「B5 라운드」가 정본이고, B5 라운드의 스펙은 여기의 노드 표(§1), 상태·파라미터 표(§2), 게이트(§4.1)를 복사해 간다. 노드 모델은 [`v41-b5-plan/nodes.py`](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-b5-plan/nodes.py)(`python3 nodes.py <깊이>`)와 `bykind.py`(§1.3의 층 종류별 합)로 다시 돌릴 수 있다 — 저장소로 옮기면서 임계 표시 두 줄을 §1.3의 B5 기준 배치(`engram_wkv`는 0층 그늘, HC_PRE(attn)는 임계)에 맞췄다. 보고 안의 `b5plan/`·`lead-b11b/`·`wave-m3/` 경로는 세션 스크래치라 남아 있지 않을 수 있다.
 
 ---
 
@@ -327,7 +327,7 @@ ik가 올리는 f16 마스크는 우리는 올리지 않는다(d1 input 행 기�
 - **G5 forced_ik(V2-Lite forced_exact에 해당하는 것)**
   - 같은 실행의 채점 위치에서 argmax가 어긋나고 ik 마진 ≥ 0.5인 위치를 센다.
   - 핀은 ≤ E + 3√E다. E = Σ Φ(−m_i/σ_rel)이고, σ_rel은 같은 실행에서 (우리 마진 − ik 마진)의 RMS다.
-  - 버그를 잡는 핀이지 정밀도 순위가 아니다(plan.md "성능이 먼저").
+  - 버그를 잡는 핀이지 정밀도 순위가 아니다(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md "성능이 먼저").
   - f64 V4.1 심판은 L 크기라 B5 밖에 둔다.
 - **G6 V2-Lite 불변**: b5load는 이동 클래스다. `just ptx-scan` 표가 같고, e2e 세트가 같고, `gate-gpu-e2e` 개수 핀이 그대로여야 한다.
 - **tok/s는 리드가 잰다**: 같은 임대에서 ik와 우리 (a)를 깊이 6/1024/4096으로 잰다.
@@ -354,7 +354,7 @@ ik가 올리는 f16 마스크는 우리는 올리지 않는다(d1 input 행 기�
 - b2b 머지 뒤: b5load ‖ b5host.
 - b5load 뒤: b5attn ‖ b5ffn ‖ b5glue. 파일이 분리돼 있고, op가 도착하는 대로 시작한다.
 - 그다음: b5step → b5index.
-- **model.rs를 만지는 B5 라운드는 b5load 하나다.** 그래서 plan.md:377의 "B5 → A5"를 "b5load → A5 ‖ B5의 나머지"로 풀 수 있다.
+- **model.rs를 만지는 B5 라운드는 b5load 하나다.** 그래서 https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L377의 "B5 → A5"를 "b5load → A5 ‖ B5의 나머지"로 풀 수 있다.
 - 1단계에서 인덱서를 뺄 수 있다. 다만 **압축기와 인덱스 키 쓰기(b4-comp)는 pos 0부터 필요하다.**
   - hca는 비율이 1이라 20층이 pos 0에 행 0을 쓰고, 20–39층이 그것을 읽는다.
   - pos ≥ 512의 인덱서는 그 앞의 키 전부를 읽는다.
@@ -403,7 +403,7 @@ ik가 올리는 f16 마스크는 우리는 올리지 않는다(d1 input 행 기�
 | 재지 않은 항 4 | 64헤드 attention의 키당 비용(0.39–0.57) | b4attn | — |
 | 재지 않은 항 5 | Sinkhorn 20회의 직렬 지연 | b4hc | — |
 | 재지 않은 항 6 | 첫 청크 호스트 expert의 콜드 NVMe 읽기. 토큰당 3.4 GB라 콜드면 ~0.5 s/토큰 [유도, NVMe 7 GB/s 가정]. 그래서 PPL은 ik 실행 직후(같은 파일이 캐시에 따뜻할 때) 돌린다 | — | — |
-| 가장 큰 레버 | B12(−7…−10 ms, `v41-placement.md` 재유도 표). R1에서 호스트 레버가 GPU 레버보다 크다 | plan.md B12 | L |
+| 가장 큰 레버 | B12(−7…−10 ms, `v41-placement.md` 재유도 표). R1에서 호스트 레버가 GPU 레버보다 크다 | https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md B12 | L |
 
 ### 커널 엔지니어 시선
 
@@ -427,16 +427,16 @@ ik가 올리는 f16 마스크는 우리는 올리지 않는다(d1 input 행 기�
 
 ## 7. 문서·스펙이 코드나 ik와 어긋나는 곳
 
-- `docs/arch-split.md:36`, `docs/research/v41-op-map-report.md:342`: engram "한 스텝 앞서"는 성립하지 않는다. 행 id가 현재 토큰에서 시작한다(ik `src/llama.cpp:5403-5415`).
+- `docs/arch-split.md:36`, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-op-map-report.md#L342: engram "한 스텝 앞서"는 성립하지 않는다. 행 id가 현재 토큰에서 시작한다(ik `src/llama.cpp:5403-5415`).
 - `docs/arch-split.md:120-123` 대 `:62`: `AnyEngine::Deepseek41(GpuModel<deepseek41::Body>)`가 crates/gpu에 있는데, body는 crates/gpu-deepseek41에 있고 그 크레이트가 crates/gpu에 의존한다. 순환이다. AnyEngine을 gpu-gates로 올려야 한다.
 - `docs/arch-split.md:89-99`: `ChainBody::derive`/`load`가 `&Gguf`를 받는데, V4.1은 9샤드 Split을 배치 계획으로 싣는다(`weights.rs:167`).
 - `docs/research/v41-b4-plan-report.md:205`: attention을 44 µs(바이트) + 68 µs(노드)로 잡았다. 3.2 GFLOP/토큰(128 FLOP/B)의 연산 한계를 빼먹었다. 0.39–0.57 ms다 [유도].
-- `docs/research/v41-placement/measured.py:16-17`: NONGEMV 0.9–1.4, KV 0.16은 이 표에서 임계 1.89, 0.50이다. engram 조회 0.31은 (a) 줄들에 빠져 있다.
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-placement/measured.py#L16-L17: NONGEMV 0.9–1.4, KV 0.16은 이 표에서 임계 1.89, 0.50이다. engram 조회 0.31은 (a) 줄들에 빠져 있다.
 - `docs/v41-placement.md:18-19`: "(b′)는 A2-2가 필수 아님"은 맞다. 그러나 배치 코드가 (b′)를 표현하지 못하고(`placement.rs:113-114,431-432`), 3090 서버 그래프와 작업자 둘짜리 합류가 필요하다. 비용이 0이 아니다.
 - `spec-b4hc.md:40-42`: "[HC_POST + 다음 접기] 한 커널"은 1·14층 경계에서 틀린다. 다음 입력의 접기는 engram이 스트림 4개를 바꾼 뒤에 온다(`build_deepseek4.cpp:1543-1550`).
 - `spec-b4moe.md:41`: "shared 2.98 ms"는 B11b 뒤 2.666 ms다(`measured.py:9`). 게다가 R1에서는 토큰에 닿지 않는다.
 - `spec-b4engram.md:32`: "`engram_wkv` 0.52 ms가 지배"는 맞는 측정이다. 다만 설계상 0층 그늘로 옮겨져 임계 경로에서 빠진다.
-- `docs/plan.md:205,355`(B5 카드)와 브리프 §1: 목표 2.2355는 다른 파일의 값이다. 서빙 파일의 패리티 목표는 고친 ik 1.8989 ± 0.0491이다.
+- https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L205, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L355 (B5 카드)와 브리프 §1: 목표 2.2355는 다른 파일의 값이다. 서빙 파일의 패리티 목표는 고친 ik 1.8989 ± 0.0491이다.
 - `docs/research/v41-b4-plan-report.md:98`: ik raw 셀과 우리 링은 레이아웃이 다르다. 모순은 아니지만, 상태 주입 게이트가 raw 셀에서 마지막 128행만 링으로 옮기는 변환을 가져야 한다.
 
 ---
@@ -451,7 +451,7 @@ ik가 올리는 f16 마스크는 우리는 올리지 않는다(d1 input 행 기�
 | `crates/gpu/src/fused.rs:539` | V2-Lite norm_quant ×54 = 216 µs/스텝을 K1과 같은 방식으로 | M |
 | `tools/ref/ik-ppl.sh:159-160` | `--kl-divergence-base`를 넘기는 경로가 없다(패리티 프로토콜에 필요) | XS–S |
 | `crates/model/src/placement/workstation.rs:106-123` | 게이트 배치(3090 전 층 + n_l 상한)가 없다 | S |
-| `docs/research/v41-placement/measured.py:16-17` | NONGEMV·KV 가정을 이 노드 표의 항으로 교체 | XS |
+| https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/v41-placement/measured.py#L16-L17 | NONGEMV·KV 가정을 이 노드 표의 항으로 교체 | XS |
 | `crates/gpu-gates/src/bin/bench_v41.rs:142-143` | 라우터 bf16 → f32 디코드가 바이트를 두 배로 만든다(K5) | S |
 | 박스 `/root/bloomery-data/nsys/nsys-d6-graph-234345.sqlite` | device 0 = RTX 3090이다. A6000 시간 규칙에 맞게 `nsys-gpu.sh`로 다시 뜨기 | XS(리드) |
 | `tools/ref/models/deepseek41.sh`(`ref_step_variant`) | 1단계용 `d1n` 변형(프리필 301, top_k 512) 추가 | XS |

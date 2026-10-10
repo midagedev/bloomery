@@ -458,7 +458,7 @@ AMX·AVX512 커널 수치(ISA가 없다), pre-gate(재학습 불가). 한 줄로
 - **Non-temporal·huge page**: 이 규모 MoE CPU 추론에서 NT 로드·huge page가
   유의미하다는 공개 실측을 찾지 못했다. 우리 인-트리 실측에서는
   `MADV_HUGEPAGE`가 초 단위 실행에서 `AnonHugePages` 0 kB로 미발동
-  (인-트리 `RESULTS-r4-lead.md`, plan.md도 "미확인"으로 기록). NT 로드는
+  (인-트리 `RESULTS-r4-lead.md`, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md도 "미확인"으로 기록). NT 로드는
   캐시 오염을 줄이지만 우리 작업 집합(토큰당 3.3 GB 스트림)은 어차피
   L3를 흘러넘치므로, 효과를 주장하려면 측정이 먼저다. 둘 다 측정 필요 —
   단 우선순위는 디스패치 구조(Q3)보다 한참 아래다.
@@ -470,7 +470,7 @@ Q5의 한 줄: 커널 내부는 끝났고, 남은 CPU 과제는 (a) M>1 GEMM 튜
 
 문헌이 아니라 설계에 답한다. 1단계 라운드(1-1 로더/디퀀트 완료, 1-2 임베딩+
 블록 0, 1-3 MoE+라우터, 1-4 단일 토큰 순전파, 1-5 GPU 오프로드+KV)는
-[plan](../plan.md)에서 가져왔다.
+[plan](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md)에서 가져왔다.
 
 1. **순전파 API는 토큰 배치를 1급으로.** — **1-2 전 결정.**
    k토큰 검증이 레버 1위(Q3)인데, M=1로 쓴 엔진은 나중에 못 바꾼다:

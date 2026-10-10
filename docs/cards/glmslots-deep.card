@@ -10,7 +10,7 @@
 #   A, one row's attention from depth 6 to 4096: 0.52 ms from P 512 to 4096 [measured: rig-log 10-01#glmpp-depth,
 #     decode 20.72 -> 20.50 tok/s, n=8, ctx 4200] plus under 0.1 ms from 6 to 512 [derived]: A <= 0.6 ms. The 34 KDA
 #     layers' state is depth-free; the 11 latent layers attend the selector's top_k 2048 of 4096 positions
-#     (docs/research/linear-attn.md) [derived].
+#     (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/linear-attn.md) [derived].
 #   In the plain step the card front and the host leg run one after the other: S1(4096) = S1 + A. In the pair chain
 #     the card's two fronts run under the host's two legs (0.25..0.86 ms of slack a MoE layer, glmpair-probe.card's
 #     per-layer terms, against 2 x 0.6 / 11 = 0.11 ms more a latent layer): R2(4096) = R2 + delta, delta 0..2A

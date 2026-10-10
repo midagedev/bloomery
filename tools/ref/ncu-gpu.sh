@@ -95,7 +95,7 @@
 # The clock is the card's own (--clock-control none, where the other forms fix it at base), because the
 # question is the step under the 300 W cap; the summary prints sm__cycles_elapsed.avg.per_second. Kernel
 # replay idles the card between passes, so a clock well above the prompt's (1.46-1.55 GHz [derived,
-# docs/research/q3tail-design-report.md 3.2]) means the replay ran uncapped: then only the cycle figures
+# https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3tail-design-report.md 3.2]) means the replay ran uncapped: then only the cycle figures
 # carry, and its microseconds are not records in any case (ncu serializes and replays). Sections
 # SpeedOfLight WarpStateStats SchedulerStats ComputeWorkloadAnalysis Occupancy LaunchStats
 # (BLOOMERY_NCU_SECTIONS) and `q3pp.py metrics` (the tensor pipe, issue, every pipe's count, L2 and DRAM

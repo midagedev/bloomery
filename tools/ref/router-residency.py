@@ -186,7 +186,7 @@ RULES = {
     "knee": dict(every=16, cap=24, margin=6.0, min_count=2.0, decay=0.9),
 }
 B_PIN, B_PAGE = 25.0, 14.4  # GB/s: the rates the recorded replays priced with (A6000: 26.28 / 21.16)
-HOST_GBPS = 121.0  # GB/s: the host expert read rate b5prof measured (docs/plan-ledger.md B12), prices a host miss
+HOST_GBPS = 121.0  # GB/s: the host expert read rate b5prof measured (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md B12), prices a host miss
 MAX_STREAMS = 8  # hit --streams: the most sessions one card is replayed for
 COPIES = 30  # the window replays' copy budget, copies a decode step
 WINDOW_B = 16  # the block the window replays average over

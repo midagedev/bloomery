@@ -1,6 +1,6 @@
 # Example (kind profile). The grouped GEMM's counters before a lever on it. The band is the
 # expectation written beside the recipe ncu-gpu-gemm in the justfile [derived,
-# docs/research/q3next-design-report.md sections 3 and 6].
+# https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3next-design-report.md sections 3 and 6].
 kind: profile
 question: which unit carries gemm_q4k's block-step in the Qwen3 ubatch GEMM (128 experts of
   768 x 2048 Q4_K, top-8, T = 4096)?
