@@ -6,7 +6,8 @@
 //! answers (`api/models/<repo>/tree/main?recursive=true`, [`listing`]), the
 //! GGUF sets in it ([`gguf_sets`]) and the one a quant tag picks ([`pick`]),
 //! the files named exactly ([`exact`]), the MTP draft by its file name
-//! ([`mtp_draft`]), the cache paths ([`cache_root`],
+//! ([`mtp_draft`]), a model's image-projector sibling ([`mmproj_sibling`]),
+//! the cache paths ([`cache_root`],
 //! [`cache_path`]), where a model file comes from ([`source`]) and what a
 //! model card says ([`card`]). The network part, [`fetch`], is `curl`, the
 //! checks of what it wrote, and the cache standing in when the network
@@ -521,6 +522,67 @@ pub fn mtp_draft<'a>(
     }
 }
 
+/// The path `entry` less `.gguf` and its split suffix: llama.cpp's `prefix`
+/// of `get_gguf_split_info`; `None` for a path that is not a `.gguf` file.
+fn split_prefix(path: &str) -> Option<&str> {
+    let stem = path.strip_suffix(".gguf")?;
+    Some(split_of(stem).map_or(stem, |(prefix, _, _)| prefix))
+}
+
+/// llama.cpp's `extract_quant_bits` of a repo path: the number the quant tag
+/// starts at its first digit (`Q4_K_M` 4, `BF16` 16, `F32` 32, `MXFP4_MOE` 4),
+/// 0 when the tag has no digit or the path is not a `.gguf` file. A number
+/// past `u64` saturates, which only ranks it last.
+fn quant_bits(path: &str) -> u64 {
+    let tag = split_prefix(path).map(tag_of).unwrap_or_default();
+    let digits = tag.trim_start_matches(|c: char| !c.is_ascii_digit());
+    digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0u64, |n, d| {
+            n.saturating_mul(10).saturating_add(u64::from(d - b'0'))
+        })
+}
+
+/// The directories of a repo path, outermost first (the path less its file
+/// name, split at `/`).
+fn dirs_of(path: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = path.split('/').collect();
+    parts.pop();
+    parts
+}
+
+/// The image projector a model file is run with: the repo's `mmproj` GGUF
+/// that llama.cpp's `find_best_sibling` picks for `model`, the path of the
+/// model's first shard. A candidate has `mmproj` in its file name and sits in
+/// the model's directory or one of its ancestors (unsloth keeps a set's shards
+/// under `UD-Q4_K_XL/` and the projector at the root); the deepest such
+/// directory wins, then the quant of the fewest bits away from the model's
+/// ([`quant_bits`]), then the earlier file of the listing. llama.cpp reads
+/// `mmproj` anywhere in the path; here it is the file name, as [`gguf_sets`]
+/// reads it, so no file is both a model and a projector. `None` when the
+/// repo holds no candidate.
+pub fn mmproj_sibling<'a>(entries: &'a [Entry], model: &str) -> Option<&'a Entry> {
+    let model_dirs = dirs_of(model);
+    let model_bits = quant_bits(model);
+    let mut best: Option<(&Entry, usize, u64)> = None;
+    for e in entries {
+        if !e.path.ends_with(".gguf") || !e.name().contains("mmproj") {
+            continue;
+        }
+        let dirs = dirs_of(&e.path);
+        if dirs.len() > model_dirs.len() || dirs[..] != model_dirs[..dirs.len()] {
+            continue;
+        }
+        let (depth, diff) = (dirs.len(), quant_bits(&e.path).abs_diff(model_bits));
+        let better = best.is_none_or(|(_, d, f)| depth > d || (depth == d && diff < f));
+        if better {
+            best = Some((e, depth, diff));
+        }
+    }
+    best.map(|(e, _, _)| e)
+}
+
 /// The cache's root: `$BLOOMERY_CACHE` (`cache`) when set and non-empty,
 /// else `$HOME/.cache/bloomery/hf`; neither is [`HfError::NoCache`].
 pub fn cache_root(cache: Option<OsString>, home: Option<OsString>) -> Result<PathBuf, HfError> {
@@ -827,6 +889,130 @@ mod tests {
             .to_string();
         assert!(said.contains("MTP/mtp-m-Q8_0.gguf"), "{said}");
         assert!(said.contains("the MTP draft"), "{said}");
+    }
+
+    /// A repo's listing from its fixture.
+    fn fixture_entries(repo: &str, file: &str) -> Vec<Entry> {
+        listing(repo, &fixture(file)).expect("listing")
+    }
+
+    /// The path of the one set of `repo`'s `entries` that `quant` picks, and the
+    /// projector `mmproj_sibling` gives its first shard.
+    fn sibling_of(repo: &str, entries: &[Entry], quant: &str) -> (String, Option<String>) {
+        let sets = gguf_sets(repo, entries).expect("sets");
+        let first = pick(repo, &sets, Some(quant)).expect("pick").files[0]
+            .path
+            .clone();
+        let mm = mmproj_sibling(entries, &first).map(|e| e.path.clone());
+        (first, mm)
+    }
+
+    /// H1: the four repos the vision seats are run from each pick their BF16
+    /// projector — Clef (bartowski, a Q5_K_M file and a bf16 and an f16 projector
+    /// at the root), Qwen3.6 (lmstudio, one BF16 projector), Qwen3.8 (unsloth,
+    /// shards under `UD-Q4_K_XL/` and the projector at the root) and GLM-5.3
+    /// (unsloth, whose `Shard_Rewrite/` folder holds `.gguf_file` copies).
+    /// BF16 and F16 are both 16 bits, so the tie goes to the listing's order.
+    #[test]
+    fn the_four_repos_each_pick_their_bf16_projector() {
+        let clef = fixture_entries(CLEF, "bartowski-clef-flash-gguf.json");
+        assert_eq!(
+            sibling_of(CLEF, &clef, "Q5_K_M").1.as_deref(),
+            Some("mmproj-Cloudflare_clef-flash-bf16.gguf")
+        );
+        let q36 = "lmstudio-community/Qwen3.6-35B-A3B-GGUF";
+        let e = fixture_entries(q36, "lmstudio-community-qwen3-6-35b-a3b-gguf.json");
+        assert_eq!(
+            sibling_of(q36, &e, "Q4_K_M").1.as_deref(),
+            Some("mmproj-Qwen3.6-35B-A3B-BF16.gguf")
+        );
+        let q38 = "unsloth/Qwen3.8-Flash-Next-GGUF";
+        let e = fixture_entries(q38, "unsloth-qwen3-8-flash-next-gguf.json");
+        let (model, mm) = sibling_of(q38, &e, "UD-Q4_K_XL");
+        assert_eq!(
+            model,
+            "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        );
+        assert_eq!(mm.as_deref(), Some("mmproj-BF16.gguf"));
+        let glm = "unsloth/GLM-5.3-Flash-GGUF";
+        let e = fixture_entries(glm, "unsloth-glm-5-3-flash-gguf.json");
+        let (model, mm) = sibling_of(glm, &e, "UD-Q4_K_XL");
+        assert_eq!(
+            model,
+            "UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"
+        );
+        assert_eq!(mm.as_deref(), Some("mmproj-BF16.gguf"));
+    }
+
+    fn entry(path: &str) -> Entry {
+        Entry {
+            path: path.to_owned(),
+            size: 1,
+            check: Check::GitSha1,
+            digest: "0".repeat(40),
+        }
+    }
+
+    fn pick_of(files: &[&str], model: &str) -> Option<String> {
+        let entries: Vec<Entry> = files.iter().map(|p| entry(p)).collect();
+        mmproj_sibling(&entries, model).map(|e| e.path.clone())
+    }
+
+    /// llama.cpp's order of the rule: the deepest shared directory, then the
+    /// fewest bits away, then the listing's order; a file that is not a
+    /// `.gguf`, has `mmproj` only in a directory, or sits beside or under
+    /// another model's folder is no sibling.
+    #[test]
+    fn the_rule_orders_depth_then_bits_then_the_listing() {
+        let model = "UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00002.gguf";
+        // Depth beats bits: the folder's own F32 over the root's Q4.
+        assert_eq!(
+            pick_of(&["mmproj-Q4_K_M.gguf", "UD-Q4_K_XL/mmproj-F32.gguf"], model).as_deref(),
+            Some("UD-Q4_K_XL/mmproj-F32.gguf")
+        );
+        // Bits beat the listing's order at one depth: 8 is 4 away, 16 is 12.
+        assert_eq!(
+            pick_of(&["mmproj-F16.gguf", "mmproj-Q8_0.gguf"], model).as_deref(),
+            Some("mmproj-Q8_0.gguf")
+        );
+        // A tie goes to the earlier file.
+        assert_eq!(
+            pick_of(&["mmproj-F16.gguf", "mmproj-BF16.gguf"], model).as_deref(),
+            Some("mmproj-F16.gguf")
+        );
+        // Not siblings: another model's folder, a deeper one than the model's,
+        // `mmproj` only in a directory name, another extension.
+        for f in [
+            "Q8_0/mmproj-Q8_0.gguf",
+            "UD-Q4_K_XL/sub/mmproj-F16.gguf",
+            "mmproj/projector.gguf",
+            "mmproj-F16.gguf_file",
+            "mmproj-F16.bin",
+        ] {
+            assert_eq!(pick_of(&[f], model), None, "{f}");
+        }
+        // A root model takes only the root's.
+        assert_eq!(pick_of(&["Q8_0/mmproj-F16.gguf"], "m-Q4_K_M.gguf"), None);
+    }
+
+    /// The bits of a quant tag as llama.cpp's `extract_quant_bits` reads them.
+    #[test]
+    fn quant_bits_read_the_first_number_of_the_tag() {
+        for (path, bits) in [
+            ("m-Q4_K_M.gguf", 4),
+            ("d/m-UD-IQ1_M-00001-of-00003.gguf", 1),
+            ("mmproj-BF16.gguf", 16),
+            ("mmproj-Cloudflare_clef-flash-f16.gguf", 16),
+            ("mmproj-F32.gguf", 32),
+            ("m-MXFP4_MOE.gguf", 4),
+            ("m-Q8_0.gguf", 8),
+            ("model.gguf", 0),
+            ("m-BF.gguf", 0),
+            ("m-Q4_K_M.bin", 0),
+        ] {
+            assert_eq!(quant_bits(path), bits, "{path}");
+        }
+        assert_eq!(quant_bits("m-Q99999999999999999999999.gguf"), u64::MAX);
     }
 
     #[test]
