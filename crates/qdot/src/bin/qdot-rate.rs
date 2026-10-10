@@ -136,50 +136,73 @@ fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize
     );
 }
 
-fn main() {
-    let rows: usize = 360_448;
+/// The rows, in the order they run: (type, k, row bytes), each with the shape it stands for.
+const ROWS: &[(GgmlType, usize, usize)] = &[
     // Row bytes: Q3_K 110 B/256, Q4_K 144 B/256, Q6_K 210 B/256.
-    bench(GgmlType::Q3_K, 2048, (2048 / 256) * 110, rows);
-    bench(GgmlType::Q4_K, 2048, (2048 / 256) * 144, rows);
-    bench(GgmlType::Q6_K, 2048, (2048 / 256) * 210, rows);
+    (GgmlType::Q3_K, 2048, (2048 / 256) * 110),
+    (GgmlType::Q4_K, 2048, (2048 / 256) * 144),
+    (GgmlType::Q6_K, 2048, (2048 / 256) * 210),
     // Real ffn_down_exps shape: k = 1408 (44 x 22 B = 968 B/row).
-    bench(GgmlType::Q5_0, 1408, (1408 / 32) * 22, rows);
+    (GgmlType::Q5_0, 1408, (1408 / 32) * 22),
     // Real ffn_down shape: k = 10944 (342 x 24 B = 8208 B/row).
-    bench(GgmlType::Q5_1, 10944, (10944 / 32) * 24, rows);
+    (GgmlType::Q5_1, 10944, (10944 / 32) * 24),
     // Q8_0 at the Q5_1 row's k, so the two compare per byte: 342 x 34 B = 11628 B/row.
-    bench(GgmlType::Q8_0, 10944, (10944 / 32) * 34, rows);
+    (GgmlType::Q8_0, 10944, (10944 / 32) * 34),
     // V4.1 ffn_down_exps shape (layers 0 and 1): k = 2304 (9 x 176 B = 1584 B/row).
-    bench(GgmlType::Q5_K, 2304, (2304 / 256) * 176, rows);
+    (GgmlType::Q5_K, 2304, (2304 / 256) * 176),
     // V4-Flash ffn_gate/up_exps shape: k = 4096 (16 x 98 B = 1568 B/row).
-    bench(GgmlType::IQ3_XXS, 4096, (4096 / 256) * 98, rows);
+    (GgmlType::IQ3_XXS, 4096, (4096 / 256) * 98),
     // GLM-5.3-Flash UD-IQ4_XS ffn_gate/up_exps shape: k = 4096 (16 x 110 B = 1760 B/row),
     // beside the IQ3_XXS row at the same k.
-    bench(GgmlType::IQ3_S, 4096, (4096 / 256) * 110, rows);
+    (GgmlType::IQ3_S, 4096, (4096 / 256) * 110),
     // V4-Flash and MiMo-V2.6-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
-    bench(GgmlType::MXFP4, 2048, (2048 / 32) * 17, rows);
+    (GgmlType::MXFP4, 2048, (2048 / 32) * 17),
     // MiMo-V2.6-Flash ffn_gate/up_exps shape: k = 4096 (128 x 17 B = 2176 B/row).
-    bench(GgmlType::MXFP4, 4096, (4096 / 32) * 17, rows);
-    // The C = 8 tile at the same two shapes: the host union's run of eight columns.
-    bench_tile(
-        GgmlType::MXFP4,
-        2048,
-        (2048 / 32) * 17,
-        rows,
-        qdot::TILE_COLS,
-    );
-    bench_tile(
-        GgmlType::MXFP4,
-        4096,
-        (4096 / 32) * 17,
-        rows,
-        qdot::TILE_COLS,
-    );
+    (GgmlType::MXFP4, 4096, (4096 / 32) * 17),
     // Qwen3.8 UD-Q3_K_XL ffn_down_exps shape (43 of 48 layers): k = 640 (20 x 18 B =
     // 360 B/row), beside the Q5_1 row it replaces at the same k.
-    bench(GgmlType::IQ4_NL, 640, (640 / 32) * 18, rows);
-    bench(GgmlType::Q5_1, 640, (640 / 32) * 24, rows);
+    (GgmlType::IQ4_NL, 640, (640 / 32) * 18),
+    (GgmlType::Q5_1, 640, (640 / 32) * 24),
     // Qwen3.8 UD-Q3_K_XL ffn_gate/up_exps shape (the one IQ4_XS layer): k = 2560
     // (10 x 136 B = 1360 B/row), beside the Q4_K row it replaces at the same k.
-    bench(GgmlType::IQ4_XS, 2560, (2560 / 256) * 136, rows);
-    bench(GgmlType::Q4_K, 2560, (2560 / 256) * 144, rows);
+    (GgmlType::IQ4_XS, 2560, (2560 / 256) * 136),
+    (GgmlType::Q4_K, 2560, (2560 / 256) * 144),
+];
+
+/// `qdot-rate [--only TYPE@K]...`: every row, or only the named ones (a counter run over one
+/// row). A name that is no row is refused with the list.
+fn main() {
+    let rows: usize = 360_448;
+    let name = |&(ty, k, _): &(GgmlType, usize, usize)| format!("{ty:?}@{k}");
+    let mut only = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let v = match (a.as_str(), args.next()) {
+            ("--only", Some(v)) => v,
+            _ => {
+                eprintln!("qdot-rate: usage: qdot-rate [--only TYPE@K]..., got {a:?}");
+                std::process::exit(64);
+            }
+        };
+        if !ROWS.iter().any(|r| name(r) == v) {
+            let all: Vec<String> = ROWS.iter().map(name).collect();
+            eprintln!(
+                "qdot-rate: --only {v}: no such row; the rows are {}",
+                all.join(" ")
+            );
+            std::process::exit(64);
+        }
+        only.push(v);
+    }
+    for r in ROWS {
+        if only.is_empty() || only.contains(&name(r)) {
+            bench(r.0, r.1, r.2, rows);
+        }
+    }
+    // The C = 8 tile at MXFP4's two shapes, the host union's run of eight columns: a full run only.
+    if only.is_empty() {
+        for k in [2048, 4096] {
+            bench_tile(GgmlType::MXFP4, k, (k / 32) * 17, rows, qdot::TILE_COLS);
+        }
+    }
 }

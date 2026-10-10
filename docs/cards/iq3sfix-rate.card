@@ -1,0 +1,67 @@
+# The IQ3_S x Q8_K single-core rate with and without the two SSE4a `extrq` in dot_iq3s_q8k_avx2's AVX
+# loop (iq3sfix, specs-iq3sfix/cause.md). Base: this tree's source at 4a88b347's flags
+# (target-cpu=znver3, sse4a on); changed: the same source under `-C target-feature=-sse4a` in both host
+# rustflags owners.
+# Counted on the box [perf stat counts, no lease, not times]: base 2.003 ymm spill + 11.989 fill faults
+# a block of the IQ3_S row, IPC 0.46 against the IQ3_XXS row's 2.98; the -sse4a build 0 and 0 over the
+# whole run (3 and 3), IPC 2.67 against 2.88, and the row's sum equal to the last digit.
+# Census of the block loop [build time, tools/ref/asm-census.py loop on the box's release qdot-rate]:
+#   base dot_iq3s_q8k_avx2 333 instructions (2 extrq), changed 341 (no extrq, 11 stack operands where
+#   the base had 2: spilled scalars and one ymm partial); IQ3_XXS 309 in both builds, unchanged.
+# Prediction of the changed arm [derived], from the same-run anchor IQ3_XXS@4096 (s2-rate.log, the base
+#   sitting of 2026-10-09T23:59Z: 656.2-659.2 ms, 5.145-5.168 GB/s, mean 5.155):
+#   instruction count (the XXS kernel's IPC): R = 5.155 x (110 B / 98 B) x 309 / 341 = 5.24 GB/s;
+#   shuffle-port work (docs/cards/iq3s-rate.card's model, its 145 shuffle-class + 30 transfers within
+#     +-3 in the new loop): R = 5.6 at 4.5 GHz and 4.5 at 3.6 GHz;
+#   so the rate band stays docs/cards/iq3s-rate.card's 4.6-6.2 GB/s with the point near 5.2.
+# Base arm [measured, s2-rate.log]: 6.503 / 6.510 / 6.454 s = 0.585 / 0.585 / 0.590 GB/s, mean 0.587;
+#   this sitting runs it again as its first run. Effect (changed - base) / base: 4.6 / 0.587 - 1 = +684 %,
+#   6.2 / 0.587 - 1 = +956 %.
+# The floor (tools/ref/qdot-rate-floors.tsv, IQ3_S@4096 0.90 against ik's iq3s_rate): the base run is
+#   red on that row alone at ~0.13 (FAIL-first of the runner's check: tools/ref/qdot-rate-floors.py
+#   check over s2-rate.log reads exactly the three IQ3_S rounds red), the changed run predicted at
+#   ours/ik = 4.6-6.2 / 4.4 = 1.05-1.41, at or above 0.9 in every round.
+# Every other row [derived]: its function is the same instruction sequence in both builds
+#   (tools/ref/asm-census.py diff of the base and -sse4a qdot-rate, generate_ds41, generate_glm5next,
+#   gate_e2e, bench_v41_host, bloomery-decode: only dot_iq3s_q8k_avx2, the scalar mirrors'
+#   dot_row_scalar_ty, which no row times, and in generate_ds41 one byte-pack blend in
+#   Body::begin_call moved), so each pair reads its base ratio within the ruler, at or above its floor:
+#   Q4_K@2048 0.965 (floor 0.92), Q6_K@2048 0.991 (0.88), Q5_0@1408 0.882 (0.71), Q5_1@10944 0.985
+#   (0.87), Q5_K@2304 0.985 (0.79), IQ3_XXS@4096 1.587 (1.43), MXFP4@2048 0.889 (0.72), IQ4_NL@640
+#   0.753 (0.65), IQ4_XS@2560 0.946 (0.78); the rows with no ik twin (Q3_K@2048, Q8_0@10944,
+#   MXFP4@4096, Q5_1@640, Q4_K@2560) at their base GB/s within the ruler. The rows whose function held
+#   a legacy-encoded instruction in the census: IQ3_S@4096 alone.
+# Resource timeline of one 256-value block, one thread [derived]: host CPU 17.7-23.9 ns at R = 6.2-4.6;
+#   DRAM at the one thread's stream rate <= 9.2 ns; card, PCIe, NVMe 0. Base: 187 ns, the faults.
+# Result [measured, written after the sitting; the card ran as sha256 7f7c2f5c…]: the quiet sitting of
+#   2026-10-10T06:41-06:42Z (worker2's hold up, pressure-io avg10 0.74 -> 0.00, both cards idle) read IQ3_S@4096
+#   at 4.2-4.3 GB/s, ours/ik 0.975 / 0.961 / 0.979, every floor ok (10 rows x 3 rounds), every other pair at its
+#   base ratio. Below the band: the loop runs at ik's rate, not 1.05-1.41 past it, so the census model's
+#   rate term was wrong (decide-below). An earlier run that day (06:30-06:33Z, loadavg 14.9, pressure-io 16.8,
+#   the 3090 at 219 W) was contended and is not evidence.
+kind: ab
+question: does removing the two legacy-encoded extrq (-C target-feature=-sse4a) bring the IQ3_S x Q8_K
+  dot's single-core rate at k = 4096 from the base's 0.59 GB/s into the kernel's derived band 4.6-6.2,
+  and hold its ratio to ik's iq3s_rate over the 0.90 floor?
+term: qdot-rate single-thread GB/s of the IQ3_S@4096 row (1760 B/row, 360,448 rows x 6 passes), one
+  pinned core (BLOOMERY_RATE_CORE), changed binary against the base binary, each run's three rounds
+  alternating with ik's harnesses in one lease
+unit: %
+predict: +684..+956
+rounds: 3
+condition: the lead runs, on this tree's remote dir, two runs back to back under this card (the box
+  quiet, the witness blocks clean): first the kept base binary,
+  BLOOMERY_REMOTE='~/repo/bloomery-iq3sfix' BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/iq3sfix-rate.card'
+  just measure-qdot-rate 3 target/iq3sfix-base/qdot-rate (md5 c57c00ced4e6932401f29998ac379fc5, built by
+  the recipe's own cargo command at base flags; expected to end rc 1 with the floor red on IQ3_S@4096
+  alone), then the changed one, the same command without the binary argument (the recipe builds it;
+  expected rc 0). Each log names its binary and md5 (`rust-bin:`). About 4 minutes [derived: the
+  2026-10-09 sitting's 74 s for three rounds, the base arm 3 x 6 s longer, two builds and the guards]
+decide-in: the fix holds: land the -sse4a flag with the floor table, record the IQ3_S rate in
+  docs/plan.md's host-union row (c per core), and re-run the GLM-5.3-Flash UD-IQ4_XS decode card
+  (docs/cards/glmiq4xs-decode.card) on a build with the flag
+decide-below: the faults are gone (counted) but the loop runs under the band: perf stat the changed
+  binary's IQ3_S row alone (qdot-rate --only IQ3_S@4096) for ymm faults and IPC, then price the
+  extraction candidates of docs/cards/iq3s-rate.card's decide-below by the loop census before any code
+decide-above: the shuffle-port model overcounts the extraction: record the rate, re-derive the IQ3_S
+  per-core cost c in the union model from it, and land as for the band

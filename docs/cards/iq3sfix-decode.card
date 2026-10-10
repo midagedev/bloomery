@@ -1,0 +1,41 @@
+# GLM-5.3-Flash UD-IQ4_XS (unsloth, 156.8 GB, the file in a user's X post) decode on the serving plan after the
+# IQ3_S fix (-C target-feature=-sse4a): the number the X-post reply states, and the end-to-end check of the fix.
+# Base [measured, 2026-10-09T23:27Z, docs/cards/glmiq4xs-decode.card in the glmiq4 tree, two rounds]: 5.68 and 5.69
+# tok/s @ n=96, depth 512, A6000, plan (a), p50 175.45 ms a step; card_experts 0, host_experts 12096 (every routed
+# layer on the host tier: IQ3_S gate·up has no card `_sel`, the IQ4_XS downs no card down).
+# The base step from its terms [derived]: a token routes 3,991 MB (the headers; quantwide design §4.1), of which the
+# IQ3_S gate·up is 2 x 110 / (2 x 110 + 136) = 0.618 -> 2,466 MB and the IQ4_XS down 1,525 MB. At the base single-core
+# IQ3_S rate 0.5 GB/s [measured, docs/cards/iq3sfix-rate.card's base arm] x 32 cores = 16 GB/s, the gate·up alone is
+# 154 ms; the down at 14.4 GB/s a core (DRAM-bound at 130..137 GB/s) 11.1..11.7 ms; the card front 42 x 0.30..0.41 ms
+# = 12.6..17.2 ms and the host leg's fixed cost 42 x 60..80 us = 2.5..3.4 ms (glm-public.card's terms): 180..186 ms
+# against 175.5 measured, so the model holds the base within 6 %.
+# After [derived]: the fixed IQ3_S row reads 3.5..4.2 GB/s a core [measured, 2026-10-10T06:32Z, a contended sitting:
+# loadavg 14.9, pressure-io 16.8, the 3090 at 219 W], ik's own 3.6..4.1 in the same rounds. At 3.5..4.6 GB/s x 32 the
+# gate·up is 16.8..22.0 ms against its DRAM floor 18.0..19.0 ms, so the leg is max(compute, DRAM) = 18.0..22.0 ms; with
+# the down, the front and the fixed cost the step is 44.2..54.3 ms -> 18.4..22.6 tok/s. Band, with the front's and the
+# DRAM term's spread: 17.0..22.4 (the base card's band, unchanged, now from these terms).
+# Resource timeline of one step [derived]: host CPU (32 cores) 29..34 ms on the routed legs, DRAM 29..31 ms of it (the
+# legs are near the CPU/DRAM break-even), card SMs 12.6..17.2 ms for the 42 layer fronts in sequence with the legs,
+# PCIe the hidden rows only (< 0.1 ms), NVMe 0 (page cache warm). The wall is the sum of the front and the leg per layer.
+kind: baseline
+question: what decode rate does GLM-5.3-Flash UD-IQ4_XS reach on the A6000's serving plan once the IQ3_S host dot
+  runs at ik's rate, for the X-post reply?
+term: tok/s @ n=96, depth 512, A6000, bloomery (generate_glm5next of the iq3sfix tree — main 5e028de6 + r4glm + k1iq3s
+  + the -sse4a flag — plan (a), the `512` arm of just depth-gpu-glm5next, prose ids, the draft off), on
+  /models/GLM-5.3-Flash-UD-IQ4_XS/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
+unit: tok/s
+predict: 17.0..22.4
+condition: worker2's hold up and the box quiet (no rustc or cargo, pressure-io avg10 under 2) before the lease; one
+  lease, two rounds after the runner's discarded warm-up process; the arm `512` only; no row carries [cpu-busy],
+  [other-busy] or [cold]; the witness blocks name the A6000 and its power limit; the full output to a file first.
+  Command: BLOOMERY_REF_MODEL=<the file above> BLOOMERY_AB_ROUNDS=2 BLOOMERY_REMOTE='~/repo/bloomery-iq3sfix'
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/iq3sfix-decode.card' just depth-gpu-glm5next 512 > <log> 2>&1.
+  Wall 8..15 min [derived: three processes of a ~60..90 s load from the page cache, the 512-id feed and 96 steps]
+reason: sets the one number the X-post reply states, and shows the IQ3_S fix end to end; why now: the fix is gated
+  and the base row exists
+decide-in: state the row in the reply with its conditions (A6000 plan (a), depth 512, n=96, draft off) beside the
+  base 5.69; write it into rig-log's bench page under GLM-5.3-Flash — RTX A6000 as its own file's row
+decide-below: the leg is slower than its terms: read a BLOOMERY_STEP_STATS run's host leg per layer against
+  18..22 ms / 42, and the qdot-rate IQ3_S row of a quiet sitting, before the reply states a rate
+decide-above: state the row, then name the term: the card front or the host leg's fixed cost is smaller than
+  glm-public.card took, and glmhot's step model shares that term

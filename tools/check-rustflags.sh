@@ -24,5 +24,11 @@ if plain != oxide:
 if "target-cpu=znver3" not in oxide:
     print(f"check-rustflags: target-cpu=znver3 is not in the flags: {oxide!r}")
     sys.exit(1)
+# znver3 turns on sse4a, and LLVM then lowers some byte shuffles to EXTRQ/INSERTQ, which have no VEX
+# form: inside AVX code each one takes a ymm spill fault, then fill faults, on Zen 3.
+if "target-feature=-sse4a" not in oxide:
+    print(f"check-rustflags: target-feature=-sse4a is not in the flags: {oxide!r} — LLVM would emit "
+          "legacy-encoded EXTRQ/INSERTQ inside AVX kernels")
+    sys.exit(1)
 print(f"check-rustflags: ok — both owners carry {oxide}")
 PY

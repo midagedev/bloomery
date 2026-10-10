@@ -5,4 +5,7 @@
 # target.<triple>.rustflags를 가린다 — 그쪽 소유자는 .cargo/cuda-oxide.toml의 extra-rustflags이고,
 # tools/check-rustflags.sh(just check-rustflags)가 두 목록이 같은지 본다.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=znver3"]
+# znver3 turns on sse4a; with it LLVM lowers some byte shuffles to EXTRQ/INSERTQ, which have no VEX
+# form, and inside AVX code each one takes a ymm spill fault and fill faults on Zen 3. -sse4a keeps
+# every other znver3 feature.
+rustflags = ["-C", "target-cpu=znver3", "-C", "target-feature=-sse4a"]
