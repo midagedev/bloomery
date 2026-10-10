@@ -65,7 +65,7 @@
 //!   `target_layers`, header only: no draft is loaded) attached after the
 //!   tiered load made the prompt batch's buffers, then `body::prepare_prefill`
 //!   again — the order `--place bp` opens a draft in (`app::Loaded::open`,
-//!   `CardDraft::open`, `Loaded::ready`). Then the [`BATCH_P2`] prose ids fed
+//!   `CardDraft::open`, `Loaded::ready`). Then the [`FEAT_P`] prose ids fed
 //!   one decode step each, each position's features read after its step
 //!   (`Body::read_features`); against them, a prompt call of the same ids
 //!   (`body::prefill_with`) handing over its last `window` positions' rows,
@@ -153,10 +153,28 @@ mod gate {
     const EAGER_STEPS: usize = 4;
     /// Positions of the prompt call `--batch` feeds against the steps: one
     /// batch.
-    const BATCH_P: usize = 512;
+    /// PIN(2026-10-10): 64 where it was 512. The batch call against the steps
+    /// at depth (the `CASES` of P, 512 among them, and the three `SPLITS`;
+    /// every layer's ring, state, shadow, rows, keys and logits) is
+    /// `gate-gpu-ds41-prefill`'s Cases clause; this clause keeps what only the
+    /// tier loopback load shows, at this size: the batch call is the steps' on
+    /// the tiered load with every tier layer sent a slot, and `--batch2` keeps
+    /// the two-batch call against the reference.
+    const BATCH_P: usize = 64;
     /// Positions of the prompt call `--batch2` feeds against the reference's:
     /// two batches, one group of two under the default group lever.
     const BATCH_P2: usize = 1024;
+    /// Positions of the prompt call `--bfeat` hands the feature tap's rows over
+    /// in, against the steps': one past the batch width, which is two batches
+    /// of one group.
+    /// PIN(2026-10-10): 513 where it was `BATCH_P2` (1024). The tap's rows from
+    /// a prompt call (the kept features' positions and rows at each of `CASES`
+    /// and of `SPLITS`, and the wide-taps case of 1100 keeping 300)
+    /// are `gate-gpu-ds41-prefill`'s Cases and Wide taps clauses; this clause
+    /// keeps what only the tier gate shows, at this size: the tap attached
+    /// after the tiered load made the batch buffers, every tier layer sent a
+    /// slot, and a group of two batches both handing rows over.
+    const FEAT_P: usize = 513;
     /// The batches a group holds that `--batch2`'s call must run as.
     const BATCH_GROUP: usize = 2;
     /// Greedy steps after a prompt call.
@@ -805,9 +823,9 @@ mod gate {
             let mut f = load()?;
             pass &= batch_feature_case(
                 &mut f,
-                &long,
+                &long[..FEAT_P],
                 &dhp.target_layers,
-                &[dhp.window, long.len()],
+                &[dhp.window, FEAT_P],
                 &tier_layers,
             )?;
             drop(f);
