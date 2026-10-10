@@ -47,7 +47,7 @@ use super::dispatch::{self, PassCtx};
 use super::placed::{BatchWalk, Placed, WalkParts};
 use super::program::{self, Program, Tail};
 use super::router::MAX_TOKENS;
-use super::scratch::{Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
+use super::scratch::{Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
 use super::ubatch::UbCtx;
 use super::wide::GEMV_COLS;
 use crate::head::Head;
@@ -191,10 +191,11 @@ impl Prefill {
         (0..MAX_TOKENS).map(|_| None).collect()
     }
 
-    /// The arena for [`MAX_TOKENS`] rows of `d`, an image for a prompt as
-    /// long as the cache (`d.ctx` tokens), the slot and its windows, no pass
-    /// captured. Load-time only.
-    pub(super) fn new(stream: &CudaStream, d: Dims) -> Result<Prefill, GpuError> {
+    /// The arena for [`MAX_TOKENS`] rows of `d` holding what the sites'
+    /// forms `forms` need, an image for a prompt as long as the cache
+    /// (`d.ctx` tokens), the slot and its windows, no pass captured.
+    /// Load-time only.
+    pub(super) fn new(stream: &CudaStream, d: Dims, forms: Forms) -> Result<Prefill, GpuError> {
         let blocks = d.ctx.div_ceil(MAX_TOKENS);
         let slot = DeviceBuffer::zeroed(stream, BLOCK)?;
         // SAFETY: the slot is one BLOCK and every `m <= MAX_TOKENS`; the slot
@@ -207,7 +208,7 @@ impl Prefill {
         };
         Ok(Prefill {
             graphs: Prefill::no_passes(),
-            a: Arena::new(stream, d, MAX_TOKENS)?,
+            a: Arena::with(stream, d, MAX_TOKENS, forms)?,
             slot_windows,
             slot,
             image: Inbox::new(stream, blocks * BLOCK)?,
