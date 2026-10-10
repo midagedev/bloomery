@@ -29,7 +29,7 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.2.9)
+## Status (0.2.10)
 
 | Area | State |
 |---|---|
@@ -42,9 +42,10 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default; its width follows measured cost |
 | Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
-| i-quants | Qwen3.8 `UD-Q3_K_XL` (IQ3_XXS, IQ4_XS, IQ4_NL experts) runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. IQ3_S, IQ2_*, IQ1_M and BF16 tensors are not loaded yet |
+| i-quants | Qwen3.8 `UD-Q3_K_XL` (IQ3_XXS, IQ4_XS, IQ4_NL experts) runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. GLM-5.3 `UD-IQ4_XS` (IQ3_S experts) runs with every routed expert on the host. IQ2_*, IQ1_M and BF16 tensors are not loaded yet |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`). With `--place` unset and two cards visible, Qwen3.8 and GLM-5.3 add the second card when their plan finds it pays |
 | Host RAM under the model (Qwen3.8) | Runs: the routed experts the RAM cannot hold are read from the model file on NVMe. Tokens equal the all-RAM load; an RTX 3060 12 GB with 27.5 GB of RAM free (WSL2) reads 2.3K–3.7K-token prompts at 57–86 tok/s and decodes at 5–7 tok/s after them. Such a load serves one request at a time with the MTP draft and adaptive residency off (a set `--parallel 2`, draft or residency is refused by name), and sets aside each slot's prompt checkpoints (up to 4 GiB) before it sizes its RAM buffer: the 3060 numbers were read before that, with a 4 GiB larger buffer. On WSL2 with the model on a Windows drive, set `BLOOMERY_NVTIER_READ=buffered` |
+| MiMo-V2.6-Flash | Runs with every routed expert on the host (about 161 GB of RAM for them); the card holds the dense layers, attention and the KV cache. Long prompts are slow: a 5,620-token prompt took 66.6 s to its first token, then 19.1 tok/s (RTX A6000, 0.2.10). Card experts come in 0.2.11 |
 | Vision input (V4.1) | On with `--mmproj <file>` (llama-server's flag), the encoder GGUF `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`; images go in as base64 (`data:` URLs), not fetched URLs. The encoder (1.31 GB) stays resident on a card the plan leaves free, else on the stage card as a reserve the plan counts |
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
@@ -67,16 +68,16 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.2.9-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.9-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.10-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.10-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.2.9](https://github.com/midagedev/bloomery/releases/tag/v0.2.9)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.2.10](https://github.com/midagedev/bloomery/releases/tag/v0.2.10)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
-One binary, five seats; the file's architecture picks the seat, and `--place` can stay unset on every model.
+One binary, six seats; the file's architecture picks the seat, and `--place` can stay unset on every model.
 
 | Seat | Serves | One command |
 |---|---|---|
@@ -84,6 +85,7 @@ One binary, five seats; the file's architecture picks the seat, and `--place` ca
 | `glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `bloomery-serve --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL` |
 | `qwen38` | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL` |
 | `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
+| `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) (routed experts on the host, above) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
 ```sh
@@ -151,6 +153,16 @@ Each point has a same-engine measurement in [`docs/performance.md`](docs/perform
 
 Output is checked layer by layer against ik_llama.cpp (V4.1: PPL 2.2401 against 2.2378, same top token 97.46 %),
 and every gate is shown to fail on its defect before the fix lands ([how](docs/performance.md#how-it-is-verified)).
+
+## Contributing
+
+Issues and pull requests are welcome, in Korean or English: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+([한국어](CONTRIBUTING.ko.md)). Two tracks we hope for are a new model architecture
+([`docs/contrib/new-model.md`](docs/contrib/new-model.md)) and the NVIDIA DGX Spark port
+([`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Starter work carries the
+[good first issue](https://github.com/midagedev/bloomery/labels/good%20first%20issue) label; questions go to
+[Discussions](https://github.com/midagedev/bloomery/discussions). Review looks first at code shape: one owner for
+shared logic, no second copy, no silent failure.
 
 ## Docs
 
