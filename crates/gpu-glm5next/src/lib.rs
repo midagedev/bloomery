@@ -52,7 +52,9 @@ pub use body::prefill::{
     prefill_mode, prompt_bytes, prompt_route_taps, prompt_with, set_prefill, set_prefill_group,
     set_prompt_route_taps, set_prompt_stats, store_digests, store_rows, take_prompt_stats,
 };
-pub use body::seq::{GlmSeq, seq_bytes, seq_resume, seq_save};
+pub use body::seq::{
+    GlmSeq, seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
+};
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, LOAD_ROWS, NEXTN_ON_TIER, Plant,
     TIER_BEFORE_UPLOAD, prompt, set_taps,

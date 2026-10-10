@@ -15,6 +15,7 @@
 //! held with the extent ([`Staged::hold`]), and dropping the extent waits for
 //! it first.
 
+use std::fmt;
 use std::ops::Range;
 use std::slice;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -194,6 +195,25 @@ impl NoRoom {
         self.held.saturating_sub(self.lent) >= self.need
     }
 }
+
+impl fmt::Display for NoRoom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the staging pool has no room for {} bytes: {} of its {} bytes are lent ({})",
+            self.need,
+            self.lent,
+            self.held,
+            if self.fragmented() {
+                "fragmented"
+            } else {
+                "full"
+            }
+        )
+    }
+}
+
+impl std::error::Error for NoRoom {}
 
 /// An extent of pinned memory holding a state's two host arrays: `rows`
 /// `u16` from its start, `recurrent` `f32` from the next cache line

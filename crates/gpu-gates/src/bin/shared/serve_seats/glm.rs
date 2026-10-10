@@ -89,8 +89,14 @@
 //! position and at the last checkpoint below it (the last prompt call's
 //! end), and on a NextN load the layer's store rows and the target's rows
 //! its draft reads next, with the draft's waiting rows beside them
-//! ([`SlotDrafts::park`]). A returning session's state comes back whole
-//! after the session's reset (`seq_resume`), its checkpoints that one point,
+//! ([`SlotDrafts::park`]). With the cache on, the copy runs on a stream of its
+//! own into pinned staging that the cache's budget pins whole at the open
+//! (`seq_save_async`), begun when a request ends and waited for only when the
+//! state is read back; a pool with no room is the server's `NoRoom`
+//! (`bind::begin`), which makes room or saves on the request path. A returning
+//! session's state comes back after the session's reset (`seq_resume`, or
+//! `seq_resume_prefix` for the first positions the server keeps, of which
+//! only those rows go to the card), its checkpoints the points up to there,
 //! its draft joining where it left (`SlotDrafts::unpark`); the residency is
 //! the model's and stays where use has taken it, the state carrying no slot
 //! map. Its default is the lesser of `bind::CACHE_RAM_CAP` and half of what
@@ -206,7 +212,6 @@
 //! prompt cache's notes past `cache reuse`, which print as their own lines;
 //! `--records-schema` prints those kinds and exits.
 
-use std::any::Any;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -215,11 +220,13 @@ use std::time::Instant;
 use app::arch::glm5next::{GlmCfg, open_nextn_slots, open_resident_slots};
 use app::mtp::{MtpBody, MtpDraft};
 use app::{OpenLog, RowsLog, Session, SessionError};
+use bloomery_gpu::GpuError;
+use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab,
-    bind_server, model_props, note_line, parallel_line, placement_of, slots_given,
+    CacheRam, Cached, ChatSurface, Landing, Listen, Pass, Seat, SeatEngine, SlotPassRow, SlotStep,
+    Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -228,7 +235,8 @@ use bloomery_gpu_gates::residency38::{
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
-    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_bytes, seq_resume, seq_save,
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_bytes, seq_lane, seq_resume,
+    seq_resume_prefix, seq_save, seq_save_async,
 };
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -245,7 +253,9 @@ use runtime::Target;
 use runtime::seqstate::Why;
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
-use serve::{CacheNote, DraftProps, Drafted, EngineProps, ResidencyReset, Saved, ServeError};
+use serve::{
+    CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
+};
 use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
@@ -967,6 +977,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_off,
         draft_bytes,
         residency,
+        cache_ram: cache.ram,
         stats: levers.step_stats(),
         width,
     };
@@ -1025,6 +1036,10 @@ struct SeatArgs {
     draft_bytes: u64,
     /// The residency the load runs.
     residency: Residency,
+    /// The prompt cache's byte budget: the pinned staging its saves are
+    /// copied into on a lane of their own, pinned whole at the open
+    /// (`SaveLane::new`); 0 (the cache off) makes no lane.
+    cache_ram: u64,
     /// Whether the seat counts its rounds of several slots
     /// (`BLOOMERY_STEP_STATS`, the binary's `main` parsed).
     stats: bool,
@@ -1048,6 +1063,9 @@ struct Glm {
     /// The load runs the residency machine: each call prints its
     /// boundaries' `residency pass` records.
     residency: bool,
+    /// The copy stream and the pinned staging the prompt cache's saves are
+    /// made on ([`Seat::snapshots_async`]); none with the cache off.
+    lane: Option<SaveLane>,
     /// The shape a round of several slots runs in ([`Rounds::of`], decided
     /// at the open): a plain load's step rounds one pass
     /// ([`Glm::step_slots`]), a NextN load's drafted rounds one pass when the
@@ -1117,6 +1135,10 @@ impl Glm {
                 MtpDraft::open(m, prefill, StepMode::Eager)
             })?,
         };
+        let lane = match a.cache_ram {
+            0 => None,
+            ram => Some(seq_lane(s.model_mut(), ram)?),
+        };
         Ok(Glm {
             s,
             drafted,
@@ -1124,9 +1146,33 @@ impl Glm {
             draft_bytes: a.draft_bytes,
             path: a.path,
             residency,
+            lane,
             rounds: Rounds::of(a.draft_off.is_none()),
             stats: a.stats,
         })
+    }
+
+    /// `state`, which this seat took, put back by `put` after the session's
+    /// reset, then the draft's side of it ([`SlotDrafts::unpark`]): the draft
+    /// joins the slot's next call where it left, or stays off for its parked
+    /// why. The state's copy is waited for first ([`Cached::body`]); the
+    /// positions `put` leaves the model at. Refused by name, before the reset,
+    /// for a state this seat did not take or one saved with the draft on put
+    /// back with it off (or the other way); the body refuses another model's
+    /// state or layout.
+    fn put_back(
+        &mut self,
+        state: &dyn Saved,
+        put: impl FnOnce(&mut Glm5nextModel, &GlmSeq) -> Result<u32, GpuError>,
+    ) -> Result<usize, GateError> {
+        let saved = SavedGlm::of(state, "a glm5next body's")?;
+        let body = saved.body()?;
+        let sel = self.s.selected();
+        self.drafted.takes(saved.draft.as_ref())?;
+        self.drafted.reset(&mut self.s, sel)?;
+        let at = put(self.s.model_mut(), body)?;
+        self.drafted.unpark(sel, saved.draft.as_ref())?;
+        Ok(at as usize)
     }
 
     /// The `residency pass` records of the boundaries the last call made, on
@@ -1178,32 +1224,10 @@ impl Glm {
 const SKIP_OFF_WHY: &str = "the draft skips until the slot's next reset, and a NextN pass of \
                             several slots takes each slot's whole verify";
 
-/// A GLM sequence state as the server's prompt cache holds it ([`GlmSeq`]),
-/// with the draft's side of it when the seat drafts. The cache ranks it by
-/// the body's rule: every position it holds, or the point it carries at or
-/// below the shared prefix.
-struct SavedGlm {
-    state: GlmSeq,
-    draft: Option<ParkedDraft<GlmArena>>,
-}
-
-impl Saved for SavedGlm {
-    fn n_tokens(&self) -> usize {
-        self.state.positions() as usize
-    }
-
-    fn n_bytes(&self) -> u64 {
-        self.state.bytes() as u64
-    }
-
-    fn keepable(&self, n: usize) -> usize {
-        self.state.keep_point(u32::try_from(n).unwrap_or(u32::MAX)) as usize
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+/// A GLM sequence state as the server's prompt cache holds it ([`GlmSeq`],
+/// the body's rule ranking it), with the draft's side of it when the seat
+/// drafts: the one common [`Cached`], whose draft side is this seat's.
+type SavedGlm = Cached<GlmSeq, Option<ParkedDraft<GlmArena>>>;
 
 /// The verify pass's capture: its nodes, one line.
 struct PairCapture;
@@ -1546,28 +1570,46 @@ impl Seat for Glm {
     /// The sequence state ([`seq_save`]) and, under the draft, its side of
     /// it ([`SlotDrafts::park`]), as the prompt cache holds them.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-        Ok(Arc::new(SavedGlm {
-            state: seq_save(self.s.model_mut())?,
-            draft: self.drafted.park(self.s.selected())?,
-        }))
+        let state = seq_save(self.s.model_mut())?;
+        let draft = self.drafted.park(self.s.selected())?;
+        Ok(Arc::new(SavedGlm::landed(state, draft)))
+    }
+
+    /// Whether the saves copy on the lane: the seat holds one.
+    fn snapshots_async(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// The state's copy begun on the lane ([`seq_save_async`]), the draft's
+    /// side taken beside it; a pool with no room is the server's `NoRoom`
+    /// ([`begin`]). Without a lane, the snapshot on the call.
+    fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+        let Some(lane) = &self.lane else {
+            return Ok(Pending::landed(self.snapshot()?));
+        };
+        let copy = seq_save_async(self.s.model_mut(), lane)?
+            .map(|(state, pending)| (state, Arc::new(pending) as Arc<dyn Landing>));
+        let sel = self.s.selected();
+        begin(copy, || self.drafted.park(sel))
     }
 
     /// The state put back ([`seq_resume`]) after the session's reset, then
-    /// the draft's side of it ([`SlotDrafts::unpark`]): the sequence's next
-    /// call runs as it would have with no switch between, its draft joining
-    /// where it left. Refused by name, before the reset, for a state this
-    /// seat did not take or one saved with the draft on put back with it off
-    /// (or the other way); the body refuses another model's state or layout.
+    /// the draft's side of it ([`Glm::put_back`]).
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
-        let saved = state
-            .as_any()
-            .downcast_ref::<SavedGlm>()
-            .ok_or("a saved state that is not a glm5next body's")?;
-        let sel = self.s.selected();
-        self.drafted.takes(saved.draft.as_ref())?;
-        self.drafted.reset(&mut self.s, sel)?;
-        seq_resume(self.s.model_mut(), &saved.state)?;
-        self.drafted.unpark(sel, saved.draft.as_ref())
+        self.put_back(state, |m, body| {
+            seq_resume(m, body).map(|()| body.positions())
+        })
+        .map(drop)
+    }
+
+    /// The first `n` positions the state can be cut to put back after the
+    /// session's reset ([`seq_resume_prefix`]), then the draft's side of it
+    /// ([`Glm::put_back`]): the sequence's next call runs as it would have
+    /// after the whole state's resume and a rollback to the returned
+    /// position, its draft joining where the cut leaves it.
+    fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        self.put_back(state, |m, body| seq_resume_prefix(m, body, n))
     }
 
     /// A prefix kept less of than shared is a `cache reuse` record; every
