@@ -1,12 +1,12 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
-//! ds41|qwen38|glm|qwen3|decide` picks the seat (`serve_seats`, the shared
+//! ds41|qwen38|glm|qwen3|mimo2|decide` picks the seat (`serve_seats`, the shared
 //! seat modules), every other flag the seat's own, parsed by the seat's own
 //! parser, so each seat's flag set is exactly its per-model binary's. The
 //! word is optional with a model file: with none, the file's architecture
 //! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
 //! one line a seat with a working `--hf` example.
 //!
-//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|decide]
+//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    <the seat's own flags>
@@ -37,7 +37,7 @@
 //! Otherwise, with no `--model`, the architecture of the file's first shard
 //! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next and
 //! glm5-next the glm seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe
-//! the qwen3 seat;
+//! the qwen3 seat, mimo2 the mimo2 seat;
 //! a file of a decision row's backbone (qwen35) with no head is refused by
 //! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
 //! that carries its head); a
@@ -130,15 +130,15 @@ mod drive {
     use serve::decide::Ask;
     use serve::preflight::Driver;
 
-    use crate::serve_seats::{decide, ds41, glm, qwen3, qwen38};
+    use crate::serve_seats::{decide, ds41, glm, mimo2, qwen3, qwen38};
 
     const NAME: &str = "bloomery-serve";
 
-    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|decide] [-m PATH | \
+    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|decide] [-m PATH | \
                          --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
                          [--head-config <file>]] <the chosen seat's own flags, as \
-                         bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3 or the \
-                         decide seat takes them> | --version";
+                         bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
+                         mimo2 or the decide seat takes them> | --version";
 
     /// One line a seat, printed beside [`USAGE`] on `--help` and a bare
     /// start: the seat word, what it serves, and a working `--hf` example of
@@ -149,6 +149,7 @@ models (the --model word is optional with a model file: the file's architecture 
   qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
   glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL
   qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+  mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
   decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
@@ -168,6 +169,7 @@ models (the --model word is optional with a model file: the file's architecture 
         Qwen38,
         Glm,
         Qwen3,
+        Mimo2,
     }
 
     /// A `--model` word: a generative seat's, or the decide seat's.
@@ -184,9 +186,10 @@ models (the --model word is optional with a model file: the file's architecture 
                 "qwen38" => Ok(Word::Seat(Model::Qwen38)),
                 "glm" => Ok(Word::Seat(Model::Glm)),
                 "qwen3" => Ok(Word::Seat(Model::Qwen3)),
+                "mimo2" => Ok(Word::Seat(Model::Mimo2)),
                 serve::decide::WORD => Ok(Word::Decide),
                 other => Err(format!(
-                    "--model is ds41, qwen38, glm, qwen3 or {}, not {other}",
+                    "--model is ds41, qwen38, glm, qwen3, mimo2 or {}, not {other}",
                     serve::decide::WORD
                 )
                 .into()),
@@ -203,7 +206,13 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 4] = [Model::Ds41, Model::Qwen38, Model::Glm, Model::Qwen3];
+        const ALL: [Model; 5] = [
+            Model::Ds41,
+            Model::Qwen38,
+            Model::Glm,
+            Model::Qwen3,
+            Model::Mimo2,
+        ];
 
         /// The seat's word, as errors and the usage name it.
         fn word(self) -> &'static str {
@@ -212,6 +221,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Qwen38 => "qwen38",
                 Model::Glm => "glm",
                 Model::Qwen3 => "qwen3",
+                Model::Mimo2 => "mimo2",
             }
         }
 
@@ -225,6 +235,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Qwen38 => arch == "qwen4exp",
                 Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
                 Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe"),
+                Model::Mimo2 => arch == "mimo2",
             }
         }
     }
@@ -242,7 +253,7 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             let v = it.next().ok_or_else(|| {
                 format!(
-                    "--model needs a value (ds41, qwen38, glm, qwen3 or {}): {USAGE}",
+                    "--model needs a value (ds41, qwen38, glm, qwen3, mimo2 or {}): {USAGE}",
                     serve::decide::WORD
                 )
             })?;
@@ -428,6 +439,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Qwen38 => qwen38::run(&rest),
             Model::Glm => glm::run(&rest),
             Model::Qwen3 => qwen3::run(&rest),
+            Model::Mimo2 => mimo2::run(&rest),
         };
         ended(r)
     }

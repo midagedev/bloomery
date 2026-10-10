@@ -790,9 +790,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               pinned — an unpinned run has none and runs flat whatever this says. `flat` \
               cuts every matrix's units end to end into one lane a participant, the \
               same-binary arm. Both write the same bits. Acted on by the binaries that pin \
-              their main thread: `generate_ds41`, `bloomery-chat`, and the ds41, qwen38 and \
-              glm seats of `bloomery-serve` (`bloomery-serve-ds41`, \
-              `bloomery-serve-qwen38`); every other binary that parses its levers runs \
+              their main thread: `generate_ds41`, `bloomery-chat`, and the ds41, qwen38, \
+              glm and mimo2 seats of `bloomery-serve` (`bloomery-serve-ds41`, \
+              `bloomery-serve-qwen38`, `bloomery-serve-mimo2`); every other binary that parses its levers runs \
               the default and refuses the name set, and `bloomery-decode` and \
               `bench_v41_host`, which do not read it, run the default.",
         site: Site::Parsed {

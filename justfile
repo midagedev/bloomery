@@ -830,7 +830,7 @@ gate-gpu-clef-hidden:
 # Q8_0; fetched into /root/models/clef-flash/) serves the request with no head flag, and its answers equal the
 # same file's with the release's head (the one difference: the head's dtype). Either card.
 gate-gpu-clef-serve:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
 
 # The decide seat of bloomery-serve on lev (gate_lev_serve's doc): ggml-org/lev-GGUF's Q4_K_M (3.0 GB, a `qwen35`
 # file with `qwen35.decision.type = lev`, fetched into /root/models/lev-4b/) with no head flag; five refusals before
@@ -840,7 +840,7 @@ gate-gpu-clef-serve:
 # prompts' ids; ARGS `--hf ggml-org/lev-GGUF:Q4_K_M` adds the clause that serves the file from the hub, no head flag, and
 # answers the first request as the `-m` server does (a network read). Either card.
 gate-gpu-lev-serve *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
 
 # clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
 # position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.
@@ -1693,7 +1693,7 @@ gate-gpu-qwen38-serve:
 # target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device bundle.
 [group('pool')]
 gate-gpu-qwen3-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve --bin generate_qwen3moe --bin gate_qwen3_serve && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin generate_qwen3moe --bin gate_qwen3_serve && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless
@@ -2142,7 +2142,22 @@ gate-gpu-glm5next-residency:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-serve:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+
+# The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
+# slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'
+# ids (the batch set's, a prose, the chat turn rendered by the server's template), the chat answer inside those ids, the
+# edit and extension prefix clauses (the seat keeps any held position), and then the same file opened in process at the
+# same context answering the server's ids bit for bit, the batch prompt's first id ik's or a named tie. Logs in
+# target/mimo2-serve-gate/<server>/. Loads the whole host set twice (the server, then the session): alone in a batch, and
+# under the big-load lock the V4.1 loads take. Real-only: there is no fixture file for it yet, so a fixture-tier run is
+# refused by name (66) and the recipe is a weekly, selected by its trigger rows in tools/gate-paths.tsv and its own text.
+# The bound is 28 min (the default 900 s is under two cold loads); `--place bp`'s refusal runs only on a census of two
+# cards, the id clause only on one.
+[group('solo')]
+[group('v41-load')]
+weekly-gpu-mimo2-serve:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.

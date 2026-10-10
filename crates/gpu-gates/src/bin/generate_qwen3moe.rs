@@ -103,8 +103,8 @@
 //! context, scratch and margin against the census's free reading — and when
 //! it does not, the placed plan on that card runs instead, its `plan` line
 //! naming why (`why=whole_does_not_fit`). A `place unset` record names the
-//! placement the flag or the common rule gave (`generate::Place::choose` by
-//! `q3place::Q3_RULE`: the body serves no tier card, so unset is `a`) before
+//! placement the flag or the common rule gave (`generate::Place::choose_untiered`:
+//! the body serves no tier card, so unset is `a`) before
 //! the `load` line; the load itself takes the flag as given, or unset the
 //! pick above. The placement's levers
 //! (`BLOOMERY_CARD_BUDGET` and the host set's, `q3place::PLACED_LEVERS`)
@@ -1881,7 +1881,7 @@ mod cli {
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
     /// (`generate::Place`), refused by name beside `--prefill gemm` — a
     /// placed prompt runs as passes through the host tier's batch port. The
-    /// common unset rule (`Place::choose` by `q3place::Q3_RULE`) prints its
+    /// common unset rule (`Place::choose_untiered`) prints its
     /// `place unset` record, set or unset; the flag goes on as given, so an
     /// unset one loads the census pick (`q3place::open_unplaced_qwen3`).
     fn place_q3(arg: Option<&str>, prefill: Option<&str>) -> Result<Option<Place>, GateError> {

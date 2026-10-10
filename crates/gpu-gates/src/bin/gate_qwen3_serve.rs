@@ -356,9 +356,11 @@ mod gate {
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
-        Served, curl, ids_of, json_of, metric, parse_ids, server_log,
+        self, Answer, PrefixTurns, Served, agree, beside, chat_is_those_ids, check, curl,
+        edit_and_extension, ids_of, json_of, metric, parse_ids, rendered, serve_cmd, server_log,
+        tokenized,
     };
-    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed};
     use gguf::Split;
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
@@ -463,11 +465,6 @@ mod gate {
         }
     }
 
-    fn check(ok: &mut bool, name: &str, pass: bool) {
-        println!("check {name}: {}", verdict(pass));
-        *ok &= pass;
-    }
-
     /// A fake census of this workstation's cards by short name, in the
     /// order given: each its CUDA ordinal by position, its measured total,
     /// all of it free.
@@ -519,11 +516,6 @@ mod gate {
             e.starts_with("--place a: the placement takes the largest visible card, and 0 devices")
         });
         check(ok, "unplaced_card_is_the_largest", pass);
-    }
-
-    /// A binary beside this one.
-    fn beside(name: &str) -> Result<PathBuf, GateError> {
-        Ok(std::env::current_exe()?.with_file_name(name))
     }
 
     /// The busy slots the server has booked over its `decodes` engine calls:
@@ -1129,11 +1121,9 @@ mod gate {
     /// plain engine is pinned: the prefix clauses below hold the one-slot
     /// path's keeps.
     fn spawn(model: &Path, dir: &Path) -> Result<Served, GateError> {
-        let mut cmd = Command::new(beside("bloomery-serve")?);
-        cmd.env_remove("BLOOMERY_REF_MODEL");
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
         Served::spawn_cmd(
-            cmd,
+            serve_cmd()?,
             &[
                 "--model",
                 "qwen3",
@@ -1148,18 +1138,9 @@ mod gate {
         )
     }
 
-    /// What the server answered for one prompt.
-    struct Answer {
-        prompt: Vec<u32>,
-        tokens: Vec<u32>,
-        stop: String,
-        /// `cache_n`: the positions the request kept of what the slot held.
-        cache_n: u64,
-    }
-
-    /// `/completion` of `prompt` at temperature 0 — `cache` asks the server
-    /// to keep the prefix the prompt shares with the slot — its body in
-    /// `<dir>/<name>.json`.
+    /// `/completion` of `prompt` at temperature 0 for [`N`] tokens — `cache`
+    /// asks the server to keep the prefix the prompt shares with the slot —
+    /// its body in `<dir>/<name>.json`.
     fn greedy(
         url: &dyn Fn(&str) -> String,
         prompt: Vec<u32>,
@@ -1167,47 +1148,7 @@ mod gate {
         name: &str,
         cache: bool,
     ) -> Result<(Answer, Value), GateError> {
-        let body = json!({
-            "prompt": prompt, "n_predict": N, "temperature": 0, "return_tokens": true,
-            "cache_prompt": cache,
-        });
-        let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-        std::fs::write(dir.join(format!("{name}.json")), &text)?;
-        let v = json_of("/completion", st, &text)?;
-        let tokens = ids_of(&v["tokens"]);
-        let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
-        let cache_n = v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX);
-        println!("{name} completion tokens {tokens:?} stop {stop} cache_n {cache_n}");
-        Ok((
-            Answer {
-                prompt,
-                tokens,
-                stop,
-                cache_n,
-            },
-            v,
-        ))
-    }
-
-    /// The ids of `messages` as the server's chat template renders them
-    /// (`/apply-template`, then `/tokenize`).
-    fn rendered(url: &dyn Fn(&str) -> String, messages: Value) -> Result<Vec<u32>, GateError> {
-        let (st, body) = curl(
-            &url("/apply-template"),
-            Some(&json!({ "messages": messages })),
-            false,
-        )?;
-        let text = json_of("/apply-template", st, &body)?["prompt"]
-            .as_str()
-            .ok_or("/apply-template: no prompt")?
-            .to_owned();
-        tokenized(url, &text)
-    }
-
-    /// `/tokenize` of `text`.
-    fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, GateError> {
-        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": text })), false)?;
-        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+        serve_client::greedy(url, prompt, N, dir, name, cache)
     }
 
     /// The prefix clauses (the module header), on the qwen3moe arm alone:
@@ -1228,58 +1169,20 @@ mod gate {
         dir: &Path,
         ok: &mut bool,
     ) -> Result<Answer, GateError> {
-        let p = rendered(url, json!([{ "role": "user", "content": EDIT_A }]))?;
-        let q = rendered(url, json!([{ "role": "user", "content": EDIT_B }]))?;
         let later = tokenized(url, LATER)?;
-        let j = p.iter().zip(&q).take_while(|(a, b)| a == b).count();
-        if j == 0 || j >= p.len() || q.len() < j + GEMM_FROM + 1 {
-            return Err(format!(
-                "the edit clause's turns diverge at {j} of {} and {} ids; the divergence must \
-                 sit inside the first turn's prompt rows with at least {} ids after it",
-                p.len(),
-                q.len(),
-                GEMM_FROM
-            )
-            .into());
-        }
-        // The edit clause: the turn answered fresh, resent with the user
-        // message changed, and the changed turn fed fresh.
-        let (first, _) = greedy(url, p.clone(), dir, "edit_first", false)?;
-        let (edit, _) = greedy(url, q.clone(), dir, "edit", true)?;
-        let (fresh, _) = greedy(url, q, dir, "edit_fresh", false)?;
-        println!(
-            "edit: the turns diverge at {j}; the resend kept {}; its ids {:?}; the fresh run's \
-             {:?}",
-            edit.cache_n, edit.tokens, fresh.tokens
-        );
-        check(
+        // The edit clause and the extension clause, the owner's.
+        edit_and_extension(
+            url,
+            dir,
             ok,
-            "edit_resend_keeps_the_row_where_it_diverges",
-            first.cache_n == 0 && edit.cache_n == j as u64,
-        );
-        check(
-            ok,
-            "edit_resend_ids_are_a_fresh_runs",
-            !fresh.tokens.is_empty() && edit.tokens == fresh.tokens && fresh.cache_n == 0,
-        );
-
-        // The extension clause: the turn answered again, then resent with
-        // its reply and a later user turn.
-        let (held_run, _) = greedy(url, p, dir, "extend_first", false)?;
-        let held = (held_run.prompt.len() + held_run.tokens.len()).saturating_sub(1) as u64;
-        let mut extend = held_run.prompt.clone();
-        extend.extend_from_slice(&held_run.tokens);
-        extend.extend_from_slice(&later);
-        let (resend, _) = greedy(url, extend, dir, "extend", true)?;
-        println!(
-            "extension: the slot held {held}; the resend kept {} and answered {:?}",
-            resend.cache_n, resend.tokens
-        );
-        check(
-            ok,
-            "extension_keeps_every_held_position",
-            held_run.cache_n == 0 && resend.cache_n == held && !resend.tokens.is_empty(),
-        );
+            &PrefixTurns {
+                a: EDIT_A,
+                b: EDIT_B,
+                n: N,
+                min_after: GEMM_FROM,
+            },
+            &later,
+        )?;
 
         // The whole-call clause: the two-message chat on the slot the
         // extension left holding another conversation. Each message at
@@ -1639,8 +1542,7 @@ mod gate {
         }
         // Two distinct prompts, each first run alone, then both together.
         let a_ids = rendered(&url, messages())?;
-        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
-        let b_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let b_ids = tokenized(&url, PROSE)?;
         let mut alone = Vec::new();
         for ids in [&a_ids, &b_ids] {
             let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
@@ -1844,8 +1746,7 @@ mod gate {
             let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
             let url = |p: &str| format!("http://{addr}{p}");
             let a_ids = rendered(&url, messages())?;
-            let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
-            let b_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+            let b_ids = tokenized(&url, PROSE)?;
             let mut alone = Vec::new();
             for ids in [&a_ids, &b_ids] {
                 let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
@@ -2007,8 +1908,7 @@ mod gate {
         let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
         let url = |p: &str| format!("http://{addr}{p}");
         let a_ids = rendered(&url, messages())?;
-        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
-        let b_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let b_ids = tokenized(&url, PROSE)?;
         let mut alone = Vec::new();
         for ids in [&a_ids, &b_ids] {
             let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
@@ -2556,58 +2456,18 @@ mod gate {
             .ok_or("/apply-template: no prompt")?
             .to_owned();
         std::fs::write(dir.join("prompt.txt"), &text)?;
-        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": text })), false)?;
-        let prompt = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let prompt = tokenized(&url, &text)?;
         println!("rendered prompt: {} ids", prompt.len());
         check(ok, "the_turn_is_past_a_pass", prompt.len() > PASS_IDS);
 
         let (chat_ids, v) = greedy(&url, prompt, dir, "completion", false)?;
-        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
-        let prose = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let prose = tokenized(&url, PROSE)?;
         println!("prose prompt: {} ids", prose.len());
         check(ok, "the_prose_is_past_a_pass", prose.len() > PASS_IDS);
         let (prose_ids, _) = greedy(&url, prose, dir, "prose", false)?;
 
-        let body = json!({
-            "messages": messages(), "max_tokens": N, "temperature": 0, "stream": false,
-        });
-        let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
-        std::fs::write(dir.join("chat.json"), &text)?;
-        let chat = json_of("/v1/chat/completions", st, &text)?;
-        let msg = &chat["choices"][0]["message"];
-        let said = format!(
-            "{}{}",
-            msg["reasoning_content"].as_str().unwrap_or(""),
-            msg["content"].as_str().unwrap_or("")
-        );
-        let (st, text) = curl(
-            &url("/detokenize"),
-            Some(&json!({ "tokens": chat_ids.tokens })),
-            false,
-        )?;
-        let detok = json_of("/detokenize", st, &text)?["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
-        let usage = &chat["usage"];
-        let counted = usage["prompt_tokens"].as_u64() == Some(chat_ids.prompt.len() as u64)
-            && usage["completion_tokens"].as_u64() == v["tokens_predicted"].as_u64();
-        let parts_inside = [
-            msg["reasoning_content"].as_str().unwrap_or(""),
-            msg["content"].as_str().unwrap_or(""),
-        ]
-        .iter()
-        .all(|p| detok.contains(p.trim()));
-        println!(
-            "chat usage {usage}; said {} chars, the ids' text {} chars",
-            said.len(),
-            detok.len()
-        );
-        check(
-            ok,
-            "chat_is_those_ids",
-            counted && !said.trim().is_empty() && parts_inside,
-        );
+        let chat_ok = chat_is_those_ids(&url, dir, messages(), N, (&chat_ids, &v))?;
+        check(ok, "chat_is_those_ids", chat_ok);
         // The qwen3moe arm's whole-call answer joins the CLI comparison: a
         // fresh run's ids for the two-message chat.
         let mut whole = None;
@@ -2767,15 +2627,12 @@ mod gate {
             };
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
             let references = cli(model, &prompts, &dir)?;
-            let mut agree = true;
+            let mut agree_all = true;
             for (ans, reference) in answers.iter().zip(&references) {
                 println!("cli tokens {reference:?}");
-                agree &= match ans.stop.as_str() {
-                    "eos" => !ans.tokens.is_empty() && reference.starts_with(&ans.tokens),
-                    _ => ans.tokens == *reference,
-                };
+                agree_all &= agree(&ans.tokens, &ans.stop, reference);
             }
-            check(&mut ok, "completion_ids_are_the_cli_ids", agree);
+            check(&mut ok, "completion_ids_are_the_cli_ids", agree_all);
             ctx_default(model, &dir, default_n, &mut ok)?;
             whole_fit_counts_the_planes_granules(model, &dir, &mut ok)?;
             cache_refusals(model, &dir, &mut ok)?;

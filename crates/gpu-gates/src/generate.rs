@@ -104,6 +104,17 @@ const fn alias(i: usize) -> Place {
     }
 }
 
+/// The step a searched default context moves in: a round power of two a
+/// cache row count stays readable in.
+pub const CTX_GRAN: usize = 1024;
+
+/// The file's trained context (`<arch>.context_length`), `None` when the
+/// file states none.
+pub fn trained_ctx(file: &Split) -> Option<usize> {
+    file.arch_get_u64("context_length")
+        .and_then(|v| usize::try_from(v).ok())
+}
+
 /// A family's input to the common unset-`--place` rule ([`Place::choose`]):
 /// the expert tier cards its body serves, the tier count that pays once a
 /// sitting has shown the tier not slower (`None` until one has), and the card
@@ -116,6 +127,16 @@ pub struct TierRule {
     pub break_even: Option<u64>,
     /// The card file that decided [`Self::break_even`].
     pub basis: &'static str,
+}
+
+impl TierRule {
+    /// A body that serves no tier card: an unset `--place` runs `a` on the
+    /// largest card and no card file decides anything.
+    pub const UNTIERED: TierRule = TierRule {
+        tiers: 0,
+        break_even: None,
+        basis: "",
+    };
 }
 
 /// [`Place::choose`]'s answer: the placement to run, why in the words a
@@ -297,6 +318,23 @@ impl Place {
             }) => Place::A.on(census),
             Err(e) => Err(format!("--place bp: {e}").into()),
         }
+    }
+
+    /// [`Place::choose`] for a `body` that serves no tier card
+    /// ([`TierRule::UNTIERED`]): `flag` as given when set, else `a`, the plan
+    /// never asked; the refusal of a tier count names `body`.
+    pub fn choose_untiered(
+        flag: Option<Place>,
+        census: &[DeviceInfo],
+        body: &str,
+    ) -> Result<PlaceWhy, GateError> {
+        Place::choose(flag, census, TierRule::UNTIERED, |p| {
+            Err(format!(
+                "--place unset: the {body} body serves no tier card, so no tier count for {}",
+                p.name()
+            )
+            .into())
+        })
     }
 
     /// The placement a serving seat runs by, set or unset, and why in the

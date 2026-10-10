@@ -13,7 +13,9 @@
 #   glm5next   --place gate: need=173,015,891,968 B (the glm5next serve log's cache line)
 #   qwen4exp   --place gate: need=92,054,154,240 B (the qwen38 serve log's cache line); the serve/residency seats add
 #              the churn pool 35.6e9 B beside it; iqleg loads the file twice (both resident): 2 x.
-#   mimo2: resident_bytes 6,771,848,948 (train028's log) + scratch, rounded up [derived].
+#   mimo2      --place gate: every routed expert on the host — host routed 160,859,947,008 B (mimo2_meta's pin) + the
+#              host embedding 664,010,752 B, rounded up to 161.6e9 [derived]; the serve gate loads twice, one after the
+#              other, never both.
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
@@ -33,7 +35,8 @@ weekly-gpu-ds41-cand	-	237600000000
 weekly-gpu-ds41-lost	-	237600000000
 weekly-gpu-ds41-serve	-	237600000000
 weekly-gpu-glm5next-e2e-long	-	173015891968
-weekly-gpu-mimo2-e2e	-	8000000000
+weekly-gpu-mimo2-e2e	-	161600000000
+weekly-gpu-mimo2-serve	-	161600000000
 gate-gpu-ds41-residency-a	-	237600000000
 gate-gpu-glm5next-e2e	-	173015891968
 gate-gpu-glm5next-mtp	-	173015891968

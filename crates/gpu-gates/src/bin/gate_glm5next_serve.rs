@@ -257,9 +257,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "glm5next")]
 mod gate {
     use std::fs::File;
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -267,10 +266,11 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
-        curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
+        self, agree, beside, check, completion, curl, ids_of, json_of, metric, parse_ids, rendered,
+        server_log, stage_usable, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use gguf::Split;
     use model::arch::glm5next::place::{
         KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs,
@@ -447,88 +447,35 @@ mod gate {
         (bloomery_levers::STEP_STATS, "1"),
     ];
 
-    /// The server this binary started; killed and reaped on every way out.
-    /// `serve_client::Served`'s core with this gate's server's name — that
-    /// module's `exe` names `bloomery-serve-ds41`.
-    struct Served {
-        child: Child,
-    }
+    /// The server this binary started: `serve_client::Served` under the
+    /// arm's levers.
+    struct Served(serve_client::Served);
 
     impl Served {
         /// `bloomery-serve` beside this binary with `args` and the arm's
         /// levers, stdout to `<dir>/server.out` and stderr to
-        /// `<dir>/server.err`. The child is killed when this process dies, so
-        /// a runner's bound that ends this process does not leave the server
-        /// holding a card.
+        /// `<dir>/server.err`.
         fn spawn(args: &[&str], dir: &Path, levers: Levers) -> Result<Served, GateError> {
-            let exe = beside("bloomery-serve")?;
-            let mut cmd = Command::new(&exe);
-            cmd.args(args)
-                .env_remove(bloomery_levers::DRAFT)
+            let mut cmd = Command::new(beside("bloomery-serve")?);
+            cmd.env_remove(bloomery_levers::DRAFT)
                 .env_remove(bloomery_levers::RESIDENCY)
-                .envs(levers.iter().copied())
-                .stdin(Stdio::null())
-                .stdout(File::create(dir.join("server.out"))?)
-                .stderr(File::create(dir.join("server.err"))?);
-            // SAFETY: the closure runs in the child between fork and exec and
-            // calls only `prctl`, which is async-signal-safe and touches no
-            // memory of ours.
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-            let child = cmd
-                .spawn()
-                .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-            Ok(Served { child })
-        }
-
-        /// Waits for the `listening on http://<addr>` line in the server's
-        /// stderr, `polls` reads `poll` apart.
-        fn address(&mut self, err_log: &Path) -> Result<String, GateError> {
-            for _ in 0..POLLS {
-                let text = std::fs::read_to_string(err_log).unwrap_or_default();
-                if let Some(addr) = text
-                    .lines()
-                    .find_map(|l| l.split_once("listening on http://").map(|(_, a)| a.trim()))
-                {
-                    return Ok(addr.to_owned());
-                }
-                if let Some(status) = self.child.try_wait()? {
-                    return Err(format!(
-                        "the server exited ({status}) before listening; {}:\n{text}",
-                        err_log.display()
-                    )
-                    .into());
-                }
-                std::thread::sleep(POLL);
-            }
-            Err(format!("the server did not listen within {POLLS} polls").into())
-        }
-
-        fn stop(&mut self) -> Result<String, GateError> {
-            self.child.kill()?;
-            Ok(format!("{}", self.child.wait()?))
+                .envs(levers.iter().copied());
+            Ok(Served(serve_client::Served::spawn_cmd(cmd, args, dir)?))
         }
     }
 
-    impl Drop for Served {
-        fn drop(&mut self) {
-            if matches!(self.child.try_wait(), Ok(None)) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
+    impl std::ops::Deref for Served {
+        type Target = serve_client::Served;
+
+        fn deref(&self) -> &serve_client::Served {
+            &self.0
         }
     }
 
-    /// The binary `name` beside this one.
-    fn beside(name: &str) -> Result<PathBuf, GateError> {
-        Ok(std::env::current_exe()?.with_file_name(name))
+    impl std::ops::DerefMut for Served {
+        fn deref_mut(&mut self) -> &mut serve_client::Served {
+            &mut self.0
+        }
     }
 
     struct Args {
@@ -553,11 +500,6 @@ mod gate {
             (Some(arm), Some(dir)) => Ok(Args { arm, dir }),
             _ => Err(USAGE.into()),
         }
-    }
-
-    fn check(ok: &mut bool, name: &str, pass: bool) {
-        println!("check {name}: {}", verdict(pass));
-        *ok &= pass;
     }
 
     /// The lines of the server's stderr from line `from` on.
@@ -639,12 +581,7 @@ mod gate {
         n: usize,
         cache: bool,
     ) -> Result<Value, GateError> {
-        let body = json!({
-            "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
-            "cache_prompt": cache,
-        });
-        let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-        json_of("/completion", st, &text)
+        completion(url, ids, n, cache)
     }
 
     /// The chat turn at temperature 0, from a reset (`cache_prompt` off: a
@@ -663,16 +600,6 @@ mod gate {
             v["choices"][0]["message"], v["choices"][0]["finish_reason"], v["usage"], v["timings"]
         );
         Ok((st, v))
-    }
-
-    /// `ids` agree with `reference`, a run that did not stop at the
-    /// end-of-generation id: all of them, or, when `stop` is `eos`, a prefix
-    /// ending there.
-    fn agree(ids: &[u32], stop: &str, reference: &[u32]) -> bool {
-        match stop {
-            "eos" => !ids.is_empty() && reference.starts_with(ids),
-            _ => ids == reference,
-        }
     }
 
     /// `generate_glm5next --place gate --ctx 2048 --tokens <ids> -n 16`,
@@ -1240,7 +1167,7 @@ mod gate {
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, &dir, DRAFT_ONLY)?;
         println!("draft-only server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         let load = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
@@ -1299,31 +1226,6 @@ mod gate {
         ok &= cache(&url, &err_log, true)?;
         println!("draft-only server stopped: {}", served.stop()?);
         Ok(ok)
-    }
-
-    /// The ids of `messages` as the server's chat template renders them
-    /// (`/apply-template`, then `/tokenize` without BOS).
-    fn rendered(url: &dyn Fn(&str) -> String, messages: Value) -> Result<Vec<u32>, GateError> {
-        let (st, body) = curl(
-            &url("/apply-template"),
-            Some(&json!({ "messages": messages })),
-            false,
-        )?;
-        let text = json_of("/apply-template", st, &body)?["prompt"]
-            .as_str()
-            .ok_or("/apply-template: no prompt")?
-            .to_owned();
-        tokenized(url, &text)
-    }
-
-    /// `/tokenize` of `text` without BOS.
-    fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, GateError> {
-        let (st, body) = curl(
-            &url("/tokenize"),
-            Some(&json!({ "content": text, "add_special": false })),
-            false,
-        )?;
-        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
     }
 
     /// The slot `slot` dropped and not saved (`POST
@@ -1721,7 +1623,7 @@ mod gate {
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&args, &dir, DRAFT_ONLY_STATS)?;
         println!("slots server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         let listening = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?
@@ -2320,7 +2222,7 @@ mod gate {
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&args, &dir, PLAIN_STATS)?;
         println!("plain slots server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         // The `parallel` line printed before the load names the round's
@@ -2414,7 +2316,7 @@ mod gate {
         let err_log = own.join("server.err");
         let mut served = Served::spawn(&UNSET_ARGS, &own, UNSET)?;
         println!("unset server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         let load = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
@@ -2485,7 +2387,7 @@ mod gate {
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir, PLAIN)?;
         println!("plain server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let (st, body) = curl(&url("/health"), None, false)?;
         check(
@@ -2570,7 +2472,7 @@ mod gate {
         ];
         let mut served = Served::spawn(&SERVER_ARGS, &own, levers)?;
         println!("width-cost server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         let c = greedy(&url, ids, N_PREDICT, false)?;
@@ -2630,7 +2532,7 @@ mod gate {
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir, DRAFTED)?;
         println!("drafted server pid {}", served.child.id());
-        let addr = served.address(&err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         let (st, body) = curl(&url("/health"), None, false)?;

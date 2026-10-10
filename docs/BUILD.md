@@ -64,7 +64,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-qwen38` | the same, `--features deepseek41` (the feature scopes the server code; it runs no V4.1 code) | Qwen3.8-Flash-Next |
-| `bloomery-serve` | `… --features glm5next,clef,vision --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, Clef-Flash, lev |
+| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Clef-Flash, lev |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |
@@ -201,10 +201,10 @@ target/release/bloomery-tokenize -m "$M" --decode -p "$(sed -n 's/^tokens //p' g
 
 Flags: `-n N` (default 16), `--ctx C` (default 2048, at most 16,384), `--place a|gate` (default `gate`), `--prefill batch|steps` (default `batch`), `--mode graph|eager`, `--plan` (print the plan and exit before the load), `--logits`, `--time [--warm W]`.
 
-The server is `bloomery-serve --model glm` (build it with `--features glm5next,clef --bin bloomery-serve`). With `--place` unset it plans `bp` when a second card is visible and keeps it when the plan puts at least 526 experts on that card (the break-even, derived in `docs/cards/glmbp-ab.card`), else it runs `a`; a `place unset` line on stderr names the pick, the tier's experts and the break-even. On the development machine's A6000 + 3090 the `bp` plan holds 1,501 tier experts, and one request (MTP draft on, residency `mid-p0-s1`) decodes 13.0 % ± 2.8 faster than under `a` after a 512-token prompt and prefills it 11.1 % ± 0.5 faster (rig-log 10-06#glmbp-ab); two requests run 35.26 tok/s in total after a 512-token prompt (rig-log 10-06#num3090). At `--place a` and `--place bp` (the 3090 as an expert tier) it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
+The server is `bloomery-serve --model glm` (build it with `--features glm5next,clef,mimo2 --bin bloomery-serve`). With `--place` unset it plans `bp` when a second card is visible and keeps it when the plan puts at least 526 experts on that card (the break-even, derived in `docs/cards/glmbp-ab.card`), else it runs `a`; a `place unset` line on stderr names the pick, the tier's experts and the break-even. On the development machine's A6000 + 3090 the `bp` plan holds 1,501 tier experts, and one request (MTP draft on, residency `mid-p0-s1`) decodes 13.0 % ± 2.8 faster than under `a` after a 512-token prompt and prefills it 11.1 % ± 0.5 faster (rig-log 10-06#glmbp-ab); two requests run 35.26 tok/s in total after a 512-token prompt (rig-log 10-06#num3090). At `--place a` and `--place bp` (the 3090 as an expert tier) it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve
 BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve --model glm --place a --ctx 4096 --host 127.0.0.1 --port 8080
 ```
 
@@ -255,7 +255,7 @@ The same binary opens the Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` file (`unsloth/Qw
 [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone and a small joint schema head that scores every allowed option of every question in one prompt pass. bartowski's current GGUF upload is llama.cpp's `clef` layout, which carries the head inside the file; an older `qwen35`-layout file takes the release's own head file.
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve
 
 # the backbone on one card (see Picking the card), the head (in the file) on the host
 target/release/bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q8_0 --port 8091

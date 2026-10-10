@@ -218,8 +218,8 @@ use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
-    placement_props, sampler_factory,
+    CacheRam, ChatSurface, Listen, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, bind_server,
+    model_props, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -245,10 +245,7 @@ use runtime::Target;
 use runtime::seqstate::Why;
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
-use serve::{
-    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
-    Server, ServerConfig, SlotConfig,
-};
+use serve::{CacheNote, DraftProps, Drafted, EngineProps, ResidencyReset, Saved, ServeError};
 use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
@@ -753,20 +750,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let path = ref_model_path()?;
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let template = match &a.template_file {
-        Some(file) => std::fs::read_to_string(file)
-            .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))?,
-        None => inv
-            .value("tokenizer.chat_template")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
-            .to_owned(),
-    };
-    let name = inv
-        .value("general.name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("glm-5.3-flash")
-        .to_owned();
+    let ChatSurface { template, name } = ChatSurface::read(
+        &path,
+        inv.value("tokenizer.chat_template"),
+        inv.value("general.name"),
+        a.template_file.as_deref(),
+        "glm-5.3-flash",
+    )?;
     drop(inv);
 
     // The plan record, and `/props` from the same plan the load runs by:
@@ -781,14 +771,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // where a window fits, and never refuses). The slot count itself: a set
     // `--ctx` with no `--parallel` is one request's context — one slot at
     // the whole of it (`placement::ctx::slots_of`).
-    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
-    if from == "ctx" {
-        eprintln!(
-            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
-             once (they split it)",
-            a.ctx.unwrap_or_default()
-        );
-    }
+    let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
     let (floor, why) = match levers.draft() {
         Some("mtp") => (
             NEED_FLOOR,
@@ -953,28 +936,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     )?
     .holding(seq_bytes(&inputs, 1, nextn.is_some()));
     eprintln!("{}", cache.line());
-    eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={} total={} from={from} pass={}",
+    // The round's shape the open below runs (the module doc).
+    parallel_line(
+        slots,
         rule.ctx,
-        slots * rule.ctx,
-        // The round's shape the open below runs (the module doc).
-        Rounds::of(draft_off.is_none()).word()
+        from,
+        Some(Rounds::of(draft_off.is_none()).word()),
     );
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
         std::process::exit(0);
     }
-    let gpu = machine
-        .all_cards()
-        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
-        .collect::<Result<Vec<String>, String>>()
-        .and_then(|g| placement_props(&plan, &g));
-    if let Err(e) = &gpu {
-        eprintln!("{WHAT}: /props leaves the placement out: {e}");
-    }
     let props = EngineProps {
         model: Some(model),
-        placement: gpu.ok(),
+        placement: placement_of(WHAT, &machine, &plan),
         ..EngineProps::default()
     };
 
@@ -1006,28 +981,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         cache.ram,
     )?;
 
-    let config = ServerConfig {
-        model_alias: a.alias.unwrap_or(name),
-        model_path: path.display().to_string(),
-        chat_template: template,
-        sampler: Some(sampler_factory()),
-        fatal_linger: FATAL_LINGER,
-        slot_save_path: a.slot_save_path,
-        api_keys: a.api_keys,
-    };
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its
     // per-slot draft), no turns and no park.
-    let config_slots = SlotConfig {
-        parallel: slots,
-        queue_depth: a.queue_depth,
-        ..SlotConfig::default()
-    };
-    let server = Server::bind_with(
-        (a.host.as_str(), a.port),
-        Box::new(engine),
-        config,
-        config_slots,
+    let server = bind_server(
+        engine,
+        Listen {
+            host: &a.host,
+            port: a.port,
+            alias: a.alias.unwrap_or(name),
+            path: &path,
+            template,
+            slot_save_path: a.slot_save_path,
+            api_keys: a.api_keys,
+            parallel: slots,
+            queue_depth: a.queue_depth,
+        },
     )?;
     Record::new(&record::LISTENING_GLM)
         .w("place", place.name())
@@ -1606,23 +1575,6 @@ impl Seat for Glm {
     /// A prefix kept less of than shared is a `cache reuse` record; every
     /// other note of the prompt cache prints as its line.
     fn note(note: &CacheNote) {
-        if let CacheNote::Reuse {
-            common,
-            ask,
-            kept,
-            held,
-            reason,
-        } = note
-        {
-            Record::new(&record::CACHE_REUSE)
-                .u("common", common)
-                .u("ask", ask)
-                .u("kept", kept)
-                .u("held", held)
-                .w("reason", reason.as_deref().unwrap_or("unstated"))
-                .eprint();
-            return;
-        }
-        eprintln!("{WHAT}: {note}");
+        note_line(WHAT, note);
     }
 }

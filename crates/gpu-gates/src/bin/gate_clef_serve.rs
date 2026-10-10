@@ -192,13 +192,16 @@ mod gate {
     /// ([`drive::MODELS`] in `bloomery_serve.rs`): one line a seat, the seat
     /// word, what it serves and a working `--hf` example of it, and the
     /// header line above them.
-    const MODELS_LINES: [&str; 6] = [
+    ///
+    /// PIN(2026-10-10): a seventh row, the mimo2 seat's, joins the table.
+    const MODELS_LINES: [&str; 7] = [
         "models (the --model word is optional with a model file: the file's architecture picks \
          the seat)",
         "ds41    DeepSeek-V4.1-Flash          --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M",
         "qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL",
         "glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL",
         "qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M",
+        "mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4",
         "decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M",
     ];
 
