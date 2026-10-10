@@ -114,11 +114,13 @@
 //! - (k) checkpoints, on the prose set's ids through the session: a prompt
 //!   of [`A`] ids takes its checkpoints at 512 and [`A`]; a cut keeps 512 for
 //!   600 and nothing for 500, each with its reason's code, and a cut to 600
-//!   is refused by name; a cut to 512 and a branch of 200 ids leave the
-//!   points at 512 and 712 (the abandoned 640 dropped); a cut to 712 (a
+//!   is refused by name; a cut to 512 and a branch of [`KEEP_BRANCH`] ids
+//!   ([`KEEP_BRANCH_STEPS`] on the steps feed) leave the points at 512 and
+//!   the branch's end (the abandoned 640 dropped); a cut to that end (a
 //!   point the restored branch took, then a step: the copy back runs in the
 //!   step) and a cut to 512 (below the abandoned point, then a prompt call:
-//!   the copy back runs in its first take) then a tail of 64 ids each give
+//!   the copy back runs in its first take) then a tail of [`KEEP_TAIL`] ids
+//!   ([`KEEP_TAIL_STEPS`]) each give
 //!   the logits plain steps of the same ids from a reset give, bit for bit;
 //!   and a prompt call's takes leave those logits as they are. All of it
 //!   twice: on the steps feed, then on the batch feed in groups of two
@@ -431,7 +433,8 @@ mod gate {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
-    use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
+    use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
+    use bloomery_gpu::linear::RING_ROWS;
     use bloomery_gpu::model::{SlotsOut, StepMode};
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::Arm;
@@ -2382,6 +2385,25 @@ mod gate {
     /// The first prompt's ids: past one inner mark (512) and short of the
     /// next.
     const A: usize = 640;
+    /// (k)'s branch from the mark at 512 (ids 700..) and its tail (ids 900..) on the batch feed.
+    const KEEP_BRANCH: usize = 200;
+    const KEEP_TAIL: usize = 64;
+    // PIN(2026-10-10): the steps feed's branch 200 → 16 and tail 64 → 16: the user approved it for
+    // train wall; what still reads a restore replayed past 16 positions is (sc)'s slot cut (slot 1
+    // back to its prompt call's checkpoint and stepped on to where it stood, its state hash and last
+    // id as before the cut) and (pb-long)'s tail (a call's checkpoint restored and 174 positions
+    // replayed as chunk calls); the batch feed keeps 200 and 64, and 16 still wraps the conv ring
+    // and completes whole pools ([`RING_ROWS`] 11, [`POOL`] 4, asserted below).
+    const KEEP_BRANCH_STEPS: usize = 16;
+    const KEEP_TAIL_STEPS: usize = 16;
+    const _: () = assert!(
+        KEEP_BRANCH_STEPS > RING_ROWS
+            && KEEP_TAIL_STEPS > RING_ROWS
+            && KEEP_BRANCH_STEPS.is_multiple_of(POOL)
+            && KEEP_TAIL_STEPS.is_multiple_of(POOL)
+            && KEEP_BRANCH.is_multiple_of(POOL)
+            && KEEP_TAIL.is_multiple_of(POOL)
+    );
 
     /// The logits row a session call read back.
     fn row(out: Out<'_>) -> Result<Vec<f32>, GateError> {
@@ -2411,7 +2433,16 @@ mod gate {
         if ids.len() < 964 {
             return Err(format!("{D1K}: {} prefill ids, the clause reads 964", ids.len()).into());
         }
-        let (a, d, e) = (&ids[..A], &ids[700..900], &ids[900..964]);
+        let batch = prefill_mode(s.model())? == PrefillMode::Batch;
+        let (nd, ne) = if batch {
+            (KEEP_BRANCH, KEEP_TAIL)
+        } else {
+            (KEEP_BRANCH_STEPS, KEEP_TAIL_STEPS)
+        };
+        let (a, d, e) = (&ids[..A], &ids[700..700 + nd], &ids[900..900 + ne]);
+        // The branch's end, where its call takes a checkpoint, and a position inside it.
+        let end = u32::try_from(512 + nd)?;
+        let inside = end - 12;
         let points = |s: &Session<Body>| -> Result<Vec<u32>, GateError> {
             Ok(s.model().body("keep")?.checkpoints().positions())
         };
@@ -2460,18 +2491,18 @@ mod gate {
         let p2 = points(s)?;
         s.step(ids[A], Want::Argmax)?;
         s.step(ids[A + 1], Want::Argmax)?;
-        s.cut(712)?;
+        s.cut(end)?;
         // A step first: the restore runs in the step's refresh, not in a
         // prompt call's first take.
         s.step(e[0], Want::Argmax)?;
-        let l712 = row(s.prompt(&e[1..], Want::Logits)?)?;
-        let k700 = s.kept(700);
-        s.cut(k700.at)?;
+        let l_end = row(s.prompt(&e[1..], Want::Logits)?)?;
+        let k_in = s.kept(inside);
+        s.cut(k_in.at)?;
         let l512 = row(s.prompt(e, Want::Logits)?)?;
-        let branch_ok = p2 == [512, 712] && k700.at == 512;
+        let branch_ok = p2 == [512, end] && k_in.at == 512;
         println!(
-            "keep ({feed}): cut to 512, branch of {}: points {p2:?} (want [512, 712]); kept(700) = {k700} \
-             {}",
+            "keep ({feed}): cut to 512, branch of {}: points {p2:?} (want [512, {end}]); \
+             kept({inside}) = {k_in} {}",
             d.len(),
             verdict(branch_ok)
         );
@@ -2482,8 +2513,7 @@ mod gate {
         // branches made, so each token runs in a batch of the size it ran in
         // there — a batch's bits depend on its side of GEMM_FROM — and the
         // calls' takes are the references' too.
-        let batch = prefill_mode(s.model())? == PrefillMode::Batch;
-        let (f512, f712) = if batch {
+        let (f512, f_end) = if batch {
             s.reset()?;
             s.prompt(&a[..512], Want::Argmax)?;
             let f512 = row(s.prompt(e, Want::Logits)?)?;
@@ -2523,16 +2553,16 @@ mod gate {
             verdict(read_only)
         );
         ok &= read_only;
-        let bits = same_bits(&l712, &f712) && same_bits(&l512, &f512);
+        let bits = same_bits(&l_end, &f_end) && same_bits(&l512, &f512);
         let c = s.model().body("keep")?.checkpoints();
         println!(
-            "keep ({feed}): restored at 712 and at 512, a tail of {} each, against {reference}: \
+            "keep ({feed}): restored at {end} and at 512, a tail of {} each, against {reference}: \
              logits bit for bit {bits} (argmax {} / {} and {} / {}); {} \
              taken, {} restored, {} dropped, {} evicted before the references; {} slots made of \
              {}, {} bytes a checkpoint {}",
             e.len(),
-            argmax(&l712),
-            argmax(&f712),
+            argmax(&l_end),
+            argmax(&f_end),
             argmax(&l512),
             argmax(&f512),
             stats.taken,
