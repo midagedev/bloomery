@@ -1,0 +1,16 @@
+# The box's idle-fill list: the work a card takes when nothing of ours is queued for it. One owner: this file.
+# tools/boxq.py fill-list parses it and refuses a row whose recipe is not in the justfile; docs/plan-triage.md points here.
+# Tab-separated, four columns, blank and `#` lines skipped:
+#   item      a justfile recipe name, or `cmd:<command>` for work that is not a recipe
+#   lane      3090 | a6000 | both | any | none — the card the item holds, read from the recipe's own box.sh/gpu-gate.sh
+#             line (BLOOMERY_CARD=both: both; BLOOMERY_GATE_CARD=${...:-any}: any; no card variable: the box.sh pin, 3090)
+#   minutes   times:<item> — the median of the item's last rows in the gate-times file, resolved when the job is
+#             queued — or given:<minutes> for an item with no times row
+#   why       one line: what the item is for
+# The recipe's justfile groups (solo, v41-load) are read from the justfile by fill-list, not repeated here.
+weekly-gpu-ds41-lost	both	times:weekly-gpu-ds41-lost	weekly tier: the lost-card clauses of the V4.1 engine
+weekly-gpu-ds41-cand	any	times:weekly-gpu-ds41-cand	weekly tier: the V4.1 prefill past 16,384 and its candidate launches
+weekly-gpu-ds41-flowcounts	3090	times:weekly-gpu-ds41-flowcounts	weekly tier: the prefill flow model's queue-entry counts against the engine's records
+weekly-gpu-ds41-serve	both	times:weekly-gpu-ds41-serve	weekly tier: the V4.1 server gate, eight loads (plain, media, drafted, two-card)
+weekly-gpu-mimo2-e2e	any	times:weekly-gpu-mimo2-e2e	weekly tier: the MiMo end-to-end gate on the whole host set
+weekly-gpu-glm5next-e2e-long	any	times:weekly-gpu-glm5next-e2e-long	weekly tier: the GLM 1,024- and 3,070-position step sets against ik

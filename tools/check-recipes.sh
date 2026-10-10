@@ -369,6 +369,7 @@ blk_pytools() {
     "tools/bloomery/records.py --self-test"
     "tools/bloomery/rows.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
+    "tools/boxq.py --self-test"
     "tools/check-comment-only.py --self-test"
     "tools/check-defaults.py --self-test"
     "tools/flow/ds41_prefill.py --self-test"
@@ -435,6 +436,16 @@ blk_pytools() {
   fi
   echo "check-recipes: ${#selftests[@]} tool self-tests ok"
 }
+# The box queue's exit codes 80, 81 and 83-85 name one meaning each: no other tool, recipe or script produces one of them, and
+# they overlap none of the codes tools/ and the justfile already name (tools/boxq.py codes-check).
+blk_boxqcodes() {
+  if ! bc=$(python3 "$(dirname "$0")/boxq.py" codes-check 2>&1); then
+    echo "$bc" >&2
+    echo "check-recipes: a tool or recipe produces one of the box queue's exit codes 80, 81, 83-85" >&2
+    return 1
+  fi
+  echo "${bc##*$'\n'}"
+}
 # Every #[test] in the workspace is run by some gate-* or lab-* recipe's cargo test call on the box: its
 # target, the features its path's cfgs need, its name filter and its #[ignore] (tools/recipes.py
 # orphan-tests). A test no gate runs is neither a test nor a gate: without gate-ds41-bind, gpu-gates' bind
@@ -449,7 +460,7 @@ blk_orphan() {
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools orphan)
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools boxqcodes orphan)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
