@@ -1691,8 +1691,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     runner(
         "BLOOMERY_GATE_V41_LOAD",
         Some("gpu-gate.sh"),
-        "`1`: the run loads the whole V4.1 model, so it also takes the box-wide V4.1 load lock \
-         after its card lock(s); a recipe in the justfile's `v41-load` group exports it.",
+        "`1`: the run loads the whole V4.1 model, so it also takes the box-wide V4.1 load lock, \
+         queued in arrival order and taken before its card lock(s); a recipe in the \
+         justfile's `v41-load` group exports it.",
+    ),
+    runner(
+        "BLOOMERY_V41_CLASS",
+        Some("gpu-gate.sh"),
+        "The V4.1 load queue's class for a loader (`tools/gpu-gate.sh`): `1` the lead's landing \
+         batch (`tools/gate-batch.sh --ledger` sets it), `2` round gates (the default), `3` \
+         sittings, `4` idle fill. The queue serves (class, arrival) ascending and nothing \
+         preempts; any other value is refused (64).",
+    ),
+    runner(
+        "BLOOMERY_V41_PRED_S",
+        Some("gpu-gate.sh"),
+        "Whole seconds: the calling recipe's median wall, written into a loader's V4.1 queue \
+         ticket as `pred_s`; unset, `-`.",
     ),
     runner(
         "BLOOMERY_GATE_STACKS",
