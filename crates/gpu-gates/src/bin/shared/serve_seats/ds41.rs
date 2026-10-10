@@ -1298,11 +1298,13 @@ impl Seat for V41 {
         }
         // Each span borrows its own ranges of the call's one pair of buffers.
         let (rows, kinds, ats) = on_encoder_card(s, || v.span_rows(feeds))?;
-        let spans: Vec<body::MediaSpan<'_>> = ats
+        let spans: Vec<body::Span41<'_>> = ats
             .iter()
-            .map(|(at, r, k)| body::MediaSpan {
-                at: at.clone(),
-                rows: &rows[r.clone()],
+            .map(|(at, r, k)| body::Span41 {
+                span: body::MediaSpan {
+                    at: at.clone(),
+                    rows: &rows[r.clone()],
+                },
                 kinds: &kinds[k.clone()],
             })
             .collect();

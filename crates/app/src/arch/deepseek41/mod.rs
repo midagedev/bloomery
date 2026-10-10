@@ -9,17 +9,15 @@ pub use draft::CardDraft;
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
-use bloomery_gpu::host::PassKind;
 use bloomery_gpu_deepseek41::body::{
-    self, Body, BodyMeta, FeatureRows, FeatureSink, MediaSpan, OpenCfg, PrefillMode, TierOpen,
+    self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode, TierOpen,
 };
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, Plan};
-use runtime::swaprule::KeptRows;
-use runtime::{Out, Tapped, Target, Want};
+use runtime::{Tapped, Target};
 
-use crate::{Keep, Open, Prompt, Session, SessionError};
+use crate::{Keep, Open, Prompt, Session, SessionError, call};
 
 const WHAT: &str = "deepseek41 session";
 
@@ -132,24 +130,6 @@ impl Prompt for Body {
     }
 }
 
-/// A prompt call `run` of `m` as one residency pass: its boundary before it
-/// and none inside ([`GpuModel::pass_boundary`]), so the slot map is one map
-/// for the whole call, and 0 rows kept after it, whatever it returned — the
-/// residency rule counts decode rows only, and the batch service notes no
-/// id. Nothing more on a load with no residency machine.
-fn call<T>(
-    m: &mut GpuModel<Body>,
-    run: impl FnOnce(&mut GpuModel<Body>) -> Result<T, GpuError>,
-) -> Result<T, GpuError> {
-    m.pass_boundary()?;
-    let r = run(m);
-    let kept = m.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
-    // The call's own error first: a keep refused after a failed call is its echo.
-    let v = r?;
-    kept?;
-    Ok(v)
-}
-
 impl Keep for Body {
     /// [`Body::keep_point`].
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
@@ -175,33 +155,6 @@ impl Tapped for Session<Body> {
 }
 
 impl Session<Body> {
-    /// [`Target::prompt`] of `ids` with `media` spliced in: under the batched
-    /// schedule one prompt call ([`body::prefill_media`], one residency pass
-    /// as [`Prompt::prompt`]'s), each span's positions taking its rows, the
-    /// vision routing bias and dead engram n-grams, which the history keeps
-    /// for the steps after. Refused by name under steps, which feed one id a
-    /// step and have no place for a span's rows.
-    pub fn prompt_media(
-        &mut self,
-        ids: &[u32],
-        media: &[MediaSpan<'_>],
-        want: Want,
-    ) -> Result<Out<'_>, SessionError> {
-        self.idle("prompt")?;
-        let _busy = self.model().prompt_busy();
-        match self.model().body(WHAT)?.prefill_mode() {
-            PrefillMode::Batch => {
-                let argmax = call(self.model_mut(), |m| body::prefill_media(m, ids, media))?;
-                self.read(argmax, want)
-            }
-            PrefillMode::Steps => Err(SessionError::Refused(format!(
-                "a prompt with {} media spans under BLOOMERY_PREFILL=steps: a span's rows enter \
-                 only through the batched call (BLOOMERY_PREFILL=batch)",
-                media.len()
-            ))),
-        }
-    }
-
     /// [`Target::prompt`] with the feature tap's rows handed to `sink` (the
     /// first position they hold, then one row a position): under the batched
     /// schedule the rows of the call's last `window` positions, per batch

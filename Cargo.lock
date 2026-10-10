@@ -134,6 +134,7 @@ dependencies = [
  "bloomery-model",
  "bloomery-runtime",
  "bloomery-threads",
+ "bloomery-vision",
  "crc32fast",
  "cuda-core",
  "cuda-device",

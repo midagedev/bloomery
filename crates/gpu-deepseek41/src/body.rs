@@ -115,11 +115,12 @@ mod program;
 mod seq;
 mod slots;
 mod snap;
+pub use bloomery_gpu::media::MediaSpan;
 pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
-    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, MediaKind, MediaSpan,
-    PrefillMode, PrefillStats, PromptCounts, RouteTap, T_MAX, batch_count, batches, prefill,
-    prefill_media, prefill_media_observed, prefill_observed, prefill_with, prepare_media,
+    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, MediaKind,
+    PrefillMode, PrefillStats, PromptCounts, RouteTap, Span41, T_MAX, batch_count, batches,
+    prefill, prefill_media, prefill_media_observed, prefill_observed, prefill_with, prepare_media,
     prepare_prefill,
 };
 use seq::RowSeqs;

@@ -2,7 +2,7 @@
 //! (`gate_ds41_media`) and the serve seat (`serve_seats::ds41` under
 //! `--mmproj`): the learned delimiter rows of an encoder file and the span's
 //! rows and kinds. The engine side of a span
-//! ([`bloomery_gpu_deepseek41::body::MediaSpan`]) carries what these build;
+//! ([`bloomery_gpu_deepseek41::body::Span41`]) carries what these build;
 //! nothing here touches a card. The encoder's card bytes are
 //! `vision::arch::deepseek41v::card`'s.
 
