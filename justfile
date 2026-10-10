@@ -1820,6 +1820,20 @@ depth-gpu-qwen4exp *ARMS:
 depth-gpu-glm5next *ARMS:
     BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
 
+# Any model's decode and prompt rate through `bloomery-serve`, one fresh server an arm and a round (A6000, one lease,
+# lead-only): `<tree>:<D>` is ~/repo/<tree>'s bloomery-serve on the first D ids of the model's prose corpus, `env=K=V,K=V:<tree>:<D>`
+# sets levers for that arm's server only, the arms rotate every round (BLOOMERY_AB_ROUNDS, default 4). Rows: tg and pp tok/s
+# from the server's own `timings`, the load seconds and the major faults; then per arm the mean and, against the first arm of
+# its D, the difference with its 95 % interval. BLOOMERY_MODEL names the profile (tools/ref/models/<name>.sh) and is required.
+# The context, n_predict and port ride BLOOMERY_BOX_ENV as DEPTH_SERVE_CTX, DEPTH_SERVE_N and DEPTH_SERVE_PORT (defaults 4160,
+# 128, 18180; D + n_predict - 1 must fit the context); the header of tools/ref/depth-serve.sh has the arms, the rates and the
+# refusals. The binary requires the features of every seat (`required-features` of the bin), whatever the model: an arm that
+# names this tree builds it here, an arm of another tree needs that tree's own build of this line. Under
+# BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and no lease is taken: the plan and each binary's state.
+depth-serve *ARMS:
+    @[ -n "${BLOOMERY_MODEL:-}" ] || { echo "depth-serve: BLOOMERY_MODEL is unset: name the model profile (tools/ref/models/<name>.sh), e.g. BLOOMERY_MODEL=mimo2 just depth-serve <tree>:<D>" >&2; exit 64; }
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
+
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.

@@ -770,5 +770,9 @@ fi
 # The cpu guard (guard_cpu, cpu_busy_reading) on a stub /proc tree, and live where /proc exists.
 run 'the cpu guard tests (cpu-guard.sh)' 0 '^cpu-guard: [0-9]+ tests, 0 failed$' bash "$HERE/cpu-guard.sh"
 
+# The depth-serve runner's stub tests (arms, rotation, refusals, the servers' stop, the tables' math; a stub server, no lease). The runner
+# calls lease_take, so gate-batch's walker refuses check-recipes for naming it; a *-tests directory is the harness the walker does not read.
+run "the depth-serve runner's stub tests (depth-serve.sh --self-test)" 0 '^depth-serve\.sh self-test: [0-9]+ checks ok$' bash "$ROOT/tools/ref/depth-serve.sh" --self-test
+
 echo "card-tests: $n tests, $failed failed"
 [ "$failed" = 0 ]

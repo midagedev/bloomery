@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """A stand-in llama-server for the depth runners' stub tests (depth-ds41-stub.sh, depth-qwen3moe-stub.sh,
-depth-glm5next-stub.sh):
+depth-glm5next-stub.sh) and depth-serve.sh's self-test, where it stands for bloomery-serve:
 the process lcpp-warm.sh starts, with no model and no card.
 
 --help lists the flags the server arms pass (less STUB_SRV_HELP_MISSING). Otherwise it logs its argv
 ($TMPDIR/stub-srv-argv) and pid ($TMPDIR/stub-srv-pids), a build and a device line, under `-fit on -v`
 two model loads (the fit's measuring one, then the real one with two expert tensors of blk 1 on the host),
 and llama_context's n_ctx line: the -c it was given, STUB_SRV_NCTX in its place;
-binds 127.0.0.1 at a port the kernel picks and logs `listening on`; answers /health, and /completion with
-prompt_n the ids, prompt_ms 100, prompt_per_second 10 an id, predicted_ms 50 a step, predicted_per_second
+binds 127.0.0.1 at `--port` (a port the kernel picks without one, or at 0) and logs `listening on`;
+answers /health, and /completion with prompt_n the ids, prompt_ms 100, prompt_per_second 10 an id, predicted_ms 50 a step, predicted_per_second
 20.0, cache_n 0 and tokens 1000, 1001, ... (the second STUB_SRV_TOKEN1 in its stead) Every request appends `<number in this process> <ids> <n_predict>
 <ids, comma-separated>` to $TMPDIR/stub-srv-reqs. STUB_SRV_COLD, a comma list of request numbers (1 the
 warm-up, 2 the timed request, 3 a retry), adds 1000000 to the fault counter file $STUB_MAJFLT at those;
 STUB_SRV_BADN answers request 2 with one predicted token too few; STUB_SRV_EXIT exits 5 before it listens;
-STUB_SRV_HANG never listens. Under --spec-type (the MTP arm) each answer carries draft_n 4 and
-draft_n_accepted 3 and the log a `draft acceptance` line; STUB_SRV_NODRAFT drafts nothing. A TERM ends it
+STUB_SRV_HANG never listens; STUB_SRV_TPS answers its predicted_per_second in place of 20.0;
+STUB_SRV_NOTIMINGS answers with the tokens and no `timings`; STUB_SRV_LISTEN_CTX puts ` ctx=<n>` before the
+`listening on` words, as bloomery-serve's listening record has it (`argv`: the value of --ctx-size, --ctx or -c).
+Under --spec-type (the MTP arm) each answer carries draft_n 4 and draft_n_accepted 3 and the log a `draft acceptance` line; STUB_SRV_NODRAFT drafts nothing. A TERM ends it
 at once, as llama-server's own handler does.
 Under a CUDA_VISIBLE_DEVICES of two cards (the two-card mode) its device lines are ggml_cuda_init's for the
 A6000 and the 3090, as the stub llama-bench's (depth-stub-cards.sh); STUB_SRV_SEE_ONE=1 makes them one card,
@@ -84,14 +86,22 @@ class H(http.server.BaseHTTPRequestHandler):
             open(m, "w").write(f"{v + 1000000}\n")
         n, p = len(req["prompt"]), req["n_predict"]
         if os.environ.get("STUB_SRV_BADN") and n_req[0] == 2: p -= 1
+        tps = float(os.environ.get("STUB_SRV_TPS", "20.0"))
         t = {"cache_n": 0, "prompt_n": n, "prompt_ms": 100.0, "prompt_per_second": n * 10.0,
-             "predicted_n": p, "predicted_ms": 50.0 * max(p - 1, 0), "predicted_per_second": 20.0 if p > 1 else 0.0}
+             "predicted_n": p, "predicted_ms": 50.0 * max(p - 1, 0), "predicted_per_second": tps if p > 1 else 0.0}
         if "--spec-type" in sys.argv and not os.environ.get("STUB_SRV_NODRAFT"):
             t["draft_n"], t["draft_n_accepted"] = 4, 3
             print("slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (    3 accepted /     4 generated), mean len = 1.75", flush=True)
         toks = [1000 + i for i in range(p)]
         if os.environ.get("STUB_SRV_TOKEN1") and p > 1: toks[1] = int(os.environ["STUB_SRV_TOKEN1"])
+        if os.environ.get("STUB_SRV_NOTIMINGS"):
+            return self.reply(200, {"tokens": toks})
         self.reply(200, {"tokens": toks, "timings": t})
-s = http.server.HTTPServer(("127.0.0.1", 0), H)
-print(f"srv  main: listening on http://127.0.0.1:{s.server_address[1]}", flush=True)
+port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 0
+lctx = os.environ.get("STUB_SRV_LISTEN_CTX", "")
+if lctx == "argv":
+    lctx = next((sys.argv[sys.argv.index(f) + 1] for f in ("--ctx-size", "--ctx", "-c") if f in sys.argv), "0")
+lctx = f" ctx={lctx}" if lctx else ""
+s = http.server.HTTPServer(("127.0.0.1", port), H)
+print(f"srv  main:{lctx} listening on http://127.0.0.1:{s.server_address[1]}", flush=True)
 s.serve_forever()
