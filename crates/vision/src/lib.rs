@@ -7,6 +7,8 @@
 //! * [`resample`] — Pillow's bicubic resize and `ImageOps.pad`, ported to the integer: the
 //!   reference resizes every image whose size is not already its grid through them; and the same
 //!   resize under llama.cpp's `PAD_CEIL` pad. Both pads take the projector's fill as an argument.
+//! * [`mrope`] — the M-RoPE positions of a sequence that holds images ([`MropeSeq`]) and the rows of
+//!   a rope table they select: what a text model that reads `table[row]` needs to place an image.
 //! * [`preprocess`] — the plan of one image ([`GridPlan`]), and the normalize to bf16 and the cut
 //!   into patches that every projector type shares: row-major in V4.1's order, or in merge groups
 //!   with the patch repeated over temporal frames.
@@ -26,11 +28,13 @@
 pub mod arch;
 pub mod image;
 pub mod media;
+pub mod mrope;
 pub mod preprocess;
 pub mod resample;
 
 pub use image::{FileKind, Rgb8};
 pub use media::{MediaModel, Prepared};
+pub use mrope::{MropeError, MropeSeq};
 pub use preprocess::{GridPlan, PatchLayout, Patches, patchify};
 
 /// Everything this crate refuses, each naming what it refused.
