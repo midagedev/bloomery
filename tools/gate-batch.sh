@@ -2000,11 +2000,13 @@ IG
   want_row 'hold: both items ran, each under its own batch'"'"'s hold file' "$t/fake-state/seen.log" "$items_only"' { c++ } END { if (c == 2) print c }'
   want_no_row '  … none without its owner in the env and the hold in place' "$t/fake-state/seen.log" "$items_only"' && index($2, "owner=" $1 " since=") != 1'
   want_no_row '  … every item call carries BLOOMERY_BATCH_OWNER in its box env' "$t/fake-state/box.log" '$2 != "true" && $2 !~ /box-manifest/ && $1 !~ /BLOOMERY_BATCH_OWNER=gb_/'
+  want_no_row '  … and BLOOMERY_V41_CLASS=1, the lead'"'"'s class on the V4.1 load queue' "$t/fake-state/box.log" '$2 != "true" && $2 !~ /box-manifest/ && $1 !~ /BLOOMERY_V41_CLASS=1( |$)/'
+  want_not '  … the class is in no key call' "$t/fake-state/keycalls.log" 'V41_CLASS'
   want '  … and the caller'"'"'s own box env reached the key calls' "$t/fake-state/keycalls.log" '^KEEP=1$'
   want_not '  … the owner is in no key call' "$t/fake-state/keycalls.log" 'BATCH_OWNER'
   want '  … the ledger recorded both' "$t/lead-hold-up.tsv" '^stub-plain-any'
-  want_not '  … the owner is in no ledger line' "$t/lead-hold-up.tsv" 'BATCH_OWNER'
-  want_not '  … nor in a times row' "$t/times-hold-up.tsv" 'BATCH_OWNER'
+  want_not '  … the owner is in no ledger line' "$t/lead-hold-up.tsv" 'BATCH_OWNER|V41_CLASS'
+  want_not '  … nor in a times row' "$t/times-hold-up.tsv" 'BATCH_OWNER|V41_CLASS'
   want_not '  … and run.log carries no hold line' "$t/target/c-hold-up/run.log" 'gpuhold|gpu hold|BATCH_OWNER'
   want_no_row '  … every hold call went read-only, with no guard wait' "$t/fake-state/hold.log" '$0 !~ /^ro=1 wait=0 bash tools\/gpu-gate\.sh --gpuhold /'
   want_row '  … one up' "$t/fake-state/hold.log" '/--gpuhold up gb_/ { c++ } END { if (c == 1) print c }'
@@ -2025,7 +2027,7 @@ IG
   rc_ok 'no hold: a --round-ledger batch ends green' hold-round 1
   want_row '  … its item ran' "$t/fake-state/seen.log" "$items_only"' { c++ } END { if (c == 1) print c }'
   want_no_row '  … with no owner and no hold file' "$t/fake-state/seen.log" "$items_only"' && ($1 != "none" || $2 != "nohold")'
-  want_not '  … no call carries an owner' "$t/fake-state/box.log" 'BATCH_OWNER'
+  want_not '  … no call carries an owner or a class' "$t/fake-state/box.log" 'BATCH_OWNER|V41_CLASS'
   if [ ! -e "$t/fake-state/hold.log" ] && [ ! -e "$t/target/c-hold-round/gpuhold.pid" ]; then pass '  … no hold call, no heartbeat pid'
   else fail '  … no hold call, no heartbeat pid' "hold.log or gpuhold.pid exists"; fi
   rc=$(LFLAG=--ledger steal_case hold-off "plain-any	B	a6000	10	$d" -- --no-gpu-hold plain-any)
@@ -2033,6 +2035,7 @@ IG
   rc_ok '  … and a --ledger batch with --no-gpu-hold ends green' hold-off 1
   want_no_row '  … with no owner and no hold file' "$t/fake-state/seen.log" "$items_only"' && ($1 != "none" || $2 != "nohold")'
   want_not '  … no call carries an owner' "$t/fake-state/box.log" 'BATCH_OWNER'
+  want_no_row '  … but every item call carries class 1, hold or none' "$t/fake-state/box.log" '$2 != "true" && $2 !~ /box-manifest/ && $1 !~ /BLOOMERY_V41_CLASS=1( |$)/'
   if [ ! -e "$t/fake-state/hold.log" ] && [ ! -e "$t/target/c-hold-off/gpuhold.pid" ]; then pass '  … no hold call, no heartbeat pid'
   else fail '  … no hold call, no heartbeat pid' "hold.log or gpuhold.pid exists"; fi
   # A batch that is red takes the hold down too (the EXIT trap: every exit).
@@ -2212,9 +2215,11 @@ IG
   out="$(cut -f1,4 "$TIMES_FILE" 2>&1 || true) | $(cut -f1,4 "$COLD_FILE" 2>&1 || true)"
   if [ "$out" = "k-warm	12 | k-cold	900" ]; then pass 'cold: its row goes to the cold file, never into the median'
   else fail 'cold: its row goes to the cold file, never into the median' "got '$out'"; fi
-  # The waits a times row leaves out: box.sh's guard, the card lock and the V4.1 load lock, final try only.
+  # The waits a times row leaves out: box.sh's guard, the card lock and the V4.1 load lock, final try only. A queued loader's `queued at`
+  # line carries seconds too (the head's age) and is no wait: the sample holds one.
   printf '%s\n' '=== try 1 x' 'gpu-gate.sh: waited 99 s for the gate lock (3090)' '=== try 2 x' \
     '[guard] 2026-09-27T00:00:00Z quiet on two polls in a row after 60 s: the command starts' \
+    'gpu-gate.sh: gen_x queued at 2 of 3 for the V4.1 load lock (head: gen_y gb_x_1_2, 5 s)' \
     'gpu-gate.sh: waited 7 s for the batch hold' \
     'gpu-gate.sh: waited 15 s for the gate lock (3090)' 'gpu-gate.sh: waited 40 s for the V4.1 load lock' > "$t/waits.log"
   out=$(try_waits "$t/waits.log" 2)
@@ -4208,6 +4213,8 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   benv=$(box_env_of "$i")
   # The batch's own runs pass its GPU hold: the owner joins the call's env here, never box_env_of's (which feeds the ledger key).
   [ "$HOLD_UP" != 1 ] || benv="${benv:+$benv }BLOOMERY_BATCH_OWNER=$HOLD_OWNER"
+  # The lead's landing batch is class 1 of the V4.1 load queue (tools/gpu-gate.sh's header): in the call's env, never the key's.
+  [ "$LMODE" != lead ] || benv="${benv:+$benv }BLOOMERY_V41_CLASS=1"
   t0=$(date +%s)
   while :; do
     try=$((try + 1))
