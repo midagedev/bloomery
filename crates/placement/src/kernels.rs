@@ -44,9 +44,10 @@
 //! - Q8_0 `_sel` over f32 activations
 //!   (`Q8F32Kernels::enqueue_q8_0_gemv_sel_f32`, the MTP draft's experts): an
 //!   activation form [`DownAct`] does not name.
-//! - MXFP4 gate·up and down: `crates/gpu-deepseek41/src/experts_mxfp4.rs` is
-//!   V4.1's own; `crates/gpu/src/mxfp4.rs` holds a device row core and no
-//!   launcher.
+//! - `dflash_expert_gate_up` and `dflash_expert_down` in
+//!   `crates/gpu/src/mxfp4_sel.rs`: the V4.1 DSpark draft's route-plan entries
+//!   over two weight planes, with a fused weighted combine. The MXFP4 rows
+//!   below are that file's per-slot pair over the file's own blocks.
 //! - `crates/gpu/src/iq.rs`'s `IqFormat` plane row cores (IQ2_XS, IQ3_XXS,
 //!   IQ4_XS, Q2_K) are run by gates only; IQ3_XXS and IQ4_XS reach a launch
 //!   through `crates/gpu/src/iq_sel.rs`, the rows below.
@@ -88,6 +89,9 @@ pub enum GateUpEntry {
     /// `IqSelKernels::enqueue_gate_up` (`iq4_xs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4xs,
+    /// `Mxfp4SelKernels::enqueue_gate_up` (`mxfp4_gate_up_sel`, the file's
+    /// 17-byte `block_mxfp4` stream) in `crates/gpu/src/mxfp4_sel.rs`.
+    Mxfp4,
 }
 
 /// A common card down `_sel` entry: slot `s` writes the rows of expert
@@ -118,6 +122,9 @@ pub enum DownEntry {
     /// `IqSelKernels::enqueue_down` (`iq4_nl_gemv_sel32`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4nl,
+    /// `Mxfp4SelKernels::enqueue_down` (`mxfp4_gemv_sel`, the file's 17-byte
+    /// `block_mxfp4` stream) in `crates/gpu/src/mxfp4_sel.rs`.
+    Mxfp4,
 }
 
 /// The activation form a down `_sel` reads.
@@ -227,6 +234,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GgmlType::Q8_0 => Some(GateUpEntry::Q8_0),
         GgmlType::IQ3_XXS => Some(GateUpEntry::Iq3xxs),
         GgmlType::IQ4_XS => Some(GateUpEntry::Iq4xs),
+        GgmlType::MXFP4 => Some(GateUpEntry::Mxfp4),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::Q5_0
@@ -235,7 +243,6 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::Q3_K
         | GgmlType::Q6_K
         | GgmlType::BF16
-        | GgmlType::MXFP4
         | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
         | GgmlType::IQ1_S
@@ -266,12 +273,12 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         GgmlType::Q5_1 => Some((DownEntry::Q5_1, DownAct::Q8Blocks32)),
         GgmlType::Q8_0 => Some((DownEntry::Q8_0, DownAct::Q8Blocks32)),
         GgmlType::IQ4_NL => Some((DownEntry::Iq4nl, DownAct::Q8Blocks32)),
+        GgmlType::MXFP4 => Some((DownEntry::Mxfp4, DownAct::Q8Act)),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::Q2_K
         | GgmlType::Q3_K
         | GgmlType::BF16
-        | GgmlType::MXFP4
         | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
         | GgmlType::IQ3_XXS
@@ -546,6 +553,7 @@ mod tests {
                 (GgmlType::Q8_0, GateUpEntry::Q8_0),
                 (GgmlType::Q4_K, GateUpEntry::Q4k),
                 (GgmlType::Q5_K, GateUpEntry::Q5k),
+                (GgmlType::MXFP4, GateUpEntry::Mxfp4),
                 (GgmlType::IQ3_XXS, GateUpEntry::Iq3xxs),
                 (GgmlType::IQ4_XS, GateUpEntry::Iq4xs),
             ]
@@ -567,13 +575,14 @@ mod tests {
                 (GgmlType::Q4_K, DownEntry::Q4k),
                 (GgmlType::Q5_K, DownEntry::Q5k),
                 (GgmlType::Q6_K, DownEntry::Q6k),
+                (GgmlType::MXFP4, DownEntry::Mxfp4),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
             ]
         );
     }
 
-    /// The K-quant downs read the 128-value `Q8Act`; every other down reads
-    /// the 32-value `Q8Blocks32`.
+    /// The K-quant and MXFP4 downs read the 128-value `Q8Act`; every other
+    /// down reads the 32-value `Q8Blocks32`.
     #[test]
     fn down_reads_the_activation_form_of_its_entry() {
         let forms: Vec<_> = ALL
@@ -589,6 +598,7 @@ mod tests {
                 (GgmlType::Q4_K, DownAct::Q8Act),
                 (GgmlType::Q5_K, DownAct::Q8Act),
                 (GgmlType::Q6_K, DownAct::Q8Act),
+                (GgmlType::MXFP4, DownAct::Q8Act),
                 (GgmlType::IQ4_NL, DownAct::Q8Blocks32),
             ]
         );

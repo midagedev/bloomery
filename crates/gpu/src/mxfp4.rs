@@ -14,6 +14,12 @@
 //! to a word in the same order. The repack refuses a scale outside
 //! [`E_MIN`]..=[`E_MAX`], so the kernel's scale is a normal f32 power of two.
 //!
+//! The file layout is also read as it is ([`lane_partial_file`]): a block `g`
+//! of a stream of whole rows starts at byte `17g` and is read through the
+//! five words that cover it, so the stack stays the file's blocks
+//! (`CardFormat::KQuant`). That path takes every scale byte by ggml's half
+//! rule ([`scale_half`]); the planes path takes the normal range only.
+//!
 //! Activations are the q8_1 quantizer's (`q8_1_quant_block`): per 128-value
 //! block a scale `d_x` and int8 codes, stored in the Q4_K gemv's permutation,
 //! where value-order word `v` of a column sits at slot `256·(v >> 8) +
@@ -24,13 +30,15 @@
 //! The rule, one row against one column, both sides:
 //! - lane `L` of the row's warp takes blocks `b = L, L + 32, …` ascending;
 //! - block sum `s_b = Σ_j KVALUES_MXFP4[c_j] · q_j` over the 32 values, an
-//!   exact i32 (`|s_b| ≤ 32 · 12 · 127`), by `dp4a` on the device;
+//!   exact i32 (`|s_b| ≤ 32 · 12 · 127`), by `dp4a` on the device
+//!   ([`decode_block`], then [`block_fma`]);
 //! - `f = fma(d_w · d_x, s_b as f32, f)` from 0, `d_w = 2^(E − 128)` and
-//!   `d_x` the scale of the 128-value block holding `b`;
+//!   `d_x` the scale of the 128-value block holding `b` ([`block_fma`]);
 //! - the caller sums the 32 lane values with the warp butterfly
 //!   (`warp::reduce_sum_f32`).
 
 use crate::GpuError;
+use crate::kquant::q8_0::q8_0_code;
 use cuda_device::dotprod::dp4a_s32;
 use cuda_device::prmt::prmt;
 use cuda_device::vector::U32x4;
@@ -93,6 +101,146 @@ fn scale_of(e: u32) -> f32 {
     f32::from_bits((e - 1) << 23)
 }
 
+/// `2^(E − 128)` for any scale byte `E`: ggml's half rule
+/// (`gguf::quant::e8m0_to_f32_half`), `E >= 2` the f32 whose exponent field
+/// is `E − 1` (255 is `2^127`), and `E = 0`, `1` the subnormals
+/// `2^-129`, `2^-128`.
+#[inline(always)]
+fn scale_half(e: u32) -> f32 {
+    f32::from_bits(if e >= 2 {
+        (e - 1) << 23
+    } else {
+        0x0020_0000 << e
+    })
+}
+
+/// The eight int8 words one block's four `qs` words decode to, in value
+/// order: the low-nibble words of `qs[0..4]`, then their high-nibble words
+/// ([`decode_word`]). The first half of the block rule.
+#[inline(always)]
+pub fn decode_block(qs: [u32; 4]) -> [u32; 8] {
+    let (l0, h0) = decode_word(qs[0]);
+    let (l1, h1) = decode_word(qs[1]);
+    let (l2, h2) = decode_word(qs[2]);
+    let (l3, h3) = decode_word(qs[3]);
+    [l0, l1, l2, l3, h0, h1, h2, h3]
+}
+
+/// The second half of the block rule, one block against one column: the
+/// exact i32 block sum of the decoded words `dec` ([`decode_block`]) with the
+/// column's eight activation words `x` (value order), by eight `dp4a`, then
+/// `fma(d_w · d_x, s, f)`.
+#[inline(always)]
+pub fn block_fma(dec: &[u32; 8], x: &[u32; 8], dw: f32, dx: f32, f: f32) -> f32 {
+    let s = dp4a_s32(dec[0], x[0], 0);
+    let s = dp4a_s32(dec[1], x[1], s);
+    let s = dp4a_s32(dec[2], x[2], s);
+    let s = dp4a_s32(dec[3], x[3], s);
+    let s = dp4a_s32(dec[4], x[4], s);
+    let s = dp4a_s32(dec[5], x[5], s);
+    let s = dp4a_s32(dec[6], x[6], s);
+    let s = dp4a_s32(dec[7], x[7], s);
+    (dw * dx).mul_add(s as f32, f)
+}
+
+/// Block `g` of a file-layout stream (the rows' 17-byte blocks back to back as
+/// little-endian words): its scale by [`scale_half`] and its four `qs` words.
+///
+/// The block starts at byte `17g`, word `17g >> 2`, `17g & 3 = g & 3` bytes
+/// in, and its last byte is in the fifth word from there for every `g`, so
+/// five words cover it and none lies past the block's own last byte. The
+/// scale is byte `g & 3` of the first word; code word `i` is the
+/// little-endian pair of words `i`, `i + 1` shifted right by `8 · (g & 3) + 8`
+/// ([`q8_0_code`], whose shift reaches 32 for `g & 3 = 3`).
+///
+/// The caller keeps `w` holding the stream's word of block `g`'s last byte,
+/// `(17g + 16) >> 2` (rust-quality R28: a crate-internal fn over unchecked
+/// reads under a caller-kept boundary).
+#[inline(always)]
+pub(crate) fn file_block(w: &[u32], g: usize) -> (f32, [u32; 4]) {
+    let at = BLOCK_BYTES * g;
+    let i = at >> 2;
+    let o = (at & 3) as u32;
+    // SAFETY: words i .. i + 4 end at (17g + 16) >> 2, inside `w` by this
+    // fn's contract.
+    let v = unsafe {
+        [
+            *w.get_unchecked(i),
+            *w.get_unchecked(i + 1),
+            *w.get_unchecked(i + 2),
+            *w.get_unchecked(i + 3),
+            *w.get_unchecked(i + 4),
+        ]
+    };
+    let sh = 8 * o + 8;
+    (
+        scale_half((v[0] >> (8 * o)) & 0xff),
+        [
+            q8_0_code(v[0], v[1], sh),
+            q8_0_code(v[1], v[2], sh),
+            q8_0_code(v[2], v[3], sh),
+            q8_0_code(v[3], v[4], sh),
+        ],
+    )
+}
+
+/// Lane `lane`'s partial of one row of a file-layout stream against one
+/// q8_1 column, the module doc's rule: row `row`'s block `b` is block `row ·
+/// n_blk + b` of the stream ([`file_block`]), the column's words are read as
+/// in [`lane_partials`] from `q0` and its scales from `d0`.
+///
+/// The caller keeps `n_blk` a multiple of 4 (so a row is whole words), `w`
+/// holding the stream through the last block of row `row` ([`file_block`]'s
+/// boundary), `q.len() >= q0 + 256 · ceil(n_blk / 32)`, `d8.len() >= d0 +
+/// n_blk / 4` and `lane < 32` (rust-quality R28).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) fn lane_partial_file(
+    w: &[u32],
+    row: usize,
+    n_blk: usize,
+    q: &[u32],
+    d8: &[f32],
+    q0: usize,
+    d0: usize,
+    lane: usize,
+) -> f32 {
+    let g0 = row * n_blk;
+    let mut f = 0.0f32;
+    let mut b = lane;
+    while b < n_blk {
+        // b < n_blk, so block g0 + b is inside the row, inside `w` by this
+        // fn's contract.
+        let (dw, qs) = file_block(w, g0 + b);
+        let dec = decode_block(qs);
+        let qb = q0 + 256 * (b >> 5) + (b & 31);
+        // SAFETY: qb + 224 < q0 + 256·ceil(n_blk/32) for b < n_blk, so the
+        // eight words qb + 32i are inside the column, and scale d0 + b/4
+        // inside its scales, both by this fn's contract.
+        let (x, dx) = unsafe {
+            (
+                [
+                    *q.get_unchecked(qb),
+                    *q.get_unchecked(qb + 32),
+                    *q.get_unchecked(qb + 64),
+                    *q.get_unchecked(qb + 96),
+                    *q.get_unchecked(qb + 128),
+                    *q.get_unchecked(qb + 160),
+                    *q.get_unchecked(qb + 192),
+                    *q.get_unchecked(qb + 224),
+                ],
+                *d8.get_unchecked(d0 + (b >> 2)),
+            )
+        };
+        f = block_fma(&dec, &x, dw, dx, f);
+        b += 32;
+    }
+    f
+}
+
 /// Lane `lane`'s partial sums of one MXFP4 row against `M` q8_1 columns, the
 /// module doc's rule: each block's codes are loaded and decoded once and
 /// dotted with every column whose bit is set in `mask`. Column `c` reads its
@@ -142,11 +290,7 @@ pub unsafe fn lane_partials<const M: usize>(
             )
         };
         let dw = scale_of((ew >> (8 * (b & 3))) & 0xff);
-        let [w0, w1, w2, w3] = v.0;
-        let (l0, h0) = decode_word(w0);
-        let (l1, h1) = decode_word(w1);
-        let (l2, h2) = decode_word(w2);
-        let (l3, h3) = decode_word(w3);
+        let dec = decode_block(v.0);
         let slot = 256 * (b >> 5) + (b & 31);
         macro_rules! col {
             ($c:literal) => {
@@ -171,15 +315,7 @@ pub unsafe fn lane_partials<const M: usize>(
                             *d8.get_unchecked(d0 + $c * d_col + (b >> 2)),
                         )
                     };
-                    let s = dp4a_s32(l0, x[0], 0);
-                    let s = dp4a_s32(l1, x[1], s);
-                    let s = dp4a_s32(l2, x[2], s);
-                    let s = dp4a_s32(l3, x[3], s);
-                    let s = dp4a_s32(h0, x[4], s);
-                    let s = dp4a_s32(h1, x[5], s);
-                    let s = dp4a_s32(h2, x[6], s);
-                    let s = dp4a_s32(h3, x[7], s);
-                    f[$c] = (dw * dx).mul_add(s as f32, f[$c]);
+                    f[$c] = block_fma(&dec, &x, dw, dx, f[$c]);
                 }
             };
         }

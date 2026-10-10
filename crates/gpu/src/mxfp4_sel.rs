@@ -1,9 +1,20 @@
-//! The MXFP4 routed-expert kernels over a route plan, for up to eight tokens
-//! per launch: the experts of a model whose stacks hold MXFP4 in the two-plane
-//! card layout of [`crate::mxfp4`]. The V4.1 DSpark draft is their first
-//! caller.
+//! The MXFP4 routed-expert kernels, two forms of one rule ([`crate::mxfp4`]).
 //!
-//! Kernels, in the order a layer runs them:
+//! The draft's route-plan kernels ([`MxExpertKernels`]), for up to eight
+//! tokens per launch: the experts of a model whose stacks hold MXFP4 in the
+//! two-plane card layout. The V4.1 DSpark draft is their first caller.
+//!
+//! The common table's per-slot pair ([`Mxfp4SelKernels`]), shaped like every
+//! other `_sel` pair ([`crate::kquant::sel`]): the stacks are the file's
+//! 17-byte blocks (`CardFormat::KQuant`, read through five-word windows,
+//! [`crate::mxfp4::file_block`]), the activation a [`crate::Q8Act`], and
+//! `mxfp4_gate_up_sel` / `mxfp4_gemv_sel` run all slots in one launch each.
+//! Their ids, activation rule, fault sink and geometry are the family's, and
+//! the block rule is the route-plan kernels', so a (slot, column) of the pair
+//! equals the route kernel's value for that (slot, token) bit for bit; the
+//! scale byte follows ggml's half rule for every value.
+//!
+//! The route-plan kernels, in the order a layer runs them:
 //! - `dflash_quantize_q8_1`: the engine's q8_1 activation rule
 //!   ([`crate::q8_1_quant_block`]) over any number of columns — the down
 //!   projection reads `n_slots · m` of them, past `Q8Act`'s eight.
@@ -37,8 +48,10 @@
 //! - `out[c · rows + d]`: from 0, for each slot `j` in order that token `c`
 //!   routes to, `acc = fma(dot_j, w, acc)`.
 
-use crate::kquant::act::swiglu_clamp;
-use crate::mxfp4::{self, Planes, lane_partials};
+use crate::hybrid::HOST;
+use crate::kquant::act::{self, swiglu_clamp};
+use crate::kquant::{GateUpAct, SelDown};
+use crate::mxfp4::{self, Planes, lane_partial_file, lane_partials};
 use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{U32x4, as_vectors};
@@ -58,6 +71,17 @@ const BLOCK: u32 = 256;
 
 // The kernels' route masks and column macros stop at eight tokens.
 const _: () = assert!(MAX_TOKENS == 8);
+
+/// Output rows a block computes: one per warp.
+const ROWS_PER_BLOCK: usize = BLOCK as usize / 32;
+
+// The entries' launch attributes spell the block as a literal.
+const _: () = assert!(BLOCK == 256);
+
+/// Words of a file-layout MXFP4 row a 256-value super-block (eight 17-byte
+/// blocks): the `34 · n_sb` of the pair's launch contracts.
+const SB_WORDS: usize = 34;
+const _: () = assert!(4 * SB_WORDS == 8 * mxfp4::BLOCK_BYTES);
 
 /// The slots `0 .. 3m` in token order: the plan that lists every token's
 /// router ids in turn (`sel` = a router's `ids` over `m` tokens).
@@ -428,6 +452,173 @@ mod mxfp4_sel_kernels {
     }
 }
 
+#[cuda_module]
+mod mxfp4_pair_kernels {
+    use super::*;
+
+    /// The MXFP4 gate·up with its rule as an argument: thread row `n = slot ·
+    /// rows_per_expert + r` (one warp per row, eight rows per block) dots row
+    /// `sel[slot] · rows_per_expert + r` of the gate stack and of the up stack
+    /// ([`lane_partial_file`], the file's blocks) with activation column `slot
+    /// / slots_per_col`, reduces each with the warp tree and stores `h[n] =
+    /// act::apply(act, limit, g, u)` from lane 0. [`HOST`] returns before any
+    /// load, writing and raising nothing; any other id at or past
+    /// `n_experts` raises [`FaultSite::ExpertId`] and writes NaN into its row
+    /// of `h` (warp-uniform, before the first weight load). `m_cols` only
+    /// bounds the activation in the launch contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wg.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            wu.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn mxfp4_gate_up_sel(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let t = thread::index_1d().get() % BLOCK as usize;
+        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (the warp's lanes share `row`, hence `slot`),
+        // so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+                // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+                // launch contract; only lane 0 of the warp writes h[row].
+                unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        let row_abs = id as usize * rpe + row % rpe;
+        let col = slot / slots_per_col as usize;
+        let n_sb = n_sb as usize;
+        let (n_blk, q0, d0) = (8 * n_sb, col * 256 * iters as usize, col * 2 * n_sb);
+        // The launch contract keeps lane_partial_file's boundary: row_abs <
+        // n_experts · rows_per_expert rows of 34 · n_sb words in both stacks,
+        // so each holds row_abs's last block; n_blk = 8 · n_sb is a multiple
+        // of 4; column col < m_cols because slot < n_slots <= m_cols ·
+        // slots_per_col, its q words end at q0 + 256 · iters and its scales
+        // at d0 + 2 · n_sb inside q and d8 (the host passes iters =
+        // ceil(n_sb/4) = ceil(n_blk/32)); all 32 lanes of the warp are here
+        // (both returns above are warp-uniform).
+        let fg = lane_partial_file(wg, row_abs, n_blk, q, d8, q0, d0, lane);
+        let fu = lane_partial_file(wu, row_abs, n_blk, q, d8, q0, d0, lane);
+        let g = warp::reduce_sum_f32(fg);
+        let u = warp::reduce_sum_f32(fu);
+        if lane == 0 {
+            // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+            // launch contract; only lane 0 of the warp writes h[row].
+            unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+        }
+    }
+
+    /// The MXFP4 down `_sel`: thread row `n = slot · rows_per_expert + r`
+    /// stores `y[n]`, the dot of row `sel[slot] · rows_per_expert + r` of the
+    /// stack ([`lane_partial_file`]) with activation column `slot`, reduced by
+    /// the warp tree. [`HOST`] and ids at or past `n_experts` as the gate·up,
+    /// but the rows of `y` stay as they were.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * 34 * n_sb,
+            q.len() >= n_slots * 256 * iters,
+            d8.len() >= n_slots * 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn mxfp4_gemv_sel(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % BLOCK as usize;
+        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform, so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        let row_abs = id as usize * rpe + row % rpe;
+        let n_sb = n_sb as usize;
+        let (n_blk, q0, d0) = (8 * n_sb, slot * 256 * iters as usize, slot * 2 * n_sb);
+        // The launch contract keeps lane_partial_file's boundary: row_abs <
+        // n_experts · rows_per_expert rows of 34 · n_sb words, so the stack
+        // holds its last block; n_blk a multiple of 4; column slot < n_slots
+        // of the planes (q0 + 256 · iters <= q.len(), d0 + 2 · n_sb <=
+        // d8.len(), iters = ceil(n_sb/4)); all 32 lanes of the warp are here.
+        let f = lane_partial_file(w, row_abs, n_blk, q, d8, q0, d0, lane);
+        let s = warp::reduce_sum_f32(f);
+        if lane == 0 {
+            // SAFETY: row < n_slots · rows_per_expert <= y.len() by the
+            // launch contract; only lane 0 of the warp writes y[row].
+            unsafe { *y.get_unchecked_mut(row) = s };
+        }
+    }
+}
+
 /// An MXFP4 expert stack on the card, in [`crate::mxfp4`]'s card
 /// layout: `n_experts · rows_per_expert` rows of `k` values.
 pub struct MxStack {
@@ -759,6 +950,193 @@ impl MxExpertKernels {
             launch_u32(what, "n_blk", n_blk)?,
             launch_u32(what, "n_grp", n_blk.div_ceil(32))?,
             out,
+        )?;
+        Ok(())
+    }
+}
+
+/// The loaded MXFP4 per-slot pair and its launchers. Owns no stream: every
+/// enqueue takes the engine stream, so launches order with the step and are
+/// capturable.
+pub struct Mxfp4SelKernels {
+    module: mxfp4_pair_kernels::LoadedModule,
+    /// The fault word of the `Gpu` that owns the context: the launches'
+    /// sinks point into it, and the module keeps it alive.
+    _fault: Arc<DeviceBuffer<u32>>,
+}
+
+/// The experts of a stack of `SB_WORDS · n_sb`-word rows, or the shape error
+/// naming `what`.
+fn stack_experts(
+    what: &'static str,
+    w: &DeviceTensor<u32>,
+    n_sb: usize,
+    rows_per_expert: usize,
+) -> Result<usize, GpuError> {
+    if w.cols() != SB_WORDS * n_sb {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "MXFP4 rows are {SB_WORDS}*{n_sb} = {} words (the file's 17-byte blocks), got {}",
+                SB_WORDS * n_sb,
+                w.cols()
+            ),
+        ));
+    }
+    if rows_per_expert == 0 || w.rows() == 0 || !w.rows().is_multiple_of(rows_per_expert) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "w.rows() {} must be a positive multiple of rows_per_expert {rows_per_expert}",
+                w.rows()
+            ),
+        ));
+    }
+    Ok(w.rows() / rows_per_expert)
+}
+
+impl Mxfp4SelKernels {
+    /// Load this module's device bundle into `ctx`, whose launches raise into
+    /// `word`, the fault word of the `Gpu` that owns `ctx`
+    /// ([`crate::Gpu::fault_word`]); a word of another context is refused.
+    /// Load-time only.
+    pub fn load(
+        ctx: &Arc<CudaContext>,
+        word: &Arc<DeviceBuffer<u32>>,
+    ) -> Result<Mxfp4SelKernels, GpuError> {
+        let fault = crate::module_fault_word(ctx, word, "Mxfp4SelKernels::load")?;
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the module above; every launcher checks its launch contract.
+        let module = unsafe { crate::shared_module!(mxfp4_pair_kernels, ctx)? };
+        Ok(Mxfp4SelKernels {
+            module,
+            _fault: fault,
+        })
+    }
+
+    /// Enqueue the MXFP4 gate·up: slot `s` writes `h[s · rows_per_expert
+    /// ..][..rows_per_expert]` as `a.rule` over the rows of expert `sel[s]` of
+    /// both stacks (the file's 17-byte blocks as the KQuant word stream, `34 ·
+    /// n_sb` words a row) dotted with column `s / slots_per_col` of `a.act`
+    /// (module doc for [`HOST`] and ids past the stack, which raise on
+    /// `fault` and write NaN). Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gate_up(
+        &self,
+        stream: &CudaStream,
+        a: &GateUpAct<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Mxfp4SelKernels::enqueue_gate_up";
+        let n_sb = a.act.n_sb();
+        let n_experts = stack_experts(what, a.wg, n_sb, a.rows_per_expert)?;
+        let (n_slots, rpe, spc, m) = (a.n_slots, a.rows_per_expert, a.slots_per_col, a.act.m());
+        if a.wu.rows() != a.wg.rows() || a.wu.cols() != a.wg.cols() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the up stack {} x {} must be the gate stack's {} x {}",
+                    a.wu.rows(),
+                    a.wu.cols(),
+                    a.wg.rows(),
+                    a.wg.cols()
+                ),
+            ));
+        }
+        if n_slots == 0
+            || spc == 0
+            || n_slots > m * spc
+            || a.sel.len() < n_slots
+            || h.len() < n_slots * rpe
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots (at least one) at {spc} a column (at least one) over {m} \
+                     columns, sel.len() {}, h.len() {} >= n_slots*rows_per_expert = {}",
+                    a.sel.len(),
+                    h.len(),
+                    n_slots * rpe
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let prep = self
+            .module
+            .prepare_mxfp4_gate_up_sel(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        let (act, limit) = a.rule.code();
+        self.module.mxfp4_gate_up_sel(
+            stream,
+            &prep,
+            a.wg.buf(),
+            a.wu.buf(),
+            &a.act.q4,
+            &a.act.d8,
+            a.sel,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "slots_per_col", spc)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(4))?,
+            act,
+            limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the MXFP4 down `_sel`: slot `s` writes `y[s · rows_per_expert
+    /// ..][..rows_per_expert]` as the rows of expert `sel[s]` dotted with
+    /// column `s` of `a.act` (module doc for [`HOST`] and ids past the stack,
+    /// which raise on `fault`). `a.act` holds at least `n_slots` columns;
+    /// column `slot` is read for `slot < n_slots` and the rest are not
+    /// touched, so a cap-sized activation serves a smaller batch. The family
+    /// sums the slots' rows. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_down(
+        &self,
+        stream: &CudaStream,
+        a: &SelDown<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Mxfp4SelKernels::enqueue_down";
+        let n_sb = a.act.n_sb();
+        let n_experts = stack_experts(what, a.w, n_sb, a.rows_per_expert)?;
+        let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
+        if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
+                     n_slots), an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert = {}",
+                    a.act.m(),
+                    a.sel.len(),
+                    y.len(),
+                    n_slots * rpe
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let prep = self
+            .module
+            .prepare_mxfp4_gemv_sel(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.mxfp4_gemv_sel(
+            stream,
+            &prep,
+            a.w.buf(),
+            &a.act.q4,
+            &a.act.d8,
+            a.sel,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(4))?,
+            fault,
+            y,
         )?;
         Ok(())
     }
