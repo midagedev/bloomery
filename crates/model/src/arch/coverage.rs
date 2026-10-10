@@ -2172,10 +2172,11 @@ mod tests {
     /// rules pass theirs: the rule reads the type alone, and the width the
     /// host cannot fuse is not listed (the card holds a prefix of the experts
     /// and the host serves the rest).
-    // PIN(2026-10-10): the narrow-down case is a q4_K stack, which the common
-    // card leg does not run (`kernels::card_runs`); the MXFP4 stack of the same width
-    // (before this round an item, as every stack the host could not fuse was)
-    // lists nothing, which the last assertion holds.
+    // PIN(2026-10-10): the MXFP4 stack of the same width (before that round an
+    // item, as every stack the host could not fuse was) lists nothing, which
+    // the last assertion holds.
+    // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg, so
+    // the narrow-down case is a q6_K stack, which no card entry runs.
     #[test]
     fn what_the_mimo2_body_does_not_run_is_an_item() {
         let (spec, model) = mimo2_real();
@@ -2200,7 +2201,7 @@ mod tests {
                 t.ty = GgmlType::IQ2_S;
             }
             if t.name == "blk.6.ffn_down_exps.weight" {
-                t.ty = GgmlType::Q4_K;
+                t.ty = GgmlType::Q6_K;
                 t.dims[0] = 2000;
             }
         }
@@ -2213,7 +2214,7 @@ mod tests {
             [
                 "q4_K attention matrices (the body reads q8_0)",
                 "iq2_s routed experts on a card",
-                "q4_K routed experts on a card",
+                "q6_K routed experts on a card",
             ],
             "{items:?}"
         );

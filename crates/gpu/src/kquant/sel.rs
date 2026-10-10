@@ -545,7 +545,9 @@ pub struct SelDown<'a> {
     /// words, `W` the entry's format's super-block words (Q5_K 44, Q8_0 68;
     /// `w.rows()` a positive multiple of `rows_per_expert`).
     pub w: &'a DeviceTensor<u32>,
-    /// One q8_1 column per slot: `act.m() == n_slots`.
+    /// At least `n_slots` q8_1 columns: column `slot` is read for `slot <
+    /// n_slots` and the rest are not touched, so a cap-sized activation serves
+    /// a smaller batch.
     pub act: &'a Q8Act,
     /// At least `n_slots` ids, read on the device at each launch.
     pub sel: &'a DeviceBuffer<u32>,
@@ -656,12 +658,12 @@ fn down_dims(
     let n_sb = a.act.n_sb();
     let n_experts = stack_experts(what, fmt, a.w, n_sb, a.rows_per_expert)?;
     let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
-    if n_slots == 0 || a.act.m() != n_slots || a.sel.len() < n_slots || y_len < n_slots * rpe {
+    if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y_len < n_slots * rpe {
         return Err(GpuError::shape(
             what,
             format!(
-                "{n_slots} slots (at least one): one activation column a slot (act.m() {}), \
-                 an id a slot (sel.len() {}), y.len() {y_len} >= n_slots*rows_per_expert = {}",
+                "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
+                 n_slots), an id a slot (sel.len() {}), y.len() {y_len} >= n_slots*rows_per_expert = {}",
                 a.act.m(),
                 a.sel.len(),
                 n_slots * rpe

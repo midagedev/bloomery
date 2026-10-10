@@ -880,8 +880,10 @@ impl Q4kSelKernels {
     /// stack: one launch computes `n_slots` experts, slot s writing
     /// `y[s*rows_per_expert .. (s+1)*rows_per_expert]` as
     /// `w[sel[s]*rows_per_expert .. +rows_per_expert] · act` column `s`.
-    /// `act` holds exactly `n_slots` quantized columns, one per slot — a
-    /// shared-input (m = 1) `act` is a misuse here. `w` is the full resident
+    /// `act` holds at least `n_slots` quantized columns, one per slot: column
+    /// `s` is read for `s < n_slots` and the rest are not touched, so a
+    /// cap-sized activation serves a smaller batch; a shared-input (m = 1)
+    /// `act` for several slots is a misuse here. `w` is the full resident
     /// stack in `Gpu::enqueue_gemv_q4k`'s row format (`36 * n_sb` u32 words
     /// per row), `w.rows()` a positive multiple of `rows_per_expert`
     /// (`n_experts = w.rows() / rows_per_expert`). `sel` is a device buffer
@@ -907,11 +909,11 @@ impl Q4kSelKernels {
     ) -> Result<(), GpuError> {
         let what = "enqueue_gemv_q4k_sel";
         let n_sb = act.n_sb();
-        if act.m() != n_slots {
+        if act.m() < n_slots {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "one activation column per slot: act.m() = {} must equal \
+                    "an activation column per slot: act.m() = {} must be at least \
                  n_slots = {n_slots}",
                     act.m()
                 ),

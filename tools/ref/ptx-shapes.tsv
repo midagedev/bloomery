@@ -309,12 +309,15 @@ gate_e2e   dflash_expert_down                       0           0
 gate_e2e   dflash_expert_gate_up                    0           0
 gate_e2e   dflash_quantize_q8_1                     0           0
 gate_e2e   down_add_q5_1                            0           0
+gate_e2e   ds41_ffn_card_acc                        0           0
+gate_e2e   ds41_ffn_card_acc_8                      0           0
 gate_e2e   ds41_ffn_handoff                         0           0
 gate_e2e   ds41_ffn_handoff_10                      0           0
 gate_e2e   ds41_ffn_handoff_10_cols                 0           0
 gate_e2e   ds41_ffn_handoff_10_cols_tier            0           0
 gate_e2e   ds41_ffn_handoff_8                       0           0
 gate_e2e   ds41_ffn_handoff_8_tier                  0           0
+gate_e2e   ds41_ffn_places                          0           0
 gate_e2e   ds41_ffn_places_10_cols                  0           0
 gate_e2e   embed_rows                               0           0
 gate_e2e   embed_rows_q3k                           0           0

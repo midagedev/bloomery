@@ -104,9 +104,12 @@ use crate::transpose::TransposeKernels;
 mod batch;
 mod tier;
 pub use batch::{
-    BatchLayer, BlockIo, CardAcc, CardAccTier, CardGather, ChunkIo, FfnBatch, FfnBatchKernels,
-    JoinIo, Places, TiledGateUp,
+    BatchLayer, BlockIo, CardAccTier, CardGather, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo,
+    TiledGateUp,
 };
+// The card half of the combine, and the places and sum launches the common
+// card slots own (`bloomery_gpu::card_slots`).
+pub use bloomery_gpu::card_slots::{CardAcc, Places, card_sum_elem};
 pub use tier::{Ds41Tier, STAGE_TIER, TierPiece};
 
 /// What the enqueue path's errors name.
@@ -147,21 +150,6 @@ pub fn combine_elem(
     shexp: f32,
 ) -> f32 {
     join_elem(card_sum_elem(down, w, card), hsum, shexp)
-}
-
-/// The combine's card half: `acc = fma(down_j, w_j, acc)` from zero for each
-/// slot `j` whose place is on the card, in slot order.
-#[inline(always)]
-pub fn card_sum_elem(down: [f32; N_USED], w: [f32; N_USED], card: [bool; N_USED]) -> f32 {
-    let mut acc = 0.0f32;
-    let mut j = 0usize;
-    while j < N_USED {
-        if card[j] {
-            acc = down[j].mul_add(w[j], acc);
-        }
-        j += 1;
-    }
-    acc
 }
 
 /// The combine's join: the card sum, then the host's, then the shared

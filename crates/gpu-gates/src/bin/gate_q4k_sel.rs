@@ -17,8 +17,10 @@
 //! bit-identical rerun; the in-graph replay following ids overwritten
 //! between replays; an id past the stack that raises the named fault
 //! (`FaultSite::ExpertId`) and a host-served slot (`hybrid::HOST`) that
-//! raises nothing, both leaving their slots untouched; and the host
-//! contract's refusals. A
+//! raises nothing, both leaving their slots untouched; the host contract's
+//! refusals (an activation of fewer columns than slots among them); and an
+//! activation of twice the slots' columns, which serves the launch with the
+//! same rows bit for bit. A
 //! failing check names its first mismatch — slot, row, both bit patterns.
 //!
 //! Then the card slots' quantizer (`enqueue_quantize_sel`) over columns
@@ -170,6 +172,9 @@ fn run() -> Result<(), GateError> {
     // 4. The host contract, on a 2048-row stack.
     ok &= check_host_contract(&gpu, &a)?;
 
+    // 4b. An activation of more columns than slots serves the launch.
+    ok &= check_wider_act(&gpu, &mut a)?;
+
     // 5. The card slots' quantizer, read back through the `_sel` down.
     ok &= check_quantize_sel(&gpu, &a)?;
 
@@ -184,7 +189,8 @@ fn run() -> Result<(), GateError> {
          alone (K = 2048, 2816, 2304); graph replay follows ids overwritten between replays; \
          an id past the stack raises expert_id, a host slot raises nothing, both leave their \
          slots untouched; host contract refuses \
-         a shared-input act and a non-dividing rows_per_expert; the card slots' quantizer \
+         an act of fewer columns than slots and a non-dividing rows_per_expert, and takes an act \
+         of more columns than slots bit for bit; the card slots' quantizer \
          writes the plain quantizer's bytes into card columns alone; the tile table is the \
          host's cut of runs of 0..237 slots, the tiled down over it is the _sel down bit for \
          bit, and both raise expert_id on a table they cannot read"
@@ -470,7 +476,8 @@ fn oor_case(
 
 /// Check 4: the launcher refuses, as a `Shape` error of its own, two
 /// misuses the kernel's launch contract either reports as a different error
-/// or misses: a one-column (shared-input) act for six slots, and a
+/// or misses: an act of fewer columns than slots (one, shared-input, or five
+/// for six slots), and a
 /// `rows_per_expert` that does not divide the stack's rows (100 on 2048 —
 /// twenty such experts fit in the buffer, so the contract alone would
 /// launch it on a wrong split).
@@ -480,11 +487,17 @@ fn check_host_contract(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
     let sel_dev = DeviceBuffer::from_host(stream, &SEL_A)?;
     let mut y = st.sentinel_y(gpu)?;
     let one_col = Q8Act::with_k(stream, 1, st.k)?;
+    let short = Q8Act::with_k(stream, N_SLOTS - 1, st.k)?;
     let cases = [
         (
             "act_m1_n_slots6",
             gpu.q4k_sel()
                 .enqueue_gemv_q4k_sel(stream, &st.w, &one_col, &sel_dev, N_SLOTS, st.rpe, &mut y),
+        ),
+        (
+            "act_m5_n_slots6",
+            gpu.q4k_sel()
+                .enqueue_gemv_q4k_sel(stream, &st.w, &short, &sel_dev, N_SLOTS, st.rpe, &mut y),
         ),
         (
             "rows_per_expert100_rows2048",
@@ -513,6 +526,54 @@ fn check_host_contract(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
         ok &= pass;
     }
     Ok(ok)
+}
+
+/// Check 4b: an activation of more columns than slots serves a launch of
+/// `N_SLOTS` slots — `2 · N_SLOTS` columns whose first `N_SLOTS` are the
+/// stack's own and whose rest no slot reads — so a cap-sized activation
+/// serves a smaller batch. Every slot is bit-identical to its reference, the
+/// same bytes the exact-width launch writes.
+#[cfg(feature = "gpu")]
+fn check_wider_act(gpu: &Gpu, st: &mut Stack) -> Result<bool, GateError> {
+    let stream = gpu.stream();
+    let sel_dev = DeviceBuffer::from_host(stream, &SEL_A)?;
+    /// The seed of the columns past the stack's own.
+    const SEED_EXTRA: u32 = 6419;
+    let mut x = st.x.clone();
+    x.extend(activations(st.k, N_SLOTS, SEED_EXTRA));
+    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+    let mut wide = Q8Act::with_slots(stream, 2 * N_SLOTS, st.k)?;
+    gpu.enqueue_quantize_q8_1(&x_dev, &mut wide)?;
+    let mut y = st.sentinel_y(gpu)?;
+    let launched = gpu
+        .q4k_sel()
+        .enqueue_gemv_q4k_sel(stream, &st.w, &wide, &sel_dev, N_SLOTS, st.rpe, &mut y);
+    let mut pass = launched.is_ok();
+    let seen = match &launched {
+        Ok(()) => "Ok".to_owned(),
+        Err(e) => format!("Err: {e}"),
+    };
+    if pass {
+        stream.synchronize()?;
+        let got = y.to_host_vec(stream)?;
+        let want = st.expected(gpu, &SEL_A)?;
+        pass = bits_equal(&got, &want);
+        println!(
+            "q4k_wide[{}] cols={} slots={N_SLOTS} slots_bit_identical={pass} {}{}",
+            st.tag,
+            wide.m(),
+            verdict(pass),
+            mismatch("first_mismatch", &got, &want, st.rpe),
+        );
+    } else {
+        println!(
+            "q4k_wide[{}] cols={} slots={N_SLOTS} launch={seen} {}",
+            st.tag,
+            wide.m(),
+            verdict(false)
+        );
+    }
+    Ok(pass)
 }
 
 /// The table a bucket pass writes for `sel`: every slot whose id is below

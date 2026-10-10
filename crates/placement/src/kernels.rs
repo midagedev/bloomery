@@ -442,20 +442,44 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
     }
 }
 
-/// Whether the common card leg (`crates/gpu/src/card_leg.rs`) runs a routed
-/// stack of `ty`: the type's gate·up and down rows are ones the leg launches
-/// over an activation of more columns than a run uses. Q4_K and Q5_K's down
-/// launchers read exactly one column a slot, so their rows are not here until
-/// the leg's callers move onto it.
+/// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the
+/// gate·up entry of a routed gate or up stack of type `ty`: the table's
+/// [`gate_up`] row, for the entries whose launchers read a `Q8Act` of more
+/// columns than a run uses. The IQ3_XXS, IQ4_XS and Q8_0 rows have a launcher
+/// of that shape and no arm in the leg yet.
+#[must_use]
+pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
+    matches!(
+        gate_up(ty),
+        Some(GateUpEntry::Q4k | GateUpEntry::Q5k | GateUpEntry::Mxfp4)
+    )
+}
+
+/// Whether the common card leg launches the down entry of a routed down stack
+/// of type `ty`: the table's [`down`] row, for the entries that read the
+/// 128-value [`DownAct::Q8Act`] the leg quantizes and take an activation of
+/// more columns than a run uses. The Q6_K launcher still reads exactly one
+/// column a slot; the Q5_0, Q5_1, Q8_0 and IQ4_NL rows read [`DownAct::Q8Blocks32`].
+#[must_use]
+pub const fn card_down_runs(ty: GgmlType) -> bool {
+    matches!(
+        down(ty),
+        Some((
+            DownEntry::Q4k | DownEntry::Q5k | DownEntry::Mxfp4,
+            DownAct::Q8Act
+        ))
+    )
+}
+
+/// Whether the common card leg runs a routed stack of `ty` in any of the three
+/// roles: the gate·up and the down rows both have launches the leg runs
+/// ([`card_gate_up_runs`], [`card_down_runs`]). A plan reads a stack's type
+/// alone, so a stack is a card stack when its type runs in every role; the leg
+/// itself checks each role by its own rule ([`card_gate_up_runs`] for a gate or
+/// up stack, [`card_down_runs`] for a down stack).
 #[must_use]
 pub const fn card_runs(ty: GgmlType) -> bool {
-    matches!(
-        (gate_up(ty), down(ty)),
-        (
-            Some(GateUpEntry::Mxfp4),
-            Some((DownEntry::Mxfp4, DownAct::Q8Act))
-        )
-    )
+    card_gate_up_runs(ty) && card_down_runs(ty)
 }
 
 #[cfg(test)]
@@ -699,10 +723,31 @@ mod tests {
     #[test]
     fn card_runs_admits_exactly_the_pinned_types() {
         let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_runs(ty)).collect();
-        assert_eq!(runs, [GgmlType::MXFP4]);
+        assert_eq!(runs, [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::MXFP4]);
         for ty in runs {
             assert!(gate_up(ty).is_some() && down(ty).is_some(), "{ty:?}");
         }
+    }
+
+    /// The leg checks each role by its own rule: the sets coincide today, and a
+    /// type whose table row the leg has no arm for is in neither (the i-quant
+    /// and Q8_0 gate·up rows, the Q6_K down row).
+    #[test]
+    fn the_leg_admits_each_role_by_its_own_rule() {
+        let gate_up_runs: Vec<GgmlType> = ALL
+            .into_iter()
+            .filter(|&ty| card_gate_up_runs(ty))
+            .collect();
+        let down_runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_down_runs(ty)).collect();
+        assert_eq!(
+            gate_up_runs,
+            [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::MXFP4]
+        );
+        assert_eq!(down_runs, [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::MXFP4]);
+        for ty in [GgmlType::IQ3_XXS, GgmlType::IQ4_XS, GgmlType::Q8_0] {
+            assert!(gate_up(ty).is_some() && !card_gate_up_runs(ty), "{ty:?}");
+        }
+        assert!(down(GgmlType::Q6_K).is_some() && !card_down_runs(GgmlType::Q6_K));
     }
 
     /// A type id the enum does not name has no row in any operation.

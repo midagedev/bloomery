@@ -8,15 +8,15 @@
 //!   `_sel` with the routed SwiGLU (slot `s` against column `s / N_USED`), the
 //!   q8_1 of the card slots' `h` columns (the host's slots are left alone) and
 //!   the down `_sel`;
-//! - the card slots' weighted sum, a token's slots in slot order
-//!   (`FfnBatchKernels::enqueue_card_acc`);
+//! - the card slots' weighted sum, a token's slots in slot order (the leg's
+//!   sum stage, `card_slots`);
 //! - the sum plus the residual after the attention, the `pre` the layer's back
 //!   adds the host's sum to.
 //!
 //! The one-token step is the run at `m = 1`, its places written by the
 //! handoff; a prompt batch is the run at `m = t`, one launch each over the
 //! batch's `t · N_USED` slots, its places written by one launch
-//! (`FfnBatchKernels::enqueue_places`). Each slot's rows are what the step's
+//! (`CardSlotKernels::enqueue_places`). Each slot's rows are what the step's
 //! launches write for it, whatever `m`, so the two feeds leave the same bits.
 //!
 //! MiMo facts that fix this file: the routed block has no shared expert, so
@@ -24,12 +24,12 @@
 //! to `acc + x1`; the routed SwiGLU is the description's limit (0: plain);
 //! no expert tier hangs on these experts.
 
-use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, leg_bytes};
+use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, leg_bytes};
+use bloomery_gpu::card_slots::{CardSlotKernels, Places};
 use bloomery_gpu::hybrid::SlotMap;
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
-use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, FfnBatchKernels, Places};
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::mimo2::names;
@@ -38,10 +38,11 @@ use models::{Ffn, LayerSpec};
 /// What the card experts' errors name.
 const CARD: &str = "mimo2 CardExperts";
 
-/// The kernels a run launches: the card leg's, and the sums'.
+/// The kernels a run launches: the card leg's (its sum stage included), and
+/// the places' of a prompt batch.
 struct CardKernels {
     leg: CardLeg,
-    batch: FfnBatchKernels,
+    places: CardSlotKernels,
 }
 
 /// The card leg's shape for runs of up to `cap` tokens of `n` values through
@@ -244,7 +245,7 @@ impl CardExperts {
         Ok(CardExperts {
             k: CardKernels {
                 leg: CardLeg::load(gpu)?,
-                batch: FfnBatchKernels::load(gpu.context())?,
+                places: CardSlotKernels::load(gpu.context())?,
             },
             layers: per,
             ff,
@@ -325,7 +326,7 @@ impl CardExperts {
                 detail: format!("a batch of {} tokens in buffers of {}", io.m, cb.bufs.cap()),
             });
         }
-        self.k.batch.enqueue_places(
+        self.k.places.enqueue_places(
             gpu.stream(),
             &Places {
                 ids,
@@ -370,18 +371,12 @@ impl CardKernels {
             n_card: layer.n_card,
             rule,
         };
-        self.leg.enqueue(gpu, &mut bufs.leg, &run)?;
-        let stream = gpu.stream();
-        let acc = CardAcc {
-            down: bufs.leg.down(),
+        let sum = LegSum {
             w: io.weights,
-            sel,
-            n,
-            m: io.m,
-            n_card: layer.n_card,
-            n_used: N_USED,
+            acc: &mut bufs.acc,
         };
-        self.batch.enqueue_card_acc(stream, &acc, &mut bufs.acc)?;
+        self.leg.enqueue(gpu, &mut bufs.leg, &run, Some(sum))?;
+        let stream = gpu.stream();
         gpu.elem()
             .enqueue_add(stream, &bufs.acc, io.x1, io.m * n, &mut bufs.pre)
     }

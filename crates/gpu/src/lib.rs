@@ -32,6 +32,7 @@ pub mod arch;
 pub mod cand;
 pub mod capsync;
 pub mod card_leg;
+pub mod card_slots;
 pub mod checkpoint;
 pub mod cores;
 pub mod elem;
