@@ -50,12 +50,14 @@ use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use vision::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 
 use crate::engine::{
-    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Sampler,
-    SavedState, SlotPass, StateError, Tokenizer,
+    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight, Landed, Pending,
+    ResidencyReset, Sampler, Saved, SavedState, SlotPass, StateError, Tokenizer, resume_bytes,
+    snapshot_bytes,
 };
 use crate::media::{MediaFeed, MediaSpan, SharedMediaModel};
 use crate::slotfile;
@@ -105,6 +107,85 @@ pub struct MockEngine {
     /// The log of its image calls, when it takes images
     /// ([`MockEngine::with_media`]).
     media: Option<Arc<Mutex<Vec<MediaCall>>>>,
+    /// Its saves, when it copies its states off the request path and puts a
+    /// prefix back ([`MockEngine::with_async_snapshots`]).
+    saves: Option<AsyncSaves>,
+}
+
+/// The mock's copy stream: how long a copy takes, what the engine saw, and
+/// each slot's copy that may still run.
+struct AsyncSaves {
+    copy: Duration,
+    stats: Arc<SaveStats>,
+    /// Each slot's latest copy, begun through `&self`.
+    flights: Mutex<Vec<Option<Arc<MockFlight>>>>,
+}
+
+/// The mock's state under [`MockEngine::with_async_snapshots`]: its context.
+struct MockSaved {
+    ctx: Vec<u32>,
+}
+
+impl Saved for MockSaved {
+    fn n_tokens(&self) -> usize {
+        self.ctx.len()
+    }
+
+    fn n_bytes(&self) -> u64 {
+        MOCK_STATE_HEAD + 4 * self.ctx.len() as u64
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        n.min(self.ctx.len())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// What a mock of [`MockEngine::with_async_snapshots`] saw.
+#[derive(Debug, Default)]
+pub struct SaveStats {
+    /// Snapshots taken on the request path ([`Engine::snapshot`]).
+    pub sync_snapshots: AtomicUsize,
+    /// Copies begun ([`Engine::snapshot_begin`]).
+    pub begun: AtomicUsize,
+    /// Calls that cut, reset or replaced a slot's rows while its copy still
+    /// ran: the copy would have read rows another call rewrote.
+    pub hazards: AtomicUsize,
+    /// Positions [`Engine::resume_prefix`] put back, in all.
+    pub resumed: AtomicUsize,
+    /// States put back whole ([`Engine::resume`]).
+    pub whole_resumes: AtomicUsize,
+}
+
+/// A copy that lands `copy` after it begins.
+struct MockFlight {
+    done_at: Instant,
+    copy: Duration,
+}
+
+impl MockFlight {
+    fn landed(&self) -> Landed {
+        Landed {
+            copy_ms: self.copy.as_secs_f64() * 1e3,
+            calls: 1,
+            alloc_ms: 0.0,
+        }
+    }
+}
+
+impl Flight for MockFlight {
+    fn poll(&self) -> Result<Option<Landed>, StateError> {
+        Ok((Instant::now() >= self.done_at).then(|| self.landed()))
+    }
+
+    fn wait(&self) -> Result<Landed, StateError> {
+        let left = self.done_at.saturating_duration_since(Instant::now());
+        std::thread::sleep(left);
+        Ok(self.landed())
+    }
 }
 
 impl MockEngine {
@@ -123,6 +204,7 @@ impl MockEngine {
             cache_ram: 0,
             prompt_quantum: None,
             media: None,
+            saves: None,
         }
     }
 
@@ -154,6 +236,10 @@ impl MockEngine {
     #[must_use]
     pub fn with_slots(self, n: usize) -> Self {
         assert!(n > 0, "a mock of no slots");
+        assert!(
+            self.saves.is_none(),
+            "a mock's slots are set before its async snapshots"
+        );
         MockEngine {
             parked: vec![Vec::new(); n],
             ..self
@@ -185,6 +271,37 @@ impl MockEngine {
         MockEngine {
             prompt_quantum: NonZeroUsize::new(quantum),
             ..self
+        }
+    }
+
+    /// The same mock copying its states on a stream of its own that takes
+    /// `copy` a state ([`Engine::snapshots_async`]), and putting back only
+    /// the prefix a request keeps ([`Engine::resume_prefix`]); what it saw
+    /// is in the returned [`SaveStats`]. A call that cuts, resets or replaces
+    /// a slot's rows while the slot's copy still runs counts a hazard.
+    #[must_use]
+    pub fn with_async_snapshots(self, copy: Duration) -> (Self, Arc<SaveStats>) {
+        let stats = Arc::new(SaveStats::default());
+        let flights = Mutex::new(vec![None; self.parked.len()]);
+        let mock = MockEngine {
+            saves: Some(AsyncSaves {
+                copy,
+                stats: Arc::clone(&stats),
+                flights,
+            }),
+            ..self
+        };
+        (mock, stats)
+    }
+
+    /// Counts a hazard when the selected slot's copy still runs.
+    fn rewrites(&self) {
+        let Some(saves) = &self.saves else { return };
+        let running = saves.flights.lock().expect("the mock's flights")[self.cur]
+            .as_ref()
+            .is_some_and(|f| Instant::now() < f.done_at);
+        if running {
+            saves.stats.hazards.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -382,6 +499,7 @@ impl Engine for MockEngine {
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {
+        self.rewrites();
         self.ctx.clear();
         Ok(())
     }
@@ -391,6 +509,7 @@ impl Engine for MockEngine {
     }
 
     fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.rewrites();
         if n > self.ctx.len() {
             return Err(EngineError(format!(
                 "mock: cut to {n} with {} positions held",
@@ -449,6 +568,69 @@ impl Engine for MockEngine {
             version_note: Some("mock".to_owned()),
             ..EngineProps::default()
         }
+    }
+
+    fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+        let Some(saves) = &self.saves else {
+            return snapshot_bytes(self);
+        };
+        saves.stats.sync_snapshots.fetch_add(1, Ordering::SeqCst);
+        // A snapshot on the request path costs the copy's time.
+        std::thread::sleep(saves.copy);
+        Ok(Arc::new(MockSaved {
+            ctx: self.ctx.clone(),
+        }))
+    }
+
+    fn snapshots_async(&self) -> bool {
+        self.saves.is_some()
+    }
+
+    /// The state as [`Engine::snapshot`] takes it, whose copy lands `copy`
+    /// later; until then a cut, a reset or a resume of its slot is a hazard.
+    fn snapshot_begin(&self) -> Result<Pending, StateError> {
+        let Some(saves) = &self.saves else {
+            return Ok(Pending::landed(self.snapshot()?));
+        };
+        saves.stats.begun.fetch_add(1, Ordering::SeqCst);
+        let flight = Arc::new(MockFlight {
+            done_at: Instant::now() + saves.copy,
+            copy: saves.copy,
+        });
+        saves.flights.lock().expect("the mock's flights")[self.cur] = Some(Arc::clone(&flight));
+        let state: Arc<dyn Saved> = Arc::new(MockSaved {
+            ctx: self.ctx.clone(),
+        });
+        Ok(Pending::new(state, flight))
+    }
+
+    fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+        let Some(saves) = &self.saves else {
+            return resume_bytes(self, state);
+        };
+        saves.stats.whole_resumes.fetch_add(1, Ordering::SeqCst);
+        self.resume_prefix(state, usize::MAX).map(|_| ())
+    }
+
+    /// The first `n` positions of the state: only those are put back.
+    fn resume_prefix(&mut self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
+        if self.saves.is_none() {
+            self.resume(state)?;
+            return Ok(state.n_tokens());
+        }
+        let Some(saved) = state.as_any().downcast_ref::<MockSaved>() else {
+            return Err(StateError::Format(
+                "a saved state this engine did not take".to_owned(),
+            ));
+        };
+        self.rewrites();
+        let kept = n.min(saved.ctx.len());
+        self.ctx.clear();
+        self.ctx.extend_from_slice(&saved.ctx[..kept]);
+        if let Some(saves) = &self.saves {
+            saves.stats.resumed.fetch_add(kept, Ordering::SeqCst);
+        }
+        Ok(kept)
     }
 
     fn save_state(&self, out: &mut dyn Write) -> Result<SavedState, StateError> {

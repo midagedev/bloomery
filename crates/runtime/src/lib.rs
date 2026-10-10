@@ -30,6 +30,7 @@ pub mod layer;
 mod lookup;
 pub mod prompt;
 pub mod qsa;
+pub mod savemap;
 pub mod sched;
 pub mod seqstate;
 mod speculative;

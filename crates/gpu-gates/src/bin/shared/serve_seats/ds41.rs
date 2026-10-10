@@ -1567,12 +1567,28 @@ impl Seat for V41 {
                 entries,
                 cache_bytes,
                 copied: _,
+                off_path,
             } => Record::new(&record::CACHE_SAVE)
                 .u("positions", positions)
                 .u("bytes", bytes)
                 .f("ms", *ms)
                 .u("entries", entries)
-                .u("cache_bytes", cache_bytes),
+                .u("cache_bytes", cache_bytes)
+                .w("off_path", off_path),
+            CacheNote::Landed {
+                positions,
+                bytes,
+                calls,
+                copy_ms,
+                alloc_ms,
+                waited_ms,
+            } => Record::new(&record::CACHE_LANDED)
+                .u("positions", positions)
+                .u("bytes", bytes)
+                .u("calls", calls)
+                .f("copy_ms", *copy_ms)
+                .f("alloc_ms", *alloc_ms)
+                .f("waited_ms", *waited_ms),
             CacheNote::Load {
                 positions,
                 common,
@@ -1580,13 +1596,17 @@ impl Seat for V41 {
                 slot_kept,
                 bytes,
                 ms,
+                resumed,
+                waited_ms,
             } => Record::new(&record::CACHE_LOAD)
                 .u("positions", positions)
                 .u("common", common)
                 .u("kept", kept)
                 .u("slot_kept", slot_kept)
                 .u("bytes", bytes)
-                .f("ms", *ms),
+                .f("ms", *ms)
+                .u("resumed", resumed)
+                .f("waited_ms", *waited_ms),
             CacheNote::Evict {
                 positions,
                 bytes,

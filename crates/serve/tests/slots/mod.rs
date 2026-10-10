@@ -18,6 +18,7 @@
 //! idle states the turns stop parking taken into it too. A prompt run a call a
 //! round beside the decoding slots is [`yields`]'s.
 
+mod kvsave;
 mod yields;
 
 use std::io::{Read, Write};
