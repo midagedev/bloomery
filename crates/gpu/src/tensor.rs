@@ -4,6 +4,7 @@
 //! replay against fixed addresses).
 
 use crate::GpuError;
+use crate::graph::cu;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, sys};
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, align_of, size_of};
@@ -173,6 +174,168 @@ fn cut<T, P>(
     // constructors tie the window to `parent`'s borrow, so the parent stays
     // in place until the window is gone.
     Ok(unsafe { window::<T>(parent.cu_deviceptr() + off, len, parent.context()) })
+}
+
+/// The geometry of one 2-D copy between a device buffer and host memory:
+/// `rows` runs of `width` bytes, the device's `dev_pitch` bytes apart and the
+/// host's `host_pitch` bytes apart. A strided store (the planes of a KV
+/// cache) moves as one call instead of one a plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pitched {
+    pub width: usize,
+    pub rows: usize,
+    pub dev_pitch: usize,
+    pub host_pitch: usize,
+}
+
+impl Pitched {
+    /// The bytes a side spans, its first byte to its last: the rows' pitch
+    /// times all but the last, and the last's width.
+    fn span(&self, pitch: usize) -> Option<usize> {
+        self.rows
+            .checked_sub(1)?
+            .checked_mul(pitch)?
+            .checked_add(self.width)
+    }
+
+    /// Refused by name unless the copy moves something, the rows do not
+    /// overlap, and both spans lie inside the `dev_len` bytes of the device
+    /// buffer past `dev_off` and the `host_len` bytes of the host's.
+    fn check(
+        &self,
+        what: &'static str,
+        dev_off: usize,
+        dev_len: usize,
+        host_len: usize,
+    ) -> Result<(), GpuError> {
+        let refuse = |detail: String| GpuError::Shape { what, detail };
+        if self.width == 0 || self.rows == 0 {
+            return Err(refuse(format!(
+                "{} rows of {} bytes",
+                self.rows, self.width
+            )));
+        }
+        if self.rows > 1 && (self.dev_pitch < self.width || self.host_pitch < self.width) {
+            return Err(refuse(format!(
+                "{} rows of {} bytes at pitches of {} (device) and {} (host) overlap",
+                self.rows, self.width, self.dev_pitch, self.host_pitch
+            )));
+        }
+        let dev_span = self.span(self.dev_pitch);
+        let host_span = self.span(self.host_pitch);
+        let dev_end = dev_span.and_then(|d| d.checked_add(dev_off));
+        if dev_end.is_none_or(|e| e > dev_len) || host_span.is_none_or(|h| h > host_len) {
+            return Err(refuse(format!(
+                "{} rows of {} bytes (device pitch {}, host pitch {}) from byte {dev_off} of a \
+                 {dev_len}-byte buffer into {host_len} host bytes",
+                self.rows, self.width, self.dev_pitch, self.host_pitch
+            )));
+        }
+        Ok(())
+    }
+
+    /// The driver's descriptor of the copy. Device to host when `to_host`.
+    fn descriptor(
+        &self,
+        dev: sys::CUdeviceptr,
+        host: *mut u8,
+        to_host: bool,
+    ) -> sys::CUDA_MEMCPY2D {
+        let device = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+        let on_host = sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
+        sys::CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: if to_host { device } else { on_host },
+            srcHost: if to_host {
+                std::ptr::null()
+            } else {
+                host.cast_const().cast()
+            },
+            srcDevice: if to_host { dev } else { 0 },
+            srcArray: std::ptr::null_mut(),
+            srcPitch: if to_host {
+                self.dev_pitch
+            } else {
+                self.host_pitch
+            },
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: if to_host { on_host } else { device },
+            dstHost: if to_host {
+                host.cast()
+            } else {
+                std::ptr::null_mut()
+            },
+            dstDevice: if to_host { 0 } else { dev },
+            dstArray: std::ptr::null_mut(),
+            dstPitch: if to_host {
+                self.host_pitch
+            } else {
+                self.dev_pitch
+            },
+            WidthInBytes: self.width,
+            Height: self.rows,
+        }
+    }
+}
+
+/// Enqueue the 2-D copy `shape` from `dev` (from byte `dev_off`) to the host
+/// memory at `host`, `host_len` bytes of it: one call for a strided store.
+/// Refused by name, nothing enqueued, when either span leaves its buffer.
+///
+/// # Safety
+///
+/// - `host .. host + host_len` must be page-locked memory of `dev`'s context
+///   (a pinned buffer or an extent of one) and writable.
+/// - Nothing may read, write or free it until the copy has completed: an
+///   event recorded on `stream` after this call and waited for, or a
+///   synchronize of `stream`.
+pub unsafe fn dtoh_2d<D>(
+    stream: &CudaStream,
+    dev: &DeviceBuffer<D>,
+    dev_off: usize,
+    host: *mut u8,
+    host_len: usize,
+    shape: Pitched,
+) -> Result<(), GpuError> {
+    shape.check("dtoh_2d", dev_off, dev.num_bytes(), host_len)?;
+    let at = dev.cu_deviceptr() + dev_off as u64;
+    let copy = shape.descriptor(at, host, true);
+    // SAFETY: both spans lie inside their buffers (checked above); the
+    // descriptor is read at the call; the host side's contract is the
+    // caller's.
+    let rc = unsafe { sys::cuMemcpy2DAsync_v2(&raw const copy, stream.cu_stream()) };
+    cu(rc, "cuMemcpy2DAsync_v2 (device to host)")
+}
+
+/// Enqueue the 2-D copy `shape` from the host memory at `host`, `host_len`
+/// bytes of it, to `dev` (from byte `dev_off`): one call for a strided store.
+/// Refused by name, nothing enqueued, when either span leaves its buffer.
+///
+/// # Safety
+///
+/// - `host .. host + host_len` must be readable.
+/// - It must not be written or freed until the copy has completed: a
+///   synchronize of `stream`, or an event recorded on it after this call and
+///   waited for. (A pageable source is copied out by the driver before the
+///   call returns, but the caller does not rely on it.)
+pub unsafe fn htod_2d<D>(
+    stream: &CudaStream,
+    dev: &mut DeviceBuffer<D>,
+    dev_off: usize,
+    host: *const u8,
+    host_len: usize,
+    shape: Pitched,
+) -> Result<(), GpuError> {
+    shape.check("htod_2d", dev_off, dev.num_bytes(), host_len)?;
+    let at = dev.cu_deviceptr() + dev_off as u64;
+    let copy = shape.descriptor(at, host.cast_mut(), false);
+    // SAFETY: both spans lie inside their buffers (checked above); the
+    // descriptor is read at the call; the host side's contract is the
+    // caller's.
+    let rc = unsafe { sys::cuMemcpy2DAsync_v2(&raw const copy, stream.cu_stream()) };
+    cu(rc, "cuMemcpy2DAsync_v2 (host to device)")
 }
 
 /// One device allocation cut into `N` consecutive parts, each of which the
@@ -581,6 +744,154 @@ mod tests {
                 && msg.contains(&format!("rows {}", usize::MAX))
                 && msg.contains("cols 2"),
             "the panic names the constructor and both values: {msg}"
+        );
+    }
+
+    /// Four planes of 64 `u16` (a stride of 128 bytes) with the first 20 of
+    /// each carried: one 2-D copy moves the bytes four plane-by-plane copies
+    /// move (planes × width, packed at the host's pitch), and its way back
+    /// writes those bytes and not one byte of the gap past a plane's width.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_2d_copy_moves_the_bytes_of_the_planes_one_by_one() {
+        const PLANES: usize = 4;
+        const STRIDE: usize = 64;
+        const LEN: usize = 20;
+        const GAP: u16 = 0xDEAD;
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let on_card: Vec<u16> = (0..PLANES * STRIDE).map(|i| i as u16 + 1).collect();
+        let dev = DeviceBuffer::from_host(&stream, &on_card).expect("the device store");
+        let width = LEN * 2;
+        let shape = Pitched {
+            width,
+            rows: PLANES,
+            dev_pitch: STRIDE * 2,
+            host_pitch: width,
+        };
+        let mut pin =
+            cuda_core::PinnedHostBuffer::<u8>::zeroed(&ctx, PLANES * width).expect("pinned");
+        let len = pin.len();
+        // SAFETY: `pin` is page-locked memory of the device's context, `len`
+        // bytes of it; nothing touches it before the synchronize below.
+        unsafe { dtoh_2d(&stream, &dev, 0, pin.as_mut_ptr(), len, shape) }.expect("a 2-D read");
+        stream.synchronize().expect("the read lands");
+        // The plane-by-plane bytes, worked out from the values.
+        let by_plane: Vec<u8> = (0..PLANES)
+            .flat_map(|p| {
+                on_card[p * STRIDE..p * STRIDE + LEN]
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+            })
+            .collect();
+        assert_eq!(pin.as_slice().len(), PLANES * width, "the bytes moved");
+        assert_eq!(
+            pin.as_slice(),
+            &by_plane[..],
+            "the bytes of the planes, one by one"
+        );
+        let mut back = DeviceBuffer::from_host(&stream, &vec![GAP; PLANES * STRIDE])
+            .expect("a poisoned store");
+        // SAFETY: `pin` holds `len` readable bytes and is neither written nor
+        // freed before the synchronize below.
+        unsafe { htod_2d(&stream, &mut back, 0, pin.as_ptr(), len, shape) }.expect("a 2-D write");
+        stream.synchronize().expect("the write lands");
+        let got = back.to_host_vec(&stream).expect("the store");
+        for p in 0..PLANES {
+            let plane = &got[p * STRIDE..(p + 1) * STRIDE];
+            assert_eq!(
+                &plane[..LEN],
+                &on_card[p * STRIDE..p * STRIDE + LEN],
+                "plane {p}"
+            );
+            assert!(
+                plane[LEN..].iter().all(|&v| v == GAP),
+                "plane {p} written past its width"
+            );
+        }
+        // From a byte offset: the last two planes only.
+        let mut tail = cuda_core::PinnedHostBuffer::<u8>::zeroed(&ctx, 2 * width).expect("pinned");
+        let (tail_len, shape) = (tail.len(), Pitched { rows: 2, ..shape });
+        // SAFETY: as the first read, into `tail`.
+        unsafe {
+            dtoh_2d(
+                &stream,
+                &dev,
+                2 * STRIDE * 2,
+                tail.as_mut_ptr(),
+                tail_len,
+                shape,
+            )
+        }
+        .expect("a 2-D read from an offset");
+        stream.synchronize().expect("the read lands");
+        assert_eq!(tail.as_slice(), &by_plane[2 * width..], "planes 2 and 3");
+    }
+
+    /// A 2-D copy leaves by name, with nothing enqueued, when a side's span
+    /// leaves its buffer, when the rows overlap, when it moves nothing, or when
+    /// the span's arithmetic wraps; it takes a single row at any pitch.
+    #[test]
+    fn a_2d_copy_refuses_by_name_what_leaves_its_buffers() {
+        let shape = Pitched {
+            width: 40,
+            rows: 4,
+            dev_pitch: 128,
+            host_pitch: 40,
+        };
+        // 3 pitches and the last row's width: 424 device bytes, 160 host bytes.
+        assert!(shape.check("t", 0, 424, 160).is_ok());
+        for (dev_off, dev_len, host_len, why) in [
+            (0, 423, 160, "a device span one byte short"),
+            (1, 424, 160, "an offset past the device's end"),
+            (0, 424, 159, "a host span one byte short"),
+        ] {
+            let err = shape.check("t", dev_off, dev_len, host_len).expect_err(why);
+            assert!(
+                err.to_string().starts_with("t: ") && err.to_string().contains("pitch"),
+                "{why}: {err}"
+            );
+        }
+        for (shape, why) in [
+            (Pitched { rows: 0, ..shape }, "no rows"),
+            (Pitched { width: 0, ..shape }, "no width"),
+            (
+                Pitched {
+                    dev_pitch: 32,
+                    ..shape
+                },
+                "device rows overlap",
+            ),
+            (
+                Pitched {
+                    host_pitch: 32,
+                    ..shape
+                },
+                "host rows overlap",
+            ),
+            (
+                Pitched {
+                    rows: usize::MAX,
+                    dev_pitch: 2,
+                    host_pitch: 2,
+                    ..shape
+                },
+                "a span that wraps",
+            ),
+        ] {
+            assert!(
+                shape.check("t", 0, usize::MAX, usize::MAX).is_err(),
+                "{why}"
+            );
+        }
+        let one = Pitched {
+            rows: 1,
+            dev_pitch: 0,
+            host_pitch: 0,
+            ..shape
+        };
+        assert!(
+            one.check("t", 0, 40, 40).is_ok(),
+            "a single row has no pitch to overlap"
         );
     }
 }

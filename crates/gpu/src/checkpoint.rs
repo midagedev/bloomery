@@ -29,6 +29,7 @@
 //! a point's slot out, [`Checkpoints::adopt`] makes a point of host bytes.
 
 pub mod saved;
+pub mod staging;
 
 use std::sync::Arc;
 
