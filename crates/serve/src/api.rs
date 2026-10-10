@@ -2881,7 +2881,7 @@ fn state_error(
             None,
         ),
         StateError::Engine(e) => (Err(engine_error(&e)), Some(e)),
-        StateError::Format(_) | StateError::Io(_) => (
+        StateError::Format(_) | StateError::Io(_) | StateError::NoRoom { .. } => (
             Err(ApiError {
                 retry_after: false,
                 code,

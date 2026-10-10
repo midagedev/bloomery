@@ -92,6 +92,39 @@ pub enum StateError {
     /// The engine failed mid-call.
     #[error(transparent)]
     Engine(#[from] EngineError),
+    /// The engine's staging pool has no extent for a state of `need` bytes
+    /// ([`Engine::snapshot_begin`]): it pins `held` bytes and has `lent` of
+    /// them out. `held - lent >= need` tells a pool whose free bytes are in
+    /// pieces ([`StateError::fallback`]) from one that is full. Nothing was
+    /// begun and nothing changed.
+    #[error(
+        "the staging pool has no room for {need} bytes: {lent} of its {held} bytes are lent ({})",
+        pool_state(*.need, *.held, *.lent)
+    )]
+    NoRoom { need: u64, held: u64, lent: u64 },
+}
+
+/// `full` or `fragmented`: what a pool of `held` bytes, `lent` of them out,
+/// lacks for an extent of `need` ([`StateError::NoRoom`]).
+fn pool_state(need: u64, held: u64, lent: u64) -> &'static str {
+    if held.saturating_sub(lent) >= need {
+        "fragmented"
+    } else {
+        "full"
+    }
+}
+
+impl StateError {
+    /// What a save that fell back to the request path names
+    /// ([`CacheNote::Save`]): `fragmented` or `full` for a pool that had no
+    /// room ([`StateError::NoRoom`]), `None` for any other error.
+    #[must_use]
+    pub fn fallback(&self) -> Option<&'static str> {
+        match *self {
+            StateError::NoRoom { need, held, lent } => Some(pool_state(need, held, lent)),
+            _ => None,
+        }
+    }
 }
 
 /// A slot's rows were about to be cut, reset or replaced while the copy of
@@ -689,7 +722,11 @@ pub enum CacheNote {
     /// the save's own wall clock (a park's snapshot is the switch's).
     /// `off_path`: the state is a [`Pending`] begun when its request ended,
     /// its copy running on the engine's copy stream; `ms` is then the call
-    /// that began it and [`CacheNote::Landed`] follows.
+    /// that began it and [`CacheNote::Landed`] follows. `fallback`: the
+    /// engine's staging pool had no room for it even after the oldest landed
+    /// state left, so it was taken on the request path: `full` (the pool's
+    /// free bytes cannot hold it) or `fragmented` (they could, in one piece;
+    /// [`StateError::fallback`]).
     Save {
         positions: usize,
         bytes: u64,
@@ -698,6 +735,7 @@ pub enum CacheNote {
         cache_bytes: u64,
         copied: bool,
         off_path: bool,
+        fallback: Option<&'static str>,
     },
     /// The copy of a saved state of `positions` landed: its bytes, the copy
     /// calls it took, its time on the copy stream, the pinned staging it
@@ -768,10 +806,12 @@ impl std::fmt::Display for CacheNote {
                 cache_bytes,
                 copied,
                 off_path,
+                fallback,
             } => write!(
                 f,
                 "cache save positions={positions} bytes={bytes} ms={ms:.3} entries={entries} \
-                 cache_bytes={cache_bytes} copied={copied} off_path={off_path}"
+                 cache_bytes={cache_bytes} copied={copied} off_path={off_path} fallback={}",
+                fallback.unwrap_or("none")
             ),
             CacheNote::Landed {
                 positions,

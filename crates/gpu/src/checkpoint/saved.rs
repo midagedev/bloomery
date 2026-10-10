@@ -45,13 +45,13 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
 use runtime::savemap::{Per, Run, Strip, plan_prefix, plan_whole};
 
 use super::Checkpoints;
-use super::staging::{Staged, Staging};
+use super::staging::{NoRoom, Staged, Staging};
 use crate::GpuError;
 use crate::tensor::{Pitched, dtoh_2d, htod_2d};
 
@@ -263,6 +263,10 @@ pub struct SeqState<T> {
     current: T,
     /// Ascending, each below `positions`.
     points: Vec<(u32, T)>,
+    /// What the copy cost, set once the host arrays hold the whole state: at
+    /// once for a state taken on the engine stream, by [`Pending::land`] for
+    /// one a copy stream fills. A resume reads the arrays only after.
+    landed: OnceLock<SaveCost>,
 }
 
 /// The copy stream saves run on and the pinned staging their states are made
@@ -315,15 +319,15 @@ pub struct SaveCost {
 
 /// A state whose copy runs on the copy stream ([`SeqState::save_async`]): its
 /// positions, bytes and points are known at once, its rows and stores are read
-/// only after [`Pending::land`] (a state is [`Pending::into_state`] only once
-/// it has landed).
+/// only after [`Pending::land`]. The state is shared ([`Pending::shared`]): a
+/// holder reads it through `&self` once it has landed, and a resume of it
+/// before then is refused by name.
 pub struct Pending<T> {
-    state: SeqState<T>,
+    state: Arc<SeqState<T>>,
     start: CudaEvent,
     end: Arc<CudaEvent>,
     calls: u64,
     alloc_ms: f64,
-    landed: Option<SaveCost>,
 }
 
 impl<T> Pending<T> {
@@ -353,37 +357,40 @@ impl<T> Pending<T> {
 
     /// Whether the copy has landed; never waits.
     pub fn ready(&self) -> Result<bool, GpuError> {
-        Ok(self.landed.is_some() || self.end.query()?)
+        Ok(self.state.landed.get().is_some() || self.end.query()?)
     }
 
     /// Waits for the copy to land and lets the state's bytes be read; what it
-    /// cost. The same answer on every call.
-    pub fn land(&mut self) -> Result<SaveCost, GpuError> {
-        if let Some(cost) = self.landed {
+    /// cost. The same answer on every call, from any holder of the state.
+    pub fn land(&self) -> Result<SaveCost, GpuError> {
+        if let Some(&cost) = self.state.landed.get() {
             return Ok(cost);
         }
         self.end.synchronize()?;
-        if let Host::Staged(s) = &mut self.state.host {
-            s.settle()?;
-        }
         let cost = SaveCost {
             copy_ms: f64::from(self.start.elapsed_ms(&self.end)?),
             calls: self.calls,
             alloc_ms: self.alloc_ms,
             bytes: self.state.bytes() as u64,
         };
-        self.landed = Some(cost);
-        Ok(cost)
+        Ok(*self.state.landed.get_or_init(|| cost))
+    }
+
+    /// The state, whose copy may still run: a holder of it waits for the
+    /// copy ([`Pending::land`]) before a resume reads it.
+    #[must_use]
+    pub fn shared(&self) -> Arc<SeqState<T>> {
+        Arc::clone(&self.state)
     }
 
     /// The state once it has landed; `None` while the copy may still run.
     #[must_use]
     pub fn state(&self) -> Option<&SeqState<T>> {
-        self.landed.is_some().then_some(&self.state)
+        self.state.landed.get().is_some().then_some(&*self.state)
     }
 
     /// Waits for the copy and hands the state over with its cost.
-    pub fn into_state(mut self) -> Result<(SeqState<T>, SaveCost), GpuError> {
+    pub fn into_state(self) -> Result<(Arc<SeqState<T>>, SaveCost), GpuError> {
         let cost = self.land()?;
         Ok((self.state, cost))
     }
@@ -558,6 +565,7 @@ impl<T> SeqState<T> {
             lens,
             current,
             points,
+            landed: OnceLock::from(SaveCost::default()),
         })
     }
 
@@ -570,8 +578,8 @@ impl<T> SeqState<T> {
     /// The rows it reads are not cut, reset or replaced until
     /// [`Pending::land`], and `ckpt` refuses a take, an open take or an adopt
     /// until then.
-    /// `None`, nothing enqueued, when the staging holds no free extent for the
-    /// state ([`Staging::lend`]): the caller makes room or saves with
+    /// [`NoRoom`], nothing enqueued, when the staging holds no free extent
+    /// for the state ([`Staging::lend`]): the caller makes room or saves with
     /// [`SeqState::save`].
     pub fn save_async(
         streams: Streams<'_>,
@@ -581,7 +589,7 @@ impl<T> SeqState<T> {
         current: T,
         points: Vec<(u32, T)>,
         ckpt: &Checkpoints,
-    ) -> Result<Option<Pending<T>>, GpuError> {
+    ) -> Result<Result<Pending<T>, NoRoom>, GpuError> {
         let lens = Self::checked(lent, positions, &points, ckpt)?;
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
@@ -589,8 +597,9 @@ impl<T> SeqState<T> {
         let rows_n: usize = runs.iter().map(Run::values).sum();
         let Streams { lane, engine } = streams;
         let pinned = lane.staging.stats().grown_ms;
-        let Some(mut staged) = lane.staging.lend(rows_n, one * (1 + points.len()))? else {
-            return Ok(None);
+        let mut staged = match lane.staging.lend(rows_n, one * (1 + points.len()))? {
+            Ok(staged) => staged,
+            Err(short) => return Ok(Err(short)),
         };
         // What the lend pinned: 0, the pool pins at load.
         let alloc_ms = lane.staging.stats().grown_ms - pinned;
@@ -647,8 +656,8 @@ impl<T> SeqState<T> {
         let end = Arc::new(end);
         staged.hold(Arc::clone(&end));
         ckpt.guard_points(Arc::clone(&end));
-        Ok(Some(Pending {
-            state: SeqState {
+        Ok(Ok(Pending {
+            state: Arc::new(SeqState {
                 who,
                 positions,
                 host: Host::Staged(staged),
@@ -656,12 +665,12 @@ impl<T> SeqState<T> {
                 lens,
                 current,
                 points,
-            },
+                landed: OnceLock::new(),
+            }),
             start,
             end,
             calls,
             alloc_ms,
-            landed: None,
         }))
     }
 
@@ -732,6 +741,11 @@ impl<T> SeqState<T> {
     ) -> Result<Resumed<'_, T>, GpuError> {
         if *who != self.who {
             return Err(shape(format!("a state of {} put back on {who}", self.who)));
+        }
+        if self.landed.get().is_none() {
+            return Err(shape(
+                "a state whose copy is still running put back: wait for the save to land first",
+            ));
         }
         let spans = lent.spans();
         let mine: Vec<usize> = self
@@ -1113,7 +1127,7 @@ mod tests {
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         lane: &SaveLane,
-    ) -> (SeqState<char>, SeqState<char>, SaveCost) {
+    ) -> (SeqState<char>, Arc<SeqState<char>>, SaveCost) {
         let mut src = source(ctx, stream);
         let points = vec![(16, 'p'), (32, 'q')];
         let sync = lend(&mut src, POS as usize, |lent, ckpt| {
@@ -1264,16 +1278,20 @@ mod tests {
         // A pool of 1 MiB cannot stage 64 MiB: no room, nothing enqueued.
         let small = SaveLane::new(&ctx, 1 << 20).expect("a lane");
         let mut src = source(&ctx, &stream);
-        let none = lend(&mut src, POS as usize, |lent, ckpt| {
+        let short = lend(&mut src, POS as usize, |lent, ckpt| {
             let streams = Streams {
                 lane: &small,
                 engine: &stream,
             };
             SeqState::save_async(streams, who(), POS, lent, 'c', vec![(16, 'p')], ckpt)
                 .expect("a save")
-                .is_none()
+                .err()
         });
-        assert!(none, "a state past the pool is no save off the path");
+        let short = short.expect("a state past the pool is no save off the path");
+        assert!(
+            short.need > short.held && !short.fragmented(),
+            "a state over the whole pool is full, not fragmented: {short:?}"
+        );
     }
 
     /// A Qwen3-30B-shaped state (48 layers' K and V: 96 stores of 4 planes of
@@ -1325,8 +1343,9 @@ mod tests {
         // they are in flight when the call returns.
         let hold = hold::Hold::on(&stream).expect("a hold");
         let (pending, begin_ms) = at(&lent);
-        let in_flight = !pending.ready().expect("a query");
+        let ready = pending.ready();
         hold.open();
+        let in_flight = !ready.expect("a query");
         let (state, alone) = pending.into_state().expect("a landed copy");
         let want = (STORES * PLANES * AT * HEAD * 2 + 4 * 4) as u64;
         assert!(
@@ -1358,8 +1377,9 @@ mod tests {
         drop(beside_state);
         let hold = hold::Hold::on(&stream).expect("a hold");
         let (warm, begin_warm) = at(&lent);
-        let warm_in_flight = !warm.ready().expect("a query");
+        let warm_ready = warm.ready();
         hold.open();
+        let warm_in_flight = !warm_ready.expect("a query");
         let (_, warm_cost) = warm.into_state().expect("a landed copy");
         assert!(
             warm_in_flight,
@@ -1409,6 +1429,12 @@ mod tests {
             positional: &mut spans,
             recurrent: &mut [&mut rec],
         };
+        let mut nothing = Lent {
+            positional: &mut [],
+            recurrent: &mut [],
+        };
+        let mut empty =
+            Checkpoints::new(&ctx, vec![ONE], 4 * ONE as u64, 512).expect("checkpoints");
         let hold = hold::Hold::on(&stream).expect("a hold");
         let t = Instant::now();
         let streams = Streams {
@@ -1420,23 +1446,42 @@ mod tests {
                 .expect("a save off the path")
                 .expect("staging room");
         let begin_ms = t.elapsed().as_secs_f64() * 1e3;
+        // What the held stream shows is read first and judged after it opens:
+        // a failed assert with the stream shut would drop `pending`, whose
+        // extent waits for a copy that cannot run.
         let Host::Staged(staged) = &pending.state.host else {
+            hold.open();
             panic!("an async save is staged");
         };
+        let point_still_zero = staged.recurrent()[ONE..].iter().all(|&v| v == 0.0);
+        let ready = pending.ready();
+        let refused = ckpt.adopt(12, &vec![2.0f32; ONE]);
+        // A holder of the shared state is refused by name until the copy lands.
+        let shared = pending.shared();
+        let early = shared.load(&stream, &who(), &mut nothing, &mut empty);
+        hold.open();
+        assert!(begin_ms < 4.0, "the call took {begin_ms:.3} ms");
         assert!(
-            staged.recurrent()[ONE..].iter().all(|&v| v == 0.0),
+            point_still_zero,
             "the point's bytes were in the extent when the call returned ({begin_ms:.3} ms)"
         );
-        assert!(!pending.ready().expect("a query"), "the copy had landed");
-        assert!(begin_ms < 4.0, "the call took {begin_ms:.3} ms");
-        let refused = ckpt.adopt(12, &vec![2.0f32; ONE]);
+        assert!(!ready.expect("a query"), "the copy had landed");
         assert!(
             matches!(&refused, Err(GpuError::Shape { detail, .. }) if detail.contains("save in flight")),
             "a slot written under the point copy: {:?}",
             refused.err().map(|e| e.to_string())
         );
-        hold.open();
+        assert!(
+            matches!(&early, Err(GpuError::Shape { detail, .. }) if detail.contains("still running")),
+            "a state resumed while its copy ran: {:?}",
+            early.err().map(|e| e.to_string())
+        );
         let (state, cost) = pending.into_state().expect("a landed copy");
+        assert_eq!(
+            shared.landed.get().copied(),
+            Some(cost),
+            "the holder sees the landing"
+        );
         assert!(
             state.host.recurrent()[ONE..].iter().all(|&v| v == 1.0),
             "the point's bytes did not arrive whole"

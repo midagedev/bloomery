@@ -1568,13 +1568,15 @@ impl Seat for V41 {
                 cache_bytes,
                 copied: _,
                 off_path,
+                fallback,
             } => Record::new(&record::CACHE_SAVE)
                 .u("positions", positions)
                 .u("bytes", bytes)
                 .f("ms", *ms)
                 .u("entries", entries)
                 .u("cache_bytes", cache_bytes)
-                .w("off_path", off_path),
+                .w("off_path", off_path)
+                .w("fallback", fallback.unwrap_or("none")),
             CacheNote::Landed {
                 positions,
                 bytes,

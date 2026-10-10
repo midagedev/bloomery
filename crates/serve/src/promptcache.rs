@@ -155,7 +155,35 @@ impl PromptCache {
         ms: f64,
         copied: bool,
     ) -> Vec<CacheNote> {
-        self.place(held, state, None, ms, copied)
+        self.place(held, state, None, ms, copied, None)
+    }
+
+    /// Keeps `state` of `held` as [`PromptCache::insert`] does, a snapshot
+    /// taken on the request path because the engine's staging pool had no
+    /// room for a copy off it: the `Save` names why (`fallback`,
+    /// [`CacheNote::Save`]).
+    pub(crate) fn insert_fallback(
+        &mut self,
+        held: Held,
+        state: Arc<dyn Saved>,
+        ms: f64,
+        fallback: &'static str,
+    ) -> Vec<CacheNote> {
+        self.place(held, state, None, ms, true, Some(fallback))
+    }
+
+    /// The oldest entry whose copy has landed leaves, for the room its
+    /// staging gives back: an entry whose copy still runs never does, since
+    /// that copy writes the staging. `None`, the cache as it was, when every
+    /// entry's copy still runs or the cache holds none.
+    pub(crate) fn evict_oldest_landed(&mut self) -> Option<CacheNote> {
+        let i = self.entries.iter().position(|e| e.pending.is_none())?;
+        let e = self.entries.remove(i);
+        Some(CacheNote::Evict {
+            positions: e.held.ids.len(),
+            bytes: e.state.n_bytes(),
+            why: "the engine's staging pool had no room",
+        })
     }
 
     /// Keeps `pending`'s state of `held` as [`PromptCache::insert`] does,
@@ -170,7 +198,7 @@ impl PromptCache {
         ms: f64,
     ) -> Vec<CacheNote> {
         let state = Arc::clone(pending.state());
-        self.place(held, state, Some(pending), ms, true)
+        self.place(held, state, Some(pending), ms, true, None)
     }
 
     fn place(
@@ -180,6 +208,7 @@ impl PromptCache {
         pending: Option<Pending>,
         ms: f64,
         copied: bool,
+        fallback: Option<&'static str>,
     ) -> Vec<CacheNote> {
         let bytes = state.n_bytes();
         let positions = held.ids.len();
@@ -253,6 +282,7 @@ impl PromptCache {
             cache_bytes: self.bytes(),
             copied,
             off_path,
+            fallback,
         });
         notes
     }
@@ -512,6 +542,42 @@ mod tests {
                 }
             ),
             "{notes:?}"
+        );
+    }
+
+    /// The state that leaves for the staging pool's room is the oldest one
+    /// whose copy has landed: never one whose copy still runs, even when it is
+    /// the oldest; with none landed, nothing leaves.
+    #[test]
+    fn the_room_made_for_a_copy_is_the_oldest_landed_state_never_one_in_flight() {
+        let mut c = PromptCache::new(1000);
+        assert!(c.evict_oldest_landed().is_none(), "an empty cache");
+        let p = running(10, 20);
+        c.insert_pending(ids(10, 1), p.clone(), 0.0);
+        c.insert(ids(11, 2), state(11, 20, None), 0.0, true);
+        c.insert(ids(12, 3), state(12, 20, None), 0.0, true);
+        for positions in [11, 12] {
+            assert!(
+                matches!(
+                    c.evict_oldest_landed(),
+                    Some(CacheNote::Evict { positions: n, bytes: 20, .. }) if n == positions
+                ),
+                "the oldest landed state is next ({positions} positions)"
+            );
+        }
+        assert_eq!(c.len(), 1, "the state in flight stayed");
+        assert!(
+            c.evict_oldest_landed().is_none(),
+            "only a copy in flight is left"
+        );
+        assert_eq!((c.len(), c.in_flight().len()), (1, 1));
+        assert!(c.settle(&p));
+        assert!(
+            matches!(
+                c.evict_oldest_landed(),
+                Some(CacheNote::Evict { positions: 10, .. })
+            ),
+            "landed, it leaves like any other"
         );
     }
 
