@@ -1410,7 +1410,12 @@ mod gate {
     ///   switch), and its ids are those of the same two requests run back to
     ///   back (fresh, then the resend), run first. Not a fresh run
     ///   of the resend: the positions A's generation fed were steps, which a
-    ///   fresh prompt call would run through the ubatch walk;
+    ///   fresh prompt call would run through the ubatch walk. The plain
+    ///   server saves each request's state on its lane when the request
+    ///   ends and an erase keeps the cache, so the switched resend finds the
+    ///   state the first resend left (its ids and its reply) and keeps the
+    ///   whole resend but its last id, where the first resend kept what A
+    ///   held;
     /// - (b) A's first turn resent with the reasoning-stripped reply in place
     ///   of the reply, so the shared prefix ends at the first turn's end: it
     ///   keeps the checkpoint there (the turn's prompt call's end, one short
@@ -1435,7 +1440,9 @@ mod gate {
     /// alone ((b) keeps 0); a resume that leaves the PLE history behind (the
     /// resend is refused); a keep rule that grants any position (B's request
     /// cuts where no checkpoint stands, refused); under the draft every
-    /// shorter prefix kept as none (the cuts' clause sees no cut).
+    /// shorter prefix kept as none (the cuts' clause sees no cut); the seat
+    /// saving on the request path (`Seat::snapshots_async` false: the plain
+    /// switched resend keeps A's held positions, not the whole resend).
     fn cache(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -1463,8 +1470,8 @@ mod gate {
         };
         let mut ok = true;
 
-        // The run with no switch first, then the slot dropped unsaved, so no
-        // cached state holds the resend when the switched run asks for it.
+        // The run with no switch first, then the slot dropped: an erase keeps the prompt cache,
+        // which holds the states the lane saved when each request ended.
         let r1 = greedy(url, err_log, &p1, n, false)?;
         r1.show(&format!("cache {label}: A's turn fresh"));
         let resend = with(&p1, &r1.tokens, &later);
@@ -1486,6 +1493,13 @@ mod gate {
         let cut_kept = keep38.is_none_or(|k| turn_end >= k.at(n) as u64);
         let cut_at = if cut_kept { turn_end } else { 0 };
         let want = if drafted { cut_at } else { held };
+        // PIN(2026-10-11): the plain switched resend keeps every id of the resend but its last,
+        // not A's held positions; the lane saved the first resend's end state (its ids and its
+        // reply) when that request ended, the erase kept it, and the switched resend takes the
+        // prefix of it up to the nearest point it carries at or below all but the resend's last
+        // id, which is the end of the first resend's prompt call. A request keeps at most all
+        // but its last id, and the first resend still keeps A's held positions.
+        let all_but_last = resend.len() as u64 - 1;
         if let Some(k) = keep38 {
             println!(
                 "cache {label}: the turn's end {turn_end} against the break-even {} of a reply of \
@@ -1495,7 +1509,11 @@ mod gate {
                 if cut_kept { "kept" } else { "reset" }
             );
         }
-        let kept = a2.cache_n == want && r2.cache_n == want;
+        let kept = if drafted {
+            a2.cache_n == want && r2.cache_n == want
+        } else {
+            r2.cache_n == held && a2.cache_n == all_but_last && a2.cache_n >= held
+        };
         // Under the draft, whether a verbatim resend cuts depends on where the draft's last call
         // left its rows, which the file's acceptance decides: the fixture tier defers it by name.
         let name = format!("cache_{label}_a_keeps_every_held_position_after_the_switch");
