@@ -1,0 +1,6 @@
+# case	images (the order of the image runs in the case's prompt)	decode steps after the prompt (set F; 0 none)
+# c1..c3 are the prompts of requests.jsonl of the same id (set C is their hidden states, C' and C'' the controls); c3 must
+# tokenize to 2,000..2,400 ids (the chatids set records it); e1..e3 of requests.jsonl are set E only
+c1	free-448x448	32
+c2	free-640x480,free-1024x768	32
+c3	free-448x448	0

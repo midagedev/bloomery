@@ -584,6 +584,18 @@ build-clefvis-ref:
 dump-ref-clefvis *ARGS:
     case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
 
+# Qwen3.6 / Qwen3.8 image input, the oracle's tree: llama.cpp mainline at 36a73916e in /home/user/llama.cpp-36a73916 (tools/ref/qvis/build-lcpp-qvis.sh; detached, pid, log and rc under /root/lcpp-qvis), beside Clef's 53ed051ce tree.
+build-qvis-lcpp:
+    ./tools/box.sh 'setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
+# Qwen3.6 / Qwen3.8 image input, the oracle's binary: dump_mtmd linked against that tree's libmtmd and libllama-common, with its chat mode (tools/ref/clefvis/build-clefvis.sh). One binary, $BLOOMERY_DATA/bin/dump_mtmd_qvis, serves both seats.
+build-qvis-ref:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# Qwen3.6 (MODEL qwen35moe) or Qwen3.8 (qwen4exp) image input, the oracle sets (tools/ref/clefvis/clefvis.sh, tools/ref/qvis/cases.tsv): the tower's output end (ref_<arch>_vis_taps), hidden states of three chat prompts (…_hidden_c*, with the prose control …_prose_c* and the bf16-rows control …_bf16rows_c*) and 32 greedy decode steps after two of them (…_decode_c*) into $BLOOMERY_DATA; SETS names base sets, `--cpu-twin` writes the CPU twins (<set>.cpu) and `--ids` the chat ids of every request by llama-server's own path (…_chatids_*, both without a card). The card runs go through the card's gate lock (CLEFVIS_BOUND is the whole call's bound); no lease.
+dump-ref-qvis MODEL *ARGS:
+    case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
+
 # GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
 # 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀).
