@@ -2,12 +2,12 @@
 //! `<|vision_start|><|image_pad|><|vision_end|>` whose `<|image_pad|>` is expanded to one id per
 //! merged token (the delimiters are ordinary ids of the placeholder text), and the preprocessing
 //! of an image (size plan, pad on this projector's colour, normalize, merge-order patches) as the
-//! prepare.
+//! prepare. Its content parts join by llama-server's rule ([`PartJoin::LlamaServer`]).
 
 use super::TEMPORAL_FRAMES;
 use super::size::SizeRule;
 use crate::GridPlan;
-use crate::media::{MediaModel, Prepared};
+use crate::media::{MediaModel, PartJoin, Prepared};
 use crate::preprocess::{PatchLayout, Patches, patchify};
 use crate::resample::pad_ceil;
 use crate::{Rgb8, VisionError};
@@ -79,6 +79,10 @@ impl MediaModel for Media {
         IMAGE_TOKEN_ID
     }
 
+    fn part_join(&self) -> PartJoin {
+        PartJoin::LlamaServer
+    }
+
     fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
         let patches = preprocess(image, &self.rule)?;
         Ok(Prepared {
@@ -93,7 +97,7 @@ mod tests {
     use super::{IMAGE_PLACEHOLDER, Media, PAD_BLACK, VISION_END_ID, VISION_START_ID};
     use crate::Rgb8;
     use crate::arch::qwen3vl::size::{SizeRule, TokenLimits};
-    use crate::media::MediaModel;
+    use crate::media::{MediaModel, PartJoin};
     use crate::preprocess::{f32_to_bf16, normalize};
 
     fn media() -> Media {
@@ -112,6 +116,7 @@ mod tests {
         assert_eq!((VISION_START_ID, VISION_END_ID), (248_053, 248_054));
         assert_eq!(PAD_BLACK, [0, 0, 0]);
         assert_eq!(m.part_separator(), "\n");
+        assert_eq!(m.part_join(), PartJoin::LlamaServer);
     }
 
     /// A 448×448 image is its own plan (14×14 merged tokens, 28×28 patches of 1,536 values), and

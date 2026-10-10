@@ -10,6 +10,18 @@
 
 use crate::{Patches, Rgb8, VisionError};
 
+/// How a message's content parts are flattened into one text before the chat template sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartJoin {
+    /// The same separator between every two parts, an image's placeholder included.
+    Uniform(&'static str),
+    /// llama-server's rule (`common_chat_msg::to_json_oaicompat` in `common/chat.cpp`): a `\n`
+    /// between two text parts, and none before or after an image's placeholder. A text part is
+    /// preceded by `\n` unless no text has been written yet or the part before it is a
+    /// placeholder; a placeholder is never preceded by one.
+    LlamaServer,
+}
+
 /// One image made ready for a model: the positions it takes in the prompt and the encoder's input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepared {
@@ -30,9 +42,16 @@ pub trait MediaModel {
     /// tokenizes to, and the `<|image_pad|>` between the two delimiter ids Clef's tokenizes to.
     fn image_token(&self) -> u32;
 
-    /// The separator between a message's content parts when they are flattened into one text.
+    /// The separator between a message's content parts when they are flattened into one text:
+    /// the separator of a [`PartJoin::Uniform`] join.
     fn part_separator(&self) -> &str {
         "\n"
+    }
+
+    /// How a message's content parts are flattened into one text. A model whose parts do not all
+    /// join alike says so here.
+    fn part_join(&self) -> PartJoin {
+        PartJoin::Uniform("\n")
     }
 
     /// Resize and patch one decoded image: its span length and the encoder's input.

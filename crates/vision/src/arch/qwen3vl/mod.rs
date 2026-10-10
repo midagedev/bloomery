@@ -7,6 +7,7 @@
 //! pixel size, [`media`] pads the image onto a black canvas, normalizes it and cuts it in merge
 //! order with each patch repeated over the two temporal frames.
 
+pub mod card;
 pub mod hparams;
 pub mod media;
 pub mod names;
