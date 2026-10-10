@@ -1742,9 +1742,9 @@ mod tests {
     /// The items [`super::check`] lists for a glm5next file holding
     /// `tensors` whose text holds `needle`: each its layer and text. A spec
     /// with no layers and no chat surface stands for the rest of the file,
-    /// and `needle` leaves its items out. The check reads the CPU's features
-    /// (`qdot::fuses`), so the host leg's answer is the x86-64-v3 host the
-    /// engine itself requires.
+    /// and `needle` leaves its items out. The check asks this machine's
+    /// `qdot::fuses`: on x86_64 the x86-64-v3 host the engine itself requires,
+    /// elsewhere the scalar mirrors, which fuse the same types.
     fn glm5next_items(tensors: Vec<ModelTensor>, needle: &str) -> Vec<(Option<usize>, String)> {
         let spec = ModelSpec {
             arch: Arch::Glm5Next,

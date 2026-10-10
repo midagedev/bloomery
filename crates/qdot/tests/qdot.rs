@@ -2572,9 +2572,7 @@ fn dot_f32_is_the_reference_lane_order() {
         .map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.0071)
         .collect();
     let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let Some(got) = qdot::dot_f32(&bytes, &x) else {
-        return; // no AVX2+FMA: the caller's scalar loop owns the value
-    };
+    let got = qdot::dot_f32(&bytes, &x).expect("k is a multiple of 8");
     let mut lane = [0.0f32; 8];
     for (l, a) in lane.iter_mut().enumerate() {
         *a = x[l] * w[l];
@@ -2642,7 +2640,10 @@ fn round_ties_even(v: f32) -> i32 {
     }
 }
 
-/// The gates below only mean something where the AVX2 encoder is running.
+/// The gates below compare `quantize_col`'s AVX2 path with the scalar mirror,
+/// so on x86_64 they need AVX2. Off x86_64 `supports` holds through the
+/// mirror, which is `quantize_col` there, and they hold it to their hand
+/// oracles.
 fn require_quantizer_avx2() {
     assert!(
         supports(GgmlType::Q3_K),
@@ -2670,6 +2671,7 @@ fn assert_col_bit_identical(w: GgmlType, x: &[f32]) {
 /// Sweep: 200 pseudo-random columns per type per shape over magnitudes
 /// 1e-6..1e4, with forced +/-max ties (both signs at max magnitude — the
 /// first-max pick decides) and zeros (both signs) folded in.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn quantize_col_random_bit_identical() {
     require_quantizer_avx2();
@@ -5747,6 +5749,7 @@ fn expf_ik_scalar_tracks_libm() {
     assert_eq!(qdot::expf_ik_scalar(-200.0).to_bits(), 0.0f32.to_bits());
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box's AVX2 (card_expf's vector body, v_expf)"]
 fn hw_v_expf_equals_expf_ik_over_f32_range() {
@@ -5793,6 +5796,7 @@ fn hw_v_expf_equals_expf_ik_over_f32_range() {
     assert!(checked > 1 << 29, "the sweep covered {checked} inputs");
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box's AVX2 (card_swiglu_clamp's vector body)"]
 fn hw_card_swiglu_clamp_scalar_matches_avx2() {
