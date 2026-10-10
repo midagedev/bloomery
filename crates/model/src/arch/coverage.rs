@@ -23,7 +23,7 @@ use models::{
     RopeMode, needs,
 };
 
-use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role, Unimplemented};
+use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role, Unimplemented, kernels};
 
 /// A layer program: the chain that runs a family's layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -562,10 +562,54 @@ struct TypePin {
     reads: &'static [GgmlType],
 }
 
-/// The per-tensor type pins of the programs (the qwen3moe body's `kq_site`
-/// calls in `Body::load`, the head's Q6_K gemv in `gpu/src/head.rs`, the
-/// card embedding's `embed_rows_q4k`; `Body35`'s site types, its `PROJ`,
-/// `ROUTED`, `ROUTED_DOWN`, `EMBED` and `HEAD_TY` in
+/// A tensor family whose types a program reads are the types one operation
+/// of the card kernel table ([`kernels`]) has a launch for: the same scope
+/// fields as [`TypePin`], and `row` asks the table instead of a list kept
+/// here, so a type the table gains is admitted here with no edit.
+struct RowPin {
+    program: Program,
+    role: Role,
+    matrices: bool,
+    names: Option<fn(&str) -> bool>,
+    what: &'static str,
+    /// Whether the table's row of the operation names a launch for the type.
+    row: fn(GgmlType) -> bool,
+}
+
+/// The type pins whose types are a row of the card kernel table: the
+/// qwen3moe body's attention sites (`kernels::dense`: `site.rs`'s launches,
+/// the fused Q4_K ones among them), its head (`kernels::head`: `head.rs`) and
+/// its token embedding (`kernels::embed`: `elem.rs`).
+const ROW_PINS: &[RowPin] = &[
+    RowPin {
+        program: Program::Qwen3moeBody,
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention matrices (the body's dense sites: the types kernels::dense names)",
+        row: |ty| kernels::dense(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen3moeBody,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output head (the types kernels::head names)",
+        row: |ty| kernels::head(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen3moeBody,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the card's rows: the types kernels::embed names)",
+        row: |ty| kernels::embed(ty).is_some(),
+    },
+];
+
+/// The per-tensor type pins of the programs, as lists (the qwen3moe body's
+/// routed stacks, the `kq_site` calls in `Body::load`; `Body35`'s site types,
+/// its `PROJ`, `ROUTED`, `ROUTED_DOWN`, `EMBED` and `HEAD_TY` in
 /// `gpu/src/arch/qwen3moe/body35.rs`, each a launch of `gpu/src/site.rs`;
 /// the V4.1 chain's attention gemvs, whose
 /// head-split sites in `chain/attn.rs` take q3_K or q8_0, the same head, and
@@ -573,22 +617,6 @@ struct TypePin {
 /// the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the head's
 /// q8_0 arm, and the embedding row the host dequantizes).
 const TYPE_PINS: &[TypePin] = &[
-    TypePin {
-        program: Program::Qwen3moeBody,
-        role: Role::Attention,
-        matrices: true,
-        names: Some(|n| !n.ends_with(".attn_v.weight")),
-        what: "attention q, k and output matrices (the body reads q4_K)",
-        reads: &[GgmlType::Q4_K],
-    },
-    TypePin {
-        program: Program::Qwen3moeBody,
-        role: Role::Attention,
-        matrices: true,
-        names: Some(|n| n.ends_with(".attn_v.weight")),
-        what: "attention value matrices (the body reads q4_K and q6_K)",
-        reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
-    },
     TypePin {
         program: Program::Qwen3moeBody,
         role: Role::DenseFfn,
@@ -604,22 +632,6 @@ const TYPE_PINS: &[TypePin] = &[
         names: Some(|n| n.ends_with(".ffn_down.weight")),
         what: "dense FFN down (the body reads q4_K and q6_K)",
         reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
-    },
-    TypePin {
-        program: Program::Qwen3moeBody,
-        role: Role::Head,
-        matrices: true,
-        names: None,
-        what: "output head (the head reads q6_K)",
-        reads: &[GgmlType::Q6_K],
-    },
-    TypePin {
-        program: Program::Qwen3moeBody,
-        role: Role::TokenEmbedding,
-        matrices: true,
-        names: None,
-        what: "token embedding (the card reads q4_K rows)",
-        reads: &[GgmlType::Q4_K],
     },
     TypePin {
         program: Program::Qwen3moeBody,
@@ -911,36 +923,44 @@ fn indexer_projection(name: &str) -> bool {
 /// The type pins of `program` (every program's when `None`) that tensor `t`
 /// is of a type none of reads, as items: with a program, each pin of its role
 /// (and name) whose types do not hold `t`'s; with none, the first such pin
-/// when no program's pin reads the type.
+/// when no program's pin reads the type. A [`TypePin`] reads its list, a
+/// [`RowPin`] its row of the kernel table.
 fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
     let matrix = t.dims.len() >= 2 && t.ty != GgmlType::F32;
-    let pins: Vec<&TypePin> = TYPE_PINS
+    let binds = |p: Program, role: Role, matrices: bool, names: Option<fn(&str) -> bool>| {
+        program.is_none_or(|q| p == q)
+            && role == t.role
+            && (!matrices || matrix)
+            && names.is_none_or(|takes| takes(&t.name))
+    };
+    // Each pin that binds `t`: its text, and whether it reads `t`'s type.
+    let pins: Vec<(&'static str, bool)> = TYPE_PINS
         .iter()
-        .filter(|pin| {
-            program.is_none_or(|p| pin.program == p)
-                && pin.role == t.role
-                && (!pin.matrices || matrix)
-                && pin.names.is_none_or(|takes| takes(&t.name))
-        })
+        .filter(|pin| binds(pin.program, pin.role, pin.matrices, pin.names))
+        .map(|pin| (pin.what, pin.reads.contains(&t.ty)))
+        .chain(
+            ROW_PINS
+                .iter()
+                .filter(|pin| binds(pin.program, pin.role, pin.matrices, pin.names))
+                .map(|pin| (pin.what, (pin.row)(t.ty))),
+        )
         .collect();
-    let refused: Vec<&TypePin> = match program {
+    let refused: Vec<&'static str> = match program {
         Some(_) => pins
-            .into_iter()
-            .filter(|pin| !pin.reads.contains(&t.ty))
+            .iter()
+            .filter(|(_, reads)| !reads)
+            .map(|(what, _)| *what)
             .collect(),
         // No program: an item only when no program's pin reads the type,
         // named by the first pin.
-        None if pins.iter().all(|pin| !pin.reads.contains(&t.ty)) => {
-            pins.into_iter().take(1).collect()
+        None if pins.iter().all(|(_, reads)| !reads) => {
+            pins.iter().take(1).map(|(what, _)| *what).collect()
         }
         None => Vec::new(),
     };
     refused
         .into_iter()
-        .map(|pin| Need::WeightFormat {
-            what: pin.what,
-            ty: t.ty,
-        })
+        .map(|what| Need::WeightFormat { what, ty: t.ty })
         .collect()
 }
 
@@ -1166,8 +1186,7 @@ mod tests {
     }
 
     /// A Q8_0 qwen35 file is no item: `Body35` launches Q8_0 at every
-    /// projection, the head and the embedding; the qwen3moe body still
-    /// refuses Q8_0 attention by name.
+    /// projection, the head and the embedding.
     #[test]
     fn a_q8_0_qwen35_file_is_no_item() {
         let q8 = GgmlType::Q8_0;
@@ -1195,35 +1214,158 @@ mod tests {
                 t.name
             );
         }
-        let attn = matrix("attn_q.weight", Role::Attention, q8);
-        assert_eq!(
-            items(Program::Qwen3moeBody, &attn),
-            ["q8_0 attention q, k and output matrices (the body reads q4_K)"]
+    }
+
+    /// The file's global tensor `name` (no layer) of role `role` and type `ty`.
+    fn global(name: &str, role: Role, ty: GgmlType) -> ModelTensor {
+        ModelTensor {
+            name: name.into(),
+            layer: None,
+            ..matrix("", role, ty)
+        }
+    }
+
+    /// The qwen3moe body's attention, head and embedding read the card kernel
+    /// table's rows ([`super::ROW_PINS`]): every attention matrix a dense
+    /// site launches (q, k, v and output alike), the head types `head.rs`
+    /// launches, the embedding rows `elem.rs` and `q38.rs` launch; a type
+    /// with no row is an item that names the row.
+    // PIN(2026-10-10): widened from q4_K attention (q, k and output; v q4_K
+    // or q6_K), a q6_K head and q4_K embedding rows to the table's rows, so
+    // the unsloth Qwen3-Coder Q4_K_S, UD-Q4_K_XL and Q5_K_M files' attention,
+    // embedding and head are no items. Derivation: each type admitted below
+    // has a launch the qwen3moe body runs on both paths (`gpu/src/site.rs`
+    // `kgemv`/`gemv` and `gemm`; `Head::enqueue`; `enqueue_embed_rows_kquant`
+    // and `embed_rows_q8_0`), and `kernels`' own tests pin each row's set.
+    // The routed stacks' pins are unchanged: the last two asserts.
+    #[test]
+    fn the_qwen3moe_body_reads_the_kernel_tables_rows() {
+        // Every mismatch is collected, so a base run lists each type it
+        // refuses.
+        let mut bad = Vec::<String>::new();
+        let mut check = |what: String, t: ModelTensor, want: &[String]| {
+            let got = items(Program::Qwen3moeBody, &t);
+            if got != want {
+                bad.push(format!("{what}: items {got:?}, want {want:?}"));
+            }
+        };
+        let none = Vec::<String>::new();
+        for name in [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+        ] {
+            for ty in [
+                GgmlType::Q3_K,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+                GgmlType::Q8_0,
+            ] {
+                check(
+                    format!("{name} {ty}"),
+                    matrix(name, Role::Attention, ty),
+                    &none,
+                );
+            }
+            for ty in [GgmlType::BF16, GgmlType::F16, GgmlType::IQ4_XS] {
+                let item = format!(
+                    "{ty} attention matrices (the body's dense sites: the types kernels::dense \
+                     names)"
+                );
+                check(
+                    format!("{name} {ty}"),
+                    matrix(name, Role::Attention, ty),
+                    &[item],
+                );
+            }
+        }
+        for ty in [GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0] {
+            check(
+                format!("head {ty}"),
+                global("output.weight", Role::Head, ty),
+                &none,
+            );
+        }
+        check(
+            "head q5_K".into(),
+            global("output.weight", Role::Head, GgmlType::Q5_K),
+            &["q5_K output head (the types kernels::head names)".to_string()],
         );
-        let v = matrix("attn_v.weight", Role::Attention, q8);
-        assert_eq!(
-            items(Program::Qwen3moeBody, &v),
-            ["q8_0 attention value matrices (the body reads q4_K and q6_K)"]
+        for ty in [
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+        ] {
+            check(
+                format!("embedding {ty}"),
+                global("token_embd.weight", Role::TokenEmbedding, ty),
+                &none,
+            );
+        }
+        check(
+            "embedding f16".into(),
+            global("token_embd.weight", Role::TokenEmbedding, GgmlType::F16),
+            &["f16 token embedding (the card's rows: the types kernels::embed names)".to_string()],
+        );
+        // The routed stacks keep their lists: a Q6_K gate·up and a Q5_K down
+        // are refused by name.
+        check(
+            "routed gate q6_K".into(),
+            matrix("ffn_gate_exps.weight", Role::RoutedExperts, GgmlType::Q6_K),
+            &["q6_K routed experts gate and up (the body reads q4_K)".to_string()],
+        );
+        check(
+            "routed down q5_K".into(),
+            matrix("ffn_down_exps.weight", Role::RoutedExperts, GgmlType::Q5_K),
+            &["q5_K routed experts down (the body reads q4_K and q6_K)".to_string()],
+        );
+        assert!(
+            bad.is_empty(),
+            "{} mismatches:\n{}",
+            bad.len(),
+            bad.join("\n")
         );
     }
 
-    /// The qwen3moe body's attention pins are its launches' by part: q, k and
-    /// the output projection read q4_K alone, the values q4_K or q6_K, so a
-    /// q6_K q or output is an item a looser one-list pin passes.
+    /// The table-owned pins follow the table, not a list: each pin's verdict
+    /// on every type equals whether the table's row names a launch for it.
     #[test]
-    fn the_qwen3moe_body_reads_attention_by_part() {
-        for name in ["attn_q.weight", "attn_k.weight", "attn_output.weight"] {
-            assert_eq!(
-                items(
-                    Program::Qwen3moeBody,
-                    &matrix(name, Role::Attention, GgmlType::Q6_K)
-                ),
-                ["q6_K attention q, k and output matrices (the body reads q4_K)"],
-                "{name}"
-            );
+    fn a_row_pin_follows_its_table_row() {
+        use super::ROW_PINS;
+        let types = [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::BF16,
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ4_XS,
+        ];
+        for pin in ROW_PINS {
+            for ty in types {
+                let t = ModelTensor {
+                    name: "blk.0.attn_q.weight".into(),
+                    role: pin.role,
+                    ..matrix("", pin.role, ty)
+                };
+                let item = weight_formats(Some(pin.program), &t)
+                    .iter()
+                    .any(|n| n.to_string() == format!("{ty} {}", pin.what));
+                let is_matrix = t.dims.len() >= 2 && ty != GgmlType::F32;
+                assert_eq!(item, !(pin.row)(ty) && (!pin.matrices || is_matrix), "{ty}");
+            }
         }
-        let v = matrix("attn_v.weight", Role::Attention, GgmlType::Q6_K);
-        assert_eq!(items(Program::Qwen3moeBody, &v), Vec::<String>::new());
     }
 
     /// The whole-card bodies' routed pins, by part: the gate and up stacks
