@@ -24,6 +24,13 @@
 //! | 13 | GEMM `x · mm1ᵀ + b` (9216 → 5120), GELU epilogue | `Aligner.w1` :111, `F.gelu` :119 | the product, then the GELU |
 //! | 14 | GEMM `h · mm2ᵀ + b` (5120 → 5120) | `Aligner.w2` :112, :119 | once |
 //!
+//! Tap names ([`TapSink`]) are the oracle's file stems: `embed`, `blk{b}`, `blk{b}.norm1`, `.qkv`,
+//! `.qrot`, `.krot`, `.sdpa`, `.attn`, `.resid1` (the stream after the attention residual),
+//! `.norm2`, `.w1`, `.act`, `.mlp`, then `vit`, `aligner.x` (the unfolded rows), `aligner.w1`,
+//! `aligner.h`. `blk{b}.attn`, `blk{b}.mlp` and `aligner.w1` are the branch outputs before their
+//! fused epilogue: asking for one runs its GEMM a second time without the epilogue, into the
+//! buffer the fused launch then overwrites in full, so the chain reads none of it.
+//!
 //! Launches per image: `1 + 9·n_layer + 1 + 3` ([`Encoder::launches`]), 293 at 32 blocks. Eager,
 //! not a captured graph: the grid of every launch depends on the image's patch count, which
 //! changes per request.
@@ -40,11 +47,13 @@
 
 use crate::aligner::{AlignerKernels, UnfoldArgs, cells};
 use crate::attn::{AttnArgs, AttnKernels, QkvLayout};
+pub use crate::chain::{Encoded, TapSink};
+use crate::chain::{NoTaps, read_bf16, side, tap, to_host, up_bf16, up_f32};
 use crate::gemm_bf16::{Epilogue, GemmArgs, GemmKernels};
 use crate::mlp::MlpKernels;
 use crate::norm::NormKernels;
 use crate::rope2d::{PAIRS, RopeArgs, RopeKernels, RopeTable};
-use bloomery_gpu::{DeviceTensor, GpuError, TensorWindow, Window, WindowMut};
+use bloomery_gpu::{DeviceTensor, GpuError, WindowMut};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Gguf;
 use std::sync::Arc;
@@ -92,38 +101,6 @@ impl Weights {
             + 2 * (self.patch_w.len() + self.mm1_w.len() + self.mm2_w.len())
             + 4 * (self.patch_b.len() + self.post_ln.len() + self.mm1_b.len() + self.mm2_b.len())
     }
-}
-
-/// Where an encode's intermediate tensors go when a caller asks for them (a gate). `wants` is
-/// asked before each named point; a `true` synchronizes the stream and hands the tensor over
-/// as bf16 bits, `cols` values per row. Names are the oracle's file stems: `embed`, `blk{b}`,
-/// `blk{b}.norm1`, `.qkv`, `.qrot`, `.krot`, `.sdpa`, `.attn`, `.resid1` (the stream after the
-/// attention residual), `.norm2`, `.w1`, `.act`, `.mlp`, then `vit`, `aligner.x` (the unfolded
-/// rows), `aligner.w1`, `aligner.h`. `blk{b}.attn`, `blk{b}.mlp` and `aligner.w1` are the
-/// branch outputs before their fused epilogue: asking for one runs its GEMM a second time without
-/// the epilogue, into the buffer the fused launch then overwrites in full, so the chain reads none
-/// of it.
-pub trait TapSink {
-    fn wants(&self, name: &str) -> bool;
-    fn take(&mut self, name: &str, cols: usize, bits: Vec<u16>);
-}
-
-/// The sink of a plain encode.
-struct NoTaps;
-
-impl TapSink for NoTaps {
-    fn wants(&self, _: &str) -> bool {
-        false
-    }
-    fn take(&mut self, _: &str, _: usize, _: Vec<u16>) {}
-}
-
-/// An encode's result: the aligner rows (`n_llm_h · n_llm_w` rows of `out_dim` bf16, reading
-/// order), a window of the encoder's own buffer that lives until its next call, and the chain
-/// launches it took.
-pub struct Encoded<'a> {
-    pub rows: TensorWindow<'a, u16>,
-    pub launches: usize,
 }
 
 /// The loaded encoder: the chain of one file, the activations of the largest image a plan makes,
@@ -206,12 +183,12 @@ impl Encoder {
             });
         }
         let card = card_bytes(&hp);
-        let bf16 = |name: String| up_bf16(stream, file, &name);
-        let f32s = |name: String| up_f32(stream, file, &name);
+        let bf16 = |name: String| up_bf16(stream, file, &name, what);
+        let f32s = |name: String| up_f32(stream, file, &name, what);
         let mut blocks = Vec::with_capacity(hp.n_layer);
         for b in 0..hp.n_layer {
-            let mut gate_up = read_bf16(file, &names::ffn_gate(b))?;
-            gate_up.extend(read_bf16(file, &names::ffn_up(b))?);
+            let mut gate_up = read_bf16(file, &names::ffn_gate(b), what)?;
+            gate_up.extend(read_bf16(file, &names::ffn_up(b), what)?);
             blocks.push(BlockWeights {
                 ln1: f32s(names::ln1(b))?,
                 qkv_w: bf16(names::attn_qkv_weight(b))?,
@@ -524,7 +501,8 @@ impl Chain {
             },
         )?;
         tap(stream, taps, &name("sdpa"), &s.att, n, dim)?;
-        self.side(
+        side(
+            &self.gemm,
             stream,
             taps,
             &name("attn"),
@@ -567,7 +545,8 @@ impl Chain {
         tap(stream, taps, &name("w1"), &s.u, n, 2 * ff)?;
         self.mlp.enqueue(stream, &s.u, ff, n, &mut s.act)?;
         tap(stream, taps, &name("act"), &s.act, n, ff)?;
-        self.side(
+        side(
+            &self.gemm,
             stream,
             taps,
             &name("mlp"),
@@ -629,7 +608,8 @@ impl Chain {
             },
         )?;
         tap(stream, taps, "aligner.x", &s.un, n_llm, unfold_w)?;
-        self.side(
+        side(
+            &self.gemm,
             stream,
             taps,
             "aligner.w1",
@@ -669,102 +649,4 @@ impl Chain {
         launches += 3;
         Ok((n_llm, launches))
     }
-
-    /// A branch GEMM without its fused epilogue, for a tap only: `a · bᵀ (+ bias)` of shape
-    /// `(m, n, k)` into `c`, the buffer the fused launch after it overwrites in full, handed to
-    /// `taps` under `name`.
-    #[allow(
-        clippy::type_complexity,
-        reason = "the operand triple and the shape triple of one GEMM, named at the call"
-    )]
-    fn side(
-        &self,
-        stream: &CudaStream,
-        taps: &mut dyn TapSink,
-        name: &str,
-        (a, b, bias): (
-            &DeviceBuffer<u16>,
-            &DeviceBuffer<u16>,
-            Option<&DeviceBuffer<f32>>,
-        ),
-        (m, n, k): (usize, usize, usize),
-        c: &mut DeviceBuffer<u16>,
-    ) -> Result<(), GpuError> {
-        if !taps.wants(name) {
-            return Ok(());
-        }
-        self.gemm.enqueue(
-            stream,
-            GemmArgs {
-                a,
-                b,
-                bias,
-                epilogue: Epilogue::None,
-                resid: None,
-                m,
-                n,
-                k,
-                c,
-            },
-        )?;
-        tap(stream, taps, name, c, m, n)
-    }
-}
-
-/// Hand the first `rows` rows of `buf` (`cols` values each) to `taps` under `name` when it asks
-/// for them.
-fn tap(
-    stream: &CudaStream,
-    taps: &mut dyn TapSink,
-    name: &str,
-    buf: &DeviceBuffer<u16>,
-    rows: usize,
-    cols: usize,
-) -> Result<(), GpuError> {
-    if taps.wants(name) {
-        let v = to_host(stream, buf, rows * cols)?;
-        taps.take(name, cols, v);
-    }
-    Ok(())
-}
-
-/// The first `len` values of `buf`, after the stream's work so far.
-fn to_host(stream: &CudaStream, buf: &DeviceBuffer<u16>, len: usize) -> Result<Vec<u16>, GpuError> {
-    stream.synchronize()?;
-    Ok(Window::<u16>::of(buf, 0, len)?.to_host_vec(stream)?)
-}
-
-fn tensor_bytes<'a>(file: &'a Gguf, name: &str) -> Result<&'a [u8], GpuError> {
-    let t = file.find(name).ok_or_else(|| GpuError::Tensor {
-        what: "Encoder::load",
-        name: name.to_string(),
-        need: "in the encoder file",
-    })?;
-    Ok(file.data(t)?)
-}
-
-fn up_bf16(stream: &CudaStream, file: &Gguf, name: &str) -> Result<DeviceBuffer<u16>, GpuError> {
-    Ok(DeviceBuffer::from_host(stream, &read_bf16(file, name)?)?)
-}
-
-fn up_f32(stream: &CudaStream, file: &Gguf, name: &str) -> Result<DeviceBuffer<f32>, GpuError> {
-    Ok(DeviceBuffer::from_host(stream, &read_f32(file, name)?)?)
-}
-
-fn read_bf16(file: &Gguf, name: &str) -> Result<Vec<u16>, GpuError> {
-    Ok(tensor_bytes(file, name)?
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes(*c))
-        .collect())
-}
-
-fn read_f32(file: &Gguf, name: &str) -> Result<Vec<f32>, GpuError> {
-    Ok(tensor_bytes(file, name)?
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect())
 }

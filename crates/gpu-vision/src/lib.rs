@@ -26,6 +26,7 @@
 
 pub mod aligner;
 pub mod attn;
+pub mod chain;
 pub mod encoder;
 pub mod gemm_bf16;
 pub mod mlp;
