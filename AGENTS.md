@@ -169,6 +169,26 @@ Measurement comes first only for the named residue: hardware faults (Xid 79), re
 no mechanism yet. Build-time facts (node, launch, instruction, register counts) are compile-time ratchets, not runtime
 measurements. Every number carries its conditions — `tok/s @ n=N, depth D, card` — or it is not a number.
 
+## Compute first, the box never idle
+
+The user's rule (2026-10-10): settle as much as possible by derivation and simulation on the Mac, and keep the box
+scheduled without gaps. The box is held more than it computes (cards touched in ~60 % of the time at ~7 % mean SM; 41 %
+of batch wall was lock waits, 2026-10-03…10), so the cost to cut is waiting and over-selection, not compute.
+- **The box is for what the Mac cannot settle:** family gates on fixture or real bits, a compiler defect's
+  reproducer and FAIL-first, release numbers (baselines, the user-facing pass, the clip), reference dumps, and the one
+  term a derivation names with its expected value. A surprise gets a reading round before a run.
+- **A plan shape is read before a card or a sitting names it:** the plan, nvtier and pick lines for that model, card,
+  room and place (a bin's `--plan` print where it has one), never a shape copied from another card.
+- **A landing list is derived, never hand-picked.** It starts from `just affected` and narrows only by `--narrow` with
+  covering scan pairs (`ptx-scan --no-jit` proves a move) and by `python3 tools/recipes.py reach FILE` for each changed
+  host file. The narrowed list carries that proof; a touched crate's lib-test gate (`gate-gpu-lib`,
+  `gate-gpu-gates-lib`, …) is never dropped; every gate the tool kept and the batch did not run has a dated reason.
+- **The box always has a next job.** Before a serial point (review, cut, release pass, a usage-limit stall) the lead
+  queues the next batch, sitting or fill item: weekly recipes, reference dumps, fixture requants, ptx-scan bases. A
+  round never sleeps on the box: it arms a waiter on its `.rc` sentinel and goes on with Mac work.
+- **`held` is the occupancy to cut:** a process on a card with no kernels. A gate that holds a card while it waits on
+  another lock is a lock-order defect.
+
 ## Performance first, accuracy opt-in
 
 When a choice trades speed against closeness to the exact result, the default is the faster one, and the engine carries
@@ -196,6 +216,9 @@ Before landing, run `just affected` on each pending piece and sort:
   lands alone as soon as it is Mac-green: its own `tools/gate-batch.sh --ledger`, ff-merge, push.
 - **Train.** Only pieces whose sets overlap wait and land together; one run of the union replaces one run per piece
   (`crates/gpu`, `crates/model`, `crates/levers` select 77–119 gates).
+- **A landing runs the fixture tier** (user, 2026-10-10): `tools/gate-batch.sh --tier fixture`. Its deferred list runs
+  once in the release batch and in `just weekly`, never per landing. A red only in the real tier is a fixture gap,
+  closed by clause name before the next release. `weekly-*` items leave a landing's list and run after the push.
 
 A rebase moves only the keys of gates whose closure holds the landed files, so an express landing leaves a train's
 greens standing. The box already schedules small runs (one gate lock per card, the timing lease, `any` on an idle
