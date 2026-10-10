@@ -584,6 +584,7 @@ mod gate {
                 mma: true,
                 ubatch: U_GATE,
                 kv,
+                media: false,
             },
         )?;
         println!(
@@ -2828,6 +2829,7 @@ mod gate {
             mma: true,
             ubatch: U_GATE,
             kv: KvQ8::F16,
+            media: false,
         };
         let whole = matches!(
             q3place::unplaced_qwen35(&file, &o)?,
@@ -2877,6 +2879,7 @@ mod gate {
             mma: true,
             ubatch: U_GATE,
             kv: KvQ8::F16,
+            media: false,
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {

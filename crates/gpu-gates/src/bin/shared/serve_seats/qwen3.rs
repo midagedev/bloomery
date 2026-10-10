@@ -284,6 +284,7 @@ fn open35(ctx: usize, kv: KvQ8) -> Result<Open35, GateError> {
         mma: true,
         ubatch: ubatch_size()?,
         kv,
+        media: false,
     })
 }
 

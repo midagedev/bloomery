@@ -944,6 +944,7 @@ mod gate {
                     mma: true,
                     ubatch: ubatch_size()?,
                     kv: KvQ8::F16,
+                    media: false,
                 };
                 let WholeLoad::Checked { arena, reserve } = Qwen35moeModel::whole_load(split, o)?
                 else {

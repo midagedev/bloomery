@@ -78,6 +78,7 @@ use crate::head::Head;
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
+use crate::media::SeqRope;
 use crate::model::{
     ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
 };
@@ -91,13 +92,14 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
-use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec};
+use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, RopeMode};
 use model::placement::{Plan, WholeLoad};
 use runtime::seqstate::{HOST_BUDGET, Kept};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
+use vision::mrope::MropeSeq;
 
 const WHAT: &str = "qwen35moe::Body35::load";
 
@@ -126,6 +128,12 @@ pub struct Open35 {
     /// The attention layers' KV planes' format ([`KvQ8`]); the delta layers'
     /// recurrent stores are f32 either way.
     pub kv: KvQ8,
+    /// Whether the sequences take image rows ([`MediaBody`](crate::media::MediaBody)):
+    /// each one holds a rotation table of its own, made here before any
+    /// graph is captured (a captured graph bakes its buffer's address), that
+    /// an image's positions rewrite ([`SeqRope`]). A text load holds none and
+    /// every rope launch reads the load's one table.
+    pub media: bool,
 }
 
 /// Rows of the ubatch arena for ubatches of `u` tokens on a `ctx`-row cache:
@@ -385,6 +393,13 @@ pub struct Body35 {
     pub(super) stores: Vec<LayerStore>,
     /// The rope table every attention layer reads by position, 64 f32 a row.
     pub(super) rope: RopeRows,
+    /// The live sequence's rotation table on a media load: the rope launches
+    /// of the sequence read it in place of `rope` ([`rope_table`]). `None`
+    /// on a text load.
+    pub(super) seq_rope: Option<SeqRope>,
+    /// What a media load makes each further sequence's table from
+    /// ([`Slots::new_seq`]); `None` on a text load.
+    rope_base: Option<RopeBase>,
     /// The decode step's one-row arena and its input record.
     pub(super) s: Arena,
     pub(super) sp: StepParams,
@@ -436,13 +451,32 @@ pub struct Body35 {
 /// One Qwen3.6 sequence's own state ([`Slots`], what a select exchanges):
 /// every layer's store — an attention layer's K/V planes, a delta layer's
 /// recurrent state and conv ring —, the positions its recurrent stores hold,
-/// and its checkpoints of those stores on the host. No capture travels with
-/// it: the body records none over the stores (the step's and the passes'
+/// its checkpoints of those stores on the host, and on a media load its
+/// rotation table. No capture travels with it: the body records none over the stores (the step's and the passes'
 /// are the model's, kept a slot).
 pub struct Slot35 {
     pub(super) stores: Vec<LayerStore>,
     held: u32,
     ckpt: Checkpoints,
+    /// The sequence's rotation table on a media load ([`Body35::seq_rope`]).
+    pub(super) rope: Option<SeqRope>,
+}
+
+/// What a media load makes each sequence's rotation table from
+/// ([`SeqRope::new`]): the plain table's host rows, shared by every table,
+/// and the file's IMROPE sections.
+struct RopeBase {
+    base: Arc<[f32]>,
+    sections: [u32; 4],
+}
+
+/// The table the rope launches of a sequence read: its own on a media load,
+/// else the load's.
+pub(super) fn rope_table<'a>(
+    rope: &'a RopeRows,
+    own: Option<&'a SeqRope>,
+) -> &'a DeviceBuffer<f32> {
+    own.map_or(&rope.table, SeqRope::table)
 }
 
 /// `name` of layer `l`.
@@ -873,12 +907,18 @@ struct Pre35 {
     d: Dims,
     ubatch: NonZeroUsize,
     base: f32,
+    /// The file's IMROPE sections, read when the load takes media.
+    sections: Option<[u32; 4]>,
 }
 
 impl Pre35 {
     fn read(file: &Split, o: Open35) -> Result<Pre35, GpuError> {
         let Open35 {
-            ctx, mma, ubatch, ..
+            ctx,
+            mma,
+            ubatch,
+            media,
+            ..
         } = o;
         let read = model::arch::qwen35moe::spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         let spec = read.spec;
@@ -902,6 +942,24 @@ impl Pre35 {
                 WHAT,
                 "no attention layer to read the rope base from",
             ))?;
+        let sections = media
+            .then(|| {
+                spec.layers.iter().find_map(|s| match &s.mixer {
+                    Mixer::Gqa(g) => match g.rope.mode {
+                        RopeMode::Imrope { sections } => Some(sections),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+            })
+            .map(|found| {
+                found.ok_or(GpuError::shape(
+                    WHAT,
+                    "a media load of a file with no IMROPE attention layer: an image's positions \
+                     have no sections to follow",
+                ))
+            })
+            .transpose()?;
         if mma && kinds.contains(&Kind35::Gqa(Flash::Pairs)) {
             return Err(GpuError::shape(
                 WHAT,
@@ -945,6 +1003,7 @@ impl Pre35 {
             d,
             ubatch,
             base,
+            sections,
         })
     }
 }
@@ -1235,6 +1294,7 @@ impl Body35 {
             d,
             ubatch,
             base,
+            sections,
         } = pre;
         let ctx = o.ctx;
         let stream = gpu.stream();
@@ -1247,8 +1307,17 @@ impl Body35 {
             });
         }
         let forms = Forms::of(&plans, &d);
-        let rope = RopeTable::new(&RopeSpec::window(base, q35::ROPE_DIMS as usize))?;
-        let rope = RopeRows::new(stream, &rope, q35::ROPE_DIMS as usize, ctx)?;
+        let table = RopeTable::new(&RopeSpec::window(base, q35::ROPE_DIMS as usize))?;
+        let rope = RopeRows::new(stream, &table, q35::ROPE_DIMS as usize, ctx)?;
+        let (seq_rope, rope_base) = match sections {
+            Some(sections) => {
+                let base: Arc<[f32]> =
+                    RopeRows::host_rows(&table, q35::ROPE_DIMS as usize, ctx)?.into();
+                let own = SeqRope::new(stream, base.clone(), sections, ctx)?;
+                (Some(own), Some(RopeBase { base, sections }))
+            }
+            None => (None, None),
+        };
         // The stores a checkpoint copies, always in this order: each delta
         // layer's state, then its conv ring.
         let lens: Vec<usize> = stores
@@ -1288,6 +1357,8 @@ impl Body35 {
             plans,
             stores,
             rope,
+            seq_rope,
+            rope_base,
             s,
             sp,
             a,
@@ -1358,6 +1429,12 @@ impl Body35 {
     #[must_use]
     pub fn store_bytes(&self) -> usize {
         self.stores.iter().map(LayerStore::bytes).sum()
+    }
+
+    /// Device bytes of the live sequence's rotation table; 0 on a text load.
+    #[must_use]
+    pub fn rope_bytes(&self) -> usize {
+        self.seq_rope.as_ref().map_or(0, |r| r.table().num_bytes())
     }
 
     /// What a cut to at most `n` positions of a model standing at `pos`
@@ -1515,12 +1592,14 @@ impl Body35 {
     }
 
     /// Exchange the live sequence with `seq`: its stores, the positions they
-    /// hold and its checkpoints, pointer moves only ([`Slots::swap_seq`],
-    /// and a pass of several slots' per-slot work, `body35_slots`).
+    /// hold, its checkpoints and its rotation table, pointer moves only
+    /// ([`Slots::swap_seq`], and a pass of several slots' per-slot work,
+    /// `body35_slots`).
     pub(super) fn exchange(&mut self, seq: &mut Slot35) {
         std::mem::swap(&mut self.stores, &mut seq.stores);
         std::mem::swap(&mut self.held, &mut seq.held);
         std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
+        std::mem::swap(&mut self.seq_rope, &mut seq.rope);
     }
 
     /// Keep a copy of every layer's output residual after each layer of the
@@ -1554,6 +1633,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         plans,
         stores,
         rope,
+        seq_rope,
         s,
         sp,
         k,
@@ -1570,7 +1650,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         k,
         mma: *mma,
         eps: *eps,
-        table: &rope.table,
+        table: rope_table(rope, seq_rope.as_ref()),
     };
     if let Some(Placed {
         hybrid, side, step, ..
@@ -1641,6 +1721,7 @@ fn enqueue_rows(
         plans,
         stores,
         rope,
+        seq_rope,
         a,
         rp,
         k,
@@ -1655,7 +1736,7 @@ fn enqueue_rows(
         k,
         mma: *mma,
         eps: *eps,
-        table: &rope.table,
+        table: rope_table(rope, seq_rope.as_ref()),
     };
     Program {
         c: &c,
@@ -1712,6 +1793,7 @@ impl Body35 {
             plans,
             stores,
             rope,
+            seq_rope,
             u,
             k,
             head_state,
@@ -1726,7 +1808,7 @@ impl Body35 {
             k,
             mma: *mma,
             eps: *eps,
-            table: &rope.table,
+            table: rope_table(rope, seq_rope.as_ref()),
         };
         let tail = match end {
             UnitEnd::Head(head) => Tail::Last {
@@ -2011,7 +2093,8 @@ impl ChainBody for Body35 {
     }
 
     /// Every delta layer's state lanes and conv ring back to zero, the
-    /// checkpoints dropped and the stores counted at 0 — the live
+    /// checkpoints dropped, the rotation table of a media load back to its
+    /// text rows and the stores counted at 0 — the live
     /// sequence's, the selected slot's; a parked one keeps its own — and
     /// the records' lane word to [`LANE`], after a placed load's host tier
     /// reset — the load's, whichever slot resets: a refused input's poison
@@ -2040,6 +2123,9 @@ impl ChainBody for Body35 {
         }
         self.ckpt.clear();
         self.held = 0;
+        if let Some(rope) = self.seq_rope.as_mut() {
+            rope.restore(stream, MropeSeq::new())?;
+        }
         self.sp.write(stream, 0, 0)?;
         stream.synchronize()?;
         Ok(())
@@ -2052,6 +2138,7 @@ impl ChainBody for Body35 {
     fn resident_bytes(&self) -> usize {
         self.store_bytes()
             + self.rope.table.num_bytes()
+            + self.rope_bytes()
             + self.s.bytes()
             + self.sp.bytes()
             + self.a.bytes()
@@ -2082,7 +2169,7 @@ impl Slots for Body35 {
     /// (read back from the live planes), or a recurrent state and conv ring
     /// of the layer's delta shape —, no position held, and checkpoints of
     /// the same stores at the load's spacing, no point taken and no host slot
-    /// made. A placed load's sequences share its placed side whole: the card
+    /// made, and on a media load a rotation table of text rows. A placed load's sequences share its placed side whole: the card
     /// experts and the slot map are weights, the host tier's experts
     /// compute each token apart, its handoff words and health are the
     /// load's protocol (a go advances them whichever sequence runs), and its
@@ -2118,17 +2205,23 @@ impl Slots for Body35 {
             HOST_BUDGET,
             self.every,
         )?;
+        let rope = self
+            .rope_base
+            .as_ref()
+            .map(|b| SeqRope::new(stream, b.base.clone(), b.sections, d.ctx))
+            .transpose()?;
         Ok(Slot35 {
             stores,
             held: 0,
             ckpt,
+            rope,
         })
     }
 
     /// Exchange the live sequence with `seq`: pointer moves only — the
-    /// stores are buffer handles, the held count and the checkpoints host
-    /// values the body holds by value — so nothing is copied, captured or
-    /// synchronized. Nothing refuses: a prompt call waits for its
+    /// stores and the rotation table are buffer handles, the held count and
+    /// the checkpoints host values the body holds by value — so nothing is
+    /// copied, captured or synchronized. Nothing refuses: a prompt call waits for its
     /// checkpoints' copies before it returns, and a cut waits in its own
     /// sequence's checkpoints for that sequence's next call
     /// ([`Body35::settle`]), so it travels with it.
@@ -2138,21 +2231,54 @@ impl Slots for Body35 {
     }
 
     /// Device bytes one sequence holds: its layers' stores
-    /// ([`Body35::store_bytes`]). Its checkpoints are host bytes, left out:
+    /// ([`Body35::store_bytes`]) and its rotation table
+    /// ([`Body35::rope_bytes`]). Its checkpoints are host bytes, left out:
     /// pinned slots its prompt calls make as they take points, up to
     /// [`HOST_BUDGET`] a sequence and none at [`Slots::new_seq`].
     fn seq_bytes(&self) -> usize {
-        self.store_bytes()
+        self.store_bytes() + self.rope_bytes()
     }
 }
 
 impl Rollback for Body35 {
     /// A cut to `pos` ([`Body35::cut`]): the checkpoint there planned for
     /// the next call to carry out ([`Body35::settle`]), any other position
-    /// behind the stores refused by name. No device work, so the default
-    /// `rollback_on` serves.
+    /// behind the stores refused by name. A text load has no device work in
+    /// it; a media load's table is cut on the card
+    /// ([`Rollback::rollback_on`]), so it is refused here by name.
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        if self.seq_rope.is_some() {
+            return Err(GpuError::shape(
+                "qwen35moe::Body35::rollback",
+                format!(
+                    "back to position {pos} without the card: GpuModel::rollback cuts a media \
+                     load's rotation table"
+                ),
+            ));
+        }
         self.cut(pos)
+    }
+
+    /// [`Rollback::rollback`] with the card at hand: the cut of the stores
+    /// ([`Body35::cut`]), and on a media load the rotation table's: the
+    /// images from `pos` on go and the rows after `pos` take the positions
+    /// the kept images leave ([`SeqRope::cut`]). A cut inside an image is
+    /// refused by name before anything moves.
+    fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
+        const WHAT_R: &str = "qwen35moe::Body35::rollback";
+        let row = pos as usize;
+        if let Some(rope) = &self.seq_rope {
+            rope.rows()
+                .seq()
+                .clone()
+                .cut(row)
+                .map_err(|e| GpuError::shape(WHAT_R, e.to_string()))?;
+        }
+        self.cut(pos)?;
+        if let Some(rope) = self.seq_rope.as_mut() {
+            rope.cut(gpu.stream(), row)?;
+        }
+        Ok(())
     }
 }
 

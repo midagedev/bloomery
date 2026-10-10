@@ -1996,6 +1996,7 @@ mod cli {
             mma: true,
             ubatch: ubatch_size()?,
             kv,
+            media: false,
         };
         let mut m = match place {
             None => q3place::open_unplaced_qwen35(file, o, levers, Record::print)?,

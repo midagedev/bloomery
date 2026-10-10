@@ -5,7 +5,7 @@
 //! the per-layer copies of the output residual the decode chain leaves when
 //! asked; and the decode flash pass switched for an eager ruler.
 
-use super::body35::Body35;
+use super::body35::{Body35, rope_table};
 use super::dispatch::{self, Ctx};
 use super::plan::MixerPlan;
 use super::scratch::LayerStore;
@@ -289,7 +289,7 @@ impl GpuModel<Body35> {
             &b.k,
             b.mma,
             b.eps,
-            &b.rope.table,
+            rope_table(&b.rope, b.seq_rope.as_ref()),
         )?;
         let io = b.rp.io(m)?;
         dispatch::layer(&c, b.stores[slot].as_mut(), &mut b.a, &io, m, false, None)?;
@@ -316,7 +316,7 @@ impl GpuModel<Body35> {
             &b.k,
             b.mma,
             b.eps,
-            &b.rope.table,
+            rope_table(&b.rope, b.seq_rope.as_ref()),
         )?;
         dispatch::ffn(&c, &b.plans[slot].ffn, &mut b.a, m, None)?;
         b.read_ffn(gpu, m)

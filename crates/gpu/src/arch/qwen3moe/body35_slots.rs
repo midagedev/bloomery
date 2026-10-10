@@ -8,8 +8,10 @@
 //! first position and its ids), a delta layer's conv over its conv ring and
 //! delta step over its state, and an attention layer's head-256 rope with
 //! the cache append and the flash's segment pass and merge over its K/V
-//! planes. Every slot's rows read one lane word, `LANE`: each slot's
-//! recurrent stores are its own and hold one lane, so two slots never share
+//! planes, the rope reading the slot's own rotation table (a media load's
+//! images shift one sequence's rows and no other's). Every slot's rows read
+//! one lane word, `LANE`: each slot's recurrent stores are its own and hold
+//! one lane, so two slots never share
 //! a lane, and two ranges of one slot are refused before any body code runs
 //! (`GpuModel::step_slots`). Each launch is the one that slot's rows would
 //! run alone, and a row's arithmetic in every launch does not depend on the
@@ -28,7 +30,7 @@
 //! would need the state after a kept row, which no lane holds.
 
 use super::body::ATTN_SCALE_256;
-use super::body35::{Body35, Slot35};
+use super::body35::{Body35, Slot35, rope_table};
 use super::delta;
 use super::dispatch::{self, Ctx, PassCtx};
 use super::head_argmax::HeadArgmaxState;
@@ -160,6 +162,7 @@ impl SlotRows for Body35 {
             plans,
             stores,
             rope,
+            seq_rope,
             a,
             k,
             head_state,
@@ -168,6 +171,7 @@ impl SlotRows for Body35 {
             slot_lane,
             ..
         } = self;
+        let live = rope_table(rope, seq_rope.as_ref());
         let c = PassCtx {
             gpu,
             w,
@@ -175,28 +179,26 @@ impl SlotRows for Body35 {
             k,
             mma: *mma,
             eps: *eps,
-            table: &rope.table,
+            table: live,
         };
         let recs = rows
             .iter()
             .enumerate()
             .map(|(j, r)| slot_in.io(j, r))
             .collect::<Result<Vec<_>, GpuError>>()?;
-        let mut live = Some(stores.as_mut_slice());
+        let mut live_stores = Some(stores.as_mut_slice());
         let mut others = parked.iter_mut();
         let mut seqs = Vec::with_capacity(rows.len());
         for (r, rec) in rows.iter().zip(&recs) {
-            let stores = if r.slot == 0 {
-                live.take().ok_or_else(|| slot_twice(r))?
+            let (stores, table) = if r.slot == 0 {
+                (live_stores.take().ok_or_else(|| slot_twice(r))?, live)
             } else {
-                others
-                    .next()
-                    .ok_or_else(|| no_parked(r))?
-                    .stores
-                    .as_mut_slice()
+                let p = others.next().ok_or_else(|| no_parked(r))?;
+                (p.stores.as_mut_slice(), rope_table(rope, p.rope.as_ref()))
             };
             seqs.push(SlotSeq35 {
                 stores,
+                table,
                 io: Io {
                     lane: Some(&*slot_lane),
                     ..rec.io()
@@ -259,11 +261,12 @@ fn seq_launches(plans: &[LayerPlan]) -> usize {
         .sum::<usize>()
 }
 
-/// One busy slot of a pass: its layers' stores, its input record (its
-/// first position, its ids and the lane word) and the rows of the pass it
-/// holds.
+/// One busy slot of a pass: its layers' stores, the rotation table its rope
+/// launches read, its input record (its first position, its ids and the
+/// lane word) and the rows of the pass it holds.
 struct SlotSeq35<'a> {
     stores: &'a mut [LayerStore],
+    table: &'a DeviceBuffer<f32>,
     io: Io<'a>,
     rows: Range<usize>,
 }
@@ -458,7 +461,7 @@ fn gqa_layer(
                     v: &*rows(v, r, d.kv_len())?,
                     gq,
                     gk,
-                    table: c.table,
+                    table: qs.table,
                     pos: &pos,
                     eps: c.eps,
                     n_head: d.n_head,

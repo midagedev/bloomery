@@ -364,6 +364,7 @@ mod gate {
                 mma: true,
                 ubatch: U_GATE,
                 kv: KvQ8::F16,
+                media: false,
             },
         ) {
             Ok(_) => "opened".to_string(),

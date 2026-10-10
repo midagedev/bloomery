@@ -74,6 +74,7 @@ pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, S
         mma: false,
         ubatch,
         kv: KvQ8::F16,
+        media: false,
     };
     let census = bloomery_gpu_gates::gpu_census::census()?;
     let card = Place::A.on(&census)?.card_specs()?[0];
