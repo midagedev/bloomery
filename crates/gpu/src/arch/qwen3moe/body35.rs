@@ -60,13 +60,14 @@ use super::image::{ImageWrite, PromptImage};
 use super::placed::{BatchWalk, Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
-    SharedPlan, SiteTy, kinds35, moe_fits, q35,
+    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kinds35, moe_fits, q35,
+    shared_entry,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
 use super::scratch::{
-    Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore, RecStore, RopeRows,
-    StepParams, Wants, param_view, put_input,
+    ApartForms, Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore,
+    RecStore, RopeRows, StepParams, Wants, param_view, put_input,
 };
 use super::slot_pass::SlotIn;
 use super::ubatch::UBATCH;
@@ -468,10 +469,11 @@ fn joint(l: usize, part: &str) -> String {
 }
 
 /// The types each site launches (`crate::site`): a projection of the normed
-/// rows or an output projection, a K-quant or Q8_0; β and α also F32; a
-/// routed layer's stacks, the Q4_K gate and up and a K-quant down the routed
-/// launches take; the embedding Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
-/// Q4_K or Q8_0 (`Head`).
+/// rows or an output projection, a K-quant or Q8_0; β and α also F32; the
+/// embedding Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
+/// Q4_K or Q8_0 (`Head`). A routed layer's stacks and its shared expert are
+/// read at any site type ([`FFN_READ`]) and admitted by the card kernel
+/// table's entries ([`plan_ffn`]).
 const PROJ: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -487,8 +489,14 @@ const BETA_ALPHA: &[SiteTy] = &[
     SiteTy::Q8_0,
     SiteTy::F32,
 ];
-const ROUTED: &[SiteTy] = &[SiteTy::Q4K];
-const ROUTED_DOWN: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q6K];
+const FFN_READ: &[SiteTy] = &[
+    SiteTy::Q3K,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+    SiteTy::F32,
+];
 const EMBED: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -509,66 +517,77 @@ fn ty_of(
     file_site(file, WHAT, name, (rows, k), allowed)
 }
 
-/// The one type of a routed stack `part` of layer `l` (its experts' and its
-/// shared expert's, which the load joins into one stack), of `rows` rows an
-/// expert of `k` values, from `file`'s header; parts of two types are
-/// refused by name.
-fn routed_ty(
+/// The types of routed part `part` of layer `l` from `file`'s header: its
+/// experts' stack (`experts` experts of `rows` rows of `k` values) and its
+/// shared expert's matrix (`rows` of `k`).
+fn part_tys(
     file: &Split,
     l: usize,
     part: &str,
     (rows, k, experts): (usize, usize, usize),
-    allowed: &[SiteTy],
-) -> Result<SiteTy, GpuError> {
-    let exps = ty_of(
-        file,
-        &blk(l, &format!("ffn_{part}_exps.weight")),
-        experts * rows,
-        k,
-        allowed,
-    )?;
-    let sh = ty_of(
-        file,
-        &blk(l, &format!("ffn_{part}_shexp.weight")),
-        rows,
-        k,
-        allowed,
-    )?;
-    if exps != sh {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "layer {l}: ffn_{part} experts are {exps}, the shared expert {sh}; one stack holds one type"
-            ),
-        ));
-    }
-    Ok(exps)
+) -> Result<(SiteTy, SiteTy), GpuError> {
+    let exps = blk(l, &format!("ffn_{part}_exps.weight"));
+    let sh = blk(l, &format!("ffn_{part}_shexp.weight"));
+    Ok((
+        ty_of(file, &exps, experts * rows, k, FFN_READ)?,
+        ty_of(file, &sh, rows, k, FFN_READ)?,
+    ))
 }
 
 /// Layer `l`'s FFN by its description `spec`, every site's type from
-/// `file`'s header: a routed one with the shared expert folded in — the
-/// three stacks joined with their shared expert as expert `n` (the routed
-/// count, [`join_ffn`]), the router with the shared gate as row `n` — or a
-/// dense one, its three matrices a stack of one expert on the arena's fixed
-/// route.
+/// `file`'s header. A routed one: its stacks' types admitted by the card
+/// kernel table's entries (`plan::gate_up_entry`, `plan::down_entry`) and
+/// its shared expert's by its dense sites (`plan::shared_entry`), each
+/// refused by name with the layer; the router joined with the shared gate
+/// as row `n` (the routed count, [`join_ffn`]); and the shared expert folded
+/// into the stacks as expert `n` when its gate, up and down are each its
+/// stack's type ([`SharedPlan::Joined`]), else kept apart at its own types
+/// ([`SharedPlan::Apart`]). A dense one: its three matrices a stack of one
+/// expert on the arena's fixed route.
 fn plan_ffn(file: &Split, d: &Dims, spec: &LayerSpec, l: usize) -> Result<FfnPlan, GpuError> {
     let (h, ff) = (d.hidden, d.ff);
     let ffn_norm = blk(l, "post_attention_norm.weight");
     match &spec.ffn {
         Ffn::Moe(m) => {
             let n = m.experts as usize;
+            let (gate_ty, sh_gate) = part_tys(file, l, "gate", (ff, h, n))?;
+            let (up_ty, sh_up) = part_tys(file, l, "up", (ff, h, n))?;
+            let (down_ty, sh_down) = part_tys(file, l, "down", (h, ff, n))?;
+            let at = |e: GpuError| GpuError::shape(WHAT, format!("layer {l}: {e}"));
+            gate_up_entry(gate_ty, up_ty, WHAT).map_err(at)?;
+            down_entry(down_ty, WHAT).map_err(at)?;
+            for ty in [sh_gate, sh_up, sh_down] {
+                shared_entry(ty, WHAT).map_err(at)?;
+            }
+            let routed = |part: &str| blk(l, &format!("ffn_{part}_exps.weight"));
+            let (shared, [gate, up, down]) =
+                if (gate_ty, up_ty, down_ty) == (sh_gate, sh_up, sh_down) {
+                    let stacks = ["gate", "up", "down"].map(|part| joint(l, part));
+                    (SharedPlan::Joined, stacks)
+                } else {
+                    let sites = SharedSites {
+                        gate: blk(l, "ffn_gate_shexp.weight"),
+                        up: blk(l, "ffn_up_shexp.weight"),
+                        down: blk(l, "ffn_down_shexp.weight"),
+                        gate_ty: sh_gate,
+                        up_ty: sh_up,
+                        down_ty: sh_down,
+                    };
+                    let stacks = ["gate", "up", "down"].map(routed);
+                    (SharedPlan::Apart(sites), stacks)
+                };
             Ok(FfnPlan {
                 ffn_norm,
                 route: FfnRoute::Router {
                     gate_inp: format!("derived.blk.{l}.ffn_gate_inp_sh"),
-                    shared: Some(SharedPlan),
+                    shared: Some(shared),
                 },
-                gate: joint(l, "gate"),
-                up: joint(l, "up"),
-                down: joint(l, "down"),
-                gate_ty: routed_ty(file, l, "gate", (ff, h, n), ROUTED)?,
-                up_ty: routed_ty(file, l, "up", (ff, h, n), ROUTED)?,
-                down_ty: routed_ty(file, l, "down", (h, ff, n), ROUTED_DOWN)?,
+                gate,
+                up,
+                down,
+                gate_ty,
+                up_ty,
+                down_ty,
             })
         }
         Ffn::Dense { .. } => {
@@ -591,28 +610,36 @@ fn plan_ffn(file: &Split, d: &Dims, spec: &LayerSpec, l: usize) -> Result<FfnPla
     }
 }
 
-/// Layer `l`'s routed stacks joined with their shared expert, and its router
-/// with the shared gate (`Weights::join_rows`: the parts leave the map); a
-/// dense layer has nothing to join.
-fn join_ffn(
-    stream: &CudaStream,
-    w: &mut Weights,
-    spec: &LayerSpec,
-    l: usize,
-) -> Result<(), GpuError> {
-    if !matches!(spec.ffn, Ffn::Moe(_)) {
+/// Layer `l`'s router joined with its shared gate, and, when its plan `f`
+/// folds the shared expert in ([`SharedPlan::Joined`]), its routed stacks
+/// joined with the shared expert (`Weights::join_rows`: the parts leave the
+/// map); a shared expert kept apart stays its own three sites, and a dense
+/// layer has nothing to join.
+fn join_ffn(stream: &CudaStream, w: &mut Weights, f: &FfnPlan, l: usize) -> Result<(), GpuError> {
+    let FfnRoute::Router {
+        shared: Some(shared),
+        ..
+    } = &f.route
+    else {
         return Ok(());
+    };
+    if let SharedPlan::Joined = shared {
+        for part in ["gate", "up", "down"] {
+            w.join_rows(
+                stream,
+                &[
+                    blk(l, &format!("ffn_{part}_exps.weight")).as_str(),
+                    blk(l, &format!("ffn_{part}_shexp.weight")).as_str(),
+                ],
+                joint(l, part),
+            )?;
+        }
     }
-    for part in ["gate", "up", "down"] {
-        w.join_rows(
-            stream,
-            &[
-                blk(l, &format!("ffn_{part}_exps.weight")).as_str(),
-                blk(l, &format!("ffn_{part}_shexp.weight")).as_str(),
-            ],
-            joint(l, part),
-        )?;
-    }
+    join_gate_inp(stream, w, l)
+}
+
+/// Layer `l`'s router weight with its shared gate as the last row.
+fn join_gate_inp(stream: &CudaStream, w: &mut Weights, l: usize) -> Result<(), GpuError> {
     w.join_rows(
         stream,
         &[
@@ -715,10 +742,13 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<
     }
     let f = &p.ffn;
     let e = match &f.route {
-        FfnRoute::Router { gate_inp, .. } => {
-            let e = d.routed(WHAT)?.logits();
-            f32_site(w, gate_inp, e, h)?;
-            e
+        FfnRoute::Router { gate_inp, shared } => {
+            let r = d.routed(WHAT)?;
+            f32_site(w, gate_inp, r.logits(), h)?;
+            match shared {
+                Some(SharedPlan::Joined) => r.logits(),
+                Some(SharedPlan::Apart(_)) | None => r.experts(),
+            }
         }
         FfnRoute::Dense => 1,
     };
@@ -728,7 +758,13 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<
     }
     on(&f.gate, e * ff, h, f.gate_ty)?;
     on(&f.up, e * ff, h, f.up_ty)?;
-    on(&f.down, e * h, ff, f.down_ty)
+    on(&f.down, e * h, ff, f.down_ty)?;
+    if let Some(sh) = f.apart() {
+        on(&sh.gate, ff, h, sh.gate_ty)?;
+        on(&sh.up, ff, h, sh.up_ty)?;
+        on(&sh.down, h, ff, sh.down_ty)?;
+    }
+    Ok(())
 }
 
 /// Layer `l`'s router joined with its shared expert's gate, the routed
@@ -743,14 +779,7 @@ fn join_router(
     if !matches!(spec.ffn, Ffn::Moe(_)) {
         return Ok(());
     }
-    w.join_rows(
-        stream,
-        &[
-            blk(l, "ffn_gate_inp.weight").as_str(),
-            blk(l, "ffn_gate_inp_shexp.weight").as_str(),
-        ],
-        format!("derived.blk.{l}.ffn_gate_inp_sh"),
-    )
+    join_gate_inp(stream, w, l)
 }
 
 impl Forms {
@@ -761,6 +790,7 @@ impl Forms {
     fn of(plans: &[LayerPlan], d: &Dims) -> Forms {
         let mut hid: Vec<SiteTy> = Vec::new();
         let (mut attn, mut h, mut glu, mut cols) = (Vec::new(), Vec::new(), false, 0usize);
+        let mut apart: Vec<SiteTy> = Vec::new();
         let mut alone = |ty: SiteTy, rows: usize| {
             if ty.kgemv_order() == Some(Order::RowMajor) {
                 cols = cols.max(rows);
@@ -797,6 +827,15 @@ impl Forms {
             let f = &p.ffn;
             hid.extend([f.gate_ty, f.up_ty]);
             h.push(f.down_ty);
+            // A shared expert kept apart: its gate and up read the normed
+            // rows, its down its own SwiGLU rows, each site launched alone.
+            if let Some(sh) = f.apart() {
+                hid.extend([sh.gate_ty, sh.up_ty]);
+                apart.push(sh.down_ty);
+                alone(sh.gate_ty, d.ff);
+                alone(sh.up_ty, d.ff);
+                alone(sh.down_ty, d.hidden);
+            }
             if !f.gate_up_fused() {
                 glu = true;
                 alone(f.gate_ty, d.slots() * d.ff);
@@ -816,6 +855,7 @@ impl Forms {
             h: wants(&h),
             glu,
             cols,
+            apart: (!apart.is_empty()).then(|| ApartForms { h: wants(&apart) }),
         }
     }
 }
@@ -1152,12 +1192,12 @@ impl GpuModel<Body35> {
 }
 
 impl Body35 {
-    /// The whole-card load: each routed layer's stacks joined with its
-    /// shared expert and its router with the shared gate ([`join_ffn`]),
-    /// then the body ([`Body35::build`]).
+    /// The whole-card load: each routed layer's router joined with its
+    /// shared gate, and its stacks with its shared expert where the plan
+    /// folds it in ([`join_ffn`]), then the body ([`Body35::build`]).
     fn load(gpu: &Gpu, w: &mut Weights, pre: Pre35, o: Open35) -> Result<Body35, GpuError> {
-        for (l, layer) in pre.layers.iter().enumerate() {
-            join_ffn(gpu.stream(), w, layer, l)?;
+        for (l, plan) in pre.plans.iter().enumerate() {
+            join_ffn(gpu.stream(), w, &plan.ffn, l)?;
         }
         Body35::build(gpu, w, pre, o, o.ubatch, None)
     }
@@ -1273,6 +1313,13 @@ impl Body35 {
                 MixerPlan::Delta(_) => LayerKind35::Delta,
             })
             .collect()
+    }
+
+    /// Each layer's shared expert as the plan runs it: `true` when kept
+    /// apart from the routed stacks at its own types, `false` when folded
+    /// into them (or a layer with none).
+    pub fn shared_apart(&self) -> Vec<bool> {
+        self.plans.iter().map(|p| p.ffn.apart().is_some()).collect()
     }
 
     /// Launches of a pass of `m` rows through every layer, without the

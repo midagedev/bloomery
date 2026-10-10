@@ -133,6 +133,27 @@
 //!   B re-fed from the mark and stepped as far as the interleave and H2
 //!   stepped it, stands with H2's last id, digest, points and position;
 //!   a reset of slot 1 leaves slot 0's points standing.
+//! - (j) the unjoined shared expert, on its own load of [`UNJOINED`] (no ik
+//!   set: a dump would be `just dump-ref-qwen35moe` over that file): every
+//!   layer's shared expert kept apart from its routed stacks exactly where
+//!   the header gives a part of another type than its stack's (here every
+//!   layer: q8_0 shared parts beside q4_K gate and up and q5_K or q6_K
+//!   downs); the captured decode step [`NODES_DECODE_UD`] nodes, all
+//!   kernels, and a pass of `m` rows [`NODES_PASS_UD`] `+ 4m`, each the
+//!   body's launch count plus its heads; (p) and (p′) on the batch set's
+//!   tokens; and (w)'s cut on the step-1,024 set's prompt (one ubatch of
+//!   [`U_GATE`] and two calls cut at [`W_CUT`], the wide arm's unjoined
+//!   launches), each bit for bit. The FFN half against the host: the first
+//!   layer of each of the file's FFN type combinations, run alone on each
+//!   arm — the gemv arm (`ffn_rows`) on the rows a decode run of the batch
+//!   set's tokens left at the layer before it, the wide arm
+//!   (`ffn_rows_wide`) on [`WIDE_ROWS`] of them cycled — against the host's
+//!   f64 FFN of the file's own matrices (dequantized as stored) under the
+//!   card's routing — each
+//!   routed slot's `w · down(silu(gate · x̂) · up · x̂)` and the shared
+//!   expert's at the router's sigmoid weight — the update's relative error
+//!   within [`UNJOINED_FFN_BAND`]. (s) holds the gates' file joined on
+//!   every layer. `--unjoined-only` runs (j) alone.
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
 //!   refused by name before any launch, the position kept.
@@ -364,6 +385,48 @@ mod gate {
     /// cache append and the flash's segment pass and merge: 1 + 30·2 + 10·3.
     const NODES_SLOT: usize = 91;
 
+    /// The train-gate file of the unjoined shared expert: unsloth's
+    /// `UD-Q4_K_M`, every layer's shared expert q8_0 beside q4_K gate and up
+    /// stacks and a q5_K down (37 layers) or a q6_K one (34, 38, 39); every
+    /// mixer site q8_0 but β and α, F32.
+    const UNJOINED: &str = "/models/qwen36-hf/unsloth/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+
+    /// PIN(2026-10-10): the unjoined file's captured decode step, derived
+    /// from its header before the path ran: the embedding row; each delta
+    /// layer's 10 mixer launches (norm+quant, the q8_0 `attn_qkv` and
+    /// `attn_gate` and the F32 β and α each its own gemv, conv, delta, gated
+    /// norm, the q8_0 `ssm_out` into `normed` and the residual add) and each
+    /// attention layer's 10 (norm+quant, q, k and v each its own gemv, rope,
+    /// flash segment pass and merge, the f32 out gate, the q8_0
+    /// `attn_output` and the add); each layer's 11 FFN launches with its
+    /// shared expert kept apart (`norm_quant` and the router on the f32 rows
+    /// its q8_0 gate and up read, the card list, the routed gate·up, the
+    /// routed slots' quantizer, the routed down `_sel`, the shared gate and
+    /// up, the SwiGLU, the shared down, the host-sum combine); then the
+    /// head's three: 1 + 40·(10 + 11) + 3. No site here is row-major past
+    /// one row (q8_0 and F32 gemvs are token-major), so a pass of `m >= 2`
+    /// rows holds the same launches a row: 1 + 40·21.
+    const NODES_DECODE_UD: usize = 844;
+    const NODES_PASS_UD: usize = 841;
+
+    /// PIN(2026-10-10): (j)'s band on the FFN update against the host's f64
+    /// FFN (`‖ours − host‖ / ‖host‖`, the update `l_out − ffn_inp`). The
+    /// card's routed launches read the normed rows and the SwiGLU rows as
+    /// q8_1 (8-bit codes a 32-value block, a step of the block's largest
+    /// value over 127): each reading moves a projection by some 0.5 % of its
+    /// size, two readings in the routed path, the SwiGLU between them
+    /// adding the gate's and the up's; the q8_0 shared expert reads f32 rows
+    /// on the gemv arm and q8 blocks of 32 on the wide arm (an 8-bit reading
+    /// of each of its three projections' inputs). Predicted 0.5 % to 2 %. The
+    /// shared expert at weight 1 in place of its sigmoid, a down read at
+    /// another type, or a slot's rows from another expert move the update by
+    /// an order of its size.
+    const UNJOINED_FFN_BAND: f64 = 5e-2;
+
+    const _: () = assert!(
+        NODES_DECODE_UD == 1 + N_LAYER * (10 + 11) + 3 && NODES_PASS_UD == 1 + N_LAYER * 21
+    );
+
     const _: () = assert!(
         NODES_DECODE == 1 + N_DELTA * 13 + N_ATTN * 12 + Q6_V + 3
             && NODES_PASS == 1 + N_DELTA * 13 + Q6_QKV + N_ATTN * 12 + 2 * Q6_V
@@ -504,9 +567,13 @@ mod gate {
     }
 
     fn open(ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        open_at(MODEL, ctx, kv)
+    }
+
+    fn open_at(path: &str, ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
+        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
         if file.architecture() != Some("qwen35moe") {
-            return Err(format!("{MODEL} is {:?}, not qwen35moe", file.architecture()).into());
+            return Err(format!("{path} is {:?}, not qwen35moe", file.architecture()).into());
         }
         let t = Instant::now();
         let m = Qwen35moeModel::open(
@@ -550,13 +617,16 @@ mod gate {
             .count();
         let (launch_1, launch_m) = (body.pass_launches(1), body.pass_launches(2));
         let (stores, want_stores) = (body.store_bytes(), store_bytes());
-        let mut ok = n_attn == N_ATTN && kinds.len() == N_LAYER && stores == want_stores;
+        let apart = body.shared_apart().iter().filter(|a| **a).count();
+        let mut ok =
+            n_attn == N_ATTN && kinds.len() == N_LAYER && stores == want_stores && apart == 0;
         let attn_at: Vec<usize> = (0..kinds.len())
             .filter(|&l| kinds[l] == LayerKind35::Attention)
             .collect();
         println!(
             "structure layers={} attention at {attn_at:?} ({n_attn}, want {N_ATTN}); store bytes \
-             {stores} (want {want_stores}, derived) {}",
+             {stores} (want {want_stores}, derived); shared experts kept apart {apart} (want 0: \
+             every part its stack's type) {}",
             kinds.len(),
             verdict(ok)
         );
@@ -2401,6 +2471,297 @@ mod gate {
         Ok(taken && held_ok && refed_ok && kept_ok && refusals_ok && harness_ok)
     }
 
+    // ------------------------------------ (j) the unjoined shared expert
+
+    /// Whether each layer's header gives a shared expert part of another
+    /// type than its routed stack's: the layers the plan keeps it apart on.
+    fn header_apart(path: &str) -> Result<Vec<bool>, GateError> {
+        let split = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let ty = |name: String| -> Result<gguf::GgmlType, GateError> {
+            Ok(split
+                .find(&name)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| format!("{path} holds no {name}"))?)
+        };
+        (0..N_LAYER)
+            .map(|l| {
+                let mut apart = false;
+                for part in ["gate", "up", "down"] {
+                    let exps = ty(format!("blk.{l}.ffn_{part}_exps.weight"))?;
+                    let sh = ty(format!("blk.{l}.ffn_{part}_shexp.weight"))?;
+                    apart |= exps != sh;
+                }
+                Ok(apart)
+            })
+            .collect()
+    }
+
+    /// One of the file's matrices as the host reads it: its stored rows of
+    /// `k` values, each `row_bytes` long.
+    struct HostMat<'a> {
+        ty: gguf::GgmlType,
+        data: &'a [u8],
+        row_bytes: usize,
+        k: usize,
+    }
+
+    impl<'a> HostMat<'a> {
+        /// Tensor `name` of `split`, whose first dim is `k` values.
+        fn of(split: &'a Split, name: &str) -> Result<HostMat<'a>, GateError> {
+            let (s, t) = split
+                .find(name)
+                .ok_or_else(|| format!("{name} is not in the model file"))?;
+            let data = split.shard(s).ok_or("shard index out of range")?.data(t)?;
+            let k = usize::try_from(*t.dims.first().ok_or("a tensor of no dims")?)?;
+            let rows = usize::try_from(t.dims.iter().skip(1).product::<u64>())?;
+            if rows == 0 || data.len() % rows != 0 {
+                return Err(format!("{name}: {} bytes over {rows} rows", data.len()).into());
+            }
+            Ok(HostMat {
+                ty: t.ty,
+                data,
+                row_bytes: data.len() / rows,
+                k,
+            })
+        }
+
+        /// Rows `first..first + n`, each dequantized as stored, dotted with
+        /// `x` in f64.
+        fn dots(&self, first: usize, n: usize, x: &[f64]) -> Result<Vec<f64>, GateError> {
+            let mut row = vec![0.0f32; self.k];
+            (first..first + n)
+                .map(|r| {
+                    let bytes = self
+                        .data
+                        .get(r * self.row_bytes..(r + 1) * self.row_bytes)
+                        .ok_or("a row past the tensor")?;
+                    gguf::quant::dequant_row(self.ty, bytes, &mut row)
+                        .map_err(|e| format!("dequant {}: {e}", self.ty))?;
+                    Ok(row.iter().zip(x).map(|(&w, &v)| f64::from(w) * v).sum())
+                })
+                .collect()
+        }
+    }
+
+    /// One expert's FFN on the host in f64: `down(silu(gate · x) · up · x)`
+    /// over expert `e`'s rows of the three matrices (`ff` gate and up rows
+    /// an expert, `hidden` down rows).
+    fn host_expert(
+        [g, u, d]: [&HostMat<'_>; 3],
+        e: usize,
+        x: &[f64],
+        (ff, hidden): (usize, usize),
+    ) -> Result<Vec<f64>, GateError> {
+        let (gr, ur) = (g.dots(e * ff, ff, x)?, u.dots(e * ff, ff, x)?);
+        let h: Vec<f64> = gr
+            .iter()
+            .zip(&ur)
+            .map(|(&a, &b)| a / (1.0 + (-a).exp()) * b)
+            .collect();
+        d.dots(e * hidden, hidden, &h)
+    }
+
+    /// (j)'s wide rows: the decode run's rows cycled to twice the gemv arm's
+    /// widest unit, so the FFN takes the wide arm's launches.
+    const WIDE_ROWS: usize = 2 * (WIDE_FROM - 1);
+
+    /// (j)'s FFN clause (module doc): each FFN type combination's first
+    /// layer run alone on each arm against the host's f64 FFN under the
+    /// card's routing.
+    fn unjoined_ffn(m: &mut Qwen35moeModel, toks: &[u32]) -> Result<bool, GateError> {
+        let split = Split::open(UNJOINED).map_err(|e| format!("open {UNJOINED}: {e}"))?;
+        let parts = |l: usize| {
+            ["gate", "up", "down"].map(|p| {
+                [
+                    format!("blk.{l}.ffn_{p}_exps.weight"),
+                    format!("blk.{l}.ffn_{p}_shexp.weight"),
+                ]
+            })
+        };
+        let (mut seen, mut layers) = (Vec::new(), Vec::new());
+        for l in 0..N_LAYER {
+            let tys: Vec<String> = parts(l)
+                .iter()
+                .flatten()
+                .map(|n| split.find(n).map(|(_, t)| t.ty.to_string()))
+                .collect::<Option<_>>()
+                .ok_or_else(|| format!("layer {l}: an FFN matrix missing"))?;
+            if !seen.contains(&tys) {
+                seen.push(tys);
+                layers.push(l);
+            }
+        }
+        m.set_layer_taps(true)?;
+        fresh(m)?;
+        let mut rows: Vec<Vec<f32>> = vec![Vec::new(); N_LAYER];
+        for &t in toks {
+            m.step(&[t])?;
+            for (r, tap) in rows.iter_mut().zip(m.layer_taps()?) {
+                r.extend(tap);
+            }
+        }
+        m.set_layer_taps(false)?;
+        m.set_mode(StepMode::Graph);
+        let mut ok = true;
+        for (&l, tys) in layers.iter().zip(&seen) {
+            // The rows the decode run left at the layer before (layer 0 its
+            // own): rows at the chain's scale, which the FFN reads as any.
+            let x = &rows[l.saturating_sub(1)];
+            let cycled: Vec<f32> = x
+                .chunks(HIDDEN)
+                .cycle()
+                .take(WIDE_ROWS)
+                .flatten()
+                .copied()
+                .collect();
+            let gain = split_f32(
+                &split,
+                &format!("blk.{l}.post_attention_norm.weight"),
+                HIDDEN,
+            )?;
+            let [g, u, d] = parts(l);
+            let mats = |i: usize| -> Result<[HostMat<'_>; 3], GateError> {
+                Ok([
+                    HostMat::of(&split, &g[i])?,
+                    HostMat::of(&split, &u[i])?,
+                    HostMat::of(&split, &d[i])?,
+                ])
+            };
+            let (routed, shared) = (mats(0)?, mats(1)?);
+            let ff = routed[0].data.len()
+                / routed[0].row_bytes
+                / (routed[2].data.len() / routed[2].row_bytes / HIDDEN);
+            for (arm, x, f) in [
+                ("gemv", x.as_slice(), m.ffn_rows(l, x)?),
+                ("wide", cycled.as_slice(), m.ffn_rows_wide(l, &cycled)?),
+            ] {
+                let t_n = x.len() / HIDDEN;
+                let slots = f.ids.len() / t_n;
+                let xn = normed(x, &gain, HIDDEN);
+                let (mut got, mut want) = (Vec::new(), Vec::new());
+                for t in 0..t_n {
+                    let xt: Vec<f64> = xn[t * HIDDEN..(t + 1) * HIDDEN]
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect();
+                    let mut acc = vec![0.0f64; HIDDEN];
+                    for j in 0..slots {
+                        let (id, w) = (
+                            f.ids[t * slots + j] as usize,
+                            f64::from(f.weights[t * slots + j]),
+                        );
+                        let (mats, e) = if j + 1 < slots {
+                            (&routed, id)
+                        } else {
+                            (&shared, 0)
+                        };
+                        let y = host_expert([&mats[0], &mats[1], &mats[2]], e, &xt, (ff, HIDDEN))?;
+                        for (a, v) in acc.iter_mut().zip(y) {
+                            *a += w * v;
+                        }
+                    }
+                    want.extend(acc.iter().map(|&v| v as f32));
+                    got.extend(
+                        f.l_out[t * HIDDEN..(t + 1) * HIDDEN]
+                            .iter()
+                            .zip(&x[t * HIDDEN..(t + 1) * HIDDEN])
+                            .map(|(&o, &i)| o - i),
+                    );
+                }
+                let err = rel_to(&got, &want);
+                let pass = err <= UNJOINED_FFN_BAND;
+                ok &= pass;
+                println!(
+                    "unjoined ffn layer={l} {tys:?} {arm} arm ({t_n} rows, {slots} slots a row): \
+                     update vs the host's f64 FFN rel={err:.3e} (band {UNJOINED_FFN_BAND:.0e}) {}",
+                    verdict(pass)
+                );
+            }
+        }
+        Ok(ok)
+    }
+
+    /// (j) (module doc): the unjoined file's plan, node counts and paths.
+    fn unjoined(toks: &[u32]) -> Result<bool, GateError> {
+        let want = header_apart(UNJOINED)?;
+        let mut m = open_at(UNJOINED, CTX, KvQ8::F16)?;
+        let body = m.body("unjoined")?;
+        let got = body.shared_apart();
+        let (launch_1, launch_m) = (body.pass_launches(1), body.pass_launches(2));
+        let n_apart = got.iter().filter(|a| **a).count();
+        let mut ok = got == want && n_apart == N_LAYER;
+        println!(
+            "unjoined plan: shared experts kept apart on {n_apart} of {} layers (want {N_LAYER}, \
+             the header's {} layers of a part of another type) {}",
+            got.len(),
+            want.iter().filter(|a| **a).count(),
+            verdict(ok)
+        );
+        let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
+        let memcpy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
+        let nodes = m.capture_step()?;
+        let ([k, c], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memcpy]);
+        let pass = nodes == NODES_DECODE_UD && k == nodes && launch_1 + 3 == nodes;
+        println!(
+            "unjoined decode graph_nodes={nodes} (want {NODES_DECODE_UD}; the body counts {} + 3) \
+             kernel={k} memcpy={c} other={other} {}",
+            launch_1,
+            verdict(pass)
+        );
+        ok &= pass;
+        for (rows, nodes, list) in [
+            (5usize, m.capture_rows::<5>()?, m.rows_graph_nodes::<5>()?),
+            (8, m.capture_rows::<8>()?, m.rows_graph_nodes::<8>()?),
+        ] {
+            let ([k, c], other) = count_kinds(&list, [kernel, memcpy]);
+            let want = NODES_PASS_UD + 4 * rows;
+            let pass =
+                nodes == want && c == rows && k == nodes - rows && launch_m + 4 * rows == nodes;
+            println!(
+                "unjoined pass m={rows} graph_nodes={nodes} (want {want}; the body counts {} + \
+                 4·{rows}) kernel={k} memcpy={c} (want {rows}) other={other} {}",
+                launch_m,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let (p_ok, decode) = paths(&mut m, toks)?;
+        ok &= p_ok;
+        ok &= gemv_arm(&mut m, toks, &decode)?;
+        ok &= unjoined_ffn(&mut m, toks)?;
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prompt) = man.step()?;
+        let mut run = |cut: Option<usize>| -> Result<(u32, Vec<f32>, Vec<StoreHost>), GateError> {
+            fresh(&mut m)?;
+            let next = match cut {
+                None => m.prefill_with(prompt, PrefillPath::Gemm)?,
+                Some(c) => {
+                    m.prefill_with(&prompt[..c], PrefillPath::Gemm)?;
+                    m.prefill_with(&prompt[c..], PrefillPath::Gemm)?
+                }
+            };
+            Ok((next, m.logits()?, stores(&mut m)?))
+        };
+        let (tok0, logits0, stores0) = run(None)?;
+        let (tok, logits, st) = run(Some(W_CUT))?;
+        let differ: Vec<usize> = (0..st.len())
+            .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
+            .collect();
+        let same_logits = bits_equal(&logits, &logits0);
+        let pass = tok == tok0 && same_logits && differ.is_empty() && st.len() == N_LAYER;
+        println!(
+            "unjoined wide arm: {} ids as one ubatch of {U_GATE} and as two calls of {W_CUT} and \
+             {}: token {tok} vs {tok0}, last logits bit-identical={same_logits}, every store \
+             bit-identical (layers differing {differ:?}) {}",
+            prompt.len(),
+            prompt.len() - W_CUT,
+            verdict(pass)
+        );
+        ok &= pass;
+        println!("unjoined: {}", verdict(ok));
+        Ok(ok)
+    }
+
     // ---------------------------------------------------- (r) refusals
 
     fn refusals(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
@@ -2748,6 +3109,15 @@ mod gate {
             }
             return Ok(());
         }
+        if std::env::args().any(|a| a == "--unjoined-only") {
+            let (_, toks) = batch_set()?;
+            let ok = unjoined(&toks)?;
+            println!("gate_qwen35moe_e2e --unjoined-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if std::env::args().any(|a| a == "--memguard-only") {
             let ok = memguard()?;
             println!("gate_qwen35moe_e2e --memguard-only: {}", verdict(ok));
@@ -2779,6 +3149,7 @@ mod gate {
         ok &= refusals(&mut m)?;
         let slots = Q35Slots::new(m.body("gate_qwen35moe_e2e")?.vocab());
         drop(m);
+        ok &= unjoined(&toks)?;
         ok &= checkpoints()?;
         ok &= slots_two(&slots)?;
         ok &= placed(&man, &toks, host)?;

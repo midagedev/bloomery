@@ -138,7 +138,9 @@ EXTRA_TYPES = {2: "Q4_0", 3: "Q4_1", 9: "Q8_1", 15: "Q8_K"}
 # (body35_lists, SiteTy::Q3K being Q3_K through crates/gpu/src/site.rs:SiteTy::of_ggml), so a type added to one is followed.
 # BODY35_ARCHS are the architectures that body reads (crates/model/src/arch/mod.rs:QWEN35_BODY); BODY35_SITES the tensors
 # each list is read for, by the `ty_of`/`routed_ty` calls of `plan_gqa`, `plan_delta`, `plan_ffn` and `open`; --self-test
-# holds how many calls read each list. The routed lists are read only for a routed layer, which a qwen35 file has none of.
+# holds how many calls read each list. A routed layer's stacks and shared expert are read against FFN_READ, their admission
+# being the card kernel table's (crates/model/src/arch/coverage.rs:qwen35_gate_up/qwen35_down/qwen35_shared); a qwen35 file
+# has no routed layer.
 # The head site is `crates/gpu/src/weights.rs:head_tensor`.
 BODY35_RS = "crates/gpu/src/arch/qwen3moe/body35.rs"
 BODY35_ARCHS = ("qwen35", "clef")
@@ -155,9 +157,8 @@ BODY35_SITES = (
     (r"blk\.\d+\.ffn_down\.weight", "PROJ"),
     (r"blk\.\d+\.ssm_beta\.weight", "BETA_ALPHA"),
     (r"blk\.\d+\.ssm_alpha\.weight", "BETA_ALPHA"),
-    (r"blk\.\d+\.ffn_gate_(?:exps|shexp)\.weight", "ROUTED"),
-    (r"blk\.\d+\.ffn_up_(?:exps|shexp)\.weight", "ROUTED"),
-    (r"blk\.\d+\.ffn_down_(?:exps|shexp)\.weight", "ROUTED_DOWN"),
+    (r"blk\.\d+\.ffn_(?:gate|up|down)_exps\.weight", "FFN_READ"),
+    (r"blk\.\d+\.ffn_(?:gate|up|down)_shexp\.weight", "FFN_READ"),
 )
 # crates/gpu-gates/src/bin/shared/serve_seats/decide.rs:BODIES — the one backbone body the decide seat opens, by the
 # predicate that selects it (`is_qwen35_body`: BODY35_ARCHS).

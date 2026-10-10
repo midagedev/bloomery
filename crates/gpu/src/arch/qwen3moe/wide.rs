@@ -30,20 +30,27 @@
 //! to the error of those sums and are not bit-equal.
 
 use super::body::ATTN_SCALE_256;
+use super::body35::Body35;
 use super::dispatch::Ctx;
 use super::experts::CombineArgs;
+use super::hostleg::HostCombineArgs;
 use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, SiteTy};
 use super::router::MAX_TOKENS;
-use super::scratch::{Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Wants};
+use super::scratch::{
+    ApartForms, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route, Wants,
+};
+use super::taps35::Ffn35Run;
 use crate::GpuError;
 use crate::flash_gqa::{HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::gemm::{GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, GemmAct, GemmAct32, GemmInput, GemmRoute};
+use crate::hybrid::HOST;
 use crate::linear::{self, LinearShape};
-use crate::model::MAX_PASS_ROWS;
 use crate::model::lookup::{f32_gain, f32_tensor};
+use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
 use crate::site::{self, WideIn, WideKernels};
+use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
@@ -142,6 +149,71 @@ pub(super) struct Wide {
     /// joined stacks' `logits()` experts; `None` for a dense chain, whose
     /// FFN reads `dense`.
     moe: Option<GemmRoute>,
+    /// What a layer that keeps its shared expert apart reads
+    /// (`Forms::apart`); `None` on a chain whose every layer joins it.
+    apart: Option<WideApart>,
+}
+
+/// The wide part's buffers of a layer that keeps its shared expert apart
+/// from its routed stacks: the routed table and its map, the slots' card
+/// list the combine reads, the shared expert's gate, up and SwiGLU rows with
+/// the SwiGLU's forms its downs read, its output and the zero host sum
+/// (`scratch::ApartRows`, the gemv arm's twin).
+struct WideApart {
+    /// Expert `e`'s place in the routed stacks: `e` for each routed id,
+    /// [`HOST`] for the shared expert's (the routed count), so the routed
+    /// table lists no shared slot.
+    map: DeviceBuffer<u32>,
+    /// The routed experts' table over `t · slots` slots of the file's
+    /// routed stacks.
+    moe: GemmRoute,
+    sel: DeviceBuffer<u32>,
+    g: DeviceBuffer<f32>,
+    u: DeviceBuffer<f32>,
+    h: DeviceBuffer<f32>,
+    act_h: Acts,
+    y: DeviceBuffer<f32>,
+    zero: DeviceBuffer<f32>,
+}
+
+impl WideApart {
+    /// The buffers for `rows` tokens of `d`, whose router routes, and the
+    /// shared downs' forms `forms`, the map written and every other buffer
+    /// zero. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        d: &Dims,
+        rows: usize,
+        forms: ApartForms,
+    ) -> Result<WideApart, GpuError> {
+        let n = d.routed(WHAT)?.experts();
+        let slots = rows * d.slots();
+        let host = u32::try_from(n).map_err(|_| GpuError::shape(WHAT, "an expert id past u32"))?;
+        let map: Vec<u32> = (0..host).chain([HOST]).collect();
+        let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        Ok(WideApart {
+            map: DeviceBuffer::from_host(stream, &map)?,
+            moe: GemmRoute::new(stream, slots, n)?,
+            sel: DeviceBuffer::zeroed(stream, slots)?,
+            g: f(rows * d.ff)?,
+            u: f(rows * d.ff)?,
+            h: f(rows * d.ff)?,
+            act_h: Acts::new(stream, forms.h, rows, d.ff)?,
+            y: f(rows * d.hidden)?,
+            zero: f(rows * d.hidden)?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        [&self.g, &self.u, &self.h, &self.y, &self.zero]
+            .iter()
+            .map(|b| b.num_bytes())
+            .sum::<usize>()
+            + self.map.num_bytes()
+            + self.moe.bytes()
+            + self.sel.num_bytes()
+            + self.act_h.bytes()
+    }
 }
 
 impl Wide {
@@ -177,6 +249,10 @@ impl Wide {
                 .router
                 .map(|r| GemmRoute::new(stream, slots, r.logits()))
                 .transpose()?,
+            apart: forms
+                .apart
+                .map(|a| WideApart::new(stream, d, rows, a))
+                .transpose()?,
         })
     }
 
@@ -189,6 +265,7 @@ impl Wide {
             + self.attn_o.num_bytes()
             + self.dense.bytes()
             + self.moe.as_ref().map_or(0, GemmRoute::bytes)
+            + self.apart.as_ref().map_or(0, WideApart::bytes)
     }
 }
 
@@ -273,7 +350,27 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
     } else {
         0
     };
-    (f32s + u32s) * 4 + acts + route + d.lin.map_or(0, |s| gdn_bytes(s, rows)) + wide
+    // A layer that keeps its shared expert apart: the gemv arm's card list,
+    // the shared gate, up and SwiGLU rows with their q8_1, its output and
+    // the zero host sum; past GEMV_COLS rows the wide part's twins, its map
+    // and its routed table.
+    let apart = match (forms.apart, d.router) {
+        (Some(a), Some(r)) => {
+            let narrow = (n * slots + 3 * n * d.ff + 2 * n * d.hidden) * 4
+                + (1..=n).map(|m| m * act_col_bytes(d.ff)).sum::<usize>();
+            let wide = if rows > GEMV_COLS {
+                let s = rows * slots;
+                (s + r.experts() + 1 + 3 * rows * d.ff + 2 * rows * d.hidden) * 4
+                    + wants_bytes(a.h, rows, d.ff)
+                    + route_bytes(s, r.experts())
+            } else {
+                0
+            };
+            narrow + wide
+        }
+        (Some(_), None) | (None, _) => 0,
+    };
+    (f32s + u32s) * 4 + acts + route + d.lin.map_or(0, |s| gdn_bytes(s, rows)) + wide + apart
 }
 
 /// The arena's wide part, or a named refusal (an arena of at most
@@ -563,8 +660,14 @@ pub(super) fn delta_out(
 /// of each token's, its id the joined stacks' last expert) through the
 /// layer's expert table, or a dense FFN's one slot a token through the
 /// unit's one-expert table at the arena's fixed weight 1; the SwiGLU's
-/// quantizer is the one the down's type reads. Qwen3's plain router takes
-/// its wide rows through `ubatch.rs` and is refused here by name.
+/// quantizer is the one the down's type reads. A layer that keeps its shared
+/// expert apart ([`FfnPlan::apart`]) routes its routed slots through a table
+/// over the file's routed stacks that lists no shared slot, runs the shared
+/// expert's gate, up, SwiGLU and down on the unit's one-expert table at
+/// their own types, and adds it in the host-sum combine (`hostleg`):
+/// `((routed + 0) + resid) + σ · shared`, the host's routed sum zero on a
+/// whole-card load. Qwen3's plain router takes its wide rows through
+/// `ubatch.rs` and is refused here by name.
 pub(super) fn ffn(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -618,67 +721,156 @@ pub(super) fn ffn(
         m,
         normed,
     )?;
-    wd.act_hid.quantize(c, normed, m, &[n.gate_ty, n.up_ty])?;
+    let sh = n.apart();
+    let hid_tys = [
+        n.gate_ty,
+        n.up_ty,
+        sh.map_or(n.gate_ty, |a| a.gate_ty),
+        sh.map_or(n.up_ty, |a| a.up_ty),
+    ];
+    wd.act_hid.quantize(c, normed, m, &hid_tys)?;
     let Wide {
         act_hid,
         act_h,
         up,
         dense,
         moe,
+        apart,
         ..
     } = wd;
-    let (table, input): (&GemmRoute, GemmInput) = match &n.route {
-        FfnRoute::Router { gate_inp, .. } => {
-            k.q35(WHAT_FFN)?.router.enqueue_ubatch(
-                stream,
-                f32_tensor(w, gate_inp)?,
-                normed,
-                m,
-                c.sink,
-                route.gated(WHAT_FFN)?,
-            )?;
-            let moe = moe.as_mut().ok_or(GpuError::state(
-                WHAT_FFN,
-                "the wide part's expert table (a routed chain's)",
-            ))?;
-            k.gemm
-                .enqueue_route(stream, route.ids(), m * slots, moe, c.sink)?;
-            (moe, GemmInput::Shared { top_k: slots })
-        }
-        FfnRoute::Dense => (dense, GemmInput::PerSlot),
-    };
-    let hid = act_hid.input(normed);
-    gemm(c, (n.gate_ty, &n.gate), d.ff, &hid, (table, input), m, h)?;
-    gemm(c, (n.up_ty, &n.up), d.ff, &hid, (table, input), m, up)?;
-    let n_slots = m * slots;
-    match n.down_ty.reads() {
-        Form::Q8x128 => {
-            let a = act_h.q128.as_mut().ok_or(GpuError::state(
-                WHAT_FFN,
-                "the wide part's q8_1 blocks of the SwiGLU rows",
-            ))?;
-            k.gemm
-                .enqueue_swiglu_quant(stream, h, up, n_slots, a, c.sink)?;
-        }
-        Form::Q8x32 => {
-            let a = act_h.q32.as_mut().ok_or(GpuError::state(
-                WHAT_FFN,
-                "the wide part's q8 blocks of the SwiGLU rows",
-            ))?;
-            k.q35(WHAT_FFN)?
-                .g32
-                .enqueue_swiglu_quant32(stream, h, up, n_slots, a, c.sink)?;
-        }
-        Form::F32 => {
-            return Err(GpuError::shape(
-                WHAT_FFN,
-                format!(
-                    "layer {}: an F32 down, which the load refuses (no SwiGLU writes its rows)",
-                    c.layer
-                ),
-            ));
-        }
+    if let FfnRoute::Router { gate_inp, .. } = &n.route {
+        k.q35(WHAT_FFN)?.router.enqueue_ubatch(
+            stream,
+            f32_tensor(w, gate_inp)?,
+            normed,
+            m,
+            c.sink,
+            route.gated(WHAT_FFN)?,
+        )?;
     }
+    let hid = act_hid.input(normed);
+    let rows = (act_h, &mut *h, &mut *up, &mut *down);
+    let y = match out {
+        Some(y) => y,
+        None => x,
+    };
+    let Some(sh) = sh else {
+        let table = match &n.route {
+            FfnRoute::Router { .. } => {
+                let moe = moe.as_mut().ok_or(GpuError::state(
+                    WHAT_FFN,
+                    "the wide part's expert table (a routed chain's)",
+                ))?;
+                k.gemm
+                    .enqueue_route(stream, route.ids(), m * slots, moe, c.sink)?;
+                (&*moe, GemmInput::Shared { top_k: slots })
+            }
+            FfnRoute::Dense => (&*dense, GemmInput::PerSlot),
+        };
+        slots_gemm(c, n, &d, table, &hid, rows, m)?;
+        return k.experts.enqueue_combine_tokens(
+            stream,
+            CombineArgs {
+                down,
+                w: route.weights(),
+                resid: ffn_inp,
+                rows: d.hidden,
+                n_slots: slots,
+                m,
+                y,
+            },
+        );
+    };
+    let WideApart {
+        map,
+        moe: routed,
+        sel,
+        g,
+        u,
+        h: sh_h,
+        act_h: sh_act,
+        y: sh_y,
+        zero,
+    } = apart.as_mut().ok_or(GpuError::state(
+        WHAT_FFN,
+        "the wide part's buffers of a shared expert kept apart",
+    ))?;
+    let q35 = k.q35(WHAT_FFN)?;
+    let n_routed = d.routed(WHAT_FFN)?.experts();
+    // The slots' card list the combine reads (the shared slot's id, the
+    // routed count, is HOST), and the routed table over the file's routed
+    // stacks, which lists no shared slot.
+    gpu.elem().enqueue_card_sel(
+        stream,
+        route.ids(),
+        m * slots,
+        n_routed,
+        n_routed + 1,
+        c.sink,
+        sel,
+    )?;
+    q35.g32
+        .enqueue_route_remap(stream, route.ids(), map, m * slots, routed, c.sink)?;
+    let table = (&*routed, GemmInput::Shared { top_k: slots });
+    slots_gemm(c, n, &d, table, &hid, rows, m)?;
+    let one = (&*dense, GemmInput::PerSlot);
+    gemm(c, (sh.gate_ty, &sh.gate), d.ff, &hid, one, m, g)?;
+    gemm(c, (sh.up_ty, &sh.up), d.ff, &hid, one, m, u)?;
+    swiglu_into(c, sh.down_ty, (g, u), (m, d.ff), (sh_act, Some(sh_h)))?;
+    gemm(
+        c,
+        (sh.down_ty, &sh.down),
+        d.hidden,
+        &sh_act.input(sh_h),
+        one,
+        m,
+        sh_y,
+    )?;
+    // Every routed slot is the card's on a whole-card load, so the host's
+    // routed sum the combine adds is the zero rows.
+    q35.ffn.leg.enqueue_combine(
+        stream,
+        HostCombineArgs {
+            down,
+            w: route.weights(),
+            sel,
+            hsum: zero,
+            resid: ffn_inp,
+            shared: Some((sh_y, used)),
+            rows: d.hidden,
+            pitch: slots,
+            n_card: n_routed,
+            m,
+            fault: c.sink,
+            y,
+        },
+    )
+}
+
+/// The slots' half of the FFN at `m` rows: the gate and up GEMMs over
+/// `table` (each slot's column of `hid` as its input picks it), their
+/// SwiGLU into the form the down's type reads, and the down over the same
+/// table, slot by slot, into `down` — the `m · d.slots()` slots' SwiGLU
+/// forms, gate (`h`), up and down rows. A slot the table lists in no tile
+/// keeps its rows.
+fn slots_gemm(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    d: &Dims,
+    (table, input): (&GemmRoute, GemmInput),
+    hid: &WideIn<'_>,
+    (act_h, h, up, down): (
+        &mut Acts,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ),
+    m: usize,
+) -> Result<(), GpuError> {
+    let n_slots = m * d.slots();
+    gemm(c, (n.gate_ty, &n.gate), d.ff, hid, (table, input), m, h)?;
+    gemm(c, (n.up_ty, &n.up), d.ff, hid, (table, input), m, up)?;
+    swiglu_into(c, n.down_ty, (h, up), (n_slots, d.ff), (act_h, None))?;
     gemm(
         c,
         (n.down_ty, &n.down),
@@ -687,23 +879,113 @@ pub(super) fn ffn(
         (table, GemmInput::PerSlot),
         n_slots,
         down,
-    )?;
-    let y = match out {
-        Some(y) => y,
-        None => x,
-    };
-    k.experts.enqueue_combine_tokens(
-        stream,
-        CombineArgs {
-            down,
-            w: route.weights(),
-            resid: ffn_inp,
-            rows: d.hidden,
-            n_slots: slots,
-            m,
-            y,
-        },
     )
+}
+
+/// `silu(gate) · up` over `cols` columns of `ff` values into the form a
+/// down of type `ty` reads: its q8_1 blocks of 128 or q8 blocks of 32 in
+/// `acts` (one launch with the quantizer), or for an F32 down the f32 rows
+/// `rows`, which a routed down does not have (`None`: refused by name, as
+/// the load refuses an F32 routed down).
+fn swiglu_into(
+    c: &Ctx<'_>,
+    ty: SiteTy,
+    (gate, up): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+    (cols, ff): (usize, usize),
+    (acts, rows): (&mut Acts, Option<&mut DeviceBuffer<f32>>),
+) -> Result<(), GpuError> {
+    const WHAT_S: &str = "qwen3moe::wide::swiglu_into";
+    let stream = c.gpu.stream();
+    match ty.reads() {
+        Form::Q8x128 => {
+            let a = acts.q128.as_mut().ok_or(GpuError::state(
+                WHAT_S,
+                "the wide part's q8_1 blocks of the SwiGLU rows",
+            ))?;
+            c.k.gemm
+                .enqueue_swiglu_quant(stream, gate, up, cols, a, c.sink)
+        }
+        Form::Q8x32 => {
+            let a = acts.q32.as_mut().ok_or(GpuError::state(
+                WHAT_S,
+                "the wide part's q8 blocks of the SwiGLU rows",
+            ))?;
+            c.k.q35(WHAT_S)?
+                .g32
+                .enqueue_swiglu_quant32(stream, gate, up, cols, a, c.sink)
+        }
+        Form::F32 => {
+            let y = rows.ok_or_else(|| {
+                GpuError::shape(
+                    WHAT_S,
+                    format!(
+                        "layer {}: an F32 routed down, which the load refuses (no SwiGLU writes \
+                         its rows)",
+                        c.layer
+                    ),
+                )
+            })?;
+            c.gpu.elem().enqueue_swiglu(stream, gate, up, cols * ff, y)
+        }
+    }
+}
+
+impl GpuModel<Body35> {
+    /// Run layer `l`'s FFN half alone eagerly at the rows of `ffn_inp` (past
+    /// [`GEMV_COLS`] rows, at most the ubatch arena's: the wide arm) on the
+    /// ubatch arena, the unit's one-expert table first, and read back what it
+    /// left: the router's logits, ids and weights and the output residual.
+    /// Synchronizes; gate use.
+    pub fn ffn_rows_wide(&mut self, l: usize, ffn_inp: &[f32]) -> Result<Ffn35Run, GpuError> {
+        const WHAT: &str = "qwen35moe::ffn_rows_wide";
+        let hidden = self.body(WHAT)?.hidden();
+        let slot = self.layer_slot(l, WHAT)?;
+        let (gpu, w, b) = self.body_parts(WHAT)?;
+        let m = ffn_inp.len() / hidden.max(1);
+        if m * hidden != ffn_inp.len() || m <= GEMV_COLS || m > b.u.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} values: {}..={} rows of {hidden}",
+                    ffn_inp.len(),
+                    GEMV_COLS + 1,
+                    b.u.rows
+                ),
+            ));
+        }
+        let stream = gpu.stream();
+        // The window lives for this copy alone.
+        WindowMut::<f32>::of_mut(&mut b.u.ffn_inp, 0, m * hidden)?
+            .copy_from_host(stream, ffn_inp)?;
+        let c = Ctx::new(
+            gpu,
+            w,
+            (&b.plans[slot], slot),
+            &b.k,
+            b.mma,
+            b.eps,
+            &b.rope.table,
+        )?;
+        route_dense(&c, &mut b.u, m)?;
+        ffn(&c, &b.plans[slot].ffn, &mut b.u, m, None)?;
+        let Route::Gated(r) = &b.u.route else {
+            return Err(GpuError::state(WHAT, "the gated router's buffers"));
+        };
+        let slots = b.u.dims.slots();
+        let head = |v: &DeviceBuffer<f32>, n: usize| -> Result<Vec<f32>, GpuError> {
+            let mut v = v.to_host_vec(stream)?;
+            v.truncate(n);
+            Ok(v)
+        };
+        let mut ids = r.ids.to_host_vec(stream)?;
+        ids.truncate(m * slots);
+        Ok(Ffn35Run {
+            logits: head(&r.logits, m * r.dims().logits())?,
+            ids,
+            weights: head(&r.weights, m * slots)?,
+            l_out: head(&b.u.x, m * hidden)?,
+        })
+    }
 }
 
 #[cfg(test)]

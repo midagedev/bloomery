@@ -1047,9 +1047,10 @@ impl KvPlanes {
 /// input's q8_1 blocks of 128 for a K-quant site, its q8 blocks of 32 for a
 /// Q8_0 site — and on the gemv arm the gate and up rows of an unfused
 /// gate·up, and the row-major output of a K-quant site launched alone at
-/// more than one row (`cols` values a column). [`Forms::KQUANT`] is a chain
-/// of fused Q4_K and Q6_K sites: the buffers the arena held before any other
-/// type ran.
+/// more than one row (`cols` values a column); and on a chain with a layer
+/// that keeps its shared expert apart, that expert's buffers (`apart`).
+/// [`Forms::KQUANT`] is a chain of fused Q4_K and Q6_K sites: the buffers
+/// the arena held before any other type ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Forms {
     pub(super) hid: Wants,
@@ -1057,6 +1058,15 @@ pub(super) struct Forms {
     pub(super) h: Wants,
     pub(super) glu: bool,
     pub(super) cols: usize,
+    pub(super) apart: Option<ApartForms>,
+}
+
+/// What a chain whose layer keeps its shared expert apart from its routed
+/// stacks (`plan::SharedPlan::Apart`) reads beyond a joined chain: on the
+/// wide arm, the forms of the shared expert's SwiGLU rows its downs read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ApartForms {
+    pub(super) h: Wants,
 }
 
 /// Which quantized forms of one wide input the sites read.
@@ -1082,6 +1092,7 @@ impl Forms {
         },
         glu: false,
         cols: 0,
+        apart: None,
     };
 }
 
@@ -1090,6 +1101,52 @@ impl Forms {
 pub(super) struct Glu {
     pub(super) g: DeviceBuffer<f32>,
     pub(super) u: DeviceBuffer<f32>,
+}
+
+/// The gemv arm's buffers of a layer that keeps its shared expert apart
+/// (`Forms::apart`), for at most [`GEMV_COLS`] tokens: the routed slots'
+/// card list (`slots` a token: the routed ids, the shared slot
+/// [`crate::hybrid::HOST`]), the shared expert's gate, up and SwiGLU rows
+/// (`ff` a token) with the SwiGLU's q8_1 form (`act[m − 1]` of `m` columns),
+/// its output (`hidden` a token), and the host sum the combine adds: zero,
+/// since a whole-card load serves every routed slot on the card.
+pub(super) struct ApartRows {
+    pub(super) sel: DeviceBuffer<u32>,
+    pub(super) g: DeviceBuffer<f32>,
+    pub(super) u: DeviceBuffer<f32>,
+    pub(super) h: DeviceBuffer<f32>,
+    pub(super) act: Vec<Q8Act>,
+    pub(super) y: DeviceBuffer<f32>,
+    pub(super) zero: DeviceBuffer<f32>,
+}
+
+impl ApartRows {
+    /// The buffers for `narrow` tokens of `d`, every one zero. Load-time
+    /// only.
+    fn new(stream: &CudaStream, d: &Dims, narrow: usize) -> Result<ApartRows, GpuError> {
+        let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        Ok(ApartRows {
+            sel: DeviceBuffer::zeroed(stream, narrow * d.slots())?,
+            g: f(narrow * d.ff)?,
+            u: f(narrow * d.ff)?,
+            h: f(narrow * d.ff)?,
+            act: (1..=narrow)
+                .map(|m| Q8Act::with_k(stream, m, d.ff))
+                .collect::<Result<Vec<_>, _>>()?,
+            y: f(narrow * d.hidden)?,
+            zero: f(narrow * d.hidden)?,
+        })
+    }
+
+    /// Device bytes.
+    fn bytes(&self) -> usize {
+        [&self.g, &self.u, &self.h, &self.y, &self.zero]
+            .iter()
+            .map(|b| b.num_bytes())
+            .sum::<usize>()
+            + self.sel.num_bytes()
+            + self.act.iter().map(act_bytes).sum::<usize>()
+    }
 }
 
 /// The arena, in chain order: every intermediate of one layer for up to
@@ -1165,6 +1222,9 @@ pub(super) struct Arena {
     /// more than one row (`Forms::cols` values a column); `None` on a
     /// one-row arena.
     pub(super) cols: Option<DeviceBuffer<f32>>,
+    /// The gemv arm's buffers of a layer that keeps its shared expert apart
+    /// (`Forms::apart`); `None` on a chain whose every layer joins it.
+    pub(super) apart: Option<ApartRows>,
 }
 
 /// Where the FFN's slots come from: a router launch's results — the plain
@@ -1634,6 +1694,10 @@ impl Arena {
             cols: (rows > 1 && forms.cols > 0)
                 .then(|| f(narrow * forms.cols))
                 .transpose()?,
+            apart: forms
+                .apart
+                .map(|_| ApartRows::new(stream, &d, narrow))
+                .transpose()?,
             dims: d,
             rows,
         })
@@ -1691,6 +1755,7 @@ impl Arena {
                 .as_ref()
                 .map_or(0, |g| g.g.num_bytes() + g.u.num_bytes())
             + self.cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.apart.as_ref().map_or(0, ApartRows::bytes)
             + self.route.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }

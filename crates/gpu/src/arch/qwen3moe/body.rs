@@ -70,6 +70,8 @@ pub(super) struct Q35Kernels {
     pub(super) q38: Q38Kernels,
     /// A K-quant site's gemv beyond the `Gpu`'s own (the Q5_K one).
     pub(super) kgemv: KGemvKernels,
+    /// The FFN's K-quant `_sel` family and its combine with a host sum.
+    pub(super) ffn: dispatch::FfnKernels,
 }
 
 /// The kernels the chain launches beyond the crate's shared modules.
@@ -114,6 +116,7 @@ impl Kernels {
                     g32: Gemm32Kernels::load(ctx)?,
                     q38: Q38Kernels::load(ctx)?,
                     kgemv: KGemvKernels::load(gpu)?,
+                    ffn: dispatch::FfnKernels::load(gpu)?,
                 })
             } else {
                 None

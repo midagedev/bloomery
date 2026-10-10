@@ -80,13 +80,12 @@ const COVERAGE_Q4KM: &[&str] = &["a tool-call parser for this template"];
 // where the default expert rule's card formats let them through to the load's refusal, so the
 // file's q5_K stacks are the two part items (down on 0,2-33,35-37; gate and up on layer 1 alone)
 // where one `q5_K routed experts on a card` line named them.
-const COVERAGE_UD: &[&str] = &[
-    "q5_K routed experts down, each shared expert joined in (the body reads q4_K and q6_K): 0,2-33,35-37",
-    "q8_0 shared expert down, joined into the routed stack (the body reads q4_K and q6_K): 0-39",
-    "q8_0 shared expert gate and up, joined into the routed stacks (the body reads q4_K): 0-39",
-    "q5_K routed experts gate and up, each shared expert joined in (the body reads q4_K): 1",
-    "a tool-call parser for this template",
-];
+// PIN(2026-10-10): Body35's FFN pins are the card kernel table's rows its dispatch runs
+// (`coverage::qwen35_gate_up`, `qwen35_down`, `qwen35_shared`): a q5_K gate·up (`kq_gate_up_act_q5k`)
+// and down (`q5k_gemv_sel`) beside their grouped GEMM, and a shared expert of another type than its
+// stacks kept apart as its own dense FFN of its type (q8_0 here, on every layer), so the four format
+// items left; red on the tree before by exactly those four lines.
+const COVERAGE_UD: &[&str] = &["a tool-call parser for this template"];
 
 // PIN(2026-09-27): each shape-table row of AVAILABLE the files use, and the item it covers on
 // them — the coverage change's FAIL-first, on the Q4_K_M file; with them two of Body35's own rows.
