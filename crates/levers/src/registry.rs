@@ -1354,6 +1354,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          tools' stub tests point it at their own.",
     ),
     path(
+        "BLOOMERY_LEASE_TRACE",
+        Some("ref/lease.sh"),
+        "The lease's trace file, `/root/bloomery-sittings.log` under the machine lease when \
+         unset; the tools' stub tests point it at their own.",
+    ),
+    path(
         "BLOOMERY_MODEL",
         Some("box.sh"),
         "Mac side, the tool profile a box command runs under (`tools/ref/models/`), which \
@@ -1999,6 +2005,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_PROFILE_LEVELS",
         Some("ref/profile-measure.sh"),
         "`tools/ref/profile-measure.sh`: the `BLOOMERY_PROFILE` levels it runs.",
+    ),
+    runner(
+        "BLOOMERY_Q_JOB",
+        Some("ref/lease.sh"),
+        "The box queue job a runner started under; the lease's trace names it.",
     ),
     runner(
         "BLOOMERY_RATE_CORE",
