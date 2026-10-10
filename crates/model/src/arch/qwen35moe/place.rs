@@ -54,8 +54,8 @@ use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::workstation::{
     self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
-    TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host, tier_batch_host_bytes,
-    tier_batch_staging_bytes,
+    TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
+    tier_batch_staging_bytes, unified_of,
 };
 use crate::placement::{
     self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
@@ -645,7 +645,7 @@ impl PlanInputs {
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
-            .violations()
+            .violations_beside(reserve)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. }))
             .chain(draft.violations())
@@ -746,7 +746,7 @@ impl PlanInputs {
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
-            .violations()
+            .violations_beside(reserve)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. }))
             .chain(draft.violations())
@@ -1037,7 +1037,8 @@ pub const fn counted_ubatch_bytes(card: &Card) -> u64 {
 
 /// The machine a qwen4exp plan runs on: `card` runs every one of `layers`,
 /// the head and the token embedding table whole (the file's q8_0 rows, which
-/// the card gathers), with this workstation's context, margin and host tier
+/// the card gathers), with this workstation's context and margin, the host
+/// its card's machine has ([`host_of`]: the pool on a unified machine)
 /// and the scratch of a load that runs ubatches of up to `ubatch` positions
 /// ([`card_scratch_bytes`]): the size the load itself takes, read once by
 /// the caller that builds this machine and opens the load. A host-routed
@@ -1080,7 +1081,8 @@ pub fn machine_for_experts(
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: host(),
+        host: host_of(&card),
+        unified: unified_of(&card),
     }
 }
 
@@ -1844,6 +1846,7 @@ fn draft_machine() -> Machine {
             usable_bytes: 0,
             reserves: Vec::new(),
         },
+        unified: None,
     }
 }
 
@@ -2297,6 +2300,7 @@ mod tests {
                     usable_bytes: u64::MAX,
                     reserves: Vec::new(),
                 },
+                unified: None,
             }
         }
 
@@ -3101,6 +3105,7 @@ mod tests {
                     usable_bytes: u64::MAX,
                     reserves: Vec::new(),
                 },
+                unified: None,
             }
         }
 

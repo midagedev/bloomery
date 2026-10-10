@@ -145,7 +145,10 @@ gguf 9 2 0
 # entries and launchers went from gpu-deepseek41's experts_mxfp4.rs to the gpu crate's mxfp4_sel.rs (14 blocks, 2
 # unsafe fns, verbatim), plus the one block that loads mxfp4_sel.rs's own device module (shared_module!), which the
 # entries need now that they are not in the draft router's module; its SAFETY line is the router module's.
-gpu 1638 180 8
+# PIN(2026-10-11): gpu 1638 -> 1639 blocks, new code, not old code relaxed: the census reads
+# CU_DEVICE_ATTRIBUTE_INTEGRATED (lib.rs raw_device_integrated, one block, with its SAFETY line), the census calls
+# beside it being raw driver calls of the same form.
+gpu 1639 180 8
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

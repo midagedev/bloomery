@@ -908,6 +908,7 @@ pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
             c.device,
             c.free_bytes,
             c.held_by,
+            c.integrated,
         )
     };
     let ok = witness(

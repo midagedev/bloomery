@@ -97,9 +97,12 @@ fn refuse_unless_whole_fits(split: &Split, o: Open35, card: CardSpec) -> Result<
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
     let machine = q3::machine(card, layers, 0);
+    let card = machine
+        .whole_card()
+        .ok_or_else(|| format!("the whole load on {}: a machine with no card", card.name))?;
     let need = whole_need(
         &inputs.model,
-        &machine.cards[0],
+        &card,
         kv,
         Qwen35moeModel::whole_load(split, o)?,
     )?;

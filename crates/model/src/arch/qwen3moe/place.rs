@@ -17,7 +17,9 @@ use gguf::{GgmlType, Split};
 use super::hparams::Hparams;
 use super::roles;
 use crate::arch::coverage::{qwen35_down, qwen35_gate_up};
-use crate::placement::workstation::{CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host};
+use crate::placement::workstation::{
+    CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host_of, unified_of,
+};
 use crate::placement::{
     self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
     Violation, checked, joined,
@@ -41,8 +43,9 @@ pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
 /// of `layers`, the head and the token embedding whole, with the
 /// workstation's context and margin, the m = 1 scratch plus `arena` bytes —
 /// what the load's prompt arenas hold beyond it, which the program sizes
-/// and its load refuses to pass — and the workstation's host. The spec's
-/// free reading and its holders ride on the card
+/// and its load refuses to pass — and the host the card's machine has
+/// ([`host_of`]: the workstation's, or the pool on a unified machine). The
+/// spec's free reading and its holders ride on the card
 /// ([`crate::placement::Card::free_bytes`]). No expert tier.
 #[must_use]
 pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
@@ -63,7 +66,8 @@ pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: host(),
+        host: host_of(&card),
+        unified: unified_of(&card),
     }
 }
 

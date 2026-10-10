@@ -159,6 +159,7 @@ mod tests {
                 shadow_bytes: 0,
                 reserve_bytes: 0,
                 row_reserve_bytes: 0,
+                pool_card_bytes: 0,
                 headroom_bytes: headroom,
             },
             nvme_bytes: 0,
@@ -186,6 +187,7 @@ mod tests {
                 usable_bytes: 0,
                 reserves: Vec::new(),
             },
+            unified: None,
         };
         let plan = with_headroom(&model, &machine, 150);
         let pool = ChurnPool {
