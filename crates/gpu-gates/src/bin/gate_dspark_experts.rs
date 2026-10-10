@@ -62,12 +62,14 @@ mod gate {
     use std::path::PathBuf;
 
     use bloomery_gpu::mxfp4::{BLOCK_BYTES, BLOCK_VALUES, lane_partial_host};
+    use bloomery_gpu::mxfp4_sel::{
+        DownArgs, GateUpArgs, MxAct, MxExpertKernels, MxStack, concat_route,
+    };
     use bloomery_gpu::route_core::renorm_divisor;
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_deepseek41::experts::swiglu_clamp;
     use bloomery_gpu_deepseek41::experts_mxfp4::{
-        DownArgs, DraftExpertKernels, DraftRouterOut, GateUpArgs, MxAct, MxStack, N_EXPERT, N_USED,
-        RouterArgs, concat_route, sqrt_softplus,
+        DraftRouterKernels, DraftRouterOut, N_EXPERT, N_USED, RouterArgs, sqrt_softplus,
     };
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
@@ -311,7 +313,8 @@ mod gate {
 
     struct Ctx<'a> {
         gpu: &'a Gpu,
-        dk: &'a DraftExpertKernels,
+        dk: &'a MxExpertKernels,
+        rk: &'a DraftRouterKernels,
         gate: Stack<'a>,
         up: Stack<'a>,
         down: Stack<'a>,
@@ -643,7 +646,7 @@ mod gate {
                 tok,
                 fault: cx.gpu.unlabelled_sink(),
             };
-            cx.dk.enqueue_router(s, &a, &mut out)?;
+            cx.rk.enqueue_router(s, &a, &mut out)?;
         }
         s.synchronize()?;
         Ok((
@@ -1006,12 +1009,14 @@ mod gate {
             hp.swiglu_limit[0]
         );
         let gpu = Gpu::new()?;
-        let dk = DraftExpertKernels::load(gpu.context())?;
+        let dk = MxExpertKernels::load(gpu.context())?;
+        let rk = DraftRouterKernels::load(gpu.context())?;
         let s = gpu.stream();
         let e = N_EXPERT as u64;
         let cx = Ctx {
             gpu: &gpu,
             dk: &dk,
+            rk: &rk,
             gate: load_stack(&split, s, &names::ffn_gate_exps(0), k, ff)?,
             up: load_stack(&split, s, &names::ffn_up_exps(0), k, ff)?,
             down: load_stack(&split, s, &names::ffn_down_exps(0), ff, k)?,

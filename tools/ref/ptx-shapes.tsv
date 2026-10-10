@@ -303,6 +303,9 @@ gate_e2e   cand_compact                             0           0
 gate_e2e   cand_remap                               0           0
 gate_e2e   cand_select                              0           0
 gate_e2e   card_sel                                 0           0
+gate_e2e   dflash_expert_down                       0           0
+gate_e2e   dflash_expert_gate_up                    0           0
+gate_e2e   dflash_quantize_q8_1                     0           0
 gate_e2e   down_add_q5_1                            0           0
 gate_e2e   ds41_ffn_handoff                         0           0
 gate_e2e   ds41_ffn_handoff_10                      0           0

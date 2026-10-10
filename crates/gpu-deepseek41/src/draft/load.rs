@@ -16,6 +16,7 @@
 //! The file is checked against [`dspark::inventory`] before anything is
 //! uploaded: an absent, misshapen or unread tensor is refused by name.
 
+use bloomery_gpu::mxfp4_sel::MxStack;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -27,7 +28,7 @@ use model::arch::models::shape::{MoeShape, rules, select_router};
 use model::embed::RowLayout;
 use model::placement::CardFormat;
 
-use crate::experts_mxfp4::{MxStack, ROUTER_ROW};
+use crate::experts_mxfp4::ROUTER_ROW;
 use crate::markov::MARKOV_ROW_WORDS;
 
 const WHAT: &str = "draft::load";
