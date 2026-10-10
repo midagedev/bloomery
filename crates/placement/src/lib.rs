@@ -5,7 +5,8 @@
 //! `model::placement`, so a caller names one crate for the model and its
 //! placement; what the planner needs of the model's file side reaches it as
 //! plain values ([`crate::placement::ModelTensors`], the device figures,
-//! the KV bytes).
+//! the KV bytes). [`kernels`] is the pure table of which common card kernel
+//! entry runs each operation on a file tensor of a given type.
 //!
 //! What does not live here, because the Mac cannot run it: the host tier's
 //! page locks and residency walks (`bloomery-model`'s
@@ -14,6 +15,7 @@
 //! and checker (`r8file`, which re-exports this crate's [`r8`]: the refusal
 //! type the planner's error wraps).
 
+pub mod kernels;
 pub mod placement;
 pub mod r8;
 pub mod slots;
