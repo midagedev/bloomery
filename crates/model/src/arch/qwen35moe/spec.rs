@@ -6,8 +6,9 @@
 //! query's width. The file folds the norms' `+1` offset into their gains, so
 //! every norm is a plain RMS norm. A layer's feed-forward block is the routed
 //! experts or, on a qwen35 file, one SwiGLU block of `feed_forward_length`
-//! (qwen35.cpp:470-480), as its tensors say. No chat parser is bound for this
-//! family.
+//! (qwen35.cpp:470-480), as its tensors say. The layers are the trunk's: a
+//! file's next-token layers are no layer of the description (`hparams`, their
+//! tensors `Role::Unused`). No chat parser is bound for this family.
 //!
 //! What qwen4exp changes, by its architecture and not by a key (llama.cpp
 //! `src/models/qwen4exp.cpp`): the GDN output gate is a sigmoid (:476-486);
@@ -71,7 +72,7 @@ pub fn spec_of(
         base: hp.rope_base,
         yarn: None,
     };
-    let layers = (0..hp.n_layer)
+    let layers = (0..hp.n_trunk)
         .map(|l| {
             let mixer = match hp.kinds[l] {
                 Kind::DeltaRule => Mixer::DeltaRule(DeltaRule {

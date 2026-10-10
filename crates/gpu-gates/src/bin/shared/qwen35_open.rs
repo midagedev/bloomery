@@ -93,7 +93,7 @@ pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, S
 /// its holders.
 fn refuse_unless_whole_fits(split: &Split, o: Open35, card: CardSpec) -> Result<(), GateError> {
     let inputs = q35::PlanInputs::describe(split)?;
-    let layers = inputs.hp.n_layer;
+    let layers = inputs.hp.n_trunk;
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
     let machine = q3::machine(card, layers, 0);

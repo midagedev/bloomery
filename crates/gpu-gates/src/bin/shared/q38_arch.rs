@@ -13,7 +13,7 @@ use model::arch::qwen35moe::hparams::Hparams;
 pub fn shape_of(hp: &Hparams) -> Result<Shape, GateError> {
     let ple = hp.exp.as_ref().and_then(|e| e.ple.as_ref());
     Shape::from_header(
-        hp.n_layer,
+        hp.n_trunk,
         hp.interval,
         ple.map(|p| p.layer),
         ple.and_then(|p| p.image),

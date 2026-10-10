@@ -2980,6 +2980,7 @@ mod tests {
             Hparams {
                 variant: Variant::Qwen4Exp,
                 n_layer: LAYERS,
+                n_trunk: LAYERS,
                 n_embd: 2560,
                 n_head: 16,
                 n_head_kv: 2,

@@ -27,7 +27,8 @@ pub fn layer(src: R8Source<'_>, hp: &Hparams, layer: usize) -> Result<HostLayer,
 }
 
 /// What a family layer's routed stacks are, as the host tier reads them:
-/// the layers, the experts a layer, the model width and an expert's width.
+/// the trunk's layers (a next-token layer's experts are never served), the
+/// experts a layer, the model width and an expert's width.
 /// The tensor names (`blk.L.ffn_{gate,up,down}_exps.weight`) are the same in
 /// every file of the qwen3moe family (qwen3moe, qwen35moe, qwen4exp), and
 /// the routed SwiGLU has no limit in any of them.
@@ -44,7 +45,7 @@ impl RoutedDims {
     #[must_use]
     pub fn of(hp: &Hparams) -> RoutedDims {
         RoutedDims {
-            n_layer: hp.n_layer,
+            n_layer: hp.n_trunk,
             n_expert: hp.n_expert,
             embd: hp.n_embd,
             ff: hp.expert_ff,
@@ -155,5 +156,33 @@ pub fn routed_layers(
             arch,
             layers: refused,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RoutedDims;
+    use crate::arch::qwen35moe::hparams::{Hparams, tests::keys, tests::tensors};
+    use crate::arch::synthetic::{V, header_shaped};
+
+    /// The host tier's layers are the trunk's: a file whose last block is a
+    /// next-token layer has one layer fewer than its block count.
+    #[test]
+    fn the_routed_layers_are_the_trunk_of_a_file_with_a_next_token_layer() {
+        let kv: Vec<(&str, V)> = keys()
+            .into_iter()
+            .map(|(k, v)| match k {
+                "block_count" => (k, V::U32(5)),
+                "attention.compress_ratios" => (k, V::I32s(vec![0, 0, 0, 4, 0])),
+                _ => (k, v),
+            })
+            .chain([("nextn_predict_layers", V::U32(1))])
+            .collect();
+        let path = header_shaped("q4x-host", "qwen4exp", &kv, &[], &tensors());
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let hp = Hparams::read(&split).expect("the header reads");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((hp.n_layer, hp.n_trunk), (5, 4));
+        assert_eq!(RoutedDims::of(&hp).n_layer, 4);
     }
 }
