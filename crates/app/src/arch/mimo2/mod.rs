@@ -6,7 +6,13 @@
 //! batches ([`bloomery_gpu_mimo2::prefill`]) or one decode step an id
 //! ([`GpuModel::step`]), the two leaving the same bits. The caches are per
 //! position, and the body takes no checkpoint, so a cut keeps every held
-//! position (its rollback takes positions back without device work).
+//! position (its rollback takes positions back without device work). The
+//! body parks resident slots ([`bloomery_gpu::model::Slots`]: a slot is its
+//! layers' stores), so [`crate::Session::add_slots`] and
+//! [`crate::Session::select_slot`] serve it as they serve every body that
+//! does.
+
+use std::num::NonZeroUsize;
 
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_mimo2::{Body, PrefillMode};
@@ -31,6 +37,10 @@ pub struct Mimo2Cfg {
     /// Batches a prompt group runs layer by layer
     /// ([`bloomery_gpu_mimo2::set_prefill_group`]).
     pub group: usize,
+    /// The resident sequences the plan counts and the load serves
+    /// ([`Body::open_placed_slots`]); [`crate::Session::add_slots`] makes
+    /// them after the load.
+    pub slots: NonZeroUsize,
 }
 
 impl Open for Body {
@@ -45,9 +55,10 @@ impl Open for Body {
         inputs.model.layers
     }
 
-    /// The plan on `machine`, refused unless its layers sit on one card: the
-    /// chain runs on one. A placement that hangs an expert tier card is
-    /// refused by the plan itself: every routed expert is the host's.
+    /// The plan on `machine` counting `cfg.slots` sequences, refused unless
+    /// its layers sit on one card: the chain runs on one. A placement that
+    /// hangs an expert tier card is refused by the plan itself: every routed
+    /// expert is the host's.
     fn plan<'a>(
         inputs: &'a PlanInputs,
         machine: &'a Machine,
@@ -68,7 +79,7 @@ impl Open for Body {
             detail: format!("a context of {ctx} positions passes u64"),
         })?;
         inputs
-            .plan(machine, ctx, &cfg.place)
+            .plan_with_slots(machine, ctx, &cfg.place, cfg.slots)
             .map_err(|e| GpuError::plan(WHAT, e))
     }
 
@@ -78,7 +89,7 @@ impl Open for Body {
         plan: &Plan<'_>,
         cfg: &Mimo2Cfg,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed(file, plan, inputs, 0, cfg.host)
+        Body::open_placed_slots(file, plan, inputs, 0, cfg.host, cfg.slots)
     }
 
     /// The configuration's feed and group; the batch feed's buffers made

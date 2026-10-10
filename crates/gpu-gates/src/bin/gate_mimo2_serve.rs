@@ -26,9 +26,9 @@
 //! hand on a census of two prints `deferred(one card) …` for the two session
 //! clauses. A `deferred(…)` line is a half that did not run, never a pass.
 //!
-//! The seat serves one slot, every routed expert on the host tier, the prompt
-//! fed in batches (bit for bit the decode steps), and a later request keeps
-//! any prefix it shares with what the slot holds. Every server is `bloomery-serve --model mimo2 -m
+//! The seat serves resident slots (`--parallel N`), every routed expert on the
+//! host tier, the prompt fed in batches (bit for bit the decode steps), and a
+//! later request keeps any prefix it shares with what its slot holds. Every server is `bloomery-serve --model mimo2 -m
 //! <file> …` beside this binary, `BLOOMERY_REF_MODEL` removed from its
 //! environment. Logs per server in `<dir>/<name>/` (`server.err`, the
 //! responses).
@@ -46,14 +46,26 @@
 //!   (`--ctx <ctx_max + 1024> --plan` is refused). FAIL-first: a seat that
 //!   defaults to 4096 regardless plans a `ctx_max` whose next step stands,
 //!   and the largest-plan hold is red.
-//! - `refusals_before_any_load`: `--parallel 2` exits non-zero within
-//!   [`REFUSE_WITHIN`], its stderr names the one-slot refusal and no `load`
-//!   record is printed. On a census of two cards, `--place bp` exits
-//!   non-zero the same way with the plan's tier-card refusal; on one card
-//!   the `bp` half is a `deferred(two cards)` line. FAIL-first: a seat that accepts
-//!   `--parallel 2` is still running at the bound and the clause is red.
+//! - `refusals_before_any_load`: `--ctx 1 --parallel 2` — a split that
+//!   leaves a slot no position — exits non-zero within [`REFUSE_WITHIN`],
+//!   its stderr names the split and no `load` record is printed. On a
+//!   census of two cards, `--place bp` exits non-zero the same way with the
+//!   plan's tier-card refusal; on one card the `bp` half is a `deferred(two cards)` line.
+//!   FAIL-first: a seat that takes a slot of no position is still running at
+//!   the bound and the clause is red.
+//! - `slots_total_is_planned`: the plan counts every slot's positions. At
+//!   the default context `c` (the first clause's), `--parallel 2 --ctx c
+//!   --plan` exits 0 and its `parallel` line splits it (`slots=2
+//!   slot_ctx=⌊c/2⌋`); `--parallel 2 --ctx c + [`CTX_STEP`]`, a total the
+//!   one-slot plan refuses, exits non-zero within [`REFUSE_WITHIN`], its
+//!   stderr names the plan's refusal and no `load` record is printed (a file
+//!   whose default is its trained context has no step past it and the second
+//!   half is a named skip). FAIL-first: a seat whose plan counts one slot
+//!   (`plan_with_slots` at one, over a slot's share) loads and is still
+//!   running at the bound; the refusal half is red.
 //!
-//! One server, `--ctx` [`CTX`], `--parallel 1`, `--port 0`:
+//! One server, `--ctx` [`CTX`], `--parallel 1`, `--port 0`, its answers the one
+//! slot's:
 //!
 //! - `load_and_listen`: the `load` record comes before the `listening`
 //!   record; the load names `arch=mimo2`, `slots=1`, `card_experts=0`,
@@ -91,7 +103,27 @@
 //!   else { 0 }`, `cut` refusing any other position by name).
 //!
 //! Then the server is stopped by its handle and waited for (its host set is
-//! free before the next load):
+//! free before the next load), and one server of `--parallel 2` over `2 ·`
+//! [`CTX`] positions (a slot of [`CTX`]) answers the same prompts together:
+//!
+//! - `two_slots_decode_as_one_slot_runs`: its `load` record names `slots=2`
+//!   and `ctx` [`CTX`], its `listening` record `slots=2`, its `parallel` line
+//!   the split, and its resident bytes exceed the one-slot server's by exactly
+//!   one slot's stores (the plan's own count, `KvLayout::bytes` over the
+//!   layers at [`CTX`]). Two rounds, each of two requests in flight together
+//!   at `cache_prompt: false` — the batch prompt with the prose prompt, then
+//!   the prose prompt with the batch prompt started first — answer each
+//!   prompt's ids bit for bit as the one-slot server answered them, the two
+//!   requests of a round on different slots (`id_slot`), and the server's
+//!   `swaps_total` is 0 or absent (the slots are resident, no state is
+//!   parked). The one-slot server's ids are the session's
+//!   (`server_ids_are_the_session_ids`), so this is the session's ids by
+//!   transitivity, and a second server is the only added load. FAIL-first: a
+//!   `swap_seq` that exchanges nothing leaves both slots on the live stores,
+//!   the slots overwrite each other's rows and the ids move; a `seq_bytes`
+//!   of 0 leaves the resident bytes short of the stores.
+//!
+//! Then, with both servers stopped:
 //!
 //! - `server_ids_are_the_session_ids`: the session opened in process at [`CTX`]
 //!   on the gate card (`shared/mimo2_open.rs`), each of the three prompts
@@ -147,11 +179,12 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
         Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl, edit_and_extension,
-        greedy, json_of, rendered, serve_cmd, server_log, tokenized,
+        greedy, json_of, metric, rendered, serve_cmd, server_log, tokenized,
     };
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, ref_model_path};
     use bloomery_levers::CARD_BUDGET;
     use gguf::Split;
+    use model::arch::mimo2::place::PlanInputs;
     use refset::arch::mimo2::{BATCH, IK};
     use serde_json::{Value, json};
 
@@ -184,13 +217,14 @@ mod gate {
 
     /// The clauses the child of a census of two or more owes: each prints its
     /// own `check` line, and the parent's verdict needs every one.
-    const CHILD_CLAUSES: [&str; 8] = [
+    const CHILD_CLAUSES: [&str; 9] = [
         "load_and_listen",
         "completion_ids",
         "chat_is_those_ids",
         "edit_resend_keeps_the_row_where_it_diverges",
         "edit_resend_ids_are_a_fresh_runs",
         "extension_keeps_every_held_position",
+        "two_slots_decode_as_one_slot_runs",
         "server_ids_are_the_session_ids",
         "ids_see_an_id_short",
     ];
@@ -202,9 +236,17 @@ mod gate {
     /// A `--plan` reads the file's header and exits; it opens no card.
     const PLAN_WITHIN: Duration = Duration::from_secs(120);
 
-    /// The words the one-slot refusal names: the seat serves one slot, and
-    /// the prompt cache is not served either.
-    const ONE_SLOT: [&str; 2] = ["serves one slot", "no prompt cache"];
+    /// The words the slot split's refusal names (`--ctx 1 --parallel 2`): the
+    /// flags, and the positions a slot is left with.
+    const SPLIT_REFUSAL: [&str; 2] = [
+        "--parallel 2 splits it to 0 positions a slot",
+        "a slot holds at least one position",
+    ];
+
+    /// The words the plan's refusal of a total the card cannot hold names:
+    /// the dense trunk's need, which the KV term counts every slot's stores
+    /// in.
+    const PLAN_REFUSAL: [&str; 2] = ["the plan's dense trunk alone needs", "KV"];
 
     /// The words the plan's tier-card refusal names (`PlacementError::
     /// HostRoutedTier`): the tier card, and the plan that keeps every routed
@@ -504,6 +546,33 @@ mod gate {
         Ok(())
     }
 
+    /// A server of `args` refused before any load: it exits non-zero within
+    /// [`REFUSE_WITHIN`], its stderr holds every word of `want` and it
+    /// printed no `load` record. A server still running at the bound is
+    /// killed and the refusal is red.
+    fn refusal(
+        dir: &Path,
+        file: &Path,
+        name: &str,
+        args: &[&str],
+        want: &[&str],
+    ) -> Result<bool, GateError> {
+        let (status, err) = run_to_exit(dir, name, file, args, REFUSE_WITHIN)?;
+        let text = std::fs::read_to_string(&err).unwrap_or_default();
+        let log = server_log(&err, record::BLOOMERY_SERVE_MIMO2)?;
+        let no_load = log.first(&record::LOAD_MIMO2)?.is_none();
+        let named = want.iter().all(|w| text.contains(w));
+        let exited = status.is_some_and(|s| !s.success());
+        println!(
+            "{name}: exit non-zero within {REFUSE_WITHIN:?} {exited}; names {want:?} {named}; \
+             no load record {no_load}"
+        );
+        if !(exited && named && no_load) {
+            println!("{name} stderr:\n{text}");
+        }
+        Ok(exited && named && no_load)
+    }
+
     /// `refusals_before_any_load` (the module header); `cards` the visible
     /// cards of the census.
     fn refusals_before_any_load(
@@ -512,29 +581,17 @@ mod gate {
         cards: usize,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        let refusal = |name: &str, args: &[&str], want: &[&str]| -> Result<bool, GateError> {
-            let (status, err) = run_to_exit(dir, name, file, args, REFUSE_WITHIN)?;
-            let text = std::fs::read_to_string(&err).unwrap_or_default();
-            let log = server_log(&err, record::BLOOMERY_SERVE_MIMO2)?;
-            let no_load = log.first(&record::LOAD_MIMO2)?.is_none();
-            let named = want.iter().all(|w| text.contains(w));
-            let exited = status.is_some_and(|s| !s.success());
-            println!(
-                "{name}: exit non-zero within {REFUSE_WITHIN:?} {exited}; names {want:?} {named}; \
-                 no load record {no_load}"
-            );
-            if !(exited && named && no_load) {
-                println!("{name} stderr:\n{text}");
-            }
-            Ok(exited && named && no_load)
-        };
         let mut pass = refusal(
-            "refuse-parallel",
-            &["--parallel", "2", "--port", "0"],
-            &ONE_SLOT,
+            dir,
+            file,
+            "refuse-split",
+            &["--ctx", "1", "--parallel", "2", "--port", "0"],
+            &SPLIT_REFUSAL,
         )?;
         if cards >= 2 {
             pass &= refusal(
+                dir,
+                file,
                 "refuse-bp",
                 &["--place", "bp", "--port", "0"],
                 &TIER_REFUSAL,
@@ -545,8 +602,54 @@ mod gate {
                 "deferred(two cards) refusals_before_any_load (--place bp): {cards} card in view; \
                  the tier-card refusal needs a census of two"
             );
-            check(ok, "refusals_before_any_load (--parallel 2 only)", pass);
+            check(ok, "refusals_before_any_load (the split only)", pass);
         }
+        Ok(())
+    }
+
+    /// `slots_total_is_planned` (the module header).
+    fn slots_total_is_planned(dir: &Path, file: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let trained = trained_ctx(file)?;
+        let (_, log, _) = plan_run(dir, "plan-for-slots", file, &[])?;
+        let Some(plan) = log.first(&record::PLAN)? else {
+            println!("slots_total_is_planned: the default plan printed no plan record");
+            check(ok, "slots_total_is_planned", false);
+            return Ok(());
+        };
+        let c = plan.u64("ctx_max")?;
+        let c_arg = c.to_string();
+        let (status, _, text) = plan_run(
+            dir,
+            "plan-two-slots",
+            file,
+            &["--parallel", "2", "--ctx", &c_arg],
+        )?;
+        let want = format!(
+            "parallel rule=slots slots=2 slot_ctx={} total={} from=flag",
+            c / 2,
+            2 * (c / 2)
+        );
+        let split = status.is_some_and(|s| s.success()) && text.lines().any(|l| l == want);
+        println!("two slots over the default context {c}: the parallel line {want:?} {split}");
+        // One step past the default the one-slot plan refuses; two slots plan
+        // the same total, so the refusal is the total's, not a slot's share.
+        let refused = if trained.is_some_and(|t| c >= t) {
+            println!(
+                "skip slots_total_is_planned (refusal half): the default {c} is the trained \
+                 context, no step of {CTX_STEP} past it"
+            );
+            true
+        } else {
+            let next = (c + CTX_STEP).to_string();
+            refusal(
+                dir,
+                file,
+                "refuse-total",
+                &["--parallel", "2", "--ctx", &next, "--port", "0"],
+                &PLAN_REFUSAL,
+            )?
+        };
+        check(ok, "slots_total_is_planned", split && refused);
         Ok(())
     }
 
@@ -584,6 +687,8 @@ mod gate {
         batch: Answer,
         prose: Answer,
         chat: Answer,
+        /// The one-slot server's `load` record's resident bytes.
+        resident: u64,
     }
 
     /// The server's clauses on the one that listens, `load_and_listen` to the
@@ -683,7 +788,166 @@ mod gate {
             &later,
         )?;
         println!("server stopped: {}", s.stop()?);
-        Ok(Some(Answers { batch, prose, chat }))
+        Ok(Some(Answers {
+            batch,
+            prose,
+            chat,
+            resident: load.u64("resident_bytes")?,
+        }))
+    }
+
+    /// What a request of a round answered, and the slot it ran on.
+    struct Ran {
+        tokens: Vec<u32>,
+        stop: String,
+        slot: Option<u64>,
+    }
+
+    /// How long a round's first request is in flight before its second is
+    /// posted: the engine thread admits it to the other slot.
+    const POST_GAP: Duration = Duration::from_millis(300);
+
+    /// A round of two requests in flight together on `addr`: `first` posted,
+    /// `gap` later `second`, each a greedy `/completion` of [`N`] ids at
+    /// `cache_prompt: false`, its body kept in `d` under its name.
+    fn together(
+        addr: &str,
+        d: &Path,
+        gap: Duration,
+        first: (&str, &Answer),
+        second: (&str, &Answer),
+    ) -> Result<[Ran; 2], GateError> {
+        let post = |(name, a): (&str, &Answer)| {
+            let (addr, d, name, prompt) = (
+                addr.to_owned(),
+                d.to_path_buf(),
+                name.to_owned(),
+                a.prompt.clone(),
+            );
+            move || -> Result<Ran, String> {
+                let url = |p: &str| format!("http://{addr}{p}");
+                let (a, v) =
+                    greedy(&url, prompt, N, &d, &name, false).map_err(|e| e.to_string())?;
+                Ok(Ran {
+                    tokens: a.tokens,
+                    stop: a.stop,
+                    slot: v["id_slot"].as_u64(),
+                })
+            }
+        };
+        std::thread::scope(|sc| {
+            let a = sc.spawn(post(first));
+            std::thread::sleep(gap);
+            let b = sc.spawn(post(second));
+            let a = a.join().map_err(|_| "a round's first request panicked")??;
+            let b = b
+                .join()
+                .map_err(|_| "a round's second request panicked")??;
+            Ok([a, b])
+        })
+    }
+
+    /// `two_slots_decode_as_one_slot_runs` (the module header): a server of
+    /// two slots of [`CTX`] positions answers `one`'s prompts together, bit
+    /// for bit as the one-slot server answered them.
+    fn two_slots_decode_as_one_slot_runs(
+        dir: &Path,
+        file: &Path,
+        one: &Answers,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        const NAME: &str = "two_slots_decode_as_one_slot_runs";
+        let total = (2 * CTX).to_string();
+        let (mut s, d) = spawn(
+            dir,
+            "serve-two",
+            file,
+            &["--ctx", &total, "--parallel", "2", "--port", "0"],
+        )?;
+        let err_log = d.join("server.err");
+        let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            Ok(addr) => addr,
+            Err(e) => {
+                println!("the two-slot server never listened: {e}");
+                println!(
+                    "server stderr:\n{}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                check(ok, NAME, false);
+                return Ok(());
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let records = server_log(&err_log, record::BLOOMERY_SERVE_MIMO2)?;
+        let load = records.one(&record::LOAD_MIMO2)?;
+        let listen = records.one(&record::LISTENING_MIMO2)?;
+        // One more sequence's stores, by the plan's own layout.
+        let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
+        let store_bytes = PlanInputs::describe(&split)?
+            .kv
+            .bytes(0..LAYERS as usize, CTX as u64);
+        let stderr = std::fs::read_to_string(&err_log).unwrap_or_default();
+        let line = format!(
+            "parallel rule=slots slots=2 slot_ctx={CTX} total={} from=flag",
+            2 * CTX
+        );
+        let resident = load.u64("resident_bytes")?;
+        let loaded = load.u64("slots")? == 2
+            && load.u64("ctx")? == CTX as u64
+            && listen.u64("slots")? == 2
+            && listen.u64("ctx")? == CTX as u64
+            && stderr.lines().any(|l| l == line)
+            && resident == one.resident + store_bytes;
+        println!(
+            "two-slot server at {addr}; load record {:?}; listening record {:?}; resident \
+             {resident} B against the one-slot server's {} B and one slot's stores \
+             {store_bytes} B: {loaded}",
+            load.line(),
+            listen.line(),
+            one.resident
+        );
+        // Each round's two requests, and the one-slot answers each is held to.
+        let by = [
+            ("batch", &one.batch),
+            ("prose", &one.prose),
+            ("chat", &one.chat),
+        ];
+        let get = |n: &str| by.iter().find(|(m, _)| *m == n).map(|&(_, a)| a);
+        let rounds = [
+            ("batch", "prose", POST_GAP),
+            ("prose", "batch", POST_GAP),
+            ("chat", "prose", Duration::ZERO),
+        ];
+        let mut same = true;
+        for (i, (f, g, gap)) in rounds.into_iter().enumerate() {
+            let (Some(fa), Some(ga)) = (get(f), get(g)) else {
+                return Err(format!("round {i}: no one-slot answer for {f} or {g}").into());
+            };
+            let ran = together(
+                &addr,
+                &d,
+                gap,
+                (&format!("round{i}-{f}"), fa),
+                (&format!("round{i}-{g}"), ga),
+            )?;
+            let equal = [(&ran[0], fa), (&ran[1], ga)]
+                .iter()
+                .all(|(r, a)| !r.tokens.is_empty() && r.tokens == a.tokens && r.stop == a.stop);
+            let apart = matches!((ran[0].slot, ran[1].slot), (Some(a), Some(b)) if a != b);
+            println!(
+                "round {i}: {f} on slot {:?} and {g} on slot {:?} in flight together; ids equal \
+                 the one-slot server's {equal}; on different slots {apart}",
+                ran[0].slot, ran[1].slot
+            );
+            same &= equal && apart;
+        }
+        // The slots are resident: no state was parked to give the engine
+        // over.
+        let swaps = metric(&url, "swaps_total")?;
+        println!("swaps_total {swaps:?}");
+        check(ok, NAME, loaded && same && swaps.is_none_or(|v| v == 0.0));
+        println!("two-slot server stopped: {}", s.stop()?);
+        Ok(())
     }
 
     /// The server's cut as the session runs it: the prompt less its last id,
@@ -759,8 +1023,8 @@ mod gate {
         Ok(())
     }
 
-    /// The clauses after the refusals, in this process: the server's, then
-    /// the session's on a census of one.
+    /// The clauses after the refusals, in this process: the server's, the
+    /// two-slot server's against them, then the session's on a census of one.
     fn after_refusals(
         dir: &Path,
         file: &Path,
@@ -771,7 +1035,11 @@ mod gate {
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let batch = toks.to_vec();
-        match served(dir, file, batch, ok)? {
+        let answers = served(dir, file, batch, ok)?;
+        if let Some(one) = &answers {
+            two_slots_decode_as_one_slot_runs(dir, file, one, ok)?;
+        }
+        match answers {
             Some(answers) if cards == 1 => {
                 server_ids_are_the_session_ids(file, levers, &answers, &man, ok)?;
             }
@@ -795,13 +1063,14 @@ mod gate {
 
         if a.after_refusals {
             println!(
-                "plan_only_names_its_default, refusals_before_any_load: run by the parent of this \
-                 child"
+                "plan_only_names_its_default, refusals_before_any_load, slots_total_is_planned: run by \
+                 the parent of this child"
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
             plan_only_names_its_default(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
+            slots_total_is_planned(&a.dir, &file, &mut ok)?;
             if cards >= 2 {
                 child_clauses(&a.dir, &mut ok)?;
             } else {

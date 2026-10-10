@@ -6,11 +6,17 @@
 //! Each layer is a GQA attention over a full plane of the stores' positions —
 //! its window bounds what a query reads, not what the layer holds — and a
 //! block; the step is [`crate::program`]'s walk, one token at a time (there is
-//! no verify pass of several rows, no draft and no resident slot). A prompt is
-//! fed by that step an id or in batches of up to a union's columns
-//! ([`prefill`]), which leave the model in the same state bit for bit. The
-//! embedding is a host row, dequantized per step and copied into `x` before
-//! the launch.
+//! no verify pass of several rows and no draft). A prompt is fed by that step
+//! an id or in batches of up to a union's columns ([`prefill`]), which leave
+//! the model in the same state bit for bit. The embedding is a host row,
+//! dequantized per step and copied into `x` before the launch.
+//!
+//! The body serves resident sequence slots ([`Slots`]): a sequence is its
+//! layers' stores ([`Seq`]), and a select exchanges those handles while the
+//! model parks each slot's captured steps and position. Everything else is
+//! the load's, one for whichever slot is live: the step's buffers, the batch
+//! feed's arena (written and read inside one call), the rope tables, the
+//! host tier and the taps.
 //!
 //! What the load refuses, by name: a plan of other than one card with no
 //! expert tier, a plan that puts a routed expert on a card, a description
@@ -19,6 +25,7 @@
 //! other rows than the description's, a non-finite sink, stores whose bytes
 //! are not the plan's, and a scratch past the plan's term.
 
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -28,7 +35,7 @@ use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use bloomery_gpu::model::{ChainBody, Rollback, StepMode, refuse_scratch_past};
+use bloomery_gpu::model::{ChainBody, Rollback, Slots, StepMode, refuse_scratch_past};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -300,6 +307,10 @@ pub struct Body {
     ctx: usize,
     /// How a prompt is fed, and the batch feed's buffers.
     prompt: PromptState,
+    /// The resident sequences the load's plan counts, the live one included
+    /// ([`Body::open_placed_slots`]), and the ones made so far.
+    slots_planned: usize,
+    slots_made: usize,
 }
 
 /// The walk's parts, lent apart from the host tier.
@@ -485,13 +496,41 @@ impl Body {
         card: usize,
         host: HostCfg,
     ) -> Result<Mimo2Model, GpuError> {
+        Body::open_placed_slots(file, plan, inputs, card, host, NonZeroUsize::MIN)
+    }
+
+    /// [`Body::open_placed`] by a plan that counts `slots` resident
+    /// sequences ([`PlanInputs::plan_with_slots`]): the model then makes up
+    /// to `slots` of them, the live one included
+    /// ([`bloomery_gpu::GpuModel::add_slots`]), and refuses one past them by
+    /// name ([`Slots::new_seq`]) — a sequence the plan did not count is card
+    /// memory nothing reserved. A plan that counts another number of
+    /// sequences is refused by name at the load.
+    pub fn open_placed_slots(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+        slots: NonZeroUsize,
+    ) -> Result<Mimo2Model, GpuError> {
         GpuModel::load_placed(
             file,
             plan,
             card,
             host,
             |_, _, _, _| Ok(()),
-            |gpu, file, w, set| Body::load(gpu, Arc::new(file), w, (plan, inputs, card), host, set),
+            |gpu, file, w, set| {
+                Body::load(
+                    gpu,
+                    Arc::new(file),
+                    w,
+                    (plan, inputs, card),
+                    host,
+                    set,
+                    slots,
+                )
+            },
         )
     }
 
@@ -506,6 +545,7 @@ impl Body {
         (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
         host: HostCfg,
         residency: HostResidency,
+        seqs: NonZeroUsize,
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
         if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() {
@@ -600,6 +640,20 @@ impl Body {
                 "the stores hold {held} device bytes; the plan's layout counts {planned}"
             )));
         }
+        let counted = plan
+            .cards
+            .get(card)
+            .map(|t| t.kv_bytes)
+            .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
+        let want = planned.saturating_mul(seqs.get() as u64);
+        if counted != want {
+            return Err(shape(format!(
+                "the plan counts {counted} store bytes on card {card}; a load of {seqs} \
+                 resident sequences of {} positions holds {want} (plan it with \
+                 PlanInputs::plan_with_slots at the load's sequences)",
+                plan.ctx_max
+            )));
+        }
         let ropes = thetas
             .iter()
             .map(|&t| RopeBase::new(stream, t, ctx))
@@ -655,6 +709,8 @@ impl Body {
             taps: None,
             ctx,
             prompt: PromptState::new(),
+            slots_planned: seqs.get(),
+            slots_made: 1,
         };
         refuse_scratch_past(
             WHAT,
@@ -721,6 +777,32 @@ impl Body {
                 .sum::<usize>()
             + self.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
+    }
+
+    /// Every store's bits on the host, a layer's key plane then its value
+    /// plane, in layer order: the live sequence's whole state, for a gate's
+    /// digest. Blocking.
+    pub fn store_planes(&self, gpu: &Gpu) -> Result<Vec<Vec<u16>>, GpuError> {
+        let stream = gpu.stream();
+        let mut out = Vec::with_capacity(2 * self.stores.len());
+        for s in &self.stores {
+            out.push(s.k.to_host_vec(stream)?);
+            out.push(s.v.to_host_vec(stream)?);
+        }
+        Ok(out)
+    }
+
+    /// Every store of the live sequence zeroed: the state of a fresh
+    /// sequence ([`Slots::new_seq`]), which [`ChainBody::reset`] leaves
+    /// stale rows past the position of. A gate's seam; never inside a
+    /// capture.
+    pub fn clear_stores(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        let stream = gpu.stream();
+        for s in &mut self.stores {
+            s.k.zero_async(stream)?;
+            s.v.zero_async(stream)?;
+        }
+        Ok(())
     }
 
     /// The host tier.
@@ -894,5 +976,67 @@ impl Rollback for Body {
     /// rows past `pos` are dead the moment the model stands at `pos`.
     fn rollback(&mut self, _pos: u32) -> Result<(), GpuError> {
         Ok(())
+    }
+}
+
+/// One resident sequence of the load ([`Slots`], what a select exchanges):
+/// its layers' stores. Every step and every prompt call writes the stores
+/// and a later call reads them; nothing else outlives a call. The buffer
+/// handles move on a select, and each slot's captured steps keep addressing
+/// the stores that were live when they were captured.
+pub struct Seq {
+    stores: Vec<Store>,
+}
+
+impl Slots for Body {
+    type Seq = Seq;
+
+    /// A sequence of the load's shape in the state the load leaves
+    /// ([`ChainBody::reset`]'s contract): zeroed stores of the live ones'
+    /// positions and kv heads. Refused by name past the sequences the load's
+    /// plan counts ([`Body::open_placed_slots`]), and when the card has
+    /// fewer free bytes than the stores take (the prompt batch's buffers
+    /// are unreserved and come out of the same free bytes). Load-time
+    /// allocation.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
+        if self.slots_made >= self.slots_planned {
+            return Err(shape(format!(
+                "sequence {} of a plan that counts {} resident sequences; plan the load for as \
+                 many as it serves (PlanInputs::plan_with_slots, Body::open_placed_slots)",
+                self.slots_made + 1,
+                self.slots_planned
+            )));
+        }
+        let need = self.seq_bytes();
+        let (free, _) = gpu.mem_info()?;
+        if need > free {
+            return Err(shape(format!(
+                "a sequence of {need} B of stores, and the card has {free} B free"
+            )));
+        }
+        let stream = gpu.stream();
+        let stores = self
+            .cfg
+            .iter()
+            .map(|c| Store::new(stream, c.attn.kv_heads, self.ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Last, so a sequence whose allocation failed is not counted.
+        self.slots_made += 1;
+        Ok(Seq { stores })
+    }
+
+    /// Exchange the live sequence's stores with `seq`'s: pointer moves, no
+    /// device work. Nothing is in flight to drain first: every call ends on
+    /// a synchronized readback (the token, the prompt's fault word), and the
+    /// host tier keeps no state of a sequence (the rows of a step are
+    /// consumed inside it, and no residency machine runs).
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
+        std::mem::swap(&mut self.stores, &mut seq.stores);
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its stores.
+    fn seq_bytes(&self) -> usize {
+        self.store_bytes()
     }
 }

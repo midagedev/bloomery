@@ -10,6 +10,9 @@
 //! and refuses by name a machine that hangs an expert tier card and a
 //! context of no position.
 
+use std::num::NonZeroUsize;
+
+use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::Split;
 use models::ModelSpec;
 
@@ -114,11 +117,44 @@ impl PlanInputs {
         ctx_max: u64,
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_with_slots(machine, ctx_max, levers, NonZeroUsize::MIN)
+    }
+
+    /// The placement of a load that serves `slots` resident sequences of
+    /// `ctx_max` positions each: every layer's KV planes counted `slots`
+    /// times on the card ([`SeqTerms::slots_of`] over
+    /// [`PlanInputs::seq_terms`]), refused as [`PlanInputs::plan`] refuses.
+    /// A sequence holds nothing beside its stores, so the card's kv class is
+    /// `slots` sequences' stores.
+    pub fn plan_with_slots<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        slots: NonZeroUsize,
+    ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
-        let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
+        let kv = self.seq_terms().slots_of(slots.get() as u64);
+        let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &kv, levers)?;
         checked(plan).map_err(PlaceError::Broken)
+    }
+
+    /// What one resident sequence of a load of the file holds on its card
+    /// ([`SeqTerms`]): its stores over the trunk's layers ([`KvLayout`]), no
+    /// draft and nothing beside them — the body's sequence is its layers'
+    /// KV planes alone.
+    #[must_use]
+    pub fn seq_terms(&self) -> SeqTerms<'_> {
+        SeqTerms {
+            layers: Stores {
+                kv: &self.kv,
+                count: self.hp.n_trunk,
+            },
+            draft: None,
+            beside: 0,
+        }
     }
 }
 
@@ -167,7 +203,7 @@ mod tests {
     use gguf::Split;
 
     use super::super::hparams::tests::{keys, tensors};
-    use super::{F16_BYTES, KvBytes, KvLayout, PlanInputs};
+    use super::{F16_BYTES, KvBytes, KvLayout, PlanInputs, SeqTerms, Stores};
     use crate::arch::synthetic::{V, header_shaped};
 
     /// A layer's plane: its own KV-head count's key and value rows in f16 a
@@ -188,6 +224,30 @@ mod tests {
         assert_eq!(kv.layer_bytes(4, 9), 0);
         assert_eq!(kv.bytes(0..4, 1), 6 * 48);
         assert_eq!(kv.bytes(0..4, 9), 9 * 6 * 48);
+    }
+
+    /// One sequence's terms are the layout's stores over the trunk with
+    /// nothing beside them, and `slots` sequences count each layer `slots`
+    /// times — the card's kv class of a load that serves them.
+    #[test]
+    fn seq_terms_count_every_sequence() {
+        let kv = KvLayout {
+            kv_heads: vec![2, 1, 1, 2],
+            row: (16 + 8) as u64 * F16_BYTES,
+        };
+        let terms = SeqTerms {
+            layers: Stores { kv: &kv, count: 4 },
+            draft: None,
+            beside: 0,
+        };
+        assert_eq!(terms.bytes(9, 1), kv.bytes(0..4, 9));
+        assert_eq!(terms.bytes(9, 3), 3 * kv.bytes(0..4, 9));
+        assert_eq!(terms.plan_kv(9, 3), 3 * kv.bytes(0..4, 9));
+        let three = terms.slots_of(3);
+        for l in 0..4 {
+            assert_eq!(three.layer_bytes(l, 9), 3 * kv.layer_bytes(l, 9));
+        }
+        assert_eq!(three.layer_bytes(4, 9), 0);
     }
 
     /// A file whose next-token layers carry tensors is refused at

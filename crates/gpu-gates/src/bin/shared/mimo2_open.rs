@@ -6,6 +6,7 @@
 //! ([`last_argmax`]). A gate includes it by `#[path]` and holds
 //! `shared/gate_card.rs` and `shared/e2e.rs` as modules beside it.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 
@@ -93,6 +94,7 @@ pub fn open(
         host: levers.host(),
         prefill: PrefillMode::Steps,
         group: 1,
+        slots: NonZeroUsize::MIN,
     };
     let mut log = Log {
         t: Instant::now(),

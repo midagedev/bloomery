@@ -50,7 +50,21 @@
 //!   prefill is two batches and the 4,096-position one eight, so the cut at a
 //!   batch's end and a flash over a window of real keys are both on the path.
 //!
-//! `--only s|p|c|t|b` runs one clause on the load; `--step-sets short` takes
+//! - (slots) resident sequence slots, on loads of their own at [`SLOT_CTX`]
+//!   positions after the main load is dropped: the slot harness's contracts
+//!   (`slots_gate`: H1 interleave — two streams, each run solo and then
+//!   together on their own slots with a select between every token, every
+//!   slot's ids, last logits, store digest and position its solo run's —, H3
+//!   bytes, H4 reset, H5 poison, H6 refusals, H7 captures), through
+//!   [`MimoSlots`]; and (sp): a sequence past the plan's count refused by
+//!   name, the plan's kv class of two slots twice the stores of one slot's
+//!   (and the descriptor's bytes), and a load of two sequences by a plan of
+//!   one refused by name. FAIL-first: a `swap_seq` that exchanges nothing
+//!   leaves both slots on the live stores and H1 is red; a `seq_bytes` of 0
+//!   is red at H3.
+//!
+//! `--only s|p|c|t|b|slots` runs one clause on the load (`slots` on its own
+//! loads); `--step-sets short` takes
 //! (t)'s two 4-token sets only, `--step-sets long` the 1,024- and
 //! 4,096-position sets only, `--step-sets d1k` the 1,024-position one,
 //! `--step-sets all` (the default) all four; it goes with `--only t`, `--only
@@ -100,19 +114,22 @@ mod mimo2_open;
 mod gate {
     use crate::e2e::{elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, word_after};
     use crate::mimo2_open::{N_VOCAB, Opened, last_argmax, open};
+    use std::num::NonZeroUsize;
     use std::path::Path;
     use std::time::Instant;
 
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
-    use bloomery_gpu_mimo2::{Mimo2Model, set_taps};
+    use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode, feed, set_prefill, set_taps};
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::mimo2::place::PlanInputs;
     use model::arch::mimo2::program::{AttnArgs, step_launches};
     use model::arch::models::Mixer;
+    use model::placement::PlanLevers;
     use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
@@ -499,6 +516,220 @@ mod gate {
         Ok((taps, logits))
     }
 
+    // ------------------------------------------------------- (slots) slots
+
+    /// Cache rows of the slots' load: a slot's positions, over the longest
+    /// stream (a prompt, [`SLOT_STEPS`] steps and the harness's tails).
+    const SLOT_CTX: usize = 256;
+
+    /// Greedy steps and continuation steps of a slot's stream
+    /// ([`SlotsAdapter::STEPS`], [`SlotsAdapter::TAIL`]).
+    const SLOT_STEPS: usize = 12;
+    const SLOT_TAIL: usize = 6;
+
+    /// The (slots) body for the slot harness ([`slots_gate`]): the load at
+    /// [`SLOT_CTX`] positions on the gate placement, its plan counting the
+    /// slots it serves ([`PlanInputs::plan_with_slots`]), stream `i`'s prompt
+    /// `prompts[i]` fed as the server feeds it ([`server_start`]).
+    struct MimoSlots<'a> {
+        levers: &'a bloomery_levers::Levers,
+        inputs: PlanInputs,
+        prompts: [Vec<u32>; slots_gate::STREAMS],
+    }
+
+    impl MimoSlots<'_> {
+        /// The plan of `slots` sequences on `machine` the load runs by.
+        fn plan<'p>(
+            &'p self,
+            machine: &'p model::placement::Machine,
+            slots: NonZeroUsize,
+        ) -> Result<model::placement::Plan<'p>, GateError> {
+            let place = PlanLevers::from_levers(self.levers)?;
+            Ok(self
+                .inputs
+                .plan_with_slots(machine, SLOT_CTX as u64, &place, slots)?)
+        }
+    }
+
+    impl SlotsAdapter for MimoSlots<'_> {
+        type Body = Body;
+
+        const STEPS: usize = SLOT_STEPS;
+        const TAIL: usize = SLOT_TAIL;
+
+        fn open(&self, slots: usize) -> Result<Mimo2Model, GateError> {
+            let n = NonZeroUsize::new(slots).ok_or("(slots) a load of no slot")?;
+            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
+            let plan = self.plan(&machine, n)?;
+            let t = Instant::now();
+            let mut m =
+                Body::open_placed_slots(file, &plan, &self.inputs, 0, self.levers.host(), n)?;
+            set_prefill(&mut m, PrefillMode::Batch)?;
+            println!(
+                "slots load resident_bytes={} ctx={SLOT_CTX} slots={slots} in {:.1} s (runtime \
+                 value)",
+                m.resident_bytes(),
+                t.elapsed().as_secs_f64()
+            );
+            Ok(m)
+        }
+
+        /// The reset, and every store zeroed: a reset keeps the rows past
+        /// the position (a position is written before a later one reads
+        /// it), which [`SlotsAdapter::state_hash`] reads whole, so no other
+        /// stream's rows may stand there.
+        fn rewind(&self, m: &mut Mimo2Model) -> Result<(), GateError> {
+            m.reset()?;
+            let (gpu, _, body) = m.body_parts("gate_mimo2_e2e slots")?;
+            body.clear_stores(gpu)?;
+            gpu.stream().synchronize()?;
+            Ok(())
+        }
+
+        fn prompt(&self, m: &mut Mimo2Model, stream: usize) -> Result<u32, GateError> {
+            let p = self
+                .prompts
+                .get(stream)
+                .ok_or_else(|| format!("(slots) runs streams 0 and 1, not {stream}"))?;
+            server_start(m, p)
+        }
+
+        /// Every layer's key and value planes of the selected slot, every
+        /// row of them.
+        fn state_hash(&self, m: &mut Mimo2Model) -> Result<u64, GateError> {
+            let (gpu, _, body) = m.body_parts("gate_mimo2_e2e slots")?;
+            let mut h = Fnv1a64::default();
+            for plane in body.store_planes(gpu)? {
+                let bytes: Vec<u8> = plane.iter().flat_map(|v| v.to_le_bytes()).collect();
+                h = h.bytes(&bytes);
+            }
+            Ok(h.value())
+        }
+
+        /// The stores alone: the sequence holds nothing else, so it is the
+        /// header's bytes a position ([`KV_BYTES_PER_POSITION`]) at
+        /// [`SLOT_CTX`] positions.
+        fn seq_bytes_derived(&self, _m: &Mimo2Model) -> Result<Derived, GateError> {
+            let bytes = KV_BYTES_PER_POSITION * SLOT_CTX;
+            Ok(Derived {
+                bytes,
+                terms: format!(
+                    "the stores {SLOT_CTX} positions of {KV_BYTES_PER_POSITION} B (derived from \
+                     the header), nothing beside them"
+                ),
+            })
+        }
+
+        /// The plan's sequence descriptor ([`PlanInputs::seq_terms`]).
+        fn seq_terms_bytes(&self, _m: &Mimo2Model) -> Result<Option<usize>, GateError> {
+            Ok(Some(usize::try_from(
+                self.inputs.seq_terms().bytes(SLOT_CTX as u64, 1),
+            )?))
+        }
+
+        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
+        /// the body's own mut path.
+        fn plant_refusal(&self, m: &mut Mimo2Model) -> Result<bool, GateError> {
+            m.body_parts("gate_mimo2_e2e slots")?
+                .2
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        /// H5's window: the tier's own refusal, read through the body's
+        /// tier.
+        fn tier_poisoned(&self, m: &mut Mimo2Model) -> Result<bool, GateError> {
+            Ok(m.body_parts("gate_mimo2_e2e slots")?
+                .2
+                .hybrid()
+                .refuse_if_poisoned("slots H5")
+                .is_err())
+        }
+    }
+
+    /// The prompt as the server feeds it: every id but the last in one call
+    /// by the load's feed ([`feed`]), then the last one step; the step's
+    /// argmax.
+    fn server_start(m: &mut Mimo2Model, p: &[u32]) -> Result<u32, GateError> {
+        let (&last, head) = p.split_last().ok_or("an empty prompt")?;
+        feed(m, head)?;
+        Ok(m.step(&[last])?)
+    }
+
+    /// (sp) the plan's count: a sequence past it refused by name, the plan
+    /// of [`slots_gate::STREAMS`] counting [`slots_gate::STREAMS`] times the
+    /// stores of the plan of one (and the descriptor's bytes), and a load
+    /// of a plan that counts another number refused by name. Moves no slot;
+    /// the harness's model is the caller's to have dropped before the last.
+    fn slots_plan(a: &MimoSlots<'_>, m: &mut Mimo2Model) -> Result<bool, GateError> {
+        const N: usize = slots_gate::STREAMS;
+        let past = m.add_slots(N + 1);
+        let named = matches!(&past, Err(e) if e.to_string().contains(&format!(
+            "of a plan that counts {N} resident sequences"
+        )));
+        let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
+        let one = NonZeroUsize::MIN;
+        let many = NonZeroUsize::new(N).ok_or("no slots")?;
+        let kv = |n| -> Result<u64, GateError> { Ok(a.plan(&machine, n)?.cards[0].kv_bytes) };
+        let (kv_one, kv_many) = (kv(one)?, kv(many)?);
+        let seq = a.inputs.seq_terms().bytes(SLOT_CTX as u64, 1);
+        let counted = kv_one == seq && kv_many == N as u64 * seq;
+        println!(
+            "(sp) a sequence past the plan's {N} refused by name {named}; the plan's kv class \
+             {kv_one} B for one slot and {kv_many} B for {N} (one sequence's descriptor {seq} B): \
+             {counted} {}",
+            verdict(named && counted)
+        );
+        Ok(named && counted)
+    }
+
+    /// (sp)'s load of a plan that counts one sequence as a load of two: the
+    /// plan's kv class is another count's, refused by name at the load.
+    fn slots_other_plan(a: &MimoSlots<'_>) -> Result<bool, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
+        let plan = a.plan(&machine, NonZeroUsize::MIN)?;
+        let two = NonZeroUsize::new(slots_gate::STREAMS).ok_or("no slots")?;
+        let refused = Body::open_placed_slots(file, &plan, &a.inputs, 0, a.levers.host(), two);
+        let named = matches!(&refused, Err(e) if e.to_string().contains("the plan counts"));
+        println!(
+            "(sp) a load of {} sequences by a plan of one is refused by name {named} {}",
+            slots_gate::STREAMS,
+            verdict(named)
+        );
+        Ok(named)
+    }
+
+    /// The (slots) clauses: the harness's contracts and (sp), each on a load
+    /// at [`SLOT_CTX`] positions of its own, the main load dropped first.
+    fn slots(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let inputs = PlanInputs::read(&file)?;
+        drop(file);
+        // Two streams of distinct ids and lengths: the batch set's five
+        // tokens, and the head of the 1,024-position set's prompt.
+        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let (_, a, _) = man.step()?;
+        let (_, _, _, long, _) = set_open((D1K, &IK), None)?;
+        let b = long.get(..21).ok_or("the 1,024-position prompt is short")?;
+        let body = MimoSlots {
+            levers,
+            inputs,
+            prompts: [a.to_vec(), b.to_vec()],
+        };
+        let t = Instant::now();
+        let mut s = slots_gate::interleave(&body)?;
+        elapsed("(slots) harness open (H1, H3, H6, H7)", &t);
+        let mut ok = slots_plan(&body, s.model())?;
+        let t = Instant::now();
+        ok &= s.finish()?;
+        elapsed("(slots) harness finish (H4, H5)", &t);
+        ok &= slots_other_plan(&body)?;
+        Ok(ok)
+    }
+
     // ------------------------------------------------------------ selectors
 
     /// Which clause a run takes.
@@ -510,6 +741,8 @@ mod gate {
         C,
         T,
         B,
+        /// The resident slots' clauses ([`slots`]), on loads of their own.
+        Slots,
     }
 
     /// Which step sets (t) and (b) take.
@@ -546,7 +779,7 @@ mod gate {
         }
     }
 
-    /// `--only s|p|c|t|b`, or every clause.
+    /// `--only s|p|c|t|b|slots`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
@@ -556,7 +789,8 @@ mod gate {
                 Some("c") => Ok(Only::C),
                 Some("t") => Ok(Only::T),
                 Some("b") => Ok(Only::B),
-                other => Err(format!("--only is s, p, c, t or b, not {other:?}").into()),
+                Some("slots") => Ok(Only::Slots),
+                other => Err(format!("--only is s, p, c, t, b or slots, not {other:?}").into()),
             },
         }
     }
@@ -593,6 +827,12 @@ mod gate {
         crate::gate_card::init()?;
         let only = only()?;
         let sets = step_sets(only)?;
+        if only == Only::Slots {
+            let t = Instant::now();
+            let ok = slots(&levers)?;
+            elapsed("(slots)", &t);
+            return if ok { Ok(()) } else { Err(checks_failed()) };
+        }
         let (mut s, opened) = open(Path::new(MODEL), &levers, CTX)?;
         let m = s.model_mut();
         let mut ok = true;
@@ -663,6 +903,13 @@ mod gate {
                 .into());
             }
             println!("batch feed ({}): {} ran", sets.name(), ran.join(" "));
+        }
+        if only == Only::All {
+            // The slots' loads take the card with the main one dropped.
+            drop(s);
+            let t = Instant::now();
+            ok &= slots(&levers)?;
+            elapsed("(slots)", &t);
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
