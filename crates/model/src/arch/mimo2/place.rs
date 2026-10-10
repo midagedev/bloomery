@@ -4,16 +4,17 @@
 //! layer's KV bytes ([`KvLayout`]) are read once ([`PlanInputs::read`], which
 //! refuses a file whose next-token layers carry tensors — the draft that
 //! reads them is a later round's — and one with a feature no program runs,
-//! every one listed); then the placement ([`PlanInputs::plan`]) keeps every
-//! routed expert on the host ([`placement::plan_host_routed`]: this program
-//! runs no card expert), every layer's KV planes full whatever its window,
-//! and refuses by name a machine that hangs an expert tier card and a
-//! context of no position.
+//! every one listed); then the placement ([`PlanInputs::plan`]) runs the
+//! expert rule on the routed layers whose stacks the card experts read
+//! ([`card_routed`]) and keeps the rest of every layer's experts on the host
+//! ([`placement::plan_routed`], the path the other hybrid families plan by),
+//! every layer's KV planes full whatever its window, and refuses by name a
+//! machine that hangs an expert tier card and a context of no position.
 
 use std::num::NonZeroUsize;
 
 use bloomery_placement::slots::{SeqTerms, Stores};
-use gguf::Split;
+use gguf::{GgmlType, Split};
 use models::ModelSpec;
 
 use super::hparams::Hparams;
@@ -21,11 +22,20 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::{
-    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
-    Violation, checked, joined,
+    self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
+    Unimplemented, Violation, checked, joined,
 };
 
 const F16_BYTES: u64 = 2;
+
+/// The routed stacks the card experts read, each as the file stores it
+/// ([`CardFormat::KQuant`]): the types the common card leg runs
+/// ([`placement::kernels::card_runs`]). The rule reads a stack's type alone; a
+/// layer with a stack of any other type keeps its experts on the host.
+#[must_use]
+pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
+    placement::kernels::card_runs(ty).then_some(CardFormat::KQuant)
+}
 
 /// What a plan of a mimo2 file is made from, read from its headers.
 #[derive(Debug)]
@@ -43,12 +53,21 @@ pub struct PlanInputs {
 /// Why a plan was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
-    /// The placement could not be built — a machine that hangs an expert
-    /// tier card among its refusals ([`PlacementError::HostRoutedTier`]):
-    /// this plan keeps every routed expert on the host, so the tier would
-    /// hold nothing.
+    /// The placement could not be built.
     #[error(transparent)]
     Placement(#[from] PlacementError),
+    /// A machine with an expert tier card: this program hangs no expert tier
+    /// on its card experts.
+    #[error(
+        "the machine has the expert tier card {card} (tier {tier}); the program this plan is \
+         for hangs no expert tier"
+    )]
+    Tier {
+        /// The tier card's name.
+        card: String,
+        /// Its index among the machine's tiers.
+        tier: usize,
+    },
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]
     Broken(Vec<Violation>),
@@ -107,10 +126,11 @@ impl PlanInputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`, every routed expert on the host and none on
-    /// a card; refused by name a context of no position, and as the
-    /// placement refuses a machine that hangs an expert tier card (it would
-    /// hold nothing) and a context whose KV planes do not fit the card.
+    /// the placement's `levers`: the expert rule on the layers whose routed
+    /// stacks [`card_routed`] runs, each such layer's id prefix on the card
+    /// as far as its budget holds them, the rest on the host; refused by name
+    /// a context of no position, a machine that hangs an expert tier card
+    /// and a context whose KV planes do not fit the card.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -136,8 +156,14 @@ impl PlanInputs {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
+        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
+            return Err(PlaceError::Tier {
+                card: card.name.clone(),
+                tier,
+            });
+        }
         let kv = self.seq_terms().slots_of(slots.get() as u64);
-        let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &kv, levers)?;
+        let plan = placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, card_routed)?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -200,11 +226,15 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
-    use gguf::Split;
+    use gguf::{GgmlType, Split};
 
     use super::super::hparams::tests::{keys, tensors};
-    use super::{F16_BYTES, KvBytes, KvLayout, PlanInputs, SeqTerms, Stores};
+    use super::{
+        CardFormat, F16_BYTES, KvBytes, KvLayout, PlaceError, PlanInputs, PlanLevers, SeqTerms,
+        Stores, card_routed,
+    };
     use crate::arch::synthetic::{V, header_shaped};
+    use crate::placement::workstation;
 
     /// A layer's plane: its own KV-head count's key and value rows in f16 a
     /// position — a window layer's plane is as full as a full layer's, and at
@@ -275,6 +305,69 @@ mod tests {
             err.contains("feature(s) of this file are not implemented"),
             "{err}"
         );
+    }
+
+    /// A stack is card-routed when the common kernel table gives its type the
+    /// entries this program's leg launches, and not otherwise: the types the
+    /// table runs on the card for other families (Q4_K, Q5_K, Q8_0 and the
+    /// i-quants) and the ones it has no row for (Q2_K, the floats) keep their
+    /// layer's experts on the host.
+    #[test]
+    fn only_the_stacks_the_leg_runs_are_card_routed() {
+        assert_eq!(card_routed(GgmlType::MXFP4), Some(CardFormat::KQuant));
+        for ty in [
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_XS,
+            GgmlType::IQ4_NL,
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
+            GgmlType::F32,
+            GgmlType::BF16,
+        ] {
+            assert_eq!(card_routed(ty), None, "{ty}");
+        }
+    }
+
+    /// A machine that hangs an expert tier card is refused by name, before
+    /// any plan is made: the program's card experts have no tier to join,
+    /// and a context of no position is refused first.
+    #[test]
+    fn a_tier_card_is_refused_by_name() {
+        let path = header_shaped(
+            "mimo2-place-tier",
+            "mimo2",
+            &keys(),
+            &[
+                ("tokenizer.ggml.pre", V::Str("qwen2")),
+                ("tokenizer.chat_template", V::Str("{{ messages }}")),
+            ],
+            &tensors(),
+        );
+        let split = Split::open(&path).expect("the synthetic header opens");
+        let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
+        let _ = std::fs::remove_file(&path);
+        let mut machine = workstation::plan_gate(inputs.hp.n_trunk);
+        let mut tier = machine.cards[0].clone();
+        tier.layers = 0..0;
+        tier.head = false;
+        tier.token_embedding = false;
+        machine.tiers.push(tier);
+        let levers = PlanLevers::default();
+        match inputs.plan(&machine, 4, &levers) {
+            Err(e @ PlaceError::Tier { tier: 0, .. }) => assert_eq!(
+                e.to_string(),
+                "the machine has the expert tier card 3090 (tier 0); the program this plan is \
+                 for hangs no expert tier"
+            ),
+            other => panic!("{other:?}, not the tier refusal"),
+        }
+        assert!(matches!(
+            inputs.plan(&machine, 0, &levers),
+            Err(PlaceError::CtxZero)
+        ));
     }
 
     /// The small header of the `hparams` tests' keys with its next-token

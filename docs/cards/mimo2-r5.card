@@ -1,0 +1,43 @@
+# Round w3r5c's decode card: MiMo-V2.6-Flash (MXFP4 experts, Q8_0 dense tier) on plan (a), the A6000 alone, with the hot
+# routed experts on the card (R5c: the common MXFP4 pair in the host leg's shadow) against main with every routed expert
+# on the host. Decomposition [derived, specs/worker3/r5design/report.md §4], one decode step at n = 1:
+# - experts: 13,369,344 B each (3 x 4,096 x 2,048 values x 17/32), 12,032 of them, 160.86 GB. The A6000's room 48,592 MiB
+#   less 1,600 MiB (context 512, scratch 64, margin 1,024), the dense 5.84 GB and the KV planes (222,720 B a position at
+#   4,160) holds 3,118..3,179 of them (26 %, 66..68 a routed layer; the plan print of gate-mimo2-meta bounds it, the
+#   allocator's granules the spread). The card's expert share of a token's 8 slots is 0.26 x 8 = 2.1 slots, the host's
+#   k_host = 5.9 (all-host: 8.0).
+# - host leg a routed layer: 21..36 us floor + k_host x 92.2..102.8 us (13.37 MB at 130..145 GB/s) = 565..643 us on
+#   plan (a), 758..857 us all-host. The card's shadow under it: 6 launches x (0.85 + 1.2..5.8 us) + 2.1 x 13.37 MB at
+#   579 GB/s (48.5 us) = 61..89 us a layer, inside the host leg, so worth 0 on the wall.
+# - card side, unchanged by R5c: gemv 8.30..9.17 ms, small kernels 1.0..2.4, nodes 0.53, sync 47 x 21..36 us: 10.82..13.79
+#   ms; depth adds 0.07..0.20 ms at 1,024 and 0.2..0.6 at 4,096. The step's graph holds 625 + 6 x 47 = 907 nodes
+#   (the shadow's six launches on each routed layer; the go and wait pair stays 94).
+# - step: all-host 34.7..38.7 ms host + the card side overlapped to 19.0..22.0 tok/s (mid 20.4); plan (a) 25.6..28.5 ms
+#   host, 23.6..27.5 tok/s (mid 25.4). Ratio 1.23..1.26. The KV planes without a ring cost 60 experts at 4,160, under
+#   0.5 %, inside the ruler.
+# - the terms that can miss: the host leg's per-expert time at k_host 5.9 (BW_host, the 21..36 us floor) and the routed
+#   mass the id prefix carries (the realized card share of the slots). Both have free reads: the base arm in this lease,
+#   and the host tier's card-slot share on any functional run.
+# Sitting [worker3's]: the two binaries (main's and this round's) in one lease at the same A6000 and ctx, 4 rounds each,
+# load ~41 s warm a process (the 161.6 GB host copy in the page cache), 2 arms x (4 + 1 warm-up) x ~1.5..2 min: 15..20 min.
+kind: ab
+question: with the hot routed experts of MiMo-V2.6-Flash on the A6000 beside the host tier (R5c), does decode run faster
+  than with every routed expert on the host, by the host slots the card takes off the host leg?
+term: decode tok/s @ n=64 greedy ids, prose depth 6, ctx 4,160, A6000 alone (the 3090 idle), one stream, R5c's binary
+  against main's, paired by round, the runner's per-round ratio (R5c / main) less 1
+unit: %
+predict: +23..+26
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: both binaries in one lease on the A6000, every row's card field A6000 and each witness block with no Xid before
+  or after any arm; a fresh process a run with the 161.6 GB host copy resident (majflt ~0, no [cold], [cpu-busy] or
+  [other-busy] on a row); the R5c arm's plan record reads card_experts 3,118..3,179 and the base arm's 0, the step's graph
+  907 nodes against 625 (gate_mimo2_e2e's structure clause); the full output to a file first
+decide-in: the card experts pay as derived: land R5c, publish the depth rows (1,024 and 4,096 positions) and the A6000
+  row in the README's MiMo table, and open the tier attach (bp) round
+decide-below: below +23 the host leg or the realized share is off the derivation: between +18 and +23 read the base
+  arm's host leg per expert and the card's slot share from the plan before landing (the effect is real but the term to
+  re-fit is named by them); below +18 BLOOMERY_PROFILE=1 on one arm of each binary for the host leg's times and the
+  slots the card took, and hold the landing until the missing term is named
+decide-above: above +26 the host leg is slower per expert than 92..103 us (BW_host under 130 GB/s on this file) or the
+  prefix carries more than 26 % of the routed mass: re-fit BW_host for MiMo from the base arm's host leg and land

@@ -4,14 +4,19 @@
 //! own: the q8_0 gemvs, the K192 rope-and-append, the K192 flash with its
 //! sink merge, the host handoff and the head are `bloomery-gpu`'s, the
 //! shared-expert gate·up and the 256-expert sigmoid router
-//! `bloomery-gpu-deepseek41`'s. Every routed expert runs on the host tier.
+//! `bloomery-gpu-deepseek41`'s, and the card experts the common per-slot pair
+//! of the kernel table (`bloomery-gpu`). The routed experts the plan puts on
+//! the card run there, in the host leg's shadow; the rest run on the host
+//! tier.
 //!
 //! - [`body`]: the load, the stores, the step's buffers and [`body::Body`]
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
 //! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
 //! - `attn`: the attention sub-layer;
-//! - `ffn`: the dense block and the routed block around its host leg.
+//! - `ffn`: the dense block and the routed block around its host leg;
+//! - `card`: the routed block's card experts, one run for the step and for a
+//!   prompt batch.
 //!
 //! What each layer's launches take, and the step's node counts, are facts of
 //! the file's description (`model::arch::mimo2::program`), where their tests
@@ -21,6 +26,7 @@
 
 mod attn;
 pub mod body;
+mod card;
 mod ffn;
 mod program;
 

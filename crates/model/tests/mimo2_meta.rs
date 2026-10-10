@@ -151,23 +151,39 @@ fn hw_mimo2_spec() {
 // machine (the 3090, all 48 trunk layers and the head) at the gate context 4160, made from
 // `PlanInputs::describe`. KV a position over the trunk 222,720 B = (39 window × 8 + 9 full × 4) KV heads ×
 // 320 values (key 192 + value 128) × 2 B, every layer a full plane.
-// PIN(2026-10-08): the card's weights 5,839,528,704 B [derived] = attention Q8_0 9 × 94,699,520 +
+// PIN(2026-10-08): the card's dense weights 5,839,528,704 B [derived] = attention Q8_0 9 × 94,699,520 +
 // 39 × 100,270,080 (a layer's rows: 4,096 × (64·192 + kv·(192 + 128)) of qkv + 64·128 × 4,096 of
 // o, × 34/32) + the dense block 3 × 4,096 × 16,384 × 34/32 + the head 152,576 × 4,096 × 34/32 +
 // the routers 47 × 256 × 4,096 × 4 + the norms, biases and sinks 97 × 4,096 × 4 + 47 × 256 × 4 +
-// 39 × 64 × 4. Host routed 160,859,947,008 B [derived] = 47 × 256 experts × 3 × 4,096 × 2,048
-// values × 17/32 B (MXFP4); the embedding 664,010,752 B = 152,576 × 4,096 × 34/32 on the host as
-// the row-gathered table. n_l 0 on every layer: this program runs no card expert.
-/// The plan of the RL file onto the gate machine: what
+// 39 × 64 × 4. The embedding 664,010,752 B = 152,576 × 4,096 × 34/32 on the host as the
+// row-gathered table.
+// PIN(2026-10-10): an expert is 13,369,344 B = 3 stacks × 4,096 × 2,048 values × 17/32 B (MXFP4), the
+// routed experts 47 × 256 = 12,032 and 160,859,947,008 B [derived]. The card experts run
+// (`place::card_routed`: the MXFP4 stacks the common pair reads), so the plan puts on the card as many
+// as its budget holds, one at a time on the routed layer with the fewest (the first on a tie): the dense
+// layer 0 none, the routed layers' counts non-increasing and within one of each other. The count N
+// is bounded by the budget arithmetic [derived]: the card's usable bytes less 1,600 MiB (context 512,
+// scratch 64, margin 1,024), the KV planes (222,720 B × 4,160) and the dense weights, over an expert's
+// bytes — at most ⌊16,906,607,872 / 13,369,344⌋ = 1,264 on the 3090's bytes (usable 24,176 MiB) and
+// ⌊42,508,639,488 / 13,369,344⌋ = 3,179 on the A6000 (usable 48,592 MiB), and at the least 61
+// experts fewer (the allocator's 2 MiB granules over the 391 or so uploads, 782 MiB at their worst):
+// 1,203 and 3,118. The count the plan makes is printed, and the card's and the host's expert bytes
+// are N and 12,032 − N experts of the bytes above.
+/// The plan of the RL file onto the gate machine and onto the A6000's: what
 /// `arch::mimo2::place::PlanInputs` resolves for the file the spec test
-/// reads — every routed expert on the host (this program runs no card
-/// expert), every layer's KV planes full — and the plan's named refusals:
-/// a machine that hangs an expert tier card and a context of no position.
+/// reads — the routed experts on the card as far as its budget holds them
+/// (every routed layer's prefix) and the rest on the host, every layer's KV
+/// planes full — and the plan's named refusals: a machine that hangs an
+/// expert tier card and a context of no position.
 #[test]
 #[ignore = "needs the MiMo-V2.6-Flash-RL shards on the box (just gate-mimo2-meta)"]
 fn hw_mimo2_plan() {
     use model::placement::PlanLevers;
     use model::placement::workstation;
+
+    /// An expert's bytes, and the routed experts of the file.
+    const EXPERT_BYTES: u64 = 13_369_344;
+    const ROUTED: u64 = 47 * 256;
 
     let mut o = String::new();
     let mut b = Vec::new();
@@ -176,10 +192,7 @@ fn hw_mimo2_plan() {
         .unwrap_or_else(|e| panic!("plan inputs of {MIMO}: {e}"));
     let layers = inputs.hp.n_trunk;
     let ctx: u64 = 4160;
-    let _ = writeln!(
-        o,
-        "file {MIMO}, {layers} trunk layers, gate machine at ctx {ctx}"
-    );
+    let _ = writeln!(o, "file {MIMO}, {layers} trunk layers, ctx {ctx}");
     row(
         &mut o,
         &mut b,
@@ -187,40 +200,81 @@ fn hw_mimo2_plan() {
         inputs.kv.bytes(0..layers, 1),
         222_720,
     );
+    for (name, machine, bound) in [
+        (
+            "gate machine (the 3090's bytes)",
+            workstation::plan_gate(layers),
+            1_203..=1_264,
+        ),
+        (
+            "A6000 (the default place)",
+            workstation::plan_a(layers),
+            3_118..=3_179,
+        ),
+    ] {
+        let plan = inputs
+            .plan(&machine, ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("plan on the {name} at ctx {ctx}: {e}"));
+        let card = &plan.cards[0];
+        let n: u64 = plan.n_l.iter().sum();
+        let _ = writeln!(o, "{name}: n_l {:?}", plan.n_l);
+        row(
+            &mut o,
+            &mut b,
+            "card dense bytes",
+            card.dense_bytes,
+            5_839_528_704,
+        );
+        row(
+            &mut o,
+            &mut b,
+            "card kv bytes",
+            card.kv_bytes,
+            ctx * 222_720,
+        );
+        let held = (bound.contains(&n), format!("{n} in {bound:?}"));
+        row(
+            &mut o,
+            &mut b,
+            "card experts inside the budget's bound",
+            held.0,
+            true,
+        );
+        let _ = writeln!(o, "  card experts {}", held.1);
+        let spread = plan.n_l[0] == 0
+            && plan.n_l[1..].windows(2).all(|w| w[0] >= w[1])
+            && plan.n_l[1] - plan.n_l[layers - 1] <= 1
+            && plan.n_l[layers - 1] >= 1;
+        row(
+            &mut o,
+            &mut b,
+            "dense layer none, routed counts even",
+            spread,
+            true,
+        );
+        row(
+            &mut o,
+            &mut b,
+            "card expert bytes",
+            card.expert_bytes,
+            n * EXPERT_BYTES,
+        );
+        row(
+            &mut o,
+            &mut b,
+            "host routed bytes",
+            plan.host.expert_bytes,
+            (ROUTED - n) * EXPERT_BYTES,
+        );
+        row(
+            &mut o,
+            &mut b,
+            "host table bytes (the embedding)",
+            plan.host.table_bytes,
+            664_010_752,
+        );
+    }
     let machine = workstation::plan_gate(layers);
-    let plan = inputs
-        .plan(&machine, ctx, &PlanLevers::default())
-        .unwrap_or_else(|e| panic!("plan on the gate machine at ctx {ctx}: {e}"));
-    let card = &plan.cards[0];
-    row(
-        &mut o,
-        &mut b,
-        "card weight bytes",
-        card.dense_bytes + card.expert_bytes,
-        5_839_528_704,
-    );
-    row(
-        &mut o,
-        &mut b,
-        "card kv bytes",
-        card.kv_bytes,
-        ctx * 222_720,
-    );
-    row(&mut o, &mut b, "n_l", plan.n_l.clone(), vec![0; layers]);
-    row(
-        &mut o,
-        &mut b,
-        "host routed bytes",
-        plan.host.expert_bytes,
-        160_859_947_008,
-    );
-    row(
-        &mut o,
-        &mut b,
-        "host table bytes (the embedding)",
-        plan.host.table_bytes,
-        664_010_752,
-    );
     let mut tiered = workstation::plan_gate(layers);
     let mut tier = tiered.cards[0].clone();
     tier.layers = 0..0;
@@ -232,14 +286,11 @@ fn hw_mimo2_plan() {
         .expect_err("a machine that hangs an expert tier card is refused by name")
         .to_string();
     let _ = writeln!(o, "  as the plan refuses a tier card: {err}");
-    // PIN(2026-10-08): the tier refusal is the placement's own
-    // (HostRoutedTier), lifted from the family's Tier variant — it names the
-    // card and the all-host plan, no longer the card-expert round.
-    if !(err.contains("tier card 3090")
-        && err.contains("this plan puts every routed expert on the host"))
-    {
+    // PIN(2026-10-10): the tier refusal is the program's own (`PlaceError::Tier`): it names the card
+    // and that the program hangs no expert tier on its card experts.
+    if !(err.contains("expert tier card 3090") && err.contains("hangs no expert tier")) {
         b.push(format!(
-            "the tier refusal names neither the card nor the all-host plan: {err}"
+            "the tier refusal names neither the card nor the missing tier: {err}"
         ));
     }
     let err = inputs

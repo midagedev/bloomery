@@ -10,8 +10,8 @@
 //! own base; the nine full layers have 4 key/value heads over 64 query heads
 //! and the 39 window layers 8, with a window of positions and per-head sinks;
 //! every layer multiplies its value rows by one constant before the cache;
-//! the routed block has no shared expert and no clamp; layer 0's block is
-//! dense.
+//! the routed block has no shared expert and no clamp, so a layer's card
+//! shadow is its card experts alone; layer 0's block is dense.
 
 use models::{Ffn, LayerSpec, Mixer, RopeMode, Score};
 use runtime::layer::FfnKind;
@@ -173,7 +173,7 @@ pub struct BlockArgs {
 /// renormalizes its picks, unhashed, at another width, count or scale than
 /// the program's; a shared expert (the routed block has none, and a layer with
 /// one would lose its output); a clamp on the routed experts (the host tier
-/// runs the plain combine).
+/// and the card experts run the plain combine).
 pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockArgs, Refusal> {
     match &s.ffn {
         Ffn::Dense { ff, act } => Ok(BlockArgs {
@@ -215,7 +215,8 @@ pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockAr
             if m.act.swiglu_limit() != 0.0 {
                 return Err(refuse(
                     l,
-                    "a clamp on the routed experts; the host tier runs the plain combine"
+                    "a clamp on the routed experts; the host tier and the card experts run the \
+                     plain combine"
                         .to_string(),
                 ));
             }
@@ -241,28 +242,42 @@ pub const DENSE_LAUNCHES: usize = 4;
 /// the wait and the add.
 pub const MOE_LAUNCHES: usize = 3 + 1 + 1 + 1;
 
+/// The shadow's launches on a routed layer with card experts: the norm's
+/// q8_1, the gate·up, the q8_1 of its card columns, the down, the card sum
+/// and its add of the residual after the attention.
+pub const CARD_LAUNCHES: usize = 6;
+
 /// The head's launches: the norm, the q8_0 gemv and the argmax.
 pub const HEAD_LAUNCHES: usize = 3;
 
-/// One layer's launches: its attention's and its block's.
+/// One layer's launches: its attention's and its block's, a routed block's
+/// [`CARD_LAUNCHES`] more when `card` (the plan puts experts of the layer on a
+/// card). A dense block has no experts: `card` on one is a named panic.
 #[must_use]
-pub fn layer_launches(ffn: FfnKind) -> usize {
+pub fn layer_launches(ffn: FfnKind, card: bool) -> usize {
     ATTN_LAUNCHES
         + match ffn {
-            FfnKind::Dense => DENSE_LAUNCHES,
-            FfnKind::Moe => MOE_LAUNCHES,
+            FfnKind::Dense => {
+                assert!(!card, "a dense block has no card experts");
+                DENSE_LAUNCHES
+            }
+            FfnKind::Moe => MOE_LAUNCHES + if card { CARD_LAUNCHES } else { 0 },
         }
 }
 
 /// The nodes of the step's captured chain: every layer's launches
-/// ([`layer_launches`]) and the head's.
+/// ([`layer_launches`]; a layer is `(block, card experts)`) and the head's.
 #[must_use]
-pub fn step_launches(ffns: &[FfnKind]) -> usize {
-    ffns.iter().map(|&f| layer_launches(f)).sum::<usize>() + HEAD_LAUNCHES
+pub fn step_launches(layers: &[(FfnKind, bool)]) -> usize {
+    layers
+        .iter()
+        .map(|&(f, card)| layer_launches(f, card))
+        .sum::<usize>()
+        + HEAD_LAUNCHES
 }
 
 /// The stream memory-operation batches of the step's captured chain: each
-/// routed layer's go and its wait.
+/// routed layer's go and its wait, whether or not it has card experts.
 #[must_use]
 pub fn step_memops(ffns: &[FfnKind]) -> usize {
     2 * ffns.iter().filter(|&&f| f == FfnKind::Moe).count()
@@ -276,8 +291,8 @@ mod tests {
     use runtime::layer::FfnKind;
 
     use super::{
-        AttnArgs, AttnBuilt, BlockArgs, HEAD_LAUNCHES, RouterBuilt, attn_args, block_args,
-        layer_launches, sinks_row, step_launches, step_memops,
+        AttnArgs, AttnBuilt, BlockArgs, CARD_LAUNCHES, HEAD_LAUNCHES, RouterBuilt, attn_args,
+        block_args, layer_launches, sinks_row, step_launches, step_memops,
     };
 
     /// The kernels' shapes: 192-wide scores over 128-wide values, 64 of the
@@ -510,25 +525,64 @@ mod tests {
         ffns
     }
 
+    /// The layers as the step counts them: each with its block, and whether
+    /// the plan puts experts of it on a card.
+    fn counted(card: impl Fn(usize) -> bool) -> Vec<(FfnKind, bool)> {
+        real()
+            .into_iter()
+            .enumerate()
+            .map(|(l, f)| (f, f == FfnKind::Moe && card(l)))
+            .collect()
+    }
+
     /// The step's nodes are the sum of its layers' launches and the head's:
     /// 48 attention layers of 7, the dense block's 4, 47 routed blocks of 6
     /// and the head's 3, of which the 47 routed layers' go and wait are the
-    /// 94 memory-operation batches.
+    /// 94 memory-operation batches; with no card experts, 625 nodes.
     #[test]
     fn the_step_is_625_nodes_and_94_memops() {
         let ffns = real();
-        assert_eq!(step_launches(&ffns), 48 * 7 + 4 + 47 * 6 + 3);
-        assert_eq!(step_launches(&ffns), 625);
+        let layers = counted(|_| false);
+        assert_eq!(step_launches(&layers), 48 * 7 + 4 + 47 * 6 + 3);
+        assert_eq!(step_launches(&layers), 625);
         assert_eq!(step_memops(&ffns), 94);
-        assert_eq!(step_launches(&ffns) - step_memops(&ffns), 531);
+        assert_eq!(step_launches(&layers) - step_memops(&ffns), 531);
     }
 
-    /// A layer's launches are its attention's and its block's alone.
+    /// Each routed layer with card experts adds its shadow's six launches and
+    /// no memory operation (the go and the wait stay the layer's one pair):
+    /// 625 + 6 · 47 = 907 nodes with every routed layer holding experts on the
+    /// card, 625 + 6 · 20 with the first twenty.
+    #[test]
+    fn card_experts_add_six_launches_a_routed_layer() {
+        let ffns = real();
+        let all = counted(|_| true);
+        assert_eq!(CARD_LAUNCHES, 6);
+        assert_eq!(step_launches(&all), 625 + 6 * 47);
+        assert_eq!(step_launches(&all), 907);
+        assert_eq!(step_memops(&ffns), 94);
+        assert_eq!(step_launches(&all) - step_memops(&ffns), 813);
+        let some = counted(|l| l <= 20);
+        assert_eq!(step_launches(&some), 625 + 6 * 20);
+    }
+
+    /// A layer's launches are its attention's and its block's alone, the
+    /// shadow's more on a routed layer with card experts; a dense block with
+    /// card experts is a named panic.
     #[test]
     fn a_layer_is_its_attention_and_its_block() {
-        assert_eq!(layer_launches(FfnKind::Dense), 7 + 4);
-        assert_eq!(layer_launches(FfnKind::Moe), 7 + 6);
+        assert_eq!(layer_launches(FfnKind::Dense, false), 7 + 4);
+        assert_eq!(layer_launches(FfnKind::Moe, false), 7 + 6);
+        assert_eq!(layer_launches(FfnKind::Moe, true), 7 + 6 + 6);
         assert_eq!(step_launches(&[]), HEAD_LAUNCHES);
         assert_eq!(step_memops(&[FfnKind::Dense, FfnKind::Dense]), 0);
+    }
+
+    /// Card experts on a dense block are an undefined count, not a defined
+    /// one.
+    #[test]
+    #[should_panic(expected = "a dense block has no card experts")]
+    fn a_dense_block_with_card_experts_panics() {
+        let _ = layer_launches(FfnKind::Dense, true);
     }
 }

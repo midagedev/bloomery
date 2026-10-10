@@ -442,6 +442,22 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
     }
 }
 
+/// Whether the common card leg (`crates/gpu/src/card_leg.rs`) runs a routed
+/// stack of `ty`: the type's gate·up and down rows are ones the leg launches
+/// over an activation of more columns than a run uses. Q4_K and Q5_K's down
+/// launchers read exactly one column a slot, so their rows are not here until
+/// the leg's callers move onto it.
+#[must_use]
+pub const fn card_runs(ty: GgmlType) -> bool {
+    matches!(
+        (gate_up(ty), down(ty)),
+        (
+            Some(GateUpEntry::Mxfp4),
+            Some((DownEntry::Mxfp4, DownAct::Q8Act))
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +691,17 @@ mod tests {
                     "{name} has a row for {ty:?}, which no card layout holds"
                 );
             }
+        }
+    }
+
+    /// The common card leg runs exactly the pinned types, each of which has
+    /// both rows.
+    #[test]
+    fn card_runs_admits_exactly_the_pinned_types() {
+        let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_runs(ty)).collect();
+        assert_eq!(runs, [GgmlType::MXFP4]);
+        for ty in runs {
+            assert!(gate_up(ty).is_some() && down(ty).is_some(), "{ty:?}");
         }
     }
 

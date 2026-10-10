@@ -1,8 +1,9 @@
 //! The MiMo-V2.6-Flash end-to-end gate: the whole program — 48 GQA attention
 //! layers over two head widths (key 192, value 128; nine full layers and 39
 //! window layers with sinks), the dense layer 0 and 47 routed blocks whose
-//! experts all run on the host tier (the plan keeps none on a card), the q8_0
-//! head and the argmax — loaded once by its placement on the gate card
+//! experts run on the card where the plan puts them (the common MXFP4 pair, in
+//! the host leg's shadow) and on the host tier otherwise, the q8_0 head and
+//! the argmax — loaded once by its placement on the gate card
 //! (`crate::gate_card::plan_gate`), against ik's CPU oracle sets
 //! (`refset::arch::mimo2`: the 5-token batch set, the step after a fused
 //! 4-token prefill, the same after a prefill run node by node, and the steps
@@ -13,10 +14,13 @@
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes,
 //!   [`MEMOPS`] of them stream memory-operation batches (each routed layer's
 //!   go and wait) and the rest kernels, and the program's own count
-//!   (`step_launches` over the body's layer programs, a fact of the file's
-//!   description) is the same; the dense layer is layer 0 and the host run
-//!   is layers `1..48`; the plan puts no routed expert on a card (the plan's
-//!   `n_l` and the slot map's both); the stores hold
+//!   (`step_launches` over the body's layer programs and the layers the plan
+//!   puts card experts on, a fact of the file's description and the plan) is
+//!   the same — [`NODES_HOST`] plus [`CARD_LAUNCHES`] for each such layer; the
+//!   dense layer is layer 0 and the host run is layers `1..48`; the plan puts
+//!   at least one routed expert on the card, as many as the slot map holds
+//!   there and none on a tier (the plan's `n_l` and the slot map's both), on
+//!   every routed layer; the stores hold
 //!   [`KV_BYTES_PER_POSITION`] a position at [`CTX`] positions;
 //!   each layer's arguments to its attention launches (kv heads, window,
 //!   sinks, the rope table's base, the value multiplier) are its
@@ -30,8 +34,9 @@
 //!   or — named and counted, never silently — ours ik's runner-up with ik's
 //!   own margin between the two inside twice the distance between our logits
 //!   and ik's at those ids ([`tie_allowed`]). Each layer's output against
-//!   ik's `l_out-L` is printed by position; there is no band yet (the forced
-//!   arm that derives one is a later round's).
+//!   ik's `l_out-L` is printed by position, and the worst one is held to
+//!   [`FREE_WORST`], a ceiling that sees a dropped card sum; there is no
+//!   finer band yet (the forced arm that derives one is a later round's).
 //! - (t) each step set: its prefill fed by our own steps from a reset, then
 //!   the step; its argmax equal to ik's or a named tie as in (c). The step's
 //!   layer outputs against ik's `l_out-L` are printed, and each set's logits
@@ -142,14 +147,25 @@ mod gate {
     const HIDDEN: usize = 4096;
     const N_LAYER: usize = 48;
 
-    /// PIN(2026-10-08): the captured decode step's node count, derived before
-    /// the chain was built: every layer's attention takes 7 launches (the
-    /// norm, the fused q·k·v gemv, the rope-and-append, the flash's segment
-    /// pass and its merge, the output gemv, the add); the dense block 4
-    /// (norm, gate·up, down, add); a routed block 6 (norm, router, handoff,
-    /// the go, the wait, the add); the head 3 (norm, q8_0 gemv, argmax):
-    /// 48·7 + 4 + 47·6 + 3.
-    const NODES_DECODE: usize = 625;
+    /// PIN(2026-10-08): the captured decode step's node count with every
+    /// routed expert on the host, derived before the chain was built: every
+    /// layer's attention takes 7 launches (the norm, the fused q·k·v gemv, the
+    /// rope-and-append, the flash's segment pass and its merge, the output
+    /// gemv, the add); the dense block 4 (norm, gate·up, down, add); a routed
+    /// block 6 (norm, router, handoff, the go, the wait, the add); the head 3
+    /// (norm, q8_0 gemv, argmax): 48·7 + 4 + 47·6 + 3.
+    const NODES_HOST: usize = 625;
+
+    /// PIN(2026-10-10): a routed layer with card experts adds its shadow's six
+    /// launches (the norm's q8_1, the gate·up, the q8_1 of the card columns,
+    /// the down, the card sum, the add of `x1`) and no memory operation.
+    const CARD_LAUNCHES: usize = 6;
+
+    /// PIN(2026-10-10): the captured decode step's node count at the gate
+    /// plan, which puts card experts on every routed layer (its prefixes
+    /// spread evenly over the 47, the card's budget holding far more than one
+    /// each): [`NODES_HOST`] + [`CARD_LAUNCHES`]·47 = 625 + 6·47.
+    const NODES_DECODE: usize = 907;
 
     /// PIN(2026-10-08): each routed layer's go and wait: 47 routed layers.
     const MEMOPS: usize = 94;
@@ -233,17 +249,29 @@ mod gate {
             body.ctx(),
             verdict(ok)
         );
-        // No routed expert on a card: the plan's count and the slot map's.
+        // Card experts: the plan's count and the slot map's, on every routed
+        // layer, none on a tier.
         let slots = body.hybrid().slots();
-        let mut on_card = 0usize;
+        let (mut on_card, mut on_tier, mut bare) = (0usize, 0usize, Vec::new());
         for l in body.host_run() {
-            on_card += slots.on_card(l)? + slots.on_tier(l)?;
+            let here = slots.on_card(l)?;
+            on_card += here;
+            on_tier += slots.on_tier(l)?;
+            if here == 0 {
+                bare.push(l);
+            }
         }
         let planned: u64 = o.n_l.iter().sum();
-        let card_ok = on_card == 0 && planned == 0;
+        let card_ok = on_card > 0
+            && on_tier == 0
+            && planned == on_card as u64
+            && bare.is_empty()
+            && o.n_l.iter().skip(1).all(|&n| n > 0);
         println!(
             "structure card experts: the plan's n_l sums to {planned}, the slot map holds \
-             {on_card} on a card or tier (want 0 and 0: every routed expert on the host) {}",
+             {on_card} on the card and {on_tier} on a tier (want at least 1 on the card, the \
+             plan's count, 0 on a tier), routed layers with none on the card {bare:?} (want \
+             none) {}",
             verdict(card_ok)
         );
         // Each layer's attention arguments: the program's against the
@@ -271,24 +299,37 @@ mod gate {
                 "; first off at layer {l}: program {got:?}, description {want:?}, pin {pin:?}"
             ))
         );
-        let ffns: Vec<FfnKind> = kinds.iter().map(|k| k.ffn).collect();
-        let counted = step_launches(&ffns);
+        let blocks = body.blocks();
+        let card_layers = blocks.iter().filter(|(_, card)| *card).count();
+        let counted = step_launches(&blocks);
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
         let nodes = k + b + other;
+        let derived = NODES_HOST + CARD_LAUNCHES * card_layers;
         let pass = nodes == NODES_DECODE
+            && derived == NODES_DECODE
             && counted == NODES_DECODE
             && b == MEMOPS
             && k == NODES_DECODE - MEMOPS
             && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {NODES_DECODE}; the program counts \
+            "structure decode graph_nodes={nodes} (want {NODES_DECODE} = {NODES_HOST} + \
+             {CARD_LAUNCHES} · {card_layers} layers with card experts; the program counts \
              {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) other={other} {}",
             verdict(pass)
         );
         Ok(ok && card_ok && args_ok && pass)
     }
+
+    /// PIN(2026-10-10): the ceiling of the batch set's worst layer-output
+    /// distance from ik's (`l_out_rel`, a distance over the output's own
+    /// size): 1.0, past which an output is no nearer ik's than zero is. The
+    /// distance reads 1.669e-1 (layer 42) with the card experts on; with the
+    /// shadow's `acc + x1` replaced by `x1` (the card slots' sum dropped) it
+    /// reads 1.340e1 while the argmax stays ik's runner-up inside the tie
+    /// rule, so this ceiling is what sees the card sum.
+    const FREE_WORST: f64 = 1.0;
 
     // ------------------------------------------------ (p) one chain, (c) free
 
@@ -377,16 +418,17 @@ mod gate {
             );
         let ik = ik_last(man, N_VOCAB)?;
         let ours = eager.logits.last().ok_or("no logits")?;
-        let (ok, _) = last_argmax("free", (ours, &ik), input_rel);
+        let (argmax_ok, _) = last_argmax("free", (ours, &ik), input_rel);
+        let band_ok = worst.0 <= FREE_WORST;
         println!(
-            "free: {} tokens, worst l_out_rel={:.3e} at layer {} (printed, no band); last \
+            "free: {} tokens, worst l_out_rel={:.3e} at layer {} (want at most {FREE_WORST}); last \
              position {}",
             eager.tokens.len(),
             worst.0,
             worst.1,
-            verdict(ok)
+            verdict(argmax_ok && band_ok)
         );
-        Ok(ok)
+        Ok(argmax_ok && band_ok)
     }
 
     // ------------------------------------------------------------ (t) sets

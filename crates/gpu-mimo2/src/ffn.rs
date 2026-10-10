@@ -6,25 +6,32 @@
 //! (`ds41_shexp_gate_up` over the q8_0 planes, plain at the layer's limit 0),
 //! the down projection and the add of `x1`. Four launches.
 //!
-//! A routed block runs around its host leg; every routed expert is on the
-//! host tier (the plan keeps none on a card):
+//! A routed block runs around its host leg; the card computes the experts the
+//! slot map puts on it ([`crate::card`]), the host tier the rest:
 //! - [`front`]: `ffn_norm` RMS into the boundary's handoff region, the
 //!   sigmoid router over 256 experts with the selection bias (top 8, the
 //!   weights from the unbiased scores, normalized and scaled), the handoff
-//!   into the host-mapped image and the go. Three kernels and the go.
-//! - [`back`]: the wait, then the add of `x1` and the host's routed sum. One
+//!   into the host-mapped image — each slot's place in the card's stacks, or
+//!   the host mark, from the layer's slot-map row — and the go. Three kernels
+//!   and the go.
+//! - [`shadow`]: while the host computes, the card's slots, six launches
+//!   ([`crate::card`]) ending in the card sum plus `x1`; none on a layer with
+//!   no card experts.
+//! - [`back`]: the wait, then the add of the host's routed sum and the
+//!   shadow's `acc + x1` (`x1` alone on a layer with no card experts). One
 //!   kernel after the wait.
 //!
 //! MiMo facts that fix this file: the routed block has no shared expert, so
-//! the card has nothing to run under the host leg and the walk has no shadow;
-//! the routed sum is the whole of the block's output; the routed experts'
-//! SwiGLU is plain (no clamp); the dense block's width is 16384.
+//! the shadow is the card experts alone; the routed sum plus the residual is
+//! the whole of the block's output; the routed experts' SwiGLU is plain (no
+//! clamp); the dense block's width is 16384.
 
 use std::ops::Range;
 
 use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::run::HostRun;
-use bloomery_gpu::hybrid::Hybrid;
+use bloomery_gpu::hybrid::{Boundary, Hybrid};
+use bloomery_gpu::kquant::Act;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::router::mimo2::N_EXPERT;
@@ -39,6 +46,7 @@ use model::r8file::R8Source;
 use runtime::layer::FfnKind;
 
 use crate::body::{Parts, WHAT, shape};
+use crate::card::Io;
 
 /// The block's tensors, named once at load.
 pub(crate) enum FfnNames {
@@ -174,22 +182,50 @@ pub(crate) fn front(
     hybrid.boundary().enqueue_go_of(stream, l, 0)
 }
 
-/// Enqueue layer `l`'s wait and the add of the host's routed sum to `x1`
-/// into `dest`, after its [`front`]: the head's input after the last layer
-/// and `x` otherwise.
+/// Enqueue layer `l`'s card experts, when it has any, in its host leg's
+/// shadow, after its [`front`]: the card sum plus `x1` into the card's `pre`.
+pub(crate) fn shadow(
+    gpu: &Gpu,
+    w: &Weights,
+    p: &mut Parts<'_>,
+    boundary: &Boundary,
+    l: usize,
+) -> Result<(), GpuError> {
+    if !p.card.has(l) {
+        return Ok(());
+    }
+    let rule = Act::SwigluClamp {
+        limit: p.cfg[l].ffn.limit,
+    };
+    let s = &*p.s;
+    let io = Io {
+        normed: boundary.normed(),
+        weights: &s.rout.weights,
+        x1: &s.x1,
+        m: 1,
+    };
+    p.card.enqueue_step(gpu, w, l, rule, &io, &s.sel)
+}
+
+/// Enqueue layer `l`'s wait and the add of the host's routed sum to the
+/// shadow's `acc + x1` (`x1` on a layer with no card experts) into `dest`,
+/// after its [`shadow`]: the head's input after the last layer and `x`
+/// otherwise.
 pub(crate) fn back(
     gpu: &Gpu,
     p: &mut Parts<'_>,
     hybrid: &Hybrid<HostRun>,
+    l: usize,
     dest: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let boundary = hybrid.boundary();
     let s = &mut *p.s;
     boundary.enqueue_back_of(stream, 0)?;
+    let shadowed = if p.card.has(l) { p.card.pre() } else { &s.x1 };
     let dest = dest.unwrap_or(&mut s.x);
     gpu.elem()
-        .enqueue_add(stream, boundary.hsum_of(0)?, &s.x1, p.d.embd, dest)
+        .enqueue_add(stream, boundary.hsum_of(0)?, shadowed, p.d.embd, dest)
 }
 
 /// The host views of the routed layers `run`, each from [`host::layer`]; a

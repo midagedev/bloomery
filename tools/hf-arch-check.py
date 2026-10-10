@@ -185,7 +185,8 @@ TYPE_PLACES = {
               ("crates/gpu/src/head.rs", "fn head_out_w(w: &Weights)"),
               ("crates/model/src/arch/qwen3moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
-    "mimo2": (("crates/model/src/arch/mimo2/place.rs", "let plan = placement::plan_host_routed("),
+    "mimo2": (("crates/model/src/arch/mimo2/place.rs", "pub fn card_routed(ty: GgmlType)"),
+              ("crates/placement/src/kernels.rs", "pub const fn card_runs(ty: GgmlType) -> bool"),
               ("crates/gpu-mimo2/src/body.rs", "if table.ty() != GgmlType::Q8_0"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
 }

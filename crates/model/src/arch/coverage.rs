@@ -44,8 +44,9 @@ pub enum Program {
     /// The qwen4exp body (`crates/gpu/src/arch/qwen3moe` `Body38`): every
     /// routed expert on the host tier.
     Qwen38Body,
-    /// The mimo2 body (`crates/gpu-mimo2`): every routed expert on the host
-    /// tier, none on a card.
+    /// The mimo2 body (`crates/gpu-mimo2`): the routed experts the plan puts
+    /// on a card (MXFP4 stacks, the common pair) and the rest on the host
+    /// tier.
     Mimo2Body,
 }
 
@@ -1088,10 +1089,11 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2 body's rule: the same, with no card expert — a
-                // stack passes only on the host by a qdot fused kernel.
+                // The mimo2 body's rule: the same — a stack passes when the
+                // common card leg runs its type (`kernels::card_runs`) or the
+                // host runs it by a qdot fused kernel at the stack's row width.
                 Some(Program::Mimo2Body) => {
-                    if routed_unrun(t, |_| false) {
+                    if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -2164,9 +2166,16 @@ mod tests {
     /// What the mimo2 body does not run is still an item, by name: a
     /// window layer with no sinks (the K192 window row folds them), a
     /// q4_K attention matrix (the body reads q8_0), a routed stack whose row
-    /// width no fused qdot kernel serves, and a routed stack of a type with
-    /// no host kernel at all — MiMo has no card expert, so no card rule
-    /// passes a stack the host cannot.
+    /// width no fused qdot kernel serves and whose type its card experts do
+    /// not read, and a routed stack of a type with neither. The card rule
+    /// passes an MXFP4 stack whatever its width, as the other families' card
+    /// rules pass theirs: the rule reads the type alone, and the width the
+    /// host cannot fuse is not listed (the card holds a prefix of the experts
+    /// and the host serves the rest).
+    // PIN(2026-10-10): the narrow-down case is a q4_K stack, which the common
+    // card leg does not run (`kernels::card_runs`); the MXFP4 stack of the same width
+    // (before this round an item, as every stack the host could not fuse was)
+    // lists nothing, which the last assertion holds.
     #[test]
     fn what_the_mimo2_body_does_not_run_is_an_item() {
         let (spec, model) = mimo2_real();
@@ -2190,6 +2199,10 @@ mod tests {
             if t.name == "blk.5.ffn_up_exps.weight" {
                 t.ty = GgmlType::IQ2_S;
             }
+            if t.name == "blk.6.ffn_down_exps.weight" {
+                t.ty = GgmlType::Q4_K;
+                t.dims[0] = 2000;
+            }
         }
         let items: Vec<String> = super::check(&spec, &other)
             .into_iter()
@@ -2199,10 +2212,14 @@ mod tests {
             items,
             [
                 "q4_K attention matrices (the body reads q8_0)",
-                "mxfp4 routed experts on a card",
                 "iq2_s routed experts on a card",
+                "q4_K routed experts on a card",
             ],
             "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|i| i.contains("mxfp4")),
+            "the MXFP4 down of 2000 values lists nothing: {items:?}"
         );
     }
 }

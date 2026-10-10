@@ -2,8 +2,9 @@
 //! [`Body`] behind `GpuModel`.
 //!
 //! All 48 layers are one card's chain: the dense layer 0 and 47 routed layers
-//! whose experts all run on the host tier (the plan keeps none on a card).
-//! Each layer is a GQA attention over a full plane of the stores' positions —
+//! whose experts run on the card where the plan puts them ([`crate::card`]: the
+//! common per-slot pair, in the host leg's shadow) and on the host tier
+//! otherwise. Each layer is a GQA attention over a full plane of the stores' positions —
 //! its window bounds what a query reads, not what the layer holds — and a
 //! block; the step is [`crate::program`]'s walk, one token at a time (there is
 //! no verify pass of several rows and no draft). A prompt is fed by that step
@@ -19,8 +20,9 @@
 //! host tier and the taps.
 //!
 //! What the load refuses, by name: a plan of other than one card with no
-//! expert tier, a plan that puts a routed expert on a card, a description
-//! whose layers the K192 kernels or the routed block do not run
+//! expert tier, card experts whose stacks are not resident in the rows the slot
+//! map counts, a description whose layers the K192 kernels or the routed block
+//! do not run
 //! ([`facts::attn_args`], [`facts::block_args`]), a resident weight of
 //! other rows than the description's, a non-finite sink, stores whose bytes
 //! are not the plan's, and a scratch past the plan's term.
@@ -54,6 +56,7 @@ use model::placement::Plan;
 use runtime::layer::{FfnKind, Layer, ResidualKind, hosted};
 
 use crate::attn::{AttnNames, checked_sinks};
+use crate::card::CardExperts;
 use crate::ffn::{FfnNames, routed_layers};
 use crate::program;
 
@@ -294,6 +297,8 @@ pub struct Body {
     dims: Dims,
     k: Kernels,
     s: Scratch,
+    /// The card's routed experts and the step's buffers they run in.
+    card: CardExperts,
     stores: Vec<Store>,
     /// One table a distinct rope base.
     ropes: Vec<RopeBase>,
@@ -320,6 +325,7 @@ pub(crate) struct Parts<'s> {
     pub cfg: &'s [LayerCfg],
     pub names: &'s [LayerNames],
     pub s: &'s mut Scratch,
+    pub card: &'s mut CardExperts,
     pub stores: &'s mut [Store],
     pub ropes: &'s [RopeBase],
     pub slots: &'s DeviceTensor<u32>,
@@ -485,10 +491,10 @@ impl Body {
     /// the plan puts on the card, the stores at the plan's `ctx_max`, the host
     /// tier over every routed layer and the embedding as a host row; the load's
     /// slot map for the model's life. Refused by name (module doc): a plan of
-    /// other than one card or with an expert tier, one that puts a routed
-    /// expert on a card, a layer or a width no kernel here runs, routed layers
-    /// that are not one run, stores whose bytes are not the plan's, and the
-    /// machine's own refusals at the load.
+    /// other than one card or with an expert tier, card experts the resident
+    /// stacks do not hold, a layer or a width no kernel here runs, routed
+    /// layers that are not one run, stores whose bytes are not the plan's, and
+    /// the machine's own refusals at the load.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -581,16 +587,6 @@ impl Body {
         let dims = dims_of(inputs)?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
         let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
-        for l in run.clone() {
-            let (on_card, on_tier) = (map.on_card(l)?, map.on_tier(l)?);
-            if on_card + on_tier > 0 {
-                return Err(shape(format!(
-                    "layer {l}: the plan puts {} routed experts on a card; this program runs \
-                     every routed expert on the host tier",
-                    on_card + on_tier
-                )));
-            }
-        }
         let mut thetas = Vec::new();
         let mut cfg = Vec::with_capacity(spec.layers.len());
         for (l, s) in spec.layers.iter().enumerate() {
@@ -613,6 +609,7 @@ impl Body {
         for (c, n) in cfg.iter().zip(&names) {
             check_layer(w, c, n, &dims)?;
         }
+        let card_experts = CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff)?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         // MiMo fact: only the window layers carry sinks, one per query head, file constants.
@@ -702,6 +699,7 @@ impl Body {
             dims,
             k: Kernels::load(gpu)?,
             s,
+            card: card_experts,
             stores,
             ropes,
             slots,
@@ -717,7 +715,8 @@ impl Body {
             plan,
             card,
             body.scratch_bytes(),
-            "the step's buffers, the rope tables, the host boundary, the slot map's copy",
+            "the step's buffers, the card experts' buffers, the rope tables, the host \
+             boundary, the slot map's copy",
         )?;
         Ok(body)
     }
@@ -743,6 +742,19 @@ impl Body {
         first.zip(last).map_or(0..0, |(f, l)| f..l + 1)
     }
 
+    /// Each layer's block and whether the plan puts experts of it on the
+    /// card, as the step counts its launches
+    /// ([`model::arch::mimo2::program::step_launches`]).
+    #[must_use]
+    pub fn blocks(&self) -> Vec<(FfnKind, bool)> {
+        let card = self.card.card_layers();
+        self.cfg
+            .iter()
+            .zip(card)
+            .map(|(c, on_card)| (c.kind.ffn, on_card))
+            .collect()
+    }
+
     /// What each layer's attention launches take: its kv heads, window,
     /// sinks and value multiplier, and the base of the rope table the layer
     /// reads (not the description's: the table's own).
@@ -764,12 +776,13 @@ impl Body {
     }
 
     /// Device bytes of the load's scratch, what the plan's card term
-    /// `scratch_bytes` sets aside: the step's buffers, the rope tables, the
-    /// host boundary and the slot map's card copy. A load past the term is
-    /// refused by name.
+    /// `scratch_bytes` sets aside: the step's buffers, the card experts'
+    /// buffers, the rope tables, the host boundary and the slot map's card
+    /// copy. A load past the term is refused by name.
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
+            + self.card.bytes()
             + self
                 .ropes
                 .iter()
@@ -857,6 +870,7 @@ impl Body {
                 cfg: &self.cfg,
                 names: &self.names,
                 s: &mut self.s,
+                card: &mut self.card,
                 stores: &mut self.stores,
                 ropes: &self.ropes,
                 slots: &self.slots,

@@ -5,10 +5,11 @@
 //!
 //! - the front: the attention sub-layer whole, then either the dense block
 //!   whole or the routed block up to its go;
-//! - the shadow: none — the routed block has no shared expert and no card
-//!   expert, so the card has no work under the host leg;
-//! - the back (a routed layer): the wait and the add of the host's sum, then
-//!   the host tier told the layer is enqueued.
+//! - the shadow (a routed layer): its card experts, when the slot map puts
+//!   any on the card — the routed block has no shared expert, so the card has
+//!   no other work under the host leg;
+//! - the back (a routed layer): the wait and the add of the host's sum to the
+//!   shadow's, then the host tier told the layer is enqueued.
 //!
 //! A layer's output goes to its tap, where a gate armed one, once its last
 //! add is enqueued. The begin starts from `x`, which the embedding wrote; the
@@ -117,6 +118,22 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
         }
     }
 
+    /// A routed layer's card experts under its host leg.
+    fn shadow(&mut self, port: &mut StepLeg<'s, HostRun>, at: At) -> Result<(), GpuError> {
+        no_other_row(at.unit)?;
+        let l = at.layer;
+        if !self.parts.cfg[l].kind.host_leg() {
+            return Ok(());
+        }
+        ffn::shadow(
+            self.gpu,
+            self.w,
+            &mut self.parts,
+            port.hybrid().boundary(),
+            l,
+        )
+    }
+
     /// A routed layer's wait and add, its tap, and the host tier told the
     /// layer is enqueued (an eager chain is served there).
     fn back(&mut self, port: &mut StepLeg<'s, HostRun>, at: At) -> Result<(), GpuError> {
@@ -126,7 +143,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
             return Ok(());
         }
         let dest = self.last(l).then(|| self.head.input_mut());
-        ffn::back(gpu, &mut self.parts, port.hybrid(), dest)?;
+        ffn::back(gpu, &mut self.parts, port.hybrid(), l, dest)?;
         self.tap(l)?;
         port.hybrid().row_enqueued(l, at.unit)
     }

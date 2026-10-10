@@ -19,10 +19,14 @@
 //! - the front: the attention sub-layer over the batch's rows, then either
 //!   the dense block whole, or the routed block's norm, its router over the
 //!   rows and the download of the rows, ids and weights to the host;
-//! - the shadow: none — the routed block has no shared expert and no card
-//!   expert;
+//! - the shadow: the card experts, where the slot map puts any
+//!   ([`crate::card`]: every slot's place in one launch, then the common pair
+//!   over the batch's `t · N_USED` slots, one launch each — the steps'
+//!   one-token launches' rows for each slot, so the sums are the steps'); the
+//!   routed block has no shared expert, so nothing else;
 //! - the back: the host's sums (the walk's serve uploaded them) plus the
-//!   residual after the attention.
+//!   shadow's card sum and the residual after the attention (`x1` alone on a
+//!   layer with no card experts).
 //!
 //! The head runs after the last layer of the batch that holds the call's last
 //! position, for that position alone.
@@ -54,9 +58,10 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::read_fault;
+use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{COL_GROUP, Gpu, GpuError};
+use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
@@ -70,6 +75,7 @@ use runtime::prompt::{
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use super::{Body, Dims, Kernels, LayerCfg, LayerNames, Mimo2Model, RopeBase, Store, WHAT, shape};
+use crate::card::{CardBatch, CardExperts, Io, card_batch_bytes};
 use crate::ffn::FfnNames;
 
 /// Positions one batch runs at most: the host union's columns.
@@ -112,12 +118,13 @@ impl PromptState {
 }
 
 /// The batch's buffers: the walk's shared ones, one set a unit of a group,
-/// and the host sums the batch port uploads (lent to the port apart from
-/// them).
+/// the host sums the batch port uploads (lent to the port apart from them) and
+/// the card experts' buffers, on a load with card experts.
 struct Batch {
     bufs: Bufs,
     units: Vec<UnitBufs>,
     hsum: DeviceBuffer<f32>,
+    card: Option<CardBatch>,
 }
 
 impl Batch {
@@ -125,6 +132,7 @@ impl Batch {
         self.bufs.bytes()
             + self.units.iter().map(UnitBufs::bytes).sum::<usize>()
             + self.hsum.num_bytes()
+            + self.card.as_ref().map_or(0, CardBatch::bytes)
     }
 }
 
@@ -539,7 +547,11 @@ impl Body {
         let n = self.dims.embd;
         let lens = Lens::of(&self.dims, &self.cfg, cap);
         let sets = group_sets(self.prompt.group);
-        let shared = lens.bytes() + size_of::<f32>() * cap * n;
+        let card = self
+            .card
+            .any()
+            .then(|| card_batch_bytes(n, self.card.ff(), cap));
+        let shared = lens.bytes() + size_of::<f32>() * cap * n + card.unwrap_or(0);
         let planned = shared + sets * UnitBufs::planned(n, cap);
         self.refuse_unreserved(gpu, sets, shared)?;
         let bufs = Bufs::new(gpu, &lens, cap)?;
@@ -547,7 +559,15 @@ impl Body {
             .map(|_| UnitBufs::new(gpu, n, cap))
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * n)?;
-        let batch = Batch { bufs, units, hsum };
+        let card = card
+            .map(|_| CardBatch::new(gpu, n, self.card.ff(), cap))
+            .transpose()?;
+        let batch = Batch {
+            bufs,
+            units,
+            hsum,
+            card,
+        };
         if batch.bytes() != planned {
             return Err(shape(format!(
                 "the prompt batch takes {} B; the sizes the refusal counts add to {planned}",
@@ -616,14 +636,21 @@ impl Body {
             dims,
             k,
             s,
+            card,
             stores,
             ropes,
+            slots,
             embd,
             prompt,
             ctx,
             ..
         } = self;
-        let Batch { bufs, units, hsum } = prompt.batch.as_deref_mut().ok_or(GpuError::State {
+        let Batch {
+            bufs,
+            units,
+            hsum,
+            card: card_batch,
+        } = prompt.batch.as_deref_mut().ok_or(GpuError::State {
             what: WHAT,
             missing: "the batch's buffers (set_prefill)",
         })?;
@@ -675,6 +702,9 @@ impl Body {
             names,
             stores,
             ropes,
+            slots,
+            card,
+            card_batch: card_batch.as_mut(),
             no_bias: &s.no_bias,
             ctx: *ctx,
             b: bufs,
@@ -707,6 +737,12 @@ struct PromptProgram<'a> {
     names: &'a [LayerNames],
     stores: &'a mut [Store],
     ropes: &'a [RopeBase],
+    /// The slot map's card copy: each routed layer's row of places.
+    slots: &'a DeviceTensor<u32>,
+    /// The card's routed experts and the batch's buffers they run in, on a
+    /// load with card experts.
+    card: &'a CardExperts,
+    card_batch: Option<&'a mut CardBatch>,
     /// The zero selection bias of a router the file gives none.
     no_bias: &'a DeviceBuffer<f32>,
     ctx: usize,
@@ -892,6 +928,36 @@ impl PromptProgram<'_> {
             .enqueue_download(stream, [&b.normed, &b.weights], &b.ids, key)
     }
 
+    /// Layer `l`'s card experts over unit `u`'s batch (`card::CardExperts::
+    /// enqueue_rows`) under its host leg: the batch's normed rows and routing
+    /// as `route` wrote them, into the card's sum plus the unit's `x1`.
+    fn card_experts(&mut self, l: usize, u: usize) -> Result<(), GpuError> {
+        let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
+        let (b, ub) = (&*self.b, &self.u[u]);
+        let cb = self.card_batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the card experts' batch buffers",
+        })?;
+        let rule = Act::SwigluClamp {
+            limit: self.cfg[l].ffn.limit,
+        };
+        let io = Io {
+            normed: &b.normed,
+            weights: &b.weights,
+            x1: &ub.x1,
+            m: t,
+        };
+        self.card.enqueue_rows(
+            gpu,
+            w,
+            cb,
+            l,
+            rule,
+            &io,
+            (&b.ids, self.slots, self.cfg[l].row_off),
+        )
+    }
+
     /// After the last layer: the group's last unit's last token's output
     /// row into the head's input, and the head.
     fn head(&mut self, head: &mut Head) -> Result<(), GpuError> {
@@ -935,18 +1001,39 @@ impl<'a> LayerProgram for PromptProgram<'a> {
         }
     }
 
+    /// A routed layer's card experts, where the slot map puts any, under its
+    /// host leg.
+    fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if !self.card.has(at.layer) {
+            return Ok(());
+        }
+        self.card_experts(at.layer, at.unit)
+    }
+
     /// A routed layer's host sums (the walk's serve uploaded them) plus the
-    /// residual after the attention, into the unit's `x`.
+    /// shadow's card sum and the residual after the attention (`x1` alone on
+    /// a layer with no card experts), into the unit's `x`.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.cfg[at.layer].kind.host_leg() {
             return Ok(());
         }
         let t = self.t[at.unit];
         let ub = &mut self.u[at.unit];
+        let shadowed = if self.card.has(at.layer) {
+            self.card_batch
+                .as_deref()
+                .ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the card experts' batch buffers",
+                })?
+                .pre()
+        } else {
+            &ub.x1
+        };
         self.gpu.elem().enqueue_add(
             self.gpu.stream(),
             port.hsum(),
-            &ub.x1,
+            shadowed,
             t * self.d.embd,
             &mut ub.x,
         )
