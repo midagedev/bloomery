@@ -2,6 +2,8 @@
 //! hashes raw token ids with an EOS reset (a PLE site). Plain integer
 //! arithmetic over slices: no header, no file, no allocation per token.
 
+use std::ops::Range;
+
 /// The `out.len()` row ids of one site for the window `ctx`.
 ///
 /// `ctx[0]` is the current token's context value and `ctx[s]` the one `s`
@@ -74,6 +76,21 @@ pub enum NgramError {
     },
     #[error("this hash maps its ids through a token map; it has no raw-id window")]
     NotRawIds,
+    #[error(
+        "image span {index} ({span:?}) is malformed for a call of {tokens} tokens: {why}; spans \
+         are non-empty, ascending, non-overlapping row ranges inside the call"
+    )]
+    BadSpan {
+        index: usize,
+        span: Range<usize>,
+        tokens: usize,
+        why: &'static str,
+    },
+    #[error(
+        "the call has image spans, and this hash carries no image token id (`ple.image_token_id`) \
+         to hash an image position by"
+    )]
+    NoImageToken,
 }
 
 /// The raw-id window: a site that hashes token ids as they are, where an
@@ -88,7 +105,8 @@ pub struct EosWindow {
     /// The id that resets the window (`ple.eos_token_id`), not necessarily the
     /// tokenizer's end of text.
     pub eos: u32,
-    /// The image placeholder id (`ple.image_token_id`), refused by name.
+    /// The image placeholder id (`ple.image_token_id`): hashed like any id at
+    /// an image position, refused by name anywhere else.
     pub image: Option<u32>,
     /// Tokens of the model's vocabulary; an id at or past it is refused.
     pub n_vocab: u32,
@@ -97,13 +115,20 @@ pub struct EosWindow {
 impl EosWindow {
     /// Refuse an id that is no text token of the model.
     pub fn check(&self, token: u32) -> Result<(), NgramError> {
+        self.check_at(token, false)
+    }
+
+    /// [`EosWindow::check`] for a position that may be an image position
+    /// (`in_image_span`): there the image placeholder is the id the position
+    /// hashes by, and passes.
+    pub fn check_at(&self, token: u32, in_image_span: bool) -> Result<(), NgramError> {
         if token >= self.n_vocab {
             return Err(NgramError::TokenPastVocab {
                 token,
                 vocab: self.n_vocab,
             });
         }
-        if self.image == Some(token) {
+        if self.image == Some(token) && !in_image_span {
             return Err(NgramError::ImageToken { token });
         }
         Ok(())
@@ -224,6 +249,25 @@ mod tests {
         assert_eq!(
             w.check(248_056),
             Err(NgramError::ImageToken { token: 248_056 })
+        );
+    }
+
+    /// The image placeholder passes inside an image span only; the vocabulary
+    /// bound holds there too.
+    #[test]
+    fn image_id_passes_inside_a_span_only() {
+        let w = win();
+        assert_eq!(w.check_at(248_056, true), Ok(()));
+        assert_eq!(
+            w.check_at(248_056, false),
+            Err(NgramError::ImageToken { token: 248_056 })
+        );
+        assert_eq!(
+            w.check_at(248_320, true),
+            Err(NgramError::TokenPastVocab {
+                token: 248_320,
+                vocab: 248_320
+            })
         );
     }
 
