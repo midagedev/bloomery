@@ -3,18 +3,18 @@
 //! dumped by `tools/ref/clefvis/dump_mtmd.cpp` (`just dump-ref-clefvis`) in
 //! the node dumps' set format, at the mainline tree [`LCPP_BUILD`], with the
 //! bf16 projector [`MMPROJ_BF16`]. One family a kind of set
-//! ([`crate::clefvis::Kind`], the family's `Identity::Clefvis`), so a set of one
-//! is refused by name where another is read, by [`Family::check_set`] too; the tower's sets state the projector as their model file
-//! (`# arch clip`), the prompts' sets the text model. No gate reads them yet
-//! (R1 onward), so `consumers` is empty.
+//! ([`crate::clefvis::Kind`], the family's `Identity::Clefvis` with the seat's
+//! [`CLEF`] profile), so a set of one is refused by name where another is
+//! read, by [`Family::check_set`] too; the tower's sets state the projector
+//! as their model file (`# arch clip`), the prompts' sets the text model. No
+//! gate reads them yet (R1 onward), so `consumers` is empty.
 
 use super::{ARCH, LCPP_BUILD, MODEL_FLASH_Q8};
 use crate::RefError;
-use crate::clefvis::{Kind, MMPROJ_BF16};
+use crate::clefvis::{CLEF, Kind, MMPROJ_BF16};
 use crate::family::{Build, Family, Identity};
 
-/// The architecture the projector's manifest names in its `# arch` line.
-pub const TOWER_ARCH: &str = "clip";
+pub use crate::clefvis::TOWER_ARCH;
 
 /// Set A: the 8 test images after mtmd's preprocess.
 pub const PREPROC_SET: &str = "ref_clefvis_preproc";
@@ -65,7 +65,7 @@ pub static PREPROC: Family = Family {
     sets: &[PREPROC_SET],
     resolve: None,
     recipe: "just dump-ref-clefvis ref_clefvis_preproc",
-    identity: Identity::Clefvis(Kind::Preproc),
+    identity: Identity::Clefvis(Kind::Preproc, &CLEF),
     arch: Some(TOWER_ARCH),
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(mmproj),
@@ -79,7 +79,7 @@ pub static TAPS: Family = Family {
     sets: &[TAPS_SET, TAPS_CPU_SET],
     resolve: None,
     recipe: "just dump-ref-clefvis [--cpu-twin] ref_clefvis_taps",
-    identity: Identity::Clefvis(Kind::Taps),
+    identity: Identity::Clefvis(Kind::Taps, &CLEF),
     arch: Some(TOWER_ARCH),
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(mmproj),
@@ -93,7 +93,7 @@ pub static HIDDEN: Family = Family {
     sets: HIDDEN_SETS,
     resolve: None,
     recipe: "just dump-ref-clefvis [--cpu-twin] ref_clefvis_hidden_c<N>",
-    identity: Identity::Clefvis(Kind::Hidden),
+    identity: Identity::Clefvis(Kind::Hidden, &CLEF),
     arch: Some(ARCH),
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
@@ -107,7 +107,7 @@ pub static PROSE: Family = Family {
     sets: PROSE_SETS,
     resolve: None,
     recipe: "just dump-ref-clefvis [--cpu-twin] ref_clefvis_prose_c<N>",
-    identity: Identity::Clefvis(Kind::Prose),
+    identity: Identity::Clefvis(Kind::Prose, &CLEF),
     arch: Some(ARCH),
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
@@ -121,7 +121,7 @@ pub static BF16ROWS: Family = Family {
     sets: BF16ROWS_SETS,
     resolve: None,
     recipe: "just dump-ref-clefvis ref_clefvis_bf16rows_c<N>",
-    identity: Identity::Clefvis(Kind::Bf16Rows),
+    identity: Identity::Clefvis(Kind::Bf16Rows, &CLEF),
     arch: Some(ARCH),
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),

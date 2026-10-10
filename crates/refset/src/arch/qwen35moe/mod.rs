@@ -5,6 +5,8 @@
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
+pub mod vis;
+
 /// The file every qwen35moe set is dumped from and the tree runs. The
 /// family owns the path until the model crate reads this architecture.
 pub const MODEL: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
@@ -49,7 +51,15 @@ pub static IK: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK];
+pub static FAMILIES: &[&Family] = &[
+    &IK,
+    &vis::TAPS,
+    &vis::CHATIDS,
+    &vis::HIDDEN,
+    &vis::PROSE,
+    &vis::BF16ROWS,
+    &vis::DECODE,
+];
 
 #[cfg(test)]
 mod tests;

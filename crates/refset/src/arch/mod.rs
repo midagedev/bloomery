@@ -64,6 +64,9 @@ pub fn named(name: &str) -> Option<&'static Family> {
 }
 
 #[cfg(test)]
+mod qwen_vis_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{all, named, node_dumps};
     use crate::family::Identity;

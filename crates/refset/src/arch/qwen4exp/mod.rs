@@ -9,6 +9,7 @@ use crate::family::{Build, Family, Identity};
 
 pub mod fixture;
 pub mod mtp;
+pub mod vis;
 
 /// The first shard of the split set every qwen4exp set is dumped from and
 /// the tree runs: the identity each set's `# model` line states. The family
@@ -68,7 +69,18 @@ pub static IK: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK, &mtp::MTP, &fixture::IK, &fixture::MTP];
+pub static FAMILIES: &[&Family] = &[
+    &IK,
+    &mtp::MTP,
+    &fixture::IK,
+    &fixture::MTP,
+    &vis::TAPS,
+    &vis::CHATIDS,
+    &vis::HIDDEN,
+    &vis::PROSE,
+    &vis::BF16ROWS,
+    &vis::DECODE,
+];
 
 #[cfg(test)]
 mod tests;
