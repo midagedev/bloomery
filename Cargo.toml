@@ -27,9 +27,9 @@ thiserror = "2"
 # upstream (listed in THIRD_PARTY_NOTICES.md). With no patch left this section goes. A rev move here needs the box's
 # backend rebuilt for that rev (tools/box.sh, CUDA_OXIDE_BACKEND).
 [patch."https://github.com/NVIDIA/cuda-rust.git"]
-cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "4da6c138448538ca12218cb80924c070417ab419" }
-cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "4da6c138448538ca12218cb80924c070417ab419" }
-cuda-core = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "4da6c138448538ca12218cb80924c070417ab419" }
+cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
+cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
+cuda-core = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
 
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]

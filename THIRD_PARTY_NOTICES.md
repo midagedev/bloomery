@@ -49,6 +49,7 @@ upstream has it; with none left, the `[patch]` section goes away.
 | [`361737ce`](https://github.com/midagedev/cuda-oxide/commit/361737ce49963829d844625b30df365c9ee1a5b3) fix(cuda-macros): name the macro call when a cuda_module finds no kernels | not yet proposed |
 | [`e5eddb3b`](https://github.com/midagedev/cuda-oxide/commit/e5eddb3bf8a9cf8f26b9d32201af9c9a730cfc83) feat(unroll): recognize range `for` loops | proposed upstream as [NVIDIA/cuda-rust#1346](https://github.com/NVIDIA/cuda-rust/pull/1346) (open) |
 | [`4da6c138`](https://github.com/midagedev/cuda-oxide/commit/4da6c138448538ca12218cb80924c070417ab419) fix(mir-lower): give an aggregate niche payload's leaves typed slots | not yet proposed |
+| [`87bc9518`](https://github.com/midagedev/cuda-oxide/commit/87bc951864b79f723b4da9c11fa229f5600aefcb) feat(cargo-oxide): select extra-rustflags by target triple | not yet proposed |
 
 ## cuda-core (cutile-rs)
 

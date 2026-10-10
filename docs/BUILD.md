@@ -9,7 +9,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Piece | Version | Where it is pinned |
 |---|---|---|
 | Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
-| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `1691162ab9204ef21b0329c2e8059815420dfd5a` (upstream: NVIDIA/cuda-rust), source rev `4da6c138448538ca12218cb80924c070417ab419` | `[workspace.dependencies]` in `Cargo.toml` (NVIDIA/cuda-rust), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
+| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `1691162ab9204ef21b0329c2e8059815420dfd5a` (upstream: NVIDIA/cuda-rust), source rev `87bc951864b79f723b4da9c11fa229f5600aefcb` | `[workspace.dependencies]` in `Cargo.toml` (NVIDIA/cuda-rust), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
 | `cargo-oxide` | 0.2.1, from the same fork and rev | the install command below; `cargo oxide doctor` must pass |
 | LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | on `PATH`, or `CUDA_OXIDE_LLC` |
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
@@ -26,7 +26,7 @@ Install `cargo-oxide` from the fork at the pinned rev, not from upstream's main 
 
 ```sh
 cargo +nightly-2026-08-28 install --git https://github.com/midagedev/cuda-oxide.git \
-  --rev 4da6c138448538ca12218cb80924c070417ab419 cargo-oxide
+  --rev 87bc951864b79f723b4da9c11fa229f5600aefcb cargo-oxide
 ```
 
 That `cargo-oxide` builds its codegen backend from the checkout cargo resolved for `cuda-device`, which is the `[patch]` fork at the pinned rev (the fork's `crates/cargo-oxide/src/backend_source.rs`). The maintainers' machine instead keeps one prebuilt backend per rev and points `CUDA_OXIDE_BACKEND` at it; you do not need that. The install above has not been run on a clean host yet.
@@ -43,12 +43,17 @@ cuda-oxide's README says the pipeline prefers the `llc` of the Rust toolchain, t
 
 ## The CPU flag
 
-Both cargo configuration files force `-C target-cpu=znver3`:
+Both cargo configuration files set the CPU per target triple:
 
-- `.cargo/config.toml` sets it for `x86_64-unknown-linux-gnu` in plain `cargo` builds.
-- `.cargo/cuda-oxide.toml` sets it for `cargo oxide` builds (`extra-rustflags`). cargo-oxide passes its own rustflags, which hide the first file's setting, so the flag needs this second owner.
+- `.cargo/config.toml` sets it in plain `cargo` builds (`[target.<triple>] rustflags`).
+- `.cargo/cuda-oxide.toml` sets it for `cargo oxide` builds (`[target.<triple>] extra-rustflags`). cargo-oxide passes its own rustflags, which hide the first file's setting, so the flag needs this second owner. cargo-oxide takes the table of the triple it builds for (`--target`, else `CARGO_BUILD_TARGET`, else the host rustc's); a triple with neither table gets no CPU flag. The `cargo-oxide` you have installed must be the pinned rev: an older one ignores the tables without a word.
 
-Every bit gate runs under this flag. A host that is not Zen 3 has not been tested; on an older AMD or an Intel CPU a binary built for `znver3` may stop with an illegal instruction. To build for your own CPU, change the flag in **both** files, for example to `target-cpu=native`, and keep the two lists equal. `tools/check-rustflags.sh` (`just check-rustflags`) checks that the two lists are equal and that they still name `znver3`, so it fails after this change; that check is the maintainers'. The kernels carry their own `#[target_feature]` attributes and need AVX2 and FMA in any case.
+| Triple | Flags | Machine |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `-C target-cpu=znver3 -C target-feature=-sse4a` | the development machine (Zen 3) |
+| `aarch64-unknown-linux-gnu` | `-C target-cpu=native` | a DGX Spark, building for itself |
+
+Every bit gate runs under the x86_64 flags. An x86_64 host that is not Zen 3 has not been tested; on an older AMD or an Intel CPU a binary built for `znver3` may stop with an illegal instruction. To build for your own x86_64 CPU, change that triple's flags in **both** files, for example to `target-cpu=native`, and keep the two lists equal. `tools/check-rustflags.sh` (`just check-rustflags`) checks that each triple's two lists are equal, that the x86_64 lists still name `znver3` and `-sse4a`, and that the aarch64 lists name no x86 CPU or feature, so it fails after that change; that check is the maintainers'. The kernels carry their own `#[target_feature]` attributes and need AVX2 and FMA in any case.
 
 ## Building
 

@@ -1,6 +1,14 @@
 # cargo-oxide reads this file from the workspace root. `cargo oxide` exports
 # CARGO_ENCODED_RUSTFLAGS, which cargo consults before `target.<triple>.rustflags`,
-# so the flags in config.toml never reach an oxide build's host code; this list is
-# the oxide side of the same fact, and tools/check-rustflags.sh keeps the two equal.
+# so the flags in config.toml never reach an oxide build's host code; these tables
+# are the oxide side of the same fact, and tools/check-rustflags.sh keeps each
+# triple's list equal to config.toml's. cargo-oxide picks the table of the triple
+# it builds for (`--target`, else CARGO_BUILD_TARGET, else the host rustc's); a
+# triple with no table gets no CPU flag. There is no top-level `extra-rustflags`:
+# it would reach every triple.
 # -sse4a: the reason is in config.toml beside the same list.
+[target.x86_64-unknown-linux-gnu]
 extra-rustflags = ["-C", "target-cpu=znver3", "-C", "target-feature=-sse4a"]
+
+[target.aarch64-unknown-linux-gnu]
+extra-rustflags = ["-C", "target-cpu=native"]
