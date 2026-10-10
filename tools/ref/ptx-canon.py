@@ -45,6 +45,13 @@ older rule set — and a pair whose methods differ is refused by name (exit 2): 
 with this tree's tools. A failed scan is refused too. Exit 0 when both scans hold the same entries,
 every row and every md5 equal, 1 otherwise, with the moved rows and digests listed.
 
+A `--no-jit` scan (banner `jit=skipped(no-jit)`) has no driver JIT reading: its `jit_regs` and
+`jit_local` cells read `skipped(no-jit)`. Those two columns are never compared when either scan is
+no-jit — a skipped cell is not a value and equals nothing, not even another skipped cell — and one line
+says so (`jit columns not compared (no-jit: base|new|both)`); every other column and the md5 block
+compare as before. A scan whose banner and cells disagree (a no-jit banner over a number, a full banner
+over a skipped cell) or that holds a skipped cell in any other column is refused by name (exit 2).
+
 `reordered-only` is a same-multiset result, not by itself a proof. Its line therefore also checks
 every pair of lines whose relative order changed: the pair is independent when the two lines share
 no register and neither is a memory, synchronisation or control line (anything but the pure
@@ -340,15 +347,29 @@ def read(path):
         raise Refused(f"cannot read {path}: {e}") from e
 
 
+# What a `ptx-scan.sh --no-jit` scan prints in place of the driver JIT's reading: in the banner as
+# `jit=skipped(no-jit)`, and in each row's two JIT columns.
+SKIPPED = "skipped(no-jit)"
+JIT_COLUMNS = ("jit_regs", "jit_local")
+
+
 def parse_scan(path):
-    """A saved ptx-scan output: (method, {entry: row fields}, {entry: (md5, lines)}). `method` is
-    the md5 line's `method=` value, or `none` for a block from before the method was named."""
+    """A saved ptx-scan output: (method, header, {entry: row fields}, {entry: (md5, lines)}, nojit).
+    `method` is the md5 line's `method=` value, or `none` for a block from before the method was
+    named. `nojit` is whether the scan skipped the driver JIT: its banner says so and its JIT cells
+    read SKIPPED, and a scan where the two disagree, or with a skipped cell in any other column, is
+    refused."""
     text = read(path)
     banner = next((l for l in text.split("\n") if l.startswith("ptx-scan bin=")), None)
     if banner is None:
         raise Refused(f"{path} holds no ptx-scan banner line")
     if banner.endswith("scan=failed"):
         raise Refused(f"{path} is a failed scan: {banner}")
+    jit = [w[len("jit="):] for w in banner.split() if w.startswith("jit=")]
+    if jit not in ([], [SKIPPED]):
+        raise Refused(f"{path}: a banner jit={' jit='.join(jit)} this reader does not parse "
+                      f"(a scan that ran the JIT names jit-card, jit-cc and jit-cuda, not jit=)")
+    nojit = bool(jit)
     rows, md5, method, header, state = {}, {}, None, None, None
     for line in text.split("\n"):
         f = line.split()
@@ -367,17 +388,42 @@ def parse_scan(path):
             state = None
     if header is None or method is None:
         raise Refused(f"{path} holds no table header or no md5 block")
-    return method, header, rows, md5
+    jit_at = [header.index(c) - 1 for c in JIT_COLUMNS if c in header]
+    for e, cells in rows.items():
+        for i, cell in enumerate(cells):
+            if cell != SKIPPED:
+                if nojit and i in jit_at:
+                    raise Refused(f"{path}: the banner says jit={SKIPPED} but {e}'s {header[i + 1]} "
+                                  f"reads {cell}; a skipped scan holds no JIT value")
+                continue
+            if i not in jit_at:
+                raise Refused(f"{path}: {e}'s {header[i + 1]} reads {SKIPPED}; only "
+                              f"{' and '.join(JIT_COLUMNS)} can be skipped")
+            if not nojit:
+                raise Refused(f"{path}: {e}'s {header[i + 1]} reads {SKIPPED} but the banner names "
+                              "the JIT (jit-card, jit-cc, jit-cuda)")
+    return method, header, rows, md5, nojit
 
 
 def compare_scans(base_path, new_path):
     """Print the entries, rows and digests two scans do not share; return whether any moved."""
-    bm, header, br, b5 = parse_scan(base_path)
-    nm, _, nr, n5 = parse_scan(new_path)
+    bm, header, br, b5, bj = parse_scan(base_path)
+    nm, nheader, nr, n5, nj = parse_scan(new_path)
     if bm != nm:
         raise Refused(f"{base_path} digests are method {bm} and {new_path}'s are method {nm}: md5 "
                       "blocks of two methods do not compare; rescan the older binary with this "
                       "tree's tools/ptx-scan.sh and extractor")
+    if header != nheader:
+        raise Refused(f"{base_path} and {new_path} have other table columns: {' '.join(header)} "
+                      f"against {' '.join(nheader)}")
+    # A skipped JIT cell is no value: with either side skipped the two JIT columns are dropped from
+    # both sides, whatever the other side holds.
+    skipped = {(True, True): "both", (True, False): "base", (False, True): "new"}.get((bj, nj))
+    if skipped:
+        keep = [i for i, h in enumerate(header[1:]) if h not in JIT_COLUMNS]
+        br = {e: [cells[i] for i in keep] for e, cells in br.items()}
+        nr = {e: [cells[i] for i in keep] for e, cells in nr.items()}
+        header = [header[0]] + [header[1 + i] for i in keep]
     only_b, only_n = sorted(set(br) - set(nr)), sorted(set(nr) - set(br))
     common = sorted(set(br) & set(nr))
     rows_moved = [e for e in common if br[e] != nr[e]]
@@ -385,6 +431,8 @@ def compare_scans(base_path, new_path):
     md5_moved = [e for e in md5_common if b5[e] != n5[e]]
     print(f"ptx-canon: scans method={bm} entries base={len(br)} new={len(nr)} "
           f"only-base={len(only_b)} only-new={len(only_n)}")
+    if skipped:
+        print(f"ptx-canon: jit columns not compared (no-jit: {skipped})")
     for e in only_b:
         print(f"ptx-canon: {e} only in base")
     for e in only_n:
@@ -496,12 +544,17 @@ def self_test():
         msg = refused(lambda: canons(bad + "\n" + self_module()))
         expect(msg is not None and "_7" in msg, f"unparsed declaration {bad!r}: {msg}")
 
-    row = "{e:<28} 256 no 0 0 1 0 12 0 0 16 12 0"
-    def scan(md5_line, rows):
-        lines = ["ptx-scan bin=target/release/x section=.oxart bytes=1 modules=1",
+    row = "{e:<28} 256 no 0 0 1 0 {regs} 0 0 16 {jit}"
+    def scan(md5_line, rows, nojit=False, jit=None, regs="12", banner=""):
+        """A scan fixture. `nojit` is a `--no-jit` scan (the banner field and the two skipped
+        cells); `jit` and `banner` override the two JIT cells and the banner's tail to build a scan
+        whose banner and cells disagree."""
+        jit = jit or (f"{SKIPPED} {SKIPPED}" if nojit else "12 0")
+        banner = banner or (f" jit={SKIPPED}" if nojit else "")
+        lines = [f"ptx-scan bin=target/release/x section=.oxart bytes=1 modules=1{banner}",
                  "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill "
                  "blk/SM(static) jit_regs jit_local"]
-        lines += [row.format(e=e) for e in rows]
+        lines += [row.format(e=e, regs=regs, jit=jit) for e in rows]
         lines += [md5_line] + [f"{e} {h} 9" for e, h in rows.items()]
         return "\n".join(lines) + "\n"
     with tempfile.TemporaryDirectory() as tmp:
@@ -526,6 +579,62 @@ def self_test():
         failed = put("failed", "ptx-scan bin=target/release/x missing scan=failed\n")
         msg = refused(lambda: compare_scans(a, failed))
         expect(msg is not None and "failed scan" in msg, f"a failed scan refused: {msg}")
+        # --no-jit scans: the JIT columns hold a word, not a value, and are never compared
+        m = "ptx-scan-md5: method=decl1"
+        n1 = put("n1", scan(m, {"alpha": h1, "beta": h1}, nojit=True))
+        n2 = put("n2", scan(m, {"alpha": h1, "beta": h1}, nojit=True))
+        n_regs = put("n_regs", scan(m, {"alpha": h1, "beta": h1}, nojit=True, regs="13"))
+        n_md5 = put("n_md5", scan(m, {"alpha": h1, "beta": h2}, nojit=True))
+        n_add = put("n_add", scan(m, {"alpha": h1, "beta": h1, "gamma": h1}, nojit=True))
+        f_jit = put("f_jit", scan(m, {"alpha": h1, "beta": h1}, jit="14 8"))
+        not_compared = "jit columns not compared (no-jit: "
+
+        def compared(x, y):
+            with contextlib.redirect_stdout(io.StringIO()) as o:
+                moved = compare_scans(x, y)
+            return moved, o.getvalue()
+
+        moved, out = compared(n1, n2)
+        expect(not moved and not_compared + "both)" in out and "table rows identical=2 moved=0" in out,
+               f"two equal no-jit scans are identical on the other columns and say the JIT columns were "
+               f"not compared: moved={moved} {out!r}")
+        moved, out = compared(a, n1)
+        expect(not moved and not_compared + "new)" in out,
+               f"a full base against a no-jit new compares as no-jit: moved={moved} {out!r}")
+        moved, out = compared(n1, a)
+        expect(not moved and not_compared + "base)" in out,
+               f"a no-jit base against a full new compares as no-jit: moved={moved} {out!r}")
+        moved, out = compared(f_jit, n1)
+        expect(not moved, f"a full scan whose JIT cells differ from a no-jit scan's is not moved: {out!r}")
+        moved, out = compared(a, f_jit)
+        expect(moved and "row-moved alpha jit_regs:12->14 jit_local:0->8" in out and not_compared not in out,
+               f"two full scans still compare the JIT columns: moved={moved} {out!r}")
+        moved, out = compared(n1, n_regs)
+        expect(moved and "row-moved alpha regs:12->13" in out and "jit_" not in out.split("row-moved", 1)[-1],
+               f"a no-jit pair still compares every other column: moved={moved} {out!r}")
+        moved, out = compared(n1, n_md5)
+        expect(moved and "md5-moved beta" in out, f"a no-jit pair still compares the md5 block: {out!r}")
+        moved, out = compared(n1, n_add)
+        expect(moved and "gamma only in new" in out, f"a no-jit pair still compares the entry set: {out!r}")
+        for what, text, why in (
+            ("a skipped cell in the regs column", scan(m, {"alpha": h1}, nojit=True, regs=SKIPPED),
+             "only jit_regs and jit_local can be skipped"),
+            ("a no-jit banner over numeric JIT cells", scan(m, {"alpha": h1}, banner=f" jit={SKIPPED}"),
+             "holds no JIT value"),
+            ("a full banner over skipped JIT cells", scan(m, {"alpha": h1}, jit=f"{SKIPPED} {SKIPPED}"),
+             "the banner names the JIT"),
+            ("a banner jit= the reader does not know", scan(m, {"alpha": h1}, banner=" jit=maybe"),
+             "does not parse"),
+        ):
+            bad = put("bad", text)
+            msg = refused(lambda: compare_scans(a, bad))
+            expect(msg is not None and why in msg, f"{what} refused by name: {msg}")
+            msg = refused(lambda: compare_scans(bad, a))
+            expect(msg is not None and why in msg, f"{what} refused by name as the base: {msg}")
+        wide = put("wide", scan(m, {"alpha": h1}).replace(" jit_local", " jit_local extra")
+                   .replace("16 12 0", "16 12 0 1"))
+        msg = refused(lambda: compare_scans(a, wide))
+        expect(msg is not None and "other table columns" in msg, f"two tables of other columns refused: {msg}")
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     print(f"ptx-canon self-test: {'FAIL' if fails else 'ok'} ({len(fails)} failures)")

@@ -2,7 +2,7 @@
 # PTX scan — read the device code a gate binary carries, as a table. An instrument, not a gate: it
 # asserts nothing about a kernel. But a scan that could not read the kernels is a failure, not a
 # table — it exits 0 only when every PTX module came out of the container, assembled under ptxas
-# and loaded under the driver's JIT.
+# and loaded under the driver's JIT (with --no-jit: assembled under ptxas, the JIT not run).
 #
 # `cargo oxide` puts the bundle's PTX text into the executable's `.oxart` ELF section verbatim.
 # So a kernel's compiled shape — whether registers spilled to local (`__local_depot`), how many
@@ -36,13 +36,24 @@
 # callee's work outside its row; the banner names such entries (`calls=NAME:N,…`) and stderr says
 # why — the same reading as bloomery_gpu_gates::ptx (`body`, `Counts::calls`).
 #
-# Usage: tools/ptx-scan.sh <binary name> [entry substring]
+# Usage: tools/ptx-scan.sh [--no-jit] <binary name> [entry substring]
 #   Reads target/release/<binary> and runs the extractor on its section. The recipe
-#   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds all three first.
+#   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds all three first;
+#   with `--no-jit` it builds the binary and the extractor only.
 #   PTX_SCAN_PTXAS (default $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas),
 #   PTX_SCAN_ARCH (default sm_86), PTX_SCAN_EXTRACT (default target/release/oxart_ptx) and
 #   PTX_SCAN_JIT (default oxart_jit, a target/release binary run through tools/gpu-gate.sh)
 #   override the tools.
+#   --no-jit (anywhere among the words; the only flag) skips the driver JIT: no card, no gate lock, no
+#   wait on a landing batch's GPU hold. The banner then names `jit=skipped(no-jit)` in place of
+#   jit-card/jit-cc/jit-cuda, and every jit_regs and jit_local cell reads `skipped(no-jit)` — never
+#   blank, never 0. Everything else is as a full scan: the table's other columns come from ptxas and
+#   the byte scan, the md5 block from the extractor, and each of their failures fails the scan. The
+#   scan proves a MOVE (no kernel changed: equal md5 block, equal ptxas columns; identical PTX under one
+#   driver JITs to identical rows). The add and occupancy/geometry classes and the spill ratchet
+#   (tools/ptx-spill-check.sh) read the JIT columns and need the full scan. Every reader of a scan
+#   (tools/ref/ptx-canon.py, tools/recipes.py `affected --narrow`, tools/ptx-spill-check.sh) reads the
+#   banner's `jit=` and the cell, and never takes the marker for a value.
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
 #
@@ -73,14 +84,16 @@
 #   modules=0            the section carries no PTX payload
 #   ptxas=none           no executable ptxas, so the ptxas columns cannot be read
 #   ptxas-failed=modN    ptxas rejected these modules (comma-separated)
-#   jit=failed           the driver did not load every module, or the gate lock was not free
+#   jit=failed           the driver did not load every module, or the gate lock was not free (never under
+#                        --no-jit, which runs no JIT)
 #   ptxas-unread=NAME    ptxas assembled every module but reported nothing for these entries
-#   jit-unread=NAME      the driver loaded every module but reported nothing for these entries
+#   jit-unread=NAME      the driver loaded every module but reported nothing for these entries (not read
+#                        under --no-jit)
 #   bytescan=failed      the byte scan itself failed
 #   rows=0               no entry, or none the entry substring matches
 #   digest-unread=NAME   the extractor wrote no normalized body for these entries (`method`: it named
 #                        no digest method)
-# 2: a usage error.
+# 2: a usage error (no binary, more than one entry substring, a flag other than --no-jit).
 #
 # The next four columns come from `ptxas -v` on the same PTX, not from the byte scan:
 #   regs   registers per thread ("Used N registers")
@@ -104,10 +117,24 @@
 #   jit_local  CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES — per-thread local memory (spill and local arrays)
 # The banner names the card, its compute capability and the driver's CUDA version they came from
 # (jit-card, jit-cc, jit-cuda). The load needs a card, so it runs under the gate lock: a scan waits
-# while another GPU gate holds it.
+# while another GPU gate holds it. Under --no-jit both columns read `skipped(no-jit)` and the banner's
+# three fields are the one field `jit=skipped(no-jit)`.
 set -uo pipefail
-NAME=${1:-}
-FILTER=${2:-}
+NOJIT=0
+WORDS=()
+for W in "$@"; do
+  case $W in
+    --no-jit) NOJIT=1 ;;
+    -*)
+      echo "ptx-scan.sh: '$W': the scan's one flag is --no-jit" >&2
+      echo "usage: ptx-scan.sh [--no-jit] <gate_bin_name> [entry-substring]" >&2
+      exit 2
+      ;;
+    *) WORDS+=("$W") ;;
+  esac
+done
+NAME=${WORDS[0]:-}
+FILTER=${WORDS[1]:-}
 # The toolkit the build uses (the box env's CUDA_TOOLKIT_PATH): toolkits differ here by a register
 # on some entries, so the scan reads the one the bindings were generated from.
 PTXAS=${PTX_SCAN_PTXAS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/ptxas}
@@ -115,12 +142,12 @@ ARCH=${PTX_SCAN_ARCH:-sm_86}
 EXTRACT=${PTX_SCAN_EXTRACT:-target/release/oxart_ptx}
 JIT=${PTX_SCAN_JIT:-oxart_jit}
 if [ -z "$NAME" ]; then
-  echo "usage: ptx-scan.sh <gate_bin_name> [entry-substring]" >&2
+  echo "usage: ptx-scan.sh [--no-jit] <gate_bin_name> [entry-substring]" >&2
   exit 2
 fi
-if [ $# -gt 2 ]; then
-  echo "ptx-scan.sh: '${*:3}' after the entry substring '$FILTER': the scan takes one binary and at most one entry substring" >&2
-  echo "usage: ptx-scan.sh <gate_bin_name> [entry-substring]" >&2
+if [ "${#WORDS[@]}" -gt 2 ]; then
+  echo "ptx-scan.sh: '${WORDS[*]:2}' after the entry substring '$FILTER': the scan takes one binary and at most one entry substring" >&2
+  echo "usage: ptx-scan.sh [--no-jit] <gate_bin_name> [entry-substring]" >&2
   exit 2
 fi
 BIN=target/release/$NAME
@@ -208,33 +235,41 @@ done
 # columns follow the card's compute capability and the driver, not its name — both cards are GA102
 # (sm_86) under one driver, so the table does not depend on which one JITs it — and the scan does not
 # queue behind the 3090's gate lock. A scan pair (tools/recipes.py) compares the capability
-# (jit-cc) and the driver (jit-cuda), never the card name.
+# (jit-cc) and the driver (jit-cuda), never the card name. Under --no-jit none of this runs: no card,
+# no gate lock, and the one banner field `jit=skipped(no-jit)` stands for the three.
 JITTBL=$MODS/jit
-# The runner's own `gpu-gate.sh: waited …` lines go back to stderr, so a landing batch books the lock wait.
-jit_rc=0
-BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err" || jit_rc=$?
-grep '^gpu-gate\.sh: waited ' "$MODS/jit.err" >&2 || true
-if [ "$jit_rc" != 0 ]; then
-  echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
-  fail "$SEC $TOOLS modules=$NMOD jit=failed"
-fi
-JITS=$(sed -n 's/^# card=\([^ ]*\) cc=\([^ ]*\) cuda_driver=\([^ ]*\)$/jit-card=\1 jit-cc=\2 jit-cuda=\3/p' "$JITTBL")
-if [ -z "$JITS" ]; then
-  echo "ptx-scan: $JIT printed no '# card=… cc=… cuda_driver=…' line (an older oxart_jit names no cc)" >&2
-  fail "$SEC $TOOLS modules=$NMOD jit=failed"
+if [ "$NOJIT" = 1 ]; then
+  echo "ptx-scan: --no-jit: the driver JIT is not run; jit_regs and jit_local read skipped(no-jit)" >&2
+  JITS="jit=skipped(no-jit)"
+else
+  # The runner's own `gpu-gate.sh: waited …` lines go back to stderr, so a landing batch books the lock wait.
+  jit_rc=0
+  BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err" || jit_rc=$?
+  grep '^gpu-gate\.sh: waited ' "$MODS/jit.err" >&2 || true
+  if [ "$jit_rc" != 0 ]; then
+    echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
+    fail "$SEC $TOOLS modules=$NMOD jit=failed"
+  fi
+  JITS=$(sed -n 's/^# card=\([^ ]*\) cc=\([^ ]*\) cuda_driver=\([^ ]*\)$/jit-card=\1 jit-cc=\2 jit-cuda=\3/p' "$JITTBL")
+  if [ -z "$JITS" ]; then
+    echo "ptx-scan: $JIT printed no '# card=… cc=… cuda_driver=…' line (an older oxart_jit names no cc)" >&2
+    fail "$SEC $TOOLS modules=$NMOD jit=failed"
+  fi
 fi
 ROWS=$MODS/rows
 UNREAD=$MODS/unread
 JITUNREAD=$MODS/jitunread
 CALLS=$MODS/calls
 if ! LC_ALL=C awk -v filter="$FILTER" -v tbl="$TBL" -v unread="$UNREAD" -v jit="$JITTBL" \
-  -v jitunread="$JITUNREAD" -v callsf="$CALLS" '
+  -v jitunread="$JITUNREAD" -v callsf="$CALLS" -v nojit="$NOJIT" '
 BEGIN {
+  # A skipped cell is a word, not a number: the JIT columns widen to hold it.
+  fmt = "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s " (nojit ? "%15s %15s" : "%8s %9s") "\n"
   while ((getline line < tbl) > 0) {
     split(line, f, "\t"); R[f[1]] = f[2]; S[f[1]] = f[3]; P[f[1]] = f[4]
   }
   close(tbl)
-  while ((getline line < jit) > 0) {
+  while (!nojit && (getline line < jit) > 0) {
     if (substr(line, 1, 1) == "#") continue
     split(line, f, "\t"); JR[f[1]] = f[2]; JL[f[1]] = f[3]
   }
@@ -262,13 +297,13 @@ function flush(   have, hj) {
   have = (name in R)
   hj = (name in JR)
   if (!have) print name > unread
-  if (!hj) print name > jitunread
+  if (!nojit && !hj) print name > jitunread
   if (filter == "" || index(name, filter) > 0) {
-    printf "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s %8s %9s\n", (depot ? 0 : 1), name,
+    printf fmt, (depot ? 0 : 1), name,
            (ntid == "" ? "-" : ntid), (depot ? "YES" : "no"), ldl, stl, fma, cvt,
            (have ? R[name] : "-"), (have ? S[name] : "-"), (have ? P[name] : "-"),
            (have ? blocks(ntid, R[name], S[name]) : "-"),
-           (hj ? JR[name] : "-"), (hj ? JL[name] : "-")
+           (nojit ? "skipped(no-jit)" : (hj ? JR[name] : "-")), (nojit ? "skipped(no-jit)" : (hj ? JL[name] : "-"))
     if (calls > 0) printf "%s:%d\n", name, calls > callsf
   }
   name = ""
@@ -347,7 +382,9 @@ if [ -s "$CALLS" ]; then
   echo "ptx-scan: entries that call a device function — their rows count their own body, not the callee's: $CALLERS" >&2
 fi
 echo "ptx-scan bin=$BIN $SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} $JITS${CALLERS:+ calls=$CALLERS}"
-printf '%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s %8s %9s\n' \
+JFMT='%8s %9s'
+[ "$NOJIT" = 1 ] && JFMT='%15s %15s'
+printf "%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s $JFMT\n" \
   entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)' jit_regs jit_local
 cat "$ROWS"
 echo "ptx-scan-md5: method=$METHOD"

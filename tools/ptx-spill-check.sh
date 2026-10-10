@@ -9,6 +9,11 @@
 # ds41_attn_seg_sel was found by eye). A new entry is a failure until it is pinned, so a new kernel
 # cannot arrive spilling unseen.
 #
+# A scan that skipped the driver JIT (`ptx-scan.sh --no-jit`: banner `jit=skipped(no-jit)`, the
+# jit_local cells `skipped(no-jit)`) holds no jit_local reading, and this ratchet pins that column: it is
+# refused by name, never read as a value. The script runs the scan itself without the flag, so this
+# guards a caller that hands it another scan.
+#
 # Usage: tools/ptx-spill-check.sh <table> <binary name>...
 #        tools/ptx-spill-check.sh --self-test   (a stub ptx-scan.sh on fixed scans, no build; check-recipes runs it)
 #   Runs `tools/ptx-scan.sh <binary>` for each binary (the recipe builds them first) and compares
@@ -22,6 +27,7 @@
 #   <bin> <entry> spill=<got> pinned=<want> ABOVE|BELOW   (either column; BELOW = lower the pin)
 #   <bin> <entry> unpinned spill=<got> jit_local=<got>     (in the scan, not in the table)
 #   <bin> <entry> stale                                    (in the table, not in the scan)
+#   ptx-spill bin=<bin> scan is no-jit (jit_local not read) FAIL   (a scan that skipped the JIT)
 # Exit status: 0 when every binary's scan read and matched its pins; 1 on a violation or a scan
 # that failed (ptx-scan's own nonzero exit, or a table it printed without rows); 2 on a usage error.
 set -uo pipefail
@@ -41,11 +47,22 @@ self_test() {
       for r in "$@"; do set -- $r; echo "$1 32 $2 $3"; done
       echo "ptx-scan-md5: method=m"; echo "k 0123 1"; } > "$t/$b.scan"
   }
+  marked() { # marked <bin> <banner tail> <jit_local cell> <entry spill>...: a scan whose banner tail and jit_local cell are given
+    local b=$1 banner=$2 cell=$3 r
+    shift 3
+    { echo "ptx-scan bin=target/release/$b modules=1$banner"; echo "entry regs spill jit_local"
+      for r in "$@"; do set -- $r; echo "$1 32 $2 $cell"; done
+      echo "ptx-scan-md5: method=m"; echo "k 0123 1"; } > "$t/$b.scan"
+  }
   scan a "k1 0 0" "k2 8 0"
   scan b "k3 0 0"
   scan c "k4 0 0"
   scan d "k1 16 0"
-  printf '%s\n' '# fixture' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' 'd k1 0 0' 'd k9 0 0' > "$t/table"
+  marked f " jit=skipped(no-jit)" "skipped(no-jit)" "k1 0"
+  marked g " jit=skipped(no-jit)" 0 "k1 0"
+  marked h "" "skipped(no-jit)" "k1 0"
+  printf '%s\n' '# fixture' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' 'd k1 0 0' 'd k9 0 0' \
+    'f k1 0 0' 'g k1 0 0' 'h k1 0 0' > "$t/table"
   check() { # check <name> <want rc> <want line or -> <args...>
     local name=$1 want=$2 line=$3
     shift 3
@@ -62,6 +79,9 @@ self_test() {
   check "a spill above its pin" 1 "d k1 spill=16 pinned=0 ABOVE" "$t/table" d
   check "a pinned row the scan lacks" 1 "d k9 stale" "$t/table" d
   check "a failed scan" 1 "ptx-spill bin=e scan rc=1 FAIL" "$t/table" e
+  check "a scan that skipped the JIT (banner and cells)" 1 "ptx-spill bin=f scan is no-jit (jit_local not read) FAIL" "$t/table" f
+  check "a no-jit banner over a numeric jit_local" 1 "ptx-spill bin=g scan is no-jit (jit_local not read) FAIL" "$t/table" g
+  check "a skipped jit_local under a banner that ran the JIT" 1 "ptx-spill bin=h scan is no-jit (jit_local not read) FAIL" "$t/table" h
   check "no binary" 2 - "$t/table"
   rm -rf "$t"
   [ "$fails" = 0 ] && echo "ptx-spill-check: self-test ok" || { echo "ptx-spill-check: self-test $fails failed" >&2; return 1; }
@@ -91,6 +111,12 @@ for BIN in "$@"; do
   if [ "$src" -ne 0 ]; then
     echo "ptx-spill bin=$BIN scan rc=$src FAIL"
     sed 's/^/  ptx-scan stderr: /' "$TMP/$BIN.err" | head -5
+    rc=1
+    continue
+  fi
+  # A skipped JIT is no reading, and `skipped(no-jit)` in awk's arithmetic is 0: refused before any compare.
+  if grep -qF 'skipped(no-jit)' "$TMP/$BIN.scan"; then
+    echo "ptx-spill bin=$BIN scan is no-jit (jit_local not read) FAIL"
     rc=1
     continue
   fi
