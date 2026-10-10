@@ -185,9 +185,9 @@ bg_lock() {
   mkfifo "$tmp/rdy" "$tmp/rel"
   exec 7<> "$tmp/rdy" 8<> "$tmp/rel"
   if [ "$mode" = -s ]; then
-    flock -s "$lock" bash -c 'echo up > "$1"; read -r _ < "$2"' _ "$tmp/rdy" "$tmp/rel" &
+    flock -s "$lock" bash -c 'echo up > "$1"; read -t 120 -r _ < "$2"' _ "$tmp/rdy" "$tmp/rel" &
   else
-    flock "$lock" bash -c 'echo up > "$1"; read -r _ < "$2"' _ "$tmp/rdy" "$tmp/rel" &
+    flock "$lock" bash -c 'echo up > "$1"; read -t 120 -r _ < "$2"' _ "$tmp/rdy" "$tmp/rel" &
   fi
   BG=$!
   read -t 60 -r _ <&7 && return 0
@@ -196,9 +196,10 @@ bg_lock() {
   return 1
 }
 # bg_end: release what bg_lock holds and wait for it to end.
+# The holder's 120 s bound turns a lost release into a red, never a hang.
 bg_end() {
   echo go >&8
-  wait "$BG"
+  wait "$BG" || fail 'bg_lock: the holder' "ended rc $? (no release within its 120 s bound)"
   exec 7>&- 8>&-
 }
 
@@ -567,15 +568,30 @@ B=$tmp/boxtree
 mkdir -p "$B/tools" "$tmp/stub"
 cp "$ROOT/tools/box.sh" "$B/tools/"
 cp "$ROOT/Cargo.toml" "$B/"
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$tmp/ssh.log" > "$tmp/stub/ssh"
-printf '#!/bin/sh\nexit 0\n' > "$tmp/stub/rsync"
+# The ssh stub answers the queue's one probe (flock -n -x on the dir lock) with $STUB_PROBE_RC, 0 where unset; the rsync stub
+# records its arguments and the .sync-id it was handed, and ends with $STUB_RSYNC_RC, 0 where unset.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\ncase "$*" in *"flock -n -x"*) exit ${STUB_PROBE_RC:-0} ;; esac\n' "$tmp/ssh.log" > "$tmp/stub/ssh"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nfor a; do case $a in */.sync-id) cp "$a" "%s"; echo "$a" > "%s" ;; esac; done\nexit ${STUB_RSYNC_RC:-0}\n' \
+  "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" > "$tmp/stub/rsync"
+# The queue client stub: the words before the job's text, one a line, and the text itself (the last word) byte for byte.
+cat > "$B/tools/boxq.py" << 'PYSTUB'
+import os, sys
+with open(os.environ["STUB_BOXQ_ARGS"], "w") as f:
+    f.write("\n".join(sys.argv[1:-1]) + "\n")
+with open(os.environ["STUB_BOXQ_JOB"], "w") as f:
+    f.write(sys.argv[-1])
+sys.exit(int(os.environ.get("STUB_BOXQ_RC", "0")))
+PYSTUB
 chmod +x "$tmp/stub/ssh" "$tmp/stub/rsync"
 # The caller's own box.sh variables are dropped (a batch run with BLOOMERY_HOLD_OWNER set runs these
 # tests too); a test that wants one sets it after `box`.
 box() {
   : > "$tmp/ssh.log"
+  rm -f "$tmp/rsync.log" "$tmp/rsync.sync-id" "$tmp/rsync.sync-path" "$tmp/boxq.args" "$tmp/boxq.job"
   env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_READONLY -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD \
     -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL -u BLOOMERY_DATA \
+    -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S -u STUB_RSYNC_RC -u STUB_PROBE_RC -u STUB_BOXQ_RC \
+    STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
     PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
 }
 sshlog() {
@@ -612,6 +628,194 @@ rc_is 'box.sh: a command with the default card runs' 0 box "$B/tools/box.sh" tru
 sshlog 'box.sh: the default card reaches the box as BLOOMERY_BOX_CARD=3090' ' BLOOMERY_BOX_CARD=3090 && .*true$'
 rc_is 'box.sh: a command with BLOOMERY_CARD=both runs' 0 box env BLOOMERY_CARD=both "$B/tools/box.sh" true
 sshlog 'box.sh: BLOOMERY_CARD=both reaches the box as BLOOMERY_BOX_CARD=both' ' BLOOMERY_BOX_CARD=both && .*true$'
+
+# The box queue (BLOOMERY_BOX_QUEUE=1): the call syncs behind the remote directory's lock and submits the command as a job
+# of tools/boxq.py (the stub above: it records its words and the job's text, and ends with $STUB_BOXQ_RC). Where the stub
+# tree cannot show a behaviour (the job's own text on the box), the recorded text itself runs here, under stub tools.
+Q=$tmp/queue
+mkdir -p "$Q"
+inlog() {
+  if grep -Eq -- "$3" "$2"; then pass "$1"; else fail "$1" "no line of ${2##*/} matches /$3/" "$2"; fi
+}
+notinlog() {
+  if grep -Eq -- "$3" "$2"; then fail "$1" "a line of ${2##*/} matches /$3/" "$2"; else pass "$1"; fi
+}
+nofile() {
+  if [ -e "$2" ]; then fail "$1" "${2##*/} exists" "$2"; else pass "$1"; fi
+}
+# The unset path: no queue words anywhere, and BLOOMERY_BOX_QUEUE=0 is the same bytes.
+rc_is 'box.sh: a direct call' 0 box "$B/tools/box.sh" 'cargo check'
+cp "$tmp/ssh.log" "$Q/direct.ssh"; cp "$tmp/rsync.log" "$Q/direct.rsync"
+nofile 'box.sh: a direct call runs no queue client' "$tmp/boxq.args"
+notinlog 'box.sh: a direct call has no dir lock in its rsync' "$tmp/rsync.log" 'rsync-path|\.sync-id|bloomery-queue'
+rc_is 'box.sh: BLOOMERY_BOX_QUEUE=0 is the direct call' 0 box env BLOOMERY_BOX_QUEUE=0 "$B/tools/box.sh" 'cargo check'
+if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.log"; then pass 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
+run 'box.sh: BLOOMERY_BOX_QUEUE takes 1 or 0' 64 'BLOOMERY_BOX_QUEUE is 1' box env BLOOMERY_BOX_QUEUE=yes "$B/tools/box.sh" ls
+nofile 'box.sh: a queue refusal syncs nothing' "$tmp/rsync.log"
+
+# A queued call: the lock behind rsync, the id along, the words of the job, no guard, the queue line before the submit.
+run 'box.sh: a queued call submits one job' 0 'box.sh: queue round card=3090 predicted 90 s remote=~/repo/x$' \
+  box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_PRED_S=90 "$B/tools/box.sh" 'echo hi'
+inlog 'box.sh: the sync runs behind the remote directory'"'"'s lock' "$tmp/rsync.log" \
+  ' --rsync-path=mkdir -p /root/bloomery-queue && flock -n -x /root/bloomery-queue/dir-x\.lock rsync '
+inlog 'box.sh: the id goes with the tree as .sync-id, after the tree' "$tmp/rsync.log" ' '"$B"'/ [^ ]*/\.sync-id stub:~/repo/x/$'
+id=$(cat "$tmp/rsync.sync-id" 2> /dev/null)
+case $id in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) pass 'box.sh: the id is 16 hex digits' ;;
+  *) fail 'box.sh: the id is 16 hex digits' "got '$id'" ;;
+esac
+if [ -e "$(cat "$tmp/rsync.sync-path" 2> /dev/null || echo "$tmp/none")" ]; then fail 'box.sh: the id'"'"'s temp dir is gone after the call' 'it is still there' "$tmp/rsync.sync-path"; else pass 'box.sh: the id'"'"'s temp dir is gone after the call'; fi
+inlog 'box.sh: the sync id is not a file of the Mac tree' "$tmp/rsync.sync-path" '^/.*/box-sync\.[^/]*/\.sync-id$'
+nofile 'box.sh: the Mac tree has no .sync-id' "$B/.sync-id"
+if [ "$(tr '\n' ' ' < "$tmp/boxq.args")" = "run --card 3090 --class round --name x-echo-${id:0:6} --expected-s 90 -- " ]; then pass 'box.sh: the job words are run --card 3090 --class round --name x-echo-<id6> --expected-s 90 --'; else fail 'box.sh: the job words are run --card 3090 --class round --name x-echo-<id6> --expected-s 90 --' 'differ' "$tmp/boxq.args"; fi
+inlog 'box.sh: the job holds the dir lock shared, 85 when it cannot' "$tmp/boxq.job" "^flock -s -n -E 8[5] /root/bloomery-queue/dir-x\.lock bash -c '"
+if grep -Fq "[ \"\$(cat ~/repo/x/.sync-id 2>/dev/null)\" = $id ] ||" "$tmp/boxq.job"; then pass 'box.sh: the job checks the tree'"'"'s .sync-id against this call'"'"'s id first'; else fail 'box.sh: the job checks the tree'"'"'s .sync-id against this call'"'"'s id first' 'no such check' "$tmp/boxq.job"; fi
+inlog 'box.sh: the job exits 80 on a stale tree' "$tmp/boxq.job" 'exit[ ]80; \}'
+inlog 'box.sh: the job is the command as it runs directly' "$tmp/boxq.job" "^\} && cd ~/repo/x && .*echo hi'\$"
+notinlog 'box.sh: the job has no guard' "$tmp/boxq.job" 'lease_guard|lease-probe'
+notinlog 'box.sh: the ssh of a queued call has no guard and no command' "$tmp/ssh.log" 'lease_guard|source ~/bloomery-env'
+inlog 'box.sh: the remote directory is made before the sync' "$tmp/ssh.log" '^-n stub mkdir -p ~/repo/x$'
+# The exit code is the queue client's: its own codes and a job's pass through.
+for code in 3 80 81 83 84 85 130 143; do
+  rc_is "box.sh: a queued call exits with the client's $code" "$code" box env BLOOMERY_BOX_QUEUE=1 STUB_BOXQ_RC=$code "$B/tools/box.sh" true
+done
+# Predicted wall: unset is named and the job goes without one.
+run 'box.sh: no prediction prints predicted unknown' 0 'box.sh: queue round card=3090 predicted unknown remote=~/repo/x$' \
+  box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" true
+if grep -q -- '--expected-s' "$tmp/boxq.args"; then fail 'box.sh: no prediction submits without --expected-s' 'it was passed' "$tmp/boxq.args"; else pass 'box.sh: no prediction submits without --expected-s'; fi
+for bad in 0 abc 1.5 -3 090; do
+  run "box.sh: BLOOMERY_Q_PRED_S=$bad is refused" 64 'BLOOMERY_Q_PRED_S is whole seconds >= 1' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_PRED_S=$bad "$B/tools/box.sh" true
+  nofile "box.sh: the refused prediction $bad synced nothing" "$tmp/rsync.log"
+done
+# Class and name.
+run 'box.sh: BLOOMERY_Q_CLASS reaches the job and the queue line' 0 'box.sh: queue lead card=3090 ' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CLASS=lead "$B/tools/box.sh" true
+inlog 'box.sh: --class lead' "$tmp/boxq.args" '^lead$'
+run 'box.sh: BLOOMERY_Q_CLASS is a class' 64 'BLOOMERY_Q_CLASS is lead, round, sitting or fill, got .media.' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CLASS=media "$B/tools/box.sh" true
+rc_is 'box.sh: a command whose first word is a path' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" './target/release/gate_x --a b'
+inlog 'box.sh: the name takes the last part of the first word' "$tmp/boxq.args" '^x-gate_x-[0-9a-f]{6}$'
+rc_is 'box.sh: a command whose first word is an assignment' 0 box env BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" 'FOO=1 true'
+inlog 'box.sh: the name holds only [A-Za-z0-9._-]' "$tmp/boxq.args" '^x-FOO_1-[0-9a-f]{6}$'
+# A held dir lock: rsync fails (12), and the lock decides 83; a failure with the lock free or untestable is rsync's own.
+run 'box.sh: a failed sync with the dir lock held ends 83, named' 83 'a job of this remote directory is running .*bloomery-queue/dir-x\.lock is held on stub.; its tree cannot be replaced under it' \
+  box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=1 "$B/tools/box.sh" true
+nofile 'box.sh: the 83 submitted no job' "$tmp/boxq.args"
+inlog 'box.sh: the 83 probed the dir lock once' "$tmp/ssh.log" '^-n stub mkdir -p /root/bloomery-queue && flock -n -x /root/bloomery-queue/dir-x\.lock true$'
+if [ -e "$(cat "$tmp/rsync.sync-path" 2> /dev/null || echo "$tmp/none")" ]; then fail 'box.sh: the 83 left the id'"'"'s temp dir' 'it is still there'; else pass 'box.sh: the 83 left no temp dir'; fi
+rc_is 'box.sh: a failed sync with the dir lock free is rsync'"'"'s own code' 12 box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=0 "$B/tools/box.sh" true
+rc_is 'box.sh: a failed sync whose probe cannot reach the box is rsync'"'"'s own code' 12 box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=255 "$B/tools/box.sh" true
+rc_is 'box.sh: a direct call whose rsync fails keeps rsync'"'"'s code' 12 box env STUB_RSYNC_RC=12 STUB_PROBE_RC=1 "$B/tools/box.sh" true
+notinlog 'box.sh: a direct call probes no lock' "$tmp/ssh.log" 'flock'
+# The lane: BLOOMERY_CARD, or BLOOMERY_Q_CARD (any and none too); two that differ are refused, before any sync.
+for lane in a6000 both; do
+  rc_is "box.sh: BLOOMERY_CARD=$lane is the queue lane" 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=$lane "$B/tools/box.sh" true
+  if [ "$(tr '\n' ' ' < "$tmp/boxq.args" | cut -d' ' -f1-3)" = "run --card $lane" ]; then pass "box.sh: --card $lane"; else fail "box.sh: --card $lane" 'differ' "$tmp/boxq.args"; fi
+done
+rc_is 'box.sh: BLOOMERY_Q_CARD=a6000 alone is the lane' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=a6000 "$B/tools/box.sh" true
+inlog 'box.sh: the lane from BLOOMERY_Q_CARD' "$tmp/boxq.args" '^a6000$'
+rc_is 'box.sh: BLOOMERY_CARD and BLOOMERY_Q_CARD that agree are one lane' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=a6000 BLOOMERY_Q_CARD=a6000 "$B/tools/box.sh" true
+run 'box.sh: BLOOMERY_CARD and BLOOMERY_Q_CARD that differ are refused' 64 "BLOOMERY_CARD is 'a6000' and BLOOMERY_Q_CARD is 'both': name one lane" \
+  box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=a6000 BLOOMERY_Q_CARD=both "$B/tools/box.sh" true
+nofile 'box.sh: the differing lanes synced nothing' "$tmp/rsync.log"
+run 'box.sh: BLOOMERY_CARD=any is not a lane (only BLOOMERY_Q_CARD takes it)' 64 'BLOOMERY_CARD must be 3090, a6000 or both' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_CARD=any "$B/tools/box.sh" true
+run 'box.sh: BLOOMERY_Q_CARD is a lane' 64 'BLOOMERY_Q_CARD must be 3090, a6000, both, any or none, got .moon.' box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=moon "$B/tools/box.sh" true
+# `any`: the card is the daemon's choice, read when the job starts; `none`: no card pin beyond the default.
+rc_is 'box.sh: BLOOMERY_Q_CARD=any' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=any "$B/tools/box.sh" true
+inlog 'box.sh: --card any' "$tmp/boxq.args" '^any$'
+inlog 'box.sh: any picks the card from $SIGNALBOX_CARD when the job starts' "$tmp/boxq.job" '\{ case "\$\{SIGNALBOX_CARD:-\}" in$'
+inlog 'box.sh: any exports the daemon'"'"'s card as BLOOMERY_BOX_CARD' "$tmp/boxq.job" 'BLOOMERY_BOX_CARD="\$SIGNALBOX_CARD" && '
+notinlog 'box.sh: any fixes no card on the Mac' "$tmp/boxq.job" 'BLOOMERY_BOX_CARD=(3090|a6000|any) '
+cp "$tmp/boxq.job" "$Q/any.job"
+rc_is 'box.sh: BLOOMERY_Q_CARD=none' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_Q_CARD=none "$B/tools/box.sh" true
+inlog 'box.sh: --card none' "$tmp/boxq.args" '^none$'
+inlog 'box.sh: none keeps the default card pin and BLOOMERY_BOX_CARD=3090' "$tmp/boxq.job" 'BLOOMERY_BOX_CARD=3090 && '
+notinlog 'box.sh: none picks no card' "$tmp/boxq.job" 'CUDA_VISIBLE_DEVICES|SIGNALBOX_CARD'
+# A read never goes through the queue, whatever the queue's own variables say.
+rc_is 'box.sh: a read under BLOOMERY_BOX_QUEUE=1 runs' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_BOX_READONLY=1 BLOOMERY_Q_CARD=any "$B/tools/box.sh" 'ps -e | wc -l'
+nofile 'box.sh: a read under the queue submits no job' "$tmp/boxq.args"
+nofile 'box.sh: a read under the queue syncs nothing' "$tmp/rsync.log"
+inlog 'box.sh: a read under the queue is the direct read' "$tmp/ssh.log" '^stub source ~/bloomery-env\.sh && \{ :$'
+notinlog 'box.sh: a read under the queue has no dir lock' "$tmp/ssh.log" 'bloomery-queue|flock'
+run 'box.sh: a read under the queue still refuses a build' 64 "names 'cargo'" box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'cargo --version'
+
+# The job's own text, run as the daemon runs it (`bash -c <text>`) in a sandbox: its HOME holds the env file and the remote
+# directory, nvidia-smi and systemctl are stubs, and the dir lock is a file of this directory.
+QH=$Q/home
+mkdir -p "$QH/repo/x/tools/ref/models" "$Q/bin" "$Q/locks"
+printf 'export CUDA_VISIBLE_DEVICES=GPU-default\n' > "$QH/bloomery-env.sh"
+printf 'BLOOMERY_MODEL=prof\nMODEL=/m/a.gguf\nBLOOMERY_DATA=/d\nFIXTURE_FILE=\n' > "$QH/repo/x/tools/ref/ref-paths.sh"
+printf 'V41_MODEL=/m/v.gguf\n' > "$QH/repo/x/tools/ref/models/deepseek41.sh"
+printf '#!/bin/sh\ncase "$*" in *--query-gpu=uuid,name*) printf "GPU-A, NVIDIA RTX A6000\\nGPU-30, NVIDIA GeForce RTX 3090\\n" ;; esac\n' > "$Q/bin/nvidia-smi"
+printf '#!/bin/sh\necho inactive\n' > "$Q/bin/systemctl"
+chmod +x "$Q/bin/nvidia-smi" "$Q/bin/systemctl"
+# qjob <env NAME=value…> -- <command>: box.sh's job text for the command, with the lock under $Q/locks, into $Q/job.sh.
+qjob() {
+  local envs=() w
+  while [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  box env BLOOMERY_BOX_QUEUE=1 ${envs[@]+"${envs[@]}"} "$B/tools/box.sh" "$@" > /dev/null 2>&1
+  sed "s#/root/bloomery-queue#$Q/locks#g" "$tmp/boxq.job" > "$Q/job.sh"
+  QID=$(cat "$tmp/rsync.sync-id")
+}
+# qrun <name> <rc> <pattern> <NAME=value…>: the job text in the sandbox with those variables; the tree's .sync-id is $QID.
+qrun() {
+  local name=$1 want=$2 pat=$3
+  shift 3
+  printf '%s\n' "$QID" > "$QH/repo/x/.sync-id"
+  run "$name" "$want" "$pat" env -u SIGNALBOX_CARD HOME="$QH" PATH="$Q/bin:$PATH" "$@" bash -c "$(cat "$Q/job.sh")"
+}
+# qrc <name> <rc> <NAME=value…>: the same, the code only (a job that prints nothing).
+qrc() {
+  local name=$1 want=$2
+  shift 2
+  printf '%s\n' "$QID" > "$QH/repo/x/.sync-id"
+  rc_is "$name" "$want" env -u SIGNALBOX_CARD HOME="$QH" PATH="$Q/bin:$PATH" "$@" bash -c "$(cat "$Q/job.sh")"
+}
+SHOW='echo "dev=$CUDA_VISIBLE_DEVICES card=$BLOOMERY_BOX_CARD sbc=${SIGNALBOX_CARD-}"; exit 3'
+qjob -- "$SHOW"
+qrun 'box.sh job: the command runs and its code is the job'"'"'s' 3 '^dev=GPU-default card=3090 sbc=$'
+qjob BLOOMERY_CARD=a6000 -- "$SHOW"
+qrun 'box.sh job: lane a6000 pins the A6000' 3 '^dev=GPU-A card=a6000 sbc=$'
+qjob BLOOMERY_CARD=both -- "$SHOW"
+qrun 'box.sh job: lane both pins the 3090 then the A6000' 3 '^dev=GPU-30,GPU-A card=both sbc=$'
+qjob BLOOMERY_Q_CARD=any -- "$SHOW"
+qrun 'box.sh job: any on the daemon'"'"'s a6000 pins the A6000' 3 '^dev=GPU-A card=a6000 sbc=a6000$' SIGNALBOX_CARD=a6000
+qrun 'box.sh job: any on the daemon'"'"'s 3090 keeps the default pin' 3 '^dev=GPU-default card=3090 sbc=3090$' SIGNALBOX_CARD=3090
+qrun 'box.sh job: any with no SIGNALBOX_CARD is a named 70, the command not run' 70 'a job of lane any starts with SIGNALBOX_CARD 3090 or a6000 \(the daemon sets it\), got ..$'
+qrun 'box.sh job: any on a lane that is neither card is a named 70' 70 'got .both.$' SIGNALBOX_CARD=both
+qjob BLOOMERY_Q_CARD=none -- "$SHOW"
+qrun 'box.sh job: none keeps the default pin' 3 '^dev=GPU-default card=3090 sbc=none$' SIGNALBOX_CARD=none
+# The stale-tree check: another sync (a different id, or none) between the submit and the start ends 80 before the command.
+qjob -- "touch $Q/ran; echo ran"
+rm -f "$Q/ran"
+printf 'other\n' > "$QH/repo/x/.sync-id"
+run 'box.sh job: a tree synced again since the submit ends 80, named' 80 'box.sh: ~/repo/x was synced again after this job was queued \(stale tree\)' \
+  env HOME="$QH" PATH="$Q/bin:$PATH" bash -c "$(cat "$Q/job.sh")"
+nofile 'box.sh job: the stale tree ran nothing' "$Q/ran"
+rm -f "$QH/repo/x/.sync-id"
+run 'box.sh job: a tree with no .sync-id ends 80' 80 'stale tree' env HOME="$QH" PATH="$Q/bin:$PATH" bash -c "$(cat "$Q/job.sh")"
+nofile 'box.sh job: the tree with no .sync-id ran nothing' "$Q/ran"
+qrun 'box.sh job: the same id runs the command' 0 '^ran$'
+if [ -e "$Q/ran" ]; then pass 'box.sh job: the command ran'; else fail 'box.sh job: the command ran' 'no marker'; fi
+# The dir lock: held exclusive (a sync in flight) the job ends 85, named by the code only, and runs nothing; held shared (another job of the
+# directory) it runs beside it. Its own lock stays held for the job's life, children included.
+rm -f "$Q/ran"
+if bg_lock -x "$Q/locks/dir-x.lock"; then
+  qrc 'box.sh job: the dir lock held exclusive ends 85' 85
+  nofile 'box.sh job: the 85 ran nothing' "$Q/ran"
+  bg_end
+else
+  fail 'box.sh job: the dir lock held exclusive' 'the background lock was not taken'
+fi
+if bg_lock -s "$Q/locks/dir-x.lock"; then
+  qrun 'box.sh job: the dir lock held shared by another job lets this one run' 0 '^ran$'
+  bg_end
+else
+  fail 'box.sh job: the dir lock held shared' 'the background lock was not taken'
+fi
+# A command with quotes, dollars, newlines and a semicolon crosses the job's quoting whole.
+qjob -- 'printf "%s|" "it'"'"'s" '"'"'$HOME `x`'"'"'; printf "a\nb\n"; echo "$((1+2))"'
+qrun 'box.sh job: quotes, dollars and newlines in the command cross whole' 0 "^it's[|]\\\$HOME \`x\`[|]a$"
+inlog 'box.sh job: the quoted command ends the output the same way' "$tmp/out" '^3$'
 
 # tools/gpu-gate.sh takes the gate lock of the card box.sh put in view (BLOOMERY_BOX_CARD): a card named
 # against it, and `both` without both cards in view, are refused before any lock is opened. The paths

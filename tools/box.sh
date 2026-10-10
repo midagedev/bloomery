@@ -44,6 +44,31 @@
 #                             sync beside a sitting would put this tree's uncommitted edits under the
 #                             sitting's running scripts. Its ssh is the only one that reads stdin, so a
 #                             script can go over it (`just box-gc`: 'bash -s -- …' < tools/box-gc.sh)
+#
+# The box queue. BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's signalbox daemon (unset or 0:
+# the path above, byte for byte). The daemon waits on the timing lease and the holds, so the job carries
+# no guard; tools/boxq.py runs it (submit, follow its out and err apart, exit with its rc, cancel it on
+# INT or TERM). A read (BLOOMERY_BOX_READONLY=1) never goes through the queue.
+#   Sync. The tree goes to the remote directory under that directory's lock, /root/bloomery-queue/dir-<key>.lock
+#   (<key> the remote directory's name): rsync runs behind `flock -n -x`, so a tree a job is running in is
+#   never replaced under it. A sync that fails on that lock ends 83 naming it (the lock is probed once
+#   after a failed rsync: rsync's own code is 12 for a lock and a network fault alike). A fresh id goes
+#   along as the remote tree's .sync-id, from a temp dir (a file in the Mac tree would make every later
+#   command `-dirty` and move the ledger keys that walk the tree).
+#   Job. The assembled remote command, without the guard, runs as `flock -s -n -E 85 <the dir lock> bash -c
+#   '…'`: the lock is held shared for the job's life, children included, and not taking it ends 85. Inside,
+#   a .sync-id that is not this call's id (another sync replaced the tree after the submit) ends 80 before
+#   anything runs. box.sh produces 80, 83 and 85 only, and tools/boxq.py passes them through; boxq.py's own
+#   are 81, 84 and 130/143 (see its header). A queued job has no stdin, and BLOOMERY_BOX_WAIT and
+#   BLOOMERY_HOLD_OWNER do not reach the daemon.
+#   BLOOMERY_Q_CLASS=lead|round|sitting|fill   the job's class, which sets its priority (default round)
+#   BLOOMERY_Q_CARD=3090|a6000|both|any|none   the lane (default BLOOMERY_CARD, else 3090; both set to
+#                             different values: 64). `any` is the daemon's choice of a card: the card pick and
+#                             BLOOMERY_BOX_CARD then read $SIGNALBOX_CARD, which the daemon sets in the job's
+#                             environment. `none` holds no card and pins none beyond the default
+#   BLOOMERY_Q_PRED_S=<s>     the job's predicted wall, whole seconds >= 1; unset prints `predicted unknown`
+#                             and the job goes without one. The queue line `box.sh: queue <class> card=<lane>
+#                             predicted <s> remote=<dir>` goes to stderr before the submit
 set -euo pipefail
 HOST=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$(cd "$(dirname "$0")/.." && pwd)")"}
@@ -95,6 +120,12 @@ if [ -n "$VARIANT" ] && [ "$TIER" != fixture ]; then
 fi
 VARX=
 [ -z "$VARIANT" ] || VARX="export BLOOMERY_FIXTURE_VARIANT=$VARIANT && "
+QUEUE=0
+case ${BLOOMERY_BOX_QUEUE:-0} in
+  0) ;;
+  1) QUEUE=1 ;;
+  *) echo "box.sh: BLOOMERY_BOX_QUEUE is 1 (a job of the box queue), or 0 or unset (the command runs directly), got '$BLOOMERY_BOX_QUEUE'" >&2; exit 64 ;;
+esac
 READONLY=0
 case ${BLOOMERY_BOX_READONLY:-0} in
   0) GUARD="( cd $REMOTE && . tools/ref/lease-probe.sh && lease_guard $BOX_WAIT $HOLD_OWNER ) && " ;;
@@ -112,6 +143,43 @@ case ${BLOOMERY_BOX_READONLY:-0} in
     ;;
   *) echo "box.sh: BLOOMERY_BOX_READONLY is 1 (a read), or 0 or unset (behind the guard), got '$BLOOMERY_BOX_READONLY'" >&2; exit 64 ;;
 esac
+# A read never goes through the queue. The queue's settings (the header) are named before anything is synced: a refusal touches nothing.
+[ "$READONLY" = 0 ] || QUEUE=0
+QLOCK_DIR=/root/bloomery-queue
+QKEY= QLOCK= QCLASS= QLANE= QPRED=
+if [ "$QUEUE" = 1 ]; then
+  QKEY=$(basename "$REMOTE")
+  case $QKEY in
+    '' | *[!A-Za-z0-9._-]*) echo "box.sh: the remote directory's name is the dir lock's key, [A-Za-z0-9._-]+, got '$QKEY' (BLOOMERY_REMOTE=$REMOTE)" >&2; exit 64 ;;
+  esac
+  QLOCK=$QLOCK_DIR/dir-$QKEY.lock
+  QCLASS=${BLOOMERY_Q_CLASS:-round}
+  case $QCLASS in
+    lead | round | sitting | fill) ;;
+    *) echo "box.sh: BLOOMERY_Q_CLASS is lead, round, sitting or fill, got '$QCLASS'" >&2; exit 64 ;;
+  esac
+  QPRED=${BLOOMERY_Q_PRED_S:-}
+  case $QPRED in
+    '') ;;
+    0* | *[!0-9]*) echo "box.sh: BLOOMERY_Q_PRED_S is whole seconds >= 1 (unset: predicted unknown), got '$QPRED'" >&2; exit 64 ;;
+  esac
+  case ${BLOOMERY_CARD:-3090} in
+    3090 | a6000 | both) ;;
+    *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both (BLOOMERY_Q_CARD also takes any and none)" >&2; exit 64 ;;
+  esac
+  QLANE=${BLOOMERY_CARD:-3090}
+  if [ -n "${BLOOMERY_Q_CARD:-}" ]; then
+    case $BLOOMERY_Q_CARD in
+      3090 | a6000 | both | any | none) ;;
+      *) echo "box.sh: BLOOMERY_Q_CARD must be 3090, a6000, both, any or none, got '$BLOOMERY_Q_CARD'" >&2; exit 64 ;;
+    esac
+    if [ -n "${BLOOMERY_CARD:-}" ] && [ "$BLOOMERY_CARD" != "$BLOOMERY_Q_CARD" ]; then
+      echo "box.sh: BLOOMERY_CARD is '$BLOOMERY_CARD' and BLOOMERY_Q_CARD is '$BLOOMERY_Q_CARD': name one lane" >&2
+      exit 64
+    fi
+    QLANE=$BLOOMERY_Q_CARD
+  fi
+fi
 if [ "$READONLY" = 1 ]; then
   # A read runs in the remote directory as it is. -n: this lookup leaves stdin to the command's ssh.
   rc=0
@@ -130,7 +198,28 @@ else
   # 원격 디렉터리에서 빌드가 도는 사이 다른 box.sh 호출의 --delete가 그것을 지우면 빌드가 rc 101로 죽는다(dspark-q3k와
   # ds41splitk 라운드에서 한 번씩). `.oxide-artifacts/`(`embed.o` 등)도 같은 부류다(q3fix 라운드에서 한 번). 맥 트리에는 없으니
   # 삭제 대상에서 뺀다.
-  rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' "$HERE"/ "$HOST:$REMOTE/"
+  # A queued call syncs behind the remote directory's lock and ships a fresh id with the tree (the header); the direct call adds neither.
+  SYNC_ID= SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=()
+  if [ "$QUEUE" = 1 ]; then
+    SYNC_ID=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+    SYNC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/box-sync.XXXXXX")
+    printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id"
+    SYNC_PATH=(--rsync-path="mkdir -p $QLOCK_DIR && flock -n -x $QLOCK rsync")
+    SYNC_ID_SRC=("$SYNC_TMP/.sync-id")
+  fi
+  rc=0
+  rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
+  [ -z "$SYNC_TMP" ] || rm -rf "$SYNC_TMP"
+  if [ "$rc" != 0 ] && [ "$QUEUE" = 1 ]; then
+    # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock decides (flock: 1 held, 0 free).
+    prc=0
+    ssh -n "$HOST" "mkdir -p $QLOCK_DIR && flock -n -x $QLOCK true" || prc=$?
+    if [ "$prc" = 1 ]; then
+      echo "box.sh: a job of this remote directory is running ($QLOCK is held on $HOST); its tree cannot be replaced under it: wait for it, or use another BLOOMERY_REMOTE" >&2
+      exit 83
+    fi
+  fi
+  [ "$rc" = 0 ] || exit "$rc"
 fi
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은
@@ -138,16 +227,17 @@ fi
 # lease both free is not one of ours: the command ends with rc 75 (below). llm.service 검사는 누가 다시 켰을 때의
 # 안전장치다.
 # 고른 값은 박스 쪽에 BLOOMERY_BOX_CARD로 넘어가고, tools/gpu-gate.sh가 그 카드의 게이트 락을 잡는다(both = 둘 다).
-CARD=${BLOOMERY_CARD:-3090}
-case "$CARD" in
-  3090) PICK=":" ;;
-  a6000|both) PICK='
+# card_pick <card>: the remote text that picks that card (3090, a6000 or both); a card of another name is refused (64).
+card_pick() {
+  case "$1" in
+    3090) printf %s ":" ;;
+    a6000|both) printf %s '
     A=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "A6000" | cut -d, -f1)
     T=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "3090" | cut -d, -f1)
     # a6000 alone needs only its own UUID — the 3090 has fallen off the bus twice on 2026-09-22 and must not
     # take the healthy card down with it. both needs both.
     [ -n "$A" ] || { echo "box.sh: A6000 lookup failed" >&2; exit 75; }
-    [ "'"$CARD"'" != both ] || [ -n "$T" ] || { echo "box.sh: 3090 lookup failed (both)" >&2; exit 75; }
+    [ "'"$1"'" != both ] || [ -n "$T" ] || { echo "box.sh: 3090 lookup failed (both)" >&2; exit 75; }
     if [ "$(systemctl is-active llm.service)" = active ]; then echo "box.sh: llm.service holds the A6000" >&2; exit 75; fi
     # A compute process on the A6000 while its gate lock or the timing lease is held is one of our runs: the
     # command goes on, and tools/gpu-gate.sh waits for the card lock inside its bound. One with both free is
@@ -155,9 +245,28 @@ case "$CARD" in
     if [ -n "$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader)" ] &&
        flock -s -n /root/bloomery-gate-a6000.lock true && flock -s -n /root/bloomery-cpu.lock true; then
       echo "box.sh: the A6000 has compute processes and neither its gate lock nor the timing lease is held (serving or training?) — not taking it" >&2; exit 75; fi
-    '"$( [ "$CARD" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )" ;;
-  *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both" >&2; exit 64 ;;
+    '"$( [ "$1" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )" ;;
+    *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both" >&2; exit 64 ;;
+  esac
+}
+CARD=${BLOOMERY_CARD:-3090}
+# A queue lane (BLOOMERY_Q_CARD) of `any` or `none` takes today's default pin here; `any` then picks its card when the job starts (below).
+case "$QLANE" in
+  '') ;;
+  any | none) CARD=3090 ;;
+  *) CARD=$QLANE ;;
 esac
+PICK=$(card_pick "$CARD")
+BOXCARD=$CARD
+if [ "$QLANE" = any ]; then
+  PICK="case \"\${SIGNALBOX_CARD:-}\" in
+  3090) : ;;
+  a6000) $(card_pick a6000)
+  ;;
+  *) echo \"box.sh: a job of lane any starts with SIGNALBOX_CARD 3090 or a6000 (the daemon sets it), got '\${SIGNALBOX_CARD:-}'\" >&2; exit 70 ;;
+esac"
+  BOXCARD='"$SIGNALBOX_CARD"'
+fi
 # The model the gates and GPU binaries open (BLOOMERY_REF_MODEL) is a property of the tool profile:
 # every command runs with it exported from tools/ref/ref-paths.sh, and an unknown profile stops the
 # command with that file's exit 64. The profile is picked on this side — BLOOMERY_MODEL here, or
@@ -247,5 +356,27 @@ esac
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
-ssh "$HOST" "${GUARD}source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$CARD && $OXIDE$ENVS$*"
+REMOTE_CMD="source ~/bloomery-env.sh && { $PICK
+} && cd $REMOTE && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ENVS$*"
+if [ "$QUEUE" = 0 ]; then
+  ssh "$HOST" "${GUARD}$REMOTE_CMD"
+  exit
+fi
+# The queued job (the header): the command as it runs directly, minus the guard, behind the stale-tree check and the dir lock.
+# $REMOTE stays unquoted in `cat`: a quoted ~ would not expand.
+STALE="[ \"\$(cat $REMOTE/.sync-id 2>/dev/null)\" = $SYNC_ID ] || { echo \"box.sh: $REMOTE was synced again after this job was queued (stale tree)\" >&2; exit 80; }"
+INNER="$STALE
+$REMOTE_CMD"
+sq=\'\\\'\'
+QUOTED=${INNER//\'/$sq}
+JOB="flock -s -n -E 85 $QLOCK bash -c '$QUOTED'"
+# <remote directory>-<the command's first word, as a name>-<the id's first 6>
+first=${*%%[[:space:]]*}
+first=$(printf %s "${first##*/}" | tr -c 'A-Za-z0-9._-' '_')
+QNAME="$QKEY-${first:0:24}-${SYNC_ID:0:6}"
+[ -n "$first" ] || QNAME="$QKEY-cmd-${SYNC_ID:0:6}"
+qargs=(run --card "$QLANE" --class "$QCLASS" --name "$QNAME")
+[ -z "$QPRED" ] || qargs+=(--expected-s "$QPRED")
+PRED_TEXT=${QPRED:+$QPRED s}
+echo "box.sh: queue $QCLASS card=$QLANE predicted ${PRED_TEXT:-unknown} remote=$REMOTE" >&2
+exec python3 "$HERE/tools/boxq.py" ${qargs[@]+"${qargs[@]}"} -- "$JOB"

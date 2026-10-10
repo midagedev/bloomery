@@ -380,6 +380,7 @@ blk_pytools() {
     "tools/bloomery/records.py --self-test"
     "tools/bloomery/rows.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
+    "tools/boxq-check.py --self-test"
     "tools/boxq.py --self-test"
     "tools/check-comment-only.py --self-test"
     "tools/check-defaults.py --self-test"
@@ -448,9 +449,9 @@ blk_pytools() {
   echo "check-recipes: ${#selftests[@]} tool self-tests ok"
 }
 # The box queue's exit codes 80, 81 and 83-85 name one meaning each: no other tool, recipe or script produces one of them, and
-# they overlap none of the codes tools/ and the justfile already name (tools/boxq.py codes-check).
+# they overlap none of the codes tools/ and the justfile already name (tools/boxq-check.py codes-check).
 blk_boxqcodes() {
-  if ! bc=$(python3 "$(dirname "$0")/boxq.py" codes-check 2>&1); then
+  if ! bc=$(python3 "$(dirname "$0")/boxq-check.py" codes-check 2>&1); then
     echo "$bc" >&2
     echo "check-recipes: a tool or recipe produces one of the box queue's exit codes 80, 81, 83-85" >&2
     return 1

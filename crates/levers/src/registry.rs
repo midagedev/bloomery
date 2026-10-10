@@ -1572,6 +1572,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          lever reaches a binary through an unchanged recipe.",
     ),
     runner(
+        "BLOOMERY_BOX_QUEUE",
+        Some("box.sh"),
+        "Mac side: `1` makes a box command a job of the box queue: the tree syncs under the remote \
+         directory's lock and `tools/boxq.py` runs the job, which exits with the job's code. A read \
+         (`BLOOMERY_BOX_READONLY=1`) never queues; unset or `0` runs the command directly.",
+    ),
+    runner(
         "BLOOMERY_BOX_READONLY",
         Some("box.sh"),
         "Mac side: `1` runs a read on the box beside a sitting, with no guard and no sync.",
@@ -2017,9 +2024,28 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "`tools/ref/profile-measure.sh`: the `BLOOMERY_PROFILE` levels it runs.",
     ),
     runner(
+        "BLOOMERY_Q_CARD",
+        Some("box.sh"),
+        "Mac side, with `BLOOMERY_BOX_QUEUE=1`: the queue lane of the job, `3090`, `a6000`, `both`, \
+         `any` (the daemon picks a card; the job reads it from `$SIGNALBOX_CARD`) or `none`. Unset: \
+         `BLOOMERY_CARD`, else `3090`; both set to different values is refused.",
+    ),
+    runner(
+        "BLOOMERY_Q_CLASS",
+        Some("box.sh"),
+        "Mac side, with `BLOOMERY_BOX_QUEUE=1`: the job's class, `lead`, `round`, `sitting` or \
+         `fill`, which sets its priority on the daemon; unset means `round`.",
+    ),
+    runner(
         "BLOOMERY_Q_JOB",
         Some("ref/lease.sh"),
         "The box queue job a runner started under; the lease's trace names it.",
+    ),
+    runner(
+        "BLOOMERY_Q_PRED_S",
+        Some("box.sh"),
+        "Mac side, with `BLOOMERY_BOX_QUEUE=1`: the job's predicted wall in whole seconds (at \
+         least 1); unset prints `predicted unknown` and the job goes without one.",
     ),
     runner(
         "BLOOMERY_RATE_CORE",

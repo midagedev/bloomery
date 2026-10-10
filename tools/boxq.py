@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""boxq.py — the box queue's client, the idle-fill list's reader and the guard on the client's exit codes.
+"""boxq.py — the box queue's client: it posts a job to signalbox, follows it and cancels it.
 
-  boxq.py submit --card C --class K --expected-s N --name TAG [--owner O] [--env K=V …] -- CMD…
+  boxq.py submit --card C --class K [--expected-s N] --name TAG [--owner O] [--env K=V …] -- CMD…
                                                    post a job to signalbox; its id on stdout
   boxq.py attach ID [--rc-dir DIR]                 follow its out and err, mirror its rc, exit with it
   boxq.py run …                                    submit, then attach (the id goes to stderr: stdout is the job's out)
   boxq.py cancel ID                                post the cancel, print the job's status
-  boxq.py fill-list   [--file F] [--justfile J]   print tools/box-fill.tsv's rows, each checked against the justfile
-  boxq.py codes-check [--root DIR]                 no other tool or recipe produces exit codes 80, 81, 83, 84, 85
   boxq.py --self-test [CASE …]                     --list-cases names the cases
 
 Client. Every request is one `ssh <host> curl …` to the daemon on the box's loopback; a POST's JSON body goes on ssh's
@@ -24,6 +22,7 @@ The box's rc is the authority: for done and failed the exit code is the job's rc
 80, 83 and 85 from the job's command prefix pass through unchanged; a job cancelled by someone else exits with its rc,
 else 81, with `boxq: <id> cancelled elsewhere` on stderr; 143 is only our own trapped TERM. A mirror that cannot be
 written is a stderr line; the exit code stays the job's.
+A job with no --expected-s is posted without one (the daemon reads it as an unknown wall) and its line says `predicted unknown`.
 INT or TERM during run or attach posts the cancel and keeps polling until the job is terminal (at most
 BOXQ_CANCEL_WAIT_S), then exits 130 or 143; a job not terminal by then, or a second signal, exits 81 naming the job.
 Three polls in a row that cannot reach the daemon exit 84 and leave the job as it is.
@@ -32,20 +31,10 @@ Three polls in a row that cannot reach the daemon exit 84 and leave the job as i
   BOXQ_SSH    the ssh command (default ssh)                  BOXQ_POLL_S         poll interval, seconds (5)
   BOXQ_NOTE_S seconds between queue-wait lines (60)          BOXQ_CANCEL_WAIT_S  wait after a cancel (150)
 
-fill-list: a row names a justfile recipe (or `cmd:<command>`), the card lane it holds, where its predicted minutes come
-from (`times:<item>` or `given:<minutes>`) and a reason. A row whose recipe the justfile does not hold, an unknown lane,
-a malformed minutes source, a duplicate or a row with no reason is refused by name (rc 65); the recipe's justfile
-groups are printed beside it, read from the justfile and kept nowhere else.
-
-codes-check: the box queue's client keeps 80 (stale tree), 81 (lost), 83 (dir owned by another tree), 84 (consumer not
-alive) and 85 (a job's dir lock not taken). 82 is retired and never reused. The check refuses any script under tools/
-or the justfile that produces one of these codes (`exit N`, `sys.exit(N)`, `return N`, `flock -E N`, `SystemExit(N)`);
-a script that only tests a code, or names it in a comment, is no collision. The codes also stay clear of those tools/
-and the justfile already name.
-
-Exit: the job's rc (run, attach); 0 ok; 64 usage or no such job; 65 a fill row or a code collision, named; 69 an
-unreadable file; 81 lost, or still running after the cancel; 84 the daemon is not alive or answers outside the wire;
-130/143 a trapped INT/TERM; a daemon refusal exits with the rc it names.
+Exit: the job's rc (run, attach); 0 ok; 64 usage or no such job; 81 lost, or still running after the cancel; 84 the daemon
+is not alive or answers outside the wire; 130/143 a trapped INT/TERM; a daemon refusal exits with the rc it names. 80, 83
+and 85 are tools/box.sh's, and only pass through here. tools/boxq-check.py holds the guard that keeps the five codes apart
+from every other tool, and the idle-fill list's reader.
 """
 
 import argparse
@@ -67,10 +56,7 @@ import tempfile
 import threading
 import time
 
-USAGE, DATA, ROOT_BAD = 64, 65, 69
-OWN_CODES = (80, 81, 83, 84, 85)
-# What tools/ and the justfile already name; the collision check holds the queue's codes apart from these.
-OTHER_CODES = frozenset(range(64, 76)) | {77, 78, 97, 124, 137}
+USAGE = 64
 LANES = ("3090", "a6000", "both", "any", "none")
 CLASSES = ("lead", "round", "sitting", "fill")
 STATUSES = ("queued", "running", "done", "failed", "cancelled", "lost")
@@ -96,110 +82,6 @@ class Parser(argparse.ArgumentParser):
 
 def here():
     return os.path.dirname(os.path.abspath(__file__))
-
-
-def justfile_recipes(path):
-    """{recipe: [groups]} from a justfile's text: a recipe is a column-0 name whose first unquoted ':' is not ':='."""
-    try:
-        with open(path) as f:
-            lines = f.read().splitlines()
-    except OSError as e:
-        raise Refusal(ROOT_BAD, "no-justfile", f"{path}: {e}")
-    out, attrs = {}, []
-    for line in lines:
-        if not line or line[0] in " \t":
-            continue
-        s = line.rstrip()
-        if s.startswith("#"):
-            continue
-        m = re.match(r"^\[(.*)\]$", s)
-        if m:
-            attrs += re.findall(r"group\s*[(:]\s*['\"]([^'\"]+)['\"]", m.group(1))
-            continue
-        quote, colon = None, -1
-        for i, ch in enumerate(s):
-            if quote:
-                quote = None if ch == quote else quote
-            elif ch in "'\"`":
-                quote = ch
-            elif ch == ":":
-                colon = i
-                break
-        name = re.match(r"^@?([A-Za-z_][A-Za-z0-9_-]*)", s)
-        if (name and colon > 0 and s[colon:colon + 2] != ":="
-                and name.group(1) not in ("set", "alias", "export", "import", "mod", "unexport")):
-            out[name.group(1)] = attrs
-        attrs = []
-    return out
-
-
-def read_fill(path, jf):
-    recipes = justfile_recipes(jf)
-    try:
-        with open(path) as f:
-            text = f.read().splitlines()
-    except OSError as e:
-        raise Refusal(ROOT_BAD, "no-fill-file", f"{path}: {e}")
-    rows, seen = [], set()
-    for n, line in enumerate(text, 1):
-        if not line.strip() or line.startswith("#"):
-            continue
-        cols = line.split("\t")
-        where = f"{path}:{n}"
-        if len(cols) != 4:
-            raise Refusal(DATA, "bad-fill-row", f"{where}: {len(cols)} columns, the file has 4 (item, lane, minutes, why)")
-        item, lane, src, why = cols
-        if item in seen:
-            raise Refusal(DATA, "bad-fill-row", f"{where}: {item} appears twice")
-        seen.add(item)
-        if not item.startswith("cmd:") and item not in recipes:
-            raise Refusal(DATA, "bad-fill-row", f"{where}: {item} is not a recipe of {jf}")
-        if lane not in LANES:
-            raise Refusal(DATA, "bad-fill-row", f"{where}: lane {lane!r} is not one of {', '.join(LANES)}")
-        m = re.match(r"^(times:\S+|given:([0-9]+(?:\.[0-9]+)?))$", src)
-        if not m:
-            raise Refusal(DATA, "bad-fill-row", f"{where}: minutes source {src!r} is not times:<item> or given:<minutes>")
-        if item.startswith("cmd:") and not m.group(2):
-            raise Refusal(DATA, "bad-fill-row", f"{where}: a cmd: row has no recipe to take times from: use given:<minutes>")
-        if not why.strip():
-            raise Refusal(DATA, "bad-fill-row", f"{where}: no reason")
-        rows.append({"item": item, "lane": lane, "src": src, "why": why,
-                     "groups": recipes.get(item, [])})
-    return rows
-
-
-def cmd_fill_list(a):
-    for r in read_fill(a.file or os.path.join(here(), "box-fill.tsv"), a.justfile or os.path.join(here(), "..", "justfile")):
-        print(f"{r['item']}\tlane={r['lane']}\tgroups={','.join(r['groups']) or '-'}\t{r['src']}")
-
-PRODUCE_RES = [re.compile(p) for p in (
-    r"(?<![\w$.-])exit\s+(8[01345])\b", r"\bexit\(\s*(8[01345])\s*\)", r"(?<![\w$-])return\s+(8[01345])\b",
-    r"\s-E\s*(8[01345])\b", r"\bSystemExit\(\s*(8[01345])\b", r"\bos\._exit\(\s*(8[01345])\b",
-)]
-
-
-def cmd_codes_check(a):
-    base = a.root or os.path.join(here(), "..")
-    bad = []
-    files = [os.path.join(base, "justfile")]
-    for dp, _, fns in os.walk(os.path.join(base, "tools")):
-        files += [os.path.join(dp, f) for f in fns if f.endswith((".sh", ".py")) or "." not in f]
-    for p in sorted(files):
-        if os.path.abspath(p) == os.path.abspath(__file__) or not os.path.isfile(p):
-            continue
-        try:
-            with open(p, errors="replace") as f:
-                for n, line in enumerate(f, 1):
-                    if line.lstrip().startswith("#"):
-                        continue
-                    for rx in PRODUCE_RES:
-                        for m in rx.finditer(line):
-                            bad.append(f"{os.path.relpath(p, base)}:{n}: produces {m.group(1)}")
-        except OSError as e:
-            raise Refusal(ROOT_BAD, "unreadable", f"{p}: {e}")
-    if bad or set(OWN_CODES) & OTHER_CODES or len(set(OWN_CODES)) != len(OWN_CODES):
-        raise Refusal(DATA, "exit-code-collision", "\n".join(bad) or "the tool's own codes overlap the reserved set")
-    print("boxq codes 80, 81, 83-85: no other tool or recipe produces them")
 
 
 # ---- the queue client ---------------------------------------------------------------------------------------------
@@ -517,7 +399,7 @@ def job_body(a):
     for flag, v in (("--name", a.name), ("--owner", owner)):
         if not NAME_RE.match(v):
             raise Refusal(USAGE, "usage", f"{flag} is [A-Za-z0-9._-]+, got {v!r}")
-    if a.expected_s < 1:
+    if a.expected_s is not None and a.expected_s < 1:
         raise Refusal(USAGE, "usage", f"--expected-s is whole seconds >= 1, got {a.expected_s}")
     env = {}
     for kv in a.env:
@@ -525,13 +407,17 @@ def job_body(a):
         if not eq or not ENV_RE.match(k):
             raise Refusal(USAGE, "usage", f"--env is NAME=VALUE, got {kv!r}")
         env[k] = v
-    return {"kind": "command", "argv": words[0] if len(words) == 1 else shlex.join(words), "env": env, "owner": owner,
-            "name": a.name, "card": a.card, "job_class": a.job_class, "expected_s": a.expected_s, "wait": 0}
+    body = {"kind": "command", "argv": words[0] if len(words) == 1 else shlex.join(words), "env": env, "owner": owner,
+            "name": a.name, "card": a.card, "job_class": a.job_class, "wait": 0}
+    if a.expected_s is not None:
+        body["expected_s"] = a.expected_s
+    return body
 
 
 def submit_job(q, body, trap=None):
     """Post the job; its id."""
-    say(f"boxq: {body['name']} class={body['job_class']} card={body['card']} predicted {body['expected_s']} s")
+    predicted = f"{body['expected_s']} s" if "expected_s" in body else "unknown"
+    say(f"boxq: {body['name']} class={body['job_class']} card={body['card']} predicted {predicted}")
     q.health()
     if trap and trap.sigs:
         raise Refusal(trap.rc(), "interrupted", "before the job was posted")
@@ -581,7 +467,7 @@ def parser():
         s = sub.add_parser(name)
         s.add_argument("--card", required=True, choices=LANES)
         s.add_argument("--class", dest="job_class", required=True, choices=CLASSES)
-        s.add_argument("--expected-s", dest="expected_s", required=True, type=int)
+        s.add_argument("--expected-s", dest="expected_s", type=int)
         s.add_argument("--name", required=True)
         s.add_argument("--owner")
         s.add_argument("--env", action="append", default=[])
@@ -591,15 +477,10 @@ def parser():
     s.add_argument("id")
     s.add_argument("--rc-dir")
     sub.add_parser("cancel").add_argument("id")
-    s = sub.add_parser("fill-list")
-    s.add_argument("--file")
-    s.add_argument("--justfile")
-    sub.add_parser("codes-check").add_argument("--root")
     return p
 
 
-HANDLERS = {"submit": cmd_submit, "attach": cmd_attach, "run": cmd_run, "cancel": cmd_cancel,
-            "fill-list": cmd_fill_list, "codes-check": cmd_codes_check}
+HANDLERS = {"submit": cmd_submit, "attach": cmd_attach, "run": cmd_run, "cancel": cmd_cancel}
 
 
 def main(argv):
@@ -866,57 +747,14 @@ def check(cond, msg):
         raise AssertionError(msg)
 
 
-def case_fill_list(fx):
-    jf = os.path.join(fx.tmp, "justfile")
-    with open(jf, "w") as f:
-        f.write("set shell := ['bash', '-c']\nX := 'a:b'\nalias w := weekly-a\n\n[group('solo')]\n# c\n[group('v41-load')]\n"
-                "weekly-a:\n    echo hi:there\n\nweekly-b *ARGS:\n    true\nname arg='x:y' *R: dep\n    true\nexport Y := 'z'\n")
-    check(justfile_recipes(jf) == {"weekly-a": ["solo", "v41-load"], "weekly-b": [], "name": []},
-          f"the justfile parse read {justfile_recipes(jf)}")
-    ff = os.path.join(fx.tmp, "fill.tsv")
-
-    def run(*rows):
-        with open(ff, "w") as f:
-            f.write("# header\n" + "\n".join("\t".join(r) for r in rows) + "\n")
-        return fx.call("fill-list", "--file", ff, "--justfile", jf)
-
-    good = ("weekly-a", "both", "times:weekly-a", "why")
-    rc, out, err = run(good, ("weekly-b", "any", "given:10", "why"))
-    check(rc == 0 and "groups=solo,v41-load" in out and out.count("\n") == 2, f"good rows: {rc} {out!r} {err!r}")
-    for bad, name in ((("nope", "any", "given:5", "w"), "a recipe the justfile lacks"),
-                      (("weekly-a", "moon", "given:5", "w"), "an unknown lane"),
-                      (("weekly-a", "any", "five", "w"), "a bad minutes source"),
-                      (("cmd:true", "any", "times:x", "w"), "a cmd: row on times"),
-                      (("weekly-a", "any", "given:5", ""), "no reason"),
-                      (("weekly-a", "any", "given:5"), "three columns")):
-        rc, _, err = run(bad)
-        check(rc == DATA and "bad-fill-row" in err, f"{name} must be 65 by name, got {rc} {err!r}")
-    check(run(good, good)[0] == DATA, "a duplicate row is refused")
-    check(run(("weekly-a", "any", "given:45", "w"))[0] == 0, "a row over 30 min parses: the minutes bound nothing")
-
-
-def case_codes(fx):
-    check(not set(OWN_CODES) & OTHER_CODES and len(set(OWN_CODES)) == 5 and OWN_CODES == (80, 81, 83, 84, 85),
-          "the codes 80, 81, 83-85 overlap the reserved set or each other")
-    d = os.path.join(fx.tmp, "repo")
-    os.makedirs(os.path.join(d, "tools"))
-    for n, text in (("justfile", "r:\n    exit 64\n"), ("tools/a.sh", "# exit 80 in a comment\nexit 75\n"),
-                    ("tools/b.py", "sys.exit(97)\n")):
-        with open(os.path.join(d, n), "w") as f:
-            f.write(text)
-    rc, out, err = fx.call("codes-check", "--root", d)
-    check(rc == 0, f"a tree producing 64, 75 and 97 is clean: {rc} {err!r}")
-    for bad in ("exit 80", "sys.exit(83)", "return 84", "flock -s -n -E 85 f true", "(exit 81)", "raise SystemExit(80)"):
-        with open(os.path.join(d, "tools", "c.sh"), "w") as f:
-            f.write(f"x\n{bad}\n")
-        rc, out, err = fx.call("codes-check", "--root", d)
-        check(rc == DATA and "tools/c.sh:2" in err, f"a tool producing '{bad}' must be 65: {rc} {err!r}")
-    with open(os.path.join(d, "tools", "c.sh"), "w") as f:
-        f.write("exit 82\n")
-    check(fx.call("codes-check", "--root", d)[0] == 0, "82 is no longer the queue's: another tool may produce it")
-    with open(os.path.join(d, "tools", "c.sh"), "w") as f:
-        f.write('[ "$rc" = 80 ] && case $rc in 83) echo x;; esac\n')
-    check(fx.call("codes-check", "--root", d)[0] == 0, "a tool that tests a code, not produces it, is not a collision")
+def case_submit_no_prediction(fx):
+    fake = fx.serve([{"status": "queued"}])
+    args = [a for a in JOB_ARGS if a not in ("--expected-s", "90")]
+    rc, out, err = fx.client("submit", *args, "--", "true")
+    check(rc == 0 and out == b"j1\n", f"a job with no prediction is posted: {rc} {out!r} {err!r}")
+    check(err == b"boxq: tag-1 class=round card=a6000 predicted unknown\n", f"the line says unknown: {err!r}")
+    body = json.loads(fake.requests[-1][2])
+    check("expected_s" not in body and body["card"] == "a6000", f"the body leaves the field out: {body}")
 
 def case_submit_body(fx):
     fake = fx.serve([{"status": "queued"}])
@@ -1240,13 +1078,15 @@ def case_tails_stop(fx):
     os.close(null)
 
 
-CASES = [case_fill_list, case_codes, case_submit_body, case_run_done, case_lost, case_health_down, case_refusal,
+CASES = [case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
          case_tails_stop, case_flush_cap, case_queued_age, case_cancelled_elsewhere]
 
 
-def self_test(names):
-    known = {c.__name__[5:].replace("_", "-"): c for c in CASES}
+def run_cases(label, cases, make_fix, names):
+    """Run each case, or only the ones `names` lists, each on its own fixture (make_fix of a fresh temp dir, cleaned up
+    after the case); the exit code. tools/boxq-check.py runs its cases through this."""
+    known = {c.__name__[5:].replace("_", "-"): c for c in cases}
     unknown = [n for n in names if n not in known]
     if unknown:
         raise Refusal(USAGE, "usage", f"no such case: {', '.join(unknown)}")
@@ -1254,8 +1094,8 @@ def self_test(names):
     for name, fn in known.items():
         if names and name not in names:
             continue
-        with tempfile.TemporaryDirectory(prefix="boxq-selftest-") as tmp:
-            fx = Fix(tmp)
+        with tempfile.TemporaryDirectory(prefix=f"{label}-selftest-") as tmp:
+            fx = make_fix(tmp)
             try:
                 fn(fx)
                 print(f"ok   {name}")
@@ -1265,10 +1105,14 @@ def self_test(names):
             finally:
                 fx.cleanup()
     if failed:
-        print(f"boxq self-test: {len(failed)} red: {', '.join(failed)}")
+        print(f"{label} self-test: {len(failed)} red: {', '.join(failed)}")
         return 1
-    print(f"boxq self-test: {len(names) or len(known)} cases ok")
+    print(f"{label} self-test: {len(names) or len(known)} cases ok")
     return 0
+
+
+def self_test(names):
+    return run_cases("boxq", CASES, Fix, names)
 
 
 if __name__ == "__main__":
