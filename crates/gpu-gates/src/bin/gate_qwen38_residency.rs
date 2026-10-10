@@ -31,9 +31,9 @@
 //!   name).
 //! - `transform`: after the history, every expert the machine admitted holds
 //!   in its slot, part by part, the bytes a static load uploads for it —
-//!   the file's Q4_K gate and up, Q5_1 down (mutant: `swap38::stacks`' names
-//!   returns the gate and the up swapped, so the up's bytes stage into the
-//!   gate's stack).
+//!   the file's Q4_K gate and up, Q5_1 down (mutant: `routed_stacks`
+//!   (`model::arch::names`) returns the gate and the up swapped, so the up's
+//!   bytes stage into the gate's stack).
 //! - `passes` (green-only): a history's boundaries end, in order, no pass,
 //!   the prompt call (one pass, 0 rows kept), a step (1 kept), a verify (its
 //!   accepted rows) and the steps after it (1 kept each), the last step's

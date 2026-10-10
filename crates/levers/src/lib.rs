@@ -2021,9 +2021,9 @@ pub fn paged_draft(
 pub const GLM_DRAFT_UNSET: &str = "mtp";
 
 /// The word the GLM seat runs by with [`RESIDENCY`] unset where the machine
-/// runs: the serving placements', no seed expert pinned and one spare a layer
-/// ([`glm_unset`], [`glm_residency_at_plan`]).
-pub const GLM_RESIDENCY_UNSET: &str = "mid-p0-s1";
+/// runs: the serving word ([`RESIDENCY_SERVING`]) ([`glm_unset`],
+/// [`glm_residency_at_plan`]).
+pub const GLM_RESIDENCY_UNSET: &str = RESIDENCY_SERVING;
 
 /// What decides the GLM seat's unset words before any plan ([`glm_unset`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -22,6 +22,7 @@
 use crate::GpuError;
 use crate::host::swap_source::{PlanStacks, StackFacts};
 use gguf::quant::GgmlType;
+use model::arch::names::routed_stacks;
 use model::placement::ModelTensors;
 
 pub use crate::host::swap_source::{DEADLINE, LIVE_DELAY};
@@ -56,28 +57,6 @@ fn card_types(l: usize, [gate, up, down]: [GgmlType; 3]) -> Result<(), GpuError>
     Ok(())
 }
 
-/// Layer `l`'s routed gate, up and down names.
-fn stack_names(l: usize) -> [String; 3] {
-    [
-        model::arch::qwen35moe::names::ffn_gate_exps(l),
-        model::arch::qwen35moe::names::ffn_up_exps(l),
-        model::arch::qwen35moe::names::ffn_down_exps(l),
-    ]
-}
-
-/// The r8 sidecar's refusal ([`crate::host::swap_source::FileStacks::open`]):
-/// undefined input for this family, not a conversion.
-fn no_sidecar() -> GpuError {
-    GpuError::shape(
-        "swap38::stacks",
-        "an r8 sidecar beside a qwen4exp file: the sidecar holds Q3_K \
-         stacks (qdot::repack_q3k_r8), and this model's routed gate and up \
-         are Q4_K, Q5_K, IQ3_XXS or IQ4_XS and its down Q5_1, Q8_0 or IQ4_NL \
-         — undefined input, not a \
-         conversion",
-    )
-}
-
 /// Qwen3.8's stack table: the common one ([`PlanStacks`]) over this family's
 /// facts — every layer holds all three stacks, each checked against the card
 /// leg's types ([`card_types`]), the whole card range the map, every layer
@@ -92,12 +71,11 @@ pub fn stacks(model: &ModelTensors) -> Result<Qwen38Stacks, GpuError> {
         model,
         StackFacts {
             what: "swap38::stacks",
-            names: stack_names,
+            names: routed_stacks,
             check: Some(card_types),
             empty: false,
             map_layers: None,
             unrouted: Vec::new(),
-            sidecar: no_sidecar,
         },
     )
 }

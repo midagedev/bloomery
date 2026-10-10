@@ -195,22 +195,20 @@ pub struct StackFacts {
     pub map_layers: Option<usize>,
     /// The map's layers no pass routes ([`FileStacks::unrouted`]).
     pub unrouted: Vec<usize>,
-    /// The r8 sidecar's refusal ([`FileStacks::open`]), in the family's
-    /// words.
-    pub sidecar: fn() -> GpuError,
 }
 
 /// The [`FileStacks`] of a model whose card holds the file's bytes: each
 /// layer's gate, up and down types read from the plan's tensors, nothing to
-/// convert, every family fact an input ([`StackFacts`]).
+/// convert, every family fact an input ([`StackFacts`]). With nothing to
+/// convert, an r8 sidecar beside the file is refused by name.
 pub struct PlanStacks {
+    what: &'static str,
     names_of: fn(usize) -> [String; 3],
     /// Per layer, its three stacks' types in stack order; `None` on a layer
     /// that holds none of them.
     types: Vec<Option<[GgmlType; 3]>>,
     map_layers: Option<usize>,
     unrouted: Vec<usize>,
-    sidecar: fn() -> GpuError,
 }
 
 impl PlanStacks {
@@ -251,11 +249,11 @@ impl PlanStacks {
             });
         }
         Ok(PlanStacks {
+            what: facts.what,
             names_of: facts.names,
             types,
             map_layers: facts.map_layers,
             unrouted: facts.unrouted,
-            sidecar: facts.sidecar,
         })
     }
 
@@ -267,6 +265,34 @@ impl PlanStacks {
             .get(l)
             .and_then(Option::as_ref)
             .map(|t| (t[0], t[2]))
+    }
+
+    /// The r8 sidecar's refusal ([`FileStacks::open`]): the sidecar is the
+    /// Q3_K stacks' r8 layout (`qdot::repack_q3k_r8`) and this table has no
+    /// unpack from it, so a part a sidecar held would stage into its slot as
+    /// r8 bytes. Refused by name under the facts' `what` whatever the file
+    /// holds, the message listing the types its stacks are. `Ok` without a
+    /// sidecar.
+    fn check_sidecar(&self, sidecar: bool) -> Result<(), GpuError> {
+        if !sidecar {
+            return Ok(());
+        }
+        let mut found: Vec<GgmlType> = Vec::new();
+        for &ty in self.types.iter().flatten().flatten() {
+            if !found.contains(&ty) {
+                found.push(ty);
+            }
+        }
+        let found: Vec<String> = found.iter().map(ToString::to_string).collect();
+        Err(GpuError::shape(
+            self.what,
+            format!(
+                "an r8 sidecar beside a file whose routed stacks are {}: the sidecar's format is \
+                 Q3_K's (qdot::repack_q3k_r8) and this table has no unpack from it, so a staged \
+                 part is the file's bytes as they stand (BLOOMERY_R8=off)",
+                found.join(", ")
+            ),
+        ))
     }
 }
 
@@ -297,9 +323,7 @@ impl FileStacks for PlanStacks {
         sidecar: bool,
         _ctx: &Arc<CudaContext>,
     ) -> Result<Option<Arc<dyn Convert>>, GpuError> {
-        if sidecar {
-            return Err((self.sidecar)());
-        }
+        self.check_sidecar(sidecar)?;
         Ok(None)
     }
 }
@@ -1291,14 +1315,6 @@ mod tests {
         ["gate", "up", "down"].map(|part| format!("layer.{l}.{part}"))
     }
 
-    /// The sidecar refusal of the tests' families, its text never read.
-    fn no_sidecar() -> GpuError {
-        GpuError::State {
-            what: "the tests' stacks",
-            missing: "no sidecar",
-        }
-    }
-
     /// A layer that holds some of its three stacks but not all is refused by
     /// the name of the first one missing, under the caller's own `what`, in a
     /// family whose layers may hold none. Mutant: the refusal's `need` reads
@@ -1322,7 +1338,6 @@ mod tests {
                 empty: true,
                 map_layers: None,
                 unrouted: Vec::new(),
-                sidecar: no_sidecar,
             },
         ) {
             Err(GpuError::Tensor { what, name, need }) => {
@@ -1363,7 +1378,6 @@ mod tests {
                 empty: true,
                 map_layers: None,
                 unrouted: Vec::new(),
-                sidecar: no_sidecar,
             },
         )
         .expect("a family with empty layers reads its layers");
@@ -1397,7 +1411,6 @@ mod tests {
                     empty: false,
                     map_layers: None,
                     unrouted: Vec::new(),
-                    sidecar: no_sidecar,
                 },
             ) {
                 Err(GpuError::Tensor {
@@ -1441,7 +1454,6 @@ mod tests {
                 empty: true,
                 map_layers: None,
                 unrouted: Vec::new(),
-                sidecar: no_sidecar,
             },
         ) {
             Err(GpuError::Shape { what, detail }) => {
@@ -1465,10 +1477,72 @@ mod tests {
                 empty: true,
                 map_layers: None,
                 unrouted: Vec::new(),
-                sidecar: no_sidecar,
             },
         )
         .expect("the check spares an empty layer");
         assert_eq!(stacks.types(1), &[]);
+    }
+
+    /// An r8 sidecar beside the table's file is refused by name under the
+    /// facts' `what`, the message listing the types the stacks are, whether
+    /// or not one of them is Q3_K: the table has no unpack from the
+    /// sidecar's layout. Without a sidecar the check passes. Mutants: the
+    /// refusal dropped — the no-Q3_K arm catches it; made only where no stack
+    /// is Q3_K — the Q3_K arm catches it.
+    #[test]
+    fn an_r8_sidecar_is_refused_whatever_the_stacks_are() {
+        let table = |plan: &ModelTensors| {
+            PlanStacks::of(
+                plan,
+                StackFacts {
+                    what: "of",
+                    names: three_names,
+                    check: None,
+                    empty: true,
+                    map_layers: None,
+                    unrouted: Vec::new(),
+                },
+            )
+            .expect("a table of complete layers")
+        };
+        let (q3, q4, q5, q6) = (
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+        );
+        let cases = [
+            (
+                plan(2, |l| {
+                    if l == 0 {
+                        [Some(q4), Some(q4), Some(q5)]
+                    } else {
+                        [Some(q4), Some(q4), Some(q6)]
+                    }
+                }),
+                format!("{q4}, {q5}, {q6}"),
+            ),
+            (
+                plan(1, |_| [Some(q3), Some(q3), Some(q4)]),
+                format!("{q3}, {q4}"),
+            ),
+        ];
+        for (plan, types) in cases {
+            let stacks = table(&plan);
+            assert!(
+                stacks.check_sidecar(false).is_ok(),
+                "no sidecar, of {types}"
+            );
+            match stacks.check_sidecar(true) {
+                Err(GpuError::Shape { what, detail }) => {
+                    assert_eq!(what, "of", "of {types}");
+                    assert!(
+                        detail.contains(&format!("routed stacks are {types}:")),
+                        "{detail}, of {types}"
+                    );
+                }
+                r => panic!("a sidecar is refused whatever the stacks, of {types}, got {r:?}"),
+            }
+        }
     }
 }

@@ -36,8 +36,8 @@ use bloomery_gpu_glm5next::Body;
 use cuda_core::DeviceBuffer;
 use gguf::{GgmlType, Split};
 use model::arch::glm5next::hparams::Hparams;
-use model::arch::glm5next::names;
 use model::arch::glm5next::place::{PlanInputs, card_routed};
+use model::arch::names::routed_stacks;
 
 /// The checks (i)–(iii) on `s`'s model, whose plan put `n_l[l]` card experts
 /// on layer `l`, of `experts` a layer; `budgeted` when the plan ran under a
@@ -86,7 +86,7 @@ fn card_lists(n_l: &[u64]) -> Result<Vec<Vec<u32>>, GateError> {
 fn readable_layers(split: &Split, hp: &Hparams) -> Vec<usize> {
     (hp.dense_lead..hp.n_trunk)
         .filter(|&l| {
-            stack_names(l).iter().all(|name| {
+            routed_stacks(l).iter().all(|name| {
                 split
                     .find(name)
                     .is_some_and(|(_, info)| card_routed(info.ty).is_some())
@@ -217,15 +217,6 @@ fn check_copy(gpu: &Gpu, body: &Body, lists: &[Vec<u32>]) -> Result<bool, GateEr
         println!("FAIL: check iii: {b}");
     }
     Ok(bad.is_empty())
-}
-
-/// Layer `l`'s routed gate, up and down names.
-fn stack_names(l: usize) -> [String; 3] {
-    [
-        names::ffn_gate_exps(l),
-        names::ffn_up_exps(l),
-        names::ffn_down_exps(l),
-    ]
 }
 
 /// `k` values of a fixed pattern in about [-1, 1], quantized to q8_1 on
@@ -383,7 +374,7 @@ fn check_slots(
         }
         let limit = hp.limit_exp[l];
         layers += 1;
-        let names = stack_names(l);
+        let names = routed_stacks(l);
         let stacks = [
             resident(w, &names[0])?,
             resident(w, &names[1])?,

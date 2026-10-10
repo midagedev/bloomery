@@ -17,6 +17,7 @@ pub mod deepseek41;
 pub mod dspark;
 pub mod glm5next;
 pub mod mimo2;
+pub mod names;
 pub mod qwen35moe;
 pub mod qwen3moe;
 mod stems;

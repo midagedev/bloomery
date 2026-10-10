@@ -20,29 +20,10 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::host::swap_source::{PlanStacks, StackFacts};
-use model::arch::glm5next::names;
 use model::arch::glm5next::place::PlanInputs;
+use model::arch::names::routed_stacks;
 
 pub use bloomery_gpu::host::swap_source::{DEADLINE, LIVE_DELAY};
-
-/// Layer `l`'s routed gate, up and down names.
-fn stack_names(l: usize) -> [String; 3] {
-    [
-        names::ffn_gate_exps(l),
-        names::ffn_up_exps(l),
-        names::ffn_down_exps(l),
-    ]
-}
-
-/// The r8 sidecar's refusal (`FileStacks::open`): the sidecar's format is
-/// Q3_K's alone and no stack of the file is one.
-fn no_sidecar() -> GpuError {
-    GpuError::State {
-        what: "glm5next::swap::stacks",
-        missing: "no r8 sidecar for GLM's stacks: the sidecar's format is Q3_K's alone \
-                  and no stack of the file is one (BLOOMERY_R8=off)",
-    }
-}
 
 /// The stacks of the layers `inputs` describes, their types read from its
 /// tensors, over GLM's facts: a layer may hold none of its stacks (a dense
@@ -61,12 +42,11 @@ pub fn stacks(
         &inputs.model,
         StackFacts {
             what: "glm5next::swap::stacks",
-            names: stack_names,
+            names: routed_stacks,
             check: None,
             empty: true,
             map_layers: Some(map_layers),
             unrouted: nextn.into_iter().collect(),
-            sidecar: no_sidecar,
         },
     )
 }
