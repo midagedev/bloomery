@@ -2140,7 +2140,9 @@ mod gate {
     /// reset route answers 200 and prints its `residency reset` record;
     /// and, after a one-id flush, the draft's width chooser (`cost`, the
     /// unset lever) prints its `mtp width` record as the chooser's own
-    /// aggregate.
+    /// aggregate. The fixture tier defers that last clause by name: beside
+    /// the fixture's card budget the unset rule leaves the draft off, so no
+    /// chooser runs, and the draft is the real file's in any case.
     fn slots_default_residency(dir: &Path, ok: &mut bool) -> Result<bool, GateError> {
         let own = dir.join("slots-default");
         std::fs::create_dir_all(&own)?;
@@ -2348,17 +2350,20 @@ mod gate {
             parsed.push((rec.u64("windows")?, widths, rec.f64("e")?));
         }
         println!("slots-default flushed {flushed}: mtp width (windows, widths, e) {parsed:?}");
-        check(
-            ok,
-            "slots_default_width_record_is_the_choosers",
-            adaptive
-                && flushed
-                && !parsed.is_empty()
-                && parsed.iter().any(|(w, _, _)| *w > 0)
-                && parsed.iter().all(|(w, widths, e)| {
-                    *w == widths.iter().skip(1).sum::<u64>() && (*w == 0 || (1.0..=4.0).contains(e))
-                }),
-        );
+        if tier::run_clause("slots_default_width_record_is_the_choosers", Tag::FileBound)? {
+            check(
+                ok,
+                "slots_default_width_record_is_the_choosers",
+                adaptive
+                    && flushed
+                    && !parsed.is_empty()
+                    && parsed.iter().any(|(w, _, _)| *w > 0)
+                    && parsed.iter().all(|(w, widths, e)| {
+                        *w == widths.iter().skip(1).sum::<u64>()
+                            && (*w == 0 || (1.0..=4.0).contains(e))
+                    }),
+            );
+        }
         // The reset route answers on the seat's residency: a 200 whose `diff`
         // is 0, and the server prints its `residency reset` record with the
         // same counts. FAIL-first: a seat whose open runs no machine answers
@@ -2622,8 +2627,14 @@ mod gate {
     /// window's rows, and at least one pass of a width below the draft's
     /// own (the warm-up rotation's measurements, on this server too). The
     /// per-window width is the CLI gate's clause (its window records); this
-    /// server's records are the chooser's aggregates.
+    /// server's records are the chooser's aggregates. The fixture tier
+    /// defers the four clauses by name: the draft is the real file's, which
+    /// proposes nothing a random target accepts, and the fixture's card
+    /// budget holds no slot of the gate's context beside it.
     fn width_cost(dir: &Path, prompt: &str, reference: &[u32]) -> Result<bool, GateError> {
+        if !tier::run_clause("width_cost", Tag::FileBound)? {
+            return Ok(true);
+        }
         let own = dir.join("width-cost");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
