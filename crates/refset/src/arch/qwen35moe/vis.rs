@@ -6,6 +6,7 @@
 //! file or its projector.
 
 use super::{ARCH, MODEL};
+use crate::RefError;
 use crate::clefvis::{Profile, QVIS_LCPP_BUILD, vis_families};
 
 /// The projector every Qwen3.6 image-input set is dumped with: lmstudio-community's bf16 file, the repository
@@ -28,13 +29,13 @@ pub static PROFILE: Profile = Profile {
 };
 
 /// [`MMPROJ_BF16`], as a tower family's `runs`.
-fn mmproj() -> String {
-    MMPROJ_BF16.to_string()
+fn mmproj() -> Result<String, RefError> {
+    Ok(MMPROJ_BF16.to_string())
 }
 
 /// [`MODEL`], as a prompt family's `runs`.
-fn model() -> String {
-    MODEL.to_string()
+fn model() -> Result<String, RefError> {
+    Ok(MODEL.to_string())
 }
 
 vis_families! {
