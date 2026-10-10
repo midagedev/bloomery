@@ -7839,6 +7839,7 @@ def orphan_self_test(expect, real: Side) -> None:
     # how many there are is the scan's own count of them, not a number spelled here
     gg_lib = next(t.src for t in real.tree.packages["bloomery-gpu-gates"].targets if t.kind == "lib")
     n_bind = sum(1 for t in TestScan(real.tree).tests_of(gg_lib)[0] if t.path.startswith("bind::"))
+    n_vseat = sum(1 for t in TestScan(real.tree).tests_of(gg_lib)[0] if t.path.startswith("vision_seat::"))
     expect(n_bind > 0, "orphan scan: the tree holds no bind:: test for the FAIL-first clause to orphan")
     orphans, errors, checked = orphan_tests(real.tree, real.recipes)
     expect(not errors, f"orphan scan on the real tree: {errors[:3]}")
@@ -7857,7 +7858,7 @@ def orphan_self_test(expect, real: Side) -> None:
                 fh.write(text[: m.start()] + text[m.end() :])
             got = set(orphan_tests(real.tree, load_justfile(p))[0]) - base
             bind = [o for o in got if " bind::tests::" in o]
-            expect(len(bind) == n_bind and len(got) == n_bind and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (no feature)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
+            expect(len(bind) == n_bind and len(got) == n_bind + n_vseat and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (no feature)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
         # (c) a filter that matches nothing of its module: the tests only that filter reached go red
         for pat in (r"--lib -- (bind::)'", r"--ignored (hw_ds41_oracle) "):
             m = re.search(pat, text)

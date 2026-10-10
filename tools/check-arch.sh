@@ -128,6 +128,10 @@ dispatch=(
   # Hparams::read refuses a non-deepseek41v file by name, and the delimiter names and the card
   # figure it reads are the tower's own.
   'crates/gpu-gates/src/ds41_media.rs use'
+  # The vision seat's one table that maps a projector type (`clip.projector_type`) to its host crate's module: the ids
+  # its span carries, the text rope it needs, the row width and the image-token cap are that module's own facts.
+  'crates/gpu-gates/src/vision_seat.rs use'
+  'crates/gpu-gates/src/vision_seat.rs fn rules'
   # CPU 디코드 바이너리: Arch::detect 로 다른 아키텍처를 거절한 뒤 deepseek2 순전파를 돈다.
   'crates/model/src/bin/bloomery-decode.rs use'
   # r8 사이드카 변환기: Hparams::read 가 deepseek41 이 아닌 파일을 이름 붙여 거절한 뒤 V4.1 의 routed 술어를 쓴다.

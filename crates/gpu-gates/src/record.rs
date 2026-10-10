@@ -2778,6 +2778,22 @@ pub static SLOT_CALL: Kind = Kind {
     ],
 };
 
+/// A serve seat's resident image encoder after its load (`vision_seat::record`).
+pub static VISION: Kind = Kind {
+    name: "vision",
+    head: "vision",
+    doc: "The resident image encoder after its load: the card it sits on and whether that card is off the plan or the stage card's reserve, its weight and activation bytes, where the activations live (its own buffers or the prompt's arena), the most image tokens one image takes, and the load's seconds.",
+    parts: &[
+        key("card", Word, ""),
+        key("seat", Word, ""),
+        key("weights", U64, "B"),
+        key("scratch", U64, "B"),
+        key("scratch_home", Word, ""),
+        key("cap", U64, "tokens"),
+        key("load_s", F64(1), "s"),
+    ],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {
@@ -3010,6 +3026,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
+    &VISION,
     &LISTENING,
     &CACHE_REUSE,
     &CACHE_SAVE,

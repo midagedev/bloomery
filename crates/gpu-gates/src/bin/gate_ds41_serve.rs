@@ -177,7 +177,7 @@
 //!
 //! - the server of [`SERVER_ARGS`] with `--mmproj <the vision set's encoder
 //!   file>` (the one `gate-gpu-vision` and `gate-gpu-ds41-media` load): (a)
-//!   `/props`' `modalities.vision` is true, and its `vision` line names the
+//!   `/props`' `modalities.vision` is true, and its `vision` record names the
 //!   encoder's card — a card the plan leaves off it, not the stage card —
 //!   and the bytes of the encoder's card figure
 //!   (`vision::arch::deepseek41v::card`) as weights and
@@ -193,12 +193,12 @@
 //! - a server of [`BP_SERVER_ARGS`] with the same `--mmproj` and no draft
 //!   (`BLOOMERY_RESIDENCY=off`, the fixed placement): every held card is on
 //!   the plan, so the encoder takes a named reserve on the stage card — its
-//!   `vision` line says so and names the stage card, `/props`' vision is
+//!   `vision` record says so and names the stage card, `/props`' vision is
 //!   true, and its placement's bytes are the gate's own plan (b′) of the
 //!   file with that reserve (the encoder displaces experts from the stage
 //!   card to the host, so the reserve is in the bytes, not beside them);
 //! - a server of [`SERVER_ARGS`] with no `--mmproj` (d): its `/props`
-//!   `modalities.vision` is false, its stderr holds no `vision` line, and
+//!   `modalities.vision` is false, its stderr holds no `vision` record, and
 //!   its per-card bytes are what `place.machine` gives for the same
 //!   arguments with no reserve ([`props_engine`]'s own check) — a structural
 //!   check within this one run, not a golden file.
@@ -1775,30 +1775,20 @@ mod gate {
         })
     }
 
-    /// The server's `vision` line (the seat's `open_encoder`'s), as its card,
-    /// its seat word and its bytes; `None` when the server printed none.
+    /// The server's `vision` record (the seat's `open_encoder`'s,
+    /// [`record::VISION`]), as its card, its seat word and its bytes; `None`
+    /// when the server printed none.
     fn vision_line(err_log: &Path) -> Result<Option<(String, String, u64, u64)>, GateError> {
-        let text = std::fs::read_to_string(err_log)?;
-        let Some(line) = text.lines().find(|l| l.starts_with("vision ")) else {
+        let Some(f) = server_log(err_log, record::BLOOMERY_SERVE_DS41)?.first(&record::VISION)?
+        else {
             return Ok(None);
         };
-        let (mut card, mut seat, mut weights, mut scratch) =
-            (String::new(), String::new(), None, None);
-        for f in line.split_whitespace() {
-            match f.split_once('=') {
-                Some(("card", v)) => card = v.to_owned(),
-                Some(("seat", v)) => seat = v.to_owned(),
-                Some(("weights", v)) => weights = v.parse::<u64>().ok(),
-                Some(("scratch", v)) => scratch = v.parse::<u64>().ok(),
-                _ => {}
-            }
-        }
-        match (weights, scratch) {
-            (Some(weights), Some(scratch)) if !card.is_empty() && !seat.is_empty() => {
-                Ok(Some((card, seat, weights, scratch)))
-            }
-            _ => Err(format!("the server's vision line does not parse: {line}").into()),
-        }
+        Ok(Some((
+            f.word("card")?.to_owned(),
+            f.word("seat")?.to_owned(),
+            f.u64("weights")?,
+            f.u64("scratch")?,
+        )))
     }
 
     /// Which encoder seat this card view leaves `place` (the seat's own

@@ -50,6 +50,9 @@ pub mod serve_client;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
 pub mod tier;
+// The image encoder's pieces the serve seats share; the tower itself is `bloomery-gpu-vision`'s, behind `vision`.
+#[cfg(any(feature = "vision", feature = "deepseek41"))]
+pub mod vision_seat;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
