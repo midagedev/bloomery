@@ -157,6 +157,42 @@ Copied from `AGENTS.md`, Conventions:
 
 MiMo shows the rule at work: the body copied helpers, and the next commit gave each one an owner (`69ce7cb7`).
 
+## The common-owner table: fill it in before the body
+
+A model's spec, and its pull request, open with one row for each common owner below. Each row says one of three
+things:
+- **attaches**: the model plugs into the owner;
+- **already attached**: the owner works for the model with no new code;
+- **does not attach**: the row names the architecture fact that forces this.
+
+"Later" is not a value. A row left for later needs a maintainer to cut it explicitly, and the cut is written into the
+row.
+
+The rule exists because skipping a row costs twice:
+- you pay once in a slower first version;
+- you pay again in a copy that someone has to lift later.
+
+MiMo's first card-expert design skipped two rows, with these results:
+- **The card leg.** The design planned a fourth copy of the leg, when three already existed (GLM's
+  `crates/gpu-glm5next/src/ffn.rs:503`, Qwen3.8's `crates/gpu/src/arch/qwen3moe/card38.rs`, V4.1's
+  `crates/gpu-deepseek41/src/chain/ffn/batch.rs`).
+- **Residency.** The design placed experts statically, by id. The common residency machine never ran:
+  `crates/gpu-mimo2/src/body.rs:961` still returns `None`. The predicted gain was smaller than it had to be.
+
+| Owner | Where it lives | How a model attaches |
+|---|---|---|
+| Placement plan | `placement::plan_routed` (`crates/placement/src/placement.rs:1771`) | Pass the model's card rule; no model-owned planner |
+| Kernel table | `crates/placement/src/kernels.rs` | A quant type gets a row there; the body dispatches through the table, never by matching `GgmlType` itself |
+| Card expert leg | Each family's own today (the three files above) | Call an existing leg, or lift it to a common owner in `crates/gpu`; never add a copy |
+| Residency (hot experts move to the card at run time) | `crates/gpu/src/host/served.rs` (`TierBody::residency_parts`, `ResidencyParts`) | The body's `residency_parts` returns `Some`; glue like GLM's `crates/gpu-glm5next/src/swap.rs` (72 lines) |
+| Expert tier (a second card holds experts) | `crates/gpu/src/host/tier.rs` | Glue like `crates/gpu-glm5next/src/tier.rs` or `crates/gpu/src/arch/qwen3moe/tier38.rs` |
+| Prompt walk | `crates/runtime/src/prompt.rs` | The body implements the walk's hooks; no per-model prompt loop |
+| Resident slots (`--parallel N`) | `crates/gpu/src/model/slots.rs` (`Slots`), `crates/placement/src/slots.rs` | `impl Slots` for the body |
+| Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/` | One seat file per model, shaped like `glm.rs` or `mimo2.rs` |
+| Timing | The lease runners in `tools/ref/` | Through the serve seat or an existing runner; no per-model timing driver |
+
+If a row needs a copy of another model's code, stop and say so in the issue: that copy is a lift to do first.
+
 ## Where you stop today
 
 Steps 1, 2 (code), 8, 9 and the bookkeeping of 10 you can do and verify on an x86_64 Linux machine. Steps 3 and 4
