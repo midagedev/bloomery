@@ -12,6 +12,12 @@
 # clears ~7.8 GB/s — t(m) = max(W, a + c·m) at m = 1 has W 92-99 µs (13.37 MB
 # per expert at 135-145 GB/s) against a + c = 40.4 + 30.2 µs, so the leg tips
 # only at c' <= 51.8 µs per expert-column.
+# Measured 2026-10-10 (the m2-mxfp4-tile sitting, qdot-rate, one pinned core, 3
+# rounds; witness loadavg ~13, not a quiet box): the band ~~12.8-14.6~~ GB/s
+# below is struck; 10.1-10.2 GB/s at k = 2048 and 10.4-10.8 at k = 4096, under
+# the band and above the 7.8 break-even (decide-in's DRAM-bound leg holds; the
+# "between 7.8 and 12.8" branch: profile qdot-rate first); ik's mxfp4_x4_rate
+# 11.1-11.4 GB/s at k = 2048 in the same lease.
 kind: calibration
 question: does the MXFP4 x Q8_2_X4 dot's single-core rate keep MiMo-V2.6-Flash's
   decode host leg bound by host DRAM — per-core rate at or above the ~7.8 GB/s

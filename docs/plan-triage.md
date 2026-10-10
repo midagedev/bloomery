@@ -465,6 +465,14 @@ through R4 (worker1's train 2 carries R3a and the lifts), then the user-facing p
   `gate-gpu-qwen38-residency` (inline exit-66 guard instead of `real-only.sh`), and this one. Next after the fixture
   tier: fxr2 sitting (worker2, started 00:30:54).
 
+### What W3's R8a left (worker3, 10-10)
+- **The MXFP4 one-column dot runs under its assumed rate (tracker; profile first).** `qdot-rate` on one pinned core,
+  3 rounds (m2-mxfp4-tile sitting, 10-10 04:19Z, loadavg ~13, not a quiet box): `dot_mxfp4_q82x4_avx2` 10.1–10.8 GB/s
+  against the 12.3–13.1 the R8 design assumed, and ~5–9 % under ik's `mxfp4_x4_rate` at k = 2048 (10.1 vs 11.1–11.4).
+  Still above the 7.8 GB/s break-even, so MiMo's decode host leg stays DRAM-bound and R5 stays next. First step:
+  `perf -e cpu-clock` on `qdot-rate`'s MXFP4 rows beside ik's x4 kernel, before any kernel round. The C = 8 tile's
+  ratio to the one-column dot is 0.51 (105.0 ns per row-column at k = 4096), so the tile holds; the miss is the base.
+
 ## After 0.2.8 (10-09, leader — the post-tag train: paged2, bpslots, levphase, loadchain + packsched, roomneed, stepunion2, binslots)
 
 ### What paged1 and pagedoff left
