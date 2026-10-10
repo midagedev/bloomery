@@ -19,8 +19,8 @@ pub const V2LITE_MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf"
 /// The harness built by `tools/ref/build-dequant.sh` against ik's `libggml.so`
 /// (`/home/user/ik_llama.cpp`): the executable's bytes follow
 /// `dequant_ref.cpp` and the compiler, the library's follow ik's build.
-// PIN(2026-10-08): the dequant_ref and libggml.so of /home/user/ik_llama.cpp.
-pub const BUILD: &str = "dequant_ref e265fd2f62e16c4f8c5ebc5d28705f41 \
+// PIN(2026-10-10): the dequant_ref (with IQ3_S in --synthetic) and libggml.so of /home/user/ik_llama.cpp.
+pub const BUILD: &str = "dequant_ref 26743c698bb627717351fab4dde24272 \
                          libggml.so 75ce969e36e0fd4d520b5086a16c8b57";
 
 /// The first rows of one tensor of each type of the V2-Lite file. The set has

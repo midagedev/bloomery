@@ -4,11 +4,11 @@ use crate::family::{Build, Family, Identity};
 use crate::md5::hex_of;
 use std::path::{Path, PathBuf};
 
-const BINARY_MD5: &str = "e265fd2f62e16c4f8c5ebc5d28705f41";
+const BINARY_MD5: &str = "26743c698bb627717351fab4dde24272";
 const LIBRARY_MD5: &str = "75ce969e36e0fd4d520b5086a16c8b57";
 const OTHER_MD5: &str = "0128e83c5e71e5f2b72f3d5d2c2de6b2";
 const MODEL: &str = "/models/small/M.gguf";
-const PIN: &str = "dequant_ref e265fd2f62e16c4f8c5ebc5d28705f41 \
+const PIN: &str = "dequant_ref 26743c698bb627717351fab4dde24272 \
                    libggml.so 75ce969e36e0fd4d520b5086a16c8b57";
 
 fn model() -> Result<String, RefError> {
