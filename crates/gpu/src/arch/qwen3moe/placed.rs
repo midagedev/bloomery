@@ -290,18 +290,12 @@ impl Placed {
             embd: shape.hidden,
             ff: shape.ff,
         };
-        let mut experts = {
-            // The NVMe expert tier of a paged plan, built by the common
-            // chain and attached to the run before its first call: the
-            // plan's host segments keep the mapping, every other id the
-            // arena serves.
-            let tier = crate::model::nvme_tier(o.plan, &o.file, o.host.r8)?;
-            let mut experts = HostRun::build(o.file, 0, o.host.r8, widths, |src| {
-                model::arch::qwen35moe::host::routed_layers(src, dims, 0..n, o.arch)
-            })?;
-            experts.attach_tier(tier)?;
-            experts
-        };
+        // The common chain's host-run build: a paged plan's NVMe expert tier
+        // is attached before the run's first call, the plan's host segments
+        // keep the mapping and every other id the arena serves.
+        let mut experts = crate::model::host_run(o.plan, &o.file, 0, o.host.r8, widths, |src| {
+            model::arch::qwen35moe::host::routed_layers(src, dims, 0..n, o.arch)
+        })?;
         experts.prepare_union(MAX_PASS_ROWS)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
