@@ -7,7 +7,7 @@
 //! A6000 first, so a term restated wrong fails here before any large-card
 //! figure is read.
 
-use bloomery_levers::{Residency38Pick, Residency38Why, residency38_at_plan};
+use bloomery_levers::{PlanTier, Residency38Pick, Residency38Why, residency38_at_plan};
 use gguf::GgmlType;
 
 use super::churn::ChurnPool;
@@ -350,13 +350,17 @@ const UBATCH_PLANNED: u64 = 4096;
 /// yet); the box's own is [`PLAN_ROOM`].
 const SCOPE_61G: u64 = 61 << 30;
 
-/// The unset residency rule on `plan` with `MemAvailable` ample
-/// (`residency38_at_plan`), and its churn pool's bytes.
+/// The unset residency rule on `plan` (`residency38_at_plan`, fed the plan's
+/// NVMe tier terms) with `MemAvailable` ample, and its churn pool's bytes.
 fn residency(plan: &Plan<'_>) -> (Residency38Pick, u64) {
     let pool = |pinned| ChurnPool::of(plan, 0, pinned).map(|p| p.bytes);
     let pick = residency38_at_plan(
         plan.n_l.iter().copied(),
         plan.host.experts,
+        PlanTier {
+            paged: plan.host.nvme_expert_bytes,
+            arena: plan.host.nvme_arena_bytes,
+        },
         pool,
         plan.host.headroom_bytes,
         i128::MAX,
@@ -1033,12 +1037,15 @@ fn a_split_leaves_the_run_ahead_window() {
 
 /// A churn pool leaves out the stacks the plan pages to the NVMe tier, whose
 /// victims the tier's arena serves: on both paged gate plans every layer
-/// pages, the pool is empty and the unset rule resolves `mid-p0-s1`, while
-/// the unsplit twin keeps its whole pool.
+/// pages and the pool at P 0 is empty, while the unsplit twin keeps its whole
+/// pool. The unset rule on the plan that pages through an arena (27 GiB) is
+/// `off`, its why the plan's own paged and arena bytes; on the plan whose
+/// tier has no arena, the mapping path (58 GiB), it resolves `mid-p0-s1` over
+/// that empty pool.
 #[test]
 fn a_paged_stack_adds_nothing_to_the_churn_pool() {
     let (q4, gate) = (model(false), machine_a(RTX_3090));
-    for room in [27u64 << 30, 58 << 30] {
+    for (room, arena) in [(27u64 << 30, true), (58 << 30, false)] {
         let split = plan_at(&q4, &gate, 4096, 1, room).expect("the split plan");
         let twin = plan_with(&q4, &gate, 4096, 1, room, false).expect("the unsplit plan");
         assert!(
@@ -1048,12 +1055,29 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
         let pool = |p: &Plan<'_>| ChurnPool::of(p, 0, 0).expect("the pool").bytes;
         assert_eq!(pool(&split), 0, "room {room}: the paged plan's pool");
         assert!(pool(&twin) > 0, "room {room}: the unsplit twin's pool");
-        let (pick, bytes) = residency(&split);
         assert_eq!(
-            (pick.word(), bytes),
-            ("mid-p0-s1".to_string(), 0),
-            "room {room}: the unset rule on the paged plan"
+            split.host.nvme_arena_bytes > 0,
+            arena,
+            "room {room}: the arena"
         );
+        let (pick, bytes) = residency(&split);
+        if arena {
+            let why = Residency38Why::Paged {
+                paged: split.host.nvme_expert_bytes,
+                arena: split.host.nvme_arena_bytes,
+            };
+            assert_eq!(
+                pick,
+                Residency38Pick { pinned: None, why },
+                "room {room}: the unset rule on the plan that pages through an arena"
+            );
+        } else {
+            assert_eq!(
+                (pick.word(), bytes),
+                ("mid-p0-s1".to_string(), 0),
+                "room {room}: the unset rule on the paged plan"
+            );
+        }
     }
 }
 

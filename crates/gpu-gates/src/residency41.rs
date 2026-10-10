@@ -5,6 +5,7 @@
 //! (`residency38::residency38`, `serve_seats::glm`).
 
 use crate::GateError;
+use crate::residency38::plan_tier;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_levers::{ResidencyPick, residency_at_plan, residency_word};
@@ -26,6 +27,7 @@ pub fn at_plan(plan: &Plan<'_>, pick: ResidencyPick) -> Result<ResidencyPick, Ga
     Ok(residency_at_plan(
         pick,
         plan.n_l.iter().copied(),
+        plan_tier(plan),
         |pinned| {
             swap::churn(plan, 0, Residency::Mid { pinned, spares })
                 .map(|pool| pool.expect("churn under mid holds a pool").bytes)
