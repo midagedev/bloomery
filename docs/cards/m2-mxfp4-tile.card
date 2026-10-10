@@ -1,0 +1,38 @@
+# The MXFP4 C = 8 tile's one-core rate, never measured. Prediction [derived, the
+# R8 design's §5]: the tile shares the weight-side decode (lut4_codes, the E8M0
+# pair) across eight columns, leaving per column the activation loads, four
+# maddubs/madd pairs, the unpack tree and one FMA: the census reads 32.5
+# instructions a column per x4 group against the one-column kernel's ~65 (32 fixed + 32.5)
+# (release asm at C = 2..4, 97/129/162 a group), so a column costs 0.52-0.62
+# of a one-column dot. With the one-column rate 12.3-13.1 GB/s
+# (m2-mxfp4-rate.card's band), the tile's column-weighted rate is 21-25 GB/s at
+# k = 4096 (2176 B a row) and 20-24 at k = 2048: per row-column 2176 B / 21-25
+# GB/s = 87-104 ns at k = 4096 [derived].
+kind: calibration
+question: does the MXFP4 C = 8 tile cut the host union's per-column cost to
+  the R8c bound (c_tile <= ~23.5 us a slot), its per row-column time at
+  k = 4096 inside the predicted band?
+term: qdot-rate's `MXFP4 tile C=8 k=4096` row, ns per row-column, single
+  thread on one pinned core (BLOOMERY_RATE_CORE), 360,448 rows; the k = 2048
+  row (predicted 45-54 ns) read beside it, the rounds alternating with ik's
+  rate harnesses in one lease
+unit: ns
+predict: 87..104
+condition: worker3 runs, on the lead's go,
+  BLOOMERY_REMOTE='~/repo/bloomery-w3r8a'
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/m2-mxfp4-tile.card'
+  just measure-qdot-rate 3 on this tree (branch w3r8a) — the recipe builds
+  qdot-rate itself, the runner pins one core and reverses arm order every
+  round, and the witness shows no other compute on the box
+reason: sets c_tile, the MXFP4 per-column cost of the host union under
+  R8b's batch walk (c_tile = (8.913/r4096 + 4.456/r2048)/32 x k_clock x
+  k_batch), which decides R8c's default group and the R8 prediction (4K TTFT
+  53 s at G1, 40 s at G2); why now: R8b is in flight and R8c opens on this
+  number
+decide-in: c_tile <= ~23.5 us: R8c holds ~5x at the centre; land group 2 as
+  MiMo's default
+decide-below: faster than 87 ns: the card front becomes G1's wall; R8e (the
+  GEMM front lift) comes next after R8c
+decide-above: slower than 104 ns: up to 121 ns read k_batch from R8b's first
+  functional run before deciding R8c; past 121 ns ship R8a + R8b at ~3.9x and
+  open a C = 4 / spill profile of the tile
