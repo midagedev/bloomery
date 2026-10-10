@@ -28,6 +28,23 @@ pub const PAIRS: usize = HEAD_DIM / 2;
 const PER_AXIS: usize = PAIRS / 2;
 const BLOCK: u32 = 256;
 
+/// The patches `(row, column)` of an `n_h × n_w` grid in raster order.
+pub fn raster(n_h: usize, n_w: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..n_h).flat_map(move |h| (0..n_w).map(move |w| (h, w)))
+}
+
+/// The patches `(row, column)` of an `n_h × n_w` grid in merge order: groups of `merge × merge`
+/// patches in raster order, the patches of a group in raster order inside it — the order of the
+/// vision crate's `PatchLayout` with a `merge` above one.
+pub fn merge_order(n_h: usize, n_w: usize, merge: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..n_h / merge).flat_map(move |gy| {
+        (0..n_w / merge).flat_map(move |gx| {
+            (0..merge)
+                .flat_map(move |dy| (0..merge).map(move |dx| (gy * merge + dy, gx * merge + dx)))
+        })
+    })
+}
+
 /// Per patch, the `(cos, sin)` of its [`PAIRS`] angles, patch-major: pair `j` of patch `p` at
 /// `cs[2·(p·PAIRS + j) ..]`.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +62,18 @@ impl RopeTable {
     /// `cos` and `sin` of that f32 angle, correctly rounded.
     #[must_use]
     pub fn new(n_h: usize, n_w: usize, theta: f32) -> RopeTable {
+        RopeTable::in_order(n_h, n_w, raster(n_h, n_w), theta)
+    }
+
+    /// The table of the patches `coords` (each `(row, column)` of an `n_h × n_w` grid, in the
+    /// order the rows are wanted) at RoPE base `theta`, by [`RopeTable::new`]'s rule.
+    #[must_use]
+    pub fn in_order(
+        n_h: usize,
+        n_w: usize,
+        coords: impl IntoIterator<Item = (usize, usize)>,
+        theta: f32,
+    ) -> RopeTable {
         let freq: Vec<f32> = (0..PER_AXIS)
             .map(|i| {
                 let e = (2 * i) as f32 / PAIRS as f32;
@@ -53,13 +82,11 @@ impl RopeTable {
             })
             .collect();
         let mut cs = Vec::with_capacity(n_h * n_w * 2 * PAIRS);
-        for h in 0..n_h {
-            for w in 0..n_w {
-                for (j, pos) in (0..PAIRS).map(|j| (j, if j < PER_AXIS { h } else { w })) {
-                    let a = pos as f32 * freq[j % PER_AXIS];
-                    cs.push(f64::from(a).cos() as f32);
-                    cs.push(f64::from(a).sin() as f32);
-                }
+        for (h, w) in coords {
+            for (j, pos) in (0..PAIRS).map(|j| (j, if j < PER_AXIS { h } else { w })) {
+                let a = pos as f32 * freq[j % PER_AXIS];
+                cs.push(f64::from(a).cos() as f32);
+                cs.push(f64::from(a).sin() as f32);
             }
         }
         RopeTable { n_h, n_w, cs }
@@ -105,6 +132,10 @@ pub fn rope_ref(x: &mut [u16], row_width: usize, col0: usize, n_heads: usize, ta
 mod rope2d_kernels {
     use super::*;
 
+    /// A second head width is its own entry (`vis_rope2d_h72`), not this body made generic: a
+    /// kernel body moved into an inline helper changes its PTX (docs/upstream/nvlabs-ledger.md
+    /// row 39) and this entry's md5 is held.
+    ///
     /// Turn the query and key heads of a `[n, row_width]` bf16 buffer in place: the `n_heads`
     /// heads at columns `q0 + h·64` and those at `k0 + h·64` of every row, pair `j` of patch `p`
     /// by table entry `cs[2·(p·32 + j) ..]`. One thread per (patch, q-or-k, head, pair); the
@@ -232,6 +263,221 @@ impl RopeKernels {
             .module
             .prepare_vis_rope2d(LaunchConfig1D::new(grid, BLOCK, 0))?;
         self.module.vis_rope2d(
+            stream,
+            &prep,
+            cs,
+            launch_u32(what, "n", n)?,
+            launch_u32(what, "row_width", row_width)?,
+            launch_u32(what, "q0", q0)?,
+            launch_u32(what, "k0", k0)?,
+            launch_u32(what, "n_heads", n_heads)?,
+            x,
+        )?;
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------- heads of 72 (the Qwen3-VL tower)
+
+/// Values in one attention head of the Qwen3-VL tower.
+pub const HEAD_DIM_72: usize = 72;
+/// Pairs one such head turns: half the head, each pair `(x[j], x[j + 36])`.
+pub const PAIRS_72: usize = HEAD_DIM_72 / 2;
+/// Angles per axis: the rows take `PAIRS_72 / 2`, the columns the rest.
+const PER_AXIS_72: usize = PAIRS_72 / 2;
+
+/// Per patch, the `(cos, sin)` of its [`PAIRS_72`] angles, in the order of the patches the table
+/// was built over: pair `j` of patch `p` at `cs[2·(p·PAIRS_72 + j) ..]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RopeTable72 {
+    pub n_h: usize,
+    pub n_w: usize,
+    pub cs: Vec<f32>,
+}
+
+impl RopeTable72 {
+    /// The table of the patches `coords` (each `(row, column)` of an `n_h × n_w` grid) at RoPE
+    /// base `theta`, as llama.cpp's vision RoPE builds its cache in f32
+    /// (`ggml_mrope_cache_init`): `theta_scale = theta^(−2/36)`; the angle of pair `k` of an axis
+    /// is the position times `theta_scale^k`, formed by multiplying the running angle by
+    /// `theta_scale` once per pair (the first eighteen pairs take the row, the next eighteen the
+    /// column, each axis starting again from its own position); `cos` and `sin` of
+    /// that f32 angle, correctly rounded.
+    #[must_use]
+    pub fn in_order(
+        n_h: usize,
+        n_w: usize,
+        coords: impl IntoIterator<Item = (usize, usize)>,
+        theta: f32,
+    ) -> RopeTable72 {
+        let theta_scale = f64::from(theta).powf(f64::from(-2.0f32 / PAIRS_72 as f32)) as f32;
+        let mut cs = Vec::with_capacity(n_h * n_w * 2 * PAIRS_72);
+        for (y, x) in coords {
+            for pos in [y, x] {
+                let mut angle = pos as f32;
+                for _ in 0..PER_AXIS_72 {
+                    cs.push(f64::from(angle).cos() as f32);
+                    cs.push(f64::from(angle).sin() as f32);
+                    angle *= theta_scale;
+                }
+            }
+        }
+        RopeTable72 { n_h, n_w, cs }
+    }
+
+    /// Patches the table covers.
+    #[must_use]
+    pub fn patches(&self) -> usize {
+        self.cs.len() / (2 * PAIRS_72)
+    }
+}
+
+/// The host rule over a whole `[patches, row_width]` bf16 buffer, in place, for heads of 72:
+/// every head `h` of `n_heads` at column `col0 + h·72` of every row turned by its patch's table row.
+pub fn rope_72_ref(
+    x: &mut [u16],
+    row_width: usize,
+    col0: usize,
+    n_heads: usize,
+    table: &RopeTable72,
+) {
+    for p in 0..table.patches() {
+        for h in 0..n_heads {
+            let base = p * row_width + col0 + h * HEAD_DIM_72;
+            for j in 0..PAIRS_72 {
+                let (c, s) = (
+                    table.cs[2 * (p * PAIRS_72 + j)],
+                    table.cs[2 * (p * PAIRS_72 + j) + 1],
+                );
+                let (y1, y2) = rope_pair_ref(x[base + j], x[base + j + PAIRS_72], c, s);
+                x[base + j] = y1;
+                x[base + j + PAIRS_72] = y2;
+            }
+        }
+    }
+}
+
+#[cuda_module]
+mod rope2d_72_kernels {
+    use super::*;
+
+    /// `vis_rope2d`'s rule for heads of 72 values (36 pairs):
+    /// turn the query and key heads of a `[n, row_width]` bf16 buffer in place, the `n_heads`
+    /// heads at columns `q0 + h·72` and those at `k0 + h·72` of every row, pair `j` of patch `p`
+    /// by table entry `cs[2·(p·36 + j) ..]`. One thread per (patch, q-or-k, head, pair). A new
+    /// entry, not the V4.1 body with a wider constant: moving that body into a shared inline
+    /// helper changes its PTX (docs/upstream/nvlabs-ledger.md row 39), and its md5 is held.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= n * row_width, cs.len() >= n * 72)
+    )]
+    pub fn vis_rope2d_h72(
+        cs: &[f32],
+        n: u32,
+        row_width: u32,
+        q0: u32,
+        k0: u32,
+        n_heads: u32,
+        mut x: DisjointSlice<u16>,
+    ) {
+        let i = thread::index_1d().get();
+        let per_patch = 2 * n_heads as usize * PAIRS_72;
+        if i >= n as usize * per_patch {
+            return;
+        }
+        let p = i / per_patch;
+        let r = i - p * per_patch;
+        let which = r / (n_heads as usize * PAIRS_72); // 0 query, 1 key
+        let r = r - which * n_heads as usize * PAIRS_72;
+        let h = r / PAIRS_72;
+        let j = r - h * PAIRS_72;
+        let col0 = if which == 0 { q0 } else { k0 } as usize;
+        let a = p * row_width as usize + col0 + h * HEAD_DIM_72 + j;
+        let t = 2 * (p * PAIRS_72 + j);
+        // SAFETY: p < n and j < 36 put t + 1 below 72·n <= cs.len() (contract).
+        let (c, s) = unsafe { (*cs.get_unchecked(t), *cs.get_unchecked(t + 1)) };
+        // SAFETY: p < n and col0 + h·72 + 72 <= row_width (host-checked) bound a and a + 36
+        // below n·row_width <= x.len(); this thread is the only one touching them.
+        let (x1, x2) = unsafe {
+            (
+                bf16_to_f32(*x.get_unchecked_mut(a)),
+                bf16_to_f32(*x.get_unchecked_mut(a + PAIRS_72)),
+            )
+        };
+        let y1 = add_rn_f32(mul_rn_f32(x1, c), -mul_rn_f32(x2, s));
+        let y2 = add_rn_f32(mul_rn_f32(x2, c), mul_rn_f32(x1, s));
+        // SAFETY: the same two positions as the reads.
+        unsafe {
+            *x.get_unchecked_mut(a) = f32_to_bf16_rne(y1);
+            *x.get_unchecked_mut(a + PAIRS_72) = f32_to_bf16_rne(y2);
+        }
+    }
+}
+
+/// The loaded RoPE module for heads of 72.
+pub struct Rope72Kernels {
+    module: rope2d_72_kernels::LoadedModule,
+}
+
+impl Rope72Kernels {
+    /// Load this file's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<Rope72Kernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the module above; the
+        // launcher checks its launch contract.
+        let module = unsafe { bloomery_gpu::shared_module!(rope2d_72_kernels, ctx)? };
+        Ok(Rope72Kernels { module })
+    }
+
+    /// Enqueue the 2D RoPE of the query and key heads of 72 values in place ([`RopeArgs`], its
+    /// `cs` the uploaded [`RopeTable72::cs`]). Asynchronous.
+    pub fn enqueue(&self, stream: &CudaStream, args: RopeArgs<'_>) -> Result<(), GpuError> {
+        let what = "Rope72Kernels::enqueue";
+        let RopeArgs {
+            cs,
+            n,
+            row_width,
+            q0,
+            k0,
+            n_heads,
+            x,
+        } = args;
+        let span = n_heads * HEAD_DIM_72;
+        if n == 0 || q0 + span > row_width || k0 + span > row_width {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{n_heads} heads of {HEAD_DIM_72} at columns {q0} and {k0} do not fit rows of {row_width} (n={n})"
+                ),
+            });
+        }
+        if x.len() < n * row_width || cs.len() < n * 2 * PAIRS_72 {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "x.len() {} (need {}), cs.len() {} (need {})",
+                    x.len(),
+                    n * row_width,
+                    cs.len(),
+                    n * 2 * PAIRS_72
+                ),
+            });
+        }
+        let grid = launch_u32(
+            what,
+            "grid",
+            (n * 2 * n_heads * PAIRS_72).div_ceil(BLOCK as usize),
+        )?;
+        let prep = self
+            .module
+            .prepare_vis_rope2d_h72(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.vis_rope2d_h72(
             stream,
             &prep,
             cs,

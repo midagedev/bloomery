@@ -533,3 +533,7 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_vision_encoder"
 required-features = ["vision"]
+
+[[bin]]
+name = "gate_qwen3vl_tower"
+required-features = ["vision"]

@@ -178,7 +178,10 @@ gpu-deepseek41 412 46 0
 gpu-gates 62 5 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
-gpu-vision 48 0 0
+# PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
+# write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,
+# vis_layer_norm 12, vis_gelu_tanh 2, vis_pos_bilinear 3.
+gpu-vision 86 0 0
 hf 0 0 0
 jinja 0 0 0
 levers 0 0 0

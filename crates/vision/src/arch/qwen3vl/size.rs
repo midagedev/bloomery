@@ -49,6 +49,18 @@ impl TokenLimits {
         }
         Ok(TokenLimits { min, max })
     }
+
+    /// The fewest tokens an image takes.
+    #[must_use]
+    pub fn min(self) -> usize {
+        self.min
+    }
+
+    /// The most tokens an image takes.
+    #[must_use]
+    pub fn max(self) -> usize {
+        self.max
+    }
 }
 
 /// The parameters of the size rule: the patch and merge sides and the token limits.

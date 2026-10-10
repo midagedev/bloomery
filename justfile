@@ -1889,8 +1889,11 @@ ptx-scan BIN FEATURES='gpu' NOJIT='' *ARGS:
 # spill(ptxas 스필 저장 바이트)·jit_local(드라이버 JIT의 스레드당 로컬 바이트)을 tools/ref/ptx-shapes.tsv의 핀과 대조한다.
 # 핀 위든 아래든 다른 값, 핀 없는 새 엔트리, 스캔에서 사라진 핀 행이 전부 빨강이다 — 스필은 비트를 안 바꾸고 속도만
 # 바꿔 비트 게이트가 전부 지나가므로(ds41_attn_seg_sel의 8 B 스필을 눈으로 찾았다), 0이 아닌 핀은 PIN 줄로 사유를 단다.
+# The third binary, gate_qwen3vl_tower (--features vision), is scanned for the `vis_` entries of the image tower crate only
+# (bloomery-gpu-vision, V4.1's six and the Qwen3-VL tower's five); the bloomery-gpu entries of the same bundle are pinned by the
+# first two binaries.
 gate-ptx-spill:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 --bin oxart_jit && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_e2e'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 --bin oxart_jit && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_e2e gate_qwen3vl_tower:vis_'
 
 # 인자: `<엔트리> n,t,…`(분기 결정 한 줄을 따라간 경로), `<엔트리> list`(목록).
 # SASS 스캔(ptx-scan의 짝, 계측기): 첫 대기 전에 발행된 전역 로드 수를 루프마다, 그리고 한 경로를 따라 센다.
@@ -1997,6 +2000,18 @@ gate-vision:
 # 참조의 자기 민감도 행(MANIFEST `# sensitivity`)의 K배 안; 블록 0은 crates/gpu-vision의 호스트 규칙과 연산별로 대조. 3090, 게이트 락.
 gate-gpu-vision:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_vision_encoder && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_vision_encoder'
+
+# The Qwen3-VL image tower on the card (the `qwen3vl_merger` mmproj of Clef-Flash, Qwen3.6 and Qwen3.8): 27 blocks (heads of 72,
+# LayerNorm, tanh GELU, the learned position table resized to the grid, 2D RoPE) and the 2x2 merger against every tap of the Clef
+# set B (ref_clefvis_taps: mainline mtmd's graph nodes, with the CPU twin). A tap is held to K times the larger of the reference's
+# rounding floor, its CPU twin's distance and the network's sensitivity to 1-ulp input noise; a one-step tap to K times the floor.
+# Block 0 and the merger are held to their host rules op by op (position rows, norms and RoPE bit for bit, GEMMs inside the
+# accumulation-order bound, attention inside its f32 bound, the tanh GELU at a pinned count). Also the card bytes (weights
+# 924,123,136 B, scratch 570,949,632 B at 4096 tokens), 249 launches an image, and reuse after the largest image bit for bit. The
+# Qwen3.6 and Qwen3.8 arms end in a named deferred line while their family's set is not in the tree (a deferral is not a pass).
+# Real file only; the gate lock.
+gate-gpu-qwen3vl-tower:
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
 
 # V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
 # top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과

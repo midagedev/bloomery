@@ -119,6 +119,11 @@ dispatch=(
   'crates/gpu/src/lib.rs type Qwen3moeModel'
   # gpu-vision 은 deepseek41v 탑 자신의 크레이트다(이름이 gpu-<arch> 가 아닐 뿐) — 인코더가 그 탑의 이름표를 읽는다.
   'crates/gpu-vision/src/encoder.rs use'
+  # The same crate's second tower (the Qwen3-VL merger of Clef, Qwen3.6 and Qwen3.8) reads its file's
+  # names and hyperparameters, and `open` is the one place that maps a file's projector type to a tower.
+  'crates/gpu-vision/src/qwen3vl.rs use'
+  'crates/gpu-vision/src/lib.rs use'
+  'crates/gpu-vision/src/lib.rs fn open'
   # The V4.1 media span's one owner (ds41_media, the media gate and the serve seat share it):
   # Hparams::read refuses a non-deepseek41v file by name, and the delimiter names and the card
   # figure it reads are the tower's own.

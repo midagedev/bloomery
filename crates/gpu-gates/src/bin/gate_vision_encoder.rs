@@ -46,17 +46,20 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "vision")]
+#[path = "shared/vision_rules.rs"]
+mod vision_rules;
+
+#[cfg(feature = "vision")]
 mod gate {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
 
+    use super::vision_rules::{Count, exact_check, gemm_check, near_check, par_rows};
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
     use bloomery_gpu_vision::aligner::unfold_ref;
     use bloomery_gpu_vision::attn::{HEAD_DIM, QkvLayout, attn_bound, attn_ref};
     use bloomery_gpu_vision::encoder::{Encoder, TapSink};
-    use bloomery_gpu_vision::gemm_bf16::{
-        Epilogue, epilogue_ref, gemm_ref, order_bound, within_order,
-    };
+    use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, within_order};
     use bloomery_gpu_vision::mlp::silu_mul_ref;
     use bloomery_gpu_vision::norm::rms_norm_ref;
     use bloomery_gpu_vision::rope2d::{RopeTable, rope_ref};
@@ -74,8 +77,6 @@ mod gate {
     /// The image encoded on both sides of the larger grids: it pads on both axes, so its unfold
     /// writes zero cells where a larger grid has patches.
     const SMALL: &str = "odd-777x513";
-    /// Threads the host rules run on.
-    const HOST_THREADS: usize = 8;
     /// A free-running tap after block 0 passes when `rms(ours − ref) / rms(ref)` is at most this
     /// multiple of its [`ruler`] row's `rms_rel` in the set's `# sensitivity` rows: the reference
     /// run against itself with a one-ulp flip in the fraction of its patch embedding ours differs
@@ -615,118 +616,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ host rules
-
-    /// `f(row)` for every row on [`HOST_THREADS`] threads, summed.
-    fn par_rows<T: Send + Default + std::ops::AddAssign>(
-        rows: usize,
-        f: impl Fn(usize) -> T + Sync,
-    ) -> T {
-        std::thread::scope(|s| {
-            let hs: Vec<_> = (0..HOST_THREADS)
-                .map(|t| {
-                    let f = &f;
-                    s.spawn(move || {
-                        let mut acc = T::default();
-                        let mut r = t;
-                        while r < rows {
-                            acc += f(r);
-                            r += HOST_THREADS;
-                        }
-                        acc
-                    })
-                })
-                .collect();
-            let mut total = T::default();
-            for h in hs {
-                total += h.join().expect("host rule thread");
-            }
-            total
-        })
-    }
-
-    #[derive(Default, Clone, Copy)]
-    struct Count {
-        outside: usize,
-        differ: usize,
-    }
-
-    impl std::ops::AddAssign for Count {
-        fn add_assign(&mut self, o: Count) {
-            self.outside += o.outside;
-            self.differ += o.differ;
-        }
-    }
-
-    /// One GEMM of the chain against [`gemm_ref`]: every output inside the accumulation-order
-    /// bound, and the count that differ from the exact rounding.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one GEMM's operands and shape, as the kernel takes them"
-    )]
-    fn gemm_check(
-        name: &str,
-        a: &[u16],
-        b: &[u16],
-        bias: Option<&[f32]>,
-        m: usize,
-        n: usize,
-        k: usize,
-        got: &[u16],
-    ) -> bool {
-        let g = order_bound(k);
-        let c = par_rows(m, |i| {
-            let mut c = Count::default();
-            for j in 0..n {
-                let (exact, mag) = gemm_ref(a, b, bias, k, i, j);
-                let y = got[i * n + j];
-                c.outside += usize::from(!within_order(y, exact, g * mag));
-                c.differ += usize::from(y != f32_bf16(exact as f32));
-            }
-            c
-        });
-        let pass = c.outside == 0;
-        println!(
-            "rule gemm {name:<12} m {m} n {n} k {k}: outside the order bound {} of {}, differ from the exact rounding {} ({:.5})  {}",
-            c.outside,
-            m * n,
-            c.differ,
-            c.differ as f64 / (m * n) as f64,
-            verdict(pass)
-        );
-        pass
-    }
-
-    /// A bit-exact rule: `got` equals `want` everywhere.
-    fn exact_check(name: &str, got: &[u16], want: &[u16]) -> bool {
-        let differ =
-            got.iter().zip(want).filter(|(a, b)| a != b).count() + got.len().abs_diff(want.len());
-        let pass = differ == 0;
-        println!(
-            "rule {name:<17} bit-exact: {differ} of {} differ  {}",
-            want.len(),
-            verdict(pass)
-        );
-        pass
-    }
-
-    /// A rule the device's libm differs from by ulps: at most `pin` values differ, none by more
-    /// than one bf16 step.
-    fn near_check(name: &str, got: &[u16], want: &[u16], pin: usize) -> bool {
-        let (mut differ, mut far) = (0usize, 0usize);
-        for (&a, &b) in got.iter().zip(want) {
-            if a != b {
-                differ += 1;
-                far += usize::from(a.abs_diff(b) > 1 || (a ^ b) & 0x8000 != 0);
-            }
-        }
-        let pass = got.len() == want.len() && differ <= pin && far == 0;
-        println!(
-            "rule {name:<17} {differ} of {} differ (pin {pin}), {far} by more than one step  {}",
-            want.len(),
-            verdict(pass)
-        );
-        pass
-    }
 
     /// The GELU epilogue on every normal bf16 value in [−8, 8]: a GEMM of `K = 2` whose A rows
     /// are `(x, 0)` and whose B row 0 is `(1, 0)` puts each `x` exactly into column 0 of its row,
