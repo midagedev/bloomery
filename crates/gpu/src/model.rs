@@ -40,6 +40,7 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
+use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
@@ -50,9 +51,11 @@ use bloomery_levers::HostCfg;
 use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
+use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{self, HostNeed};
 use model::placement::{ExpertList, Plan};
+use model::r8file::R8Source;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1698,6 +1701,27 @@ pub fn nvme_tier(
         ));
     }
     NvTier::of_paged(plan, file, levers.direct).map(|t| t.map(Arc::new))
+}
+
+/// The host leg of a load on `plan`: the routed layers `first ..` built by
+/// `layers`, given the NVMe tier's arena when the plan pages routed experts
+/// and reserved one ([`nvme_tier`], then [`HostRun::build`], then
+/// [`HostRun::attach_tier`]). The one owner of a body's host-run build.
+pub fn host_run<E>(
+    plan: &Plan<'_>,
+    file: &Arc<Split>,
+    first: usize,
+    r8: bool,
+    widths: HostWidths,
+    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+) -> Result<HostRun, GpuError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let arena = nvme_tier(plan, file, r8)?;
+    let mut run = HostRun::build(Arc::clone(file), first, r8, widths, layers)?;
+    run.attach_tier(arena)?;
+    Ok(run)
 }
 
 /// The steps of a placed load before its body: the plan's card and context
