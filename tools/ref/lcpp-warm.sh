@@ -28,8 +28,8 @@
 #                                  the flags, then LCPP_SRV_FIXED, -c, --host 127.0.0.1 --port 0
 #   lcpp_srv_probe <server>        true when <server> --help (no card: CUDA_VISIBLE_DEVICES=-1) lists every
 #                                  option word of SRV_CMD; else 1 and SRV_WHY
-#   lcpp_srv_start <bound> <log> [NAME=VALUE...]  starts `timeout --kill-after=10 <bound> env <NAME=VALUE...>
-#                                  SRV_CMD` with its stdout and stderr in <log>, and waits (at most <bound> s)
+#   lcpp_srv_start <bound> <log> [NAME=VALUE...]  empties <log>, starts (lcpp_srv_spawn) `timeout --kill-after=10
+#                                  <bound> env <NAME=VALUE...> SRV_CMD` with its stdout and stderr in <log>, and waits (at most <bound> s)
 #                                  for its `listening on http://127.0.0.1:<port>` line — printed after the
 #                                  model loaded — and a 200 from /health. SRV_PID (the timeout's pid, the only
 #                                  one signalled), SRV_PORT; 1 with SRV_WHY and SRV_RC when it exited first
@@ -297,12 +297,23 @@ lcpp_srv_probe() {
 
 lcpp_srv_majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 
+# lcpp_srv_spawn <bound> <log> [NAME=VALUE...]: the background launch, SRV_PID the timeout's pid. The child
+# appends to <log>; lcpp_srv_start has emptied it first (the self-test's seam).
+lcpp_srv_spawn() {
+  local bound=$1 log=$2
+  shift 2
+  timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" >> "$log" 2>&1 &
+  SRV_PID=$!
+}
+
 lcpp_srv_start() {
   local bound=$1 log=$2 k a
   shift 2
   SRV_PID='' SRV_PORT='' SRV_WHY='' SRV_RC=0
-  timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" > "$log" 2>&1 &
-  SRV_PID=$!
+  # The log is the parent's to empty, before the fork: the child's own truncation would run after the fork,
+  # and the read loop below could meet the previous run's bytes at the same path.
+  : > "$log"
+  lcpp_srv_spawn "$bound" "$log" "$@"
   for ((k = 0; k < 2 * bound; k++)); do
     [ -n "$SRV_PORT" ] || SRV_PORT=$(sed -n 's|.*listening on http://127\.0\.0\.1:\([0-9][0-9]*\)$|\1|p' "$log" | head -n 1)
     if [ "$SRV_PORT" = 0 ]; then
@@ -893,6 +904,20 @@ EOF
   lcpp_srv_stop
   lcpp_srv_start 20 "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
   check exits "$r|$SRV_RC|$SRV_WHY" "1|5|llama-server exited 5 before it answered /health: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory"
+  # stale-log: the log holds a previous run's port line and the child's own truncation comes late (a shim
+  # copy of lcpp_srv_spawn whose child sleeps before it opens the log with `>`). The parent must have emptied
+  # the log before its first read, so the verdict is this run's, not the previous one's.
+  spawn_def=$(declare -f lcpp_srv_spawn)
+  lcpp_srv_spawn() {
+    local bound=$1 log=$2
+    shift 2
+    (sleep 1; timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" > "$log" 2>&1) &
+    SRV_PID=$!
+  }
+  echo 'main: listening on http://127.0.0.1:0' > "$t/log"
+  lcpp_srv_start 20 "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
+  check stale-log "$r|$SRV_RC|$SRV_WHY" "1|5|llama-server exited 5 before it answered /health: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory"
+  eval "$spawn_def"
   # A server row (srv_row, the runner's hooks stubbed): its decode value, its prompt rate as a prefill
   # record under its own label, and its tokens for the cross-check; a prompt row's one id.
   cold_check() { COLD_TAG='' MAJ_BOUND=0.0; }
