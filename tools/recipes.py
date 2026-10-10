@@ -8,6 +8,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...]
+    python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
     python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
@@ -175,6 +176,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1942,8 +1944,9 @@ def cmd_box_command(args: argparse.Namespace) -> int:
 #     tools/gate-paths.tsv whose glob matches it, all of them. No row: the full list, naming the file.
 #     A row whose recipes are `*`: the full list, naming the row;
 #   - a file under docs/, a `.card` or a `*.md` needs no row (not a host path);
-#   - the gates of a kernel carrier no scan pair covers: a device lib whose bundle is in no pair's
-#     banner, or a bin with kernels of its own, whenever the change touches that carrier's closure.
+#   - the gates of a kernel carrier no scan pair covers, whenever the change touches that carrier's
+#     closure: a device lib whose bundle is in no pair's banner, or a bin with kernels of its own
+#     unless a pair is the scan of that very bin and names the package's bundle (carrier_covered).
 # Then the static checks (ALWAYS), gate-ptx-spill when the PTX or its own pins can have moved (a
 # scan pair not identical, or a changed file the recipe reads), and every recipe the diff adds.
 #
@@ -3542,12 +3545,26 @@ def host_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
 
 @dataclass
 class Carrier:
-    """A cargo target with kernels of its own: its PTX is a bundle a scan may cover."""
+    """A cargo target with kernels of its own: its PTX is a bundle a scan may cover. cuda-oxide names a bundle
+    after the package being compiled (`CARGO_PKG_NAME`, the `ptx-scan: modN bundle=<name>` lines), so a bin's own
+    kernels and every other bin's of the same package share one bundle name."""
 
     label: str
-    bundle: str | None  # the package name of a device lib; None for a bin (no scan reads it)
+    bundle: str  # the package name: what the bundle of this target's kernels is called in a scan
     files: set[str]  # the files its kernels can take code from: its own tree and its closure's libs
     recipes: list[str]  # the gates that link it
+    bin: str | None = None  # a bin carrier's target name; None for a lib
+    siblings: frozenset[str] = frozenset()  # a lib carrier: the bin carriers of its package, whose bundle carries the same name
+
+
+def carrier_covered(c: Carrier, bin: str, bundles: Iterable[str]) -> bool:
+    """Whether a scan of `bin`, whose `modN bundle=` lines are `bundles`, reads carrier `c`'s kernels. A lib's
+    bundle is named after the lib, so any scan that carries it reads it. A bin's own kernels are in the bundle
+    named after its package, which every bin of the package shares: only the scan of that bin reads them, and a
+    scan of a bin carrier cannot vouch for a lib of the same package (its package-named bundle may be the bin's)."""
+    if c.bundle not in bundles:
+        return False
+    return bin == c.bin if c.bin is not None else bin not in c.siblings
 
 
 def kernel_carriers(side: Side, gates: list[str]) -> list[Carrier]:
@@ -3571,7 +3588,10 @@ def kernel_carriers(side: Side, gates: list[str]) -> list[Carrier]:
             else:
                 files = set(tree.target_files(p.name, "bin", t.name, list(p.features), True, True))
                 users = [n for n in gates if any(k == "bin" and tn == t.name for _, k, tn, _ in side.graph.inputs(n).targets)]
-                out.append(Carrier(f"bin {t.name}", None, files, users))
+                out.append(Carrier(f"bin {t.name}", p.name, files, users, bin=t.name))
+    for c in out:
+        if c.bin is None:
+            c.siblings = frozenset(o.bin for o in out if o.bin is not None and o.bundle == c.bundle)
     return out
 
 
@@ -3593,7 +3613,6 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
     for v in res.verdicts:
         if v.kind == "moved":
             res.full.append(f"ptx-scan {v.line()}")
-    covered = {bd for v in res.verdicts for bd in v.bundles}
     picks: dict[str, str] = {}
     tables = tables if tables is not None else TableReads(changed, a, b)
 
@@ -3643,7 +3662,7 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
         # are picked above as their own targets
         entries_only = f in tables.docs and all(own for _, own in view_moves(*tables.docs[f], os.path.dirname(f), None))
         for c in carriers:
-            if f in c.files and not entries_only and (c.bundle is None or c.bundle not in covered):
+            if f in c.files and not entries_only and not any(carrier_covered(c, v.bin, v.bundles) for v in res.verdicts):
                 for n in c.recipes:
                     pick(n, f"{f} [{c.label}: kernels no scan pair covers]")
                 rule.append(f"{c.label} not scanned -> {len(c.recipes)} recipes")
@@ -3670,6 +3689,90 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
                     break
     res.picks = {n: picks[n] for n in gates if n in picks}
     return res
+
+
+# ---- the scan set: the bins whose ptx-scans cover every kernel carrier ----
+#
+# `just narrow` scans these bins, base and change, and hands the pairs to narrow(). A bin covers what its
+# scan's bundle lines can name (carrier_covered): the device libs its package links under its features, and its
+# own kernels when it is a bin carrier. The libs are read from the package's dependency closure, which can
+# name a lib the bin never references (the linker keeps a bundle only when the bin reaches its loader):
+# narrow() judges the scans' own bundle lines, so a lib the scan lacks keeps its gates, and the line
+# `just narrow` prints per bin shows which bundles each scan carried.
+
+SCAN_PACKAGE = "bloomery-gpu-gates"  # the package whose bins `just ptx-scan` builds and tools/ptx-scan.sh reads
+
+
+@dataclass
+class ScanPick:
+    bin: str
+    features: tuple[str, ...]  # the cargo features the scan's build enables, sorted
+    covers: list[str]  # the labels of every carrier its scan can name
+
+
+def scan_shapes(side: Side) -> dict[str, set[tuple[str, ...]]]:
+    """Per bin of SCAN_PACKAGE the feature sets a scan can build it with: its required-features, and every
+    feature list a gate-* or weekly-* recipe builds it with. A recipe's list is kept only when it enables the
+    bin's required-features (the recipe's own build proves it, the one-line check keeps a hand-edited
+    justfile from handing out a shape cargo refuses)."""
+    tree = side.tree
+    pkg = tree.packages.get(SCAN_PACKAGE)
+    if pkg is None:
+        raise RecipeError(f"scan-set: no workspace package {SCAN_PACKAGE}, the package whose bins a ptx-scan builds")
+    bins = {t.name: t for t in pkg.targets if t.kind == "bin"}
+    shapes: dict[str, set[tuple[str, ...]]] = {n: {tuple(sorted(set(t.required)))} for n, t in bins.items()}
+    for n in side.recipes:
+        if not n.startswith((GATE_PREFIX, WEEKLY_PREFIX)):
+            continue
+        for p, kind, name, feats in side.graph.inputs(n).targets:
+            if p != SCAN_PACKAGE or kind != "bin" or name not in bins:
+                continue
+            enabled = tree.feature_closure(pkg, list(feats), True, False)[0]
+            if set(bins[name].required) <= enabled:
+                shapes[name].add(tuple(sorted(set(feats))))
+    return shapes
+
+
+def scan_set(side: Side) -> list[ScanPick]:
+    """The minimal list of (bin, features) whose scans cover every kernel carrier of the tree, greedy: the scan that
+    covers most uncovered carriers first, ties to fewer features, then to the bin's name. A carrier no bin of
+    SCAN_PACKAGE can cover is a named error, never dropped."""
+    gates = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
+    carriers = kernel_carriers(side, gates)
+    shapes = scan_shapes(side)
+    pkg = side.tree.packages[SCAN_PACKAGE]
+    cands: list[tuple[str, tuple[str, ...], list[int]]] = []
+    for bin_name in sorted(shapes):
+        for feats in sorted(shapes[bin_name]):
+            bundles = set(side.tree.closure(pkg, list(feats), False))
+            bundles |= {c.bundle for c in carriers if c.bundle == pkg.name and c.bin in (None, bin_name)}
+            cands.append((bin_name, feats, [i for i, c in enumerate(carriers) if carrier_covered(c, bin_name, bundles)]))
+    uncovered = set(range(len(carriers)))
+    picks: list[ScanPick] = []
+    while uncovered:
+        best = max(cands, key=lambda c: (len(uncovered & set(c[2])), -len(c[1])), default=None)
+        if best is None or not uncovered & set(best[2]):
+            break
+        picks.append(ScanPick(best[0], best[1], [carriers[i].label for i in best[2]]))
+        uncovered -= set(best[2])
+    if uncovered:
+        raise RecipeError("scan-set: no bin of " + SCAN_PACKAGE + " covers " + ", ".join(carriers[i].label for i in sorted(uncovered))
+                          + " — a scan reads only the bins of that package, and a lib's bundle needs a bin that links it")
+    return picks
+
+
+def cmd_scan_set(args: argparse.Namespace) -> int:
+    tmp = tempfile.mkdtemp(prefix="recipes-scanset-")
+    try:
+        side = make_side(archive(args.rev, tmp) if args.rev else ROOT)
+        picks = scan_set(side)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for p in picks:
+        print(f"{p.bin}\t{','.join(p.features)}\t{'; '.join(p.covers)}")
+    n_carriers = len({c for p in picks for c in p.covers})
+    print(f"scan-set: {len(picks)} bins cover {n_carriers} kernel carriers", file=sys.stderr)
+    return 0
 
 
 def trigger_rows(side: Side) -> tuple[list[PathRow], str | None]:
@@ -6705,6 +6808,87 @@ def static_self_test(expect) -> None:
         expect(len(got) == 1 and "lint: not one" in got[0], f"static: a lint of one target gives {got}")
 
 
+def scan_set_self_test(expect, side: Side) -> None:
+    """scan_set on the real tree (every carrier covered, every bin carrier by its own scan) and on synthetic
+    workspaces: package bloomery-gpu-gates with bins x (feature fa), y (fb), z (fa, a bin carrier) and w; device
+    libs liba (behind fa), libb (behind fb) and, unlinked by any bin, libc."""
+    gates = [n for n in side.recipes if n.startswith(GATE_PREFIX)]
+    carriers = kernel_carriers(side, gates)
+    try:
+        picks = scan_set(side)
+    except RecipeError as err:
+        expect(False, f"scan-set: the real tree's scan set is refused: {err}")
+        picks = []
+    covered = {c for p in picks for c in p.covers}
+    expect(covered == {c.label for c in carriers},
+           f"scan-set: the real tree's picks leave {sorted({c.label for c in carriers} - covered)} uncovered")
+    expect({c.bin for c in carriers if c.bin} <= {p.bin for p in picks}, f"scan-set: a bin carrier whose own scan is not in the set: {[(p.bin, p.features) for p in picks]}")
+    expect(all(c.bundle for c in carriers), "scan-set: a carrier with no bundle name")
+
+    def build(tmp: str, name: str, libc: bool = False, other: bool = False, recipe: str = "") -> Side:
+        root = os.path.join(tmp, name)
+        kernel, plain = "#[kernel]\nfn k() {}\n", "fn f() {}\n"
+        files = {"crates/liba/src/lib.rs": kernel, "crates/libb/src/lib.rs": kernel, "crates/libc/src/lib.rs": kernel if libc else plain,
+                 "crates/gates/src/lib.rs": plain, "crates/gates/src/bin/x.rs": "fn main() {}\n", "crates/gates/src/bin/y.rs": "fn main() {}\n",
+                 "crates/gates/src/bin/z.rs": kernel + "fn main() {}\n", "crates/gates/src/bin/w.rs": "fn main() {}\n",
+                 "crates/other/src/main.rs": kernel + "fn main() {}\n" if other else "fn main() {}\n",
+                 "justfile": "gate-gx:\n    ./tools/box.sh 'cargo oxide build -- -p bloomery-gpu-gates --features fa --release --bin x'\n" + recipe}
+        for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+            files[f] = ""
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        def pkg(n: str, d: str, targets: list[dict], features=None, deps=()) -> dict:
+            return {"id": n, "name": n, "manifest_path": os.path.join(root, f"crates/{d}/Cargo.toml"), "features": features or {},
+                    "dependencies": [{"name": x, "kind": None, "optional": True, "features": [], "uses_default_features": True} for x in deps],
+                    "targets": targets}
+
+        def tgt(kind: str, n: str, src: str, req=()) -> dict:
+            return {"kind": [kind], "name": n, "src_path": os.path.join(root, src), "required-features": list(req)}
+
+        meta = {"workspace_root": root, "workspace_members": ["liba", "libb", "libc", "bloomery-gpu-gates", "other"], "packages": [
+            pkg("liba", "liba", [tgt("lib", "liba", "crates/liba/src/lib.rs")]),
+            pkg("libb", "libb", [tgt("lib", "libb", "crates/libb/src/lib.rs")]),
+            pkg("libc", "libc", [tgt("lib", "libc", "crates/libc/src/lib.rs")]),
+            pkg("bloomery-gpu-gates", "gates", [tgt("lib", "bloomery-gpu-gates", "crates/gates/src/lib.rs"), tgt("bin", "x", "crates/gates/src/bin/x.rs", ["fa"]),
+                                              tgt("bin", "y", "crates/gates/src/bin/y.rs", ["fb"]), tgt("bin", "z", "crates/gates/src/bin/z.rs", ["fa"]),
+                                              tgt("bin", "w", "crates/gates/src/bin/w.rs")],
+                {"fa": ["dep:liba"], "fb": ["dep:libb"]}, ["liba", "libb"]),
+            pkg("other", "other", [tgt("bin", "o", "crates/other/src/main.rs")]),
+        ]}
+        return side_at(root, meta)
+
+    def shown(ps: list[ScanPick]) -> list[tuple[str, tuple[str, ...]]]:
+        return [(p.bin, p.features) for p in ps]
+
+    def refused(fn, why: str) -> bool:
+        try:
+            fn()
+        except RecipeError as err:
+            return why in str(err)
+        return False
+
+    with tempfile.TemporaryDirectory(prefix="recipes-scanset-") as tmp:
+        fx = build(tmp, "t0")
+        got = scan_set(fx)
+        expect(shown(got) == [("z", ("fa",)), ("y", ("fb",))], f"scan-set: two device libs and a bin carrier are not covered by z and y: {shown(got)}")
+        expect(got and sorted(got[0].covers) == ["bin z", "lib liba"], f"scan-set: the first pick's coverage: {got[0].covers if got else got}")
+        # a recipe's wider feature list is a candidate too, and loses the tie to the bin's own required features
+        got = scan_set(build(tmp, "t1", recipe="gate-gy:\n    ./tools/box.sh 'cargo oxide build -- -p bloomery-gpu-gates --features fa,fb --release --bin y'\n"))
+        expect(shown(got) == [("z", ("fa",)), ("y", ("fb",))], f"scan-set: a wider recipe shape beat the bin's own features: {shown(got)}")
+        # a carrier no bin links is a named error, never dropped; so is a bin carrier of another package
+        expect(refused(lambda: scan_set(build(tmp, "t2", libc=True)), "no bin of bloomery-gpu-gates covers lib libc"),
+               "scan-set: a lib no bin links is not a named error")
+        expect(refused(lambda: scan_set(build(tmp, "t3", other=True)), "no bin of bloomery-gpu-gates covers bin o"),
+               "scan-set: a bin carrier outside the scan package is not a named error")
+        # a bin's own scan does not vouch for a lib of its package: the bundle name is shared
+        c = Carrier("lib p", "p", set(), [], siblings=frozenset({"b"}))
+        expect(not carrier_covered(c, "b", ["p"]) and carrier_covered(c, "x", ["p"]) and not carrier_covered(c, "x", ["q"]),
+               "scan-set: a lib carrier is covered by its sibling bin carrier's scan")
+
+
 def manifest_self_test(expect) -> None:
     """A package manifest read by table, on a synthetic workspace (package g: a lib and bins x, y, v; user: a
     bin linking g; a script that reads g's manifest whole). Each change gives the recipes it must select and
@@ -7727,7 +7911,7 @@ def narrow_self_test(expect, side: Side) -> None:
     h1, h2, h3 = "1" * 32, "2" * 32, "3" * 32
 
     def scan(tmp: str, name: str, rows: dict[str, str], banner_extra: str = "", bundles=("bloomery-gpu",), md5_rows=None, banners=1,
-             cc: str = "8.6", nojit: bool = False, jit_banner: str | None = None, cells: str | None = None, regs: str = "12") -> str:
+             cc: str = "8.6", nojit: bool = False, jit_banner: str | None = None, cells: str | None = None, regs: str = "12", bin: str = "gx") -> str:
         """A scan log. `nojit` makes it a `--no-jit` scan (the banner's one jit= field and two skipped cells);
         `jit_banner` and `cells` override the banner's JIT fields and the two JIT cells to build a log whose
         banner and cells disagree."""
@@ -7738,7 +7922,7 @@ def narrow_self_test(expect, side: Side) -> None:
         lines = ["./tools/box.sh 'cargo oxide build …'", "   Compiling bloomery-gpu v0.1.0 (/root/x/crates/gpu)"]
         lines += [f"ptx-scan: mod{i + 1} bundle={b} bytes=100" for i, b in enumerate(bundles)]
         for _ in range(banners):
-            lines.append(f"ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 "
+            lines.append(f"ptx-scan bin=target/release/{bin} section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 "
                          f"modules={len(bundles)} {jits}{banner_extra}")
         lines.append(header)
         lines += [f"{e:<24} 256 no 0 0 0 0 {regs} 0 0 6 {cells}" for e in rows]
@@ -7887,6 +8071,43 @@ def narrow_self_test(expect, side: Side) -> None:
                f"narrow: a kernel carrier no pair covers does not keep its gates: {n.files} {sorted(n.picks)}")
         n = narrow(["crates/gpu-gates/src/bin/gate_p1.rs"], side, side, [(base, same)], rows)
         expect(not n.full and set(n.picks) == {"gate-gpu-p1"}, f"narrow: a bin's own file, an equal-scan change the ratchet does not read: {n.full} {sorted(n.picks)}")
+        # a bin carrier is covered by the scan of that bin alone. Every bin of gpu-gates carries its own kernels in a
+        # bundle named for the package, so a scan of another gpu-gates bin (same bundle name) or of that bin without
+        # the package's bundle reads nothing of them. A change under crates/gpu reaches the closure of both bin
+        # carriers (gate_swap, gate_kquant) and of the three device libs.
+        libs = ("bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-vision")
+        own = ("bloomery-gpu", "bloomery-gpu-gates")
+        gpu_rows = [row("crates/gpu/src/**", ["gate-gpu-lib"])]
+
+        def pair(name: str, bin: str, bundles) -> tuple[ScanLog, ScanLog]:
+            return (read_scan(scan(tmp, f"{name}-b.log", {"alpha": h1}, bundles=bundles, bin=bin, nojit=True)),
+                    read_scan(scan(tmp, f"{name}-h.log", {"alpha": h1}, bundles=bundles, bin=bin, nojit=True)))
+
+        lib_pair = pair("libs", "gx", libs)
+        swap, kquant = pair("swap", "gate_swap", own), pair("kquant", "gate_kquant", own)
+
+        def picked(*pairs) -> tuple[set[str], str]:
+            got = narrow(["crates/gpu/src/model.rs"], side, side, list(pairs), gpu_rows)
+            return set(got.picks), got.files[0]
+
+        got, why = picked(lib_pair)
+        expect({"gate-gpu-swap", "gate-gpu-kquant"} <= got and "bin gate_swap not scanned" in why and "bin gate_kquant not scanned" in why,
+               f"narrow: the bin carriers with no scan of their own do not keep their gates: {sorted(got)} {why}")
+        got, why = picked(lib_pair, swap)
+        expect("gate-gpu-swap" not in got and "gate-gpu-kquant" in got and "bin gate_swap" not in why and "bin gate_kquant not scanned" in why,
+               f"narrow: a scan of gate_swap does not cover gate_swap alone: {sorted(got)} {why}")
+        got, why = picked(lib_pair, kquant)
+        expect("gate-gpu-kquant" not in got and "gate-gpu-swap" in got and "bin gate_kquant" not in why and "bin gate_swap not scanned" in why,
+               f"narrow: a scan of gate_kquant does not cover gate_kquant alone: {sorted(got)} {why}")
+        got, why = picked(lib_pair, swap, kquant)
+        expect(not {"gate-gpu-swap", "gate-gpu-kquant"} & got and "not scanned" not in why, f"narrow: both bins scanned still keep a bin carrier's gates: {sorted(got)} {why}")
+        got, why = picked(lib_pair, pair("swap-nobundle", "gate_swap", ("bloomery-gpu",)))
+        expect("gate-gpu-swap" in got and "bin gate_swap not scanned" in why,
+               f"narrow: a scan of gate_swap that names no package bundle covers its kernels: {sorted(got)} {why}")
+        # a lib carrier is covered by any scan that names its bundle, and by no other
+        got, why = picked(pair("nolibs", "gx", ("bloomery-gpu",)), swap, kquant)
+        expect({"gate-gpu-vision", "gate-ds41-bind"} <= got and "lib bloomery-gpu-vision not scanned" in why and "lib bloomery-gpu-deepseek41 not scanned" in why,
+               f"narrow: the device libs a scan names no bundle of do not keep their gates: {sorted(got)[:6]} {why}")
         # a trigger names its weekly recipe and maps nothing: a file only a trigger row matches, which every gate reads
         # through a dependency, keeps the full list; beside a gate row it narrows as that row says
         trig = [row("rust-toolchain.toml", ["weekly-gpu-ds41-serve"], 9)]
@@ -8564,6 +8785,9 @@ def self_test() -> int:
     # affected --narrow
     narrow_self_test(expect, side)
 
+    # the scan set
+    scan_set_self_test(expect, side)
+
     # a package manifest read by table
     manifest_self_test(expect)
 
@@ -8603,6 +8827,8 @@ def main(argv: list[str]) -> int:
     a.add_argument("--depinfo-remote", default=os.environ.get("BLOOMERY_DEPINFO_REMOTE", "~/repo/bloomery"))
     a.add_argument("--narrow", action="store_true", help=f"the gates that run the changed host path, when every --scan pair is identical or added (the rule and {GATE_PATHS}: the section above narrow())")
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
+    ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
+    ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
     w = sub.add_parser("why")
     w.add_argument("files", nargs="+")
     w.add_argument("--all-recipes", action="store_true")
@@ -8651,6 +8877,8 @@ def main(argv: list[str]) -> int:
             return cmd_targets(args)
         if args.cmd == "affected":
             return cmd_affected(args)
+        if args.cmd == "scan-set":
+            return cmd_scan_set(args)
         if args.cmd == "why":
             return cmd_why(args)
         if args.cmd == "reach":

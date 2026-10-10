@@ -87,6 +87,18 @@ check-recipes:
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}
 
+# BASE..HEAD narrowed by ptx-scans it takes itself: derives the bins whose scans cover every kernel carrier (tools/recipes.py
+# scan-set), builds and scans them with `--no-jit` at both commits in two persistent box dirs (~/repo/bloomery-narrow-base,
+# ~/repo/bloomery-narrow-head: a second run builds incrementally), and prints `just affected --narrow` over those pairs,
+# its `recipes:` line included. HEAD defaults to this tree's HEAD commit, read through `git archive` (uncommitted edits are
+# not scanned). It runs no gate and takes no lease, no hold, no card and no gate lock. `--out DIR` keeps the scan logs and the
+# list (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>); `--dry-run` prints the scan set and touches no box.
+# The owner is tools/narrow-scan.sh.
+[arg("OUT", long="out")]
+[arg("DRY", long="dry-run", value="--dry-run")]
+narrow BASE HEAD='HEAD' OUT='' DRY='':
+    ./tools/narrow-scan.sh {{BASE}} {{HEAD}} {{DRY}} {{ if OUT != '' { '--out "' + OUT + '"' } else { '' } }}
+
 # 호스트 rustflags의 두 소유자(.cargo/config.toml, .cargo/cuda-oxide.toml)가 같은지 — 맥에서, 빌드 없음.
 check-rustflags:
     ./tools/check-rustflags.sh

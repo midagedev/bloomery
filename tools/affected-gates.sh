@@ -10,6 +10,9 @@
 #                                        # identical or added pairs keep the gates whose own target changed and
 #                                        # the rows the changed files match; a moved pair, no pair or a file no
 #                                        # row maps prints the full list with the reason
+#   just narrow BASE [HEAD] [--out DIR]  # the same with the scans taken for you (tools/narrow-scan.sh): the bins whose
+#                                        # scans cover every kernel carrier (tools/recipes.py scan-set), built and scanned
+#                                        # --no-jit at both commits in two persistent box dirs, then this --narrow run
 #
 # Output: one line per selected recipe with the file that selected it and the chain (`bin gate_x <- lib
 # bloomery-gpu (bloomery-gpu-gates -> bloomery-gpu)`), a `recipes:` line to paste, the `always:` static

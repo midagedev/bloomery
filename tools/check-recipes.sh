@@ -308,6 +308,17 @@ blk_scanargs() {
   fi
   echo "${sa##*$'\n'}"
 }
+# narrow-scan.sh is `just narrow`'s box orchestration: the runner it ships to each side (one build per feature list, the
+# scanner embedded verbatim), the cut of the box's output into per-bin scan logs, the one-run-at-a-time lock on the
+# persistent remote dirs, its usage refusals, and the drift check against the ptx-scan recipe's build lines. No box.
+blk_narrowscan() {
+  if ! nsc=$(bash "$(dirname "$0")/narrow-scan.sh" --self-test 2>&1); then
+    echo "$nsc" >&2
+    echo "check-recipes: the narrow-scan self-test failed" >&2
+    return 1
+  fi
+  echo "${nsc##*$'\n'}"
+}
 # lds-scan.sh's rows (its PTX and SASS counts over a fixture binary, stub extractor, ptxas and cuobjdump),
 # its filter, its failed-scan banner and its usage refusal, no box.
 blk_ldsscan() {
@@ -527,7 +538,8 @@ blk_orphan() {
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools boxqcodes fixturevariants orphan)
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic carry pytools boxqcodes fixturevariants
+  orphan)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
