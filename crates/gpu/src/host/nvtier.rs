@@ -55,7 +55,11 @@
 //! takes the oldest transient before any hot slot, and a later step or keep
 //! hit turns a transient hot. A batch pin ([`NvTier::pin`]) counts the ids
 //! of a batch in the same open-read counts a lane's read does, so the books
-//! take none of them until the guard drops.
+//! take none of them until the guard drops. A prompt call's union claims
+//! each batch of its experts as one claim and pin ([`NvTier::ensure_pinned`]):
+//! a hit counts at the claim and a miss as its fill publishes, each under the
+//! one hold of the lock the claim or the publish takes, so no claim between
+//! them takes a slot of the batch.
 
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -193,6 +197,10 @@ struct Claimed {
     picks: Vec<Pick>,
     evicted: Vec<usize>,
     misses: u64,
+    /// The ids found filled that the claim pinned as it found them
+    /// ([`claim_slots_pinned`]), each one open read counted for the caller's
+    /// [`BatchPin`] to close; none when the claim did not pin.
+    pinned: Vec<u32>,
 }
 
 /// The books' pass of one `ensure` over layer `layer`'s `ids`: ids the plan's
@@ -219,6 +227,33 @@ fn claim_slots(
     books: &mut Books,
     ids: &[u32],
     kind: Claim,
+) -> Result<Claimed, GpuError> {
+    claim_with(layer, arena, books, ids, kind, false)
+}
+
+/// [`claim_slots`] that pins what it finds filled as it finds it, under the
+/// caller's one hold of the books' lock: each hit counts one open read at
+/// once, so no later miss of this call and no other claim takes it, and a
+/// refused claim closes them again. The misses' slots are filling, which no
+/// claim takes; the caller pins them as their fill publishes
+/// ([`publish_pinned`]).
+fn claim_slots_pinned(
+    layer: usize,
+    arena: &LayerArena,
+    books: &mut Books,
+    ids: &[u32],
+    kind: Claim,
+) -> Result<Claimed, GpuError> {
+    claim_with(layer, arena, books, ids, kind, true)
+}
+
+fn claim_with(
+    layer: usize,
+    arena: &LayerArena,
+    books: &mut Books,
+    ids: &[u32],
+    kind: Claim,
+    pin: bool,
 ) -> Result<Claimed, GpuError> {
     const WHAT: &str = "NvTier::ensure";
     let n = arena.n_expert as usize;
@@ -253,6 +288,13 @@ fn claim_slots(
         picks: Vec::new(),
         evicted: Vec::new(),
         misses: 0,
+        pinned: Vec::new(),
+    };
+    // Closes the hits' pins when the claim is refused.
+    let mut held = BatchPin {
+        arena,
+        layer,
+        ids: Vec::new(),
     };
     for &id in ids {
         let at = id as usize;
@@ -260,6 +302,9 @@ fn claim_slots(
             continue;
         }
         if let Some(slot) = arena.filled(id) {
+            if pin {
+                held.add(id, WHAT)?;
+            }
             let book = &arena.slots[slot];
             if kind != Claim::Transient || book.seq.load(Ordering::Relaxed) == 0 {
                 books.tick += 1;
@@ -304,6 +349,7 @@ fn claim_slots(
         arena.of_id[at].store(slot as u32 + 1, Ordering::Relaxed);
         claim.picks.push(Pick { slot, id, gone });
     }
+    claim.pinned = std::mem::take(&mut held.ids);
     Ok(claim)
 }
 
@@ -346,6 +392,24 @@ fn publish(arena: &LayerArena, books: &mut Books, picks: &[Pick], kind: Claim) {
         }
         book.state.store(FILLED, Ordering::Relaxed);
     }
+}
+
+/// [`publish`] and the pin of the picks, under the one hold of the books'
+/// lock the caller has: each pick counts one open read as its slot turns
+/// filled, so no claim sees it filled and unpinned. `held` is the batch's pin
+/// with the hits [`claim_slots_pinned`] counted.
+fn publish_pinned(
+    arena: &LayerArena,
+    books: &mut Books,
+    picks: &[Pick],
+    kind: Claim,
+    held: &mut BatchPin<'_>,
+) -> Result<(), GpuError> {
+    publish(arena, books, picks, kind);
+    for p in picks {
+        held.add(p.id, "NvTier::ensure_pinned")?;
+    }
+    Ok(())
 }
 
 /// Where part `part` of the expert slot at byte `slot_off` of the mapping
@@ -628,6 +692,15 @@ struct BatchPin<'a> {
     arena: &'a LayerArena,
     layer: usize,
     ids: Vec<u32>,
+}
+
+impl BatchPin<'_> {
+    /// Count one open read of expert `id` into the batch, closed by the drop.
+    fn add(&mut self, id: u32, what: &'static str) -> Result<(), GpuError> {
+        self.arena.open(self.layer, id, what)?;
+        self.ids.push(id);
+        Ok(())
+    }
 }
 
 impl Drop for BatchPin<'_> {
@@ -1645,11 +1718,42 @@ impl NvTier {
         by: FillBy,
         claim: Claim,
     ) -> Result<(), GpuError> {
-        self.fill_missing(layer, ids, by, claim)?;
+        self.fill_missing(layer, ids, by, claim, false)?;
         if self.audit.get().is_some() {
             self.audit_slots(layer, ids)?;
         }
         Ok(())
+    }
+
+    /// [`NvTier::ensure_as`] and [`NvTier::pin`] as one claim: every id of
+    /// `ids` the arena serves is filled and pinned until the guard drops. A
+    /// hit is pinned as the claim finds it and a miss as its fill publishes,
+    /// each under one hold of the books' lock with the claim's or the
+    /// publish's own, so no claim takes a slot of the batch between its
+    /// claim and its pin. The misses are read on the resident pool, as
+    /// [`NvTier::ensure_as`]'s. Refused by name like the two it joins, nothing
+    /// pinned: a layer the arena does not cover, an id past its experts, a
+    /// call past the slots and a miss that finds every slot taken.
+    pub fn ensure_pinned(
+        &self,
+        layer: usize,
+        ids: &[u32],
+        claim: Claim,
+    ) -> Result<TierPin<'_>, GpuError> {
+        let held = self.fill_missing(layer, ids, FillBy::Pool, claim, true)?;
+        if self.audit.get().is_some() {
+            self.audit_slots(layer, ids)?;
+        }
+        Ok(TierPin::new(held))
+    }
+
+    /// Layer `layer`'s slot count; 0 for a layer the arena does not cover.
+    #[must_use]
+    pub fn layer_slots(&self, layer: usize) -> usize {
+        self.by_layer
+            .get(layer)
+            .and_then(|l| l.as_ref())
+            .map_or(0, |arena| arena.slots.len())
     }
 
     /// Turn the audit on, once: after every [`NvTier::ensure`] each slot it
@@ -1730,21 +1834,34 @@ impl NvTier {
     }
 
     /// The misses of `ids` read into their slots ([`NvTier::ensure`]), the
-    /// reads on `by`.
+    /// reads on `by`. With `pin` every id the arena serves is pinned too
+    /// ([`NvTier::ensure_pinned`]) and the guard returned holds them; without,
+    /// the guard holds none.
     fn fill_missing(
         &self,
         layer: usize,
         ids: &[u32],
         by: FillBy,
         kind: Claim,
-    ) -> Result<(), GpuError> {
+        pin: bool,
+    ) -> Result<BatchPin<'_>, GpuError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
             return Err(GpuError::state(WHAT, "the layer's arena"));
         };
         let claim = {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            claim_slots(layer, arena, &mut books, ids, kind)?
+            if pin {
+                claim_slots_pinned(layer, arena, &mut books, ids, kind)?
+            } else {
+                claim_slots(layer, arena, &mut books, ids, kind)?
+            }
+        };
+        // The hits' pins close if anything below refuses.
+        let mut held = BatchPin {
+            arena,
+            layer,
+            ids: claim.pinned,
         };
         self.stats.misses.fetch_add(claim.misses, Ordering::Relaxed);
         for &slot in &claim.evicted {
@@ -1758,7 +1875,7 @@ impl NvTier {
         }
         let picks = claim.picks;
         if picks.is_empty() {
-            return Ok(());
+            return Ok(held);
         }
         let t0 = Instant::now();
         self.fill(arena, &picks, by).inspect_err(|_| {
@@ -1770,7 +1887,11 @@ impl NvTier {
         })?;
         {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            publish(arena, &mut books, &picks, kind);
+            if pin {
+                publish_pinned(arena, &mut books, &picks, kind, &mut held)?;
+            } else {
+                publish(arena, &mut books, &picks, kind);
+            }
         }
         let bytes: u64 = picks
             .iter()
@@ -1792,7 +1913,7 @@ impl NvTier {
             picks.len() as u64 * arena.slot_bytes as u64,
             Ordering::Relaxed,
         );
-        Ok(())
+        Ok(held)
     }
 
     /// The misses' reads: on the resident pool, each worker filling the picks
@@ -1905,6 +2026,19 @@ impl TierSlots for NvTier {
             layer,
             source: Box::new(e),
         })
+    }
+
+    fn slots(&self, layer: usize) -> usize {
+        self.layer_slots(layer)
+    }
+
+    fn ensure_pinned<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        claim: Claim,
+    ) -> Result<TierPin<'a>, TierError> {
+        NvTier::ensure_pinned(self, layer, ids, claim).map_err(|e| seam_error(layer, ids, e))
     }
 
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
@@ -2329,6 +2463,149 @@ mod tests {
         let c = super::claim_slots(0, &arena, &mut books, &[3], Claim::Step).unwrap();
         assert_eq!((c.picks.len(), c.evicted.len()), (1, 1));
         drop(pin);
+    }
+
+    /// The open reads of experts `ids` as the books count them.
+    fn open_reads(arena: &super::LayerArena, ids: &[u32]) -> Vec<u32> {
+        ids.iter()
+            .map(|&id| {
+                arena
+                    .reading(0, id, "test")
+                    .expect("an id of the layer")
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+            .collect()
+    }
+
+    /// An `ensure_pinned` pins a hit as its claim finds it and a miss as its
+    /// fill publishes, each under the books' lock of the claim or the
+    /// publish: a claim that runs between the two — the lane's, or the next
+    /// batch's — takes none of the batch's slots, the hit's pinned already
+    /// and the miss's filling. Once the fill publishes, the miss is filled
+    /// and pinned in the same hold, so no claim finds it filled and free. The
+    /// guard's drop unpins the whole batch.
+    #[test]
+    fn ensure_pinned_pins_hits_and_picks_in_one_hold() {
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1], Claim::Step);
+        // Hit 0 and misses 2 and 3: one slot, expert 1's, is left to take.
+        let mut claim =
+            super::claim_slots_pinned(0, &arena, &mut books, &[0, 2, 3], Claim::Keep).unwrap();
+        assert_eq!(claim.pinned, [0], "the hit is pinned by its claim");
+        assert_eq!(open_reads(&arena, &[0, 1, 2, 3]), [1, 0, 0, 0]);
+        let mut held = super::BatchPin {
+            arena: &arena,
+            layer: 0,
+            ids: std::mem::take(&mut claim.pinned),
+        };
+        // A claim between the claim and the publish: the hit's slot is
+        // pinned and the misses' are filling, so it can take expert 1's one
+        // slot and no more; the second miss is refused by name and the
+        // first's slot is given back.
+        let e = super::claim_slots(0, &arena, &mut books, &[4, 5], Claim::Step)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pinned by a lane's read or a batch pin"), "{e}");
+        assert_eq!(filled_ids(&arena), [0, 1], "nothing of the batch was taken");
+        assert!(arena.filled(2).is_none() && arena.filled(3).is_none());
+        // The fill publishes: the misses are filled and pinned together.
+        super::publish_pinned(&arena, &mut books, &claim.picks, Claim::Keep, &mut held).unwrap();
+        assert_eq!(filled_ids(&arena), [0, 1, 2, 3]);
+        assert_eq!(open_reads(&arena, &[0, 1, 2, 3]), [1, 0, 1, 1]);
+        // Only expert 1 can be taken: a claim of two misses is refused whole.
+        let e = super::claim_slots(0, &arena, &mut books, &[4, 5], Claim::Step)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pinned by a lane's read or a batch pin"), "{e}");
+        assert_eq!(
+            filled_ids(&arena),
+            [0, 1, 2, 3],
+            "no slot of the batch taken"
+        );
+        let taken = super::claim_slots(0, &arena, &mut books, &[4], Claim::Step).unwrap();
+        assert_eq!(taken.evicted.len(), 1);
+        fill_claimed(&arena, &mut books, &taken);
+        assert_eq!(filled_ids(&arena), [0, 2, 3, 4], "1 went, the batch stayed");
+        drop(held);
+        assert_eq!(open_reads(&arena, &[0, 1, 2, 3, 4]), [0; 5]);
+        ensure_as(&arena, &mut books, &[5, 6, 7], Claim::Step);
+        assert_eq!(
+            filled_ids(&arena),
+            [4, 5, 6, 7],
+            "the unpinned batch is evictable"
+        );
+    }
+
+    /// A pinned claim that is refused closes the pins it had taken on its
+    /// hits, whatever the refusal: no count outlives it.
+    #[test]
+    fn a_refused_pinned_claim_closes_its_hit_pins() {
+        let arena = arena_of(8, 3);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1, 2], Claim::Step);
+        // Lanes read 1 and 2; the claim pins its hit 0 and finds no slot for
+        // 3.
+        arena.open(0, 1, "test").unwrap();
+        arena.open(0, 2, "test").unwrap();
+        let e = super::claim_slots_pinned(0, &arena, &mut books, &[0, 3], Claim::Keep)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pinned by a lane's read or a batch pin"), "{e}");
+        assert_eq!(
+            open_reads(&arena, &[0, 1, 2]),
+            [0, 1, 1],
+            "the hit's pin closed"
+        );
+        assert_eq!(filled_ids(&arena), [0, 1, 2]);
+    }
+
+    /// A prefetch ticket returns the pin only once the batch's fill has
+    /// published: before the wait the batch's slots are claimed (no claim
+    /// takes them) and its misses unfilled, and what the wait returns holds
+    /// every id of the batch — the hit pinned at the claim, the misses at the
+    /// publish — filled. The ticket owns the fill's completion: the closure
+    /// it is made of runs the publish, as a lane thread's join would.
+    #[test]
+    fn a_prefetch_ticket_waits_to_the_pin() {
+        use model::moe::{Ticket, TierPin};
+        let arena = arena_of(8, 4);
+        let books = std::sync::Mutex::new(super::Books::default());
+        ensure_as(&arena, &mut books.lock().unwrap(), &[0], Claim::Step);
+        let mut claim = {
+            let mut b = books.lock().unwrap();
+            super::claim_slots_pinned(0, &arena, &mut b, &[0, 1, 2], Claim::Keep).unwrap()
+        };
+        let mut held = super::BatchPin {
+            arena: &arena,
+            layer: 0,
+            ids: std::mem::take(&mut claim.pinned),
+        };
+        let picks = claim.picks;
+        let ticket = Ticket::new(|| {
+            let mut b = books.lock().unwrap();
+            super::publish_pinned(&arena, &mut b, &picks, Claim::Keep, &mut held).unwrap();
+            drop(b);
+            Ok(TierPin::new(held))
+        });
+        // Before the wait: the misses are claimed, not filled, and a claim
+        // past the batch takes the one free slot and no more.
+        assert!(arena.filled(1).is_none() && arena.filled(2).is_none());
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [1, 0, 0]);
+        let e = super::claim_slots(0, &arena, &mut books.lock().unwrap(), &[3, 4], Claim::Step)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pinned by a lane's read or a batch pin"), "{e}");
+        assert!(arena.filled(3).is_none(), "the refused claim took nothing");
+        let pin = ticket.wait().expect("the fill ended");
+        assert_eq!(filled_ids(&arena), [0, 1, 2], "every id filled at the wait");
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [1, 1, 1], "and pinned");
+        drop(pin);
+        assert_eq!(open_reads(&arena, &[0, 1, 2]), [0, 0, 0]);
     }
 
     /// A pin names what it refuses and pins nothing then: an id with no

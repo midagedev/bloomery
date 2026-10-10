@@ -4209,8 +4209,10 @@ impl<'p> UnionPlanView<'p> {
 
     /// Column `j`'s weighted sum into `o`, from zero in the order of its list
     /// `list` — the one-column call's order — over the downs in `store`, slot
-    /// `q`'s at `store[q·w..(q + 1)·w]`, `w` the width of `o`.
-    fn sum_col(self, store: &[f32], list: &[(u32, f32)], j: usize, o: &mut [f32]) {
+    /// `q`'s at `store[q·w..(q + 1)·w]`, `w` the width of `o`. Expert `d`'s
+    /// slots are the ones from `slot[d]` on: `off` for a call that ran whole,
+    /// the batch order's for one served in batches.
+    fn sum_col(self, slot: &[usize], store: &[f32], list: &[(u32, f32)], j: usize, o: &mut [f32]) {
         let w_col = o.len();
         o.fill(0.0);
         for &(e, w) in list {
@@ -4222,7 +4224,7 @@ impl<'p> UnionPlanView<'p> {
                 .cols(d)
                 .binary_search(&j)
                 .expect("a listing column is in its expert's columns");
-            let q = self.off[d] + t;
+            let q = slot[d] + t;
             for (o, &dv) in o.iter_mut().zip(&store[q * w_col..(q + 1) * w_col]) {
                 *o += w * dv;
             }
@@ -4791,6 +4793,14 @@ pub(crate) struct UnionSlabs<'s> {
     pub(crate) claims: &'s mut [std::sync::atomic::AtomicU8],
 }
 
+/// A union call's `x` quantized for the batches of one call
+/// ([`UnionCall::quantize_batched`]): in the gate's encoding and, when the
+/// up's rows read other bytes, in the up's.
+pub(crate) struct UnionXq<'s> {
+    gate: &'s mut [u8],
+    up: Option<&'s mut [u8]>,
+}
+
 /// The front `len` cells of `slab`, or a named panic when the scratch has no
 /// room for them — a scratch made for fewer columns or narrower encodings
 /// than the call's.
@@ -4946,6 +4956,115 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             profile::record_time("host_sum", since(t_sum));
         }
         Ok(())
+    }
+
+    /// x quantized once for a call served in batches of experts: the pass
+    /// [`UnionCall::run`] opens with, into the front of `xq` (the gate's
+    /// encoding) and, when the up's rows read other bytes, of `xq_up`. Every
+    /// batch's [`UnionCall::run_batch`] reads the returned rooms.
+    pub(crate) fn quantize_batched<'s>(
+        &self,
+        xq: &'s mut [u8],
+        xq_up: &'s mut [u8],
+        passes: &mut u64,
+    ) -> UnionXq<'s> {
+        let cols = self.x.ne1();
+        let xq = room(xq, cols * self.gate.cb, "x in the gate's encoding");
+        let mut xq_up = if self.gate.shares_input(&self.up) {
+            None
+        } else {
+            Some(room(xq_up, cols * self.up.cb, "x in the up's encoding"))
+        };
+        if poison() {
+            xq.fill(0xA5);
+            if let Some(xq_up) = xq_up.as_deref_mut() {
+                xq_up.fill(0xA5);
+            }
+        }
+        let t = (profile::level() > 0).then(Instant::now);
+        self.quantize_x(xq, xq_up.as_deref_mut());
+        *passes += 1;
+        if let Some(t) = t {
+            profile::record_time("host_x_quant", t.elapsed().as_nanos() as u64);
+        }
+        UnionXq {
+            gate: xq,
+            up: xq_up,
+        }
+    }
+
+    /// One batch of a call served in batches: this call's plan is the
+    /// batch's experts alone (compact, from slot 0) and the three row passes
+    /// run over them — gate and up, the combines, the downs — from the
+    /// call's `x` as [`UnionCall::quantize_batched`] left it, into the front
+    /// of `gu` and `qc` (the batch's own, reused by the next) and of `store`,
+    /// where the caller placed the batch's downs. No claim state: the
+    /// quantizations are whole before the first batch, whatever the width.
+    /// Every value is the one [`UnionCall::run`] writes for the same (expert,
+    /// column).
+    pub(crate) fn run_batch(
+        &self,
+        xq: &mut UnionXq<'_>,
+        gu: &mut [f32],
+        qc: &mut [u8],
+        store: &mut [f32],
+        passes: &mut u64,
+    ) -> Result<(), crate::ModelError> {
+        let (ff, embd, slots) = (self.gate.n, self.down.n, self.plan.slots());
+        let gu = room(gu, 2 * slots * ff, "the gate/up slab");
+        let qc = room(qc, slots * self.down.cb, "the combines' slab");
+        let store = room(store, slots * embd, "the down store");
+        if poison() {
+            gu.fill(f32::NAN);
+            qc.fill(0xA5);
+            store.fill(f32::NAN);
+        }
+        let lvl = profile::level();
+        // No claim runs here, so the passes' claim time is none.
+        self.gate_up(xq.gate, xq.up.as_deref_mut(), gu, false, lvl)?;
+        *passes += 1;
+        let t = (lvl > 0).then(Instant::now);
+        self.combine(gu, qc);
+        *passes += 1;
+        if let Some(t) = t {
+            profile::record_time("host_h_quant", t.elapsed().as_nanos() as u64);
+        }
+        self.down(gu, qc, store, None, lvl)?;
+        *passes += 1;
+        Ok(())
+    }
+
+    /// The last pass of a call served in batches: every column's sum from
+    /// `store` into its column of `out` ([`UnionCall::run`]'s own), this call
+    /// holding the whole call's plan, ascending, with expert `d`'s downs at
+    /// slot `slot[d]` on in `store` — where each batch's
+    /// [`UnionCall::run_batch`] was given them.
+    pub(crate) fn sum_batched(
+        &self,
+        slot: &[usize],
+        store: &[f32],
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        passes: &mut u64,
+    ) {
+        let (cols, embd) = (self.x.ne1(), self.down.n);
+        assert_eq!(lists.len(), cols, "host union: one list a column of x");
+        assert_eq!(
+            out.len(),
+            cols * embd,
+            "host union: out holds every column's sum"
+        );
+        assert!(
+            slot.len() >= self.plan.n(),
+            "host union: a slot for every expert of the plan"
+        );
+        let t = (profile::level() > 0).then(Instant::now);
+        if self.sum_at(slot, store, lists, out) {
+            *passes += 1;
+        }
+        if let Some(t) = t {
+            profile::record_time("host_sum", t.elapsed().as_nanos() as u64);
+        }
     }
 
     /// Whether a pass over `stacks` runs qdot's row lanes: a call wider than
@@ -5156,10 +5275,22 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     /// [`UNION_INLINE_COLS`] columns, else one dispatch over the columns.
     /// Returns whether it dispatched.
     fn sum(&self, store: &[f32], lists: &[&[(u32, f32)]], out: &mut [f32]) -> bool {
+        self.sum_at(self.plan.off, store, lists, out)
+    }
+
+    /// [`UnionCall::sum`] over a `store` that holds expert `d`'s slots from
+    /// slot `slot[d]` on ([`UnionPlanView::sum_col`]).
+    fn sum_at(
+        &self,
+        slot: &[usize],
+        store: &[f32],
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> bool {
         let (cols, embd) = (self.x.ne1(), self.down.n);
         if cols <= UNION_INLINE_COLS {
             for (j, o) in out.chunks_exact_mut(embd).enumerate() {
-                self.plan.sum_col(store, lists[j], j, o);
+                self.plan.sum_col(slot, store, lists[j], j, o);
             }
             return false;
         }
@@ -5173,7 +5304,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
                 // SAFETY: the method's contract — column `j` is in this
                 // participant's chunk, inside `out` (see the construction site).
                 let o = unsafe { out.cells_mut(j * embd, embd) };
-                self.plan.sum_col(store, lists[j], j, o);
+                self.plan.sum_col(slot, store, lists[j], j, o);
             }
         });
         true

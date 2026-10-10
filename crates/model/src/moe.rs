@@ -1079,6 +1079,12 @@ pub const UNION_TAIL_MAX_GROUPS: usize = 8;
 /// The most columns a group tail's scratch can be made for.
 pub const UNION_TAIL_MAX_COLS: usize = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
 
+/// Experts of the NVMe tier's arena one batch of a tiered union call holds:
+/// the unit a claim, a fill and a pin move in ([`HostLayer::experts_union_into`]).
+/// A call whose arena ids are over the layer's slots less two batches runs in
+/// batches, and the layer's slots must hold two of them and the lane's claim.
+pub const UNION_BATCH_IDS: usize = 16;
+
 /// The listed slots — (expert, column) pairs, a column once per expert — of
 /// one batch at its worst, every column listing `n_used` experts: the least
 /// slot budget a group tail's scratch for that routed width takes, so any
@@ -1110,6 +1116,35 @@ impl UnionPlan {
             cols: Vec::with_capacity(slots),
             pairs: Vec::with_capacity(slots),
         }
+    }
+
+    /// Room for the plan of one batch of a call that holds at most `slots`
+    /// slots: no `pairs`, a batch's plan is cut from the whole's
+    /// ([`UnionPlan::cut`]).
+    fn batch_room(slots: usize) -> UnionPlan {
+        UnionPlan {
+            ids: Vec::with_capacity(slots),
+            off: Vec::with_capacity(slots + 1),
+            cols: Vec::with_capacity(slots),
+            pairs: Vec::new(),
+        }
+    }
+
+    /// The plan of `whole`'s experts `ds` (indices into `whole`, any order)
+    /// alone, in that order: compact, its slots from 0, each expert's columns
+    /// as `whole` lists them.
+    fn cut(&mut self, whole: &UnionPlan, ds: &[u32]) {
+        self.ids.clear();
+        self.off.clear();
+        self.cols.clear();
+        for &d in ds {
+            let d = d as usize;
+            self.ids.push(whole.ids[d]);
+            self.off.push(self.cols.len());
+            self.cols
+                .extend_from_slice(&whole.cols[whole.off[d]..whole.off[d + 1]]);
+        }
+        self.off.push(self.cols.len());
     }
 
     /// The plan of `lists` in place, or the named error of a list past
@@ -1164,6 +1199,95 @@ impl UnionPlan {
             ids: &self.ids,
             off: &self.off,
             cols: &self.cols,
+        }
+    }
+}
+
+/// The order a tiered call serves its experts in and where each one's downs
+/// lie in the store, in storage the scratch made at load: the batches of
+/// [`HostLayer::experts_union_into`] over a layer with an arena.
+struct UnionBatches {
+    /// The plan's experts, as indices into the plan, in serving order: the
+    /// plan's host segment's first (the file mapping's, one batch), then the
+    /// arena's keep set, then the rest, each run ascending.
+    order: Vec<u32>,
+    /// The ids of `order`, for the claims.
+    ids: Vec<u32>,
+    /// Where each batch ends in `order`.
+    ends: Vec<usize>,
+    /// Plan expert `d`'s first slot in the store: the store holds the batches
+    /// one after the other, each as its own compact plan.
+    slot: Vec<usize>,
+    /// The batch being served, as a plan of its own.
+    plan: UnionPlan,
+}
+
+/// How [`UnionBatches::lay_out`] cut a call: the batches of the host segment
+/// (none or one) and of the keep set, the rest being the other arena ids'.
+struct BatchCut {
+    host: usize,
+    keep: usize,
+}
+
+impl UnionBatches {
+    /// Room for a call of at most `slots` slots.
+    fn with_room(slots: usize) -> UnionBatches {
+        UnionBatches {
+            order: Vec::with_capacity(slots),
+            ids: Vec::with_capacity(slots),
+            ends: Vec::with_capacity(slots / UNION_BATCH_IDS + 4),
+            slot: Vec::with_capacity(slots),
+            plan: UnionPlan::batch_room(slots),
+        }
+    }
+
+    /// `plan`'s experts cut into batches of `batch`: first the ones `host`
+    /// holds, all at once, then the arena's — the `keep` of them with the most
+    /// columns (the ties to the lower id) in batches of their own, the rest
+    /// after, each run ascending by id. The caller has checked that the
+    /// arena's ids are more than `keep`, and `keep` is at least one.
+    fn lay_out(
+        &mut self,
+        plan: &UnionPlan,
+        host: &std::ops::Range<u32>,
+        keep: usize,
+        batch: usize,
+    ) -> BatchCut {
+        self.order.clear();
+        self.ends.clear();
+        let is_host = |d: usize| host.contains(&plan.ids[d]);
+        self.order
+            .extend((0..plan.n()).filter(|&d| is_host(d)).map(|d| d as u32));
+        let host_end = self.order.len();
+        if host_end > 0 {
+            self.ends.push(host_end);
+        }
+        self.order
+            .extend((0..plan.n()).filter(|&d| !is_host(d)).map(|d| d as u32));
+        let arena = &mut self.order[host_end..];
+        assert!(
+            0 < keep && keep < arena.len(),
+            "host union: a keep set of at least one, under the call's arena ids"
+        );
+        let columns = |d: u32| plan.off[d as usize + 1] - plan.off[d as usize];
+        arena.select_nth_unstable_by_key(keep - 1, |&d| (std::cmp::Reverse(columns(d)), d));
+        let (kept, rest) = arena.split_at_mut(keep);
+        kept.sort_unstable();
+        rest.sort_unstable();
+        let keep_end = host_end + keep;
+        for (from, to) in [(host_end, keep_end), (keep_end, self.order.len())] {
+            let mut at = from;
+            while at < to {
+                at = (at + batch).min(to);
+                self.ends.push(at);
+            }
+        }
+        self.ids.clear();
+        self.ids
+            .extend(self.order.iter().map(|&d| plan.ids[d as usize]));
+        BatchCut {
+            host: usize::from(host_end > 0),
+            keep: keep.div_ceil(batch),
         }
     }
 }
@@ -1225,6 +1349,8 @@ pub struct UnionScratch {
     /// A step union's distinct ids the NVMe tier lends, ascending
     /// ([`HostLayer::experts_step_union_into`]): room for every slot.
     tier_ids: Vec<u32>,
+    /// A tiered call's batches and the store's layout for them.
+    batches: UnionBatches,
 }
 
 impl UnionScratch {
@@ -1340,6 +1466,7 @@ impl UnionScratch {
                 .map(|_| AtomicU8::new(0))
                 .collect(),
             tier_ids: Vec::with_capacity(cols * per_list),
+            batches: UnionBatches::with_room(slots),
         }
     }
 
@@ -1446,18 +1573,21 @@ fn check_union_call(
 /// budget — runs as consecutive calls of [`UNION_MAX_COLS`] columns, each
 /// within them, and counts in [`UnionScratch::cut_calls`]. `stacks` are the
 /// layer's `[gate, up, down]`, resolved once for the call; `lists` has been
-/// checked against `x`, `out` and the scratch.
-fn serve_union(
-    stacks: [ExpertStack<'_>; 3],
+/// checked against `x`, `out` and the scratch. With `tier`, each call reads
+/// the ids outside the plan's host segment from the NVMe tier's arena
+/// ([`serve_tiered`]); without, every id from `stacks`' own bytes.
+fn serve_union<'w>(
+    stacks: [ExpertStack<'w>; 3],
     run: LegRun,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
     s: &mut UnionScratch,
+    tier: Option<&'w LayerTier>,
 ) -> Result<(), ModelError> {
     s.plan.build(lists, s.per_list)?;
     if s.plan.fits(s.max_slots) {
-        return serve_planned(stacks, run, x, lists, out, s);
+        return serve_one(stacks, run, x, lists, out, s, tier);
     }
     s.cut_calls += 1;
     let embd = x.ne0();
@@ -1470,16 +1600,197 @@ fn serve_union(
             s.plan.fits(s.max_slots),
             "host union: a batch's columns fit every scratch (union_batch_slots or more)"
         );
-        serve_planned(
+        serve_one(
             stacks,
             run,
             part,
             &lists[c0..c1],
             &mut out[c0 * embd..c1 * embd],
             s,
+            tier,
         )?;
         c0 = c1;
     }
+    Ok(())
+}
+
+/// [`serve_union`]'s one call: the plan in `s.plan` served from the tier when
+/// there is one and the plan names an expert.
+fn serve_one<'w>(
+    stacks: [ExpertStack<'w>; 3],
+    run: LegRun,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    s: &mut UnionScratch,
+    tier: Option<&'w LayerTier>,
+) -> Result<(), ModelError> {
+    match tier {
+        Some(tier) if s.plan.n() > 0 => serve_tiered(stacks, run, x, lists, out, s, tier),
+        _ => serve_planned(stacks, run, x, lists, out, s),
+    }
+}
+
+/// A call served in batches: the layer's tier and the arena's ids kept (the
+/// `S − 2B` of [`serve_tiered`]).
+#[derive(Clone, Copy)]
+struct Batching<'t> {
+    tier: &'t LayerTier,
+    keep: usize,
+}
+
+/// [`serve_planned`] for the plan in `s.plan` over a layer with an arena: every
+/// id outside the plan's host segment is read from its slot, so each is
+/// claimed, filled and pinned before the passes read it — and a pin lasts
+/// only while the passes read it. The layer's slots `S` and the batch `B`
+/// decide the shape. A call whose arena ids are at most `S − 2B` claims them
+/// all as [`Claim::Keep`] at once and runs whole, as a decode step's union
+/// does. A larger call runs its experts in batches of `B`, the arena's ids
+/// as `lay_out` orders them: the `S − 2B` with the most columns claimed
+/// [`Claim::Keep`], the rest [`Claim::Transient`] — the arena's cold end, the
+/// first victims — each batch pinned while it computes and no longer, and the
+/// next batch's claim issued before the compute, so the pinned slots are at
+/// most `2B`. Its gate/up, combine and down passes run per batch, each
+/// expert's downs stored by their slot, and the per-column sums run once
+/// after the last batch, in list order from zero: every value is the
+/// whole call's, bit for bit. A layer under `2B` and the lane's claim is
+/// refused by name ([`TierError::BatchFloor`]) before any claim, and so is an
+/// expert past the stacks'. The host segment's experts compute first, under
+/// the first batch's fill.
+fn serve_tiered<'w>(
+    stacks: [ExpertStack<'w>; 3],
+    run: LegRun,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    s: &mut UnionScratch,
+    tier: &'w LayerTier,
+) -> Result<(), ModelError> {
+    let batch = tier.batch;
+    assert!(batch > 0, "host union: a batch holds at least one expert");
+    // Refused before any claim: an expert past the stacks' (the passes' own
+    // check, made once here).
+    UnionCall::new(s.plan.view(), stacks, x, run.limit, s.ff)?;
+    let mut stacks = stacks;
+    tier.lend(&mut stacks);
+    s.tier_ids.clear();
+    s.tier_ids.extend(
+        s.plan
+            .ids
+            .iter()
+            .copied()
+            .filter(|e| !tier.host.contains(e)),
+    );
+    if s.tier_ids.is_empty() {
+        return serve_planned(stacks, run, x, lists, out, s);
+    }
+    let slots = tier.slots.slots(tier.layer);
+    if slots >= 2 * batch && s.tier_ids.len() <= slots - 2 * batch {
+        let pin = tier
+            .slots
+            .ensure_pinned(tier.layer, &s.tier_ids, Claim::Keep)?;
+        tier.check_lent(&stacks, &s.tier_ids)?;
+        let served = serve_planned(stacks, run, x, lists, out, s);
+        drop(pin);
+        return served;
+    }
+    let need = 2 * batch + crate::placement::ARENA_LANE_CLAIMS as usize;
+    if slots < need {
+        return Err(TierError::BatchFloor {
+            layer: tier.layer,
+            slots,
+            need,
+        }
+        .into());
+    }
+    let batching = Batching {
+        tier,
+        keep: slots - 2 * batch,
+    };
+    serve_batched(stacks, run, x, lists, out, s, batching)
+}
+
+/// [`serve_tiered`]'s batches: the arena's ids of the plan in `s.plan` cut as
+/// `batching` says.
+fn serve_batched<'w>(
+    stacks: [ExpertStack<'w>; 3],
+    run: LegRun,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    s: &mut UnionScratch,
+    batching: Batching<'w>,
+) -> Result<(), ModelError> {
+    let Batching { tier, keep } = batching;
+    let (batch, embd) = (tier.batch, x.ne0());
+    let ff = s.ff;
+    let UnionScratch {
+        plan,
+        xq,
+        xq_up,
+        gu,
+        qc,
+        store,
+        passes,
+        batches,
+        ..
+    } = s;
+    let plan = &*plan;
+    let cut = batches.lay_out(plan, &tier.host, keep, batch);
+    let UnionBatches {
+        order,
+        ids,
+        ends,
+        slot,
+        plan: sub,
+    } = batches;
+    let (order, ids, ends) = (&*order, &*ids, &*ends);
+    let span = |g: usize| {
+        let from = g.checked_sub(1).map_or(0, |p| ends[p]);
+        from..ends[g]
+    };
+    let whole = UnionCall::new(plan.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+    let mut xqs = whole.quantize_batched(xq, xq_up, passes);
+    slot.clear();
+    slot.resize(plan.n(), 0);
+    let claim_of = |g: usize| {
+        if g < cut.host + cut.keep {
+            Claim::Keep
+        } else {
+            Claim::Transient
+        }
+    };
+    let mut pending = Some(tier.slots.prefetch_pinned(
+        tier.layer,
+        &ids[span(cut.host)],
+        claim_of(cut.host),
+    )?);
+    let mut base = 0;
+    for g in 0..ends.len() {
+        let mut pin = None;
+        if g >= cut.host {
+            let ticket = pending.take().expect("a ticket for every arena batch");
+            pin = Some(ticket.wait()?);
+            if g + 1 < ends.len() {
+                pending = Some(tier.slots.prefetch_pinned(
+                    tier.layer,
+                    &ids[span(g + 1)],
+                    claim_of(g + 1),
+                )?);
+            }
+            tier.check_lent(&stacks, &ids[span(g)])?;
+        }
+        sub.cut(plan, &order[span(g)]);
+        for (i, &d) in order[span(g)].iter().enumerate() {
+            slot[d as usize] = base + sub.off[i];
+        }
+        let batch_call =
+            UnionCall::new(sub.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+        batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], passes)?;
+        base += sub.cols.len();
+        drop(pin);
+    }
+    whole.sum_batched(slot, store, lists, out, passes);
     Ok(())
 }
 
@@ -1540,7 +1851,7 @@ pub fn experts_union_into<'x>(
         ExpertStack::in_file(gguf, up)?,
         ExpertStack::in_file(gguf, down)?,
     ];
-    serve_union(stacks, LegRun::flat(None), x, lists, out, scratch)
+    serve_union(stacks, LegRun::flat(None), x, lists, out, scratch, None)
 }
 
 /// What a host tier needs to serve one layer's routed experts, in the
@@ -1675,6 +1986,18 @@ pub enum TierError {
         layer: usize,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// A union call over more of the arena's ids than the layer's slots less
+    /// two batches runs in batches, and the layer's slots are under the
+    /// floor of that: the computing batch and the one being filled pinned at
+    /// once, and the lane's claim beside them.
+    #[error(
+        "layer {layer}'s arena holds {slots} slots; a union call served in batches pins two          batches and leaves the lane's claim a slot, which takes {need}"
+    )]
+    BatchFloor {
+        layer: usize,
+        slots: usize,
+        need: usize,
+    },
 }
 
 /// How a claim places the slots it takes and the ids it finds filled in the
@@ -1710,6 +2033,38 @@ impl<'a> TierPin<'a> {
     }
 }
 
+/// A batch's claim in flight ([`TierSlots::prefetch_pinned`]): the batch's
+/// slots are taken in the tier's books and being filled, and
+/// [`Ticket::wait`] returns once every one is filled, with the batch pinned.
+/// The ticket owns its completion — a boxed handle, not a borrow of the
+/// tier's threads — so whoever fills may run anywhere. A ticket dropped
+/// without a wait gives its claim back: the batch is unpinned, once its fill
+/// has ended.
+#[must_use = "the claim lasts until the ticket is waited for or dropped"]
+pub struct Ticket<'a> {
+    wait: Box<dyn FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a>,
+}
+
+impl<'a> Ticket<'a> {
+    /// A ticket that completes as `wait` returns: the batch's pin once every
+    /// slot is filled, or the fill's refusal.
+    pub fn new(wait: impl FnOnce() -> Result<TierPin<'a>, TierError> + Send + 'a) -> Ticket<'a> {
+        Ticket {
+            wait: Box::new(wait),
+        }
+    }
+
+    /// A ticket whose batch is filled and pinned already.
+    pub fn ready(pin: TierPin<'a>) -> Ticket<'a> {
+        Ticket::new(move || Ok(pin))
+    }
+
+    /// Block until the batch is filled; its pin, or the fill's refusal.
+    pub fn wait(self) -> Result<TierPin<'a>, TierError> {
+        (self.wait)()
+    }
+}
+
 /// The RAM arena a host layer's routed experts read from beside the file
 /// mapping, as the gpu side holds it: `ensure` fills the slots of the ids a
 /// call is about to read (a miss is read before the compute, so a call's
@@ -1730,6 +2085,36 @@ pub trait TierSlots: Send + Sync {
     /// a victim of a later claim until the guard drops. Refused by name when
     /// an id is past the layer's experts or unfilled; nothing is pinned then.
     fn pin<'a>(&'a self, layer: usize, ids: &[u32]) -> Result<TierPin<'a>, TierError>;
+    /// Layer `layer`'s slot count: what a union call sizes its batches
+    /// against. 0 for a layer the tier does not cover.
+    fn slots(&self, layer: usize) -> usize;
+    /// [`TierSlots::ensure_as`] and [`TierSlots::pin`] as one claim, for a
+    /// batch the caller computes at once: every id of `ids` the tier serves
+    /// is filled and pinned when this returns, and no claim takes a slot of
+    /// the batch between its claim and its pin — a hit is pinned as the
+    /// claim finds it, a miss as its fill publishes, under one hold of the
+    /// tier's books. Refused by name like the two it joins (an id past the
+    /// layer's experts, every slot pinned); nothing is pinned then.
+    fn ensure_pinned<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        claim: Claim,
+    ) -> Result<TierPin<'a>, TierError>;
+    /// [`TierSlots::ensure_pinned`] as a claim in flight: the batch's slots
+    /// are claimed when this returns, the fill may run on other threads, and
+    /// [`Ticket::wait`] returns the pin once it ends. A caller issues the
+    /// next batch's ticket before it computes the one it holds, so the fill
+    /// of the next runs under the compute of this. The default fills on the
+    /// caller, the ticket ready.
+    fn prefetch_pinned<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        claim: Claim,
+    ) -> Result<Ticket<'a>, TierError> {
+        self.ensure_pinned(layer, ids, claim).map(Ticket::ready)
+    }
     /// Layer `layer`, expert `id`, part `part`'s bytes as the tier holds
     /// them; `None` when its slot is unfilled.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
@@ -1745,6 +2130,47 @@ struct LayerTier {
     layer: usize,
     host: std::ops::Range<u32>,
     slots: std::sync::Arc<dyn TierSlots>,
+    /// The experts a batch of the layer's tiered union holds.
+    batch: usize,
+}
+
+impl LayerTier {
+    /// `stacks` reading every id outside the plan's host segment from the
+    /// arena's slots.
+    fn lend<'w>(&'w self, stacks: &mut [ExpertStack<'w>; 3]) {
+        for (part, stack) in stacks.iter_mut().enumerate() {
+            *stack = stack.with_tier(StackTier::new(&*self.slots, self.layer, &self.host, part));
+        }
+    }
+
+    /// Each of `ids`' three parts as the arena lends them, against `stacks`:
+    /// refused by name when a slot is unfilled ([`TierError::Unfilled`]) or
+    /// of another length than the stack's matrix ([`TierError::SlotLength`]).
+    fn check_lent(&self, stacks: &[ExpertStack<'_>; 3], ids: &[u32]) -> Result<(), TierError> {
+        for &id in ids {
+            for (part, stack) in stacks.iter().enumerate() {
+                match self.slots.slot(self.layer, id, part) {
+                    None => {
+                        return Err(TierError::Unfilled {
+                            layer: self.layer,
+                            id,
+                        });
+                    }
+                    Some(bytes) if bytes.len() != stack.per() => {
+                        return Err(TierError::SlotLength {
+                            layer: self.layer,
+                            id,
+                            part,
+                            got: bytes.len(),
+                            want: stack.per(),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One layer's routed experts as a host tier serves them: the three stacks —
@@ -1837,7 +2263,12 @@ impl HostLayer {
         host: std::ops::Range<u32>,
         slots: std::sync::Arc<dyn TierSlots>,
     ) {
-        self.tier = Some(LayerTier { layer, host, slots });
+        self.tier = Some(LayerTier {
+            layer,
+            host,
+            slots,
+            batch: UNION_BATCH_IDS,
+        });
     }
 
     /// One expert's part as this layer serves it, the one owner of the
@@ -1984,7 +2415,11 @@ impl HostLayer {
     /// [`HostLayer::experts_into`] of column `j` of `x` and `lists[j]` bit
     /// for bit, each distinct expert's matrices read once per call from the
     /// shard that holds them. `x` is read in place, a block or a view; `src`
-    /// is the pair the layer was built from.
+    /// is the pair the layer was built from. A layer with an NVMe tier reads
+    /// the ids outside the plan's host segment from the arena's slots instead,
+    /// claimed, filled and pinned in batches when the call names more than the
+    /// layer's slots less two batches ([`UNION_BATCH_IDS`]), so its tier ids
+    /// never need the file mapping; the bits are the same.
     pub fn experts_union_into<'x>(
         &self,
         src: R8Source<'_>,
@@ -1998,7 +2433,10 @@ impl HostLayer {
 
     /// [`HostLayer::experts_union_into`] with the two row passes laid over
     /// the pool as `lanes` says: the same values, bit for bit, whichever
-    /// lanes.
+    /// lanes. A layer with an arena reads the ids outside the plan's host
+    /// segment from its slots, in batches when the call names more than the
+    /// layer's slots less two batches ([`serve_tiered`]); a layer with none
+    /// reads the file mapping alone.
     fn union_on<'x>(
         &self,
         lanes: Lanes,
@@ -2011,10 +2449,6 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         let x = x.into();
-        // Every id from the file mapping, the NVMe tier's too: a prompt call
-        // touches more ids a layer than the arena holds slots, and its reader
-        // lets the tier's pages go after the call. A decode step's union reads
-        // the tier's ids from the arena ([`HostLayer::experts_step_union_into`]).
         check_union_call(
             x,
             lists,
@@ -2026,7 +2460,15 @@ impl HostLayer {
             limit: Some(self.limit),
             lanes,
         };
-        serve_union(self.stacks_of(split)?, run, x, lists, out, scratch)
+        serve_union(
+            self.stacks_of(split)?,
+            run,
+            x,
+            lists,
+            out,
+            scratch,
+            self.tier.as_ref(),
+        )
     }
 
     /// [`HostLayer::experts_union_into`] with every id outside the plan's
@@ -2102,40 +2544,14 @@ impl HostLayer {
         let mut stacks = self.stacks_of(split)?;
         if !scratch.tier_ids.is_empty() {
             tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
-            for &id in &scratch.tier_ids {
-                for (part, stack) in stacks.iter().enumerate() {
-                    match tier.slots.slot(tier.layer, id, part) {
-                        None => {
-                            return Err(TierError::Unfilled {
-                                layer: tier.layer,
-                                id,
-                            }
-                            .into());
-                        }
-                        Some(bytes) if bytes.len() != stack.per() => {
-                            return Err(TierError::SlotLength {
-                                layer: tier.layer,
-                                id,
-                                part,
-                                got: bytes.len(),
-                                want: stack.per(),
-                            }
-                            .into());
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-            for (part, stack) in stacks.iter_mut().enumerate() {
-                *stack =
-                    stack.with_tier(StackTier::new(&*tier.slots, tier.layer, &tier.host, part));
-            }
+            tier.check_lent(&stacks, &scratch.tier_ids)?;
+            tier.lend(&mut stacks);
         }
         let run = LegRun {
             limit: Some(self.limit),
             lanes,
         };
-        serve_union(stacks, run, x, lists, out, scratch)
+        serve_union(stacks, run, x, lists, out, scratch, None)
     }
 
     /// The matrices a warm routine fills for `ids`, pushed to `out` in `ids`'
@@ -2172,10 +2588,7 @@ impl HostLayer {
         self.read_beside(src)?;
         let mut stacks = self.stacks_of(src.split())?;
         if let Some(tier) = &self.tier {
-            for (part, stack) in stacks.iter_mut().enumerate() {
-                *stack =
-                    stack.with_tier(StackTier::new(&*tier.slots, tier.layer, &tier.host, part));
-            }
+            tier.lend(&mut stacks);
         }
         'ids: for &id in ids {
             if id as usize >= self.n_expert {
@@ -2710,8 +3123,52 @@ mod tests {
     struct MockTier {
         parts: Vec<Vec<u8>>,
         filled: bool,
+        /// What `slots` reports for every layer.
+        slots: usize,
         ensured: std::sync::Mutex<Vec<(usize, Vec<u32>)>>,
         asked: std::sync::Mutex<Vec<(usize, u32, usize)>>,
+        pins: std::sync::Mutex<PinLog>,
+    }
+
+    /// What the batch pins did, in order, and every read no pin covered.
+    #[derive(Default)]
+    struct PinLog {
+        /// The ids pinned now with whether their ticket was waited for (a
+        /// direct `ensure_pinned` is waited for as it returns).
+        held: Vec<(u32, bool)>,
+        /// The most ids pinned at once.
+        peak: usize,
+        events: Vec<PinEvent>,
+        /// `(id, part)` of every `slot` call for an id that was not pinned
+        /// by a batch whose ticket had been waited for.
+        loose: Vec<(u32, usize)>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum PinEvent {
+        Pinned(super::Claim, Vec<u32>),
+        Unpinned(Vec<u32>),
+    }
+
+    /// A batch's pin: the drop unpins it in the mock's log.
+    struct MockPin<'a> {
+        tier: &'a MockTier,
+        ids: Vec<u32>,
+    }
+
+    impl Drop for MockPin<'_> {
+        fn drop(&mut self) {
+            let mut log = self.tier.pins.lock().unwrap();
+            for id in &self.ids {
+                let at = log
+                    .held
+                    .iter()
+                    .position(|h| h.0 == *id)
+                    .expect("a pinned id");
+                log.held.remove(at);
+            }
+            log.events.push(PinEvent::Unpinned(self.ids.clone()));
+        }
     }
 
     impl MockTier {
@@ -2733,9 +3190,26 @@ mod tests {
             MockTier {
                 parts,
                 filled,
+                slots: 0,
                 ensured: std::sync::Mutex::new(Vec::new()),
                 asked: std::sync::Mutex::new(Vec::new()),
+                pins: std::sync::Mutex::new(PinLog::default()),
             }
+        }
+
+        /// `ids` pinned and logged, `waited` when the caller has the pin.
+        fn pin_batch(&self, ids: &[u32], claim: super::Claim, waited: bool) -> super::TierPin<'_> {
+            let ids = ids.to_vec();
+            let mut log = self.pins.lock().unwrap();
+            log.held.extend(ids.iter().map(|&id| (id, waited)));
+            log.peak = log.peak.max(log.held.len());
+            log.events.push(PinEvent::Pinned(claim, ids.clone()));
+            super::TierPin::new(MockPin { tier: self, ids })
+        }
+
+        /// The batch pins' events so far.
+        fn events(&self) -> Vec<PinEvent> {
+            std::mem::take(&mut self.pins.lock().unwrap().events)
         }
 
         fn ensured(&self) -> Vec<(usize, Vec<u32>)> {
@@ -2766,8 +3240,50 @@ mod tests {
             Ok(super::TierPin::new(()))
         }
 
+        fn slots(&self, _layer: usize) -> usize {
+            self.slots
+        }
+
+        fn ensure_pinned<'a>(
+            &'a self,
+            _layer: usize,
+            ids: &[u32],
+            claim: super::Claim,
+        ) -> Result<super::TierPin<'a>, super::TierError> {
+            Ok(self.pin_batch(ids, claim, true))
+        }
+
+        /// The claim is made now, as a ready ticket's would be, and only the
+        /// wait covers the batch's reads: a compute that reads it before its
+        /// ticket was waited for reads a fill that may be running.
+        fn prefetch_pinned<'a>(
+            &'a self,
+            _layer: usize,
+            ids: &[u32],
+            claim: super::Claim,
+        ) -> Result<super::Ticket<'a>, super::TierError> {
+            let pin = self.pin_batch(ids, claim, false);
+            let ids = ids.to_vec();
+            Ok(super::Ticket::new(move || {
+                let mut log = self.pins.lock().unwrap();
+                for id in &ids {
+                    log.held
+                        .iter_mut()
+                        .find(|h| h.0 == *id)
+                        .expect("a pinned id")
+                        .1 = true;
+                }
+                drop(log);
+                Ok(pin)
+            }))
+        }
+
         fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
             self.asked.lock().unwrap().push((layer, id, part));
+            let mut log = self.pins.lock().unwrap();
+            if !log.held.contains(&(id, true)) {
+                log.loose.push((id, part));
+            }
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
     }
@@ -2922,6 +3438,249 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A union over a layer with an arena runs in pinned batches: the keep
+    /// set (the arena ids with the most columns, the ties to the lower id)
+    /// first, each batch claimed [`super::Claim::Keep`], then the rest as
+    /// [`super::Claim::Transient`], each batch ascending; every read of a slot
+    /// lands after its batch's ticket was waited for and while it is pinned, at
+    /// most two batches are pinned at once, and every column is bit for bit
+    /// the file mapping's union — a call of ten columns (the five passes) and
+    /// one of eight (the narrow form's claimed quantizations and inline sum
+    /// against the batches' quantize-first passes). A call whose arena ids fit
+    /// the slots less two batches takes one claim of all of them. A layer under
+    /// two batches and the lane's claim, and an expert past the stacks', are
+    /// refused by name before any claim, and an unfilled slot by name with
+    /// every pin released.
+    #[test]
+    fn a_tiered_union_runs_in_pinned_batches_keep_first() {
+        use super::{Claim, TierError};
+        let (embd, ff, n_expert, batch) = (256, 256, 14, 3);
+        let tys = [GgmlType::Q4_K; 3];
+        let path = layer_file("tierbatch", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        let plain = build_layer(&split, embd, ff, n_expert).unwrap();
+        // Ids 0 and 1 are the host segment's; ids 2..14 the arena's. `counts`
+        // are the columns that list each id (an id is listed by the first
+        // `counts[id]` columns, each list rotated by its column).
+        let lists_of = |counts: &[usize; 14], cols: usize| -> Vec<Vec<(u32, f32)>> {
+            (0..cols)
+                .map(|j| {
+                    let mut ids: Vec<u32> = (0..n_expert as u32)
+                        .filter(|&e| counts[e as usize] > j)
+                        .collect();
+                    let turn = j % ids.len();
+                    ids.rotate_left(turn);
+                    ids.iter()
+                        .enumerate()
+                        .map(|(i, &e)| (e, 0.125 + 0.0625 * ((i + j) % 5) as f32))
+                        .collect()
+                })
+                .collect()
+        };
+        let x_of = |cols: usize| {
+            Tensor2::from_vec(
+                embd,
+                cols,
+                (0..embd * cols)
+                    .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                    .collect(),
+            )
+        };
+        let mut us = UnionScratch::new_routed(embd, ff, 10, n_expert).unwrap();
+        // The mapping's union of `lists` over `x`.
+        let reference = |us: &mut UnionScratch, x: &Tensor2, lists: &[Vec<(u32, f32)>]| {
+            let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+            let mut want = vec![f32::NAN; embd * lists.len()];
+            plain
+                .experts_union_into(src, x, &slices, &mut want, us)
+                .unwrap();
+            want
+        };
+        let tiered = |filled: bool, slots: usize| {
+            let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+            let mut mock = MockTier::of(&split, &layer, filled);
+            mock.slots = slots;
+            let mock = std::sync::Arc::new(mock);
+            layer.attach_tier(4, 0..2, mock.clone());
+            layer.tier.as_mut().expect("the tier just attached").batch = batch;
+            (layer, mock)
+        };
+        let diff = |got: &[f32], want: &[f32]| {
+            got.iter()
+                .zip(want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count()
+        };
+
+        // Ten columns; the arena holds ten slots: keep 10 - 2 * 3 = 4 of the
+        // twelve ids. The top four by columns, ties to the lower id: 13, 3, 5,
+        // 7 — not the ascending head 2, 3, 4, 5.
+        let counts = [3usize, 1, 1, 9, 1, 4, 1, 2, 2, 1, 2, 1, 1, 10];
+        let (lists, x) = (lists_of(&counts, 10), x_of(10));
+        let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+        let want = reference(&mut us, &x, &lists);
+        let (layer, mock) = tiered(true, 10);
+        let mut got = vec![f32::NAN; embd * 10];
+        layer
+            .experts_union_into(src, &x, &slices, &mut got, &mut us)
+            .unwrap();
+        assert_eq!(
+            diff(&got, &want),
+            0,
+            "the batched union differs from the mapping's"
+        );
+        let events = mock.events();
+        let claims: Vec<(Claim, Vec<u32>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                PinEvent::Pinned(claim, ids) => Some((*claim, ids.clone())),
+                PinEvent::Unpinned(_) => None,
+            })
+            .collect();
+        let mut by_count: Vec<u32> = (2..n_expert as u32).collect();
+        by_count.sort_by_key(|&e| (std::cmp::Reverse(counts[e as usize]), e));
+        let mut kept: Vec<u32> = by_count[..4].to_vec();
+        kept.sort_unstable();
+        assert_eq!(kept, [3, 5, 7, 13], "the keep set the test expects");
+        let keep_claimed: Vec<u32> = claims[..2]
+            .iter()
+            .flat_map(|(_, ids)| ids.clone())
+            .collect();
+        assert_eq!(
+            keep_claimed, kept,
+            "the first batches are the keep set, ascending"
+        );
+        assert_eq!(
+            claims,
+            vec![
+                (Claim::Keep, vec![3, 5, 7]),
+                (Claim::Keep, vec![13]),
+                (Claim::Transient, vec![2, 4, 6]),
+                (Claim::Transient, vec![8, 9, 10]),
+                (Claim::Transient, vec![11, 12]),
+            ],
+            "batches of three, one kind each, the keep set's first, ascending"
+        );
+        {
+            let log = mock.pins.lock().unwrap();
+            assert!(
+                log.loose.is_empty(),
+                "a slot was read outside a waited, pinned batch: {:?}",
+                log.loose
+            );
+            assert_eq!(log.peak, 2 * batch, "two batches pinned at the most");
+            assert!(log.held.is_empty(), "every pin released after the call");
+        }
+        let pinned = events
+            .iter()
+            .filter(|e| matches!(e, PinEvent::Pinned(..)))
+            .count();
+        assert_eq!(pinned, events.len() - pinned, "one unpin for every pin");
+        let read: std::collections::BTreeSet<u32> =
+            mock.asked().iter().map(|&(_, id, _)| id).collect();
+        assert_eq!(
+            read.iter().copied().collect::<Vec<_>>(),
+            (2..n_expert as u32).collect::<Vec<_>>(),
+            "every arena id read from its slot, no host id"
+        );
+
+        // A call whose arena ids (three) fit the slots less two batches: one
+        // claim of all of them, as keep, and the same bits.
+        let small: Vec<Vec<(u32, f32)>> = vec![
+            vec![(4, 0.5), (0, 0.25), (9, 0.125)],
+            vec![(11, 0.75), (1, 0.5)],
+        ];
+        let small_refs: Vec<&[(u32, f32)]> = small.iter().map(Vec::as_slice).collect();
+        let xs = Tensor2::from_vec(embd, 2, [x.col(0), x.col(1)].concat());
+        let want_small = reference(&mut us, &xs, &small);
+        let mut got_small = vec![f32::NAN; 2 * embd];
+        layer
+            .experts_union_into(src, &xs, &small_refs, &mut got_small, &mut us)
+            .unwrap();
+        assert_eq!(
+            diff(&got_small, &want_small),
+            0,
+            "the one-claim union differs from the mapping's"
+        );
+        assert_eq!(
+            mock.events(),
+            vec![
+                PinEvent::Pinned(Claim::Keep, vec![4, 9, 11]),
+                PinEvent::Unpinned(vec![4, 9, 11]),
+            ],
+            "a small call claims all its arena ids at once, as keep"
+        );
+
+        // The floor's own slots (two batches and the lane's claim) serve the
+        // call with a keep set of one, and the narrow form (eight columns:
+        // claimed quantizations and an inline sum whole) matches the batches'
+        // passes; the ties at the cut go to the lower id (3 and 13 both list
+        // in eight columns).
+        let counts8 = [3usize, 1, 1, 8, 1, 4, 1, 2, 2, 1, 2, 1, 1, 8];
+        let (lists8, x8) = (lists_of(&counts8, 8), x_of(8));
+        let slices8: Vec<&[(u32, f32)]> = lists8.iter().map(Vec::as_slice).collect();
+        let want8 = reference(&mut us, &x8, &lists8);
+        let (layer, mock) = tiered(true, 2 * batch + 1);
+        let mut got8 = vec![f32::NAN; embd * 8];
+        layer
+            .experts_union_into(src, &x8, &slices8, &mut got8, &mut us)
+            .unwrap();
+        assert_eq!(
+            diff(&got8, &want8),
+            0,
+            "the narrow call's batches differ from its whole"
+        );
+        assert_eq!(
+            mock.events().first(),
+            Some(&PinEvent::Pinned(Claim::Keep, vec![3])),
+            "a keep set of one, the tie to the lower id"
+        );
+        assert!(mock.pins.lock().unwrap().loose.is_empty());
+        // One slot under the floor is refused by name before any claim.
+        let (layer, mock) = tiered(true, 2 * batch);
+        match layer.experts_union_into(src, &x, &slices, &mut got, &mut us) {
+            Err(crate::ModelError::Tier(TierError::BatchFloor {
+                layer: 4,
+                slots: 6,
+                need: 7,
+            })) => {}
+            other => panic!("not the floor's refusal by name: {other:?}"),
+        }
+        assert!(
+            mock.events().is_empty(),
+            "the refusal came before any claim"
+        );
+
+        // An expert past the stacks' is refused before any claim.
+        let (layer, mock) = tiered(true, 10);
+        let past = [(14u32, 1.0f32)];
+        let past_refs: Vec<&[(u32, f32)]> = vec![&past[..]];
+        let x1 = Tensor2::zeros(embd, 1);
+        let e = layer
+            .experts_union_into(src, &x1, &past_refs, &mut got[..embd], &mut us)
+            .expect_err("an expert past the stacks'")
+            .to_string();
+        assert!(e.contains("expert 14"), "{e}");
+        assert!(
+            mock.events().is_empty(),
+            "the refusal came before any claim"
+        );
+
+        // An unfilled slot is refused by name once its batch is pinned, and
+        // the pins are released with the refusal.
+        let (layer, mock) = tiered(false, 10);
+        match layer.experts_union_into(src, &x, &slices, &mut got, &mut us) {
+            Err(crate::ModelError::Tier(TierError::Unfilled { layer: 4, id: 3 })) => {}
+            other => panic!("not the unfilled refusal by name: {other:?}"),
+        }
+        assert!(
+            mock.pins.lock().unwrap().held.is_empty(),
+            "no pin outlives the refusal"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// The host segment's ids read the mapping and every other id the tier's
     /// slot: an unfilled slot is refused by name, naming its layer and
     /// expert, never a silent fallback to the mapping — and a filled slot
@@ -2972,7 +3731,9 @@ mod tests {
 
         // The filled slot: bytes the call turns into the mapping's own
         // values — the no-tier path's, bit for bit.
-        let full = std::sync::Arc::new(MockTier::of(&split, &layer, true));
+        let mut full = MockTier::of(&split, &layer, true);
+        full.slots = 2 * super::UNION_BATCH_IDS + 8;
+        let full = std::sync::Arc::new(full);
         layer.attach_tier(4, 1..2, full.clone());
         let mut want = vec![f32::NAN; embd];
         layer
@@ -2989,8 +3750,8 @@ mod tests {
             "a filled slot's call writes the mapping path's values"
         );
 
-        // The union path's hook: the same ensure over its columns' ids, and
-        // the call's bits the plain path's.
+        // The union path's claim: its columns' tier ids pinned once, as keep,
+        // for the call, and the call's bits the plain path's.
         let cols = 3;
         let xw = Tensor2::from_vec(
             embd,
@@ -3018,6 +3779,14 @@ mod tests {
             b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "a tier-bearing union call writes the plain path's values"
         );
+        assert_eq!(
+            full.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Keep, vec![0, 2]),
+                PinEvent::Unpinned(vec![0, 2]),
+            ],
+            "the union claimed the call's tier ids at once, as keep"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -3027,7 +3796,8 @@ mod tests {
     /// the first such id; a filled one gives the bits of the mapping's union
     /// — a layer with no tier and the same layer's mapping reader alike —
     /// and the tier is asked for every tier id's three parts and never for
-    /// an id of the host segment.
+    /// an id of the host segment; the same layer's prompt union reads the
+    /// arena too and writes the same bits.
     #[test]
     fn a_step_union_reads_the_tier_from_its_slots() {
         let (embd, ff, n_expert) = (256, 256, 6);
@@ -3072,7 +3842,9 @@ mod tests {
             "ensure saw the call's distinct tier ids once, ascending, at the tier's layer"
         );
 
-        let full = std::sync::Arc::new(MockTier::of(&split, &layer, true));
+        let mut full = MockTier::of(&split, &layer, true);
+        full.slots = 2 * super::UNION_BATCH_IDS + 8;
+        let full = std::sync::Arc::new(full);
         layer.attach_tier(4, 1..2, full.clone());
         let mut got = vec![f32::NAN; embd * cols];
         layer
@@ -3095,9 +3867,9 @@ mod tests {
         );
 
         let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-        let mut mapped = vec![f32::NAN; embd * cols];
+        let mut prompt = vec![f32::NAN; embd * cols];
         layer
-            .experts_union_into(src, &xw, &lists, &mut mapped, &mut us)
+            .experts_union_into(src, &xw, &lists, &mut prompt, &mut us)
             .unwrap();
         let plain = build_layer(&split, embd, ff, n_expert).unwrap();
         let mut want = vec![f32::NAN; embd * cols];
@@ -3110,9 +3882,9 @@ mod tests {
             "the step union writes a tier-less union's bits"
         );
         assert_eq!(
-            bits(&mapped),
+            bits(&prompt),
             bits(&want),
-            "the same layer's mapping reader writes a tier-less union's bits"
+            "the same layer's prompt union, from the arena, writes a tier-less union's bits"
         );
         std::fs::remove_file(&path).unwrap();
     }
