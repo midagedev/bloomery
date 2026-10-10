@@ -40,7 +40,7 @@ not built. Say in the pull request which commands you ran and paste their output
   last three attaches, and which of them you can verify alone).
 - **NVIDIA DGX Spark (aarch64, GB10):** [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md) (the port map).
 
-Open an issue first for either, so two people do not take the same model. MiMo-V2.6-Flash is in progress.
+Open an issue first for either (the "New model support" template for a model), so two people do not take the same one. MiMo-V2.6-Flash is in progress.
 
 ## Rules
 
