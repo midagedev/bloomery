@@ -887,8 +887,9 @@ const Q35_PROJ: &[GgmlType] = &[
 /// the table names the type's prompt GEMM too ([`kernels::gemm`]), among
 /// the entries the family's FFN dispatch launches
 /// (`gpu/src/arch/qwen3moe/dispatch.rs`): the K-quant family's Q4_K and
-/// Q5_K. The table's Q8_0 row reads a stack in the file's block stream and
-/// its i-quant rows are `iq_sel.rs`'s; the dispatch launches neither, so
+/// Q5_K. The table's Q8_0 row reads a stack in the file's block stream, its
+/// i-quant rows are `iq_sel.rs`'s and its MXFP4 row is `mxfp4_sel.rs`'s; the
+/// dispatch launches none of them, so
 /// such a stack is refused by name.
 #[must_use]
 pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
@@ -897,7 +898,7 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
     };
     match entry {
         GateUpEntry::Q4k | GateUpEntry::Q5k => Some(entry),
-        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => None,
+        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs | GateUpEntry::Mxfp4 => None,
     }
 }
 
@@ -914,7 +915,11 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
     };
     match entry {
         DownEntry::Q4k | DownEntry::Q5k | DownEntry::Q6k => Some(entry),
-        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => None,
+        DownEntry::Q5_0
+        | DownEntry::Q5_1
+        | DownEntry::Q8_0
+        | DownEntry::Iq4nl
+        | DownEntry::Mxfp4 => None,
     }
 }
 

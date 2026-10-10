@@ -662,10 +662,9 @@ fn gate_up_sel(
     match entry {
         GateUpEntry::Q4k => kq.enqueue_gate_up_q4k(stream, a, sink, h),
         GateUpEntry::Q5k => kq.enqueue_gate_up_q5k(stream, a, sink, h),
-        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => Err(GpuError::state(
-            WHAT,
-            "a gate·up entry the plan admits for no stack here",
-        )),
+        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs | GateUpEntry::Mxfp4 => Err(
+            GpuError::state(WHAT, "a gate·up entry the plan admits for no stack here"),
+        ),
     }
 }
 
@@ -696,7 +695,11 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         DownEntry::Q6k => DownArm::Q6k,
         // These read `Q8Blocks32` columns (the 32-value quantizer,
         // `enqueue_quantize_q8_sel`); the placed side's rows are `Q8Act`.
-        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
+        DownEntry::Q5_0
+        | DownEntry::Q5_1
+        | DownEntry::Q8_0
+        | DownEntry::Iq4nl
+        | DownEntry::Mxfp4 => {
             return Err(refuse(format!(
                 "its entry {entry:?} reads {act:?} columns; the placed side quantizes its \
                  SwiGLU rows as {:?}",

@@ -23,7 +23,23 @@
 //!    are printed in ulps), the tickets return to zero. Then planted ties,
 //!    where the larger id must win, and a row whose every score is 0, whose
 //!    weights must still be finite.
-//! 4. **Oracle diagnostics, no pin**: the dsref set `code64_n32_w3`, block 0
+//! 4. **The common table's per-slot pair** (`bloomery_gpu::mxfp4_sel::
+//!    Mxfp4SelKernels`, the file's 17-byte blocks as the KQuant word stream
+//!    and a `Q8Act`): for each plan of item 1, per (slot, token) the pair's
+//!    gate·up rows equal the route entry's `h` bit for bit, and the pair's
+//!    down rows summed in the fused entry's combine order (slots ascending,
+//!    `acc = fma(dot, w, acc)`) equal its `out` bit for bit; a (slot, token)
+//!    the plan does not route is a `HOST` slot, which keeps its rows at the
+//!    sentinel and raises nothing; ids past the stack raise `ExpertId`
+//!    (the gate·up writes NaN rows, the down leaves its rows) and the next
+//!    clean launch is clean; both activation rules (`SwigluClamp` at a limit
+//!    that clamps, bit for bit against the route entry at the same limit;
+//!    `SiluMul` against the f64 rule on the host dots); and planted stacks
+//!    whose scale bytes run through E = 0, 1, 2, 3, 100, 127, 128 and
+//!    through 255, 254, 253, 200, 127, 1, 0 (activations scaled so no sum
+//!    leaves f32) against the host transcription, gate·up and down, bit for
+//!    bit — ggml's half rule for every byte.
+//! 5. **Oracle diagnostics, no pin**: the dsref set `code64_n32_w3`, block 0
 //!    layer 0 — our router and experts on ik's FFN input against ik's
 //!    logits, top-3, weights, SwiGLU rows, per-slot down rows and combine.
 //!
@@ -61,12 +77,16 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::path::PathBuf;
 
+    use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
+    use bloomery_gpu::hybrid::HOST;
+    use bloomery_gpu::kquant::{Act, GateUpAct, SelDown};
     use bloomery_gpu::mxfp4::{BLOCK_BYTES, BLOCK_VALUES, lane_partial_host};
     use bloomery_gpu::mxfp4_sel::{
-        DownArgs, GateUpArgs, MxAct, MxExpertKernels, MxStack, concat_route,
+        DownArgs, GateUpArgs, MxAct, MxExpertKernels, MxStack, Mxfp4SelKernels, concat_route,
     };
+    use bloomery_gpu::q4k_sel::{Q4kSelKernels, QuantSel};
     use bloomery_gpu::route_core::renorm_divisor;
-    use bloomery_gpu::{DeviceTensor, Gpu};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
     use bloomery_gpu_deepseek41::experts::swiglu_clamp;
     use bloomery_gpu_deepseek41::experts_mxfp4::{
         DraftRouterKernels, DraftRouterOut, N_EXPERT, N_USED, RouterArgs, sqrt_softplus,
@@ -131,11 +151,13 @@ mod gate {
             .collect()
     }
 
-    /// One MXFP4 stack: the file bytes (the host rule reads them) and the
-    /// card copy.
+    /// One MXFP4 stack: the file bytes (the host rule reads them), the card
+    /// copy in two planes (the route entries') and the card copy as the file's
+    /// blocks, the KQuant word stream (the per-slot pair's).
     struct Stack<'a> {
         bytes: &'a [u8],
         dev: MxStack,
+        kq: DeviceTensor<u32>,
         rows_per_expert: usize,
         k: usize,
     }
@@ -157,6 +179,25 @@ mod gate {
         }
     }
 
+    /// File bytes of `rows` rows, a whole number of words each (`17 · n_blk`
+    /// bytes, `n_blk` a multiple of 4), as the card's KQuant word stream.
+    fn upload_words(
+        s: &cuda_core::CudaStream,
+        bytes: &[u8],
+        rows: usize,
+    ) -> Result<DeviceTensor<u32>, GateError> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(4 * rows) {
+            return Err(format!("{} bytes are not {rows} rows of whole words", bytes.len()).into());
+        }
+        let w: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        Ok(DeviceTensor::upload(s, &w, rows, w.len() / rows)?)
+    }
+
     /// Block 0's stack `name`, `[k, rows, N_EXPERT]`, read and uploaded.
     fn load_stack<'a>(
         split: &'a Split,
@@ -170,6 +211,7 @@ mod gate {
         Ok(Stack {
             bytes,
             dev: MxStack::upload(s, bytes, N_EXPERT, rows, k)?,
+            kq: upload_words(s, bytes, N_EXPERT * rows)?,
             rows_per_expert: rows,
             k,
         })
@@ -314,6 +356,8 @@ mod gate {
     struct Ctx<'a> {
         gpu: &'a Gpu,
         dk: &'a MxExpertKernels,
+        pk: &'a Mxfp4SelKernels,
+        qk: &'a Q4kSelKernels,
         rk: &'a DraftRouterKernels,
         gate: Stack<'a>,
         up: Stack<'a>,
@@ -347,6 +391,11 @@ mod gate {
     }
 
     fn run_plan(cx: &Ctx<'_>, p: &Plan, x: &[f32]) -> Result<Run, GateError> {
+        run_plan_at(cx, p, x, cx.limit)
+    }
+
+    /// [`run_plan`] at the SwiGLU limit `limit`.
+    fn run_plan_at(cx: &Ctx<'_>, p: &Plan, x: &[f32], limit: f32) -> Result<Run, GateError> {
         let s = cx.gpu.stream();
         let (k, ff, n) = (cx.gate.k, cx.gate.rows_per_expert, cx.down.rows_per_expert);
         let n_slots = p.sel.len();
@@ -365,7 +414,7 @@ mod gate {
             sel: &sel,
             route: &route,
             n_slots,
-            limit: cx.limit,
+            limit,
         };
         cx.dk.enqueue_gate_up(s, &a, &mut h)?;
         let mut act_h = MxAct::new(s, n_slots * p.m, ff)?;
@@ -572,6 +621,498 @@ mod gate {
             verdict(pass2)
         );
         Ok(pass1 && pass2)
+    }
+
+    // ------------------------------------------------- the per-slot pair
+
+    /// A value no kernel writes: the rows of a slot the pair skips or
+    /// refuses stay at it.
+    const SENT: f32 = f32::from_bits(0x7a5e_17e1);
+    /// The SwiGLU limit of the clamping-rule check: small enough that the
+    /// clamp changes most rows.
+    const CLAMP_LIMIT: f32 = 0.05;
+    /// The SwiGLU limit of the planted-scale checks.
+    const PLANT_LIMIT: f32 = 7.0;
+
+    /// What a pair launch wrote and the fault word after it.
+    struct PairOut {
+        v: Vec<f32>,
+        fault: Option<Fault>,
+    }
+
+    /// The pair gate·up over `sel` (one slot per entry, slot `s` reading
+    /// column `s / spc` of the `m` columns of `x`), `h` pre-filled with the
+    /// sentinel; the fault word is cleared before and read after.
+    #[allow(clippy::too_many_arguments, reason = "one gate helper's launch")]
+    fn pair_gate_up(
+        cx: &Ctx<'_>,
+        (wg, wu): (&DeviceTensor<u32>, &DeviceTensor<u32>),
+        (rpe, k): (usize, usize),
+        sel: &[u32],
+        spc: usize,
+        m: usize,
+        x: &[f32],
+        rule: Act,
+    ) -> Result<PairOut, GateError> {
+        let s = cx.gpu.stream();
+        let xd = DeviceBuffer::from_host(s, x)?;
+        let mut act = Q8Act::with_k(s, m, k)?;
+        cx.gpu.enqueue_quantize_q8_1(&xd, &mut act)?;
+        let seld = DeviceBuffer::from_host(s, sel)?;
+        let mut h = DeviceBuffer::from_host(s, &vec![SENT; sel.len() * rpe])?;
+        cx.gpu.clear_fault()?;
+        let a = GateUpAct {
+            wg,
+            wu,
+            act: &act,
+            sel: &seld,
+            n_slots: sel.len(),
+            rows_per_expert: rpe,
+            slots_per_col: spc,
+            rule,
+        };
+        cx.pk
+            .enqueue_gate_up(s, &a, cx.gpu.unlabelled_sink(), &mut h)?;
+        s.synchronize()?;
+        let v = h.to_host_vec(s)?;
+        let fault = cx.gpu.fault()?;
+        cx.gpu.clear_fault()?;
+        Ok(PairOut { v, fault })
+    }
+
+    /// The pair down over `sel` (slot `s` reading column `s` of `x`, `k`
+    /// values each, quantized for the card slots by `enqueue_quantize_sel`),
+    /// `y` pre-filled with the sentinel; the fault word as above.
+    fn pair_down(
+        cx: &Ctx<'_>,
+        w: &DeviceTensor<u32>,
+        dims: (usize, usize, usize),
+        sel: &[u32],
+        x: &[f32],
+    ) -> Result<PairOut, GateError> {
+        Ok(pair_down_cols(cx, w, dims, sel, x, sel.len())??)
+    }
+
+    /// [`pair_down`] with an activation of `cols` columns for the same
+    /// `sel.len()` slots: columns past the slots hold the first slots'
+    /// columns negated, so a launch that reads one of them moves its rows.
+    /// The inner result is the launcher's own refusal.
+    fn pair_down_cols(
+        cx: &Ctx<'_>,
+        w: &DeviceTensor<u32>,
+        (rpe, k, n_card): (usize, usize, usize),
+        sel: &[u32],
+        x: &[f32],
+        cols: usize,
+    ) -> Result<Result<PairOut, GpuError>, GateError> {
+        let s = cx.gpu.stream();
+        let n = sel.len();
+        let wide_x: Vec<f32> = (0..cols * k)
+            .map(|i| {
+                let (c, d) = (i / k, i % k);
+                if c < n { x[i] } else { -x[(c % n) * k + d] }
+            })
+            .collect();
+        let wide_sel: Vec<u32> = (0..cols).map(|c| sel[c % n]).collect();
+        let xd = DeviceBuffer::from_host(s, &wide_x)?;
+        let seld = DeviceBuffer::from_host(s, &wide_sel)?;
+        let mut act = Q8Act::with_slots(s, cols, k)?;
+        cx.gpu.clear_fault()?;
+        let q = QuantSel {
+            x: &xd,
+            cols: 0..cols,
+            sel: &seld,
+            n_card,
+        };
+        cx.qk
+            .enqueue_quantize_sel(s, &q, cx.gpu.unlabelled_sink(), &mut act)?;
+        let mut y = DeviceBuffer::from_host(s, &vec![SENT; n * rpe])?;
+        let a = SelDown {
+            w,
+            act: &act,
+            sel: &seld,
+            n_slots: n,
+            rows_per_expert: rpe,
+        };
+        if let Err(e) = cx.pk.enqueue_down(s, &a, cx.gpu.unlabelled_sink(), &mut y) {
+            s.synchronize()?;
+            cx.gpu.clear_fault()?;
+            return Ok(Err(e));
+        }
+        s.synchronize()?;
+        let v = y.to_host_vec(s)?;
+        let fault = cx.gpu.fault()?;
+        cx.gpu.clear_fault()?;
+        Ok(Ok(PairOut { v, fault }))
+    }
+
+    /// The pair's slots for a plan: token-major runs of the plan's `n`
+    /// slots, slot `c · n + j` holds plan slot `j` for token `c` when that
+    /// token routes to it and `HOST` when it does not (column `s / n`).
+    fn pair_sel(p: &Plan) -> Vec<u32> {
+        let n = p.sel.len();
+        (0..p.m * n)
+            .map(|s| {
+                let (c, j) = (s / n, s % n);
+                if p.mask(j as u32) >> c & 1 != 0 {
+                    p.sel[j]
+                } else {
+                    HOST
+                }
+            })
+            .collect()
+    }
+
+    /// Whether every value of `v` is the sentinel.
+    fn all_sent(v: &[f32]) -> bool {
+        v.iter().all(|x| x.to_bits() == SENT.to_bits())
+    }
+
+    /// The pair down rows `y` (slot `c · n + j`) summed per token in the
+    /// fused entry's combine order: slots ascending, `acc = fma(dot, w, acc)`
+    /// from 0, rows `rpe` wide, tokens `p.m`.
+    fn combine_pair(p: &Plan, y: &[f32], rpe: usize) -> Vec<f32> {
+        let n = p.sel.len();
+        let mut out = vec![0.0f32; p.m * rpe];
+        for c in 0..p.m {
+            for d in 0..rpe {
+                let mut acc = 0.0f32;
+                for j in 0..n {
+                    if let Some(w) = slot_weight(&p.route, &p.wts, j as u32, c) {
+                        acc = y[(c * n + j) * rpe + d].mul_add(w, acc);
+                    }
+                }
+                out[c * rpe + d] = acc;
+            }
+        }
+        out
+    }
+
+    /// `silu` in f64: the reference of the `SiluMul` rule.
+    fn silu64(g: f64) -> f64 {
+        g / (1.0 + (-g).exp())
+    }
+
+    /// A fault as the gate prints it.
+    fn shown(f: &Option<Fault>) -> String {
+        f.map_or_else(|| "none".into(), |f| format!("{f:?}"))
+    }
+
+    /// Item 4 for one plan: the pair against the route entries.
+    fn check_pair_plan(cx: &Ctx<'_>, name: &str, p: &Plan, x: &[f32]) -> Result<bool, GateError> {
+        let (ff, n, n_slots) = (
+            cx.gate.rows_per_expert,
+            cx.down.rows_per_expert,
+            p.sel.len(),
+        );
+        let route = run_plan(cx, p, x)?;
+        let sel = pair_sel(p);
+        let n_host = sel.iter().filter(|&&id| id == HOST).count();
+        let gu = pair_gate_up(
+            cx,
+            (&cx.gate.kq, &cx.up.kq),
+            (ff, cx.gate.k),
+            &sel,
+            n_slots,
+            p.m,
+            x,
+            Act::SwigluClamp { limit: cx.limit },
+        )?;
+        let (mut h_eq, mut skip) = (true, true);
+        for c in 0..p.m {
+            for j in 0..n_slots {
+                let got = &gu.v[(c * n_slots + j) * ff..][..ff];
+                if p.mask(j as u32) >> c & 1 != 0 {
+                    h_eq &= bits_equal(got, &route.h[(j * p.m + c) * ff..][..ff]);
+                } else {
+                    skip &= all_sent(got);
+                }
+            }
+        }
+        // The down reads the pair's own h, as a family's chain would.
+        let dn = pair_down(cx, &cx.down.kq, (n, ff, N_EXPERT), &sel, &gu.v)?;
+        // An activation wider than the slots gives the same rows (the
+        // columns past the slots are not read); one narrower is refused.
+        let wide = pair_down_cols(
+            cx,
+            &cx.down.kq,
+            (n, ff, N_EXPERT),
+            &sel,
+            &gu.v,
+            2 * sel.len(),
+        )?;
+        let wide_eq = wide
+            .as_ref()
+            .is_ok_and(|w| w.fault.is_none() && bits_equal(&w.v, &dn.v));
+        let narrow = pair_down_cols(
+            cx,
+            &cx.down.kq,
+            (n, ff, N_EXPERT),
+            &sel,
+            &gu.v,
+            sel.len() - 1,
+        )?;
+        let narrow_refused = narrow.is_err();
+        let out = combine_pair(p, &dn.v, n);
+        let out_eq = bits_equal(&out, &route.out);
+        let rows_skip = (0..p.m * n_slots)
+            .filter(|&s| sel[s] == HOST)
+            .all(|s| all_sent(&dn.v[s * n..][..n]));
+        let clean = gu.fault.is_none() && dn.fault.is_none();
+        let pass = h_eq && out_eq && skip && rows_skip && clean && wide_eq && narrow_refused;
+        println!(
+            "pair plan={name} m={} slots={} host_slots={n_host} gate_up_equals_route_h={h_eq} \
+             down_combine_equals_fused_out={out_eq} (max|diff| {:e}) host_slots_keep_sentinel={} \
+             no_fault={clean} wider_act_equals_exact={wide_eq} fewer_columns_refused={narrow_refused} {}",
+            p.m,
+            sel.len(),
+            max_abs_diff(&out, &route.out),
+            skip && rows_skip,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Item 4's activation rules on a plan: `SwigluClamp` at a limit that
+    /// clamps equals the route entry at that limit bit for bit (and that
+    /// limit moves rows, so the check is sharp), `SiluMul` equals the f64
+    /// rule on the host dots within a few ulps of the device `expf` and is
+    /// not the clamped rule.
+    fn check_pair_rules(cx: &Ctx<'_>, p: &Plan, x: &[f32]) -> Result<bool, GateError> {
+        let (k, ff, n_slots) = (cx.gate.k, cx.gate.rows_per_expert, p.sel.len());
+        let sel = pair_sel(p);
+        let gu = |rule| {
+            pair_gate_up(
+                cx,
+                (&cx.gate.kq, &cx.up.kq),
+                (ff, k),
+                &sel,
+                n_slots,
+                p.m,
+                x,
+                rule,
+            )
+        };
+        let routed = |c: usize, j: usize| p.mask(j as u32) >> c & 1 != 0;
+        let base = run_plan(cx, p, x)?;
+        let tight = run_plan_at(cx, p, x, CLAMP_LIMIT)?;
+        let clamp = gu(Act::SwigluClamp { limit: CLAMP_LIMIT })?;
+        let mut clamp_eq = true;
+        for c in 0..p.m {
+            for j in (0..n_slots).filter(|&j| routed(c, j)) {
+                clamp_eq &= bits_equal(
+                    &clamp.v[(c * n_slots + j) * ff..][..ff],
+                    &tight.h[(j * p.m + c) * ff..][..ff],
+                );
+            }
+        }
+        let sharp = !bits_equal(&base.h, &tight.h);
+        let silu = gu(Act::SiluMul)?;
+        let qx: Vec<_> = (0..p.m)
+            .map(|c| q8_1_host(&x[c * k..(c + 1) * k]))
+            .collect();
+        let (mut worst, mut silu_ok) = (0.0f64, true);
+        let mut differs = false;
+        for (c, q) in qx.iter().enumerate() {
+            for j in (0..n_slots).filter(|&j| routed(c, j)) {
+                for r in 0..32 {
+                    let (g, u) = (
+                        dot_host(cx.gate.row(p.sel[j], r), q),
+                        dot_host(cx.up.row(p.sel[j], r), q),
+                    );
+                    let at = (c * n_slots + j) * ff + r;
+                    let want = silu64(f64::from(g)) * f64::from(u);
+                    let got = f64::from(silu.v[at]);
+                    let rel = (got - want).abs() / (want.abs() + 1e-30);
+                    worst = worst.max(rel);
+                    silu_ok &= rel <= 1e-5;
+                    differs |= silu.v[at].to_bits() != clamp.v[at].to_bits();
+                }
+            }
+        }
+        let clean = clamp.fault.is_none() && silu.fault.is_none();
+        let pass = clamp_eq && sharp && silu_ok && differs && clean;
+        println!(
+            "pair rules m={} swiglu_clamp@{CLAMP_LIMIT}_equals_route={clamp_eq} limit_moves_rows={sharp} \
+             silu_mul_vs_f64 max_rel {worst:.2e} (<= 1e-5)={silu_ok} silu_not_clamp={differs} \
+             no_fault={clean} {}",
+            p.m,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Item 4's ids on a plan: an id at the stack's end and one far past it
+    /// raise `ExpertId` in both entries (the gate·up writes NaN rows, the
+    /// down leaves its rows at the sentinel), an explicit `HOST` slot raises
+    /// nothing and keeps its rows, every other slot equals the clean launch,
+    /// and the next clean launch raises nothing.
+    fn check_pair_ids(cx: &Ctx<'_>, p: &Plan, x: &[f32]) -> Result<bool, GateError> {
+        let (k, ff, n) = (cx.gate.k, cx.gate.rows_per_expert, cx.down.rows_per_expert);
+        let n_slots = p.sel.len();
+        let clean_sel = pair_sel(p);
+        let (end, far, host) = (1usize, clean_sel.len() - 2, 4usize);
+        let mut sel = clean_sel.clone();
+        sel[end] = N_EXPERT as u32;
+        sel[far] = u32::MAX - 1;
+        sel[host] = HOST;
+        let rule = Act::SwigluClamp { limit: cx.limit };
+        let run = |sel: &[u32]| {
+            pair_gate_up(
+                cx,
+                (&cx.gate.kq, &cx.up.kq),
+                (ff, k),
+                sel,
+                n_slots,
+                p.m,
+                x,
+                rule,
+            )
+        };
+        let clean_gu = run(&clean_sel)?;
+        let bad_gu = run(&sel)?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+        let rows = |v: &[f32], s: usize, w: usize| v[s * w..(s + 1) * w].to_vec();
+        let nan = |s: usize| rows(&bad_gu.v, s, ff).iter().all(|v| v.is_nan());
+        let others = |bad: &PairOut, good: &PairOut, w: usize| {
+            (0..sel.len())
+                .filter(|s| ![end, far, host].contains(s))
+                .all(|s| bits_equal(&rows(&bad.v, s, w), &rows(&good.v, s, w)))
+        };
+        let gu_ok = bad_gu.fault == want
+            && nan(end)
+            && nan(far)
+            && all_sent(&rows(&bad_gu.v, host, ff))
+            && others(&bad_gu, &clean_gu, ff);
+        let clean_dn = pair_down(cx, &cx.down.kq, (n, ff, N_EXPERT), &clean_sel, &clean_gu.v)?;
+        let bad_dn = pair_down(cx, &cx.down.kq, (n, ff, N_EXPERT), &sel, &clean_gu.v)?;
+        let dn_ok = bad_dn.fault == want
+            && [end, far, host]
+                .iter()
+                .all(|&s| all_sent(&rows(&bad_dn.v, s, n)))
+            && others(&bad_dn, &clean_dn, n);
+        let again = run(&clean_sel)?;
+        let after = again.fault.is_none() && clean_gu.fault.is_none() && clean_dn.fault.is_none();
+        let pass = gu_ok && dn_ok && after;
+        println!(
+            "pair ids m={} bad_ids at slots {end} (= n_experts) and {far} (far past), HOST at {host}: \
+             gate_up(fault {} nan_rows, host kept, others clean)={gu_ok} down(fault {}, rows kept, \
+             others clean)={dn_ok} next_clean_no_fault={after} {}",
+            p.m,
+            shown(&bad_gu.fault),
+            shown(&bad_dn.fault),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Row `r` of expert `id` of a planted stack of `rpe`-row experts.
+    fn planted_row(bytes: &[u8], rpe: usize, k: usize, id: u32, r: usize) -> &[u8] {
+        let rb = k / BLOCK_VALUES * BLOCK_BYTES;
+        &bytes[(id as usize * rpe + r) * rb..][..rb]
+    }
+
+    /// Item 4's planted scale bytes (module doc): stacks of `EXPERTS`
+    /// experts whose blocks take their scale byte from a list — rows 0 and 1
+    /// of every four carry the list's first two bytes throughout, so their
+    /// sums are of that scale alone, and the rest cycle through the list —
+    /// against the host transcription.
+    fn check_pair_planted(cx: &Ctx<'_>) -> Result<bool, GateError> {
+        const K: usize = 2048;
+        const RPE: usize = 16;
+        const EXPERTS: usize = 3;
+        let cases: [(&str, &[u8], f32); 2] = [
+            ("low", &[0, 1, 2, 3, 100, 127, 128], 2.0),
+            ("high", &[255, 254, 253, 200, 127, 1, 0], 2e-9),
+        ];
+        let s = cx.gpu.stream();
+        let rows = EXPERTS * RPE;
+        let mut all = true;
+        for (ci, (name, es, amp)) in cases.into_iter().enumerate() {
+            let stack = |seed: u64, salt: usize| {
+                let b = planted(rows, K, seed, |r, b| match r % 4 {
+                    0 => es[0],
+                    1 => es[1],
+                    _ => es[(r * 3 + b + salt) % es.len()],
+                });
+                upload_words(s, &b, rows).map(|dev| (b, dev))
+            };
+            let ((gb, g), (ub, u), (db, d)) = (
+                stack(0x5eed_0001 + ci as u64, 0)?,
+                stack(0x5eed_0101 + ci as u64, 2)?,
+                stack(0x5eed_0201 + ci as u64, 5)?,
+            );
+            // Gate·up: three columns, slot s reading column s.
+            let (sel, m) = (vec![2u32, 0, 1], 3usize);
+            let x = seeded(K * m, 7001 + ci as u32, -amp, 2.0 * amp);
+            let qx: Vec<_> = (0..m).map(|c| q8_1_host(&x[c * K..(c + 1) * K])).collect();
+            let rule = Act::SwigluClamp { limit: PLANT_LIMIT };
+            let gu = pair_gate_up(cx, (&g, &u), (RPE, K), &sel, 1, m, &x, rule)?;
+            let want_h: Vec<f32> = sel
+                .iter()
+                .enumerate()
+                .flat_map(|(slot, &id)| {
+                    let (gb, ub, q) = (&gb, &ub, &qx[slot]);
+                    (0..RPE).map(move |r| {
+                        let gd = dot_host(planted_row(gb, RPE, K, id, r), q);
+                        let ud = dot_host(planted_row(ub, RPE, K, id, r), q);
+                        swiglu_clamp(gd, ud, PLANT_LIMIT)
+                    })
+                })
+                .collect();
+            let gu_ok = bits_equal(&gu.v, &want_h) && gu.fault.is_none();
+            // Down: six slots over the three experts, a column each.
+            let dsel = vec![0u32, 1, 2, 1, 0, 2];
+            let xd = seeded(K * dsel.len(), 7101 + ci as u32, -amp, 2.0 * amp);
+            let qd: Vec<_> = (0..dsel.len())
+                .map(|c| q8_1_host(&xd[c * K..(c + 1) * K]))
+                .collect();
+            let dn = pair_down(cx, &d, (RPE, K, EXPERTS), &dsel, &xd)?;
+            let want_y: Vec<f32> = dsel
+                .iter()
+                .enumerate()
+                .flat_map(|(slot, &id)| {
+                    let (db, q) = (&db, &qd[slot]);
+                    (0..RPE).map(move |r| dot_host(planted_row(db, RPE, K, id, r), q))
+                })
+                .collect();
+            let dn_ok = bits_equal(&dn.v, &want_y) && dn.fault.is_none();
+            let finite = want_y.iter().chain(&want_h).all(|v| v.is_finite());
+            let pass = gu_ok && dn_ok && finite;
+            println!(
+                "pair planted case={name} scale_bytes={es:?} k={K} experts={EXPERTS}: \
+                 gate_up_equals_host (max|diff| {:e})={gu_ok} down_equals_host (max|diff| {:e}, \
+                 max|y| {:e})={dn_ok} host_values_finite={finite} {}",
+                max_abs_diff(&gu.v, &want_h),
+                max_abs_diff(&dn.v, &want_y),
+                max_abs(&want_y),
+                verdict(pass)
+            );
+            all &= pass;
+        }
+        Ok(all)
+    }
+
+    /// The file bytes of a planted stack: `rows` rows of `k` values, codes
+    /// from an xorshift stream, the scale byte of block `b` of row `r` from
+    /// `e_of(r, b)`.
+    fn planted(rows: usize, k: usize, seed: u64, e_of: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+        let mut st = seed;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let n_blk = k / BLOCK_VALUES;
+        let mut v = Vec::with_capacity(rows * n_blk * BLOCK_BYTES);
+        for r in 0..rows {
+            for b in 0..n_blk {
+                v.push(e_of(r, b));
+                v.extend((0..BLOCK_BYTES - 1).map(|_| (next() >> 32) as u8));
+            }
+        }
+        v
     }
 
     // ------------------------------------------------------------- router
@@ -1011,11 +1552,15 @@ mod gate {
         let gpu = Gpu::new()?;
         let dk = MxExpertKernels::load(gpu.context())?;
         let rk = DraftRouterKernels::load(gpu.context())?;
+        let pk = Mxfp4SelKernels::load(gpu.context(), gpu.fault_word())?;
+        let qk = Q4kSelKernels::load(gpu.context(), gpu.fault_word())?;
         let s = gpu.stream();
         let e = N_EXPERT as u64;
         let cx = Ctx {
             gpu: &gpu,
             dk: &dk,
+            pk: &pk,
+            qk: &qk,
             rk: &rk,
             gate: load_stack(&split, s, &names::ffn_gate_exps(0), k, ff)?,
             up: load_stack(&split, s, &names::ffn_up_exps(0), k, ff)?,
@@ -1060,6 +1605,11 @@ mod gate {
                 m,
             };
             ok &= check_plan(&cx, "all3", &p, &x)?;
+            ok &= check_pair_plan(&cx, "all3", &p, &x)?;
+            if m == 3 {
+                ok &= check_pair_rules(&cx, &p, &x)?;
+                ok &= check_pair_ids(&cx, &p, &x)?;
+            }
         }
         // Three tokens routed by the router itself: sel = its ids, one slot each.
         let x = seeded(k * 3, 31, -2.0, 4.0);
@@ -1071,6 +1621,8 @@ mod gate {
             m: 3,
         };
         ok &= check_plan(&cx, "concat", &p, &x)?;
+        ok &= check_pair_plan(&cx, "concat", &p, &x)?;
+        ok &= check_pair_planted(&cx)?;
         ok &= check_router(&cx, &router)?;
 
         oracle(&cx, &router)?;
@@ -1079,6 +1631,8 @@ mod gate {
             println!(
                 "PASSED: {NAME} — dflash_expert_gate_up and dflash_expert_down (slots 0/64/127 at m 1/3/8, \
                  a routed m=3 plan) bit-identical to the host rule and inside the q8_1 bound and pins; \
+                 mxfp4_gate_up_sel and mxfp4_gemv_sel (the same plans per slot, both rules, HOST and bad ids, \
+                 planted scale bytes 0/1/255) bit-identical to the route entries and the host rule; \
                  dflash_router (16 vectors, 7 tie cases) bit-identical to the host rule; oracle rows printed, not pinned"
             );
             Ok(())

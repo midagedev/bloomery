@@ -1064,7 +1064,7 @@ fn slots_down(
                 c.sink,
                 &mut s.h,
             )?,
-            GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => {
+            GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs | GateUpEntry::Mxfp4 => {
                 return Err(GpuError::state(
                     WHAT,
                     "a gate·up entry the plan admits for no stack here",
@@ -1129,7 +1129,11 @@ fn slots_down(
                 c.sink,
                 &mut s.down,
             )?,
-            DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
+            DownEntry::Q5_0
+            | DownEntry::Q5_1
+            | DownEntry::Q8_0
+            | DownEntry::Iq4nl
+            | DownEntry::Mxfp4 => {
                 return Err(GpuError::state(
                     WHAT,
                     "a down entry the plan admits for no stack here",
@@ -1275,7 +1279,7 @@ fn apart_down(
     match gate_up_entry(n.gate_ty, n.up_ty, WHAT)? {
         GateUpEntry::Q4k => kk.kq.enqueue_gate_up_q4k(stream, &gate_up, c.sink, h)?,
         GateUpEntry::Q5k => kk.kq.enqueue_gate_up_q5k(stream, &gate_up, c.sink, h)?,
-        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => {
+        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs | GateUpEntry::Mxfp4 => {
             return Err(GpuError::state(
                 WHAT,
                 "a gate·up entry the plan admits for no stack here",
@@ -1315,7 +1319,11 @@ fn apart_down(
             c.sink,
             down,
         )?,
-        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
+        DownEntry::Q5_0
+        | DownEntry::Q5_1
+        | DownEntry::Q8_0
+        | DownEntry::Iq4nl
+        | DownEntry::Mxfp4 => {
             return Err(GpuError::state(
                 WHAT,
                 "a down entry the plan admits for no stack here",
