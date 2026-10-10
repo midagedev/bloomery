@@ -4193,6 +4193,7 @@ fn dot_row_cols_refuses_bad_shapes() {
         (GgmlType::Q3_K, 256, 110),
         (GgmlType::Q5_1, 640, 480),
         (GgmlType::Q8_0, 640, 680),
+        (GgmlType::MXFP4, 640, 340),
     ] {
         let wrow = vec![0u8; row_bytes];
         let a = vec![0u8; col_bytes(ty, k)];
@@ -4239,6 +4240,106 @@ fn dot_row_cols_refuses_bad_shapes() {
             .unwrap_err()
             .to_string();
         assert!(e.contains("1..=8 columns"), "{ty:?}: {e}");
+    }
+}
+
+// ------------------------------------------------------- MXFP4 tile
+// Synthetic rows only: MXFP4's multi-column caller is a model file the gates do
+// not read, and every block's bytes are valid codes, so random bytes and the
+// end blocks cover the kernel's whole input space.
+
+/// Row lengths of the MXFP4 tile clause: 2048 and 4096 (the routed experts'
+/// widths, sixteen and thirty-two x4 groups), 736 — five groups and three q8_2
+/// tail blocks — and 96, three tail blocks and no group.
+const MXFP4_TILE_KS: [usize; 4] = [2048, 4096, 736, 96];
+
+/// An MXFP4 block: the E8M0 scale `e` and the 16 code bytes from `qs`.
+fn mxfp4_block(e: u8, qs: impl Fn(usize) -> u8) -> Vec<u8> {
+    let mut b = vec![e];
+    b.extend((0..16).map(qs));
+    b
+}
+
+/// MXFP4 end blocks: the largest code (the unsigned table's 24) and the
+/// smallest (code 15, 0) at scale 1, code 0 (value 0, table 12), mixed
+/// nibbles, a ramp, the two subnormal scales e = 0 and e = 1 and e = 2 (the
+/// first normal one), then the largest scales e = 254 and e = 255, whose
+/// products reach the f32 range's end. The first [`MXFP4_FINITE_ENDS`] stay
+/// finite against any seeded column.
+const MXFP4_ENDS: [IqEnd; 10] = [
+    || mxfp4_block(127, |_| 0x77),
+    || mxfp4_block(127, |_| 0xFF),
+    || mxfp4_block(127, |_| 0x00),
+    || mxfp4_block(127, |_| 0x7F),
+    || mxfp4_block(130, |i| (i * 37) as u8),
+    || mxfp4_block(0, |_| 0x77),
+    || mxfp4_block(1, |_| 0x77),
+    || mxfp4_block(2, |i| (i * 11) as u8),
+    || mxfp4_block(254, |_| 0x77),
+    || mxfp4_block(255, |_| 0x7F),
+];
+const MXFP4_FINITE_ENDS: usize = 8;
+
+/// One call of `dot_row_cols` over each of c = 2, 3, 5 and 8 columns from the
+/// start of `acols` equals the scalar mirror `dot_row_scalar` per column, bit
+/// for bit: the tile against the emulator, not through the AVX2 one-column
+/// kernel.
+fn assert_tile_matches_emulator(
+    ty: GgmlType,
+    label: &str,
+    k: usize,
+    row_bytes: usize,
+    bytes: &[u8],
+    acols: &[Vec<u8>],
+) {
+    for r in 0..bytes.len() / row_bytes {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        for c in [2, 3, 5, qdot::TILE_COLS] {
+            let cols: Vec<&[u8]> = acols[..c].iter().map(Vec::as_slice).collect();
+            let mut out = vec![f32::NAN; c];
+            qdot::dot_row_cols(ty, src, &cols, k, &mut out).unwrap();
+            for (j, (&got, a)) in out.iter().zip(&cols).enumerate() {
+                let want = dot_row_scalar(ty, src, a, k).unwrap();
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{label}: row {r}, c = {c}, column {j}: tile {got:e} (bits {:#x}) vs \
+                     emulator {want:e} (bits {:#x})",
+                    got.to_bits(),
+                    want.to_bits()
+                );
+            }
+        }
+    }
+}
+
+/// MXFP4 tile clause: at each of [`MXFP4_TILE_KS`], random rows (valid codes,
+/// scales e in 112..=143) and then the ends of [`MXFP4_ENDS`], against the
+/// ±3.0 columns and the seeded ones — tile = `dot_row` per column, bit for
+/// bit; the random rows and the finite ends also equal the scalar mirror.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_mxfp4_tile_matches_dot_row() {
+    let ty = GgmlType::MXFP4;
+    let mut rng = Lcg(0x3F_4711);
+    for k in MXFP4_TILE_KS {
+        let nb = k / 32;
+        let row_bytes = nb * 17;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let mut rows = Vec::new();
+        for _ in 0..LEGACY_RANDOM_ROWS * nb {
+            let e = 112 + (rng.next_u32() % 32) as u8;
+            let codes: [u8; 16] = std::array::from_fn(|_| (rng.next_u32() >> 7) as u8);
+            rows.extend_from_slice(&mxfp4_block(e, |i| codes[i]));
+        }
+        let calls = assert_tile_matches(ty, "random rows", k, row_bytes, &rows, &cols);
+        assert_tile_matches_emulator(ty, "random rows", k, row_bytes, &rows, &cols);
+        eprintln!("mxfp4 tile: random rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+        let rows = legacy_end_rows(&MXFP4_ENDS, nb, |end| end());
+        let calls = assert_tile_matches(ty, "end rows", k, row_bytes, &rows, &cols);
+        eprintln!("mxfp4 tile: end rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+        let rows = legacy_end_rows(&MXFP4_ENDS[..MXFP4_FINITE_ENDS], nb, |end| end());
+        assert_tile_matches_emulator(ty, "finite end rows", k, row_bytes, &rows, &cols);
     }
 }
 

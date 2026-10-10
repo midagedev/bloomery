@@ -3158,6 +3158,8 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         GgmlType::Q3_K => Some((192, 63)),
         GgmlType::Q4_K => Some((96, 97)),
         GgmlType::Q5_K => Some((156, 98)),
+        // Per 32-value block (`qdot::k_granularity`): a quarter of an x4 group's instructions.
+        GgmlType::MXFP4 => Some((16, 16)),
         _ => None,
     }
 }

@@ -73,6 +73,69 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
     );
 }
 
+/// The tile kernel's rate: `rows` weight rows each dotted against `cols` columns through
+/// `dot_row_cols`, single-threaded, as the host union walks a run of columns. Prints the
+/// weight bytes streamed per second and the time per (row, column) dot, the number
+/// `dot_row`'s line gives as bytes over time for one column. MXFP4 only: the filler is its
+/// E8M0 range as in `bench`.
+fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize) {
+    assert!(
+        ty == GgmlType::MXFP4,
+        "bench_tile fills MXFP4 blocks only, got {ty:?}"
+    );
+    assert!(qdot::has_tile(ty), "{ty:?} has no tile kernel on this CPU");
+    let mut s = 0x9E3779B97F4A7C15u64;
+    let mut next = || {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        s.wrapping_mul(0x2545F4914F6CDD1D)
+    };
+    let mut w = vec![0u8; rows * row_bytes];
+    for c in w.as_chunks_mut::<8>().0 {
+        c.copy_from_slice(&next().to_le_bytes());
+    }
+    for b in w.as_chunks_mut::<17>().0 {
+        b[0] = 0x70 | (b[0] & 0x0f);
+    }
+    let cb = qdot::col_bytes(ty, k);
+    let acols: Vec<Vec<u8>> = (0..cols)
+        .map(|j| {
+            let col: Vec<f32> = (0..k)
+                .map(|i| ((((i + 7 * j) as i64 % 31) as f32) - 15.0) / 16.0)
+                .collect();
+            let mut acol = vec![0u8; cb];
+            qdot::quantize_col(ty, &col, &mut acol);
+            acol
+        })
+        .collect();
+    let refs: Vec<&[u8]> = acols.iter().map(Vec::as_slice).collect();
+    let mut out = vec![0.0f32; cols];
+
+    let mut acc = 0.0f32;
+    for r in 0..rows.min(4096) {
+        qdot::dot_row_cols(ty, &w[r * row_bytes..], &refs, k, &mut out).unwrap();
+        acc += out.iter().sum::<f32>();
+    }
+    let passes = 6u32;
+    let t0 = Instant::now();
+    for _ in 0..passes {
+        for r in 0..rows {
+            qdot::dot_row_cols(ty, &w[r * row_bytes..], &refs, k, &mut out).unwrap();
+            acc += out.iter().sum::<f32>();
+        }
+    }
+    let dt = t0.elapsed();
+    let bytes = rows as f64 * row_bytes as f64 * passes as f64;
+    let dots = rows as f64 * cols as f64 * passes as f64;
+    println!(
+        "{ty:?} tile C={cols}  k={k} rows {rows} x {row_bytes} B x {passes} passes in {:.3?} = {:.1} GB/s weights, {:.2} ns per row-column (sum {acc:.3})",
+        dt,
+        bytes / dt.as_secs_f64() / 1e9,
+        dt.as_secs_f64() * 1e9 / dots
+    );
+}
+
 fn main() {
     let rows: usize = 360_448;
     // Row bytes: Q3_K 110 B/256, Q4_K 144 B/256, Q6_K 210 B/256.
@@ -96,6 +159,21 @@ fn main() {
     bench(GgmlType::MXFP4, 2048, (2048 / 32) * 17, rows);
     // MiMo-V2.6-Flash ffn_gate/up_exps shape: k = 4096 (128 x 17 B = 2176 B/row).
     bench(GgmlType::MXFP4, 4096, (4096 / 32) * 17, rows);
+    // The C = 8 tile at the same two shapes: the host union's run of eight columns.
+    bench_tile(
+        GgmlType::MXFP4,
+        2048,
+        (2048 / 32) * 17,
+        rows,
+        qdot::TILE_COLS,
+    );
+    bench_tile(
+        GgmlType::MXFP4,
+        4096,
+        (4096 / 32) * 17,
+        rows,
+        qdot::TILE_COLS,
+    );
     // Qwen3.8 UD-Q3_K_XL ffn_down_exps shape (43 of 48 layers): k = 640 (20 x 18 B =
     // 360 B/row), beside the Q5_1 row it replaces at the same k.
     bench(GgmlType::IQ4_NL, 640, (640 / 32) * 18, rows);
