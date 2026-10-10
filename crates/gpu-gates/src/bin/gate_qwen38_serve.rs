@@ -1151,8 +1151,10 @@ mod gate {
     /// is the prompt resent, which keeps the prompt's end (one short of it)
     /// by a cut: the draft proposes nothing from there, by name, and the
     /// extension, with the draft off, keeps the prompt only at or past the
-    /// break-even of its reply (`mtp keep` `kept`, plain steps), else resets
-    /// (`reset`, drafted) — with the fresh run's ids either way. Every prompt
+    /// break-even of its reply (`mtp keep` `kept`, plain steps), else it takes
+    /// the state the first request left in the prompt cache when it ended (the
+    /// same ids, its draft on) and keeps the whole prompt, drafted from the
+    /// join at its end — with the fresh run's ids either way. Every prompt
     /// call stays below
     /// [`GEMM_FROM`](bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM), so
     /// a continued and a fresh feed leave the same state.
@@ -1239,9 +1241,20 @@ mod gate {
                 && skips_at_p
                 && x3.keeps.last() == Some(&k.record(8, p, true))
         } else {
-            // The reset may follow a state the prompt cache put back first,
-            // whose prefix the rule then declined: any prefix up to p.
-            (1..=p).any(|q| x3.reset_by_rule(&k.record(8, q, false)))
+            // PIN(2026-10-11): below the break-even `x3` keeps the whole prompt from the state the
+            // lane saved when the first request ended (the same `p` ids, its draft on: the
+            // slot's own state, which `b` left with the draft off, was not saved, the cache
+            // already keeping all of its ids). The server picks it over the slot's reset
+            // (`Slot::reuse`: it keeps more than the rule's 0), puts it back whole, and the
+            // draft joins the rows it holds and drafts: no cut, no keep record, no draft-off
+            // line; was a reset by the rule, the cache holding no such state before the saves
+            // at the request's end.
+            x3.ok
+                && x3.cache_n == p
+                && x3.draft_n > 0
+                && x3.offs.is_empty()
+                && x3.keeps.is_empty()
+                && x3.joined_at(p)
         };
         check(
             &mut ok,
@@ -1391,8 +1404,10 @@ mod gate {
         Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
     }
 
-    /// The slot dropped and not saved (`POST /slots/0?action=erase`): the
-    /// prompt cache keeps what it held, and nothing more.
+    /// The slot emptied (`POST /slots/0?action=erase`): its rows are reset and
+    /// its ids forgotten, and nothing is saved by it. The prompt cache keeps
+    /// every state it holds, among them the one the lane saved when the last
+    /// request ended.
     fn erase(url: &dyn Fn(&str) -> String) -> Result<(), GateError> {
         let (st, body) = curl(&url("/slots/0?action=erase"), Some(&json!({})), false)?;
         json_of("/slots/0?action=erase", st, &body)?;
@@ -1415,7 +1430,8 @@ mod gate {
     ///   ends and an erase keeps the cache, so the switched resend finds the
     ///   state the first resend left (its ids and its reply) and keeps the
     ///   whole resend but its last id, where the first resend kept what A
-    ///   held;
+    ///   held (under the draft that prefix is weighed against the break-even
+    ///   like any other: kept with the draft off by name when it reaches it);
     /// - (b) A's first turn resent with the reasoning-stripped reply in place
     ///   of the reply, so the shared prefix ends at the first turn's end: it
     ///   keeps the checkpoint there (the turn's prompt call's end, one short
@@ -1423,8 +1439,9 @@ mod gate {
     ///   or off, and its ids are a fresh run's of the same ids (every prompt
     ///   call of at least nine ids is the ubatch walk, whose bits do not
     ///   depend on where a call is cut);
-    /// - under the draft, the cuts (the resends with and without the switch,
-    ///   the stripped resend) weigh the turn's end against the seat's
+    /// - under the draft, the cuts (the resend with no switch, the stripped
+    ///   resend: the turn's end; the switched resend: all but its last id)
+    ///   weigh their prefix against the seat's
     ///   break-even for the reply ([`Keep38`], the `draft keep` line): at or
     ///   past it each keeps the turn's end, drafts nothing and says so by
     ///   name (the seat's draft-off line at the kept position, an `mtp
@@ -1499,7 +1516,13 @@ mod gate {
         // prefix of it up to the nearest point it carries at or below all but the resend's last
         // id, which is the end of the first resend's prompt call. A request keeps at most all
         // but its last id, and the first resend still keeps A's held positions.
+        // Under the draft that prefix is weighed against the break-even like any kept one: at or
+        // past it the switched resend keeps it with the draft off by name (`cache load
+        // positions=121 common=105 kept=105`, `mtp keep branch=kept prefix=105 break_even=86`),
+        // below it the request resets; was the turn's end weighed, as for the first resend.
         let all_but_last = resend.len() as u64 - 1;
+        let a2_kept = keep38.is_none_or(|k| all_but_last >= k.at(n) as u64);
+        let a2_at = if a2_kept { all_but_last } else { 0 };
         if let Some(k) = keep38 {
             println!(
                 "cache {label}: the turn's end {turn_end} against the break-even {} of a reply of \
@@ -1510,7 +1533,7 @@ mod gate {
             );
         }
         let kept = if drafted {
-            a2.cache_n == want && r2.cache_n == want
+            a2.cache_n == a2_at && r2.cache_n == want
         } else {
             r2.cache_n == held && a2.cache_n == all_but_last && a2.cache_n >= held
         };
@@ -1558,20 +1581,25 @@ mod gate {
             &format!("cache_{label}_b_ids_are_a_fresh_runs"),
             f3.ok && f3.cache_n == 0 && !a3.tokens.is_empty() && a3.tokens == f3.tokens,
         );
-        let cuts = [&r2, &a2, &a3];
+        // Each cut as its own prefix weighed: the first resend's and the stripped resend's at the
+        // turn's end, the switched resend's at all but its last id.
         let named = match keep38 {
-            Some(k) if cut_kept => {
-                let rec = k.record(n, turn_end, true);
-                cuts.iter()
-                    .all(|g| g.skipped_by_name() && g.keeps.last() == Some(&rec))
+            Some(k) => {
+                let cut = |g: &Greedy, at: u64, kept: bool| {
+                    let rec = k.record(n, at, kept);
+                    if kept {
+                        g.skipped_by_name() && g.keeps.last() == Some(&rec)
+                    } else {
+                        g.reset_by_rule(&rec)
+                    }
+                };
+                cut(&r2, turn_end, cut_kept)
+                    && cut(&a2, all_but_last, a2_kept)
+                    && cut(&a3, turn_end, cut_kept)
                     && f3.draft_n > 0
                     && f3.offs.is_empty()
             }
-            Some(k) => {
-                let rec = k.record(n, turn_end, false);
-                cuts.iter().all(|g| g.reset_by_rule(&rec)) && f3.draft_n > 0 && f3.offs.is_empty()
-            }
-            None => cuts.iter().chain([&f3].iter()).all(|g| g.offs.is_empty()),
+            None => [&r2, &a2, &a3, &f3].iter().all(|g| g.offs.is_empty()),
         };
         let name = format!("cache_{label}_cuts_leave_the_draft_off_by_name");
         if !drafted || tier::run_clause(&name, Tag::FileBound)? {

@@ -1974,6 +1974,11 @@ struct Q38 {
     /// query runs on `&self` (the engine thread owns the seat, so the borrow
     /// never contends).
     branch: std::cell::RefCell<Vec<Option<Branch38>>>,
+    /// The draft-off line a prefix put back owes ([`Seat::resume_prefix`]), one a
+    /// slot: the position and the sentence, printed at the slot's next call
+    /// ([`Q38::before_call_at`]) if the draft is still off then, so a request the
+    /// server resets after the load (its keep below the break-even) prints none.
+    cut_line: Vec<Option<(u32, String)>>,
     /// The copy stream and the pinned staging the prompt cache's saves are
     /// made on ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
@@ -2211,6 +2216,7 @@ impl Q38 {
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
+            cut_line: vec![None; a.slots],
             lane,
         })
     }
@@ -2260,7 +2266,8 @@ impl Q38 {
     }
 
     /// What the request's reuse left to say, at its first call on the slot
-    /// it runs: the `mtp keep` record of the branch its keep took.
+    /// it runs: the draft-off line of a prefix put back that the request kept,
+    /// then the `mtp keep` record of the branch its keep took.
     fn before_call(&mut self) {
         self.before_call_at(self.s.selected());
     }
@@ -2268,6 +2275,11 @@ impl Q38 {
     /// [`Q38::before_call`] at `slot`, a round's row printing at its own
     /// slot as the fallback loop's per-row pass would.
     fn before_call_at(&mut self, slot: usize) {
+        if let Some((pos, what)) = self.cut_line[slot].take()
+            && self.drafts.is_off(slot)
+        {
+            draft_off(pos, &what);
+        }
         if let Some(b) = self.branch.borrow_mut()[slot].take() {
             Record::new(&record::MTP_KEEP38)
                 .w("branch", if b.kept { "kept" } else { "reset" })
@@ -2643,7 +2655,9 @@ impl Seat for Q38 {
         let held = self.s.pos();
         self.s.model_mut().rollback(pos)?;
         if self.drafts.drafts() && pos < held {
-            self.drafts.turn_off(self.s.selected(), DRAFT_OFF_WHY)?;
+            let sel = self.s.selected();
+            self.drafts.turn_off(sel, DRAFT_OFF_WHY)?;
+            self.cut_line[sel] = None;
             draft_off(pos, &format!("a cut back from {held}"));
         }
         Ok(())
@@ -2730,19 +2744,22 @@ impl Seat for Q38 {
     /// of it ([`put_back`]): the sequence's next call runs as it would have
     /// after the whole state's resume and a rollback to the returned position
     /// ([`Seat::rollback`]): a cut short of the state's positions under the
-    /// draft leaves it proposing nothing from there ([`DRAFT_OFF_WHY`]).
+    /// draft leaves it proposing nothing from there ([`DRAFT_OFF_WHY`]); the
+    /// line says so at the slot's next call, unless the server resets the slot
+    /// first (its keep is below the break-even, [`Q38::keep_for`]).
     fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
         let n = u32::try_from(n).unwrap_or(u32::MAX);
         let at = put_back(self, state, WHOSE, |q, body| {
             q.s.model_mut().seq_resume_prefix(body, n)
         })?;
         if self.drafts.drafts() && at < state.n_tokens() {
-            self.drafts.turn_off(self.s.selected(), DRAFT_OFF_WHY)?;
+            let sel = self.s.selected();
+            self.drafts.turn_off(sel, DRAFT_OFF_WHY)?;
             let from = state.n_tokens();
-            draft_off(
+            self.cut_line[sel] = Some((
                 u32::try_from(at).unwrap_or(u32::MAX),
-                &format!("a state of {from} positions put back as its first {at}"),
-            );
+                format!("a state of {from} positions put back as its first {at}"),
+            ));
         }
         Ok(at)
     }
