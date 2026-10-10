@@ -1491,11 +1491,16 @@ mod gate {
             );
         }
         let kept = a2.cache_n == want && r2.cache_n == want;
-        check(
-            &mut ok,
-            &format!("cache_{label}_a_keeps_every_held_position_after_the_switch"),
-            r1.ok && a1.ok && b1.ok && a2.ok && !a1.tokens.is_empty() && kept,
-        );
+        // Under the draft, whether a verbatim resend cuts depends on where the draft's last call
+        // left its rows, which the file's acceptance decides: the fixture tier defers it by name.
+        let name = format!("cache_{label}_a_keeps_every_held_position_after_the_switch");
+        if !drafted || tier::run_clause(&name, Tag::FileBound)? {
+            check(
+                &mut ok,
+                &name,
+                r1.ok && a1.ok && b1.ok && a2.ok && !a1.tokens.is_empty() && kept,
+            );
+        }
         check(
             &mut ok,
             &format!("cache_{label}_a_ids_are_the_run_with_no_switch"),
@@ -1545,11 +1550,10 @@ mod gate {
             }
             None => cuts.iter().chain([&f3].iter()).all(|g| g.offs.is_empty()),
         };
-        check(
-            &mut ok,
-            &format!("cache_{label}_cuts_leave_the_draft_off_by_name"),
-            named,
-        );
+        let name = format!("cache_{label}_cuts_leave_the_draft_off_by_name");
+        if !drafted || tier::run_clause(&name, Tag::FileBound)? {
+            check(&mut ok, &name, named);
+        }
         if let Some(k) = keep38 {
             ok &= break_even(url, err_log, k, &pb)?;
         }
