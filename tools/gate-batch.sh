@@ -864,7 +864,14 @@ DF
   # steal's lease probe, logged as `probe`) ends in <word>, then FAKE_GRACE seconds more — so a
   # case waits on the other lane's progress, not on a race — and FAKE_LEASE_UP=1 raises the lease
   # marker the fake answers the steal's READONLY probe (`. tools/ref/lease-probe.sh && lease_free`)
-  # from.
+  # from. Two items that must run beside each other are held for each other, not for a clock: the
+  # case's AWAIT (the batch's FAKE_AWAIT_MAP, `<word>=<peer word>` pairs) holds a call until its
+  # peer's start is in seq.log, up to FAKE_AWAIT_CAP seconds (the longest a red case waits; a call held to it writes a `C` line,
+  # which overlap and no_overlap name), and
+  # overlap and no_overlap read seq.log — every call's `S` line at its start and `E` line at its
+  # end, in the one order they were written — never the seconds in ran.log. The case's DELAY
+  # (FAKE_START_DELAY, `<word>=<seconds>` pairs) holds a call before its start line, a process
+  # that starts late.
   cat > "$t/tools/box.sh" << 'FB'
 #!/bin/sh
 here=$(dirname "$0")/..
@@ -885,7 +892,10 @@ case "$*" in
     exec bash tools/gpu-gate.sh --test-locks "$st" ${*#bash tools/gpu-gate.sh } ;;
 esac
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
+word=${*##* }
+for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+echo "S $*" >> "$st/seq.log"
 # What an item sees of the batch's hold when it starts: its owner from the env, and the hold file as it stands.
 printf '%s\t%s\t%s\n' "${BLOOMERY_BATCH_OWNER:-none}" "$(head -1 "$st/batch.gpuhold" 2> /dev/null || echo nohold)" "$*" >> "$st/seen.log"
 n=0
@@ -905,9 +915,16 @@ if [ "${FAKE_CARD75:-0}" = 1 ]; then
 fi
 [ "${FAKE_LEASE_UP:-0}" = 1 ] && : > "$st/lease-up"
 s0=$(date +%s)
-k=0
-while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
-  if [ -n "${FAKE_UNTIL:-}" ] && cat "$st/box.log" "$st/probe.log" 2> /dev/null | grep -q "${FAKE_UNTIL}\$"; then
+peer=
+for pr in ${FAKE_AWAIT_MAP:-}; do [ "${pr%%=*}" != "$word" ] || peer=${pr#*=}; done
+k=0 cap=${FAKE_SLEEP:-0} met=
+[ -z "$peer" ] || cap=${FAKE_AWAIT_CAP:-30}
+while [ "$k" -lt "$cap" ]; do
+  if [ -n "$peer" ] && grep -q "^S .* $peer\$" "$st/seq.log"; then
+    met=1
+    break
+  fi
+  if [ -z "$peer" ] && [ -n "${FAKE_UNTIL:-}" ] && cat "$st/box.log" "$st/probe.log" 2> /dev/null | grep -q "${FAKE_UNTIL}\$"; then
     sleep "${FAKE_GRACE:-0}"
     break
   fi
@@ -915,6 +932,8 @@ while [ "$k" -lt "${FAKE_SLEEP:-0}" ]; do
   k=$((k + 1))
 done
 echo "$s0 $(date +%s) $*" >> "$st/ran.log"
+[ -z "$peer" ] || [ -n "$met" ] || echo "C $*" >> "$st/seq.log"
+echo "E $*" >> "$st/seq.log"
 # …and whether the hold is still up when it ends (a lane that finished first must not have taken it down).
 if [ -f "$st/batch.gpuhold" ]; then printf 'present\t%s\n' "$*" >> "$st/end.log"; else printf 'ABSENT\t%s\n' "$*" >> "$st/end.log"; fi
 exit "${FAKE_RC:-0}"
@@ -1021,7 +1040,9 @@ FP
     # LFLAG: the ledger flag of the batch (default the round's); MTAG: a mutant copy's tag
     [ "${GBFAST:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-fast.sh")
     [ -z "${MTAG:-}" ] || runner=(bash "$t/tools/gate-batch-$MTAG.sh")
-    BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+    # AWAIT: the fake's FAKE_AWAIT_MAP, DELAY: its FAKE_START_DELAY (the header above the fake)
+    FAKE_AWAIT_MAP=${AWAIT:-} FAKE_START_DELAY=${DELAY:-} \
+      BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
       "${runner[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
   }
@@ -1070,9 +1091,9 @@ FP
     'host	B	none	70	2026-09-27T10:00:00+0900' 'steal-bal	A	3090	60	2026-09-27T10:00:00+0900' > "$t/times-dry.tsv"
   out=$(BLOOMERY_GATE_TIMES=$t/times-dry.tsv "${gb[@]}" --dry-run 'steal-slow@FAKE_SLEEP=3' host steal-bal 2>&1) \
     || fail 'steal: the dry run of a movable pair failed' "$out"
-  if grep -A3 '^lane A  steal-bal' <<< "$out" | grep -q 'movable'; then pass 'steal: the dry run names the balanced item movable'
+  if grep -q 'movable' <<< "$(grep -A3 '^lane A  steal-bal' <<< "$out")"; then pass 'steal: the dry run names the balanced item movable'
   else fail 'steal: the dry run names the balanced item movable' "no movable line under steal-bal"; fi
-  if grep -A3 '^lane A  steal-slow' <<< "$out" | grep -q 'movable'; then fail 'steal: the dry run leaves a fixed item unmarked' "a movable line under steal-slow"
+  if grep -q 'movable' <<< "$(grep -A3 '^lane A  steal-slow' <<< "$out")"; then fail 'steal: the dry run leaves a fixed item unmarked' "a movable line under steal-slow"
   else pass 'steal: the dry run leaves a fixed item unmarked'; fi
   # The chain (class C). A mutant copy per rule: the sed applies (its line greps the copy), the
   # batch runs against the mutant and the defect shows, then the same batch runs green here.
@@ -1083,15 +1104,18 @@ FP
     if grep -Eq -- "$proof" "$t/tools/gate-batch-$tag.sh"; then echo "mutant $tag: $expr"
     else bad=$((bad + 1)); echo "FAIL mutant $tag: the sed did not apply: $expr"; fi
   }
-  # no_overlap <ran.log> <cmd-a> <cmd-b>: the two items' run intervals do not overlap; a batch's
-  # chain members run one at a time, so their intervals never cross. A command with no line in the log
-  # (or no log) is a FAIL line and status 2, never a pass or a defined answer for the pair.
+  # no_overlap <seq.log> <cmd-a> <cmd-b>: the two items' runs do not overlap — one's end line came before the other's start line
+  # (the order the fake wrote them in, no clock); a batch's chain members run one at a time, so they never cross. A command with
+  # no start line in the log (or no log) is a FAIL line and status 2, never a pass or a defined answer for the pair.
   no_overlap() {
     local arc=0
     awk -v a="$2" -v b="$3" '
-      $0 ~ (" " a "[ ]*$") { as = $1; ae = $2 }
-      $0 ~ (" " b "[ ]*$") { bs = $1; be = $2 }
-      END { if (as == "" || bs == "") exit 2; exit !(as < bs ? ae <= bs : be <= as) }' "$1" || arc=$?
+      $1 == "S" && $0 ~ (" " a "[ ]*$") { as = NR }
+      $1 == "E" && $0 ~ (" " a "[ ]*$") { ae = NR }
+      $1 == "S" && $0 ~ (" " b "[ ]*$") { bs = NR }
+      $1 == "E" && $0 ~ (" " b "[ ]*$") { be = NR }
+      $1 == "C" && ($0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")) { print "  (a call was held to its AWAIT cap: its peer never started: " $0 ")" }
+      END { if (as == "" || bs == "") exit 2; exit !((ae != "" && ae < bs) || (be != "" && be < as)) }' "$1" || arc=$?
     [ "$arc" != 2 ] || { n=$((n + 1)) bad=$((bad + 1)); echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
     return "$arc"
   }
@@ -1109,13 +1133,15 @@ FP
     -- steal-fix 'plain-any@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=5' 'gate-gpu-glm5next-e2e@FAKE_SLEEP=5')
   printf '%s' "$rc" > "$t/rc-ch-excl"
   rc_ok 'chain: two any-form members end green' ch-excl 4
-  if no_overlap "$t/fake-state/ran.log" gen_x gen_ge; then pass 'chain: no two members overlap (the mutex)'
+  if no_overlap "$t/fake-state/seq.log" gen_x gen_ge; then pass 'chain: no two members overlap (the mutex)'
   else fail 'chain: no two members overlap (the mutex)' "$(awk '$0 ~ /gen_x$|gen_ge$/' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
   mutant_of ch-nomutex 's|^  mkdir "$CHAIN_MUTEX" 2> /dev/null \|\| return 1$|  true # MUTANT ch-nomutex|' '# MUTANT ch-nomutex$'
-  rc=$(MTAG=ch-nomutex steal_case ch-exclm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	B	a6000	5	$d" "gate-gpu-glm5next-e2e	B	a6000	5	$d" \
+  # The e2e member starts 6 s late, longer than any 5 s slice: each member is held for the other's start line, so the overlap shows
+  # however late a process starts.
+  rc=$(AWAIT='gen_x=gen_ge gen_ge=gen_x' DELAY='gen_ge=6' MTAG=ch-nomutex steal_case ch-exclm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	B	a6000	5	$d" "gate-gpu-glm5next-e2e	B	a6000	5	$d" \
     -- steal-fix 'plain-any@FAKE_SLEEP=1' 'v41-any@FAKE_SLEEP=5' 'gate-gpu-glm5next-e2e@FAKE_SLEEP=5')
   printf '%s' "$rc" > "$t/rc-ch-exclm"
-  if no_overlap "$t/fake-state/ran.log" gen_x gen_ge; then fail 'chain mutant: without the mutex the members overlap' "the intervals did not cross"
+  if no_overlap "$t/fake-state/seq.log" gen_x gen_ge; then fail 'chain mutant: without the mutex the members overlap' "the intervals did not cross"
   else pass 'chain mutant: without the mutex the members overlap'; fi
   # (2) a lane-B chain run: the pick member (A6000) holds lane B first, so lane A opens its own slow
   # item; when the pick ends lane B takes the any-form member at once, on the A6000 — its row, its
@@ -1209,31 +1235,31 @@ FP
   # (the mutex race decides which lane meets the boundary); the order mutant ch-recorder above is
   # the family rule's FAIL-first, and the good case above pins the runtime wait.
   # (6) a pool item never overlaps a member; an untagged one runs beside one.
-  rc=$(steal_case ch-pool "steal-fix	A	3090	5	$d" "pool-any	B	a6000	3	$d" "plain-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+  rc=$(AWAIT='gen_x=other other=gen_x' steal_case ch-pool "steal-fix	A	3090	5	$d" "pool-any	B	a6000	3	$d" "plain-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
     -- steal-fix 'pool-any@FAKE_SLEEP=3' 'plain-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
   printf '%s' "$rc" > "$t/rc-ch-pool"
   rc_ok 'chain: a pool item and a plain one end green' ch-pool 4
-  if no_overlap "$t/fake-state/ran.log" gen_x gen_pl; then pass 'chain: a pool item never overlaps a member'
+  if no_overlap "$t/fake-state/seq.log" gen_x gen_pl; then pass 'chain: a pool item never overlaps a member'
   else fail 'chain: a pool item never overlaps a member' "the intervals crossed"; fi
-  if no_overlap "$t/fake-state/ran.log" gen_x other; then fail 'chain: an untagged item runs beside a member'
+  if no_overlap "$t/fake-state/seq.log" gen_x other; then fail 'chain: an untagged item runs beside a member'
   else pass 'chain: an untagged item runs beside a member' "plain-any never overlapped gen_x"; fi
   mutant_of ch-nopool 's|^tagged_neighbour() { #.*$|tagged_neighbour() { return 1 # MUTANT ch-nopool|' '# MUTANT ch-nopool$'
-  rc=$(MTAG=ch-nopool steal_case ch-poolm "steal-fix	A	3090	5	$d" "pool-any	B	a6000	3	$d" "plain-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+  rc=$(AWAIT='gen_x=gen_pl gen_pl=gen_x' MTAG=ch-nopool steal_case ch-poolm "steal-fix	A	3090	5	$d" "pool-any	B	a6000	3	$d" "plain-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
     -- steal-fix 'pool-any@FAKE_SLEEP=3' 'plain-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
   printf '%s' "$rc" > "$t/rc-ch-poolm"
-  if no_overlap "$t/fake-state/ran.log" gen_x gen_pl; then fail 'chain mutant: without the pool rule the item overlaps a member' "the intervals did not cross"
+  if no_overlap "$t/fake-state/seq.log" gen_x gen_pl; then fail 'chain mutant: without the pool rule the item overlaps a member' "the intervals did not cross"
   else pass 'chain mutant: without the pool rule the item overlaps a member'; fi
   # (7) a big-host item never overlaps a member.
   rc=$(steal_case ch-big "steal-fix	A	3090	5	$d" "big-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
     -- steal-fix 'big-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
   printf '%s' "$rc" > "$t/rc-ch-big"
   rc_ok 'chain: a big-host item ends green' ch-big 3
-  if no_overlap "$t/fake-state/ran.log" gen_x gen_bh; then pass 'chain: a big-host item never overlaps a member'
+  if no_overlap "$t/fake-state/seq.log" gen_x gen_bh; then pass 'chain: a big-host item never overlaps a member'
   else fail 'chain: a big-host item never overlaps a member' "the intervals crossed"; fi
-  rc=$(MTAG=ch-nopool steal_case ch-bigm "steal-fix	A	3090	5	$d" "big-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
+  rc=$(AWAIT='gen_x=gen_bh gen_bh=gen_x' MTAG=ch-nopool steal_case ch-bigm "steal-fix	A	3090	5	$d" "big-any	B	a6000	3	$d" "v41-any	A	3090	5	$d" \
     -- steal-fix 'big-any@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=5')
   printf '%s' "$rc" > "$t/rc-ch-bigm"
-  if no_overlap "$t/fake-state/ran.log" gen_x gen_bh; then fail 'chain mutant: without the rule a big-host item overlaps a member' "the intervals did not cross"
+  if no_overlap "$t/fake-state/seq.log" gen_x gen_bh; then fail 'chain mutant: without the rule a big-host item overlaps a member' "the intervals did not cross"
   else pass 'chain mutant: without the rule a big-host item overlaps a member'; fi
   # (8) the gap: the pick member (A6000) runs first; the 3090-only member waits for lane A, inside
   # its own 15 s item — and while it is unclaimed the big-host item must not start in the gap,
@@ -1429,29 +1455,32 @@ FP
   out=$("${gb[@]}" --dry-run plain-any host 2>&1) || fail 'dry run: a list with no member names no chain feeders' "the dry run failed"
   if grep -q 'the chain is fed by' <<< "$out"; then fail 'dry run: a list with no member names no chain feeders' "a feeders line is there"
   else pass 'dry run: a list with no member names no chain feeders'; fi
-  # The pack (the header's «pack»). overlap is no_overlap's inverse: the two items' intervals cross (a command
-  # with no line is a FAIL line and status 2, as there).
+  # The pack (the header's «pack»). overlap is no_overlap's inverse: both items started before either ended (a command
+  # with no start line is a FAIL line and status 2, as there).
   overlap() {
     local arc=0
     awk -v a="$2" -v b="$3" '
-      $0 ~ (" " a "[ ]*$") { as = $1; ae = $2 }
-      $0 ~ (" " b "[ ]*$") { bs = $1; be = $2 }
-      END { if (as == "" || bs == "") exit 2; exit !(as < bs ? ae > bs : be > as) }' "$1" || arc=$?
+      $1 == "S" && $0 ~ (" " a "[ ]*$") { as = NR }
+      $1 == "E" && $0 ~ (" " a "[ ]*$") { ae = NR }
+      $1 == "S" && $0 ~ (" " b "[ ]*$") { bs = NR }
+      $1 == "E" && $0 ~ (" " b "[ ]*$") { be = NR }
+      $1 == "C" && ($0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")) { print "  (a call was held to its AWAIT cap: its peer never started: " $0 ")" }
+      END { if (as == "" || bs == "") exit 2; exit !((ae == "" || bs < ae) && (be == "" || as < be)) }' "$1" || arc=$?
     [ "$arc" != 2 ] || { n=$((n + 1)) bad=$((bad + 1)); echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
     return "$arc"
   }
-  ivals() { # <ran.log> <cmd-a> <cmd-b>: the two items' ran.log lines (start, end, command), a red's detail
+  ivals() { # <seq.log> <cmd-a> <cmd-b>: the two items' seq.log lines (S start, E end, command), a red's detail
     awk -v a="$2" -v b="$3" '$0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")' "$1" | tr '\n' ' '
   }
   # The times rows are keyed by the item as written (its @FAKE_SLEEP env included), so each case's
   # expected seconds, and the longest-est launch order the case names, are the rows' own.
   # (1) two one-card items whose bytes fit run side by side, one a card; the second take names the
   # free card and its row, key and call follow it.
-  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-pair "pk-a@FAKE_SLEEP=5	A	3090	5	$d" "pk-b@FAKE_SLEEP=5	B	a6000	5	$d" \
+  rc=$(AWAIT='gen_pa=gen_pb gen_pb=gen_pa' BLOOMERY_PACK_BUDGET=10000 steal_case pk-pair "pk-a@FAKE_SLEEP=5	A	3090	5	$d" "pk-b@FAKE_SLEEP=5	B	a6000	5	$d" \
     -- pk-a@FAKE_SLEEP=5 pk-b@FAKE_SLEEP=5)
   printf '%s' "$rc" > "$t/rc-pk-pair"
   rc_ok 'pack: two one-card items that fit end green' pk-pair 2
-  if overlap "$t/fake-state/ran.log" gen_pa gen_pb; then pass 'pack: the two items ran side by side, one a card'
+  if overlap "$t/fake-state/seq.log" gen_pa gen_pb; then pass 'pack: the two items ran side by side, one a card'
   else fail 'pack: the two items ran side by side, one a card' "$(awk '$0 ~ /gen_p[ab]$/' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
   want_row 'pack: the second take ran on the free card (the 3090)' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_p[ab]$/'
   want_row 'pack: both rows name lane X and the card each took' "$t/times-pk-pair.tsv" '$2 == "X" && ($3 == "3090" || $3 == "a6000") { c++ } END { if (c == 2) print c }'
@@ -1460,46 +1489,46 @@ FP
     -- pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-pk-budget"
   rc_ok 'pack: a pair over the budget ends green (serially)' pk-budget 2
-  if no_overlap "$t/fake-state/ran.log" gen_pg gen_pg2; then pass 'pack: the pair over the budget never overlapped'
-  else fail 'pack: the pair over the budget never overlapped' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pg gen_pg2)"; fi
+  if no_overlap "$t/fake-state/seq.log" gen_pg gen_pg2; then pass 'pack: the pair over the budget never overlapped'
+  else fail 'pack: the pair over the budget never overlapped' "the intervals crossed: $(ivals "$t/fake-state/seq.log" gen_pg gen_pg2)"; fi
   mutant_of pk-nobudget 's|^      sumb=\$((sumb + R_BYTES\[i\]))$|      sumb=0 # MUTANT pk-nobudget|' '# MUTANT pk-nobudget$'
-  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nobudget steal_case pk-budgetm "pk-big@FAKE_SLEEP=3	A	3090	3	$d" "pk-big2@FAKE_SLEEP=3	B	a6000	3	$d" \
+  rc=$(AWAIT='gen_pg=gen_pg2 gen_pg2=gen_pg' BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nobudget steal_case pk-budgetm "pk-big@FAKE_SLEEP=3	A	3090	3	$d" "pk-big2@FAKE_SLEEP=3	B	a6000	3	$d" \
     -- pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-pk-budgetm"
-  if overlap "$t/fake-state/ran.log" gen_pg gen_pg2; then pass 'pack mutant: without the budget the pair overlaps'
+  if overlap "$t/fake-state/seq.log" gen_pg gen_pg2; then pass 'pack mutant: without the budget the pair overlaps'
   else fail 'pack mutant: without the budget the pair overlaps' "the intervals did not cross"; fi
   # (3) an m item runs with nothing else beside it, first (it is the longest) or after a running item.
   rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-m1 "pk-m@FAKE_SLEEP=5	A	3090	5	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
     -- pk-m@FAKE_SLEEP=5 pk-a@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-pk-m1"
   rc_ok 'pack: an m item first ends green' pk-m1 2
-  if no_overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack: nothing ran beside the m item'
-  else fail 'pack: nothing ran beside the m item' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pm gen_pa)"; fi
+  if no_overlap "$t/fake-state/seq.log" gen_pm gen_pa; then pass 'pack: nothing ran beside the m item'
+  else fail 'pack: nothing ran beside the m item' "the intervals crossed: $(ivals "$t/fake-state/seq.log" gen_pm gen_pa)"; fi
   rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-m2 "pk-m@FAKE_SLEEP=3	B	a6000	3	$d" "pk-a@FAKE_SLEEP=5	A	3090	5	$d" \
     -- pk-m@FAKE_SLEEP=3 pk-a@FAKE_SLEEP=5)
   printf '%s' "$rc" > "$t/rc-pk-m2"
   rc_ok 'pack: an m item behind a longer one ends green' pk-m2 2
-  if no_overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack: the m item waited for the host alone'
-  else fail 'pack: the m item waited for the host alone' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pm gen_pa)"; fi
+  if no_overlap "$t/fake-state/seq.log" gen_pm gen_pa; then pass 'pack: the m item waited for the host alone'
+  else fail 'pack: the m item waited for the host alone' "the intervals crossed: $(ivals "$t/fake-state/seq.log" gen_pm gen_pa)"; fi
   mutant_of pk-nom 's|^          \[ "\$mrun" = 0 \] \|\| continue # and nothing starts beside one$|          true # MUTANT pk-nom|' '# MUTANT pk-nom$'
-  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nom steal_case pk-m1m "pk-m@FAKE_SLEEP=5	A	3090	5	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
+  rc=$(AWAIT='gen_pm=gen_pa gen_pa=gen_pm' BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nom steal_case pk-m1m "pk-m@FAKE_SLEEP=5	A	3090	5	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
     -- pk-m@FAKE_SLEEP=5 pk-a@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-pk-m1m"
-  if overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack mutant: without the m rule an item runs beside it'
+  if overlap "$t/fake-state/seq.log" gen_pm gen_pa; then pass 'pack mutant: without the m rule an item runs beside it'
   else fail 'pack mutant: without the m rule an item runs beside it' "the intervals did not cross"; fi
   mutant_of pk-nomw 's|^          \[ "\$nrun" = 0 \] \|\| continue # an m item starts with nothing else running$|          true # MUTANT pk-nomw|' '# MUTANT pk-nomw$'
-  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nomw steal_case pk-m2m "pk-m@FAKE_SLEEP=3	B	a6000	3	$d" "pk-a@FAKE_SLEEP=5	A	3090	5	$d" \
+  rc=$(AWAIT='gen_pm=gen_pa gen_pa=gen_pm' BLOOMERY_PACK_BUDGET=10000 MTAG=pk-nomw steal_case pk-m2m "pk-m@FAKE_SLEEP=3	B	a6000	3	$d" "pk-a@FAKE_SLEEP=5	A	3090	5	$d" \
     -- pk-m@FAKE_SLEEP=3 pk-a@FAKE_SLEEP=5)
   printf '%s' "$rc" > "$t/rc-pk-m2m"
-  if overlap "$t/fake-state/ran.log" gen_pm gen_pa; then pass 'pack mutant: without the wait the m item starts beside a running one'
-  else fail 'pack mutant: without the wait the m item starts beside a running one' "the intervals did not cross: $(ivals "$t/fake-state/ran.log" gen_pm gen_pa)"; fi
+  if overlap "$t/fake-state/seq.log" gen_pm gen_pa; then pass 'pack mutant: without the wait the m item starts beside a running one'
+  else fail 'pack mutant: without the wait the m item starts beside a running one' "the intervals did not cross: $(ivals "$t/fake-state/seq.log" gen_pm gen_pa)"; fi
   # (4) a both-cards item runs alone (both cards busy for the pack).
   rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case pk-bothc "pk-both@FAKE_SLEEP=4	X	both	4	$d" "pk-a@FAKE_SLEEP=3	B	a6000	3	$d" \
     -- pk-both@FAKE_SLEEP=4 pk-a@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-pk-bothc"
   rc_ok 'pack: a both-cards item ends green' pk-bothc 2
-  if no_overlap "$t/fake-state/ran.log" gen_pt gen_pa; then pass 'pack: a both-cards item ran alone'
-  else fail 'pack: a both-cards item ran alone' "the intervals crossed: $(ivals "$t/fake-state/ran.log" gen_pt gen_pa)"; fi
+  if no_overlap "$t/fake-state/seq.log" gen_pt gen_pa; then pass 'pack: a both-cards item ran alone'
+  else fail 'pack: a both-cards item ran alone' "the intervals crossed: $(ivals "$t/fake-state/seq.log" gen_pt gen_pa)"; fi
   # (4b) a box-pick item (its recipe names the card: the plan's cards field is `-`, its label the card) takes no
   # card from the pack: its call carries no BLOOMERY_GATE_CARD, so its key holds and its line ends recorded. The
   # twin is the guard removed — the pack switches whatever card its label names, the old behaviour.
@@ -1530,11 +1559,11 @@ FP
   if [ "$(grep -c 'the pack takes it at [0-9]*s' <<< "$out")" = 2 ]; then pass 'pack: the dry run names each X item'"'"'s simulated take'
   else fail 'pack: the dry run names each X item'"'"'s simulated take' "$(grep 'lane X' <<< "$out")"; fi
   # (6) the fixture tier reads no bytes: a pair over any budget packs there.
-  rc=$(BLOOMERY_PACK_BUDGET=1 steal_case pk-fx "pk-big	A	3090	3	$d" "pk-big2	B	a6000	3	$d" \
+  rc=$(AWAIT='gen_pg=gen_pg2 gen_pg2=gen_pg' BLOOMERY_PACK_BUDGET=1 steal_case pk-fx "pk-big	A	3090	3	$d" "pk-big2	B	a6000	3	$d" \
     -- --tier fixture pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-pk-fx"
   rc_ok 'pack: a fixture pair over the budget ends green' pk-fx 2
-  if overlap "$t/fake-state/ran.log" gen_pg gen_pg2; then pass 'pack: the fixture tier sums no bytes (its loads are the small fixtures)'
+  if overlap "$t/fake-state/seq.log" gen_pg gen_pg2; then pass 'pack: the fixture tier sums no bytes (its loads are the small fixtures)'
   else fail 'pack: the fixture tier sums no bytes (its loads are the small fixtures)' "the intervals did not cross"; fi
   # (7) the table's own errors: a solo recipe with no row, a row for a recipe that is not solo.
   cp "$t/justfile" "$t/justfile.pk"
@@ -1552,13 +1581,13 @@ FP
     -- pool-any@FAKE_SLEEP=4 pool-two@FAKE_SLEEP=4)
   printf '%s' "$rc" > "$t/rc-pool-lanes"
   rc_ok 'pool: two pool items in two lanes end green' pool-lanes 2
-  if no_overlap "$t/fake-state/ran.log" gen_pl gen_p2; then pass 'pool: two pool items never overlap (the mutex)'
+  if no_overlap "$t/fake-state/seq.log" gen_pl gen_p2; then pass 'pool: two pool items never overlap (the mutex)'
   else fail 'pool: two pool items never overlap (the mutex)' "the intervals crossed"; fi
   mutant_of pk-nopool 's|^pool_take() { until mkdir "\$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|' '# MUTANT pk-nopool$'
-  rc=$(MTAG=pk-nopool steal_case pool-lanesm "pool-any	A	3090	4	$d" "pool-two	B	a6000	4	$d" \
+  rc=$(AWAIT='gen_pl=gen_p2 gen_p2=gen_pl' MTAG=pk-nopool steal_case pool-lanesm "pool-any	A	3090	4	$d" "pool-two	B	a6000	4	$d" \
     -- pool-any@FAKE_SLEEP=4 pool-two@FAKE_SLEEP=4)
   printf '%s' "$rc" > "$t/rc-pool-lanesm"
-  if overlap "$t/fake-state/ran.log" gen_pl gen_p2; then pass 'pool mutant: without the mutex the two pool items overlap'
+  if overlap "$t/fake-state/seq.log" gen_pl gen_p2; then pass 'pool mutant: without the mutex the two pool items overlap'
   else fail 'pool mutant: without the mutex the two pool items overlap' "the intervals did not cross"; fi
   # (9) the budget scan follows the calls: a bound two scripts deep refuses the item; one hop deep
   # (the mutant) it reads unchecked and the batch runs it.
@@ -1948,7 +1977,7 @@ IG
   check '  … and fixed to the A6000 lane in the fixture tier' 0 '^sr-a6000	B	fixed	-	' "${gb[@]}" --tier fixture --classes
   out=$("${gb[@]}" --tier fixture --dry-run sr-a6000 plain-any host 2>&1) || fail 'one card: the fixture dry run failed' "$out"
   if grep -q '^lane B  sr-a6000 ' <<< "$out" && grep -q "^lane B  sr-a6000 .*BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture' just sr-a6000$" <<< "$out" \
-    && ! grep -A3 '^lane B  sr-a6000 ' <<< "$out" | grep -q movable; then pass 'one card: the fixture dry run puts it in lane B with no card forced, and not movable'
+    && ! grep -q movable <<< "$(grep -A3 '^lane B  sr-a6000 ' <<< "$out")"; then pass 'one card: the fixture dry run puts it in lane B with no card forced, and not movable'
   else fail 'one card: the fixture dry run puts it in lane B with no card forced, and not movable' "$out"; fi
   rc=$(steal_case sr-one "plain-any	B	a6000	10	$d" "host	B	none	5	$d" "sr-a6000	B	a6000	8	$d" -- --tier fixture host plain-any sr-a6000)
   printf '%s' "$rc" > "$t/rc-sr-one"
@@ -2113,7 +2142,7 @@ IG
     && grep -q "^gate-batch: another batch's GPU hold is up" "$t/out-hold-foreign.log"; then
     pass 'hold: another batch'"'"'s fresh hold: not starting, 75, named'
   else fail 'hold: another batch'"'"'s fresh hold: not starting, 75, named' "rc=$(cat "$t/rc-hold-foreign") $(tail -2 "$t/out-hold-foreign.log")"; fi
-  if head -1 "$t/fake-state/batch.gpuhold" | grep -q '^owner=otherbatch ' && [ ! -e "$t/target/c-hold-foreign/run.log" ]; then
+  if grep -q '^owner=otherbatch ' <<< "$(head -1 "$t/fake-state/batch.gpuhold")" && [ ! -e "$t/target/c-hold-foreign/run.log" ]; then
     pass '  … its hold stays, and the refused start left no run.log'
   else fail '  … its hold stays, and the refused start left no run.log' "$(head -1 "$t/fake-state/batch.gpuhold" 2>&1)"; fi
   want_no_row '  … and no item ran' "$t/fake-state/seen.log" "$items_only"
