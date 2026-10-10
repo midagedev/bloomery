@@ -1,26 +1,39 @@
-//! The Clef-Flash image-input oracle sets (`tools/ref/clefvis/dump_mtmd.cpp`):
-//! llama.cpp mainline's mtmd `qwen3vl_merger` tower and its qwen35 text model on
-//! Clef-Flash's Q8_0 file, written in the node-dump set format
-//! (`tools/ref/dump_ref.cpp`), so a family's identity check
-//! ([`crate::arch::qwen35::clefvis`], through [`RefManifest::open`]) already
+//! The image-input oracle sets of the Qwen3-VL family seats
+//! (`tools/ref/clefvis/dump_mtmd.cpp`): llama.cpp mainline's mtmd
+//! `qwen3vl_merger` tower and a family's text model (Clef-Flash's qwen35 on
+//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp), written in the
+//! node-dump set format (`tools/ref/dump_ref.cpp`), so a family's identity
+//! check ([`crate::arch::qwen35::clefvis`], [`crate::arch::qwen35moe::vis`],
+//! [`crate::arch::qwen4exp::vis`], through [`RefManifest::open`]) already
 //! refuses a set of another file, another build or another architecture and
 //! a set without its trailer. This module reads what the format leaves to the
 //! kind of set: the `# clefvis <kind>` line, the mmproj the set names, the
 //! images and spans, and the rows each kind must carry, and hands the values
-//! out by name.
+//! out by name. What differs between the seats is a [`Profile`], the family's
+//! `Identity::Clefvis` payload: the projector file and its digest, the text
+//! model's width and the image-pad id.
 //!
 //! - [`Kind::Preproc`] (set A): per image `<name>/inp_raw`, the f32 image after
 //!   mtmd's preprocess, channel-planar `[W, H, 3, 1]`, the tower's graph input.
 //! - [`Kind::Taps`] (set B): per image `<name>/<node>` for the nodes of
-//!   [`tap_names`], and `<name>/embd`, the final embeddings `[4096, tokens]`.
+//!   [`tap_names`], and `<name>/embd`, the final embeddings `[n_embd, tokens]`;
+//!   a set tapped [`TapScope::Final`] holds `embd` and the post-LN output
+//!   [`POST_LN`] of every image.
 //! - [`Kind::Hidden`], [`Kind::Prose`] and [`Kind::Bf16Rows`] (sets C, C′, C″):
-//!   one prompt's `result_norm` of every position `[4096, ids]` and the
+//!   one prompt's `result_norm` of every position `[n_embd, ids]` and the
 //!   positions the decode was fed, `mrope_pos` `[3, ids]` (t, y, x), with the
 //!   spans of its images.
+//! - [`Kind::ChatIds`] (set E): the ids llama-server's chat path gives one
+//!   request, `ids` `[n]`, the rendered prompt, the chat template's digest and
+//!   the spans of its images.
+//! - [`Kind::Decode`] (set F): greedy decode steps after a prompt, `ids`
+//!   `[steps]`, `result_norm` `[n_embd, steps]` and `n_past` `[steps]`, with
+//!   the position the prompt left and the spans of its images.
 //!
 //! The header lines this reader owns: `# clefvis`, `# mmproj`, `# device`,
 //! `# image columns` and `# image`, `# span columns` and `# span`,
-//! `# tap_effect`; the rest are [`RefManifest`]'s.
+//! `# tap_effect`, `# prompt`, `# chat`, `# decode`; the rest are
+//! [`RefManifest`]'s.
 
 use crate::RefError;
 use crate::columns::{Columns, Row};
@@ -28,6 +41,9 @@ use crate::family::{Family, Identity};
 use crate::ik::{self, FileElem, Layout, RefManifest, RefRow, RowKind};
 use std::fmt;
 use std::path::Path;
+
+/// The architecture a tower set's manifest names in its `# arch` line (the projector's `general.architecture`).
+pub const TOWER_ARCH: &str = "clip";
 
 /// The projector file every clefvis set is dumped with: Clef-Flash's bf16
 /// mmproj from bartowski's `Cloudflare_clef-flash-GGUF`, under the box's
@@ -46,6 +62,33 @@ pub const IMAGE_PAD_ID: u32 = 248_056;
 
 /// The text model's width, and so the width of the tower's output rows.
 pub const N_EMBD: usize = 4096;
+
+/// What a seat's sets state that no other seat's do: the projector file and its digest, the text model's width and
+/// the id of its `<|image_pad|>`. A family's `Identity::Clefvis` carries one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Profile {
+    /// The projector file every set of the seat is dumped with.
+    pub mmproj: &'static str,
+    /// The sha256 of [`Profile::mmproj`].
+    pub mmproj_sha256: &'static str,
+    /// The text model's width, and so the width of the tower's output rows.
+    pub n_embd: usize,
+    /// The token id of `<|image_pad|>` in the text model's vocabulary.
+    pub image_pad_id: u32,
+}
+
+/// The mainline commit the Qwen3.6 and Qwen3.8 image-input sets name in their `# build` line.
+// PIN(2026-10-10): /home/user/llama.cpp-36a73916 at its HEAD 36a73916ee0c (ggml-org master, 2026-10-07), the tree that
+// carries the qwen4exp and GLM5-Next fixes after Clef's pin (`crate::arch::qwen35::LCPP_BUILD`); both trees stay on the box.
+pub const QVIS_LCPP_BUILD: &str = "36a73916e";
+
+/// Clef-Flash's seat.
+pub static CLEF: Profile = Profile {
+    mmproj: MMPROJ_BF16,
+    mmproj_sha256: MMPROJ_BF16_SHA256,
+    n_embd: N_EMBD,
+    image_pad_id: IMAGE_PAD_ID,
+};
 
 /// Patch size times the merge size: the sides of mtmd's planned image are
 /// multiples of it, and a token covers this many pixels a side.
@@ -100,6 +143,10 @@ pub enum Kind {
     Prose,
     /// Set C″: the same prompt with the tower's rows rounded to bf16.
     Bf16Rows,
+    /// Set E: the ids llama-server's chat path gives one request.
+    ChatIds,
+    /// Set F: greedy decode steps after a prompt.
+    Decode,
 }
 
 impl Kind {
@@ -112,20 +159,30 @@ impl Kind {
             Kind::Hidden => "hidden",
             Kind::Prose => "prose",
             Kind::Bf16Rows => "bf16rows",
+            Kind::ChatIds => "chatids",
+            Kind::Decode => "decode",
         }
     }
 
     /// Every kind, in the order the recipe writes them; the table holds one family of each.
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 7] = [
         Kind::Preproc,
         Kind::Taps,
         Kind::Hidden,
         Kind::Prose,
         Kind::Bf16Rows,
+        Kind::ChatIds,
+        Kind::Decode,
     ];
 
+    /// Whether a set of the kind holds `result_norm` and `mrope_pos` of every position of a prompt.
     fn is_prompt(self) -> bool {
         matches!(self, Kind::Hidden | Kind::Prose | Kind::Bf16Rows)
+    }
+
+    /// Whether a set of the kind states its prompt's ids: `# tokens_count`, `# image_pad_id` and the spans.
+    fn has_prompt_ids(self) -> bool {
+        self.is_prompt() || matches!(self, Kind::ChatIds | Kind::Decode)
     }
 }
 
@@ -169,16 +226,26 @@ pub struct Span {
     pub end_pos: i64,
 }
 
+/// Which nodes of the tower an image carries besides its final embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapScope {
+    /// Every node of [`tap_names`].
+    Full,
+    /// The post-LN output [`POST_LN`] only: the tower's output end.
+    Final,
+    /// None: the image is larger than the dump's `--tap-patches`.
+    EmbdOnly,
+}
+
 /// One `# tap_effect` line: whether the tap pass's final embeddings equal the
-/// clean pass's, and whether the image carries its block taps.
+/// clean pass's, and which nodes the image carries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TapEffect {
     pub image: String,
     pub values: u64,
     pub differing: u64,
     pub max_abs_diff: f64,
-    /// `true` when the image carries every node of [`tap_names`].
-    pub full: bool,
+    pub scope: TapScope,
 }
 
 /// A clefvis set: the node-dump manifest and what this module read of it.
@@ -186,6 +253,8 @@ pub struct TapEffect {
 pub struct ClefvisSet {
     pub man: RefManifest,
     pub kind: Kind,
+    /// The seat the family belongs to.
+    pub profile: &'static Profile,
     /// `# device cpu`: the CPU twin.
     pub cpu: bool,
     /// The card the dump ran on (`# device … card <name>`), `cpu` for a twin.
@@ -193,6 +262,29 @@ pub struct ClefvisSet {
     pub images: Vec<Image>,
     pub spans: Vec<Span>,
     pub tap_effect: Vec<TapEffect>,
+    /// The `# chat` line of a [`Kind::ChatIds`] set.
+    pub chat: Option<ChatLine>,
+    /// The `# decode` line of a [`Kind::Decode`] set.
+    pub decode: Option<DecodeLine>,
+}
+
+/// The `# chat` line of a chat-ids set: how the request was rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLine {
+    /// The sha256 of the model's chat template source.
+    pub template_sha256: String,
+    pub enable_thinking: bool,
+    pub add_generation_prompt: bool,
+    /// A trailing assistant message was continued, not closed.
+    pub continue_final_message: bool,
+}
+
+/// The `# decode` line of a decode set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeLine {
+    pub steps: usize,
+    /// The position after the prompt, where the first decoded token sits.
+    pub n_past_start: i64,
 }
 
 struct At<'a>(&'a Path);
@@ -233,11 +325,11 @@ fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
 impl ClefvisSet {
     /// Read the set at `dir` as a set of `family`, a family of identity [`Identity::Clefvis`]: against the family
     /// ([`RefManifest::open`]: the trailer, the model file, the architecture and the mainline build), then against
-    /// the family's kind. A set of another kind is [`RefError::Foreign`] on `clefvis`, one made with another mmproj
-    /// [`RefError::Stale`], a row the kind needs that is missing or of another shape [`RefError::Malformed`]
-    /// naming it, and so is a family of another identity.
+    /// the family's kind and profile. A set of another kind is [`RefError::Foreign`] on `clefvis`, one made with
+    /// another mmproj [`RefError::Stale`], a row the kind needs that is missing or of another shape
+    /// [`RefError::Malformed`] naming it, and so is a family of another identity.
     pub fn open(dir: &Path, family: &Family) -> Result<ClefvisSet, RefError> {
-        let Identity::Clefvis(kind) = family.identity else {
+        let Identity::Clefvis(kind, profile) = family.identity else {
             return Err(RefError::malformed(
                 At(dir),
                 format!("the {} family is not a clefvis family", family.name),
@@ -262,11 +354,11 @@ impl ClefvisSet {
                 format!("{mm:?}: want <path>\tsha256\t<digest>"),
             ));
         };
-        if path != MMPROJ_BF16 || digest != MMPROJ_BF16_SHA256 {
+        if path != profile.mmproj || digest != profile.mmproj_sha256 {
             return Err(RefError::Stale {
                 set: dir.display().to_string(),
                 dumped_from: format!("mmproj {path} sha256 {digest}"),
-                runs: format!("mmproj {MMPROJ_BF16} sha256 {MMPROJ_BF16_SHA256}"),
+                runs: format!("mmproj {} sha256 {}", profile.mmproj, profile.mmproj_sha256),
             });
         }
         let dev = one(&man, "device")?;
@@ -284,14 +376,27 @@ impl ClefvisSet {
         let images = read_images(&man)?;
         let spans = read_spans(&man)?;
         let tap_effect = read_tap_effect(&man)?;
+        let chat = if kind == Kind::ChatIds {
+            Some(read_chat(&man)?)
+        } else {
+            None
+        };
+        let decode = if kind == Kind::Decode {
+            Some(read_decode(&man)?)
+        } else {
+            None
+        };
         let set = ClefvisSet {
             man,
             kind,
+            profile,
             cpu,
             card,
             images,
             spans,
             tap_effect,
+            chat,
+            decode,
         };
         set.check_rows()?;
         Ok(set)
@@ -333,15 +438,24 @@ impl ClefvisSet {
 
     /// Node `node` of image `name`'s tower ([`Kind::Taps`]): a name of [`tap_names`] or
     /// [`EMBD`]; the row's shape is `[1152, patches]` (`Qcur_rope`: `[72, 16, patches]`),
-    /// `[4096, tokens]` for [`EMBD`]. An image the set holds `embd` only for
-    /// ([`TapEffect::full`] false) refuses every other node by name.
+    /// `[n_embd, tokens]` for [`EMBD`]. An image holds the nodes of its [`TapScope`] and [`EMBD`];
+    /// every other node is refused by name.
     pub fn tap(&self, name: &str, node: &str) -> Result<(RefRow, Vec<f32>), RefError> {
         self.need(Kind::Taps, "tap")?;
-        if node != EMBD && !self.tap_effect_of(name)?.full {
+        let carries = match self.tap_effect_of(name)?.scope {
+            TapScope::Full => true,
+            TapScope::Final => node == POST_LN,
+            TapScope::EmbdOnly => false,
+        };
+        if node != EMBD && !carries {
+            let only = match self.tap_effect_of(name)?.scope {
+                TapScope::Final => format!("{POST_LN} and {EMBD} only"),
+                _ => format!("{EMBD} only"),
+            };
             return Err(RefError::missing(
                 &self.man.dir,
                 format!(
-                    "{}: {name} carries {EMBD} only, not {node}",
+                    "{}: {name} carries {only}, not {node}",
                     self.man.dir.display()
                 ),
             ));
@@ -372,9 +486,9 @@ impl ClefvisSet {
             .collect()
     }
 
-    /// The number of ids of the prompt (a prompt kind): its `# tokens_count`.
+    /// The number of ids of the prompt (a prompt kind, a chat-ids or a decode set): its `# tokens_count`.
     pub fn n_ids(&self) -> Result<usize, RefError> {
-        self.need_prompt("n_ids")?;
+        self.need_prompt_ids("n_ids")?;
         self.man
             .header
             .tokens_count
@@ -385,6 +499,97 @@ impl ClefvisSet {
                     format!("{}: no `# tokens_count` line", self.man.dir.display()),
                 )
             })
+    }
+
+    /// The ids the chat path gave the request ([`Kind::ChatIds`]), image runs as the image-pad id repeated.
+    pub fn ids(&self) -> Result<Vec<u32>, RefError> {
+        self.need(Kind::ChatIds, "ids")?;
+        self.u32s("ids")
+    }
+
+    /// The prompt the chat template rendered, before tokenization ([`Kind::ChatIds`]).
+    pub fn prompt(&self) -> Result<String, RefError> {
+        self.need(Kind::ChatIds, "prompt")?;
+        let line = one(&self.man, "prompt")?;
+        let [raw] = line[..] else {
+            return Err(RefError::malformed(
+                At(&self.man.dir),
+                format!("a `# prompt` line of {} fields, want one", line.len()),
+            ));
+        };
+        unescape(raw).map_err(|e| RefError::malformed(At(&self.man.dir), format!("# prompt: {e}")))
+    }
+
+    /// The sha256 of [`ClefvisSet::prompt`] as the dump computed it ([`Kind::ChatIds`]).
+    pub fn prompt_sha256(&self) -> Result<String, RefError> {
+        self.need(Kind::ChatIds, "prompt_sha256")?;
+        Ok(one(&self.man, "prompt_sha256")?.join("\t"))
+    }
+
+    /// The `# chat` line ([`Kind::ChatIds`]).
+    pub fn chat(&self) -> Result<&ChatLine, RefError> {
+        self.need(Kind::ChatIds, "chat")?;
+        self.chat.as_ref().ok_or_else(|| {
+            RefError::missing(&self.man.dir, "a chat-ids set without its `# chat` line")
+        })
+    }
+
+    /// The `# decode` line ([`Kind::Decode`]).
+    pub fn decode(&self) -> Result<&DecodeLine, RefError> {
+        self.need(Kind::Decode, "decode")?;
+        self.decode.as_ref().ok_or_else(|| {
+            RefError::missing(&self.man.dir, "a decode set without its `# decode` line")
+        })
+    }
+
+    /// The token each decode step took, the argmax of the step before's last row ([`Kind::Decode`]).
+    pub fn decode_ids(&self) -> Result<Vec<u32>, RefError> {
+        self.need(Kind::Decode, "decode_ids")?;
+        self.u32s("ids")
+    }
+
+    /// `result_norm` of each decoded token's row `[n_embd, steps]`, row-major by step ([`Kind::Decode`]).
+    pub fn decode_result_norm(&self) -> Result<Vec<f32>, RefError> {
+        self.need(Kind::Decode, "decode_result_norm")?;
+        Ok(ik::load_ref_in(&self.man, "result_norm", 0)?.1)
+    }
+
+    /// The position after each decoded token ([`Kind::Decode`]).
+    pub fn decode_n_past(&self) -> Result<Vec<i32>, RefError> {
+        self.need(Kind::Decode, "decode_n_past")?;
+        ik::ref_ints(&self.man, "n_past", 0, RowKind::Tensor, Layout::Flat)?
+            .into_iter()
+            .map(|p| {
+                i32::try_from(p).map_err(|_| {
+                    RefError::malformed(At(&self.man.dir), format!("position {p} is not an i32"))
+                })
+            })
+            .collect()
+    }
+
+    /// The int row `name` as token ids.
+    fn u32s(&self, name: &str) -> Result<Vec<u32>, RefError> {
+        ik::ref_ints(&self.man, name, 0, RowKind::Tensor, Layout::Flat)?
+            .into_iter()
+            .map(|t| {
+                u32::try_from(t).map_err(|_| {
+                    RefError::malformed(At(&self.man.dir), format!("{name}: {t} is not a token id"))
+                })
+            })
+            .collect()
+    }
+
+    fn need_prompt_ids(&self, what: &str) -> Result<(), RefError> {
+        if self.kind.has_prompt_ids() {
+            return Ok(());
+        }
+        Err(RefError::malformed(
+            At(&self.man.dir),
+            format!(
+                "{what} reads a set that states its prompt's ids, this is {}",
+                self.kind.as_str()
+            ),
+        ))
     }
 
     fn need(&self, kind: Kind, what: &str) -> Result<(), RefError> {
@@ -414,6 +619,7 @@ impl ClefvisSet {
     /// Every row the kind needs is there, of its shape.
     fn check_rows(&self) -> Result<(), RefError> {
         let at = At(&self.man.dir);
+        let n_embd = self.profile.n_embd as u64;
         let want = |name: String, ne: [u64; 4]| -> Result<(), RefError> {
             let r = self.man.tensor(&name, 0)?;
             if r.ne != ne {
@@ -456,21 +662,20 @@ impl ClefvisSet {
                 for i in &self.images {
                     want(
                         format!("{}/{EMBD}", i.name),
-                        [N_EMBD as u64, i.n_tokens as u64, 1, 1],
+                        [n_embd, i.n_tokens as u64, 1, 1],
                     )?;
-                    let full = self.tap_effect_of(&i.name)?.full;
-                    if full {
-                        for n in tap_names() {
-                            let r = self.man.tensor(&format!("{}/{n}", i.name), 0)?;
-                            if r.ne.iter().product::<u64>() % (4 * i.n_tokens as u64) != 0 {
-                                return Err(RefError::malformed(
-                                    &at,
-                                    format!(
-                                        "{}/{n} is {:?}, not a whole row per patch",
-                                        i.name, r.ne
-                                    ),
-                                ));
-                            }
+                    let nodes = match self.tap_effect_of(&i.name)?.scope {
+                        TapScope::Full => tap_names(),
+                        TapScope::Final => vec![POST_LN.to_string()],
+                        TapScope::EmbdOnly => Vec::new(),
+                    };
+                    for n in nodes {
+                        let r = self.man.tensor(&format!("{}/{n}", i.name), 0)?;
+                        if r.ne.iter().product::<u64>() % (4 * i.n_tokens as u64) != 0 {
+                            return Err(RefError::malformed(
+                                &at,
+                                format!("{}/{n} is {:?}, not a whole row per patch", i.name, r.ne),
+                            ));
                         }
                     }
                 }
@@ -485,58 +690,26 @@ impl ClefvisSet {
                     ));
                 }
             }
-            Kind::Hidden | Kind::Prose | Kind::Bf16Rows => {
+            Kind::Hidden | Kind::Prose | Kind::Bf16Rows | Kind::ChatIds | Kind::Decode => {
                 let pad = one(&self.man, "image_pad_id")?;
-                if pad != [IMAGE_PAD_ID.to_string()] {
+                if pad != [self.profile.image_pad_id.to_string()] {
                     return Err(RefError::malformed(
                         &at,
                         format!(
-                            "image_pad_id {pad:?}, the Clef vocabulary's <|image_pad|> is {IMAGE_PAD_ID}"
+                            "image_pad_id {pad:?}, the vocabulary's <|image_pad|> is {}",
+                            self.profile.image_pad_id
                         ),
                     ));
                 }
                 let n = self.n_ids()? as u64;
-                want("result_norm".to_string(), [N_EMBD as u64, n, 1, 1])?;
-                want("mrope_pos".to_string(), [3, n, 1, 1])?;
-                let int =
-                    ik::find_int_row(&self.man, "mrope_pos", 0, RowKind::Tensor, Layout::Flat)?;
-                if int.twin != FileElem::I32 || int.count != 3 * n {
-                    return Err(RefError::malformed(
-                        &at,
-                        format!(
-                            "mrope_pos twin: {} elements of {:?}, want {} of I32",
-                            int.count,
-                            int.twin,
-                            3 * n
-                        ),
-                    ));
+                if self.kind.is_prompt() {
+                    want("result_norm".to_string(), [n_embd, n, 1, 1])?;
+                    want("mrope_pos".to_string(), [3, n, 1, 1])?;
+                    self.check_int_row("mrope_pos", 3 * n)?;
                 }
-                let mut end = 0usize;
-                for (k, s) in self.spans.iter().enumerate() {
-                    if s.index != k || s.at < end || s.at + s.len > n as usize || s.len == 0 {
-                        return Err(RefError::malformed(
-                            &at,
-                            format!(
-                                "span {}: {} + {} of {n} ids after index {end}",
-                                s.index, s.at, s.len
-                            ),
-                        ));
-                    }
-                    end = s.at + s.len;
-                    if self.kind != Kind::Prose {
-                        let i = self.image(&s.image)?;
-                        if s.len != i.n_tokens || (s.nx, s.ny, s.n_pos) != (i.nx, i.ny, i.n_pos) {
-                            return Err(RefError::malformed(
-                                &at,
-                                format!(
-                                    "span {} holds {} ids as {}x{}, image {} is {} tokens as {}x{}",
-                                    s.index, s.len, s.nx, s.ny, s.image, i.n_tokens, i.nx, i.ny
-                                ),
-                            ));
-                        }
-                    }
-                }
-                if (self.kind == Kind::Prose) != self.images.is_empty() {
+                self.check_spans(n as usize)?;
+                if (self.kind == Kind::Prose) != self.images.is_empty() && self.kind != Kind::Decode
+                {
                     return Err(RefError::malformed(
                         &at,
                         format!(
@@ -546,10 +719,207 @@ impl ClefvisSet {
                         ),
                     ));
                 }
+                if self.kind == Kind::ChatIds {
+                    self.check_chat_ids(n)?;
+                }
+                if self.kind == Kind::Decode {
+                    self.check_decode(n)?;
+                }
             }
         }
         Ok(())
     }
+
+    /// The int row `name`, of `count` elements, has its lossless i32 twin.
+    fn check_int_row(&self, name: &str, count: u64) -> Result<(), RefError> {
+        let int = ik::find_int_row(&self.man, name, 0, RowKind::Tensor, Layout::Flat)?;
+        if int.twin != FileElem::I32 || int.count != count {
+            return Err(RefError::malformed(
+                At(&self.man.dir),
+                format!(
+                    "{name} twin: {} elements of {:?}, want {count} of I32",
+                    int.count, int.twin
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The spans lie inside the `n` ids in order, hold their image's tokens, and (an image set) carry the decoder
+    /// positions the images' `n_pos` give: a span starts at its index less what the images before it saved.
+    fn check_spans(&self, n: usize) -> Result<(), RefError> {
+        let at = At(&self.man.dir);
+        let mut end = 0usize;
+        let mut saved = 0i64;
+        for (k, s) in self.spans.iter().enumerate() {
+            if s.index != k || s.at < end || s.at + s.len > n || s.len == 0 {
+                return Err(RefError::malformed(
+                    &at,
+                    format!(
+                        "span {}: {} + {} of {n} ids after index {end}",
+                        s.index, s.at, s.len
+                    ),
+                ));
+            }
+            end = s.at + s.len;
+            if self.kind != Kind::Prose {
+                let i = self.image(&s.image)?;
+                if s.len != i.n_tokens || (s.nx, s.ny, s.n_pos) != (i.nx, i.ny, i.n_pos) {
+                    return Err(RefError::malformed(
+                        &at,
+                        format!(
+                            "span {} holds {} ids as {}x{}, image {} is {} tokens as {}x{}",
+                            s.index, s.len, s.nx, s.ny, s.image, i.n_tokens, i.nx, i.ny
+                        ),
+                    ));
+                }
+                let start = s.at as i64 - saved;
+                if (s.start_pos, s.end_pos) != (start, start + s.n_pos as i64) {
+                    return Err(RefError::malformed(
+                        &at,
+                        format!(
+                            "span {} runs from position {} to {}, its {} ids and the images before it give {start} to {}",
+                            s.index,
+                            s.start_pos,
+                            s.end_pos,
+                            s.len,
+                            start + s.n_pos as i64
+                        ),
+                    ));
+                }
+                saved += s.len as i64 - s.n_pos as i64;
+            }
+        }
+        if self.kind != Kind::Prose
+            && self.kind != Kind::Decode
+            && self.images.len() != self.spans.len()
+        {
+            return Err(RefError::malformed(
+                &at,
+                format!(
+                    "{} image lines, {} spans",
+                    self.images.len(),
+                    self.spans.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A chat-ids set's `ids` row is the `n` ids of the header, the image-pad id fills each span and no id outside one.
+    fn check_chat_ids(&self, n: u64) -> Result<(), RefError> {
+        let at = At(&self.man.dir);
+        let r = self.man.tensor("ids", 0)?;
+        if r.ne != [n, 1, 1, 1] {
+            return Err(RefError::malformed(
+                &at,
+                format!("ids is {:?}, want [{n}, 1, 1, 1]", r.ne),
+            ));
+        }
+        self.check_int_row("ids", n)?;
+        let ids = self.u32s("ids")?;
+        let pad = self.profile.image_pad_id;
+        let mut in_span = vec![false; ids.len()];
+        for s in &self.spans {
+            in_span[s.at..s.at + s.len].fill(true);
+        }
+        for (i, (&id, &inside)) in ids.iter().zip(&in_span).enumerate() {
+            if (id == pad) != inside {
+                return Err(RefError::malformed(
+                    &at,
+                    format!(
+                        "ids[{i}] is {id}: the image-pad id {pad} fills the spans and nothing else"
+                    ),
+                ));
+            }
+        }
+        let chat = self.chat()?;
+        if chat.continue_final_message == chat.add_generation_prompt {
+            return Err(RefError::malformed(
+                &at,
+                "# chat: a request either opens the next turn or continues the last, never both or neither",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A decode set holds one id, one row and one position a step; the first token sits where the prompt's ids and
+    /// images leave the decoder (`ids - span lengths + image positions`), and each step advances it by one.
+    fn check_decode(&self, n: u64) -> Result<(), RefError> {
+        let at = At(&self.man.dir);
+        let line = self.decode()?;
+        let steps = line.steps as u64;
+        want_shape(&self.man, "ids", [steps, 1, 1, 1], &at)?;
+        want_shape(&self.man, "n_past", [steps, 1, 1, 1], &at)?;
+        want_shape(
+            &self.man,
+            "result_norm",
+            [self.profile.n_embd as u64, steps, 1, 1],
+            &at,
+        )?;
+        self.check_int_row("ids", steps)?;
+        self.check_int_row("n_past", steps)?;
+        let advance: i64 = self
+            .spans
+            .iter()
+            .map(|s| s.n_pos as i64 - s.len as i64)
+            .sum();
+        let start = n as i64 + advance;
+        if line.n_past_start != start {
+            return Err(RefError::malformed(
+                &at,
+                format!(
+                    "# decode: the first token sits at {}, the prompt's {n} ids and {} spans give {start}",
+                    line.n_past_start,
+                    self.spans.len()
+                ),
+            ));
+        }
+        for (k, p) in self.decode_n_past()?.into_iter().enumerate() {
+            let want = line.n_past_start + k as i64 + 1;
+            if i64::from(p) != want {
+                return Err(RefError::malformed(
+                    &at,
+                    format!("n_past[{k}] is {p}, step {k} ends at position {want}"),
+                ));
+            }
+        }
+        self.decode_ids()?;
+        Ok(())
+    }
+}
+
+/// Row `name` of the set has shape `ne`.
+fn want_shape(man: &RefManifest, name: &str, ne: [u64; 4], at: &At<'_>) -> Result<(), RefError> {
+    let r = man.tensor(name, 0)?;
+    if r.ne != ne {
+        return Err(RefError::malformed(
+            at,
+            format!("{name} is {:?}, want {ne:?}", r.ne),
+        ));
+    }
+    Ok(())
+}
+
+/// Undo the dump's line escaping: `\\`, `\n`, `\t` and `\r`; another escape, or one cut short, is an error.
+fn unescape(raw: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut it = raw.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(match it.next() {
+            Some('\\') => '\\',
+            Some('n') => '\n',
+            Some('t') => '\t',
+            Some('r') => '\r',
+            Some(o) => return Err(format!("the escape \\{o} is none of \\\\ \\n \\t \\r")),
+            None => return Err("a backslash ends the line".to_string()),
+        });
+    }
+    Ok(out)
 }
 
 fn columns_of(man: &RefManifest, kind: &str) -> Result<Option<Columns>, RefError> {
@@ -630,7 +1000,7 @@ fn read_spans(man: &RefManifest) -> Result<Vec<Span>, RefError> {
     })
 }
 
-/// `# tap_effect\t<image>\tembd values <n>\tdiffering <n>\tmax_abs_diff <x>\ttaps full|inp_raw only`.
+/// `# tap_effect\t<image>\tembd values <n>\tdiffering <n>\tmax_abs_diff <x>\ttaps full|final|inp_raw only`.
 fn read_tap_effect(man: &RefManifest) -> Result<Vec<TapEffect>, RefError> {
     lines(man, "tap_effect")
         .into_iter()
@@ -643,10 +1013,15 @@ fn read_tap_effect(man: &RefManifest) -> Result<Vec<TapEffect>, RefError> {
                     .map(str::trim)
                     .ok_or_else(|| bad(&format!("field {i} is not `{key} <value>`")))
             };
-            let full = match value(4, "taps")? {
-                "full" => true,
-                "inp_raw only" => false,
-                v => return Err(bad(&format!("taps {v:?}, want full or inp_raw only"))),
+            let scope = match value(4, "taps")? {
+                "full" => TapScope::Full,
+                "final" => TapScope::Final,
+                "inp_raw only" => TapScope::EmbdOnly,
+                v => {
+                    return Err(bad(&format!(
+                        "taps {v:?}, want full, final or inp_raw only"
+                    )));
+                }
             };
             Ok(TapEffect {
                 image: f.first().copied().unwrap_or("").to_string(),
@@ -659,8 +1034,215 @@ fn read_tap_effect(man: &RefManifest) -> Result<Vec<TapEffect>, RefError> {
                 max_abs_diff: value(3, "max_abs_diff")?
                     .parse()
                     .map_err(|e| bad(&format!("{e}")))?,
-                full,
+                scope,
             })
         })
         .collect()
 }
+
+/// `# chat\ttemplate_sha256 <hex>\tuse_jinja 1\tenable_thinking 0|1\treasoning_format deepseek\t
+/// add_generation_prompt 0|1\tcontinue_final_message none|auto`.
+fn read_chat(man: &RefManifest) -> Result<ChatLine, RefError> {
+    let f = one(man, "chat")?;
+    let bad = |what: &str| RefError::malformed(At(&man.dir), format!("# chat {f:?}: {what}"));
+    let value = |i: usize, key: &str| -> Result<&str, RefError> {
+        f.get(i)
+            .and_then(|s| s.strip_prefix(key))
+            .and_then(|s| s.strip_prefix(' '))
+            .ok_or_else(|| bad(&format!("field {i} is not `{key} <value>`")))
+    };
+    let flag = |i: usize, key: &str| -> Result<bool, RefError> {
+        match value(i, key)? {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            v => Err(bad(&format!("{key} {v:?}, want 0 or 1"))),
+        }
+    };
+    if value(1, "use_jinja")? != "1" {
+        return Err(bad("the oracle renders with the jinja template"));
+    }
+    Ok(ChatLine {
+        template_sha256: value(0, "template_sha256")?.to_string(),
+        enable_thinking: flag(2, "enable_thinking")?,
+        add_generation_prompt: flag(4, "add_generation_prompt")?,
+        continue_final_message: match value(5, "continue_final_message")? {
+            "none" => false,
+            "auto" => true,
+            v => {
+                return Err(bad(&format!(
+                    "continue_final_message {v:?}, want none or auto"
+                )));
+            }
+        },
+    })
+}
+
+/// `# decode\tsteps\t<n>\tn_past_start\t<n>\tsampler\t…`.
+fn read_decode(man: &RefManifest) -> Result<DecodeLine, RefError> {
+    let f = one(man, "decode")?;
+    let bad = |what: &str| RefError::malformed(At(&man.dir), format!("# decode {f:?}: {what}"));
+    let [steps, n, start, p, _sampler, ..] = f[..] else {
+        return Err(bad("want steps\t<n>\tn_past_start\t<n>\tsampler\t…"));
+    };
+    if steps != "steps" || start != "n_past_start" {
+        return Err(bad("want steps\t<n>\tn_past_start\t<n>\tsampler\t…"));
+    }
+    Ok(DecodeLine {
+        steps: n.parse().map_err(|e| bad(&format!("steps: {e}")))?,
+        n_past_start: p.parse().map_err(|e| bad(&format!("n_past_start: {e}")))?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod testkit;
+
+/// The families of one Qwen seat's sets, `$prefix` the sets' common name (`ref_<arch>_vis`): the tower's [`Kind::Taps`]
+/// family states the projector as its model file (`# arch clip`), every other kind states the text model; the card's
+/// sets of each kind and the CPU twins the recipe writes sit in one family, the chat ids (no card, no twin) too. The
+/// invoking module names the seat's [`Profile`], architecture, mainline build and the two files as functions.
+macro_rules! vis_families {
+    (
+        prefix: $prefix:literal, name: $name:literal, model: $arg:literal,
+        profile: $profile:expr, arch: $arch:expr, build: $build:expr,
+        mmproj: $mmproj:expr, text: $text:expr $(,)?
+    ) => {
+        /// Set B of the seat's tower: the post-LN output and the final embeddings of each test image.
+        pub static TAPS: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-taps"),
+            sets: &[concat!($prefix, "_taps"), concat!($prefix, "_taps.cpu")],
+            resolve: None,
+            recipe: concat!(
+                "just dump-ref-qvis ",
+                $arg,
+                " [--cpu-twin] ",
+                $prefix,
+                "_taps"
+            ),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Taps, &$profile),
+            arch: Some($crate::clefvis::TOWER_ARCH),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($mmproj),
+            draft_runs: None,
+            consumers: &[],
+        };
+
+        /// Set C: `result_norm` of every position of a chat prompt with mainline's tower rows, and the positions fed.
+        pub static HIDDEN: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-hidden"),
+            sets: &[
+                concat!($prefix, "_hidden_c1"),
+                concat!($prefix, "_hidden_c2"),
+                concat!($prefix, "_hidden_c3"),
+                concat!($prefix, "_hidden_c1.cpu"),
+                concat!($prefix, "_hidden_c2.cpu"),
+                concat!($prefix, "_hidden_c3.cpu"),
+            ],
+            resolve: None,
+            recipe: concat!(
+                "just dump-ref-qvis ",
+                $arg,
+                " [--cpu-twin] ",
+                $prefix,
+                "_hidden_c<N>"
+            ),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Hidden, &$profile),
+            arch: Some($arch),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($text),
+            draft_runs: None,
+            consumers: &[],
+        };
+
+        /// Set C′: the same prompts with each image's rows replaced by prose-id text rows.
+        pub static PROSE: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-prose"),
+            sets: &[
+                concat!($prefix, "_prose_c1"),
+                concat!($prefix, "_prose_c2"),
+                concat!($prefix, "_prose_c3"),
+                concat!($prefix, "_prose_c1.cpu"),
+                concat!($prefix, "_prose_c2.cpu"),
+                concat!($prefix, "_prose_c3.cpu"),
+            ],
+            resolve: None,
+            recipe: concat!(
+                "just dump-ref-qvis ",
+                $arg,
+                " [--cpu-twin] ",
+                $prefix,
+                "_prose_c<N>"
+            ),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Prose, &$profile),
+            arch: Some($arch),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($text),
+            draft_runs: None,
+            consumers: &[],
+        };
+
+        /// Set C″: the same prompts with mainline's tower rows rounded to bf16; the card only.
+        pub static BF16ROWS: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-bf16rows"),
+            sets: &[
+                concat!($prefix, "_bf16rows_c1"),
+                concat!($prefix, "_bf16rows_c2"),
+                concat!($prefix, "_bf16rows_c3"),
+            ],
+            resolve: None,
+            recipe: concat!("just dump-ref-qvis ", $arg, " ", $prefix, "_bf16rows_c<N>"),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Bf16Rows, &$profile),
+            arch: Some($arch),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($text),
+            draft_runs: None,
+            consumers: &[],
+        };
+
+        /// Set E: the ids llama-server's chat path gives each request, with its rendered prompt.
+        pub static CHATIDS: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-chatids"),
+            sets: &[
+                concat!($prefix, "_chatids_c1"),
+                concat!($prefix, "_chatids_c2"),
+                concat!($prefix, "_chatids_c3"),
+                concat!($prefix, "_chatids_e1"),
+                concat!($prefix, "_chatids_e2"),
+                concat!($prefix, "_chatids_e3"),
+            ],
+            resolve: None,
+            recipe: concat!("just dump-ref-qvis ", $arg, " --ids"),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::ChatIds, &$profile),
+            arch: Some($arch),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($text),
+            draft_runs: None,
+            consumers: &[],
+        };
+
+        /// Set F: 32 greedy decode steps after prompts C1 and C2.
+        pub static DECODE: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-decode"),
+            sets: &[
+                concat!($prefix, "_decode_c1"),
+                concat!($prefix, "_decode_c2"),
+                concat!($prefix, "_decode_c1.cpu"),
+                concat!($prefix, "_decode_c2.cpu"),
+            ],
+            resolve: None,
+            recipe: concat!(
+                "just dump-ref-qvis ",
+                $arg,
+                " [--cpu-twin] ",
+                $prefix,
+                "_decode_c<N>"
+            ),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Decode, &$profile),
+            arch: Some($arch),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($text),
+            draft_runs: None,
+            consumers: &[],
+        };
+    };
+}
+pub(crate) use vis_families;
