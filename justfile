@@ -1317,11 +1317,12 @@ gate-gpu-ds41-index:
 gate-gpu-ds41-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib'
 
-# V4.1 서버 엔진 결합(gpu-gates의 bind, deepseek41 기능 뒤에 있어 gate-gpu-gates-lib가 빌드하지 않는다)의 호스트 단위 시험:
+# V4.1 서버 엔진 결합(gpu-gates의 bind, deepseek41 기능 뒤에 있어 gate-gpu-gates-lib가 빌드하지 않는다)과 모든 서버 좌석이 나눠 쓰는
+# 비전 좌석(vision_seat: 플래그, 투영기↔텍스트 검사, 인코더 자리와 reserve, 표의 위치당 바이트, `vision` 레코드)의 호스트 단위 시험:
 # 샘플링 스텝이 엔진의 로짓 버퍼 하나를 빌려 쓰고, 길이가 다른 호출자 버퍼는 이름 붙은 오류다. 카드·게이트 락 없음.
 [group('host')]
 gate-ds41-bind:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- bind::'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- vision_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- bind::'
 
 # The Qwen3.8 serve seat's feed rules (bloomery-serve-qwen38's own unit tests, behind the deepseek41 feature like bind):
 # the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes
@@ -1645,7 +1646,7 @@ gate-gpu-ds41-chat:
 # (a continuation, a cut, a resume) against
 # cache_prompt: false. Then the image clauses (gate_ds41_serve --mmproj: the server built with the vision feature, the
 # same build gate-gpu-vision and gate-gpu-ds41-media's encoder file): /props vision on, the encoder's seat and bytes on
-# its `vision` line (the off-plan card under the gate placement), the bar-chart scene's values read from a data URL, the
+# its `vision` record (the off-plan card under the gate placement), the bar-chart scene's values read from a data URL, the
 # same image's span kept through the prompt cache, the reserve path under --place bp (the plan's bytes carry the
 # encoder's reserve), and the plain server's no-vision no-reserve /props. Then plan (b′) with the draft (--place bp: the
 # A6000 plan (a), the 3090 the expert tier and the draft): generate_ds41 --place bp under the draft, then
