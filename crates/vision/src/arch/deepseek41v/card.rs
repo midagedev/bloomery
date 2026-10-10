@@ -1,5 +1,5 @@
-//! The encoder's bytes on its card, from the hyperparameters alone — the one figure the loaded
-//! encoder (`gpu_vision::Encoder`) and a plan that reserves room for it both read:
+//! The encoder's bytes on its card, from the hyperparameters alone ([`of`]) — the one figure the
+//! loaded encoder (`gpu_vision::Encoder`) and a plan that reserves room for it both read:
 //!
 //! * the weights: every [`Home::Card`] row of the tensor table at its own type. The span's three
 //!   delimiter rows ([`Home::Span`]) are the text model's input, read on the host, and are not
@@ -10,33 +10,18 @@
 use super::Hparams;
 use super::tensors::{Home, expected};
 
-/// The encoder's bytes on its card for a file of given hyperparameters ([`CardBytes::of`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CardBytes {
-    /// The weights the encoder uploads.
-    pub weights: u64,
-    /// The activations it allocates.
-    pub scratch: u64,
-}
+pub use crate::arch::card::CardBytes;
 
-impl CardBytes {
-    /// The encoder of a file of `hp` (module doc).
-    #[must_use]
-    pub fn of(hp: &Hparams) -> CardBytes {
-        CardBytes {
-            weights: expected(hp)
-                .iter()
-                .filter(|e| e.home == Home::Card)
-                .map(super::tensors::Expected::bytes)
-                .sum(),
-            scratch: ScratchLens::of(hp).bytes(),
-        }
-    }
-
-    /// The figure a plan reserves for the encoder.
-    #[must_use]
-    pub const fn total(self) -> u64 {
-        self.weights + self.scratch
+/// The encoder's bytes on its card for a file of `hp` (module doc).
+#[must_use]
+pub fn of(hp: &Hparams) -> CardBytes {
+    CardBytes {
+        weights: expected(hp)
+            .iter()
+            .filter(|e| e.home == Home::Card)
+            .map(super::tensors::Expected::bytes)
+            .sum(),
+        scratch: ScratchLens::of(hp).bytes(),
     }
 }
 
@@ -117,7 +102,7 @@ impl ScratchLens {
 
 #[cfg(test)]
 mod tests {
-    use super::CardBytes;
+    use super::{CardBytes, of};
     use crate::arch::deepseek41v::tensors::tests::hp;
 
     /// The V4.1 encoder's card bytes. Weights: 970,088,448 B of bf16 matrices (the patch
@@ -127,7 +112,7 @@ mod tests {
     #[test]
     fn the_v41_encoder_card_bytes_leave_the_span_rows_out() {
         assert_eq!(
-            CardBytes::of(&hp()),
+            of(&hp()),
             CardBytes {
                 weights: 970_924_032,
                 scratch: 339_878_648,

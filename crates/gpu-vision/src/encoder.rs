@@ -49,7 +49,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Gguf;
 use std::sync::Arc;
 use vision::Patches;
-use vision::arch::deepseek41v::card::{CardBytes, ScratchLens};
+use vision::arch::deepseek41v::card::{CardBytes, ScratchLens, of as card_bytes};
 use vision::arch::deepseek41v::{Hparams, names, tensors};
 
 /// One block's weights on the card.
@@ -205,7 +205,7 @@ impl Encoder {
                 ),
             });
         }
-        let card = CardBytes::of(&hp);
+        let card = card_bytes(&hp);
         let bf16 = |name: String| up_bf16(stream, file, &name);
         let f32s = |name: String| up_f32(stream, file, &name);
         let mut blocks = Vec::with_capacity(hp.n_layer);

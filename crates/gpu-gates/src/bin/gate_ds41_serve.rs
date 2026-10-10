@@ -1728,7 +1728,7 @@ mod gate {
             vision::arch::deepseek41v::grid::num_image_tokens(plan.n_llm_h, plan.n_llm_w);
         Ok(Scene {
             mmproj: set.mmproj,
-            bytes: CardBytes::of(&hp),
+            bytes: vision::arch::deepseek41v::card::of(&hp),
             png,
             span_len,
             token: set.image_token_id,
