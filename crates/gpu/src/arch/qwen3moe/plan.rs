@@ -284,6 +284,17 @@ impl FfnPlan {
         }
     }
 
+    /// Whether a routed layer launches a kernel of `dispatch::FfnKernels`:
+    /// the table's Q5_K gate·up or down. The family's own Q4_K gate·up and
+    /// the Q4_K and Q6_K downs launch from the chain's base kernels.
+    pub(super) fn kq_sel(&self) -> bool {
+        matches!(self.route, FfnRoute::Router { .. })
+            && (matches!(
+                gate_up_entry(self.gate_ty, self.up_ty, ""),
+                Ok(GateUpEntry::Q5k)
+            ) || matches!(down_entry(self.down_ty, ""), Ok(DownEntry::Q5k)))
+    }
+
     /// The shared expert kept apart, on a layer that keeps one
     /// ([`SharedPlan::Apart`]).
     pub(super) fn apart(&self) -> Option<&SharedSites> {
@@ -752,5 +763,39 @@ mod tests {
                 Ok(k) => panic!("layer {at} accepted: {k:?}"),
             }
         }
+    }
+
+    /// A routed layer's gate·up and down launch at the table's entries of
+    /// their types, and only a Q5_K one is the K-quant `_sel` family's
+    /// (`FfnPlan::kq_sel`: the kernels a Q4_K or Q6_K layer never loads);
+    /// a type with no entry for the dispatch is refused by name.
+    #[test]
+    fn a_routed_layer_needs_the_kquant_sel_family_for_a_q5k_stack_only() {
+        use super::fixtures::layer;
+        use super::{DownEntry, GateUpEntry, GqaKind, SiteTy, down_entry, gate_up_entry};
+        use SiteTy::{Q3K, Q4K, Q5K, Q6K, Q8_0};
+        let attn = [Q4K; 4];
+        let kq_sel = |gate_up: SiteTy, down: SiteTy| {
+            let mut p = layer(GqaKind::Neox128, attn);
+            (p.ffn.gate_ty, p.ffn.up_ty, p.ffn.down_ty) = (gate_up, gate_up, down);
+            p.ffn.kq_sel()
+        };
+        assert!(!kq_sel(Q4K, Q4K));
+        assert!(!kq_sel(Q4K, Q6K));
+        assert!(kq_sel(Q5K, Q4K));
+        assert!(kq_sel(Q4K, Q5K));
+        assert!(kq_sel(Q5K, Q6K));
+        assert_eq!(gate_up_entry(Q5K, Q5K, "t").ok(), Some(GateUpEntry::Q5k));
+        assert_eq!(down_entry(Q5K, "t").ok(), Some(DownEntry::Q5k));
+        for ty in [Q3K, Q6K, Q8_0] {
+            let e = gate_up_entry(ty, ty, "t").expect_err("a gate·up with no entry");
+            assert!(e.to_string().contains(&format!("{ty} gate·up")), "{e}");
+        }
+        for ty in [Q3K, Q8_0] {
+            let e = down_entry(ty, "t").expect_err("a down with no entry");
+            assert!(e.to_string().contains(&format!("{ty} down")), "{e}");
+        }
+        let e = gate_up_entry(Q4K, Q5K, "t").expect_err("a gate beside another type's up");
+        assert!(e.to_string().contains("one gate·up launch"), "{e}");
     }
 }

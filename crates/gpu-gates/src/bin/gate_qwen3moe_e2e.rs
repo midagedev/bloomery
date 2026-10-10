@@ -135,6 +135,21 @@
 //!   activations) where the card runs q8_1, so no layer's error grows.
 //!   `--placed-only` runs (o) alone.
 //!
+//! - (y) the Q5_K routed path, on its own loads of [`Y_FILE`] (unsloth's
+//!   Qwen3-Coder `Q5_K_M`, which has no ik reference set, so each clause is
+//!   the arm's own consistency): the header carries every launch family the
+//!   clause names (Q5_K attention q/k/v/output, a Q5_K token embedding,
+//!   Q5_K routed gate·up and down); the captured step and passes hold
+//!   [`Y_NODES_STEP`], [`Y_NODES_PASS_1`] and [`Y_NODES_PASS_M`] nodes; the
+//!   greedy continuation of [`Y_IDS`] prose ids is the same tokens and last
+//!   logits bit for bit in graph and in eager mode, and prefilled on the pass
+//!   path (`PrefillPath::Pass`, the first [`Y_PASS`] ids); the GEMM prefill
+//!   of the [`Y_IDS`] ids leaves a continuation that differs from the
+//!   one-token path's only where its margin is under [`MARGIN_FLOOR`]; the
+//!   file planned under [`PLACED_BUDGET`] with experts on both tiers and
+//!   loaded by that plan gives the whole-card greedy tokens by the same
+//!   rule, the host tier serving slots. `--q5-only` runs (y) alone.
+//!
 //! - (m) the memory guard, `--memguard-only` (the card as the runner pins
 //!   it, nothing loaded): the census reads device 0's free bytes (at most
 //!   its usable bytes); with the card quiet the `--place`-unset load is
@@ -501,6 +516,14 @@ mod gate {
             }
             return Ok(());
         }
+        if args.iter().any(|a| a == "--q5-only") {
+            let ok = q5_routed(host)?;
+            println!("gate_qwen3moe_e2e --q5-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--memguard-only") {
             let ok = memguard()?;
             println!("gate_qwen3moe_e2e --memguard-only: {}", verdict(ok));
@@ -571,7 +594,7 @@ mod gate {
             return Ok(());
         }
         let mut ok = true;
-        ok &= structure(&mut m)?;
+        ok &= structure(&mut m, NODES_FILE)?;
         let mut s = Session::from_model(m, u32::try_from(CTX)?);
         ok &= clear(&mut s)?;
         let m = s.model_mut();
@@ -593,6 +616,7 @@ mod gate {
         drop(m);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
+        ok &= q5_routed(host)?;
         ok &= q8_cache()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
@@ -761,7 +785,28 @@ mod gate {
 
     // ------------------------------------------------------- (s) structure
 
-    fn structure(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+    /// The node counts (s) holds a file's captures to: the step, the pass at
+    /// one token and the pass at every count from two.
+    #[derive(Clone, Copy)]
+    struct StructureNodes {
+        chain: usize,
+        pass_1: usize,
+        pass_m: usize,
+    }
+
+    /// The gates' file (`BLOOMERY_MODEL`): the counts above.
+    const NODES_FILE: StructureNodes = StructureNodes {
+        chain: NODES_CHAIN,
+        pass_1: NODES_PASS_1,
+        pass_m: NODES_PASS_M,
+    };
+
+    fn structure(m: &mut Qwen3moeModel, want: StructureNodes) -> Result<bool, GateError> {
+        let StructureNodes {
+            chain,
+            pass_1,
+            pass_m,
+        } = want;
         let nodes = m.capture_step()?;
         let ([kernel, memcpy, memset, host], other) = count_kinds(
             &m.step_graph_nodes()?,
@@ -772,9 +817,9 @@ mod gate {
                 sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST,
             ],
         );
-        let mut pass = nodes == NODES_CHAIN && memcpy == MEMCPY_CHAIN && host == 0;
+        let mut pass = nodes == chain && memcpy == MEMCPY_CHAIN && host == 0;
         println!(
-            "structure graph_nodes={nodes} (want {NODES_CHAIN}) kernel={kernel} memcpy={memcpy} \
+            "structure graph_nodes={nodes} (want {chain}) kernel={kernel} memcpy={memcpy} \
              (want {MEMCPY_CHAIN}) memset={memset} host={host} (want 0) other={other} {}",
             verdict(pass)
         );
@@ -799,11 +844,7 @@ mod gate {
         );
         for (i, &nodes) in counts.iter().enumerate() {
             let rows = i + 1;
-            let want = if rows == 1 {
-                NODES_PASS_1
-            } else {
-                NODES_PASS_M
-            };
+            let want = if rows == 1 { pass_1 } else { pass_m };
             let list = m.prefill_graph_nodes(rows)?;
             let ([kernel], other) =
                 count_kinds(&list, [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL]);
@@ -1178,8 +1219,11 @@ mod gate {
     /// [`PLACED_BUDGET`], its `plan` record and the split line printed, and
     /// loaded by that plan with its host set as `host` asks; `None` when the
     /// plan leaves no routed expert on the card or none on the host.
-    fn open_placed(ctx: usize, host: HostCfg) -> Result<Option<Qwen3moeModel>, GateError> {
-        let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+    fn open_placed(
+        file: gguf::Split,
+        ctx: usize,
+        host: HostCfg,
+    ) -> Result<Option<Qwen3moeModel>, GateError> {
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(PLACED_BUDGET),
@@ -1205,7 +1249,8 @@ mod gate {
     /// (o) (module doc): the model is dropped before the clause returns.
     fn placed(host: HostCfg) -> Result<bool, GateError> {
         let t = Instant::now();
-        let Some(mut m) = open_placed(CTX, host)? else {
+        let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+        let Some(mut m) = open_placed(file, CTX, host)? else {
             return Ok(false);
         };
         let counts = m
@@ -1239,6 +1284,188 @@ mod gate {
             verdict(served)
         );
         Ok(ok && served)
+    }
+
+    // ------------------------------------------- (y) the Q5_K routed path
+
+    /// (y)'s file: unsloth's Qwen3-Coder-30B-A3B-Instruct `Q5_K_M`, the
+    /// smallest real file that carries the Q5_K paths (the family has no
+    /// fixture): Q5_K attention q/k/o and v (Q6_K on every other layer), a
+    /// Q5_K token embedding, Q5_K routed gate·up and Q5_K routed down (Q6_K
+    /// on every other layer), a Q6_K head.
+    const Y_FILE: &str = "/models/qwen3-coder-hf/Qwen3-Coder-30B-A3B-Instruct-Q5_K_M.gguf";
+
+    /// (y)'s prompt: the prose's first ids, a GEMM ubatch (more than a pass
+    /// holds) in the prefill clause, stepped one id at a time in the others.
+    const Y_IDS: usize = 600;
+
+    /// The ids (y)'s pass clause prefills: several passes, the last short.
+    const Y_PASS: usize = MAX_TOKENS * 2 + 3;
+
+    /// PIN(2026-10-10): the captured step's node count on [`Y_FILE`],
+    /// derived from its header before any run: the embedding row, 15 nodes
+    /// on each of 48 layers, the head's three (norm, q8_1, the Q6_K gemv with
+    /// the argmax folded in). A layer's 15: attention norm+quant, q, k and v
+    /// each alone (a Q5_K or Q6_K site is not one of the fused Q4_K groups),
+    /// QK-norm+rope+append, the flash segment pass and merge, the q8_1 of
+    /// the attention rows, attn_output alone and the residual add; the FFN
+    /// half's 5 (the norm with the router, gate·up, the q8_1 of the slots,
+    /// the down `_sel`, the combine), each routed launch replacing the Q4_K
+    /// one for one: 1 + 48 · 15 + 3.
+    const Y_NODES_STEP: usize = 724;
+
+    /// PIN(2026-10-10): the captured pass at one token: the step without its
+    /// head, 1 + 48 · 15.
+    const Y_NODES_PASS_1: usize = 721;
+
+    /// PIN(2026-10-10): the captured pass at every count from two: the pass
+    /// at one token plus a token-major copy after each row-major (Q6_K) site
+    /// launched alone, which are the 24 layers' `attn_v` (Q5_K sites are
+    /// token-major and need none): 721 + 24.
+    const Y_NODES_PASS_M: usize = 745;
+
+    /// (y) (module doc), on its own loads, each dropped before the clause
+    /// returns. The whole-card runs are kept for the placed clause's compare.
+    fn q5_routed(host: HostCfg) -> Result<bool, GateError> {
+        use gguf::quant::GgmlType::{Q5_K, Q6_K};
+        let file = gguf::Split::open(Y_FILE).map_err(|e| format!("open {Y_FILE}: {e}"))?;
+        // The census: each launch family the clause names is in the header.
+        let mut census = std::collections::BTreeMap::<(String, String), usize>::new();
+        for (_, t) in file.iter_tensors() {
+            let role = t
+                .name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split_once('.'))
+                .map_or(t.name.as_str(), |(_, r)| r);
+            if t.dims.len() >= 2 {
+                *census
+                    .entry((role.to_string(), t.ty.to_string()))
+                    .or_default() += 1;
+            }
+        }
+        let mut ok = true;
+        for (role, ty) in [
+            ("attn_q.weight", Q5_K),
+            ("attn_k.weight", Q5_K),
+            ("attn_v.weight", Q5_K),
+            ("attn_v.weight", Q6_K),
+            ("attn_output.weight", Q5_K),
+            ("token_embd.weight", Q5_K),
+            ("ffn_gate_exps.weight", Q5_K),
+            ("ffn_up_exps.weight", Q5_K),
+            ("ffn_down_exps.weight", Q5_K),
+            ("ffn_down_exps.weight", Q6_K),
+            ("output.weight", Q6_K),
+        ] {
+            let n = census
+                .get(&(role.to_string(), ty.to_string()))
+                .copied()
+                .unwrap_or(0);
+            let carried = n > 0;
+            println!(
+                "q5 census {role} {ty} x{n} (at least 1) {}",
+                verdict(carried)
+            );
+            ok &= carried;
+        }
+        let ids = prose(Y_IDS)?;
+        let open = |ctx: usize| -> Result<Qwen3moeModel, GateError> {
+            let file = gguf::Split::open(Y_FILE).map_err(|e| format!("open {Y_FILE}: {e}"))?;
+            let t = Instant::now();
+            let mut m = Qwen3moeModel::open(
+                Gpu::new()?,
+                file,
+                Qwen3moeModel::lever_opts(ctx, KvQ8::F16)?,
+            )?;
+            m.set_mode(StepMode::Graph);
+            println!(
+                "q5 load resident_bytes={} ctx={ctx} in {:.1} s (runtime value)",
+                m.resident_bytes(),
+                t.elapsed().as_secs_f64()
+            );
+            Ok(m)
+        };
+        let mut m = open(CTX)?;
+        ok &= structure(
+            &mut m,
+            StructureNodes {
+                chain: Y_NODES_STEP,
+                pass_1: Y_NODES_PASS_1,
+                pass_m: Y_NODES_PASS_M,
+            },
+        )?;
+        // Graph and eager steps: the same tokens, the last logits bit for bit.
+        m.set_mode(StepMode::Graph);
+        let graph = long_run(&mut m, &ids, None, None)?;
+        m.set_mode(StepMode::Eager);
+        let eager = long_run(&mut m, &ids, None, None)?;
+        let same = graph.tokens == eager.tokens && bits_equal(&graph.logits, &eager.logits);
+        println!(
+            "q5 graph = eager over {GEN} tokens: first {} {}",
+            graph.tokens.first().copied().unwrap_or(0),
+            verdict(same)
+        );
+        ok &= same;
+        // The pass path: the same tokens and logits as one step per id.
+        m.set_mode(StepMode::Graph);
+        let ids_p = &ids[..Y_PASS];
+        let step_p = long_run(&mut m, ids_p, None, None)?;
+        let pass_p = long_run(&mut m, ids_p, Some(PrefillPath::Pass), None)?;
+        let same = step_p.tokens == pass_p.tokens
+            && bits_equal(&step_p.logits, &pass_p.logits)
+            && step_p.kv == pass_p.kv;
+        println!(
+            "q5 pass prefill = one-token path ({Y_PASS} ids) {}",
+            verdict(same)
+        );
+        ok &= same;
+        // The GEMM ubatch: a continuation that differs from the one-token
+        // path's only where that path's own margin is under the floor.
+        let step = long_run(&mut m, &ids, None, None)?;
+        let gemm = long_run(&mut m, &ids, Some(PrefillPath::Gemm), None)?;
+        let first_diff = step
+            .tokens
+            .iter()
+            .zip(&gemm.tokens)
+            .position(|(a, b)| a != b);
+        let near_tie = first_diff.is_none_or(|i| step.margins[i] < MARGIN_FLOOR);
+        println!(
+            "q5 gemm prefill ({Y_IDS} ids): first difference {first_diff:?} (none, or at a margin \
+             under {MARGIN_FLOOR}) logits rel {:.3e} {}",
+            rel_base(&gemm.logits, &step.logits, |i| f64::from(step.logits[i])),
+            verdict(near_tie)
+        );
+        ok &= near_tie;
+        drop(m);
+        // The placed load: experts on both tiers, the pass prompt's
+        // whole-card tokens.
+        let Some(mut pm) = open_placed(file, CTX, host)? else {
+            return Ok(false);
+        };
+        pm.set_mode(StepMode::Graph);
+        let placed_run = long_run(&mut pm, ids_p, Some(PrefillPath::Pass), None)?;
+        let first_diff = step_p
+            .tokens
+            .iter()
+            .zip(&placed_run.tokens)
+            .position(|(a, b)| a != b);
+        let near_tie = first_diff.is_none_or(|i| step_p.margins[i] < MARGIN_FLOOR);
+        let stats = pm
+            .body("gate_qwen3moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .hybrid()
+            .stats();
+        let served = stats.host_slots > 0;
+        println!(
+            "q5 placed greedy vs whole-card: first difference {first_diff:?} (none, or at a margin \
+             under {MARGIN_FLOOR}) {}; host_slots={} (above 0) {}",
+            verdict(near_tie),
+            stats.host_slots,
+            verdict(served)
+        );
+        ok &= near_tie && served;
+        Ok(ok)
     }
 
     // ------------------------------------------ (v) the q8_0 cache arm
@@ -3211,7 +3438,8 @@ mod gate {
         let mut m = match placed {
             None => open(base.n_ctx(), StepMode::Graph, KvQ8::F16)?,
             Some(host) => {
-                let mut m = open_placed(base.n_ctx(), host)?
+                let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+                let mut m = open_placed(file, base.n_ctx(), host)?
                     .ok_or("--placed: the plan leaves no routed expert on one side")?;
                 m.set_mode(StepMode::Graph);
                 m

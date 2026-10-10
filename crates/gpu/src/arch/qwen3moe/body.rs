@@ -7,7 +7,10 @@ use super::dispatch::{self, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::placed::{Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
-use super::plan::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
+use super::plan::{
+    FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
+    gate_up_entry,
+};
 use super::prefill::Prefill;
 use super::program::Tail;
 use super::proj::ProjKernels;
@@ -238,43 +241,54 @@ fn pins(hp: &Hparams) -> Result<RouterDims, GpuError> {
     Ok(router)
 }
 
-/// Weight `name` as a K-quant word plane of `rows` rows of `k` values, and
-/// which of the two K-quants it is; `allowed` says which it may be.
-pub(super) fn kq_site(
+/// Layer `l`'s routed stacks `[gate, up, down]` of `n` experts (or a stack of
+/// one expert: a placed layer's shared expert) of `ff` rows of `h` values:
+/// each a resident K-quant word plane of its shape, its type the file's, then
+/// the types the card kernel table's entries admit for the family's FFN
+/// dispatch ([`gate_up_entry`]: one launch reads the gate and up of one
+/// type; [`down_entry`]), a type with no entry refused by name with the
+/// layer. Returns the gate, up and down types.
+pub(super) fn stack_tys(
     w: &Weights,
-    name: &str,
-    rows: usize,
-    k: usize,
-    allowed: &[SiteTy],
-) -> Result<SiteTy, GpuError> {
+    [gate, up, down]: [&str; 3],
+    (n, ff, h): (usize, usize, usize),
+    l: usize,
+) -> Result<[SiteTy; 3], GpuError> {
     let what = "qwen3moe::Body::load";
-    let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
-        return Err(GpuError::tensor(
-            what,
-            name,
-            "a resident K-quant word plane",
-        ));
-    };
-    let kq = match ty {
-        GgmlType::Q4_K => SiteTy::Q4K,
-        GgmlType::Q6_K => SiteTy::Q6K,
-        _ => {
+    let stack = |name: &str, rows: usize, k: usize| -> Result<SiteTy, GpuError> {
+        let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
+            return Err(GpuError::tensor(
+                what,
+                name,
+                "a resident K-quant word plane",
+            ));
+        };
+        let Some(site) = SiteTy::of_ggml(*ty) else {
             return Err(GpuError::shape(
                 what,
-                format!("{name} is {ty}; the chain runs Q4_K and Q6_K"),
+                format!("{name} is {ty}; no launch family reads it"),
+            ));
+        };
+        if t.rows() != rows || *wk != k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{name} is {ty} {} rows x {wk}; the chain takes {rows} rows x {k}",
+                    t.rows()
+                ),
             ));
         }
+        Ok(site)
     };
-    if !allowed.contains(&kq) || t.rows() != rows || *wk != k {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "{name} is {ty} {} rows x {wk}; the chain takes {allowed:?} {rows} rows x {k}",
-                t.rows()
-            ),
-        ));
-    }
-    Ok(kq)
+    let tys = [
+        stack(gate, n * ff, h)?,
+        stack(up, n * ff, h)?,
+        stack(down, n * h, ff)?,
+    ];
+    let at = |e: GpuError| GpuError::shape(what, format!("layer {l}: {e}"));
+    gate_up_entry(tys[0], tys[1], what).map_err(at)?;
+    down_entry(tys[2], what).map_err(at)?;
+    Ok(tys)
 }
 
 /// The launch family of the table's dense entry `entry`: `site.rs`'s name
@@ -416,9 +430,7 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
             ffn: f,
         });
     }
-    kq_site(w, &f.gate, e * ff, h, &[SiteTy::Q4K])?;
-    kq_site(w, &f.up, e * ff, h, &[SiteTy::Q4K])?;
-    f.down_ty = kq_site(w, &f.down, e * h, ff, &[SiteTy::Q4K, SiteTy::Q6K])?;
+    [f.gate_ty, f.up_ty, f.down_ty] = stack_tys(w, [&f.gate, &f.up, &f.down], (e, ff, h), l)?;
     Ok(LayerPlan {
         mixer: MixerPlan::Gqa(g),
         ffn: f,
@@ -429,13 +441,17 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
 /// resident in `w` reaches [`Kernels::q35`]: an attention site that is not
 /// one of the fused Q4_K groups (`dispatch::site_gemv`: its gemv, and on the
 /// prompt's wide arm its GEMM and quantizers), or a Q8_0 embedding
-/// (`dispatch::embed_into`). A chain of fused Q4_K and Q6_K sites over
-/// K-quant rows launches none of them.
+/// (`dispatch::embed_into`), or a routed stack whose launch is the K-quant
+/// `_sel` family's ([`FfnPlan::kq_sel`]: [`Q35Kernels::ffn`]). A chain of
+/// fused Q4_K and Q6_K sites over K-quant rows and Q4_K or Q6_K stacks
+/// launches none of them.
 fn needs_site_kernels(w: &Weights, plans: &[LayerPlan]) -> bool {
     let fused = plans
         .iter()
         .all(|p| matches!(&p.mixer, MixerPlan::Gqa(g) if g.qkv_fused() && g.o_fused()));
-    !fused || matches!(w.get(&token_embd()), Some(DevWeight::Q8_0 { .. }))
+    !fused
+        || plans.iter().any(|p| p.ffn.kq_sel())
+        || matches!(w.get(&token_embd()), Some(DevWeight::Q8_0 { .. }))
 }
 
 impl Body {

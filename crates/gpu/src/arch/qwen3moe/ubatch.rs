@@ -669,11 +669,14 @@ fn ffn(
     )?;
     k.gemm
         .enqueue_route(stream, &a.route.ids, slots, &mut a.moe, sink)?;
-    for (name, y) in [(&n.gate, &mut a.gate), (&n.up, &mut a.up)] {
+    for (ty, name, y) in [
+        (n.gate_ty, &n.gate, &mut a.gate),
+        (n.up_ty, &n.up, &mut a.up),
+    ] {
         k.gemm.enqueue_gemm(
             stream,
             GemmArgs {
-                ty: GemmWeight::Q4K,
+                ty: gemm_ty(ty)?,
                 w: kq_weight(w, name)?,
                 rows_per_expert: d.ff,
                 act: &a.act_hid,

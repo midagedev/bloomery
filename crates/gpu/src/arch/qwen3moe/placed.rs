@@ -15,7 +15,8 @@
 //!   and the go; a unit's download of its rows and routing with its places
 //!   (`hostleg`);
 //! - the shadow: the card's routed experts of the layer when it has any —
-//!   the K-quant family's Q4_K gate·up over the places, the q8_1 of the card
+//!   the K-quant family's gate·up over the places ([`GateUpEntry`]: Q4_K or
+//!   Q5_K, the table's entry for the stack's type), the q8_1 of the card
 //!   slots' rows, the down `_sel` the table names for the stack's type
 //!   ([`DownArm`]: Q4_K, Q5_K or Q6_K) — and on Qwen3.6 the shared
 //!   expert on its own stacks, a stack of one expert on a fixed route of
@@ -41,10 +42,10 @@
 //! family's — the same Walk A arithmetic as the whole-card launches — so a
 //! placed load agrees with the whole-card one to the error of those sums.
 
-use super::body::{Kernels, ggml_ty, kq_site};
+use super::body::{Kernels, ggml_ty, stack_tys};
 use super::dispatch::{self, Ctx, PassCtx};
 use super::hostleg::{HostCombineArgs, HostLegKernels, PlacesArgs};
-use super::plan::{FfnPlan, FfnRoute, LayerPlan, SiteTy};
+use super::plan::{FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SiteTy, gate_up_entry};
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Io};
 use super::wide::{GEMV_COLS, act_col_bytes};
@@ -71,23 +72,27 @@ use std::sync::Arc;
 const WHAT: &str = "qwen3moe placed load";
 
 /// The shared expert of a placed Qwen3.6 layer: its three stacks of one
-/// expert each, as the file holds them, and its down's type.
+/// expert each, as the file holds them, its gate·up entry and its down's
+/// type.
 pub(super) struct SharedFfn {
     gate: String,
     up: String,
     down: String,
+    gate_up: GateUpEntry,
     down_ty: SiteTy,
 }
 
 /// A placed layer's routed experts on the card: how many the slot map puts
 /// there, the file's three stacks (the card holds their rows of those
-/// experts, in the map's slot order) and the down's type; and the shared
-/// expert, on a chain that has one.
+/// experts, in the map's slot order), the gate·up entry and the down's type;
+/// and the shared expert, on a chain that has one.
 pub(super) struct PlacedFfn {
     n_card: usize,
     gate: String,
     up: String,
     down: String,
+    /// `None` on a layer with no card expert, which launches none.
+    gate_up: Option<GateUpEntry>,
     down_ty: SiteTy,
     shared: Option<SharedFfn>,
 }
@@ -227,15 +232,15 @@ impl Placed {
     /// The placed side of a load of `plans` over arena dims `d`, from `o`:
     /// the plan's slot map ([`SlotMap::of_plan`]) and its card copy, each
     /// layer's card stacks checked against its card count and the types the
-    /// launches take ([`kq_site`]: a Q4_K gate and up, a Q4_K or Q6_K down;
-    /// a stack of other rows would leave slots that neither side sums), the
-    /// shared expert's stacks on a gated router's chain, the boundary of one
-    /// row, the host tier over every layer's routed stacks (qdot's, refused
-    /// by name for a stack no fused kernel serves) watching the fault word
-    /// and holding the host set, its batch port for passes of up to
-    /// [`MAX_PASS_ROWS`] rows, and the buffers. A plan of other than one
-    /// card, with an expert tier, or not of every layer is refused by name.
-    /// Load-time only.
+    /// launches take ([`stack_tys`]: the table's gate·up and down entries the
+    /// FFN dispatch launches; a stack of other rows would leave slots that
+    /// neither side sums), the shared expert's stacks on a gated router's
+    /// chain, the boundary of one row, the host tier over every layer's
+    /// routed stacks (qdot's, refused by name for a stack no fused kernel
+    /// serves) watching the fault word and holding the host set, its batch
+    /// port for passes of up to [`MAX_PASS_ROWS`] rows, and the buffers. A
+    /// plan of other than one card, with an expert tier, or not of every
+    /// layer is refused by name. Load-time only.
     pub(super) fn new(
         gpu: &Gpu,
         w: &Weights,
@@ -408,12 +413,11 @@ fn placed_ffn(
         model::arch::qwen3moe::names::ffn_down_exps(l),
     );
     let (h, ff) = (s.hidden, s.ff);
-    let down_ty = if n_card > 0 {
-        kq_site(w, &gate, n_card * ff, h, &[SiteTy::Q4K])?;
-        kq_site(w, &up, n_card * ff, h, &[SiteTy::Q4K])?;
-        kq_site(w, &down, n_card * h, ff, &[SiteTy::Q4K, SiteTy::Q6K])?
+    let (gate_up, down_ty) = if n_card > 0 {
+        let [g, u, d] = stack_tys(w, [&gate, &up, &down], (n_card, ff, h), l)?;
+        (Some(gate_up_entry(g, u, WHAT)?), d)
     } else {
-        p.ffn.down_ty
+        (None, p.ffn.down_ty)
     };
     let shared = match &p.ffn.route {
         FfnRoute::Router {
@@ -424,10 +428,9 @@ fn placed_ffn(
                 format!("blk.{l}.ffn_up_shexp.weight"),
                 format!("blk.{l}.ffn_down_shexp.weight"),
             );
-            kq_site(w, &g, ff, h, &[SiteTy::Q4K])?;
-            kq_site(w, &u, ff, h, &[SiteTy::Q4K])?;
-            let down_ty = kq_site(w, &dn, h, ff, &[SiteTy::Q4K, SiteTy::Q6K])?;
+            let [gate_ty, up_ty, down_ty] = stack_tys(w, [&g, &u, &dn], (1, ff, h), l)?;
             Some(SharedFfn {
+                gate_up: gate_up_entry(gate_ty, up_ty, WHAT)?,
                 gate: g,
                 up: u,
                 down: dn,
@@ -457,6 +460,7 @@ fn placed_ffn(
         gate,
         up,
         down,
+        gate_up,
         down_ty,
         shared,
     })
@@ -568,8 +572,13 @@ fn shadow(
     let i = s.col(m)?;
     if f.n_card > 0 {
         let n_slots = m * pitch;
-        side.k.kquant.enqueue_gate_up_q4k(
-            stream,
+        let entry = f.gate_up.ok_or(GpuError::state(
+            WHAT,
+            "a gate·up entry for a layer with card experts",
+        ))?;
+        gate_up_sel(
+            (stream, &side.k.kquant),
+            entry,
             &GateUpAct {
                 wg: kq_weight(w, &f.gate)?,
                 wu: kq_weight(w, &f.up)?,
@@ -605,8 +614,9 @@ fn shadow(
         )?;
     }
     if let (Some(sh), Some(r)) = (&f.shared, rows.shared.as_mut()) {
-        side.k.kquant.enqueue_gate_up_q4k(
-            stream,
+        gate_up_sel(
+            (stream, &side.k.kquant),
+            sh.gate_up,
             &GateUpAct {
                 wg: kq_weight(w, &sh.gate)?,
                 wu: kq_weight(w, &sh.up)?,
@@ -636,6 +646,27 @@ fn shadow(
         )?;
     }
     Ok(())
+}
+
+/// The gate·up `_sel` of the slots `a` selects over the stacks `a` names, at
+/// the table's entry for their type: the K-quant family's Q4_K or Q5_K, each
+/// skipping a [`HOST`] slot. The entries the family's FFN dispatch does not
+/// launch (`plan::gate_up_entry` admits none of them) are named, not run.
+fn gate_up_sel(
+    (stream, kq): (&CudaStream, &KquantKernels),
+    entry: GateUpEntry,
+    a: &GateUpAct<'_>,
+    sink: FaultSink,
+    h: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    match entry {
+        GateUpEntry::Q4k => kq.enqueue_gate_up_q4k(stream, a, sink, h),
+        GateUpEntry::Q5k => kq.enqueue_gate_up_q5k(stream, a, sink, h),
+        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => Err(GpuError::state(
+            WHAT,
+            "a gate·up entry the plan admits for no stack here",
+        )),
+    }
 }
 
 /// The down `_sel` launches a placed stack takes: the table's entries
