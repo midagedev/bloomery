@@ -87,9 +87,13 @@
 #      first-appearance order; within a family, record order. A lane takes the first unclaimed member
 #      in that order whose candidates include its card, within the family of the first unclaimed
 #      member — it never opens the next family while the current one holds an unclaimed member, even
-#      one only the other lane's card can run. In the fixture tier and --lanes 1 the class does not
-#      exist: a member is placed as the v41-load paragraph says. The dry run lists the members as
-#      `lane C` with their candidates; the lane and card of each are decided at run time.
+#      one only the other lane's card can run. A lane starts when a plan item carries its label or
+#      when some member's candidates include its card: members are labelled C, so a list of members
+#      alone labels no lane A or B, and the lanes that can take a member start for it (a lane with
+#      nothing to take does not start, and its DONE sum reads 0 s). In the fixture tier and --lanes 1
+#      the class does not exist: a member is placed as the v41-load paragraph says. The dry run lists
+#      the members as `lane C` with their candidates and names the lanes that feed the chain; the
+#      lane and card of each member are decided at run time.
 #   pool: a recipe (or a dependency) that carries `[group('pool')]` — its host tier spins a worker
 #      pool on the cores a big load's pool is pinned to (crates/threads: the pool is process-wide and
 #      pins its workers; crates/gpu/src/host/step.rs: the host tier's service is a pool job) — never
@@ -1373,6 +1377,58 @@ FP
   if [ "$(ran_before "$t/fake-state/ran.log" gen_b 'bash tools/gate.sh -p x')" = no ]; then pass 'chain mutant: a reversed take starts the short item first'
   else fail 'chain mutant: a reversed take still starts the longest-est item first, or an item never ran' "$(grep -E 'gen_b|gate.sh -p x' "$t/fake-state/ran.log" 2>&1 | tr '\n' ' ')"; fi
   # The take's card and lease semantics are the steal cases' above and below.
+  # (12) a list of chain members alone labels no lane A or B (a member is class C), and the lanes still
+  # start for it: a lane starts when it holds an item or when some member's candidates include its
+  # card. An any-form member runs on whichever lane wins the mutex; a 3090-only one on lane A with lane
+  # B never started; an A6000 pick on lane B with lane A never started; a list whose items all sit in
+  # lane A still starts lane B for an A6000 pick. Each batch runs exactly its items.
+  want_count() { # <name> <file> <ERE> <count>: exactly that many lines match
+    local c=0
+    n=$((n + 1))
+    if [ -f "$2" ]; then c=$(grep -Ec -- "$3" "$2" || true); fi
+    if [ "$c" = "$4" ]; then echo "ok $1"
+    else bad=$((bad + 1)); echo "FAIL $1: $c lines match /$3/ in $2, want $4"; fi
+  }
+  want_absent() { # <name> <path>: nothing is there
+    n=$((n + 1))
+    if [ -e "$2" ]; then bad=$((bad + 1)); echo "FAIL $1: $2 exists"; else echo "ok $1"; fi
+  }
+  rc=$(steal_case ch-only "v41-any@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-any@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-ch-only"
+  rc_ok 'chain only: a list of one any-form member ends green' ch-only 1
+  want 'chain only: the member is recorded, on a lane that took it' "$t/target/c-ch-only/run.log" '^v41-any rc=0 [0-9]+s try=1 lane=[AB]( |$)'
+  want_count 'chain only: the member ran once and no lane invented a call' "$t/fake-state/ran.log" ' gen_' 1
+  want 'chain only: the DONE line carries both lanes' "$t/target/c-ch-only/run.log" '^DONE total=1 red=0 .* laneA=[0-9]+s laneB=[0-9]+s( |$)'
+  mutant_of ch-nofeed 's|^chain_feeds() { #.*$|chain_feeds() { return 1 # MUTANT ch-nofeed|' '# MUTANT ch-nofeed$'
+  rc=$(MTAG=ch-nofeed steal_case ch-onlym "v41-any@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-any@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-ch-onlym"
+  if [ "$rc" = 70 ] && grep -q '1 items planned, 0 recorded' "$t/out-ch-onlym.log"; then pass 'chain only mutant: without the feed rule no lane starts and the count check names it'
+  else fail 'chain only mutant: without the feed rule no lane starts and the count check names it' "rc $rc, $(tail -1 "$t/out-ch-onlym.log" 2> /dev/null)"; fi
+  rc=$(steal_case ch-only-a "v41-a@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-a@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-ch-only-a"
+  rc_ok 'chain only: a list of one 3090-only member ends green' ch-only-a 1
+  want 'chain only: the 3090-only member runs in lane A' "$t/target/c-ch-only-a/run.log" '^v41-a rc=0 [0-9]+s try=1 lane=A( |$)'
+  want_absent 'chain only: lane B never started for it' "$t/target/c-ch-only-a/lane-B.pid"
+  want 'chain only: its DONE line carries laneB=0s' "$t/target/c-ch-only-a/run.log" '^DONE total=1 red=0 .* laneB=0s( |$)'
+  rc=$(steal_case ch-only-b "gate-gpu-ds41-residency-a@FAKE_SLEEP=1	B	a6000	2	$d" -- 'gate-gpu-ds41-residency-a@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-ch-only-b"
+  rc_ok 'chain only: a list of one A6000-pick member ends green' ch-only-b 1
+  want 'chain only: the pick member runs in lane B' "$t/target/c-ch-only-b/run.log" '^gate-gpu-ds41-residency-a rc=0 [0-9]+s try=1 lane=B( |$)'
+  want_absent 'chain only: lane A never started for it' "$t/target/c-ch-only-b/lane-A.pid"
+  want 'chain only: its DONE line carries laneA=0s' "$t/target/c-ch-only-b/run.log" '^DONE total=1 red=0 .* laneA=0s( |$)'
+  rc=$(steal_case ch-lone "steal-fix	A	3090	5	$d" "gate-gpu-ds41-residency-a	B	a6000	2	$d" -- steal-fix 'gate-gpu-ds41-residency-a@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-ch-lone"
+  rc_ok 'chain: a list whose items all sit in lane A ends green' ch-lone 2
+  want 'chain: its fixed item ran in lane A' "$t/target/c-ch-lone/run.log" '^steal-fix rc=0 [0-9]+s try=1 lane=A( |$)'
+  want 'chain: lane B started for the A6000 pick' "$t/target/c-ch-lone/run.log" '^gate-gpu-ds41-residency-a rc=0 [0-9]+s try=1 lane=B( |$)'
+  # The dry run names the lanes that feed the chain: a lane whose card some member lists as a candidate.
+  check 'dry run: a list of one any-form member names both lanes as the chain'"'"'s feeders' 0 \
+    '^gate-batch: the chain is fed by lane A \(3090\), lane B \(a6000\):' "${gb[@]}" --dry-run v41-any
+  check 'dry run: a 3090-only member is fed by lane A alone' 0 '^gate-batch: the chain is fed by lane A \(3090\):' "${gb[@]}" --dry-run v41-a
+  check 'dry run: an A6000 pick is fed by lane B alone' 0 '^gate-batch: the chain is fed by lane B \(a6000\):' "${gb[@]}" --dry-run gate-gpu-ds41-residency-a
+  out=$("${gb[@]}" --dry-run plain-any host 2>&1) || fail 'dry run: a list with no member names no chain feeders' "the dry run failed"
+  if grep -q 'the chain is fed by' <<< "$out"; then fail 'dry run: a list with no member names no chain feeders' "a feeders line is there"
+  else pass 'dry run: a list with no member names no chain feeders'; fi
   # The pack (the header's «pack»). overlap is no_overlap's inverse: the two items' intervals cross (a command
   # with no line is a FAIL line and status 2, as there).
   overlap() {
@@ -3984,6 +4040,24 @@ hold_down() { # the EXIT trap: the heartbeat's pid from DIR, then the hold, only
   fi
 }
 
+# The chain's lane rules (the header's class C), read by the dry run and by the run.
+lane_card() { [ "$1" = A ] && printf 3090 || printf a6000; }
+card_ok() { # $1 = plan index, $2 = a card: one of the item's candidate labels names it (a pick's
+  # label is the card box.sh gives it; no card is forced)
+  local labels
+  rec_get "$1" labels
+  case " $labels " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+}
+chain_feeds() { # $1 = lane: some chain member's candidates include this lane's card, so the lane has
+  # chain work to take even when no plan item carries its label (a member's label is C)
+  local i
+  [ "$CHAIN_ACTIVE" = 1 ] || return 1
+  for i in ${CHAIN_ORDER[@]+"${CHAIN_ORDER[@]}"}; do
+    if card_ok "$i" "$(lane_card "$1")"; then return 0; fi
+  done
+  return 1
+}
+
 stop() {
   local f
   # The lanes first, so none starts its next item, then the items they were running.
@@ -4022,6 +4096,13 @@ if [ "$DRY" = 1 ]; then
     printf 'lane C  %-28s %s\n        %s — %s\n' "${P_STEM[$i]}" "$(cmd_of "$i")" "${P_PLAN[$i]}" "${P_WHY[$i]}"
     [ "$LEDGER" = 0 ] || printf '        ledger: %s — %s\n' "${P_LST[$i]}" "${P_LDET[$i]}"
   done
+  if [ "${#CHAIN_ORDER[@]}" -gt 0 ]; then
+    fed=''
+    for lane in A B; do
+      if chain_feeds "$lane"; then fed="${fed:+$fed, }lane $lane ($(lane_card "$lane"))"; fi
+    done
+    echo "gate-batch: the chain is fed by $fed: a lane takes a member whose candidates include its card, and a lane with no item and no such member does not start"
+  fi
   for ((i = 0; i < ND; i++)); do
     printf 'lane -  %-28s %s\n        deferred to the real tier (%s), never run in the fixture tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
   done
@@ -4207,7 +4288,6 @@ stealable() { # $1 = plan index, $2 = lane
 
 # The chain (class C, the header): one member at a time batch-wide, both lanes feeding it.
 CHAIN_MUTEX=$OUT/chain.lock # taken (mkdir) before a member's run, released (rmdir) when it returns
-lane_card() { [ "$1" = A ] && printf 3090 || printf a6000; }
 tagged_neighbour() { # $1 = plan index: a pool or big-host item (D5's groups)
   case " ${P_TAG[$1]:-} " in *' pool '*|*' big-host '*) return 0 ;; *) return 1 ;; esac
 }
@@ -4246,12 +4326,6 @@ neighbour_blocked() { # $1 = plan index: a tagged item starts only once the whol
   [ "$CHAIN_ACTIVE" = 1 ] || return 1
   tagged_neighbour "$1" || return 1
   ! chain_quiet
-}
-card_ok() { # $1 = plan index, $2 = a card: one of the item's candidate labels names it (a pick's
-  # label is the card box.sh gives it; no card is forced)
-  local labels
-  rec_get "$1" labels
-  case " $labels " in *" $2 "*) return 0 ;; *) return 1 ;; esac
 }
 chain_next() { # $1 = lane: the first unclaimed member, in the K order, whose candidates include
   # this lane's card — within the family of the first unclaimed member: a lane never opens the next
@@ -4591,9 +4665,11 @@ run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class 
 
 has_lane() { local i; for ((i = 0; i < N; i++)); do [ "${P_LANE[$i]}" = "$1" ] && return 0; done; return 1; }
 
+# A lane starts when a plan item carries its label or when it has chain work (the members are labelled
+# C, so a list of members alone labels no A or B).
 LANES_RUN=""
 for lane in A B; do
-  if has_lane "$lane"; then
+  if has_lane "$lane" || chain_feeds "$lane"; then
     run_lane "$lane" &
     echo $! > "$OUT/lane-$lane.pid"
     LANES_RUN="$LANES_RUN $lane"
