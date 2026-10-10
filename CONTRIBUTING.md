@@ -2,7 +2,7 @@
 
 Thank you for looking. Issues and pull requests are welcome. A plain statement of where the project stands first:
 every gate runs on the maintainers' one workstation, so a pull request is verified by a maintainer there. What you
-can check on your own machine, and what you cannot, is below.
+can check on your own machine, and what you cannot, is below. A Korean version: [`CONTRIBUTING.ko.md`](CONTRIBUTING.ko.md).
 
 ## Build
 
