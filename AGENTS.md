@@ -115,10 +115,12 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   batch keeps waiting.
 - **Narrowing.** The graph over-selects a host-only change. When `just ptx-scan` equals the base for every bin the
   change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
-  checks; `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list and why. A kernel, a launch or a byte
-  formula moved runs the whole list. Always `just ptx-scan <bin> --features …`. A `--no-jit` scan (no card, no gate
-  lock) proves only a move: a pair with one narrows when it is identical and is refused by name otherwise; the add
-  and occupancy classes and `gate-ptx-spill` read the JIT columns and take the full scan.
+  checks; `just narrow BASE [HEAD]` scans the covering bin set (`tools/recipes.py scan-set`, every kernel carrier) with
+  `--no-jit` on both sides and prints that list and why (`just affected BASE --narrow --scan BASE_LOG NEW_LOG …` by
+  hand). A kernel, a launch or a byte formula moved runs the whole list. Always `just ptx-scan <bin> --features …`. A
+  `--no-jit` scan (no card, no gate lock) proves only a move: a pair with one narrows when it is identical and is
+  refused by name otherwise; the add and occupancy classes and `gate-ptx-spill` read the JIT columns and take the full
+  scan.
 - **Weekly and opt-in.** `just affected` selects a `weekly-*` recipe only when a changed file matches one of its trigger
   rows in `tools/gate-paths.tsv` or its own text changes. `just stage-gpu-load-v41 [--plan a]` (plan (b) staged on
   both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
