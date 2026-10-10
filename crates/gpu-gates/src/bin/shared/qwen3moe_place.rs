@@ -182,11 +182,12 @@ pub use bloomery_gpu_gates::residency38::Seqs;
 /// ([`laid`]): each one's stores that no position moves.
 pub const SLOTS_RESERVE: &str = "resident slots";
 
-/// The file's layers.
+/// The layers the model loads: a qwen35moe file's trunk (its next-token
+/// layers are never loaded).
 fn layers_of(inputs: &Inputs) -> usize {
     match inputs {
         Inputs::Qwen3(i) => i.hp.n_layer,
-        Inputs::Qwen35(i) => i.hp.n_layer,
+        Inputs::Qwen35(i) => i.hp.n_trunk,
     }
 }
 
@@ -388,7 +389,7 @@ impl PlaceQ3 {
         Ok(Some(plan.cards[0].experts))
     }
 
-    /// The file's layers.
+    /// The layers the model loads ([`layers_of`]).
     fn layers(&self) -> usize {
         layers_of(&self.inputs)
     }
