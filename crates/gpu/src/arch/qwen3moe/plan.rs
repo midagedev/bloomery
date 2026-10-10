@@ -9,8 +9,9 @@
 //! Qwen3-30B-A3B's layers are all [`MixerPlan::Gqa`] at head 128 with no
 //! shared expert. Qwen3.6-35B-A3B interleaves [`MixerPlan::Delta`] (gated
 //! delta rule) with gated GQA at head 256, each followed by 256 routed
-//! experts and a sigmoid-gated shared expert folded in as one more slot of
-//! joined stacks. Qwen3.5-9B has the same mixers and a dense SwiGLU FFN,
+//! experts and a sigmoid-gated shared expert ([`SharedPlan`]): folded in as
+//! one more slot of joined stacks where its parts are their stacks' types,
+//! else its own dense FFN of its types. Qwen3.5-9B has the same mixers and a dense SwiGLU FFN,
 //! which runs as a stack of one expert, every token's one slot on it at
 //! weight 1 ([`FfnRoute::Dense`]): the routed FFN's launches without the
 //! router. A layer's kind comes from its [`LayerSpec`] — the file's tensors,
@@ -20,7 +21,9 @@
 use super::router::RouterDims;
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
-use model::arch::coverage::turns_as_neox;
+use gguf::quant::GgmlType;
+pub(super) use model::arch::coverage::{DownEntry, GateUpEntry};
+use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_shared, turns_as_neox};
 use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
 use model::arch::models::{
     Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe,
@@ -135,7 +138,7 @@ pub(super) enum FfnRoute {
         /// The router weight: the file's, or the joined one with the shared
         /// expert's gate as its last row.
         gate_inp: String,
-        /// The shared expert, when the stacks are the joined ones.
+        /// The shared expert, on a router whose last row is its gate.
         shared: Option<SharedPlan>,
     },
     /// A dense FFN: one slot a token, on expert 0 of the one-expert stacks,
@@ -143,11 +146,42 @@ pub(super) enum FfnRoute {
     Dense,
 }
 
-/// A shared expert folded into the routed stacks as their last expert (id
-/// the routed count) in every token's last slot, weighted by the sigmoid of
-/// the router's last row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SharedPlan;
+/// A layer's sigmoid-gated shared expert: its weight is every token's last
+/// slot's, the sigmoid of the router's last row (the router's other rows are
+/// the routed experts').
+pub(super) enum SharedPlan {
+    /// Folded into the routed stacks as their last expert (id the routed
+    /// count) in that slot: its gate, up and down are each their stack's
+    /// type.
+    Joined,
+    /// Its own dense FFN at its own types ([`SharedSites`]): a part of
+    /// another type than its stack's. The routed launches see the last
+    /// slot's id as [`crate::hybrid::HOST`] and skip it, and the combine adds
+    /// the shared expert's output at the slot's weight.
+    Apart(SharedSites),
+}
+
+/// A shared expert kept apart from the routed stacks: its three matrices as
+/// the file holds them, each a dense site of its own type (`crate::site`).
+pub(super) struct SharedSites {
+    pub(super) gate: String,
+    pub(super) up: String,
+    pub(super) down: String,
+    pub(super) gate_ty: SiteTy,
+    pub(super) up_ty: SiteTy,
+    pub(super) down_ty: SiteTy,
+}
+
+impl SharedSites {
+    /// Whether the gate or the up reads the f32 normed rows on the gemv arm
+    /// (a Q8_0 or F32 site), which the norm folded into the router does not
+    /// write.
+    pub(super) fn reads_f32(&self) -> bool {
+        [self.gate_ty, self.up_ty]
+            .iter()
+            .any(|t| t.reads() != Form::Q8x128)
+    }
+}
 
 impl LayerPlan {
     /// The GQA plan, or a named refusal for a delta layer: what a path that
@@ -215,18 +249,98 @@ impl DeltaPlan {
 }
 
 impl FfnPlan {
-    /// The gemv arm's gate·up·SwiGLU in one launch: Q4_K gate and up;
-    /// otherwise each launches alone and the SwiGLU after them.
+    /// The gemv arm's gate·up·SwiGLU in one launch: a routed FFN's always
+    /// (the card kernel table's gate·up entry of its type), a dense FFN's
+    /// Q4_K gate and up; otherwise each launches alone and the SwiGLU after
+    /// them.
     pub(super) fn gate_up_fused(&self) -> bool {
-        all_q4k(&[self.gate_ty, self.up_ty])
+        match self.route {
+            FfnRoute::Router { .. } => true,
+            FfnRoute::Dense => all_q4k(&[self.gate_ty, self.up_ty]),
+        }
     }
 
-    /// The gemv arm's down as the slots' `_sel` over their ids: a Q4_K or
-    /// Q6_K down; otherwise a dense FFN's one slot a token runs it as a
+    /// The gemv arm's down as the slots' `_sel` over their ids: a routed
+    /// FFN's always (the table's down entry of its type), a dense FFN's
+    /// Q4_K or Q6_K; otherwise a dense FFN's one slot a token runs it as a
     /// plain projection (`dispatch::site_gemv`).
     pub(super) fn down_sel(&self) -> bool {
-        q4k_or_q6k(self.down_ty)
+        match self.route {
+            FfnRoute::Router { .. } => true,
+            FfnRoute::Dense => q4k_or_q6k(self.down_ty),
+        }
     }
+
+    /// The shared expert kept apart, on a layer that keeps one
+    /// ([`SharedPlan::Apart`]).
+    pub(super) fn apart(&self) -> Option<&SharedSites> {
+        match &self.route {
+            FfnRoute::Router {
+                shared: Some(SharedPlan::Apart(sh)),
+                ..
+            } => Some(sh),
+            FfnRoute::Router { .. } | FfnRoute::Dense => None,
+        }
+    }
+}
+
+/// The file type a site of `ty` reads: the inverse of [`SiteTy::of_ggml`].
+const fn ggml_of(ty: SiteTy) -> GgmlType {
+    match ty {
+        SiteTy::Q3K => GgmlType::Q3_K,
+        SiteTy::Q4K => GgmlType::Q4_K,
+        SiteTy::Q5K => GgmlType::Q5_K,
+        SiteTy::Q6K => GgmlType::Q6_K,
+        SiteTy::Q8_0 => GgmlType::Q8_0,
+        SiteTy::F32 => GgmlType::F32,
+    }
+}
+
+/// The gate·up entry the family's FFN dispatch launches gate and up stacks
+/// of `gate` and `up` with in one launch ([`qwen35_gate_up`]), or a named
+/// refusal: one launch reads one type, and a plan holds only the types the
+/// table admits.
+pub(super) fn gate_up_entry(
+    gate: SiteTy,
+    up: SiteTy,
+    what: &'static str,
+) -> Result<GateUpEntry, GpuError> {
+    if gate != up {
+        return Err(GpuError::shape(
+            what,
+            format!("a {gate} gate beside a {up} up; one gate·up launch reads one type"),
+        ));
+    }
+    qwen35_gate_up(ggml_of(gate)).ok_or_else(|| {
+        GpuError::shape(
+            what,
+            format!("a {gate} gate·up, which the card kernel table names no entry for here"),
+        )
+    })
+}
+
+/// The routed down entry the family's FFN dispatch launches a stack of `ty`
+/// with ([`qwen35_down`]), or a named refusal.
+pub(super) fn down_entry(ty: SiteTy, what: &'static str) -> Result<DownEntry, GpuError> {
+    qwen35_down(ggml_of(ty)).ok_or_else(|| {
+        GpuError::shape(
+            what,
+            format!("a {ty} down `_sel`, which the card kernel table names no entry for here"),
+        )
+    })
+}
+
+/// The dense site a shared expert's part of `ty` kept apart from its stack
+/// runs at ([`qwen35_shared`]), or a named refusal.
+pub(super) fn shared_entry(ty: SiteTy, what: &'static str) -> Result<SiteEntry, GpuError> {
+    qwen35_shared(ggml_of(ty)).ok_or_else(|| {
+        GpuError::shape(
+            what,
+            format!(
+                "a {ty} shared expert part, which the card kernel table names no dense site for"
+            ),
+        )
+    })
 }
 
 /// A Body35 layer's mixer kind, from its description.

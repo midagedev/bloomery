@@ -16,6 +16,8 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
+use bloomery_placement::kernels;
+pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
 use models::{
@@ -565,8 +567,8 @@ struct TypePin {
 /// The per-tensor type pins of the programs (the qwen3moe body's `kq_site`
 /// calls in `Body::load`, the head's Q6_K gemv in `gpu/src/head.rs`, the
 /// card embedding's `embed_rows_q4k`; `Body35`'s site types, its `PROJ`,
-/// `ROUTED`, `ROUTED_DOWN`, `EMBED` and `HEAD_TY` in
-/// `gpu/src/arch/qwen3moe/body35.rs`, each a launch of `gpu/src/site.rs`;
+/// `EMBED` and `HEAD_TY` in `gpu/src/arch/qwen3moe/body35.rs`, each a
+/// launch of `gpu/src/site.rs` (its FFN's are [`ROW_PINS`]);
 /// the V4.1 chain's attention gemvs, whose
 /// head-split sites in `chain/attn.rs` take q3_K or q8_0, the same head, and
 /// the hyper-connection fn `hc.rs` reads as q3_K words, `hc_f32.rs` as f32;
@@ -656,24 +658,6 @@ const TYPE_PINS: &[TypePin] = &[
     },
     TypePin {
         program: Program::Qwen35Body,
-        role: Role::SharedExpert,
-        matrices: true,
-        names: Some(|n| {
-            n.ends_with(".ffn_gate_shexp.weight") || n.ends_with(".ffn_up_shexp.weight")
-        }),
-        what: "shared expert gate and up, joined into the routed stacks (the body reads q4_K)",
-        reads: &[GgmlType::Q4_K],
-    },
-    TypePin {
-        program: Program::Qwen35Body,
-        role: Role::SharedExpert,
-        matrices: true,
-        names: Some(|n| n.ends_with(".ffn_down_shexp.weight")),
-        what: "shared expert down, joined into the routed stack (the body reads q4_K and q6_K)",
-        reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
-    },
-    TypePin {
-        program: Program::Qwen35Body,
         role: Role::Head,
         matrices: true,
         names: None,
@@ -693,22 +677,6 @@ const TYPE_PINS: &[TypePin] = &[
             GgmlType::Q6_K,
             GgmlType::Q8_0,
         ],
-    },
-    TypePin {
-        program: Program::Qwen35Body,
-        role: Role::RoutedExperts,
-        matrices: true,
-        names: Some(routed_gate_up),
-        what: "routed experts gate and up, each shared expert joined in (the body reads q4_K)",
-        reads: &[GgmlType::Q4_K],
-    },
-    TypePin {
-        program: Program::Qwen35Body,
-        role: Role::RoutedExperts,
-        matrices: true,
-        names: Some(routed_down),
-        what: "routed experts down, each shared expert joined in (the body reads q4_K and q6_K)",
-        reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
     TypePin {
         program: Program::Deepseek41Chain,
@@ -865,6 +833,49 @@ const TYPE_PINS: &[TypePin] = &[
     },
 ];
 
+/// A tensor family whose type a program pins by the card kernel table's
+/// rows: the types it reads are those `row` takes.
+struct RowPin {
+    program: Program,
+    role: Role,
+    /// As [`TypePin::matrices`].
+    matrices: bool,
+    /// As [`TypePin::names`].
+    names: Option<fn(&str) -> bool>,
+    what: &'static str,
+    row: fn(GgmlType) -> bool,
+}
+
+/// The per-tensor pins whose types are the card kernel table's: `Body35`'s
+/// FFN ([`qwen35_gate_up`], [`qwen35_down`], [`qwen35_shared`]), each `what`
+/// naming the types its row takes.
+const ROW_PINS: &[RowPin] = &[
+    RowPin {
+        program: Program::Qwen35Body,
+        role: Role::SharedExpert,
+        matrices: true,
+        names: None,
+        what: "shared expert (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)",
+        row: |ty| qwen35_shared(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen35Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_gate_up),
+        what: "routed experts gate and up (the body reads q4_K and q5_K)",
+        row: |ty| qwen35_gate_up(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen35Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_down),
+        what: "routed experts down (the body reads q4_K, q5_K and q6_K)",
+        row: |ty| qwen35_down(ty).is_some(),
+    },
+];
+
 /// `Body35`'s projection types (`PROJ`): every attention, delta-rule and
 /// dense FFN matrix.
 const Q35_PROJ: &[GgmlType] = &[
@@ -875,14 +886,60 @@ const Q35_PROJ: &[GgmlType] = &[
     GgmlType::Q8_0,
 ];
 
-/// A routed expert stack's gate or up rows (`ffn_gate_exps`/`ffn_up_exps`),
-/// the part both whole-card bodies launch q4_K alone.
+/// The card gate·up entry `Body35` runs a routed stack of `ty` with: the
+/// card kernel table's row ([`kernels::gate_up`], the decode `_sel`) when
+/// the table names the type's prompt GEMM too ([`kernels::gemm`]), among
+/// the entries the family's FFN dispatch launches
+/// (`gpu/src/arch/qwen3moe/dispatch.rs`): the K-quant family's Q4_K and
+/// Q5_K. The table's Q8_0 row reads a stack in the file's block stream and
+/// its i-quant rows are `iq_sel.rs`'s; the dispatch launches neither, so
+/// such a stack is refused by name.
+#[must_use]
+pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
+    let (Some(entry), Some(_)) = (kernels::gate_up(ty), kernels::gemm(ty)) else {
+        return None;
+    };
+    match entry {
+        GateUpEntry::Q4k | GateUpEntry::Q5k => Some(entry),
+        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => None,
+    }
+}
+
+/// The card down entry `Body35` runs a routed stack of `ty` with: the
+/// table's row ([`kernels::down`]) when it names the type's prompt GEMM too
+/// ([`kernels::gemm`]), among the entries the FFN dispatch launches: the
+/// downs over `Q8Act`, Q4_K, Q5_K and Q6_K. The downs over `Q8Blocks32`
+/// (Q5_0, Q5_1, Q8_0, IQ4_NL) read an activation form the dispatch does not
+/// quantize, so such a stack is refused by name.
+#[must_use]
+pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
+    let (Some((entry, _)), Some(_)) = (kernels::down(ty), kernels::gemm(ty)) else {
+        return None;
+    };
+    match entry {
+        DownEntry::Q4k | DownEntry::Q5k | DownEntry::Q6k => Some(entry),
+        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => None,
+    }
+}
+
+/// The dense site `Body35` runs a part of a shared expert of `ty` with when
+/// the layer keeps it apart from its routed stacks (a part whose type is not
+/// its stack's): the table's dense gemv site of the part's own type
+/// ([`kernels::dense`]). A shared expert of its stacks' types is joined into
+/// them and runs at their entries.
+#[must_use]
+pub const fn qwen35_shared(ty: GgmlType) -> Option<SiteEntry> {
+    kernels::dense(ty)
+}
+
+/// A routed expert stack's gate or up rows (`ffn_gate_exps`/`ffn_up_exps`):
+/// the whole-card bodies read the gate·up part at its own types.
 fn routed_gate_up(name: &str) -> bool {
     name.ends_with(".ffn_gate_exps.weight") || name.ends_with(".ffn_up_exps.weight")
 }
 
-/// A routed expert stack's down rows (`ffn_down_exps`), the part both
-/// whole-card bodies launch q4_K or q6_K.
+/// A routed expert stack's down rows (`ffn_down_exps`): the whole-card
+/// bodies read the down part at its own types.
 fn routed_down(name: &str) -> bool {
     name.ends_with(".ffn_down_exps.weight")
 }
@@ -916,39 +973,47 @@ fn indexer_projection(name: &str) -> bool {
     name.ends_with(".indexer.k_proj.weight") || name.ends_with(".indexer.q_proj.weight")
 }
 
-/// The type pins of `program` (every program's when `None`) that tensor `t`
-/// is of a type none of reads, as items: with a program, each pin of its role
-/// (and name) whose types do not hold `t`'s; with none, the first such pin
-/// when no program's pin reads the type.
+/// The type pins of `program` (every program's when `None`), [`TYPE_PINS`]
+/// then [`ROW_PINS`], that tensor `t` is of a type none of reads, as items:
+/// with a program, each pin of its role (and name) whose types do not hold
+/// `t`'s; with none, the first such pin when no program's pin reads the
+/// type.
 fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
     let matrix = t.dims.len() >= 2 && t.ty != GgmlType::F32;
-    let pins: Vec<&TypePin> = TYPE_PINS
+    let takes = |p: Program, role: Role, matrices: bool, names: Option<fn(&str) -> bool>| {
+        program.is_none_or(|q| p == q)
+            && role == t.role
+            && (!matrices || matrix)
+            && names.is_none_or(|takes| takes(&t.name))
+    };
+    // Each pin that takes `t`, with whether it reads `t`'s type.
+    let pins: Vec<(&'static str, bool)> = TYPE_PINS
         .iter()
-        .filter(|pin| {
-            program.is_none_or(|p| pin.program == p)
-                && pin.role == t.role
-                && (!pin.matrices || matrix)
-                && pin.names.is_none_or(|takes| takes(&t.name))
-        })
+        .filter(|pin| takes(pin.program, pin.role, pin.matrices, pin.names))
+        .map(|pin| (pin.what, pin.reads.contains(&t.ty)))
+        .chain(
+            ROW_PINS
+                .iter()
+                .filter(|pin| takes(pin.program, pin.role, pin.matrices, pin.names))
+                .map(|pin| (pin.what, (pin.row)(t.ty))),
+        )
         .collect();
-    let refused: Vec<&TypePin> = match program {
+    let refused: Vec<&'static str> = match program {
         Some(_) => pins
-            .into_iter()
-            .filter(|pin| !pin.reads.contains(&t.ty))
+            .iter()
+            .filter(|(_, reads)| !reads)
+            .map(|(what, _)| *what)
             .collect(),
         // No program: an item only when no program's pin reads the type,
         // named by the first pin.
-        None if pins.iter().all(|pin| !pin.reads.contains(&t.ty)) => {
-            pins.into_iter().take(1).collect()
+        None if pins.iter().all(|(_, reads)| !reads) => {
+            pins.iter().take(1).map(|(what, _)| *what).collect()
         }
         None => Vec::new(),
     };
     refused
         .into_iter()
-        .map(|pin| Need::WeightFormat {
-            what: pin.what,
-            ty: t.ty,
-        })
+        .map(|what| Need::WeightFormat { what, ty: t.ty })
         .collect()
 }
 
@@ -1245,67 +1310,234 @@ mod tests {
         assert_eq!(items(Program::Qwen3moeBody, &v), Vec::<String>::new());
     }
 
-    /// The whole-card bodies' routed pins, by part: the gate and up stacks
-    /// read q4_K alone, the down q4_K or q6_K — the parts the default expert
-    /// rule's card formats pass (q3_K, q6_K, q8_0 gate·up; q3_K, q8_0 down)
-    /// reach the loads' refusal otherwise.
+    /// The whole-card bodies' routed pins, by part: the qwen3moe body's gate
+    /// and up stacks read q4_K alone and its down q4_K or q6_K; `Body35`'s
+    /// the types its FFN dispatch runs of the card kernel table's rows, q4_K
+    /// or q5_K gate and up and q4_K, q5_K or q6_K down — the parts the
+    /// default expert rule's card formats pass (q3_K, q6_K, q8_0 gate·up;
+    /// q3_K, q8_0 down) reach the loads' refusal otherwise.
+    // PIN(2026-10-10): `Body35`'s routed pins moved from the joined stacks'
+    // q4_K gate·up and q4_K or q6_K down to the table's rows its dispatch
+    // runs (`qwen35_gate_up`, `qwen35_down`): q5_K gate·up and down left its
+    // refused types; red on the tree before the move by those two.
     #[test]
     fn the_whole_card_bodies_read_routed_stacks_by_part() {
-        for (program, join) in [
-            (Program::Qwen3moeBody, ""),
-            (Program::Qwen35Body, ", each shared expert joined in"),
-        ] {
-            let stack = |name: &str, part: &str, ty: GgmlType, reads: &str, item: bool| {
-                let want = format!("{ty} routed experts {part}{join} (the body reads {reads})");
-                assert_eq!(
-                    items(program, &matrix(name, Role::RoutedExperts, ty)),
-                    if item {
-                        vec![want]
-                    } else {
-                        Vec::<String>::new()
-                    },
-                    "{name} {ty}"
-                );
-            };
-            stack(
-                "ffn_gate_exps.weight",
-                "gate and up",
-                GgmlType::Q4_K,
-                "q4_K",
-                false,
-            );
-            stack(
-                "ffn_up_exps.weight",
-                "gate and up",
-                GgmlType::Q4_K,
-                "q4_K",
-                false,
-            );
-            stack(
-                "ffn_down_exps.weight",
-                "down",
-                GgmlType::Q6_K,
-                "q4_K and q6_K",
-                false,
-            );
-            for ty in [
-                GgmlType::Q3_K,
-                GgmlType::Q6_K,
-                GgmlType::Q8_0,
-                GgmlType::Q5_K,
+        type Parts = (&'static str, &'static [GgmlType], &'static [GgmlType]);
+        let bodies: [(Program, Parts, Parts); 2] = [
+            (
+                Program::Qwen3moeBody,
+                (
+                    "q4_K",
+                    &[GgmlType::Q4_K],
+                    &[
+                        GgmlType::Q3_K,
+                        GgmlType::Q6_K,
+                        GgmlType::Q8_0,
+                        GgmlType::Q5_K,
+                    ],
+                ),
+                (
+                    "q4_K and q6_K",
+                    &[GgmlType::Q4_K, GgmlType::Q6_K],
+                    &[GgmlType::Q3_K, GgmlType::Q8_0, GgmlType::Q5_K],
+                ),
+            ),
+            (
+                Program::Qwen35Body,
+                (
+                    "q4_K and q5_K",
+                    &[GgmlType::Q4_K, GgmlType::Q5_K],
+                    &[
+                        GgmlType::Q3_K,
+                        GgmlType::Q6_K,
+                        GgmlType::Q8_0,
+                        GgmlType::IQ4_XS,
+                    ],
+                ),
+                (
+                    "q4_K, q5_K and q6_K",
+                    &[GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K],
+                    &[
+                        GgmlType::Q3_K,
+                        GgmlType::Q8_0,
+                        GgmlType::Q5_1,
+                        GgmlType::IQ4_NL,
+                    ],
+                ),
+            ),
+        ];
+        for (program, gate_up, down) in bodies {
+            for (names, part, (reads, runs, refused)) in [
+                (
+                    &["ffn_gate_exps.weight", "ffn_up_exps.weight"][..],
+                    "gate and up",
+                    gate_up,
+                ),
+                (&["ffn_down_exps.weight"][..], "down", down),
             ] {
-                stack("ffn_gate_exps.weight", "gate and up", ty, "q4_K", true);
-                stack("ffn_up_exps.weight", "gate and up", ty, "q4_K", true);
-            }
-            for ty in [GgmlType::Q3_K, GgmlType::Q8_0, GgmlType::Q5_K] {
-                stack("ffn_down_exps.weight", "down", ty, "q4_K and q6_K", true);
+                for name in names {
+                    for (ty, item) in runs
+                        .iter()
+                        .map(|t| (t, false))
+                        .chain(refused.iter().map(|t| (t, true)))
+                    {
+                        let want = format!("{ty} routed experts {part} (the body reads {reads})");
+                        assert_eq!(
+                            items(program, &matrix(name, Role::RoutedExperts, *ty)),
+                            if item {
+                                vec![want]
+                            } else {
+                                Vec::<String>::new()
+                            },
+                            "{program:?} {name} {ty}"
+                        );
+                    }
+                }
             }
         }
     }
 
+    /// `Body35`'s FFN pins are the card kernel table's: over every type id,
+    /// a routed part's matrix is an item exactly when [`qwen35_gate_up`] or
+    /// [`qwen35_down`] gives its type no entry, the shared expert's exactly
+    /// when [`qwen35_shared`] does not, and each pin's text names the types
+    /// its row takes (a pin reads no F32 matrix).
+    #[test]
+    fn the_qwen35_ffn_pins_are_the_card_kernel_table() {
+        use super::{qwen35_down, qwen35_gate_up, qwen35_shared};
+        type Row = fn(GgmlType) -> bool;
+        let parts: [(&str, Role, Row); 3] = [
+            ("ffn_gate_exps.weight", Role::RoutedExperts, |t| {
+                qwen35_gate_up(t).is_some()
+            }),
+            ("ffn_down_exps.weight", Role::RoutedExperts, |t| {
+                qwen35_down(t).is_some()
+            }),
+            ("ffn_up_shexp.weight", Role::SharedExpert, |t| {
+                qwen35_shared(t).is_some()
+            }),
+        ];
+        let rows = |row: Row| -> Vec<GgmlType> {
+            (0..64u32)
+                .map(GgmlType::from_u32)
+                .filter(|&t| t != GgmlType::F32 && row(t))
+                .collect()
+        };
+        for (name, role, row) in parts {
+            for id in 0..64u32 {
+                let ty = GgmlType::from_u32(id);
+                if ty == GgmlType::F32 {
+                    continue;
+                }
+                assert_eq!(
+                    items(Program::Qwen35Body, &matrix(name, role, ty)).is_empty(),
+                    row(ty),
+                    "{name} {ty:?}"
+                );
+            }
+        }
+        // Each pin's text names, in any order, exactly the types its row
+        // takes: the list inside its parentheses, "a, b and c".
+        for (name, role, row) in parts {
+            let text = items(Program::Qwen35Body, &matrix(name, role, GgmlType::BF16));
+            let [text] = text.as_slice() else {
+                panic!("{name}: one item for bf16, got {text:?}");
+            };
+            let list = text
+                .split_once("(the body reads ")
+                .and_then(|(_, l)| l.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{name}: no type list in {text:?}"));
+            let mut named: Vec<String> = list
+                .replace(" and ", ", ")
+                .split(", ")
+                .map(str::to_string)
+                .collect();
+            let mut want: Vec<String> = rows(row).iter().map(ToString::to_string).collect();
+            named.sort();
+            want.sort();
+            assert_eq!(named, want, "{name}: {text}");
+        }
+    }
+
+    /// The FFN layer shapes of the four most downloaded Qwen3.6-35B-A3B
+    /// files `-hf` picks (unsloth's `UD-Q4_K_M` with and without the
+    /// next-token layer, bartowski's and ggml-org's `Q4_K_M`, their headers
+    /// in the quantwide mirror) are no items: a q5_K routed down beside q4_K
+    /// gate and up, a q8_0 shared expert beside q4_K, q5_K or q6_K routed
+    /// stacks, a q6_K shared expert beside q4_K ones. A part of a type the
+    /// table names no `Body35` launch for stays an item by name.
+    // PIN(2026-10-10): red on the tree before the table's rows (the q5_K
+    // down, the q8_0 and q6_K shared experts beside stacks of other types).
+    #[test]
+    fn the_hf_qwen36_layer_shapes_are_no_items() {
+        use GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
+        let parts = |routed: [GgmlType; 3], shared: [GgmlType; 3]| {
+            let mut out = Vec::new();
+            for (part, (r, s)) in ["gate", "up", "down"]
+                .iter()
+                .zip(routed.into_iter().zip(shared))
+            {
+                out.push(matrix(
+                    &format!("ffn_{part}_exps.weight"),
+                    Role::RoutedExperts,
+                    r,
+                ));
+                out.push(matrix(
+                    &format!("ffn_{part}_shexp.weight"),
+                    Role::SharedExpert,
+                    s,
+                ));
+            }
+            out
+        };
+        for (file, routed, shared) in [
+            ("unsloth UD-Q4_K_M", [Q4_K, Q4_K, Q5_K], [Q8_0, Q8_0, Q8_0]),
+            ("unsloth UD-Q4_K_M", [Q4_K, Q4_K, Q6_K], [Q8_0, Q8_0, Q8_0]),
+            ("bartowski Q4_K_M", [Q4_K, Q4_K, Q6_K], [Q8_0, Q8_0, Q8_0]),
+            ("bartowski Q4_K_M", [Q4_K, Q4_K, Q4_K], [Q6_K, Q6_K, Q6_K]),
+            ("ggml-org Q4_K_M", [Q4_K, Q4_K, Q4_K], [Q8_0, Q8_0, Q8_0]),
+        ] {
+            for t in parts(routed, shared) {
+                assert_eq!(
+                    items(Program::Qwen35Body, &t),
+                    Vec::<String>::new(),
+                    "{file}: {} {}",
+                    t.name,
+                    t.ty
+                );
+            }
+        }
+        for (name, role, ty, want) in [
+            (
+                "ffn_gate_exps.weight",
+                Role::RoutedExperts,
+                Q8_0,
+                "q8_0 routed experts gate and up (the body reads q4_K and q5_K)",
+            ),
+            (
+                "ffn_down_exps.weight",
+                Role::RoutedExperts,
+                Q8_0,
+                "q8_0 routed experts down (the body reads q4_K, q5_K and q6_K)",
+            ),
+            (
+                "ffn_gate_shexp.weight",
+                Role::SharedExpert,
+                GgmlType::IQ4_XS,
+                "iq4_xs shared expert (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)",
+            ),
+        ] {
+            assert_eq!(
+                items(Program::Qwen35Body, &matrix(name, role, ty)),
+                [want],
+                "{name} {ty}"
+            );
+        }
+    }
+
     /// A type `Body35` cannot launch is still an item by name: bf16
-    /// attention and dense FFN, a q8_0 shared expert gate (joined into a
-    /// q4_K stack).
+    /// attention and dense FFN (its FFN's pins:
+    /// `the_qwen35_ffn_pins_are_the_card_kernel_table`).
     #[test]
     fn a_type_body35_cannot_launch_is_an_item() {
         let bf16 = GgmlType::BF16;
@@ -1324,13 +1556,6 @@ mod tests {
                 &matrix("ffn_up.weight", Role::DenseFfn, bf16)
             ),
             ["bf16 dense FFN (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)"]
-        );
-        assert_eq!(
-            items(
-                Program::Qwen35Body,
-                &matrix("ffn_gate_shexp.weight", Role::SharedExpert, GgmlType::Q8_0)
-            ),
-            ["q8_0 shared expert gate and up, joined into the routed stacks (the body reads q4_K)"]
         );
     }
 

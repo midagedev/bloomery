@@ -16,6 +16,7 @@ use gguf::{GgmlType, Split};
 
 use super::hparams::Hparams;
 use super::roles;
+use crate::arch::coverage::{qwen35_down, qwen35_gate_up};
 use crate::placement::workstation::{CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host};
 use crate::placement::{
     self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
@@ -24,17 +25,16 @@ use crate::placement::{
 use runtime::stores::{kv_q8_row_bytes, kv_row_bytes};
 
 /// The routed stacks the qwen3moe program's card experts read, each in the
-/// file's blocks ([`CardFormat::KQuant`]): the Q4_K gate and up (the
-/// K-quant family's Q4_K gate·up) and a Q4_K or Q6_K down (`q4k_gemv_sel`,
-/// `q6k_gemv_sel`). The rule reads a stack's type alone; the load refuses
-/// by name a Q6_K gate or up, which no card gate·up of the program reads.
-/// A stack of any other type keeps its layer's experts on the host.
+/// file's blocks ([`CardFormat::KQuant`]): a type the card kernel table
+/// gives the program's routed gate·up or down an entry on both the decode
+/// and the prompt path ([`qwen35_gate_up`], [`qwen35_down`]) — a Q4_K or
+/// Q5_K gate and up, a Q4_K, Q5_K or Q6_K down. The rule reads a stack's
+/// type alone; the load refuses by name a stack of one of these types in a
+/// part no entry runs it in (a Q6_K gate or up). A stack of any other type
+/// keeps its layer's experts on the host.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    match ty {
-        GgmlType::Q4_K | GgmlType::Q6_K => Some(CardFormat::KQuant),
-        _ => None,
-    }
+    (qwen35_gate_up(ty).is_some() || qwen35_down(ty).is_some()).then_some(CardFormat::KQuant)
 }
 
 /// The machine a placed load of the program runs on: `card` runs every one
