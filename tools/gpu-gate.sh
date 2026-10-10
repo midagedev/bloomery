@@ -20,6 +20,13 @@
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
 # BLOOMERY_BATCH_OWNER(letters, digits, _: the owner of the batch hold this run's batch put up — the batch hold paragraph below).
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
+# BLOOMERY_LOCK_DIR: the directory of every lock and hold file named below, /root when unset (tools/ref/lease-probe.sh's LOCK_DIR).
+# BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, bloomery-gate-local.lock, for the card(s) this
+# machine shows when BLOOMERY_GATE_CARD is unset, 3090, a6000 or any (`both` and other names: 64), and leaves
+# CUDA_VISIBLE_DEVICES as it finds it. A held timing lease is read as timing that card: the run waits as for its lock. Its
+# lock directory is never /root (64).
+# Where /root/bloomery-cpu.lock exists (the box, as lease_take reads it), BLOOMERY_BOX_CARD=local and a BLOOMERY_LOCK_DIR other
+# than /root are refused (64): the run would hold no lock the box's gates and sittings take.
 # BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
 # BLOOMERY_TIER=real|fixture (unset: real) and BLOOMERY_FIXTURE_MODEL: the fixture tier (tools/box.sh resolves both, see
 # tools/ref/ref-paths.sh). A run asking for the V4.1 load lock takes none when its tier is fixture AND its
@@ -37,7 +44,7 @@
 # class from BLOOMERY_V41_CLASS (1 the lead's landing batch, 2 round gates, the default, 3 sittings, 4 idle fill; any other value is 64),
 # seq ten digits from /root/bloomery-v41-queue.seq, read and incremented under a short flock, the ticket written inside it so that no
 # lower seq is ever missing from the directory while a higher one is there. The content is one line, `owner=<BLOOMERY_BATCH_OWNER or the
-# remote dir's basename> pid=<pid> start=<field 22 of /proc/<pid>/stat> since=<epoch> cards=<3090|a6000|both|any> item=<the binary and
+# remote dir's basename> pid=<pid> start=<field 22 of /proc/<pid>/stat> since=<epoch> cards=<3090|a6000|both|any|local> item=<the binary and
 # its args, up to ` tier=`> tier=real pred_s=<BLOOMERY_V41_PRED_S, the calling recipe's median wall in seconds, or ->`. The order key is
 # (class, seq), ascending; the batch hold below stays above every class, and nothing preempts a holder. A ticket is live while the
 # process's start time equals its start= (a reused pid does not keep one alive); any reader removes a dead ticket and says so once on
@@ -74,12 +81,12 @@
 # The batch calls these through tools/box.sh with BLOOMERY_BOX_READONLY=1 (no sync, no guard wait: a heartbeat stuck behind a sitting
 # would go stale), a deliberate write of this one control file.
 set -uo pipefail
-GATE_LOCK=/root/bloomery-gate.lock A6000_LOCK=/root/bloomery-gate-a6000.lock
-V41_LOCK=/root/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
-GPU_HOLD=/root/bloomery-batch.gpuhold HOLD_STALE=300
-V41_QDIR=/root/bloomery-v41-queue.d V41_SEQ=/root/bloomery-v41-queue.seq PACE=''
 # shellcheck source=tools/ref/lease-probe.sh
 source "${BASH_SOURCE[0]%/*}/ref/lease-probe.sh"
+GATE_LOCK=$LOCK_DIR/bloomery-gate.lock A6000_LOCK=$LOCK_DIR/bloomery-gate-a6000.lock LOCAL_LOCK=$LOCK_DIR/bloomery-gate-local.lock
+V41_LOCK=$LOCK_DIR/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
+GPU_HOLD=$LOCK_DIR/bloomery-batch.gpuhold HOLD_STALE=300
+V41_QDIR=$LOCK_DIR/bloomery-v41-queue.d V41_SEQ=$LOCK_DIR/bloomery-v41-queue.seq PACE=''
 
 # batch_hold_read: HOLD_STATE none | up | stale (its mtime is HOLD_STALE s old or more), HOLD_OWNER (`?` when the file names none or
 # is not readable), HOLD_AGE (seconds since its last refresh, `?` when its mtime cannot be read — then it is up: never free) and
@@ -341,6 +348,8 @@ pace() {
 self_test() {
   local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc cap=50
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  # The cases pin the box's /root paths, so a lock directory from local mode is dropped; the local cases name their own.
+  unset BLOOMERY_LOCK_DIR
   t=$(mktemp -d "${TMPDIR:-/tmp}/gpu-gate-test.XXXXXX") || return 70
   # shellcheck disable=SC2064 # the path is fixed now
   trap "rm -rf '$t'" EXIT
@@ -1144,6 +1153,26 @@ PY
     "$(dirname "$self")/ref/lease-probe.sh" "$out")"
   printf '%s\n' "$out" > "$t/out"
   judge_all "the batch hold's name does not match the sittings' LEASE_HOLDS" 0 0 '^/root/bloomery-batch\.gpuhold sitting-hold-matches apart$'
+  # box.sh's local mode (BLOOMERY_BOX_CARD=local, its lock directory the test's): one lock for this machine's card(s), apart from
+  # the box's two, and the caller's CUDA_VISIBLE_DEVICES (the stub prints it); a held lease is waited for as the lock is.
+  local ON_LOCAL="ok on this machine's card\\(s\\), the local gate lock" LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$t")
+  rc=0
+  gate "$t/out" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
+  judge_all 'local: any takes the local lock and leaves CUDA_VISIBLE_DEVICES as it was' "$rc" 0 "$ON_LOCAL \\(asked any\\)$" '^ran on GPU-caller$'
+  case_ '  … a6000 takes it too' 0 "$ON_LOCAL \\(asked a6000\\)$" a6000 "$t/lease" "${LOC[@]}"
+  case_ '  … a V4.1 load takes the V4.1 load lock with it' 0 "$ON_LOCAL \\(asked any\\), V4\\.1 load lock$" any "$t/lease" "${LOC[@]}" BLOOMERY_GATE_V41_LOAD=1
+  exec 5> "$t/gate.lock" 6> "$t/gate-a6000.lock"
+  { flock -x 5 && flock -x 6; } || { echo "FAIL: the test cannot hold the two card locks"; return 1; }
+  case_ "  … the box's two card locks held: it runs" 0 "$ON_LOCAL \\(asked any\\)$" any "$t/lease" "${LOC[@]}"
+  exec 5>&- 6>&-
+  exec 6> "$t/gate-local.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the local lock"; return 1; }
+  case_ '  … the local lock held: 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
+  exec 6>&-
+  exec 7> "$t/lease"
+  flock -x 7 || { echo "FAIL: the test cannot hold its lease file"; return 1; }
+  case_ '  … the lease held: it times the card, 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
+  exec 7>&-
   echo "gpu-gate self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -1153,7 +1182,7 @@ if [ "${1:-}" = --self-test ]; then
 fi
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 3 ] && [ -d "$2" ] || { echo "usage: gpu-gate.sh --test-locks <dir> <binary> [args...] (the self-test's)" >&2; exit 64; }
-  GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
+  GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock LOCAL_LOCK=$2/gate-local.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
   V41_QDIR=$2/v41-queue.d V41_SEQ=$2/v41-queue.seq
   # A helper waiter, one whose life the test ends by an event (it releases the lock the waiter queues on), is set up with a safety cap
   # in place of the two bounds; the cases that judge a bound never set it.
@@ -1164,6 +1193,10 @@ if [ "${1:-}" = --test-locks ]; then
   # GATE_TEST_PACE=<FIFO prefix>: a loader whose polls the test paces (the pace function); only here is the variable read.
   PACE=${GATE_TEST_PACE:-}
   shift 2
+# On the box (the header) every run but the self-test's takes the locks under /root.
+elif on_box && { [ "$LOCK_DIR" != /root ] || [ "${BLOOMERY_BOX_CARD:-}" = local ]; }; then
+  echo "gpu-gate.sh: $([ "$LOCK_DIR" != /root ] && echo "BLOOMERY_LOCK_DIR=$LOCK_DIR" || echo BLOOMERY_BOX_CARD=local) on the machine whose lease is $BOX_LEASE (the box): its gates and sittings lock under /root, and this run would hold none of their locks; run it through tools/box.sh without local mode. If this machine is not the box, a lock script run as root without BLOOMERY_LOCK_DIR made that file: remove it" >&2
+  exit 64
 fi
 if [ "${1:-}" = --gpuhold ]; then
   shift
@@ -1260,9 +1293,19 @@ case "$BOXC" in
       echo "gpu-gate.sh: box.sh put $([ "$BOXC" = both ] && echo 'both cards' || echo 'the A6000') in view (BLOOMERY_CARD=$BOXC), and BLOOMERY_GATE_CARD=$CARD names another lock — leave it unset or set it to $BOXC" >&2
       exit 64
     } ;;
-  *) echo "gpu-gate.sh: BLOOMERY_BOX_CARD is 3090, a6000 or both (box.sh sets it), got '$BOXC'" >&2; exit 64 ;;
+  local)
+    if box_lock_dir "$LOCK_DIR"; then
+      echo "gpu-gate.sh: box.sh's local mode (BLOOMERY_BOX_CARD=local) keeps its lock under BLOOMERY_LOCK_DIR, and that is $LOCK_DIR (unset: /root), the box's lock directory: run it through tools/box.sh's local mode, which sets both" >&2
+      exit 64
+    fi
+    ASK=${BLOOMERY_GATE_CARD:-3090}
+    case $ASK in
+      3090 | a6000 | any) CARD=local ;;
+      *) echo "gpu-gate.sh: box.sh's local mode (BLOOMERY_BOX_CARD=local) runs on what this machine shows under one lock, and BLOOMERY_GATE_CARD=$ASK names $([ "$ASK" = both ] && echo "the box's two cards" || echo 'no card'): leave it unset" >&2; exit 64 ;;
+    esac ;;
+  *) echo "gpu-gate.sh: BLOOMERY_BOX_CARD is 3090, a6000, both or local (box.sh sets it), got '$BOXC'" >&2; exit 64 ;;
 esac
-case "$CARD" in
+[ "$BOXC" = local ] || case "$CARD" in
   3090 | a6000 | any) ;;
   both)
     [ "$BOXC" = both ] || {
@@ -1278,9 +1321,10 @@ a6000_idle() {
 }
 # 락 파일을 못 여는 셸(박스의 root가 아니거나 박스가 아님)은 경쟁이 아니다 — 여기서 이름을 대고 끝난다.
 LOCK_FILES=("9:$GATE_LOCK" "8:$A6000_LOCK")
+[ "$CARD" != local ] || LOCK_FILES=("9:$LOCAL_LOCK")
 [ "$V41" = 0 ] || LOCK_FILES+=("7:$V41_LOCK")
 for lock in "${LOCK_FILES[@]}"; do
-  eval "exec ${lock%%:*}>${lock#*:}" 2> /dev/null || { echo "gpu-gate.sh: cannot open ${lock#*:} — the gate runs on the box, as root" >&2; exit 69; }
+  eval "exec ${lock%%:*}>\"\${lock#*:}\"" 2> /dev/null || { echo "gpu-gate.sh: cannot open ${lock#*:} — the gate runs on the box, as root$([ "$CARD" != local ] || echo ", or in box.sh's local mode with a BLOOMERY_LOCK_DIR it can write")" >&2; exit 69; }
 done
 # A V4.1 loader queues (the header) before its first poll, and its ticket goes with the run on every exit.
 if [ "$V41" = 1 ]; then
@@ -1432,6 +1476,16 @@ take_3090() {
   fi
   GOT=3090
 }
+# take_local: the local lock (box.sh's local mode). The lease, held or in doubt, times this machine's card: the run lets the lock
+# go and polls on, as `any` passes a timing card by.
+take_local() {
+  flock -n 9 || return 1
+  if ! lease_free; then
+    flock -u 9
+    return 1
+  fi
+  GOT=local
+}
 # take_card: one try, without blocking, at the card lock(s) this run asked for; GOT names what it holds, empty when none.
 take_card() {
   GOT=
@@ -1439,6 +1493,7 @@ take_card() {
     3090) take_3090 || true ;;
     a6000) take_a6000 || true ;;
     any) take_a6000 || take_3090 || true ;;
+    local) take_local || true ;;
   esac
 }
 # take_both: the 3090 lock first, then, holding it, the A6000's. Every other run holds one card lock and never waits while
@@ -1456,7 +1511,7 @@ take_both() {
 }
 drop_card() {
   case "$GOT" in
-    3090) flock -u 9 ;;
+    3090 | local) flock -u 9 ;;
     a6000) flock -u 8 ;;
     both) flock -u 9; flock -u 8 ;;
   esac
@@ -1564,7 +1619,12 @@ if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then
   [ -n "$U" ] || { echo "gpu-gate.sh: the $GOT lookup failed" >&2; exit 75; }
   export CUDA_VISIBLE_DEVICES=$U
 fi
-echo "gpu-gate.sh: $NAME on $([ "$GOT" = both ] && echo 'both cards, both gate locks' || echo "the $GOT") (asked $CARD)$([ "$V41" = 0 ] || echo ', V4.1 load lock')$TIER_NOTE" >&2
+case $GOT in
+  both) ON='both cards, both gate locks' ;;
+  local) ON="this machine's card(s), the local gate lock" ;;
+  *) ON="the $GOT" ;;
+esac
+echo "gpu-gate.sh: $NAME on $ON (asked $([ "$CARD" = local ] && echo "$ASK" || echo "$CARD"))$([ "$V41" = 0 ] || echo ', V4.1 load lock')$TIER_NOTE" >&2
 # The run's own wall, its locks' waits outside it, is the closing line: a recipe that runs several
 # binaries, or one binary several times, is read per run.
 RUN_T0=$SECONDS

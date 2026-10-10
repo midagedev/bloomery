@@ -1315,6 +1315,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The `engram-rate` binary `tools/ref/engram-rate.sh` runs.",
     ),
     path(
+        "BLOOMERY_ENV_FILE",
+        Some("box.sh"),
+        "Local mode (`BLOOMERY_BOX_LOCAL=1`): the environment file `tools/box.sh` sources \
+         before the command, `~/bloomery-env.sh` when unset.",
+    ),
+    path(
         "BLOOMERY_FIXTURE_MODEL",
         Some("box.sh"),
         "The fixture file `tools/box.sh` resolved the fixture tier's model to (the first shard), set only \
@@ -1395,6 +1401,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("ref/lease.sh"),
         "The lease's trace file, `/root/bloomery-sittings.log` under the machine lease when \
          unset; the tools' stub tests point it at their own.",
+    ),
+    path(
+        "BLOOMERY_LOCK_DIR",
+        Some("ref/lease-probe.sh"),
+        "The directory of the timing lease, the holds and the gate locks, `/root` when \
+         unset; `tools/box.sh`'s local mode sets it, `~/.cache/bloomery/locks` by default.",
     ),
     path(
         "BLOOMERY_MODEL",
@@ -1607,6 +1619,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          lever reaches a binary through an unchanged recipe.",
     ),
     runner(
+        "BLOOMERY_BOX_LOCAL",
+        Some("box.sh"),
+        "`1`: `tools/box.sh` runs the command in this tree on this machine, with no ssh and \
+         no rsync, for a contributor's Linux machine with a card of its own; its locks live \
+         under `BLOOMERY_LOCK_DIR`.",
+    ),
+    runner(
         "BLOOMERY_BOX_QUEUE",
         Some("box.sh"),
         "Mac side: `1` makes a box command a job of the box queue: the tree syncs under the remote \
@@ -1773,8 +1792,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     runner(
         "BLOOMERY_BOX_CARD",
         Some("box.sh"),
-        "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000` or \
-         `both`; `tools/gpu-gate.sh` takes that card's gate lock (both locks for `both`).",
+        "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000`, \
+         `both`, or `local` in its local mode; `tools/gpu-gate.sh` takes that card's gate lock \
+         (both locks for `both`, the one local lock for `local`).",
     ),
     runner(
         "BLOOMERY_GEN_CTX",
