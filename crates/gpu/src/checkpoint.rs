@@ -27,16 +27,22 @@
 //! A sequence state on the host ([`saved`]) carries the stores of some of
 //! these points away and hands them back: [`Checkpoints::read_point`] copies
 //! a point's slot out, [`Checkpoints::adopt`] makes a point of host bytes.
+//! A save off the request path has the copy-out run on its copy stream
+//! ([`Checkpoints::enqueue_points`]): the slots it reads are not written
+//! ([`Checkpoints::take`], [`Checkpoints::open_take`], [`Checkpoints::adopt`])
+//! or freed before it lands, and a write that reaches one is refused by name.
 
 pub mod saved;
 pub mod staging;
 
-use std::sync::Arc;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, PinnedHostBuffer};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
 use runtime::seqstate::{self, Cut, Kept, Ledger, Stats, Take};
 
 use crate::GpuError;
+use crate::graph::cu;
 
 const WHAT: &str = "checkpoint";
 
@@ -81,6 +87,10 @@ pub struct Checkpoints {
     open: usize,
     /// The spacing of a prompt call's inner checkpoints (`seqstate::marks`).
     every: u32,
+    /// The ends of the saves whose copy of a point's slots may still run
+    /// ([`Checkpoints::enqueue_points`]): no slot is written while one has
+    /// not completed.
+    reading: Mutex<Vec<Arc<CudaEvent>>>,
     ctx: Arc<CudaContext>,
 }
 
@@ -103,6 +113,7 @@ impl Checkpoints {
             points: Vec::new(),
             open: 0,
             every,
+            reading: Mutex::new(Vec::new()),
             ctx: Arc::clone(ctx),
         })
     }
@@ -227,6 +238,7 @@ impl Checkpoints {
         at: u32,
         stores: &mut [&mut DeviceBuffer<f32>],
     ) -> Result<Take, GpuError> {
+        self.unread("a take")?;
         self.apply(stream, stores)?;
         self.check(stores)?;
         let take = self.ledger.take(at).map_err(refused)?;
@@ -274,6 +286,7 @@ impl Checkpoints {
         at: u32,
         stores: &mut [&mut DeviceBuffer<f32>],
     ) -> Result<Option<Pending>, GpuError> {
+        self.unread("an open take")?;
         self.apply(stream, stores)?;
         self.check(stores)?;
         let Take::Copy { slot, new, evicted } = self.ledger.take(at).map_err(refused)? else {
@@ -436,6 +449,98 @@ impl Checkpoints {
         Ok(())
     }
 
+    /// The points at `ats`' stores copied after the work `stream` holds, into
+    /// `dst` (`ats.len()` checkpoints' f32s, each in [`Checkpoints::read_point`]'s
+    /// layout, one after another): a host copy the driver runs in the stream's
+    /// order, so the call returns once it is queued. Refused by name, nothing
+    /// queued, as [`Checkpoints::read_point`] refuses. Follow it with
+    /// [`Checkpoints::guard_points`] on the event that ends the copy.
+    ///
+    /// # Safety
+    ///
+    /// `dst .. dst + dst_len` must be writable pinned memory that nothing
+    /// reads, writes or frees until the copy has completed, and `self` must
+    /// outlive the copy or be waited for first (its drop does).
+    pub unsafe fn enqueue_points(
+        &self,
+        stream: &CudaStream,
+        ats: &[u32],
+        dst: *mut f32,
+        dst_len: usize,
+    ) -> Result<(), GpuError> {
+        let one: usize = self.lens.iter().sum();
+        if dst_len != one * ats.len() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("{dst_len} host f32s for {} checkpoints of {one}", ats.len()),
+            });
+        }
+        let mut parts: Vec<(usize, usize, usize)> = Vec::new();
+        for (i, &at) in ats.iter().enumerate() {
+            let src = self.slot_of(at)?;
+            let mut off = one * i;
+            for b in &src.bufs {
+                // SAFETY: `off + b.len()` is within `dst_len` (the lens sum to `one`).
+                let to = unsafe { dst.add(off) };
+                parts.push((b.as_slice().as_ptr() as usize, to as usize, b.len() * 4));
+                off += b.len();
+            }
+        }
+        let data = Box::into_raw(Box::new(parts)).cast::<c_void>();
+        // SAFETY: `data` is the box `copy_points` takes back, once; the
+        // addresses in it are the slots' pinned buffers (not written or freed
+        // while a copy reads them: `unread`, `Drop`) and the caller's `dst`.
+        let rc = unsafe { sys::cuLaunchHostFunc(stream.cu_stream(), Some(copy_points), data) };
+        if rc != sys::cudaError_enum_CUDA_SUCCESS {
+            // SAFETY: the launch failed, so `copy_points` never takes it.
+            drop(unsafe { Box::from_raw(data.cast::<Vec<(usize, usize, usize)>>()) });
+        }
+        cu(rc, "cuLaunchHostFunc")
+    }
+
+    /// `end` marks the end of the copy [`Checkpoints::enqueue_points`] queued:
+    /// no slot is written before it has completed.
+    pub fn guard_points(&self, end: Arc<CudaEvent>) {
+        self.reading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(end);
+    }
+
+    /// Refused by name, nothing changed, while a copy of a point's slots
+    /// ([`Checkpoints::enqueue_points`]) has not completed: `what` would write
+    /// a slot under it, and the caller waits for the save first
+    /// ([`saved::Pending::land`]).
+    fn unread(&self, what: &str) -> Result<(), GpuError> {
+        let mut reading = self.reading.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut live = Vec::new();
+        let mut failed = None;
+        for e in reading.drain(..) {
+            match e.query() {
+                Ok(true) => {}
+                Ok(false) => live.push(e),
+                Err(err) => {
+                    failed.get_or_insert(err);
+                    live.push(e);
+                }
+            }
+        }
+        *reading = live;
+        if let Some(err) = failed {
+            return Err(err.into());
+        }
+        if reading.is_empty() {
+            return Ok(());
+        }
+        Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "save in flight: {what} would write a slot a saved state's point copy still \
+                 reads; wait for the save to land first"
+            ),
+        })
+    }
+
     /// A point at `at` whose stores are `src` ([`Checkpoints::read_point`]'s
     /// layout): a slot the ledger gives it, filled from the host. The model
     /// is cut without a copy: `at` lies at or above every point, and no cut
@@ -443,6 +548,7 @@ impl Checkpoints {
     /// `src` is another length; a slot left half written names no point.
     /// Host memory only.
     pub fn adopt(&mut self, at: u32, src: &[f32]) -> Result<(), GpuError> {
+        self.unread("an adopt")?;
         self.fits(src.len())?;
         let take = self.ledger.take(at).map_err(refused)?;
         let Take::Copy { slot, new, evicted } = take else {
@@ -564,13 +670,92 @@ impl Checkpoints {
 }
 
 impl Drop for Checkpoints {
-    /// With a take open, its copies may still write its slot: the context is
-    /// waited for before the slots are freed, under the device's capture
+    /// With a take open, its copies may still write its slot, and a save's
+    /// point copy may still read them: the context is waited for before the
+    /// slots are freed, under the device's capture
     /// lock ([`crate::capsync::ctx_sync_in_drop`], which a drop path calls
     /// because it must not panic).
     fn drop(&mut self) {
-        if self.open > 0 {
+        let reading = !self
+            .reading
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
+        if self.open > 0 || reading {
             let _ = crate::capsync::ctx_sync_in_drop(&self.ctx, "Checkpoints::drop");
+        }
+    }
+}
+
+/// The host copy [`Checkpoints::enqueue_points`] queues: `(from, to, bytes)`
+/// each, as addresses. Runs on the driver's thread in the stream's order and
+/// makes no driver call.
+unsafe extern "C" fn copy_points(data: *mut c_void) {
+    // SAFETY: the box `enqueue_points` leaked for this one call.
+    let parts = unsafe { Box::from_raw(data.cast::<Vec<(usize, usize, usize)>>()) };
+    for &(from, to, bytes) in parts.iter() {
+        // SAFETY: both ranges are pinned memory `enqueue_points`' contract
+        // keeps unwritten and unfreed until this copy has completed, and they
+        // are different buffers.
+        unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, bytes) };
+    }
+}
+
+/// A stream held shut for a test: what is enqueued on it after [`hold::Hold::on`]
+/// does not start until the test opens the hold, so a copy behind it is in
+/// flight for as long as the test says, whatever else the device or the
+/// driver is doing.
+#[cfg(test)]
+pub(crate) mod hold {
+    use std::ffi::c_void;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use cuda_core::{CudaStream, sys};
+
+    use crate::GpuError;
+    use crate::graph::cu;
+
+    /// Runs on the driver's thread in the stream's order, and returns once
+    /// the flag is up.
+    unsafe extern "C" fn wait_open(flag: *mut c_void) {
+        // SAFETY: the `Arc` count `Hold::on` handed this call.
+        let flag = unsafe { Arc::from_raw(flag.cast::<AtomicBool>()) };
+        while !flag.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    /// The hold; dropping it opens it, so a failed assert never leaves the
+    /// stream shut. While it is shut the test must not wait for anything
+    /// enqueued behind it: no land, no event or stream sync, no extent drop.
+    pub struct Hold(Arc<AtomicBool>);
+
+    impl Hold {
+        /// Shuts `stream` after the work it holds so far.
+        pub fn on(stream: &CudaStream) -> Result<Hold, GpuError> {
+            let flag = Arc::new(AtomicBool::new(false));
+            let data = Arc::into_raw(Arc::clone(&flag)).cast_mut().cast::<c_void>();
+            // SAFETY: `data` is a live `Arc` count that `wait_open` takes.
+            let rc = unsafe { sys::cuLaunchHostFunc(stream.cu_stream(), Some(wait_open), data) };
+            if rc != sys::cudaError_enum_CUDA_SUCCESS {
+                // SAFETY: the launch failed, so `wait_open` never takes it.
+                drop(unsafe { Arc::from_raw(data.cast::<AtomicBool>()) });
+            }
+            cu(rc, "cuLaunchHostFunc")?;
+            Ok(Hold(flag))
+        }
+
+        /// Opens the hold: the stream runs on.
+        pub fn open(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.open();
         }
     }
 }
