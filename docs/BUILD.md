@@ -9,7 +9,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Piece | Version | Where it is pinned |
 |---|---|---|
 | Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
-| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `ec4aa4797956534578a1af010f86252a0b6d8626` (upstream: NVlabs/cuda-oxide, now NVIDIA/cuda-rust), source rev `0af1016c72c2224857d02bead7bdb7cbc10e580b` | `[workspace.dependencies]` in `Cargo.toml` (NVlabs), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
+| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `1691162ab9204ef21b0329c2e8059815420dfd5a` (upstream: NVIDIA/cuda-rust), source rev `4da6c138448538ca12218cb80924c070417ab419` | `[workspace.dependencies]` in `Cargo.toml` (NVIDIA/cuda-rust), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
 | `cargo-oxide` | 0.2.1, from the same fork and rev | the install command below; `cargo oxide doctor` must pass |
 | LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | on `PATH`, or `CUDA_OXIDE_LLC` |
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
@@ -26,7 +26,7 @@ Install `cargo-oxide` from the fork at the pinned rev, not from upstream's main 
 
 ```sh
 cargo +nightly-2026-08-28 install --git https://github.com/midagedev/cuda-oxide.git \
-  --rev 0af1016c72c2224857d02bead7bdb7cbc10e580b cargo-oxide
+  --rev 4da6c138448538ca12218cb80924c070417ab419 cargo-oxide
 ```
 
 That `cargo-oxide` builds its codegen backend from the checkout cargo resolved for `cuda-device`, which is the `[patch]` fork at the pinned rev (the fork's `crates/cargo-oxide/src/backend_source.rs`). The maintainers' machine instead keeps one prebuilt backend per rev and points `CUDA_OXIDE_BACKEND` at it; you do not need that. The install above has not been run on a clean host yet.
