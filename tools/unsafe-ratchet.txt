@@ -218,7 +218,9 @@ placement 0 0 0
 # (dot_iq3s_q8k_avx2, dot_iq3s_q8k_tile_avx2) and the two #[inline(always)] decode helpers they share (iq3s_scales,
 # iq3s_values), four unsafe fns of one block each, and the three dispatch arms that call them, each with its SAFETY
 # line.
-qdot 109 60 0
+# PIN(2026-10-10): qdot 109 -> 111 blocks, 60 -> 61 fns, a new kernel, not old code relaxed: the MXFP4 tile (one
+# unsafe fn) and the dispatch arm that calls it, each with its SAFETY line.
+qdot 111 61 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
