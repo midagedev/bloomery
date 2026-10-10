@@ -14,7 +14,7 @@ use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::flip::tie_allowed;
-use bloomery_gpu_mimo2::{Body, Mimo2Model};
+use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
 use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
 use model::placement::{Machine, Plan, PlanLevers};
@@ -91,6 +91,8 @@ pub fn open(
     let cfg = Mimo2Cfg {
         place: PlanLevers::from_levers(levers)?,
         host: levers.host(),
+        prefill: PrefillMode::Steps,
+        group: 1,
     };
     let mut log = Log {
         t: Instant::now(),

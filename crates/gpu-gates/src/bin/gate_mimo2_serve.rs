@@ -27,8 +27,8 @@
 //! clauses. A `deferred(…)` line is a half that did not run, never a pass.
 //!
 //! The seat serves one slot, every routed expert on the host tier, the prompt
-//! fed one decode step an id, and a later request keeps any prefix it shares
-//! with what the slot holds. Every server is `bloomery-serve --model mimo2 -m
+//! fed in batches (bit for bit the decode steps), and a later request keeps
+//! any prefix it shares with what the slot holds. Every server is `bloomery-serve --model mimo2 -m
 //! <file> …` beside this binary, `BLOOMERY_REF_MODEL` removed from its
 //! environment. Logs per server in `<dir>/<name>/` (`server.err`, the
 //! responses).
@@ -81,8 +81,8 @@
 //!   answered, then resent with its user message changed to [`EDIT_B`], which
 //!   diverges at `j` inside the prompt — keeps `j` (`cache_n`);
 //!   `edit_resend_ids_are_a_fresh_runs` — its ids equal the same request with
-//!   `cache_prompt: false`, bit for bit, since every position is a decode step
-//!   either way; and `extension_keeps_every_held_position` — the turn resent
+//!   `cache_prompt: false`, bit for bit, since the batch feed writes the
+//!   steps' bits whatever the cut; and `extension_keeps_every_held_position` — the turn resent
 //!   with its reply and a later user turn (the ids the template renders past a
 //!   reply, found by [`later_ids`]) — keeps every position the slot held.
 //!   FAIL-first: the seat's former keep rule, every position or none, keeps 0

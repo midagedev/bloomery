@@ -10,6 +10,7 @@
 //! pin the uploads against independent host packings bit for bit.
 
 use crate::q5::{pack_q5_0, pack_q5_1};
+use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
 use crate::{Gpu, GpuError};
@@ -647,6 +648,34 @@ impl Weights {
     ) -> Result<(), GpuError> {
         let (qs, d) = self.q8_planes(what, name)?;
         gpu.q8f32().enqueue_q8_0_gemv(gpu.stream(), qs, d, x, 1, y)
+    }
+
+    /// `y = W · x` for the resident Q8_0 weight `name` over `c` columns of `x`
+    /// (1 to [`crate::COL_GROUP`], token-major), the columns' outputs
+    /// token-major into `y` (`q8_0_gemv_mcol`: each column is the one-column
+    /// gemv's bits); a weight of another variant is refused by name as
+    /// `what`'s.
+    pub fn q8_gemv_mcol(
+        &self,
+        gpu: &Gpu,
+        what: &'static str,
+        name: &str,
+        x: &DeviceBuffer<f32>,
+        c: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (qs, d) = self.q8_planes(what, name)?;
+        gpu.q8f32().enqueue_q8_0_gemv_mcol(
+            gpu.stream(),
+            Q8_0GemvMcolArgs {
+                qs,
+                d,
+                x,
+                m: c,
+                out: GemvOut::TokenMajor,
+                y,
+            },
+        )
     }
 
     /// Every resident name, sorted.

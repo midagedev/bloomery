@@ -14,7 +14,8 @@
 //! changes which passes run and never a token.
 //!
 //! Beneath a target's call: [`sched`], the order in which a schedule runs a
-//! layer program's parts over its units ([`sched::walk`]), [`state`], the
+//! layer program's parts over its units ([`sched::walk`]), [`prompt`], how a
+//! prompt call is cut into batches and walked in groups, [`state`], the
 //! stores a layer keeps and how later positions read them, [`stores`], their
 //! sizes, [`seqstate`], the
 //! checkpoints of the recurrent ones and which cuts they serve, and
@@ -27,6 +28,7 @@ pub mod combine;
 pub mod hc_gated;
 pub mod layer;
 mod lookup;
+pub mod prompt;
 pub mod qsa;
 pub mod sched;
 pub mod seqstate;

@@ -7,7 +7,7 @@
 //!     bloomery-serve --model mimo2 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
-//!                    [--parallel 1] [--queue-depth Q]
+//!                    [--prefill batch|steps] [--parallel 1] [--queue-depth Q]
 //!                    [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
@@ -20,12 +20,19 @@
 //! unknown argument.
 //!
 //! Three facts of the architecture set this seat's shape, and nothing else
-//! does: the body holds one sequence (no `Slots`), the program runs no pass of
-//! several rows (a prompt is one decode step an id, `app::Prompt for Body`),
-//! and no draft is read. So the server feeds the prompt less its last id as
-//! one prompt call, then steps the last, as `bloomery-serve --model qwen3`
-//! does; `--parallel` beyond one slot and a prompt cache are refused by
-//! name, and a tier card has no expert to hold.
+//! does: the body holds one sequence (no `Slots`), the program runs no verify
+//! pass of several rows, and no draft is read. So the server feeds the prompt
+//! less its last id as one prompt call, then steps the last, as
+//! `bloomery-serve --model qwen3` does; `--parallel` beyond one slot and a
+//! prompt cache are refused by name, and a tier card has no expert to hold.
+//!
+//! The prompt call is fed as `--prefill` says (`app::Prompt for Body`): in
+//! batches of up to a union's columns (`batch`, the default), or one decode
+//! step an id (`steps`, the same-binary arm); the two leave the same bits. A
+//! word other than those is refused naming the flag and the word. The batch
+//! feed's buffers come out of the card's free bytes at the load, refused by
+//! name when they do not fit, and the group lever is not read: a group runs
+//! one batch.
 //!
 //! `--place W` is the shared placement word (`generate::Place`): `a` (the
 //! largest visible card), `gate`, or one card of the census by name or
@@ -87,7 +94,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_gpu_mimo2::{Body, Mimo2Model};
+use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::Arch;
@@ -103,8 +110,8 @@ const NAME: &str = "bloomery-serve-mimo2";
 
 const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--place W] [--plan] [--parallel 1] [--queue-depth Q] [--api-key KEY] \
-                     [--api-key-file FNAME]";
+                     [--place W] [--plan] [--prefill batch|steps] [--parallel 1] \
+                     [--queue-depth Q] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
@@ -144,6 +151,8 @@ struct Args {
     template_file: Option<PathBuf>,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
+    /// `--prefill`: how a prompt call is fed.
+    prefill: PrefillMode,
     /// `--parallel`: only 1 is served.
     parallel: Option<usize>,
     queue_depth: Option<usize>,
@@ -161,6 +170,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         alias: None,
         template_file: None,
         plan_only: false,
+        prefill: PrefillMode::Batch,
         parallel: None,
         queue_depth: None,
         api_keys: serve::flag::ApiKeys::default(),
@@ -184,6 +194,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--place" => a.place = Some(Place::parse(v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
+            "--prefill" => {
+                a.prefill = PrefillMode::from_name(v)
+                    .ok_or_else(|| format!("--prefill is batch or steps, not {v}"))?;
+            }
             "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
@@ -266,6 +280,7 @@ struct OpenSeat {
     plan: PlanLevers,
     host: HostCfg,
     pin_main: bool,
+    prefill: PrefillMode,
 }
 
 /// The open's records: the plan's expert counts and the model's size are
@@ -350,6 +365,8 @@ impl Mimo {
             cfg: Mimo2Cfg {
                 place: a.plan,
                 host: a.host,
+                prefill: a.prefill,
+                group: 1,
             },
         };
         let s = Loaded::<Body>::open(file, args, &mut log)?
@@ -368,8 +385,8 @@ impl Seat for Mimo {
         self.ctx
     }
 
-    /// One decode step an id (`app::Prompt for Body`), the argmax after the
-    /// last.
+    /// The prompt as `--prefill` says (`app::Prompt for Body`), the argmax
+    /// after the last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         Ok(<Body as app::Prompt>::prompt(self.s.model_mut(), ids)?)
     }
@@ -498,6 +515,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         plan: plan_levers,
         host: levers.host(),
         pin_main: levers.pin_main(),
+        prefill: a.prefill,
     };
     let engine = SeatEngine::spawn(move || Mimo::open(open), ctx, vocab, card, props, 0)?;
     let server = bind_server(

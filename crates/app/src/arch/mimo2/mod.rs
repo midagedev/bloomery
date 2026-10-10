@@ -2,13 +2,14 @@
 //! once by its placement (every routed expert on the host tier) and loaded by
 //! gpumodel's constructor ([`Body::open_placed`]).
 //!
-//! A prompt is fed one decode step an id ([`GpuModel::step`]): the program has
-//! no pass of several rows. The caches are per position, and the body takes no
-//! checkpoint, so a cut keeps every held position (its rollback takes
-//! positions back without device work).
+//! A prompt is fed as the configuration says ([`Mimo2Cfg::prefill`]): in
+//! batches ([`bloomery_gpu_mimo2::prefill`]) or one decode step an id
+//! ([`GpuModel::step`]), the two leaving the same bits. The caches are per
+//! position, and the body takes no checkpoint, so a cut keeps every held
+//! position (its rollback takes positions back without device work).
 
 use bloomery_gpu::{GpuError, GpuModel};
-use bloomery_gpu_mimo2::Body;
+use bloomery_gpu_mimo2::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
@@ -25,6 +26,11 @@ pub struct Mimo2Cfg {
     pub place: PlanLevers,
     /// The host set's read-in and lock, and the file pages' release.
     pub host: HostCfg,
+    /// How a prompt is fed: in batches, or one decode step per id.
+    pub prefill: PrefillMode,
+    /// Batches a prompt group runs layer by layer
+    /// ([`bloomery_gpu_mimo2::set_prefill_group`]).
+    pub group: usize,
 }
 
 impl Open for Body {
@@ -75,16 +81,19 @@ impl Open for Body {
         Body::open_placed(file, plan, inputs, 0, cfg.host)
     }
 
-    /// The prompt call has no buffers of its own.
-    fn prepare(_m: &mut GpuModel<Body>, _cfg: &Mimo2Cfg) -> Result<bool, GpuError> {
-        Ok(false)
+    /// The configuration's feed and group; the batch feed's buffers made
+    /// here, for the group's units.
+    fn prepare(m: &mut GpuModel<Body>, cfg: &Mimo2Cfg) -> Result<bool, GpuError> {
+        let grew = bloomery_gpu_mimo2::set_prefill_group(m, cfg.group)?;
+        Ok(bloomery_gpu_mimo2::set_prefill(m, cfg.prefill)? || grew)
     }
 }
 
 impl Prompt for Body {
-    /// One decode step an id, the argmax after the last.
+    /// The body's feed ([`bloomery_gpu_mimo2::feed`]): a call past the
+    /// stores' positions is refused before anything runs.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        m.step(ids)
+        bloomery_gpu_mimo2::feed(m, ids)
     }
 }
 
