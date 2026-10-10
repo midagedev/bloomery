@@ -244,7 +244,14 @@ impl HostExperts for HostRun {
     ) -> Result<(), GpuError> {
         let (view, src, scratch) = self.union_of(layer, "HostRun::experts_union_into")?;
         view.experts_union_into(src, x, lists, out, scratch)?;
-        self.reads.file(lists.iter().map(|l| l.len()).sum());
+        // A layer with an arena reads the ids it serves from the arena's
+        // slots, batch by batch; the plan's host segment and a layer with
+        // none read the mapping.
+        self.reads.arena_or_file(
+            self.tier.as_deref(),
+            layer,
+            lists.iter().flat_map(|l| l.iter().map(|&(id, _)| id)),
+        );
         Ok(())
     }
 
@@ -266,13 +273,6 @@ impl HostExperts for HostRun {
             lists.iter().flat_map(|l| l.iter().map(|&(id, _)| id)),
         );
         Ok(())
-    }
-
-    fn release_union(&mut self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
-        match &self.tier {
-            Some(tier) if tier.covers(layer) => tier.release_union(layer, lists),
-            _ => Ok(()),
-        }
     }
 
     fn reads(&self) -> Option<HostReads> {

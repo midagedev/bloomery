@@ -1537,9 +1537,6 @@ impl BatchService {
         );
         let Some((first, saw)) = refused else {
             let r = t.experts.experts_union_into(layer, x, &lists, out);
-            // A prompt call's union has consumed what it read: the host lets
-            // go of the pages it does not keep.
-            let r = r.and_then(|()| t.experts.release_union(layer, &lists));
             self.slices = reuse_slices(lists);
             r?;
             self.count(cols, host_slots, excluded, t0);
@@ -1553,8 +1550,7 @@ impl BatchService {
         }
         let r = t
             .experts
-            .experts_union_into(layer, clean.view(), &lists, out)
-            .and_then(|()| t.experts.release_union(layer, &lists));
+            .experts_union_into(layer, clean.view(), &lists, out);
         self.slices = reuse_slices(lists);
         r?;
         for &j in &self.refused {

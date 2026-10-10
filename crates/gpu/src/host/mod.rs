@@ -247,18 +247,6 @@ pub trait HostExperts {
         self.experts_union_into(layer, x, lists, out)
     }
 
-    /// A prompt call's union over `lists` ([`HostExperts::experts_union_into`]
-    /// from the batch port) has consumed what it read of layer `layer`: the
-    /// host lets go of the pages those reads brought in that it does not
-    /// keep (the NVMe tier's ids, [`nvtier::NvTier::release_union`]). The
-    /// step port's union does not call it: it reads the tier's ids from the
-    /// arena ([`HostExperts::experts_step_union_into`]). Nothing by default:
-    /// a host whose reads leave nothing behind.
-    fn release_union(&mut self, layer: usize, lists: &[&[(u32, f32)]]) -> Result<(), GpuError> {
-        let _ = (layer, lists);
-        Ok(())
-    }
-
     /// The host's routed picks since load by where it read their bytes
     /// ([`census::HostReads`]), for the tier census; `None` for a host that
     /// does not count them, whose census is not taken.

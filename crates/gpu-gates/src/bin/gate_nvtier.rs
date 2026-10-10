@@ -20,9 +20,13 @@
 //! - `refuse` (clause 4): the room under the tier's floor
 //!   (`HostRoomFloor`), an arena budget under the arena's floor at load
 //!   (`ArenaFloor`: one byte, `(k − 1)` slot sets, the floor's own slots
-//!   less the lane claim's, each by name), the floor's own budget loading
-//!   with exactly its slots and the placement's slot set, and the
-//!   direct-read probe of a mount without direct IO, by name.
+//!   less one — the floor is a prompt union's two batches and the lane's
+//!   claim, 2 × `UNION_BATCH_IDS` + 1, over the call's own `k + lanes` — each
+//!   by name), the floor's own budget loading with exactly its slots and the
+//!   placement's slot set and then serving the prompt (a load of its own at
+//!   that arena, its prompt's argmax and logits row bit for bit the all-RAM
+//!   arm's), and the direct-read probe of a mount without direct IO, by
+//!   name.
 //! - `residency` (clause 5): the paged plan's unset rule resolves `off`
 //!   ([`residency38`]: the plan pages through the tier's arena, where a
 //!   promotion copies an expert from its slot when the arena holds it and
@@ -78,10 +82,9 @@
 //!   drop cannot take. The first read's interior pages are printed, each
 //!   with its layer, stack row, expert and the expert's class (a card id,
 //!   an NVMe-tier id) and its distance to its run's nearer end. (b) After
-//!   the prompt call, at most the readahead its readers had in flight when
-//!   each layer's drop ran: `2R` pages a
-//!   reading thread a paged layer, the readers no more than the host's
-//!   CPUs. (c) With the residue dropped again so the two readers stay
+//!   the prompt call, no page: the prompt's union reads each tier id from its
+//!   arena slot, so it faults no page of a drop run and queues no drop.
+//!   (c) With the residue dropped again so the two readers stay
 //!   apart, after the [`STEPS`] steps, at most the readahead spill of the
 //!   flips' copies, which a lane's drop of its own id does not name: a copy
 //!   reads an expert's three parts in order through the mapping, each with
@@ -144,11 +147,20 @@
 //!   demotions), the dropper's calls and wall and the pool's dispatch waits,
 //!   a token. The bug catchers: every phase's card, arena and file picks sum
 //!   to its picks, and its tokens are the ones the gate ran in it (every
-//!   layer of a paged plan's map pages ids, so every walk serves each).
+//!   layer of a paged plan's map pages ids, so every walk serves each); and
+//!   the prompt call's union read the tier's ids from arena slots — arena
+//!   picks and fill bytes, and no drop, since a mapping page of a tier id was
+//!   never read (the `file` picks are the plan's host segment's).
 //! - `pool` (clause 10): no phase's dispatches waited for another caller's
-//!   job. The chain is the pool's one dispatcher; the lane's victim fills
-//!   read on the lane's own threads ([`NvTier::ensure_here`]), where a fill
-//!   through the pool took the dispatch mutex the chain's host compute holds.
+//!   job, and the prompt's fills ran on the tier's fill reader
+//!   ([`NvTier::reader_stats`]: its picks are at least 99 % of the fills the
+//!   prompt made, the rest the residency lane's). The chain is the pool's one
+//!   dispatcher; the lane's victim fills read on the lane's own threads
+//!   ([`NvTier::ensure_here`]) and a prompt batch's on the reader's, where a
+//!   fill through the pool took the dispatch mutex the chain's host compute
+//!   holds.
+//!
+//! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
 //! PIN(2026-10-10): clause 5's `late` is judged at most [`LATE_MAX`] = 4 of the flips that landed, where the design's rule judges 0 for a plan whose lane span is at most its window / 1.5; derived, not measured, from the 2026-10-09 train log's late-flip print on the A6000 (552 flips landed, 8 late):
 //! the lane serves a plan's F = 24 flips one after the other, S = queue / ahead a flip, against the plan's window, so a plan's tail is `max(0, F - floor(window / S))`, 1 / 5 / 2 flips at the three plans that were late, the 8 observed. A promotion that reads its arena slot in place of the cold
@@ -291,6 +303,9 @@ struct ArmRun {
     tier: Option<Arc<NvTier>>,
     seam: Option<Seam>,
     footprint: Option<Footprint>,
+    /// What the prompt call's fills cost and where they ran, on a load with a
+    /// tier.
+    prompt_fill: Option<PromptFill>,
     /// Every boundary's report in order, the prompt call's and the steps',
     /// and where the steps' begin.
     passes: Vec<PassReport>,
@@ -385,6 +400,20 @@ struct Footprint {
     layers: usize,
     prompt_drops: u64,
     prompt_drop_ns: u64,
+    prompt_ns: u64,
+}
+
+/// The prompt call's fills: what the tier read for it, in picks and bytes and
+/// the fills' own wall summed over the batches, and where those reads ran
+/// (the fill reader's jobs, picks and the waits the caller blocked in).
+struct PromptFill {
+    fills: u64,
+    bytes: u64,
+    fill_ns: u64,
+    reader_jobs: u64,
+    reader_units: u64,
+    reader_waits: u64,
+    reader_wait_ns: u64,
     prompt_ns: u64,
 }
 
@@ -498,6 +527,7 @@ fn arm(
         None => (Pages::default(), Vec::new()),
     };
     let drops0 = tier.as_ref().map(|t| t.stats());
+    let reader0 = tier.as_ref().map(|t| t.reader_stats());
     let mut run = ArmRun {
         tokens: Vec::with_capacity(STEPS + 1),
         digests: Vec::with_capacity(STEPS + 1),
@@ -512,6 +542,7 @@ fn arm(
         tier: tier.clone(),
         seam: None,
         footprint: None,
+        prompt_fill: None,
         passes: Vec::new(),
         steps_from: 0,
         step_ns: Vec::with_capacity(STEPS),
@@ -548,6 +579,7 @@ fn arm(
         t.flush()?;
     }
     let drops1 = tier.as_ref().map(|t| t.stats());
+    let reader1 = tier.as_ref().map(|t| t.reader_stats());
     let c1 = census_of(&s)?;
     // The prompt's residue dropped through the tier, so the steps' read
     // names only what the steps' own readers left.
@@ -593,6 +625,18 @@ fn arm(
             ("prompt", ids.len(), c1.since(&c0)),
             ("steps", STEPS, c2.since(&c1b)),
         ];
+    }
+    if let (Some(d0), Some(d1), Some(r0), Some(r1)) = (drops0, drops1, reader0, reader1) {
+        run.prompt_fill = Some(PromptFill {
+            fills: d1.fills - d0.fills,
+            bytes: d1.fill_bytes - d0.fill_bytes,
+            fill_ns: d1.fill_ns - d0.fill_ns,
+            reader_jobs: r1.jobs - r0.jobs,
+            reader_units: r1.units - r0.units,
+            reader_waits: r1.waits - r0.waits,
+            reader_wait_ns: r1.wait_ns - r0.wait_ns,
+            prompt_ns,
+        });
     }
     if let (Some((_, regions, band)), Some(d0), Some(d1)) = (&foot, drops0, drops1) {
         run.footprint = Some(Footprint {
@@ -918,6 +962,60 @@ struct MidRun {
     unresident: usize,
     faulting: usize,
     served: Option<(u64, u64, TierCensus)>,
+}
+
+/// What the `refuse` clause's floor arm read: the slots a paged layer its arena
+/// carved, its prompt's argmax and logits digest, and the picks the fill
+/// reader took for it.
+struct FloorRun {
+    slots: u64,
+    argmax: u32,
+    digest: u64,
+    reader_units: u64,
+}
+
+/// The `refuse` clause's floor arm: a load whose arena is exactly the floor's
+/// bytes (a prompt union's two batches and the lane's claim a layer) on the
+/// paged plan under `residency`, and [`PROMPT`] positions as one prompt call:
+/// the union claims, fills and pins its batches in the least room it is
+/// served in, the lane's claims beside it. Refused by name: a plan that pages
+/// no routed expert, and a load that built no arena.
+fn floor_arm(
+    path: &Path,
+    machine: &Machine,
+    residency: Residency,
+    host: HostCfg,
+    ids: &[u32],
+    arena: u64,
+) -> Result<FloorRun, GateError> {
+    let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let inputs = inputs_of(&file, Some(ROOM))?;
+    let ub = ubatch_for(CTX)?;
+    let mut plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    if plan.host.nvme_expert_bytes == 0 {
+        return Err("the floor arm's plan pages no routed expert on the NVMe tier".into());
+    }
+    plan.host.nvme_arena_bytes = arena;
+    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 1)?;
+    let mut s = Session::from_model(model, CTX as u32);
+    let tier = s
+        .model()
+        .body(NAME)?
+        .nvme_tier()
+        .cloned()
+        .ok_or("the floor arm's load built no arena")?;
+    let slots = tier.stats().slots_per_layer;
+    let r0 = tier.reader_stats();
+    let Out::Logits { argmax, row } = s.prompt(ids, Want::Logits)? else {
+        return Err("a prompt asked for its logits answered an argmax".into());
+    };
+    let digest = Fnv1a64::default().f32s(row).value();
+    Ok(FloorRun {
+        slots,
+        argmax,
+        digest,
+        reader_units: tier.reader_stats().units - r0.units,
+    })
 }
 
 /// The `stepunion mid` clause's arm: a load made for **two** slots under the
@@ -1367,6 +1465,7 @@ fn run() -> Result<(), GateError> {
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
+    let least = ArenaFloor::of(&plan, ARENA_COLUMNS)?;
     let (layers, experts) = (plan.model.layers, plan.model.experts as u32);
     drop(plan);
 
@@ -1432,6 +1531,38 @@ fn run() -> Result<(), GateError> {
     );
     pass &= split;
 
+    // `refuse` (clause 4), the floor's prompt: an arena of exactly the
+    // floor's slots serves the prompt, bit for bit the all-RAM arm's. A load
+    // or a prompt the floor's arena refuses is the clause's own failure, read
+    // beside the clauses after it.
+    let floor_ok = match floor_arm(path, &machine, residency, host, &ids, least.bytes) {
+        Ok(floor) => {
+            let bits = ram.tokens.first() == Some(&floor.argmax)
+                && ram.digests.first() == Some(&floor.digest);
+            let ok = floor.slots == least.slots && bits && floor.reader_units > 0;
+            println!(
+                "refuse floor-serve: an arena of the floor's {} slots a paged layer (carved {}) \
+                 served the {PROMPT}-position prompt, its argmax and logits row bit for bit the \
+                 all-RAM arm's ({bits}), the fill reader took {} picks of it: {}",
+                least.slots,
+                floor.slots,
+                floor.reader_units,
+                verdict(ok)
+            );
+            ok
+        }
+        Err(e) => {
+            println!(
+                "refuse floor-serve: an arena of the floor's {} slots a paged layer did not serve \
+                 the {PROMPT}-position prompt: {e}: {}",
+                least.slots,
+                verdict(false)
+            );
+            false
+        }
+    };
+    pass &= floor_ok;
+
     let tier = paged.tier.as_ref().ok_or("the paged arm built no arena")?;
     // `room`: the loaded tier's arena, the plan's host need and the churn
     // pool fit the room together, and the plan's headroom is what the room
@@ -1472,13 +1603,11 @@ fn run() -> Result<(), GateError> {
             .footprint
             .as_ref()
             .ok_or("the paged arm read no footprint")?;
-        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
-        let prompt_bound = f.layers as u64 * cpus * 2 * ra;
         let steps_bound = paged.landed as u64 * 15 * ra / 2;
         // A page past the ones checked one by one counts held.
         let held = f.held.iter().filter(|&&h| h).count() as u64 + f.first.past;
         let base_ok = f.base.total > 0 && held == 0;
-        let prompt_ok = f.prompt.interior <= prompt_bound;
+        let prompt_ok = f.prompt.interior == 0;
         let steps_ok = f.steps.interior <= steps_bound;
         let footprint = base_ok && prompt_ok && steps_ok;
         for ((p, h), at) in f
@@ -1515,8 +1644,8 @@ fn run() -> Result<(), GateError> {
              (read_ahead_kb), an edge band of {} pages at each run end (printed, not judged); \
              in the interiors {} after the tier's own drop (printed), {held} of them held \
              through a second drop ({} past the {HELD_CHECKED} checked one by one, counted \
-             held; want 0: {}), {} after the prompt \
-             (at most {} layers x {cpus} readers x 2R = {prompt_bound}: {}), {} after {STEPS} \
+             held; want 0: {}), {} after the prompt (want 0: the union reads each tier id \
+             from its slot: {}), {} after {STEPS} \
              steps (at most {} flips x 15R/2 = {steps_bound}: {}); in the bands {} / {} / {}; \
              the prompt's drops {} calls, {:.1} ms on the dropper's thread beside the \
              prompt's {:.1} ms ({:.2} %): {}",
@@ -1531,7 +1660,6 @@ fn run() -> Result<(), GateError> {
                 "held after the tier's own drop: another mapper, or a page the drop cannot take"
             },
             f.prompt.interior,
-            f.layers,
             if prompt_ok {
                 "ok"
             } else {
@@ -1776,6 +1904,7 @@ fn run() -> Result<(), GateError> {
     // `mid-p0-s1`, whose flips land under the passes. The two arms' loads and
     // arena go first.
     let mut census = std::mem::take(&mut paged.census);
+    let prompt_fill = paged.prompt_fill.take();
     drop((paged, ram));
     let step = stepunion_arm(path, &machine, host, &ids, &probe, band)?;
     let solo_bits = !step.tokens.is_empty()
@@ -1863,6 +1992,24 @@ fn run() -> Result<(), GateError> {
     for (phase, tokens, c) in &census {
         census_record(phase, c).print();
         census_ok &= c.picks > 0 && c.adds_up() && c.tokens == *tokens as u64;
+        if *phase == "prompt" {
+            // The prompt's union reads each tier id from its arena slot: the
+            // arena's picks and fills are there, and no drop ran, since no
+            // mapping page of a tier id was read for one to drop. Its `file`
+            // picks are the plan's host segment's.
+            let slots = c.arena > 0 && c.fill_bytes > 0 && c.drops == 0;
+            println!(
+                "census prompt: the union read {} picks from arena slots after {:.2} GB of fills \
+                 and {} from the mapping (the plan's host segment's), {} drops (want arena and \
+                 fills above 0 and no drop): {}",
+                c.arena,
+                c.fill_bytes as f64 / 1e9,
+                c.file,
+                c.drops,
+                verdict(slots)
+            );
+            census_ok &= slots;
+        }
         let per = (*tokens).max(1) as f64;
         println!(
             "census {phase}: {tokens} tokens run (the census counts {}); a token {:.1} picks: card \
@@ -1908,6 +2055,26 @@ fn run() -> Result<(), GateError> {
         verdict(pool_ok)
     );
     pass &= pool_ok;
+    let fill = prompt_fill
+        .as_ref()
+        .ok_or("the paged arm read no prompt fills")?;
+    let on_reader = fill.fills > 0 && fill.reader_units * 100 >= fill.fills * 99;
+    println!(
+        "pool: the prompt's {} fills ({:.2} GB, {:.1} ms summed over the batches' own walls, \
+         {:.2} GB/s) ran {} picks in {} batches on the fill reader (want at least 99 % of the \
+         fills): {}; the caller blocked in {} waits for {:.1} ms of the prompt's {:.1} ms",
+        fill.fills,
+        fill.bytes as f64 / 1e9,
+        fill.fill_ns as f64 / 1e6,
+        fill.bytes as f64 / fill.fill_ns.max(1) as f64,
+        fill.reader_units,
+        fill.reader_jobs,
+        verdict(on_reader),
+        fill.reader_waits,
+        fill.reader_wait_ns as f64 / 1e6,
+        fill.prompt_ns as f64 / 1e6
+    );
+    pass &= on_reader;
 
     if pass {
         println!("{NAME}: every clause passed");
@@ -1957,7 +2124,7 @@ fn refuse_clauses(
     );
     // The arena's floor at load (`slots_of`, the placement's `ArenaFloor`):
     // an arena of the routed width less one slot sets, and of the floor's
-    // own slots less one (the lane claim's), each refused by name with the
+    // own slots less one (the union's), each refused by name with the
     // floor's terms; the floor's own bytes load, carve exactly its slots,
     // and carve the slot set the placement counts — the window geometry's
     // one owner.
@@ -1967,8 +2134,9 @@ fn refuse_clauses(
             let text = e.to_string();
             let named = text.contains(&format!("carves {slots} slots a paged layer"))
                 && text.contains(&format!(
-                    "under the floor of {} slots ({} × {} ids a call + {} lane claims",
-                    least.slots, least.k, least.columns, least.lanes
+                    "under the floor of {} slots (the larger of {} × {} ids a call + {} lane \
+                     claims and {} for a union in batches",
+                    least.slots, least.k, least.columns, least.lanes, least.union
                 ));
             println!("refuse floor: {} B: {text}", slots * least.slot_set);
             named
@@ -1983,13 +2151,13 @@ fn refuse_clauses(
         least.slot_set,
         verdict(floor_k)
     );
-    let floor_lane = named(least.slots - 1);
+    let floor_union = named(least.slots - 1);
     println!(
-        "refuse floor-lane: an arena of {} × {} B (the floor less its lane claim) is refused at \
-         load by name: {}",
+        "refuse floor-union: an arena of {} × {} B (the floor, a union's two batches and the \
+         lane's claim, less one slot) is refused at load by name: {}",
         least.slots - 1,
         least.slot_set,
-        verdict(floor_lane)
+        verdict(floor_union)
     );
     let accepted = match with_arena(least.bytes) {
         Ok(Some(t)) => {
@@ -2035,5 +2203,5 @@ fn refuse_clauses(
             true
         }
     };
-    Ok(floor && slot && floor_k && floor_lane && accepted && probe)
+    Ok(floor && slot && floor_k && floor_union && accepted && probe)
 }

@@ -2614,6 +2614,14 @@ pub const ARENA_COLUMNS: u64 = 1;
 /// that finds every candidate pinned is refused by name.
 pub const ARENA_LANE_CLAIMS: u64 = 1;
 
+/// The experts of the NVMe tier's arena one batch of a prompt union holds:
+/// the unit a claim, a fill and a pin move in. A union over more of a
+/// layer's arena ids than its slots less two batches runs in batches, each
+/// pinned while it computes and the next claimed and filled beside it, so
+/// two batches are pinned at once ([`ArenaFloor::union`]). The model side's
+/// batched union and the arena's floor read this one value.
+pub const UNION_BATCH_IDS: u64 = 16;
+
 /// The bytes one part of `len` bytes takes in an arena slot: the part and
 /// the two partial pages an aligned read of it can span, in whole
 /// [`ARENA_ALIGN`] pages. The one shape of a slot's window, which the
@@ -2626,7 +2634,9 @@ pub fn arena_window_bytes(len: u64) -> u64 {
 /// The NVMe tier arena's floor: the slots a paged layer needs so that one
 /// call reads every distinct id it names from its own slot while the lane
 /// claims beside it take others — the call's `k × columns` ids and the
-/// lanes — and their bytes over one slot of every layer the arena may page.
+/// lanes — or, for a prompt union run in batches, the two batches it pins
+/// at once and the lane's claim ([`ArenaFloor::union`]), whichever is
+/// larger, and their bytes over one slot of every layer the arena may page.
 /// The one owner of the floor: the split dial gives no arena under it
 /// ([`nvme_arena_of`]), and the arena's carve at load refuses a budget
 /// under its slots.
@@ -2643,7 +2653,11 @@ pub struct ArenaFloor {
     /// One slot of every layer the host leg serves routed experts of, each
     /// part in its window ([`arena_window_bytes`]).
     pub slot_set: u64,
-    /// `k × columns + lanes`.
+    /// The slots a prompt union run in batches holds at once: two batches
+    /// ([`UNION_BATCH_IDS`]) and the lane's claim ([`ARENA_LANE_CLAIMS`],
+    /// whether or not a lane runs: the union's own refusal counts it so).
+    pub union: u64,
+    /// The larger of `k × columns + lanes` and `union`.
     pub slots: u64,
     /// `slots × slot_set`.
     pub bytes: u64,
@@ -2665,16 +2679,19 @@ impl ArenaFloor {
                 "{k} × {columns} ids + {lanes} lane claims over a {slot_set} B slot set pass u64"
             ),
         };
-        let slots = k
+        let call = k
             .checked_mul(columns)
             .and_then(|ids| ids.checked_add(lanes))
             .ok_or_else(past)?;
+        let union = 2 * UNION_BATCH_IDS + ARENA_LANE_CLAIMS;
+        let slots = call.max(union);
         let bytes = slots.checked_mul(slot_set).ok_or_else(past)?;
         Ok(ArenaFloor {
             k,
             columns,
             lanes,
             slot_set,
+            union,
             slots,
             bytes,
         })
@@ -2719,9 +2736,9 @@ impl fmt::Display for ArenaFloor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} slots a paged layer ({} × {} ids a call + {} lane claims) × {} B a slot of every \
-             paged layer = {} B",
-            self.slots, self.k, self.columns, self.lanes, self.slot_set, self.bytes
+            "{} slots a paged layer (the larger of {} × {} ids a call + {} lane claims and {} for \
+             a union in batches) × {} B a slot of every paged layer = {} B",
+            self.slots, self.k, self.columns, self.lanes, self.union, self.slot_set, self.bytes
         )
     }
 }
@@ -3368,6 +3385,35 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The floor is the larger of a call's `k × columns + lanes` and the
+    /// batched union's two batches and the lane claim, and the union's term
+    /// counts the lane claim whether or not a lane runs: the model side's
+    /// refusal of a union under it (`TierError::BatchFloor`) never reads the
+    /// plan's lanes.
+    #[test]
+    fn the_floor_carries_the_batched_unions_pins() {
+        let union = 2 * UNION_BATCH_IDS + ARENA_LANE_CLAIMS;
+        let slot_set = 1 << 20;
+        // The routed width a call names, one column, a lane: under the union.
+        let narrow = ArenaFloor::new(10, 1, 1, slot_set).expect("a floor");
+        assert_eq!((narrow.union, narrow.slots), (union, union));
+        assert_eq!(narrow.bytes, union * slot_set);
+        // No lane runs: the union's term still counts the claim.
+        let no_lane = ArenaFloor::new(10, 1, 0, slot_set).expect("a floor");
+        assert_eq!(no_lane.slots, union);
+        // A call wider than the union's pins: its own term.
+        let wide = ArenaFloor::new(16, 3, 1, slot_set).expect("a floor");
+        assert_eq!((wide.union, wide.slots), (union, 16 * 3 + 1));
+        assert_eq!(wide.bytes, wide.slots * slot_set);
+        let text = narrow.to_string();
+        assert!(
+            text.contains("33 slots a paged layer") && text.contains("33 for a union in batches"),
+            "{text}"
+        );
+        // Past u64 is refused by name, not wrapped.
+        assert!(ArenaFloor::new(u64::MAX, 2, 0, 1).is_err());
+    }
 
     /// A card running `layers`, with the head and the token embedding as
     /// given; its byte figures play no part in the stage map.

@@ -1083,7 +1083,8 @@ pub const UNION_TAIL_MAX_COLS: usize = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
 /// the unit a claim, a fill and a pin move in ([`HostLayer::experts_union_into`]).
 /// A call whose arena ids are over the layer's slots less two batches runs in
 /// batches, and the layer's slots must hold two of them and the lane's claim.
-pub const UNION_BATCH_IDS: usize = 16;
+/// The placement's value, which its arena floor counts.
+pub const UNION_BATCH_IDS: usize = crate::placement::UNION_BATCH_IDS as usize;
 
 /// The listed slots — (expert, column) pairs, a column once per expert — of
 /// one batch at its worst, every column listing `n_used` experts: the least

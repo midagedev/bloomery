@@ -1,0 +1,585 @@
+//! The NVMe tier's fill reader: threads the tier owns, started at its build,
+//! that run a fill's units (one pick's reads a unit) off the caller. Each
+//! thread is blocked in one read at a time, so the threads are the queue
+//! depth the drive is read at. They never take the pool's dispatch lock, the
+//! books' lock or wait on the card: a job is its own data (the mapping, the
+//! files, the spans), and its completion is a latch the caller waits on.
+//!
+//! One queue, by rank: a job of a lower rank is taken before every job of a
+//! higher one, first come first served within a rank. A job's units are taken
+//! in order, so the queue holds one front job at a time and the threads that
+//! find it taken go on to the next.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use crate::GpuError;
+
+/// The work of one unit of a job: a pick's reads. Runs on a reader thread.
+type Unit = Box<dyn Fn(usize) -> Result<(), GpuError> + Send + Sync>;
+
+/// Why a job's unit failed: the first failure of the job, by the unit's index.
+#[derive(Debug)]
+pub(super) struct Failure {
+    pub unit: usize,
+    pub error: GpuError,
+}
+
+/// A fill in flight: `units` units of work, each run once on some reader
+/// thread, and the latch [`Reader::wait`] blocks on.
+pub(super) struct Job {
+    units: usize,
+    run: Unit,
+    state: Mutex<JobState>,
+    done: Condvar,
+}
+
+struct JobState {
+    /// Units not yet finished (run, failed or cancelled).
+    left: usize,
+    /// The first failure; the units after it are skipped, not run.
+    failed: Option<Failure>,
+    /// The first unit's start and the last unit's end: the job's own wall.
+    first: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl Job {
+    /// A job of `units` units, each `run(unit)` once.
+    pub(super) fn new(
+        units: usize,
+        run: impl Fn(usize) -> Result<(), GpuError> + Send + Sync + 'static,
+    ) -> Job {
+        Job {
+            units,
+            run: Box::new(run),
+            state: Mutex::new(JobState {
+                left: units,
+                failed: None,
+                first: None,
+                last: None,
+            }),
+            done: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, JobState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One unit finished as `result`: the first failure is kept, the job's
+    /// last end moves, and the latch opens when no unit is left.
+    fn finish_unit(&self, unit: usize, result: Result<(), GpuError>, started: Option<Instant>) {
+        let mut s = self.lock();
+        if let Err(error) = result {
+            s.failed.get_or_insert(Failure { unit, error });
+        }
+        if let Some(t) = started {
+            s.first.get_or_insert(t);
+            s.last = Some(Instant::now());
+        }
+        s.left -= 1;
+        if s.left == 0 {
+            self.done.notify_all();
+        }
+    }
+
+    /// Units `from ..` will never run, the tier having stopped: they finish
+    /// as the failure `error` names, so a waiter is released.
+    fn cancel(&self, from: usize, error: impl Fn() -> GpuError) {
+        for unit in from..self.units {
+            self.finish_unit(unit, Err(error()), None);
+        }
+    }
+
+    /// Whether a unit of the job still runs or waits: the job's latch is
+    /// open.
+    fn is_open(&self) -> bool {
+        self.lock().left > 0
+    }
+}
+
+/// What the readers count ([`Reader::stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReaderStats {
+    /// Jobs submitted, and their units (picks) — the fills that ran off the
+    /// caller.
+    pub jobs: u64,
+    pub units: u64,
+    /// Waits that found their job unfinished, and the wall they blocked
+    /// (ns): the part of the fills the caller's compute did not hide.
+    pub waits: u64,
+    pub wait_ns: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    jobs: AtomicU64,
+    units: AtomicU64,
+    waits: AtomicU64,
+    wait_ns: AtomicU64,
+}
+
+/// A job waiting for its units to be taken: `next` is the first unit no
+/// thread took yet.
+struct Entry {
+    rank: u8,
+    job: Arc<Job>,
+    next: usize,
+}
+
+struct Queue {
+    /// Jobs with a unit still to take, the front one first: by rank, then
+    /// by arrival.
+    jobs: VecDeque<Entry>,
+    stop: bool,
+    /// Threads running their loop.
+    alive: usize,
+}
+
+struct Shared {
+    queue: Mutex<Queue>,
+    /// Signalled when a job arrives or the reader stops.
+    work: Condvar,
+    /// Signalled when a thread leaves its loop.
+    exited: Condvar,
+    /// Jobs submitted and not finished: a stop that finds one open has a
+    /// ticket that outlived the tier.
+    open: Mutex<Vec<Arc<Job>>>,
+    counters: Counters,
+}
+
+impl Shared {
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A reader thread's loop: take the front job's next unit, run it, until
+    /// the reader stops. A unit that panics fails its job by name; the
+    /// thread goes on.
+    fn work(&self) {
+        let mut q = self.queue();
+        loop {
+            if q.stop {
+                break;
+            }
+            let Some(front) = q.jobs.front_mut() else {
+                q = self.work.wait(q).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let unit = front.next;
+            front.next += 1;
+            let job = Arc::clone(&front.job);
+            if front.next == job.units {
+                q.jobs.pop_front();
+            }
+            drop(q);
+            self.run_unit(&job, unit);
+            q = self.queue();
+        }
+        q.alive -= 1;
+        self.exited.notify_all();
+    }
+
+    fn run_unit(&self, job: &Job, unit: usize) {
+        if job.lock().failed.is_some() {
+            // A job that failed runs no more of its units.
+            job.finish_unit(unit, Ok(()), None);
+            return;
+        }
+        let started = Instant::now();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)(unit)));
+        let result = ran.unwrap_or_else(|p| {
+            let what = p
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string payload".to_string());
+            Err(GpuError::protocol(
+                "NvTier::fill",
+                format!("a fill thread panicked in unit {unit}: {what}"),
+            ))
+        });
+        job.finish_unit(unit, result, Some(started));
+    }
+}
+
+/// Why [`Reader::stop`] could not end cleanly.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StopError {
+    /// Jobs were still open: a ticket outlived the tier. Their queued units
+    /// were cancelled and the running ones ended before the threads joined.
+    Open { jobs: usize },
+    /// Threads still read past the bound: a read the drive did not return.
+    Stuck { threads: usize, bound: Duration },
+}
+
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopError::Open { jobs } => write!(
+                f,
+                "the NVMe tier's fill reader stopped with {jobs} batch fill(s) still open: a \
+                 ticket outlived the tier"
+            ),
+            StopError::Stuck { threads, bound } => write!(
+                f,
+                "the NVMe tier's fill reader still has {threads} thread(s) in a read after {} s",
+                bound.as_secs()
+            ),
+        }
+    }
+}
+
+/// The readers: `threads` of them, a queue by rank and the counters.
+pub(super) struct Reader {
+    shared: Arc<Shared>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Reader {
+    /// `threads` reader threads named `name`-`i`, started now. Refused by
+    /// name: a thread the host would not start.
+    pub(super) fn start(threads: usize, name: &str) -> Result<Reader, GpuError> {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                jobs: VecDeque::new(),
+                stop: false,
+                alive: 0,
+            }),
+            work: Condvar::new(),
+            exited: Condvar::new(),
+            open: Mutex::new(Vec::new()),
+            counters: Counters::default(),
+        });
+        let mut handles = Vec::with_capacity(threads);
+        for i in 0..threads {
+            shared.queue().alive += 1;
+            // Floating: the tier may be built on a thread pinned to one cpu,
+            // whose mask a plain spawn would hand all of the readers.
+            let spawned = threads::helper::spawn_helper(
+                &format!("{name}-{i}"),
+                threads::helper::Placement::Float,
+                {
+                    let shared = Arc::clone(&shared);
+                    move || shared.work()
+                },
+            );
+            match spawned {
+                Ok((h, _)) => handles.push(h),
+                Err(e) => {
+                    let reader = Reader {
+                        shared,
+                        handles: Mutex::new(handles),
+                    };
+                    reader.shared.queue().alive -= 1;
+                    // Stops the threads already started before the refusal.
+                    let _ = reader.stop(Duration::from_secs(10));
+                    return Err(GpuError::shape(
+                        "NvTier::of_paged",
+                        format!("the fill reader's thread {i}: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(Reader {
+            shared,
+            handles: Mutex::new(handles),
+        })
+    }
+
+    /// Queue `job` at `rank`: its units run on the reader threads, after the
+    /// jobs of a lower or equal rank already queued. Refused by name once
+    /// the reader has stopped.
+    pub(super) fn submit(&self, rank: u8, job: Job) -> Result<Arc<Job>, GpuError> {
+        let units = job.units;
+        let job = Arc::new(job);
+        let mut q = self.shared.queue();
+        if q.stop {
+            return Err(GpuError::protocol(
+                "NvTier::prefetch_pinned",
+                "a fill queued after the tier's fill reader stopped".to_string(),
+            ));
+        }
+        let c = &self.shared.counters;
+        c.jobs.fetch_add(1, Ordering::Relaxed);
+        c.units.fetch_add(units as u64, Ordering::Relaxed);
+        {
+            let mut open = self.shared.open.lock().unwrap_or_else(|e| e.into_inner());
+            open.retain(|j| j.is_open());
+            open.push(Arc::clone(&job));
+        }
+        if units > 0 {
+            let at = q.jobs.partition_point(|e| e.rank <= rank);
+            q.jobs.insert(
+                at,
+                Entry {
+                    rank,
+                    job: Arc::clone(&job),
+                    next: 0,
+                },
+            );
+            drop(q);
+            self.shared.work.notify_all();
+        }
+        Ok(job)
+    }
+
+    /// Block until every unit of `job` has finished: the job's wall (ns, its
+    /// first unit's start to its last unit's end), or its first failure. The
+    /// jobs' own failures reach the caller here, never as a panic on a
+    /// reader.
+    pub(super) fn wait(&self, job: &Job) -> Result<u64, Failure> {
+        let mut s = job.lock();
+        if s.left > 0 {
+            let t0 = Instant::now();
+            while s.left > 0 {
+                s = job.done.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            let c = &self.shared.counters;
+            c.waits.fetch_add(1, Ordering::Relaxed);
+            c.wait_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        if let Some(f) = s.failed.take() {
+            return Err(f);
+        }
+        Ok(match (s.first, s.last) {
+            (Some(a), Some(b)) => b.duration_since(a).as_nanos() as u64,
+            _ => 0,
+        })
+    }
+
+    /// The readers' counters.
+    pub(super) fn stats(&self) -> ReaderStats {
+        let c = &self.shared.counters;
+        ReaderStats {
+            jobs: c.jobs.load(Ordering::Relaxed),
+            units: c.units.load(Ordering::Relaxed),
+            waits: c.waits.load(Ordering::Relaxed),
+            wait_ns: c.wait_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stop the readers and join them within `bound`: queued units are
+    /// cancelled, a unit already reading ends, then the threads leave.
+    /// Refused by name: a job still open (a ticket outlived the tier), and
+    /// threads still in a read past the bound — those are left to leave on
+    /// their own, since what a job holds is its own, never freed under it.
+    pub(super) fn stop(&self, bound: Duration) -> Result<(), StopError> {
+        let open = {
+            let mut open = self.shared.open.lock().unwrap_or_else(|e| e.into_inner());
+            open.retain(|j| j.is_open());
+            open.len()
+        };
+        let cancelled = {
+            let mut q = self.shared.queue();
+            q.stop = true;
+            std::mem::take(&mut q.jobs)
+        };
+        self.shared.work.notify_all();
+        for e in cancelled {
+            e.job.cancel(e.next, || {
+                GpuError::protocol(
+                    "NvTier::fill",
+                    "the tier stopped with this batch's fill queued".to_string(),
+                )
+            });
+        }
+        let deadline = Instant::now() + bound;
+        let mut q = self.shared.queue();
+        while q.alive > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(StopError::Stuck {
+                    threads: q.alive,
+                    bound,
+                });
+            };
+            q = self
+                .shared
+                .exited
+                .wait_timeout(q, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        drop(q);
+        let handles = std::mem::take(&mut *self.handles.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
+            // A thread that panicked outside a unit has nothing left to run.
+            let _ = h.join();
+        }
+        if open > 0 {
+            return Err(StopError::Open { jobs: open });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        // A reader dropped on its own (a build that refused) leaves no
+        // thread behind; the tier's drop has stopped its own, so this is a
+        // second, clean stop.
+        let _ = self.stop(Duration::from_secs(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Failure, Job, Reader, StopError};
+    use crate::GpuError;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A unit that reports its start on `started` and holds until `release`
+    /// answers: the test's latch, in place of a sleep.
+    fn held(
+        started: mpsc::Sender<usize>,
+        release: mpsc::Receiver<()>,
+    ) -> impl Fn(usize) -> Result<(), GpuError> + Send + Sync + 'static {
+        let release = Mutex::new(release);
+        move |unit| {
+            started.send(unit).expect("the test listens");
+            release
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the test releases the unit");
+            Ok(())
+        }
+    }
+
+    /// A job of a lower rank is taken before every queued job of a higher
+    /// one, and the units of a rank in arrival order. One thread, so the
+    /// order the units start in is the order the queue pops them.
+    #[test]
+    fn the_reader_takes_prompt_fills_first() {
+        let reader = Reader::start(1, "test-fill").unwrap();
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tagged = |tag: &'static str, log: &Arc<Mutex<Vec<&'static str>>>| {
+            let log = Arc::clone(log);
+            move |_unit: usize| -> Result<(), GpuError> {
+                log.lock().unwrap().push(tag);
+                Ok(())
+            }
+        };
+        // The thread is held by a first job, so the next two queue behind it.
+        let first = reader
+            .submit(1, Job::new(1, held(started_tx, release)))
+            .unwrap();
+        assert_eq!(started.recv().unwrap(), 0);
+        let other = reader
+            .submit(1, Job::new(1, tagged("other", &log)))
+            .unwrap();
+        let other_later = reader
+            .submit(1, Job::new(1, tagged("other-later", &log)))
+            .unwrap();
+        let prompt = reader
+            .submit(0, Job::new(1, tagged("prompt", &log)))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        for j in [&first, &other, &other_later, &prompt] {
+            assert!(reader.wait(j).is_ok());
+        }
+        assert_eq!(*log.lock().unwrap(), ["prompt", "other", "other-later"]);
+        reader.stop(Duration::from_secs(10)).unwrap();
+    }
+
+    /// The first failing unit is the job's failure, by its index, and the
+    /// units after it do not run; the reader thread goes on, a panic in a
+    /// unit included, which reaches the wait as a named failure.
+    #[test]
+    fn a_jobs_first_failure_skips_its_later_units() {
+        let reader = Reader::start(1, "test-fill").unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let job = {
+            let ran = Arc::clone(&ran);
+            Job::new(4, move |u| {
+                ran.lock().unwrap().push(u);
+                if u == 1 {
+                    return Err(GpuError::shape("test", "a short read".to_string()));
+                }
+                Ok(())
+            })
+        };
+        let job = reader.submit(0, job).unwrap();
+        let Failure { unit, error } = reader.wait(&job).unwrap_err();
+        assert_eq!(unit, 1);
+        assert!(error.to_string().contains("a short read"), "{error}");
+        assert_eq!(*ran.lock().unwrap(), [0, 1], "units 2 and 3 were skipped");
+        let boom = reader
+            .submit(0, Job::new(1, |_| panic!("a bad slice")))
+            .unwrap();
+        let e = reader.wait(&boom).unwrap_err().error.to_string();
+        assert!(e.contains("panicked") && e.contains("a bad slice"), "{e}");
+        let after = reader.submit(0, Job::new(1, |_| Ok(()))).unwrap();
+        assert!(reader.wait(&after).is_ok(), "the thread outlived the panic");
+        reader.stop(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A stop cancels what is queued and names a job still open; a stop with
+    /// every job finished is clean; a fill queued after it is refused by
+    /// name.
+    #[test]
+    fn a_stop_names_an_open_ticket_and_refuses_later_fills() {
+        let clean = Reader::start(2, "test-fill").unwrap();
+        let ok = clean.submit(0, Job::new(3, |_| Ok(()))).unwrap();
+        assert!(clean.wait(&ok).is_ok());
+        assert_eq!(clean.stop(Duration::from_secs(10)), Ok(()));
+        let e = clean.submit(0, Job::new(1, |_| Ok(()))).err().unwrap();
+        assert!(e.to_string().contains("stopped"), "{e}");
+
+        let reader = Reader::start(1, "test-fill").unwrap();
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let running = reader
+            .submit(0, Job::new(1, held(started_tx, release)))
+            .unwrap();
+        assert_eq!(started.recv().unwrap(), 0);
+        let queued = reader.submit(0, Job::new(2, |_| Ok(()))).unwrap();
+        // Releases the running unit from another thread once the stop is
+        // waiting on it.
+        let (releaser, _) = threads::helper::spawn_helper(
+            "test-release",
+            threads::helper::Placement::Float,
+            move || release_tx.send(()).unwrap(),
+        )
+        .unwrap();
+        let stopped = reader.stop(Duration::from_secs(10));
+        releaser.join().unwrap();
+        assert_eq!(stopped, Err(StopError::Open { jobs: 2 }));
+        let cancelled = reader.wait(&queued).unwrap_err().error.to_string();
+        assert!(cancelled.contains("queued"), "{cancelled}");
+        assert!(reader.wait(&running).is_ok());
+    }
+
+    /// A thread held in a read past the bound is a named refusal, not a
+    /// hang; the read, once it returns, finishes its job.
+    #[test]
+    fn a_stop_past_its_bound_names_the_stuck_threads() {
+        let reader = Reader::start(1, "test-fill").unwrap();
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let job = reader
+            .submit(0, Job::new(1, held(started_tx, release)))
+            .unwrap();
+        assert_eq!(started.recv().unwrap(), 0);
+        let stopped = reader.stop(Duration::from_millis(50));
+        assert_eq!(
+            stopped,
+            Err(StopError::Stuck {
+                threads: 1,
+                bound: Duration::from_millis(50)
+            })
+        );
+        release_tx.send(()).unwrap();
+        assert!(reader.wait(&job).is_ok(), "what a job holds is its own");
+        reader.stop(Duration::from_secs(10)).unwrap();
+    }
+}
