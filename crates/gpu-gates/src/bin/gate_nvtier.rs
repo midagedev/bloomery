@@ -24,19 +24,28 @@
 //!   with exactly its slots and the placement's slot set, and the
 //!   direct-read probe of a mount without direct IO, by name.
 //! - `residency` (clause 5): the paged plan's unset rule resolves `off`
-//!   ([`residency38`]: the plan pages through the tier's arena, and a
-//!   promotion would copy a paged expert through the file mapping, cold
-//!   after the tier's drops), and both arms run a set
+//!   ([`residency38`]: the plan pages through the tier's arena, where a
+//!   promotion copies an expert from its slot when the arena holds it and
+//!   through the file mapping, cold after the tier's drops, when it does
+//!   not), and both arms run a set
 //!   `mid-p0-s1` with an empty churn pool (`ChurnPool::of` leaves the paged
 //!   stacks out: the arena serves their victims): flips land on the paged
 //!   arm, and its `unresident` and `faulting` are 0 — bug catchers,
 //!   structurally unreachable once the seam serves the victims the arena
-//!   holds from its books. Its `late` flips are printed, one line each from
-//!   the machine's debug ring, with the five terms that sum to a late
-//!   copy's issue→boundary time — the lane queue, the victim's preparation,
-//!   the staging wait, the source read, the copy stream — and the ring is
-//!   held to them: it carries every late flip the passes counted, or its
-//!   own overflow count names the rest (a bug catcher).
+//!   holds from its books. Its `late` flips are at most [`LATE_MAX`] (the
+//!   PIN below) and printed, one line each from the machine's debug ring,
+//!   with the five terms that sum to a late copy's issue→boundary time —
+//!   the lane queue, the victim's preparation, the staging wait, the source
+//!   read, the copy stream — and the ring is held to them: it carries every
+//!   late flip the passes counted, or its own overflow count names the rest
+//!   (a bug catcher). The flips that land at one boundary are a plan; the
+//!   `plan` lines print the [`PLANS_SHOWN`] with the least window / span,
+//!   the window the lane had (the first flip's issue to the boundary) over
+//!   the span it took (that issue to the last copy staged), and the `plans`
+//!   line the least ratio over every plan, the plans under [`PLAN_MARGIN`],
+//!   and the steps' wall and sums: the boundaries' wait, the lane's
+//!   preparation and staging, the victims the lane prepared, the slots the
+//!   tier filled and the landings freed.
 //! - `room` (clause 6): the loaded tier's arena, the plan's host need and
 //!   the churn pool the residency holds fit the room together, and the
 //!   plan's headroom is what the room leaves past the arena and the need.
@@ -99,22 +108,47 @@
 //!   so by none: the step port's unions read the arena, and a two-column
 //!   decode leaves no mapping page behind (the old reader keeps every page
 //!   it reads). The arena's misses and fills move over the passes: under
-//!   `off` no lane fills it, so only the step port's unions can.
+//!   `off` no lane fills it, so only the step port's unions can. A second
+//!   such load runs the set `mid-p0-s1` (`stepunion mid`): its flips land
+//!   under the passes, the lane's victim fills and copies racing the
+//!   two-column chain's reads of the arena, and the passes' bits are those of
+//!   the same passes on an all-RAM two-slot load under the same word, as
+//!   clause 1 holds its pair — a flip moves the card's split with the
+//!   schedule, so the solo steps' schedule would sum differently, and the
+//!   two loads run one. Flips landed (as many as the all-RAM load's), none
+//!   unresident or faulting, the arena served the passes; the arm's `late` is
+//!   printed.
+//! - `exclusive` (clause 9): the tiers hold an expert once. A promotion of
+//!   an expert the arena holds filled reads its slot (the file's bytes at
+//!   the arena's skew, the slot pinned against the LRU for the read), and the
+//!   landing frees the slot ([`NvTierStats::releases`], the residency
+//!   machine's `release_host`). Over the paged arm's steps: every slot read
+//!   lends [`EXPERT_PARTS`] parts, the mapping is read only for an expert
+//!   the arena held unfilled when its copy opened, the landings' frees and
+//!   the copies' opens tally within the flips in flight at the span's two
+//!   ends, and the dropper ran no more drops than those mapping reads
+//!   queued. Over the run: the slots the books hold — fills less evictions
+//!   less releases — are the ones the seam finds filled and the resident
+//!   bytes hold, within the fills the lane's threads had in flight at the
+//!   read.
 //! - `census` (the instrument the next rounds read): each phase's
 //!   `tier census` record — the paged arm's prompt call and its steps, the
-//!   `stepunion` arm's passes — with its picks a token by where they were
+//!   `stepunion` arms' passes — with its picks a token by where they were
 //!   served (the card, the arena, the mapping), the bytes it moved between
 //!   the tiers (the arena's fills, the residency machine's promotions and
 //!   demotions), the dropper's calls and wall and the pool's dispatch waits,
 //!   a token. The bug catchers: every phase's card, arena and file picks sum
 //!   to its picks, and its tokens are the ones the gate ran in it (every
 //!   layer of a paged plan's map pages ids, so every walk serves each).
+//! - `pool` (clause 10): no phase's dispatches waited for another caller's
+//!   job. The chain is the pool's one dispatcher; the lane's victim fills
+//!   read on the lane's own threads ([`NvTier::ensure_here`]), where a fill
+//!   through the pool took the dispatch mutex the chain's host compute holds.
 //!
-//! PIN(2026-10-09): clause 5's `late` is printed, not judged — a set `mid`
-//! on a paged plan promotes a paged expert through the file mapping, read
-//! cold from the drive after the tier's drops, so its copy can miss its
-//! landing; the unset rule runs such a plan `off`, and `late` returns to a
-//! judged 0 with the tiers whose promotions read the arena.
+//! PIN(2026-10-10): clause 5's `late` is judged at most [`LATE_MAX`] = 4 of the flips that landed, where the design's rule judges 0 for a plan whose lane span is at most its window / 1.5; derived, not measured, from the 2026-10-09 train log's late-flip print on the A6000 (552 flips landed, 8 late):
+//! the lane serves a plan's F = 24 flips one after the other, S = queue / ahead a flip, against the plan's window, so a plan's tail is `max(0, F - floor(window / S))`, 1 / 5 / 2 flips at the three plans that were late, the 8 observed. A promotion that reads its arena slot in place of the cold
+//! mapping, and a victim's fill off the pool, cut S, and the chain's dispatch waits leave the windows: the margin window / (F x S) is 1.22 / 1.30 / 1.66 at the three plans, under 1.5 at two of them, so 0 is not derived. The pessimistic corner, a cold read cheaper than derived so that S falls by only a
+//! tenth, leaves a tail of 4 at the worst plan and 0 at the rest. The `plan` lines print the margins a run measures: after the change every run read `late` 0, and every plan read [`PLAN_MARGIN`] or more in all but one run (a loaded box, one plan at 1.12), so 0 is not pinned; a landing batch whose runs read every plan at [`PLAN_MARGIN`] or more takes the bound to 0.
 //!
 //! PIN(2026-10-09): clause 7 judges the runs' interiors, the `2R` bands at
 //! their ends printed, and its base judges the interior pages held through
@@ -156,6 +190,7 @@ use app::Session;
 use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::host::census::TierCensus;
+use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
 use bloomery_gpu::host::nvtier::{DropRuns, NvTier, NvTierStats, advice_disjoint};
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
@@ -197,6 +232,18 @@ const STEP_COLS: usize = 24;
 /// The late flips the residency clause prints, one line each; the ring
 /// holds the rest and counts them.
 const LATE_SHOWN: usize = 32;
+/// The most flips of the paged arm's passes whose copy may miss its landing
+/// (the PIN in the module doc).
+const LATE_MAX: usize = 4;
+/// The landing boundaries' plans the residency clause prints, the worst
+/// ones: a plan is the flips that land at one boundary.
+const PLANS_SHOWN: usize = 8;
+/// The parts of an expert the arena's slot holds and a promotion copies: the
+/// gate, up and down stacks.
+const EXPERT_PARTS: u64 = 3;
+/// The margin the design asks of a plan's window over the lane's span for a
+/// judged 0 of `late` (printed beside each plan).
+const PLAN_MARGIN: f64 = 1.5;
 
 fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
@@ -239,6 +286,29 @@ struct ArmRun {
     tier: Option<Arc<NvTier>>,
     seam: Option<Seam>,
     footprint: Option<Footprint>,
+    /// Every boundary's report in order, the prompt call's and the steps',
+    /// and where the steps' begin.
+    passes: Vec<PassReport>,
+    steps_from: usize,
+    /// Each step's wall, nanoseconds.
+    step_ns: Vec<u64>,
+    /// The tier's and the lane's counters at the steps' start and end, on a
+    /// load with a tier.
+    steps: Option<Span>,
+}
+
+/// The counters of a span: the tier's and the lane's at its start and at
+/// its end.
+struct Span {
+    tier: [NvTierStats; 2],
+    lane: [LaneStats; 2],
+}
+
+impl Span {
+    /// What the tier's counter `of` moved over the span.
+    fn tier(&self, of: fn(&NvTierStats) -> u64) -> u64 {
+        of(&self.tier[1]) - of(&self.tier[0])
+    }
 }
 
 /// Resident pages over the tier's drop runs (`footprint`): those in a run's
@@ -310,11 +380,14 @@ struct Footprint {
     prompt_ns: u64,
 }
 
-/// The residency seam's answers over the ids the arena serves, against the arena's own books.
+/// The residency seam's answers over the ids the arena serves, against the arena's own books,
+/// and the tier's counters just before and just after the read: the lane's threads keep filling
+/// while it runs.
 struct Seam {
     checked: usize,
     filled: usize,
     wrong: usize,
+    counters: [NvTierStats; 2],
 }
 
 /// The plan of `file` on `machine` with `room` given, or the machine's own
@@ -419,6 +492,10 @@ fn arm(
         tier: tier.clone(),
         seam: None,
         footprint: None,
+        passes: Vec::new(),
+        steps_from: 0,
+        step_ns: Vec::with_capacity(STEPS),
+        steps: None,
     };
     let note = |s: &mut Session<Body38>, run: &mut ArmRun| -> Result<(), GateError> {
         for (_, r) in take_passes(s)? {
@@ -426,6 +503,7 @@ fn arm(
             run.faulting += r.faulting.count();
             run.late += r.late;
             run.landed += r.landed;
+            run.passes.push(r);
         }
         if let Some(t) = &tier {
             run.resident_max = run.resident_max.max(t.stats().resident_bytes);
@@ -463,8 +541,15 @@ fn arm(
     };
     // The steps' census starts past the footprint's own drops.
     let c1b = census_of(&s)?;
+    run.steps_from = run.passes.len();
+    let span0 = match (&tier, lane_of(&s)?) {
+        (Some(t), Some(l)) => Some((t.stats(), l)),
+        _ => None,
+    };
     for _ in 0..STEPS {
+        let t = Instant::now();
         let out = s.step(next, Want::Logits)?;
+        run.step_ns.push(t.elapsed().as_nanos() as u64);
         if let Out::Logits { row, .. } = out {
             run.digests.push(Fnv1a64::default().f32s(row).value());
         }
@@ -476,6 +561,12 @@ fn arm(
         t.flush()?;
     }
     run.stats = tier.as_ref().map(|t| t.stats());
+    if let (Some((t0, l0)), Some(t1), Some(l1)) = (span0, run.stats, lane_of(&s)?) {
+        run.steps = Some(Span {
+            tier: [t0, t1],
+            lane: [l0, l1],
+        });
+    }
     if let (Some(c0), Some(c1), Some(c1b), Some(c2)) = (c0, c1, c1b, census_of(&s)?) {
         run.census = vec![
             ("prompt", ids.len(), c1.since(&c0)),
@@ -520,6 +611,7 @@ fn seam_of(s: &Session<Body38>, layers: usize, experts: u32) -> Result<Option<Se
         checked: 0,
         filled: 0,
         wrong: 0,
+        counters: [tier.stats(); 2],
     };
     for l in 0..layers {
         for id in 0..experts {
@@ -532,7 +624,19 @@ fn seam_of(s: &Session<Body38>, layers: usize, experts: u32) -> Result<Option<Se
             seam.wrong += usize::from(source.host_resident(l, id)? != held);
         }
     }
+    seam.counters[1] = tier.stats();
     Ok(Some(seam))
+}
+
+/// What the residency machine's lane did since the load
+/// ([`bloomery_gpu::host::swap::SwapMachine::lane_stats`]): `None` on a load
+/// with no machine.
+fn lane_of(s: &Session<Body38>) -> Result<Option<LaneStats>, GateError> {
+    Ok(s.model()
+        .body(NAME)?
+        .hybrid()
+        .swap()
+        .map(|m| m.lane_stats()))
 }
 
 /// The load's tier census since the load (`HostTier::census`): `None` on a
@@ -556,6 +660,60 @@ fn drop_all(tier: &NvTier, regions: &[(usize, DropRuns)]) -> Result<(), GateErro
         tier.drop_layer(layer)?;
     }
     Ok(())
+}
+
+/// The set `mid-p0-s1` the paged arms and the two-slot `mid` arms run.
+const MID: Residency = Residency::Mid {
+    pinned: 0,
+    spares: RESIDENCY38_SPARES,
+};
+
+/// A prompt in each of the two slots of `s`: slot 0's the first window of
+/// the corpus, slot 1's the next — a routing of its own; each slot's argmax.
+fn prompt_slots(s: &mut Session<Body38>, ids: &[u32]) -> Result<[u32; 2], GateError> {
+    let windows = [&ids[..STEP_PROMPT], &ids[STEP_PROMPT..2 * STEP_PROMPT]];
+    let mut out = [0u32; 2];
+    for (slot, p) in windows.iter().enumerate() {
+        s.select_slot(slot)?;
+        out[slot] = s.prompt(p, Want::Argmax)?.argmax();
+    }
+    Ok(out)
+}
+
+/// [`STEP_COLS`] passes of both slots' tokens as one two-column step
+/// ([`Session::step_slots`], the step port's union), the first pass fed
+/// `prompts` and each next the tokens the pass before answered: every token
+/// and logits-row digest (slot-major within a pass), and the tokens each
+/// pass was fed.
+#[allow(
+    clippy::type_complexity,
+    reason = "one pass's three records, each named"
+)]
+fn two_columns(
+    s: &mut Session<Body38>,
+    prompts: [u32; 2],
+) -> Result<(Vec<u32>, Vec<u64>, Vec<[u32; 2]>), GateError> {
+    let mut tokens = Vec::with_capacity(2 * STEP_COLS);
+    let mut digests = Vec::with_capacity(2 * STEP_COLS);
+    let mut fed: Vec<[u32; 2]> = Vec::with_capacity(STEP_COLS);
+    let mut next = prompts;
+    for _ in 0..STEP_COLS {
+        fed.push(next);
+        let out = s.step_slots(&[(0, &next[..1]), (1, &next[1..])])?;
+        for row in s.model().slots_logits()? {
+            digests.push(Fnv1a64::default().f32s(&row).value());
+        }
+        let &[a, b] = out.ids.as_slice() else {
+            return Err(format!(
+                "a two-column pass answered {} tokens, not one a slot",
+                out.ids.len()
+            )
+            .into());
+        };
+        tokens.extend([a, b]);
+        next = [a, b];
+    }
+    Ok((tokens, digests, fed))
 }
 
 /// The `stepunion` arm's run: each slot's prompt argmax and the two-column
@@ -666,14 +824,7 @@ fn stepunion_arm(
         .filter(|&l| tier.covers(l))
         .map(|l| Ok((l, tier.drop_region(l)?)))
         .collect::<Result<Vec<_>, GateError>>()?;
-    // A prompt in each slot: slot 0's the first window of the corpus, slot
-    // 1's the next — a routing of its own.
-    let windows = [&ids[..STEP_PROMPT], &ids[STEP_PROMPT..2 * STEP_PROMPT]];
-    let mut prompts = [0u32; 2];
-    for (slot, p) in windows.iter().enumerate() {
-        s.select_slot(slot)?;
-        prompts[slot] = s.prompt(p, Want::Argmax)?.argmax();
-    }
+    let prompts = prompt_slots(&mut s, ids)?;
     // The prompts' readers done and their residue dropped twice, so the
     // read after the passes names only the passes' own readers.
     tier.flush()?;
@@ -686,26 +837,7 @@ fn stepunion_arm(
     };
     let t0 = tier.stats();
     let c0 = census_of(&s)?.ok_or("the stepunion arm's load took no census")?;
-    let mut tokens = Vec::with_capacity(2 * STEP_COLS);
-    let mut digests = Vec::with_capacity(2 * STEP_COLS);
-    let mut fed: Vec<[u32; 2]> = Vec::with_capacity(STEP_COLS);
-    let mut next = prompts;
-    for _ in 0..STEP_COLS {
-        fed.push(next);
-        let out = s.step_slots(&[(0, &next[..1]), (1, &next[1..])])?;
-        for row in s.model().slots_logits()? {
-            digests.push(Fnv1a64::default().f32s(&row).value());
-        }
-        let &[a, b] = out.ids.as_slice() else {
-            return Err(format!(
-                "a two-column pass answered {} tokens, not one a slot",
-                out.ids.len()
-            )
-            .into());
-        };
-        tokens.extend([a, b]);
-        next = [a, b];
-    }
+    let (tokens, digests, fed) = two_columns(&mut s, prompts)?;
     let flips = take_passes(&mut s)?.iter().map(|(_, r)| r.landed).sum();
     let t1 = tier.stats();
     tier.flush()?;
@@ -721,11 +853,7 @@ fn stepunion_arm(
         s.select_slot(slot)?;
         s.reset()?;
     }
-    let mut solo_prompts = [0u32; 2];
-    for (slot, p) in windows.iter().enumerate() {
-        s.select_slot(slot)?;
-        solo_prompts[slot] = s.prompt(p, Want::Argmax)?.argmax();
-    }
+    let solo_prompts = prompt_slots(&mut s, ids)?;
     let mut solo_tokens = Vec::with_capacity(2 * STEP_COLS);
     let mut solo_digests = Vec::with_capacity(2 * STEP_COLS);
     for pass in &fed {
@@ -752,6 +880,109 @@ fn stepunion_arm(
         before,
         after,
         layers: regions.len(),
+    })
+}
+
+/// The `stepunion mid` arm's run: each slot's prompt argmax and the two-column
+/// passes' tokens and logits-row digests; the flips that landed during the
+/// passes, how many were late and the experts found unresident or faulting
+/// over them; and, on a load with a tier, the arena's misses and fills over
+/// the passes and their tier census.
+struct MidRun {
+    prompts: [u32; 2],
+    tokens: Vec<u32>,
+    digests: Vec<u64>,
+    flips: usize,
+    late: usize,
+    unresident: usize,
+    faulting: usize,
+    served: Option<(u64, u64, TierCensus)>,
+}
+
+/// The `stepunion mid` clause's arm: a load made for **two** slots under the
+/// set `mid-p0-s1`, on the paged plan at [`ROOM`] when `room` is given and
+/// on the all-RAM plan when it is not, a prompt in each slot and then
+/// [`STEP_COLS`] two-column passes: flips land under them, and on the paged
+/// load the lane's victim fills and copies race the two-column chain's reads
+/// of the arena. Both loads run one schedule, so the paged one's bits are
+/// held to the all-RAM one's, as clause 1 holds the one-slot pair. Refused by
+/// name: a plan whose paging does not match `room`, and on the paged load an
+/// arena under the two-column floor.
+fn slots_mid_arm(
+    path: &Path,
+    machine: &Machine,
+    host: HostCfg,
+    ids: &[u32],
+    room: Option<u64>,
+) -> Result<MidRun, GateError> {
+    let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let inputs = inputs_of(&file, room)?;
+    let plan = inputs.plan_with_slots(
+        machine,
+        CTX as u64,
+        &PlanLevers::default(),
+        Experts::Card,
+        2,
+    )?;
+    let kind = if room.is_some() { "paged" } else { "all-RAM" };
+    if (plan.host.nvme_expert_bytes > 0) != room.is_some()
+        || (room.is_some() && plan.host.nvme_arena_bytes == 0)
+    {
+        return Err(format!(
+            "the stepunion mid {kind} arm's two-slot plan pages {} B on the NVMe tier with an \
+             arena of {} B",
+            plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
+        )
+        .into());
+    }
+    let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+    println!(
+        "stepunion mid plan: two slots, the {kind} plan: {} B on the NVMe tier, arena {} B, \
+         residency the set mid-p0-s1",
+        plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
+    );
+    let ub = ubatch_for(CTX)?;
+    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 2)?;
+    let mut s = Session::from_model(model, CTX as u32);
+    s.add_slots(2)?;
+    s.model_mut().body_parts(NAME)?.2.log_residency(0);
+    let tier = s.model().body(NAME)?.nvme_tier().cloned();
+    if let Some(t) = &tier {
+        let wide = ArenaFloor::of(&plan, 2)?;
+        let carved = t.stats().slots_per_layer;
+        if carved < wide.slots {
+            return Err(format!(
+                "the stepunion mid arm's arena carves {carved} slots a paged layer, under its \
+                 two-column floor of {wide}"
+            )
+            .into());
+        }
+    }
+    let prompts = prompt_slots(&mut s, ids)?;
+    take_passes(&mut s)?;
+    let t0 = tier.as_ref().map(|t| t.stats());
+    let c0 = census_of(&s)?;
+    let (tokens, digests, _) = two_columns(&mut s, prompts)?;
+    let passes = take_passes(&mut s)?;
+    let served = match (&tier, t0, c0) {
+        (Some(t), Some(t0), Some(c0)) => {
+            let t1 = t.stats();
+            let census = census_of(&s)?
+                .ok_or("the stepunion mid arm's load took no census")?
+                .since(&c0);
+            Some((t1.misses - t0.misses, t1.fills - t0.fills, census))
+        }
+        _ => None,
+    };
+    Ok(MidRun {
+        prompts,
+        tokens,
+        digests,
+        flips: passes.iter().map(|(_, r)| r.landed).sum(),
+        late: passes.iter().map(|(_, r)| r.late).sum(),
+        unresident: passes.iter().map(|(_, r)| r.unresident.count()).sum(),
+        faulting: passes.iter().map(|(_, r)| r.faulting.count()).sum(),
+        served,
     })
 }
 
@@ -1027,6 +1258,40 @@ fn take_passes(
     Ok(b.take_residency_passes())
 }
 
+/// The flips that land together at one boundary — a plan, issued at one
+/// boundary — with the window the lane had from the first one's issue to the
+/// boundary and the span it took from that issue to the last copy staged.
+struct Plan {
+    boundary: u64,
+    landed: usize,
+    late: usize,
+    window_us: u64,
+    span_us: u64,
+}
+
+impl Plan {
+    /// How many spans the window holds: 1 is the lane just keeping up.
+    fn margin(&self) -> f64 {
+        self.window_us as f64 / self.span_us.max(1) as f64
+    }
+}
+
+/// The plans of `passes`: each boundary that landed flips whose stamps the
+/// machine held ([`PassReport::lane_span_us`]).
+fn plans_of(passes: &[PassReport]) -> Vec<Plan> {
+    passes
+        .iter()
+        .filter(|r| r.landed > 0 && r.lane_span_us > 0)
+        .map(|r| Plan {
+            boundary: r.boundary,
+            landed: r.landed,
+            late: r.late,
+            window_us: r.window_us,
+            span_us: r.lane_span_us,
+        })
+        .collect()
+}
+
 fn run() -> Result<(), GateError> {
     let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
     record::at_main(NAME, record::GATE_NVTIER);
@@ -1057,17 +1322,7 @@ fn run() -> Result<(), GateError> {
     pass &= unset_off;
     // The residency word both arms run: a set `mid-p0-s1`, so the paged
     // arm's flips, the seam and a lane's drops stay held.
-    let residency = residency38(
-        &plan,
-        Lever38::Set(
-            Residency::Mid {
-                pinned: 0,
-                spares: RESIDENCY38_SPARES,
-            },
-            "mid-p0-s1",
-        ),
-        Record::print,
-    )?;
+    let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
     // `room`'s plan terms: the host need, the churn pool the residency
     // holds beside it, and the headroom the split left.
     // PIN(2026-10-09): `HostNeed::bytes` counts the plan's NVMe tier arena,
@@ -1342,27 +1597,136 @@ fn run() -> Result<(), GateError> {
             late.flips.len() - LATE_SHOWN
         );
     }
+    // The landing boundaries' plans, printed: what the lane had (the window)
+    // beside what it took (the span) — a plan whose window is under
+    // `PLAN_MARGIN` spans is one the bound is for, and the run's sums beside
+    // them say where the lane's time went.
+    let steps = paged.steps.as_ref().ok_or("the paged arm read no steps")?;
+    let mut plans = plans_of(&paged.passes);
+    plans.sort_by(|a, b| a.margin().total_cmp(&b.margin()));
+    for p in plans.iter().take(PLANS_SHOWN) {
+        println!(
+            "plan: landed at boundary {} ({} flips, {} late): the window {:.1} ms from the first \
+             issue, the lane's span {:.1} ms to the last copy staged, window / span {:.2}",
+            p.boundary,
+            p.landed,
+            p.late,
+            p.window_us as f64 / 1e3,
+            p.span_us as f64 / 1e3,
+            p.margin()
+        );
+    }
+    let in_steps = &paged.passes[paged.steps_from..];
+    let sum = |of: fn(&PassReport) -> u64| in_steps.iter().map(of).sum::<u64>() as f64 / 1e3;
+    let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len().max(1) as f64 / 1e6;
+    let thin = plans.iter().filter(|p| p.margin() < PLAN_MARGIN).count();
+    println!(
+        "plans: {} landing plans over {} boundaries; window / span at least {:.2}, {} under \
+         {PLAN_MARGIN} (the margin the design asks for a judged 0); over the {STEPS} steps: a \
+         step {:.1} ms, the boundaries' wait {:.1} ms, the lane's prepare {:.1} ms and stage \
+         {:.1} ms (thread time), {} victims the lane prepared, {} slots the tier filled, {} \
+         slots the landings freed",
+        plans.len(),
+        paged.passes.len(),
+        plans.first().map_or(0.0, Plan::margin),
+        thin,
+        mean(&paged.step_ns),
+        sum(|r| r.wait_us),
+        sum(|r| r.prepare_us),
+        sum(|r| r.stage_us),
+        steps.lane[1].victims - steps.lane[0].victims,
+        steps.tier(|t| t.fills),
+        in_steps.iter().map(|r| r.released).sum::<usize>()
+    );
+    let late_in = paged.late <= LATE_MAX;
     let residency_ok = flips && paged.unresident == 0 && paged.faulting == 0;
     println!(
         "residency: under the set mid-p0-s1, flips landed {} (the seam ran: {flips}), unresident \
-         {}, faulting {}: {}; late {} (printed, not judged), the ring holds {} and names {} \
+         {}, faulting {}: {}; late {} (at most {LATE_MAX}: {}), the ring holds {} and names {} \
          dropped (want {} together): {}",
         paged.landed,
         paged.unresident,
         paged.faulting,
         verdict(residency_ok),
         paged.late,
+        verdict(late_in),
         late.flips.len(),
         late.dropped,
         paged.late,
         verdict(late_ok)
     );
-    pass &= residency_ok && late_ok;
+    pass &= residency_ok && late_ok && late_in;
+
+    // `exclusive` (clause 9): a promotion reads the expert's arena slot, and
+    // the landing frees it. Over the steps: every slot read lends its three
+    // parts (the file's bytes at the arena's skew) and a mapping read is the
+    // lane's alone, since an id the arena holds unfilled when its copy opens
+    // reads the file; the landings' frees and the copies' opens tally within
+    // the flips in flight at the span's two ends; and the dropper ran no more
+    // drops than the mapping's reads queued (a slot read leaves no page).
+    // Over the run: the arena's books follow the frees — fills less
+    // evictions less releases is what the seam finds filled and what the
+    // resident bytes hold, within the fills the lane's threads had in flight
+    // when the counters were read.
+    let in_start = paged.passes[..paged.steps_from]
+        .last()
+        .map_or(0, |r| r.in_flight)
+        + in_steps.first().and_then(|r| r.picked).unwrap_or(0);
+    let in_start = in_start as u64;
+    let in_end = in_steps.last().map_or(0, |r| r.in_flight) as u64;
+    let slot_reads = steps.tier(|t| t.slot_reads);
+    let mapping_reads = steps.tier(|t| t.mapping_reads);
+    let slot_parts = steps.tier(|t| t.slot_parts);
+    let freed = steps.tier(|t| t.releases);
+    let found_none = steps.tier(|t| t.release_misses);
+    let drops = steps.tier(|t| t.drops);
+    let opened = slot_reads + mapping_reads;
+    let landed_here = freed + found_none;
+    // A copy opened before an end of the span can lend its parts after it,
+    // at most `LANE_THREADS` copies at each end.
+    let parts_slack = EXPERT_PARTS * LANE_THREADS as u64;
+    let reads_ok = slot_reads > 0 && slot_parts.abs_diff(EXPERT_PARTS * slot_reads) <= parts_slack;
+    let frees_ok = freed > 0 && landed_here <= opened + in_start && opened <= landed_here + in_end;
+    let drops_ok = drops <= mapping_reads + in_start;
+    let covered = (0..layers).filter(|&l| tier.covers(l)).count().max(1) as u64;
+    let slot_bytes = tier.slot_set() / covered;
+    let held_in = |c: &NvTierStats| (c.fills as i64) - (c.evictions as i64) - (c.releases as i64);
+    let (held_a, held_b) = (held_in(&seam.counters[0]), held_in(&seam.counters[1]));
+    let slack = LANE_THREADS as i64;
+    let books_ok = (held_a.min(held_b) - slack..=held_a.max(held_b) + slack)
+        .contains(&(seam.filled as i64))
+        && seam.counters.iter().all(|c| {
+            c.resident_bytes
+                .abs_diff((held_in(c).max(0) as u64) * slot_bytes)
+                <= slack as u64 * slot_bytes
+        });
+    let exclusive = reads_ok && frees_ok && drops_ok && books_ok;
+    println!(
+        "exclusive: over {STEPS} steps the lane's copies opened {opened} reads, {slot_reads} of an \
+         arena slot and {mapping_reads} of the file mapping, the slot reads lending {slot_parts} \
+         parts ({EXPERT_PARTS} a read: {}); the landings freed {freed} slots and found none to \
+         free at {found_none}, against the {opened} opens within the {in_start} flips in flight \
+         at the start and {in_end} at the end: {}; the dropper ran {drops} drops against the \
+         {mapping_reads} mapping reads' ({}); over the run fills - evictions - releases = \
+         {held_a} slots before the seam's read and {held_b} after, the seam finds {} filled and \
+         the arena holds {} B at {slot_bytes} B a slot, within the {slack} fills the lane's \
+         threads can have in flight at a read: {}: {}",
+        verdict(reads_ok),
+        verdict(frees_ok),
+        verdict(drops_ok),
+        seam.filled,
+        seam.counters[1].resident_bytes,
+        verdict(books_ok),
+        verdict(exclusive)
+    );
+    pass &= exclusive;
 
     // `stepunion` (clause 8): the step port's union of two columns on a
     // paged plan — a load of its own made for two slots (the two arms' plan
     // counts one), a prompt in each slot, then two-column passes against the
-    // same sequences stepped alone. The two arms' loads and arena go first.
+    // same sequences stepped alone; and a second such load under the set
+    // `mid-p0-s1`, whose flips land under the passes. The two arms' loads and
+    // arena go first.
     let mut census = std::mem::take(&mut paged.census);
     drop((paged, ram));
     let step = stepunion_arm(path, &machine, host, &ids, &probe, band)?;
@@ -1404,6 +1768,41 @@ fn run() -> Result<(), GateError> {
     );
     pass &= stepunion;
 
+    // `stepunion` under a set `mid-p0-s1`: the flips land while the two-column
+    // chain runs, so a lane's victim fill races the chain's own reads of the
+    // arena (the claims, the pins and the frees all under the books' one
+    // lock). The paged load's bits are the all-RAM load's, as clause 1's
+    // one-slot pair: one schedule, and the fills' and the copies' timing
+    // moves no bit.
+    let mid = slots_mid_arm(path, &machine, host, &ids, Some(ROOM))?;
+    let mid_ram = slots_mid_arm(path, &machine, host, &ids, None)?;
+    let mid_bits = !mid.tokens.is_empty()
+        && mid.prompts == mid_ram.prompts
+        && mid.tokens == mid_ram.tokens
+        && mid.digests == mid_ram.digests
+        && mid.flips == mid_ram.flips;
+    let (mid_misses, mid_fills, mid_census) = mid.served.ok_or("the paged mid arm took no tier")?;
+    let mid_flips = mid.flips > 0 && mid.unresident == 0 && mid.faulting == 0;
+    let mid_served = mid_misses > 0 && mid_fills > 0;
+    let stepmid = mid_bits && mid_flips && mid_served && mid_ram.served.is_none();
+    println!(
+        "stepunion mid: {STEP_COLS} two-column passes on a two-slot load under the set mid-p0-s1, \
+         flips landed {} (the lane filled and copied under the chain: {}; the all-RAM load's {}), \
+         unresident {}, faulting {}, late {} (printed, not judged); {} tokens and logits rows and \
+         both prompts' argmax bit for bit the all-RAM load's: {}; misses +{mid_misses}, fills \
+         +{mid_fills} over the passes (the arena served them: {mid_served}): {}",
+        mid.flips,
+        mid.flips > 0,
+        mid_ram.flips,
+        mid.unresident,
+        mid.faulting,
+        mid.late,
+        mid.tokens.len(),
+        verdict(mid_bits),
+        verdict(stepmid)
+    );
+    pass &= stepmid;
+
     // `census`: each phase's tier census — the paged arm's prompt call and
     // steps, the stepunion arm's two-column passes — printed as its record,
     // its picks by where they were served and the bytes the phase moved
@@ -1411,7 +1810,8 @@ fn run() -> Result<(), GateError> {
     // arena and file picks sum to its picks (a reader that serves picks it
     // does not count leaves them out).
     census.push(("slots", 2 * STEP_COLS, step.census));
-    let mut census_ok = census.len() == 3;
+    census.push(("slots_mid", 2 * STEP_COLS, mid_census));
+    let mut census_ok = census.len() == 4;
     for (phase, tokens, c) in &census {
         census_record(phase, c).print();
         census_ok &= c.picks > 0 && c.adds_up() && c.tokens == *tokens as u64;
@@ -1443,6 +1843,23 @@ fn run() -> Result<(), GateError> {
         verdict(census_ok)
     );
     pass &= census_ok;
+
+    // `pool` (clause 10): no phase's dispatch waited for another caller's
+    // job. The chain is the pool's one dispatcher: the lane's victim fills
+    // read on the lane's own threads (`NvTier::ensure_here`), where a fill on
+    // the pool took the dispatch mutex the chain's host compute holds.
+    let waits: Vec<String> = census
+        .iter()
+        .map(|(phase, _, c)| format!("{phase} {}", c.dispatch_waits))
+        .collect();
+    let pool_ok = census.iter().all(|(_, _, c)| c.dispatch_waits == 0);
+    println!(
+        "pool: dispatches that waited for another caller's job, by phase: {} (want 0 in every \
+         one): {}",
+        waits.join(", "),
+        verdict(pool_ok)
+    );
+    pass &= pool_ok;
 
     if pass {
         println!("{NAME}: every clause passed");

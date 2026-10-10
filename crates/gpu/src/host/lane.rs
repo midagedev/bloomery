@@ -15,10 +15,12 @@
 //! flip), so up to [`LANE_THREADS`] of those stage at once. A victim's
 //! preparation stays in issue order under the lock, one lane thread at a
 //! time: a source's preparation (the NVMe tier's books and its reads) is
-//! written for one lane caller. The lock closes no cycle: job `n` waits only
-//! on job `n − RING_SLOTS`'s copy, a job an earlier holder of the lock took,
-//! whose staging needs the lock no more. A panic or a poisoned lock stops no
-//! other thread. Why no wait here can close a cycle through the card is the
+//! written for one lane caller, and runs on the lane thread itself: the
+//! thread does the fill's reads and takes no pool dispatch, so a victim's
+//! fill never waits on the step's chain. The lock closes no cycle: job `n`
+//! waits only on job `n − RING_SLOTS`'s copy, a job an earlier holder of the
+//! lock took, whose staging needs the lock no more. A panic or a poisoned
+//! lock stops no other thread. Why no wait here can close a cycle through the card is the
 //! machine's to argue (its module doc, **No wait without a bound** and **No
 //! cycle through the card**).
 
@@ -394,6 +396,8 @@ pub(crate) struct Shared {
     /// took them.
     pub(super) stage_ns: AtomicU64,
     pub(super) prepare_ns: AtomicU64,
+    /// Victims the lane threads prepared (one per job that carries one).
+    pub(super) victims: AtomicU64,
     /// Jobs the lane has finished (staged, or failed), counted before each
     /// one's ticket is published, in the order they finish: `jobs_issued -
     /// served` copies wait for staging.
@@ -580,6 +584,7 @@ impl Shared {
             taken: std::array::from_fn(|t| self.taken[t].load(Ordering::Relaxed)),
             peak_window: self.peak_window.load(Ordering::Relaxed),
             peak_open: self.peak_open.load(Ordering::Relaxed),
+            victims: self.victims.load(Ordering::Relaxed),
         }
     }
 
@@ -611,6 +616,7 @@ impl Shared {
                 .note_prepare_at(job.n, since_epoch(self.epoch, t0));
             self.source.prepare_victim(job.layer, v)?;
             let took = super::nanos(t0.elapsed());
+            self.victims.fetch_add(1, Ordering::Relaxed);
             self.prepare_ns.fetch_add(took, Ordering::Relaxed);
             self.stamps.note_prepare(job.n, took);
         }
@@ -743,6 +749,9 @@ pub struct LaneStats {
     pub peak_window: u32,
     /// The most jobs a flush or their landing opened that staged at once.
     pub peak_open: u32,
+    /// The victims the lane threads prepared: the fills the lane's jobs
+    /// asked of the source, each read on the lane thread.
+    pub victims: u64,
 }
 
 /// The lane's threads and their job queue, which the machine holds beside
@@ -815,6 +824,7 @@ pub(super) fn start(
         stamps: JobStamps::new(),
         stage_ns: AtomicU64::new(0),
         prepare_ns: AtomicU64::new(0),
+        victims: AtomicU64::new(0),
         stop: AtomicBool::new(false),
         failed: Mutex::new(None),
         jobs_issued: AtomicU64::new(0),

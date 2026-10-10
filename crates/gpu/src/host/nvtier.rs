@@ -35,6 +35,19 @@
 //! one service at a time, so no pick reads a slot another service evicts —
 //! the seat and the run-ahead that share the arena across threads join
 //! their fills before the books give the slot away.
+//!
+//! A lane's copy of an id the arena holds filled reads the slot, not the
+//! mapping: [`NvTier::open_read`] pins the slot (the LRU takes no pinned
+//! slot, and a miss that finds every candidate pinned is refused by name),
+//! [`NvTier::staged_slot`] lends its bytes and [`NvTier::end_read`] lets it
+//! go and queues no drop, since the copy read no page of the model file's
+//! mapping. An id the arena holds unfilled when the lane opens it reads the
+//! mapping and drops as before. An id on the card holds no slot: the machine
+//! frees the promoted id's slot at the landing ([`NvTier::release`], through
+//! `SwapSource::release_host`), so every demotion fills. A victim's fill runs
+//! on the lane's own thread ([`NvTier::ensure_here`]) and never on the pool,
+//! whose one dispatch mutex is the chain's: beside the chain the lane takes
+//! only the books' lock, for claims, pins and publishes that wait on nothing.
 
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -118,22 +131,43 @@ pub(crate) fn slots_of(
     Ok(n)
 }
 
+/// Why a miss found no slot to take.
+#[derive(Debug, PartialEq, Eq)]
+enum NoSlot {
+    /// Every slot is filling: two ensures raced the layer.
+    Filling,
+    /// No slot is free and every filled one is pinned by a lane's open read:
+    /// the arena's floor does not cover the reads open beside the call.
+    Pinned,
+}
+
 /// The slot a miss takes: the first free one, else the least recently used
-/// filled — a filling slot is never the arena's to take, its fill owns it.
-/// `None` when every slot is filling (two ensures raced a layer).
-fn pick_slot(slots: &[SlotBook]) -> Option<usize> {
+/// filled one `pinned` does not name — a filling slot is never the arena's to
+/// take, its fill owns it, and a pinned one is being read. Refused by name
+/// when none is left, never waited for and never overwritten: all filling is
+/// the race of two ensures, all the rest pinned the floor's.
+fn pick_slot(slots: &[SlotBook], pinned: impl Fn(&SlotBook) -> bool) -> Result<usize, NoSlot> {
     if let Some(k) = slots
         .iter()
         .position(|s| s.state.load(Ordering::Relaxed) == FREE)
     {
-        return Some(k);
+        return Ok(k);
     }
-    slots
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.state.load(Ordering::Relaxed) == FILLED)
+    let filled = || {
+        slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.state.load(Ordering::Relaxed) == FILLED)
+    };
+    filled()
+        .filter(|(_, s)| !pinned(s))
         .min_by_key(|(_, s)| s.tick.load(Ordering::Relaxed))
         .map(|(k, _)| k)
+        .ok_or(if filled().next().is_some() {
+            NoSlot::Pinned
+        } else {
+            NoSlot::Filling
+        })
 }
 
 /// What one `ensure` claimed under the books' lock: the slots to fill, the
@@ -208,8 +242,18 @@ fn claim_slots(
             continue;
         }
         claim.misses += 1;
-        let slot = pick_slot(&arena.slots).ok_or_else(|| {
-            GpuError::shape(WHAT, "every slot is filling: two ensures raced a layer")
+        let slot = pick_slot(&arena.slots, |s| arena.pins(s)).map_err(|why| match why {
+            NoSlot::Filling => {
+                GpuError::shape(WHAT, "every slot is filling: two ensures raced a layer")
+            }
+            NoSlot::Pinned => GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer}: no slot is free and every filled one is pinned by a lane's \
+                     read: the arena's {} slots do not cover the reads open beside a call",
+                    arena.slots.len()
+                ),
+            ),
         })?;
         if arena.slots[slot].state.load(Ordering::Relaxed) == FILLED {
             let gone = arena.slots[slot].id.load(Ordering::Relaxed);
@@ -329,9 +373,13 @@ struct LayerArena {
     parts: Vec<[PartRange; PARTS]>,
     /// Per id: the slot that holds it, + 1; 0 when none does.
     of_id: Vec<AtomicU32>,
-    /// Per id: the lanes reading it through the model file's mapping now
-    /// ([`NvTier::open_read`]); a drop keeps its pages while it is nonzero.
+    /// Per id: the lane reads of it open now ([`NvTier::open_read`]); a drop
+    /// keeps its pages and the LRU its slot while it is nonzero.
     reading: Vec<AtomicU32>,
+    /// Per id: of those, the reads that went to the model file's mapping,
+    /// because its slot was not filled when they opened; the rest read the
+    /// slot. Only the mapping's reads leave pages for a drop.
+    mapped: Vec<AtomicU32>,
     /// Per slot: its state (a pick's read), its id and LRU tick (the
     /// lock's alone).
     slots: Vec<SlotBook>,
@@ -341,6 +389,14 @@ impl LayerArena {
     /// Slot `slot`'s first byte in the mapping.
     fn slot_off(&self, slot: usize) -> usize {
         self.base + slot * self.slot_bytes
+    }
+
+    /// Whether a lane's open read pins slot `s`: the expert it holds is read
+    /// now. The LRU takes no pinned slot.
+    fn pins(&self, s: &SlotBook) -> bool {
+        self.reading
+            .get(s.id.load(Ordering::Relaxed) as usize)
+            .is_some_and(|n| n.load(Ordering::Acquire) > 0)
     }
 
     /// The slot holding expert `id` filled, if one does — the one reading
@@ -476,6 +532,18 @@ pub struct NvTierStats {
     pub drop_ns: u64,
     /// The slots each paged layer holds: at least the arena's floor.
     pub slots_per_layer: u64,
+    /// Lane reads of an id the arena serves that opened it filled, pinned
+    /// its slot and read it ([`NvTier::open_read`]); and the parts of them
+    /// the arena lent ([`NvTier::staged_slot`]).
+    pub slot_reads: u64,
+    pub slot_parts: u64,
+    /// Lane reads of an id the arena serves that opened it unfilled and read
+    /// the model file's mapping, each queuing a drop at its end.
+    pub mapping_reads: u64,
+    /// Slots freed because the id went to the card ([`NvTier::release`]), and
+    /// the releases of an id the arena held no filled slot of.
+    pub releases: u64,
+    pub release_misses: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -489,6 +557,11 @@ struct Stats {
     resident_bytes: AtomicU64,
     buffered_reads: AtomicU64,
     buffered_bytes: AtomicU64,
+    slot_reads: AtomicU64,
+    slot_parts: AtomicU64,
+    mapping_reads: AtomicU64,
+    releases: AtomicU64,
+    release_misses: AtomicU64,
 }
 
 /// What the tier's dropper thread shares with the tier: the split whose
@@ -831,6 +904,7 @@ impl NvTier {
                     .collect(),
                 of_id: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 reading: (0..n).map(|_| AtomicU32::new(0)).collect(),
+                mapped: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 slots: Vec::new(),
             });
         }
@@ -1000,6 +1074,11 @@ impl NvTier {
             drop_bytes: self.drops.drop_bytes.load(Ordering::Relaxed),
             drop_ns: self.drops.drop_ns.load(Ordering::Relaxed),
             slots_per_layer: self.slots as u64,
+            slot_reads: s.slot_reads.load(Ordering::Relaxed),
+            slot_parts: s.slot_parts.load(Ordering::Relaxed),
+            mapping_reads: s.mapping_reads.load(Ordering::Relaxed),
+            releases: s.releases.load(Ordering::Relaxed),
+            release_misses: s.release_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -1032,22 +1111,78 @@ impl NvTier {
         self.paged
     }
 
-    /// A lane is about to read layer `layer`'s expert `id` through the model
-    /// file's mapping: until [`NvTier::end_read`] no drop names a page of it
-    /// — the bytes it faults in stay until it has copied them out. Nothing
-    /// for an id the arena does not serve. Refused by name: a layer the
-    /// arena does not cover and an id past its experts.
+    /// A lane is about to read layer `layer`'s expert `id`. An id the arena
+    /// holds filled is pinned in its slot until [`NvTier::end_read`]: the LRU
+    /// takes no pinned slot, so [`NvTier::staged_slot`]'s bytes stay put. Any
+    /// other id the arena serves is read through the model file's mapping,
+    /// and until the end no drop names a page of it — the bytes it faults in
+    /// stay until the lane has copied them out. The check and the pin are
+    /// made under the books' lock, so a claim either sees the pin or ran
+    /// before it. Nothing for an id the arena does not serve. Refused by
+    /// name: a layer the arena does not cover and an id past its experts.
     pub fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::open_read";
         let arena = self.arena_of(layer, WHAT)?;
         if arena.host.contains(&id) {
             return Ok(());
         }
-        arena.open(layer, id, WHAT)
+        let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+        arena.open(layer, id, WHAT)?;
+        if arena.filled(id).is_some() {
+            self.stats.slot_reads.fetch_add(1, Ordering::Relaxed);
+        } else {
+            arena.mapped[id as usize].fetch_add(1, Ordering::AcqRel);
+            self.stats.mapping_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Part `stack` (the plan's routed stack's tensor name) of layer
+    /// `layer`'s expert `id`, read from its slot: `Some` when the lane's open
+    /// read ([`NvTier::open_read`]) pinned the filled slot, `None` when it
+    /// opened the id unfilled (the mapping's) or the arena holds no such
+    /// stack. The bytes are the file's, at the skew the fill wrote them. A
+    /// read with no open one, or of a slot the pin no longer finds filled, is
+    /// refused by name: never a stale read.
+    pub fn staged_slot(
+        &self,
+        layer: usize,
+        id: u32,
+        stack: &str,
+    ) -> Result<Option<&[u8]>, GpuError> {
+        const WHAT: &str = "NvTier::staged_slot";
+        let arena = self.arena_of(layer, WHAT)?;
+        if arena.host.contains(&id) {
+            return Ok(None);
+        }
+        let open = arena.reading(layer, id, WHAT)?.load(Ordering::Acquire);
+        if open == 0 {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!("layer {layer} expert {id}: a slot read with no read open"),
+            ));
+        }
+        if open <= arena.mapped[id as usize].load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let slot = arena.filled(id).ok_or_else(|| {
+            GpuError::protocol(
+                WHAT,
+                format!("layer {layer} expert {id}: its pinned slot reads unfilled"),
+            )
+        })?;
+        let Some(row) = arena.names.iter().position(|n| n == stack) else {
+            return Ok(None);
+        };
+        let r = arena.parts[id as usize][row];
+        let (at, len) = window_span(arena.slot_off(slot), &arena.windows, row, r);
+        self.stats.slot_parts.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(&self.map.bytes()[at..at + len]))
     }
 
     /// The lane that opened layer `layer`'s expert `id`
-    /// ([`NvTier::open_read`]) has copied it out: the layer's ids the arena
+    /// ([`NvTier::open_read`]) has copied it out. A slot read unpins the slot
+    /// and queues nothing. A mapping read lets the layer's ids the arena
     /// serves leave the mapping and the page cache, the copied id and what
     /// the kernel read around it alike, but the ones a lane still has open,
     /// whose own end asks again ([`NvTier::drop_layer`]'s rule, queued for
@@ -1060,7 +1195,61 @@ impl NvTier {
             return Ok(());
         }
         arena.close(layer, id, WHAT)?;
-        self.queue_drop(layer, arena, WHAT)
+        let mapped = arena.mapped[id as usize]
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok();
+        if mapped {
+            self.queue_drop(layer, arena, WHAT)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Layer `layer`'s expert `id` went to the card: its slot is freed — the
+    /// state back to free, the slot's pages returned (`MADV_DONTNEED`, the
+    /// arena's own range only) — and the bytes the slot takes returned, 0 for
+    /// an id the arena serves no filled slot of (an id the plan's host
+    /// segment holds, one never filled, one the LRU took since its copy
+    /// staged). Done under the books' lock, so no claim takes the slot
+    /// between its freeing and its pages' return. Refused by name: a layer
+    /// the arena does not cover, an id past its experts, and an id a lane
+    /// has open — the landing follows its copy's staging.
+    pub fn release(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
+        const WHAT: &str = "NvTier::release";
+        let arena = self.arena_of(layer, WHAT)?;
+        if id >= arena.n_expert {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} expert {id} is past the {} experts",
+                    arena.n_expert
+                ),
+            ));
+        }
+        if arena.host.contains(&id) {
+            return Ok(0);
+        }
+        let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = arena.filled(id) else {
+            self.stats.release_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        };
+        if arena.reading(layer, id, WHAT)?.load(Ordering::Acquire) > 0 {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!("layer {layer} expert {id}: freed while a lane has it open"),
+            ));
+        }
+        arena.slots[slot].state.store(FREE, Ordering::Relaxed);
+        arena.of_id[id as usize].store(0, Ordering::Relaxed);
+        self.stats
+            .resident_bytes
+            .fetch_sub(arena.slot_bytes as u64, Ordering::Relaxed);
+        self.stats.releases.fetch_add(1, Ordering::Relaxed);
+        self.map
+            .dontneed(arena.slot_off(slot), arena.slot_bytes)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        Ok(arena.slot_bytes as u64)
     }
 
     /// Layer `layer`'s drop, on this thread: every id the arena serves
@@ -1252,7 +1441,21 @@ impl NvTier {
     /// failed is freed, never lent half-filled. An id the plan's host
     /// segment holds is the mapping's and is skipped ([`NvTier::serves`]).
     pub fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
-        self.fill_missing(layer, ids)?;
+        self.ensure_by(layer, ids, FillBy::Pool)
+    }
+
+    /// [`NvTier::ensure`] with every read on the calling thread, one pick
+    /// after the other, and none on the pool: the residency lane's victim
+    /// fill, which must not take the pool's dispatch mutex the chain's host
+    /// compute and its own `ensure` take. A one-pick call reads its three
+    /// parts at queue depth 1 either way; the books' claim and publish are
+    /// `ensure`'s.
+    pub fn ensure_here(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
+        self.ensure_by(layer, ids, FillBy::Caller)
+    }
+
+    fn ensure_by(&self, layer: usize, ids: &[u32], by: FillBy) -> Result<(), GpuError> {
+        self.fill_missing(layer, ids, by)?;
         if self.audit.get().is_some() {
             self.audit_slots(layer, ids)?;
         }
@@ -1336,8 +1539,9 @@ impl NvTier {
         Ok(())
     }
 
-    /// The misses of `ids` read into their slots ([`NvTier::ensure`]).
-    fn fill_missing(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
+    /// The misses of `ids` read into their slots ([`NvTier::ensure`]), the
+    /// reads on `by`.
+    fn fill_missing(&self, layer: usize, ids: &[u32], by: FillBy) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
             return Err(GpuError::state(WHAT, "the layer's arena"));
@@ -1361,7 +1565,7 @@ impl NvTier {
             return Ok(());
         }
         let t0 = Instant::now();
-        self.fill(arena, &picks).inspect_err(|_| {
+        self.fill(arena, &picks, by).inspect_err(|_| {
             // A failed fill frees its slot: never lent half-filled.
             for p in &picks {
                 arena.slots[p.slot].state.store(FREE, Ordering::Relaxed);
@@ -1401,60 +1605,79 @@ impl NvTier {
         Ok(())
     }
 
-    /// The misses' reads, split over the resident pool: each worker fills
-    /// the picks its chunk names, part by part into its slot's own windows
-    /// — disjoint by the books' slot ownership, joined before this returns.
-    fn fill(&self, arena: &LayerArena, picks: &[Pick]) -> Result<(), GpuError> {
-        const WHAT: &str = "NvTier::fill";
-        let fail: Mutex<Option<GpuError>> = Mutex::new(None);
-        threads::pool().for_each_chunk(picks.len(), |chunk| {
-            for p in &picks[chunk] {
-                for part in 0..PARTS {
-                    let r = arena.parts[p.id as usize][part];
-                    let (start, span, need) = aligned_span(r.at, r.len as u64);
-                    // SAFETY: the pick owns its slot (the books marked it
-                    // Filling) and this worker writes only this part's
-                    // window of it; the workers' windows are disjoint by
-                    // their picks' slots, and `for_each_chunk` joins every
-                    // worker before it returns.
-                    let window = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            self.shared
-                                .0
-                                .add(arena.slot_off(p.slot) + arena.windows[part]),
-                            span,
-                        )
-                    };
-                    let got = match arena.files[part].read_span(window, start) {
-                        Ok(n) => n,
-                        Err(e) => return note(&fail, GpuError::plan(WHAT, e)),
-                    };
-                    if got < need {
-                        return note(
-                            &fail,
-                            GpuError::shape(
-                                WHAT,
-                                format!(
-                                    "expert {}: the run ends {got} B in, its part needs {need} B \
-                                     at {start}",
-                                    p.id
-                                ),
-                            ),
-                        );
+    /// The misses' reads: on the resident pool, each worker filling the picks
+    /// its chunk names, or on the caller, pick after pick — part by part into
+    /// each pick's slot's own windows, disjoint by the books' slot
+    /// ownership, joined before this returns.
+    fn fill(&self, arena: &LayerArena, picks: &[Pick], by: FillBy) -> Result<(), GpuError> {
+        match by {
+            FillBy::Caller => picks.iter().try_for_each(|p| self.fill_pick(arena, p)),
+            FillBy::Pool => {
+                let fail: Mutex<Option<GpuError>> = Mutex::new(None);
+                threads::pool().for_each_chunk(picks.len(), |chunk| {
+                    for p in &picks[chunk] {
+                        if let Err(e) = self.fill_pick(arena, p) {
+                            return note(&fail, e);
+                        }
                     }
-                    if !arena.files[part].is_direct() {
-                        self.stats.buffered_reads.fetch_add(1, Ordering::Relaxed);
-                        self.stats
-                            .buffered_bytes
-                            .fetch_add(r.len as u64, Ordering::Relaxed);
-                    }
-                }
+                });
+                fail.into_inner()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map_or(Ok(()), Err)
             }
-        });
-        fail.into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .map_or(Ok(()), Err)
+        }
     }
+
+    /// One pick's slot filled: its three parts read, each into its own
+    /// window at the skew an aligned read of the part's file range needs.
+    /// The one body of a fill, whichever thread runs it.
+    fn fill_pick(&self, arena: &LayerArena, p: &Pick) -> Result<(), GpuError> {
+        const WHAT: &str = "NvTier::fill";
+        for part in 0..PARTS {
+            let r = arena.parts[p.id as usize][part];
+            let (start, span, need) = aligned_span(r.at, r.len as u64);
+            // SAFETY: the pick owns its slot (the books marked it Filling)
+            // and this caller writes only this part's window of it; the
+            // callers' windows are disjoint by their picks' slots, and a
+            // pool fill joins every worker before it returns.
+            let window = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.shared
+                        .0
+                        .add(arena.slot_off(p.slot) + arena.windows[part]),
+                    span,
+                )
+            };
+            let got = arena.files[part]
+                .read_span(window, start)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+            if got < need {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "expert {}: the run ends {got} B in, its part needs {need} B at {start}",
+                        p.id
+                    ),
+                ));
+            }
+            if !arena.files[part].is_direct() {
+                self.stats.buffered_reads.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .buffered_bytes
+                    .fetch_add(r.len as u64, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which thread reads a fill's misses.
+#[derive(Clone, Copy)]
+enum FillBy {
+    /// The resident pool's workers, one dispatch.
+    Pool,
+    /// The calling thread.
+    Caller,
 }
 
 /// Record the first fill failure, the rest dropped on the floor.
@@ -1500,7 +1723,7 @@ impl TierSlots for NvTier {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILLED, FILLING, FREE, PARTS, PartRange, SlotBook, advice_disjoint, audit_offsets,
+        FILLED, FILLING, FREE, NoSlot, PARTS, PartRange, SlotBook, advice_disjoint, audit_offsets,
         layer_bases, pick_slot, slots_of, window_bytes, window_span,
     };
     use engram::direct::{DIRECT_ALIGN, aligned_span};
@@ -1597,17 +1820,95 @@ mod tests {
     }
 
     /// The slot a miss takes: the first free one, else the least recently
-    /// used filled; a filling slot is nobody's to take.
+    /// used filled one no lane's read pins; a filling slot is nobody's to
+    /// take, and a miss with nothing left is refused by name, with the
+    /// reason, never waited for.
     #[test]
-    fn a_miss_takes_a_free_slot_else_the_least_recently_used() {
+    fn a_miss_takes_a_free_slot_else_the_least_recently_used_unpinned() {
+        let open = |_: &SlotBook| false;
         let free = [book(FREE, 0), book(FILLED, 5), book(FILLED, 2)];
-        assert_eq!(pick_slot(&free), Some(0), "the first free slot");
+        assert_eq!(pick_slot(&free, open), Ok(0), "the first free slot");
         let lru = [book(FILLED, 5), book(FILLED, 2), book(FILLED, 9)];
-        assert_eq!(pick_slot(&lru), Some(1), "the least recently used");
+        assert_eq!(pick_slot(&lru, open), Ok(1), "the least recently used");
         let mixed = [book(FILLING, 1), book(FILLED, 7), book(FILLED, 3)];
-        assert_eq!(pick_slot(&mixed), Some(2), "a filling slot is not taken");
-        assert_eq!(pick_slot(&[book(FILLING, 1)]), None, "all filling: raced");
-        assert_eq!(pick_slot(&[]), None, "no slots at all");
+        assert_eq!(
+            pick_slot(&mixed, open),
+            Ok(2),
+            "a filling slot is not taken"
+        );
+        assert_eq!(
+            pick_slot(&[book(FILLING, 1)], open),
+            Err(NoSlot::Filling),
+            "all filling: raced"
+        );
+        assert_eq!(
+            pick_slot(&[], open),
+            Err(NoSlot::Filling),
+            "no slots at all"
+        );
+        // The least recently used slot (index 1) is pinned: the next oldest
+        // goes, and the pinned one stays whatever its age.
+        for (i, b) in lru.iter().enumerate() {
+            b.id.store(i as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        let pins_one = |s: &SlotBook| s.id.load(std::sync::atomic::Ordering::Relaxed) == 1;
+        assert_eq!(pick_slot(&lru, pins_one), Ok(0), "the oldest unpinned");
+        // A free slot is taken before any pin is read; every filled slot
+        // pinned is the floor's refusal, not the race's.
+        assert_eq!(
+            pick_slot(&free, |_| true),
+            Ok(0),
+            "a free slot needs no unpinned one"
+        );
+        assert_eq!(
+            pick_slot(&lru, |_| true),
+            Err(NoSlot::Pinned),
+            "all pinned: the named refusal"
+        );
+        let filling_and_pinned = [book(FILLING, 1), book(FILLED, 3)];
+        assert_eq!(
+            pick_slot(&filling_and_pinned, |_| true),
+            Err(NoSlot::Pinned),
+            "a filling slot beside the pinned one"
+        );
+    }
+
+    /// A lane's open read pins its id's slot against the claim that would
+    /// evict it, from the open to the end: the claim takes the next oldest
+    /// slot, and with every filled slot pinned refuses by name, the slots
+    /// and the books as they were. The mapping's reads and the slot's are
+    /// told apart by the open count against the mapping's.
+    #[test]
+    fn an_open_read_keeps_its_slot_out_of_the_lru() {
+        let arena = arena_of(4, 2);
+        let mut books = super::Books {
+            tick: 0,
+            seen: Vec::new(),
+        };
+        let first = super::claim_slots(0, &arena, &mut books, &[0, 1]).unwrap();
+        fill_claimed(&arena, &mut books, &first);
+        // Expert 0 is the least recently used and a lane has it open.
+        arena.open(0, 0, "test").expect("the lane's open");
+        let evict = super::claim_slots(0, &arena, &mut books, &[2]).unwrap();
+        assert_eq!(evict.evicted.len(), 1);
+        assert!(arena.filled(0).is_some(), "the pinned slot stays filled");
+        assert!(arena.filled(1).is_none(), "the next oldest was taken");
+        fill_claimed(&arena, &mut books, &evict);
+        // Every filled slot pinned: refused by name, nothing moved.
+        arena.open(0, 2, "test").expect("a second lane's open");
+        let tick = books.tick;
+        let e = super::claim_slots(0, &arena, &mut books, &[3])
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pinned by a lane's read"), "{e}");
+        assert_eq!(books.tick, tick, "the books' tick stands");
+        assert!(arena.filled(0).is_some() && arena.filled(2).is_some());
+        // The ends unpin: the slot is the LRU's again.
+        arena.close(0, 0, "test").expect("the end");
+        arena.close(0, 2, "test").expect("the end");
+        let again = super::claim_slots(0, &arena, &mut books, &[3]).unwrap();
+        assert_eq!(again.evicted.len(), 1, "an unpinned slot goes again");
     }
 
     /// Disjoint arena and mapping ranges pass; an arena range that names a
@@ -1665,6 +1966,7 @@ mod tests {
             parts: vec![[part; PARTS]; n_expert as usize],
             of_id: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
             reading: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
+            mapped: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),
             slots: (0..slots).map(|_| book(FREE, 0)).collect(),
         }
     }

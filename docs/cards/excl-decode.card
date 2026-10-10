@@ -1,0 +1,102 @@
+# Round excl (unitier R2): exclusive tiers. This tree's promotion copy reads the arena's slot (no mapping read, no
+# dropper call), the landing frees the promoted id's slot, and the lane's victim fill runs on the lane thread instead
+# of the pool. The base is the tree it branched from (3ce4f2f3), built with `just build-decode` in its own worktree
+# and remote dir. The change is host-only (ptx-scan equal), so this A/B is the dispatch-path speed check AGENTS.md asks
+# for, not a kernel claim.
+#
+# Shape, fixed by a functional probe on the A6000 (no lease, no timing; generate_qwen3moe, plan a, ctx 3072, prose 512,
+# BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off, one slot, -n 2 / -n 96). BLOOMERY_RESIDENCY=mid-p0-s1 is set on both
+# arms (the unset rule runs a paged plan `off`, where no flip exists and R2 changes nothing). The room is NOT 27G alone and
+# no room alone gives plan a an arena of 20 GB: gate_nvtier plans the 3090's bytes (gate_card.rs), and on the A6000 the
+# default split dial (placement nvme_arena_of) gives an arena only while the room is under H/2, H the 11,767 host
+# experts' bytes (about 37.2e9; the plan's need is 37,413,670,912 B), and then room - F, F = 3,472,166,912 B (512 MiB
+# of host terms + 3 x 978,432,000 B, the heaviest layer's host-served experts; the floor `BLOOMERY_HOST_ROOM=1` names,
+# 5,139,824,640 B, adds the arena's least): 14,781,444,096 B at BLOOMERY_HOST_ROOM=17G [measured], at most about 15.1e9 B
+# [derived: H/2 - 1 - F] at the last room, so no room alone gives 20 GB; 18G (above H/2) and 27G build no arena (no
+# nvtier record), the stepunion2 null. Both arms therefore set BLOOMERY_NVTIER_BYTES=20G beside
+# BLOOMERY_HOST_ROOM=27G: nvtier budget=21,474,836,480 paged=31,855,001,600 (host_experts=11767 card_experts=12809).
+# [measured, the base build at that shape, -n 96, functional: 527 flips landed in 97 passes, 46 late, the boundaries'
+# wait 132.6 ms, the lane's thread time 5.61 s staging and 2.05 s preparing; arena fills 4,785 (15.0 GB), no eviction:
+# the arena is 70 % full at the window's end.] The arena is empty after a prompt, so the 96 tokens are its warm-up; the
+# band is for that window, not a long decode.
+# [derived, re-read at this shape; `predict` below is the lead's] the terms below came from the 3090 plan's print. Here the
+# chain's fills are about 44 a token against 87.9 (term 1 about halves, 2.6 ms), the landing stall is 1.38 ms a token
+# (term 2, up from 0.25), the arena does not fill (term 3 about 0): net about +2.6 ms of a 72..92 ms token, +3 %, the
+# band's lower edge near 0.
+#
+# [measured, train029a, gate_nvtier on the A6000 in lane X (the batch's solo lane, not a lease run; the plan is the
+# 3090's bytes); specs/leader/train029a/real/g-gate-gpu-nvtier.log:90-106] steps phase, 96 tokens, per token: card
+# 154.7, arena 316.0, file 9.3 picks; fills 276 MB (87.9 fills: the arena warms to its 7,488 slots); promotions and
+# demotions 17.93 MB (5.71 each); the pool's dispatch waits 10.4, 13.347 ms; the dropper 5.5 calls, 5.178 ms. 8 late of
+# 552 landed flips, all behind the lane queue (156-213 ms of a 162-217 ms issue->boundary window, 19-23 copies ahead).
+# A window is two passes: a pass is 81 / 86 / 109 ms at boundaries 65 / 93 / 17 (the step time is not printed).
+#
+# [derived] Per token, what R2 does to the chain. The step is the chain (card kernels, then the host leg's fills and
+# compute, in series); the lane's work runs beside it and touches it through the pool's one dispatch mutex, the staging
+# window and the landing boundary.
+#   1. +2.9..+7.9 ms, central 5.3. The pool's mutex: 999 waits, 1,281 ms over 96 tokens. Each lane hold blocks the chain at
+#      most once and each lane dispatch waits at most once, so 999 <= 2 n_L, n_L (victim fills) = 500..549. The print
+#      does not split the 1,281 ms between the chain behind a lane fill and the lane behind a chain fill. Bounds: a
+#      chain wait is at most one hold h, h = 1.12..1.42 ms (a one-pick O_DIRECT fill at the k=1 rate, design Q5; fill_ns
+#      is not a clean read time, it includes this mutex wait), so the chain side is at most 531 x 1.42 / 96 = 7.9; and
+#      the lane's mean prepare is at most 3.0 ms, so the lane side is at most 1,281 - 531 x (3.0 - 1.42) = 998 ms and
+#      the chain side at least 283 ms = 2.9 ms/token. After R2 the lane never dispatches: the steps census reads 0 waits.
+#   2. +0.15..+0.5, central 0.25. The late flips' landing stall (sum of PassReport.wait_us): 8 late flips, about 25 ms
+#      over 96 tokens, the queued prepares serial under the receive lock.
+#   3. 0..+0.8, central 0.65. Exclusive tiers' misses: the nvtier replay's no-seat rows (excl+prep against keep+prep at
+#      the 22 / 25 / 28 GB tier, 30.78 / 27.58 / 25.46 misses a token down to 28.10 / 25.59 / 23.47) cut the chain's
+#      miss-calls 0.019..0.026 a layer, 1.4..2.2 ms a token once the arena is full. The replay starts full; here the
+#      arena fills by about token 61 (7,488 slots, 87.9 fills a token), so about 36 % of the window sees it.
+#   4. -1.0..-0.4, central -0.6. Every landing frees a 3.16 MB slot with MADV_DONTNEED on the boundary thread, 23 a plan,
+#      70..100 us each [assumption: 80 ns a page, 770 pages, one TLB shootdown].
+#   5. -2.4..0, central -0.8. The lane's QD 1 victim read now overlaps the chain's fills on the drive; today the mutex
+#      serializes them. The chain's fills read 3.1 GB/s of the drive's 4.6-6 GB/s at k=2..3 (design [price]:93), and the
+#      lane adds 0.19 GB/s, so a 0..3 % slower chain fill [assumption], 0..2.4 ms of the chain's 80 ms of fills.
+#   Net -0.35..+8.8 ms, central +4.8, of a base token of 72..92 ms (the print's three passes average 92; worker2's R1
+#   probe, residency off, read 72-74 a pass, docs/plan-triage.md:167): central +6 %, corners -0.4..+12.2 %. The card's band
+#   is central +-2 sigma, sigma = the RSS of the terms' ranges over sqrt(12) = 1.64 ms = 2.05 %: +2..+10.
+# Priced 0 on purpose: the dropper's thread time (5.178 ms a token on a thread of its own; its cost on the chain is
+# unmeasured) and the lane's stage read (about 2.7 ms cold through the mapping to 0.35 ms from the slot, 3.134 MB at the
+# 9.07 GB/s a lane thread's staging copy ran, rig-log 09-29#odswap-ab; the lane runs it under the chain's shadow).
+#
+# Ruler: sd 2.6 % (the same pair slots-qwen38-ab.card cites). Kind noninf with a 2 % margin (the lead's call): at 6
+# rounds the paired h_p is 3.859 % (t 2.571, df 5), so the claim a run can carry is no loss past 2 %, not the gain the
+# band predicts, and card.py check passes with lo - h_p = -1.859 % > -2 %. The band's own +2 % edge would resolve at
+# 15 rounds, about 35 min.
+#
+# Runner (the lead; the full output to a file first; every variable but the rounds inside BLOOMERY_BOX_ENV, which is
+# all the recipe forwards; the room and the arena are the probe's). The base is built from 3ce4f2f3:
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/excl-decode.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DRAFT=off BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' \
+#   BLOOMERY_AB_ROUNDS=6 just depth-gpu-qwen4exp \
+#     bin:/root/repo/bloomery-excl-base/target/release/generate_qwen3moe:prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G \
+#     prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G
+kind: noninf
+question: on a paged plan under a set residency, does R2 (slot-sourced promotions, the landing freeing the promoted slot,
+  the lane's victim fill off the pool's dispatch mutex) speed the plain decode through the arena's warm-up window?
+term: decode tok/s @ n=96, prose 512 (the corpus's first 512 ids), ctx 3072, A6000, plan a at the BLOOMERY_HOST_ROOM
+  27G with BLOOMERY_NVTIER_BYTES=20G (a 20 GiB arena), BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off, one slot; this tree's
+  generate_qwen3moe against 3ce4f2f3's, (ours - base) / base, paired by round
+unit: %
+predict: +2..+10
+rounds: 6
+margin: 2.0 % terms 4 and 5 (the landing's MADV_DONTNEED on the boundary thread, the lane's overlapped drive read) cost -1.4 ms a token at their centres, -1.5 % of an 80 ms token; a loss past 2 % means a term the derivation missed
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds (paired SD 3.7 %,
+  / sqrt 2), as slots-qwen38-ab.card; Qwen3.8's plain decode under the residency scatters past the 0.6 % default
+condition: one lease; both builds with their Cargo.lock current; every arm a fresh process (BLOOMERY_AB_LOAD=arm in
+  BLOOMERY_BOX_ENV), the order rotated each round, one warm-up round discarded (a `WARMUP r0` row in the log: the
+  recipe forwards no BLOOMERY_AB_WARMUP outside BLOOMERY_BOX_ENV); no [cpu-busy], [other-busy] or [cold] row and no
+  Xid in either witness. Each arm's plan line names a paged plan with an arena, its nvtier record is there and its
+  window reads drive bytes (an arena fills by O_DIRECT), its `residency lever` / `residency host` records name
+  mid-p0-s1 and its `load draft=off` record is there; each arm's `residency pass` records sum to 400 or more landed
+  flips over the 96 steps (derived 5.7 a token on the print's plan), so the lane worked in both; both arms print the
+  same greedy tokens (R2 moves no bit). Read beside the ratio, from the arms' records, not judged: the ours arm's
+  `residency pass` wait_us and late, and each arm's nvtier fills and fill_ns
+decide-in: land R2 on its gates and write the row (tok/s both arms, the ratio and its interval, landed flips, late,
+  fills) with its window named, the arena's warm-up, to rig-log; the unset rule stays off on arena plans until R4
+decide-below: the lane's touchpoints cost less than the print's bounds allow, or terms 4 and 5 cost more. Read the arms'
+  `residency pass` wait_us, late and stage_us / prepare_us and each arm's nvtier fills and fill_ns before any figure;
+  land R2 as the structural change (the RAM the double hold freed, the dropper off the promotions) and claim no
+  decode gain
+decide-above: a term priced 0 moved: the base's dropper thread and its mapping faults competing with the pool, or the
+  lane's memcpy sharing DRAM. Read the base arm's nvtier drop_ns against its step wall and the census's dispatch wait
+  before the number is claimed as the mutex's
