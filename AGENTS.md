@@ -323,8 +323,8 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
   without them instead of linking the stub `main`.
 - **Do not split a `#[target_feature]` kernel body into helpers** (10–13 % loss). A helper touching `_mm*` intrinsics
   is `#[inline(always)]` or carries the attribute itself. `.cargo/config.toml` sets `-C target-cpu=znver3` for plain
-  cargo builds, and `.cargo/cuda-oxide.toml` carries it for oxide builds (`CARGO_ENCODED_RUSTFLAGS` masks the former);
-  `just check-rustflags` holds the two equal. The attributes stay.
+  cargo builds, and `.cargo/cuda-oxide.toml` carries it for oxide builds (`CARGO_ENCODED_RUSTFLAGS` masks the former),
+  both per target triple (aarch64 takes `native`); `just check-rustflags` holds each triple's two lists equal. The attributes stay.
 - **An unprofiled chunk takes no lock and reports nothing.** Per-chunk collectors are for `BLOOMERY_PROFILE` and
   errors; an unconditional lock per chunk is a futex convoy (symptom: a flat thread-scaling curve; first question
   `SWEEP="8 16 24 32" just measure-decode`).

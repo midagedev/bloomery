@@ -9,3 +9,9 @@
 # form, and inside AVX code each one takes a ymm spill fault and fill faults on Zen 3. -sse4a keeps
 # every other znver3 feature.
 rustflags = ["-C", "target-cpu=znver3", "-C", "target-feature=-sse4a"]
+
+# DGX Spark(GB10, Cortex-X925 + A725). znver3는 aarch64의 프로세서 이름이 아니어서 rustc가 크레이트마다
+# 경고하고 일부 크레이트(glob, regex-syntax)에서 LLVM 안에서 SIGSEGV로 죽는다. native는 빌드하는
+# 기계의 CPU를 쓴다 — 이 표는 그 기계에서 빌드하고 그 기계에서 도는 바이너리를 위한 것이다.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]

@@ -130,7 +130,7 @@ The raise itself is a few lines of `ptx_asm!` (`red.relaxed.gpu.global.min.u32`)
 - **Only `cargo oxide` builds device crates.** A plain `cargo build` of such a crate compiles, but produces a binary without the device code.
 - **cuda-oxide is pinned by git revision.** `Cargo.toml` declares the upstream revision (the URL still reads NVlabs/cuda-oxide, which GitHub redirects to [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust), the repository's new name), and a `[patch]` section takes the source from [our fork](https://github.com/midagedev/cuda-oxide) (`bloomery` branch), which is that revision plus a few small patches on their way upstream (`THIRD_PARTY_NOTICES.md` lists them). `just deny` fails if either revision floats. The Rust nightly moves only when this pin moves.
 - **One codegen backend per revision.** On the build machine each revision's backend sits in its own directory with a `source-rev.txt`. `tools/box.sh` sets `CUDA_OXIDE_BACKEND` to it and stops when the file is missing or names another revision.
-- **Host code gets the same CPU flags as a plain cargo build.** `cargo oxide` sets its own `CARGO_ENCODED_RUSTFLAGS`, which hides `.cargo/config.toml`. So `.cargo/cuda-oxide.toml` repeats `-C target-cpu=znver3` in `extra-rustflags`, and `just check-rustflags` fails when the two files disagree.
+- **Host code gets the same CPU flags as a plain cargo build.** `cargo oxide` sets its own `CARGO_ENCODED_RUSTFLAGS`, which hides `.cargo/config.toml`. So `.cargo/cuda-oxide.toml` repeats each triple's flags in a `[target.<triple>] extra-rustflags` table (our fork's cargo-oxide picks the table of the triple it builds for), and `just check-rustflags` fails when the two files disagree for a triple.
 
 ## Checking the compiled code
 
