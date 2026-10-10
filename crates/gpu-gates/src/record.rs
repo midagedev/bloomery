@@ -2802,7 +2802,7 @@ pub static CACHE_REUSE: Kind = Kind {
 pub static CACHE_SAVE: Kind = Kind {
     name: "cache_save",
     head: "cache save",
-    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot (the call that began the copy when off_path), the cache after it, and whether its copy runs off the request path, on the engine's copy stream.",
+    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot (the call that began the copy when off_path), the cache after it, whether its copy runs off the request path, on the engine's copy stream, and the fallback: none, or full or fragmented when the staging pool had no room for the copy even after its oldest landed state left, so the snapshot was taken on the request path.",
     parts: &[
         key("positions", U64, "positions"),
         key("bytes", U64, "B"),
@@ -2810,6 +2810,7 @@ pub static CACHE_SAVE: Kind = Kind {
         key("entries", U64, ""),
         key("cache_bytes", U64, "B"),
         key("off_path", Bool, ""),
+        key("fallback", Word, ""),
     ],
 };
 
@@ -4189,7 +4190,7 @@ mod tests {
         assert_eq!((plan38.at(), plan38.line()), (2, PLAN38_PLACED));
         let ds41 = Log::of(
             "cache ram=8589934592 headroom=111730458624 user_start=<|User|> in_template=true\n\
-             cache save positions=46 bytes=359555072 ms=103.234 entries=2 cache_bytes=718986240 off_path=false\n\
+             cache save positions=46 bytes=359555072 ms=103.234 entries=2 cache_bytes=718986240 off_path=false fallback=none\n\
              cache reuse common=40 ask=40 kept=38 held=46 reason=the cut at a message start",
             BLOOMERY_SERVE_DS41,
         );
@@ -4216,17 +4217,25 @@ mod tests {
     /// by field: `cache save` says it ran off the path and what the call that
     /// began it cost, `cache landed` the copy's own cost and what the request
     /// path waited, `cache load` the positions put back and what that load
-    /// waited for.
+    /// waited for. A save that fell back to the request path names the pool
+    /// that had no room.
     #[test]
     fn an_off_path_save_reads_by_field() {
         let log = Log::of(
-            "cache save positions=46 bytes=1000 ms=0.500 entries=2 cache_bytes=2000 off_path=true\n\
+            "cache save positions=46 bytes=1000 ms=0.500 entries=2 cache_bytes=2000 off_path=true fallback=none\n\
              cache landed positions=46 bytes=1000 calls=97 copy_ms=15.000 alloc_ms=0.000 waited_ms=0.000\n\
-             cache load positions=46 common=40 kept=38 slot_kept=10 bytes=1000 ms=1.500 resumed=38 waited_ms=2.500",
+             cache load positions=46 common=40 kept=38 slot_kept=10 bytes=1000 ms=1.500 resumed=38 waited_ms=2.500\n\
+             cache save positions=60 bytes=1500 ms=9.000 entries=3 cache_bytes=3500 off_path=false fallback=fragmented",
             BLOOMERY_SERVE_DS41,
         );
-        let save = log.one(&CACHE_SAVE).unwrap();
+        let saves = log.all(&CACHE_SAVE).unwrap();
+        let save = &saves[0];
         assert_eq!((save.bool("off_path"), save.f64("ms")), (Ok(true), Ok(0.5)));
+        assert_eq!(save.word("fallback"), Ok("none"));
+        assert_eq!(
+            (saves[1].bool("off_path"), saves[1].word("fallback")),
+            (Ok(false), Ok("fragmented"))
+        );
         let landed = log.one(&CACHE_LANDED).unwrap();
         assert_eq!(
             (
