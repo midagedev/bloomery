@@ -7,8 +7,10 @@
 //! gates' `$BLOOMERY_REF_MODEL`. The rules of a model named twice are
 //! [`hf::source`]'s. A decision model's head comes from the repo a `--hf`
 //! repo's model card says it quantizes ([`quantized_from`]), fetched by
-//! [`fetch_exact`]. The qwen4exp family's MTP draft is fetched beside a set
-//! only when the plan's own rule says the set can run it ([`draft_usable`]).
+//! [`fetch_exact`]. A family's MTP draft ([`refset::arch::beside_drafts`], one
+//! row per family that keeps its draft in a file of its own) is fetched beside
+//! a set only when the plan's own rule says the set can run it
+//! ([`draft_usable`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -17,6 +19,7 @@ use gguf::Split;
 use hf::HfError;
 use hf::fetch::{Client, Draft, Event};
 use hf::source::{self, Flags, Source};
+use refset::arch::BesideDraft;
 
 use crate::GateError;
 use crate::record::{self, Record};
@@ -105,28 +108,36 @@ fn print(e: &Event<'_>) {
     }
 }
 
-/// The MTP draft file name a `--hf` resolve also fetches when the repo
-/// holds a file of it, landing it beside the picked set where the engine's
-/// draft rule opens it from: the qwen4exp family's shared draft
-/// ([`refset::arch::qwen4exp::mtp::DRAFT`]'s file name), the one family
-/// whose draft is a file of its own beside the target — GLM's NextN is
-/// inside the target, so it needs none.
-fn draft_name() -> &'static str {
-    Path::new(refset::arch::qwen4exp::mtp::DRAFT)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .expect("the qwen4exp DRAFT path names no file")
-}
+/// A row's usability rule, [`draft_usable`] closed over the row.
+type Usable = Box<dyn Fn(&Path) -> Result<(), String>>;
 
-/// Whether the set whose first shard is `first` can run the qwen4exp MTP
-/// draft: the plan's own rule (`PlanInputs::mtp_borrows`, the target's
-/// `token_embd` and `output` in the format the draft reads them), why not as
-/// that rule says it; a shard the plan cannot describe runs no draft either.
-fn draft_usable(first: &Path) -> Result<(), String> {
+/// Whether the set whose first shard is `first` can run `row`'s MTP draft:
+/// the set declares the row's architecture, then the plan's own rule
+/// (`PlanInputs::mtp_borrows`, the target's `token_embd` and `output` in the
+/// format the draft reads them), why not as that rule says it; a shard the
+/// plan cannot describe runs no draft either. A row of an architecture this
+/// has no rule for is refused by name, and its draft is not fetched: a family
+/// adds its row to `refset::arch::beside_drafts` and its rule here.
+fn draft_usable(row: &BesideDraft, first: &Path) -> Result<(), String> {
     let split = Split::open(first).map_err(|e| format!("open {}: {e}", first.display()))?;
-    let inputs =
-        model::arch::qwen35moe::place::PlanInputs::describe(&split).map_err(|e| e.to_string())?;
-    inputs.mtp_borrows().map_err(|e| e.to_string())
+    let arch = split.architecture().unwrap_or("<missing>");
+    if arch != row.arch {
+        return Err(format!(
+            "the set's architecture is {arch}, and the draft {} is {}'s",
+            row.name(),
+            row.arch
+        ));
+    }
+    match model::arch::qwen35moe_variant(&split) {
+        Ok(model::arch::qwen35moe::hparams::Variant::Qwen4Exp) => {
+            let inputs = model::arch::qwen35moe::place::PlanInputs::describe(&split)
+                .map_err(|e| e.to_string())?;
+            inputs.mtp_borrows().map_err(|e| e.to_string())
+        }
+        _ => Err(format!(
+            "no rule says whether a {arch} set can run its draft"
+        )),
+    }
 }
 
 /// The local path of what `flags` and `env` (the gates' variable, `None`
@@ -139,11 +150,20 @@ pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, Gate
         None => Ok(None),
         Some(Source::File(p)) => Ok(Some(PathBuf::from(p))),
         Some(Source::Hf(r)) => {
-            let draft = Draft {
-                name: draft_name(),
-                usable: &draft_usable,
-            };
-            let files = client()?.resolve(&r, Some(&draft), &mut print)?;
+            let rows = refset::arch::beside_drafts();
+            let usable: Vec<Usable> = rows
+                .iter()
+                .map(|&row| -> Usable { Box::new(move |first: &Path| draft_usable(row, first)) })
+                .collect();
+            let drafts: Vec<Draft<'_>> = rows
+                .iter()
+                .zip(&usable)
+                .map(|(row, usable)| Draft {
+                    name: row.name(),
+                    usable: usable.as_ref(),
+                })
+                .collect();
+            let files = client()?.resolve_drafts(&r, &drafts, &mut print)?;
             Ok(Some(files.into_iter().next().ok_or_else(|| {
                 format!("--hf {r}: the picked set has no file")
             })?))

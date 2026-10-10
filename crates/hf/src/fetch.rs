@@ -117,9 +117,9 @@ pub enum Event<'a> {
 }
 
 /// The MTP draft a resolve fetches beside the set it picks
-/// ([`Client::resolve`]): the file name the family's draft goes by, and
-/// whether the set can run it — `usable` reads the set's first shard, once it
-/// is fetched, and says why not.
+/// ([`Client::resolve`], [`Client::resolve_drafts`]): the file name the
+/// family's draft goes by, and whether the set can run it — `usable` reads the
+/// set's first shard, once it is fetched, and says why not.
 pub struct Draft<'a> {
     pub name: &'a str,
     pub usable: &'a dyn Fn(&Path) -> Result<(), String>,
@@ -556,6 +556,21 @@ impl Client {
         draft: Option<&Draft<'_>>,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
+        self.resolve_drafts(r, draft.map_or(&[], std::slice::from_ref), events)
+    }
+
+    /// [`Client::resolve`] for a caller that does not know the set's family
+    /// before it is fetched: `drafts` holds each family's draft, and each
+    /// whose file name the repo holds is fetched or skipped by its own
+    /// [`Draft::usable`], which reads the fetched first shard and refuses a
+    /// set of another family by name. No draft, nothing fetched and nothing
+    /// said.
+    pub fn resolve_drafts(
+        &self,
+        r: &RepoRef,
+        drafts: &[Draft<'_>],
+        events: &mut dyn FnMut(&Event<'_>),
+    ) -> Result<Vec<PathBuf>, HfError> {
         let entries = match self.listed(&r.repo)? {
             Listed::Hub(entries) => entries,
             Listed::Cache(why) => return self.offline_set(r, &why, events),
@@ -567,20 +582,21 @@ impl Client {
         for e in &set.files {
             files.push(self.fetch(&r.repo, e, events)?);
         }
-        if let Some(d) = draft
-            && let Some(e) = crate::mtp_draft(&r.repo, &entries, d.name)?
-        {
-            match (d.usable)(&files[0]) {
-                // Beside the first shard, under the name the engine opens it
-                // by: wherever the repo keeps the draft, the run finds it there.
-                Ok(()) => {
-                    let dest = files[0].with_file_name(d.name);
-                    self.fetch_to(&r.repo, e, &dest, events)?;
+        for d in drafts {
+            if let Some(e) = crate::mtp_draft(&r.repo, &entries, d.name)? {
+                match (d.usable)(&files[0]) {
+                    // Beside the first shard, under the name the engine opens
+                    // it by: wherever the repo keeps the draft, the run finds
+                    // it there.
+                    Ok(()) => {
+                        let dest = files[0].with_file_name(d.name);
+                        self.fetch_to(&r.repo, e, &dest, events)?;
+                    }
+                    Err(why) => events(&Event::DraftSkip {
+                        file: &e.path,
+                        why: &why,
+                    }),
                 }
-                Err(why) => events(&Event::DraftSkip {
-                    file: &e.path,
-                    why: &why,
-                }),
             }
         }
         Ok(files)
@@ -1424,6 +1440,71 @@ mod tests {
             .expect("resolve");
         assert_eq!(got, [d.join("cache/a/b/m-Q4_K_M.gguf")]);
         assert_eq!(seen, ["m-Q4_K_M.gguf"]);
+    }
+
+    /// A family with no draft row hands a resolve no draft: the repo's file
+    /// of a draft's name is not fetched, and nothing is said of it.
+    #[test]
+    fn a_family_with_no_draft_row_fetches_no_draft() {
+        let d = scratch("draft-no-row");
+        let body = content();
+        let c = hub(
+            &d,
+            "a/b",
+            &[
+                ("m-Q4_K_M.gguf", &body),
+                ("MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", b"draft"),
+            ],
+        );
+        let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
+        let mut seen = Vec::new();
+        let got = c
+            .resolve_drafts(&r, &[], &mut |ev| match ev {
+                Event::File { file, .. } => seen.push(format!("file {file}")),
+                Event::DraftSkip { file, .. } => seen.push(format!("skip {file}")),
+                _ => {}
+            })
+            .expect("resolve");
+        assert_eq!(got, [d.join("cache/a/b/m-Q4_K_M.gguf")]);
+        assert_eq!(seen, ["file m-Q4_K_M.gguf"]);
+        assert!(!d.join("cache/a/b/MTP").exists(), "a draft was fetched");
+        assert!(
+            !got[0].with_file_name(DRAFT).exists(),
+            "a draft was fetched"
+        );
+    }
+
+    /// Each draft of the slice is looked up by its own name: the row the repo
+    /// holds no file of fetches nothing, the one it holds lands beside the set.
+    #[test]
+    fn each_draft_of_the_slice_is_looked_up_by_its_own_name() {
+        let d = scratch("draft-rows");
+        let body = content();
+        let c = hub(&d, "a/b", &[("m-Q4_K_M.gguf", &body), (DRAFT, b"draft")]);
+        let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
+        let drafts = [
+            Draft {
+                name: "mtp-another-family.gguf",
+                usable: &|_| Err("never asked".to_owned()),
+            },
+            RUNS,
+        ];
+        let mut seen = Vec::new();
+        let got = c
+            .resolve_drafts(&r, &drafts, &mut |ev| match ev {
+                Event::File { file, .. } => seen.push(format!("file {file}")),
+                Event::DraftSkip { file, .. } => seen.push(format!("skip {file}")),
+                _ => {}
+            })
+            .expect("resolve");
+        assert_eq!(
+            seen,
+            ["file m-Q4_K_M.gguf".to_owned(), format!("file {DRAFT}")]
+        );
+        assert_eq!(
+            fs::read(got[0].with_file_name(DRAFT)).expect("draft"),
+            b"draft"
+        );
     }
 
     #[test]

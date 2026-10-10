@@ -10,58 +10,26 @@ use std::path::{Path, PathBuf};
 
 use super::{ARCH, MODEL};
 use crate::RefError;
+use crate::arch::BesideDraft;
+pub use crate::arch::DraftFrom;
 use crate::family::{Build, Family, Identity};
 
 /// The shared MTP draft file every set of the family is dumped with and
 /// the tree runs: its one layer, no embedding and no output of its own.
 pub const DRAFT: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
 
-/// Where the MTP draft file a run opens came from ([`draft_file`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DraftFrom {
-    /// `BLOOMERY_MTP_DRAFT`.
-    Lever,
-    /// The file of [`DRAFT`]'s name in the target's directory.
-    Beside,
-    /// [`DRAFT`] itself: the lever unset and no file of its name beside the
-    /// target.
-    Family,
-}
+/// The qwen4exp family's beside-file draft ([`DRAFT`], for the target files
+/// that declare [`ARCH`]).
+pub static BESIDE: BesideDraft = BesideDraft {
+    arch: ARCH,
+    path: DRAFT,
+};
 
-impl DraftFrom {
-    /// Where the file came from, as an error about opening it says.
-    #[must_use]
-    pub fn describe(self) -> &'static str {
-        match self {
-            DraftFrom::Lever => "BLOOMERY_MTP_DRAFT",
-            DraftFrom::Beside => "the shared draft's name beside the target",
-            DraftFrom::Family => {
-                "the family's path: BLOOMERY_MTP_DRAFT is unset and no file of the shared draft's \
-                 name is beside the target"
-            }
-        }
-    }
-}
-
-/// The MTP draft file a run of `target` opens: `set` when given (the lever,
-/// which its reading has proven a file); else the file of [`DRAFT`]'s name in
-/// `target`'s directory, when one is there; else [`DRAFT`]. The family's
-/// identity stays [`DRAFT`] whichever the run opens: a set is checked
-/// against that path ([`MTP`]'s `draft_runs`), never against this one.
+/// The MTP draft file a run of `target` opens: [`BESIDE`]'s pick
+/// ([`BesideDraft::pick`]).
 #[must_use]
 pub fn draft_file(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
-    if let Some(p) = set {
-        return (p.to_path_buf(), DraftFrom::Lever);
-    }
-    let beside = Path::new(DRAFT)
-        .file_name()
-        .zip(target.parent())
-        .map(|(name, dir)| dir.join(name))
-        .filter(|p| p.is_file());
-    match beside {
-        Some(p) => (p, DraftFrom::Beside),
-        None => (PathBuf::from(DRAFT), DraftFrom::Family),
-    }
+    BESIDE.pick(set, target)
 }
 
 /// The ik tree the MTP draft set is dumped from: ik's glm5next MTP graph
