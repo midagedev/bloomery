@@ -117,7 +117,9 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
 - **Narrowing.** The graph over-selects a host-only change. When `just ptx-scan` equals the base for every bin the
   change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
   checks; `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list and why. A kernel, a launch or a byte
-  formula moved runs the whole list. Always `just ptx-scan <bin> --features …`.
+  formula moved runs the whole list. Always `just ptx-scan <bin> --features …`. A `--no-jit` scan (no card, no gate
+  lock) proves only a move: a pair with one narrows when it is identical and is refused by name otherwise; the add
+  and occupancy classes and `gate-ptx-spill` read the JIT columns and take the full scan.
 - **Weekly and opt-in.** `just affected` selects a `weekly-*` recipe only when a changed file matches one of its trigger
   rows in `tools/gate-paths.tsv` or its own text changes. `just stage-gpu-load-v41 [--plan a]` (plan (b) staged on
   both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
@@ -137,7 +139,7 @@ A round opens with a prediction: the value and band derived from the cost and er
 
 | Change class | Proof | Runtime gate | Timed A/B |
 |---|---|---|---|
-| move, split, rename | `just ptx-scan` identical; host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
+| move, split, rename | `just ptx-scan` identical (`--no-jit` suffices: no card, no gate lock); host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
 | delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` and equal resource columns | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
 | add (no engine caller yet) | ptx-scan = base plus exactly the new entries; `gate-ptx-spill` red on exactly them before pinning; the family gate green with FAIL-first per clause | the new family gate, and the owning gates of entries engine bins gained | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
