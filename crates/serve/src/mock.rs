@@ -119,11 +119,62 @@ struct AsyncSaves {
     stats: Arc<SaveStats>,
     /// Each slot's latest copy, begun through `&self`.
     flights: Mutex<Vec<Option<Arc<MockFlight>>>>,
+    /// The pool the copies' extents come from, when it is bounded
+    /// ([`MockEngine::with_staging`]).
+    pool: Option<Arc<MockPool>>,
 }
 
-/// The mock's state under [`MockEngine::with_async_snapshots`]: its context.
+/// The mock's staging pool: cells of `cell` bytes, a state taking as many
+/// next to each other as its bytes need, first fit, and giving them back when
+/// it drops.
+struct MockPool {
+    cell: u64,
+    used: Mutex<Vec<bool>>,
+}
+
+impl MockPool {
+    /// An extent for `bytes`, or what the pool lacks for it.
+    fn lend(self: &Arc<Self>, bytes: u64) -> Result<Extent, StateError> {
+        let cells = usize::try_from(bytes.div_ceil(self.cell)).expect("cells fit usize");
+        let mut used = self.used.lock().expect("the mock's pool");
+        let at = (0..used.len().saturating_sub(cells.saturating_sub(1)))
+            .find(|&i| used[i..i + cells].iter().all(|u| !u));
+        let Some(at) = at else {
+            let lent = used.iter().filter(|&&u| u).count() as u64;
+            return Err(StateError::NoRoom {
+                need: cells as u64 * self.cell,
+                held: used.len() as u64 * self.cell,
+                lent: lent * self.cell,
+            });
+        };
+        used[at..at + cells].fill(true);
+        Ok(Extent {
+            pool: Arc::clone(self),
+            at,
+            cells,
+        })
+    }
+}
+
+/// A run of cells of the mock's pool, lent to one state.
+struct Extent {
+    pool: Arc<MockPool>,
+    at: usize,
+    cells: usize,
+}
+
+impl Drop for Extent {
+    fn drop(&mut self) {
+        let mut used = self.pool.used.lock().expect("the mock's pool");
+        used[self.at..self.at + self.cells].fill(false);
+    }
+}
+
+/// The mock's state under [`MockEngine::with_async_snapshots`]: its context,
+/// and the extent of the pool it holds when its copy ran in one.
 struct MockSaved {
     ctx: Vec<u32>,
+    _extent: Option<Extent>,
 }
 
 impl Saved for MockSaved {
@@ -151,6 +202,9 @@ pub struct SaveStats {
     pub sync_snapshots: AtomicUsize,
     /// Copies begun ([`Engine::snapshot_begin`]).
     pub begun: AtomicUsize,
+    /// Copies the staging pool had no room to begin
+    /// ([`MockEngine::with_staging`]).
+    pub no_room: AtomicUsize,
     /// Calls that cut, reset or replaced a slot's rows while its copy still
     /// ran: the copy would have read rows another call rewrote.
     pub hazards: AtomicUsize,
@@ -288,10 +342,29 @@ impl MockEngine {
                 copy,
                 stats: Arc::clone(&stats),
                 flights,
+                pool: None,
             }),
             ..self
         };
         (mock, stats)
+    }
+
+    /// The same mock whose copies take their room from a pool of `cells`
+    /// cells of `cell` bytes ([`MockPool`]): a copy with no free run of cells
+    /// for its state is refused with [`StateError::NoRoom`], and the cells
+    /// come back when the state drops. Only after
+    /// [`MockEngine::with_async_snapshots`].
+    #[must_use]
+    pub fn with_staging(mut self, cell: u64, cells: usize) -> Self {
+        let saves = self
+            .saves
+            .as_mut()
+            .expect("a staging pool needs with_async_snapshots first");
+        saves.pool = Some(Arc::new(MockPool {
+            cell,
+            used: Mutex::new(vec![false; cells]),
+        }));
+        self
     }
 
     /// Counts a hazard when the selected slot's copy still runs.
@@ -579,6 +652,7 @@ impl Engine for MockEngine {
         std::thread::sleep(saves.copy);
         Ok(Arc::new(MockSaved {
             ctx: self.ctx.clone(),
+            _extent: None,
         }))
     }
 
@@ -592,6 +666,16 @@ impl Engine for MockEngine {
         let Some(saves) = &self.saves else {
             return Ok(Pending::landed(self.snapshot()?));
         };
+        let extent = match &saves.pool {
+            Some(pool) => match pool.lend(MOCK_STATE_HEAD + 4 * self.ctx.len() as u64) {
+                Ok(extent) => Some(extent),
+                Err(e) => {
+                    saves.stats.no_room.fetch_add(1, Ordering::SeqCst);
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
         saves.stats.begun.fetch_add(1, Ordering::SeqCst);
         let flight = Arc::new(MockFlight {
             done_at: Instant::now() + saves.copy,
@@ -600,6 +684,7 @@ impl Engine for MockEngine {
         saves.flights.lock().expect("the mock's flights")[self.cur] = Some(Arc::clone(&flight));
         let state: Arc<dyn Saved> = Arc::new(MockSaved {
             ctx: self.ctx.clone(),
+            _extent: extent,
         });
         Ok(Pending::new(state, flight))
     }
