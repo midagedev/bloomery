@@ -17,7 +17,10 @@
 //! seat's rule, which the engine thread answers ([`SeatEngine`]'s `keepable`
 //! and `keep_limit`); so are the prompt feed, a pass of the draft
 //! ([`Seat::pass`]), where a prompt call is cut, and the state the server's
-//! prompt cache saves and puts back ([`Seat::snapshot`], [`Seat::resume`]). How
+//! prompt cache saves and puts back ([`Seat::snapshot`], [`Seat::resume`]; a
+//! seat that copies on a stream of its own begins a save that does not stop the
+//! slots, [`Seat::snapshot_begin`], and puts back a prefix,
+//! [`Seat::resume_prefix`]). How
 //! far the positions go is the lesser of the cache and the positions the body
 //! computes the model at (`spawn`'s `defined`): the server refuses a request
 //! past it, so a client's long prompt or `max_tokens` never reaches the body's
@@ -53,8 +56,8 @@ use model::placement::{Device, Machine, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER,
-    ModelProps, PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused, SamplingParams,
+    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Landed,
+    ModelProps, Pending, PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused, SamplingParams,
     Saved, SavedState, ServeError, Server, ServerConfig, SlotConfig, StateError, Tokenizer,
 };
 
@@ -843,8 +846,20 @@ enum Cmd {
     },
     /// The sequence state, as a value.
     Save,
+    /// The sequence state, as a value whose copy may still run
+    /// ([`Seat::snapshot_begin`]).
+    SaveBegin,
+    /// What a begun copy cost if it has landed, `None` if it runs
+    /// ([`serve::Flight::poll`]), asked on the engine thread.
+    SavePoll(Pending),
+    /// The wait for a begun copy ([`serve::Flight::wait`]), on the engine
+    /// thread.
+    SaveWait(Pending),
     /// Replace the sequence state with a saved one.
     Resume(Arc<dyn Saved>),
+    /// Replace the sequence state with the first positions of a saved one
+    /// ([`Seat::resume_prefix`]).
+    ResumePrefix(Arc<dyn Saved>, usize),
     /// The selected slot's state written into the pipe ([`save_into`]).
     SaveState(SyncSender<Vec<u8>>),
     /// The selected slot's state read from the pipe ([`restore_from`]).
@@ -896,8 +911,17 @@ enum Extra {
     Splits(Vec<usize>),
     /// A `Save`'s state, or its failure with its kind ([`snapshot_of`]).
     Saved(Result<Arc<dyn Saved>, StateError>),
+    /// A `SaveBegin`'s state with its copy in flight, or its failure with its
+    /// kind ([`begin_of`]).
+    Begun(Result<Pending, StateError>),
+    /// A `SavePoll`'s or `SaveWait`'s answer: what the copy cost once it has
+    /// landed, `None` while it runs (a wait never answers `None`).
+    Polled(Result<Option<Landed>, StateError>),
     /// A `Resume`'s outcome with its kind ([`resume_of`]).
     Resumed(Result<(), StateError>),
+    /// A `ResumePrefix`' positions put back, or its failure with its kind
+    /// ([`resume_prefix_of`]).
+    Prefix(Result<usize, StateError>),
     /// A `SaveState`'s or `RestoreState`'s outcome, its kind as the seat
     /// gave it.
     State(Result<SavedState, StateError>),
@@ -1106,10 +1130,35 @@ pub trait Seat: 'static {
     /// request's: the server keeps no state and serves on. Any other error is
     /// the engine's, which ends the server.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError>;
+    /// Whether [`Seat::snapshot_begin`] copies the state on a stream of the
+    /// seat's own, so the server may ask for it when a request ends without
+    /// stopping the slots (`serve::Engine::snapshots_async`). The default is
+    /// false: the snapshot is taken on the request path.
+    fn snapshots_async(&self) -> bool {
+        false
+    }
+    /// [`Seat::snapshot`] whose copy may still run when the call returns:
+    /// the state's positions, bytes and rules are known at once, its bytes
+    /// are read only after the [`Pending`]'s flight has landed, and the
+    /// slot's rows are not cut, reset or replaced before then
+    /// (`serve::Engine::snapshot_begin`). The default is the snapshot, landed
+    /// already.
+    fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+        Ok(Pending::landed(self.snapshot()?))
+    }
     /// Replace the sequence state with `state`, which [`Seat::snapshot`] took
     /// of this seat. A refusal by name ([`Seat::snapshot`]'s kinds) is the
     /// request's: the server drops the state and resets the slot.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError>;
+    /// Replace the sequence state with the first `n` positions of `state`
+    /// (`serve::Engine::resume_prefix`): only the rows and the stores of those
+    /// positions go to the card; returns the positions the seat holds after.
+    /// The default is [`Seat::resume`] of the whole state.
+    fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
+        let _ = n;
+        self.resume(state)?;
+        Ok(state.n_tokens())
+    }
     /// The selected slot's sequence state written to `out` in a form
     /// [`Seat::restore_state`] reads back (`serve::Engine::save_state`), the
     /// state unchanged; the bytes written. A refusal is `Format`, an error
@@ -1167,6 +1216,8 @@ pub struct SeatEngine {
     slot_drafts: bool,
     /// [`Seat::drafts_sampled`], the opened seat's.
     drafts_sampled: bool,
+    /// [`Seat::snapshots_async`], the opened seat's.
+    snapshots_async: bool,
     /// [`Seat::media_model`], the opened seat's.
     media: Option<SharedMediaModel>,
     card: String,
@@ -1225,6 +1276,7 @@ impl SeatEngine {
                     usize,
                     bool,
                     bool,
+                    bool,
                     Option<SharedMediaModel>,
                     EngineProps,
                 ),
@@ -1249,6 +1301,7 @@ impl SeatEngine {
                         g.slots(),
                         g.slot_drafts(),
                         g.drafts_sampled(),
+                        g.snapshots_async(),
                         g.media_model(),
                         g.props(props),
                     )))
@@ -1320,6 +1373,11 @@ impl SeatEngine {
                             (result, None, extra)
                         }
                         Cmd::Save => (Ok(0), None, Extra::Saved(snapshot_of(&mut g))),
+                        Cmd::SaveBegin => (Ok(0), None, Extra::Begun(begin_of(&mut g))),
+                        Cmd::SavePoll(p) => (Ok(0), None, Extra::Polled(p.flight().poll())),
+                        Cmd::SaveWait(p) => {
+                            (Ok(0), None, Extra::Polled(p.flight().wait().map(Some)))
+                        }
                         Cmd::ResidencyReset => match g.residency_reset() {
                             Ok(r) => (Ok(0), None, Extra::Residency(r)),
                             Err(e) => (
@@ -1331,6 +1389,11 @@ impl SeatEngine {
                         Cmd::Resume(state) => {
                             (Ok(0), None, Extra::Resumed(resume_of(&mut g, &*state)))
                         }
+                        Cmd::ResumePrefix(state, n) => (
+                            Ok(0),
+                            None,
+                            Extra::Prefix(resume_prefix_of(&mut g, &*state, n)),
+                        ),
                         Cmd::SaveState(chunks) => {
                             (Ok(0), None, Extra::State(save_into(&mut g, chunks)))
                         }
@@ -1381,9 +1444,10 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, slots, slot_drafts, drafts_sampled, media, props) = match loaded.recv()
-        {
-            Ok(Ok((c, rows, n, d, ds, m, props))) => (c.min(defined), rows, n, d, ds, m, props),
+        let (ctx_max, rows, slots, drafts, media, props) = match loaded.recv() {
+            Ok(Ok((c, rows, n, d, ds, sa, m, props))) => {
+                (c.min(defined), rows, n, [d, ds, sa], m, props)
+            }
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -1399,8 +1463,9 @@ impl SeatEngine {
             ctx_max,
             rows,
             slots,
-            slot_drafts,
-            drafts_sampled,
+            slot_drafts: drafts[0],
+            drafts_sampled: drafts[1],
+            snapshots_async: drafts[2],
             media,
             card,
             props,
@@ -1471,6 +1536,51 @@ impl Link {
             (Err(e), _) => Err(StateError::Engine(EngineError(e))),
             (Ok(_), _) => Err(StateError::Engine(EngineError(
                 "the engine thread answered a resume with no outcome".to_owned(),
+            ))),
+        }
+    }
+
+    /// The selected slot's state as a value whose copy may still run
+    /// ([`Seat::snapshot_begin`]), its failure's kind as [`begin_of`] read it.
+    fn snapshot_begin(&self) -> Result<Pending, StateError> {
+        let reply = self.ask(Cmd::SaveBegin)?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Begun(p)) => p,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a begun save with no state".to_owned(),
+            ))),
+        }
+    }
+
+    /// A begun copy's answer from the engine thread: `wait` waits for it,
+    /// else it is asked without waiting.
+    fn flight(&self, p: &Pending, wait: bool) -> Result<Option<Landed>, StateError> {
+        let cmd = if wait {
+            Cmd::SaveWait(p.clone())
+        } else {
+            Cmd::SavePoll(p.clone())
+        };
+        let reply = self.ask(cmd)?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Polled(l)) => l,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a copy's flight with no outcome".to_owned(),
+            ))),
+        }
+    }
+
+    /// The first `n` positions of `state` back into the selected slot
+    /// ([`Seat::resume_prefix`]), its failure's kind as [`resume_prefix_of`]
+    /// read it.
+    fn resume_prefix(&self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
+        let reply = self.ask(Cmd::ResumePrefix(Arc::clone(state), n))?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Prefix(r)) => r,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a prefix resume with no outcome".to_owned(),
             ))),
         }
     }
@@ -1858,7 +1968,11 @@ fn serve_cmd<S: Seat>(
         Cmd::Keep(..)
         | Cmd::Splits { .. }
         | Cmd::Save
+        | Cmd::SaveBegin
+        | Cmd::SavePoll(_)
+        | Cmd::SaveWait(_)
         | Cmd::Resume(_)
+        | Cmd::ResumePrefix(..)
         | Cmd::SaveState(_)
         | Cmd::RestoreState(_)
         | Cmd::Pass { .. }
@@ -2034,6 +2148,34 @@ fn resume_of<S: Seat + ?Sized>(g: &mut S, state: &dyn Saved) -> Result<(), State
         seat_failure(
             &*e,
             format!("resume of a state of {} positions", state.n_tokens()),
+        )
+    })
+}
+
+/// The selected slot's state as a value whose copy may still run
+/// ([`Seat::snapshot_begin`]), on the engine thread; a failure with its kind
+/// ([`seat_failure`]).
+fn begin_of<S: Seat + ?Sized>(g: &mut S) -> Result<Pending, StateError> {
+    let at = g.pos();
+    g.snapshot_begin()
+        .map_err(|e| seat_failure(&*e, format!("snapshot begun at position {at}")))
+}
+
+/// The first `n` positions of `state` back into the selected slot
+/// ([`Seat::resume_prefix`]), on the engine thread; a failure with its kind
+/// ([`seat_failure`]).
+fn resume_prefix_of<S: Seat + ?Sized>(
+    g: &mut S,
+    state: &dyn Saved,
+    n: usize,
+) -> Result<usize, StateError> {
+    g.resume_prefix(state, n).map_err(|e| {
+        seat_failure(
+            &*e,
+            format!(
+                "resume of the first {n} positions of a state of {} positions",
+                state.n_tokens()
+            ),
         )
     })
 }
@@ -2312,6 +2454,12 @@ impl Engine for SeatEngine {
         self.drafts_sampled
     }
 
+    /// The seat's declaration ([`Seat::snapshots_async`]), read once at the
+    /// spawn.
+    fn snapshots_async(&self) -> bool {
+        self.snapshots_async
+    }
+
     /// The seat's slots ([`Seat::slots`]), read once at the spawn: the
     /// server serves this many sequences at once and steps them together.
     fn slots(&self) -> usize {
@@ -2406,6 +2554,31 @@ impl Engine for SeatEngine {
     /// any other failure fatal.
     fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
         self.link.resume(state)
+    }
+
+    /// The seat's state with its copy in flight ([`Link::snapshot_begin`]).
+    fn snapshot_begin(&self) -> Result<Pending, StateError> {
+        self.link.snapshot_begin()
+    }
+
+    /// Whether `pending`'s copy has landed, asked on the engine thread.
+    fn snapshot_poll(&self, pending: &Pending) -> Result<Option<Landed>, StateError> {
+        self.link.flight(pending, false)
+    }
+
+    /// The wait for `pending`'s copy, on the engine thread.
+    fn snapshot_wait(&self, pending: &Pending) -> Result<Landed, StateError> {
+        self.link.flight(pending, true)?.ok_or_else(|| {
+            StateError::Engine(EngineError(
+                "the engine thread answered a wait for a copy with none landed".to_owned(),
+            ))
+        })
+    }
+
+    /// The first `n` positions of the state back into the seat
+    /// ([`Link::resume_prefix`]).
+    fn resume_prefix(&mut self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
+        self.link.resume_prefix(state, n)
     }
 
     /// The selected slot's state through the pipe ([`Seat::save_state`]),
@@ -3112,16 +3285,19 @@ mod tests {
     mod slot_files {
         use std::io::{self, Read, Write};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
         use std::thread::JoinHandle;
 
-        use serve::{CacheNote, EngineError, Saved, SavedState, StateError};
+        use serve::{
+            CacheNote, EngineError, Flight, Landed, Pending, Saved, SavedState, StateError,
+        };
 
         use bloomery_gpu::GpuError;
 
         use super::super::{
-            Cmd, Extra, Link, PIPE_CHUNK, Reply, Seat, restore_from, resume_of, save_into, settle,
-            snapshot_of,
+            Cmd, Extra, Link, PIPE_CHUNK, Reply, Seat, begin_of, restore_from, resume_of,
+            resume_prefix_of, save_into, settle, snapshot_of,
         };
         use crate::GateError;
 
@@ -3270,6 +3446,76 @@ mod tests {
             }
         }
 
+        /// What a landed copy cost.
+        const COST: Landed = Landed {
+            copy_ms: 1.5,
+            calls: 6,
+            alloc_ms: 0.0,
+        };
+
+        /// A copy that lands on its `at`-th poll; a wait lands it at once.
+        struct Slow {
+            polls: AtomicUsize,
+            at: usize,
+        }
+
+        impl Flight for Slow {
+            fn poll(&self) -> Result<Option<Landed>, StateError> {
+                Ok((self.polls.fetch_add(1, Ordering::SeqCst) + 1 >= self.at).then_some(COST))
+            }
+
+            fn wait(&self) -> Result<Landed, StateError> {
+                Ok(COST)
+            }
+        }
+
+        /// A seat that copies its snapshots on a stream of its own and puts
+        /// back the prefix it is asked for.
+        struct Lazy {
+            pos: usize,
+            flight: Arc<Slow>,
+            resumed: Vec<usize>,
+        }
+
+        impl Seat for Lazy {
+            no_steps!();
+            no_cache!();
+
+            fn snapshots_async(&self) -> bool {
+                true
+            }
+
+            fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+                Ok(Pending::new(Arc::new(Held(30)), self.flight.clone()))
+            }
+
+            fn resume_prefix(&mut self, _: &dyn Saved, n: usize) -> Result<usize, GateError> {
+                self.resumed.push(n);
+                Ok(n)
+            }
+        }
+
+        /// A seat that keeps the trait's defaults for a begun copy and a
+        /// prefix: its snapshot is taken on the call, its resume is the whole
+        /// state's.
+        struct Whole {
+            pos: usize,
+            resumes: usize,
+        }
+
+        impl Seat for Whole {
+            no_steps!();
+
+            fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+                Ok(Arc::new(Held(30)))
+            }
+
+            fn resume(&mut self, _: &dyn Saved) -> Result<(), GateError> {
+                self.resumes += 1;
+                Ok(())
+            }
+        }
+
         /// An error whose source is the one it wraps, as a seat's own error
         /// wraps the body's.
         #[derive(Debug)]
@@ -3300,6 +3546,12 @@ mod tests {
                         Cmd::RestoreState(chunks) => Extra::State(restore_from(&mut seat, chunks)),
                         Cmd::Save => Extra::Saved(snapshot_of(&mut seat)),
                         Cmd::Resume(state) => Extra::Resumed(resume_of(&mut seat, &*state)),
+                        Cmd::SaveBegin => Extra::Begun(begin_of(&mut seat)),
+                        Cmd::SavePoll(p) => Extra::Polled(p.flight().poll()),
+                        Cmd::SaveWait(p) => Extra::Polled(p.flight().wait().map(Some)),
+                        Cmd::ResumePrefix(state, n) => {
+                            Extra::Prefix(resume_prefix_of(&mut seat, &*state, n))
+                        }
                         _ => panic!("the file thread answers a seat's state commands only"),
                     };
                     let reply = Reply {
@@ -3321,6 +3573,68 @@ mod tests {
                 scratch: Vec::new(),
             };
             (link, worker)
+        }
+
+        /// A copy begun on the engine thread is asked and waited for there: the
+        /// begun state reaches the link at once, a poll answers nothing while
+        /// the copy runs and its cost once it has landed, a wait answers the
+        /// cost, and a prefix goes back through the seat's own call; a seat
+        /// that keeps the defaults takes its snapshot on the call (landed
+        /// already, its `snapshots_async` false) and puts the whole state back,
+        /// saying so.
+        #[test]
+        fn a_begun_copy_is_asked_and_waited_for_on_the_engine_thread() {
+            let flight = Arc::new(Slow {
+                polls: AtomicUsize::new(0),
+                at: 2,
+            });
+            let lazy = Lazy {
+                pos: 30,
+                flight: Arc::clone(&flight),
+                resumed: Vec::new(),
+            };
+            assert!(lazy.snapshots_async());
+            let (mut link, worker) = file_link(lazy);
+            let p = link.snapshot_begin().expect("a begun copy");
+            assert_eq!(p.state().n_tokens(), 30);
+            assert_eq!(
+                link.flight(&p, false).expect("a poll"),
+                None,
+                "still running"
+            );
+            assert_eq!(
+                link.flight(&p, false).expect("a poll"),
+                Some(COST),
+                "landed"
+            );
+            assert_eq!(link.flight(&p, true).expect("a wait"), Some(COST));
+            assert_eq!(link.resume_prefix(p.state(), 12).expect("a prefix"), 12);
+            link.tx = None;
+            let seat = worker.join().expect("the file thread");
+            assert_eq!(seat.resumed, vec![12]);
+            assert_eq!(
+                flight.polls.load(Ordering::SeqCst),
+                2,
+                "a wait is not a poll"
+            );
+
+            let whole = Whole {
+                pos: 30,
+                resumes: 0,
+            };
+            assert!(!whole.snapshots_async());
+            let (mut link, worker) = file_link(whole);
+            let p = link.snapshot_begin().expect("a snapshot on the call");
+            assert_eq!(
+                link.flight(&p, false).expect("a poll"),
+                Some(Landed::default())
+            );
+            assert_eq!(
+                link.resume_prefix(p.state(), 12).expect("a whole resume"),
+                30
+            );
+            link.tx = None;
+            assert_eq!(worker.join().expect("the file thread").resumes, 1);
         }
 
         /// `n` bytes of a pattern that repeats past no chunk boundary.
@@ -3505,10 +3819,20 @@ mod tests {
                 let (mut link, worker) = file_link(Caches { pos: 7, fail });
                 let saved = link.snapshot().map(|_| ()).expect_err("a failed snapshot");
                 let resumed = link.resume(&held).expect_err("a failed resume");
+                let begun = link
+                    .snapshot_begin()
+                    .map(|_| ())
+                    .expect_err("a failed begin");
+                let prefix = link.resume_prefix(&held, 3).expect_err("a failed prefix");
                 let want = fail().to_string();
                 for (e, head) in [
                     (&saved, "snapshot at position 7: "),
                     (&resumed, "resume of a state of 4 positions: "),
+                    (&begun, "snapshot begun at position 7: "),
+                    (
+                        &prefix,
+                        "resume of the first 3 positions of a state of 4 positions: ",
+                    ),
                 ] {
                     let m = match e {
                         StateError::Format(m) if refused => m,

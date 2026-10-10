@@ -350,6 +350,9 @@ struct Worker {
     /// where it holds one request's sequence at a time.
     quantum: Option<NonZeroUsize>,
     turns: Option<Turns>,
+    /// The slots whose requests ended since the round's last seal
+    /// ([`Worker::seal_ended`]).
+    ended: Vec<usize>,
 }
 
 /// Runs the engine thread until the engine fails or the thread panics.
@@ -385,6 +388,7 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
         prompting: Vec::new(),
         quantum,
         turns,
+        ended: Vec::new(),
     };
     let ran = panic::catch_unwind(AssertUnwindSafe(|| {
         if w.turns.is_some() {
@@ -487,7 +491,28 @@ impl Worker {
             if self.step().is_err() {
                 return;
             }
+            if self.seal_ended().is_err() {
+                return;
+            }
         }
+    }
+
+    /// The slots whose requests ended this round hand their states to the
+    /// prompt cache ([`Slot::seal`]): an engine that copies on a stream of
+    /// its own begins each copy here, after the round's step and before any
+    /// request is admitted to the slot, so the next request that cuts the
+    /// slot finds its state saved. An engine failure is fatal.
+    fn seal_ended(&mut self) -> Result<(), Dead> {
+        for slot in std::mem::take(&mut self.ended) {
+            if self.sh.stopped() {
+                break;
+            }
+            if let Err(e) = self.slot.seal(slot) {
+                let f = self.fail(&e);
+                return Err(self.end(f));
+            }
+        }
+        Ok(())
     }
 
     /// Records an engine failure: `/health` and every later request see it,
@@ -892,6 +917,11 @@ impl Worker {
     fn end_request(&mut self, a: Active, r: Result<Outcome, GenError>) {
         let t = a.job.timings();
         self.book(t);
+        // An engine failure leaves no state to save; any other end leaves the
+        // slot holding what it fed.
+        if self.turns.is_none() && !matches!(r, Err(GenError::Engine(_))) {
+            self.ended.push(a.slot);
+        }
         {
             let mut b = relock(&self.sh.board);
             let v = b.view_mut(a.slot);

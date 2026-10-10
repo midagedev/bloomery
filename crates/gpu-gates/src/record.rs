@@ -2802,13 +2802,29 @@ pub static CACHE_REUSE: Kind = Kind {
 pub static CACHE_SAVE: Kind = Kind {
     name: "cache_save",
     head: "cache save",
-    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot, and the cache after it.",
+    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot (the call that began the copy when off_path), the cache after it, and whether its copy runs off the request path, on the engine's copy stream.",
     parts: &[
         key("positions", U64, "positions"),
         key("bytes", U64, "B"),
         key("ms", F64(3), "ms"),
         key("entries", U64, ""),
         key("cache_bytes", U64, "B"),
+        key("off_path", Bool, ""),
+    ],
+};
+
+/// A saved state's copy landed.
+pub static CACHE_LANDED: Kind = Kind {
+    name: "cache_landed",
+    head: "cache landed",
+    doc: "The copy of a saved state landed on the host: its positions and bytes, the copy calls it took, its time on the copy stream, the pinned staging it allocated for itself, and the time the request path waited for it (0 when it had landed before a request needed it).",
+    parts: &[
+        key("positions", U64, "positions"),
+        key("bytes", U64, "B"),
+        key("calls", U64, ""),
+        key("copy_ms", F64(3), "ms"),
+        key("alloc_ms", F64(3), "ms"),
+        key("waited_ms", F64(3), "ms"),
     ],
 };
 
@@ -2816,7 +2832,7 @@ pub static CACHE_SAVE: Kind = Kind {
 pub static CACHE_LOAD: Kind = Kind {
     name: "cache_load",
     head: "cache load",
-    doc: "A cached state replaced the slot's: its positions, the ids it shares with the request, what the engine keeps of them after it and what the slot would have kept, its bytes and the server's wall clock around the resume.",
+    doc: "A cached state replaced the slot's: its positions, the ids it shares with the request, what the engine keeps of them after it and what the slot would have kept, its bytes and the server's wall clock around the resume, the positions the engine put back of it, and the time the request path waited for the state's copy to land first.",
     parts: &[
         key("positions", U64, "positions"),
         key("common", U64, "positions"),
@@ -2824,6 +2840,8 @@ pub static CACHE_LOAD: Kind = Kind {
         key("slot_kept", U64, "positions"),
         key("bytes", U64, "B"),
         key("ms", F64(3), "ms"),
+        key("resumed", U64, "positions"),
+        key("waited_ms", F64(3), "ms"),
     ],
 };
 
@@ -2986,6 +3004,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &LISTENING,
     &CACHE_REUSE,
     &CACHE_SAVE,
+    &CACHE_LANDED,
     &CACHE_LOAD,
     &CACHE_EVICT,
     &CACHE_SKIP,
@@ -4170,7 +4189,7 @@ mod tests {
         assert_eq!((plan38.at(), plan38.line()), (2, PLAN38_PLACED));
         let ds41 = Log::of(
             "cache ram=8589934592 headroom=111730458624 user_start=<|User|> in_template=true\n\
-             cache save positions=46 bytes=359555072 ms=103.234 entries=2 cache_bytes=718986240\n\
+             cache save positions=46 bytes=359555072 ms=103.234 entries=2 cache_bytes=718986240 off_path=false\n\
              cache reuse common=40 ask=40 kept=38 held=46 reason=the cut at a message start",
             BLOOMERY_SERVE_DS41,
         );
@@ -4190,6 +4209,37 @@ mod tests {
         assert_eq!(
             q3.one(&LOAD_QWEN3).and_then(|f| f.u64("slot_ctx")),
             Ok(23_552)
+        );
+    }
+
+    /// A save whose copy runs off the request path is three lines, each read
+    /// by field: `cache save` says it ran off the path and what the call that
+    /// began it cost, `cache landed` the copy's own cost and what the request
+    /// path waited, `cache load` the positions put back and what that load
+    /// waited for.
+    #[test]
+    fn an_off_path_save_reads_by_field() {
+        let log = Log::of(
+            "cache save positions=46 bytes=1000 ms=0.500 entries=2 cache_bytes=2000 off_path=true\n\
+             cache landed positions=46 bytes=1000 calls=97 copy_ms=15.000 alloc_ms=0.000 waited_ms=0.000\n\
+             cache load positions=46 common=40 kept=38 slot_kept=10 bytes=1000 ms=1.500 resumed=38 waited_ms=2.500",
+            BLOOMERY_SERVE_DS41,
+        );
+        let save = log.one(&CACHE_SAVE).unwrap();
+        assert_eq!((save.bool("off_path"), save.f64("ms")), (Ok(true), Ok(0.5)));
+        let landed = log.one(&CACHE_LANDED).unwrap();
+        assert_eq!(
+            (
+                landed.u64("calls"),
+                landed.f64("copy_ms"),
+                landed.f64("waited_ms")
+            ),
+            (Ok(97), Ok(15.0), Ok(0.0))
+        );
+        let load = log.one(&CACHE_LOAD).unwrap();
+        assert_eq!(
+            (load.u64("resumed"), load.f64("waited_ms")),
+            (Ok(38), Ok(2.5))
         );
     }
 

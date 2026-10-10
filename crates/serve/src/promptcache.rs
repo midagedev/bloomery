@@ -11,15 +11,32 @@
 //! branch from one saved state both find it. A new state removes every older
 //! one it keeps all of, and the oldest states leave until the new one fits; a
 //! state larger than the whole budget is not kept.
+//!
+//! A state may be held while its copy still runs ([`Pending`]): it counts
+//! against the budget and ranks like any other, but it never leaves before
+//! its copy has landed ([`PromptCache::settle`]) — not for the budget, not
+//! because a newer state keeps all of it — since its staging may not be freed
+//! or lent again while the copy writes it. A state that fits only by one
+//! leaving is not kept, and the cache is then as it was.
 
 use std::sync::Arc;
 
-use crate::engine::{CacheNote, Saved};
+use crate::engine::{CacheNote, Pending, Saved};
 use crate::media::{Held, common_prefix, keep_whole_spans};
 
 struct Entry {
     held: Held,
     state: Arc<dyn Saved>,
+    /// The copy of `state` while it may still run.
+    pending: Option<Pending>,
+}
+
+/// What [`PromptCache::take`] hands back: a state, the ids it holds, and its
+/// copy while it may still run — to wait for before the state is read.
+pub(crate) struct Taken {
+    pub held: Held,
+    pub state: Arc<dyn Saved>,
+    pub pending: Option<Pending>,
 }
 
 /// The cached state a request is best served by ([`PromptCache::best`]).
@@ -80,11 +97,36 @@ impl PromptCache {
     }
 
     /// `pick`'s held sequence and state, the entry made the most recent.
-    pub(crate) fn take(&mut self, pick: Pick) -> (Held, Arc<dyn Saved>) {
+    pub(crate) fn take(&mut self, pick: Pick) -> Taken {
         let e = self.entries.remove(pick.index);
-        let got = (e.held.clone(), Arc::clone(&e.state));
+        let got = Taken {
+            held: e.held.clone(),
+            state: Arc::clone(&e.state),
+            pending: e.pending.clone(),
+        };
         self.entries.push(e);
         got
+    }
+
+    /// The copies that may still run, oldest entry first.
+    pub(crate) fn in_flight(&self) -> Vec<Pending> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.pending.clone())
+            .collect()
+    }
+
+    /// `pending`'s copy landed: its entry may leave from here on. False when
+    /// the cache no longer holds the entry.
+    pub(crate) fn settle(&mut self, pending: &Pending) -> bool {
+        let mut found = false;
+        for e in &mut self.entries {
+            if e.pending.as_ref().is_some_and(|p| p.is(pending)) {
+                e.pending = None;
+                found = true;
+            }
+        }
+        found
     }
 
     /// Drops the entry that holds `state`, if the cache still does: a state
@@ -113,6 +155,32 @@ impl PromptCache {
         ms: f64,
         copied: bool,
     ) -> Vec<CacheNote> {
+        self.place(held, state, None, ms, copied)
+    }
+
+    /// Keeps `pending`'s state of `held` as [`PromptCache::insert`] does,
+    /// the copy still running: the entry stays until it is
+    /// [settled](PromptCache::settle). A state that fits only by an entry
+    /// whose copy still runs leaving is refused (a `Skip`), the cache as it
+    /// was. `ms` is the call that began the copy.
+    pub(crate) fn insert_pending(
+        &mut self,
+        held: Held,
+        pending: Pending,
+        ms: f64,
+    ) -> Vec<CacheNote> {
+        let state = Arc::clone(pending.state());
+        self.place(held, state, Some(pending), ms, true)
+    }
+
+    fn place(
+        &mut self,
+        held: Held,
+        state: Arc<dyn Saved>,
+        pending: Option<Pending>,
+        ms: f64,
+        copied: bool,
+    ) -> Vec<CacheNote> {
         let bytes = state.n_bytes();
         let positions = held.ids.len();
         if bytes > self.budget {
@@ -124,28 +192,59 @@ impl PromptCache {
                 ),
             }];
         }
-        let mut notes = Vec::new();
-        self.entries.retain(|e| {
-            let covered = held.starts_with(&e.held)
+        // What leaves, decided before anything does: the entries the new
+        // state keeps all of, then the oldest, none of them one whose copy
+        // still runs.
+        let mut gone: Vec<(usize, &'static str)> = Vec::new();
+        let mut held_bytes = self.bytes();
+        for (i, e) in self.entries.iter().enumerate() {
+            let covered = e.pending.is_none()
+                && held.starts_with(&e.held)
                 && state.keepable(e.held.ids.len()) >= e.state.keepable(e.held.ids.len());
             if covered {
-                notes.push(CacheNote::Evict {
-                    positions: e.held.ids.len(),
-                    bytes: e.state.n_bytes(),
-                    why: "a newer state keeps all of it",
-                });
+                gone.push((i, "a newer state keeps all of it"));
+                held_bytes -= e.state.n_bytes();
             }
-            !covered
-        });
-        while !self.entries.is_empty() && self.bytes() + bytes > self.budget {
-            let e = self.entries.remove(0);
+        }
+        for (i, e) in self.entries.iter().enumerate() {
+            if held_bytes + bytes <= self.budget {
+                break;
+            }
+            if e.pending.is_none() && !gone.iter().any(|&(g, _)| g == i) {
+                gone.push((i, "the budget"));
+                held_bytes -= e.state.n_bytes();
+            }
+        }
+        if held_bytes + bytes > self.budget {
+            return vec![CacheNote::Skip {
+                positions,
+                why: format!(
+                    "its {bytes} bytes fit the cache's budget of {} only past the states \
+                     whose copies still run",
+                    self.budget
+                ),
+            }];
+        }
+        let mut notes = Vec::new();
+        for &(i, why) in &gone {
+            let e = &self.entries[i];
             notes.push(CacheNote::Evict {
                 positions: e.held.ids.len(),
                 bytes: e.state.n_bytes(),
-                why: "the budget",
+                why,
             });
         }
-        self.entries.push(Entry { held, state });
+        let mut leaving: Vec<usize> = gone.iter().map(|&(i, _)| i).collect();
+        leaving.sort_unstable_by(|a, b| b.cmp(a));
+        for i in leaving {
+            self.entries.remove(i);
+        }
+        let off_path = pending.is_some();
+        self.entries.push(Entry {
+            held,
+            state,
+            pending,
+        });
         notes.push(CacheNote::Save {
             positions,
             bytes,
@@ -153,6 +252,7 @@ impl PromptCache {
             entries: self.entries.len(),
             cache_bytes: self.bytes(),
             copied,
+            off_path,
         });
         notes
     }
@@ -164,7 +264,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::PromptCache;
-    use crate::engine::{CacheNote, Saved};
+    use crate::engine::{CacheNote, Flight, Landed, Pending, Saved, StateError};
     use crate::media::{Held, ImageKey, MediaSpan};
 
     /// A state of `n` positions and `bytes` bytes that keeps every position
@@ -277,7 +377,7 @@ mod tests {
         req.push(5);
         let p = c.best(&req, 0).expect("a pick");
         assert_eq!((p.common, p.kept), (30, 30), "{p:?}");
-        assert_eq!(c.take(p).0, a, "the state of the request's image");
+        assert_eq!(c.take(p).held, a, "the state of the request's image");
         let p = c.best(&imaged(3, &tail), 0).expect("a pick");
         assert_eq!(
             (p.common, p.kept),
@@ -341,6 +441,95 @@ mod tests {
         assert!(!c.covers(&head(&a, 60)), "the newer state keeps 0 of 60");
     }
 
+    /// A copy that runs until `land` is called.
+    #[derive(Default)]
+    struct Lands(std::sync::atomic::AtomicBool);
+
+    impl Flight for Lands {
+        fn poll(&self) -> Result<Option<Landed>, StateError> {
+            let done = self.0.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(done.then(Landed::default))
+        }
+        fn wait(&self) -> Result<Landed, StateError> {
+            Ok(Landed::default())
+        }
+    }
+
+    /// A state of `n` positions and `bytes` bytes whose copy runs.
+    fn running(n: usize, bytes: u64) -> Pending {
+        Pending::new(state(n, bytes, None), Arc::new(Lands::default()))
+    }
+
+    /// A state whose copy still runs is never evicted — not for the budget,
+    /// not because a newer state keeps all of it — and a state that fits only
+    /// by its leaving is refused with the cache as it was; once the copy has
+    /// landed it leaves like any other.
+    #[test]
+    fn a_state_in_flight_never_leaves_before_its_copy_lands() {
+        let mut c = PromptCache::new(100);
+        let a = ids(50, 1);
+        let p = running(50, 60);
+        let notes = c.insert_pending(a.clone(), p.clone(), 0.0);
+        assert!(
+            matches!(
+                notes[..],
+                [CacheNote::Save {
+                    off_path: true,
+                    entries: 1,
+                    ..
+                }]
+            ),
+            "{notes:?}"
+        );
+        // The budget needs its bytes: 60 + 60 > 100, and the only state is in flight.
+        let notes = c.insert(ids(30, 9), state(30, 60, None), 0.0, true);
+        assert!(
+            matches!(&notes[..], [CacheNote::Skip { positions: 30, why }] if why.contains("copies still run")),
+            "{notes:?}"
+        );
+        assert_eq!((c.len(), c.bytes()), (1, 60), "the cache is as it was");
+        // A newer state that keeps all of it: it stays while the copy runs.
+        let mut longer = a.clone();
+        longer.ids.extend(ids(10, 5).ids);
+        let notes = c.insert(longer.clone(), state(60, 30, None), 0.0, true);
+        assert!(
+            notes.iter().all(|n| !matches!(n, CacheNote::Evict { .. })),
+            "the in-flight state was pruned: {notes:?}"
+        );
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.in_flight().len(), 1);
+        // Landed, it leaves for the budget like any other.
+        assert!(c.settle(&p));
+        assert!(c.in_flight().is_empty());
+        let notes = c.insert(ids(30, 9), state(30, 60, None), 0.0, true);
+        assert!(
+            matches!(
+                notes[0],
+                CacheNote::Evict {
+                    positions: 50,
+                    why: "the budget",
+                    ..
+                }
+            ),
+            "{notes:?}"
+        );
+    }
+
+    /// A pick of a state in flight hands its copy back, to wait for before
+    /// the state is read; a state that landed hands none.
+    #[test]
+    fn a_pick_hands_back_the_copy_still_running() {
+        let mut c = PromptCache::new(100);
+        let p = running(10, 20);
+        c.insert_pending(ids(10, 1), p.clone(), 0.0);
+        c.insert(ids(10, 2), state(10, 20, None), 0.0, true);
+        let pick = c.best(&ids(10, 1), 0).expect("the first state");
+        let taken = c.take(pick);
+        assert!(taken.pending.as_ref().is_some_and(|q| q.is(&p)));
+        let pick = c.best(&ids(10, 2), 0).expect("the second state");
+        assert!(c.take(pick).pending.is_none());
+    }
+
     /// Taking a state back leaves it in the cache as the most recent.
     #[test]
     fn take_makes_the_state_the_most_recent() {
@@ -348,7 +537,7 @@ mod tests {
         c.insert(ids(10, 1), state(10, 20, None), 0.0, true);
         c.insert(ids(10, 2), state(10, 20, None), 0.0, true);
         let p = c.best(&ids(10, 1), 0).expect("the first state");
-        let (got, _) = c.take(p);
+        let got = c.take(p).held;
         assert_eq!(got, ids(10, 1));
         c.insert(ids(10, 3), state(10, 30, None), 0.0, true);
         assert!(
