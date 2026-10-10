@@ -15,6 +15,7 @@
 //! live key count.
 
 use super::body::KvQ8;
+use super::image::MediaRows;
 use super::plan::Flash;
 use super::router::{MAX_TOKENS, RouterDims, RouterOut};
 use super::ubatch::UBATCH;
@@ -1225,6 +1226,10 @@ pub(super) struct Arena {
     /// The gemv arm's buffers of a layer that keeps its shared expert apart
     /// (`Forms::apart`); `None` on a chain whose every layer joins it.
     pub(super) apart: Option<ApartRows>,
+    /// The media call's rows the unit about to walk takes over its
+    /// embeddings ([`Arena::write_media`]); `Some` only on a prompt arena of
+    /// a media load.
+    pub(super) media: Option<MediaRows>,
 }
 
 /// Where the FFN's slots come from: a router launch's results — the plain
@@ -1698,9 +1703,21 @@ impl Arena {
                 .apart
                 .map(|_| ApartRows::new(stream, &d, narrow))
                 .transpose()?,
+            media: None,
             dims: d,
             rows,
         })
+    }
+
+    /// Copy the media rows the unit about to walk holds over the embeddings
+    /// in `x` ([`MediaRows::write`]); nothing when the arena holds no media
+    /// call's rows.
+    pub(super) fn write_media(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        let Arena { x, media, .. } = self;
+        match media {
+            Some(rows) => rows.write(stream, x),
+            None => Ok(()),
+        }
     }
 
     /// `m − 1`, the index of the `m`-column activations a gemv arm of `m`

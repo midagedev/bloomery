@@ -52,11 +52,20 @@
 //! one pass (`SlotRows`, `body35_slots`): each slot's record — its first
 //! position and its ids, beside one lane word every slot's rows read — and
 //! each slot's own stores, bound by the slot; a placed load refuses it.
+//!
+//! A load opened with [`Open35::media`] takes image rows ([`MediaBody`]): an
+//! image's M-RoPE positions shift the rows of its sequence, so each sequence
+//! holds a rotation table of its own ([`SeqRope`]), made at load before any
+//! graph is captured and exchanged with the sequence; every rope launch reads
+//! the table of the sequence it runs. A media call is eager and runs every
+//! unit on [`PrefillPath::Wide`]; each unit's first layer copies the rows of
+//! the spans inside it over the embeddings of their positions
+//! (`image::MediaRows`, `dispatch::mixer`).
 
 use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
-use super::image::{ImageWrite, PromptImage};
+use super::image::{ImageWrite, MediaRows, PromptImage};
 use super::placed::{BatchWalk, Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
@@ -78,7 +87,7 @@ use crate::head::Head;
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
-use crate::media::SeqRope;
+use crate::media::{ImageSpan, MediaBody, SeqRope};
 use crate::model::{
     ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
 };
@@ -1340,7 +1349,7 @@ impl Body35 {
         let k = Kernels::load(gpu, true)?;
         let head_state = HeadArgmaxState::new(stream)?;
         let img = PromptImage::new(stream, ctx, true)?;
-        let (u, placed) = match placed {
+        let (mut u, placed) = match placed {
             None => {
                 let (free, _) = gpu.mem_info()?;
                 (ubatch_arena(stream, (d, forms), ubatch.get(), free)?, None)
@@ -1351,6 +1360,10 @@ impl Body35 {
                 (u, Some(Placed::new(gpu, w, &plans, &d, open)?))
             }
         };
+        u.media = o
+            .media
+            .then(|| MediaRows::new(stream, d.hidden))
+            .transpose()?;
         Ok(Body35 {
             vocab,
             eps,
@@ -1787,6 +1800,9 @@ impl Body35 {
         let m = tokens.len();
         self.stand_held(gpu.stream(), pos, m)?;
         let win = self.img.windows(tokens)?;
+        if let Some(rows) = self.u.media.as_mut() {
+            rows.plan(pos as usize..pos as usize + m);
+        }
         self.prompt_walks += 1;
         let Body35 {
             eps,
@@ -1879,7 +1895,9 @@ impl GpuModel<Body35> {
         let size = ubatch_of(&d, u)?;
         let forms = Forms::of(&body.plans, &d);
         let (free, _) = gpu.mem_info()?;
-        body.u = ubatch_arena(gpu.stream(), (d, forms), u, free)?;
+        let mut arena = ubatch_arena(gpu.stream(), (d, forms), u, free)?;
+        arena.media = body.u.media.take();
+        body.u = arena;
         body.ubatch = size;
         Ok(())
     }
@@ -2060,6 +2078,203 @@ impl GpuModel<Body35> {
             })?;
         }
         Ok(out)
+    }
+}
+
+impl Body35 {
+    /// Whether the load takes media ([`Open35::media`]): every sequence holds
+    /// a rotation table of its own.
+    #[must_use]
+    pub fn takes_media(&self) -> bool {
+        self.seq_rope.is_some()
+    }
+}
+
+impl GpuModel<Body35> {
+    /// The images the live sequence's rotation table holds, to keep beside a
+    /// save of the sequence's state; the empty record on a text load.
+    pub fn rope_saved(&self) -> Result<MropeSeq, GpuError> {
+        let body = self.body("qwen35moe::rope_saved")?;
+        Ok(body
+            .seq_rope
+            .as_ref()
+            .map_or_else(MropeSeq::new, SeqRope::saved))
+    }
+
+    /// The rotation table the live sequence's rope launches read, `ctx` rows
+    /// of 64 values read back: a media load's own, else the load's. An
+    /// instrument; synchronizes.
+    pub fn rope_rows(&self) -> Result<Vec<f32>, GpuError> {
+        let body = self.body("qwen35moe::rope_rows")?;
+        Ok(rope_table(&body.rope, body.seq_rope.as_ref()).to_host_vec(self.gpu().stream())?)
+    }
+
+    /// Keep (`on`) or stop keeping and drop what was kept of every unit's
+    /// rows as its first layer reads them: the embedding rows of the unit's
+    /// positions after a media call's rows replaced theirs, `(first
+    /// position, rows)` read back eagerly after each unit's copies, so the
+    /// unit's launches wait for the read. An instrument for gates; refused by
+    /// name on a load opened without media.
+    pub fn set_media_tap(&mut self, on: bool) -> Result<(), GpuError> {
+        const WHAT_T: &str = "qwen35moe::set_media_tap";
+        let (_, _, body) = self.body_parts(WHAT_T)?;
+        let rows = body.u.media.as_mut().ok_or(GpuError::state(
+            WHAT_T,
+            "a load opened with media (Open35::media)",
+        ))?;
+        rows.set_tap(on);
+        Ok(())
+    }
+
+    /// The rows the tap kept since the last call ([`GpuModel::set_media_tap`]),
+    /// in unit order, and the tap emptied.
+    pub fn take_media_tap(&mut self) -> Result<Vec<(usize, Vec<f32>)>, GpuError> {
+        const WHAT_T: &str = "qwen35moe::take_media_tap";
+        let (_, _, body) = self.body_parts(WHAT_T)?;
+        body.u
+            .media
+            .as_mut()
+            .and_then(MediaRows::take_tap)
+            .ok_or(GpuError::state(WHAT_T, "the tap armed on a media load"))
+    }
+
+    /// Take `seq` (from [`GpuModel::rope_saved`]) as the images of the live
+    /// sequence: the table's rows from the first image that differs are
+    /// rewritten. The record belongs to the state the sequence stands at, so
+    /// the caller restores it with that state. A record that holds an image
+    /// is refused by name on a text load, and one that reaches past the
+    /// cache by the table.
+    pub fn rope_restore(&mut self, seq: MropeSeq) -> Result<(), GpuError> {
+        const WHAT_S: &str = "qwen35moe::rope_restore";
+        let (gpu, _, body) = self.body_parts(WHAT_S)?;
+        match body.seq_rope.as_mut() {
+            Some(rope) => rope.restore(gpu.stream(), seq),
+            None if seq.is_empty() => Ok(()),
+            None => Err(GpuError::shape(
+                WHAT_S,
+                "a record of images for a load opened without media (Open35::media): a text \
+                 load's sequence holds none",
+            )),
+        }
+    }
+}
+
+/// A media call of `spans` over `ids` on `m`, as `run` feeds `ids` (the call
+/// is eager, every unit on [`PrefillPath::Wide`]): the spans checked, the
+/// images' rows entered in the sequence's rotation table and their rows
+/// staged for the units, then `run`. No span is the plain call. A call that
+/// fails returns its own error, and takes back the images of the positions it
+/// did not feed: the model stands where its last unit left it, and the table
+/// holds the images that start before that position, so the next call reads
+/// the rows the cache holds. An image the fed positions cut cannot be taken
+/// back (a cut inside an image is refused) and stays whole in the table; a
+/// later span at a position inside it is refused by name, and a cut back
+/// ([`Rollback::rollback_on`]) or a reset takes it away. A take-back that
+/// fails on the card is named beside the call's error.
+fn media_call<T>(
+    m: &mut GpuModel<Body35>,
+    what: &'static str,
+    ids: &[u32],
+    spans: &[ImageSpan<'_>],
+    run: impl FnOnce(&mut GpuModel<Body35>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    let first = m.pos() as usize;
+    let hidden = m.body(what)?.hidden();
+    ImageSpan::check(what, spans, ids.len(), hidden)?;
+    if spans.is_empty() {
+        return run(m);
+    }
+    {
+        let (gpu, _, body) = m.body_parts(what)?;
+        if !body.takes_media() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} image spans on a load opened without media (Open35::media): a text \
+                     load's sequences hold one rotation table",
+                    spans.len()
+                ),
+            ));
+        }
+        if crate::capturing(gpu.stream())? {
+            return Err(GpuError::state(
+                what,
+                "an eager call: a captured unit would bake the staged rows' address",
+            ));
+        }
+    }
+    m.prefill_plan(ids.len(), PrefillPath::Wide)?;
+    {
+        let (gpu, _, body) = m.body_parts(what)?;
+        let stream = gpu.stream();
+        let Body35 { seq_rope, u, .. } = body;
+        let (Some(rope), Some(rows)) = (seq_rope.as_mut(), u.media.as_mut()) else {
+            return Err(GpuError::state(what, "the media load's table and staging"));
+        };
+        rows.begin(stream, first, spans)?;
+        if let Err(e) = rope.push_spans(stream, &ImageSpan::rows_of(first, spans)) {
+            rows.end();
+            return Err(e);
+        }
+    }
+    let ran = run(m);
+    let stood = m.pos() as usize;
+    let (gpu, _, body) = m.body_parts(what)?;
+    if let Some(rows) = body.u.media.as_mut() {
+        rows.end();
+    }
+    match (ran, body.seq_rope.as_mut()) {
+        (Err(e), Some(rope)) => match rope.cut(gpu.stream(), stood) {
+            // A cut inside an image is refused by the table and changes
+            // nothing: the call's own error stands.
+            Ok(()) | Err(GpuError::Shape { .. }) => Err(e),
+            Err(undo) => Err(GpuError::shape(
+                what,
+                format!("{e}; and the images past the fed positions were not taken back: {undo}"),
+            )),
+        },
+        (ran, _) => ran,
+    }
+}
+
+impl MediaBody for Body35 {
+    type Span<'a> = ImageSpan<'a>;
+
+    /// Image spans on a text load.
+    fn media_refusal(m: &GpuModel<Body35>, spans: usize) -> Option<String> {
+        let takes = m.body(WHAT).is_ok_and(Body35::takes_media);
+        (spans > 0 && !takes).then(|| {
+            format!(
+                "a prompt with {spans} image spans on a load opened without media \
+                 (Open35::media)"
+            )
+        })
+    }
+
+    /// [`GpuModel::prefill_with`] on [`PrefillPath::Wide`] with the spans' rows in
+    /// place of their positions' embeddings and the sequence's rotation table
+    /// shifted by them. The argmax after the last id.
+    fn prefill_media(
+        m: &mut GpuModel<Body35>,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+    ) -> Result<u32, GpuError> {
+        media_call(m, "qwen35moe::prefill_media", ids, spans, |m| {
+            m.prefill_with(ids, PrefillPath::Wide)
+        })
+    }
+
+    /// [`GpuModel::prefill_hidden`] on [`PrefillPath::Wide`], as
+    /// [`MediaBody::prefill_media`] feeds: every position's final-norm hidden
+    /// row.
+    fn prefill_hidden_media(
+        m: &mut GpuModel<Body35>,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+    ) -> Result<Vec<f32>, GpuError> {
+        media_call(m, "qwen35moe::prefill_hidden_media", ids, spans, |m| {
+            m.prefill_hidden(ids, PrefillPath::Wide)
+        })
     }
 }
 

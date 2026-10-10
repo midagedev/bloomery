@@ -12,6 +12,11 @@
 //! (`PrefillPath::Wide`) and the checkpoints' keep rule — the nearest
 //! checkpoint a marked prompt call took at or below the cut.
 //!
+//! A Qwen3.6 body opened with media
+//! ([`Open35::media`](bloomery_gpu::arch::qwen3moe::Open35::media)) is a
+//! [`MediaBody`](bloomery_gpu::media::MediaBody), so its session takes
+//! images through the common [`Session::prompt_media`]; no entry of its own.
+//!
 //! The MTP layer's row at position `q` reads the token at `q` and the
 //! target's hidden row at `q − 1` (ik's pairing, the `mtp-qwen4exp` set's
 //! shift 1), and predicts the token at `q + 1`.

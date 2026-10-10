@@ -157,13 +157,14 @@ pub trait MediaBody: ChainBody {
         spans: &[Self::Span<'_>],
     ) -> Result<u32, GpuError>;
 
-    /// [`MediaBody::prefill_media`] for a call that keeps the last position's hidden row and reads
-    /// no token. A body with no such call refuses it by name.
+    /// [`MediaBody::prefill_media`] for a call that reads no token and returns every position's
+    /// final-norm hidden row instead, `ids.len()` rows of the model's width. A body with no such
+    /// call refuses it by name.
     fn prefill_hidden_media(
         m: &mut GpuModel<Self>,
         ids: &[u32],
         spans: &[Self::Span<'_>],
-    ) -> Result<(), GpuError> {
+    ) -> Result<Vec<f32>, GpuError> {
         let _ = (m, ids, spans);
         Err(GpuError::shape(
             "MediaBody::prefill_hidden_media",

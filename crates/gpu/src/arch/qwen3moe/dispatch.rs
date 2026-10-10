@@ -434,8 +434,9 @@ pub(super) fn layer(
 }
 
 /// One layer at `m` rows up to its FFN half ([`layer`]'s first part): the
-/// embedding rows in front when `embed`, then the mixer the plan names over
-/// the layer's store, which leaves the FFN's input residual in `ffn_inp`.
+/// embedding rows in front when `embed` — a media call's rows over the
+/// embeddings of their positions —, then the mixer the plan names over the
+/// layer's store, which leaves the FFN's input residual in `ffn_inp`.
 pub(super) fn mixer(
     c: &Ctx<'_>,
     st: StoreMut<'_>,
@@ -446,6 +447,7 @@ pub(super) fn mixer(
 ) -> Result<(), GpuError> {
     if embed {
         embed_rows(c.gpu, c.w, c.k, io, s)?;
+        s.write_media(c.gpu.stream())?;
         if m > GEMV_COLS {
             wide::route_dense(c, s, m)?;
         }
