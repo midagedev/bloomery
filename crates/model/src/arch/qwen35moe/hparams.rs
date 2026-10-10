@@ -12,7 +12,9 @@
 
 use gguf::{Split, Value};
 
-use crate::arch::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, qwen35moe_variant};
+use crate::arch::{
+    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers, qwen35moe_variant,
+};
 use crate::placement::PlacementError;
 
 /// llama.cpp's `LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX`.
@@ -202,9 +204,16 @@ impl Hparams {
     /// interval is an error naming the key or the tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
         let variant = qwen35moe_variant(split)?;
-        let mut defaults = Vec::new();
         let n_layer = meta_usize(split, "block_count")?;
-        let n_trunk = trunk_layers(split, n_layer)?;
+        let mut defaults = Vec::new();
+        let n_trunk = n_layer
+            - nextn_layers(
+                split,
+                n_layer,
+                "llama-hparams.cpp:725,818",
+                "the probe of llama-hparams.cpp:1662-1666",
+                &mut defaults,
+            )?;
         let n_embd = meta_usize(split, "embedding_length")?;
         let n_head = meta_usize(split, "attention.head_count")?;
         let n_head_kv = match optional_usize(split, "attention.head_count_kv")? {
@@ -937,22 +946,6 @@ fn kinds(
         .collect()
 }
 
-/// The layers the description runs: `block_count` less
-/// `nextn_predict_layers`, absent as 0. A count that leaves no trunk layer is
-/// refused by name, as qwen4exp's loader refuses it
-/// (`src/llama-hparams.cpp:726-728`).
-fn trunk_layers(split: &Split, n_layer: usize) -> Result<usize, PlacementError> {
-    match optional_usize(split, "nextn_predict_layers")? {
-        Some(n) if n > 0 && n >= n_layer => Err(metadata(
-            split,
-            "nextn_predict_layers",
-            format!("is {n} for {n_layer} layers; the trunk keeps at least one"),
-        )),
-        Some(n) => Ok(n_layer - n),
-        None => Ok(n_layer),
-    }
-}
-
 /// Whether a per-layer array of `len` values covers the trunk: one value per
 /// layer of the file, next-token layers last (the trunk's are the first
 /// `n_trunk`), or one per trunk layer.
@@ -1130,7 +1123,8 @@ pub(super) mod tests {
                 row: 16,
             })
         );
-        assert_eq!(hp.defaults.len(), 3, "{:?}", hp.defaults);
+        // The router's three constants and the absent `nextn_predict_layers`.
+        assert_eq!(hp.defaults.len(), 4, "{:?}", hp.defaults);
     }
 
     #[test]
@@ -1619,7 +1613,16 @@ pub(super) mod tests {
         assert_eq!(with.spec, without.spec, "the layer is no layer of the spec");
         assert_eq!(with.spec.layers.len(), 4);
         assert_eq!(with.tensors.layers, 4);
-        assert_eq!(with.defaults, without.defaults);
+        assert!(
+            without.defaults[0].starts_with("nextn_predict_layers = 0 ("),
+            "{:?}",
+            without.defaults
+        );
+        assert_eq!(
+            with.defaults[..],
+            without.defaults[1..],
+            "the declared count is no default"
+        );
         let rows = &with.tensors.tensors;
         let last: Vec<_> = rows.iter().filter(|r| r.layer == Some(4)).collect();
         assert_eq!(last.len(), 20, "every tensor of the layer is a row");
@@ -1752,7 +1755,7 @@ pub(super) mod tests {
                 .expect_err("no trunk layer is left");
             assert!(
                 err.contains(&format!(
-                    "qwen35moe.nextn_predict_layers: is {n} for 4 layers; the trunk keeps at least one"
+                    "qwen35moe.nextn_predict_layers: is {n}, not below block_count 4"
                 )),
                 "{err}"
             );
@@ -1761,11 +1764,45 @@ pub(super) mod tests {
                 read("q4x-all", "qwen4exp", &kv, &tensors()).expect_err("no trunk layer is left");
             assert!(
                 err.contains(&format!(
-                    "qwen4exp.nextn_predict_layers: is {n} for 4 layers; the trunk keeps at least one"
+                    "qwen4exp.nextn_predict_layers: is {n}, not below block_count 4"
                 )),
                 "{err}"
             );
         }
+    }
+
+    /// The owner of `nextn_predict_layers` (`arch::nextn_layers`): an absent
+    /// key and a declared count whose first next-token layer has no
+    /// `nextn.eh_proj` are each a recorded 0, and a count the tensors back is
+    /// believed.
+    #[test]
+    fn a_declared_count_is_believed_only_where_its_probe_tensor_is() {
+        let read_n = |tag: &str, kv: &[(&str, V)], t: &[(String, Vec<u64>)], probe_note: &str| {
+            let path = header_shaped(tag, "qwen35moe", kv, &[], t);
+            let split = gguf::Split::open(&path).expect("the synthetic header opens");
+            let mut defaults = Vec::new();
+            let n = crate::arch::nextn_layers(&split, 5, "absent", probe_note, &mut defaults);
+            let _ = std::fs::remove_file(&path);
+            (n.expect("a count below block_count"), defaults)
+        };
+        let kv = with_next_token_layer(qwen35moe_keys());
+        let (n, defaults) = read_n("q35n-pr-ok", &kv, &qwen35moe_next_token_layer(4), "");
+        assert_eq!((n, defaults.len()), (1, 0));
+        let (n, defaults) = read_n("q35n-pr-no", &kv, &qwen35moe_tensors(), "probe");
+        assert_eq!(n, 0);
+        assert_eq!(
+            defaults,
+            ["nextn_predict_layers = 0 (blk.4.nextn.eh_proj.weight is not in the file, probe)"]
+        );
+        let (_, defaults) = read_n("q35n-pr-nn", &kv, &qwen35moe_tensors(), "");
+        assert_eq!(
+            defaults,
+            ["nextn_predict_layers = 0 (blk.4.nextn.eh_proj.weight is not in the file)"]
+        );
+        let kv = set(qwen35moe_keys(), "block_count", V::U32(5));
+        let (n, defaults) = read_n("q35n-pr-abs", &kv, &qwen35moe_tensors(), "");
+        assert_eq!(n, 0);
+        assert_eq!(defaults, ["nextn_predict_layers = 0 (absent)"]);
     }
 
     /// A next-token stem is the next-token layer's alone: on a trunk layer, or

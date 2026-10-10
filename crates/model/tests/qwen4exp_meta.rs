@@ -38,7 +38,13 @@ const VIEW: &[&str] = &[
 
 // PIN(2026-09-27): the keys the reader took a default for: the router's constants, which the file
 // does not carry.
+// PIN(2026-10-10): `nextn_predict_layers = 0` joined the list: the key is absent from the file's
+// first shard (ik's llama-gguf lists its 67 keys, none of them it), and the reader records every
+// default it takes, the next-token count's among them (it took the default without recording it
+// before). FAIL-first: the run before this pin listed it as `BAD nextn_predict_layers = 0
+// (llama-hparams.cpp:725,818)`.
 const DEFAULTS: &[&str] = &[
+    "nextn_predict_layers = 0 (llama-hparams.cpp:725,818)",
     "expert_gating_func = softmax (qwen4exp.cpp:992-1001)",
     "expert_weights_norm = true (qwen4exp.cpp:992-1001)",
     "expert_weights_scale = 1 (qwen4exp.cpp:992-1001)",

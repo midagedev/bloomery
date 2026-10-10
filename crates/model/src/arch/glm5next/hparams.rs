@@ -7,7 +7,9 @@
 use gguf::{Split, Value};
 
 use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
-use crate::arch::{meta_arr, meta_bool, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
+use crate::arch::{
+    meta_arr, meta_bool, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers,
+};
 use crate::placement::PlacementError;
 
 /// ik's `LLM_EXPERT_GATING_FUNC_SIGMOID` (`src/llama-hparams.h`).
@@ -547,26 +549,7 @@ fn nextn(
     n_layer: usize,
     defaults: &mut Vec<String>,
 ) -> Result<usize, PlacementError> {
-    let key = "nextn_predict_layers";
-    let Some(n) = optional_usize(split, key)? else {
-        defaults.push(format!("{key} = 0 (:2301)"));
-        return Ok(0);
-    };
-    if n >= n_layer {
-        return Err(metadata(
-            split,
-            key,
-            format!("is {n}, not below block_count {n_layer}"),
-        ));
-    }
-    let probe = format!("blk.{}.nextn.eh_proj.weight", n_layer - n);
-    if n > 0 && split.find(&probe).is_none() {
-        defaults.push(format!(
-            "{key} = 0 ({probe} is not in the file, :2302-2308)"
-        ));
-        return Ok(0);
-    }
-    Ok(n)
+    nextn_layers(split, n_layer, ":2301", ":2302-2308", defaults)
 }
 
 /// The token-pool indexer's keys, required: a latent layer without the
@@ -910,6 +893,43 @@ pub(super) mod tests {
             &kv,
             &tensors(),
             "glm5next.attention.indexer.index_share_mtp: is absent or not a bool",
+        );
+    }
+
+    /// The recorded lines of the next-token count's two defaults, as ik's
+    /// lines cite them.
+    #[test]
+    fn the_next_token_count_records_its_defaults_with_ik_lines() {
+        let nextn = |tag: &str, kv: &[(&str, V)], t: &[String]| {
+            let path = header_shaped(tag, "glm5next", kv, &[], &shaped(t));
+            let split = gguf::Split::open(&path).expect("the synthetic header opens");
+            let mut defaults = Vec::new();
+            let n = super::nextn(&split, 5, &mut defaults);
+            let _ = std::fs::remove_file(&path);
+            (n.expect("a count below block_count"), defaults)
+        };
+        let (n, defaults) = nextn("glm5next-nx-ok", &keys(), &tensors());
+        assert_eq!((n, defaults.len()), (1, 0));
+        let absent: Vec<_> = keys()
+            .into_iter()
+            .filter(|(k, _)| *k != "nextn_predict_layers")
+            .collect();
+        let (n, defaults) = nextn("glm5next-nx-abs", &absent, &tensors());
+        assert_eq!(
+            (n, defaults),
+            (0, ["nextn_predict_layers = 0 (:2301)".to_string()].to_vec())
+        );
+        let bare: Vec<_> = tensors()
+            .into_iter()
+            .filter(|n| !n.contains("nextn.eh_proj"))
+            .collect();
+        let (n, defaults) = nextn("glm5next-nx-probe", &keys(), &bare);
+        assert_eq!(n, 0);
+        assert_eq!(
+            defaults,
+            [
+                "nextn_predict_layers = 0 (blk.4.nextn.eh_proj.weight is not in the file, :2302-2308)"
+            ]
         );
     }
 

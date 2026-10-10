@@ -178,7 +178,9 @@ mod tests {
             })
             .chain([("nextn_predict_layers", V::U32(1))])
             .collect();
-        let path = header_shaped("q4x-host", "qwen4exp", &kv, &[], &tensors());
+        let mut t = tensors();
+        t.push(("blk.4.nextn.eh_proj.weight".to_string(), vec![1]));
+        let path = header_shaped("q4x-host", "qwen4exp", &kv, &[], &t);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let hp = Hparams::read(&split).expect("the header reads");
         let _ = std::fs::remove_file(&path);
