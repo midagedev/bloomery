@@ -887,15 +887,19 @@ impl Body {
         Ok(())
     }
 
-    /// `d` put back on a model that stands at `pos` ([`Body::draft_rows`]'s
-    /// rows): the store holding `d`'s positions, the step's and the verify's
-    /// arenas their rows, the prompt batch's arena none. Refused by name, as
-    /// [`Body::draft_fits`] refuses, before any copy.
+    /// `d` ([`Body::draft_rows`]'s rows of a state of `pos` positions) put
+    /// back on a model that stands at `at`, `at` at most `pos`: the store
+    /// holding `d`'s positions below `at`, the step's and the verify's arenas
+    /// their rows with the positions from `at` on taken back
+    /// ([`Wrote::cut`]), the prompt batch's arena none — what a put back at
+    /// `pos` and a cut to `at` leave. Refused by name, as [`Body::draft_fits`]
+    /// refuses, before any copy.
     pub(super) fn put_draft_rows(
         &mut self,
         stream: &CudaStream,
         d: &DraftRows,
         pos: u32,
+        at: u32,
     ) -> Result<(), GpuError> {
         self.draft_fits(d, pos)?;
         let fin = crate::program::final_streams(self.cfg.len());
@@ -910,11 +914,13 @@ impl Body {
         let mut pair_rows = [&mut nx.pair0, &mut s.rows[1].streams[fin]];
         write_rows(stream, &d.pair.1, &mut pair_rows, wide)?;
         nx.held = d.held;
+        nx.cut(at);
         *wrote = Wrote {
             step: d.step.0,
             pair: d.pair.0,
             prefill: Held::NONE,
         };
+        wrote.cut(at);
         Ok(())
     }
 

@@ -23,8 +23,14 @@
 //! (a NextN load and a plain one), or onto a model that is not empty is
 //! refused by name, nothing copied.
 
-use bloomery_gpu::checkpoint::saved::{Lent, SeqState, Spans};
-use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
+use std::sync::Arc;
+
+use bloomery_gpu::checkpoint::Checkpoints;
+use bloomery_gpu::checkpoint::saved::{
+    Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
+};
+use bloomery_gpu::checkpoint::staging::NoRoom;
+use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
 use bloomery_gpu::linear::KHeadMap;
 use bloomery_gpu::linear::LinearShape;
 use bloomery_gpu::{DeviceTensor, GpuError, GpuModel};
@@ -39,7 +45,7 @@ use super::{Body, Store, shape};
 /// A GLM sequence state ([`seq_save`]): the shared state of the module
 /// doc's rows and stores, and on a NextN load the layer's side beside it.
 pub struct GlmSeq {
-    state: SeqState<()>,
+    state: Arc<SeqState<()>>,
     draft: Option<DraftRows>,
 }
 
@@ -70,17 +76,32 @@ impl GlmSeq {
     }
 }
 
+impl SeqView for GlmSeq {
+    fn positions(&self) -> u32 {
+        GlmSeq::positions(self)
+    }
+
+    fn bytes(&self) -> usize {
+        GlmSeq::bytes(self)
+    }
+
+    fn keep_point(&self, n: u32) -> u32 {
+        GlmSeq::keep_point(self, n)
+    }
+}
+
 /// The rows of positions below `n` of one latent store's three planes: its
 /// latent rows, its index rows and the keys of the pools those positions
-/// reach.
+/// reach, each growing with the positions ([`Spans::by_position`],
+/// [`Spans::by_pool`]), so a prefix of the state moves only its own rows.
 fn latent_spans<'a>(
     [latent, index, pooled]: [&'a mut DeviceTensor<u16>; 3],
     n: usize,
 ) -> Result<[Spans<'a>; 3], GpuError> {
     Ok([
-        Spans::planes(latent.buf_mut(), 1, 0, n * LATENT)?,
-        Spans::planes(index.buf_mut(), 1, 0, n * INDEX_ROW)?,
-        Spans::planes(pooled.buf_mut(), 1, 0, pools_for(n) * INDEX_HEAD)?,
+        Spans::by_position(latent.buf_mut(), 1, 0, n, LATENT)?,
+        Spans::by_position(index.buf_mut(), 1, 0, n, INDEX_ROW)?,
+        Spans::by_pool(pooled.buf_mut(), 1, 0, n, (POOL, INDEX_HEAD))?,
     ])
 }
 
@@ -116,12 +137,23 @@ fn lend<'a>(
 }
 
 impl Body {
-    /// The state at `pos`, where the stores stand, a waiting cut carried out
-    /// first: the rows and stores the module doc lists, the point the last
-    /// checkpoint below `pos`. Refused by name while a verify waits for its
-    /// commit, after a step failed past its launch, and on a NextN load whose
-    /// store holds positions past `pos`.
-    fn save_state(&mut self, stream: &CudaStream, pos: u32) -> Result<GlmSeq, GpuError> {
+    /// What every save takes before its copy: a waiting cut carried out, the
+    /// NextN side read, the last checkpoint below `pos` as the point, the
+    /// stores lent, and `take` (the copy, on the engine stream or on a lane)
+    /// run on them. Refused by name while a verify waits for its commit,
+    /// after a step failed past its launch, and on a NextN load whose store
+    /// holds positions past `pos`.
+    fn take_state<R>(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        take: impl FnOnce(
+            Identity,
+            &Lent<'_, '_, '_>,
+            Vec<(u32, ())>,
+            &Checkpoints,
+        ) -> Result<R, GpuError>,
+    ) -> Result<(R, Option<DraftRows>), GpuError> {
         self.stores_at(pos)?;
         self.apply_cut(stream)?;
         let draft = self.draft_rows(stream, pos)?;
@@ -145,18 +177,57 @@ impl Body {
             positional: &mut positional,
             recurrent: &mut recurrent,
         };
-        let state = SeqState::save(stream, self.who.clone(), pos, &lent, (), points, &self.ckpt)?;
-        Ok(GlmSeq { state, draft })
+        let taken = take(self.who.clone(), &lent, points, &self.ckpt)?;
+        Ok((taken, draft))
     }
 
-    /// `s` put back on the empty model: the stores standing at its
-    /// positions, every KDA layer's committed lane stamped there, the points
-    /// it carried the checkpoints, its NextN side the layer's. Refused by
-    /// name, nothing copied, onto a model that is not empty, for a NextN
-    /// side the load does not take (a state with it onto a load without the
-    /// layer, or the other way: the store layouts differ), and for another
-    /// model's state or layout ([`SeqState::load`]).
-    fn load_state(&mut self, stream: &CudaStream, s: &GlmSeq) -> Result<(), GpuError> {
+    /// The state at `pos`, where the stores stand ([`Body::take_state`]): the
+    /// rows and stores the module doc lists, copied on the engine stream.
+    fn save_state(&mut self, stream: &CudaStream, pos: u32) -> Result<GlmSeq, GpuError> {
+        let (state, draft) = self.take_state(stream, pos, |who, lent, points, ckpt| {
+            SeqState::save(stream, who, pos, lent, (), points, ckpt)
+        })?;
+        Ok(GlmSeq {
+            state: Arc::new(state),
+            draft,
+        })
+    }
+
+    /// [`Body::save_state`] with the copy on `lane`'s stream into its pinned
+    /// staging ([`SeqState::save_async`]): the state and its copy in flight,
+    /// or [`NoRoom`], nothing begun. The NextN side is read here, blocking.
+    fn save_state_async(
+        &mut self,
+        stream: &CudaStream,
+        lane: &SaveLane,
+        pos: u32,
+    ) -> Result<Result<(GlmSeq, Pending<()>), NoRoom>, GpuError> {
+        let (taken, draft) = self.take_state(stream, pos, |who, lent, points, ckpt| {
+            let streams = Streams {
+                lane,
+                engine: stream,
+            };
+            SeqState::save_async(streams, who, pos, lent, (), points, ckpt)
+        })?;
+        Ok(taken.map(|pending| {
+            let state = pending.shared();
+            (GlmSeq { state, draft }, pending)
+        }))
+    }
+
+    /// The first `ask` positions of `s` (or the nearest point below, `at`:
+    /// [`SeqState::keep_point`]) put back on the empty model, the state a
+    /// whole resume and a cut to `at` leave: the stores standing at `at`,
+    /// every KDA layer's committed lane stamped there, the points up to `at`
+    /// the checkpoints, and on a NextN load the layer's side cut to `at` too
+    /// (the store holds no position past it, the arenas' rows past it are
+    /// taken back). Only the rows of the first `at` positions go to the card.
+    /// Returns `at`. Refused by name, nothing copied, onto a model that is
+    /// not empty, for a NextN side the load does not take (a state with it
+    /// onto a load without the layer, or the other way: the store layouts
+    /// differ), and for another model's state or layout
+    /// ([`SeqState::load_prefix`]).
+    fn load_state(&mut self, stream: &CudaStream, s: &GlmSeq, ask: u32) -> Result<u32, GpuError> {
         const WHAT_L: &str = "glm5next resume";
         self.stores_at(0).map_err(|e| GpuError::Shape {
             what: WHAT_L,
@@ -173,7 +244,7 @@ impl Body {
             None => {}
         }
         let lane = self.s.lanes.committed();
-        {
+        let at = {
             let (mut positional, mut recurrent) = lend(
                 &mut self.stores,
                 self.nextn.as_deref_mut(),
@@ -184,16 +255,18 @@ impl Body {
                 positional: &mut positional,
                 recurrent: &mut recurrent,
             };
-            s.state.load(stream, &self.who, &mut lent, &mut self.ckpt)?;
-        }
+            s.state
+                .load_prefix(stream, &self.who, &mut lent, &mut self.ckpt, ask)?
+                .at
+        };
         if let Some(d) = &s.draft {
-            self.put_draft_rows(stream, d, n)?;
+            self.put_draft_rows(stream, d, n, at)?;
         }
         for st in &mut self.stores {
-            st.restamp(stream, lane, n)?;
+            st.restamp(stream, lane, at)?;
         }
-        self.held = n;
-        Ok(())
+        self.held = at;
+        Ok(at)
     }
 }
 
@@ -215,6 +288,34 @@ pub fn seq_save(m: &mut GpuModel<Body>) -> Result<GlmSeq, GpuError> {
     body.save_state(gpu.stream(), pos)
 }
 
+/// [`seq_save`] whose copy runs on `lane`'s stream into its pinned staging and
+/// whose call returns once it is enqueued ([`SeqState::save_async`]): the
+/// state and its copy in flight, which the model's rows are not cut, reset or
+/// replaced before; or [`NoRoom`], nothing begun, when the staging holds no
+/// free extent for it. Refused by name as [`seq_save`] refuses.
+pub fn seq_save_async(
+    m: &mut GpuModel<Body>,
+    lane: &SaveLane,
+) -> Result<Result<(GlmSeq, Pending<()>), NoRoom>, GpuError> {
+    const WHAT_S: &str = "glm5next snapshot";
+    if let Some(fault) = m.poisoned() {
+        return Err(GpuError::Poisoned {
+            what: WHAT_S,
+            fault,
+        });
+    }
+    let pos = m.pos();
+    let (gpu, _, body) = m.body_parts(WHAT_S)?;
+    body.save_state_async(gpu.stream(), lane, pos)
+}
+
+/// A save lane on `m`'s card sized to `limit` pinned bytes of states
+/// ([`SaveLane::new`]): load-time only.
+pub fn seq_lane(m: &mut GpuModel<Body>, limit: u64) -> Result<SaveLane, GpuError> {
+    let (gpu, _, _) = m.body_parts("glm5next save lane")?;
+    SaveLane::new(gpu.context(), limit)
+}
+
 /// Replace `m`'s sequence with `s`, which [`seq_save`] took of this load: a
 /// reset unless the model is empty already (a reset just before, or the
 /// load; the residency stays where use has taken it), then — as a pass of
@@ -224,8 +325,15 @@ pub fn seq_save(m: &mut GpuModel<Body>) -> Result<GlmSeq, GpuError> {
 /// taken. Refused by name, nothing copied, for another model's state (its
 /// file, card or context) or layout.
 pub fn seq_resume(m: &mut GpuModel<Body>, s: &GlmSeq) -> Result<(), GpuError> {
-    const WHAT_R: &str = "glm5next resume";
-    let b = m.body(WHAT_R)?;
+    if s.positions() == 0 {
+        return seq_reset_for(m, "glm5next resume");
+    }
+    seq_resume_prefix(m, s, s.positions()).map(drop)
+}
+
+/// The model reset unless it is empty already: what every resume starts from.
+fn seq_reset_for(m: &mut GpuModel<Body>, what: &'static str) -> Result<(), GpuError> {
+    let b = m.body(what)?;
     let empty = m.pos() == 0
         && b.stores_at(0).is_ok()
         && b.ckpt.positions().is_empty()
@@ -233,15 +341,35 @@ pub fn seq_resume(m: &mut GpuModel<Body>, s: &GlmSeq) -> Result<(), GpuError> {
     if !empty {
         m.reset()?;
     }
-    let n = s.positions() as usize;
-    if n == 0 {
-        return Ok(());
+    Ok(())
+}
+
+/// [`seq_resume`] of the first `n` positions of `s` the state can be cut to
+/// ([`GlmSeq::keep_point`]): the model stands at that many, which it
+/// returns, as a whole resume and a rollback to it leave it, with only those
+/// positions' rows moved to the card ([`SeqState::load_prefix`]). Refused by
+/// name as [`seq_resume`] refuses, and for a prefix of no positions (reset the
+/// model instead). `s`'s copy must have landed.
+pub fn seq_resume_prefix(m: &mut GpuModel<Body>, s: &GlmSeq, n: u32) -> Result<u32, GpuError> {
+    const WHAT_R: &str = "glm5next resume";
+    seq_reset_for(m, WHAT_R)?;
+    let at = s.keep_point(n);
+    if at == 0 {
+        return Err(shape(format!(
+            "a prefix of 0 positions of a state of {} (asked {n}): reset the model instead",
+            s.positions()
+        )));
     }
-    m.run_rows(n, WHAT_R, |gpu, _, body, _, _| {
-        body.load_state(gpu.stream(), s)?;
+    m.run_rows(at as usize, WHAT_R, |gpu, _, body, _, _| {
+        let put = body.load_state(gpu.stream(), s, n)?;
+        if put != at {
+            return Err(shape(format!(
+                "a prefix of {at} positions put back as {put}"
+            )));
+        }
         Ok(false)
     })?;
-    Ok(())
+    Ok(at)
 }
 
 /// The host bytes a sequence state of `ctx` positions holds on the file

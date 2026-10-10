@@ -26,6 +26,13 @@
 //! past it, so a client's long prompt or `max_tokens` never reaches the body's
 //! refusal, which is fatal.
 //!
+//! The seats whose state is a `bloomery_gpu` `SeqView` share one owner of what
+//! the prompt cache holds and waits for: [`Cached`] is their [`Saved`] (the
+//! body's state with the seat's own side), [`begin`] their
+//! [`Seat::snapshot_begin`] over the body's save on its lane (a pool with no
+//! room is the server's `NoRoom`, [`seat_failure`]), and [`Cached::body`] the
+//! one way to read a state, which waits for its copy to land first.
+//!
 //! A sampled token's logits cross to the calling thread in one buffer the
 //! engine owns: lent with each `Next` that wants them, filled on the engine
 //! thread, and handed back with the reply, so no token allocates a row.
@@ -41,6 +48,7 @@
 //! is read from the file's header and the placement plan the engine loads by,
 //! once, before the load; the engine hands it back unchanged.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -50,6 +58,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
+use bloomery_gpu::GpuError;
+use bloomery_gpu::checkpoint::saved::{Pending as Saving, SeqView};
+use bloomery_gpu::checkpoint::staging::NoRoom;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, Machine, ModelTensors, Plan, Role};
@@ -57,9 +68,9 @@ use sampler::{Sampler, SamplerParams};
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER,
-    Landed, ModelProps, Pending, PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused,
-    SamplingParams, Saved, SavedState, ServeError, Server, ServerConfig, SlotConfig, StateError,
-    Tokenizer,
+    Flight, Landed, ModelProps, Pending, PlacementProps, ResidencyReset, SamplerFactory,
+    SamplerRefused, SamplingParams, Saved, SavedState, ServeError, Server, ServerConfig,
+    SlotConfig, StateError, Tokenizer,
 };
 
 use crate::GateError;
@@ -2136,13 +2147,25 @@ fn resume_prefix_of<S: Seat + ?Sized>(
 }
 
 /// A seat's failure of a prompt-cache state with `what` before it, as the
-/// server's kind: a refusal by name (a `GpuError` of kind `State` or
-/// `Shape` anywhere in the chain, [`Seat::snapshot`]) is `Format`, the
-/// request's, which the server answers by keeping no state or by resetting
-/// the slot; any other failure — the card's, the driver's, a fault, an
-/// error of no known kind — is `Engine`, which ends it.
+/// server's kind: a staging pool with no room for the state
+/// (`bloomery_gpu::checkpoint::staging::NoRoom` anywhere in the chain) is
+/// `NoRoom`, its three numbers one to one, which the server answers by giving
+/// up its oldest landed state and asking once more; a refusal by name (a
+/// `GpuError` of kind `State` or `Shape` anywhere in the chain,
+/// [`Seat::snapshot`]) is `Format`, the request's, which the server answers
+/// by keeping no state or by resetting the slot; any other failure — the
+/// card's, the driver's, a fault, an error of no known kind — is `Engine`,
+/// which ends it.
 fn seat_failure(e: &(dyn std::error::Error + 'static), what: String) -> StateError {
-    let refused = std::iter::successors(Some(e), |e| e.source())
+    let chain = || std::iter::successors(Some(e), |e| e.source());
+    if let Some(short) = chain().find_map(|e| e.downcast_ref::<NoRoom>()) {
+        return StateError::NoRoom {
+            need: short.need,
+            held: short.held,
+            lent: short.lent,
+        };
+    }
+    let refused = chain()
         .find_map(|e| e.downcast_ref::<bloomery_gpu::GpuError>())
         .is_some_and(|g| {
             matches!(
@@ -2155,6 +2178,135 @@ fn seat_failure(e: &(dyn std::error::Error + 'static), what: String) -> StateErr
     } else {
         StateError::Engine(EngineError(format!("{what}: {e}")))
     }
+}
+
+/// A copy on a seat's save lane, as the cache's entry for its state waits for
+/// it ([`Cached`]) and the server's [`Flight`] polls it.
+pub trait Landing: Send + Sync {
+    /// Whether the copy has landed; never waits.
+    fn ready(&self) -> Result<bool, GpuError>;
+    /// Waits for the copy to land and returns what it cost; the same answer
+    /// on every call.
+    fn land(&self) -> Result<Landed, GpuError>;
+}
+
+impl<T: Send + Sync> Landing for Saving<T> {
+    fn ready(&self) -> Result<bool, GpuError> {
+        Saving::ready(self)
+    }
+
+    fn land(&self) -> Result<Landed, GpuError> {
+        let c = Saving::land(self)?;
+        Ok(Landed {
+            copy_ms: c.copy_ms,
+            calls: c.calls,
+            alloc_ms: c.alloc_ms,
+        })
+    }
+}
+
+/// The server's flight of a copy on a seat's lane: its failure's kind as
+/// [`seat_failure`] reads it.
+struct Flying(Arc<dyn Landing>);
+
+impl Flying {
+    fn failed(e: &GpuError) -> StateError {
+        seat_failure(e, "the copy of a saved state".to_owned())
+    }
+}
+
+impl Flight for Flying {
+    fn poll(&self) -> Result<Option<Landed>, StateError> {
+        if self.0.ready().map_err(|e| Flying::failed(&e))? {
+            self.0.land().map(Some).map_err(|e| Flying::failed(&e))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn wait(&self) -> Result<Landed, StateError> {
+        self.0.land().map_err(|e| Flying::failed(&e))
+    }
+}
+
+/// A body's sequence state `S` as the server's prompt cache holds it, with the
+/// seat's own side `D` of it (the draft's parked side, or `()`): the one
+/// [`Saved`] of every seat whose state sits on `bloomery_gpu`'s `SeqView`.
+/// The cache ranks it by the body's rule, every position it holds or the
+/// point it carries at or below the shared prefix. A state taken on a save
+/// lane ([`begin`]) may still be copying: the body's side is reached only
+/// through [`Cached::body`], which waits for the copy first, so no resume
+/// reads a state the lane is writing.
+pub struct Cached<S, D> {
+    body: S,
+    /// The seat's side of the state, taken on the engine thread at the save.
+    pub draft: D,
+    landing: Option<Arc<dyn Landing>>,
+}
+
+impl<S: SeqView, D: Send + Sync + 'static> Cached<S, D> {
+    /// A state taken on the request path: landed already.
+    pub fn landed(body: S, draft: D) -> Cached<S, D> {
+        Cached {
+            body,
+            draft,
+            landing: None,
+        }
+    }
+
+    /// `state` as this seat's, refused by name for a state another seat took
+    /// (`whose` names the seat's body).
+    pub fn of<'a>(state: &'a dyn Saved, whose: &str) -> Result<&'a Cached<S, D>, GateError> {
+        state
+            .as_any()
+            .downcast_ref::<Cached<S, D>>()
+            .ok_or_else(|| format!("a saved state that is not {whose}").into())
+    }
+
+    /// The body's state once its copy has landed, waited for here: the one
+    /// way to read it.
+    pub fn body(&self) -> Result<&S, GateError> {
+        if let Some(l) = &self.landing {
+            l.land()?;
+        }
+        Ok(&self.body)
+    }
+}
+
+impl<S: SeqView, D: Send + Sync + 'static> Saved for Cached<S, D> {
+    fn n_tokens(&self) -> usize {
+        self.body.positions() as usize
+    }
+
+    fn n_bytes(&self) -> u64 {
+        self.body.bytes() as u64
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        self.body.keep_point(u32::try_from(n).unwrap_or(u32::MAX)) as usize
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// [`Seat::snapshot_begin`] over a body's save on its lane: `copy` is what the
+/// body's async save answered, its state and the copy's [`Landing`] or the
+/// pool's [`NoRoom`], which goes up as the seat's error for the server to
+/// read ([`seat_failure`]: evict, retry, then the request path); `side` is
+/// the seat's part of the state, taken once the copy is begun.
+pub fn begin<S: SeqView, D: Send + Sync + 'static>(
+    copy: Result<(S, Arc<dyn Landing>), NoRoom>,
+    side: impl FnOnce() -> Result<D, GateError>,
+) -> Result<Pending, GateError> {
+    let (body, landing) = copy.map_err(GateError::from)?;
+    let cached = Cached {
+        body,
+        draft: side()?,
+        landing: Some(Arc::clone(&landing)),
+    };
+    Ok(Pending::new(Arc::new(cached), Arc::new(Flying(landing))))
 }
 
 /// The selected slot's state ([`Seat::save_state`]) written into the pipe
@@ -3209,7 +3361,7 @@ mod tests {
     mod slot_files {
         use std::io::{self, Read, Write};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::mpsc;
         use std::thread::JoinHandle;
 
@@ -3218,10 +3370,12 @@ mod tests {
         };
 
         use bloomery_gpu::GpuError;
+        use bloomery_gpu::checkpoint::saved::SeqView;
+        use bloomery_gpu::checkpoint::staging::NoRoom;
 
         use super::super::{
-            Cmd, Extra, Link, PIPE_CHUNK, Reply, Seat, begin_of, restore_from, resume_of,
-            resume_prefix_of, save_into, settle, snapshot_of,
+            Cached, Cmd, Extra, Landing, Link, PIPE_CHUNK, Reply, Seat, begin, begin_of,
+            restore_from, resume_of, resume_prefix_of, save_into, settle, snapshot_of,
         };
         use crate::GateError;
 
@@ -3559,6 +3713,152 @@ mod tests {
             );
             link.tx = None;
             assert_eq!(worker.join().expect("the file thread").resumes, 1);
+        }
+
+        /// A body's sequence state of `.0` positions, every one a point.
+        struct Rows(u32);
+
+        impl SeqView for Rows {
+            fn positions(&self) -> u32 {
+                self.0
+            }
+
+            fn bytes(&self) -> usize {
+                self.0 as usize * 8
+            }
+
+            fn keep_point(&self, n: u32) -> u32 {
+                n.min(self.0)
+            }
+        }
+
+        /// A copy on a lane that has landed once `ready` is set; `lands`
+        /// counts the waits for it.
+        struct Copy {
+            ready: AtomicBool,
+            lands: AtomicUsize,
+        }
+
+        impl Landing for Copy {
+            fn ready(&self) -> Result<bool, GpuError> {
+                Ok(self.ready.load(Ordering::SeqCst))
+            }
+
+            fn land(&self) -> Result<Landed, GpuError> {
+                self.lands.fetch_add(1, Ordering::SeqCst);
+                self.ready.store(true, Ordering::SeqCst);
+                Ok(COST)
+            }
+        }
+
+        fn copy() -> Arc<Copy> {
+            Arc::new(Copy {
+                ready: AtomicBool::new(false),
+                lands: AtomicUsize::new(0),
+            })
+        }
+
+        /// A seat whose staging pool has no room for the state it was asked
+        /// to begin, and says so as the body's [`NoRoom`] under its own error.
+        struct Short {
+            pos: usize,
+            wrapped: bool,
+        }
+
+        impl Seat for Short {
+            no_steps!();
+            no_cache!();
+
+            fn snapshots_async(&self) -> bool {
+                true
+            }
+
+            fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+                let short = NoRoom {
+                    need: 4096,
+                    held: 8192,
+                    lent: 6144,
+                };
+                if self.wrapped {
+                    return Err(Box::new(Pooled(short)));
+                }
+                begin::<Rows, ()>(Err(short), || Ok(()))
+            }
+        }
+
+        /// An error whose source is a pool's refusal, as a seat's own error
+        /// wraps the body's.
+        #[derive(Debug)]
+        struct Pooled(NoRoom);
+
+        impl std::fmt::Display for Pooled {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "the save failed")
+            }
+        }
+
+        impl std::error::Error for Pooled {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        /// A pool with no room for a save is the server's `NoRoom` with the
+        /// pool's three numbers (which it answers by evicting and asking
+        /// again), whether the seat hands the refusal up as it is or wrapped
+        /// in its own error — never `Engine`, which ends the server.
+        #[test]
+        fn a_full_pool_is_the_servers_no_room_not_an_engine_failure() {
+            for wrapped in [false, true] {
+                let (mut link, worker) = file_link(Short { pos: 30, wrapped });
+                let Err(e) = link.snapshot_begin() else {
+                    panic!("wrapped {wrapped}: a pool with no room began a copy");
+                };
+                match e {
+                    StateError::NoRoom { need, held, lent } => {
+                        assert_eq!((need, held, lent), (4096, 8192, 6144), "wrapped {wrapped}");
+                    }
+                    other => panic!("wrapped {wrapped}: {other:?} is not NoRoom"),
+                }
+                assert_eq!(e.fallback(), Some("full"));
+                link.tx = None;
+                worker.join().expect("the file thread");
+            }
+        }
+
+        /// The body's state of a begun copy is read only after the copy has
+        /// landed: [`Cached::body`] waits for it, once for every reader, and
+        /// the server's flight answers nothing while the copy runs and its
+        /// cost after. A state taken on the request path waits for nothing.
+        #[test]
+        fn a_cached_state_is_read_only_after_its_copy_landed() {
+            let lane = copy();
+            let landing: Arc<dyn Landing> = lane.clone();
+            let p = begin(Ok((Rows(30), landing)), || Ok(7_u8)).expect("a begun state");
+            assert_eq!(p.state().n_tokens(), 30);
+            assert_eq!(p.state().n_bytes(), 240);
+            assert_eq!(p.state().keepable(12), 12);
+            assert_eq!(p.flight().poll().expect("a poll"), None, "still running");
+            assert_eq!(lane.lands.load(Ordering::SeqCst), 0, "a poll does not wait");
+
+            let saved = Cached::<Rows, u8>::of(&**p.state(), "a test body's").expect("this seat's");
+            assert_eq!(saved.draft, 7);
+            assert_eq!(saved.body().expect("the body").positions(), 30);
+            assert_eq!(
+                lane.lands.load(Ordering::SeqCst),
+                1,
+                "the body is read before its copy landed"
+            );
+            assert_eq!(p.flight().poll().expect("a poll"), Some(COST));
+            assert_eq!(p.flight().wait().expect("a wait"), COST);
+
+            let Err(e) = Cached::<Rows, u16>::of(&**p.state(), "a test body's") else {
+                panic!("a state of another seat's draft side was taken");
+            };
+            assert!(e.to_string().contains("not a test body's"), "{e}");
+
+            let own = Cached::landed(Rows(5), ());
+            assert_eq!(own.body().expect("the body").positions(), 5);
         }
 
         /// `n` bytes of a pattern that repeats past no chunk boundary.

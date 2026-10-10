@@ -248,6 +248,32 @@ impl Host {
     }
 }
 
+/// What a server's prompt cache asks of a body's sequence state, whatever
+/// else the body keeps beside it ([`SeqState`] is one, a body's own wrapper of
+/// it another): what it holds and what a resume can be cut to.
+pub trait SeqView: Send + Sync + 'static {
+    /// The positions it holds.
+    fn positions(&self) -> u32;
+    /// The host bytes it holds.
+    fn bytes(&self) -> usize;
+    /// [`SeqState::keep_point`].
+    fn keep_point(&self, n: u32) -> u32;
+}
+
+impl<T: Send + Sync + 'static> SeqView for SeqState<T> {
+    fn positions(&self) -> u32 {
+        self.positions
+    }
+
+    fn bytes(&self) -> usize {
+        SeqState::bytes(self)
+    }
+
+    fn keep_point(&self, n: u32) -> u32 {
+        SeqState::keep_point(self, n)
+    }
+}
+
 /// A sequence state of `positions` positions on the host (the module doc),
 /// with the body's host value `T` beside the current position and each
 /// carried point.
