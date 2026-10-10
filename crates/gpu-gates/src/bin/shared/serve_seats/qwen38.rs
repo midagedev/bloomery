@@ -307,7 +307,6 @@
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
 //! kinds and exits.
 
-use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -316,13 +315,15 @@ use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
+use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab,
-    bind_server, model_props, note_line, parallel_line, placement_of,
+    CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
+    SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
+    put_back,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -350,7 +351,9 @@ use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use runtime::width::Mode as WidthMode;
-use serve::{CacheNote, DraftProps, Drafted, EngineProps, ResidencyReset, Saved, ServeError};
+use serve::{
+    CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
+};
 use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
@@ -1762,6 +1765,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         xstream: levers.xstream(),
         stats: levers.step_stats(),
         width,
+        cache_ram: cache.ram,
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -1913,6 +1917,10 @@ struct SeatArgs {
     /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
     /// chooser's (`cost`) or the draft's own (`fixed`).
     width: WidthMode,
+    /// The prompt cache's byte budget: the pinned staging its saves are
+    /// copied into on a lane of their own, pinned whole at the open
+    /// (`SaveLane::new`); 0 (the cache off) makes no lane.
+    cache_ram: u64,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -1966,6 +1974,9 @@ struct Q38 {
     /// query runs on `&self` (the engine thread owns the seat, so the borrow
     /// never contends).
     branch: std::cell::RefCell<Vec<Option<Branch38>>>,
+    /// The copy stream and the pinned staging the prompt cache's saves are
+    /// made on ([`Seat::snapshots_async`]); none with the cache off.
+    lane: Option<SaveLane>,
 }
 
 impl Q38 {
@@ -2182,6 +2193,10 @@ impl Q38 {
             let b = s.model().body(WHAT)?;
             b.hybrid().census(b.nvme_tier().map(|t| &**t))
         };
+        let lane = match a.cache_ram {
+            0 => None,
+            ram => Some(s.model_mut().seq_lane(ram)?),
+        };
         Ok(Q38 {
             s,
             drafts,
@@ -2196,6 +2211,7 @@ impl Q38 {
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
+            lane,
         })
     }
 
@@ -2351,31 +2367,31 @@ fn draft_off(pos: u32, what: &str) {
     );
 }
 
-/// A Qwen3.8 sequence state as the server's prompt cache holds it, with the
-/// draft's side of it ([`SlotDrafts::park`]) beside the body's
-/// ([`Seq38`], the draft's rows within it). The cache ranks it by the
-/// seat's rule: every position it holds, or the point it carries at or
-/// below the shared prefix.
-struct Saved38 {
-    state: Seq38,
-    draft: Option<ParkedDraft<TargetRows>>,
-}
+/// A Qwen3.8 sequence state as the server's prompt cache holds it ([`Seq38`],
+/// the draft's rows within it, the body's rule ranking it), with the draft's
+/// side of it ([`SlotDrafts::park`]) beside the body's: the one common
+/// [`Cached`], whose draft side is this seat's.
+type Saved38 = Cached<Seq38, Option<ParkedDraft<TargetRows>>>;
 
-impl Saved for Saved38 {
-    fn n_tokens(&self) -> usize {
-        self.state.positions() as usize
+/// What a refusal of another seat's state names ([`put_back`]).
+const WHOSE: &str = "a qwen4exp body's";
+
+/// The draft's three steps around a Qwen3.8 state's put-back ([`put_back`]).
+impl PutBack for Q38 {
+    type Body = Seq38;
+    type Side = Option<ParkedDraft<TargetRows>>;
+
+    fn takes(&self, side: &Self::Side) -> Result<(), GateError> {
+        self.drafts.takes(side.as_ref())
     }
 
-    fn n_bytes(&self) -> u64 {
-        self.state.bytes() as u64
+    fn reset_selected(&mut self) -> Result<(), GateError> {
+        let sel = self.s.selected();
+        self.drafts.reset(&mut self.s, sel)
     }
 
-    fn keepable(&self, n: usize) -> usize {
-        self.state.keep_point(u32::try_from(n).unwrap_or(u32::MAX)) as usize
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn unpark(&mut self, side: &Self::Side) -> Result<(), GateError> {
+        self.drafts.unpark(self.s.selected(), side.as_ref())
     }
 }
 
@@ -2670,29 +2686,65 @@ impl Seat for Q38 {
     /// ([`SlotDrafts::park`]) beside the body's.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
         let sel = self.s.selected();
-        Ok(Arc::new(Saved38 {
-            state: self.s.model_mut().seq_save()?,
-            draft: self.drafts.park(sel)?,
-        }))
+        let state = self.s.model_mut().seq_save()?;
+        let draft = self.drafts.park(sel)?;
+        Ok(Arc::new(Saved38::landed(state, draft)))
+    }
+
+    /// Whether the saves copy on the lane: the seat holds one.
+    fn snapshots_async(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// The state's copy begun on the lane (`GpuModel::seq_save_async`), the
+    /// draft's side taken beside it; a pool with no room is the server's
+    /// `NoRoom` ([`begin`]). Without a lane, the snapshot on the call.
+    fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+        let Some(lane) = &self.lane else {
+            return Ok(Pending::landed(self.snapshot()?));
+        };
+        let copy = self
+            .s
+            .model_mut()
+            .seq_save_async(lane)?
+            .map(|(state, pending)| (state, Arc::new(pending) as Arc<dyn Landing>));
+        let sel = self.s.selected();
+        begin(copy, || self.drafts.park(sel))
     }
 
     /// The state put back (`GpuModel::seq_resume`) after the session's reset,
-    /// then the draft's side of it ([`SlotDrafts::unpark`]): the sequence's
-    /// next call runs as it would have with no switch between, its draft
-    /// joining where it left. Refused by name, before the reset, for a state
-    /// this seat did not take or one saved with the draft on put back with it
-    /// off (or the other way); the body refuses another model's state or
-    /// layout.
+    /// then the draft's side of it ([`put_back`]): the sequence's next call
+    /// runs as it would have with no switch between, its draft joining where
+    /// it left. Refused by name, before the reset, for a state this seat did
+    /// not take or one saved with the draft on put back with it off (or the
+    /// other way); the body refuses another model's state or layout.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
-        let saved = state
-            .as_any()
-            .downcast_ref::<Saved38>()
-            .ok_or("a saved state that is not a qwen4exp body's")?;
-        let sel = self.s.selected();
-        self.drafts.takes(saved.draft.as_ref())?;
-        self.drafts.reset(&mut self.s, sel)?;
-        self.s.model_mut().seq_resume(&saved.state)?;
-        self.drafts.unpark(sel, saved.draft.as_ref())
+        put_back(self, state, WHOSE, |q, body| {
+            q.s.model_mut().seq_resume(body).map(|()| body.positions())
+        })
+        .map(drop)
+    }
+
+    /// The first `n` positions the state can be cut to put back after the
+    /// session's reset (`GpuModel::seq_resume_prefix`), then the draft's side
+    /// of it ([`put_back`]): the sequence's next call runs as it would have
+    /// after the whole state's resume and a rollback to the returned position
+    /// ([`Seat::rollback`]): a cut short of the state's positions under the
+    /// draft leaves it proposing nothing from there ([`DRAFT_OFF_WHY`]).
+    fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        let at = put_back(self, state, WHOSE, |q, body| {
+            q.s.model_mut().seq_resume_prefix(body, n)
+        })?;
+        if self.drafts.drafts() && at < state.n_tokens() {
+            self.drafts.turn_off(self.s.selected(), DRAFT_OFF_WHY)?;
+            let from = state.n_tokens();
+            draft_off(
+                u32::try_from(at).unwrap_or(u32::MAX),
+                &format!("a state of {from} positions put back as its first {at}"),
+            );
+        }
+        Ok(at)
     }
 
     /// A prefix kept less of than shared is a `cache reuse` record; every
