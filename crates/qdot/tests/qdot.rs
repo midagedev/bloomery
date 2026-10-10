@@ -5682,6 +5682,10 @@ fn hw_lanes_match_dot_row_v41() {
 #[ignore = "hw: the box's CPU (a type has row lanes only with AVX2+FMA+F16C)"]
 fn hw_lanes_refuse_bad_shapes() {
     let ty = GgmlType::Q4_K;
+    assert!(
+        qdot::has_lanes(ty),
+        "{ty:?} has no row lanes on this CPU: every shape would be refused as NoLanes"
+    );
     let k = 256;
     let rows = vec![0u8; 8 * 144];
     let need = qdot::lane_pack_bytes(k);

@@ -773,7 +773,7 @@ fn hw_engram_open_direct_reads_the_files_bytes() {
         .map(|v| u32::from_str_radix(v.trim(), 8).unwrap())
         .expect("fdinfo names the open flags");
     assert_ne!(
-        flags & 0o40000,
+        flags & libc::O_DIRECT as u32,
         0,
         "the handle carries O_DIRECT: flags {flags:o}"
     );
