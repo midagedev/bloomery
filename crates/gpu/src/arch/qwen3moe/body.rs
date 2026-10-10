@@ -12,9 +12,9 @@ use super::prefill::Prefill;
 use super::program::Tail;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
-use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
+use super::scratch::{Arena, Dims, Forms, KvPlanes, RopeRows, StepParams, f32_view};
 use super::slot_pass::{SlotIn, SlotPass};
-use super::ubatch::{Ubatch, ubatch_size};
+use super::ubatch::{Q32, Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
@@ -29,7 +29,7 @@ use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
-use crate::site::KGemvKernels;
+use crate::site::{self, KGemvKernels};
 use crate::tensor::window;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Graph};
@@ -40,8 +40,9 @@ use gguf::quant::GgmlType;
 use model::arch::Arch;
 use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
-use model::arch::qwen3moe::names;
+use model::arch::qwen3moe::names::{self, token_embd};
 use model::placement::Plan;
+use model::placement::kernels::{self, SiteEntry};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
@@ -58,10 +59,12 @@ const _: () = assert!(crate::flash_gqa::HEAD_256 == 256);
 
 /// The kernels only Qwen3.6's layers launch: the delta rule's three, the
 /// gated router and the gated output projection's quantizer; and what a
-/// site of a type other than the K-quants launches — the 32-value GEMM
-/// family with its quantizers and the F32 tile, and the Q8_0 embedding and
-/// the f32 out gate (a Q8_0 or F32 `attn_output` reads the gated rows as
-/// f32).
+/// site that is not one of the fused Q4_K groups launches — the 32-value
+/// GEMM family with its quantizers and the F32 tile, the K-quant gemv beyond
+/// the `Gpu`'s own (Q5_K), the Q8_0 embedding and the f32 out gate (a Q8_0
+/// or F32 `attn_output` reads the gated rows as f32). A qwen3moe load holds
+/// them only when one of its sites or its embedding takes such a launch
+/// ([`needs_site_kernels`]).
 pub(super) struct Q35Kernels {
     pub(super) linear: LinearKernels,
     pub(super) router: gated::RouterKernels,
@@ -124,11 +127,12 @@ impl Kernels {
         })
     }
 
-    /// Qwen3.6's kernels, or a named refusal on a qwen3moe load.
+    /// Qwen3.6's kernels, or a named refusal on a load that holds none (a
+    /// qwen3moe load whose sites are all fused Q4_K groups).
     pub(super) fn q35(&self, what: &'static str) -> Result<&Q35Kernels, GpuError> {
         self.q35.as_ref().ok_or(GpuError::state(
             what,
-            "Qwen3.6's kernels (a qwen3moe load has none)",
+            "Qwen3.6's kernels (a qwen3moe load whose sites and embedding take none holds none)",
         ))
     }
 }
@@ -273,6 +277,69 @@ pub(super) fn kq_site(
     Ok(kq)
 }
 
+/// The launch family of the table's dense entry `entry`: `site.rs`'s name
+/// for it. Every arm names its entry, so an entry the table gains does not
+/// compile here until it is placed.
+pub(super) const fn site_ty(entry: SiteEntry) -> SiteTy {
+    match entry {
+        SiteEntry::Q3k => SiteTy::Q3K,
+        SiteEntry::Q4k => SiteTy::Q4K,
+        SiteEntry::Q5k => SiteTy::Q5K,
+        SiteEntry::Q6k => SiteTy::Q6K,
+        SiteEntry::Q8_0 => SiteTy::Q8_0,
+        SiteEntry::F32 => SiteTy::F32,
+    }
+}
+
+/// The file type a launch family reads: `SiteTy::of_ggml`'s inverse, so a
+/// site's type can be asked of the table's rows (`kernels::*`), which are
+/// keyed by file type. Every arm names its family.
+pub(super) const fn ggml_ty(site: SiteTy) -> GgmlType {
+    match site {
+        SiteTy::Q3K => GgmlType::Q3_K,
+        SiteTy::Q4K => GgmlType::Q4_K,
+        SiteTy::Q5K => GgmlType::Q5_K,
+        SiteTy::Q6K => GgmlType::Q6_K,
+        SiteTy::Q8_0 => GgmlType::Q8_0,
+        SiteTy::F32 => GgmlType::F32,
+    }
+}
+
+/// Weight `name` as a dense site of `rows` rows of `k` values and the launch
+/// family the table's `dense` row picks for the type it is resident as (a
+/// K-quant word plane, Q8_0 planes or an F32 plane); a type with no row, or
+/// a weight of another shape or form, is refused by name.
+pub(super) fn dense_site(
+    w: &Weights,
+    name: &str,
+    rows: usize,
+    k: usize,
+) -> Result<SiteTy, GpuError> {
+    let what = "qwen3moe::Body::load";
+    let ty = match w.get(name) {
+        Some(DevWeight::KQuant { ty, .. }) => *ty,
+        Some(DevWeight::Q8_0 { .. }) => GgmlType::Q8_0,
+        Some(DevWeight::F32 { .. }) => GgmlType::F32,
+        Some(_) => {
+            return Err(GpuError::tensor(
+                what,
+                name,
+                "a K-quant word plane, Q8_0 planes or an F32 plane",
+            ));
+        }
+        None => return Err(GpuError::tensor(what, name, "resident")),
+    };
+    let Some(entry) = kernels::dense(ty) else {
+        return Err(GpuError::shape(
+            what,
+            format!("{name} is {ty}; no dense site launches it (kernels::dense)"),
+        ));
+    };
+    let family = site_ty(entry);
+    site::site(w, what, name, (rows, k), family)?;
+    Ok(family)
+}
+
 /// Weight `name` as a resident F32 plane of `rows` rows of `k`.
 pub(super) fn f32_site(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
     let what = "qwen3moe::Body::load";
@@ -339,10 +406,10 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
         f32_site(w, name, 1, len)?;
     }
     f32_site(w, &router, e, h)?;
-    kq_site(w, &g.attn_q, q, h, &[SiteTy::Q4K])?;
-    kq_site(w, &g.attn_k, kv, h, &[SiteTy::Q4K])?;
-    g.v_ty = kq_site(w, &g.attn_v, kv, h, &[SiteTy::Q4K, SiteTy::Q6K])?;
-    kq_site(w, &g.attn_output, h, q, &[SiteTy::Q4K])?;
+    g.q_ty = dense_site(w, &g.attn_q, q, h)?;
+    g.k_ty = dense_site(w, &g.attn_k, kv, h)?;
+    g.v_ty = dense_site(w, &g.attn_v, kv, h)?;
+    g.o_ty = dense_site(w, &g.attn_output, h, q)?;
     if !stacks {
         return Ok(LayerPlan {
             mixer: MixerPlan::Gqa(g),
@@ -356,6 +423,19 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
         mixer: MixerPlan::Gqa(g),
         ffn: f,
     })
+}
+
+/// Whether a launch of the chain over `plans` and the token embedding
+/// resident in `w` reaches [`Kernels::q35`]: an attention site that is not
+/// one of the fused Q4_K groups (`dispatch::site_gemv`: its gemv, and on the
+/// prompt's wide arm its GEMM and quantizers), or a Q8_0 embedding
+/// (`dispatch::embed_into`). A chain of fused Q4_K and Q6_K sites over
+/// K-quant rows launches none of them.
+fn needs_site_kernels(w: &Weights, plans: &[LayerPlan]) -> bool {
+    let fused = plans
+        .iter()
+        .all(|p| matches!(&p.mixer, MixerPlan::Gqa(g) if g.qkv_fused() && g.o_fused()));
+    !fused || matches!(w.get(&token_embd()), Some(DevWeight::Q8_0 { .. }))
 }
 
 impl Body {
@@ -652,7 +732,7 @@ impl Body {
         let kv = layers
             .map(|_| KvPlanes::new(stream, &dims, kv))
             .collect::<Result<Vec<_>, _>>()?;
-        let k = Kernels::load(gpu, false)?;
+        let k = Kernels::load(gpu, needs_site_kernels(w, &plans))?;
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         let placed = match placed {
             None => None,
@@ -670,8 +750,8 @@ impl Body {
             }
         };
         Ok(Body {
-            prefill: Prefill::new(stream, dims)?,
-            ub: Ubatch::new(stream, dims, ubatch)?,
+            prefill: Prefill::new(stream, dims, Forms::of(&plans, &dims))?,
+            ub: Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?,
             rope: RopeRows::new(stream, &rope, HEAD, dims.ctx)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream, false)?,
@@ -1007,5 +1087,53 @@ impl GpuModel<Body> {
             )
         };
         Ok(rows.to_host_vec(self.stage_stream()?)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ggml_ty, site_ty};
+    use crate::site::SiteTy;
+    use gguf::quant::GgmlType;
+    use model::placement::kernels;
+
+    /// A dense entry of the table is the launch family of its own file type:
+    /// `site_ty` maps the entry to the family `site.rs` names for the type,
+    /// and `ggml_ty` maps it back, for every type the `dense` row names.
+    #[test]
+    fn a_dense_entry_is_the_launch_family_of_its_file_type() {
+        let mut named = 0;
+        for ty in [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::BF16,
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ4_XS,
+        ] {
+            let Some(entry) = kernels::dense(ty) else {
+                assert_eq!(
+                    SiteTy::of_ggml(ty),
+                    None,
+                    "{ty}: a launch with no table row"
+                );
+                continue;
+            };
+            named += 1;
+            assert_eq!(ggml_ty(site_ty(entry)), ty, "{ty}");
+            assert_eq!(SiteTy::of_ggml(ty), Some(site_ty(entry)), "{ty}");
+        }
+        assert!(
+            named >= 6,
+            "the dense row names {named} of the listed types"
+        );
     }
 }

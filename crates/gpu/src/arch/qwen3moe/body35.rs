@@ -787,7 +787,7 @@ impl Forms {
     /// chain's buffers (`Forms`'s doc), `d` its dims: every form one of the
     /// sites reads, the gate and up rows of an unfused gate·up, and the
     /// longest row-major output of a K-quant site launched alone.
-    fn of(plans: &[LayerPlan], d: &Dims) -> Forms {
+    pub(super) fn of(plans: &[LayerPlan], d: &Dims) -> Forms {
         let mut hid: Vec<SiteTy> = Vec::new();
         let (mut attn, mut h, mut glu, mut cols) = (Vec::new(), Vec::new(), false, 0usize);
         let mut apart: Vec<SiteTy> = Vec::new();

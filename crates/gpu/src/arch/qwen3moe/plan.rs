@@ -83,6 +83,19 @@ pub(super) struct GqaPlan {
     pub(super) attn_k_norm: String,
     pub(super) attn_output: String,
     /// The file's types of `attn_q`, `attn_k`, `attn_v` and `attn_output`.
+    /// Which launch a type takes, on the gemv arm (at most `GEMV_COLS` rows)
+    /// and on the wide arm (the prompt's GEMM units):
+    /// - Q4_K: the fused groups ([`GqaPlan::qkv_fused`], [`GqaPlan::o_fused`])
+    ///   — `ProjKernels::enqueue_qkv` over q, k and v, `enqueue_o_resid` for
+    ///   the output projection with the residual add in its store, a Q6_K v
+    ///   its own gemv — and the grouped GEMM `gemm_q4k`.
+    /// - Any other type, and a Q4_K one beside a type the group cannot hold:
+    ///   `site.rs`, each projection its own launch — Q3_K, Q4_K and Q6_K
+    ///   `Gpu::enqueue_gemv_*` (row-major, a token-major copy past one row),
+    ///   Q5_K the K-quant down `_sel` over one expert (`q5k_gemv_sel`), Q8_0
+    ///   `q8_0_gemv` or `q8_0_gemv_mcol` and F32 `f32_tile_gemm`, both over
+    ///   the f32 rows; the wide arm the grouped GEMM of a K-quant
+    ///   (`gemm_q{3,4,5,6}k`), `gemm_q8_0p` for Q8_0, the F32 tile for F32.
     pub(super) q_ty: SiteTy,
     pub(super) k_ty: SiteTy,
     pub(super) v_ty: SiteTy,
@@ -500,6 +513,48 @@ pub(super) fn moe_fits(m: &Moe) -> Result<RouterDims, String> {
             "experts {m:?}; the kernels take SwiGLU experts of {EXPERT_FF}, softmax renormalized \
              at scale 1, and a sigmoid-gated shared expert of {EXPERT_FF}"
         ))
+    }
+}
+
+/// Plans the unit tests of the dispatch and the ubatch share.
+#[cfg(test)]
+pub(super) mod fixtures {
+    use super::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
+
+    /// One layer of `kind` with the attention types `[q, k, v, o]` over the
+    /// plain routed FFN of Q4_K stacks.
+    pub(in crate::arch::qwen3moe) fn layer(kind: GqaKind, [q, k, v, o]: [SiteTy; 4]) -> LayerPlan {
+        let name = |s: &str| s.to_string();
+        LayerPlan {
+            mixer: MixerPlan::Gqa(GqaPlan {
+                kind,
+                flash: Flash::Group,
+                attn_norm: name("attn_norm"),
+                attn_q: name("attn_q"),
+                attn_k: name("attn_k"),
+                attn_v: name("attn_v"),
+                attn_q_norm: name("attn_q_norm"),
+                attn_k_norm: name("attn_k_norm"),
+                attn_output: name("attn_output"),
+                q_ty: q,
+                k_ty: k,
+                v_ty: v,
+                o_ty: o,
+            }),
+            ffn: FfnPlan {
+                ffn_norm: name("ffn_norm"),
+                route: FfnRoute::Router {
+                    gate_inp: name("gate_inp"),
+                    shared: None,
+                },
+                gate: name("gate"),
+                up: name("up"),
+                down: name("down"),
+                gate_ty: SiteTy::Q4K,
+                up_ty: SiteTy::Q4K,
+                down_ty: SiteTy::Q4K,
+            },
+        }
     }
 }
 

@@ -44,21 +44,23 @@
 //! token or per slot.
 
 use super::body::{ATTN_SCALE, Body, Kernels};
+use super::dispatch::embed_into;
 use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
 use super::image::PromptImage;
 use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
+use super::plan::{Form, MixerPlan};
 use super::router::RouterOut;
 use super::scratch::{Append128, Dims, KvPlanes, PrefillFlash, f32_view};
-use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::HEAD;
+use crate::gemm::GemmAct32;
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::site::{self, WideIn, WideKernels};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
-use model::arch::qwen3moe::names::token_embd;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -143,12 +145,17 @@ pub(super) struct UbArena {
     normed: DeviceBuffer<f32>,
     /// q8_1 of `normed`: the q·k·v input, then the gate·up input.
     act_hid: GemmAct,
+    /// q8 blocks of 32 of `normed` for the q·k·v of a Q8_0 site; `None` when
+    /// no site of the chain reads that form ([`Q32`]).
+    act_hid32: Option<GemmAct32>,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     /// The attention rows, `n_head · HEAD` per token.
     attn: DeviceBuffer<f32>,
     act_attn: GemmAct,
+    /// q8 blocks of 32 of `attn` for a Q8_0 output projection ([`Q32`]).
+    act_attn32: Option<GemmAct32>,
     /// The output projection's rows; the residual add reads them.
     attn_o: DeviceBuffer<f32>,
     /// The FFN's input residual: `x` plus the attention output.
@@ -168,9 +175,34 @@ pub(super) struct UbArena {
     down: DeviceBuffer<f32>,
 }
 
+/// Whether any attention site of the chain reads q8 blocks of 32 values (a
+/// Q8_0 site) from the normed rows and from the attention rows: the
+/// ubatch holds those forms only then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Q32 {
+    hid: bool,
+    attn: bool,
+}
+
+impl Q32 {
+    /// What the attention sites of `plans` read.
+    pub(super) fn of(plans: &[LayerPlan]) -> Q32 {
+        let reads = |tys: &[SiteTy]| tys.iter().any(|t| t.reads() == Form::Q8x32);
+        let mut q = Q32::default();
+        for p in plans {
+            if let MixerPlan::Gqa(g) = &p.mixer {
+                q.hid |= reads(&[g.q_ty, g.k_ty, g.v_ty]);
+                q.attn |= reads(&[g.o_ty]);
+            }
+        }
+        q
+    }
+}
+
 impl UbArena {
-    /// The arena for `d` and up to `rows` tokens. Load-time only.
-    fn new(stream: &CudaStream, d: Dims, rows: usize) -> Result<UbArena, GpuError> {
+    /// The arena for `d` and up to `rows` tokens, holding the q8 blocks of 32
+    /// `q32` names. Load-time only.
+    fn new(stream: &CudaStream, d: Dims, rows: usize, q32: Q32) -> Result<UbArena, GpuError> {
         let q_len = d.n_head * HEAD;
         let kv_len = d.n_kv * HEAD;
         let slots = rows * d.slots();
@@ -192,11 +224,19 @@ impl UbArena {
             n_keys: DeviceBuffer::zeroed(stream, rows)?,
             normed: f(rows * d.hidden)?,
             act_hid: GemmAct::new(stream, rows, d.hidden)?,
+            act_hid32: q32
+                .hid
+                .then(|| GemmAct32::new(stream, rows, d.hidden))
+                .transpose()?,
             q: f(rows * q_len)?,
             k: f(rows * kv_len)?,
             v: f(rows * kv_len)?,
             attn: f(rows * q_len)?,
             act_attn: GemmAct::new(stream, rows, q_len)?,
+            act_attn32: q32
+                .attn
+                .then(|| GemmAct32::new(stream, rows, q_len))
+                .transpose()?,
             attn_o: f(rows * d.hidden)?,
             ffn_inp: f(rows * d.hidden)?,
             route: RouterOut::for_ubatch(stream, r, rows)?,
@@ -233,6 +273,11 @@ impl UbArena {
                 .iter()
                 .map(|a| a.bytes())
                 .sum::<usize>()
+            + [&self.act_hid32, &self.act_attn32]
+                .into_iter()
+                .flatten()
+                .map(GemmAct32::bytes)
+                .sum::<usize>()
             + self.route.bytes()
             + self.dense.bytes()
             + self.moe.bytes()
@@ -259,17 +304,26 @@ pub(super) struct Ubatch {
     img: PromptImage,
     /// The ubatch size `U`; the arena holds `min(U, ctx)` rows.
     size: NonZeroUsize,
+    /// The q8 blocks of 32 the arena holds ([`Q32`]), kept for a resize.
+    q32: Q32,
 }
 
 impl Ubatch {
-    /// The arena for `min(u, d.ctx)` rows of `d` and an image for a prompt
-    /// of `d.ctx` tokens; `u` in `1..=UBATCH`, else refused. Load-time only.
-    pub(super) fn new(stream: &CudaStream, d: Dims, u: usize) -> Result<Ubatch, GpuError> {
+    /// The arena for `min(u, d.ctx)` rows of `d` (with the q8 blocks of 32
+    /// `q32` names) and an image for a prompt of `d.ctx` tokens; `u` in
+    /// `1..=UBATCH`, else refused. Load-time only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        d: Dims,
+        u: usize,
+        q32: Q32,
+    ) -> Result<Ubatch, GpuError> {
         let size = ubatch_of(u)?;
         Ok(Ubatch {
-            a: UbArena::new(stream, d, u.min(d.ctx))?,
+            a: UbArena::new(stream, d, u.min(d.ctx), q32)?,
             img: PromptImage::new(stream, d.ctx, false)?,
             size,
+            q32,
         })
     }
 
@@ -285,7 +339,7 @@ impl Ubatch {
     pub(super) fn resize(&mut self, stream: &CudaStream, u: usize) -> Result<(), GpuError> {
         let size = ubatch_of(u)?;
         let d = self.a.dims;
-        self.a = UbArena::new(stream, d, u.min(d.ctx))?;
+        self.a = UbArena::new(stream, d, u.min(d.ctx), self.q32)?;
         self.size = size;
         Ok(())
     }
@@ -338,18 +392,7 @@ impl Ubatch {
         let io = win.io();
         let (gpu, a) = (c.gpu, &mut self.a);
         let stream = gpu.stream();
-        gpu.elem().enqueue_embed_rows_q4k(
-            stream,
-            EmbedRowsArgs {
-                w: kq_weight(c.w, &token_embd())?,
-                ids: io.ids,
-                pos0: io.pos0,
-                first: io.first,
-                y: &mut a.x,
-                pos: &mut a.pos,
-                n_keys: &mut a.n_keys,
-            },
-        )?;
+        embed_into(gpu, c.w, c.k, &io, (&mut a.x, &mut a.pos, &mut a.n_keys))?;
         c.k.gemm
             .enqueue_route_dense(stream, t, &mut a.dense, gpu.unlabelled_sink())?;
         for (slot, (p, kv)) in c.plans.iter().zip(kv.iter_mut()).enumerate() {
@@ -401,9 +444,82 @@ pub(super) struct UbCtx<'a> {
     pub(super) table: &'a DeviceBuffer<f32>,
 }
 
+/// `x`'s first `t` rows quantized into each form a site of `tys` reads: q8_1
+/// blocks of 128 into `q128`, q8 blocks of 32 into `q32`.
+fn quantize(
+    c: &UbCtx<'_>,
+    x: &DeviceBuffer<f32>,
+    t: usize,
+    (q128, q32): (&mut GemmAct, Option<&mut GemmAct32>),
+    tys: &[SiteTy],
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    let reads = |f: Form| tys.iter().any(|ty| ty.reads() == f);
+    if reads(Form::Q8x128) {
+        c.gpu.enqueue_quantize_gemm(x, t, q128, sink)?;
+    }
+    if reads(Form::Q8x32) {
+        let a = q32.ok_or(GpuError::state(
+            WHAT,
+            "the ubatch's q8 blocks of 32 (a Q8_0 site reads them)",
+        ))?;
+        c.k.q35(WHAT)?
+            .g32
+            .enqueue_quantize_gemm32(c.gpu.stream(), x, t, a, sink)?;
+    }
+    Ok(())
+}
+
+/// `y = W · x` for the dense site `name` of type `ty`, `rows` rows, over the
+/// ubatch's one-expert table `dense` and its `t` rows: a K-quant straight
+/// through the grouped GEMM over the q8_1 blocks of 128 (the one launch a
+/// chain of K-quant sites loads), any other type through `site::gemm`, which
+/// also needs the 32-value kernels.
+fn project(
+    c: &UbCtx<'_>,
+    (ty, name): (SiteTy, &str),
+    rows: usize,
+    (x, dense): (&WideIn<'_>, &GemmRoute),
+    t: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    match ty.gemm_weight() {
+        Some(gw) => k.gemm.enqueue_gemm(
+            gpu.stream(),
+            GemmArgs {
+                ty: gw,
+                w: kq_weight(w, name)?,
+                rows_per_expert: rows,
+                act: x.q128.ok_or(GpuError::state(
+                    WHAT,
+                    "the ubatch's q8_1 blocks of 128 (a K-quant site reads them)",
+                ))?,
+                route: dense,
+                input: GemmInput::PerSlot,
+                y,
+            },
+        ),
+        None => site::gemm(
+            gpu,
+            &WideKernels {
+                gemm: &k.gemm,
+                g32: &k.q35(WHAT)?.g32,
+            },
+            (ty, w, name),
+            rows,
+            x,
+            (dense, GemmInput::PerSlot),
+            t,
+            y,
+        ),
+    }
+}
+
 /// The attention half at `t` rows: `x` in, `ffn_inp = x + attn_output(attn(x))`
 /// out; the ubatch's K/V rows appended to the layer's planes at the rows'
-/// positions.
+/// positions. Each projection runs the launch its type picks ([`project`]);
+/// the rows are quantized into the forms those sites read.
 fn attention(
     c: &UbCtx<'_>,
     n: &GqaPlan,
@@ -432,24 +548,25 @@ fn attention(
         t,
         &mut a.normed,
     )?;
-    gpu.enqueue_quantize_gemm(&a.normed, t, &mut a.act_hid, sink)?;
+    quantize(
+        c,
+        &a.normed,
+        t,
+        (&mut a.act_hid, a.act_hid32.as_mut()),
+        &[n.q_ty, n.k_ty, n.v_ty],
+        sink,
+    )?;
+    let hid = WideIn {
+        q128: Some(&a.act_hid),
+        q32: a.act_hid32.as_ref(),
+        f32: Some(&a.normed),
+    };
     for (name, ty, rows, y) in [
-        (&n.attn_q, SiteTy::Q4K, q_len, &mut a.q),
-        (&n.attn_k, SiteTy::Q4K, kv_len, &mut a.k),
+        (&n.attn_q, n.q_ty, q_len, &mut a.q),
+        (&n.attn_k, n.k_ty, kv_len, &mut a.k),
         (&n.attn_v, n.v_ty, kv_len, &mut a.v),
     ] {
-        k.gemm.enqueue_gemm(
-            stream,
-            GemmArgs {
-                ty: gemm_ty(ty)?,
-                w: kq_weight(w, name)?,
-                rows_per_expert: rows,
-                act: &a.act_hid,
-                route: &a.dense,
-                input: GemmInput::PerSlot,
-                y,
-            },
-        )?;
+        project(c, (ty, name), rows, (&hid, &a.dense), t, y)?;
     }
     kv.append_128(
         &k.neox,
@@ -485,18 +602,26 @@ fn attention(
             y: &mut a.attn,
         },
     )?;
-    gpu.enqueue_quantize_gemm(&a.attn, t, &mut a.act_attn, sink)?;
-    k.gemm.enqueue_gemm(
-        stream,
-        GemmArgs {
-            ty: GemmWeight::Q4K,
-            w: kq_weight(w, &n.attn_output)?,
-            rows_per_expert: d.hidden,
-            act: &a.act_attn,
-            route: &a.dense,
-            input: GemmInput::PerSlot,
-            y: &mut a.attn_o,
-        },
+    quantize(
+        c,
+        &a.attn,
+        t,
+        (&mut a.act_attn, a.act_attn32.as_mut()),
+        &[n.o_ty],
+        sink,
+    )?;
+    let attn = WideIn {
+        q128: Some(&a.act_attn),
+        q32: a.act_attn32.as_ref(),
+        f32: Some(&a.attn),
+    };
+    project(
+        c,
+        (n.o_ty, &n.attn_output),
+        d.hidden,
+        (&attn, &a.dense),
+        t,
+        &mut a.attn_o,
     )?;
     gpu.elem()
         .enqueue_add(stream, &a.x, &a.attn_o, t * d.hidden, &mut a.ffn_inp)
@@ -584,4 +709,35 @@ fn ffn(
             y: &mut a.x,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Q32;
+    use crate::arch::qwen3moe::plan::fixtures::layer;
+    use crate::arch::qwen3moe::plan::{GqaKind, SiteTy};
+
+    fn q32_of(tys: [SiteTy; 4]) -> Q32 {
+        Q32::of(&[layer(GqaKind::Neox128, tys)])
+    }
+
+    fn q32(hid: bool, attn: bool) -> Q32 {
+        Q32 { hid, attn }
+    }
+
+    /// The ubatch holds q8 blocks of 32 values only for the forms a Q8_0 site
+    /// reads: the normed rows for q, k and v, the attention rows for the
+    /// output projection. K-quant and F32 sites read other forms.
+    #[test]
+    fn the_ubatch_holds_32_value_blocks_for_a_q8_0_site_only() {
+        use SiteTy::{F32, Q4K, Q5K, Q8_0};
+        assert_eq!(q32_of([Q4K; 4]), q32(false, false));
+        assert_eq!(q32_of([Q5K; 4]), q32(false, false));
+        assert_eq!(q32_of([F32; 4]), q32(false, false));
+        assert_eq!(q32_of([Q8_0, Q4K, Q4K, Q4K]), q32(true, false));
+        assert_eq!(q32_of([Q4K, Q8_0, Q4K, Q4K]), q32(true, false));
+        assert_eq!(q32_of([Q4K, Q4K, Q8_0, Q4K]), q32(true, false));
+        assert_eq!(q32_of([Q4K, Q4K, Q4K, Q8_0]), q32(false, true));
+        assert_eq!(q32_of([Q8_0; 4]), q32(true, true));
+    }
 }

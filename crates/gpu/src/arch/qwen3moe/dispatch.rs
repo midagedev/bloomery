@@ -263,7 +263,8 @@ pub(super) fn enqueue_pass(
 ///   q·k·v of other types each projection launches alone
 ///   ([`site_launches`]); an output projection not of Q4_K is its
 ///   quantizer (a K-quant) or the f32 out gate (any other), the projection
-///   and the residual add.
+///   and the residual add. At head 128 a Q8_0 or F32 output projection has
+///   neither: the flash's f32 rows are its input.
 /// - Delta rule ([`delta::launches`]): norm+quant, the two projection
 ///   launches, conv, delta, gated norm, quantizer and output projection —
 ///   8 — plus a Q6_K q·k·v projection's token-major copy at more than one
@@ -321,7 +322,10 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 let out = if g.o_fused() {
                     2
                 } else {
-                    1 + out_resid_launches(g.o_ty, m)
+                    // The quantizer of the attention rows (a K-quant) or the
+                    // f32 out gate; head 128 has no out gate.
+                    let rows = usize::from(g.kind == GqaKind::Gated256 || g.o_ty.kquant());
+                    rows + out_resid_launches(g.o_ty, m)
                 };
                 1 + qkv + 3 + out
             }
@@ -637,7 +641,9 @@ fn attention(
                 },
                 c.mma,
             )?;
-            gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
+            if n.o_ty.kquant() {
+                gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
+            }
         }
         GqaKind::Gated256 => gated_256(c, n, kv, s, m)?,
     }
@@ -706,9 +712,10 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
 }
 
 /// The attention half's row-wise back at `m <= GEMV_COLS` rows, once the
-/// attention rows' q8_1 is in `act_attn`: the output projection, a Q4_K one
-/// with the residual add in its store, any other into `normed` and an add,
-/// into `ffn_inp`.
+/// attention rows are ready for the output projection — their q8_1 in
+/// `act_attn` for a K-quant one, f32 rows for any other: the output
+/// projection, a Q4_K one with the residual add in its store, any other into
+/// `normed` and an add, into `ffn_inp`.
 pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     let (w, k) = (c.w, c.k);
     let stream = c.gpu.stream();
@@ -730,17 +737,22 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
         x,
         normed,
         q_out,
+        attn,
         act_attn,
         ffn_inp,
         cols,
         ..
     } = s;
-    // A gated output projection of another type reads the f32 rows
-    // `gated_256` wrote into the free query buffer.
-    let rows = q_out.as_ref().ok_or(GpuError::state(
-        "qwen3moe::attention",
-        "the arena's gated rows",
-    ))?;
+    // An output projection of another type reads f32 rows: at head 128 the
+    // flash's own, at head 256 the products `gated_256` wrote into the free
+    // query buffer.
+    let rows = match n.kind {
+        GqaKind::Neox128 => &*attn,
+        GqaKind::Gated256 => q_out.as_ref().ok_or(GpuError::state(
+            "qwen3moe::attention",
+            "the arena's gated rows",
+        ))?,
+    };
     out_resid(
         c,
         (n.o_ty, &n.attn_output),
@@ -1356,4 +1368,46 @@ fn apart_down(
             y: out.unwrap_or(x),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pass_launches;
+    use crate::arch::qwen3moe::plan::fixtures::layer;
+    use crate::arch::qwen3moe::plan::{GqaKind, SiteTy};
+
+    /// The launches of a one-layer pass at `m` rows, less the embedding.
+    fn one(kind: GqaKind, tys: [SiteTy; 4], m: usize) -> usize {
+        pass_launches(&[layer(kind, tys)], m) - 1
+    }
+
+    /// A layer's attention launches follow its sites' types: the fused Q4_K
+    /// groups are 7 (12 with the FFN's 5, the pin of the Q4_K_M file), a site
+    /// that leaves a group launches alone (+3 for four Q5_K sites at one row,
+    /// +2 for a Q5_K value beside Q4_K q and k, which keep their gemvs), and
+    /// a Q8_0 or F32 output projection at head 128 is its gemv and the add:
+    /// no quantizer, as many launches as the fused one.
+    #[test]
+    fn an_attention_layer_launches_by_its_site_types() {
+        use SiteTy::{F32, Q3K, Q4K, Q5K, Q6K, Q8_0};
+        let h = GqaKind::Neox128;
+        let ffn = 5;
+        assert_eq!(one(h, [Q4K; 4], 1), 7 + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 1), 8 + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 2), 9 + ffn);
+        assert_eq!(one(h, [Q5K; 4], 1), 10 + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q5K, Q4K], 1), 9 + ffn);
+        // Past one row a row-major site alone adds its token-major copy; a
+        // token-major Q5_K site does not.
+        assert_eq!(one(h, [Q4K, Q4K, Q5K, Q4K], 2), 11 + ffn);
+        assert_eq!(one(h, [Q5K; 4], 2), 10 + ffn);
+        assert_eq!(one(h, [Q6K; 4], 2), 1 + 6 + 3 + (1 + 2 + 1) + ffn);
+        assert_eq!(one(h, [Q3K, Q3K, Q3K, Q4K], 1), 1 + 3 + 3 + 2 + ffn);
+        // Head 128 and a Q8_0 or F32 output projection: gemv and add, no
+        // quantizer; the same count as the fused projection's two.
+        assert_eq!(one(h, [Q4K, Q4K, Q4K, Q8_0], 1), 7 + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q4K, F32], 1), 7 + ffn);
+        // Head 256 keeps its out gate in front of the projection.
+        assert_eq!(one(GqaKind::Gated256, [Q4K, Q4K, Q4K, Q8_0], 1), 8 + ffn);
+    }
 }

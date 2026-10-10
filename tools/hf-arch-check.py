@@ -181,7 +181,7 @@ TYPE_PLACES = {
                ("crates/gpu/src/arch/qwen3moe/program38.rs",
                 "let (qs, d) = q8(c.w, &model::arch::qwen35moe::names::token_embd())?;"),
                ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
-    "qwen3": (("crates/gpu/src/arch/qwen3moe/body.rs", "kq_site(w, &g.attn_q, q, h, &[SiteTy::Q4K])?;"),
+    "qwen3": (("crates/gpu/src/arch/qwen3moe/body.rs", "g.q_ty = dense_site(w, &g.attn_q, q, h)?;"),
               ("crates/gpu/src/head.rs", "fn head_out_w(w: &Weights)"),
               ("crates/model/src/arch/qwen3moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
