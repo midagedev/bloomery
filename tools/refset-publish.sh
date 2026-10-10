@@ -8,7 +8,7 @@
 #       /tmp/refset-publish; never under /models or --data).
 #   tools/refset-publish.sh --upload
 #       Refused (64) unless REFSET_PUBLISH_GO=1. Stages the files as hardlinks (REFSET_PUBLISH_STAGE, default beside
-#       --data, which must be the same filesystem) plus README.md and SHA256SUMS, and runs `hf upload --repo-type dataset`
+#       --data, which must be the same filesystem) plus README.md, SHA256SUMS and LICENCES/, and runs `hf upload --repo-type dataset`
 #       on it with HF_TOKEN_PATH pointing at the token file; this script never reads the token.
 #   tools/refset-publish.sh --self-test    # the assignment, the named errors, the left-out block and the --upload refusal
 #                                          # on a fake tree; check-recipes runs it
@@ -162,7 +162,19 @@ assign() {
     n=$(awk -F'\t' -v f="$fam" '$1 == f { print $3 }' "$W/published.tsv" | sort -u | wc -l | tr -d ' ')
     [ "$n" = 1 ] || die 65 "the family $fam: its sets carry $n different '# fixture' lines, so they were not all dumped from one fixture"
     grep -q "^$fam$TAB" "$ROOT/tools/refset-publish/sources.tsv" || die 65 "the family $fam has no row in tools/refset-publish/sources.tsv (model and licence)"
+    licence_ok "$fam"
   done
+}
+
+# The family's licence copy exists and hashes to its sources.tsv row; anything else is a named error (65), since the
+# published LICENCES/<fam>.txt is the notice the licence asks every copy to carry.
+licence_ok() {
+  local fam=$1 want got f=$ROOT/tools/refset-publish/licences/$1.txt
+  want=$(awk -F'\t' -v f="$fam" '$1 == f { print $5; exit }' "$ROOT/tools/refset-publish/sources.tsv")
+  [ -n "$want" ] || die 65 "the family $fam: its sources.tsv row has no sha256 of the licence text"
+  [ -f "$f" ] || die 65 "the family $fam: no licence text at $f"
+  got=$($SHA "$f" | cut -d" " -f1)
+  [ "$got" = "$want" ] || die 65 "the family $fam: $f hashes to $got, not the $want its sources.tsv row records"
 }
 
 # size<TAB>path of every file, NUL-separated names in, from stdin
@@ -267,7 +279,7 @@ render_readme() {
   : > "$W/setlist.md"
   printf '| family | fixture dir | sets | files | size |\n|---|---|---|---|---|\n' >> "$W/table.md"
   for fam in $(cut -f1 "$W/published.tsv" | sort -u); do
-    IFS=$TAB read -r _ model lic link < <(grep "^$fam$TAB" "$src")
+    IFS=$TAB read -r _ model lic link _ < <(grep "^$fam$TAB" "$src")
     dir=$(awk -F'\t' -v f="$fam" '$1 == f { print $2; exit }' "$W/dirs.tsv")
     sets=$(awk -F'\t' -v f="$fam" '$1 == f' "$W/published.tsv" | wc -l | tr -d ' ')
     files=$(awk -F'\t' -v f="$fam" '$1 == f' "$W/manifest.tsv" | wc -l | tr -d ' ')
@@ -275,7 +287,7 @@ render_readme() {
     printf '| `%s` | `/models/fixtures/%s` | %s | %s | %s GB |\n' "$fam" "$dir" "$sets" "$files" "$(gb "$bytes")" >> "$W/table.md"
     printf -- '- `%s`: %s\n' "$fam" "$(awk -F'\t' -v f="$fam" '$1 == f { print "`" $2 "`" }' "$W/published.tsv" | sort | paste -sd, - | sed 's/,/, /g')" >> "$W/setlist.md"
     printf 'fixture fetch %s /models/fixtures/%s\n' "$fam" "$dir" >> "$W/fetch.txt"
-    printf -- '- %s (family `%s`): %s, [model card](%s)\n' "$model" "$fam" "$lic" "$link" >> "$W/licences.md"
+    printf -- '- %s (family `%s`): %s, [`LICENCES/%s.txt`](LICENCES/%s.txt), a copy of [the base model'"'"'s LICENSE](%s)\n' "$model" "$fam" "$lic" "$fam" "$fam" "$link" >> "$W/licences.md"
   done
   if [ -s "$W/leftout.tsv" ]; then
     awk -F'\t' '{ printf "- `%s`: %s\n", $1, $2 }' "$W/leftout.tsv" > "$W/leftout.md"
@@ -307,10 +319,10 @@ render_readme() {
   fi
 }
 
-# Hardlink every published file into STAGE at its repo path, and write README.md and SHA256SUMS beside them. STAGE must be on the
+# Hardlink every published file into STAGE at its repo path, and write README.md, SHA256SUMS and LICENCES/<family>.txt beside them. STAGE must be on the
 # filesystem of --data: a link that fails is a named error (65) and nothing is copied.
 stage_tree() {
-  local stage=$1 rp src
+  local stage=$1 rp src fam
   rm -rf "$stage"
   mkdir -p "$stage"
   while IFS=$TAB read -r _ rp src _; do
@@ -318,6 +330,10 @@ stage_tree() {
     ln "$src" "$stage/$rp" 2> /dev/null || die 65 "cannot hardlink $src to $stage/$rp: the stage must be on the filesystem of $DATA (set REFSET_PUBLISH_STAGE); nothing is copied"
   done < "$W/manifest.tsv"
   cp "$OUT/README.md" "$OUT/SHA256SUMS" "$stage/"
+  mkdir -p "$stage/LICENCES"
+  for fam in $(cut -f1 "$W/manifest.tsv" | sort -u); do
+    cp "$ROOT/tools/refset-publish/licences/$fam.txt" "$stage/LICENCES/" || die 65 "cannot copy the licence text of $fam into $stage/LICENCES"
+  done
 }
 
 upload() {
@@ -403,6 +419,20 @@ self_test() {
   want "stage_tree stages the fake tree" "$rc"
   [ "$T/stage/ref-mtp/fx_prose64/a.f32" -ef "$T/data/ref-mtp/fx_prose64/a.f32" ] && [ -f "$T/stage/README.md" ] && [ -f "$T/stage/SHA256SUMS" ] && rc=0 || rc=1
   want "a staged file is a hardlink of its source (same inode), README.md and SHA256SUMS are beside them" "$rc"
+  cmp -s "$T/stage/LICENCES/glm5next.txt" "$ROOT/tools/refset-publish/licences/glm5next.txt" && [ "$(ls "$T/stage/LICENCES" | paste -sd' ' -)" = "$(cut -f1 "$T/w/manifest.tsv" | sort -u | sed 's/$/.txt/' | paste -sd' ' -)" ] && rc=0 || rc=1
+  want "the stage carries the licence text of each published family, and only those" "$rc"
+  grep -q '(family `glm5next`): MIT, \[`LICENCES/glm5next.txt`\](LICENCES/glm5next.txt), a copy of \[the base model.s LICENSE\](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/[0-9a-f]\{40\}/LICENSE)$' "$T/out1/README.md" && rc=0 || rc=1
+  want "the README links the published licence text and the base model's LICENSE at a revision" "$rc"
+  mkdir -p "$T/lroot/tools/refset-publish/licences"
+  cp "$ROOT/tools/refset-publish/sources.tsv" "$T/lroot/tools/refset-publish/"
+  { cat "$ROOT/tools/refset-publish/licences/glm5next.txt"; echo; } > "$T/lroot/tools/refset-publish/licences/glm5next.txt"
+  o2=$( ( ROOT=$T/lroot; licence_ok glm5next ) 2>&1 ) && rc=0 || rc=$?
+  { [ "$rc" = 65 ] && case $o2 in *"the family glm5next: $T/lroot/tools/refset-publish/licences/glm5next.txt hashes to "*", not the "*) true ;; *) false ;; esac; } && rc=0 || rc=1
+  want "a licence copy that differs from its recorded sha256 ends 65 by name" "$rc"
+  rm "$T/lroot/tools/refset-publish/licences/glm5next.txt"
+  o2=$( ( ROOT=$T/lroot; licence_ok glm5next ) 2>&1 ) && rc=0 || rc=$?
+  { [ "$rc" = 65 ] && case $o2 in *"the family glm5next: no licence text at "*) true ;; *) false ;; esac; } && rc=0 || rc=1
+  want "a missing licence copy ends 65 by name" "$rc"
   printf 'glm5next\tfx_gone/a.f32\t%s/data/fx_gone/a.f32\t1\tab\n' "$T" > "$T/w/manifest.tsv"
   o2=$( ( DATA=$T/data OUT=$T/out1 W=$T/w; stage_tree "$T/stage2" ) 2>&1 ) && rc=0 || rc=$?
   { [ "$rc" = 65 ] && case $o2 in *"cannot hardlink $T/data/fx_gone/a.f32 to $T/stage2/fx_gone/a.f32"*) true ;; *) false ;; esac; } && rc=0 || rc=1

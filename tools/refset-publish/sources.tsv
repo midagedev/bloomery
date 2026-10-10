@@ -1,7 +1,11 @@
 # The model and licence of each fixture family, for the dataset README. Where `fixture fetch` reads a family's files from (repo, quant,
 # revision) is the fixture table in crates/model/src/bin/fixture.rs (SPECS) and is not copied here. Every family that
 # tools/refset-publish.sh publishes needs a row; the family names are the architectures of crates/refset/src/fixture.rs DIRS.
-# arch<TAB>model<TAB>licence<TAB>licence link (the model card of the source repo)
-deepseek41	DeepSeek V4.1 Flash	MIT	https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF
-glm5next	GLM-5.3-Flash	MIT	https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF
-qwen4exp	Qwen3.8-Flash-Next	Qwen Community License 1.0	https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF
+# The licence text is the base model's LICENSE file at a fixed revision, copied with its line ends as LF into
+# tools/refset-publish/licences/<arch>.txt and published as LICENCES/<arch>.txt; the sha256 column is that file's, and the
+# script refuses a copy that differs. Each licence permits redistribution on the condition that its notice goes with
+# every copy, which the published LICENCES/ directory carries.
+# arch<TAB>model<TAB>licence<TAB>licence text (the base model's LICENSE at a revision)<TAB>sha256 of the copy
+deepseek41	DeepSeek V4.1 Flash	MIT	https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/LICENSE	1c8f573e830ca9b3ebfeb7ace1823146e22b66f99ee223840e7637c9e745e1c7
+glm5next	GLM-5.3-Flash	MIT	https://huggingface.co/zai-org/GLM-5.3-Flash/blob/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a/LICENSE	30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1
+qwen4exp	Qwen3.8-Flash-Next	Qwen Community License 1.0	https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/LICENSE	465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4
