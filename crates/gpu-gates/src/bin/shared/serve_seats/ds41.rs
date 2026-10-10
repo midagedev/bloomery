@@ -227,8 +227,6 @@ use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision::arch::deepseek41v::Hparams as VisionHparams;
 #[cfg(feature = "vision")]
-use vision::arch::deepseek41v::card::CardBytes;
-#[cfg(feature = "vision")]
 use vision::arch::deepseek41v::media::Media;
 
 use crate::draft::{Draft, open_dspark};
@@ -472,7 +470,7 @@ fn vision_of(a: &Args, prefill: body::PrefillMode) -> Result<Option<EncoderSeat>
     }
     let file = gguf::Gguf::open(path).map_err(|e| format!("--mmproj {}: {e}", path.display()))?;
     let hp = VisionHparams::read(&file)?;
-    let bytes = CardBytes::of(&hp).total();
+    let bytes = vision::arch::deepseek41v::card::of(&hp).total();
     Ok(Some(encoder_seat(a.place, bytes)?))
 }
 
