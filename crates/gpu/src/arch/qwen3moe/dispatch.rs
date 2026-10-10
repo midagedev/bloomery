@@ -20,7 +20,11 @@ use super::body::{ATTN_SCALE, ATTN_SCALE_256, Body, Kernels};
 use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
-use super::plan::{FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
+use super::hostleg::{HostCombineArgs, HostLegKernels};
+use super::plan::{
+    DownEntry, FfnPlan, FfnRoute, Form, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan,
+    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry,
+};
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes, StoreMut};
@@ -28,7 +32,9 @@ use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
+use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::q4k_sel::QuantSel;
 use crate::q38::{EmbedQ8Args, OutGateArgs};
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
@@ -270,6 +276,12 @@ pub(super) fn enqueue_pass(
 ///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
 ///   one launch with no quantizer, a Q3_K or Q5_K one the quantizer and its
 ///   projection ([`site_launches`]).
+/// - A routed FFN whose shared expert is kept apart ([`apart_down`]): the
+///   norm with the router (`norm_quant` and the router, two, when the
+///   shared gate or up reads f32 rows), the card list, the routed gate·up,
+///   its quantizer and down, the shared gate and up, the SwiGLU, a K-quant
+///   shared down's quantizer, the shared down, and the combine — 11 of
+///   Q8_0 or of K-quant shared sites at one row.
 ///
 /// So a qwen3moe layer is 12 or 13 launches at one row and 12 or 14 at
 /// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
@@ -278,9 +290,12 @@ pub(super) fn enqueue_pass(
 /// prefill flash, gated quantizer, output GEMM and residual add, 10; the
 /// delta rule's 12 ([`delta::launches`]) — and the FFN's norm, quantizer,
 /// router logits and routing, route table, gate, up, SwiGLU quantizer, down
-/// and combine, 10; a dense FFN's norm, quantizer, gate, up, SwiGLU
-/// quantizer, down and combine, 7. A wide input is quantized once for each
-/// form its sites read ([`wide_quants`]: none for F32 sites alone, two for
+/// and combine, 10; with the shared expert kept apart, the norm, the
+/// router's two, the card list, the routed table, the routed four, the
+/// shared gate, up, SwiGLU (with its quantizer) and down, and the combine,
+/// 14, beside the input's quantizers; a dense FFN's norm, quantizer, gate,
+/// up, SwiGLU quantizer, down and combine, 7. A wide input is quantized once
+/// for each form its sites read ([`wide_quants`]: none for F32 sites alone, two for
 /// a K-quant beside a Q8_0), and a gated output projection not of a K-quant
 /// takes the f32 out gate and its own quantizer in place of the gated one.
 pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
@@ -314,6 +329,29 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
         };
         let f = &p.ffn;
         let ffn = match (&f.route, wide) {
+            (
+                FfnRoute::Router {
+                    shared: Some(SharedPlan::Apart(sh)),
+                    ..
+                },
+                true,
+            ) => 1 + wide_quants(&[f.gate_ty, f.up_ty, sh.gate_ty, sh.up_ty]) + 2 + 2 + 4 + 4 + 1,
+            (
+                FfnRoute::Router {
+                    shared: Some(SharedPlan::Apart(sh)),
+                    ..
+                },
+                false,
+            ) => {
+                1 + usize::from(sh.reads_f32())
+                    + 4
+                    + site(sh.gate_ty)
+                    + site(sh.up_ty)
+                    + 1
+                    + usize::from(sh.down_ty.kquant())
+                    + site(sh.down_ty)
+                    + 1
+            }
             (FfnRoute::Router { .. }, true) => 10,
             (FfnRoute::Router { .. }, false) => 5,
             (FfnRoute::Dense, true) => 1 + wide_quants(&[f.gate_ty, f.up_ty]) + 5,
@@ -839,9 +877,13 @@ fn gated_256(
 /// token (the file's `top_k`); with one ([`FfnRoute::Router`]'s `shared`)
 /// the gated router adds one more, the shared expert's id in the joined
 /// stacks weighted by the sigmoid of the router's last row, and every launch
-/// after it runs `k + 1` slots a token. A dense FFN ([`FfnRoute::Dense`])
-/// launches no router: its norm is `norm_quant` at every `m`, and the launches
-/// after it run its one slot a token from the arena's fixed route.
+/// after it runs `k + 1` slots a token; a shared expert kept apart from the
+/// stacks runs as its own FFN ([`apart_down`]). Each routed stack launches
+/// at the card kernel table's entry for its type (`plan::gate_up_entry`,
+/// `plan::down_entry`), the family's own Q4_K gate·up on joined stacks. A
+/// dense FFN ([`FfnRoute::Dense`]) launches no router: its norm is
+/// `norm_quant` at every `m`, and the launches after it run its one slot a
+/// token from the arena's fixed route.
 /// The down `_sel` runs every token's slots in one launch: slot `t · slots
 /// + j` is token `t`'s slot `j`, its id, its q8_1 column and its down rows
 /// all at that index, so each slot's row is the row a one-token launch
@@ -849,7 +891,8 @@ fn gated_256(
 /// 128-value block is quantized on its own, so a column's bytes do not
 /// depend on the columns beside it). The norm runs inside the router's
 /// launch, `norm_quant`'s bytes: `enqueue_norm_fused` at one token,
-/// `enqueue_norm_fused_m` at more.
+/// `enqueue_norm_fused_m` at more; a shared expert kept apart whose gate or
+/// up reads f32 rows takes `norm_quant` and the router on those rows.
 pub(super) fn ffn(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -882,6 +925,28 @@ pub(super) fn ffn(
     };
     let router = f32_tensor(w, gate_inp)?;
     match shared {
+        // A shared expert kept apart whose gate or up reads the f32 normed
+        // rows: `norm_quant` writes them beside their q8_1, then the router
+        // reads them — the bytes the fused norm and router write.
+        Some(SharedPlan::Apart(sh)) if sh.reads_f32() => {
+            gpu.fused().enqueue_norm_quant(
+                stream,
+                &s.ffn_inp,
+                gain,
+                c.eps,
+                &mut s.act_ffn[i],
+                &mut s.normed,
+                c.sink,
+            )?;
+            k.q35(WHAT)?.router.enqueue_fused(
+                stream,
+                router,
+                &s.normed,
+                m,
+                c.sink,
+                s.route.gated(WHAT)?,
+            )?;
+        }
         None if m == 1 => k.router.enqueue_norm_fused(
             stream,
             router,
@@ -923,7 +988,10 @@ pub(super) fn ffn(
             s.route.gated(WHAT)?,
         )?,
     }
-    slots_down(c, n, s, m, out)
+    match n.apart() {
+        Some(sh) => apart_down(c, n, sh, s, m, out),
+        None => slots_down(c, n, s, m, out),
+    }
 }
 
 /// The FFN half after its slots are picked: the gate·up·SwiGLU of every
@@ -954,19 +1022,43 @@ fn slots_down(
         ));
     }
     if n.gate_up_fused() {
-        k.experts.enqueue_gate_up(
-            stream,
-            GateUpArgs {
-                wg: kq_weight(w, &n.gate)?,
-                wu: kq_weight(w, &n.up)?,
-                act: &s.act_ffn[i],
-                sel: s.route.ids(),
-                n_slots: m * slots,
-                rows_per_expert: d.ff,
-                fault: c.sink,
-                h: &mut s.h,
-            },
-        )?;
+        match gate_up_entry(n.gate_ty, n.up_ty, WHAT)? {
+            // The family's own Q4_K gate·up·SwiGLU over the slots' ids.
+            GateUpEntry::Q4k => k.experts.enqueue_gate_up(
+                stream,
+                GateUpArgs {
+                    wg: kq_weight(w, &n.gate)?,
+                    wu: kq_weight(w, &n.up)?,
+                    act: &s.act_ffn[i],
+                    sel: s.route.ids(),
+                    n_slots: m * slots,
+                    rows_per_expert: d.ff,
+                    fault: c.sink,
+                    h: &mut s.h,
+                },
+            )?,
+            GateUpEntry::Q5k => k.q35(WHAT)?.ffn.kq.enqueue_gate_up_q5k(
+                stream,
+                &GateUpAct {
+                    wg: kq_weight(w, &n.gate)?,
+                    wu: kq_weight(w, &n.up)?,
+                    act: &s.act_ffn[i],
+                    sel: s.route.ids(),
+                    n_slots: m * slots,
+                    rows_per_expert: d.ff,
+                    slots_per_col: slots,
+                    rule: Act::SiluMul,
+                },
+                c.sink,
+                &mut s.h,
+            )?,
+            GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => {
+                return Err(GpuError::state(
+                    WHAT,
+                    "a gate·up entry the plan admits for no stack here",
+                ));
+            }
+        }
     } else {
         // A dense FFN's one slot a token (the load refuses an unfused
         // routed gate·up): the token's gate and up rows apart, then the
@@ -990,11 +1082,12 @@ fn slots_down(
             .enqueue_swiglu(stream, &g.g, &g.u, m * slots * d.ff, h)?;
     }
     if n.down_sel() {
+        let entry = down_entry(n.down_ty, WHAT)?;
         let wd = kq_weight(w, &n.down)?;
         gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
         let act_h = &s.act_h[i];
-        if n.down_ty == SiteTy::Q4K {
-            gpu.q4k_sel().enqueue_gemv_q4k_sel(
+        match entry {
+            DownEntry::Q4k => gpu.q4k_sel().enqueue_gemv_q4k_sel(
                 stream,
                 wd,
                 act_h,
@@ -1002,9 +1095,8 @@ fn slots_down(
                 m * slots,
                 d.hidden,
                 &mut s.down,
-            )?;
-        } else {
-            k.q6_sel.enqueue_gemv_q6k_sel(
+            )?,
+            DownEntry::Q6k => k.q6_sel.enqueue_gemv_q6k_sel(
                 stream,
                 wd,
                 act_h,
@@ -1012,7 +1104,25 @@ fn slots_down(
                 m * slots,
                 d.hidden,
                 &mut s.down,
-            )?;
+            )?,
+            DownEntry::Q5k => k.q35(WHAT)?.ffn.kq.enqueue_gemv_q5k_sel(
+                stream,
+                &SelDown {
+                    w: wd,
+                    act: act_h,
+                    sel: s.route.ids(),
+                    n_slots: m * slots,
+                    rows_per_expert: d.hidden,
+                },
+                c.sink,
+                &mut s.down,
+            )?,
+            DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
+                return Err(GpuError::state(
+                    WHAT,
+                    "a down entry the plan admits for no stack here",
+                ));
+            }
         }
     } else {
         // A dense FFN's one slot a token: the down over the token's SwiGLU
@@ -1051,6 +1161,199 @@ fn slots_down(
             n_slots: slots,
             m,
             y,
+        },
+    )
+}
+
+/// The FFN's kernels beyond the family's own: the K-quant `_sel` family (the
+/// table's Q4_K and Q5_K gate·up, its Q5_K down, each skipping a
+/// [`crate::hybrid::HOST`] slot) and the combine with a host sum
+/// (`hostleg`), which adds a shared expert kept apart.
+pub(super) struct FfnKernels {
+    pub(super) kq: KquantKernels,
+    pub(super) leg: HostLegKernels,
+}
+
+impl FfnKernels {
+    /// Load both into `gpu`'s context, the `_sel` family raising into its
+    /// fault word. Load-time only.
+    pub(super) fn load(gpu: &Gpu) -> Result<FfnKernels, GpuError> {
+        Ok(FfnKernels {
+            kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            leg: HostLegKernels::load(gpu.context())?,
+        })
+    }
+}
+
+/// The FFN half after its slots are picked on a layer that keeps its shared
+/// expert apart ([`FfnPlan::apart`]), at `m <= GEMV_COLS` rows: the slots'
+/// card list (`elem::card_sel`: the routed ids, the shared slot's id — the
+/// routed count — [`crate::hybrid::HOST`]); the routed gate·up·SwiGLU over
+/// it at the table's entry (the K-quant family's, which skips the shared
+/// slot), the q8_1 of the routed slots' columns alone, the routed down
+/// `_sel`; the shared expert as its own dense FFN at its types
+/// ([`site_gemv`]: gate, up, the SwiGLU, the down, with the SwiGLU's q8_1
+/// for a K-quant down); and the combine with a host sum (`hostleg`): `((Σ
+/// routed w·d + 0) + resid) + σ · shared`, ik's grouping, the host's routed
+/// sum zero because a whole-card load serves every routed slot on the card.
+fn apart_down(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    sh: &SharedSites,
+    s: &mut Arena,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::ffn";
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let i = s.col(m)?;
+    let slots = d.slots();
+    let router = d.routed(WHAT)?;
+    let (used, n_routed) = (router.used(), router.experts());
+    if slots != c.p.slots(used) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {}: the arena is cut for {slots} slots a token, the plan routes {}",
+                c.layer,
+                c.p.slots(used)
+            ),
+        ));
+    }
+    let n_slots = m * slots;
+    let kk = &k.q35(WHAT)?.ffn;
+    let Arena {
+        normed,
+        act_ffn,
+        route,
+        h,
+        act_h,
+        down,
+        cols,
+        apart,
+        ffn_inp,
+        x,
+        ..
+    } = s;
+    let a = apart.as_mut().ok_or(GpuError::state(
+        WHAT,
+        "the arena's buffers of a shared expert kept apart",
+    ))?;
+    gpu.elem().enqueue_card_sel(
+        stream,
+        route.ids(),
+        n_slots,
+        n_routed,
+        n_routed + 1,
+        c.sink,
+        &mut a.sel,
+    )?;
+    let gate_up = GateUpAct {
+        wg: kq_weight(w, &n.gate)?,
+        wu: kq_weight(w, &n.up)?,
+        act: &act_ffn[i],
+        sel: &a.sel,
+        n_slots,
+        rows_per_expert: d.ff,
+        slots_per_col: slots,
+        rule: Act::SiluMul,
+    };
+    match gate_up_entry(n.gate_ty, n.up_ty, WHAT)? {
+        GateUpEntry::Q4k => kk.kq.enqueue_gate_up_q4k(stream, &gate_up, c.sink, h)?,
+        GateUpEntry::Q5k => kk.kq.enqueue_gate_up_q5k(stream, &gate_up, c.sink, h)?,
+        GateUpEntry::Q8_0 | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs => {
+            return Err(GpuError::state(
+                WHAT,
+                "a gate·up entry the plan admits for no stack here",
+            ));
+        }
+    }
+    gpu.q4k_sel().enqueue_quantize_sel(
+        stream,
+        &QuantSel {
+            x: h,
+            cols: 0..n_slots,
+            sel: &a.sel,
+            n_card: n_routed,
+        },
+        c.sink,
+        &mut act_h[i],
+    )?;
+    let wd = kq_weight(w, &n.down)?;
+    let act = &act_h[i];
+    match down_entry(n.down_ty, WHAT)? {
+        DownEntry::Q4k => gpu
+            .q4k_sel()
+            .enqueue_gemv_q4k_sel(stream, wd, act, &a.sel, n_slots, d.hidden, down)?,
+        DownEntry::Q6k => {
+            k.q6_sel
+                .enqueue_gemv_q6k_sel(stream, wd, act, &a.sel, n_slots, d.hidden, down)?;
+        }
+        DownEntry::Q5k => kk.kq.enqueue_gemv_q5k_sel(
+            stream,
+            &SelDown {
+                w: wd,
+                act,
+                sel: &a.sel,
+                n_slots,
+                rows_per_expert: d.hidden,
+            },
+            c.sink,
+            down,
+        )?,
+        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
+            return Err(GpuError::state(
+                WHAT,
+                "a down entry the plan admits for no stack here",
+            ));
+        }
+    }
+    let xin = (&act_ffn[i], &*normed);
+    site_gemv(
+        c,
+        (sh.gate_ty, &sh.gate),
+        d.ff,
+        xin,
+        m,
+        cols.as_mut(),
+        &mut a.g,
+    )?;
+    site_gemv(c, (sh.up_ty, &sh.up), d.ff, xin, m, cols.as_mut(), &mut a.u)?;
+    gpu.elem()
+        .enqueue_swiglu(stream, &a.g, &a.u, m * d.ff, &mut a.h)?;
+    let sh_act = a.act.get_mut(i).ok_or(GpuError::state(
+        WHAT,
+        "the shared expert's SwiGLU activations of m columns",
+    ))?;
+    if sh.down_ty.kquant() {
+        gpu.enqueue_quantize_q8_1_layer(&a.h, sh_act, c.layer)?;
+    }
+    site_gemv(
+        c,
+        (sh.down_ty, &sh.down),
+        d.hidden,
+        (sh_act, &a.h),
+        m,
+        cols.as_mut(),
+        &mut a.y,
+    )?;
+    kk.leg.enqueue_combine(
+        stream,
+        HostCombineArgs {
+            down,
+            w: route.weights(),
+            sel: &a.sel,
+            hsum: &a.zero,
+            resid: ffn_inp,
+            shared: Some((&a.y, used)),
+            rows: d.hidden,
+            pitch: slots,
+            n_card: n_routed,
+            m,
+            fault: c.sink,
+            y: out.unwrap_or(x),
         },
     )
 }
