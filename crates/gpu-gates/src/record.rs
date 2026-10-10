@@ -3346,21 +3346,6 @@ pub fn residency_unset(pick: &bloomery_levers::Residency38Pick) -> Record {
         .w("why", pick.why)
 }
 
-/// [`residency_unset`] of a plan that pages `nvme_bytes` of routed experts
-/// through the NVMe tier's RAM arena of `arena_bytes`: `off`, since a
-/// promotion would copy those experts through the file mapping, read cold
-/// from the drive after the tier's drops.
-pub fn residency_unset_paged(nvme_bytes: u64, arena_bytes: u64) -> Record {
-    Record::new(&RESIDENCY_UNSET).w("residency", "off").w(
-        "why",
-        format_args!(
-            "unset: the plan pages {nvme_bytes} B of routed experts through the NVMe tier's RAM \
-             arena ({arena_bytes} B), whose promotions would read them cold through the file \
-             mapping"
-        ),
-    )
-}
-
 /// The churn pool's record under the residency word `residency`, against
 /// the plan it was taken from.
 pub fn residency_host(

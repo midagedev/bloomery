@@ -2636,6 +2636,7 @@ mod tests {
             bloomery_levers::residency38_at_plan(
                 [100u64],
                 384,
+                bloomery_levers::PlanTier::NONE,
                 |_pinned: usize| Ok::<u64, std::convert::Infallible>(10u64 << 30),
                 i128::MAX,
                 mem_left,
