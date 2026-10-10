@@ -11,8 +11,8 @@
 # Refused by name, exit 2, the message naming the word and the recipe's right form:
 #   a word that names a cargo feature of crates/gpu-gates, or a comma list of them;
 #   a comma anywhere in the entry substring (the first word that is not a flag): entry names have none;
-#   a flag the scan script does not take (ptx and lds take none; sass takes --exact, --raw and
-#   --step <HEAD>);
+#   a flag the scan script does not take (lds takes none; ptx takes --no-jit, anywhere among the words,
+#   which skips the driver JIT; sass takes --exact, --raw and --step <HEAD>);
 #   more words than the scan script takes (ptx and lds: one entry substring; sass: the entry and its
 #   decisions, which are a comma list of t/n or ADDR=t|n and are not refused for their commas).
 # A feature table it cannot read ends it with 2 too: an unread table would pass every word.
@@ -30,7 +30,7 @@ check() {
   local scan=$1 bin=$2 feats=$3 w why pos=0 max flags form item all
   shift 3
   case $scan in
-    ptx) max=1 flags='' form="just ptx-scan $bin --features <features> [entry substring]" ;;
+    ptx) max=1 flags=' --no-jit ' form="just ptx-scan $bin --features <features> [--no-jit] [entry substring]" ;;
     lds) max=1 flags='' form="just lds-scan $bin --features <features> [entry substring]" ;;
     sass) max=2 flags=' --exact --raw --step ' form="just sass-scan $bin --features <features> [-- --exact|--raw|--step HEAD] [entry substring [decisions|list]]" ;;
     *) echo "scan-args.sh: the scan is ptx, sass or lds, got '$scan'" >&2; return 64 ;;
@@ -89,6 +89,14 @@ self_test() {
   case_ ptx-flag 2 ptx --features
   case_ ptx-two 2 ptx gemm flash
   case_ ptx-comma 2 ptx gemm,flash
+  case_ ptx-no-jit 0 ptx --no-jit
+  case_ ptx-no-jit-entry 0 ptx --no-jit gemm_q4k
+  case_ ptx-entry-no-jit 0 ptx gemm_q4k --no-jit
+  case_ ptx-jit 2 ptx --jit
+  case_ ptx-no-jit-flag 2 ptx --no-jit --features
+  case_ ptx-no-jit-two 2 ptx --no-jit gemm flash
+  case_ ptx-no-jit-feature 2 ptx --no-jit deepseek41
+  case_ lds-no-jit 2 lds --no-jit
   case_ lds-entry 0 lds hc_gated_up_mix
   case_ lds-list 2 lds gpu,deepseek41
   case_ lds-feature 2 lds qwen3moe

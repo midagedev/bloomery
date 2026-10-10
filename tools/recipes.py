@@ -1921,6 +1921,12 @@ def cmd_box_command(args: argparse.Namespace) -> int:
 # the base, no kernel moved, and the landing batch is the gates that run the changed host path plus
 # the static checks. The "add" class is the same with the base plus exactly the new entries.
 #
+# A log of `just ptx-scan <bin> --no-jit` (banner `jit=skipped(no-jit)`, the two JIT cells the word
+# `skipped(no-jit)`) proves the first rule only: a pair with one, equal in entries, rows without the JIT
+# columns and digests, narrows as an identical pair does, and its verdict says the JIT was skipped. Any
+# other result of such a pair is refused by name (scan_verdict): the add and occupancy classes read the
+# JIT columns.
+#
 # A scan log is the text `just ptx-scan <bin>` prints. tools/ref/ptx-canon.py's parse_scan is the one
 # reader of its entry table and its md5 block; read_scan below adds what that reader does not see —
 # the banner's fields and the `ptx-scan: modN bundle=<crate>` lines — and refuses a log it cannot
@@ -1953,7 +1959,9 @@ PTX_CANON = "tools/ref/ptx-canon.py"
 # capability or driver makes the columns incomparable, which is not the same as a kernel that moved.
 # The JIT columns follow the card's compute capability, not its name (both cards here are sm_86 under
 # one driver, measured equal entry by entry): a pair scanned on either card of one capability
-# compares, so the name (jit-card) is never a compared field.
+# compares, so the name (jit-card) is never a compared field. A `ptx-scan.sh --no-jit` scan names
+# `jit=skipped(no-jit)` instead of the jit-* fields and holds no JIT reading, so a pair with one
+# compares neither the jit-* fields nor the two JIT columns (scan_verdict).
 SCAN_SAME = ("method", "ptxas-version", "arch", "jit-cc", "jit-cuda")
 NOT_HOST = re.compile(r"^docs/|\.card$|\.md$")
 # In a narrowed list only when the PTX or its own pins can have moved (narrow() owns the rule): the
@@ -1985,6 +1993,7 @@ class ScanLog:
     header: list[str]
     rows: dict[str, list[str]]
     md5: dict[str, tuple[str, str]]
+    nojit: bool = False  # a `--no-jit` scan: its JIT cells are the word `skipped(no-jit)`, not readings
 
 
 _SCAN_BANNER = re.compile(r"^ptx-scan bin=\S")
@@ -1994,7 +2003,7 @@ _SCAN_BUNDLE = re.compile(r"^ptx-scan: mod[0-9]+ bundle=(\S+) bytes=[0-9]+$")
 def read_scan(path: str) -> ScanLog:
     pc = _ptx_canon()
     try:
-        method, header, rows, md5 = pc.parse_scan(path)
+        method, header, rows, md5, nojit = pc.parse_scan(path)
     except pc.Refused as err:
         raise RecipeError(f"scan log {path}: {err}") from err
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -2003,6 +2012,9 @@ def read_scan(path: str) -> ScanLog:
     if len(banners) != 1:
         raise RecipeError(f"scan log {path}: {len(banners)} `ptx-scan bin=` banners — one log holds one scan")
     fields = dict(w.split("=", 1) for w in banners[0].split()[1:] if "=" in w)
+    if not nojit and "jit-card" not in fields and "jit-cc" not in fields:
+        raise RecipeError(f"scan log {path}: the banner names no JIT reading (jit-card, jit-cc) and no jit=skipped(no-jit) — "
+                          "which columns the JIT cells hold is unknown")
     if "filter" in fields:
         raise RecipeError(f"scan log {path}: a scan filtered to entries containing {fields['filter']!r} holds part of the table — scan the whole binary")
     bundles = [m.group(1) for m in map(_SCAN_BUNDLE.match, lines) if m]
@@ -2012,7 +2024,7 @@ def read_scan(path: str) -> ScanLog:
         odd = sorted(set(rows) ^ set(md5))
         raise RecipeError(f"scan log {path}: {len(odd)} entries in only one of the table and the md5 block ({' '.join(odd[:4])}) — a cut or mixed log")
     fields["method"] = method
-    return ScanLog(path, os.path.basename(fields["bin"]), fields, bundles, header, rows, md5)
+    return ScanLog(path, os.path.basename(fields["bin"]), fields, bundles, header, rows, md5, nojit)
 
 
 @dataclass
@@ -2028,33 +2040,62 @@ class ScanVerdict:
         return f"{self.bin}: {self.kind}{what}{f' ({self.detail})' if self.detail else ''}"
 
 
+def _compared_rows(log: ScanLog, nojit: bool) -> dict[str, list[str]]:
+    """The rows a pair compares: with a no-jit scan in the pair, the two JIT columns are cut from both sides."""
+    if not nojit:
+        return log.rows
+    cut = _ptx_canon().JIT_COLUMNS
+    keep = [i for i, h in enumerate(log.header[1:]) if h not in cut]
+    return {e: [cells[i] for i in keep] for e, cells in log.rows.items()}
+
+
 def scan_verdict(base: ScanLog, new: ScanLog) -> ScanVerdict:
     """identical, added (every base row and digest unchanged, only new entries) or moved (a base row or
-    digest changed, or an entry removed). A pair of two binaries or of two scan setups is refused."""
+    digest changed, or an entry removed). A pair of two binaries or of two scan setups is refused.
+
+    A pair with a `--no-jit` scan compares neither the jit-* banner fields nor the two JIT columns (a
+    skipped cell is no reading and equals nothing). It proves a move only: identical entries, rows and
+    digests, said in the verdict's detail. Any other result is refused by name, since the add and the
+    occupancy classes read the JIT columns."""
     if base.bin != new.bin:
         raise RecipeError(f"scan pair {base.path} {new.path}: bin {base.bin} against bin {new.bin} — a pair is two scans of one binary")
-    # A banner older than jit-cc names only the card: two such logs compare as before, by the card's
-    # name; one of each is refused, since the old side's capability is unknown.
-    olds = ("jit-cc" not in base.fields) + ("jit-cc" not in new.fields)
-    if olds == 1:
-        raise RecipeError(f"scan pair {base.path} {new.path}: one banner names no jit-cc (an older ptx-scan) — "
-                          "rescan it with this tree's tools before comparing")
-    same = SCAN_SAME if olds == 0 else tuple("jit-card" if k == "jit-cc" else k for k in SCAN_SAME)
+    nojit = base.nojit or new.nojit
+    if nojit:
+        same = tuple(k for k in SCAN_SAME if not k.startswith("jit-"))
+    else:
+        # A banner older than jit-cc names only the card: two such logs compare as before, by the card's
+        # name; one of each is refused, since the old side's capability is unknown.
+        olds = ("jit-cc" not in base.fields) + ("jit-cc" not in new.fields)
+        if olds == 1:
+            raise RecipeError(f"scan pair {base.path} {new.path}: one banner names no jit-cc (an older ptx-scan) — "
+                              "rescan it with this tree's tools before comparing")
+        same = SCAN_SAME if olds == 0 else tuple("jit-card" if k == "jit-cc" else k for k in SCAN_SAME)
     for k in same:
         if base.fields.get(k) != new.fields.get(k):
             raise RecipeError(f"scan pair {base.path} {new.path}: {k}={base.fields.get(k)} against {k}={new.fields.get(k)} — "
                               "rescan both under one toolchain and card capability before comparing")
     if base.header != new.header:
         raise RecipeError(f"scan pair {base.path} {new.path}: the tables have other columns")
+    brows, nrows = _compared_rows(base, nojit), _compared_rows(new, nojit)
     if sorted(base.bundles) != sorted(new.bundles):
-        return ScanVerdict(base.bin, "moved", [], f"bundles {' '.join(base.bundles)} -> {' '.join(new.bundles)}", new.bundles)
-    removed = sorted(set(base.rows) - set(new.rows))
-    changed = sorted(e for e in set(base.rows) & set(new.rows) if base.rows[e] != new.rows[e] or base.md5[e] != new.md5[e])
-    added = sorted(set(new.rows) - set(base.rows))
-    if removed or changed:
-        detail = "; ".join(x for x in (f"{len(removed)} removed" if removed else "", f"{len(changed)} changed" if changed else "") if x)
-        return ScanVerdict(base.bin, "moved", removed + changed, detail, new.bundles)
-    return ScanVerdict(base.bin, "added" if added else "identical", added, "", new.bundles)
+        v = ScanVerdict(base.bin, "moved", [], f"bundles {' '.join(base.bundles)} -> {' '.join(new.bundles)}", new.bundles)
+    else:
+        removed = sorted(set(brows) - set(nrows))
+        changed = sorted(e for e in set(brows) & set(nrows) if brows[e] != nrows[e] or base.md5[e] != new.md5[e])
+        added = sorted(set(nrows) - set(brows))
+        if removed or changed:
+            detail = "; ".join(x for x in (f"{len(removed)} removed" if removed else "", f"{len(changed)} changed" if changed else "") if x)
+            v = ScanVerdict(base.bin, "moved", removed + changed, detail, new.bundles)
+        else:
+            v = ScanVerdict(base.bin, "added" if added else "identical", added, "", new.bundles)
+    if not nojit:
+        return v
+    which = "both" if base.nojit and new.nojit else "base" if base.nojit else "new"
+    if v.kind != "identical":
+        raise RecipeError(f"scan pair {base.path} {new.path}: {v.line()} in a pair with a --no-jit scan ({which}) — "
+                          "rescan without --no-jit: the add and occupancy classes need the JIT columns")
+    v.detail = f"JIT skipped: --no-jit {which}"
+    return v
 
 
 @dataclass
@@ -7686,14 +7727,21 @@ def narrow_self_test(expect, side: Side) -> None:
     h1, h2, h3 = "1" * 32, "2" * 32, "3" * 32
 
     def scan(tmp: str, name: str, rows: dict[str, str], banner_extra: str = "", bundles=("bloomery-gpu",), md5_rows=None, banners=1,
-             cc: str = "8.6") -> str:
+             cc: str = "8.6", nojit: bool = False, jit_banner: str | None = None, cells: str | None = None, regs: str = "12") -> str:
+        """A scan log. `nojit` makes it a `--no-jit` scan (the banner's one jit= field and two skipped cells);
+        `jit_banner` and `cells` override the banner's JIT fields and the two JIT cells to build a log whose
+        banner and cells disagree."""
+        skipped = "skipped(no-jit)"
+        jits = jit_banner if jit_banner is not None else (
+            f"jit={skipped}" if nojit else f"jit-card=NVIDIA_RTX_A6000{' jit-cc=' + cc if cc else ''} jit-cuda=13.4")
+        cells = cells if cells is not None else (f"{skipped} {skipped}" if nojit else "12 0")
         lines = ["./tools/box.sh 'cargo oxide build …'", "   Compiling bloomery-gpu v0.1.0 (/root/x/crates/gpu)"]
         lines += [f"ptx-scan: mod{i + 1} bundle={b} bytes=100" for i, b in enumerate(bundles)]
         for _ in range(banners):
             lines.append(f"ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 "
-                         f"modules={len(bundles)} jit-card=NVIDIA_RTX_A6000{' jit-cc=' + cc if cc else ''} jit-cuda=13.4{banner_extra}")
+                         f"modules={len(bundles)} {jits}{banner_extra}")
         lines.append(header)
-        lines += [f"{e:<24} 256 no 0 0 0 0 12 0 0 6 12 0" for e in rows]
+        lines += [f"{e:<24} 256 no 0 0 0 0 {regs} 0 0 6 {cells}" for e in rows]
         lines.append("ptx-scan-md5: method=decl1")
         lines += [f"{e} {h} 41" for e, h in (md5_rows if md5_rows is not None else rows).items()]
         path = os.path.join(tmp, name)
@@ -7749,6 +7797,51 @@ def narrow_self_test(expect, side: Side) -> None:
         other = read_scan(scan(tmp, "bin.log", {"alpha": h1, "beta": h2}))
         other.bin = "gy"
         expect(refused(lambda: scan_verdict(base, other), "a pair is two scans of one binary"), "narrow: a pair of two binaries not refused")
+        # a `--no-jit` scan holds no JIT reading: a pair with one compares neither the jit-* fields nor the two JIT
+        # columns, proves a move only (identical, said in the verdict) and is refused by name for anything else
+        def tried(fn):
+            """fn's value, or the refusal's text: a case reads what the tool said, not a traceback."""
+            try:
+                return fn()
+            except RecipeError as err:
+                return f"refused: {err}"
+
+        def says(v, kind: str, detail: str) -> bool:
+            return isinstance(v, ScanVerdict) and v.kind == kind and detail in v.line()
+
+        nj = read_scan(scan(tmp, "nj.log", {"alpha": h1, "beta": h2}, nojit=True))
+        nj_same = read_scan(scan(tmp, "nj_same.log", {"alpha": h1, "beta": h2}, nojit=True))
+        v = tried(lambda: scan_verdict(nj, nj_same))
+        expect(says(v, "identical", "JIT skipped: --no-jit both"), f"narrow: two equal no-jit scans: {v}")
+        v = tried(lambda: scan_verdict(base, nj_same))
+        expect(says(v, "identical", "JIT skipped: --no-jit new"), f"narrow: a full base and a no-jit new: {v}")
+        v = tried(lambda: scan_verdict(nj, base))
+        expect(says(v, "identical", "JIT skipped: --no-jit base"), f"narrow: a no-jit base and a full new: {v}")
+        full_cc = read_scan(scan(tmp, "full9.log", {"alpha": h1, "beta": h2}, cc="9.0", cells="99 7"))
+        v = tried(lambda: scan_verdict(full_cc, nj_same))
+        expect(says(v, "identical", ""), f"narrow: a full scan of another capability and other JIT cells against a no-jit scan: {v}")
+        old_banner = read_scan(scan(tmp, "oldnj.log", {"alpha": h1, "beta": h2}, cc=""))
+        v = tried(lambda: scan_verdict(old_banner, nj_same))
+        expect(says(v, "identical", ""), f"narrow: a full older banner (no jit-cc) against a no-jit scan: {v}")
+        refusal = "rescan without --no-jit: the add and occupancy classes need the JIT columns"
+        for what, other in (("an added entry", {"alpha": h1, "beta": h2, "gamma": h3}), ("a moved digest", {"alpha": h1, "beta": h3}),
+                            ("a removed entry", {"alpha": h1})):
+            for pair in ((nj, read_scan(scan(tmp, "njx.log", other, nojit=True))), (base, read_scan(scan(tmp, "njy.log", other, nojit=True))),
+                         (read_scan(scan(tmp, "njz.log", other)), nj)):
+                v = tried(lambda: scan_verdict(*pair))
+                expect(isinstance(v, str) and refusal in v, f"narrow: {what} in a pair with a no-jit scan not refused by name: {v if isinstance(v, str) else v.line()}")
+        v = tried(lambda: scan_verdict(nj, read_scan(scan(tmp, "njb.log", {"alpha": h1, "beta": h2}, bundles=("bloomery-gpu", "bloomery-x"), nojit=True))))
+        expect(isinstance(v, str) and refusal in v, f"narrow: a moved bundle set in a no-jit pair not refused by name: {v if isinstance(v, str) else v.line()}")
+        # a log whose banner and cells disagree, a skipped cell outside the JIT columns, a banner that names no JIT
+        # reading at all: refused when read, never read as a value
+        for what, kw, why in (
+            ("a no-jit banner over JIT readings", {"jit_banner": "jit=skipped(no-jit)"}, "holds no JIT value"),
+            ("a full banner over skipped cells", {"cells": "skipped(no-jit) skipped(no-jit)"}, "the banner names the JIT"),
+            ("a banner with no JIT field", {"jit_banner": "jit-cuda=13.4"}, "names no JIT reading"),
+            ("a skipped cell in the regs column", {"nojit": True, "regs": "skipped(no-jit)"}, "only jit_regs and jit_local can be skipped"),
+        ):
+            v = tried(lambda: read_scan(scan(tmp, "bad.log", {"alpha": h1}, **kw)))
+            expect(isinstance(v, str) and why in v, f"narrow: {what} not refused by name: {v if isinstance(v, str) else 'read'}")
         # narrow() on the real tree. A cargo global reaches every gate through a dependency edge and sits in no
         # kernel carrier's closure, so its row's recipes are its whole selection.
         rows = [row("rust-toolchain.toml", ["gate-sampler"]), row("crates/vision/src/**", ["gate-vision"], 2)]
@@ -7763,6 +7856,16 @@ def narrow_self_test(expect, side: Side) -> None:
         n = narrow(["rust-toolchain.toml"], side, side, [(base, gone)], rows)
         expect(any("ptx-scan gx: moved beta (1 removed)" in r for r in n.full), f"narrow: a removed entry does not keep the full list: {n.full}")
         expect(set(NARROW_ALWAYS) <= set(n.picks), f"narrow: a removed entry must keep the spill ratchet: {sorted(n.picks)}")
+        # narrow(): an identical no-jit pair narrows as an identical full pair does and says the JIT was skipped; a
+        # no-jit pair that is not identical is refused by name, never narrowed and never the silent full list
+        n = tried(lambda: narrow(["rust-toolchain.toml"], side, side, [(nj, nj_same)], rows))
+        expect(isinstance(n, Narrowed) and not n.full and set(n.picks) == {"gate-sampler", *NARROW_ALWAYS} and "JIT skipped" in n.verdicts[0].line(),
+               f"narrow: an identical no-jit pair does not narrow as an identical full pair: {n}")
+        n = tried(lambda: narrow(["rust-toolchain.toml"], side, side, [(base, nj_same)], rows))
+        expect(isinstance(n, Narrowed) and not n.full and set(n.picks) == {"gate-sampler", *NARROW_ALWAYS}, f"narrow: an identical mixed pair does not narrow: {n}")
+        nj_add = read_scan(scan(tmp, "nj_add.log", {"alpha": h1, "beta": h2, "gamma": h3}, nojit=True))
+        n = tried(lambda: narrow(["rust-toolchain.toml"], side, side, [(nj, nj_add)], rows))
+        expect(isinstance(n, str) and refusal in n, f"narrow: an added entry in a no-jit pair narrows or falls back instead of being refused by name: {n}")
         # a change of the ratchet's own pin file keeps it even with every pair identical: the tsv is
         # the recipe's own script's read, so its own-target pick names it and nothing else moves
         n = narrow(["tools/ref/ptx-shapes.tsv"], side, side, [(base, same)], rows)

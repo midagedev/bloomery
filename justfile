@@ -1859,13 +1859,18 @@ gate-gpu-p8b *ARGS:
 # 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
 # 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
 # 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
+# `--no-jit`: the driver JIT is not built or run, so the scan takes no card lock and waits on no landing batch's GPU hold.
+# The banner names `jit=skipped(no-jit)` and both JIT columns read `skipped(no-jit)`. The md5 block and the ptxas columns
+# are as in a full scan: that proves a move (`just affected --narrow` reads such a pair as identical or refuses it by name).
+# The add and occupancy classes and gate-ptx-spill need the full scan. `-- --no-jit` among the words does the same.
 # BIN 뒤의 말은 ptx-scan.sh의 엔트리 부분 문자열 하나뿐이다. 자리로 준 피처(`gpu,deepseek41`, 피처 이름)나 플래그는
 # 빌드 전에 거절한다(tools/scan-args.sh, 세 스캔 레시피 공용) — ARGS로 흘러 기본 피처로 빌드되면 트랙의 바이너리를
 # 호스트 전용으로 덮어쓴다.
 [arg("FEATURES", long="features")]
-ptx-scan BIN FEATURES='gpu' *ARGS:
-    @bash tools/scan-args.sh ptx {{BIN}} {{ARGS}}
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
+[arg("NOJIT", long="no-jit", value="--no-jit")]
+ptx-scan BIN FEATURES='gpu' NOJIT='' *ARGS:
+    @bash tools/scan-args.sh ptx {{BIN}} {{NOJIT}} {{ARGS}}
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} {{ if (NOJIT + " " + ARGS) =~ "(^| )--no-jit( |$)" { "" } else { "--bin oxart_jit" } }} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{NOJIT}} {{BIN}} {{ARGS}}'
 
 # PTX 스필 래칫 — 빌드 시점 게이트. generate_ds41(deepseek41)과 gate_e2e(V2-Lite)의 ptx-scan 표에서 엔트리마다
 # spill(ptxas 스필 저장 바이트)·jit_local(드라이버 JIT의 스레드당 로컬 바이트)을 tools/ref/ptx-shapes.tsv의 핀과 대조한다.
