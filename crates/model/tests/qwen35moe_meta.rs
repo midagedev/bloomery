@@ -43,7 +43,13 @@ const CHAT_Q4KM: &str = "chat pre qwen35 template bytes 7764 tools None reasonin
 const CHAT_UD: &str = "chat pre qwen35 template bytes 8057 tools None reasoning None";
 
 // PIN(2026-09-27): the keys the reader took a default for, on both files.
+// PIN(2026-10-10): `nextn_predict_layers = 0` joined the list on both files: the key is absent from
+// each header (ik's llama-gguf lists 41 keys of the Q4_K_M file and 54 of the UD file, none of
+// them it, and no `nextn` tensor), and the reader records every default it takes, the next-token
+// count's among them (it took the default without recording it before). FAIL-first: the run
+// before this pin listed it as `BAD nextn_predict_layers = 0 (llama-hparams.cpp:725,818)` on both.
 const DEFAULTS: &[&str] = &[
+    "nextn_predict_layers = 0 (llama-hparams.cpp:725,818)",
     "expert_gating_func = softmax (qwen35moe.cpp:499-508)",
     "expert_weights_norm = true (qwen35moe.cpp:499-508)",
     "expert_weights_scale = 1 (qwen35moe.cpp:499-508)",

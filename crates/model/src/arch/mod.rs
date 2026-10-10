@@ -246,6 +246,47 @@ fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], Placement
         .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
+/// The next-token layers a file carries, from `nextn_predict_layers`: the
+/// count, believed only when the first of them (`blk.{n_layer - n}`) carries
+/// `nextn.eh_proj`. Every default taken is recorded in `defaults`: an absent
+/// key (`absent_note`, the line that defaults it) and a declared count whose
+/// probe tensor is not in the file (`probe_note`, the line that probes it, or
+/// empty). A count that leaves no trunk layer is refused by name.
+fn nextn_layers(
+    split: &Split,
+    n_layer: usize,
+    absent_note: &str,
+    probe_note: &str,
+    defaults: &mut Vec<String>,
+) -> Result<usize, PlacementError> {
+    let key = "nextn_predict_layers";
+    let n = match split.value(&split.arch_key(key)) {
+        None => {
+            defaults.push(format!("{key} = 0 ({absent_note})"));
+            return Ok(0);
+        }
+        Some(_) => meta_usize(split, key)?,
+    };
+    if n >= n_layer {
+        return Err(metadata(
+            split,
+            key,
+            format!("is {n}, not below block_count {n_layer}"),
+        ));
+    }
+    let probe = format!("blk.{}.nextn.eh_proj.weight", n_layer - n);
+    if n > 0 && split.find(&probe).is_none() {
+        let note = if probe_note.is_empty() {
+            String::new()
+        } else {
+            format!(", {probe_note}")
+        };
+        defaults.push(format!("{key} = 0 ({probe} is not in the file{note})"));
+        return Ok(0);
+    }
+    Ok(n)
+}
+
 /// `tokenizer.ggml.pre`.
 const PRE: &str = "tokenizer.ggml.pre";
 /// `tokenizer.chat_template`.

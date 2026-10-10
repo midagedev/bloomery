@@ -748,7 +748,11 @@ mod tests {
         };
         let check = |tag: &str, nextn: Option<u32>| {
             let source = header_shaped("qfx-src", "qwen4exp", &keys(), &[], &tensors());
-            let fixture = header_shaped(tag, "qwen4exp", &fixture_keys(nextn), &[], &tensors());
+            let mut t = tensors();
+            if nextn.is_some() {
+                t.push(("blk.3.nextn.eh_proj.weight".to_string(), vec![1]));
+            }
+            let fixture = header_shaped(tag, "qwen4exp", &fixture_keys(nextn), &[], &t);
             let src = gguf::Split::open(&source).expect("the synthetic header opens");
             let fx = gguf::Split::open(&fixture).expect("the synthetic header opens");
             let checked = check_kinds(&spec, &fx, &src);
