@@ -84,6 +84,60 @@ take() {
     bash -c 'source "$1" && lease_take && echo "[test] lease_take returned"' _ "$tree/tools/ref/lease.sh"
 }
 
+# run_rel <name> <rc> <pattern> <trigger> <command…>: run (above) with the command's output read here as it comes, so the lock bg_lock
+# holds (or a FIFO a command waits on, descriptor 8) is released on the command's own words: the first output line that holds <trigger>
+# writes the release, and the end of the output does when none did, so a hold never outlives its waiter. The command runs in the
+# background and is waited for by its pid. A trigger that has not come within $rel_cap s (the command printed nothing for that long,
+# a waiter that waits for the lock for minutes) releases the hold all the same and is a red by name, never a pass.
+rel_cap=50
+run_rel() {
+  local name=$1 want=$2 pat=$3 trig=$4 rc=0 line seen=0 capped=0 rp rrc t0
+  shift 4
+  rm -f "$tmp/stream"
+  mkfifo "$tmp/stream"
+  "$@" > "$tmp/stream" 2>&1 &
+  rp=$!
+  : > "$tmp/out"
+  while :; do
+    t0=$SECONDS
+    if [ "$seen" = 0 ]; then
+      IFS= read -t "$rel_cap" -r line
+      rrc=$?
+    else
+      IFS= read -r line
+      rrc=$?
+    fi
+    # bash 3.2 (the Mac) ends a timed read with 1, as the end of the stream does: a read that took the whole cap timed out.
+    if [ "$rrc" -gt 128 ] || { [ "$rrc" != 0 ] && [ "$seen" = 0 ] && [ $((SECONDS - t0)) -ge "$rel_cap" ]; }; then
+      capped=1 seen=1
+      echo go >&8
+      continue
+    fi
+    [ "$rrc" = 0 ] || break
+    printf '%s\n' "$line" >> "$tmp/out"
+    case $line in *"$trig"*) if [ "$seen" = 0 ]; then echo go >&8; seen=1; fi ;; esac
+  done < "$tmp/stream"
+  [ "$seen" = 1 ] || echo go >&8
+  wait "$rp" || rc=$?
+  if [ "$capped" = 1 ]; then
+    fail "$name" "the release trigger '$trig' did not come within $rel_cap s: the hold was released on its cap" "$tmp/out"
+  elif [ "$rc" != "$want" ]; then
+    fail "$name" "rc $rc, want $want" "$tmp/out"
+  elif ! grep -Eq -- "$pat" "$tmp/out"; then
+    fail "$name" "no line matches /$pat/" "$tmp/out"
+  else
+    pass "$name"
+  fi
+}
+# take_rel <tree> <name> <rc> <pattern> <lock> <trigger> [NAME=value…]: take (below) through run_rel.
+take_rel() {
+  local tree=$1 name=$2 want=$3 pat=$4 lock=$5 trig=$6
+  shift 6
+  run_rel "$name" "$want" "$pat" "$trig" env -u BLOOMERY_LEASE_CARD -u BLOOMERY_CARD -u ROUNDS -u BLOOMERY_AB_ROUNDS \
+    -u ROUND_MINUTES -u BLOOMERY_LEASE_HELD BLOOMERY_LEASE_LOCK="$lock" "$@" \
+    bash -c 'source "$1" && lease_take && echo "[test] lease_take returned"' _ "$tree/tools/ref/lease.sh"
+}
+
 # hold <tree> <name> <rc> <pattern> <lock> <lease-hold args…>: that tree's lease-hold.sh.
 hold() {
   local tree=$1 name=$2 want=$3 pat=$4 lock=$5
@@ -119,20 +173,33 @@ held() {
   s=$(lock_state "$2")
   if [ "$s" = held ]; then pass "$1"; else fail "$1" "$2 is $s"; fi
 }
-# bg_lock <mode> <lock> <marker> <seconds>: a background process that holds <lock> (-s shared, -x
-# exclusive) for <seconds>, started once the lock is taken (<marker> appears); its pid is in BG.
+# bg_lock <mode> <lock>: a background process that holds <lock> (-s shared, -x exclusive) from the moment it has it (it says so on a
+# FIFO this shell reads, descriptor 7) until bg_end or a trigger line (run_rel) releases it (a line on a second FIFO, descriptor 8; both
+# are held open read-write by this shell, so neither side blocks on opening one, and a shell that ends releases the lock by EOF). Its pid
+# is in BG. No clock decides how long the lock is held: a case runs its assertions against a lock that is surely held, then ends the hold.
+# The 60 s bound is the longest a lock may take to be taken, as a red.
 bg_lock() {
-  local mode=$1 lock=$2 mark=$3 secs=$4 i
-  rm -f "$mark"
+  local mode=$1 lock=$2
+  exec 7>&- 8>&-
+  rm -f "$tmp/rdy" "$tmp/rel"
+  mkfifo "$tmp/rdy" "$tmp/rel"
+  exec 7<> "$tmp/rdy" 8<> "$tmp/rel"
   if [ "$mode" = -s ]; then
-    flock -s "$lock" bash -c 'touch "$1"; sleep "$2"' _ "$mark" "$secs" &
+    flock -s "$lock" bash -c 'echo up > "$1"; read -r _ < "$2"' _ "$tmp/rdy" "$tmp/rel" &
   else
-    flock "$lock" bash -c 'touch "$1"; sleep "$2"' _ "$mark" "$secs" &
+    flock "$lock" bash -c 'echo up > "$1"; read -r _ < "$2"' _ "$tmp/rdy" "$tmp/rel" &
   fi
   BG=$!
-  for i in $(seq 100); do [ -e "$mark" ] && return 0; sleep 0.05; done
-  echo "bg_lock: $lock was not taken within 5 s" >&2
+  read -t 60 -r _ <&7 && return 0
+  echo "bg_lock: $lock was not taken within 60 s" >&2
+  echo go >&8
   return 1
+}
+# bg_end: release what bg_lock holds and wait for it to end.
+bg_end() {
+  echo go >&8
+  wait "$BG"
+  exec 7>&- 8>&-
 }
 
 # fakeproc <dir> <lock file>: a /proc tree for lease_holders (BLOOMERY_LEASE_PROC) with one process,
@@ -341,13 +408,21 @@ else
   # (heavy work beside the next sitting would contaminate it); the next waiter names it, then takes
   # the lease when it ends. The waiter reads the fake /proc tree (the Mac has none): what is tested
   # here is that a busy lease prints its holder at once; the real /proc is the box's run.
+  # The process left behind waits on a FIFO this shell holds open (descriptor 8) until the waiter below has named it: the lease is
+  # held when the waiter looks, whatever the load.
+  exec 8>&-
+  rm -f "$tmp/rel"
+  mkfifo "$tmp/rel"
+  exec 8<> "$tmp/rel"
   hold "$T" 'lease-hold command leaves a process behind' 0 '^\[lease-hold\] rc=0 ' "$L" --card docs/cards/exclusive.card -- \
-    bash -c 'sleep 4 > /dev/null 2>&1 & exit 0'
+    bash -c '(read -r _ < "$1") > /dev/null 2>&1 & exit 0' _ "$tmp/rel"
   has 'lease-hold says the lease outlives it' '^\[lease\] this process let go at .*, but the lease is still held'
   held 'the process left behind keeps the lease' "$L"
   fakeproc "$tmp/proc" "$L"
-  take "$T" 'a waiter names the holder at once' 0 "^\\[lease\\] $L is held; waiting up to 30 min\\. Its holder:\$" "$L" \
+  # lease_holders prints once it has scanned the /proc tree, so its first line (`[lease]   `) releases the process left behind.
+  take_rel "$T" 'a waiter names the holder at once' 0 "^\\[lease\\] $L is held; waiting up to 30 min\\. Its holder:\$" "$L" '[lease]   ' \
     BLOOMERY_LEASE_CARD=docs/cards/exclusive.card BLOOMERY_LEASE_PROC="$tmp/proc"
+  exec 8>&-
   for pat in '^\[lease\]   pid 4242 holds it: comm=sleep exe=/bin/sleep cwd=/tmp elapsed=0h10m00s card=docs/cards/selftest-lease-hold\.card args=\[sleep 60\]$' \
     '/locks: FLOCK WRITE taken by pid 4241 \(not running — a lock outlives the process that took it .*; the holders are the processes above\)$' \
     '^\[lease\] held by pid' '^\[test\] lease_take returned$'; do
@@ -362,11 +437,11 @@ else
     env BLOOMERY_LEASE_PROC="$tmp/no-proc" bash -c 'source "$1" && lease_holders "$2"' _ "$T/tools/ref/lease.sh" "$L"
   # A probe (lease_free's shared lock) in at the instant lease_take tries its exclusive `flock -n 9`
   # fails that try: the runner waits (`flock -w 60 9`) and takes the lease once the probe lets go.
-  if bg_lock -s "$tmp/l3.lock" "$tmp/l3.mark" 2; then
-    take "$T" 'lease_take meeting a shared probe waits for it' 0 "^\\[lease\\] $tmp/l3\\.lock is held; waiting up to 30 min\\. Its holder:\$" \
-      "$tmp/l3.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card BLOOMERY_LEASE_PROC="$tmp/proc-empty"
+  if bg_lock -s "$tmp/l3.lock"; then
+    take_rel "$T" 'lease_take meeting a shared probe waits for it' 0 "^\\[lease\\] $tmp/l3\\.lock is held; waiting up to 30 min\\. Its holder:\$" \
+      "$tmp/l3.lock" '[lease]   ' BLOOMERY_LEASE_CARD=docs/cards/exclusive.card BLOOMERY_LEASE_PROC="$tmp/proc-empty"
     has 'lease_take takes the lease once the probe lets go' '^\[lease\] held by pid'
-    wait "$BG"
+    bg_end
   else
     fail 'lease_take meeting a shared probe' 'the background shared lock was not taken'
   fi
@@ -397,16 +472,16 @@ P=$tmp/probe.lock
 : > "$P"
 probe() { bash -c 'source "$1" && lease_free "$2"' _ "$T/tools/ref/lease-probe.sh" "$1"; }
 rc_is 'lease_free: a free lock reads free (0)' 0 probe "$P"
-if bg_lock -s "$P" "$tmp/probe.mark" 2; then
+if bg_lock -s "$P"; then
   rc_is 'lease_free: a shared holder (another probe) does not read as held (0)' 0 probe "$P"
   rc_is 'the old exclusive probe reads that shared holder as held (1, the false read)' 1 flock -n "$P" true
-  wait "$BG"
+  bg_end
 else
   fail 'lease_free: a shared holder' 'the background shared lock was not taken'
 fi
-if bg_lock -x "$P" "$tmp/probe.mark" 2; then
+if bg_lock -x "$P"; then
   rc_is 'lease_free: an exclusive holder (the lease) reads held (1)' 1 probe "$P"
-  wait "$BG"
+  bg_end
 else
   fail 'lease_free: an exclusive holder' 'the background exclusive lock was not taken'
 fi
@@ -448,17 +523,19 @@ guard "lease_guard 0 with another owner's hold up: 75" 75 'did not run \(rc 75\)
 rm -f "$H/bloomery-03-hold"
 rc_is 'lease_guard 0 on a quiet box: 0 at once' 0 guardenv lease_guard 0
 silent 'lease_guard 0 on a quiet box: silent'
-if bg_lock -x "$P" "$tmp/probe.mark" 2; then
+if bg_lock -x "$P"; then
   guard 'lease_guard 0 with the lease held: 75, naming the lease' 75 'the timing lease .*probe\.lock is held \(a sitting runs\); its holders:' lease_guard 0
   has 'lease_guard asks lease_holders for the holder' '^\[lease\]   the holder of .* cannot be named'
-  wait "$BG"
+  bg_end
 else
   fail 'lease_guard with the lease held' 'the background exclusive lock was not taken'
 fi
-if bg_lock -x "$P" "$tmp/probe.mark" 2; then
-  guard 'lease_guard waits for the lease, then starts on two quiet polls' 0 'quiet on two polls in a row after [0-9]+ s: the command starts' lease_guard 20
+if bg_lock -x "$P"; then
+  # The lease is released on the guard's own "waits" line, so it is held when the guard first looks and free for its two quiet polls.
+  run_rel 'lease_guard waits for the lease, then starts on two quiet polls' 0 'quiet on two polls in a row after [0-9]+ s: the command starts' \
+    'the box is busy; the command waits up to 20 s' guardenv lease_guard 20
   has 'lease_guard says it waits, with its bound and poll' 'the box is busy; the command waits up to 20 s \(BLOOMERY_BOX_WAIT\), polling every 1 s:'
-  wait "$BG"
+  bg_end
 else
   fail 'lease_guard waits for the lease' 'the background exclusive lock was not taken'
 fi
