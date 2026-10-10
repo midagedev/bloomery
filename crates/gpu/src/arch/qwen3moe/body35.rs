@@ -1947,6 +1947,7 @@ impl GpuModel<Body35> {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
         }
         let pos0 = self.pos();
+        self.body(WHAT_P)?.refuse_inside_image(WHAT_P, pos0)?;
         let n = launch_u32(WHAT_P, "tokens", tokens.len())?;
         self.check_pos(pos0 + n - 1, WHAT_P)?;
         let marked = {
@@ -2037,6 +2038,7 @@ impl GpuModel<Body35> {
             return Err(GpuError::shape(WHAT_H, "empty token slice"));
         }
         let pos0 = self.pos();
+        self.body(WHAT_H)?.refuse_inside_image(WHAT_H, pos0)?;
         self.check_pos(
             pos0 + launch_u32(WHAT_H, "tokens", tokens.len())? - 1,
             WHAT_H,
@@ -2087,6 +2089,37 @@ impl Body35 {
     #[must_use]
     pub fn takes_media(&self) -> bool {
         self.seq_rope.is_some()
+    }
+
+    /// Refuse a call whose first position `pos` lies strictly inside an image
+    /// the live sequence's table holds: the table's rows there are the
+    /// image's, which the call's own ids (text, or a span after the image's
+    /// end) would read. A sequence stands there when a call failed inside an
+    /// image (the table keeps the image whole) or a record was restored
+    /// ahead of the state it belongs to. A cut back to the image's start
+    /// ([`Rollback::rollback_on`]) or a reset takes the image away. Nothing
+    /// moves; a text load holds no image.
+    pub(super) fn refuse_inside_image(&self, what: &'static str, pos: u32) -> Result<(), GpuError> {
+        let Some(rope) = &self.seq_rope else {
+            return Ok(());
+        };
+        let row = pos as usize;
+        match rope
+            .rows()
+            .seq()
+            .spans()
+            .find(|&(at, nx, ny)| at < row && row < at + nx * ny)
+        {
+            None => Ok(()),
+            Some((at, nx, ny)) => Err(GpuError::shape(
+                what,
+                format!(
+                    "a call at position {pos} inside the image at rows {at}..{}: the rotation \
+                     table holds the image's rows there; cut back to {at} or reset first",
+                    at + nx * ny
+                ),
+            )),
+        }
     }
 }
 
@@ -2168,7 +2201,8 @@ impl GpuModel<Body35> {
 /// holds the images that start before that position, so the next call reads
 /// the rows the cache holds. An image the fed positions cut cannot be taken
 /// back (a cut inside an image is refused) and stays whole in the table; a
-/// later span at a position inside it is refused by name, and a cut back
+/// later call that starts inside it, a prompt or a step, is refused by name
+/// ([`Body35::refuse_inside_image`]), and a cut back
 /// ([`Rollback::rollback_on`]) or a reset takes it away. A take-back that
 /// fails on the card is named beside the call's error.
 fn media_call<T>(
@@ -2178,8 +2212,10 @@ fn media_call<T>(
     spans: &[ImageSpan<'_>],
     run: impl FnOnce(&mut GpuModel<Body35>) -> Result<T, GpuError>,
 ) -> Result<T, GpuError> {
-    let first = m.pos() as usize;
+    let pos = m.pos();
+    let first = pos as usize;
     let hidden = m.body(what)?.hidden();
+    m.body(what)?.refuse_inside_image(what, pos)?;
     ImageSpan::check(what, spans, ids.len(), hidden)?;
     if spans.is_empty() {
         return run(m);
@@ -2297,6 +2333,7 @@ impl ChainBody for Body35 {
     /// the enqueue leaves held for the next call to refuse.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput35) -> Result<(), GpuError> {
         let DecodeInput35 { token, pos } = *input;
+        self.refuse_inside_image("qwen35moe::step", pos)?;
         self.settle(stream)?;
         self.stores_at(pos)?;
         self.held = pos + 1;
@@ -2504,6 +2541,7 @@ impl Rows for Body35 {
     const CHAIN: Chain = Chain::Step;
 
     fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        self.refuse_inside_image("qwen35moe::rows", pos)?;
         self.stand_held(stream, pos, tokens.len())?;
         self.rp.write(stream, tokens, pos)
     }

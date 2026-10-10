@@ -238,11 +238,14 @@ impl Body35 {
     }
 
     /// Refused by name unless the live sequence takes `tokens` from `r.pos0`
-    /// as slot `r.slot`'s rows of a pass: its stores stand there, and every
-    /// id is below the vocabulary.
+    /// as slot `r.slot`'s rows of a pass: its stores stand there, the
+    /// position is not inside an image its table holds
+    /// ([`Body35::refuse_inside_image`]), and every id is below the
+    /// vocabulary.
     fn check_slot(&self, r: &SlotRange, tokens: &[u32]) -> Result<(), GpuError> {
         let named = |e: GpuError| GpuError::shape(WHAT, format!("slot {}: {e}", r.slot));
         self.stores_at(r.pos0).map_err(named)?;
+        self.refuse_inside_image(WHAT, r.pos0).map_err(named)?;
         super::refuse_past_vocab(WHAT, tokens, self.vocab).map_err(named)
     }
 }
