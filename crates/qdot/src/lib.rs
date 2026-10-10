@@ -41,6 +41,7 @@
 //!
 //! Each AVX2 kernel has a bit-identical scalar mirror for fallback and verification.
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::fmt;
 
@@ -198,6 +199,7 @@ pub fn fuses(w: GgmlType, k: usize) -> bool {
 /// The per-type ISA table matching each fused kernel's `#[target_feature]` requirements.
 ///
 /// Q3_K needs avx2+f16c; MXFP4 needs avx2+fma; every other type avx2+fma+f16c.
+#[cfg(target_arch = "x86_64")]
 fn has_features(w: GgmlType) -> bool {
     // Per arm, so a call checks only the features its kernel needs: `dot_row`
     // asks once per row.
@@ -224,6 +226,12 @@ fn has_features(w: GgmlType) -> bool {
         | GgmlType::IQ4_XS => avx2() && fma() && f16c(),
         _ => false,
     }
+}
+
+/// Off x86_64 no fused kernel is compiled, so no type has its ISA.
+#[cfg(not(target_arch = "x86_64"))]
+fn has_features(_: GgmlType) -> bool {
+    false
 }
 
 /// The `k` contract: `k` must be a multiple of the weight format's block size
@@ -275,6 +283,7 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 /// name on a non-finite activation value (undefined input is refused, never
 /// encoded). Uses the AVX2 encoders when the CPU has AVX2 — byte-identical to
 /// the scalar mirrors.
+#[cfg(target_arch = "x86_64")]
 pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
     quantize_col_check(w, x, out);
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
@@ -310,6 +319,12 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
             }
         }
     }
+}
+
+/// Off x86_64 no AVX2 encoder is compiled: [`quantize_col_scalar`].
+#[cfg(not(target_arch = "x86_64"))]
+pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
+    quantize_col_scalar(w, x, out);
 }
 
 /// The scalar mirror behind [`quantize_col`] — the fallback the crate runs
@@ -360,6 +375,7 @@ fn quantize_col_check(w: GgmlType, x: &[f32], out: &[u8]) {
 ///
 /// Returns Err on shape or alignment mismatch. Uses AVX2 kernels when supported,
 /// falling back to scalar mirrors.
+#[cfg(target_arch = "x86_64")]
 pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
     let hw = has_features(w);
@@ -419,6 +435,13 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
     }
 }
 
+/// Off x86_64 no AVX2 kernel is compiled: every type runs its scalar mirror
+/// ([`dot_row_scalar`]).
+#[cfg(not(target_arch = "x86_64"))]
+pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
+    dot_row_scalar(w, wrow, acol, k)
+}
+
 /// The scalar mirror behind [`dot_row`] — the fallback the crate runs when
 /// AVX2 is absent.
 pub fn dot_row_scalar(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
@@ -444,6 +467,7 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 }
 
 /// Direct AVX2 kernel call behind [`dot_row`]; panics if required features are missing.
+#[cfg(target_arch = "x86_64")]
 pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
     assert!(
@@ -605,6 +629,7 @@ pub fn dot_row_cols(
 /// The `C`-column tile of `kind` over validated inputs: `acols` holds `C`
 /// columns of at least the activation bytes `nb` blocks need, `wrow` the
 /// row's `nb` blocks, `out` `C` values.
+#[cfg(target_arch = "x86_64")]
 fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize, out: &mut [f32]) {
     let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
     let v = match kind {
@@ -635,6 +660,12 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         TileKind::Mxfp4 => unsafe { dot_mxfp4_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
     };
     out.copy_from_slice(&v);
+}
+
+/// Off x86_64 [`tile_kind`] is `None` for every type, so no call reaches a tile.
+#[cfg(not(target_arch = "x86_64"))]
+fn tile<const C: usize>(_: TileKind, _: &[u8], _: &[&[u8]], _: usize, _: &mut [f32]) {
+    unreachable!("no qdot tile kernel off x86_64")
 }
 
 /// Rows one group of the row-lane Q3_K layout interleaves ([`repack_q3k_r8`]).
@@ -851,6 +882,7 @@ fn check_r8(group_len: usize, acols: &[&[u8]], k: usize, outs: usize) -> Result<
 /// The `C`-column row-lane tile over validated inputs: `group` holds `nb`
 /// group super-blocks, `acols` `C` columns of at least `nb` Q8_K blocks, `out`
 /// `C` values.
+#[cfg(target_arch = "x86_64")]
 fn r8_tile<const C: usize>(
     group: &[u8],
     acols: &[&[u8]],
@@ -862,6 +894,12 @@ fn r8_tile<const C: usize>(
     // the group for nb super-blocks and every column for nb Q8_K blocks.
     let v = unsafe { dot_q3k_r8_tile_avx2::<C>(group, &cols, nb) };
     out.copy_from_slice(&v);
+}
+
+/// Off x86_64 [`dot_q3k_r8_cols`] takes the scalar mirror for every call.
+#[cfg(not(target_arch = "x86_64"))]
+fn r8_tile<const C: usize>(_: &[u8], _: &[&[u8]], _: usize, _: &mut [[f32; Q3K_R8_ROWS]]) {
+    unreachable!("no qdot row-lane Q3_K kernel off x86_64")
 }
 
 /// Rows one row-lane group holds ([`pack_lanes`]).
@@ -880,6 +918,7 @@ const LANE_SB_BYTES: usize = LANE_SC + 16 * 32;
 /// Where a packed super-block's scale vectors start.
 const LANE_SC: usize = 64 * 32;
 /// Where a packed Q4_K or Q5_K super-block's min vectors start.
+#[cfg(target_arch = "x86_64")]
 const LANE_MN: usize = LANE_SC + 8 * 32;
 
 /// Whether `w` runs row lanes on this machine ([`pack_lanes`],
@@ -973,6 +1012,7 @@ pub fn pack_lanes(
 /// [`LANE_ROWS`] rows of `nb` blocks of it, `next` (with `AHEAD`) as many
 /// bytes, `packed` `nb` packed super-blocks. One function an arm, so each
 /// arm's three kernels are compiled alike: each the one call of its body.
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn pack_group<const AHEAD: bool>(
     w: GgmlType,
@@ -990,6 +1030,12 @@ fn pack_group<const AHEAD: bool>(
             _ => pack_lanes_q6k_avx2::<AHEAD>(rows, next, nb, packed),
         }
     }
+}
+
+/// Off x86_64 [`has_lanes`] is false for every type, so [`pack_lanes`] refuses first.
+#[cfg(not(target_arch = "x86_64"))]
+fn pack_group<const AHEAD: bool>(_: GgmlType, _: &[u8], _: &[u8], _: usize, _: &mut [u8]) {
+    unreachable!("no qdot row-lane pack off x86_64")
 }
 
 /// One row-lane group ([`pack_lanes`]' `packed`) against up to [`TILE_COLS`]
@@ -1060,6 +1106,7 @@ pub fn dot_lanes_cols(
 /// packed super-blocks (of Q6_K rows with `q6`, else of Q4_K or Q5_K rows),
 /// `acols` `C` columns of at least `nb` super-blocks' x4 groups, `out` `C`
 /// values.
+#[cfg(target_arch = "x86_64")]
 fn lanes<const C: usize>(
     q6: bool,
     packed: &[u8],
@@ -1078,6 +1125,12 @@ fn lanes<const C: usize>(
         }
     };
     out.copy_from_slice(&v);
+}
+
+/// Off x86_64 [`has_lanes`] is false for every type, so [`dot_lanes_cols`] refuses first.
+#[cfg(not(target_arch = "x86_64"))]
+fn lanes<const C: usize>(_: bool, _: &[u8], _: &[&[u8]], _: usize, _: &mut [[f32; LANE_ROWS]]) {
+    unreachable!("no qdot row-lane kernel off x86_64")
 }
 
 /// Shape validation shared by every `dot_row` entry point.
@@ -1201,6 +1254,7 @@ fn quantize_q8k_block(x: &[f32], out: &mut [u8]) {
 ///
 /// # Safety
 /// AVX2 must be available on the target.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn v_nearest_int(y: __m256) -> __m256i {
     unsafe {
@@ -1222,6 +1276,7 @@ unsafe fn v_nearest_int(y: __m256) -> __m256i {
 ///
 /// # Safety
 /// AVX2 must be available on the target.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn v_wrap_i8(q: __m256i) -> __m256i {
     unsafe {
@@ -1239,6 +1294,7 @@ unsafe fn v_wrap_i8(q: __m256i) -> __m256i {
 /// AVX (`_mm256_castps256_ps128`, `_mm256_extractf128_ps`) and SSE3
 /// (`_mm_movehdup_ps`) must be available on the target; being
 /// `#[inline(always)]`, it takes them from its caller's features.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hmax_ps(v: __m256) -> f32 {
     unsafe {
@@ -1261,6 +1317,7 @@ unsafe fn hmax_ps(v: __m256) -> f32 {
 ///
 /// # Safety
 /// CPU must support AVX2; `x`/`out` are the fixed 256-value/296-byte block.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_q8k_block_avx2(x: &[f32; 256], out: &mut [u8; 296]) {
     // SAFETY: AVX2 present per contract; every load lands inside the 256-value
@@ -1337,6 +1394,7 @@ unsafe fn quantize_q8k_block_avx2(x: &[f32; 256], out: &mut [u8; 296]) {
 // ------------------------------------------------------------- q3_K dot
 
 /// Scale shuffle table for Q3_K dot.
+#[cfg(target_arch = "x86_64")]
 static K_SHUFFLE_Q3K: [u8; 128] = [
     0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, //
     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, //
@@ -1352,6 +1410,7 @@ static K_SHUFFLE_Q3K: [u8; 128] = [
 ///
 /// # Safety
 /// AVX2 must be available on the target.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum_i32(v: __m256i) -> i32 {
     unsafe {
@@ -1364,6 +1423,7 @@ unsafe fn hsum_i32(v: __m256i) -> i32 {
 }
 
 /// Vector constants the field dot needs, built once per row.
+#[cfg(target_arch = "x86_64")]
 struct Masks {
     m3: __m256i,
     mone: __m256i,
@@ -1373,6 +1433,7 @@ struct Masks {
 ///
 /// # Safety
 /// `q8` must point at 32 readable bytes inside column buffer; AVX2 must be present.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn field_dot<const SHIFT: i32, const BIT: i32>(
     q8: *const u8,
@@ -1407,6 +1468,7 @@ unsafe fn field_dot<const SHIFT: i32, const BIT: i32>(
 ///
 /// # Safety
 /// CPU must support AVX2+F16C; buffers must hold `nb` super-blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "f16c")]
 unsafe fn dot_q3k_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+F16C present and both slices hold nb super-blocks per contract.
@@ -1628,6 +1690,7 @@ fn dot_q3k_q8k_scalar(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// Each `q8[c] + off` must point at 32 readable bytes inside column `c`'s
 /// buffer; AVX2 must be present.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -1680,6 +1743,7 @@ unsafe fn field_dot_cols<const SHIFT: i32, const BIT: i32, const C: usize>(
 /// # Safety
 /// CPU must support AVX2+F16C; `wrow` must hold `nb` super-blocks and each
 /// `acols[c]` point at `nb` readable Q8_K blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "f16c")]
 unsafe fn dot_q3k_q8k_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -1807,6 +1871,7 @@ unsafe fn dot_q3k_q8k_tile_avx2<const C: usize>(
 ///
 /// # Safety
 /// AVX2 must be available on the target.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum8_i32(s: &[__m256i; 8]) -> __m256i {
     // SAFETY: register-only intrinsics, no memory access.
@@ -1864,6 +1929,7 @@ const _: () = assert!(R8_CODES + 8 * R8_PAIR == Q3K_R8_BLOCK);
 /// Scale-pair shuffles of the row-lane tile, per 128-bit half: from a vector
 /// whose dword `r` is the i16 pair `[s_r,2p, s_r,2p+1]`, the first 32 bytes
 /// make `[s_r,2p, s_r,2p]` and the last 32 `[s_r,2p+1, s_r,2p+1]`.
+#[cfg(target_arch = "x86_64")]
 static R8_DUP: [u8; 64] = [
     0, 1, 0, 1, 4, 5, 4, 5, 8, 9, 8, 9, 12, 13, 12, 13, //
     0, 1, 0, 1, 4, 5, 4, 5, 8, 9, 8, 9, 12, 13, 12, 13, //
@@ -1975,6 +2041,7 @@ fn r8_scalar(group: &[u8], acols: &[&[u8]], nb: usize, out: &mut [[f32; Q3K_R8_R
 ///
 /// # Safety
 /// Each `blk[c] + off .. + 16` must be readable; AVX2 must be present.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn r8_sub_block<const C: usize>(
     w: &[__m256i; 4],
@@ -2024,6 +2091,7 @@ unsafe fn r8_sub_block<const C: usize>(
 /// # Safety
 /// CPU must support AVX2+F16C; `group` must hold `nb` group super-blocks and
 /// each `acols[c]` point at `nb` readable Q8_K blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "f16c")]
 unsafe fn dot_q3k_r8_tile_avx2<const C: usize>(
     group: &[u8],
@@ -2272,6 +2340,7 @@ pub fn card_q8_1_scalar(x: &[f32]) -> CardQ81 {
 pub fn card_q8_1_fill(x: &[f32], out: &mut CardQ81) {
     card_q8_1_check(x);
     assert_eq!(out.k, x.len(), "card_q8_1_fill: the form's k is x.len()");
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the features were just detected; card_q8_1_check pinned
         // x.len() to whole 128-value blocks and the assert the form's shape.
@@ -2327,6 +2396,7 @@ fn card_q8_1_check(x: &[f32]) {
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `x` whole 128-value blocks with
 /// `out` the form [`CardQ81::for_k`] made for them.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn card_q8_1_fill_avx2(x: &[f32], out: &mut CardQ81) {
     let (blocks, _) = x.as_chunks::<128>();
@@ -2451,6 +2521,7 @@ unsafe fn card_q8_1_fill_avx2(x: &[f32], out: &mut CardQ81) {
 ///
 /// # Safety
 /// AVX2 must be available on the target. Register-only.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn card_warp_sum(f: [__m256; 4]) -> f32 {
@@ -2744,6 +2815,7 @@ pub fn card_q3k_dot_row_cols(
     out: &mut [f32],
 ) -> Result<(), QdotError> {
     let n_sb = card_dot_check(wrow, Q3K_BLOCK, cols, out)?;
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the features were just detected; card_dot_check pinned the
         // row to n_sb super-blocks and every column to k = 256·n_sb.
@@ -2774,6 +2846,7 @@ pub fn card_q3k_dot_row_cols_scalar(
 /// The CPU must support AVX2 and FMA; [`card_dot_check`] pinned `wrow` to
 /// `n_sb` super-blocks, every column to `k = 256·n_sb` and `out` to one
 /// value per column.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn card_q3k_dot_row_cols_avx2(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out: &mut [f32]) {
     let iters = n_sb.div_ceil(2);
@@ -2942,6 +3015,7 @@ pub fn card_q4k_dot_row_cols(
     out: &mut [f32],
 ) -> Result<(), QdotError> {
     let n_sb = card_dot_check(wrow, Q4K_BLOCK, cols, out)?;
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the features were just detected; card_dot_check pinned the
         // row to n_sb super-blocks and every column to k = 256·n_sb.
@@ -2978,6 +3052,7 @@ fn card_q4k_dot_row_scalar_into(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out
 /// The CPU must support AVX2 and FMA; [`card_dot_check`] pinned `wrow` to
 /// `n_sb` super-blocks, every column to `k = 256·n_sb` and `out` to one
 /// value per column.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn card_q4k_dot_row_cols_avx2(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out: &mut [f32]) {
     let iters = n_sb.div_ceil(4);
@@ -3164,6 +3239,7 @@ pub fn card_swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) 
         gate.len() == up.len() && gate.len() == out.len(),
         "card_swiglu_clamp: gate, up and out are one length"
     );
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the features were just detected; the slices are equal
         // length, and both bodies spell the same value per lane as
@@ -3188,6 +3264,7 @@ pub fn card_swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) 
 /// [`expf_ik_scalar`] bit for bit.
 pub fn card_expf(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "card_expf: one output per input");
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the features were just detected; the slices are one length.
         unsafe { card_expf_avx2(x, out) };
@@ -3200,6 +3277,7 @@ pub fn card_expf(x: &[f32], out: &mut [f32]) {
 
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `x` and `out` must be one length.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn card_expf_avx2(x: &[f32], out: &mut [f32]) {
     let (body, tail) = x.as_chunks::<8>();
@@ -3331,6 +3409,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
 ///
 /// # Safety
 /// AVX2 must be available on the target; `x` is the fixed 32-value block.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
     // SAFETY: AVX2 present per contract; loads stay inside the fixed 32-value
@@ -3388,6 +3467,7 @@ unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
 /// CPU must support AVX2; `x.len()` must be a multiple of 32 and
 /// `out.len()` equal `col_bytes(w, x.len())` (both enforced by
 /// [`quantize_col_check`]).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
     // SAFETY: AVX2 present per contract; whole 8-lane loads of each 32-value
@@ -3422,6 +3502,7 @@ unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
 /// # Safety
 /// F16C must be available on the target; being `#[inline(always)]`, it takes it
 /// from its caller's features.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn f16c_to_f32(h: u16) -> f32 {
     // SAFETY: register-only intrinsics, no memory access.
@@ -3432,6 +3513,7 @@ unsafe fn f16c_to_f32(h: u16) -> f32 {
 ///
 /// # Safety
 /// AVX and SSE3 must be available on the target.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum_float_8(x: __m256) -> f32 {
     // SAFETY: AVX and SSE3 present per contract; register-only, no memory is touched.
@@ -3450,6 +3532,7 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q4k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
@@ -3734,6 +3817,7 @@ static K_SHUFFLE_Q6K: [u8; 32] = [
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q6k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
@@ -4006,6 +4090,7 @@ const Q5K_BLOCK: usize = 176;
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q5k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
@@ -4233,6 +4318,7 @@ fn dot_q5k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` blocks of its type
 /// and each `acols[c]` point at the `2 · nb` readable Q8_2_X4 groups of `nb`
 /// super-blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q45k_q82x4_tile_avx2<const C: usize, const Q5: bool>(
     wrow: &[u8],
@@ -4384,6 +4470,7 @@ unsafe fn dot_q45k_q82x4_tile_avx2<const C: usize, const Q5: bool>(
 ///
 /// # Safety
 /// AVX2 must be present.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn transpose8_epi32(v: [__m256i; 8]) -> [__m256i; 8] {
     // SAFETY: register-only AVX2 shuffles.
@@ -4421,6 +4508,7 @@ unsafe fn transpose8_epi32(v: [__m256i; 8]) -> [__m256i; 8] {
 ///
 /// # Safety
 /// AVX2 must be present.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn transpose8_ps(v: [__m256; 8]) -> [__m256; 8] {
     // SAFETY: register-only casts and AVX2 shuffles.
@@ -4449,6 +4537,7 @@ unsafe fn transpose8_ps(v: [__m256; 8]) -> [__m256; 8] {
 ///
 /// # Safety
 /// AVX2 must be present; `dst` must be writable for one packed super-block.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn lane_codes<const Q5: bool, const LO: i32, const HI: i32>(
     chunk: [__m256i; 8],
@@ -4483,6 +4572,7 @@ unsafe fn lane_codes<const Q5: bool, const LO: i32, const HI: i32>(
 ///
 /// # Safety
 /// `next` must hold at least `(i + 1) · SHARE` bytes.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn lane_ahead<const SHARE: usize>(next: &[u8], i: usize) {
     // SAFETY: every offset is below `(i + 1) · SHARE`, inside `next` (the
@@ -4499,6 +4589,7 @@ unsafe fn lane_ahead<const SHARE: usize>(next: &[u8], i: usize) {
 ///
 /// # Safety
 /// `next` must not be empty.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn lane_ahead_last(next: &[u8]) {
     // SAFETY: `next.len() - 1` is inside the non-empty `next` (the caller's
@@ -4514,6 +4605,7 @@ unsafe fn lane_ahead_last(next: &[u8]) {
 /// AVX2+FMA+F16C must be present; `rows` must hold [`LANE_ROWS`] rows of `nb`
 /// blocks, `next` (with `AHEAD`) as many bytes, and `packed` `nb` packed
 /// super-blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn pack_lanes_avx2<const Q5: bool, const AHEAD: bool>(
     rows: &[u8],
@@ -4613,6 +4705,7 @@ unsafe fn pack_lanes_avx2<const Q5: bool, const AHEAD: bool>(
 /// AVX2+FMA+F16C must be present; `rows` must hold [`LANE_ROWS`] rows of `nb`
 /// Q6_K blocks, `next` (with `AHEAD`) as many bytes, and `packed` `nb` packed
 /// super-blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn pack_lanes_q6k_avx2<const AHEAD: bool>(
     rows: &[u8],
@@ -4707,6 +4800,7 @@ unsafe fn pack_lanes_q6k_avx2<const AHEAD: bool>(
 /// Super-blocks one pass of [`dot_lanes_avx2`] walks before it moves to the
 /// next lane: their packed codes (10 KB) and the columns' activation bytes
 /// stay in L1 across the eight lanes.
+#[cfg(target_arch = "x86_64")]
 const LANE_CHUNK: usize = 4;
 
 /// AVX2 row-lane kernel: one packed group ([`pack_lanes`]) against `C`
@@ -4729,6 +4823,7 @@ const LANE_CHUNK: usize = 4;
 /// # Safety
 /// AVX2+FMA+F16C must be present; `packed` must hold `nb` packed
 /// super-blocks and every column `nb` super-blocks' Q8_2_X4 groups.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_lanes_avx2<const C: usize>(
     packed: &[u8],
@@ -4850,6 +4945,7 @@ unsafe fn dot_lanes_avx2<const C: usize>(
 /// # Safety
 /// AVX2+FMA+F16C must be present; `packed` must hold `nb` packed Q6_K
 /// super-blocks and every column `nb` super-blocks' Q8_2_X4 groups.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_lanes_q6k_avx2<const C: usize>(
     packed: &[u8],
@@ -4979,6 +5075,7 @@ unsafe fn dot_lanes_q6k_avx2<const C: usize>(
 // --------------------------------------------------------- Q5_0 x Q8_2_X4
 
 /// `HBitDequantizer` constants for unpacking high bits.
+#[cfg(target_arch = "x86_64")]
 struct Q5HBit {
     shuffle: __m256i,
     mask: __m256i,
@@ -4989,6 +5086,7 @@ struct Q5HBit {
 ///
 /// # Safety
 /// `blk` must hold QS_OFF + 16 readable bytes.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn q5x_codes<const QH_OFF: usize, const QS_OFF: usize>(
     blk: &[u8],
@@ -5027,6 +5125,7 @@ unsafe fn q5x_codes<const QH_OFF: usize, const QS_OFF: usize>(
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q5f0_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present (checked by dot_row) and both slices hold
@@ -5317,6 +5416,7 @@ fn dot_q5f0_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q5f1_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present (checked by dot_row) and both slices
@@ -5529,6 +5629,7 @@ fn dot_q5f1_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` Q5_1 blocks and each
 /// `acols[c]` point at `col_bytes(Q5_1, 32 · nb)` readable bytes.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q5f1_q82x4_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -5678,6 +5779,7 @@ unsafe fn dot_q5f1_q82x4_tile_avx2<const C: usize>(
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q8f0_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present (checked by dot_row) and both slices
@@ -5852,6 +5954,7 @@ fn dot_q8f0_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` Q8_0 blocks and each
 /// `acols[c]` point at `col_bytes(Q8_0, 32 · nb)` readable bytes.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_q8f0_q82x4_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -5963,8 +6066,10 @@ const IQ3XXS_BLOCK: usize = 98;
 /// ik's `keven_signs` (iqk_common.h): entry i is [`KSIGNS_IQ2XS`]`[i]` spread to one
 /// byte per bit, 0xff where the bit is set and 0x01 where it is clear — the
 /// `sign_epi8` operand that negates or keeps each of eight grid values.
+#[cfg(target_arch = "x86_64")]
 static KEVEN_SIGNS: [u64; 128] = keven_signs();
 
+#[cfg(target_arch = "x86_64")]
 const fn keven_signs() -> [u64; 128] {
     let mut t = [0u64; 128];
     let mut i = 0;
@@ -5999,6 +6104,7 @@ const IQ3XXS_MIN: i8 = 64;
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq3xxs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
@@ -6104,6 +6210,7 @@ unsafe fn dot_iq3xxs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// AVX2+FMA must be available (taken from the caller, being
 /// `#[inline(always)]`); `col` must point at a validated Q8_K block.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn q8k_block_step(
     values: &[__m256i; 8],
@@ -6159,6 +6266,7 @@ unsafe fn q8k_block_step(
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ3_XXS blocks and
 /// each `acols[c]` point at `nb` Q8_K blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq3xxs_q8k_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -6314,6 +6422,7 @@ const IQ3S_MIN: i8 = 16;
 /// # Safety
 /// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
 /// `blk` must point at a whole IQ3_S block.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn iq3s_scales(blk: *const u8) -> __m128i {
     // SAFETY: one unaligned u32 read of the four scale bytes inside the block.
@@ -6338,6 +6447,7 @@ unsafe fn iq3s_scales(blk: *const u8) -> __m128i {
 /// # Safety
 /// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
 /// `blk` must point at a whole IQ3_S block and `b` be below 8.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn iq3s_values(blk: *const u8, b: usize) -> __m256i {
     // SAFETY: sub-block b's eight index bytes, its qh byte and its four sign bytes,
@@ -6399,6 +6509,7 @@ unsafe fn iq3s_values(blk: *const u8, b: usize) -> __m256i {
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq3s_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
@@ -6476,6 +6587,7 @@ unsafe fn dot_iq3s_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ3_S blocks and each
 /// `acols[c]` point at `nb` Q8_K blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq3s_q8k_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -6609,6 +6721,7 @@ static KVALUES_MXFP4_U: [u8; 16] = {
 ///
 /// # Safety
 /// `qs` must point at 16 readable bytes; AVX2 must be present.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn lut4_codes(qs: *const u8, m4: __m256i, table: __m256i) -> __m256i {
     // SAFETY: 16 readable bytes per contract; the rest is register-only.
@@ -6632,6 +6745,7 @@ unsafe fn lut4_codes(qs: *const u8, m4: __m256i, table: __m256i) -> __m256i {
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_mxfp4_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA present (checked by dot_row) and both slices hold the
@@ -6756,6 +6870,7 @@ unsafe fn dot_mxfp4_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// CPU must support AVX2+FMA; `wrow` must hold `nb` MXFP4 blocks and each
 /// `acols[c]` point at `col_bytes(MXFP4, 32 · nb)` readable bytes.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_mxfp4_q82x4_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -6995,6 +7110,7 @@ const IQ4NL_BLOCK: usize = 18;
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq4nl_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present (checked by dot_row) and both slices hold the
@@ -7112,6 +7228,7 @@ unsafe fn dot_iq4nl_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ4_NL blocks and
 /// each `acols[c]` point at `col_bytes(IQ4_NL, 32 · nb)` readable bytes.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq4nl_q82x4_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -7380,6 +7497,7 @@ const IQ4XS_MIN: f32 = -128.0;
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq4xs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
@@ -7486,6 +7604,7 @@ unsafe fn dot_iq4xs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ4_XS blocks and
 /// each `acols[c]` point at `nb` Q8_K blocks.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq4xs_q8k_tile_avx2<const C: usize>(
     wrow: &[u8],
@@ -7676,12 +7795,15 @@ pub fn q_nope2_cells(
         out.len(),
         j_end - j0
     );
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: AVX2+FMA detected just now; asserts bound every index the kernel touches.
         unsafe { q_nope2_cells_avx2_inner(whead, acol, j0, j_end, out) }
     } else {
         q_nope2_cells_scalar(whead, acol, j0, j_end, out);
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    q_nope2_cells_scalar(whead, acol, j0, j_end, out);
 }
 
 /// Scalar mirror of `q_nope2_cells`, bit-identical by construction.
@@ -7708,6 +7830,7 @@ pub fn q_nope2_cells_scalar(
 }
 
 /// AVX2 entry point for `q_nope2_cells` for comparison against scalar mirror.
+#[cfg(target_arch = "x86_64")]
 pub fn q_nope2_cells_avx2(
     whead: &[Q8Block],
     acol: &[ActBlock],
@@ -7743,6 +7866,7 @@ pub fn q_nope2_cells_avx2(
 /// # Safety
 /// CPU must support AVX2+FMA; caller must ensure slice lengths match segment
 /// bounds. Activation codes must be in [-127, 127] (section header, DOMAIN).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn q_nope2_cells_avx2_inner(
     whead: &[Q8Block],
@@ -7892,6 +8016,7 @@ unsafe fn sum_sq_f64_avx2(x: &[f32]) -> f64 {
 /// where in the block it sits. Falls back to the scalar libm form without AVX2+FMA.
 pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     assert!(gate.len() == up.len() && gate.len() == out.len());
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the features were just detected; the slices are equal length.
         unsafe { swiglu_avx2(gate, up, out) };
@@ -7913,6 +8038,7 @@ pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
     assert!(gate.len() == up.len() && gate.len() == out.len());
     // ik's own test, so a NaN limit clamps nothing either.
     if limit > 1e-6 {
+        #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             // SAFETY: the features were just detected; the slices are equal length.
@@ -7934,6 +8060,7 @@ pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
 /// the same length — the loads and the store share one index.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
     let n = gate.len();
@@ -7970,6 +8097,7 @@ unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
 /// the same length — the loads and the store share one index.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let n = gate.len();
@@ -8004,6 +8132,7 @@ unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
 ///
 /// # Safety
 /// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn v_silu(x: __m256) -> __m256 {
@@ -8020,6 +8149,7 @@ unsafe fn v_silu(x: __m256) -> __m256 {
 ///
 /// # Safety
 /// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn v_expf(x: __m256) -> __m256 {

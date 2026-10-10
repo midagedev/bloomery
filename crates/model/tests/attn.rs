@@ -763,6 +763,7 @@ fn kq_reassoc_band(q: &[f32], k: &[u16]) -> f32 {
 /// tile tail. Both `r` buffers start from the same random non-zero state:
 /// the accumulator carries across blocks in the kernel, never re-zeroed
 /// between them.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
 fn hw_flash_v_accum_avx2_matches_scalar() {
@@ -846,6 +847,7 @@ fn hw_flash_v_accum_avx2_matches_scalar() {
 /// take: row width % 32 == 0, latent % 8 == 0) at a small head/token count.
 /// No model file, no oracle — only the box's ISA. One struct so the re-exec
 /// child and its parent test consume the same bytes.
+#[cfg(target_arch = "x86_64")]
 struct FlashLeverFixture {
     p: attn::MlaParams,
     q_rope: Tensor2,
@@ -856,6 +858,7 @@ struct FlashLeverFixture {
     q_slots: Vec<Slot>,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl FlashLeverFixture {
     /// The cache view over the flat buffer, at the real row width.
     fn keys(&self) -> model::kv::KvRows<'_> {
@@ -863,6 +866,7 @@ impl FlashLeverFixture {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn flash_lever_fixture() -> FlashLeverFixture {
     let p = attn::MlaParams {
         n_head: 2,
@@ -936,6 +940,7 @@ fn flash_lever_fixture() -> FlashLeverFixture {
 /// test of its own: when `BLOOMERY_FLASH_SIMD_CHILD_DUMP` is absent (i.e.
 /// someone ran the file directly) it returns without doing anything — the
 /// pattern `tests/mt.rs`'s child helper set.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: re-exec child of hw_flash_simd_lever_forces_scalar; standalone it is a no-op"]
 fn hw_flash_simd_lever_child_dump() {
@@ -971,6 +976,7 @@ fn hw_flash_simd_lever_child_dump() {
 /// bytes to equal its own in-process `flash_attn_latent_scalar` run on the
 /// same fixture. A broken lever (the child silently running the SIMD twin)
 /// moves the output by the kq sum-order ULPs and reds the byte compare.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
 fn hw_flash_simd_lever_forces_scalar() {
@@ -1061,6 +1067,7 @@ fn hw_flash_simd_lever_forces_scalar() {
 /// `hw_flash_simd_lever_forces_scalar`; in the parent's `--ignored` run a
 /// neighbouring test's multi-query row could land between the call and
 /// the read.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore]
 fn hw_kv_prefetch_lever_is_observed() {
@@ -1090,6 +1097,7 @@ fn hw_kv_prefetch_lever_is_observed() {
 
 /// The child half of `hw_kv_prefetch_lever_is_observed`: only meaningful in
 /// the re-exec, where no other row writes the observable.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore]
 fn hw_kv_prefetch_lever_child() {

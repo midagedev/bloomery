@@ -5519,6 +5519,7 @@ fn warm_walk(
 /// rate within the core's reorder window instead of running past it; every
 /// other line of its page is prefetched into the cache the reads fill, with no
 /// load to wait for. An `off` outside `bytes` is an index panic.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn warm_touch(bytes: &[u8], off: usize, paced: bool) {
     let line = &bytes[off];
@@ -5533,6 +5534,13 @@ fn warm_touch(bytes: &[u8], off: usize, paced: bool) {
             );
         }
     }
+}
+
+/// Off x86_64 every line of a warm walk is a read: the prefetch is x86's.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn warm_touch(bytes: &[u8], off: usize, _: bool) {
+    std::hint::black_box(bytes[off]);
 }
 
 /// Participant `t`'s share of a warm of `spans`, in priority order: of each

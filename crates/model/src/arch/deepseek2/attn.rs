@@ -756,6 +756,7 @@ fn v_expf(x: f32) -> f32 {
 /// # Safety
 /// The CPU must support AVX2+FMA; this inlines into the `#[target_feature]`
 /// kernels that call it and takes their features.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn v_expf8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     // SAFETY: the fn contract — ISA from the caller; register-only ops.
@@ -814,6 +815,7 @@ unsafe fn v_expf8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 ///
 /// # Safety
 /// The CPU must support AVX2; inlines into its `#[target_feature]` caller.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn lane_tree8(s: std::arch::x86_64::__m256) -> f32 {
     // SAFETY: the fn contract — register-only ops.
@@ -832,6 +834,7 @@ unsafe fn lane_tree8(s: std::arch::x86_64::__m256) -> f32 {
 ///
 /// # Safety
 /// The CPU must support AVX2; inlines into its `#[target_feature]` caller.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn lane_tree8x8(a: &[std::arch::x86_64::__m256; 8]) -> std::arch::x86_64::__m256 {
     // SAFETY: the fn contract — register-only ops.
@@ -878,6 +881,7 @@ pub fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
 ///
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and `q.len() == k.len()` must be a multiple of 32 — [`kq_dot_simd`] checks both for direct calls, `flash_simd` at the flash site.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn kq_dot_fa4_avx2(q: &[f32], k: &[u16]) -> f32 {
     // SAFETY: the fn contract above — ISA from the caller's detection, lengths validated one step up; offsets stay in bounds by the `% 32 == 0` walk.
@@ -915,6 +919,7 @@ unsafe fn kq_dot_fa4_avx2(q: &[f32], k: &[u16]) -> f32 {
 ///
 /// # Safety
 /// As [`kq_dot_fa4_avx2`], with `q.len()` a multiple of 8.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn kq_dot_lane8_avx2(q: &[f32], k: &[u16]) -> f32 {
     // SAFETY: the fn contract above — ISA from the caller, lengths validated one step up.
@@ -936,6 +941,7 @@ unsafe fn kq_dot_lane8_avx2(q: &[f32], k: &[u16]) -> f32 {
 /// tile ([`attn_bundle`] 8, the default), [`kq_dot_fa4_avx2`] under the
 /// per-head kernel (`BLOOMERY_ATTN_BUNDLE=1`). On a CPU without the ISA,
 /// panic — no quiet fall back.
+#[cfg(target_arch = "x86_64")]
 pub fn kq_dot_simd(q: &[f32], k: &[u16]) -> f32 {
     assert!(
         std::arch::is_x86_feature_detected!("avx2")
@@ -961,6 +967,13 @@ pub fn kq_dot_simd(q: &[f32], k: &[u16]) -> f32 {
             kq_dot_lane8_avx2(q, k)
         }
     }
+}
+
+/// Off x86_64 no AVX2 kernel is compiled: a named panic, as on a CPU without
+/// the ISA.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn kq_dot_simd(_: &[f32], _: &[u16]) -> f32 {
+    panic!("kq_dot_simd called off x86_64: no AVX2+FMA+F16C kernel in this build")
 }
 
 /// `F16::reduce_add<32>` (iqk_fa_templates.h:54-206): `((v0+v1)+v2)+v3` elementwise over the four 8-lane registers, then `hsum_float_8`. Masked lanes hold exactly `0.0` and ride through the tree without changing any rounding.
@@ -1064,6 +1077,7 @@ pub fn flash_attn_latent_scalar(
 ///
 /// `BLOOMERY_FLASH_SIMD=0` forces the scalar path for a whole process (read once) —
 /// the gates' A/B lever: same binary, same oracle, only the kernel choice changes.
+#[cfg(target_arch = "x86_64")]
 fn flash_simd(p: &MlaParams) -> bool {
     static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
     if *FORCE_SCALAR.get_or_init(|| std::env::var("BLOOMERY_FLASH_SIMD").is_ok_and(|v| v == "0")) {
@@ -1074,6 +1088,13 @@ fn flash_simd(p: &MlaParams) -> bool {
         && std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("fma")
         && std::arch::is_x86_feature_detected!("f16c")
+}
+
+/// Off x86_64 no AVX2 twin is compiled: [`flash_attn_latent`] keeps the scalar
+/// transcription.
+#[cfg(not(target_arch = "x86_64"))]
+fn flash_simd(_: &MlaParams) -> bool {
+    false
 }
 
 /// How many key rows ahead the AVX2 flash twin prefetches on a decode row;
@@ -1523,6 +1544,13 @@ struct SegOut<'a> {
     clippy::too_many_arguments,
     reason = "the segment kernel's operands, its scratch and the twin choice"
 )]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        unused_variables,
+        reason = "`simd` and `ahead` choose and feed the AVX2 twins, which only x86_64 compiles"
+    )
+)]
 fn flash_segment_heads(
     simd: bool,
     ahead: usize,
@@ -1540,6 +1568,7 @@ fn flash_segment_heads(
     let d_len = seg.r.len() / nh;
     debug_assert!(nh <= HEAD_BUNDLE && seg.s.len() == nh && qrows.len() == nh * d_head);
     if attn_bundle() != 1 {
+        #[cfg(target_arch = "x86_64")]
         if simd {
             // SAFETY: `simd` is `flash_simd`'s verdict (ISA and panel shapes);
             // every dispatch asserts `keys16.width() == d_head`, sizes `qrows`
@@ -1548,17 +1577,22 @@ fn flash_segment_heads(
         } else {
             flash_tile_scalar(qrows, rk, p, keys, d_off, seg, ts);
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        flash_tile_scalar(qrows, rk, p, keys, d_off, seg, ts);
         return;
     }
     for h in 0..nh {
         let qrow = &qrows[h * d_head..(h + 1) * d_head];
         let r = &mut seg.r[h * d_len..(h + 1) * d_len];
+        #[cfg(target_arch = "x86_64")]
         let (m, s_sum) = if simd {
             // SAFETY: as above, for one head's row and latent range.
             unsafe { flash_seg_avx2(qrow, rk, p, keys.clone(), ahead, d_off, r, w) }
         } else {
             flash_seg_scalar(qrow, rk, p, keys.clone(), d_off, r, w)
         };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (m, s_sum) = flash_seg_scalar(qrow, rk, p, keys.clone(), d_off, r, w);
         seg.m[h] = m;
         seg.s[h] = s_sum;
     }
@@ -1617,6 +1651,7 @@ pub fn flash_v_accum_scalar(
 /// `w[l] != 0.0` — inactive lanes are never read.
 // TWIN: flash_v_accum_scalar — same FMAs in the same per-element order; every
 // edit to the arithmetic or the lane semantics must be made in both.
+#[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 pub unsafe fn flash_v_accum_avx2(
@@ -1822,6 +1857,7 @@ fn flash_seg_scalar(
 /// checked bounds and fixed stride are the whole guarantee — `qrow` sized
 /// `d_head`, `keys.end <= keys16.len()`, and `r` a latent range: `d_off +
 /// r.len() <= latent`, `r.len()` a multiple of 8.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 #[allow(
     clippy::too_many_arguments,
@@ -2106,6 +2142,7 @@ fn flash_tile_scalar(
 /// latent range inside the latent: `d_off + d_len <= latent`, `d_len` a
 /// multiple of 8, `seg.r.len() == nh·d_len`, `nh <= 8`.
 // TWIN: flash_tile_scalar — every edit outside the kq dot must be made in both.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 #[allow(
     clippy::too_many_arguments,
@@ -3110,6 +3147,7 @@ fn heads_split_k(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[cfg(test)]
 mod tests {
     use super::{lane_tree8, lane_tree8x8, v_expf, v_expf8};

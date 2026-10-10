@@ -8702,7 +8702,7 @@ def self_test() -> int:
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
     expect(any("bloomery-gpu -> cuda-" in w for w in real.get("bloomery-gpu", [])), f"pure: bloomery-gpu's reason {real.get('bloomery-gpu')}")
-    expect(any("x86_64 intrinsics" in w for w in real.get("bloomery-qdot", [])), f"pure: qdot's reason {real.get('bloomery-qdot')}")
+    expect(any("crates/threads/src/" in w for w in real.get("bloomery-qdot", [])), f"pure: qdot's reason {real.get('bloomery-qdot')}")
     # host nightly on the real tree: the crates the set runs are the device-free ones and the admitted app; every gpu crate is left out
     # by its chain; every check script is a unit or an excluded one; the tables hold no stale entry
     lock_now = load_lock(tree.root)
