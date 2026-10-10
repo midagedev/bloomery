@@ -237,6 +237,15 @@
 //!   between, then slot 1 put back (`seq_resume`): both slots'
 //!   [`SLOT_RESUMED`] passes and a step bit for bit, counts included, their
 //!   solo runs'.
+//! - (kp) prefix restore: a state of `a` taken after two prompt calls (a
+//!   point at the first call's end), put back whole and cut to the point
+//!   (`seq_resume`, `rollback`) and as the point's prefix alone
+//!   (`seq_resume_prefix` asked for more positions than the point holds), on
+//!   the NextN load with the draft idle: the stores' rows of the first `k`
+//!   positions (latent, index and pool keys) bit for bit the same both ways, `a`'s rest prompted and
+//!   [`KP_STEPS`] steps from there, the ids and every step's logits bit for
+//!   bit the same both ways and the unbroken run's, the prefix restore
+//!   returning the point.
 //!
 //! The harness's last clause, H5's one-slot case, runs after them on a load
 //! of one sequence of its own, the card holding one load at a time.
@@ -452,7 +461,7 @@ mod gate {
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode, RouteTapRows,
         StoreDigest, StoreRows, feed, nextn_store, plant_prompt_routes, prefill, prefill_mode,
-        prompt_route_taps, seq_resume, seq_save, set_prefill, set_prefill_group,
+        prompt_route_taps, seq_resume, seq_resume_prefix, seq_save, set_prefill, set_prefill_group,
         set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows,
     };
     use bloomery_levers::CARD_BUDGET;
@@ -3042,6 +3051,108 @@ mod gate {
         Ok(b_back && a_on)
     }
 
+    /// One store's layer, name and values as bits ([`kp_rows`]).
+    type KpRow = (usize, &'static str, Vec<u32>);
+    type KpSteps = (Vec<u32>, Vec<Vec<u32>>);
+
+    /// Steps (kp) takes after the prompt's rest, each reading its logits.
+    const KP_STEPS: usize = 4;
+
+    /// (kp) after (s3) (module header): `a` prompted in two calls, so a
+    /// point stands at the first call's end `k`; its state saved, then put
+    /// back two ways, each followed by `a`'s rest and [`KP_STEPS`] steps:
+    /// whole and cut to `k` (`seq_resume`, `rollback`), and as the prefix
+    /// alone asked past `k` (`seq_resume_prefix`), which only the first `k`
+    /// positions' rows reach the card for. Both ways' ids and logits are the
+    /// unbroken run's, bit for bit.
+    fn slots_prefix(s: &mut Session<Body>, a: &[u32]) -> Result<bool, GateError> {
+        let (&last, rest) = a.split_last().ok_or("an empty prompt")?;
+        let k = rest.len() / 2;
+        let ask = u32::try_from(k + 3)?;
+        s.reset()?;
+        s.prompt(&rest[..k], Want::Argmax)?;
+        s.prompt(&rest[k..], Want::Argmax)?;
+        let state = seq_save(s.model_mut())?;
+        let at = u32::try_from(k)?;
+        let points = state.points();
+        let unbroken = kp_steps(s, last)?;
+        // The stores are read after the rest's call: each way's cut has been
+        // applied by then, so every store (a KDA layer's state and ring
+        // included) stands where the unbroken run's does.
+        let landed = |s: &mut Session<Body>| -> Result<(Vec<KpRow>, KpSteps), GateError> {
+            s.prompt(&rest[k..], Want::Argmax)?;
+            let rows = kp_rows(s, k + 1)?;
+            Ok((rows, kp_steps(s, last)?))
+        };
+        s.reset()?;
+        seq_resume(s.model_mut(), &state)?;
+        s.model_mut().rollback(at)?;
+        let whole_pos = s.model().pos();
+        let (whole_rows, whole_steps) = landed(s)?;
+        let whole = (whole_pos, whole_steps);
+        s.reset()?;
+        let put = seq_resume_prefix(s.model_mut(), &state, ask)?;
+        let prefix_pos = s.model().pos();
+        let (prefix_rows, prefix_steps) = landed(s)?;
+        let prefix = (prefix_pos, prefix_steps);
+        let stores = whole_rows == prefix_rows;
+        let same = |x: &(u32, KpSteps)| x.1 == unbroken;
+        let pass = points == [at]
+            && state.keep_point(ask) == at
+            && put == at
+            && whole.0 == at
+            && prefix.0 == at
+            && same(&whole)
+            && same(&prefix)
+            && stores;
+        println!(
+            "slots (kp) prefix restore: a state of {} positions with its point at {points:?}, asked \
+             {ask}: the prefix restore put back {put} (kept {}), the model at {} (whole and cut: {}); \
+             the rest prompted and {KP_STEPS} steps, ids {:?}: logits bit for bit the unbroken \
+             run's, whole and cut {}, prefix {}; every store after the rest's call (latent, index and pool \
+             rows of the first {} positions, KDA state and ring) bit for bit both ways {stores} {}",
+            state.positions(),
+            state.keep_point(ask),
+            prefix.0,
+            whole.0,
+            unbroken.0,
+            same(&whole),
+            same(&prefix),
+            k + 1,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Every store as bits ([`store_rows`]): a KDA layer's state and ring
+    /// whole, a latent layer's latent and index rows and pool keys of the
+    /// first `live` positions.
+    fn kp_rows(s: &mut Session<Body>, live: usize) -> Result<Vec<KpRow>, GateError> {
+        Ok(store_rows(s.model_mut(), live)?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.layer,
+                    r.what,
+                    r.values.iter().map(|v| v.to_bits()).collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// [`KP_STEPS`] steps from `last`, each greedy: the ids and every step's
+    /// logits as bits.
+    fn kp_steps(s: &mut Session<Body>, last: u32) -> Result<KpSteps, GateError> {
+        let (mut ids, mut rows) = (Vec::new(), Vec::new());
+        let mut feed = last;
+        for _ in 0..KP_STEPS {
+            feed = s.step(feed, Want::Argmax)?.argmax();
+            ids.push(feed);
+            rows.push(s.model().logits()?.iter().map(|v| v.to_bits()).collect());
+        }
+        Ok((ids, rows))
+    }
+
     /// The (slots) clauses (the module header): the harness's contracts and
     /// the body's own between them on one load, then (sd) and (s3) on a load
     /// of their own.
@@ -3148,6 +3259,7 @@ mod gate {
                 );
             }
         }
+        ok &= clause_timed("slots", "(kp) prefix restore", || slots_prefix(s, a));
         Ok(ok)
     }
 
