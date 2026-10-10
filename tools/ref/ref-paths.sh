@@ -45,6 +45,14 @@
 # Exit codes: 64 a BLOOMERY_TIER that is neither, 65 a fixture whose header is not a whole fixture (`fixture_budget`), 66 no
 # fixture for the family.
 #
+# A fixture variant. BLOOMERY_FIXTURE_VARIANT=<tag> moves the fixture root to fixture-variants/<tag> beside it (the box manifest keys
+# every file under the root into every fixture-tier item, so variants never sit under it): the family's fixture requantized
+# to the type map of the tag's row in tools/fixture-variants.tsv (`just fixture-requant`), in a directory of the same name. The tag is
+# lower-case letters and digits and a row of the table whose family is this profile; the real tier has no variant, and a tag set there
+# is a named 64, as is one the table does not name. refset's fixture::root is the Rust twin of this line, and a variant's sets carry
+# the tag in their names (SET_PREFIX, below). A script that writes the variant file sets FIXTURE_NEW=1 before sourcing: the file is
+# then not looked for, and FIXTURE_DIR is the directory it goes in (set whenever the family has a fixture directory).
+#
 # SC2034: the sourcing script reads these, which shellcheck does not see in this file alone.
 # shellcheck disable=SC2034
 : "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
@@ -68,8 +76,21 @@ IKBIN=${IKBIN:-$IK/build/bin/llama-bench}
 
 REF_PATHS_DIR=${BASH_SOURCE[0]%/*}
 FIXTURE_FILE=
+FIXTURE_DIR=
+FIXTURE_VARIANT=${BLOOMERY_FIXTURE_VARIANT:-}
+case $FIXTURE_VARIANT in
+  *[!a-z0-9]*)
+    echo "ref-paths.sh: BLOOMERY_FIXTURE_VARIANT is a tag of tools/fixture-variants.tsv, lower-case letters and digits, got '$FIXTURE_VARIANT' (exit 64)" >&2
+    exit 64
+    ;;
+esac
 case "${BLOOMERY_TIER:-real}" in
-  real) ;;
+  real)
+    if [ -n "$FIXTURE_VARIANT" ]; then
+      echo "ref-paths.sh: BLOOMERY_FIXTURE_VARIANT=$FIXTURE_VARIANT, but the tier is real: a variant is a requantized fixture file, and nothing runs on a real file under a variant's name (exit 64)" >&2
+      exit 64
+    fi
+    ;;
   fixture)
     case "$BLOOMERY_MODEL" in
       qwen4exp) __fixture_dir=qwen38 ;;
@@ -79,38 +100,58 @@ case "${BLOOMERY_TIER:-real}" in
       *) __fixture_dir=none ;;
     esac
     case "$__fixture_dir" in
-      self) ;;
+      self)
+        if [ -n "$FIXTURE_VARIANT" ]; then
+          echo "ref-paths.sh: BLOOMERY_FIXTURE_VARIANT=$FIXTURE_VARIANT, but the family '$BLOOMERY_MODEL' has no fixture file to be a variant of (exit 64)" >&2
+          exit 64
+        fi
+        ;;
       none)
         echo "ref-paths.sh: BLOOMERY_TIER=fixture, but the family '$BLOOMERY_MODEL' has no fixture yet (the table in $REF_PATHS_DIR/ref-paths.sh): not running it on its real file (exit 66)" >&2
         exit 66
         ;;
       *)
         __fixture_root=${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}
-        __fixture_files=("$__fixture_root/$__fixture_dir"/*-00001-of-*.gguf)
-        if [ ! -e "${__fixture_files[0]}" ]; then
-          echo "ref-paths.sh: BLOOMERY_TIER=fixture: the family '$BLOOMERY_MODEL' has no fixture file, no $__fixture_root/$__fixture_dir/*-00001-of-*.gguf (\`fixture generate\` writes it); not running it on its real file (exit 66)" >&2
-          exit 66
+        if [ -n "$FIXTURE_VARIANT" ]; then
+          __variant_family=$(awk -F'\t' -v t="$FIXTURE_VARIANT" '$0 !~ /^#/ && $1 == t { print $2 }' "$REF_PATHS_DIR/../fixture-variants.tsv")
+          if [ -z "$__variant_family" ]; then
+            echo "ref-paths.sh: BLOOMERY_FIXTURE_VARIANT=$FIXTURE_VARIANT, which tools/fixture-variants.tsv does not name (it holds: $(awk -F'\t' '$0 !~ /^#/ && NF { printf "%s ", $1 }' "$REF_PATHS_DIR/../fixture-variants.tsv")) (exit 64)" >&2
+            exit 64
+          fi
+          if [ "$__variant_family" != "$BLOOMERY_MODEL" ]; then
+            echo "ref-paths.sh: BLOOMERY_FIXTURE_VARIANT=$FIXTURE_VARIANT is a variant of $__variant_family, and this command picked the '$BLOOMERY_MODEL' profile (exit 64)" >&2
+            exit 64
+          fi
+          __fixture_root=${__fixture_root%/*}/fixture-variants/$FIXTURE_VARIANT
         fi
-        if [ "${#__fixture_files[@]}" != 1 ]; then
-          echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir holds ${#__fixture_files[@]} first shards (${__fixture_files[*]}), not one (exit 66)" >&2
-          exit 66
-        fi
-        FIXTURE_FILE=${__fixture_files[0]}
-        [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_FILE
-        # A family whose fixture has a DSpark draft keeps it in a directory of its own beside the target's shards (the glob above sees
-        # the target's first shard only): the fixture tier's draft is that file, never the real draft the profile names. A caller's own
-        # BLOOMERY_DSPARK_MODEL wins, as it does in the profile (the Rust side refuses a draft that is not a whole fixture).
-        if [ "$BLOOMERY_MODEL" = deepseek41 ] && [ -z "${BLOOMERY_DSPARK_MODEL:-}" ]; then
-          __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
-          if [ ! -e "${__fixture_drafts[0]}" ] || [ "${#__fixture_drafts[@]}" != 1 ]; then
-            echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)" >&2
+        FIXTURE_DIR=$__fixture_root/$__fixture_dir
+        if [ -z "${FIXTURE_NEW:-}" ]; then
+          __fixture_files=("$__fixture_root/$__fixture_dir"/*-00001-of-*.gguf)
+          if [ ! -e "${__fixture_files[0]}" ]; then
+            echo "ref-paths.sh: BLOOMERY_TIER=fixture: the family '$BLOOMERY_MODEL' has no fixture file, no $__fixture_root/$__fixture_dir/*-00001-of-*.gguf (\`fixture generate\` writes it${FIXTURE_VARIANT:+, \`just fixture-requant $BLOOMERY_MODEL $FIXTURE_VARIANT\` writes the variant file}); not running it on its real file (exit 66)" >&2
             exit 66
           fi
-          DSPARK_MODEL=${__fixture_drafts[0]}
+          if [ "${#__fixture_files[@]}" != 1 ]; then
+            echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir holds ${#__fixture_files[@]} first shards (${__fixture_files[*]}), not one (exit 66)" >&2
+            exit 66
+          fi
+          FIXTURE_FILE=${__fixture_files[0]}
+          [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_FILE
+          # A family whose fixture has a DSpark draft keeps it in a directory of its own beside the target's shards (the glob above sees
+          # the target's first shard only): the fixture tier's draft is that file, never the real draft the profile names. A caller's own
+          # BLOOMERY_DSPARK_MODEL wins, as it does in the profile (the Rust side refuses a draft that is not a whole fixture).
+          if [ "$BLOOMERY_MODEL" = deepseek41 ] && [ -z "${BLOOMERY_DSPARK_MODEL:-}" ]; then
+            __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
+            if [ ! -e "${__fixture_drafts[0]}" ] || [ "${#__fixture_drafts[@]}" != 1 ]; then
+              echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)" >&2
+              exit 66
+            fi
+            DSPARK_MODEL=${__fixture_drafts[0]}
+          fi
         fi
         ;;
     esac
-    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts
+    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts __variant_family
     ;;
   *)
     echo "ref-paths.sh: BLOOMERY_TIER is real (unset: the same) or fixture, got '${BLOOMERY_TIER}'" >&2
@@ -157,7 +198,8 @@ PY
 
 # fixture_dump_tier <script>: what a dump script (dump.sh, dump-mtp.sh) takes of the tier, before it names a set. Sets
 # SET_PREFIX: `fx_` under the fixture tier, where a set is the fixture file's and carries its real twin's name behind that
-# prefix (the fixture families of crates/refset name them), and nothing in the real tier. In the fixture tier it refuses, by
+# prefix (the fixture families of crates/refset name them), `fx_<tag>_` for a variant's (refset's fixture::variant_set_name is
+# its twin), and nothing in the real tier. In the fixture tier it refuses, by
 # name: a family whose real file stands (no fixture file, 66), and a model that is not the fixture first shard (64) — a caller's
 # own BLOOMERY_REF_MODEL wins over the fixture in ref-paths.sh above, and an `fx_` set of another file would be a wrong answer
 # under a right name. The model string is the one refset's `fixture::first_shard` returns, so the dumper's `# model` line is
@@ -173,7 +215,7 @@ fixture_dump_tier() {
     echo "$1: BLOOMERY_TIER=fixture, but the model is $MODEL, not the fixture $FIXTURE_FILE (a BLOOMERY_REF_MODEL of the caller's?): an fx_ set is the fixture file's, never another file's (exit 64)" >&2
     exit 64
   fi
-  SET_PREFIX=fx_
+  SET_PREFIX=fx_${FIXTURE_VARIANT:+${FIXTURE_VARIANT}_}
 }
 
 # fixture_line <script>: the `# fixture` header line of the fixture file, on stdout; nothing in the real tier. It is what

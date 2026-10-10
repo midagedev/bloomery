@@ -214,7 +214,7 @@ impl SiteRel {
 /// `None` for a type or an arm no launch of the GLM-5.3 and Qwen3.8 bodies reads.
 ///
 /// - ik: `gguf::quant::activation_format`'s table, the weight type's `vec_dot_type` — Q3_K,
-///   IQ3_XXS and IQ4_XS read q8_K blocks of [`QK_K`] values, Q4_K, Q5_K, Q6_K, Q8_0, Q5_1 and
+///   IQ3_S, IQ3_XXS and IQ4_XS read q8_K blocks of [`QK_K`] values, Q4_K, Q5_K, Q6_K, Q8_0, Q5_1 and
 ///   IQ4_NL q8_2 blocks of [`crate::ik_q8_2::QK`], F32 f32 — which ggml applies whatever the
 ///   column count. The iqk matmul's `is_dequant_better` changes the weight's form, not the
 ///   activation's, and only from 32 columns up (64 for Q6_K), so a batch under 32 columns runs
@@ -224,7 +224,8 @@ impl SiteRel {
 ///   f32 rows on the gemv and q8 blocks of [`Q8_32_BLOCK`] on the GEMM, F32 f32. An expert reads
 ///   q8_1 blocks of [`Q8_1_BLOCK`] under a K-quant, IQ3_XXS or IQ4_XS (the gate·up's `Q8Act` and
 ///   the grouped GEMM's `GemmAct`) and q8 blocks of [`Q8_32_BLOCK`] under Q8_0, Q5_1 or IQ4_NL
-///   (`Q8Blocks32` and `GemmAct32`). For Q5_K this differs from [`Rule::of`], which names the
+///   (`Q8Blocks32` and `GemmAct32`). An IQ3_S expert stack is read by the host tier alone, whose dot
+///   takes the q8_K blocks of [`QK_K`] values ik's takes, so ours is ik's there. For Q5_K this differs from [`Rule::of`], which names the
 ///   V4.1 gemv's f32.
 #[must_use]
 pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
@@ -233,6 +234,8 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
         | (GgmlType::IQ3_XXS | GgmlType::IQ4_XS, Arm::Expert) => Some(Q8_1_BLOCK),
         (GgmlType::Q8_0, Arm::Gemm | Arm::Expert)
         | (GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert) => Some(Q8_32_BLOCK),
+        // No card launch reads IQ3_S; the host tier reads its q8_K blocks as ik does (the same dot).
+        (GgmlType::IQ3_S, Arm::Expert) => Some(QK_K),
         (GgmlType::Q8_0, Arm::Gemv) | (GgmlType::F32, Arm::Gemv | Arm::Gemm) => None,
         _ => return None,
     };
@@ -917,6 +920,7 @@ mod site_tests {
         for ty in [GgmlType::IQ3_XXS, GgmlType::IQ4_XS] {
             assert_eq!(site_rel(ty, Arm::Expert), q(q256, q128), "{ty}");
         }
+        assert_eq!(site_rel(GgmlType::IQ3_S, Arm::Expert), q(q256, q256));
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemv), q(q32, None));
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemm), q(q32, q32));
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Expert), q(q32, q32));
@@ -926,6 +930,7 @@ mod site_tests {
         for arm in [Arm::Gemv, Arm::Gemm] {
             assert_eq!(site_rel(GgmlType::F32, arm), q(None, None));
             for ty in [
+                GgmlType::IQ3_S,
                 GgmlType::IQ3_XXS,
                 GgmlType::IQ4_XS,
                 GgmlType::Q5_1,

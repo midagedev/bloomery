@@ -1,0 +1,13 @@
+# The fixture variants (crates/model/src/fixture/variant.rs, `just fixture-requant FAMILY TAG`): a family's fixture requantized by ik's
+# llama-quantize to one type map, written to /models/fixture-variants/<tag>/<fixture dir>/, so a quant type's train gate runs on a small file.
+# tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why
+#   tag      lower-case letters and digits; BLOOMERY_FIXTURE_VARIANT=<tag> selects the variant (tools/ref/ref-paths.sh), and it joins the
+#            variant's set names (`fx_<tag>_...`) and its file name
+#   family   the architecture the fixture declares (the BLOOMERY_MODEL profile name)
+#   scope    `trunk`: every layer but the NextN one, which keeps the fixture's types
+#   map      `role=type` words, a role being the tensor name between `blk.<L>.` and `.weight`, a type ggml's name; every tensor
+#            the map does not name keeps the fixture's type and bytes
+#   recipes  the gate recipes that run on the variant: the ones whose clauses read the retyped tensors, with BLOOMERY_FIXTURE_VARIANT=<tag>
+#            in their item env (tools/gate-batch.sh)
+#   why      the file the map is the small proof of
+iq4xs	glm5next	trunk	ffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs	gate-gpu-glm5next-e2e gate-gpu-glm5next-mtp	unsloth GLM-5.3-Flash UD-IQ4_XS: routed gate and up IQ3_S, routed down IQ4_XS, every other tensor as the fixture has it; the small proof of the card-or-host routed rule and of IQ3_S on the host. gate-gpu-glm-sel is not a row: it reads no weight but indexer_compressor_ape, which the variant holds unchanged

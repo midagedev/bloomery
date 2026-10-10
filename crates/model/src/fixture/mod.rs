@@ -40,6 +40,11 @@
 //! beside its whole fixture, written once the fixture's files are in place
 //! ([`generate`]) and checked byte for byte by [`verify`].
 //!
+//! A variant of a fixture ([`variant_check`], `tools/fixture-variants.tsv`) is the fixture requantized by ik's quantizer to a type map,
+//! every other tensor kept bit for bit and the header's `bloomery.fixture.*` keys kept, with [`KEY_VARIANT`] added; it lives under the
+//! `fixture-variants/<tag>/` beside the fixture root (the box manifest keys every file under the root into
+//! every fixture-tier item) and its reference sets are named apart from the base's.
+//!
 //! A 1-D F32 tensor holds the family's constant, or, for a tensor whose
 //! elements must differ (a router's selection bias), a uniform spread
 //! ([`Family::spread_value`]); each tensor's stream is keyed by its name, so
@@ -60,6 +65,7 @@ mod fill;
 mod plan;
 mod sidecar;
 mod spec;
+mod variant;
 mod verify;
 mod write;
 
@@ -71,6 +77,11 @@ pub use sidecar::{SidecarStat, path_of as sidecar_path};
 pub use spec::{
     Budget, CardBudget, CardExperts, DraftRules, DraftSpec, Family, FixtureSpec, KeyRule, Options,
     SidecarSpec, Tables,
+};
+pub use variant::{
+    CheckStats, Retype, Row as VariantRow, Scope as VariantScope, TABLE as VARIANT_TABLE,
+    check as variant_check, custom_q as variant_custom_q, expand as variant_expand,
+    override_kv as variant_override_kv, parse_table as variant_parse_table, row as variant_row,
 };
 pub use verify::{
     Sample, VerifyStats, check_tensor, check_units, rms_within, sample_chunks, verify,
@@ -94,6 +105,9 @@ pub const KEY_CARD_BUDGET: &str = "bloomery.fixture.card_budget";
 /// String array: present only on a file that holds some of the planned
 /// tensors — their names, in file order.
 pub const KEY_SUBSET: &str = "bloomery.fixture.subset";
+/// String: the tag of the variant a file is (`variant`'s table), present only
+/// on a fixture requantized to a variant's type map.
+pub const KEY_VARIANT: &str = "bloomery.fixture.variant";
 
 /// The seed `generate` takes when none is given.
 pub const DEFAULT_SEED: u64 = 1;
@@ -174,6 +188,8 @@ pub enum FixtureError {
     },
     #[error("the fixture's {what}: {detail}")]
     Mismatch { what: String, detail: String },
+    #[error("fixture variant {tag}: {detail}")]
+    Variant { tag: String, detail: String },
     #[error("tensor {name}: block {block}: {detail}")]
     Block {
         name: String,

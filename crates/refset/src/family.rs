@@ -135,8 +135,32 @@ impl Family {
     /// The path of set `name` of this family under the data directory.
     #[must_use]
     pub fn path(&self, name: &str) -> PathBuf {
+        self.path_in(&crate::data_dir(), name)
+    }
+
+    /// The path of set `name` of this family under `data_dir`: the one place a set's name is resolved.
+    /// A fixture family's sets of a fixture variant ([`crate::fixture::variant_of`] the file the tree
+    /// runs) carry the variant's tag ([`crate::fixture::variant_set_name`]); with no fixture file to
+    /// ask, or a base fixture, the name is the family's own, and [`Family::runs`] refuses by name
+    /// what the file is not.
+    #[must_use]
+    pub fn path_in(&self, data_dir: &Path, name: &str) -> PathBuf {
         let name = self.resolve.map_or_else(|| name.to_string(), |f| f(name));
-        crate::data_dir().join(name)
+        let fixture = matches!(
+            self.identity,
+            Identity::FixtureManifest | Identity::FixtureMtpManifest
+        );
+        let variant = if fixture {
+            self.runs()
+                .ok()
+                .and_then(|file| crate::fixture::variant_of(Path::new(&file)).ok().flatten())
+        } else {
+            None
+        };
+        data_dir.join(match variant {
+            Some(tag) => crate::fixture::variant_set_name(&tag, &name),
+            None => name,
+        })
     }
 
     /// The paths of the sets in place.

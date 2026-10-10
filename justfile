@@ -617,9 +617,18 @@ dump-ref-glm5next-cuda:
 # real recipe's (step4, step4-every-node, d1k, d3k, d3kdsa, d16kdsa; deepseek41: step4-every-node, d1n-every-node,
 # d1-every-node, d2-every-node). BLOOMERY_TIER=fixture is required (in the real tier: exit 64; the real sets have their own
 # recipes). Under the CPU lease and a card (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/fxoracle-dump.card'); DUMP_DRY=1 in
-# that variable prints the dump and stops before the lease.
+# that variable prints the dump and stops before the lease. Under BLOOMERY_FIXTURE_VARIANT=<tag> (tools/fixture-variants.tsv; not the
+# VARIANT argument) the model is that fixture variant's file and the sets are fx_<tag>_<the real twin's set>, beside the base's.
 dump-ref-fixture FAMILY *VARIANT:
     BLOOMERY_MODEL={{FAMILY}} ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = fixture ] || { echo "dump-ref-fixture: this recipe needs BLOOMERY_TIER=fixture, got ${BLOOMERY_TIER:-real}; it dumps the fixture files, and the real sets have their own recipes (exit 64)" >&2; exit 64; } && bash tools/ref/dump.sh {{VARIANT}}'
+
+# The fixture variant TAG of FAMILY's fixture (tools/fixture-variants.tsv: glm5next iq4xs): the fixture requantized by ik's
+# llama-quantize to the tag's type map, every other tensor bit for bit, into /models/fixture-variants/TAG/<fixture dir>/
+# (tools/ref/fixture-requant.sh has the steps and the refusals; `fixture variant-check` holds the written file to its source;
+# an existing output is refused). The variant is then run with BLOOMERY_FIXTURE_VARIANT=TAG under BLOOMERY_TIER=fixture, and its
+# oracle sets are dumped by the recipes below under the same two variables (their sets carry the tag: fx_TAG_...).
+fixture-requant FAMILY TAG:
+    env -u BLOOMERY_FIXTURE_VARIANT BLOOMERY_MODEL={{FAMILY}} BLOOMERY_TIER=fixture ./tools/box.sh 'bash tools/ref/fixture-requant.sh {{FAMILY}} {{TAG}}'
 
 # The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
 # carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
@@ -648,7 +657,8 @@ dump-ref-mtp-qwen4exp:
 # draft file beside the fixture target (GLM's draft is the target itself). Needs dump_mtp built from this tree
 # (`just build-ref-dump-mtp`). BLOOMERY_TIER=fixture is required (in the real tier: exit 64; `just dump-ref-mtp-glm5next` and
 # `dump-ref-mtp-qwen4exp` are the real sets'). Under the CPU lease and a card, as every dump; DUMP_DRY=1 in BLOOMERY_BOX_ENV
-# prints the dump and stops before the lease.
+# prints the dump and stops before the lease. Under BLOOMERY_FIXTURE_VARIANT=<tag> the target is that fixture variant's file and the
+# set is ref-mtp/fx_<tag>_<the real twin's set>.
 dump-ref-mtp-fixture FAMILY:
     BLOOMERY_MODEL={{FAMILY}} ./tools/box.sh '[ "${BLOOMERY_TIER:-real}" = fixture ] || { echo "dump-ref-mtp-fixture: this recipe needs BLOOMERY_TIER=fixture, got ${BLOOMERY_TIER:-real}; it dumps the fixture files, and the real sets have their own recipes (exit 64)" >&2; exit 64; } && bash tools/ref/dump-mtp.sh'
 

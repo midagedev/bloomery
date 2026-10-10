@@ -1,10 +1,14 @@
 //! fixture — the gate fixture of a model file (`model::fixture`, one spec per family): print its
-//! layout, write it, or check a written one against its source.
+//! layout, write it, or check a written one against its source; and the variants of a written
+//! fixture (`model::fixture::variant`, the table `tools/fixture-variants.tsv`).
 //!
 //!     fixture plan <real first shard> [--draft <real draft>] [flags]
 //!     fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
 //!     fixture verify <fixture first shard> [--source <real first shard>]
 //!                    [--draft-source <real draft>]
+//!     fixture variant-rules <fixture first shard> --tag T [--table FILE]
+//!     fixture variant-check <variant first shard> --source <fixture first shard> --tag T
+//!                           [--table FILE]
 //!
 //! The spec is the family's whose architecture the first file declares (for `verify`, the
 //! fixture's, which is its source's); an architecture with no spec is refused by name.
@@ -18,7 +22,13 @@
 //! directory (`r8file::sidecar_path`), and a failed sidecar takes the directory down. `verify`
 //! takes the source from `--source`, else the spec's default, and checks the spec's draft fixture
 //! when it exists, against `--draft-source`, else the spec's default draft, and a whole fixture's
-//! sidecar. A flag its verb does not take, a flag given twice, `--draft-tensors` without
+//! sidecar. `variant-rules` prints what the quantizer is run with to make variant T of the fixture:
+//! a `custom-q<TAB>` line (its `--custom-q` argument, which names every tensor) and an
+//! `override-kv<TAB>` line (the tag's stamp), after the map's expansion over the fixture; it
+//! refuses a row that retypes nothing. `variant-check` holds a written variant to its source: the
+//! same header but for the tag, the same shards and shapes, the map's types, and every other
+//! tensor's bytes equal. The table is `--table`, else `tools/fixture-variants.tsv` under the
+//! working directory. A flag its verb does not take, a flag given twice, `--draft-tensors` without
 //! `--draft` and `--draft-source` with no draft fixture are refused. One line per tensor, a
 //! summary line, and exit status 1 with the error on any failure.
 
@@ -32,12 +42,15 @@ use model::arch::glm5next::fixture as glm5;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::fixture::{
     self, DEFAULT_SEED, FilePlan, FixtureSpec, Options, PlannedTensor, Sample, TensorStat,
+    VARIANT_TABLE,
 };
 use model::placement::card_budget;
 
 const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft>] [flags]
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
+       fixture variant-rules <fixture first shard> --tag T [--table FILE]
+       fixture variant-check <variant first shard> --source <fixture first shard> --tag T [--table FILE]
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...";
 
 /// Every family's spec, found by the architecture it declares.
@@ -54,6 +67,10 @@ const PLAN_FLAGS: [&str; 6] = [
 ];
 /// The flags `verify` takes.
 const VERIFY_FLAGS: [&str; 2] = ["--source", "--draft-source"];
+/// The flags `variant-rules` takes.
+const RULES_FLAGS: [&str; 2] = ["--tag", "--table"];
+/// The flags `variant-check` takes.
+const CHECK_FLAGS: [&str; 3] = ["--source", "--tag", "--table"];
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -75,6 +92,8 @@ fn run(args: &[String]) -> Res<()> {
     let takes: &[&str] = match cmd.as_str() {
         "plan" | "generate" => &PLAN_FLAGS,
         "verify" => &VERIFY_FLAGS,
+        "variant-rules" => &RULES_FLAGS,
+        "variant-check" => &CHECK_FLAGS,
         _ => return Err(USAGE.into()),
     };
     let a = Args::parse(cmd, takes, rest)?;
@@ -82,6 +101,8 @@ fn run(args: &[String]) -> Res<()> {
         ("plan", [source]) => plan(source, &a),
         ("generate", [source, out]) => generate(source, out, &a),
         ("verify", [first]) => verify(first, &a),
+        ("variant-rules", [source]) => variant_rules(source, &a),
+        ("variant-check", [variant]) => variant_check(variant, &a),
         _ => Err(USAGE.into()),
     }
 }
@@ -92,6 +113,8 @@ struct Args {
     draft: Option<String>,
     source: Option<String>,
     draft_source: Option<String>,
+    tag: Option<String>,
+    table: Option<String>,
     seed: Option<u64>,
     card_budget: Option<u64>,
     shard_bytes: Option<u64>,
@@ -107,6 +130,8 @@ impl Args {
             draft: None,
             source: None,
             draft_source: None,
+            tag: None,
+            table: None,
             seed: None,
             card_budget: None,
             shard_bytes: None,
@@ -132,6 +157,8 @@ impl Args {
                 "--draft" => a.draft = Some(value()?),
                 "--source" => a.source = Some(value()?),
                 "--draft-source" => a.draft_source = Some(value()?),
+                "--tag" => a.tag = Some(value()?),
+                "--table" => a.table = Some(value()?),
                 "--seed" => {
                     let v = value()?;
                     a.seed = Some(
@@ -440,5 +467,50 @@ fn verify(first: &str, a: &Args) -> Res<()> {
             sc.secs
         );
     }
+    Ok(())
+}
+
+/// The row of `--tag` in the table.
+fn variant_row(a: &Args) -> Res<fixture::VariantRow> {
+    let tag = a.tag.as_deref().ok_or("--tag is required")?;
+    let table = a.table.as_deref().unwrap_or(VARIANT_TABLE);
+    let text = std::fs::read_to_string(table).map_err(|e| format!("read {table}: {e}"))?;
+    Ok(fixture::variant_row(&fixture::variant_parse_table(&text)?, tag)?.clone())
+}
+
+fn variant_rules(source: &str, a: &Args) -> Res<()> {
+    let row = variant_row(a)?;
+    let split = open(source)?;
+    let retypes = fixture::variant_expand(&row, &split)?;
+    for r in &retypes {
+        eprintln!(
+            "fixture: variant {} {} {} <- {}",
+            row.tag, r.name, r.to, r.from
+        );
+    }
+    eprintln!(
+        "fixture: variant {} retypes {} of {} tensors of {source}",
+        row.tag,
+        retypes.len(),
+        split.tensor_count()
+    );
+    println!(
+        "custom-q\t{}",
+        fixture::variant_custom_q(&row.tag, &split, &retypes)?
+    );
+    println!("override-kv\t{}", fixture::variant_override_kv(&row.tag));
+    Ok(())
+}
+
+fn variant_check(variant: &str, a: &Args) -> Res<()> {
+    let row = variant_row(a)?;
+    let source = a.source.as_deref().ok_or("variant-check needs --source")?;
+    let (src, var) = (open(source)?, open(variant)?);
+    let mut line = |l: &str| println!("{l}");
+    let s = fixture::variant_check(&row, &src, &var, &mut line)?;
+    println!(
+        "fixture: variant-check done tag={} tensors={} retyped={} copied_bytes={} shards={}",
+        row.tag, s.tensors, s.retyped, s.copied_bytes, s.shards
+    );
     Ok(())
 }

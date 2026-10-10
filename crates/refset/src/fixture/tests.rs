@@ -1,6 +1,7 @@
 use super::{
-    DEFAULT_ROOT, DIRS, KEY_SUBSET, KEY_VERSION, ROOT_ENV, first_shard_in, keys, line, render,
-    root_of, with_root,
+    DEFAULT_ROOT, DIRS, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, ROOT_ENV, VARIANT_ENV, first_shard,
+    first_shard_in, keys, line, render, root_of, selected_of, variant_of, variant_root,
+    variant_set_name, with_root, with_variant,
 };
 use crate::RefError;
 use crate::arch::named;
@@ -761,5 +762,194 @@ fn an_mtp_set_of_another_generation_is_stale() -> Result<(), RefError> {
     remove(&qroot)?;
     remove(&root)?;
     remove(&other)?;
+    remove(&set)
+}
+
+/// The variant's tag is `$BLOOMERY_FIXTURE_VARIANT` (an empty value counting as unset), which moves the root to
+/// `<parent of root>/fixture-variants/<tag>` and the sets' names to `fx_<tag>_<set>`; each rule is `tools/ref/ref-paths.sh`'s, whose
+/// two lines are held here.
+#[test]
+fn a_variant_moves_the_root_and_names_its_sets() {
+    assert_eq!(selected_of(None).ok(), Some(None));
+    assert_eq!(selected_of(Some(OsString::new())).ok(), Some(None));
+    assert_eq!(
+        selected_of(Some(OsString::from("iq4xs"))).ok(),
+        Some(Some("iq4xs".to_string()))
+    );
+    for bad in ["IQ4", "a/b", "..", "a_b", "a b"] {
+        let e = selected_of(Some(OsString::from(bad)))
+            .expect_err(bad)
+            .to_string();
+        assert!(
+            e.contains(VARIANT_ENV) && e.contains("lower-case letters and digits"),
+            "{e}"
+        );
+    }
+    assert_eq!(variant_root("/m/fixtures", None), "/m/fixtures");
+    assert_eq!(
+        variant_root("/m/fixtures", Some("iq4xs")),
+        "/m/fixture-variants/iq4xs"
+    );
+    assert_eq!(
+        variant_set_name("iq4xs", "fx_ref_glm5next_d1k"),
+        "fx_iq4xs_ref_glm5next_d1k"
+    );
+    assert_eq!(
+        variant_set_name("iq4xs", "ref-mtp/fx_prose64_n64_k1"),
+        "ref-mtp/fx_iq4xs_prose64_n64_k1"
+    );
+    assert_eq!(variant_set_name("iq4xs", "ref_glm5next"), "ref_glm5next");
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/ref-paths.sh");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let has = |want: &str| text.lines().any(|l| l.trim() == want);
+    assert!(
+        has("__fixture_root=${__fixture_root%/*}/fixture-variants/$FIXTURE_VARIANT"),
+        "the shell's variant root is not `<parent of root>/fixture-variants/<tag>`"
+    );
+    assert!(
+        has("SET_PREFIX=fx_${FIXTURE_VARIANT:+${FIXTURE_VARIANT}_}"),
+        "the shell's set prefix is not `fx_<tag>_`"
+    );
+    assert!(
+        has("FIXTURE_VARIANT=${BLOOMERY_FIXTURE_VARIANT:-}")
+            && VARIANT_ENV == "BLOOMERY_FIXTURE_VARIANT",
+        "the shell reads another variable than refset"
+    );
+}
+
+/// The file a variant's tag selects is under `<parent of root>/fixture-variants/<tag>` and says so in its header; a file that
+/// does not say it, or says it with no tag selected, is refused naming both.
+#[test]
+fn a_variant_file_is_found_under_its_root_and_says_so() -> Result<(), RefError> {
+    let top = temp("variant-file")?;
+    let root = top.join("fixtures");
+    let base = root_with(&root, "glm5next", &fixture_kvs(1))?;
+    let mut with_key = fixture_kvs(1);
+    with_key.push(kv(KEY_VARIANT, Value::String("iq4xs".to_string())));
+    let variants = top.join("fixture-variants/iq4xs");
+    let var = root_with(&variants, "glm5next", &with_key)?;
+    assert_eq!(variant_of(Path::new(&base))?, None);
+    assert_eq!(variant_of(Path::new(&var))?.as_deref(), Some("iq4xs"));
+
+    let first = |arch: &str| with_root(&root, || first_shard(arch));
+    assert_eq!(first("glm5next")?, base);
+    let var_first = with_root(&root, || with_variant("iq4xs", || first_shard("glm5next")))?;
+    assert_eq!(var_first, var);
+    assert!(
+        var.starts_with(&format!("{}/fixture-variants/iq4xs/", top.display())),
+        "{var}"
+    );
+
+    // The tag selects a file that does not carry it.
+    let bare_top = temp("variant-bare")?;
+    let bare = bare_top.join("fixtures");
+    root_with(
+        &bare_top.join("fixture-variants/iq4xs"),
+        "glm5next",
+        &fixture_kvs(1),
+    )?;
+    let e = with_root(&bare, || with_variant("iq4xs", || first_shard("glm5next")))
+        .expect_err("a variant file with no key")
+        .to_string();
+    assert!(
+        e.contains(VARIANT_ENV) && e.contains("\"iq4xs\"") && e.contains("none"),
+        "{e}"
+    );
+    // A file that carries a tag, with none selected.
+    let keyed = temp("variant-keyed")?;
+    root_with(&keyed, "glm5next", &with_key)?;
+    let e = with_root(&keyed, || first_shard("glm5next"))
+        .expect_err("a keyed file, no tag")
+        .to_string();
+    assert!(e.contains("selects none") && e.contains("\"iq4xs\""), "{e}");
+    // A tag whose directory is not there is the missing directory.
+    let e = with_root(&root, || with_variant("other", || first_shard("glm5next")))
+        .expect_err("another tag")
+        .to_string();
+    assert!(e.contains("fixture-variants/other/glm5next"), "{e}");
+
+    remove(&top)?;
+    remove(&bare_top)?;
+    remove(&keyed)
+}
+
+/// A fixture family resolves a set's name at one place: the base name on a base fixture, `fx_<tag>_` on a
+/// variant's. A set dumped from one file is stale for the other, at either name, by `# model` first.
+#[test]
+fn a_variants_sets_are_named_and_checked_apart_from_the_bases() -> Result<(), RefError> {
+    let top = temp("variant-sets")?;
+    let root = top.join("fixtures");
+    let data = temp("variant-data")?;
+    let u = under("fx-ik-glm5next", "ik-glm5next")?;
+    let mut with_key = fixture_kvs(1);
+    with_key.push(kv(KEY_VARIANT, Value::String("iq4xs".to_string())));
+    let base = root_with(&root, u.arch, &fixture_kvs(1))?;
+    let var = root_with(&top.join("fixture-variants/iq4xs"), u.arch, &with_key)?;
+    let (base_line, var_line) = (line(Path::new(&base))?, line(Path::new(&var))?);
+    assert!(
+        var_line.contains("bloomery.fixture.variant=iq4xs"),
+        "{var_line}"
+    );
+    assert!(!base_line.contains("variant"), "{base_line}");
+
+    let in_base = |set: &str| with_root(&root, || u.family.path_in(&data, set));
+    let in_var = |set: &str| {
+        with_root(&root, || {
+            with_variant("iq4xs", || u.family.path_in(&data, set))
+        })
+    };
+    assert_eq!(in_base("fx_ref_glm5next"), data.join("fx_ref_glm5next"));
+    assert_eq!(
+        in_var("fx_ref_glm5next"),
+        data.join("fx_iq4xs_ref_glm5next")
+    );
+    assert_eq!(
+        in_var("fx_ref_glm5next_step4"),
+        data.join("fx_iq4xs_ref_glm5next_step4")
+    );
+    // No fixture file to ask: the family's own name, and runs() refuses by name.
+    let none = temp("variant-none")?;
+    assert_eq!(
+        with_root(&none, || with_variant("iq4xs", || u
+            .family
+            .path_in(&data, "fx_ref_glm5next"))),
+        data.join("fx_ref_glm5next")
+    );
+
+    let set = temp("variant-set")?;
+    // The variant's own set passes under the variant, and is stale under the base fixture.
+    write_node_set(&set, u.arch, &var, Some(body(&var_line)), u.build, true);
+    let under_var =
+        |set: &Path| with_root(&root, || with_variant("iq4xs", || u.family.check_set(set)));
+    assert_eq!(under_var(&set)?.dumped_from, var);
+    let e = open(u.family, &root, &set).expect_err("a variant set under the base fixture");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    let e = e.to_string();
+    assert!(
+        e.contains(&format!("dumped from {var}")) && e.contains(&format!("the tree runs {base}")),
+        "{e}"
+    );
+    // The base's set under the variant: stale on the model file, not on the fixture line.
+    write_node_set(&set, u.arch, &base, Some(body(&base_line)), u.build, true);
+    let e = under_var(&set).expect_err("a base set under the variant");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    let e = e.to_string();
+    assert!(
+        e.contains(&format!("dumped from {base}")) && e.contains(&format!("the tree runs {var}")),
+        "{e}"
+    );
+    // The variant's file with the base's fixture line: the line is what differs.
+    write_node_set(&set, u.arch, &var, Some(body(&base_line)), u.build, true);
+    let e = under_var(&set).expect_err("the base's fixture line");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    assert!(
+        e.to_string().contains("bloomery.fixture.variant=iq4xs"),
+        "{e}"
+    );
+
+    remove(&top)?;
+    remove(&data)?;
+    remove(&none)?;
     remove(&set)
 }

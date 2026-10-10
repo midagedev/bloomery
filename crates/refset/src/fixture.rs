@@ -13,6 +13,14 @@
 //! The path owner is [`first_shard`], the twin of `tools/ref/ref-paths.sh`'s
 //! fixture table: the string it returns is the one the dumper is given, so it
 //! is the one a set's `# model` states.
+//!
+//! A fixture variant is the fixture requantized to a type map
+//! (`tools/fixture-variants.tsv`): `$BLOOMERY_FIXTURE_VARIANT` moves the root to
+//! `<parent of root>/fixture-variants/<tag>` ([`root`]), the file's `bloomery.fixture.variant`
+//! key names the tag, and a variant's sets carry it in their names
+//! ([`variant_set_name`]), so a base set and a variant's never share a path. The
+//! key is part of the `# fixture` line, so a set dumped from one is stale for the
+//! other twice over: by `# model` and by `# fixture`.
 
 use crate::RefError;
 use gguf::{Gguf, LoadError, Value};
@@ -23,6 +31,9 @@ use std::path::{Path, PathBuf};
 pub const ROOT_ENV: &str = "BLOOMERY_FIXTURE_ROOT";
 /// The fixture root when [`ROOT_ENV`] is unset or empty.
 pub const DEFAULT_ROOT: &str = "/models/fixtures";
+/// The variable that selects a fixture variant: a tag of `tools/fixture-variants.tsv`, whose files
+/// live under `<parent of root>/fixture-variants/<tag>`, beside the fixture root and not under it.
+pub const VARIANT_ENV: &str = "BLOOMERY_FIXTURE_VARIANT";
 
 /// What opens a set's `# fixture` line, tab included: the line is this and
 /// [`keys`].
@@ -44,10 +55,13 @@ const KEY_VERSION: &str = "bloomery.fixture.version";
 /// String array: present only on a file that holds some of the planned
 /// tensors.
 const KEY_SUBSET: &str = "bloomery.fixture.subset";
+/// String: the tag of the variant a file is; present only on a requantized fixture.
+const KEY_VARIANT: &str = "bloomery.fixture.variant";
 
 #[cfg(test)]
 thread_local! {
     static TEST_ROOT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static TEST_VARIANT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with [`root`] answering `root` on this thread only: a test's
@@ -66,14 +80,119 @@ pub(crate) fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Run `f` with [`selected`] answering `tag` on this thread only, as [`with_root`] does the root.
+#[cfg(test)]
+pub(crate) fn with_variant<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_VARIANT.with(|r| *r.borrow_mut() = None);
+        }
+    }
+    TEST_VARIANT.with(|r| *r.borrow_mut() = Some(tag.to_string()));
+    let _reset = Reset;
+    f()
+}
+
 /// The fixture root as the shell takes it: `$BLOOMERY_FIXTURE_ROOT`, with an
-/// empty value counting as unset; [`DEFAULT_ROOT`] otherwise.
+/// empty value counting as unset, [`DEFAULT_ROOT`] otherwise; for a selected
+/// variant ([`selected`]) `fixture-variants/<tag>` beside that root.
 pub fn root() -> Result<String, RefError> {
     #[cfg(test)]
-    if let Some(root) = TEST_ROOT.with(|r| r.borrow().clone()) {
-        return Ok(root);
+    let base = match TEST_ROOT.with(|r| r.borrow().clone()) {
+        Some(root) => Ok(root),
+        None => root_of(std::env::var_os(ROOT_ENV)),
+    };
+    #[cfg(not(test))]
+    let base = root_of(std::env::var_os(ROOT_ENV));
+    Ok(variant_root(&base?, selected()?.as_deref()))
+}
+
+/// `base` for no variant, `<parent of base>/fixture-variants/<tag>` for one: the shell's
+/// `__fixture_root=${__fixture_root%/*}/fixture-variants/$FIXTURE_VARIANT`. The variants sit beside the
+/// fixture root because the box manifest keys every file under the root into every fixture-tier item.
+fn variant_root(base: &str, variant: Option<&str>) -> String {
+    match variant {
+        None => base.to_string(),
+        Some(tag) => {
+            let parent = base.rsplit_once('/').map_or(base, |(parent, _)| parent);
+            format!("{parent}/fixture-variants/{tag}")
+        }
     }
-    root_of(std::env::var_os(ROOT_ENV))
+}
+
+/// The variant `$BLOOMERY_FIXTURE_VARIANT` selects, an empty value counting as unset.
+///
+/// # Errors
+/// A value that is not UTF-8 or not lower-case letters and digits, which no tag of the table is.
+pub fn selected() -> Result<Option<String>, RefError> {
+    #[cfg(test)]
+    if let Some(tag) = TEST_VARIANT.with(|r| r.borrow().clone()) {
+        return Ok(Some(tag));
+    }
+    selected_of(std::env::var_os(VARIANT_ENV))
+}
+
+/// [`selected`] over the variable's value.
+fn selected_of(var: Option<OsString>) -> Result<Option<String>, RefError> {
+    let bad = |why: String| RefError::malformed(VARIANT_ENV.to_string(), why);
+    match var {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) => {
+            let tag = v
+                .into_string()
+                .map_err(|v| bad(format!("{v:?} is not UTF-8")))?;
+            if tag
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            {
+                Ok(Some(tag))
+            } else {
+                Err(bad(format!(
+                    "{tag:?} is not a tag of tools/fixture-variants.tsv (lower-case letters and digits)"
+                )))
+            }
+        }
+    }
+}
+
+/// The name of a fixture set `base` (`fx_<set>`, or `ref-mtp/fx_<set>` for an MTP set) of the variant `tag`: `fx_<tag>_<set>`,
+/// so no variant's set shares a path with the base's or another variant's. The shell's `SET_PREFIX` is `fx_<tag>_`.
+#[must_use]
+pub fn variant_set_name(tag: &str, base: &str) -> String {
+    if let Some(set) = base.strip_prefix("fx_") {
+        format!("fx_{tag}_{set}")
+    } else if let Some(set) = base.strip_prefix("ref-mtp/fx_") {
+        format!("ref-mtp/fx_{tag}_{set}")
+    } else {
+        base.to_string()
+    }
+}
+
+/// The variant the fixture file `first_shard` is: its `bloomery.fixture.variant` key, none on a base fixture.
+///
+/// # Errors
+/// A file that is not a readable GGUF header, or a key that is not a string.
+pub fn variant_of(first_shard: &Path) -> Result<Option<String>, RefError> {
+    let file = first_shard.display().to_string();
+    let g = Gguf::open(first_shard).map_err(|e| match e {
+        LoadError::Io(io) => {
+            RefError::missing(first_shard, format!("fixture: cannot open {file}: {io}"))
+        }
+        e => RefError::malformed(
+            format!("fixture: {file}"),
+            format!("not a readable GGUF header: {e}"),
+        ),
+    })?;
+    match g.value(KEY_VARIANT) {
+        None => Ok(None),
+        Some(Value::String(tag)) => Ok(Some(tag.clone())),
+        Some(other) => Err(RefError::malformed(
+            format!("fixture: {file}"),
+            format!("{KEY_VARIANT} is {other:?}, not a string"),
+        )),
+    }
 }
 
 /// [`root`] over the variable's value.
@@ -94,7 +213,23 @@ fn root_of(var: Option<OsString>) -> Result<String, RefError> {
 /// first shard, `<root>/<dir>/<file>` joined as the shell joins it. See
 /// [`first_shard_in`].
 pub fn first_shard(arch: &str) -> Result<String, RefError> {
-    first_shard_in(&root()?, arch)
+    let first = first_shard_in(&root()?, arch)?;
+    let (wants, has) = (selected()?, variant_of(Path::new(&first))?);
+    if wants == has {
+        return Ok(first);
+    }
+    let show = |v: &Option<String>| {
+        v.as_deref()
+            .map_or("none".to_string(), |t| format!("{t:?}"))
+    };
+    Err(RefError::malformed(
+        format!("fixture: {first}"),
+        format!(
+            "{VARIANT_ENV} selects {}, and the file's {KEY_VARIANT} is {}",
+            show(&wants),
+            show(&has)
+        ),
+    ))
 }
 
 /// The fixture file of `arch` under `root`: the one file of the architecture's
