@@ -79,7 +79,7 @@ use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
 use crate::model::{
-    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots, block_count,
+    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
@@ -1060,6 +1060,14 @@ fn ffn_dims(spec: &ModelSpec) -> Result<(Option<super::router::RouterDims>, usiz
     }
 }
 
+/// The layers a load of `file` runs: its trunk, the blocks before the
+/// next-token layers its header declares (read as unused).
+fn trunk_count(file: &Split, what: &'static str) -> Result<usize, GpuError> {
+    let hp = model::arch::qwen35moe::hparams::Hparams::read(file)
+        .map_err(|e| GpuError::plan(what, e))?;
+    Ok(hp.n_trunk)
+}
+
 impl GpuModel<Body35> {
     /// The whole Qwen3.6 model of `file` resident on `gpu`, plus the output
     /// head, with caches of `o.ctx` rows, the decode flash `o.mma` (the
@@ -1068,13 +1076,13 @@ impl GpuModel<Body35> {
     /// type no launch reads refused by name before any upload. The model
     /// takes the file.
     pub fn open(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        let n_layers = block_count(&file, "qwen35moe GpuModel::open")?;
+        let n_layers = trunk_count(&file, "qwen35moe GpuModel::open")?;
         let pre = Pre35::read(&file, o)?;
         if pre.layers.len() != n_layers {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "the description holds {} layers, the file's block count {n_layers}",
+                    "the description holds {} layers, the file's trunk {n_layers}",
                     pre.layers.len()
                 ),
             ));
@@ -1136,7 +1144,7 @@ impl GpuModel<Body35> {
         const WHAT_P: &str = "qwen35moe GpuModel::open_placed";
         let asked = o.ubatch;
         let o = placed_open(o);
-        let n_layers = block_count(&file, WHAT_P)?;
+        let n_layers = trunk_count(&file, WHAT_P)?;
         if u64::try_from(o.ctx).ok() != Some(plan.ctx_max) {
             return Err(GpuError::shape(
                 WHAT_P,
@@ -1151,7 +1159,7 @@ impl GpuModel<Body35> {
             return Err(GpuError::shape(
                 WHAT_P,
                 format!(
-                    "the description holds {} layers, the file's block count {n_layers}",
+                    "the description holds {} layers, the file's trunk {n_layers}",
                     pre.layers.len()
                 ),
             ));
