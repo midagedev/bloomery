@@ -14,8 +14,8 @@
 # 타이밍 카드임(모두 경쟁이지 게이트 실패가 아니다), 70 = 카드를 강제했는데 임대를 테스트할 수 없음, 64 = 사용법, 2 = 바이너리 없음,
 # 69 = 게이트 락이나 V4.1 적재 락 파일을 열 수 없음(박스의 root 셸이 아님).
 # `--self-test`: 카드 고르기, 임대 거절, V4.1 적재 락을 임시 디렉터리의 락·임대 파일과 가짜 nvidia-smi로 시험한다(리눅스,
-# flock과 timeout이 필요하다 — 맥에는 없다). 시험만 쓰는 첫 인자 `--test-locks DIR`이 세 락과 배치 홀드 파일(batch.gpuhold)을 DIR 아래로 옮기고
-# V4.1 적재 락의 상한을 6초로, 카드 락의 상한을 4초로, 폴링을 1초로 줄인다. GATE_TEST_CAP=<초> (the self-test's helper waiters only): both bounds become that safety cap.
+# flock과 timeout이 필요하다 — 맥에는 없다). 시험만 쓰는 첫 인자 `--test-locks DIR`이 세 락과 배치 홀드 파일(batch.gpuhold), V4.1 적재 큐(v41-queue.d, v41-queue.seq)를 DIR 아래로 옮기고
+# V4.1 적재 락의 상한을 6초로, 카드 락의 상한을 4초로, 폴링을 1초로 줄인다. GATE_TEST_CAP=<초> (the self-test's helper waiters only): both bounds become that safety cap; GATE_TEST_PACE=<FIFO prefix> (the self-test's paced loaders only): each poll rests until the test grants the next one.
 # 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버), BLOOMERY_GATE_CARD(아래 카드 고르기),
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
 # BLOOMERY_BATCH_OWNER(letters, digits, _: the owner of the batch hold this run's batch put up — the batch hold paragraph below).
@@ -27,9 +27,38 @@
 # out of each other's page cache, and a fixture's host set is a few GB. The request alone does not skip it: a fixture tier whose
 # model is not the resolved fixture file (a caller's own BLOOMERY_REF_MODEL, a family the tier left on its real file) takes the
 # lock as a real load does, and says so. A fixture run does not open the lock file at all. Any other BLOOMERY_TIER value is 64.
-# Locks. A run takes its card lock(s) and, when it loads, the V4.1 load lock TOGETHER: each poll tries every lock it needs
-# without blocking, and a run that got the card but not the load lock lets the card go before it sleeps, so a loader queued behind
-# another load holds no card — an `any` gate takes it. Nothing waits while holding a lock, except the two-card order below.
+# Locks. A run takes its card lock(s) and, when it loads, the V4.1 load lock: the loaders are served in arrival order (the queue
+# below), the head takes the load lock first and then its card(s), and every other run takes no card while it waits for a card or the
+# lock, so an `any` gate takes a card a queued loader would have held. Nothing waits while holding a lock except the head (the load
+# lock, for a card) and the two-card order (the 3090's lock, for the A6000's).
+# The V4.1 load queue. A run that loads V4.1 (BLOOMERY_GATE_V41_LOAD=1 and a real tier; a fixture load takes no ticket, as it takes
+# no lock) writes a ticket into /root/bloomery-v41-queue.d/ before its first poll and removes it once it holds the load lock and its
+# card(s), and on every exit (a trap; a run killed outright leaves a ticket the next reader removes). The name is `<class>-<seq>-<pid>`:
+# class from BLOOMERY_V41_CLASS (1 the lead's landing batch, 2 round gates, the default, 3 sittings, 4 idle fill; any other value is 64),
+# seq ten digits from /root/bloomery-v41-queue.seq, read and incremented under a short flock, the ticket written inside it so that no
+# lower seq is ever missing from the directory while a higher one is there. The content is one line, `owner=<BLOOMERY_BATCH_OWNER or the
+# remote dir's basename> pid=<pid> start=<field 22 of /proc/<pid>/stat> since=<epoch> cards=<3090|a6000|both|any> item=<the binary and
+# its args, up to ` tier=`> tier=real pred_s=<BLOOMERY_V41_PRED_S, the calling recipe's median wall in seconds, or ->`. The order key is
+# (class, seq), ascending; the batch hold below stays above every class, and nothing preempts a holder. A ticket is live while the
+# process's start time equals its start= (a reused pid does not keep one alive); any reader removes a dead ticket and says so once on
+# stderr. Only the head live ticket tries a lock: a run behind it takes no card and no load lock, each poll it only re-reads the queue.
+# A ticket a fresh batch hold holds back (its owner is not the hold's) is not counted: such a run waits under the hold and takes nothing,
+# so as head it would stall the batch's own loaders, which pass the hold; and a head that holds the load lock when a hold goes up lets
+# it go at its next poll and queues again at its place. `gpu-gate.sh --v41-queue` prints the live tickets in order and their age (a read: box.sh runs it
+# under BLOOMERY_BOX_READONLY=1), removing a dead one it finds. Paths: V41_QDIR, V41_SEQ (--test-locks moves them with the locks).
+# Lock order, checked path by path: the load lock (7) is taken before a card lock (3090: 9, A6000: 8), a card lock never before it, and the
+# 3090's before the A6000's. Every blocking wait goes from a lower lock to a higher one, so none waits in a cycle:
+#   - the head loader holds 7 and waits for a card: a one-card or `any` run by non-blocking tries each poll, `both` by take_both's
+#     blocking flock on 9, then, holding 9, on 8. No holder of a card waits for 7: a loader takes 7 before any card; the one other order
+#     is an older copy of this script on another track (card first, then a non-blocking `flock -n 7`, which drops the card at once).
+#   - a non-loader gate, a one-card or `any` loader's polls (a try that wins one card stops there; `any` frees the A6000 it found busy before
+#     it tries the 3090) and the fixture tier hold one card at most and never wait while holding it. take_both is the only run that waits
+#     holding a card lock (9, for 8), and nothing waits for 7 while holding 9 or 8.
+#   - tools/ref/dump-draft.sh and tools/ref/vision/dump-vision.sh wait on the 3090's lock (blocking, holding nothing) and take no load lock.
+#   - the loader's binary inherits the three descriptors and takes no gate lock or load lock; BLOOMERY_HOST_LOCK locks pages, not a file.
+#   - a non-head waiter and a run under the batch hold wait holding nothing. A head that polls for its card drops 7 at the next poll when a
+#     hold goes up. A `both` head is inside take_both's blocking flock and reads the hold only after it, so the batch's own loaders can wait
+#     behind it for up to CARD_BOUND: a cost, not a cycle (the head's wait ends when the cards are released).
 # The batch hold. While the lead's landing batch (tools/gate-batch.sh --ledger) runs, the file /root/bloomery-batch.gpuhold is up on
 # the box: `owner=<id> since=<epoch>`, its mtime refreshed by the batch's heartbeat. A run whose BLOOMERY_BATCH_OWNER (which the
 # batch puts in each of its items' box env) is not that owner WAITS at the top of every poll — before the V4.1 load lock, before any
@@ -48,6 +77,7 @@ set -uo pipefail
 GATE_LOCK=/root/bloomery-gate.lock A6000_LOCK=/root/bloomery-gate-a6000.lock
 V41_LOCK=/root/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
 GPU_HOLD=/root/bloomery-batch.gpuhold HOLD_STALE=300
+V41_QDIR=/root/bloomery-v41-queue.d V41_SEQ=/root/bloomery-v41-queue.seq PACE=''
 # shellcheck source=tools/ref/lease-probe.sh
 source "${BASH_SOURCE[0]%/*}/ref/lease-probe.sh"
 
@@ -149,10 +179,164 @@ gpuhold() {
   esac
 }
 
+# The V4.1 load queue (the header). Q_NAME[i] is the ticket's file name, Q_LINE[i] its line and Q_OWNER[i] its owner, in key order.
+Q_NAME=() Q_LINE=() Q_OWNER=() Q_N=0 Q_POS=0 Q_HEAD_ITEM='' Q_HEAD_OWNER='' Q_HEAD_SINCE='' TICKET='' TV='' PID_START=''
+
+# pid_start <pid>: PID_START is the process's start time as a ticket's `start=` holds it (/proc/<pid>/stat field 22), empty when the
+# process is gone or a zombie. Without /proc (the Mac, where the self-test runs) the `ps` start time stands in, its spaces dropped.
+pid_start() {
+  local line rest f
+  PID_START=
+  if [ -d /proc/self ]; then
+    IFS= read -r line 2> /dev/null < "/proc/$1/stat" || return 0
+    rest=${line##*) }
+    read -r -a f <<< "$rest"
+    [ "${f[0]:-Z}" != Z ] || return 0
+    PID_START=${f[19]:-}
+  else
+    PID_START=$(ps -o lstart= -p "$1" 2> /dev/null | tr -d ' ') || PID_START=
+  fi
+}
+
+# tget <ticket line> <key>: TV is the key's value (up to the next space), empty when the line has no such key.
+tget() {
+  local r=" $1"
+  TV=
+  case $r in *" $2="*) r=${r#*" $2="}; TV=${r%% *} ;; esac
+}
+
+# v41_queue_read: removes the dead tickets (once each, on stderr) and fills Q_NAME, Q_LINE and Q_OWNER with the live ones in key
+# order. The class digit and the zero-padded seq make the C-locale glob order the key order.
+v41_queue_read() {
+  local LC_ALL=C f name line pid start why
+  Q_NAME=() Q_LINE=() Q_OWNER=()
+  for f in "$V41_QDIR"/[1-4]-*; do
+    [ -f "$f" ] || continue
+    name=${f##*/}
+    line=
+    IFS= read -r line 2> /dev/null < "$f" || [ -e "$f" ] || continue
+    tget "$line" pid
+    pid=$TV
+    tget "$line" start
+    start=$TV
+    why=
+    case $pid in '' | *[!0-9]*) why="no valid pid in it" ;; esac
+    if [ -z "$why" ]; then
+      pid_start "$pid"
+      if [ -z "$PID_START" ]; then
+        why="pid $pid is gone"
+      elif [ "$PID_START" != "$start" ]; then
+        why="pid $pid is another process now (start $PID_START, the ticket's $start)"
+      fi
+    fi
+    if [ -n "$why" ]; then
+      rm "$f" 2> /dev/null && echo "gpu-gate.sh: removed the dead V4.1 queue ticket $name ($why)" >&2
+      continue
+    fi
+    tget "$line" owner
+    Q_NAME+=("$name")
+    Q_LINE+=("$line")
+    Q_OWNER+=("${TV:-?}")
+  done
+}
+
+# v41_standing <ticket name>: reads the queue (batch_hold_read has just run: HOLD_STATE, HOLD_OWNER) and sets Q_N, the live tickets a fresh
+# hold of another owner does not hold back, Q_POS, the named ticket's place among them (0: it is not there) and the head's item, owner
+# and since. Returns 0 when the named ticket is the head.
+v41_standing() {
+  local i
+  v41_queue_read
+  Q_N=0 Q_POS=0 Q_HEAD_ITEM='' Q_HEAD_OWNER='' Q_HEAD_SINCE=''
+  for ((i = 0; i < ${#Q_NAME[@]}; i++)); do
+    if [ "$HOLD_STATE" = up ] && [ "${Q_OWNER[$i]}" != "$HOLD_OWNER" ]; then continue; fi
+    Q_N=$((Q_N + 1))
+    if [ "$Q_N" = 1 ]; then
+      Q_HEAD_OWNER=${Q_OWNER[$i]}
+      tget "${Q_LINE[$i]}" since
+      Q_HEAD_SINCE=$TV
+      Q_HEAD_ITEM=${Q_LINE[$i]#*" item="}
+      Q_HEAD_ITEM=${Q_HEAD_ITEM% tier=*}
+    fi
+    [ "${Q_NAME[$i]}" != "$1" ] || Q_POS=$Q_N
+  done
+  [ "$Q_POS" = 1 ]
+}
+
+# queued_say: the queue line, on arrival and once a minute.
+queued_say() {
+  local age='?'
+  case $Q_HEAD_SINCE in '' | *[!0-9]*) ;; *) age=$(($(date +%s) - Q_HEAD_SINCE)) ;; esac
+  echo "gpu-gate.sh: $NAME queued at $Q_POS of $Q_N for the V4.1 load lock (head: $Q_HEAD_ITEM $Q_HEAD_OWNER, $age s)" >&2
+}
+
+# v41_queue_view: `gpu-gate.sh --v41-queue`, the live tickets in order, one line each with the ticket's age.
+v41_queue_view() {
+  local i now age
+  v41_queue_read
+  now=$(date +%s)
+  for ((i = 0; i < ${#Q_NAME[@]}; i++)); do
+    tget "${Q_LINE[$i]}" since
+    age='?'
+    case $TV in '' | *[!0-9]*) ;; *) age=$((now - TV)) ;; esac
+    echo "${Q_NAME[$i]} ${Q_LINE[$i]} age=$age"
+  done
+}
+
+# ticket_write: this run's ticket, TICKET its path. The seq and the file are written inside one flock on the seq file, the file by a
+# rename, so a reader sees a whole line and never a lower seq missing beside a higher one.
+ticket_write() {
+  local start owner item name
+  pid_start "$$"
+  start=$PID_START
+  [ -n "$start" ] || { echo "gpu-gate.sh: cannot read this run's start time (pid $$) for its V4.1 queue ticket" >&2; exit 69; }
+  owner=${BLOOMERY_BATCH_OWNER:-${PWD##*/}}
+  owner=${owner//[^A-Za-z0-9._-]/_}
+  item="$NAME${*:+ $*}"
+  item=${item//[$'\n\r\t']/ }
+  mkdir -p "$V41_QDIR" 2> /dev/null || { echo "gpu-gate.sh: cannot create $V41_QDIR — the gate runs on the box, as root" >&2; exit 69; }
+  TICKET=$(
+    {
+      flock -x 10 || exit 1
+      seq=
+      IFS= read -r seq 2> /dev/null < "$V41_SEQ" || true
+      if [[ $seq == *[!0-9]* ]]; then echo "gpu-gate.sh: $V41_SEQ holds '$seq', not a number" >&2; exit 1; fi
+      seq=$((10#${seq:-0} + 1))
+      printf '%s\n' "$seq" > "$V41_SEQ" || exit 1
+      printf -v name '%s-%010d-%s' "$CLASS" "$seq" "$$"
+      printf 'owner=%s pid=%s start=%s since=%s cards=%s item=%s tier=real pred_s=%s\n' "${owner:-?}" "$$" "$start" "$(date +%s)" "$CARD" "$item" "$PRED" \
+        > "$V41_QDIR/.new.$$" && mv "$V41_QDIR/.new.$$" "$V41_QDIR/$name" || exit 1
+      echo "$V41_QDIR/$name"
+    } 10>> "$V41_SEQ"
+  ) || { echo "gpu-gate.sh: cannot write a ticket under $V41_QDIR (above) — the gate runs on the box, as root" >&2; exit 69; }
+}
+
+# ticket_drop: removes this run's ticket.
+ticket_drop() {
+  [ -z "$TICKET" ] || rm -f "$TICKET"
+  TICKET=
+}
+
+# on_exit: the EXIT trap of a V4.1 loader. In the self-test a paced loader (PACE) ends with one more line on its ack FIFO.
+on_exit() {
+  ticket_drop
+  [ -z "$PACE" ] || echo exit > "$PACE.ack"
+}
+
+# pace: what a poll rests with: POLL seconds of sleep. A paced loader (the self-test's, PACE=<FIFO prefix>) writes `polled` to
+# <prefix>.ack and rests until the test writes a line to <prefix>.go, so the test, not the clock, decides when it polls next.
+pace() {
+  if [ -n "$PACE" ]; then
+    echo polled > "$PACE.ack"
+    read -r _ < "$PACE.go" || true
+  else
+    sleep "$POLL"
+  fi
+}
+
 # The runner's own tests: each case runs this script with --test-locks <tmp> (the three locks under <tmp>,
 # the V4.1 load lock's bound 6 s, the card locks' 4 s, the polls 1 s), BLOOMERY_LEASE_LOCK at a file the test holds or not, a stub
-# nvidia-smi on PATH (two cards, no compute process) and a stub target/release/ok that, when asked (STUB_READY, STUB_HOLD), says it is
-# running and holds until the test releases it. Concurrent runs are started with & and waited for by their $!. One line per case;
+# nvidia-smi on PATH (two cards, no compute process) and a stub target/release/ok that, when asked (STUB_READY, STUB_ORDER, STUB_HOLD), says it is
+# running, appends its STUB_ID to a marker file and holds until the test releases it. Concurrent runs are started with & and waited for by their $!. One line per case;
 # exit 0 iff none failed.
 self_test() {
   local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc cap=50
@@ -168,7 +352,8 @@ self_test() {
     '  *query-gpu=name,uuid*) printf "NVIDIA GeForce RTX 3090, GPU-11111111-1111-1111-1111-111111111111\nNVIDIA RTX A6000, GPU-00000000-0000-0000-0000-000000000000\n" ;;' \
     '  *query-gpu=*) printf "GPU-11111111-1111-1111-1111-111111111111, NVIDIA GeForce RTX 3090\nGPU-00000000-0000-0000-0000-000000000000, NVIDIA RTX A6000\n" ;;' \
     'esac' > "$t/bin/nvidia-smi"
-  printf '%s\n' '#!/bin/sh' '[ -z "${STUB_READY:-}" ] || echo up > "$STUB_READY"' '[ -z "${STUB_HOLD:-}" ] || read -r _ < "$STUB_HOLD"' \
+  printf '%s\n' '#!/bin/sh' '[ -z "${STUB_READY:-}" ] || echo up > "$STUB_READY"' '[ -z "${STUB_ORDER:-}" ] || echo "${STUB_ID:-?}" >> "$STUB_ORDER"' \
+    '[ -z "${STUB_HOLD:-}" ] || read -r _ < "$STUB_HOLD"' \
     'echo "ran on $CUDA_VISIBLE_DEVICES"' > "$t/tree/target/release/ok"
   chmod +x "$t/bin/nvidia-smi" "$t/tree/target/release/ok"
   # Where util-linux flock or coreutils timeout is missing (the Mac), stand-ins for the forms this runner
@@ -225,7 +410,8 @@ PY
     shift 3
     # Under a bound of its own: a runner that hangs ends the case red (124), it does not hang the check.
     (cd "$t/tree" && timeout --kill-after=5 60 env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES \
-      -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER \
+      -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S \
+      -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID \
       PATH="$t/bin:$PATH" BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
       bash "$self" --test-locks "${TL:-$t}" ok) > "$o" 2>&1
   }
@@ -240,6 +426,26 @@ PY
     else
       bad=$((bad + 1))
       echo "FAIL $1: $(helper_cap)rc $2 (want $3), /$4/${5:+, not /$5/}"
+      printf '%s\n' "$out" | sed 's/^/    | /'
+    fi
+  }
+  # judge_all <name> <rc> <want rc> <ERE>…: every ERE must match a line of the output ($t/out), and one that starts with ! must match none.
+  judge_all() {
+    local name=$1 got=$2 want=$3 pat miss=
+    shift 3
+    n=$((n + 1))
+    out=$(cat "$t/out")
+    for pat in "$@"; do
+      case $pat in
+        '!'*) ! grep -Eq -- "${pat#!}" <<< "$out" || miss="$miss /$pat/" ;;
+        *) grep -Eq -- "$pat" <<< "$out" || miss="$miss /$pat/" ;;
+      esac
+    done
+    if [ "$got" = "$want" ] && [ -z "$miss" ]; then
+      echo "ok $name"
+    else
+      bad=$((bad + 1))
+      echo "FAIL $name: rc $got (want $want), failed:${miss:- none}"
       printf '%s\n' "$out" | sed 's/^/    | /'
     fi
   }
@@ -344,16 +550,20 @@ PY
   }
   # event <case>: blocks until one event is on descriptor 3; 60 s is gate()'s own bound on a run, so a run that never got there was killed.
   event() { read -t 60 -r _ <&3 || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $1: the event never came"; }; }
-  # relay <fifo> <out file> <string> <fd>: reads a run's output from <fifo> into <out file> as it comes; the first line that holds
-  # <string> writes one line to descriptor <fd>, and so does the end of the output when none did (a waiter never outlives its run).
+  # relay <fifo> <out file> <string> <fd> [<string> <fd>]: reads a run's output from <fifo> into <out file> as it comes; the first line that
+  # holds <string> writes one line to descriptor <fd>, and so does the end of the output when none did (a waiter never outlives its run).
   relay() {
-    local f=$1 o=$2 str=$3 fd=$4 line seen=0
+    local f=$1 o=$2 str=$3 fd=$4 str2=${5:-} fd2=${6:-} line seen=0 seen2=0
     : > "$o"
     while IFS= read -r line; do
       printf '%s\n' "$line" >> "$o"
       case $line in *"$str"*) if [ "$seen" = 0 ]; then echo go >&"$fd"; seen=1; fi ;; esac
+      if [ -n "$str2" ]; then
+        case $line in *"$str2"*) if [ "$seen2" = 0 ]; then echo go >&"$fd2"; seen2=1; fi ;; esac
+      fi
     done < "$f"
     [ "$seen" = 1 ] || echo go >&"$fd"
+    [ -z "$str2" ] || [ "$seen2" = 1 ] || echo go >&"$fd2"
   }
   # Two V4.1 loads at once, on the two cards: the second waits for the first, names it, and counts the wait. The first holds the load
   # lock until the second has scanned for its holder (lease_holders prints once its scan of /proc is done, so its first `[lease]   `
@@ -389,29 +599,34 @@ PY
   flock -u 6
   exec 6>&-
   judge 'a run that is not a V4.1 load does not wait for one' "$rc" 0 'ok on the 3090 \(asked 3090\)' 'V4\.1'
-  # The lock order: a V4.1 load that waits for its card lock holds no V4.1 load lock meanwhile. The loader queues on the 3090 lock
-  # the test holds and says it waits; then the test takes a shared hold of the load lock — shared, as the loader's own polls are, so
-  # it never meets one of them, and refused for as long as the loader waits if the loader held the lock — and frees the card.
+  # The two waits, counted apart: the test holds the load lock and the 3090's gate lock. A loader (the head of a queue of one) waits for
+  # the load lock, takes it once the test lets it go and then, holding it, waits for its card: each wait is one `waited` line of its own
+  # (the load lock's seconds end where the card's begin), and the card wait says it holds the load lock.
   fifos
-  exec 6> "$t/gate.lock"
-  flock -x 6 || { echo "FAIL: the test cannot hold the 3090 gate lock"; return 1; }
+  qreset() { rm -rf "$t/v41-queue.d" "$t/v41-queue.seq" "$t/order"; }
+  qreset
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  exec 5> "$t/gate.lock"
+  flock -x 5 || { echo "FAIL: the test cannot hold the 3090 gate lock"; return 1; }
   streams "$t/s1"
   gate "$t/s1" 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 GATE_TEST_CAP="$cap" &
   p1=$!
-  relay "$t/s1" "$t/first" 'waits for the gate lock' 3 &
+  relay "$t/s1" "$t/first" 'queued at' 3 'waits for the gate lock' 3 &
   r1=$!
-  event 'lock order'
-  prc=0
-  flock -s -n "$t/v41-load.lock" true || prc=$?
-  echo "probe load lock rc=$prc" > "$t/out"
+  event 'waited lines: queued'
   flock -u 6
+  event 'waited lines: the card wait'
+  flock -u 5
+  exec 5>&-
   exec 6>&-
-  judge 'lock order: a V4.1 load queued on its card lock holds no V4.1 load lock' 0 0 'probe load lock rc=0$'
   rc=0
   wait "$p1" || rc=$?
   wait "$r1" || true
   cp "$t/first" "$t/out"
-  judge '  … and runs once its card lock frees' "$rc" 0 'waited [0-9]+ s for the gate lock \(3090\)'
+  judge_all 'the load lock and the card lock are two waits, each in its own waited line' "$rc" 0 \
+    '^gpu-gate\.sh: waited [0-9]+ s for the V4\.1 load lock$' '^gpu-gate\.sh: waited [0-9]+ s for the gate lock \(3090\)$' \
+    'waits for the gate lock \(3090\), holding the V4\.1 load lock' 'ok on the 3090 \(asked 3090\), V4\.1 load lock$'
   # Taken together: the load lock is held (by the test) and two loaders wait on it, one asking `any` each. A loader that held
   # the card it had got while it waited would leave an `any` gate that is no load with no card, and with the load lock held until that
   # gate ends it could only end 75 at the card bound; with neither held, that gate takes a card. Each loader's seconds are its
@@ -424,9 +639,9 @@ PY
   p1=$!
   gate "$t/s2" any "$t/lease" BLOOMERY_GATE_V41_LOAD=1 GATE_TEST_CAP="$cap" &
   p2=$!
-  relay "$t/s1" "$t/w1" 'waits for the V4.1 load lock' 3 &
+  relay "$t/s1" "$t/w1" 'queued at' 3 &
   r1=$!
-  relay "$t/s2" "$t/w2" 'waits for the V4.1 load lock' 3 &
+  relay "$t/s2" "$t/w2" 'queued at' 3 &
   r2=$!
   event 'together'
   event 'together'
@@ -467,6 +682,271 @@ PY
   wait "$r1" || true
   cp "$t/w1" "$t/out"
   judge '  … and the loader runs on both cards once the lock frees' "$rc" 0 'on both cards, both gate locks \(asked both\), V4\.1 load lock'
+  # The V4.1 load queue. A paced loader (pgate) polls only when the test grants it a poll (the pace function), so the order loaders are
+  # served in is the queue's and never the clock's: the test holds the load lock while loaders arrive, lets it go, and grants the polls in
+  # an order a run that tried the lock whether or not it was the head would win by. Each grant ends with the loader's next sign on its ack
+  # FIFO: `polled` (it waited) or `exit` (it took the locks, ran the stub, and ended); the stub's marker file says in what order.
+  # pace_open <k>: loader k's FIFO pair, held open read-write here (descriptors 20+2k grants, 21+2k signs).
+  pace_open() {
+    local g=$((20 + 2 * $1)) a=$((21 + 2 * $1))
+    rm -f "$t/pc$1.go" "$t/pc$1.ack"
+    mkfifo "$t/pc$1.go" "$t/pc$1.ack"
+    ENDED[$1]=0
+    eval "exec $g<> '$t/pc$1.go' $a<> '$t/pc$1.ack'"
+  }
+  pace_close() {
+    local g=$((20 + 2 * $1)) a=$((21 + 2 * $1))
+    eval "exec $g>&- $a>&-"
+  }
+  # ack <k> <case>: ACK is loader k's next sign; 60 s is gate()'s own bound on a run, so a run that never signed was killed.
+  # A loader that has signed `exit` is gone: its next sign is `gone` at once, not a minute's wait for one that cannot come.
+  ack() {
+    ACK=
+    if [ "${ENDED[$1]:-0}" = 1 ]; then
+      ACK=gone
+      return 0
+    fi
+    read -t 60 -r ACK <&"$((21 + 2 * $1))" || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 gave no sign"; ACK=none; }
+    [ "$ACK" != exit ] || ENDED[$1]=1
+  }
+  # grant <k> <case>: lets loader k poll once and takes its sign.
+  grant() {
+    echo go >&"$((20 + 2 * $1))"
+    ack "$@"
+  }
+  # pgate <k> <id> <class> <card> [K=V…]: starts paced loader k (marker <id>, output $t/q<k>); PG is the pid of the run. The job's own stderr is
+  # dropped: it is where bash reports a loader the test kills (`Killed`, `Terminated`); the loader's output goes to its file.
+  pgate() {
+    local k=$1 id=$2 cl=$3 c=$4
+    shift 4
+    pace_open "$k"
+    gate "$t/q$k" "$c" "$t/lease" BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_V41_CLASS="$cl" GATE_TEST_PACE="$t/pc$k" GATE_TEST_CAP="$cap" \
+      STUB_ORDER="$t/order" STUB_ID="$id" "$@" 2> /dev/null &
+    PG=$!
+  }
+  # markers: the stub's markers in the order it wrote them, on one line.
+  markers() { printf 'markers: %s\n' "$(tr '\n' ' ' < "$t/order" 2> /dev/null)"; }
+  # Three loaders arrive in the order A, B, C while the test holds the load lock; the view lists them in order; once the lock is free the
+  # polls are granted C, B, A, B, C: only the head may take it, so C and B poll in vain and the markers are A, B, C.
+  qreset
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  pgate 0 A 2 any BLOOMERY_V41_PRED_S=11
+  p1=$PG
+  ack 0 'queue order'
+  pgate 1 B 2 any BLOOMERY_V41_PRED_S=22
+  p2=$PG
+  ack 1 'queue order'
+  pgate 2 C 2 any BLOOMERY_V41_PRED_S=33
+  p3=$PG
+  ack 2 'queue order'
+  rc=0
+  bash "$self" --test-locks "$t" --v41-queue > "$t/out" 2>&1 || rc=$?
+  echo "order: $(grep -o 'pred_s=[0-9]*' "$t/out" | tr '\n' ' ')" >> "$t/out"
+  judge_all '--v41-queue lists the live tickets in order, one line each with the age' "$rc" 0 \
+    '^2-0000000001-[0-9]+ owner=tree pid=[0-9]+ start=[^ ]+ since=[0-9]+ cards=any item=ok tier=real pred_s=11 age=[0-9]+$' \
+    '^2-0000000002-[0-9]+ .* pred_s=22 age=[0-9]+$' '^2-0000000003-[0-9]+ .* pred_s=33 age=[0-9]+$' 'order: pred_s=11 pred_s=22 pred_s=33 $'
+  cp "$t/q2" "$t/out"
+  judge_all '  … a queued loader says its place and the head' 0 0 'gpu-gate\.sh: ok queued at 3 of 3 for the V4\.1 load lock \(head: ok tree, [0-9]+ s\)'
+  flock -u 6
+  exec 6>&-
+  grant 2 'queue order'
+  s1=$ACK
+  grant 1 'queue order'
+  s2=$ACK
+  grant 0 'queue order'
+  s3=$ACK
+  grant 1 'queue order'
+  s4=$ACK
+  grant 2 'queue order'
+  s5=$ACK
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  wait "$p3" || rc=$?
+  echo "signs: $s1 $s2 $s3 $s4 $s5" > "$t/out"
+  markers >> "$t/out"
+  judge_all 'queue order: loaders arriving A, B, C are served A, B, C, however the polls fall' "$rc" 0 'signs: polled polled exit exit exit$' 'markers: A B C $'
+  pace_close 0; pace_close 1; pace_close 2
+  # Class: a class-1 loader that arrives after a class-2 one is served first.
+  qreset
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  pgate 0 X 2 any
+  p1=$PG
+  ack 0 'queue class'
+  pgate 1 Y 1 any
+  p2=$PG
+  ack 1 'queue class'
+  rc=0
+  bash "$self" --test-locks "$t" --v41-queue > "$t/out" 2>&1 || rc=$?
+  echo "order: $(cut -d- -f1,2 "$t/out" | tr '\n' ' ')" >> "$t/out"
+  judge_all '--v41-queue puts a class-1 ticket ahead of an earlier class-2 one' "$rc" 0 'order: 1-0000000002 2-0000000001 $'
+  flock -u 6
+  exec 6>&-
+  grant 0 'queue class'
+  s1=$ACK
+  grant 1 'queue class'
+  s2=$ACK
+  grant 0 'queue class'
+  s3=$ACK
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  echo "signs: $s1 $s2 $s3" > "$t/out"
+  markers >> "$t/out"
+  judge_all 'queue class: a class-1 loader arriving after a class-2 one is served first' "$rc" 0 'signs: polled exit exit$' 'markers: Y X $'
+  pace_close 0; pace_close 1
+  # Dead tickets block nobody: a loader killed outright leaves its ticket (no trap ran), and a ticket whose pid lives on with another start
+  # time (a reused pid) is a dead one too. A loader arriving behind both removes them on its first poll, says so, and is the head.
+  qreset
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  pgate 0 K 2 any
+  p1=$PG
+  ack 0 'dead tickets'
+  kpid=$(sed -n 's/.* pid=\([0-9]*\) .*/\1/p' "$t"/v41-queue.d/2-*)
+  kill -9 "$kpid"
+  wait "$p1" || true
+  printf 'owner=reuse pid=%s start=1 since=%s cards=any item=reuse tier=real pred_s=-\n' "$$" "$(date +%s)" > "$t/v41-queue.d/2-0000000000-$$"
+  pgate 1 L 2 any
+  p2=$PG
+  ack 1 'dead tickets'
+  cp "$t/q1" "$t/out"
+  echo "tickets left: $(ls "$t/v41-queue.d" | wc -l | tr -d ' ')" >> "$t/out"
+  judge_all 'dead tickets: a killed loader and a reused pid are removed, named, and the next loader is the head' 0 0 \
+    'gpu-gate\.sh: removed the dead V4\.1 queue ticket 2-0000000001-[0-9]+ \(pid [0-9]+ is gone\)' \
+    'gpu-gate\.sh: removed the dead V4\.1 queue ticket 2-0000000000-[0-9]+ \(pid [0-9]+ is another process now' \
+    'queued at 1 of 1 for the V4\.1 load lock' 'tickets left: 1$'
+  flock -u 6
+  exec 6>&-
+  grant 1 'dead tickets'
+  s1=$ACK
+  rc=0
+  wait "$p2" || rc=$?
+  echo "signs: $s1" > "$t/out"
+  markers >> "$t/out"
+  judge_all '  … and is served' "$rc" 0 'signs: exit$' 'markers: L $'
+  pace_close 0; pace_close 1
+  # The head that waits for its card holds the load lock: a loader of the 3090 queues on the card the test holds, the load lock is held
+  # (the probe is shared, so it never meets a poll of the loader) and a second loader, asking `any` with the A6000 idle, stays queued
+  # and holds no card; once the card is free the head runs first, then the second.
+  qreset
+  exec 6> "$t/gate.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the 3090 gate lock"; return 1; }
+  pgate 0 H 2 3090
+  p1=$PG
+  ack 0 'head holds the load lock'
+  prc=0
+  flock -s -n "$t/v41-load.lock" true || prc=$?
+  pgate 1 B 2 any
+  p2=$PG
+  ack 1 'head holds the load lock'
+  pra=0
+  flock -n "$t/gate-a6000.lock" true || pra=$?
+  echo "probe load lock rc=$prc a6000 lock rc=$pra" > "$t/out"
+  cat "$t/q0" "$t/q1" >> "$t/out"
+  judge_all 'lock order: the head waiting for its card holds the load lock, the loader behind it takes nothing' 0 0 \
+    'probe load lock rc=1 a6000 lock rc=0$' 'waits for the gate lock \(3090\), holding the V4\.1 load lock' \
+    'queued at 2 of 2 for the V4\.1 load lock \(head: ok tree, [0-9]+ s\)'
+  flock -u 6
+  exec 6>&-
+  grant 0 'head holds the load lock'
+  s1=$ACK
+  grant 1 'head holds the load lock'
+  s2=$ACK
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  echo "signs: $s1 $s2" > "$t/out"
+  markers >> "$t/out"
+  judge_all '  … and is served first, the second loader after it' "$rc" 0 'signs: exit exit$' 'markers: H B $'
+  pace_close 0; pace_close 1
+  qreset
+  # The batch hold stays above every class. A head holding the load lock for its card lets it go when another owner's hold goes up, and a
+  # loader the hold holds back is no head for the batch's own loader, which passes the hold (its owner is the hold's) and arrives behind it
+  # in the same class: the batch's loader is served first, the held-back ticket keeps its name (its place) meanwhile, and it is served once
+  # the hold is down.
+  qreset
+  exec 6> "$t/gate.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the 3090 gate lock"; return 1; }
+  pgate 0 H 2 3090
+  p1=$PG
+  ack 0 'hold over the queue'
+  tk0=$(ls "$t/v41-queue.d")
+  printf 'owner=other since=%s\n' "$(date +%s)" > "$t/batch.gpuhold"
+  grant 0 'hold over the queue'
+  s1=$ACK
+  prc=0
+  flock -s -n "$t/v41-load.lock" true || prc=$?
+  pgate 1 Q 2 any BLOOMERY_BATCH_OWNER=other
+  p2=$PG
+  ack 1 'hold over the queue'
+  s2=$ACK
+  tk1=$(ls "$t/v41-queue.d")
+  rm -f "$t/batch.gpuhold"
+  grant 0 'hold over the queue'
+  s3=$ACK
+  flock -u 6
+  exec 6>&-
+  grant 0 'hold over the queue'
+  s4=$ACK
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  echo "signs: $s1 $s2 $s3 $s4 probe load lock rc=$prc" > "$t/out"
+  echo "held-back ticket before and after the batch's loader: $([ "$tk0" = "$tk1" ] && [ -n "$tk0" ] && echo same || echo "moved ($tk0 / $tk1)")" >> "$t/out"
+  markers >> "$t/out"
+  judge_all 'the batch hold: a head lets the load lock go and a held-back ticket is no head for the batch'"'"'s own loader' "$rc" 0 \
+    'signs: polled exit polled exit probe load lock rc=0$' 'held-back ticket before and after the batch.s loader: same$' 'markers: Q H $'
+  pace_close 0; pace_close 1
+  # A loader ended by TERM takes its ticket with it (the trap runs; its last sign says so).
+  qreset
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  pgate 0 T 2 any
+  p1=$PG
+  ack 0 'TERM'
+  kill -TERM "$(sed -n 's/.* pid=\([0-9]*\) .*/\1/p' "$t"/v41-queue.d/2-*)"
+  ack 0 'TERM'
+  wait "$p1" || true
+  flock -u 6
+  exec 6>&-
+  echo "sign: $ACK tickets left: $(ls "$t/v41-queue.d" | wc -l | tr -d ' ')" > "$t/out"
+  judge_all 'a queued loader ended by TERM removes its ticket' 0 0 'sign: exit tickets left: 0$'
+  pace_close 0
+  # A loader the bound ends (75) takes its ticket with it.
+  exec 6> "$t/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the V4.1 load lock"; return 1; }
+  case_ 'a V4.1 loader that is not served within the bound is 75 and leaves no ticket' 75 'V4\.1 load lock .* was not free within 6 s' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 BLOOMERY_V41_CLASS=3
+  flock -u 6
+  exec 6>&-
+  echo "tickets left: $(ls "$t/v41-queue.d" 2> /dev/null | wc -l | tr -d ' ')" > "$t/out"
+  judge_all '  … the ticket is gone' 0 0 'tickets left: 0$'
+  # A queue nobody waits in prints nothing, and the view is a read: box.sh under BLOOMERY_BOX_READONLY=1 runs it in the remote dir as it
+  # is and syncs nothing (stub ssh and rsync that record their arguments and reach nothing).
+  qreset
+  rc=0
+  bash "$self" --test-locks "$t" --v41-queue > "$t/out" 2>&1 || rc=$?
+  judge_all '--v41-queue with nobody queued prints nothing and is 0' "$rc" 0 '^$'
+  mkdir -p "$t/boxtree/tools" "$t/stub"
+  cp "$(dirname "$self")/box.sh" "$t/boxtree/tools/"
+  cp "$(dirname "$self")/../Cargo.toml" "$t/boxtree/"
+  : > "$t/ssh.log"
+  : > "$t/rsync.log"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$t/ssh.log" > "$t/stub/ssh"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$t/rsync.log" > "$t/stub/rsync"
+  chmod +x "$t/stub/ssh" "$t/stub/rsync"
+  rc=0
+  env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL \
+    -u BLOOMERY_DATA -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_VARIANT \
+    PATH="$t/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_READONLY=1 \
+    bash "$t/boxtree/tools/box.sh" 'bash tools/gpu-gate.sh --v41-queue' > "$t/out" 2>&1 || rc=$?
+  { echo "rsync calls: $(wc -l < "$t/rsync.log" | tr -d ' ')"; echo "last ssh: $(tail -1 "$t/ssh.log" | sed 's/.*&& //')"; } >> "$t/out"
+  judge_all '--v41-queue runs under BLOOMERY_BOX_READONLY=1 and syncs nothing' "$rc" 0 'rsync calls: 0$' 'last ssh: bash tools/gpu-gate\.sh --v41-queue$'
+  case_ 'BLOOMERY_V41_CLASS other than 1 to 4: 64, named' 64 "BLOOMERY_V41_CLASS is 1 .* got '5'" 3090 "$t/lease" BLOOMERY_V41_CLASS=5
+  case_ '  … a name is no class either' 64 "BLOOMERY_V41_CLASS is 1 .* got 'two'" 3090 "$t/lease" BLOOMERY_V41_CLASS=two
+  case_ 'BLOOMERY_V41_PRED_S not whole seconds: 64, named' 64 "BLOOMERY_V41_PRED_S is whole seconds .* got '2m'" 3090 "$t/lease" BLOOMERY_V41_PRED_S=2m
   # The tier. A fixture load takes no V4.1 load lock — only when its model is the file box.sh resolved: the lock file is not opened
   # (a directory stands there, which a real load refuses with 69), a held lock is not waited for, a request without the resolved
   # file is refused nothing and takes the lock as a real load does.
@@ -474,9 +954,12 @@ PY
   mkdir "$t/v41-load.lock"
   FX='BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_MODEL=/m/fx-00001-of-00001.gguf'
   case_ 'a real load whose lock file cannot be opened: 69, named' 69 'cannot open .*v41-load\.lock' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1
+  qreset
   # shellcheck disable=SC2086 # FX is K=V words
   case_ 'a fixture load opens no load lock and takes none' 0 'ok on the 3090 \(asked 3090\), tier fixture: no V4\.1 load lock' 3090 "$t/lease" \
     BLOOMERY_GATE_V41_LOAD=1 $FX BLOOMERY_REF_MODEL=/m/fx-00001-of-00001.gguf
+  echo "queue dir: $([ -e "$t/v41-queue.d" ] && echo made || echo none)" > "$t/out"
+  judge_all '  … and takes no ticket' 0 0 'queue dir: none$'
   rmdir "$t/v41-load.lock"
   : > "$t/v41-load.lock"
   exec 6> "$t/v41-load.lock"
@@ -506,8 +989,7 @@ PY
   exec 6>&-
   # The batch hold (the header). hold <owner> [age s] writes the file as the batch's writer leaves it, its mtime <age> seconds back
   # (python3's utime: BSD and GNU touch share no relative form); hold_age is the mtime's age; hrun <verb> <owner> runs the writer and
-  # appends the file as it stands after (all three take a third argument, a directory: the hold of another --test-locks dir); judge_all <name> <rc> <want rc> <ERE>…: every ERE must match a line of the output, and one
-  # that starts with ! must match none.
+  # appends the file as it stands after (all three take a third argument, a directory: the hold of another --test-locks dir).
   hold() {
     printf 'owner=%s since=%s\n' "$1" "$(($(date +%s) - ${2:-0}))" > "${3:-$t}/batch.gpuhold"
     python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "${3:-$t}/batch.gpuhold" "${2:-0}"
@@ -526,25 +1008,6 @@ PY
       printf 'after: %s age=%s fresh=%s\n' "$(head -1 "$t/batch.gpuhold")" "$(hold_age "$t/batch.gpuhold")" "$(hold_fresh "$t/batch.gpuhold" "$t0" "$t1")" >> "$t/out"
     else
       echo 'after: no hold' >> "$t/out"
-    fi
-  }
-  judge_all() {
-    local name=$1 got=$2 want=$3 pat miss=
-    shift 3
-    n=$((n + 1))
-    out=$(cat "$t/out")
-    for pat in "$@"; do
-      case $pat in
-        '!'*) ! grep -Eq -- "${pat#!}" <<< "$out" || miss="$miss /$pat/" ;;
-        *) grep -Eq -- "$pat" <<< "$out" || miss="$miss /$pat/" ;;
-      esac
-    done
-    if [ "$got" = "$want" ] && [ -z "$miss" ]; then
-      echo "ok $name"
-    else
-      bad=$((bad + 1))
-      echo "FAIL $name: rc $got (want $want), failed:${miss:- none}"
-      printf '%s\n' "$out" | sed 's/^/    | /'
     fi
   }
   rm -f "$t/batch.gpuhold"
@@ -691,18 +1154,25 @@ fi
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 3 ] && [ -d "$2" ] || { echo "usage: gpu-gate.sh --test-locks <dir> <binary> [args...] (the self-test's)" >&2; exit 64; }
   GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
+  V41_QDIR=$2/v41-queue.d V41_SEQ=$2/v41-queue.seq
   # A helper waiter, one whose life the test ends by an event (it releases the lock the waiter queues on), is set up with a safety cap
   # in place of the two bounds; the cases that judge a bound never set it.
   if [ -n "${GATE_TEST_CAP:-}" ]; then
     case $GATE_TEST_CAP in 0 | *[!0-9]*) echo "gpu-gate.sh: GATE_TEST_CAP is whole seconds from 1, got '$GATE_TEST_CAP'" >&2; exit 64 ;; esac
     V41_BOUND=$GATE_TEST_CAP CARD_BOUND=$GATE_TEST_CAP
   fi
+  # GATE_TEST_PACE=<FIFO prefix>: a loader whose polls the test paces (the pace function); only here is the variable read.
+  PACE=${GATE_TEST_PACE:-}
   shift 2
 fi
 if [ "${1:-}" = --gpuhold ]; then
   shift
   gpuhold "$@"
   exit $?
+fi
+if [ "${1:-}" = --v41-queue ]; then
+  v41_queue_view
+  exit 0
 fi
 NAME=${1:-}
 [ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...]" >&2; exit 64; }
@@ -729,6 +1199,17 @@ esac
 # BLOOMERY_BATCH_OWNER: the owner of the batch hold this run's batch put up (the header); the batch exports it into each item's box env.
 case ${BLOOMERY_BATCH_OWNER:-} in
   *[!A-Za-z0-9_]*) echo "gpu-gate.sh: BLOOMERY_BATCH_OWNER is the batch hold's owner (letters, digits and _) or unset, got '$BLOOMERY_BATCH_OWNER'" >&2; exit 64 ;;
+esac
+# BLOOMERY_V41_CLASS and BLOOMERY_V41_PRED_S: the V4.1 load queue's class and the calling recipe's predicted wall (the header).
+CLASS=${BLOOMERY_V41_CLASS:-2}
+case $CLASS in
+  1 | 2 | 3 | 4) ;;
+  *) echo "gpu-gate.sh: BLOOMERY_V41_CLASS is 1 (the lead's landing batch), 2 (round gates, the default), 3 (sittings) or 4 (idle fill), got '$CLASS'" >&2; exit 64 ;;
+esac
+PRED=${BLOOMERY_V41_PRED_S:--}
+case $PRED in
+  -) ;;
+  '' | *[!0-9]*) echo "gpu-gate.sh: BLOOMERY_V41_PRED_S is whole seconds (the recipe's median wall) or unset, got '$PRED'" >&2; exit 64 ;;
 esac
 TIER_NOTE=
 if [ "$V41" = 1 ] && [ "$TIER" = fixture ]; then
@@ -801,6 +1282,11 @@ LOCK_FILES=("9:$GATE_LOCK" "8:$A6000_LOCK")
 for lock in "${LOCK_FILES[@]}"; do
   eval "exec ${lock%%:*}>${lock#*:}" 2> /dev/null || { echo "gpu-gate.sh: cannot open ${lock#*:} — the gate runs on the box, as root" >&2; exit 69; }
 done
+# A V4.1 loader queues (the header) before its first poll, and its ticket goes with the run on every exit.
+if [ "$V41" = 1 ]; then
+  trap on_exit EXIT
+  ticket_write "$@"
+fi
 # The held lease's timing card: the record lease_take writes beside the lock once it holds it
 # (tools/ref/lease.sh), `pid=<the runner> timing_gpu=<card UUID | none>`. It counts only while its pid is
 # a process that holds the lease or an ancestor of one (a descriptor on LEASE_LOCK carrying the lock, the
@@ -956,7 +1442,8 @@ take_card() {
   esac
 }
 # take_both: the 3090 lock first, then, holding it, the A6000's. Every other run holds one card lock and never waits while
-# holding it, so this order cannot deadlock; a blocked flock wakes at the release before the polls of one-card runs
+# holding it, and a loader's head waits here holding only the load lock, which no card holder waits for (the header's lock order),
+# so this order cannot deadlock; a blocked flock wakes at the release before the polls of one-card runs
 # (a poll that takes only when both are free starves while gates keep coming). Blocks up to what is left of CARD_BOUND.
 take_both() {
   local left=$((CARD_BOUND - CARD_W)) start=$SECONDS
@@ -978,32 +1465,50 @@ drop_card() {
 # The V4.1 load lock: one V4.1 load on the box at a time, across trees and batches — two at once push each other's
 # host set (~190 GB of the 256 GB) out of the page cache and both turn IO-bound. It is held by the binary for the whole
 # run: the descriptor stays open, so the lock lives exactly as long as the load's process.
-# The run takes it TOGETHER with its card lock(s): each poll tries the lock and then the card without blocking, and a run that
-# got a card but not the lock lets the card go before it sleeps. A loader queued behind another load therefore holds no card
-# while it waits (it held one for the other load's whole run, and an `any` gate found both cards taken with one idle); the
-# poll's first look is a shared test of the lock, so while it is held the poll touches no card and no nvidia-smi.
-# The only wait that holds a lock is take_both's second card lock, in the order above. The waits are the bounds' own:
-# CARD_BOUND for a poll that found no card, V41_BOUND for one that found the card and not the lock, each 75 (contention, not a
-# red gate) with the lock named; the load lock's holders are named at once and once a minute, a card wait too (a line, no holders).
-# Each poll's seconds go to one of the two waits, so the two `waited` lines never overlap: tools/gate-batch.sh subtracts both.
-# The batch hold (the header) is read first in every poll, before the load lock's shared probe and before any card lock: a run under
-# a hold holds nothing while it waits, and a gate already polling cannot slip in between a batch's items.
+# A loader is served by the queue (the header): each poll, a run that is not the head only re-reads the queue and touches no card, no
+# nvidia-smi and no lock; the head takes the load lock without blocking and then, holding it, its card(s) — a card wait of the head is
+# the one wait that holds the load lock, so a later arrival never passes it. A run that is not a loader tries its card alone.
+# The waits are the bounds' own: CARD_BOUND for a poll that found no card, V41_BOUND for one that found the lock held or a place behind
+# another loader, each 75 (contention, not a red gate) with the lock named; a queued loader says its place at once and once a minute, the
+# head names the lock's holders too (the card wait: a line, no holders).
+# Each poll's seconds go to one of the waits — the batch hold, the card lock, the load lock and the queue (both `waited ... load lock`) —
+# so the `waited` lines never overlap: tools/gate-batch.sh subtracts them all.
+# The batch hold (the header) is read first in every poll, before the queue and before any lock: a run under a hold holds nothing while
+# it waits (a head lets the load lock go), and a gate already polling cannot slip in between a batch's items.
 GOT=
-CARD_W=0 LOAD_W=0 HOLD_W=0 why='' said=-60 hsaid=-60 csaid=-60 last=$SECONDS
+CARD_W=0 LOAD_W=0 HOLD_W=0 why='' said=-60 hsaid=-60 csaid=-60 qsaid=-60 last=$SECONDS HAVE7=0 qnote=''
+try_cards() {
+  if [ "$CARD" = both ]; then take_both; else take_card; fi
+}
 while :; do
   why=
   if batch_hold_blocks; then
     why=hold
-  elif [ "$V41" = 1 ] && ! flock -s -n "$V41_LOCK" true 2> /dev/null; then
-    why=load
-  else
-    if [ "$CARD" = both ]; then take_both; else take_card; fi
-    if [ -z "$GOT" ]; then
-      why=card
-    elif [ "$V41" = 1 ] && ! flock -n 7; then
-      drop_card
-      why=load
+    if [ "$HAVE7" = 1 ]; then
+      flock -u 7
+      HAVE7=0
     fi
+  elif [ "$V41" = 1 ]; then
+    if [ "$HAVE7" = 0 ]; then
+      v41_standing "${TICKET##*/}" || true
+      if [ "$Q_POS" = 0 ]; then
+        echo "gpu-gate.sh: $NAME: its V4.1 queue ticket $TICKET is gone (removed by hand, or a reader read this process as dead) — not queueing again (rc 75)" >&2
+        exit 75
+      elif [ "$Q_POS" != 1 ]; then
+        why=queue
+      elif flock -n 7; then
+        HAVE7=1
+      else
+        why=load
+      fi
+    fi
+    if [ -z "$why" ]; then
+      try_cards
+      [ -n "$GOT" ] || why=card
+    fi
+  else
+    try_cards
+    [ -n "$GOT" ] || why=card
   fi
   [ -n "$why" ] || break
   if [ "$why" = hold ] && [ $((HOLD_W - hsaid)) -ge 60 ]; then
@@ -1013,15 +1518,19 @@ while :; do
     hsaid=$HOLD_W
   fi
   if [ "$why" = card ] && [ $((CARD_W - csaid)) -ge 60 ]; then
-    echo "gpu-gate.sh: $NAME waits for the gate lock ($CARD), holding no lock; ${CARD_W} s so far, at most ${CARD_BOUND} s with the other waits" >&2
+    echo "gpu-gate.sh: $NAME waits for the gate lock ($CARD), holding $([ "$HAVE7" = 1 ] && echo 'the V4.1 load lock' || echo 'no lock'); ${CARD_W} s so far, at most ${CARD_BOUND} s with the other waits" >&2
     csaid=$CARD_W
+  fi
+  if { [ "$why" = queue ] || [ "$why" = load ]; } && [ $((LOAD_W - qsaid)) -ge 60 ]; then
+    queued_say
+    qsaid=$LOAD_W
   fi
   if [ "$why" = load ] && [ $((LOAD_W - said)) -ge 60 ]; then
     echo "gpu-gate.sh: $NAME waits for the V4.1 load lock $V41_LOCK (another run is loading V4.1), holding no gate lock; ${LOAD_W} s so far, its holders:" >&2
     lease_holders "$V41_LOCK" >&2
     said=$LOAD_W
   fi
-  sleep "$POLL"
+  pace
   spent=$((SECONDS - last)) last=$SECONDS
   case $why in
     card) CARD_W=$((CARD_W + spent)) ;;
@@ -1037,13 +1546,15 @@ while :; do
     echo "gpu-gate.sh: $NAME: the batch hold $GPU_HOLD (owner $HOLD_OWNER) was still up after ${HOLD_W} s (CARD_BOUND ${CARD_BOUND} s) — contention, not a red gate (rc 75)" >&2
     exit 75
   fi
-  if [ "$LOAD_W" -ge "$V41_BOUND" ] && [ "$why" = load ]; then
-    echo "gpu-gate.sh: $NAME: the V4.1 load lock $V41_LOCK was not free within ${V41_BOUND} s — contention, not a red gate (rc 75)" >&2
+  if [ "$LOAD_W" -ge "$V41_BOUND" ] && { [ "$why" = load ] || [ "$why" = queue ]; }; then
+    [ "$why" != queue ] || qnote="; queued at $Q_POS of $Q_N (head: $Q_HEAD_ITEM $Q_HEAD_OWNER)"
+    echo "gpu-gate.sh: $NAME: the V4.1 load lock $V41_LOCK was not free within ${V41_BOUND} s — contention, not a red gate (rc 75)$qnote" >&2
     exit 75
   fi
 done
 # What the last poll spent (take_both's blocking) was a wait for the card lock.
 CARD_W=$((CARD_W + SECONDS - last))
+ticket_drop
 # The waits are not the gate's time: tools/gate-batch.sh subtracts these lines' seconds from the item's times row.
 [ "$HOLD_W" = 0 ] || echo "gpu-gate.sh: waited ${HOLD_W} s for the batch hold" >&2
 [ "$CARD_W" = 0 ] || echo "gpu-gate.sh: waited ${CARD_W} s for the gate lock ($CARD)" >&2
