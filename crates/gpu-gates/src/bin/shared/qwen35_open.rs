@@ -60,6 +60,17 @@ pub fn read_ids(path: &Path, n: Option<usize>) -> Result<Vec<u32>, GateError> {
 /// upload, with the verdict's terms ([`refuse_unless_whole_fits`]): a dense
 /// backbone has no routed experts to move to the host tier.
 pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, Split), GateError> {
+    open_with(path, ctx, ubatch, false)
+}
+
+/// [`open`] with the sequences' rotation tables of a media load (`media`: [`Open35::media`]); the same
+/// fit check, the same card.
+pub fn open_with(
+    path: &Path,
+    ctx: usize,
+    ubatch: usize,
+    media: bool,
+) -> Result<(Qwen35moeModel, Split), GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     if !split.architecture().is_some_and(is_qwen35_body) {
         return Err(format!(
@@ -74,7 +85,7 @@ pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, S
         mma: false,
         ubatch,
         kv: KvQ8::F16,
-        media: false,
+        media,
     };
     let census = bloomery_gpu_gates::gpu_census::census()?;
     let card = Place::A.on(&census)?.card_specs()?[0];
