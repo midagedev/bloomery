@@ -473,6 +473,17 @@ through R4 (worker1's train 2 carries R3a and the lifts), then the user-facing p
   `perf -e cpu-clock` on `qdot-rate`'s MXFP4 rows beside ik's x4 kernel, before any kernel round. The C = 8 tile's
   ratio to the one-column dot is 0.51 (105.0 ns per row-column at k = 4096), so the tile holds; the miss is the base.
 
+### What W3's R9 left (worker3, 10-10)
+- **MiMo's default `--parallel` stays 1 (tracker).** The seat serves N resident slots through the common `Slots`
+  owner, but MiMo has no one-pass round of several rows, so two slots at the default would only halve each request's
+  context. Its default goes to 2, the qwen3/GLM default, once such a round exists
+  (`crates/gpu-gates/src/bin/shared/serve_seats/mimo2.rs`, `slots_given`).
+- **"No sequence past the plan" lives in three bodies (tracker, after 0210b).** GLM
+  (`crates/gpu-glm5next/src/body.rs`, `slots_planned`/`slots_made`), V4.1 (`crates/gpu-deepseek41/src/body.rs`) and
+  MiMo (`crates/gpu-mimo2/src/body.rs`) each count the sequences made against the plan's count, and refuse one past it
+  in `Slots::new_seq`. It is one rule, so it belongs to `GpuModel::add_slots`
+  (`crates/gpu/src/model/slots.rs`), with the planned count given at the load. Size S–M.
+
 ## After 0.2.8 (10-09, leader — the post-tag train: paged2, bpslots, levphase, loadchain + packsched, roomneed, stepunion2, binslots)
 
 ### What paged1 and pagedoff left
