@@ -1,0 +1,40 @@
+# The qdot-rate floor table, the one owner of the pairs tools/ref/qdot-rate.sh rules: a Rust qdot-rate row
+# (type, k) and the ik harness that times the same type at the same row bytes; the floor is the lowest
+# same-round ratio ours/ik a sitting may read (tools/ref/qdot-rate-floors.py check: one round under it
+# ends the runner rc 1, naming the row). The runner runs the harnesses this table names, in its order.
+#
+# Derivation of the derived rows (tools/ref/qdot-rate-floors.py derive, its docstring's rule): the six
+# rounds of two A6000-box sittings, one pinned core, pooled — 2026-10-07T16:39Z (worker1 m2rate, three
+# rounds) and 2026-10-09T23:59Z (glmiq4 s2-rate, three rounds; the IQ3_S row only there). Per row:
+# floor = mean - t(1 - 0.05/60, 5) * sd * sqrt(1 + 1/6) - res * mean, t = 6.138 (10 rows x 6 rounds
+# = 60 checks a sitting at most), res = the two times' print resolution; written rounded down to 0.01.
+# The kernels these rows time are the same functions in the -sse4a build (tools/ref/asm-census.py diff
+# of the two qdot-rate builds: only dot_iq3s_q8k_avx2 and the scalar mirrors' dot_row_scalar_ty moved),
+# so the base sittings rule it. The pooling holds because the two sittings' one-column rows read the same
+# within their SD (their trees may differ by dae925ca, the multi-column tiles, which these rows do not run).
+#
+# type    k      ik_harness     floor
+# PIN(2026-10-10): rounds .957 .970 .965 .962 .966 .970, mean 0.965, sd 0.0051, res 0.0034 -> 0.928
+Q4_K      2048   q4k_x4_rate    0.92
+# PIN(2026-10-10): rounds .980 .988 .986 .975 1.004 1.016, mean 0.991, sd 0.0154, res 0.0025 -> 0.887
+Q6_K      2048   q6k_x4_rate    0.88
+# PIN(2026-10-10): rounds .908 .846 .898 .902 .859 .876, mean 0.882, sd 0.0252, res 0.0035 -> 0.711
+Q5_0      1408   q5f0_rate      0.71
+# PIN(2026-10-10): rounds .964 .990 .989 .973 .980 1.014, mean 0.985, sd 0.0171, res 0.0009 -> 0.871
+Q5_1      10944  q5f1_rate      0.87
+# PIN(2026-10-10): rounds 1.002 .994 .947 .955 .998 1.018, mean 0.985, sd 0.0282, res 0.0025 -> 0.796
+Q5_K      2304   q5k_x4_rate    0.79
+# PIN(2026-10-10): rounds 1.598 1.603 1.540 1.597 1.595 1.588, mean 1.587, sd 0.0235, res 0.0005 -> 1.430
+IQ3_XXS   4096   iq3xxs_rate    1.43
+# PIN(2026-10-10): rounds .880 .913 .845 .898 .904 .891, mean 0.889, sd 0.0242, res 0.0030 -> 0.725
+MXFP4     2048   mxfp4_x4_rate  0.72
+# PIN(2026-10-10): rounds .758 .776 .751 .752 .733 .745, mean 0.753, sd 0.0144, res 0.0091 -> 0.650
+IQ4_NL    640    iq4nl_rate     0.65
+# PIN(2026-10-10): rounds .955 .955 .899 .950 .963 .955, mean 0.946, sd 0.0233, res 0.0026 -> 0.789
+IQ4_XS    2560   iq4xs_rate     0.78
+# PIN(2026-10-10): 0.9, set by the iq3sfix spec, not derived: the base sitting read 0.133-0.135 (two
+# extrq in the AVX loop, docs/cards/iq3sfix-rate.card); the -sse4a build was predicted at ~~1.15-1.20~~
+# and read 0.975 / 0.961 / 0.979 in the quiet sitting of 2026-10-10T06:41Z (its loop runs at 0.81x the
+# IQ3_XXS loop's IPC, not 1x), so 0.9 sits 0.06 under that sitting's lowest round and is red on the base
+# by 6.7x.
+IQ3_S     4096   iq3s_rate      0.90
