@@ -650,11 +650,34 @@ guard_cpu() {
   return 0
 }
 
+# __witness_needs <field>: the runner variables a field reads (the brackets in the list above), one owner for
+# witness's refusal and for the self-test's scan of every runner.
+__witness_needs() {
+  case $1 in
+    table) echo DIR SRC DEV ;;
+    blockstat) echo DEV STAT ;;
+    binary) echo BIN BIN_SHA ;;
+    core | core-mhz) echo CORE ;;
+    read-sectors) echo MODEL ;;
+  esac
+}
+
 witness() {
-  local tag=$1 field fn
+  local tag=$1 field fn v unset_vars=
   __witness_indent=
   if [ -z "${WITNESS[*]+set}" ]; then
     echo "witness: this runner lists no WITNESS fields" >&2
+    return 64
+  fi
+  # Every field's variables are checked before the first line prints, so a runner that never set one ends
+  # by name at its first witness instead of on an unbound variable halfway through the block.
+  for field in "${WITNESS[@]}"; do
+    for v in $(__witness_needs "$field"); do
+      [ -n "${!v+set}" ] || unset_vars+=" $field:$v"
+    done
+  done
+  if [ -n "$unset_vars" ]; then
+    echo "witness: the runner did not set the variables its fields read (field:variable):$unset_vars" >&2
     return 64
   fi
   for field in "${WITNESS[@]}"; do
@@ -1075,6 +1098,36 @@ EOF
     unset BLOOMERY_LEASE_TRACE BLOOMERY_LEASE_CARD
   fi
   # ---- end the trace ----
+  # ---- the witness fields' variables ----
+  # witness refuses by name, before any line, a field whose variable the runner did not set.
+  OUT=$(WITNESS=(head table); DIR=/d; DEV=sda; unset SRC; witness pre 2>&1); RC=$?
+  check needs-refused-rc "$RC" 64
+  matches needs-refused-line '^witness: the runner did not set the variables its fields read \(field:variable\): table:SRC$' "$OUT"
+  check needs-refused-nothing-printed "$(printf '%s\n' "$OUT" | grep -c -- '--- witness')" 0
+  OUT=$(WITNESS=(head table); DIR=/d; SRC=/dev/sda1; DEV=sda; witness pre 2>&1); RC=$?
+  check needs-set-rc "$RC" 0
+  matches needs-set-line '^table: /d on /dev/sda1 \(block device sda\)$' "$OUT"
+  # Every runner under tools/ref that lists a field assigns that field's variables, itself or in a file it
+  # sources from tools/ref (a box run is the only other place this would show, at the first witness).
+  # MODEL is the profile's (tools/ref/models/<profile>.sh through ref-paths.sh), so only witness checks it.
+  for f in "$LEASE_TREE"/tools/ref/*.sh; do
+    w=$(grep -h '^[[:space:]]*WITNESS=(' "$f" | tr '\n' ' ')
+    [ -n "$w" ] || continue
+    srcs=("$f")
+    for s in $(grep -E '^[[:space:]]*(\.|source) ' "$f" | grep -oE '/[a-z0-9-]+\.sh' | sort -u); do
+      # lease.sh sets none of them; its own self-test's assignments above would read as the runner's.
+      [ "$s" != /lease.sh ] && [ -e "$LEASE_TREE/tools/ref$s" ] && srcs+=("$LEASE_TREE/tools/ref$s")
+    done
+    miss=
+    for field in $(printf '%s\n' "$w" | grep -oE '\(.*\)' | tr -d '()'); do
+      for v in $(__witness_needs "$field"); do
+        [ "$v" != MODEL ] || continue
+        grep -Eq "(^|[[:space:];(|&])(local |export |readonly )?$v=" "${srcs[@]}" || miss+=" $field:$v"
+      done
+    done
+    check "needs-assigned-${f##*/}" "${miss# }" ''
+  done
+  # ---- end the witness fields' variables ----
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]
   exit
