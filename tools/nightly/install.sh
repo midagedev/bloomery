@@ -15,7 +15,7 @@
 #              repository added, no driver, no toolkit, no libcuda: cuda-bindings loads libcuda at run time and the units
 #              open no card). cuda-cudart-dev (cuda.h), libcurand-dev (curand.h), cuda-crt (crt/host_config.h).
 #   just       the prebuilt release binary (the version the Mac's recipes.py self-test is run with; its JSON dump differs between versions)
-#   /usr/local/lib/bloomery-nightly/{run.sh,mail.sh}   root-owned copies of this directory's scripts
+#   /usr/local/lib/bloomery-nightly/{run.sh,units.sh,mail.sh}   root-owned copies of this directory's scripts
 #   /etc/systemd/system/bloomery-nightly.{service,timer}, the timer enabled
 set -euo pipefail
 
@@ -100,6 +100,7 @@ fi
 # ---- the root-owned scripts and the units ----
 install -d -o root -g root -m 0755 "$LIB"
 install -o root -g root -m 0755 "$SRC/tools/nightly/run.sh" "$LIB/run.sh"
+install -o root -g root -m 0755 "$SRC/tools/nightly/units.sh" "$LIB/units.sh"
 install -o root -g root -m 0755 "$SRC/tools/nightly/mail.sh" "$LIB/mail.sh"
 install -o root -g root -m 0644 "$SRC/tools/nightly/bloomery-nightly.service" /etc/systemd/system/bloomery-nightly.service
 install -o root -g root -m 0644 "$SRC/tools/nightly/bloomery-nightly.timer" /etc/systemd/system/bloomery-nightly.timer

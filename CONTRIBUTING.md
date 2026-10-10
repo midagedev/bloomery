@@ -18,14 +18,19 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
 - **The host tier, x86_64 Linux, no card.** `python3 tools/recipes.py host-nightly` prints the units the nightly runs
   (`tools/nightly/run.sh`): a `cargo test --release` per crate that reaches no card, then every `tools/check-*.sh`.
   The build targets Zen 3 (`.cargo/config.toml:8`) and may stop with an illegal instruction on another CPU
-  (`docs/BUILD.md:51`): set `RUSTFLAGS='-C target-cpu=native'` as the nightly does (`tools/nightly/run.sh:55`). A host with
+  (`docs/BUILD.md:51`): set `RUSTFLAGS='-C target-cpu=native'` (`just contrib-check` does this for you; the nightly's own Zen 1 host sets `x86-64-v3`, `tools/nightly/run.sh:55`). A host with
   no card still needs the CUDA headers, libclang and numpy/PIL (`tools/nightly/install.sh:7-17`).
 - **Python and shell tools** under `tools/` carry self-tests (`python3 tools/recipes.py --self-test`,
   `python3 tools/hf-arch-check.py --self-test`).
 - **On a Mac,** `just mac-static` is the static tier (format, clippy as an x86_64-linux cross check, every check script);
   it needs the environment the header of `tools/mac-check.sh` describes (`docs/BUILD.md:299`).
 - Starter rows that need none of our hardware: [`docs/contrib/good-first-issues.md`](docs/contrib/good-first-issues.md).
-- One command for all of this is designed, not built: [`docs/contrib/local-check.md`](docs/contrib/local-check.md).
+- **One command for all of this:** `just contrib-check` (`tools/contrib-check.sh`). `--tier t0` runs on any OS with the
+  pinned nightly: `cargo fmt --check`, `cargo test -p` for each pure crate, the Python tool self-tests and every
+  `tools/check-*.sh`. `--tier t1` (the default on x86_64 Linux) adds the host-nightly units. It prints one line per unit
+  and a `DONE` line; paste them in your pull request. The card tier (T2) is designed, not built:
+  [`docs/contrib/local-check.md`](docs/contrib/local-check.md). CI runs `just contrib-check --tier t0` on every pull
+  request (`.github/workflows/pr.yml`); that is a smoke test for your change, not landing evidence.
 
 ## How a pull request is verified
 

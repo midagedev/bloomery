@@ -1,11 +1,14 @@
-# `just contrib-check`: one off-box verification command (design, not implemented)
+# `just contrib-check`: one off-box verification command (T0 and T1 implemented, T2 designed)
 
-A contributor has no way today to answer "is my change green?" on their own machine with one command. The gates are
-`just gate-*` recipes, and 278 lines of the `justfile` run through `tools/box.sh`, which ssh's to the maintainers' one
-workstation (`tools/box.sh:42,225`, `docs/BUILD.md:5`). This page designs the command, lists the box assumptions it must
-bypass with their size, and says who does each change. Nothing here is built; every claim cites `path:line` and
-`[unverified]` marks what I could not check. The result of `contrib-check` is the contributor's evidence in a pull
-request, never landing evidence: the maintainers' box record still decides (`AGENTS.md`, "Never run a gate on the Mac").
+A contributor needs one command that answers "is my change green?" on their own machine. The gates are `just gate-*`
+recipes, and 278 lines of the `justfile` run through `tools/box.sh`, which ssh's to the maintainers' one workstation
+(`tools/box.sh:42,225`, `docs/BUILD.md:5`). `just contrib-check` runs the tiers that need no workstation: T0 and T1 are
+built (`tools/contrib-check.sh`, with the unit runner it shares with the nightly, `tools/nightly/units.sh`), and
+`.github/workflows/pr.yml` runs T0 on every pull request. T2, the card and fixture tier, is designed below and not built;
+this page lists the box assumptions it must bypass with their size, and who does each change. Every claim cites
+`path:line`, and `[unverified]` marks what I could not check. The result of `contrib-check` is the contributor's evidence in
+a pull request, never landing evidence: the maintainers' box record still decides (`AGENTS.md`, "Never run a gate on the
+Mac").
 
 ## What already runs off the box
 
@@ -32,25 +35,35 @@ request, never landing evidence: the maintainers' box record still decides (`AGE
 
 ## The command
 
-`just contrib-check [--base BASE] [--require T2]` is a recipe that calls one script, `tools/contrib-check.sh`
-(`just check-recipes` forbids a test recipe with `||` or a bare `cargo test`, so the logic lives in the script). It
-detects its tier, runs it, and never skips silently:
+`just contrib-check [--tier t0|t1]` is a recipe that calls one script, `tools/contrib-check.sh` (`just check-recipes`
+forbids a test recipe with `||` or a bare `cargo test`, so the logic lives in the script). The default tier is T1 on
+x86_64 Linux and T0 elsewhere; `--tier t2` prints `T2 is not built yet` and exits 64, and `--tier t1` on another host is a
+named 64. The script reads every list from its owner and copies none: the pure crates from `recipes.py pure-crates`, the
+Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`, the host units from `recipes.py host-nightly`.
 
 | Tier | Where | Runs |
 |---|---|---|
-| T0 | any OS with the pinned nightly | `cargo fmt --check`; `cargo test -p` for each `pure` row of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; the `tools/check-*.sh` scripts except `check-rustflags` (it holds the repo's `znver3` against itself, so it is the maintainers' after a CPU change, `docs/BUILD.md:51`). On macOS it calls `mac-static` and `mac-check.sh test` |
-| T1 | x86_64 Linux, no card needed | T0 plus every unit of `recipes.py host-nightly`, each under `BLOOMERY_GATE_BOUND`, with `RUSTFLAGS` set to the machine's own CPU when it is not Zen 3 (`run.sh:55`) |
-| T2 | T1 plus an NVIDIA card and fixtures | the fixture-tier family gates: `just affected BASE`, run serially under `BLOOMERY_TIER=fixture`; a recipe the tier refuses by name (rc 66 from `tools/ref/real-only.sh` or `ref-paths.sh`; `gate-batch.sh` counts such items as `deferred`) is printed `DEFER`, never counted green |
+| T0 | any OS with the pinned nightly (rustup, rustfmt) | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists; every `tools/check-*.sh`. None of the check scripts is left out: each reads the tree and runs no cargo and no box command, `host-nightly` runs the same set, and all ran green on a Mac. The earlier draft of this page excluded `check-rustflags` as the maintainers' after a CPU change; it holds `.cargo/config.toml` against `.cargo/cuda-oxide.toml` and never reads this machine's CPU, so it runs |
+| T1 | x86_64 Linux, no card needed | T0, then every unit of `recipes.py host-nightly` that T0 did not already run under the same name (the check scripts and `recipes-self-test` run once), each `bash tools/gate.sh --release --locked -p <crate>` under a bound (`CONTRIB_UNIT_BOUND`, default 1200 s). Needs what `tools/nightly/install.sh` lists: the CUDA 13.3 headers, libclang for bindgen, python3-numpy and python3-pil |
+| T2 | T1 plus an NVIDIA card and fixtures | **not built.** The fixture-tier family gates: `just affected BASE`, run serially under `BLOOMERY_TIER=fixture`; a recipe the tier refuses by name (rc 66 from `tools/ref/real-only.sh` or `ref-paths.sh`; `gate-batch.sh` counts such items as `deferred`) is printed `DEFER`, never counted green |
 
-Output is one line per unit, `contrib-check <tier> <unit> PASS|FAIL|SKIP|DEFER rc=<n> <seconds>s`, then a summary of what
-ran and what was skipped and why (`T2 skipped: no nvidia-smi`). It writes `target/contrib-check/<time>/` with each
-unit's log and a `report.txt` that opens with the commit, `uname -a`, the CPU model, RAM, the toolchain, and the card,
-driver and `--version` when there is one: the block a pull request pastes. Exit: 0 every unit that ran is green, 1 a
-unit failed, 64 usage, 69 a prerequisite is missing or a tier named by `--require` could not run (the code
-`tools/mac-check.sh:31-35` uses for a missing prerequisite; 75 stays contention, which a retry is for: the standing rule
-is `AGENTS.md`'s rc 75, so a missing card must not use it). An opt-in
-`CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, as `NIGHTLY_INJECT_FAIL` does (`run.sh:33`), so the red path
-is shown to fail first. aarch64 Linux runs T0 only until the host compiles there (`docs/contrib/dgx-spark.md`).
+`RUSTFLAGS`: on x86_64 Linux the script sets `-C target-cpu=native` for every cargo unit unless `RUSTFLAGS` is already set
+(a binary built for the repo's `znver3` may stop with an illegal instruction on another CPU, `docs/BUILD.md:51`). The nightly
+sets `x86-64-v3` for its own VPS (`tools/nightly/run.sh:55`). The two callers share one unit runner, `tools/nightly/units.sh`
+(`run_unit`, `unit_failure`): how a unit's exit code, counts and failing tests are read is one piece of code.
+
+Output (built): a header (commit, host, toolchain, `RUSTFLAGS`, bound), one line per unit, `<name> rc=<n> <seconds>s`, under a
+red one its failing tests or first red lines and its log path, then `DONE tier=… total=… red=… wall=…s`. Each unit's log is
+in `target/contrib-check/<time>/<name>.log`. A host without GNU `timeout` (macOS) runs units unbounded and the header says
+so. Exit: 0 every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list
+the script reads is empty (75 stays contention, which a retry is for: `AGENTS.md`'s rc 75, so a missing card must not use
+it). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, as `NIGHTLY_INJECT_FAIL` does (`run.sh:33`), so the red path
+is shown to fail first.
+
+Not built, still designed: the `--base` and `--require T2` flags, a `report.txt` per run (the header and the log directory
+carry its facts), the `SKIP`/`DEFER` unit states (no unit is skipped in T0 or T1), a call of `mac-static` on a Mac (it needs
+the maintainers' Mac environment file; `just mac-static` stays the Mac's static tier beside this command), and the T2 tier.
+aarch64 Linux runs T0 only until the host compiles there (`docs/contrib/dgx-spark.md`).
 
 ## The box assumptions T2 must bypass
 
@@ -91,9 +104,9 @@ The fixture tier is what makes a family's gates runnable without the 100 GB to 3
 
 ## Order and sizes
 
-1. **C1, T0 and T1 only** (`tools/contrib-check.sh`, its self-test, the recipe): S. A contributor can write it from
-   `run.sh` and `recipes.py host-nightly`, which already hold the logic. Value on day one: every pure-crate and
-   host-tier change is checkable alone.
+1. **C1, T0 and T1: built** (`tools/contrib-check.sh`, the shared runner `tools/nightly/units.sh`, the recipe, and the T0
+   pull-request workflow `.github/workflows/pr.yml`). Every pure-crate and host-tier change is checkable alone. T1 is not in
+   the workflow: it needs three NVIDIA `.deb` files unpacked by hand, more than apt packages (`pr.yml` header).
 2. **Rows 1, 2, 3, 7** (the `BLOOMERY_BOX_LOCAL` mode of `box.sh` and the env example): S-M, maintainers. After it `just gate-<x>` runs on a
    host with no card for the gates that open none (`gate-mimo2-meta`'s header test given the file).
 3. **Rows 4, 5, 6, 8, 9, 10**: the card and fixture half, M each; row 10's publication is a maintainers' decision first.

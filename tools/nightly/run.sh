@@ -56,6 +56,10 @@ export RUSTFLAGS='-C target-cpu=x86-64-v3'
 export BLOOMERY_GATE_BOUND=$UNIT_BOUND
 unset BLOOMERY_BOX_ENV BLOOMERY_DATA
 
+# The unit runner (run_unit, unit_failure) is shared with tools/contrib-check.sh; it is installed beside this file.
+# shellcheck source=tools/nightly/units.sh
+source "$(dirname "${BASH_SOURCE[0]}")/units.sh"
+
 # Atomic one-line file write, so mail.sh never reads half a file.
 put() { printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }
 
@@ -129,7 +133,7 @@ cd "$CLONE" || finish 2 RED "no clone"
 
 # The installed scripts are copies: a later edit of the tree's own scripts reaches them only through install.sh. Say so, loudly enough
 # to be read in the summary (a green run mails nothing).
-for f in run.sh mail.sh; do
+for f in run.sh mail.sh units.sh; do
   if [ -f "tools/nightly/$f" ] && ! cmp -s "tools/nightly/$f" "/usr/local/lib/bloomery-nightly/$f"; then DRIFT="$DRIFT $f"; fi
 done
 if [ -n "$DRIFT" ]; then echo "== NOTE: installed${DRIFT} differ from the tree's tools/nightly/ copies: run tools/nightly/install.sh"; fi
@@ -168,31 +172,14 @@ while IFS=$'\t' read -r name cmd; do
   CURRENT_UNIT=$name
   ulog=$RUN/units/$name.log
   echo "== unit $name: $cmd"
-  t0=$SECONDS
-  timeout --kill-after=10 "$((UNIT_BOUND + 30))" bash -c "$cmd" < /dev/null 2>&1 | tee "$ulog"
-  rc=${PIPESTATUS[0]}
-  secs=$((SECONDS - t0))
-  kind=script
-  case $cmd in *gate.sh*) kind=cargo ;; esac
-  read -r p f i < <(awk '/^test result: / { for (k = 2; k <= NF; k++) { if ($k == "passed;") p += $(k - 1); if ($k == "failed;") f += $(k - 1); if ($k == "ignored;") g += $(k - 1) } } END { print p + 0, f + 0, g + 0 }' "$ulog")
+  run_unit "$cmd" "$ulog" "$UNIT_BOUND"
+  rc=$UNIT_RC secs=$UNIT_SECS kind=$UNIT_KIND p=$UNIT_P f=$UNIT_F i=$UNIT_I
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$kind" "$rc" "$p" "$f" "$i" "$secs" >> "$RUN/units.tsv"
   if [ "$kind" = cargo ] || [ "$name" = inject-fail ]; then COUNTS="$COUNTS $name $p/$f/$i"; else COUNTS="$COUNTS $name $([ "$rc" = 0 ] && echo ok || echo "rc$rc")"; fi
   if [ "$rc" != 0 ]; then
     FAILS=$((FAILS + 1))
     [ -n "$FIRST_FAIL" ] || FIRST_FAIL=$ulog
-    named=$(sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$ulog")
-    if [ -n "$named" ]; then
-      printf '%s\n' "$named" | sed "s/^/$name: /" >> "$RUN/failed"
-    else
-      case $rc in
-        124 | 137) why="timeout after ${UNIT_BOUND}s (rc $rc)" ;;
-        78) why="a test filter matched no test (rc 78)" ;;
-        *) if grep -q 'could not compile\|^error\(\[E[0-9]*\]\)\?:' "$ulog"; then why="build failure (rc $rc)"; else why="rc $rc"; fi ;;
-      esac
-      echo "$name: $why" >> "$RUN/failed"
-      # a script's red lines sit anywhere in its output, not in its last 80: name the first few
-      grep -E 'FAIL|[Ff]ailed|[Ee]rror' "$ulog" | grep -v '^ok ' | head -n 8 | cut -c1-220 | sed 's/^/    | /' >> "$RUN/failed"
-    fi
+    unit_failure "$name" "$rc" "$ulog" "$UNIT_BOUND" >> "$RUN/failed"
   fi
 done < "$PLAN"
 CURRENT_UNIT=""

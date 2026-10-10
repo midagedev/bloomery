@@ -1,0 +1,71 @@
+# The off-box check on every pull request and every push to main: `just contrib-check --tier t0` (tools/contrib-check.sh):
+# cargo fmt --check, `cargo test -p` for each pure crate, the Python tool self-tests and every tools/check-*.sh.
+#
+# Tier t1 (the host-nightly units) is not run here. It needs the CUDA 13.3 headers (cuda.h, curand.h, crt/host_config.h), and
+# those come from three .deb files of NVIDIA's download site that tools/nightly/install.sh checks against pinned sha256 and
+# unpacks by hand: more than apt packages (Ubuntu's own CUDA packages are another version). It also builds the host tier in
+# release mode. The nightly (tools/nightly/run.sh) runs t1 on a machine made for it.
+#
+# This is a smoke test of a change, never landing evidence: the gates run on the maintainers' workstation.
+name: PR check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contrib-check-t0:
+    name: contrib-check t0
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The channel rust-toolchain.toml pins, minimal profile plus rustfmt (the file's own component list is about a
+      # gigabyte no unit needs). tools/contrib-check.sh reads the same channel and selects it.
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml | head -1)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+
+      # recipes.py reads the justfile through `just --dump`; the version and sha256 are the nightly's pin.
+      - name: Install just
+        run: |
+          version=$(sed -n 's/^JUST_VERSION=//p' tools/nightly/install.sh)
+          sha=$(sed -n 's/^JUST_SHA=//p' tools/nightly/install.sh)
+          test -n "$version" && test -n "$sha"
+          curl -sSfL -o "$RUNNER_TEMP/just.tgz" "https://github.com/casey/just/releases/download/$version/just-$version-x86_64-unknown-linux-musl.tar.gz"
+          echo "$sha  $RUNNER_TEMP/just.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$RUNNER_TEMP/just.tgz" -C "$HOME/.local/bin" just
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo downloads and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: pr-check-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            pr-check-${{ runner.os }}-
+
+      - name: Python packages the tool self-tests import
+        run: sudo apt-get install -y --no-install-recommends python3-numpy python3-pil
+
+      - name: contrib-check t0
+        run: just contrib-check --tier t0

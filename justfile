@@ -78,6 +78,12 @@ mac-test:
 mac-static *ARGS:
     ./tools/mac-static.sh {{ARGS}}
 
+# An off-box check for a contributor: fmt, the pure crates' tests, the Python tool self-tests and every tools/check-*.sh
+# (T0, any OS with the pinned nightly), plus the host-nightly units on x86_64 Linux with no card (T1, the default there).
+# `just contrib-check --tier t0|t1`. One line per unit, then a DONE line; docs/contrib/local-check.md. The owner is tools/contrib-check.sh.
+contrib-check *ARGS:
+    ./tools/contrib-check.sh {{ARGS}}
+
 # 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
 check-recipes:
     ./tools/check-recipes.sh
