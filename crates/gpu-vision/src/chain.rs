@@ -7,7 +7,7 @@
 use crate::gemm_bf16::{Epilogue, GemmArgs, GemmKernels};
 use bloomery_gpu::{GpuError, TensorWindow, Window};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::Gguf;
+use gguf::{GgmlType, Gguf};
 
 /// Where an encode's intermediate tensors go when a caller asks for them (a gate). `wants` is
 /// asked before each named point; a `true` synchronizes the stream and hands the tensor over
@@ -140,11 +140,7 @@ pub(crate) fn up_f32(
     )?)
 }
 
-pub(crate) fn read_bf16(
-    file: &Gguf,
-    name: &str,
-    what: &'static str,
-) -> Result<Vec<u16>, GpuError> {
+pub(crate) fn read_bf16(file: &Gguf, name: &str, what: &'static str) -> Result<Vec<u16>, GpuError> {
     Ok(tensor_bytes(file, name, what)?
         .as_chunks::<2>()
         .0
@@ -160,4 +156,56 @@ pub(crate) fn read_f32(file: &Gguf, name: &str, what: &'static str) -> Result<Ve
         .iter()
         .map(|c| f32::from_le_bytes(*c))
         .collect())
+}
+
+/// A matrix of the file as bf16 bits: a bf16 tensor as it is; an f32 or f16 one only when every
+/// value round-trips through bf16 exactly (the converter keeps some kernels out of the narrow
+/// type, and an f16 export's values are not generally bf16's), else refused naming the tensor
+/// and the first value that does not.
+pub(crate) fn read_bf16_narrowed(
+    file: &Gguf,
+    name: &str,
+    what: &'static str,
+) -> Result<Vec<u16>, GpuError> {
+    let ty = file
+        .find(name)
+        .ok_or_else(|| GpuError::Tensor {
+            what,
+            name: name.to_string(),
+            need: "in the encoder file",
+        })?
+        .ty;
+    let values: Vec<f32> = match ty {
+        GgmlType::BF16 => return read_bf16(file, name, what),
+        GgmlType::F32 => read_f32(file, name, what)?,
+        GgmlType::F16 => tensor_bytes(file, name, what)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| gguf::quant::half_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        other => {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!("tensor {name} is {other}; a matrix is bf16, f16 or f32"),
+            });
+        }
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let bits = crate::f32_bf16(v);
+            if crate::bf16_f32(bits).to_bits() == v.to_bits() {
+                Ok(bits)
+            } else {
+                Err(GpuError::Shape {
+                    what,
+                    detail: format!(
+                        "tensor {name} value {v:e} at index {i} does not round-trip through bf16; the tower keeps its matrices in bf16"
+                    ),
+                })
+            }
+        })
+        .collect()
 }

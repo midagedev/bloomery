@@ -9,10 +9,13 @@
 # ds41_attn_seg_sel was found by eye). A new entry is a failure until it is pinned, so a new kernel
 # cannot arrive spilling unseen.
 #
-# Usage: tools/ptx-spill-check.sh <table> <binary name>...
+# Usage: tools/ptx-spill-check.sh <table> <binary name>[:<entry substring>]...
 #        tools/ptx-spill-check.sh --self-test   (a stub ptx-scan.sh on fixed scans, no build; check-recipes runs it)
 #   Runs `tools/ptx-scan.sh <binary>` for each binary (the recipe builds them first) and compares
-#   its entry rows with the table's rows for that binary. The table (tools/ref/ptx-shapes.tsv) holds
+#   its entry rows with the table's rows for that binary. A `<binary>:<substring>` argument scans only the
+#   entries whose name holds the substring (ptx-scan's own filter) and the table's rows for the binary are
+#   those entries: a binary that links a bundle another named binary already pins (the gpu bundle) pins only
+#   its own device crate's entries. The table (tools/ref/ptx-shapes.tsv) holds
 #   `<binary> <entry> <spill> <jit_local>`, whitespace-separated; `#` starts a comment. A pinned
 #   nonzero value carries a `# PIN(YYYY-MM-DD): <reason>` comment on the line above its row.
 #   The table is read once, into a copy every binary reads: a table given as a pipe or a process
@@ -32,8 +35,9 @@ self_test() {
   cp "${BASH_SOURCE[0]}" "$t/ptx-spill-check.sh"
   # The stub scan prints the fixture scan of its binary, or fails as ptx-scan does on a missing binary.
   printf '%s\n' '#!/usr/bin/env bash' \
-    '[ -f "${BASH_SOURCE[0]%/*}/$1.scan" ] || { echo "ptx-scan bin=target/release/$1 missing scan=failed"; exit 1; }' \
-    'cat "${BASH_SOURCE[0]%/*}/$1.scan"' > "$t/ptx-scan.sh"
+    'f="${BASH_SOURCE[0]%/*}/$1${2:+.$2}.scan"' \
+    '[ -f "$f" ] || { echo "ptx-scan bin=target/release/$1 missing scan=failed"; exit 1; }' \
+    'cat "$f"' > "$t/ptx-scan.sh"
   scan() { # scan <bin> <entry spill jit_local>...
     local b=$1 r
     shift
@@ -45,7 +49,8 @@ self_test() {
   scan b "k3 0 0"
   scan c "k4 0 0"
   scan d "k1 16 0"
-  printf '%s\n' '# fixture' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' 'd k1 0 0' 'd k9 0 0' > "$t/table"
+  scan h.vis_ "vis_a 0 0"
+  printf '%s\n' '# fixture' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' 'd k1 0 0' 'd k9 0 0' 'h vis_a 0 0' > "$t/table"
   check() { # check <name> <want rc> <want line or -> <args...>
     local name=$1 want=$2 line=$3
     shift 3
@@ -62,6 +67,7 @@ self_test() {
   check "a spill above its pin" 1 "d k1 spill=16 pinned=0 ABOVE" "$t/table" d
   check "a pinned row the scan lacks" 1 "d k9 stale" "$t/table" d
   check "a failed scan" 1 "ptx-spill bin=e scan rc=1 FAIL" "$t/table" e
+  check "a binary scanned under an entry filter pins only the filtered entries" 0 "ptx-spill bin=h entries=1 pinned=1 nonzero=none violations=0 PASS" "$t/table" h:vis_
   check "no binary" 2 - "$t/table"
   rm -rf "$t"
   [ "$fails" = 0 ] && echo "ptx-spill-check: self-test ok" || { echo "ptx-spill-check: self-test $fails failed" >&2; return 1; }
@@ -83,8 +89,11 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 cat -- "$TABLE" > "$TMP/table" || { echo "ptx-spill-check: cannot read the table $TABLE" >&2; exit 2; }
 rc=0
-for BIN in "$@"; do
-  bash "$SCAN" "$BIN" > "$TMP/$BIN.scan" 2> "$TMP/$BIN.err"
+for ARG in "$@"; do
+  BIN=${ARG%%:*}
+  FILTER=
+  case "$ARG" in *:*) FILTER=${ARG#*:} ;; esac
+  bash "$SCAN" "$BIN" ${FILTER:+"$FILTER"} > "$TMP/$BIN.scan" 2> "$TMP/$BIN.err"
   src=$?
   banner=$(grep -m1 '^ptx-scan bin=' "$TMP/$BIN.scan")
   echo "${banner:-ptx-scan bin=target/release/$BIN (no banner)}"
