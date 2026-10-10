@@ -64,7 +64,9 @@
 //!   arm's main server, after that server's drafted clauses;
 //! - under the draft (`--arm drafted`, that arm's main server): a greedy
 //!   `/completion` gives the plain run's ids with its draft counts carried
-//!   (a draft changes which passes run, never a token), and `/props`'
+//!   (a draft changes which passes run, never a token; the fixture tier
+//!   defers the counts by name: its draft proposes and its random-weight
+//!   target accepts none), and `/props`'
 //!   `engine.draft` names the draft file
 //!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
 //!   requests that extend the sequence the
@@ -366,7 +368,11 @@
 //! on the plain arm's main server and the plain clauses' own) and
 //! `BLOOMERY_RESIDENCY` (`off`; the residency word's server sets its word) —
 //! the slots clause's second server alone sets neither: it is the seat under
-//! its own defaults (the user's case).
+//! its own defaults (the user's case). The drafted arm's main server also
+//! takes the drafting load's `BLOOMERY_CARD_BUDGET` (`tier::plan_levers`: in
+//! the fixture tier the header's budget plus the draft's card bytes at
+//! `CTX`, as a drafting load plans there; the runner exports the target's
+//! alone), and `/props`' engine clauses plan under the same.
 //! `BLOOMERY_DRAFT`, `BLOOMERY_RESIDENCY` and `BLOOMERY_XSTREAM` set in this
 //! binary's environment are refused by name:
 //! the arm names the draft (a set `BLOOMERY_MTP_DRAFT` needs the drafted
@@ -734,13 +740,13 @@ mod gate {
         // Under the draft the plan carries it (its granules, its store, its
         // row map and its program's arena beside the target's card terms),
         // and `/props` files its bytes as the card's `draft` class.
-        let levers_plan = PlanLevers::from_levers(levers)?;
-        let (draft_path, from) = draft_file(levers.mtp_draft(), &path);
+        let (draft_path, _) = draft_file(levers.mtp_draft(), &path);
         let terms = |dense: u64, experts_at: u64, host: u64, tables: u64, kv: u64, draft: u64| {
             (dense + experts_at + draft, host + tables, kv, draft)
         };
         let (card_bytes, host_bytes, kv, draft_bytes) = match mtp {
             false => {
+                let levers_plan = PlanLevers::from_levers(levers)?;
                 let plan =
                     inputs.plan_with(&machine, u64::try_from(CTX)?, &levers_plan, experts)?;
                 let c = plan.cards.first().ok_or("the gate's plan has no card")?;
@@ -754,15 +760,7 @@ mod gate {
                 )
             }
             true => {
-                let rows = head_rows_of(levers.mtp_head_rows(), &split, inputs.spec.vocab)?.rows;
-                let draft = Split::open(&draft_path).map_err(|e| {
-                    format!(
-                        "open the MTP draft {} ({}): {e}",
-                        draft_path.display(),
-                        from.describe()
-                    )
-                })?;
-                let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
+                let (mtp, levers_plan) = drafted_plan_inputs(levers, &path, &split, &inputs)?;
                 let with = inputs.plan_mtp_with(
                     &machine,
                     u64::try_from(CTX)?,
@@ -4237,6 +4235,34 @@ mod gate {
         Ok(ok)
     }
 
+    /// The MTP draft the drafted main server opens ([`draft_file`]) read
+    /// against the target at `path` (`split`, `inputs`), its head the
+    /// lever's rows, and the plan levers of that load at [`CTX`] a slot:
+    /// [`tier::plan_levers`] with the draft's card bytes there as its
+    /// reserve — in the fixture tier the header's budget plus them (the
+    /// header's is the target's alone, so the target keeps the card experts
+    /// its plain load holds), in the real tier the caller's lever as it
+    /// stands.
+    fn drafted_plan_inputs(
+        levers: &bloomery_levers::Levers,
+        path: &Path,
+        split: &Split,
+        inputs: &PlanInputs,
+    ) -> Result<(MtpInputs, PlanLevers), GateError> {
+        let (draft_path, from) = draft_file(levers.mtp_draft(), path);
+        let draft = Split::open(&draft_path).map_err(|e| {
+            format!(
+                "open the MTP draft {} ({}): {e}",
+                draft_path.display(),
+                from.describe()
+            )
+        })?;
+        let rows = head_rows_of(levers.mtp_head_rows(), split, inputs.spec.vocab)?.rows;
+        let mtp = MtpInputs::read(&draft, split, inputs, rows)?;
+        let plan_levers = tier::plan_levers(split, levers, mtp.card_bytes(u64::try_from(CTX)?)?)?;
+        Ok((mtp, plan_levers))
+    }
+
     /// The drafted arm (the module header): the main server of
     /// [`SERVER_ARGS`] under `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`
     /// and the fixed window, running the main arm's drafted clauses alone —
@@ -4261,6 +4287,16 @@ mod gate {
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env(bloomery_levers::RESIDENCY, "off")
             .env(bloomery_levers::MTP_WIDTH, "fixed");
+        // The drafting load's budget ([`drafted_plan_inputs`]): the fixture
+        // tier's runner exports the target's alone, beside which the draft's
+        // card bytes leave no slot of [`CTX`].
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::describe(&split)?;
+        let (_, plan_levers) = drafted_plan_inputs(levers, &path, &split, &inputs)?;
+        if let Some(budget) = plan_levers.card_budget_bytes {
+            cmd.env(bloomery_levers::CARD_BUDGET, budget.to_string());
+        }
         let mut served = Served38::spawn_with(&SERVER_ARGS, dir, &mut cmd)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
@@ -4295,12 +4331,16 @@ mod gate {
             "drafted_ids_are_the_plain_runs",
             agree(&first, &stop, reference),
         );
-        check(
-            &mut ok,
-            "drafted_timings_carry_the_draft_counts",
-            d["draft_n"].as_u64().is_some_and(|n| n > 0)
-                && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
-        );
+        // The accepted count is the file's: the fixture's draft proposes,
+        // and its random-weight target accepts none of it.
+        if tier::run_clause("drafted_timings_carry_the_draft_counts", Tag::FileBound)? {
+            check(
+                &mut ok,
+                "drafted_timings_carry_the_draft_counts",
+                d["draft_n"].as_u64().is_some_and(|n| n > 0)
+                    && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
+            );
+        }
         ok &= continued(&url, &err_log, ids, reference)?;
         let sampled = json!({
             "prompt": prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
