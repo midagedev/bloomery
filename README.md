@@ -16,9 +16,11 @@
 - **MoE models larger than the card.** Routed experts live on the GPU and in host RAM; the engine counts its own
   routing and moves the experts it calls most onto the card while it runs. On one RTX 3090 24 GB beside a 256 GB
   host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 34.4 tok/s in total and GLM-5.3-Flash at 26.9.
-- **Several requests, one pass.** With `--parallel 2` two busy streams run through the model together: 25–37 %
-  more tokens a second in total than one stream
-  ([measured on the A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).
+- **Several requests, one pass.** With `--parallel 2` two busy streams run through the model together. With the MTP
+  draft off, that gave 25–37 % more tokens a second in total than one stream (0.2.1,
+  [measured on the A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)). The draft
+  is on by default and already fills the pass's rows: in 0.2.10's release check (A6000), two streams of Qwen3.8
+  (`--place a`) and GLM-5.3 `UD-IQ4_XS` gave about the total of one stream.
 - **llama-server compatible.** The same HTTP API (OpenAI and Anthropic), GGUF files and flag spellings: your client
   works unchanged.
 - **Rust all the way down.** Every CUDA kernel is written in Rust and compiled with
@@ -39,7 +41,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. Every number here comes from an 8-channel host; a 2-channel desktop host is not measured here and runs the CPU experts slower |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
-| Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does |
+| Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 (in turn under `--place bp`) and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default; its width follows measured cost |
 | Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
 | i-quants | Qwen3.8 `UD-Q3_K_XL` (IQ3_XXS, IQ4_XS, IQ4_NL experts) runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. GLM-5.3 `UD-IQ4_XS` (IQ3_S experts) runs with every routed expert on the host. IQ2_*, IQ1_M and BF16 tensors are not loaded yet |
