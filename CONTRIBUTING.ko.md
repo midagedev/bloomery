@@ -14,9 +14,12 @@
 - **순수 크레이트 (OS 무관):** `python3 tools/recipes.py pure-crates`가 목록을 보여 줍니다. `cargo test -p <crate>`로
   하나씩 돌립니다. `bloomery-serve`에는 mock 엔진이 있어서 모델 없이 HTTP API를 테스트할 수 있습니다.
 - **호스트 tier (x86_64 Linux, 카드 불필요):** `python3 tools/recipes.py host-nightly`가 보여 주는 단위들입니다.
-  Zen 3 대상으로 빌드되므로 다른 CPU에서는 `RUSTFLAGS='-C target-cpu=native'`를 주세요.
+  Zen 3 대상으로 빌드되므로 다른 CPU에서는 `RUSTFLAGS='-C target-cpu=native'`를 주세요(`just contrib-check`는 알아서 설정합니다).
 - **Python·셸 도구:** `tools/` 아래 도구들은 self-test가 있습니다(`python3 tools/recipes.py --self-test` 등).
 - **Mac:** `just mac-static`이 정적 검사(포맷, x86_64-linux 대상 clippy, 모든 check 스크립트)를 돌립니다.
+- **한 번에:** `just contrib-check`가 위 항목을 모두 돌리고, 항목마다 한 줄씩 결과를 낸 뒤 마지막에 `DONE` 줄을 찍습니다.
+  `--tier t0`은 OS와 관계없이, `--tier t1`(x86_64 Linux의 기본값)은 호스트 tier까지 돌립니다. PR에는 이 출력을 붙여
+  주세요. PR마다 GitHub CI가 `--tier t0`을 돌리지만, 이것은 변경을 빠르게 훑는 검사이지 착지 근거가 아닙니다.
 - **입문 작업:** [`good first issue` 라벨](https://github.com/midagedev/bloomery/labels/good%20first%20issue)이 붙은
   이슈들입니다. `no-box` 라벨은 우리 머신 없이 끝까지 검증할 수 있다는 뜻입니다.
 
