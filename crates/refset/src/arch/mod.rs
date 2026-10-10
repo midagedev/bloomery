@@ -6,9 +6,12 @@
 
 use crate::family::{Family, Identity};
 
+pub use draft::{BesideDraft, DraftFrom, beside_draft, beside_drafts};
+
 pub mod deepseek41;
 pub mod deepseek41v;
 pub mod dequant;
+pub mod draft;
 pub mod glm5next;
 pub mod mimo2;
 pub mod qwen35;
