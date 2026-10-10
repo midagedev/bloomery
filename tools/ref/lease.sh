@@ -394,7 +394,7 @@ lease_take() {
     echo "[lease] refused: a GPU timing runner (timing-card.sh sourced) with TIMING_GPU empty — the lease would record no timing card${TIMING_CARDS_WHY:+ ($TIMING_CARDS_WHY)}" >&2
     exit 64
   fi
-  if [ "$LEASE_LOCK" != /root/bloomery-cpu.lock ] && [ -e /root/bloomery-cpu.lock ]; then
+  if [ "$LEASE_LOCK" != /root/bloomery-cpu.lock ] && on_box; then
     echo "[lease] refused: BLOOMERY_LEASE_LOCK=$LEASE_LOCK on the machine whose lease is /root/bloomery-cpu.lock: a run under another lock would share the box with a real sitting" >&2
     exit 64
   fi
@@ -1076,7 +1076,7 @@ EOF
     check trace-let-go-none "$([ -e "$t/trace5.log" ] && echo written || echo none)" none
     # lease_take and lease-hold.sh write them. The machine's own lease refuses a lock override
     # (lease_take, exit 64), so these two take a lock of their own only where there is no machine lease.
-    if [ -e /root/bloomery-cpu.lock ]; then
+    if on_box; then
       echo "skip trace wiring: /root/bloomery-cpu.lock exists, a lease_take under another lock is refused; these two cases run off the box"
     else
       wenv=(env -u BLOOMERY_LEASE_HELD -u ROUNDS -u BLOOMERY_AB_ROUNDS BLOOMERY_LEASE_CARD=docs/cards/selftest-lease-hold.card

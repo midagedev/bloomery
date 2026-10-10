@@ -10,8 +10,22 @@
 #
 # What it owns: the lease's file (LEASE_LOCK); its probe (lease_free, the only `flock` on the lease
 # that is not a take); the holds (LEASE_HOLDS, lease_holds_up); the guard (lease_guard); naming the
-# lease's holder to a waiter (lease_holders); the UTC stamp every [lease] line carries (now).
-LEASE_LOCK=${BLOOMERY_LEASE_LOCK:-/root/bloomery-cpu.lock}
+# lease's holder to a waiter (lease_holders); the UTC stamp every [lease] line carries (now); the box's mark (BOX_LEASE,
+# on_box, box_lock_dir).
+# LOCK_DIR: the directory of the machine's lock files, the lease and the holds here and tools/gpu-gate.sh's gate locks;
+# BLOOMERY_LOCK_DIR, /root when unset (tools/box.sh's local mode sets it).
+LOCK_DIR=${BLOOMERY_LOCK_DIR:-/root}
+LEASE_LOCK=${BLOOMERY_LEASE_LOCK:-$LOCK_DIR/bloomery-cpu.lock}
+
+# The box is the machine whose timing lease is BOX_LEASE (lease_take makes it there; the box runs as root, which reads
+# /root): on_box is 0 there. box_lock_dir <dir> is 0 when <dir> is /root, the box's lock directory, as spelled or as an
+# existing directory resolves (`/root/.`, a symlink): tools/box.sh's local mode keeps its locks anywhere else.
+BOX_LEASE=/root/bloomery-cpu.lock
+on_box() { [ -e "$BOX_LEASE" ]; }
+box_lock_dir() {
+  case $1 in /root | /root/) return 0 ;; esac
+  [ "$(cd -- "$1" 2> /dev/null && pwd -P)" = /root ]
+}
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -42,7 +56,7 @@ lease_free() {
 # /root/bloomery-<owner>-hold, one per owner, <owner> letters, digits and `_` (`03`: bloomery-03's
 # sitting scripts). LEASE_HOLDS is the one pattern that names them, its `*` the owner
 # (BLOOMERY_LEASE_HOLDS, for the stub tests).
-LEASE_HOLDS=${BLOOMERY_LEASE_HOLDS:-/root/bloomery-*-hold}
+LEASE_HOLDS=${BLOOMERY_LEASE_HOLDS:-$LOCK_DIR/bloomery-*-hold}
 
 # lease_holds_up [owner]: one line `<file> owner=<o> up=<age> since=<epoch>` per hold that is up,
 # except <owner>'s: a hold's owner runs its own sitting through tools/box.sh while the hold is up. A
@@ -55,8 +69,7 @@ lease_holds_up() {
     echo "[guard] LEASE_HOLDS='$LEASE_HOLDS' is not <prefix>*<suffix> with one '*' (the owner)" >&2
     return 64
   fi
-  # shellcheck disable=SC2086 # LEASE_HOLDS is a pattern; its expansion is the list of holds
-  for f in $LEASE_HOLDS; do
+  for f in "$pre"*"$suf"; do
     [ -e "$f" ] || continue
     o=${f#"$pre"} o=${o%"$suf"}
     [ -n "$mine" ] && [ "$o" = "$mine" ] && continue
@@ -76,13 +89,15 @@ __lease_mtime() { stat -c %Y "$1" 2> /dev/null || stat -f %m "$1" 2> /dev/null |
 # (lease_holds_up's lines) went up before it — same second: the owner that sorts first went up first.
 # Two sittings whose holds are both up wait on each other; the later one gives way at once.
 __lease_gives_way() {
-  local owner=$1 mine m f o since
+  local owner=$1 mine m ln f o since
   mine=${LEASE_HOLDS%%\**}$owner${LEASE_HOLDS#*\*}
   [ -n "$owner" ] && [ -e "$mine" ] || return 1
   m=$(__lease_mtime "$mine")
   [ -n "$m" ] || return 1
-  while read -r f o _ since; do
-    o=${o#owner=} since=${since#since=}
+  # A hold's path may hold a space (BLOOMERY_LOCK_DIR), so the fields are cut from the line's end.
+  while IFS= read -r ln; do
+    f=${ln% owner=*} o=${ln##* owner=} since=${ln##* since=}
+    o=${o%% *}
     case $since in '' | *[!0-9]*) continue ;; esac
     if [ "$since" -lt "$m" ] || { [ "$since" = "$m" ] && [[ $o < $owner ]]; }; then
       echo "[guard] $(now) hold $f (owner $o) went up before $mine: two sittings would wait on each other, so this one gives way — the command did not run (rc 75); take $mine down and start again after $o's sitting" >&2

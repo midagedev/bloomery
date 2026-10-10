@@ -43,6 +43,9 @@
 # Killing is TERM, then up to five seconds of `kill -0` on the pids we were handed at start,
 # then KILL. Signals go to those pids and to nothing found later: a pid discovered by a
 # pattern after the fact is the class of mistake above.
+#
+# Under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local) root is the contributor's own tree, whose
+# binaries are their own runs, not a track's orphans: every mode but --self-test is refused (64).
 set -uo pipefail
 
 # --self-test (the header): the selection rules on a fake /proc tree, no box, no signal.
@@ -82,7 +85,7 @@ self_test() {
     echo "FAIL $1: ${2:-}"
     printf '%s\n' "$out" | sed 's/^/    | /'
   }
-  out=$(bash "$t/box-gc.sh" --dry-run "$t/root" 2>&1)
+  out=$(env -u BLOOMERY_BOX_CARD bash "$t/box-gc.sh" --dry-run "$t/root" 2>&1)
   rc=$?
   if [ "$rc" = 0 ] && grep -Eq '^proc 4194302 /bin/bash: bash tools/gpu-gate\.sh gen_x \(cwd .*/root\)$' <<< "$out"; then
     pass 'dry run: this track'"'"'s waiting bash tools/gpu-gate.sh is listed'
@@ -96,7 +99,7 @@ self_test() {
   if grep -q '^proc 4194301 ' <<< "$out" && grep -q '^proc 4194306 ' <<< "$out" && grep -q 'found 3 process(es)' <<< "$out"; then
     pass 'dry run: the target/ orphan and the harness runner are still listed (3 in all)'
   else fail 'dry run: the target/ orphan and the harness runner are still listed (3 in all)' 'see the listing'; fi
-  out=$(bash "$t/box-gc.sh" --check "$t/root" 2>&1)
+  out=$(env -u BLOOMERY_BOX_CARD bash "$t/box-gc.sh" --check "$t/root" 2>&1)
   rc=$?
   if [ "$rc" = 10 ] && grep -q 'found 5 process(es)' <<< "$out" && grep -q '^proc 4194304 ' <<< "$out"; then
     pass 'check: rc 10, and every cwd inside root counted beside them (5 in all)'
@@ -113,6 +116,10 @@ case "${1:-}" in
     exit $? ;;
   -*) echo "box-gc: unknown flag $1 (use --dry-run, --check, --kill or --self-test)" >&2; exit 64 ;;
 esac
+if [ "${BLOOMERY_BOX_CARD:-}" = local ]; then
+  echo "box-gc: BLOOMERY_BOX_CARD=local is tools/box.sh's local mode, whose root is this machine's own tree: a binary under its target/ is a run of yours, not an orphan on the box; box-gc is the box's" >&2
+  exit 64
+fi
 ROOT=${1:-$PWD}
 PREFIX="$ROOT/target"
 # The self-test's copy seds the next line to its fake tree — no BLOOMERY_* name for it: every such
