@@ -215,6 +215,9 @@ echo "[binary] $BIN sha256=$BIN_SHA mtime=$BIN_MTIME (newer than every file in i
 [ -r "$MODEL" ] || { echo "nvtier-read.sh: the model file $MODEL is not readable (profile $MODEL_NAME)" >&2; exit 2; }
 DIR=$(dirname "$MODEL")
 DEV=$(drive_dev "$MODEL") || exit 2
+# The witness's table and blockstat fields read the mount source and the device's counters.
+SRC=$(findmnt -n -o SOURCE --target "$DIR")
+STAT=/sys/block/$DEV/stat
 
 WITNESS=(head loadavg pressure-cpu pressure-io table blockstat meminfo pgmajfault cpu cpu-mhz-range lock-holder binary model)
 
