@@ -730,11 +730,25 @@ pub(crate) mod hold {
     /// The hold; dropping it opens it, so a failed assert never leaves the
     /// stream shut. While it is shut the test must not wait for anything
     /// enqueued behind it: no land, no event or stream sync, no extent drop.
+    ///
+    /// No other test may run beside it: a device-wide sync in a parallel test
+    /// (`cuMemFree` is one) waits for the shut stream while holding the
+    /// driver's lock that this test's next launch needs, and neither returns.
+    /// So a test that holds is named `hw_held_…`, the lib's parallel pass
+    /// skips that prefix, and a second pass runs it under `RUST_TEST_THREADS=1`
+    /// (`just gate-gpu-lib`); [`Hold::on`] refuses by name anywhere else.
     pub struct Hold(Arc<AtomicBool>);
 
     impl Hold {
-        /// Shuts `stream` after the work it holds so far.
+        /// Shuts `stream` after the work it holds so far. Panics by name
+        /// unless the tests run one at a time (see [`Hold`]).
         pub fn on(stream: &CudaStream) -> Result<Hold, GpuError> {
+            assert_eq!(
+                std::env::var("RUST_TEST_THREADS").as_deref(),
+                Ok("1"),
+                "a held stream deadlocks a parallel test's device sync: name the test hw_held_… so \
+                 gate-gpu-lib runs it in its RUST_TEST_THREADS=1 pass"
+            );
             let flag = Arc::new(AtomicBool::new(false));
             let data = Arc::into_raw(Arc::clone(&flag)).cast_mut().cast::<c_void>();
             // SAFETY: `data` is a live `Arc` count that `wait_open` takes.

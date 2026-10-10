@@ -1255,9 +1255,10 @@ gate-gpu-mcol:
 
 # bloomery-gpu's lib tests through tools/gate.sh --oxide (its bound, cargo's exit code), with no gate lock, so the
 # batch keeps them on the 3090 (lane A). The hw_ tests (graph.rs' capture, replay, host flags and node kinds;
-# checkpoint.rs; host/step.rs' boundary) run small kernels on device 0. just gate runs it.
+# checkpoint.rs; host/step.rs' boundary) run small kernels on device 0. A test that holds a stream shut (hw_held_,
+# checkpoint.rs' Hold) runs in a second pass, one at a time: beside another test it deadlocks. just gate runs it.
 gate-gpu-lib:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored --skip hw_held_ && RUST_TEST_THREADS=1 bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored hw_held_'
 
 # bloomery-gpu-gates 라이브러리의 단위 시험(호스트 전용, 카드·게이트 락 없음). ptx.rs의 컨테이너 판독 계약 —
 # 8의 배수 길이 페이로드의 마지막 본문, 번들 경계, 파서가 거부한 섹션은 빈 표가 아니라 오류 — 이 여기서 돈다.

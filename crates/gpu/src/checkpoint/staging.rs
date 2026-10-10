@@ -477,7 +477,7 @@ mod tests {
     /// the call.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_dropping_an_extent_waits_for_the_copy_that_fills_it() {
+    fn hw_held_dropping_an_extent_waits_for_the_copy_that_fills_it() {
         const BYTES: usize = 256 << 20;
         let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let dev = DeviceBuffer::<u8>::zeroed(&stream, BYTES).expect("the device store");
