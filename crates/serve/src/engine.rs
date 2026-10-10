@@ -45,11 +45,20 @@
 //! that prompt's reply — the server takes the slot's state as a value
 //! ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`] bytes,
 //! keyed by the ids and the images it covers; a later request that one of
-//! those states serves better than the slot does gets it back
-//! ([`Engine::resume`]). Slots that take the engine in turns hand the cache the
-//! idle states they stop parking. What the cache did, and every prefix the
-//! engine keeps less of than a request shares, reaches the engine's binary as
-//! a [`CacheNote`] ([`Engine::note`]).
+//! those states serves better than the slot does gets back the prefix of it
+//! it keeps ([`Engine::resume_prefix`]). Slots that take the engine in turns
+//! hand the cache the idle states they stop parking. What the cache did, and
+//! every prefix the engine keeps less of than a request shares, reaches the
+//! engine's binary as a [`CacheNote`] ([`Engine::note`]).
+//!
+//! An engine that copies a state on a stream of its own
+//! ([`Engine::snapshots_async`]) is asked for it when a request ends, off the
+//! request path ([`Engine::snapshot_begin`]): the state goes into the cache at
+//! once as a [`Pending`], which the cache never evicts before its copy has
+//! landed ([`Engine::snapshot_poll`], [`Engine::snapshot_wait`]), and the
+//! slot's next request waits for the copy before it cuts, resets or replaces
+//! the rows the copy reads. The copy running while a cut, a reset or a resume
+//! reaches the same rows is [`SaveInFlight`], never an overwrite.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -83,6 +92,24 @@ pub enum StateError {
     /// The engine failed mid-call.
     #[error(transparent)]
     Engine(#[from] EngineError),
+}
+
+/// A slot's rows were about to be cut, reset or replaced while the copy of
+/// its state was still reading them ([`Engine::snapshot_begin`]): a defect of
+/// the caller, which waits for the copy first ([`Engine::snapshot_wait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "slot {slot}: its state is still being copied; its rows cannot be cut, reset or replaced \
+     before the copy lands"
+)]
+pub struct SaveInFlight {
+    pub slot: usize,
+}
+
+impl From<SaveInFlight> for EngineError {
+    fn from(e: SaveInFlight) -> EngineError {
+        EngineError(e.to_string())
+    }
 }
 
 /// What a save wrote or a restore read of the engine's part of a slot file.
@@ -368,19 +395,7 @@ pub trait Engine: Send {
     /// The whole cache as a value [`Engine::resume`] takes back, the cache
     /// unchanged. The default is [`Engine::save_state`] into host memory.
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
-        let mut bytes = Vec::new();
-        let saved = self.save_state(&mut bytes)?;
-        if saved.n_bytes != bytes.len() as u64 {
-            return Err(StateError::Format(format!(
-                "the engine saved {} bytes and reported {}",
-                bytes.len(),
-                saved.n_bytes
-            )));
-        }
-        Ok(Arc::new(SavedBytes {
-            n_tokens: saved.n_tokens,
-            bytes,
-        }))
+        snapshot_bytes(self)
     }
     /// Replaces the cache with `state`, which this engine's
     /// [`Engine::snapshot`] took; the next `prefill` continues after
@@ -388,22 +403,45 @@ pub trait Engine: Send {
     /// server resets it). The default reads the default snapshot's bytes with
     /// [`Engine::restore_state`].
     fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
-        let Some(saved) = state.as_any().downcast_ref::<SavedBytes>() else {
-            return Err(StateError::Format(
-                "a saved state this engine did not take".to_owned(),
-            ));
-        };
-        let mut input = saved.bytes.as_slice();
-        let read = self.restore_state(&mut input)?;
-        if !input.is_empty() || read.n_tokens != saved.n_tokens {
-            return Err(StateError::Format(format!(
-                "the engine restored {} positions and left {} bytes of a state of {} positions",
-                read.n_tokens,
-                input.len(),
-                saved.n_tokens
-            )));
-        }
-        Ok(())
+        resume_bytes(self, state)
+    }
+    /// Whether [`Engine::snapshot_begin`] copies the state on a stream of the
+    /// engine's own, so a request's end can start it without stopping the
+    /// slots: only then does the server save a state when its request ends
+    /// instead of when the slot's rows are about to be cut. The default is
+    /// false: the snapshot is taken on the request path, as before.
+    fn snapshots_async(&self) -> bool {
+        false
+    }
+    /// The selected slot's state as a value whose copy may still run
+    /// ([`Pending`]): the cache holds it at once, and it is read only after
+    /// [`Engine::snapshot_wait`] returned. The slot's rows are not cut, reset
+    /// or replaced before then. The default is [`Engine::snapshot`], already
+    /// landed.
+    fn snapshot_begin(&self) -> Result<Pending, StateError> {
+        Ok(Pending::landed(self.snapshot()?))
+    }
+    /// What `pending`'s copy cost once it has landed, `None` while it runs;
+    /// never waits.
+    fn snapshot_poll(&self, pending: &Pending) -> Result<Option<Landed>, StateError> {
+        pending.flight().poll()
+    }
+    /// Waits until `pending`'s copy has landed and returns what it cost; the
+    /// same answer on every call.
+    fn snapshot_wait(&self, pending: &Pending) -> Result<Landed, StateError> {
+        pending.flight().wait()
+    }
+    /// Replaces the cache with the first `n` positions of `state` (a state
+    /// this engine's [`Engine::snapshot`] took, `n` a count
+    /// [`Saved::keepable`] granted): only the rows and the stores of those
+    /// positions go back to the engine. Returns the positions the cache holds
+    /// after, `n` or fewer; the server cuts what it keeps of them. The
+    /// default is [`Engine::resume`] of the whole state, which holds all of
+    /// its positions.
+    fn resume_prefix(&mut self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
+        let _ = n;
+        self.resume(state)?;
+        Ok(state.n_tokens())
     }
     /// Where to cut a prompt call of positions `first .. end` into calls so
     /// that the `marks` (ascending, each inside the call) a later request may
@@ -485,6 +523,127 @@ pub trait Saved: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// What a snapshot's copy cost on the engine's copy stream ([`Flight`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Landed {
+    /// The copy's own time, from its first byte's start to its last byte's
+    /// landing, as the copy stream timed it.
+    pub copy_ms: f64,
+    /// The copy calls the state took.
+    pub calls: u64,
+    /// The pinned staging this save allocated for itself, in ms: 0 when the
+    /// staging pool lent it memory it already held.
+    pub alloc_ms: f64,
+}
+
+/// The copy of a snapshot as it runs on the engine's copy stream.
+pub trait Flight: Send + Sync {
+    /// What the copy cost once it has landed; `None` while it runs. Never
+    /// waits.
+    fn poll(&self) -> Result<Option<Landed>, StateError>;
+    /// Waits for the copy to land and returns what it cost; the same answer
+    /// on every call.
+    fn wait(&self) -> Result<Landed, StateError>;
+}
+
+/// A copy that has landed already (a snapshot the engine took on the request
+/// path).
+struct Landed0;
+
+impl Flight for Landed0 {
+    fn poll(&self) -> Result<Option<Landed>, StateError> {
+        Ok(Some(Landed::default()))
+    }
+
+    fn wait(&self) -> Result<Landed, StateError> {
+        Ok(Landed::default())
+    }
+}
+
+/// A snapshot whose copy may still run ([`Engine::snapshot_begin`]): the
+/// state it becomes, which the cache ranks and counts from the moment it is
+/// begun, and the copy's [`Flight`]. The state's bytes are read only after
+/// the flight has landed.
+#[derive(Clone)]
+pub struct Pending {
+    state: Arc<dyn Saved>,
+    flight: Arc<dyn Flight>,
+}
+
+impl Pending {
+    /// `state`, whose copy `flight` runs.
+    #[must_use]
+    pub fn new(state: Arc<dyn Saved>, flight: Arc<dyn Flight>) -> Pending {
+        Pending { state, flight }
+    }
+
+    /// `state` with nothing in flight: a snapshot taken on the request path.
+    #[must_use]
+    pub fn landed(state: Arc<dyn Saved>) -> Pending {
+        Pending::new(state, Arc::new(Landed0))
+    }
+
+    /// The state the copy fills.
+    #[must_use]
+    pub fn state(&self) -> &Arc<dyn Saved> {
+        &self.state
+    }
+
+    /// The copy's flight.
+    #[must_use]
+    pub fn flight(&self) -> &Arc<dyn Flight> {
+        &self.flight
+    }
+
+    /// Whether `other` is this very snapshot.
+    #[must_use]
+    pub fn is(&self, other: &Pending) -> bool {
+        Arc::ptr_eq(&self.flight, &other.flight)
+    }
+}
+
+/// The default [`Engine::snapshot`]: [`Engine::save_state`]'s bytes, into
+/// host memory.
+pub(crate) fn snapshot_bytes<E: Engine + ?Sized>(e: &E) -> Result<Arc<dyn Saved>, StateError> {
+    let mut bytes = Vec::new();
+    let saved = e.save_state(&mut bytes)?;
+    if saved.n_bytes != bytes.len() as u64 {
+        return Err(StateError::Format(format!(
+            "the engine saved {} bytes and reported {}",
+            bytes.len(),
+            saved.n_bytes
+        )));
+    }
+    Ok(Arc::new(SavedBytes {
+        n_tokens: saved.n_tokens,
+        bytes,
+    }))
+}
+
+/// The default [`Engine::resume`]: [`Engine::restore_state`] of the default
+/// snapshot's bytes.
+pub(crate) fn resume_bytes<E: Engine + ?Sized>(
+    e: &mut E,
+    state: &Arc<dyn Saved>,
+) -> Result<(), StateError> {
+    let Some(saved) = state.as_any().downcast_ref::<SavedBytes>() else {
+        return Err(StateError::Format(
+            "a saved state this engine did not take".to_owned(),
+        ));
+    };
+    let mut input = saved.bytes.as_slice();
+    let read = e.restore_state(&mut input)?;
+    if !input.is_empty() || read.n_tokens != saved.n_tokens {
+        return Err(StateError::Format(format!(
+            "the engine restored {} positions and left {} bytes of a state of {} positions",
+            read.n_tokens,
+            input.len(),
+            saved.n_tokens
+        )));
+    }
+    Ok(())
+}
+
 /// The default snapshot: [`Engine::save_state`]'s bytes. Its `keepable` is
 /// every position it holds.
 struct SavedBytes {
@@ -528,6 +687,9 @@ pub enum CacheNote {
     /// state is a snapshot taken for the save, or for a park that found no
     /// room; not a state the slot already had, handed over as it is. `ms` is
     /// the save's own wall clock (a park's snapshot is the switch's).
+    /// `off_path`: the state is a [`Pending`] begun when its request ended,
+    /// its copy running on the engine's copy stream; `ms` is then the call
+    /// that began it and [`CacheNote::Landed`] follows.
     Save {
         positions: usize,
         bytes: u64,
@@ -535,10 +697,27 @@ pub enum CacheNote {
         entries: usize,
         cache_bytes: u64,
         copied: bool,
+        off_path: bool,
+    },
+    /// The copy of a saved state of `positions` landed: its bytes, the copy
+    /// calls it took, its time on the copy stream, the pinned staging it
+    /// allocated (0 when the pool lent it), and `waited_ms`, how long the
+    /// request path waited for it (0 when it had landed before a request
+    /// needed it).
+    Landed {
+        positions: usize,
+        bytes: u64,
+        calls: u64,
+        copy_ms: f64,
+        alloc_ms: f64,
+        waited_ms: f64,
     },
     /// A cached state of `positions` sharing `common` ids with the request
     /// replaced the slot's, which kept `slot_kept` of them; the engine then
-    /// keeps `kept`.
+    /// keeps `kept`, and `resumed` is the positions the engine put back of
+    /// the state (all of them for an engine that resumes whole). `waited_ms`
+    /// is how long the request path waited for the state's copy to land
+    /// first.
     Load {
         positions: usize,
         common: usize,
@@ -546,6 +725,8 @@ pub enum CacheNote {
         slot_kept: usize,
         bytes: u64,
         ms: f64,
+        resumed: usize,
+        waited_ms: f64,
     },
     /// A cached state left the cache: the budget needed its bytes, or a newer
     /// state keeps everything it did.
@@ -586,10 +767,23 @@ impl std::fmt::Display for CacheNote {
                 entries,
                 cache_bytes,
                 copied,
+                off_path,
             } => write!(
                 f,
                 "cache save positions={positions} bytes={bytes} ms={ms:.3} entries={entries} \
-                 cache_bytes={cache_bytes} copied={copied}"
+                 cache_bytes={cache_bytes} copied={copied} off_path={off_path}"
+            ),
+            CacheNote::Landed {
+                positions,
+                bytes,
+                calls,
+                copy_ms,
+                alloc_ms,
+                waited_ms,
+            } => write!(
+                f,
+                "cache landed positions={positions} bytes={bytes} calls={calls} \
+                 copy_ms={copy_ms:.3} alloc_ms={alloc_ms:.3} waited_ms={waited_ms:.3}"
             ),
             CacheNote::Load {
                 positions,
@@ -598,10 +792,13 @@ impl std::fmt::Display for CacheNote {
                 slot_kept,
                 bytes,
                 ms,
+                resumed,
+                waited_ms,
             } => write!(
                 f,
                 "cache load positions={positions} common={common} kept={kept} \
-                 slot_kept={slot_kept} bytes={bytes} ms={ms:.3}"
+                 slot_kept={slot_kept} bytes={bytes} ms={ms:.3} resumed={resumed} \
+                 waited_ms={waited_ms:.3}"
             ),
             CacheNote::Evict {
                 positions,

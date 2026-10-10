@@ -58,11 +58,11 @@ use serde_json::{Value, json};
 
 use crate::api::logprobs::{Ask, Collector, RowError};
 use crate::engine::{
-    CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplerRefused,
-    SamplingParams, Saved, SlotPass, SlotRow, StateError, Tokenizer,
+    CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
+    SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotPass, SlotRow, StateError, Tokenizer,
 };
 use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
-use crate::promptcache::PromptCache;
+use crate::promptcache::{PromptCache, Taken};
 use crate::reasoning::{THINK_CLOSE, ThinkEntry, ThinkSplit};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
@@ -327,6 +327,18 @@ pub(crate) struct Slot {
     /// slot's ([`Slot::select_off`]): [`Slot::erase`] drops its ids alone.
     off: bool,
     cache: PromptCache,
+    /// Each slot's state copy while it may still run ([`Slot::seal`]): its
+    /// rows are not cut, reset or replaced before it has landed.
+    saving: Vec<Option<Pending>>,
+}
+
+/// What a cache hit put back ([`Slot::load`]).
+struct Loaded {
+    positions: usize,
+    bytes: u64,
+    ms: f64,
+    resumed: usize,
+    waited_ms: f64,
 }
 
 impl Slot {
@@ -349,6 +361,7 @@ impl Slot {
             prompts: vec![0; n],
             away: None,
             off: false,
+            saving: vec![None; n],
         }
     }
 
@@ -530,11 +543,18 @@ impl Slot {
     /// no prefix it shared is noted.
     fn reuse(&mut self, req: &Held, want: bool) -> Result<usize, EngineError> {
         let away = self.away.take();
+        // The slot's own state copy lands before its rows are cut, reset or
+        // replaced; the copies of the other slots that have landed leave
+        // the cache free to evict them.
+        self.settle(self.cur)?;
+        self.refresh()?;
         let (mut common, mut ask, mut k) = self.keep_of(req, want, away.as_ref());
         // The pick is taken out before the slot's state is saved: making room
         // for that state may evict it, and the pick then lives on in `picked`.
         let picked = if want && self.cache.enabled() {
-            self.cache.best(req, k).map(|p| self.cache.take(p))
+            self.cache
+                .best(req, k)
+                .map(|p| (p.kept, self.cache.take(p)))
         } else {
             None
         };
@@ -551,17 +571,19 @@ impl Slot {
         {
             self.save_held(away.as_ref())?;
         }
-        if let Some((entry, state)) = picked {
+        if let Some((want_kept, taken)) = picked {
             let slot_kept = k;
-            if let Some((positions, bytes, ms)) = self.load(entry, &state)? {
+            if let Some(l) = self.load(taken, want_kept)? {
                 (common, ask, k) = self.keep_of(req, want, None);
                 self.engine.note(&CacheNote::Load {
-                    positions,
+                    positions: l.positions,
                     common,
                     kept: k,
                     slot_kept,
-                    bytes,
-                    ms,
+                    bytes: l.bytes,
+                    ms: l.ms,
+                    resumed: l.resumed,
+                    waited_ms: l.waited_ms,
                 });
             } else {
                 (common, ask, k) = (0, 0, 0);
@@ -583,13 +605,25 @@ impl Slot {
         }
         let held = std::mem::take(&mut self.held);
         if k == 0 {
-            self.engine.reset()?;
+            self.rows()?.reset()?;
         } else if k < held.len() {
-            self.engine.cut(k)?;
+            self.rows()?.cut(k)?;
         }
         self.held = held;
         self.held.truncate(k);
         Ok(k)
+    }
+
+    /// The engine, for a call that cuts, resets or replaces the selected
+    /// slot's rows. Refused by name ([`SaveInFlight`]) while that slot's state
+    /// is still being copied: every caller waits for the copy first
+    /// ([`Slot::settle`]), so this stands between a missed wait and a copy
+    /// that reads rows another call has already rewritten.
+    fn rows(&mut self) -> Result<&mut dyn Engine, EngineError> {
+        if !self.off && self.saving[self.cur].is_some() {
+            return Err(SaveInFlight { slot: self.cur }.into());
+        }
+        Ok(self.engine.as_mut())
     }
 
     /// The positions `req` shares with the slot, the most of them a request
@@ -673,29 +707,209 @@ impl Slot {
         }
     }
 
-    /// A cached `state` of `held` into the engine, the slot then holding it;
-    /// returns its positions, bytes and the wall time of the resume. A
-    /// state the engine refuses leaves the cache, the engine is reset and the
-    /// slot holds nothing (`None`); an engine failure is the request's error.
-    fn load(
-        &mut self,
-        held: Held,
-        state: &Arc<dyn Saved>,
-    ) -> Result<Option<(usize, u64, f64)>, EngineError> {
+    /// The request on `slot` ended and the slot holds its state: an engine
+    /// that copies on a stream of its own ([`Engine::snapshots_async`]) is
+    /// asked for the state now ([`Engine::snapshot_begin`]), which goes into
+    /// the cache as a copy still running, so the next request that cuts the
+    /// slot finds it saved instead of taking a snapshot on its own path. The
+    /// cost here is the call that begins the copy. Nothing happens for an
+    /// engine that copies on the request path, a cache that is off, a slot
+    /// that holds nothing or a state a cached one already keeps all of.
+    pub(crate) fn seal(&mut self, slot: usize) -> Result<(), EngineError> {
+        if !self.cache.enabled() || !self.engine.snapshots_async() {
+            return Ok(());
+        }
+        self.select(slot)?;
+        self.refresh()?;
+        if self.held.is_empty() || self.cache.covers(&self.held) {
+            return Ok(());
+        }
+        self.settle(slot)?;
+        let t = Instant::now();
+        match self.engine.snapshot_begin() {
+            Ok(p) => self.keep_pending(slot, p, ms_since(t)),
+            Err(StateError::Engine(e)) => Err(e),
+            Err(e) => {
+                self.engine.note(&CacheNote::Skip {
+                    positions: self.held.len(),
+                    why: format!("the engine took no snapshot: {e}"),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// `pending`, `slot`'s state of what it holds with its copy running,
+    /// into the cache; the slot's rows are held still until it lands. A state
+    /// of other than the slot's positions, or one the cache refuses, waits
+    /// for its copy and is dropped.
+    fn keep_pending(&mut self, slot: usize, pending: Pending, ms: f64) -> Result<(), EngineError> {
+        let held = self.held_of(slot).clone();
+        let positions = held.ids.len();
+        if pending.state().n_tokens() != positions {
+            self.engine.note(&CacheNote::Skip {
+                positions,
+                why: format!(
+                    "the state holds {} positions, slot {slot} holds {positions}",
+                    pending.state().n_tokens()
+                ),
+            });
+            return self.discard(&pending);
+        }
+        let notes = self.cache.insert_pending(held, pending.clone(), ms);
+        let kept = matches!(notes.last(), Some(CacheNote::Save { .. }));
+        for note in notes {
+            self.engine.note(&note);
+        }
+        if kept {
+            self.saving[slot] = Some(pending);
+            Ok(())
+        } else {
+            self.discard(&pending)
+        }
+    }
+
+    /// A copy nobody will read: waited for, so that the staging it fills is
+    /// free when the state drops.
+    fn discard(&mut self, pending: &Pending) -> Result<(), EngineError> {
+        match self.engine.snapshot_wait(pending) {
+            Ok(_) | Err(StateError::Format(_) | StateError::Io(_) | StateError::Unsupported(_)) => {
+                Ok(())
+            }
+            Err(StateError::Engine(e)) => Err(e),
+        }
+    }
+
+    /// `slot`'s state copy landed, waited for if it still runs; what the
+    /// request path waited is in the note. Nothing when none runs.
+    fn settle(&mut self, slot: usize) -> Result<(), EngineError> {
+        if let Some(p) = self.saving[slot].take() {
+            self.land(&p)?;
+        }
+        Ok(())
+    }
+
+    /// The copies that have landed, settled and noted, none waited for.
+    fn refresh(&mut self) -> Result<(), EngineError> {
+        for p in self.cache.in_flight() {
+            match self.engine.snapshot_poll(&p) {
+                Ok(Some(landed)) => self.landed(&p, landed, 0.0),
+                Ok(None) => {}
+                Err(StateError::Engine(e)) => return Err(e),
+                Err(e) => self.lose(&p, &e),
+            }
+        }
+        Ok(())
+    }
+
+    /// `p`'s copy landed: waited for when it still runs. Returns the ms the
+    /// request path waited, or `None` when the copy failed in a way that is
+    /// the state's alone (it leaves the cache; an engine failure is the
+    /// request's error).
+    fn land(&mut self, p: &Pending) -> Result<Option<f64>, EngineError> {
+        let t = Instant::now();
+        let (landed, waited_ms) = match self.engine.snapshot_poll(p) {
+            Ok(Some(landed)) => (landed, 0.0),
+            Ok(None) => match self.engine.snapshot_wait(p) {
+                Ok(landed) => (landed, ms_since(t)),
+                Err(StateError::Engine(e)) => return Err(e),
+                Err(e) => {
+                    self.lose(p, &e);
+                    return Ok(None);
+                }
+            },
+            Err(StateError::Engine(e)) => return Err(e),
+            Err(e) => {
+                self.lose(p, &e);
+                return Ok(None);
+            }
+        };
+        self.landed(p, landed, waited_ms);
+        Ok(Some(waited_ms))
+    }
+
+    /// `p`'s copy landed with `landed`, the request path having waited
+    /// `waited_ms`: its entry may leave the cache from here on.
+    fn landed(&mut self, p: &Pending, landed: Landed, waited_ms: f64) {
+        for s in &mut self.saving {
+            if s.as_ref().is_some_and(|q| q.is(p)) {
+                *s = None;
+            }
+        }
+        if self.cache.settle(p) {
+            self.engine.note(&CacheNote::Landed {
+                positions: p.state().n_tokens(),
+                bytes: p.state().n_bytes(),
+                calls: landed.calls,
+                copy_ms: landed.copy_ms,
+                alloc_ms: landed.alloc_ms,
+                waited_ms,
+            });
+        }
+    }
+
+    /// `p`'s copy failed for a reason that is the state's alone: the state
+    /// leaves the cache and is noted.
+    fn lose(&mut self, p: &Pending, why: &StateError) {
+        for s in &mut self.saving {
+            if s.as_ref().is_some_and(|q| q.is(p)) {
+                *s = None;
+            }
+        }
+        self.cache.settle(p);
+        self.cache.remove(p.state());
+        self.engine.note(&CacheNote::Skip {
+            positions: p.state().n_tokens(),
+            why: format!("the copy of the state failed: {why}"),
+        });
+    }
+
+    /// The first `n` positions of a cached state into the engine, the slot
+    /// then holding them; returns what went back: the state's positions and
+    /// bytes, the positions the engine put back, the wall time of the resume
+    /// and what the request path waited for the state's copy to land first.
+    /// A state the engine refuses leaves the cache, the engine is reset and
+    /// the slot holds nothing (`None`); an engine failure is the request's
+    /// error.
+    fn load(&mut self, taken: Taken, n: usize) -> Result<Option<Loaded>, EngineError> {
+        let Taken {
+            mut held,
+            state,
+            pending,
+        } = taken;
         self.held = Held::default();
         let t = Instant::now();
-        match self.engine.resume(state) {
-            Ok(()) => {
-                let ms = ms_since(t);
-                let got = (held.ids.len(), state.n_bytes(), ms);
+        let waited_ms = match &pending {
+            Some(p) => match self.land(p)? {
+                Some(ms) => ms,
+                None => return self.refuse_load(&state, held.ids.len(), "its copy failed"),
+            },
+            None => 0.0,
+        };
+        match self.rows()?.resume_prefix(&state, n) {
+            Ok(resumed) => {
+                let positions = held.ids.len();
+                if resumed > positions {
+                    return Err(EngineError(format!(
+                        "the engine put back {resumed} positions of a state of {positions}"
+                    )));
+                }
+                held.truncate(resumed);
+                let got = Loaded {
+                    positions,
+                    bytes: state.n_bytes(),
+                    ms: ms_since(t),
+                    resumed,
+                    waited_ms,
+                };
                 self.prompts[self.cur] = held.ids.len();
                 self.held = held;
                 Ok(Some(got))
             }
             Err(StateError::Engine(e)) => Err(e),
             Err(e) => {
-                self.cache.remove(state);
-                self.engine.reset()?;
+                self.cache.remove(&state);
+                self.rows()?.reset()?;
                 self.engine.note(&CacheNote::Skip {
                     positions: held.ids.len(),
                     why: format!("the engine refused to take the state back: {e}"),
@@ -703,6 +917,23 @@ impl Slot {
                 Ok(None)
             }
         }
+    }
+
+    /// A cached state that cannot be taken back, for `why`: it leaves the
+    /// cache, the engine is reset and the slot holds nothing.
+    fn refuse_load(
+        &mut self,
+        state: &Arc<dyn Saved>,
+        positions: usize,
+        why: &str,
+    ) -> Result<Option<Loaded>, EngineError> {
+        self.cache.remove(state);
+        self.rows()?.reset()?;
+        self.engine.note(&CacheNote::Skip {
+            positions,
+            why: format!("the engine refused to take the state back: {why}"),
+        });
+        Ok(None)
     }
 
     /// The slot's own handed-back `state` into the engine; true once it is
@@ -969,8 +1200,13 @@ impl Slot {
         let mut r = Counting::new(BufReader::new(File::open(path)?));
         let stored = slotfile::read_header(&mut r, self.vocab.n_vocab(), self.engine.ctx_max())?;
         let head = r.bytes;
+        self.settle(self.cur).map_err(StateError::Engine)?;
         let held = std::mem::take(&mut self.held);
-        let restored = match self.engine.restore_state(&mut r) {
+        let restored = match self
+            .rows()
+            .map_err(StateError::Engine)?
+            .restore_state(&mut r)
+        {
             Ok(s) => s,
             Err(StateError::Unsupported(what)) => {
                 self.held = held;
@@ -979,7 +1215,7 @@ impl Slot {
             Err(e @ StateError::Engine(_)) => return Err(e),
             Err(e) => {
                 self.prompts[self.cur] = 0;
-                self.engine.reset()?;
+                self.rows()?.reset()?;
                 return Err(e);
             }
         };
@@ -1003,7 +1239,7 @@ impl Slot {
         };
         if let Some(m) = mismatch {
             self.prompts[self.cur] = 0;
-            self.engine.reset()?;
+            self.rows()?.reset()?;
             return Err(StateError::Format(m));
         }
         let n = stored.len();
@@ -1014,10 +1250,13 @@ impl Slot {
 
     /// Drops the whole cache and the ids it held; returns how many it held.
     pub(crate) fn erase(&mut self) -> Result<usize, EngineError> {
+        if !self.off {
+            self.settle(self.cur)?;
+        }
         let held = std::mem::take(&mut self.held);
         self.prompts[self.cur] = 0;
         if !self.off {
-            self.engine.reset()?;
+            self.rows()?.reset()?;
         }
         Ok(held.len())
     }
@@ -1855,13 +2094,16 @@ mod cache_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use std::sync::atomic::Ordering::SeqCst;
+
     use super::{GenParams, Outcome, Slot, Timings, generate};
     use crate::api::logprobs::Ask;
     use crate::engine::{
-        CacheNote, Decoder, Engine, EngineError, SamplingParams, Saved, StateError, Tokenizer,
+        CacheNote, Decoder, Engine, EngineError, SamplingParams, SaveInFlight, Saved, StateError,
+        Tokenizer,
     };
     use crate::media::Held;
-    use crate::mock::{MockEngine, MockTokenizer};
+    use crate::mock::{MockEngine, MockTokenizer, SaveStats};
     use crate::reasoning::ThinkEntry;
     use crate::sampling;
 
@@ -2449,6 +2691,206 @@ mod cache_tests {
             t.cache_ms
         );
         assert_eq!(t.to_json()["cache_ms"].as_f64(), Some(t.cache_ms));
+    }
+
+    /// The mock under [`MockEngine::with_async_snapshots`] in a slot of
+    /// `slots` slots, its states copied in `copy`, and a probe of the notes
+    /// the server printed.
+    fn async_slot(
+        slots: usize,
+        copy: Duration,
+    ) -> (Slot, Arc<SaveStats>, Arc<Mutex<Vec<CacheNote>>>) {
+        let (mock, stats) = MockEngine::new(4096)
+            .with_slots(slots)
+            .with_cache_ram(1 << 20)
+            .with_async_snapshots(copy);
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let engine = Noted {
+            inner: mock,
+            notes: Arc::clone(&notes),
+        };
+        (Slot::with_slots(Box::new(engine), slots), stats, notes)
+    }
+
+    /// The mock, its notes kept.
+    struct Noted {
+        inner: MockEngine,
+        notes: Arc<Mutex<Vec<CacheNote>>>,
+    }
+
+    impl Engine for Noted {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.inner.tokenizer()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.inner.prefill(ids)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            self.inner.next(last, out)
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.inner.reset()
+        }
+        fn keepable(&self, n: usize) -> usize {
+            self.inner.keepable(n)
+        }
+        fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+            self.inner.cut(n)
+        }
+        fn ctx_max(&self) -> usize {
+            self.inner.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn cache_ram(&self) -> u64 {
+            self.inner.cache_ram()
+        }
+        fn slots(&self) -> usize {
+            self.inner.slots()
+        }
+        fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+            self.inner.select_slot(slot)
+        }
+        fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+            self.inner.snapshot()
+        }
+        fn snapshots_async(&self) -> bool {
+            self.inner.snapshots_async()
+        }
+        fn snapshot_begin(&self) -> Result<crate::engine::Pending, StateError> {
+            self.inner.snapshot_begin()
+        }
+        fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+            self.inner.resume(state)
+        }
+        fn resume_prefix(&mut self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
+            self.inner.resume_prefix(state, n)
+        }
+        fn note(&self, note: &CacheNote) {
+            self.notes.lock().expect("the notes").push(note.clone());
+        }
+    }
+
+    /// One request on `slot` of `s`, then its end as the worker books it.
+    fn served(s: &mut Slot, slot: usize, ids: &[u32]) -> Outcome {
+        s.select(slot).expect("a select");
+        let o = outcome(s, ids);
+        s.seal(slot).expect("a seal");
+        o
+    }
+
+    const COPY: Duration = Duration::from_millis(60);
+
+    /// A request's end begins the copy of its slot's state; the next
+    /// conversation on that slot, arriving after the copy landed, cuts the
+    /// slot with no snapshot on its path: none taken, its `cache_ms` well
+    /// under the copy's time and no wait noted.
+    #[test]
+    fn a_conversation_switch_pays_no_snapshot_on_the_request_path() {
+        let (mut slot, stats, notes) = async_slot(1, COPY);
+        served(
+            &mut slot,
+            0,
+            &enc("<｜User｜>the cat sat on the mat and the "),
+        );
+        std::thread::sleep(COPY * 2);
+        let t = served(&mut slot, 0, &enc("xyz uvw xyz ")).timings;
+        assert_eq!(
+            stats.sync_snapshots.load(SeqCst),
+            0,
+            "the request path took a snapshot"
+        );
+        assert_eq!(stats.begun.load(SeqCst), 2, "a copy begun at each end");
+        assert!(
+            t.cache_ms < COPY.as_secs_f64() * 1e3 / 4.0,
+            "cache_ms {} of a request that waits for nothing",
+            t.cache_ms
+        );
+        let n = notes.lock().expect("notes");
+        let waited: Vec<f64> = n
+            .iter()
+            .filter_map(|n| match n {
+                CacheNote::Landed { waited_ms, .. } => Some(*waited_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waited, [0.0], "the first copy landed unwaited: {n:?}");
+    }
+
+    /// A request that arrives while its slot's copy still runs waits for it
+    /// before the slot's rows are cut: the wait is in `cache_ms` and in the
+    /// `Landed` note, and no call ever rewrote rows the copy read.
+    #[test]
+    fn a_request_waits_for_its_slots_copy_before_it_cuts_the_rows() {
+        let (mut slot, stats, notes) = async_slot(1, COPY);
+        served(
+            &mut slot,
+            0,
+            &enc("<｜User｜>the cat sat on the mat and the "),
+        );
+        let t = served(&mut slot, 0, &enc("xyz uvw xyz ")).timings;
+        assert_eq!(stats.hazards.load(SeqCst), 0, "a cut under a copy");
+        assert_eq!(stats.sync_snapshots.load(SeqCst), 0);
+        assert!(
+            t.cache_ms > COPY.as_secs_f64() * 1e3 / 4.0,
+            "cache_ms {} of a request that had a copy to wait for",
+            t.cache_ms
+        );
+        let n = notes.lock().expect("notes");
+        assert!(
+            n.iter()
+                .any(|n| matches!(n, CacheNote::Landed { waited_ms, .. } if *waited_ms > 0.0)),
+            "no wait noted: {n:?}"
+        );
+    }
+
+    /// A cut, a reset or a resume of rows a copy still reads is
+    /// [`SaveInFlight`], by name, and nothing is rewritten.
+    #[test]
+    fn a_rewrite_under_a_running_copy_is_save_in_flight() {
+        let (mut slot, stats, _) = async_slot(1, COPY);
+        served(
+            &mut slot,
+            0,
+            &enc("<｜User｜>the cat sat on the mat and the "),
+        );
+        let err = slot.rows().err().expect("refused while the copy runs");
+        assert_eq!(err.0, SaveInFlight { slot: 0 }.to_string());
+        assert_eq!(stats.hazards.load(SeqCst), 0);
+        slot.settle(0).expect("the wait");
+        assert!(slot.rows().is_ok(), "once the copy has landed");
+    }
+
+    /// A cache hit puts back the prefix the request keeps and nothing past
+    /// it: the positions the engine took back are the kept ones, not the
+    /// state's, and no state goes back whole.
+    #[test]
+    fn a_cache_hit_puts_back_only_the_prefix_it_keeps() {
+        let (mut slot, stats, notes) = async_slot(1, COPY);
+        let a1 = enc("<｜User｜>the cat sat on the mat and the dog sat on the log and the ");
+        let o1 = served(&mut slot, 0, &a1);
+        served(&mut slot, 0, &enc("xyz uvw xyz uvw xyz "));
+        // A request that shares only the first 20 ids of the first.
+        let mut a3 = a1[..20].to_vec();
+        a3.extend(enc("qq rr ss "));
+        let o3 = served(&mut slot, 0, &a3);
+        assert_eq!(o3.timings.cache_n, 20, "{:?}", notes.lock().expect("notes"));
+        assert_eq!(stats.resumed.load(SeqCst), 20, "positions put back");
+        assert_eq!(stats.whole_resumes.load(SeqCst), 0);
+        let held = a1.len() + o1.tokens.len() - 1;
+        assert!(
+            held > 20,
+            "the fixture: the state holds more than the prefix"
+        );
+        let n = notes.lock().expect("notes");
+        let load = n.iter().find_map(|n| match n {
+            CacheNote::Load {
+                positions, resumed, ..
+            } => Some((*positions, *resumed)),
+            _ => None,
+        });
+        assert_eq!(load, Some((held, 20)), "{n:?}");
     }
 }
 
