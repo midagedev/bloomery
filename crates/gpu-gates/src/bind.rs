@@ -56,9 +56,10 @@ use model::placement::{Device, Machine, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Landed,
-    ModelProps, Pending, PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused, SamplingParams,
-    Saved, SavedState, ServeError, Server, ServerConfig, SlotConfig, StateError, Tokenizer,
+    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER,
+    Landed, ModelProps, Pending, PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused,
+    SamplingParams, Saved, SavedState, ServeError, Server, ServerConfig, SlotConfig, StateError,
+    Tokenizer,
 };
 
 use crate::GateError;

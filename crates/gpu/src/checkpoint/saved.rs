@@ -273,12 +273,13 @@ pub struct SaveLane {
 }
 
 impl SaveLane {
-    /// A lane on `ctx`'s device with room for `limit` pinned bytes of states.
-    /// Load-time only: it makes a stream, and `ctx` already has its first.
+    /// A lane on `ctx`'s device with `limit` pinned bytes of states, all
+    /// pinned now ([`Staging::pinned`]). Load-time only: it pins, and makes a
+    /// stream, where `ctx` already has its first.
     pub fn new(ctx: &Arc<CudaContext>, limit: u64) -> Result<SaveLane, GpuError> {
         Ok(SaveLane {
             stream: ctx.new_stream()?,
-            staging: Staging::new(ctx, limit),
+            staging: Staging::pinned(ctx, limit)?,
         })
     }
 
@@ -304,8 +305,8 @@ pub struct SaveCost {
     pub copy_ms: f64,
     /// The copy calls it took: one a positional store, one a recurrent store.
     pub calls: u64,
-    /// The ms the staging pool spent allocating pinned memory for it: 0 when
-    /// the pool lent memory it already held.
+    /// The ms the staging pool spent pinning memory during the save: 0, the
+    /// pool pins at load ([`Staging::pinned`]) and a save only borrows.
     pub alloc_ms: f64,
     /// The bytes copied off the card.
     pub bytes: u64,
@@ -320,6 +321,7 @@ pub struct Pending<T> {
     start: CudaEvent,
     end: Arc<CudaEvent>,
     calls: u64,
+    alloc_ms: f64,
     landed: Option<SaveCost>,
 }
 
@@ -360,17 +362,13 @@ impl<T> Pending<T> {
             return Ok(cost);
         }
         self.end.synchronize()?;
-        let alloc_ms = match &mut self.state.host {
-            Host::Staged(s) => {
-                s.settle()?;
-                s.alloc_ms()
-            }
-            Host::Owned { .. } => 0.0,
-        };
+        if let Host::Staged(s) = &mut self.state.host {
+            s.settle()?;
+        }
         let cost = SaveCost {
             copy_ms: f64::from(self.start.elapsed_ms(&self.end)?),
             calls: self.calls,
-            alloc_ms,
+            alloc_ms: self.alloc_ms,
             bytes: self.state.bytes() as u64,
         };
         self.landed = Some(cost);
@@ -568,6 +566,9 @@ impl<T> SeqState<T> {
     /// itself does is one copy call a store and the points' host reads
     /// (`ckpt`'s slots into the staging), nothing waited for. The rows it
     /// reads are not cut, reset or replaced until [`Pending::land`].
+    /// `None`, nothing enqueued, when the staging holds no free extent for the
+    /// state ([`Staging::lend`]): the caller makes room or saves with
+    /// [`SeqState::save`].
     pub fn save_async(
         streams: Streams<'_>,
         who: Identity,
@@ -576,14 +577,19 @@ impl<T> SeqState<T> {
         current: T,
         points: Vec<(u32, T)>,
         ckpt: &Checkpoints,
-    ) -> Result<Pending<T>, GpuError> {
+    ) -> Result<Option<Pending<T>>, GpuError> {
         let lens = Self::checked(lent, positions, &points, ckpt)?;
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
         let one: usize = lens.iter().sum();
         let rows_n: usize = runs.iter().map(Run::values).sum();
         let Streams { lane, engine } = streams;
-        let mut staged = lane.staging.lend(rows_n, one * (1 + points.len()))?;
+        let pinned = lane.staging.stats().grown_ms;
+        let Some(mut staged) = lane.staging.lend(rows_n, one * (1 + points.len()))? else {
+            return Ok(None);
+        };
+        // What the lend pinned: 0, the pool pins at load.
+        let alloc_ms = lane.staging.stats().grown_ms - pinned;
         let ctx = engine.context();
         let timed = Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
         let ready = engine.record_event(None)?;
@@ -620,7 +626,7 @@ impl<T> SeqState<T> {
             let from = one * (1 + i);
             ckpt.read_point(at, staged.recurrent_mut(from..from + one))?;
         }
-        Ok(Pending {
+        Ok(Some(Pending {
             state: SeqState {
                 who,
                 positions,
@@ -633,8 +639,9 @@ impl<T> SeqState<T> {
             start,
             end,
             calls,
+            alloc_ms,
             landed: None,
-        })
+        }))
     }
 
     /// The recurrent stores' lengths, after the checks both saves share:
@@ -1097,6 +1104,7 @@ mod tests {
             };
             SeqState::save_async(streams, who(), POS, lent, 'c', points.clone(), ckpt)
                 .expect("a save off the path")
+                .expect("staging room")
         });
         let (state, cost) = pending.into_state().expect("a landed copy");
         (sync, state, cost)
@@ -1122,7 +1130,10 @@ mod tests {
             "{} calls of {by_plane}",
             cost.calls
         );
-        assert!(cost.alloc_ms > 0.0, "the first state grew the pool");
+        assert_eq!(
+            cost.alloc_ms, 0.0,
+            "a save pins nothing: the pool pinned at load"
+        );
         drop(state);
         let (_, state2, cost2) = both_saves(&ctx, &stream, &lane);
         assert_eq!(cost2.alloc_ms, 0.0, "the pool had the memory");
@@ -1228,19 +1239,19 @@ mod tests {
             rows_below(&m, &stream, 1),
             rows_below(&Model::new(&ctx, &stream, false), &stream, 1)
         );
-        // A pool of 1 MiB cannot stage 64 MiB.
+        // A pool of 1 MiB cannot stage 64 MiB: no room, nothing enqueued.
         let small = SaveLane::new(&ctx, 1 << 20).expect("a lane");
         let mut src = source(&ctx, &stream);
-        let err = lend(&mut src, POS as usize, |lent, ckpt| {
+        let none = lend(&mut src, POS as usize, |lent, ckpt| {
             let streams = Streams {
                 lane: &small,
                 engine: &stream,
             };
             SeqState::save_async(streams, who(), POS, lent, 'c', vec![(16, 'p')], ckpt)
-                .err()
-                .expect("a state past the pool")
+                .expect("a save")
+                .is_none()
         });
-        assert!(err.to_string().contains("pool of"), "{err}");
+        assert!(none, "a state past the pool is no save off the path");
     }
 
     /// A Qwen3-30B-shaped state (48 layers' K and V: 96 stores of 4 planes of
@@ -1284,7 +1295,8 @@ mod tests {
                 engine: &stream,
             };
             let p = SeqState::save_async(streams, who(), AT as u32, lent, 'c', Vec::new(), &ckpt)
-                .expect("a save off the path");
+                .expect("a save off the path")
+                .expect("staging room");
             (p, t.elapsed().as_secs_f64() * 1e3)
         };
         let (pending, begin_ms) = at(&lent);
@@ -1329,11 +1341,11 @@ mod tests {
         let gb = |ms: f64| want as f64 / ms / 1e6;
         eprintln!(
             "qwen3-shaped state {want} bytes, {} calls (plane by plane {}): begin {begin_ms:.3} ms \
-             cold (alloc {:.1} ms), {begin_warm:.3} ms warm; d2h alone {:.2} ms ({:.1} GB/s), h2d alone {up_alone:.2} ms ({:.1} GB/s); \
+             first, {begin_warm:.3} ms warm (pinned at load {:.1} ms); d2h alone {:.2} ms ({:.1} GB/s), h2d alone {up_alone:.2} ms ({:.1} GB/s); \
              together d2h {:.2} ms ({:.1} GB/s), h2d {up_beside:.2} ms ({:.1} GB/s)",
             alone.calls,
             STORES * PLANES + 1,
-            alone.alloc_ms,
+            lane.staging().stats().grown_ms,
             alone.copy_ms,
             gb(alone.copy_ms),
             gb(up_alone),
