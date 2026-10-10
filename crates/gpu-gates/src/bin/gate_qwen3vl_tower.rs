@@ -70,7 +70,7 @@ mod gate {
     use cuda_core::DeviceBuffer;
     use gguf::Gguf;
     use refset::arch::qwen35::clefvis::{TAPS, TAPS_CPU_SET, TAPS_SET};
-    use refset::clefvis::{ClefvisSet, MMPROJ_BF16, N_EMBD};
+    use refset::clefvis::{ClefvisSet, MMPROJ_BF16, N_EMBD, TapScope};
     use vision::arch::qwen3vl::{Hparams, TokenLimits, preprocess};
     use vision::{Patches, Rgb8};
 
@@ -770,7 +770,7 @@ mod gate {
                 verdict(shape)
             );
             ok &= shape;
-            let taps_full = set.tap_effect_of(name)?.full;
+            let taps_full = set.tap_effect_of(name)?.scope == TapScope::Full;
             let mut sink = Collect {
                 want: if taps_full {
                     wanted(*full)
