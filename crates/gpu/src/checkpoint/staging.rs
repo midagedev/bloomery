@@ -235,8 +235,8 @@ impl Staged {
         }
     }
 
-    /// Recurrent values `range`, for the host to write: no copy may write
-    /// them (the host-side points of a state, which no copy fills).
+    /// Recurrent values `range`, for the host to write: no copy in flight may
+    /// write them.
     pub fn recurrent_mut(&mut self, range: Range<usize>) -> &mut [f32] {
         assert!(
             range.start <= range.end && range.end <= self.recurrent,
@@ -448,6 +448,9 @@ mod tests {
         let dev = DeviceBuffer::<u8>::zeroed(&stream, BYTES).expect("the device store");
         let pool = Staging::pinned(&ctx, 2 * BYTES as u64).expect("a pinned pool");
         let mut staged = pool.lend(BYTES / 2, 0).expect("a lend").expect("an extent");
+        // The stream is held shut, so the copy behind the hold is in flight
+        // until this test opens it.
+        let hold = crate::checkpoint::hold::Hold::on(&stream).expect("a hold");
         let shape = Pitched {
             width: BYTES,
             rows: 1,
@@ -474,7 +477,19 @@ mod tests {
             staged.running().expect("a query"),
             "the copy had landed before the drop: not a test"
         );
-        drop(staged);
+        let (done, dropped) = std::sync::mpsc::channel();
+        let drop_it = std::thread::spawn(move || {
+            drop(staged);
+            let _ = done.send(());
+        });
+        assert!(
+            dropped
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "the extent went back while its copy was held in flight"
+        );
+        hold.open();
+        drop_it.join().expect("the drop");
         assert!(
             end.query().expect("a query"),
             "the extent went back with its copy still running"

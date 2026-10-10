@@ -43,3 +43,4 @@ crates/gpu-gates/src/bin/gate_swap.rs 2 a gate binary, never pinned (its placeme
 crates/gpu-gates/src/bin/shared/vision_rules.rs 1 the image towers' gates' host rules, run on worker threads (par_rows); a gate, never pinned
 crates/hf/src/fetch.rs 1 a test's local HTTP answerer (the HTTP-error clause), from a test thread that is never pinned
 crates/gpu-gates/src/bin/probe_nvread.rs 1 a probe binary, never pinned: the cache and direct arms' resident workers
+crates/gpu/src/checkpoint/staging.rs 1 a gate test drops an extent on a thread of its own: the drop blocks on a held stream, and no placement matters

@@ -301,7 +301,8 @@ pub struct Streams<'a> {
 /// What a save's copy cost ([`Pending::land`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SaveCost {
-    /// The copy's time on the copy stream, from its first byte to its last.
+    /// The copy's time on the copy stream, from its first byte to its last:
+    /// the device copies and the points' host copy after them.
     pub copy_ms: f64,
     /// The copy calls it took: one a positional store, one a recurrent store.
     pub calls: u64,
@@ -563,9 +564,12 @@ impl<T> SeqState<T> {
     /// [`SeqState::save`] whose copies run on `lane`'s stream into pinned
     /// staging, after everything `engine` ran so far, and whose call returns
     /// once they are enqueued: the state is a [`Pending`]. What the call
-    /// itself does is one copy call a store and the points' host reads
-    /// (`ckpt`'s slots into the staging), nothing waited for. The rows it
-    /// reads are not cut, reset or replaced until [`Pending::land`].
+    /// itself does is one copy call a store and one host copy for the points
+    /// (`ckpt`'s slots into the staging, queued on the lane's stream after the
+    /// device copies: [`Checkpoints::enqueue_points`]), nothing waited for.
+    /// The rows it reads are not cut, reset or replaced until
+    /// [`Pending::land`], and `ckpt` refuses a take, an open take or an adopt
+    /// until then.
     /// `None`, nothing enqueued, when the staging holds no free extent for the
     /// state ([`Staging::lend`]): the caller makes room or saves with
     /// [`SeqState::save`].
@@ -618,14 +622,31 @@ impl<T> SeqState<T> {
                 return Err(e);
             }
         };
+        if !points.is_empty() {
+            let ats: Vec<u32> = points.iter().map(|&(at, _)| at).collect();
+            // SAFETY: the points' region of the extent is this state's alone,
+            // read or freed only after the end event below has completed (it
+            // is held with the extent); the checkpoints refuse a write to the
+            // slots until then ([`Checkpoints::guard_points`]) and wait for
+            // the context before freeing them.
+            let queued = unsafe {
+                ckpt.enqueue_points(
+                    &lane.stream,
+                    &ats,
+                    rec_at.add(one * 4).cast::<f32>(),
+                    one * points.len(),
+                )
+            };
+            if let Err(e) = queued {
+                lane.stream.synchronize()?;
+                return Err(e);
+            }
+        }
         let end = ctx.new_event(timed)?;
         end.record(&lane.stream)?;
         let end = Arc::new(end);
         staged.hold(Arc::clone(&end));
-        for (i, &(at, _)) in points.iter().enumerate() {
-            let from = one * (1 + i);
-            ckpt.read_point(at, staged.recurrent_mut(from..from + one))?;
-        }
+        ckpt.guard_points(Arc::clone(&end));
         Ok(Some(Pending {
             state: SeqState {
                 who,
@@ -863,6 +884,7 @@ fn shape(detail: impl Into<String>) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::hold;
 
     /// A state of 5 positions carries rows 0..5 of a two-plane store, the
     /// recurrent stores at 5 and the point at 3; put back on an empty model it
@@ -1299,8 +1321,12 @@ mod tests {
                 .expect("staging room");
             (p, t.elapsed().as_secs_f64() * 1e3)
         };
+        // The engine stream is held shut: the save's copies wait behind it, so
+        // they are in flight when the call returns.
+        let hold = hold::Hold::on(&stream).expect("a hold");
         let (pending, begin_ms) = at(&lent);
         let in_flight = !pending.ready().expect("a query");
+        hold.open();
         let (state, alone) = pending.into_state().expect("a landed copy");
         let want = (STORES * PLANES * AT * HEAD * 2 + 4 * 4) as u64;
         assert!(
@@ -1330,8 +1356,10 @@ mod tests {
         // The pool holds the memory now: a save asks it for nothing, and its
         // call still returns while the copy runs.
         drop(beside_state);
+        let hold = hold::Hold::on(&stream).expect("a hold");
         let (warm, begin_warm) = at(&lent);
         let warm_in_flight = !warm.ready().expect("a query");
+        hold.open();
         let (_, warm_cost) = warm.into_state().expect("a landed copy");
         assert!(
             warm_in_flight,
@@ -1352,6 +1380,72 @@ mod tests {
             down_beside.copy_ms,
             gb(down_beside.copy_ms),
             gb(up_beside),
+        );
+    }
+    /// A save's host copy of a point runs on the lane, not in its call. With
+    /// the engine stream held shut, the call returns while the point's bytes
+    /// are not yet in the extent (a copy on the calling thread has written
+    /// them by then), and within a bound derived from its enqueues: the one
+    /// strip, the one recurrent store, the host function, three events and a
+    /// stream wait are eight driver calls of tens of microseconds at most, so
+    /// the bound is a few ms, under what a core takes to copy 180 MiB even at
+    /// its fastest. Until the save lands the checkpoints refuse a write to the
+    /// slot by name; after, the bytes are whole and the slot is free.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_points_host_copy_runs_on_the_lane_and_its_slot_waits_for_it() {
+        use std::time::Instant;
+        const ONE: usize = 45 << 20;
+        const AT: usize = 16;
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let lane = SaveLane::new(&ctx, 1 << 30).expect("a lane");
+        let mut pos = DeviceBuffer::<u16>::zeroed(&stream, PLANES * 64 * 8).expect("a store");
+        let mut spans = [Spans::by_position(&mut pos, PLANES, 64 * 8, AT, 8).expect("spans")];
+        let mut rec = DeviceBuffer::<f32>::zeroed(&stream, ONE).expect("a recurrent store");
+        let mut ckpt =
+            Checkpoints::new(&ctx, vec![ONE], 2 * 4 * ONE as u64, 512).expect("checkpoints");
+        ckpt.adopt(8, &vec![1.0f32; ONE]).expect("a point");
+        let lent = Lent {
+            positional: &mut spans,
+            recurrent: &mut [&mut rec],
+        };
+        let hold = hold::Hold::on(&stream).expect("a hold");
+        let t = Instant::now();
+        let streams = Streams {
+            lane: &lane,
+            engine: &stream,
+        };
+        let pending =
+            SeqState::save_async(streams, who(), AT as u32, &lent, 'c', vec![(8, 'p')], &ckpt)
+                .expect("a save off the path")
+                .expect("staging room");
+        let begin_ms = t.elapsed().as_secs_f64() * 1e3;
+        let Host::Staged(staged) = &pending.state.host else {
+            panic!("an async save is staged");
+        };
+        assert!(
+            staged.recurrent()[ONE..].iter().all(|&v| v == 0.0),
+            "the point's bytes were in the extent when the call returned ({begin_ms:.3} ms)"
+        );
+        assert!(!pending.ready().expect("a query"), "the copy had landed");
+        assert!(begin_ms < 4.0, "the call took {begin_ms:.3} ms");
+        let refused = ckpt.adopt(12, &vec![2.0f32; ONE]);
+        assert!(
+            matches!(&refused, Err(GpuError::Shape { detail, .. }) if detail.contains("save in flight")),
+            "a slot written under the point copy: {:?}",
+            refused.err().map(|e| e.to_string())
+        );
+        hold.open();
+        let (state, cost) = pending.into_state().expect("a landed copy");
+        assert!(
+            state.host.recurrent()[ONE..].iter().all(|&v| v == 1.0),
+            "the point's bytes did not arrive whole"
+        );
+        ckpt.adopt(12, &vec![2.0f32; ONE])
+            .expect("the slot is free once the save landed");
+        eprintln!(
+            "point save: begin {begin_ms:.3} ms, copy {:.2} ms",
+            cost.copy_ms
         );
     }
 }
