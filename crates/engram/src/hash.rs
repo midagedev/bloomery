@@ -41,6 +41,7 @@
 //! wrap. The reduction's result is a row id, which fits `u32` because the
 //! partition total does — both constructors refuse a file where it does not.
 
+use std::ops::Range;
 use std::path::Path;
 
 use gguf::{Inventory, Value};
@@ -171,7 +172,8 @@ impl Hash {
     /// (the buckets' sizes, the formula's `prime`, none zero) and
     /// `ple.head_offsets`, one per row a token reads, every bucket's top
     /// inside an `i32` row index; `ple.eos_token_id` resets the window and
-    /// `ple.image_token_id`, when present, is refused as an input. Both ids
+    /// `ple.image_token_id`, when present, is refused as an input outside an
+    /// image span ([`Hash::ple_rows_media`]). Both ids
     /// must be tokens of the `n_vocab`-token vocabulary the caller's reader
     /// states. The EOS is the file's `ple.eos_token_id`, never the
     /// tokenizer's end of text: the two differ (qwen4exp: 248,044 against
@@ -461,6 +463,59 @@ impl Hash {
         tokens: &[u32],
         out: &mut [u32],
     ) -> Result<(), NgramError> {
+        self.ple_rows_spanned(hist, pos, tokens, &[], out)
+    }
+
+    /// [`Hash::ple_rows_into`] for a call that carries images: `spans` are
+    /// the call's image spans as row ranges of `tokens` (`start..end`, end
+    /// exclusive), non-empty, ascending, non-overlapping and inside the call,
+    /// or a refusal by name ([`NgramError::BadSpan`]). Inside a span the image
+    /// placeholder hashes like any id, and the history takes it, so the text
+    /// after an image reads the placeholder as its predecessors; outside a
+    /// span it is refused as in [`Hash::ple_rows_into`]. Spans on a hash with
+    /// no image id are refused ([`NgramError::NoImageToken`]).
+    pub fn ple_rows_media(
+        &self,
+        hist: &mut History,
+        pos: u64,
+        tokens: &[u32],
+        spans: &[Range<usize>],
+        out: &mut [u32],
+    ) -> Result<(), NgramError> {
+        let mut floor = 0;
+        for (index, span) in spans.iter().enumerate() {
+            let why = if span.start >= span.end {
+                Some("it holds no row")
+            } else if span.start < floor {
+                Some("it starts before the span before it ends")
+            } else if span.end > tokens.len() {
+                Some("it ends past the call's last row")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(NgramError::BadSpan {
+                    index,
+                    span: span.clone(),
+                    tokens: tokens.len(),
+                    why,
+                });
+            }
+            floor = span.end;
+        }
+        self.ple_rows_spanned(hist, pos, tokens, spans, out)
+    }
+
+    /// The one body of [`Hash::ple_rows_into`] and [`Hash::ple_rows_media`];
+    /// `spans` are already valid.
+    fn ple_rows_spanned(
+        &self,
+        hist: &mut History,
+        pos: u64,
+        tokens: &[u32],
+        spans: &[Range<usize>],
+        out: &mut [u32],
+    ) -> Result<(), NgramError> {
         let Window::Eos(w) = &self.window else {
             return Err(NgramError::NotRawIds);
         };
@@ -472,6 +527,9 @@ impl Hash {
             hist.tokens().len(),
             self.n_gram
         );
+        if !spans.is_empty() && w.image.is_none() {
+            return Err(NgramError::NoImageToken);
+        }
         if pos != hist.next_pos() {
             return Err(NgramError::PositionGap {
                 want: hist.next_pos(),
@@ -486,8 +544,11 @@ impl Hash {
                 got: out.len(),
             });
         }
-        for &t in tokens {
-            w.check(t)?;
+        let mut next_span = spans.iter().peekable();
+        for (row, &t) in tokens.iter().enumerate() {
+            while next_span.next_if(|s| s.end <= row).is_some() {}
+            let in_span = next_span.peek().is_some_and(|s| s.start <= row);
+            w.check_at(t, in_span)?;
         }
         let mut ctx = [0u64; MAX_PLE_NGRAM];
         let ctx = &mut ctx[..self.n_gram];
@@ -625,6 +686,7 @@ mod tests {
     use super::{Hash, History, NgramError, Window};
     use crate::EngramError;
     use gguf::{Inventory, Value};
+    use std::ops::Range;
 
     /// A hash whose map covers token ids `0..vocab`, with the smallest
     /// constants the reader accepts: these tests read the map only.
@@ -1093,6 +1155,185 @@ mod tests {
             v41.ple_rows_into(&mut History::new(4, 0), 0, &[1], &mut [0; 24]),
             Err(NgramError::NotRawIds)
         );
+    }
+
+    /// The row rule of `qwen4exp.cpp` `llm_graph_input_qwen4exp_ple::set_input`
+    /// transcribed on its own terms: the sequence's ids with an image
+    /// position's id already `ple.image_token_id` (`llama-kv-cache.cpp`
+    /// `ext.tok`), the predecessors read from that list with a missing one a
+    /// null, an EOS or a null cutting the window, and the token's own EOS
+    /// cutting nothing.
+    fn llamacpp_rows(hash: &Hash, ids: &[u32], eos: u32) -> Vec<u32> {
+        let n_gram = hash.n_gram();
+        let per_gram = hash.n_heads;
+        let mut out = Vec::new();
+        for i in 0..ids.len() {
+            let mut ctx = vec![u64::from(ids[i]); n_gram];
+            let mut cut = false;
+            for s in 1..n_gram {
+                let t: Option<u32> = if cut || s > i { None } else { Some(ids[i - s]) };
+                cut = cut || t.is_none() || t == Some(eos);
+                ctx[s] = u64::from(if cut { eos } else { t.unwrap() });
+            }
+            for n in 2..=n_gram {
+                let mut mixed = ctx[0].wrapping_mul(hash.mult[0]);
+                for j in 1..n {
+                    mixed ^= ctx[j].wrapping_mul(hash.mult[j]);
+                }
+                let base = (n - 2) * per_gram;
+                for g in 0..per_gram {
+                    out.push((mixed % hash.prime[base + g] + hash.offset[base + g]) as u32);
+                }
+            }
+        }
+        out
+    }
+
+    const IMG: u32 = 248_056;
+
+    /// A one-span list (a bare `&[a..b]` reads as a range of indices to clippy).
+    fn one(span: Range<usize>) -> Vec<Range<usize>> {
+        vec![span]
+    }
+
+    /// Text, a five-row image, text with an EOS and the tokenizer's end of
+    /// text, a two-row image, text: the image rows are rows 3..8 and 13..15.
+    const MEDIA_IDS: [u32; 16] = [
+        248_045, 846, 198, IMG, IMG, IMG, IMG, IMG, 248_046, 198, 248_044, 9707, 11, IMG, IMG, 11,
+    ];
+
+    /// Inside a span the rows are llama.cpp's for the image id, in one call
+    /// and in two split inside the first span, and the text after a span
+    /// reads the image ids as its predecessors (the same rows with the images
+    /// read as EOS differ).
+    #[test]
+    fn ple_media_rows_are_llamacpps() {
+        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let want = llamacpp_rows(&hash, &MEDIA_IDS, 248_044);
+        let mut as_eos = MEDIA_IDS;
+        as_eos[3..8].fill(248_044);
+        as_eos[13..15].fill(248_044);
+        assert_ne!(
+            llamacpp_rows(&hash, &as_eos, 248_044)[8 * 16..],
+            want[8 * 16..]
+        );
+
+        let mut hist = hash.new_history().unwrap();
+        let mut out = vec![0u32; 16 * 16];
+        hash.ple_rows_media(&mut hist, 0, &MEDIA_IDS, &[3..8, 13..15], &mut out)
+            .unwrap();
+        assert_eq!(out, want, "one call");
+        assert_eq!((hist.tokens(), hist.next_pos()), (&[IMG, 11][..], 16));
+
+        let mut split = hash.new_history().unwrap();
+        let mut out = vec![0u32; 16 * 16];
+        let (a, b) = out.split_at_mut(5 * 16);
+        hash.ple_rows_media(&mut split, 0, &MEDIA_IDS[..5], &one(3..5), a)
+            .unwrap();
+        hash.ple_rows_media(&mut split, 5, &MEDIA_IDS[5..], &[0..3, 8..10], b)
+            .unwrap();
+        assert_eq!(out, want, "two calls, the first ending inside a span");
+        assert_eq!(split, hist);
+    }
+
+    /// With no spans `ple_rows_media` is `ple_rows_into`: the same rows, the
+    /// same history, and the same refusal of the image id.
+    #[test]
+    fn ple_media_without_spans_is_text_only() {
+        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let mut a = hash.new_history().unwrap();
+        let mut b = hash.new_history().unwrap();
+        let mut rows_a = vec![0u32; 9 * 16];
+        let mut rows_b = vec![0u32; 9 * 16];
+        hash.ple_rows_into(&mut a, 0, &PLE_PROMPT, &mut rows_a)
+            .unwrap();
+        hash.ple_rows_media(&mut b, 0, &PLE_PROMPT, &[], &mut rows_b)
+            .unwrap();
+        assert_eq!(rows_a, rows_b);
+        assert_eq!(a, b);
+        assert_eq!(
+            hash.ple_rows_media(&mut b, 9, &[IMG], &[], &mut [0; 16]),
+            Err(NgramError::ImageToken { token: IMG })
+        );
+    }
+
+    /// The image id outside every span is refused by name and leaves the
+    /// history and the rows as they were: before a span, at its exclusive
+    /// end, between two spans, and past the last.
+    #[test]
+    fn ple_media_refuses_an_image_id_outside_its_span() {
+        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let mut hist = hash.new_history().unwrap();
+        let before = hist.clone();
+        let cases: [([u32; 6], Vec<Range<usize>>); 4] = [
+            ([5, IMG, IMG, 6, 7, 8], one(2..3)),
+            ([5, 6, IMG, IMG, 7, 8], one(2..3)),
+            ([5, IMG, 6, IMG, IMG, 8], vec![1..2, 4..5]),
+            ([5, 6, 7, IMG, IMG, IMG], one(3..5)),
+        ];
+        for (tokens, spans) in cases {
+            let mut out = [u32::MAX; 6 * 16];
+            assert_eq!(
+                hash.ple_rows_media(&mut hist, 0, &tokens, &spans, &mut out),
+                Err(NgramError::ImageToken { token: IMG }),
+                "{tokens:?} in {spans:?}"
+            );
+            assert_eq!(hist, before);
+            assert!(out.iter().all(|&r| r == u32::MAX), "no row written");
+        }
+        // A span's own first and last rows are inside it, and spans may touch.
+        let mut out = [0u32; 4 * 16];
+        hash.ple_rows_media(&mut hist, 0, &[IMG, IMG, IMG, 5], &[0..1, 1..3], &mut out)
+            .unwrap();
+    }
+
+    /// A malformed span list is refused by name before anything is written:
+    /// an empty span, descending, overlapping, past the call, and spans on a
+    /// hash with no image id.
+    #[test]
+    fn ple_media_refuses_malformed_spans() {
+        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let mut hist = hash.new_history().unwrap();
+        let before = hist.clone();
+        let tokens = [IMG, IMG, IMG, 5];
+        let bad = |spans: &[Range<usize>], index: usize, why: &'static str| {
+            (
+                spans.to_vec(),
+                NgramError::BadSpan {
+                    index,
+                    span: spans[index].clone(),
+                    tokens: 4,
+                    why,
+                },
+            )
+        };
+        let cases = [
+            bad(&one(1..1), 0, "it holds no row"),
+            bad(&[2..3, 0..1], 1, "it starts before the span before it ends"),
+            bad(&[0..2, 1..3], 1, "it starts before the span before it ends"),
+            bad(&[0..3, 3..5], 1, "it ends past the call's last row"),
+        ];
+        for (spans, err) in cases {
+            let mut out = [u32::MAX; 4 * 16];
+            assert_eq!(
+                hash.ple_rows_media(&mut hist, 0, &tokens, &spans, &mut out),
+                Err(err),
+                "{spans:?}"
+            );
+            assert_eq!(hist, before);
+            assert!(out.iter().all(|&r| r == u32::MAX), "no row written");
+        }
+
+        let mut inv = ple_fixture();
+        inv.meta.retain(|(k, _)| k != "qwen4exp.ple.image_token_id");
+        let no_image = Hash::ple_from_gguf(&inv, "qwen4exp", 248_320).unwrap();
+        assert_eq!(
+            no_image.ple_rows_media(&mut hist, 0, &tokens, &one(0..3), &mut [0; 4 * 16]),
+            Err(NgramError::NoImageToken)
+        );
+        no_image
+            .ple_rows_media(&mut hist, 0, &[5], &[], &mut [0; 16])
+            .unwrap();
     }
 
     /// A raw-id hash has no pad id: asking for one panics by name.
