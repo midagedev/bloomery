@@ -134,6 +134,7 @@ impl Head {
 /// # Safety
 /// The CPU must support AVX2 and FMA; `stride` is a multiple of 8, `e.len() == LANES * stride`,
 /// `w2.len() == out.len() / LANES * stride`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn logits_lanes(w2: &[f32], e: &[f32], stride: usize, out: &mut [f32]) {
     // SAFETY: the fn contract above — ISA from the caller's detection; every load reads eight
@@ -160,6 +161,7 @@ unsafe fn logits_lanes(w2: &[f32], e: &[f32], stride: usize, out: &mut [f32]) {
 }
 
 /// [`logits_lanes`] behind its checks: the ISA and every length.
+#[cfg(target_arch = "x86_64")]
 fn logits(w2: &[f32], e: &[f32], stride: usize, out: &mut [f32]) {
     assert!(
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
@@ -169,6 +171,12 @@ fn logits(w2: &[f32], e: &[f32], stride: usize, out: &mut [f32]) {
     assert!(out.len().is_multiple_of(LANES) && w2.len() == out.len() / LANES * stride);
     // SAFETY: the ISA and the lengths the kernel's contract names were asserted just above.
     unsafe { logits_lanes(w2, e, stride, out) }
+}
+
+/// Off x86_64 there is no `logits_lanes`: the refusal a CPU without the ISA gets.
+#[cfg(not(target_arch = "x86_64"))]
+fn logits(_: &[f32], _: &[f32], _: usize, _: &mut [f32]) {
+    panic!("markov-accept needs AVX2 and FMA, an x86_64 build");
 }
 
 /// One dot in [`logits_lanes`]'s sum order, scalar: lane `l` accumulates elements `8i + l`

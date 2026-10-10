@@ -11,9 +11,10 @@
 
 use gguf::GgmlType;
 use gguf::quant::{dequant_row, quantize_row_q8_k_roundtrip};
+#[cfg(target_arch = "x86_64")]
+use qdot::dot_row_avx2;
 use qdot::{
-    QdotError, col_bytes, dot_row, dot_row_avx2, dot_row_scalar, quantize_col, quantize_col_scalar,
-    supports,
+    QdotError, col_bytes, dot_row, dot_row_scalar, quantize_col, quantize_col_scalar, supports,
 };
 
 fn model_path() -> String {
@@ -333,6 +334,7 @@ fn hw_dot_row_closer_to_exact_than_current_path() {
 // ------------------------------------------------------------- gate 4
 
 /// Gate 4: scalar fallback is bit-identical to the AVX2 kernel.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_scalar_fallback_bit_identical_to_avx2() {
@@ -1084,6 +1086,7 @@ fn hw_q5k_encoder_matches_ik() {
 }
 
 /// Q5_K gate A: the AVX2 kernel and its emulator agree bit for bit on real rows.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box, the V4.1 shard and $BLOOMERY_DATA/ref"]
 fn hw_q5k_kernel_matches_emulator() {
@@ -1337,6 +1340,7 @@ impl V4Case {
     }
 
     /// Gate A: the AVX2 kernel and its mirror agree bit for bit on `ROWS` rows.
+    #[cfg(target_arch = "x86_64")]
     fn gate_a(&self) {
         assert!(
             supports(self.ty),
@@ -1385,6 +1389,7 @@ impl V4Case {
 }
 
 /// IQ3_XXS gate A: kernel vs mirror on the V4-Flash gate stack.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
 fn hw_iq3xxs_kernel_matches_mirror() {
@@ -1419,6 +1424,7 @@ fn hw_mxfp4_encoder_matches_ik() {
 }
 
 /// MXFP4 gate A: kernel vs mirror on the V4-Flash down stack.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
 fn hw_mxfp4_kernel_matches_mirror() {
@@ -1529,6 +1535,7 @@ fn qwen_dump(file: &str, ty: GgmlType, block: usize, gran: usize) -> QwenDump {
 /// Gate A over generated rows: `ROWS` pseudo-random rows at every `k`, every byte a
 /// valid code, each block's f16 d masked finite, against a `quantize_col` column —
 /// kernel vs mirror, bit for bit.
+#[cfg(target_arch = "x86_64")]
 fn generated_gate_a(ty: GgmlType, block: usize, gran: usize, ks: &[usize]) {
     assert!(
         supports(ty),
@@ -1587,6 +1594,7 @@ fn hw_iq4nl_encoder_matches_ik() {
 /// the down width (k = 640, whole groups) and both tail shapes — plus the pin that
 /// the kernel never reads a group's i16 sum bytes (bytes 8..16): no min correction
 /// exists, so corrupting them must not move the dot.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
 fn hw_iq4nl_kernel_matches_mirror() {
@@ -1680,6 +1688,7 @@ fn hw_iq4nl_kernel_predicts_ik() {
 /// IQ4_XS gate A: kernel vs mirror on the dump's rows (the UD-Q3_K_XL layer's rows, or
 /// the harness's synthetic blocks until that file's `.done` lands) and on `ROWS`
 /// generated rows at the gate/up width and both smaller block counts.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
 fn hw_iq4xs_kernel_matches_mirror() {
@@ -1793,6 +1802,7 @@ const IQ3S_ENDS: [IqEnd; 9] = [
 /// the gate/up width and both smaller block counts, and on the ends of [`IQ3S_ENDS`] (every
 /// index bit, sign bit and scale at its extreme, d = 0, a subnormal d) against the ±3.0 and
 /// seeded columns — bit for bit.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
 fn hw_iq3s_kernel_matches_mirror() {
@@ -1999,6 +2009,7 @@ fn hw_q8f0_encoder_matches_ik() {
 /// Q8_0 gate A: the AVX2 kernel and its mirror agree bit for bit — on the dump's 64 rows
 /// against ik's column, and on `ROWS` generated rows at every tail count (k = 32, 96, 128,
 /// 160, 224 and 2144: 1, 3, 0, 1, 3 and 3 tail blocks) against columns of every magnitude.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
 fn hw_q8f0_kernel_matches_mirror() {
@@ -2135,15 +2146,19 @@ impl Rng {
     }
 
     /// Uniform code in [-127, 127].
+    #[cfg(target_arch = "x86_64")]
     fn code(&mut self) -> i8 {
         ((self.next() % 255) as i32 - 127) as i8
     }
 }
 
 /// Weight f16 scales and activation f32 scales.
+#[cfg(target_arch = "x86_64")]
 const W_SCALES: [u16; 6] = [0x3C00, 0x3800, 0x4000, 0x3B00, 0x0040, 0xBC00];
+#[cfg(target_arch = "x86_64")]
 const A_SCALES: [f32; 6] = [1.0, 0.5, 2.0, 0.00390625, 0.25, -1.0];
 
+#[cfg(target_arch = "x86_64")]
 fn gen_blocks(rng: &mut Rng, n: usize, side: u32) -> Vec<qdot::Q8Block> {
     (0..n)
         .map(|i| {
@@ -2159,6 +2174,7 @@ fn gen_blocks(rng: &mut Rng, n: usize, side: u32) -> Vec<qdot::Q8Block> {
         .collect()
 }
 
+#[cfg(target_arch = "x86_64")]
 fn gen_acol(rng: &mut Rng, nb: usize) -> Vec<qdot::ActBlock> {
     (0..nb)
         .map(|i| {
@@ -2175,6 +2191,7 @@ fn gen_acol(rng: &mut Rng, nb: usize) -> Vec<qdot::ActBlock> {
 }
 
 /// Compare kernel vs mirror over one (whead, acol) pair on bits.
+#[cfg(target_arch = "x86_64")]
 fn assert_cells_bit_identical(
     what: &str,
     whead: &[qdot::Q8Block],
@@ -2199,6 +2216,7 @@ fn assert_cells_bit_identical(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "hw: needs the box's AVX2 (q_nope2_cells_avx2 panics without it)"]
 fn hw_q_nope2_cells_bit_identical() {
@@ -3076,6 +3094,7 @@ fn quantize_col_non_finite_panics_on_both_paths() {
 /// on every f16 but a NaN (whose payload F16C may quiet) — subnormal and extreme scales
 /// included, which real rows rarely carry. One block per type, the scale fields swept
 /// over all 65,536 bit patterns, the rest fixed pseudo-random bytes.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn f16_scales_bit_identical_kernel_vs_mirror() {
     let mut rng = Lcg(0x00F1_6C5C_A1E5);

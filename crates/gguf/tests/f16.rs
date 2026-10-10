@@ -6,13 +6,16 @@
 //! the host and on the card, so this enumeration is its proof; the second is
 //! the refusal contract — a NaN is never turned into an infinity or a number.
 
+#[cfg(target_arch = "x86_64")]
 use gguf::quant::f32_to_f16_bits;
 
 /// Threads the 2^32 patterns are split over, at most.
+#[cfg(target_arch = "x86_64")]
 const MAX_THREADS: usize = 32;
 
 /// f32 NaN patterns: an all-ones exponent with a nonzero mantissa, under
 /// either sign.
+#[cfg(target_arch = "x86_64")]
 const NAN_PATTERNS: u64 = 2 * ((1 << 23) - 1);
 
 /// The CPU's round-to-nearest-even conversion of `x` to f16 bits.
@@ -32,6 +35,7 @@ unsafe fn f16c_rne(x: f32) -> u16 {
 }
 
 /// What one chunk of patterns found.
+#[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct Tally {
     checked: u64,
@@ -44,6 +48,7 @@ struct Tally {
     first_nan_bad: Option<u32>,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Tally {
     fn add(&mut self, o: Tally) {
         self.checked += o.checked;
@@ -55,6 +60,7 @@ impl Tally {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn min_some(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
