@@ -552,12 +552,25 @@ if grep -q 'gives way' "$tmp/out"; then fail 'the earlier owner does not give wa
 touch -t 202601010000 "$H/bloomery-aa-hold"
 guard 'two holds up in the same second: the owner that sorts later gives way' 75 'bloomery-03-hold \(owner 03\) went up before' lease_guard 20 aa
 rm -f "$H/bloomery-03-hold" "$H/bloomery-aa-hold"
+# The same two holds under a lock directory with a space in its path (tools/box.sh's local mode passes it whole).
+D="$tmp/lock dir"
+mkdir -p "$D"
+touch -t 202601010000 "$D/bloomery-03-hold"
+touch -t 202601010100 "$D/bloomery-aa-hold"
+run 'two holds up under a lock directory with a space: the later owner gives way at once (75)' 75 "hold $D/bloomery-03-hold \\(owner 03\\) went up before $D/bloomery-aa-hold" \
+  env -u BLOOMERY_LEASE_HOLDS BLOOMERY_LOCK_DIR="$D" BLOOMERY_LEASE_LOCK="$P" BLOOMERY_LEASE_POLL=1 BLOOMERY_LEASE_PROC="$tmp/proc-none" \
+  bash -c 'source "$1" && lease_guard 2 aa' _ "$T/tools/ref/lease-probe.sh"
+rm -f "$D/bloomery-03-hold" "$D/bloomery-aa-hold"
 run 'lease_guard on an untestable lease: 70 at once' 70 'the lease cannot be tested \(above\): the command did not run \(rc 70\)' \
   env BLOOMERY_LEASE_LOCK="$tmp/no-such-dir/x.lock" BLOOMERY_LEASE_HOLDS="$H/bloomery-*-hold" bash -c 'source "$1" && lease_guard 0' _ "$T/tools/ref/lease-probe.sh"
 guard 'lease_guard refuses a bound that is not seconds' 64 'the bound is whole seconds' lease_guard 1m
 guard 'lease_guard refuses an owner that is not a word' 64 'an owner is letters, digits and _' lease_guard 0 0/3
 run 'lease_guard refuses a hold pattern without one * for the owner' 64 'is not <prefix>\*<suffix> with one' \
   env BLOOMERY_LEASE_LOCK="$P" BLOOMERY_LEASE_HOLDS="$H/hold" bash -c 'source "$1" && lease_guard 0' _ "$T/tools/ref/lease-probe.sh"
+# The lease and the holds default to /root, and BLOOMERY_LOCK_DIR moves both (tools/box.sh's local mode).
+lockdir() { env -u BLOOMERY_LEASE_LOCK -u BLOOMERY_LEASE_HOLDS "$@" bash -c 'source "$1" && echo "$LEASE_LOCK $LEASE_HOLDS"' _ "$T/tools/ref/lease-probe.sh"; }
+run 'the lease and the holds are under /root by default' 0 '^/root/bloomery-cpu\.lock /root/bloomery-\*-hold$' lockdir -u BLOOMERY_LOCK_DIR
+run 'BLOOMERY_LOCK_DIR moves the lease and the holds' 0 "^$tmp/ld/bloomery-cpu\\.lock $tmp/ld/bloomery-\\*-hold\$" lockdir BLOOMERY_LOCK_DIR="$tmp/ld"
 
 # tools/box.sh builds the guard into the remote command, before the environment and the command; the
 # read-only opt-in leaves it out and refuses a build. ssh and rsync are stubs that record their
@@ -591,6 +604,7 @@ box() {
   env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_READONLY -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD \
     -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL -u BLOOMERY_DATA -u BLOOMERY_ARCH \
     -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S -u STUB_RSYNC_RC -u STUB_PROBE_RC -u STUB_BOXQ_RC \
+    -u BLOOMERY_BOX_LOCAL -u BLOOMERY_ENV -u BLOOMERY_LOCK_DIR \
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
     PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
 }
@@ -674,6 +688,8 @@ nofile 'box.sh: a direct call runs no queue client' "$tmp/boxq.args"
 notinlog 'box.sh: a direct call has no dir lock in its rsync' "$tmp/rsync.log" 'rsync-path|\.sync-id|bloomery-queue'
 rc_is 'box.sh: BLOOMERY_BOX_QUEUE=0 is the direct call' 0 box env BLOOMERY_BOX_QUEUE=0 "$B/tools/box.sh" 'cargo check'
 if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.log"; then pass 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
+box env BLOOMERY_BOX_LOCAL=0 "$B/tools/box.sh" 'cargo check' > "$tmp/out" 2>&1
+if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.log"; then pass 'box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
 run 'box.sh: BLOOMERY_BOX_QUEUE takes 1 or 0' 64 'BLOOMERY_BOX_QUEUE is 1' box env BLOOMERY_BOX_QUEUE=yes "$B/tools/box.sh" ls
 nofile 'box.sh: a queue refusal syncs nothing' "$tmp/rsync.log"
 
@@ -841,23 +857,119 @@ qjob -- 'printf "%s|" "it'"'"'s" '"'"'$HOME `x`'"'"'; printf "a\nb\n"; echo "$((
 qrun 'box.sh job: quotes, dollars and newlines in the command cross whole' 0 "^it's[|]\\\$HOME \`x\`[|]a$"
 inlog 'box.sh job: the quoted command ends the output the same way' "$tmp/out" '^3$'
 
+# Local mode (BLOOMERY_BOX_LOCAL=1): the same command runs here, in the tree, through bash; nothing reaches ssh or rsync. The tree
+# gets the files the command reads (the guard's lease-probe.sh, the profiles), the environment file is a stub that says it ran,
+# the locks live in a directory of the test's own, and a stub uname says Linux (STUB_UNAME names another system).
+mkdir -p "$B/tools/ref/models" "$tmp/home" "$tmp/uname"
+cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/ref-paths.sh" "$B/tools/ref/"
+cp "$ROOT"/tools/ref/models/*.sh "$B/tools/ref/models/"
+printf 'echo "[env] sourced"\n' > "$tmp/local-env.sh"
+printf '#!/bin/sh\necho "${STUB_UNAME:-Linux}"\n' > "$tmp/uname/uname"
+chmod +x "$tmp/uname/uname"
+L=$tmp/locks-local
+SHOW='echo "pwd=$PWD card=$BLOOMERY_BOX_CARD locks=$BLOOMERY_LOCK_DIR oxide=${CUDA_OXIDE_BACKEND-unset} data=$BLOOMERY_DATA jobs=${CARGO_BUILD_JOBS-unset}"'
+boxl() {
+  box env -u CUDA_OXIDE_BACKEND -u CARGO_BUILD_JOBS PATH="$tmp/uname:$tmp/stub:$PATH" BLOOMERY_BOX_LOCAL=1 \
+    BLOOMERY_ENV="$tmp/local-env.sh" BLOOMERY_LOCK_DIR="$L" BLOOMERY_DATA="$tmp/data" "$@"
+}
+unreached() {
+  if [ -s "$tmp/ssh.log" ] || [ -s "$tmp/rsync.log" ]; then cat "$tmp/ssh.log" "$tmp/rsync.log" > "$tmp/both.log"; fail "$1" 'ssh or rsync ran' "$tmp/both.log"; else pass "$1"; fi
+}
+if [ -e /root/bloomery-cpu.lock ]; then
+  run 'box.sh: local mode on the box is refused' 64 'BLOOMERY_BOX_LOCAL=1 on the machine whose lease is /root/bloomery-cpu\.lock' boxl "$B/tools/box.sh" "$SHOW"
+  unreached 'box.sh: the refusal on the box reached no ssh'
+else
+  run 'box.sh: local mode runs the command here, after the environment file' 0 '^\[env\] sourced$' boxl "$B/tools/box.sh" "$SHOW"
+  has 'box.sh: local mode runs it in the tree, the card local, the locks and data passed, no oxide backend and no build jobs set' \
+    "^pwd=$B card=local locks=$L oxide=unset data=$tmp/data jobs=unset\$"
+  unreached 'box.sh: local mode reaches no ssh and no rsync'
+  if [ -d "$L" ]; then pass 'box.sh: local mode made its lock directory'; else fail 'box.sh: local mode made its lock directory' "no $L"; fi
+  printf 'export CUDA_OXIDE_BACKEND=/x/backend.so\n' > "$tmp/oxide-env.sh"
+  run 'box.sh: local mode unsets the environment file'"'"'s CUDA_OXIDE_BACKEND and adds no backend check to cargo oxide' 0 'oxide=unset data=' \
+    boxl BLOOMERY_ENV="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
+  printf 'export BLOOMERY_LOCK_DIR=%s/elsewhere\n' "$tmp" > "$tmp/lockdir-env.sh"
+  run "box.sh: local mode refuses an environment file that moves the lock directory after the guard" 64 \
+    'the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode.s guard probed the lock directory' \
+    boxl BLOOMERY_ENV="$tmp/lockdir-env.sh" "$B/tools/box.sh" "$SHOW"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: that refusal ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: that refusal ran no command'; fi
+  run 'box.sh: local mode runs BLOOMERY_CARD=a6000 on the local card' 0 ' card=local ' boxl BLOOMERY_CARD=a6000 "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: local mode refuses BLOOMERY_CARD=both' 64 "BLOOMERY_CARD=both puts the box's two cards in view, and BLOOMERY_BOX_LOCAL=1 runs on what this machine shows" \
+    boxl BLOOMERY_CARD=both "$B/tools/box.sh" "$SHOW"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the refusal of both ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the refusal of both ran no command'; fi
+  L2="$tmp/lock dir;x"
+  mkdir -p "$L2" && touch "$L2/bloomery-aa-hold"
+  run 'box.sh: the local guard reads the holds in the lock directory, a path with a space and a ; whole' 75 "hold $L2/bloomery-aa-hold owner=aa " \
+    boxl BLOOMERY_LOCK_DIR="$L2" BLOOMERY_BOX_WAIT=0 "$B/tools/box.sh" "$SHOW"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the local guard ran no command while the hold was up' 'the command ran' "$tmp/out"; else
+    pass 'box.sh: the local guard ran no command while the hold was up'; fi
+  run 'box.sh: local mode with no environment file: 69, named' 69 "sources the environment file BLOOMERY_ENV .*'$tmp/no-env\.sh' is not there" \
+    boxl BLOOMERY_ENV="$tmp/no-env.sh" "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: local mode keeps its locks under ~/.cache/bloomery/locks by default' 0 "locks=$tmp/home/\\.cache/bloomery/locks " \
+    boxl BLOOMERY_LOCK_DIR= HOME="$tmp/home" "$B/tools/box.sh" "$SHOW"
+  run "box.sh: local mode refuses the lock directory /root, the box's" 64 "BLOOMERY_LOCK_DIR=/root is the box's lock directory: local mode's guard would make /root/bloomery-cpu\\.lock" \
+    boxl BLOOMERY_LOCK_DIR=/root "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: local mode refuses a relative lock directory, which two trees would read apart' 64 "BLOOMERY_LOCK_DIR 'rel-locks' is relative" \
+    boxl BLOOMERY_LOCK_DIR=rel-locks "$B/tools/box.sh" "$SHOW"
+  printf 'export BLOOMERY_ARCH=sm_121\n' > "$tmp/arch-env.sh"
+  run "box.sh: local mode refuses an environment file's BLOOMERY_ARCH that the recipe did not expand" 64 \
+    'the environment file set BLOOMERY_ARCH=sm_121, and the recipe expanded sm_86' boxl BLOOMERY_ENV="$tmp/arch-env.sh" "$B/tools/box.sh" "$SHOW"
+  sel='echo "model=${BLOOMERY_MODEL-unset} card=${BLOOMERY_CARD-unset} local=${BLOOMERY_BOX_LOCAL-unset} env=${BLOOMERY_ENV-unset}'
+  sel+=' queue=${BLOOMERY_BOX_QUEUE-unset} class=${BLOOMERY_Q_CLASS-unset} qcard=${BLOOMERY_Q_CARD-unset} pred=${BLOOMERY_Q_PRED_S-unset}'
+  sel+=' budget=${BLOOMERY_CARD_BUDGET-unset} fixture=${BLOOMERY_FIXTURE_MODEL-unset} box=${BLOOMERY_BOX-unset} remote=${BLOOMERY_REMOTE-unset}'
+  sel+=' wait=${BLOOMERY_BOX_WAIT-unset} owner=${BLOOMERY_HOLD_OWNER-unset} boxenv=${BLOOMERY_BOX_ENV-unset} ro=${BLOOMERY_BOX_READONLY-unset}'
+  sel+=' profile=${BLOOMERY_REF_MODEL_PROFILE-unset} lease=${BLOOMERY_LEASE_LOCK-unset} holds=${BLOOMERY_LEASE_HOLDS-unset}"'
+  run "box.sh: the command gets none of what box.sh read on this side, its own outputs only as it exports them, as on the box" 0 \
+    '^model=unset card=unset local=unset env=unset queue=unset class=unset qcard=unset pred=unset budget=unset fixture=unset box=unset remote=unset wait=unset owner=unset boxenv=unset ro=unset profile=deepseek2 lease=unset holds=unset$' \
+    boxl BLOOMERY_MODEL=deepseek2 BLOOMERY_CARD=a6000 BLOOMERY_BOX_QUEUE=0 BLOOMERY_Q_CLASS=lead BLOOMERY_Q_CARD=a6000 \
+    BLOOMERY_Q_PRED_S=90 BLOOMERY_CARD_BUDGET=12345 BLOOMERY_FIXTURE_MODEL=/m/x.gguf BLOOMERY_BOX=elsewhere BLOOMERY_REMOTE='~/x' \
+    BLOOMERY_BOX_WAIT=7 BLOOMERY_HOLD_OWNER=zz BLOOMERY_BOX_ENV=BLOOMERY_PREHEAT=0 BLOOMERY_BOX_READONLY=0 \
+    BLOOMERY_REF_MODEL_PROFILE=qwen4exp BLOOMERY_LEASE_LOCK="$tmp/other.lock" BLOOMERY_LEASE_HOLDS="$tmp/other-*-hold" "$B/tools/box.sh" "$sel"
+  run "box.sh: just box-gc's script refuses local mode by name" 64 "box-gc: BLOOMERY_BOX_CARD=local is tools/box\\.sh's local mode" \
+    boxl BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'bash -s -- --kill' < "$ROOT/tools/box-gc.sh"
+fi
+run 'box.sh: local mode refuses the box queue' 64 "BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's queue, and BLOOMERY_BOX_LOCAL=1 runs it here" \
+  boxl BLOOMERY_BOX_QUEUE=1 "$B/tools/box.sh" "$SHOW"
+if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the refusal of the queue ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the refusal of the queue ran no command'; fi
+nofile 'box.sh: the refusal of the queue runs no queue client' "$tmp/boxq.args"
+run 'box.sh: local mode refuses a host that is not Linux' 64 "BLOOMERY_BOX_LOCAL=1 runs the box's commands here, and they need Linux \\(this is Darwin\\)" \
+  boxl STUB_UNAME=Darwin "$B/tools/box.sh" "$SHOW"
+run 'box.sh: BLOOMERY_BOX_LOCAL takes 1 or 0' 64 'BLOOMERY_BOX_LOCAL is 1 \(run here\) or 0' box env BLOOMERY_BOX_LOCAL=yes "$B/tools/box.sh" true
+
 # tools/gpu-gate.sh takes the gate lock of the card box.sh put in view (BLOOMERY_BOX_CARD): a card named
 # against it, and `both` without both cards in view, are refused before any lock is opened. The paths
-# that take a lock open /root's gate locks, so they are the box's to show, not these tests'.
+# that take a /root gate lock are the box's to show, not these tests'; local mode's lock is in a directory of the test's.
 G=$tmp/gatetree
 mkdir -p "$G/tools/ref" "$G/target/release"
 cp "$ROOT/tools/gpu-gate.sh" "$ROOT/tools/gate-bound.sh" "$G/tools/"
 cp "$ROOT/tools/ref/lease-probe.sh" "$G/tools/ref/"
 printf '#!/bin/sh\nexit 0\n' > "$G/target/release/x"
 chmod +x "$G/target/release/x"
-gg() { (cd "$G" && env -u BLOOMERY_GATE_CARD -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND "$@" bash tools/gpu-gate.sh x); }
+gg() { (cd "$G" && env -u BLOOMERY_GATE_CARD -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_LOCK_DIR "$@" bash tools/gpu-gate.sh x); }
 run 'gpu-gate.sh: both cards in view refuse the 3090 lock alone' 64 'box.sh put both cards in view \(BLOOMERY_CARD=both\), and BLOOMERY_GATE_CARD=3090 names another lock' \
   gg BLOOMERY_BOX_CARD=both BLOOMERY_GATE_CARD=3090
 run 'gpu-gate.sh: both cards in view refuse any' 64 'box.sh put both cards in view' gg BLOOMERY_BOX_CARD=both BLOOMERY_GATE_CARD=any
 run 'gpu-gate.sh: the A6000 in view refuses the 3090 lock' 64 'box.sh put the A6000 in view \(BLOOMERY_CARD=a6000\)' \
   gg BLOOMERY_BOX_CARD=a6000 BLOOMERY_GATE_CARD=3090
 run 'gpu-gate.sh: both needs both cards in view' 64 "run it under box.sh's BLOOMERY_CARD=both" gg BLOOMERY_GATE_CARD=both
-run 'gpu-gate.sh: BLOOMERY_BOX_CARD is a card box.sh picks' 64 'BLOOMERY_BOX_CARD is 3090, a6000 or both' gg BLOOMERY_BOX_CARD=two
+run 'gpu-gate.sh: BLOOMERY_BOX_CARD is a card box.sh picks' 64 'BLOOMERY_BOX_CARD is 3090, a6000, both or local' gg BLOOMERY_BOX_CARD=two
+run "gpu-gate.sh: local is box.sh's choice, never a gate card" 64 "BLOOMERY_GATE_CARD is 3090, a6000, any or both, got 'local'" \
+  gg BLOOMERY_GATE_CARD=local
+# The box (its lease file): box.sh's local card and another lock directory would hold none of the box's locks. Elsewhere local mode
+# keeps its one lock under a lock directory that is not /root, and the path is opened whole.
+if [ -e /root/bloomery-cpu.lock ]; then
+  run "gpu-gate.sh: on the box, box.sh's local card is refused" 64 'BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu\.lock' \
+    gg BLOOMERY_BOX_CARD=local
+  run 'gpu-gate.sh: on the box, a lock directory other than /root is refused' 64 "BLOOMERY_LOCK_DIR=$tmp/ld on the machine whose lease is /root/bloomery-cpu\\.lock" \
+    gg BLOOMERY_LOCK_DIR="$tmp/ld"
+else
+  run "gpu-gate.sh: box.sh's local mode refuses both" 64 "BLOOMERY_GATE_CARD=both names the box's two cards" \
+    gg BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" BLOOMERY_GATE_CARD=both
+  run "gpu-gate.sh: box.sh's local mode refuses the lock directory /root" 64 'keeps its lock under BLOOMERY_LOCK_DIR, and that is /root \(unset: /root\)' \
+    gg BLOOMERY_BOX_CARD=local
+  run 'gpu-gate.sh: BLOOMERY_LOCK_DIR holds the gate locks' 69 "cannot open $tmp/no-such-dir/bloomery-gate\\.lock" gg BLOOMERY_LOCK_DIR="$tmp/no-such-dir"
+  run "gpu-gate.sh: box.sh's local mode opens its one lock there, the path whole" 69 "cannot open $tmp/no such;dir/bloomery-gate-local\\.lock .*local mode" \
+    gg BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/no such;dir"
+fi
 run 'gpu-gate.sh: BLOOMERY_GATE_CARD is a card' 64 'BLOOMERY_GATE_CARD is 3090, a6000, any or both' gg BLOOMERY_GATE_CARD=all
 if [ -w /root ]; then
   echo "skip gpu-gate.sh lock-open test: /root is writable here (the box), where it would take the real gate lock"

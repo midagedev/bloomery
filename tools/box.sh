@@ -51,6 +51,26 @@
 #                             sync beside a sitting would put this tree's uncommitted edits under the
 #                             sitting's running scripts. Its ssh is the only one that reads stdin, so a
 #                             script can go over it (`just box-gc`: 'bash -s -- …' < tools/box-gc.sh)
+#   BLOOMERY_BOX_LOCAL=1      the command runs here, in this tree, on a contributor's Linux machine with a card of its own
+#                             (docs/contrib/local-check.md): the same command line as on the box, guard and profile and
+#                             exports, run by bash with no ssh and no rsync. Its environment file is BLOOMERY_ENV (default
+#                             ~/bloomery-env.sh; not there: 69). The timing lease, the holds and the gate locks live under
+#                             BLOOMERY_LOCK_DIR (a path from /, default ~/.cache/bloomery/locks, made when missing),
+#                             exported to the command, so the guard reads this machine's lease and holds; the environment
+#                             file or BLOOMERY_BOX_ENV moving it after the guard is refused (64), and so is an environment
+#                             file's BLOOMERY_ARCH that is not the one the recipe expanded. The card is what this machine
+#                             shows: the box side sees BLOOMERY_BOX_CARD=local (tools/gpu-gate.sh's one local lock), any
+#                             BLOOMERY_CARD but `both` runs on it, `both` is refused (64), and CUDA_VISIBLE_DEVICES is the
+#                             caller's, or the environment file's when it sets one. CUDA_OXIDE_BACKEND is unset after the
+#                             environment file, so cargo oxide builds and keeps its own backend. BLOOMERY_REMOTE names no
+#                             directory here and adds no CARGO_BUILD_JOBS. What box.sh reads on this side, its own outputs
+#                             (BLOOMERY_REF_MODEL_PROFILE, the fixture tier's BLOOMERY_CARD_BUDGET and
+#                             BLOOMERY_FIXTURE_MODEL) and the lease's file names reach the command only as box.sh exports
+#                             them, as on the box. Refused (64): on a host that is not Linux, with BLOOMERY_BOX_QUEUE=1 (the
+#                             queue is the box's), with a relative BLOOMERY_LOCK_DIR (two trees would lock apart), with /root
+#                             however it is spelled (the guard would make /root/bloomery-cpu.lock, the file that marks the
+#                             box), and where /root/bloomery-cpu.lock exists: on the box its locks under BLOOMERY_LOCK_DIR
+#                             would not keep it off the box's sittings and gates
 #
 # The box queue. BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's signalbox daemon (unset or 0:
 # the path above, byte for byte). The daemon waits on the timing lease and the holds, so the job carries
@@ -128,7 +148,7 @@ fi
 VARX=
 [ -z "$VARIANT" ] || VARX="export BLOOMERY_FIXTURE_VARIANT=$VARIANT && "
 # The arch (the header), named before anything is synced: a refusal touches nothing on the box.
-ARCHX='' ARCH_ENTRY=''
+ARCHX='' ARCH_ENTRY='' RECIPE_ARCH=sm_86
 ARCH_SEEN=0
 for kv in ${tier_env[@]+"${tier_env[@]}"}; do
   if [ "${kv%%=*}" = BLOOMERY_ARCH ]; then
@@ -139,6 +159,7 @@ if [ -n "${BLOOMERY_ARCH+x}" ] || [ "$ARCH_SEEN" = 1 ]; then
   # shellcheck source=tools/arch.sh
   source "$HERE/tools/arch.sh"
   bloomery_arch box.sh || exit $?
+  RECIPE_ARCH=$ARCH
   [ -z "${BLOOMERY_ARCH+x}" ] || ARCHX="export BLOOMERY_ARCH=$ARCH && "
   if [ "$ARCH_SEEN" = 1 ] && [ "$ARCH_ENTRY" != "$ARCH" ]; then
     echo "box.sh: BLOOMERY_ARCH is '$ARCH_ENTRY' in BLOOMERY_BOX_ENV and '$ARCH' in the environment (unset: sm_86): name it in the environment, where the recipes read it" >&2
@@ -151,9 +172,50 @@ case ${BLOOMERY_BOX_QUEUE:-0} in
   1) QUEUE=1 ;;
   *) echo "box.sh: BLOOMERY_BOX_QUEUE is 1 (a job of the box queue), or 0 or unset (the command runs directly), got '$BLOOMERY_BOX_QUEUE'" >&2; exit 64 ;;
 esac
+# Local mode (the header): the command's directory is this tree, and nothing below syncs or ssh's.
+LOCAL=${BLOOMERY_BOX_LOCAL:-0}
+# shellcheck disable=SC2088 # the box's shell expands the '~'
+DIR=$REMOTE ENVF='~/bloomery-env.sh'
+case $LOCAL in
+  0) ;;
+  1)
+    if [ "$QUEUE" = 1 ]; then
+      echo "box.sh: BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's queue, and BLOOMERY_BOX_LOCAL=1 runs it here: name one" >&2
+      exit 64
+    fi
+    if [ "$(uname -s)" != Linux ]; then
+      echo "box.sh: BLOOMERY_BOX_LOCAL=1 runs the box's commands here, and they need Linux (this is $(uname -s)); a Mac runs the static tier, just mac-static" >&2
+      exit 64
+    fi
+    # shellcheck source=tools/ref/lease-probe.sh
+    . "$HERE/tools/ref/lease-probe.sh"
+    if on_box; then
+      echo "box.sh: BLOOMERY_BOX_LOCAL=1 on the machine whose lease is $BOX_LEASE (the box): local mode's locks under BLOOMERY_LOCK_DIR would not keep its gates off the box's own; run box commands from another machine. If this machine is not the box, a lock script run as root without BLOOMERY_LOCK_DIR made that file (flock creates the file it probes): remove it" >&2
+      exit 64
+    fi
+    LOCAL_ENV=${BLOOMERY_ENV:-$HOME/bloomery-env.sh}
+    if [ ! -f "$LOCAL_ENV" ]; then
+      echo "box.sh: BLOOMERY_BOX_LOCAL=1 sources the environment file BLOOMERY_ENV (default ~/bloomery-env.sh), and '$LOCAL_ENV' is not there: write the toolchain block of docs/BUILD.md into it" >&2
+      exit 69
+    fi
+    LOCAL_ENV=$(cd "$(dirname "$LOCAL_ENV")" && pwd)/${LOCAL_ENV##*/}
+    LOCK_DIR=${BLOOMERY_LOCK_DIR:-$HOME/.cache/bloomery/locks}
+    case $LOCK_DIR in
+      /*) ;;
+      *) echo "box.sh: BLOOMERY_LOCK_DIR '$LOCK_DIR' is relative, and every tree on this machine has to take its locks in one directory: name it from / (default ~/.cache/bloomery/locks)" >&2; exit 64 ;;
+    esac
+    if box_lock_dir "$LOCK_DIR"; then
+      echo "box.sh: BLOOMERY_LOCK_DIR=$LOCK_DIR is the box's lock directory: local mode's guard would make $BOX_LEASE there, the file that marks the box, and refuse every later call; name another (default ~/.cache/bloomery/locks)" >&2
+      exit 64
+    fi
+    mkdir -p "$LOCK_DIR" || { echo "box.sh: BLOOMERY_LOCK_DIR '$LOCK_DIR' cannot be made" >&2; exit 69; }
+    DIR=$(printf %q "$HERE") ENVF=$(printf %q "$LOCAL_ENV")
+    ;;
+  *) echo "box.sh: BLOOMERY_BOX_LOCAL is 1 (run here) or 0/unset (run on the box), got '$LOCAL'" >&2; exit 64 ;;
+esac
 READONLY=0
 case ${BLOOMERY_BOX_READONLY:-0} in
-  0) GUARD="( cd $REMOTE && . tools/ref/lease-probe.sh && lease_guard $BOX_WAIT $HOLD_OWNER ) && " ;;
+  0) GUARD="( cd $DIR && . tools/ref/lease-probe.sh && lease_guard $BOX_WAIT $HOLD_OWNER ) && " ;;
   1)
     READONLY=1
     GUARD=
@@ -205,7 +267,9 @@ if [ "$QUEUE" = 1 ]; then
     QLANE=$BLOOMERY_Q_CARD
   fi
 fi
-if [ "$READONLY" = 1 ]; then
+if [ "$LOCAL" = 1 ]; then
+  :
+elif [ "$READONLY" = 1 ]; then
   # A read runs in the remote directory as it is. -n: this lookup leaves stdin to the command's ssh.
   rc=0
   ssh -n "$HOST" "test -d $REMOTE" || rc=$?
@@ -292,6 +356,13 @@ if [ "$QLANE" = any ]; then
 esac"
   BOXCARD='"$SIGNALBOX_CARD"'
 fi
+if [ "$LOCAL" = 1 ]; then
+  if [ "$CARD" = both ]; then
+    echo "box.sh: BLOOMERY_CARD=both puts the box's two cards in view, and BLOOMERY_BOX_LOCAL=1 runs on what this machine shows: a two-card run is the box's" >&2
+    exit 64
+  fi
+  PICK=":" BOXCARD=local
+fi
 # The model the gates and GPU binaries open (BLOOMERY_REF_MODEL) is a property of the tool profile:
 # every command runs with it exported from tools/ref/ref-paths.sh, and an unknown profile stops the
 # command with that file's exit 64. The profile is picked on this side — BLOOMERY_MODEL here, or
@@ -357,7 +428,7 @@ for kv in ${box_env[@]+"${box_env[@]}"}; do
 done
 # 트랙 원격 디렉터리(BLOOMERY_REMOTE)의 빌드는 CARGO_BUILD_JOBS 기본 12: 파동의 4중 빌드가 32코어를 스래싱하지 않게.
 # BLOOMERY_BOX_ENV로 주면 그 값이고, 메인 트리(BLOOMERY_REMOTE 없음)는 그대로다.
-if [ -n "${BLOOMERY_REMOTE:-}" ] && [[ " ${box_env[*]+${box_env[*]}} " != *" CARGO_BUILD_JOBS="* ]]; then
+if [ "$LOCAL" = 0 ] && [ -n "${BLOOMERY_REMOTE:-}" ] && [[ " ${box_env[*]+${box_env[*]}} " != *" CARGO_BUILD_JOBS="* ]]; then
   ENVS="${ENVS}export CARGO_BUILD_JOBS=12 && "
 fi
 # cuda-oxide 백엔드(librustc_codegen_cuda.so)는 핀 rev마다 제 디렉터리에 둔다: ~/.cargo/cuda-oxide-bloomery/<rev>/.
@@ -377,12 +448,31 @@ OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librus
 case "$*" in
   *"cargo oxide"*) OXIDE="${OXIDE}{ [ -f \"\$CUDA_OXIDE_BACKEND\" ] || { echo \"box.sh: no cuda-oxide backend for rev $OXREV at \$CUDA_OXIDE_BACKEND (tools/box.sh header)\" >&2; exit 70; }; } && { __r=\$(cat \"\${CUDA_OXIDE_BACKEND%/*}/source-rev.txt\" 2>/dev/null); [ \"\$__r\" = $OXREV ] || { echo \"box.sh: the backend at \$CUDA_OXIDE_BACKEND records source rev '\$__r', not $OXREV\" >&2; exit 70; }; unset __r; } && " ;;
 esac
+# Local mode unsets the environment file's backend: cargo oxide builds and keeps its own (the header).
+[ "$LOCAL" = 0 ] || OXIDE="unset CUDA_OXIDE_BACKEND && "
+# The guard probed LOCK_DIR and the recipe expanded its arch before the environment file and BLOOMERY_BOX_ENV ran; one of
+# them moving either would put the command's locks where the guard did not look, or build for another arch.
+LOCALX=
+if [ "$LOCAL" = 1 ]; then
+  LOCALX="{ [ \"\${BLOOMERY_LOCK_DIR-}\" = $(printf %q "$LOCK_DIR") ] || { echo \"box.sh: the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode's guard probed the lock directory; set it before tools/box.sh\" >&2; exit 64; }; } && "
+  LOCALX+="{ [ \"\${BLOOMERY_ARCH:-sm_86}\" = $RECIPE_ARCH ] || { echo \"box.sh: the environment file set BLOOMERY_ARCH=\$BLOOMERY_ARCH, and the recipe expanded $RECIPE_ARCH (this side's BLOOMERY_ARCH, unset: sm_86): name it in the environment, where the recipes read it\" >&2; exit 64; }; } && "
+fi
 # serve의 build.rs가 `/props`의 version에 새기는 커밋. 박스 사본에는 .git이 없어서(rsync가 뺀다) 여기서 넘긴다.
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
-REMOTE_CMD="source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ARCHX$ENVS$*"
+REMOTE_CMD="source $ENVF && { $PICK
+} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ARCHX$ENVS$LOCALX$*"
+if [ "$LOCAL" = 1 ]; then
+  # ssh carries no environment to the box: the command runs without what this side read, BLOOMERY_MODEL above all (the model
+  # crate's tests read that name as a model path), without box.sh's own outputs, which only the profile sets, and without
+  # the lease's file names, which BLOOMERY_LOCK_DIR sets.
+  exec env -u BLOOMERY_BOX -u BLOOMERY_REMOTE -u BLOOMERY_BOX_WAIT -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_ENV -u BLOOMERY_BOX_READONLY \
+    -u BLOOMERY_BOX_LOCAL -u BLOOMERY_ENV -u BLOOMERY_CARD -u BLOOMERY_MODEL \
+    -u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S \
+    -u BLOOMERY_CARD_BUDGET -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL_PROFILE -u BLOOMERY_LEASE_LOCK -u BLOOMERY_LEASE_HOLDS \
+    bash -c "export BLOOMERY_LOCK_DIR=$(printf %q "$LOCK_DIR") && ${GUARD}$REMOTE_CMD"
+fi
 if [ "$QUEUE" = 0 ]; then
   ssh "$HOST" "${GUARD}$REMOTE_CMD"
   exit
