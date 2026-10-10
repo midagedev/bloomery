@@ -1771,10 +1771,37 @@ fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> 
     Ok(uuid.bytes.map(|c| c.to_ne_bytes()[0]))
 }
 
+/// Whether device `dev` allocates from host memory
+/// (`CU_DEVICE_ATTRIBUTE_INTEGRATED`), asked of the driver without a context.
+fn raw_device_integrated(dev: cuda_core::sys::CUdevice) -> Result<bool, GpuError> {
+    let mut integrated = 0;
+    // SAFETY: `integrated` is a live out-pointer for the call and `dev` a
+    // device handle the driver returned.
+    let rc = unsafe {
+        cuda_core::sys::cuDeviceGetAttribute(
+            &mut integrated,
+            cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_INTEGRATED,
+            dev,
+        )
+    };
+    graph::cu(rc, "cuDeviceGetAttribute(INTEGRATED)")?;
+    Ok(integrated != 0)
+}
+
+/// The room a device allocation can take on an integrated device: the
+/// host's ([`::model::placement::workstation::host_available`]), since
+/// `cuMemGetInfo` there leaves out the page cache the kernel gives back to a
+/// device allocation. A failed host read is `what`'s error.
+fn integrated_room(what: &'static str) -> Result<u64, GpuError> {
+    ::model::placement::workstation::host_available()
+        .map_err(|e| GpuError::plan(what, format!("an integrated device's room: {e}")))
+}
+
 /// The visible devices as this process's driver enumerates them, each read
 /// without a context but its free bytes, which the primary context answers:
-/// ordinal, name, `cuDeviceTotalMem`, free bytes, UUID and PCI bus
-/// id — the census a plan resolves its cards against
+/// ordinal, name, `cuDeviceTotalMem`, free bytes (on a device that allocates
+/// from host memory, the host's room: [`raw_device_free_bytes`]), whether it
+/// does, UUID and PCI bus id — the census a plan resolves its cards against
 /// ([`::model::placement::workstation::resolve`]) and an open checks them
 /// against ([`Gpu::open_card`]). No device is an empty census, not an error.
 /// The holder list (`DeviceInfo::held_by`) stays empty here; the gates'
@@ -1801,12 +1828,14 @@ pub fn census() -> Result<Vec<::model::placement::workstation::DeviceInfo>, GpuE
             .take_while(|&&c| c != 0)
             .map(|&c| c.to_ne_bytes()[0])
             .collect();
+        let integrated = raw_device_integrated(dev)?;
         out.push(::model::placement::workstation::DeviceInfo {
             ordinal: u32::try_from(ordinal)
                 .map_err(|_| GpuError::shape("census", "an ordinal past u32"))?,
             name: raw_device_name(dev)?,
             total_bytes: total as u64,
-            free_bytes: raw_device_free_bytes(dev)?,
+            free_bytes: raw_device_free_bytes(dev, integrated)?,
+            integrated,
             uuid: raw_device_uuid(dev)?,
             pci_bus: String::from_utf8_lossy(&bus).into_owned(),
             held_by: None,
@@ -1972,8 +2001,10 @@ fn anchor(device: usize) -> Result<Arc<CudaContext>, GpuError> {
 /// not open. The calling thread's current context is put back. Every step's
 /// failure is the call's error: the restore and the release run whatever came
 /// before them, one failure is that driver error, and more than one is a
-/// census error naming each.
-fn raw_device_free_bytes(dev: cuda_core::sys::CUdevice) -> Result<u64, GpuError> {
+/// census error naming each. On an `integrated` device the reading is the
+/// host's room on that context ([`integrated_room`]), which is what a load
+/// can take there.
+fn raw_device_free_bytes(dev: cuda_core::sys::CUdevice, integrated: bool) -> Result<u64, GpuError> {
     use cuda_core::sys::{
         cuCtxGetCurrent, cuCtxSetCurrent, cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain,
         cuMemGetInfo_v2,
@@ -1991,6 +2022,9 @@ fn raw_device_free_bytes(dev: cuda_core::sys::CUdevice) -> Result<u64, GpuError>
     // current on the calling thread by this call.
     let rc = unsafe { cuCtxSetCurrent(primary) };
     let read = graph::cu(rc, "cuCtxSetCurrent").and_then(|()| {
+        if integrated {
+            return integrated_room("census");
+        }
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: both out-pointers are live locals for the call and the
         // retained context is current on this thread.
@@ -2292,6 +2326,19 @@ impl Gpu {
     /// The device's name as the driver reports it.
     pub fn device_name(&self) -> Result<String, GpuError> {
         Ok(self.ctx.device_name()?)
+    }
+
+    /// The bytes a new allocation on this context's device can take now:
+    /// `cuMemGetInfo`'s free bytes ([`Gpu::mem_info`]), or on a device that
+    /// allocates from host memory the host's room ([`integrated_room`]), as
+    /// the census reads them ([`census`]).
+    pub fn alloc_room(&self) -> Result<usize, GpuError> {
+        const WHAT: &str = "Gpu::alloc_room";
+        if raw_device_integrated(self.ctx.cu_device())? {
+            return usize::try_from(integrated_room(WHAT)?)
+                .map_err(|_| GpuError::shape(WHAT, "a room past usize"));
+        }
+        Ok(self.mem_info()?.0)
     }
 
     /// `(free, total)` device bytes of this context's device, as

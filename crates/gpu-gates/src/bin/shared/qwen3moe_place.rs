@@ -381,9 +381,9 @@ impl PlaceQ3 {
     }
 
     /// The whole-fit verdict of this file on the card's device at `ctx`
-    /// positions for `slots` resident sequences ([`whole_on`]), the cache in
-    /// the planes' format this load counts, `load` what the program holds
-    /// past it or its refusal.
+    /// positions for `slots` resident sequences ([`whole_on`]), each taking
+    /// checkpoints when this load's do, the cache in the planes' format this
+    /// load counts, `load` what the program holds past it or its refusal.
     fn whole_at(
         &self,
         ctx: u64,
@@ -397,6 +397,7 @@ impl PlaceQ3 {
             inputs_model(&self.inputs),
             layers.end,
             kv,
+            Seqs { slots, ..self.seqs },
             load,
         )
     }
@@ -594,15 +595,18 @@ impl Whole {
 
 /// The whole-fit verdict of a load of the whole of `model` — `layers`
 /// layers, `kv` bytes of cache — on `spec`'s card: the card the plan lays
-/// out for the program ([`q3::machine`], its step arenas' scratch) and what
-/// the program holds past it (`load`, or the program's refusal), sized by
-/// `placement::whole_need`, the verdict's one owner. A tensor no card
-/// format loads is a refusal; any other planner error is the error.
+/// out for the program ([`q3::machine`], its step arenas' scratch), on a
+/// unified machine with the checkpoints `seqs` pin ([`reserve_checkpoints`],
+/// `Machine::whole_card`), and what the program holds past it (`load`, or
+/// the program's refusal), sized by `placement::whole_need`, the verdict's
+/// one owner. A tensor no card format loads is a refusal; any other planner
+/// error is the error.
 fn whole_on(
     spec: CardSpec,
     model: &ModelTensors,
     layers: usize,
     kv: u64,
+    seqs: Seqs,
     load: Result<WholeLoad, String>,
 ) -> Result<Whole, GateError> {
     let refused = |why: &dyn std::fmt::Display| {
@@ -612,15 +616,17 @@ fn whole_on(
         Ok(l) => l,
         Err(why) => return Ok(refused(&why)),
     };
-    let machine = q3::machine(spec, layers, 0);
-    Ok(
-        match placement::whole_need(model, &machine.cards[0], kv, load) {
-            Ok(need) if need.fits() => Whole::Fits(need),
-            Ok(need) => Whole::Short(need),
-            Err(e @ PlacementError::NoCardFormat { .. }) => refused(&e),
-            Err(e) => return Err(e.into()),
-        },
-    )
+    let mut machine = q3::machine(spec, layers, 0);
+    reserve_checkpoints(&mut machine, seqs);
+    let card = machine
+        .whole_card()
+        .ok_or_else(|| format!("the whole load on {}: a machine with no card", spec.name))?;
+    Ok(match placement::whole_need(model, &card, kv, load) {
+        Ok(need) if need.fits() => Whole::Fits(need),
+        Ok(need) => Whole::Short(need),
+        Err(e @ PlacementError::NoCardFormat { .. }) => refused(&e),
+        Err(e) => return Err(e.into()),
+    })
 }
 
 impl PlaceQ3 {
@@ -1026,7 +1032,9 @@ fn open_slots<B: Slots>(
 /// against the host's usable bytes and refuses by name; a whole-card load has
 /// no host plan, so the host's available bytes now
 /// ([`workstation::host_available`]) must hold them, else they are refused
-/// by name before anything loads. Nothing for `seqs` that take none.
+/// by name before anything loads (on a unified machine the whole fit counts
+/// them with the card's too, [`whole_on`]). Nothing for `seqs` that take
+/// none.
 #[allow(
     dead_code,
     reason = "the serve seat's qwen35moe loads take checkpoints; the CLI and the e2e gates take none"

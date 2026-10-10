@@ -487,6 +487,7 @@ mod gate {
                     uuid: [u8::try_from(i + 1).expect("a short list"); 16],
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                     held_by: None,
+                    integrated: false,
                 }
             })
             .collect()

@@ -599,6 +599,7 @@ fn nextn_machine() -> Machine {
             usable_bytes: u64::MAX,
             reserves: Vec::new(),
         },
+        unified: None,
     }
 }
 
@@ -771,7 +772,8 @@ impl PlanInputs {
         )?;
         let arena = NEXTN_ARENA_BYTES;
         let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
-        let reserve = (nextn_card_bytes(&draft.cards[0]) + arena + front).saturating_add(beside);
+        let nextn_card = nextn_card_bytes(&draft.cards[0]);
+        let reserve = (nextn_card + arena + front).saturating_add(beside);
         let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
@@ -784,12 +786,14 @@ impl PlanInputs {
         // The bytes beside the stores ride the stage card's KV term, as
         // [`PlanInputs::plan_slots`] counts them.
         plan.cards[0].grow_kv(beside);
-        let total = card_terms(&plan.cards[0]) + nextn_card_bytes(&draft.cards[0]) + arena;
+        let total = card_terms(&plan.cards[0]) + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let host_headroom = plan.host.headroom_bytes - i128::from(draft.host.expert_bytes);
+        // On a unified machine the pool holds the draft and the front beside
+        // the target's own terms.
         let mut broken: Vec<Violation> = plan
-            .violations()
+            .violations_beside(nextn_card + arena + front + draft.host.expert_bytes)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. } | Violation::HostOver { .. }))
             .chain(
@@ -1323,6 +1327,7 @@ mod tests {
                     usable_bytes: u64::MAX,
                     reserves: Vec::new(),
                 },
+                unified: None,
             }
         }
 

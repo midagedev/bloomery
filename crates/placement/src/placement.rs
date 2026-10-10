@@ -216,6 +216,17 @@ pub struct Host {
     pub reserves: Vec<(String, u64)>,
 }
 
+/// One memory behind the cards and the host (GB10): each side's figure
+/// reads the same bytes, so a plan holds their sum to it as well
+/// ([`Violation::PoolOver`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnifiedPool {
+    /// The pool's room at plan time, as the census read it for the card
+    /// ([`Card::free_bytes`]): net of the primary context's own creation
+    /// cost, like any census reading.
+    pub bytes: u64,
+}
+
 /// The devices: the cards in stage order, the expert tier cards and the
 /// host. The NVMe tier has no figure here — it holds its tensors in place and
 /// never loads them.
@@ -226,6 +237,10 @@ pub struct Machine {
     /// stage card in this order.
     pub tiers: Vec<Card>,
     pub host: Host,
+    /// The pool the cards and the host share, on a machine whose card
+    /// allocates from host memory ([`workstation::unified_of`]); `None` where
+    /// each card has memory of its own.
+    pub unified: Option<UnifiedPool>,
 }
 
 impl Machine {
@@ -242,6 +257,19 @@ impl Machine {
             None => self.cards.get(i),
             Some(t) => self.tiers.get(t),
         }
+    }
+
+    /// The stage card a whole load of this machine is sized against
+    /// ([`whole_need`]): the first, and on a unified machine with the host's
+    /// reserves among its own, since a whole load has no host plan and the
+    /// pool its card takes from holds them too. `None` with no stage card.
+    #[must_use]
+    pub fn whole_card(&self) -> Option<Card> {
+        let mut card = self.cards.first()?.clone();
+        if self.unified.is_some() {
+            card.reserves.extend(self.host.reserves.iter().cloned());
+        }
+        Some(card)
     }
 }
 
@@ -817,10 +845,19 @@ pub struct HostTotals {
     /// reads from the NVMe tier ([`row_table_tier`]); 0 when none lies
     /// there. Inside [`HostTotals::reserve_bytes`].
     pub row_reserve_bytes: u64,
+    /// On a unified machine, what the cards take from the pool the host's
+    /// room is read from: each card's terms with its margin, less the
+    /// context self cost its census reading carries
+    /// ([`Card::context_in_free`]), and the reserve the expert rule kept
+    /// beside the plan ([`plan_routed_reserving`]); 0 where each card has
+    /// memory of its own. The host's need counts it
+    /// ([`workstation::HostNeed::cards`]), so the headroom below, the load's
+    /// host check and the NVMe tier's split all leave the cards their share.
+    pub pool_card_bytes: u64,
     /// The room the machine's figure leaves
     /// ([`workstation::HostNeed::machine_room`]) less the plan's host need
     /// ([`workstation::HostNeed`]): usable − experts − tables − shadows −
-    /// reserves; on a plan the NVMe expert tier split ([`expert_nvme_tier`]),
+    /// reserves − the cards' share of a unified pool; on a plan the NVMe expert tier split ([`expert_nvme_tier`]),
     /// the room the split read less the arena and the plan's host need,
     /// since the room binds there.
     pub headroom_bytes: i128,
@@ -1108,6 +1145,18 @@ pub enum Violation {
     /// ([`workstation::HostNeed::machine_room`]): `total` is them with the
     /// OS reserve in it, beside the host's usable bytes.
     HostOver { total: u64, usable: u64 },
+    /// On a unified machine, the `cards`' [`Violation::CardOver`] totals
+    /// with their margins, the `host`'s need and the `beside` bytes the load
+    /// holds past the plan's own terms ([`Plan::violations_beside`])
+    /// together pass the pool: each side may fit its own figure while both
+    /// read the same bytes. `pool` is the pool's bytes with each card's
+    /// context self cost added back, as [`capped`] adds it to a card.
+    PoolOver {
+        cards: u64,
+        host: u64,
+        beside: u64,
+        pool: u64,
+    },
 }
 
 impl fmt::Display for Violation {
@@ -1133,6 +1182,21 @@ impl fmt::Display for Violation {
                 "host: tensors + ring shadows + reserves = {total} B pass usable {usable} B by {} B",
                 total - usable
             ),
+            Violation::PoolOver {
+                cards,
+                host,
+                beside,
+                pool,
+            } => {
+                let total = cards + host + beside;
+                write!(
+                    f,
+                    "unified pool: the cards with their margins {cards} B + the host's need \
+                     {host} B + {beside} B the load holds beside the plan = {total} B pass the \
+                     pool {pool} B by {} B",
+                    total - pool
+                )
+            }
         }
     }
 }
@@ -1790,9 +1854,10 @@ pub fn plan_routed<'a>(
 /// [`plan_routed`] with `reserve` bytes of every card kept for what the
 /// caller plans beside this plan on the same card — an MTP draft's granules
 /// and store: the expert rule spreads within the card's budget less
-/// `reserve`, and nothing else sees it. The plan's usable bytes, card budget,
-/// headroom and violations are its own; the caller checks the card's bound
-/// on the sum.
+/// `reserve`, and nothing else on the card sees it. The plan's usable bytes,
+/// card budget, headroom and violations are its own; the caller checks the
+/// card's bound on the sum. On a unified machine the host's need counts it
+/// in the cards' share of the pool ([`HostTotals::pool_card_bytes`]).
 pub fn plan_routed_reserving<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1961,7 +2026,7 @@ fn plan_rule<'a>(
         }
     }
     let rows: Vec<Row> = rows.into_iter().flatten().collect();
-    Ok(totals(
+    let mut plan = totals(
         model,
         machine,
         ctx_max,
@@ -1969,7 +2034,15 @@ fn plan_rule<'a>(
         &kv_bytes,
         (n_l, tier_n_l),
         card_budget,
-    ))
+    );
+    // What the caller plans beside this plan on each card comes out of a
+    // unified pool too.
+    if machine.unified.is_some() {
+        let beside = reserve * machine.all_cards().count() as u64;
+        plan.host.pool_card_bytes += beside;
+        plan.host.headroom_bytes -= i128::from(beside);
+    }
+    Ok(plan)
 }
 
 /// A card's KV cache and its ring shadows over the layers its stage runs;
@@ -2987,6 +3060,7 @@ fn totals<'a>(
             Some(t) => tier_n_l[t].iter().sum(),
         }
     };
+    let mut pool_cards = 0u64;
     let card_totals = cards
         .iter()
         .zip(&heaps)
@@ -2995,6 +3069,7 @@ fn totals<'a>(
             let rounding = heap.taken - (card_dense[c] + card_experts[c]);
             let (kv, _) = kv_bytes[c];
             let used = heap.taken + kv + card.set_aside_bytes();
+            pool_cards += used + card.margin_bytes - card.context_in_free();
             CardTotals {
                 dense_bytes: card_dense[c],
                 expert_bytes: card_experts[c],
@@ -3024,6 +3099,11 @@ fn totals<'a>(
         shadow_bytes,
         reserve_bytes,
         row_reserve_bytes: row_reserve,
+        pool_card_bytes: if machine.unified.is_some() {
+            pool_cards
+        } else {
+            0
+        },
         headroom_bytes: 0,
     };
     // The room the machine's figure leaves past the plan's host need, the
@@ -3066,8 +3146,17 @@ impl Plan<'_> {
     /// the plan's own host terms within the room its machine's figure leaves
     /// ([`workstation::HostNeed::check`] at
     /// [`workstation::HostNeed::machine_room`]), the NVMe tier's arena and
-    /// window held to the room its split read instead.
+    /// window held to the room its split read instead; on a unified machine,
+    /// the cards and the host together within the pool.
     pub fn violations(&self) -> Vec<Violation> {
+        self.violations_beside(0)
+    }
+
+    /// [`Plan::violations`] of a plan whose load holds `beside` bytes past
+    /// the plan's own terms (a draft's card bytes, a prompt front), which
+    /// its maker holds to the card's bound itself: on a unified machine the
+    /// pool holds them with the rest ([`Violation::PoolOver`]).
+    pub fn violations_beside(&self, beside: u64) -> Vec<Violation> {
         let model = self.model;
         let cards: Vec<&Card> = self.machine.all_cards().collect();
         let stage_cards = self.machine.cards.len();
@@ -3119,8 +3208,10 @@ impl Plan<'_> {
         }
         let (heaps, unsized_segments) = card_heaps(model, &cards, &self.rows);
         out.extend(unsized_segments);
+        let mut card_sum = 0u64;
         for ((card, totals), heap) in cards.iter().zip(&self.cards).zip(&heaps) {
             let total = heap.taken + totals.kv_bytes + card.set_aside_bytes();
+            card_sum += total + card.margin_bytes;
             let limit = self.usable_bytes(card).saturating_sub(card.margin_bytes);
             if total > limit {
                 out.push(Violation::CardOver {
@@ -3135,7 +3226,8 @@ impl Plan<'_> {
         // the rows' resident bytes, the ring shadows and the machine's
         // reserves. The NVMe tier's arena and run-ahead window are the
         // split's, sized to the room it read and held to that room
-        // ([`expert_nvme_tier`]), not to the machine's figure.
+        // ([`expert_nvme_tier`]), not to the machine's figure; a unified
+        // pool's share of the cards is the pool's bound, below.
         let host = &self.machine.host;
         let need = workstation::HostNeed {
             experts: host_resident,
@@ -3143,6 +3235,7 @@ impl Plan<'_> {
             reserves: host.reserves.iter().map(|(_, b)| b).sum::<u64>()
                 + self.host.row_reserve_bytes,
             arena: 0,
+            cards: 0,
             ..workstation::HostNeed::of(self, 0)
         };
         if let Err(short) = need.check(workstation::HostNeed::machine_room(host)) {
@@ -3150,6 +3243,26 @@ impl Plan<'_> {
                 total: short.need.bytes() + short.need.os,
                 usable: host.usable_bytes,
             });
+        }
+        // One pool holds the cards, re-derived from the rows here, and the
+        // host's whole need with the split's arena and window.
+        if let Some(unified) = self.machine.unified {
+            let need = workstation::HostNeed {
+                experts: host_resident,
+                tables: 0,
+                cards: 0,
+                ..workstation::HostNeed::of(self, 0)
+            };
+            let host = need.bytes();
+            let pool = unified.bytes + cards.iter().map(|c| c.context_in_free()).sum::<u64>();
+            if card_sum + host + beside > pool {
+                out.push(Violation::PoolOver {
+                    cards: card_sum,
+                    host,
+                    beside,
+                    pool,
+                });
+            }
         }
         out
     }
@@ -3381,6 +3494,7 @@ mod tests {
             cards: vec![bytes_card("stage", HEAD + stage * EXPERT, 0..3)],
             tiers: vec![bytes_card("tier", tier * EXPERT, 0..0)],
             host: host(),
+            unified: None,
         };
         let whole = machine(24, 4);
         match plan_with(&model, &whole, 4096, &NoKv, None) {
@@ -3426,6 +3540,7 @@ mod tests {
             }],
             tiers: Vec::new(),
             host: host(),
+            unified: None,
         };
         let held_machine = machine(Some(HEAD + 12 * EXPERT));
         let plan = plan_with(&model, &held_machine, 4096, &NoKv, None).expect("a held card plans");
@@ -3461,6 +3576,98 @@ mod tests {
         assert_eq!(plan.n_l.iter().sum::<u64>(), 24);
     }
 
+    /// A unified machine's pool holds the card and the host together: the
+    /// model's bytes, wherever the fill put an expert, the card's cache,
+    /// set-aside and margin, the host's ring shadows, reserves and NVMe
+    /// arena and window, and the bytes the load holds beside the plan, each
+    /// counted once. A plan whose card and host each fit their own figure
+    /// plans clean at a pool of exactly that sum, as with no pool at all,
+    /// and is refused by name one byte under it, term by term; the host's
+    /// headroom is what the pool leaves past the card and the host's need.
+    #[test]
+    fn a_unified_pool_holds_card_and_host_together() {
+        struct Kv;
+        impl KvBytes for Kv {
+            fn layer_bytes(&self, _layer: usize, _ctx_max: u64) -> u64 {
+                64
+            }
+            fn shadow_bytes(&self, _layer: usize, _ctx_max: u64) -> u64 {
+                32
+            }
+        }
+        let model = layered(3);
+        let (context, set_aside, margin) = (1_000, 1_000 + 300 + 100, 200);
+        let (kv, shadows, pinned) = (3 * 64, 3 * 32, 50);
+        // An NVMe split's arena and run-ahead window, set after the plan.
+        let (arena, window) = (7, 5);
+        let plan_at = |experts: u64, pool: Option<u64>, beside: u64| {
+            let usable = HEAD + experts * EXPERT + set_aside + margin + kv;
+            let machine = Machine {
+                cards: vec![Card {
+                    context_bytes: context,
+                    scratch_bytes: 300,
+                    margin_bytes: margin,
+                    free_bytes: Some(usable - context),
+                    reserves: vec![("draft".to_string(), 100)],
+                    ..bytes_card("pool", usable, 0..3)
+                }],
+                tiers: Vec::new(),
+                // On a unified machine the host is the pool
+                // (`workstation::host_of`).
+                host: Host {
+                    usable_bytes: pool.unwrap_or(1 << 40),
+                    reserves: vec![("pinned".to_string(), pinned)],
+                },
+                unified: pool.map(|bytes| UnifiedPool { bytes }),
+            };
+            let mut plan = plan_with(&model, &machine, 4096, &Kv, None).expect("plans");
+            assert!(plan.host.experts > 0, "the host holds experts");
+            let headroom = plan.host.headroom_bytes;
+            plan.host.nvme_arena_bytes = arena;
+            plan.host.reserve_bytes += window;
+            (headroom, plan.violations_beside(beside))
+        };
+        let model_bytes: u64 = model.tensors.iter().map(|t| t.file_bytes).sum();
+        for (experts, beside) in [(6, 0), (12, 9)] {
+            let on_card = HEAD + experts * EXPERT;
+            let cards = on_card + kv + set_aside + margin;
+            let host = model_bytes - on_card + shadows + pinned + arena + window;
+            let total = cards + host + beside;
+            let (_, v) = plan_at(experts, None, beside);
+            assert!(
+                v.is_empty(),
+                "{experts} experts on the card, no pool: {v:?}"
+            );
+            // The census reads the pool net of the context's own creation
+            // cost, which the card's context term counts again.
+            let (headroom, v) = plan_at(experts, Some(total - context), beside);
+            assert!(
+                v.is_empty(),
+                "{experts} experts on the card, a pool of the sum: {v:?}"
+            );
+            assert_eq!(
+                headroom,
+                i128::from(arena + window + beside),
+                "{experts} experts on the card: the pool past the plan's own terms"
+            );
+            match plan_at(experts, Some(total - context - 1), beside)
+                .1
+                .as_slice()
+            {
+                [v @ Violation::PoolOver { .. }] => assert_eq!(
+                    v.to_string(),
+                    format!(
+                        "unified pool: the cards with their margins {cards} B + the host's need \
+                         {host} B + {beside} B the load holds beside the plan = {total} B pass \
+                         the pool {} B by 1 B",
+                        total - 1
+                    )
+                ),
+                v => panic!("{experts} experts on the card: {v:?}, not one PoolOver"),
+            }
+        }
+    }
+
     /// The census reads a card on its primary context, so an idle card's
     /// reading is its usable bytes less the context's own creation cost,
     /// which the card's context term counts again: the plan counts the
@@ -3483,6 +3690,7 @@ mod tests {
             }],
             tiers: Vec::new(),
             host: host(),
+            unified: None,
         };
         let (none, idle, busy, budgeted) = (
             machine(None),
@@ -3534,6 +3742,7 @@ mod tests {
             }],
             tiers: Vec::new(),
             host: host(),
+            unified: None,
         };
         let held = machine(HEAD - 1);
         match plan_with(&model, &held, 4096, &NoKv, None) {
@@ -3717,6 +3926,7 @@ mod tests {
             cards: vec![bytes_card("dev", usable, 0..3)],
             tiers: vec![bytes_card("dev", usable, 0..0)],
             host: host(),
+            unified: None,
         };
         match plan_with(&model, &machine, 4096, &NoKv, None) {
             Err(e @ PlacementError::DeviceTwice { .. }) => assert_eq!(
@@ -3758,6 +3968,7 @@ mod tests {
             cards: vec![on(bytes_card("3090", usable, 0..3), a)],
             tiers: vec![on(bytes_card("3090", usable, 0..0), b)],
             host: host(),
+            unified: None,
         };
         let two = machine(dev(0), dev(1));
         let plan = plan_with(&model, &two, 4096, &NoKv, None).expect("two 3090s");
@@ -3839,6 +4050,7 @@ mod tests {
             }],
             tiers: Vec::new(),
             host: host(),
+            unified: None,
         };
         let mut plan = plan_routed_reserving(
             &model,
@@ -3888,6 +4100,7 @@ mod tests {
                     usable_bytes: usable,
                     reserves: vec![(os.to_string(), 7_000), ("pool".to_string(), 1_000)],
                 },
+                unified: None,
             };
             let probe = machine(1 << 40);
             let plan = plan_with(&model, &probe, 4096, &NoKv, None).expect("the plan");

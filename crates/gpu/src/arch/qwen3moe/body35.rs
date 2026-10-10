@@ -192,10 +192,10 @@ fn ubatch_need(d: &Dims, forms: Forms, u: usize) -> (usize, usize) {
 
 /// The ubatch arena of `d` for ubatches of `u` tokens, after the check that
 /// it fits: its bytes ([`ubatch_need`]) and [`FIT_RESERVE`] within the
-/// card's `free` bytes, else a named refusal with the free bytes, the need
-/// and the largest ubatch that fits, before anything is allocated. The
-/// arena it allocates holds the bytes the check counted, or the load fails
-/// by name. Load-time allocation.
+/// card's `free` bytes ([`Gpu::alloc_room`]), else a named refusal with the
+/// free bytes, the need and the largest ubatch that fits, before anything is
+/// allocated. The arena it allocates holds the bytes the check counted, or
+/// the load fails by name. Load-time allocation.
 fn ubatch_arena(
     stream: &CudaStream,
     (d, forms): (Dims, Forms),
@@ -1273,7 +1273,7 @@ impl Body35 {
         let img = PromptImage::new(stream, ctx, true)?;
         let (u, placed) = match placed {
             None => {
-                let (free, _) = gpu.mem_info()?;
+                let free = gpu.alloc_room()?;
                 (ubatch_arena(stream, (d, forms), ubatch.get(), free)?, None)
             }
             Some((open, counted)) => {
@@ -1796,7 +1796,7 @@ impl GpuModel<Body35> {
         let d = body.u.dims;
         let size = ubatch_of(&d, u)?;
         let forms = Forms::of(&body.plans, &d);
-        let (free, _) = gpu.mem_info()?;
+        let free = gpu.alloc_room()?;
         body.u = ubatch_arena(gpu.stream(), (d, forms), u, free)?;
         body.ubatch = size;
         Ok(())

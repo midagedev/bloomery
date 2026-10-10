@@ -286,6 +286,7 @@ mod gate {
             t.device = machine.cards[0].device;
         }
         out.host = bp.host;
+        out.unified = bp.unified;
         Ok(out)
     }
 
