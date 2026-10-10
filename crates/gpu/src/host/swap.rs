@@ -35,7 +35,9 @@
 //! flip's event; a lane thread prepares the victim for the host
 //! ([`SwapSource::prepare_victim`]), then copies the source bytes into the
 //! ring, gated to the staging window ([`SwapMachine::window`]), which a step
-//! service closes only while it computes a layer's host experts.
+//! service closes only while it computes a layer's host experts. When the
+//! flip lands, the admitted expert is in one tier: the source frees what the
+//! host held of it ([`SwapSource::release_host`]).
 //!
 //! **Boundaries.** [`SwapMachine::boundary`] runs before each pass's launch,
 //! in this order: the jobs of the flips live here are made due, and the host
@@ -77,7 +79,16 @@
 //! machine's owner drops it before it frees anything
 //! ([`crate::host::HostTier::stop_swap`]), and the drop releases every such
 //! copy. A panic on a lane thread is a staging failure of its job,
-//! published like any other.
+//! published like any other. A job's preparation waits on nothing of the
+//! chain's: the victim's fill reads on the lane's own thread
+//! ([`SwapSource::prepare_victim`]) and takes beside the chain only the
+//! tier's books lock, which a claim, a pin, a release or a publish holds for
+//! a few stores with no wait inside it — never the pool's dispatch mutex,
+//! which the chain's host compute holds while it waits for its workers. A
+//! lane read of an admitted expert's bytes is open only inside its job's
+//! staging, which the host waits for before the flip lands, so the landing's
+//! release of the promoted expert's host copy
+//! ([`SwapSource::release_host`], on the machine's thread) finds none open.
 //!
 //! **No cycle through the card.** The copy stream's wait for a staging word
 //! is a stream memory op, an order the driver's scheduler does not see: a
@@ -93,9 +104,11 @@
 //! reset's drain); the window is closed only from a step service's go
 //! landing to its signal, or its failure (`host::step`'s `Closed`), while
 //! host code runs that waits on nothing of the card, and a prompt's batch
-//! walk never closes it. Each word is therefore raised in bounded time
-//! whatever the card does after it, and one hardware queue only serializes
-//! the streams; it cannot close a cycle.
+//! walk never closes it. The tier's books lock, the one lock beside the
+//! chain's a preparation takes, is held by threads that wait on nothing
+//! inside it, the card included. Each word is therefore raised in bounded
+//! time whatever the card does after it, and one hardware queue only
+//! serializes the streams; it cannot close a cycle.
 //!
 //! **Broken.** An error after a call's first change — a boundary's first
 //! engine stream wait, `end_pass`'s first fold into the rule, a reset's first
@@ -324,9 +337,10 @@ pub trait SwapSource: Send + Sync {
 
     /// Bring layer `layer`'s expert `id` to where the host serves it from
     /// resident pages (read its pages in). The lane calls it for a flip's
-    /// victim ahead of the landing; the machine's thread calls it
-    /// again for an expert it finds not host-resident when it sends it to
-    /// the host, whose pages the page cache let go since.
+    /// victim ahead of the landing, on its own thread; the machine's thread
+    /// calls it again for an expert it finds not host-resident when it sends
+    /// it to the host, whose pages the page cache let go since. Neither
+    /// takes anything the chain's compute holds while it waits for workers.
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError>;
 
     /// Whether the host serves layer `layer`'s expert `id` from resident
@@ -336,9 +350,11 @@ pub trait SwapSource: Send + Sync {
     /// refusing the flip or sending the expert on.
     fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError>;
 
-    /// Release the host pages of layer `layer`'s expert `id`, which stays on
-    /// the card after a reset; the bytes released. The host pages of an
-    /// admitted expert stay until a reset sends it back or releases them.
+    /// Release what the host holds of layer `layer`'s expert `id`, which
+    /// stays on the card: when its flip lands and at a reset that leaves it
+    /// there; the bytes released, 0 for an expert the host held nothing of
+    /// by then. A lane has no read of it open: the landing follows its
+    /// copy's staging.
     fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError>;
 }
 
@@ -1149,6 +1165,16 @@ pub struct PassReport {
     /// preparing victims for the host.
     pub stage_us: u64,
     pub prepare_us: u64,
+    /// The slots of the flips that landed here that the source freed
+    /// ([`SwapSource::release_host`]), and their bytes.
+    pub released: usize,
+    pub released_bytes: u64,
+    /// Of the flips that landed here, microseconds from the first one's issue
+    /// to this boundary's start (the window the lane had) and to the last
+    /// one's copy staged (the lane's budget for them); 0 with no flip landing
+    /// or none whose stamps the ring still holds.
+    pub window_us: u64,
+    pub lane_span_us: u64,
     /// Experts the machine's thread found not host-resident and read in
     /// again since the last boundary (the load's, a call's and a reset's
     /// with it): a page the page cache let go after the load or after the
@@ -2417,6 +2443,7 @@ impl SwapMachine {
         }
         report.wait_us = micros(t0);
         self.refuse_staging_failure(WHAT, Some(b))?;
+        (report.window_us, report.lane_span_us) = self.landing_span(&landing, start);
         // The flips' copies have landed in their slots: a victim the host
         // does not serve from resident pages goes all the same.
         for f in &landing {
@@ -2585,6 +2612,28 @@ impl SwapMachine {
         Ok(Faulting::of(&self.faulted))
     }
 
+    /// The window and the lane's span of the flips landing at a boundary that
+    /// began at `start`: from the earliest of their issues to the boundary
+    /// and to the last of their copies staged, in microseconds; 0 and 0 where
+    /// no landing flip's stamps are held, or one has not staged.
+    fn landing_span(&self, landing: &[Landing], start: Instant) -> (u64, u64) {
+        let stamps = landing
+            .iter()
+            .map(|f| self.shared.stamps.of(f.job))
+            .collect::<Option<Vec<_>>>();
+        let Some(stamps) = stamps.filter(|st| !st.is_empty() && st.iter().all(|s| s.staged != 0))
+        else {
+            return (0, 0);
+        };
+        let first = stamps.iter().map(|s| s.queued).min().unwrap_or(0);
+        let last = stamps.iter().map(|s| s.staged).max().unwrap_or(0);
+        let now = lane::since_epoch(self.shared.epoch, start);
+        (
+            now.saturating_sub(first) / 1000,
+            last.saturating_sub(first) / 1000,
+        )
+    }
+
     /// The flips live at boundary `b` as the ledger holds them, in the rule's
     /// order. The ledger must hold each flip the rule lands there, once.
     fn landing(&self, b: u64) -> Result<Vec<Landing>, GpuError> {
@@ -2657,6 +2706,11 @@ impl SwapMachine {
             row[f.slot as usize] = SlotState::Live(f.admit);
             row[freed as usize] = SlotState::Spare;
             self.free.push(f.event);
+            // The admitted expert is on the card now, and its copy staged
+            // before this boundary: what the host held of it goes.
+            let freed_bytes = self.shared.source.release_host(f.layer, f.admit)?;
+            report.released += usize::from(freed_bytes > 0);
+            report.released_bytes += freed_bytes;
         }
         report.landed = landing.len();
         self.boundary_event.record(stream)?;

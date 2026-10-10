@@ -2516,7 +2516,10 @@ pub const ARENA_COLUMNS: u64 = 1;
 /// thread at a time, and a job the staging window gates then waits for the
 /// window under the same lock; the step port closes the window for each
 /// service's compute, and every due job's victim is prepared before the
-/// pass launches. A count, not a pin: nothing holds a read slot.
+/// pass launches. A lane's open read of an admitted id pins its slot against
+/// the claim (the LRU takes no pinned slot); a layer has one flip in flight,
+/// so its claim and its pin never coexist and the count stays one. A claim
+/// that finds every candidate pinned is refused by name.
 pub const ARENA_LANE_CLAIMS: u64 = 1;
 
 /// The bytes one part of `len` bytes takes in an arena slot: the part and

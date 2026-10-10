@@ -19,6 +19,15 @@
 //! model's hook ([`Convert`]): V4.1's gates and ups under the sidecar hold
 //! the r8 row-lane layout, unpacked into Q3_K on the copy stream.
 //!
+//! **The arena.** On a paged plan ([`NvTier`]) an id the arena holds filled
+//! is read from its slot, part by part, the bytes the arena's fill wrote —
+//! the file's — while the lane's open read pins it ([`NvTier::open_read`]);
+//! a part the sidecar holds still reads the sidecar, whose bytes are not the
+//! arena's, and an id unfilled when the lane opens it reads the file's
+//! mapping. An id the card then holds gives its slot back when its flip
+//! lands ([`SwapSource::release_host`]), so an expert is in one tier, and a
+//! victim the arena serves fills its slot on the lane's own thread.
+//!
 //! **Host residency.** The host serves an expert from resident pages when
 //! every byte it reads for it lies in the load's host set and is in the page
 //! cache now ([`HostSet::serves`], `mincore`): the set says what the load
@@ -692,10 +701,33 @@ impl SwapSource for FileSwap {
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
         let t = &p.tensors[part];
         let src = self.pair.source();
-        let whole = match src
+        let side = src
             .sidecar()
-            .filter(|side| side.file_bytes(&t.name).is_some())
+            .filter(|side| side.file_bytes(&t.name).is_some());
+        // A part the sidecar does not hold, of an id the arena's slot holds
+        // filled under the lane's open read: the slot's bytes, which are the
+        // file's. The sidecar's bytes are not the arena's, so its parts read
+        // the sidecar as they always did.
+        if side.is_none()
+            && let Some(tier) = self.tier_serving(layer, id)
+            && let Some(bytes) = tier.staged_slot(layer, id, &t.name)?
         {
+            if bytes.len() != per {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {layer} expert {id}: its slot holds {} bytes of {}, the part is {per}",
+                        bytes.len(),
+                        t.name
+                    ),
+                ));
+            }
+            return Ok(Piece {
+                bytes,
+                transform: Transform::Identity,
+            });
+        }
+        let whole = match side {
             Some(side) => side.data(&t.name).map_err(|e| GpuError::plan(WHAT, e))?,
             None => {
                 let split = src.split();
@@ -729,8 +761,10 @@ impl SwapSource for FileSwap {
     }
 
     /// An id the arena serves is open on the tier while a lane reads it
-    /// ([`NvTier::open_read`]): no union's drop of its layer takes the pages
-    /// the lane has yet to copy out. An id the mapping serves needs nothing.
+    /// ([`NvTier::open_read`]): filled, its slot is pinned against the LRU
+    /// and read in place; unfilled, no union's drop of its layer takes the
+    /// pages the lane has yet to copy. An id the mapping serves needs
+    /// nothing.
     fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         match self.tier_serving(layer, id) {
             Some(tier) => tier.open_read(layer, id),
@@ -738,10 +772,11 @@ impl SwapSource for FileSwap {
         }
     }
 
-    /// An id the arena serves leaves the mapping and the page cache once a
-    /// lane is done with it ([`NvTier::end_read`]): its pages were the
-    /// read's alone, and the next read faults them in again. An id the
-    /// mapping serves keeps its pages: the host set's.
+    /// An id the arena serves is let go once a lane is done with it
+    /// ([`NvTier::end_read`]): a slot read unpins the slot; a mapping read
+    /// leaves the mapping and the page cache, its pages having been the
+    /// read's alone (the next read faults them in again). An id the mapping
+    /// serves keeps its pages: the host set's.
     fn release_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         match self.tier_serving(layer, id) {
             Some(tier) => tier.end_read(layer, id),
@@ -783,9 +818,10 @@ impl SwapSource for FileSwap {
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "FileSwap::prepare_victim";
         // A victim the arena serves fills its slot, never the page cache:
-        // the tier's own read, on this thread, inside the deadline.
+        // the tier's own read, on this thread — never the pool's, whose
+        // dispatch mutex the chain's compute takes — inside the deadline.
         if let Some(tier) = self.tier_serving(layer, id) {
-            return tier.ensure(layer, &[id]);
+            return tier.ensure_here(layer, &[id]);
         }
         let parts = self.layer(layer, WHAT)?.parts.len();
         for part in 0..parts {
@@ -818,13 +854,17 @@ impl SwapSource for FileSwap {
         Ok(true)
     }
 
-    /// Nothing: every stage card expert the machine can move is the churn
-    /// pool's, which the load's host set holds for the model's life, and the
-    /// host never reads the rest of a card expert's bytes (the source's gate
-    /// and up under the sidecar), which the load already released. The reset
-    /// lets go of no byte the host set held, so it reports 0.
-    fn release_host(&self, _layer: usize, _id: u32) -> Result<u64, GpuError> {
-        Ok(0)
+    /// An id the arena serves goes to the card holding no slot: its slot is
+    /// freed ([`NvTier::release`]) and the bytes it took returned. An id the
+    /// mapping serves frees nothing: the churn pool the load's host set holds
+    /// for the model's life is the host's, and the host never reads the rest
+    /// of a card expert's bytes (the source's gate and up under the
+    /// sidecar), which the load already released.
+    fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
+        match self.tier_serving(layer, id) {
+            Some(tier) => tier.release(layer, id),
+            None => Ok(0),
+        }
     }
 }
 
