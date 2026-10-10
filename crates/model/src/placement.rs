@@ -5,7 +5,10 @@
 //! documented there ([`bloomery_placement::placement`]); this path is the
 //! one the tree's callers and gates name. The resident-slot rules — a
 //! sequence's terms and the context split ([`slots`]) — are re-exported
-//! beside it, for the seats that split a context among their slots.
+//! beside it, for the seats that split a context among their slots, and so
+//! is the card kernel table ([`kernels`]: which common launch runs each
+//! operation on a file tensor of a type) for the bodies that route their
+//! types through it.
 //!
 //! What the Mac cannot run stays in this crate, beside the re-export:
 //! [`host_lock`] (the host tier's page locks, residency walks and page
@@ -15,7 +18,7 @@
 //! ([`checked`], [`joined`]) — one owner beside the planner it checks.
 
 pub use bloomery_placement::placement::*;
-pub use bloomery_placement::slots;
+pub use bloomery_placement::{kernels, slots};
 pub mod host_lock;
 pub mod workstation;
 

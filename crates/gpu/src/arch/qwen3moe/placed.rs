@@ -16,7 +16,8 @@
 //!   (`hostleg`);
 //! - the shadow: the card's routed experts of the layer when it has any —
 //!   the K-quant family's Q4_K gate·up over the places, the q8_1 of the card
-//!   slots' rows, the Q4_K or Q6_K down `_sel` — and on Qwen3.6 the shared
+//!   slots' rows, the down `_sel` the table names for the stack's type
+//!   ([`DownArm`]: Q4_K, Q5_K or Q6_K) — and on Qwen3.6 the shared
 //!   expert on its own stacks, a stack of one expert on a fixed route of
 //!   expert 0 ([`SharedFfn`]); a slot the host serves is [`HOST`] there and
 //!   no launch reads or writes it;
@@ -40,7 +41,7 @@
 //! family's — the same Walk A arithmetic as the whole-card launches — so a
 //! placed load agrees with the whole-card one to the error of those sums.
 
-use super::body::{Kernels, kq_site};
+use super::body::{Kernels, ggml_ty, kq_site};
 use super::dispatch::{self, Ctx, PassCtx};
 use super::hostleg::{HostCombineArgs, HostLegKernels, PlacesArgs};
 use super::plan::{FfnPlan, FfnRoute, LayerPlan, SiteTy};
@@ -51,17 +52,19 @@ use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, HOST, HostResidency, Hybrid, Refusal, SlotMap};
-use crate::kquant::{Act, GateUpAct, KquantKernels};
+use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::model::{HostServed, MAX_PASS_ROWS};
 use crate::q4k_sel::QuantSel;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
+use crate::{FaultSink, Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
+use gguf::quant::GgmlType;
 use model::placement::Plan;
+use model::placement::kernels::{self, DownAct, DownEntry};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
 
@@ -592,12 +595,12 @@ fn shadow(
             &mut s.act_h[i],
         )?;
         down_sel(
-            gpu,
-            k,
+            (gpu, k, &side.k.kquant),
             (f.down_ty, kq_weight(w, &f.down)?),
             (&s.act_h[i], &rows.sel),
             n_slots,
             hidden,
+            c.sink,
             &mut s.down,
         )?;
     }
@@ -623,42 +626,99 @@ fn shadow(
         ))?;
         gpu.enqueue_quantize_q8_1_layer(&r.h, act, c.layer)?;
         down_sel(
-            gpu,
-            k,
+            (gpu, k, &side.k.kquant),
             (sh.down_ty, kq_weight(w, &sh.down)?),
             (act, &r.zero),
             m,
             hidden,
+            c.sink,
             &mut r.y,
         )?;
     }
     Ok(())
 }
 
+/// The down `_sel` launches a placed stack takes: the table's entries
+/// (`kernels::down`) that read the `Q8Act` columns the placed side
+/// quantizes its SwiGLU rows into (`enqueue_quantize_sel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownArm {
+    /// `q4k_gemv_sel`.
+    Q4k,
+    /// `q5k_gemv_sel` (Walk A, the K-quant family).
+    Q5k,
+    /// `q6k_gemv_sel`.
+    Q6k,
+}
+
+/// The arm a stack of file type `ty` takes, or why it takes none. The match
+/// is on the table's entry with no wildcard, so an entry the table gains does
+/// not compile here until it is placed or refused.
+fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
+    let refuse = |why: String| GpuError::shape(WHAT, format!("a {ty} down: {why}"));
+    let Some((entry, act)) = kernels::down(ty) else {
+        return Err(refuse("no common down `_sel` launches it".into()));
+    };
+    let arm = match entry {
+        DownEntry::Q4k => DownArm::Q4k,
+        DownEntry::Q5k => DownArm::Q5k,
+        DownEntry::Q6k => DownArm::Q6k,
+        // These read `Q8Blocks32` columns (the 32-value quantizer,
+        // `enqueue_quantize_q8_sel`); the placed side's rows are `Q8Act`.
+        DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl => {
+            return Err(refuse(format!(
+                "its entry {entry:?} reads {act:?} columns; the placed side quantizes its \
+                 SwiGLU rows as {:?}",
+                DownAct::Q8Act
+            )));
+        }
+    };
+    if act != DownAct::Q8Act {
+        return Err(refuse(format!(
+            "its entry {entry:?} reads {act:?} columns; the placed side quantizes its SwiGLU \
+             rows as {:?}",
+            DownAct::Q8Act
+        )));
+    }
+    Ok(arm)
+}
+
 /// The down `_sel` of `n_slots` slots of the stack `wd` of type `ty`: slot
 /// `s` the rows of expert `sel[s]` against column `s` of `act`, a [`HOST`]
 /// slot left as it was.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one launch's kernels, stack, columns, slots, width, fault sink and output (rust-quality R8)"
+)]
 fn down_sel(
-    gpu: &Gpu,
-    k: &Kernels,
+    (gpu, k, kq): (&Gpu, &Kernels, &KquantKernels),
     (ty, wd): (SiteTy, &DeviceTensor<u32>),
     (act, sel): (&Q8Act, &DeviceBuffer<u32>),
     n_slots: usize,
     hidden: usize,
+    sink: FaultSink,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
-    match ty {
-        SiteTy::Q4K => gpu
+    match down_arm(ggml_ty(ty))? {
+        DownArm::Q4k => gpu
             .q4k_sel()
             .enqueue_gemv_q4k_sel(stream, wd, act, sel, n_slots, hidden, y),
-        SiteTy::Q6K => k
+        DownArm::Q5k => kq.enqueue_gemv_q5k_sel(
+            stream,
+            &SelDown {
+                w: wd,
+                act,
+                sel,
+                n_slots,
+                rows_per_expert: hidden,
+            },
+            sink,
+            y,
+        ),
+        DownArm::Q6k => k
             .q6_sel
             .enqueue_gemv_q6k_sel(stream, wd, act, sel, n_slots, hidden, y),
-        other => Err(GpuError::shape(
-            WHAT,
-            format!("a {other:?} down: the placed load runs Q4_K and Q6_K downs"),
-        )),
     }
 }
 
@@ -936,5 +996,45 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
         let p = &mut self.p;
         let lc = ctx_of(p.c, at.layer)?;
         combine(&lc, p.side, p.rows, p.s, p.m, port.hsum(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DownArm, down_arm};
+    use gguf::quant::GgmlType;
+
+    /// The placed side launches the table's `Q8Act` downs, each at its own
+    /// entry, and refuses every other type by name: the `Q8Blocks32` entries
+    /// with the form they read, a type with no entry with that fact.
+    #[test]
+    fn the_placed_down_follows_the_tables_entry() {
+        for (ty, arm) in [
+            (GgmlType::Q4_K, DownArm::Q4k),
+            (GgmlType::Q5_K, DownArm::Q5k),
+            (GgmlType::Q6_K, DownArm::Q6k),
+        ] {
+            assert_eq!(down_arm(ty).ok(), Some(arm), "{ty}");
+        }
+        for ty in [
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::IQ4_NL,
+        ] {
+            let why = down_arm(ty).err().map(|e| e.to_string());
+            assert!(
+                why.as_deref().is_some_and(|w| w.contains("Q8Blocks32")),
+                "{ty}: {why:?}"
+            );
+        }
+        for ty in [GgmlType::Q3_K, GgmlType::IQ3_XXS, GgmlType::F16] {
+            let why = down_arm(ty).err().map(|e| e.to_string());
+            assert!(
+                why.as_deref()
+                    .is_some_and(|w| w.contains("no common down `_sel`")),
+                "{ty}: {why:?}"
+            );
+        }
     }
 }
