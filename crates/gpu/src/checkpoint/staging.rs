@@ -1,14 +1,15 @@
 //! Pinned host memory for sequence states saved off the request path
-//! ([`Staging`]): a pool of page-locked slabs, lent to a state as one extent
+//! ([`Staging`]): page-locked slabs, lent to a state as one extent
 //! ([`Staged`]) and taken back when the state is dropped.
 //!
-//! Page-locking costs far more than a copy over the link, so a save never
-//! allocates for itself once the pool has grown to the states it holds: a
-//! state's extent is cut from a slab the pool already has, and the extent of
-//! a state the cache evicted is the next one's. The pool grows a slab at a
-//! time, up to its limit (the prompt cache's budget), and a request past the
-//! limit is refused by name. What a growth cost is recorded
-//! ([`Staged::alloc_ms`], [`StagingStats`]), apart from the copy.
+//! Page-locking costs far more than a copy over the link, so the pool pins
+//! all of its memory once, when it is made ([`Staging::pinned`], at load),
+//! and a save never allocates: a state's extent is cut from the slab, and the
+//! extent of a state the cache evicted is the next one's. The pool is the
+//! prompt cache's budget and no more. A state that finds no free extent gets
+//! `None` ([`Staging::lend`]), nothing allocated: the caller makes room
+//! (evicts a landed state) or takes the state on the request path. What the
+//! pinning cost is recorded ([`StagingStats`]), apart from the copy.
 //!
 //! An extent is never lent again while a copy writes it: the copy's event is
 //! held with the extent ([`Staged::hold`]), and dropping the extent waits for
@@ -23,10 +24,6 @@ use cuda_core::{CudaContext, CudaEvent, PinnedHostBuffer};
 use runtime::savemap::{Extents, Layout};
 
 use crate::GpuError;
-
-/// A slab's size at least: the pool grows by this much, or by the state's
-/// own bytes when it needs more.
-const SLAB: usize = 64 << 20;
 
 /// An extent starts on a boundary of this many bytes, a huge page's.
 const GRAIN: usize = 2 << 20;
@@ -47,6 +44,23 @@ struct Pool {
     /// Slabs allocated, and the ms they took, for the pool's life.
     grown: u64,
     grown_ms: f64,
+}
+
+impl Pool {
+    /// Pins one more slab of `size` bytes and records what it cost: the only
+    /// place the pool allocates.
+    fn grow(&mut self, ctx: &Arc<CudaContext>, size: usize) -> Result<(), GpuError> {
+        let t = Instant::now();
+        let mem = PinnedHostBuffer::<u8>::zeroed(ctx, size)?;
+        self.grown_ms += t.elapsed().as_secs_f64() * 1e3;
+        self.grown += 1;
+        self.held += size;
+        self.slabs.push(Slab {
+            mem,
+            extents: Extents::new(size, GRAIN),
+        });
+        Ok(())
+    }
 }
 
 struct Shared {
@@ -82,23 +96,30 @@ pub struct Staging {
 }
 
 impl Staging {
-    /// An empty pool of at most `limit` pinned bytes on `ctx`'s device. It
-    /// allocates nothing until a state asks.
-    #[must_use]
-    pub fn new(ctx: &Arc<CudaContext>, limit: u64) -> Staging {
-        Staging {
+    /// A pool of `limit` pinned bytes (rounded down to a whole grain) on
+    /// `ctx`'s device, all of it pinned now: the one allocation it ever
+    /// makes, at load. A limit under one grain pins nothing, and every
+    /// [`Staging::lend`] finds no room. Fails with the driver's error when the
+    /// memory cannot be pinned.
+    pub fn pinned(ctx: &Arc<CudaContext>, limit: u64) -> Result<Staging, GpuError> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX) / GRAIN * GRAIN;
+        let mut pool = Pool {
+            slabs: Vec::new(),
+            held: 0,
+            lent: 0,
+            grown: 0,
+            grown_ms: 0.0,
+        };
+        if limit > 0 {
+            pool.grow(ctx, limit)?;
+        }
+        Ok(Staging {
             shared: Arc::new(Shared {
                 ctx: Arc::clone(ctx),
-                limit: usize::try_from(limit).unwrap_or(usize::MAX),
-                pool: Mutex::new(Pool {
-                    slabs: Vec::new(),
-                    held: 0,
-                    lent: 0,
-                    grown: 0,
-                    grown_ms: 0.0,
-                }),
+                limit,
+                pool: Mutex::new(pool),
             }),
-        }
+        })
     }
 
     /// What the pool holds and has cost.
@@ -115,56 +136,29 @@ impl Staging {
     }
 
     /// An extent for `rows` `u16` and `recurrent` `f32` values, zeroed the
-    /// first time its memory was lent. The pool grows by a slab when no slab
-    /// has room; refused by name, nothing allocated, when the extent does not
-    /// fit the limit beside what the slabs hold.
-    pub fn lend(&self, rows: usize, recurrent: usize) -> Result<Staged, GpuError> {
+    /// first time its memory was lent; `None`, nothing changed, when no free
+    /// extent of that size is left (the pool is full of lent extents, or what
+    /// is free is in pieces — [`StagingStats::held`] less `lent` tells which).
+    pub fn lend(&self, rows: usize, recurrent: usize) -> Result<Option<Staged>, GpuError> {
         let layout = Layout::of(rows, recurrent).ok_or_else(|| GpuError::Shape {
             what: WHAT,
             detail: format!("{rows} u16 and {recurrent} f32 values pass usize"),
         })?;
         let mut pool = self.shared.pool();
-        let mut alloc_ms = 0.0;
-        let at = pool
+        let Some((slab, off)) = pool
             .slabs
             .iter_mut()
             .enumerate()
-            .find_map(|(i, s)| s.extents.take(layout.total).map(|off| (i, off)));
-        let (slab, off) = match at {
-            Some(found) => found,
-            None => {
-                let need = layout.total.next_multiple_of(GRAIN);
-                let room = self.shared.limit.saturating_sub(pool.held);
-                if need > room {
-                    return Err(GpuError::Shape {
-                        what: WHAT,
-                        detail: format!(
-                            "a state of {} bytes where the pool of {} bytes holds {} and lends {}",
-                            layout.total, self.shared.limit, pool.held, pool.lent
-                        ),
-                    });
-                }
-                let size = need.max(SLAB.min(room));
-                let t = Instant::now();
-                let mem = PinnedHostBuffer::<u8>::zeroed(&self.shared.ctx, size)?;
-                alloc_ms = t.elapsed().as_secs_f64() * 1e3;
-                let mut extents = Extents::new(size, GRAIN);
-                let off = extents
-                    .take(layout.total)
-                    .expect("a fresh slab holds the extent it was sized for");
-                pool.held += size;
-                pool.grown += 1;
-                pool.grown_ms += alloc_ms;
-                pool.slabs.push(Slab { mem, extents });
-                (pool.slabs.len() - 1, off)
-            }
+            .find_map(|(i, s)| s.extents.take(layout.total).map(|off| (i, off)))
+        else {
+            return Ok(None);
         };
         let len = layout.total;
         pool.lent += len.next_multiple_of(GRAIN);
         // SAFETY: `off` lies inside the slab (an extent it lent), whose memory
         // lives as long as the pool, which `Staged` keeps alive.
         let base = unsafe { pool.slabs[slab].mem.as_mut_ptr().add(off) };
-        Ok(Staged {
+        Ok(Some(Staged {
             shared: Arc::clone(&self.shared),
             slab,
             off,
@@ -173,9 +167,8 @@ impl Staging {
             rows,
             recurrent,
             layout,
-            alloc_ms,
             hold: None,
-        })
+        }))
     }
 }
 
@@ -193,7 +186,6 @@ pub struct Staged {
     rows: usize,
     recurrent: usize,
     layout: Layout,
-    alloc_ms: f64,
     hold: Option<Arc<CudaEvent>>,
 }
 
@@ -218,13 +210,6 @@ impl Staged {
     #[must_use]
     pub fn recurrent_len(&self) -> usize {
         self.recurrent
-    }
-
-    /// The ms the pool spent growing for this extent: 0 when a slab already
-    /// had room for it.
-    #[must_use]
-    pub fn alloc_ms(&self) -> f64 {
-        self.alloc_ms
     }
 
     /// The rows. Read only after the copy that fills them has landed.
@@ -345,28 +330,32 @@ mod tests {
     use crate::tensor::{Pitched, dtoh_2d};
     use cuda_core::DeviceBuffer;
 
-    /// A state's memory is cut from a slab the pool grew once: the first
-    /// extent pays the allocation, the second pays none and shares the slab,
-    /// and the extent a dropped state gives back is lent again at the same
-    /// place without another allocation. The two arrays are the extent's own
-    /// (a write to one is not seen in the other).
+    /// The pool pins its memory once, when it is made, and lends it without
+    /// allocating: two extents share the slab, and the extent a dropped state
+    /// gives back is lent again at the same place. The two arrays are the
+    /// extent's own (a write to one is not seen in the other).
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_the_pool_grows_once_and_lends_the_memory_a_dropped_state_gave_back() {
+    fn hw_the_pool_pins_once_at_load_and_lends_without_allocating() {
         let ctx = crate::capsync::fresh_context(0).expect("CUDA device 0");
-        let pool = Staging::new(&ctx, 256 << 20);
+        let pool = Staging::pinned(&ctx, 256 << 20).expect("a pinned pool");
+        let at_load = pool.stats();
         assert_eq!(
-            pool.stats().grown,
-            0,
-            "nothing is allocated until a state asks"
+            (at_load.grown, at_load.held, at_load.lent),
+            (1, 256 << 20, 0),
+            "the whole limit is pinned at load"
         );
-        let mut a = pool.lend(1 << 20, 4096).expect("a first extent");
-        assert!(a.alloc_ms() > 0.0, "the first extent grew the pool");
+        assert!(at_load.grown_ms > 0.0, "pinning has a cost");
+        let mut a = pool
+            .lend(1 << 20, 4096)
+            .expect("a lend")
+            .expect("a first extent");
         assert!(a.rows().iter().all(|&v| v == 0) && a.recurrent().iter().all(|&v| v == 0.0));
         a.recurrent_mut(0..4096).fill(1.5);
-        let b = pool.lend(1 << 20, 4096).expect("a second extent");
-        assert_eq!(b.alloc_ms(), 0.0, "the slab had room");
-        assert_eq!(pool.stats().grown, 1, "one slab for both");
+        let b = pool
+            .lend(1 << 20, 4096)
+            .expect("a lend")
+            .expect("a second extent");
         assert!(
             b.rows().iter().all(|&v| v == 0),
             "the second extent is not the first's rows"
@@ -379,40 +368,72 @@ mod tests {
         let lent = pool.stats().lent;
         drop(a);
         assert!(pool.stats().lent < lent, "the dropped extent went back");
-        let c = pool.lend(1 << 20, 4096).expect("a third extent");
+        let _c = pool
+            .lend(1 << 20, 4096)
+            .expect("a lend")
+            .expect("a third extent");
+        let after = pool.stats();
         assert_eq!(
-            (c.alloc_ms(), pool.stats().grown),
-            (0.0, 1),
-            "the given-back memory was lent"
+            (after.grown, after.grown_ms),
+            (at_load.grown, at_load.grown_ms),
+            "lending pinned nothing"
         );
     }
 
-    /// A state that does not fit the limit beside what the slabs hold is
-    /// refused by name, nothing allocated; the same request goes through once a
-    /// lent extent is given back.
+    /// A state that fits no free extent gets `None`, nothing allocated or
+    /// lent; the same request goes through once a lent extent is given back.
+    /// Free space in pieces is no room either: `held - lent` reads as enough
+    /// while the lend finds none.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_a_state_past_the_limit_is_refused_by_name_until_an_extent_comes_back() {
+    fn hw_a_state_that_fits_no_free_extent_gets_none_until_one_comes_back() {
         let ctx = crate::capsync::fresh_context(0).expect("CUDA device 0");
-        let pool = Staging::new(&ctx, 4 << 20);
-        // Two extents of 2 MiB fill a pool of 4 MiB.
-        let a = pool.lend(1 << 20, 0).expect("a first extent");
-        let _b = pool.lend(1 << 20, 0).expect("a second extent");
-        let before = pool.stats();
-        let err = pool
+        let pool = Staging::pinned(&ctx, 6 << 20).expect("a pinned pool");
+        // Three extents of 2 MiB fill a pool of 6 MiB.
+        let a = pool
             .lend(1 << 20, 0)
-            .err()
-            .expect("a third extent past the pool");
-        let msg = err.to_string();
-        assert!(msg.contains("staging") && msg.contains("pool of"), "{msg}");
-        assert_eq!(
-            pool.stats(),
-            before,
-            "a refusal allocated nothing and lent nothing"
+            .expect("a lend")
+            .expect("a first extent");
+        let b = pool
+            .lend(1 << 20, 0)
+            .expect("a lend")
+            .expect("a second extent");
+        let c = pool
+            .lend(1 << 20, 0)
+            .expect("a lend")
+            .expect("a third extent");
+        let before = pool.stats();
+        assert!(
+            pool.lend(1 << 20, 0).expect("a lend").is_none(),
+            "a fourth extent past the pool"
         );
+        assert_eq!(pool.stats(), before, "a refusal lent nothing");
+        drop(b);
+        let middle = pool
+            .lend(1 << 20, 0)
+            .expect("a lend")
+            .expect("b's extent again");
+        // The ends given back leave 4 MiB free in two pieces of 2 MiB.
         drop(a);
-        let c = pool.lend(1 << 20, 0).expect("the given-back extent");
-        assert_eq!((c.alloc_ms(), pool.stats().grown), (0.0, 1));
+        drop(c);
+        let held = pool.stats();
+        assert_eq!(held.held - held.lent, 4 << 20);
+        assert!(
+            pool.lend(2 << 20, 0).expect("a lend").is_none(),
+            "4 MiB free, no 4 MiB extent"
+        );
+        assert_eq!(pool.stats(), held, "a refusal lent nothing");
+        drop(middle);
+    }
+
+    /// A limit under one grain pins nothing and lends nothing.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_pool_under_one_grain_is_empty() {
+        let ctx = crate::capsync::fresh_context(0).expect("CUDA device 0");
+        let pool = Staging::pinned(&ctx, (GRAIN - 1) as u64).expect("an empty pool");
+        assert_eq!(pool.stats(), StagingStats::default());
+        assert!(pool.lend(1, 0).expect("a lend").is_none());
     }
 
     /// Dropping an extent whose copy still runs waits for the copy: the
@@ -425,8 +446,8 @@ mod tests {
         const BYTES: usize = 256 << 20;
         let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let dev = DeviceBuffer::<u8>::zeroed(&stream, BYTES).expect("the device store");
-        let pool = Staging::new(&ctx, 2 * BYTES as u64);
-        let mut staged = pool.lend(BYTES / 2, 0).expect("an extent");
+        let pool = Staging::pinned(&ctx, 2 * BYTES as u64).expect("a pinned pool");
+        let mut staged = pool.lend(BYTES / 2, 0).expect("a lend").expect("an extent");
         let shape = Pitched {
             width: BYTES,
             rows: 1,
