@@ -7,7 +7,7 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
 
 | File | What it serves |
 |---|---|
-| `bin/bloomery-serve` | every seat in one binary (the model file's architecture picks it; `--help` lists them): llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming) for DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, and Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) as its decide seat |
+| `bin/bloomery-serve` | every seat in one binary (the model file's architecture picks it; `--help` lists them): llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming) for DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, and Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) as its decide seat |
 
 ## Requirements
 

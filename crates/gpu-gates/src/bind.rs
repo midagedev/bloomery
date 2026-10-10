@@ -41,6 +41,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -48,16 +49,17 @@ use std::thread::JoinHandle;
 
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
-use model::placement::{Device, ModelTensors, Plan, Role};
+use model::placement::{Device, Machine, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
-    PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused, SamplingParams, Saved,
-    SavedState, StateError, Tokenizer,
+    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER,
+    ModelProps, PlacementProps, ResidencyReset, SamplerFactory, SamplerRefused, SamplingParams,
+    Saved, SavedState, ServeError, Server, ServerConfig, SlotConfig, StateError, Tokenizer,
 };
 
 use crate::GateError;
+use crate::record::Record;
 
 /// The file's vocabulary as the server reads it.
 pub struct Vocab {
@@ -223,6 +225,151 @@ pub fn sampler_factory() -> SamplerFactory {
             }))
         },
     )
+}
+
+/// The chat surface a seat's file gives the server: the Jinja template and
+/// the model's name.
+pub struct ChatSurface {
+    /// `--chat-template-file`'s text where the seat takes the flag, else the
+    /// file's `tokenizer.chat_template`.
+    pub template: String,
+    /// The file's `general.name`, else the seat's default alias.
+    pub name: String,
+}
+
+impl ChatSurface {
+    /// The surface of the file at `path` from its header's `tokenizer.chat_template`
+    /// and `general.name` (`template` and `name`): `template_file`'s text
+    /// replaces the header's template, and a file with neither is refused by
+    /// name; `name` falls to `default_alias` when the file states none.
+    pub fn read(
+        path: &Path,
+        template: Option<&gguf::Value>,
+        name: Option<&gguf::Value>,
+        template_file: Option<&Path>,
+        default_alias: &str,
+    ) -> Result<ChatSurface, GateError> {
+        let template = match template_file {
+            Some(file) => std::fs::read_to_string(file)
+                .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))?,
+            None => template
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
+                .to_owned(),
+        };
+        let name = name
+            .and_then(|v| v.as_str())
+            .unwrap_or(default_alias)
+            .to_owned();
+        Ok(ChatSurface { template, name })
+    }
+}
+
+/// What a seat's server binds with, past its engine.
+pub struct Listen<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    /// `model` in responses and the `/v1/models` id.
+    pub alias: String,
+    /// The model file, `/props`' `model_path`.
+    pub path: &'a Path,
+    pub template: String,
+    /// `--slot-save-path`; `None` refuses every slot action.
+    pub slot_save_path: Option<PathBuf>,
+    pub api_keys: serve::flag::ApiKeys,
+    /// The slots the engine made at its open, which the server steps together.
+    pub parallel: usize,
+    pub queue_depth: Option<usize>,
+}
+
+/// The server over a seat's `engine`: the sampler crate's chain, the fatal
+/// linger every seat keeps, the seat's own slots as the server's. The seat
+/// prints its own `listening` record from the bound server and runs it.
+pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeError> {
+    let config = ServerConfig {
+        model_alias: l.alias,
+        model_path: l.path.display().to_string(),
+        chat_template: l.template,
+        sampler: Some(sampler_factory()),
+        fatal_linger: FATAL_LINGER,
+        slot_save_path: l.slot_save_path,
+        api_keys: l.api_keys,
+    };
+    let slots = SlotConfig {
+        parallel: l.parallel,
+        queue_depth: l.queue_depth,
+        ..SlotConfig::default()
+    };
+    Server::bind_with((l.host, l.port), Box::new(engine), config, slots)
+}
+
+/// The slots a seat serves and what set the count (`from`, as
+/// `model::placement::ctx::slots_of` words it); a set `--ctx` with no
+/// `--parallel` prints the one line that says the flag is one request's
+/// context.
+pub fn slots_given(
+    parallel: Option<usize>,
+    ctx: Option<usize>,
+    default: usize,
+) -> Result<(usize, &'static str), GateError> {
+    let (slots, from) = model::placement::ctx::slots_of(parallel, ctx.is_some(), default)?;
+    if from == "ctx" {
+        eprintln!(
+            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
+             once (they split it)",
+            ctx.unwrap_or_default()
+        );
+    }
+    Ok((slots, from))
+}
+
+/// The `parallel` line a seat prints before its load: the slots, a slot's
+/// context, the total, what set the count (`from`), and the shape of a round
+/// (`pass`) where the seat has one.
+pub fn parallel_line(slots: usize, slot_ctx: usize, from: &str, pass: Option<&str>) {
+    let pass = pass.map_or_else(String::new, |p| format!(" pass={p}"));
+    eprintln!(
+        "parallel rule=slots slots={slots} slot_ctx={slot_ctx} total={} from={from}{pass}",
+        slots * slot_ctx
+    );
+}
+
+/// `/props`' placement of `plan` on `machine`: its cards by nvidia-smi
+/// index. A placement that cannot be named prints one line under `name` and
+/// is left out.
+pub fn placement_of(name: &str, machine: &Machine, plan: &Plan<'_>) -> Option<PlacementProps> {
+    let placement = machine
+        .all_cards()
+        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
+        .collect::<Result<Vec<String>, String>>()
+        .and_then(|g| placement_props(plan, &g));
+    if let Err(e) = &placement {
+        eprintln!("{name}: /props leaves the placement out: {e}");
+    }
+    placement.ok()
+}
+
+/// A seat's [`Seat::note`]: a prefix kept less of than shared is a `cache
+/// reuse` record; every other note prints as `name`'s line.
+pub fn note_line(name: &str, note: &CacheNote) {
+    if let CacheNote::Reuse {
+        common,
+        ask,
+        kept,
+        held,
+        reason,
+    } = note
+    {
+        Record::new(&crate::record::CACHE_REUSE)
+            .u("common", common)
+            .u("ask", ask)
+            .u("kept", kept)
+            .u("held", held)
+            .w("reason", reason.as_deref().unwrap_or("unstated"))
+            .eprint();
+        return;
+    }
+    eprintln!("{name}: {note}");
 }
 
 /// The class toktape files a placement role's bytes under: the buckets of its

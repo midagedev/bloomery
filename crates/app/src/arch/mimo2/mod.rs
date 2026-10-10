@@ -3,9 +3,9 @@
 //! gpumodel's constructor ([`Body::open_placed`]).
 //!
 //! A prompt is fed one decode step an id ([`GpuModel::step`]): the program has
-//! no pass of several rows. The caches are per position, but the body takes no
-//! checkpoint and no rollback, so a cut keeps every held position or the
-//! empty model.
+//! no pass of several rows. The caches are per position, and the body takes no
+//! checkpoint, so a cut keeps every held position (its rollback takes
+//! positions back without device work).
 
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_mimo2::Body;
@@ -14,7 +14,7 @@ use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
 use model::placement::{Machine, Plan, PlanLevers};
 
-use crate::{Keep, Open, Prompt};
+use crate::{Keep, Open, Prompt, cut_positions, keep_positions};
 
 const WHAT: &str = "mimo2 session";
 
@@ -89,25 +89,15 @@ impl Prompt for Body {
 }
 
 impl Keep for Body {
-    /// Every held position, or the empty model: the body holds no
-    /// checkpoint and takes no rollback.
+    /// Every held position: the caches are per-position and the body holds
+    /// no checkpoint.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        if n >= m.pos() { m.pos() } else { 0 }
+        keep_positions(m, n)
     }
 
-    /// Nothing to take back at the model's position; back to empty at 0 — a
-    /// reset; any other position refused by name.
+    /// Back to empty at 0 — a reset; else the model's rollback, which the
+    /// caches take as given.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
-        match n {
-            n if n == m.pos() => Ok(()),
-            0 => m.reset(),
-            n => Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "a cut to {n} of {} positions; the body keeps every position or none",
-                    m.pos()
-                ),
-            }),
-        }
+        cut_positions(m, n)
     }
 }

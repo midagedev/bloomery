@@ -50,8 +50,8 @@
 //! the placed plan on that card, its `plan` record naming why
 //! (`whole_does_not_fit`). Each `--ctx` search prints one line more: its
 //! probes and the census readings it took. The seat takes the common rule
-//! every serving seat takes (`generate::Place::choose`, by `q3place::Q3_RULE`:
-//! the body serves no tier card): a `place unset` record names the word `a`
+//! every serving seat takes (`generate::Place::choose_untiered`: the body
+//! serves no tier card): a `place unset` record names the word `a`
 //! and why — `one card`, or on two `the body serves no tier card` — before
 //! the first search.
 //!
@@ -139,7 +139,10 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
-use bloomery_gpu_gates::bind::{Seat, SeatEngine, SlotStep, Vocab, sampler_factory};
+use bloomery_gpu_gates::bind::{
+    ChatSurface, Listen, Seat, SeatEngine, SlotStep, Vocab, bind_server, note_line, parallel_line,
+    slots_given,
+};
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -149,9 +152,7 @@ use model::arch::Arch;
 use model::placement::PlanLevers;
 use model::placement::workstation::CardSpec;
 use runtime::Target as _;
-use serve::{
-    CacheNote, EngineProps, FATAL_LINGER, Saved, ServeError, Server, ServerConfig, SlotConfig,
-};
+use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
 const NAME: &str = "bloomery-serve-qwen3";
@@ -405,7 +406,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 /// One of the two bodies the seat serves, opened as `generate_qwen3moe`
 /// opens it, its prompt schedule and its keep rule. Both hold resident
 /// sequences ([`Slots`]): the session adds and selects them alike.
-trait Body3: Slots<Seq: 'static> + Sized + 'static {
+trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     /// The file's `general.architecture`, as the `load` record names it.
     const ARCH: &'static str;
     /// Whether the body runs several slots' rows as one pass on a
@@ -432,13 +433,6 @@ trait Body3: Slots<Seq: 'static> + Sized + 'static {
     /// `ids` from where the model stands by the body's schedule; the argmax
     /// after the last.
     fn prompt(m: &mut GpuModel<Self>, ids: &[u32]) -> Result<u32, GateError>;
-    /// The body's rule as the server's keep query meets it: the longest
-    /// prefix of at most `n` of the session's held positions a rollback
-    /// keeps, and the rule's sentence when it keeps less.
-    fn keep(s: &app::Session<Self>, n: usize) -> (usize, Option<String>);
-    /// Take back the session's positions from `pos` on, one the rule
-    /// granted; anything else is refused by name.
-    fn rollback(s: &mut app::Session<Self>, pos: u32) -> Result<(), GateError>;
     /// Where to cut a prompt call of `first .. end` at `marks` so every run
     /// the cut makes still holds what the body's prompt schedule treats as
     /// one whole call; empty where the body cuts nowhere.
@@ -508,19 +502,6 @@ impl Body3 for Body {
     /// at every length.
     fn prompt(m: &mut Qwen3moeModel, ids: &[u32]) -> Result<u32, GateError> {
         Ok(<Body as app::Prompt>::prompt(m, ids)?)
-    }
-
-    /// Every held position (`app::Keep for Body`), the session's answer.
-    fn keep(s: &app::Session<Body>, n: usize) -> (usize, Option<String>) {
-        let pos = s.pos() as usize;
-        let k = s.kept(u32::try_from(n).unwrap_or(u32::MAX));
-        let at = k.at as usize;
-        (at, (at < n.min(pos)).then(|| k.to_string()))
-    }
-
-    /// The session's cut, which takes only a position the rule granted.
-    fn rollback(s: &mut app::Session<Body>, pos: u32) -> Result<(), GateError> {
-        Ok(s.cut(pos)?)
     }
 
     /// Nowhere: the caches are per-position, so every position the body
@@ -597,21 +578,6 @@ impl Body3 for Body35 {
     /// ubatch walk from [`GEMM_FROM`] rows on, passes below.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GateError> {
         Ok(<Body35 as app::Prompt>::prompt(m, ids)?)
-    }
-
-    /// The checkpoints' rule (`app::Keep for Body35`), the session's answer:
-    /// every held position, the nearest checkpoint at or below, or nothing
-    /// with the rule's sentence.
-    fn keep(s: &app::Session<Body35>, n: usize) -> (usize, Option<String>) {
-        let pos = s.pos() as usize;
-        let k = s.kept(u32::try_from(n).unwrap_or(u32::MAX));
-        let at = k.at as usize;
-        (at, (at < n.min(pos)).then(|| k.to_string()))
-    }
-
-    /// The session's cut, which takes only a position the rule granted.
-    fn rollback(s: &mut app::Session<Body35>, pos: u32) -> Result<(), GateError> {
-        Ok(s.cut(pos)?)
     }
 
     /// The marks inside the call where both runs hold at least
@@ -714,7 +680,7 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        B::prompt(self.s.model_mut(), ids)
+        <B as Body3>::prompt(self.s.model_mut(), ids)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
@@ -767,14 +733,17 @@ impl<B: Body3> Seat for Q3<B> {
         Ok(self.s.model_mut().reset()?)
     }
 
-    /// One [`Body3::keep`] granted ([`Seat::keep`]); a cut the rule does
-    /// not grant is refused by the session, by name.
+    /// The session's cut (`app::Keep`), which takes only a position
+    /// [`Seat::keep`] granted; any other is refused by name.
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
-        B::rollback(&mut self.s, pos)
+        Ok(self.s.cut(pos)?)
     }
 
+    /// The body's rule: every held position, or for a body with checkpoints
+    /// the nearest at or below `n`, with the rule's sentence when it keeps
+    /// less.
     fn keep(&self, n: usize) -> (usize, Option<String>) {
-        B::keep(&self.s, n)
+        self.s.keep_query(n)
     }
 
     fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
@@ -793,24 +762,7 @@ impl<B: Body3> Seat for Q3<B> {
     /// A prefix kept less of than shared is a `cache reuse` record; every
     /// other note prints as its line.
     fn note(note: &CacheNote) {
-        if let CacheNote::Reuse {
-            common,
-            ask,
-            kept,
-            held,
-            reason,
-        } = note
-        {
-            Record::new(&record::CACHE_REUSE)
-                .u("common", common)
-                .u("ask", ask)
-                .u("kept", kept)
-                .u("held", held)
-                .w("reason", reason.as_deref().unwrap_or("unstated"))
-                .eprint();
-            return;
-        }
-        eprintln!("{NAME}: {note}");
+        note_line(NAME, note);
     }
 }
 
@@ -937,27 +889,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .shard(0)
         .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
     let arch = Arch::detect(first).map_err(|e| format!("{}: {e}", path.display()))?;
-    let template = split
-        .value("tokenizer.chat_template")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
-        .to_owned();
-    let alias = split
-        .value("general.name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("qwen3")
-        .to_owned();
+    let ChatSurface {
+        template,
+        name: alias,
+    } = ChatSurface::read(
+        &path,
+        split.value("tokenizer.chat_template"),
+        split.value("general.name"),
+        None,
+        "qwen3",
+    )?;
     // The slot count before the context it sizes: a set `--ctx` with no
     // `--parallel` is one request's context — one slot at the whole of it
     // (`placement::ctx::slots_of`).
-    let (slots, from) = model::placement::ctx::slots_of(a.parallel, a.ctx.is_some(), 2)?;
-    if from == "ctx" {
-        eprintln!(
-            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
-             once (they split it)",
-            a.ctx.unwrap_or_default()
-        );
-    }
+    let (slots, from) = slots_given(a.parallel, a.ctx, 2)?;
     // The common unset rule, once, on one census reading: the load below
     // still takes `a`'s card (`PlaceQ3::unplaced_on`), the rule's own pick
     // for a body with no tier card; its `place unset` record is printed here.
@@ -986,10 +931,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     // The slots the seat serves, one line before the load (`from` names what
     // set the count).
-    eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={slot_ctx} total={} from={from}",
-        slots * slot_ctx
-    );
+    parallel_line(slots, slot_ctx, from, None);
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let open = path.clone();
@@ -1016,27 +958,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
     };
-    let config = ServerConfig {
-        model_alias: alias,
-        model_path: path.display().to_string(),
-        chat_template: template,
-        sampler: Some(sampler_factory()),
-        fatal_linger: FATAL_LINGER,
-        slot_save_path: None,
-        api_keys: a.api_keys,
-    };
     // The seat's own slots are the engine's: the seat made them at its open,
     // and the server steps them together.
-    let config_slots = SlotConfig {
-        parallel: slots,
-        queue_depth: a.queue_depth,
-        ..SlotConfig::default()
-    };
-    let server = Server::bind_with(
-        (a.host.as_str(), a.port),
-        Box::new(engine),
-        config,
-        config_slots,
+    let server = bind_server(
+        engine,
+        Listen {
+            host: &a.host,
+            port: a.port,
+            alias,
+            path: &path,
+            template,
+            slot_save_path: None,
+            api_keys: a.api_keys,
+            parallel: slots,
+            queue_depth: a.queue_depth,
+        },
     )?;
     Record::new(&record::LISTENING_QWEN3)
         .w("arch", arch.name())
