@@ -7,7 +7,7 @@
 //! and a save never allocates: a state's extent is cut from the slab, and the
 //! extent of a state the cache evicted is the next one's. The pool is the
 //! prompt cache's budget and no more. A state that finds no free extent gets
-//! `None` ([`Staging::lend`]), nothing allocated: the caller makes room
+//! [`NoRoom`] ([`Staging::lend`]), nothing allocated: the caller makes room
 //! (evicts a landed state) or takes the state on the request path. What the
 //! pinning cost is recorded ([`StagingStats`]), apart from the copy.
 //!
@@ -136,10 +136,10 @@ impl Staging {
     }
 
     /// An extent for `rows` `u16` and `recurrent` `f32` values, zeroed the
-    /// first time its memory was lent; `None`, nothing changed, when no free
-    /// extent of that size is left (the pool is full of lent extents, or what
-    /// is free is in pieces — [`StagingStats::held`] less `lent` tells which).
-    pub fn lend(&self, rows: usize, recurrent: usize) -> Result<Option<Staged>, GpuError> {
+    /// first time its memory was lent; [`NoRoom`], nothing changed, when no
+    /// free extent of that size is left (the pool is full of lent extents, or
+    /// what is free is in pieces — [`NoRoom::fragmented`] tells which).
+    pub fn lend(&self, rows: usize, recurrent: usize) -> Result<Result<Staged, NoRoom>, GpuError> {
         let layout = Layout::of(rows, recurrent).ok_or_else(|| GpuError::Shape {
             what: WHAT,
             detail: format!("{rows} u16 and {recurrent} f32 values pass usize"),
@@ -151,14 +151,18 @@ impl Staging {
             .enumerate()
             .find_map(|(i, s)| s.extents.take(layout.total).map(|off| (i, off)))
         else {
-            return Ok(None);
+            return Ok(Err(NoRoom {
+                need: layout.total.next_multiple_of(GRAIN) as u64,
+                held: pool.held as u64,
+                lent: pool.lent as u64,
+            }));
         };
         let len = layout.total;
         pool.lent += len.next_multiple_of(GRAIN);
         // SAFETY: `off` lies inside the slab (an extent it lent), whose memory
         // lives as long as the pool, which `Staged` keeps alive.
         let base = unsafe { pool.slabs[slab].mem.as_mut_ptr().add(off) };
-        Ok(Some(Staged {
+        Ok(Ok(Staged {
             shared: Arc::clone(&self.shared),
             slab,
             off,
@@ -169,6 +173,25 @@ impl Staging {
             layout,
             hold: None,
         }))
+    }
+}
+
+/// A lend that found no free extent ([`Staging::lend`]): the pool pins `held`
+/// bytes, has `lent` of them out, and could not cut an extent of `need`
+/// (grain-rounded) bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoRoom {
+    pub need: u64,
+    pub held: u64,
+    pub lent: u64,
+}
+
+impl NoRoom {
+    /// Whether the free bytes (`held - lent`) would hold the extent if they
+    /// were in one piece: the pool is fragmented, not full.
+    #[must_use]
+    pub fn fragmented(&self) -> bool {
+        self.held.saturating_sub(self.lent) >= self.need
     }
 }
 
@@ -195,8 +218,9 @@ pub struct Staged {
 // integers and floats.
 unsafe impl Send for Staged {}
 // SAFETY: a shared reference reads the extent through `&self` methods, which
-// the copy in flight never overlaps once its event has been waited for
-// ([`Staged::settle`]); writes need `&mut self`.
+// the copy in flight never overlaps once the save has landed
+// ([`super::saved::Pending::land`], which every reader of a state waits for
+// first); writes need `&mut self`.
 unsafe impl Sync for Staged {}
 
 impl Staged {
@@ -217,7 +241,7 @@ impl Staged {
     pub fn rows(&self) -> &[u16] {
         // SAFETY: `rows` `u16` from the extent's start, inside it (the
         // layout's total counts them) and 2-aligned (the slab's pages and
-        // the grain are); no write is in flight past `settle`.
+        // the grain are); no write is in flight once the save has landed.
         unsafe { slice::from_raw_parts(self.base.cast::<u16>(), self.rows) }
     }
 
@@ -225,8 +249,8 @@ impl Staged {
     #[must_use]
     pub fn recurrent(&self) -> &[f32] {
         // SAFETY: `recurrent` `f32` from the layout's cache-line boundary,
-        // inside the extent and 4-aligned; no write is in flight past
-        // `settle`.
+        // inside the extent and 4-aligned; no write is in flight once the
+        // save has landed.
         unsafe {
             slice::from_raw_parts(
                 self.base.add(self.layout.recurrent_at).cast::<f32>(),
@@ -295,18 +319,6 @@ impl Staged {
             Some(e) => Ok(!e.query()?),
             None => Ok(false),
         }
-    }
-
-    /// Waits for the copy that fills the extent, then lets its bytes be
-    /// read.
-    pub fn settle(&mut self) -> Result<(), GpuError> {
-        if let Some(e) = self.hold.take()
-            && let Err(err) = e.synchronize()
-        {
-            self.hold = Some(e);
-            return Err(err.into());
-        }
-        Ok(())
     }
 }
 
@@ -380,13 +392,13 @@ mod tests {
         );
     }
 
-    /// A state that fits no free extent gets `None`, nothing allocated or
+    /// A state that fits no free extent gets [`NoRoom`], nothing allocated or
     /// lent; the same request goes through once a lent extent is given back.
     /// Free space in pieces is no room either: `held - lent` reads as enough
-    /// while the lend finds none.
+    /// while the lend finds none, and the refusal says so ([`NoRoom::fragmented`]).
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_a_state_that_fits_no_free_extent_gets_none_until_one_comes_back() {
+    fn hw_a_state_that_fits_no_free_extent_gets_no_room_until_one_comes_back() {
         let ctx = crate::capsync::fresh_context(0).expect("CUDA device 0");
         let pool = Staging::pinned(&ctx, 6 << 20).expect("a pinned pool");
         // Three extents of 2 MiB fill a pool of 6 MiB.
@@ -403,8 +415,13 @@ mod tests {
             .expect("a lend")
             .expect("a third extent");
         let before = pool.stats();
-        assert!(
-            pool.lend(1 << 20, 0).expect("a lend").is_none(),
+        assert_eq!(
+            pool.lend(1 << 20, 0).expect("a lend").err(),
+            Some(NoRoom {
+                need: 2 << 20,
+                held: 6 << 20,
+                lent: 6 << 20
+            }),
             "a fourth extent past the pool"
         );
         assert_eq!(pool.stats(), before, "a refusal lent nothing");
@@ -418,9 +435,27 @@ mod tests {
         drop(c);
         let held = pool.stats();
         assert_eq!(held.held - held.lent, 4 << 20);
-        assert!(
-            pool.lend(2 << 20, 0).expect("a lend").is_none(),
+        let short = pool.lend(2 << 20, 0).expect("a lend").err();
+        assert_eq!(
+            short,
+            Some(NoRoom {
+                need: 4 << 20,
+                held: 6 << 20,
+                lent: 2 << 20
+            }),
             "4 MiB free, no 4 MiB extent"
+        );
+        assert!(
+            short.is_some_and(|n| n.fragmented()),
+            "free in pieces, not full"
+        );
+        assert!(
+            !NoRoom {
+                need: 2 << 20,
+                held: 6 << 20,
+                lent: 6 << 20
+            }
+            .fragmented()
         );
         assert_eq!(pool.stats(), held, "a refusal lent nothing");
         drop(middle);
@@ -433,7 +468,7 @@ mod tests {
         let ctx = crate::capsync::fresh_context(0).expect("CUDA device 0");
         let pool = Staging::pinned(&ctx, (GRAIN - 1) as u64).expect("an empty pool");
         assert_eq!(pool.stats(), StagingStats::default());
-        assert!(pool.lend(1, 0).expect("a lend").is_none());
+        assert!(pool.lend(1, 0).expect("a lend").is_err());
     }
 
     /// Dropping an extent whose copy still runs waits for the copy: the

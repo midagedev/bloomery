@@ -672,7 +672,7 @@ impl Slot {
                 }
             }
         };
-        self.keep(self.cur, state, copied, t);
+        self.keep(self.cur, state, copied, None, t);
         Ok(())
     }
 
@@ -683,13 +683,22 @@ impl Slot {
     /// not a parked state handed over as it is.
     pub(crate) fn offer(&mut self, slot: usize, state: Arc<dyn Saved>, copied: bool) {
         if self.cache.enabled() && !self.cache.covers(self.held_of(slot)) {
-            self.keep(slot, state, copied, Instant::now());
+            self.keep(slot, state, copied, None, Instant::now());
         }
     }
 
-    /// `state` of what `slot` holds into the prompt cache, timed from `t`.
-    /// A state of other than those positions is noted and not kept.
-    fn keep(&mut self, slot: usize, state: Arc<dyn Saved>, copied: bool, t: Instant) {
+    /// `state` of what `slot` holds into the prompt cache, timed from `t`;
+    /// `fallback` names the pool that had no room for it off the request path
+    /// ([`CacheNote::Save`]). A state of other than those positions is noted
+    /// and not kept.
+    fn keep(
+        &mut self,
+        slot: usize,
+        state: Arc<dyn Saved>,
+        copied: bool,
+        fallback: Option<&'static str>,
+        t: Instant,
+    ) {
         let held = self.held_of(slot).clone();
         let positions = held.ids.len();
         if state.n_tokens() != positions {
@@ -702,7 +711,13 @@ impl Slot {
             });
             return;
         }
-        for note in self.cache.insert(held, state, ms_since(t), copied) {
+        let notes = match fallback {
+            Some(fallback) => self
+                .cache
+                .insert_fallback(held, state, ms_since(t), fallback),
+            None => self.cache.insert(held, state, ms_since(t), copied),
+        };
+        for note in notes {
             self.engine.note(&note);
         }
     }
@@ -712,9 +727,13 @@ impl Slot {
     /// asked for the state now ([`Engine::snapshot_begin`]), which goes into
     /// the cache as a copy still running, so the next request that cuts the
     /// slot finds it saved instead of taking a snapshot on its own path. The
-    /// cost here is the call that begins the copy. Nothing happens for an
-    /// engine that copies on the request path, a cache that is off, a slot
-    /// that holds nothing or a state a cached one already keeps all of.
+    /// cost here is the call that begins the copy. A pool with no room for it
+    /// ([`StateError::NoRoom`]) gives up the oldest landed state (never one
+    /// whose copy still runs) and is asked once more; only then is the state
+    /// snapshotted on this path, `fallback` in the `Save` naming the pool
+    /// `full` or `fragmented`. Nothing happens for an engine that copies on
+    /// the request path, a cache that is off, a slot that holds nothing or a
+    /// state a cached one already keeps all of.
     pub(crate) fn seal(&mut self, slot: usize) -> Result<(), EngineError> {
         if !self.cache.enabled() || !self.engine.snapshots_async() {
             return Ok(());
@@ -726,8 +745,50 @@ impl Slot {
         }
         self.settle(slot)?;
         let t = Instant::now();
-        match self.engine.snapshot_begin() {
+        let mut begun = self.engine.snapshot_begin();
+        if let Err(StateError::NoRoom { need, held, .. }) = &begun {
+            // A state that passes the whole pool has no room to make.
+            if need <= held && self.evict_for_room() {
+                begun = self.engine.snapshot_begin();
+            }
+        }
+        match begun {
             Ok(p) => self.keep_pending(slot, p, ms_since(t)),
+            Err(StateError::Engine(e)) => Err(e),
+            Err(e) => self.keep_on_path(slot, &e),
+        }
+    }
+
+    /// The oldest landed state leaves the cache for the engine's staging
+    /// room, noted. False when every cached state's copy still runs, or the
+    /// cache holds none.
+    fn evict_for_room(&mut self) -> bool {
+        match self.cache.evict_oldest_landed() {
+            Some(note) => {
+                self.engine.note(&note);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `slot`'s state taken on this path, the engine having begun no copy of
+    /// it for `why`: [`StateError::NoRoom`] keeps it with the pool's state
+    /// named, any other refusal is noted and keeps nothing.
+    fn keep_on_path(&mut self, slot: usize, why: &StateError) -> Result<(), EngineError> {
+        let Some(fallback) = why.fallback() else {
+            self.engine.note(&CacheNote::Skip {
+                positions: self.held.len(),
+                why: format!("the engine took no snapshot: {why}"),
+            });
+            return Ok(());
+        };
+        let t = Instant::now();
+        match self.engine.snapshot() {
+            Ok(state) => {
+                self.keep(slot, state, true, Some(fallback), t);
+                Ok(())
+            }
             Err(StateError::Engine(e)) => Err(e),
             Err(e) => {
                 self.engine.note(&CacheNote::Skip {
@@ -773,9 +834,13 @@ impl Slot {
     /// free when the state drops.
     fn discard(&mut self, pending: &Pending) -> Result<(), EngineError> {
         match self.engine.snapshot_wait(pending) {
-            Ok(_) | Err(StateError::Format(_) | StateError::Io(_) | StateError::Unsupported(_)) => {
-                Ok(())
-            }
+            Ok(_)
+            | Err(
+                StateError::Format(_)
+                | StateError::Io(_)
+                | StateError::Unsupported(_)
+                | StateError::NoRoom { .. },
+            ) => Ok(()),
             Err(StateError::Engine(e)) => Err(e),
         }
     }
@@ -2704,6 +2769,23 @@ mod cache_tests {
             .with_slots(slots)
             .with_cache_ram(1 << 20)
             .with_async_snapshots(copy);
+        noted_slot(mock, slots, stats)
+    }
+
+    /// [`async_slot`] whose copies take their room from a pool of `cells`
+    /// cells of [`CELL`] bytes, and land at once.
+    fn pooled_slot(cells: usize) -> (Slot, Arc<SaveStats>, Arc<Mutex<Vec<CacheNote>>>) {
+        let (mock, stats) = MockEngine::new(4096)
+            .with_cache_ram(1 << 20)
+            .with_async_snapshots(Duration::ZERO);
+        noted_slot(mock.with_staging(CELL, cells), 1, stats)
+    }
+
+    fn noted_slot(
+        mock: MockEngine,
+        slots: usize,
+        stats: Arc<SaveStats>,
+    ) -> (Slot, Arc<SaveStats>, Arc<Mutex<Vec<CacheNote>>>) {
         let notes = Arc::new(Mutex::new(Vec::new()));
         let engine = Noted {
             inner: mock,
@@ -2860,6 +2942,131 @@ mod cache_tests {
         assert_eq!(stats.hazards.load(SeqCst), 0);
         slot.settle(0).expect("the wait");
         assert!(slot.rows().is_ok(), "once the copy has landed");
+    }
+
+    /// A pooled mock's cell: a state of the short prompts below fills one,
+    /// and [`LONG`]'s two.
+    const CELL: u64 = 512;
+
+    const SHORT: [&str; 3] = [
+        "<｜User｜>the cat sat on the mat and the ",
+        "<｜User｜>xyz uvw xyz uvw xyz ",
+        "<｜User｜>one two three four five six ",
+    ];
+
+    const LONG: &str = "<｜User｜>the quick brown fox jumps over the lazy dog and the quick brown \
+        fox jumps over the lazy dog again and again until the dog gets up and chases the fox over \
+        the hill and ";
+
+    /// The save notes the server printed, in order: `(copied, off_path,
+    /// fallback)`.
+    fn saves(notes: &[CacheNote]) -> Vec<(bool, bool, Option<&'static str>)> {
+        notes
+            .iter()
+            .filter_map(|n| match n {
+                CacheNote::Save {
+                    copied,
+                    off_path,
+                    fallback,
+                    ..
+                } => Some((*copied, *off_path, *fallback)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A pool with no room for a state's copy gives up its oldest landed
+    /// state and is asked once more: the copy is begun, no snapshot is taken
+    /// on the request path, and the save names no fallback.
+    #[test]
+    fn a_full_pool_gives_up_its_oldest_landed_state_and_the_copy_is_begun() {
+        let (mut slot, stats, notes) = pooled_slot(2);
+        for p in SHORT {
+            served(&mut slot, 0, &enc(p));
+        }
+        assert_eq!(
+            stats.no_room.load(SeqCst),
+            1,
+            "the third copy found no room"
+        );
+        assert_eq!(stats.begun.load(SeqCst), 3, "a copy begun at each end");
+        assert_eq!(
+            stats.sync_snapshots.load(SeqCst),
+            0,
+            "the request path took a snapshot"
+        );
+        let n = notes.lock().expect("notes");
+        assert_eq!(saves(&n), [(true, true, None); 3], "{n:?}");
+        let evicted: Vec<_> = n
+            .iter()
+            .filter_map(|n| match n {
+                CacheNote::Evict { why, .. } => Some(*why),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evicted, ["the engine's staging pool had no room"], "{n:?}");
+    }
+
+    /// When the room the oldest state gave back is in pieces, the state is
+    /// snapshotted on the request path and the `Save` names the pool
+    /// `fragmented`: its free cells could hold it, not next to each other.
+    /// (Before the eviction the pool was `full`, one cell free of two needed.)
+    #[test]
+    fn a_pool_still_without_room_after_the_eviction_falls_back_named() {
+        let (mut slot, stats, notes) = pooled_slot(4);
+        for p in SHORT {
+            served(&mut slot, 0, &enc(p));
+        }
+        served(&mut slot, 0, &enc(LONG));
+        assert_eq!(stats.no_room.load(SeqCst), 2, "both asks found no room");
+        assert_eq!(
+            stats.begun.load(SeqCst),
+            3,
+            "the long state's copy was never begun"
+        );
+        assert_eq!(
+            stats.sync_snapshots.load(SeqCst),
+            1,
+            "its snapshot, on the request path"
+        );
+        let n = notes.lock().expect("notes");
+        assert_eq!(
+            saves(&n),
+            [
+                (true, true, None),
+                (true, true, None),
+                (true, true, None),
+                (true, false, Some("fragmented")),
+            ],
+            "{n:?}"
+        );
+        assert_eq!(
+            n.iter()
+                .filter(|n| matches!(n, CacheNote::Evict { .. }))
+                .count(),
+            1,
+            "one state left for the room: {n:?}"
+        );
+    }
+
+    /// A state that passes the whole pool is snapshotted on the request path
+    /// as `full` at once: no state leaves for room that cannot be made.
+    #[test]
+    fn a_state_over_the_whole_pool_evicts_nothing() {
+        let (mut slot, stats, notes) = pooled_slot(1);
+        served(&mut slot, 0, &enc(SHORT[0]));
+        served(&mut slot, 0, &enc(LONG));
+        assert_eq!(stats.sync_snapshots.load(SeqCst), 1);
+        let n = notes.lock().expect("notes");
+        assert_eq!(
+            saves(&n),
+            [(true, true, None), (true, false, Some("full"))],
+            "{n:?}"
+        );
+        assert!(
+            n.iter().all(|n| !matches!(n, CacheNote::Evict { .. })),
+            "a state left for nothing: {n:?}"
+        );
     }
 
     /// A cache hit puts back the prefix the request keeps and nothing past

@@ -165,8 +165,15 @@ gguf 9 2 0
 # pool (six blocks: the lent extent's base pointer and the slices over it; Staged's Send and Sync impls owning the
 # one-holder argument); checkpoint/saved.rs's read_into / put_from (two unsafe fns) and their five call blocks —
 # each with its SAFETY line.
-# PIN(2026-10-11): on main's 1659 181 8: 1659 + 18 = 1677 blocks, 181 + 4 = 185 fns, 8 + 2 = 10 impls.
-gpu 1677 185 10
+# PIN(2026-10-10): gpu +9 blocks, 184 -> 187 fns, new code, not old code relaxed: the saved state's point
+# copy off the request path. checkpoint.rs's Checkpoints::enqueue_points (one unsafe fn; three blocks: the offset into
+# the caller's host array, the cuLaunchHostFunc call that queues the copy, and the Box::from_raw that takes the
+# parts back when the launch failed) and its host function copy_points (one unsafe fn; two blocks: the Box::from_raw
+# of the queued parts and the copy_nonoverlapping of each part), saved.rs's save_async (one block: its call of
+# enqueue_points), and the test-only Hold's wait_open (one unsafe fn; one block: the Arc::from_raw of its flag) with
+# Hold::on's two (the cuLaunchHostFunc call and the Arc::from_raw when the launch failed) — each with its SAFETY line.
+# PIN(2026-10-11): on main's 1659 181 8: 1659 + 18 + 9 = 1686 blocks, 181 + 4 + 3 = 188 fns, 8 + 2 = 10 impls.
+gpu 1686 188 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
