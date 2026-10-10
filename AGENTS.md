@@ -42,10 +42,9 @@ To run or evaluate bloomery rather than develop it, read the README's "Status" s
   `BLOOMERY_CARD=a6000|both tools/box.sh …` runs functional work on the A6000 and refuses (rc 75) while that card has
   a compute process that is not ours (its gate lock and the timing lease both free); one of ours, the run waits for
   the card's lock in `tools/gpu-gate.sh`. The pick reaches the box as `BLOOMERY_BOX_CARD`.
-- **Never start a box job longer than 30 minutes without the user's approval.** Estimate the wall first and batch long
-  jobs so one approval covers one sitting. A round spec that needs one names the estimate; the lead asks the user.
-  Exception: the lead's landing batch of gates through `tools/gate-batch.sh` needs none; it still prints its predicted
-  wall before it starts.
+- **Never start a box job without its predicted wall.** Estimate it first (`gate-times.tsv` medians, the card, the
+  resource table), print it before the job starts, and batch long jobs into one sitting. A box job's length needs no
+  user approval (user, 2026-10-10: fixture-tier trains made the 30-minute approval rule cost more than it saved).
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated comment and a reason, or file an issue. The
   lint levels in the root `Cargo.toml` carry the hit counts they were chosen from.
 - **Never write a number you did not measure.** If it is derived, say so. If it turns out wrong, strike it through and
