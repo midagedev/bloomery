@@ -22,6 +22,10 @@
 //! - [`Tag::FixtureOracle`]: a comparison with a reference engine's output on
 //!   the fixture file (ik's sets dumped on that fixture). It opens its set
 //!   through [`fixture_set`].
+//! - [`Tag::NoCardLayer`]: a clause that reads a routed stack a card launch
+//!   reads, on a fixture variant none of whose routed layers has one
+//!   ([`card_clause`]). The real tier runs it; the fixture tier leaves it to
+//!   the real tier, by name.
 //!
 //! The `real` tier runs every clause except the fixture's oracle comparisons,
 //! tagged or not: nothing changes for a gate that declares no tags. Each of
@@ -80,7 +84,7 @@ pub enum Tier {
     Fixture,
 }
 
-/// What a clause answers (the module doc names the five).
+/// What a clause answers (the module doc names the six).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tag {
     /// Two arms of the engine under one plan agree.
@@ -94,16 +98,21 @@ pub enum Tag {
     /// A comparison with a reference engine's output on the fixture file (ik's
     /// sets dumped on that fixture).
     FixtureOracle,
+    /// A clause that reads a routed stack a card launch reads, on a fixture
+    /// variant none of whose routed layers has one: the clause has no input
+    /// there, and the real file (which has them) answers it.
+    NoCardLayer,
 }
 
 impl Tag {
     /// Every tag, in the order the module doc names them.
-    pub const ALL: [Tag; 5] = [
+    pub const ALL: [Tag; 6] = [
         Tag::SelfConsistency,
         Tag::Oracle,
         Tag::FileBound,
         Tag::Scale,
         Tag::FixtureOracle,
+        Tag::NoCardLayer,
     ];
 
     /// The tag's name as a [`DEFERRED`] line prints it.
@@ -115,6 +124,7 @@ impl Tag {
             Tag::FileBound => "file-bound",
             Tag::Scale => "scale",
             Tag::FixtureOracle => "fixture-oracle",
+            Tag::NoCardLayer => "no-card-layer",
         }
     }
 }
@@ -441,6 +451,49 @@ pub fn premise_once(name: &'static str) -> Result<bool, GateError> {
     Ok(runs)
 }
 
+/// The card experts' clause `name` of a gate whose load holds the routed layers `card_readable`
+/// says (some layer has all three stacks of a type a card launch reads). It is a self-consistency
+/// clause, run in both tiers, except on a fixture variant (`BLOOMERY_FIXTURE_VARIANT`) none of
+/// whose routed layers the card reads: there it declares [`Tag::NoCardLayer`] and the fixture tier
+/// leaves it to the real tier, its [`DEFERRED`] line naming the tag. The premise is the file's
+/// types, never the plan's placement, so a plan that put nothing on the card on a file the card
+/// reads still runs the clause and fails it. `Ok(false)`: the clause was left, skip it.
+///
+/// # Errors
+/// As [`run_clause`], or [`refset::RefError`] for a malformed `BLOOMERY_FIXTURE_VARIANT`.
+pub fn card_clause(name: &str, card_readable: bool) -> Result<bool, GateError> {
+    let variant = refset::fixture::selected()?.is_some();
+    card_clause_in(
+        Tier::from_env()?,
+        variant && !card_readable,
+        name,
+        &TALLY,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`card_clause`] of its inputs: the tier, whether the file is a variant the card reads no
+/// routed layer of, the tally and the sink.
+fn card_clause_in(
+    tier: Tier,
+    no_card_layer: bool,
+    name: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<bool, GateError> {
+    let tag = if no_card_layer && tier == Tier::Fixture {
+        Tag::NoCardLayer
+    } else {
+        Tag::SelfConsistency
+    };
+    let runs = run_clause_in(tier, name, tag, tally, out)?;
+    if runs || tag == Tag::NoCardLayer {
+        Ok(runs)
+    } else {
+        Err(format!("the self-consistency clause {name:?} was deferred").into())
+    }
+}
+
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
 /// here, never skipped.
 ///
@@ -577,7 +630,7 @@ pub fn fixture_set(clause: &str, family: &Family, set: &str) -> Result<PathBuf, 
     Ok(fixture_set_in(&crate::data_dir(), clause, family, set)?)
 }
 
-/// [`fixture_set`] under `data_dir`. The set is resolved as the family's [`Family::path`] does,
+/// [`fixture_set`] under `data_dir`. The set is resolved as the family's [`Family::path_in`] does,
 /// then opened through the family's check ([`Family::check_set`]): the file it was dumped from,
 /// the generation of that file (`# fixture`), the ik build and the completion trailer. A set that
 /// is not there, or that the check refuses, ends the gate; it never defers the clause.
@@ -608,7 +661,7 @@ pub fn fixture_set_in(
             set: set.to_string(),
         });
     }
-    let path = data_dir.join(family.resolve.map_or_else(|| set.to_string(), |f| f(set)));
+    let path = family.path_in(data_dir, set);
     let recipe = family.recipe;
     if !path.exists() {
         return Err(FixtureSetError::Missing {
@@ -873,10 +926,10 @@ pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
 mod tests {
     use super::*;
 
-    /// The five tags are the five kinds of clause the module doc names, once
+    /// The six tags are the six kinds of clause the module doc names, once
     /// each, and every name prints as one word.
     #[test]
-    fn five_tags_in_the_docs_order() {
+    fn six_tags_in_the_docs_order() {
         let names: Vec<&str> = Tag::ALL.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
@@ -885,7 +938,8 @@ mod tests {
                 "oracle",
                 "file-bound",
                 "scale",
-                "fixture-oracle"
+                "fixture-oracle",
+                "no-card-layer"
             ]
         );
         assert!(names.iter().all(|n| !n.contains(' ')));
@@ -928,10 +982,10 @@ mod tests {
         }
     }
 
-    /// A clause's fate in each tier, the five tags and an untagged clause:
+    /// A clause's fate in each tier, the six tags and an untagged clause:
     /// the real tier runs everything but a fixture-oracle clause, which it
     /// leaves to the fixture tier; the fixture tier runs self-consistency and
-    /// fixture-oracle clauses, defers the other three with their tag, and
+    /// fixture-oracle clauses, defers the other four with their tag, and
     /// refuses an untagged one. Mutant: any cell changed.
     #[test]
     fn a_clauses_fate_in_each_tier() {
@@ -945,6 +999,11 @@ mod tests {
             ),
             (Tag::Scale, Decision::Run, Decision::Deferred(Tag::Scale)),
             (Tag::FixtureOracle, Decision::FixtureOnly, Decision::Run),
+            (
+                Tag::NoCardLayer,
+                Decision::Run,
+                Decision::Deferred(Tag::NoCardLayer),
+            ),
         ];
         assert_eq!(table.len(), Tag::ALL.len());
         for (tag, real, fixture) in table {
@@ -1031,6 +1090,30 @@ mod tests {
             call(Tier::Fixture, Tag::SelfConsistency),
             (true, String::new(), (1, 0, 0))
         );
+    }
+
+    /// The card experts' clause runs as a self-consistency clause everywhere but on a fixture variant
+    /// the card reads no routed layer of, where the fixture tier leaves it by its own tag; the real
+    /// tier runs it whatever the flag says. Mutant: the flag ignored, or the tag borrowed from
+    /// another kind (the line names it).
+    #[test]
+    fn the_card_clause_is_left_only_on_a_variant_with_no_card_layer() {
+        let call = |tier: Tier, no_card_layer: bool| {
+            let (tally, mut out) = (Tally::new(), Vec::new());
+            let runs = card_clause_in(tier, no_card_layer, "(card) slots", &tally, &mut out)
+                .expect("a card clause");
+            (runs, String::from_utf8(out).expect("UTF-8"), tally.counts())
+        };
+        assert_eq!(call(Tier::Fixture, false), (true, String::new(), (1, 0, 0)));
+        assert_eq!(
+            call(Tier::Fixture, true),
+            (
+                false,
+                "deferred(real) no-card-layer: (card) slots\n".to_string(),
+                (0, 1, 0)
+            )
+        );
+        assert_eq!(call(Tier::Real, true), (true, String::new(), (1, 0, 0)));
     }
 
     /// The tally counts each kind of decision once, and its line has the

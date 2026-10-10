@@ -216,12 +216,13 @@ pub fn first_flip_layers(flips: &[Flip], taps: usize, n_layer: usize) -> Vec<usi
 /// and token, its prefill ids, and the layer the band holds to (0 without a
 /// band). With `band` — the batch set's tokens and the first layer a flip
 /// lies on the path of its last position — the set's prefill and step must
-/// be those tokens, which the free arm routed.
+/// be those tokens, which the free arm routed. The set's path is the family's [`Family::path_in`]: a
+/// fixture variant's sets carry its tag.
 pub fn set_open(
     (name, family): (&str, &Family),
     band: Option<(&[u32], usize)>,
 ) -> Result<(RefManifest, u32, u32, Vec<u32>, usize), GateError> {
-    let man = RefManifest::open(&data_dir().join(name), family)?;
+    let man = RefManifest::open(&family.path_in(&data_dir(), name), family)?;
     let (pos, step, prefill) = man.step()?;
     let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
     let [tok] = step[..] else {

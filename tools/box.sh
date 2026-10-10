@@ -29,6 +29,12 @@
 #                             one on its real file. The tier comes from the environment here or a BLOOMERY_TIER entry of
 #                             BLOOMERY_BOX_ENV, which is read here, before the profile: an entry the profile had not seen would
 #                             reach the binary and not the file. Both set to different tiers is 64.
+#   BLOOMERY_FIXTURE_VARIANT=<tag>  the fixture variant (tools/fixture-variants.tsv): the family's fixture requantized to the tag's type
+#                             map, under /models/fixture-variants/<tag> (beside the fixture root: the box manifest keys every file
+#                             under the root into every fixture-tier item). Read as the tier is, from the environment here or a
+#                             BLOOMERY_BOX_ENV entry, before the profile, for the same reason; only under BLOOMERY_TIER=fixture (the
+#                             real tier has no variant: 64), and both set to different tags is 64. ref-paths.sh resolves the file
+#                             and refuses a tag the table does not name.
 #   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
 #                             guard: the way to read a sitting's log, the owner's own included, while it
 #                             runs. Refused (64) when the command names cargo, just, make, cmake, ninja
@@ -70,6 +76,25 @@ TIER=${TIER_BOX:-${TIER_MAC:-real}}
 # Exported ahead of the profile below, so ref-paths.sh sees it; nothing is added for a command that names none.
 TIERX=
 [ -z "$TIER_MAC$TIER_BOX" ] || TIERX="export BLOOMERY_TIER=$TIER && "
+# The fixture variant (the header), read the same way: a BLOOMERY_BOX_ENV entry is exported after the profile, too late for the file it names.
+VAR_MAC=${BLOOMERY_FIXTURE_VARIANT:-} VAR_BOX=
+for kv in ${tier_env[@]+"${tier_env[@]}"}; do
+  [ "${kv%%=*}" != BLOOMERY_FIXTURE_VARIANT ] || VAR_BOX=${kv#*=}
+done
+if [ -n "$VAR_MAC" ] && [ -n "$VAR_BOX" ] && [ "$VAR_MAC" != "$VAR_BOX" ]; then
+  echo "box.sh: BLOOMERY_FIXTURE_VARIANT is '$VAR_MAC' in the environment and '$VAR_BOX' in BLOOMERY_BOX_ENV: name one" >&2
+  exit 64
+fi
+VARIANT=${VAR_BOX:-$VAR_MAC}
+case "$VARIANT" in
+  *[!a-z0-9]*) echo "box.sh: BLOOMERY_FIXTURE_VARIANT is a tag of tools/fixture-variants.tsv, lower-case letters and digits, got '$VARIANT'" >&2; exit 64 ;;
+esac
+if [ -n "$VARIANT" ] && [ "$TIER" != fixture ]; then
+  echo "box.sh: BLOOMERY_FIXTURE_VARIANT=$VARIANT, but the tier is $TIER: a variant is a requantized fixture file, and nothing runs on a real file under a variant's name" >&2
+  exit 64
+fi
+VARX=
+[ -z "$VARIANT" ] || VARX="export BLOOMERY_FIXTURE_VARIANT=$VARIANT && "
 READONLY=0
 case ${BLOOMERY_BOX_READONLY:-0} in
   0) GUARD="( cd $REMOTE && . tools/ref/lease-probe.sh && lease_guard $BOX_WAIT $HOLD_OWNER ) && " ;;
@@ -223,4 +248,4 @@ esac
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 ssh "$HOST" "${GUARD}source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $V41 && $TIERX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$CARD && $OXIDE$ENVS$*"
+} && cd $REMOTE && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$CARD && $OXIDE$ENVS$*"
