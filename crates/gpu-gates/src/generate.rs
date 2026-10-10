@@ -2001,6 +2001,7 @@ mod tests {
                     uuid: [u8::try_from(i).expect("small") + 1; 16],
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                     held_by: None,
+                    integrated: false,
                 }
             })
             .collect()

@@ -153,7 +153,10 @@ gguf 9 2 0
 # MediaRows::write) go from pinned host staging to the unit arena in one asynchronous copy a run, which cuda-core
 # offers only as an unsafe call; its SAFETY line names why the staging outlives the copy.
 # PIN(2026-10-11): train0211b holds both: 1638 + 8 (mxfp4_sel) + 1 (MediaRows::write) = 1647.
-gpu 1647 180 8
+# PIN(2026-10-11): gpu 1647 -> 1648 blocks, new code, not old code relaxed: the census reads
+# CU_DEVICE_ATTRIBUTE_INTEGRATED (lib.rs raw_device_integrated, one block, with its SAFETY line), the census calls
+# beside it being raw driver calls of the same form.
+gpu 1648 180 8
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

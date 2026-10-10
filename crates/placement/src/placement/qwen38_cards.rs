@@ -49,6 +49,7 @@ fn census_96(n: usize) -> Vec<DeviceInfo> {
             uuid: [u8::try_from(i).expect("small") + 0x30; 16],
             pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
             held_by: None,
+            integrated: false,
         })
         .collect()
 }
@@ -252,6 +253,7 @@ fn machine_a(spec: CardSpec) -> Machine {
         cards: vec![stage(spec)],
         tiers: Vec::new(),
         host: host(),
+        unified: None,
     }
 }
 
@@ -289,6 +291,7 @@ fn machine_bp(stage_spec: CardSpec, tier: CardSpec) -> Machine {
             )],
         }],
         host: h,
+        unified: None,
     }
 }
 

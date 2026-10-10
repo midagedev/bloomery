@@ -30,8 +30,14 @@ pub struct DeviceInfo {
     /// `cuMemGetInfo`'s free bytes on the device's primary context, read at
     /// census time: what the device had left after every process done with
     /// it, our own future context included in the reading's cost. A plan
-    /// sizes against this, not the total ([`spec_of_device`]).
+    /// sizes against this, not the total ([`spec_of_device`]). On an
+    /// [`integrated`](DeviceInfo::integrated) device, the host's room read on
+    /// that context instead: `cuMemGetInfo` there leaves out the page cache
+    /// the kernel hands back to a device allocation.
     pub free_bytes: u64,
+    /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device allocates from host
+    /// memory (GB10), one pool with the host.
+    pub integrated: bool,
     /// `cuDeviceGetUuid`.
     pub uuid: [u8; 16],
     /// `cuDeviceGetPCIBusId`.
@@ -89,7 +95,8 @@ pub const fn census_usable(total_bytes: u64) -> u64 {
 
 /// The card spec device `d` gives a plan, naming `d`: the device's free
 /// reading and its holders ride along ([`CardSpec::free_bytes`],
-/// [`CardSpec::held_by`]) for the plan's budget term and its refusals. A
+/// [`CardSpec::held_by`]) for the plan's budget term and its refusals, and
+/// whether it shares the host's memory ([`CardSpec::integrated`]). A
 /// device of a known card's driver name whose total gives that card's
 /// usable bytes takes the card's measured figures; any other device takes
 /// its census total with [`census_usable`]'s tail as the reserve, under a
@@ -107,6 +114,7 @@ pub fn spec_of_device(d: &DeviceInfo) -> CardSpec {
             device,
             free_bytes: free,
             held_by,
+            integrated: d.integrated,
             ..*k
         };
     }
@@ -117,6 +125,7 @@ pub fn spec_of_device(d: &DeviceInfo) -> CardSpec {
         device,
         free_bytes: free,
         held_by,
+        integrated: d.integrated,
     }
 }
 
@@ -670,6 +679,7 @@ mod tests {
                 uuid: [u8::try_from(i).expect("small") + 0x10; 16],
                 pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                 held_by: None,
+                integrated: false,
             })
             .collect()
     }

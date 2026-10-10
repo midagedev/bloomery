@@ -2875,6 +2875,7 @@ mod tests {
                     usable_bytes: 0,
                     reserves: Vec::new(),
                 },
+                unified: None,
             };
             reserve_checkpoints(
                 &mut machine,
@@ -3542,6 +3543,7 @@ mod tests {
                     usable_bytes: 0,
                     reserves: vec![("os".to_owned(), os)],
                 },
+                unified: None,
             }
         }
 

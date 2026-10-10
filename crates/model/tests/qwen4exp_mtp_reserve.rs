@@ -298,6 +298,7 @@ fn machine(usable: u64) -> Machine {
             usable_bytes: u64::MAX,
             reserves: Vec::new(),
         },
+        unified: None,
     }
 }
 
