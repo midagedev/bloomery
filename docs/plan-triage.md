@@ -783,6 +783,10 @@ Order:
   - Fix after the loop, one owner: (a) `primary_context` takes each handle's first stream before any capture can run;
     (b) one handle per device through `ANCHORS` (changes `hw_gpus_on_a_device_hold_their_own_handles`); (c) a fork
     switch for `event_tracking` (a pin move). No test mutex: it would hide the engine's version of the race.
+- **`gate-gpu-xstream` hangs intermittently in its drop** (train0210d fixture batch, 2026-10-10; S, 0.2.11). It ended
+  rc 124 at 909 s on "XStream drop: the copy stream did not drain"; the rerun was green in 50 s, and the gate-times
+  history has an earlier 1088 s row. First question: which copy is still queued when the drop waits (a stats() ring of
+  the queued copies at drop), then a FAIL-first that holds one copy in flight across the drop.
 - **gpu-gate.sh holds a card lock while it waits for the V4.1 load lock** (xstream23, 2026-10-07; S, after 0.2.6).
   The A6000 then idles (1 MiB in use) while `any` items fall back to the 3090 queue. Round gate items waited 20+ min
   each. The order is deliberate (`tools/gpu-gate.sh` self-test "lock order": a load queued on its card lock holds no
