@@ -173,7 +173,7 @@
 //! it, with the bytes the batches past a group's first hold); 1 and 2 must
 //! pass. The cases hold calls of
 //! one batch, two, three (one group of three under 2), five (a pair, then
-//! three), six and eight. `BLOOMERY_STEP_STATS=1`
+//! three) and six. `BLOOMERY_STEP_STATS=1`
 //! times each layer's card work with events and prints, after each case, a
 //! `stat prefill split` line (`body::PrefillStats`) — with the queue entries
 //! the route and the shadow put in a layer-batch (`entries_route=`,
@@ -289,20 +289,29 @@ mod gate {
     use bloomery_gpu_gates::tier;
 
     const NAME: &str = "gate_deepseek41_prefill";
-    /// Positions the oracle steps at most: the longest case and one more.
+    /// Positions the oracle steps at most: the longest `--cases` P and one more. A run walks
+    /// `top + 1` of its own cases and splits, 3001 for the default list.
     const ORACLE: usize = 4097;
-    /// The longest case.
+    /// The longest `--cases` P, and the length of the CED reach case's call.
     const P_MAX: usize = ORACLE - 1;
     /// The prompt lengths: one position (the only one-position call, and the
     /// fault-reset case's clean `P`), the ring's wrap, the ubatch seam, and
-    /// several ubatches — five (a pair, then three) and eight. Three batches
+    /// several ubatches — five (a pair, then three). Three batches
     /// (a lone last batch joining the group before it) is the wide-taps
     /// case's `P`, a pair with a partial last batch the 1800 + 1000 split's
-    /// second call.
+    /// second call, six the 300 + 2700 split's.
     // PIN(2026-09-30): 2, 5, 1100 and 2600 cut (user-approved): 2 and 5 are
     // held by 1 and 127/129, 1100 by the wide-taps case on the same ids,
-    // 2600 by the 1800 + 1000 split and 4096.
-    const CASES: [usize; 9] = [1, 127, 128, 129, 511, 512, 513, 2300, 4096];
+    // 2600 by the 1800 + 1000 split and the 2700-id call of 300 + 2700.
+    // PIN(2026-10-10): 4096 cut, the oracle's walk 4097 → 3001 steps (52.7 s [derived]: 41.4 s of
+    // steps and the case's 11.3 s): the user approved it for train wall; only the batch = step
+    // equality at positions 3001–4096 goes. What still reads the depth: the CED reach case's prefill
+    // of [`P_MAX`] = 4096 ids (one eight-batch call, needs only, no steps), `--cases 4096` by hand,
+    // and the weekly `--cand` and `long --candidates` calls of 16,300 and 16,448 ids as the base of
+    // a later comparison; no other landing gate runs a call of more than four batches (tier B7 and
+    // B8 one and two, callstream four, the step gate feeds its prompts by steps) and none compares
+    // one with steps.
+    const CASES: [usize; 8] = [1, 127, 128, 129, 511, 512, 513, 2300];
     /// The splits on the real file: `ids[.. a + b]` as two prefill calls (module doc).
     const SPLITS: [(usize, usize); 3] = [(700, 400), (1800, 1000), (300, 2700)];
     /// The splits on a fixture. PIN(2026-10-08): the real list straddles the real file's reach of
