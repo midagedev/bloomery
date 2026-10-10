@@ -21,6 +21,8 @@ bloomery-gguf = { path = "../gguf" }
 bloomery-levers = { path = "../levers" }
 # Host only: Qwen3.8's PLE rows are the n-gram hash's (`engram::Hash::ple_rows_into`).
 bloomery-engram = { path = "../engram" }
+# Host only: a sequence's rotation table holds the M-RoPE rows of its images (`vision::mrope::SeqRows`).
+bloomery-vision = { path = "../vision" }
 # Host only: the qwen3moe chain and pass are walks of the schedules' overlap (`runtime::sched`).
 bloomery-runtime = { path = "../runtime" }
 # The pinned pool the hybrid host tier waits on and computes with (the CPU

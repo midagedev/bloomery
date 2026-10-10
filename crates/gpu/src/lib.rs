@@ -52,6 +52,7 @@ pub mod kpool;
 pub mod kquant;
 pub mod latent;
 pub mod linear;
+pub mod media;
 pub mod model;
 pub mod moe_fused;
 pub mod mtp;

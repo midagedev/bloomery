@@ -190,14 +190,10 @@ pub struct RopeRows {
 
 impl RopeRows {
     /// Rows `0..ctx` of `rope` (a `width`-wide spec, else refused), one
-    /// `push` per position in order, copied to the card. Load-time only.
-    pub fn new(
-        stream: &CudaStream,
-        rope: &RopeTable,
-        width: usize,
-        ctx: usize,
-    ) -> Result<RopeRows, GpuError> {
-        const WHAT: &str = "RopeRows::new";
+    /// `push` per position in order, as the host's f32 values: what [`RopeRows::new`]
+    /// copies to the card and a sequence's rotation table starts from.
+    pub fn host_rows(rope: &RopeTable, width: usize, ctx: usize) -> Result<Vec<f32>, GpuError> {
+        const WHAT: &str = "RopeRows::host_rows";
         let positions = u32::try_from(ctx).map_err(|_| {
             GpuError::shape(
                 WHAT,
@@ -213,11 +209,23 @@ impl RopeRows {
                 ),
             ));
         }
-        let t0 = Instant::now();
         let mut host = Vec::with_capacity(ctx * width);
         for pos in 0..positions {
             rope.push(pos, Direction::Forward, &mut host);
         }
+        Ok(host)
+    }
+
+    /// Rows `0..ctx` of `rope` ([`RopeRows::host_rows`]) copied to the card.
+    /// Load-time only.
+    pub fn new(
+        stream: &CudaStream,
+        rope: &RopeTable,
+        width: usize,
+        ctx: usize,
+    ) -> Result<RopeRows, GpuError> {
+        let t0 = Instant::now();
+        let host = RopeRows::host_rows(rope, width, ctx)?;
         let build = t0.elapsed();
         Ok(RopeRows {
             table: DeviceBuffer::from_host(stream, &host)?,

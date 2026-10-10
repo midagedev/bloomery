@@ -32,6 +32,7 @@ pub mod mtp;
 
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::ResetReport;
+use bloomery_gpu::media::MediaBody;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, SlotRows, Slots, SlotsOut, StepMode};
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
@@ -539,6 +540,45 @@ impl<B: Keep> Session<B> {
         let at = k.at as usize;
         (at, (at < n.min(held)).then(|| k.to_string()))
     }
+}
+
+impl<B: MediaBody> Session<B> {
+    /// [`Target::prompt`] of `ids` with `media` spliced in: one prompt call ([`call`]: one
+    /// residency pass) whose span positions take the span's rows in place of their token
+    /// embeddings ([`MediaBody::prefill_media`]). A call the body refuses before it enters
+    /// ([`MediaBody::media_refusal`]) is refused by name here.
+    pub fn prompt_media(
+        &mut self,
+        ids: &[u32],
+        media: &[B::Span<'_>],
+        want: Want,
+    ) -> Result<Out<'_>, SessionError> {
+        self.idle("prompt")?;
+        let _busy = self.model().prompt_busy();
+        if let Some(why) = B::media_refusal(self.model(), media.len()) {
+            return Err(SessionError::Refused(why));
+        }
+        let argmax = call(self.model_mut(), |m| B::prefill_media(m, ids, media))?;
+        self.read(argmax, want)
+    }
+}
+
+/// A prompt call `run` of `m` as one residency pass: its boundary before it
+/// and none inside ([`GpuModel::pass_boundary`]), so the slot map is one map
+/// for the whole call, and 0 rows kept after it, whatever it returned — the
+/// residency rule counts decode rows only, and the batch service notes no
+/// id. Nothing more on a load with no residency machine.
+pub(crate) fn call<B: ChainBody, T>(
+    m: &mut GpuModel<B>,
+    run: impl FnOnce(&mut GpuModel<B>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    m.pass_boundary()?;
+    let r = run(m);
+    let kept = m.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
+    // The call's own error first: a keep refused after a failed call is its echo.
+    let v = r?;
+    kept?;
+    Ok(v)
 }
 
 impl<B: Slots> Session<B>

@@ -121,6 +121,7 @@ use model::moe::UNION_MAX_COLS;
 use bloomery_gpu::COL_GROUP;
 use bloomery_gpu::host::swap::{CallCfg, CallPick, CallReport};
 use bloomery_gpu::hybrid::BatchKey;
+use bloomery_gpu::media::{MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::weights::DevWeight;
 
 use super::ced::{Ced, Mode};
@@ -186,26 +187,21 @@ pub enum MediaKind {
     End,
 }
 
-/// One media span of a [`prefill_media`] call: its positions `at` in the
-/// call's ids, the bf16 row of each of them (`n_embd` values, the aligner's
-/// or a learned delimiter's, as the reference's merge casts them) and each
-/// position's kind. The engine reads the positions and the rows; the kinds
-/// are checked against the reference's splice shape.
+/// One media span of a [`prefill_media`] call: the common span (its positions `at` in the call's
+/// ids and the bf16 row of each of them, `n_embd` values, the aligner's or a learned delimiter's, as
+/// the reference's merge casts them) and each position's kind. The engine reads the positions and
+/// the rows; the kinds are checked against the reference's splice shape.
 #[derive(Clone)]
-pub struct MediaSpan<'a> {
-    /// The span's positions in the call's ids, non-empty.
-    pub at: Range<usize>,
-    /// The span's rows, `at.len()` rows of `n_embd` bf16 values.
-    pub rows: &'a [u16],
+pub struct Span41<'a> {
+    pub span: MediaSpan<'a>,
     /// The kind of each of the span's positions, `at.len()` of them.
     pub kinds: &'a [MediaKind],
 }
 
-impl fmt::Debug for MediaSpan<'_> {
+impl fmt::Debug for Span41<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MediaSpan")
-            .field("at", &self.at)
-            .field("rows", &self.rows.len())
+        f.debug_struct("Span41")
+            .field("span", &self.span)
             .field("kinds", &self.kinds.len())
             .finish()
     }
@@ -217,8 +213,9 @@ impl fmt::Debug for MediaSpan<'_> {
 pub(crate) struct CallMedia<'a> {
     /// The file's `n_embd`, the width of a row.
     n_embd: usize,
-    /// Per span: its absolute positions and its rows.
-    spans: Vec<(Range<u32>, &'a [u16])>,
+    /// Per span: its absolute positions and the common span over them, whose
+    /// `at` is absolute too.
+    spans: Vec<(Range<u32>, MediaSpan<'a>)>,
 }
 
 impl CallMedia<'_> {
@@ -235,9 +232,8 @@ impl CallMedia<'_> {
 
     /// The row of position `p` (`n_embd` bf16 values); `None` off the spans.
     fn row(&self, p: u32) -> Option<&[u16]> {
-        let (at, rows) = self.spans.iter().find(|(at, _)| at.contains(&p))?;
-        let i = (p - at.start) as usize;
-        rows.get(i * self.n_embd..(i + 1) * self.n_embd)
+        let (_, span) = self.spans.iter().find(|(at, _)| at.contains(&p))?;
+        span.row(p as usize, self.n_embd)
     }
 }
 
@@ -594,7 +590,7 @@ pub fn prefill_observed(
 pub fn prefill_media(
     m: &mut Deepseek41Model,
     ids: &[u32],
-    media: &[MediaSpan<'_>],
+    media: &[Span41<'_>],
 ) -> Result<u32, GpuError> {
     feed_media(m, ids, media, None, &mut |_, _| Ok(()))
 }
@@ -605,7 +601,7 @@ pub fn prefill_media(
 pub fn prefill_media_observed(
     m: &mut Deepseek41Model,
     ids: &[u32],
-    media: &[MediaSpan<'_>],
+    media: &[Span41<'_>],
     observe: &mut BatchObserver<'_>,
 ) -> Result<u32, GpuError> {
     feed_media(m, ids, media, None, observe)
@@ -616,7 +612,7 @@ pub fn prefill_media_observed(
 fn feed_media(
     m: &mut Deepseek41Model,
     ids: &[u32],
-    media: &[MediaSpan<'_>],
+    media: &[Span41<'_>],
     features: Option<FeatureRows<'_>>,
     observe: &mut BatchObserver<'_>,
 ) -> Result<u32, GpuError> {
@@ -625,6 +621,30 @@ fn feed_media(
         .body_parts(WHAT)
         .and_then(|(_, _, body)| body.check_media(first, ids, media))?;
     feed(m, ids, features, observe, Some(&call))
+}
+
+impl MediaBody for Body {
+    type Span<'a> = Span41<'a>;
+
+    /// The steps feed: a span's rows have no step path, and the call's batches are the only
+    /// place they enter.
+    fn media_refusal(m: &Deepseek41Model, spans: usize) -> Option<String> {
+        (m.body(WHAT).ok()?.prefill_mode() == PrefillMode::Steps).then(|| {
+            format!(
+                "a prompt with {spans} media spans under BLOOMERY_PREFILL=steps: a span's rows \
+                 enter only through the batched call (BLOOMERY_PREFILL=batch)"
+            )
+        })
+    }
+
+    /// [`prefill_media`].
+    fn prefill_media(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        spans: &[Span41<'_>],
+    ) -> Result<u32, GpuError> {
+        prefill_media(m, ids, spans)
+    }
 }
 
 /// Where [`prefill_with`] hands the feature rows: the first position they
@@ -1428,7 +1448,7 @@ impl Body {
         &self,
         first: usize,
         ids: &[u32],
-        media: &[MediaSpan<'a>],
+        media: &[Span41<'a>],
     ) -> Result<CallMedia<'a>, GpuError> {
         const MEDIA: &str = "deepseek41 prefill_media";
         if self.levers.prefill != PrefillMode::Batch {
@@ -1457,29 +1477,25 @@ impl Body {
             });
         }
         let n_embd = self.hp.n_embd;
+        let common: Vec<MediaSpan<'a>> = media.iter().map(|s| s.span.clone()).collect();
+        check_spans(MEDIA, &common, ids.len(), n_embd)?;
         let mut spans = Vec::with_capacity(media.len());
-        for span in media {
-            let at = span.at.clone();
-            let rows = span.rows.len() / n_embd;
-            if at.is_empty()
-                || at.end > ids.len()
-                || span.rows.len() != at.len() * n_embd
-                || span.kinds.len() != at.len()
-            {
+        for Span41 { span, kinds } in media {
+            let at = &span.at;
+            if kinds.len() != at.len() {
                 return Err(GpuError::Shape {
                     what: MEDIA,
                     detail: format!(
-                        "a media span of {} positions at {:?} of a prompt of {} ids, {} rows of \
-                         {n_embd} and {} kinds: the call holds a span whole or not at all",
+                        "a media span of {} positions at {:?} of a prompt of {} ids with {} \
+                         kinds: the call holds a span whole or not at all",
                         at.len(),
                         at,
                         ids.len(),
-                        rows,
-                        span.kinds.len()
+                        kinds.len()
                     ),
                 });
             }
-            match (span.kinds.first(), span.kinds.last()) {
+            match (kinds.first(), kinds.last()) {
                 (Some(&MediaKind::Start), Some(&MediaKind::End)) => {}
                 got => {
                     return Err(GpuError::Shape {
@@ -1491,7 +1507,7 @@ impl Body {
                     });
                 }
             }
-            if let Some(bad) = span.kinds[1..span.kinds.len() - 1]
+            if let Some(bad) = kinds[1..kinds.len() - 1]
                 .iter()
                 .find(|k| !matches!(k, MediaKind::Image | MediaKind::NewLine))
             {
@@ -1503,27 +1519,22 @@ impl Body {
                     ),
                 });
             }
-            spans.push((
-                u32::try_from(first + at.start).map_err(|_| GpuError::Shape {
-                    what: MEDIA,
-                    detail: format!("a media position {} passes u32", first + at.start),
-                })?..u32::try_from(first + at.end).map_err(|_| {
-                    GpuError::Shape {
-                        what: MEDIA,
-                        detail: format!("a media position {} passes u32", first + at.end),
-                    }
-                })?,
-                span.rows,
-            ));
-        }
-        if media.windows(2).any(|p| p[0].at.end > p[1].at.start) {
-            return Err(GpuError::Shape {
+            let absolute = u32::try_from(first + at.start).map_err(|_| GpuError::Shape {
                 what: MEDIA,
-                detail: format!(
-                    "the media spans {:?}: ascending, each inside the prompt, disjoint",
-                    media.iter().map(|s| s.at.clone()).collect::<Vec<_>>()
-                ),
-            });
+                detail: format!("a media position {} passes u32", first + at.start),
+            })?..u32::try_from(first + at.end).map_err(|_| {
+                GpuError::Shape {
+                    what: MEDIA,
+                    detail: format!("a media position {} passes u32", first + at.end),
+                }
+            })?;
+            spans.push((
+                absolute,
+                MediaSpan {
+                    at: first + at.start..first + at.end,
+                    rows: span.rows,
+                },
+            ));
         }
         Ok(CallMedia { n_embd, spans })
     }

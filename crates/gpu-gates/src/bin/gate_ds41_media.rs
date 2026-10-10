@@ -102,7 +102,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{
-        self, BatchSeam, BatchSeamKind, Deepseek41Model, MediaKind, MediaSpan, PrefillMode,
+        self, BatchSeam, BatchSeamKind, Deepseek41Model, MediaKind, MediaSpan, PrefillMode, Span41,
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
     use bloomery_gpu_deepseek41::span::span;
@@ -148,10 +148,12 @@ mod gate {
 
     impl Feed {
         /// The span, placed at `at` of a prompt's ids.
-        fn span(&self, at: usize) -> MediaSpan<'_> {
-            MediaSpan {
-                at: at..at + self.kinds.len(),
-                rows: &self.rows,
+        fn span(&self, at: usize) -> Span41<'_> {
+            Span41 {
+                span: MediaSpan {
+                    at: at..at + self.kinds.len(),
+                    rows: &self.rows,
+                },
                 kinds: &self.kinds,
             }
         }
@@ -270,14 +272,14 @@ mod gate {
         }
 
         /// The span as one call of the whole layout takes it.
-        fn span<'a>(&self, feed: &'a Feed) -> MediaSpan<'a> {
+        fn span<'a>(&self, feed: &'a Feed) -> Span41<'a> {
             feed.span(self.at)
         }
 
         /// The span as a call of `len` ids from `at` takes it: `None` when
         /// the call holds none of it. The layouts never split their span;
         /// [`run_once`] refuses an arrangement that does.
-        fn span_from<'a>(&self, feed: &'a Feed, at: usize, len: usize) -> Option<MediaSpan<'a>> {
+        fn span_from<'a>(&self, feed: &'a Feed, at: usize, len: usize) -> Option<Span41<'a>> {
             (self.at >= at && self.at + feed.len() <= at + len).then(|| feed.span(self.at - at))
         }
     }
@@ -1110,9 +1112,11 @@ mod gate {
             s0 + 40,
             verdict(cut_ok)
         );
-        let torn = MediaSpan {
-            at: mid.at..mid.at + span_len,
-            rows: &feed.rows,
+        let torn = Span41 {
+            span: MediaSpan {
+                at: mid.at..mid.at + span_len,
+                rows: &feed.rows,
+            },
             kinds: &feed.kinds,
         };
         let whole_ok = refused(
