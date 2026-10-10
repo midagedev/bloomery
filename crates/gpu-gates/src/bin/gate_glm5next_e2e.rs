@@ -4915,7 +4915,6 @@ mod gate {
     fn main_clauses(levers: &bloomery_levers::Levers, sets: StepSets) -> Result<bool, GateError> {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
         let t = Instant::now();
-        tier::sc("(card) the card experts' slot map, slots and copy")?;
         let mut ok = card::clauses(&mut s, &opened.n_l, opened.experts, opened.budgeted)?;
         elapsed("(card)", &t);
         let m = s.model_mut();

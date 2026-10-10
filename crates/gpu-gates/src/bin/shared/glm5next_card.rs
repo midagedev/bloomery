@@ -30,6 +30,7 @@ use bloomery_gpu::hybrid::HOST;
 use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+use bloomery_gpu_gates::tier;
 use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, ref_model_path, verdict};
 use bloomery_gpu_glm5next::Body;
 use cuda_core::DeviceBuffer;
@@ -40,7 +41,8 @@ use model::arch::glm5next::place::{PlanInputs, card_routed};
 
 /// The checks (i)–(iii) on `s`'s model, whose plan put `n_l[l]` card experts
 /// on layer `l`, of `experts` a layer; `budgeted` when the plan ran under a
-/// card budget. `false` when one is red.
+/// card budget. `false` when one is red. On a fixture variant the card reads no routed layer of
+/// the clause is left by name ([`tier::card_clause`]) and nothing runs.
 pub fn clauses(
     s: &mut Session<Body>,
     n_l: &[u64],
@@ -50,6 +52,12 @@ pub fn clauses(
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let hp = PlanInputs::read(&split)?.hp;
+    if !tier::card_clause(
+        "(card) the card experts' slot map, slots and copy",
+        !readable_layers(&split, &hp).is_empty(),
+    )? {
+        return Ok(true);
+    }
     let lists = card_lists(n_l)?;
     let experts = usize::try_from(experts)?;
     let (gpu, w, body) = s.model_mut().body_parts("glm5next card checks")?;
@@ -71,6 +79,19 @@ pub fn clauses(
 fn card_lists(n_l: &[u64]) -> Result<Vec<Vec<u32>>, GateError> {
     n_l.iter()
         .map(|&n| Ok((0..u32::try_from(n)?).collect()))
+        .collect()
+}
+
+/// The trunk's routed layers whose three stacks `card_routed` reads, from the file's types.
+fn readable_layers(split: &Split, hp: &Hparams) -> Vec<usize> {
+    (hp.dense_lead..hp.n_trunk)
+        .filter(|&l| {
+            stack_names(l).iter().all(|name| {
+                split
+                    .find(name)
+                    .is_some_and(|(_, info)| card_routed(info.ty).is_some())
+            })
+        })
         .collect()
 }
 
@@ -107,22 +128,14 @@ fn check_map(
             ));
         }
     }
-    let mut readable = Vec::new();
-    let routed = lists
+    let readable = readable_layers(split, hp);
+    for (l, list) in lists
         .iter()
         .enumerate()
         .take(hp.n_trunk)
-        .skip(hp.dense_lead);
-    for (l, list) in routed {
-        let reads = stack_names(l).iter().all(|name| {
-            split
-                .find(name)
-                .is_some_and(|(_, info)| card_routed(info.ty).is_some())
-        });
-        if reads {
-            readable.push(l);
-        }
-        if !reads && !list.is_empty() {
+        .skip(hp.dense_lead)
+    {
+        if !readable.contains(&l) && !list.is_empty() {
             bad.push(format!(
                 "layer {l}: card experts on stacks the card does not read"
             ));

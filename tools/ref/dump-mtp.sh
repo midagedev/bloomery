@@ -198,9 +198,11 @@ witness post-dump
 
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" ||
   { echo "dump-mtp.sh: the staged set has no completion trailer — not installing it" >&2; exit 1; }
-# A set names its model by the first shard's full path (`# model`) and, for Qwen3.8, its draft file
-# (`# draft_model`); a set of other files is not replaced.
-model_of() { awk -F'\t' '$1 == "# model" || $1 == "# draft_model" { print $2 }' "$1" | paste -sd' ' -; }
+# A set names its model by the first shard's path (`# model`) and, for Qwen3.8, its draft file
+# (`# draft_model`); a set of other files is not replaced. Compared by the files' basenames, as dump.sh compares them: the same
+# file in another directory (a fixture variant's, beside the fixture root) is the same model here, and the family check at open
+# refuses a set dumped from another path by its full string.
+model_of() { awk -F'\t' '$1 == "# model" || $1 == "# draft_model" { n = split($2, p, "/"); print p[n] }' "$1" | paste -sd' ' -; }
 if [ -f "$REF/MANIFEST.tsv" ] && [ "$(model_of "$REF/MANIFEST.tsv")" != "$(model_of "$STAGE/MANIFEST.tsv")" ]; then
   echo "dump-mtp.sh: $REF holds a set of $(model_of "$REF/MANIFEST.tsv"), this dump is of" \
     "$(model_of "$STAGE/MANIFEST.tsv") — not replacing it (the staged set stays in $STAGE)" >&2

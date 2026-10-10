@@ -1302,6 +1302,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          not carry it from the Mac.",
     ),
     path(
+        "BLOOMERY_FIXTURE_VARIANT",
+        Some("ref/ref-paths.sh"),
+        "The fixture variant, a tag of `tools/fixture-variants.tsv`: the family's fixture requantized to \
+         the tag's type map (`just fixture-requant`), whose files live in `fixture-variants/<tag>` beside \
+         the fixture root and whose sets carry the tag in their names. `tools/box.sh` reads it from the \
+         environment or `BLOOMERY_BOX_ENV` before the profile, as it does `BLOOMERY_TIER`; only the \
+         fixture tier has variants (the real tier refuses one, 64), and `tools/ref/ref-paths.sh` refuses \
+         a tag the table does not name. refset reads it in place (`fixture::root`).",
+    ),
+    path(
         "BLOOMERY_GATE_LEDGER",
         Some("gate-batch.sh"),
         "Mac side: the green ledger `tools/gate-batch.sh --ledger` reads and writes.",

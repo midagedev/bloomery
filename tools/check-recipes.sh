@@ -446,6 +446,73 @@ blk_boxqcodes() {
   fi
   echo "${bc##*$'\n'}"
 }
+# The fixture variants' table (tools/fixture-variants.tsv) against the tree, and the rules ref-paths.sh applies to a variant, on a
+# temporary fixture root: six columns a row, unique tags of lower-case letters and digits, a family that has a fixture directory in
+# ref-paths.sh's table, recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
+# writer is given) and each refusal by name and exit code: a real tier, a tag the table does not name, one of another family, one
+# that is no tag, a family with no fixture file, a variant file that is not there.
+blk_fixturevariants() {
+  local jf=$JF tsv rp d n=0 out vars
+  tsv=$(dirname "$0")/fixture-variants.tsv rp=$(dirname "$0")/ref/ref-paths.sh
+  d=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$d'" RETURN
+  local tags="" line tag family recipes r cols
+  while IFS= read -r line; do
+    case $line in '' | '#'*) continue ;; esac
+    n=$((n + 1))
+    cols=$(awk -F'\t' '{ print NF }' <<< "$line")
+    [ "$cols" = 6 ] || { echo "check-recipes: $tsv row $n has $cols columns, want 6 (tag family scope map recipes why)" >&2; return 1; }
+    IFS=$'\t' read -r tag family _ _ recipes _ <<< "$line"
+    case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $tsv: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
+    case " $tags " in *" $tag "*) echo "check-recipes: $tsv names the tag $tag twice" >&2; return 1 ;; esac
+    tags="$tags $tag"
+    grep -E "__fixture_dir=[a-z0-9]+ ;;" "$rp" | grep -vE "=(self|none) ;;" | grep -qE "(^|[ (|])$family([ )|]|\$)" ||
+      { echo "check-recipes: $tsv: family $family has no fixture directory row in $rp" >&2; return 1; }
+    for r in $recipes; do
+      grep -qE "^$r:" "$jf" || { echo "check-recipes: $tsv: $r is no recipe of the justfile" >&2; return 1; }
+    done
+  done < "$tsv"
+  [ "$n" -gt 0 ] || { echo "check-recipes: $tsv holds no variant" >&2; return 1; }
+  grep -qE '^fixture-requant FAMILY TAG:' "$jf" || { echo "check-recipes: the justfile has no fixture-requant recipe" >&2; return 1; }
+  # The tier's paths on a temporary root: $d/fixtures/<dir>/ the fixture, $d/fixture-variants/<tag>/<dir>/ its variant.
+  tag=$(awk -F'\t' '$0 !~ /^#/ && NF { print $1; exit }' "$tsv") family=$(awk -F'\t' '$0 !~ /^#/ && NF { print $2; exit }' "$tsv")
+  mkdir -p "$d/fixtures/glm5next" "$d/fixture-variants/$tag/glm5next"
+  touch "$d/fixtures/glm5next/f-00001-of-00001.gguf" "$d/fixture-variants/$tag/glm5next/v-00001-of-00001.gguf"
+  rps() { # rps NAME=value... : ref-paths.sh under those variables; stdout, then the exit code on the last line
+    env -i PATH="$PATH" BLOOMERY_FIXTURE_ROOT="$d/fixtures" "$@" bash -c '. "$1" && printf "%s|%s|%s|%s" "$MODEL" "$FIXTURE_FILE" "$FIXTURE_DIR" "${SET_PREFIX-}"' _ "$rp" 2>&1
+    echo "|rc=$?"
+  }
+  want() { # want WHAT EXPECTED_SUBSTRING NAME=value... : the output holds the substring
+    local what=$1 sub=$2
+    shift 2
+    out=$(rps "$@")
+    case $out in *"$sub"*) ;; *) echo "check-recipes: ref-paths.sh, $what: wanted '$sub' in: $out" >&2; return 1 ;; esac
+  }
+  want "base fixture" "|$d/fixtures/glm5next/f-00001-of-00001.gguf|$d/fixtures/glm5next|" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture || return 1
+  want "variant fixture" "|$d/fixture-variants/$tag/glm5next/v-00001-of-00001.gguf|$d/fixture-variants/$tag/glm5next|" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a variant's set prefix" "|rc=0" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  out=$(env -i PATH="$PATH" BLOOMERY_FIXTURE_ROOT="$d/fixtures" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" bash -c '. "$1" && fixture_dump_tier t && printf %s "$SET_PREFIX"' _ "$rp" 2>&1)
+  [ "$out" = "fx_${tag}_" ] || { echo "check-recipes: ref-paths.sh: a variant's set prefix is '$out', want fx_${tag}_" >&2; return 1; }
+  want "the directory a writer is given" "|$d/fixture-variants/$tag/glm5next|" FIXTURE_NEW=1 BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "the real tier" "the tier is real" BLOOMERY_MODEL="$family" BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "the real tier exit" "rc=64" BLOOMERY_MODEL="$family" BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a tag the table does not name" "does not name (it holds:" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=nosuchtag || return 1
+  want "a tag the table does not name, exit" "rc=64" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=nosuchtag || return 1
+  want "a variant of another family" "is a variant of $family" BLOOMERY_MODEL=qwen4exp BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a string that is no tag" "lower-case letters and digits" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT='../x' || return 1
+  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=qwen3moe BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  rm -f "$d/fixture-variants/$tag/glm5next/"*.gguf
+  want "a variant file that is not there" "fixture-requant $family $tag" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a variant file that is not there, exit" "rc=66" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  # tools/box.sh reads the variant like the tier, before it syncs anything: its refusals need no box.
+  for c in "BLOOMERY_FIXTURE_VARIANT=$tag|the tier is real" "BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=a/b|lower-case letters and digits" "BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=ab BLOOMERY_BOX_ENV=BLOOMERY_FIXTURE_VARIANT=cd|name one"; do
+    read -r -a vars <<< "${c%%|*}"
+    out=$(env -i PATH="$PATH" HOME="$HOME" "${vars[@]}" BLOOMERY_BOX_READONLY=1 bash "$(dirname "$0")/box.sh" true 2>&1 || true)
+    case $out in *"${c#*|}"*) ;; *) echo "check-recipes: box.sh with '${c%%|*}': wanted '${c#*|}' in: $out" >&2; return 1 ;; esac
+  done
+  echo "check-recipes: fixture variants ok ($n row(s): $tags )"
+}
 # Every #[test] in the workspace is run by some gate-* or lab-* recipe's cargo test call on the box: its
 # target, the features its path's cfgs need, its name filter and its #[ignore] (tools/recipes.py
 # orphan-tests). A test no gate runs is neither a test nor a gate: without gate-ds41-bind, gpu-gates' bind
@@ -460,7 +527,7 @@ blk_orphan() {
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools boxqcodes orphan)
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs ldsscan mutantrun macstatic carry pytools boxqcodes fixturevariants orphan)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
