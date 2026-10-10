@@ -46,7 +46,11 @@ A recipe's inputs are:
     `#[cfg(test)]` (or `cfg(all(…, test, …))`), and whatever it includes or names, belongs to the test
     builds of its own target — a lib's test target (`--lib` under cargo test, `--tests`,
     `--all-targets`), a test, a bench, and a bin's or example's own tree — never to the lib as a
-    dependency sees it;
+    dependency sees it. A module under a one-line `#[cfg(feature = …)]` (alone or under `all`, `any`,
+    `not`) that the recipe's `--features` make false is left out of its own package's trees (the target's
+    and its lib's) — a build that is not one `-p` with its whole feature list in `--features` (a recipe
+    parameter, a `pkg/feature`, several packages or a workspace: cargo unifies features across a build) is
+    read whole; another package's lib is read whole too, whatever the dependent enables;
   - on the box's last build, the bin's top-level dep-info (`target/release/<bin>.d`, which lists every
     local source file of the binary) — a cross-check of the walk, and a union with it;
   - the scripts the recipe text names (`tools/**`, `crates/*/tools/**`) and, transitively, the repository
@@ -863,7 +867,7 @@ class Tree:
         # `dir/` of every workspace package: a .rs literal under one of these is source, not data
         # (`_resolve_literals`); a .rs outside them (an excluded crate) stays an input.
         self.pkg_dirs = tuple(sorted(p.dir + "/" for p in self.packages.values() if p.dir not in ("", ".")))
-        self._walk_cache: dict[str, ModuleTree] = {}
+        self._walk_cache: dict[tuple[str, frozenset[str] | None], ModuleTree] = {}
         self.unresolved: list[str] = []
         self.depinfo: dict[str, tuple[set[str], float]] = {}  # bin name -> (files, mtime)
 
@@ -911,18 +915,31 @@ class Tree:
         items.append(cur.strip())
         return "test" in items
 
-    def walk(self, src: str) -> ModuleTree:
+    @staticmethod
+    def cfg_off(attr: str, features: frozenset[str] | None) -> bool:
+        """Whether a one-line `#[cfg(…)]` is false in every build whose enabled features are `features`
+        (`eval_cfg` with every target key and `test` unknown): a `feature = …` that is off, alone or
+        under `all`, `any` and `not`. Anything it cannot decide — a target predicate, `test`, a
+        multi-line attribute, no `features` — is not off: the item stays in."""
+        if features is None:
+            return False
+        m = Tree._CFG.match(attr)
+        return bool(m) and eval_cfg(parse_cfg(m.group(1)), None, {}, {}, features) is False
+
+    def walk(self, src: str, features: frozenset[str] | None = None) -> ModuleTree:
         """The module tree rooted at `src`. A module declared under a test-only `cfg` (`cfg_test`),
         file or inline, and what it declares, includes and names go to the test side; a file reached
-        both ways is on the build side."""
+        both ways is on the build side. With `features` (the enabled features of the package the tree is
+        compiled in), a module under a `cfg` they make false (`cfg_off`) is not walked: its file, and
+        what it declares, includes and names, are not the build's."""
         acc = ModuleTree(set(), [], set(), [])
-        self._walk(src, os.path.dirname(src), acc, False)
+        self._walk(src, os.path.dirname(src), acc, False, (), features)
         acc.test_files -= acc.files
         for m in set(acc.test_mods) & set(acc.mods):
             del acc.test_mods[m]
         return acc
 
-    def _walk(self, rel: str, moddir: str, acc: ModuleTree, test: bool, modpath: tuple[str, ...] = ()) -> None:
+    def _walk(self, rel: str, moddir: str, acc: ModuleTree, test: bool, modpath: tuple[str, ...] = (), features: frozenset[str] | None = None) -> None:
         (acc.test_mods if test else acc.mods).setdefault(modpath, rel)
         if rel in acc.files or (test and rel in acc.test_files):
             return
@@ -930,7 +947,8 @@ class Tree:
         fdir = os.path.dirname(rel)
         pending_path: str | None = None
         pending_test = False  # a test-only `#[cfg]` since the last item: the next module is test-only
-        inline: list[tuple[int, str, bool]] = []  # (indent, name, test-only)
+        pending_off = False  # a `#[cfg]` the features make false since the last item: the next module is not built
+        inline: list[tuple[int, str, bool, bool]] = []  # (indent, name, test-only, not built)
         attr_depth = 0  # open brackets of a multi-line attribute (`#[allow(\n…\n)]`)
         for line in self.read(rel).split("\n"):
             s = line.strip()
@@ -944,6 +962,12 @@ class Tree:
                 inline.pop()
                 continue
             here = inline[-1][2] if inline else test
+            if inline and inline[-1][3]:
+                # inside an inline module the features switch off: only its end is read
+                im = self._INLINE.match(line)
+                if im:
+                    inline.append((len(im.group(1)), im.group(2), here, True))
+                continue
             for lit in self._LITERAL.findall(line):
                 (acc.test_literals if here else acc.literals).append((rel, lit))
             for inc in self._INCLUDE.findall(line):
@@ -962,28 +986,36 @@ class Tree:
                 name = m.group(2)
                 path_attr = pm.group(1) if pm else pending_path
                 child_test = here or pending_test
+                child_off = pending_off
                 pending_path = None
                 pending_test = False
-                inner = [n for (i, n, _) in inline if i < indent]
+                pending_off = False
+                if child_off:
+                    continue
+                inner = [n for (i, n, _, _) in inline if i < indent]
                 hit, child_dir, err = self.mod_file(rel, moddir, inner, name, path_attr)
                 if hit is None:
                     self.unresolved.append(err)
                     continue
-                self._walk(hit, child_dir, acc, child_test, modpath + tuple(inner) + (name,))
+                self._walk(hit, child_dir, acc, child_test, modpath + tuple(inner) + (name,), features)
                 continue
             if im:
-                inner = [n for (i, n, _) in inline if i < indent]
-                (acc.test_mods if here or pending_test else acc.mods).setdefault(modpath + tuple(inner) + (im.group(2),), rel)
-                inline.append((len(im.group(1)), im.group(2), here or pending_test))
+                inner = [n for (i, n, _, _) in inline if i < indent]
+                if not pending_off:
+                    (acc.test_mods if here or pending_test else acc.mods).setdefault(modpath + tuple(inner) + (im.group(2),), rel)
+                inline.append((len(im.group(1)), im.group(2), here or pending_test, pending_off))
                 pending_path = None
                 pending_test = False
+                pending_off = False
                 continue
             if s.startswith("#["):
                 pending_test = pending_test or self.cfg_test(s)
+                pending_off = pending_off or self.cfg_off(s, features)
                 attr_depth = max(0, s.count("[") - s.count("]"))
                 continue
             pending_path = None
             pending_test = False
+            pending_off = False
 
     def mod_file(self, rel: str, moddir: str, inner: list[str], name: str, path_attr: str | None) -> tuple[str | None, str, str]:
         """(file, its module directory, "") of `mod name;` declared in `rel`, whose children live in
@@ -1004,12 +1036,14 @@ class Tree:
             return None, "", f"{rel}: mod {name} (neither {cand[0]} nor {cand[1]})"
         return hit, os.path.dirname(hit) if hit.endswith("mod.rs") else hit[: -len(".rs")], ""
 
-    def tree_of(self, src: str, test: bool = False) -> tuple[set[str], list[tuple[str, str]]]:
+    def tree_of(self, src: str, test: bool = False, features: frozenset[str] | None = None) -> tuple[set[str], list[tuple[str, str]]]:
         """`src`'s module tree as one build of it sees it: a test build (`test`) with its test-only
-        modules, any other build without them."""
-        if src not in self._walk_cache:
-            self._walk_cache[src] = self.walk(src)
-        w = self._walk_cache[src]
+        modules, any other build without them; with `features`, without the modules those features
+        switch off (`walk`)."""
+        key = (src, features)
+        if key not in self._walk_cache:
+            self._walk_cache[key] = self.walk(src, features)
+        w = self._walk_cache[key]
         if test:
             return w.files | w.test_files, w.literals + w.test_literals
         return w.files, w.literals
@@ -1017,7 +1051,7 @@ class Tree:
     def mods_of(self, src: str, test: bool = False) -> dict[tuple[str, ...], str]:
         """`src`'s modules as `tree_of` sees them: module path below the root -> the file that holds it."""
         self.tree_of(src)
-        w = self._walk_cache[src]
+        w = self._walk_cache[(src, None)]
         return {**w.mods, **w.test_mods} if test else w.mods
 
     # ---------------- features and dependencies ----------------
@@ -1054,20 +1088,21 @@ class Tree:
                 unknown.append(f)
         return feats, deps_on, unknown
 
-    def lib_files(self, name: str) -> dict[str, str]:
-        """The files a dependent sees of package `name`: its lib tree, manifest and build script."""
+    def lib_files(self, name: str, features: frozenset[str] | None = None) -> dict[str, str]:
+        """The files a dependent sees of package `name`: its lib tree, manifest and build script. `features`,
+        when the build's enabled features of `name` are known, leave out the modules they switch off."""
         out: dict[str, str] = {self.packages[name].manifest: f"{name} Cargo.toml"}
-        for f, why in self._lib_reads(name).items():
+        for f, why in self._lib_reads(name, features).items():
             out.setdefault(f, why)
         return out
 
-    def _lib_reads(self, name: str) -> dict[str, str]:
+    def _lib_reads(self, name: str, features: frozenset[str] | None = None) -> dict[str, str]:
         """lib_files but the manifest: what package `name`'s lib and build script read as files."""
         pkg = self.packages[name]
         out: dict[str, str] = {}
         lib = pkg.lib()
         if lib is not None:
-            files, lits = self.tree_of(lib.src)
+            files, lits = self.tree_of(lib.src, features=features)
             for f in files:
                 out.setdefault(f, f"lib {name}")
             for f in self._resolve_literals(pkg, lits):
@@ -1126,15 +1161,22 @@ class Tree:
                 stack.append((d.pkg, d.features, d.default, f"{why} -> {d.pkg}"))
         return seen
 
-    def target_files(self, pkg_name: str, kind: str, name: str | None, features: list[str], default: bool = True, all_features: bool = False, use: ManifestUse | None = None) -> dict[str, str]:
+    def target_files(self, pkg_name: str, kind: str, name: str | None, features: list[str], default: bool = True, all_features: bool = False, use: ManifestUse | None = None, by_features: bool = False) -> dict[str, str]:
         """file -> origin for one target. kind: lib bin test example bench doctest libtest. The
         target's own test-only modules count for every kind but `lib` and `doctest` (rustdoc sets no
         cfg(test)); for a bin or an example that is also its plain build, an over-selection confined to
         its own recipes. Every lib it links, its own package's included, is seen without them. `use`,
         when given, gains how the target reads each manifest of its closure: by table — its own entry in
-        its package's, the shared tables of every other — or whole, when a file walk reaches one."""
+        its package's, the shared tables of every other — or whole, when a file walk reaches one.
+        `by_features`: the package's own trees (the target's and its lib's) leave out the modules the build's
+        enabled features switch off (`#[cfg(feature = …)] mod x;`, `Tree.walk`); the caller says it only
+        when `features` is the build's whole list. Another package's lib is read whole either way."""
         pkg = self.packages[pkg_name]
         out: dict[str, str] = {}
+        built: frozenset[str] | None = None
+        if by_features:
+            on, deps_on, _ = self.feature_closure(pkg, features, default, all_features)
+            built = frozenset(on | deps_on)
         dev = kind in ("test", "bench", "doctest", "libtest", "example")
         if kind in ("lib", "doctest", "libtest"):
             own = pkg.lib()
@@ -1144,12 +1186,12 @@ class Tree:
             label = f"{kind} {name}"
         if own is None:
             raise RecipeError(f"{pkg_name} has no {kind} target {name or ''}".rstrip())
-        files, lits = self.tree_of(own.src, test=kind not in ("lib", "doctest"))
+        files, lits = self.tree_of(own.src, test=kind not in ("lib", "doctest"), features=built)
         for f in files:
             out[f] = f"{pkg_name} {label}"
         for f in self._resolve_literals(pkg, lits):
             out.setdefault(f, f"{pkg_name} {label} (path literal)")
-        for f, why in self.lib_files(pkg_name).items():
+        for f, why in self.lib_files(pkg_name, built).items():
             out.setdefault(f, why)
         linked = self.closure(pkg, features, dev, default, all_features)
         for dep, why in linked.items():
@@ -1357,7 +1399,11 @@ class Graph:
             for pname, kind, tname, feats in tl:
                 targets.append((pname, kind, tname, feats))
                 label = f"{kind} {tname}" if tname else kind
-                for f, why in self.tree.target_files(pname, kind, tname, feats, not inv.no_default, inv.all_features, use).items():
+                # Read by the features only where they are the build's whole list for the package: one `-p`, no
+                # recipe parameter (known at run time only), no `pkg/feature` (it reaches another package's
+                # features, and a build with several packages unifies them); else the build is read whole.
+                by_features = len(inv.packages) == 1 and not any("{{" in f or "/" in f for f in inv.features)
+                for f, why in self.tree.target_files(pname, kind, tname, feats, not inv.no_default, inv.all_features, use, by_features).items():
                     if f.endswith("/"):
                         prefixes.setdefault(f, f"{label} <- {why}")
                     else:
@@ -7158,6 +7204,79 @@ def manifest_self_test(expect) -> None:
                f"tables: a manifest that does not parse, in the key: {kb}")
 
 
+def module_gate_self_test(expect) -> None:
+    """A module gated by a cargo feature is read by the recipes that build with that feature only, on a synthetic
+    workspace (package g: features fy and fz, a lib with a plain module, one under `feature = "fy"`, one under
+    `not(feature = "fy")`, one inline under `all(feature = "fy", feature = "fz")` with a data file, one under
+    `any(test, feature = "fy")`, and bins x and y whose own trees gate a module the same way). The cases are the
+    ones the rule must keep (an ungated module is read by every build; what a feature does not decide stays in)
+    and the saving (a gated module leaves the builds without its feature); a recipe parameter in `--features`
+    is read whole, and so is one that names several packages or a `pkg/feature` (cargo unifies features across
+    the build)."""
+    just = (
+        "gate-x:\n    ./tools/box.sh 'cargo build -p g --bin x'\n"
+        "gate-xy:\n    ./tools/box.sh 'cargo build -p g --features fy --bin x'\n"
+        "gate-yz:\n    ./tools/box.sh 'cargo build -p g --features fy,fz --bin y'\n"
+        "gate-lib:\n    ./tools/box.sh 'cargo test -p g --lib'\n"
+        "gate-liby:\n    ./tools/box.sh 'cargo test -p g --lib --features fy'\n"
+        "gate-all:\n    ./tools/box.sh 'cargo test -p g --lib --all-features'\n"
+        "gate-par F='fy':\n    ./tools/box.sh 'cargo build -p g --features {{F}} --bin x'\n"
+        "gate-ws:\n    ./tools/box.sh 'cargo build --workspace --bin x'\n"
+        "gate-slash:\n    ./tools/box.sh 'cargo build -p g --features g/fy --bin x'\n"
+    )
+    files = {
+        "crates/g/Cargo.toml": "",
+        "crates/g/src/lib.rs": (
+            'mod plain;\n#[cfg(feature = "fy")]\nmod gated;\n#[cfg(not(feature = "fy"))]\nmod off;\n'
+            '#[cfg(all(feature = "fy", feature = "fz"))]\n#[allow(dead_code)]\nmod inl {\n    mod deep;\n'
+            '    const D: &str = include_str!("../data/d.txt");\n}\n#[cfg(any(test, feature = "fy"))]\nmod either;\n'
+        ),
+        "crates/g/src/plain.rs": "",
+        "crates/g/src/gated.rs": "",
+        "crates/g/src/off.rs": "",
+        "crates/g/src/inl/deep.rs": "",
+        "crates/g/src/either.rs": "",
+        "crates/g/data/d.txt": "",
+        "crates/g/src/bin/x.rs": '#[cfg(feature = "fy")]\nmod xg;\nfn main() {}\n',
+        "crates/g/src/bin/xg.rs": "",
+        "crates/g/src/bin/y.rs": "fn main() {}\n",
+        "justfile": just,
+    }
+    with tempfile.TemporaryDirectory(prefix="recipes-modgate-") as tmp:
+        for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+            files[f] = ""
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        targets = [{"kind": ["lib"], "name": "g", "src_path": os.path.join(tmp, "crates/g/src/lib.rs")}]
+        targets += [{"kind": ["bin"], "name": n, "src_path": os.path.join(tmp, f"crates/g/src/bin/{n}.rs"), "required-features": req} for n, req in (("x", []), ("y", ["fy"]))]
+        meta = {
+            "workspace_root": tmp,
+            "workspace_members": ["g"],
+            "packages": [{"id": "g", "name": "g", "manifest_path": os.path.join(tmp, "crates/g/Cargo.toml"), "features": {"fy": [], "fz": []}, "dependencies": [], "targets": targets}],
+        }
+        side = side_at(tmp, meta)
+        whole = {"gate-par", "gate-ws", "gate-slash"}  # read whole: a parameter, no `-p`, a `pkg/feature`
+        every = {"gate-x", "gate-xy", "gate-yz", "gate-lib", "gate-liby", "gate-all"} | whole
+        fy = {"gate-xy", "gate-yz", "gate-liby", "gate-all"} | whole
+        cases = [
+            ("an ungated module", "plain.rs", every),
+            ("a module under feature = fy", "gated.rs", fy),
+            ("a module under not(feature = fy)", "off.rs", {"gate-x", "gate-lib"} | whole),
+            ("a module under any(test, feature = fy), which a test build compiles whatever the features", "either.rs", every),
+            ("an inline module under all(fy, fz): what it declares", "inl/deep.rs", {"gate-yz", "gate-all"} | whole),
+            ("an inline module under all(fy, fz): what it includes", "../data/d.txt", {"gate-yz", "gate-all"} | whole),
+            # only the recipes that build bin x read its own tree; of those, the ones without fy leave xg out
+            ("a bin's own module under feature = fy", "bin/xg.rs", {"gate-xy"} | whole),
+        ]
+        for what, rel, want in cases:
+            sels, _, _ = select([os.path.normpath(os.path.join("crates/g/src", rel))], side, side, GATE_PREFIX)
+            got = {x.recipe for x in sels}
+            expect(got == want, f"module gate: {what} selects {sorted(got)}, not {sorted(want)}")
+        expect(not side.tree.unresolved, f"module gate: unresolved {side.tree.unresolved[:2]}")
+
+
 def key_self_test(expect, real: Side) -> None:
     """The ledger key: the detectors on the real tree, then a scratch copy where each input class is
     changed in turn — the same inputs give the same key, each change moves exactly the keys that read it."""
@@ -8971,6 +9090,9 @@ def self_test() -> int:
 
     # a package manifest read by table
     manifest_self_test(expect)
+
+    # a module gated by a cargo feature
+    module_gate_self_test(expect)
 
     # the static tier compiles every feature-gated bin
     static_self_test(expect)

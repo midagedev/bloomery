@@ -167,7 +167,12 @@
 //!   step early splits a total whose next grid point still fits, red on (c).
 //! - `slots_rounds_run_one_pass`, on both arms (both bodies run one pass of
 //!   their slots, `SlotRows`: a qwen3moe file's `Body`, a qwen35moe file's
-//!   `Body35`): a whole-card server
+//!   `Body35`), and the seat's `parallel` line names the shape the open
+//!   decided (`slots_parallel_line_names_one_pass` on the whole-card arm,
+//!   `placed_slots_parallel_line_names_turns` on the placed one, whose host
+//!   experts keep the fallback loop: `qwen3::pass_of`; FAIL-first: the word
+//!   printed flipped, red on both and on the one-slot arm's
+//!   `one_slot_parallel_line_names_one_pass`): a whole-card server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
 //!   slots clause's prompts, each first run alone on that server and then
@@ -218,15 +223,18 @@
 //!   prompt call taking its checkpoints in its own sequence). FAIL-first: a
 //!   round that leaves the wrong slot selected runs the second request's
 //!   prompt over the first's sequence, and both requests' ids move at once.
-//! - `slot_ctx_too_small_is_refused` and `ctx_set_parallel_unset_is_one_slot`
-//!   (both arms): the refusal, `--ctx 15 --parallel 2` — a slot of 7 rows,
+//! - `slot_ctx_too_small_is_refused`, `ctx_set_parallel_unset_is_one_slot` and
+//!   `one_slot_parallel_line_names_one_pass` (the arms): the refusal, `--ctx 15 --parallel 2` — a slot of 7 rows,
 //!   one under the 8 rows
 //!   a slot loads at (`router::MAX_TOKENS`: the widest pass a whole-card
 //!   load captures, and one whole prompt pass of a placed load) — ends the
 //!   process before the load, naming the total, the slot count and the
 //!   slot ctx; the same `--ctx 15` with no `--parallel` takes one slot at
 //!   the whole flag, its `parallel` line (`from=ctx`) and the one-request
-//!   note on stderr before the load, the server stopped there.
+//!   note on stderr before the load, the server stopped there; the line's
+//!   `pass=` word is `one` (`one_slot_parallel_line_names_one_pass`: a load
+//!   of one slot runs no round of several, `Pass::of` is `Pass::One`
+//!   whatever the body or the placement, so the word holds on both files).
 //!   PIN(2026-10-07): the refusal's flag set gained its `--parallel 2` — a
 //!   set `--ctx` with no `--parallel` is one request's context now
 //!   (`placement::ctx::slots_of`), so the split refusal needs the count said, and the
@@ -539,6 +547,13 @@ mod gate {
             .next()?
             .parse()
             .ok()
+    }
+
+    /// The word ` name=…` of a `parallel` line; `None` when the line
+    /// carries none.
+    fn parallel_word<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(&format!("{name}=")))
     }
 
     /// The `--ctx` searches a server's stderr names, one line a search
@@ -1746,6 +1761,24 @@ mod gate {
             let mut s = Served::spawn_cmd(cmd, &args, &d)?;
             let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
             let url = |p: &str| format!("http://{addr}{p}");
+            // The shape the seat's open decided, by the line it printed before its load: one pass
+            // of the busy rows on the whole-card load, a select and a step a slot beside the host
+            // tier (`qwen3::pass_of`); the rounds below hold the records to the same shape.
+            let log = std::fs::read_to_string(&err_log)?;
+            let parallel = log.lines().find(|l| l.starts_with("parallel rule="));
+            println!("{dir_name}: {parallel:?}");
+            check(
+                ok,
+                &named(if one_pass {
+                    "slots_parallel_line_names_one_pass"
+                } else {
+                    "slots_parallel_line_names_turns"
+                }),
+                parallel.is_some_and(|l| {
+                    parallel_word(l, "slots") == Some("2")
+                        && parallel_word(l, "pass") == Some(if one_pass { "one" } else { "turns" })
+                }),
+            );
             let a_ids = rendered(&url, messages())?;
             let b_ids = tokenized(&url, PROSE)?;
             let mut alone = Vec::new();
@@ -2280,10 +2313,7 @@ mod gate {
              once (they split it)"
         );
         let agrees = line.as_deref().is_some_and(|l| {
-            let f = |k: &str| {
-                l.split_whitespace()
-                    .find_map(|w| w.strip_prefix(&format!("{k}=")))
-            };
+            let f = |k: &str| parallel_word(l, k);
             f("slots") == Some("1")
                 && f("slot_ctx") == Some(total.as_str())
                 && f("total") == Some(total.as_str())
@@ -2294,6 +2324,14 @@ mod gate {
             ok,
             "ctx_set_parallel_unset_is_one_slot",
             agrees && said.contains(&one_request),
+        );
+        // One slot runs no round of several: `Pass::of(1, _)` is `Pass::One`
+        // for every body and placement (`bind::Pass::of`, `qwen3::pass_of`).
+        check(
+            ok,
+            "one_slot_parallel_line_names_one_pass",
+            line.as_deref()
+                .is_some_and(|l| parallel_word(l, "pass") == Some("one")),
         );
         let _ = s.stop();
         Ok(())

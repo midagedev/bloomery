@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # `just narrow BASE [HEAD]`: the scans `just affected --narrow` needs, taken for you.
 #   tools/narrow-scan.sh BASE [HEAD] [--out DIR] [--dry-run]
+#   tools/narrow-scan.sh BASE --worktree [--out DIR] [--dry-run]
 #   tools/narrow-scan.sh --self-test
 #
 # What it does, in order:
 #   1. Resolves BASE and HEAD (default: this tree's HEAD commit) to commits. The scans read the commits through
-#      `git archive`, never the working tree: uncommitted edits are not scanned (a note says so).
-#   2. Derives the scan set from HEAD's tree (`tools/recipes.py scan-set`): the fewest bins of bloomery-gpu-gates whose
-#      scans cover every kernel carrier (each device lib, and each bin with kernels of its own), each with the cargo
-#      features it builds under.
+#      `git archive`, never the working tree: uncommitted edits are not scanned (a note says so). `--worktree` is
+#      the mode for a tree that may not commit (a round): the head side is this tree's current content, uncommitted
+#      and untracked files included, synced as box.sh syncs it (its own tools/box.sh from this tree), and the base
+#      side stays BASE's commit. BASE must be an ancestor of this tree's HEAD, so that `tools/affected-gates.sh BASE`
+#      (the working tree against the merge base) reads the change the two scans compare; a fingerprint of the tree
+#      (tracked diff against BASE plus each untracked file's md5) is taken before the scans and again before the
+#      affected run, and a tree that moved in between ends the run (rc 1) instead of narrowing on mixed content.
+#   2. Derives the scan set from HEAD's tree (`tools/recipes.py scan-set`; with `--worktree`, this tree as it is): the
+#      fewest bins of bloomery-gpu-gates whose scans cover every kernel carrier (each device lib, and each bin with
+#      kernels of its own), each with the cargo features it builds under.
 #   3. For each side in turn, BASE then HEAD: extracts the commit into DIR/src-<side>, syncs it to that side's remote
 #      dir with its own tools/box.sh, builds the set there (`cargo oxide build`, as the ptx-scan recipe does) and runs
 #      `ptx-scan.sh --no-jit` on each bin. This tree's tools/ptx-scan.sh is the scanner on both sides (the commit's
 #      own may predate --no-jit), shipped over stdin; the extractor (oxart_ptx) is the commit's.
 #   4. Splits the box's output into DIR/<side>/<bin>.log and runs
-#      `tools/affected-gates.sh BASE..HEAD --narrow --scan <base log> <head log> ...` with every pair, printing its
-#      output: the narrowed list with its why-lines, and the `recipes:` line to paste. DIR/narrowed.txt keeps it.
+#      `tools/affected-gates.sh BASE..HEAD --narrow --scan <base log> <head log> ...` (`BASE --narrow …` under
+#      `--worktree`) with every pair, printing its output: the narrowed list with its why-lines, and the `recipes:`
+#      line to paste. DIR/narrowed.txt keeps it.
 #
 # The remote dirs persist across runs (~/repo/bloomery-narrow-base and ~/repo/bloomery-narrow-head), so a second
 # run builds incrementally: the BASE side costs a sync and the scans, the HEAD side the crates the change touched.
@@ -28,7 +36,7 @@
 # contention: run again, BLOOMERY_BOX_WAIT=3600 waits longer). BLOOMERY_CARD, BLOOMERY_BOX_ENV and BLOOMERY_TIER are
 # unset for the box calls, so nothing card-related reaches the box.
 #
-# DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>) keeps: scan-set.tsv, runner.sh (the script each side
+# DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv, runner.sh (the script each side
 # runs), <side>.build.log (the box's stderr: the builds), <side>.scan.out, <side>/<bin>.log (the scan logs a landing
 # cites), narrowed.txt and MANIFEST.
 #
@@ -39,7 +47,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
-USAGE="usage: narrow-scan.sh BASE [HEAD] [--out DIR] [--dry-run] | --self-test"
+USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] | --self-test"
 
 die() { # die <rc> <message>
   echo "narrow-scan: $2" >&2
@@ -48,6 +56,18 @@ die() { # die <rc> <message>
 
 md5_of() { # md5_of <file>: the Mac has md5, the box md5sum
   if command -v md5sum > /dev/null; then md5sum "$1" | cut -d' ' -f1; else md5 -q "$1"; fi
+}
+
+# worktree_key <base sha>: a fingerprint of this tree's content against BASE: the tracked diff (binary) and each
+# untracked, not ignored file's md5 by path (git lists them in path order). Equal keys are the same content; the ignored files box.sh also syncs
+# are not in it (affected-gates reads git's view of the change too).
+worktree_key() {
+  {
+    git -C "$ROOT" diff --binary --no-renames "$1" || echo "diff failed"
+    git -C "$ROOT" ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
+      printf '%s %s\n' "$(md5_of "$ROOT/$f" 2> /dev/null || echo unreadable)" "$f"
+    done
+  } | if command -v md5sum > /dev/null; then md5sum | cut -d' ' -f1; else md5 -q; fi
 }
 
 # make_runner <scan-set.tsv> <ptx-scan.sh> <runner out>: the script a side runs on the box. It writes ptx-scan.sh to a
@@ -163,15 +183,20 @@ side_command() {
 }
 
 # run_side <name> <rev> <remote dir> <runner> <out dir> <bound s> <bin>...: one side's sync, build and scans on the box.
+# `rev` is a commit (extracted from `git archive`) or `worktree`: this tree as it is, synced by its own tools/box.sh.
 run_side() {
   local name=$1 rev=$2 dir=$3 runner=$4 out=$5 bound=$6 src rc t0 cmd
   shift 6
-  src=$out/src-$name
-  rm -rf "$src"
-  mkdir -p "$src"
-  git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"
-  rc=("${PIPESTATUS[@]}")
-  [ "${rc[0]}" = 0 ] && [ "${rc[1]}" = 0 ] || die 1 "git archive $rev failed (git ${rc[0]}, tar ${rc[1]})"
+  if [ "$rev" = worktree ]; then
+    src=$ROOT
+  else
+    src=$out/src-$name
+    rm -rf "$src"
+    mkdir -p "$src"
+    git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"
+    rc=("${PIPESTATUS[@]}")
+    [ "${rc[0]}" = 0 ] && [ "${rc[1]}" = 0 ] || die 1 "git archive $rev failed (git ${rc[0]}, tar ${rc[1]})"
+  fi
   cmd=$(side_command "$bound")
   echo "narrow-scan: $name: $rev -> $dir (bound ${bound}s)" >&2
   t0=$SECONDS
@@ -182,7 +207,7 @@ run_side() {
   ) | tee "$out/$name.build.log" >&2
   rc=${PIPESTATUS[0]}
   SIDE_WALL=$((SECONDS - t0))
-  rm -rf "$src"
+  [ "$rev" = worktree ] || rm -rf "$src"
   case $rc in
     0) ;;
     75) echo "narrow-scan: $name: rc 75: the box is held by a sitting or a lease (contention, not failure; nothing was built): run again, BLOOMERY_BOX_WAIT=3600 waits longer" >&2 ;;
@@ -253,6 +278,61 @@ self_test() {
   grep -qF "cargo oxide build --arch sm_86 -- -p $PKG --features {{FEATURES}} --release --bin {{BIN}}" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds with this runner's cargo oxide line" $?
   grep -qF "cargo build --release -p $PKG --bin oxart_ptx && bash tools/ptx-scan.sh" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds the extractor as this runner does" $?
   grep -qF "NARROW_PTX_SCAN_EOF" "$ROOT/tools/ptx-scan.sh"; [ $? = 1 ]; ok "drift: ptx-scan.sh does not hold the runner's here-document marker" $?
+  # --worktree: this script in a throwaway repository beside stub tools (no box, no card), so the whole run goes through
+  # the real argument handling, the side loop and the affected call. The box stub logs which content each side synced.
+  w=$t/wt
+  mkdir -p "$w/tools" "$t/home"
+  cp "$0" "$w/tools/narrow-scan.sh"
+  printf '%s\n' 'import os, sys' 'open(os.environ["STUB_LOG"], "a").write("recipes " + " ".join(sys.argv[1:]) + "\n")' \
+    'print("gate_x\tgpu\tbin gate_x")' > "$w/tools/recipes.py"
+  printf '#!/usr/bin/env bash\necho scan\n' > "$w/tools/ptx-scan.sh"
+  printf '#!/usr/bin/env bash\necho "affected $*" >> "$STUB_LOG"\necho "affected stub"\n' > "$w/tools/affected-gates.sh"
+  cat > "$w/tools/box.sh" <<'NARROW_STUB_EOF'
+#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")/.." && pwd)
+cat > /dev/null
+side=head
+[ "$BLOOMERY_REMOTE" = rb ] && side=base
+new=no
+[ -e "$here/new.txt" ] && new=yes
+echo "$side $BLOOMERY_REMOTE marker=$(cat "$here/marker.txt") new=$new" >> "$STUB_LOG"
+[ "$side" = head ] && [ -n "${STUB_EDIT:-}" ] && echo more >> "$here/marker.txt"
+echo '=== narrow-scan begin gate_x'
+echo 'ptx-scan: mod0 bundle=b bytes=1'
+echo '=== narrow-scan end gate_x rc=0'
+NARROW_STUB_EOF
+  chmod +x "$w/tools/"*.sh
+  git -C "$w" init -q && git -C "$w" config user.email test@test && git -C "$w" config user.name test && git -C "$w" config commit.gpgsign false
+  echo base > "$w/marker.txt"
+  git -C "$w" add -A && git -C "$w" commit -q -m base
+  wb=$(git -C "$w" rev-parse HEAD)
+  echo edited > "$w/marker.txt"
+  echo new > "$w/new.txt"
+  # wt_run <stub log> <narrow-scan args...>: the run's output in $got, its code in $rc
+  wt_run() {
+    local log=$1
+    shift
+    : > "$log"
+    got=$(HOME="$t/home" STUB_LOG="$log" NARROW_BASE_REMOTE=rb NARROW_HEAD_REMOTE=rh bash "$w/tools/narrow-scan.sh" "$@" 2>&1)
+    rc=$?
+  }
+  wt_run "$t/wt.log" "$wb" --worktree --out "$t/wt-out"
+  [ "$rc" = 0 ]; ok "worktree: the run ends rc 0" $?
+  grep -qx "head rh marker=edited new=yes" "$t/wt.log"; ok "worktree: the head side synced the edited and the untracked file" $?
+  grep -qx "base rb marker=base new=no" "$t/wt.log"; ok "worktree: the base side is BASE's commit" $?
+  grep -qx "recipes scan-set" "$t/wt.log"; ok "worktree: the scan set is read from the tree, no commit named" $?
+  grep -qx "affected $wb --narrow --scan $t/wt-out/base/gate_x.log $t/wt-out/head/gate_x.log" "$t/wt.log"; ok "worktree: affected reads the working tree against BASE with the pair" $?
+  grep -qx "head=worktree@$wb" "$t/wt-out/MANIFEST" && grep -q '^worktree_key=[0-9a-f]\{32\}$' "$t/wt-out/MANIFEST"; ok "worktree: the MANIFEST names the tree and its key" $?
+  wt_run "$t/cm.log" "$wb" "$wb" --out "$t/cm-out"
+  [ "$rc" = 0 ] && grep -qx "head rh marker=base new=no" "$t/cm.log" && grep -qx "recipes scan-set $wb" "$t/cm.log" && grep -qx "affected $wb..$wb --narrow --scan $t/cm-out/base/gate_x.log $t/cm-out/head/gate_x.log" "$t/cm.log"
+  ok "worktree: a commit head side still reads the commit, not the edit (the contrast)" $?
+  STUB_EDIT=1 wt_run "$t/edit.log" "$wb" --worktree --out "$t/edit-out"
+  [ "$rc" = 1 ] && grep -qF "the working tree changed during the run" <<< "$got"; ok "worktree: a tree edited during the run is refused by name" $?
+  wt_run "$t/arg.log" "$wb" "$wb" --worktree --out "$t/arg-out"
+  [ "$rc" = 64 ] && grep -qF -- "--worktree takes no HEAD" <<< "$got"; ok "worktree: a HEAD beside --worktree is refused rc 64 by name" $?
+  orphan=$(git -C "$w" commit-tree "$(git -C "$w" rev-parse 'HEAD^{tree}')" -m orphan)
+  wt_run "$t/anc.log" "$orphan" --worktree --out "$t/anc-out"
+  [ "$rc" = 64 ] && grep -qF "is not an ancestor of this tree's HEAD" <<< "$got" && [ ! -s "$t/anc.log" ]; ok "worktree: a BASE that is not an ancestor is refused rc 64 by name, nothing synced" $?
   # usage refusals
   for args in "" "--bogus a" "a b c" "x --out"; do
     # shellcheck disable=SC2086
@@ -273,7 +353,7 @@ if [ "${1:-}" = --self-test ]; then
   exit
 fi
 
-BASE='' HEAD_REV='' OUT='' DRY=0
+BASE='' HEAD_REV='' OUT='' DRY=0 WORKTREE=0
 while [ $# -gt 0 ]; do
   case $1 in
     --out)
@@ -282,6 +362,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --dry-run) DRY=1; shift ;;
+    --worktree) WORKTREE=1; shift ;;
     -*) die 64 "'$1' is not a flag of this tool; $USAGE" ;;
     *)
       if [ -z "$BASE" ]; then BASE=$1
@@ -293,22 +374,41 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$BASE" ] || die 64 "$USAGE"
+[ "$WORKTREE" = 0 ] || [ -z "$HEAD_REV" ] || die 64 "--worktree takes no HEAD ('$HEAD_REV'): its head side is this tree's current content; $USAGE"
 HEAD_REV=${HEAD_REV:-HEAD}
 BASE_SHA=$(git -C "$ROOT" rev-parse --verify --quiet "$BASE^{commit}") || die 64 "'$BASE' is not a commit of this repository"
 HEAD_SHA=$(git -C "$ROOT" rev-parse --verify --quiet "$HEAD_REV^{commit}") || die 64 "'$HEAD_REV' is not a commit of this repository"
-[ -n "$OUT" ] || OUT=$HOME/.cache/bloomery/narrow/$(basename "$ROOT")/${BASE_SHA:0:8}-${HEAD_SHA:0:8}
+HEAD_NAME=${HEAD_SHA:0:8}
+if [ "$WORKTREE" = 1 ]; then
+  [ "$(git -C "$ROOT" merge-base "$BASE_SHA" "$HEAD_SHA" 2> /dev/null)" = "$BASE_SHA" ] \
+    || die 64 "--worktree: '$BASE' is not an ancestor of this tree's HEAD ${HEAD_SHA:0:8}; the affected run reads the working tree against the merge base, so the base side must be that commit"
+  HEAD_NAME=worktree
+  WT_KEY0=$(worktree_key "$BASE_SHA")
+fi
+[ -n "$OUT" ] || OUT=$HOME/.cache/bloomery/narrow/$(basename "$ROOT")/${BASE_SHA:0:8}-$HEAD_NAME
 case $OUT in /*) ;; *) OUT=$PWD/$OUT ;; esac
 mkdir -p "$OUT" || die 70 "cannot make $OUT"
 BASE_DIR=${NARROW_BASE_REMOTE:-'~/repo/bloomery-narrow-base'}
 HEAD_DIR=${NARROW_HEAD_REMOTE:-'~/repo/bloomery-narrow-head'}
 BOUND=${NARROW_BOUND:-7200}
 case $BOUND in '' | *[!0-9]*) die 64 "NARROW_BOUND is whole seconds, got '$BOUND'" ;; esac
-[ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null | head -n 1)" ] || echo "narrow-scan: note: this tree has uncommitted changes; the scans read the commits ${BASE_SHA:0:8} and ${HEAD_SHA:0:8} only" >&2
+if [ "$WORKTREE" = 1 ]; then
+  HEAD_LABEL="the working tree (HEAD ${HEAD_SHA:0:8}, key $WT_KEY0)"
+  SCAN_SET_REV=()
+  AFFECTED_RANGE=$BASE_SHA
+  HEAD_SRC=worktree
+else
+  [ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null | head -n 1)" ] || echo "narrow-scan: note: this tree has uncommitted changes; the scans read the commits ${BASE_SHA:0:8} and ${HEAD_SHA:0:8} only (--worktree reads the tree)" >&2
+  HEAD_LABEL=${HEAD_SHA:0:8}
+  SCAN_SET_REV=("$HEAD_SHA")
+  AFFECTED_RANGE=$BASE_SHA..$HEAD_SHA
+  HEAD_SRC=$HEAD_SHA
+fi
 
-echo "narrow-scan: ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (no gate, no lease, no hold, no card, no gate lock: --no-jit scans); out $OUT"
-python3 "$ROOT/tools/recipes.py" scan-set "$HEAD_SHA" > "$OUT/scan-set.tsv" 2> "$OUT/scan-set.err" || {
+echo "narrow-scan: ${BASE_SHA:0:8}..$HEAD_LABEL (no gate, no lease, no hold, no card, no gate lock: --no-jit scans); out $OUT"
+python3 "$ROOT/tools/recipes.py" scan-set ${SCAN_SET_REV[@]+"${SCAN_SET_REV[@]}"} > "$OUT/scan-set.tsv" 2> "$OUT/scan-set.err" || {
   cat "$OUT/scan-set.err" >&2
-  die 2 "the scan set could not be derived from ${HEAD_SHA:0:8}"
+  die 2 "the scan set could not be derived from $HEAD_LABEL"
 }
 cat "$OUT/scan-set.err" >&2
 BINS=()
@@ -322,7 +422,7 @@ if [ "$DRY" = 1 ]; then
 fi
 
 LOCKD=$HOME/.cache/bloomery/narrow-scan.lock.d
-lock_take "$LOCKD" "${NARROW_WAIT:-1800}" "$(basename "$ROOT") ${BASE_SHA:0:8}..${HEAD_SHA:0:8} since $(date +%H:%M:%S)" || exit $?
+lock_take "$LOCKD" "${NARROW_WAIT:-1800}" "$(basename "$ROOT") ${BASE_SHA:0:8}..$HEAD_NAME since $(date +%H:%M:%S)" || exit $?
 trap 'lock_release "$LOCKD"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -330,7 +430,7 @@ trap 'exit 143' TERM
 T0=$SECONDS
 WALL_BASE=- WALL_HEAD=-
 for side in base head; do
-  if [ "$side" = base ]; then rev=$BASE_SHA dir=$BASE_DIR; else rev=$HEAD_SHA dir=$HEAD_DIR; fi
+  if [ "$side" = base ]; then rev=$BASE_SHA dir=$BASE_DIR; else rev=$HEAD_SRC dir=$HEAD_DIR; fi
   left=$((BOUND - (SECONDS - T0)))
   [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side (the base side took ${WALL_BASE}s): run again, the dirs keep their compiled crates"
   run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}" || exit $?
@@ -347,13 +447,22 @@ for b in "${BINS[@]}"; do
 done
 ARGS=()
 for b in "${BINS[@]}"; do ARGS[${#ARGS[@]}]=--scan; ARGS[${#ARGS[@]}]=$OUT/base/$b.log; ARGS[${#ARGS[@]}]=$OUT/head/$b.log; done
-"$ROOT/tools/affected-gates.sh" "$BASE_SHA..$HEAD_SHA" --narrow "${ARGS[@]}" > "$OUT/narrowed.txt" 2> "$OUT/narrowed.err"
+if [ "$WORKTREE" = 1 ]; then
+  WT_KEY1=$(worktree_key "$BASE_SHA")
+  [ "$WT_KEY1" = "$WT_KEY0" ] || die 1 "the working tree changed during the run (key $WT_KEY0 -> $WT_KEY1): the head scans and the affected list would read different content; run again with the tree still"
+fi
+"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" > "$OUT/narrowed.txt" 2> "$OUT/narrowed.err"
 arc=$?
 cat "$OUT/narrowed.txt"
 cat "$OUT/narrowed.err" >&2
 {
   echo "base=$BASE_SHA"
-  echo "head=$HEAD_SHA"
+  if [ "$WORKTREE" = 1 ]; then
+    echo "head=worktree@$HEAD_SHA"
+    echo "worktree_key=$WT_KEY1"
+  else
+    echo "head=$HEAD_SHA"
+  fi
   echo "base_dir=$BASE_DIR"
   echo "head_dir=$HEAD_DIR"
   echo "wall_base_s=$WALL_BASE"
