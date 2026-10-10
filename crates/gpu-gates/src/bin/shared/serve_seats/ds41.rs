@@ -194,8 +194,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
-    sampler_factory,
+    CacheRam, ChatSurface, Listen, Seat, SeatEngine, SlotStep, Vocab, bind_server, model_props,
+    nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -212,9 +212,8 @@ use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{Committed, Draft as RtDraft, Lookup, Speculative, Target, Want};
 use serve::flag::{CTX, number};
 use serve::{
-    CacheNote, DeviceProps, DraftProps, Drafted, EngineError, EngineProps, FATAL_LINGER,
-    PlacementProps, ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
-    StateError,
+    CacheNote, DeviceProps, DraftProps, Drafted, EngineError, EngineProps, PlacementProps,
+    ResidencyReset, Saved, ServeError, StateError,
 };
 use tokenizer::Tokenizer;
 
@@ -526,10 +525,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
     // Before anything is read or planned: a context no slot can serve.
     let ctx = slot_ctx(a.ctx, slots)?;
-    eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={ctx} total={} from={from}",
-        slots.get() * ctx
-    );
+    parallel_line(slots.get(), ctx, from, None);
     // The encoder's file is read before the plan, which reserves its bytes.
     #[cfg(feature = "vision")]
     let vision_seat = vision_of(&a, cfg.body.prefill)?;
@@ -551,16 +547,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let template = inv
-        .value("tokenizer.chat_template")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
-        .to_owned();
-    let name = inv
-        .value("general.name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("deepseek-v4.1")
-        .to_owned();
+    let ChatSurface { template, name } = ChatSurface::read(
+        &path,
+        inv.value("tokenizer.chat_template"),
+        inv.value("general.name"),
+        None,
+        "deepseek-v4.1",
+    )?;
     drop(inv);
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -628,27 +621,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         vision: None,
     };
     let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?;
-    let config = ServerConfig {
-        model_alias: a.alias.unwrap_or(name),
-        model_path: path.display().to_string(),
-        chat_template: template,
-        sampler: Some(sampler_factory()),
-        fatal_linger: FATAL_LINGER,
-        slot_save_path: a.slot_save_path,
-        api_keys: a.api_keys,
-    };
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together, no turns and no park.
-    let config_slots = SlotConfig {
-        parallel: slots.get(),
-        queue_depth: a.queue_depth,
-        ..SlotConfig::default()
-    };
-    let server = Server::bind_with(
-        (a.host.as_str(), a.port),
-        Box::new(engine),
-        config,
-        config_slots,
+    let server = bind_server(
+        engine,
+        Listen {
+            host: &a.host,
+            port: a.port,
+            alias: a.alias.unwrap_or(name),
+            path: &path,
+            template,
+            slot_save_path: a.slot_save_path,
+            api_keys: a.api_keys,
+            parallel: slots.get(),
+            queue_depth: a.queue_depth,
+        },
     )?;
     Record::new(&record::LISTENING)
         .w("place", a.place.name())
@@ -807,16 +794,9 @@ fn print_plan(
         pool_bytes,
         checkpoints_reserved(plan.machine),
     )?;
-    let gpus: Result<Vec<String>, String> = machine
-        .all_cards()
-        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
-        .collect();
-    let placement = gpus.and_then(|g| placement_props(&plan, &g));
-    if let Err(e) = &placement {
-        eprintln!("bloomery-serve-ds41: /props leaves the placement out: {e}");
-    }
+    let placement = placement_of("bloomery-serve-ds41", &machine, &plan);
     let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
-    Ok((cards.join("+"), placement.ok(), cache, pick))
+    Ok((cards.join("+"), placement, cache, pick))
 }
 
 const WHAT: &str = "bloomery-serve-ds41";

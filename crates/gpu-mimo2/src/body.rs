@@ -25,7 +25,7 @@ use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use bloomery_gpu::model::{ChainBody, StepMode, refuse_scratch_past};
+use bloomery_gpu::model::{ChainBody, Rollback, StepMode, refuse_scratch_past};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -864,5 +864,17 @@ impl TierBody for Body {
 
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)
+    }
+}
+
+impl Rollback for Body {
+    /// Nothing to take back: every layer holds its full plane of rows (a
+    /// window layer's window bounds what a query reads, not what the layer
+    /// holds), the flash never loads a key row at or past the live count
+    /// (`n_keys = pos + 1`, [`ChainBody::refresh`]), and every row below it is
+    /// written by its own step first ([`ChainBody::reset`]'s rule), so the
+    /// rows past `pos` are dead the moment the model stands at `pos`.
+    fn rollback(&mut self, _pos: u32) -> Result<(), GpuError> {
+        Ok(())
     }
 }

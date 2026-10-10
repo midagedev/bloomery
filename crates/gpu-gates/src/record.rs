@@ -2522,6 +2522,42 @@ pub static LOAD_QWEN3: Kind = Kind {
     ],
 };
 
+/// The MiMo seat's load.
+pub static LOAD_MIMO2: Kind = Kind {
+    name: "load_mimo2",
+    head: "load",
+    doc: "The MiMo seat's model on its card: its architecture, resident bytes, the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("graph_nodes", U64, ""),
+        key("pin_main", Word, ""),
+        key("pinned", Bool, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The MiMo seat's address.
+pub static LISTENING_MIMO2: Kind = Kind {
+    name: "listening_mimo2",
+    head: "bloomery-serve-mimo2:",
+    doc: "The MiMo seat's placement, the context its slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The GGUF set a `--hf` quant picked.
 pub static HF_SET: Kind = Kind {
     name: "hf_set",
@@ -2995,6 +3031,23 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &CACHE_REUSE,
     &SLOTS_ROUND,
     &SLOT_CALL,
+];
+
+/// What the MiMo seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf` fetch's lines (printed by the
+/// server before the seat registers), the plan, the load, the address and
+/// each request's note of the prefix it kept less of than it shared.
+pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
+    &PLACE_UNSET,
+    &PLAN,
+    &HF_OFFLINE,
+    &HF_SET,
+    &HF_FILE,
+    &HF_PROGRESS,
+    &HF_DONE,
+    &LOAD_MIMO2,
+    &LISTENING_MIMO2,
+    &CACHE_REUSE,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the

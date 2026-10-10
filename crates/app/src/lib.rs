@@ -204,6 +204,22 @@ pub trait Keep: ChainBody {
     fn cut(m: &mut GpuModel<Self>, n: u32) -> Result<(), GpuError>;
 }
 
+/// [`Keep::keepable`] of a body whose caches are per-position: every held
+/// position up to `n`, as [`Rollback`] takes a position back without device
+/// work.
+pub fn keep_positions<B: Rollback>(m: &GpuModel<B>, n: u32) -> u32 {
+    n.min(m.pos())
+}
+
+/// [`Keep::cut`] of the same body: back to empty at 0 — a reset; else the
+/// model's rollback.
+pub fn cut_positions<B: Rollback>(m: &mut GpuModel<B>, n: u32) -> Result<(), GpuError> {
+    match n {
+        0 => m.reset(),
+        n => m.rollback(n),
+    }
+}
+
 /// How a session opens: the placement, the context the plan is asked for,
 /// the step mode and the body's own configuration.
 pub struct OpenArgs<C, M = fn(usize) -> Machine> {
@@ -510,6 +526,18 @@ impl<B: ChainBody> Session<B> {
                 })
             }
         }
+    }
+}
+
+impl<B: Keep> Session<B> {
+    /// The server's keep query ([`Keep::kept`]): the longest prefix of at most
+    /// `n` positions a cut keeps, and the rule's sentence when it keeps less
+    /// than the session holds of them.
+    pub fn keep_query(&self, n: usize) -> (usize, Option<String>) {
+        let held = self.model.pos() as usize;
+        let k = B::kept(&self.model, u32::try_from(n).unwrap_or(u32::MAX));
+        let at = k.at as usize;
+        (at, (at < n.min(held)).then(|| k.to_string()))
     }
 }
 

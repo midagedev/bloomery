@@ -82,26 +82,26 @@ mod gate_card;
 mod e2e;
 
 #[cfg(feature = "mimo2")]
+#[path = "shared/mimo2_open.rs"]
+mod mimo2_open;
+
+#[cfg(feature = "mimo2")]
 mod gate {
-    use crate::e2e::{
-        elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, tie_numbers, word_after,
-    };
+    use crate::e2e::{elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, word_after};
+    use crate::mimo2_open::{N_VOCAB, Opened, last_argmax, open};
+    use std::path::Path;
     use std::time::Instant;
 
-    use app::arch::mimo2::Mimo2Cfg;
-    use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::flip::tie_allowed;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
-    use bloomery_gpu_mimo2::{Body, Mimo2Model, set_taps};
+    use bloomery_gpu_mimo2::{Mimo2Model, set_taps};
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::mimo2::place::PlanInputs;
     use model::arch::mimo2::program::{AttnArgs, step_launches};
     use model::arch::models::Mixer;
-    use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
@@ -110,9 +110,8 @@ mod gate {
     /// margin of whole 64 positions.
     const CTX: usize = 4160;
 
-    /// The model's width, vocabulary and layer count.
+    /// The model's width and layer count.
     const HIDDEN: usize = 4096;
-    const N_VOCAB: usize = 152_576;
     const N_LAYER: usize = 48;
 
     /// PIN(2026-10-08): the captured decode step's node count, derived before
@@ -144,84 +143,6 @@ mod gate {
     const THETA_FULL: f32 = 1.0e7;
     const THETA_WINDOW: f32 = 1.0e4;
     const V_SCALE: f32 = 0.707;
-
-    /// No band yet on a named tie's logits row against the head input's
-    /// distance (the forced arm that measures one is a later round's): the
-    /// tie is ik's runner-up inside twice our distance at the two ids, and the
-    /// row's and the last layer's distances are printed.
-    const HEAD_BAND: f64 = f64::INFINITY;
-
-    /// What the open decided besides the session: the plan's card experts a
-    /// layer.
-    struct Opened {
-        n_l: Vec<u64>,
-    }
-
-    /// The open's records, as the gate prints them.
-    struct Log {
-        t: Instant,
-        n_l: Vec<u64>,
-    }
-
-    impl OpenLog<Body> for Log {
-        fn plan(
-            &mut self,
-            place: &'static str,
-            _inputs: &PlanInputs,
-            _machine: &Machine,
-            plan: &Plan<'_>,
-        ) -> Result<bool, SessionError> {
-            println!(
-                "plan place={place} ctx_max={} host_experts={} card_experts={}",
-                plan.ctx_max, plan.host.experts, plan.cards[0].experts
-            );
-            self.n_l = plan.n_l.clone();
-            Ok(true)
-        }
-
-        fn load(&mut self, m: &Mimo2Model) -> Result<(), SessionError> {
-            println!(
-                "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
-                m.resident_bytes(),
-                m.layers().len(),
-                self.t.elapsed().as_secs_f64()
-            );
-            Ok(())
-        }
-
-        fn capture(&mut self, _nodes: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-
-        fn prompt_buffers(&mut self, _m: &Mimo2Model) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    /// The session at [`CTX`] positions on the gate placement, its prompts
-    /// fed one step an id.
-    fn open(levers: &bloomery_levers::Levers) -> Result<(Session<Body>, Opened), GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let cfg = Mimo2Cfg {
-            place: PlanLevers::from_levers(levers)?,
-            host: levers.host(),
-        };
-        let mut log = Log {
-            t: Instant::now(),
-            n_l: Vec::new(),
-        };
-        let args = OpenArgs {
-            place: "gate",
-            machine: crate::gate_card::plan_gate,
-            ctx: CTX,
-            mode: StepMode::Graph,
-            cfg,
-        };
-        let s = Loaded::<Body>::open(file, args, &mut log)?
-            .ok_or("the open stopped at its plan")?
-            .ready(&mut log)?;
-        Ok((s, Opened { n_l: log.n_l }))
-    }
 
     // ------------------------------------------------------ (s) structure
 
@@ -404,26 +325,6 @@ mod gate {
         Ok(())
     }
 
-    /// The last position's argmax against ik's: equal, or a named tie
-    /// ([`tie_allowed`], no band on the logits row). Prints the numbers; the
-    /// verdict and whether it was a tie.
-    fn last_argmax(what: &str, (ours, ik): (&[f32], &[f32]), input_rel: f64) -> (bool, bool) {
-        let (top, ik_top, ik_2, margin, dist, logits_rel) = tie_numbers(ours, ik);
-        let tie = tie_allowed(
-            (top, ik_top, ik_2),
-            (margin, dist),
-            (logits_rel, input_rel),
-            HEAD_BAND,
-        );
-        println!(
-            "{what}: argmax ours={top} ik={ik_top} (ik's runner-up {ik_2}, margin {margin:.4}, \
-             our distance at the two {dist:.4}, logits_rel {logits_rel:.3e} against the last \
-             layer's {input_rel:.3e}{})",
-            if tie { ", a named tie" } else { "" }
-        );
-        (top == ik_top || tie, tie)
-    }
-
     /// (c): the batch set's tokens as eager steps, the last position's argmax
     /// against ik's, each layer's output by position printed.
     fn free(m: &mut Mimo2Model, man: &RefManifest, toks: &[u32]) -> Result<bool, GateError> {
@@ -598,7 +499,7 @@ mod gate {
         crate::gate_card::init()?;
         let only = only()?;
         let sets = step_sets(only)?;
-        let (mut s, opened) = open(&levers)?;
+        let (mut s, opened) = open(Path::new(MODEL), &levers, CTX)?;
         let m = s.model_mut();
         let mut ok = true;
         if matches!(only, Only::All | Only::S) {

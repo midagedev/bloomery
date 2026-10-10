@@ -320,8 +320,8 @@ use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
-    placement_props, sampler_factory,
+    CacheRam, ChatSurface, Listen, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, bind_server,
+    model_props, note_line, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -349,10 +349,7 @@ use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use runtime::width::Mode as WidthMode;
-use serve::{
-    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
-    Server, ServerConfig, SlotConfig,
-};
+use serve::{CacheNote, DraftProps, Drafted, EngineProps, ResidencyReset, Saved, ServeError};
 use tokenizer::Tokenizer;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
@@ -1336,20 +1333,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let tok = Tokenizer::from_gguf(&path)?;
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let template = match &a.template_file {
-        Some(file) => std::fs::read_to_string(file)
-            .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))?,
-        None => inv
-            .value("tokenizer.chat_template")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
-            .to_owned(),
-    };
-    let name = inv
-        .value("general.name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("qwen3.8")
-        .to_owned();
+    let ChatSurface { template, name } = ChatSurface::read(
+        &path,
+        inv.value("tokenizer.chat_template"),
+        inv.value("general.name"),
+        a.template_file.as_deref(),
+        "qwen3.8",
+    )?;
     drop(inv);
     // The message start the server cuts prompt calls at, when both the
     // vocabulary and the template have it.
@@ -1617,11 +1607,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The slots the seat serves ([`Session::add_slots`]): the flag's, one
     // beside a set `--ctx-size`, or 2 — one drafted pass a slot a round,
     // nothing parked.
-    eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={} total={} from={from}",
-        rule.ctx,
-        slots * rule.ctx
-    );
+    parallel_line(slots, rule.ctx, from, None);
     if mtp {
         let be = break_even_of(a.place);
         eprintln!(
@@ -1740,17 +1726,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             route_trace38::create(dir, &inputs, &run)
         })
         .transpose()?;
-    let gpu = machine
-        .all_cards()
-        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
-        .collect::<Result<Vec<_>, _>>()
-        .and_then(|g| placement_props(&plan, &g));
-    if let Err(e) = &gpu {
-        eprintln!("bloomery-serve-qwen38: /props leaves the placement out: {e}");
-    }
     let props = EngineProps {
         model: Some(model),
-        placement: gpu.ok(),
+        placement: placement_of("bloomery-serve-qwen38", &machine, &plan),
         ctx_verified: Some(VERIFIED_POSITIONS),
         ..EngineProps::default()
     };
@@ -1788,28 +1766,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         cache.ram,
     )?;
 
-    let config = ServerConfig {
-        model_alias: a.alias.unwrap_or(name),
-        model_path: path.display().to_string(),
-        chat_template: template,
-        sampler: Some(sampler_factory()),
-        fatal_linger: FATAL_LINGER,
-        slot_save_path: a.slot_save_path,
-        api_keys: a.api_keys,
-    };
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its
     // per-slot draft), no turns and no park.
-    let config_slots = SlotConfig {
-        parallel: slots,
-        queue_depth: a.queue_depth,
-        ..SlotConfig::default()
-    };
-    let server = Server::bind_with(
-        (a.host.as_str(), a.port),
-        Box::new(engine),
-        config,
-        config_slots,
+    let server = bind_server(
+        engine,
+        Listen {
+            host: &a.host,
+            port: a.port,
+            alias: a.alias.unwrap_or(name),
+            path: &path,
+            template,
+            slot_save_path: a.slot_save_path,
+            api_keys: a.api_keys,
+            parallel: slots,
+            queue_depth: a.queue_depth,
+        },
     )?;
     Record::new(&record::LISTENING38)
         .w("place", a.place.name())
@@ -2612,10 +2584,7 @@ impl Seat for Q38 {
     /// nearest checkpoint at or below `n`, with the rule's sentence when it
     /// keeps less.
     fn keep(&self, n: usize) -> (usize, Option<String>) {
-        let pos = self.s.pos() as usize;
-        let k = self.s.kept(u32::try_from(n).unwrap_or(u32::MAX));
-        let at = k.at as usize;
-        (at, (at < n.min(pos)).then(|| k.to_string()))
+        self.s.keep_query(n)
     }
 
     /// [`Seat::keep`] under the MTP draft's break-even ([`Q38::draft_keep`]):
@@ -2720,23 +2689,6 @@ impl Seat for Q38 {
     /// A prefix kept less of than shared is a `cache reuse` record; every
     /// other note of the prompt cache prints as its line.
     fn note(note: &CacheNote) {
-        if let CacheNote::Reuse {
-            common,
-            ask,
-            kept,
-            held,
-            reason,
-        } = note
-        {
-            Record::new(&record::CACHE_REUSE)
-                .u("common", common)
-                .u("ask", ask)
-                .u("kept", kept)
-                .u("held", held)
-                .w("reason", reason.as_deref().unwrap_or("unstated"))
-                .eprint();
-            return;
-        }
-        eprintln!("bloomery-serve-qwen38: {note}");
+        note_line("bloomery-serve-qwen38", note);
     }
 }
