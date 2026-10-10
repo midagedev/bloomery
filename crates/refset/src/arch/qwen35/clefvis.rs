@@ -6,8 +6,9 @@
 //! ([`crate::clefvis::Kind`], the family's `Identity::Clefvis` with the seat's
 //! [`CLEF`] profile), so a set of one is refused by name where another is
 //! read, by [`Family::check_set`] too; the tower's sets state the projector
-//! as their model file (`# arch clip`), the prompts' sets the text model. No
-//! gate reads them yet (R1 onward), so `consumers` is empty.
+//! as their model file (`# arch clip`), the prompts' sets the text model.
+//! `gate-gpu-qwen35-media` reads sets B, C and C″; sets A and C′ have no
+//! reader yet, so their `consumers` are empty.
 
 use super::{ARCH, LCPP_BUILD, MODEL_FLASH_Q8};
 use crate::RefError;
@@ -84,7 +85,7 @@ pub static TAPS: Family = Family {
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(mmproj),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-qwen35-media"],
 };
 
 /// Set C: `result_norm` of every position of a Clef prompt with mainline's tower rows, and the positions fed.
@@ -98,7 +99,7 @@ pub static HIDDEN: Family = Family {
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-qwen35-media"],
 };
 
 /// Set C′: the same prompts with each image's rows replaced by prose-id text rows.
@@ -126,7 +127,7 @@ pub static BF16ROWS: Family = Family {
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-qwen35-media"],
 };
 
 #[cfg(test)]
