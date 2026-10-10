@@ -146,6 +146,18 @@
 //!   `hc_mix` on a row that is not finite first, so no call of the model
 //!   plants one row alone); the word left raised, a verify of two
 //!   rows is that fault and poisons the model.
+//! - (kp) prefix restore: a state of [`KP_FIRST`] + [`KP_REST`] positions
+//!   taken after two prompt calls (a point at the first call's end, inside a
+//!   pool), put back whole and cut to the point (`seq_resume`, `rollback`) and
+//!   as the point's prefix alone (`seq_resume_prefix` asked past the point),
+//!   from a model whose planes hold [`PLANE_FILL`] (`fresh`: a row the
+//!   restore did not move reads the pattern), and the prefix once more from
+//!   a state whose copy ran on a save lane (`seq_save_async`); the state's
+//!   bytes equal their derivation ([`seq38_bytes`]); each way's model stands
+//!   at the point, and after the rest's call every live row of every store
+//!   (the delta states and rings, the K/V planes, the raw and pooled keys)
+//!   and [`KP_STEPS`] steps' ids and logits are bit for bit the same, and
+//!   the unbroken run's.
 //! - (o) one owner of the position: after the prefix, a graph step, an eager
 //!   pass of three rows and a graph verify of two rows (kept whole), each
 //!   with a failure planted before its launch (`Body38::plant_before_launch`)
@@ -320,7 +332,8 @@ mod gate {
     use crate::qwen38_open::{Open38, Opened38, PlanFacts};
 
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host, TargetRows,
+        Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Seq38, Store38Host, TargetRows,
+        seq38_bytes,
     };
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::batch::HOT_COLS;
@@ -3732,6 +3745,138 @@ mod gate {
 
     // ---------------------------------------------------- (r) refusals
 
+    /// Positions of (kp)'s first prompt call: the point's, not a multiple of
+    /// [`POOL`], so the pool it ends in is partial.
+    const KP_FIRST: usize = 22;
+    /// Positions of (kp)'s second prompt call.
+    const KP_REST: usize = 19;
+    /// Steps (kp) takes after the rest's call, each reading its logits.
+    const KP_STEPS: usize = 3;
+
+    /// The ids and every step's logits as bits of [`KP_STEPS`] greedy steps.
+    type KpSteps = (Vec<u32>, Vec<Vec<u32>>);
+
+    /// One way a state is put back in (kp): the positions the restore
+    /// returned (none for a whole resume), the position the model stands at
+    /// after it, the stores after the rest's call and the steps after those.
+    type KpWay = (Option<u32>, u32, VRun, KpSteps);
+
+    /// [`KP_STEPS`] steps from `last`, each greedy.
+    fn kp_steps(m: &mut Qwen38Model, last: u32) -> Result<KpSteps, GateError> {
+        let (mut ids, mut rows) = (Vec::new(), Vec::new());
+        let mut feed = last;
+        for _ in 0..KP_STEPS {
+            feed = m.step(&[feed])?;
+            ids.push(feed);
+            rows.push(m.logits()?.iter().map(|v| v.to_bits()).collect());
+        }
+        Ok((ids, rows))
+    }
+
+    /// Every store and the PLE ring as a [`VRun`]'s, for [`live_diff`].
+    fn kp_stores(m: &mut Qwen38Model) -> Result<VRun, GateError> {
+        let (stores, ple_ring) = stores(m)?;
+        Ok(VRun {
+            tokens: Vec::new(),
+            logits: Vec::new(),
+            stores,
+            ple_ring,
+            lane: 0,
+            next: Err(String::new()),
+        })
+    }
+
+    /// (kp) (module header): a state of `ids[..KP_FIRST + KP_REST]` prompted
+    /// in two calls, so a point stands at the first call's end; saved on the
+    /// engine stream and on a lane, then put back three ways onto a model
+    /// `fresh` from a reset, each followed by the rest's call and
+    /// [`KP_STEPS`] steps from `ids`' next id. A way's refusal is its FAIL,
+    /// named.
+    fn snapshot_prefix(m: &mut Qwen38Model, ids: &[u32]) -> Result<bool, GateError> {
+        let (k, n) = (KP_FIRST, KP_FIRST + KP_REST);
+        let last = *ids.get(n).ok_or("(kp): the prefill holds too few ids")?;
+        let at = u32::try_from(k)?;
+        let ask = u32::try_from(k + 3)?;
+        m.body_parts("(kp)")?.2.set_checkpoints(true);
+        fresh(m)?;
+        m.prompt38(&ids[..k], Prompt38::Pass)?;
+        m.prompt38(&ids[k..n], Prompt38::Pass)?;
+        let state = m.seq_save()?;
+        let derived = seq38_bytes(n_gdn(), n_qsa(), n, false);
+        let lane = m.seq_lane(2 * derived)?;
+        let (on_lane, pending) = m.seq_save_async(&lane)?.map_err(GateError::from)?;
+        pending.land()?;
+        let unbroken_stores = kp_stores(m)?;
+        let unbroken = kp_steps(m, last)?;
+        // The rest's call from the restored point, then the stores and the
+        // steps: each way's cut has been applied by then, so every store
+        // stands where the unbroken run's does, the rows below the position
+        // live.
+        let landed = |m: &mut Qwen38Model, put: Option<u32>| -> Result<KpWay, GateError> {
+            let pos = m.pos();
+            m.prompt38(&ids[k..n], Prompt38::Pass)?;
+            Ok((put, pos, kp_stores(m)?, kp_steps(m, last)?))
+        };
+        let whole = (|| -> Result<KpWay, GateError> {
+            fresh(m)?;
+            m.seq_resume(&state)?;
+            m.rollback(at)?;
+            landed(m, None)
+        })();
+        let prefix_of = |m: &mut Qwen38Model, s: &Seq38| -> Result<KpWay, GateError> {
+            fresh(m)?;
+            let put = m.seq_resume_prefix(s, ask)?;
+            landed(m, Some(put))
+        };
+        let prefix = prefix_of(m, &state);
+        let from_lane = prefix_of(m, &on_lane);
+        m.body_parts("(kp)")?.2.set_checkpoints(false);
+        m.reset()?;
+        let keep = state.keep_point(ask);
+        let mut ok =
+            state.bytes() as u64 == derived && state.positions() as usize == n && keep == at;
+        let mut said = format!(
+            "a state of {} positions, {} bytes (derived {derived}), kept {keep} of {ask} asked",
+            state.positions(),
+            state.bytes()
+        );
+        for (name, way) in [
+            ("whole and cut", &whole),
+            ("prefix", &prefix),
+            ("prefix of a lane's state", &from_lane),
+        ] {
+            match way {
+                Err(e) => {
+                    ok = false;
+                    said += &format!("; {name} refused: {e}");
+                }
+                Ok((put, pos, stores, steps)) => {
+                    let (layers, ple) = live_diff(stores, &unbroken_stores, n);
+                    let good = *pos == at
+                        && put.is_none_or(|p| p == at)
+                        && steps == &unbroken
+                        && layers.is_empty()
+                        && !ple;
+                    ok &= good;
+                    said += &format!(
+                        "; {name} at {pos}{}: ids {:?} and logits the unbroken run's {}, stores \
+                         differing from it {layers:?} (PLE ring {ple}) {}",
+                        put.map_or(String::new(), |p| format!(" (returned {p})")),
+                        steps.0,
+                        steps == &unbroken,
+                        verdict(good)
+                    );
+                }
+            }
+        }
+        println!(
+            "(kp) prefix restore: {said}; every live row of every store bit for bit the \
+             unbroken run's {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     fn refusals(m: &mut Qwen38Model) -> Result<bool, GateError> {
         let mut ok = true;
         // The four paths parse; the refusal is a name none of them is,
@@ -5096,6 +5241,8 @@ mod gate {
         ok &= verify_clause(&mut m, &toks)?;
         tier::sc("(o) one owner of the position")?;
         ok &= position_owner(&mut m, &toks)?;
+        tier::sc("(kp) prefix restore = whole resume then rollback, a state from a save lane too")?;
+        ok &= snapshot_prefix(&mut m, &prefill_of(D1K)?)?;
         tier::sc("(r) refusals")?;
         ok &= refusals(&mut m)?;
         drop(m);

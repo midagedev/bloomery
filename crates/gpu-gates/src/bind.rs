@@ -2309,6 +2309,48 @@ pub fn begin<S: SeqView, D: Send + Sync + 'static>(
     Ok(Pending::new(Arc::new(cached), Arc::new(Flying(landing))))
 }
 
+/// What a seat gives [`put_back`]: the body's state and the seat's side of
+/// it as [`Cached`] holds them, and the three steps of the seat's draft that
+/// go around the body's restore.
+pub trait PutBack {
+    /// The body's sequence state, as [`Cached`] holds it.
+    type Body: SeqView;
+    /// The seat's side of a saved state (the draft's parked side, or `()`).
+    type Side: Send + Sync + 'static;
+
+    /// Refused by name unless a state whose side is `side` fits this seat: a
+    /// state saved with the draft on put back with it off, or the other way.
+    fn takes(&self, side: &Self::Side) -> Result<(), GateError>;
+    /// The session reset, and the selected slot's draft started over.
+    fn reset_selected(&mut self) -> Result<(), GateError>;
+    /// `side` back in the selected slot's draft: it joins the slot's next
+    /// call where it left, or stays off for its parked why.
+    fn unpark(&mut self, side: &Self::Side) -> Result<(), GateError>;
+}
+
+/// `state`, which a seat's [`Cached`] took (`whose` names its body), put back
+/// into the selected slot: the state's copy waited for ([`Cached::body`]), the
+/// seat's side checked ([`PutBack::takes`]), the session reset
+/// ([`PutBack::reset_selected`]), `put` run on the seat with the body's state
+/// (the model's whole or prefix restore, the positions it leaves the model
+/// at), then the seat's side put back ([`PutBack::unpark`]). Refused by name
+/// before the reset for a state another seat took or a side this seat does not
+/// take; the body's own refusals come from `put`. The positions `put` left.
+pub fn put_back<P: PutBack>(
+    seat: &mut P,
+    state: &dyn Saved,
+    whose: &str,
+    put: impl FnOnce(&mut P, &P::Body) -> Result<u32, GpuError>,
+) -> Result<usize, GateError> {
+    let saved = Cached::<P::Body, P::Side>::of(state, whose)?;
+    let body = saved.body()?;
+    seat.takes(&saved.draft)?;
+    seat.reset_selected()?;
+    let at = put(seat, body)?;
+    seat.unpark(&saved.draft)?;
+    Ok(at as usize)
+}
+
 /// The selected slot's state ([`Seat::save_state`]) written into the pipe
 /// `chunks`, on the engine thread: its last chunk sent and its end dropped
 /// before the reply, so the server's thread holds every byte when the
@@ -3374,8 +3416,8 @@ mod tests {
         use bloomery_gpu::checkpoint::staging::NoRoom;
 
         use super::super::{
-            Cached, Cmd, Extra, Landing, Link, PIPE_CHUNK, Reply, Seat, begin, begin_of,
-            restore_from, resume_of, resume_prefix_of, save_into, settle, snapshot_of,
+            Cached, Cmd, Extra, Landing, Link, PIPE_CHUNK, PutBack, Reply, Seat, begin, begin_of,
+            put_back, restore_from, resume_of, resume_prefix_of, save_into, settle, snapshot_of,
         };
         use crate::GateError;
 
@@ -3859,6 +3901,112 @@ mod tests {
 
             let own = Cached::landed(Rows(5), ());
             assert_eq!(own.body().expect("the body").positions(), 5);
+        }
+
+        /// A seat whose draft steps [`put_back`] drives, each recorded; one
+        /// of them may refuse.
+        struct Steps {
+            calls: Vec<&'static str>,
+            refuse: Option<&'static str>,
+        }
+
+        impl Steps {
+            fn step(&mut self, name: &'static str) -> Result<(), GateError> {
+                self.calls.push(name);
+                match self.refuse {
+                    Some(r) if r == name => Err(format!("{name} refused").into()),
+                    _ => Ok(()),
+                }
+            }
+        }
+
+        impl PutBack for Steps {
+            type Body = Rows;
+            type Side = u8;
+
+            fn takes(&self, _: &u8) -> Result<(), GateError> {
+                match self.refuse {
+                    Some("takes") => Err("takes refused".into()),
+                    _ => Ok(()),
+                }
+            }
+
+            fn reset_selected(&mut self) -> Result<(), GateError> {
+                self.step("reset")
+            }
+
+            fn unpark(&mut self, _: &u8) -> Result<(), GateError> {
+                self.step("unpark")
+            }
+        }
+
+        /// A put-back is the side's check, the reset, the body's restore on
+        /// the copy that landed, then the side put back, in that order; a
+        /// state of another seat, a side refused or a body refused stops it
+        /// before the next step, and the unpark is the last step of every
+        /// whole run.
+        #[test]
+        fn a_put_back_runs_its_steps_in_order_and_stops_at_a_refusal() {
+            let lane = copy();
+            let landing: Arc<dyn Landing> = lane.clone();
+            let p = begin(Ok((Rows(30), landing)), || Ok(7_u8)).expect("a begun state");
+            let run = |refuse: Option<&'static str>, put: Result<u32, GpuError>| {
+                let mut seat = Steps {
+                    calls: Vec::new(),
+                    refuse,
+                };
+                let r = put_back(&mut seat, &**p.state(), "a test body's", |s, body| {
+                    assert_eq!(body.positions(), 30);
+                    s.calls.push("put");
+                    put
+                });
+                (r, seat.calls)
+            };
+            let (r, calls) = run(None, Ok(12));
+            assert_eq!(r.expect("a put-back"), 12);
+            assert_eq!(calls, ["reset", "put", "unpark"]);
+            assert_eq!(
+                lane.lands.load(Ordering::SeqCst),
+                1,
+                "the copy is waited for"
+            );
+
+            let (r, calls) = run(Some("takes"), Ok(12));
+            assert!(r.is_err());
+            assert!(calls.is_empty(), "a refused side reached {calls:?}");
+
+            let (r, calls) = run(Some("reset"), Ok(12));
+            assert!(r.is_err());
+            assert_eq!(calls, ["reset"], "a refused reset reached the restore");
+
+            let (r, calls) = run(
+                None,
+                Err(GpuError::Shape {
+                    what: "test",
+                    detail: "no".to_owned(),
+                }),
+            );
+            assert!(r.is_err());
+            assert_eq!(
+                calls,
+                ["reset", "put"],
+                "a refused restore reached the unpark"
+            );
+
+            let (r, calls) = run(Some("unpark"), Ok(12));
+            assert!(r.is_err());
+            assert_eq!(calls, ["reset", "put", "unpark"]);
+
+            let mut seat = Steps {
+                calls: Vec::new(),
+                refuse: None,
+            };
+            let other = Cached::landed(Rows(5), 1_u16);
+            let Err(e) = put_back(&mut seat, &other, "a test body's", |_, _| Ok(5)) else {
+                panic!("a state of another seat's side was put back");
+            };
+            assert!(e.to_string().contains("not a test body's"), "{e}");
+            assert!(seat.calls.is_empty(), "{:?}", seat.calls);
         }
 
         /// `n` bytes of a pattern that repeats past no chunk boundary.
