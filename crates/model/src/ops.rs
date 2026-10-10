@@ -3192,9 +3192,10 @@ const R8_TILE_UNITS: (u64, u64) = (540, 506);
 
 /// The cost of one row-lane Q3_K group over `k` values against `ne1` columns
 /// in runs of up to [`qdot::TILE_COLS`], as `compute_groups` walks them;
-/// `None` where qdot does not run Q3_K fused.
+/// `None` where qdot has no Q3_K tile kernel ([`qdot::has_tile`]; the row-lane
+/// tile needs the same ISA), so its scalar mirror reads the group once a column.
 fn r8_tile_cost(k: usize, ne1: usize) -> Option<u64> {
-    if !qdot::supports(GgmlType::Q3_K) {
+    if !qdot::has_tile(GgmlType::Q3_K) {
         return None;
     }
     let (fixed, per_col) = R8_TILE_UNITS;

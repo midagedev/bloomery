@@ -1620,6 +1620,10 @@ fn hw_union_q6_k_down_matches_per_column() {
         "{} (k, arm) Q6_K union calls issued other than their dispatches: {miscounted:?}",
         miscounted.len()
     );
+    assert!(
+        qdot::has_lanes(GgmlType::Q6_K),
+        "the k = 10 clause: Q6_K has no row lanes on this CPU — its calls above ran by rows"
+    );
     println!(
         "PASSED: union q6_K down — the union call at k = 1, 8, 10 (the last through the row \
          lanes, its Q6_K down included) equal to experts_into bit for bit under both deferral arms \

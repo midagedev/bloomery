@@ -183,9 +183,18 @@ fn has_kernel(w: GgmlType) -> bool {
 
 /// Whether the fused path handles this weight type on this machine: the type
 /// is supported and the CPU has the required features.
+#[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn supports(w: GgmlType) -> bool {
     has_kernel(w) && has_features(w)
+}
+
+/// Off x86_64 every type with a kernel takes the fused path through its
+/// scalar mirror: the AVX2 kernels' bits, not their speed.
+#[cfg(not(target_arch = "x86_64"))]
+#[must_use]
+pub fn supports(w: GgmlType) -> bool {
+    has_kernel(w)
 }
 
 /// Whether a `k`-wide row of `w` takes the fused path: [`supports`] and the
@@ -228,7 +237,7 @@ fn has_features(w: GgmlType) -> bool {
     }
 }
 
-/// Off x86_64 no fused kernel is compiled, so no type has its ISA.
+/// Off x86_64 no AVX2 kernel is compiled, so no type has its ISA.
 #[cfg(not(target_arch = "x86_64"))]
 fn has_features(_: GgmlType) -> bool {
     false
@@ -7915,8 +7924,9 @@ unsafe fn q_nope2_cells_avx2_inner(
 /// an F32 column, in the reference's float-kernel order (`mul_mat_Qx_Qy_MxN`,
 /// iqk_gemm_floats.cpp): one eight-lane accumulator — the first block a plain
 /// multiply, every later block `fmadd(y, x, acc)` — then `hsum_float_8` (upper
-/// half onto lower, `movehl`, `movehdup`). `None` when the CPU lacks AVX2+FMA or
-/// `k` is not a multiple of 8; the caller keeps its scalar loop for that.
+/// half onto lower, `movehl`, `movehdup`). Without AVX2+FMA the same lanes run
+/// one value at a time, `mul_add` for each fused add: the same bits. `None`
+/// when `k` is 0 or not a multiple of 8; the caller keeps its scalar loop for that.
 pub fn dot_f32(wrow: &[u8], x: &[f32]) -> Option<f32> {
     assert_eq!(
         wrow.len(),
@@ -7932,7 +7942,19 @@ pub fn dot_f32(wrow: &[u8], x: &[f32]) -> Option<f32> {
         // SAFETY: the features were just detected; lengths checked above.
         return Some(unsafe { dot_f32_avx2(wrow, x) });
     }
-    None
+    if x.is_empty() || !x.len().is_multiple_of(8) {
+        return None;
+    }
+    let (w, _) = wrow.as_chunks::<4>();
+    let w = |i: usize| f32::from_le_bytes(w[i]);
+    let mut acc: [f32; 8] = std::array::from_fn(|l| x[l] * w(l));
+    for i in 1..x.len() / 8 {
+        for (l, a) in acc.iter_mut().enumerate() {
+            *a = x[i * 8 + l].mul_add(w(i * 8 + l), *a);
+        }
+    }
+    let s: [f32; 4] = std::array::from_fn(|l| acc[l] + acc[l + 4]);
+    Some((s[0] + s[2]) + (s[1] + s[3]))
 }
 
 /// # Safety
@@ -8013,7 +8035,8 @@ unsafe fn sum_sq_f64_avx2(x: &[f32]) -> f64 {
 /// `ggml_v_silu` ported lane for lane (`x / (1 + exp(-x))`, then `* up`), so the
 /// result tracks ik's bits rather than libm's. A tail shorter than eight goes
 /// through the same lanes on a padded copy — an element's value never depends on
-/// where in the block it sits. Falls back to the scalar libm form without AVX2+FMA.
+/// where in the block it sits. Without AVX2+FMA one lane at a time, `v_expf` as
+/// [`expf_ik_scalar`]: the same bits.
 pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     assert!(gate.len() == up.len() && gate.len() == out.len());
     #[cfg(target_arch = "x86_64")]
@@ -8023,7 +8046,7 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
         return;
     }
     for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
-        *o = g / (1.0 + (-g).exp()) * u;
+        *o = g / (1.0 + expf_ik_scalar(0.0 - g)) * u;
     }
 }
 
@@ -8046,7 +8069,7 @@ pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
             return;
         }
         for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
-            let s = g / (1.0 + (-g).exp());
+            let s = g / (1.0 + expf_ik_scalar(0.0 - g));
             let s = if limit < s { limit } else { s };
             let c = if u < limit { u } else { limit };
             let c = if -limit < c { c } else { -limit };
