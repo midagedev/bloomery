@@ -1302,7 +1302,7 @@ mod tests {
     /// printed (an observation, not a timing: no lease holds the machine).
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_a_qwen3_shaped_state_begins_in_a_call_and_copies_in_one_call_a_store() {
+    fn hw_held_a_qwen3_shaped_state_begins_in_a_call_and_copies_in_one_call_a_store() {
         use std::time::Instant;
         const STORES: usize = 96;
         const HEAD: usize = 128;
@@ -1413,7 +1413,7 @@ mod tests {
     /// slot by name; after, the bytes are whole and the slot is free.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_a_points_host_copy_runs_on_the_lane_and_its_slot_waits_for_it() {
+    fn hw_held_a_points_host_copy_runs_on_the_lane_and_its_slot_waits_for_it() {
         use std::time::Instant;
         const ONE: usize = 45 << 20;
         const AT: usize = 16;
