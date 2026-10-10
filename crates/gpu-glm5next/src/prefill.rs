@@ -21,7 +21,7 @@
 //! between two marks into batches of at most [`T_MAX`] positions
 //! ([`call_batches`]), and each mark's checkpoint is taken where the steps
 //! take it, so a cut keeps the same points after either feed. The call's
-//! batches run in groups of [`set_prefill_group`]'s size (`place::groups`: a
+//! batches run in groups of [`set_prefill_group`]'s size ([`runtime::prompt::groups`]: a
 //! lone last batch joins the group before it); a group is one walk of the
 //! runtime's layer schedule at the point `(G, T, Batch)`
 //! ([`runtime::sched::walk`]), one unit a batch, through the host tier's
@@ -96,10 +96,10 @@ use std::ops::Range;
 use std::time::Instant;
 
 use bloomery_gpu::checkpoint::{Checkpoints, Pending};
-use bloomery_gpu::fault::read_cards;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::served::read_fault;
 use bloomery_gpu::kpool;
 use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for};
 use bloomery_gpu::linear::conv::KdaConvArgs;
@@ -121,9 +121,15 @@ use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{self, FrontWidths};
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
+pub use runtime::prompt::PrefillMode;
+use runtime::prompt::{
+    GROUP_LEVER, call_end, check_group, chunks, end_of, group_sets, groups,
+    refuse_dense_after_routed,
+};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use runtime::swaprule::KeptRows;
 
+use super::WHAT as BODY;
 use super::nextn::GlmArena;
 use super::{
     Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape, weight,
@@ -151,34 +157,6 @@ const _: () = assert!(CHUNK == HC_MAX_TOKENS);
 /// projection, a dense block): a batch of at most a chunk
 /// runs them as the step's gemv does, so it writes the step's bits.
 pub const GEMM_FROM: usize = CHUNK + 1;
-
-/// How a prompt is fed: in batches ([`prefill`]) or one decode step per id
-/// ([`prompt`]) — the same-binary arm, which is the decode step and not a
-/// second implementation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefillMode {
-    Batch,
-    Steps,
-}
-
-impl PrefillMode {
-    /// The mode [`PrefillMode::name`] names; `None` for any other word.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<PrefillMode> {
-        [PrefillMode::Batch, PrefillMode::Steps]
-            .into_iter()
-            .find(|m| m.name() == name)
-    }
-
-    /// The name a `load` line prints and `--prefill` takes.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            PrefillMode::Batch => "batch",
-            PrefillMode::Steps => "steps",
-        }
-    }
-}
 
 /// The body's prompt feed: its mode, the batches a group runs, the batch's
 /// buffers once a batch feed made them, the unit a sink reads, whether a
@@ -744,34 +722,13 @@ fn kv_width(d: &Dims) -> usize {
     LATENT + 2 * d.index_d
 }
 
-/// The chunks of a batch of `t` tokens: runs of [`CHUNK`] from its first,
-/// the last one shorter; `(first token, tokens)` each.
-fn chunks(t: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..t).step_by(CHUNK).map(move |c0| (c0, CHUNK.min(t - c0)))
-}
-
 /// The batches of a call from `from` to `to` whose checkpoint marks are
-/// `marks` ([`bloomery_gpu::checkpoint::Checkpoints::marks`]): each run between two marks cut into
-/// `⌈len / T_MAX⌉` batches of near-equal size, the first ones a position
-/// longer. Each layer reads every host expert its batch's tokens route to
-/// once, so a short last batch would pay that read for few tokens.
+/// `marks` ([`bloomery_gpu::checkpoint::Checkpoints::marks`]): each run
+/// between two marks cut by [`runtime::prompt::call_batches`] at [`T_MAX`]
+/// positions.
 #[must_use]
 pub fn call_batches(from: u32, to: u32, marks: &[u32]) -> Vec<Range<u32>> {
-    let t_max = u32::try_from(T_MAX).expect("T_MAX is the host union's column count");
-    let mut out = Vec::new();
-    let mut at = from;
-    for &mark in marks.iter().filter(|&&k| k > from && k <= to) {
-        let len = mark - at;
-        let k = len.div_ceil(t_max);
-        let mut p = at;
-        for j in 0..k {
-            let n = len / k + u32::from(j < len % k);
-            out.push(p..p + n);
-            p += n;
-        }
-        at = mark;
-    }
-    out
+    runtime::prompt::call_batches(from, to, marks, T_MAX)
 }
 
 /// The batches a call of `n` ids from the model's position runs
@@ -779,18 +736,9 @@ pub fn call_batches(from: u32, to: u32, marks: &[u32]) -> Vec<Range<u32>> {
 /// counts as its passes.
 pub fn batches_of(m: &Glm5nextModel, n: usize) -> Result<Vec<Range<u32>>, GpuError> {
     let from = m.pos();
-    let to = end_of(from, n)?;
+    let to = end_of(from, n).map_err(|r| shape(r.to_string()))?;
     let marks = m.body(WHAT)?.ckpt.marks(from, to);
     Ok(call_batches(from, to, &marks))
-}
-
-/// The call's end, `from + n`, refused by name for no id or past `u32`.
-fn end_of(from: u32, n: usize) -> Result<u32, GpuError> {
-    u32::try_from(n)
-        .ok()
-        .and_then(|n| from.checked_add(n))
-        .filter(|&to| to > from)
-        .ok_or_else(|| shape(format!("a prompt of {n} ids from {from}")))
 }
 
 /// The call of `ids` from the model's position, refused by name before
@@ -801,17 +749,8 @@ fn check_call(m: &Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
     if let Some(fault) = m.poisoned() {
         return Err(GpuError::Poisoned { what: WHAT, fault });
     }
-    let from = m.pos();
-    let to = end_of(from, ids.len())?;
     let ctx = m.body(WHAT)?.ctx;
-    if to as usize > ctx {
-        return Err(shape(format!(
-            "a prompt of {} ids from position {from} ends at {to}, past the {ctx} positions the \
-             stores hold (the load's ctx)",
-            ids.len()
-        )));
-    }
-    Ok(to)
+    call_end(m.pos(), ids.len(), ctx).map_err(|r| shape(r.to_string()))
 }
 
 /// Feed `ids` from where `m` stands by the body's mode ([`set_prefill`]) and
@@ -883,7 +822,7 @@ fn steps_with(
     sink: &mut GlmPromptSink<'_>,
 ) -> Result<u32, GpuError> {
     let from = m.pos();
-    let to = end_of(from, ids.len())?;
+    let to = end_of(from, ids.len()).map_err(|r| shape(r.to_string()))?;
     let marks = m.body(WHAT)?.ckpt.marks(from, to);
     let mut argmax = None;
     let mut at = from;
@@ -928,14 +867,14 @@ pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, Gpu
 }
 
 /// The batches a prompt group of `m` runs layer by layer: `g` consecutive
-/// batches of a call walked as one group ([`place::groups`]: a lone last
+/// batches of a call walked as one group ([`runtime::prompt::groups`]: a lone last
 /// batch joins the group before it), each layer-batch's front enqueued
 /// ahead of the previous one's host serve; 1 runs each batch alone, and
 /// every `g` writes the same bits. Refused by name inside a call, for a `g`
 /// outside 1 to the lever's most, and for a `g` of 2 or more on a load whose
 /// dense layers do not all come before its routed ones. When the batch's
 /// buffers are made and hold fewer units than `g` needs
-/// ([`place::group_sets`]), the units it lacks and the timing's marks are
+/// ([`runtime::prompt::group_sets`]), the units it lacks and the timing's marks are
 /// made here, between calls. Returns whether it made any.
 pub fn set_prefill_group(m: &mut Glm5nextModel, g: usize) -> Result<bool, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
@@ -944,13 +883,11 @@ pub fn set_prefill_group(m: &mut Glm5nextModel, g: usize) -> Result<bool, GpuErr
             "a prompt group of {g} batches set inside a prompt call"
         )));
     }
-    if !(1..=GROUP_MAX).contains(&g) {
-        return Err(GpuError::Shape {
-            what: "BLOOMERY_PREFILL_GROUP",
-            detail: format!("{g} batches, where a group holds 1 to {GROUP_MAX}"),
-        });
-    }
-    refuse_dense_after_routed(&body.cfg, g)?;
+    check_group(g, GROUP_MAX).map_err(|r| GpuError::Shape {
+        what: GROUP_LEVER,
+        detail: r.to_string(),
+    })?;
+    refuse_late_dense(&body.cfg, g)?;
     body.prompt.group = g;
     let made = body.grow_units(gpu)?;
     Ok(made)
@@ -972,7 +909,7 @@ pub fn set_prompt_stats(m: &mut Glm5nextModel, on: bool) -> Result<(), GpuError>
         Some(PromptTiming::new(
             gpu.context(),
             body.cfg.len(),
-            place::group_sets(body.prompt.group),
+            group_sets(body.prompt.group),
         )?)
     } else {
         None
@@ -1027,23 +964,10 @@ pub fn prompt_bytes(m: &Glm5nextModel) -> Result<Option<PromptBytes>, GpuError> 
 const GROUP_MAX: usize = bloomery_levers::PREFILL_GROUP_MAX as usize;
 const _: () = assert!(GROUP_MAX as u64 == bloomery_levers::PREFILL_GROUP_MAX);
 
-/// Refused by name for a group of 2 or more on a load with a dense layer
-/// past a routed one: a dense front writes the shared buffers the previous
-/// routed item's back still reads (the shared-buffer rule holds only for a
-/// dense prefix).
-fn refuse_dense_after_routed(cfg: &[super::LayerCfg], g: usize) -> Result<(), GpuError> {
-    if g < 2 {
-        return Ok(());
-    }
-    let first_routed = cfg.iter().position(|c| c.kind.host_leg());
-    let late_dense = first_routed.and_then(|r| (r..cfg.len()).find(|&l| !cfg[l].kind.host_leg()));
-    match late_dense {
-        Some(l) => Err(shape(format!(
-            "a prompt group of {g} batches on a load whose dense layer {l} comes after a routed \
-             one: a group's units share buffers only behind a dense prefix"
-        ))),
-        None => Ok(()),
-    }
+/// [`refuse_dense_after_routed`] over `cfg`'s layers, as this crate's error.
+fn refuse_late_dense(cfg: &[super::LayerCfg], g: usize) -> Result<(), GpuError> {
+    refuse_dense_after_routed(cfg.iter().map(|c| c.kind.host_leg()), g)
+        .map_err(|r| shape(r.to_string()))
 }
 
 /// Feed `ids` from where `m` stands in batches (module doc) and return the
@@ -1127,7 +1051,7 @@ fn call_groups(
         body.timed_checkpoint(gpu, from)?;
     }
     let mut argmax = None;
-    for gr in place::groups(batches.len(), group) {
+    for gr in groups(batches.len(), group) {
         let runs = &batches[gr];
         let (Some(first), Some(end)) = (runs.first(), runs.last()) else {
             continue;
@@ -1440,7 +1364,7 @@ impl Body {
     }
 
     /// The batch feed's buffers — the shared ones and a set for each unit a
-    /// group of the body's size holds ([`place::group_sets`]) — the host
+    /// group of the body's size holds ([`runtime::prompt::group_sets`]) — the host
     /// tier's batch sets for as many tokens and the host union's slabs, made
     /// once. Refused by name for a group of 2 or more on a load with a dense
     /// layer past a routed one.
@@ -1448,7 +1372,7 @@ impl Body {
         if self.prompt.batch.is_some() {
             return Ok(());
         }
-        refuse_dense_after_routed(&self.cfg, self.prompt.group)?;
+        refuse_late_dense(&self.cfg, self.prompt.group)?;
         let ff = self.cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let dense_ff = self
             .cfg
@@ -1461,8 +1385,8 @@ impl Body {
         let cap = T_MAX.min(self.ctx);
         let tiered = self.card.tier().is_some();
         let bufs = Bufs::new(gpu, &self.dims, [ff, dense_ff, expert_ff], self.ctx, cap)?;
-        self.refuse_unreserved(gpu, place::group_sets(self.prompt.group) - 1)?;
-        let units = (0..place::group_sets(self.prompt.group))
+        self.refuse_unreserved(gpu, group_sets(self.prompt.group) - 1)?;
+        let units = (0..group_sets(self.prompt.group))
             .map(|_| UnitBufs::new(gpu, self.dims.embd, cap, tiered))
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * self.dims.embd)?;
@@ -1498,12 +1422,12 @@ impl Body {
         )))
     }
 
-    /// The units the body's group needs ([`place::group_sets`]) that the
+    /// The units the body's group needs ([`runtime::prompt::group_sets`]) that the
     /// batch's buffers lack, made, and the timing's marks remade for as
     /// many: between calls only. Nothing before the buffers are made, or
     /// when they hold enough. Returns whether it made any.
     fn grow_units(&mut self, gpu: &Gpu) -> Result<bool, GpuError> {
-        let need = place::group_sets(self.prompt.group);
+        let need = group_sets(self.prompt.group);
         let more = self
             .prompt
             .batch
@@ -1695,37 +1619,11 @@ impl Body {
             prog.head(head)?;
         }
         let t0 = timing.as_ref().map(|_| Instant::now());
-        let read = read_fault(gpu, hybrid, last);
+        let read = read_fault(WHAT, gpu, hybrid, last);
         if let (Some(t0), Some(t)) = (t0, timing.as_mut()) {
             t.add_fault(nanos(t0.elapsed()));
         }
         read
-    }
-}
-
-/// The fault word after a group's walk: a fault the group raised on the
-/// expert tier is the call's error, as the stage card's is (the first layer
-/// wins); `None` without a tier. The last group's stage word rides the
-/// head's readback ([`bloomery_gpu::GpuModel::run_rows`]), so it returns
-/// that the head was enqueued; an inner group reads both words here.
-fn read_fault(
-    gpu: &Gpu,
-    hybrid: &mut bloomery_gpu::hybrid::Hybrid<HostRun>,
-    last: bool,
-) -> Result<bool, GpuError> {
-    let tier = hybrid.tier_fault()?;
-    if last {
-        return match tier {
-            Some(t) => Err(GpuError::fault(
-                WHAT,
-                read_cards(&[gpu.fault()?, Some(t)]).unwrap_or(t),
-            )),
-            None => Ok(true),
-        };
-    }
-    match read_cards(&[gpu.fault()?, tier]) {
-        Some(fault) => Err(GpuError::fault(WHAT, fault)),
-        None => Ok(false),
     }
 }
 
@@ -1743,31 +1641,6 @@ fn kda_store_index(stores: &[Store]) -> Vec<Option<usize>> {
             Store::Latent { .. } => None,
         })
         .collect()
-}
-
-/// `y = W · x` for the q8_0 weight `name` over `c` token columns of `x`,
-/// token-major into `y` (`q8_0_gemv_mcol`: each column the one-column
-/// gemv's bits).
-fn mcol(
-    gpu: &Gpu,
-    w: &Weights,
-    name: &str,
-    x: &DeviceBuffer<f32>,
-    c: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let (qs, d) = q8(w, name)?;
-    gpu.q8f32().enqueue_q8_0_gemv_mcol(
-        gpu.stream(),
-        Q8_0GemvMcolArgs {
-            qs,
-            d,
-            x,
-            m: c,
-            out: GemvOut::TokenMajor,
-            y,
-        },
-    )
 }
 
 /// Rows `rows` of a resident q8_0 weight as a weight of their own: both
@@ -1985,38 +1858,38 @@ impl PromptProgram<'_> {
                 },
             )?;
         }
-        for (c0, c) in chunks(t) {
+        for (c0, c) in chunks(t, CHUNK) {
             let xs = span(W, &b.xn, c0 * n, c * n)?;
             if !gemm {
-                mcol(
+                w.q8_gemv_mcol(
                     gpu,
-                    w,
+                    BODY,
                     &nm.qkv,
                     &xs,
                     c,
                     &mut *span_mut(W, &mut b.qkv, c0 * ch, c * ch)?,
                 )?;
             }
-            mcol(
+            w.q8_gemv_mcol(
                 gpu,
-                w,
+                BODY,
                 &nm.f_a,
                 &xs,
                 c,
                 &mut *span_mut(W, &mut b.fa, c0 * head, c * head)?,
             )?;
             if !gemm {
-                mcol(
+                w.q8_gemv_mcol(
                     gpu,
-                    w,
+                    BODY,
                     &nm.g_a,
                     &xs,
                     c,
                     &mut *span_mut(W, &mut b.ga, c0 * head, c * head)?,
                 )?;
-                mcol(
+                w.q8_gemv_mcol(
                     gpu,
-                    w,
+                    BODY,
                     &nm.beta,
                     &xs,
                     c,
@@ -2024,9 +1897,9 @@ impl PromptProgram<'_> {
                 )?;
             }
             let fa = span(W, &b.fa, c0 * head, c * head)?;
-            mcol(
+            w.q8_gemv_mcol(
                 gpu,
-                w,
+                BODY,
                 &nm.f_b,
                 &fa,
                 c,
@@ -2034,9 +1907,9 @@ impl PromptProgram<'_> {
             )?;
             if !gemm {
                 let ga = span(W, &b.ga, c0 * head, c * head)?;
-                mcol(
+                w.q8_gemv_mcol(
                     gpu,
-                    w,
+                    BODY,
                     &nm.g_b,
                     &ga,
                     c,
@@ -2106,11 +1979,11 @@ impl PromptProgram<'_> {
         if gemm {
             return b.front.kda_out(gpu, w, l, t, &b.gated, &nm.out, &mut b.out);
         }
-        for (c0, c) in chunks(t) {
+        for (c0, c) in chunks(t, CHUNK) {
             let gs = span(W, &b.gated, c0 * v, c * v)?;
-            mcol(
+            w.q8_gemv_mcol(
                 gpu,
-                w,
+                BODY,
                 &nm.out,
                 &gs,
                 c,
@@ -2178,7 +2051,7 @@ impl PromptProgram<'_> {
             let (qs, dd) = q8(w, &nm.stack)?;
             let qa_rows = RowWindow::of(qs, dd, 0..ql)?;
             let kv_rows = RowWindow::of(qs, dd, ql..ql + kvw)?;
-            for (c0, c) in chunks(t) {
+            for (c0, c) in chunks(t, CHUNK) {
                 let xs = span(W, &b.xn, c0 * n, c * n)?;
                 for (win, y, width) in [(&qa_rows, &mut b.qa, ql), (&kv_rows, &mut b.kv, kvw)] {
                     gpu.q8f32().enqueue_q8_0_gemv_mcol(
@@ -2261,12 +2134,12 @@ impl PromptProgram<'_> {
         };
         let (q, av) = b.front.heads_rows();
         let r = (|| -> Result<(), GpuError> {
-            for (c0, c) in chunks(t) {
+            for (c0, c) in chunks(t, CHUNK) {
                 let qr = span(W, &b.qr, c0 * ql, c * ql)?;
                 if !gemm {
-                    mcol(
+                    w.q8_gemv_mcol(
                         gpu,
-                        w,
+                        BODY,
                         &nm.q_b,
                         &qr,
                         c,
@@ -2356,9 +2229,9 @@ impl PromptProgram<'_> {
                     },
                 )?;
                 if !gemm {
-                    mcol(
+                    w.q8_gemv_mcol(
                         gpu,
-                        w,
+                        BODY,
                         &nm.out,
                         &*span(W, av, c0 * hv, c * hv)?,
                         c,
@@ -2410,15 +2283,15 @@ impl PromptProgram<'_> {
             );
         }
         let (g, u) = (weight(w, gate)?, weight(w, up)?);
-        for (c0, cn) in chunks(t) {
+        for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.xn, c0 * n, cn * n)?;
             self.p
                 .k
                 .experts
                 .enqueue_shexp_gate_up_mcol(stream, g, u, &xs, cn, c.limit, &mut b.h)?;
-            mcol(
+            w.q8_gemv_mcol(
                 gpu,
-                w,
+                BODY,
                 down,
                 &b.h,
                 cn,
@@ -2567,15 +2440,15 @@ impl PromptProgram<'_> {
         }
         let nm = ffn::moe_names(&self.p, l)?;
         let (g, u) = (weight(w, nm.sh_gate)?, weight(w, nm.sh_up)?);
-        for (c0, cn) in chunks(t) {
+        for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.normed, c0 * n, cn * n)?;
             self.p
                 .k
                 .experts
                 .enqueue_shexp_gate_up_mcol(stream, g, u, &xs, cn, c.limit, &mut b.h)?;
-            mcol(
+            w.q8_gemv_mcol(
                 gpu,
-                w,
+                BODY,
                 nm.sh_down,
                 &b.h,
                 cn,

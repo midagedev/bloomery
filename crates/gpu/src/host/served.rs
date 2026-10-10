@@ -13,6 +13,7 @@ use runtime::swaprule::KeptRows;
 
 use crate::Gpu;
 use crate::GpuError;
+use crate::fault::read_cards;
 use crate::host::HostExperts;
 use crate::host::PassKind;
 use crate::host::swap::{BoundaryAt, ResetReport};
@@ -139,5 +140,34 @@ impl<B: TierBody> HostServed for B {
             }) => glue.start(hybrid, gpu.context(), gpu.stream(), Arc::clone(slots)),
             None => Ok(()),
         }
+    }
+}
+
+/// The fault word after a prompt group's walk on a body with a host tier: a
+/// fault the group raised on the expert tier is the call's error, as the
+/// stage card's is (the first layer wins), named `what`; `Ok(false)` for a
+/// group with none. The last group's stage word rides the head's readback
+/// ([`crate::GpuModel::run_rows`]), so with `last` it returns that the head
+/// was enqueued and reads only the tier's word; an inner group reads both
+/// words here.
+pub fn read_fault<E: HostExperts>(
+    what: &'static str,
+    gpu: &Gpu,
+    hybrid: &mut Hybrid<E>,
+    last: bool,
+) -> Result<bool, GpuError> {
+    let tier = hybrid.tier_fault()?;
+    if last {
+        return match tier {
+            Some(t) => Err(GpuError::fault(
+                what,
+                read_cards(&[gpu.fault()?, Some(t)]).unwrap_or(t),
+            )),
+            None => Ok(true),
+        };
+    }
+    match read_cards(&[gpu.fault()?, tier]) {
+        Some(fault) => Err(GpuError::fault(what, fault)),
+        None => Ok(false),
     }
 }

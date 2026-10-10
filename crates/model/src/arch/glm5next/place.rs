@@ -12,6 +12,7 @@
 use bloomery_placement::slots::{SeqTerms, SlotsOf, Stores};
 use gguf::{GgmlType, Split};
 use models::ModelSpec;
+use runtime::prompt::group_sets;
 use runtime::stores;
 
 use super::hparams::{Hparams, Kind};
@@ -211,7 +212,7 @@ pub fn card_tile_bytes(n: usize, ff: usize, used: usize, cap: usize) -> usize {
 /// prompt batch at `ctx_max` positions: its GEMM front
 /// ([`prompt_front_bytes`]), the card experts' grouped scratch
 /// ([`card_tile_bytes`] at the front's columns) and the units a group of
-/// [`PROMPT_GROUP`] holds past the first ([`group_sets`], [`unit_bytes`] at
+/// [`PROMPT_GROUP`] holds past the first ([`runtime::prompt::group_sets`], [`unit_bytes`] at
 /// the front's columns, the tier places when `tiered`). The first unit and
 /// the other buffers the units share come out of the card's margin.
 #[must_use]
@@ -220,35 +221,6 @@ pub fn prompt_reserve_bytes(hp: &Hparams, ctx_max: u64, tiered: bool) -> u64 {
     let unit = unit_bytes(hp.n_embd, cols, hp.hc.streams, hp.n_used, tiered);
     let tiles = card_tile_bytes(hp.n_embd, hp.expert_ff, hp.n_used, cols);
     prompt_front_bytes(hp, ctx_max) + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
-}
-
-/// Batches a prompt group holds at most under a group lever of `g`
-/// (`BLOOMERY_PREFILL_GROUP`): `g`, and one more from 2 on — a call's lone
-/// last batch joins the group before it ([`groups`]). The prompt batch's
-/// per-unit buffers are made for this many.
-#[must_use]
-pub const fn group_sets(g: usize) -> usize {
-    if g >= 2 { g + 1 } else { 1 }
-}
-
-/// The groups of a call of `k` batches under a lever of `g`: runs of `g`
-/// consecutive batches, where a lone last batch joins the run before it —
-/// a group of one runs no route under another batch's union. A call of one
-/// batch is one group of one.
-#[must_use]
-pub fn groups(k: usize, g: usize) -> Vec<std::ops::Range<usize>> {
-    let g = g.max(1);
-    let mut out: Vec<std::ops::Range<usize>> =
-        (0..k).step_by(g).map(|s| s..(s + g).min(k)).collect();
-    if g >= 2
-        && out.len() >= 2
-        && out.last().is_some_and(|r| r.len() == 1)
-        && let Some(tail) = out.pop()
-        && let Some(prev) = out.last_mut()
-    {
-        prev.end = tail.end;
-    }
-    out
 }
 
 /// What a plan of a glm5next file is made from, read from its headers.
@@ -1069,7 +1041,7 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 mod tests {
     use super::{
         KdaLanes, Kind, KvBytes, KvLayout, NEXTN_ARENA_BYTES, NextnKv, PROMPT_GROUP, PlaceError,
-        card_tile_bytes, group_sets, groups, recurrent_bytes, refusal_text, row_bytes, seq_terms,
+        card_tile_bytes, group_sets, recurrent_bytes, refusal_text, row_bytes, seq_terms,
         stage_term, unit_bytes,
     };
     use crate::placement::Violation;
@@ -1126,36 +1098,6 @@ mod tests {
             refusal_text(&past, Some(1 << 20), 20_000, 1),
             past.to_string()
         );
-    }
-
-    /// A call's batches cut into groups: runs of `g`, a lone last batch
-    /// joining the run before it (never at a lever of 1, never a call of one
-    /// batch), and no group past `group_sets(g)` batches.
-    #[test]
-    fn groups_join_a_lone_last_batch() {
-        assert_eq!(groups(1, 2), vec![0..1]);
-        assert_eq!(groups(2, 2), vec![0..2]);
-        assert_eq!(groups(3, 2), vec![0..3]);
-        assert_eq!(groups(5, 2), vec![0..2, 2..5]);
-        assert_eq!(groups(4, 2), vec![0..2, 2..4]);
-        assert_eq!(groups(5, 4), vec![0..5]);
-        assert_eq!(groups(6, 4), vec![0..4, 4..6]);
-        assert_eq!(groups(3, 1), vec![0..1, 1..2, 2..3]);
-        assert_eq!(groups(0, 2), Vec::<std::ops::Range<usize>>::new());
-        assert_eq!((group_sets(1), group_sets(2), group_sets(8)), (1, 3, 9));
-        for g in 1..=8 {
-            for k in 1..=20 {
-                let cut = groups(k, g);
-                assert_eq!(cut.first().map(|r| r.start), Some(0));
-                assert_eq!(cut.last().map(|r| r.end), Some(k));
-                assert!(cut.windows(2).all(|w| w[0].end == w[1].start));
-                assert!(
-                    cut.iter()
-                        .all(|r| !r.is_empty() && r.len() <= group_sets(g)),
-                    "{k} batches at {g}: {cut:?}"
-                );
-            }
-        }
     }
 
     /// A prompt group unit at GLM-5.3-Flash's sizes (4,096 values, four

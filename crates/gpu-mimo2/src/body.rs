@@ -6,8 +6,11 @@
 //! Each layer is a GQA attention over a full plane of the stores' positions —
 //! its window bounds what a query reads, not what the layer holds — and a
 //! block; the step is [`crate::program`]'s walk, one token at a time (there is
-//! no pass of several rows, no draft and no resident slot). The embedding is a
-//! host row, dequantized per step and copied into `x` before the launch.
+//! no verify pass of several rows, no draft and no resident slot). A prompt is
+//! fed by that step an id or in batches of up to a union's columns
+//! ([`prefill`]), which leave the model in the same state bit for bit. The
+//! embedding is a host row, dequantized per step and copied into `x` before
+//! the launch.
 //!
 //! What the load refuses, by name: a plan of other than one card with no
 //! expert tier, a plan that puts a routed expert on a card, a description
@@ -46,6 +49,10 @@ use runtime::layer::{FfnKind, Layer, ResidualKind, hosted};
 use crate::attn::{AttnNames, checked_sinks};
 use crate::ffn::{FfnNames, routed_layers};
 use crate::program;
+
+#[path = "prefill.rs"]
+pub mod prefill;
+use prefill::PromptState;
 
 /// What the body's errors name.
 pub(crate) const WHAT: &str = "mimo2 Body";
@@ -255,6 +262,13 @@ impl Embedding {
         self.table.row_into(token, &mut self.row)?;
         Ok(())
     }
+
+    /// Row `token`, dequantized into `row` (one row of `n_embd` values);
+    /// refused as [`Embedding::fill`] refuses.
+    fn fill_into(&self, token: u32, row: &mut [f32]) -> Result<(), GpuError> {
+        self.table.row_into(token, row)?;
+        Ok(())
+    }
 }
 
 /// One step's host values: its position.
@@ -284,6 +298,8 @@ pub struct Body {
     taps: Option<Vec<DeviceBuffer<f32>>>,
     /// Positions every store holds.
     ctx: usize,
+    /// How a prompt is fed, and the batch feed's buffers.
+    prompt: PromptState,
 }
 
 /// The walk's parts, lent apart from the host tier.
@@ -638,6 +654,7 @@ impl Body {
             embd,
             taps: None,
             ctx,
+            prompt: PromptState::new(),
         };
         refuse_scratch_past(
             WHAT,
@@ -830,6 +847,7 @@ impl ChainBody for Body {
     fn resident_bytes(&self) -> usize {
         self.store_bytes()
             + self.scratch_bytes()
+            + self.prompt.bytes()
             + self
                 .taps
                 .as_ref()
