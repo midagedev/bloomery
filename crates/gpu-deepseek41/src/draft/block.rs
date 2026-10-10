@@ -47,6 +47,7 @@
 
 use std::mem::size_of;
 
+use bloomery_gpu::mxfp4_sel::{DownArgs, GateUpArgs, MxAct, MxExpertKernels, concat_route};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -61,10 +62,7 @@ use super::stage::{Inbox, put_f32};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
 use crate::chain::glue::glue_kernels;
 use crate::experts::ExpertKernels;
-use crate::experts_mxfp4::{
-    DownArgs, DraftExpertKernels, DraftRouterOut, GateUpArgs, MxAct, N_EXPERT, N_USED, RouterArgs,
-    concat_route,
-};
+use crate::experts_mxfp4::{DraftRouterKernels, DraftRouterOut, N_EXPERT, N_USED, RouterArgs};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels, HcPostArgs};
 use crate::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
 use crate::rope::{Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape};
@@ -285,7 +283,8 @@ struct Kernels {
     rope: RopeKernels,
     hc: HcKernels,
     hc_f32: HcF32Kernels,
-    dflash: DraftExpertKernels,
+    dflash: DraftRouterKernels,
+    mx: MxExpertKernels,
     experts: ExpertKernels,
 }
 
@@ -538,9 +537,9 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
     };
     let n_slots = N_USED * m;
     let act_x = &mut b.act_x[m - 1];
-    cx.k.dflash
+    cx.k.mx
         .enqueue_quantize(s, &b.normed_f, act_x, cx.gpu.unlabelled_sink())?;
-    cx.k.dflash.enqueue_gate_up(
+    cx.k.mx.enqueue_gate_up(
         s,
         &GateUpArgs {
             gate: &ex.gate,
@@ -554,9 +553,9 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
         &mut b.h,
     )?;
     let act_h = &mut b.act_h[m - 1];
-    cx.k.dflash
+    cx.k.mx
         .enqueue_quantize(s, &b.h, act_h, cx.gpu.unlabelled_sink())?;
-    cx.k.dflash.enqueue_down(
+    cx.k.mx.enqueue_down(
         s,
         &DownArgs {
             down: &ex.down,
@@ -817,7 +816,8 @@ impl BlockPass {
                 rope: RopeKernels::load(ctx)?,
                 hc: HcKernels::load(ctx)?,
                 hc_f32: HcF32Kernels::load(ctx)?,
-                dflash: DraftExpertKernels::load(ctx)?,
+                dflash: DraftRouterKernels::load(ctx)?,
+                mx: MxExpertKernels::load(ctx)?,
                 experts: ExpertKernels::load(ctx)?,
             },
             table: RopeTable::new(&RopeSpec::window(hp.rope_base, hp.rope_dims))?,
