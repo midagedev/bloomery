@@ -8,21 +8,38 @@
 //! the snapshot's `joint_head.safetensors` with its `joint_head_config.json` ([`CLEF_HEAD`]). The head
 //! in llama.cpp's Clef layout, the same release's weights as bartowski's GGUF carries them
 //! ([`CLEF_LAYOUT_GGUF`]), is held to the release's: tensor by tensor, and through the logits.
+//!
+//! The release's encoding of requests that carry images is set D, `$BLOOMERY_DATA/clefvis/ref/`
+//! (`tools/ref/clef_ref.py images`, driven by `just dump-ref-clefvis --ref-d`): `images.jsonl` and,
+//! from the same run, `reference.jsonl`. The requests are `tools/ref/clefvis/requests.jsonl`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use decision::answer::{answer, probabilities};
-use decision::encode::{Encoded, EncodedQuestion, MAX_LENGTH, encode};
+use decision::encode::{Encoded, EncodedQuestion, MAX_LENGTH, encode, encode_media};
 use decision::gguf_head::GgufHead;
 use decision::head::{ClefHead, SCALARS, Weights};
 use decision::json::{self, Json};
 use decision::render::render;
 use decision::request::{Kind, Request};
+use vision::arch::qwen3vl::{Media, SizeRule, TokenLimits};
+
+fn data_root() -> PathBuf {
+    PathBuf::from(std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into()))
+}
 
 fn data() -> PathBuf {
-    PathBuf::from(std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into()))
-        .join("clef/flash")
+    data_root().join("clef/flash")
+}
+
+/// Set D's directory (`tools/ref/clefvis/profile.sh`'s `REF`).
+fn images_dir() -> PathBuf {
+    data_root().join("clefvis/ref")
+}
+
+fn clefvis_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/clefvis")
 }
 
 fn requests_dir() -> PathBuf {
@@ -101,7 +118,20 @@ fn reference_encoding(row: &Json) -> Encoded {
                 .collect(),
         })
         .collect();
-    Encoded { ids, questions }
+    let image_spans = row.get("image_spans").map_or_else(Vec::new, |spans| {
+        array(spans)
+            .iter()
+            .map(|s| {
+                let (start, len) = span(s);
+                (start, start + len)
+            })
+            .collect()
+    });
+    Encoded {
+        ids,
+        questions,
+        image_spans,
+    }
 }
 
 fn requests() -> HashMap<String, Json> {
@@ -155,6 +185,113 @@ fn hw_clef_ids_equal_the_release() {
             got.ids.len(),
             want.ids.len(),
             got.questions == want.questions,
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            bad.push(id);
+        }
+    }
+    assert!(bad.is_empty(), "encodings differ from the release: {bad:?}");
+}
+
+/// The snapshot revision the release's runs are made at: the recipe's own `REVISION`.
+fn release_revision() -> String {
+    let path = clefvis_dir().join("clefvis.sh");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines()
+        .find_map(|l| l.strip_prefix("REVISION="))
+        .unwrap_or_else(|| panic!("{}: no REVISION line", path.display()))
+        .to_string()
+}
+
+/// A request of `requests.jsonl` as our reader takes it: each image stem a data URL (the encoder
+/// reads no pixels, so the URL carries the stem) and a `state_tokens` request's state the one the
+/// release rendered, which its own filler made.
+fn image_request(sent: &Json, state_render: &str) -> Json {
+    let Json::Object(pairs) = sent else {
+        panic!("a request is an object")
+    };
+    let mut out = Vec::new();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "images" => out.push((
+                k.clone(),
+                Json::Array(
+                    array(v)
+                        .iter()
+                        .map(|stem| {
+                            let stem = stem.as_str().expect("an image stem");
+                            Json::Str(format!("data:image/png;base64,{stem}"))
+                        })
+                        .collect(),
+                ),
+            )),
+            "state_tokens" => out.push(("state".to_string(), Json::Str(state_render.to_string()))),
+            _ => out.push((k.clone(), v.clone())),
+        }
+    }
+    Json::Object(out)
+}
+
+/// images: our encoder, given each image's token count from the release's grid, gives set D's
+/// `input_ids`, question spans and image-pad spans exactly, request by request.
+///
+/// Set D has no identity of its own (`images.jsonl` states no revision and no trailer), so the
+/// clause holds it to what the same run left beside it: `reference.jsonl` names the release's
+/// revision, the recipe's, and carries the same `input_ids` for every request.
+#[test]
+#[ignore = "needs set D under $BLOOMERY_DATA/clefvis/ref and the Flash GGUF; just gate-decision-clef"]
+fn hw_clef_image_ids_equal_the_release() {
+    let dir = images_dir();
+    let rows = jsonl(&dir.join("images.jsonl"));
+    let reference = jsonl(&dir.join("reference.jsonl"));
+    let sent: HashMap<String, Json> = jsonl(&clefvis_dir().join("requests.jsonl"))
+        .into_iter()
+        .map(|r| (id_of(&r), r))
+        .collect();
+    assert_eq!(rows.len(), sent.len(), "a row of set D per request");
+    let revision = release_revision();
+    // The encoder reads the media description's placeholder and pad id; the size rule is not read.
+    let media = Media::new(SizeRule::new(16, 2, TokenLimits::DEFAULT).expect("a size rule"));
+    let tok =
+        tokenizer::Tokenizer::from_gguf(CLEF_GGUF).unwrap_or_else(|e| panic!("{CLEF_GGUF}: {e}"));
+    let mut bad = Vec::new();
+    for row in &rows {
+        let id = id_of(row);
+        let pair = reference
+            .iter()
+            .find(|r| id_of(r) == id)
+            .unwrap_or_else(|| panic!("{id}: no row in reference.jsonl beside images.jsonl"));
+        let facts = pair.get("facts").expect("reference rows carry facts");
+        let state_render = row.get("state_render").and_then(Json::as_str).unwrap();
+        let body = sent
+            .get(&id)
+            .unwrap_or_else(|| panic!("{id}: not in requests.jsonl"));
+        let req = Request::from_json(&image_request(body, state_render)).unwrap();
+        let want = reference_encoding(row);
+        // The release's own counts: a grid (t, h, w) is t·h·w / 4 merged tokens; its pad runs say the same.
+        let counts: Vec<usize> = array(row.get("image_grid_thw").unwrap())
+            .iter()
+            .map(|g| {
+                let g = array(g);
+                usize_of(&g[0]) * usize_of(&g[1]) * usize_of(&g[2]) / 4
+            })
+            .collect();
+        let runs: Vec<usize> = want.image_spans.iter().map(|s| s.1 - s.0).collect();
+        let got = encode_media(&tok, &req, &media, &counts, MAX_LENGTH).unwrap();
+        let provenance = facts.get("revision").and_then(Json::as_str) == Some(revision.as_str())
+            && pair.get("input_ids") == row.get("input_ids")
+            && counts == runs;
+        let render_ok = render(&req.state) == state_render;
+        let first = got.ids.iter().zip(&want.ids).position(|(a, b)| a != b);
+        let ok = got == want && render_ok && provenance;
+        println!(
+            "images {id}: n={} ref_n={} first_diff={first:?} spans_equal={} image_spans_equal={} counts={counts:?} \
+             render_equal={render_ok} provenance={provenance} {}",
+            got.ids.len(),
+            want.ids.len(),
+            got.questions == want.questions,
+            got.image_spans == want.image_spans,
             if ok { "PASS" } else { "FAIL" }
         );
         if !ok {

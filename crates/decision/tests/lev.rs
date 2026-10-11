@@ -527,6 +527,15 @@ fn lev_policy() {
         r#"q/noul/I/{"i": -7, "n": 1.23457e+29}/[A false null][B true null]/0"#
     );
 
+    // The label model reads text only: a request that carries an image is a 501 by name.
+    let image = request(
+        r#"{"state":"s","images":["data:image/png;base64,AA=="],"questions":{"q":{"type":"noul","instructions":"I"}}}"#,
+    );
+    assert!(matches!(
+        m.plan(&image),
+        Err(decision::Error::NotSupported(_))
+    ));
+
     // More options than labels, and a vocabulary with too few labels, are refused by name.
     let ten = model_of(labels_of(10), template, Temperatures::default());
     let wide = request(&format!(

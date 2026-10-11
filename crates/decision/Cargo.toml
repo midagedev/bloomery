@@ -24,6 +24,7 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 bloomery-jinja = { path = "../jinja" }
 bloomery-tokenizer = { path = "../tokenizer" }
+bloomery-vision = { path = "../vision" }
 # The label models' prompt templates take serde_json values (the jinja crate's input). `preserve_order`
 # keeps an object's keys in the order they were built in; no other feature is wanted here (the request
 # reader in `json` is ours, for exact integers).
