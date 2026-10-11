@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--no-canary]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it)
@@ -193,6 +193,17 @@
 # than the wait costs the lane nothing beyond its own items; a hold, or a sitting that starts after
 # the probe, is the stolen item's own box.sh guard, as it is for every item. --lanes 1 steals
 # nothing.
+# Canary (staticwire, 2026-10-11: a half-applied change failed deep into a landing batch): a recipe that carries
+# `[group('canary')]` — gate-ptx-spill and the lib-test gate of a device crate (gate-gpu-lib, gate-gpu-gates-lib,
+# gate-gpu-ds41-lib): the gates that turn red from a half-applied change in the first minutes — runs FIRST in its lane,
+# ahead of the lane's other items, and the first canary item that ends red (any rc but 0 or a round batch's yield) stops
+# the batch: the lanes and every running item are signalled as for INT/TERM, and the batch ends rc 1 with
+# `DONE total=<n> red=<n> canary=red <item>[,<item>] unrun=<n> wall=<s>s` (unrun: the items no line records, killed
+# or never started; a box process a killed item left behind is `just box-gc`'s). The canary items are the batch's own
+# items (one run, one times row, one ledger record each, a ledger skip passes at 0 s); the lanes and the balance are
+# unchanged, so a green stage costs nothing and no lane waits for the other's canary item. A canary item on a lane
+# class of its own (solo, solo-real, v41-load) is a named error. `--no-canary` runs the batch with no stage, as
+# before; a green batch's DONE line is unchanged either way. The dry run prints the stage first.
 # --lanes 1 runs every item in the
 # list's order in one lane (labelled A), with no card forced — the recipes' own defaults, as a hand
 # batch runs them.
@@ -391,7 +402,7 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # BLOOMERY_PACK_BUDGET overrides it (bytes, a positive integer; the self-test's numbers).
 PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] | --classes | --self-test"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -773,6 +784,15 @@ rf-q4:
 # A box command that only branches on the tier: no `exit 66`, so no inline guard (the inline-guard cases below plant one).
 tg-branch:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'if [ "${BLOOMERY_TIER:-real}" = fixture ]; then echo fixture-arm; else echo real-arm; fi && bash tools/gpu-gate.sh gen_tb'
+
+# The canary stage's cases (the header's «Canary»): one canary recipe fixed to lane A (device code, no gate lock), one balanced.
+[group('canary')]
+cn-red:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p cr'
+
+[group('canary')]
+cn-ok:
+    ./tools/box.sh 'bash tools/gate.sh -p co'
 JF
   # The pack's resource table: a row per solo/solo-real recipe of the fixture justfile above (a
   # recipe the justfile does not hold — sr-arm arrives in a case below — is ignored), and the pack
@@ -2421,6 +2441,55 @@ IG
     *) fail 'disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>' "the dry run says: $out" ;;
   esac
   [ ! -e "$h/home-dry" ] || fail "the dry run created its OUT tree under $h/home-dry"
+  # The canary stage (the header's «Canary»). The dry run says it first, names the canary items, and runs them ahead of the lane's
+  # other items; --no-canary and a list with no canary item say so.
+  out=$("${gb[@]}" --dry-run host plain-any cn-ok cn-red 2>&1) || fail 'canary: the dry run failed' "$out"
+  got=$(grep -A1 '^gate-batch: dry run — ' <<< "$out" | tail -1)
+  if [ "$got" = 'gate-batch: canary stage: cn-red,cn-ok run first in their lanes; the first one that ends red stops the batch (DONE canary=red); --no-canary runs without the stage' ]; then
+    pass 'canary: the dry run prints the stage right after its header, naming the canary items'
+  else fail 'canary: the dry run prints the stage right after its header, naming the canary items' "the line after the header is: $got"; fi
+  got=$(printf '%s\n' "$out" | sed -n 's/^lane [AB]  \([^ ]*\) .*/\1/p' | tr '\n' ' ')
+  case $got in
+    'cn-red cn-ok '* | 'cn-ok cn-red '*) pass 'canary: the canary items head the run order' ;;
+    *) fail 'canary: the canary items head the run order' "got '$got'" ;;
+  esac
+  check 'canary: --no-canary says the stage is off' 0 '^gate-batch: canary stage: off \(--no-canary\)$' "${gb[@]}" --dry-run --no-canary cn-red host
+  check 'canary: a list with no canary item says there is no stage' 0 '^gate-batch: canary stage: none — no item of the list that runs carries' "${gb[@]}" --dry-run host plain-any
+  printf '%s\n' '' "[group('canary')]" "[group('solo')]" 'cn-solo:' "    ./tools/box.sh 'bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'canary: a canary recipe in a class of its own is a named error' 65 "recipe cn-solo: \[group\('canary'\)\] with \[group\('solo'\)\] — a canary runs first in lane A or B" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  # A red canary item stops the batch: lane A's canary item ends rc 1 at once while lane B's item would hold 6 s. The DONE line names
+  # the canary item and counts the unrun one, the batch ends rc 1, and the other lane's item records nothing.
+  rc=$(steal_case cn-red "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any@FAKE_SLEEP=6	B	a6000	6	$d" -- 'cn-red@FAKE_RC=1' 'plain-any@FAKE_SLEEP=6')
+  printf '%s' "$rc" > "$t/rc-cn-red"
+  if [ "$rc" = 1 ]; then pass 'canary: a red canary item ends the batch rc 1'; else fail 'canary: a red canary item ends the batch rc 1' "rc=$rc"; fi
+  want 'canary: the DONE line names the canary item and the unrun count' "$t/target/c-cn-red/run.log" '^DONE total=2 red=1 canary=red cn-red unrun=1 wall=[0-9]+s$'
+  want_not 'canary: the other lane'"'"'s item recorded nothing' "$t/target/c-cn-red/run.log" '^plain-any rc='
+  want 'canary: the red item is named on stdout' "$t/out-cn-red.log" '^red: cn-red  '
+  # Without the hook (a mutant) the same batch runs the other item to its end: the case above sees the stage, not the clock.
+  mutant_of canary-nohook 's|^  if \[ "\$CANARY" = 1 \] \&\& \[ -z "\$yowner" \].*$|  true # MUTANT canary-nohook|' '# MUTANT canary-nohook$'
+  rc=$(MTAG=canary-nohook steal_case cn-redm "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any@FAKE_SLEEP=2	B	a6000	2	$d" -- 'cn-red@FAKE_RC=1' 'plain-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-cn-redm"
+  want 'canary mutant: without the hook the other lane'"'"'s item runs' "$t/target/c-cn-redm/run.log" '^plain-any rc=0 '
+  want_not 'canary mutant: … and no canary DONE' "$t/target/c-cn-redm/run.log" 'canary=red'
+  # --no-canary runs the same list as before the stage: both items record, red=1, no canary token.
+  rc=$(steal_case cn-off "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any@FAKE_SLEEP=2	B	a6000	2	$d" -- --no-canary 'cn-red@FAKE_RC=1' 'plain-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-cn-off"
+  if [ "$rc" = 1 ]; then pass 'canary: --no-canary leaves a red canary item an ordinary red (rc 1)'; else fail 'canary: --no-canary leaves a red canary item an ordinary red (rc 1)' "rc=$rc"; fi
+  want 'canary: --no-canary: both items record, the DONE line has no canary token' "$t/target/c-cn-off/run.log" '^DONE total=2 red=1 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s$'
+  want 'canary: --no-canary: the other lane'"'"'s item ran' "$t/target/c-cn-off/run.log" '^plain-any rc=0 '
+  # A green stage costs nothing: one lane (--lanes 1) runs the canary item first although the balance would not, and the DONE line is
+  # the unchanged green one.
+  rc=$(steal_case cn-green "plain-any	A	3090	10	$d" "cn-ok	A	none	1	$d" -- --lanes 1 plain-any cn-ok)
+  printf '%s' "$rc" > "$t/rc-cn-green"
+  rc_ok 'canary: a green stage ends green' cn-green 2
+  want_row 'canary: … the canary item ran first' "$t/fake-state/box.log" '$2 ~ /gate\.sh/ { if (++c == 1 && $2 ~ /gate\.sh -p co$/) print "first" }'
+  want 'canary: … and the DONE line carries no canary token' "$t/target/c-cn-green/run.log" '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=0s$'
+  # A canary item the ledger skips passes at 0 s and stops nothing.
+  rc=$(FAKE_SKIP=1 steal_case cn-skip "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any	B	a6000	6	$d" -- 'cn-red@FAKE_RC=1' plain-any)
+  printf '%s' "$rc" > "$t/rc-cn-skip"
+  rc_ok 'canary: a canary item the ledger skips ends the batch green' cn-skip 2
+  want 'canary: … and the run says no canary item runs' "$t/out-cn-skip.log" '^gate-batch: canary stage: none — no item of the list that runs'
   echo "gate-batch self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -2432,6 +2501,7 @@ if [ "${1:-}" = --self-test ]; then
   exit $?
 fi
 OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0
+CANARY=1
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -2450,6 +2520,7 @@ while [ $# -gt 0 ]; do
     --no-gpu-hold) NOHOLD=1; shift ;;
     --rerun) RERUN=1; shift ;;
     --over-budget-ok) BUDGET_OK=1; shift ;;
+    --no-canary) CANARY=0; shift ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
     --tier) [ $# -ge 2 ] || die "--tier needs real or fixture; $USAGE"
@@ -2820,6 +2891,7 @@ GROUPS = {
     "host": "balanced over lanes A and B, no card forced: device-crate tests that open no card",
     "pool": "never beside a chain item: its host tier spins a worker pool on the cores a big load's pool is pinned to",
     "big-host": "never beside a chain item: it locks or allocates more host memory than fits beside a chain item's host set",
+    "canary": "first in its lane, and a red one stops the batch (the header's «Canary»); it changes no placement",
 }
 unknown = [
     f"recipe {n}: [group({a['group']!r})] is not a group this runner knows ({', '.join(GROUPS)}) — "
@@ -3041,6 +3113,20 @@ if pb_bad:
     for e in pb_bad:
         print("gate-batch: " + e, file=sys.stderr)
     fail(f"{len(pb_bad)} pool/big-host recipe(s) the class could not hold; nothing ran")
+
+# canary (the header's «Canary»): the item runs first in lane A or B, so a recipe whose class places it elsewhere (solo,
+# solo-real: lane X; v41-load: the chain) cannot be one.
+cn_bad = []
+for n in sorted(recipes):
+    if {"group": "canary"} not in recipes[n]["attributes"]:
+        continue
+    why = [f"[group('{g}')]" for g in ("solo", "solo-real", "v41-load") if group_of(n, g)]
+    if why:
+        cn_bad.append(f"recipe {n}: [group('canary')] with {' and '.join(why)} — a canary runs first in lane A or B, and that class places it elsewhere")
+if cn_bad:
+    for e in cn_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(cn_bad)} canary recipe(s) the class could not place; nothing ran")
 
 
 # CHAIN_SOLO_REAL (the shell constant above): the solo-real recipes that join the chain. A name the
@@ -3511,7 +3597,7 @@ if src == "classes":
             print("\t".join([name, lane, "timed" if lane == "T" else "refused", "-", reason]))
         else:
             cls, kind, cards, labels = placement(name, lane, "2")
-            tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host", "pool", "big-host") for n in group_of(name, g)]
+            tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host", "pool", "big-host", "canary") for n in group_of(name, g)]
             tags += defer_tags(name)
             if cls == "C":
                 cards = labels  # a chain member's candidates are its labels (a pick forces no card)
@@ -3589,7 +3675,7 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} hands {b} {flag}, the arm of the solo recipe {solo_n} — it runs alone in "
                       f"lane X with what that recipe sets around it; list {solo_n} instead")
         continue
-    tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host", "pool", "big-host") for n in group_of(name, g)]
+    tags = [f"{n}: [group('{g}')]" for g in ("solo", "solo-real", "v41-load", "host", "pool", "big-host", "canary") for n in group_of(name, g)]
     tags += defer_tags(name)
     if tags:
         reason = "; ".join(tags + [reason])
@@ -3619,10 +3705,10 @@ for item, at in zip(raw_items, where):
         budget_over.append(f"{shown or name}={exp}s>past-0.75xBLOOMERY_GATE_BOUND={calls[0][1]}s")
     elif len(calls) != 1 or calls[0][1] < 0:
         budget_unchecked.append(shown or name)
-    # The neighbour tags (pool, big-host) the run-time rule reads, and the family of a chain member
+    # The tags (pool, big-host: the neighbour rule's; canary: the stage's) the run-time rules read, and the family of a chain member
     # (class C: the chain's order is by family). The pack's resource field (X items only): the
     # table's flags and host bytes, read by the shell side's driver and PYBAL's pack simulation.
-    held = " ".join(g for g in ("pool", "big-host") if group_of(name, g))
+    held = " ".join(g for g in ("pool", "big-host", "canary") if group_of(name, g))
     # The fields below are the shell side's REC_FIELDS, in this order.
     out.append("\x1f".join([cls, stem, name, " ".join(envs), qargs, shown, reason, kind, str(exp), esrc, tkey, " ".join(cards), " ".join(labels),
                             family(name) if cls in ("X", "C") else "", held,
@@ -4038,6 +4124,7 @@ P_CI=() P_KEY=() P_LST=() P_LDET=() P_TAG=() P_SIM=() # the candidate taken, its
 P_FAM=()
 for ((i = 0; i < ${#CHAIN_ORDER[@]}; i++)); do P_FAM[${CHAIN_ORDER[$i]}]=${CHAIN_FAMS[$i]}; done
 SUM_A=0 SUM_B=0 SUM_X=0 SUM_C=0 SUM_W=0 SUM_NDEF=0 SUM_DEF=''
+canary_of() { case " ${P_TAG[$1]:-} " in *' canary '*) return 0 ;; *) return 1 ;; esac; } # $1 = plan index: the recipe carries [group('canary')]
 
 box_env_of() { # the item's full BLOOMERY_BOX_ENV: the caller's, then the item's and the lane's
   local e="${BLOOMERY_BOX_ENV:-}"
@@ -4174,6 +4261,25 @@ if [ "$LEDGER" = 1 ]; then
 fi
 balance
 for ((i = 0; i < N; i++)); do [ "${P_LST[$i]}" != skip ] || SKIP_N=$((SKIP_N + 1)); done
+# The canary stage (the header's «Canary»): the canary items of lanes A and B move to the front of the run order, each lane's
+# own order otherwise as the balance made it; CANARY_RUN lists the ones that will run (a ledger skip passes at 0 s).
+CANARY_IDX=() CANARY_RUN=''
+if [ "$CANARY" = 1 ]; then
+  cn_front=() cn_rest=()
+  for i in ${ORDER[@]+"${ORDER[@]}"}; do
+    if canary_of "$i" && { [ "${P_LANE[$i]}" = A ] || [ "${P_LANE[$i]}" = B ]; }; then cn_front+=("$i"); else cn_rest+=("$i"); fi
+  done
+  ORDER=(${cn_front[@]+"${cn_front[@]}"} ${cn_rest[@]+"${cn_rest[@]}"})
+  CANARY_IDX=(${cn_front[@]+"${cn_front[@]}"})
+  for i in ${CANARY_IDX[@]+"${CANARY_IDX[@]}"}; do
+    [ "${P_LST[$i]}" = skip ] || CANARY_RUN="${CANARY_RUN:+$CANARY_RUN,}${P_STEM[$i]}"
+  done
+fi
+canary_say() { # the stage's one line: the dry run's first and the run's second
+  if [ "$CANARY" = 0 ]; then echo "gate-batch: canary stage: off (--no-canary)"
+  elif [ -z "$CANARY_RUN" ]; then echo "gate-batch: canary stage: none — no item of the list that runs carries [group('canary')] in lane A or B"
+  else echo "gate-batch: canary stage: $CANARY_RUN run first in their lanes; the first one that ends red stops the batch (DONE canary=red); --no-canary runs without the stage"; fi
+}
 if [ "$LEDGER" = 1 ]; then
   echo "gate-batch: ledger: reads $LEAD_LEDGER${ALSO_READ:+ and $ALSO_READ}, writes $LEDGER_FILE: $SKIP_N of $N items skip"
 fi
@@ -4286,19 +4392,39 @@ chain_feeds() { # $1 = lane: some chain member's candidates include this lane's 
   return 1
 }
 
+canary_done() { # a canary item ended red (DIR/canary.red names it): the batch's last act, after stop() signalled the lanes
+  local stems recorded red unrun line
+  stems=$(awk '{ printf "%s%s", (NR > 1 ? "," : ""), $1 }' "$OUT/canary.red")
+  recorded=$(grep -c ' rc=' "$RUNLOG" || true)
+  red=$(grep ' rc=' "$RUNLOG" | grep -v ' rc=0 ' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | grep -vc ' rc=yield ' || true)
+  unrun=$((NT - recorded))
+  line="DONE total=$NT red=$red canary=red $stems unrun=$unrun wall=$(($(date +%s) - T0))s"
+  echo "$line" >> "$RUNLOG"
+  echo "$line"
+  grep ' rc=' "$RUNLOG" | grep -v ' rc=0 ' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | grep -v ' rc=yield ' |
+    while read -r stem _; do echo "red: $stem  $OUT/g-$stem.log"; done
+}
+
 stop() {
   local f
+  trap '' INT TERM # a second canary item ending red meanwhile signals this shell again
   board_event stop
   # The lanes first, so none starts its next item, then the items they were running.
   for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
     if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
   done
+  if [ -s "$OUT/canary.red" ]; then
+    canary_done
+    echo "gate-batch: stopped by a red canary item (above); a box process a killed item left behind is cleared by 'just box-gc'; --no-canary runs the batch without the stage" >&2
+    exit 1
+  fi
   echo "gate-batch: stopped; a box process a killed item left behind is cleared by 'just box-gc'" >&2
   exit 130
 }
 
 if [ "$DRY" = 1 ]; then
   echo "gate-batch: dry run — $N items$DEFER_NOTE, lanes $LANES, logs would go to $OUT"
+  canary_say
   [ "${#BUDGET_OVER[@]}" = 0 ] || echo "gate-batch: budget: ${#BUDGET_OVER[@]} item(s) past 0.75x the bound that kills them (a real run refuses them, 65, unless --over-budget-ok): ${BUDGET_OVER[*]}"
   [ "${#BUDGET_UNCHECKED[@]}" = 0 ] || echo "gate-batch: budget: ${#BUDGET_UNCHECKED[@]} item(s) unchecked (no single bounded call, or a bound the text does not spell): ${BUDGET_UNCHECKED[*]}"
   if [ "${#CHAIN_ORDER[@]}" -gt 0 ]; then
@@ -4379,6 +4505,7 @@ fi
 
 # run.log exists from here on (a refused start leaves none, so the same --out can be retried).
 : > "$RUNLOG"
+rm -f "$OUT/canary.red" # a retried --out holds no earlier run's stop
 mkdir -p "$OUT/claims" # one claim per item: the owner's start and the thief's steal agree on it
 T0=$(date +%s)
 echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" >> "$RUNLOG"
@@ -4386,6 +4513,8 @@ BOARD_FILE=$BOARD_DIR/batch/$(basename "$OUT").jsonl
 board_event start total="$NT" tier="$TIER" lanes="$LANES" mode="${LMODE:-none}" predicted_wall="$SUM_W" \
   tree="$(basename "$ROOT")" branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2> /dev/null || echo unknown)"
 echo "gate-batch: $N items$DEFER_NOTE, lanes $LANES, logs in $OUT"
+canary_say
+MAIN_PID=$$ # canary_red signals this shell from a lane's subshell
 predicted
 for ((i = 0; i < ND; i++)); do # a deferred item is recorded at once: the batch never calls it (nothing to time, key or claim)
   line="${DP_STEM[$i]} rc=deferred ${DP_KIND[$i]} lane=- deferred=1"
@@ -4488,6 +4617,14 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   echo "$line" >> "$RUNLOG"
   board_event item name="${P_STEM[$i]}" rc="$rcl" secs="$s" lane="$lane"
   echo "$line"
+  # A red canary item stops the batch (the header's «Canary»): the main shell's TERM trap (stop) signals the lanes and ends the run.
+  if [ "$CANARY" = 1 ] && [ -z "$yowner" ] && [ "$rc" != 0 ] && canary_of "$i"; then canary_red "$i" "$rc"; fi
+}
+
+canary_red() { # $1 = plan index, $2 = rc: tell the main shell, then wait to be signalled — the lane starts nothing meanwhile
+  printf '%s rc=%s\n' "${P_STEM[$1]}" "$2" >> "$OUT/canary.red"
+  kill -TERM "$MAIN_PID" 2> /dev/null || return 0
+  sleep 60 # stop() ends this lane within a second; a lane that outlives the minute goes on
 }
 
 skip_item() { # $1 = plan index, $2 = lane label: the ledger holds a green run of these inputs
