@@ -391,6 +391,17 @@ impl MockEngine {
         (mock, log)
     }
 
+    /// The same mock whose tokenizer asks for a BOS ([`BosTokenizer`]), as a
+    /// GGUF with `add_bos_token` does.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_bos(self) -> Self {
+        MockEngine {
+            tok: Arc::new(BosTokenizer),
+            ..self
+        }
+    }
+
     fn push(&mut self, id: u32) -> Result<(), EngineError> {
         if self.ctx.len() >= self.ctx_max {
             return Err(EngineError(format!(
@@ -757,6 +768,41 @@ impl Engine for MockEngine {
             n_tokens: n,
             n_bytes: MOCK_STATE_HEAD + 4 * n as u64,
         })
+    }
+}
+
+/// [`MockTokenizer`] with `add_bos` set, for the paths that prepend a BOS.
+#[cfg(test)]
+pub(crate) struct BosTokenizer;
+
+#[cfg(test)]
+impl Tokenizer for BosTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        MockTokenizer.encode(text)
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        MockTokenizer.decode(ids)
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        MockTokenizer.decoder()
+    }
+
+    fn bos(&self) -> u32 {
+        MockTokenizer.bos()
+    }
+
+    fn eos(&self) -> u32 {
+        MockTokenizer.eos()
+    }
+
+    fn add_bos(&self) -> bool {
+        true
+    }
+
+    fn n_vocab(&self) -> usize {
+        MockTokenizer.n_vocab()
     }
 }
 

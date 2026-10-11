@@ -2005,16 +2005,20 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
 
 // ---------------------------------------------------------------- tokenizer endpoints
 
+/// `/tokenize`. `content` is a string or an array of strings and token ids,
+/// read as a `/completion` prompt is ([`prompt_ids`]); `add_special` puts the
+/// tokenizer's BOS before it where the tokenizer adds one and it starts with
+/// text, as llama-server's `tokenize_mixed`. An absent `content` is a 400
+/// naming it (llama-server answers no tokens; an undefined input is an error
+/// here), and so is any other type, `null` included.
 fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
-    let content = b.get("content").and_then(Value::as_str).unwrap_or("");
     let add_special = get_b(b, "add_special")?.unwrap_or(false);
     let with_pieces = get_b(b, "with_pieces")?.unwrap_or(false);
     let t = &*state.tok;
-    let mut ids = Vec::new();
-    if add_special && t.add_bos() {
-        ids.push(t.bos());
-    }
-    ids.extend(t.encode(content));
+    let ids = match b.get("content") {
+        None => return Err(invalid("'content' is required")),
+        Some(v) => prompt_ids(state, "content", v, add_special && t.add_bos())?,
+    };
     let tokens: Vec<Value> = if with_pieces {
         ids.iter()
             .map(|&id| json!({ "id": id, "piece": t.decode(&[id]) }))
@@ -2025,9 +2029,11 @@ fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     Ok(json!({ "tokens": tokens }))
 }
 
+/// `/detokenize`: `tokens` is an array of token ids; an absent one is a 400
+/// naming it.
 fn detokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let ids = match b.get("tokens") {
-        None => Vec::new(),
+        None => return Err(invalid("'tokens' is required")),
         Some(v) => token_ids(state, v)?,
     };
     Ok(json!({ "content": state.tok.decode(&ids) }))
@@ -2921,22 +2927,35 @@ fn completion_prompt(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiEr
 }
 
 fn completion_ids(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
-    let e = &*state.tok;
-    let no_media =
-        || invalid("Multimodal data provided, but model does not support multimodal requests.");
     match v {
         Some(o) if carries_media(o) => Err(no_media()),
-        Some(Value::String(s)) => {
-            let mut ids = Vec::new();
-            if e.add_bos() {
+        Some(v @ (Value::String(_) | Value::Array(_))) => {
+            prompt_ids(state, "prompt", v, state.tok.add_bos())
+        }
+        _ => Err(invalid("'prompt' must be a string or an array of tokens")),
+    }
+}
+
+fn no_media() -> ApiError {
+    invalid("Multimodal data provided, but model does not support multimodal requests.")
+}
+
+/// The field `k`, a string or an array of strings and token ids, as token ids:
+/// each string encoded, each id checked against the vocabulary. `bos` puts the
+/// tokenizer's BOS first when it starts with text. Any other type is a 400
+/// naming `k` and the type it got.
+fn prompt_ids(state: &State, k: &str, v: &Value, bos: bool) -> Result<Vec<u32>, ApiError> {
+    let e = &*state.tok;
+    let mut ids = Vec::new();
+    match v {
+        Value::String(s) => {
+            if bos {
                 ids.push(e.bos());
             }
             ids.extend(e.encode(s));
-            Ok(ids)
         }
-        Some(Value::Array(a)) => {
-            let mut ids = Vec::new();
-            if a.first().is_some_and(Value::is_string) && e.add_bos() {
+        Value::Array(a) => {
+            if bos && a.first().is_some_and(Value::is_string) {
                 ids.push(e.bos());
             }
             for x in a {
@@ -2946,10 +2965,16 @@ fn completion_ids(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError
                     other => ids.extend(token_ids(state, &Value::Array(vec![other.clone()]))?),
                 }
             }
-            Ok(ids)
         }
-        _ => Err(invalid("'prompt' must be a string or an array of tokens")),
+        other => {
+            return Err(wrong_type(
+                k,
+                "a string or an array of strings and token ids",
+                other,
+            ));
+        }
     }
+    Ok(ids)
 }
 
 /// Whether a prompt object carries media: a `multimodal_data` that holds
@@ -3904,6 +3929,94 @@ mod tests {
         ] {
             let (status, text) = roundtrip(addr, "POST", path, &body);
             assert_eq!(status, 200, "{path}: {text}");
+        }
+    }
+
+    /// `/tokenize` takes `content` as a string or an array of strings and
+    /// token ids, read as a `/completion` prompt is, with the BOS only under
+    /// `add_special` and only before text; an absent `content` and any other
+    /// type (`null` included) are a 400 naming it. `/detokenize` without
+    /// `tokens` is a 400 naming it.
+    #[test]
+    fn tokenize_content_is_a_prompt_and_absent_is_a_400() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64).with_bos()),
+            super::testserve::mock_config(),
+        );
+        let tokens = |body: Value| {
+            let (status, text) = roundtrip(addr, "POST", "/tokenize", &body.to_string());
+            assert_eq!(status, 200, "{body}: {text}");
+            serde_json::from_str::<Value>(&text).expect("JSON")["tokens"].clone()
+        };
+        let bos = crate::engine::Tokenizer::bos(&crate::mock::BosTokenizer);
+        let ab = tokens(json!({"content": "ab"}));
+        let ab_ids: Vec<u64> = ab
+            .as_array()
+            .expect("tokens")
+            .iter()
+            .map(|x| x.as_u64().expect("an id"))
+            .collect();
+        assert!(!ab_ids.is_empty(), "{ab}");
+        assert_eq!(tokens(json!({"content": ["ab"]})), ab);
+        assert_eq!(tokens(json!({"content": ab_ids.clone()})), ab);
+        assert_eq!(tokens(json!({"content": ["a", ab_ids[1]]})), ab);
+        let mut with_bos = vec![bos as u64];
+        with_bos.extend(&ab_ids);
+        assert_eq!(
+            tokens(json!({"content": "ab", "add_special": true})),
+            json!(with_bos)
+        );
+        assert_eq!(
+            tokens(json!({"content": ["ab"], "add_special": true})),
+            json!(with_bos)
+        );
+        assert_eq!(
+            tokens(json!({"content": ab_ids.clone(), "add_special": true})),
+            ab,
+            "no BOS before a prompt that starts with an id"
+        );
+        assert_eq!(
+            tokens(json!({"content": "", "add_special": true})),
+            json!([bos])
+        );
+        let refused = [
+            ("/tokenize", json!({}), "'content' is required".to_string()),
+            (
+                "/tokenize",
+                json!({"add_special": true}),
+                "'content' is required".to_string(),
+            ),
+            ("/detokenize", json!({}), "'tokens' is required".to_string()),
+            (
+                "/tokenize",
+                json!({"content": ["ab", {"multimodal_data": ["x"]}]}),
+                "Multimodal data provided, but model does not support multimodal requests."
+                    .to_string(),
+            ),
+        ]
+        .into_iter()
+        .chain(
+            [
+                (json!(5), "a number"),
+                (json!({"text": "ab"}), "an object"),
+                (json!(true), "a boolean"),
+                (Value::Null, "null"),
+            ]
+            .into_iter()
+            .map(|(content, got)| {
+                (
+                    "/tokenize",
+                    json!({ "content": content }),
+                    format!(
+                        "content must be a string or an array of strings and token ids, not {got}"
+                    ),
+                )
+            }),
+        );
+        for (path, body, want) in refused {
+            let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+            assert_eq!(status, 400, "{path} {body}: {text}");
+            assert_eq!(message_of(&text), want, "{path} {body}");
         }
     }
 
