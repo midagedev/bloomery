@@ -174,7 +174,7 @@ TYPE_PLACES = {
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "glm": (("crates/model/src/arch/glm5next/place.rs", "pub fn card_routed(ty: GgmlType)"),
             ("crates/gpu/src/card_leg.rs", "match kernels::gate_up(st.gate.ty)"),
-            ("crates/gpu-glm5next/src/body.rs", "if table.ty() != GgmlType::Q8_0"),
+            ("crates/gpu-glm5next/src/body.rs", "if !GLM5NEXT_EMBED.contains(&table.ty())"),
             ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "qwen38": (("crates/model/src/arch/qwen35moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
                ("crates/placement/src/placement/qwen38_cards.rs", "fn card_routed(ty: GgmlType)"),
