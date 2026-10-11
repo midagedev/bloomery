@@ -229,7 +229,9 @@ mod cli {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{GLM_CARD, glm_machine, residency_room, residency_set};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
+    use bloomery_gpu_glm5next::{
+        Body, Glm5nextModel, PrefillMode, checkpoint_budget, prompt_bytes,
+    };
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
         MTP_WIDTH, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy,
@@ -642,7 +644,8 @@ mod cli {
         };
         let place = placement.name();
         let tier_batch = glm_place::tier_batch(placement, &inputs.hp);
-        let machine = glm_machine(placement, tier_batch, slots)?;
+        let budget = checkpoint_budget(&inputs, u64::try_from(ctx)?)?;
+        let machine = glm_machine(placement, tier_batch, slots, budget)?;
         let trace = trace_of(
             &levers,
             &file,

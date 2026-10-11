@@ -232,12 +232,13 @@ use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
-    GLM_CARD, checkpoints_reserved, glm_machine, residency_room, residency_set,
+    GLM_CARD, check_glm_reserve, checkpoints_reserved, glm_machine, residency_room, residency_set,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
-    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_bytes, seq_lane, seq_resume,
-    seq_resume_prefix, seq_save, seq_save_async,
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, checkpoint_budget,
+    search_checkpoint_budget, seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save,
+    seq_save_async,
 };
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -558,9 +559,20 @@ impl Placed {
         slots: usize,
     ) -> Result<Placed, GateError> {
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
-        let machine = glm_machine(place, tier_batch, slots)?(inputs.model.layers);
-        let rule = ctx_of(inputs, &machine, levers, nextn, set, slots)?;
+        // The context is chosen by a search over one machine, its checkpoints
+        // reserved at the deepest context a load can be granted; the load's
+        // machine, after it, at the context it is granted.
+        let search = glm_machine(
+            place,
+            tier_batch,
+            slots,
+            search_checkpoint_budget(inputs, set)?,
+        )?(inputs.model.layers);
+        let rule = ctx_of(inputs, &search, levers, nextn, set, slots)?;
         let ctx = u64::try_from(rule.ctx)?;
+        let machine = glm_machine(place, tier_batch, slots, checkpoint_budget(inputs, ctx)?)?(
+            inputs.model.layers,
+        );
         let tier_experts =
             glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?;
         Ok(Placed {
@@ -914,6 +926,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .into());
     }
     let ctx = u64::try_from(rule.ctx)?;
+    // The sequences the load makes pin the body's budget at this context;
+    // the plan's machine must reserve at least that.
+    let ckpt = checkpoint_budget(&inputs, ctx)?;
+    check_glm_reserve(&machine, slots, ckpt)?;
     // The plans count every slot in their KV terms.
     let (plan, beside, draft_bytes) = match &nextn {
         None => (
@@ -970,6 +986,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         lane,
         tier_batch,
         ctx: rule.ctx,
+        checkpoint_budget: ckpt,
         slots,
         cfg: GlmCfg {
             place: plan_levers,
@@ -1031,6 +1048,9 @@ struct SeatArgs {
     tier_batch: Option<TierBatchBytes>,
     /// A slot's context: the stores' rows one sequence serves.
     ctx: usize,
+    /// The host bytes one sequence's checkpoints pin at that context
+    /// ([`checkpoint_budget`]), which the load's machine reserves a slot.
+    checkpoint_budget: u64,
     /// The resident sequences the plan counts and the load makes
     /// ([`Session::add_slots`]).
     slots: usize,
@@ -1116,7 +1136,7 @@ impl Glm {
         let prefill = a.cfg.prefill;
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: glm_machine(a.place, a.tier_batch, a.slots)?,
+            machine: glm_machine(a.place, a.tier_batch, a.slots, a.checkpoint_budget)?,
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: a.cfg,

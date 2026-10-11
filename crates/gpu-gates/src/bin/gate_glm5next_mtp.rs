@@ -147,15 +147,15 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip;
-    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
+    use bloomery_gpu_gates::residency38::reserve_glm_checkpoints;
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
-        NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
-        nextn_logits, nextn_router, nextn_store, nextn_target_streams, nextn_walk, prompt_with,
-        seq_bytes, seq_resume, seq_save, set_prefill, set_prefill_group,
+        NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, checkpoint_budget, feed,
+        nextn_chain, nextn_hidden, nextn_logits, nextn_router, nextn_store, nextn_target_streams,
+        nextn_walk, prompt_with, seq_bytes, seq_resume, seq_save, set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -1744,7 +1744,8 @@ mod gate {
     ) -> Result<bool, GateError> {
         let file = glm5next_tier::open()?;
         let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
-        reserve_checkpoints(&mut machine, glm_seqs(Z_SLOTS));
+        let ckpt = checkpoint_budget(inputs, u64::try_from(Z_CTX)?)?;
+        reserve_glm_checkpoints(&mut machine, Z_SLOTS, ckpt);
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let np =
             inputs.plan_nextn_slots(&machine, u64::try_from(Z_CTX)?, &place, nextn, Z_SLOTS)?;
@@ -1900,10 +1901,10 @@ mod gate {
         } else {
             None
         };
-        let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
-        reserve_checkpoints(&mut machine, glm_seqs(1));
-        let place = glm5next_tier::plan_levers(&levers, 0)?;
         let ctx = u64::try_from(CTX)?;
+        let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
+        reserve_glm_checkpoints(&mut machine, 1, checkpoint_budget(&inputs, ctx)?);
+        let place = glm5next_tier::plan_levers(&levers, 0)?;
         let base = inputs.plan(&machine, ctx, &place)?;
         let np = inputs.plan_nextn(&machine, ctx, &place, &nextn)?;
         let card = |n_l: &[u64]| n_l.iter().sum::<u64>();
