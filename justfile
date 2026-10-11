@@ -2021,7 +2021,7 @@ ptx-scan BIN FEATURES='gpu' NOJIT='' *ARGS:
 # 핀 위든 아래든 다른 값, 핀 없는 새 엔트리, 스캔에서 사라진 핀 행이 전부 빨강이다 — 스필은 비트를 안 바꾸고 속도만
 # 바꿔 비트 게이트가 전부 지나가므로(ds41_attn_seg_sel의 8 B 스필을 눈으로 찾았다), 0이 아닌 핀은 PIN 줄로 사유를 단다.
 # The third binary, gate_qwen3vl_tower (--features vision), is scanned for the `vis_` entries of the image tower crate only
-# (bloomery-gpu-vision, V4.1's six and the Qwen3-VL tower's five); the bloomery-gpu entries of the same bundle are pinned by the
+# (bloomery-gpu-vision, V4.1's six, the Qwen3-VL tower's five and the glm5v tower's three); the bloomery-gpu entries of the same bundle are pinned by the
 # first two binaries.
 # [group('canary')]: tools/gate-batch.sh runs the canary recipes first in their lanes and stops the batch at the first red one (its
 # header's «Canary»); gate-ptx-spill and the lib-test gates of the crates carry it, the gates a half-applied change turns red first.
@@ -2146,6 +2146,19 @@ gate-gpu-vision:
 # Real file only; the gate lock.
 gate-gpu-qwen3vl-tower:
     ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
+
+# The glm5v image tower on the card (the mmproj of GLM-5.3-Flash: llama.cpp's `glm4v` graph with a per-head q/k norm, a clamped
+# SwiGLU and an erf GELU; 24 blocks of heads of 64, a 2x2 convolution merger) against the glm5next vision seat's tap set B
+# (fx_ref_glm5next_vis_taps, with its CPU twin: mainline mtmd's `vit_out`, `after_fc_proj`, `after_ffn_proj` and `embd` of nine
+# images). A tap is held to K times the larger of the reference's rounding floor, its CPU twin's distance and the network's
+# sensitivity to 1-ulp input noise; the merger and projector MLP are held teacher-forced on the reference's `vit_out`. Block 0 and
+# the merger are held to their host rules op by op (norms, per-head norms and RoPE bit for bit, GEMMs inside the
+# accumulation-order bound, the merger's convolution against a host convolution of the file's weight, attention inside its f32
+# bound, the clamped SwiGLU at pinned counts and the erf GELU inside its libm bound, on sweeps and in the chain). Also the card bytes (weights
+# 1,128,026,112 B, scratch 2,016,768,000 B at 8000 tokens), 273 launches an image, and reuse after the largest image bit for bit.
+# The fixture tier is the only tier with sets: the real tier ends by name with 0 clauses run, never green on nothing.
+gate-gpu-glm5v-tower:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_glm5v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5v_tower'
 
 # V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
 # top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과
