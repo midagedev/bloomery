@@ -91,7 +91,7 @@ use crate::head::Head;
 use crate::host::swap::Residency;
 use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec};
 use crate::host::{BatchLeg, StepLeg};
-use crate::hybrid::Chain;
+use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
 use crate::media::{ImageSpan, MediaBody, SeqRope};
 use crate::model::{
@@ -1296,13 +1296,19 @@ impl GpuModel<Body35> {
         // `Residency::Off`: the load starts no machine, and its shape is the
         // one a machine would take.
         let (top_k, max_rows) = tally_shape(&pre.d)?;
+        // The stack table checks only the layers the plan gives card experts:
+        // the machine keeps each layer's card count.
+        let n_expert = usize::try_from(plan.model.experts).map_err(|_| {
+            GpuError::shape(WHAT_P, "a plan of more experts than the host addresses")
+        })?;
+        let carded = SlotMap::of_plan(plan, 0, None, 0..n_layers, n_expert)?;
         let residency = ResidencySpec {
             lever: Residency::Off,
             delay: LIVE_DELAY,
             deadline: DEADLINE,
             top_k,
             max_rows,
-            stacks: Arc::new(swap35::stacks(plan.model)?),
+            stacks: Arc::new(swap35::stacks(plan.model, |l| Ok(carded.on_card(l)? > 0))?),
         };
         GpuModel::load_placed_with(
             file,
