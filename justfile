@@ -151,6 +151,12 @@ check-waits:
 check-loads:
     ./tools/check-loads.sh
 
+# The ptx-shapes name check (Mac, text only, no build): every row of tools/ref/ptx-shapes.tsv names a kernel its binary's device
+# crates declare, and every kernel they declare has a row — gate-ptx-spill's `stale` and `unpinned` halves without the box. Rule,
+# macro family, refusals and gaps are tools/check-ptx-names.py's header.
+check-ptx-names:
+    ./tools/check-ptx-names.sh
+
 # `[group('v41-load')]`: 바이너리가 V4.1 전체를 적재하는(body::open — 호스트 세트 populate) 레시피. tools/gate-batch.sh가 한 레인(A)에 차례로 세운다.
 # GPU 게이트 바이너리는 tools/gpu-gate.sh 아래에서 카드마다 하나인 게이트 락에 줄을 선다(빌드는 병렬, 실행만 직렬).
 # 게이트 하나가 모델을 12 GB 올리므로 둘이 같은 카드에 겹치면 OOM이다. 시간 러너의 임대(/root/bloomery-cpu.lock)와는
@@ -1103,6 +1109,7 @@ gate-threads:
 
 # 레버 레지스트리 게이트(crates/levers, 호스트만): 모든 행이 형식에 맞는가, 종류가 받지 않는 값과 은퇴한 이름을
 # 이름을 대고 거부하는가, 제자리 행과 tools/levers-direct.txt가 서로 맞는가. 레지스트리를 마크다운 표로 찍는다.
+[group('canary')]
 gate-levers:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-levers --lib -- --nocapture'
 
@@ -1114,6 +1121,7 @@ gate-sampler:
 # The generation loop (crates/runtime, host only): the stop rule, the lookup draft, and the drafts'
 # pick/commit arithmetic against a mock target — plain = draft tokens, a rejected row taken back,
 # only kept tokens in the lookup's context, a failed call not run again.
+[group('canary')]
 gate-runtime:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-runtime --lib -- --nocapture'
 
@@ -1121,11 +1129,13 @@ gate-runtime:
 # the tree runs selects its router and flash instance, a shape between or outside the rows is
 # refused by name, no two rows overlap — and the shipped MTP head list's miss rate on each held-out
 # language set (tests/head_coverage.rs: under the break-even, held-out text no input of the build).
+[group('canary')]
 gate-models:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-models --lib --test head_coverage -- --nocapture'
 
 # The session crate's host tests (crates/app, a device-linked crate, so cargo oxide test): a fault
 # read at a step, a group end or a call end is one SessionError::Fault. They open no card (host group).
+[group('canary')]
 [group('host')]
 gate-app:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-app --release --lib'
@@ -1190,6 +1200,7 @@ gate-serve:
 # The template engine (crates/jinja, host only): its unit tests, the HF environment's whitespace control, scoping,
 # macros, filters and tests, Python's `str()` and slicing rules, and the V4.1 template rendered by hand. The engine's
 # jinja2-parity cases are gate-serve's. No network, no card.
+[group('canary')]
 gate-jinja:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-jinja --lib -- --nocapture'
 
@@ -1253,7 +1264,7 @@ dump-ref-dequant:
     ./tools/box.sh 'bash tools/ref/dump-dequant.sh'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
+gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
 # The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
@@ -1292,6 +1303,7 @@ gate-gpu-mcol:
 # batch keeps them on the 3090 (lane A). The hw_ tests (graph.rs' capture, replay, host flags and node kinds;
 # checkpoint.rs; host/step.rs' boundary) run small kernels on device 0. A test that holds a stream shut (hw_held_,
 # checkpoint.rs' Hold) runs in a second pass, one at a time: beside another test it deadlocks. just gate runs it.
+[group('canary')]
 gate-gpu-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored --skip hw_held_ && RUST_TEST_THREADS=1 bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored hw_held_'
 
@@ -1299,6 +1311,7 @@ gate-gpu-lib:
 # 8의 배수 길이 페이로드의 마지막 본문, 번들 경계, 파서가 거부한 섹션은 빈 표가 아니라 오류 — 이 여기서 돈다.
 # gpu 피처 없이 빌드하므로 디바이스 크레이트를 컴파일하지 않고, 그래서 평범한 cargo다. just gate가 부른다.
 # probe_nvread's helper tests (batch split, quantiles, aligned spans, the seeded layer draw) run here too: the bin takes no feature.
+[group('canary')]
 gate-gpu-gates-lib:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib --bin probe_nvread'
 
@@ -1312,6 +1325,7 @@ gate-ds41-oracle:
 # through curl on file:// URLs (a resume from a truncated file, a refetch-free second start, size and digest refusals),
 # and the offline start (a refused connection lets the one verified cached set stand in; zero or two, or an HTTP error
 # from a local port, are refused). No network, no card.
+[group('canary')]
 gate-hf:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-hf --lib -- --nocapture'
 
@@ -1349,6 +1363,7 @@ gate-gpu-ds41-index:
 
 # V4.1 디바이스 크레이트의 호스트 단위 시험(카드·게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
 # 락이 없어도 되는 까닭: 이 크레이트의 시험 모듈은 카드를 열지 않는다(Gpu·스트림·디바이스 버퍼를 쓰는 시험이 없다). cargo oxide는 빌드 때문이다.
+[group('canary')]
 [group('host')]
 gate-gpu-ds41-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib'
@@ -1983,6 +1998,9 @@ ptx-scan BIN FEATURES='gpu' NOJIT='' *ARGS:
 # The third binary, gate_qwen3vl_tower (--features vision), is scanned for the `vis_` entries of the image tower crate only
 # (bloomery-gpu-vision, V4.1's six and the Qwen3-VL tower's five); the bloomery-gpu entries of the same bundle are pinned by the
 # first two binaries.
+# [group('canary')]: tools/gate-batch.sh runs the canary recipes first in their lanes and stops the batch at the first red one (its
+# header's «Canary»); gate-ptx-spill and the lib-test gates of the crates carry it, the gates a half-applied change turns red first.
+[group('canary')]
 gate-ptx-spill:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 --bin oxart_jit && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e --bin oxart_jit && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_e2e gate_qwen3vl_tower:vis_'
 
