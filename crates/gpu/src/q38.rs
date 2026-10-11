@@ -20,17 +20,12 @@
 //!   rounded, then added to the host tier's routed sum and rounded — ggml's
 //!   MUL then ADD, each an explicit round-to-nearest intrinsic so the device
 //!   build does not contract them into one fused multiply-add.
-//! - [`q38_kernels::q38_card_acc`] — one thread per value: the card's routed
-//!   slots' sum, each of a token's [`SLOTS`] slots whose place is on the card
-//!   (below the layer's card expert count) by a fused multiply-add from zero,
-//!   in slot order (`runtime::combine::card_sum`), its weight the router's at
-//!   pitch [`W_PITCH`] (the routed slots, then the shared expert's gate); a
-//!   slot the host serves is never read.
 //! - [`q38_kernels::q38_card_shared_add`] — `q38_shared_add` with the card
 //!   sum: `(hsum + acc) + sh · w`, the host's sum, then the card's, then the
 //!   shared expert's rounded product, each step rounded.
 //! - [`q38_kernels::q38_card_tier_shared_add`] — the join of a layer an
-//!   expert tier holds experts of, after the wait: `q38_card_acc`'s sum over
+//!   expert tier holds experts of, after the wait: the sum of
+//!   `crate::card_slots`' `ds41_ffn_card_acc_10` over
 //!   the slots on the card or on the tier, in slot order, each slot's down
 //!   output read from the card's rows or, for a tier slot, from the tier's
 //!   rows through the mapping, then `q38_card_shared_add`'s combine of it —
@@ -52,17 +47,20 @@
 //!   alone (`crate::host::tier::BlockRows::Packed`), so only the tier's rows
 //!   cross the bus, by the copy engine.
 //!
-//! The card sum runs in the layer's host-leg shadow and the combine after the
-//! wait in `q38_shared_add`'s place, so the card leg adds no launch after the
-//! wait; on a tier layer the tier's rows land only with the wait, so the sum
-//! moves into the combine and the leg still adds none. A layer without card experts keeps `q38_shared_add`: `hsum + 0.0`
-//! would turn a `-0.0` sum into `+0.0`.
+//! The card sum (`crate::card_slots`' `ds41_ffn_card_acc_10`, the weights at a
+//! pitch of [`W_PITCH`]) runs in the layer's host-leg shadow and the combine
+//! after the wait in `q38_shared_add`'s place, so the card leg adds no launch
+//! after the wait; on a tier layer the tier's rows land only with the wait, so
+//! the sum moves into the combine and the leg still adds none. A layer without
+//! card experts keeps `q38_shared_add`: `hsum + 0.0` would turn a `-0.0` sum
+//! into `+0.0`.
 //!
 //! No silent failure: an embedding id past the table raises
 //! [`FaultSite::TokenId`] and writes a NaN row; a position at or past the
 //! raw plane raises [`FaultSite::CachePos`] and writes nothing; a card slot's
 //! place that is neither a card expert nor [`HOST`] raises
-//! [`FaultSite::ExpertId`] and writes its token's card sum NaN; a raw key that
+//! [`FaultSite::ExpertId`] and writes its token's card sum NaN (the sum in
+//! `crate::card_slots` and the tier joins here); a raw key that
 //! is not finite after its f16 rounding raises [`FaultSite::PoolSelect`]; an
 //! input or a result of the two f32 products, or of the combine with the card
 //! sum, that is not finite raises [`FaultSite::F32Product`] (a card slot's
@@ -351,81 +349,9 @@ mod q38_kernels {
         }
     }
 
-    /// The card slots' sum of `m` tokens: thread `i < n·m`, token `t = i /
-    /// n`, value `d = i % n`, writes to `acc[i]` the fused multiply-adds from
-    /// zero of `down[(10t + j)·n + d]` by `w[11t + j]`, in ascending `j <
-    /// 10`, over the slots whose place `sel[10t + j]` is below `n_card` — this
-    /// order is the gate (`runtime::combine::card_sum`). No other slot's
-    /// down row or weight is read. A [`HOST`] place is the host's slot and
-    /// raises nothing; a place in `[n_card, HOST)` is no expert either side
-    /// serves: it raises [`FaultSite::ExpertId`] on `fault` and its token's
-    /// values are NaN.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            down.len() >= 10 * n * m,
-            w.len() >= 11 * m,
-            sel.len() >= 10 * m,
-            acc.len() >= n * m
-        )
-    )]
-    pub fn q38_card_acc(
-        down: &[f32],
-        w: &[f32],
-        sel: &[u32],
-        n: u32,
-        m: u32,
-        n_card: u32,
-        fault: FaultSink,
-        mut acc: DisjointSlice<f32>,
-    ) {
-        let (n, m) = (n as usize, m as usize);
-        let i = thread::index_1d().get();
-        if i >= n * m {
-            return;
-        }
-        let (t, d) = (i / n, i % n);
-        let mut a = 0.0f32;
-        for j in 0..SLOTS {
-            cuda_device::thread::__unroll_config::<0>();
-            let s = t * SLOTS + j;
-            // SAFETY: t < m and j < 10 put s below 10m <= sel.len() by the
-            // launch contract.
-            let place = unsafe { *sel.get_unchecked(s) };
-            if place < n_card {
-                // SAFETY: t < m and j < 10 put 11t + j below 11m <= w.len(),
-                // and s·n + d below 10nm <= down.len(), by the launch
-                // contract.
-                let (ws, ds) = unsafe {
-                    (
-                        *w.get_unchecked(t * W_PITCH + j),
-                        *down.get_unchecked(s * n + d),
-                    )
-                };
-                a = ds.mul_add(ws, a);
-            } else if place != HOST {
-                if d == 0 {
-                    fault.raise(FaultSite::ExpertId);
-                }
-                a = f32::NAN;
-            }
-        }
-        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
-        unsafe {
-            *acc.get_unchecked_mut(i) = a;
-        }
-    }
-
     /// `y = (hsum + acc) + sh · w[t·slots + slot]` over `m` tokens of `n`
     /// values: the host tier's routed sum, then the card's
-    /// ([`q38_card_acc`]), then the shared expert's output times its gate
+    /// (`ds41_ffn_card_acc_10`), then the shared expert's output times its gate
     /// weight, the product and each sum rounded — this order is the gate. A
     /// non-finite input or result raises [`FaultSite::F32Product`].
     #[allow(
@@ -484,7 +410,7 @@ mod q38_kernels {
     }
 
     /// The join of a tier layer over `m` tokens of `n` values, one thread a
-    /// value: [`q38_card_acc`]'s sum from zero over the slots on the card —
+    /// value: `ds41_ffn_card_acc_10`'s sum from zero over the slots on the card —
     /// place `sel[10t + j]` below `n_card`, its row `down`'s — or, on a slot
     /// the card does not hold ([`HOST`] there), on the tier — tier place
     /// `tsel[10t + j]` below `n_tier`, its row `trows`' (slot-major as
@@ -595,7 +521,7 @@ mod q38_kernels {
     /// rank `trank[10t + j]` ([`q38_tier_rank`]: the tier's rows come packed)
     /// — in ascending `j < 10`, each by a fused multiply-add of the router's
     /// weight, this order the gate. A ubatch's join, after which
-    /// [`q38_card_shared_add`] combines it as it combines [`q38_card_acc`]'s
+    /// [`q38_card_shared_add`] combines it as it combines `ds41_ffn_card_acc_10`'s
     /// sum. A slot [`HOST`] in both places is the host's; a place in
     /// `[n_card, HOST)`, a tier place in `[n_tier, HOST)` on a host slot of
     /// the card, or a tier slot's rank at or past `10m`, raises
@@ -880,25 +806,9 @@ pub struct SharedAddArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`Q38Kernels::enqueue_card_acc`]'s arguments: `m` tokens' [`SLOTS`]
-/// slots — their down outputs slot-major (`n` values a slot, token `t`'s
-/// slots from `SLOTS · t`), the router's weights ([`W_PITCH`] a token) and
-/// the slots' places (the card's below `n_card`, the layer's card expert
-/// count; the host's [`HOST`]) — the sink a place that is neither raises
-/// on, and the sum's output, `n` values a token.
-pub struct CardAccArgs<'a> {
-    pub down: &'a DeviceBuffer<f32>,
-    pub w: &'a DeviceBuffer<f32>,
-    pub sel: &'a DeviceBuffer<u32>,
-    pub n: usize,
-    pub m: usize,
-    pub n_card: usize,
-    pub fault: FaultSink,
-    pub acc: &'a mut DeviceBuffer<f32>,
-}
-
 /// [`Q38Kernels::enqueue_card_shared_add`]'s arguments: [`SharedAddArgs`]'s
-/// and the card slots' sum `acc` (`[m][n]`, [`Q38Kernels::enqueue_card_acc`]).
+/// and the card slots' sum `acc` (`[m][n]`, `CardSlotKernels::enqueue_card_acc`
+/// at ten slots).
 pub struct CardSharedAddArgs<'a> {
     pub hsum: &'a DeviceBuffer<f32>,
     pub acc: &'a DeviceBuffer<f32>,
@@ -1218,54 +1128,6 @@ impl Q38Kernels {
             launch_u32(what, "m", a.m)?,
             a.fault,
             a.y,
-        )?;
-        Ok(())
-    }
-
-    /// Enqueue the card slots' sum ([`CardAccArgs`], module doc): `down`
-    /// `SLOTS·n·m` values, `w` `W_PITCH·m`, `sel` `SLOTS·m`, `acc` `n·m`. A
-    /// card of no expert is refused by name: a layer without card experts has
-    /// no card sum and keeps [`Q38Kernels::enqueue_shared_add`]. A place in
-    /// `[n_card, HOST)` raises [`FaultSite::ExpertId`] on `a.fault`. One launch.
-    /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_card_acc(
-        &self,
-        stream: &CudaStream,
-        a: CardAccArgs<'_>,
-    ) -> Result<(), GpuError> {
-        let what = "q38::enqueue_card_acc";
-        let nm = a.n * a.m;
-        if nm == 0 || a.n_card == 0 {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{} values of {} tokens over a card of {} experts: at least one of each",
-                    a.n, a.m, a.n_card
-                ),
-            ));
-        }
-        short(
-            what,
-            &[
-                ("down", a.down.len(), SLOTS * nm),
-                ("w", a.w.len(), W_PITCH * a.m),
-                ("sel", a.sel.len(), SLOTS * a.m),
-                ("acc", a.acc.len(), nm),
-            ],
-        )?;
-        let cfg = grid(what, nm)?;
-        let prep = self.module.prepare_q38_card_acc(cfg)?;
-        self.module.q38_card_acc(
-            stream,
-            &prep,
-            a.down,
-            a.w,
-            a.sel,
-            launch_u32(what, "n", a.n)?,
-            launch_u32(what, "m", a.m)?,
-            launch_u32(what, "n_card", a.n_card)?,
-            a.fault,
-            a.acc,
         )?;
         Ok(())
     }

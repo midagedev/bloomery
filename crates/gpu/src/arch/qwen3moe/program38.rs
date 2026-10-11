@@ -55,6 +55,7 @@ use super::router::gated;
 use super::scratch::{Io, f32_view};
 use super::scratch38::{Arena38, Store38, Taps38};
 use super::tier38::{STAGE_TIER, TierSide38};
+use crate::card_slots::CardSlotKernels;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
@@ -193,6 +194,8 @@ fn walk_launches(
 /// Every module a Qwen3.8 walk launches besides the `Gpu`'s own.
 pub(super) struct Kernels38 {
     pub(super) q38: Q38Kernels,
+    /// The card slots' places and sum.
+    pub(super) slots: CardSlotKernels,
     pub(super) hc: HcGatedKernels,
     pub(super) ple: PleKernels,
     pub(super) qsa: QsaKernels,
@@ -219,6 +222,7 @@ impl Kernels38 {
         let ctx = gpu.context();
         Ok(Kernels38 {
             q38: Q38Kernels::load(ctx)?,
+            slots: CardSlotKernels::load(ctx)?,
             hc: HcGatedKernels::load(ctx)?,
             ple: PleKernels::load(ctx)?,
             qsa: QsaKernels::load(ctx)?,

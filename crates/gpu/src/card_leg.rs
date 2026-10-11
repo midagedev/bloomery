@@ -40,7 +40,7 @@
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
 //! for is refused by name at the launch.
 
-use crate::card_slots::{CardAcc, CardSlotKernels};
+use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
 use crate::iq_sel::{IqDown, IqGateUp, IqSelKernels};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::mxfp4_sel::Mxfp4SelKernels;
@@ -53,7 +53,6 @@ use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry};
-use runtime::combine::Slots;
 
 /// What the leg's errors name.
 const WHAT: &str = "CardLeg";
@@ -314,8 +313,8 @@ pub struct LegRun<'a> {
 /// The card slots' sum a run ends with ([`CardLeg::enqueue`]): `w` the
 /// slots' routing weights, `slots_per_col` a token and token-major, and `acc`
 /// the sum, `m` rows of `n` values. A token's slots are summed in slot order
-/// over the slots whose place is below `n_card`; `slots_per_col` is 6 or 8,
-/// any other count is refused by name before the run launches anything.
+/// over the slots whose place is below `n_card`; `slots_per_col` is 6, 8 or
+/// 10, any other count is refused by name before the run launches anything.
 pub struct LegSum<'a> {
     pub w: &'a DeviceBuffer<f32>,
     pub acc: &'a mut DeviceBuffer<f32>,
@@ -374,11 +373,15 @@ impl CardLeg {
             down,
         } = bufs;
         let shape = *shape;
-        if sum.is_some() {
-            Slots::of(shape.slots_per_col).map_err(|e| GpuError::Shape {
+        if sum.is_some() && CardSlots::of(shape.slots_per_col).is_none() {
+            return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!("the card sum: {e}"),
-            })?;
+                detail: format!(
+                    "the card sum: {} routed slots a token: the sum's entries are built for 6, 8 \
+                     and 10",
+                    shape.slots_per_col
+                ),
+            });
         }
         let scratch = Scratch {
             shape,
@@ -398,6 +401,8 @@ impl CardLeg {
             m: run.m,
             n_card: run.n_card,
             n_used: shape.slots_per_col,
+            w_pitch: shape.slots_per_col,
+            fault: gpu.layer_sink(run.layer)?,
         };
         self.slots.enqueue_card_acc(gpu.stream(), &a, acc)
     }

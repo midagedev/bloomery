@@ -15,9 +15,9 @@
 //! the page's slot count ([`HandoffSlots::of`]), refusing any other by name.
 //! `ds41_ffn_handoff_10_cols` writes a row of several columns of ten slots in
 //! one launch ([`HandoffKernels::enqueue_handoff_cols`]);
-//! `ds41_ffn_places_10_cols` writes the places alone of such a row, for a walk
-//! whose routing reaches the host by a download
-//! ([`HandoffKernels::enqueue_places_cols`]). `ds41_ffn_handoff_8_tier` is
+//! [`HandoffKernels::enqueue_places_cols`] writes the places alone of such a
+//! row, for a walk whose routing reaches the host by a download, through
+//! `crate::card_slots`' `ds41_ffn_places`. `ds41_ffn_handoff_8_tier` is
 //! the eight-slot handoff of a layer an expert tier holds experts of: the
 //! same writes, and the slots' tier places and the activation in f32 into
 //! the row's tier image ([`HandoffKernels::enqueue_handoff_tier`]);
@@ -35,6 +35,7 @@ use cuda_host::cuda_module;
 use super::slots::HOST;
 use super::step::HandoffTarget;
 use super::tier::TierTarget;
+use crate::card_slots::{CardSlotKernels, ColPlaces};
 use crate::{FaultSink, FaultSite, GpuError, launch_u32};
 
 /// Threads per block of the handoff.
@@ -620,62 +621,6 @@ mod handoff_kernels {
             );
         }
     }
-
-    /// The places alone of `m` columns of ten slots, for a walk whose
-    /// routing reaches the host by a download instead of the image: one
-    /// thread per slot `k < 10·m`, column `c = k / 10`, slot `e = k % 10`,
-    /// reads the router's word `c·pitch + e` and writes `sel[k]` — the id's
-    /// place, or [`HOST`] with [`FaultSite::ExpertId`] raised for an id not
-    /// below `n_expert` ([`ds41_ffn_handoff_10_cols`]'s rule). A word of a
-    /// column past its ten (the shared expert's, at a pitch of eleven) is
-    /// never read.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            m >= 1,
-            pitch >= 10,
-            ids_in.len() >= m * pitch,
-            map.len() >= row_off + n_expert,
-            sel.len() >= m * 10
-        )
-    )]
-    pub fn ds41_ffn_places_10_cols(
-        ids_in: &[u32],
-        pitch: u32,
-        map: &[u32],
-        row_off: u32,
-        n_expert: u32,
-        m: u32,
-        fault: FaultSink,
-        mut sel: DisjointSlice<u32>,
-    ) {
-        let k = thread::index_1d().get();
-        if k >= m as usize * SLOTS_10 {
-            return;
-        }
-        let (c, e) = (k / SLOTS_10, k % SLOTS_10);
-        // SAFETY: c < m and e < 10 <= pitch, so c·pitch + e < m·pitch <=
-        // ids_in.len() by the launch contract.
-        let id = unsafe { *ids_in.get_unchecked(c * pitch as usize + e) };
-        let place = if id < n_expert {
-            // SAFETY: id < n_expert, so row_off + id < map.len() by the launch
-            // contract.
-            unsafe { *map.get_unchecked(row_off as usize + id as usize) }
-        } else {
-            fault.raise(FaultSite::ExpertId);
-            HOST
-        };
-        // SAFETY: k < 10·m <= sel.len() by the launch contract; thread k is
-        // sel[k]'s only writer.
-        unsafe { *sel.get_unchecked_mut(k) = place };
-    }
 }
 
 /// What a handoff entry of `N` slots reads ([`handoff_at`]): its arguments
@@ -911,6 +856,7 @@ pub struct Handoff<'a> {
 /// routed slots to the host tier, or alone by a gate.
 pub struct HandoffKernels {
     module: handoff_kernels::LoadedModule,
+    places: CardSlotKernels,
 }
 
 impl HandoffKernels {
@@ -919,7 +865,10 @@ impl HandoffKernels {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(handoff_kernels, ctx)? };
-        Ok(HandoffKernels { module })
+        Ok(HandoffKernels {
+            module,
+            places: CardSlotKernels::load(ctx)?,
+        })
     }
 
     /// Enqueue the handoff of `target.layout.n_used` slots a token
@@ -1247,13 +1196,13 @@ impl HandoffKernels {
     }
 
     /// Enqueue the places alone of `m` columns of ten slots
-    /// (`ds41_ffn_places_10_cols`): column `c`'s slot `e` — `p.ids`'s word
-    /// `c·pitch + e` — into `sel[10·c + e]`, its place in `p.map`'s row at
-    /// `p.row_off`, or [`HOST`] with [`FaultSite::ExpertId`] raised on
-    /// `fault` for an id not below `p.n_expert`; no image, no sequence word.
-    /// `m` of 0, a pitch under ten, and buffers short of `m` columns are
-    /// refused by name. One launch. Asynchronous, allocation-free,
-    /// capturable.
+    /// ([`CardSlotKernels::enqueue_places_cols`]): column `c`'s slot `e` —
+    /// `p.ids`'s word `c·pitch + e` — into `sel[10·c + e]`, its place in
+    /// `p.map`'s row at `p.row_off`, or [`HOST`] with
+    /// [`FaultSite::ExpertId`] raised on `fault` for an id not below
+    /// `p.n_expert`; no image, no sequence word. A pitch under ten is refused
+    /// by name, as are `m` of 0 and buffers short of `m` columns. One launch.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_places_cols(
         &self,
         stream: &CudaStream,
@@ -1263,48 +1212,23 @@ impl HandoffKernels {
         fault: FaultSink,
         sel: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "ds41_ffn_places_10_cols";
-        if m == 0
-            || pitch < SLOTS_10
-            || p.ids.len() < m * pitch
-            || sel.len() < m * SLOTS_10
-            || p.map.len() < p.row_off + p.n_expert
-        {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "{m} columns at a pitch of {pitch} over {} ids into {} places, a map of {} \
-                     words read from {} for {} experts: one column or more, a pitch of at least \
-                     ten, and every buffer that long",
-                    p.ids.len(),
-                    sel.len(),
-                    p.map.len(),
-                    p.row_off,
-                    p.n_expert
-                ),
-            });
+        if pitch < SLOTS_10 {
+            return Err(GpuError::shape(
+                "ds41_ffn_places",
+                format!("columns at a pitch of {pitch}: the ten routed slots come first"),
+            ));
         }
-        let grid = launch_u32(
-            WHAT,
-            "grid",
-            (m * SLOTS_10).div_ceil(HANDOFF_THREADS as usize),
-        )?;
-        let prep = self
-            .module
-            .prepare_ds41_ffn_places_10_cols(LaunchConfig1D::new(grid, HANDOFF_THREADS, 0))?;
-        self.module.ds41_ffn_places_10_cols(
-            stream,
-            &prep,
-            p.ids,
-            launch_u32(WHAT, "pitch", pitch)?,
-            p.map,
-            launch_u32(WHAT, "row_off", p.row_off)?,
-            launch_u32(WHAT, "n_expert", p.n_expert)?,
-            launch_u32(WHAT, "m", m)?,
-            fault,
-            sel,
-        )?;
-        Ok(())
+        let cols = ColPlaces {
+            ids: p.ids,
+            ids_pitch: pitch,
+            used: SLOTS_10,
+            sel_pitch: SLOTS_10,
+            m,
+            map: p.map,
+            row_off: p.row_off,
+            n_expert: p.n_expert,
+        };
+        self.places.enqueue_places_cols(stream, &cols, fault, sel)
     }
 }
 

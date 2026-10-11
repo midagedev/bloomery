@@ -1233,7 +1233,7 @@ mod gate {
         let slots = taps.slots_row;
         // PIN(2026-09-30): the routed sum's bound per value — each slot's
         // down (γ(640/32 + 5) of Σ|w·x|, `dot_depth`) through its weight,
-        // and `q38_card_acc`'s ten fused multiply-adds in slot order, γ(10)
+        // and `ds41_ffn_card_acc_10`'s ten fused multiply-adds in slot order, γ(10)
         // of Σ|w·down|. Measured on the set's 127 rows: at worst 0.006 of it.
         let (mut acc, mut bound) = (vec![0.0f64; HIDDEN], vec![0.0f64; HIDDEN]);
         for j in 0..N_USED {

@@ -9,7 +9,7 @@
 //! SiLU·mul over the unit's ten slots a column, the 32-value q8_1 of the
 //! card slots' columns, the down `_sel` of its type (Q5_1, Q8_0 or IQ4_NL,
 //! the file's blocks) — the four launches of the common card leg
-//! (`crate::card_leg`) — and the card slots' weighted sum (`q38_card_acc`,
+//! (`crate::card_leg`) — and the card slots' weighted sum (`ds41_ffn_card_acc_10`,
 //! this family's own: ten slots at a weight pitch of eleven, and a place in
 //! `[n_card, HOST)` is a fault the leg's sum does not raise) —
 //! [`CARD_LAUNCHES`] — and the back combines `(hsum + acc) + sh·w`
@@ -54,9 +54,10 @@ use super::program38::Ctx38;
 use super::scratch38::PASS_ROWS;
 use super::swap38::Qwen38Stacks;
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use crate::card_slots::CardAcc;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
-use crate::q38::{CardAccArgs, CardTierSharedAddArgs, SLOTS};
+use crate::q38::{CardTierSharedAddArgs, SLOTS, W_PITCH};
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
@@ -531,19 +532,18 @@ impl Card38 {
         ) else {
             return Err(no_card(l));
         };
-        c.k.q38.enqueue_card_acc(
-            c.gpu.stream(),
-            CardAccArgs {
-                down: &r.down,
-                w: weights,
-                sel,
-                n: geo::HIDDEN,
-                m,
-                n_card: cl.n_card,
-                fault: c.gpu.layer_sink(l)?,
-                acc: &mut r.acc,
-            },
-        )
+        let a = CardAcc {
+            down: &r.down,
+            w: weights,
+            sel,
+            n: geo::HIDDEN,
+            m,
+            n_card: cl.n_card,
+            n_used: SLOTS,
+            w_pitch: W_PITCH,
+            fault: c.gpu.layer_sink(l)?,
+        };
+        c.k.slots.enqueue_card_acc(c.gpu.stream(), &a, &mut r.acc)
     }
 
     /// [`Card38::enqueue`] but the card sum: the card slots' down outputs

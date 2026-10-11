@@ -2201,7 +2201,7 @@ impl FfnPiece {
             let mut sel = span_mut(WHAT, sel, at * N_USED, slots_n)?;
             kernels.enqueue_sel_merge(gpu.stream(), &ssel, slots_n, &mut sel)?;
         }
-        self.enqueue_block_finish(gpu, i, b, io.set, [at, u], tiered)
+        self.enqueue_block_finish(gpu, i, b, [layer, io.set], [at, u], tiered)
     }
 
     /// The block's launches for tokens `at .. u` of the group's batch `set`,
@@ -2227,7 +2227,7 @@ impl FfnPiece {
         tiered: bool,
     ) -> Result<(), GpuError> {
         self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], false)?;
-        self.enqueue_block_finish(gpu, i, b, set, [at, u], tiered)
+        self.enqueue_block_finish(gpu, i, b, [layer, set], [at, u], tiered)
     }
 
     /// With card experts, the tile path over the block's card slots
@@ -2285,7 +2285,7 @@ impl FfnPiece {
         gpu: &Gpu,
         i: usize,
         b: &mut FfnBatch,
-        set: usize,
+        [layer, set]: [usize; 2],
         [at, u]: [usize; 2],
         tiered: bool,
     ) -> Result<(), GpuError> {
@@ -2308,6 +2308,8 @@ impl FfnPiece {
             m,
             n_card: c.n_card,
             n_used: N_USED,
+            w_pitch: N_USED,
+            fault: gpu.layer_sink(layer)?,
         };
         b.kernels.enqueue_card_acc(stream, &a, &mut acc)
     }

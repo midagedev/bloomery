@@ -1,8 +1,8 @@
-//! The two launches a placed load of the family's chain (`placed`) runs
-//! around its host leg that no other module owns: each routed slot's place
-//! in the card's stacks ([`HostLegKernels::enqueue_places`]), and the
-//! combine of the card's slots with the host tier's routed sum
-//! ([`HostLegKernels::enqueue_combine`]).
+//! The launches a placed load of the family's chain (`placed`) runs around
+//! its host leg that no other module owns: each routed slot's place in the
+//! card's stacks ([`HostLegKernels::enqueue_places`], `crate::card_slots`'
+//! `ds41_ffn_places`), and the combine of the card's slots with the host
+//! tier's routed sum ([`HostLegKernels::enqueue_combine`]).
 //!
 //! The places, one thread per slot of `m` tokens at `pitch` slots a token
 //! (the router's layout: the routed `used`, then a gated router's shared
@@ -23,6 +23,7 @@
 //! place in `[n_card, HOST)` is no expert either side serves: it raises
 //! [`FaultSite::ExpertId`] and the token's value is NaN.
 
+use crate::card_slots::{CardSlotKernels, ColPlaces};
 use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
 use crate::{GpuError, launch_u32};
@@ -74,58 +75,6 @@ unsafe fn card_sum(
 #[cuda_module]
 mod qwen3moe_hostleg_kernels {
     use super::*;
-
-    /// Each slot's place (module doc): thread `k < m·pitch` writes
-    /// `sel[k]`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            used <= pitch,
-            ids.len() >= m * pitch,
-            map.len() >= row_off + n_expert,
-            sel.len() >= m * pitch
-        )
-    )]
-    pub fn qwen3moe_places(
-        ids: &[u32],
-        map: &[u32],
-        row_off: u32,
-        n_expert: u32,
-        pitch: u32,
-        used: u32,
-        m: u32,
-        fault: FaultSink,
-        mut sel: DisjointSlice<u32>,
-    ) {
-        let k = thread::index_1d().get();
-        if k >= m as usize * pitch as usize {
-            return;
-        }
-        let place = if k % pitch as usize >= used as usize {
-            HOST
-        } else {
-            // SAFETY: k < m·pitch <= ids.len() by the launch contract.
-            let id = unsafe { *ids.get_unchecked(k) };
-            if id < n_expert {
-                // SAFETY: id < n_expert, so row_off + id < map.len() by the
-                // launch contract.
-                unsafe { *map.get_unchecked(row_off as usize + id as usize) }
-            } else {
-                fault.raise(FaultSite::ExpertId);
-                HOST
-            }
-        };
-        // SAFETY: k < m·pitch <= sel.len() by the launch contract; thread k
-        // is sel[k]'s only writer.
-        unsafe { *sel.get_unchecked_mut(k) = place };
-    }
 
     /// The combine without a shared expert (module doc): thread `i <
     /// rows·m` writes `y[i]`.
@@ -293,6 +242,7 @@ pub(super) struct HostCombineArgs<'a> {
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub(super) struct HostLegKernels {
     module: qwen3moe_hostleg_kernels::LoadedModule,
+    places: CardSlotKernels,
 }
 
 impl HostLegKernels {
@@ -301,13 +251,17 @@ impl HostLegKernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(qwen3moe_hostleg_kernels, ctx)? };
-        Ok(HostLegKernels { module })
+        Ok(HostLegKernels {
+            module,
+            places: CardSlotKernels::load(ctx)?,
+        })
     }
 
-    /// Enqueue the places of `a.m` tokens' slots into `sel` (module doc). A
-    /// shape whose buffers are short, no token, or more routed slots than
-    /// the pitch is refused by name. Asynchronous, allocation-free,
-    /// capturable.
+    /// Enqueue the places of `a.m` tokens' slots into `sel` (module doc), as
+    /// [`CardSlotKernels::enqueue_places_cols`] at `ids` and `sel` pitches of
+    /// `a.pitch`. A shape whose buffers are short, no token, or more routed
+    /// slots than the pitch is refused by name. Asynchronous,
+    /// allocation-free, capturable.
     pub(super) fn enqueue_places(
         &self,
         stream: &CudaStream,
@@ -315,50 +269,17 @@ impl HostLegKernels {
         fault: FaultSink,
         sel: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "qwen3moe_places";
-        let n = a.m * a.pitch;
-        if a.m == 0
-            || a.used == 0
-            || a.used > a.pitch
-            || a.ids.len() < n
-            || sel.len() < n
-            || a.map.len() < a.row_off + a.n_expert
-        {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{} tokens of {} routed slots at a pitch of {} over {} ids into {} places, a \
-                     map of {} words read from {} for {} experts: a token or more, the routed \
-                     slots within the pitch, and every buffer that long",
-                    a.m,
-                    a.used,
-                    a.pitch,
-                    a.ids.len(),
-                    sel.len(),
-                    a.map.len(),
-                    a.row_off,
-                    a.n_expert
-                ),
-            ));
-        }
-        let grid = launch_u32(WHAT, "grid", n.div_ceil(THREADS as usize))?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_places(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.qwen3moe_places(
-            stream,
-            &prep,
-            a.ids,
-            a.map,
-            launch_u32(WHAT, "row_off", a.row_off)?,
-            launch_u32(WHAT, "n_expert", a.n_expert)?,
-            launch_u32(WHAT, "pitch", a.pitch)?,
-            launch_u32(WHAT, "used", a.used)?,
-            launch_u32(WHAT, "m", a.m)?,
-            fault,
-            sel,
-        )?;
-        Ok(())
+        let cols = ColPlaces {
+            ids: a.ids,
+            ids_pitch: a.pitch,
+            used: a.used,
+            sel_pitch: a.pitch,
+            m: a.m,
+            map: a.map,
+            row_off: a.row_off,
+            n_expert: a.n_expert,
+        };
+        self.places.enqueue_places_cols(stream, &cols, fault, sel)
     }
 
     /// Enqueue the combine of `a.m` tokens (module doc): the card's slots,

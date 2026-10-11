@@ -48,7 +48,7 @@
 //!   is the card's), the routed gate and up and down through
 //!   `q8_0_gemv_sel_f32` (the stacks are Q8_0 planes, and the down's 640
 //!   values are no multiple of `Q8Act`'s 256), SwiGLU between, the slots'
-//!   weighted sum (`q38_card_acc` over 512 card experts), the shared expert
+//!   weighted sum (`ds41_ffn_card_acc_10` over 512 card experts), the shared expert
 //!   and its gated sum (`q38_shared_add`);
 //! - the head site's mix (`nextn.hc_head_*`, the block's combine first, so
 //!   the streams are then the layer's output, `l_out`), the head's
@@ -97,6 +97,7 @@ use super::program38::{Ctx38, Kernels38, MMA, q8};
 use super::router::{RouterDims, RouterOut};
 use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
+use crate::card_slots::CardAcc;
 use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
@@ -107,7 +108,7 @@ use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
 use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, Q8_0SelArgs};
-use crate::q38::{CardAccArgs, EmbedQ8Args, OutGateArgs, SharedAddArgs};
+use crate::q38::{EmbedQ8Args, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
@@ -2073,19 +2074,18 @@ impl Mtp38 {
             sink,
             &mut a.rdown,
         )?;
-        k.q38.enqueue_card_acc(
-            stream,
-            CardAccArgs {
-                down: &a.rdown,
-                w: &a.route.weights,
-                sel: &a.sel,
-                n: h,
-                m,
-                n_card: geo::EXPERTS,
-                fault: sink,
-                acc: &mut a.acc,
-            },
-        )?;
+        let sum = CardAcc {
+            down: &a.rdown,
+            w: &a.route.weights,
+            sel: &a.sel,
+            n: h,
+            m,
+            n_card: geo::EXPERTS,
+            n_used: SLOTS,
+            w_pitch: W_PITCH,
+            fault: sink,
+        };
+        k.slots.enqueue_card_acc(stream, &sum, &mut a.acc)?;
         cx.q8_gemv(&n.gate_sh, &a.ffn_x, m, &mut a.sh_g)?;
         cx.q8_gemv(&n.up_sh, &a.ffn_x, m, &mut a.sh_u)?;
         gpu.elem()

@@ -707,6 +707,8 @@ pub(crate) fn card_rows(
         m: t,
         n_card: cl.n_card,
         n_used: N_USED,
+        w_pitch: N_USED,
+        fault,
     };
     k.batch.enqueue_card_acc(stream, &acc, &mut *io.acc)
 }

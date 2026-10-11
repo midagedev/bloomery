@@ -1518,10 +1518,11 @@ mod gate {
         let mut ok = no_local_depot(&["ds41_ffn_card_acc_8", "ds41_card_gather_8"])?;
 
         // Per token, the places of its eight slots: slot 7 on the card in
-        // every token, place 9 (not below N_CARD) and HOST off it.
+        // every token, HOST off it (a place between the card and HOST raises:
+        // card_slots.rs's hw test holds that clause).
         let places: [[u32; SLOTS8]; M] = [
-            [0, HOST, 2, 1, 9, 5, HOST, 3],
-            [HOST, 4, 4, 0, 1, HOST, 9, 5],
+            [0, HOST, 2, 1, HOST, 5, HOST, 3],
+            [HOST, 4, 4, 0, 1, HOST, HOST, 5],
             [3, 2, HOST, HOST, 0, 1, 5, 4],
         ];
         for n_used in [SLOTS8, N_USED] {
@@ -1558,6 +1559,8 @@ mod gate {
                 m: M,
                 n_card: N_CARD,
                 n_used,
+                w_pitch: n_used,
+                fault: gpu.unlabelled_sink(),
             };
             kernels.enqueue_card_acc(stream, &a, &mut acc)?;
             let got = acc.to_host_vec(stream)?;
@@ -1607,6 +1610,8 @@ mod gate {
                 m: M,
                 n_card: N_CARD,
                 n_used,
+                w_pitch: n_used,
+                fault: gpu.unlabelled_sink(),
             };
             let got = kernels.enqueue_card_acc(stream, &a, &mut acc);
             let untouched = acc

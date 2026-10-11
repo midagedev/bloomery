@@ -148,6 +148,7 @@ use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use super::tier38::TierSide38;
 use crate::GpuError;
+use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaSelArgs;
 use crate::flash_gqa_prefill::GqaPrefillArgs;
@@ -168,8 +169,8 @@ use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
 use crate::q38::{
-    CardAccArgs, CardSharedAddArgs, CardTierAccArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs,
-    SharedAddArgs,
+    CardSharedAddArgs, CardTierAccArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, SLOTS,
+    SharedAddArgs, W_PITCH,
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
@@ -1178,19 +1179,18 @@ impl CardRoute38 {
                     sum_places = (&rr.union, n_card + r.n);
                 }
                 if !tiered {
-                    c.k.q38.enqueue_card_acc(
-                        stream,
-                        CardAccArgs {
-                            down: &down_w,
-                            w: &w_w,
-                            sel: sum_places.0,
-                            n: geo::HIDDEN,
-                            m: n,
-                            n_card: sum_places.1,
-                            fault: sink,
-                            acc: &mut acc_w,
-                        },
-                    )?;
+                    let a = CardAcc {
+                        down: &down_w,
+                        w: &w_w,
+                        sel: sum_places.0,
+                        n: geo::HIDDEN,
+                        m: n,
+                        n_card: sum_places.1,
+                        n_used: SLOTS,
+                        w_pitch: W_PITCH,
+                        fault: sink,
+                    };
+                    c.k.slots.enqueue_card_acc(stream, &a, &mut acc_w)?;
                 }
                 c0 += n;
             }

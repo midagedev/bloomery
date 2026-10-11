@@ -166,6 +166,7 @@ crates/model/src/arch/mimo2/**	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the M
 crates/refset/src/arch/mimo2/**	weekly-gpu-mimo2-e2e	the MiMo oracle sets' family, which the gate reads every set through
 crates/gpu-gates/src/bin/gate_mimo2_e2e.rs	weekly-gpu-mimo2-e2e	the MiMo end-to-end gate's own bin
 crates/gpu-gates/src/bin/shared/mimo2_open.rs	weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	the MiMo open both MiMo gates load the model through
+crates/gpu/src/{card_slots,card_leg}.rs	weekly-gpu-mimo2-e2e	the card slots' places and sum, which MiMo's card leg runs
 crates/gpu-gates/src/bin/{gate_mimo2_serve.rs,shared/serve_seats/mimo2.rs}	weekly-gpu-mimo2-serve	the MiMo serve gate's own bin and the seat it serves through
 tools/flow/**	weekly-gpu-ds41-flowcounts	the flow model and its plans, which --counts holds to the engine's
 crates/gpu-deepseek41/src/body/prefill*.rs	weekly-gpu-ds41-flowcounts	the prompt call's counters (stat prefill front, stat prefill lb)

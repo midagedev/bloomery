@@ -4,20 +4,26 @@
 //! experts on the card ([`crate::card_leg`] runs the launches between them):
 //! each reads `m` tokens of `n_used` routed slots, slot-major.
 //!
-//! - **Places** (`ds41_ffn_places`): the handoff's rule over a batch's ids,
-//!   `sel[i] = map[row_off + ids[i]]`, the id's slot in the card's routed
-//!   stacks, or [`HOST`] for an expert the card does not hold; an id not below
-//!   the layer's expert count has no place and raises
-//!   [`FaultSite::ExpertId`].
-//! - **Sum** (`ds41_ffn_card_acc` for six slots a token, `ds41_ffn_card_acc_8`
-//!   for eight, any other count refused by name): value `d` of token `t` is
-//!   `acc = fma(down[(Nt + j)·n + d], w[Nt + j], acc)` from zero for each slot
-//!   `j` whose place is below `n_card`, in ascending `j` (this order is the
-//!   gate, `runtime::combine::card_sum`). No other slot's rows are read.
+//! - **Places** (`ds41_ffn_places`): the handoff's rule over `m` columns of
+//!   routed ids, `sel[c·sel_pitch + e] = map[row_off + ids[c·ids_pitch +
+//!   e]]` for the routed slots `e < used`, the id's slot in the card's routed
+//!   stacks, or [`HOST`] for an expert the card does not hold; an id not
+//!   below the layer's expert count has no place and raises
+//!   [`FaultSite::ExpertId`]. A lane `e >= used` of a `sel_pitch` wider than
+//!   `used` is [`HOST`] and reads no id (the router's shared slot); an
+//!   `ids_pitch` wider than `used` leaves the router's extra words unread.
+//! - **Sum** (`ds41_ffn_card_acc` for six slots a token, `_8` for eight,
+//!   `_10` for ten, any other count refused by name): value `d` of token `t`
+//!   is `acc = fma(down[(Nt + j)·n + d], w[Nt·p/N + j], acc)` from zero for
+//!   each slot `j` whose place is below `n_card`, in ascending `j` (this
+//!   order is the gate, `runtime::combine::card_sum`), `p` the weights' pitch
+//!   a token (`N` or the router's `N + 1`). No other slot's rows or weight are
+//!   read. A place in `[n_card, HOST)` names neither a card slot nor the
+//!   host: it raises [`FaultSite::ExpertId`] and its token's values are NaN.
 //!
-//! The entries keep the names the DeepSeek-V4.1 family gave them; a family
-//! whose sum is another rule (a shared expert, the expert tier's rows, a fault
-//! on a place no side serves) keeps its own.
+//! The entries keep the names the DeepSeek-V4.1 family gave them; no family
+//! keeps its own sum for the fault or the weights' pitch. A family whose sum
+//! is another rule (a shared expert, the expert tier's rows) keeps its own.
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
@@ -25,7 +31,6 @@ use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
-use runtime::combine::Slots;
 use std::sync::Arc;
 
 /// Threads per block of every kernel here.
@@ -37,11 +42,68 @@ const _: () = assert!(THREADS == 256);
 pub const SLOTS_6: usize = 6;
 /// Slots a token of the `_8` sum, whose contract spells it as a literal.
 pub const SLOTS_8: usize = 8;
-// The instance table's counts are the entries' own.
-const _: () = assert!(Slots::Six.n() == SLOTS_6 && Slots::Eight.n() == SLOTS_8);
+/// Slots a token of the `_10` sum, whose contract spells it as a literal.
+pub const SLOTS_10: usize = 10;
+
+/// The routed slot counts the sum has an entry for: one entry per count,
+/// picked at launch, and every other count refused by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardSlots {
+    /// Six slots a token (DeepSeek-V4.1).
+    Six,
+    /// Eight slots a token (GLM-5.3-Flash).
+    Eight,
+    /// Ten slots a token, the router's weights at a pitch of eleven
+    /// (Qwen3.8).
+    Ten,
+}
+
+impl CardSlots {
+    /// The instance for `n_used` slots a token, or `None`.
+    #[must_use]
+    pub const fn of(n_used: usize) -> Option<CardSlots> {
+        match n_used {
+            SLOTS_6 => Some(CardSlots::Six),
+            SLOTS_8 => Some(CardSlots::Eight),
+            SLOTS_10 => Some(CardSlots::Ten),
+            _ => None,
+        }
+    }
+
+    /// The instance's slot count.
+    #[must_use]
+    pub const fn n(self) -> usize {
+        match self {
+            CardSlots::Six => SLOTS_6,
+            CardSlots::Eight => SLOTS_8,
+            CardSlots::Ten => SLOTS_10,
+        }
+    }
+
+    /// The entry's name.
+    #[must_use]
+    const fn entry(self) -> &'static str {
+        match self {
+            CardSlots::Six => "ds41_ffn_card_acc",
+            CardSlots::Eight => "ds41_ffn_card_acc_8",
+            CardSlots::Ten => "ds41_ffn_card_acc_10",
+        }
+    }
+
+    /// The count `n_used` refused by name, as the launchers report it.
+    pub(crate) fn refusal(n_used: usize) -> GpuError {
+        GpuError::Shape {
+            what: "ds41_ffn_card_acc",
+            detail: format!(
+                "{n_used} routed slots a token: the card sum's entries are built for 6, 8 and 10"
+            ),
+        }
+    }
+}
 
 /// The card half of one output value's combine: `acc = fma(down_j, w_j, acc)`
-/// from zero for each slot `j` whose place is on the card, in slot order.
+/// from zero for each slot `j` whose place is on the card (`card[j]`), in slot
+/// order.
 #[inline(always)]
 pub fn card_sum_elem(down: [f32; SLOTS_6], w: [f32; SLOTS_6], card: [bool; SLOTS_6]) -> f32 {
     let mut acc = 0.0f32;
@@ -59,50 +121,13 @@ pub fn card_sum_elem(down: [f32; SLOTS_6], w: [f32; SLOTS_6], card: [bool; SLOTS
 mod card_slots_kernels {
     use super::*;
 
-    /// Each slot's place, the handoff's rule: thread `i < n` writes `sel[i] =
-    /// map[row_off + ids[i]]` — the id's slot in the card's routed stacks, or
-    /// [`HOST`]. An id not below `n_expert` has no place: it raises
-    /// [`FaultSite::ExpertId`] on `fault` and its place is [`HOST`], so no
-    /// card kernel reads a row for it.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (ids.len() >= n, map.len() >= row_off + n_expert, sel.len() >= n)
-    )]
-    pub fn ds41_ffn_places(
-        ids: &[u32],
-        map: &[u32],
-        row_off: u32,
-        n_expert: u32,
-        n: u32,
-        fault: FaultSink,
-        mut sel: DisjointSlice<u32>,
-    ) {
-        let i = thread::index_1d().get();
-        if i >= n as usize {
-            return;
-        }
-        // SAFETY: i < n <= ids.len() by the launch contract.
-        let id = unsafe { *ids.get_unchecked(i) };
-        let place = if id < n_expert {
-            // SAFETY: id < n_expert, so row_off + id < map.len() by the launch
-            // contract.
-            unsafe { *map.get_unchecked(row_off as usize + id as usize) }
-        } else {
-            fault.raise(FaultSite::ExpertId);
-            HOST
-        };
-        // SAFETY: i < n <= sel.len(); thread i is sel[i]'s only writer.
-        unsafe { *sel.get_unchecked_mut(i) = place };
-    }
-
-    /// The card slots' sum of `m` tokens: thread `i < m·n` is token `t = i /
-    /// n`, value `d = i % n`, and writes [`card_sum_elem`] of its six slots'
-    /// down outputs `down[(6t + j)·n + d]`, weights `w[6t + j]` and places
-    /// `sel[6t + j]` (the card's below `n_card`; no other slot's rows are
-    /// read) to `acc[i]`.
+    /// Each slot's place, the handoff's rule: thread `k < m·sel_pitch` is
+    /// column `c = k / sel_pitch`, lane `e = k % sel_pitch`, and writes
+    /// `sel[k] = map[row_off + ids[c·ids_pitch + e]]` — the id's slot in the
+    /// card's routed stacks, or [`HOST`] — for a routed lane `e < used`; a
+    /// lane `e >= used` is [`HOST`] and reads no id. An id not below
+    /// `n_expert` has no place: it raises [`FaultSite::ExpertId`] on `fault`
+    /// and its place is [`HOST`], so no card kernel reads a row for it.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -113,8 +138,67 @@ mod card_slots_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
+            used >= 1,
+            used <= ids_pitch,
+            used <= sel_pitch,
+            ids.len() >= m * ids_pitch,
+            map.len() >= row_off + n_expert,
+            sel.len() >= m * sel_pitch
+        )
+    )]
+    pub fn ds41_ffn_places(
+        ids: &[u32],
+        map: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        ids_pitch: u32,
+        used: u32,
+        sel_pitch: u32,
+        m: u32,
+        fault: FaultSink,
+        mut sel: DisjointSlice<u32>,
+    ) {
+        let k = thread::index_1d().get();
+        if k >= m as usize * sel_pitch as usize {
+            return;
+        }
+        let (c, e) = (k / sel_pitch as usize, k % sel_pitch as usize);
+        let place = if e >= used as usize {
+            HOST
+        } else {
+            // SAFETY: c < m and e < used <= ids_pitch put c·ids_pitch + e
+            // below m·ids_pitch <= ids.len() by the launch contract.
+            let id = unsafe { *ids.get_unchecked(c * ids_pitch as usize + e) };
+            if id < n_expert {
+                // SAFETY: id < n_expert, so row_off + id < map.len() by the
+                // launch contract.
+                unsafe { *map.get_unchecked(row_off as usize + id as usize) }
+            } else {
+                fault.raise(FaultSite::ExpertId);
+                HOST
+            }
+        };
+        // SAFETY: k < m·sel_pitch <= sel.len(); thread k is sel[k]'s only
+        // writer.
+        unsafe { *sel.get_unchecked_mut(k) = place };
+    }
+
+    /// The card slots' sum of `m` tokens: thread `i < m·n` is token `t = i /
+    /// n`, value `d = i % n`, and writes [`card_acc_at`] of its six slots to
+    /// `acc[i]`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= 6,
             down.len() >= 6 * n * m,
-            w.len() >= 6 * m,
+            w.len() >= w_pitch * m,
             sel.len() >= 6 * m,
             acc.len() >= n * m
         )
@@ -126,6 +210,8 @@ mod card_slots_kernels {
         n: u32,
         m: u32,
         n_card: u32,
+        w_pitch: u32,
+        fault: FaultSink,
         mut acc: DisjointSlice<f32>,
     ) {
         let (n, m) = (n as usize, m as usize);
@@ -133,25 +219,12 @@ mod card_slots_kernels {
         if i >= n * m {
             return;
         }
-        let (t, d) = (i / n, i % n);
-        let mut dv = [0.0f32; SLOTS_6];
-        let mut wv = [0.0f32; SLOTS_6];
-        let mut card = [false; SLOTS_6];
-        let mut j = 0usize;
-        while j < SLOTS_6 {
-            let s = t * SLOTS_6 + j;
-            // SAFETY: s < 6m <= sel.len() and w.len() by the launch contract.
-            let (place, ws) = unsafe { (*sel.get_unchecked(s), *w.get_unchecked(s)) };
-            if place < n_card {
-                card[j] = true;
-                wv[j] = ws;
-                // SAFETY: s < 6m and d < n, so s·n + d < 6nm <= down.len().
-                dv[j] = unsafe { *down.get_unchecked(s * n + d) };
-            }
-            j += 1;
-        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_6 slots.
+        let v =
+            unsafe { card_acc_at::<SLOTS_6>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
-        unsafe { *acc.get_unchecked_mut(i) = card_sum_elem(dv, wv, card) };
+        unsafe { *acc.get_unchecked_mut(i) = v };
     }
 
     /// [`ds41_ffn_card_acc`] of eight slots a token ([`card_acc_at`]).
@@ -165,8 +238,9 @@ mod card_slots_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
+            w_pitch >= 8,
             down.len() >= 8 * n * m,
-            w.len() >= 8 * m,
+            w.len() >= w_pitch * m,
             sel.len() >= 8 * m,
             acc.len() >= n * m
         )
@@ -178,6 +252,8 @@ mod card_slots_kernels {
         n: u32,
         m: u32,
         n_card: u32,
+        w_pitch: u32,
+        fault: FaultSink,
         mut acc: DisjointSlice<f32>,
     ) {
         let (n, m) = (n as usize, m as usize);
@@ -187,20 +263,69 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_8 slots.
-        let v = unsafe { card_acc_at::<SLOTS_8>(down, w, sel, n, n_card, i) };
+        let v =
+            unsafe { card_acc_at::<SLOTS_8>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc`] of ten slots a token ([`card_acc_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= 10,
+            down.len() >= 10 * n * m,
+            w.len() >= w_pitch * m,
+            sel.len() >= 10 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_10(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        w_pitch: u32,
+        fault: FaultSink,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_10 slots.
+        let v =
+            unsafe { card_acc_at::<SLOTS_10>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
 }
 
 /// The card slots' sum of value `i` (token `t = i / n`, value `d = i % n`)
-/// of `N` slots a token: `acc = fma(down[(Nt + j)·n + d], w[Nt + j], acc)`
-/// from zero for each slot `j` below `N` whose place `sel[Nt + j]` is below
-/// `n_card`, in ascending `j` — the order `runtime::combine::card_sum` pins
-/// (this order is the gate); no other slot's rows are read.
+/// of `N` slots a token: `acc = fma(down[(Nt + j)·n + d], w[t·w_pitch + j],
+/// acc)` from zero for each slot `j` below `N` whose place `sel[Nt + j]` is
+/// below `n_card`, in ascending `j` — the order `runtime::combine::card_sum`
+/// pins (this order is the gate); no other slot's rows or weight are read. A
+/// place in `[n_card, HOST)` raises [`FaultSite::ExpertId`] (from the token's
+/// value 0) and the value is NaN.
 ///
-/// SAFETY: `i < n · m` for an `m` with `down.len() >= N · n · m`, `w.len()`
-/// and `sel.len() >= N · m`.
+/// SAFETY: `i < n · m` for an `m` with `down.len() >= N · n · m`, `sel.len()
+/// >= N · m`, and `w.len() >= w_pitch · m` with `w_pitch >= N`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device helper: the entries' arguments flat (rust-quality R8)"
+)]
 #[inline(always)]
 unsafe fn card_acc_at<const N: usize>(
     down: &[f32],
@@ -208,6 +333,8 @@ unsafe fn card_acc_at<const N: usize>(
     sel: &[u32],
     n: usize,
     n_card: u32,
+    w_pitch: usize,
+    fault: FaultSink,
     i: usize,
 ) -> f32 {
     let (t, d) = (i / n, i % n);
@@ -215,12 +342,24 @@ unsafe fn card_acc_at<const N: usize>(
     for j in 0..N {
         cuda_device::thread::__unroll_config::<0>();
         let s = t * N + j;
-        // SAFETY: s < N·m <= sel.len() and w.len() by this fn's contract.
-        let (place, ws) = unsafe { (*sel.get_unchecked(s), *w.get_unchecked(s)) };
+        // SAFETY: s < N·m <= sel.len() by this fn's contract.
+        let place = unsafe { *sel.get_unchecked(s) };
         if place < n_card {
-            // SAFETY: s < N·m and d < n, so s·n + d < N·n·m <= down.len().
-            let ds = unsafe { *down.get_unchecked(s * n + d) };
+            // SAFETY: t < m and j < N <= w_pitch put t·w_pitch + j below
+            // w_pitch·m <= w.len(), and s < N·m and d < n put s·n + d below
+            // N·n·m <= down.len(), by this fn's contract.
+            let (ws, ds) = unsafe {
+                (
+                    *w.get_unchecked(t * w_pitch + j),
+                    *down.get_unchecked(s * n + d),
+                )
+            };
             acc = ds.mul_add(ws, acc);
+        } else if place != HOST {
+            if d == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            acc = f32::NAN;
         }
     }
     acc
@@ -237,10 +376,28 @@ pub struct Places<'a> {
     pub n_expert: usize,
 }
 
+/// What [`CardSlotKernels::enqueue_places_cols`] reads: `m` columns of the
+/// router's words at `ids_pitch` a column, the routed `used` first, and the
+/// slot map's card copy as in [`Places`]; the places go out at `sel_pitch` a
+/// column.
+pub struct ColPlaces<'a> {
+    pub ids: &'a DeviceBuffer<u32>,
+    pub ids_pitch: usize,
+    pub used: usize,
+    pub sel_pitch: usize,
+    pub m: usize,
+    pub map: &'a DeviceBuffer<u32>,
+    pub row_off: usize,
+    pub n_expert: usize,
+}
+
 /// What [`CardSlotKernels::enqueue_card_acc`] reads, `m` tokens of `n_used`
 /// slots: `down` the slots' down outputs slot-major (`n` each, token `t`'s
-/// slots `n_used · t ..`), `w` their routing weights and `sel` their places
-/// (the card's below `n_card`; no other slot's rows are read).
+/// slots `n_used · t ..`), `w` their routing weights (`w_pitch` a token, the
+/// routed slots first: `n_used`, or `n_used + 1` for a router whose last
+/// weight is the shared expert's) and `sel` their places (the card's below
+/// `n_card`, the host's [`HOST`]; a place between raises
+/// [`FaultSite::ExpertId`] on `fault` and its token's sum is NaN).
 pub struct CardAcc<'a> {
     pub down: &'a DeviceBuffer<f32>,
     pub w: &'a DeviceBuffer<f32>,
@@ -249,6 +406,8 @@ pub struct CardAcc<'a> {
     pub m: usize,
     pub n_card: usize,
     pub n_used: usize,
+    pub w_pitch: usize,
+    pub fault: FaultSink,
 }
 
 /// The launches' module: loaded once per context by its owner, or alone by a
@@ -266,9 +425,10 @@ impl CardSlotKernels {
         Ok(CardSlotKernels { module })
     }
 
-    /// Enqueue `ds41_ffn_places`: `sel[i]` the place of `p.ids[i]` for `i <
-    /// p.n`, [`HOST`] and [`FaultSite::ExpertId`] on `fault` for an id past
-    /// the stack. One launch. Asynchronous, allocation-free.
+    /// Enqueue `ds41_ffn_places` over `p.n` flat ids: `sel[i]` the place of
+    /// `p.ids[i]` for `i < p.n`, [`HOST`] and [`FaultSite::ExpertId`] on
+    /// `fault` for an id past the stack. One launch. Asynchronous,
+    /// allocation-free.
     pub fn enqueue_places(
         &self,
         stream: &CudaStream,
@@ -276,8 +436,62 @@ impl CardSlotKernels {
         fault: FaultSink,
         sel: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        let what = "ds41_ffn_places";
-        let grid = launch_u32(what, "grid", p.n.div_ceil(THREADS as usize))?;
+        let cols = ColPlaces {
+            ids: p.ids,
+            ids_pitch: 1,
+            used: 1,
+            sel_pitch: 1,
+            m: p.n,
+            map: p.map,
+            row_off: p.row_off,
+            n_expert: p.n_expert,
+        };
+        self.enqueue_places_cols(stream, &cols, fault, sel)
+    }
+
+    /// Enqueue `ds41_ffn_places` over `p.m` columns (module doc): lane `e <
+    /// p.used` of column `c` is the place of `p.ids[c·ids_pitch + e]`, a
+    /// lane up to `sel_pitch` past the routed ones [`HOST`], and
+    /// [`FaultSite::ExpertId`] on `fault` for an id past the stack. No
+    /// column, no routed slot, `used` past either pitch, and buffers short
+    /// of `m` columns are refused by name. One launch. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_places_cols(
+        &self,
+        stream: &CudaStream,
+        p: &ColPlaces<'_>,
+        fault: FaultSink,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "ds41_ffn_places";
+        if p.m == 0
+            || p.used == 0
+            || p.used > p.ids_pitch
+            || p.used > p.sel_pitch
+            || p.ids.len() < p.m * p.ids_pitch
+            || sel.len() < p.m * p.sel_pitch
+            || p.map.len() < p.row_off + p.n_expert
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} columns of {} routed slots, ids at a pitch of {} over {} words, places at \
+                     a pitch of {} into {}, a map of {} words read from {} for {} experts: a \
+                     column or more, the routed slots within both pitches, and every buffer that \
+                     long",
+                    p.m,
+                    p.used,
+                    p.ids_pitch,
+                    p.ids.len(),
+                    p.sel_pitch,
+                    sel.len(),
+                    p.map.len(),
+                    p.row_off,
+                    p.n_expert
+                ),
+            ));
+        }
+        let grid = launch_u32(WHAT, "grid", (p.m * p.sel_pitch).div_ceil(THREADS as usize))?;
         let prep = self
             .module
             .prepare_ds41_ffn_places(LaunchConfig1D::new(grid, THREADS, 0))?;
@@ -286,9 +500,12 @@ impl CardSlotKernels {
             &prep,
             p.ids,
             p.map,
-            launch_u32(what, "row_off", p.row_off)?,
-            launch_u32(what, "n_expert", p.n_expert)?,
-            launch_u32(what, "n", p.n)?,
+            launch_u32(WHAT, "row_off", p.row_off)?,
+            launch_u32(WHAT, "n_expert", p.n_expert)?,
+            launch_u32(WHAT, "ids_pitch", p.ids_pitch)?,
+            launch_u32(WHAT, "used", p.used)?,
+            launch_u32(WHAT, "sel_pitch", p.sel_pitch)?,
+            launch_u32(WHAT, "m", p.m)?,
             fault,
             sel,
         )?;
@@ -296,9 +513,12 @@ impl CardSlotKernels {
     }
 
     /// Enqueue the card sums of `a.m` tokens of `a.n_used` slots
-    /// (`ds41_ffn_card_acc` for 6, `ds41_ffn_card_acc_8` for 8; any other
-    /// count is refused by name): value `i` of token `t = i / a.n` into
-    /// `acc[i]`, the card half of the combine. One launch. Asynchronous,
+    /// (`ds41_ffn_card_acc` for 6, `_8` for 8, `_10` for 10; any other count
+    /// is refused by name): value `i` of token `t = i / a.n` into `acc[i]`,
+    /// the card half of the combine. A card of no expert, a weights pitch
+    /// under the slot count, and buffers short of `a.m` tokens are refused by
+    /// name, nothing launched. A place in `[a.n_card, HOST)` raises
+    /// [`FaultSite::ExpertId`] on `a.fault`. One launch. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_card_acc(
         &self,
@@ -306,33 +526,266 @@ impl CardSlotKernels {
         a: &CardAcc<'_>,
         acc: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let slots = Slots::of(a.n_used).map_err(|e| GpuError::Shape {
-            what: "ds41_ffn_card_acc",
-            detail: e.to_string(),
-        })?;
-        let what = match slots {
-            Slots::Six => "ds41_ffn_card_acc",
-            Slots::Eight => "ds41_ffn_card_acc_8",
-        };
-        let grid = launch_u32(what, "grid", (a.m * a.n).div_ceil(THREADS as usize))?;
+        let slots = CardSlots::of(a.n_used).ok_or_else(|| CardSlots::refusal(a.n_used))?;
+        let what = slots.entry();
+        let (nm, k) = (a.n * a.m, slots.n());
+        if nm == 0 || a.n_card == 0 || a.w_pitch < k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} values of {} tokens over a card of {} experts, weights at a pitch of {} \
+                     for {k} slots: at least one of each, and a pitch of the slot count or more",
+                    a.n, a.m, a.n_card, a.w_pitch
+                ),
+            ));
+        }
+        for (name, len, need) in [
+            ("down", a.down.len(), k * nm),
+            ("w", a.w.len(), a.w_pitch * a.m),
+            ("sel", a.sel.len(), k * a.m),
+            ("acc", acc.len(), nm),
+        ] {
+            if len < need {
+                return Err(GpuError::shape(
+                    what,
+                    format!("{name} holds {len} words, {need} needed"),
+                ));
+            }
+        }
+        let grid = launch_u32(what, "grid", nm.div_ceil(THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, THREADS, 0);
-        let (n, m, n_card) = (
+        let (n, m, n_card, w_pitch) = (
             launch_u32(what, "n", a.n)?,
             launch_u32(what, "m", a.m)?,
             launch_u32(what, "n_card", a.n_card)?,
+            launch_u32(what, "w_pitch", a.w_pitch)?,
         );
+        let mo = &self.module;
         match slots {
-            Slots::Six => {
-                let prep = self.module.prepare_ds41_ffn_card_acc(cfg)?;
-                self.module
-                    .ds41_ffn_card_acc(stream, &prep, a.down, a.w, a.sel, n, m, n_card, acc)?;
+            CardSlots::Six => {
+                let prep = mo.prepare_ds41_ffn_card_acc(cfg)?;
+                mo.ds41_ffn_card_acc(
+                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
             }
-            Slots::Eight => {
-                let prep = self.module.prepare_ds41_ffn_card_acc_8(cfg)?;
-                self.module
-                    .ds41_ffn_card_acc_8(stream, &prep, a.down, a.w, a.sel, n, m, n_card, acc)?;
+            CardSlots::Eight => {
+                let prep = mo.prepare_ds41_ffn_card_acc_8(cfg)?;
+                mo.ds41_ffn_card_acc_8(
+                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
+            }
+            CardSlots::Ten => {
+                let prep = mo.prepare_ds41_ffn_card_acc_10(cfg)?;
+                mo.ds41_ffn_card_acc_10(
+                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Gpu;
+    use runtime::combine::card_sum;
+
+    /// The host rule of value `d` of token `t` at `N` slots.
+    fn rule<const N: usize>(
+        (down, w, sel): (&[f32], &[f32], &[u32]),
+        (n, n_card, w_pitch): (usize, u32, usize),
+        (t, d): (usize, usize),
+    ) -> f32 {
+        card_sum::<N>(
+            std::array::from_fn(|j| down[(t * N + j) * n + d]),
+            std::array::from_fn(|j| w[t * w_pitch + j]),
+            std::array::from_fn(|j| sel[t * N + j] < n_card),
+        )
+    }
+
+    /// The sum at 6, 8 and 10 slots (the weights at the router's pitch of
+    /// eleven at ten): a token whose slots are on the card or [`HOST`] is
+    /// `runtime::combine::card_sum`'s and raises nothing; a place in
+    /// `[n_card, HOST)` — the first past the card and the last before the
+    /// host — raises [`FaultSite::ExpertId`] alone, at the launch's layer,
+    /// and its token's values are NaN, the other tokens' the rule's. Every
+    /// case is judged and printed before the test fails.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_place_between_the_card_and_the_host_faults_the_sum() {
+        const N: usize = 300;
+        const M: usize = 3;
+        const N_CARD: u32 = 5;
+        const LAYER: usize = 7;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let kernels = CardSlotKernels::load(gpu.context()).expect("the card slots' module");
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let mut red = Vec::new();
+        for n_used in [SLOTS_6, SLOTS_8, SLOTS_10] {
+            let w_pitch = if n_used == SLOTS_10 {
+                n_used + 1
+            } else {
+                n_used
+            };
+            // Slots on the card or the host's; token 1's slot 3 takes the
+            // stray's place.
+            let base: Vec<u32> = (0..M * n_used)
+                .map(|s| {
+                    if (s * 7 + s / n_used).is_multiple_of(3) {
+                        HOST
+                    } else {
+                        (s % 5) as u32
+                    }
+                })
+                .collect();
+            for stray in [None, Some(N_CARD), Some(HOST - 1)] {
+                let mut sel = base.clone();
+                if let Some(p) = stray {
+                    sel[n_used + 3] = p;
+                }
+                let on = |s: usize| sel[s] < N_CARD;
+                // A slot the sum must not read holds NaN, its weight too.
+                let down: Vec<f32> = (0..M * n_used * N)
+                    .map(|i| if on(i / N) { next() } else { f32::NAN })
+                    .collect();
+                let w: Vec<f32> = (0..M * w_pitch)
+                    .map(|i| {
+                        let (t, j) = (i / w_pitch, i % w_pitch);
+                        if j < n_used && on(t * n_used + j) {
+                            next()
+                        } else {
+                            f32::NAN
+                        }
+                    })
+                    .collect();
+                let (sel_d, down_d, w_d) = (
+                    DeviceBuffer::from_host(stream, &sel).expect("sel"),
+                    DeviceBuffer::from_host(stream, &down).expect("down"),
+                    DeviceBuffer::from_host(stream, &w).expect("w"),
+                );
+                let mut acc = DeviceBuffer::from_host(stream, &[0.0f32; N * M]).expect("acc");
+                let a = CardAcc {
+                    down: &down_d,
+                    w: &w_d,
+                    sel: &sel_d,
+                    n: N,
+                    m: M,
+                    n_card: N_CARD as usize,
+                    n_used,
+                    w_pitch,
+                    fault: gpu.layer_sink(LAYER).expect("a sink"),
+                };
+                kernels
+                    .enqueue_card_acc(stream, &a, &mut acc)
+                    .expect("the card sum");
+                let got = acc.to_host_vec(stream).expect("sums");
+                stream.synchronize().expect("sync");
+                let fault = gpu.take_fault().expect("the fault word");
+                let off = got
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, g)| {
+                        let (t, d) = (i / N, i % N);
+                        if stray.is_some() && t == 1 {
+                            return !g.is_nan();
+                        }
+                        let args = ((&down[..], &w[..], &sel[..]), (N, N_CARD, w_pitch), (t, d));
+                        let want = match n_used {
+                            SLOTS_6 => rule::<SLOTS_6>(args.0, args.1, args.2),
+                            SLOTS_8 => rule::<SLOTS_8>(args.0, args.1, args.2),
+                            _ => rule::<SLOTS_10>(args.0, args.1, args.2),
+                        };
+                        g.to_bits() != want.to_bits()
+                    })
+                    .count();
+                let fault_ok = match (stray, fault) {
+                    (None, None) => true,
+                    (Some(_), Some(f)) => {
+                        f.layer as usize == LAYER
+                            && f.site() == Some(FaultSite::ExpertId)
+                            && f.sites == 1 << FaultSite::ExpertId as u32
+                    }
+                    _ => false,
+                };
+                let pass = off == 0 && fault_ok;
+                println!(
+                    "card_acc of {n_used} slots, weights at {w_pitch}, stray {stray:?}: {off} \
+                     values off the rule, fault {fault:?}: {}",
+                    if pass { "PASS" } else { "FAIL" }
+                );
+                if !pass {
+                    red.push(format!("{n_used} slots, stray {stray:?}"));
+                }
+            }
+        }
+        assert!(red.is_empty(), "red cases: {red:?}");
+    }
+
+    /// The places' lanes past `used` at a `sel_pitch` of the router's width:
+    /// [`HOST`], and the id words there — the shared expert's, past the
+    /// experts — never read, so nothing is raised.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_places_lanes_past_the_routed_slots_are_host_and_read_no_id() {
+        const N_EXPERT: usize = 40;
+        const USED: usize = 10;
+        const PITCH: usize = USED + 1;
+        const M: usize = 4;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let kernels = CardSlotKernels::load(gpu.context()).expect("the card slots' module");
+        let place_of = |e: usize| {
+            if e.is_multiple_of(3) {
+                HOST
+            } else {
+                (e * 7 % 20) as u32
+            }
+        };
+        let map: Vec<u32> = (0..N_EXPERT).map(place_of).collect();
+        let ids: Vec<u32> = (0..M * PITCH)
+            .map(|k| {
+                if k % PITCH == USED {
+                    N_EXPERT as u32
+                } else {
+                    ((k * 37 + 11) % N_EXPERT) as u32
+                }
+            })
+            .collect();
+        let (ids_d, map_d) = (
+            DeviceBuffer::from_host(stream, &ids).expect("ids"),
+            DeviceBuffer::from_host(stream, &map).expect("map"),
+        );
+        let mut sel = DeviceBuffer::from_host(stream, &[0xdead_beefu32; M * PITCH]).expect("sel");
+        let p = ColPlaces {
+            ids: &ids_d,
+            ids_pitch: PITCH,
+            used: USED,
+            sel_pitch: PITCH,
+            m: M,
+            map: &map_d,
+            row_off: 0,
+            n_expert: N_EXPERT,
+        };
+        kernels
+            .enqueue_places_cols(stream, &p, gpu.layer_sink(9).expect("a sink"), &mut sel)
+            .expect("the places");
+        let got = sel.to_host_vec(stream).expect("places");
+        stream.synchronize().expect("sync");
+        let want: Vec<u32> = (0..M * PITCH)
+            .map(|k| match k % PITCH {
+                USED => HOST,
+                _ => place_of(ids[k] as usize),
+            })
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(gpu.take_fault().expect("the fault word"), None);
     }
 }
