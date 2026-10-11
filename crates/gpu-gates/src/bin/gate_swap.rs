@@ -710,14 +710,23 @@ mod gate {
             .clone())
     }
 
+    /// The name of the thread `task` (a `/proc/self/task` entry), or `None`
+    /// for one that exited after the directory was read: its entry is gone.
+    fn task_comm(task: &std::fs::DirEntry) -> Result<Option<String>, GateError> {
+        match std::fs::read_to_string(task.path().join("comm")) {
+            Ok(comm) => Ok(Some(comm.trim_end().to_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The tids of this process's threads named as the swap machine names
     /// its lane threads.
     fn staging_tids() -> Result<Vec<String>, GateError> {
         let mut out = Vec::new();
         for t in std::fs::read_dir("/proc/self/task")? {
             let t = t?;
-            let comm = std::fs::read_to_string(t.path().join("comm"))?;
-            if comm.trim_end() == "swap-staging" {
+            if task_comm(&t)?.as_deref() == Some("swap-staging") {
                 out.push(t.file_name().to_string_lossy().into_owned());
             }
         }
@@ -810,8 +819,7 @@ mod gate {
     fn staging_threads() -> Result<usize, GateError> {
         let mut n = 0;
         for t in std::fs::read_dir("/proc/self/task")? {
-            let comm = std::fs::read_to_string(t?.path().join("comm"))?;
-            n += usize::from(comm.trim_end() == "swap-staging");
+            n += usize::from(task_comm(&t?)?.as_deref() == Some("swap-staging"));
         }
         Ok(n)
     }
