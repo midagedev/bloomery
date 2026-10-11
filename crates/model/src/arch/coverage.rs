@@ -565,6 +565,16 @@ struct TypePin {
     reads: &'static [GgmlType],
 }
 
+/// The row types the glm5next body's host reader dequantizes for the token
+/// embedding (`gguf::quant::dequant_row`): the one set the body's load check
+/// and the embedding's pin both read.
+pub const GLM5NEXT_EMBED: &[GgmlType] = &[
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+];
+
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
 /// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
@@ -700,8 +710,8 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
-        what: "token embedding (the host reads q8_0 rows)",
-        reads: &[GgmlType::Q8_0],
+        what: "token embedding (the host reads q8_0, q4_K, q5_K and q6_K rows)",
+        reads: GLM5NEXT_EMBED,
     },
     TypePin {
         program: Program::Qwen38Body,
@@ -1895,7 +1905,7 @@ mod tests {
     /// The glm5next head's pin reads the set the head kernel reads
     /// (`gpu::head`'s `head_out_w`, which every head the body runs goes
     /// through): q8_0 planes, a q6_K or q4_K word plane; another type of
-    /// `output` is an item, and the embedding's pin stays q8_0 alone.
+    /// `output` is an item.
     // PIN(2026-10-09): q6_K (and q4_K, which the same gemv reads) joined the
     // head's set so a file with a q6_K output loads.
     #[test]
@@ -1913,18 +1923,44 @@ mod tests {
                     .to_string()
             )]
         );
-        assert_eq!(
+    }
+
+    /// The glm5next embedding's pin reads the set the host row reader
+    /// dequantizes for the table (`GLM5NEXT_EMBED`, which the body's load
+    /// check reads too), pinned here by its four types; a type outside it is
+    /// an item named by its type.
+    // PIN(2026-10-11): q4_K, q5_K and q6_K joined the embedding's set (the
+    // host reader `gguf::quant::dequant_row` decodes them) so a file whose
+    // `token_embd` is a K-quant loads; derivation: the row is dequantized on
+    // the host, one row a step, so no card launch reads the type.
+    #[test]
+    fn the_glm5next_embedding_pin_reads_the_host_rows_set() {
+        let embed = |ty: GgmlType| {
             glm5next_whole_items(
                 "token_embd.weight",
                 Role::TokenEmbedding,
-                GgmlType::Q6_K,
-                "token embedding"
-            ),
-            [(
-                None,
-                "q6_K token embedding (the host reads q8_0 rows)".to_string()
-            )]
-        );
+                ty,
+                "token embedding",
+            )
+        };
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+        ] {
+            assert_eq!(embed(ty), Vec::<(Option<usize>, String)>::new(), "{ty}");
+        }
+        for ty in [GgmlType::Q3_K, GgmlType::IQ4_XS, GgmlType::F16] {
+            assert_eq!(
+                embed(ty),
+                [(
+                    None,
+                    format!("{ty} token embedding (the host reads q8_0, q4_K, q5_K and q6_K rows)")
+                )],
+                "{ty}"
+            );
+        }
     }
 
     /// The qwen4exp head's pin reads the set the head kernel reads
