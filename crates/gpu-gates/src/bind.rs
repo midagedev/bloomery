@@ -3202,8 +3202,9 @@ mod tests {
 
     /// The checkpoints a load's sequences pin grow one budget a sequence
     /// ([`checkpoints_pinned`]), the bytes the machine's checkpoint reserve
-    /// carries: a point of 1 MiB spaced 512 apart takes 8 points over a slot
-    /// of 4,096 positions, and sequences that take none pin none.
+    /// carries: a point of 1 MiB spaced 512 apart takes 9 points over a slot
+    /// of 4,096 positions (a whole call's 8 and the previous call's end), and
+    /// sequences that take none pin none.
     #[test]
     fn checkpoints_pinned_grow_a_budget_a_sequence() {
         use crate::residency38::{Seqs, checkpoints_pinned};
@@ -3212,7 +3213,7 @@ mod tests {
             point_bytes: 1 << 20,
             every: 512,
         };
-        let budget = 8 << 20;
+        let budget = 9 << 20;
         let pinned = |slots| checkpoints_pinned(Seqs::priced(slots, price), 4_096);
         assert_eq!(pinned(0).expect("a reserve"), 0);
         assert_eq!(pinned(1).expect("a reserve"), budget);
