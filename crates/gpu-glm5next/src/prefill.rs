@@ -105,6 +105,7 @@ use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_f
 use bloomery_gpu::linear::conv::KdaConvArgs;
 use bloomery_gpu::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
 use bloomery_gpu::linear::norm_gate::NormGateArgs;
+use bloomery_gpu::media::{MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
@@ -130,6 +131,7 @@ use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use runtime::swaprule::KeptRows;
 
 use super::WHAT as BODY;
+use super::media::{CallRows, check_image_ids, stage_row};
 use super::nextn::GlmArena;
 use super::{
     Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape, weight,
@@ -180,6 +182,9 @@ pub(crate) struct PromptState {
     routes: Option<RouteTaps>,
     /// The batch walks' planted routes ([`plant_prompt_routes`]).
     plant_routes: Option<RoutePlant>,
+    /// The id a media span's every position carries ([`set_prefill_media`]); `None` on a load
+    /// that takes no media.
+    media: Option<u32>,
 }
 
 impl PromptState {
@@ -194,6 +199,7 @@ impl PromptState {
             timing: None,
             routes: None,
             plant_routes: None,
+            media: None,
         }
     }
 
@@ -802,7 +808,7 @@ pub fn prompt_with(
 ) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     match (mode, sink) {
-        (PrefillMode::Batch, sink) => call(m, |m| prefill_units(m, ids, sink)),
+        (PrefillMode::Batch, sink) => call(m, |m| prefill_units(m, ids, sink, None)),
         (PrefillMode::Steps, None) => {
             super::refuse_steps_under_residency(m)?;
             prompt(m, ids)
@@ -977,15 +983,96 @@ fn refuse_late_dense(cfg: &[super::LayerCfg], g: usize) -> Result<(), GpuError> 
 /// holds one token's streams, and a batch runs many). The batch's buffers
 /// are made by the first call when [`set_prefill`] has not made them.
 pub fn prefill(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
-    prefill_units(m, ids, None)
+    prefill_units(m, ids, None, None)
+}
+
+/// Set the id every position of a media span carries (`<|image|>`), or `None` for a load that
+/// takes no media: a media call without it is refused by name. A load-time call, refused inside
+/// a prompt call.
+pub fn set_prefill_media(m: &mut Glm5nextModel, image: Option<u32>) -> Result<(), GpuError> {
+    let (_, _, body) = m.body_parts(WHAT)?;
+    if body.prompt.in_call {
+        return Err(shape(
+            "the media token set inside a prompt call".to_string(),
+        ));
+    }
+    body.prompt.media = image;
+    Ok(())
+}
+
+/// The image token a media call of `spans` spans holds its ids to, or why the call is refused
+/// before it enters the batch walk: the steps feed has no place for a span's rows, and a load not
+/// set for media ([`set_prefill_media`]) has no token.
+fn media_token(mode: PrefillMode, image: Option<u32>, spans: usize) -> Result<u32, String> {
+    if mode == PrefillMode::Steps {
+        return Err(format!(
+            "a prompt with {spans} media spans under BLOOMERY_PREFILL=steps: a span's rows enter \
+             only through the batched call (BLOOMERY_PREFILL=batch)"
+        ));
+    }
+    image.ok_or_else(|| {
+        format!("a prompt with {spans} media spans on a load not set for media (set_prefill_media)")
+    })
+}
+
+/// Feed `ids` from where `m` stands with `spans` spliced in: each span's rows stand in for the
+/// token embeddings of its positions, which take consecutive positions as text ids do
+/// ([`super::media`]). Refused by name before anything runs: as [`feed`] refuses, under the
+/// steps feed and on a load not set for media ([`set_prefill_media`]), a span the common checks
+/// refuse ([`check_spans`]: inside the call, whole rows of the text width, ascending and
+/// disjoint) and a span with an id that is not the image token. No span is [`feed`]. The batch
+/// call is one residency pass ([`call`]). Returns the argmax after the last id.
+pub fn prefill_media(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    spans: &[MediaSpan<'_>],
+) -> Result<u32, GpuError> {
+    check_call(m, ids)?;
+    if spans.is_empty() {
+        return feed(m, ids);
+    }
+    let body = m.body(WHAT)?;
+    let image = media_token(body.prompt.mode, body.prompt.media, spans.len()).map_err(shape)?;
+    let n_embd = body.dims.embd;
+    check_spans(WHAT, spans, ids.len(), n_embd)?;
+    for s in spans {
+        check_image_ids(ids, &s.at, image).map_err(|r| shape(r.to_string()))?;
+    }
+    let rows = CallRows::new(m.pos(), n_embd, spans.iter().map(|s| (&s.at, s.rows)))
+        .map_err(|r| shape(r.to_string()))?;
+    call(m, |m| prefill_units(m, ids, None, Some(&rows)))
+}
+
+impl MediaBody for Body {
+    type Span<'a> = MediaSpan<'a>;
+
+    /// [`media_token`]'s refusal on this load's feed and image token.
+    fn media_refusal(m: &Glm5nextModel, spans: usize) -> Option<String> {
+        let body = m.body(WHAT).ok()?;
+        if spans == 0 {
+            return None;
+        }
+        media_token(body.prompt.mode, body.prompt.media, spans).err()
+    }
+
+    /// [`prefill_media`].
+    fn prefill_media(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        spans: &[MediaSpan<'_>],
+    ) -> Result<u32, GpuError> {
+        prefill_media(m, ids, spans)
+    }
 }
 
 /// [`prefill`], `sink` called after each batch, in batch order, once the
-/// group that holds it has run ([`prompt_with`]).
+/// group that holds it has run ([`prompt_with`]), and a media position's
+/// row taken from `media` where a span holds it ([`prefill_media`]).
 fn prefill_units(
     m: &mut Glm5nextModel,
     ids: &[u32],
     sink: Option<&mut GlmPromptSink<'_>>,
+    media: Option<&CallRows<'_>>,
 ) -> Result<u32, GpuError> {
     let to = check_call(m, ids)?;
     let from = m.pos();
@@ -1017,7 +1104,7 @@ fn prefill_units(
         }
         body.prompt.in_call = true;
     }
-    let r = call_groups(m, ids, from, to, sink);
+    let r = call_groups(m, ids, from, to, sink, media);
     if let Ok(body) = m.body_parts(WHAT).map(|(_, _, b)| b) {
         body.prompt.in_call = false;
         if let Some(taps) = body.prompt.routes.as_mut() {
@@ -1043,6 +1130,7 @@ fn call_groups(
     from: u32,
     to: u32,
     mut sink: Option<&mut GlmPromptSink<'_>>,
+    media: Option<&CallRows<'_>>,
 ) -> Result<u32, GpuError> {
     let marks = m.body(WHAT)?.ckpt.marks(from, to);
     let batches = call_batches(from, to, &marks);
@@ -1065,7 +1153,7 @@ fn call_groups(
             Err(e) => return Err(take_back(m, from, e)),
         };
         let ran = m.run_rows(seg.len(), WHAT, |gpu, w, body, head, pos| {
-            body.enqueue_group(gpu, w, head, seg, pos, runs, last, &mut takes)
+            body.enqueue_group(gpu, w, head, seg, pos, runs, last, &mut takes, media)
         });
         let sealed = match ran {
             Ok(t) => seal_takes(m, &mut takes).map(|()| t),
@@ -1476,11 +1564,12 @@ impl Body {
     /// ends on (`takes`, one a unit) right after that unit's front. An inner
     /// group waits for its launches and reads the fault word once, so a
     /// fault ends the call before the mark after it; the last group's word
-    /// rides the head's readback.
+    /// rides the head's readback. A position a span of `media` holds takes
+    /// the span's row as its embedding row, by the position it is written at.
     #[allow(
         clippy::too_many_arguments,
         reason = "one pass's inputs: the model's parts run_rows lends, the group's ids, \
-                  batches and end flag, and its open takes"
+                  batches and end flag, its open takes and the call's media rows"
     )]
     fn enqueue_group(
         &mut self,
@@ -1492,6 +1581,7 @@ impl Body {
         runs: &[Range<u32>],
         last: bool,
         takes: &mut [Option<Pending>],
+        media: Option<&CallRows<'_>>,
     ) -> Result<bool, GpuError> {
         self.stores_at(pos)?;
         let n = self.dims.embd;
@@ -1561,11 +1651,12 @@ impl Body {
         for (ub, &t) in units.iter_mut().zip(&ts) {
             let p0 = pos + at as u32;
             let rows = &mut ub.rows[..t * HC_STREAMS * n];
-            for (&token, r) in ids[at..at + t]
+            for (i, (&token, r)) in ids[at..at + t]
                 .iter()
                 .zip(rows.chunks_exact_mut(HC_STREAMS * n))
+                .enumerate()
             {
-                embd.fill_row(token, r)?;
+                stage_row(media, p0 + i as u32, token, r, |t, r| embd.fill_row(t, r))?;
             }
             for i in 0..t {
                 let p = p0 + i as u32;
