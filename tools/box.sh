@@ -61,7 +61,8 @@
 #                             file's BLOOMERY_ARCH that is not the one the recipe expanded. The card is what this machine
 #                             shows: the box side sees BLOOMERY_BOX_CARD=local (tools/gpu-gate.sh's one local lock), any
 #                             BLOOMERY_CARD but `both` runs on it, `both` is refused (64), and CUDA_VISIBLE_DEVICES is the
-#                             caller's, or the environment file's when it sets one. CUDA_OXIDE_BACKEND is unset after the
+#                             caller's, or the environment file's when it sets one (a timing runner then pins its timing
+#                             card: tools/ref/timing-card.sh). CUDA_OXIDE_BACKEND is unset after the
 #                             environment file, so cargo oxide builds and keeps its own backend. BLOOMERY_REMOTE names no
 #                             directory here and adds no CARGO_BUILD_JOBS. What box.sh reads on this side, its own outputs
 #                             (BLOOMERY_REF_MODEL_PROFILE, the fixture tier's BLOOMERY_CARD_BUDGET and

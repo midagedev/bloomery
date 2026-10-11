@@ -4,8 +4,9 @@
 # the holds and box.sh's guard (lease_guard), tools/box.sh's remote command and its read-only
 # refusals (stub ssh), tools/ref/card-precheck.sh, tools/gpu-ab.py's card check, the witness fields
 # with a failing nvidia-smi, tools/ref/cards.sh's name→UUID resolution (a fake nvidia-smi on
-# PATH: the repository is public and carries no UUID), the t table's four readers (tdump.sh),
-# tools/gate-batch.sh's script walker (--classes on a stub tree) and the cpu guard (cpu-guard.sh).
+# PATH: the repository is public and carries no UUID), tools/ref/timing-card.sh's local mode, the t
+# table's four readers (tdump.sh), tools/gate-batch.sh's script walker (--classes on a stub tree) and the
+# cpu guard (cpu-guard.sh).
 #
 #   tools/ref/card-tests/run.sh
 #
@@ -391,6 +392,13 @@ else
     bash -c 'source "$1" && [ "$LEASE_CARDS_RECORD" = 1 ] && witness_card() { :; } && TIMING_GPU=GPU-a && TIMING_GPU2=GPU-b &&
       lease_take > /dev/null && r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" && [ "$r" = "pid=$$ timing_gpu=GPU-a,GPU-b" ] &&
       echo "record matches"' _ "$T/tools/ref/lease.sh"
+  # tools/box.sh's local mode: the machine lease is bloomery-cpu.lock in BLOOMERY_LOCK_DIR.
+  mkdir -p "$tmp/ld-take"
+  run 'lease_take under BLOOMERY_LOCK_DIR takes the machine lease' 0 '^\[test\] lease_take returned$' \
+    env -u BLOOMERY_LEASE_HELD -u BLOOMERY_LEASE_LOCK -u BLOOMERY_LEASE_TRACE BLOOMERY_LOCK_DIR="$tmp/ld-take" \
+    BLOOMERY_LEASE_CARD=docs/cards/exclusive.card bash -c 'source "$1" && lease_take && echo "[test] lease_take returned"' _ "$T/tools/ref/lease.sh"
+  if grep -q 'is not the machine lease' "$tmp/out"; then fail 'lease_take under BLOOMERY_LOCK_DIR is admissible' 'it says it is not the machine lease' "$tmp/out"; else
+    pass 'lease_take under BLOOMERY_LOCK_DIR is admissible'; fi
 
   # lease-hold.sh: the card, the lease for the command's life, both witnesses, the command's rc, and a
   # lease that ends with this process whatever the command did.
@@ -1068,6 +1076,92 @@ cards 'cards: a failing nvidia-smi leaves both empty, named' 0 \
 run 'cards: no nvidia-smi on PATH leaves both empty, named' 0 \
   '^3090=\[\] a6000=\[\] err=\[nvidia-smi is not on PATH\]$' \
   env PATH="$C/none" /bin/bash -c "$cards_src" _ "$ROOT/tools/ref/cards.sh"
+
+# tools/ref/timing-card.sh's local mode (BLOOMERY_BOX_CARD=local), sourced under set -euo pipefail by a runner
+# that opts in: the timing card read by UUID with one query, never by name, each refusal in TIMING_CARDS_WHY
+# (lease_take ends the run on it, 64), the Xid reader's journal check, the lost card and arm-place.sh's
+# placement refusal. The stub nvidia-smi lists the UUIDs STUB_UUIDS gives (STUB_UUID_RC fails the list,
+# STUB_UUID_WARN adds a warning line), answers every card's name as a GB10's and none once STUB_GONE is set;
+# the stub journalctl has one kernel line (STUB_JOURNAL=fail fails it, empty shows none, warn none and a
+# warning on stderr). The box refuses local mode, so there that refusal is the one case.
+FAKE_GB10=GPU-22222222-2222-2222-2222-222222222222
+mkdir -p "$C/local"
+cat > "$C/local/nvidia-smi" << 'SMI'
+#!/bin/sh
+case "$*" in
+  *--query-gpu=uuid\ *)
+    [ -z "$STUB_UUID_RC" ] || { echo 'NVIDIA-SMI has failed (stub)'; exit "$STUB_UUID_RC"; }
+    [ -z "$STUB_UUID_WARN" ] || echo 'WARNING: infoROM is corrupted (stub)'
+    printf '%s\n' $STUB_UUIDS
+    exit 0
+    ;;
+esac
+[ -z "$STUB_GONE" ] || { echo 'GPU is lost (stub)' >&2; exit 15; }
+echo 'NVIDIA GB10'
+SMI
+cat > "$C/local/journalctl" << 'JCTL'
+#!/bin/sh
+case $STUB_JOURNAL in
+  fail) echo 'journalctl: the stub fails' >&2; exit 1 ;;
+  empty) exit 0 ;;
+  warn) echo 'No journal files were opened due to insufficient permissions (stub).' >&2; exit 0 ;;
+esac
+echo '1790428800.000000 ws kernel: Linux version (stub)'
+JCTL
+printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$C/local/timeout"
+chmod +x "$C/local/nvidia-smi" "$C/local/journalctl" "$C/local/timeout"
+locx() { # <name> <rc> <pattern> <commands after the source> [NAME=value…]: the tree's timing-card.sh in local mode
+  local name=$1 want=$2 pat=$3 body=$4
+  shift 4
+  run "$name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT -u STUB_UUID_RC -u STUB_UUID_WARN \
+    -u STUB_GONE -u STUB_JOURNAL PATH="$C/local:$PATH" BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" TIMING_LOCAL_RUNNER=1 \
+    STUB_UUIDS="$FAKE_GB10" "$@" bash -c "set -euo pipefail; source \"\$1\"; $body" _ "$ROOT/tools/ref/timing-card.sh"
+}
+loc() { # <name> <pattern> [NAME=value…]: the card, CUDA_VISIBLE_DEVICES and the refusal after the source
+  locx "$1" 0 "$2" 'printf "gpu=[%s] cvd=[%s] local=[%s] why=[%s]\n" "$TIMING_GPU" "$CUDA_VISIBLE_DEVICES" "$TIMING_LOCAL" "$TIMING_CARDS_WHY"' "${@:3}"
+}
+if [ -e /root/bloomery-cpu.lock ]; then
+  loc 'timing-card.sh local: refused on the box' '^gpu=\[\] cvd=\[\] local=\[1\] why=\[BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu\.lock \(the box\): '
+else
+  loc 'timing-card.sh local: the one card listed is the timing card' "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]\$"
+  loc 'timing-card.sh local: a warning beside the list is no card' "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]\$" STUB_UUID_WARN=1
+  loc 'timing-card.sh local: a runner that does not opt in is refused' \
+    '^gpu=\[\] cvd=\[\] local=\[1\] why=\[BLOOMERY_BOX_CARD=local, and _ has no local mode \(a runner opts in with TIMING_LOCAL_RUNNER=1\): ' \
+    TIMING_LOCAL_RUNNER=
+  has 'timing-card.sh local: the refusal line is tagged [timing-card]' '^\[timing-card\] refused: BLOOMERY_BOX_CARD=local, and _ has no local mode '
+  loc 'timing-card.sh local: a failing nvidia-smi is refused' \
+    '^gpu=\[\] cvd=\[\] local=\[1\] why=\[local mode: nvidia-smi --query-gpu=uuid failed \(rc 9\): NVIDIA-SMI has failed \(stub\)\]$' STUB_UUID_RC=9
+  loc 'timing-card.sh local: no card listed is refused' '^gpu=\[\] cvd=\[\] local=\[1\] why=\[local mode: nvidia-smi --query-gpu=uuid lists no card\]$' \
+    STUB_UUIDS=
+  loc 'timing-card.sh local: two cards and no BLOOMERY_TIMING_GPU are refused' \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: nvidia-smi lists 2 cards \\($FAKE_GB10 $FAKE_A6000\\): name one by UUID in BLOOMERY_TIMING_GPU\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000"
+  loc 'timing-card.sh local: BLOOMERY_TIMING_GPU picks a listed card' "^gpu=\\[$FAKE_A6000\\] cvd=\\[$FAKE_A6000\\] local=\\[1\\] why=\\[\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" BLOOMERY_TIMING_GPU="$FAKE_A6000"
+  loc 'timing-card.sh local: a BLOOMERY_TIMING_GPU nvidia-smi does not list is refused' \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: BLOOMERY_TIMING_GPU=$FAKE_3090 is not a card nvidia-smi lists \\($FAKE_GB10\\)\\]\$" \
+    BLOOMERY_TIMING_GPU="$FAKE_3090"
+  loc 'timing-card.sh local: BLOOMERY_TIMING_CARDS is refused' \
+    '^gpu=\[\] cvd=\[\] local=\[1\] why=\[BLOOMERY_TIMING_CARDS=a6000\+3090 and BLOOMERY_BOX_CARD=local: ' BLOOMERY_TIMING_CARDS=a6000+3090
+  loc 'timing-card.sh local: the lock directory /root is refused' \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[BLOOMERY_BOX_CARD=local keeps the lease under BLOOMERY_LOCK_DIR, and that is /root " \
+    BLOOMERY_LOCK_DIR=/root
+  # The precheck: the kernel journal answers with a line, one `[timing-card]` line; else 69 and the reason.
+  pc='timing_cards_precheck || { rc=$?; echo "$TWOCARD_WHY"; exit "$rc"; }'
+  locx 'timing-card.sh local: the precheck reads the kernel journal' 0 '^\[timing-card\] Xid reader: journalctl -k$' "$pc"
+  locx 'timing-card.sh local: the precheck refuses a journal that fails (69)' 69 '^journalctl -k does not answer \(rc 1\): ' "$pc" STUB_JOURNAL=fail
+  locx 'timing-card.sh local: the precheck refuses a journal that shows no line (69)' 69 '^journalctl -k shows no kernel line ' "$pc" STUB_JOURNAL=empty
+  locx 'timing-card.sh local: the precheck refuses a journal that only warns on stderr (69)' 69 '^journalctl -k shows no kernel line ' \
+    "$pc" STUB_JOURNAL=warn
+  # After an arm: no Xid and the card answering is 0; the card lost fails the arm by name.
+  arm='timing_cards_start > /dev/null; timing_cards_arm log; echo "arm 0"; export STUB_GONE=1; timing_cards_arm log || echo "arm $?: $TWOCARD_WHY"'
+  locx 'timing-card.sh local: a lost card fails the arm' 0 "^arm 1: the timing card \\($FAKE_GB10\\) does not answer nvidia-smi \\(rc 15\\)\$" "$arm"
+  has 'timing-card.sh local: the card answering passes the arm' '^arm 0$'
+  # arm-place.sh: one card, so bp (two cards by size rank) is refused by name, as gate (the card named 3090) is.
+  locx 'timing-card.sh local: arm-place.sh refuses bp (64)' 64 \
+    "^r: BLOOMERY_GEN_PLACE=bp: local mode times this machine's one card, at a \\(gate loads the card named 3090, bp two cards by size rank\\)\$" \
+    'source "${1%/*}/arm-place.sh"; PLACE_RUNNER=r PLACE_BIN=b PLACE_WORDS="a gate bp"; place_check "" bp'
+fi
 
 # The t table: the four readers print the same t for df 1..40 (tdump.sh), and it is tdist.py's.
 if "$HERE/tdump.sh" "$ROOT" > "$tmp/tdump" 2>&1; then

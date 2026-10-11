@@ -529,8 +529,10 @@ xc_drop() {
 # A_IDS (lcg, or a corpus name whose ids are A_TOK's), N, BOUND, MODEL, LCPP, LCPP_GPU_FLAGS, CARD_NAME,
 # ARM_FAIL_STEM, SRVBIN (srv_preflight sets it), sums and pp_sums; the functions witness, ref_witness,
 # lcg_prompt, majflt_now, cold_check, cold_verdict, counted, arm_fail, count_row, lcpp_fit_col and
-# timing_cards_arm (timing-card.sh: in the two-card mode a server that saw other than the A6000 and the 3090
-# as its devices 0 and 1, or an Xid, a lost card or a 3090 off its cap since the last arm, fails the arm); and
+# timing_cards_arm with its modes' TIMING_CARDS and TIMING_LOCAL (timing-card.sh: in the two-card mode a
+# server that saw other than the A6000 and the 3090 as its devices 0 and 1, or an Xid, a lost card or a 3090
+# off its cap since the last arm, fails the arm; in local mode an Xid or the card lost since the last arm
+# does, a failed arm's too); and
 #   srv_tail <wall s>   the end of a server row after its device column, in that runner's field order
 #   srv_after <round> <label> <key>   (optional) a guard after the server stopped
 # A server arm's engine (lcppsrv, lcppsrvfit, lcppsrvpp[fit][<U>], each with its per-arm flags `+…`, the
@@ -667,9 +669,11 @@ srv_arm() {
   # A fit twin's loader lines say what the server's fit chose; a fit that failed or never ran is a FAIL row,
   # whatever the server measured after it (it loads without the fit, as llama-bench does).
   if [ -n "$rc" ]; then
+    # Local mode checks a failed arm too, so the next arm is not charged with its Xid.
+    [ -z "$TIMING_LOCAL" ] || timing_cards_arm "$(cat "$log")" || why="$why; $TWOCARD_WHY"
     arm_fail "$r" "$label" "$key" "$rc" "$why" "$(cat "$log")"
   elif ! timing_cards_arm "$(cat "$log")"; then
-    arm_fail "$r" "$label" "$key" 0 "two cards: $TWOCARD_WHY" "$(cat "$log")"
+    arm_fail "$r" "$label" "$key" 0 "${TIMING_CARDS:+two cards: }$TWOCARD_WHY" "$(cat "$log")"
   elif [[ $eng == *fit* ]] && ! lcpp_fit_col "$(cat "$log")"; then
     arm_fail "$r" "$label" "$key" 0 "$FIT_WHY" "$(cat "$log")"
   else

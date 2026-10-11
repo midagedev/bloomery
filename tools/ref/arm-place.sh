@@ -24,7 +24,8 @@
 # A6000 as the timing card (on the 3090 alone it would plan the gate plan's card under a's label), gate the
 # 3090 (on the A6000 alone the binary finds no 3090), and bp is refused. The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090) shows both cards to every arm: bp
 # loads both, a loads the A6000 and leaves the 3090 idle (place_arm_cards holds each a arm's load record to
-# the A6000 alone), and gate, a 3090-only row in the A6000+3090 table, is refused.
+# the A6000 alone), and gate, a 3090-only row in the A6000+3090 table, is refused. Local mode
+# (timing-card.sh's TIMING_LOCAL) times this machine's one card at a, and gate and bp are refused.
 
 # place_refuse <arm or empty> <why>: the refusal, exit 64.
 place_refuse() {
@@ -89,6 +90,10 @@ place_check() {
       gate) place_refuse "$a" "$what is the gate plan, which loads the 3090 alone; the two-card mode times a (plan (a) on the A6000, the 3090 idle) or bp (plan (b′), both cards)" ;;
       *) place_refuse "$a" "$what has no two-card placement (a: the A6000, the 3090 idle; bp: both cards)" ;;
     esac
+  fi
+  if [ -n "$TIMING_LOCAL" ]; then
+    [ "$p" = a ] || place_refuse "$a" "$what: local mode times this machine's one card, at a (gate loads the card named 3090, bp two cards by size rank)"
+    return 0
   fi
   case $p in
     bp) place_refuse "$a" "$what is plan (b′), which loads on both cards (the A6000 and its 3090 expert tier); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000+3090" ;;
