@@ -85,8 +85,10 @@ unset __lease_dir
 # once per arm, like tools/gpu-ab.py); else at the card's own `rounds`. ROUND_MINUTES, a runner's box
 # minutes per round, prices a ruler or margin refusal.
 # BLOOMERY_LEASE_LOCK names another lock file, for the Mac stub tests (tools/ref/card-tests/run.sh).
-# A run under any other file holds no machine lease, so where /root/bloomery-cpu.lock exists (the box)
-# lease_take refuses the override (exit 64): a fake lock during a real sitting would contaminate it.
+# The machine lease is bloomery-cpu.lock in the lock directory (lease-probe.sh's LOCK_DIR: /root, or
+# BLOOMERY_LOCK_DIR in tools/box.sh's local mode). A run under any other file holds no machine lease, so
+# where /root/bloomery-cpu.lock exists (the box) lease_take refuses the override (exit 64): a fake lock
+# during a real sitting would contaminate it.
 # A command that tools/ref/lease-hold.sh runs carries BLOOMERY_LEASE_HELD (that script's pid): a lease
 # taken inside it would wait on the one already held and end as contention, so it exits 64 at once.
 # The record beside the lock names the run's timing cards: TIMING_GPU, and in timing-card.sh's two-card
@@ -275,9 +277,10 @@ lease_gpu_idle() {
 # The lease's trace: one line per event in a file that outlives every runner, so a sitting can be
 # read back with its owner, card and pid. /var/log/netdata-lease-gate.log stays the timing source
 # (take and free at 0.5-2 s); this file adds who. The file is BLOOMERY_LEASE_TRACE, else
-# /root/bloomery-sittings.log under the machine lease; under any other lock file (the stub tests) no
-# trace is written unless BLOOMERY_LEASE_TRACE names one. A line that cannot be written is one named
-# `[lease] trace not written` line on stderr and the lease goes on, as the timing-card record does.
+# bloomery-sittings.log in the lock directory under the machine lease (/root/bloomery-sittings.log on the
+# box); under any other lock file (the stub tests) no trace is written unless BLOOMERY_LEASE_TRACE names
+# one. A line that cannot be written is one named `[lease] trace not written` line on stderr and the
+# lease goes on, as the timing-card record does.
 #   take    lease_take, once the lease is held: its id (<epoch>.<pid>), the runner, the owner (the
 #           tree's directory), the queue job when BLOOMERY_Q_JOB is set, the timing card(s), the card file
 #   free    when the lease file turns free: a detached waiter probes it every 0.5 s (never a blocking
@@ -295,8 +298,8 @@ LEASE_TRACE_FILE=
 __lease_trace_file() {
   if [ -n "${BLOOMERY_LEASE_TRACE:-}" ]; then
     printf '%s' "$BLOOMERY_LEASE_TRACE"
-  elif [ "$LEASE_LOCK" = /root/bloomery-cpu.lock ]; then
-    printf '%s' /root/bloomery-sittings.log
+  elif [ "$LEASE_LOCK" = "$LOCK_DIR/bloomery-cpu.lock" ]; then
+    printf '%s' "$LOCK_DIR/bloomery-sittings.log"
   fi
 }
 # __lease_trace_header: the lines that open a new trace file.
@@ -399,7 +402,7 @@ lease_take() {
     exit 64
   fi
   lease_card || exit $?
-  [ "$LEASE_LOCK" = /root/bloomery-cpu.lock ] ||
+  [ "$LEASE_LOCK" = "$LOCK_DIR/bloomery-cpu.lock" ] ||
     echo "[lease] BLOOMERY_LEASE_LOCK=$LEASE_LOCK is not the machine lease: nothing measured under it is admissible"
   # The runner the card guards compare against (lease_pid_is_ours): recorded once, so a helper
   # called from a subshell still compares against the runner.
@@ -724,9 +727,14 @@ __witness_head_load() {
 # __lease_timing_labels: the `card` field's apps-line labels of the cards this run times (`a6000`,
 # `3090`) — TIMING_GPU and TIMING_GPU2 against the UUIDs tools/ref/cards.sh resolved for whoever
 # sourced this file; empty when no timed card is one of them (its apps lines stay untagged; a card
-# cards.sh could not name is named in those lines themselves).
+# cards.sh could not name is named in those lines themselves). In timing-card.sh's local mode
+# (TIMING_LOCAL) the timed card's label is `local`.
 __lease_timing_labels() {
   local uuid out=''
+  if [ -n "${TIMING_LOCAL:-}" ]; then
+    printf '%s' "${TIMING_GPU:+local}"
+    return 0
+  fi
   for uuid in ${TIMING_GPU:-} ${TIMING_GPU2:-}; do
     if [ -n "${GPU_A6000:-}" ] && [ "$uuid" = "$GPU_A6000" ]; then out="$out a6000"; fi
     if [ -n "${GPU_3090:-}" ] && [ "$uuid" = "$GPU_3090" ]; then out="$out 3090"; fi
@@ -950,6 +958,13 @@ EOF
   witness_card() { echo '    a6000-apps: unresolved (no A6000 UUID)'; }
   OUT=$(__witness_card 2>&1)
   matches tag-unresolved-untouched '^    a6000-apps: unresolved \(no A6000 UUID\)$' "$OUT"
+  # timing-card.sh's local mode (TIMING_LOCAL): the timed card's apps line is `local-apps`, tagged as the
+  # box's are.
+  TIMING_LOCAL=1
+  witness_card() { echo '    local-apps: [4242, 100 MiB;]'; }
+  OUT=$(__witness_card 2>&1)
+  matches tag-local-busy '^    local-apps: \[4242, 100 MiB;\] \[timing-card-busy\]$' "$OUT"
+  unset TIMING_LOCAL
   # ---- lease_pid_is_ours ----
   # A made-up /proc tree (BLOOMERY_LEASE_PROC, as the card tests use it: this runs on the Mac too):
   # pid 101 holds the lease's descriptor 9 as the runner does, 102 descends from it without the
@@ -1066,7 +1081,9 @@ EOF
     # No trace file and a lock that is not the machine's: nothing written, nothing named.
     unset BLOOMERY_LEASE_TRACE
     check trace-file-other-lock "$(__lease_trace_file)" ''
-    check trace-file-machine-lock "$(LEASE_LOCK=/root/bloomery-cpu.lock __lease_trace_file)" /root/bloomery-sittings.log
+    check trace-file-machine-lock "$(LOCK_DIR=/root LEASE_LOCK=/root/bloomery-cpu.lock __lease_trace_file)" /root/bloomery-sittings.log
+    # The machine lease in another lock directory (tools/box.sh's local mode): the trace beside it.
+    check trace-file-lock-dir "$(LOCK_DIR=$t/locks LEASE_LOCK=$t/locks/bloomery-cpu.lock __lease_trace_file)" "$t/locks/bloomery-sittings.log"
     # let_go: the line of the id this process took; none when nothing was written.
     LEASE_TRACE_ID=9.9 LEASE_TRACE_FILE=$t/trace4.log
     lease_trace_let_go 1
