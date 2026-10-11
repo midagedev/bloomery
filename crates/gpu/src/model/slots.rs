@@ -27,8 +27,8 @@
 //! keyed by the busy slots and their row counts ([`SlotGraphs`]).
 
 use super::{
-    ChainBody, GpuModel, Graphs, MAX_PASS_ROWS, PassRead, RowHeads, StepMode, launch_served,
-    no_head, pass_slice,
+    ChainBody, GpuModel, Graphs, HostServed, MAX_PASS_ROWS, PassRead, RowHeads, StepMode,
+    launch_served, no_head, pass_slice,
 };
 use crate::fault::Fault;
 use crate::head::Head;
@@ -399,16 +399,28 @@ where
             ));
         }
         let bytes = self.body.seq_bytes();
+        let mut grown = Ok(());
         for _ in held..n {
-            let seq = self.body.new_seq(&self.gpu)?;
-            self.parked.push(ParkedSlot {
-                graphs: Graphs::new(),
-                pos: 0,
-                bytes,
-                seq: Box::new(seq),
-            });
+            match self.body.new_seq(&self.gpu) {
+                Ok(seq) => self.parked.push(ParkedSlot {
+                    graphs: Graphs::new(),
+                    pos: 0,
+                    bytes,
+                    seq: Box::new(seq),
+                }),
+                Err(e) => {
+                    grown = Err(e);
+                    break;
+                }
+            }
         }
-        Ok(())
+        // The residency rule keeps one stream a slot that exists, a failed
+        // allocation's slots included.
+        let streams = match self.body.host() {
+            Some(host) => host.add_streams(self.parked.len() + 1),
+            None => Ok(()),
+        };
+        grown.and(streams)
     }
 
     /// The slots the model serves: 1 until [`GpuModel::add_slots`] grows it.
@@ -450,6 +462,19 @@ where
         // slot 0 (or the old slot) live and named, never a mix.
         self.one_pass = None;
         self.slot_rows = None;
+        let moved = self.move_to_slot(slot);
+        // The residency stream follows the slot the live fields hold, whether
+        // or not the exchange completed.
+        let streams = match self.body.host() {
+            Some(host) => host.select_stream(self.selected),
+            None => Ok(()),
+        };
+        moved.and(streams)
+    }
+
+    /// The exchanges of [`GpuModel::select_slot`]: the live slot home, then
+    /// `slot` live.
+    fn move_to_slot(&mut self, slot: usize) -> Result<(), GpuError> {
         if self.selected != 0 {
             self.swap_parked(self.selected - 1)?;
             self.selected = 0;
@@ -724,7 +749,8 @@ where
                 break;
             }
         }
-        let out = settled.and_then(|()| self.keep_rows(accepted, PassKind::SlotsDrafted));
+        let out =
+            settled.and_then(|()| self.keep_rows_by(accepted, PassKind::SlotsDrafted, &ranges));
         self.note_fault_in(WHAT, out, SlotSet::of(&ranges))
     }
 
@@ -1012,7 +1038,7 @@ where
             name_slots(refusal, ranges)
         })?;
         if pass == SlotPass::Kept {
-            self.keep_rows(KeptRows::prefix(total), PassKind::Slots)?;
+            self.keep_rows_by(KeptRows::prefix(total), PassKind::Slots, ranges)?;
             self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
         }
         for r in ranges {

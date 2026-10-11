@@ -474,6 +474,16 @@ impl Tally {
         self.filled.fill(0);
     }
 
+    /// One past the last row with a slot noted: the rows the rule will have
+    /// observed at the end of this pass.
+    fn rows(&self) -> usize {
+        let n = self.layers.len();
+        (0..self.max_rows)
+            .rev()
+            .find(|&row| self.filled[row * n..(row + 1) * n].iter().any(|&m| m != 0))
+            .map_or(0, |row| row + 1)
+    }
+
     /// Every slot of a cell noted.
     fn full(&self) -> u64 {
         if self.top_k == TALLY_TOP_K {
@@ -2297,13 +2307,40 @@ impl SwapMachine {
     /// of a layer noted and not all, and a noted row routing an id twice or
     /// past the experts. A failure of the fold itself breaks the machine.
     pub fn end_pass(&mut self, tally: &mut Tally, kept: KeptRows) -> Result<(), GpuError> {
-        const WHAT: &str = "SwapMachine::end_pass";
+        self.end_pass_of(tally, kept, None, "SwapMachine::end_pass")
+    }
+
+    /// [`SwapMachine::end_pass`] for a pass whose row `row` belongs to the
+    /// serving slot `row_stream[row]`: each kept row folds into its own
+    /// stream's heat ([`SwapRule::end_pass_by`]). Refused by name, the machine
+    /// unchanged, besides what `end_pass` refuses: a map shorter than the
+    /// rows the tally noted, and a noted row whose stream is past the rule's
+    /// or not live. The plain `end_pass` refuses a rule with several streams
+    /// live.
+    pub fn end_pass_by(
+        &mut self,
+        tally: &mut Tally,
+        kept: KeptRows,
+        row_stream: &[u32],
+    ) -> Result<(), GpuError> {
+        self.end_pass_of(tally, kept, Some(row_stream), "SwapMachine::end_pass_by")
+    }
+
+    /// The body of both ends of a pass: `row_stream` is the row→stream map,
+    /// or `None` for the rule's stream 0.
+    fn end_pass_of(
+        &mut self,
+        tally: &mut Tally,
+        kept: KeptRows,
+        row_stream: Option<&[u32]>,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
         let start = Instant::now();
-        self.refuse_if_broken(WHAT)?;
-        self.refuse_in_call(WHAT)?;
-        self.refuse_if_ahead(WHAT)?;
+        self.refuse_if_broken(what)?;
+        self.refuse_in_call(what)?;
+        self.refuse_if_ahead(what)?;
         if self.planned != Some(self.rule.passes()) {
-            return Err(GpuError::state(WHAT, "a boundary before the pass"));
+            return Err(GpuError::state(what, "a boundary before the pass"));
         }
         let r = self.rule_shape;
         if !tally.on
@@ -2312,7 +2349,7 @@ impl SwapMachine {
             || tally.max_rows != r.max_rows
         {
             return Err(GpuError::shape(
-                WHAT,
+                what,
                 format!(
                     "a tally (on {}) of layers {:?}, top-{}, {} rows for a machine of layers \
                      {:?}, top-{}, {} rows",
@@ -2328,7 +2365,7 @@ impl SwapMachine {
         }
         if let Some(row) = kept.past(r.max_rows) {
             return Err(GpuError::shape(
-                WHAT,
+                what,
                 format!(
                     "row {row} of {} rows kept of a pass of at most {}",
                     kept.count(),
@@ -2336,9 +2373,14 @@ impl SwapMachine {
                 ),
             ));
         }
-        self.check_tally(tally, kept, WHAT)?;
+        self.check_tally(tally, kept, what)?;
+        if let Some(map) = row_stream {
+            self.rule
+                .check_row_streams(map, tally.rows())
+                .map_err(|e| rule_err(what, e))?;
+        }
         let pass = self.rule.passes();
-        let folded = self.fold(tally, kept, WHAT);
+        let folded = self.fold(tally, kept, row_stream, what);
         self.after_change(folded, || format!("the end of pass {pass}"))?;
         tally.clear();
         self.kept = kept;
@@ -2392,8 +2434,16 @@ impl SwapMachine {
     }
 
     /// Every fully noted cell of `t` into the rule, then the pass ended at
-    /// `kept`'s rows: the rule drops the rows outside the set.
-    fn fold(&mut self, t: &Tally, kept: KeptRows, what: &'static str) -> Result<(), GpuError> {
+    /// `kept`'s rows: the rule drops the rows outside the set. Each kept row
+    /// folds into its stream's heat by `row_stream`, or into stream 0's when
+    /// there is no map.
+    fn fold(
+        &mut self,
+        t: &Tally,
+        kept: KeptRows,
+        row_stream: Option<&[u32]>,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
         let n = self.layers.len();
         for row in 0..t.max_rows {
             for l in 0..n {
@@ -2407,7 +2457,11 @@ impl SwapMachine {
                     .map_err(|e| rule_err(what, e))?;
             }
         }
-        self.rule.end_pass(kept).map_err(|e| rule_err(what, e))
+        match row_stream {
+            Some(map) => self.rule.end_pass_by(kept, map),
+            None => self.rule.end_pass(kept),
+        }
+        .map_err(|e| rule_err(what, e))
     }
 
     /// The boundary before the next pass, on the engine stream `stream`, with
@@ -3516,6 +3570,28 @@ impl SwapMachine {
         }
         self.write_changed(stream)?;
         self.agree(layer, slots, WHAT)
+    }
+
+    /// Whether a live stream other than `stream` holds a count over 0
+    /// ([`SwapRule::others_hold_rows`]): which slots' rows have been folded.
+    ///
+    /// # Panics
+    ///
+    /// When `stream` is past the rule's streams.
+    #[must_use]
+    pub fn others_hold_rows(&self, stream: usize) -> bool {
+        self.rule.others_hold_rows(stream)
+    }
+
+    /// The rule serves `n` streams, one per serving slot, each live from
+    /// here with no history; the streams it has keep theirs
+    /// ([`SwapRule::add_streams`]). Load-time work: it allocates. Refused by
+    /// name, the machine unchanged: fewer streams than it has, none, and a
+    /// broken machine.
+    pub fn add_streams(&mut self, n: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::add_streams";
+        self.refuse_if_broken(WHAT)?;
+        self.rule.add_streams(n).map_err(|e| rule_err(WHAT, e))
     }
 
     /// Whether the rule holds any decode history ([`SwapRule::has_history`]):

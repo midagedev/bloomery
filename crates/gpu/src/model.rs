@@ -234,6 +234,37 @@ pub trait HostServed {
         Ok(())
     }
 
+    /// [`HostServed::keep_rows`] for a pass of several slots: each row is
+    /// kept for the slot of the `(slot, rows)` range that holds it, so it
+    /// folds into that slot's stream ([`crate::host::HostTier::keep_rows_by`]).
+    /// A body with no machine ignores it.
+    fn keep_rows_by(
+        &mut self,
+        kept: runtime::swaprule::KeptRows,
+        kind: crate::host::PassKind,
+        ranges: impl Iterator<Item = (usize, std::ops::Range<usize>)> + Clone,
+    ) -> Result<(), GpuError> {
+        let _ = (kept, kind, ranges);
+        Ok(())
+    }
+
+    /// The residency rule serves `n` slots' streams
+    /// ([`crate::host::HostTier::add_streams`]): what
+    /// [`GpuModel::add_slots`] calls once the new slots exist. A body with no
+    /// machine ignores it.
+    fn add_streams(&mut self, n: usize) -> Result<(), GpuError> {
+        let _ = n;
+        Ok(())
+    }
+
+    /// Every later plain keep belongs to `slot`'s stream
+    /// ([`crate::host::HostTier::select_stream`]): what
+    /// [`GpuModel::select_slot`] moves. A body with no machine ignores it.
+    fn select_stream(&mut self, slot: usize) -> Result<(), GpuError> {
+        let _ = slot;
+        Ok(())
+    }
+
     /// The residency back to its seed at a quiet boundary, on `stream`
     /// ([`crate::host::swap::SwapMachine::reset`]); `None` for a body with no
     /// machine.
@@ -1183,6 +1214,23 @@ impl<B: ChainBody> GpuModel<B> {
     ) -> Result<(), GpuError> {
         match self.body.host() {
             Some(host) => host.keep_rows(kept, kind),
+            None => Ok(()),
+        }
+    }
+
+    /// [`GpuModel::keep_rows`] for a pass of several slots: each row is kept
+    /// for the slot of the range that holds it
+    /// ([`HostServed::keep_rows_by`]).
+    pub fn keep_rows_by(
+        &mut self,
+        kept: runtime::swaprule::KeptRows,
+        kind: crate::host::PassKind,
+        ranges: &[SlotRange],
+    ) -> Result<(), GpuError> {
+        match self.body.host() {
+            Some(host) => {
+                host.keep_rows_by(kept, kind, ranges.iter().map(|r| (r.slot, r.rows.clone())))
+            }
             None => Ok(()),
         }
     }
