@@ -2252,6 +2252,17 @@ gate-gpu-glm5next-stagger:
 gate-gpu-glm5next-media:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-media && bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media'
 
+# The serve seat's media call of the same fixture (`bloomery-serve --mmproj` on a GLM file), gate_glm5next_e2e's `--only media-seat`
+# ((sm), `shared/glm5next_media.rs`'s `seat`, built with the `vision` feature the other recipes leave out): the encoder file of
+# the fixture's image sets, seated as the seat seats it and loaded as its resident tower; two procedural images of known grids
+# encoded on it and spliced through the seat's own steps (`Resident::span_rows`, `Session::prompt_media`), held to
+# `prefill_media` called with spans put together from the images' sizes, the same argmax and a bit-identical last hidden row; a
+# control without the rows that lies away from it; and the tower's refusal by name of a grid past its cap. No oracle: the
+# numbers' quality is the tower's gate's and (im)'s. Fixture tier only: on the real tier the bin fails by name before any load
+# (0 clauses). Loads the fixture once, on either card.
+gate-gpu-glm5next-media-seat:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,vision --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media-seat'
+
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
 # the dense limit. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
