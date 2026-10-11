@@ -16,9 +16,12 @@
 //!   the stage card ([`reserve_on`] puts the same reserve into a placed plan and a whole-fit probe).
 //! * [`table_bytes_per_position`] — what a plan adds per position of a sequence for a media load.
 //! * [`on_encoder_card`] — binds the tower's card for a tower call and the model's card back.
+//! * [`span_rows`] — a media call's images encoded on the tower and read back as the rows a prompt call
+//!   splices ([`span_rows_of`] is its host half, which takes the readback as a closure).
 //! * [`record`] — the `vision` line after the tower's load.
 
 use std::fmt::Display;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,7 +32,7 @@ use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{deepseek41v, qwen3vl};
-use vision::{MediaModel, VisionError};
+use vision::{MediaModel, Patches, VisionError};
 
 use crate::GateError;
 use crate::generate::Place;
@@ -440,6 +443,112 @@ pub fn on_encoder_card<T>(
         .bind_to_thread()
         .map_err(|e| format!("binding the model's card back after the tower: {e}"))?;
     out
+}
+
+/// One image of a media call: where its span starts in the call's ids, the patches the tower
+/// encodes, and the positions its span takes (what the model's prepare said).
+#[derive(Clone, Copy, Debug)]
+pub struct Image<'a> {
+    pub at: usize,
+    pub patches: &'a Patches,
+    pub span_len: usize,
+}
+
+/// A media call's spans in one pair of buffers: the rows (`width` bf16 values a position), the
+/// kind of each position, and each span's ranges of them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SpanRows<K> {
+    pub rows: Vec<u16>,
+    pub kinds: Vec<K>,
+    pub ats: Vec<SpanAt>,
+}
+
+/// One span's ranges: its positions in the call's ids, its values of [`SpanRows::rows`] and its
+/// entries of [`SpanRows::kinds`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanAt {
+    pub positions: Range<usize>,
+    pub rows: Range<usize>,
+    pub kinds: Range<usize>,
+}
+
+/// [`SpanRows`] of `images`, encoded on `tower` in order and read back on `stream`, the stream the
+/// tower was opened with ([`span_rows_of`] holds the rules).
+#[cfg(feature = "vision")]
+pub fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
+    tower: &mut T,
+    stream: &Arc<cuda_core::CudaStream>,
+    images: impl IntoIterator<Item = Image<'a>>,
+    width: usize,
+    rows_of: impl Fn(&Patches) -> usize,
+    splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
+) -> Result<SpanRows<K>, GateError> {
+    span_rows_of(
+        images,
+        width,
+        rows_of,
+        |patches| {
+            let encoded = tower.encode(patches).map_err(|e| e.to_string())?;
+            encoded
+                .rows
+                .buf()
+                .to_host_vec(stream)
+                .map_err(|e| e.to_string())
+        },
+        splice,
+    )
+}
+
+/// The host half of [`span_rows`]: each image encoded and read back as bf16 by `encode`, the
+/// first `rows_of(patches) · width` values kept (fewer is refused by name) and handed to `splice`
+/// with the patches, which returns the span's rows and the kind of each of its positions; their
+/// count is the image's `span_len`, refused by name when it is not. What a tower's rows are and
+/// what its span adds around them (V4.1's delimiters, none for a merger's tokens) is `rows_of`
+/// and `splice`; the rest is the same for every tower.
+pub fn span_rows_of<'a, K, E: Display>(
+    images: impl IntoIterator<Item = Image<'a>>,
+    width: usize,
+    rows_of: impl Fn(&Patches) -> usize,
+    mut encode: impl FnMut(&Patches) -> Result<Vec<u16>, E>,
+    mut splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
+) -> Result<SpanRows<K>, GateError> {
+    let mut out = SpanRows {
+        rows: Vec::new(),
+        kinds: Vec::new(),
+        ats: Vec::new(),
+    };
+    for Image {
+        at,
+        patches,
+        span_len,
+    } in images
+    {
+        let (h, w) = (patches.plan.n_llm_h, patches.plan.n_llm_w);
+        let all = encode(patches).map_err(|e| format!("the image at {at}: {e}"))?;
+        let want = rows_of(patches) * width;
+        let image = all.get(..want).ok_or_else(|| {
+            format!(
+                "the image at {at}: {} encoded values for a {h}x{w} grid, want {want}",
+                all.len()
+            )
+        })?;
+        let (rows, kinds) = splice(image, patches)?;
+        if kinds.len() != span_len {
+            return Err(format!(
+                "the image at {at}: a {h}x{w} grid splices {} positions, its prepare said {span_len}",
+                kinds.len()
+            )
+            .into());
+        }
+        out.ats.push(SpanAt {
+            positions: at..at + kinds.len(),
+            rows: out.rows.len()..out.rows.len() + rows.len(),
+            kinds: out.kinds.len()..out.kinds.len() + kinds.len(),
+        });
+        out.rows.extend(rows);
+        out.kinds.extend(kinds);
+    }
+    Ok(out)
 }
 
 /// Where a tower's activations live.
@@ -943,5 +1052,155 @@ mod tests {
             line.contains("seat=stage-reserve") && line.contains("scratch_home=arena"),
             "{line}"
         );
+    }
+
+    /// Values a position holds in the span tests.
+    const W: usize = 3;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kind {
+        Start,
+        Image,
+        NewLine,
+        End,
+    }
+
+    fn patches(h: usize, w: usize) -> Patches {
+        Patches {
+            plan: vision::GridPlan {
+                n_llm_h: h,
+                n_llm_w: w,
+                best_h: 0,
+                best_w: 0,
+            },
+            n_vit_h: 0,
+            n_vit_w: 0,
+            patch_len: 0,
+            bf16: Vec::new(),
+        }
+    }
+
+    /// The rows rule of a tower whose rows are the plan's grid, one row a cell.
+    fn cells(p: &Patches) -> usize {
+        p.plan.n_llm_h * p.plan.n_llm_w
+    }
+
+    /// A span that adds rows around the tower's: a Start row of 9s, each grid row's cells and a
+    /// NewLine row of 8s, an End row of 7s.
+    fn delimited(rows: &[u16], p: &Patches) -> Result<(Vec<u16>, Vec<Kind>), GateError> {
+        let (mut out, mut kinds) = (vec![9; W], vec![Kind::Start]);
+        for row in rows.chunks(p.plan.n_llm_w * W) {
+            out.extend_from_slice(row);
+            kinds.extend(vec![Kind::Image; row.len() / W]);
+            out.extend([8; W]);
+            kinds.push(Kind::NewLine);
+        }
+        out.extend([7; W]);
+        kinds.push(Kind::End);
+        Ok((out, kinds))
+    }
+
+    #[test]
+    fn two_images_come_back_in_one_pair_of_buffers_with_each_spans_ranges() {
+        let (a, b) = (patches(2, 2), patches(1, 3));
+        let images = [
+            Image {
+                at: 5,
+                patches: &a,
+                span_len: 8,
+            },
+            Image {
+                at: 20,
+                patches: &b,
+                span_len: 6,
+            },
+        ];
+        let mut seen = Vec::new();
+        // The tower's rows of image n: values n·100…, and the first image's window is wider than
+        // its grid: only the grid's rows are the image's.
+        let encode = |p: &Patches| -> Result<Vec<u16>, String> {
+            seen.push((p.plan.n_llm_h, p.plan.n_llm_w));
+            let n = seen.len() as u16;
+            let len = cells(p) * W + if n == 1 { 2 * W } else { 0 };
+            Ok((0..len as u16).map(|i| n * 100 + i).collect())
+        };
+        let got = span_rows_of(images, W, cells, encode, delimited).unwrap();
+        assert_eq!(seen, [(2, 2), (1, 3)]);
+        assert_eq!(
+            got.ats,
+            [
+                SpanAt {
+                    positions: 5..13,
+                    rows: 0..8 * W,
+                    kinds: 0..8
+                },
+                SpanAt {
+                    positions: 20..26,
+                    rows: 8 * W..14 * W,
+                    kinds: 8..14
+                },
+            ]
+        );
+        assert_eq!((got.rows.len(), got.kinds.len()), (14 * W, 14));
+        let one = &got.rows[got.ats[0].rows.clone()];
+        let cell = |first: u16| [first, first + 1, first + 2];
+        let want_one: Vec<u16> = [
+            [9; W],
+            cell(100),
+            cell(103),
+            [8; W],
+            cell(106),
+            cell(109),
+            [8; W],
+            [7; W],
+        ]
+        .concat();
+        assert_eq!(one, want_one);
+        let two = &got.rows[got.ats[1].rows.clone()];
+        let want_two: Vec<u16> = [[9; W], cell(200), cell(203), cell(206), [8; W], [7; W]].concat();
+        assert_eq!(two, want_two);
+        assert_eq!(
+            &got.kinds[got.ats[1].kinds.clone()],
+            [
+                Kind::Start,
+                Kind::Image,
+                Kind::Image,
+                Kind::Image,
+                Kind::NewLine,
+                Kind::End
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_window_a_wrong_span_and_a_failed_encode_are_refused_by_name() {
+        let p = patches(2, 2);
+        let image = |span_len| {
+            [Image {
+                at: 5,
+                patches: &p,
+                span_len,
+            }]
+        };
+        let rows = |len: usize| move |_: &Patches| Ok::<_, String>(vec![1; len]);
+        let refused = |r: Result<SpanRows<Kind>, GateError>| r.unwrap_err().to_string();
+        let short = span_rows_of(image(8), W, cells, rows(4 * W - 1), delimited);
+        assert_eq!(
+            refused(short),
+            "the image at 5: 11 encoded values for a 2x2 grid, want 12"
+        );
+        let span = span_rows_of(image(7), W, cells, rows(4 * W), delimited);
+        assert_eq!(
+            refused(span),
+            "the image at 5: a 2x2 grid splices 8 positions, its prepare said 7"
+        );
+        let failed = span_rows_of(
+            image(8),
+            W,
+            cells,
+            |_: &Patches| Err::<Vec<u16>, _>("device lost"),
+            delimited,
+        );
+        assert_eq!(refused(failed), "the image at 5: device lost");
     }
 }
