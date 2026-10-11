@@ -5017,11 +5017,22 @@ mod gate {
             ok &= prompt_batch(&levers)?;
             elapsed("arm pp", &t);
         }
-        if only == Only::Media && tier::run_clause(IM, Tag::FixtureOracle)? {
-            let t = Instant::now();
-            let (mut s, _) = open(&levers, CTX, PrefillMode::Batch, KdaLanes::One)?;
-            ok &= crate::glm5next_media::media_clause(s.model_mut())?;
-            elapsed("(im)", &t);
+        if only == Only::Media {
+            if tier::run_clause(IM, Tag::FixtureOracle)? {
+                let t = Instant::now();
+                let (mut s, _) = open(&levers, CTX, PrefillMode::Batch, KdaLanes::One)?;
+                ok &= crate::glm5next_media::media_clause(s.model_mut())?;
+                elapsed("(im)", &t);
+            } else {
+                // `--only media` runs no other clause: a tier that leaves (im) would end green on
+                // nothing, so it is a named failure instead.
+                println!(
+                    "glm5next-media: 0 clauses on the {} tier: (im) reads mainline's image sets of \
+                     the fixture only",
+                    tier::Tier::from_env()?.name()
+                );
+                ok = false;
+            }
         }
         if matches!(only, Only::All | Only::Slots) {
             let t = Instant::now();
