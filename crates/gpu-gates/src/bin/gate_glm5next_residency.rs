@@ -410,7 +410,7 @@ mod gate {
         residency: Residency,
     ) -> Result<bool, GateError> {
         let place = glm5next_tier::plan_levers(levers, 0)?;
-        let front = prompt_reserve_bytes(&inputs.hp, CTX as u64, false);
+        let front = prompt_reserve_bytes(inputs, CTX as u64, false);
         let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) else {
             return Err("the gate machine has no stage card".into());
         };
@@ -824,7 +824,7 @@ mod gate {
         nextn: &NextnInputs,
     ) -> Result<bool, GateError> {
         let place = glm5next_tier::plan_levers(levers, 0)?;
-        let front = prompt_reserve_bytes(&inputs.hp, CTX as u64, false);
+        let front = prompt_reserve_bytes(inputs, CTX as u64, false);
         let Some(card) = machine.cards.first() else {
             return Err("the gate machine has no stage card".into());
         };
