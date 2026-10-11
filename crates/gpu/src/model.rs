@@ -1592,6 +1592,16 @@ impl<B: ChainBody> GpuModel<B> {
             .logits_into_host(&self.gpu, out)
     }
 
+    /// The head's normed rows of the last `step` or prompt call (`result_norm`, `hidden`
+    /// f32 a row): the call's last position's row. Blocking read; gate/debug use.
+    pub fn head_normed(&self) -> Result<Vec<f32>, GpuError> {
+        self.refuse_one_pass("GpuModel::head_normed")?;
+        self.heads
+            .first()
+            .ok_or(no_head("GpuModel::head_normed"))?
+            .normed_to_host(&self.gpu)
+    }
+
     // --------------------------------------------- what the body's own impl
     // --------------------------------------------- blocks are handed
 
