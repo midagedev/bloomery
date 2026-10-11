@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the eight test images of the Clef-Flash image-input oracle into images/ beside this file.
+"""Write the nine test images of the image-input oracle (eight of the Qwen3-VL seats' tower sets, one glm5v-only) into images/ beside this file.
 
 The pixels are a pure function of the coordinates (integer arithmetic, no RNG), so the set can be
 rebuilt anywhere with numpy and Pillow. The PNG bytes also depend on the zlib that writes them, so
@@ -19,6 +19,10 @@ resize), with the aligned size computed by `plan()` below in f32, op for op:
   pad-777x513.png       777x513     aligns to 768x512: bicubic down to 768x508, 2 rows above
   max-2600x1800.png     2600x1800   above max_pixels: 2432x1696 (4028 tokens), bicubic down, no pad
   strip-1000x1.png      1000x1      aligns to 992x32 (31x1 tokens): one image row at row 15, black elsewhere
+
+One more file is for the glm5v seat only (images-glm5v.tsv; images.tsv, which every Qwen seat's tower sets follow, does
+not list it): cap-3000x2200.png, 3000x2200, whose 28-aligned canvas 3024x2212 is over glm5v's image_max_pixels (6,272,000),
+so mtmd's glm5v preprocess takes its budget branch. `main()` writes it with the others and states no Qwen plan for it.
 
 The content is smooth colour ramps, rings and coarse checkers, so each file compresses to a few
 kilobytes and a resize still meets edges and every one of the 256 levels.
@@ -133,7 +137,9 @@ IMAGES = {
     "pad-777x513.png": lambda: mixed(777, 513, 27, 12000),
     "max-2600x1800.png": lambda: mixed(2600, 1800, 130, 600000),
     "strip-1000x1.png": lambda: strip(1000),
+    "cap-3000x2200.png": lambda: mixed(3000, 2200, 150, 800000),
 }
+GLM_ONLY = {"cap-3000x2200.png"}
 
 
 def main():
@@ -149,6 +155,9 @@ def main():
         path = OUT / name
         img.save(path, optimize=True)
         total += path.stat().st_size
+        if name in GLM_ONLY:
+            print(f"{name}\t{w}x{h}\t{path.stat().st_size} B\t(glm5v only: no Qwen plan)")
+            continue
         w_bar, h_bar = plan(w, h)
         nw, nh, ox, oy = pad_ceil(w, h, w_bar, h_bar)
         print(f"{name}\t{w}x{h}\t{path.stat().st_size} B\t-> {w_bar}x{h_bar} ({w_bar // ALIGN}x{h_bar // ALIGN} tokens)"
