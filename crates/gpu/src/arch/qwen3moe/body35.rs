@@ -92,7 +92,7 @@ use crate::head::Head;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::swap::{CallPick, CallReport, Residency};
 use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec};
-use crate::host::xstream::{XMode, XStreamBody};
+use crate::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
@@ -1602,36 +1602,60 @@ impl Body35 {
     /// (`wide38`'s `STREAM_FLOOR`); a prompt call of fewer ids opens no call.
     pub const STREAM_FLOOR: u32 = STREAM_FLOOR;
 
+    /// The expert stream rule's costs for the file's routed kinds, in µs:
+    /// the host union's cost of one expert per column and its floor, and the
+    /// card route's fixed and per-column cost of one streamed expert. No
+    /// record has fitted this row: it is Qwen3.8's fitted Q4 row carried to
+    /// this family's expert shape (2048 by 512, Q4_K gate and up, a Q4_K or
+    /// Q6_K down) — the union's per-column cost by the row-lane instructions
+    /// a column takes (`model::ops`' `lane_units`, the arm a union of these
+    /// stacks takes) over the two layer kinds, its floor by an expert's bytes
+    /// at the same read rate, the card's per-column cost by the expert's
+    /// MACs, the card's fixed cost as that row's. The record that fits it is
+    /// a `stat prompt lb` record of a placed load of this family at 512 and
+    /// 4096 columns (the per-layer walls against their slots and listed
+    /// experts).
+    pub const XSTREAM_COSTS: Costs = Costs {
+        host_us_per_col: 2.0,
+        host_us_fixed: 12.4,
+        card_us_fixed: 13.0,
+        card_us_per_col: 0.10,
+    };
+
     /// What the next prompt calls move (`BLOOMERY_XSTREAM`,
     /// [`PromptStream`]): off until set here, so one load can run every
     /// arm. Under `Admit` a prompt call of the wide units' path moves each
     /// card layer's residency pool toward the experts its units route most
-    /// ([`super::placed`]'s streaming walk). Refused by name: `Admit` on a
-    /// load that runs no residency machine, `Split` (the walk's card route
-    /// has no ring pass), and any change while a call streams.
-    pub fn set_xstream(&mut self, mode: XMode) -> Result<(), GpuError> {
+    /// ([`super::placed`]'s streaming walk); `Split` starts the expert stream
+    /// on `gpu` at its first setting ([`Placed::start_xstream`]: the ring
+    /// sized from the card's free bytes, the lane's probe,
+    /// [`Body35::XSTREAM_COSTS`] for the rule) and arms the walk's pass rows
+    /// for its ring, whose pass runs the streamed experts on the card beside
+    /// its stacks; the stream then stays for the load's life, idle under
+    /// `Admit` and `Off`. Refused by name: `Admit` or `Split` on a load that
+    /// runs no residency machine, `Split` on a load the ring cannot serve
+    /// (no wide unit) or when the stream cannot start (the card's room among
+    /// the refusals), and any change while a call streams.
+    pub fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         if self.stream.streaming() {
             return Err(GpuError::state(
                 "Body35::set_xstream",
                 "no prompt call streaming",
             ));
         }
-        let machine = self
-            .placed
-            .as_ref()
-            .is_some_and(|p| p.hybrid.swap().is_some());
-        if mode != XMode::Off && !machine {
+        let placed = self.placed.as_mut().filter(|p| p.hybrid.swap().is_some());
+        let Some(p) = placed else {
+            if mode == XMode::Off {
+                self.stream.set_mode(mode);
+                return Ok(());
+            }
             return Err(GpuError::state(
                 "BLOOMERY_XSTREAM",
                 "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>) for admit or split",
             ));
-        }
+        };
         if mode == XMode::Split {
-            return Err(GpuError::shape(
-                "BLOOMERY_XSTREAM",
-                "split on qwen35moe waits for its ring: the placed walk's card route has no \
-                 ring pass; take admit or off",
-            ));
+            p.start_xstream(gpu, Body35::XSTREAM_COSTS)?;
         }
         self.stream.set_mode(mode);
         Ok(())
@@ -1652,6 +1676,25 @@ impl Body35 {
     /// second read is empty ([`PromptStream::take_pick_records`]).
     pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
         self.stream.take_pick_records()
+    }
+
+    /// The expert stream's rule costs in place of [`Body35::XSTREAM_COSTS`]
+    /// ([`PromptStream::set_costs`]). Refused by name on a load with no host
+    /// tier, before `split` started the stream and while a call streams.
+    pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {
+        let p = self.placed.as_mut().ok_or(GpuError::state(
+            "Body35::set_xstream_costs",
+            "a placed load's host tier",
+        ))?;
+        self.stream.set_costs(&mut p.hybrid, costs)
+    }
+
+    /// The last streaming prompt call's streamed layers, each with its walk,
+    /// and the stream's report; empty and `None` after a call that did not
+    /// stream under `split`. Taken: a second read is empty
+    /// ([`PromptStream::take_xstream_records`]).
+    pub fn take_xstream_records(&mut self) -> (Vec<(usize, XLayer)>, Option<XReport>) {
+        self.stream.take_xstream_records()
     }
 
     /// The marks a prompt call from `from` to `to` takes a checkpoint at:
@@ -2503,10 +2546,9 @@ fn media_call<T>(
 }
 
 impl XStreamBody for Body35 {
-    /// [`Body35::set_xstream`]; the card is not read until `split` has a
-    /// ring to start.
-    fn set_xstream(&mut self, _gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
-        Body35::set_xstream(self, mode)
+    /// [`Body35::set_xstream`].
+    fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
+        Body35::set_xstream(self, gpu, mode)
     }
 
     /// [`Body35::xstream_word`].
