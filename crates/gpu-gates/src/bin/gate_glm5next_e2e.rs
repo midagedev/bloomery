@@ -385,7 +385,13 @@
 //!
 //! A run that takes the load at [`CTX`]'s clauses declares one fixture-oracle clause for each of (cfx), (crx) and
 //! (ffx) and one for each step set it takes (`tier::expect_fixture_oracle`, [`declared_fixture_oracle`], which reads
-//! the same step-set table and selection the clauses do); every other arm declares none.
+//! the same step-set table and selection the clauses do); `--only media` declares its one; every other arm
+//! declares none.
+//!
+//! `--only media` is (im), the image-row clause of the prompt batch (`shared/glm5next_media.rs`): a media call
+//! (`prefill_media`) fed mainline's own tower rows of the fixture's image sets, held on the last position's
+//! `result_norm` against the CUDA run within the CPU twin's distance, and the refusals by name. The real tier
+//! leaves it to the fixture tier before any load.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -415,6 +421,10 @@ mod e2e;
 #[cfg(feature = "glm5next")]
 #[path = "shared/glm5next_tier.rs"]
 mod glm5next_tier;
+
+#[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_media.rs"]
+mod glm5next_media;
 
 #[cfg(feature = "glm5next")]
 #[path = "shared/quiet.rs"]
@@ -485,6 +495,9 @@ mod gate {
 
     /// Cache rows: the `--dsa` set's step at position 3,070, with room.
     const CTX: usize = 3136;
+
+    /// (im): the media call against mainline's image-input sets of the fixture (`--only media`).
+    const IM: &str = "(im) image rows in the prompt batch against mainline's sets";
 
     /// The prompt batch's load: every position the latent layers attend whole
     /// (`place::dense_positions`: the indexer's top-k in whole pools of 512,
@@ -1350,6 +1363,9 @@ mod gate {
     /// The fixture-oracle clauses a run decides: [`FX_CLAUSES`] and one a step set the run takes,
     /// when it takes the load at [`CTX`]'s clauses, none otherwise.
     fn declared_fixture_oracle(only: Only, sets: StepSets) -> usize {
+        if only == Only::Media {
+            return 1;
+        }
         if !only.runs_main() {
             return 0;
         }
@@ -4872,6 +4888,9 @@ mod gate {
         /// (h1)-(h4), on the NextN load at [`SLOT_CTX`]: no other run takes
         /// them.
         StaggerDraft,
+        /// (im) alone, on a load at [`CTX`] on the batch feed: the fixture's media rows against
+        /// mainline's sets.
+        Media,
     }
 
     impl Only {
@@ -4937,8 +4956,8 @@ mod gate {
     }
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
-    /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`, or
-    /// every clause.
+    /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`,
+    /// `--only media`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
@@ -4951,9 +4970,10 @@ mod gate {
                 Some("slots") => Ok(Only::Slots),
                 Some("stagger") => Ok(Only::Stagger),
                 Some("stagger-draft") => Ok(Only::StaggerDraft),
+                Some("media") => Ok(Only::Media),
                 other => Err(format!(
-                    "--only is main, pp, pplong, verify, keep, slots, stagger or stagger-draft, \
-                     not {other:?}"
+                    "--only is main, pp, pplong, verify, keep, slots, stagger, stagger-draft or \
+                     media, not {other:?}"
                 )
                 .into()),
             },
@@ -4996,6 +5016,12 @@ mod gate {
             let t = Instant::now();
             ok &= prompt_batch(&levers)?;
             elapsed("arm pp", &t);
+        }
+        if only == Only::Media && tier::run_clause(IM, Tag::FixtureOracle)? {
+            let t = Instant::now();
+            let (mut s, _) = open(&levers, CTX, PrefillMode::Batch, KdaLanes::One)?;
+            ok &= crate::glm5next_media::media_clause(s.model_mut())?;
+            elapsed("(im)", &t);
         }
         if matches!(only, Only::All | Only::Slots) {
             let t = Instant::now();
