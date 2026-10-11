@@ -2753,6 +2753,23 @@ impl ArenaFloor {
     }
 }
 
+/// The slots `plan`'s arena holds: its bytes over one slot of every layer the
+/// host leg serves routed experts of ([`ArenaFloor::slot_set`]); 0 on a plan
+/// with no arena. Refused by name: an arena on a plan with no such layer.
+pub fn arena_slots(plan: &Plan<'_>) -> Result<u64, PlacementError> {
+    let arena = plan.host.nvme_arena_bytes;
+    if arena == 0 {
+        return Ok(0);
+    }
+    let set = ArenaFloor::of(plan, ARENA_COLUMNS)?.slot_set;
+    arena
+        .checked_div(set)
+        .ok_or_else(|| PlacementError::Metadata {
+            key: "the NVMe tier arena's slots".to_string(),
+            detail: format!("an arena of {arena} B over a slot set of 0 B"),
+        })
+}
+
 impl fmt::Display for ArenaFloor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -2900,7 +2917,15 @@ pub fn nvme_arena_of(dial: &ArenaDial, given: Option<u64>) -> Result<u64, Placem
 /// experts the host leg serves, on either tier.
 /// The split plan's headroom is what the room leaves past the arena and the
 /// host need, the budget a churn pool beside them must fit.
-pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
+///
+/// `given` is the lever `BLOOMERY_NVTIER_BYTES`'s value ([`nvme_arena_of`]),
+/// read once by the family's `describe` beside the room: this function reads
+/// no environment, so a gate plans each arm by its own arena.
+pub fn expert_nvme_tier(
+    plan: &mut Plan<'_>,
+    room: u64,
+    given: Option<u64>,
+) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
     if need.bytes() <= room {
@@ -2989,9 +3014,6 @@ pub fn expert_nvme_tier(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementE
         need: need.bytes(),
         least: ArenaFloor::of(plan, ARENA_COLUMNS)?,
     };
-    let given = bloomery_levers::nvtier_levers()
-        .map_err(|e| PlacementError::HostRoom(format!("BLOOMERY_NVTIER_BYTES: {e}")))?
-        .bytes;
     let arena = nvme_arena_of(&dial, given)?;
     let room = room - arena;
     plan.host.nvme_arena_bytes = arena;

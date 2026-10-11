@@ -39,7 +39,7 @@ use bloomery_gpu::host::xstream::{XLayer, XReport};
 use bloomery_gpu::hybrid::HostResidency;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::prompt_timing::PromptStats;
-use model::placement::{Machine, Plan};
+use model::placement::{Machine, Plan, arena_slots};
 
 /// The schema's version, the first line of `--records-schema`.
 pub const VERSION: u32 = 1;
@@ -992,7 +992,7 @@ use Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -1012,6 +1012,9 @@ pub static PLAN: Kind = Kind {
         pos("n_l_layers", U64, "layers"),
         lit(" layers"),
         key("card_budget", Word, "B"),
+        key("paged", U64, "B"),
+        key("arena", U64, "B"),
+        key("arena_slots", U64, "slots"),
         opt("card_free", U64, "B"),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
@@ -2953,6 +2956,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &NVTIER,
     &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
@@ -3256,7 +3260,8 @@ pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST,
 
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
-/// card counts' range, and the budget.
+/// card counts' range, the budget, and the NVMe tier's terms (the bytes paged,
+/// the arena and its slots).
 pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
     let card = &plan.cards[0];
@@ -3282,6 +3287,12 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             "card_budget",
             plan.card_budget
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
+        )
+        .u("paged", plan.host.nvme_expert_bytes)
+        .u("arena", plan.host.nvme_arena_bytes)
+        .u(
+            "arena_slots",
+            arena_slots(plan).expect("the arena's slots of a plan the split made"),
         );
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
@@ -4103,7 +4114,7 @@ mod tests {
         devices=[stage:3090:cuda0:25350373376] cuda_order=unset(FASTEST_FIRST)";
     const PLAN_BP: &str = "plan place=bp card=A6000 ctx_max=16384 card_experts=2552 \
         (38801506304 B) host_experts=8045 (123885584384 B) host_shadow=0 B n_l=65..66 on 39 \
-        layers card_budget=none card_free=50668240896 \
+        layers card_budget=none paged=0 arena=0 arena_slots=0 card_free=50668240896 \
         devices=[stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376] \
         cuda_order=unset(FASTEST_FIRST)";
     const RESIDENCY_HOST_GLM: &str = "residency host residency=mid-p0-s1 pinned=0 \

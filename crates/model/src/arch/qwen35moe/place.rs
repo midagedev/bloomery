@@ -196,6 +196,11 @@ pub struct PlanInputs {
     /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
     /// of its own sets it, read [`HostRead::Given`].
     pub room: (u64, HostRead),
+    /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
+    /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
+    /// as its `given` ([`placement::expert_nvme_tier`]). A gate that plans an
+    /// arm by an arena of its own sets it.
+    pub arena: Option<u64>,
 }
 
 /// Why a plan was refused.
@@ -347,12 +352,14 @@ impl PlanInputs {
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
         let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
+        let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
             model,
             spec,
             kv,
             room,
+            arena,
         })
     }
 
@@ -563,7 +570,7 @@ impl PlanInputs {
         };
         let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
         placement::row_table_tier(&mut plan, self.room.0, floor, UBATCH_PLANNED)?;
-        placement::expert_nvme_tier(&mut plan, self.room.0)?;
+        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
         Ok(plan)
     }
 
@@ -3238,6 +3245,7 @@ mod tests {
                 spec,
                 kv,
                 room: (u64::MAX, HostRead::Given),
+                arena: None,
             }
         }
 
