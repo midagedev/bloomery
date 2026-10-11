@@ -3,8 +3,9 @@
 //! each of its parts in its own [`DIRECT_ALIGN`]-aligned window, the bytes
 //! landing at the skew an aligned read of the part's file range needs —
 //! filled on a miss by [`DirectFile::read_span`] — over the resident pool for
-//! a decode step's misses, on the tier's own reader for a prompt batch's —
-//! and lent to the host leg through the model side's [`TierSlots`] seam.
+//! a decode step's misses, on the tier's own reader for a prompt batch's and
+//! a residency flip's victim — and lent to the host leg through the model
+//! side's [`TierSlots`] seam.
 //! The file mapping serves the plan's host segment; every other id the leg
 //! reads — the NVMe segment's, and the card's victims once they flip — is
 //! this arena's, its slot refused by name while unfilled.
@@ -47,9 +48,10 @@
 //! mapping and drops as before. An id on the card holds no slot: the machine
 //! frees the promoted id's slot at the landing ([`NvTier::release`], through
 //! `SwapSource::release_host`), so every demotion fills. A victim's fill runs
-//! on the lane's own thread ([`NvTier::ensure_here`]) and never on the pool,
-//! whose one dispatch mutex is the chain's: beside the chain the lane takes
-//! only the books' lock, for claims, pins and publishes that wait on nothing.
+//! on the tier's fill reader at the victim rank, behind every queued prompt
+//! batch ([`NvTier::ensure_victim`]), and never on the pool, whose one
+//! dispatch mutex is the chain's: beside the chain the lane takes only the
+//! books' lock, for claims, pins and publishes that wait on nothing.
 //!
 //! A call's claim kind ([`Claim`]) places what it takes in the books. A
 //! step's and a keep's slots take a fresh tick; a transient's enter at the
@@ -67,11 +69,12 @@
 //! A prompt batch's fill runs off the caller, on the tier's own reader:
 //! [`NVTIER_FILL_THREADS`] threads started at the build, each blocked in one
 //! `O_DIRECT` read at a time, taking one queue by rank with a prompt batch's
-//! picks first. The claim and the pin stay on the caller; [`Ticket::wait`]
-//! joins the fill and publishes the picks under the books' lock. A pick's
-//! reads write straight into its slot's windows, after the pages of the
-//! expert it evicted went back, and the threads never take the pool's
-//! dispatch lock or the books' lock, and never wait on the card.
+//! picks first and a flip's victim behind them. The claim and the pin stay on
+//! the caller; [`Ticket::wait`] joins the fill and publishes the picks under
+//! the books' lock. A pick's reads write straight into its slot's windows,
+//! after the pages of the expert it evicted went back, and the threads never
+//! take the pool's dispatch lock or the books' lock, and never wait on the
+//! card.
 
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -93,17 +96,13 @@ use model::placement::{
 use crate::GpuError;
 
 mod reader;
-pub use reader::ReaderStats;
-use reader::{Job, Reader};
+use reader::{Job, Kind, Reader};
+pub use reader::{KindStats, ReaderStats};
 
 /// Threads of the tier's fill reader: the depth the drive is read at. The
 /// drive's rate stops rising near it; a deeper queue puts more reads in
 /// flight and no more bytes through.
 pub(crate) const NVTIER_FILL_THREADS: usize = 16;
-
-/// The reader's rank of a prompt batch's fill, the lowest: taken before any
-/// other fill queued.
-const PROMPT_RANK: u8 = 0;
 
 /// How long the tier's drop waits for the reader's threads to leave their
 /// reads.
@@ -1921,27 +1920,35 @@ impl NvTier {
     /// [`Claim::Step`] and [`Claim::Keep`] take a fresh tick, [`Claim::Transient`]
     /// enters its misses at the cold end, where they are the first victims.
     pub fn ensure_as(&self, layer: usize, ids: &[u32], claim: Claim) -> Result<(), GpuError> {
-        self.ensure_by(layer, ids, FillBy::Pool, claim)
+        self.fill_missing(layer, ids, claim, false)?;
+        if self.audit.get().is_some() {
+            self.audit_slots(layer, ids)?;
+        }
+        Ok(())
     }
 
-    /// [`NvTier::ensure`] with every read on the calling thread, one pick
-    /// after the other, and none on the pool: the residency lane's victim
-    /// fill, which must not take the pool's dispatch mutex the chain's host
-    /// compute and its own `ensure` take. A one-pick call reads its three
-    /// parts at queue depth 1 either way; the books' claim and publish are
-    /// `ensure`'s.
-    pub fn ensure_here(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
-        self.ensure_by(layer, ids, FillBy::Caller, Claim::Step)
-    }
-
-    fn ensure_by(
-        &self,
-        layer: usize,
-        ids: &[u32],
-        by: FillBy,
-        claim: Claim,
-    ) -> Result<(), GpuError> {
-        self.fill_missing(layer, ids, by, claim, false)?;
+    /// The residency lane's victim fill: `ids` claimed as a step's (unpinned)
+    /// and their misses read on the tier's fill reader at the victim rank,
+    /// behind every queued prompt batch, then published unpinned. It waits on
+    /// the reader and takes nothing of the pool, whose one dispatch mutex is
+    /// the chain's: beside the chain the lane takes only the books' lock, for
+    /// the claim and the publish, which wait on nothing. A victim holds no
+    /// pin once published, and the fill counts as a fill, not a union's.
+    /// Refused by name like [`NvTier::ensure`], and once the reader has
+    /// stopped.
+    pub fn ensure_victim(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
+        let (arena, claim) = self.claim(layer, ids, Claim::Step, false)?;
+        if !claim.picks.is_empty() {
+            let reads: Vec<PickRead> = claim.picks.iter().map(|p| read_of(arena, p)).collect();
+            let mem = Arc::clone(&self.mem);
+            let tier = TierParts {
+                arena,
+                books: &self.books,
+                stats: &self.stats,
+                reader: &self.reader,
+            };
+            fill_victims(tier, &claim.picks, move |i| read_pick(&mem, &reads[i]))?;
+        }
         if self.audit.get().is_some() {
             self.audit_slots(layer, ids)?;
         }
@@ -1963,7 +1970,7 @@ impl NvTier {
         ids: &[u32],
         claim: Claim,
     ) -> Result<TierPin<'_>, GpuError> {
-        let held = self.fill_missing(layer, ids, FillBy::Pool, claim, true)?;
+        let held = self.fill_missing(layer, ids, claim, true)?;
         if self.audit.get().is_some() {
             self.audit_slots(layer, ids)?;
         }
@@ -2095,14 +2102,13 @@ impl NvTier {
     }
 
     /// The misses of `ids` read into their slots ([`NvTier::ensure`]), the
-    /// reads on `by`. With `pin` every id the arena serves is pinned too
-    /// ([`NvTier::ensure_pinned`]) and the guard returned holds them; without,
-    /// the guard holds none.
+    /// reads on the resident pool. With `pin` every id the arena serves is
+    /// pinned too ([`NvTier::ensure_pinned`]) and the guard returned holds
+    /// them; without, the guard holds none.
     fn fill_missing(
         &self,
         layer: usize,
         ids: &[u32],
-        by: FillBy,
         kind: Claim,
         pin: bool,
     ) -> Result<BatchPin<'_>, GpuError> {
@@ -2118,7 +2124,7 @@ impl NvTier {
             return Ok(held);
         }
         let t0 = Instant::now();
-        self.fill(arena, &picks, by)
+        self.fill(arena, &picks)
             .inspect_err(|_| free_picks(arena, &picks))?;
         {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
@@ -2138,28 +2144,22 @@ impl NvTier {
         Ok(held)
     }
 
-    /// The misses' reads: on the resident pool, each worker reading the
-    /// picks its chunk names, or on the caller, pick after pick — each into
-    /// its slot's own windows, disjoint by the books' slot ownership, joined
-    /// before this returns.
-    fn fill(&self, arena: &LayerArena, picks: &[Pick], by: FillBy) -> Result<(), GpuError> {
+    /// The misses' reads on the resident pool, each worker reading the picks
+    /// its chunk names, each into its slot's own windows, disjoint by the
+    /// books' slot ownership, joined before this returns.
+    fn fill(&self, arena: &LayerArena, picks: &[Pick]) -> Result<(), GpuError> {
         let reads: Vec<PickRead> = picks.iter().map(|p| read_of(arena, p)).collect();
-        match by {
-            FillBy::Caller => reads.iter().try_for_each(|r| read_pick(&self.mem, r)),
-            FillBy::Pool => {
-                let fail: Mutex<Option<GpuError>> = Mutex::new(None);
-                threads::pool().for_each_chunk(reads.len(), |chunk| {
-                    for r in &reads[chunk] {
-                        if let Err(e) = read_pick(&self.mem, r) {
-                            return note(&fail, e);
-                        }
-                    }
-                });
-                fail.into_inner()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .map_or(Ok(()), Err)
+        let fail: Mutex<Option<GpuError>> = Mutex::new(None);
+        threads::pool().for_each_chunk(reads.len(), |chunk| {
+            for r in &reads[chunk] {
+                if let Err(e) = read_pick(&self.mem, r) {
+                    return note(&fail, e);
+                }
             }
-        }
+        });
+        fail.into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .map_or(Ok(()), Err)
     }
 
     /// [`NvTier::ensure_pinned`] as a claim in flight: the batch is claimed
@@ -2360,7 +2360,7 @@ impl<'a> Inflight<'a> {
             match inflight
                 .tier
                 .reader
-                .submit(PROMPT_RANK, Job::new(units, read))
+                .submit(Job::new(Kind::Prompt, units, read))
             {
                 Ok(job) => inflight.job = Some(job),
                 Err(e) => {
@@ -2423,6 +2423,38 @@ impl Drop for Inflight<'_> {
     }
 }
 
+/// A victim's picks, claimed unpinned, read on the reader as one job at the
+/// victim rank (`read(i)` pick `i`'s), waited for and published unpinned:
+/// nothing is held once this returns, and the fill is counted as a fill, not
+/// a union's. A fill that failed, or a reader that has stopped, frees the
+/// picks' slots and refuses by name.
+fn fill_victims(
+    tier: TierParts<'_>,
+    picks: &[Pick],
+    read: impl Fn(usize) -> Result<(), GpuError> + Send + Sync + 'static,
+) -> Result<(), GpuError> {
+    let TierParts {
+        arena,
+        books,
+        stats,
+        reader,
+    } = tier;
+    let t0 = Instant::now();
+    let job = reader
+        .submit(Job::new(Kind::Victim, picks.len(), read))
+        .inspect_err(|_| free_picks(arena, picks))?;
+    reader.wait(&job).map_err(|f| {
+        free_picks(arena, picks);
+        f.error
+    })?;
+    {
+        let mut books = books.lock().unwrap_or_else(|e| e.into_inner());
+        publish(arena, &mut books, picks, Claim::Step);
+    }
+    count_fill(stats, arena, picks, t0.elapsed().as_nanos() as u64, false);
+    Ok(())
+}
+
 /// A fill that failed, as the seam names it to the model side.
 fn fill_error(layer: usize, f: FillFailed) -> TierError {
     TierError::Fill {
@@ -2430,15 +2462,6 @@ fn fill_error(layer: usize, f: FillFailed) -> TierError {
         id: f.id,
         source: Box::new(f.error),
     }
-}
-
-/// Which thread reads a fill's misses.
-#[derive(Clone, Copy)]
-enum FillBy {
-    /// The resident pool's workers, one dispatch.
-    Pool,
-    /// The calling thread.
-    Caller,
 }
 
 /// Record the first fill failure, the rest dropped on the floor.
@@ -3274,12 +3297,70 @@ mod tests {
         let counted = stats.fills.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(counted, 2);
         assert_eq!(
-            (reader.stats().jobs, reader.stats().units),
-            (1, 2),
-            "the reader ran the batch"
+            {
+                let r = reader.stats();
+                (
+                    (r.prompt.jobs, r.prompt.units),
+                    (r.victim.jobs, r.victim.units),
+                )
+            },
+            ((1, 2), (0, 0)),
+            "the reader ran the batch as a prompt fill"
         );
         drop(pin);
         assert_eq!(open_reads(&arena, &[0, 1]), [0, 0]);
+    }
+
+    /// A victim's fill runs on the reader at the victim rank and ends
+    /// unpinned: the slot is filled with no open read (a pin left would
+    /// refuse the landing's release), the fill counts as a fill and not a
+    /// union's, and a read that failed frees the slot and names the failure.
+    #[test]
+    fn a_victim_fill_publishes_unpinned() {
+        use std::sync::Mutex;
+        use std::sync::atomic::Ordering::Relaxed;
+        let arena = arena_of(8, 4);
+        let books = Mutex::new(super::Books::default());
+        let stats = super::Stats::default();
+        let reader = super::Reader::start(2, "test-fill").unwrap();
+        let tier = super::TierParts {
+            arena: &arena,
+            books: &books,
+            stats: &stats,
+            reader: &reader,
+        };
+        let claim_of = |id: u32| {
+            let mut b = books.lock().unwrap();
+            super::claim_slots(0, &arena, &mut b, &[id], Claim::Step).unwrap()
+        };
+        super::fill_victims(tier, &claim_of(5).picks, |_| Ok(())).unwrap();
+        assert_eq!(filled_ids(&arena), [5]);
+        assert_eq!(open_reads(&arena, &[5]), [0], "no pin is left");
+        assert_eq!(
+            (stats.fills.load(Relaxed), stats.union_fills.load(Relaxed)),
+            (1, 0),
+            "a fill, not a union's"
+        );
+        let ran = reader.stats();
+        assert_eq!(
+            (
+                (ran.victim.jobs, ran.victim.units),
+                (ran.prompt.jobs, ran.prompt.units)
+            ),
+            ((1, 1), (0, 0)),
+            "the reader ran it as a victim fill"
+        );
+        let failed = claim_of(6);
+        let e = super::fill_victims(tier, &failed.picks, |_| {
+            Err(crate::GpuError::shape(
+                "NvTier::fill",
+                "expert 6: a short read".to_string(),
+            ))
+        })
+        .unwrap_err();
+        assert!(e.to_string().contains("a short read"), "{e}");
+        assert_eq!(filled_ids(&arena), [5], "the failed pick is not lent");
+        assert_eq!(stats.fills.load(Relaxed), 1, "and not counted");
     }
 
     /// A read that failed reaches the join as the failure it raised, naming

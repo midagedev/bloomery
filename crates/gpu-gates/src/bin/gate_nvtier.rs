@@ -154,10 +154,10 @@
 //!   never read (the `file` picks are the plan's host segment's).
 //! - `pool` (clause 10): no phase's dispatches waited for another caller's
 //!   job, and the prompt's fills ran on the tier's fill reader
-//!   ([`NvTier::reader_stats`]: its picks are at least 99 % of the fills the
-//!   prompt made, the rest the residency lane's). The chain is the pool's one
-//!   dispatcher; the lane's victim fills read on the lane's own threads
-//!   ([`NvTier::ensure_here`]) and a prompt batch's on the reader's, where a
+//!   ([`NvTier::reader_stats`]: the prompt kind's picks are at least 99 % of
+//!   the fills the prompt made, the rest the residency lane's). The chain is
+//!   the pool's one dispatcher; every fill off the chain reads on the
+//!   reader's threads, a prompt batch's ahead of a lane's victim, where a
 //!   fill through the pool took the dispatch mutex the chain's host compute
 //!   holds.
 //! - `claim` (clause 11): the prompt union's claim rule, read from the arena's
@@ -174,6 +174,12 @@
 //!   the load, and a transient hit leaves its tick, so the keep ids outlive it).
 //!   The arena's misses over the [`STEPS`] steps are printed beside the
 //!   replay's prediction ([`STEP_MISSES_PREDICTED`]), not judged.
+//! - `residency_prompt` (clause 12): over the paged arm's run under the set
+//!   `mid-p0-s1` (the prompt call, then the [`STEPS`] steps) the residency
+//!   lane's victim fills ran on the tier's fill reader beside the prompt's:
+//!   the reader ran victim jobs and prompt jobs (each kind counted alone),
+//!   flips landed, and the lane's copies read arena slots. The copies' reads
+//!   of the file mapping are printed, not judged.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -223,7 +229,9 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, SplitWalk};
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
-use bloomery_gpu::host::nvtier::{DropRuns, Heat, NvTier, NvTierStats, UnionBook, advice_disjoint};
+use bloomery_gpu::host::nvtier::{
+    DropRuns, Heat, NvTier, NvTierStats, ReaderStats, UnionBook, advice_disjoint,
+};
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
@@ -328,6 +336,9 @@ struct ArmRun {
     /// What the prompt call's fills cost and where they ran, on a load with a
     /// tier.
     prompt_fill: Option<PromptFill>,
+    /// What the fill reader counted over the prompt call and the steps, each
+    /// kind of job alone, on a load with a tier.
+    reader: Option<ReaderStats>,
     /// Every boundary's report in order, the prompt call's and the steps',
     /// and where the steps' begin.
     passes: Vec<PassReport>,
@@ -568,15 +579,12 @@ struct Footprint {
 
 /// The prompt call's fills: what the tier read for it, in picks and bytes and
 /// the fills' own wall summed over the batches, and where those reads ran
-/// (the fill reader's jobs, picks and the waits the caller blocked in).
+/// (what the fill reader counted over the call, each kind of job alone).
 struct PromptFill {
     fills: u64,
     bytes: u64,
     fill_ns: u64,
-    reader_jobs: u64,
-    reader_units: u64,
-    reader_waits: u64,
-    reader_wait_ns: u64,
+    reader: ReaderStats,
     prompt_ns: u64,
 }
 
@@ -710,6 +718,7 @@ fn arm(
         seam: None,
         footprint: None,
         prompt_fill: None,
+        reader: None,
         passes: Vec::new(),
         steps_from: 0,
         step_ns: Vec::with_capacity(STEPS),
@@ -787,6 +796,10 @@ fn arm(
         t.flush()?;
     }
     run.stats = tier.as_ref().map(|t| t.stats());
+    run.reader = tier
+        .as_ref()
+        .zip(reader0)
+        .map(|(t, r0)| t.reader_stats().since(&r0));
     if let (Some((t0, l0)), Some(t1), Some(l1)) = (span0, run.stats, lane_of(&s)?) {
         run.steps = Some(Span {
             tier: [t0, t1],
@@ -804,10 +817,7 @@ fn arm(
             fills: d1.fills - d0.fills,
             bytes: d1.fill_bytes - d0.fill_bytes,
             fill_ns: d1.fill_ns - d0.fill_ns,
-            reader_jobs: r1.jobs - r0.jobs,
-            reader_units: r1.units - r0.units,
-            reader_waits: r1.waits - r0.waits,
-            reader_wait_ns: r1.wait_ns - r0.wait_ns,
+            reader: r1.since(&r0),
             prompt_ns,
         });
     }
@@ -1139,7 +1149,7 @@ struct MidRun {
 
 /// What the `refuse` clause's floor arm read: the slots a paged layer its arena
 /// carved, its prompt's argmax and logits digest, and the picks the fill
-/// reader took for it.
+/// prompt batches' fills the reader took for it.
 struct FloorRun {
     slots: u64,
     argmax: u32,
@@ -1187,7 +1197,7 @@ fn floor_arm(
         slots,
         argmax,
         digest,
-        reader_units: tier.reader_stats().units - r0.units,
+        reader_units: tier.reader_stats().prompt.units - r0.prompt.units,
     })
 }
 
@@ -2072,6 +2082,36 @@ fn run() -> Result<(), GateError> {
     );
     pass &= exclusive;
 
+    // `residency_prompt` (clause 12): the lane's victim fills ran on the
+    // tier's fill reader beside the prompt's. Over the prompt call and the
+    // steps the reader counted victim jobs and prompt jobs, each kind alone;
+    // flips landed; and the lane's copies read arena slots. The copies' reads
+    // of the file mapping are printed, not judged.
+    let ran = paged
+        .reader
+        .as_ref()
+        .ok_or("the paged arm read no fill reader counters")?;
+    let residency_prompt =
+        ran.victim.jobs > 0 && ran.prompt.jobs > 0 && paged.landed > 0 && slot_reads > 0;
+    println!(
+        "residency_prompt: over the prompt call and {STEPS} steps under the set mid-p0-s1 the fill \
+         reader ran {} victim jobs ({} picks, {} waits for {:.1} ms) and {} prompt jobs ({} picks, \
+         {} waits for {:.1} ms); {} flips landed; the lane's copies read {slot_reads} arena slots \
+         and {mapping_reads} of the file mapping over the steps (the mapping reads are printed, \
+         not judged) (want victim jobs, prompt jobs, flips and slot reads above 0): {}",
+        ran.victim.jobs,
+        ran.victim.units,
+        ran.victim.waits,
+        ran.victim.wait_ns as f64 / 1e6,
+        ran.prompt.jobs,
+        ran.prompt.units,
+        ran.prompt.waits,
+        ran.prompt.wait_ns as f64 / 1e6,
+        paged.landed,
+        verdict(residency_prompt)
+    );
+    pass &= residency_prompt;
+
     // `claim` (clause 11): the prompt union's claim rule, read from the
     // arena's books right after the prompt call. Per paged layer: the path
     // the call's ids decide, its top `S - 2B` arena ids by columns filled and
@@ -2294,7 +2334,7 @@ fn run() -> Result<(), GateError> {
 
     // `pool` (clause 10): no phase's dispatch waited for another caller's
     // job. The chain is the pool's one dispatcher: the lane's victim fills
-    // read on the lane's own threads (`NvTier::ensure_here`), where a fill on
+    // read on the tier's fill reader (`NvTier::ensure_victim`), where a fill on
     // the pool took the dispatch mutex the chain's host compute holds.
     let waits: Vec<String> = census
         .iter()
@@ -2311,7 +2351,8 @@ fn run() -> Result<(), GateError> {
     let fill = prompt_fill
         .as_ref()
         .ok_or("the paged arm read no prompt fills")?;
-    let on_reader = fill.fills > 0 && fill.reader_units * 100 >= fill.fills * 99;
+    let batches = fill.reader.prompt;
+    let on_reader = fill.fills > 0 && batches.units * 100 >= fill.fills * 99;
     println!(
         "pool: the prompt's {} fills ({:.2} GB, {:.1} ms summed over the batches' own walls, \
          {:.2} GB/s) ran {} picks in {} batches on the fill reader (want at least 99 % of the \
@@ -2320,11 +2361,11 @@ fn run() -> Result<(), GateError> {
         fill.bytes as f64 / 1e9,
         fill.fill_ns as f64 / 1e6,
         fill.bytes as f64 / fill.fill_ns.max(1) as f64,
-        fill.reader_units,
-        fill.reader_jobs,
+        batches.units,
+        batches.jobs,
         verdict(on_reader),
-        fill.reader_waits,
-        fill.reader_wait_ns as f64 / 1e6,
+        batches.waits,
+        batches.wait_ns as f64 / 1e6,
         fill.prompt_ns as f64 / 1e6
     );
     pass &= on_reader;
