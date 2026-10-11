@@ -865,67 +865,31 @@ struct Vision {
     media: SharedMedia,
 }
 
-/// A media call's rows: every feed's image encoded on the resident encoder,
-/// its aligner rows read back as bf16 and spliced ([`ds41_media::span_rows`]),
-/// all in one pair of buffers — the rows, the kinds, and each span's
-/// positions, rows and kinds as ranges of them.
-#[cfg(feature = "vision")]
-type SpanRows = (
-    Vec<u16>,
-    Vec<body::MediaKind>,
-    Vec<(
-        std::ops::Range<usize>,
-        std::ops::Range<usize>,
-        std::ops::Range<usize>,
-    )>,
-);
-
 #[cfg(feature = "vision")]
 impl Vision {
-    /// [`SpanRows`] of `feeds`, encoded in order.
-    fn span_rows(&mut self, feeds: &[MediaFeed]) -> Result<SpanRows, GateError> {
-        let mut rows = Vec::new();
-        let mut kinds = Vec::new();
-        let mut ats = Vec::new();
-        for f in feeds {
-            let p = &f.prepared.patches;
-            let (h, w) = (p.plan.n_llm_h, p.plan.n_llm_w);
-            let encoded = self
-                .enc
-                .encode(p)
-                .map_err(|e| format!("the image at {}: {e}", f.at))?;
-            let all = encoded
-                .rows
-                .buf()
-                .to_host_vec(&self.stream)
-                .map_err(|e| format!("the image at {}: {e}", f.at))?;
-            let want = h * w * self.n_embd;
-            let aligner = all.get(..want).ok_or_else(|| {
-                format!(
-                    "the image at {}: {} aligner values for a {h}x{w} grid, want {want}",
-                    f.at,
-                    all.len()
-                )
-            })?;
-            let (r, k) = ds41_media::span_rows(aligner, (h, w), self.n_embd, &self.delims)?;
-            if k.len() != f.prepared.span_len {
-                return Err(format!(
-                    "the image at {}: a {h}x{w} grid splices {} positions, its prepare said {}",
-                    f.at,
-                    k.len(),
-                    f.prepared.span_len
-                )
-                .into());
-            }
-            ats.push((
-                f.at..f.at + k.len(),
-                rows.len()..rows.len() + r.len(),
-                kinds.len()..kinds.len() + k.len(),
-            ));
-            rows.extend(r);
-            kinds.extend(k);
-        }
-        Ok((rows, kinds, ats))
+    /// Every feed's image encoded on the resident encoder, its aligner rows read back as bf16
+    /// and spliced ([`ds41_media::span_rows`]), all in one pair of buffers — the rows, the
+    /// kinds, and each span's positions, rows and kinds as ranges of them
+    /// ([`vision_seat::span_rows`]). The aligner emits the plan's token grid, one row a cell.
+    fn span_rows(
+        &mut self,
+        feeds: &[MediaFeed],
+    ) -> Result<vision_seat::SpanRows<body::MediaKind>, GateError> {
+        let (n_embd, delims) = (self.n_embd, &self.delims);
+        vision_seat::span_rows(
+            &mut self.enc,
+            &self.stream,
+            feeds.iter().map(|f| vision_seat::Image {
+                at: f.at,
+                patches: &f.prepared.patches,
+                span_len: f.prepared.span_len,
+            }),
+            n_embd,
+            |p| p.plan.n_llm_h * p.plan.n_llm_w,
+            |aligner, p| {
+                ds41_media::span_rows(aligner, (p.plan.n_llm_h, p.plan.n_llm_w), n_embd, delims)
+            },
+        )
     }
 }
 
@@ -1231,16 +1195,16 @@ impl Seat for V41 {
             Served::Off => {}
         }
         // Each span borrows its own ranges of the call's one pair of buffers.
-        let (rows, kinds, ats) =
+        let vision_seat::SpanRows { rows, kinds, ats } =
             vision_seat::on_encoder_card(s.model().gpu().context(), || v.span_rows(feeds))?;
         let spans: Vec<body::Span41<'_>> = ats
             .iter()
-            .map(|(at, r, k)| body::Span41 {
+            .map(|a| body::Span41 {
                 span: body::MediaSpan {
-                    at: at.clone(),
-                    rows: &rows[r.clone()],
+                    at: a.positions.clone(),
+                    rows: &rows[a.rows.clone()],
                 },
-                kinds: &kinds[k.clone()],
+                kinds: &kinds[a.kinds.clone()],
             })
             .collect();
         let next = s.prompt_media(ids, &spans, Want::Argmax)?.argmax();
