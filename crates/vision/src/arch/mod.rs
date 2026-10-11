@@ -12,6 +12,7 @@
 
 pub mod card;
 pub mod deepseek41v;
+pub mod glm5v;
 pub(crate) mod header;
 pub(crate) mod naming;
 pub mod narrow;
