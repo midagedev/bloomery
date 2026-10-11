@@ -45,6 +45,20 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
             b[1] &= 0x7b;
         }
     }
+    // Q2_K carries two f16 fields per block (d at byte 80, dmin at byte 82) and IQ2_XS one (d at
+    // byte 0): the same mask on each field's high byte, as q2k_rate.cpp and iq2xs_rate.cpp do —
+    // raw bytes give an infinity or NaN in one Q2_K block of 16 and one IQ2_XS block of 32.
+    if ty == GgmlType::Q2_K {
+        for b in w.as_chunks_mut::<84>().0 {
+            b[81] &= 0x7b;
+            b[83] &= 0x7b;
+        }
+    }
+    if ty == GgmlType::IQ2_XS {
+        for b in w.as_chunks_mut::<74>().0 {
+            b[1] &= 0x7b;
+        }
+    }
     let col: Vec<f32> = (0..k)
         .map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0)
         .collect();
@@ -155,6 +169,10 @@ const ROWS: &[(GgmlType, usize, usize)] = &[
     // GLM-5.3-Flash UD-IQ4_XS ffn_gate/up_exps shape: k = 4096 (16 x 110 B = 1760 B/row),
     // beside the IQ3_XXS row at the same k.
     (GgmlType::IQ3_S, 4096, (4096 / 256) * 110),
+    // GLM-5.3-Flash ffn_gate/up_exps row length k = 4096 at the IQ3_S row's k, so the three compare
+    // per byte: Q2_K 16 x 84 B = 1344 B/row, IQ2_XS 16 x 74 B = 1184 B/row.
+    (GgmlType::Q2_K, 4096, (4096 / 256) * 84),
+    (GgmlType::IQ2_XS, 4096, (4096 / 256) * 74),
     // V4-Flash and MiMo-V2.6-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
     (GgmlType::MXFP4, 2048, (2048 / 32) * 17),
     // MiMo-V2.6-Flash ffn_gate/up_exps shape: k = 4096 (128 x 17 B = 2176 B/row).

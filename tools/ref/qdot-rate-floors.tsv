@@ -38,3 +38,10 @@ IQ4_XS    2560   iq4xs_rate     0.78
 # IQ3_XXS loop's IPC, not 1x), so 0.9 sits 0.06 under that sitting's lowest round and is red on the base
 # by 6.7x.
 IQ3_S     4096   iq3s_rate      0.90
+# PIN(2026-10-11): provisional 0.65. Both kernels are straight ports of ik's loops (the same decode integers, the same
+# fmadds); the lowest pair ratio any port has read is IQ4_NL's 0.753 (floor 0.65), and 0.65 still catches the 6.7x of
+# the IQ3_S extrq defect. One quiet 3-round sitting has read them (docs/cards/qdot-rate-redpairs.card, lease 13:02Z):
+# Q2_K 1.101 1.097 0.985, IQ2_XS 1.028 1.027 0.941 [measured]; `derive` on 3 rounds gives t(2) = 26.8 and a negative
+# floor, so the rule needs a 6-round sitting before either row is re-derived.
+Q2_K      4096   q2k_rate       0.65
+IQ2_XS    4096   iq2xs_rate     0.65

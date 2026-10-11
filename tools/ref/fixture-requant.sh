@@ -11,6 +11,10 @@
 #      the quantizer's --custom-q argument, which names every tensor of the fixture at the type it takes (the map's at the new type,
 #      each other at its own, which the quantizer copies) and the --override-kv that stamps the tag. A row that names no tensor, or
 #      one already at the map's type, is refused there by name.
+#      A map that retypes a tensor to a very-low-bit type (iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m) gets a flat importance
+#      matrix, written by tools/ref/flat-imatrix.py (every weight 1.0, one entry per such tensor): the quantizer bails out on
+#      those types without one, and the variant needs the type, not the quality. The matrix is part of the variant's identity: the
+#      row's why column names it (`imatrix=sha256:<16 hex>`, flat-imatrix.py --check-row), and a row of a map that needs none names none.
 #   2. llama-quantize --allow-requantize --keep-split --leave-output-tensor writes into <dir>.tmp.<pid>.
 #   3. `fixture variant-check` holds the written file to the fixture: every tensor's name, shape and shard equal, the type equal
 #      but where the map names it (and then the map's), every other tensor's bytes equal, every bloomery.fixture.* key kept and
@@ -81,12 +85,24 @@ CUSTOM_Q=$(awk -F'\t' '$1 == "custom-q" { print $2 }' <<< "$RULES")
 OVERRIDE_KV=$(awk -F'\t' '$1 == "override-kv" { print $2 }' <<< "$RULES")
 [ -n "$CUSTOM_Q" ] && [ -n "$OVERRIDE_KV" ] || die "fixture variant-rules printed no custom-q and override-kv lines" 65
 
+IMATRIX_ARGS=()
+rm -f "$LOG.imatrix"
+if python3 "$HERE/flat-imatrix.py" "$SRC" "$CUSTOM_Q" "$LOG.imatrix" 2> "$LOG.imatrix.log"; then
+  IMATRIX_ARGS=(--imatrix "$LOG.imatrix")
+  echo "fixture-requant.sh: a flat importance matrix for $(wc -l < "$LOG.imatrix.log") very-low-bit tensors ($LOG.imatrix)"
+elif [ $? != 1 ]; then
+  tail -5 "$LOG.imatrix.log" >&2
+  die "flat-imatrix.py failed (log $LOG.imatrix.log)" 65
+fi
+# The matrix is part of the variant's identity: the row names it (its id), so a changed matrix is an edited row and a new fixture.
+python3 "$HERE/flat-imatrix.py" --check-row "$LOG.imatrix" "$TABLE" "$TAG" || die "the row of $TAG does not name the importance matrix the quantizer is given" 65
+
 mkdir "$TMP"
 START=$(date +%s)
 echo "fixture-requant.sh: quantizing (log $LOG, ${REQUANT_THREADS:-24} threads, bound ${REQUANT_BOUND:-1500} s)"
 # The type argument is the quantizer's own and moves no tensor: every tensor has a rule. The output is the shards' prefix (--keep-split).
 timeout --kill-after=10 "${REQUANT_BOUND:-1500}" "$QUANT" --allow-requantize --keep-split --leave-output-tensor \
-  --custom-q "$CUSTOM_Q" --override-kv "$OVERRIDE_KV" "$SRC" "$TMP/$STEM-$TAG" Q4_K_M "${REQUANT_THREADS:-24}" > "$LOG" 2>&1 ||
+  "${IMATRIX_ARGS[@]}" --custom-q "$CUSTOM_Q" --override-kv "$OVERRIDE_KV" "$SRC" "$TMP/$STEM-$TAG" Q4_K_M "${REQUANT_THREADS:-24}" > "$LOG" 2>&1 ||
   { tail -20 "$LOG" >&2; die "llama-quantize failed (log $LOG)" 70; }
 echo "fixture-requant.sh: llama-quantize done in $(($(date +%s) - START)) s; log $LOG"
 grep -c 'converting to' "$LOG" | xargs echo "fixture-requant.sh: tensors the quantizer converted:"

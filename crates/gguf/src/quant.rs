@@ -1181,14 +1181,18 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 ///
 /// A weight type no CPU matmul here takes is refused, not given a format: BF16 activations
 /// are BF16 in ggml (`vec_dot_type`, ggml.c:1494), which this engine does not encode, and
-/// f32 would be a plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and the
-/// other i-quants take Q8_K in ggml (ggml.c:895, :1090, :1302) and have no CPU matmul here
-/// either.
+/// f32 would be a plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and
+/// IQ2_XS take Q8_K in ggml (ggml.c:895, :1105 on the IQK build; `iqk_set_kernels_kquants` and
+/// `iqk_set_kernels_iquants` accept Q8_K only for them); the other i-quants take Q8_K too and have no
+/// CPU matmul here.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
-        GgmlType::Q3_K | GgmlType::IQ3_XXS | GgmlType::IQ3_S | GgmlType::IQ4_XS => {
-            Ok(Some(ActivationFormat::Q8K))
-        }
+        GgmlType::Q2_K
+        | GgmlType::Q3_K
+        | GgmlType::IQ2_XS
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ3_S
+        | GgmlType::IQ4_XS => Ok(Some(ActivationFormat::Q8K)),
         GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -1199,9 +1203,7 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         | GgmlType::IQ4_NL => Ok(Some(ActivationFormat::Q8_2X4)),
         GgmlType::F32 | GgmlType::F16 => Ok(None),
         GgmlType::BF16
-        | GgmlType::Q2_K
         | GgmlType::IQ2_XXS
-        | GgmlType::IQ2_XS
         | GgmlType::IQ1_S
         | GgmlType::IQ2_S
         | GgmlType::I8
@@ -1370,11 +1372,15 @@ mod tests {
     /// The activation format of every type a CPU matmul takes, as ggml's `vec_dot_type` on
     /// this AVX2 IQK build names it, and BF16 refused by name.
     // PIN(2026-09-27): Q8_0 takes Q8_2_X4, no longer refused — qdot fuses it (q8qdot).
+    // PIN(2026-10-11): Q2_K and IQ2_XS take Q8_K, no longer refused — qdot fuses them (qw2h); ggml.c:895
+    // and :1105 name Q8_K as their vec_dot_type, and ik's kernel tables accept no other column.
     #[test]
     fn activation_formats_are_ggmls_vec_dot_types() {
         use super::ActivationFormat::{Q8_2X4, Q8K};
         for (ty, want) in [
+            (GgmlType::Q2_K, Some(Q8K)),
             (GgmlType::Q3_K, Some(Q8K)),
+            (GgmlType::IQ2_XS, Some(Q8K)),
             (GgmlType::IQ3_XXS, Some(Q8K)),
             (GgmlType::IQ3_S, Some(Q8K)),
             (GgmlType::Q4_K, Some(Q8_2X4)),
