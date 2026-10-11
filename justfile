@@ -1112,9 +1112,10 @@ gate-runtime:
 
 # The model description crate (crates/models, host only): the shape selector's rows — every model
 # the tree runs selects its router and flash instance, a shape between or outside the rows is
-# refused by name, no two rows overlap.
+# refused by name, no two rows overlap — and the shipped MTP head list's miss rate on each held-out
+# language set (tests/head_coverage.rs: under the break-even, held-out text no input of the build).
 gate-models:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-models --lib -- --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-models --lib --test head_coverage -- --nocapture'
 
 # The session crate's host tests (crates/app, a device-linked crate, so cargo oxide test): a fault
 # read at a step, a group end or a call end is one SessionError::Fault. They open no card (host group).

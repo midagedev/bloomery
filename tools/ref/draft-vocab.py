@@ -3,7 +3,8 @@
 target emits and what the corpora hold.
 
     tools/ref/draft-vocab.py --target <first shard> --rows N --out FILE \\
-        [--greedy TSV ...] [--corpus IDS ...] [--keep ID,...] [--fill-ids]
+        [--greedy TSV ...] [--corpus IDS ...] [--corpus-source IDS ...] [--keep-corpus IDS ...] [--keep ID,...]
+        [--fill-ids | --fill-rows M]
     tools/ref/draft-vocab.py --self-test
 
 --target is the target model's first shard. Its header gives the vocabulary (`tokenizer.ggml.tokens`),
@@ -16,15 +17,19 @@ lossily, so it cannot see such a token's bytes.
 Each --greedy file is ik's greedy continuations (`tools/ref/argmax_ref.cpp --gen`). Its rows are read
 by the names on its `#id` column line, never by position. The ids a row contributes are those under
 `gen_ids` (the target's own greedy tokens) and under `top5_ids`. Each --corpus file is one id per line
-(`corpus-prose.ids`, `corpus-code.ids`).
+(`corpus-prose.ids`, `corpus-code.ids`); all of them together are one source, so a bigger file weighs more.
+Each --corpus-source file is a source of its own, one id per line too: its share is taken within the file, so
+every such file weighs the same however many ids it holds. Every id of a --keep-corpus file is kept, as a
+--keep id is, and is not ranked.
 
-Every id gets two frequencies: its share of the greedy ids and its share of the corpus ids. A source
-with no files adds 0. An id's score is the sum of the two, and the ids are ranked by that score, ties
-to the lower id. The list is the end id, the padding id and every --keep id, then the ranked ids until
-it holds N. With --fill-ids, a list the inputs cannot fill is filled with the lowest ids not yet in it,
-until it holds N: a byte-level BPE vocabulary numbers its tokens in merge order, so a low id is a token
-its own training text joined early (a prior from no input of ours, so it cannot be in-sample). It is
-written in ascending order:
+Every id gets a frequency in each source: the greedy ids, the --corpus files together, and each
+--corpus-source file. A source with no files adds 0. An id's score is the sum of its shares, and the ids are
+ranked by that score, ties to the lower id. The list is the end id, the padding id, every --keep id and every
+--keep-corpus id, then the ranked ids until it holds N (N - M under --fill-rows M). With --fill-ids, a list
+the inputs cannot fill is filled with the lowest ids not yet in it, until it holds N. --fill-rows M asks for
+exactly M such rows: the ranked ids stop at N - M, and the inputs must name that many. A byte-level BPE
+vocabulary numbers its tokens in merge order, so a low id is a token its own training text joined early (a
+prior from no input of ours, so it cannot be in-sample). The list is written in ascending order:
 
     # bloomery mtp-head-rows 1 vocab=<n> rows=<N> vocab_sha256=<64 hex digits>
     <id>
@@ -32,13 +37,15 @@ written in ascending order:
 
 One line goes on stdout:
     rows=<N> vocab=<n> greedy_ids=<g> greedy_cover=<x> corpus_ids=<c> corpus_cover=<y> filled=<f>
-Each cover is the share of that source's ids the list holds. They are in-sample: the list was chosen from
-those same ids. `filled` is how many ids --fill-ids added (0 without it).
+Each cover is the share of that source's ids the list holds (`source_ids` and `source_cover` appear, before
+`filled`, when --corpus-source files are given). They are in-sample: the list was chosen from those same ids.
+`filled` is how many ids the fill added (0 without it).
 
 Refused, each by name: an id at or past the vocabulary in any input; a greedy file with no `#id` line,
 or one without the `gen_ids` and `top5_ids` columns, or a row of another width; a non-integer corpus
-line; N outside 1..vocab-1; without --fill-ids, fewer distinct ids in the inputs and the kept ids than N
-(a list is padded with ids no input names only when --fill-ids asks for it); a header that is not GGUF 2 or 3, or has no token array.
+line; N outside 1..vocab-1; --fill-rows M outside 0..N; kept ids past N - M; without --fill-ids or --fill-rows,
+fewer distinct ids in the inputs and the kept ids than N (a list is padded with ids no input names only when the
+fill is asked for); under --fill-rows M, fewer than N - M; a header that is not GGUF 2 or 3, or has no token array.
 
 The list moves how often the draft is accepted. The tokens the target emits are its own argmax, and the
 load's plan is the full head's, so they are the full head's unless a running residency (which counts by
@@ -207,25 +214,33 @@ def read_corpus(path, vocab):
     return out
 
 
-def choose(vocab, rows, greedy, corpus, keep, fill=False):
-    """The list: the kept ids, then the ranked ones until `rows`, then under `fill` the lowest ids not
-    yet chosen until `rows`, ascending; and how many ids the fill added."""
+def choose(vocab, rows, sources, keep, fill=False, fill_rows=None):
+    """The list: the kept ids, then the ranked ones until `rows` (until `rows - fill_rows` under `fill_rows`),
+    then under `fill` or `fill_rows` the lowest ids not yet chosen until `rows`, ascending; and how many ids
+    the fill added. `sources` are lists of ids, each normalised on its own."""
     if not 0 < rows < vocab:
         raise Refusal(64, f"--rows {rows}: a list holds 1 to {vocab - 1} rows (the whole vocabulary is the full head)")
+    if fill_rows is not None and not 0 <= fill_rows <= rows:
+        raise Refusal(64, f"--fill-rows {fill_rows}: a list of {rows} rows holds 0 to {rows} fill rows")
+    ranked_rows = rows if fill_rows is None else rows - fill_rows
     score = Counter()
-    for src in (greedy, corpus):
+    for src in sources:
         if src:
             for v, c in Counter(src).items():
                 score[v] += c / len(src)
     chosen = set(keep)
-    if len(chosen) > rows:
-        raise Refusal(64, f"--rows {rows} is fewer than the {len(chosen)} ids the list always holds")
+    if len(chosen) > ranked_rows:
+        raise Refusal(64, f"{len(chosen)} ids are always held, more than the {ranked_rows} rows left for them and the ranked ids"
+                          f" ({rows} rows, {rows - ranked_rows} of them fill)")
     for v, _ in sorted(score.items(), key=lambda kv: (-kv[1], kv[0])):
-        if len(chosen) == rows:
+        if len(chosen) == ranked_rows:
             break
         chosen.add(v)
+    if fill_rows is not None and len(chosen) < ranked_rows:
+        raise Refusal(65, f"the inputs and the kept ids name {len(chosen)} distinct ids, fewer than the {ranked_rows} rows"
+                          f" that are not the {fill_rows} fill rows (--fill-rows fills those last rows only)")
     filled = 0
-    if fill:
+    if fill or fill_rows is not None:
         for v in range(vocab):
             if len(chosen) == rows:
                 break
@@ -250,23 +265,31 @@ def write(path, vocab, digest, ids):
             f.write(f"{v}\n")
 
 
-def run(target, rows, out, greedy_paths, corpus_paths, keep, fill=False):
+def run(target, rows, out, greedy_paths, corpus_paths, keep, fill=False, source_paths=(), keep_corpus_paths=(),
+        fill_rows=None):
     tokens, eos, pad = header_tokens(target)
     vocab = len(tokens)
     for v in keep:
         check_id("--keep", 1, v, vocab)
     greedy = [v for p in greedy_paths for v in read_greedy(p, vocab)]
     corpus = [v for p in corpus_paths for v in read_corpus(p, vocab)]
-    ids, filled = choose(vocab, rows, greedy, corpus, [eos, pad] + keep, fill)
+    sources = [read_corpus(p, vocab) for p in source_paths]
+    kept_by_corpus = [v for p in keep_corpus_paths for v in read_corpus(p, vocab)]
+    ids, filled = choose(vocab, rows, [greedy, corpus] + sources, [eos, pad] + keep + kept_by_corpus, fill, fill_rows)
     write(out, vocab, vocab_sha256(tokens), ids)
+    extra = ""
+    if sources:
+        flat = [v for src in sources for v in src]
+        extra = f"source_ids={len(flat)} source_cover={cover(flat, ids):.4f} "
     return (f"rows={len(ids)} vocab={vocab} greedy_ids={len(greedy)} greedy_cover={cover(greedy, ids):.4f} "
-            f"corpus_ids={len(corpus)} corpus_cover={cover(corpus, ids):.4f} filled={filled}")
+            f"corpus_ids={len(corpus)} corpus_cover={cover(corpus, ids):.4f} {extra}filled={filled}")
 
 
 def main(argv):
     if argv == ["--self-test"]:
         return self_test()
     target, rows, out, greedy, corpus, keep, fill = None, None, None, [], [], [], False
+    sources, keep_corpus, fill_rows = [], [], None
     i = 0
     try:
         while i < len(argv):
@@ -288,6 +311,12 @@ def main(argv):
                 greedy.append(v)
             elif a == "--corpus":
                 corpus.append(v)
+            elif a == "--corpus-source":
+                sources.append(v)
+            elif a == "--keep-corpus":
+                keep_corpus.append(v)
+            elif a == "--fill-rows":
+                fill_rows = int(v)
             elif a == "--keep":
                 keep.extend(int(x) for x in v.split(","))
             else:
@@ -295,7 +324,7 @@ def main(argv):
             i += 2
         if target is None or rows is None or out is None:
             raise Refusal(64, "--target, --rows and --out are required")
-        print(run(target, rows, out, greedy, corpus, keep, fill))
+        print(run(target, rows, out, greedy, corpus, keep, fill, sources, keep_corpus, fill_rows))
     except ValueError as e:
         print(f"draft-vocab: {e}\n{__doc__}", file=sys.stderr)
         return 64
@@ -414,6 +443,44 @@ def self_test():
         refused("a token holding U+FFFD", 65, lambda: header_tokens(bt))
         _gguf(bt, [b"a", b"b"], eos=5, pad=0)
         refused("an end id past the vocabulary", 65, lambda: header_tokens(bt))
+        # Sources on their own: A (4 ids) and B (100 ids). Pooled as --corpus, B's 3 and 4 outweigh A's 1 and 2; as
+        # --corpus-source each file's shares are its own (1: .5, 2: .5, 3: .6, 4: .4), so A's ids rank above 4.
+        src_a, src_b = os.path.join(d, "a.ids"), os.path.join(d, "b.ids")
+        with open(src_a, "w") as f:
+            f.write("1\n1\n2\n2\n")
+        with open(src_b, "w") as f:
+            f.write("3\n" * 60 + "4\n" * 40)
+        run(target, 5, out, [], [src_a, src_b], [])
+        expect("--corpus pools its files (bigger weighs more)", open(out).read().splitlines()[1:] == ["1", "3", "4", "10", "11"])
+        line = run(target, 5, out, [], [], [], source_paths=[src_a, src_b])
+        expect("--corpus-source weighs each file the same",
+               open(out).read().splitlines()[1:] == ["1", "2", "3", "10", "11"])
+        expect(f"--corpus-source: the summary names the sources' ids: {line}",
+               "source_ids=104 source_cover=0.6154 " in line and line.endswith(" filled=0"))
+        # Kept by corpus: 5 and 6 are held and not ranked, the one ranked row is the corpus's best id.
+        kept = os.path.join(d, "k.ids")
+        with open(kept, "w") as f:
+            f.write("5\n6\n5\n")
+        run(target, 5, out, [], [corpus], [], keep_corpus_paths=[kept])
+        expect("--keep-corpus holds every id of the file", open(out).read().splitlines()[1:] == ["1", "5", "6", "10", "11"])
+        # Fill rows: three of the eight rows are the lowest unchosen ids; the five before them are the kept ids and
+        # the ranked ones (corpus ids 1, 9, 2 of a file naming only those).
+        few = os.path.join(d, "few.ids")
+        with open(few, "w") as f:
+            f.write("1\n1\n1\n2\n9\n")
+        line = run(target, 8, out, [], [few], [], fill_rows=3)
+        expect("--fill-rows: the ranked rows, then exactly the asked fill",
+               open(out).read().splitlines()[1:] == ["0", "1", "2", "3", "4", "9", "10", "11"] and line.endswith(" filled=3"))
+        refused("--fill-rows more than the rows", 64, lambda: run(target, 8, out, [], [few], [], fill_rows=9))
+        refused("kept ids past the rows left by --fill-rows", 64, lambda: run(target, 8, out, [], [few], [], fill_rows=7))
+        one = os.path.join(d, "one.ids")
+        with open(one, "w") as f:
+            f.write("1\n")
+        refused("--fill-rows with too few named ids", 65, lambda: run(target, 8, out, [], [one], [], fill_rows=3))
+        expect("main: --corpus-source, --keep-corpus and --fill-rows",
+               main(["--target", target, "--rows", "8", "--out", out, "--corpus-source", few, "--keep-corpus", kept,
+                     "--fill-rows", "3"]) == 0
+               and open(out).read().splitlines()[1:] == ["0", "1", "2", "3", "5", "6", "10", "11"])
     print("draft-vocab self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 1
 

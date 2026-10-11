@@ -15,7 +15,7 @@
 //!   the list's ids and the rest 0.
 //! - (u) before the load: the head `BLOOMERY_MTP_HEAD_ROWS` unset picks on
 //!   this target (`head_list::head_rows_of`) is the shipped list — its
-//!   65,536 rows, its first line naming the target tokenizer's digest, the
+//!   76,000 rows, its first line naming the target tokenizer's digest, the
 //!   pick `shipped` — and `full` is the full head.
 //! - (q) `Mtp38::open` refuses by name, beside the loaded model: a draft
 //!   read as carrying its own matrices, and a plan whose row map is not the
@@ -419,7 +419,7 @@ mod gate {
     /// The head's rows: every sixth id, 0 to 245,754.
     const LIST_ROWS: u32 = 40_960;
     /// The shipped list's rows ([`SHIPPED`]'s first line).
-    const SHIPPED_ROWS: usize = 65_536;
+    const SHIPPED_ROWS: usize = 76_000;
     /// The draft layer's index in ik's node names: the real file's 48 target
     /// layers. ik's sets are the real tier's, so the names stay.
     const IK_LAYER: usize = 48;

@@ -390,9 +390,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::C,
         kind: Kind::PathOr(&["full"]),
         default: Unset::Means(
-            "the list the model crate ships (Qwen3.8's hangul family, 65,536 rows) when the \
-             target's tokenizer is the one its first line names; the full head on any other \
-             target, the load's `mtp head` record saying why",
+            "the list the model crate ships (Qwen3.8's Korean, Chinese and Japanese list, 76,000 \
+             rows) when the target's tokenizer is the one its first line names; the full head on \
+             any other target, the load's `mtp head` record saying why",
         ),
         doc: "Qwen3.8's MTP draft: the head its walks score with. Unset is the shipped row list \
               (`crates/model/data/`, built in, its bytes pinned beside it: a list whose bytes \

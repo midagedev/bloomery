@@ -164,7 +164,7 @@ TERMS = {
     "tier_experts": (0.0, "experts on an expert-tier card (place bp: the 3090)"),
     "tier_hit": (-1.0, "the tier's share of a row's slots; -1 from tier_experts over the routed set"),
     "host_only_layers": (0.0, "layers whose routed experts all stay on the host (5 before 2026-10-01's q38hol)"),
-    "head_rows": (65536.0, "the draft head's rows (the shipped list); 248320 the full head"),
+    "head_rows": (76000.0, "the draft head's rows (the shipped list); 248320 the full head"),
     "pick": (2.0, "prompt pick: 0 none (0.2.5), 1 v0.2.6/0.2.7's floor rule, 2 the walk (0.2.8), 3 admit mode's floor 32 (place bp)"),
     "copier_threads": (4.0, "the pick's staging threads (1 before 0.2.8's pickrate)"),
     "pool_pinned": (0.0, "card experts a layer the residency pins (no admit replaces them): mid-p0-s1 today"),

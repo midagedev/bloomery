@@ -2,10 +2,10 @@
 //! scores with from `BLOOMERY_MTP_HEAD_ROWS`, and the row list the crate
 //! ships for it unset.
 //!
-//! Unset, the head is [`SHIPPED`] — the hangul family at 65,536 rows,
-//! `crates/model/data/` built in, so a load finds it with no working
-//! directory and no data directory — read through the same reader and the
-//! same refusals as a list given by path ([`parse_head_rows`]). Its bytes
+//! Unset, the head is [`SHIPPED`] — the Korean, Chinese and Japanese list
+//! at 76,000 rows, `crates/model/data/` built in, so a load finds it with no
+//! working directory and no data directory — read through the same reader
+//! and the same refusals as a list given by path ([`parse_head_rows`]). Its bytes
 //! are pinned ([`SHIPPED_SHA256`]): a list whose bytes are not the pinned
 //! ones is refused by name before it is read. On a target whose tokenizer is
 //! not the one the list's first line names (another vocabulary size or
@@ -22,16 +22,16 @@ use super::place::{HeadRowsError, PlaceError, parse_head_rows, read_head_rows, v
 use crate::fileio::sha256_hex;
 
 /// The shipped list's name, as a pick prints it.
-pub const SHIPPED_NAME: &str = "kohangul-65536";
+pub const SHIPPED_NAME: &str = "cjk-76000";
 
 /// Where the shipped list lives in the repository.
-pub const SHIPPED_PATH: &str = "crates/model/data/mtp-head-rows-qwen38-kohangul-65536.txt";
+pub const SHIPPED_PATH: &str = "crates/model/data/mtp-head-rows-qwen38-cjk-76000.txt";
 
-/// The shipped list: Qwen3.8's hangul family at 65,536 rows.
-pub const SHIPPED: &str = include_str!("../../../data/mtp-head-rows-qwen38-kohangul-65536.txt");
+/// The shipped list: Qwen3.8's Korean, Chinese and Japanese list at 76,000 rows.
+pub const SHIPPED: &str = include_str!("../../../data/mtp-head-rows-qwen38-cjk-76000.txt");
 
 /// The SHA-256 of [`SHIPPED`]'s bytes, as the list was built.
-pub const SHIPPED_SHA256: &str = "b9deced66fc00185620bb0a8cdc591240e6801e298bdc76438490eed3e426bdc";
+pub const SHIPPED_SHA256: &str = "e20c786dd2c1471343273c74794d93ae000f74efb844626d9fd9dc5a566a2cea";
 
 /// Why the shipped list is not read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -195,17 +195,17 @@ mod tests {
     }
 
     /// The shipped list reads as its first line says: Qwen3.8's vocabulary,
-    /// 65,536 ascending ids, on a target of the digest it names.
+    /// 76,000 ascending ids, on a target of the digest it names.
     #[test]
     fn shipped_list_reads_on_its_own_tokenizer() {
         let first = SHIPPED.lines().next().expect("a first line");
         assert!(first.starts_with(HEAD_ROWS_FORMAT), "{first}");
-        assert!(first.contains(" vocab=248320 rows=65536 "), "{first}");
+        assert!(first.contains(" vocab=248320 rows=76000 "), "{first}");
         let pick = shipped_rows(SHIPPED, 248_320, &named_digest()).expect("the shipped list");
         assert_eq!(pick.why, HeadWhy::Shipped);
         match pick.rows {
             HeadRows::List { ids, digest } => {
-                assert_eq!(ids.len(), 65_536);
+                assert_eq!(ids.len(), 76_000);
                 assert_eq!(digest, named_digest());
             }
             HeadRows::Full => panic!("the full head"),
