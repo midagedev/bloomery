@@ -26,7 +26,7 @@
 //! layout of every consumer.
 
 use crate::GpuError;
-use crate::cores::{q4k_row_dot, q4k_row_dot_1col};
+use crate::cores::{l2_prefetch, q4k_row_dot, q4k_row_dot_1col};
 use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -100,6 +100,7 @@ mod qwen3moe_proj_kernels {
         } else {
             (wv, off_v as usize, row - rq - rk, rv)
         };
+        l2_prefetch(w, r * 144 * n_sb, 144 * n_sb, lane);
         // The core's caller contract, from the launch contract: r < rows
         // rows of `w`, m_cols columns of q/s8/d8, iters = ceil(n_sb/4) from
         // the host, and all 32 lanes of the warp are here (the return above
@@ -302,6 +303,7 @@ mod qwen3moe_proj_kernels {
         let lane = warp::lane_id() as usize;
         let m = m_cols as usize;
         let n_sb = n_sb as usize;
+        l2_prefetch(w, row * 144 * n_sb, 144 * n_sb, lane);
         // The core's caller contract as in `qwen3moe_qkv_q4k`.
         let mut c = 0;
         while c < m {
