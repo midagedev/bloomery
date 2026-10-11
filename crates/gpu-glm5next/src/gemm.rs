@@ -3,7 +3,8 @@
 //! up to [`FrontShape::cols`] token columns at once: each input quantized
 //! once to the GEMM's 32-value activations (`quantize_gemm32`), then every
 //! projection that reads it, each output token-major as `q8_0_gemv_mcol`
-//! writes it (`y[t · rows + r]`).
+//! writes it (`y[t · rows + r]`). A dense block's three projections go
+//! through the GEMM their file types pick instead ([`GemmFront::dense_ffn`]).
 //!
 //! The entries are the sites whose inputs and outputs a batch holds whole:
 //! - [`GemmFront::kda_in`]: a KDA mixer's projections of its normed input —
@@ -21,34 +22,45 @@
 //!   which the caller writes into the front's own rows between the two. The
 //!   absorbed pair between them (`k_b`, `v_b`) is not the front's: each is a
 //!   per-head product around the attention, which runs by chunk;
-//! - [`GemmFront::dense_ffn`]: a dense block's gate and up from its normed
-//!   input, the clamped SwiGLU quantized in one launch
-//!   (`swiglu_act_quant32`, the gemv's `swiglu_clamp` rule), then the down.
-//!   A routed layer's shared expert is not the front's: it runs under the
-//!   host's serve.
+//! - [`GemmFront::dense_ffn`]: a dense block on `site::gated`, whatever the
+//!   types of its three matrices: its normed input quantized once into the
+//!   form its gate and up read, their rows through the clamped SwiGLU
+//!   (`swiglu_clamp` at the layer's limit) quantized in one launch into the
+//!   form its down reads, then the down. A routed layer's shared expert is
+//!   not the front's: it runs under the host's serve.
 //!
-//! Numerics are the GEMM's (`gemm32.rs`'s contract): an output's bits are a
-//! function of its weight row and its column's quantized codes alone, so a
-//! batch's rows are those of any other column count over the same inputs —
-//! but not the one-column gemv's, whose activations stay f32.
+//! Numerics are the GEMM's (`gemm32.rs`'s and `grouped.rs`'s contracts): an
+//! output's bits are a function of its weight row and its column's quantized
+//! codes alone, so a batch's rows are those of any other column count over
+//! the same inputs — but not the one-column gemv's, whose activations stay
+//! f32 where the Q8_0 GEMM's are 32-value int8 blocks.
 //!
-//! Refused by name, before any launch: a weight that is not a resident
-//! Q8_0 plane, a weight whose K is not the width its input's activations
-//! were sized for, a weight whose rows are not the width the front's own
-//! rows were sized for, no columns or more than the scratch holds, a row
-//! range outside its stack, a dense block on a front sized for none. A
-//! front whose made bytes are not [`front_bytes`]' is refused at open.
+//! The forms the dense block's sites read ([`DenseForms`]) are held only
+//! when a dense layer's types need them: the normed input's q8 blocks of 32
+//! values beside the mixers' own, q8_1 blocks of 128 for a K-quant gate and
+//! up, and the SwiGLU rows in q8 blocks of 32 for a Q8_0 down or q8_1
+//! blocks of 128 for a K-quant one.
+//!
+//! Refused by name, before any launch: a Q8_0 plane that is not the one a
+//! projection reads, a weight whose K is not the width its input's
+//! activations were sized for, a weight whose rows are not the width the
+//! front's own rows were sized for, no columns or more than the scratch
+//! holds, a row range outside its stack, a dense block on a front sized for
+//! none or without a form its types read. A front whose made bytes are not
+//! [`front_bytes`]' is refused at open.
 
 use std::ops::Range;
 
 use bloomery_gpu::fault::FaultSink;
 use bloomery_gpu::gemm::{
-    GEMM_BN, GEMM32_STEP, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
+    GEMM_BN, GEMM32_STEP, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmInput,
     GemmKernels, GemmRoute,
 };
 use bloomery_gpu::kquant::Act;
+use bloomery_gpu::site::{self, Form, Gated, GatedIo, SwigluRows, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
+use bloomery_gpu_deepseek41::block::Block;
 use cuda_core::DeviceBuffer;
 use model::arch::glm5next::place::{self, FrontWidths};
 
@@ -100,14 +112,6 @@ pub struct LatentInRows<'a> {
     pub kv: &'a mut DeviceBuffer<f32>,
 }
 
-/// A dense block's three projections by name ([`GemmFront::dense_ffn`]).
-#[derive(Clone, Copy, Debug)]
-pub struct DenseNames<'a> {
-    pub gate: &'a str,
-    pub up: &'a str,
-    pub down: &'a str,
-}
-
 /// Which activation scratch an input quantizes into.
 #[derive(Clone, Copy, Debug)]
 enum Input {
@@ -116,7 +120,6 @@ enum Input {
     Gated,
     QLow,
     Heads,
-    Ff,
 }
 
 impl Input {
@@ -127,7 +130,6 @@ impl Input {
             Input::Gated => "gated rows",
             Input::QLow => "query low rank",
             Input::Heads => "heads' outputs",
-            Input::Ff => "SwiGLU rows",
         }
     }
 }
@@ -140,10 +142,12 @@ struct Proj<'a, 'y> {
     y: &'y mut DeviceBuffer<f32>,
 }
 
-/// A dense block's scratch: the SwiGLU rows' activations and the gate's and
-/// up's f32 rows.
+/// A dense block's scratch: the SwiGLU rows in the form each down type reads, and the gate's and up's f32 rows.
 struct FfScratch {
-    act: GemmAct32,
+    /// q8 blocks of 32 values, for a Q8_0 down.
+    rows32: Option<GemmAct32>,
+    /// q8_1 blocks of 128 values, for a K-quant down.
+    rows128: Option<GemmAct>,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
 }
@@ -161,6 +165,9 @@ pub struct GemmFront {
     gated: GemmAct32,
     q_low: GemmAct32,
     heads: GemmAct32,
+    /// The normed input as q8_1 blocks of 128 values, for a K-quant gate and up; `None` when no dense layer
+    /// has one.
+    in128: Option<GemmAct>,
     /// `None` on a front sized for no dense block.
     ff: Option<FfScratch>,
     /// The latent query heads, token-major.
@@ -182,11 +189,23 @@ impl GemmFront {
         let ff = match w.ff {
             0 => None,
             ff => Some(FfScratch {
-                act: GemmAct32::new(stream, cols, ff)?,
+                rows32: w
+                    .forms
+                    .rows32
+                    .then(|| GemmAct32::new(stream, cols, ff))
+                    .transpose()?,
+                rows128: w
+                    .forms
+                    .rows128
+                    .then(|| GemmAct::new(stream, cols, ff))
+                    .transpose()?,
                 g: rows(ff)?,
                 u: rows(ff)?,
             }),
         };
+        let in128 = (w.ff > 0 && w.forms.in128)
+            .then(|| GemmAct::new(stream, cols, w.embd))
+            .transpose()?;
         let front = GemmFront {
             route_k: GemmKernels::load(ctx)?,
             k32: Gemm32Kernels::load(ctx)?,
@@ -196,6 +215,7 @@ impl GemmFront {
             gated: GemmAct32::new(stream, cols, w.gated)?,
             q_low: GemmAct32::new(stream, cols, w.q_low)?,
             heads: GemmAct32::new(stream, cols, w.heads_v)?,
+            in128,
             ff,
             q: rows(w.q)?,
             av: rows(w.heads_v)?,
@@ -234,11 +254,14 @@ impl GemmFront {
             .iter()
             .map(|a| a.bytes())
             .sum::<usize>();
-        let ff = self
-            .ff
-            .as_ref()
-            .map_or(0, |s| s.act.bytes() + s.g.num_bytes() + s.u.num_bytes());
-        self.dense.bytes() + acts + ff + self.q.num_bytes() + self.av.num_bytes()
+        let ff = self.ff.as_ref().map_or(0, |s| {
+            s.rows32.as_ref().map_or(0, GemmAct32::bytes)
+                + s.rows128.as_ref().map_or(0, GemmAct::bytes)
+                + s.g.num_bytes()
+                + s.u.num_bytes()
+        });
+        let in128 = self.in128.as_ref().map_or(0, GemmAct::bytes);
+        self.dense.bytes() + acts + in128 + ff + self.q.num_bytes() + self.av.num_bytes()
     }
 
     /// The latent query heads and the heads' outputs, token-major, each a
@@ -396,94 +419,174 @@ impl GemmFront {
         Ok(())
     }
 
-    /// Layer `l`'s dense block over the first `m` columns of its normed input
-    /// `xn`, into `y`: `xn` quantized once for the gate and the up, their
-    /// rows through the clamped SwiGLU at `limit` (`swiglu_clamp`: none at
-    /// or under 1e-6) quantized in the same launch, then the down. The gate's
-    /// and the up's rows must be the front's SwiGLU width.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the step's context, the layer, the width, the input, the names, the limit and the output"
-    )]
+    /// The dense block `blk` over the first `m` columns of its normed input `xn`, into `y`, on
+    /// [`site::gated`]: `xn` quantized once into the form its gate and up read, their rows through the clamped
+    /// SwiGLU at `blk.limit` (`swiglu_clamp`: none at or under 1e-6) quantized in the same launch into the form
+    /// its down reads, then the down. The launches are those of the three types ([`site::gemm`]); `blk.ff`
+    /// must be the front's SwiGLU width.
     pub fn dense_ffn(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        l: usize,
         m: usize,
         xn: &DeviceBuffer<f32>,
-        nm: DenseNames<'_>,
-        limit: f32,
+        blk: &Block<'_>,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let (g_len, u_len) = match self.ff.as_ref() {
-            Some(s) => (s.g.len(), s.u.len()),
-            None => {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "layer {l}'s dense block on a front sized for none (a SwiGLU width of 0)"
-                    ),
-                });
-            }
-        };
-        let ff = self.shape.widths.ff;
-        self.check(
-            w,
-            m,
-            (Input::Embd, xn.len()),
-            &[(nm.gate, None, g_len), (nm.up, None, u_len)],
-        )?;
-        check_rows(w, nm.gate, ff, "SwiGLU rows")?;
-        check_rows(w, nm.up, ff, "SwiGLU rows")?;
-        self.check(w, m, (Input::Ff, g_len), &[(nm.down, None, y.len())])?;
-        let fault = self.fill(gpu, l, m)?;
+        self.check_dense(w, m, (xn.len(), y.len()), blk)?;
+        let fault = self.fill(gpu, blk.layer, m)?;
+        let [gate, up, down] = blk.plan.types();
+        let [gate_n, up_n, down_n] = blk.names;
+        let hidden = self.shape.widths.embd;
         let stream = gpu.stream();
-        self.k32
-            .enqueue_quantize_gemm32(stream, xn, m, &mut self.embd, fault)?;
-        let Some(FfScratch { act, g, u }) = self.ff.as_mut() else {
-            return Err(GpuError::State {
-                what: WHAT,
-                missing: "the dense block's scratch",
-            });
+        let GemmFront {
+            route_k,
+            k32,
+            dense,
+            embd,
+            in128,
+            ff,
+            stats,
+            ..
+        } = self;
+        let missing = |missing| GpuError::State {
+            what: WHAT,
+            missing,
         };
-        let k = (&self.k32, &self.dense);
-        gemm(k, gpu, q8(w, nm.gate)?, &self.embd, g)?;
-        gemm(k, gpu, q8(w, nm.up)?, &self.embd, u)?;
-        self.k32.enqueue_swiglu_act_quant32(
-            stream,
+        let FfScratch {
+            rows32,
+            rows128,
             g,
             u,
-            Act::SwigluClamp { limit },
-            m,
-            act,
-            fault,
-        )?;
-        gemm(k, gpu, q8(w, nm.down)?, act, y)?;
-        self.stats.quantize += 2;
-        self.stats.gemm += 3;
+        } = ff.as_mut().ok_or(missing("the dense block's scratch"))?;
+        let x = if gate.reads() == Form::Q8x128 {
+            let act = in128
+                .as_mut()
+                .ok_or(missing("the normed input's q8_1 blocks of 128"))?;
+            gpu.enqueue_quantize_gemm(xn, m, act, fault)?;
+            WideIn {
+                q128: Some(&*act),
+                q32: None,
+                f32: None,
+            }
+        } else {
+            k32.enqueue_quantize_gemm32(stream, xn, m, embd, fault)?;
+            WideIn {
+                q128: None,
+                q32: Some(&*embd),
+                f32: None,
+            }
+        };
+        let rows = if down.reads() == Form::Q8x128 {
+            SwigluRows {
+                q128: rows128.as_mut(),
+                q32: None,
+                f32: None,
+            }
+        } else {
+            SwigluRows {
+                q128: None,
+                q32: rows32.as_mut(),
+                f32: None,
+            }
+        };
+        let block = Gated {
+            w,
+            route: &*dense,
+            gate: (gate, gate_n),
+            up: (up, up_n),
+            down: (down, down_n),
+            ff: blk.ff,
+            hidden,
+            rule: Act::SwigluClamp { limit: blk.limit },
+            input: GemmInput::PerSlot,
+        };
+        let io = GatedIo {
+            x: &x,
+            gate: g,
+            up: u,
+            rows,
+            y,
+        };
+        let k = WideKernels {
+            gemm: &*route_k,
+            g32: &*k32,
+        };
+        site::gated(gpu, &k, &block, (m, m), io, fault)?;
+        stats.quantize += 2;
+        stats.gemm += 3;
         Ok(())
     }
 
-    /// The scratch input `which` quantizes into; refused by name for the
-    /// SwiGLU rows of a front sized for no dense block.
-    fn act(&self, which: Input) -> Result<&GemmAct32, GpuError> {
-        Ok(match which {
+    /// The dense block `blk` over `m` columns launchable: the front sized for a dense block of `blk.ff` rows
+    /// and holding the forms its types read, `m` inside the scratch, the three weights resident as the plan's
+    /// types at the block's shape, and the input and output long enough; refused by name otherwise.
+    fn check_dense(
+        &self,
+        w: &Weights,
+        m: usize,
+        (xn_len, y_len): (usize, usize),
+        blk: &Block<'_>,
+    ) -> Result<(), GpuError> {
+        let refuse = |detail: String| Err(GpuError::Shape { what: WHAT, detail });
+        let l = blk.layer;
+        let Some(ff) = self.ff.as_ref() else {
+            return refuse(format!(
+                "layer {l}'s dense block on a front sized for none (a SwiGLU width of 0)"
+            ));
+        };
+        let widths = self.shape.widths;
+        if blk.ff != widths.ff {
+            return refuse(format!(
+                "layer {l}'s dense block has {} rows; the front's SwiGLU rows were sized for {}",
+                blk.ff, widths.ff
+            ));
+        }
+        if !(1..=self.shape.cols).contains(&m) {
+            return refuse(format!(
+                "{m} columns: the scratch holds 1 ..= {} columns",
+                self.shape.cols
+            ));
+        }
+        let need = m * widths.embd;
+        if xn_len < need || y_len < need {
+            return refuse(format!(
+                "layer {l}'s dense block over {m} columns of {} values needs {need} in and out; the \
+                 normed input holds {xn_len} and the output {y_len}",
+                widths.embd
+            ));
+        }
+        blk.plan
+            .check_resident(w, WHAT, blk.names, (blk.ff, widths.embd))?;
+        let [gate, _, down] = blk.plan.types();
+        let has = |held: bool, ty: site::SiteTy, what: &str| {
+            if held {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "layer {l}'s dense block has a {ty} {what}, whose form the front was sized without"
+                ))
+            }
+        };
+        if gate.reads() == Form::Q8x128 {
+            has(self.in128.is_some(), gate, "gate and up")?;
+        }
+        if down.reads() == Form::Q8x128 {
+            has(ff.rows128.is_some(), down, "down")
+        } else {
+            has(ff.rows32.is_some(), down, "down")
+        }
+    }
+
+    /// The scratch input `which` quantizes into.
+    fn act(&self, which: Input) -> &GemmAct32 {
+        match which {
             Input::Embd => &self.embd,
             Input::Low => &self.low,
             Input::Gated => &self.gated,
             Input::QLow => &self.q_low,
             Input::Heads => &self.heads,
-            Input::Ff => match self.ff.as_ref() {
-                Some(s) => &s.act,
-                None => {
-                    return Err(GpuError::Shape {
-                        what: WHAT,
-                        detail: "SwiGLU rows on a front sized for no dense block".into(),
-                    });
-                }
-            },
-        })
+        }
     }
 
     /// The projections `outs` (a weight's name, its row range or every row,
@@ -506,7 +609,7 @@ impl GemmFront {
                 self.shape.cols
             ));
         }
-        let k = self.act(which)?.k();
+        let k = self.act(which).k();
         if x_len < m * k {
             return refuse(format!(
                 "the {} hold {x_len} values, {m} columns of K = {k} need {}",
@@ -575,19 +678,13 @@ impl GemmFront {
             Input::Gated => &mut self.gated,
             Input::QLow => &mut self.q_low,
             Input::Heads => &mut self.heads,
-            Input::Ff => {
-                return Err(GpuError::State {
-                    what: WHAT,
-                    missing: "a projection of the SwiGLU rows outside the dense block",
-                });
-            }
         };
         self.k32
             .enqueue_quantize_gemm32(gpu.stream(), x, m, act, fault)?;
         self.stats.quantize += 1;
         for p in projs {
             let (qs, d) = q8(w, p.name)?;
-            let act = self.act(which)?;
+            let act = self.act(which);
             let k = (&self.k32, &self.dense);
             match p.rows {
                 None => gemm(k, gpu, (qs, d), act, p.y)?,

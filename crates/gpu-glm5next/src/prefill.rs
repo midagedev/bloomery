@@ -4,11 +4,13 @@
 //! reads: every KDA layer's state and conv ring, every latent layer's latent
 //! and index rows and pool plane, the checkpoints, and the last position's
 //! logits. A batch of at most [`CHUNK`] positions writes the steps' bits; one
-//! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections on the GEMM
-//! ([`GemmFront`]: a KDA mixer's input projections but the decay's pair and
-//! its output projection, a latent mixer's joined projection, query heads
-//! and output projection, a dense block), whose activations are quantized to 32-value int8 blocks, so it writes the
-//! GEMM's bits there. Either way a token's bits are a function of the ids
+//! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections and its dense
+//! blocks on the GEMM ([`GemmFront`]: a KDA mixer's input projections but the
+//! decay's pair and its output projection, a latent mixer's joined
+//! projection, query heads and output projection, a dense block of any
+//! types), whose activations are quantized to int8 blocks (of 32 values for a
+//! Q8_0 projection, q8_1 blocks of 128 for a K-quant dense block), so it
+//! writes the GEMM's bits there. Either way a token's bits are a function of the ids
 //! before it and of which side of [`GEMM_FROM`] each batch they ran in fell,
 //! not of the batches' cut otherwise: the GEMM's output for a column is that
 //! of any other column count, and every other launch writes a column what
@@ -68,8 +70,10 @@
 //! - the GEMM's projections over the batch's `T` rows from [`GEMM_FROM`];
 //! - chunks of up to [`CHUNK`] tokens where it takes at most that many: the
 //!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`) the GEMM does
-//!   not take, the shared expert's
-//!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the k-pool selector,
+//!   not take, the shared expert's and, below [`GEMM_FROM`], the dense
+//!   block's gate·up·SwiGLU and down (a q8_0 block's multi-column launches,
+//!   `ds41_shexp_gate_up_q8_0_mcol` among them; a K-quant block's one-row
+//!   run on each column, [`enqueue_block_cols`]), the k-pool selector,
 //!   and the attention, each token over the
 //!   positions at and before its own — the batch's own rows and pools
 //!   written before the first chunk attends.
@@ -120,7 +124,7 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use model::arch::glm5next::names::Sub;
-use model::arch::glm5next::place::{self, FrontWidths};
+use model::arch::glm5next::place::{self, DenseForms, FrontWidths};
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
 pub use runtime::prompt::PrefillMode;
@@ -136,7 +140,7 @@ use super::media::{CallRows, check_image_ids, stage_row};
 use super::nextn::GlmArena;
 use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
 use crate::ffn::{self, CardRows, CardTiles};
-use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
+use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAccTier, Places};
@@ -593,8 +597,8 @@ struct Bufs {
 impl Bufs {
     /// The shared buffers for batches of up to `cap` tokens of `d`'s widths,
     /// `ff` the widest dense or shared-expert width, `dense_ff` the widest
-    /// dense block's (0 for none), `expert_ff` a routed expert's, over stores
-    /// of `ctx` positions. The attention's partials
+    /// dense block's (0 for none) with the `forms` its sites read,
+    /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
     /// positions, which are a list's width, so they cover a list too.
     /// Load-time or first-prompt only.
@@ -602,6 +606,7 @@ impl Bufs {
         gpu: &Gpu,
         d: &Dims,
         [ff, dense_ff, expert_ff]: [usize; 3],
+        forms: DenseForms,
         ctx: usize,
         cap: usize,
     ) -> Result<Bufs, GpuError> {
@@ -669,6 +674,7 @@ impl Bufs {
                         q: d.heads * d.head_k,
                         heads_v: d.heads * d.head_v,
                         ff: dense_ff,
+                        forms,
                     },
                 },
             )?,
@@ -976,22 +982,16 @@ fn refuse_late_dense(cfg: &[super::LayerCfg], g: usize) -> Result<(), GpuError> 
         .map_err(|r| shape(r.to_string()))
 }
 
-/// Refused by name for a load with a K-quant dense block or shared expert: the batch feed's blocks run over columns (the
-/// multi-column launches below [`GEMM_FROM`] tokens, the GEMM front from it),
-/// which only the q8_0 block does
-/// ([`bloomery_gpu_deepseek41::block::BlockPlan::check_cols`]); such a file
-/// feeds by steps.
-fn refuse_k_quant_blocks(cfg: &[super::LayerCfg]) -> Result<(), GpuError> {
-    for (l, c) in cfg.iter().enumerate() {
-        c.block.check_cols(BODY, l).map_err(|e| match e {
-            GpuError::Shape { what, detail } => GpuError::Shape {
-                what,
-                detail: format!("{detail}; this file feeds by steps"),
-            },
-            other => other,
-        })?;
-    }
-    Ok(())
+/// The forms `cfg`'s dense blocks read ([`DenseForms`]), from the plans the file's types gave them: what the
+/// GEMM front is sized for, which the plan's reserve counts the same way
+/// ([`place::PlanInputs::dense_forms`]).
+pub(crate) fn dense_forms(cfg: &[super::LayerCfg]) -> DenseForms {
+    cfg.iter()
+        .filter(|c| c.kind.ffn == FfnKind::Dense)
+        .fold(DenseForms::NONE, |forms, c| {
+            let [gate, _, down] = c.block.types();
+            forms.with_block(gate.kquant(), down.kquant())
+        })
 }
 
 /// Feed `ids` from where `m` stands in batches (module doc) and return the
@@ -1479,7 +1479,6 @@ impl Body {
             return Ok(());
         }
         refuse_late_dense(&self.cfg, self.prompt.group)?;
-        refuse_k_quant_blocks(&self.cfg)?;
         let ff = self.cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let dense_ff = self
             .cfg
@@ -1491,7 +1490,15 @@ impl Body {
         let expert_ff = self.card.ff();
         let cap = T_MAX.min(self.ctx);
         let tiered = self.card.tier().is_some();
-        let bufs = Bufs::new(gpu, &self.dims, [ff, dense_ff, expert_ff], self.ctx, cap)?;
+        let forms = dense_forms(&self.cfg);
+        let bufs = Bufs::new(
+            gpu,
+            &self.dims,
+            [ff, dense_ff, expert_ff],
+            forms,
+            self.ctx,
+            cap,
+        )?;
         self.refuse_unreserved(gpu, group_sets(self.prompt.group) - 1)?;
         let units = (0..group_sets(self.prompt.group))
             .map(|_| UnitBufs::new(gpu, self.dims.embd, cap, tiered))
@@ -2380,18 +2387,6 @@ impl PromptProgram<'_> {
         let n = d.embd;
         gpu.elem()
             .enqueue_rms_norm(stream, &b.x, f32v(w, norm)?, d.rms_eps, n, t, &mut b.xn)?;
-        if t >= GEMM_FROM {
-            return b.front.dense_ffn(
-                gpu,
-                w,
-                l,
-                t,
-                &b.xn,
-                DenseNames { gate, up, down },
-                c.limit,
-                &mut b.out,
-            );
-        }
         let blk = Block {
             plan: c.block,
             names: [gate, up, down],
@@ -2399,6 +2394,9 @@ impl PromptProgram<'_> {
             limit: c.limit,
             layer: l,
         };
+        if t >= GEMM_FROM {
+            return b.front.dense_ffn(gpu, w, t, &b.xn, &blk, &mut b.out);
+        }
         for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.xn, c0 * n, cn * n)?;
             let mut out = span_mut(W, &mut b.out, c0 * n, cn * n)?;
@@ -2407,7 +2405,15 @@ impl PromptProgram<'_> {
                 h: &mut b.h,
                 y: &mut out,
             };
-            enqueue_block_cols(gpu, w, &self.p.k.experts, &blk, cn, io)?;
+            enqueue_block_cols(
+                gpu,
+                w,
+                &self.p.k.block_kernels(),
+                &mut self.p.s.block,
+                &blk,
+                cn,
+                io,
+            )?;
         }
         Ok(())
     }
@@ -2565,7 +2571,15 @@ impl PromptProgram<'_> {
                 h: &mut b.h,
                 y: &mut out,
             };
-            enqueue_block_cols(gpu, w, &self.p.k.experts, &blk, cn, io)?;
+            enqueue_block_cols(
+                gpu,
+                w,
+                &self.p.k.block_kernels(),
+                &mut self.p.s.block,
+                &blk,
+                cn,
+                io,
+            )?;
         }
         if card && !tiered {
             gpu.elem()

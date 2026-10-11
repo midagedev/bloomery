@@ -1607,6 +1607,13 @@ impl Body {
             c.block
                 .check_resident(w, WHAT, block_names(n), (c.ff, dims.embd))?;
         }
+        let forms = prefill::dense_forms(&cfg);
+        if forms != inputs.dense_forms() {
+            return Err(shape(format!(
+                "the dense blocks read the forms {forms:?}; the plan's prompt front was sized for {:?}",
+                inputs.dense_forms()
+            )));
+        }
         let nextn = nextn
             .map(|(np, ni)| {
                 nextn::block_plan(file, inputs, ni, dims.embd).map(|block| (np, ni, block))
