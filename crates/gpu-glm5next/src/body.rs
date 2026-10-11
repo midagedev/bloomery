@@ -120,6 +120,9 @@ use crate::swap;
 use crate::tensors::LayerNames;
 use crate::tier;
 
+#[path = "media.rs"]
+mod media;
+
 #[path = "prefill.rs"]
 pub mod prefill;
 

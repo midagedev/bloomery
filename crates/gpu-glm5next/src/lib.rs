@@ -12,7 +12,9 @@
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
 //! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps up
-//!   to a chunk a batch and the mixers' projections on the GEMM past it;
+//!   to a chunk a batch and the mixers' projections on the GEMM past it,
+//!   with media spans' rows in place of their positions' embeddings
+//!   (`body::media`);
 //! - `body::pair`: the verify of two rows behind `Rows`, bit for bit two
 //!   steps, and its commit over the KDA lanes;
 //! - [`body::nextn`]: the next-token (MTP) layer beside the chain on a NextN
@@ -49,8 +51,9 @@ pub use body::nextn::{
 pub use body::prefill::{
     CHUNK, GEMM_FROM, GlmPromptSink, PrefillMode, PromptBytes, RouteTapRows, StoreDigest,
     StoreRows, T_MAX, batches_of, call_batches, feed, plant_prompt_routes, prefill, prefill_group,
-    prefill_mode, prompt_bytes, prompt_route_taps, prompt_with, set_prefill, set_prefill_group,
-    set_prompt_route_taps, set_prompt_stats, store_digests, store_rows, take_prompt_stats,
+    prefill_media, prefill_mode, prompt_bytes, prompt_route_taps, prompt_with, set_prefill,
+    set_prefill_group, set_prefill_media, set_prompt_route_taps, set_prompt_stats, store_digests,
+    store_rows, take_prompt_stats,
 };
 pub use body::seq::{
     GlmSeq, seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
