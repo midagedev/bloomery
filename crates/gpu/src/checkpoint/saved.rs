@@ -1321,21 +1321,23 @@ mod tests {
     }
 
     /// A Qwen3-30B-shaped state (48 layers' K and V: 96 stores of 4 planes of
-    /// 128 values a position, 4096 of 8192 positions) begins its copy in a
+    /// 128 values a position, 1024 of 2048 positions) begins its copy in a
     /// call that returns while the copy still runs, takes one copy call a
     /// store, and moves the bytes of those positions; what the copy and the
     /// call cost, alone and beside the same bytes going the other way, is
     /// printed (an observation, not a timing: no lease holds the machine).
+    /// `gate-gpu-lib` takes no card lock, so the two sets of stores are kept
+    /// to a few hundred MiB of the card: a peer gate may hold most of it.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_held_a_qwen3_shaped_state_begins_in_a_call_and_copies_in_one_call_a_store() {
         use std::time::Instant;
         const STORES: usize = 96;
         const HEAD: usize = 128;
-        const MAX: usize = 8192;
-        const AT: usize = 4096;
+        const MAX: usize = 2048;
+        const AT: usize = 1024;
         let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
-        let lane = SaveLane::new(&ctx, 1 << 30).expect("a lane");
+        let lane = SaveLane::new(&ctx, 256 << 20).expect("a lane");
         let stores = || -> Vec<DeviceBuffer<u16>> {
             (0..STORES)
                 .map(|_| DeviceBuffer::zeroed(&stream, PLANES * MAX * HEAD).expect("a store"))
