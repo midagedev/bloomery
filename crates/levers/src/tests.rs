@@ -701,15 +701,8 @@ fn residency38_unset_follows_the_plan() {
     // The host holds one expert unless a case says otherwise.
     let pick_mem = |n_l: &[u64], headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
-        residency38_at_plan(
-            n_l.iter().copied(),
-            1,
-            PlanTier::NONE,
-            pool(fewest),
-            headroom,
-            mem_left,
-        )
-        .expect("no pool error")
+        residency38_at_plan(n_l.iter().copied(), 1, pool(fewest), headroom, mem_left)
+            .expect("no pool error")
     };
     let pick = |n_l: &[u64], headroom: i128| pick_mem(n_l, headroom, 1 << 40);
     let derived = pick(&[0, 297, 298, 0, 297], 1 << 40);
@@ -743,15 +736,8 @@ fn residency38_unset_follows_the_plan() {
     }
     // A plan that leaves the host no routed expert: the pool would serve
     // none, whatever room the card and the host have.
-    let all_on_cards = residency38_at_plan(
-        [512u64, 512],
-        0,
-        PlanTier::NONE,
-        pool(512),
-        1 << 40,
-        1 << 40,
-    )
-    .expect("no pool error");
+    let all_on_cards =
+        residency38_at_plan([512u64, 512], 0, pool(512), 1 << 40, 1 << 40).expect("no pool error");
     assert_eq!(
         all_on_cards,
         Residency38Pick {
@@ -765,7 +751,7 @@ fn residency38_unset_follows_the_plan() {
         "unset: the plan holds every routed expert on a card; a churn pool would serve none"
     );
     assert_eq!(
-        residency38_at_plan([0u64, 0], 0, PlanTier::NONE, pool(0), 1 << 40, 1 << 40)
+        residency38_at_plan([0u64, 0], 0, pool(0), 1 << 40, 1 << 40)
             .expect("no pool error")
             .why,
         Residency38Why::NoCardExperts,
@@ -843,57 +829,54 @@ fn residency38_unset_follows_the_plan() {
         }
     );
     assert_eq!(
-        residency38_at_plan(
-            [297u64],
-            1,
-            PlanTier::NONE,
-            |_| Err::<u64, &str>("the pool"),
-            0,
-            0
-        ),
+        residency38_at_plan([297u64], 1, |_| Err::<u64, &str>("the pool"), 0, 0),
         Err("the pool"),
         "the pool's error is the call's"
     );
 }
 
-/// A paged plan's Qwen3.8 unset residency ([`residency38_at_plan`]) is
-/// `off`, its why naming both byte counts, ahead of the rule's own
-/// refusals — no card expert, no host expert; the same inputs with no arena
-/// resolve by the rule's other terms.
+/// A paged plan's unset residency resolves by each rule's own terms: its
+/// stacks leave the churn pool empty at every P (a paged stack's victims are
+/// the arena's, `ChurnPool::of`), so the Qwen3.8 word is `mid-p0-s1` while the
+/// plan's host headroom and `MemAvailable` are not negative, and `off` with
+/// the host's why where one is. Nothing about the tier's arena is an input.
+// PIN(2026-10-11): the paged plan's pick was `off`, why `paged`, under a
+// plan-time clause that read the tier's arena; a promotion reads the arena's
+// slots, not the file mapping, so the clause is gone. Derivation: pool 0 at
+// every P, the headroom 0 or more: `room_for`'s host side fits at P 0.
+// FAIL-first: a `room_for` that turns a pool-0 plan `off` reds it.
 #[test]
-fn residency38_at_plan_runs_off_on_a_paged_plan() {
+fn residency38_at_plan_resolves_a_paged_plan_by_its_own_rule() {
     let big = 1 << 40;
-    let pool = |p: usize| Ok::<u64, ()>(10 * (297 - p) as u64);
-    let at = |tier: PlanTier, n_l: &[u64], host: u64| {
-        residency38_at_plan(n_l.iter().copied(), host, tier, pool, big, big).expect("no pool error")
-    };
-    let paged = Residency38Pick {
-        pinned: None,
-        why: Residency38Why::Paged {
-            paged: PAGED_TIER.paged,
-            arena: PAGED_TIER.arena,
-        },
-    };
-    assert_eq!(at(PAGED_TIER, &[297, 298], 1), paged);
-    assert_eq!(paged.word(), "off");
-    assert_eq!(paged.why.to_string(), PAGED_WHY);
-    // Ahead of the rule's own refusals.
-    for (n_l, host) in [(&[0u64, 0][..], 1), (&[297][..], 0), (&[0, 0][..], 0)] {
-        assert_eq!(at(PAGED_TIER, n_l, host), paged, "{n_l:?} {host}");
-    }
-    // No arena: the rule's other terms decide.
-    let no_arena = PlanTier {
-        paged: PAGED_TIER.paged,
-        arena: 0,
+    let empty = |_: usize| Ok::<u64, ()>(0);
+    let at = |headroom: i128, mem_left: i128| {
+        residency38_at_plan([297u64, 298], 1, empty, headroom, mem_left).expect("no pool error")
     };
     let planned = Residency38Pick {
         pinned: Some(0),
         why: Residency38Why::PlanA { fewest: 297 },
     };
-    assert_eq!(at(no_arena, &[297, 298], 1), planned);
-    assert_eq!(at(PlanTier::NONE, &[297, 298], 1), planned);
-    assert_eq!(at(no_arena, &[0, 0], 1).why, Residency38Why::NoCardExperts);
-    assert_eq!(at(no_arena, &[297], 0).why, Residency38Why::NoHostExperts);
+    assert_eq!(at(0, big), planned);
+    assert_eq!(at(big, 0), planned);
+    assert_eq!(
+        at(-1, big).why,
+        Residency38Why::HostShort {
+            needs: 0,
+            leaves: -1
+        }
+    );
+    assert_eq!(
+        at(big, -1).why,
+        Residency38Why::MemShort {
+            needs: 0,
+            leaves: -1
+        }
+    );
+    assert_eq!(
+        room_for(0, 1, [297u64, 298], empty, 0, big),
+        Ok(Room::AsIs),
+        "the room is the same rule under every family"
+    );
 }
 
 /// The plan's room for a family's target word ([`room_for`]): the word at
@@ -911,7 +894,6 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
             target,
             spares,
             n_l.iter().copied(),
-            PlanTier::NONE,
             pool(fewest),
             headroom,
             mem_left,
@@ -989,68 +971,9 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
         })
     );
     assert_eq!(
-        room_for(40, 1, [42u64], PlanTier::NONE, |_| Err(()), 0, 0),
+        room_for(40, 1, [42u64], |_| Err(()), 0, 0),
         Err(()),
         "the pool's error is the call's"
-    );
-}
-
-/// A plan that pages 48 GiB of routed experts through a 4 GiB RAM arena.
-const PAGED_TIER: PlanTier = PlanTier {
-    paged: 51_539_607_552,
-    arena: 4_294_967_296,
-};
-
-/// The `residency unset` record's why on [`PAGED_TIER`]: both byte counts in
-/// the one sentence every family's `Paged` why prints.
-const PAGED_WHY: &str = "unset: the plan pages 51539607552 B of routed experts through the NVMe \
-                         tier's RAM arena (4294967296 B), whose promotions would read them cold \
-                         through the file mapping";
-
-/// The plan-time clause every family's rule opens with ([`PlanTier::short`],
-/// [`room_for`]): a plan that pages routed experts through the NVMe tier's
-/// RAM arena leaves no room, before the card slots, the host room and the
-/// pool are read — the pool unasked. It is the arena that pages: bytes paged
-/// with no arena, and a plan with no tier, leave the room to the other terms.
-#[test]
-fn room_for_refuses_a_paged_plan_before_any_other_count() {
-    let big = 1 << 40;
-    let pool = |p: usize| Ok::<u64, ()>(10 * (50 - p) as u64);
-    let paged = Room::Short(RoomShort::Paged {
-        paged: PAGED_TIER.paged,
-        arena: PAGED_TIER.arena,
-    });
-    // Whatever the card slots hold, including none.
-    for n_l in [&[42u64, 43][..], &[0, 0][..], &[]] {
-        assert_eq!(
-            room_for(40, 1, n_l.iter().copied(), PAGED_TIER, pool, big, big),
-            Ok(paged),
-            "{n_l:?}"
-        );
-    }
-    assert_eq!(
-        room_for(40, 1, [2u64], PAGED_TIER, |_| Err(()), 0, 0),
-        Ok(paged),
-        "the pool is not asked"
-    );
-    // The arena is the term: paged bytes alone leave the room to the other terms.
-    let no_arena = PlanTier {
-        paged: PAGED_TIER.paged,
-        arena: 0,
-    };
-    assert_eq!(
-        room_for(40, 1, [42u64, 43], no_arena, pool, big, big),
-        Ok(Room::AsIs)
-    );
-    assert_eq!(
-        room_for(40, 1, [0u64, 0], no_arena, pool, big, big),
-        Ok(Room::Short(RoomShort::NoCardExperts))
-    );
-    assert_eq!(PlanTier::NONE.short(), None);
-    assert_eq!(no_arena.short(), None);
-    assert_eq!(
-        PlanTier { paged: 0, arena: 1 }.short(),
-        Some(RoomShort::Paged { paged: 0, arena: 1 })
     );
 }
 
@@ -1069,15 +992,8 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     };
     let at = |n_l: &[u64], headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
-        residency_at_plan(
-            unset,
-            n_l.iter().copied(),
-            PlanTier::NONE,
-            pool(fewest),
-            headroom,
-            mem_left,
-        )
-        .expect("no pool error")
+        residency_at_plan(unset, n_l.iter().copied(), pool(fewest), headroom, mem_left)
+            .expect("no pool error")
     };
     let big = 1 << 40;
     // The serving word wherever the plan's layers hold the rule.
@@ -1114,7 +1030,6 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     let raised = residency_at_plan(
         unset,
         [50u64],
-        PlanTier::NONE,
         |p| Ok::<u64, ()>(10 * (50 - p) as u64),
         50,
         big,
@@ -1138,8 +1053,7 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     );
     // A set word and every other why pass through untouched, the pool unasked.
     let refused = |pick: ResidencyPick| {
-        residency_at_plan(pick, [30u64], PlanTier::NONE, |_| Err::<u64, ()>(()), 0, 0)
-            .expect("no pool error")
+        residency_at_plan(pick, [30u64], |_| Err::<u64, ()>(()), 0, 0).expect("no pool error")
     };
     assert_eq!(
         refused(ResidencyPick {
@@ -1157,51 +1071,6 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         .why,
         ResidencyWhy::FixedPlace
     );
-}
-
-/// A paged plan's V4.1 unset residency ([`residency_at_plan`]) is `off`
-/// whatever the card slots and the host leave, its why naming both byte
-/// counts; the same inputs with no arena resolve by the rule's other terms.
-#[test]
-fn residency_at_plan_runs_off_on_a_paged_plan() {
-    let big = 1 << 40;
-    let pool = |p: usize| Ok::<u64, ()>(10 * (50 - p) as u64);
-    let unset = ResidencyPick {
-        word: RESIDENCY_SERVING,
-        why: ResidencyWhy::Place,
-    };
-    let at = |pick: ResidencyPick, tier: PlanTier, n_l: &[u64]| {
-        residency_at_plan(pick, n_l.iter().copied(), tier, pool, big, big).expect("no pool error")
-    };
-    let paged = ResidencyPick {
-        word: "off",
-        why: ResidencyWhy::Paged {
-            paged: PAGED_TIER.paged,
-            arena: PAGED_TIER.arena,
-        },
-    };
-    assert_eq!(at(unset, PAGED_TIER, &[42, 43]), paged);
-    assert_eq!(paged.why.name(), "paged");
-    assert_eq!(paged.why.detail().as_deref(), Some(PAGED_WHY));
-    // Before the plan's own refusals: no card expert.
-    assert_eq!(at(unset, PAGED_TIER, &[0, 0]), paged);
-    // No arena: the rule's other terms decide.
-    let no_arena = PlanTier {
-        paged: PAGED_TIER.paged,
-        arena: 0,
-    };
-    assert_eq!(at(unset, no_arena, &[42, 43]), unset);
-    assert_eq!(at(unset, PlanTier::NONE, &[42, 43]), unset);
-    assert_eq!(
-        at(unset, PlanTier::NONE, &[0, 0]).why,
-        ResidencyWhy::NoCardExperts
-    );
-    // A set word and every other why pass through a paged plan untouched.
-    let fixed = ResidencyPick {
-        word: "off",
-        why: ResidencyWhy::FixedPlace,
-    };
-    assert_eq!(at(fixed, PAGED_TIER, &[42, 43]), fixed);
 }
 
 /// `BLOOMERY_DRAFT` unset on a qwen4exp file in `generate_qwen3moe`: the MTP
@@ -1589,7 +1458,6 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         glm_residency_at_plan(
             mid,
             n.iter().copied(),
-            PlanTier::NONE,
             |p| {
                 assert_eq!(p, 0, "the word's pinned count");
                 Ok::<u64, &str>(pool)
@@ -1606,19 +1474,12 @@ fn glm_residency_at_plan_takes_only_what_fits() {
     );
     let gate = off(GlmWhy::Gate);
     assert_eq!(
-        glm_residency_at_plan(gate, [66u64], PlanTier::NONE, |_| Err("not asked"), 0, 0),
+        glm_residency_at_plan(gate, [66u64], |_| Err("not asked"), 0, 0),
         Ok(gate)
     );
     assert_eq!(fit(&[66], 10, 10, 10).map(|p| p.why), Ok(GlmWhy::Serving));
     assert_eq!(
-        glm_residency_at_plan(
-            mid,
-            [66u64],
-            PlanTier::NONE,
-            |_| Err::<u64, &str>("the pool"),
-            0,
-            0
-        ),
+        glm_residency_at_plan(mid, [66u64], |_| Err::<u64, &str>("the pool"), 0, 0),
         Err("the pool"),
         "the pool's error is the call's"
     );
@@ -1629,7 +1490,6 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         glm_residency_at_plan(
             mid,
             [66u64],
-            PlanTier::NONE,
             |p| Ok::<u64, &str>((66 - p) as u64),
             headroom,
             mem,
@@ -1658,7 +1518,6 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         glm_residency_at_plan(
             mid,
             [66u64],
-            PlanTier::NONE,
             |p| Ok::<u64, &str>(100 * (66 - p) as u64),
             headroom,
             mem,
@@ -1679,49 +1538,6 @@ fn glm_residency_at_plan_takes_only_what_fits() {
             leaves: 9
         })
     );
-}
-
-/// A paged plan's GLM unset residency ([`glm_residency_at_plan`]) is `off`,
-/// its why naming both byte counts, whatever the card slots hold; the same
-/// inputs with no arena resolve by the rule's other terms, and an `off` pick
-/// passes through.
-#[test]
-fn glm_residency_at_plan_runs_off_on_a_paged_plan() {
-    let big = 1 << 40;
-    let pool = |p: usize| Ok::<u64, ()>(10 * (66 - p) as u64);
-    let mid = GlmPick {
-        word: "mid-p0-s1",
-        why: GlmWhy::Serving,
-    };
-    let at = |pick: GlmPick, tier: PlanTier, n_l: &[u64]| {
-        glm_residency_at_plan(pick, n_l.iter().copied(), tier, pool, big, big)
-            .expect("no pool error")
-    };
-    let paged = GlmPick {
-        word: "off",
-        why: GlmWhy::Paged {
-            paged: PAGED_TIER.paged,
-            arena: PAGED_TIER.arena,
-        },
-    };
-    assert_eq!(at(mid, PAGED_TIER, &[66, 67]), paged);
-    assert_eq!(paged.why.to_string(), PAGED_WHY);
-    // Before the plan's own refusals: no card expert.
-    assert_eq!(at(mid, PAGED_TIER, &[0, 0]), paged);
-    // No arena: the rule's other terms decide.
-    let no_arena = PlanTier {
-        paged: PAGED_TIER.paged,
-        arena: 0,
-    };
-    assert_eq!(at(mid, no_arena, &[66, 67]), mid);
-    assert_eq!(at(mid, PlanTier::NONE, &[66, 67]), mid);
-    assert_eq!(
-        at(mid, PlanTier::NONE, &[0, 0]),
-        GlmPick::off(GlmWhy::NoCardExperts)
-    );
-    // An `off` pick passes through a paged plan untouched.
-    let gate = GlmPick::off(GlmWhy::Gate);
-    assert_eq!(at(gate, PAGED_TIER, &[66, 67]), gate);
 }
 
 /// `BLOOMERY_QWEN38_EXPERTS` unset is the card plan; set, as set.

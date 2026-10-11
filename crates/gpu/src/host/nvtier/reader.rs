@@ -72,6 +72,8 @@ struct JobState {
     /// The first unit's start and the last unit's end: the job's own wall.
     first: Option<Instant>,
     last: Option<Instant>,
+    /// The job's wall is in its kind's `run_ns`: counted by the first wait.
+    run_counted: bool,
 }
 
 impl Job {
@@ -90,6 +92,7 @@ impl Job {
                 failed: None,
                 first: None,
                 last: None,
+                run_counted: false,
             }),
             done: Condvar::new(),
         }
@@ -142,6 +145,10 @@ pub struct KindStats {
     /// (ns): the part of the fills the waiter's own work did not hide.
     pub waits: u64,
     pub wait_ns: u64,
+    /// The wall of the jobs a wait saw end (ns, each job's first unit's start
+    /// to its last unit's end): what the units ran, beside the wake and the
+    /// wait around them.
+    pub run_ns: u64,
 }
 
 /// What the readers count ([`Reader::stats`]): the prompt batches' fills and
@@ -161,6 +168,7 @@ impl ReaderStats {
             units: now.units - then.units,
             waits: now.waits - then.waits,
             wait_ns: now.wait_ns - then.wait_ns,
+            run_ns: now.run_ns - then.run_ns,
         };
         ReaderStats {
             prompt: kind(self.prompt, base.prompt),
@@ -175,6 +183,7 @@ struct KindCounters {
     units: AtomicU64,
     waits: AtomicU64,
     wait_ns: AtomicU64,
+    run_ns: AtomicU64,
 }
 
 #[derive(Default)]
@@ -400,24 +409,28 @@ impl Reader {
     /// jobs' own failures reach the caller here, never as a panic on a
     /// reader.
     pub(super) fn wait(&self, job: &Job) -> Result<u64, Failure> {
+        let c = self.shared.counters.of(job.kind);
         let mut s = job.lock();
         if s.left > 0 {
             let t0 = Instant::now();
             while s.left > 0 {
                 s = job.done.wait(s).unwrap_or_else(|e| e.into_inner());
             }
-            let c = self.shared.counters.of(job.kind);
             c.waits.fetch_add(1, Ordering::Relaxed);
             c.wait_ns
                 .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+        let wall = match (s.first, s.last) {
+            (Some(a), Some(b)) => b.duration_since(a).as_nanos() as u64,
+            _ => 0,
+        };
+        if !std::mem::replace(&mut s.run_counted, true) {
+            c.run_ns.fetch_add(wall, Ordering::Relaxed);
+        }
         if let Some(f) = s.failed.take() {
             return Err(f);
         }
-        Ok(match (s.first, s.last) {
-            (Some(a), Some(b)) => b.duration_since(a).as_nanos() as u64,
-            _ => 0,
-        })
+        Ok(wall)
     }
 
     /// The readers' counters.
@@ -429,6 +442,7 @@ impl Reader {
                 units: c.units.load(Ordering::Relaxed),
                 waits: c.waits.load(Ordering::Relaxed),
                 wait_ns: c.wait_ns.load(Ordering::Relaxed),
+                run_ns: c.run_ns.load(Ordering::Relaxed),
             }
         };
         ReaderStats {
@@ -573,6 +587,10 @@ mod tests {
             (counted(stats.prompt), counted(stats.victim)),
             ((3, 3), (2, 2)),
             "each kind counted alone"
+        );
+        assert!(
+            stats.prompt.run_ns > 0,
+            "the held job's wall is counted by its wait: {stats:?}"
         );
         reader.stop(Duration::from_secs(10)).unwrap();
     }

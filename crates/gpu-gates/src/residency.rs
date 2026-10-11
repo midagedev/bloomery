@@ -4,13 +4,13 @@
 //! [`bloomery_levers::residency_at_plan`] resolves against its plan). The
 //! families' rules differ by clause and record (`residency38`, the GLM seat,
 //! the V4.1 and MiMo seats print their own whys); the inputs they read of the
-//! plan are these five: the card experts a layer, the NVMe tier's terms, the
-//! churn pool's bytes at a pinned count, the host headroom and what
-//! `MemAvailable` leaves past the plan's host need.
+//! plan are these four: the card experts a layer, the churn pool's bytes at a
+//! pinned count, the host headroom and what `MemAvailable` leaves past the
+//! plan's host need.
 
 use crate::GateError;
-use crate::residency38::{mem_left_38, plan_tier};
-use bloomery_levers::{PlanTier, ResidencyPick, residency_at_plan};
+use crate::residency38::mem_left_38;
+use bloomery_levers::{ResidencyPick, residency_at_plan};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, host_available};
 use model::placement::{PlacementError, Plan};
@@ -35,12 +35,6 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
     /// The plan's card experts a layer (a layer holding none included).
     pub fn card_experts(&self) -> impl Iterator<Item = u64> + '_ {
         self.plan.n_l.iter().copied()
-    }
-
-    /// The plan's NVMe tier terms ([`plan_tier`]).
-    #[must_use]
-    pub fn tier(&self) -> PlanTier {
-        plan_tier(self.plan)
     }
 
     /// The plan's host headroom less what the load hosts beside the plan.
@@ -83,7 +77,6 @@ pub fn at_plan(
     Ok(residency_at_plan(
         pick,
         room.card_experts(),
-        room.tier(),
         |pinned| room.pool_bytes(pinned),
         room.headroom(),
         room.mem_left()?,
