@@ -6,17 +6,19 @@
 //! down launches read) and builds its table with [`stacks`]: `swap35` is
 //! Qwen3.6's, `swap38` Qwen3.8's.
 //!
-//! **The check.** A layer whose three stacks are all of types the leg runs
-//! (the place rule's card stacks) holds a gate and an up of one type its
+//! **The check.** A layer the body's plan gives card experts, whose three
+//! stacks are all of types the leg runs (the place rule's card stacks), holds a gate and an up of one type its
 //! gate·up launches read and a down of a type its down launches read; a layer
-//! with a stack of another type stays on the host and is not checked. The
+//! with a stack of another type stays on the host and is not checked, and so
+//! is a layer the plan gives no card expert: the machine keeps each layer's
+//! card count, so none of its stacks ever reaches the leg. The
 //! place rule reads a stack's type alone, so a type the leg runs in one role
 //! only (a Q6_K gate, a Q4_K down on Qwen3.8's leg) puts its layer on the
 //! card, and the check refuses it by name here, at load, instead of the leg
 //! at its first launch.
 
 use crate::GpuError;
-use crate::host::swap_source::{PlanStacks, StackFacts};
+use crate::host::swap_source::{FileStacks, PlanStacks, StackFacts};
 use gguf::quant::GgmlType;
 use model::arch::names::routed_stacks;
 use model::placement::ModelTensors;
@@ -43,8 +45,7 @@ fn listed(pred: fn(GgmlType) -> bool) -> Vec<GgmlType> {
         .collect()
 }
 
-/// Layer `l`'s card-leg contract under the leg `L` (module doc), for
-/// [`StackFacts::check`]: a layer whose stacks are all card types holds a gate
+/// Layer `l`'s card-leg contract under the leg `L` (module doc): a layer whose stacks are all card types holds a gate
 /// and an up of one gate·up type and a down type the down launches read;
 /// refused by name otherwise.
 fn check<L: CardLeg>(l: usize, [gate, up, down]: [GgmlType; 3]) -> Result<(), GpuError> {
@@ -66,22 +67,34 @@ fn check<L: CardLeg>(l: usize, [gate, up, down]: [GgmlType; 3]) -> Result<(), Gp
 }
 
 /// The stacks of `model`'s layers, each layer's types read from its tensors:
-/// every layer holds all three stacks, each complete layer checked against the
-/// leg `L`, the whole card range the map, every layer routed. Refused by name,
-/// under `L::WHAT`: a layer without all three stacks, and a layer the leg
-/// refuses. Load-time only.
-pub(super) fn stacks<L: CardLeg>(model: &ModelTensors) -> Result<PlanStacks, GpuError> {
-    PlanStacks::of(
+/// every layer holds all three stacks, each layer `carded` names (one the
+/// plan gives card experts) checked against the leg `L`, the whole card range
+/// the map, every layer routed. Refused by name, under `L::WHAT`: a layer
+/// without all three stacks, and a carded layer the leg refuses; a layer
+/// `carded` refuses fails with its error. Load-time only.
+pub(super) fn stacks<L: CardLeg>(
+    model: &ModelTensors,
+    carded: impl Fn(usize) -> Result<bool, GpuError>,
+) -> Result<PlanStacks, GpuError> {
+    let table = PlanStacks::of(
         model,
         StackFacts {
             what: L::WHAT,
             names: routed_stacks,
-            check: Some(check::<L>),
+            check: None,
             empty: false,
             map_layers: None,
             unrouted: Vec::new(),
         },
-    )
+    )?;
+    for l in 0..model.layers {
+        if let &[gate, up, down] = table.types(l)
+            && carded(l)?
+        {
+            check::<L>(l, [gate, up, down])?;
+        }
+    }
+    Ok(table)
 }
 
 #[cfg(test)]
@@ -119,7 +132,7 @@ mod tests {
 
     /// What `L` makes of one layer of `types`: `Ok` or the refusal's text.
     fn layer<L: CardLeg>(types: [GgmlType; 3]) -> Result<(), String> {
-        match stacks::<L>(&model(1, |_| types)) {
+        match stacks::<L>(&model(1, |_| types), |_| Ok(true)) {
             Ok(_) => Ok(()),
             Err(GpuError::Shape { what, detail }) => {
                 assert_eq!(what, L::WHAT, "the refusal names the leg");
@@ -232,7 +245,7 @@ mod tests {
                 [Q4_K, Q4_K, Q6_K]
             }
         };
-        match stacks::<Leg35>(&model(4, three)) {
+        match stacks::<Leg35>(&model(4, three), |_| Ok(true)) {
             Err(GpuError::Shape { detail, .. }) => {
                 assert!(detail.starts_with("layer 2's gate q6_K"), "{detail}");
             }
@@ -241,8 +254,34 @@ mod tests {
         let mut short = model(2, |_| [Q4_K, Q4_K, Q6_K]);
         short.tensors.pop();
         assert!(
-            matches!(stacks::<Leg35>(&short), Err(GpuError::Tensor { .. })),
+            matches!(
+                stacks::<Leg35>(&short, |_| Ok(true)),
+                Err(GpuError::Tensor { .. })
+            ),
             "a layer without its down is a missing tensor"
         );
+    }
+
+    /// A layer the plan gives no card expert loads whatever its types: the
+    /// leg never runs its stacks, so a gate and an up of two card types (or a
+    /// Q6_K gate and up on Qwen3.6's leg) is refused only on a carded layer.
+    /// Mutant: the check run on every layer whatever `carded` says — the
+    /// uncarded arms are refused.
+    #[test]
+    fn a_layer_with_no_card_expert_is_not_checked() {
+        use GgmlType::{Q4_K, Q5_K, Q6_K};
+        for bad in [[Q4_K, Q5_K, Q4_K], [Q6_K, Q6_K, Q4_K]] {
+            let two = model(2, |_| bad);
+            assert!(
+                stacks::<Leg35>(&two, |_| Ok(false)).is_ok(),
+                "{bad:?} on layers with no card expert loads"
+            );
+            match stacks::<Leg35>(&two, |l| Ok(l == 1)) {
+                Err(GpuError::Shape { detail, .. }) => {
+                    assert!(detail.starts_with("layer 1's gate"), "{detail}");
+                }
+                _ => panic!("{bad:?} on carded layer 1 is refused by name"),
+            }
+        }
     }
 }

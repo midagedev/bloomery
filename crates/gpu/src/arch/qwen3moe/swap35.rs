@@ -37,10 +37,13 @@ impl CardLeg for Leg35 {
     }
 }
 
-/// The stacks of `model`'s layers, each layer's types read from its tensors
-/// and checked against [`Leg35`]. Refused by name: a layer without all three
-/// stacks, and a layer the leg refuses (a Q6_K gate or up among them).
-/// Load-time only.
-pub(super) fn stacks(model: &ModelTensors) -> Result<PlanStacks, GpuError> {
-    swap::stacks::<Leg35>(model)
+/// The stacks of `model`'s layers, each layer's types read from its tensors,
+/// each layer `carded` names checked against [`Leg35`] ([`swap::stacks`]).
+/// Refused by name: a layer without all three stacks, and a carded layer the
+/// leg refuses (a Q6_K gate or up among them). Load-time only.
+pub(super) fn stacks(
+    model: &ModelTensors,
+    carded: impl Fn(usize) -> Result<bool, GpuError>,
+) -> Result<PlanStacks, GpuError> {
+    swap::stacks::<Leg35>(model, carded)
 }

@@ -52,8 +52,9 @@ impl CardLeg for Leg38 {
 pub type Qwen38Stacks = PlanStacks;
 
 /// The stacks of `model`'s layers, each layer's types read from its tensors
-/// and checked against [`Leg38`]. Refused by name: a layer without all three
-/// stacks, and a layer the leg refuses. Load-time only.
+/// and every layer checked against [`Leg38`] ([`swap::stacks`] with every
+/// layer carded). Refused by name: a layer without all three stacks, and a
+/// layer the leg refuses. Load-time only.
 pub fn stacks(model: &ModelTensors) -> Result<Qwen38Stacks, GpuError> {
-    swap::stacks::<Leg38>(model)
+    swap::stacks::<Leg38>(model, |_| Ok(true))
 }
