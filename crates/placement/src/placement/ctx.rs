@@ -1,16 +1,20 @@
 //! The serving seats' shared `--ctx` rules: the bisection the seats'
-//! searches run ([`largest`]), the expert-margin guard that bounds a default
-//! context past the seat's floor ([`within_margin`], qwen38's margin rule,
-//! which the glm seat lifts), the prompt-cache guard that bounds it by the
-//! budget the plan leaves at each context ([`within_cache`]), the search over
-//! a context grid both qwen3 defaults run ([`searched`]) and the slot count a
-//! `--ctx` flag buys ([`slots_of`]) — more positions on the card push card
-//! experts to the host, and decode crawls, so a context the flag did not name
-//! never trades away more than the plan's margin of stage-card expert bytes.
-//! The plan a seat probes at each context is its own (the model's placements
+//! searches run ([`largest`]), the default context a slot takes past the
+//! seat's base ([`default_slot_ctx`]; [`within_margin`] is its card-only
+//! form, which the glm seat lifts), the prompt-cache guard that bounds it by
+//! the budget the plan leaves at each context ([`within_cache`]), the search
+//! over a context grid both qwen3 defaults run ([`searched`]) and the slot
+//! count a `--ctx` flag buys ([`slots_of`]) — more positions on the card push
+//! card experts to the host, and decode crawls, so a context the flag did not
+//! name never trades away more than the plan's margin of stage-card expert
+//! bytes, nor moves experts to the NVMe tier the base's plan kept off it. The
+//! plan a seat probes at each context is its own (the model's placements
 //! differ); these are the terms the seats already share, and every
 //! model-specific input — the plan's bytes, the margin, the step, the trained
 //! context — enters as an argument.
+
+use std::cell::Cell;
+use std::convert::Infallible;
 
 /// Why a slot count was refused.
 #[derive(Debug, thiserror::Error)]
@@ -83,16 +87,90 @@ pub fn largest<E>(
     Ok(lo)
 }
 
+/// A plan's routed-expert bytes by tier at one context, what the default
+/// rule counts; the host's share is the rest of the experts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertBytes {
+    /// Experts resident on the stage card.
+    pub card: u64,
+    /// Experts the plan leaves on the NVMe tier.
+    pub nvme: u64,
+}
+
+impl ExpertBytes {
+    /// Whether this plan, a deeper context's, is within `margin` of `base`'s:
+    /// at most `margin` fewer card expert bytes and no more NVMe expert
+    /// bytes. The one owner of "within" for [`default_slot_ctx`] and
+    /// [`within_margin`].
+    fn within(self, base: Self, margin: u64) -> bool {
+        base.card.saturating_sub(self.card) <= margin && self.nvme <= base.nvme
+    }
+}
+
+/// The multiple of `step` up to `fit` the margin allows, and its plan's
+/// bytes: `fit` when its plan is within `margin` of `base`'s (the plan at
+/// `base_at`), `base_at` when no step past it is, else the largest multiple
+/// of `step` above `base_at` whose plan is. A probe's error is a context
+/// that is not within. `base_at` is the context `base` was planned at; it
+/// is at or under `fit`, and the base's own plan is within by definition,
+/// so it is never probed.
+///
+/// Bisection, after one probe at `fit`: [`ExpertBytes::within`] is a prefix
+/// of the contexts when the probe is monotone (see [`default_slot_ctx`]).
+///
+/// # Panics
+/// On a `step` of 0.
+fn scan<E>(
+    fit: usize,
+    base_at: usize,
+    base: ExpertBytes,
+    step: usize,
+    margin: u64,
+    probe: &dyn Fn(usize) -> Result<ExpertBytes, E>,
+) -> (usize, ExpertBytes) {
+    assert!(step > 0, "a context step of 0");
+    if fit <= base_at {
+        return (base_at, base);
+    }
+    // The last context probed within, which a bisection moves only upward.
+    let best = Cell::new((base_at, base));
+    let within = |ctx: usize| {
+        let Ok(plan) = probe(ctx) else {
+            return false;
+        };
+        let holds = plan.within(base, margin);
+        if holds {
+            best.set((ctx, plan));
+        }
+        holds
+    };
+    if within(fit) {
+        return best.get();
+    }
+    // Step `i` is the `i`-th multiple of `step` past the base's; step 0 is
+    // the base itself, which `largest` never probes. The steps under `fit`
+    // are numbered up to `(fit - 1) / step - base_at / step` (the fit's own
+    // probe is above).
+    let steps = (fit - 1) / step - base_at / step;
+    let at = |i: usize| (base_at / step + i) * step;
+    let Ok(_) = largest(0, steps, |i| Ok::<_, Infallible>(within(at(i))));
+    best.get()
+}
+
 /// The largest multiple of `step` up to `fit` whose `card_bytes` holds at
 /// most `margin` fewer bytes than `base_bytes` (the plan's at `base_at`):
 /// `fit` when every context to there does, `base_at` when no step past it
 /// does, else the largest that does rounded down to `step` (never under
 /// `base_at`). A context whose plan is refused is not within, as the fit's
-/// own search reads it: a probe is never the seat's refusal.
+/// own search reads it: a probe is never the seat's refusal. The card-only
+/// form of [`default_slot_ctx`]'s scan, for a plan with no NVMe tier.
 ///
 /// # Errors
 /// None today: a probe's error is a context that is not within. The result
 /// type is the seat's own so its call reads as the fit's search does.
+///
+/// # Panics
+/// On a `step` of 0.
 pub fn within_margin<E>(
     fit: usize,
     base_at: usize,
@@ -101,13 +179,117 @@ pub fn within_margin<E>(
     margin: u64,
     card_bytes: &dyn Fn(usize) -> Result<u64, E>,
 ) -> Result<usize, E> {
-    let within =
-        |c: usize| Ok::<_, E>(card_bytes(c).is_ok_and(|b| base_bytes.saturating_sub(b) <= margin));
-    let c = largest(base_at, fit, within)?;
-    if c == fit {
-        return Ok(c);
+    let base = ExpertBytes {
+        card: base_bytes,
+        nvme: 0,
+    };
+    let probe = |c: usize| card_bytes(c).map(|card| ExpertBytes { card, nvme: 0 });
+    Ok(scan(fit, base_at, base, step, margin, &probe).0)
+}
+
+/// What [`default_slot_ctx`] chose and the terms it chose by: a seat prints
+/// them as one line ([`SlotCtx::line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotCtx {
+    /// The context a slot takes. A seat that bounds it further (a prompt
+    /// cache's room) sets it and [`SlotCtx::rule`], and leaves the scan's
+    /// terms below as they are.
+    pub ctx: usize,
+    /// What set it: `card` (the card holds fewer than a base context, the
+    /// fit is the answer) or `margin` (the scan's).
+    pub rule: &'static str,
+    /// The largest context a slot holds, as the caller's own search found it.
+    pub fit: usize,
+    /// The scan's answer: `ctx` as [`default_slot_ctx`] returns it.
+    pub margin_ctx: usize,
+    /// The context the margin counts against, `base` or `fit` when that is
+    /// fewer, and its plan's bytes.
+    pub base_ctx: usize,
+    pub base: ExpertBytes,
+    /// The plan's bytes at `margin_ctx`.
+    pub chosen: ExpertBytes,
+    /// The margin the rule held `chosen` to.
+    pub margin: u64,
+}
+
+impl SlotCtx {
+    /// The `ctx` line a seat prints on stderr: every context a slot's,
+    /// `total` the sum of the `slots`', `base` the context the margin counts
+    /// against, `lost_bytes` the card expert bytes the chosen plan holds
+    /// fewer than the base's.
+    #[must_use]
+    pub fn line(&self, slots: usize) -> String {
+        format!(
+            "ctx rule={} ctx={} slots={slots} total={} fit={} margin_ctx={} base={} \
+             base_card_expert_bytes={} base_nvme_expert_bytes={} card_expert_bytes={} \
+             nvme_expert_bytes={} lost_bytes={} margin_bytes={}",
+            self.rule,
+            self.ctx,
+            slots * self.ctx,
+            self.fit,
+            self.margin_ctx,
+            self.base_ctx,
+            self.base.card,
+            self.base.nvme,
+            self.chosen.card,
+            self.chosen.nvme,
+            self.base.card.saturating_sub(self.chosen.card),
+            self.margin
+        )
     }
-    Ok((c / step * step).max(base_at))
+}
+
+/// The context a slot takes when the flag names none, every number a slot's:
+/// `fit` when it is under `base` (rule `card`: the card holds fewer than a
+/// base context), else the largest multiple of `step` up to `fit` whose plan
+/// holds at most `margin` fewer card expert bytes than the plan at `base`
+/// and no more NVMe expert bytes (rule `margin`) — `fit` when its plan does,
+/// `base` when no step past it does. The NVMe clause stops a deeper context
+/// from buying positions with experts a tier slower than the host's.
+///
+/// `probe` plans one context. A context whose plan is refused is not within
+/// (a probe is never the seat's refusal), except the base's own, whose error
+/// is the rule's.
+///
+/// The scan is a bisection over the multiples of `step`, after one probe at
+/// `fit`, where a linear scan would take one probe a step: it assumes `probe`
+/// is monotone in the context — card expert bytes never rise, NVMe expert
+/// bytes never fall and a refused plan stays refused as the context deepens,
+/// the solver trading experts for positions only one way — so the contexts
+/// within are a prefix. A probe is a plan solve: past the probes at `base`
+/// and `fit`, the `n` multiples of `step` between them cost at most
+/// `⌈log2(n + 1)⌉` more.
+///
+/// # Errors
+/// The error of the probe at `base`, or at `fit` when that is under it.
+///
+/// # Panics
+/// On a `step` of 0.
+pub fn default_slot_ctx<E>(
+    fit: usize,
+    base: usize,
+    step: usize,
+    margin: u64,
+    probe: &dyn Fn(usize) -> Result<ExpertBytes, E>,
+) -> Result<SlotCtx, E> {
+    let base_ctx = base.min(fit);
+    let at_base = probe(base_ctx)?;
+    let (ctx, rule, chosen) = if fit < base {
+        (fit, "card", at_base)
+    } else {
+        let (ctx, chosen) = scan(fit, base_ctx, at_base, step, margin, probe);
+        (ctx, "margin", chosen)
+    };
+    Ok(SlotCtx {
+        ctx,
+        rule,
+        fit,
+        margin_ctx: ctx,
+        base_ctx,
+        base: at_base,
+        chosen,
+        margin,
+    })
 }
 
 /// The context a default keeps when the prompt cache must hold one sequence
@@ -449,6 +631,269 @@ mod tests {
         };
         let err = within_cache(200, 1, &state, &refused).expect_err("a plan refused");
         assert_eq!(err.to_string(), "refused");
+
+    /// The default rule's base context, step and margin, and a plan whose
+    /// card holds `CARD` there.
+    const AT: usize = 4096;
+    const STEP: usize = 256;
+    const MARGIN: u64 = 1_000;
+    const CARD: u64 = 1_000_000;
+
+    /// A plan's bytes at a context: the card holds `card` at `at` and loses
+    /// `per` bytes a position past it, to none at the least; the NVMe tier
+    /// holds `nvme(c)`.
+    fn plan(
+        card: u64,
+        at: usize,
+        per: u64,
+        nvme: impl Fn(usize) -> u64,
+    ) -> impl Fn(usize) -> Result<ExpertBytes, String> {
+        move |c| {
+            Ok(ExpertBytes {
+                card: card.saturating_sub((c.saturating_sub(at) as u64) * per),
+                nvme: nvme(c),
+            })
+        }
+    }
+
+    /// The default over `probe`, with the probes it took.
+    fn run(
+        fit: usize,
+        step: usize,
+        margin: u64,
+        probe: impl Fn(usize) -> Result<ExpertBytes, String>,
+    ) -> (Result<SlotCtx, String>, usize) {
+        let probes = Probes::new();
+        let counted = |c: usize| {
+            probes.take();
+            probe(c)
+        };
+        let got = default_slot_ctx(fit, AT, step, margin, &counted);
+        (got, probes.0.get())
+    }
+
+    /// The probes a default may take over a context range: the base's, the
+    /// fit's and a bisection's `⌈log2(n + 1)⌉` over the `n` multiples of
+    /// `step` between them, counted here one at a time.
+    fn probe_bound(fit: usize, step: usize) -> usize {
+        let n = (1..)
+            .map(|i| (AT / step + i) * step)
+            .take_while(|&c| c < fit)
+            .count();
+        2 + (n + 1).next_power_of_two().ilog2() as usize
+    }
+
+    /// A fit under the base is the answer, off the step as it is, by the
+    /// `card` rule: the one probe is the base's, which is the chosen plan's
+    /// too; a fit at the base is the margin rule's, with no step past it.
+    #[test]
+    fn default_ctx_under_the_base_is_the_fit_by_the_card_rule() {
+        let (got, probes) = run(3000, STEP, MARGIN, plan(CARD, AT, 1, |_| 0));
+        let got = got.expect("a plan");
+        assert_eq!((got.ctx, got.rule, got.base_ctx), (3000, "card", 3000));
+        assert_eq!(got.base, got.chosen, "the plan at the fit is both");
+        assert_eq!(probes, 1);
+        let (got, probes) = run(AT - 1, STEP, MARGIN, plan(CARD, AT, 1, |_| 0));
+        let got = got.expect("a plan");
+        assert_eq!((got.ctx, got.rule), (AT - 1, "card"));
+        assert_eq!(probes, 1);
+        let (got, probes) = run(AT, STEP, MARGIN, plan(CARD, AT, 1, |_| 0));
+        let got = got.expect("a plan");
+        assert_eq!((got.ctx, got.rule, got.base_ctx), (AT, "margin", AT));
+        assert_eq!(probes, 1, "a fit at the base has nothing to scan");
+    }
+
+    /// The card margin binds: the largest multiple of the step within it, a
+    /// multiple of the step itself (not the base plus whole steps, a base
+    /// off the step has its own), never under the base, over a short range
+    /// and a wide one (a linear scan is a panic past the probe cap). No
+    /// context here sits at the margin's last byte (the next test's).
+    #[test]
+    fn default_ctx_margin_binds_at_the_last_step_within_it() {
+        // The card loses 1 B a position past the base: 1,000 B of margin
+        // holds through 5096.
+        let rows = [
+            (9000, 256, 4864, "5096 rounded down to a step of 256"),
+            (9000, 1024, 4096, "no whole step past the base holds"),
+            (
+                9000,
+                100,
+                5000,
+                "a multiple of 100 itself, off the base's 4096",
+            ),
+            (262_144, 256, 4864, "the wide range"),
+        ];
+        for (fit, step, want, why) in rows {
+            let (got, probes) = run(fit, step, MARGIN, plan(CARD, AT, 1, |_| 0));
+            let got = got.expect("a plan");
+            assert_eq!((got.ctx, got.rule), (want, "margin"), "{why}");
+            assert_eq!(got.margin_ctx, want, "{why}");
+            assert_eq!(got.base_ctx, AT, "{why}");
+            let at = |c| plan(CARD, AT, 1, |_| 0)(c).expect("a plan");
+            assert_eq!(got.base, at(AT), "{why}");
+            assert_eq!(
+                got.chosen,
+                at(want),
+                "the plan at the chosen context: {why}"
+            );
+            assert!(probes <= probe_bound(fit, step), "{why}: {probes} probes");
+        }
+    }
+
+    /// Every context within is the fit — off the step, and at the margin's
+    /// last byte (at most `margin` fewer is within) — after the base's probe
+    /// and the fit's alone; one byte of margin less and the answer is the
+    /// last step.
+    #[test]
+    fn default_ctx_every_context_within_is_the_fit() {
+        let lost_at_fit = 9000 - AT as u64;
+        let (got, probes) = run(9000, STEP, lost_at_fit, plan(CARD, AT, 1, |_| 0));
+        let got = got.expect("a plan");
+        assert_eq!((got.ctx, got.rule), (9000, "margin"));
+        assert_eq!(got.chosen.card, CARD - lost_at_fit);
+        assert_eq!(probes, 2, "the base and the fit");
+        let (got, _) = run(9000, STEP, lost_at_fit - 1, plan(CARD, AT, 1, |_| 0));
+        assert_eq!(
+            got.expect("a plan").ctx,
+            8960,
+            "8999 rounded down to a step"
+        );
+    }
+
+    /// A plan the card refuses past a context is not within there, whatever
+    /// its bytes, and a refused fit is not the rule's error: the scan goes on
+    /// below it.
+    #[test]
+    fn default_ctx_refused_plan_past_the_base_is_not_within() {
+        let card = plan(CARD, AT, 1, |_| 0);
+        let refused_past = |at: usize| {
+            let card = plan(CARD, AT, 1, |_| 0);
+            move |c: usize| {
+                if c > at {
+                    Err("refused".to_string())
+                } else {
+                    card(c)
+                }
+            }
+        };
+        // The margin holds through 5096; the card refuses past 4600.
+        let (got, _) = run(9000, STEP, MARGIN, refused_past(4600));
+        assert_eq!(
+            got.expect("a plan").ctx,
+            4352,
+            "4600 rounded down to a step"
+        );
+        // A refusal at the fit alone leaves the margin's answer.
+        let (got, _) = run(9000, STEP, MARGIN, refused_past(8999));
+        let want = run(9000, STEP, MARGIN, &card).0.expect("a plan");
+        assert_eq!(
+            got.expect("a plan"),
+            want,
+            "the fit's refusal is not within"
+        );
+        assert_eq!(want.ctx, 4864);
+    }
+
+    /// A whole-card load — every expert on the card, nothing on the NVMe tier,
+    /// at every context — is within a margin of none: the fit, after two
+    /// probes, however wide the range.
+    #[test]
+    fn default_ctx_whole_card_load_is_the_fit() {
+        for fit in [5000, 9000, 262_144] {
+            let (got, probes) = run(fit, STEP, 0, |_| {
+                Ok(ExpertBytes {
+                    card: CARD,
+                    nvme: 0,
+                })
+            });
+            let got = got.expect("a plan");
+            assert_eq!((got.ctx, got.rule), (fit, "margin"), "fit {fit}");
+            assert_eq!(probes, 2, "fit {fit}: the base and the fit");
+        }
+    }
+
+    /// NVMe expert bytes growing past the base's stop the default below the
+    /// context where they do, though the card's margin holds there: the
+    /// base's own NVMe bytes are what it keeps (no more than those, not
+    /// none), and bytes that stay or fall are within.
+    #[test]
+    fn default_ctx_stops_where_nvme_grows() {
+        let grows_past_6000 = |base: u64| move |c: usize| base + c.saturating_sub(6000) as u64 * 10;
+        // The margin never binds; the NVMe bytes grow at 6001 and the answer
+        // is the last multiple of 256 under it.
+        for base in [0, 500] {
+            let (got, probes) = run(
+                262_144,
+                STEP,
+                1 << 40,
+                plan(CARD, AT, 1, grows_past_6000(base)),
+            );
+            let got = got.expect("a plan");
+            assert_eq!((got.ctx, got.rule), (5888, "margin"), "base NVMe {base}");
+            assert_eq!(
+                (got.base.nvme, got.chosen.nvme),
+                (base, base),
+                "the base's NVMe bytes are the bound"
+            );
+            assert!(probes <= probe_bound(262_144, STEP), "{probes} probes");
+        }
+        // The same NVMe bytes at every context, or fewer, are within.
+        let (got, _) = run(9000, STEP, 1 << 40, plan(CARD, AT, 1, |_| 500));
+        assert_eq!(got.expect("a plan").ctx, 9000, "equal NVMe bytes");
+        let fewer = |c: usize| if c <= AT { 500 } else { 400 };
+        let (got, _) = run(9000, STEP, 1 << 40, plan(CARD, AT, 1, fewer));
+        assert_eq!(got.expect("a plan").ctx, 9000, "fewer NVMe bytes");
+    }
+
+    /// The base's own plan refused is the rule's error, by the card rule as by
+    /// the margin's, and nothing is probed past it.
+    #[test]
+    fn default_ctx_base_probe_error_is_returned() {
+        let card = plan(CARD, AT, 1, |_| 0);
+        let base_refused = |c: usize| {
+            if c == AT {
+                Err("no base".to_string())
+            } else {
+                card(c)
+            }
+        };
+        let (got, probes) = run(9000, STEP, MARGIN, base_refused);
+        assert_eq!((got, probes), (Err("no base".to_string()), 1));
+        let all_refused = |_: usize| Err::<ExpertBytes, _>("none".to_string());
+        let (got, probes) = run(3000, STEP, MARGIN, all_refused);
+        assert_eq!((got, probes), (Err("none".to_string()), 1), "the card rule");
+    }
+
+    /// A step of 0 is refused by name, not by the divide it would reach.
+    #[test]
+    #[should_panic(expected = "a context step of 0")]
+    fn default_ctx_step_of_zero_is_refused_by_name() {
+        let _ = run(9000, 0, MARGIN, plan(CARD, AT, 1, |_| 0));
+    }
+
+    /// The `ctx` line the seats print: its field names are what the gates
+    /// read, in this order — the margin rule's line (an example plan whose
+    /// card loses 48 KiB a position past the base, for a margin of 1 GiB) and
+    /// the card rule's.
+    #[test]
+    fn default_ctx_line_names_its_terms() {
+        let probe = plan(9_000_000_000, AT, 49_152, |_| 0);
+        let got = default_slot_ctx(262_144, AT, STEP, 1 << 30, &probe).expect("a plan");
+        assert_eq!(
+            got.line(2),
+            "ctx rule=margin ctx=25856 slots=2 total=51712 fit=262144 margin_ctx=25856 \
+             base=4096 base_card_expert_bytes=9000000000 base_nvme_expert_bytes=0 \
+             card_expert_bytes=7930452480 nvme_expert_bytes=0 lost_bytes=1069547520 \
+             margin_bytes=1073741824"
+        );
+        let got = default_slot_ctx(3000, AT, STEP, 1 << 30, &probe).expect("a plan");
+        assert_eq!(
+            got.line(1),
+            "ctx rule=card ctx=3000 slots=1 total=3000 fit=3000 margin_ctx=3000 base=3000 \
+             base_card_expert_bytes=9000000000 base_nvme_expert_bytes=0 \
+             card_expert_bytes=9000000000 nvme_expert_bytes=0 lost_bytes=0 \
+             margin_bytes=1073741824"
+        );
     }
 
     /// The grid search's rows: no trained context is no answer, a trained
