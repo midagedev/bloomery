@@ -24,6 +24,7 @@ use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::host::StepLeg;
+use crate::host::swap_source::ResidencyGlue;
 use crate::linear::LinearKernels;
 use crate::model::{
     ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, RowHeads, SlotRange, SlotRows,
@@ -655,6 +656,7 @@ impl GpuModel<Body> {
                     file: Arc::clone(&file),
                     host,
                     set,
+                    glue: ResidencyGlue::off(),
                     arch: "qwen3moe",
                     rows: MAX_PASS_ROWS,
                 };

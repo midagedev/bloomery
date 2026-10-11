@@ -68,6 +68,7 @@ use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, MediaRows, PromptImage};
 use super::placed::{
     BatchWalk, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans, placed_bytes,
+    tally_shape,
 };
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
@@ -81,17 +82,20 @@ use super::scratch::{
     RecStore, RopeRows, StepParams, Wants, param_view, put_input,
 };
 use super::slot_pass::SlotIn;
+use super::swap35;
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
 use crate::checkpoint::{self, Checkpoints};
 use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
+use crate::host::swap::Residency;
+use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
 use crate::media::{ImageSpan, MediaBody, SeqRope};
 use crate::model::{
-    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
+    ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
@@ -1240,16 +1244,19 @@ impl GpuModel<Body35> {
     /// `model::arch::qwen35moe::place::PlanInputs::plan_rule` under
     /// `model::arch::qwen3moe::place::card_routed` on the machine
     /// `model::arch::qwen3moe::place::machine` lays out): the plan's card
-    /// segments resident ([`GpuModel::load_placed`]: the trunk, the shared
-    /// experts, each layer's card experts) with each router joined with its
-    /// shared gate, the host set read in and locked as `host` asks, and the
-    /// body over them with its placed side ([`Placed`]), caches of `o.ctx`
-    /// rows — the plan's context — and the ubatch arena of the placed
+    /// segments resident ([`GpuModel::load_placed_with`]: the trunk, the
+    /// shared experts, each layer's card experts) with each router joined
+    /// with its shared gate, the host set read in and locked as `host` asks,
+    /// and the body over them with its placed side ([`Placed`]), caches of
+    /// `o.ctx` rows — the plan's context — and the ubatch arena of the placed
     /// ubatch ([`placed_open`]) held to the bytes the plan counts
     /// ([`GpuModel::placed_arena_bytes`]); the checkpoints' spacing
-    /// ([`checkpoint_every`]) is the one part that reads `o.ubatch`. Refused
-    /// by name as [`GpuModel::open`] refuses, for a plan of another context,
-    /// and as the placed side refuses ([`Placed::new`]).
+    /// ([`checkpoint_every`]) is the one part that reads `o.ubatch`. The load
+    /// runs no residency machine ([`Residency::Off`]): the plan's slot map is
+    /// the model's for its life. Refused by name as [`GpuModel::open`]
+    /// refuses, for a plan of another context, as the placed side refuses
+    /// ([`Placed::new`]), and as the family's stack table refuses a layer's
+    /// types ([`swap35::stacks`]).
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -1286,11 +1293,23 @@ impl GpuModel<Body35> {
             .ok_or(GpuError::shape(WHAT_P, "a plan of no card"))?;
         let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
         let specs = pre.layers.clone();
-        GpuModel::load_placed(
+        // `Residency::Off`: the load starts no machine, and its shape is the
+        // one a machine would take.
+        let (top_k, max_rows) = tally_shape(&pre.d)?;
+        let residency = ResidencySpec {
+            lever: Residency::Off,
+            delay: LIVE_DELAY,
+            deadline: DEADLINE,
+            top_k,
+            max_rows,
+            stacks: Arc::new(swap35::stacks(plan.model)?),
+        };
+        GpuModel::load_placed_with(
             file,
             plan,
             0,
             host,
+            residency,
             |stream, _, layers, w| {
                 for l in layers {
                     let spec = specs.get(l).ok_or_else(|| {
@@ -1300,16 +1319,23 @@ impl GpuModel<Body35> {
                 }
                 Ok(())
             },
-            |gpu, file, w, set| {
+            |gpu, file, w, set, glue| {
                 let open = PlacedOpen {
                     plan,
-                    file: Arc::new(file),
+                    file: Arc::clone(file),
                     host,
                     set,
+                    glue,
                     arch: "qwen35moe",
                     rows: PLACED_ROWS,
                 };
-                Body35::build(gpu, w, pre, o, asked, Some((open, counted)))
+                let mut body = Body35::build(gpu, w, pre, o, asked, Some((open, counted)))?;
+                // Last: the machine empties each layer's spare slots, and
+                // every piece above sized itself from the load's map.
+                if let Some(placed) = body.placed.as_mut() {
+                    placed.start_residency(gpu)?;
+                }
+                Ok(body)
             },
         )
     }

@@ -39,6 +39,8 @@ pub mod router;
 mod scratch;
 mod scratch38;
 mod slot_pass;
+mod swap;
+mod swap35;
 mod swap38;
 mod taps;
 mod taps35;
