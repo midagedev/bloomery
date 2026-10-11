@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Box: fetch the two BF16 projectors the Qwen image-input sets are dumped with, each at the repository revision named
-# here, into /models/mmproj, detached at idle IO priority and bounded at 1 h; then check each file's size and sha256
-# against the LFS oid of the revision's tree listing.
+# Box: fetch the BF16 projectors the image-input sets are dumped with (the two Qwen seats' and GLM-5.3-Flash's), each at the
+# repository revision named here, into /models/mmproj, detached at idle IO priority and bounded at 1 h; then check each file's
+# size and sha256 against the LFS oid of the revision's tree listing.
 #
 #   BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh 'bash tools/ref/qvis/mmproj-dl.sh'
 #   BLOOMERY_BOX_READONLY=1 tools/box.sh 'cat /models/mmproj/qvis-dl.rc; cat /models/mmproj/qvis-dl.log'
 #
 # The llama.cpp sibling rule (`find_best_sibling`) picks the BF16 file of each default `-hf` repository; the F16 copies
 # that are already under /models/mmproj stay. The lmstudio directory carries the organization, because unsloth's
-# repository of the same name holds its own files in /models/mmproj/Qwen3.6-35B-A3B-GGUF.
+# repository of the same name holds its own files in /models/mmproj/Qwen3.6-35B-A3B-GGUF; GLM's does for the same reason (the
+# F16 copy under /models/mmproj/GLM-5.3-Flash-GGUF stays, and the family pins the BF16 file).
 set -u
 D=/models/mmproj
 mkdir -p "$D"
@@ -18,6 +19,7 @@ rm -f "$D/qvis-dl.rc"
 SPECS=(
   "lmstudio-community/Qwen3.6-35B-A3B-GGUF 68a34855558af61cbef0324d31f411be8a506b08 mmproj-Qwen3.6-35B-A3B-BF16.gguf lmstudio-community--Qwen3.6-35B-A3B-GGUF 902822016 e5c205cec2fd28f66c3895e4040021ab994b860323c3db8531640305ff49b322"
   "unsloth/Qwen3.8-Flash-Next-GGUF 766911a6b7369840a91dbcd95f9f997acaab6cd6 mmproj-BF16.gguf Qwen3.8-Flash-Next-GGUF 907542944 2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
+  "unsloth/GLM-5.3-Flash-GGUF a38483c8cd5df544f53d70fb281afe97369d5ab6 mmproj-BF16.gguf unsloth--GLM-5.3-Flash-GGUF 1164010176 82b7adb44411dbb298b1c689567804e5ed0790d80f308ed8b5b6b8ac0527d2ac"
 )
 script=$(
   cat << 'EOF'
