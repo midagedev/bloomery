@@ -228,7 +228,7 @@ use bloomery_gpu_gates::bind::{
     SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
     put_back, slots_given,
 };
-use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
+use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
@@ -843,6 +843,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Ok(plan_place(p)?.tier_experts)
     })?;
     chosen.record().eprint();
+    // The lane's rate, taken before the plan reads the room (`lane_of`).
+    let lane = lane_at(chosen.place)?;
     let drafted = plan_place(chosen.place)?;
     // The unset draft's yield to the context (qwen38's module doc, the one
     // rule through `bloomery_levers::DraftYield`): the chosen placement's
@@ -965,6 +967,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let open = SeatArgs {
         place,
+        lane,
         tier_batch,
         ctx: rule.ctx,
         slots,
@@ -1020,6 +1023,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place,
+    /// The lane's rate probed before the plan, and the card it ran on: the
+    /// `lane` line beside the `load` line.
+    lane: Lane,
     /// The expert tier's prompt-batch bytes the plan reserves under a
     /// placement with a tier card.
     tier_batch: Option<TierBatchBytes>,
@@ -1105,6 +1111,7 @@ impl Glm {
             t,
             draft_off: a.draft_off.clone(),
             draft_bytes: a.draft_bytes,
+            lane: a.lane,
         };
         let prefill = a.cfg.prefill;
         let args = app::OpenArgs {
@@ -1261,6 +1268,9 @@ struct Log {
     draft_off: Option<String>,
     /// The plan's bytes for the NextN layer.
     draft_bytes: u64,
+    /// The lane's rate probed before the plan, and the card it ran on: the
+    /// `lane` line beside the `load` line.
+    lane: Lane,
 }
 
 impl OpenLog<Body> for Log {
@@ -1286,6 +1296,7 @@ impl OpenLog<Body> for Log {
             .w("shadow", "none")
             .u("shadow_bytes", 0)
             .u("unified_addressing", 0);
+        record::lane(self.lane.0, &self.lane.1).eprint();
         with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
             .map_err(app::SessionError::Caller)?
             .w("prefill", self.prefill.name())

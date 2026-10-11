@@ -221,8 +221,9 @@ mod cli {
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{
-        Diag, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table, dump_table,
-        place_table, read_table, repeat_runs, seed_path, slot_table, with_cards, write_table,
+        Diag, Lane, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table,
+        dump_table, lane_at, place_table, read_table, repeat_runs, seed_path, slot_table,
+        with_cards, write_table,
     };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
@@ -324,6 +325,9 @@ mod cli {
         /// The host bytes the load holds beside the plan's: the NextN
         /// layer's host experts on a drafted load, else 0.
         beside: u64,
+        /// The lane's rate probed before the plan, and the card it ran on:
+        /// the `lane` line beside the `load` line.
+        lane: Option<Lane>,
     }
 
     impl OpenLog<Body> for Log {
@@ -358,6 +362,9 @@ mod cli {
                 .w("shadow", "none")
                 .u("shadow_bytes", 0)
                 .u("unified_addressing", 0);
+            if let Some((card, rate)) = &self.lane {
+                record::lane(card, rate).print();
+            }
             with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
                 .map_err(SessionError::Caller)?
                 .w("prefill", self.prefill.name())
@@ -627,6 +634,12 @@ mod cli {
         )?;
         chosen.record().print();
         let placement = chosen.place;
+        // The lane's rate, taken before the plan reads the room (`lane_of`).
+        let lane = if has("--plan") {
+            None
+        } else {
+            Some(lane_at(placement)?)
+        };
         let place = placement.name();
         let tier_batch = glm_place::tier_batch(placement, &inputs.hp);
         let machine = glm_machine(placement, tier_batch, slots)?;
@@ -665,6 +678,7 @@ mod cli {
             t,
             residency,
             beside: 0,
+            lane,
         };
         // `--card-table`: the table the load is placed by, read here; a load
         // that runs the residency machine would move the experts it places.

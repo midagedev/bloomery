@@ -31,6 +31,7 @@ use bloomery_gpu::host::slots::{HOST, MAX_TIERS, SlotMap};
 use bloomery_gpu::host::swap::{CardTable, SwapMachine, TableCheck};
 use bloomery_gpu::host::tier::TierCard;
 use bloomery_gpu::host::{HostExperts, HostTier};
+use bloomery_gpu::lane;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -44,6 +45,24 @@ use tokenizer::Tokenizer;
 
 use crate::record::{self, Record};
 use crate::{GateError, ref_model_path};
+
+/// A load's lane line: the stage card's name and the rate [`lane_of`] took.
+pub type Lane = (&'static str, lane::LaneRate);
+
+/// The lane's rate on `stage`, taken before a plan reads the room it plans
+/// by: [`lane::probe_card`] drops its extents and its handle first. A load
+/// prints it beside its `load` record ([`record::lane`]).
+pub fn lane_of(stage: CardSpec) -> Result<Lane, GateError> {
+    Ok((
+        stage.name,
+        lane::probe_card(stage.name, stage.device, lane::PROBE_BYTES)?,
+    ))
+}
+
+/// The lane's rate on `place`'s stage card ([`lane_of`]).
+pub fn lane_at(place: Place) -> Result<Lane, GateError> {
+    lane_of(place.card_specs()?[0])
+}
 
 /// Which placement the engine loads by: a stage card that runs every layer
 /// and the head, then the expert tier cards beside the host tier. The flag
@@ -713,6 +732,8 @@ impl<B: ChainBody> Generator<B> {
         let path = ref_model_path()?;
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // The lane's rate, taken before the plan reads the room (`lane_of`).
+        let lane = lane_at(args.place)?;
         let machine = args.place.machine(None, args.tier_batch)?;
         let headers = t.elapsed();
         let mut model = open(file, &machine, args.ctx)?;
@@ -722,6 +743,7 @@ impl<B: ChainBody> Generator<B> {
             .u("ctx", args.ctx);
         let load = check(&model, load)?;
         let total = t.elapsed();
+        writeln!(log, "{}", record::lane(lane.0, &lane.1).line())?;
         let load = load
             .w("mode", mode_name(args.mode))
             .w("place", args.place.name())
