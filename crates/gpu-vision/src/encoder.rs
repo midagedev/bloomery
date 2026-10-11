@@ -543,7 +543,7 @@ impl Chain {
             },
         )?;
         tap(stream, taps, &name("w1"), &s.u, n, 2 * ff)?;
-        self.mlp.enqueue(stream, &s.u, ff, n, &mut s.act)?;
+        self.mlp.enqueue(stream, &s.u, ff, n, None, &mut s.act)?;
         tap(stream, taps, &name("act"), &s.act, n, ff)?;
         side(
             &self.gemm,

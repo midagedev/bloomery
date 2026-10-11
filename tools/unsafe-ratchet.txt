@@ -230,7 +230,10 @@ gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
 # write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,
 # vis_layer_norm 12, vis_gelu_tanh 2, vis_pos_bilinear 3.
-gpu-vision 86 0 0
+# PIN(2026-10-11): gpu-vision 86 -> 91 blocks, new code, not old code relaxed: the glm5v tower's three new kernel entries read
+# and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_head_rms_norm 2,
+# vis_silu_mul_clamp 2, vis_gelu_erf 1.
+gpu-vision 91 0 0
 hf 0 0 0
 jinja 0 0 0
 levers 0 0 0
