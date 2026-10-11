@@ -543,12 +543,20 @@ mod tests {
             .unwrap();
         assert_eq!(started.recv().unwrap(), 0);
         let queued = reader.submit(0, Job::new(2, |_| Ok(()))).unwrap();
-        // Releases the running unit from another thread once the stop is
-        // waiting on it.
+        // Releases the running unit from another thread once the stop has
+        // counted the open jobs: `stop` counts them before it sets the
+        // queue's flag, so a release seen after the flag cannot let the two
+        // jobs finish ahead of the count.
+        let shared = Arc::clone(&reader.shared);
         let (releaser, _) = threads::helper::spawn_helper(
             "test-release",
             threads::helper::Placement::Float,
-            move || release_tx.send(()).unwrap(),
+            move || {
+                while !shared.queue().stop {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                release_tx.send(()).unwrap();
+            },
         )
         .unwrap();
         let stopped = reader.stop(Duration::from_secs(10));
