@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--no-canary]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--no-canary] [--wait-hold [SECONDS]]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it)
@@ -198,7 +198,7 @@
 # gate-gpu-ds41-lib): the gates that turn red from a half-applied change in the first minutes — runs FIRST in its lane,
 # ahead of the lane's other items, and the first canary item that ends red (any rc but 0 or a round batch's yield) stops
 # the batch: the lanes and every running item are signalled as for INT/TERM, and the batch ends rc 1 with
-# `DONE total=<n> red=<n> canary=red <item>[,<item>] unrun=<n> wall=<s>s` (unrun: the items no line records, killed
+# `DONE total=<n> red=<n> tier=<t> canary=red <item>[,<item>] unrun=<n> wall=<s>s` (unrun: the items no line records, killed
 # or never started; a box process a killed item left behind is `just box-gc`'s). The canary items are the batch's own
 # items (one run, one times row, one ledger record each, a ledger skip passes at 0 s); the lanes and the balance are
 # unchanged, so a green stage costs nothing and no lane waits for the other's canary item. A canary item on a lane
@@ -239,10 +239,12 @@
 # ledger record. A plain card-lock rc 75 and the lead's --ledger batch keep today's retry.
 # DIR/run.log opens with `plan laneA=<s>s laneB=<s>s laneX=<s>s wall=<s>s
 # defaults=<n> …` (the predicted sums, derived from the times file), then gets `<recipe>[-<n>] rc=<n>
-# <s>s try=<t> lane=<A|B|X>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
-# times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> wall=<s>s laneA=<s>s laneB=<s>s`
-# (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). A fixture batch's deferred item has
-# its own line (`<item> rc=deferred <real-only|no-fixture|real-file> lane=- deferred=1`), counted in `total=` and in no other rc class; a
+# <s>s try=<t> lane=<A|B|X> tier=<real|fixture>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
+# times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> tier=<real|fixture> wall=<s>s laneA=<s>s laneB=<s>s`
+# (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). `tier=` is the tier the batch runs in
+# (--tier below), on every item line (a skip, a yield and a deferred item too) and on the DONE line of a red canary stop, so a report
+# that quotes a line names its tier. A fixture batch's deferred item has
+# its own line (`<item> rc=deferred <real-only|no-fixture|real-file> lane=- tier=fixture deferred=1`), counted in `total=` and in no other rc class; a
 # yielded item (`rc=yield`, above) is counted the same way, in `yielded=` when any did. Exit 0
 # iff every rc is 0 (or deferred, yielded, or a ledger skip). DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
@@ -253,12 +255,21 @@
 # Refuses to start while the timing lease (/root/bloomery-cpu.lock) or a hold
 # (/root/bloomery-<owner>-hold, other than BLOOMERY_HOLD_OWNER's) is up, naming what is up (exit 75);
 # a lease that cannot be tested is exit 70; no override. The check is tools/box.sh's own guard
-# (lease_guard, tools/ref/lease-probe.sh) with BLOOMERY_BOX_WAIT=0. Once the batch runs, every item's box.sh
+# (lease_guard, tools/ref/lease-probe.sh) with BLOOMERY_BOX_WAIT=0 — or, with --wait-hold, after the wait below. Once the batch runs, every item's box.sh
 # call passes that guard with its default wait: a sitting that takes the lease mid-batch gets a quiet
 # box — the item waits (up to 30 min, then rc 75, which retries below) and starts after the sitting.
 # The wait comes before the item's command, so the runners' 900 s bound does not count it; nor does the
 # item's times row: the final try's seconds less the waits its log names (box.sh's guard, gpu-gate.sh's card
-# lock and V4.1 load lock), which the item line prints as `waited=<s>s`. --dry-run validates, prints each item's lane, command and
+# lock and V4.1 load lock), which the item line prints as `waited=<s>s`.
+# --wait-hold [SECONDS] (default 3600) waits instead of refusing: before the batch's first box call (the ledger's manifest read
+# included) it polls the lease and the holds every 30 s, each poll a READONLY box.sh call that runs lease_guard with no wait of
+# its own (tools/ref/lease-probe.sh: lease_free, the shared-lock probe, and every hold but BLOOMERY_HOLD_OWNER's), so nothing is
+# synced under a sitting. Every busy poll prints a `[guard]` line with the elapsed time and the bound, then the guard's lines
+# naming what is up. A box that is quiet at the first poll starts the batch at once; after a wait it starts on the second quiet
+# poll in a row, as box.sh's own guard does (the lease is free for seconds between a sitting's runs). Still busy after SECONDS:
+# 75, as without the flag. A remote dir that is not there yet (66) takes one plain `box.sh true`, which syncs and makes it; a
+# lease that cannot be tested, or any other failure of the poll, is 70. No wait when no item runs on the box; --dry-run waits
+# for nothing and says so. --dry-run validates, prints each item's lane, command and
 # plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
 # neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
 #
@@ -379,6 +390,8 @@ SMOKE=(
 )
 TRIES_MAX=11
 RETRY_WAIT=30
+# --wait-hold's period between polls
+WAIT_POLL=30
 STEAL_WAIT=$RETRY_WAIT # a held timing lease: the steal's re-probe bound, waited in 1 s slices
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/ (tools/mac-check.sh), rounded up to a whole GiB
@@ -402,7 +415,7 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # BLOOMERY_PACK_BUDGET overrides it (bytes, a positive integer; the self-test's numbers).
 PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] | --classes | --self-test"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--wait-hold [SECONDS]] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -874,11 +887,12 @@ DF
     else pass "$name"; fi
   }
   local gb=(bash "$t/tools/gate-batch.sh")
-  # The rc 75 cases below run a copy of the fixture script whose retry wait is 1 s, not 30 — a sed of
-  # the one constant, the way gpu-gate.sh's --test-locks shrinks its bounds. No BLOOMERY_* name exists
+  # The rc 75 and --wait-hold cases below run a copy of the fixture script whose retry wait and poll period are 1 s, not 30 — a sed of
+  # the two constants, the way gpu-gate.sh's --test-locks shrinks its bounds. No BLOOMERY_* name exists
   # for it: every such name is a row of the lever registry (tools/check-levers.sh holds tools/ to it).
-  sed 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
+  sed -e 's/^RETRY_WAIT=30$/RETRY_WAIT=1/' -e 's/^WAIT_POLL=30$/WAIT_POLL=1/' "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-fast.sh"
   grep -q '^RETRY_WAIT=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-retry copy did not patch (RETRY_WAIT's line moved?)" >&2; return 70; }
+  grep -q '^WAIT_POLL=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-poll copy did not patch (WAIT_POLL's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
   check 'classes: an any-form v41-load recipe is a chain member over both cards' 0 \
     "^v41-any	C	chain	3090,a6000	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
@@ -960,6 +974,22 @@ case "$*" in
     [ -e "$st/lease-up" ] || exit 0
     echo '[guard] the fake lease is up' >&2
     exit 1 ;;
+  '. tools/ref/lease-probe.sh && lease_guard 0'*)
+    # --wait-hold's poll: busy (75, the guard's lines) for the first FAKE_BUSY_POLLS polls, then quiet. FAKE_NODIR=1: the remote
+    # dir is not there until a plain call has been made (66); FAKE_PROBE_RC: the lease cannot be tested.
+    if [ "${FAKE_NODIR:-0}" = 1 ] && [ ! -e "$st/dir-made" ]; then
+      echo 'box.sh: BLOOMERY_BOX_READONLY=1 runs the command in ~/repo/fake as it is and syncs nothing, and ws has no ~/repo/fake: nothing was synced there yet' >&2
+      exit 66
+    fi
+    echo "ro=${BLOOMERY_BOX_READONLY:-0} $*" >> "$st/waitprobe.log"
+    echo P >> "$st/seq.log"
+    if [ -n "${FAKE_PROBE_RC:-}" ]; then echo '[guard] the fake lease cannot be tested' >&2; exit "$FAKE_PROBE_RC"; fi
+    if [ "$(grep -c . "$st/waitprobe.log")" -le "${FAKE_BUSY_POLLS:-0}" ]; then
+      echo '[guard] fake: the box is busy and BLOOMERY_BOX_WAIT=0 does not wait: the command did not run (rc 75):' >&2
+      echo '[guard]   hold /fake/bloomery-sit-hold owner=sit up=0h00m05s since=1 — its owner passes with BLOOMERY_HOLD_OWNER' >&2
+      exit 75
+    fi
+    exit 0 ;;
   'bash tools/gpu-gate.sh --gpuhold '*)
     # The hold's writer: logged with the box.sh flags the batch passed, then the real script on the fixture, its hold file under
     # fake-state (--test-locks).
@@ -968,6 +998,7 @@ case "$*" in
     # shellcheck disable=SC2086 # the verb and the owner: two words
     exec bash tools/gpu-gate.sh --test-locks "$st" ${*#bash tools/gpu-gate.sh } ;;
 esac
+[ "${BLOOMERY_BOX_READONLY:-0}" = 1 ] || : > "$st/dir-made"
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
@@ -1544,7 +1575,7 @@ FP
   want_count 'board: one item event per item' "$bj" '"ev": "item"' 3
   want 'board: a run item event names the item, rc, seconds and lane' "$bj" '"ev": "item", "ts": "[^"]+", "name": "steal-fix", "rc": 0, "secs": [0-9]+, "lane": "A"'
   want 'board: the ledger skip is an item event with rc skip' "$bj" '"name": "v41-any", "rc": "skip", "secs": 0, "lane": "C"'
-  want 'board: the done event holds the DONE line'"'"'s fields' "$bj" '"ev": "done", "ts": "[^"]+", "total": 3, "red": 0, "skipped": 1, "wall": [0-9]+, "laneA": [0-9]+, "laneB": [0-9]+'
+  want 'board: the done event holds the DONE line'"'"'s fields' "$bj" '"ev": "done", "ts": "[^"]+", "total": 3, "red": 0, "tier": "real", "skipped": 1, "wall": [0-9]+, "laneA": [0-9]+, "laneB": [0-9]+'
   want_count 'board: the file holds the start, the three items and the done, nothing else' "$bj" '.' 5
   # Best effort: a regular file where the board directory would go. The batch's rc and lines are what they always were and the failure
   # costs one stderr line, not one per event.
@@ -1680,14 +1711,14 @@ FP
   want_row 'pack: the box-pick item ran' "$t/fake-state/box.log" '$2 ~ /gen_sa/'
   # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
   want_no_row 'pack: the box-pick item took no card env from the pack' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=/ && $2 ~ /gen_sa/'
-  want 'pack: the box-pick item'"'"'s line ends ledger=recorded' "$t/target/c-pk-pick/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X ledger=recorded( |$)'
+  want 'pack: the box-pick item'"'"'s line ends ledger=recorded' "$t/target/c-pk-pick/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X tier=real ledger=recorded( |$)'
   # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
   mutant_of pk-noguard 's|^      case " \$cards " in \*" \$card "\*) switch_candidate "\$i" "\$card" ;; esac$|      case $card in 3090 \| a6000) switch_candidate "$i" "$card" ;; esac # MUTANT pk-noguard|' '# MUTANT pk-noguard$'
   rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-noguard steal_case pk-pickm "sr-a6000@FAKE_SLEEP=2	B	a6000	2	$d" -- sr-a6000@FAKE_SLEEP=2)
   printf '%s' "$rc" > "$t/rc-pk-pickm"
   # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
   want_row 'pack mutant: without the guard the box-pick item takes a card env' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_sa/'
-  want 'pack mutant: … and its line ends ledger=changed' "$t/target/c-pk-pickm/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X ledger=changed( |$)'
+  want 'pack mutant: … and its line ends ledger=changed' "$t/target/c-pk-pickm/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X tier=real ledger=changed( |$)'
   # (5) the predicted line's laneX= is the pack's own wall (two fits beside each other, a pair over
   # the budget serial); the dry run names each item's simulated take.
   printf '%s\n' "pk-a	A	3090	5	$d" "pk-b	B	a6000	5	$d" > "$t/times-pkpred.tsv"
@@ -1860,8 +1891,8 @@ FP
   printf '%s' "$rc" > "$t/rc-tier-fx"
   rc_ok 'tier run: a fixture batch ends green' tier-fx 1
   want_row 'tier run: its box call carries BLOOMERY_TIER=fixture' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_b$/'
-  want 'tier run: its item line counts the deferred clauses' "$t/target/c-tier-fx/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] deferred=2 ledger=recorded item=steal-bal@FAKE_DEFER=2$'
-  want 'tier run: the DONE line totals them' "$t/target/c-tier-fx/run.log" '^DONE total=1 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2$'
+  want 'tier run: its item line counts the deferred clauses' "$t/target/c-tier-fx/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=fixture deferred=2 ledger=recorded item=steal-bal@FAKE_DEFER=2$'
+  want 'tier run: the DONE line totals them' "$t/target/c-tier-fx/run.log" '^DONE total=1 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2$'
   want 'tier run: the times row is an entry of its own' "$t/times-tier-fx.tsv" "$(printf '^steal-bal@FAKE_DEFER=2,BLOOMERY_TIER=fixture\t')"
   n=$((n + 1))
   if [ "$(grep -c . "$t/fake-state/keycalls.log")" -ge 2 ] && ! grep -qv 'BLOOMERY_TIER=fixture' "$t/fake-state/keycalls.log"; then echo 'ok tier run: the plan'"'"'s key call and the recheck both carry the tier'
@@ -1870,14 +1901,14 @@ FP
   rc=$(steal_case tier-f0 "steal-bal	B	a6000	10	$d" -- --tier fixture steal-bal)
   printf '%s' "$rc" > "$t/rc-tier-f0"
   rc_ok 'tier run: a fixture batch whose gates defer nothing ends green' tier-f0 1
-  want 'tier run: … its DONE line totals 0' "$t/target/c-tier-f0/run.log" '^DONE total=1 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=0$'
+  want 'tier run: … its DONE line totals 0' "$t/target/c-tier-f0/run.log" '^DONE total=1 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=0$'
   want_not 'tier run: … and its item line counts none' "$t/target/c-tier-f0/run.log" '^steal-bal .* deferred='
   rc=$(steal_case tier-re "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_DEFER=2')
   printf '%s' "$rc" > "$t/rc-tier-re"
   rc_ok 'tier run: the same item in the real tier ends green' tier-re 1
   want_no_row 'tier run: … and none of its calls names the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER/'
   want_not 'tier run: … and the DONE line counts no deferrals' "$t/target/c-tier-re/run.log" '^DONE .* deferred='
-  want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] deferred=2 ledger=recorded '
+  want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real deferred=2 ledger=recorded '
   # real-only (the header's paragraph): a no-op in the real tier, a deferral in the fixture tier, never a lane, a key or a call.
   check 'real-only: in the real tier the recipe is placed by its calls, as without the dependency' 0 \
     '^ro-any	F	balanced	3090,a6000	ro-any: real-only call; ro-any: gpu-gate.sh any' "${gb[@]}" --classes
@@ -1898,17 +1929,17 @@ FP
   rc=$(steal_case ro-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any 'steal-bal@FAKE_DEFER=2' ro-solo)
   printf '%s' "$rc" > "$t/rc-ro-fx"
   rc_ok 'real-only run: a fixture batch with two deferred items ends green' ro-fx 3
-  want 'real-only run: the deferred item has its own line' "$t/target/c-ro-fx/run.log" '^ro-any rc=deferred real-only lane=- deferred=1$'
-  want '  … a solo one too' "$t/target/c-ro-fx/run.log" '^ro-solo rc=deferred real-only lane=- deferred=1$'
+  want 'real-only run: the deferred item has its own line' "$t/target/c-ro-fx/run.log" '^ro-any rc=deferred real-only lane=- tier=fixture deferred=1$'
+  want '  … a solo one too' "$t/target/c-ro-fx/run.log" '^ro-solo rc=deferred real-only lane=- tier=fixture deferred=1$'
   want 'real-only run: the DONE line counts them in deferred= (with the clauses) and in real_only=' "$t/target/c-ro-fx/run.log" \
-    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=4 real_only=2 deferred_list=[^ ]*/deferred.list$'
+    '^DONE total=3 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=4 real_only=2 deferred_list=[^ ]*/deferred.list$'
   want_no_row 'real-only run: the batch never called a deferred recipe' "$t/fake-state/box.log" '$2 ~ /gen_ro$|gen_rs$/'
   want_no_row '  … and wrote no times row for it' "$t/times-ro-fx.tsv" '$1 ~ /^ro-/'
   want_not '  … nor a ledger record' "$t/rounds-ro-fx.tsv" '^[^	]*ro-(any|solo)'
   rc=$(steal_case ro-all "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any ro-solo)
   printf '%s' "$rc" > "$t/rc-ro-all"
   rc_ok 'real-only run: a batch of deferred items only ends green' ro-all 2
-  want 'real-only run: … its DONE line' "$t/target/c-ro-all/run.log" '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 real_only=2 deferred_list=[^ ]*/deferred.list$'
+  want 'real-only run: … its DONE line' "$t/target/c-ro-all/run.log" '^DONE total=2 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 real_only=2 deferred_list=[^ ]*/deferred.list$'
   want 'real-only run: … says nothing ran on the box' "$t/out-ro-all.log" '^gate-batch: every item is deferred to the real tier — nothing runs on the box, so no lease check$'
   want_no_row 'real-only run: … and made no box call at all' "$t/fake-state/box.log" '1'
   rc=$(steal_case ro-real "steal-bal	B	a6000	10	$d" -- ro-any)
@@ -1937,10 +1968,10 @@ FP
   rc=$(steal_case nf-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any x-glm steal-bal)
   printf '%s' "$rc" > "$t/rc-nf-fx"
   rc_ok 'no-fixture run: a fixture batch with a real-only and a no-fixture item ends green' nf-fx 3
-  want 'no-fixture run: the family item has its own line' "$t/target/c-nf-fx/run.log" '^x-glm rc=deferred no-fixture lane=- deferred=1$'
-  want '  … beside the real-only one' "$t/target/c-nf-fx/run.log" '^ro-any rc=deferred real-only lane=- deferred=1$'
+  want 'no-fixture run: the family item has its own line' "$t/target/c-nf-fx/run.log" '^x-glm rc=deferred no-fixture lane=- tier=fixture deferred=1$'
+  want '  … beside the real-only one' "$t/target/c-nf-fx/run.log" '^ro-any rc=deferred real-only lane=- tier=fixture deferred=1$'
   want 'no-fixture run: the DONE line counts both kinds and names the list' "$t/target/c-nf-fx/run.log" \
-    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 real_only=1 no_fixture=1 deferred_list=[^ ]*/c-nf-fx/deferred.list$'
+    '^DONE total=3 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 real_only=1 no_fixture=1 deferred_list=[^ ]*/c-nf-fx/deferred.list$'
   want_no_row 'no-fixture run: the batch never called either recipe' "$t/fake-state/box.log" '$2 ~ /gen_ro$|xg$/'
   n=$((n + 1))
   if [ "$(grep -v '^#' "$t/target/c-nf-fx/deferred.list" | paste -sd, -)" = 'ro-any,x-glm' ] && grep -q '^# real-only: ' "$t/target/c-nf-fx/deferred.list" \
@@ -1986,9 +2017,9 @@ FP
   rc=$(steal_case vr-real "steal-bal	B	a6000	10	$d" -- 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt' steal-bal)
   printf '%s' "$rc" > "$t/rc-vr-real"
   rc_ok 'variant run: a real batch with a variant item ends green' vr-real 2
-  want 'variant run: the item has its own line' "$t/target/c-vr-real/run.log" '^vr-q rc=deferred variant lane=- deferred=1 item=vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
+  want 'variant run: the item has its own line' "$t/target/c-vr-real/run.log" '^vr-q rc=deferred variant lane=- tier=real deferred=1 item=vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
   want 'variant run: the DONE line counts it and names the list' "$t/target/c-vr-real/run.log" \
-    '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 variant=1 deferred_list=[^ ]*/c-vr-real/deferred.list$'
+    '^DONE total=2 red=0 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 variant=1 deferred_list=[^ ]*/c-vr-real/deferred.list$'
   want_no_row 'variant run: the batch never called the recipe' "$t/fake-state/box.log" '$2 ~ /gen_vq$/'
   want 'variant run: DIR/deferred.list holds the item text, with its comment' "$t/target/c-vr-real/deferred.list" '^vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
   want '  … and the comment of its kind' "$t/target/c-vr-real/deferred.list" '^# variant: '
@@ -2015,7 +2046,7 @@ FP
   rc=$(steal_case vr-chain "steal-bal	B	a6000	10	$d" -- 'v41-any@BLOOMERY_FIXTURE_VARIANT=vt5' steal-bal)
   printf '%s' "$rc" > "$t/rc-vr-chain"
   rc_ok 'variant chain: a real batch of the variant item and a plain one ends green' vr-chain 2
-  want 'variant chain: the variant item is deferred, in no lane' "$t/target/c-vr-chain/run.log" '^v41-any rc=deferred variant lane=- deferred=1 item=v41-any@BLOOMERY_FIXTURE_VARIANT=vt5$'
+  want 'variant chain: the variant item is deferred, in no lane' "$t/target/c-vr-chain/run.log" '^v41-any rc=deferred variant lane=- tier=real deferred=1 item=v41-any@BLOOMERY_FIXTURE_VARIANT=vt5$'
   want 'variant chain: the plain item ran in lane B' "$t/target/c-vr-chain/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=B( |$)'
   want_absent 'variant chain: it fed no lane, so lane A never started' "$t/target/c-vr-chain/lane-A.pid"
   want 'variant chain: the DONE line carries laneA=0s' "$t/target/c-vr-chain/run.log" '^DONE total=2 red=0 .* laneA=0s .*variant=1( |$)'
@@ -2075,10 +2106,10 @@ FP
   rc=$(steal_case rf-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any x-glm rf-def steal-bal)
   printf '%s' "$rc" > "$t/rc-rf-fx"
   rc_ok 'real-file run: a fixture batch with a real-file item beside the other kinds ends green' rf-fx 4
-  want 'real-file run: the item has its own line' "$t/target/c-rf-fx/run.log" '^rf-def rc=deferred real-file lane=- deferred=1$'
-  want '  … beside the other two kinds' "$t/target/c-rf-fx/run.log" '^x-glm rc=deferred no-fixture lane=- deferred=1$'
+  want 'real-file run: the item has its own line' "$t/target/c-rf-fx/run.log" '^rf-def rc=deferred real-file lane=- tier=fixture deferred=1$'
+  want '  … beside the other two kinds' "$t/target/c-rf-fx/run.log" '^x-glm rc=deferred no-fixture lane=- tier=fixture deferred=1$'
   want 'real-file run: the DONE line counts it in deferred= and in real_file=' "$t/target/c-rf-fx/run.log" \
-    '^DONE total=4 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=3 real_only=1 no_fixture=1 real_file=1 deferred_list=[^ ]*/c-rf-fx/deferred.list$'
+    '^DONE total=4 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=3 real_only=1 no_fixture=1 real_file=1 deferred_list=[^ ]*/c-rf-fx/deferred.list$'
   want_no_row 'real-file run: the batch never called the recipe' "$t/fake-state/box.log" '$2 ~ /gen_rd$/'
   want_no_row '  … and wrote no times row for it' "$t/times-rf-fx.tsv" '$1 ~ /^rf-/'
   want_not '  … nor a ledger record' "$t/rounds-rf-fx.tsv" '^[^	]*rf-def'
@@ -2096,7 +2127,7 @@ FP
   rc=$(steal_case rf-only "steal-bal	B	a6000	10	$d" -- --tier fixture rf-def rf-q3)
   printf '%s' "$rc" > "$t/rc-rf-only"
   want 'real-file run: a batch of real-file items only: its DONE line' "$t/target/c-rf-only/run.log" \
-    '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 real_file=2 deferred_list=[^ ]*/c-rf-only/deferred.list$'
+    '^DONE total=2 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 real_file=2 deferred_list=[^ ]*/c-rf-only/deferred.list$'
   want_not '  … has no other kind in it' "$t/target/c-rf-only/run.log" '^DONE .*(real_only|no_fixture)='
   want_no_row '  … and made no box call at all' "$t/fake-state/box.log" '1'
   check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
@@ -2367,18 +2398,18 @@ IG
   printf '%s' "$rc" > "$t/rc-yield-hold"
   rc_ok 'yield: a round batch with a hold-blocked item ends green (not red)' yield-hold 2
   want 'yield: the item ends rc=yield naming the hold'"'"'s owner, not retried' "$t/target/c-yield-hold/run.log" \
-    "^plain-any rc=yield held by leadbatch: not retried \(a round batch yields to the lead's hold\) [0-9]+s try=1 lane=[AB] ledger=yield item=plain-any@FAKE_HOLD75=leadbatch$"
-  want 'yield: the DONE line counts it in yielded=' "$t/target/c-yield-hold/run.log" '^DONE total=2 red=0 skipped=0 yielded=1 wall=[0-9]+s'
+    "^plain-any rc=yield held by leadbatch: not retried \(a round batch yields to the lead's hold\) [0-9]+s try=1 lane=[AB] tier=real ledger=yield item=plain-any@FAKE_HOLD75=leadbatch$"
+  want 'yield: the DONE line counts it in yielded=' "$t/target/c-yield-hold/run.log" '^DONE total=2 red=0 tier=real skipped=0 yielded=1 wall=[0-9]+s'
   want_row 'yield: one call, then no retry — it never starts in a gap the lead leaves' "$t/fake-state/box.log" \
     '$1 ~ /FAKE_HOLD75=leadbatch/ { c++ } END { if (c == 1) print c }'
-  want '  … and the lane moved on to its next item' "$t/target/c-yield-hold/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] ledger=recorded( |$)'
+  want '  … and the lane moved on to its next item' "$t/target/c-yield-hold/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real ledger=recorded( |$)'
   want_not 'yield: no rc 75 line for it' "$t/target/c-yield-hold/run.log" ' rc=75 '
   want_not 'yield: and no ledger record' "$t/rounds-yield-hold.tsv" 'plain-any'
   want_no_row 'yield: no times row for a yielded item' "$t/times-yield-hold.tsv" '$1 ~ /^plain-any@FAKE_HOLD75/' # the seeded plain-any row is the plan's input
   rc=$(GBFAST=1 steal_case yield-card "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_CARD75=1')
   printf '%s' "$rc" > "$t/rc-yield-card"
   if [ "$(cat "$t/rc-yield-card")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yield-card/run.log" \
-    && grep -Eq '^DONE total=1 red=1 skipped=0 wall=[0-9]+s' "$t/out-yield-card.log"; then
+    && grep -Eq '^DONE total=1 red=1 tier=real skipped=0 wall=[0-9]+s' "$t/out-yield-card.log"; then
     pass 'yield: a plain card-lock rc 75 keeps today'"'"'s retry (try=11, red)'
   else fail 'yield: a plain card-lock rc 75 keeps today'"'"'s retry (try=11, red)' "rc=$(cat "$t/rc-yield-card") $(tail -1 "$t/out-yield-card.log")"; fi
   rc=$(GBFAST=1 LFLAG=--ledger steal_case yield-lead "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_HOLD75=leadbatch')
@@ -2503,7 +2534,7 @@ IG
   rc=$(steal_case cn-red "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any@FAKE_SLEEP=6	B	a6000	6	$d" -- 'cn-red@FAKE_RC=1' 'plain-any@FAKE_SLEEP=6')
   printf '%s' "$rc" > "$t/rc-cn-red"
   if [ "$rc" = 1 ]; then pass 'canary: a red canary item ends the batch rc 1'; else fail 'canary: a red canary item ends the batch rc 1' "rc=$rc"; fi
-  want 'canary: the DONE line names the canary item and the unrun count' "$t/target/c-cn-red/run.log" '^DONE total=2 red=1 canary=red cn-red unrun=1 wall=[0-9]+s$'
+  want 'canary: the DONE line names the canary item and the unrun count' "$t/target/c-cn-red/run.log" '^DONE total=2 red=1 tier=real canary=red cn-red unrun=1 wall=[0-9]+s$'
   want_not 'canary: the other lane'"'"'s item recorded nothing' "$t/target/c-cn-red/run.log" '^plain-any rc='
   want 'canary: the red item is named on stdout' "$t/out-cn-red.log" '^red: cn-red  '
   # Without the hook (a mutant) the same batch runs the other item to its end: the case above sees the stage, not the clock.
@@ -2516,7 +2547,7 @@ IG
   rc=$(steal_case cn-off "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any@FAKE_SLEEP=2	B	a6000	2	$d" -- --no-canary 'cn-red@FAKE_RC=1' 'plain-any@FAKE_SLEEP=2')
   printf '%s' "$rc" > "$t/rc-cn-off"
   if [ "$rc" = 1 ]; then pass 'canary: --no-canary leaves a red canary item an ordinary red (rc 1)'; else fail 'canary: --no-canary leaves a red canary item an ordinary red (rc 1)' "rc=$rc"; fi
-  want 'canary: --no-canary: both items record, the DONE line has no canary token' "$t/target/c-cn-off/run.log" '^DONE total=2 red=1 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s$'
+  want 'canary: --no-canary: both items record, the DONE line has no canary token' "$t/target/c-cn-off/run.log" '^DONE total=2 red=1 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s$'
   want 'canary: --no-canary: the other lane'"'"'s item ran' "$t/target/c-cn-off/run.log" '^plain-any rc=0 '
   # A green stage costs nothing: one lane (--lanes 1) runs the canary item first although the balance would not, and the DONE line is
   # the unchanged green one.
@@ -2524,12 +2555,71 @@ IG
   printf '%s' "$rc" > "$t/rc-cn-green"
   rc_ok 'canary: a green stage ends green' cn-green 2
   want_row 'canary: … the canary item ran first' "$t/fake-state/box.log" '$2 ~ /gate\.sh/ { if (++c == 1 && $2 ~ /gate\.sh -p co$/) print "first" }'
-  want 'canary: … and the DONE line carries no canary token' "$t/target/c-cn-green/run.log" '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=0s$'
+  want 'canary: … and the DONE line carries no canary token' "$t/target/c-cn-green/run.log" '^DONE total=2 red=0 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=0s$'
   # A canary item the ledger skips passes at 0 s and stops nothing.
   rc=$(FAKE_SKIP=1 steal_case cn-skip "cn-red@FAKE_RC=1	A	3090	2	$d" "plain-any	B	a6000	6	$d" -- 'cn-red@FAKE_RC=1' plain-any)
   printf '%s' "$rc" > "$t/rc-cn-skip"
   rc_ok 'canary: a canary item the ledger skips ends the batch green' cn-skip 2
   want 'canary: … and the run says no canary item runs' "$t/out-cn-skip.log" '^gate-batch: canary stage: none — no item of the list that runs'
+  # tier= (the header): each item's line in run.log and the DONE line name the tier the batch ran in.
+  rc=$(steal_case tr-real "steal-bal	B	a6000	10	$d" -- steal-bal)
+  printf '%s' "$rc" > "$t/rc-tr-real"
+  rc_ok 'tier=: a real-tier batch ends green' tr-real 1
+  want 'tier=: its item line says tier=real, behind lane=' "$t/target/c-tr-real/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real( |$)'
+  want 'tier=: its DONE line says tier=real, behind red=' "$t/target/c-tr-real/run.log" '^DONE total=1 red=0 tier=real skipped=0 wall='
+  rc=$(steal_case tr-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ro-any steal-bal)
+  printf '%s' "$rc" > "$t/rc-tr-fx"
+  rc_ok 'tier=: a fixture batch with a deferred item ends green' tr-fx 2
+  want 'tier=: … its item line says tier=fixture' "$t/target/c-tr-fx/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=fixture( |$)'
+  want 'tier=: … the deferred item'"'"'s line says tier=fixture' "$t/target/c-tr-fx/run.log" '^ro-any rc=deferred real-only lane=- tier=fixture deferred=1$'
+  want 'tier=: … its DONE line says tier=fixture' "$t/target/c-tr-fx/run.log" '^DONE total=2 red=0 tier=fixture skipped=0 wall='
+  rc=$(FAKE_SKIP=1 steal_case tr-skip "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-tr-skip"
+  rc_ok 'tier=: a batch whose item the ledger skips ends green' tr-skip 1
+  want 'tier=: … the skip line says tier=real, behind lane=' "$t/target/c-tr-skip/run.log" '^plain-any rc=skip .* lane=[AB] tier=real( |$)'
+  # --wait-hold (the header). The fake answers the poll (`lease_guard 0`, a READONLY call) busy for the first FAKE_BUSY_POLLS polls and
+  # quiet after; the fast copy polls every second. The dry run touches no box.
+  check 'wait-hold: bare it takes the default bound and leaves the next word to the items' 0 '^gate-batch: --wait-hold: a real run waits up to 3600 s' \
+    "${gb[@]}" --dry-run --wait-hold plain-any
+  check 'wait-hold: a number after it is the bound' 0 '^gate-batch: --wait-hold: a real run waits up to 90 s' "${gb[@]}" --dry-run --wait-hold 90 plain-any
+  check 'wait-hold: … and the item beside it is still planned' 0 '^lane [AB]  plain-any ' "${gb[@]}" --dry-run plain-any --wait-hold 90
+  if "${gb[@]}" --dry-run plain-any 2>&1 | grep -q -- '--wait-hold'; then fail 'wait-hold: without the flag a dry run says nothing of it' "a line names it"
+  else pass 'wait-hold: without the flag a dry run says nothing of it'; fi
+  rc=$(FAKE_BUSY_POLLS=2 GBFAST=1 steal_case wh-ok "plain-any	B	a6000	10	$d" -- --wait-hold 30 plain-any)
+  printf '%s' "$rc" > "$t/rc-wh-ok"
+  rc_ok 'wait-hold: a batch that meets a busy box waits, then ends green' wh-ok 1
+  want 'wait-hold: … naming what is up at a busy poll, in the guard'"'"'s style' "$t/out-wh-ok.log" '^\[guard\]   hold /fake/bloomery-sit-hold owner=sit'
+  want 'wait-hold: … a line for each poll' "$t/out-wh-ok.log" '^\[guard\] [^ ]+ --wait-hold: poll 2, busy after [0-9]+ s \(bound 30 s, polling every 1 s\):$'
+  want 'wait-hold: … starting on the second quiet poll in a row' "$t/out-wh-ok.log" '^\[guard\] [^ ]+ --wait-hold: quiet on two polls in a row after [0-9]+ s: the batch starts$'
+  if [ "$(grep -c . "$t/fake-state/waitprobe.log")" = 4 ]; then pass 'wait-hold: … on the fourth poll: two busy, two quiet'
+  else fail 'wait-hold: … on the fourth poll: two busy, two quiet' "$(grep -c . "$t/fake-state/waitprobe.log") polls"; fi
+  want 'wait-hold: … each a READONLY call (no sync under a sitting)' "$t/fake-state/waitprobe.log" '^ro=1 '
+  n=$((n + 1))
+  if awk '/^P$/ { lastp = NR } /^S python3 tools\/recipes\.py box-manifest/ && !first { first = NR } END { exit !(lastp && first && lastp < first) }' "$t/fake-state/seq.log"; then
+    echo 'ok wait-hold: … every poll came before the first box call of the batch (the ledger'"'"'s manifest read)'
+  else bad=$((bad + 1)); echo "FAIL wait-hold: a poll came after the manifest read: $(tr '\n' ' ' < "$t/fake-state/seq.log")"; fi
+  rc=$(GBFAST=1 steal_case wh-now "plain-any	B	a6000	10	$d" -- --wait-hold 30 plain-any)
+  printf '%s' "$rc" > "$t/rc-wh-now"
+  rc_ok 'wait-hold: an idle box ends green' wh-now 1
+  if [ "$(grep -c . "$t/fake-state/waitprobe.log")" = 1 ]; then pass 'wait-hold: … after one poll, no wait'
+  else fail 'wait-hold: … after one poll, no wait' "$(grep -c . "$t/fake-state/waitprobe.log" 2>&1) polls"; fi
+  want_not 'wait-hold: … and prints no wait line' "$t/out-wh-now.log" '--wait-hold'
+  rc=$(FAKE_BUSY_POLLS=999 GBFAST=1 steal_case wh-to "plain-any	B	a6000	10	$d" -- --wait-hold 5 plain-any)
+  if [ "$rc" = 75 ]; then pass 'wait-hold: still busy at the bound: rc 75'; else fail 'wait-hold: still busy at the bound: rc 75' "rc=$rc"; fi
+  want 'wait-hold: … naming the bound and that nothing started' "$t/out-wh-to.log" '^gate-batch: the timing lease or a hold was still up after [0-9]+ s \(--wait-hold 5\) — a batch'"'"'s builds contaminate a sitting; not starting$'
+  if [ "$(grep -c . "$t/fake-state/waitprobe.log")" -ge 2 ] && [ ! -e "$t/target/c-wh-to/run.log" ]; then pass 'wait-hold: … after polling more than once, with no run.log'
+  else fail 'wait-hold: … after polling more than once, with no run.log' "$(grep -c . "$t/fake-state/waitprobe.log" 2>&1) polls"; fi
+  rc=$(FAKE_BUSY_POLLS=999 steal_case wh-off "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-wh-off"
+  rc_ok 'wait-hold: without the flag the start check is unchanged and ends green' wh-off 1
+  if [ ! -e "$t/fake-state/waitprobe.log" ]; then pass 'wait-hold: … and made no poll'; else fail 'wait-hold: … and made no poll' "$(cat "$t/fake-state/waitprobe.log")"; fi
+  rc=$(FAKE_NODIR=1 GBFAST=1 steal_case wh-nodir "plain-any	B	a6000	10	$d" -- --wait-hold 30 plain-any)
+  printf '%s' "$rc" > "$t/rc-wh-nodir"
+  rc_ok 'wait-hold: a remote dir that is not there yet (66) takes the plain call, and the batch ends green' wh-nodir 1
+  if [ "$(head -1 "$t/fake-state/seq.log")" = 'S true' ]; then pass 'wait-hold: … the plain call was the first box call'; else fail 'wait-hold: … the plain call was the first box call' "$(head -1 "$t/fake-state/seq.log")"; fi
+  rc=$(FAKE_PROBE_RC=70 GBFAST=1 steal_case wh-70 "plain-any	B	a6000	10	$d" -- --wait-hold 30 plain-any)
+  if [ "$rc" = 70 ]; then pass 'wait-hold: a lease that cannot be tested: rc 70'; else fail 'wait-hold: a lease that cannot be tested: rc 70' "rc=$rc"; fi
+  want 'wait-hold: … named' "$t/out-wh-70.log" '^gate-batch: the wait probe through box.sh failed \(rc 70; '
   echo "gate-batch self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -2540,7 +2630,7 @@ if [ "${1:-}" = --self-test ]; then
   self_test
   exit $?
 fi
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0
+OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
 CANARY=1
 ITEMS=()
 while [ $# -gt 0 ]; do
@@ -2561,6 +2651,11 @@ while [ $# -gt 0 ]; do
     --rerun) RERUN=1; shift ;;
     --over-budget-ok) BUDGET_OK=1; shift ;;
     --no-canary) CANARY=0; shift ;;
+    --wait-hold) WAIT_HOLD=3600
+      # an optional bound: the next word when it is whole seconds (an item is a recipe name, never a number)
+      if [ $# -ge 2 ]; then
+        case "$2" in '' | *[!0-9]*) shift ;; *) WAIT_HOLD=$2; shift 2 ;; esac
+      else shift; fi ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
     --tier) [ $# -ge 2 ] || die "--tier needs real or fixture; $USAGE"
@@ -4193,6 +4288,57 @@ ALSO_READ=''
 if [ "$LMODE" = round ] || [ "$TRUST" = 1 ]; then ALSO_READ=$ROUND_LEDGER; fi
 LEDGER_PARTS=$LEDGER_FILE.parts
 
+# --wait-hold's wait (the header). A poll is box.sh's guard with no wait of its own — lease_guard 0, tools/ref/lease-probe.sh's one
+# check of the timing lease and of every hold but BLOOMERY_HOLD_OWNER's — as a READONLY call, so a poll syncs nothing under a sitting.
+# Its output is WAIT_OUT, its code 0 quiet, 75 busy, 70 a lease that cannot be tested. A remote dir that is not there yet (66) takes
+# the plain call the start check makes, which syncs and makes it.
+wait_probe() {
+  local rc=0
+  WAIT_OUT=$(BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" ". tools/ref/lease-probe.sh && lease_guard 0${BLOOMERY_HOLD_OWNER:+ $BLOOMERY_HOLD_OWNER}" 2>&1) || rc=$?
+  if [ "$rc" = 66 ]; then
+    rc=0
+    WAIT_OUT=$(BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" true 2>&1) || rc=$?
+  fi
+  return "$rc"
+}
+
+wait_hold() { # $1 = the bound in seconds: returns when the box is quiet (first look, or two polls in a row after a wait); 75 at the bound
+  local bound=$1 t0 el quiet=0 waited=0 n=0 rc s
+  t0=$(date +%s)
+  while :; do
+    n=$((n + 1))
+    rc=0
+    wait_probe || rc=$?
+    el=$(($(date +%s) - t0))
+    case $rc in
+      0)
+        [ "$waited" = 1 ] || return 0
+        quiet=$((quiet + 1))
+        if [ "$quiet" -ge 2 ]; then
+          echo "[guard] $(date -u +%Y-%m-%dT%H:%M:%SZ) --wait-hold: quiet on two polls in a row after ${el} s: the batch starts" >&2
+          return 0
+        fi
+        echo "[guard] $(date -u +%Y-%m-%dT%H:%M:%SZ) --wait-hold: poll $n, quiet (1 of 2 in a row): polling once more" >&2
+        s=$WAIT_POLL
+        ;;
+      75)
+        quiet=0 waited=1
+        echo "[guard] $(date -u +%Y-%m-%dT%H:%M:%SZ) --wait-hold: poll $n, busy after ${el} s (bound ${bound} s, polling every ${WAIT_POLL} s):" >&2
+        # lease_guard 0 words its first line for a command that is not waiting; the lines naming what is up are the point here
+        printf '%s\n' "$WAIT_OUT" | grep -v 'does not wait: the command did not run' >&2 || true
+        [ "$el" -lt "$bound" ] || RC=75 die "the timing lease or a hold was still up after ${el} s (--wait-hold ${bound}) — a batch's builds contaminate a sitting; not starting"
+        s=$((bound - el))
+        [ "$s" -lt "$WAIT_POLL" ] || s=$WAIT_POLL
+        ;;
+      *)
+        printf '%s\n' "$WAIT_OUT" >&2
+        RC=70 die "the wait probe through box.sh failed (rc $rc; 70 from the guard: the lease cannot be tested)"
+        ;;
+    esac
+    sleep "$s"
+  done
+}
+
 ledger_plan() { # the box manifest, then every candidate's key and status (C_*), before the lease check
   local m=$1/box-manifest.txt merr='' rc=0 try i key item status detail kargs=()
   for try in 1 2; do
@@ -4285,6 +4431,15 @@ if [ "$DRY" = 0 ]; then
   [ ! -e "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
 fi
 RUNLOG=$OUT/run.log
+
+# --wait-hold (the header): before the first box call of the batch, the ledger's manifest read among them.
+if [ -n "$WAIT_HOLD" ] && [ "$DRY" = 0 ]; then
+  if [ "$N" -gt 0 ]; then
+    wait_hold "$WAIT_HOLD"
+  else
+    echo "gate-batch: --wait-hold: every item is deferred to the other tier — nothing runs on the box, so no wait"
+  fi
+fi
 
 SKIP_N=0
 if [ "$LEDGER" = 1 ]; then
@@ -4438,7 +4593,7 @@ canary_done() { # a canary item ended red (DIR/canary.red names it): the batch's
   recorded=$(grep -c ' rc=' "$RUNLOG" || true)
   red=$(grep ' rc=' "$RUNLOG" | grep -v ' rc=0 ' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | grep -vc ' rc=yield ' || true)
   unrun=$((NT - recorded))
-  line="DONE total=$NT red=$red canary=red $stems unrun=$unrun wall=$(($(date +%s) - T0))s"
+  line="DONE total=$NT red=$red tier=$TIER canary=red $stems unrun=$unrun wall=$(($(date +%s) - T0))s"
   echo "$line" >> "$RUNLOG"
   echo "$line"
   grep ' rc=' "$RUNLOG" | grep -v ' rc=0 ' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | grep -v ' rc=yield ' |
@@ -4507,6 +4662,7 @@ if [ "$DRY" = 1 ]; then
   done
   predicted
   hold_say
+  [ -z "$WAIT_HOLD" ] || echo "gate-batch: --wait-hold: a real run waits up to ${WAIT_HOLD} s, polling every ${WAIT_POLL} s, for the timing lease and the holds to drop before its first box call; this dry run touches no box"
   exit 0
 fi
 
@@ -4557,7 +4713,7 @@ canary_say
 MAIN_PID=$$ # canary_red signals this shell from a lane's subshell
 predicted
 for ((i = 0; i < ND; i++)); do # a deferred item is recorded at once: the batch never calls it (nothing to time, key or claim)
-  line="${DP_STEM[$i]} rc=deferred ${DP_KIND[$i]} lane=- deferred=1"
+  line="${DP_STEM[$i]} rc=deferred ${DP_KIND[$i]} lane=- tier=$TIER deferred=1"
   [ -z "${DP_ITEM[$i]}" ] || line="$line item=${DP_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
   board_event item name="${DP_STEM[$i]}" rc=deferred secs=0 lane=-
@@ -4630,10 +4786,10 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   s=$(($(date +%s) - t0))
   if [ -n "$yowner" ]; then
     rcl=yield
-    line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lane"
+    line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lane tier=$TIER"
   else
     rcl=$rc
-    line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane"
+    line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane tier=$TIER"
   fi
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
   ran=$((ran > waits ? ran - waits : 0))
@@ -4669,7 +4825,7 @@ canary_red() { # $1 = plan index, $2 = rc: tell the main shell, then wait to be 
 
 skip_item() { # $1 = plan index, $2 = lane label: the ledger holds a green run of these inputs
   local i=$1 line
-  line="${P_STEM[$i]} rc=skip ${P_LDET[$i]% tree=*} lane=$2"
+  line="${P_STEM[$i]} rc=skip ${P_LDET[$i]% tree=*} lane=$2 tier=$TIER"
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
   board_event item name="${P_STEM[$i]}" rc=skip secs=0 lane="$2"
@@ -5151,7 +5307,7 @@ skipped=$(grep -c ' rc=skip ' "$RUNLOG" || true)
 yielded=$(grep -c ' rc=yield ' "$RUNLOG" || true)
 red=$((NT - green - skipped - yielded - ND))
 lane_s() { if [ -f "$OUT/lane-$1.s" ]; then cat "$OUT/lane-$1.s"; else echo 0; fi; }
-done_line="DONE total=$NT red=$red"
+done_line="DONE total=$NT red=$red tier=$TIER"
 [ "$LEDGER" = 0 ] || done_line="$done_line skipped=$skipped"
 [ "$yielded" = 0 ] || done_line="$done_line yielded=$yielded"
 done_line="$done_line wall=$(($(date +%s) - T0))s laneA=$(lane_s A)s laneB=$(lane_s B)s"
