@@ -1367,6 +1367,46 @@ FP
     -- steal-fix plain-any 'v41-any@FAKE_SLEEP=2')
   printf '%s' "$rc" > "$t/rc-ch-skipm"
   want_not 'chain mutant: without the skip placement the member runs although it is green' "$t/target/c-ch-skipm/run.log" '^v41-any rc=skip '
+  # (9b) a ledger skip of a lane item, not a member: a balanced item green on one key. Either lane may take it (take_next hands a
+  # green skip out first), so a lane claims it before it records the skip: one `rc=skip` line, the other lane goes on, the batch
+  # ends. Unclaimed, the same item came back to both lanes without end, so the case runs the batch under a bound: the lanes' skip
+  # line past one, or the batch still running after 20 s, stops it. lskip_case prints `<rc, 124 at the bound> <skip lines>`.
+  lskip_case() { # <tag> <script>
+    local tag=$1 script=$2 sp k=0 rc=0 cnt=0 f
+    rm -rf "$t/fake-state" "$t/target/c-$tag"
+    printf '%s\n' "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	A	3090	2	$d" > "$t/times-$tag.tsv"
+    FAKE_GREEN_FILE=$t/green-lskip.tsv BLOOMERY_GATE_TIMES=$t/times-$tag.tsv BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+      bash "$script" --out "$t/target/c-$tag" --round-ledger steal-fix plain-any 'v41-any@FAKE_SLEEP=2' > "$t/out-$tag.log" 2>&1 &
+    sp=$!
+    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 20 ]; do
+      cnt=$(grep -c '^plain-any rc=skip ' "$t/target/c-$tag/run.log" 2> /dev/null || true)
+      [ "${cnt:-0}" -lt 2 ] || break
+      sleep 1
+      k=$((k + 1))
+    done
+    if kill -0 "$sp" 2> /dev/null; then
+      kill -TERM "$sp" 2> /dev/null || true
+      wait "$sp" 2> /dev/null || true
+      rc=124
+    else
+      wait "$sp" || rc=$?
+    fi
+    for f in "$t/target/c-$tag"/lane-*.pid "$t/target/c-$tag"/lane-*.child; do
+      if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
+    done
+    cnt=$(grep -c '^plain-any rc=skip ' "$t/target/c-$tag/run.log" 2> /dev/null || true)
+    printf '%s %s' "$rc" "${cnt:-0}"
+  }
+  printf 'stub-plain-any@BLOOMERY_GATE_CARD=a6000\n' > "$t/green-lskip.tsv"
+  res=$(lskip_case ch-lskip "$t/tools/gate-batch.sh")
+  printf '%s' "${res% *}" > "$t/rc-ch-lskip"
+  rc_ok 'chain: a lane item green on one key ends green' ch-lskip 3
+  if [ "${res#* }" = 1 ]; then pass 'chain: … and its skip is recorded once'
+  else fail 'chain: … and its skip is recorded once' "${res#* } skip lines (rc ${res% *}, 124 is the bound)"; fi
+  mutant_of ch-lskip 's|^          claim_item "\$i" "\$lane" \|\| continue # the other lane skipped it first.*$|          true # MUTANT ch-lskip|' '# MUTANT ch-lskip$'
+  res=$(lskip_case ch-lskipm "$t/tools/gate-batch-ch-lskip.sh")
+  if [ "${res% *}" = 124 ] || [ "${res#* }" -gt 1 ]; then pass 'chain mutant: without the claim a green lane item skips again and again'
+  else fail 'chain mutant: without the claim a green lane item skips again and again' "the mutant batch ended with ${res#* } skip line(s) (rc ${res% *})"; fi
   # (10) a lane killed while it holds the mutex: the batch ends by name inside a bound, never a
   # wait without end. The deaf-watch mutant hangs instead and the case kills it.
   rm -rf "$t/fake-state" "$t/target/c-ch-kill"
@@ -5025,6 +5065,7 @@ run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class 
       chain_take "$lane" && continue
       if take_next "$lane" i; then
         if [ "${P_LST[$i]}" = skip ]; then
+          claim_item "$i" "$lane" || continue # the other lane skipped it first; an unclaimed skip is handed out again
           skip_item "$i" "$lane"
         else
           claim_item "$i" "$lane" || continue # the other lane took it while this one was busy
