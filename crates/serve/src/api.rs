@@ -1322,6 +1322,66 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
     }
 }
 
+/// The llama.cpp samplers this server has none of: each is a 400 naming it
+/// when its own field turns it on, `typical_p < 1`, `mirostat > 0` (llama-server
+/// clamps it to `0..=2`), `dry_multiplier` other than 0, `xtc_probability > 0`,
+/// `top_n_sigma > 0` or `dynatemp_range > 0` (the off ranges of llama.cpp's
+/// `llama-sampler.cpp`). A secondary field can also leave a sampler off
+/// (`dry_penalty_last_n` 0, `xtc_threshold > 0.5`); that does not lift the
+/// refusal. The secondary fields pass at any value of the type they take, except
+/// the values llama-server's schema refuses: `dry_allowed_length` or
+/// `dry_penalty_last_n` below 0, and a `dry_sequence_breakers` that is not a
+/// non-empty array of strings. `null` is unset.
+fn unserved_samplers(o: &Map<String, Value>) -> Result<(), ApiError> {
+    let on = [
+        (
+            "typical_p",
+            get_f32(o, "typical_p")?.is_some_and(|p| p < 1.0),
+        ),
+        ("mirostat", get_i(o, "mirostat")?.is_some_and(|m| m > 0)),
+        (
+            "dry_multiplier",
+            get_f32(o, "dry_multiplier")?.is_some_and(|m| m != 0.0),
+        ),
+        (
+            "xtc_probability",
+            get_f32(o, "xtc_probability")?.is_some_and(|p| p > 0.0),
+        ),
+        (
+            "top_n_sigma",
+            get_f32(o, "top_n_sigma")?.is_some_and(|n| n > 0.0),
+        ),
+        (
+            "dynatemp_range",
+            get_f32(o, "dynatemp_range")?.is_some_and(|r| r > 0.0),
+        ),
+    ];
+    if let Some((field, _)) = on.iter().find(|(_, hit)| *hit) {
+        return Err(invalid(format!("{field} is not supported by this server")));
+    }
+    for k in [
+        "mirostat_tau",
+        "mirostat_eta",
+        "dry_base",
+        "xtc_threshold",
+        "dynatemp_exponent",
+    ] {
+        get_f32(o, k)?;
+    }
+    for k in ["dry_allowed_length", "dry_penalty_last_n"] {
+        get_i_in(o, k, 0)?;
+    }
+    let takes = "a non-empty array of strings";
+    match o.get("dry_sequence_breakers") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_string) => Ok(()),
+        Some(Value::Array(_)) => Err(invalid(format!(
+            "dry_sequence_breakers must be {takes}, as llama-server takes it"
+        ))),
+        Some(v) => Err(wrong_type("dry_sequence_breakers", takes, v)),
+    }
+}
+
 /// Knobs shared by both generation endpoints. The token limit is the first set
 /// of `n_predict`, `max_completion_tokens` and `max_tokens`, llama-server's
 /// order on both routes (`n_predict` first, the OpenAI names its aliases in that
@@ -1335,11 +1395,12 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
 /// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
 /// non-empty `grammar`, `logprobs` other than `false` (a bool, or OpenAI's text
 /// completion count), `top_logprobs > 0`, `n > 1`, `tool_choice` other than
-/// `"none"` or `"auto"` (nothing forces a call without a grammar), and a
-/// non-empty `logit_bias`. `null` counts as absent. Other unknown fields are
-/// ignored. The two routes whose answers render probabilities take their
-/// fields out of the body before this runs ([`completion_plan_logprobs`],
-/// [`chat_plan_logprobs`]); every other route keeps the refusal.
+/// `"none"` or `"auto"` (nothing forces a call without a grammar), a non-empty
+/// `logit_bias`, and the samplers [`unserved_samplers`] names. `null` counts as
+/// absent. Other unknown fields are ignored. The two routes whose answers render
+/// probabilities take their fields out of the body before this runs
+/// ([`completion_plan_logprobs`], [`chat_plan_logprobs`]); every other route
+/// keeps the refusal.
 ///
 /// The penalties take llama-server's names and defaults (`repeat_penalty` 1,
 /// `frequency_penalty` 0, `presence_penalty` 0, `repeat_last_n` 64) and
@@ -1391,6 +1452,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
     if let Some((field, _)) = refused.iter().find(|(_, hit)| *hit) {
         return Err(invalid(format!("{field} is not supported by this server")));
     }
+    unserved_samplers(o)?;
     let d = SamplingParams::default();
     let seed = match get_i(o, "seed")? {
         Some(s) if s >= 0 => s as u64,
@@ -1527,7 +1589,7 @@ fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
 /// llama-server's `generation_settings`, with the values this server applies.
 /// Knobs it does not implement are reported at their neutral setting.
 fn generation_settings(state: &State, p: &GenParams) -> Value {
-    json!({
+    let mut v = json!({
         "n_ctx": state.info.ctx_max,
         "n_predict": p.n_predict,
         "model": state.alias,
@@ -1561,7 +1623,22 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
         "min_keep": 0,
         "grammar": "",
         "samplers": ["penalties", "top_k", "top_p", "min_p", "temperature"],
-    })
+    });
+    // The samplers [`unserved_samplers`] refuses, at llama-server's off values
+    // (one `json!` over every key passes the macro's recursion limit).
+    for (k, off) in [
+        ("top_n_sigma", json!(-1.0)),
+        ("xtc_probability", json!(0.0)),
+        ("xtc_threshold", json!(0.1)),
+        ("dry_multiplier", json!(0.0)),
+        ("dry_base", json!(1.75)),
+        ("dry_allowed_length", json!(2)),
+        ("dry_penalty_last_n", json!(64)),
+        ("dry_sequence_breakers", json!(["\n", ":", "\"", "*"])),
+    ] {
+        v[k] = off;
+    }
+    v
 }
 
 /// The settings a request with an empty body would get (seed shown as llama-server's default).
@@ -4052,6 +4129,107 @@ mod tests {
                 let (status, text) = ask(field, value);
                 assert_eq!(status, 200, "{field} {value}: {text}");
             }
+        }
+    }
+
+    /// The llama.cpp samplers this server lacks are a 400 naming them where
+    /// llama-server would change a token, and pass where it would not (each
+    /// field's off range in `llama-sampler.cpp`, including `top_n_sigma` 0);
+    /// their secondary fields pass at any value of their type, except the
+    /// values llama-server's schema refuses.
+    #[test]
+    fn samplers_this_server_lacks_are_refused_only_when_on() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let ask = |extra: Value| {
+            let mut body = json!({"prompt": "ab", "n_predict": 1});
+            for (k, v) in extra.as_object().expect("an object") {
+                body[k] = v.clone();
+            }
+            roundtrip(addr, "POST", "/completion", &body.to_string())
+        };
+        let on = [
+            ("typical_p", json!(0.9)),
+            ("mirostat", json!(1)),
+            ("mirostat", json!(2)),
+            ("dry_multiplier", json!(0.8)),
+            ("dry_multiplier", json!(-0.5)),
+            ("xtc_probability", json!(0.5)),
+            ("top_n_sigma", json!(1.0)),
+            ("dynatemp_range", json!(0.5)),
+        ];
+        for (k, v) in on {
+            let (status, text) = ask(json!({ k: v }));
+            assert_eq!(status, 400, "{k} {v}: {text}");
+            assert_eq!(
+                message_of(&text),
+                format!("{k} is not supported by this server")
+            );
+        }
+        let chat = json!({"messages": [{"role": "user", "content": "ab"}], "max_tokens": 1,
+            "typical_p": 0.9});
+        let (status, text) = roundtrip(addr, "POST", "/v1/chat/completions", &chat.to_string());
+        assert_eq!(status, 400, "{text}");
+        assert_eq!(
+            message_of(&text),
+            "typical_p is not supported by this server"
+        );
+        let off = json!({
+            "typical_p": 1.0, "mirostat": 0, "mirostat_tau": 5.0, "mirostat_eta": 0.1,
+            "dry_multiplier": 0.0, "dry_base": 1.75, "dry_allowed_length": 2,
+            "dry_penalty_last_n": 64, "dry_sequence_breakers": ["\n", ":", "\"", "*"],
+            "xtc_probability": 0.0, "xtc_threshold": 0.1, "top_n_sigma": -1.0,
+            "dynatemp_range": 0.0, "dynatemp_exponent": 1.0,
+        });
+        let (status, text) = ask(off.clone());
+        assert_eq!(status, 200, "{text}");
+        // The settings report each of them at llama-server's off value, the
+        // one this request sent, so a client reads what the server applies.
+        let v: Value = serde_json::from_str(&text).expect("JSON");
+        for (k, want) in off.as_object().expect("an object") {
+            assert_eq!(&v["generation_settings"][k], want, "{k}");
+        }
+        for extra in [
+            json!({"typical_p": 1.5}),
+            json!({"mirostat": -1}),
+            json!({"xtc_probability": -0.2}),
+            json!({"top_n_sigma": 0.0}),
+            json!({"dynatemp_range": -1.0}),
+            json!({"mirostat_tau": 9.0, "dry_base": 0.5, "xtc_threshold": 0.9}),
+            json!({"typical_p": null, "dry_sequence_breakers": null}),
+        ] {
+            let (status, text) = ask(extra.clone());
+            assert_eq!(status, 200, "{extra}: {text}");
+        }
+        for (extra, want) in [
+            (
+                json!({"dry_allowed_length": -1}),
+                format!(
+                    "dry_allowed_length must be an integer in 0..={}, as llama-server takes it, not -1",
+                    i32::MAX
+                ),
+            ),
+            (
+                json!({"dry_penalty_last_n": -1}),
+                format!(
+                    "dry_penalty_last_n must be an integer in 0..={}, as llama-server takes it, not -1",
+                    i32::MAX
+                ),
+            ),
+            (
+                json!({"dry_sequence_breakers": []}),
+                "dry_sequence_breakers must be a non-empty array of strings, as llama-server takes it".to_string(),
+            ),
+            (
+                json!({"dynatemp_exponent": "1"}),
+                "dynatemp_exponent must be a number, not a string".to_string(),
+            ),
+        ] {
+            let (status, text) = ask(extra.clone());
+            assert_eq!(status, 400, "{extra}: {text}");
+            assert_eq!(message_of(&text), want, "{extra}");
         }
     }
 

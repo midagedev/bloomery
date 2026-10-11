@@ -32,8 +32,10 @@ no card and no model (the pure crates, `python3 tools/recipes.py pure-crates`; `
 ### 3. The sampling fields the server cannot honour are ignored, not refused (M on the board; refusing them is S)
 - **What:** `typical_p`, `mirostat`, `dry_*`, `xtc_*`, `top_n_sigma` and `dynatemp_*` are never read from a request, so
   a client that sets them gets a plain sample with no warning. The refusal list has the pattern (`n_probs`, `grammar`,
-  `logprobs`, `logit_bias` are refused by name); add rows that refuse a non-neutral value. The neutral values are the
-  ones the server already reports (`api.rs:1522-1537`). Use llama-server's field names and its
+  `logprobs`, `logit_bias` are refused by name); add rows that refuse a primary field (`typical_p`, `mirostat`,
+  `dry_multiplier`, `xtc_probability`, `top_n_sigma`, `dynatemp_range`) where it turns its sampler on, and let the
+  secondary fields pass unless llama-server's schema refuses them. `generation_settings` reports every one at its
+  off value. Use llama-server's field names and its
   `tools/server/tests/unit/test_*.py` cases as the oracle (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-triage.md, "llama-server parity").
 - **Files:** `crates/serve/src/api.rs:1337-1370` (`refused`), tests in the same file.
 - **Verify:** `cargo test --release -p bloomery-serve`.
