@@ -14,13 +14,13 @@
 //! nothing is skipped, repaired or fetched.
 
 use std::fmt;
-use std::ops::Range;
 use std::sync::Arc;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub use vision::media::PartJoin;
+use vision::media::{ExpandError, expand_spans};
 pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
 
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
@@ -55,14 +55,6 @@ pub struct ImageFile {
     pub kind: FileKind,
     pub bytes: Vec<u8>,
     pub key: ImageKey,
-}
-
-/// A prompt whose image placeholders are expanded to their images' spans.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Expanded {
-    pub ids: Vec<u32>,
-    /// Where each image's span sits in `ids`, in the order of the images.
-    pub spans: Vec<Range<usize>>,
 }
 
 /// One image's span among a prompt's ids: its first position, its length, and the key of the
@@ -298,6 +290,21 @@ pub enum MediaError {
     ImageLast,
 }
 
+impl From<ExpandError> for MediaError {
+    fn from(e: ExpandError) -> MediaError {
+        match e {
+            ExpandError::PlaceholderCount {
+                placeholders,
+                images,
+            } => MediaError::PlaceholderCount {
+                placeholders,
+                images,
+            },
+            ExpandError::EmptySpan(i) => MediaError::EmptySpan(i),
+        }
+    }
+}
+
 impl fmt::Display for ImageKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
@@ -416,39 +423,6 @@ pub fn load(url: &str) -> Result<ImageFile, MediaError> {
 pub fn prepare(file: &ImageFile, model: &dyn MediaModel) -> Result<Prepared, MediaError> {
     let image = Rgb8::from_bytes(&file.bytes).map_err(MediaError::Decode)?;
     model.prepare(&image).map_err(MediaError::Prepare)
-}
-
-/// Replace the i-th `image_token` of `ids` by `span_lens[i]` copies of it.
-pub fn expand_spans(
-    ids: &[u32],
-    image_token: u32,
-    span_lens: &[usize],
-) -> Result<Expanded, MediaError> {
-    let placeholders = ids.iter().filter(|&&t| t == image_token).count();
-    if placeholders != span_lens.len() {
-        return Err(MediaError::PlaceholderCount {
-            placeholders,
-            images: span_lens.len(),
-        });
-    }
-    if let Some(i) = span_lens.iter().position(|&n| n == 0) {
-        return Err(MediaError::EmptySpan(i));
-    }
-    let mut out = Vec::with_capacity(ids.len() - placeholders + span_lens.iter().sum::<usize>());
-    let mut spans = Vec::with_capacity(placeholders);
-    let mut lens = span_lens.iter();
-    for &t in ids {
-        if t == image_token {
-            let n = *lens
-                .next()
-                .expect("one length per placeholder, counted above");
-            spans.push(out.len()..out.len() + n);
-            out.extend(std::iter::repeat_n(t, n));
-        } else {
-            out.push(t);
-        }
-    }
-    Ok(Expanded { ids: out, spans })
 }
 
 /// The prompt of a rendered chat whose ids are `ids` and whose images are `urls`, in the order of
@@ -620,9 +594,9 @@ mod tests {
     use vision::{GridPlan, Patches};
 
     use super::{
-        Expanded, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Part, PartJoin,
-        Prepared, Rgb8, VisionError, common_prefix, expand_prompt, expand_spans, flatten,
-        keep_whole_spans, load, parse_part, prepare,
+        ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Part, PartJoin,
+        Prepared, Rgb8, VisionError, common_prefix, expand_prompt, flatten, keep_whole_spans, load,
+        parse_part, prepare,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -1083,41 +1057,23 @@ mod tests {
         ));
     }
 
+    /// The expansion's refusals keep their variants here: `EmptySpan` is the model's 500, the
+    /// placeholder count the request's 400 (`api::media_error`).
     #[test]
-    fn spans_expand_in_order() {
-        let got = expand_spans(&[1, 7, 2, 7, 3], 7, &[3, 1]).unwrap();
-        assert_eq!(
-            got,
-            Expanded {
-                ids: vec![1, 7, 7, 7, 2, 7, 3],
-                spans: vec![1..4, 5..6],
-            }
-        );
-        let none = expand_spans(&[1, 2], 7, &[]).unwrap();
-        assert_eq!((none.ids, none.spans.len()), (vec![1, 2], 0));
-        let first = expand_spans(&[7], 7, &[2]).unwrap();
-        assert_eq!(first.ids, [7, 7]);
-        assert_eq!((first.spans.len(), first.spans.first()), (1, Some(&(0..2))));
-    }
-
-    #[test]
-    fn spans_that_do_not_pair_up_are_named() {
-        for (ids, lens, want) in [
-            (&[1, 7, 7][..], &[2][..], (2, 1)),
-            (&[1, 7][..], &[2, 2][..], (1, 2)),
-            (&[1, 2][..], &[2][..], (0, 1)),
-        ] {
-            match err(expand_spans(ids, 7, lens)) {
-                MediaError::PlaceholderCount {
-                    placeholders,
-                    images,
-                } => assert_eq!((placeholders, images), want),
-                e => panic!("{ids:?} {lens:?}: {e}"),
-            }
-        }
+    fn expansion_refusals_keep_their_variants() {
         assert!(matches!(
-            err(expand_spans(&[7, 7], 7, &[1, 0])),
+            MediaError::from(ExpandError::EmptySpan(1)),
             MediaError::EmptySpan(1)
+        ));
+        assert!(matches!(
+            MediaError::from(ExpandError::PlaceholderCount {
+                placeholders: 2,
+                images: 1
+            }),
+            MediaError::PlaceholderCount {
+                placeholders: 2,
+                images: 1
+            }
         ));
     }
 
