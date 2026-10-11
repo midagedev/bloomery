@@ -112,6 +112,7 @@ use bloomery_gpu::qsa::list_width;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block_cols};
 use bloomery_gpu_deepseek41::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_STREAMS, HcPostArgs, HcPreScratch, HcQ8Params, HcQ8PreArgs,
 };
@@ -133,9 +134,7 @@ use runtime::swaprule::KeptRows;
 use super::WHAT as BODY;
 use super::media::{CallRows, check_image_ids, stage_row};
 use super::nextn::GlmArena;
-use super::{
-    Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape, weight,
-};
+use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
 use crate::ffn::{self, CardRows, CardTiles};
 use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
 use crate::mla::{self, Select};
@@ -864,12 +863,12 @@ pub fn prefill_mode(m: &Glm5nextModel) -> Result<PrefillMode, GpuError> {
 /// prompt allocates nothing. Returns whether it made any.
 pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.prompt.mode = mode;
-    if mode == PrefillMode::Steps || body.prompt.batch.is_some() {
-        return Ok(false);
+    let made = mode == PrefillMode::Batch && body.prompt.batch.is_none();
+    if made {
+        body.make_batch(gpu)?;
     }
-    body.make_batch(gpu)?;
-    Ok(true)
+    body.prompt.mode = mode;
+    Ok(made)
 }
 
 /// The batches a prompt group of `m` runs layer by layer: `g` consecutive
@@ -975,6 +974,24 @@ const _: () = assert!(GROUP_MAX as u64 == bloomery_levers::PREFILL_GROUP_MAX);
 fn refuse_late_dense(cfg: &[super::LayerCfg], g: usize) -> Result<(), GpuError> {
     refuse_dense_after_routed(cfg.iter().map(|c| c.kind.host_leg()), g)
         .map_err(|r| shape(r.to_string()))
+}
+
+/// Refused by name for a load with a K-quant dense block or shared expert: the batch feed's blocks run over columns (the
+/// multi-column launches below [`GEMM_FROM`] tokens, the GEMM front from it),
+/// which only the q8_0 block does
+/// ([`bloomery_gpu_deepseek41::block::BlockPlan::check_cols`]); such a file
+/// feeds by steps.
+fn refuse_k_quant_blocks(cfg: &[super::LayerCfg]) -> Result<(), GpuError> {
+    for (l, c) in cfg.iter().enumerate() {
+        c.block.check_cols(BODY, l).map_err(|e| match e {
+            GpuError::Shape { what, detail } => GpuError::Shape {
+                what,
+                detail: format!("{detail}; this file feeds by steps"),
+            },
+            other => other,
+        })?;
+    }
+    Ok(())
 }
 
 /// Feed `ids` from where `m` stands in batches (module doc) and return the
@@ -1462,6 +1479,7 @@ impl Body {
             return Ok(());
         }
         refuse_late_dense(&self.cfg, self.prompt.group)?;
+        refuse_k_quant_blocks(&self.cfg)?;
         let ff = self.cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let dense_ff = self
             .cfg
@@ -2374,21 +2392,22 @@ impl PromptProgram<'_> {
                 &mut b.out,
             );
         }
-        let (g, u) = (weight(w, gate)?, weight(w, up)?);
+        let blk = Block {
+            plan: c.block,
+            names: [gate, up, down],
+            ff: c.ff,
+            limit: c.limit,
+            layer: l,
+        };
         for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.xn, c0 * n, cn * n)?;
-            self.p
-                .k
-                .experts
-                .enqueue_shexp_gate_up_mcol(stream, g, u, &xs, cn, c.limit, &mut b.h)?;
-            w.q8_gemv_mcol(
-                gpu,
-                BODY,
-                down,
-                &b.h,
-                cn,
-                &mut *span_mut(W, &mut b.out, c0 * n, cn * n)?,
-            )?;
+            let mut out = span_mut(W, &mut b.out, c0 * n, cn * n)?;
+            let io = BlockIo {
+                x: &xs,
+                h: &mut b.h,
+                y: &mut out,
+            };
+            enqueue_block_cols(gpu, w, &self.p.k.experts, &blk, cn, io)?;
         }
         Ok(())
     }
@@ -2531,21 +2550,22 @@ impl PromptProgram<'_> {
             )?;
         }
         let nm = ffn::moe_names(&self.p, l)?;
-        let (g, u) = (weight(w, nm.sh_gate)?, weight(w, nm.sh_up)?);
+        let blk = Block {
+            plan: c.block,
+            names: [nm.sh_gate, nm.sh_up, nm.sh_down],
+            ff: c.ff,
+            limit: c.limit,
+            layer: l,
+        };
         for (c0, cn) in chunks(t, CHUNK) {
             let xs = span(W, &b.normed, c0 * n, cn * n)?;
-            self.p
-                .k
-                .experts
-                .enqueue_shexp_gate_up_mcol(stream, g, u, &xs, cn, c.limit, &mut b.h)?;
-            w.q8_gemv_mcol(
-                gpu,
-                BODY,
-                nm.sh_down,
-                &b.h,
-                cn,
-                &mut *span_mut(W, &mut b.sh_y, c0 * n, cn * n)?,
-            )?;
+            let mut out = span_mut(W, &mut b.sh_y, c0 * n, cn * n)?;
+            let io = BlockIo {
+                x: &xs,
+                h: &mut b.h,
+                y: &mut out,
+            };
+            enqueue_block_cols(gpu, w, &self.p.k.experts, &blk, cn, io)?;
         }
         if card && !tiered {
             gpu.elem()

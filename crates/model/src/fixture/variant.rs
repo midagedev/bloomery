@@ -7,7 +7,7 @@
 //! A table row is `tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why`. The map is `role=type`
 //! words: `role` is a tensor name between `blk.<L>.` and `.weight`, `type` a ggml type name. The scope
 //! `trunk` is every layer but the NextN one (the layer that holds `nextn.*` tensors), which keeps the
-//! source's types.
+//! source's types; `all` is every layer, the NextN one included.
 //!
 //! The quantizer picks a type for every tensor it sees, so the argument names every tensor of the
 //! source by its exact name: the map's tensors at their new type, every other at its own, which the
@@ -35,6 +35,8 @@ const QUANTIZER_KEY_PREFIX: &str = "quantize.imatrix.";
 pub enum Scope {
     /// Every layer but the NextN one.
     Trunk,
+    /// Every layer, the NextN one included.
+    All,
 }
 
 /// One row of the table.
@@ -132,10 +134,11 @@ pub fn parse_table(text: &str) -> Result<Vec<Row>, FixtureError> {
         }
         let scope = match *scope {
             "trunk" => Scope::Trunk,
+            "all" => Scope::All,
             other => {
                 return Err(err(
                     tag,
-                    format!("line {at}: scope {other:?} is not `trunk`"),
+                    format!("line {at}: scope {other:?} is not `trunk` or `all`"),
                 ));
             }
         };
@@ -260,7 +263,7 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
             let Some((layer, rest)) = layer_of(&t.name) else {
                 continue;
             };
-            if rest != want || nextn.contains(&layer) {
+            if rest != want || (row.scope == Scope::Trunk && nextn.contains(&layer)) {
                 continue;
             }
             found += 1;
@@ -292,8 +295,9 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
             return Err(err(
                 tag,
                 format!(
-                    "the map names {role}, and the source has no blk.<L>.{want} outside the NextN \
-                     layer {nextn:?}"
+                    "the map names {role}, and the source has no blk.<L>.{want} in scope {:?} \
+                     (the NextN layers are {nextn:?})",
+                    row.scope
                 ),
             ));
         }
