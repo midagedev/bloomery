@@ -1,5 +1,5 @@
 //! bloomery-gpu-vision — the image encoders on the card: from the bf16 patch tensor of
-//! [`vision::arch`] to the bf16 rows the text model reads in place of an image's tokens. Two
+//! [`vision::arch`] to the bf16 rows the text model reads in place of an image's tokens. Three
 //! towers, one per projector type of the encoder file (an mmproj GGUF):
 //!
 //! * `deepseek41v` — DeepSeek-V4.1-Flash's ViT (32 blocks, 2D RoPE, full bidirectional
@@ -7,7 +7,11 @@
 //! * `qwen3vl_merger` — the Qwen3-VL ViT (27 blocks of heads of 72, LayerNorm with bias, GELU-tanh
 //!   MLP, learned 48×48 positions resized to the grid, 2D RoPE) and its 2×2 merger, shared by
 //!   Clef-Flash, Qwen3.6-35B-A3B and Qwen3.8-Flash-Next, whose files differ only in the merger's
-//!   output width ([`qwen3vl`]).
+//!   output width ([`qwen3vl`]);
+//! * `glm5v` — GLM-5.3-Flash's ViT (24 blocks of RMS norm, a per-head RMS norm on query and key, a
+//!   SwiGLU MLP with bias, 2D RoPE, no position table, a Conv3d patch embedding) and its merger (a
+//!   2×2 convolution, a linear, LayerNorm, GELU and a SwiGLU MLP to the text model's width)
+//!   ([`glm5v`]).
 //!
 //! [`open`] reads the file's projector type and loads the tower; [`Tower`] is what a seat holds.
 //!
@@ -35,8 +39,7 @@
 //! * [`pos_bilinear`] — the Qwen3-VL tower's learned position rows resized to the image's grid.
 //! * [`aligner`] — the 3×3 unfold of V4.1's ViT grid into the aligner's input rows.
 //! * [`chain`] — what both chains share: weight reading, taps, the rows an encode returns.
-//! * [`encoder`], [`qwen3vl`], [`glm5v`] — each tower's weights on the card and whole chain; the
-//!   `glm5v` tower (GLM-5.3-Flash's mmproj) has no projector arm in [`open`] yet.
+//! * [`encoder`], [`qwen3vl`], [`glm5v`] — each tower's weights on the card and whole chain.
 //!
 //! Like `bloomery-gpu`, this crate is built with `cargo oxide` only.
 
@@ -76,7 +79,7 @@ use gguf::Gguf;
 use std::sync::Arc;
 use vision::Patches;
 use vision::arch::qwen3vl::TokenLimits;
-use vision::arch::{deepseek41v, qwen3vl as qwen3vl_host};
+use vision::arch::{deepseek41v, glm5v as glm5v_host, qwen3vl as qwen3vl_host};
 
 /// One image tower on the card, whichever projector type its file declares. A call takes
 /// `&mut self`: one image at a time owns the tower's activations, which are allocated at load, and
@@ -109,9 +112,9 @@ impl Tower for encoder::Encoder {
 }
 
 /// Open the tower the file's `clip.projector_type` names and load it onto the card: V4.1's sizes
-/// its activations from its own grid plan and ignores `limits`; the Qwen3-VL tower sizes them for
-/// images of at most `limits`' token count. A projector type with no tower here, or none at all,
-/// is refused by name. Load-time only.
+/// its activations from its own grid plan and ignores `limits`; the Qwen3-VL and GLM towers size
+/// them for images of at most `limits`' token count. A projector type with no tower here, or none
+/// at all, is refused by name. Load-time only.
 pub fn open(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
@@ -125,14 +128,21 @@ pub fn open(
         Some(deepseek41v::PROJECTOR_TYPE) => {
             Ok(Box::new(encoder::Encoder::load(ctx, stream, file)?))
         }
+        Some(glm5v_host::PROJECTOR_TYPE) => Ok(Box::new(glm5v::Encoder::load(
+            ctx,
+            stream,
+            file,
+            limits.max(),
+        )?)),
         Some(qwen3vl_host::PROJECTOR_TYPE) => {
             Ok(Box::new(qwen3vl::Encoder::load(ctx, stream, file, limits)?))
         }
         other => Err(GpuError::Shape {
             what: "gpu_vision::open",
             detail: format!(
-                "clip.projector_type is {other:?}; this build has a tower for \"{}\" and \"{}\"",
+                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\" and \"{}\"",
                 deepseek41v::PROJECTOR_TYPE,
+                glm5v_host::PROJECTOR_TYPE,
                 qwen3vl_host::PROJECTOR_TYPE
             ),
         }),
