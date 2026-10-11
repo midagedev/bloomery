@@ -1343,6 +1343,14 @@ class RecipeInputs:
         return None
 
 
+def origin_label(pname: str, label: str, why: str) -> str:
+    """How a recipe input is labelled: `label` alone (`test head_coverage`) when `why` is the target's own read — its
+    module tree, or a path literal in it, which `Tree.target_files` words `<pkg> <label> …` — and `label <- why` when
+    a lib the target links brought it in. A file and a directory go through this one builder, so a target's own read
+    is its own whichever it names; `_own_origin` reads the shape back."""
+    return label if why.startswith(f"{pname} {label}") else f"{label} <- {why}"
+
+
 class Graph:
     def __init__(self, tree: Tree, recipes: dict[str, Recipe]):
         self.tree = tree
@@ -1410,10 +1418,7 @@ class Graph:
                 # features, and a build with several packages unifies them); else the build is read whole.
                 by_features = len(inv.packages) == 1 and not any("{{" in f or "/" in f for f in inv.features)
                 for f, why in self.tree.target_files(pname, kind, tname, feats, not inv.no_default, inv.all_features, use, by_features).items():
-                    if f.endswith("/"):
-                        prefixes.setdefault(f, f"{label} <- {why}")
-                    else:
-                        files.setdefault(f, f"{label} <- {why}" if not why.startswith(f"{pname} {label}") else label)
+                    (prefixes if f.endswith("/") else files).setdefault(f, origin_label(pname, label, why))
             for g in CARGO_GLOBALS:
                 files.setdefault(g, "cargo (every build)")
             if inv.oxide:
@@ -2353,7 +2358,7 @@ _OWN_LIB_TESTS = re.compile(r"^(?:libtest <- \S+ lib tests|doctest <- \S+ doctes
 
 def _own_origin(why: str) -> bool:
     """Whether a hit's origin is the recipe's own target or its own text, not a dependency edge: a lib's
-    own tests read the lib as their own tree (Graph.inputs labels them `libtest <- <pkg> lib tests`)."""
+    own tests read the lib as their own tree (origin_label words them `libtest <- <pkg> lib tests`)."""
     inner = re.sub(r" \(via [^)]*\)$", "", why)
     if _OWN_LIB_TESTS.match(inner):
         return True
@@ -3501,7 +3506,8 @@ def reach_chain(tree: Tree, graph: Graph, n: str, node: int) -> str:
     return r.chain(r.gate(graph, n), node)
 
 def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None, stats: dict[str, int] | None = None) -> list[str]:
-    """The table against the tree: each row's recipes are gate recipes; its glob matches a file; each file it
+    """The table against the tree: each row's recipes are gate recipes; its glob matches a file and a gate reads
+    one of its files through a dependency edge (a row for files only own targets read maps nothing); each file it
     matches that a gate reads through a dependency edge is in the inputs of every recipe the row names
     (a row cannot claim a gate runs code it does not link); every gate the derivation (Reach) says reaches a
     file the glob matches through a dependency edge is in the row or named by the row's exceptions, each
@@ -3542,11 +3548,13 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
         if not r.gates():
             continue
         named = [n for n in r.gates() if n in recipes]
+        deps = [f for f in matched if any(not _own_origin(w) for w in (graph.inputs(n).match(f) for n in gates) if w)]
+        if not deps:
+            problems.append(f"{at}: no gate reads a file the glob matches through a dependency — an own target's read selects "
+                            "its recipes without a row (narrow()) — take the row out")
+            continue
         unread: dict[str, list[str]] = {}
-        for f in matched:
-            dep = any(not _own_origin(w) for w in (graph.inputs(n).match(f) for n in gates) if w)
-            if not dep:
-                continue
+        for f in deps:
             for n in named:
                 if graph.inputs(n).match(f) is None:
                     unread.setdefault(n, []).append(f)
@@ -4555,7 +4563,8 @@ def mac_purity(tree: Tree, lock: Lock, name: str) -> list[str]:
         raise RecipeError(f"pure-crates: {name}: " + "; ".join(errors))
     files: set[str] = set()
     for p, kind, tname, feats in targets:
-        # a path literal names a file read at run time, not compiled; dep-info is the box's
+        # what the target compiles, not what it reads: a path literal names a file opened at run time (it moves the
+        # gate in narrow(), it is no source to scan), and dep-info is the box's
         files |= {f for f, why in tree.target_files(p, kind, tname, feats, True, True).items() if "(path literal)" not in why and not why.startswith("dep-info")}
     own = pkg.dir.rstrip("/") + "/"
     hits = []
@@ -8177,7 +8186,7 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
             "base/Cargo.toml": "",
             # each of a.rs … h.rs holds one fn, reached (or not) by one rule
             "base/src/lib.rs": (
-                "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\nmod imp;\nmod inner;\n"
+                "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod rows;\nmod imp;\nmod inner;\n"
                 "pub use inner::{T, U};\n"
                 "pub struct S;\n"
                 "impl S {\n    pub fn used(&self) {\n        c::run()\n    }\n    pub fn idle(&self) {\n        d::run()\n    }\n}\n"
@@ -8189,18 +8198,31 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
             # an impl whose type path passes through lib.rs's re-export, as U's does
             "base/src/imp.rs": "impl crate::T {\n    pub fn go(&self) {\n        crate::a::run()\n    }\n}\n",
             "base/src/g.rs": "pub const K: u32 = 1;\n",
+            # data a lib reads: two `include_str!` files, a file by path literal and a directory by path literal; the
+            # fns that name each are called by mid except `idle`
+            "base/src/rows.rs": (
+                "pub const LIST: &str = include_str!(\"../data/list.txt\");\npub const IDLE: &str = include_str!(\"../data/idle.txt\");\n"
+                "pub const TABLE: &str = \"../tools/table.tsv\";\npub const HELD: &str = \"../tools/lib-held\";\n"
+                + "".join(f"pub fn {f}() -> &'static str {{\n    {c}\n}}\n" for f, c in (("list", "LIST"), ("idle", "IDLE"), ("table", "TABLE"), ("held", "HELD")))
+            ),
             "mid/Cargo.toml": "",
-            "mid/src/lib.rs": "pub fn call() -> u32 {\n    base::b::run();\n    base::mk!();\n    base::g::K\n}\n",
+            "mid/src/lib.rs": (
+                "pub fn call() -> u32 {\n    base::b::run();\n    base::mk!();\n    base::rows::list();\n    base::rows::table();\n"
+                "    base::rows::held();\n    base::g::K\n}\n"
+            ),
             "app/Cargo.toml": "",
             "app/src/lib.rs": "",
             "app/tests/it.rs": (
                 "mod common;\n#[test]\nfn t() {\n    let h = common::H;\n    h.make();\n"
                 "    let s = base::S;\n    s.used();\n    let u = base::U;\n    u.go();\n}\n"
+                "const OWN_HELD: &str = \"../tools/own-held\";\n"
             ),
             "app/tests/common/mod.rs": "pub struct H;\nimpl H {\n    pub fn make(&self) {\n        mid::call();\n    }\n}\n",
         }
         for x in "abcdefh":
             files[f"base/src/{x}.rs"] = "pub fn run() {}\n"
+        for rel in ("base/data/list.txt", "base/data/idle.txt", "tools/table.tsv", "tools/lib-held/b.ids", "tools/own-held/a.ids"):
+            files[rel] = "x\n"
         for rel, text in files.items():
             os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
             with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
@@ -8226,7 +8248,8 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
             ],
         }
         st = Tree(tmp, meta)
-        rs = {"gate-app": Recipe("gate-app", ["./tools/box.sh 'bash tools/gate.sh -p app --test it'"], [], "")}
+        rs = {"gate-app": Recipe("gate-app", ["./tools/box.sh 'bash tools/gate.sh -p app --test it'"], [], ""),
+              "gate-mid": Recipe("gate-mid", ["./tools/box.sh 'bash tools/gate.sh -p mid --lib'"], [], "")}
         sg = Graph(st, rs)
         got = {f for f in (f"base/src/{x}.rs" for x in "abcdefgh") if dep_reach(st, sg, ["gate-app"], f)}
         want = {
@@ -8245,6 +8268,32 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         }.items():
             expect(f not in got, f"reach: {f} reached — {why}")
         expect(bool(dep_reach(st, sg, ["gate-app"], "mid/src/lib.rs")), "reach: mid's call not reached through the test crate's own impl")
+        # a data file is one more file a unit can name: an `include_str!` or a path literal a reached unit holds is
+        # reached, and what only an unreached unit holds is not
+        for f, reached in (("base/data/list.txt", True), ("tools/table.tsv", True), ("base/data/idle.txt", False)):
+            expect(bool(dep_reach(st, sg, ["gate-app"], f)) == reached, f"reach: {f} {'not reached' if reached else 'reached'} through the unit that holds it")
+        # the row check reads the same links: a row for a path-literal file naming the gates that reach it is clean, and
+        # one that leaves gate-app out is refused with the chain
+        for f in ("base/data/list.txt", "tools/table.tsv"):
+            got = gate_paths_problems(st, rs, [row(f, ["gate-app", "gate-mid"])])
+            expect(not got, f"gate-paths: a row naming the gates that reach {f} by a literal is refused: {got[:2]}")
+            got = gate_paths_problems(st, rs, [row(f, ["gate-mid"])])
+            expect(any(p.endswith(f"gate-app reaches {f} — add it to the row, or name it in the row's exceptions with the reason; the chain: {reach_chain(st, sg, 'gate-app', dep_reach(st, sg, ['gate-app'], f)['gate-app'])}") for p in got),
+                   f"gate-paths: a row leaving out the gate that reaches {f} by a literal is not refused with its chain: {got[:2]}")
+        # one label for a target's own read whether it names a file or a directory (origin_label): a test's own
+        # directory literal is the test's own, a lib's is a dependency edge, as a file of either is
+        own_dir, lib_dir = sg.inputs("gate-app").match("tools/own-held/a.ids"), sg.inputs("gate-app").match("tools/lib-held/b.ids")
+        expect(own_dir == "test it" and _own_origin(own_dir), f"origins: a test's own directory literal is labelled {own_dir!r}, not its own read")
+        expect(lib_dir is not None and not _own_origin(lib_dir), f"origins: a lib's directory literal is labelled {lib_dir!r}, not a dependency edge")
+        expect(sg.inputs("gate-app").match("tools/table.tsv") == "test it <- lib base (path literal) (app -> base)",
+               f"origins: a lib's file literal is labelled {sg.inputs('gate-app').match('tools/table.tsv')!r}")
+        # a row for files only an own target reads maps nothing (narrow() picks that target without a row) and is taken out;
+        # one for a lib's directory, a dependency read, stands
+        got = gate_paths_problems(st, rs, [row("tools/own-held/a.ids", ["gate-app"])])
+        expect(len(got) == 1 and "no gate reads a file the glob matches through a dependency" in got[0] and got[0].endswith("take the row out"),
+               f"gate-paths: a row for a test's own directory literal not refused: {got}")
+        got = gate_paths_problems(st, rs, [row("tools/lib-held/b.ids", ["gate-app", "gate-mid"])])
+        expect(not got, f"gate-paths: a row for a lib's directory literal refused: {got[:2]}")
 
     # the table's check on the real tree: the held rows, and the derivation's own lines
     tree, recipes, graph = side.tree, side.recipes, side.graph
@@ -8269,6 +8318,9 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
     got = gate_paths_problems(tree, recipes, [stale])
     expect(any(p.endswith("the exception names gate-refset, which reaches no file the glob matches through a dependency — take it out") for p in got)
            and not any(" reaches crates/" in p for p in got), f"gate-paths: a stale exception: {got[:2]}")
+    # a planted row for a test's own data directory (gate-models reads head-holdout/ as its own target): nothing for it to map
+    got = gate_paths_problems(tree, recipes, [row("crates/models/tests/data/head-holdout/*.ids", ["gate-models"])])
+    expect(len(got) == 1 and "no gate reads a file the glob matches through a dependency" in got[0], f"gate-paths: a row for a test's own data not refused: {got}")
     # the fourth column's form
     expect(parse_exceptions("except gate-a gate-b: one | except gate-c: two") == {"gate-a": "one", "gate-b": "one", "gate-c": "two"},
            "gate-paths: two exception clauses")
@@ -8484,6 +8536,33 @@ def narrow_self_test(expect, side: Side) -> None:
         got, why = picked(pair("nolibs", "gx", ("bloomery-gpu",)), swap, kquant)
         expect({"gate-gpu-vision", "gate-ds41-bind"} <= got and "lib bloomery-gpu-vision not scanned" in why and "lib bloomery-gpu-deepseek41 not scanned" in why,
                f"narrow: the device libs a scan names no bundle of do not keep their gates: {sorted(got)[:6]} {why}")
+        # a data file a gate reads by `include_str!` or by path literal, alone in a diff and under scan pairs that cover every
+        # kernel carrier, narrows with the real table: the shipped head list and the fixture variants' table through the
+        # row naming the gates that run their readers (the derivation's list, less the own targets), a test's own holdout
+        # directory as that test's own target with no row
+        gates_all = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
+        every = tuple(sorted({c.bundle for c in kernel_carriers(side, gates_all)}))
+        covering = [pair(f"cover-{b}", b, every) for b in ("gx", *sorted(c.bin for c in kernel_carriers(side, gates_all) if c.bin))]
+        table = load_gate_paths(side.tree.root)
+        shipped = shipped_files(side.tree.root)
+        for what, glob, via_row in (("the shipped head list", "crates/model/data/mtp-head-rows-qwen38-*.txt", True),
+                                    ("a holdout file", "crates/models/tests/data/head-holdout/*.ids", False),
+                                    ("the fixture variants' table", "tools/fixture-variants.tsv", True)):
+            found = [f for f in shipped if glob_regex(glob).match(f)]
+            expect(bool(found), f"narrow: {what} ({glob}) matches no file of the tree")
+            if not found:
+                continue
+            n = narrow([found[0]], side, side, covering, table)
+            expect(not n.full and ("rows " in n.files[0][len(found[0]):]) == via_row, f"narrow: {what} alone keeps the full list, or is mapped by a row or not as expected ({via_row}): {n.full} {n.files}")
+            if via_row:
+                reach = set(dep_reach(side.tree, side.graph, gates_all, found[0]))
+                expect(bool(reach) and reach <= set(n.picks), f"narrow: {what} misses a gate that runs it through a dependency: {sorted(reach - set(n.picks))}")
+            else:
+                expect("gate-models" in n.picks, f"narrow: {what} does not pick the test that reads its directory as its own target: {sorted(n.picks)}")
+        # Clef's suite is read by one bin by a file literal and by the decision test by a directory literal: both are
+        # own targets of it, so a diff of it alone picks both and no row stands for either
+        n = narrow(["tools/ref/clef/suite.jsonl"], side, side, covering, table)
+        expect(not n.full and {"gate-gpu-clef-serve", "gate-decision-clef"} <= set(n.picks), f"narrow: Clef's suite alone drops a reader or keeps the full list: {n.full} {sorted(n.picks)}")
         # a trigger names its weekly recipe and maps nothing: a file only a trigger row matches, which every gate reads
         # through a dependency, keeps the full list; beside a gate row it narrows as that row says
         trig = [row("rust-toolchain.toml", ["weekly-gpu-ds41-serve"], 9)]
