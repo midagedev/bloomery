@@ -1027,6 +1027,38 @@ impl ResidencyGlue {
         tier.keep_rows(kept, kind)
     }
 
+    /// [`ResidencyGlue::keep_rows`] for a pass of several slots, each row
+    /// kept for its range's slot ([`HostTier::keep_rows_by`]).
+    pub fn keep_rows_by<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        kept: KeptRows,
+        kind: PassKind,
+        ranges: impl Iterator<Item = (usize, Range<usize>)> + Clone,
+    ) -> Result<(), GpuError> {
+        tier.keep_rows_by(kept, kind, ranges)
+    }
+
+    /// Every later plain keep belongs to `slot`'s stream
+    /// ([`HostTier::select_stream`]).
+    pub fn select_stream<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        slot: usize,
+    ) -> Result<(), GpuError> {
+        tier.select_stream(slot)
+    }
+
+    /// The machine serves `n` slots' streams ([`HostTier::add_streams`]).
+    /// Nothing without a machine.
+    pub fn add_streams<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        tier.add_streams(n)
+    }
+
     /// The residency back to its seed at a quiet boundary
     /// ([`HostTier::swap_reset`]); `None` without a machine.
     pub fn reset<H: HostExperts>(

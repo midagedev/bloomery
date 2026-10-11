@@ -6,6 +6,7 @@
 //! [`TierBody::residency_parts`] and the machine's calls keep
 //! [`HostServed`]'s defaults.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_core::CudaStream;
@@ -109,6 +110,39 @@ impl<B: TierBody> HostServed for B {
     fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         match self.residency_parts() {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.keep_rows(hybrid, kept, kind),
+            None => Ok(()),
+        }
+    }
+
+    /// The pass keeping `kept` rows, each for its range's slot
+    /// ([`ResidencyGlue::keep_rows_by`]).
+    fn keep_rows_by(
+        &mut self,
+        kept: KeptRows,
+        kind: PassKind,
+        ranges: impl Iterator<Item = (usize, Range<usize>)> + Clone,
+    ) -> Result<(), GpuError> {
+        match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => {
+                glue.keep_rows_by(hybrid, kept, kind, ranges)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The machine's rule serving `n` slots' streams
+    /// ([`ResidencyGlue::add_streams`]).
+    fn add_streams(&mut self, n: usize) -> Result<(), GpuError> {
+        match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => glue.add_streams(hybrid, n),
+            None => Ok(()),
+        }
+    }
+
+    /// Plain keeps belonging to `slot`'s stream ([`ResidencyGlue::select_stream`]).
+    fn select_stream(&mut self, slot: usize) -> Result<(), GpuError> {
+        match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => glue.select_stream(hybrid, slot),
             None => Ok(()),
         }
     }

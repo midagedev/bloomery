@@ -2478,9 +2478,8 @@ mod gate {
         Ok(ok)
     }
 
-    /// keep: the tier's own `keep_rows` refuses a count with no pass open —
-    /// the write side of the boundary's kept-count refusal.
-    fn keep_clause(gpu: &Gpu) -> Result<bool, GateError> {
+    /// A host tier over a bare synthetic machine, no pass open.
+    fn bare_tier(gpu: &Gpu) -> Result<HostTier<NoExperts>, GateError> {
         let stacks = Stacks::new(gpu)?;
         let source = Arc::new(Synth::new(&stacks, N_L, Faults::default()));
         let slots = seed_map(&[])?;
@@ -2507,6 +2506,13 @@ mod gate {
             source,
             cfg(DELAY, DEADLINE),
         )?;
+        Ok(tier)
+    }
+
+    /// keep: the tier's own `keep_rows` refuses a count with no pass open —
+    /// the write side of the boundary's kept-count refusal.
+    fn keep_clause(gpu: &Gpu) -> Result<bool, GateError> {
+        let mut tier = bare_tier(gpu)?;
         tier.swap_boundary(gpu.stream())?
             .ok_or("gate_swap: the tier's boundary")?;
         let kept_open = tier.keep_rows(KeptRows::prefix(1), PassKind::Step).is_ok();
@@ -2526,6 +2532,93 @@ mod gate {
             "keep: a step kept on the pass the boundary opened {kept_open}; after the reset no \
              pass open {no_pass}, that keep {refused:?} named {named}, nothing stored (the next \
              boundary {after}) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// Row `row` of the open pass routes experts `0..K` at every layer.
+    fn note_row(tier: &mut HostTier<NoExperts>, row: usize) -> Result<(), GateError> {
+        let t = tier.swap_tally().ok_or("gate_swap: the tier's tally")?;
+        for layer in LAYERS {
+            for k in 0..K {
+                t.note(layer, row, k, k as u32)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A tier of two serving slots, a pass open.
+    fn two_slot_tier(gpu: &Gpu) -> Result<HostTier<NoExperts>, GateError> {
+        let mut tier = bare_tier(gpu)?;
+        tier.add_streams(2)?;
+        tier.swap_boundary(gpu.stream())?
+            .ok_or("gate_swap: the tier's boundary")?;
+        Ok(tier)
+    }
+
+    /// Whether a stream other than `stream` holds rows: which slots' rows
+    /// the machine has folded.
+    fn others_hold(tier: &HostTier<NoExperts>, stream: usize) -> bool {
+        tier.swap().is_some_and(|m| m.others_hold_rows(stream))
+    }
+
+    /// streams: with two serving slots, a pass of several slots folds each
+    /// row into its own slot's stream whatever order its ranges come in; a
+    /// plain pass folds into the selected slot's stream and a prompt call's
+    /// zero rows are not refused; a reset keeps both streams, so a pass of
+    /// both slots after it folds, from zero heats.
+    fn streams_clause(gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+
+        // Slot 1's row first, slot 0's second; only the first is kept.
+        let mut tier = two_slot_tier(gpu)?;
+        note_row(&mut tier, 0)?;
+        note_row(&mut tier, 1)?;
+        tier.keep_rows_by(
+            KeptRows::of([0]),
+            PassKind::Slots,
+            [(1, 0..1), (0, 1..2)].into_iter(),
+        )?;
+        let ranged = tier.swap_boundary(stream).is_ok();
+        let by_range = ranged && others_hold(&tier, 0) && !others_hold(&tier, 1);
+
+        // A prompt call keeps no row; a step after `select_stream(1)` keeps one.
+        let mut tier = two_slot_tier(gpu)?;
+        tier.keep_rows(KeptRows::prefix(0), PassKind::Prompt)?;
+        let prompt = tier.swap_boundary(stream).is_ok();
+        note_row(&mut tier, 0)?;
+        tier.select_stream(1)?;
+        tier.keep_rows(KeptRows::prefix(1), PassKind::Step)?;
+        let stepped = tier.swap_boundary(stream).is_ok();
+        let by_select = prompt && stepped && others_hold(&tier, 0) && !others_hold(&tier, 1);
+
+        // Both slots fold, the reset empties both, and both fold again.
+        let mut tier = two_slot_tier(gpu)?;
+        let both = [(1, 0..1), (0, 1..2)];
+        note_row(&mut tier, 0)?;
+        note_row(&mut tier, 1)?;
+        tier.keep_rows_by(KeptRows::prefix(2), PassKind::Slots, both.iter().cloned())?;
+        tier.swap_boundary(stream)?
+            .ok_or("gate_swap: the tier's boundary")?;
+        let before = tier.swap().is_some_and(|m| m.has_history());
+        tier.swap_reset(stream)?
+            .ok_or("gate_swap: the tier's reset")?;
+        let cleared = !tier.swap().is_some_and(|m| m.has_history());
+        tier.swap_boundary(stream)?
+            .ok_or("gate_swap: the tier's boundary")?;
+        note_row(&mut tier, 0)?;
+        note_row(&mut tier, 1)?;
+        tier.keep_rows_by(KeptRows::prefix(2), PassKind::Slots, both.iter().cloned())?;
+        let again = tier.swap_boundary(stream).is_ok();
+        let kept = before && cleared && again && others_hold(&tier, 0) && others_hold(&tier, 1);
+
+        let ok = by_range && by_select && kept;
+        println!(
+            "streams: slot 1's row before slot 0's folds into stream 1 alone {by_range}; a \
+             prompt call's zero rows {prompt}, then a step after select_stream(1) folds into \
+             stream 1 alone {by_select}; a reset empties both streams ({before} -> {cleared}) \
+             and a pass of both slots after it folds {kept} {}",
             verdict(ok)
         );
         Ok(ok)
@@ -5133,6 +5226,7 @@ mod gate {
         ok &= tally_clause(&gpu, &pm, &trace)?;
         ok &= ahead(&gpu, &pm, &trace, &a)?;
         ok &= keep_clause(&gpu)?;
+        ok &= streams_clause(&gpu)?;
         ok &= broken(&gpu, &pm, &trace, &a)?;
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= fault_code()?;

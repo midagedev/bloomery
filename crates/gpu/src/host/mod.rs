@@ -127,6 +127,7 @@ use route_trace::RouteTrace;
 use runtime::swaprule::KeptRows;
 use runtime::xsplit;
 use slots::{MAX_TIERS, Slot, SlotMap};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -833,6 +834,13 @@ pub struct HostTier<H> {
     /// ([`HostTier::start_swap`]), and the rows the open pass keeps.
     swap: Option<swap::SwapMachine>,
     swap_kept: Option<(KeptRows, PassKind)>,
+    /// Per row of the open pass, the serving slot whose stream the row folds
+    /// into ([`HostTier::keep_rows`], [`HostTier::keep_rows_by`]): sized once
+    /// at the machine's `max_rows`, refilled by every keep, never grown.
+    swap_streams: Vec<u32>,
+    /// The serving slot every plain keep belongs to
+    /// ([`HostTier::select_stream`]); 0 until one is selected.
+    selected: u32,
     /// The stage card's copy of the map the machine writes: after `swap`, so
     /// it outlives the machine that holds its address.
     swap_view: Option<Arc<DeviceTensor<u32>>>,
@@ -901,6 +909,8 @@ impl<H: HostExperts> HostTier<H> {
             tier_lists: Vec::new(),
             swap: None,
             swap_kept: None,
+            swap_streams: Vec::new(),
+            selected: 0,
             swap_view: None,
             xstream: None,
         })
@@ -928,8 +938,10 @@ impl<H: HostExperts> HostTier<H> {
                 "a tier without a machine",
             ));
         }
+        let rows = cfg.max_rows;
         let machine =
             swap::SwapMachine::new(ctx, stream, &mut self.slots, view.buf(), source, cfg)?;
+        self.swap_streams = vec![self.selected; rows];
         self.step.tally = machine.tally();
         self.step.window = Some(machine.window());
         self.swap = Some(machine);
@@ -964,22 +976,93 @@ impl<H: HostExperts> HostTier<H> {
 
     /// The pass that just ran, a `kind`, keeps `kept` rows (a step its one
     /// row, a verify its accepted rows, a drafted slots pass each slot's
-    /// accepted rows, a prompt call none): what the next boundary folds.
+    /// accepted rows, a prompt call none): what the next boundary folds, every
+    /// row into the selected slot's stream ([`HostTier::select_stream`]).
     /// Refused by name — the write side of the refusal the
     /// next boundary makes ([`pass_kept`]) — rows kept with no pass
     /// open, and ones kept while a boundary made ahead waits for its launch
     /// (the pass it opened has not run). Nothing without a machine.
     pub fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
-        const WHAT: &str = "HostTier::keep_rows";
-        let Some(m) = self.swap.as_ref() else {
+        if !self.can_keep(kept, kind, "HostTier::keep_rows")? {
             return Ok(());
-        };
-        m.refuse_if_ahead(WHAT)?;
-        if !m.pass_open() {
-            return Err(GpuError::protocol(WHAT, kept_with_no_pass(kept, kind)));
+        }
+        self.swap_streams.fill(self.selected);
+        self.swap_kept = Some((kept, kind));
+        Ok(())
+    }
+
+    /// [`HostTier::keep_rows`] for a pass of several slots: each row folds
+    /// into the stream of the slot whose range holds it, `ranges` being the
+    /// `(slot, rows)` pairs in the order the caller gave them (a slot's rows
+    /// are contiguous, not sorted by slot). Refused by name, nothing
+    /// recorded, besides what `keep_rows` refuses: a range past the machine's
+    /// rows, and a slot past `u32`. A slot past the rule's streams is refused
+    /// at the boundary that folds it ([`swap::SwapMachine::end_pass_by`]).
+    pub fn keep_rows_by(
+        &mut self,
+        kept: KeptRows,
+        kind: PassKind,
+        ranges: impl Iterator<Item = (usize, Range<usize>)> + Clone,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::keep_rows_by";
+        if !self.can_keep(kept, kind, WHAT)? {
+            return Ok(());
+        }
+        let rows = self.swap_streams.len();
+        for (slot, at) in ranges.clone() {
+            if at.end > rows || u32::try_from(slot).is_err() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("slot {slot}'s rows {at:?} for a machine of {rows} rows per pass"),
+                ));
+            }
+        }
+        self.swap_streams.fill(self.selected);
+        for (slot, at) in ranges {
+            self.swap_streams[at].fill(slot as u32);
         }
         self.swap_kept = Some((kept, kind));
         Ok(())
+    }
+
+    /// Every later plain keep belongs to serving slot `slot`'s stream
+    /// ([`HostTier::keep_rows`]): what [`crate::model::GpuModel::select_slot`]
+    /// moves. Rows already kept stay with the stream they were kept for.
+    /// Refused by name: a slot past `u32`.
+    pub fn select_stream(&mut self, slot: usize) -> Result<(), GpuError> {
+        self.selected = u32::try_from(slot).map_err(|_| {
+            GpuError::shape("HostTier::select_stream", format!("slot {slot} past u32"))
+        })?;
+        Ok(())
+    }
+
+    /// The residency rule serves `n` slots' streams from now on, each new one
+    /// live and empty ([`swap::SwapMachine::add_streams`]). Load-time work.
+    /// Nothing without a machine.
+    pub fn add_streams(&mut self, n: usize) -> Result<(), GpuError> {
+        match self.swap.as_mut() {
+            Some(m) => m.add_streams(n),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a keep records: `false` without a machine. Refused by name
+    /// ([`HostTier::keep_rows`]): a boundary made ahead waiting for its
+    /// launch, and no pass open.
+    fn can_keep(
+        &self,
+        kept: KeptRows,
+        kind: PassKind,
+        what: &'static str,
+    ) -> Result<bool, GpuError> {
+        let Some(m) = self.swap.as_ref() else {
+            return Ok(false);
+        };
+        m.refuse_if_ahead(what)?;
+        if !m.pass_open() {
+            return Err(GpuError::protocol(what, kept_with_no_pass(kept, kind)));
+        }
+        Ok(true)
     }
 
     /// The residency boundary before a pass on `stream`
@@ -1050,7 +1133,7 @@ impl<H: HostExperts> HostTier<H> {
         m.refuse_if_ahead("HostTier::swap_boundary")?;
         let mut kind = PassKind::None;
         if let Some((rows, of)) = pass_kept(m.pass_open(), self.swap_kept.take())? {
-            m.end_pass(&mut self.step.tally, rows)?;
+            m.end_pass_by(&mut self.step.tally, rows, &self.swap_streams)?;
             kind = of;
         }
         let report = match ahead {
@@ -2276,6 +2359,7 @@ impl<H: HostExperts> HostTier<H> {
             && self.swap_kept.is_none()
         {
             self.step.tally.clear();
+            self.swap_streams.fill(self.selected);
             self.swap_kept = Some((KeptRows::prefix(0), PassKind::Abandoned));
         }
     }
