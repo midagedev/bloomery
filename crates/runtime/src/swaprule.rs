@@ -10,6 +10,13 @@
 //! [`SwapParams::margin`]; at most [`SwapParams::cap`] pairs a planning pass
 //! over all layers, largest gain first, then every count decays.
 //!
+//! The counts are per stream: each stream the rule serves ([`SwapRule::with_streams`],
+//! [`SwapRule::stream_open`]) keeps a heat vector of its own, an end of pass
+//! folds each kept row into its stream's ([`SwapRule::end_pass_by`]), and a
+//! planning pass pairs from the blend of the live streams' heats, each weighted
+//! by its expected tokens over the largest live stream's, summed in stream
+//! order. A rule with its one stream counts as a rule with one vector does.
+//!
 //! A pair is a [`Flip`]: admit-then-flip into one of the layer's
 //! [`SwapParams::spares`] spare slots. The victim stays on the card until the
 //! flip goes live, `delay` passes after the boundary that made it, and both
@@ -288,6 +295,47 @@ pub enum SwapRuleError {
         layer: usize,
         id: u32,
     },
+    /// A stream index past the rule's streams.
+    StreamOutOfRange {
+        stream: usize,
+        streams: usize,
+    },
+    /// Opening a stream that is live.
+    StreamLive {
+        stream: usize,
+    },
+    /// A call that needs a live stream, made on one that is not.
+    StreamNotLive {
+        stream: usize,
+    },
+    /// A prior heat of another length than layers × experts.
+    PriorShape {
+        len: usize,
+        want: usize,
+    },
+    /// A prior heat cell that is not finite or is negative.
+    PriorCell {
+        index: usize,
+    },
+    /// An expected token count that is not finite or not over 0.
+    ExpectedTokens {
+        stream: usize,
+    },
+    /// An end of pass with no row→stream map while several streams are live.
+    StreamsAmbiguous {
+        live: usize,
+    },
+    /// A row→stream map shorter than the pass's rows.
+    RowStreamLength {
+        len: usize,
+        rows: usize,
+    },
+    /// Streams set on a rule that is not as built: another stream count,
+    /// a pass ended, or a heat held.
+    StreamsLate {
+        streams: usize,
+        passes: u64,
+    },
 }
 
 impl fmt::Display for SwapRuleError {
@@ -400,6 +448,38 @@ impl fmt::Display for SwapRuleError {
                 "a settled flip evicts layer {layer}'s expert {id}, which is not a live unpinned \
                  resident outside every flip in flight"
             ),
+            SwapRuleError::StreamOutOfRange { stream, streams } => {
+                write!(f, "stream {stream} of a rule over {streams} streams")
+            }
+            SwapRuleError::StreamLive { stream } => {
+                write!(f, "stream {stream} is live: close it before opening it")
+            }
+            SwapRuleError::StreamNotLive { stream } => write!(f, "stream {stream} is not live"),
+            SwapRuleError::PriorShape { len, want } => {
+                write!(f, "{len} prior heat cells, not layers × experts = {want}")
+            }
+            SwapRuleError::PriorCell { index } => write!(
+                f,
+                "prior heat cell {index} is not finite or is negative: no fold writes one"
+            ),
+            SwapRuleError::ExpectedTokens { stream } => write!(
+                f,
+                "stream {stream}'s expected tokens must be finite and over 0"
+            ),
+            SwapRuleError::StreamsAmbiguous { live } => write!(
+                f,
+                "an end of pass with {live} streams live and no row→stream map: name each row's \
+                 stream"
+            ),
+            SwapRuleError::RowStreamLength { len, rows } => write!(
+                f,
+                "a row→stream map of {len} entries for a pass of {rows} rows"
+            ),
+            SwapRuleError::StreamsLate { streams, passes } => write!(
+                f,
+                "streams set on a rule that is not as built ({streams} streams, {passes} passes \
+                 ended, stream 0 changed or a heat held): set them once, before anything else"
+            ),
         }
     }
 }
@@ -455,6 +535,18 @@ pub struct SwapRule {
     away: Vec<bool>,
     /// `layer * experts + id`.
     slot: Vec<Slot>,
+    /// `stream * layers * experts + layer * experts + id`: each stream's own
+    /// decayed counts, what an end of pass folds into and a planning pass
+    /// decays. A stream that is not live holds zeros.
+    heat: Vec<f64>,
+    /// Per stream: its heat counts toward the blend.
+    live: Vec<bool>,
+    /// Per stream: the tokens it is expected to run, its weight's numerator
+    /// ([`SwapRule::stream_open`]); 1.0 while the stream is not live.
+    expected: Vec<f64>,
+    /// `layer * experts + id`: the live streams' blend `Σ ω_s · heat_s`, in
+    /// ascending stream order. Scratch: written at a planning pass right
+    /// before `make_pairs` reads it, and read nowhere else.
     counts: Vec<f64>,
     /// Per layer: no pass routes it ([`SwapRule::with_unrouted`]).
     unrouted: Vec<bool>,
@@ -487,7 +579,9 @@ impl PartialEq for SwapRule {
             && self.pinned == o.pinned
             && self.away == o.away
             && self.slot == o.slot
-            && self.counts == o.counts
+            && self.heat == o.heat
+            && self.live == o.live
+            && self.expected == o.expected
             && self.unrouted == o.unrouted
             && self.in_flight == o.in_flight
             && self.pending == o.pending
@@ -569,6 +663,19 @@ fn check_params(p: &SwapParams) -> Result<(), SwapRuleError> {
     }
     if !(0.0..=1.0).contains(&p.decay) {
         return param("decay", "0 to 1");
+    }
+    Ok(())
+}
+
+/// Whether `c` can be a heat cell: a fold adds 1.0 and a decay multiplies by a
+/// factor in 0 to 1, so no cell is NaN, infinite or negative.
+pub(crate) fn valid_heat_cell(c: f64) -> bool {
+    c.is_finite() && c >= 0.0
+}
+
+fn check_expected(stream: usize, expected: f64) -> Result<(), SwapRuleError> {
+    if !(expected.is_finite() && expected > 0.0) {
+        return Err(SwapRuleError::ExpectedTokens { stream });
     }
     Ok(())
 }
@@ -705,6 +812,9 @@ impl SwapRule {
             pinned: pinned.to_vec(),
             away: is_away,
             slot,
+            heat: vec![0.0; layers * e],
+            live: vec![true],
+            expected: vec![1.0],
             counts: vec![0.0; layers * e],
             unrouted: vec![false; layers],
             in_flight: vec![0; layers],
@@ -743,6 +853,179 @@ impl SwapRule {
     #[must_use]
     pub fn unrouted(&self) -> &[bool] {
         &self.unrouted
+    }
+
+    /// The rule with `n` streams, each with a heat vector of its own, sized
+    /// here once: stream 0 is live, expecting 1.0 tokens, as in a rule built
+    /// with one stream, and the others are closed until
+    /// [`SwapRule::stream_open`]. Refused by name: no stream, more than a
+    /// row→stream map names (`u32::MAX`), more heat cells than `usize`
+    /// counts, and a rule that is not as built (another stream count, stream 0
+    /// closed or re-weighted, a pass ended, a heat held).
+    pub fn with_streams(mut self, n: usize) -> Result<Self, SwapRuleError> {
+        let shape_err = |what| Err(SwapRuleError::Shape { what, value: n });
+        if n == 0 || u32::try_from(n).is_err() {
+            return shape_err("streams must be 1 to u32::MAX");
+        }
+        if self.live != [true] || self.expected != [1.0] || self.passes != 0 || self.has_history() {
+            return Err(SwapRuleError::StreamsLate {
+                streams: self.live.len(),
+                passes: self.passes,
+            });
+        }
+        let Some(cells) = self.cells().checked_mul(n) else {
+            return shape_err("streams × layers × experts heat cells must fit usize");
+        };
+        self.heat.resize(cells, 0.0);
+        self.live.resize(n, false);
+        self.expected.resize(n, 1.0);
+        Ok(self)
+    }
+
+    /// Cells in one stream's heat: layers × experts.
+    fn cells(&self) -> usize {
+        self.layers * self.shape.experts
+    }
+
+    /// Stream `stream`'s heat.
+    fn heat_of(&self, stream: usize) -> &[f64] {
+        let cells = self.cells();
+        &self.heat[stream * cells..(stream + 1) * cells]
+    }
+
+    /// Whether stream `stream` is live and holds a count over 0.
+    fn holds_rows(&self, stream: usize) -> bool {
+        self.live[stream] && self.heat_of(stream).iter().any(|&c| c > 0.0)
+    }
+
+    fn check_stream(&self, stream: usize) -> Result<(), SwapRuleError> {
+        if stream >= self.live.len() {
+            return Err(SwapRuleError::StreamOutOfRange {
+                stream,
+                streams: self.live.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Open stream `stream`, live from here, with `prior` as its heat (zeros
+    /// when `None`) and `expected` tokens ahead of it: its weight in the
+    /// blend is `expected` over the largest live stream's. The heat is
+    /// the stream's own, copied: a prior is not another stream's history.
+    /// Refused by name, the rule unchanged: a stream past the rule's, one
+    /// already live, a prior of another length than layers × experts or with
+    /// a cell that is not finite or is negative, and an `expected` that is not
+    /// finite and over 0.
+    pub fn stream_open(
+        &mut self,
+        stream: usize,
+        prior: Option<&[f64]>,
+        expected: f64,
+    ) -> Result<(), SwapRuleError> {
+        self.check_stream(stream)?;
+        if self.live[stream] {
+            return Err(SwapRuleError::StreamLive { stream });
+        }
+        if let Some(p) = prior {
+            let want = self.cells();
+            if p.len() != want {
+                return Err(SwapRuleError::PriorShape { len: p.len(), want });
+            }
+            if let Some(index) = p.iter().position(|&c| !valid_heat_cell(c)) {
+                return Err(SwapRuleError::PriorCell { index });
+            }
+        }
+        check_expected(stream, expected)?;
+        let cells = self.cells();
+        let heat = &mut self.heat[stream * cells..(stream + 1) * cells];
+        match prior {
+            Some(p) => heat.copy_from_slice(p),
+            None => heat.fill(0.0),
+        }
+        self.live[stream] = true;
+        self.expected[stream] = expected;
+        Ok(())
+    }
+
+    /// Close stream `stream`: its heat goes into `out`, a buffer the caller
+    /// owns (cleared, then extended), and the stream leaves the blend, its
+    /// slice zeroed and its expected tokens back to 1.0. The blend moves at
+    /// the next planning pass, which sums the streams still live from
+    /// scratch. Refused by name, the rule unchanged: a stream past the
+    /// rule's and one that is not live.
+    pub fn stream_close(&mut self, stream: usize, out: &mut Vec<f64>) -> Result<(), SwapRuleError> {
+        self.check_stream(stream)?;
+        if !self.live[stream] {
+            return Err(SwapRuleError::StreamNotLive { stream });
+        }
+        let cells = self.cells();
+        let heat = &mut self.heat[stream * cells..(stream + 1) * cells];
+        out.clear();
+        out.extend_from_slice(heat);
+        heat.fill(0.0);
+        self.live[stream] = false;
+        self.expected[stream] = 1.0;
+        Ok(())
+    }
+
+    /// Stream `stream`'s expected tokens, from the next planning pass on.
+    /// Refused by name, the rule unchanged: a stream past the rule's, one that
+    /// is not live, and an `expected` that is not finite and over 0.
+    pub fn set_expected(&mut self, stream: usize, expected: f64) -> Result<(), SwapRuleError> {
+        self.check_stream(stream)?;
+        if !self.live[stream] {
+            return Err(SwapRuleError::StreamNotLive { stream });
+        }
+        check_expected(stream, expected)?;
+        self.expected[stream] = expected;
+        Ok(())
+    }
+
+    /// Whether a live stream other than `stream` holds a count over 0: the
+    /// rows a call's placement would take from it.
+    ///
+    /// # Panics
+    ///
+    /// When `stream` is past the rule's streams.
+    #[must_use]
+    pub fn others_hold_rows(&self, stream: usize) -> bool {
+        assert!(
+            stream < self.live.len(),
+            "stream {stream} of a rule over {} streams",
+            self.live.len()
+        );
+        (0..self.live.len()).any(|t| t != stream && self.holds_rows(t))
+    }
+
+    /// Stream `stream`'s weight in the blend: its expected tokens over the
+    /// largest live stream's, so one live stream, or equal ones, weigh exactly
+    /// 1.0; 0.0 for a stream that is not live.
+    fn weight(&self, stream: usize) -> f64 {
+        if !self.live[stream] {
+            return 0.0;
+        }
+        let top = (0..self.live.len())
+            .filter(|&t| self.live[t])
+            .fold(0.0, |top, t| f64::max(top, self.expected[t]));
+        self.expected[stream] / top
+    }
+
+    /// `counts` from the live streams' heats, from zero, in ascending stream
+    /// order: the sum's bits are the stream index's, never the order streams
+    /// were opened in.
+    fn blend(&mut self) {
+        self.counts.fill(0.0);
+        for stream in 0..self.live.len() {
+            if !self.live[stream] {
+                continue;
+            }
+            let w = self.weight(stream);
+            let cells = self.cells();
+            let heat = &self.heat[stream * cells..(stream + 1) * cells];
+            for (c, &h) in self.counts.iter_mut().zip(heat) {
+                *c += w * h;
+            }
+        }
     }
 
     /// This pass's observed cells and their ids.
@@ -879,10 +1162,35 @@ impl SwapRule {
         Ok(())
     }
 
-    /// End the pass: fold `kept`'s rows into the counts and drop the rest,
-    /// so a rejected row leaves no trace. Every layer but the ones no pass
-    /// routes must have observed every kept row.
+    /// End the pass: fold `kept`'s rows into stream 0's heat and drop the
+    /// rest, so a rejected row leaves no trace. Every layer but the ones no
+    /// pass routes must have observed every kept row. Refused by name while
+    /// more than one stream is live: whose rows these are is
+    /// [`SwapRule::end_pass_by`]'s to say.
     pub fn end_pass(&mut self, kept: KeptRows) -> Result<(), SwapRuleError> {
+        let live = self.live.iter().filter(|&&l| l).count();
+        if live > 1 {
+            return Err(SwapRuleError::StreamsAmbiguous { live });
+        }
+        self.fold_pass(kept, None)
+    }
+
+    /// [`SwapRule::end_pass`] for a pass whose row `row` belongs to stream
+    /// `row_stream[row]`: each kept row folds into its own stream's heat.
+    /// Refused by name, the rule unchanged: a map shorter than the pass's
+    /// rows, and a row, kept or dropped, whose stream is past the rule's or
+    /// not live.
+    pub fn end_pass_by(&mut self, kept: KeptRows, row_stream: &[u32]) -> Result<(), SwapRuleError> {
+        self.fold_pass(kept, Some(row_stream))
+    }
+
+    /// The end of a pass, `row_stream` mapping each row to its stream, or every
+    /// row to stream 0 when `None`. Every refusal comes before the first fold.
+    fn fold_pass(
+        &mut self,
+        kept: KeptRows,
+        row_stream: Option<&[u32]>,
+    ) -> Result<(), SwapRuleError> {
         if self.planned != self.passes {
             return Err(SwapRuleError::PlanSkipped {
                 boundary: self.passes,
@@ -894,7 +1202,28 @@ impl SwapRule {
                 rows: self.pass_rows,
             });
         }
-        let (l_n, top_k, e) = (self.layers, self.shape.top_k, self.shape.experts);
+        if let Some(map) = row_stream
+            && map.len() < self.pass_rows
+        {
+            return Err(SwapRuleError::RowStreamLength {
+                len: map.len(),
+                rows: self.pass_rows,
+            });
+        }
+        let stream_of = |row: usize| row_stream.map_or(0, |map| map[row] as usize);
+        for row in 0..self.pass_rows {
+            let stream = stream_of(row);
+            self.check_stream(stream)?;
+            if !self.live[stream] {
+                return Err(SwapRuleError::StreamNotLive { stream });
+            }
+        }
+        let (l_n, top_k, e, cells) = (
+            self.layers,
+            self.shape.top_k,
+            self.shape.experts,
+            self.cells(),
+        );
         for row in 0..self.shape.max_rows {
             if !kept.keeps(row) {
                 continue;
@@ -909,13 +1238,14 @@ impl SwapRule {
             if !kept.keeps(row) {
                 continue;
             }
+            let heat = stream_of(row) * cells;
             for layer in 0..l_n {
                 if self.unrouted[layer] {
                     continue;
                 }
                 let cell = row * l_n + layer;
                 for &id in &self.rows[cell * top_k..(cell + 1) * top_k] {
-                    self.counts[layer * e + id as usize] += 1.0;
+                    self.heat[heat + layer * e + id as usize] += 1.0;
                 }
             }
         }
@@ -928,8 +1258,9 @@ impl SwapRule {
 
     /// The boundary `boundary` the last pass ended at: the flips going live
     /// there land, and when the ended passes have kept
-    /// [`SwapParams::every`] rows past the last plan's, a planning pass makes
-    /// new flips, live at `boundary + delay`, then every count decays. The
+    /// [`SwapParams::every`] rows past the last plan's, a planning pass blends
+    /// the live streams' heats, makes new flips from the blend, live at
+    /// `boundary + delay`, then every live stream's heat decays. The
     /// kept rows past `every` carry to the next plan, so plans come every
     /// `every` kept rows whatever rows a pass keeps; a boundary plans once at
     /// most, and what a pass of more than `every` rows keeps past that carries
@@ -951,10 +1282,16 @@ impl SwapRule {
         self.flips.clear();
         if self.since >= self.params.every {
             self.since %= self.params.every;
+            self.blend();
             self.make_pairs();
             self.issue(boundary);
             let decay = self.params.decay;
-            self.counts.iter_mut().for_each(|c| *c *= decay);
+            let cells = self.cells();
+            for (heat, &live) in self.heat.chunks_exact_mut(cells).zip(&self.live) {
+                if live {
+                    heat.iter_mut().for_each(|h| *h *= decay);
+                }
+            }
             if self.params.delay == 0 {
                 self.land(boundary);
             }
@@ -1238,18 +1575,22 @@ impl SwapRule {
         r
     }
 
-    /// Whether the rule holds any decode history: a count over 0, which only
-    /// a kept row's fold writes ([`SwapRule::end_pass`]; a prompt call's rows
-    /// are not counted, and its picks move no count) and a reset clears. What
-    /// a prompt call's end reads: with history the decode has been routing
-    /// experts of its own, so the call puts the pool back where it found it;
-    /// without one (a fresh server) the call's placement stays for the decode.
+    /// Whether the rule holds any decode history: a live stream's heat over 0,
+    /// which only a kept row's fold writes ([`SwapRule::end_pass`]; a prompt
+    /// call's rows are not counted, and its picks move no count), a stream's
+    /// prior opens with ([`SwapRule::stream_open`]) and a reset or a stream's
+    /// close clears. What a prompt call's end reads: with history the decode
+    /// has been routing experts of its own, so the call puts the pool back
+    /// where it found it; without one (a fresh server) the call's placement
+    /// stays for the decode.
     pub fn has_history(&self) -> bool {
-        self.counts.iter().any(|&c| c > 0.0)
+        (0..self.live.len()).any(|stream| self.holds_rows(stream))
     }
 
     /// Back to the seed: every layer's card set, its away experts away, no
-    /// count, no flip in flight, no observed row, boundary 0.
+    /// count, no flip in flight, no observed row, boundary 0, and the streams
+    /// as built: stream 0 live and the others closed, every heat zero and every
+    /// expected token count 1.0.
     pub fn reset(&mut self) {
         let e = self.shape.experts;
         self.slot.fill(Slot::Off);
@@ -1266,6 +1607,10 @@ impl SwapRule {
                 }
             }
         }
+        self.heat.fill(0.0);
+        self.live.fill(false);
+        self.live[0] = true;
+        self.expected.fill(1.0);
         self.counts.fill(0.0);
         self.in_flight.fill(0);
         self.pending.clear();
@@ -1499,7 +1844,7 @@ mod tests {
                 r.observe(0, row, &[id]).unwrap();
             }
             end(&mut r).unwrap();
-            r.counts.clone()
+            r.heat_of(0).to_vec()
         };
         let mut want = vec![0.0; 8];
         want[2] = 1.0;
@@ -2579,7 +2924,7 @@ mod tests {
 
     /// A rule over a routed layer with card slots, a trunk layer with none
     /// (routed, all its experts on the host) and a layer with none that no
-    /// pass routes; its counts are read at `counts`.
+    /// pass routes; its counts are read at stream 0's heat.
     fn unrouted_rule(listed: &[usize]) -> Result<SwapRule, SwapRuleError> {
         let shape = Shape {
             experts: 4,
@@ -2604,8 +2949,8 @@ mod tests {
         }
         r.end_pass(KeptRows::prefix(2))
             .expect("the listed layer needs no kept row");
-        assert!(r.counts[2 * 4..3 * 4].iter().all(|&c| c == 0.0));
-        assert_eq!(r.counts[4..8], [0.0, 2.0, 0.0, 2.0]);
+        assert!(r.heat_of(0)[2 * 4..3 * 4].iter().all(|&c| c == 0.0));
+        assert_eq!(r.heat_of(0)[4..8], [0.0, 2.0, 0.0, 2.0]);
         let mut unlisted = unrouted_rule(&[]).unwrap();
         unlisted.observe(0, 0, &[0, 2]).unwrap();
         unlisted.observe(1, 0, &[1, 3]).unwrap();
@@ -2640,5 +2985,602 @@ mod tests {
                 layers: 3
             }
         );
+    }
+
+    // Streams: one heat vector each, blended at a planning pass.
+    //
+    // The multi-stream cases run 2 layers × 8 experts with one resident each, a
+    // plan at every pass and no margin, so a pass's blend decides flips at once.
+    // A pass has one row per entry of its row→stream map, each routed to the
+    // expert `1 + (boundary + stream) % 7` at both layers: the hot expert
+    // moves every pass, so the resident is overtaken and flips go on.
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|c| c.to_bits()).collect()
+    }
+
+    fn streams_rule(n: usize, decay: f64) -> SwapRule {
+        rule(params(1, 96, 0.0, 0.5, decay), 8, 1, &[&[0], &[0]])
+            .with_streams(n)
+            .unwrap()
+    }
+
+    /// Stream `s`'s prior: 0.1, 0.2 and 0.3 rotated over the cells, so that
+    /// the cells sum to different bits in different orders.
+    fn prior(s: usize) -> Vec<f64> {
+        (0..16).map(|c| [0.1, 0.2, 0.3][(s + c) % 3]).collect()
+    }
+
+    /// A rule over the streams `order` names (a permutation of 0..n), each
+    /// opened with its prior and `expected` tokens, in that order.
+    fn primed(order: &[usize], decay: f64, expected: f64) -> SwapRule {
+        let mut r = streams_rule(order.len(), decay);
+        r.stream_close(0, &mut Vec::new()).unwrap();
+        for &s in order {
+            r.stream_open(s, Some(&prior(s)), expected).unwrap();
+        }
+        r
+    }
+
+    /// A pass of one row per entry of `row_stream`, ended by stream and
+    /// planned at `boundary`: the flips it made.
+    fn pass_by(r: &mut SwapRule, boundary: u64, row_stream: &[u32]) -> Vec<Flip> {
+        for (row, &s) in row_stream.iter().enumerate() {
+            for layer in 0..2 {
+                r.observe(layer, row, &[1 + (boundary as u32 + s) % 7])
+                    .unwrap();
+            }
+        }
+        r.end_pass_by(KeptRows::prefix(row_stream.len()), row_stream)
+            .unwrap();
+        r.plan(boundary).unwrap().to_vec()
+    }
+
+    /// Main's rule before streams: one vector of counts, +1.0 for each id of a
+    /// kept row, and every `every` kept rows the whole vector times `decay`.
+    /// One kept row a pass.
+    struct Single {
+        counts: Vec<f64>,
+        since: u64,
+        every: u64,
+        decay: f64,
+        experts: usize,
+    }
+
+    impl Single {
+        fn of(r: &SwapRule) -> Single {
+            Single {
+                counts: vec![0.0; r.cells()],
+                since: 0,
+                every: r.params.every,
+                decay: r.params.decay,
+                experts: r.shape.experts,
+            }
+        }
+
+        fn pass(&mut self, row: &[Vec<u32>]) {
+            for (layer, ids) in row.iter().enumerate() {
+                for &id in ids {
+                    self.counts[layer * self.experts + id as usize] += 1.0;
+                }
+            }
+            self.since += 1;
+            if self.since >= self.every {
+                self.since %= self.every;
+                self.counts.iter_mut().for_each(|c| *c *= self.decay);
+            }
+        }
+    }
+
+    /// The default rule `make` builds, a `with_streams(4)` rule with only
+    /// stream 0 live and one whose stream 0 was closed and reopened at 7.0
+    /// expected tokens, over `x` one pass a step: the same flips at every
+    /// boundary, and each one's stream 0 heat is `Single`'s bit for bit.
+    fn lockstep(make: &dyn Fn() -> SwapRule, x: &[Vec<Vec<u32>>]) {
+        let mut a = make();
+        let mut b = make().with_streams(4).unwrap();
+        let mut c = make().with_streams(4).unwrap();
+        c.stream_close(0, &mut Vec::new()).unwrap();
+        c.stream_open(0, None, 7.0).unwrap();
+        let mut model = Single::of(&a);
+        for (step, row) in x.iter().enumerate() {
+            let boundary = step as u64 + 1;
+            for r in [&mut a, &mut b, &mut c] {
+                for (layer, ids) in row.iter().enumerate() {
+                    r.observe(layer, 0, ids).unwrap();
+                }
+                r.end_pass(KeptRows::prefix(1)).unwrap();
+            }
+            model.pass(row);
+            let want = a.plan(boundary).unwrap().to_vec();
+            assert_eq!(b.plan(boundary).unwrap(), want, "boundary {boundary}");
+            assert_eq!(c.plan(boundary).unwrap(), want, "boundary {boundary}");
+            for r in [&a, &b, &c] {
+                assert_eq!(
+                    bits(r.heat_of(0)),
+                    bits(&model.counts),
+                    "stream 0's heat at boundary {boundary}"
+                );
+            }
+            for r in [&b, &c] {
+                assert!(
+                    r.heat[r.cells()..].iter().all(|&h| h == 0.0),
+                    "streams 1 to 3 stay empty at boundary {boundary}"
+                );
+            }
+        }
+    }
+
+    type Make = Box<dyn Fn() -> SwapRule>;
+
+    /// A rule with its one stream is the rule before streams: over the
+    /// vectors of every replay test (their parameters, seeds, pins and away
+    /// lists), flips and stream 0's heat match main's single vector, whether
+    /// the rule has 1 stream or 4 and whether stream 0 was reopened. A
+    /// multi-row history with kept subsets matches the default rule's.
+    /// Mutants: the decay skips stream 0's heat; the fold adds to stream 1.
+    #[test]
+    fn a_rule_with_one_live_stream_is_the_rule_before_streams() {
+        const SEED: [&[u32]; 1] = [&[0, 1, 2, 3]];
+        const SHAPE: Shape = Shape {
+            experts: 8,
+            top_k: 1,
+            max_rows: 1,
+        };
+        let delayed = |delay: u64, decay: f64| -> Make {
+            Box::new(move || {
+                let mut p = params(2, 96, 1.5, 2.0, decay);
+                p.delay = delay;
+                rule(p, 4, 1, &[&[0]])
+            })
+        };
+        let margin = |every: u64, margin: f64, min: f64| -> Make {
+            Box::new(move || rule(params(every, 96, margin, min, 1.0), 4, 1, &[&[0]]))
+        };
+        let capped =
+            || -> Make { Box::new(|| rule(params(3, 1, 1.5, 2.0, 1.0), 4, 1, &[&[0], &[0]])) };
+        let spared = |spares: usize, cap: usize, experts: usize, top_k: usize| -> Make {
+            Box::new(move || {
+                let mut p = params(2, cap, 1.5, 2.0, 1.0);
+                p.spares = spares;
+                rule(p, experts, top_k, &[&[0, 1, 2]])
+            })
+        };
+        let mid = |spares: usize| -> Make {
+            Box::new(move || {
+                let mut p = SwapParams::mid(8);
+                p.spares = spares;
+                rule(p, 32, 1, &[&[0, 1, 2, 3]])
+            })
+        };
+        let pinned = |p: usize| -> Make {
+            Box::new(move || {
+                SwapRule::new_pinned(SwapParams::mid(0), SHAPE, &SEED, &[3], &[p]).unwrap()
+            })
+        };
+        let placed = |away: &'static [u32]| -> Make {
+            Box::new(move || {
+                SwapRule::new_placed(SwapParams::mid(0), SHAPE, &SEED, &[3], &[1], &[away]).unwrap()
+            })
+        };
+        let ties = vec![vec![vec![5, 3], vec![3, 5]]; 2];
+        let hot_every_pass: Vec<Vec<Vec<u32>>> =
+            (0..24u32).map(|s| vec![vec![10 + s / 4]]).collect();
+        let marginal = steps(&[&[2], &[2], &[2], &[0], &[2], &[2]]);
+        let cases: Vec<(Make, Vec<Vec<Vec<u32>>>)> = vec![
+            (margin(2, 1.5, 2.0), repeat(2, 6)),
+            (
+                delayed(0, 0.0),
+                steps(&[&[2], &[3], &[2], &[3], &[2], &[3]]),
+            ),
+            (delayed(3, 1.0), repeat(2, 8)),
+            (delayed(3, 1.0), repeat(2, 4)),
+            (margin(4, 1.5, 2.0), marginal.clone()),
+            (margin(4, 3.0, 2.0), marginal),
+            (margin(2, 1.5, 3.0), repeat(2, 3)),
+            (capped(), steps2(&[(2, 2), (2, 2), (1, 2), (3, 3)])),
+            (capped(), steps2(&[(2, 2), (2, 2), (1, 2), (3, 2)])),
+            (spared(3, 2, 8, 3), steps(&[&[5, 6, 7], &[5, 6, 7]])),
+            (
+                Box::new(|| rule(params(2, 96, 1.5, 2.0, 1.0), 8, 2, &[&[2, 1], &[2, 1]])),
+                ties,
+            ),
+            (delayed(2, 0.0), steps(&[&[2], &[2], &[3], &[3]])),
+            (mid(1), hot_every_pass.clone()),
+            (mid(2), hot_every_pass),
+            (pinned(2), repeat(6, 8)),
+            (pinned(3), repeat(6, 8)),
+            (placed(&[6]), repeat(6, 12)),
+            (placed(&[]), repeat(6, 12)),
+        ];
+        let flips_made: usize = cases
+            .iter()
+            .map(|(make, x)| {
+                lockstep(&**make, x);
+                replay(&mut make(), x).1.len()
+            })
+            .sum();
+        assert!(flips_made > 10, "the vectors make flips to compare");
+
+        let mut a = history_rule();
+        let mut b = history_rule().with_streams(4).unwrap();
+        assert_eq!(history(&mut a, 200), history(&mut b, 200));
+        assert_eq!(bits(a.heat_of(0)), bits(b.heat_of(0)));
+    }
+
+    /// The blend sums the live streams in ascending stream index from 0.0,
+    /// never in the order they were opened: three streams at equal expected
+    /// tokens, primed with cells whose sums differ in bits by order, give the
+    /// index-order sum, and a rule that opened them in order 1, 2, 0 gives the
+    /// same counts bits and the same flips. Mutant: the sum in the order the
+    /// streams were opened.
+    #[test]
+    fn the_blend_sums_in_stream_index_order() {
+        let heats: Vec<Vec<f64>> = (0..3).map(prior).collect();
+        let sum_in = |order: &[usize], heats: &[Vec<f64>]| {
+            let mut sum = vec![0.0; 16];
+            for &s in order {
+                sum.iter_mut().zip(&heats[s]).for_each(|(c, &h)| *c += h);
+            }
+            sum
+        };
+        assert_ne!(
+            bits(&sum_in(&[0, 1, 2], &heats)),
+            bits(&sum_in(&[1, 2, 0], &heats)),
+            "the primed cells tell the two orders apart"
+        );
+        let mut a = primed(&[0, 1, 2], 1.0, 100.0);
+        let mut b = primed(&[1, 2, 0], 1.0, 100.0);
+        let (mut fa, mut fb) = (Vec::new(), Vec::new());
+        for boundary in 1..=2 {
+            fa.extend(pass_by(&mut a, boundary, &[0, 1, 2]));
+            fb.extend(pass_by(&mut b, boundary, &[0, 1, 2]));
+        }
+        let folded: Vec<Vec<f64>> = (0..3).map(|s| a.heat_of(s).to_vec()).collect();
+        assert_eq!(
+            bits(&a.counts),
+            bits(&sum_in(&[0, 1, 2], &folded)),
+            "the index-order sum"
+        );
+        assert_eq!(
+            bits(&b.counts),
+            bits(&a.counts),
+            "opening in another order leaves the counts' bits"
+        );
+        assert_eq!(fa, fb);
+        assert!(!fa.is_empty(), "the blend makes flips to compare");
+        assert_eq!(a, b);
+    }
+
+    /// A stream closed and reopened with its own heat, no plan between, is
+    /// the stream that never closed: the rule is equal, and over three more
+    /// plans it makes the same flips. Mutant: `stream_open` copies the prior
+    /// into `counts` instead of the heat.
+    #[test]
+    fn a_stream_reopened_with_its_heat_is_the_stream_that_never_closed() {
+        let mut a = primed(&[0, 1], 0.9, 40.0);
+        a.set_expected(0, 20.0).unwrap();
+        for boundary in 1..=4 {
+            pass_by(&mut a, boundary, &[0, 1]);
+        }
+        let mut b = a.clone();
+        let mut heat = Vec::new();
+        b.stream_close(1, &mut heat).unwrap();
+        assert_ne!(a, b, "the close is a change");
+        assert_eq!(bits(&heat), bits(a.heat_of(1)));
+        b.stream_open(1, Some(&heat), 40.0).unwrap();
+        assert_eq!(
+            bits(b.heat_of(1)),
+            bits(a.heat_of(1)),
+            "the prior is the stream's heat"
+        );
+        assert_eq!(a, b);
+        let (mut fa, mut fb) = (Vec::new(), Vec::new());
+        for boundary in 5..=7 {
+            fa.extend(pass_by(&mut a, boundary, &[0, 1]));
+            fb.extend(pass_by(&mut b, boundary, &[0, 1]));
+        }
+        assert_eq!(fa, fb);
+        assert!(!fa.is_empty(), "the plans make flips to compare");
+        assert_eq!(a, b);
+    }
+
+    /// A stream that closes leaves no residue: the next plan's counts are the
+    /// one heat left times 1.0, bit for bit (a decrement of the closed
+    /// stream's share would leave `(a + b) - a`, which is not `b`), and
+    /// `others_hold_rows` is false for the only live stream, true for any
+    /// stream when another live one holds rows. Mutant: the close decrements
+    /// `counts` and the plan keeps them rather than summing the heats again.
+    #[test]
+    fn a_closed_stream_leaves_no_residue_in_the_blend() {
+        let mut r = primed(&[0, 1, 2], 1.0, 5.0);
+        r.stream_close(2, &mut Vec::new()).unwrap();
+        for boundary in 1..=2 {
+            pass_by(&mut r, boundary, &[0, 1]);
+        }
+        assert!(r.others_hold_rows(0) && r.others_hold_rows(1));
+        r.stream_close(1, &mut Vec::new()).unwrap();
+        assert!(!r.others_hold_rows(0), "stream 1 is closed");
+        assert!(
+            r.others_hold_rows(1),
+            "stream 0 is live, holds rows, and is not stream 1"
+        );
+        pass_by(&mut r, 3, &[0]);
+        assert_eq!(
+            bits(&r.counts),
+            bits(r.heat_of(0)),
+            "the blend is stream 0's heat alone"
+        );
+        assert!(
+            r.counts.iter().any(|&c| c > 0.0 && c.fract() != 0.0),
+            "the cells carry the primed fractions"
+        );
+        r.stream_open(2, None, 5.0).unwrap();
+        assert!(
+            !r.others_hold_rows(0),
+            "a live stream with no rows holds none"
+        );
+        pass_by(&mut r, 4, &[0, 2]);
+        assert!(r.others_hold_rows(0) && r.others_hold_rows(2));
+    }
+
+    /// A stream's weight is its expected tokens over the largest live one's:
+    /// equal tokens weigh exactly 1.0, 20 and 40 weigh 0.5 and 1.0, one live
+    /// stream weighs 1.0 at any tokens, a stream that closes leaves the
+    /// largest to the others, and the blend applies the weights. Mutant: the
+    /// raw expected tokens without the division.
+    #[test]
+    fn a_streams_weight_is_its_expected_tokens_over_the_largest() {
+        let weights = |expected: &[f64]| {
+            let mut r = streams_rule(expected.len(), 1.0);
+            r.set_expected(0, expected[0]).unwrap();
+            for (s, &e) in expected.iter().enumerate().skip(1) {
+                r.stream_open(s, None, e).unwrap();
+            }
+            (0..expected.len()).map(|s| r.weight(s)).collect::<Vec<_>>()
+        };
+        assert_eq!(weights(&[7.0, 7.0, 7.0]), [1.0; 3]);
+        assert_eq!(weights(&[0.3, 0.3]), [1.0; 2]);
+        assert_eq!(weights(&[20.0, 40.0]), [0.5, 1.0]);
+        assert_eq!(weights(&[40.0, 20.0]), [1.0, 0.5]);
+        assert_eq!(weights(&[10.0, 40.0, 20.0]), [0.25, 1.0, 0.5]);
+        for e in [1e-9, 1.0, 123.456, 1e12] {
+            assert_eq!(weights(&[e]), [1.0], "one live stream at {e}");
+        }
+        let mut r = primed(&[0, 1], 1.0, 40.0);
+        r.set_expected(0, 20.0).unwrap();
+        assert_eq!((r.weight(0), r.weight(1)), (0.5, 1.0));
+        r.stream_close(1, &mut Vec::new()).unwrap();
+        assert_eq!(
+            (r.weight(0), r.weight(1)),
+            (1.0, 0.0),
+            "the closed stream has no weight and the largest left is stream 0"
+        );
+        r.stream_open(1, Some(&prior(1)), 40.0).unwrap();
+        pass_by(&mut r, 1, &[0, 1]);
+        let want: Vec<f64> = (0..16)
+            .map(|c| 0.0 + 0.5 * r.heat_of(0)[c] + 1.0 * r.heat_of(1)[c])
+            .collect();
+        assert_eq!(bits(&r.counts), bits(&want));
+    }
+
+    /// The stream calls refuse by name and leave the rule as it was; the same
+    /// calls take valid input.
+    #[test]
+    fn the_stream_calls_refuse_by_name() {
+        let mut r = streams_rule(2, 0.9);
+        let at = r.clone();
+        let mut out = vec![1.0];
+        let past = SwapRuleError::StreamOutOfRange {
+            stream: 2,
+            streams: 2,
+        };
+        assert_eq!(r.stream_open(2, None, 1.0), Err(past.clone()));
+        assert_eq!(
+            r.stream_open(0, None, 1.0),
+            Err(SwapRuleError::StreamLive { stream: 0 })
+        );
+        assert_eq!(
+            r.stream_open(1, Some(&[0.0; 15]), 1.0),
+            Err(SwapRuleError::PriorShape { len: 15, want: 16 })
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut p = vec![0.0; 16];
+            p[3] = bad;
+            assert_eq!(
+                r.stream_open(1, Some(&p), 1.0),
+                Err(SwapRuleError::PriorCell { index: 3 }),
+                "prior cell {bad:?}"
+            );
+        }
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                r.stream_open(1, None, bad),
+                Err(SwapRuleError::ExpectedTokens { stream: 1 }),
+                "expected {bad:?}"
+            );
+            assert_eq!(
+                r.set_expected(0, bad),
+                Err(SwapRuleError::ExpectedTokens { stream: 0 }),
+                "expected {bad:?}"
+            );
+        }
+        assert_eq!(r.stream_close(2, &mut out), Err(past.clone()));
+        assert_eq!(
+            r.stream_close(1, &mut out),
+            Err(SwapRuleError::StreamNotLive { stream: 1 })
+        );
+        assert_eq!(out, [1.0], "a refused close leaves the buffer");
+        assert_eq!(r.set_expected(2, 1.0), Err(past));
+        assert_eq!(
+            r.set_expected(1, 1.0),
+            Err(SwapRuleError::StreamNotLive { stream: 1 })
+        );
+        assert_eq!(r, at);
+        r.stream_open(1, Some(&prior(1)), 3.0).unwrap();
+        r.set_expected(1, 4.0).unwrap();
+        out.push(2.0);
+        r.stream_close(1, &mut out).unwrap();
+        assert_eq!(
+            bits(&out),
+            bits(&prior(1)),
+            "the buffer is cleared, then filled"
+        );
+    }
+
+    /// Streams are set once, on the rule as built: no stream, another count
+    /// after the first, and a rule that has ended a pass or holds a heat are
+    /// refused by name.
+    #[test]
+    fn streams_are_set_once_on_the_rule_as_built() {
+        let base = || rule(params(1, 96, 0.0, 0.5, 1.0), 8, 1, &[&[0], &[0]]);
+        assert!(matches!(
+            base().with_streams(0),
+            Err(SwapRuleError::Shape { value: 0, .. })
+        ));
+        assert_eq!(base().with_streams(1).unwrap(), base());
+        assert_eq!(
+            base().with_streams(2).unwrap().with_streams(3),
+            Err(SwapRuleError::StreamsLate {
+                streams: 2,
+                passes: 0
+            })
+        );
+        let mut used = base();
+        replay(&mut used, &steps2(&[(2, 2)]));
+        assert_eq!(
+            used.with_streams(2),
+            Err(SwapRuleError::StreamsLate {
+                streams: 1,
+                passes: 1
+            })
+        );
+        let mut primed = base();
+        primed.stream_close(0, &mut Vec::new()).unwrap();
+        primed.stream_open(0, Some(&prior(0)), 1.0).unwrap();
+        let late = Err(SwapRuleError::StreamsLate {
+            streams: 1,
+            passes: 0,
+        });
+        assert_eq!(primed.with_streams(2), late, "a heat held");
+        let mut closed = base();
+        closed.stream_close(0, &mut Vec::new()).unwrap();
+        assert_eq!(closed.with_streams(2), late, "stream 0 closed");
+        let mut weighed = base();
+        weighed.set_expected(0, 3.0).unwrap();
+        assert_eq!(weighed.with_streams(2), late, "stream 0 re-weighted");
+    }
+
+    /// An end of pass says whose rows they are once several streams are live:
+    /// `end_pass` refuses, `end_pass_by` refuses a map shorter than the
+    /// pass's rows and a kept row of a stream that is closed or past the
+    /// rule's, kept or dropped, the rule unchanged each time. `end_pass` into
+    /// a closed stream 0 is refused too.
+    #[test]
+    fn an_end_of_pass_names_whose_rows_they_are() {
+        let mut r = streams_rule(3, 1.0);
+        r.stream_open(1, None, 1.0).unwrap();
+        for row in 0..2 {
+            r.observe(0, row, &[5 + row as u32]).unwrap();
+            r.observe(1, row, &[5 + row as u32]).unwrap();
+        }
+        let at = r.clone();
+        let two = KeptRows::prefix(2);
+        assert_eq!(
+            r.end_pass(two),
+            Err(SwapRuleError::StreamsAmbiguous { live: 2 })
+        );
+        assert_eq!(
+            r.end_pass_by(two, &[0]),
+            Err(SwapRuleError::RowStreamLength { len: 1, rows: 2 })
+        );
+        assert_eq!(
+            r.end_pass_by(two, &[0, 2]),
+            Err(SwapRuleError::StreamNotLive { stream: 2 })
+        );
+        assert_eq!(
+            r.end_pass_by(two, &[0, 3]),
+            Err(SwapRuleError::StreamOutOfRange {
+                stream: 3,
+                streams: 3
+            })
+        );
+        assert_eq!(r, at);
+        assert_eq!(
+            r.end_pass_by(KeptRows::of([0]), &[1, 9]),
+            Err(SwapRuleError::StreamOutOfRange {
+                stream: 9,
+                streams: 3
+            }),
+            "a dropped row names a stream too"
+        );
+        assert_eq!(r, at);
+        r.end_pass_by(KeptRows::of([0]), &[1, 1]).unwrap();
+        assert!(r.heat_of(0).iter().all(|&h| h == 0.0));
+        assert_eq!(r.heat_of(1)[5], 1.0);
+        assert_eq!(r.heat_of(1)[8 + 5], 1.0);
+        assert_eq!(r.heat_of(1).iter().sum::<f64>(), 2.0);
+
+        let mut r = streams_rule(2, 1.0);
+        r.stream_open(1, None, 1.0).unwrap();
+        r.stream_close(0, &mut Vec::new()).unwrap();
+        r.observe(0, 0, &[5]).unwrap();
+        r.observe(1, 0, &[5]).unwrap();
+        assert_eq!(
+            r.end_pass(KeptRows::prefix(1)),
+            Err(SwapRuleError::StreamNotLive { stream: 0 })
+        );
+        r.end_pass_by(KeptRows::prefix(1), &[1]).unwrap();
+    }
+
+    /// `has_history` reads the live heats: false at the seed and for a stream
+    /// that closed with its rows, true for a prior open or a pass folded.
+    #[test]
+    fn history_is_a_live_streams_heat_over_zero() {
+        let mut r = streams_rule(2, 0.9);
+        assert!(!r.has_history());
+        pass_by(&mut r, 1, &[0]);
+        assert!(r.has_history());
+        r.stream_close(0, &mut Vec::new()).unwrap();
+        assert!(!r.has_history(), "a closed stream's rows are not history");
+        r.stream_open(1, Some(&prior(1)), 1.0).unwrap();
+        assert!(r.has_history());
+    }
+
+    /// A reset is the rule as built: stream 0 live and the others closed,
+    /// every heat zero and every expected count 1.0.
+    #[test]
+    fn a_reset_streams_rule_is_a_fresh_one() {
+        let mut r = primed(&[2, 0, 1], 0.9, 8.0);
+        for boundary in 1..=3 {
+            pass_by(&mut r, boundary, &[0, 1, 2]);
+        }
+        r.stream_close(1, &mut Vec::new()).unwrap();
+        r.reset();
+        assert_eq!(r, streams_rule(3, 0.9));
+        assert_eq!(r.live, [true, false, false]);
+        assert_eq!(r.expected, [1.0; 3]);
+        assert!(r.heat.iter().all(|&h| h == 0.0) && !r.has_history());
+    }
+
+    /// Equality reads each stream's heat, whether it is live and its expected
+    /// tokens, and not the blend scratch.
+    #[test]
+    fn equality_reads_each_streams_heat_live_and_expected() {
+        let a = primed(&[0, 1], 1.0, 5.0);
+        let mut b = a.clone();
+        assert_eq!(a, b);
+        b.set_expected(1, 6.0).unwrap();
+        assert_ne!(a, b, "expected tokens");
+        let mut b = a.clone();
+        b.stream_close(1, &mut Vec::new()).unwrap();
+        b.stream_open(1, None, 5.0).unwrap();
+        assert_ne!(a, b, "heat");
+        let mut b = a.clone();
+        b.stream_close(1, &mut Vec::new()).unwrap();
+        assert_ne!(a, b, "live");
+        let mut b = a.clone();
+        b.counts[0] = 99.0;
+        assert_eq!(a, b, "the blend is scratch");
     }
 }

@@ -39,6 +39,7 @@ pub mod state;
 mod stop;
 pub mod stores;
 pub mod swaprule;
+pub mod warmprof;
 pub mod width;
 pub mod words;
 pub mod xsplit;
