@@ -13,12 +13,13 @@
 //!   down's q8_1 blocks (no f32 `h`);
 //! - the down by its type: the q8_0 gemv over `h`, or a K-quant gemv over `h`'s q8_1 blocks.
 //!
-//! A K-quant block runs one row: the K-quant gemvs of Q4_K, Q6_K and Q3_K write row-major and the swiglu
-//! quantizer and the model's outputs read token-major, so more than one column is the q8_0 block's alone
-//! ([`enqueue_block_cols`], [`BlockPlan::check_cols`]).
+//! Over several columns ([`enqueue_block_cols`]) a q8_0 block launches its pair and its gemv once for all of them;
+//! a K-quant block runs each column through [`enqueue_block`], because the K-quant gemvs of Q4_K, Q6_K and Q3_K
+//! write row-major and the swiglu quantizer and the model's outputs read token-major. A column's rows are then
+//! the one-row run's bit for bit, which is the contract of a batch of at most a chunk.
 //!
 //! The launches beyond the q8_0 block's two are [`BlockPlan::extra_launches`], read from the plan by whoever
-//! counts a graph's nodes.
+//! counts a graph's nodes; [`BlockPlan::column_launches`] counts a run over columns the same way.
 
 use bloomery_gpu::gemm::GemmKernels;
 use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels};
@@ -29,6 +30,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 
 use crate::experts::ExpertKernels;
+use crate::span::{span, span_mut};
 
 /// What the launches' refusals name.
 const BLOCK: &str = "gated block";
@@ -37,7 +39,7 @@ const BLOCK: &str = "gated block";
 /// coverage pin for the block lists the same set.
 pub const BLOCK_TYPES: [SiteTy; 4] = [SiteTy::Q8_0, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K];
 
-/// The most columns the q8_0 block's multi-column launches run.
+/// The most columns [`enqueue_block_cols`] takes: the q8_0 block's multi-column launches' cap, kept for every plan.
 const COLS_MAX: usize = 8;
 
 /// A shape no block launch reads, by name.
@@ -54,6 +56,24 @@ enum GateUp {
     Fused(SiteTy),
     /// A gemv each, then the clamped SwiGLU into the down's q8_1 blocks: no f32 `h`.
     Split { gate: SiteTy, up: SiteTy },
+}
+
+/// How a plan runs over several columns ([`enqueue_block_cols`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColsLaunch {
+    /// The q8_0 block's multi-column launches: the pair over the columns, then the gemv over them.
+    Mcol,
+    /// A K-quant block's one-row run for each column ([`enqueue_block`]).
+    PerColumn,
+}
+
+/// The way `plan` runs over columns: only the q8_0 block has multi-column launches.
+fn cols_launch(plan: BlockPlan) -> ColsLaunch {
+    if plan.is_q8() {
+        ColsLaunch::Mcol
+    } else {
+        ColsLaunch::PerColumn
+    }
 }
 
 /// The launches of one block by its file's types, read once at load ([`BlockPlan::of_file`]).
@@ -146,8 +166,19 @@ impl BlockPlan {
         }
     }
 
+    /// The launches [`enqueue_block_cols`] enqueues over `cols` columns: the q8_0 block's two for all of them, a
+    /// K-quant block's [`BlockPlan::extra_launches`] more than two for each column.
+    #[must_use]
+    pub fn column_launches(self, cols: usize) -> usize {
+        match cols_launch(self) {
+            ColsLaunch::Mcol => 2,
+            ColsLaunch::PerColumn => cols * (2 + self.extra_launches()),
+        }
+    }
+
     /// The types of gate, up and down.
-    fn types(self) -> [SiteTy; 3] {
+    #[must_use]
+    pub fn types(self) -> [SiteTy; 3] {
         match self.gate_up {
             GateUp::Ds41 => [SiteTy::Q8_0, SiteTy::Q8_0, self.down],
             GateUp::Fused(t) => [t, t, self.down],
@@ -171,25 +202,6 @@ impl BlockPlan {
             site::site(w, what, name, shape, ty)?;
         }
         Ok(())
-    }
-
-    /// Refused by name as `what`'s, naming `layer`, unless the block can run over several columns: only the
-    /// q8_0 block does ([`enqueue_block_cols`]).
-    ///
-    /// # Errors
-    /// A plan that is not [`BlockPlan::Q8`].
-    pub fn check_cols(self, what: &'static str, layer: usize) -> Result<(), GpuError> {
-        if self.is_q8() {
-            return Ok(());
-        }
-        let [gate, up, down] = self.types();
-        Err(refuse(
-            what,
-            format!(
-                "layer {layer}'s block is gate {gate}, up {up}, down {down}: a launch over several \
-                 columns reads q8_0 planes"
-            ),
-        ))
     }
 }
 
@@ -428,40 +440,72 @@ pub fn enqueue_block(
     site::kgemv(gpu, &kk.gemv, (blk.plan.down, w, down), act, fault, y)
 }
 
-/// Enqueue the q8_0 block over the first `cols` (1..=8) columns of `io.x`, token-major: the pair over the
-/// columns in one launch, then the q8_0 gemv over them, each column's rows the one-row launch's bit for bit.
-/// Asynchronous, allocation-free, capturable.
+/// Enqueue the block over the first `cols` (1..=8) columns of `io.x`, token-major, each column's rows the
+/// one-row launch's bit for bit: a q8_0 block is the pair over the columns in one launch, then the q8_0 gemv
+/// over them; any other plan runs [`enqueue_block`] on each column's window of `io.x` and `io.y`, which hold
+/// exactly `cols` columns of one width. Asynchronous, allocation-free, capturable;
+/// [`BlockPlan::column_launches`] launches.
 ///
 /// # Errors
-/// A plan that is not [`BlockPlan::Q8`] ([`BlockPlan::check_cols`]), `cols` outside 1..=8, or a launch's
-/// refusal.
+/// `cols` outside 1..=8, a K-quant plan over buffers that are not `cols` whole columns of one width, or the
+/// refusal of a launch ([`enqueue_block`]).
 pub fn enqueue_block_cols(
     gpu: &Gpu,
     w: &Weights,
-    experts: &ExpertKernels,
+    k: &BlockKernels<'_>,
+    s: &mut Option<BlockScratch>,
     blk: &Block<'_>,
     cols: usize,
     io: BlockIo<'_>,
 ) -> Result<(), GpuError> {
-    blk.plan.check_cols(BLOCK, blk.layer)?;
     if !(1..=COLS_MAX).contains(&cols) {
         return Err(refuse(
             BLOCK,
             format!("{cols} columns: a launch over columns takes 1..={COLS_MAX}"),
         ));
     }
-    let [gate, up, down] = blk.names;
     let BlockIo { x, h, y } = io;
-    experts.enqueue_shexp_gate_up_mcol(
-        gpu.stream(),
-        w.resident(BLOCK, gate)?,
-        w.resident(BLOCK, up)?,
-        x,
-        cols,
-        blk.limit,
-        h,
-    )?;
-    w.q8_gemv_mcol(gpu, BLOCK, down, h, cols, y)
+    match cols_launch(blk.plan) {
+        ColsLaunch::Mcol => {
+            let [gate, up, down] = blk.names;
+            k.experts.enqueue_shexp_gate_up_mcol(
+                gpu.stream(),
+                w.resident(BLOCK, gate)?,
+                w.resident(BLOCK, up)?,
+                x,
+                cols,
+                blk.limit,
+                h,
+            )?;
+            w.q8_gemv_mcol(gpu, BLOCK, down, h, cols, y)
+        }
+        ColsLaunch::PerColumn => {
+            let n = x.len() / cols;
+            if n == 0 || x.len() != n * cols || y.len() != n * cols {
+                return Err(refuse(
+                    BLOCK,
+                    format!(
+                        "layer {}: {cols} columns over buffers of {} and {} values: a block takes \
+                         whole columns of one width",
+                        blk.layer,
+                        x.len(),
+                        y.len()
+                    ),
+                ));
+            }
+            for c in 0..cols {
+                let xc = span(BLOCK, x, c * n, n)?;
+                let mut yc = span_mut(BLOCK, &mut *y, c * n, n)?;
+                let io = BlockIo {
+                    x: &xc,
+                    h: &mut *h,
+                    y: &mut yc,
+                };
+                enqueue_block(gpu, w, k, s, blk, io)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -535,18 +579,25 @@ mod tests {
         assert_eq!(extra([Q4K, Q5K, Q4K]), 3);
     }
 
-    /// Only the q8_0 block runs over columns; every other plan is refused by name with its layer.
+    /// Only the q8_0 block has multi-column launches; every other plan runs a column at a time, and its
+    /// launches over `cols` columns are the one-row run's count for each.
     #[test]
-    fn only_the_q8_block_runs_over_columns() {
-        use SiteTy::{Q4K, Q6K, Q8_0};
-        assert!(BlockPlan::Q8.check_cols(WHAT, 0).is_ok());
-        for tys in [[Q8_0, Q8_0, Q6K], [Q4K, Q4K, Q4K], [Q6K, Q6K, Q4K]] {
-            match plan(tys).unwrap().check_cols(WHAT, 7) {
-                Err(GpuError::Shape { detail, .. }) => {
-                    assert!(detail.contains("layer 7"), "{detail}");
-                }
-                other => panic!("{tys:?}: {other:?}"),
-            }
+    fn only_the_q8_block_launches_over_columns() {
+        use SiteTy::{Q4K, Q5K, Q6K, Q8_0};
+        assert_eq!(cols_launch(BlockPlan::Q8), ColsLaunch::Mcol);
+        assert_eq!(BlockPlan::Q8.column_launches(1), 2);
+        assert_eq!(BlockPlan::Q8.column_launches(8), 2);
+        for (tys, per_column) in [
+            ([Q8_0, Q8_0, Q6K], 3),
+            ([Q4K, Q4K, Q4K], 4),
+            ([Q5K, Q5K, Q8_0], 3),
+            ([Q6K, Q6K, Q5K], 5),
+        ] {
+            let p = plan(tys).unwrap();
+            assert_eq!(cols_launch(p), ColsLaunch::PerColumn, "{tys:?}");
+            assert_eq!(p.column_launches(1), per_column, "{tys:?}");
+            assert_eq!(p.column_launches(8), 8 * per_column, "{tys:?}");
+            assert_eq!(per_column, 2 + p.extra_launches(), "{tys:?}");
         }
     }
 }
