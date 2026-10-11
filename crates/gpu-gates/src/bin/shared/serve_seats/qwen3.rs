@@ -49,10 +49,12 @@
 //! plan's `plan` record on stderr before the `load` record, the card budget
 //! `BLOOMERY_CARD_BUDGET`'s and the host set's load the host levers' (each
 //! of them refused by name without `--place`). A
-//! plan with no host expert loads the whole model on the plan's card; any
-//! other runs the step graph through the host tier and every prompt as
-//! eager passes of up to eight ids (`app::Prompt for Body` takes passes at
-//! every length on a placed load), no pass captured.
+//! plan with no host expert loads the whole model on the plan's card when the
+//! whole-fit verdict takes it; any other runs the step graph through the
+//! host tier (a plan with no host expert whose whole load does not fit runs
+//! it with nothing to serve) and every prompt as eager passes of up to eight
+//! ids (`app::Prompt for Body` takes passes at every length on a placed
+//! load), no pass captured.
 //!
 //! With `--place` unset the model opens as `generate_qwen3moe` opens it,
 //! on `a`'s card, the largest visible card: the whole file while the
@@ -219,7 +221,7 @@ const BASE_SLOT_CTX: usize = 4096;
 /// routed expert stays on the card and the verdict alone bounds the fit; else
 /// the placed plan, under `--place` or the one a run without it falls to,
 /// whose card and NVMe expert bytes the margin counts (a plan that keeps
-/// every expert opens whole, so the whole verdict must take it too). The
+/// every expert opens placed like any other). The
 /// load is then made at the total, `parallel` slots of the answer
 /// ([`decide`]). One line names the answer, and one more the search's probes
 /// and the census readings it took ([`searched_line`]); a qwen35moe file's
@@ -539,10 +541,22 @@ impl Body3 for Body {
                 file,
                 opts,
             )?),
-            Q3Load::Placed { q, total, why } => {
+            Q3Load::Placed {
+                q,
+                total,
+                why,
+                whole,
+            } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, why).eprint();
-                q3place::open_qwen3_slots(file, &plan, slots, opts, levers.host())
+                match whole {
+                    Some(card) => Ok(Qwen3moeModel::open(
+                        Gpu::open_card(card.name, card.device)?,
+                        file,
+                        opts,
+                    )?),
+                    None => q3place::open_qwen3_slots(file, &plan, slots, opts, levers.host()),
+                }
             }
         }
     }
@@ -605,10 +619,20 @@ impl Body3 for Body35 {
             Q3Load::Whole(card) => {
                 Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
             }
-            Q3Load::Placed { q, total, why } => {
+            Q3Load::Placed {
+                q,
+                total,
+                why,
+                whole,
+            } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, why).eprint();
-                q3place::open_qwen35_slots(file, &plan, slots, o, levers.host())?
+                match whole {
+                    Some(card) => {
+                        Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
+                    }
+                    None => q3place::open_qwen35_slots(file, &plan, slots, o, levers.host())?,
+                }
             }
         };
         // The seat keeps prefixes, so its prompt calls take the checkpoints
@@ -981,11 +1005,16 @@ enum Q3Load {
     Whole(CardSpec),
     /// The placed plan made at `total` positions on `q`'s card: `--place`'s
     /// (no `why`), or `a`'s card's when the whole load does not fit at the
-    /// total (`why` names that, `q3place::WHY_NOT_WHOLE`).
+    /// total (`why` names that, `q3place::WHY_NOT_WHOLE`). Its open is the
+    /// placed body, its host set whatever the plan holds, none included;
+    /// under `--place` whose plan holds no host expert, `whole` is the card
+    /// the whole model opens on instead, when the whole-fit verdict takes it
+    /// (the plan record prints either way).
     Placed {
         q: Box<PlaceQ3>,
         total: usize,
         why: Option<&'static str>,
+        whole: Option<CardSpec>,
     },
 }
 
@@ -993,25 +1022,18 @@ impl Q3Load {
     /// The `plan` record a placed load prints before its open
     /// ([`Body3::open`]); a whole load has none.
     fn print_plan(&self, levers: &Levers) -> Result<(), GateError> {
-        if let Q3Load::Placed { q, total, why } = self {
+        if let Q3Load::Placed { q, total, why, .. } = self {
             let plan = q.plan(*total, &PlanLevers::from_levers(levers)?)?;
             q.record(&plan, *why).eprint();
         }
         Ok(())
     }
 
-    /// Whether the open runs routed experts on the host tier ([`Body3::placed`]
-    /// reads the same fact off the opened body): only a placed plan with host
-    /// experts does — `open_qwen3` and `open_qwen35` load the whole model on a
-    /// plan with none.
-    fn host_tier(&self, levers: &Levers) -> Result<bool, GateError> {
-        match self {
-            Q3Load::Whole(_) => Ok(false),
-            Q3Load::Placed { q, total, .. } => {
-                let plan = q.plan(*total, &PlanLevers::from_levers(levers)?)?;
-                Ok(plan.host.experts > 0)
-            }
-        }
+    /// Whether the open is the placed body ([`Body3::placed`] reads the same
+    /// fact off the opened body): a placed load, whether its plan holds host
+    /// experts or none. A load that opens the whole model is not.
+    fn placed_body(&self) -> bool {
+        matches!(self, Q3Load::Placed { whole: None, .. })
     }
 }
 
@@ -1025,8 +1047,11 @@ fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
 }
 
 /// What the `arch` file loads as at `total` positions for `parallel`
-/// resident sequences ([`Q3Load`]): `--place`'s plan on its card, else the
-/// whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`,
+/// resident sequences ([`Q3Load`]): under `--place`, the plan on its card,
+/// opening the whole model on that card when the plan holds no host expert
+/// and the whole-fit verdict takes the load (`PlaceQ3::whole_card_qwen3`,
+/// `PlaceQ3::whole_card_qwen35`: no line on stderr), else the placed body;
+/// else the whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`,
 /// `q3place::unplaced_qwen35_slots`, its line on stderr) — the whole model on
 /// `a`'s card, or the placed plan on it. A qwen35moe file's plans carry
 /// its sequences' rows ([`seqs35`]) and their arena is a slot's load's
@@ -1041,7 +1066,7 @@ fn decide(
     split: &Split,
     arch: Arch,
     total: usize,
-    place: Option<Place>,
+    (place, levers): (Option<Place>, &PlanLevers),
     parallel: usize,
     (kv, vision): (KvQ8, Option<&Opened>),
 ) -> Result<Q3Load, GateError> {
@@ -1050,10 +1075,13 @@ fn decide(
         (Arch::Qwen35moe, Some(p)) => {
             let o = q3place::share(&open35(total, kv, media)?, total, parallel);
             let q = PlaceQ3::qwen35_seqs(split, p, o, seqs35(split, parallel)?, encoder)?;
+            let plan = q.plan(total, levers)?;
+            let whole = q.whole_card_qwen35(split, &plan, (total, parallel), o)?;
             return Ok(Q3Load::Placed {
                 q: Box::new(q),
                 total,
                 why: None,
+                whole,
             });
         }
         (Arch::Qwen35moe, None) => q3place::unplaced_qwen35_slots(
@@ -1063,10 +1091,14 @@ fn decide(
             encoder,
         )?,
         (_, Some(p)) => {
+            let q = PlaceQ3::qwen3(split, p, total, kv)?;
+            let plan = q.plan(total, levers)?;
+            let whole = q.whole_card_qwen3(split, &plan, (total, parallel))?;
             return Ok(Q3Load::Placed {
-                q: Box::new(PlaceQ3::qwen3(split, p, total, kv)?),
+                q: Box::new(q),
                 total,
                 why: None,
+                whole,
             });
         }
         (_, None) => q3place::unplaced_qwen3_slots(split, total, parallel, kv)?,
@@ -1077,6 +1109,7 @@ fn decide(
             q,
             total,
             why: Some(q3place::WHY_NOT_WHOLE),
+            whole: None,
         },
     })
 }
@@ -1238,20 +1271,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let slot_ctx = slot_ctx(ctx, slots)?;
     // What the file loads as is decided here, once, at the total: the open
     // makes no fit call of its own (`decide`).
-    let load = decide(&split, arch, ctx, a.place, slots, (kv, vision.as_ref()))?;
+    let load = decide(
+        &split,
+        arch,
+        ctx,
+        (a.place, &PlanLevers::from_levers(&levers)?),
+        slots,
+        (kv, vision.as_ref()),
+    )?;
     if matches!(arch, Arch::Qwen35moe) {
-        q3place::checkpoints_fit(
-            seqs35(&split, slots)?,
-            slot_ctx,
-            matches!(load, Q3Load::Placed { .. }),
-        )?;
+        q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
     }
-    // The shape of a round of several slots, from the plan's host experts
-    // ([`Q3Load::host_tier`]); the open holds the opened body to it.
-    let host_tier = load.host_tier(&levers)?;
+    // The shape of a round of several slots, from the load's body
+    // ([`Q3Load::placed_body`]); the open holds the opened body to it.
+    let placed = load.placed_body();
     let pass = match arch {
-        Arch::Qwen3moe => pass_of::<Body>(slots, host_tier),
-        _ => pass_of::<Body35>(slots, host_tier),
+        Arch::Qwen3moe => pass_of::<Body>(slots, placed),
+        _ => pass_of::<Body35>(slots, placed),
     };
     // The slots the seat serves, one line before the load (`from` names what
     // set the count).

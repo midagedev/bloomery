@@ -93,7 +93,8 @@
 //! on that card under `BLOOMERY_CARD_BUDGET` — the trunk on the card, each
 //! layer's routed id prefix as the budget holds, the rest on the host tier
 //! — printed as a `plan` line (`record::PLAN38`) before the `load` line. A
-//! plan with no host expert loads the whole model on the plan's card; any
+//! plan with no host expert loads the whole model on the plan's card when the
+//! whole-fit verdict takes it, else the placed load with no host expert; any
 //! other runs the decode step (graph or eager) through the host tier's step
 //! port and the prompt as eager passes of up to eight ids through its batch
 //! port (`auto` and `pass`; `--prefill gemm` refused by name), and in graph
@@ -1958,7 +1959,12 @@ mod cli {
                 let q = PlaceQ3::qwen3(&file, p, ctx, kv)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, None).print();
-                q3place::open_qwen3(file, &plan, opts, levers.host())?
+                match q.whole_card_qwen3(&file, &plan, (ctx, 1))? {
+                    Some(card) => {
+                        Qwen3moeModel::open(Gpu::open_card(card.name, card.device)?, file, opts)?
+                    }
+                    None => q3place::open_qwen3(file, &plan, opts, levers.host())?,
+                }
             }
         };
         let placed = m.body("generate_qwen3moe")?.placed().is_some();
@@ -2040,7 +2046,12 @@ mod cli {
                 let q = PlaceQ3::qwen35(&file, p, o)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, None).print();
-                q3place::open_qwen35(file, &plan, o, levers.host())?
+                match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
+                    Some(card) => {
+                        Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
+                    }
+                    None => q3place::open_qwen35(file, &plan, o, levers.host())?,
+                }
             }
         };
         let placed = m.body("generate_qwen3moe")?.placed().is_some();

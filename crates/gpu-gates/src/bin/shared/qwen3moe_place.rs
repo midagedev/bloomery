@@ -8,8 +8,10 @@
 //! expert rule over the stacks `card_routed` loads — the trunk on the card,
 //! each layer's routed id prefix as the budget holds, the rest on the host
 //! tier — and the `plan` record of it. A plan that holds no host expert
-//! opens the whole model on the plan's card, as the unplaced load does; any
-//! other opens the body's placed load.
+//! opens the whole model on the plan's card, as the unplaced load does, when
+//! the whole-fit verdict takes the load ([`PlaceQ3::whole_card_qwen3`]); any
+//! other opens the body's placed load, which holds no host expert as it
+//! holds some ([`open_qwen3`]).
 //!
 //! The same two binaries' `--place`-unset default lives here too
 //! ([`unplaced_qwen3`]), on `a`'s card, the largest visible card
@@ -438,27 +440,18 @@ impl PlaceQ3 {
     }
 
     /// The routed-expert bytes the plan over `machine` at `ctx` (a total) holds
-    /// on the card and on the NVMe tier, for `slots` resident sequences: one
-    /// probe of a placed `--ctx` search. A plan that keeps every routed
-    /// expert on the card is a load [`open_qwen3`] opens whole, its arena the
-    /// whole load's, so the whole-fit verdict at `ctx` ([`Self::whole_at`],
-    /// what the program holds past its cache as `load` gives it) must take
-    /// that load. Every refusal is by name: the plan's, or the verdict's line.
+    /// on the card and on the NVMe tier: one probe of a placed `--ctx` search.
+    /// The plan's own refusal is the refusal: a plan that keeps every routed
+    /// expert on the card opens placed ([`open_qwen3`]) like any other, its
+    /// arena the placed machine's, so the plan stands wherever it is made and
+    /// the search is monotone.
     fn expert_bytes(
         &self,
         machine: &Machine,
         ctx: usize,
         levers: &PlanLevers,
-        slots: usize,
-        load: impl FnOnce() -> Result<WholeLoad, String>,
     ) -> Result<ExpertBytes, GateError> {
         let plan = self.plan_over(machine, ctx, levers)?;
-        if plan.host.experts == 0 {
-            let whole = self.whole_at(u64::try_from(ctx)?, slots, load())?;
-            if !whole.fits() {
-                return Err(whole.line(ctx).into());
-            }
-        }
         Ok(ExpertBytes {
             card: plan
                 .cards
@@ -773,6 +766,46 @@ impl PlaceQ3 {
         }
         Ok(Unplaced::Placed(Box::new(self)))
     }
+
+    /// The card a run with `--place` set opens the whole model on, for the
+    /// qwen3moe file `file` planned as `plan` at `ctx` positions for `slots`
+    /// resident sequences: this placement's card when the plan holds no
+    /// host expert and the whole-fit verdict at `ctx` takes the load
+    /// ([`qwen3_whole`]); `None` when the plan opens placed. A plan that
+    /// keeps every expert on the card but whose whole load does not fit
+    /// opens placed ([`open_qwen3`]).
+    pub fn whole_card_qwen3(
+        &self,
+        file: &Split,
+        plan: &Plan<'_>,
+        (ctx, slots): (usize, usize),
+    ) -> Result<Option<CardSpec>, GateError> {
+        self.whole_card(plan, (ctx, slots), qwen3_whole(file))
+    }
+
+    /// [`Self::whole_card_qwen3`] of a qwen35moe file, `at` the [`Open35`] the
+    /// plan was made by (a slot's share of `ctx`, [`share`]).
+    pub fn whole_card_qwen35(
+        &self,
+        file: &Split,
+        plan: &Plan<'_>,
+        (ctx, slots): (usize, usize),
+        at: Open35,
+    ) -> Result<Option<CardSpec>, GateError> {
+        self.whole_card(plan, (ctx, slots), qwen35_whole(file, at))
+    }
+
+    fn whole_card(
+        &self,
+        plan: &Plan<'_>,
+        (ctx, slots): (usize, usize),
+        load: Result<WholeLoad, String>,
+    ) -> Result<Option<CardSpec>, GateError> {
+        if plan.host.experts > 0 || !self.whole_at(u64::try_from(ctx)?, slots, load)?.fits() {
+            return Ok(None);
+        }
+        Ok(Some(self.place.card_specs()?[0]))
+    }
 }
 
 /// What a run with `--place` unset loads for one sequence
@@ -880,7 +913,7 @@ fn default_over(
             });
         }
         let machine = probe.machine_at((sizing.arena)(total)?, u64::try_from(ctx)?)?;
-        probe.expert_bytes(&machine, total, levers, slots, || (sizing.load)(total))
+        probe.expert_bytes(&machine, total, levers)
     };
     let slot = placement::ctx::default_slot_ctx(cap, rule.base, rule.step, rule.margin, &held)?;
     Ok(Defaulted {
@@ -1083,20 +1116,17 @@ pub fn open_unplaced_qwen35(
 /// whole file did not fit the card's free bytes.
 pub const WHY_NOT_WHOLE: &str = "whole_does_not_fit";
 
-/// The Qwen3-30B model of `file` by `plan`: whole on the plan's card when
-/// the plan holds no host expert, else the placed load, its host set as
-/// `host` asks.
+/// The Qwen3-30B model of `file` by `plan`: the body's placed load, its host
+/// set as `host` asks — whatever the plan holds on the host, none included.
+/// Whether the whole model loads in its place is not read off the plan: the
+/// caller decides it ([`unplaced_qwen3`], [`PlaceQ3::whole_card_qwen3`]) and
+/// opens the whole model itself.
 pub fn open_qwen3(
     file: Split,
     plan: &Plan<'_>,
     opts: OpenOpts,
     host: HostCfg,
 ) -> Result<Qwen3moeModel, GateError> {
-    if plan.host.experts == 0 {
-        let card = &plan.machine.cards[0];
-        let gpu = Gpu::open_card(&card.name, card.device)?;
-        return Ok(GpuModel::<Body>::open(gpu, file, opts)?);
-    }
     Ok(GpuModel::<Body>::open_placed(file, plan, opts, host)?)
 }
 
@@ -1263,10 +1293,5 @@ pub fn open_qwen35(
     o: Open35,
     host: HostCfg,
 ) -> Result<Qwen35moeModel, GateError> {
-    if plan.host.experts == 0 {
-        let card = &plan.machine.cards[0];
-        let gpu = Gpu::open_card(&card.name, card.device)?;
-        return Ok(GpuModel::<Body35>::open(gpu, file, o)?);
-    }
     Ok(GpuModel::<Body35>::open_placed(file, plan, o, host)?)
 }
