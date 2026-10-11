@@ -184,6 +184,25 @@
 //!   a ubatch resize and a pass of two resident slots refused by name, the
 //!   ubatch kept; (o4) the host tier served slots on both of its ports.
 //!   `--placed-only` runs (o) alone.
+//! - (e) the residency machine on the placed load (`open_placed_residency`
+//!   at the `mid` word [`residency_clauses::mid_of`] makes of (o)'s plan,
+//!   through the session's calls: a prompt is one residency pass), against
+//!   the same plan with it off, on the step set's prompt: the first 512 ids
+//!   as one wide unit, 64 greedy steps (the flips land), the next 256 ids
+//!   as a second wide unit, 16 steps — the residency run feeding the off
+//!   run's ids. `flips`: at least one flip lands before the second prompt,
+//!   and after each wide prompt every layer's map of the wide arm is the
+//!   card copy's row followed by the shared expert's HOST entry
+//!   (`Placed::stale_maps`), on both runs; every call's logits row within
+//!   [`GREEDY_MARGIN`] of the off run's, the ids equal or parting at a near
+//!   tie. `c1` (green-only): the history twice gives the same ids and
+//!   logits bit for bit. `c7`: a residency reset brings every live set back
+//!   to its seed. FAIL-first, `flips`: the maps kept as the load built them
+//!   (`PlacedSide::refresh_maps` returning at once) reads the map line red
+//!   (the first prompt's maps name the spares the machine emptied at its
+//!   start, the second's miss the admitted experts). Real tier only: the
+//!   gate has no fixture conversion (qwen35moe's fixture row is `self`).
+//!   `--residency-only` runs (e) alone.
 //!
 //! (m) the memory guard, `--memguard-only` (no model loaded): the census
 //!   free reading, the quiet-card whole decision, the held-card refusal by
@@ -252,16 +271,28 @@ mod e2e;
 mod flash_grid;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/residency_clauses.rs"]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; this one takes the residency, the seed lists and the c1 and c7 verdicts"
+)]
+mod residency_clauses;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use super::e2e::{argmax, normed, tap};
     use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
+    use super::residency_clauses;
+    use app::Session;
     use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
         Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
         PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM,
     };
+    use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
@@ -270,9 +301,9 @@ mod gate {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
-        ik_q8_2, q8_1_dequant, ref_ints, ref_tensor_logical_in, split_f32, topk_ids_logical_within,
-        verdict, widened_f16_rows_in,
+        Fnv1a64, GREEDY_MARGIN, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed,
+        data_dir, ik_q8_2, q8_1_dequant, record, ref_ints, ref_tensor_logical_in, split_f32,
+        topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use bloomery_levers::HostCfg;
     use cuda_core::sys;
@@ -282,6 +313,7 @@ mod gate {
     use model::arch::models::shape::{AttnShape, MoeShape};
     use model::placement::PlanLevers;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
+    use runtime::{Out, Target, Want};
     use std::time::Instant;
 
     /// Cache rows: the 1,024-token set's step at position 1,024, with room.
@@ -3037,6 +3069,297 @@ mod gate {
         Ok(ok && ok_scratch)
     }
 
+    const NAME: &str = "gate_qwen35moe_e2e";
+
+    // ------------------------------------- (e) residency on the placed load
+
+    /// (e)'s history, from a clear: the first [`E_P1`] ids of the step set's
+    /// prompt (one unit of the wide arm), [`E_STEPS1`] greedy steps — the
+    /// rule plans every four kept rows, so the flips land here —, the next
+    /// [`E_P2`] ids (a wide unit whose maps must follow the flips, the call
+    /// the load-time maps were wrong for), and [`E_STEPS2`] steps. At the
+    /// gate's [`CTX`].
+    const E_P1: usize = PLACED_UBATCH;
+    const E_STEPS1: usize = 64;
+    const E_P2: usize = 256;
+    const E_STEPS2: usize = 16;
+    const _: () = assert!(E_P1 + E_STEPS1 + E_P2 + E_STEPS2 < CTX);
+    const _: () = assert!(E_P2 >= WIDE_FROM && E_P2 <= PLACED_UBATCH);
+
+    /// What one run of (e)'s history saw: every call's greedy id and logits
+    /// row in order (the first prompt's, each step's, the second prompt's,
+    /// each step's), the flips that landed at the boundaries before the
+    /// second prompt, and after each wide prompt the layers whose map is not
+    /// the card copy's row ([`Placed::stale_maps`]).
+    #[derive(Default)]
+    struct Seen {
+        tokens: Vec<u32>,
+        rows: Vec<Vec<f32>>,
+        landed: usize,
+        stale: [Vec<usize>; 2],
+    }
+
+    /// The step set's prompt ids (D1K): (e)'s two prompts' ids.
+    fn e_ids() -> Result<Vec<u32>, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prompt) = man.step()?;
+        let ids: Vec<u32> = prompt.iter().copied().take(E_P1 + E_P2).collect();
+        if ids.len() != E_P1 + E_P2 {
+            return Err(format!(
+                "the step set's prompt holds {} ids, (e)'s two prompts take {}",
+                ids.len(),
+                E_P1 + E_P2
+            )
+            .into());
+        }
+        Ok(ids)
+    }
+
+    /// (o)'s plan opened as a session, under the residency the plan's card
+    /// experts give ([`residency_clauses::mid_of`]) when `on`, else off: the
+    /// session and the residency it ran (`None` when the plan leaves a layer
+    /// no room for the machine).
+    fn e_open(host: HostCfg, on: bool) -> Result<(Session<Body35>, Option<Residency>), GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let o = Open35 {
+            ctx: CTX,
+            mma: true,
+            ubatch: U_GATE,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(PLACED_BUDGET),
+        };
+        let plan = q.plan(CTX, &levers)?;
+        let mid = residency_clauses::mid_of(&plan.n_l);
+        let residency = match (on, mid) {
+            (false, _) => Residency::Off,
+            (true, Some(r)) => r,
+            (true, None) => {
+                return Err(
+                    "the plan's card experts leave no layer with room for the machine's \
+                            pinned, spare and one that moves"
+                        .into(),
+                );
+            }
+        };
+        let mut m = GpuModel::<Body35>::open_placed_residency(file, &plan, o, host, residency)?;
+        m.body_parts(NAME)?
+            .2
+            .host()
+            .ok_or("an open_placed load with no placed side")?
+            .log_residency(0);
+        Ok((Session::from_model(m, CTX as u32), mid))
+    }
+
+    /// The residency boundaries' reports since the last take.
+    fn e_take(s: &mut Session<Body35>) -> Result<Vec<(PassKind, PassReport)>, GateError> {
+        let (_, _, b) = s.model_mut().body_parts(NAME)?;
+        Ok(b.host()
+            .ok_or("an open_placed load with no placed side")?
+            .take_residency_passes())
+    }
+
+    /// The layers whose wide map is not the card copy's row now.
+    fn e_stale(s: &Session<Body35>) -> Result<Vec<usize>, GateError> {
+        let m = s.model();
+        let placed = m
+            .body(NAME)?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?;
+        Ok(placed.stale_maps(m.gpu().stream())?)
+    }
+
+    /// Note a call's greedy id and logits row in `seen`; the id.
+    fn e_note(seen: &mut Seen, out: Out<'_>) -> Result<u32, GateError> {
+        let id = out.argmax();
+        let Out::Logits { row, .. } = out else {
+            return Err("a call returned no logits row".into());
+        };
+        seen.tokens.push(id);
+        seen.rows.push(row.to_vec());
+        Ok(id)
+    }
+
+    /// One run of (e)'s history on `s` from a clear (the residency back to
+    /// its seed): each step feeds the id `forced` holds for the call before
+    /// it, or its own greedy id when `forced` is `None`.
+    fn e_history(
+        s: &mut Session<Body35>,
+        ids: &[u32],
+        forced: Option<&[u32]>,
+    ) -> Result<Seen, GateError> {
+        s.clear()?;
+        e_take(s)?;
+        let mut seen = Seen::default();
+        let out = s.prompt(&ids[..E_P1], Want::Logits)?;
+        e_note(&mut seen, out)?;
+        seen.stale[0] = e_stale(s)?;
+        let steps = |s: &mut Session<Body35>, seen: &mut Seen, n: usize| {
+            for _ in 0..n {
+                let at = seen.tokens.len() - 1;
+                let id = forced.map_or(seen.tokens[at], |f| f[at]);
+                let out = s.step(id, Want::Logits)?;
+                e_note(seen, out)?;
+            }
+            Ok::<(), GateError>(())
+        };
+        steps(s, &mut seen, E_STEPS1)?;
+        seen.landed = e_take(s)?.iter().map(|(_, r)| r.landed).sum();
+        let out = s.prompt(&ids[E_P1..], Want::Logits)?;
+        e_note(&mut seen, out)?;
+        seen.stale[1] = e_stale(s)?;
+        steps(s, &mut seen, E_STEPS2)?;
+        e_take(s)?;
+        Ok(seen)
+    }
+
+    /// Whether two runs of the history left the same ids and the same logits
+    /// bit for bit.
+    fn e_same(a: &Seen, b: &Seen) -> bool {
+        a.tokens == b.tokens
+            && a.landed == b.landed
+            && a.rows.len() == b.rows.len()
+            && a.rows.iter().zip(&b.rows).all(|(x, y)| {
+                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+            })
+    }
+
+    /// The top-1 margin of a logits row; a value that is not finite is
+    /// refused by name.
+    fn e_margin(row: &[f32]) -> Result<f32, GateError> {
+        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (i, &v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!("logit {i} is {v}").into());
+            }
+            if v > a {
+                b = a;
+                a = v;
+            } else if v > b {
+                b = v;
+            }
+        }
+        Ok(a - b)
+    }
+
+    /// (e): the placed load under the residency machine (`open_placed_residency`
+    /// at the `mid` word [`residency_clauses::mid_of`] gives the plan) against
+    /// the same plan with it off, through the session's calls — the prompt is
+    /// one residency pass, a step its own boundary. Both runs take (e)'s
+    /// history ([`e_history`]) on the step set's prompt, the residency run
+    /// feeding the off run's ids, each model dropped before the next opens:
+    /// - `flips` (the defect's catcher): the history lands at least one flip
+    ///   before its second prompt, and after each wide prompt every layer's
+    ///   map is the card copy's row followed by the shared expert's HOST
+    ///   entry (`Placed::stale_maps`: none), on the residency run and the off
+    ///   run alike; every call's logits row within [`GREEDY_MARGIN`] of the
+    ///   off run's everywhere — the card and the host sum a token's experts in
+    ///   another split —, and the ids equal or, where they first part, the
+    ///   residency run's top-1 margin below it (a near tie). Mutant: the maps
+    ///   kept as the load built them (`PlacedSide::refresh_maps` returning at
+    ///   once): the first prompt's maps still name the spare experts the
+    ///   machine emptied at its start and the second's the experts the flips
+    ///   admitted, whose columns no launch then writes; the map line reads
+    ///   it (layers named), the logits band may not.
+    /// - `c1` (green-only): the history twice on the residency load gives the
+    ///   same ids and logits bit for bit, and flips land.
+    /// - `c7`: a residency reset after the history brings every layer's live
+    ///   set back to its seed.
+    ///
+    /// Real tier: this gate has no fixture conversion (`qwen35moe`'s fixture
+    /// row is `self`).
+    fn residency(host: HostCfg) -> Result<bool, GateError> {
+        let ids = e_ids()?;
+        let (mut off, _) = e_open(host, false)?;
+        let off_seen = e_history(&mut off, &ids, None)?;
+        drop(off);
+        let (mut on, mid) = e_open(host, true)?;
+        let word = match mid {
+            Some(Residency::Mid { pinned, spares }) => format!("mid-p{pinned}-s{spares}"),
+            _ => return Err("no residency to run".into()),
+        };
+        println!("residency: {word} over the plan's card experts");
+        let seeds = {
+            let m = on.model();
+            let b = m.body(NAME)?;
+            let p = b
+                .placed()
+                .ok_or("an open_placed load with no placed side")?;
+            let machine = p
+                .hybrid()
+                .swap()
+                .ok_or("the load runs no residency machine")?;
+            residency_clauses::seeds(machine, p.hybrid().slots().layers())?
+        };
+        let first = e_history(&mut on, &ids, Some(&off_seen.tokens))?;
+        // `flips`
+        let dlogit = first
+            .rows
+            .iter()
+            .zip(&off_seen.rows)
+            .map(|(a, b)| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max)
+            })
+            .enumerate()
+            .fold(
+                (0usize, 0.0f32),
+                |w, (i, d)| if d > w.1 { (i, d) } else { w },
+            );
+        let rows_ok = first.rows.len() == off_seen.rows.len() && dlogit.1 < GREEDY_MARGIN;
+        let parted = first
+            .tokens
+            .iter()
+            .zip(&off_seen.tokens)
+            .position(|(a, b)| a != b);
+        let near = match parted {
+            None => true,
+            Some(i) => e_margin(&first.rows[i])? < GREEDY_MARGIN,
+        };
+        let maps_ok = first.stale.iter().chain(&off_seen.stale).all(Vec::is_empty);
+        let flips = first.landed > 0 && maps_ok && rows_ok && near;
+        println!(
+            "flips: {} flips landed before the second prompt (above 0); wide maps off the card \
+             copy's rows after the prompts: residency {:?} off {:?} (none); {} calls' logits \
+             within {GREEDY_MARGIN} of the off run's: worst {:.3e} at call {}; greedy ids part at \
+             {parted:?} (equal or a near tie: {near}): {}",
+            first.landed,
+            first.stale,
+            off_seen.stale,
+            first.rows.len(),
+            dlogit.1,
+            dlogit.0,
+            verdict(flips)
+        );
+        // `c1`
+        let second = e_history(&mut on, &ids, Some(&off_seen.tokens))?;
+        let c1 =
+            residency_clauses::c1_clause(first.tokens.len(), first.landed, e_same(&first, &second));
+        // `c7`
+        let r = on
+            .residency_reset()?
+            .ok_or("the load runs no residency machine")?;
+        record::residency_reset(&r).print();
+        let c7 = {
+            let m = on.model();
+            let b = m.body(NAME)?;
+            let p = b
+                .placed()
+                .ok_or("an open_placed load with no placed side")?;
+            let machine = p
+                .hybrid()
+                .swap()
+                .ok_or("the load runs no residency machine")?;
+            residency_clauses::c7_clause(&r, machine, &seeds)
+        };
+        Ok(flips && c1 && c7)
+    }
+
     /// The batch set's manifest and its five tokens.
     fn batch_set() -> Result<(RefManifest, Vec<u32>), GateError> {
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
@@ -3166,6 +3489,14 @@ mod gate {
             }
             return Ok(());
         }
+        if std::env::args().any(|a| a == "--residency-only") {
+            let ok = residency(host)?;
+            println!("gate_qwen35moe_e2e --residency-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if std::env::args().any(|a| a == "--unjoined-only") {
             let (_, toks) = batch_set()?;
             let ok = unjoined(&toks)?;
@@ -3210,6 +3541,7 @@ mod gate {
         ok &= checkpoints()?;
         ok &= slots_two(&slots)?;
         ok &= placed(&man, &toks, host)?;
+        ok &= residency(host)?;
         ok &= q8_cache()?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {

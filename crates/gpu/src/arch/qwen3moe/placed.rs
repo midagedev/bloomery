@@ -33,7 +33,11 @@
 //! The slot map is the plan's for the load's life while the load's
 //! residency glue runs no machine ([`Placed`]'s `glue`): its card copy is
 //! what the handoff and the places read, and the host tier skips the same
-//! slots by the same map, so which expert runs where has one owner. The
+//! slots by the same map, so which expert runs where has one owner. Under a
+//! machine the card copy moves between passes (which experts fill a layer's
+//! slots, never how many: [`PlacedFfn`]'s `n_card` is the map's capacity);
+//! the step and the gemv arm read it live, and each wide unit's maps are
+//! first brought to it ([`PlacedSide::refresh_maps`]). The
 //! shared expert is never one of the router's slots here: a placed load
 //! keeps Qwen3.6's routed stacks and its shared expert apart (the
 //! whole-card load folds the shared expert into its stacks as one more
@@ -65,13 +69,14 @@ use crate::gemm::GemmRoute;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
-use crate::host::swap_source::ResidencyGlue;
-use crate::host::{BatchLeg, StepLeg};
+use crate::host::swap::PassReport;
+use crate::host::swap_source::{FileSwap, ResidencyGlue};
+use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
-use crate::tensor::{DeviceTensor, Q8Act};
+use crate::tensor::{DeviceTensor, Q8Act, Window, WindowMut};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use bloomery_levers::HostCfg;
@@ -104,11 +109,14 @@ pub(super) struct SharedFfn {
     down_ty: SiteTy,
 }
 
-/// A placed layer's routed experts on the card: how many the slot map puts
-/// there, the file's three stacks (the card holds their rows of those
-/// experts, in the map's slot order), the gate·up entry and the down's type;
-/// and the shared expert, on a chain that has one.
+/// A placed layer's routed experts on the card: its slots there (the slot
+/// map's capacity, fixed for the load's life: the residency machine moves
+/// which experts fill them, never how many there are), the file's three
+/// stacks (the card holds their rows of those slots), the gate·up entry and
+/// the down's type; and the shared expert, on a chain that has one.
 pub(super) struct PlacedFfn {
+    /// The slots of the layer's card stacks: the bound a place must be below
+    /// to name one, and the width of the layer's routed table.
     n_card: usize,
     gate: String,
     up: String,
@@ -265,15 +273,49 @@ pub(super) struct PlacedKernels {
 /// experts, the slot map's card copy, the route's shape and the kernels, the
 /// most rows of a unit, and — past [`GEMV_COLS`] of them — each layer's map
 /// of the experts to their places in the card's stacks (the router's expert
-/// count and one entry for the shared expert's id, [`HOST`]).
+/// count and one entry for the shared expert's id, [`HOST`]). A map is the
+/// card copy's row with that entry after it, which the wide arm's remap
+/// cannot do without (an id at the router's expert count faults it): under a
+/// running residency machine the card copy moves between passes and the maps
+/// are brought to it at the head of each wide unit
+/// ([`PlacedSide::refresh_maps`]); the step and the gemv arm read the card
+/// copy itself.
 pub(super) struct PlacedSide {
     ffn: Vec<PlacedFfn>,
     slots: Arc<DeviceTensor<u32>>,
     maps: Vec<DeviceBuffer<u32>>,
+    /// Whether a residency machine runs, so the card copy moves.
+    live: bool,
     shape: RouteShape,
     k: PlacedKernels,
     /// The rows of the most a unit walks.
     pub(super) cap: usize,
+}
+
+impl PlacedSide {
+    /// Each layer's map brought to the card copy's row of that layer, in
+    /// stream order ahead of the unit's first read: one device-to-device copy
+    /// of the router's expert count words a layer, the map's last entry (the
+    /// shared expert's id, [`HOST`]) left as it is. A unit of at most
+    /// [`GEMV_COLS`] rows reads no map, and a load that runs no machine keeps
+    /// the plan's map for its life: neither enqueues a copy. The machine
+    /// writes the card copy on the engine stream at its boundaries
+    /// (`SwapMachine::boundary`, `reset`), and a prompt call takes no
+    /// boundary inside it, so a map read after this call is the row its
+    /// unit's places and the host's skip set read.
+    pub(super) fn refresh_maps(&mut self, stream: &CudaStream, m: usize) -> Result<(), GpuError> {
+        if !self.live || m <= GEMV_COLS {
+            return Ok(());
+        }
+        let n = self.shape.n_expert;
+        let PlacedSide { slots, maps, .. } = self;
+        for (l, map) in maps.iter_mut().enumerate() {
+            let row = Window::<u32>::of(slots.buf(), l * n * size_of::<u32>(), n)?;
+            let mut head = WindowMut::<u32>::of_mut(map, 0, n)?;
+            head.copy_from_device_async(&row, stream)?;
+        }
+        Ok(())
+    }
 }
 
 /// The placed side of a load: the host tier over every layer's routed
@@ -369,6 +411,7 @@ impl Placed {
         let stage = map.stage_view();
         let slots = Arc::new(DeviceTensor::upload(stream, &stage, n, shape.n_expert)?);
         let cards: Vec<usize> = ffn.iter().map(|f| f.n_card).collect();
+        let live = o.glue.source().is_some();
         let maps = if o.rows > GEMV_COLS {
             layer_maps(stream, &stage, n, shape.n_expert)?
         } else {
@@ -417,6 +460,7 @@ impl Placed {
                 ffn,
                 slots,
                 maps,
+                live,
                 shape,
                 k,
                 cap: o.rows,
@@ -475,6 +519,48 @@ impl Placed {
     /// ([`crate::host::HostTier::plant_refusal`]).
     pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
         &mut self.hybrid
+    }
+
+    /// The residency machine's source, when the load runs one.
+    #[must_use]
+    pub fn residency_source(&self) -> Option<&FileSwap> {
+        self.glue.source()
+    }
+
+    /// Keep the residency boundaries' reports from here on
+    /// ([`ResidencyGlue::log_passes`]): `passes` the most boundaries between
+    /// two [`Placed::take_residency_passes`]. Nothing is kept until asked.
+    pub fn log_residency(&mut self, passes: usize) {
+        self.glue.log_passes(passes);
+    }
+
+    /// The residency boundaries' reports since the last take, in order, each
+    /// with the kind of the pass it ended.
+    pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
+        self.glue.take_passes()
+    }
+
+    /// The layers whose wide map is not the card copy's row of that layer
+    /// followed by [`HOST`], read back on `stream`: none on a map the
+    /// refresh keeps ([`PlacedSide::refresh_maps`]) and on a load whose
+    /// units are at most [`GEMV_COLS`] rows (it holds no map). A debug view,
+    /// for the residency gate: after a wide unit under a machine every map
+    /// is its row.
+    pub fn stale_maps(&self, stream: &CudaStream) -> Result<Vec<usize>, GpuError> {
+        let n = self.side.shape.n_expert;
+        let copy = self.side.slots.buf().to_host_vec(stream)?;
+        let mut stale = Vec::new();
+        for (l, map) in self.side.maps.iter().enumerate() {
+            let held = map.to_host_vec(stream)?;
+            let row = copy.get(l * n..(l + 1) * n);
+            let is_row = held.len() == n + 1
+                && held.last() == Some(&HOST)
+                && row.is_some_and(|r| held[..n] == *r);
+            if !is_row {
+                stale.push(l);
+            }
+        }
+        Ok(stale)
     }
 
     /// The host tier's settling ([`crate::host::HostTier::settle`]): the
@@ -537,7 +623,9 @@ fn placed_total(d: &Dims, layers: usize, rows: usize, tables: usize) -> Result<u
 /// Each layer's map of the experts to their places in the card's stacks:
 /// `stage` the slot map's card copy (`n_expert` places a layer, [`HOST`]
 /// for the host's), each row with one more entry, [`HOST`], for the shared
-/// expert's id. Load-time only.
+/// expert's id. The rows are the load's: a load that runs a residency
+/// machine brings them to the card copy before every wide unit
+/// ([`PlacedSide::refresh_maps`]). Load-time only.
 fn layer_maps(
     stream: &CudaStream,
     stage: &[u32],
@@ -609,7 +697,10 @@ pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
         .collect()
 }
 
-/// Layer `l`'s card experts under `map` (module doc, [`Placed::new`]).
+/// Layer `l`'s card stacks under `map` (module doc, [`Placed::new`]): their
+/// slots are the map's capacity, which a residency machine's evictions and
+/// admissions leave as it is (`SlotMap::evict`), where the live count drops
+/// by the spare slots the machine empties at its start.
 fn placed_ffn(
     w: &Weights,
     map: &SlotMap,
@@ -617,7 +708,7 @@ fn placed_ffn(
     p: &LayerPlan,
     l: usize,
 ) -> Result<PlacedFfn, GpuError> {
-    let n_card = map.on_card(l)?;
+    let n_card = map.capacity(l)?;
     let (gate, up, down) = (
         model::arch::qwen3moe::names::ffn_gate_exps(l),
         model::arch::qwen3moe::names::ffn_up_exps(l),

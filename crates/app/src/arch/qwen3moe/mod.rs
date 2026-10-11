@@ -32,7 +32,7 @@ use runtime::seqstate::Kept;
 use runtime::{Speculative, Tapped};
 
 use crate::mtp::{MtpBody, MtpDraft};
-use crate::{Keep, Prompt, Session, SessionError, cut_positions, keep_positions};
+use crate::{Keep, Prompt, Session, SessionError, call, cut_positions, keep_positions};
 mod mtp;
 
 const WHAT: &str = "qwen4exp session";
@@ -132,13 +132,15 @@ impl Prompt for Body35 {
     /// to one step a row. The model takes the checkpoints of the call's
     /// marks only while a caller armed them
     /// ([`Body35::set_checkpoints`](bloomery_gpu::arch::qwen3moe::Body35)).
+    /// The call is one residency pass ([`call`]): a load with a machine takes
+    /// its boundary before the first unit, none inside.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GpuError> {
         let path = if ids.len() >= GEMM_FROM {
             PrefillPath::Wide
         } else {
             PrefillPath::Pass
         };
-        m.prefill_with(ids, path)
+        call(m, |m| m.prefill_with(ids, path))
     }
 }
 

@@ -2,8 +2,9 @@
 //! runs the residency machine on a real model: V4.1's clauses
 //! (`shared/ds41_residency.rs`, run by `gate_ds41_callstream`), GLM's
 //! (`gate_glm5next_residency`) and Qwen3.8's (`gate_qwen38_residency`)
-//! include this module with a `#[path]` line. It holds `refuse`'s halves
-//! ([`refuse_head`] the short host, [`refuse_tail`] the open's timing, the
+//! include this module with a `#[path]` line, as does Qwen3.6's
+//! (`gate_qwen35moe_e2e`). It holds the residency a gate runs over a plan
+//! ([`mid_of`]), `refuse`'s halves ([`refuse_head`] the short host, [`refuse_tail`] the open's timing, the
 //! verdict on its error, the `refuse:` line), the seed lists ([`seeds`],
 //! [`layer_seeds`]), `transform`'s check and its plain verdict
 //! ([`transform_check`]: every
@@ -28,7 +29,7 @@ use std::time::Instant;
 use app::{Keep, Prompt, Session};
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::{
-    CardTable, PassReport, ResetReport, SlotState, SwapMachine, SwapSource,
+    CardTable, PassReport, ResetReport, Residency, SlotState, SwapMachine, SwapSource,
 };
 use bloomery_gpu::host::swap_source::FileSwap;
 use bloomery_gpu::{Gpu, window};
@@ -37,6 +38,17 @@ use bloomery_gpu_gates::{GateError, verdict};
 use model::placement::Machine;
 use runtime::swaprule::SwapRule;
 use runtime::{Advance, Target as _, Want};
+
+/// The residency a gate runs over a plan whose layers hold `n_l` card
+/// experts: half of the smallest card layer pinned (the seed is the plan's id
+/// prefix, not a frequency list, so pinning most of it protects nothing), one
+/// spare a layer. `None` when no layer holds the machine's `pinned + spares +
+/// 1` card experts.
+pub fn mid_of(n_l: &[u64]) -> Option<Residency> {
+    let slots = n_l.iter().copied().filter(|&n| n > 0).min()? as usize;
+    let pinned = slots / 2;
+    (pinned >= 1 && slots >= pinned + 2).then_some(Residency::Mid { pinned, spares: 1 })
+}
 
 /// `refuse`'s head: `machine` with its host's usable bytes taken down to
 /// one byte under the plan's `headroom_bytes` plus the churn pool's

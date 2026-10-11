@@ -1263,6 +1263,29 @@ impl GpuModel<Body35> {
         o: Open35,
         host: HostCfg,
     ) -> Result<GpuModel<Body35>, GpuError> {
+        GpuModel::open_placed_residency(file, plan, o, host, Residency::Off)
+    }
+
+    /// [`GpuModel::open_placed`] under `residency`: `mid-p<P>-s<S>` runs the
+    /// residency machine over the card's routed stacks ([`crate::host::swap`],
+    /// [`swap35::stacks`]) — the load's host set also holds each layer's
+    /// churn pool (the card's experts past the first `P`), refused by name
+    /// when the plan's host headroom cannot take it — while `off` is
+    /// [`GpuModel::open_placed`] itself. The lever's word a load runs by is
+    /// the registry's, read by the caller
+    /// (`bloomery_levers::Levers::residency_at`). Under a machine the card
+    /// copy of the slot map moves between passes: a prompt call is one
+    /// residency pass its caller takes (`prompt_pass`; the app's `Prompt`
+    /// impl), the wide units' maps follow the card copy ([`Placed`]'s
+    /// `refresh_maps`), and a step's boundary is the step loop's. The body has
+    /// no steps-feed path to refuse.
+    pub fn open_placed_residency(
+        file: Split,
+        plan: &Plan<'_>,
+        o: Open35,
+        host: HostCfg,
+        residency: Residency,
+    ) -> Result<GpuModel<Body35>, GpuError> {
         const WHAT_P: &str = "qwen35moe GpuModel::open_placed";
         let asked = o.ubatch;
         let o = placed_open(o);
@@ -1293,8 +1316,6 @@ impl GpuModel<Body35> {
             .ok_or(GpuError::shape(WHAT_P, "a plan of no card"))?;
         let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
         let specs = pre.layers.clone();
-        // `Residency::Off`: the load starts no machine, and its shape is the
-        // one a machine would take.
         let (top_k, max_rows) = tally_shape(&pre.d)?;
         // The stack table checks only the layers the plan gives card experts:
         // the machine keeps each layer's card count.
@@ -1303,7 +1324,7 @@ impl GpuModel<Body35> {
         })?;
         let carded = SlotMap::of_plan(plan, 0, None, 0..n_layers, n_expert)?;
         let residency = ResidencySpec {
-            lever: Residency::Off,
+            lever: residency,
             delay: LIVE_DELAY,
             deadline: DEADLINE,
             top_k,
@@ -1912,6 +1933,7 @@ impl Body35 {
             ..
         }) = placed
         {
+            side.refresh_maps(gpu.stream(), m)?;
             let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, side.cap);
             return BatchWalk {
                 p: WalkParts {
