@@ -461,9 +461,9 @@ mod gate {
     use bloomery_gpu_glm5next::{
         Body, CHECKPOINT_EVERY, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode,
         RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
-        plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume, seq_resume_prefix,
-        seq_save, set_prefill, set_prefill_group, set_prompt_route_taps, set_taps, step_launches,
-        store_digests, store_rows,
+        plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume,
+        seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_route_taps,
+        set_taps, step_launches, store_digests, store_rows,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
