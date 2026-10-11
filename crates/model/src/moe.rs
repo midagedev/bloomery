@@ -2395,11 +2395,20 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         check_host_call(x, experts, out, scratch.n_used)?;
-        if let Some(tier) = &self.tier {
-            scratch.tier_ids.clear();
-            scratch.tier_ids.extend(experts.iter().map(|&(e, _)| e));
-            tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
-        }
+        // The call's ids stay pinned until the leg's reads end: no claim of
+        // a lane's victim takes one of their slots between the fill and the
+        // read, whatever the slot count.
+        let _pin = match &self.tier {
+            Some(tier) => {
+                scratch.tier_ids.clear();
+                scratch.tier_ids.extend(experts.iter().map(|&(e, _)| e));
+                Some(
+                    tier.slots
+                        .ensure_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?,
+                )
+            }
+            None => None,
+        };
         out.fill(0.0);
         if experts.is_empty() {
             return Ok(());
@@ -2556,11 +2565,17 @@ impl HostLayer {
                 .filter(|e| !tier.host.contains(e)),
         );
         let mut stacks = self.stacks_of(split)?;
-        if !scratch.tier_ids.is_empty() {
-            tier.slots.ensure(tier.layer, &scratch.tier_ids)?;
+        // Pinned until the union's reads end, as `experts_into_on`'s ids are.
+        let _pin = if scratch.tier_ids.is_empty() {
+            None
+        } else {
+            let pin = tier
+                .slots
+                .ensure_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?;
             tier.check_lent(&stacks, &scratch.tier_ids)?;
             tier.lend(&mut stacks);
-        }
+            Some(pin)
+        };
         let run = LegRun {
             limit: Some(self.limit),
             lanes,
@@ -3278,10 +3293,11 @@ mod tests {
 
         fn ensure_pinned<'a>(
             &'a self,
-            _layer: usize,
+            layer: usize,
             ids: &[u32],
             claim: super::Claim,
         ) -> Result<super::TierPin<'a>, super::TierError> {
+            self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             Ok(self.pin_batch(ids, claim, true))
         }
 
@@ -3862,6 +3878,14 @@ mod tests {
             vec![(4, vec![0, 2])],
             "the ensure hook saw the call's ids at the tier's layer"
         );
+        assert_eq!(
+            empty.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Step, vec![0, 2]),
+                PinEvent::Unpinned(vec![0, 2]),
+            ],
+            "a step's ids are pinned as the step's, and let go when the call refuses"
+        );
 
         // The filled slot: bytes the call turns into the mapping's own
         // values — the no-tier path's, bit for bit.
@@ -3882,6 +3906,18 @@ mod tests {
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "a filled slot's call writes the mapping path's values"
+        );
+        assert_eq!(
+            full.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Step, vec![0, 2]),
+                PinEvent::Unpinned(vec![0, 2]),
+            ],
+            "the step's ids stay pinned for the call and are let go after it"
+        );
+        assert!(
+            full.pins.lock().unwrap().loose.is_empty(),
+            "every slot the step read was pinned"
         );
 
         // The union path's claim: its columns' tier ids pinned once, as keep,
@@ -3975,6 +4011,14 @@ mod tests {
             vec![(4, tier_ids.to_vec())],
             "ensure saw the call's distinct tier ids once, ascending, at the tier's layer"
         );
+        assert_eq!(
+            empty.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
+                PinEvent::Unpinned(tier_ids.to_vec()),
+            ],
+            "the step union's tier ids are pinned as the step's, and let go when it refuses"
+        );
 
         let mut full = MockTier::of(&split, &layer, true);
         full.slots = 2 * super::UNION_BATCH_IDS + 8;
@@ -3984,6 +4028,18 @@ mod tests {
         layer
             .experts_step_union_into(src, &xw, &lists, &mut got, &mut us)
             .unwrap();
+        assert_eq!(
+            full.events(),
+            vec![
+                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
+                PinEvent::Unpinned(tier_ids.to_vec()),
+            ],
+            "the step union's tier ids stay pinned for the call and are let go after it"
+        );
+        assert!(
+            full.pins.lock().unwrap().loose.is_empty(),
+            "every slot the step union read was pinned"
+        );
         let asked = full.asked();
         assert!(
             asked.iter().all(|&(l, id, _)| l == 4 && id != 1),

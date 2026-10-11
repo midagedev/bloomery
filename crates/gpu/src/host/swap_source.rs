@@ -843,10 +843,11 @@ impl SwapSource for FileSwap {
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "FileSwap::prepare_victim";
         // A victim the arena serves fills its slot, never the page cache:
-        // the tier's own read, on this thread — never the pool's, whose
-        // dispatch mutex the chain's compute takes — inside the deadline.
+        // the tier's own read, on its fill reader behind the prompt batches
+        // — never the pool's, whose dispatch mutex the chain's compute
+        // takes — and published before this returns, inside the deadline.
         if let Some(tier) = self.tier_serving(layer, id) {
-            return tier.ensure_here(layer, &[id]);
+            return tier.ensure_victim(layer, &[id]);
         }
         let parts = self.layer(layer, WHAT)?.parts.len();
         for part in 0..parts {
