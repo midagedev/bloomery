@@ -79,6 +79,7 @@ use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
@@ -732,6 +733,9 @@ pub struct Body {
     /// The load's residency side ([`ResidencyGlue`]): the machine's source
     /// and shape, the boundaries' log, the delegation to the host tier.
     residency_glue: ResidencyGlue,
+    /// The NVMe expert tier's arena, on a load whose plan paged routed
+    /// experts ([`Body::nvme_tier`]).
+    nvme_tier: Option<Arc<NvTier>>,
     /// The residency the body was loaded with: `off` keeps the load's slot
     /// map for the model's life.
     residency: Residency,
@@ -1575,8 +1579,12 @@ impl Body {
             LOAD_ROWS,
         )?;
         let file = Arc::clone(file);
-        let experts = HostRun::build(
-            Arc::clone(&file),
+        // The common chain's host-run build: a paged plan's NVMe expert tier
+        // is attached before the run's first call. The run includes the
+        // NextN layer's index, which the tier does not cover.
+        let experts = bloomery_gpu::model::host_run(
+            plan,
+            &file,
             run.start,
             host.r8,
             HostWidths {
@@ -1586,6 +1594,8 @@ impl Body {
             },
             |src| routed_layers(src, hp, run.clone()),
         )?;
+        glue.attach_tier(experts.tier())?;
+        let nvme_tier = experts.tier().cloned();
         let tier_cards = tiers
             .iter()
             .enumerate()
@@ -1663,6 +1673,7 @@ impl Body {
             ckpt,
             prompt: prefill::PromptState::new(),
             residency_glue: glue,
+            nvme_tier,
             residency: lever,
             nextn: None,
             planned: None,
@@ -1745,6 +1756,14 @@ impl Body {
             + self.card.bytes()
             + self.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
+    }
+
+    /// The NVMe expert tier's arena, on a load whose plan paged routed
+    /// experts: the counters a run reports ([`NvTier::stats`]). `None` on a
+    /// load with no tier.
+    #[must_use]
+    pub fn nvme_tier(&self) -> Option<&Arc<NvTier>> {
+        self.nvme_tier.as_ref()
     }
 
     /// The host tier.

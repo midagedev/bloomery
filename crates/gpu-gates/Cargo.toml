@@ -315,6 +315,10 @@ name = "gate_glm5next_mtp"
 required-features = ["glm5next"]
 
 [[bin]]
+name = "gate_glm5next_nvtier"
+required-features = ["glm5next"]
+
+[[bin]]
 name = "gate_glm5next_serve"
 required-features = ["glm5next"]
 

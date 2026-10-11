@@ -769,7 +769,9 @@ mod cli {
                 timed,
                 warm,
             };
-            return slots_run(&mut s, &arm);
+            let done = slots_run(&mut s, &arm);
+            print_nvtier(&s)?;
+            return done;
         }
         // Under `--serve-feed` the call runs every id but the last, the last
         // a pass of the run's pick.
@@ -796,7 +798,9 @@ mod cli {
                 logits: has("--logits"),
                 pair,
             };
-            return drafted_run(&mut s, &arm, WidthMode::of(levers.mtp_width())?);
+            let done = drafted_run(&mut s, &arm, WidthMode::of(levers.mtp_width())?);
+            print_nvtier(&s)?;
+            return done;
         }
         if stats {
             bloomery_gpu_glm5next::set_prompt_stats(s.model_mut(), true)?;
@@ -890,6 +894,17 @@ mod cli {
                 dir.display(),
                 t.finish()?
             );
+        }
+        print_nvtier(&s)
+    }
+
+    /// The load's `nvtier` record at the end of a run (counters since the
+    /// load, as `generate_qwen3moe` prints it), nothing on a load without a
+    /// tier.
+    fn print_nvtier(s: &Session<Body>) -> Result<(), GateError> {
+        let b = s.model().body("generate_glm5next")?;
+        if let Some(r) = record::nvtier_of(b.nvme_tier().map(|t| &**t)) {
+            r.print();
         }
         Ok(())
     }
