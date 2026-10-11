@@ -880,6 +880,17 @@ gate-gpu-clef-hidden:
 gate-gpu-qwen35-media:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-media && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
 
+# The same bin on the qwen35moe profile's seat: Body35's image rows on Qwen3.6-35B-A3B at lmstudio's Q4_K_M (21.2 GB, whole
+# on one card, refused by name when the whole-fit verdict does not take it) against the qwen35moe-vis sets (mainline's mtmd on
+# the same file): set B's tower rows as the spans' rows; set C's three prompts, their CPU twins and the C'' runs for the unit
+# rows, set C's positions against ours and the rotation table they gather, the text request on the media load against the text
+# load's, a step graph captured at load and replayed after an image call, and the hidden band per region; set F's two decodes
+# (32 greedy steps after c1 and c2): the positions the steps read against F's n_past, the ids, each step's hidden against F's
+# band, and the steps' logits against the same ids through passes of two rows. Not repeated here: Body35's slot and cache
+# clauses (the dense seat closes them). Real file only; the gate lock.
+gate-gpu-qwen35moe-media:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-media && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
+
 # The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
 # `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
 # decide with no head, --model qwen3 with --head, a head config no row knows, a head narrower than the backbone,
