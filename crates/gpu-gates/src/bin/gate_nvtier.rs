@@ -22,7 +22,7 @@
 //!   (`HostRoomFloor`), an arena budget under the arena's floor at load
 //!   (`ArenaFloor`: one byte, `(k − 1)` slot sets, the floor's own slots
 //!   less one — the floor is a prompt union's two batches and the lane's
-//!   claim, 2 × `UNION_BATCH_IDS` + 1, over the call's own `k + lanes` — each
+//!   slots, 2 × `UNION_BATCH_IDS` + 5, over the call's own `k + 5` — each
 //!   by name), the floor's own budget loading with exactly its slots and the
 //!   placement's slot set and then serving the prompt (a load of its own at
 //!   that arena, its prompt's argmax and logits row bit for bit the all-RAM
@@ -1164,10 +1164,10 @@ struct FloorRun {
 }
 
 /// The `refuse` clause's floor arm: a load whose arena is exactly the floor's
-/// bytes (a prompt union's two batches and the lane's claim a layer) on the
+/// bytes (a prompt union's two batches and the lane's slots a layer) on the
 /// paged plan under `residency`, and [`PROMPT`] positions as one prompt call:
 /// the union claims, fills and pins its batches in the least room it is
-/// served in, the lane's claims beside it. Refused by name: a plan that pages
+/// served in, the lane's slots beside it. Refused by name: a plan that pages
 /// no routed expert, and a load that built no arena.
 fn floor_arm(
     path: &Path,
@@ -2448,8 +2448,8 @@ fn refuse_clauses(
             let named = text.contains(&format!("carves {slots} slots a paged layer"))
                 && text.contains(&format!(
                     "under the floor of {} slots (the larger of {} × {} ids a call + {} lane \
-                     claims and {} for a union in batches",
-                    least.slots, least.k, least.columns, least.lanes, least.union
+                     slots and {} for a union in batches",
+                    least.slots, least.k, least.columns, least.lane_slots, least.union
                 ));
             println!("refuse floor: {} B: {text}", slots * least.slot_set);
             named
@@ -2467,7 +2467,7 @@ fn refuse_clauses(
     let floor_union = named(least.slots - 1);
     println!(
         "refuse floor-union: an arena of {} × {} B (the floor, a union's two batches and the \
-         lane's claim, less one slot) is refused at load by name: {}",
+         lane's slots, less one slot) is refused at load by name: {}",
         least.slots - 1,
         least.slot_set,
         verdict(floor_union)

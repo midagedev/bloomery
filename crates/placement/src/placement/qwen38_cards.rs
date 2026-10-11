@@ -22,9 +22,9 @@ use super::workstation::{
     unified_of,
 };
 use super::{
-    ARENA_ALIGN, ARENA_COLUMNS, ArenaDial, ArenaFloor, Card, CardFormat, Device, KvBytes, Machine,
-    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
-    plan_routed_reserving,
+    ARENA_ALIGN, ARENA_COLUMNS, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, CardFormat, Device,
+    KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role,
+    nvme_arena_of, plan_routed_reserving,
 };
 use crate::slots::{SeqTerms, Stores};
 
@@ -1242,21 +1242,23 @@ fn a_room_under_the_floor_is_refused_by_name() {
 }
 
 /// The arena's floor on the gate plan: the larger of ten ids a call (the
-/// routed width, one column) with the residency machine's one lane claim
-/// beside them, and a prompt union in batches (two batches of
-/// `UNION_BATCH_IDS` pinned at once and the lane claim), over one slot of
+/// routed width, one column) with the residency lane's five slots
+/// (`ARENA_LANE_SLOTS`: four open reads and a victim claim) beside them, and
+/// a prompt union in batches (two batches of `UNION_BATCH_IDS` pinned at
+/// once and the lane's slots), over one slot of
 /// each of the 48 layers — every part of the Q4 file a whole number of
 /// pages, so a slot set is the experts' bytes and two pages a part. A room
 /// that leaves the arena fewer slots a paged layer — `k − 1`, or the floor's
 /// own count less one — is refused at plan time by name, naming the slots,
-/// the ids a call, the lane claims, the union's slots and the bytes, where
+/// the ids a call, the lane slots, the union's slots and the bytes, where
 /// the old dial planned both and the first decode call overflowed them. The
 /// floor's own room plans an arena that carves exactly its slots.
 ///
-/// PIN(2026-10-11): the floor is 33 slots, not 11 — a union run in batches
-/// pins two batches while the next is filled and the lane claims one
-/// (2 × 16 + 1 = 33 > 10 × 1 + 1 = 11): a carve of 11 to 32 slots loaded,
-/// then refused every prompt with an arena id (`TierError::BatchFloor`).
+/// PIN(2026-10-12): the floor is 37 slots, not 33 (2026-10-11: 11) — a union
+/// run in batches pins two batches while the next is filled and the lane
+/// holds `LANE_THREADS + 1` slots, four open reads and a victim claim
+/// (2 × 16 + 5 = 37 > 10 × 1 + 5 = 15): a carve of 15 to 36 slots can load,
+/// then refuse a claim beside the pins (`TierError::BatchFloor`).
 #[test]
 fn a_room_that_leaves_under_the_floors_slots_is_refused_by_name() {
     let (q4, gate) = (model(false), machine_a(RTX_3090));
@@ -1267,15 +1269,15 @@ fn a_room_that_leaves_under_the_floors_slots_is_refused_by_name() {
         (
             least.k,
             least.columns,
-            least.lanes,
+            least.lane_slots,
             least.union,
             least.slots
         ),
-        (10, 1, 1, 33, 33)
+        (10, 1, 5, 37, 37)
     );
     let units: u64 = (0..LAYERS).map(|l| layer_unit(&q4, l)).sum();
     assert_eq!(least.slot_set, units + LAYERS as u64 * 3 * 2 * ARENA_ALIGN);
-    assert_eq!(least.bytes, 33 * least.slot_set);
+    assert_eq!(least.bytes, 37 * least.slot_set);
     let floor = dial.floor().expect("the floor");
     for slots in [least.k - 1, least.slots - 1] {
         let room = floor + slots * least.slot_set;
@@ -1295,9 +1297,9 @@ fn a_room_that_leaves_under_the_floors_slots_is_refused_by_name() {
         }
         let text = e.to_string();
         for part in [
-            "33 slots a paged layer".to_string(),
-            "10 × 1 ids a call + 1 lane claims".to_string(),
-            "33 for a union in batches".to_string(),
+            "37 slots a paged layer".to_string(),
+            "10 × 1 ids a call + 5 lane slots".to_string(),
+            "37 for a union in batches".to_string(),
             format!("= {} B", least.bytes),
             "BLOOMERY_NVTIER_BYTES=0".to_string(),
         ] {
@@ -1338,7 +1340,9 @@ fn a_given_arena_under_the_floor_is_refused_by_name() {
     for part in [
         format!("{} B (BLOOMERY_NVTIER_BYTES)", least.bytes - 1),
         format!("set at least {} B", least.bytes),
-        "33 slots a paged layer".to_string(),
+        // PIN(2026-10-12): 37 slots, not 33: the lane holds five slots
+        // (`ARENA_LANE_SLOTS`), the union's 2 × 16 + 5.
+        "37 slots a paged layer".to_string(),
     ] {
         assert!(text.contains(&part), "{part:?} in {text}");
     }
@@ -1490,12 +1494,12 @@ fn the_dial_moves_a_byte_a_byte_but_at_its_step() {
 #[test]
 fn the_split_dial_picks_its_arena_or_refuses_a_too_large_one() {
     const G: u64 = 1 << 30;
-    // PIN(2026-10-11): a slot set of G / 16, a floor of 33 slots = 2.0625 G
-    // (the floor carries the batched union's 2 × 16 + 1 slots; at G / 8 it
-    // was 11 slots = 1.375 G), and the given arena below is 3 G, not 2 G:
-    // the test's subject is that a given arena at or over the floor is taken
-    // as it is.
-    let least = ArenaFloor::new(10, 1, 1, G / 16).expect("the floor");
+    // PIN(2026-10-12): a slot set of G / 16, a floor of 37 slots = 2.3125 G
+    // (the floor carries the batched union's 2 × 16 + 5 slots; 33 slots =
+    // 2.0625 G before, 11 slots = 1.375 G at G / 8 earlier), and the
+    // given arena below is 3 G, not 2 G: the test's subject is that a given
+    // arena at or over the floor is taken as it is.
+    let least = ArenaFloor::new(10, 1, ARENA_LANE_SLOTS, G / 16).expect("the floor");
     let dial = |room| ArenaDial {
         room,
         base: G,

@@ -2623,17 +2623,18 @@ pub const ARENA_ALIGN: u64 = 4096;
 /// [`ArenaFloor::of`] for its own.
 pub const ARENA_COLUMNS: u64 = 1;
 
-/// The residency machine's slot claims that can land in a paged layer while
-/// one call of the step reads it: one. A lane prepares a flip's victim (the
-/// arena's fill of that one id) under the lane's receive lock, one lane
-/// thread at a time, and a job the staging window gates then waits for the
-/// window under the same lock; the step port closes the window for each
-/// service's compute, and every due job's victim is prepared before the
-/// pass launches. A lane's open read of an admitted id pins its slot against
-/// the claim (the LRU takes no pinned slot); a layer has one flip in flight,
-/// so its claim and its pin never coexist and the count stays one. A claim
-/// that finds every candidate pinned is refused by name.
-pub const ARENA_LANE_CLAIMS: u64 = 1;
+/// The slots of a paged layer one residency lane holds at once beside the
+/// step's call: `4 + 1`. Four are open reads: each lane thread pins the slot
+/// of the id it stages from `open_read` until its `end_read`, and a flush's
+/// or a landing's jobs stage on all `LANE_THREADS` (4) threads at once
+/// (`host/lane.rs`, `Shared::serve`). One is a victim claim: the machine's
+/// pick check (`SwapMachine::check_victims`) prepares a victim on its own
+/// thread while the lane's threads hold their pins (`NvTier::ensure_victim`,
+/// published unpinned). There is one lane per swap machine, so a paged layer
+/// sees one lane's count. Placement cannot depend on the gpu crate: a test
+/// there holds `LANE_THREADS + 1` equal to this value. A claim that finds
+/// every candidate pinned is refused by name.
+pub const ARENA_LANE_SLOTS: u64 = 4 + 1;
 
 /// The experts of the NVMe tier's arena one batch of a prompt union holds:
 /// the unit a claim, a fill and a pin move in. A union over more of a
@@ -2653,11 +2654,11 @@ pub fn arena_window_bytes(len: u64) -> u64 {
 }
 
 /// The NVMe tier arena's floor: the slots a paged layer needs so that one
-/// call reads every distinct id it names from its own slot while the lane
-/// claims beside it take others — the call's `k × columns` ids and the
-/// lanes — or, for a prompt union run in batches, the two batches it pins
-/// at once and the lane's claim ([`ArenaFloor::union`]), whichever is
-/// larger, and their bytes over one slot of every layer the arena may page.
+/// call reads every distinct id it names from its own slot while the lane's
+/// pins and claim beside it take others — the call's `k × columns` ids and
+/// the lane's slots — or, for a prompt union run in batches, the two batches
+/// it pins at once and the lane's slots ([`ArenaFloor::union`]), whichever
+/// is larger, and their bytes over one slot of every layer the arena may page.
 /// The one owner of the floor: the split dial gives no arena under it
 /// ([`nvme_arena_of`]), and the arena's carve at load refuses a budget
 /// under its slots.
@@ -2667,50 +2668,50 @@ pub struct ArenaFloor {
     pub k: u64,
     /// The widest call's columns.
     pub columns: u64,
-    /// The lane claims beside the call: [`ARENA_LANE_CLAIMS`] where a
-    /// stage card holds a routed expert (the residency machine can run),
-    /// else none.
-    pub lanes: u64,
+    /// The slots the lane holds beside the call: [`ARENA_LANE_SLOTS`]
+    /// where a stage card holds a routed expert (the residency machine can
+    /// run), else none.
+    pub lane_slots: u64,
     /// One slot of every layer the host leg serves routed experts of, each
     /// part in its window ([`arena_window_bytes`]).
     pub slot_set: u64,
     /// The slots a prompt union run in batches holds at once: two batches
-    /// ([`UNION_BATCH_IDS`]) and the lane's claim ([`ARENA_LANE_CLAIMS`],
+    /// ([`UNION_BATCH_IDS`]) and the lane's slots ([`ARENA_LANE_SLOTS`],
     /// whether or not a lane runs: the union's own refusal counts it so).
     pub union: u64,
-    /// The larger of `k × columns + lanes` and `union`.
+    /// The larger of `k × columns + lane_slots` and `union`.
     pub slots: u64,
     /// `slots × slot_set`.
     pub bytes: u64,
 }
 
 impl ArenaFloor {
-    /// The floor of calls of `columns` columns of `k` ids beside `lanes`
-    /// lane claims, over a slot set of `slot_set` bytes. Refused by name: a
+    /// The floor of calls of `columns` columns of `k` ids beside `lane_slots`
+    /// lane slots, over a slot set of `slot_set` bytes. Refused by name: a
     /// count or a byte total past u64.
     pub fn new(
         k: u64,
         columns: u64,
-        lanes: u64,
+        lane_slots: u64,
         slot_set: u64,
     ) -> Result<ArenaFloor, PlacementError> {
         let past = || PlacementError::Metadata {
             key: "the NVMe tier arena's floor".to_string(),
             detail: format!(
-                "{k} × {columns} ids + {lanes} lane claims over a {slot_set} B slot set pass u64"
+                "{k} × {columns} ids + {lane_slots} lane slots over a {slot_set} B slot set pass u64"
             ),
         };
         let call = k
             .checked_mul(columns)
-            .and_then(|ids| ids.checked_add(lanes))
+            .and_then(|ids| ids.checked_add(lane_slots))
             .ok_or_else(past)?;
-        let union = 2 * UNION_BATCH_IDS + ARENA_LANE_CLAIMS;
+        let union = 2 * UNION_BATCH_IDS + ARENA_LANE_SLOTS;
         let slots = call.max(union);
         let bytes = slots.checked_mul(slot_set).ok_or_else(past)?;
         Ok(ArenaFloor {
             k,
             columns,
-            lanes,
+            lane_slots,
             slot_set,
             union,
             slots,
@@ -2719,7 +2720,7 @@ impl ArenaFloor {
     }
 
     /// `plan`'s floor for calls of `columns` columns: `k` the model's
-    /// routed width, the lane claims where a stage card holds a routed
+    /// routed width, the lane slots where a stage card holds a routed
     /// expert, and the slot set over every layer whose routed stacks the
     /// host leg serves (a host or an NVMe segment) — on a plan the split
     /// has not run on yet, the layers it can page, a bound over the ones it
@@ -2744,12 +2745,12 @@ impl ArenaFloor {
                 .checked_add(arena_window_bytes(per))
                 .ok_or_else(|| PlacementError::tensor(t, "the arena's slot set passes u64"))?;
         }
-        let lanes = if plan.n_l.iter().any(|&n| n > 0) {
-            ARENA_LANE_CLAIMS
+        let lane_slots = if plan.n_l.iter().any(|&n| n > 0) {
+            ARENA_LANE_SLOTS
         } else {
             0
         };
-        ArenaFloor::new(model.experts_used, columns, lanes, slot_set)
+        ArenaFloor::new(model.experts_used, columns, lane_slots, slot_set)
     }
 }
 
@@ -2774,9 +2775,15 @@ impl fmt::Display for ArenaFloor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} slots a paged layer (the larger of {} × {} ids a call + {} lane claims and {} for \
+            "{} slots a paged layer (the larger of {} × {} ids a call + {} lane slots and {} for \
              a union in batches) × {} B a slot of every paged layer = {} B",
-            self.slots, self.k, self.columns, self.lanes, self.union, self.slot_set, self.bytes
+            self.slots,
+            self.k,
+            self.columns,
+            self.lane_slots,
+            self.union,
+            self.slot_set,
+            self.bytes
         )
     }
 }
@@ -3429,33 +3436,52 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
 mod tests {
     use super::*;
 
-    /// The floor is the larger of a call's `k × columns + lanes` and the
-    /// batched union's two batches and the lane claim, and the union's term
-    /// counts the lane claim whether or not a lane runs: the model side's
+    /// The floor is the larger of a call's `k × columns + lane_slots` and the
+    /// batched union's two batches and the lane's slots, and the union's term
+    /// counts the lane's slots whether or not a lane runs: the model side's
     /// refusal of a union under it (`TierError::BatchFloor`) never reads the
-    /// plan's lanes.
+    /// plan's lane slots. A lane's slots are its four open reads and one
+    /// victim claim.
     #[test]
     fn the_floor_carries_the_batched_unions_pins() {
-        let union = 2 * UNION_BATCH_IDS + ARENA_LANE_CLAIMS;
+        assert_eq!(ARENA_LANE_SLOTS, 4 + 1);
+        let union = 2 * UNION_BATCH_IDS + ARENA_LANE_SLOTS;
         let slot_set = 1 << 20;
         // The routed width a call names, one column, a lane: under the union.
-        let narrow = ArenaFloor::new(10, 1, 1, slot_set).expect("a floor");
+        let narrow = ArenaFloor::new(10, 1, ARENA_LANE_SLOTS, slot_set).expect("a floor");
         assert_eq!((narrow.union, narrow.slots), (union, union));
         assert_eq!(narrow.bytes, union * slot_set);
-        // No lane runs: the union's term still counts the claim.
+        // No lane runs: the union's term still counts the lane's slots.
         let no_lane = ArenaFloor::new(10, 1, 0, slot_set).expect("a floor");
         assert_eq!(no_lane.slots, union);
         // A call wider than the union's pins: its own term.
-        let wide = ArenaFloor::new(16, 3, 1, slot_set).expect("a floor");
-        assert_eq!((wide.union, wide.slots), (union, 16 * 3 + 1));
+        let wide = ArenaFloor::new(16, 3, ARENA_LANE_SLOTS, slot_set).expect("a floor");
+        assert_eq!((wide.union, wide.slots), (union, 16 * 3 + ARENA_LANE_SLOTS));
         assert_eq!(wide.bytes, wide.slots * slot_set);
         let text = narrow.to_string();
         assert!(
-            text.contains("33 slots a paged layer") && text.contains("33 for a union in batches"),
+            text.contains("37 slots a paged layer") && text.contains("37 for a union in batches"),
             "{text}"
         );
         // Past u64 is refused by name, not wrapped.
         assert!(ArenaFloor::new(u64::MAX, 2, 0, 1).is_err());
+    }
+
+    /// PIN(2026-10-12): a lane holds its open reads and its victim claim at
+    /// once, so the union's floor is `2 × UNION_BATCH_IDS + LANE_THREADS + 1`
+    /// slots (two batches pinned, four lane threads each pinning the id they
+    /// stage, one victim claim): 37. The earlier one-slot lane term, 33,
+    /// refused a claim beside four pins and two pinned batches.
+    #[test]
+    fn a_lane_holds_its_open_reads_and_its_victim_claim() {
+        let lane_threads = 4;
+        assert_eq!(ARENA_LANE_SLOTS, lane_threads + 1);
+        let floor = ArenaFloor::new(10, 1, ARENA_LANE_SLOTS, 1 << 20).expect("a floor");
+        assert_eq!(floor.slots, 2 * UNION_BATCH_IDS + lane_threads + 1);
+        assert_eq!(floor.slots, 37);
+        // The call's term moves with the lane's slots too: k ids and the lane.
+        let call = ArenaFloor::new(40, 1, ARENA_LANE_SLOTS, 1).expect("a floor");
+        assert_eq!(call.slots, 40 + lane_threads + 1);
     }
 
     /// A card running `layers`, with the head and the token embedding as

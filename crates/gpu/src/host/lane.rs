@@ -47,6 +47,10 @@ pub const RING_SLOTS: usize = 4;
 /// once.
 pub const LANE_THREADS: usize = 4;
 
+// The arena's floor counts a lane's slots: one open read a thread and a victim
+// claim.
+const _: () = assert!(LANE_THREADS as u64 + 1 == model::placement::ARENA_LANE_SLOTS);
+
 /// Bytes between two words of the staging page: a cache line each.
 pub(super) const WORD_STRIDE: usize = 64;
 

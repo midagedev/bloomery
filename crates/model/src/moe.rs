@@ -1082,7 +1082,7 @@ pub const UNION_TAIL_MAX_COLS: usize = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
 /// Experts of the NVMe tier's arena one batch of a tiered union call holds:
 /// the unit a claim, a fill and a pin move in ([`HostLayer::experts_union_into`]).
 /// A call whose arena ids are over the layer's slots less two batches runs in
-/// batches, and the layer's slots must hold two of them and the lane's claim.
+/// batches, and the layer's slots must hold two of them and the lane's slots.
 /// The placement's value, which its arena floor counts.
 pub const UNION_BATCH_IDS: usize = crate::placement::UNION_BATCH_IDS as usize;
 
@@ -1654,7 +1654,7 @@ struct Batching<'t> {
 /// most `2B`. Its gate/up, combine and down passes run per batch, each
 /// expert's downs stored by their slot, and the per-column sums run once
 /// after the last batch, in list order from zero: every value is the
-/// whole call's, bit for bit. A layer under `2B` and the lane's claim is
+/// whole call's, bit for bit. A layer under `2B` and the lane's slots is
 /// refused by name ([`TierError::BatchFloor`]) before any claim, and so is an
 /// expert past the stacks'. The host segment's experts compute first, under
 /// the first batch's fill.
@@ -1697,7 +1697,7 @@ fn serve_tiered<'w>(
         drop(pin);
         return served;
     }
-    let need = 2 * batch + crate::placement::ARENA_LANE_CLAIMS as usize;
+    let need = 2 * batch + crate::placement::ARENA_LANE_SLOTS as usize;
     if slots < need {
         return Err(TierError::BatchFloor {
             layer: tier.layer,
@@ -1994,9 +1994,9 @@ pub enum TierError {
     /// A union call over more of the arena's ids than the layer's slots less
     /// two batches runs in batches, and the layer's slots are under the
     /// floor of that: the computing batch and the one being filled pinned at
-    /// once, and the lane's claim beside them.
+    /// once, and the lane's slots beside them.
     #[error(
-        "layer {layer}'s arena holds {slots} slots; a union call served in batches pins two          batches and leaves the lane's claim a slot, which takes {need}"
+        "layer {layer}'s arena holds {slots} slots; a union call served in batches pins two batches and leaves the lane's slots, which takes {need}"
     )]
     BatchFloor {
         layer: usize,
@@ -3505,13 +3505,19 @@ mod tests {
     /// one of eight (the narrow form's claimed quantizations and inline sum
     /// against the batches' quantize-first passes). A call whose arena ids fit
     /// the slots less two batches takes one claim of all of them. A layer under
-    /// two batches and the lane's claim, and an expert past the stacks', are
+    /// two batches and the lane's slots, and an expert past the stacks', are
     /// refused by name before any claim, and an unfilled slot by name with
     /// every pin released.
+    ///
+    /// PIN(2026-10-12): the floor is `2 × batch + ARENA_LANE_SLOTS` = 11
+    /// slots, where it was 7 (the lane's one claim): the calls run on the
+    /// floor's own slots, a keep set of five, not on ten slots and a keep set
+    /// of four.
     #[test]
     fn a_tiered_union_runs_in_pinned_batches_keep_first() {
         use super::{Claim, TierError};
         let (embd, ff, n_expert, batch) = (256, 256, 14, 3);
+        let lane = crate::placement::ARENA_LANE_SLOTS as usize;
         let tys = [GgmlType::Q4_K; 3];
         let path = layer_file("tierbatch", tys, embd, ff, n_expert);
         let split = gguf::Split::open(&path).unwrap();
@@ -3570,14 +3576,15 @@ mod tests {
                 .count()
         };
 
-        // Ten columns; the arena holds ten slots: keep 10 - 2 * 3 = 4 of the
-        // twelve ids. The top four by columns, ties to the lower id: 13, 3, 5,
-        // 7 — not the ascending head 2, 3, 4, 5.
+        // Ten columns; the arena holds the floor's eleven slots (two batches of
+        // three and the lane's five): keep 11 - 2 * 3 = 5 of the twelve ids.
+        // The top five by columns, ties to the lower id: 13, 3, 5, 7, 8 — not
+        // the ascending head 2, 3, 4, 5, 6.
         let counts = [3usize, 1, 1, 9, 1, 4, 1, 2, 2, 1, 2, 1, 1, 10];
         let (lists, x) = (lists_of(&counts, 10), x_of(10));
         let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
         let want = reference(&mut us, &x, &lists);
-        let (layer, mock) = tiered(true, 10);
+        let (layer, mock) = tiered(true, 2 * batch + lane);
         let mut got = vec![f32::NAN; embd * 10];
         layer
             .experts_union_into(src, &x, &slices, &mut got, &mut us)
@@ -3597,9 +3604,9 @@ mod tests {
             .collect();
         let mut by_count: Vec<u32> = (2..n_expert as u32).collect();
         by_count.sort_by_key(|&e| (std::cmp::Reverse(counts[e as usize]), e));
-        let mut kept: Vec<u32> = by_count[..4].to_vec();
+        let mut kept: Vec<u32> = by_count[..5].to_vec();
         kept.sort_unstable();
-        assert_eq!(kept, [3, 5, 7, 13], "the keep set the test expects");
+        assert_eq!(kept, [3, 5, 7, 8, 13], "the keep set the test expects");
         let keep_claimed: Vec<u32> = claims[..2]
             .iter()
             .flat_map(|(_, ids)| ids.clone())
@@ -3612,10 +3619,10 @@ mod tests {
             claims,
             vec![
                 (Claim::Keep, vec![3, 5, 7]),
-                (Claim::Keep, vec![13]),
+                (Claim::Keep, vec![8, 13]),
                 (Claim::Transient, vec![2, 4, 6]),
-                (Claim::Transient, vec![8, 9, 10]),
-                (Claim::Transient, vec![11, 12]),
+                (Claim::Transient, vec![9, 10, 11]),
+                (Claim::Transient, vec![12]),
             ],
             "batches of three, one kind each, the keep set's first, ascending"
         );
@@ -3669,8 +3676,8 @@ mod tests {
             "a small call claims all its arena ids at once, as keep"
         );
 
-        // The floor's own slots (two batches and the lane's claim) serve the
-        // call with a keep set of one, and the narrow form (eight columns:
+        // The floor's own slots (two batches and the lane's five) serve the
+        // call with a keep set of five, and the narrow form (eight columns:
         // claimed quantizations and an inline sum whole) matches the batches'
         // passes; the ties at the cut go to the lower id (3 and 13 both list
         // in eight columns).
@@ -3678,7 +3685,7 @@ mod tests {
         let (lists8, x8) = (lists_of(&counts8, 8), x_of(8));
         let slices8: Vec<&[(u32, f32)]> = lists8.iter().map(Vec::as_slice).collect();
         let want8 = reference(&mut us, &x8, &lists8);
-        let (layer, mock) = tiered(true, 2 * batch + 1);
+        let (layer, mock) = tiered(true, 2 * batch + lane);
         let mut got8 = vec![f32::NAN; embd * 8];
         layer
             .experts_union_into(src, &x8, &slices8, &mut got8, &mut us)
@@ -3690,17 +3697,17 @@ mod tests {
         );
         assert_eq!(
             mock.events().first(),
-            Some(&PinEvent::Pinned(Claim::Keep, vec![3])),
-            "a keep set of one, the tie to the lower id"
+            Some(&PinEvent::Pinned(Claim::Keep, vec![3, 5, 7])),
+            "a keep set of five, the first batch its three lowest ids, the tie to the lower id"
         );
         assert!(mock.pins.lock().unwrap().loose.is_empty());
         // One slot under the floor is refused by name before any claim.
-        let (layer, mock) = tiered(true, 2 * batch);
+        let (layer, mock) = tiered(true, 2 * batch + lane - 1);
         match layer.experts_union_into(src, &x, &slices, &mut got, &mut us) {
             Err(crate::ModelError::Tier(TierError::BatchFloor {
                 layer: 4,
-                slots: 6,
-                need: 7,
+                slots: 10,
+                need: 11,
             })) => {}
             other => panic!("not the floor's refusal by name: {other:?}"),
         }
@@ -3710,7 +3717,7 @@ mod tests {
         );
 
         // An expert past the stacks' is refused before any claim.
-        let (layer, mock) = tiered(true, 10);
+        let (layer, mock) = tiered(true, 2 * batch + lane);
         let past = [(14u32, 1.0f32)];
         let past_refs: Vec<&[(u32, f32)]> = vec![&past[..]];
         let x1 = Tensor2::zeros(embd, 1);
@@ -3726,7 +3733,7 @@ mod tests {
 
         // An unfilled slot is refused by name once its batch is pinned, and
         // the pins are released with the refusal.
-        let (layer, mock) = tiered(false, 10);
+        let (layer, mock) = tiered(false, 2 * batch + lane);
         match layer.experts_union_into(src, &x, &slices, &mut got, &mut us) {
             Err(crate::ModelError::Tier(TierError::Unfilled { layer: 4, id: 3 })) => {}
             other => panic!("not the unfilled refusal by name: {other:?}"),
@@ -3747,6 +3754,7 @@ mod tests {
     #[test]
     fn a_tiered_union_tells_its_tier_its_path_once() {
         let (embd, ff, n_expert, batch) = (256, 256, 14, 3);
+        let lane = crate::placement::ARENA_LANE_SLOTS as usize;
         let path = layer_file("tiernote", [GgmlType::Q4_K; 3], embd, ff, n_expert);
         let split = gguf::Split::open(&path).unwrap();
         let src = R8Source::rows(&split);
@@ -3768,11 +3776,11 @@ mod tests {
         );
         let mut us = UnionScratch::new_routed(embd, ff, 10, n_expert).unwrap();
         let mut out = vec![f32::NAN; 2 * embd];
-        let (layer, mock) = tiered(10);
-        // Five arena ids (2..=6) over ten slots less two batches (four):
+        let (layer, mock) = tiered(2 * batch + lane);
+        // Six arena ids (2..=7) over eleven slots less two batches (five):
         // batched. Id 4 is listed by both columns.
         let big = [
-            vec![(2u32, 0.5f32), (3, 0.25), (4, 0.125)],
+            vec![(2u32, 0.5f32), (3, 0.25), (4, 0.125), (7, 0.0625)],
             vec![(4, 0.5), (5, 0.25), (6, 0.125)],
         ];
         let refs: Vec<&[(u32, f32)]> = big.iter().map(Vec::as_slice).collect();
@@ -3783,8 +3791,8 @@ mod tests {
             mock.told(),
             vec![Told {
                 layer: 4,
-                ids: vec![2, 3, 4, 5, 6],
-                off: vec![0, 1, 2, 4, 5, 6],
+                ids: vec![2, 3, 4, 5, 6, 7],
+                off: vec![0, 1, 2, 4, 5, 6, 7],
                 batched: true
             }],
             "one note, batched, with the call's ids and offsets"
@@ -3807,7 +3815,7 @@ mod tests {
         );
         // Refused before the path: a layer one slot under the floor, and an
         // expert past the stacks'.
-        let (floor, floor_mock) = tiered(2 * batch);
+        let (floor, floor_mock) = tiered(2 * batch + lane - 1);
         let refs: Vec<&[(u32, f32)]> = big.iter().map(Vec::as_slice).collect();
         floor
             .experts_union_into(src, &x, &refs, &mut out, &mut us)

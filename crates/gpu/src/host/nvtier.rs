@@ -231,8 +231,8 @@ pub(crate) fn window_bytes(len: usize) -> usize {
 /// layers' slot sizes: the same count a layer, so every layer warms alike
 /// and the carved total stays under the budget. A count under the arena's
 /// floor (`least`, the placement's [`ArenaFloor`]: one call's distinct ids
-/// and the lane claims beside them, or a prompt union's two batches and the
-/// lane's claim), or under one slot, is the named refusal — a call would
+/// and the lane's slots beside them, or a prompt union's two batches and the
+/// lane's slots), or under one slot, is the named refusal — a call would
 /// evict its own ids, or every read refuse.
 pub(crate) fn slots_of(
     budget: u64,
@@ -249,11 +249,11 @@ pub(crate) fn slots_of(
         return Err(format!(
             "the arena's budget {budget} B carves {n} slots a paged layer over the paged layers' \
              {total} B a slot set, under the floor of {want} slots (the larger of {} × {} ids a \
-             call + {} lane claims and {} for a union in batches, {} B over these layers): a \
+             call + {} lane slots and {} for a union in batches, {} B over these layers): a \
              call would evict its own ids",
             least.k,
             least.columns,
-            least.lanes,
+            least.lane_slots,
             least.union,
             want.saturating_mul(total as u64)
         ));
@@ -2584,6 +2584,7 @@ mod tests {
     };
     use engram::direct::{DIRECT_ALIGN, aligned_span};
     use model::moe::Claim;
+    use model::placement::{ARENA_LANE_SLOTS, UNION_BATCH_IDS};
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
     fn book(state: u32, tick: u64) -> SlotBook {
@@ -2618,27 +2619,29 @@ mod tests {
         }
     }
 
-    /// A floor of `slots` slots over the slot set `sizes` sums to.
-    fn floor_of(k: u64, lanes: u64, sizes: &[usize]) -> model::placement::ArenaFloor {
+    /// The floor of calls of `k` ids beside `lane_slots` lane slots over the
+    /// slot set `sizes` sums to.
+    fn floor_of(k: u64, lane_slots: u64, sizes: &[usize]) -> model::placement::ArenaFloor {
         let set = sizes.iter().sum::<usize>() as u64;
-        model::placement::ArenaFloor::new(k, 1, lanes, set).expect("a floor")
+        model::placement::ArenaFloor::new(k, 1, lane_slots, set).expect("a floor")
     }
 
     /// The slots a budget holds: the same count a layer, the carve under
     /// the budget; a budget under one slot of every layer is the named
     /// refusal, and so is a plan that pages nothing.
     ///
-    /// PIN(2026-10-11): the budgets are multiples of the floor's 33 slots
-    /// (a prompt union's two batches and the lane's claim, whatever the
-    /// routed width), where they were 10 and 1 slots: the floor raised, no
-    /// refusal dropped.
+    /// PIN(2026-10-12): the budgets are multiples of the floor's 37 slots,
+    /// `2 × UNION_BATCH_IDS + LANE_THREADS + 1` (a prompt union's two batches
+    /// and the lane's four open reads and victim claim, whatever the routed
+    /// width), where they were 33 slots, and 10 and 1 before that:
+    /// the floor raised, no refusal dropped.
     #[test]
     fn the_budget_carves_the_same_count_a_layer() {
         let sizes = [1_000_000, 1_200_000, 900_000];
         let total: u64 = sizes.iter().sum::<usize>() as u64;
         let one = floor_of(1, 0, &sizes);
         let floor = one.slots;
-        assert_eq!(floor, 33);
+        assert_eq!(floor, 37);
         let n = slots_of((floor + 10) * total, &sizes, &one).expect("the floor and ten more");
         assert_eq!(n as u64, floor + 10);
         assert!(n as u64 * total <= (floor + 10) * total);
@@ -2646,7 +2649,7 @@ mod tests {
         let under = slots_of(total - 1, &sizes, &one).unwrap_err();
         assert!(
             under.contains("carves 0 slots")
-                && under.contains("under the floor of 33 slots")
+                && under.contains("under the floor of 37 slots")
                 && under.contains(&(total - 1).to_string()),
             "{under}"
         );
@@ -2661,32 +2664,33 @@ mod tests {
     }
 
     /// A budget that carves one slot a layer fewer than the arena's floor —
-    /// a prompt union's two batches and the lane's claim, thirty-three slots,
-    /// over ten ids a call and one lane claim — is refused by name, naming
-    /// the carve, the floor's slots, its ids a call, its lane claims, the
-    /// union's slots and its bytes over the paged layers; the floor's own
+    /// a prompt union's two batches and the lane's slots, thirty-seven slots,
+    /// over ten ids a call and the lane's five slots — is refused by name,
+    /// naming the carve, the floor's slots, its ids a call, its lane slots,
+    /// the union's slots and its bytes over the paged layers; the floor's own
     /// budget carves exactly its slots.
     ///
-    /// PIN(2026-10-11): the floor is 33 slots, not 11 (2 × 16 + 1 > 10 × 1 +
-    /// 1): the batched union pins two batches while the next is filled.
+    /// PIN(2026-10-12): the floor is 37 slots, not 33 (2026-10-11: 11): the
+    /// batched union pins two batches while the next is filled and the lane
+    /// holds `LANE_THREADS + 1` = 5 slots (2 × 16 + 5 > 10 × 1 + 5).
     #[test]
     fn a_carve_under_the_floor_is_refused_by_name() {
         let sizes = [3_133_440, 3_137_536, 3_133_440];
         let total: u64 = sizes.iter().sum::<usize>() as u64;
-        let least = floor_of(10, 1, &sizes);
-        assert_eq!(least.slots, 33);
-        let under = slots_of(33 * total - 1, &sizes, &least).unwrap_err();
+        let least = floor_of(10, ARENA_LANE_SLOTS, &sizes);
+        assert_eq!(least.slots, 37);
+        let under = slots_of(37 * total - 1, &sizes, &least).unwrap_err();
         for part in [
-            "carves 32 slots a paged layer".to_string(),
-            "under the floor of 33 slots".to_string(),
-            "10 × 1 ids a call + 1 lane claims".to_string(),
-            "33 for a union in batches".to_string(),
-            format!("{} B over these layers", 33 * total),
+            "carves 36 slots a paged layer".to_string(),
+            "under the floor of 37 slots".to_string(),
+            "10 × 1 ids a call + 5 lane slots".to_string(),
+            "37 for a union in batches".to_string(),
+            format!("{} B over these layers", 37 * total),
         ] {
             assert!(under.contains(&part), "{part:?} in {under}");
         }
         assert!(slots_of(9 * total, &sizes, &least).is_err(), "k − 1 slots");
-        assert_eq!(slots_of(33 * total, &sizes, &least), Ok(33));
+        assert_eq!(slots_of(37 * total, &sizes, &least), Ok(37));
     }
 
     /// The slot a miss takes: the first free one, else the least recently
@@ -3103,6 +3107,55 @@ mod tests {
         let c = super::claim_slots(0, &arena, &mut books, &[3], Claim::Step).unwrap();
         assert_eq!((c.picks.len(), c.evicted.len()), (1, 1));
         drop(pin);
+    }
+
+    /// A layer of `slots` slots under a prompt union's two pinned batches
+    /// of `UNION_BATCH_IDS` ids, the lane's threads each pinning the slot of
+    /// the id they stage (a victim filled unpinned, then opened) and one
+    /// more victim claim beside them: `Err` with the refusal that claim or
+    /// fill met.
+    fn union_beside_lane(slots: usize, lane_threads: u32) -> Result<(), String> {
+        let batch = UNION_BATCH_IDS as u32;
+        let arena = arena_of(2 * batch + lane_threads + 1, slots);
+        let mut books = super::Books::default();
+        let mut pins = Vec::new();
+        for b in 0..2 {
+            let ids: Vec<u32> = (b * batch..(b + 1) * batch).collect();
+            ensure_as(&arena, &mut books, &ids, Claim::Step);
+            pins.push(arena.pin_batch(0, &ids, "test").expect("a batch pin"));
+        }
+        for id in 2 * batch..2 * batch + lane_threads + 1 {
+            let c = super::claim_slots(0, &arena, &mut books, &[id], Claim::Step)
+                .map_err(|e| e.to_string())?;
+            fill_claimed(&arena, &mut books, &c);
+            if id < 2 * batch + lane_threads {
+                arena.open(0, id, "test").expect("the lane's open");
+            }
+        }
+        Ok(())
+    }
+
+    /// The floor holds a union beside a lane: two pinned batches, four lane
+    /// threads' open reads and one victim claim need the floor's slots, and
+    /// a layer one slot under it refuses that claim by name.
+    ///
+    /// PIN(2026-10-12): the floor's slots are `2 × UNION_BATCH_IDS +
+    /// LANE_THREADS + 1` = 37; the lane's one-slot term (33 slots) refused
+    /// the claim beside the fourth read.
+    #[test]
+    fn the_floor_holds_a_union_beside_a_lanes_reads_and_claim() {
+        let lane_threads = 4;
+        let floor = floor_of(10, ARENA_LANE_SLOTS, &[1]).slots as usize;
+        assert_eq!(
+            floor,
+            2 * UNION_BATCH_IDS as usize + lane_threads as usize + 1
+        );
+        union_beside_lane(floor, lane_threads).expect("the floor's slots hold them all");
+        let e = union_beside_lane(floor - 1, lane_threads).unwrap_err();
+        assert!(
+            e.contains("pinned by a lane's read or a batch pin"),
+            "one slot under the floor: {e}"
+        );
     }
 
     /// The open reads of experts `ids` as the books count them.
