@@ -12,7 +12,7 @@ use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
 use model::arch::{QWEN35_BODY, is_qwen35_body};
 use model::placement::workstation::CardSpec;
-use model::placement::{KvBytes, whole_need};
+use model::placement::{KvBytes, Machine, whole_need};
 use std::path::Path;
 
 /// The first `n` ids of `path`, one decimal id a line; a line that is not an
@@ -71,6 +71,19 @@ pub fn open_with(
     ubatch: usize,
     media: bool,
 ) -> Result<(Qwen35moeModel, Split), GateError> {
+    open_seated(path, ctx, ubatch, media, &|_| {})
+}
+
+/// [`open_with`] whose whole-fit machine goes through `seat` before the verdict: a seat that holds
+/// bytes of the card for something else (the image encoder on the stage card,
+/// `vision_seat::reserve_on`) puts them there, so the verdict counts them.
+pub fn open_seated(
+    path: &Path,
+    ctx: usize,
+    ubatch: usize,
+    media: bool,
+    seat: &dyn Fn(&mut Machine),
+) -> Result<(Qwen35moeModel, Split), GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     if !split.architecture().is_some_and(is_qwen35_body) {
         return Err(format!(
@@ -89,7 +102,8 @@ pub fn open_with(
     };
     let census = bloomery_gpu_gates::gpu_census::census()?;
     let card = Place::A.on(&census)?.card_specs()?[0];
-    refuse_unless_whole_fits(&split, o, card).map_err(|e| format!("{}: {e}", path.display()))?;
+    refuse_unless_whole_fits(&split, o, card, seat)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let gpu = Gpu::open_card(card.name, card.device)?;
     let model = Qwen35moeModel::open(gpu, Split::open(path)?, o)?;
     Ok((model, split))
@@ -100,15 +114,29 @@ pub fn open_with(
 /// opens on, as the census read it: every tensor's granules, the cache of
 /// `o.ctx` rows, the card the program's plan lays out (`q3::machine`:
 /// context and step arenas' scratch), and the ubatch arena with the reserve
-/// the load's own fit check keeps free past it (`GpuModel::whole_load`). The
-/// verdict's line goes to stderr; a refusal names its terms, the card and
-/// its holders.
-fn refuse_unless_whole_fits(split: &Split, o: Open35, card: CardSpec) -> Result<(), GateError> {
+/// the load's own fit check keeps free past it (`GpuModel::whole_load`), and what `seat` puts on the
+/// machine. The verdict's line goes to stderr; a refusal names its terms, the card and its holders.
+fn refuse_unless_whole_fits(
+    split: &Split,
+    o: Open35,
+    card: CardSpec,
+    seat: &dyn Fn(&mut Machine),
+) -> Result<(), GateError> {
     let inputs = q35::PlanInputs::describe(split)?;
     let layers = inputs.hp.n_trunk;
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
-    let machine = q3::machine(card, layers, 0);
+    let mut machine = q3::machine(card, layers, 0);
+    let before = machine.cards.first().map_or(0, |c| c.reserves.len());
+    seat(&mut machine);
+    // What the seat put among the card's reserves, by name and bytes, beside the reserves term the
+    // verdict sums them in; nothing for a load whose seat adds none.
+    let held: String = machine.cards.first().map_or_else(String::new, |c| {
+        c.reserves[before..]
+            .iter()
+            .map(|(name, bytes)| format!("; the reserves term holds the {name}'s {bytes} B"))
+            .collect()
+    });
     let card = machine
         .whole_card()
         .ok_or_else(|| format!("the whole load on {}: a machine with no card", card.name))?;
@@ -118,9 +146,12 @@ fn refuse_unless_whole_fits(split: &Split, o: Open35, card: CardSpec) -> Result<
         kv,
         Qwen35moeModel::whole_load(split, o)?,
     )?;
-    eprintln!("whole fit at ctx {}: {need}", o.ctx);
+    eprintln!("whole fit at ctx {}: {need}{held}", o.ctx);
     if need.fits() {
         return Ok(());
     }
-    Err(format!("{need}: a dense backbone has no routed experts to move to the host tier").into())
+    Err(
+        format!("{need}{held}: a dense backbone has no routed experts to move to the host tier")
+            .into(),
+    )
 }

@@ -4,6 +4,8 @@
 //!
 //!     bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>])
 //!                    [--head <weights> [--head-config <file>]]
+//!                    [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
+//!                    [--image-max-tokens N]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C]
 //!
 //! A decision model is named by its head (`serve::decide::pick`): `--head`,
@@ -39,25 +41,46 @@
 //! `general.file_type`, or the census of its tensor types when the file
 //! names none), the row and its routes. An unknown flag or a missing value
 //! is refused by name; any other flag given twice takes its last value.
+//!
+//! Image input is a row's own (`Decision::takes_images`: Clef's) and needs an
+//! encoder file: `--mmproj FILE`, or under `--hf` the repo's own projector
+//! (`hf::mmproj_sibling`) unless `--no-mmproj` says none. The file is opened
+//! and held against the backbone's embedding width, vocabulary and rope before
+//! any load ([`vision_seat::Projector`]), the tower is seated
+//! ([`vision_seat::encoder_seat`]: a card off the plan, else a reserve on the
+//! backbone's card that the backbone's whole-fit verdict counts), the backbone
+//! opens with sequences that take a media call, and the tower loads after it:
+//! the `vision` record follows. A request with images then runs the tower,
+//! reads its rows back and runs the backbone's media call
+//! ([`Backbone::hidden_media`]); a request with none runs the text call, as
+//! on a server with no encoder. `--mmproj` or an image limit beside a row that
+//! takes no images, or on a build without the `vision` feature, is refused by
+//! name.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-use bloomery_gpu::arch::qwen3moe::{PrefillPath, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
+use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
 use bloomery_gpu_gates::record::{self, Kind, Record};
+use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
+use cuda_core::CudaContext;
 use decision::release::{clef, lev};
 use gguf::Split;
 use model::arch::is_qwen35_body;
+use model::arch::qwen35moe::hparams::Hparams;
 use serde_json::{Value, json};
 use serve::ServeError;
 use serve::decide::{
     Decide, DecideError, DecideServer, Decided, HeadFrom, HeadRepo, HeadSource, InFile, Row, Seated,
 };
+use serve::media::{MediaModel, Prepared};
 use tokenizer::Tokenizer;
 
 use crate::{clef_seat, lev_seat};
@@ -65,13 +88,22 @@ use crate::{clef_seat, lev_seat};
 /// The seat's record bin name, the `listening` record's head.
 const WHAT: &str = "bloomery-serve-decide";
 
-/// What this seat prints, all on stderr (its `--records-schema`): the
-/// `listening` record.
-static KINDS: &[&Kind] = &[&record::LISTENING_DECIDE];
+/// What this seat prints, all on stderr (its `--records-schema`): the lines of the fetch of a head
+/// or a projector under `--hf` (the model's own are the server's, printed before the seat
+/// registers), the `vision` record of a resident image encoder, then the `listening` record.
+static KINDS: &[&Kind] = &[
+    &record::HF_OFFLINE,
+    &record::HF_FILE,
+    &record::HF_PROGRESS,
+    &record::HF_DONE,
+    &record::VISION,
+    &record::LISTENING_DECIDE,
+];
 
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
-                     [--head <weights> [--head-config <file>]] [--host H] [--port P] [--ctx C] \
-                     [--api-key KEY] [--api-key-file FNAME]";
+                     [--head <weights> [--head-config <file>]] [--mmproj FILE | --no-mmproj] \
+                     [--image-min-tokens N] [--image-max-tokens N] [--host H] [--port P] \
+                     [--ctx C] [--api-key KEY] [--api-key-file FNAME]";
 
 /// A row's own part, opened from its head's source: its weights and config files, or the model
 /// file that carries the head.
@@ -115,6 +147,11 @@ pub const ROWS: &[Row<Open>] = &[
 pub trait Decision {
     /// The hidden width the head reads.
     fn hidden_size(&self) -> usize;
+    /// Whether the row answers a request that carries images, which the seat's encoder serves
+    /// ([`Backbone::media`]); a row that does not has no encoder opened for it.
+    fn takes_images(&self) -> bool {
+        false
+    }
     /// The answer to one request body; the backbone is the seat's.
     fn decide(&mut self, body: &str, on: &mut Backbone) -> Result<Decided, DecideError>;
 }
@@ -127,6 +164,15 @@ pub trait Hidden {
     /// Every position's final-norm hidden state of `ids` from where the
     /// model stands, `ids.len()` rows of its width.
     fn prefill_hidden(&mut self, ids: &[u32]) -> Result<Vec<f32>, GpuError>;
+    /// [`Hidden::prefill_hidden`] with `spans`' rows in place of their positions' embeddings and
+    /// the sequence's rotation table shifted by them (a model opened for media).
+    fn prefill_hidden_media(
+        &mut self,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+    ) -> Result<Vec<f32>, GpuError>;
+    /// The model's own CUDA context, which a tower call on another card binds back to.
+    fn context(&self) -> &Arc<CudaContext>;
 }
 
 impl Hidden for Qwen35moeModel {
@@ -137,10 +183,25 @@ impl Hidden for Qwen35moeModel {
     fn prefill_hidden(&mut self, ids: &[u32]) -> Result<Vec<f32>, GpuError> {
         Qwen35moeModel::prefill_hidden(self, ids, PrefillPath::Auto)
     }
+
+    fn prefill_hidden_media(
+        &mut self,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+    ) -> Result<Vec<f32>, GpuError> {
+        <Body35 as MediaBody>::prefill_hidden_media(self, ids, spans)
+    }
+
+    fn context(&self) -> &Arc<CudaContext> {
+        self.gpu().context()
+    }
 }
 
-/// A backbone body opened from a file: its hidden-state call and the file.
-type OpenBody = fn(&Path, usize) -> Result<(Box<dyn Hidden>, Split), GateError>;
+/// A backbone body opened from a file for a context of `ctx` positions, its hidden-state call and
+/// the file; `Some` seat is the image encoder's, whose reserve the whole-fit verdict counts and
+/// whose presence makes the sequences take a media call.
+type OpenBody =
+    fn(&Path, usize, Option<&EncoderSeat>) -> Result<(Box<dyn Hidden>, Split), GateError>;
 
 /// The file architectures a body opens.
 type Opens = fn(&str) -> bool;
@@ -152,8 +213,16 @@ const BODIES: &[(Opens, OpenBody)] = &[(is_qwen35_body, open_qwen35)];
 /// A Qwen3.5 dense file (`qwen35`, or `clef` with its head beside the trunk)
 /// whole on one card, prompt ubatches of [`UBATCH`] ids clipped to the
 /// context.
-fn open_qwen35(path: &Path, ctx: usize) -> Result<(Box<dyn Hidden>, Split), GateError> {
-    let (model, split) = crate::qwen35_open::open(path, ctx, UBATCH.min(ctx))?;
+fn open_qwen35(
+    path: &Path,
+    ctx: usize,
+    image: Option<&EncoderSeat>,
+) -> Result<(Box<dyn Hidden>, Split), GateError> {
+    let reserve = image.and_then(|s| s.reserve);
+    let (model, split) =
+        crate::qwen35_open::open_seated(path, ctx, UBATCH.min(ctx), image.is_some(), &|machine| {
+            vision_seat::reserve_on(machine, reserve)
+        })?;
     Ok((Box::new(model), split))
 }
 
@@ -169,6 +238,16 @@ pub struct Backbone {
     /// The server's name for the model (the `--hf` repo, else the file
     /// name): the `model` an answer carries, as llama.cpp's server answers.
     pub name: String,
+    /// The resident image encoder under `--mmproj`.
+    vision: Option<image::Vision>,
+}
+
+/// One prepared image of a media call: where its span starts in the call's ids and what the
+/// model's prepare made of it.
+#[derive(Clone, Copy)]
+pub struct Placed<'a> {
+    pub at: usize,
+    pub prepared: &'a Prepared,
 }
 
 impl Backbone {
@@ -180,12 +259,290 @@ impl Backbone {
         let hidden = self.body.prefill_hidden(ids)?;
         Ok((hidden, t.elapsed().as_secs_f64() * 1e3))
     }
+
+    /// The model's image input, by which a request's images are prepared and laid out in its
+    /// ids; `None` on a server with no encoder.
+    pub fn media(&self) -> Option<&dyn MediaModel> {
+        self.vision.as_ref().map(image::Vision::media)
+    }
+
+    /// [`Backbone::hidden`] of `ids` whose image spans `images` place: each image encoded on the
+    /// resident tower and read back, then one media prompt call with the rows spliced in. The
+    /// hidden states, the prompt call's wall and the tower's wall (encode and readback) in ms.
+    pub fn hidden_media(
+        &mut self,
+        ids: &[u32],
+        images: &[Placed<'_>],
+    ) -> Result<(Vec<f32>, f64, f64), GateError> {
+        let tower = self
+            .vision
+            .as_mut()
+            .ok_or("an image request on a server with no encoder (--mmproj)")?;
+        self.body.reset()?;
+        let t = Instant::now();
+        let vision_seat::SpanRows { rows, ats, .. } =
+            tower.span_rows(self.body.context(), images)?;
+        let tower_ms = t.elapsed().as_secs_f64() * 1e3;
+        // Each span borrows its own range of the call's one buffer of rows; its grid is the
+        // image's merged-token plan, `nx` along a line (the width).
+        let spans: Vec<ImageSpan<'_>> = ats
+            .iter()
+            .zip(images)
+            .map(|(at, image)| {
+                let plan = &image.prepared.patches.plan;
+                ImageSpan {
+                    span: MediaSpan {
+                        at: at.positions.clone(),
+                        rows: &rows[at.rows.clone()],
+                    },
+                    grid: (plan.n_llm_w, plan.n_llm_h),
+                }
+            })
+            .collect();
+        let t = Instant::now();
+        let hidden = self.body.prefill_hidden_media(ids, &spans)?;
+        Ok((hidden, t.elapsed().as_secs_f64() * 1e3, tower_ms))
+    }
+}
+
+/// The seat's image encoder: the encoder file of `--mmproj` opened and seated before the backbone
+/// loads ([`image::open_seat`]), its tower loaded after ([`image::Vision::open`]). One block in
+/// the shape of the common vision seat's helpers, which it folds into
+/// (`vision_seat::open_seat`, `open_tower`, `merged_cells`).
+#[cfg(feature = "vision")]
+mod image {
+    use std::fmt::Display;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use bloomery_gpu_gates::GateError;
+    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::vision_seat::{
+        self, EncoderSeat, Flags, Projector, ScratchHome, SharedMedia, SpanRows, TextFacts,
+    };
+    use cuda_core::{CudaContext, CudaStream};
+    use gguf::Gguf;
+    use serve::media::MediaModel;
+    use vision::Patches;
+    use vision::arch::card::CardBytes;
+    use vision::arch::qwen3vl::TokenLimits;
+
+    use super::Placed;
+
+    /// What `--mmproj` opened for the load: the encoder file held against the text model, where
+    /// its tower sits and the bytes the load reserves for it.
+    pub struct Opened {
+        seat: EncoderSeat,
+        path: PathBuf,
+        /// The model's image input, which a request's images are prepared and laid out by.
+        media: SharedMedia,
+        /// The most image tokens one image takes.
+        cap: usize,
+        /// The tower's card figure: the plan's reserve on a stage-reserve seat, and what the
+        /// tower's load is held to.
+        card: CardBytes,
+        /// The image-token limits the tower's activations are sized for.
+        limits: TokenLimits,
+    }
+
+    impl Opened {
+        /// Where the tower sits, and the reserve the backbone's fit counts.
+        pub fn seat(&self) -> &EncoderSeat {
+            &self.seat
+        }
+    }
+
+    /// The encoder file `file` names (`None`: no image input; a limit given then is refused by
+    /// name), opened as one of the projector types in `takes`, held against the text model
+    /// (`text`, `token`: [`Projector::check_text`]) and seated ([`vision_seat::encoder_seat`]).
+    /// Every check runs before a card is loaded.
+    pub fn open_seat(
+        flags: &Flags,
+        file: Option<&Path>,
+        takes: &[&str],
+        text: &TextFacts,
+        token: &dyn Fn(u32) -> Option<String>,
+    ) -> Result<Option<Opened>, GateError> {
+        let Some(path) = file else {
+            if flags.sets_limits() {
+                return Err(
+                    "--image-min-tokens/--image-max-tokens without --mmproj: no image \
+                            input to bound"
+                        .into(),
+                );
+            }
+            return Ok(None);
+        };
+        let projector = Projector::open(path, flags, takes)?;
+        projector.check_text(text, token)?;
+        Ok(Some(Opened {
+            seat: vision_seat::encoder_seat(Place::A, projector.card.total())?,
+            path: projector.path,
+            media: projector.media,
+            cap: projector.cap,
+            card: projector.card,
+            limits: flags.limits()?,
+        }))
+    }
+
+    /// The tower of `--mmproj` on its seat's card: its readbacks' stream, and the width of a row.
+    pub struct Vision {
+        tower: Box<dyn bloomery_gpu_vision::Tower>,
+        stream: Arc<CudaStream>,
+        n_embd: usize,
+        media: SharedMedia,
+    }
+
+    impl Vision {
+        /// The tower of `at`'s file loaded on its seat's card, the card bound for the load and
+        /// `model` (the backbone's own context) bound back, refused by name when the load's
+        /// weight and activation bytes are not the card figure the plan reserved; the `vision`
+        /// record names the card, the seat and the bytes.
+        pub fn open(model: &CudaContext, at: &Opened, n_embd: usize) -> Result<Vision, GateError> {
+            let t = Instant::now();
+            let on = |e: &dyn Display| format!("--mmproj {}: {e}", at.path.display());
+            let file = Gguf::open(&at.path).map_err(|e| on(&e))?;
+            let ordinal = usize::try_from(at.seat.ordinal)
+                .map_err(|_| on(&format!("the card's ordinal {}", at.seat.ordinal)))?;
+            let (stream, tower) = vision_seat::on_encoder_card(model, || {
+                let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(ordinal)
+                    .map_err(|e| on(&format!("the card {}: {e}", at.seat.name)))?;
+                let tower = bloomery_gpu_vision::open(&ctx, &stream, &file, at.limits)
+                    .map_err(|e| on(&e))?;
+                let loaded = tower.weight_bytes() + tower.scratch_bytes();
+                if loaded != at.card.total() {
+                    return Err(on(&format!(
+                        "the tower holds {} B of weights and {} B of activations, {loaded} B; \
+                         the plan reserved {} B for it",
+                        tower.weight_bytes(),
+                        tower.scratch_bytes(),
+                        at.card.total()
+                    ))
+                    .into());
+                }
+                Ok((stream, tower))
+            })?;
+            vision_seat::record(
+                &at.seat,
+                (tower.weight_bytes(), tower.scratch_bytes()),
+                ScratchHome::Own,
+                at.cap,
+                t.elapsed().as_secs_f64(),
+            )
+            .eprint();
+            Ok(Vision {
+                tower,
+                stream,
+                n_embd,
+                media: at.media.clone(),
+            })
+        }
+
+        /// The model's image input.
+        pub fn media(&self) -> &dyn MediaModel {
+            &*self.media
+        }
+
+        /// Every image encoded on the tower and read back as bf16, one row a cell of its grid
+        /// and nothing around them (the tokens carry the delimiters), in one pair of buffers
+        /// ([`vision_seat::span_rows`]); the model's card (`model`) bound back after.
+        pub fn span_rows(
+            &mut self,
+            model: &CudaContext,
+            images: &[Placed<'_>],
+        ) -> Result<SpanRows<()>, GateError> {
+            let n_embd = self.n_embd;
+            vision_seat::on_encoder_card(model, || {
+                vision_seat::span_rows(
+                    &mut *self.tower,
+                    &self.stream,
+                    images.iter().map(|i| vision_seat::Image {
+                        at: i.at,
+                        patches: &i.prepared.patches,
+                        span_len: i.prepared.span_len,
+                    }),
+                    n_embd,
+                    |p| p.plan.n_llm_h * p.plan.n_llm_w,
+                    merged_cells,
+                )
+            })
+        }
+    }
+
+    /// The splice of a merger tower's span: the cells' rows as the tower wrote them, one
+    /// position a cell, nothing around them — the placeholder's delimiters are ordinary ids.
+    fn merged_cells(rows: &[u16], patches: &Patches) -> Result<(Vec<u16>, Vec<()>), GateError> {
+        let cells = patches.plan.n_llm_h * patches.plan.n_llm_w;
+        Ok((rows.to_vec(), vec![(); cells]))
+    }
+}
+
+/// The seat of a build with no `vision` feature: no encoder is ever opened, and a flag that asks
+/// for one is refused by name.
+#[cfg(not(feature = "vision"))]
+mod image {
+    use std::path::Path;
+
+    use bloomery_gpu_gates::GateError;
+    use bloomery_gpu_gates::vision_seat::{EncoderSeat, Flags, SpanRows, TextFacts};
+    use cuda_core::CudaContext;
+    use serve::media::MediaModel;
+
+    use super::Placed;
+
+    pub enum Opened {}
+
+    impl Opened {
+        pub fn seat(&self) -> &EncoderSeat {
+            match *self {}
+        }
+    }
+
+    pub fn open_seat(
+        flags: &Flags,
+        file: Option<&Path>,
+        _takes: &[&str],
+        _text: &TextFacts,
+        _token: &dyn Fn(u32) -> Option<String>,
+    ) -> Result<Option<Opened>, GateError> {
+        if file.is_some() || flags.sets_limits() {
+            return Err(
+                "--mmproj: this build takes no images (built without the vision feature)".into(),
+            );
+        }
+        Ok(None)
+    }
+
+    pub enum Vision {}
+
+    impl Vision {
+        pub fn open(_: &CudaContext, at: &Opened, _: usize) -> Result<Vision, GateError> {
+            match *at {}
+        }
+
+        pub fn media(&self) -> &dyn MediaModel {
+            match *self {}
+        }
+
+        pub fn span_rows(
+            &mut self,
+            _: &CudaContext,
+            _: &[Placed<'_>],
+        ) -> Result<SpanRows<()>, GateError> {
+            match *self {}
+        }
+    }
 }
 
 struct Args {
     host: String,
     port: u16,
     ctx: Option<usize>,
+    /// The image-input flags: `--mmproj` is the encoder file whose images the seat serves.
+    vision: vision_seat::Flags,
+    /// `--no-mmproj`: no image input, though `--hf` has a projector to pick.
+    no_mmproj: bool,
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
@@ -196,12 +553,18 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         host: "127.0.0.1".to_owned(),
         port: 8080,
         ctx: None,
+        vision: vision_seat::Flags::default(),
+        no_mmproj: false,
         api_keys: serve::flag::ApiKeys::default(),
     };
     let mut it = args.iter().map(String::as_str);
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
             return Err(USAGE.into());
+        }
+        a.no_mmproj |= flag == "--no-mmproj";
+        if a.vision.take(flag, &mut it)? {
+            continue;
         }
         let v = it
             .next()
@@ -288,6 +651,12 @@ struct Load {
     head: Option<(PathBuf, PathBuf)>,
     open: Open,
     ctx: usize,
+    /// The row's name, which a refusal names.
+    row: &'static str,
+    vision: vision_seat::Flags,
+    no_mmproj: bool,
+    /// The `--hf` repo the model file came from, whose projector a run with no image flag takes.
+    hf: Option<String>,
 }
 
 impl Load {
@@ -327,6 +696,82 @@ impl Decide for Seat {
     }
 }
 
+/// The image projector the `--hf` repo holds beside `model`, a set's first shard in the cache
+/// (`<root>/<owner>/<name>/<path in the repo>`, which gives the cache root and the model's path in
+/// the repo): the listing's `mmproj` sibling of the model ([`hf::mmproj_sibling`], through
+/// [`hf::fetch::Client::mmproj_path`]), fetched and checked; `None` when the repo holds none.
+fn hf_projector(repo: &str, model: &Path) -> Result<Option<PathBuf>, GateError> {
+    let in_repo = || {
+        format!(
+            "--hf {repo}: the model file {} is not under the repo's cache directory",
+            model.display()
+        )
+    };
+    let at = model
+        .ancestors()
+        .find(|a| a.ends_with(repo))
+        .ok_or_else(in_repo)?;
+    let rel = model
+        .strip_prefix(at)?
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", model.display()))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let root = at
+        .ancestors()
+        .nth(repo.split('/').count())
+        .ok_or_else(in_repo)?;
+    let Some(path) = hf::fetch::Client::new(root.to_path_buf())?.mmproj_path(repo, &rel)? else {
+        return Ok(None);
+    };
+    Ok(model_file::fetch_exact(repo, &[path.as_str()])?
+        .into_iter()
+        .next())
+}
+
+/// The encoder of the image input the flags ask for, opened and held against the backbone
+/// before any of it loads: `--mmproj`'s file, else (under `--hf`, with no `--no-mmproj`) the
+/// projector the repo holds beside the model. `None` serves no image. A row that takes no images
+/// refuses a file or a limit by name.
+fn open_image(
+    l: &Load,
+    row: &dyn Decision,
+    tokenizer: &Tokenizer,
+) -> Result<Option<image::Opened>, GateError> {
+    let given = l.vision.mmproj()?;
+    if !row.takes_images() {
+        if given.is_some() || l.vision.sets_limits() {
+            return Err(format!(
+                "--mmproj and the image limits: the {} row's part answers no request with images",
+                l.row
+            )
+            .into());
+        }
+        return Ok(None);
+    }
+    let file = match (given, &l.hf) {
+        (Some(file), _) => Some(file.to_owned()),
+        (None, Some(repo)) if !l.no_mmproj && cfg!(feature = "vision") => {
+            hf_projector(repo, &l.model)?
+        }
+        (None, _) => None,
+    };
+    let split = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
+    let hp = Hparams::read(&split)?;
+    // Every Qwen3.5 attention layer rotates by IMROPE over the file's sections.
+    let text = TextFacts {
+        n_embd: hp.n_embd,
+        imrope: Some(hp.rope_sections),
+        ple: PleImage::Absent,
+    };
+    image::open_seat(
+        &l.vision,
+        file.as_deref(),
+        &[vision::arch::qwen3vl::PROJECTOR_TYPE],
+        &text,
+        &|id| tokenizer.text(id).map(str::to_owned),
+    )
+}
+
 /// Opens the head, checks its width, opens the tokenizer and the backbone on
 /// this thread, reports the open (the quant word, or why not) on `ready`,
 /// then answers `jobs` until the server drops its sender.
@@ -344,11 +789,16 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
             .into());
         }
         let tokenizer = Tokenizer::from_gguf(&l.model)?;
+        let image = open_image(l, &*head, &tokenizer)?;
         let (_, open_body) = BODIES
             .iter()
             .find(|(opens, _)| opens(&l.arch))
             .ok_or_else(|| format!("no backbone body opens a {} file", l.arch))?;
-        let (body, file) = open_body(&l.model, l.ctx)?;
+        let (body, file) = open_body(&l.model, l.ctx, image.as_ref().map(image::Opened::seat))?;
+        let vision = image
+            .as_ref()
+            .map(|at| image::Vision::open(body.context(), at, usize::try_from(l.width)?))
+            .transpose()?;
         let q = quant(&file);
         let on = Backbone {
             body,
@@ -356,6 +806,7 @@ fn work(l: &Load, ready: &Sender<Result<String, String>>, jobs: &Receiver<Job>) 
             tokenizer,
             ctx: l.ctx,
             name: l.name.clone(),
+            vision,
         };
         Ok((head, on, q))
     })();
@@ -454,6 +905,10 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         head,
         open: row.open,
         ctx,
+        row: row.name,
+        vision: a.vision,
+        no_mmproj: a.no_mmproj,
+        hf: hf.map(str::to_owned),
     };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (jobs, jobs_rx) = mpsc::channel::<Job>();
