@@ -101,7 +101,7 @@ use bloomery_gpu_deepseek41::experts::ExpertKernels;
 use bloomery_gpu_deepseek41::hc::{HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcPreScratch};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use bloomery_levers::HostCfg;
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::glm5next::names;
@@ -110,7 +110,7 @@ use model::embed::EmbedTable;
 use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
-use runtime::seqstate::{HOST_BUDGET, Kept, Take};
+use runtime::seqstate::{self, Kept, Take};
 
 use crate::ffn::CardExperts;
 use crate::host::routed_layers;
@@ -145,9 +145,92 @@ const _: () = assert!(KdaLanes::MAX == LANES);
 /// The GLM model: one card, the skeleton over this body.
 pub type Glm5nextModel = GpuModel<Body>;
 
-/// The spacing of a prompt call's inner checkpoints; past the host budget's
-/// slots the oldest is evicted (`runtime::seqstate`).
+/// The spacing of a prompt call's inner checkpoints; past the sequence's
+/// budget ([`checkpoint_budget`]) the least recently used is evicted
+/// (`runtime::seqstate`).
 pub const CHECKPOINT_EVERY: u32 = 512;
+
+/// The f32s of each store one checkpoint copies, in the layers' order: every
+/// KDA layer's recurrent state and conv ring. The one derivation of what a
+/// checkpoint holds, read by the sequences' `Checkpoints` and by
+/// [`checkpoint_budget`].
+fn checkpoint_lens(inputs: &PlanInputs) -> Result<Vec<usize>, GpuError> {
+    let dims = dims_of(inputs)?;
+    Ok(inputs
+        .spec
+        .layers
+        .iter()
+        .filter(|s| Layer::of(s).mixer == MixerKind::DeltaRule)
+        .flat_map(|_| [dims.kda.state_len(), dims.kda.ring_len()])
+        .collect())
+}
+
+/// The bytes one checkpoint of stores of `lens` f32s copies.
+fn checkpoint_point_bytes(lens: &[usize]) -> u64 {
+    lens.iter().map(|&n| (n * size_of::<f32>()) as u64).sum()
+}
+
+/// The host bytes one sequence's checkpoints pin at most in a load of `ctx`
+/// positions of `inputs`' file ([`seqstate::budget_for`] of its checkpoint at
+/// [`CHECKPOINT_EVERY`]). The one owner of the figure: every sequence's
+/// `Checkpoints` is made with it ([`sequence_checkpoints`]) and a plan's host
+/// reserve carries it a sequence (`residency38::reserve_glm_checkpoints`), so
+/// the two cannot differ. Refused by name for a context past u32 or one the
+/// rule refuses.
+pub fn checkpoint_budget(inputs: &PlanInputs, ctx: u64) -> Result<u64, GpuError> {
+    budget_at(checkpoint_point_bytes(&checkpoint_lens(inputs)?), ctx)
+}
+
+/// [`checkpoint_budget`] at the deepest context a load of `inputs`' file can
+/// be granted, for a plan's search over contexts: the trained context, or the
+/// flag's `set` when that is deeper, capped to the reference set's
+/// ([`place::ORACLE_POSITIONS`], past which the plan refuses by name), so no
+/// probe's host reserve is under the load's. The load itself reserves
+/// [`checkpoint_budget`] at the context it is granted.
+pub fn search_checkpoint_budget(inputs: &PlanInputs, set: Option<usize>) -> Result<u64, GpuError> {
+    let trained = inputs.hp.n_ctx_train;
+    let deepest = set.map_or(trained, |c| c.max(trained));
+    let deepest = u64::try_from(deepest)
+        .map_err(|_| shape(format!("a context of {deepest} positions passes u64")))?;
+    checkpoint_budget(inputs, deepest.min(place::ORACLE_POSITIONS))
+}
+
+/// [`checkpoint_budget`] of a checkpoint of `point_bytes`.
+fn budget_at(point_bytes: u64, ctx: u64) -> Result<u64, GpuError> {
+    let at = u32::try_from(ctx).map_err(|_| {
+        shape(format!(
+            "a context of {ctx} positions passes the u32 positions"
+        ))
+    })?;
+    seqstate::budget_for(at, CHECKPOINT_EVERY, point_bytes)
+        .map_err(|e| shape(format!("the checkpoint budget at {ctx} positions: {e}")))
+}
+
+/// One sequence's checkpoints of stores of `lens` f32s in a load of `ctx`
+/// positions, held to [`checkpoint_budget`]: refused by name when the ledger
+/// made is not exactly that many slots.
+fn sequence_checkpoints(
+    cuda: &Arc<CudaContext>,
+    lens: Vec<usize>,
+    ctx: usize,
+) -> Result<Checkpoints, GpuError> {
+    let positions = u64::try_from(ctx)
+        .map_err(|_| shape(format!("a context of {ctx} positions passes u64")))?;
+    let budget = budget_at(checkpoint_point_bytes(&lens), positions)?;
+    let ckpt = Checkpoints::new(cuda, lens, budget, CHECKPOINT_EVERY)?;
+    let held = u64::try_from(ckpt.capacity())
+        .ok()
+        .and_then(|n| n.checked_mul(ckpt.bytes()));
+    if held != Some(budget) {
+        return Err(shape(format!(
+            "the checkpoints hold {} slots of {} bytes; the budget at {ctx} positions is \
+             {budget} bytes",
+            ckpt.capacity(),
+            ckpt.bytes()
+        )));
+    }
+    Ok(ckpt)
+}
 
 /// The most lanes of a KDA layer's state a load holds ([`KdaLanes`]): a
 /// verify of up to this many rows keeps the state after each row in a lane of
@@ -1621,12 +1704,7 @@ impl Body {
                 embd.n_vocab, hp.n_vocab
             )));
         }
-        let lens: Vec<usize> = cfg
-            .iter()
-            .filter(|c| c.kind.mixer == MixerKind::DeltaRule)
-            .flat_map(|_| [dims.kda.state_len(), dims.kda.ring_len()])
-            .collect();
-        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
+        let ckpt = sequence_checkpoints(gpu.context(), checkpoint_lens(inputs)?, ctx)?;
         let who = Identity {
             arch: "glm5next",
             file: embd
@@ -2277,12 +2355,7 @@ impl Slots for Body {
             .iter()
             .map(|c| store(stream, c.kind, &self.dims, self.ctx, self.lanes))
             .collect::<Result<Vec<_>, _>>()?;
-        let ckpt = Checkpoints::new(
-            gpu.context(),
-            self.ckpt.lens().to_vec(),
-            HOST_BUDGET,
-            CHECKPOINT_EVERY,
-        )?;
+        let ckpt = sequence_checkpoints(gpu.context(), self.ckpt.lens().to_vec(), self.ctx)?;
         let wide = HC_STREAMS * self.dims.embd;
         let rows = (0..self.seq_rows())
             .map(|_| DeviceBuffer::zeroed(stream, wide))

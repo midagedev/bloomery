@@ -176,8 +176,8 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, feed,
-        set_prefill_group,
+        Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, checkpoint_budget,
+        feed, set_prefill_group,
     };
     use bloomery_levers::{CARD_DONTNEED, GLM_RESIDENCY_UNSET, HOST_LOCK, HOST_POPULATE};
     use model::arch::glm5next::names;
@@ -743,10 +743,17 @@ mod gate {
         Ok(())
     }
 
+    /// Plan (b′)'s machine for the one sequence every arm loads, its
+    /// checkpoints reserved at [`CTX`] positions.
+    fn bp_machine(inputs: &PlanInputs) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+        let ckpt = checkpoint_budget(inputs, u64::try_from(CTX)?)?;
+        glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1, ckpt)
+    }
+
     /// The bits arm (no flag): the union reference, then the two cards.
     fn bits(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
         let cfg = cfg.clone();
-        let bp = glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1)?;
+        let bp = bp_machine(inputs)?;
         let layers = inputs.model.layers;
         let two = bp(layers);
         let plan = inputs.plan_lanes(&two, u64::try_from(CTX)?, &cfg.place, KdaLanes::Two)?;
@@ -1103,7 +1110,7 @@ mod gate {
     /// The `--residency` arm (module header).
     fn residency_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
         let lever = Residency::parse(GLM_RESIDENCY_UNSET)?;
-        let bp = glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1)?;
+        let bp = bp_machine(inputs)?;
         let prompt = prompt()?;
         let ids = &prompt[..PROMPT];
         let open_args = || OpenArgs {
@@ -1321,7 +1328,7 @@ mod gate {
     /// The `--nextn` arm (module header).
     fn nextn_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
         let nextn = NextnInputs::read(inputs)?;
-        let bp = glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1)?;
+        let bp = bp_machine(inputs)?;
         let two = bp(inputs.model.layers);
         let np = inputs.plan_nextn(&two, u64::try_from(CTX)?, &cfg.place, &nextn)?;
         println!(

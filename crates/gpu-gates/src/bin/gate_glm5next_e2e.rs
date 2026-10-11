@@ -449,7 +449,7 @@ mod gate {
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
-    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
+    use bloomery_gpu_gates::residency38::reserve_glm_checkpoints;
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag};
@@ -459,10 +459,11 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode, RouteTapRows,
-        StoreDigest, StoreRows, feed, nextn_store, plant_prompt_routes, prefill, prefill_mode,
-        prompt_route_taps, seq_resume, seq_resume_prefix, seq_save, set_prefill, set_prefill_group,
-        set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows,
+        Body, CHECKPOINT_EVERY, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode,
+        RouteTapRows, StoreDigest, StoreRows, checkpoint_budget, feed, nextn_store,
+        plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume, seq_resume_prefix,
+        seq_save, set_prefill, set_prefill_group, set_prompt_route_taps, set_taps, step_launches,
+        store_digests, store_rows,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -2584,6 +2585,17 @@ mod gate {
             verdict(bits)
         );
         ok &= bits;
+        // The load's sequence holds the points one prompt call over its
+        // context takes, the multiples of the spacing below it and its end.
+        let want = CTX.div_ceil(CHECKPOINT_EVERY as usize);
+        let held = c.capacity() == want;
+        println!(
+            "keep ({feed}): the load's sequence holds {} checkpoints at {CTX} positions (want \
+             {want}, the points one prompt call over them takes) {}",
+            c.capacity(),
+            verdict(held)
+        );
+        ok &= held;
         Ok(ok)
     }
 
@@ -2593,6 +2605,16 @@ mod gate {
     /// counts — the harness's streams, one a slot.
     const SLOT_CTX: usize = 256;
     const SLOTS: usize = slots_gate::STREAMS;
+
+    /// The gate placement's machine of a load of `slots` sequences at
+    /// [`SLOT_CTX`] positions, their checkpoints reserved at the body's
+    /// budget for it.
+    fn slot_machine(inputs: &PlanInputs, slots: usize) -> Result<Machine, GateError> {
+        let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let ckpt = checkpoint_budget(inputs, u64::try_from(SLOT_CTX)?)?;
+        reserve_glm_checkpoints(&mut machine, slots, ckpt);
+        Ok(machine)
+    }
     /// The drafted passes each slot runs after its prompt's step, and (s3)'s
     /// after the resume.
     const SLOT_PASSES: usize = 8;
@@ -2668,8 +2690,7 @@ mod gate {
 
         fn open(&self, slots: usize) -> Result<Glm5nextModel, GateError> {
             let file = glm5next_tier::open()?;
-            let mut machine = crate::gate_card::plan_gate(self.inputs.model.layers);
-            reserve_checkpoints(&mut machine, glm_seqs(slots));
+            let machine = slot_machine(&self.inputs, slots)?;
             let np = self.plan(&machine, slots)?;
             let t = Instant::now();
             let mut m = Body::open_placed_nextn_slots(
@@ -2790,8 +2811,7 @@ mod gate {
             "of a load whose plan counted {SLOTS} resident sequences"
         )));
         let counted = |n: usize| -> Result<u64, GateError> {
-            let mut machine = crate::gate_card::plan_gate(a.inputs.model.layers);
-            reserve_checkpoints(&mut machine, glm_seqs(n));
+            let machine = slot_machine(&a.inputs, n)?;
             let np = a.plan(&machine, n)?;
             Ok(np.plan.cards[0].kv_bytes + np.nextn.cards[0].kv_bytes)
         };
@@ -3524,8 +3544,7 @@ mod gate {
         slots: usize,
     ) -> Result<Glm5nextModel, GateError> {
         let file = glm5next_tier::open()?;
-        let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
-        reserve_checkpoints(&mut machine, glm_seqs(slots));
+        let machine = slot_machine(inputs, slots)?;
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let plan = inputs.plan_slots(&machine, u64::try_from(SLOT_CTX)?, &place, lanes, slots)?;
         let term = plan.machine.cards[0].scratch_bytes;

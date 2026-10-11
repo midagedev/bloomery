@@ -8,6 +8,7 @@
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::residency38::glm_machine;
+use bloomery_gpu_glm5next::checkpoint_budget;
 use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
 use model::placement::PlanLevers;
@@ -47,8 +48,8 @@ pub fn tier_batch(place: Place, hp: &Hparams) -> Option<TierBatchBytes> {
 /// layer beside the target, else `lanes` KDA lanes serving `slots` resident
 /// sequences — 0 with no tier card. `Place::choose`'s `tier_of`: the plan of
 /// the offered placement on the machine the load takes (`glm_machine`, its
-/// slots' checkpoints declared), its tier counts summed, against the
-/// family's break-even.
+/// slots' checkpoints at `ctx` declared), its tier counts summed, against
+/// the family's break-even.
 pub fn tier_experts(
     place: Place,
     inputs: &PlanInputs,
@@ -58,7 +59,9 @@ pub fn tier_experts(
     lanes: KdaLanes,
     slots: usize,
 ) -> Result<u64, GateError> {
-    let machine = glm_machine(place, tier_batch(place, &inputs.hp), slots)?(inputs.model.layers);
+    let budget = checkpoint_budget(inputs, ctx)?;
+    let machine =
+        glm_machine(place, tier_batch(place, &inputs.hp), slots, budget)?(inputs.model.layers);
     let plan = match nextn {
         None => inputs.plan_slots(&machine, ctx, levers, lanes, slots)?,
         Some(n) => {
