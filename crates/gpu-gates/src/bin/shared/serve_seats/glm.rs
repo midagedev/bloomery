@@ -7,6 +7,7 @@
 //!     [--host 127.0.0.1] [--port 8080] [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C]
 //!     [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] [--chat-template-file PATH]
 //!     [--prefill batch|steps] [--parallel N] [--queue-depth Q] [--plan]
+//!     [--mmproj FILE | --no-mmproj] [--image-min-tokens N] [--image-max-tokens N]
 //!
 //! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
 //! (`serve::flag::CTX`); a number flag's value that is not a number is
@@ -152,6 +153,27 @@
 //! so `--park-ram` is refused by name. `--queue-depth Q` bounds the requests
 //! that wait for a slot.
 //!
+//! `--mmproj FILE` (with `--no-mmproj`, `--image-min-tokens` and `--image-max-tokens`:
+//! [`vision_seat::Flags`]) gives the seat image input (behind the `vision` feature) from GLM-5.3-Flash's
+//! own encoder file (projector type `glm5v`; a limit not given is the file's own budget, 16 to 8000
+//! tokens). The file is held against the text model — its row width, and its three image ids in the
+//! vocabulary — before anything is planned ([`vision_seat::open_seat`]). The tower sits where the
+//! placement leaves room ([`vision_seat::encoder_seat`]): on a held card the plan leaves off (the 3090
+//! under `--place a`, the A6000 under `gate`), else as a named reserve of the stage card (`bp`) that every
+//! plan this seat makes counts, the offer's, the context rule's, the printed `plan` line's and the
+//! load's, so they all see one stage card. The `vision` record follows the `load` record. The server
+//! renders an image part as `<|begin_of_image|><|image|><|end_of_image|>` and expands the middle id to the
+//! merged-token count of the image's grid, positions normal (`serve::media` over [`Seat::media_model`]);
+//! a prompt call that holds an image encodes it on the tower and feeds the rows in place of their
+//! positions' embeddings ([`Seat::prefill_media`], `bloomery_gpu_glm5next::prefill_media`; the load is
+//! set for media). Refused by name: `--mmproj` beside `--prefill steps` (a span's rows enter only
+//! through the batched call) and in a build without the `vision` feature. The NextN draft is
+//! planned and loaded as without `--mmproj`: text drafts. The draft's prompt walk has no twin of
+//! the media call, so a request that holds an image turns its slot's draft off until the slot's
+//! next reset ([`SlotDrafts::turn_off`], [`MEDIA_DRAFT_OFF_WHY`]; the slot's first step after the
+//! call prints the `mtp prompt` record naming why, once), and the slot's passes are plain steps
+//! while another slot keeps drafting.
+//!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`
 //! makes: the layer's card bytes and arena reserved, each KDA layer's state
@@ -236,7 +258,10 @@ use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
     GLM_CARD, check_reserve, checkpoints_reserved, glm_machine, residency_room, residency_set,
 };
+use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+#[cfg(feature = "vision")]
+use bloomery_gpu_glm5next::set_prefill_media;
 use bloomery_gpu_glm5next::{
     Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, checkpoint_budget, checkpoint_price,
     seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
@@ -254,13 +279,18 @@ use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
+#[cfg(feature = "vision")]
+use runtime::Want;
 use runtime::seqstate::{Price, Why};
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
+#[cfg(feature = "vision")]
+use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
 };
 use tokenizer::Tokenizer;
+use vision::arch::glm5v;
 
 use super::drafted::{ParkedDraft, SlotDrafts};
 use crate::glm_place;
@@ -272,7 +302,9 @@ const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] \
                      [--ctx C] [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] \
                      [--chat-template-file PATH] [--prefill batch|steps] [--parallel N] \
-                     [--queue-depth Q] [--plan] [--api-key KEY] [--api-key-file FNAME]";
+                     [--queue-depth Q] [--plan] [--mmproj FILE | --no-mmproj] \
+                     [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
+                     [--api-key-file FNAME]";
 
 /// The positions the stores are sized for when `--ctx` names none:
 /// `generate_glm5next`'s default, and the floor [`ctx_of`]'s rule never
@@ -357,6 +389,14 @@ impl Rounds {
 const NEED: usize = VERIFY_ROWS + 1;
 /// [`NEED`] as the least a slot of a split holds under the draft.
 const NEED_FLOOR: NonZeroU64 = NonZeroU64::new(NEED as u64).expect("a window of at least one row");
+
+/// Why a slot's draft is off for a media request: an image's rows enter the target's prompt call
+/// alone, and the NextN draft's prompt walk has no twin of it. The draft stays off until the
+/// slot's next reset ([`SlotDrafts::turn_off`]); the slot's first step after the media call (or
+/// its next text prompt call) prints it as an `mtp prompt` record.
+#[cfg(feature = "vision")]
+const MEDIA_DRAFT_OFF_WHY: &str = "an image's rows enter the target's prompt call alone, and the \
+                                   NextN draft's prompt walk has no twin of the media call";
 
 /// `BLOOMERY_DRAFT` on stores of `ctx` positions, `unset` the seat's rule
 /// for it: `None` drafts with the NextN layer; `Some` runs the plain path,
@@ -455,7 +495,9 @@ fn ctx_of(
 /// on the load `nextn` names: with the next-token layer
 /// (`PlanInputs::plan_nextn_slots`, two KDA lanes) or without it
 /// (`PlanInputs::plan_slots` at one lane) — the plans the load runs
-/// ([`open_nextn_slots`], [`open_resident_slots`]).
+/// ([`open_nextn_slots`], [`open_resident_slots`]). A refusal on a machine
+/// that carries the image encoder's reserve names it
+/// ([`vision_seat::refusal`]).
 fn plan_of<'a>(
     inputs: &'a PlanInputs,
     machine: &'a Machine,
@@ -464,60 +506,109 @@ fn plan_of<'a>(
     nextn: Option<&'a NextnInputs>,
     slots: usize,
 ) -> Result<Plan<'a>, GateError> {
-    Ok(match nextn {
-        None => inputs.plan_slots(machine, ctx, levers, KdaLanes::One, slots)?,
-        Some(n) => {
-            inputs
-                .plan_nextn_slots(machine, ctx, levers, n, slots)?
-                .plan
-        }
+    let planned = match nextn {
+        None => inputs.plan_slots(machine, ctx, levers, KdaLanes::One, slots),
+        Some(n) => inputs
+            .plan_nextn_slots(machine, ctx, levers, n, slots)
+            .map(|with| with.plan),
+    };
+    planned.map_err(|e| match vision_seat::reserve_in(machine) {
+        Some(bytes) => GateError::from(vision_seat::refusal(Some(bytes), e)),
+        None => GateError::from(e),
     })
 }
 
+/// What `--mmproj` asks of a placement: the flags, and the text model's
+/// embedding width and vocabulary, which the encoder file is held against.
+struct Images<'a> {
+    flags: &'a vision_seat::Flags,
+    n_embd: usize,
+    token: &'a dyn Fn(u32) -> Option<String>,
+}
+
+impl Images<'_> {
+    /// The encoder file opened, held against the text model and seated for
+    /// a plan on `place` ([`vision_seat::open_seat`]); `None` without
+    /// `--mmproj`. Where the tower sits depends on the placement, so each
+    /// placement the seat plans opens its own.
+    fn seat(&self, place: Place) -> Result<Option<Opened>, GateError> {
+        let facts = TextFacts {
+            n_embd: self.n_embd,
+            imrope: None,
+            ple: PleImage::Absent,
+        };
+        vision_seat::open_seat(
+            self.flags,
+            self.flags.mmproj()?,
+            place,
+            &[glm5v::PROJECTOR_TYPE],
+            &facts,
+            self.token,
+        )
+    }
+}
+
 /// A placement as the seat plans it: the tier's prompt-batch bytes, the
-/// machine, the context rule over it, and the experts its tier cards hold
-/// in the plan at the rule's context (0 with no tier card).
+/// machine (carrying the image encoder's reserve when the tower sits on its
+/// stage card), the context rule over it, the experts its tier cards hold
+/// in the plan at the rule's context (0 with no tier card) and the encoder
+/// it seats under `--mmproj`.
 struct Placed {
     place: Place,
     tier_batch: Option<TierBatchBytes>,
     machine: Machine,
     rule: SlotCtx,
     tier_experts: u64,
+    vision: Option<Opened>,
 }
 
 impl Placed {
     /// `place` planned for `slots` sequences on the load `nextn` names, its
-    /// context `set` or the rule's ([`ctx_of`]); every refusal of the plan's
-    /// by name.
+    /// context `set` or the rule's ([`ctx_of`]), the encoder `images` seat
+    /// counted; every refusal of the plan's by name.
     fn of(
         place: Place,
         inputs: &PlanInputs,
         levers: &PlanLevers,
         nextn: Option<&NextnInputs>,
-        set: Option<usize>,
-        slots: usize,
+        (set, slots): (Option<usize>, usize),
+        images: &Images<'_>,
     ) -> Result<Placed, GateError> {
+        let vision = images.seat(place)?;
+        let reserve = vision.as_ref().and_then(|v| v.seat.reserve);
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
         // Every machine reserves its checkpoints at the slot context it is
         // laid for: the search's probes each at their own, the load's at the
-        // context it is granted.
+        // context it is granted; and the encoder's reserve, as the printed plan does.
         let price = checkpoint_price(inputs)?;
         let machine_at = |ctx: u64| -> Result<Machine, GateError> {
-            Ok(glm_machine(place, tier_batch, slots, price, ctx)?(
-                inputs.model.layers,
-            ))
+            Ok(vision_seat::with_reserve(
+                glm_machine(place, tier_batch, slots, price, ctx)?,
+                reserve,
+            )(inputs.model.layers))
         };
         let rule = ctx_of(inputs, &machine_at, levers, nextn, set, slots)?;
         let ctx = u64::try_from(rule.ctx)?;
         let machine = machine_at(ctx)?;
-        let tier_experts =
-            glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?;
+        // `glm_place::tier_experts` plans on a machine of its own, which carries no reserve: a
+        // stage-reserve seat counts its tier on the machine the plan runs by.
+        let tier_experts = match reserve {
+            None => {
+                glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?
+            }
+            Some(_) => plan_of(inputs, &machine, ctx, levers, nextn, slots)?
+                .tier_n_l
+                .iter()
+                .flatten()
+                .sum(),
+        };
         Ok(Placed {
             place,
             tier_batch,
             machine,
             rule,
             tier_experts,
+            vision,
         })
     }
 }
@@ -624,6 +715,9 @@ struct Args {
     /// ([`model::placement::ctx::slots_of`]).
     parallel: Option<usize>,
     queue_depth: Option<usize>,
+    /// The image-input flags: `--mmproj` is GLM's own encoder file, whose
+    /// images the seat serves; none serves no image.
+    vision: vision_seat::Flags,
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
@@ -643,6 +737,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         plan_only: false,
         parallel: None,
         queue_depth: None,
+        vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
     };
     let mut it = args.iter().map(|s| s.as_str());
@@ -652,6 +747,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         }
         if flag == "--plan" {
             a.plan_only = true;
+            continue;
+        }
+        if a.vision.take(flag, &mut it)? {
             continue;
         }
         let v = it
@@ -690,6 +788,20 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.parallel == Some(0) {
         return Err("--parallel 0: the server serves no slot".into());
     }
+    // `wanted` refuses `--mmproj` with `--no-mmproj` and a token limit with no file.
+    if a.vision.wanted()?.is_some() {
+        if a.prefill == PrefillMode::Steps {
+            return Err(
+                "--mmproj with --prefill steps: a media span's rows enter only through \
+                        the batched prompt call (--prefill batch)"
+                    .into(),
+            );
+        }
+        #[cfg(not(feature = "vision"))]
+        return Err(
+            "--mmproj: this build takes no images (built without the vision feature)".into(),
+        );
+    }
     Ok(a)
 }
 
@@ -723,6 +835,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // load's host set holds beside the plan's.
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
+    // `--mmproj`'s encoder file, held against the text model's embedding width and vocabulary
+    // before anything is planned; each placement the plans below ask about seats its own tower.
+    // A refusal of the file is read here, by name: inside the offer's plan it would read as the
+    // tier's plan refusing.
+    let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
+    let images = Images {
+        flags: &a.vision,
+        n_embd: inputs.hp.n_embd,
+        token: &token,
+    };
+    images.seat(a.place.unwrap_or(Place::A))?;
     // A slot's share of `--ctx`, refused by name under the body's least a
     // slot before anything is planned: one position, or the MTP draft's
     // window under `BLOOMERY_DRAFT=mtp` (unset, the rule below drafts only
@@ -781,7 +904,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         None => Some(NextnInputs::read(&inputs)?),
         Some(_) => None,
     };
-    let plan_place = |p: Place| Placed::of(p, &inputs, &plan_levers, nextn.as_ref(), set, slots);
+    let plan_place = |p: Place| {
+        Placed::of(
+            p,
+            &inputs,
+            &plan_levers,
+            nextn.as_ref(),
+            (set, slots),
+            &images,
+        )
+    };
     // The placement the seat runs by (`Place::choose`, by the GLM family's
     // `TIER_RULE`): the plan of the offer names its tier count, and an unset
     // flag never refuses a load that `--place a` serves — a refused plan of
@@ -811,7 +943,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         && levers.draft().is_none()
         && drafted.rule.fit < CTX
     {
-        let plain = Placed::of(chosen.place, &inputs, &plan_levers, None, set, slots)?;
+        let plain = Placed::of(
+            chosen.place,
+            &inputs,
+            &plan_levers,
+            None,
+            (set, slots),
+            &images,
+        )?;
         let with = inputs.plan_nextn_slots(
             &drafted.machine,
             u64::try_from(drafted.rule.ctx)?,
@@ -850,6 +989,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         tier_batch,
         machine,
         rule,
+        vision,
         ..
     } = placed;
     eprintln!("{}", rule.line(slots));
@@ -938,6 +1078,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         cache_ram: cache.ram,
         stats: levers.step_stats(),
         width,
+        vision,
     };
     let engine = SeatEngine::spawn(
         move || Glm::open(open),
@@ -1010,6 +1151,10 @@ struct SeatArgs {
     /// `BLOOMERY_MTP_WIDTH`: the width a drafted window verifies, the
     /// chooser's (`cost`) or the draft's own (`fixed`).
     width: WidthMode,
+    /// The encoder `--mmproj` seated for the placement the plan ran on: its
+    /// reserve rides the load's machine, and its tower is loaded after the
+    /// model (`open_encoder`).
+    vision: Option<Opened>,
 }
 
 /// The GLM session on the engine thread: the session over the model, the
@@ -1040,6 +1185,9 @@ struct Glm {
     rounds: Rounds,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
+    /// The resident image encoder under `--mmproj` ([`open_encoder`]).
+    #[cfg(feature = "vision")]
+    vision: Option<vision_seat::Resident>,
 }
 
 impl Glm {
@@ -1070,15 +1218,20 @@ impl Glm {
             lane: a.lane,
         };
         let prefill = a.cfg.prefill;
+        // The plan the open runs by counts the encoder's reserve, as the printed plan did.
+        let reserve = a.vision.as_ref().and_then(|v| v.seat.reserve);
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: glm_machine(
-                a.place,
-                a.tier_batch,
-                a.slots,
-                a.checkpoint_price,
-                u64::try_from(a.ctx)?,
-            )?,
+            machine: vision_seat::with_reserve(
+                glm_machine(
+                    a.place,
+                    a.tier_batch,
+                    a.slots,
+                    a.checkpoint_price,
+                    u64::try_from(a.ctx)?,
+                )?,
+                reserve,
+            ),
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: a.cfg,
@@ -1110,6 +1263,9 @@ impl Glm {
             0 => None,
             ram => Some(seq_lane(s.model_mut(), ram)?),
         };
+        // The tower after the model's captures and the slots, as the V4.1 seat opens its encoder.
+        #[cfg(feature = "vision")]
+        let vision = open_encoder(&mut s, a.vision)?;
         Ok(Glm {
             s,
             drafted,
@@ -1120,6 +1276,8 @@ impl Glm {
             lane,
             rounds: Rounds::of(a.draft_off.is_none()),
             stats: a.stats,
+            #[cfg(feature = "vision")]
+            vision,
         })
     }
 
@@ -1164,6 +1322,25 @@ impl Glm {
         }
         Ok(())
     }
+}
+
+/// The resident image encoder of `--mmproj` ([`vision_seat::Resident`]), its tower loaded on the
+/// card the plan seated, and the load set for media (the id every position of a span carries is
+/// the media description's, [`vision::MediaModel::image_token`]); the `vision` record that follows
+/// the `load` record names the card, which of the two seats it is and the tower's bytes.
+#[cfg(feature = "vision")]
+fn open_encoder(
+    s: &mut Session<Body>,
+    at: Option<Opened>,
+) -> Result<Option<vision_seat::Resident>, GateError> {
+    let Some(v) = at else {
+        return Ok(None);
+    };
+    let t = Instant::now();
+    set_prefill_media(s.model_mut(), Some(v.media.image_token()))?;
+    let resident = vision_seat::Resident::open(s.model().gpu().context(), &v)?;
+    resident.announce(&v, vision_seat::ScratchHome::Own, t);
+    Ok(Some(resident))
 }
 
 /// The draft's three steps around a GLM state's put-back ([`put_back`]).
@@ -1401,6 +1578,42 @@ impl Seat for Glm {
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         let sel = self.s.selected();
         let next = self.drafted.prefill(&mut self.s, sel, ids)?;
+        self.print_passes()?;
+        Ok(next)
+    }
+
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
+    /// without `--mmproj`, a seat that takes no image.
+    #[cfg(feature = "vision")]
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        self.vision.as_ref().map(vision_seat::Resident::media)
+    }
+
+    /// The selected slot's draft turned off ([`MEDIA_DRAFT_OFF_WHY`]; a slot already off stays as
+    /// it is, its reason and its record told once), each feed's image encoded on the resident
+    /// encoder and read back as bf16, one row a cell of its grid and nothing around them
+    /// ([`vision_seat::Resident::merged_rows`]: the ids carry the delimiters), then one prompt
+    /// call with the rows in place of their positions' embeddings ([`Session::prompt_media`], the
+    /// body's `prefill_media`), the model's card bound back between the two.
+    #[cfg(feature = "vision")]
+    fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
+        let Some(v) = self.vision.as_mut() else {
+            return Err("no --mmproj: this seat serves no image".into());
+        };
+        let rows = v.merged_rows(
+            self.s.model().gpu().context(),
+            feeds
+                .iter()
+                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
+        )?;
+        let sel = self.s.selected();
+        if !self.drafted.is_off(sel) {
+            self.drafted.turn_off(sel, MEDIA_DRAFT_OFF_WHY)?;
+        }
+        let next = self
+            .s
+            .prompt_media(ids, &rows.media_spans(), Want::Argmax)?
+            .argmax();
         self.print_passes()?;
         Ok(next)
     }
