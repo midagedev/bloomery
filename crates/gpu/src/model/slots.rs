@@ -27,8 +27,8 @@
 //! keyed by the busy slots and their row counts ([`SlotGraphs`]).
 
 use super::{
-    ChainBody, GpuModel, Graphs, MAX_PASS_ROWS, RowHeads, StepMode, launch_served, no_head,
-    pass_slice,
+    ChainBody, GpuModel, Graphs, MAX_PASS_ROWS, PassRead, RowHeads, StepMode, launch_served,
+    no_head, pass_slice,
 };
 use crate::fault::Fault;
 use crate::head::Head;
@@ -780,29 +780,72 @@ where
     /// Each row's logits of the last call, in its row order, when it was a
     /// [`GpuModel::step_slots`] or a [`GpuModel::verify_slots`] (`n_vocab`
     /// f32 each): row `r`'s head's, or row `r` of the pass's one head.
-    /// Blocking read; gate/debug use.
+    /// [`GpuModel::slots_logits_into`] into fresh vectors. Blocking read;
+    /// gate/debug use.
     pub fn slots_logits(&self) -> Result<Vec<Vec<f32>>, GpuError> {
         const WHAT: &str = "GpuModel::slots_logits";
+        let (rows, n_vocab) = self.slots_shape(WHAT)?;
+        let mut all = vec![0.0; rows * n_vocab];
+        self.read_slots_logits(WHAT, &mut Vec::new(), &mut all)?;
+        Ok((0..rows)
+            .map(|r| all[r * n_vocab..(r + 1) * n_vocab].to_vec())
+            .collect())
+    }
+
+    /// Every row's logits of the last call, in its row order, into `out`,
+    /// which holds exactly `rows · n_vocab` f32 — row `r` at `r · n_vocab`
+    /// — when the call was a [`GpuModel::step_slots`] or a
+    /// [`GpuModel::verify_slots`]: a caller reading every token reuses one
+    /// buffer. A pass laid in one head is fetched into the model's own
+    /// staging, grown once and reused. Blocking read. Refused by name with
+    /// no pass of several slots as the last call and for an `out` of
+    /// another length.
+    pub fn slots_logits_into(&mut self, out: &mut [f32]) -> Result<(), GpuError> {
+        let mut stage = std::mem::take(&mut self.logits_stage);
+        let read = self.read_slots_logits("GpuModel::slots_logits_into", &mut stage, out);
+        self.logits_stage = stage;
+        read
+    }
+
+    /// The rows of the last call and the logits each holds, when that call
+    /// was a pass of several slots; refused by name as `what` otherwise.
+    fn slots_shape(&self, what: &'static str) -> Result<(usize, usize), GpuError> {
         let rows = self.slot_rows.ok_or(GpuError::state(
-            WHAT,
+            what,
             "a pass of several slots as the last call",
         ))?;
-        match B::HEADS {
-            RowHeads::PerRow => self
-                .heads
-                .get(..rows)
-                .ok_or(no_head(WHAT))?
-                .iter()
-                .map(|h| h.logits_to_host(&self.gpu))
-                .collect(),
-            RowHeads::One => {
-                // The head's layout is `[v·m + r]`: row r is every m-th value.
-                let all = self.pass_head(rows, WHAT)?.logits_to_host(&self.gpu)?;
-                Ok((0..rows)
-                    .map(|r| all.iter().skip(r).step_by(rows).copied().collect())
-                    .collect())
-            }
+        Ok((rows, self.n_vocab()?))
+    }
+
+    /// The one read of a pass of several slots' rows: row `r` into
+    /// `out[r · n_vocab..]`, through [`GpuModel::pass_row`] by
+    /// [`SlotRows::HEADS`], the head fetched into `stage` once.
+    fn read_slots_logits(
+        &self,
+        what: &'static str,
+        stage: &mut Vec<f32>,
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let (rows, n_vocab) = self.slots_shape(what)?;
+        if rows.checked_mul(n_vocab) != Some(out.len()) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a buffer of {} f32 for {rows} rows of {n_vocab} logits",
+                    out.len()
+                ),
+            ));
         }
+        let mut read = PassRead {
+            layout: B::HEADS,
+            rows,
+            stage,
+            fetched: false,
+        };
+        for r in 0..rows {
+            self.pass_row(what, &mut read, r, &mut out[r * n_vocab..(r + 1) * n_vocab])?;
+        }
+        Ok(())
     }
 
     /// The pass of `rows` refused, planned and, in graph mode, captured:

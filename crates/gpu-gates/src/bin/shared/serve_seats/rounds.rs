@@ -120,16 +120,16 @@ where
         .into());
     }
     match &out.logits {
-        Some(all) if all.len() != order.len() => {
+        Some(all) if all.rows().len() != order.len() => {
             return Err(format!(
                 "a round of {} rows read back {} logits rows",
                 order.len(),
-                all.len()
+                all.rows().len()
             )
             .into());
         }
         Some(all) => {
-            for (&i, row) in order.iter().zip(all) {
+            for (&i, row) in order.iter().zip(all.rows()) {
                 let want = rows[i].logits.as_ref().map_or(row.len(), Vec::len);
                 if want != row.len() {
                     return Err(format!(
@@ -150,9 +150,9 @@ where
         rows[i].next = next;
     }
     if let Some(all) = out.logits {
-        for (&i, row) in order.iter().zip(all) {
+        for (&i, row) in order.iter().zip(all.rows()) {
             if let Some(dst) = rows[i].logits.as_deref_mut() {
-                dst.copy_from_slice(&row);
+                dst.copy_from_slice(row);
             }
         }
     }

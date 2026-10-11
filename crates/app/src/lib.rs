@@ -360,6 +360,7 @@ impl<B: Open> Loaded<B> {
             slots_waiting: None,
             logits: Vec::new(),
             pass: Vec::new(),
+            round: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
         })
@@ -397,6 +398,10 @@ pub struct Session<B: ChainBody> {
     /// The pass's head as a row read fetched it ([`GpuModel::pass_row_into`]),
     /// grown once and reused.
     pass: Vec<f32>,
+    /// The logits of the last round of several slots' steps
+    /// ([`Session::step_slots_rounds`]), every row's, grown to the widest
+    /// round once and reused.
+    round: Vec<f32>,
     /// The last tapped rows read back ([`Tapped::taps`]).
     tapped: Vec<f32>,
     /// The residency reset the last clear made, until taken.
@@ -416,6 +421,7 @@ impl<B: ChainBody> Session<B> {
             slots_waiting: None,
             logits: Vec::new(),
             pass: Vec::new(),
+            round: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
         }
@@ -520,7 +526,8 @@ impl<B: ChainBody> Session<B> {
         match want {
             Want::Argmax => Ok(Out::Argmax(argmax)),
             Want::Logits => {
-                self.logits = self.model.logits()?;
+                self.logits.resize(self.model.n_vocab()?, 0.0);
+                self.model.logits_into(&mut self.logits)?;
                 Ok(Out::Logits {
                     argmax,
                     row: &self.logits,
@@ -673,7 +680,8 @@ where
     /// step a running slot) cut into passes of at most [`SlotRows::MAX_ROWS`]
     /// rows, each row's greedy next token in row order and each slot's
     /// position moved by its own. With `logits`, every row's logits of each
-    /// pass come back too, read through [`GpuModel::slots_logits`] — never
+    /// pass come back too, read through [`GpuModel::slots_logits_into`] into
+    /// the session's own buffer, lent until the next call — never
     /// [`GpuModel::logits_into`], which a pass of several rows refuses by
     /// name; a NaN among them is a named error, as a step's row is. The
     /// round leaves slot 0 selected, as [`Session::step_slots`] does.
@@ -683,31 +691,52 @@ where
         &mut self,
         rows: &[(usize, &[u32])],
         logits: bool,
-    ) -> Result<SlotsRound, SessionError> {
-        let mut ids = Vec::with_capacity(rows.iter().map(|(_, r)| r.len()).sum());
-        let mut rows_logits = logits.then(Vec::new);
+    ) -> Result<SlotsRound<'_>, SessionError> {
+        let n_vocab = if logits { self.model.n_vocab()? } else { 0 };
+        let total: usize = rows.iter().map(|(_, t)| t.len()).sum();
+        if self.round.len() < total * n_vocab {
+            self.round.resize(total * n_vocab, 0.0);
+        }
+        let mut ids = Vec::with_capacity(total);
         let mut passes = 0;
         for chunk in rows.chunks(B::MAX_ROWS) {
             let out = self.step_slots(chunk)?;
-            ids.extend(out.ids);
-            if let Some(all) = rows_logits.as_mut() {
-                let mut pass = self.model.slots_logits()?;
-                for (r, row) in chunk.iter().zip(&pass) {
-                    if let Some(i) = row.iter().position(|v| v.is_nan()) {
+            if logits {
+                let held = ids.len() * n_vocab;
+                let pass = self
+                    .round
+                    .get_mut(held..held + out.ids.len() * n_vocab)
+                    .ok_or_else(|| {
+                        SessionError::Refused(format!(
+                            "a pass of {} rows past the round's {total}",
+                            out.ids.len()
+                        ))
+                    })?;
+                self.model.slots_logits_into(pass)?;
+                let slots = chunk
+                    .iter()
+                    .flat_map(|(slot, toks)| std::iter::repeat_n(*slot, toks.len()));
+                for (i, slot) in slots.enumerate() {
+                    let row = &pass[i * n_vocab..(i + 1) * n_vocab];
+                    if let Some(at) = row.iter().position(|v| v.is_nan()) {
                         return Err(SessionError::Refused(format!(
-                            "slot {}'s logit {i} is NaN",
-                            r.0
+                            "slot {slot}'s logit {at} is NaN"
                         )));
                     }
                 }
-                all.append(&mut pass);
             }
+            ids.extend(out.ids);
             passes += 1;
         }
+        let ran = ids.len();
         Ok(SlotsRound {
             ids,
             passes,
-            logits: rows_logits,
+            logits: logits.then(|| RoundLogits {
+                all: &self.round[..ran * n_vocab],
+                rows: ran,
+                n_vocab,
+            }),
         })
     }
 }
@@ -715,12 +744,30 @@ where
 /// What [`Session::step_slots_rounds`] ran: each row's greedy next token in
 /// row order, the passes the round took (one a cut at the body's
 /// [`SlotRows::MAX_ROWS`] bound), and every row's logits when the caller
-/// asked for them, each pass's rows in the round's row order.
+/// asked for them, each pass's rows in the round's row order — the
+/// session's own buffer, lent until its next call.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SlotsRound {
+pub struct SlotsRound<'a> {
     pub ids: Vec<u32>,
     pub passes: usize,
-    pub logits: Option<Vec<Vec<f32>>>,
+    pub logits: Option<RoundLogits<'a>>,
+}
+
+/// A round's logits rows: row `i` of the round at `i · n_vocab` in the
+/// session's buffer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoundLogits<'a> {
+    all: &'a [f32],
+    rows: usize,
+    n_vocab: usize,
+}
+
+impl<'a> RoundLogits<'a> {
+    /// Each row's logits (`n_vocab` f32), in the round's row order.
+    pub fn rows(self) -> impl ExactSizeIterator<Item = &'a [f32]> {
+        let (all, n_vocab) = (self.all, self.n_vocab);
+        (0..self.rows).map(move |i| &all[i * n_vocab..(i + 1) * n_vocab])
+    }
 }
 
 impl<B: Prompt + Keep> Target for Session<B> {

@@ -508,6 +508,9 @@ pub struct GpuModel<B: ChainBody> {
     /// The rows of the last call when it was a pass of several slots: what
     /// [`GpuModel::slots_logits`] reads.
     slot_rows: Option<usize>,
+    /// The one head's logits as [`GpuModel::slots_logits_into`] fetched them
+    /// to take each row's from; its capacity is grown once and reused.
+    logits_stage: Vec<f32>,
     /// The ranges of a pass of several slots' verify rows waiting for
     /// [`GpuModel::commit_slots`] ([`GpuModel::verify_slots`]).
     slots_waiting: Option<Vec<SlotRange>>,
@@ -579,6 +582,7 @@ impl<B: ChainBody> GpuModel<B> {
             pass_heads: (0..MAX_PASS_ROWS).map(|_| None).collect(),
             one_pass: None,
             slot_rows: None,
+            logits_stage: Vec::new(),
             slots_waiting: None,
             body: Box::new(body),
             weights,
@@ -1262,6 +1266,68 @@ impl<B: ChainBody> GpuModel<B> {
             .get(m.wrapping_sub(1))
             .and_then(Option::as_ref)
             .ok_or(GpuError::state(what, "no pass of these rows has run"))
+    }
+
+    /// Row `r` of the pass `read` describes into `row` (`n_vocab` f32): the
+    /// one read of a pass's row that [`GpuModel::pass_row_into`] and
+    /// [`GpuModel::slots_logits_into`] take by their body's layout.
+    /// [`RowHeads::PerRow`] copies head `r` alone; [`RowHeads::One`] copies
+    /// the pass's one head into the stage unless this pass's head is there
+    /// already, and takes row `r` from it (`[v·m + r]`). Blocking read.
+    /// Refused by name, as `what`, for a row past the pass's rows, a `row`
+    /// of another length, and under [`RowHeads::One`] when the last call
+    /// was not a pass of those rows.
+    fn pass_row(
+        &self,
+        what: &'static str,
+        read: &mut PassRead<'_>,
+        r: usize,
+        row: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let m = read.rows;
+        if r >= m {
+            return Err(GpuError::shape(what, format!("row {r} of a pass of {m}")));
+        }
+        match read.layout {
+            RowHeads::PerRow => self
+                .heads
+                .get(r)
+                .ok_or(GpuError::state(what, "no pass of these rows has run"))?
+                .logits_into_host(&self.gpu, row),
+            RowHeads::One => {
+                if self.one_pass != Some(m) {
+                    return Err(GpuError::state(
+                        what,
+                        "the last call was not a pass of these rows",
+                    ));
+                }
+                let head = self.pass_head(m, what)?;
+                let n_vocab = head.n_vocab();
+                if row.len() != n_vocab {
+                    return Err(GpuError::shape(
+                        what,
+                        format!("a row of {} f32 for {n_vocab} logits", row.len()),
+                    ));
+                }
+                if !read.fetched {
+                    read.stage.resize(m * n_vocab, 0.0);
+                    head.logits_into_host(&self.gpu, read.stage)?;
+                    read.fetched = true;
+                } else if read.stage.len() != m * n_vocab {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "a fetched pass of {} f32 for {m} rows of {n_vocab}",
+                            read.stage.len()
+                        ),
+                    ));
+                }
+                for (o, &v) in row.iter_mut().zip(read.stage.iter().skip(r).step_by(m)) {
+                    *o = v;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The heads a pass of `m` rows laid as `layout` writes: for
@@ -2000,50 +2066,25 @@ impl<B: Rows> GpuModel<B> {
         fetched: bool,
         row: &mut [f32],
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "GpuModel::pass_row_into";
-        if r >= m {
-            return Err(GpuError::shape(WHAT, format!("row {r} of a pass of {m}")));
-        }
-        match B::HEADS {
-            RowHeads::PerRow => self
-                .heads
-                .get(r)
-                .ok_or(GpuError::state(WHAT, "no pass of these rows has run"))?
-                .logits_into_host(&self.gpu, row),
-            RowHeads::One => {
-                if self.one_pass != Some(m) {
-                    return Err(GpuError::state(
-                        WHAT,
-                        "the last call was not a pass of these rows",
-                    ));
-                }
-                let head = self.pass_head(m, WHAT)?;
-                let n_vocab = head.n_vocab();
-                if row.len() != n_vocab {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!("a row of {} f32 for {n_vocab} logits", row.len()),
-                    ));
-                }
-                if !fetched {
-                    pass.resize(m * n_vocab, 0.0);
-                    head.logits_into_host(&self.gpu, pass)?;
-                } else if pass.len() != m * n_vocab {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!(
-                            "a fetched pass of {} f32 for {m} rows of {n_vocab}",
-                            pass.len()
-                        ),
-                    ));
-                }
-                for (o, &v) in row.iter_mut().zip(pass.iter().skip(r).step_by(m)) {
-                    *o = v;
-                }
-                Ok(())
-            }
-        }
+        let mut read = PassRead {
+            layout: B::HEADS,
+            rows: m,
+            stage: pass,
+            fetched,
+        };
+        self.pass_row("GpuModel::pass_row_into", &mut read, r, row)
     }
+}
+
+/// The read of one pass's rows ([`GpuModel::pass_row`]): the pass's `rows`,
+/// the `layout` its heads lay them in, and under [`RowHeads::One`] the host
+/// copy of its one head — `stage`, which the first row read fetches
+/// (`fetched` from then on) and the rows after it take theirs from.
+struct PassRead<'a> {
+    layout: RowHeads,
+    rows: usize,
+    stage: &'a mut Vec<f32>,
+    fetched: bool,
 }
 
 /// The heads a pass of `m` rows laid as `layout` writes: `heads[..m]`, or
