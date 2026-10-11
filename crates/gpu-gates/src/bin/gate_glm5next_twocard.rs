@@ -176,7 +176,7 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, checkpoint_budget,
+        Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, checkpoint_price,
         feed, set_prefill_group,
     };
     use bloomery_levers::{CARD_DONTNEED, GLM_RESIDENCY_UNSET, HOST_LOCK, HOST_POPULATE};
@@ -746,8 +746,13 @@ mod gate {
     /// Plan (b′)'s machine for the one sequence every arm loads, its
     /// checkpoints reserved at [`CTX`] positions.
     fn bp_machine(inputs: &PlanInputs) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
-        let ckpt = checkpoint_budget(inputs, u64::try_from(CTX)?)?;
-        glm_machine(Place::Bp, Some(place::tier_batch(&inputs.hp)), 1, ckpt)
+        glm_machine(
+            Place::Bp,
+            Some(place::tier_batch(&inputs.hp)),
+            1,
+            checkpoint_price(inputs)?,
+            u64::try_from(CTX)?,
+        )
     }
 
     /// The bits arm (no flag): the union reference, then the two cards.

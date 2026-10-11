@@ -81,7 +81,7 @@ use super::scratch::{
 use super::slot_pass::SlotIn;
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
-use crate::checkpoint::Checkpoints;
+use crate::checkpoint::{self, Checkpoints};
 use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
 use crate::host::{BatchLeg, StepLeg};
@@ -103,7 +103,7 @@ use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, RopeMode};
 use model::placement::{Plan, WholeLoad};
-use runtime::seqstate::{HOST_BUDGET, Kept};
+use runtime::seqstate::{Kept, Price};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -196,6 +196,40 @@ fn ubatch_of(d: &Dims, u: usize) -> Result<NonZeroUsize, GpuError> {
 /// [`UBATCH`], so the `u32` loses nothing.
 fn checkpoint_every(asked: usize, d: &Dims) -> Result<u32, GpuError> {
     Ok(ubatch_of(d, asked)?.get() as u32)
+}
+
+/// The f32s of each store one checkpoint copies, in [`copied`]'s order: each
+/// delta layer's state, then its conv ring. The one derivation of what a
+/// checkpoint holds, read by the sequences' `Checkpoints` and by
+/// [`checkpoint_price35`].
+fn checkpoint_lens(kinds: &[Kind35]) -> Vec<usize> {
+    kinds
+        .iter()
+        .filter_map(|k| match k {
+            Kind35::Delta(shape) => Some(RecStore::lens(*shape, LANES)),
+            Kind35::Gqa(_) => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// What one checkpoint of a load of `spec`'s model costs on the host and how
+/// a prompt call spaces them, the load asked for ubatches of `asked` tokens
+/// ([`checkpoint_every`]): the figure every sequence's `Checkpoints` is made
+/// with ([`Checkpoints::sequence`]) and a plan's host reserve prices
+/// (`residency38::reserve_checkpoints`), so the two cannot differ. The
+/// spacing reads no cache row, so the dims are read at one position.
+pub fn checkpoint_price35(spec: &ModelSpec, asked: usize) -> Result<Price, GpuError> {
+    let kinds = kinds35(&spec.layers)?;
+    let every = checkpoint_every(asked, &dims(spec, &kinds, 1)?)?;
+    Ok(checkpoint::price(&checkpoint_lens(&kinds), every))
+}
+
+/// The host bytes one sequence's checkpoints pin at most in a load of `ctx`
+/// positions (a slot's share) of `spec`'s model asked for ubatches of
+/// `asked` tokens ([`Price::budget`] of [`checkpoint_price35`]).
+pub fn checkpoint_budget35(spec: &ModelSpec, asked: usize, ctx: u64) -> Result<u64, GpuError> {
+    checkpoint::budget(checkpoint_price35(spec, asked)?, ctx)
 }
 
 /// The rows and the device bytes of the ubatch arena of `d` for ubatches of
@@ -493,7 +527,7 @@ fn blk(l: usize, stem: &str) -> String {
     format!("blk.{l}.{stem}")
 }
 
-/// The delta layers' stores a checkpoint copies, in [`Checkpoints::new`]'s
+/// The delta layers' stores a checkpoint copies, in [`Checkpoints::sequence`]'s
 /// order: each one's state, then its conv ring.
 fn copied(stores: &mut [LayerStore]) -> Vec<&mut DeviceBuffer<f32>> {
     let mut out = Vec::new();
@@ -1327,18 +1361,8 @@ impl Body35 {
             }
             None => (None, None),
         };
-        // The stores a checkpoint copies, always in this order: each delta
-        // layer's state, then its conv ring.
-        let lens: Vec<usize> = stores
-            .iter()
-            .filter_map(|s| match s {
-                LayerStore::Rec(r) => Some([r.state.len(), r.ring.len()]),
-                LayerStore::Kv(_) => None,
-            })
-            .flatten()
-            .collect();
         let every = checkpoint_every(asked, &d)?;
-        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, every)?;
+        let ckpt = Checkpoints::sequence(gpu.context(), checkpoint_lens(&kinds), ctx, every)?;
         let s = Arena::with(stream, d, 1, forms)?;
         let sp = StepParams::new(stream, true)?;
         let a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
@@ -2451,12 +2475,8 @@ impl Slots for Body35 {
                 )),
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
-        let ckpt = Checkpoints::new(
-            gpu.context(),
-            self.ckpt.lens().to_vec(),
-            HOST_BUDGET,
-            self.every,
-        )?;
+        let ckpt =
+            Checkpoints::sequence(gpu.context(), self.ckpt.lens().to_vec(), d.ctx, self.every)?;
         let rope = self
             .rope_base
             .as_ref()
@@ -2486,7 +2506,7 @@ impl Slots for Body35 {
     /// ([`Body35::store_bytes`]) and its rotation table
     /// ([`Body35::rope_bytes`]). Its checkpoints are host bytes, left out:
     /// pinned slots its prompt calls make as they take points, up to
-    /// [`HOST_BUDGET`] a sequence and none at [`Slots::new_seq`].
+    /// [`checkpoint_budget35`] a sequence and none at [`Slots::new_seq`].
     fn seq_bytes(&self) -> usize {
         self.store_bytes() + self.rope_bytes()
     }
@@ -2582,5 +2602,43 @@ impl Instrumented for Body35 {
         self.held = u32::try_from(rows)
             .map_err(|_| GpuError::shape(WHAT, format!("a depth of {rows} positions past u32")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Flash, Kind35, checkpoint_lens};
+    use crate::checkpoint::{point_bytes, price};
+    use crate::linear::{KHeadMap, LinearShape};
+
+    /// A checkpoint of Qwen3.6-35B-A3B's trunk — 30 delta layers of 16 key
+    /// and 32 value heads among 10 attention layers — copies each delta
+    /// layer's state (2,097,152 B) and conv ring (360,448 B): 73,728,000 B,
+    /// spaced at the 4,096-token default ubatch, so a slot of 2,048 positions
+    /// pins one point and one of 10,240 three. The lengths are the stores'
+    /// own ([`RecStore::lens`]), in [`copied`]'s order.
+    #[test]
+    fn a_checkpoint_copies_each_delta_layers_state_and_ring() {
+        let delta = Kind35::Delta(LinearShape {
+            n_k: 16,
+            n_v: 32,
+            map: KHeadMap::Tiled,
+        });
+        let kinds: Vec<Kind35> = (0..40)
+            .map(|l| {
+                if l % 4 == 3 {
+                    Kind35::Gqa(Flash::Group)
+                } else {
+                    delta
+                }
+            })
+            .collect();
+        let lens = checkpoint_lens(&kinds);
+        assert_eq!(lens.len(), 60);
+        assert!(lens.chunks(2).all(|c| c == [32 * 128 * 128, 11 * 8192]));
+        assert_eq!(point_bytes(&lens), 73_728_000);
+        let price = price(&lens, 4_096);
+        assert_eq!(price.budget(2_048), Ok(73_728_000));
+        assert_eq!(price.budget(10_240), Ok(3 * 73_728_000));
     }
 }

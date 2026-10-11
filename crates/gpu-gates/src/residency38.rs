@@ -6,9 +6,9 @@
 //! `residency38_at_plan` on it; `generate_qwen3moe`, the Qwen3.8 serve seat).
 //! It also owns what a load's resident sequences pin on the host for their
 //! checkpoints ([`reserve_checkpoints`]): every seat declares its load's
-//! ([`Seqs`]) as a host reserve row of the machine it plans on, so the plan's
-//! host need holds them and the rooms read from it (the unset rule's,
-//! `CacheRam`'s) take them once.
+//! ([`Seqs`]) as a host reserve row of the machine it plans on, priced at the
+//! context that machine is laid for, so the plan's host need holds them and
+//! the rooms read from it (the unset rule's, `CacheRam`'s) take them once.
 
 use crate::GateError;
 use crate::generate::Place;
@@ -19,73 +19,86 @@ use bloomery_levers::{PlanTier, RESIDENCY38_SPARES, Residency38Pick, residency38
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan};
-use runtime::seqstate::HOST_BUDGET;
+use runtime::seqstate::{Price, pinned};
 
-/// The sequences a load holds and whether they take checkpoints: `slots`
+/// The sequences a load holds and what their checkpoints cost: `slots`
 /// resident sequences, each pinning host slots for the checkpoints its prompt
-/// calls take when `checkpoints` — a load's declaration of what its body
-/// does ([`reserve_checkpoints`]), each holding up to [`HOST_BUDGET`]. A
-/// Qwen3.6 or Qwen3.8 load takes them where its seat turns them on
-/// (`set_checkpoints`), and a CLI's leaves them off; V4.1's body makes no
-/// checkpoints, nor does a qwen3moe file's. A GLM load takes them on every
-/// load with a budget of its own context ([`reserve_glm_checkpoints`]).
+/// calls take when `checkpoints` carries the family's price — a load's
+/// declaration of what its body does ([`reserve_checkpoints`]). A Qwen3.6,
+/// Qwen3.8 or GLM load takes them where its seat turns them on (the body's
+/// `set_checkpoints`, GLM's on every load), and a CLI's leaves them off;
+/// V4.1's body makes no checkpoints, nor does a qwen3moe file's. Each family
+/// builds its price from the derivation its body makes its sequences'
+/// `Checkpoints` with (`checkpoint_price`), so a sequence pins what the
+/// machine reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seqs {
     pub slots: usize,
-    pub checkpoints: bool,
+    pub checkpoints: Option<Price>,
 }
 
 impl Seqs {
     /// One sequence taking no checkpoints: the CLI's loads and a qwen3moe
     /// file's.
-    pub const ONE: Seqs = Seqs {
-        slots: 1,
-        checkpoints: false,
-    };
-}
+    pub const ONE: Seqs = Seqs::none(1);
 
-/// The host bytes the checkpoints of `slots` sequences pin at most: one
-/// [`HOST_BUDGET`] a sequence, each sequence's state carrying its own
-/// `Checkpoints` with the full budget, its pinned slots made as its prompt
-/// calls take points; `u64::MAX` past u64, which no host holds.
-#[must_use]
-pub fn checkpoint_bytes(slots: usize) -> u64 {
-    pinned(slots, HOST_BUDGET)
-}
+    /// `slots` sequences taking no checkpoints.
+    #[must_use]
+    pub const fn none(slots: usize) -> Seqs {
+        Seqs {
+            slots,
+            checkpoints: None,
+        }
+    }
 
-/// `slots` sequences of `budget` bytes each; `u64::MAX` past u64.
-fn pinned(slots: usize, budget: u64) -> u64 {
-    u64::try_from(slots).map_or(u64::MAX, |n| n.saturating_mul(budget))
+    /// `slots` sequences taking checkpoints of `price`.
+    #[must_use]
+    pub const fn priced(slots: usize, price: Price) -> Seqs {
+        Seqs {
+            slots,
+            checkpoints: Some(price),
+        }
+    }
 }
 
 /// The host reserve row ([`Machine::host`]'s `reserves`) that carries a
 /// load's checkpoints ([`reserve_checkpoints`]).
 pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
 
-/// `machine`'s host with the checkpoints `seqs` pin reserved: a
-/// [`CHECKPOINTS_RESERVE`] row of [`checkpoint_bytes`] of its slots when
-/// they take checkpoints, nothing when they take none. The one owner of a
-/// load's checkpoint bytes: the plan's host need (`HostNeed::bytes`
-/// counts every reserve) holds them, so the load's host check, the NVMe
-/// tier's floor and arena, the unset residency rule's room ([`mem_left_38`])
-/// and the prompt cache's default budget (`CacheRam`) count them once, and a
-/// load that declares none counts none. A machine reserves them once: a
-/// second declaration is a panic by name.
-pub fn reserve_checkpoints(machine: &mut Machine, seqs: Seqs) {
-    declare_checkpoints(
-        machine,
-        seqs.checkpoints.then(|| checkpoint_bytes(seqs.slots)),
-    );
+/// The host bytes `seqs` pin at most when each sequence's load is of
+/// `slot_ctx` positions: `slots` sequences of the price's budget at that
+/// context ([`Price::budget`]); 0 for sequences that take no checkpoints.
+/// Refused by name for a context the rule refuses.
+pub fn checkpoints_pinned(seqs: Seqs, slot_ctx: u64) -> Result<u64, GateError> {
+    let Some(price) = seqs.checkpoints else {
+        return Ok(0);
+    };
+    let budget = price
+        .budget(slot_ctx)
+        .map_err(|e| format!("the checkpoint reserve at {slot_ctx} positions a slot: {e}"))?;
+    Ok(pinned(seqs.slots, budget))
 }
 
-/// [`reserve_checkpoints`] for a GLM load of `slots` resident sequences, each
-/// pinning up to `budget` bytes: the body's own figure at the context the
-/// load is granted (`bloomery_gpu_glm5next::checkpoint_budget`, which every
-/// sequence's `Checkpoints` is made with), so the reserve is exactly what the
-/// sequences can pin. Every GLM load takes checkpoints: its prompt call takes
-/// a point at each mark with no switch.
-pub fn reserve_glm_checkpoints(machine: &mut Machine, slots: usize, budget: u64) {
-    declare_checkpoints(machine, Some(pinned(slots, budget)));
+/// `machine`'s host with the checkpoints `seqs` pin reserved: a
+/// [`CHECKPOINTS_RESERVE`] row of [`checkpoints_pinned`] at `slot_ctx`
+/// positions a slot — the context each sequence's body is opened with, the
+/// one the machine is laid for — when they take checkpoints, nothing when
+/// they take none. The one owner of a load's checkpoint bytes: the plan's
+/// host need (`HostNeed::bytes` counts every reserve) holds them, so the
+/// load's host check, the NVMe tier's floor and arena, the unset residency
+/// rule's room ([`mem_left_38`]) and the prompt cache's default budget
+/// (`CacheRam`) count them once, and a load that declares none counts none.
+/// Every machine builder prices its own context, so no probe of a context
+/// search reserves a figure priced at another. A machine reserves them once:
+/// a second declaration is a panic by name.
+pub fn reserve_checkpoints(
+    machine: &mut Machine,
+    seqs: Seqs,
+    slot_ctx: u64,
+) -> Result<(), GateError> {
+    let bytes = checkpoints_pinned(seqs, slot_ctx)?;
+    declare_checkpoints(machine, seqs.checkpoints.map(|_| bytes));
+    Ok(())
 }
 
 /// The one row a machine carries for its checkpoints: `bytes`, or none for
@@ -108,11 +121,13 @@ fn declare_checkpoints(machine: &mut Machine, bytes: Option<u64>) {
     }
 }
 
-/// `machine`'s checkpoint reserve against what a GLM load of `slots`
-/// sequences of `budget` bytes pins: refused by name when the reserve is
-/// short of it — the plan was made for a smaller context than the body's
-/// sequences are made for, and the host holds bytes the plan did not count.
-pub fn check_glm_reserve(machine: &Machine, slots: usize, budget: u64) -> Result<(), GateError> {
+/// `machine`'s checkpoint reserve against what a load of `slots` sequences
+/// of `budget` bytes pins (the body's `checkpoint_budget` at the context the
+/// load is granted): refused by name when the reserve is short of it — the
+/// plan was made for a smaller context than the body's sequences are made
+/// for, and the host holds bytes the plan did not count. The one check of
+/// every family's load.
+pub fn check_reserve(machine: &Machine, slots: usize, budget: u64) -> Result<(), GateError> {
     let (reserved, pins) = (checkpoints_reserved(machine), pinned(slots, budget));
     if reserved < pins {
         return Err(format!(
@@ -167,22 +182,26 @@ pub const GLM_CARD: usize = 0;
 
 /// `place`'s machine of a layer count (`Place::machine`, `batch` the expert
 /// tier's prompt-batch bytes) for a GLM load of `slots` resident sequences
-/// pinning up to `budget` bytes each, every machine it makes declaring them
-/// ([`reserve_glm_checkpoints`]): the machine a GLM load's offer, plans and
-/// open take, so each counts the checkpoints its sequences pin. `budget` is
-/// the body's figure at the load's context
-/// (`bloomery_gpu_glm5next::checkpoint_budget`), taken as bytes here because
-/// this module is built without the GLM device crate.
+/// whose checkpoints cost `price` (`bloomery_gpu_glm5next::checkpoint_price`),
+/// each of `slot_ctx` positions, every machine it makes declaring them
+/// ([`reserve_checkpoints`]): the machine a GLM load's offer, plans and open
+/// take, so each counts the checkpoints its sequences pin. The price is taken
+/// as bytes here because this module is built without the GLM device crate;
+/// a refusal of the rule is the call's, before any machine is made. Every GLM
+/// load takes checkpoints: its prompt call takes a point at each mark with no
+/// switch.
 pub fn glm_machine(
     place: Place,
     batch: Option<TierBatchBytes>,
     slots: usize,
-    budget: u64,
+    price: Price,
+    slot_ctx: u64,
 ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
     let base = place.machine(None, batch)?;
+    let bytes = checkpoints_pinned(Seqs::priced(slots, price), slot_ctx)?;
     Ok(move |layers| {
         let mut machine = base(layers);
-        reserve_glm_checkpoints(&mut machine, slots, budget);
+        declare_checkpoints(&mut machine, Some(bytes));
         machine
     })
 }

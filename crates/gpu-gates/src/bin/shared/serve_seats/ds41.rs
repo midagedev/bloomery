@@ -757,13 +757,7 @@ fn print_plan(
             .push((VISION_RESERVE.to_owned(), bytes));
     }
     // V4.1's body makes no checkpoints: its slots pin none.
-    reserve_checkpoints(
-        &mut machine,
-        Seqs {
-            slots: slots.get(),
-            checkpoints: false,
-        },
-    );
+    reserve_checkpoints(&mut machine, Seqs::none(slots.get()), u64::try_from(ctx)?)?;
     let plan = inputs
         .plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)
         .map_err(|e| {

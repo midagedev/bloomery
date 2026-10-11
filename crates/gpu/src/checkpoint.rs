@@ -39,7 +39,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
-use runtime::seqstate::{self, Cut, Kept, Ledger, Stats, Take};
+use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Stats, Take};
 
 use crate::GpuError;
 use crate::graph::cu;
@@ -94,18 +94,71 @@ pub struct Checkpoints {
     ctx: Arc<CudaContext>,
 }
 
+/// The host bytes one checkpoint of stores of `lens` f32s copies.
+#[must_use]
+pub fn point_bytes(lens: &[usize]) -> u64 {
+    lens.iter().map(|&n| (n * size_of::<f32>()) as u64).sum()
+}
+
+/// The price of checkpoints of stores of `lens` f32s taken inside a prompt
+/// call every `every` positions: what a family's body makes its sequences'
+/// `Checkpoints` with ([`Checkpoints::sequence`]) and what its plan reserves
+/// the host for.
+#[must_use]
+pub fn price(lens: &[usize], every: u32) -> Price {
+    Price {
+        point_bytes: point_bytes(lens),
+        every,
+    }
+}
+
+/// [`Price::budget`] of `price` at `ctx` positions, refused by name as the
+/// rule refuses: the one figure a sequence's `Checkpoints` is made with and
+/// a plan reserves a sequence.
+pub fn budget(price: Price, ctx: u64) -> Result<u64, GpuError> {
+    price.budget(ctx).map_err(|e| GpuError::Shape {
+        what: WHAT,
+        detail: format!("the budget at {ctx} positions: {e}"),
+    })
+}
+
 impl Checkpoints {
+    /// One sequence's checkpoints of stores of `lens` f32s in a load of
+    /// `ctx` positions, taken inside a prompt call every `every` positions:
+    /// held to the sequence's budget ([`budget`] of its [`price`]), refused
+    /// by name when the ledger made is not exactly that many slots. The one
+    /// constructor: no body names a budget of its own.
+    pub fn sequence(
+        cuda: &Arc<CudaContext>,
+        lens: Vec<usize>,
+        ctx: usize,
+        every: u32,
+    ) -> Result<Checkpoints, GpuError> {
+        let positions = u64::try_from(ctx).map_err(|_| GpuError::Shape {
+            what: WHAT,
+            detail: format!("a context of {ctx} positions passes u64"),
+        })?;
+        let granted = budget(price(&lens, every), positions)?;
+        let ckpt = Checkpoints::new(cuda, lens, granted, every)?;
+        seqstate::check_ledger(granted, ckpt.capacity(), ckpt.bytes()).map_err(|e| {
+            GpuError::Shape {
+                what: WHAT,
+                detail: format!("at {ctx} positions: {e}"),
+            }
+        })?;
+        Ok(ckpt)
+    }
+
     /// Checkpoints of stores of `lens` f32s, as many as `budget` bytes of
     /// host slots hold, taken inside a prompt call every `every` positions.
     /// Refused by name when not one fits.
-    pub fn new(
+    fn new(
         ctx: &Arc<CudaContext>,
         lens: Vec<usize>,
         budget: u64,
         every: u32,
     ) -> Result<Checkpoints, GpuError> {
-        let bytes = lens.iter().map(|&n| (n * size_of::<f32>()) as u64).sum();
-        let cap = seqstate::capacity(budget, bytes).map_err(refused)?;
+        let cap = seqstate::capacity(budget, point_bytes(&lens)).map_err(refused)?;
         Ok(Checkpoints {
             ledger: Ledger::new(cap).map_err(refused)?,
             lens,
@@ -127,10 +180,7 @@ impl Checkpoints {
     /// Bytes one checkpoint copies.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.lens
-            .iter()
-            .map(|&n| (n * size_of::<f32>()) as u64)
-            .sum()
+        point_bytes(&self.lens)
     }
 
     /// Checkpoints the budget holds.
@@ -784,6 +834,29 @@ fn refused(e: seqstate::CheckpointError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sequence's checkpoints hold the points one prompt call over its
+    /// context takes: stores of 7 f32s spaced 512 apart make 1 point at 512
+    /// positions, 8 at 4,096 (the marks 512 to 3,584 and the end), each of
+    /// `point_bytes`, the ledger exactly the budget's slots; a context past
+    /// the u32 positions is refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_sequence_holds_the_budget_of_its_context() {
+        let (ctx, _stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let lens = vec![4, 3];
+        for (positions, points) in [(512usize, 1usize), (4_096, 8)] {
+            let c = Checkpoints::sequence(&ctx, lens.clone(), positions, 512).expect("checkpoints");
+            assert_eq!(c.capacity(), points, "{positions} positions");
+            assert_eq!(c.bytes(), point_bytes(&lens));
+            let planned = budget(price(&lens, 512), positions as u64).expect("a budget");
+            assert_eq!(planned, points as u64 * c.bytes(), "{positions} positions");
+        }
+        let Err(e) = Checkpoints::sequence(&ctx, lens, usize::MAX, 512) else {
+            panic!("a context past the u32 positions is refused");
+        };
+        assert!(e.to_string().contains("passes the u32 positions"), "{e}");
+    }
 
     /// A restore reads a slot only as the position its last finished copy
     /// holds: a ledger point planted on a slot made and never copied is

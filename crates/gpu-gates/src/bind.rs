@@ -3167,9 +3167,6 @@ mod tests {
         assert!(!e.contains("--cache-ram"), "{e}");
     }
 
-    /// The checkpoints a load's sequences pin grow one [`HOST_BUDGET`] a
-    /// sequence ([`checkpoint_bytes`]), the bytes the machine's checkpoint
-    /// reserve carries.
     /// The `parallel` line names the shape a round of several slots runs
     /// in: one slot is `one` whatever the body does, several slots are `one`
     /// where the body runs one pass of the busy rows and `turns` where it
@@ -3201,14 +3198,31 @@ mod tests {
         );
     }
 
+    /// The checkpoints a load's sequences pin grow one budget a sequence
+    /// ([`checkpoints_pinned`]), the bytes the machine's checkpoint reserve
+    /// carries: a point of 1 MiB spaced 512 apart takes 8 points over a slot
+    /// of 4,096 positions, and sequences that take none pin none.
     #[test]
-    fn checkpoint_bytes_grow_a_budget_a_sequence() {
-        use crate::residency38::checkpoint_bytes;
-        let budget = runtime::seqstate::HOST_BUDGET;
-        assert_eq!(checkpoint_bytes(0), 0);
-        assert_eq!(checkpoint_bytes(1), budget);
-        assert_eq!(checkpoint_bytes(3), 3 * budget);
-        assert_eq!(checkpoint_bytes(usize::MAX), u64::MAX);
+    fn checkpoints_pinned_grow_a_budget_a_sequence() {
+        use crate::residency38::{Seqs, checkpoints_pinned};
+        use runtime::seqstate::Price;
+        let price = Price {
+            point_bytes: 1 << 20,
+            every: 512,
+        };
+        let budget = 8 << 20;
+        let pinned = |slots| checkpoints_pinned(Seqs::priced(slots, price), 4_096);
+        assert_eq!(pinned(0).expect("a reserve"), 0);
+        assert_eq!(pinned(1).expect("a reserve"), budget);
+        assert_eq!(pinned(3).expect("a reserve"), 3 * budget);
+        assert_eq!(pinned(usize::MAX).expect("a reserve"), u64::MAX);
+        assert_eq!(
+            checkpoints_pinned(Seqs::none(3), 4_096).expect("a reserve"),
+            0
+        );
+        let past = u64::from(u32::MAX) + 1;
+        let e = checkpoints_pinned(Seqs::priced(1, price), past).expect_err("a context past u32");
+        assert!(e.to_string().contains("passes the u32 positions"), "{e}");
     }
 
     /// The unset residency rule's room is what the reading leaves past the
@@ -3221,7 +3235,15 @@ mod tests {
     fn the_residency38_room_reads_the_reserved_need() {
         use crate::residency38::{Seqs, checkpoints_reserved, mem_left_38, reserve_checkpoints};
         use model::placement::{Host, Machine};
-        use runtime::seqstate::HOST_BUDGET;
+        use runtime::seqstate::Price;
+        // Points of 1 GiB spaced 512 apart: a slot of 4,096 positions takes
+        // eight and the host budget fits four, 4 GiB a slot.
+        let price = Price {
+            point_bytes: 1 << 30,
+            every: 512,
+        };
+        let slot = price.budget(4_096).expect("a budget");
+        assert_eq!(slot, 4 << 30);
         // A plan of one card layer of 100 experts, its host the rest: the
         // unset rule pins none (P 0), the pool a fixed 10 GiB whatever P is.
         let pick = |mem_left: i128| {
@@ -3235,7 +3257,7 @@ mod tests {
             )
             .expect("the pick")
         };
-        let declared = |checkpoints: bool| {
+        let declared = |seqs: Seqs| {
             let mut machine = Machine {
                 cards: Vec::new(),
                 tiers: Vec::new(),
@@ -3245,27 +3267,21 @@ mod tests {
                 },
                 unified: None,
             };
-            reserve_checkpoints(
-                &mut machine,
-                Seqs {
-                    slots: 2,
-                    checkpoints,
-                },
-            );
+            reserve_checkpoints(&mut machine, seqs, 4_096).expect("a reserve");
             checkpoints_reserved(&machine)
         };
         // The plan's own terms, 12 GiB, and the reserve the need adds.
         let (available, terms) = (24u64 << 30, 12u64 << 30);
-        let none = terms + declared(false);
+        let none = terms + declared(Seqs::none(2));
         assert_eq!(pick(mem_left_38(available, none)).pinned, Some(0));
-        let two = terms + declared(true);
-        assert_eq!(two - none, 2 * HOST_BUDGET);
+        let two = terms + declared(Seqs::priced(2, price));
+        assert_eq!(two - none, 2 * slot);
         let short = pick(mem_left_38(available, two));
         assert_eq!(
             short.why,
             bloomery_levers::Residency38Why::MemShort {
                 needs: 10u64 << 30,
-                leaves: i128::from(available) - i128::from(terms) - i128::from(2 * HOST_BUDGET),
+                leaves: i128::from(available) - i128::from(terms) - i128::from(2 * slot),
             }
         );
         assert_eq!(
@@ -4301,17 +4317,28 @@ mod tests {
         use super::super::{CacheRam, HostRead};
         use crate::generate::Place;
         use crate::residency38::{
-            CHECKPOINTS_RESERVE, Seqs, check_glm_reserve, checkpoint_bytes, checkpoints_reserved,
-            glm_machine, reserve_checkpoints, reserve_glm_checkpoints,
+            CHECKPOINTS_RESERVE, Seqs, check_reserve, checkpoints_pinned, checkpoints_reserved,
+            glm_machine, reserve_checkpoints,
         };
         use model::placement::{Host, Machine};
-        use runtime::seqstate::{HOST_BUDGET, budget_for};
+        use runtime::seqstate::{HOST_BUDGET, Price};
 
         /// One GLM checkpoint's bytes: 34 KDA layers' recurrent state and
         /// conv ring (5,275,648 B a layer).
         const GLM_POINT: u64 = 34 * 5_275_648;
         /// The spacing of a GLM prompt call's inner checkpoints.
         const GLM_EVERY: u32 = 512;
+        /// GLM's price: its point and its spacing.
+        const GLM_PRICE: Price = Price {
+            point_bytes: GLM_POINT,
+            every: GLM_EVERY,
+        };
+        /// A price whose slot of 4,096 positions takes the four points of 1 GiB
+        /// the host budget fits: 4 GiB a slot.
+        const FOUR_GIB: Price = Price {
+            point_bytes: 1 << 30,
+            every: 512,
+        };
 
         /// A machine of `os` reserved bytes on the host and nothing else.
         fn machine(os: u64) -> Machine {
@@ -4376,7 +4403,8 @@ mod tests {
         /// are refused by name.
         #[test]
         fn a_split_plan_takes_no_default_budget() {
-            let checkpoints = checkpoint_bytes(1);
+            let checkpoints =
+                checkpoints_pinned(Seqs::priced(1, FOUR_GIB), 4_096).expect("a reserve");
             let (plan, pool, arena, paged) = (6_000u64, 1_000u64, 2_000u64, 3_000u64);
             let available = 100_000 + checkpoints;
             for (tier, paged) in [(arena, paged), (0, paged)] {
@@ -4479,40 +4507,32 @@ mod tests {
         /// The checkpoint reserve is each load's declaration
         /// (`reserve_checkpoints`): V4.1's body makes no checkpoints, so its
         /// seat declares none and its machine carries no row and reserves 0;
-        /// the Qwen3.8 seat's two slots, taking them, carry one row of
-        /// `HOST_BUDGET` a slot; a second declaration on one machine is a
-        /// panic by name.
+        /// the Qwen3.8 seat's two slots, taking them, carry one row of the
+        /// price's budget at the slot's context a slot; a second declaration on
+        /// one machine is a panic by name.
         #[test]
         fn the_checkpoint_reserve_is_each_loads_declaration() {
             let declared = |seqs: Seqs| {
                 let mut m = machine(1_000);
-                reserve_checkpoints(&mut m, seqs);
+                reserve_checkpoints(&mut m, seqs, 4_096).expect("a reserve");
                 m
             };
-            let v41 = declared(Seqs {
-                slots: 2,
-                checkpoints: false,
-            });
+            let v41 = declared(Seqs::none(2));
             assert_eq!(v41.host.reserves, vec![("os".to_owned(), 1_000)]);
             assert_eq!(checkpoints_reserved(&v41), 0);
-            let q38 = declared(Seqs {
-                slots: 2,
-                checkpoints: true,
-            });
+            let slot = FOUR_GIB.budget(4_096).expect("a budget");
+            let q38 = declared(Seqs::priced(2, FOUR_GIB));
             assert_eq!(
                 q38.host.reserves,
                 vec![
                     ("os".to_owned(), 1_000),
-                    (CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(2))
+                    (CHECKPOINTS_RESERVE.to_owned(), 2 * slot)
                 ]
             );
-            assert_eq!(checkpoints_reserved(&q38), checkpoint_bytes(2));
+            assert_eq!(checkpoints_reserved(&q38), 2 * slot);
             let twice = std::panic::catch_unwind(|| {
-                let mut m = declared(Seqs {
-                    slots: 2,
-                    checkpoints: true,
-                });
-                reserve_checkpoints(&mut m, Seqs::ONE);
+                let mut m = declared(Seqs::priced(2, FOUR_GIB));
+                reserve_checkpoints(&mut m, Seqs::ONE, 4_096).expect("a reserve");
             })
             .expect_err("a second declaration panics");
             let said = twice
@@ -4521,6 +4541,67 @@ mod tests {
                 .or_else(|| twice.downcast_ref::<&str>().copied())
                 .unwrap_or_default();
             assert!(said.contains("reserves its checkpoints already"), "{said}");
+        }
+
+        /// A qwen35moe or Qwen3.8 machine's checkpoint row at a total context
+        /// `C` split across `N` slots is `N` of the family's budget at a
+        /// slot's `C / N` positions: the family's price is its point and its
+        /// spacing (`checkpoint_price35`, `checkpoint_price38`, pinned where
+        /// they are made: `gate-gpu-lib`) and the budget one sequence's
+        /// `Checkpoints` is made with is the price's at the slot's context.
+        /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 130,162,688 B
+        /// (Qwen3.8-Flash-Next) spaced 4,096 apart takes one point in a slot
+        /// of 2,048 positions and three in 10,240 — not the 4 GiB of the
+        /// default a slot.
+        #[test]
+        fn a_qwen_machine_reserves_its_familys_budget_at_each_context() {
+            for point_bytes in [73_728_000u64, 130_162_688] {
+                let price = Price {
+                    point_bytes,
+                    every: 4_096,
+                };
+                for (total, slots, points) in [
+                    (4_096u64, 2usize, 1u64),
+                    (20_480, 2, 3),
+                    (10_240, 1, 3),
+                    (81_920, 4, 5),
+                ] {
+                    let slot = total / slots as u64;
+                    let mut m = machine(1_000);
+                    reserve_checkpoints(&mut m, Seqs::priced(slots, price), slot)
+                        .expect("a reserve");
+                    let each = price.budget(slot).expect("a budget");
+                    assert_eq!(each, points * point_bytes, "{total} over {slots}");
+                    assert_eq!(
+                        checkpoints_reserved(&m),
+                        slots as u64 * each,
+                        "{total} over {slots}"
+                    );
+                    assert_ne!(checkpoints_reserved(&m), slots as u64 * HOST_BUDGET);
+                }
+            }
+        }
+
+        /// A deeper probe never reserves less: the machine's checkpoint row
+        /// at each context a search can probe holds at the row of every
+        /// shallower one, for Qwen3.8's price and GLM's, so a search's probes
+        /// never reserve under the load they bound.
+        #[test]
+        fn a_deeper_probe_never_reserves_less() {
+            let qwen38 = Price {
+                point_bytes: 130_162_688,
+                every: 4_096,
+            };
+            for price in [qwen38, GLM_PRICE] {
+                let mut last = 0;
+                for ctx in (1..=140_000u64).step_by(7) {
+                    let mut m = machine(1_000);
+                    reserve_checkpoints(&mut m, Seqs::priced(2, price), ctx).expect("a reserve");
+                    let reserved = checkpoints_reserved(&m);
+                    assert!(reserved >= last, "ctx {ctx}: {reserved} B under {last} B");
+                    last = reserved;
+                }
+            }
         }
 
         /// A GLM load's machine (`glm_machine`, the one its offer, plans and
@@ -4537,14 +4618,13 @@ mod tests {
             let layers = 4;
             let (need, pool) = (6_000u64, 1_000u64);
             let available = need + pool + 4 * HOST_BUDGET + 100_000;
-            let budget = budget_for(4_096, GLM_EVERY, GLM_POINT).expect("a budget");
             for slots in [1usize, 3] {
                 let slots_u64 = u64::try_from(slots).expect("a slot count fits u64");
-                let m =
-                    glm_machine(Place::A, None, slots, budget).expect("plan (a)'s machine")(layers);
+                let m = glm_machine(Place::A, None, slots, GLM_PRICE, 4_096)
+                    .expect("plan (a)'s machine")(layers);
                 let reserved = checkpoints_reserved(&m);
                 assert_eq!(reserved, slots_u64 * 8 * GLM_POINT, "{slots} slots");
-                assert_ne!(reserved, checkpoint_bytes(slots), "{slots} slots");
+                assert_ne!(reserved, slots_u64 * HOST_BUDGET, "{slots} slots");
                 let c = CacheRam::at(
                     None,
                     (available, HostRead::Given),
@@ -4571,9 +4651,9 @@ mod tests {
         /// either owner, is a panic by name.
         #[test]
         fn a_glm_reserve_follows_the_granted_context() {
-            for (ctx, points) in [(512u32, 1u64), (4_096, 8), (11_265, 23), (16_384, 23)] {
-                let budget = budget_for(ctx, GLM_EVERY, GLM_POINT).expect("a budget");
-                let m = glm_machine(Place::A, None, 2, budget).expect("plan (a)'s machine")(4);
+            for (ctx, points) in [(512u64, 1u64), (4_096, 8), (11_265, 23), (16_384, 23)] {
+                let m =
+                    glm_machine(Place::A, None, 2, GLM_PRICE, ctx).expect("plan (a)'s machine")(4);
                 assert_eq!(
                     checkpoints_reserved(&m),
                     2 * points * GLM_POINT,
@@ -4584,8 +4664,8 @@ mod tests {
             const { assert!(23 * GLM_POINT < HOST_BUDGET) };
             let twice = std::panic::catch_unwind(|| {
                 let mut m = machine(1_000);
-                reserve_glm_checkpoints(&mut m, 1, GLM_POINT);
-                reserve_checkpoints(&mut m, Seqs::ONE);
+                reserve_checkpoints(&mut m, Seqs::priced(1, GLM_PRICE), 4_096).expect("a reserve");
+                reserve_checkpoints(&mut m, Seqs::ONE, 4_096).expect("a reserve");
             })
             .expect_err("a second declaration panics");
             let said = twice
@@ -4603,11 +4683,12 @@ mod tests {
         /// does too.
         #[test]
         fn a_glm_reserve_short_of_the_load_is_refused_by_name() {
-            let at = |ctx: u32| budget_for(ctx, GLM_EVERY, GLM_POINT).expect("a budget");
+            let at = |ctx: u64| GLM_PRICE.budget(ctx).expect("a budget");
             let load = at(16_384);
-            let reserved =
-                |ctx: u32| glm_machine(Place::A, None, 2, at(ctx)).expect("plan (a)'s machine")(4);
-            let Err(e) = check_glm_reserve(&reserved(512), 2, load) else {
+            let reserved = |ctx: u64| {
+                glm_machine(Place::A, None, 2, GLM_PRICE, ctx).expect("plan (a)'s machine")(4)
+            };
+            let Err(e) = check_reserve(&reserved(512), 2, load) else {
                 panic!("a reserve of 512 positions covers a load of 16,384");
             };
             let e = e.to_string();
@@ -4616,8 +4697,8 @@ mod tests {
                     && e.contains(&format!("pin up to {} B", 2 * 23 * GLM_POINT)),
                 "{e}"
             );
-            assert!(check_glm_reserve(&reserved(16_384), 2, load).is_ok());
-            assert!(check_glm_reserve(&reserved(16_384), 2, at(4_096)).is_ok());
+            assert!(check_reserve(&reserved(16_384), 2, load).is_ok());
+            assert!(check_reserve(&reserved(16_384), 2, at(4_096)).is_ok());
         }
 
         /// The default budget reads the checkpoints once, inside the need:
@@ -4629,13 +4710,7 @@ mod tests {
         #[test]
         fn a_default_budget_takes_the_reserved_checkpoints_once() {
             let mut m = machine(1_000);
-            reserve_checkpoints(
-                &mut m,
-                Seqs {
-                    slots: 2,
-                    checkpoints: true,
-                },
-            );
+            reserve_checkpoints(&mut m, Seqs::priced(2, FOUR_GIB), 4_096).expect("a reserve");
             let checkpoints = checkpoints_reserved(&m);
             let (need, pool) = (6_000 + checkpoints, 1_000u64);
             let available = need + pool + 100_000;

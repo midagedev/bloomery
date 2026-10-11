@@ -130,7 +130,7 @@
 //!   (`placed_slots_load_names_the_split` red); one counted for every slot
 //!   names twice the planes and the clause is red. `slots_count_their_checkpoints`
 //!   reads both servers' stderr: a qwen35moe file's two sequences each pin
-//!   up to `runtime::seqstate::HOST_BUDGET` of checkpoints on the host, and
+//!   up to the body's budget at the slot's context of checkpoints on the host, and
 //!   the seat's `checkpoints:` line names two sequences and twice the budget
 //!   — against the host's available bytes on the whole-card arm, as the
 //!   placed plan's host reserve on the placed one; a qwen3moe file's
@@ -360,7 +360,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
@@ -372,7 +372,6 @@ mod gate {
     use gguf::Split;
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
-    use runtime::seqstate::HOST_BUDGET;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
 
@@ -2087,12 +2086,15 @@ mod gate {
 
     /// `slots_count_their_checkpoints` (module header), from both slots
     /// arms' servers' stderr once they stopped: a qwen35moe file's two
-    /// sequences each pin up to [`HOST_BUDGET`] of checkpoints, so the seat's
-    /// one `checkpoints:` line names two sequences and twice the budget — on
-    /// the whole-card arm against the host's available bytes, on the placed
-    /// arm as its plan's host reserve; a qwen3moe file's sequences take no
+    /// sequences each pin up to the body's budget at the slot's context
+    /// (`checkpoint_budget35` of the file's own spec at the asked ubatch, the
+    /// slot context read off the arm's `parallel` line), so the seat's one
+    /// `checkpoints:` line names two sequences and twice that budget — on the
+    /// whole-card arm against the host's available bytes, on the placed arm
+    /// as its plan's host reserve; a qwen3moe file's sequences take no
     /// checkpoints and print none. FAIL-first: the term counted for one
-    /// sequence names one budget.
+    /// sequence names one budget; a budget priced at the host's cap
+    /// (`runtime::seqstate::HOST_BUDGET`) names the 4 GiB of the default.
     fn slots_count_their_checkpoints(
         model: &Path,
         dir: &Path,
@@ -2100,10 +2102,10 @@ mod gate {
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let takes = split.architecture() == Some("qwen35moe");
-        let want = format!(
-            "checkpoints: 2 sequences pin at most {} B of host ({HOST_BUDGET} B each), ",
-            2 * HOST_BUDGET
-        );
+        let spec = takes
+            .then(|| model::arch::qwen35moe::spec::read(&split))
+            .transpose()?
+            .map(|read| read.spec);
         let mut held = true;
         for (arm, counted_in) in [
             ("slots", "of "),
@@ -2118,10 +2120,28 @@ mod gate {
                 .filter(|l| l.starts_with("checkpoints: "))
                 .collect();
             println!("{arm}: checkpoints lines {lines:?}");
-            held &= if takes {
-                matches!(lines[..], [l] if l.starts_with(&format!("{want}{counted_in}")))
-            } else {
-                lines.is_empty()
+            held &= match &spec {
+                Some(spec) => {
+                    let slot_ctx = log
+                        .lines()
+                        .filter(|l| l.starts_with("parallel "))
+                        .find_map(|l| parallel_word(l, "slot_ctx")?.parse::<u64>().ok());
+                    let each = slot_ctx
+                        .map(|c| checkpoint_budget35(spec, ubatch_size()?, c))
+                        .transpose()?;
+                    let want = each.zip(slot_ctx).map(|(each, c)| {
+                        format!(
+                            "checkpoints: 2 sequences pin at most {} B of host ({each} B each at \
+                             {c} positions), {counted_in}",
+                            2 * each
+                        )
+                    });
+                    match (want, &lines[..]) {
+                        (Some(want), [l]) => l.starts_with(&want),
+                        _ => false,
+                    }
+                }
+                None => lines.is_empty(),
             };
         }
         check(ok, "slots_count_their_checkpoints", held);

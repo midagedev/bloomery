@@ -147,13 +147,13 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip;
-    use bloomery_gpu_gates::residency38::reserve_glm_checkpoints;
+    use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
-        NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, checkpoint_budget, feed,
+        NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, checkpoint_price, feed,
         nextn_chain, nextn_hidden, nextn_logits, nextn_router, nextn_store, nextn_target_streams,
         nextn_walk, prompt_with, seq_bytes, seq_resume, seq_save, set_prefill, set_prefill_group,
     };
@@ -1744,8 +1744,11 @@ mod gate {
     ) -> Result<bool, GateError> {
         let file = glm5next_tier::open()?;
         let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
-        let ckpt = checkpoint_budget(inputs, u64::try_from(Z_CTX)?)?;
-        reserve_glm_checkpoints(&mut machine, Z_SLOTS, ckpt);
+        reserve_checkpoints(
+            &mut machine,
+            Seqs::priced(Z_SLOTS, checkpoint_price(inputs)?),
+            u64::try_from(Z_CTX)?,
+        )?;
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let np =
             inputs.plan_nextn_slots(&machine, u64::try_from(Z_CTX)?, &place, nextn, Z_SLOTS)?;
@@ -1903,7 +1906,11 @@ mod gate {
         };
         let ctx = u64::try_from(CTX)?;
         let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
-        reserve_glm_checkpoints(&mut machine, 1, checkpoint_budget(&inputs, ctx)?);
+        reserve_checkpoints(
+            &mut machine,
+            Seqs::priced(1, checkpoint_price(&inputs)?),
+            ctx,
+        )?;
         let place = glm5next_tier::plan_levers(&levers, 0)?;
         let base = inputs.plan(&machine, ctx, &place)?;
         let np = inputs.plan_nextn(&machine, ctx, &place, &nextn)?;
