@@ -1,0 +1,59 @@
+# Round q38cjk: Qwen3.8's shipped MTP head list cjk-76000 (the kohangul list re-ranked with Chinese and Japanese build
+# text at 76,000 rows) against the list it replaces, kohangul-65536, same binary, the shipped default otherwise
+# (residency, the MTP draft and host streaming unset: mid-p121-s1, mtp, on).
+#
+# [derived] Two terms move. Head bytes: +10,464 rows x 2,720 B x 3 walks = 85.4 MB a window, 0.126-0.139 ms at
+# 615-680 GB/s on a 37.43 ms window (P 512): -0.34..-0.37 % tok/s. Acceptance: a target token outside the list ends the
+# window's accepted prefix. With AL(q) = 1 + sum_{j=1..3} A_j (1-q)^j and A = (26, 23, 21)/26, from the kept list
+# [0, 3, 2, 21] of q38head2-ab's P 512 arm, the miss rate q of each held-out set (crates/models/tests/data/head-holdout,
+# old -> new) gives positions a window:
+#   zh-wiki .6692 -> .0332: AL 1.457 -> 3.524, x2.42    zh-chat .5984 -> .0327: 1.597 -> 3.526, x2.21
+#   ja-wiki .5901 -> .0064: 1.614 -> 3.659, x2.27       ja-chat .6006 -> .0059: 1.592 -> 3.662, x2.30
+#   ko-wiki .0195 -> .0068: +1.8 %                      ko-chat .0029 -> .0031: -0.04 %
+#   en-prose .0091 -> .0178: -1.2 %                     rust .0132 -> .0270: -1.9 %, python -2.4 %, c -2.5 %
+# The model is the one the gate's break-even uses (head_coverage.rs); it takes the misses as independent across the
+# window, and A from one prose prompt, so the zh and ja factors are a direction and a size, not a band to rule on.
+#
+# What this card times: the prose arms, the only text the depth runner feeds (`prose:<P>`, the profile's
+# corpus-prose.ids). There the change is a loss: acceptance -1.2 % (en-prose's q) plus the head bytes -0.35 %, so
+# -1.6 % [derived]. The band widens to -2.5..-0.6, because the box's prose corpus is not the held-out en-prose set.
+# The zh and ja gain is not a timed claim. Its check is functional and deterministic (greedy): one load per list,
+# BLOOMERY_MTP_WINDOWS=1, the zh-chat and ja-chat held-out ids as the prompt; read each run's mtp summary kept list and
+# E(4). Prediction: E(4) under cjk-76000 is 2.0-2.5x kohangul's on both, and the tokens lines are equal.
+#
+# Runner (lead, after cjk-76000 lands, the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38cjk-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=8
+# just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_MTP_HEAD_ROWS=/root/bloomery-data/qwen4exp/heldout/mtp-head-rows-kohangul-65536.txt
+#   prose:4096 prose:4096@BLOOMERY_MTP_HEAD_ROWS=/root/bloomery-data/qwen4exp/heldout/mtp-head-rows-kohangul-65536.txt
+# The changed arm is the unset one (the shipped cjk-76000), so the effect is (unset - kohangul) / kohangul.
+# Kind noninf, not ab: the question is whether prose loses no more than the derivation allows, and an ab card on a
+# band whose near edge is 0.6 % needs 23 rounds (card.py). Margin 4.0 %: the band's far edge -2.5 % plus the paired
+# ruler at 8 rounds (1.2 %), so a prediction that comes true passes; a loss past it is a term the model lacks.
+# Rounds: sd 1.0 %, q38seed-mtp's same-binary MTP pairs, as q38head2-ab's.
+# Wall [derived]: 2 load groups x 8 rounds = 16 Qwen3.8 loads with the draft (19-58 s each), the prompts and
+# 2 x 96 tokens a load: 7-17 min, with the build and witness blocks 9-20 min.
+kind: noninf
+question: does the cjk-76000 head list cost Qwen3.8's MTP decode on English prose what its derivation says (the
+  acceptance its en-prose miss rate loses plus 10,464 more head rows a walk), and no more?
+term: tok/s @ n=96, prose:512 and prose:4096, ctx 4352, A6000, plan a, residency, draft and host streaming unset
+  (mtp), unset (cjk-76000) against BLOOMERY_MTP_HEAD_ROWS=heldout/mtp-head-rows-kohangul-65536.txt, same binary,
+  paired by round
+unit: %
+predict: -2.5..-0.6
+rounds: 8
+margin: 4.0 % the band's far edge (-2.5 %, the derived prose loss and the gap between the held-out en-prose set and the box corpus) plus the paired ruler at 8 rounds; the loss is accepted for the zh/ja acceptance gain (lead's 76,000-row decision)
+sd: 1.0 % q38seed-mtp's same-binary MTP pairs (rig-log 09-30#q38seed-ab, 6 rounds, +-1.3 % / +-0.9 %)
+condition: one binary, every arm of a P in one lease, a fresh process per load group, the host set and the PLE
+  table warm, no [cpu-busy] or [other-busy] row; both arms' plan lines equal (the head's row map is 248,320 x 4 B
+  either way, so card_experts and card_bytes do not move); each arm's load draft line names its list (head=rows=76000
+  shipped, head=rows=65536); each arm prints one tokens line per P, and the two arms' tokens lines are equal (greedy:
+  the head list changes the draft, never the target's tokens); each arm's mtp summary kept list and E(4) are read
+  beside its tok/s
+decide-in: pass (no loss beyond 4.0 %): keep cjk-76000 as the default; write the measured prose effect and the
+  functional zh/ja E(4) ratio beside it in the release notes
+decide-below: fail (a loss beyond 4.0 %): compare the two arms' kept lists first (acceptance), then their
+  time pass rows (bytes). If acceptance explains it, re-derive q on the box's corpus-prose.ids under both lists
+  before choosing a row count; if the pass time does, take one nsys window of q8_0_gemv_ids at 76,000 rows
+decide-above: pass with a gain above -0.6 %: check that the tokens lines are equal and that each
+  arm loaded its own list; with both true, the en-prose held-out set over-states the box corpus's misses, so
+  note it and keep the default
