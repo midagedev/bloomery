@@ -1408,11 +1408,19 @@ impl RecStore {
         shape: LinearShape,
         lanes: usize,
     ) -> Result<RecStore, GpuError> {
+        let [state, ring] = RecStore::lens(shape, lanes);
         Ok(RecStore {
-            state: DeviceBuffer::zeroed(stream, lanes * shape.state_len())?,
-            ring: DeviceBuffer::zeroed(stream, shape.ring_len())?,
+            state: DeviceBuffer::zeroed(stream, state)?,
+            ring: DeviceBuffer::zeroed(stream, ring)?,
             lanes,
         })
+    }
+
+    /// The f32s of the state and of the ring of a store of `lanes` lanes for
+    /// `shape`, the lengths [`RecStore::new`] allocates and a checkpoint of
+    /// the whole store copies.
+    pub(super) fn lens(shape: LinearShape, lanes: usize) -> [usize; 2] {
+        [lanes * shape.state_len(), shape.ring_len()]
     }
 
     /// Every lane of the state and the whole ring back to zero, in stream

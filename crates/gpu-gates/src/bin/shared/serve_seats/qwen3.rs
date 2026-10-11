@@ -98,8 +98,9 @@
 //! whole because one slot's share would. A placed open holds the slots'
 //! stores to what the plan counts for them by name and prints both
 //! (`q3place::open_qwen3_slots`, `q3place::open_qwen35_slots`). A qwen35moe
-//! sequence's checkpoints pin host bytes, up to `runtime::seqstate`'s
-//! `HOST_BUDGET` a sequence: a placed plan carries every sequence's as its
+//! sequence's checkpoints pin host bytes, up to the body's budget at a slot's
+//! context (`q3place::checkpoints_fit`'s one line names it): a placed plan
+//! carries every sequence's as its
 //! host's `checkpoints` reserve, and a whole-card load, which has no host
 //! plan, is refused by name before it loads when the host's available bytes
 //! do not hold them (`q3place::checkpoints_fit`, one stderr line either way).
@@ -209,7 +210,7 @@ fn default_ctx(
                 place,
                 CTX,
                 &plan_levers,
-                seqs35(parallel),
+                seqs35(split, parallel)?,
             )?,
             _ => None,
         };
@@ -292,12 +293,11 @@ fn open35(ctx: usize, kv: KvQ8) -> Result<Open35, GateError> {
 
 /// A qwen35moe file's `parallel` resident sequences: each takes the
 /// checkpoints the seat's kept prefixes come back to ([`Body3::open`] arms
-/// them), so each pins its own on the host.
-fn seqs35(parallel: usize) -> Seqs {
-    Seqs {
-        slots: parallel,
-        checkpoints: true,
-    }
+/// them), so each pins its own on the host, priced by the body's own
+/// derivation at the ubatch the load is asked for
+/// ([`q3place::seqs_qwen35`]).
+fn seqs35(split: &Split, parallel: usize) -> Result<Seqs, GateError> {
+    q3place::seqs_qwen35(split, ubatch_size()?, parallel)
 }
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
@@ -846,7 +846,7 @@ fn decide(
     let unplaced = match (arch, place) {
         (Arch::Qwen35moe, Some(p)) => {
             let o = q3place::share(&open35(total, kv)?, total, parallel);
-            let q = PlaceQ3::qwen35_seqs(split, p, o, seqs35(parallel))?;
+            let q = PlaceQ3::qwen35_seqs(split, p, o, seqs35(split, parallel)?)?;
             return Ok(Q3Load::Placed {
                 q: Box::new(q),
                 total,
@@ -854,7 +854,7 @@ fn decide(
             });
         }
         (Arch::Qwen35moe, None) => {
-            q3place::unplaced_qwen35_slots(split, &open35(total, kv)?, seqs35(parallel))?
+            q3place::unplaced_qwen35_slots(split, &open35(total, kv)?, seqs35(split, parallel)?)?
         }
         (_, Some(p)) => {
             return Ok(Q3Load::Placed {
@@ -967,7 +967,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // makes no fit call of its own (`decide`).
     let load = decide(&split, arch, ctx, a.place, slots, kv)?;
     if matches!(arch, Arch::Qwen35moe) {
-        q3place::checkpoints_fit(seqs35(slots), matches!(load, Q3Load::Placed { .. }))?;
+        q3place::checkpoints_fit(
+            seqs35(&split, slots)?,
+            slot_ctx,
+            matches!(load, Q3Load::Placed { .. }),
+        )?;
     }
     // The shape of a round of several slots, from the plan's host experts
     // ([`Q3Load::host_tier`]); the open holds the opened body to it.

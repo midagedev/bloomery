@@ -119,11 +119,11 @@ use super::wide38::{
     Gemm38, STREAM_FLOOR, SplitWalk, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
 };
-use crate::checkpoint::Checkpoints;
 use crate::checkpoint::saved::{
     Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
 };
 use crate::checkpoint::staging::NoRoom;
+use crate::checkpoint::{self, Checkpoints};
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::run::{HostRun, HostWidths};
@@ -152,7 +152,7 @@ use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::placement::{Device, Plan};
-use runtime::seqstate::{HOST_BUDGET, Kept, Take, Why};
+use runtime::seqstate::{Kept, Price, Take, Why};
 use runtime::swaprule::KeptRows;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -277,12 +277,50 @@ pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool) -> u6
 /// ([`checkpoint_bytes`]).
 pub const CHECKPOINT_EVERY: u32 = UBATCH_MOST as u32;
 
+/// The f32s of each store one checkpoint of a load of `gdn` delta layers
+/// copies, in the layers' order: each delta layer's committed lane and conv
+/// ring, then the PLE ring. The one derivation of what a checkpoint holds,
+/// read by the sequences' `Checkpoints`, [`checkpoint_bytes`] and
+/// [`checkpoint_price38`].
+fn checkpoint_lens(gdn: usize) -> Vec<usize> {
+    (0..gdn)
+        .flat_map(|_| [GDN.state_len(), GDN.ring_len()])
+        .chain([ple::ring_len(geo::STREAMS)])
+        .collect()
+}
+
+/// [`checkpoint_lens`] of the delta layers among `stores`.
+fn checkpoint_lens_of(stores: &[Store38]) -> Vec<usize> {
+    checkpoint_lens(
+        stores
+            .iter()
+            .filter(|s| matches!(s, Store38::Rec { .. }))
+            .count(),
+    )
+}
+
 /// The bytes one checkpoint of a load of `gdn` delta layers copies: each
 /// delta layer's committed lane and conv ring, and the PLE ring.
 #[must_use]
 pub fn checkpoint_bytes(gdn: usize) -> u64 {
-    ((gdn * (GDN.state_len() + GDN.ring_len()) + ple::ring_len(geo::STREAMS)) * size_of::<f32>())
-        as u64
+    checkpoint::point_bytes(&checkpoint_lens(gdn))
+}
+
+/// What one checkpoint of a load of `gdn` delta layers costs on the host and
+/// how a prompt call spaces them ([`CHECKPOINT_EVERY`]): the figure every
+/// sequence's `Checkpoints` is made with ([`Checkpoints::sequence`]) and a
+/// plan's host reserve prices (`residency38::reserve_checkpoints`), so the
+/// two cannot differ.
+#[must_use]
+pub fn checkpoint_price38(gdn: usize) -> Price {
+    checkpoint::price(&checkpoint_lens(gdn), CHECKPOINT_EVERY)
+}
+
+/// The host bytes one sequence's checkpoints pin at most in a load of `ctx`
+/// positions (a slot's share) of `gdn` delta layers ([`Price::budget`] of
+/// [`checkpoint_price38`]).
+pub fn checkpoint_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
+    checkpoint::budget(checkpoint_price38(gdn), ctx)
 }
 
 /// The positional bytes a sequence state of `positions` positions carries
@@ -1521,13 +1559,12 @@ impl Body38 {
             .map_err(|e| GpuError::plan(WHAT, e))?
             .ok_or(GpuError::state(WHAT, "a plan that places the PLE table"))?;
         let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols, ple_tier)?;
-        let lens = stores
-            .iter()
-            .filter(|s| matches!(s, Store38::Rec { .. }))
-            .flat_map(|_| [GDN.state_len(), GDN.ring_len()])
-            .chain([ple_ring.len()])
-            .collect();
-        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
+        let ckpt = Checkpoints::sequence(
+            gpu.context(),
+            checkpoint_lens_of(&stores),
+            ctx,
+            CHECKPOINT_EVERY,
+        )?;
         let who = Identity {
             arch: "qwen4exp",
             file: file
@@ -4095,12 +4132,12 @@ impl Slots for Body38 {
                 LayerKind38::Qsa => Store38::qsa(stream, &d),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let lens = stores
-            .iter()
-            .filter(|s| matches!(s, Store38::Rec { .. }))
-            .flat_map(|_| [GDN.state_len(), GDN.ring_len()])
-            .chain([ple::ring_len(geo::STREAMS)])
-            .collect();
+        let ckpt = Checkpoints::sequence(
+            gpu.context(),
+            checkpoint_lens_of(&stores),
+            self.ctx,
+            CHECKPOINT_EVERY,
+        )?;
         let ple_hist = self
             .ple
             .hash
@@ -4121,7 +4158,7 @@ impl Slots for Body38 {
             ple_ring: DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?,
             lane: LaneWord::new(stream)?,
             pending: None,
-            ckpt: Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?,
+            ckpt,
             ple_points: Vec::new(),
             ple_hist,
             held: 0,
@@ -4994,8 +5031,34 @@ const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 
 #[cfg(test)]
 mod tests {
-    use super::ple_takes;
+    use super::{
+        checkpoint_budget38, checkpoint_bytes, checkpoint_lens, checkpoint_price38, ple_takes,
+    };
     use engram::hash::{EosWindow, Window};
+
+    /// A checkpoint of Qwen3.8-Flash-Next's 36 delta layers (48 layers at
+    /// interval 4) copies each one's committed lane (786,432 f32) and conv
+    /// ring (112,640 f32) and the PLE ring (174,080 f32): 130,162,688 B, one
+    /// derivation for the sequences' `Checkpoints` and the plan's price,
+    /// spaced at the 4,096-token ubatch, so a slot of 2,048 positions pins
+    /// one point, one of 10,240 three, and the host budget fits 32.
+    #[test]
+    fn a_checkpoint_copies_the_delta_layers_lane_ring_and_the_ple_ring() {
+        let lens = checkpoint_lens(36);
+        assert_eq!(lens.len(), 2 * 36 + 1);
+        assert!(lens[..72].chunks(2).all(|c| c == [786_432, 112_640]));
+        assert_eq!(lens[72], 174_080);
+        assert_eq!(checkpoint_bytes(36), 130_162_688);
+        assert_eq!(checkpoint_price38(36).point_bytes, 130_162_688);
+        assert_eq!(checkpoint_price38(36).every, 4_096);
+        for (ctx, points) in [(2_048u64, 1u64), (10_240, 3), (1 << 20, 32)] {
+            assert_eq!(
+                checkpoint_budget38(36, ctx).expect("a budget"),
+                points * 130_162_688,
+                "ctx {ctx}"
+            );
+        }
+    }
 
     /// The call's check is the hash's: a text id passes; the image
     /// placeholder and an id past the vocabulary are refused by name with

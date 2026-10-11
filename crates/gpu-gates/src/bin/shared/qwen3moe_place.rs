@@ -30,7 +30,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{
+    Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel, checkpoint_price35,
+};
 use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
@@ -38,7 +40,7 @@ use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{Place, PlaceWhy};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{checkpoint_bytes, reserve_checkpoints};
+use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
@@ -49,7 +51,6 @@ use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
 };
-use runtime::seqstate::HOST_BUDGET;
 
 /// The census readings this module took and the probes its context searches
 /// ran, since the process began: a caller reads them around a search
@@ -157,12 +158,25 @@ pub struct PlaceQ3 {
     machine: Machine,
 }
 
-/// The sequences a load holds and whether they take checkpoints (the
-/// lib's declaration, `residency38::Seqs`): `slots` resident sequences, the
-/// context split across them, each taking checkpoints when `checkpoints` (a
-/// qwen35moe file's seat load: its prompt calls take the points a kept
-/// prefix comes back to).
+/// The sequences a load holds and the price of the checkpoints they take
+/// (the lib's declaration, `residency38::Seqs`): `slots` resident
+/// sequences, the context split across them, each taking checkpoints when
+/// `checkpoints` carries a price (a qwen35moe file's seat load: its prompt
+/// calls take the points a kept prefix comes back to), reserved at the
+/// context a slot is laid for ([`laid`]).
 pub use bloomery_gpu_gates::residency38::Seqs;
+
+/// A qwen35moe file's `slots` resident sequences, each taking checkpoints
+/// priced by the body's own derivation (`checkpoint_price35`) at the ubatch
+/// `ubatch` the load is asked for, which sets their spacing: the seat's.
+#[allow(
+    dead_code,
+    reason = "the serve seat's qwen35moe loads take checkpoints; the CLI and the e2e gates take none"
+)]
+pub fn seqs_qwen35(file: &Split, ubatch: usize, slots: usize) -> Result<Seqs, GateError> {
+    let spec = model::arch::qwen35moe::spec::read(file)?.spec;
+    Ok(Seqs::priced(slots, checkpoint_price35(&spec, ubatch)?))
+}
 
 /// The card reserve of a load's resident sequences past the live one
 /// ([`laid`]): each one's stores that no position moves.
@@ -198,8 +212,15 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// host, every sequence's checkpoints when they take them, through the lib's
 /// one owner ([`reserve_checkpoints`]). The one owner of a placed
 /// load's machine, so a relaid machine ([`PlaceQ3::machine_at`]) keeps the
-/// rows.
-fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
+/// rows. The checkpoints are priced at `slot_ctx` positions a slot, the
+/// context the machine is laid for.
+fn laid(
+    spec: CardSpec,
+    inputs: &Inputs,
+    arena: u64,
+    seqs: Seqs,
+    slot_ctx: u64,
+) -> Result<Machine, GateError> {
     let mut machine = q3::machine(spec, layers_of(inputs), arena);
     let past = u64::try_from(seqs.slots.saturating_sub(1))
         .map_or(u64::MAX, |n| n.saturating_mul(fixed_seq_bytes(inputs)));
@@ -208,16 +229,22 @@ fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
             .reserves
             .push((SLOTS_RESERVE.to_owned(), past));
     }
-    reserve_checkpoints(&mut machine, seqs);
-    machine
+    reserve_checkpoints(&mut machine, seqs, slot_ctx)?;
+    Ok(machine)
+}
+
+/// The rows each of `slots` slots loads with when they split `ctx`
+/// positions: `ctx / slots`, the split's floor.
+fn slot_ctx(ctx: usize, slots: usize) -> usize {
+    ctx / slots.max(1)
 }
 
 /// `o` for the load each of `slots` slots opens when they split `ctx`
-/// positions: a slot's share, `ctx / slots` rows (the split's floor).
+/// positions: a slot's share ([`slot_ctx`]).
 #[must_use]
 pub fn share(o: &Open35, ctx: usize, slots: usize) -> Open35 {
     Open35 {
-        ctx: ctx / slots.max(1),
+        ctx: slot_ctx(ctx, slots),
         ..*o
     }
 }
@@ -253,7 +280,13 @@ impl PlaceQ3 {
         }
         let inputs = Inputs::Qwen3(inputs);
         let arena = Qwen3moeModel::placed_arena_bytes(file, ctx)?;
-        let machine = laid(place.card_specs()?[0], &inputs, arena, Seqs::ONE);
+        let machine = laid(
+            place.card_specs()?[0],
+            &inputs,
+            arena,
+            Seqs::ONE,
+            u64::try_from(ctx)?,
+        )?;
         Ok(PlaceQ3 {
             place,
             arch: "qwen3moe",
@@ -306,7 +339,13 @@ impl PlaceQ3 {
         }
         let inputs = Inputs::Qwen35(Box::new(inputs));
         let arena = Qwen35moeModel::placed_arena_bytes(file, o)?;
-        let machine = laid(place.card_specs()?[0], &inputs, arena, seqs);
+        let machine = laid(
+            place.card_specs()?[0],
+            &inputs,
+            arena,
+            seqs,
+            u64::try_from(o.ctx)?,
+        )?;
         Ok(PlaceQ3 {
             place,
             arch: "qwen35moe",
@@ -338,17 +377,20 @@ impl PlaceQ3 {
         })
     }
 
-    /// The same placed load's machine at `ctx`: the place, the inputs and the
-    /// sequences this one resolved and read stay — the census and the file's
-    /// headers a context search's every probe retook before — and the machine
-    /// is relaid over the arena `ctx` sets, its only ctx-dependent term.
-    fn machine_at(&self, arena: u64) -> Result<Machine, GateError> {
-        Ok(laid(
+    /// The same placed load's machine at a probe's context: the place, the
+    /// inputs and the sequences this one resolved and read stay — the census
+    /// and the file's headers a context search's every probe retook before —
+    /// and the machine is relaid over the arena the context sets and the
+    /// checkpoints a slot of `slot_ctx` positions pins, its ctx-dependent
+    /// terms.
+    fn machine_at(&self, arena: u64, slot_ctx: u64) -> Result<Machine, GateError> {
+        laid(
             self.place.card_specs()?[0],
             &self.inputs,
             arena,
             self.seqs,
-        ))
+            slot_ctx,
+        )
     }
 
     /// The card experts the plan over `machine` at `ctx` keeps, for `slots`
@@ -397,7 +439,10 @@ impl PlaceQ3 {
             inputs_model(&self.inputs),
             layers.end,
             kv,
-            Seqs { slots, ..self.seqs },
+            (
+                Seqs { slots, ..self.seqs },
+                u64::try_from(slot_ctx(usize::try_from(ctx)?, slots))?,
+            ),
             load,
         )
     }
@@ -600,8 +645,9 @@ impl Whole {
 /// The whole-fit verdict of a load of the whole of `model` — `layers`
 /// layers, `kv` bytes of cache — on `spec`'s card: the card the plan lays
 /// out for the program ([`q3::machine`], its step arenas' scratch), on a
-/// unified machine with the checkpoints `seqs` pin ([`reserve_checkpoints`],
-/// `Machine::whole_card`), and what the program holds past it (`load`, or
+/// unified machine with the checkpoints `seqs` pin at `slot_ctx` positions a
+/// slot ([`reserve_checkpoints`], `Machine::whole_card`), and what the program
+/// holds past it (`load`, or
 /// the program's refusal), sized by `placement::whole_need`, the verdict's
 /// one owner. A tensor no card format loads is a refusal; any other planner
 /// error is the error.
@@ -610,7 +656,7 @@ fn whole_on(
     model: &ModelTensors,
     layers: usize,
     kv: u64,
-    seqs: Seqs,
+    (seqs, slot_ctx): (Seqs, u64),
     load: Result<WholeLoad, String>,
 ) -> Result<Whole, GateError> {
     let refused = |why: &dyn std::fmt::Display| {
@@ -621,7 +667,7 @@ fn whole_on(
         Err(why) => return Ok(refused(&why)),
     };
     let mut machine = q3::machine(spec, layers, 0);
-    reserve_checkpoints(&mut machine, seqs);
+    reserve_checkpoints(&mut machine, seqs, slot_ctx)?;
     let card = machine
         .whole_card()
         .ok_or_else(|| format!("the whole load on {}: a machine with no card", spec.name))?;
@@ -785,7 +831,10 @@ pub fn placed_ctx_qwen3(
     let probe = PlaceQ3::qwen3(file, place, floor, kv)?;
     let experts = |ctx: usize| {
         probed();
-        let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
+        let machine = probe.machine_at(
+            Qwen3moeModel::placed_arena_bytes(file, ctx)?,
+            u64::try_from(slot_ctx(ctx, slots))?,
+        )?;
         probe.card_experts(&machine, ctx, levers, slots, || qwen3_whole(file))
     };
     placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
@@ -812,7 +861,10 @@ pub fn placed_ctx_qwen35(
     let experts = |ctx: usize| {
         probed();
         let at = share(o, ctx, seqs.slots);
-        let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
+        let machine = probe.machine_at(
+            Qwen35moeModel::placed_arena_bytes(file, at)?,
+            u64::try_from(at.ctx)?,
+        )?;
         probe.card_experts(&machine, ctx, levers, seqs.slots, || qwen35_whole(file, at))
     };
     placement::ctx::searched_placed::<GateError>(trained_ctx(file), floor, CTX_GRAN, &experts)
@@ -1030,31 +1082,37 @@ fn open_slots<B: Slots>(
     Ok(m)
 }
 
-/// The checkpoints `seqs` pin on the host held against what the load counts
-/// them in, one stderr line either way: a placed load's plan carries them as
-/// its host's checkpoint reserve ([`laid`]), which its own check holds
-/// against the host's usable bytes and refuses by name; a whole-card load has
-/// no host plan, so the host's available bytes now
-/// ([`workstation::host_available`]) must hold them, else they are refused
-/// by name before anything loads (on a unified machine the whole fit counts
-/// them with the card's too, [`whole_on`]). Nothing for `seqs` that take
-/// none.
+/// The checkpoints `seqs` pin on the host in a load of `slot_ctx` positions a
+/// slot ([`checkpoints_pinned`]) held against what the load counts them in,
+/// one stderr line either way: a placed load's plan carries them as its
+/// host's checkpoint reserve ([`laid`]), which its own check holds against
+/// the host's usable bytes and refuses by name; a whole-card load has no host
+/// plan, so the host's available bytes now ([`workstation::host_available`])
+/// must hold them, else they are refused by name before anything loads (on a
+/// unified machine the whole fit counts them with the card's too,
+/// [`whole_on`]). Nothing for `seqs` that take none.
 #[allow(
     dead_code,
     reason = "the serve seat's qwen35moe loads take checkpoints; the CLI and the e2e gates take none"
 )]
-pub fn checkpoints_fit(seqs: Seqs, placed: bool) -> Result<(), GateError> {
-    if !seqs.checkpoints {
+pub fn checkpoints_fit(seqs: Seqs, slot_ctx: usize, placed: bool) -> Result<(), GateError> {
+    let Some(price) = seqs.checkpoints else {
         return Ok(());
-    }
-    let pin = checkpoint_bytes(seqs.slots);
+    };
+    let slot_ctx = u64::try_from(slot_ctx)?;
+    let pin = checkpoints_pinned(seqs, slot_ctx)?;
+    let each = price
+        .budget(slot_ctx)
+        .map_err(|e| format!("the checkpoint budget at {slot_ctx} positions a slot: {e}"))?;
     let n = seqs.slots;
     let what = if n == 1 {
         "sequence pins"
     } else {
         "sequences pin"
     };
-    let head = format!("checkpoints: {n} {what} at most {pin} B of host ({HOST_BUDGET} B each)");
+    let head = format!(
+        "checkpoints: {n} {what} at most {pin} B of host ({each} B each at {slot_ctx} positions)"
+    );
     if placed {
         eprintln!("{head}, counted in the placed plan's host reserves");
         return Ok(());
