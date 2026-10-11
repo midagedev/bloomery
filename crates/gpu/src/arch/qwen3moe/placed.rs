@@ -67,10 +67,12 @@ use super::scratch::{Arena, Dims, Io};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, route_bytes};
 use crate::gemm::GemmRoute;
 use crate::host::handoff::{Handoff, HandoffKernels};
+use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::PassReport;
 use crate::host::swap_source::{FileSwap, ResidencyGlue};
+use crate::host::xstream::LandBatch;
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
@@ -304,17 +306,38 @@ impl PlacedSide {
     /// boundary inside it, so a map read after this call is the row its
     /// unit's places and the host's skip set read.
     pub(super) fn refresh_maps(&mut self, stream: &CudaStream, m: usize) -> Result<(), GpuError> {
+        for l in 0..self.maps.len() {
+            self.refresh_map(stream, m, l)?;
+        }
+        Ok(())
+    }
+
+    /// Layer `l`'s map brought to the card copy's row of the layer, as
+    /// [`PlacedSide::refresh_maps`] brings each: in a streaming prompt call
+    /// the layer's pick moves the card copy's row in the walk, and the map
+    /// follows it before the layer's card route reads it. Nothing at a unit
+    /// the map is not read for or on a load that runs no machine. A layer
+    /// past the maps is refused by name.
+    fn refresh_map(&mut self, stream: &CudaStream, m: usize, l: usize) -> Result<(), GpuError> {
         if !self.live || m <= GEMV_COLS {
             return Ok(());
         }
         let n = self.shape.n_expert;
         let PlacedSide { slots, maps, .. } = self;
-        for (l, map) in maps.iter_mut().enumerate() {
-            let row = Window::<u32>::of(slots.buf(), l * n * size_of::<u32>(), n)?;
-            let mut head = WindowMut::<u32>::of_mut(map, 0, n)?;
-            head.copy_from_device_async(&row, stream)?;
-        }
+        let map = maps.get_mut(l).ok_or(GpuError::state(
+            WHAT,
+            "a map of the card's experts for every layer of a wide unit",
+        ))?;
+        let row = Window::<u32>::of(slots.buf(), l * n * size_of::<u32>(), n)?;
+        let mut head = WindowMut::<u32>::of_mut(map, 0, n)?;
+        head.copy_from_device_async(&row, stream)?;
         Ok(())
+    }
+
+    /// Whether layer `l` holds routed experts on the card: the layers a
+    /// streaming prompt call picks for and reads.
+    fn has_card(&self, l: usize) -> bool {
+        self.ffn.get(l).is_some_and(|f| f.n_card > 0)
     }
 }
 
@@ -1141,15 +1164,16 @@ fn card_wide(
 }
 
 /// What a placed walk reads and writes: the chain's context, its stores,
-/// the arena and its input, the unit's rows, the placed side and the
-/// arena's host leg buffers.
+/// the arena and its input, the unit's rows, the placed side (a streaming
+/// prompt call's walk brings a layer's map to its pick,
+/// [`PlacedSide::refresh_map`]) and the arena's host leg buffers.
 pub(super) struct WalkParts<'a, S: Stores + ?Sized> {
     pub(super) c: &'a PassCtx<'a>,
     pub(super) stores: &'a mut S,
     pub(super) s: &'a mut Arena,
     pub(super) io: &'a Io<'a>,
     pub(super) m: usize,
-    pub(super) side: &'a PlacedSide,
+    pub(super) side: &'a mut PlacedSide,
     pub(super) rows: &'a mut PlacedRows,
 }
 
@@ -1165,6 +1189,27 @@ impl<S: Stores + ?Sized> WalkParts<'_, S> {
             .ok_or(GpuError::state(WHAT, "a plan and a store for every layer"))?;
         let lc = Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table)?;
         dispatch::mixer(&lc, st, self.s, self.io, self.m, l == 0)
+    }
+
+    /// Layer `lc`'s places of the unit's routed slots into the leg's `sel`,
+    /// cut from the card copy's row of the layer as the stream stands: the
+    /// combine's split of each row between the card and the host.
+    fn places(&mut self, lc: &Ctx<'_>) -> Result<(), GpuError> {
+        let shape = self.side.shape;
+        self.side.k.leg.enqueue_places(
+            lc.gpu.stream(),
+            &PlacesArgs {
+                ids: self.s.route.ids(),
+                map: self.side.slots.buf(),
+                row_off: lc.layer * shape.n_expert,
+                n_expert: shape.n_expert,
+                pitch: shape.pitch,
+                used: shape.used,
+                m: self.m,
+            },
+            lc.sink,
+            &mut self.rows.sel,
+        )
     }
 }
 
@@ -1294,6 +1339,41 @@ impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
         leg: &mut BatchLeg<'a, HostRun>,
         mut tail: Tail<'a>,
     ) -> Result<(), GpuError> {
+        let o = self.overlap()?;
+        let layers = self.p.c.plans.len();
+        sched::walk(o, layers, leg, &mut self)?;
+        let p = self.p;
+        enqueue_tail(p.c, p.s, o.cols, &mut tail)
+    }
+
+    /// [`BatchWalk::walk`] in a streaming prompt call ([`StreamWalk`]):
+    /// `stream` the call's, `walk_end` the unit's last position. The walk's
+    /// last card layer's return, which no shadow follows, is the call end's
+    /// ([`PromptStream::return_owed`]). Refused by name as `walk` refuses.
+    pub(super) fn walk_streamed(
+        self,
+        leg: &mut BatchLeg<'a, HostRun>,
+        mut tail: Tail<'a>,
+        stream: &mut PromptStream,
+        walk_end: usize,
+    ) -> Result<(), GpuError> {
+        let o = self.overlap()?;
+        let layers = self.p.c.plans.len();
+        let mut w = StreamWalk {
+            walk: self,
+            stream,
+            walk_end,
+        };
+        sched::walk(o, layers, leg, &mut w)?;
+        let engine = leg.stream();
+        w.stream.return_owed(leg.hybrid(), engine)?;
+        let p = w.walk.p;
+        enqueue_tail(p.c, p.s, o.cols, &mut tail)
+    }
+
+    /// The unit's point `(1, m, Batch)`. A unit of no row or past the
+    /// placed side's most rows is refused by name.
+    fn overlap(&self) -> Result<Overlap, GpuError> {
         let m = self.p.m;
         let cap = self.p.side.cap;
         if m == 0 || m > cap || self.p.c.plans.is_empty() {
@@ -1305,15 +1385,32 @@ impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
                 ),
             ));
         }
-        let o = Overlap {
+        Ok(Overlap {
             units: 1,
             cols: m,
             port: PortKind::Batch,
-        };
-        let layers = self.p.c.plans.len();
-        sched::walk(o, layers, leg, &mut self)?;
-        let p = self.p;
-        enqueue_tail(p.c, p.s, m, &mut tail)
+        })
+    }
+
+    /// After the pick of `l` moved the layer's map (`land`, its landing
+    /// batches, not empty): the layer's map brought to the moved card copy
+    /// ([`PlacedSide::refresh_map`]) and its places cut again from it — the
+    /// front cut them from the row before the pick, which counts an expert
+    /// the pick moved from the host to the card on neither side and one it
+    /// sent the other way on both — then the engine stream waiting the last
+    /// landing batch's event: the wide arm's card route reads the layer's
+    /// slots through one remap, so it waits every copy before its first
+    /// GEMM, not a GEMM batch a landing batch.
+    fn moved(&mut self, l: usize, land: &[LandBatch]) -> Result<(), GpuError> {
+        let p = &mut self.p;
+        let lc = ctx_of(p.c, l)?;
+        let stream = lc.gpu.stream();
+        p.side.refresh_map(stream, p.m, l)?;
+        p.places(&lc)?;
+        if let Some(e) = land.iter().rev().find_map(|b| b.event.as_deref()) {
+            stream.wait(e)?;
+        }
+        Ok(())
     }
 }
 
@@ -1345,20 +1442,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
             shape.pitch,
             key,
         )?;
-        p.side.k.leg.enqueue_places(
-            stream,
-            &PlacesArgs {
-                ids: s.route.ids(),
-                map: p.side.slots.buf(),
-                row_off: l * shape.n_expert,
-                n_expert: shape.n_expert,
-                pitch: shape.pitch,
-                used: shape.used,
-                m,
-            },
-            lc.sink,
-            &mut p.rows.sel,
-        )
+        p.places(&lc)
     }
 
     /// The card's routed experts and the shared expert.
@@ -1389,6 +1473,67 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
             return wide::ffn_combine(&lc, &lc.p.ffn, p.s, p.m, Some(host), None);
         }
         combine(&lc, p.side, p.rows, p.s, p.m, port.hsum(), None)
+    }
+}
+
+/// A prompt unit's walk in a streaming prompt call (the [`XMode`] lever's
+/// `admit`, [`PromptStream`]): [`BatchWalk`]'s parts with the stream's
+/// around them. At a layer's shadow the return of the layer whose host
+/// service ran last, then — on a layer with card experts — the layer's pick
+/// for the unit, the map and places it moved ([`BatchWalk::moved`]), the
+/// card route under them and the layer's last read of its slots; at its
+/// back the layer's return owed in the returning call's last walk. The
+/// serve of a layer runs after its shadow (the batch order's), so it reads
+/// the host map the pick moved. A unit of at most [`GEMV_COLS`] rows picks
+/// nothing (the pick's floor is past it).
+///
+/// [`XMode`]: crate::host::xstream::XMode
+struct StreamWalk<'a, 'b, S: Stores + ?Sized> {
+    walk: BatchWalk<'a, S>,
+    stream: &'b mut PromptStream,
+    /// The unit's last position: the call's last walk returns.
+    walk_end: usize,
+}
+
+impl<'a, S: Stores + ?Sized> LayerProgram for StreamWalk<'a, '_, S> {
+    type Port = BatchLeg<'a, HostRun>;
+
+    /// [`BatchWalk`]'s front: its places are cut from the row before the
+    /// layer's pick.
+    fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        self.walk.front(port, at)
+    }
+
+    /// The return owed, the pick, the moved map and places when it moved
+    /// any, the card's routed experts and the shared expert, the read.
+    fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        let StreamWalk {
+            walk,
+            stream,
+            walk_end,
+        } = self;
+        let m = walk.p.m;
+        stream.return_at_shadow(port, at, *walk_end)?;
+        let side = &*walk.p.side;
+        let (_, land) = stream.pick(port, at, (m, 1), *walk_end, |l| side.has_card(l))?;
+        if !land.is_empty() {
+            walk.moved(l, &land)?;
+        }
+        walk.shadow(port, at)?;
+        let side = &*walk.p.side;
+        stream.read(port, l, true, |l| side.has_card(l))
+    }
+
+    /// [`BatchWalk`]'s back; then, in the returning call's last walk, the
+    /// layer's return is due, asked at the next layer's shadow.
+    fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        self.walk.back(port, at)?;
+        let l = at.layer;
+        if self.stream.returns_here(self.walk_end) && self.walk.p.side.has_card(l) {
+            self.stream.owe_return(l);
+        }
+        Ok(())
     }
 }
 

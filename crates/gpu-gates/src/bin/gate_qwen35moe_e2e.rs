@@ -207,7 +207,16 @@
 //!   [`FREE_BAND`] of the off run's (relative), the ids equal or parting at
 //!   a near tie ([`GREEDY_MARGIN`]). `c1` (green-only): the history twice gives the same ids and
 //!   logits bit for bit. `c7`: a residency reset brings every live set back
-//!   to its seed. FAIL-first, `flips`: the maps kept as the load built them
+//!   to its seed. `admit`: the history once more with the prompt calls'
+//!   streaming `admit` (`Body35::set_xstream`): the first call admits
+//!   experts on the wide arm's layers (none fails by name), keeps them (each
+//!   layer's live set its start set with the pick's admits swapped in, every
+//!   wide map the card copy's row), the second (a decode history before it)
+//!   returns each layer to its start set, and every call's logits and ids
+//!   hold as `flips` holds them. FAIL-first, `admit`: the layer's map not
+//!   brought to the pick (the map line and the logits read it), and the
+//!   places kept from the front's cut before the pick (the logits read it).
+//!   FAIL-first, `flips`: the maps kept as the load built them
 //!   (`PlacedSide::refresh_maps` returning at once) reads the map line red
 //!   (the first prompt's maps name the spares the machine emptied at its
 //!   start, the second's miss the admitted experts). Real tier only: the
@@ -302,7 +311,8 @@ mod gate {
         PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM,
     };
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::swap::{PassReport, Residency};
+    use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
+    use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
@@ -3172,6 +3182,23 @@ mod gate {
         rows: Vec<Vec<f32>>,
         landed: usize,
         stale: [Vec<usize>; 2],
+        /// Each prompt call's placement and streaming records.
+        calls: [Call; 2],
+    }
+
+    /// One prompt call of (e)'s history: every layer's live ids before it
+    /// and after it (none on a load with no machine), the flips its
+    /// boundary landed (the second call's: the steps' plans land there, so
+    /// its start set is `before` with that many experts swapped), and its
+    /// streaming picks, each with its walk, and its end (none unless it
+    /// streamed).
+    #[derive(Default)]
+    struct Call {
+        before: Vec<Vec<u32>>,
+        after: Vec<Vec<u32>>,
+        landed: usize,
+        picks: Vec<(usize, CallPick)>,
+        end: Option<CallReport>,
     }
 
     /// The step set's prompt ids (D1K): (e)'s two prompts' ids.
@@ -3237,6 +3264,25 @@ mod gate {
             .take_residency_passes())
     }
 
+    /// Every layer's live ids as the residency machine's ledger holds them
+    /// ([`residency_clauses::live_sets`]); none on a load with no machine.
+    fn e_live(s: &Session<Body35>) -> Result<Vec<Vec<u32>>, GateError> {
+        let placed = s
+            .model()
+            .body(NAME)?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?;
+        Ok(placed.hybrid().swap().map_or_else(Vec::new, |m| {
+            residency_clauses::live_sets(m, placed.hybrid().slots().layers())
+        }))
+    }
+
+    /// The prompt calls' host streaming from the next call on
+    /// (`Body35::set_xstream`).
+    fn e_stream(s: &mut Session<Body35>, mode: XMode) -> Result<(), GateError> {
+        Ok(s.model_mut().body_parts(NAME)?.2.set_xstream(mode)?)
+    }
+
     /// The layers whose wide map is not the card copy's row now.
     fn e_stale(s: &Session<Body35>) -> Result<Vec<usize>, GateError> {
         let m = s.model();
@@ -3269,9 +3315,28 @@ mod gate {
         s.clear()?;
         e_take(s)?;
         let mut seen = Seen::default();
-        let out = s.prompt(&ids[..E_P1], Want::Logits)?;
-        e_note(&mut seen, out)?;
-        seen.stale[0] = e_stale(s)?;
+        let prompt = |s: &mut Session<Body35>, seen: &mut Seen, i: usize, ids: &[u32]| {
+            let before = e_live(s)?;
+            let out = s.prompt(ids, Want::Logits)?;
+            e_note(seen, out)?;
+            seen.stale[i] = e_stale(s)?;
+            let (picks, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+            // The first call's boundary is the clear's quiet one, and its
+            // reports stay for the steps' count.
+            let landed = match i {
+                0 => 0,
+                _ => e_take(s)?.iter().map(|(_, r)| r.landed).sum(),
+            };
+            seen.calls[i] = Call {
+                before,
+                after: e_live(s)?,
+                landed,
+                picks,
+                end,
+            };
+            Ok::<(), GateError>(())
+        };
+        prompt(s, &mut seen, 0, &ids[..E_P1])?;
         let steps = |s: &mut Session<Body35>, seen: &mut Seen, n: usize| {
             for _ in 0..n {
                 let at = seen.tokens.len() - 1;
@@ -3283,9 +3348,7 @@ mod gate {
         };
         steps(s, &mut seen, E_STEPS1)?;
         seen.landed = e_take(s)?.iter().map(|(_, r)| r.landed).sum();
-        let out = s.prompt(&ids[E_P1..], Want::Logits)?;
-        e_note(&mut seen, out)?;
-        seen.stale[1] = e_stale(s)?;
+        prompt(s, &mut seen, 1, &ids[E_P1..])?;
         steps(s, &mut seen, E_STEPS2)?;
         e_take(s)?;
         Ok(seen)
@@ -3358,6 +3421,9 @@ mod gate {
     ///   same ids and logits bit for bit, and flips land.
     /// - `c7`: a residency reset after the history brings every layer's live
     ///   set back to its seed.
+    /// - `admit`: the history once more on the residency load with the
+    ///   prompt calls' streaming `admit` ([`e_admit`]), the lever off again
+    ///   after it.
     ///
     /// Real tier: this gate has no fixture conversion (`qwen35moe`'s fixture
     /// row is `self`).
@@ -3386,39 +3452,16 @@ mod gate {
         };
         let first = e_history(&mut on, &ids, Some(&off_seen.tokens))?;
         // `flips`
-        let dlogit = first
-            .rows
-            .iter()
-            .zip(&off_seen.rows)
-            .map(|(a, b)| e_distance(a, b))
-            .enumerate()
-            .fold((0usize, 0.0f64, 0.0f32), |w, (i, (rel, abs))| {
-                if rel > w.1 { (i, rel, abs) } else { w }
-            });
-        let rows_ok = first.rows.len() == off_seen.rows.len() && dlogit.1 <= FREE_BAND;
-        let parted = first
-            .tokens
-            .iter()
-            .zip(&off_seen.tokens)
-            .position(|(a, b)| a != b);
-        let near = match parted {
-            None => true,
-            Some(i) => e_margin(&first.rows[i])? < GREEDY_MARGIN,
-        };
+        let band = e_band(&first, &off_seen)?;
         let maps_ok = first.stale.iter().chain(&off_seen.stale).all(Vec::is_empty);
-        let flips = first.landed > 0 && maps_ok && rows_ok && near;
+        let flips = first.landed > 0 && maps_ok && band.ok();
         println!(
             "flips: {} flips landed before the second prompt (above 0); wide maps off the card \
-             copy's rows after the prompts: residency {:?} off {:?} (none); {} calls' logits \
-             within {FREE_BAND} of the off run's, relative: worst {:.3e} at call {} (largest \
-             single logit {:.3e}); greedy ids part at {parted:?} (equal or a near tie: {near}): {}",
+             copy's rows after the prompts: residency {:?} off {:?} (none); {}: {}",
             first.landed,
             first.stale,
             off_seen.stale,
-            first.rows.len(),
-            dlogit.1,
-            dlogit.0,
-            dlogit.2,
+            band.line(),
             verdict(flips)
         );
         // `c1`
@@ -3442,7 +3485,157 @@ mod gate {
                 .ok_or("the load runs no residency machine")?;
             residency_clauses::c7_clause(&r, machine, &seeds)
         };
-        Ok(flips && c1 && c7)
+        // `admit`
+        e_stream(&mut on, XMode::Admit)?;
+        let streamed = e_history(&mut on, &ids, Some(&off_seen.tokens));
+        e_stream(&mut on, XMode::Off)?;
+        let admit = e_admit(&streamed?, &off_seen)?;
+        Ok(flips && c1 && c7 && admit)
+    }
+
+    /// How a run's calls stand from the off run's: the call whose logits
+    /// row stands farthest ([`e_distance`]: its index, ‖Δ‖/‖off‖ and the
+    /// largest single |Δ|), whether every call has its row, where the greedy
+    /// ids first part and whether the run's top-1 margin there is a near tie
+    /// ([`GREEDY_MARGIN`]).
+    struct Band {
+        worst: (usize, f64, f32),
+        rows: usize,
+        same_len: bool,
+        parted: Option<usize>,
+        near: bool,
+    }
+
+    impl Band {
+        /// Every row within [`FREE_BAND`] of the off run's (relative), the
+        /// ids equal or parting at a near tie.
+        fn ok(&self) -> bool {
+            self.same_len && self.worst.1 <= FREE_BAND && self.near
+        }
+
+        fn line(&self) -> String {
+            format!(
+                "{} calls' logits within {FREE_BAND} of the off run's, relative: worst {:.3e} at \
+                 call {} (largest single logit {:.3e}); greedy ids part at {:?} (equal or a near \
+                 tie: {})",
+                self.rows, self.worst.1, self.worst.0, self.worst.2, self.parted, self.near
+            )
+        }
+    }
+
+    /// `run`'s calls against the off run's ([`Band`]).
+    fn e_band(run: &Seen, off: &Seen) -> Result<Band, GateError> {
+        let worst = run
+            .rows
+            .iter()
+            .zip(&off.rows)
+            .map(|(a, b)| e_distance(a, b))
+            .enumerate()
+            .fold((0usize, 0.0f64, 0.0f32), |w, (i, (rel, abs))| {
+                if rel > w.1 { (i, rel, abs) } else { w }
+            });
+        let parted = run.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
+        let near = match parted {
+            None => true,
+            Some(i) => e_margin(&run.rows[i])? < GREEDY_MARGIN,
+        };
+        Ok(Band {
+            worst,
+            rows: run.rows.len(),
+            same_len: run.rows.len() == off.rows.len(),
+            parted,
+            near,
+        })
+    }
+
+    /// `admit`'s verdict on (e)'s history run with the prompt calls'
+    /// streaming `admit` (`streamed`) against the off run's:
+    /// - the first call (from a clear: no decode history, its placement
+    ///   kept) admitted experts on the wide arm's layers (a call that admits
+    ///   none fails by name, not vacuously), its end kept, and each layer's
+    ///   live set after it its start set with as many experts swapped as the
+    ///   layer's pick admitted (one walk: one pick a layer), every wide map
+    ///   the card copy's row after it;
+    /// - the second call (after the steps' decode history) ended returned,
+    ///   each layer's live set after it its start set: the one before it
+    ///   with the flips its boundary landed swapped in, one expert each;
+    /// - every call's logits row and greedy id as `flips` holds them
+    ///   ([`e_band`]).
+    fn e_admit(streamed: &Seen, off: &Seen) -> Result<bool, GateError> {
+        const _: () = assert!(E_P1 == PLACED_UBATCH && E_P1 >= Body35::STREAM_FLOOR as usize);
+        let [first, second] = &streamed.calls;
+        let admitted: usize = first.picks.iter().map(|(_, p)| p.admitted).sum();
+        if admitted == 0 {
+            println!(
+                "admit: the first call's {} picks admitted no expert, so the clause would hold \
+                 vacuously: {}",
+                first.picks.len(),
+                verdict(false)
+            );
+            return Ok(false);
+        }
+        let swapped = |l: usize| -> usize {
+            first
+                .picks
+                .iter()
+                .filter(|(_, p)| p.layer == l)
+                .map(|(_, p)| p.admitted)
+                .sum()
+        };
+        let layers_ok = first.before.len() == first.after.len()
+            && first.before.len() == second.before.len()
+            && !first.before.is_empty();
+        let kept_sets: Vec<usize> = first
+            .before
+            .iter()
+            .zip(&first.after)
+            .enumerate()
+            .filter(|(l, (b, a))| {
+                let out = b.iter().filter(|e| !a.contains(e)).count();
+                a.len() != b.len() || out != swapped(*l)
+            })
+            .map(|(l, _)| l)
+            .collect();
+        let resized: Vec<usize> = second
+            .before
+            .iter()
+            .zip(&second.after)
+            .enumerate()
+            .filter(|(_, (b, a))| b.len() != a.len())
+            .map(|(l, _)| l)
+            .collect();
+        let swapped_back: usize = second
+            .before
+            .iter()
+            .zip(&second.after)
+            .map(|(b, a)| b.iter().filter(|e| !a.contains(e)).count())
+            .sum();
+        let kept = first.end.as_ref().is_some_and(|e| e.kept);
+        let returned = second.end.as_ref().is_some_and(|e| !e.kept);
+        let band = e_band(streamed, off)?;
+        let ok = layers_ok
+            && kept
+            && returned
+            && kept_sets.is_empty()
+            && resized.is_empty()
+            && swapped_back == second.landed
+            && streamed.stale[0].is_empty()
+            && band.ok();
+        println!(
+            "admit: the first call admitted {admitted} experts over {} picks, its end kept {kept}, \
+             layers whose live set is not its start set with the pick's admits swapped in \
+             {kept_sets:?} (none), wide maps off the card copy's rows after it {:?} (none); the \
+             second call (a decode history before it) ended returned {returned} ({} restored), \
+             experts out of the live sets across it {swapped_back} (the {} flips its boundary \
+             landed), layers whose live count moved {resized:?} (none); {}: {}",
+            first.picks.len(),
+            streamed.stale[0],
+            second.end.as_ref().map_or(0, |e| e.restored),
+            second.landed,
+            band.line(),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// The batch set's manifest and its five tokens.

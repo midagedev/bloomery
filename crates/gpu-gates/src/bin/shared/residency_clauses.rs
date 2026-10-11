@@ -494,3 +494,24 @@ pub fn rule_after<B: Prompt + Keep>(
     take_passes(s)?;
     Ok(rule)
 }
+
+/// Every layer of `layers` with its live ids, ascending, as `machine`'s
+/// ledger holds them: a placement to compare across a prompt call.
+pub fn live_sets(machine: &SwapMachine, layers: impl Iterator<Item = usize>) -> Vec<Vec<u32>> {
+    layers
+        .map(|l| {
+            let mut live: Vec<u32> = machine
+                .ledger()
+                .row(l)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|st| match st {
+                    SlotState::Live(e) => Some(*e),
+                    _ => None,
+                })
+                .collect();
+            live.sort_unstable();
+            live
+        })
+        .collect()
+}
