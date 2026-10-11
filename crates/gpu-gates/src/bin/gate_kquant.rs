@@ -87,8 +87,8 @@
 //!     the card that is not `HOST` raises `ExpertId` in the quantizer (its
 //!     column not read) and in the card sum (its token NaN), a `HOST` place
 //!     in neither, each launch alone over NaN host columns; the launchers
-//!     refuse a card of no expert, weights at a pitch of ten, columns past the
-//!     scratch and a slot past the weights.
+//!     refuse weights at a pitch of ten, the quantizer a card of no expert,
+//!     columns past the scratch and a slot past the weights.
 //! 11. q8_0_sel32: the Q8_0 down `_sel` of 32-value blocks
 //!     (`bloomery_gpu::q8_0_sel32`, the file's `block_q8_0` bytes resident as
 //!     one word stream) over clause 7's seven experts and ten slots, at the
@@ -2462,21 +2462,18 @@ mod gate {
         let sink = c.gpu.unlabelled_sink();
         let slots = SEL38.len();
         let w10 = DeviceBuffer::from_host(stream, &[0.5f32; M38 * SLOTS])?;
-        let mut r_acc = Vec::with_capacity(2);
-        for (w, n_card) in [(&leg.w, 0), (&w10, E38)] {
-            let a = CardAcc {
-                down: &leg.y_down,
-                w,
-                sel: &leg.sel,
-                n: N38,
-                m: M38,
-                n_card,
-                n_used: SLOTS,
-                w_pitch: W_PITCH,
-                fault: sink,
-            };
-            r_acc.push(leg.slots.enqueue_card_acc(stream, &a, &mut leg.acc));
-        }
+        let a = CardAcc {
+            down: &leg.y_down,
+            w: &w10,
+            sel: &leg.sel,
+            n: N38,
+            m: M38,
+            n_card: E38,
+            n_used: SLOTS,
+            w_pitch: W_PITCH,
+            fault: sink,
+        };
+        let r_pitch10 = leg.slots.enqueue_card_acc(stream, &a, &mut leg.acc);
         let mut r_quant = Vec::with_capacity(2);
         for (cols, n_card) in [(0..slots, 0), (1..slots + 1, E38)] {
             let q = QuantSel {
@@ -2506,14 +2503,14 @@ mod gate {
                 y: &mut leg.y,
             },
         );
-        let [r_card0, r_pitch10]: [Result<(), GpuError>; 2] = r_acc
-            .try_into()
-            .map_err(|_| "gate_kquant: two card-sum cases")?;
         let [r_quant_card0, r_quant_past]: [Result<(), GpuError>; 2] = r_quant
             .try_into()
             .map_err(|_| "gate_kquant: two quantizer cases")?;
-        let cases: [(&str, &str, Result<(), GpuError>); 5] = [
-            ("ds41_ffn_card_acc_10", "a_card_of_no_expert", r_card0),
+        // PIN(2026-10-11): the card sum's "a card of no expert" refusal left with
+        // Qwen3.8's own launcher: the common sum serves a card of no expert as
+        // zeros (V4.1's layers with no card experts), and card_slots.rs's hw
+        // test holds that; Qwen3.8 keeps `q38_shared_add` for such a layer.
+        let cases: [(&str, &str, Result<(), GpuError>); 4] = [
             (
                 "ds41_ffn_card_acc_10",
                 "weights_at_a_pitch_of_10",

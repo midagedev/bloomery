@@ -515,7 +515,8 @@ impl CardSlotKernels {
     /// Enqueue the card sums of `a.m` tokens of `a.n_used` slots
     /// (`ds41_ffn_card_acc` for 6, `_8` for 8, `_10` for 10; any other count
     /// is refused by name): value `i` of token `t = i / a.n` into `acc[i]`,
-    /// the card half of the combine. A card of no expert, a weights pitch
+    /// the card half of the combine; a card of no expert (`a.n_card` 0, every
+    /// place [`HOST`]) sums to zeros. No value or token, a weights pitch
     /// under the slot count, and buffers short of `a.m` tokens are refused by
     /// name, nothing launched. A place in `[a.n_card, HOST)` raises
     /// [`FaultSite::ExpertId`] on `a.fault`. One launch. Asynchronous,
@@ -529,13 +530,13 @@ impl CardSlotKernels {
         let slots = CardSlots::of(a.n_used).ok_or_else(|| CardSlots::refusal(a.n_used))?;
         let what = slots.entry();
         let (nm, k) = (a.n * a.m, slots.n());
-        if nm == 0 || a.n_card == 0 || a.w_pitch < k {
+        if nm == 0 || a.w_pitch < k {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "{} values of {} tokens over a card of {} experts, weights at a pitch of {} \
-                     for {k} slots: at least one of each, and a pitch of the slot count or more",
-                    a.n, a.m, a.n_card, a.w_pitch
+                    "{} values of {} tokens, weights at a pitch of {} for {k} slots: a value and a \
+                     token, and a pitch of the slot count or more",
+                    a.n, a.m, a.w_pitch
                 ),
             ));
         }
@@ -609,8 +610,9 @@ mod tests {
     /// `runtime::combine::card_sum`'s and raises nothing; a place in
     /// `[n_card, HOST)` — the first past the card and the last before the
     /// host — raises [`FaultSite::ExpertId`] alone, at the launch's layer,
-    /// and its token's values are NaN, the other tokens' the rule's. Every
-    /// case is judged and printed before the test fails.
+    /// and its token's values are NaN, the other tokens' the rule's. A card
+    /// of no expert sums to zeros with nothing raised. Every case is judged
+    /// and printed before the test fails.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_place_between_the_card_and_the_host_faults_the_sum() {
@@ -724,6 +726,38 @@ mod tests {
                 if !pass {
                     red.push(format!("{n_used} slots, stray {stray:?}"));
                 }
+            }
+        }
+        // A card of no expert: every place is the host's, and the sum is
+        // zeros with nothing raised.
+        for n_used in [SLOTS_6, SLOTS_8, SLOTS_10] {
+            let sel = DeviceBuffer::from_host(stream, &vec![HOST; M * n_used]).expect("sel");
+            let z = DeviceBuffer::from_host(stream, &vec![f32::NAN; M * n_used * N]).expect("z");
+            let mut acc = DeviceBuffer::from_host(stream, &[1.0f32; N * M]).expect("acc");
+            let a = CardAcc {
+                down: &z,
+                w: &z,
+                sel: &sel,
+                n: N,
+                m: M,
+                n_card: 0,
+                n_used,
+                w_pitch: n_used,
+                fault: gpu.layer_sink(LAYER).expect("a sink"),
+            };
+            kernels
+                .enqueue_card_acc(stream, &a, &mut acc)
+                .expect("the card sum of a card of no expert");
+            let got = acc.to_host_vec(stream).expect("sums");
+            stream.synchronize().expect("sync");
+            let fault = gpu.take_fault().expect("the fault word");
+            let pass = fault.is_none() && got.iter().all(|v| v.to_bits() == 0);
+            println!(
+                "card_acc of {n_used} slots over a card of no expert: zeros, fault {fault:?}: {}",
+                if pass { "PASS" } else { "FAIL" }
+            );
+            if !pass {
+                red.push(format!("{n_used} slots, no card"));
             }
         }
         assert!(red.is_empty(), "red cases: {red:?}");
