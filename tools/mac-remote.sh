@@ -248,7 +248,12 @@ exit 0
 
 CHECKOUT='{
 exec < /dev/null
-cd "$HOME/'"$RBASE"'/$1" && git checkout -q -f --detach "$2"
+cd "$HOME/'"$RBASE"'/$1" || exit $?
+# The last run'"'"'s rsync (-p) chmods every file it compares, so an unchanged file'"'"'s ctime moves past the index'"'"'s whenever
+# that rsync ran a second or more after the checkout (a loaded remote); `checkout -f` compares stat data only and would
+# rewrite those files, and cargo rebuilds what they feed. The refresh re-reads the content of a stat-dirty file first.
+git update-index -q --refresh > /dev/null 2>&1
+git checkout -q -f --detach "$2"
 exit $?
 }'
 
@@ -682,7 +687,10 @@ STUB
   [ -d "$rt/.git" ] || fail "the remote clone has no .git directory"
   [ ! -d "$rh/repo/bloomery-mr/.lock-tree-one" ] || fail "the lock outlived the run"
   [ "$(tail -1 "$fake/.cache/bloomery/mac-static-ledger.tsv" | cut -f4)" = tree-one@remote ] || fail "the pulled ledger line has no @remote tree"
-  # uncommitted edits arrive, a deleted file goes, an unchanged file keeps its mtime, a repeated key is not appended twice
+  # uncommitted edits arrive, a deleted file goes, an unchanged file keeps its mtime, a repeated key is not appended twice.
+  # The touch (mtime kept, ctime moved) is the first run's rsync (-p) reaching the file a second after the checkout,
+  # as on a loaded remote: the file's ctime then differs from the index's, and a bare `checkout -f` rewrote it.
+  sleep 1; touch -m -r "$rt/rust-toolchain.toml" "$rt/rust-toolchain.toml"
   rt0=$(stat -f %m "$rt/rust-toolchain.toml")
   sleep 1
   printf 'edit\n' >> "$repo/sub/f"; rm "$repo/sub/g"; printf 'new\n' > "$repo/new.txt"
