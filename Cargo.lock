@@ -89,6 +89,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-jinja",
  "bloomery-tokenizer",
+ "bloomery-vision",
  "matrixmultiply",
  "serde_json",
  "thiserror",

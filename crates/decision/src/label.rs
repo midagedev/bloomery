@@ -298,9 +298,16 @@ impl LabelModel {
         self.width
     }
 
-    /// The questions of `req`, planned. A question with more options than the model has labels is
-    /// refused by name.
+    /// The questions of `req`, planned. A request that carries images is refused ([`Error::NotSupported`]:
+    /// the label model reads text only), and so is a question with more options than the model has
+    /// labels, each by name.
     pub fn plan(&self, req: &Request) -> Result<Vec<Asked>, Error> {
+        if !req.images.is_empty() {
+            return Err(Error::NotSupported(
+                "image input is not supported by this model (the label model reads text only)"
+                    .into(),
+            ));
+        }
         let p = &self.policy;
         let mut out = Vec::with_capacity(req.questions.len());
         for (i, q) in req.questions.iter().enumerate() {

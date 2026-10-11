@@ -66,6 +66,23 @@ pub enum Error {
     },
     #[error("schema requires {fixed} tokens before state; maximum is {max}")]
     SchemaTooLong { fixed: usize, max: usize },
+    /// The request's own text carries an image placeholder: the prompt holds more of them than the
+    /// request has images.
+    #[error(
+        "the prompt holds {placeholders} image placeholder(s) for {images} image(s): one typed into the text pairs with no image; send an image as `images` or an `image_url` part"
+    )]
+    PlaceholderInText { placeholders: usize, images: usize },
+    /// The images alone, without the schema or the state, pass the encoder's length.
+    #[error("{images} image(s) take {media} tokens; maximum is {max}")]
+    ImagesTooLong {
+        images: usize,
+        media: usize,
+        max: usize,
+    },
+    /// The image part of an encode, not the request's fault: token counts that do not pair with the
+    /// images, an image with none, or a tokenizer that does not read the placeholder as Clef's.
+    #[error("images: {0}")]
+    Images(String),
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
     #[error("safetensors: {0}")]
