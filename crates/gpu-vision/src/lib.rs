@@ -28,14 +28,15 @@
 //!   (`vis_attn`) and heads of 72 (`vis_attn_h72`).
 //! * [`rope2d`] — the 2D rotary embedding of the query and key heads and its angle tables:
 //!   heads of 64 (`vis_rope2d`) and heads of 72 (`vis_rope2d_h72`).
-//! * [`norm`] — RMSNorm over bf16 rows with f32 gains.
+//! * [`norm`] — RMSNorm over bf16 rows with f32 gains, whole rows or the heads of a segment.
 //! * [`layer_norm`] — LayerNorm with gain and bias.
-//! * [`mlp`] — the SiLU gate between V4.1's MLP linears.
-//! * [`gelu_tanh`] — the tanh GELU of the Qwen3-VL tower, in place.
+//! * [`mlp`] — the SiLU gate between the ViT MLPs' linears, with an optional clamp.
+//! * [`gelu_tanh`] — the GELU of the Qwen3-VL tower (tanh) and the `glm5v` merger (erf), in place.
 //! * [`pos_bilinear`] — the Qwen3-VL tower's learned position rows resized to the image's grid.
 //! * [`aligner`] — the 3×3 unfold of V4.1's ViT grid into the aligner's input rows.
 //! * [`chain`] — what both chains share: weight reading, taps, the rows an encode returns.
-//! * [`encoder`], [`qwen3vl`] — each tower's weights on the card and whole chain.
+//! * [`encoder`], [`qwen3vl`], [`glm5v`] — each tower's weights on the card and whole chain; the
+//!   `glm5v` tower (GLM-5.3-Flash's mmproj) has no projector arm in [`open`] yet.
 //!
 //! Like `bloomery-gpu`, this crate is built with `cargo oxide` only.
 
@@ -45,6 +46,7 @@ pub mod chain;
 pub mod encoder;
 pub mod gelu_tanh;
 pub mod gemm_bf16;
+pub mod glm5v;
 pub mod layer_norm;
 pub mod mlp;
 pub mod norm;
