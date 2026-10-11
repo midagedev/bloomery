@@ -122,6 +122,8 @@ dispatch=(
   # The same crate's second tower (the Qwen3-VL merger of Clef, Qwen3.6 and Qwen3.8) reads its file's
   # names and hyperparameters, and `open` is the one place that maps a file's projector type to a tower.
   'crates/gpu-vision/src/qwen3vl.rs use'
+  # The glm5v tower (GLM-5.3-Flash's mmproj) reads its file's names, hyperparameters, card figure and host rules the same way.
+  'crates/gpu-vision/src/glm5v.rs use'
   'crates/gpu-vision/src/lib.rs use'
   'crates/gpu-vision/src/lib.rs fn open'
   # The V4.1 media span's one owner (ds41_media, the media gate and the serve seat share it):
