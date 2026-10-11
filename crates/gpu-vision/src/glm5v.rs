@@ -192,6 +192,21 @@ pub struct Encoder {
     stream: Arc<CudaStream>,
 }
 
+impl crate::Tower for Encoder {
+    fn encode(&mut self, patches: &Patches) -> Result<Encoded<'_>, GpuError> {
+        Encoder::encode(self, patches)
+    }
+    fn out_dim(&self) -> usize {
+        self.hparams().out_dim
+    }
+    fn weight_bytes(&self) -> u64 {
+        Encoder::weight_bytes(self)
+    }
+    fn scratch_bytes(&self) -> u64 {
+        Encoder::scratch_bytes(self)
+    }
+}
+
 fn err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static) -> GpuError {
     GpuError::plan(what, e)
 }
