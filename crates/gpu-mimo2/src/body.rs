@@ -49,7 +49,7 @@ use bloomery_gpu_deepseek41::experts::ExpertKernels;
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::{GgmlType, Split};
+use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::names;
 use model::arch::mimo2::place::PlanInputs;
@@ -246,8 +246,8 @@ impl Scratch {
     }
 }
 
-/// The token embedding as the host reads it: the shared table's q8_0 rows,
-/// one dequantized per step.
+/// The token embedding as the host reads it: the shared table's rows of a
+/// type [`EmbedTable`] reads, one dequantized per step.
 struct Embedding {
     table: EmbedTable,
     row: Vec<f32>,
@@ -257,13 +257,6 @@ impl Embedding {
     fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
         let name = names::token_embd();
         let table = EmbedTable::new(file, &name, n_embd)?;
-        if table.ty() != GgmlType::Q8_0 {
-            return Err(GpuError::Tensor {
-                what: WHAT,
-                name,
-                need: "q8_0 rows of embedding_length values",
-            });
-        }
         Ok(Embedding {
             table,
             row: vec![0.0; n_embd],

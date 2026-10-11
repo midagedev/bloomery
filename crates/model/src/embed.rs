@@ -140,9 +140,17 @@ pub struct EmbedTable {
 
 impl EmbedTable {
     /// The tensor `name` of `file` as a table of rows `n_embd` values wide,
-    /// refused as [`RowLayout::open`] refuses it.
+    /// refused as [`RowLayout::open`] refuses it, and by name when its type
+    /// is one [`dequant_row`] does not decode (`GgmlType::has_dequant`, the
+    /// set a coverage pin of a body that reads this table holds too).
     pub fn new(file: Arc<Split>, name: &str, n_embd: usize) -> Result<EmbedTable, ModelError> {
         let layout = RowLayout::open(&file, name, n_embd)?;
+        if !layout.ty().has_dequant() {
+            return Err(layout.refuse(format!(
+                "is {ty}, whose rows the host reader does not decode",
+                ty = layout.ty()
+            )));
+        }
         Ok(EmbedTable { file, layout })
     }
 
@@ -207,14 +215,32 @@ mod tests {
     /// be whole `dims[1]` rows, so the table's own refusal has a case to
     /// refuse.
     fn opened(want: &str, dims: &[u64], n_embd: usize) -> Result<EmbedTable, ModelError> {
+        opened_as(8, want, dims, n_embd)
+    }
+
+    /// [`opened`] for a file whose tensor is of ggml type `type_id`: its
+    /// bytes are `row_of` rows for q8_0 and zeros for any other type, whose
+    /// blocks the test never decodes.
+    fn opened_as(
+        type_id: u32,
+        want: &str,
+        dims: &[u64],
+        n_embd: usize,
+    ) -> Result<EmbedTable, ModelError> {
         use std::sync::atomic::{AtomicU32, Ordering};
         // One directory a call: the tests run in parallel, and two calls of
         // one shape would otherwise empty each other's directory.
         static CALL: AtomicU32 = AtomicU32::new(0);
-        let nbytes = ROW * (dims[0] / 32) * dims[1..].iter().product::<u64>();
+        let ty = GgmlType::from_u32(type_id);
+        let (blck, tsz) = (ty.blck_size().unwrap(), ty.type_size().unwrap());
+        let nbytes = tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>();
         let mut bytes = Vec::with_capacity(nbytes as usize);
-        for t in 0..nbytes / ROW {
-            bytes.extend(row_of(t as usize));
+        if ty == GgmlType::Q8_0 {
+            for t in 0..nbytes / ROW {
+                bytes.extend(row_of(t as usize));
+            }
+        } else {
+            bytes.resize(nbytes as usize, 0);
         }
         let dir = std::env::temp_dir().join(format!(
             "model-embed-{}-{}",
@@ -226,7 +252,7 @@ mod tests {
         let decl = TensorDecl {
             name: NAME.to_string(),
             dims: dims.to_vec(),
-            type_id: 8, // q8_0
+            type_id,
             nbytes,
         };
         let layout = Layout::new(
@@ -319,6 +345,35 @@ mod tests {
             e.contains("output.weight") && e.contains("not in the file"),
             "{e:?}"
         );
+    }
+
+    /// The table opens the types `dequant_row` decodes, named here, and
+    /// refuses a file whose type it does not decode by name, tensor and type.
+    #[test]
+    fn a_type_the_host_reader_does_not_decode_is_refused_by_name() {
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::F16,
+            GgmlType::IQ4_XS,
+        ] {
+            assert!(ty.has_dequant(), "{ty}");
+        }
+        for type_id in [16u32, 19, 22] {
+            let ty = GgmlType::from_u32(type_id);
+            assert!(!ty.has_dequant(), "{ty}");
+            let Err(e) = opened_as(type_id, NAME, &[256, 2], 256) else {
+                panic!("a {ty} table opens");
+            };
+            let e = e.to_string();
+            assert!(
+                e.contains(NAME) && e.contains(&format!("is {ty}, whose rows the host reader")),
+                "{e:?}"
+            );
+        }
     }
 
     /// A first dimension other than the width is refused by name.
