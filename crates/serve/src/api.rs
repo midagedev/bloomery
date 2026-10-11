@@ -1382,6 +1382,70 @@ fn unserved_samplers(o: &Map<String, Value>) -> Result<(), ApiError> {
     }
 }
 
+/// The order this server samples in, by llama-server's sampler names; `/props`
+/// and `generation_settings` report it.
+const SAMPLERS: [&str; 5] = ["penalties", "top_k", "top_p", "min_p", "temperature"];
+
+/// A request's `samplers`, which llama-server reads as the order its samplers
+/// run in: an array of names (any ASCII case; its aliases `top-k`, `topk`, `nucleus`,
+/// `temp`, `typ` and the like) or a string of one character a sampler. This
+/// server runs one order, [`SAMPLERS`], so only that order is taken; another
+/// order, a name or character no sampler has (llama-server skips those with a
+/// warning), or a sampler this server lacks is a 400 naming `samplers`. `null`
+/// is unset.
+fn sampler_order(o: &Map<String, Value>) -> Result<(), ApiError> {
+    const NAMES: [(&str, char); 11] = [
+        ("dry", 'd'),
+        ("top_k", 'k'),
+        ("typ_p", 'y'),
+        ("top_p", 'p'),
+        ("top_n_sigma", 's'),
+        ("min_p", 'm'),
+        ("temperature", 't'),
+        ("xtc", 'x'),
+        ("infill", 'i'),
+        ("penalties", 'e'),
+        ("adaptive_p", 'a'),
+    ];
+    let by_name = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        let alias = match name.as_str() {
+            "nucleus" => "top_p",
+            "temp" => "temperature",
+            "typ" => "typ_p",
+            other => other,
+        };
+        NAMES
+            .iter()
+            .map(|(canonical, _)| *canonical)
+            .find(|canonical| {
+                *canonical == alias
+                    || canonical.replace('_', "-") == alias
+                    || canonical.replace('_', "") == alias
+            })
+    };
+    let by_char = |c: char| NAMES.iter().find(|(_, x)| *x == c).map(|(name, _)| *name);
+    let order: Option<Vec<&str>> = match o.get("samplers") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(a)) => a.iter().map(|x| x.as_str().and_then(by_name)).collect(),
+        Some(Value::String(s)) => s.chars().map(by_char).collect(),
+        Some(v) => {
+            return Err(wrong_type(
+                "samplers",
+                "an array of sampler names or a string of sampler characters",
+                v,
+            ));
+        }
+    };
+    if order.as_deref() == Some(&SAMPLERS[..]) {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "samplers must be this server's order {SAMPLERS:?} (or \"ekpmt\"), not {}",
+        o["samplers"]
+    )))
+}
+
 /// Knobs shared by both generation endpoints. The token limit is the first set
 /// of `n_predict`, `max_completion_tokens` and `max_tokens`, llama-server's
 /// order on both routes (`n_predict` first, the OpenAI names its aliases in that
@@ -1396,8 +1460,9 @@ fn unserved_samplers(o: &Map<String, Value>) -> Result<(), ApiError> {
 /// non-empty `grammar`, `logprobs` other than `false` (a bool, or OpenAI's text
 /// completion count), `top_logprobs > 0`, `n > 1`, `tool_choice` other than
 /// `"none"` or `"auto"` (nothing forces a call without a grammar), a non-empty
-/// `logit_bias`, and the samplers [`unserved_samplers`] names. `null` counts as
-/// absent. Other unknown fields are ignored. The two routes whose answers render
+/// `logit_bias`, the samplers [`unserved_samplers`] names, and a `samplers` other
+/// than this server's order ([`sampler_order`]). `null` counts as absent. Other
+/// unknown fields are ignored. The two routes whose answers render
 /// probabilities take their fields out of the body before this runs
 /// ([`completion_plan_logprobs`], [`chat_plan_logprobs`]); every other route
 /// keeps the refusal.
@@ -1453,6 +1518,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         return Err(invalid(format!("{field} is not supported by this server")));
     }
     unserved_samplers(o)?;
+    sampler_order(o)?;
     let d = SamplingParams::default();
     let seed = match get_i(o, "seed")? {
         Some(s) if s >= 0 => s as u64,
@@ -1622,7 +1688,7 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
         "n_probs": p.logprobs.as_ref().map_or(0, logprobs::Ask::asked),
         "min_keep": 0,
         "grammar": "",
-        "samplers": ["penalties", "top_k", "top_p", "min_p", "temperature"],
+        "samplers": SAMPLERS,
     });
     // The samplers [`unserved_samplers`] refuses, at llama-server's off values
     // (one `json!` over every key passes the macro's recursion limit).
@@ -4819,6 +4885,78 @@ mod tests {
             }
             Err(other) => panic!("not a template error: {other}"),
             Ok(_) => panic!("the bind served a template nothing renders"),
+        }
+    }
+
+    /// `samplers` is taken only in this server's order, by llama-server's
+    /// names, their aliases or its characters; another order, an unknown name
+    /// or character, or a sampler this server lacks is a 400 naming
+    /// `samplers`, on both routes.
+    #[test]
+    fn samplers_are_taken_only_in_this_servers_order() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let ask = |path: &str, samplers: &Value| {
+            let mut body = if path == "/completion" {
+                json!({"prompt": "ab", "n_predict": 1})
+            } else {
+                json!({"messages": [{"role": "user", "content": "ab"}], "max_tokens": 1})
+            };
+            body["samplers"] = samplers.clone();
+            roundtrip(addr, "POST", path, &body.to_string())
+        };
+        for path in ["/completion", "/v1/chat/completions"] {
+            for ok in [
+                json!(["penalties", "top_k", "top_p", "min_p", "temperature"]),
+                json!(["Penalties", "top-k", "nucleus", "minp", "temp"]),
+                json!("ekpmt"),
+                Value::Null,
+            ] {
+                let (status, text) = ask(path, &ok);
+                assert_eq!(status, 200, "{path} {ok}: {text}");
+            }
+            for bad in [
+                json!(["top_k", "penalties", "top_p", "min_p", "temperature"]),
+                json!([
+                    "penalties",
+                    "top_k",
+                    "top_p",
+                    "min_p",
+                    "temperature",
+                    "adaptive_p"
+                ]),
+                json!(["penalties", "top_k", "top_p", "min_p", "warmth"]),
+                json!([]),
+                json!("kpmte"),
+                json!("ekpmtz"),
+                json!(["penalties", 1, "top_p", "min_p", "temperature"]),
+                json!([
+                    "penalties",
+                    "penalties",
+                    "top_k",
+                    "top_p",
+                    "min_p",
+                    "temperature"
+                ]),
+                json!(["penalties", "top_\u{212A}", "top_p", "min_p", "temperature"]),
+                json!("EKPMT"),
+            ] {
+                let (status, text) = ask(path, &bad);
+                assert_eq!(status, 400, "{path} {bad}: {text}");
+                assert!(
+                    message_of(&text).starts_with("samplers must be this server's order"),
+                    "{path} {bad}: {text}"
+                );
+            }
+            let (status, text) = ask(path, &json!(5));
+            assert_eq!(status, 400, "{text}");
+            assert_eq!(
+                message_of(&text),
+                "samplers must be an array of sampler names or a string of sampler characters, \
+                 not a number"
+            );
         }
     }
 
