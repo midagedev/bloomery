@@ -1195,9 +1195,10 @@ mod tests {
     /// name, not taken for a block draft.
     #[test]
     fn a_draft_program_by_kind() {
+        use models::headpick::HeadSet;
         use models::{
-            Act, BlockDraft, DraftSpec, Ffn, Gqa, HcKind, HcSpec, HeadRows, LayerSpec, Mixer,
-            MtpDraft, MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode,
+            Act, BlockDraft, DraftSpec, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, MtpDraft,
+            MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode,
         };
         let block = BlockDraft {
             hidden: 64,
@@ -1251,7 +1252,7 @@ mod tests {
             hc: None,
             input: MtpInput::HeadRow,
             head_norm: MtpHeadNorm::Rms,
-            head_rows: HeadRows::Full,
+            head_rows: HeadSet::Full,
         }));
         let e = program(&mtp).unwrap_err();
         assert_eq!(e, NotBuilt { kind: "MTP" });

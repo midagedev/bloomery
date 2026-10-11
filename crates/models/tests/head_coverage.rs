@@ -10,8 +10,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use models::headpick::break_even;
+
 /// The directory the model crate keeps its built-in row lists in, and the one it ships (`head_list.rs`'s
-/// `SHIPPED_PATH`). The paths are whole literals so that `just affected` selects this gate for a change to them.
+/// `SHIPPED.path`). The paths are whole literals so that `just affected` selects this gate for a change to them.
 const LIST_DIR: &str = "../../crates/model/data";
 const SHIPPED_LIST: &str = "../../crates/model/data/mtp-head-rows-qwen38-cjk-76000.txt";
 
@@ -35,47 +37,6 @@ const SETS: &[&str] = &[
 
 /// The inputs of the build that picked the shipped list, one `<source> <first row> <last row>` a line.
 const BUILD_SOURCES: &str = "build-sources.txt";
-
-/// A window walks the head three times, each walk reading every row of the list once.
-const WALKS: f64 = 3.0;
-
-/// A row of the Q8_0 `output`: 2,560 code bytes and 160 scale bytes.
-const ROW_BYTES: f64 = 2_720.0;
-
-/// PIN(2026-10-11): the head's read rate on the A6000, the top of its measured 579-701 GB/s, which saves the fewest
-/// ms a window and so gives the lowest break-even.
-const HEAD_GB_PER_S: f64 = 701.0;
-
-/// PIN(2026-10-11): the full head's window at P 512 on the A6000, ms.
-const WINDOW_MS: f64 = 37.43;
-
-/// PIN(2026-10-11): the windows of docs/cards/q38head2-ab.card at P 512 by draft positions kept, 0 to 3 (26 windows).
-const KEPT: [f64; 4] = [0.0, 3.0, 2.0, 21.0];
-
-/// The miss rate q at which a list of `rows` of a `vocab`-token head stops beating the full head: the accepted
-/// positions a window, AL(q) = 1 + sum_j A_j (1 - q)^j with A_j the share of windows keeping j or more draft
-/// positions (KEPT), fall by the fraction of the window the list saves, AL(q) / AL(0) = 1 - S / T, with S the ms the
-/// unread rows save (WALKS x the rows not in the list x ROW_BYTES at HEAD_GB_PER_S) and T the window [derived].
-fn break_even(rows: usize, vocab: usize) -> f64 {
-    let saved_ms = WALKS * (vocab - rows) as f64 * ROW_BYTES / (HEAD_GB_PER_S * 1e9) * 1e3;
-    let windows: f64 = KEPT.iter().sum();
-    let al = |q: f64| {
-        1.0 + (1..KEPT.len())
-            .map(|j| KEPT[j..].iter().sum::<f64>() / windows * (1.0 - q).powi(j as i32))
-            .sum::<f64>()
-    };
-    let target = al(0.0) * (1.0 - saved_ms / WINDOW_MS);
-    let (mut lo, mut hi) = (0.0, 1.0);
-    for _ in 0..60 {
-        let mid = 0.5 * (lo + hi);
-        if al(mid) > target {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
 
 /// Fewer ids than this is a set cut down, not a measurement.
 const MIN_IDS: usize = 20_000;
