@@ -134,7 +134,7 @@
 #      trees — no list lives here); this runner calls it once a batch, over the recipes of `self` families that kinds 1 and 2 leave
 #      (the `self` rows come from the same parse of the table), and a call that fails or answers unreadably is a named error with
 #      nothing run, never a recipe placed. A recipe of a family with a fixture directory is never real-file: a refusal there is a
-#      fixture-conversion gap and stays a red. The kinds are checked in that order. In the real tier no kind places anything: the
+#      fixture-conversion gap and stays a red. The kinds are checked in that order. In the real tier none of these three places anything: the
 #      recipe is placed by its groups and calls as without them. In the fixture tier a deferred item gets no lane, no ledger key, no
 #      claim and no times row, and the batch never calls the recipe, so it is never a run on the fixture and never a red. Its run.log
 #      line is `<item> rc=deferred <real-only|no-fixture|real-file> lane=- deferred=1`, the dry run names it (`lane -`), and the batch
@@ -155,6 +155,18 @@
 #      in no lane, never run and never red, written to DIR/deferred.list in the --list format so a `--tier fixture` batch takes
 #      exactly that set. Its run.log line is `<item> rc=deferred variant lane=- deferred=1` and the DONE line counts `deferred=` (an
 #      item counts one) and `variant=<n>` beside `deferred_list=<path>`.
+#   fixture-only (the real tier; class D, the mirror of real-only): a recipe whose gate has sets on the fixture tier only (no real file or
+#      real-tier set exists for it yet). Its box command opens with `bash tools/ref/fixture-only.sh <its own name> && …` (every box.sh
+#      command of the recipe does), and that call is the whole declaration, read from the recipe's text as real-only's is: the box command
+#      runs the same script (it stops a run by hand under BLOOMERY_TIER=real, or none, by name, exit 66, before a build or a lock). A recipe
+#      whose closure holds such a call is fixture-only too. In the real tier it is deferred as a variant item is (kind `fixture-only`): in no
+#      lane, never called, never red. Its run.log line is `<item> rc=deferred fixture-only lane=- deferred=1`, it joins DIR/deferred.list
+#      (a `--tier fixture` batch takes exactly that set) and the DONE line counts `deferred=<n>` (an item counts one) and
+#      `fixture_only=<n>`, beside `variant=<n>` and `deferred_list=<path>`. In the fixture tier it is placed by its groups and calls as
+#      without the call. Named errors, wherever the recipe sits, as real-only's: a call that names another recipe, a box.sh command of the
+#      recipe that does not open with its call (or a call outside one), a missing script, a recipe that is both real-only and
+#      fixture-only (in its own text or through its closure: no tier would run it) and one that is also solo-real (a real-tier placement it
+#      never uses).
 #   --tier real|fixture (default real; BLOOMERY_TIER in the environment names the same, and the two must agree): the tier
 #      the batch runs in, passed to every item as BLOOMERY_TIER=fixture in its BLOOMERY_BOX_ENV — tools/box.sh resolves each
 #      item's model file from it (the family's fixture, tools/ref/ref-paths.sh); a family with none is a deferred item (above,
@@ -241,8 +253,8 @@
 # defaults=<n> …` (the predicted sums, derived from the times file), then gets `<recipe>[-<n>] rc=<n>
 # <s>s try=<t> lane=<A|B|X>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
 # times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> wall=<s>s laneA=<s>s laneB=<s>s`
-# (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). A fixture batch's deferred item has
-# its own line (`<item> rc=deferred <real-only|no-fixture|real-file> lane=- deferred=1`), counted in `total=` and in no other rc class; a
+# (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). A deferred item has
+# its own line (`<item> rc=deferred <real-only|no-fixture|real-file|variant|fixture-only> lane=- deferred=1`), counted in `total=` and in no other rc class; a
 # yielded item (`rc=yield`, above) is counted the same way, in `yielded=` when any did. Exit 0
 # iff every rc is 0 (or deferred, yielded, or a ledger skip). DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
@@ -706,6 +718,18 @@ ro-chain: ro-any
 ro-glm:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh ro-glm && bash tools/gpu-gate.sh xr'
 
+# The fixture-only class, real-only's mirror: a call that opens the box command and names the recipe. qwen4exp and deepseek41 have a
+# fixture directory in the fake table below, so the fixture tier places these (a family with none would be deferred there as no-fixture).
+fo-any:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/fixture-only.sh fo-any && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_fo'
+
+[group('solo')]
+[group('v41-load')]
+fo-solo:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/fixture-only.sh fo-solo && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh gen_fs'
+
+fo-chain: fo-any
+
 [group('solo-real')]
 sr-a6000:
     BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/gpu-gate.sh gen_sa --place a'
@@ -808,6 +832,7 @@ x-v41	-	1000
 x-none	-	1000
 x-v41b	-	1000
 ro-solo	-	1000
+fo-solo	-	1000
 sr-a6000	-	1000
 sr-arm	-	1000
 gate-gpu-glm5next-e2e	-	1000
@@ -829,6 +854,7 @@ RT
   cp "$(dirname "$self")/gpu-gate.sh" "$t/tools/gpu-gate.sh"
   cp "$(dirname "$self")/ref/lease-probe.sh" "$t/tools/ref/lease-probe.sh"
   cp "$(dirname "$self")/ref/real-only.sh" "$t/tools/ref/real-only.sh"
+  cp "$(dirname "$self")/ref/fixture-only.sh" "$t/tools/ref/fixture-only.sh"
   cat > "$t/tools/ref/ref-paths.sh" << 'RP'
 : "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
 case "${BLOOMERY_TIER:-real}" in
@@ -1876,6 +1902,55 @@ FP
   rc_ok 'real-only run: the real tier runs the recipe' ro-real 1
   want_row '  … through its box call' "$t/fake-state/box.log" '$2 ~ /gen_ro$/'
   want_not '  … and its DONE line has no real_only=' "$t/target/c-ro-real/run.log" '^DONE .*real_only='
+  # fixture-only (the header's paragraph): real-only's mirror — a no-op in the fixture tier, a deferral in the real tier, never a lane, a key or a call.
+  # fxonly:begin A
+  check 'fixture-only: in the fixture tier the recipe is placed by its calls, as without the call' 0 \
+    '^fo-any	F	balanced	3090,a6000	fo-any: fixture-only call; fo-any: gpu-gate.sh any' "${gb[@]}" --tier fixture --classes
+  check '  … and a solo recipe stays alone' 0 '^fo-solo	X	solo	3090	' "${gb[@]}" --tier fixture --classes
+  check 'fixture-only: in the real tier the recipe is deferred, in no lane' 0 '^fo-any	D	fixture-only	-	fo-any: fixture-only call' "${gb[@]}" --classes
+  check '  … a solo, v41-load one too (the deferral beats both groups there)' 0 '^fo-solo	D	fixture-only	-	' "${gb[@]}" --classes
+  check '  … and one that reaches the call through another recipe, by closure' 0 '^fo-chain	D	fixture-only	-	' "${gb[@]}" --classes
+  check 'fixture-only: the fixture dry run places it as usual' 0 '^lane [AB]  fo-any ' "${gb[@]}" --tier fixture --dry-run fo-any
+  out=$("${gb[@]}" --dry-run fo-any fo-solo plain-any 2>&1) || fail 'fixture-only: the real dry run failed' "$out"
+  if grep -q '^lane -  fo-any ' <<< "$out" && grep -q '^lane -  fo-solo ' <<< "$out" && grep -q '^lane [AB]  plain-any ' <<< "$out" \
+    && grep -q 'deferred to a fixture-tier batch (fixture-only), never run in the real tier — ' <<< "$out" \
+    && grep -q '2 item(s) deferred to a fixture-tier batch (0 variant, 2 fixture-only: a variant is a fixture, and a fixture-only gate has sets on the fixture tier only), in no lane (DONE: deferred=2, and the list .*/deferred.list): fo-any fo-solo' <<< "$out" \
+    && grep -q 'dry run — 1 items (and 2 deferred to a fixture-tier batch: 0 variant, 2 fixture-only)' <<< "$out"; then pass 'fixture-only: the real dry run names both deferred items beside the one that runs'
+  else fail 'fixture-only: the real dry run names both deferred items beside the one that runs' "$out"; fi
+  check 'fixture-only: a deferred item adds nothing to the lane sums (plain-any alone: its 10 s row in the times file)' 0 'predicted laneA=0s laneB=10s laneX=0s chain=0s wall=10s' \
+    env "BLOOMERY_GATE_TIMES=$t/times.tsv" "${gb[@]}" --dry-run fo-any fo-solo plain-any
+  check "fixture-only: an item's ARGS are still checked by just" 65 'takes no arguments' "${gb[@]}" --dry-run 'fo-any:--x'
+  rc=$(steal_case fo-re "steal-bal	B	a6000	10	$d" -- fo-any steal-bal fo-solo)
+  printf '%s' "$rc" > "$t/rc-fo-re"
+  rc_ok 'fixture-only run: a real batch with two deferred items ends green' fo-re 3
+  want 'fixture-only run: the deferred item has its own line' "$t/target/c-fo-re/run.log" '^fo-any rc=deferred fixture-only lane=- deferred=1$'
+  want '  … a solo one too' "$t/target/c-fo-re/run.log" '^fo-solo rc=deferred fixture-only lane=- deferred=1$'
+  want 'fixture-only run: the DONE line counts them in deferred= and in fixture_only=' "$t/target/c-fo-re/run.log" \
+    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 fixture_only=2 deferred_list=[^ ]*/c-fo-re/deferred.list$'
+  want_row 'fixture-only run: the item that is not deferred ran' "$t/fake-state/box.log" '$2 ~ /gen_b$/'
+  want_no_row 'fixture-only run: the batch never called a deferred recipe' "$t/fake-state/box.log" '$2 ~ /gen_fo$|gen_fs$/'
+  want_no_row '  … and wrote no times row for it' "$t/times-fo-re.tsv" '$1 ~ /^fo-/'
+  want_not '  … nor a ledger record' "$t/rounds-fo-re.tsv" '^[^	]*fo-(any|solo)'
+  n=$((n + 1))
+  if [ "$(grep -v '^#' "$t/target/c-fo-re/deferred.list" | paste -sd, -)" = 'fo-any,fo-solo' ] && grep -q '^# fixture-only: ' "$t/target/c-fo-re/deferred.list" \
+    && grep -q '^# gate-batch: the 2 item(s) it deferred to a fixture-tier batch' "$t/target/c-fo-re/deferred.list"; then echo 'ok fixture-only run: DIR/deferred.list holds the two items, with the comment of the kind'
+  else bad=$((bad + 1)); echo "FAIL fixture-only run: DIR/deferred.list: $(cat "$t/target/c-fo-re/deferred.list" 2>&1)"; fi
+  check 'fixture-only run: a fixture batch takes exactly that list (both items placed)' 0 '^lane [AB]  fo-any ' "${gb[@]}" --tier fixture --dry-run --list "$t/target/c-fo-re/deferred.list"
+  check '  … the solo one alone in lane X' 0 '^lane X  fo-solo ' "${gb[@]}" --tier fixture --dry-run --list "$t/target/c-fo-re/deferred.list"
+  rc=$(steal_case fo-all "steal-bal	B	a6000	10	$d" -- fo-any fo-solo)
+  printf '%s' "$rc" > "$t/rc-fo-all"
+  rc_ok 'fixture-only run: a batch of deferred items only ends green' fo-all 2
+  want 'fixture-only run: … its DONE line' "$t/target/c-fo-all/run.log" '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 fixture_only=2 deferred_list=[^ ]*/deferred.list$'
+  want 'fixture-only run: … says nothing ran on the box' "$t/out-fo-all.log" '^gate-batch: every item is deferred to a fixture-tier batch — nothing runs on the box, so no lease check$'
+  want_no_row 'fixture-only run: … and made no box call at all' "$t/fake-state/box.log" '1'
+  rc=$(steal_case fo-fx "steal-bal	B	a6000	10	$d" -- --tier fixture fo-any ro-any steal-bal)
+  printf '%s' "$rc" > "$t/rc-fo-fx"
+  rc_ok 'fixture-only run: the fixture tier runs the recipe, beside a real-only item it defers' fo-fx 3
+  want_row '  … through its box call, with the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_fo$/'
+  want '  … and its DONE line counts the real-only item, not a fixture-only one' "$t/target/c-fo-fx/run.log" \
+    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 real_only=1 deferred_list=[^ ]*/c-fo-fx/deferred.list$'
+  want_not '  … with no fixture_only= in it' "$t/target/c-fo-fx/run.log" '^DONE .*fixture_only='
+  # fxonly:end A
   # no-fixture (the header's deferred paragraph, kind 2): a family the fixture table of tools/ref/ref-paths.sh does not name is deferred
   # in the fixture tier, never run and never red; the table is read from that file, so a family it names runs.
   check 'no-fixture: in the real tier a recipe of a family with no fixture is placed as usual' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
@@ -1960,6 +2035,18 @@ FP
   want_row 'variant run: its box call carries the tag and the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_FIXTURE_VARIANT=vt/ && $1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_vq$/'
   want 'variant run: the times row is an entry of its own' "$t/times-vr-fx.tsv" "$(printf '^vr-q@BLOOMERY_FIXTURE_VARIANT=vt,BLOOMERY_TIER=fixture\t')"
   want_not 'variant run: … and nothing is deferred' "$t/target/c-vr-fx/run.log" '^DONE .*variant='
+  # fxonly:begin A2
+  # A real batch holding a variant item and a fixture-only one defers both, each by its own kind; the DONE line counts each.
+  rc=$(steal_case fo-vr "steal-bal	B	a6000	10	$d" -- 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt' fo-any steal-bal)
+  printf '%s' "$rc" > "$t/rc-fo-vr"
+  rc_ok 'fixture-only run: a real batch with a variant item and a fixture-only one ends green' fo-vr 3
+  want '  … each deferred item carries its own kind' "$t/target/c-fo-vr/run.log" '^vr-q rc=deferred variant lane=- deferred=1 item=vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
+  want '  … the fixture-only one too' "$t/target/c-fo-vr/run.log" '^fo-any rc=deferred fixture-only lane=- deferred=1$'
+  want '  … and the DONE line counts both kinds' "$t/target/c-fo-vr/run.log" \
+    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 variant=1 fixture_only=1 deferred_list=[^ ]*/c-fo-vr/deferred.list$'
+  want '  … with the notes of both kinds in DIR/deferred.list' "$t/target/c-fo-vr/deferred.list" '^# variant: '
+  want '  … both' "$t/target/c-fo-vr/deferred.list" '^# fixture-only: '
+  # fxonly:end A2
   # A chain member (v41-load, class C in the real tier) given as a variant item is deferred and joins no chain: it feeds no lane, so a
   # real batch of it and one plain item starts the plain item's lane alone. vt5's family is not read: the real tier skips that check.
   printf '%s\n' "vt5	deepseek41	trunk	ffn_up_exps=iq3_s	v41-any	probe" >> "$t/tools/fixture-variants.tsv"
@@ -2092,6 +2179,35 @@ FP
   printf '%s\n' '' "[group('solo-real')]" 'ro-sr:' "    ./tools/box.sh 'bash tools/ref/real-only.sh ro-sr && BLOOMERY_GATE_CARD=\${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh other'" >> "$t/justfile"
   check 'real-only: with solo-real: a named error' 65 'recipe ro-sr: \[group\(.solo-real.\)\] with a real-only call' "${gb[@]}" --classes
   cp "$t/justfile.good" "$t/justfile"
+  # fxonly:begin B
+  printf '%s\n' '' 'fo-other:' "    ./tools/box.sh 'bash tools/ref/fixture-only.sh fo-any && bash tools/gate.sh -p z'" >> "$t/justfile"
+  check "fixture-only: a call that names another recipe: a named error" 65 "recipe fo-other: its fixture-only call names fo-any, not itself" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'fo-late:' "    ./tools/box.sh 'cargo build && bash tools/ref/fixture-only.sh fo-late && bash tools/gate.sh -p z'" >> "$t/justfile"
+  check 'fixture-only: a box command that does not open with the call: a named error' 65 \
+    'recipe fo-late: a fixture-only recipe opens every box.sh command with .bash tools/ref/fixture-only.sh fo-late && …. — 1 single-quoted box.sh command\(s\), 1 call\(s\), 1 not opening with it' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'fo-two:' "    ./tools/box.sh 'bash tools/ref/fixture-only.sh fo-two && bash tools/gate.sh -p a'" "    ./tools/box.sh 'bash tools/gate.sh -p b'" >> "$t/justfile"
+  check 'fixture-only: a second box command with no call: a named error' 65 'recipe fo-two: .* 2 single-quoted box.sh command\(s\), 1 call\(s\), 1 not opening with it' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'fo-bare:' "    bash tools/ref/fixture-only.sh fo-bare" >> "$t/justfile"
+  check 'fixture-only: a call outside a single-quoted box command: a named error' 65 'recipe fo-bare: .* 0 single-quoted box.sh command\(s\), 1 call\(s\)' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  mv "$t/tools/ref/fixture-only.sh" "$t/tools/ref/fixture-only.sh.off"
+  check 'fixture-only: a call to a script that is not in the tree: a named error' 65 'recipe fo-any: calls tools/ref/fixture-only.sh, which is not in the tree' "${gb[@]}" --classes
+  mv "$t/tools/ref/fixture-only.sh.off" "$t/tools/ref/fixture-only.sh"
+  printf '%s\n' '' "[group('solo-real')]" 'fo-sr:' "    ./tools/box.sh 'bash tools/ref/fixture-only.sh fo-sr && BLOOMERY_GATE_CARD=\${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'fixture-only: with solo-real: a named error' 65 'recipe fo-sr: \[group\(.solo-real.\)\] with a fixture-only call' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  # Both classes: no tier would run the recipe. Its own two calls, and one reached through its dependencies (neither owner is wrong alone).
+  printf '%s\n' '' 'fo-own:' "    ./tools/box.sh 'bash tools/ref/real-only.sh fo-own && bash tools/ref/fixture-only.sh fo-own && bash tools/gate.sh -p z'" >> "$t/justfile"
+  check 'fixture-only: a recipe that holds both calls itself: a named error' 65 'recipe fo-own: both a real-only call \(fo-own\) and a fixture-only call \(fo-own\)' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'fo-mix: ro-any fo-any' "    ./tools/box.sh 'bash tools/gate.sh -p z'" >> "$t/justfile"
+  check 'fixture-only: a recipe whose dependencies hold one class each: a named error' 65 'recipe fo-mix: both a real-only call \(ro-any\) and a fixture-only call \(fo-any\)' "${gb[@]}" --classes
+  check '  … in the fixture tier too, and counted' 65 '^gate-batch: 1 real-only or fixture-only recipe\(s\) the class could not hold; nothing ran$' "${gb[@]}" --tier fixture --classes
+  cp "$t/justfile.good" "$t/justfile"
+  # fxonly:end B
   # An inline tier guard (a test of BLOOMERY_TIER and an `exit 66` in one box command) is the real-only call spelt by hand: this runner reads
   # only the call, so it would place the recipe and the batch would meet the exit as a red. A box command that only branches is no guard.
   check 'inline guard: a recipe that only branches on the tier (no exit 66) is placed as usual' 0 '^tg-branch	A	fixed	3090	' "${gb[@]}" --tier fixture --classes
@@ -2104,6 +2220,8 @@ IG
     'recipe ig-guard: a box.sh command holds an inline tier guard .a test of BLOOMERY_TIER and an .exit 66.. instead of the real-only call — open it with .bash tools/ref/real-only.sh ig-guard && …., which this runner reads' \
     "${gb[@]}" --tier fixture --classes
   check '  … counted, with nothing run' 65 '^gate-batch: 1 recipe\(s\) with an inline tier guard; nothing ran$' "${gb[@]}" --tier fixture --classes
+  check '  … a guard that stops the real tier is told the fixture-only call too' 65 'recipe ig-guard: .*\(`bash tools/ref/fixture-only.sh ig-guard && …` when the guard stops the real tier: it defers the recipe there\)' \
+    "${gb[@]}" --classes
   check '  … in the real tier too' 65 'recipe ig-guard: a box.sh command holds an inline tier guard' "${gb[@]}" --classes
   check '  … and for a batch that names another recipe' 65 'recipe ig-guard: a box.sh command holds an inline tier guard' "${gb[@]}" --dry-run host
   rc=$(steal_case ig-run "steal-bal	B	a6000	10	$d" -- steal-bal)
@@ -2122,6 +2240,13 @@ IG
   cp "$t/justfile.good" "$t/justfile"
   cat >> "$t/justfile" << 'IG'
 
+ig-fxboth:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/fixture-only.sh ig-fxboth && [ "${BLOOMERY_TIER:-real}" = fixture ] || exit 66'
+IG
+  check '  … nor one that holds the fixture-only call' 0 '^ig-fxboth	D	fixture-only	-	' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  cat >> "$t/justfile" << 'IG'
+
 ig-quote:
     ./tools/box.sh 'echo '\''quoted'\'' && [ "${BLOOMERY_TIER:-real}" = real ] || exit 66'
 IG
@@ -2135,6 +2260,17 @@ IG
   check '  … and so does no tier, or an empty one' 0 '^$' env -u BLOOMERY_TIER bash "$ro_sh" gate-x
   check '  … a tier that is neither is refused, 64' 64 "got 'both'" env BLOOMERY_TIER=both bash "$ro_sh" gate-x
   check '  … a call with no recipe name is a usage error, 64' 64 'usage: bash tools/ref/real-only.sh <recipe>' env BLOOMERY_TIER=fixture bash "$ro_sh"
+  # fxonly:begin C
+  # The fixture-only guard, the mirror: it stops the real tier by name before any box call, and only that tier.
+  local fo_sh
+  fo_sh=$(dirname "$self")/ref/fixture-only.sh
+  check 'fixture-only guard: BLOOMERY_TIER=real stops it by name, exit 66' 66 '^gate-x: fixture-only: .*exit 66' env BLOOMERY_TIER=real bash "$fo_sh" gate-x
+  check '  … so does no tier' 66 '^gate-x: fixture-only: .*exit 66' env -u BLOOMERY_TIER bash "$fo_sh" gate-x
+  check '  … and an empty one' 66 '^gate-x: fixture-only: .*exit 66' env BLOOMERY_TIER= bash "$fo_sh" gate-x
+  check '  … the fixture tier passes' 0 '^$' env BLOOMERY_TIER=fixture bash "$fo_sh" gate-x
+  check '  … a tier that is neither is refused, 64' 64 "got 'both'" env BLOOMERY_TIER=both bash "$fo_sh" gate-x
+  check '  … a call with no recipe name is a usage error, 64' 64 'usage: bash tools/ref/fixture-only.sh <recipe>' env BLOOMERY_TIER=real bash "$fo_sh"
+  # fxonly:end C
   # One card by box.sh's pick (solo-real, BLOOMERY_CARD=a6000): alone in the real tier, fixed to lane B in the fixture tier; two cards stay refused (sr-both above).
   check 'one card: a solo-real recipe with BLOOMERY_CARD=a6000 is alone in the real tier' 0 '^sr-a6000	X	solo	-	' "${gb[@]}" --classes
   check '  … and fixed to the A6000 lane in the fixture tier' 0 '^sr-a6000	B	fixed	-	' "${gb[@]}" --tier fixture --classes
@@ -2929,12 +3065,13 @@ def group_of(name, group):
     return [n for n in closure(name, set()) if {"group": group} in recipes[n]["attributes"]]
 
 
-# The real-only class (the header's paragraph) is a call in the box command: `bash tools/ref/real-only.sh <recipe> && …`, the first
-# command of every box.sh command of the recipe. The box side runs it (it stops the fixture tier by name); this runner reads it from
-# the text. A call that names another recipe would make the refusal name the wrong gate; a box command that does not open with it,
-# or a call outside a single-quoted box command, would leave a command the refusal does not guard.
-REAL_ONLY = "tools/ref/real-only.sh"
-REAL_ONLY_CALL = re.compile(r"\bbash " + re.escape(REAL_ONLY) + r"\s+(\S+)")
+# The marker classes (the header's paragraph) are a call in the box command: `bash tools/ref/<kind>.sh <recipe> && …`, the first command
+# of every box.sh command of the recipe. The box side runs it (it stops the other tier by name); this runner reads it from the text.
+# real-only (no fixture-tier conversion) is deferred in the fixture tier, fixture-only (sets on the fixture tier only) in the real
+# tier: kind -> (script, the tier it defers in). A call that names another recipe would make the refusal name the wrong gate; a box
+# command that does not open with it, or a call outside a single-quoted box command, would leave a command the refusal does not guard.
+MARKERS = {"real-only": ("tools/ref/real-only.sh", "fixture"), "fixture-only": ("tools/ref/fixture-only.sh", "real")}
+MARKER_CALL = {k: re.compile(r"\bbash " + re.escape(script) + r"\s+(\S+)") for k, (script, _) in MARKERS.items()}
 BOX_OPEN = "tools/box.sh '"
 # An inline tier guard — the box command tests BLOOMERY_TIER and ends in `exit 66` — is the real-only guard spelt by hand: the box
 # side stops, but this runner reads only the call, so the batch would place the recipe and meet the exit as a red.
@@ -3033,50 +3170,59 @@ def bounded_calls(name):
 
 
 def defer_tags(name):
-    """What defers a recipe in the fixture tier, for the plan's reason text."""
-    tags = [f"{n}: real-only call" for n in real_only_of(name)]
+    """What defers a recipe, for the plan's reason text: the fixture tier's kinds (real-only, no-fixture, real-file) and the real
+    tier's (fixture-only), each shown in either tier as the recipe's own fact."""
+    tags = [f"{n}: real-only call" for n in marked_of("real-only", name)]
     if tier == "fixture" and not tags and no_fixture(name):
         tags.append(f"family {no_fixture(name)}: no row in the fixture table of tools/ref/ref-paths.sh (box.sh exits 66)")
     if tier == "fixture" and not tags and real_file(name):
         target, site, called = real_file(name)
         tags.append(f"family {family(name)}: its fixture-table row is self (the real file stands, no fixture file) and {target} "
                     f"reaches the fixture fence at {site} ({called})")
-    return tags
+    return tags + [f"{n}: fixture-only call" for n in marked_of("fixture-only", name)]
 
 
-def real_only_of(name):
-    """The recipes of name's closure whose own text calls the real-only guard."""
-    return [n for n in closure(name, set()) if REAL_ONLY_CALL.search(body(n))]
+def marked_of(kind, name):
+    """The recipes of name's closure whose own text calls the guard of the marker class `kind` (MARKERS)."""
+    return [n for n in closure(name, set()) if MARKER_CALL[kind].search(body(n))]
 
 
 ro_bad = []
 for n in sorted(recipes):
     text = body(n)
-    calls = REAL_ONLY_CALL.findall(text)
-    if not calls:
-        continue
-    first = f"bash {REAL_ONLY} {n} && "
-    if not os.path.isfile(os.path.join(root, REAL_ONLY)):
-        ro_bad.append(f"recipe {n}: calls {REAL_ONLY}, which is not in the tree")
-    wrong = sorted({c for c in calls if c != n})
-    if wrong:
-        ro_bad.append(f"recipe {n}: its real-only call names {', '.join(wrong)}, not itself — write `{first.rstrip(' &')}`")
-    opens = [m.end() for m in re.finditer(re.escape(BOX_OPEN), text)]
-    loose = [e for e in opens if not text.startswith(first, e)]
-    if not opens or loose or len(calls) != len(opens):
-        ro_bad.append(f"recipe {n}: a real-only recipe opens every box.sh command with `{first.rstrip(' &')} && …` — "
-                      f"{len(opens)} single-quoted box.sh command(s), {len(calls)} call(s), {len(loose)} not opening with it")
+    for kind, (script, _) in MARKERS.items():
+        calls = MARKER_CALL[kind].findall(text)
+        if not calls:
+            continue
+        first = f"bash {script} {n} && "
+        if not os.path.isfile(os.path.join(root, script)):
+            ro_bad.append(f"recipe {n}: calls {script}, which is not in the tree")
+        wrong = sorted({c for c in calls if c != n})
+        if wrong:
+            ro_bad.append(f"recipe {n}: its {kind} call names {', '.join(wrong)}, not itself — write `{first.rstrip(' &')}`")
+        opens = [m.end() for m in re.finditer(re.escape(BOX_OPEN), text)]
+        loose = [e for e in opens if not text.startswith(first, e)]
+        if not opens or loose or len(calls) != len(opens):
+            ro_bad.append(f"recipe {n}: a {kind} recipe opens every box.sh command with `{first.rstrip(' &')} && …` — "
+                          f"{len(opens)} single-quoted box.sh command(s), {len(calls)} call(s), {len(loose)} not opening with it")
+    # No fixture-tier run and no real-tier run: the recipe would be deferred in both tiers and never run. Closure, so a recipe
+    # that reaches one class through a dependency and the other through its own call (or another dependency) is named too.
+    held = {kind: marked_of(kind, n) for kind in MARKERS}
+    if all(held.values()):
+        ro_bad.append(f"recipe {n}: both a real-only call ({', '.join(held['real-only'])}) and a fixture-only call ({', '.join(held['fixture-only'])}) — "
+                      "the first has no fixture-tier run and the second no real-tier run, so no tier would run it")
 if ro_bad:
     for e in ro_bad:
         print("gate-batch: " + e, file=sys.stderr)
-    fail(f"{len(ro_bad)} real-only recipe(s) the class could not hold; nothing ran")
+    fail(f"{len(ro_bad)} real-only or fixture-only recipe(s) the class could not hold; nothing ran")
 
 # A box command that only branches on the tier (`if [ "${BLOOMERY_TIER:-real}" = fixture ]; then …`) holds no `exit 66` and is not a guard.
 guard_bad = []
 for n in sorted(recipes):
-    if any("BLOOMERY_TIER" in c and INLINE_EXIT.search(c) and REAL_ONLY not in c for c in box_commands(body(n))):
+    if any("BLOOMERY_TIER" in c and INLINE_EXIT.search(c) and not any(script in c for script, _ in MARKERS.values()) for c in box_commands(body(n))):
         guard_bad.append(f"recipe {n}: a box.sh command holds an inline tier guard (a test of BLOOMERY_TIER and an `exit 66`) instead of the real-only call "
-                         f"— open it with `bash {REAL_ONLY} {n} && …`, which this runner reads to defer the recipe in the fixture tier")
+                         f"— open it with `bash {MARKERS['real-only'][0]} {n} && …`, which this runner reads to defer the recipe in the fixture tier "
+                         f"(`bash {MARKERS['fixture-only'][0]} {n} && …` when the guard stops the real tier: it defers the recipe there)")
 if guard_bad:
     for e in guard_bad:
         print("gate-batch: " + e, file=sys.stderr)
@@ -3208,7 +3354,7 @@ def solo_of(name):
 # the `any` card, or the recipe picks the A6000 alone through box.sh (one card: the fixture tier fixes it to lane B), and nothing
 # keeps it alone in either tier — a `solo` beside it, a pick of both cards (it stays alone whatever the tier) or a 3090-only call
 # would each make the second tier's placement the first's, and the group a name for nothing. A recipe with no fixture conversion
-# (real-only) has no second tier's placement to choose.
+# (real-only) or no real-tier run (fixture-only) has no second tier's placement to choose.
 sr_bad = []
 for n in sorted(recipes):
     if {"group": "solo-real"} not in recipes[n]["attributes"]:
@@ -3216,8 +3362,10 @@ for n in sorted(recipes):
     why = []
     if group_of(n, "solo"):
         why.append("[group('solo')] — a recipe is alone in both tiers (solo) or in the real one (solo-real)")
-    if real_only_of(n):
+    if marked_of("real-only", n):
         why.append("a real-only call — a recipe with no fixture conversion has no fixture-tier placement (real-only, or solo-real)")
+    if marked_of("fixture-only", n):
+        why.append("a fixture-only call — a recipe with no real-tier run has no real-tier placement (fixture-only, or solo-real)")
     text = "\n".join(body(m) for m in closure(n, set()))
     pick = BOX_CARD.search(text)
     if pick and pick.group(1) == "both":
@@ -3477,7 +3625,7 @@ def real_file_candidate(name):
     """Whether name is asked of `tools/recipes.py opens`: a recipe the batch places (not timed, not refused) that the real-only and
     no-fixture kinds leave, of a family whose fixture-table row is `self`. A family with a fixture directory is never real-file: a
     refusal there is a fixture-conversion gap and stays a red."""
-    return (classify(name)[0] not in ("T", "R") and not real_only_of(name) and not no_fixture(name)
+    return (classify(name)[0] not in ("T", "R") and not marked_of("real-only", name) and not no_fixture(name)
             and family(name) in self_families())
 
 
@@ -3529,9 +3677,11 @@ def placement(name, lane, lanes):
     names = closure(name, set())
     uses_gpu_gate = bool(GATE_FORMS[name])
     box = next((m.group(1) for m in (BOX_CARD.search(body(n)) for n in names) if m), None)
-    if tier == "fixture" and real_only_of(name):
-        # No fixture conversion: the item is deferred to the real tier, in no lane (class D; the shell side keeps it apart).
-        return "D", "real-only", ["-"], ["none"]
+    for kind, (_, defers_in) in MARKERS.items():
+        if tier == defers_in and marked_of(kind, name):
+            # No conversion for this tier (real-only: no fixture; fixture-only: no real run): the item is deferred to the other tier,
+            # in no lane (class D; the shell side keeps it apart).
+            return "D", kind, ["-"], ["none"]
     if tier == "fixture" and no_fixture(name):
         # The family has no fixture (box.sh would exit 66, a red): deferred in the same way, under its own kind.
         return "D", "no-fixture", ["-"], ["none"]
@@ -3790,9 +3940,9 @@ item_str() { # NAME ENV ARGS: the item as it runs, for the key — NAME[@ENV wit
 # env, then the card); R_C0 is the index of each record's first candidate. C_LST stays `-` without
 # --ledger.
 R_REC=() R_C0=() C_ITEM=() C_KEY=() C_LST=() C_LDET=()
-# The fixture tier's deferred items (class D: real-only gates, gates of a family with no fixture, real-file recipes) are not part of the plan below:
-# no lane, no key, no claim, no times row. They are kept apart, named in the dry run and in run.log, listed in DIR/deferred.list and
-# counted in the DONE line (the header's deferred paragraph).
+# The deferred items (class D: in the fixture tier the real-only gates, gates of a family with no fixture and real-file recipes; in the real
+# tier the variant items and the fixture-only gates) are not part of the plan below: no lane, no key, no claim, no times row. They are
+# kept apart, named in the dry run and in run.log, listed in DIR/deferred.list and counted in the DONE line (the header's deferred paragraph).
 DP_STEM=() DP_NAME=() DP_ENV=() DP_ARGS=() DP_ITEM=() DP_WHY=() DP_KIND=()
 # The chain's order (PYPLAN's `K` record): plan indices in the order the lanes take them (D3), each
 # with its model family. CHAIN_ACTIVE names the batches it exists in: the real tier, two lanes.
@@ -3825,19 +3975,22 @@ fi
 N=${#R_REC[@]}
 ND=${#DP_STEM[@]}
 NT=$((N + ND)) # every item of the batch: the ones that run and the ones deferred
-ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones and the variant items (real tier)
+ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 ND_FX=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones, the variant items and the fixture-only gates (the last two: real tier)
 for ((i = 0; i < ND; i++)); do
   case ${DP_KIND[$i]} in
     real-only) ND_RO=$((ND_RO + 1)) ;;
     no-fixture) ND_NF=$((ND_NF + 1)) ;;
     real-file) ND_RF=$((ND_RF + 1)) ;;
     variant) ND_VR=$((ND_VR + 1)) ;;
-    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file and variant" ;;
+    fixture-only) ND_FX=$((ND_FX + 1)) ;;
+    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant and fixture-only" ;;
   esac
 done
 DEFER_NOTE=''
-if [ "$ND_VR" != 0 ]; then
+if [ "$ND" != 0 ] && [ "$ND_VR" = "$ND" ]; then
   DEFER_NOTE=" (and $ND_VR deferred to a fixture-tier batch: a variant is a fixture)"
+elif [ "$ND" != 0 ] && [ "$TIER" = real ]; then
+  DEFER_NOTE=" (and $ND deferred to a fixture-tier batch: $ND_VR variant, $ND_FX fixture-only)"
 elif [ "$ND" != 0 ]; then
   DEFER_NOTE=" (and $ND deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file)"
 fi
@@ -4300,8 +4453,10 @@ predicted() { # the plan's lane sums, derived from the times file
   fi
   echo "gate-batch: predicted $PREDICTED (derived: $how)"
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
-  if [ "$ND_VR" != 0 ]; then
+  if [ "$ND" != 0 ] && [ "$ND_VR" = "$ND" ]; then
     echo "gate-batch: $ND_VR item(s) deferred to a fixture-tier batch (a variant is a fixture: the real tier opens none), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
+  elif [ "$ND" != 0 ] && [ "$TIER" = real ]; then
+    echo "gate-batch: $ND item(s) deferred to a fixture-tier batch ($ND_VR variant, $ND_FX fixture-only: a variant is a fixture, and a fixture-only gate has sets on the fixture tier only), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
   else
     [ "$ND" = 0 ] || echo "gate-batch: $ND item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
   fi
@@ -4459,7 +4614,7 @@ if [ "$DRY" = 1 ]; then
     echo "gate-batch: the chain is fed by $fed: a lane takes a member whose candidates include its card, and a lane with no item and no such member does not start"
   fi
   for ((i = 0; i < ND; i++)); do
-    if [ "${DP_KIND[$i]}" = variant ]; then
+    if [ "$TIER" = real ]; then
       printf 'lane -  %-28s %s\n        deferred to a fixture-tier batch (%s), never run in the real tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
     else
       printf 'lane -  %-28s %s\n        deferred to the real tier (%s), never run in the fixture tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
@@ -4482,7 +4637,7 @@ if [ "$SKIP_N" -lt "$N" ]; then
     *) echo "$lease" >&2; RC=70 die "the start check through box.sh failed (rc $rc; 70 from the guard: the lease cannot be tested)" ;;
   esac
 elif [ "$N" = 0 ]; then
-  if [ "$ND_VR" != 0 ]; then
+  if [ "$TIER" = real ]; then
     echo "gate-batch: every item is deferred to a fixture-tier batch — nothing runs on the box, so no lease check"
   else
     echo "gate-batch: every item is deferred to the real tier — nothing runs on the box, so no lease check"
@@ -4531,9 +4686,10 @@ if [ "$ND" != 0 ]; then
     else
       echo "# gate-batch: the $ND item(s) it deferred to a fixture-tier batch, one per line (the --list format; --tier fixture takes them)"
     fi
-    for kind in real-only no-fixture real-file variant; do
+    for kind in real-only no-fixture real-file variant fixture-only; do
       case $kind in
         real-only) [ "$ND_RO" = 0 ] || echo "# real-only: no fixture-tier conversion (bash tools/ref/real-only.sh in the recipe's box command)" ;;
+        fixture-only) [ "$ND_FX" = 0 ] || echo "# fixture-only: sets on the fixture tier only, no real-tier run (bash tools/ref/fixture-only.sh in the recipe's box command)" ;;
         no-fixture) [ "$ND_NF" = 0 ] || echo "# no-fixture: the recipe's family has no row in the fixture table of tools/ref/ref-paths.sh (box.sh exits 66)" ;;
         variant) [ "$ND_VR" = 0 ] || echo "# variant: the item runs on a fixture variant (tools/fixture-variants.tsv); the real tier opens none (tools/ref/ref-paths.sh exits 64)" ;;
         real-file) [ "$ND_RF" = 0 ] || echo "# real-file: the recipe's family runs on its real file (its fixture-table row is self) and a target of the recipe reaches the fixture fence (tools/recipes.py opens), which refuses that file" ;;
@@ -5132,8 +5288,11 @@ if [ "$TIER" = fixture ]; then
   [ "$ND_NF" = 0 ] || done_line="$done_line no_fixture=$ND_NF"
   [ "$ND_RF" = 0 ] || done_line="$done_line real_file=$ND_RF"
   [ "$ND" = 0 ] || done_line="$done_line deferred_list=$DEFER_LIST"
-elif [ "$ND_VR" != 0 ]; then
-  done_line="$done_line deferred=$ND_VR variant=$ND_VR deferred_list=$DEFER_LIST"
+elif [ "$ND" != 0 ]; then
+  done_line="$done_line deferred=$ND"
+  [ "$ND_VR" = 0 ] || done_line="$done_line variant=$ND_VR"
+  [ "$ND_FX" = 0 ] || done_line="$done_line fixture_only=$ND_FX"
+  done_line="$done_line deferred_list=$DEFER_LIST"
 fi
 echo "$done_line" >> "$RUNLOG"
 board_event done line="$done_line"

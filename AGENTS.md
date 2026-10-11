@@ -104,7 +104,9 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   named error, 65, nothing ran); it, a recipe of a family with no fixture and a `real-file` recipe (its family's
   fixture-table row is `self`, so it runs on the profile's real file, and a target it builds or runs reaches the gate
   fence `Tier::check_file`, which `python3 tools/recipes.py opens` reads from the code) are deferred by name, never run
-  on a file they were not written for, and listed in `DIR/deferred.list` for a real-tier `--list`. The keys and times
+  on a file they were not written for, and listed in `DIR/deferred.list` for a real-tier `--list`. The mirror, a gate with
+  sets on the fixture tier only, opens its box command with `bash tools/ref/fixture-only.sh <recipe>` and is deferred by name
+  in the real tier (`fixture_only=` in its DONE line) and run in the fixture tier. The keys and times
   keep the tiers apart, and the DONE line counts the clauses a fixture run left to the real tier (`deferred=`, with
   `real_only=`, `no_fixture=` and `real_file=`). It refuses to
   start while the timing lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose

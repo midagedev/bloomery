@@ -340,7 +340,8 @@ before any Spark run.
    <https://huggingface.co/datasets/midagedev/bloomery-refsets> (public, 17 sets, 6.48 GB, with each base model's
    licence).
 4. **The contributor gate list:** the maintainers own it, as one derived command (`local-check.md`): `just affected`
-   minus real-file and real-only gates, `gate-ptx-spill` and the timing runners.
+   minus real-file and real-only gates, `gate-ptx-spill` and the timing runners (a fixture-only gate stays: its tier is the
+   fixture tier).
 5. **Arm evidence:** a contributor's recorded run on the Spark (its own table, with the machine named) is the Arm
    evidence; the maintainers' x86 batch is the gate for main.
 6. **P2 golden:** yes. A published Clef-Flash tape, byte for byte, is the P2 criterion once it is published (answer 14);
