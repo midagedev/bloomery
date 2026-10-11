@@ -25,7 +25,7 @@ pub const VISION_START_ID: u32 = 248_053;
 pub const VISION_END_ID: u32 = 248_054;
 
 /// `<|image_pad|>`, config.json's `image_token_id`: the id between the two, which
-/// `serve::media::expand_spans` expands to one copy per merged token ([`Prepared::span_len`]).
+/// [`crate::media::expand_spans`] expands to one copy per merged token ([`Prepared::span_len`]).
 pub const IMAGE_TOKEN_ID: u32 = 248_056;
 
 /// The canvas colour of this projector's `PAD_CEIL` pad: llama.cpp's `image_pad_color` for
