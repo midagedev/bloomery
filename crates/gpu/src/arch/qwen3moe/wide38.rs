@@ -121,7 +121,7 @@
 //! ([`CardRoute38::enqueue`]'s ring pass, a GEMM batch a landing batch)
 //! before the card sum, which reads the stack's places and the ring's
 //! together; the serve's union leaves the streamed experts out. The route is
-//! then the layer's reader of the call ([`WideParts::stream_read`]), which the
+//! then the layer's reader of the call ([`PromptStream::read`]), which the
 //! next ubatch's pick and the ring's next use of the half copy behind. A
 //! split walk picks once a layer, at its first unit, from that unit's
 //! counts at twice (the group's width): the second unit shares the pick's
@@ -133,7 +133,7 @@
 //! its start (a decode history before it): then the call's last unit returns
 //! each layer once its host service has run, asked at the next layer's
 //! shadow, whose download wait the call's queued return copies fill
-//! ([`WideParts::stream_return`]); a split pick there prices an admit's way back
+//! ([`PromptStream::return_at_shadow`]); a split pick there prices an admit's way back
 //! when the lane fell behind ([`runtime::xsplit::ReturnCost`]), and the
 //! call's end issues what is left. The stream's placement never stays. A
 //! token's bits then depend on its ubatch's routing too — which of its
@@ -159,9 +159,9 @@ use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::handoff::Places;
+use crate::host::prompt_stream::PromptStream;
 use crate::host::run::HostRun;
-use crate::host::swap::{CallPick, CallReport};
-use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer, XLayer, XMode, XReport};
+use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -180,7 +180,6 @@ use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, BatchOrder, LayerProgram, Overlap, PortKind};
 use runtime::splitwalk::{self, LoadKind, SplitCosts};
-use runtime::xsplit::ReturnCost;
 use std::mem::ManuallyDrop;
 
 /// What the walk's errors name.
@@ -1123,28 +1122,22 @@ impl CardRoute38 {
                     // (the join's on a tier layer).
                     places(&map, &mut sel_w)?;
                     for b in land {
-                        // SAFETY: the batch's map row is `EXPERTS` words of
-                        // its host-mapped row (`LandBatch`), filled before
-                        // this launch was enqueued and reused only after the
-                        // walk's order has this run complete.
-                        let bmap =
-                            unsafe { crate::tensor::window::<u32>(b.map, geo::EXPERTS, ctx) };
-                        let ran = enqueue_gemm_batch(
-                            c,
-                            stream,
-                            b.event.as_deref(),
-                            (&ids_w, &self.ids),
-                            &bmap,
-                            (gate_up_ty, gate, up),
-                            down,
-                            (n, n_card),
-                            sink,
-                            &mut down_w,
-                            (&self.x, &mut self.g, &mut self.u, &mut self.act),
-                            (&mut self.bsel, &mut self.routes[table]),
-                        );
-                        drop(std::mem::ManuallyDrop::into_inner(bmap).into_raw_parts());
-                        ran?;
+                        b.with_map(ctx, geo::EXPERTS, |bmap| {
+                            enqueue_gemm_batch(
+                                c,
+                                stream,
+                                b.event.as_deref(),
+                                (&ids_w, &self.ids),
+                                bmap,
+                                (gate_up_ty, gate, up),
+                                down,
+                                (n, n_card),
+                                sink,
+                                &mut down_w,
+                                (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                                (&mut self.bsel, &mut self.routes[table]),
+                            )
+                        })?;
                     }
                 }
                 // The card sum's places and experts: the stack's, or with a
@@ -1155,26 +1148,22 @@ impl CardRoute38 {
                 {
                     places(union_map, &mut rr.union)?;
                     for b in &r.batches {
-                        // SAFETY: as the stack pass's batch rows, the
-                        // stream's own.
-                        let bmap =
-                            unsafe { crate::tensor::window::<u32>(b.map, geo::EXPERTS, ctx) };
-                        let ran = enqueue_gemm_batch(
-                            c,
-                            stream,
-                            b.event.as_deref(),
-                            (&ids_w, &self.ids),
-                            &bmap,
-                            (gate_up_ty, wg, wu),
-                            down_weight(l, st.down_ty, wd)?,
-                            (n, r.n),
-                            sink,
-                            &mut down_w,
-                            (&self.x, &mut self.g, &mut self.u, &mut self.act),
-                            (&mut rr.sel, &mut rr.route),
-                        );
-                        drop(std::mem::ManuallyDrop::into_inner(bmap).into_raw_parts());
-                        ran?;
+                        b.with_map(ctx, geo::EXPERTS, |bmap| {
+                            enqueue_gemm_batch(
+                                c,
+                                stream,
+                                b.event.as_deref(),
+                                (&ids_w, &self.ids),
+                                bmap,
+                                (gate_up_ty, wg, wu),
+                                down_weight(l, st.down_ty, wd)?,
+                                (n, r.n),
+                                sink,
+                                &mut down_w,
+                                (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                                (&mut rr.sel, &mut rr.route),
+                            )
+                        })?;
                     }
                     sum_places = (&rr.union, n_card + r.n);
                 }
@@ -1440,9 +1429,9 @@ pub(super) struct WideParts<'a> {
     pub(super) pos0: usize,
     pub(super) dense: usize,
     pub(super) cur: usize,
-    /// The prompt call's host streaming: whether this walk picks, and its
-    /// records.
-    pub(super) stream: &'a mut Stream38,
+    /// The prompt call's host streaming ([`PromptStream`]): whether this
+    /// walk picks, and its records.
+    pub(super) stream: &'a mut PromptStream,
 }
 
 /// `y = W · act` for the Q8_0 weight `name` over the first `m` columns of
@@ -2288,45 +2277,6 @@ fn qsa(
 /// record's `fallback`.
 pub(super) const STREAM_FLOOR: u32 = 32;
 
-/// A prompt call's host streaming (`BLOOMERY_XSTREAM`, the residency
-/// machine's call mode and the expert stream): what the next prompt calls
-/// move, whether one is streaming now, the pick's count buffer, and the
-/// call's pick, stream and end records for the binary that prints them.
-#[derive(Default)]
-pub(super) struct Stream38 {
-    /// What the next prompt calls move ([`super::body38::Body38::set_xstream`]).
-    pub(super) mode: Option<XMode>,
-    /// A call is streaming: every ubatch walk of it picks.
-    pub(super) on: bool,
-    /// The streaming call runs the expert stream too (`split`).
-    pub(super) split: bool,
-    /// The card tail rate a split pick's walk prices its unit with [µs per
-    /// card pick], set when a streaming call opens: the family's measured
-    /// one on the Q4 kind, none on a kind whose route no record has priced.
-    pub(super) card_tail_us_per_pick: f64,
-    /// The ubatch the walk runs, from 0, the pick records' group.
-    pub(super) ubatch: usize,
-    /// The streaming call returns to its start ([`WideParts::returns_here`]):
-    /// decided at its begin, where the decode history is read.
-    pub(super) returning: bool,
-    /// The streaming call's end position: the walk of the unit that ends
-    /// there is the call's last.
-    pub(super) call_end: usize,
-    /// The layer of the last unit whose host service ran and whose return the
-    /// walk asks for at the next layer's shadow.
-    pub(super) owed: Option<usize>,
-    /// The call's return runs whole at its end instead of in the walk: the
-    /// twin a gate holds the walk's return to (`Body38::set_return_at_end`).
-    pub(super) return_at_end: bool,
-    counts: Vec<u32>,
-    pub(super) picks: Vec<(usize, CallPick)>,
-    pub(super) end: Option<CallReport>,
-    /// Per streamed layer of the call, its ubatch and what it streamed; the
-    /// stream's end.
-    pub(super) layers: Vec<(usize, XLayer)>,
-    pub(super) xend: Option<XReport>,
-}
-
 /// A ubatch's walk `(units, cols, Batch)`: every layer through the batch
 /// port at each unit's width; the head is the caller's ([`Gemm38::head`]).
 pub(super) struct Gemm38<'a> {
@@ -2430,9 +2380,7 @@ impl<'a> Gemm38<'a> {
         }
         // The last layer's return: no front follows it in the walk, so its
         // copies are the end's.
-        if let Some(l) = self.p.stream.owed.take() {
-            leg.hybrid().call_return(l, gpu.stream())?;
-        }
+        self.p.stream.return_owed(leg.hybrid(), gpu.stream())?;
         leg.end_walk()?;
         if let Some(t) = self.p.x.taps.as_mut() {
             t.walked = Some((self.p.pos0, m));
@@ -2495,179 +2443,6 @@ impl<'a> WideParts<'a> {
             .unwrap_or(0);
         unit_widths(self.m, x.split_walk, (x.load, &x.split_costs), host)
     }
-
-    /// Under host streaming, on a layer with card experts, the layer's pick
-    /// before its card route, for the first unit of `m` rows of a walk of
-    /// `units` units: the host waits for the
-    /// front's download of the unit's routed ids, counts them, and the
-    /// residency machine's pick (`SwapMachine::call_pick`) sends the pool's
-    /// coldest residents to the host and copies the unit's hottest host
-    /// experts over them — the least count admitted [`STREAM_FLOOR`] on a
-    /// load whose lane never probed, the walk's own floor and backlog bound
-    /// ([`crate::host::HostTier::call_pick_walk`], every copy at the
-    /// beside-union rate) where it did — in victim-slot order, a landing
-    /// batch a third of them, each batch's event on the copy stream after
-    /// its last copy ([`LandBatch`]) — the host map and the card's copy of
-    /// the layer's words moved at once, so the union the walk's serve runs
-    /// next, and the card route, run under the moved map, each GEMM batch
-    /// waiting its own batch's event and no later copy. Under `split` the
-    /// expert stream then takes the layer
-    /// ([`crate::host::HostTier::xstream_layer`]): the host experts its rule
-    /// sends to the card stream into a half of its ring, its copies batched
-    /// the same way, and the serve leaves them out; the layer's ring view
-    /// for its card route is returned. Nothing else, and nothing in a walk
-    /// narrower than the gate the pick admits from.
-    ///
-    /// One pick a layer for the walk's units: the first unit's routed ids
-    /// count `units` times each (the group's width, `units · m`), so the
-    /// pick, its floor and the stream's rule price the group; under `split`
-    /// every later unit joins the layer's stream
-    /// ([`crate::host::HostTier::xstream_share`]) before any card route
-    /// reads it, so its serve leaves out the same experts and the stream
-    /// stays open for its card route. A later unit's card route reads the
-    /// same landing batches and ring ([`UnitWalk`]'s `held`).
-    fn stream_pick(
-        &mut self,
-        port: &mut BatchLeg<'a, HostRun>,
-        at: At,
-        (m, units): (usize, usize),
-    ) -> Result<(Option<RingLayer>, Vec<LandBatch>), GpuError> {
-        let l = at.layer;
-        if !self.stream.on || !self.card.has(l) {
-            return Ok((None, Vec::new()));
-        }
-        let scale = u32::try_from(units)
-            .map_err(|_| GpuError::shape(WHAT, format!("a walk of {units} units")))?;
-        let group = units * m;
-        let split = self.stream.split;
-        // The walk only where the lane probed: its gate is the least width
-        // whose picks could pay a first admit, derived without the tail (the
-        // counts it prices from do not exist yet). A load with no probe
-        // admits from the stream floor, so short prompts move what they did.
-        let k = port.hybrid().xstream().and_then(|x| x.constants(l));
-        let walked = split && k.is_some();
-        let gate = match k.as_ref() {
-            Some(k) if split => runtime::xsplit::walk_gate(k),
-            _ => STREAM_FLOOR,
-        };
-        // A walk of fewer rows than the gate gives no expert a count the
-        // pick admits (a call's last ubatch can be one).
-        if group < gate as usize {
-            return Ok((None, Vec::new()));
-        }
-        let key = port.key(at);
-        let stream = self.c.gpu.stream();
-        let ret = self.return_cost(port, l);
-        let s = &mut *self.stream;
-        let mut pick = match (split, k) {
-            (true, Some(k)) => port.hybrid().call_pick_walk_scaled(
-                stream,
-                key,
-                &mut s.counts,
-                k,
-                s.card_tail_us_per_pick,
-                ret,
-                scale,
-            )?,
-            _ => port.hybrid().call_pick_routed_scaled(
-                stream,
-                key,
-                &mut s.counts,
-                usize::MAX,
-                scale,
-            )?,
-        };
-        // The no-probe floor witness: the pick admitted from the stream
-        // floor rather than the walk's measured plan.
-        pick.fallback = u32::from(!walked);
-        let admitted = pick.admitted;
-        let land = std::mem::take(&mut pick.land);
-        s.picks.push((s.ubatch, pick));
-        if !split {
-            return Ok((None, land));
-        }
-        let x = port
-            .hybrid()
-            .xstream_layer(stream, key, group, &s.counts, admitted)?;
-        s.layers.push((s.ubatch, x));
-        for unit in 1..units {
-            let other = port.key(At { unit, layer: l });
-            port.hybrid().xstream_share(l, other)?;
-        }
-        Ok((port.hybrid().xstream_ring(l), land))
-    }
-
-    /// Whether this walk is the last of a call that returns to its start: it
-    /// returns each layer once the layer's host service has run.
-    fn returns_here(&self) -> bool {
-        let s = &*self.stream;
-        s.on && s.returning && self.pos0 + self.m == s.call_end
-    }
-
-    /// In the returning call's last walk, at a layer's shadow — its front
-    /// already enqueued, so the card never waits on this — the return of the
-    /// layer whose host service ran last
-    /// ([`crate::host::HostTier::call_return`]), then the call's queued
-    /// return copies pumped while the host waits for this layer's download
-    /// ([`crate::host::HostTier::call_return_pump`]): the copies fill the
-    /// host's idle wait for the card's front, and the layer's pick issues its
-    /// own behind a ring's worth of them at most. Nothing else.
-    fn stream_return(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        if !self.returns_here() {
-            return Ok(());
-        }
-        if let Some(l) = self.stream.owed.take() {
-            port.hybrid().call_return(l, self.c.gpu.stream())?;
-        }
-        let key = port.key(at);
-        port.hybrid().call_return_pump(key)?;
-        Ok(())
-    }
-
-    /// The return cost of an admit at layer `l`'s pick
-    /// ([`runtime::xsplit::ReturnCost`]): exposed in the returning call's
-    /// last walk while the call owes return copies the walk has not issued
-    /// (the lane fell behind the fronts), and at the walk's last card layer,
-    /// whose return no front follows; hidden otherwise.
-    fn return_cost(&self, port: &mut BatchLeg<'a, HostRun>, l: usize) -> ReturnCost {
-        if !self.returns_here() {
-            return ReturnCost::Hidden;
-        }
-        let last = !(l + 1..self.plans.len()).any(|j| self.card.has(j));
-        if last || port.hybrid().call_returns_owed() > 0 {
-            ReturnCost::Exposed
-        } else {
-            ReturnCost::Hidden
-        }
-    }
-
-    /// Under host streaming, on a layer with card experts, a unit's read of
-    /// the layer after its card route. The walk's `last` unit's is the
-    /// layer's last read of its slots in the call so far
-    /// (`SwapMachine::call_reader`): the next ubatch's pick of the layer and
-    /// the call's return copies of it wait behind that read — recorded at an
-    /// earlier unit, they would land while a later unit's route reads the
-    /// slots. Under `split` every unit reads the layer's stream
-    /// ([`crate::host::HostTier::xstream_read`]), which closes at the
-    /// group's last, the half's next stream copying behind it. Nothing else.
-    fn stream_read(
-        &mut self,
-        port: &mut BatchLeg<'a, HostRun>,
-        l: usize,
-        last: bool,
-    ) -> Result<(), GpuError> {
-        if !self.stream.on || !self.card.has(l) {
-            return Ok(());
-        }
-        let stream = self.c.gpu.stream();
-        if last {
-            port.hybrid().call_reader(l, stream)?;
-        }
-        if self.stream.split {
-            port.hybrid().xstream_read(l, stream)?;
-        }
-        Ok(())
-    }
 }
 
 impl<'a> LayerProgram for UnitWalk<'_, 'a> {
@@ -2722,10 +2497,10 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
     /// would start late by their whole time. Under host streaming the shared
     /// expert comes first, so the card runs it while the host counts and
     /// picks; then the layer's pick (and stream), the first unit's alone
-    /// ([`WideParts::stream_pick`]), and the route, its GEMM batches each
+    /// ([`PromptStream::pick`]), and the route, its GEMM batches each
     /// behind the landing batch it reads — a later unit's over the first
     /// unit's pick, held for it — then the unit's read
-    /// ([`WideParts::stream_read`]), the last unit's the layer's last read of
+    /// ([`PromptStream::read`]), the last unit's the layer's last read of
     /// its slots in the call. The shadow's first launch is marked for the
     /// walk's timer: the order puts the other unit's parts between a unit's
     /// download and its shadow.
@@ -2737,16 +2512,18 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
         let u = unit_at(&mut self.units, at)?;
         let p = &mut *self.p;
         let last = at.unit + 1 == units;
+        let walk_end = p.pos0 + p.m;
         let r = port
             .mark(at, Mark::ShadowStart as usize)
             .and_then(|()| {
-                if !p.stream.on {
+                if !p.stream.streaming() {
                     return p.route_card(u, l, None, &[]).and_then(|()| p.shared(u, l));
                 }
                 p.shared(u, l)?;
-                p.stream_return(port, at)?;
+                p.stream.return_at_shadow(port, at, walk_end)?;
                 let (ring, land) = if at.unit == 0 {
-                    p.stream_pick(port, at, (u.m, units))?
+                    p.stream
+                        .pick(port, at, (u.m, units), walk_end, |l| p.card.has(l))?
                 } else {
                     let h = held.take().filter(|h| h.layer == l).ok_or_else(|| {
                         GpuError::protocol(
@@ -2774,7 +2551,7 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
                         streams,
                     });
                 }
-                p.stream_read(port, l, last)
+                p.stream.read(port, l, last, |l| p.card.has(l))
             })
             .and_then(|()| port.mark(at, Mark::Shadow as usize));
         port.part_end(at, enq);
@@ -2803,8 +2580,9 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
         // The layer's host service has run for every unit once its last
         // unit's back runs: in the returning call's last walk its return is
         // due, asked at the next layer's shadow.
-        if r.is_ok() && at.unit + 1 == units && p.returns_here() && p.card.has(l) {
-            p.stream.owed = Some(l);
+        if r.is_ok() && at.unit + 1 == units && p.stream.returns_here(p.pos0 + p.m) && p.card.has(l)
+        {
+            p.stream.owe_return(l);
         }
         port.part_end(at, enq);
         r

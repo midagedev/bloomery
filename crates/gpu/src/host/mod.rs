@@ -100,6 +100,7 @@ pub mod lane;
 pub mod leg;
 pub mod nvtier;
 pub mod page;
+pub mod prompt_stream;
 pub mod residency;
 pub mod route_trace;
 pub mod run;

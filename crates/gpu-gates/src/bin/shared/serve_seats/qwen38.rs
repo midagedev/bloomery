@@ -277,7 +277,7 @@
 //! count one (`parallel … from=route-trace`).
 //!
 //! `BLOOMERY_XSTREAM` resolves by the rule `generate_qwen3moe` runs
-//! (`shared/xstream38.rs`): set as given; unset `split` under `--place a`
+//! (`shared/xstream_rule.rs`): set as given; unset `split` under `--place a`
 //! with a residency machine (`admit` when the card has no room for the
 //! stream's ring), `admit` under `--place bp` with one, `off` everywhere
 //! else. The open resolves it last, after the slots and the drafts, and
@@ -366,9 +366,9 @@ pub(crate) use qwen38_levers::ACTS_ON;
 #[path = "../route_trace38.rs"]
 mod route_trace38;
 use route_trace38::{TraceRun, experts_name};
-#[path = "../xstream38.rs"]
-mod xstream38;
-use xstream38::{Stage38, xstream38};
+#[path = "../xstream_rule.rs"]
+mod xstream_rule;
+use xstream_rule::{Stage, xstream_rule};
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
                      [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
@@ -496,11 +496,11 @@ impl Place38 {
     }
 
     /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
-    fn stage38(self) -> Stage38 {
+    fn stage38(self) -> Stage {
         match self.kind {
-            Kind38::A => Stage38::A,
-            Kind38::Bp => Stage38::Tiered,
-            Kind38::Gate => Stage38::Other,
+            Kind38::A => Stage::A,
+            Kind38::Bp => Stage::Tiered,
+            Kind38::Gate => Stage::Other,
         }
     }
 
@@ -1933,7 +1933,7 @@ struct SeatArgs {
     /// main thread.
     trace: Option<RouteTrace>,
     /// `BLOOMERY_XSTREAM` as set, or unset for the shared rule
-    /// ([`xstream38`]).
+    /// ([`xstream_rule`]).
     xstream: Option<&'static str>,
     /// `BLOOMERY_STEP_STATS`, the round records the seat prints.
     stats: bool,
@@ -2216,7 +2216,7 @@ impl Q38 {
         // The expert stream last: a started ring takes the card's free bytes
         // past its keep, so every card buffer the open makes comes before it.
         let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
-        let line = xstream38(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
+        let line = xstream_rule(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
         eprintln!("{line}");
         let census = {
             let b = s.model().body(WHAT)?;

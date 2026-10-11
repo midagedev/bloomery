@@ -152,7 +152,7 @@
 //! `admit` streams its hottest host experts into the residency pool, `split`
 //! admits and then streams the host experts the stream rule sends to the
 //! card through the expert stream's ring. Unset (the rule the Qwen3.8 serve
-//! seat shares, `shared/xstream38.rs`) it is `split` under `--place a`
+//! seat shares, `shared/xstream_rule.rs`) it is `split` under `--place a`
 //! with a residency machine — `admit` under `bp`, whose expert
 //! tier the ring does not serve, and where the card has no room for the
 //! ring, named on the `xstream=` line — and `off` everywhere else; `admit`
@@ -351,8 +351,8 @@ mod q38place;
 mod gen_slots;
 
 #[cfg(feature = "gpu")]
-#[path = "shared/xstream38.rs"]
-mod xstream38;
+#[path = "shared/xstream_rule.rs"]
+mod xstream_rule;
 
 #[cfg(feature = "gpu")]
 #[path = "shared/route_trace38.rs"]
@@ -365,7 +365,7 @@ mod cli {
     use super::q38place;
     use super::route_trace38::{self, TraceRun, experts_name};
     use super::taps;
-    use super::xstream38::{Stage38, xstream38};
+    use super::xstream_rule::{Stage, xstream_rule};
     use app::Session;
     use app::arch::qwen3moe::Q38Cfg;
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
@@ -1082,13 +1082,13 @@ mod cli {
     }
 
     /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
-    fn stage38(place: Place) -> Stage38 {
+    fn stage38(place: Place) -> Stage {
         if tiered(place) {
-            Stage38::Tiered
+            Stage::Tiered
         } else if place == Place::Gate {
-            Stage38::Other
+            Stage::Other
         } else {
-            Stage38::A
+            Stage::A
         }
     }
 
@@ -2387,7 +2387,7 @@ mod cli {
     }
 
     /// `BLOOMERY_XSTREAM` on the load and its `xstream=` line, by the rule
-    /// the Qwen3.8 serve seat shares ([`xstream38`]); `BLOOMERY_SPLIT_WALK`
+    /// the Qwen3.8 serve seat shares ([`xstream_rule`]); `BLOOMERY_SPLIT_WALK`
     /// set, the walks' cut (`on` the width rule's, refused by name on a load
     /// the rule does not price; unset, the load's own); `BLOOMERY_HOSTSTREAM`
     /// set here is refused by name.
@@ -2405,7 +2405,7 @@ mod cli {
             );
         }
         let (gpu, _, body) = m.body_parts("generate_qwen3moe")?;
-        let line = xstream38(gpu, body, levers.xstream(), stage38(place), residency)?;
+        let line = xstream_rule(gpu, body, levers.xstream(), stage38(place), residency)?;
         println!("{line}");
         if let Some(on) = levers.split_walk() {
             body.set_split_walk(if on { SplitWalk::Rule } else { SplitWalk::Off })?;

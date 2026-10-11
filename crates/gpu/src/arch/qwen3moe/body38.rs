@@ -116,7 +116,7 @@ use super::swap38::{self, DEADLINE, LIVE_DELAY};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, STREAM_FLOOR, SplitWalk, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
+    Gemm38, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
 };
 use crate::checkpoint::Checkpoints;
@@ -126,9 +126,10 @@ use crate::checkpoint::saved::{
 use crate::checkpoint::staging::NoRoom;
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
+use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
-use crate::host::swap::{CallCfg, CallPick, CallReport, PassReport, Residency};
+use crate::host::swap::{CallPick, CallReport, PassReport, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
@@ -932,7 +933,7 @@ pub struct Body38 {
     wide_timing: Option<PromptTiming>,
     /// The prompt call's host streaming (`BLOOMERY_XSTREAM`): off until a
     /// caller sets it ([`Body38::set_xstream`]).
-    stream: Stream38,
+    stream: PromptStream,
     /// The map check every walk reads ([`MapCheck::refuse`]): the tier's
     /// slot map's, or the one a gate planted in its place until it is taken
     /// back or the model reset.
@@ -1569,7 +1570,7 @@ impl Body38 {
             wide_hsum,
             wide,
             wide_timing: None,
-            stream: Stream38::default(),
+            stream: PromptStream::default(),
             card_leg,
             lane: LaneWord::new(stream)?,
             pending: None,
@@ -1859,7 +1860,7 @@ impl Body38 {
     /// call streams.
     pub fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         const WHAT_S: &str = "Body38::set_xstream";
-        if self.stream.on {
+        if self.stream.streaming() {
             return Err(GpuError::state(WHAT_S, "no prompt call streaming"));
         }
         if mode != XMode::Off && self.hybrid.swap().is_none() {
@@ -1883,18 +1884,7 @@ impl Body38 {
             } else {
                 XSTREAM_COSTS_UNFITTED
             };
-            let cfg = XCfg {
-                costs,
-                experts: geo::EXPERTS,
-                top_k: geo::N_USED,
-                max_half: 0,
-                keep_free: crate::host::xstream::KEEP_FREE,
-                min_half: crate::host::xstream::MIN_HALF,
-                fill_threads: crate::host::xstream::FILL_THREADS,
-                staging_slots: crate::host::xstream::STAGING_SLOTS,
-                deadline: DEADLINE,
-                probe: Vec::new(),
-            };
+            let cfg = XCfg::new(costs, geo::EXPERTS, geo::N_USED, DEADLINE, None);
             let half = self
                 .hybrid
                 .xstream_start(
@@ -1908,7 +1898,7 @@ impl Body38 {
                 r.arm_ring(gpu.stream(), half)?;
             }
         }
-        self.stream.mode = Some(mode);
+        self.stream.set_mode(mode);
         Ok(())
     }
 
@@ -1938,79 +1928,41 @@ impl Body38 {
     /// Whether a returning prompt call ([`super::wide38`]'s module doc) runs
     /// its whole return at its end instead of in its last unit's walk: the
     /// twin a gate holds the walk's return to, the same end state slot for
-    /// slot. Off at the load. Gate use. Refused by name while a call streams.
+    /// slot. Off at the load. Gate use. Refused by name while a call streams
+    /// ([`PromptStream::set_return_at_end`]).
     pub fn set_return_at_end(&mut self, on: bool) -> Result<(), GpuError> {
-        if self.stream.on {
-            return Err(GpuError::state(
-                "Body38::set_return_at_end",
-                "no prompt call streaming",
-            ));
-        }
-        self.stream.return_at_end = on;
-        Ok(())
+        self.stream.set_return_at_end(on)
     }
 
     /// The expert stream's rule costs in place of [`XSTREAM_COSTS`]
-    /// ([`crate::host::xstream::XStream::set_costs`]). Refused by name before
-    /// `split` started the stream and while a call streams.
+    /// ([`PromptStream::set_costs`]). Refused by name before `split` started
+    /// the stream and while a call streams.
     pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {
-        const WHAT_C: &str = "Body38::set_xstream_costs";
-        if self.stream.on {
-            return Err(GpuError::state(WHAT_C, "no prompt call streaming"));
-        }
-        self.hybrid
-            .xstream_mut()
-            .ok_or(GpuError::state(
-                WHAT_C,
-                "an expert stream (Body38::set_xstream's split starts it)",
-            ))?
-            .set_costs(costs)
-    }
-
-    /// What the next prompt calls move ([`Body38::set_xstream`]).
-    #[must_use]
-    pub fn xstream_mode(&self) -> XMode {
-        self.stream.mode.unwrap_or(XMode::Off)
+        self.stream.set_costs(&mut self.hybrid, costs)
     }
 
     /// The load line's `xstream=` word: the mode, and under a started
     /// stream its ring's slots a half, its pinned staging slots (0:
     /// pageable), the lane's measured rate in GB/s and the least unit width
-    /// that streams.
+    /// that streams ([`PromptStream::word`]).
     #[must_use]
     pub fn xstream_word(&self) -> String {
-        let mode = self.xstream_mode().word();
-        match self.hybrid.xstream() {
-            Some(x) => format!(
-                "{mode} xstream_half={} xstream_staging={} xstream_lane_gbs={:.2} \
-                 xstream_m_min={}",
-                x.half_slots(),
-                x.staging_slots(),
-                x.lane_b_per_us() / 1000.0,
-                x.m_min().map_or("none".to_string(), |m| m.to_string())
-            ),
-            None => mode.to_string(),
-        }
+        self.stream.word(&self.hybrid)
     }
 
     /// The last streaming prompt call's streamed layers, each with its
     /// ubatch, and the stream's end; empty and `None` after a call that did
-    /// not stream. Taken: a second read is empty.
+    /// not stream. Taken: a second read is empty
+    /// ([`PromptStream::take_xstream_records`]).
     pub fn take_xstream_records(&mut self) -> (Vec<(usize, XLayer)>, Option<XReport>) {
-        (
-            std::mem::take(&mut self.stream.layers),
-            self.stream.xend.take(),
-        )
+        self.stream.take_xstream_records()
     }
 
     /// The last streaming prompt call's picks, each with its ubatch, and its
     /// end; empty and `None` after a call that did not stream. Taken: a
-    /// second read is empty.
+    /// second read is empty ([`PromptStream::take_pick_records`]).
     pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
-        (
-            std::mem::take(&mut self.stream.picks),
-            self.stream.end.take(),
-        )
+        self.stream.take_pick_records()
     }
 
     /// The residency machine's source, when the load runs one.
@@ -3312,106 +3264,47 @@ impl GpuModel<Body38> {
         Ok(next)
     }
 
-    /// Open the prompt call's streaming when the lever is `admit` or
-    /// `split`, the path is the ubatch walk's ([`super::wide38`]'s module
-    /// doc) and the prompt's `n` ids reach the least gate a pick admits from
-    /// ([`STREAM_FLOOR`] under `admit`, the stream rule's walk gate under
-    /// `split`): the residency machine's call
-    /// ([`crate::host::HostTier::call_begin`]) inside the pass the boundary
-    /// just opened, and under `split` the expert stream's
-    /// ([`crate::host::HostTier::xstream_begin`]). Nothing otherwise: a row
-    /// routes an expert once at most, so a prompt of fewer ids than the
-    /// gate — and every pass, of at most [`PASS_ROWS`] rows — gives no
-    /// expert a count its pick would admit, and its walks would only wait
-    /// on each layer's download for nothing. A call that `returns` to its
-    /// start (a decode history) returns each layer in the walk of its last
-    /// unit, the one ending at the call's end position, unless the gate's
-    /// twin is set ([`Body38::set_return_at_end`]). Refused by name: a call
-    /// streaming already, and a mode with no machine.
+    /// Open the prompt call's streaming ([`PromptStream::begin`]) with the
+    /// body's own facts: the call's ids and end position, whether the path
+    /// is the ubatch walk's, the pick's no-probe floor ([`STREAM_FLOOR`]),
+    /// the Q4 kind's card tail rate ([`XSTREAM_TAIL_US_PER_CARD_COL`]; none
+    /// on a kind no record has priced — the walk then balances without it)
+    /// and the map's layers. A pass runs at most [`PASS_ROWS`] rows, under
+    /// the floor, so no pass-fed call opens one.
     fn stream_begin(&mut self, path: Prompt38, n: usize, returns: bool) -> Result<(), GpuError> {
         const _: () = assert!(PASS_ROWS < STREAM_FLOOR as usize);
         const WHAT_B: &str = "qwen4exp prompt streaming";
         let end = self.pos() as usize + n;
         let (gpu, _, body) = self.body_parts(WHAT_B)?;
-        if body.stream.on {
-            return Err(GpuError::state(WHAT_B, "no call streaming (stream_end)"));
-        }
-        body.stream.picks.clear();
-        body.stream.end = None;
-        body.stream.layers.clear();
-        body.stream.xend = None;
-        body.stream.ubatch = 0;
-        body.stream.owed = None;
-        body.stream.returning = returns && !body.stream.return_at_end;
-        body.stream.call_end = end;
-        let mode = body.xstream_mode();
         // The file's own tail rate: the Q4 kind's measured one, none on a
         // kind no record has priced — the walk then balances without it.
-        body.stream.card_tail_us_per_pick = if body.routed_gate == GgmlType::Q4_K {
+        let tail = if body.routed_gate == GgmlType::Q4_K {
             XSTREAM_TAIL_US_PER_CARD_COL
         } else {
             0.0
         };
-        let floor = match (mode, body.hybrid.xstream()) {
-            (XMode::Split, Some(x)) => (0..body.plans.len())
-                .map(|l| {
-                    x.constants(l)
-                        .map_or(STREAM_FLOOR, |k| runtime::xsplit::walk_gate(&k))
-                })
-                .chain([STREAM_FLOOR])
-                .min()
-                .unwrap_or(STREAM_FLOOR),
-            _ => STREAM_FLOOR,
-        };
-        if mode == XMode::Off || path != Prompt38::Gemm || n < floor as usize {
-            return Ok(());
-        }
-        let cfg = CallCfg { floor };
-        if !body.hybrid.call_begin(gpu.stream(), cfg)? {
-            return Err(GpuError::state(
-                "BLOOMERY_XSTREAM",
-                "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>)",
-            ));
-        }
-        body.stream.on = true;
-        body.stream.split = mode == XMode::Split && body.hybrid.xstream_begin();
-        if mode == XMode::Split && !body.stream.split {
-            body.stream.on = false;
-            let _ = body.hybrid.call_end(gpu.stream(), false);
-            return Err(GpuError::state(
-                "BLOOMERY_XSTREAM=split",
-                "an expert stream (Body38::set_xstream starts it)",
-            ));
-        }
-        Ok(())
+        body.stream.begin(
+            &mut body.hybrid,
+            gpu.stream(),
+            path == Prompt38::Gemm,
+            n,
+            end,
+            returns,
+            STREAM_FLOOR,
+            tail,
+            body.plans.len(),
+        )
     }
 
-    /// End the prompt call's streaming, if it streams: the expert stream's
-    /// end under `split` ([`crate::host::HostTier::xstream_end`]), then the
-    /// residency machine's ([`crate::host::HostTier::call_end`]) whatever the
-    /// first returned, its placement `kept` for the decode after it, else
-    /// each layer back at the set the call started with; the ends' reports
-    /// kept for [`Body38::take_stream_records`] and
-    /// [`Body38::take_xstream_records`]. The first error is returned.
-    /// [`Body38::prompt38_with`]'s call passes `kept` false before a decode
-    /// history ([`crate::host::HostTier::call_history`]): the decode's
-    /// experts go back on the card.
+    /// End the prompt call's streaming ([`PromptStream::end`]): the ends'
+    /// reports kept for [`Body38::take_stream_records`] and
+    /// [`Body38::take_xstream_records`]. [`Body38::prompt38_with`]'s call
+    /// passes `kept` false before a decode history
+    /// ([`crate::host::HostTier::call_history`]): the decode's experts go
+    /// back on the card.
     fn stream_end(&mut self, kept: bool) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen4exp prompt streaming")?;
-        if !std::mem::take(&mut body.stream.on) {
-            return Ok(());
-        }
-        let x = match std::mem::take(&mut body.stream.split) {
-            true => body.hybrid.xstream_end(),
-            false => Ok(None),
-        };
-        let ended = body.hybrid.call_end(gpu.stream(), kept);
-        body.stream.xend = x?;
-        body.stream.end = ended?;
-        // The stamps are final now: the end waited every layer's landed
-        // event, and every copy landed behind its staged ticket.
-        body.hybrid.call_staged_us(&mut body.stream.picks);
-        Ok(())
+        body.stream.end(&mut body.hybrid, gpu.stream(), kept)
     }
 
     /// [`GpuModel::prompt38_with`]'s units ([`GpuModel::feed38`]); while the
@@ -3503,7 +3396,7 @@ impl GpuModel<Body38> {
                     }
                     next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
                         body.walk_gemm(gpu, w, m, pos, last.then_some(head))?;
-                        body.stream.ubatch += 1;
+                        body.stream.walk_done();
                         Ok(last)
                     })?;
                     if let Some(f) = sink.as_deref_mut() {
@@ -3541,6 +3434,19 @@ impl GpuModel<Body38> {
                 "a path `Prompt38::resolve` settles (it returned `auto`)",
             )),
         }
+    }
+}
+
+impl crate::host::xstream::XStreamBody for Body38 {
+    /// [`Body38::set_xstream`]: the Qwen3.8 row's guards, its costs row and
+    /// its card's arming, over the shared start.
+    fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
+        Body38::set_xstream(self, gpu, mode)
+    }
+
+    /// [`Body38::xstream_word`].
+    fn xstream_word(&self) -> String {
+        Body38::xstream_word(self)
     }
 }
 
