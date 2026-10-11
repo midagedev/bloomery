@@ -1,7 +1,8 @@
 # Refill: a fill that takes over an evicted slot stops giving the slot's pages back before its reads (MADV_DONTNEED on the
 # slot, then the O_DIRECT reads fault ~772 zero pages back in). Host only (no kernel moved), so this is the dispatch-path A/B
-# AGENTS.md asks for. The base is main dc49ae45 built with `just build-decode` in its own worktree and remote dir
-# (/root/repo/bloomery-refill-base); this tree's generate_qwen3moe is the changed arm.
+# AGENTS.md asks for. The refill landed with 0.3.0, so the base is main b00ff641 with af6d0eba reverted (fa15c9d3, its only
+# change crates/gpu/src/host/nvtier.rs), built with `just build-decode` in its own worktree and remote dir
+# (/root/repo/bloomery-refab-base); main b00ff641's generate_qwen3moe (this tree) is the changed arm.
 #
 # Shape: r4b-decode.card's (A6000, plan a, ctx 3072, prose 512, BLOOMERY_RESIDENCY=off, BLOOMERY_DRAFT=off, one slot,
 # BLOOMERY_HOST_ROOM=27G with BLOOMERY_NVTIER_BYTES=20G) at a long decode, BLOOMERY_DECODE_N=1024. Not n = 96: R4b's prompt
@@ -59,7 +60,7 @@
 # holds s0runner's arm_lines, so each arm's nvtier record and the tokens check reach the log):
 #   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/refill-decode.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DRAFT=off BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' \
 #   BLOOMERY_AB_ROUNDS=10 just depth-gpu-qwen4exp \
-#     bin:/root/repo/bloomery-refill-base/target/release/generate_qwen3moe:prose:512@BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G \
+#     bin:/root/repo/bloomery-refab-base/target/release/generate_qwen3moe:prose:512@BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G \
 #     prose:512@BLOOMERY_RESIDENCY=off,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G
 kind: ab
 question: does a fill that takes over an evicted slot, no longer returning the slot's pages before its reads, speed the plain
@@ -67,7 +68,7 @@ question: does a fill that takes over an evicted slot, no longer returning the s
   longer pays?
 term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids), ctx 3072, A6000, plan a at the BLOOMERY_HOST_ROOM 27G
   with BLOOMERY_NVTIER_BYTES=20G (a 20 GiB arena), BLOOMERY_RESIDENCY=off, BLOOMERY_DRAFT=off, one slot; this tree's
-  generate_qwen3moe against main dc49ae45's, (ours - base) / base, paired by round
+  generate_qwen3moe against main b00ff641 with af6d0eba reverted (fa15c9d3)'s, (ours - base) / base, paired by round
 unit: %
 predict: +3..+13
 rounds: 10
