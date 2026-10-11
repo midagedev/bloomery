@@ -10,11 +10,13 @@
 //! reads — the NVMe segment's, and the card's victims once they flip — is
 //! this arena's, its slot refused by name while unfilled.
 //!
-//! The arena's own pages leave on an eviction alone, `MADV_DONTNEED` on the
-//! evicted slot's windows through the arena's one give-back
-//! (`ArenaMem::give_back`, the only door to the mapping's advice), which
-//! frees an anonymous range's pages — that is why the arena is anonymous and
-//! not the page cache, whose warm set nothing else can flush. The model
+//! The arena's own pages leave only when a landing frees a slot
+//! ([`NvTier::release`]), `MADV_DONTNEED` on the slot's windows through the
+//! arena's one give-back (`ArenaMem::give_back`, the only door to the
+//! mapping's advice), which frees an anonymous range's pages — that is why
+//! the arena is anonymous and not the page cache, whose warm set nothing
+//! else can flush. An eviction returns none: the slot's next fill, in the
+//! same call, overwrites the bytes it reads in place. The model
 //! file's mapping is its readers': a lane's copy of an id the arena holds
 //! unfilled reads it through the mapping, which faults its pages in from the
 //! drive, and once the copy has consumed them the tier drops them from the
@@ -72,9 +74,8 @@
 //! picks first and a flip's victim behind them. The claim and the pin stay on
 //! the caller; [`Ticket::wait`] joins the fill and publishes the picks under
 //! the books' lock. A pick's reads write straight into its slot's windows,
-//! after the pages of the expert it evicted went back, and the threads never
-//! take the pool's dispatch lock or the books' lock, and never wait on the
-//! card.
+//! over the expert it evicted, and the threads never take the pool's dispatch
+//! lock or the books' lock, and never wait on the card.
 
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -1580,7 +1581,7 @@ impl NvTier {
     }
 
     /// The arena's mapping as an address range `[start, end)`: the only
-    /// pages its evictions return.
+    /// pages its slot releases return.
     #[must_use]
     pub fn range(&self) -> (usize, usize) {
         let start = self.mem.start();
@@ -1907,8 +1908,8 @@ impl NvTier {
 
     /// Fill the slots of `layer`'s `ids` the arena does not already hold:
     /// the misses' parts read with [`DirectFile::read_span`] into their
-    /// slots' windows, split over the resident pool, the victims' pages
-    /// returned (`MADV_DONTNEED` on the arena's own range only). A read
+    /// slots' windows, split over the resident pool, over the victims'
+    /// bytes in place. A read
     /// that fails names its file, offset and errno; a slot whose fill
     /// failed is freed, never lent half-filled. An id the plan's host
     /// segment holds is the mapping's and is skipped ([`NvTier::serves`]).
@@ -2192,12 +2193,10 @@ impl NvTier {
     }
 }
 
-/// One pick's reads as a reader thread needs them, all owned: the pages to
-/// give back before it reads when the pick evicted an expert, and each
-/// part's file, window and aligned span ([`read_of`]).
+/// One pick's reads as a reader thread needs them, all owned: each part's
+/// file, window and aligned span ([`read_of`]).
 struct PickRead {
     id: u32,
-    give_back: Option<(usize, usize)>,
     parts: [PartRead; PARTS],
 }
 
@@ -2217,7 +2216,6 @@ fn read_of(arena: &LayerArena, p: &Pick) -> PickRead {
     let slot_off = arena.slot_off(p.slot);
     PickRead {
         id: p.id,
-        give_back: p.gone.map(|_| (slot_off, arena.slot_bytes)),
         parts: std::array::from_fn(|part| {
             let r = arena.parts[p.id as usize][part];
             let (start, span, need) = aligned_span(r.at, r.len as u64);
@@ -2232,17 +2230,15 @@ fn read_of(arena: &LayerArena, p: &Pick) -> PickRead {
     }
 }
 
-/// One pick's slot filled: the pages of the expert it evicted go back, then
-/// its three parts are read, each into its own window. The one body of a
-/// fill, whichever thread runs it: the resident pool's, the caller's or a
-/// reader's. The pages go back before the first read, never after, so no
-/// byte read is ever zeroed.
+/// One pick's slot filled: its three parts are read, each into its own
+/// window. The one body of a fill, whichever thread runs it: the resident
+/// pool's, the caller's or a reader's. A slot an eviction handed over keeps
+/// its pages: the reads overwrite the bytes they place and no page is
+/// returned and faulted in again, and the bytes of a window beside the read
+/// stay the evicted expert's, which no reader touches (a part's `need` is
+/// every byte the slot lends).
 fn read_pick(mem: &ArenaMem, r: &PickRead) -> Result<(), GpuError> {
     const WHAT: &str = "NvTier::fill";
-    if let Some((at, len)) = r.give_back {
-        mem.give_back(at, len)
-            .map_err(|e| GpuError::plan("NvTier::give_back", e))?;
-    }
     for part in &r.parts {
         // The pick owns its slot (the books marked it Filling, and no claim
         // takes a filling slot) and writes only this part's window of it.
@@ -3452,12 +3448,12 @@ mod tests {
         assert!(free.is_ok(), "no slot was left filling");
     }
 
-    /// A pick that evicted an expert gives its slot's pages back before its
-    /// first read, never after: the bytes read stay, and the part of a window
-    /// the read did not cover reads zero; a pick that evicted nothing leaves
-    /// the bytes beside its read as they were.
+    /// A pick over an evicted slot reads over its pages in place: the bytes
+    /// it reads replace the evicted expert's, and the rest of each window
+    /// keeps what it held (a returned page would read zero there) — evicted
+    /// or not, the same.
     #[test]
-    fn a_pick_gives_its_evicted_pages_back_before_it_reads() {
+    fn a_refill_of_an_evicted_slot_gives_no_pages_back() {
         use engram::direct::{AnonMap, DirectFile};
         use std::sync::Arc;
         const PAGE: usize = DIRECT_ALIGN;
@@ -3470,43 +3466,35 @@ mod tests {
             Arc::new(DirectFile::open_buffered(&old).unwrap()),
             Arc::new(DirectFile::open_buffered(&new).unwrap()),
         );
-        let mem = super::ArenaMem::new(AnonMap::new(3 * PAGE).unwrap());
-        let dirty = || {
-            for part in 0..3 {
-                let got = mem.read_into(&old, 0, part * PAGE, PAGE).unwrap();
+        let mut arena = arena_of(8, 2);
+        arena.windows = [0, PAGE, 2 * PAGE];
+        arena.slot_bytes = 3 * PAGE;
+        arena.files = [Arc::clone(&new), Arc::clone(&new), new];
+        arena.parts = vec![
+            [PartRange {
+                at: 0,
+                len: 100,
+                skew: 0,
+            }; PARTS];
+            8
+        ];
+        let mem = super::ArenaMem::new(AnonMap::new(2 * arena.slot_bytes).unwrap());
+        for (slot, gone) in [(0, Some(3)), (1, None)] {
+            let base = slot * arena.slot_bytes;
+            for part in 0..PARTS {
+                let got = mem.read_into(&old, 0, base + part * PAGE, PAGE).unwrap();
                 assert_eq!(got, PAGE);
             }
-        };
-        let pick = |give_back| super::PickRead {
-            id: 7,
-            give_back,
-            parts: std::array::from_fn(|part| super::PartRead {
-                file: Arc::clone(&new),
-                at: part * PAGE,
-                span: PAGE,
-                start: 0,
-                need: 100,
-            }),
-        };
-        dirty();
-        super::read_pick(&mem, &pick(Some((0, 3 * PAGE)))).unwrap();
-        for part in 0..3 {
-            assert!(mem.slice(part * PAGE, 100).iter().all(|&b| b == 0x11));
-            assert!(
-                mem.slice(part * PAGE + 100, PAGE - 100)
-                    .iter()
-                    .all(|&b| b == 0)
-            );
-        }
-        dirty();
-        super::read_pick(&mem, &pick(None)).unwrap();
-        for part in 0..3 {
-            assert!(mem.slice(part * PAGE, 100).iter().all(|&b| b == 0x11));
-            assert!(
-                mem.slice(part * PAGE + 100, PAGE - 100)
-                    .iter()
-                    .all(|&b| b == 0xEE)
-            );
+            let pick = super::Pick { slot, id: 7, gone };
+            super::read_pick(&mem, &super::read_of(&arena, &pick)).unwrap();
+            for part in 0..PARTS {
+                let at = base + part * PAGE;
+                assert!(mem.slice(at, 100).iter().all(|&b| b == 0x11));
+                assert!(
+                    mem.slice(at + 100, PAGE - 100).iter().all(|&b| b == 0xEE),
+                    "slot {slot} part {part}: the bytes beside the read were returned"
+                );
+            }
         }
     }
 
