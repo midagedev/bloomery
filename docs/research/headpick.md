@@ -25,6 +25,54 @@ checked-in held-out files against the two lists (formula in §1.1); they reprodu
 
 Migration: Qwen3.8 first, in three landings (§7.4). GLM and DSpark attach with zero lists first.
 
+## 0.1 L2 recut: one list plus warm spare rows (decided 2026-10-11)
+
+The user delegated the two questions `headpick-warmup.md` raised to the lead, who decided on 2026-10-11. This section
+supersedes the parts of §0-§9 named below. §1-§5 stay as the derivation that led to the decision.
+
+**The head is one list plus warm spare rows** (`headpick-warmup.md` §3.5, arm `cblind`). `C` (cjk-76000) stays the one
+shipped list. Its 2,048 highest non-control ids (below the control block, id ≥ 248,044, which is protected by
+definition) are a writable spare region per slot, filled from the slot's accepted ids. Every held-out set reaches
+≥ 0.991 of its best static list after 256 ids, and zh/ja/ko reach 0.998-1.01 from id 0. That is within the 4-round
+ruler of the pick of §1 `[sim]`, with one list instead of per-language lists. This is the user's own idea ("적당히 웜업").
+- **A miss starts from the cold base.** A session's spare rows are a function of its ids, so a KV-prefix hit refolds the
+  prefix's ids into the slot's map. That is exact (79,200 of 79,200 windows, `headpick-warmup.md` §4.1) and stores
+  nothing. A miss starts from `C` as shipped. A blended card-wide head profile loses to the cold base (ja −1.8 to −2.2
+  points `[sim]`), so the profile file holds card-wide residency and width state only, and the head has no section in it
+  (`headpick-warmup.md` §6).
+- **Rows never blend across slots.** Each slot has its own map of `R` words, swapped with its graphs (`DraftSeq38`).
+- **What it replaces:**
+  - the pick rule (§1.1-§1.3, G1, G3's pick) and the `D→C` upgrade (§1.4, G2);
+  - the second list `D` (§5) as a shipped default;
+  - the chooser's class state (§8, G10): with one list there is no class change. A large burst of spare-row writes is
+    not a class.
+  - `BLOOMERY_MTP_HEAD_ROWS` set to a path stays "one list, as given": no spare rows, as §9 says for a given list.
+- **Cost:** a dirty span of ≤ 8 KB a change window, written by an async host→card copy on the stream between passes.
+  It adds 0 kernels and 0 graph nodes; the walk's map address, `rows`, grid and argmax `n` are fixed by the fixed `R`
+  (`headpick-warmup.md` §5.1-§5.2).
+- **G8 exception (dated 2026-10-11):** G8 pinned `plan.map_bytes` to the single-list load's. One map per slot makes it
+  `max(vocab, slots × R)` words: 608 KB at the default 2 slots, 1.2 MB at 4 (`headpick-warmup.md` §5.3). The plan's
+  shape (which rows, the grid, `n`) does not change, only the spare rows' contents. G8 becomes "the plan's
+  `map_bytes` and the open-time `got == want` equal `max(vocab, slots × R)` words, the same at every point of a run".
+  `gate_qwen4exp_mtp.rs` (d) and (r), which pin the map as the list's ids, compare the protected prefix (`R − 2,048`
+  rows) after the first write: a coverage change with this dated reason, not a relaxation.
+- **Gates of the recut** (they replace G1, G2, G3's pick and G10; G4-G7 and G9 stay, with G6's ratio clause measured per
+  slot's spare region):
+  - **S1:** the fold is pure, in `crates/models/src/headpick.rs` unit tests (`just mac-test`):
+    - the same ids folded live or at once give the same set;
+    - a control id is never written;
+    - the eviction keeps `R`;
+    - FAIL-first mutants: a fold that writes a control id, and a fold whose order depends on time.
+  - **S2:** two slots, zh-chat on slot 0 and en-prose on slot 1, run under `BLOOMERY_MTP_WIDTH=fixed`. Each slot's spare
+    rows hold only its own ids. FAIL-first mutant: one map shared by both slots.
+  - **S3:** a KV-prefix hit refolds the prefix, so turn 2's first window equals the unbroken stream's.
+- **Migration:**
+  - L0 and L1 are unchanged: the host reader and one device map (§7.4).
+  - L2 becomes the spare rows: the per-slot map, the fold, the refold at admission, S1-S3 and the G8 exception.
+  - The timed claim is one `noninf` card: spare rows against `C` alone, same binary, predicted +0.6 to +2.9 % on en/code
+    `[derived]`: `C` sits at 0.972-0.985 of the best list there (§3.1 of `headpick-warmup.md`) and the spare rows at
+    ≥ 0.991 after 256 ids (its §3.5). The zh/ja/ko rows are predicted at 0.0 %.
+
 ## 1. The pick rule and its boundary
 
 ### 1.1 The model the rule is derived from
@@ -292,7 +340,7 @@ tokens (§4).
 | G5 | Tokens identical: greedy ids of one prompt set under {full head, `D`, `C`} are equal, residency off | `gate_qwen4exp_mtp.rs` (map uses `:3732`, `:4828`) | a map that aliases the target's buffers: red. **This cannot catch a wrong-list routing bug**: tokens are equal under any list by construction (the head changes the draft only, `registry.rs:406-410`) |
 | G6 | Per-slot routing that sees acceptance: two slots through `pass_rows_one_pass`, a zh-chat prompt on slot 0 and an en-prose prompt on slot 1, greedy, residency off; each slot's pick record names its list; run under `BLOOMERY_MTP_WIDTH=fixed` and `BLOOMERY_MTP_WINDOWS=1` (as q38cjk-ab, `q38cjk-ab.card:19-22`: under the cost chooser the width is cut or the gate closes on `D`-zh and E(4) is not measured), slot 0's E(4) under the pick is **≥ 1.5x** its E(4) forced to `D` (derived zh-chat ratio 3.526/1.597 = 2.21, the q38cjk card predicts 2.0-2.5x; a wrong-list slot gives ≈ 1.0x, so 1.5x sits well between and does not ride the band's lower edge) | `gate_qwen4exp_mtp.rs` and `serve_seats` | model-level "last list set wins" state (the list stored on `Mtp38` instead of the slot): slot 0 runs `D` or slot 1 runs `C`, E(4) clause red |
 | G7 | Swap: one slot runs en → zh → en with the upgrade; after each change the tokens equal the plain run's and the first headed walk's key carries the new list (`Mtp38::graph_nodes()` names it, `mtp38.rs:1481`) | same | key without the list: the post-switch walk replays the old list's baked grid, E(4) clause red (same fixed-width, 1.5x condition) |
-| G8 | Plan invariance: `plan.map_bytes` and the open-time `got == want` equal the single-list load's with two lists; a list set whose rows sum past the vocabulary is refused by name | `mtp38.rs:355-372` clause in `gate_qwen4exp_mtp.rs`; the owner's unit test | overlap allowed: refusal red |
+| G8 | (Amended 2026-10-11, §0.1: `max(vocab, slots × R)` words with one map per slot.) Plan invariance: `plan.map_bytes` and the open-time `got == want` equal the single-list load's with two lists; a list set whose rows sum past the vocabulary is refused by name | `mtp38.rs:355-372` clause in `gate_qwen4exp_mtp.rs`; the owner's unit test | overlap allowed: refusal red |
 | G9 | Records: the per-request pick record (list, rows, `S`, `P`, class, `from`: `pick` / `upgrade` / `set`) is a `Kind` in `record.rs` (the load's `MTP_HEAD38` at `:1198-1212` is one record per load); `just records-refresh` | `crates/gpu-gates/src/bin/shared/record.rs` area, `tools/bloomery/schema/` | a missing field panics by name (the `Record` machinery) |
 | G10 | Chooser class state (§8): (1) a chooser forced closed, then a class change: the next pass drafts; (2) two classes alternating on the mock clock: the second class's first window uses its own profile | `crates/runtime/src/width.rs` tests | (1) without the reopen the closed gate persists for the reply; (2) without the key the second class's first window takes the first class's width |
 
@@ -373,7 +421,7 @@ Not all three at once. The reasons are the files, the gates and the half-moved r
 |---|---|---|---|---|
 | L0 move, host | reader, `HeadRows`→`HeadSet`, `break_even` to `models::headpick`; `head_list.rs` onto `ListDef` with one list | `models/src/{lib,headpick}.rs`, `model/src/arch/qwen35moe/{place,head_list}.rs`, `head_coverage.rs`, `gpu-gates` call sites (`qwen38.rs:342`, `:1370`; `generate_qwen3moe.rs:398`, `:991`, `:2228`) | move: `ptx-scan` identical (`--no-jit` suffices); no timed A/B | crates `models`→ its dependants: wide; narrowed by `just narrow` to the host-path gates plus `gate-models` and the recipe checks |
 | L1 move, device | `RowMaps`/`HeadSel` in `gpu`; `Mtp38` onto it with **one** list; `MtpKey.head: HeadSel`; `MtpBody::Head` removed | `gpu/src/head_rows.rs`, `mtp38.rs`, `body38.rs`, `app/src/mtp.rs`, `app/src/arch/{qwen3moe,glm5next}/mtp.rs` (GLM keeps `Full` only), and the `head_map()` consumers (`gate_qwen4exp_mtp.rs:3732`, `:4828`, `generate_qwen3moe.rs:2299`, `mtp38.rs:454`) | move: `ptx-scan` identical; structural lines (graph node count per key, eager = replay) | `gate-gpu-qwen4exp-mtp`, `gate-gpu-lib` (never dropped), the app and serve gates |
-| L2 feature | second list, pick, upgrade, chooser class state (§8), records, lever text | `head_list.rs`, `headpick.rs`, `mtp.rs`, `runtime/src/{width,speculative}.rs`, `record.rs`, `registry.rs:389-415`, cards `q38cjk-ab.card:47-50` conditions (`head=rows=76000 shipped` becomes the `from=pick` word) | behaviour: G1-G9, one A/B (§6) | the L1 set plus `gate-runtime`, `gate-levers`, `check-recipes`, `records-refresh` |
+| L2 feature | (recut 2026-10-11, §0.1: one list plus warm spare rows per slot, the fold and the refold, S1-S3, the G8 exception) second list, pick, upgrade, chooser class state (§8), records, lever text | `head_list.rs`, `headpick.rs`, `mtp.rs`, `runtime/src/{width,speculative}.rs`, `record.rs`, `registry.rs:389-415`, cards `q38cjk-ab.card:47-50` conditions (`head=rows=76000 shipped` becomes the `from=pick` word) | behaviour: G1-G9, one A/B (§6) | the L1 set plus `gate-runtime`, `gate-levers`, `check-recipes`, `records-refresh` |
 | later: GLM (list build + attach), DSpark (list + kernels) | §7.5, §7.6 | | add: ptx-scan = base plus exactly the new entries (DSpark) | |
 
 Why this order: L0 and L1 are moves that change no byte of the Qwen3.8 binary, so they land first and cheap
