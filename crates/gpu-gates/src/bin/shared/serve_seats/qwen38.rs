@@ -39,30 +39,37 @@
 //! the total the N slots split): `/props`' `n_ctx` is a
 //! slot's number, a prompt that long is a 400 before it reaches the engine,
 //! and generation stops there with `truncated`. Unset, the context is
-//! [`margin38`]'s answer over a slot's share — the largest multiple of
+//! `placement::ctx::default_slot_ctx`'s answer over a slot's share (the one
+//! rule every serving seat takes, [`CTX`] a slot, steps of [`CTX_STEP`], a
+//! margin of `MARGIN` card expert bytes): the largest multiple of
 //! [`CTX_STEP`] up to the fit (the largest a slot's N-slot plan holds on the
 //! card, at most the file's serving cap) whose plan holds at most the plan's
 //! own margin (`MARGIN`) fewer card expert bytes than the N-slot plan at
-//! [`CTX`] a slot, the fit when every context does — the largest the card
-//! holds when that is fewer than [`CTX`], and at most what lets one
-//! session's sequence state with its two recurrent copies fit the prompt
-//! cache's budget (one session's whole slot context can be saved). Set, a
-//! total a slot's share of which passes the file's `context_length`
-//! (`place::serve_ctx`: YaRN scaling past it is not built), then one whose
-//! N-slot plan the card cannot hold beside the plan's dense weights — the
-//! largest slot context any N-slot plan of the file and the placement takes
-//! up to that cap ([`fit38`]) — is refused by name before the load; a set
-//! context keeps the MTP draft, so that refusal names the draft's card bytes
-//! and the context a slot holds without it. The
+//! [`CTX`] a slot and no more NVMe expert bytes, the fit when every context
+//! does — the largest the card holds when that is fewer than [`CTX`] — and
+//! at most what lets one session's sequence state with its two recurrent
+//! copies fit the prompt cache's budget (one session's whole slot context
+//! can be saved). Set, a total a slot's share of which passes the file's
+//! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
+//! then one whose N-slot plan the card cannot hold beside the plan's dense
+//! weights — the largest slot context any N-slot plan of the file and the
+//! placement takes up to that cap ([`fit38`]) — is refused by name before
+//! the load; a set context keeps the MTP draft, so that refusal names the
+//! draft's card bytes and the context a slot holds without it. The
 //! `load` line prints the stores' `ctx` (a slot's rows) with the slot count
 //! and each slot's context, the cap as `ctx_max`, `ctx_train` and
 //! `verified`, the deepest context the reference sets hold our numbers to
 //! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
-//! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names the rule, the slot context, the slots and
-//! the total they serve, the largest context the card holds with its card
+//! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names
+//! the rule (`card`, `base`, `fit`, `margin`, or `cache` where the prompt
+//! cache's budget lowered it), the slot context, the slots and the total
+//! they serve, the cap, the largest context the card holds with its card
 //! expert bytes, and the largest whose plan holds at most the plan's own
 //! margin (`MARGIN`) fewer card expert bytes than the plan at [`CTX`] a slot
-//! ([`margin38`]): more positions on the card push card experts to the host.
+//! (`margin_ctx`): more positions on the card push card experts to the host.
+//! `--plan` prints the records the decisions before the load make (the `ctx`
+//! line, the `plan` and `residency` records) and exits 0 before the route
+//! trace's directory is made or any model is loaded.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds that
 //! the recurrent layers can stand at: every held position, or the nearest
@@ -348,6 +355,7 @@ use model::arch::qwen35moe::place::{
     tier_batch,
 };
 use model::placement::churn::ChurnPool;
+use model::placement::ctx::{ExpertBytes, Refused, SlotCtx, default_slot_ctx, fit_of};
 use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -376,7 +384,7 @@ use xstream38::{Stage38, xstream38};
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
                      [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
                      [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
-                     [--api-key KEY] [--api-key-file FNAME]";
+                     [--plan] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The context the default's expert cost is counted against: the plan
 /// every Qwen3.8 measurement ran at, and `generate_qwen3moe`'s default.
@@ -764,7 +772,7 @@ fn draft38(
 /// NVMe expert tier's floor, answered by the one-column rule's own plan: the
 /// first plan the context search asks, at one position (`fit38`), is the
 /// asked slots' — its refusal, [`PlacementError::HostRoomFloor`], matched by
-/// type through the [`PlaceError`] that [`Plans::card`] hands back as it came
+/// type through the [`PlaceError`] that [`Plans::expert_bytes`] hands back as it came
 /// — and the arena of the one-slot plan with no draft, which the rule loads
 /// (`one`), when that plan pages (an arena past 0: the rule's own condition;
 /// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
@@ -778,7 +786,7 @@ fn floor_fallback(
     asked: &Plans<'_>,
     set: Option<(Residency, &str)>,
 ) -> Result<Option<u64>, GateError> {
-    let Err(refused) = asked.card(1) else {
+    let Err(refused) = asked.expert_bytes(1) else {
         return Ok(None);
     };
     let Some(PlaceError::Placement(PlacementError::HostRoomFloor { .. })) =
@@ -792,7 +800,7 @@ fn floor_fallback(
         ..*asked
     };
     let rule = ctx38(&one, None)?;
-    let arena = one.host(rule.ctx, set)?.2;
+    let arena = one.host(rule.ctx(), set)?.2;
     Ok((arena > 0).then_some(arena))
 }
 
@@ -831,9 +839,10 @@ struct Plans<'a> {
 }
 
 impl Plans<'_> {
-    /// The plan's card expert bytes at `ctx` positions a sequence serves, or
-    /// why no plan takes that context.
-    fn card(&self, ctx: usize) -> Result<u64, GateError> {
+    /// The plan's routed-expert bytes by tier at `ctx` positions a sequence
+    /// serves — the stage card's and the NVMe tier's, what the default rule
+    /// counts — or why no plan takes that context.
+    fn expert_bytes(&self, ctx: usize) -> Result<ExpertBytes, GateError> {
         let ub = ubatch_for(ctx)?;
         let ctx = u64::try_from(ctx)?;
         let machine = self.place.machine(
@@ -854,11 +863,14 @@ impl Plans<'_> {
                     .plan
             }
         };
-        Ok(plan
-            .cards
-            .first()
-            .ok_or("a plan with no card")?
-            .expert_bytes)
+        Ok(ExpertBytes {
+            card: plan
+                .cards
+                .first()
+                .ok_or("a plan with no card")?
+                .expert_bytes,
+            nvme: plan.host.nvme_expert_bytes,
+        })
     }
 
     /// The plan's host need (`HostNeed::bytes`, the NVMe expert tier's
@@ -930,89 +942,52 @@ fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
 /// The context the seat loads ([`ctx38`]) and what decided it: every number
 /// a slot's own — the stores' rows one sequence serves — the total they hold
 /// `slots` times over.
-struct Ctx38 {
-    /// A slot's context.
-    ctx: usize,
-    /// The resident sequences the plan counted.
-    slots: usize,
-    /// `set` (`--ctx-size`: under a set `--parallel N` the total the slots
-    /// split, alone one slot's whole context), or what decided the
-    /// default: `margin` ([`margin38`]'s answer), `card` (the largest
-    /// context the card holds, fewer than [`CTX`]), `cache` (one state in
-    /// the prompt cache's budget).
-    rule: &'static str,
-    /// What the default's search found; `None` for a set context, which
-    /// plans its own split alone.
-    search: Option<Search38>,
-    /// The plan's card expert bytes at `ctx`.
-    card_bytes: u64,
+enum Ctx38 {
+    /// `--ctx-size`: a slot's share of the flag, the plan's card expert
+    /// bytes there. The default's search probes contexts the flag did not
+    /// name, so a set context runs none.
+    Set {
+        ctx: usize,
+        slots: usize,
+        card_bytes: u64,
+    },
+    /// The unset default: the common rule's answer ([`ctx38`]), which the
+    /// prompt cache's bound may lower ([`Ctx38::host_bound`]) — `rule` and
+    /// `chosen` then name the bound and the plan at the lowered context.
+    Rule { found: SlotCtx, slots: usize },
 }
 
-/// The default's search: the largest slot context the card holds
-/// ([`fit38`]), the largest within the plan's margin ([`margin38`]), and the
-/// plan's card expert bytes at [`CTX`] a slot.
-#[derive(Clone, Copy)]
-struct Search38 {
-    fit: Fit38,
-    margin_ctx: usize,
-    base_bytes: u64,
+/// The refusal of a probe the common rule's searches ran, as this seat
+/// names it: a tier card the plan leaves idle is refused as itself
+/// (`PlacementError::IdleTier`): no context gives it an expert.
+fn refusal38(refused: Refused<GateError>) -> GateError {
+    match refused.source.downcast_ref::<PlaceError>() {
+        Some(PlaceError::Placement(PlacementError::IdleTier { .. })) => refused.source,
+        _ => refused.into(),
+    }
 }
 
-/// The largest slot context the card holds beside the plan's dense weights,
-/// and the plan's card expert bytes there.
-#[derive(Clone, Copy)]
-struct Fit38 {
-    ctx: usize,
-    card_bytes: u64,
+/// The most a slot serves: the file's serving cap (`place::serve_ctx`: its
+/// `context_length`).
+fn cap38(plans: &Plans<'_>) -> Result<usize, GateError> {
+    Ok(usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?)
 }
 
 /// The largest slot context any plan of the file and the placement takes —
-/// every plan counting the seat's slots — up to the file's serving cap
-/// (`place::serve_ctx`: its `context_length`): the most a `--ctx-size`'s
-/// split may give a slot. A tier card the plan leaves idle is refused as
-/// itself (`PlacementError::IdleTier`): no context gives it an expert.
-fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
-    let fits = |c: usize| Ok(plans.card(c).is_ok());
-    if let Err(e) = plans.card(1) {
-        if let Some(PlaceError::Placement(PlacementError::IdleTier { .. })) =
-            e.downcast_ref::<PlaceError>()
-        {
-            return Err(e);
-        }
-        return Err(
-            format!("no context fits the card: the plan at 1 position is refused ({e})").into(),
-        );
-    }
-    let most = usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?;
-    let ctx = model::placement::ctx::largest::<GateError>(1, most, fits)?;
-    Ok(Fit38 {
-        ctx,
-        card_bytes: plans.card(ctx)?,
-    })
-}
-
-/// The largest multiple of [`CTX_STEP`] up to `fit` whose plan holds at most
-/// `MARGIN` fewer card expert bytes than the plan at `base_at` a slot
-/// (`base_bytes` there), `fit` when every context does, `base_at` when no
-/// step past it does ([`model::placement::ctx::within_margin`], the seats'
-/// shared guard).
-fn margin38(
-    plans: &Plans<'_>,
-    fit: usize,
-    base_at: usize,
-    base_bytes: u64,
-) -> Result<usize, GateError> {
-    model::placement::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, MARGIN, &|c| {
-        plans.card(c)
-    })
+/// every plan counting the seat's slots — up to the file's serving cap: the
+/// most a `--ctx-size`'s split may give a slot.
+fn fit38(plans: &Plans<'_>) -> Result<usize, GateError> {
+    let (fit, _) = fit_of(cap38(plans)?, &|c| plans.expert_bytes(c)).map_err(refusal38)?;
+    Ok(fit)
 }
 
 /// The seat's context (the module doc), every number a slot's own: `set`
 /// when the file's serving cap takes a slot's share of the total
 /// (`place::serve_ctx`, refused by name past it) and it fits the card
-/// ([`fit38`]), else refused by name; unset, [`margin38`]'s answer, or the
-/// largest the card holds when that is fewer than [`CTX`]. The prompt
-/// cache's bound comes after ([`Ctx38::host_bound`]).
+/// ([`fit38`]), else refused by name; unset, the common rule's answer
+/// (`placement::ctx::default_slot_ctx`: [`CTX`] a slot, [`CTX_STEP`], a
+/// margin of `MARGIN` card expert bytes). The prompt cache's bound comes
+/// after ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     let n = plans.slots;
     if let Some(c) = set {
@@ -1026,23 +1001,20 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
         // A set context plans its own split alone: the default's search
         // probes contexts the flag did not name, and a refusal at one of them
         // is not this load's.
-        return match plans.card(ctx) {
-            Ok(card_bytes) => Ok(Ctx38 {
+        return match plans.expert_bytes(ctx) {
+            Ok(bytes) => Ok(Ctx38::Set {
                 ctx,
                 slots: n,
-                rule: "set",
-                search: None,
-                card_bytes,
+                card_bytes: bytes.card,
             }),
             Err(refused) => {
                 let fit = fit38(plans)?;
-                if ctx <= fit.ctx {
+                if ctx <= fit {
                     return Err(refused);
                 }
                 let head = format!(
                     "--ctx-size {c}: with --parallel {n} each slot takes {ctx} positions and the \
-                     card holds at most {} a slot beside the plan's dense weights",
-                    fit.ctx
+                     card holds at most {fit} a slot beside the plan's dense weights"
                 );
                 let place = plans.place.name();
                 // A set context keeps the MTP draft (the unset one yields to
@@ -1055,8 +1027,7 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
                 let without = fit38(&Plans {
                     mtp: None,
                     ..*plans
-                })?
-                .ctx;
+                })?;
                 let tail = if ctx <= without {
                     format!(
                         "; without the draft a slot holds {without}: set BLOOMERY_DRAFT=off to serve \
@@ -1073,90 +1044,79 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
             }
         };
     }
-    let fit = fit38(plans)?;
-    let base_at = CTX.min(fit.ctx);
-    let base_bytes = plans.card(base_at)?;
-    let margin_ctx = margin38(plans, fit.ctx, base_at, base_bytes)?;
-    let (ctx, rule) = if base_at < CTX {
-        (base_at, "card")
-    } else {
-        // Unset takes the fit's context without paying its card experts.
-        (margin_ctx, "margin")
-    };
-    Ok(Ctx38 {
-        ctx,
-        slots: n,
-        rule,
-        search: Some(Search38 {
-            fit,
-            margin_ctx,
-            base_bytes,
-        }),
-        card_bytes: plans.card(ctx)?,
+    let found = default_slot_ctx(cap38(plans)?, CTX, CTX_STEP, MARGIN, &|c| {
+        plans.expert_bytes(c)
     })
+    .map_err(refusal38)?;
+    Ok(Ctx38::Rule { found, slots: n })
 }
 
 impl Ctx38 {
+    /// A slot's context.
+    fn ctx(&self) -> usize {
+        match self {
+            Ctx38::Set { ctx, .. } => *ctx,
+            Ctx38::Rule { found, .. } => found.ctx,
+        }
+    }
+
+    /// The largest slot context the card holds, which the default's search
+    /// found; `None` for a set context, which ran none.
+    fn fit(&self) -> Option<usize> {
+        match self {
+            Ctx38::Set { .. } => None,
+            Ctx38::Rule { found, .. } => Some(found.fit),
+        }
+    }
+
     /// A default bounded by the prompt cache too: one session's state at its
     /// slot's context ([`seq38_state`]) fits the budget `ram_at` gives
     /// there, when the cache is on ([`model::placement::ctx::within_cache`]:
     /// a unified pool's need moves with the context, so the budget is read
-    /// at the context bounded, not at the one the rule read). A set context
-    /// keeps its value, as does a default whose budget is 0 at the rule's
-    /// context (the cache is off: `--cache-ram 0`, or the NVMe tier's split
-    /// fills the room); a set budget too small for one position's state is
-    /// refused by name (a default one is 0 already, [`CacheRam::holding`]).
+    /// at the context bounded, not at the one the rule read), and the plan's
+    /// bytes at the lowered context are `plans`' ([`Plans::expert_bytes`]).
+    /// A set context keeps its value, as does a default whose budget is 0 at
+    /// the rule's context (the cache is off: `--cache-ram 0`, or the NVMe
+    /// tier's split fills the room); a set budget too small for one
+    /// position's state is refused by name (a default one is 0 already,
+    /// [`CacheRam::holding`]).
     fn host_bound(
         self,
-        inputs: &PlanInputs,
+        plans: &Plans<'_>,
         ram_at: &dyn Fn(usize) -> Result<u64, GateError>,
         drafts: bool,
     ) -> Result<Ctx38, GateError> {
-        if self.rule == "set" || ram_at(self.ctx)? == 0 {
+        let Ctx38::Rule { mut found, slots } = self else {
             return Ok(self);
+        };
+        if ram_at(found.ctx)? == 0 {
+            return Ok(Ctx38::Rule { found, slots });
         }
-        let state = |n: usize| seq38_state(inputs, n, drafts);
-        let ctx = model::placement::ctx::within_cache(self.ctx, CTX_STEP, &state, ram_at)?;
-        if ctx == self.ctx {
-            return Ok(self);
+        let state = |n: usize| seq38_state(plans.inputs, n, drafts);
+        let ctx = model::placement::ctx::within_cache(found.ctx, CTX_STEP, &state, ram_at)?;
+        if ctx == found.ctx {
+            return Ok(Ctx38::Rule { found, slots });
         }
-        Ok(Ctx38 {
-            ctx,
-            rule: "cache",
-            ..self
-        })
+        found.ctx = ctx;
+        found.rule = "cache";
+        found.chosen = plans.expert_bytes(ctx)?;
+        Ok(Ctx38::Rule { found, slots })
     }
 
-    /// The `ctx` line on stderr: every context a slot's, `total` the slots'
-    /// sum, `base` the plan at [`CTX`] a slot the margin counts against; a
+    /// The `ctx` line on stderr: the common rule's ([`SlotCtx::line`]); a
     /// set context's line carries no search terms (it ran none).
     fn print(&self) {
-        let Some(s) = self.search else {
-            eprintln!(
-                "ctx rule={} ctx={} slots={} total={} card_expert_bytes={}",
-                self.rule,
-                self.ctx,
-                self.slots,
-                self.slots * self.ctx,
-                self.card_bytes
-            );
-            return;
-        };
-        eprintln!(
-            "ctx rule={} ctx={} slots={} total={} fit={} fit_card_expert_bytes={} margin_ctx={} \
-             base={CTX} base_card_expert_bytes={} card_expert_bytes={} lost_bytes={} \
-             margin_bytes={MARGIN}",
-            self.rule,
-            self.ctx,
-            self.slots,
-            self.slots * self.ctx,
-            s.fit.ctx,
-            s.fit.card_bytes,
-            s.margin_ctx,
-            s.base_bytes,
-            self.card_bytes,
-            s.base_bytes.saturating_sub(self.card_bytes)
-        );
+        match self {
+            Ctx38::Set {
+                ctx,
+                slots,
+                card_bytes,
+            } => eprintln!(
+                "ctx rule=set ctx={ctx} slots={slots} total={} card_expert_bytes={card_bytes}",
+                slots * ctx
+            ),
+            Ctx38::Rule { found, slots } => eprintln!("{}", found.line(*slots)),
+        }
     }
 }
 
@@ -1189,6 +1149,8 @@ struct Args {
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
+    /// `--plan`: the records before the load, then exit.
+    plan_only: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -1206,11 +1168,16 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         queue_depth: None,
         park_ram: None,
         api_keys: serve::flag::ApiKeys::default(),
+        plan_only: false,
     };
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
             return Err(USAGE.into());
+        }
+        if flag == "--plan" {
+            a.plan_only = true;
+            continue;
         }
         let v = it
             .next()
@@ -1490,7 +1457,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 slots,
                 feed,
             };
-            if plain.card(ctx).is_ok() {
+            if plain.expert_bytes(ctx).is_ok() {
                 plain.host(ctx, set)?.2
             } else {
                 0
@@ -1559,7 +1526,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         && draft_off.is_none()
         && a.ctx.is_none()
         && levers.draft().is_none()
-        && rule.search.is_some_and(|s| s.fit.ctx < CTX)
+        && rule.fit().is_some_and(|fit| fit < CTX)
     {
         let plain_plans = Plans {
             inputs: &inputs,
@@ -1571,12 +1538,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             feed,
         };
         let plain = ctx38(&plain_plans, a.ctx)?;
-        let without = plain.search.expect("an unset rule searched").fit.ctx;
+        let without = plain.fit().expect("an unset rule searched");
         let bytes = mtp_inputs
             .as_ref()
             .expect("a drafted search held the draft")
-            .card_bytes_of(u64::try_from(rule.ctx)?, slots)?;
-        match bloomery_levers::DraftYield::of(rule.ctx, plain.ctx, CTX.min(without), bytes) {
+            .card_bytes_of(u64::try_from(rule.ctx())?, slots)?;
+        match bloomery_levers::DraftYield::of(rule.ctx(), plain.ctx(), CTX.min(without), bytes) {
             Some(y) => {
                 record::draft_yield(&y).eprint();
                 rule = plain;
@@ -1588,7 +1555,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     } else {
         (drafted, mtp, head, draft_off)
     };
-    let host = plans.host(rule.ctx, set)?;
+    let host = plans.host(rule.ctx(), set)?;
     let (slots, from, mtp, head, draft_off, host, one) = match paged(host.2, slots, mtp)? {
         Paged::AsAsked => (slots, from, mtp, head, draft_off, host, None),
         Paged::OneColumn { slots: served } => {
@@ -1599,7 +1566,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             };
             rule = ctx38(&one, a.ctx)?;
             let (from, draft_off) = one_column(host.2, (slots, served), mtp, draft_off, false);
-            let host = one.host(rule.ctx, set)?;
+            let host = one.host(rule.ctx(), set)?;
             (served, from, false, None, draft_off, host, Some(one))
         }
     };
@@ -1633,13 +1600,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             None => Ok(cache_of(live.host(n, set)?)?.ram),
         }
     };
-    let before = rule.ctx;
-    let rule = rule.host_bound(&inputs, &ram_at, mtp)?;
+    let before = rule.ctx();
+    let rule = rule.host_bound(&live, &ram_at, mtp)?;
     // The cache line names the need of the context the load serves at.
-    let cache = if rule.ctx == before {
+    let cache = if rule.ctx() == before {
         first
     } else {
-        cache_of(live.host(rule.ctx, set)?)?
+        cache_of(live.host(rule.ctx(), set)?)?
     };
     if paged_one {
         mtp_inputs = None;
@@ -1656,7 +1623,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The slots the seat serves ([`Session::add_slots`]): the flag's, one
     // beside a set `--ctx-size`, or 2 — one drafted pass a slot a round,
     // nothing parked.
-    parallel_line(slots, rule.ctx, from, pass);
+    parallel_line(slots, rule.ctx(), from, pass);
     if mtp {
         let be = break_even_of(a.place);
         eprintln!(
@@ -1668,7 +1635,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             be.per_token
         );
     }
-    let ctx = rule.ctx;
+    let ctx = rule.ctx();
     // A drafted load's window checked at the context the rule chose — the
     // unset draft's own condition at the default's, the set draft's at any;
     // a draft the yield turned off needs no window (the plain rule's context
@@ -1763,6 +1730,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .w("cuda_order", record::cuda_order())
         .eprint();
     let residency = residency38_at(&plan, (a.place, feed), set)?;
+    if a.plan_only {
+        // The records before the load are out; nothing was loaded and the
+        // route trace's directory is not made.
+        std::process::exit(0);
+    }
     // Made last among the refusals, so a load that stops before the engine
     // leaves no directory behind.
     let trace = levers

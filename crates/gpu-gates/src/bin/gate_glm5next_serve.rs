@@ -951,7 +951,7 @@ mod gate {
         levers: &PlanLevers,
         ctx: usize,
         free: Option<u64>,
-    ) -> Result<Option<u64>, GateError> {
+    ) -> Result<Option<(u64, u64)>, GateError> {
         // The seat's ctx rule probes a machine per context, its checkpoints reserved at that probe's.
         let mut machine = workstation::plan_gate(inputs.model.layers);
         reserve_checkpoints(
@@ -963,7 +963,11 @@ mod gate {
         Ok(inputs
             .plan(&machine, u64::try_from(ctx)?, levers)
             .ok()
-            .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
+            .and_then(|p| {
+                p.cards
+                    .first()
+                    .map(|c| (c.expert_bytes, p.host.nvme_expert_bytes))
+            }))
     }
 
     /// The `ctx` clause (the module header): a plain server with no `--ctx`
@@ -971,13 +975,14 @@ mod gate {
     /// there, against this gate's own plans of the file: its context is the
     /// rule's — [`CTX`] under `base`, the largest within the plan's margin
     /// under `margin`, the plan's largest under `fit`, the card's largest
-    /// under `card`; the line's `trained` is the file's; its `fit` the
-    /// largest context whose plan stands up to the trained context capped to
-    /// `ORACLE_POSITIONS` — this gate's own plan taken, the one past it
-    /// refused when the card bounds it, else the cap itself — with that
-    /// plan's stage-card expert bytes; its `margin_ctx` at most
-    /// `workstation::MARGIN` fewer of them than the plan at [`CTX`], and the
-    /// next multiple of [`CTX_STEP`] past it more (or it is the fit). A
+    /// under `card`; the line's `cap` is the file's trained context capped to
+    /// `ORACLE_POSITIONS`; its `fit` the largest context whose plan stands up
+    /// to that cap — this gate's own plan taken, the one past it refused when
+    /// the card bounds it, else the cap itself — with that plan's stage-card
+    /// expert bytes; its `margin_ctx` at most `workstation::MARGIN` fewer of
+    /// them than the plan at [`CTX`] and no more NVMe expert bytes, and the
+    /// next multiple of [`CTX_STEP`] past it more of either (or it is the
+    /// fit). A
     /// server asked for [`FLAG_CTX`] takes it (below the floor, a value no
     /// default can coincide with); one asked past the oracle is refused by
     /// name before it listens. Every unset rule word must hold the relation
@@ -1040,18 +1045,18 @@ mod gate {
         println!("ctx: {line}");
         let num = |k: &str| field(&line, k).and_then(|v| v.parse::<usize>().ok());
         let bytes = |k: &str| field(&line, k).and_then(|v| v.parse::<u64>().ok());
-        let (rule, ctx, trained, fit) = (
+        let (rule, ctx, line_cap, fit) = (
             field(&line, "rule").map(str::to_owned),
             num("ctx"),
-            num("trained"),
+            num("cap"),
             num("fit"),
         );
         let (fit_bytes, margin_ctx) = (bytes("fit_card_expert_bytes"), num("margin_ctx"));
-        let (Some(rule), Some(ctx), Some(trained), Some(fit), Some(fit_bytes), Some(margin_ctx)) =
-            (rule, ctx, trained, fit, fit_bytes, margin_ctx)
+        let (Some(rule), Some(ctx), Some(line_cap), Some(fit), Some(fit_bytes), Some(margin_ctx)) =
+            (rule, ctx, line_cap, fit, fit_bytes, margin_ctx)
         else {
             return Err(format!(
-                "a `ctx` line without its rule, ctx, trained, fit, fit_card_expert_bytes and \
+                "a `ctx` line without its rule, ctx, cap, fit, fit_card_expert_bytes and \
                  margin_ctx: {line}"
             )
             .into());
@@ -1063,22 +1068,29 @@ mod gate {
         let plan_levers = PlanLevers::from_levers(levers)?;
         let free = Some(server_card_free(&err_log)?);
         let at = |c: usize| card_at(&inputs, &plan_levers, c, free);
-        let base = at(CTX)?.ok_or("no plan at the base context")?;
-        let lost = |c: usize| -> Result<Option<u64>, GateError> {
-            Ok(at(c)?.map(|e| base.saturating_sub(e)))
-        };
+        let (base, base_nvme) = at(CTX)?.ok_or("no plan at the base context")?;
         let margin = model::placement::workstation::MARGIN;
-        let here = lost(margin_ctx)?;
-        let past = lost(margin_ctx + CTX_STEP)?;
+        // Whether the plan at `c` is within the rule's margin of the base's:
+        // at most `margin` fewer card expert bytes and no more NVMe expert
+        // bytes, re-derived from the gate's own plans; `None` when no plan
+        // takes the context.
+        let within = |c: usize| -> Result<Option<bool>, GateError> {
+            Ok(at(c)?.map(|(card, nvme)| base.saturating_sub(card) <= margin && nvme <= base_nvme))
+        };
+        let here = within(margin_ctx)?;
+        let past = within(margin_ctx + CTX_STEP)?;
         let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
+        // The plan's bytes at the line's own context, which the line's
+        // `card_expert_bytes` and `nvme_expert_bytes` name.
+        let at_ctx = at(ctx)?;
         let cap = inputs
             .hp
             .n_ctx_train
             .min(usize::try_from(ORACLE_POSITIONS)?);
         let card_bounds = fit < cap;
         println!(
-            "ctx: the gate's plans: lost at {margin_ctx} {here:?}, at {} {past:?}, fit {fit} \
-             {at_fit:?}, past it {past_fit:?}; the cap {cap} ({})",
+            "ctx: the gate's plans: within the margin at {margin_ctx} {here:?}, at {} {past:?}, \
+             fit {fit} {at_fit:?}, past it {past_fit:?}; the cap {cap} ({})",
             margin_ctx + CTX_STEP,
             if card_bounds {
                 "the card bounds the fit"
@@ -1102,18 +1114,20 @@ mod gate {
         check(
             &mut ok,
             "ctx_line_prints_the_fit_and_the_margin",
-            trained == inputs.hp.n_ctx_train
+            line_cap == cap
                 && fit <= cap
-                && at_fit == Some(fit_bytes)
+                && at_fit.map(|e| e.0) == Some(fit_bytes)
+                && at_ctx.map(|e| e.0) == bytes("card_expert_bytes")
+                && at_ctx.map(|e| e.1) == bytes("nvme_expert_bytes")
                 && (if card_bounds {
                     past_fit.is_none()
                 } else {
                     fit == cap
                 })
-                && here.is_some_and(|l| l <= margin)
+                && here == Some(true)
                 && margin_ctx <= fit
                 && (margin_ctx == fit
-                    || (margin_ctx.is_multiple_of(CTX_STEP) && past.is_none_or(|l| l > margin))),
+                    || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
         );
 
         // The flag arm: below the floor, the flag wins.

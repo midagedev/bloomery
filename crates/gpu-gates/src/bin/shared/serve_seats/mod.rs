@@ -15,9 +15,9 @@
 //! `drafted` is the
 //! seats' shared MTP draft driver, one file a seat's per-model binary
 //! includes beside the seat. The seats' shared `--ctx` rules (the search
-//! bisection, the expert-margin guard, and the slot count a set `--ctx`
-//! buys: one slot at the whole context while `--parallel` names none) are
-//! `model::placement::ctx`.
+//! bisection, the default slot context — the fit and the expert margin — and
+//! the slot count a set `--ctx` buys: one slot at the whole context while
+//! `--parallel` names none) are `model::placement::ctx`.
 
 #[cfg(feature = "deepseek41")]
 mod drafted;

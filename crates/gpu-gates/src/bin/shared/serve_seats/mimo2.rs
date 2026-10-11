@@ -64,7 +64,7 @@
 //! [`CTX`]; a file that states no trained context takes the floor, and one
 //! stderr line names a cap that binds. Every routed expert sits on the host,
 //! so no card-expert bytes trade against the context and the expert-margin
-//! guard (`placement::ctx::within_margin`) has nothing to bound; the plan's
+//! rule (`placement::ctx::default_slot_ctx`) has nothing to bound; the plan's
 //! own fit is the cap.
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
