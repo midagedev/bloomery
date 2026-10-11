@@ -120,7 +120,10 @@ use super::wide38::{
     route_taps_host,
 };
 use crate::checkpoint::Checkpoints;
-use crate::checkpoint::saved::{Identity, Lent, SeqState, Spans};
+use crate::checkpoint::saved::{
+    Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
+};
+use crate::checkpoint::staging::NoRoom;
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::run::{HostRun, HostWidths};
@@ -176,7 +179,7 @@ pub type Qwen38Model = GpuModel<Body38>;
 /// beside them ([`DraftRows38`]) — its store rows and the two arenas' rows,
 /// so a sequence put back after another ran drafts as if none had.
 pub struct Seq38 {
-    state: SeqState<History>,
+    state: Arc<SeqState<History>>,
     draft: Option<DraftRows38>,
 }
 
@@ -198,6 +201,20 @@ impl Seq38 {
     #[must_use]
     pub fn keep_point(&self, n: u32) -> u32 {
         self.state.keep_point(n)
+    }
+}
+
+impl SeqView for Seq38 {
+    fn positions(&self) -> u32 {
+        Seq38::positions(self)
+    }
+
+    fn bytes(&self) -> usize {
+        Seq38::bytes(self)
+    }
+
+    fn keep_point(&self, n: u32) -> u32 {
+        Seq38::keep_point(self, n)
     }
 }
 
@@ -2374,13 +2391,28 @@ impl Body38 {
         Ok(())
     }
 
-    /// The sequence state at `pos`, where the stores stand (a waiting cut
-    /// carried out first): the K/V planes' rows, the raw keys' and the pooled
-    /// keys' of positions below `pos`, the recurrent stores at `pos` and at
-    /// the last checkpoint below it (the last prompt call's end), each with
-    /// its PLE history. Refused by name while a verify waits, after a call
-    /// failed past its launch, and when the history disagrees.
-    fn save_state(&mut self, stream: &CudaStream, pos: u32) -> Result<Seq38, GpuError> {
+    /// What every save takes before its copy: the sequence state at `pos`,
+    /// where the stores stand (a waiting cut carried out first), the draft's
+    /// side read (blocking), the PLE history and the last point below `pos`
+    /// as the state's host values, the stores lent, and `take` (the copy, on
+    /// the engine stream or on a lane) run on them. The K/V planes' rows, the
+    /// raw keys' and the pooled keys' of positions below `pos`, the recurrent
+    /// stores at `pos` and at the last checkpoint below it (the last prompt
+    /// call's end), each with its PLE history. Refused by name while a verify
+    /// waits, after a call failed past its launch, and when the history
+    /// disagrees.
+    fn take_state<R>(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        take: impl FnOnce(
+            Identity,
+            &Lent<'_, '_, '_>,
+            History,
+            Vec<(u32, History)>,
+            &Checkpoints,
+        ) -> Result<R, GpuError>,
+    ) -> Result<(R, Option<DraftRows38>), GpuError> {
         const WHAT_S: &str = "qwen4exp snapshot";
         self.stores_at(pos)?;
         if let Some(p) = &self.pending {
@@ -2427,16 +2459,43 @@ impl Body38 {
             positional,
             recurrent: &mut recurrent,
         };
-        let state = SeqState::save(
-            stream,
-            self.who.clone(),
-            pos,
-            &lent,
-            current,
-            points,
-            &self.ckpt,
-        )?;
-        Ok(Seq38 { state, draft })
+        let taken = take(self.who.clone(), &lent, current, points, &self.ckpt)?;
+        Ok((taken, draft))
+    }
+
+    /// The sequence state at `pos` ([`Body38::take_state`]), copied on the
+    /// engine stream.
+    fn save_state(&mut self, stream: &CudaStream, pos: u32) -> Result<Seq38, GpuError> {
+        let (state, draft) = self.take_state(stream, pos, |who, lent, current, points, ckpt| {
+            SeqState::save(stream, who, pos, lent, current, points, ckpt)
+        })?;
+        Ok(Seq38 {
+            state: Arc::new(state),
+            draft,
+        })
+    }
+
+    /// [`Body38::save_state`] with the copy on `lane`'s stream into its
+    /// pinned staging ([`SeqState::save_async`]): the state and its copy in
+    /// flight, or [`NoRoom`], nothing begun. The draft's side is read here,
+    /// blocking.
+    fn save_state_async(
+        &mut self,
+        stream: &CudaStream,
+        lane: &SaveLane,
+        pos: u32,
+    ) -> Result<Result<(Seq38, Pending<History>), NoRoom>, GpuError> {
+        let (taken, draft) = self.take_state(stream, pos, |who, lent, current, points, ckpt| {
+            let streams = Streams {
+                lane,
+                engine: stream,
+            };
+            SeqState::save_async(streams, who, pos, lent, current, points, ckpt)
+        })?;
+        Ok(taken.map(|pending| {
+            let state = pending.shared();
+            (Seq38 { state, draft }, pending)
+        }))
     }
 
     /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
@@ -2524,18 +2583,22 @@ impl Body38 {
         Ok(())
     }
 
-    /// `d` put back on a model that stands at `pos` ([`Body38::draft_rows`]'
-    /// rows): the draft's store holding `d`'s positions, the step's and the
-    /// pass's arenas their rows, the ubatch's none. Refused by name, as
-    /// [`Body38::draft_fits`] refuses, before any copy. Blocking.
+    /// `d` put back on a model whose state of `n` positions is put back
+    /// as its first `at` ([`Body38::draft_rows`]' rows): the step's and the
+    /// pass's arenas their rows, the ubatch's none, and the draft's store
+    /// holding `d`'s positions when `at` is `n`. A cut to `at < n` is what a
+    /// whole put-back and [`Body38::cut`] leave: the arenas' records cut to
+    /// `at` and the draft's store forgotten, none of its rows copied. Refused
+    /// by name, as [`Body38::draft_fits`] refuses, before any copy. Blocking.
     fn put_draft_rows(
         &mut self,
         stream: &CudaStream,
         d: &DraftRows38,
-        pos: u32,
+        n: u32,
+        at: u32,
     ) -> Result<(), GpuError> {
         const WHAT_P: &str = "qwen4exp resume";
-        self.draft_fits(d, pos)?;
+        self.draft_fits(d, n)?;
         let Body38 {
             plans,
             s,
@@ -2551,27 +2614,36 @@ impl Body38 {
             host[..v.len()].copy_from_slice(v);
             final_streams_mut(plans, [s, a, wa], walk).copy_from_host(stream, &host)?;
         }
-        mtp.as_mut()
-            .ok_or(GpuError::state(
-                WHAT_P,
-                "an MTP draft (Body38::open_placed_mtp)",
-            ))?
-            .adopt_store(stream, d.held as usize, &d.store)?;
+        let draft = mtp.as_mut().ok_or(GpuError::state(
+            WHAT_P,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        if at == n {
+            draft.adopt_store(stream, d.held as usize, &d.store)?;
+        } else {
+            draft.forget();
+        }
         *wrote = Wrote38 {
             step: d.step.0,
             pass: d.pass.0,
             ubatch: Held38::NONE,
         };
+        wrote.cut(at);
         Ok(())
     }
 
-    /// `s` put back on the empty model ([`SeqState::load`]): the stores
-    /// stand at its positions, the committed lane stamped there, the PLE
-    /// history and the points it carried the model's own. Refused by name,
-    /// nothing copied, for another model's state, a draft side the load does
-    /// not take (a state with it onto a load without the draft, or the other
-    /// way: the store layouts differ) or onto a model that is not empty.
-    fn load_state(&mut self, stream: &CudaStream, s: &Seq38) -> Result<(), GpuError> {
+    /// The first `ask` positions of `s` (or the nearest point below, `at`:
+    /// [`SeqState::keep_point`]) put back on the empty model
+    /// ([`SeqState::load_prefix`]): the state a whole put-back and a cut to
+    /// `at` ([`Body38::cut`]) leave. The stores stand at `at`, the committed
+    /// lane stamped there, the PLE history the point's, the points up to `at`
+    /// the model's own, and on a load with the draft its side cut to `at`
+    /// ([`Body38::put_draft_rows`]). Only the rows of the first `at`
+    /// positions go to the card. Returns `at`. Refused by name, nothing
+    /// copied, for another model's state, a draft side the load does not take
+    /// (a state with it onto a load without the draft, or the other way: the
+    /// store layouts differ) or onto a model that is not empty.
+    fn load_state(&mut self, stream: &CudaStream, s: &Seq38, ask: u32) -> Result<u32, GpuError> {
         const WHAT_L: &str = "qwen4exp resume";
         if self.held != 0 || self.pending.is_some() || self.staged.is_some() {
             return Err(GpuError::shape(
@@ -2593,7 +2665,7 @@ impl Body38 {
             None => {}
         }
         let lane = self.lane.lane();
-        let (cur, pts) = {
+        let (at, cur, pts) = {
             let mut c = Copied::of(
                 &mut self.stores,
                 &mut self.ple_ring,
@@ -2605,10 +2677,12 @@ impl Body38 {
                 positional,
                 recurrent: &mut recurrent,
             };
-            let (cur, pts) = s.state.load(stream, &self.who, &mut lent, &mut self.ckpt)?;
-            (cur.clone(), pts.to_vec())
+            let r = s
+                .state
+                .load_prefix(stream, &self.who, &mut lent, &mut self.ckpt, ask)?;
+            (r.at, r.current.clone(), r.points.to_vec())
         };
-        let off = std::iter::once((n, &cur))
+        let off = std::iter::once((at, &cur))
             .chain(pts.iter().map(|(p, h)| (*p, h)))
             .find(|&(p, h)| h.next_pos() != u64::from(p));
         if let Some((p, h)) = off {
@@ -2622,13 +2696,13 @@ impl Body38 {
             ));
         }
         if let Some(d) = &s.draft {
-            self.put_draft_rows(stream, d, n)?;
+            self.put_draft_rows(stream, d, n, at)?;
         }
-        self.restamp(stream, lane, n)?;
+        self.restamp(stream, lane, at)?;
         self.ple.hist = cur;
         self.ple_points = pts;
-        self.held = n;
-        Ok(())
+        self.held = at;
+        Ok(at)
     }
 
     /// Plant a failure for the next call once its plan and copies are made,
@@ -3706,6 +3780,31 @@ impl GpuModel<Body38> {
         body.save_state(gpu.stream(), pos)
     }
 
+    /// [`GpuModel::seq_save`] whose copy runs on `lane`'s stream into its
+    /// pinned staging and whose call returns once it is enqueued
+    /// ([`SeqState::save_async`]): the state and its copy in flight, which
+    /// the model's rows are not cut, reset or replaced before; or [`NoRoom`],
+    /// nothing begun, when the staging holds no free extent for it. The
+    /// draft's side is read here, blocking. Refused by name as
+    /// [`GpuModel::seq_save`] refuses.
+    pub fn seq_save_async(
+        &mut self,
+        lane: &SaveLane,
+    ) -> Result<Result<(Seq38, Pending<History>), NoRoom>, GpuError> {
+        const WHAT_S: &str = "qwen4exp snapshot";
+        self.refuse_if_poisoned(WHAT_S)?;
+        let pos = self.pos();
+        let (gpu, _, body) = self.body_parts(WHAT_S)?;
+        body.save_state_async(gpu.stream(), lane, pos)
+    }
+
+    /// A save lane on the model's card sized to `limit` pinned bytes of
+    /// states ([`SaveLane::new`]): load-time only.
+    pub fn seq_lane(&mut self, limit: u64) -> Result<SaveLane, GpuError> {
+        let (gpu, _, _) = self.body_parts("qwen4exp save lane")?;
+        SaveLane::new(gpu.context(), limit)
+    }
+
     /// Replace the sequence with `s`, which [`GpuModel::seq_save`] took of
     /// this load: a reset unless the model is empty already (a reset just
     /// before, or the load), then — as a pass of `s`'s positions whose work
@@ -3715,8 +3814,16 @@ impl GpuModel<Body38> {
     /// Refused by name, nothing copied, for another model's state (its
     /// file, card or context).
     pub fn seq_resume(&mut self, s: &Seq38) -> Result<(), GpuError> {
-        const WHAT_R: &str = "qwen4exp resume";
-        let b = self.body(WHAT_R)?;
+        if s.positions() == 0 {
+            return self.seq_reset_for("qwen4exp resume");
+        }
+        self.seq_resume_prefix(s, s.positions()).map(drop)
+    }
+
+    /// The model reset unless it is empty already: what every resume starts
+    /// from.
+    fn seq_reset_for(&mut self, what: &'static str) -> Result<(), GpuError> {
+        let b = self.body(what)?;
         let empty = self.pos() == 0
             && b.held == 0
             && b.pending.is_none()
@@ -3726,15 +3833,41 @@ impl GpuModel<Body38> {
         if !empty {
             self.reset()?;
         }
-        let n = s.positions() as usize;
-        if n == 0 {
-            return Ok(());
+        Ok(())
+    }
+
+    /// [`GpuModel::seq_resume`] of the first `n` positions of `s` the state
+    /// can be cut to ([`Seq38::keep_point`]): the model stands at that many,
+    /// which it returns, as a whole resume and a rollback to it leave it
+    /// (the draft's store forgotten, its arenas' records cut), with only
+    /// those positions' rows moved to the card
+    /// ([`SeqState::load_prefix`]). Refused by name as
+    /// [`GpuModel::seq_resume`] refuses, and for a prefix of no positions
+    /// (reset the model instead). `s`'s copy must have landed.
+    pub fn seq_resume_prefix(&mut self, s: &Seq38, n: u32) -> Result<u32, GpuError> {
+        const WHAT_R: &str = "qwen4exp resume";
+        self.seq_reset_for(WHAT_R)?;
+        let at = s.keep_point(n);
+        if at == 0 {
+            return Err(GpuError::shape(
+                WHAT_R,
+                format!(
+                    "a prefix of 0 positions of a state of {} (asked {n}): reset the model instead",
+                    s.positions()
+                ),
+            ));
         }
-        self.run_rows(n, WHAT_R, |gpu, _, body, _, _| {
-            body.load_state(gpu.stream(), s)?;
+        self.run_rows(at as usize, WHAT_R, |gpu, _, body, _, _| {
+            let put = body.load_state(gpu.stream(), s, n)?;
+            if put != at {
+                return Err(GpuError::shape(
+                    WHAT_R,
+                    format!("a prefix of {at} positions put back as {put}"),
+                ));
+            }
             Ok(false)
         })?;
-        Ok(())
+        Ok(at)
     }
 }
 
@@ -4329,11 +4462,13 @@ impl<'a> Copied<'a> {
                     if let Some((ctx, n)) = rows {
                         let (h, d) = (geo::HEAD, geo::IDX_DIM);
                         let (k, v) = kv.f16_mut("qwen38::copied")?;
-                        c.spans.push(Spans::planes(k, geo::N_KV, ctx * h, n * h)?);
-                        c.spans.push(Spans::planes(v, geo::N_KV, ctx * h, n * h)?);
-                        c.spans.push(Spans::planes(raw, 1, 0, n * d)?);
-                        let pools = crate::qsa::pools_for(n) * d;
-                        c.spans.push(Spans::planes(pooled, 1, 0, pools)?);
+                        c.spans
+                            .push(Spans::by_position(k, geo::N_KV, ctx * h, n, h)?);
+                        c.spans
+                            .push(Spans::by_position(v, geo::N_KV, ctx * h, n, h)?);
+                        c.spans.push(Spans::by_position(raw, 1, 0, n, d)?);
+                        c.spans
+                            .push(Spans::by_pool(pooled, 1, 0, n, (geo::POOL, d))?);
                     }
                 }
             }

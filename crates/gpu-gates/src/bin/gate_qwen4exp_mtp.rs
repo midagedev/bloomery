@@ -135,6 +135,13 @@
 //! - (x) a resume of a state whose draft side the load does not take (a
 //!   state of a load without the draft) is refused by name with the model
 //!   untouched: its stores, position and draft store unchanged.
+//! - (kp-draft) a prefix restore with the draft on cuts its side as `resume` then `rollback`
+//!   does: a drafted run's state with a point below its end, put back whole (the draft's store
+//!   holds the state's positions, the arenas' records stand), then cut to the point by
+//!   `rollback` and put back as the point's prefix (`seq_resume_prefix` asked one short of
+//!   the end): each stands at the point with the draft's store forgotten and the arenas'
+//!   records cut there, so a walk that reads either arena is refused with the same words both
+//!   ways and not the whole state's.
 //! - (i) a pass the width chooser holds back right after the server's cut
 //!   step (the prompt call, then its last id as the seat's first step): the
 //!   chooser walks the draft's waiting rows first (`Draft::before_plain`,
@@ -2432,6 +2439,138 @@ mod gate {
         Ok((m, ok))
     }
 
+    /// What the target's step and pass arenas hold after a restore, as a walk that reads their
+    /// row 0 as position `at` words it: the draft's store is warmed over positions `0..=at`
+    /// first (a store walk checks its own count before the arena's), then each arena is read
+    /// by a walk of one row from `at + 1`, which the arena refuses by naming the positions it
+    /// holds. A walk that runs says so: it means the arena holds the row.
+    fn arena_words(
+        m: &mut Qwen38Model,
+        prompt: &[u32],
+        at: usize,
+    ) -> Result<[String; 2], GateError> {
+        let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
+        let ids: Vec<u32> = (0..=at)
+            .map(|i| (prompt[i % prompt.len()] + 1) % vocab)
+            .collect();
+        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
+        for (i, run) in ids.chunks(MTP_STORE_ROWS).enumerate() {
+            m.mtp_walk(
+                MtpFeed::Rows {
+                    tokens: run,
+                    pos0: u32::try_from(i * MTP_STORE_ROWS)?,
+                    hidden: MtpHidden::Host(&zeros[..run.len() * WIDE]),
+                },
+                MtpHead::Rows,
+                MtpMode::Store,
+            )?;
+        }
+        let read = |m: &mut Qwen38Model, walk: TargetRows| -> Result<String, GateError> {
+            let r = m.mtp_draft(
+                MtpFeed::Rows {
+                    tokens: &ids[..1],
+                    pos0: u32::try_from(at + 1)?,
+                    hidden: MtpHidden::Target { walk, first: 0 },
+                },
+                MtpHead::Rows,
+                MtpMode::Eager,
+            );
+            Ok(match r {
+                Ok(_) => "the walk ran".to_owned(),
+                Err(e) => {
+                    let said = e.to_string();
+                    said.rsplit_once("the arena holds ")
+                        .map_or(said.clone(), |(_, held)| held.to_owned())
+                }
+            })
+        };
+        Ok([read(m, TargetRows::Step)?, read(m, TargetRows::Pass)?])
+    }
+
+    /// (kp-draft): a prefix restore with the draft on cuts the draft's side as `resume` then
+    /// `rollback` does. A drafted run's state (the draft's store and both arenas' records in
+    /// it) with a point below its end, put back whole (the draft's store holds the state's
+    /// positions, the arenas their records: the contrast), then cut to the point by `rollback`
+    /// and put back as the point's prefix (`seq_resume_prefix` asked one short of the end):
+    /// each model stands at the point with the draft's store forgotten (`held() == 0`) and the
+    /// arenas' records cut at it, so a walk that reads either arena is refused with the same
+    /// words ([`arena_words`]) both ways and not the whole state's. Mutants: the prefix
+    /// restore that puts the draft's whole store back (`held()` is the state's, not 0); the
+    /// arenas' records left uncut (the prefix's words are the whole state's).
+    fn prefix_draft(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 6;
+        let ctx = m.body("(kp-draft)")?.ctx() as u32;
+        let mut m = m;
+        m.body_parts("(kp-draft)")?.2.set_checkpoints(true);
+        let mut m = {
+            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+            let first = spec.prompt(&mut s, prompt)?;
+            runtime::generate(
+                &mut s,
+                &mut spec,
+                prompt,
+                first,
+                &runtime::Stop::new(N, ctx)?,
+                &mut Kept::default(),
+            )?;
+            s.into_model()
+        };
+        let state = m.seq_save()?;
+        let n = state.positions();
+        let ask = n.saturating_sub(1);
+        let at = state.keep_point(ask);
+        let held_of = |m: &Qwen38Model| -> Result<usize, GateError> {
+            Ok(m.body("(kp-draft)")?.mtp().map_or(0, |d| d.held()))
+        };
+        if at == 0 || at >= n {
+            m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
+            m.reset()?;
+            println!(
+                "(kp-draft) a drafted run's state of {n} positions carries no point below its \
+                 end (asked {ask}, kept {at}): nothing to cut to FAIL"
+            );
+            return Ok((m, false));
+        }
+        let probe = at as usize;
+        m.reset()?;
+        m.seq_resume(&state)?;
+        let (whole_held, whole_pos) = (held_of(&m)?, m.pos());
+        let whole_words = arena_words(&mut m, prompt, probe)?;
+        m.reset()?;
+        m.seq_resume(&state)?;
+        m.rollback(at)?;
+        let (roll_held, roll_pos) = (held_of(&m)?, m.pos());
+        let roll_words = arena_words(&mut m, prompt, probe)?;
+        m.reset()?;
+        let put = match m.seq_resume_prefix(&state, ask) {
+            Ok(put) => put,
+            Err(e) => {
+                m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
+                m.reset()?;
+                println!("(kp-draft) the prefix of {ask} positions refused: {e} FAIL");
+                return Ok((m, false));
+            }
+        };
+        let (pre_held, pre_pos) = (held_of(&m)?, m.pos());
+        let pre_words = arena_words(&mut m, prompt, probe)?;
+        m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
+        m.reset()?;
+        let contrast = whole_held == n as usize && whole_pos == n;
+        let cut = roll_held == 0 && roll_pos == at && pre_held == 0 && pre_pos == at && put == at;
+        let same = pre_words == roll_words;
+        let seen = whole_words != roll_words;
+        let ok = contrast && cut && same && seen;
+        println!(
+            "(kp-draft) a drafted run's state of {n} positions, a point at {at} (asked {ask}): \
+             whole resume holds the draft's {whole_held} at {whole_pos} (arenas {whole_words:?}); \
+             resume then rollback holds {roll_held} at {roll_pos} (arenas {roll_words:?}); the \
+             prefix returned {put} and holds {pre_held} at {pre_pos} (arenas {pre_words:?}); the \
+             cut is seen {seen}, the two cut ways agree {same} {}",
+            verdict(ok)
+        );
+        Ok((m, ok))
+    }
+
     /// (x): a resume refused before any copy. A state of a load without the
     /// draft (its own short prompt run) put back on this load is refused by
     /// name — the store layouts differ — with the model untouched: its
@@ -4724,6 +4863,9 @@ mod gate {
         tier::sc("(x) a resume of a state without the draft's side is refused")?;
         let (model, x_ok) = resume_refused(model, &inputs, ub, &prompt)?;
         ok &= x_ok;
+        tier::sc("(kp-draft) a prefix restore with the draft = resume then rollback")?;
+        let (model, kp_ok) = prefix_draft(model, &prompt)?;
+        ok &= kp_ok;
         drop(model);
         // Window B diverges from window A from position 0 on: the corpus's
         // deep window read past A's whole length, so no per-sequence state
