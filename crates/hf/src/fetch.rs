@@ -652,6 +652,18 @@ impl Client {
         Ok(files)
     }
 
+    /// The path in `repo` of the image projector that goes with the model file at `model` (its
+    /// path in the repo, a set's first shard): [`crate::mmproj_sibling`] of the listing, `None`
+    /// when the repo holds none. Where the cache stands in for the listing, as for a set, the
+    /// verified files are the entries.
+    pub fn mmproj_path(&self, repo: &str, model: &str) -> Result<Option<String>, HfError> {
+        let entries = match self.listed(repo)? {
+            Listed::Hub(entries) => entries,
+            Listed::Cache(_) => verified_entries(&self.root, repo)?,
+        };
+        Ok(crate::mmproj_sibling(&entries, model).map(|e| e.path.clone()))
+    }
+
     /// The one verified set of the cache `r` picks, there being no listing
     /// for `why`.
     fn offline_set(
