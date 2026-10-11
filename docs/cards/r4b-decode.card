@@ -1,0 +1,88 @@
+# Train unitier R4b-1 + R4b-2 + R4c against its base 04d0c0ae: the prompt union on a tier layer reads the RAM arena in
+# pinned batches under claim rule (c) (the call's top S - 2B ids by column count claim Keep, the rest Transient, B 16),
+# the batch fill runs on the tier's own reader, and every slot's pages go back through give_back, which a pick now
+# runs on its filling thread before its read. The base read the union's tier ids through the file mapping and dropped
+# those pages on the dropper thread, so its arena is empty after a prompt; this tree's arena holds the prompt's keep set.
+# Host only (no kernel moved), so this is the dispatch-path A/B AGENTS.md asks for. The base is built from 04d0c0ae with
+# `just build-decode` in its own worktree and remote dir.
+#
+# Shape: excl-decode.card's (A6000, plan a, ctx 3072, prose 512, n 96, BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off,
+# one slot, BLOOMERY_HOST_ROOM=27G with BLOOMERY_NVTIER_BYTES=20G: no room alone gives plan a an arena on the A6000).
+# [derived, code] The two builds plan the same bytes there: with BLOOMERY_NVTIER_BYTES set, placement's nvme_arena_of
+# returns the given bytes after its checks, and the train's one placement change, ArenaFloor's union term
+# (2B + ARENA_LANE_CLAIMS = 33 slots), moves only the least it checks against (about 5.2e9 B, under the 21,474,836,480 B
+# given) and the room floor of an unset arena. excl's probe printed the plan: nvtier budget=21,474,836,480
+# paged=31,855,001,600 (host_experts=11767 card_experts=12809), about 6,795 slots, S about 141 a paged layer, keep
+# S - 2B about 109 of the layer's about 210 tier ids. The `condition` below holds both arms' plan and nvtier budget/paged
+# lines equal, so a plan that moved is caught, not averaged.
+#
+# Not the prompt claim. The untimed 9.03 -> 7.44 s that R4b-2 reported compared R4b-2 with R4b-1, an intermediate that
+# never lands alone. Against the base the prompt reads about the same 38.6 GB from the drive on both sides (the base
+# through the mapping's faults, this tree in O_DIRECT batches on the reader); gate_nvtier printed 7,553 ms (train0210d,
+# before 275074de's prompt walk) and 7,313 ms (r4train), untimed. The prompt rows (pp tok/s) come from the same arms and
+# are read beside the ratio, not judged by this card.
+#
+# [measured, gate_nvtier real on the A6000, untimed, the gate plan (the 3090's bytes, S 154, keep 122)] the 96 steps
+# after the 512-position prompt: the tier filled 8,400 slots on the base (train0210d) and 4,385 on R4b-1 and R4b-2
+# (4,367 on r4train): -48 %; fills 274.89 -> 143.91 MB a token. Card, arena and file picks are equal (154.7 / 316.0 / 9.3
+# a token): the cut is fills, not the routing. The four builds' printed step ms (106.6, 82.9, 94.6, 119.6) are untimed
+# runs beside other gates' lock waits and carry nothing here.
+#
+# [derived] Per token at this shape, what the train does to the decode chain. The base's fills (excl's probe of the base
+# build at this shape, residency set: 4,785 fills, 15.0 GB, over the 96 tokens, the arena 70 % full at the window's end,
+# no eviction) run on the pool in the chain, one layer's misses at a time: lambda = 4,785 / 96 / 48 = 1.04 misses a layer.
+# A layer's fill wall is t1 (P(m >= 1)(1 - a) + a lambda), m Poisson, t1 = 1.12..1.42 ms the one-pick O_DIRECT read
+# (design Q5's k = 1 rate), a = 0.5 the drive's share a second concurrent pick adds (4.6-6 GB/s against one pick's
+# 2.2-2.8). The base pays 0.84 t1 a layer.
+#   1. -16.1..-37.8 ms, central -25.8. The prompt's keep set covers a fraction c = 0.40..0.70 (central 0.55) of the
+#      decode's first touches: the gate plan's -48 % at keep 30 % of its tier ids is the floor's anchor, and keep here
+#      is about 52 % of the tier ids. lambda goes to 1.04 (1 - c): the layer's wall goes to 0.29..0.54 t1, a cut of
+#      0.30..0.55 t1, times 48 layers.
+#   2. +1.0..+3.0 ms. The arena is full from the first step, so every decode fill now evicts and runs give_back
+#      (MADV_DONTNEED on a 3.16 MB slot, 70..100 us [assumption, excl term 4]) on its filling thread before the read,
+#      15..30 fills a token, mostly a layer's only miss; the base evicts nothing in this window.
+#   Net -13.1..-36.8 ms, central -23.8, of a base token of 72..92 ms (excl's band, central 82): central +41 % decode
+#   tok/s; sigma by the RSS of the terms' ranges over sqrt(12) (term 1 6.3 ms, term 2 0.6 ms, the base token 5.8 ms)
+#   about 15.7 %: band central +- 2 sigma, +10..+72.
+# Priced 0: the reader thread's own CPU in the decode (it serves only the union's batches; decode fills stay on the
+# pool), R2's promotions served from a warmer arena (17.93 MB a token both ways on the gate plan), the moved give_back
+# of R4b-2 against R4b-1 (the decode fills' give_back runs on the same pool threads in R4b-1 and R4b-2).
+# The gain is the arena's warm-up window after a prompt that routes like the decode (in-sample prose, P 512); a short
+# prompt keeps fewer ids, and a long decode reaches the base's warm arena anyway.
+#
+# Ruler: sd 2.6 % (excl-decode.card's, the residency pair). At 4 rounds h = 2.447 x 2.6 x sqrt(2/4) = 4.50 %, under the
+# band's +10 % edge.
+#
+# Runner (the lead; output to a file first; every variable but the rounds inside BLOOMERY_BOX_ENV):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/r4b-decode.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DRAFT=off BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' \
+#   BLOOMERY_AB_ROUNDS=4 just depth-gpu-qwen4exp \
+#     bin:/root/repo/bloomery-r4b-base/target/release/generate_qwen3moe:prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G \
+#     prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G
+kind: ab
+question: on a paged plan with an arena, does the train's prompt union through the arena under claim rule (c) speed the
+  plain decode through the arena's warm-up window after the prompt, by the fills the prompt's keep set saves?
+term: decode tok/s @ n=96, prose 512 (the corpus's first 512 ids), ctx 3072, A6000, plan a at the BLOOMERY_HOST_ROOM
+  27G with BLOOMERY_NVTIER_BYTES=20G (a 20 GiB arena), BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off, one slot; this
+  tree's generate_qwen3moe against 04d0c0ae's, (ours - base) / base, paired by round
+unit: %
+predict: +10..+72
+rounds: 4
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds (paired SD 3.7 %,
+  / sqrt 2), as excl-decode.card; Qwen3.8's plain decode under the residency scatters past the 0.6 % default
+condition: one lease; both builds with their Cargo.lock current; every arm a fresh process (BLOOMERY_AB_LOAD=arm in
+  BLOOMERY_BOX_ENV), the order rotated each round, one warm-up round discarded (a `WARMUP r0` row in the log); no
+  [cpu-busy], [other-busy] or [cold] row and no Xid in either witness. Both arms' plan lines and nvtier budget= and
+  paged= fields are equal, each arm's plan names a paged plan with an arena, its `residency lever` record names
+  mid-p0-s1 and its `load draft=off` record is there; the ours arm's nvtier record shows union_batched > 0 (the prompt
+  took the batched path); both arms print the same greedy tokens (the train moves no bit). Read beside the ratio, from
+  the arms' records, not judged: each arm's pp tok/s at P 512, each arm's nvtier fills (the ours arm's decode fills are
+  fills - union_fills), keep_claims and transient_claims, and fill_ns
+decide-in: land the train on its fixture batch and write the row (decode tok/s both arms, the ratio and its interval,
+  pp tok/s both arms, the decode fills both arms) to rig-log with its window named, the arena's warm-up after a P 512
+  prompt; the fill cut, not the reader, is the claim
+decide-below: the keep set covered less of the decode's first touches (c under 0.40) or each give_back cost more. Read
+  the arms' decode fills before any figure: a cut under 40 % re-derives term 1's c, a cut inside 40..70 % with the gain
+  under 10 % re-derives t1 and the give_back. No loss past the ruler still lands the train as the structural change
+  (one dontneed door, the reader, the floor) with no decode claim; a loss stops the landing for a reading round
+decide-above: the fills fell past 70 %, or one fill costs more than t1 in the chain (the pool's misses waiting on each
+  other or on the lane). Read the decode fills and fill_ns over the window before the number is claimed as term 1's
