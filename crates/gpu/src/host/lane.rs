@@ -14,10 +14,11 @@
 //! opened (a prompt call's picks, a reset's and a restore's copies, a late
 //! flip), so up to [`LANE_THREADS`] of those stage at once. A victim's
 //! preparation stays in issue order under the lock, one lane thread at a
-//! time: a source's preparation (the NVMe tier's books and its reads) is
-//! written for one lane caller, and runs on the lane thread itself: the
-//! thread does the fill's reads and takes no pool dispatch, so a victim's
-//! fill never waits on the step's chain. The lock closes no cycle: job `n`
+//! time: a source's preparation (the NVMe tier's books and its claims) is
+//! written for one lane caller. The fill's reads run on the NVMe tier's
+//! reader as victim jobs ranked after the prompt jobs, and the lane thread
+//! waits on them without taking a pool dispatch, so a victim's fill never
+//! waits on the step's chain. The lock closes no cycle: job `n`
 //! waits only on job `n − RING_SLOTS`'s copy, a job an earlier holder of the
 //! lock took, whose staging needs the lock no more. A panic or a poisoned
 //! lock stops no other thread. Why no wait here can close a cycle through the card is the
