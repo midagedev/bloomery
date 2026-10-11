@@ -1012,6 +1012,39 @@ ratio slots bin: bin:t@BLOOMERY_GEN_SLOTS=2 has no ours aggregate arm on its pro
   eq arm-lines-order "$(grep -nxF -e "$rp" -e "$nv" <<< "$ARM_KEPT" | cut -d: -f1 | paste -sd' ' -)" '6 8'
   arm_lines no_such_bin x
   eq arm-lines-no-schema "$?:${ARM_WHY%%no schema for no_such_bin*}" '1:records.py did not keep the arm'"'"'s lines: records.py: '
+  # The load's header lines (the hook the driver calls): every line a kind of the schema reads, and the plain
+  # lines ARM_PLAIN names, the `plan` and `residency lever` records among them; a step line and a line of no kind
+  # are not echoed.
+  local hdr
+  hdr=$(printf '%s\n' "$(sample_rec generate_qwen3moe plan38)" 'load arch=stub ctx=256' 'capture graph_nodes=10' "$(sample_rec generate_qwen3moe residency_lever)" 'step 1 7 1001' 'a line of no kind')
+  eq header-kept "$(lg_header_lines "$hdr" | cut -d' ' -f1-2 | paste -sd'|' -)" 'plan place=w|load arch=stub|capture graph_nodes=10|residency lever'
+  eq header-no-hand-list "$(cd "${me%/*}" && grep -c 'LG_HEADER_R[E]' load-groups.sh depth-qwen3moe.sh depth-ds41.sh | paste -sd' ' -)" 'load-groups.sh:0 depth-qwen3moe.sh:0 depth-ds41.sh:0'
+  # The arm's tier counters: its nvtier record minus the previous arm's in the same process, the first arm's
+  # minus 0. The levels (resident_bytes) fall between the records without a refusal; a counter that falls, a
+  # record that only one of the two arms printed, and a load with no record are told apart.
+  local nv1 nv2 o1 o2 tl rc
+  nv1=$(sed -e 's/ fills=1 / fills=4 /' -e 's/ fill_ns=1 / fill_ns=900 /' -e 's/ evictions=1 / evictions=2 /' -e 's/ union_fills=1 / union_fills=6 /' -e 's/ resident_bytes=1 / resident_bytes=80 /' <<< "$nv")
+  nv2=$(sed -e 's/ fills=1 / fills=10 /' -e 's/ fill_ns=1 / fill_ns=2500 /' -e 's/ evictions=1 / evictions=2 /' -e 's/ union_fills=1 / union_fills=9 /' <<< "$nv")
+  o1=$(printf '%s\n' 'arm i=0 arms=2 ids=6 n=2' 'step 0 6 1000' "$rp" "$nv1" "$(sample_rec generate_qwen3moe residency_reset)")
+  o2=$(printf '%s\n' 'arm i=1 arms=2 ids=6 n=2' 'step 0 6 1000' "$rp" "$nv2")
+  tier_arm "$o1" ''
+  eq tier-first "$?:$TIER_DELTA" '0:fills=4 fill_ns=900 evictions=2 union_fills=6'
+  tier_arm "$o2" "$o1"
+  eq tier-second "$?:$TIER_DELTA" '0:fills=6 fill_ns=1600 evictions=0 union_fills=3'
+  tier_arm "$o2" ''
+  eq tier-first-is-whole "$?:$TIER_DELTA" '0:fills=10 fill_ns=2500 evictions=2 union_fills=9'
+  tier_arm 'step 0 6 1000' ''
+  eq tier-none "$?:$TIER_DELTA" '0:'
+  tier_arm "$o1" "$o2"
+  eq tier-went-down "$?:${TIER_WHY%%:*}" '1:the nvtier counter fills went down'
+  tier_arm 'step 0 6 1000' "$o1"
+  eq tier-lost "$?:${TIER_WHY%% record*}" '1:the previous arm printed an nvtier'
+  tier_arm "$o2" 'step 0 6 1000'
+  eq tier-process-total "$?:$TIER_DELTA" '0:no per-arm record (a process total: run with BLOOMERY_AB_LOAD=arm)'
+  # The row's line has its own head, so no kind reads it and the log keeps no second record of the arm.
+  tl="    tier-arm r1 ours d=6: fills=4 fill_ns=900 evictions=2 union_fills=6"
+  eq tier-line-no-record "$(python3 "$RS_RECORDS" keep --bin generate_qwen3moe --also "$(arm_plain_re)" - <<< "$tl" | wc -l | tr -d ' ')" 0
+  eq tier-wired "$(grep -c '^    \[ -z "\$TIER_DELTA" \] || echo "    tier-arm r\$r \$label d=\$dep: \$TIER_DELTA"$' "$me")" 2
   # The greedy text check: arms on one prompt that part print `differ` with each arm's md5 and count in the
   # summary; equal ids print `equal`; a lone arm, or arms on other prompts or slot counts, compare to nothing.
   TK_ROWS='' TK_SHOWN=','
@@ -1044,6 +1077,10 @@ ratio slots bin: bin:t@BLOOMERY_GEN_SLOTS=2 has no ours aggregate arm on its pro
 # arms and exits before the card, the binaries and the lease; --registry names another registry file.
 PARSE_ONLY=
 LEVER_REGISTRY=${BASH_SOURCE[0]%/*}/../../crates/levers/src/registry.rs
+# The load's lines echoed once under `[load]` (load-groups.sh): every line a kind of generate_qwen3moe's schema
+# reads and ARM_PLAIN's (cold-blocks.sh, sourced by the self-test and below). The rows read the load's lines
+# unfiltered (LG_HEADER), the capture line's node count among them.
+lg_header_lines() { python3 "$RS_RECORDS" keep --bin generate_qwen3moe --also "$(arm_plain_re)" - <<< "$1"; }
 case ${1:-} in
   --self-test)
     q3_self_test
@@ -2191,6 +2228,12 @@ ours_post() {
   # the NVMe tier's counters and the greedy ids, beside the row that sums them.
   arm_lines generate_qwen3moe "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$ARM_WHY" "$out"; return 0; }
   [ -z "$ARM_KEPT" ] || printf '%s\n' "$ARM_KEPT"
+  # The tier's counters this arm added: its nvtier record minus the previous arm's in the same process (tier_arm).
+  # LG_PREV_OUT is read only past the process's first arm, which only the load driver's processes have.
+  tier_arm "$out" "$([ -z "$a" ] || [ "${a% *}" = 0 ] || printf '%s' "${LG_PREV_OUT:-}")" || {
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" tier "$TIER_WHY" "$out"
+    return 0
+  }
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
   [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
@@ -2230,11 +2273,13 @@ ours_post() {
     local agg
     agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
     echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace}${A_MEM[$i]:+ | capped mem=${A_MEM[$i]}G} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
+    [ -z "$TIER_DELTA" ] || echo "    tier-arm r$r $label d=$dep: $TIER_DELTA"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG|$nslots")
   else
     echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace}${A_MEM[$i]:+ | capped mem=${A_MEM[$i]}G} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$PROBE_COL$DRIVE_COL$COLD_TAG$PROBE_TAG"
+    [ -z "$TIER_DELTA" ] || echo "    tier-arm r$r $label d=$dep: $TIER_DELTA"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
@@ -2253,10 +2298,8 @@ ours_post() {
   esac
 }
 # The driver's hooks (tools/ref/load-groups.sh). The timing card must be free before the load's process
-# starts: after that the process itself holds it between its arms. The load's lines echoed once; its
-# capture line's node count goes into every row of the load (LG_HEADER). lg_cmd is above, with the load
-# keys.
-LG_HEADER_RE='^(load|capture) '
+# starts: after that the process itself holds it between its arms. lg_header_lines is above, with the self-test;
+# lg_cmd is above, with the load keys.
 lg_before_load() {
   guard_other
   guard_timing

@@ -43,8 +43,12 @@
 #   lg_pre <i> <round>      the arm's guards and its witness block before it
 #   lg_post <i> <round> <rc> <output> <wall s>   the arm's witness block after it and its row (or its
 #                           FAIL row); MAJ_WHOLE and MAJ_TIMED are set for it
-# and LG_HEADER_RE, the ERE of the load lines echoed under `[load]`. LG_HEADER holds the running load's
-# lines before its arm 0, for a row that reads one of them. LG_PREV_OUT holds, as lg_post runs, the output
+#   lg_header_lines <header>   the load lines echoed under `[load]`, from <header> (the output's lines before
+#                           arm 0) on stdout, one a line: every line a kind of the binary's schema reads and
+#                           the lines of no kind that ARM_PLAIN names (records.py keep; cold-blocks.sh). It
+#                           returns 1 with the reason on stdout when it cannot (the echo is display only: the
+#                           driver says so on stderr and goes on).
+# LG_HEADER holds the running load's lines before its arm 0, unfiltered, for a row that reads one of them. LG_PREV_OUT holds, as lg_post runs, the output
 # of the arm before it in the same process (empty for a process's first arm): the lines a binary prints
 # after one arm's work and before the next arm's `arm` line — a clear's report — close that output, so a
 # row that reads them reads them there. LG_FED_RE, the ERE of the arm's line that
@@ -137,7 +141,7 @@ lg_process() {
   local r=$1
   shift
   local -a arms=("$@")
-  local n=${#arms[@]} k=-1 line rc=0 st out='' prev_out='' header='' t0=0 f0=0 fed='' bound pid dir rfd wfd i
+  local n=${#arms[@]} k=-1 line rc=0 st out='' prev_out='' header='' shown t0=0 f0=0 fed='' bound pid dir rfd wfd i
   LG_LEFT=()
   lg_cmd "${arms[@]}"
   bound=$((BOUND * (n + 1)))
@@ -176,7 +180,13 @@ lg_process() {
         lg_end_arm "${arms[$k]}" 0
       else
         LG_HEADER=$header
-        [ -z "$header" ] || printf '%s' "$header" | grep -E "$LG_HEADER_RE" | sed 's/^/    /'
+        if [ -n "$header" ]; then
+          if shown=$(lg_header_lines "$header"); then
+            [ -z "$shown" ] || sed 's/^/    /' <<< "$shown"
+          else
+            echo "[load] r$r: the load's lines were not echoed: $shown" >&2
+          fi
+        fi
       fi
       k=$((k + 1))
       if [ "$k" -ge "$n" ]; then

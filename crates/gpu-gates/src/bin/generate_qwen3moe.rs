@@ -247,7 +247,10 @@
 //! clear, so it prints what it prints in a fresh process. Each arm opens
 //! with `arm i=<i> arms=<k> ids=<P> n=<N>` and its `prompt_ids` line, then
 //! the lines a one-prompt run prints from `step 0` on; the load and capture
-//! lines print once, before arm 0. `--arm` does not mix with `--prompt`,
+//! lines print once, before arm 0. A load with a tier ends each arm's lines
+//! with its `nvtier` record, the tier's counters since the load: arm k's
+//! record includes the arms before it, and the arm's own counters are its
+//! record minus the previous one. `--arm` does not mix with `--prompt`,
 //! `--tokens` or `--seed-depth`. `--arm-sync` makes each arm wait, after its
 //! `arm` line, for one line on stdin: the timing runner takes its witness
 //! blocks there. A failed arm ends the process, naming the arm.
@@ -2485,17 +2488,18 @@ mod cli {
                 arm_head(i, count, arm, sync)?;
             }
             let ran = run_arm(s.model_mut(), run, path, arm);
-            after_passes(s.model_mut(), ran)
+            end_arm(s.model_mut(), ran)
         });
         ran.map_err(|f| Box::new(f) as GateError)?;
         if let Some((dir, rows)) = B::finish_trace(s.model_mut())? {
             println!("route trace {} positions={rows} complete", dir.display());
         }
-        print_nvtier(s.model())
+        Ok(())
     }
 
-    /// The load's `nvtier` record ([`Prompted::nvtier_record`]) at the end of
-    /// a run, nothing on a load without a tier.
+    /// The load's `nvtier` record ([`Prompted::nvtier_record`]), nothing on a
+    /// load without a tier: its counters are the tier's since the load,
+    /// cumulative, so each arm's record includes the arms before it.
     fn print_nvtier<B: Prompted>(m: &GpuModel<B>) -> Result<(), GateError> {
         if let Some(r) = B::nvtier_record(m)? {
             r.print();
@@ -2550,9 +2554,26 @@ mod cli {
                 arm_head(i, count, arm, sync)?;
             }
             let ran = run_arm38_mtp(&mut s, &mut spec, path, run, arm);
-            after_passes(s.model_mut(), ran)?;
+            end_arm(s.model_mut(), ran)?;
         }
-        print_nvtier(s.model())
+        Ok(())
+    }
+
+    /// The end of an arm `ran`: its `residency pass` records
+    /// ([`after_passes`]), then the load's `nvtier` record
+    /// ([`print_nvtier`]). Both print after the arm's step and `SMOKE` lines
+    /// and before the next arm's clear report and `arm` line, so a shared
+    /// load's output splits each arm's record with its lines, and neither
+    /// prints inside the arm's prompt-plus-steps window. An arm that failed
+    /// prints no record. [`GpuModel::reset`] empties the sequence's caches
+    /// and leaves the arena and the tier's counters, so a record minus the
+    /// previous one is what the arms between ran.
+    fn end_arm<B: Prompted>(
+        m: &mut GpuModel<B>,
+        ran: Result<(), GateError>,
+    ) -> Result<(), GateError> {
+        after_passes(m, ran)?;
+        print_nvtier(m)
     }
 
     /// An arm's result `ran`, with the `residency pass` records of its
@@ -3027,7 +3048,8 @@ mod cli {
     /// with their `arm` lines. What the body refuses of the load first
     /// ([`Prompted::slots_load`]); each arm from every slot's reset and, past
     /// the first, the residency's seed ([`gen_slots::fresh`]), its record
-    /// before the arm's; each arm's `residency pass` records after its lines.
+    /// before the arm's; each arm's `residency pass` and `nvtier` records
+    /// after its lines ([`end_arm`]).
     fn drive_slots<B: Prompted + SlotRows>(
         m: GpuModel<B>,
         run: &Run,
@@ -3051,10 +3073,9 @@ mod cli {
                 arm_head(i, count, arm, sync)?;
             }
             let ran = run_arm_slots(s, run, path, arm);
-            after_passes(s.model_mut(), ran)
+            end_arm(s.model_mut(), ran)
         });
-        ran.map_err(|f| Box::new(f) as GateError)?;
-        print_nvtier(s.model())
+        ran.map_err(|f| Box::new(f) as GateError)
     }
 
     /// One arm as `run.slots` streams in one pass, every slot from its reset

@@ -560,6 +560,79 @@ arm_lines() {
   ARM_KEPT=$got
 }
 
+# An arm's nvtier counters. The `nvtier` record is the tier's counters since the load, printed at the end of each
+# arm (generate_qwen3moe's end_arm), so an arm's own are its record minus the previous arm's of the same process,
+# the first arm's minus 0. `GpuModel::reset` empties the sequence's caches and leaves the arena and these counters,
+# which is why the record is cumulative across a shared load's arms. TIER_COUNTERS are the record's counters, in
+# the order tier_arm reads them; budget, paged and resident_bytes are levels, never subtracted. records.py refuses
+# a name the schema lacks, so a renamed counter ends the arm loudly. TIER_SHOWN are the ones a row names.
+TIER_COUNTERS=(misses fills fill_bytes fill_ns evictions buffered_reads buffered_bytes drops drop_bytes drop_ns
+  union_small union_batched union_fills union_hits keep_claims transient_claims)
+TIER_SHOWN=(fills fill_ns evictions union_fills)
+TIER_DELTA='' TIER_WHY=''
+# tier_last <output>: the last `nvtier` record's TIER_COUNTERS in TIER_NOW (an array), empty when the output has
+# none. Returns 1 with TIER_WHY when records.py cannot read it or a value is no whole number.
+tier_last() {
+  local f v specs=() rec
+  TIER_NOW=()
+  for f in "${TIER_COUNTERS[@]}"; do specs+=("TV_$f=nvtier.$f*"); done
+  rec=$(python3 "$RS_RECORDS" sh --bin generate_qwen3moe - "${specs[@]}" <<< "$1" 2>&1) || {
+    TIER_WHY="records.py did not read the nvtier record: $rec"
+    return 1
+  }
+  eval "$rec"
+  [ -n "$TV_misses" ] || return 0
+  for f in "${TIER_COUNTERS[@]}"; do
+    v=TV_$f
+    v=$(tail -n 1 <<< "${!v}")
+    [[ $v =~ ^[0-9]+$ ]] || {
+      TIER_WHY="the nvtier record's $f=$v is no whole number"
+      TIER_NOW=()
+      return 1
+    }
+    TIER_NOW+=("$v")
+  done
+}
+# tier_arm <output> <previous output>: TIER_DELTA, `fills=<n> fill_ns=<n> evictions=<n> union_fills=<n>`: the
+# counters (TIER_SHOWN) this arm's `nvtier` record adds to the previous arm's, in the previous output's record,
+# or to 0 when <previous output> is empty (an arm that opens its process: the caller passes the previous output
+# only from its second slot on). TIER_DELTA is empty, and the return 0, when the arm printed no record (a load
+# with no tier). When this arm printed a record and the previous arm none (a binary that prints the record once, at
+# the process end: a process total) TIER_DELTA says so in place of the counters, return 0: the arm's speed row stands.
+# Returns 1 with TIER_WHY when the previous arm printed a record and this one none, or a counter went down.
+tier_arm() {
+  local -a cur prev
+  local i f k n d='' want=''
+  TIER_DELTA='' TIER_WHY=''
+  tier_last "$1" || return 1
+  cur=(${TIER_NOW[@]+"${TIER_NOW[@]}"})
+  if [ -n "$2" ]; then
+    tier_last "$2" || return 1
+    prev=(${TIER_NOW[@]+"${TIER_NOW[@]}"})
+    if [ ${#cur[@]} -eq 0 ] && [ ${#prev[@]} -gt 0 ]; then
+      TIER_WHY="the previous arm printed an nvtier record and this arm none: its counters cannot be split"
+      return 1
+    fi
+    if [ ${#cur[@]} -gt 0 ] && [ ${#prev[@]} -eq 0 ]; then
+      TIER_DELTA='no per-arm record (a process total: run with BLOOMERY_AB_LOAD=arm)'
+      return 0
+    fi
+  fi
+  [ ${#cur[@]} -gt 0 ] || return 0
+  for i in "${!TIER_COUNTERS[@]}"; do
+    f=${TIER_COUNTERS[$i]}
+    n=$((cur[i] - ${prev[$i]:-0}))
+    if [ "$n" -lt 0 ]; then
+      TIER_WHY="the nvtier counter $f went down: ${cur[$i]} after ${prev[$i]:-0}"
+      return 1
+    fi
+    for k in "${TIER_SHOWN[@]}"; do
+      [ "$k" != "$f" ] || d+="${d:+ }$f=$n"
+    done
+  done
+  TIER_DELTA=$d
+}
+
 # The greedy text check's rows, TK_ROWS: `<round>|<key>|<label>|<hash>` a line. tk_hash <output>: the md5
 # (12 hex) of the arm's ids, one `tokens` line a slot (the ` slot=<j>` tag, brackets and spaces dropped),
 # `none` when it printed none. tk_key <ids> <dep> [<slots> [<model>]]: the arms that fed one prompt share a
