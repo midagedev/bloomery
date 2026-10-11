@@ -57,7 +57,7 @@ use bloomery_gpu::gemm::{
     GemmKernels, GemmRoute,
 };
 use bloomery_gpu::kquant::Act;
-use bloomery_gpu::site::{self, Form, Gated, GatedIo, SwigluRows, WideIn, WideKernels};
+use bloomery_gpu::site::{self, Form, Gated, GatedIo, SiteWeight, SwigluRows, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::Block;
@@ -493,9 +493,9 @@ impl GemmFront {
         let block = Gated {
             w,
             route: &*dense,
-            gate: (gate, gate_n),
-            up: (up, up_n),
-            down: (down, down_n),
+            gate: (gate, SiteWeight::Resident(gate_n)),
+            up: (up, SiteWeight::Resident(up_n)),
+            down: (down, SiteWeight::Resident(down_n)),
             ff: blk.ff,
             hidden,
             rule: Act::SwigluClamp { limit: blk.limit },

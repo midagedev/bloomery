@@ -216,6 +216,17 @@
 //!   hold as `flips` holds them. FAIL-first, `admit`: the layer's map not
 //!   brought to the pick (the map line and the logits read it), and the
 //!   places kept from the front's cut before the pick (the logits read it).
+//!   `split`: the history once more with the prompt calls' streaming
+//!   `split`: the first call streams experts on the wide arm's layers (none
+//!   fails by name), which the card runs from the ring beside its stacks,
+//!   every ring pass's union places read back are the stack's row with the
+//!   ring's experts at `n_card` plus their slot, and the calls' live sets,
+//!   ends and logits hold as `admit`'s. FAIL-first, `split`: the union one
+//!   card place short (the combine's fault names the streamed expert past
+//!   it), the ring's first expert left out of the union places (the union
+//!   read back names its slots; the logits band does not see one expert),
+//!   and the combine over the stack's places and card count (the streamed
+//!   experts summed by neither side: the logits read it).
 //!   FAIL-first, `flips`: the maps kept as the load built them
 //!   (`PlacedSide::refresh_maps` returning at once) reads the map line red
 //!   (the first prompt's maps name the spares the machine emptied at its
@@ -312,7 +323,7 @@ mod gate {
     };
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
-    use bloomery_gpu::host::xstream::XMode;
+    use bloomery_gpu::host::xstream::{Costs, XLayer, XMode};
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
@@ -3171,6 +3182,15 @@ mod gate {
     const _: () = assert!(E_P1 + E_STEPS1 + E_P2 + E_STEPS2 < CTX);
     const _: () = assert!(E_P2 >= WIDE_FROM && E_P2 <= PLACED_UBATCH);
 
+    /// The `split` clause's rule costs: the family's, with a host column a
+    /// thousand microseconds, so the stream's floor sits under one column and
+    /// each card layer streams the host experts its units route, up to a
+    /// half of the ring and the balance's cut.
+    const SPLIT_COSTS: Costs = Costs {
+        host_us_per_col: 1000.0,
+        ..Body35::XSTREAM_COSTS
+    };
+
     /// What one run of (e)'s history saw: every call's greedy id and logits
     /// row in order (the first prompt's, each step's, the second prompt's,
     /// each step's), the flips that landed at the boundaries before the
@@ -3199,6 +3219,8 @@ mod gate {
         landed: usize,
         picks: Vec<(usize, CallPick)>,
         end: Option<CallReport>,
+        /// The layers the call streamed under `split`, each with its walk.
+        xlayers: Vec<(usize, XLayer)>,
     }
 
     /// The step set's prompt ids (D1K): (e)'s two prompts' ids.
@@ -3280,7 +3302,8 @@ mod gate {
     /// The prompt calls' host streaming from the next call on
     /// (`Body35::set_xstream`).
     fn e_stream(s: &mut Session<Body35>, mode: XMode) -> Result<(), GateError> {
-        Ok(s.model_mut().body_parts(NAME)?.2.set_xstream(mode)?)
+        let (gpu, _, b) = s.model_mut().body_parts(NAME)?;
+        Ok(b.set_xstream(gpu, mode)?)
     }
 
     /// The layers whose wide map is not the card copy's row now.
@@ -3321,6 +3344,7 @@ mod gate {
             e_note(seen, out)?;
             seen.stale[i] = e_stale(s)?;
             let (picks, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+            let (xlayers, _) = s.model_mut().body_parts(NAME)?.2.take_xstream_records();
             // The first call's boundary is the clear's quiet one, and its
             // reports stay for the steps' count.
             let landed = match i {
@@ -3333,6 +3357,7 @@ mod gate {
                 landed,
                 picks,
                 end,
+                xlayers,
             };
             Ok::<(), GateError>(())
         };
@@ -3424,6 +3449,10 @@ mod gate {
     /// - `admit`: the history once more on the residency load with the
     ///   prompt calls' streaming `admit` ([`e_admit`]), the lever off again
     ///   after it.
+    /// - `split`: the history once more with the prompt calls' streaming
+    ///   `split` at [`SPLIT_COSTS`] with the union check on
+    ///   (`Placed::set_ring_check`) ([`e_split`]), the lever off again after
+    ///   it.
     ///
     /// Real tier: this gate has no fixture conversion (`qwen35moe`'s fixture
     /// row is `self`).
@@ -3490,7 +3519,30 @@ mod gate {
         let streamed = e_history(&mut on, &ids, Some(&off_seen.tokens));
         e_stream(&mut on, XMode::Off)?;
         let admit = e_admit(&streamed?, &off_seen)?;
-        Ok(flips && c1 && c7 && admit)
+        // `split`
+        e_stream(&mut on, XMode::Split)?;
+        let b = on.model_mut().body_parts(NAME)?.2;
+        b.set_xstream_costs(SPLIT_COSTS)?;
+        println!("split: xstream={}", b.xstream_word());
+        b.host()
+            .ok_or("an open_placed load with no placed side")?
+            .set_ring_check(true)?;
+        let streamed = e_history(&mut on, &ids, Some(&off_seen.tokens));
+        let p = on
+            .model_mut()
+            .body_parts(NAME)?
+            .2
+            .host()
+            .ok_or("an open_placed load with no placed side")?;
+        let checks: Vec<(usize, usize, usize)> = p
+            .take_ring_checks()
+            .iter()
+            .map(|c| (c.layer, c.streamed, c.wrong))
+            .collect();
+        p.set_ring_check(false)?;
+        e_stream(&mut on, XMode::Off)?;
+        let split = e_split(&streamed?, &off_seen, &checks)?;
+        Ok(flips && c1 && c7 && admit && split)
     }
 
     /// How a run's calls stand from the off run's: the call whose logits
@@ -3549,21 +3601,14 @@ mod gate {
     }
 
     /// `admit`'s verdict on (e)'s history run with the prompt calls'
-    /// streaming `admit` (`streamed`) against the off run's:
-    /// - the first call (from a clear: no decode history, its placement
-    ///   kept) admitted experts on the wide arm's layers (a call that admits
-    ///   none fails by name, not vacuously), its end kept, and each layer's
-    ///   live set after it its start set with as many experts swapped as the
-    ///   layer's pick admitted (one walk: one pick a layer), every wide map
-    ///   the card copy's row after it;
-    /// - the second call (after the steps' decode history) ended returned,
-    ///   each layer's live set after it its start set: the one before it
-    ///   with the flips its boundary landed swapped in, one expert each;
-    /// - every call's logits row and greedy id as `flips` holds them
-    ///   ([`e_band`]).
+    /// streaming `admit` (`streamed`) against the off run's: the first call
+    /// (from a clear: no decode history, its placement kept) admitted
+    /// experts on the wide arm's layers — a call that admits none fails by
+    /// name, not vacuously — and the run holds what a streaming run holds
+    /// ([`e_held`]).
     fn e_admit(streamed: &Seen, off: &Seen) -> Result<bool, GateError> {
         const _: () = assert!(E_P1 == PLACED_UBATCH && E_P1 >= Body35::STREAM_FLOOR as usize);
-        let [first, second] = &streamed.calls;
+        let first = &streamed.calls[0];
         let admitted: usize = first.picks.iter().map(|(_, p)| p.admitted).sum();
         if admitted == 0 {
             println!(
@@ -3574,6 +3619,83 @@ mod gate {
             );
             return Ok(false);
         }
+        let (ok, line) = e_held(streamed, off)?;
+        println!(
+            "admit: the first call admitted {admitted} experts over {} picks, {line}: {}",
+            first.picks.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `split`'s verdict on (e)'s history run with the prompt calls'
+    /// streaming `split` (`streamed`) against the off run's: the first call
+    /// streamed experts on the wide arm's layers (`take_xstream_records`) —
+    /// a call that streams none fails by name, not vacuously; its walk may
+    /// admit none, the stream serving those experts instead — and the run
+    /// holds what a streaming run holds ([`e_held`]): the stream ended with
+    /// the call (each layer's live set is the pick's alone) and the streamed
+    /// experts, run from the ring beside the card's stacks, keep the logits
+    /// in the off run's band; and every ring pass's union places read back
+    /// (`checks`: the layer, its slots on a streamed expert, its wrong
+    /// places) are the stack's row with the ring's experts at `n_card` plus
+    /// their slot in the half, on a run whose passes put slots on the ring.
+    fn e_split(
+        streamed: &Seen,
+        off: &Seen,
+        checks: &[(usize, usize, usize)],
+    ) -> Result<bool, GateError> {
+        let first = &streamed.calls[0];
+        let wide: Vec<&XLayer> = first
+            .xlayers
+            .iter()
+            .map(|(_, x)| x)
+            .filter(|x| x.cols >= WIDE_FROM)
+            .collect();
+        let n: usize = wide.iter().map(|x| x.streamed).sum();
+        if n == 0 {
+            println!(
+                "split: the first call streamed no expert over its {} layer records of the wide \
+                 arm, so the clause would hold vacuously: {}",
+                wide.len(),
+                verdict(false)
+            );
+            return Ok(false);
+        }
+        let layers = wide.iter().filter(|x| x.streamed > 0).count();
+        let (held, line) = e_held(streamed, off)?;
+        let on_ring: usize = checks.iter().map(|c| c.1).sum();
+        let wrong: Vec<(usize, usize)> = checks
+            .iter()
+            .filter(|c| c.2 > 0)
+            .map(|c| (c.0, c.2))
+            .collect();
+        let union = on_ring > 0 && wrong.is_empty();
+        let ok = held && union;
+        println!(
+            "split: the first call streamed {n} experts over {layers} layers of the wide arm \
+             ({} admitted by its picks), {line}; union places read back over {} ring passes, \
+             {on_ring} slots on the ring (above 0), (layer, wrong places) {wrong:?} (none): {}",
+            first.picks.iter().map(|(_, p)| p.admitted).sum::<usize>(),
+            checks.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// What a streaming run of (e)'s history (`streamed`) holds against the
+    /// off run's, and its line:
+    /// - the first call's end kept, and each layer's live set after it its
+    ///   start set with as many experts swapped as the layer's pick admitted
+    ///   (one walk: one pick a layer), every wide map the card copy's row
+    ///   after it;
+    /// - the second call (after the steps' decode history) ended returned,
+    ///   each layer's live set after it its start set: the one before it
+    ///   with the flips its boundary landed swapped in, one expert each;
+    /// - every call's logits row and greedy id as `flips` holds them
+    ///   ([`e_band`]).
+    fn e_held(streamed: &Seen, off: &Seen) -> Result<(bool, String), GateError> {
+        let [first, second] = &streamed.calls;
         let swapped = |l: usize| -> usize {
             first
                 .picks
@@ -3621,21 +3743,18 @@ mod gate {
             && swapped_back == second.landed
             && streamed.stale[0].is_empty()
             && band.ok();
-        println!(
-            "admit: the first call admitted {admitted} experts over {} picks, its end kept {kept}, \
-             layers whose live set is not its start set with the pick's admits swapped in \
-             {kept_sets:?} (none), wide maps off the card copy's rows after it {:?} (none); the \
-             second call (a decode history before it) ended returned {returned} ({} restored), \
-             experts out of the live sets across it {swapped_back} (the {} flips its boundary \
-             landed), layers whose live count moved {resized:?} (none); {}: {}",
-            first.picks.len(),
+        let line = format!(
+            "its end kept {kept}, layers whose live set is not its start set with the pick's \
+             admits swapped in {kept_sets:?} (none), wide maps off the card copy's rows after it \
+             {:?} (none); the second call (a decode history before it) ended returned {returned} \
+             ({} restored), experts out of the live sets across it {swapped_back} (the {} flips \
+             its boundary landed), layers whose live count moved {resized:?} (none); {}",
             streamed.stale[0],
             second.end.as_ref().map_or(0, |e| e.restored),
             second.landed,
-            band.line(),
-            verdict(ok)
+            band.line()
         );
-        Ok(ok)
+        Ok((ok, line))
     }
 
     /// The batch set's manifest and its five tokens.
