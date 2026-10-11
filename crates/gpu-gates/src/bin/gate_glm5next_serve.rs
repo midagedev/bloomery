@@ -60,16 +60,21 @@
 //!   `BLOOMERY_PREFILL_GROUP` unset, print `group=` the group the plan
 //!   reserves the prompt units for (`place::PROMPT_GROUP`);
 //! - `POST /residency/reset` is the server's 501 (no machine);
-//! - `cache` ([`cache`]): two sessions through the prompt cache, A's state
-//!   saved when B takes the slot and put back when A returns — every held
-//!   position kept and the ids of the same requests with no switch, and a
-//!   resend that shares only A's turn keeps the checkpoint the state carried
-//!   there, with the no-switch run's ids;
+//! - `cache` ([`cache`]): two sessions through the prompt cache, every
+//!   request's end state sealed on the card's lane when it ends (an erase
+//!   drops the slot, never the cache) and put back when a request takes it —
+//!   the resend with no switch keeps every position A held, the resend after
+//!   B takes the state the first resend sealed and keeps every id but its
+//!   last, and a resend that shares only A's turn keeps the turn's end with
+//!   no switch and, after B, every id of the strip but its last (the state
+//!   the strip sealed), each with the ids of the same requests with no
+//!   switch;
 //! - `round_trip` ([`round_trip`]): a session's second turn sent as the chat
 //!   messages a client sends back — the reply's content, no
 //!   `reasoning_content`, the template rendering the think span empty —
 //!   keeps the first turn's prompt call's end (`cache_n` its prompt less
-//!   one) and saves nothing (no `cache save` line);
+//!   one) and takes no save on the request path (no `cache save` line with
+//!   `off_path=false`: the end states are sealed off it);
 //! - then a third load, the server under `BLOOMERY_DRAFT=mtp
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
 //!   host`, the same `/completion` carries the draft's counts, and its ids
@@ -78,7 +83,9 @@
 //!   each drawn by the request's sampler (`Engine::advance_sampled`), so it
 //!   carries the draft's counts — and its ids are the plain CLI's too: the
 //!   clause holds the sampled path's ids end to end; and `cache` again under the draft, where the
-//!   draft also rejoins A where A left it, its counts the no-switch run's.
+//!   no-switch resend's draft rejoins and the resend after B, a prefix of a
+//!   sealed state, forgets the draft by name (its waiting rows end at the
+//!   state's end, not where the prompt call starts).
 //!   Exact: with no residency nothing
 //!   moves between the host and the card, every kept token is the target's
 //!   own argmax, and a verify's rows are its steps' bits — the window's
@@ -199,20 +206,25 @@
 //!   `cache_prompt` on) keeps the checkpoint the turn's prompt call took at
 //!   its end and its prompt call starts there, where the waiting rows do not
 //!   end — the draft skips, its `mtp prompt` record naming why, and the
-//!   request steps plainly (no draft counts). Run alone first; then both
-//!   slots dropped, the history built again and the second turn run alone
-//!   (`cache_prompt` off — a resend of it with the cache on would cut its own
-//!   held end the same way and skip too), and the two posted at once: both
-//!   answer, each request's ids — the drafting one's counts too — its alone
-//!   run's, the skipping request keeping the turn's end (`cache_n` the turn
-//!   less one), and the seat turns the skipping slot off before each one-pass
-//!   round (its own `mtp prompt` record naming why), every `cmd=pass` record
-//!   of the together window reading `slots=2`, `rows=2` and `passes=2` — the
-//!   off slot's plain pass beside the drafting slot's window, where a round
-//!   of two drafting slots runs one pass. Mutant: the seat not turning a
-//!   skipping slot off — the slot joins the pass as its one plain row, which
-//!   the body's NextN pass of several slots refuses by name, the server dies
-//!   and the clause goes red.
+//!   request steps plainly (no draft counts); its end is sealed with the
+//!   draft's side a parked skip. Run alone first; then both slots dropped (an
+//!   erase keeps the cache), the history built again and the second turn run
+//!   alone (`cache_prompt` off — a resend of it with the cache on would cut
+//!   its own held end the same way and skip too), and the two posted at
+//!   once: both answer, each request's ids — the drafting one's counts too —
+//!   its alone run's, the strip taking the state its alone run sealed (its
+//!   `cache_n` its prompt less one, plain: the parked skip needs no join, so
+//!   its `mtp prompt` record naming the join is none), and the seat turns the
+//!   skipping slot off before each one-pass round (its own `mtp prompt`
+//!   record naming why), every `cmd=pass` record of the together window
+//!   reading `slots=2`, `rows=2` and `passes=2` — the off slot's plain pass
+//!   beside the drafting slot's window, where a round of two drafting slots
+//!   runs one pass. Mutants: the seat not turning a skipping slot off — the
+//!   slot joins the pass as its one plain row, which the body's NextN pass of
+//!   several slots refuses by name, the server dies and the clause goes red;
+//!   the seat's lane off (`snapshots_async` false) — the together strip cuts
+//!   to the turn's end, its prompt call starts there and the join's skip
+//!   record returns.
 //! - against the CLI under the same levers: the ids agree, all of them or a
 //!   prefix ending in the end-of-generation id — the CLI takes the server's
 //!   cut (`--last-step`), so both run the same batches, count the rule's
@@ -1292,34 +1304,49 @@ mod gate {
         }
 
         /// The `mtp prompt` records this request printed that say the draft
-        /// skips.
+        /// skips, their `skipped` texts.
+        fn skip_whys(&self) -> Result<Vec<String>, GateError> {
+            skip_whys(&seat_log(&self.lines))
+        }
+
+        /// How many of them.
         fn skips(&self) -> Result<usize, GateError> {
-            skips(&seat_log(&self.lines))
+            Ok(self.skip_whys()?.len())
         }
     }
 
     /// The `cache` clause on one server (`drafted`: its MTP draft runs; the
     /// residency off, so a sequence's bits are its own): session A's first
-    /// turn fed fresh, B's turn, then A again — its state saved when B took
-    /// the slot (`glm5next::seq_save`) and put back (`seq_resume`) — against
-    /// the same requests with no switch between, run first:
-    /// - (a) A's turn, its reply and a later text: it keeps every position A
-    ///   held (a `cache load` note, `cache_n` the run with no switch's), and
-    ///   its ids are that run's; under the draft the draft rejoins where A
-    ///   left it — no `mtp prompt` record says it skips (the parked rows and
-    ///   the NextN store's positions came back), it drafts and accepts, and
-    ///   its counts are that run's: counts, which hold the store's and the
-    ///   arena rows' bits only as far as a moved proposal moves an accept;
+    /// turn fed fresh, B's turn, then A again against the same requests with
+    /// no switch between, run first. Every request's end is sealed when it
+    /// ends (its state copied on the card's lane under the next request,
+    /// `glm5next::seq_save_async`) and an erase drops the slot, never the
+    /// cache, so the run after B puts back (`seq_resume`) the state the
+    /// no-switch run sealed:
+    /// - (a) A's turn, its reply and a later text: with no switch it keeps
+    ///   every position A held; after B it takes the state the no-switch
+    ///   resend sealed (a `cache load` note), which carries a checkpoint at
+    ///   that resend's prompt call's end, and keeps every id of the resend
+    ///   but its last, its ids the no-switch run's; under the draft the
+    ///   no-switch resend drafts and accepts, and the one after B forgets the
+    ///   draft by name: it restores a prefix of the state, the parked rows
+    ///   end at the state's end and not at the empty prompt call's, so one
+    ///   `mtp prompt` record says it skips and it steps plainly (no counts);
     /// - (b) A's turn with another text in place of its reply, so the shared
-    ///   prefix ends at the turn: it keeps the checkpoint at the turn's
-    ///   prompt call's end (the point the state carried), and its ids are the
-    ///   run with no switch's, which cut to the model's own checkpoint there.
+    ///   prefix ends at the turn: with no switch it keeps the checkpoint at
+    ///   the turn's prompt call's end; after B it takes the state the strip
+    ///   sealed and keeps every id of the strip but its last, and its ids
+    ///   are the run with no switch's.
     ///
-    /// Mutants: the state carrying no point ((b) keeps nothing); the KDA
-    /// stores zeroed after the put-back ((a)'s ids move); the latent rows
-    /// zeroed after it ((a)'s and (b)'s ids move); the seat's rule granting
-    /// nothing of a saved state (no `cache load`: (a) and (b) keep nothing);
-    /// under the draft its side not put back (the draft skips by name).
+    /// Mutants: the state carrying no point ((a) and (b) after B keep
+    /// nothing); the KDA stores zeroed after the put-back ((a)'s ids move);
+    /// the latent rows zeroed after it ((a)'s and (b)'s ids move); the seat's
+    /// rule granting nothing of a saved state (no `cache load`: (a) and (b)
+    /// keep nothing); the seat's lane off (`snapshots_async` false): the
+    /// state is saved on the request path when B takes the slot, so (a) keeps
+    /// the positions A held, (b) the turn's end, and under the draft the
+    /// resend rejoins. The draft's side put back whole is held by
+    /// [`resume_under_residency`], not here.
     fn cache(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -1335,8 +1362,8 @@ mod gate {
         };
         let mut ok = true;
 
-        // (a) with no switch, then the slot dropped unsaved, so no cached
-        // state holds A when the switched run asks for it.
+        // (a) with no switch, then the slot dropped; the cache keeps the
+        // state the resend sealed, which the switched run asks for.
         let r1 = Turn::run(url, err_log, &p1, false)?;
         r1.show(&format!("cache {label}: A's turn fresh"));
         if r1.stop != "limit" || r1.tokens.len() != N_PREDICT {
@@ -1358,6 +1385,13 @@ mod gate {
         let a2 = Turn::run(url, err_log, &resend, true)?;
         a2.show(&format!("cache {label}: A resent after B"));
         let least = (p1.len() + N_PREDICT - 1) as u64;
+        // PIN(2026-10-11): the resend after B keeps every id of the resend but its last, not the
+        // no-switch run's `cache_n`; the no-switch resend's end was sealed (A's turn and its reply
+        // are in it) and the erase kept it, so the resend after B takes it back at the checkpoint
+        // its own prompt call ended at, while the no-switch resend still keeps A's held positions
+        // (the state sealed after A's turn, which carries no point past them: its draft side may
+        // hold one position more than the plain arm's, hence `>=`).
+        let all_but_last = resend.len() as u64 - 1;
         check(
             &mut ok,
             &format!("cache_{label}_a_keeps_every_held_position_after_the_switch"),
@@ -1365,7 +1399,8 @@ mod gate {
                 && !b1.tokens.is_empty()
                 && a2.loaded().is_some()
                 && r2.loaded().is_none()
-                && a2.cache_n == r2.cache_n
+                && r2.cache_n >= least
+                && a2.cache_n == all_but_last
                 && a2.cache_n >= least,
         );
         check(
@@ -1374,18 +1409,25 @@ mod gate {
             !a2.tokens.is_empty() && a2.tokens == r2.tokens,
         );
         if drafted {
-            let (a2_skips, r2_skips) = (a2.skips()?, r2.skips()?);
+            let (a2_whys, r2_whys) = (a2.skip_whys()?, r2.skip_whys()?);
             println!(
-                "cache {label}: draft skips A resent after B {a2_skips}, no switch {r2_skips}"
+                "cache {label}: draft skips A resent after B {a2_whys:?}, no switch {r2_whys:?}"
             );
+            // PIN(2026-10-11): the resend after B forgets the draft by name and the no-switch
+            // resend still rejoins; was both rejoined with equal counts. The resend after B takes
+            // the state its no-switch twin sealed at a checkpoint below the state's end (a prefix
+            // restore): the parked rows end at the state's end, its prompt call is empty and
+            // starts where they do not, so the draft skips once (`SKIP_AT_JOIN`) and the request
+            // steps plainly. The draft's side put back whole is held by `resume_under_residency`.
             check(
                 &mut ok,
                 "cache_drafted_a_draft_rejoins_where_a_left_it",
-                a2_skips == 0
-                    && r2_skips == 0
-                    && a2.draft_n > 0
-                    && a2.accepted > 0
-                    && (a2.draft_n, a2.accepted) == (r2.draft_n, r2.accepted),
+                r2_whys.is_empty()
+                    && r2.draft_n > 0
+                    && r2.accepted > 0
+                    && a2_whys.len() == 1
+                    && a2_whys[0].contains(SKIP_AT_JOIN)
+                    && (a2.draft_n, a2.accepted) == (0, 0),
             );
         }
 
@@ -1411,6 +1453,11 @@ mod gate {
         let s2 = Turn::run(url, err_log, &strip, true)?;
         s2.show(&format!("cache {label}: A's turn replaced after B"));
         let turn_end = p1.len() as u64 - 1;
+        // PIN(2026-10-11): the strip after B keeps every id of the strip but its last, the
+        // no-switch strip still the turn's end; the no-switch strip's end was sealed with a
+        // checkpoint at its own prompt call's end, which the erase kept and the strip after B
+        // takes back (it extends the turn's end, the checkpoint the first state carried).
+        let strip_end = strip.len() as u64 - 1;
         check(
             &mut ok,
             &format!("cache_{label}_b_keeps_the_turns_end"),
@@ -1419,7 +1466,7 @@ mod gate {
                 && !b2.tokens.is_empty()
                 && s2.loaded().is_some()
                 && s1.cache_n == turn_end
-                && s2.cache_n == turn_end,
+                && s2.cache_n == strip_end,
         );
         check(
             &mut ok,
@@ -1438,11 +1485,16 @@ mod gate {
     /// from what the slot holds at the reply's first id. It keeps the first
     /// turn's prompt call's end (the checkpoint there: `cache_n` the first
     /// prompt less its last id), less than half of what the slot holds, and
-    /// the slot's state is not saved (no `cache save` line): the second turn
-    /// carries the slot's last prompt whole and drops only that prompt's
-    /// reply, which the client never sends back. Mutant: the cache's half
-    /// rule alone (llama-server's `f_keep < 0.5`), which saves the state
-    /// here.
+    /// the slot's state is not saved on the request path (no `cache save`
+    /// line with `off_path=false`): the second turn carries the slot's last
+    /// prompt whole and drops only that prompt's reply, which the client
+    /// never sends back. The first turn's end was sealed off the request
+    /// path, and that copy lands under this request (a `cache landed` note of
+    /// the slot's positions). Mutants: the seat's lane off (`snapshots_async`
+    /// false) — no seal, no landing; with it the cache's half rule alone
+    /// (llama-server's `f_keep < 0.5`), which saves the state here on the
+    /// request path. The half rule alone saves nothing under the seal: the
+    /// slot's state is already a cached one's.
     fn round_trip(url: &dyn Fn(&str) -> String, err_log: &Path) -> Result<bool, GateError> {
         erase(url, 0)?;
         let first = json!([{ "role": "user", "content": TURN_C }]);
@@ -1487,16 +1539,25 @@ mod gate {
         let body = json!({ "messages": messages, "temperature": 0, "max_tokens": 4 });
         let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
         let t = json_of("/v1/chat/completions", st, &text)?["timings"].clone();
-        let saves: Vec<String> = lines_from(err_log, from)?
-            .into_iter()
-            .filter(|l| l.contains(": cache save "))
+        let window = lines_from(err_log, from)?;
+        // PIN(2026-10-11): the saves read are the request path's (`off_path=false`) and the first
+        // turn's sealed copy must land in the window; was every `cache save` line. Every request's
+        // end is sealed off the path, and the second turn's own end prints its `cache save` (with
+        // `off_path=true`) into this window once its response is out; the half rule alone saves
+        // nothing here, the slot's state being a cached one's already (`PromptCache::covers`).
+        let saves: Vec<&String> = window
+            .iter()
+            .filter(|l| l.contains(": cache save ") && l.contains("off_path=false"))
             .collect();
+        let held = p1.len() + reply - 1;
+        let landed = window
+            .iter()
+            .any(|l| l.contains(": cache landed ") && l.contains(&format!("positions={held} ")));
         let want = p1.len() as u64 - 1;
         println!(
-            "round trip: a second turn of {} ids, the slot holding {}: cache_n={} (want {want}) \
-             cache_ms={} saves {saves:?}",
+            "round trip: a second turn of {} ids, the slot holding {held}: cache_n={} (want {want}) \
+             cache_ms={} request-path saves {saves:?}, the first turn's copy landed {landed}",
             p2.len(),
-            p1.len() + reply - 1,
             t["cache_n"],
             t["cache_ms"]
         );
@@ -1504,7 +1565,7 @@ mod gate {
         check(
             &mut ok,
             "round_trip_keeps_the_prompt_calls_end_and_saves_nothing",
-            t["cache_n"].as_u64() == Some(want) && saves.is_empty(),
+            t["cache_n"].as_u64() == Some(want) && saves.is_empty() && landed,
         );
         Ok(ok)
     }
@@ -1554,13 +1615,16 @@ mod gate {
     }
 
     /// The `mtp prompt` records of `log` that say the draft skips (their
-    /// `skipped` not `none`).
-    fn skips(log: &Log) -> Result<usize, GateError> {
-        let mut n = 0;
+    /// `skipped` not `none`), their `skipped` texts.
+    fn skip_whys(log: &Log) -> Result<Vec<String>, GateError> {
+        let mut whys = Vec::new();
         for f in log.all(&record::MTP_PROMPT)? {
-            n += usize::from(f.text("skipped")? != "none");
+            let why = f.text("skipped")?;
+            if why != "none" {
+                whys.push(why.to_owned());
+            }
         }
-        Ok(n)
+        Ok(whys)
     }
 
     /// (s4) the context split's refusals (module header), each a `--plan` run
@@ -1946,18 +2010,23 @@ mod gate {
     /// the reply, `cache_prompt` on — keeps the checkpoint the turn's prompt
     /// call took at its end and its prompt call starts there, where the
     /// waiting rows do not end, so the draft skips and the request steps
-    /// plainly. The strip alone first; then both slots dropped (a dropped
-    /// slot saves no state the together strip could take back in place of
-    /// the cut), the history built again, the second turn `ids[1]` run alone
-    /// on the other slot (`cache_prompt` off: a resend of it with the cache
-    /// on would cut its own held end the same way and skip too), and the
-    /// strip beside that turn posted at once: the seat turns the skipping
-    /// slot off before each one-pass round, the round running its plain pass
-    /// beside the drafting slot's window, and each request's ids — the
-    /// drafting one's counts too — are its alone run's. Mutant: the seat not
-    /// turning a skipping slot off — the slot joins the pass as its one
-    /// plain row, which the body's NextN pass of several slots refuses by
-    /// name, the server dies and this clause goes red.
+    /// plainly. The strip alone first, its end sealed (the draft's side a
+    /// parked skip); then both slots dropped (an erase keeps the cache), the
+    /// history built again, the second turn `ids[1]` run alone on the other
+    /// slot (`cache_prompt` off: a resend of it with the cache on would cut
+    /// its own held end the same way and skip too), and the strip beside that
+    /// turn posted at once: the together strip takes the state its alone run
+    /// sealed back in place of the cut, so it keeps all of its ids but the
+    /// last, its prompt call is empty and its parked skip prints no join
+    /// record; the seat turns the skipping slot off before each one-pass
+    /// round, the round running its plain pass beside the drafting slot's
+    /// window, and each request's ids — the drafting one's counts too — are
+    /// its alone run's. Mutants: the seat not turning a skipping slot off —
+    /// the slot joins the pass as its one plain row, which the body's NextN
+    /// pass of several slots refuses by name, the server dies and this clause
+    /// goes red; the seat's lane off (`snapshots_async` false) — the strip
+    /// keeps the turn's end, its prompt call starts there and the join's skip
+    /// record returns.
     fn slots_skipping(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -2000,14 +2069,7 @@ mod gate {
         };
         // The `mtp prompt` records of `lines` that say the draft skips, their
         // `skipped` texts.
-        let skips_of = |lines: &[String]| -> Result<Vec<String>, GateError> {
-            seat_log(lines)
-                .all(&record::MTP_PROMPT)?
-                .iter()
-                .filter(|f| f.text("skipped").is_ok_and(|s| s != "none"))
-                .map(|f| Ok(f.text("skipped")?.to_owned()))
-                .collect()
-        };
+        let skips_of = |lines: &[String]| skip_whys(&seat_log(lines));
         // The strip alone on that history: the checkpoint the turn's prompt
         // call took at its end kept, the draft skipping from its prompt call
         // (its rounds one request's, a select and a plain pass, printing no
@@ -2026,7 +2088,8 @@ mod gate {
         );
         // The history again and the fresh drafting turn alone; then both at
         // once, the strip's slot the one holding the history (the prefix it
-        // shares) and the turn's the other.
+        // shares) and the turn's the other; the strip's cache holds the state
+        // its alone run sealed.
         erase(url, 0)?;
         erase(url, 1)?;
         greedy(url, ids[0], SLOTS_PREDICT, false)?;
@@ -2055,6 +2118,12 @@ mod gate {
             turn_at.map(run_of),
         );
         print_rounds("slots skipping", &window, &passes);
+        // PIN(2026-10-11): the together strip keeps every id of the strip but its last, the alone
+        // strip still the turn's end; the alone strip's end was sealed, its draft side a parked
+        // skip, the erase kept it, and the together strip takes it back (its kept points include
+        // the strip's last id's checkpoint, which its prompt call ended at), so it steps plainly
+        // from an empty prompt call.
+        let strip_end = strip.len() as u64 - 1;
         check(
             &mut ok,
             "slots_skipping_slot_steps_alone_beside_a_drafting_one",
@@ -2064,7 +2133,7 @@ mod gate {
                 && cache_n(&alone) == Some(turn_end)
                 && strip_ids.as_deref() == Some(alone_ids.as_slice())
                 && strip_at.is_some_and(plain)
-                && strip_at.and_then(cache_n) == Some(turn_end)
+                && strip_at.and_then(cache_n) == Some(strip_end)
                 && turn_at.map(run_of).as_ref() == Some(&turn_alone)
                 && turn_alone.1 > 0,
         );
@@ -2076,10 +2145,14 @@ mod gate {
                     r.u64("rows") == Ok(2) && r.u64("slots") == Ok(2) && r.u64("passes") == Ok(2)
                 }),
         );
+        // PIN(2026-10-11): the together window holds the turn-off record and no join record; was
+        // both. The together strip takes its alone run's sealed state back whole to its last id:
+        // its prompt call is empty, the parked skip prints no join, and the seat's turn-off before
+        // each one-pass round is the only record naming the skip.
         check(
             &mut ok,
             "slots_skipping_records_name_the_skip_and_the_turn_off",
-            skips.iter().any(|s| s.contains(SKIP_AT_JOIN))
+            !skips.iter().any(|s| s.contains(SKIP_AT_JOIN))
                 && skips.iter().any(|s| s.contains(SKIP_TURNED_OFF)),
         );
         Ok(ok)
