@@ -710,13 +710,7 @@ fn print_plan(
     let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
     vision_seat::reserve_on(&mut machine, vision_reserve);
     // V4.1's body makes no checkpoints: its slots pin none.
-    reserve_checkpoints(
-        &mut machine,
-        Seqs {
-            slots: slots.get(),
-            checkpoints: false,
-        },
-    );
+    reserve_checkpoints(&mut machine, Seqs::none(slots.get()), u64::try_from(ctx)?)?;
     let plan = inputs
         .plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)
         .map_err(|e| vision_seat::refusal(vision_reserve, e))?;

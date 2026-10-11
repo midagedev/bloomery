@@ -39,8 +39,8 @@ pub fn choose(
 /// and ubatches of `ub` under `experts` and `levers` — the load `mtp` names
 /// planning the file's MTP draft beside the target, else the plain plan of
 /// `seqs`' resident sequences, the machine's host reserving the checkpoints
-/// the load declares (`residency38::reserve_checkpoints`, as the load's own
-/// machine does) — the unset rule's `tier_of`. The plan is the model crate's
+/// the load declares (`residency38::reserve_checkpoints` at `ctx`, as the
+/// load's own machine does) — the unset rule's `tier_of`. The plan is the model crate's
 /// one owner of both (`machine_bp_on`,
 /// `PlanInputs::plan_with_slots`/`plan_mtp_with_slots`); a plan that refuses
 /// (a host expert rule on a tier machine, an idle tier card, a context past
@@ -63,7 +63,7 @@ pub fn tier_experts(
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
         tier_batch(&inputs.hp, ub),
     );
-    reserve_checkpoints(&mut machine, seqs);
+    reserve_checkpoints(&mut machine, seqs, ctx)?;
     let plan = match mtp {
         None => inputs.plan_with_slots(&machine, ctx, levers, experts, slots)?,
         Some(mi) => {

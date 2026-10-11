@@ -55,11 +55,13 @@
 //! the largest context whose plan of every slot stands, itself never past
 //! `place::ORACLE_POSITIONS` — pulled back to the largest multiple of
 //! `CTX_STEP` that stays within the plan's `MARGIN` of stage-card expert
-//! bytes (`placement::ctx`'s guard, qwen38's margin rule: more positions
-//! on the card push card experts to the host, and decode crawls), and never
-//! under 2048 unless the card holds less than that (qwen38's `card` rule);
-//! a `ctx` line on stderr names the rule, the chosen context, the slots and
-//! their total, the trained context, the fit and the margin. Set, the flag
+//! bytes and holds no more NVMe expert bytes than the plan at 2048 does
+//! (`placement::ctx::default_slot_ctx`, the one rule every serving seat
+//! takes: more positions on the card push card experts to the host, and
+//! decode crawls), and never under 2048 unless the card holds less than that
+//! (its `card` word); a `ctx` line on stderr names the rule (`card`, `base`,
+//! `fit` or `margin`), the chosen context, the slots and their total, the
+//! cap, the fit and the margin. Set, the flag
 //! is the total and each slot takes `total / N` positions rounded down
 //! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
 //! alone it is one request's context, one slot at the whole of it
@@ -232,13 +234,12 @@ use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
-    GLM_CARD, check_glm_reserve, checkpoints_reserved, glm_machine, residency_room, residency_set,
+    GLM_CARD, check_reserve, checkpoints_reserved, glm_machine, residency_room, residency_set,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
-    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, checkpoint_budget,
-    search_checkpoint_budget, seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save,
-    seq_save_async,
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, checkpoint_budget, checkpoint_price,
+    seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
 };
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -248,11 +249,12 @@ use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlaceError, PlanInputs, refusal_text,
 };
 use model::placement::churn::ChurnPool;
+use model::placement::ctx::{ExpertBytes, SlotCtx, default_slot_ctx};
 use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
-use runtime::seqstate::Why;
+use runtime::seqstate::{Price, Why};
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
 use serve::{
@@ -393,123 +395,60 @@ fn draft_of(
     }
 }
 
-/// The seat's `--ctx` and what decided it, for its `ctx` line: every
-/// context a slot's own, the plan counting every slot.
-struct GlmCtx {
-    ctx: usize,
-    /// The resident sequences that split the total.
-    slots: usize,
-    /// `set` (`--ctx`), or what bounded the default: `card` (the largest
-    /// context the plan takes, fewer than [`CTX`]), `base` ([`CTX`]: no
-    /// step past it stays within the margin), `margin` (the largest that
-    /// does), `fit` (the plan's largest context, the margin binding nothing
-    /// below it).
-    rule: &'static str,
-    /// The file's trained context (`context_length`).
-    trained: usize,
-    /// The largest context the plan takes, capped to the trained context and
-    /// [`ORACLE_POSITIONS`], and its stage-card expert bytes.
-    fit: usize,
-    fit_bytes: u64,
-    /// The largest context within the plan's margin
-    /// (`placement::ctx`'s guard).
-    margin_ctx: usize,
-    /// The plan's stage-card expert bytes at [`CTX`] and at `ctx`.
-    base_bytes: u64,
-    card_bytes: u64,
-}
-
 /// The seat's context (the module doc), every number a slot's own and every
 /// plan counting `slots` sequences ([`plan_of`]): `set`, a slot's
 /// share of the flag ([`split_ctx`]), as given — the plan the load runs
 /// refuses it by name past [`ORACLE_POSITIONS`] and when the card cannot
 /// hold every slot, so does this, with the plan's own words and, with the
-/// draft, the NextN layer's bytes the plan counted ([`refusal_text`]); unset, [`CTX`]
-/// or the trained context capped to what the plan takes within its
-/// [`MARGIN`] of stage-card expert bytes. The searches are planning-time
-/// only: one plan a probe of the bisection, none past the cap. A card whose
-/// plan stands nowhere, not even at one position a slot, refuses by name
-/// here, as the load's own plan would.
+/// draft, the NextN layer's bytes the plan counted ([`refusal_text`]); unset,
+/// the common rule's answer over the trained context capped to
+/// [`ORACLE_POSITIONS`] (`placement::ctx::default_slot_ctx`: [`CTX`] a slot,
+/// the largest multiple of [`CTX_STEP`] within [`MARGIN`] of stage-card
+/// expert bytes). The searches are planning-time only: one plan a probe of
+/// the bisections, none past the cap. A card whose plan stands nowhere, not
+/// even at one position a slot, refuses by name here, as the load's own plan
+/// would.
 fn ctx_of(
     inputs: &PlanInputs,
-    machine: &Machine,
+    machine_at: &dyn Fn(u64) -> Result<Machine, GateError>,
     levers: &PlanLevers,
     nextn: Option<&NextnInputs>,
     set: Option<usize>,
     slots: usize,
-) -> Result<GlmCtx, GateError> {
-    let card = |ctx: usize| -> Result<u64, GateError> {
-        let plan = plan_of(inputs, machine, u64::try_from(ctx)?, levers, nextn, slots)?;
-        Ok(plan
-            .cards
-            .first()
-            .ok_or("a plan with no card")?
-            .expert_bytes)
+) -> Result<SlotCtx, GateError> {
+    let expert_bytes = |ctx: usize| -> Result<ExpertBytes, GateError> {
+        let ctx = u64::try_from(ctx)?;
+        let machine = machine_at(ctx)?;
+        let plan = plan_of(inputs, &machine, ctx, levers, nextn, slots)?;
+        Ok(ExpertBytes {
+            card: plan
+                .cards
+                .first()
+                .ok_or("a plan with no card")?
+                .expert_bytes,
+            nvme: plan.host.nvme_expert_bytes,
+        })
     };
-    let trained = inputs.hp.n_ctx_train;
-    let cap = trained.min(usize::try_from(ORACLE_POSITIONS)?);
-    let fits = |c: usize| Ok(card(c).is_ok());
-    if let Err(e) = card(1) {
-        return Err(format!(
-            "no context fits the card: the plan of {slots} slots at 1 position a slot is \
-             refused ({e})"
-        )
-        .into());
+    let cap = inputs
+        .hp
+        .n_ctx_train
+        .min(usize::try_from(ORACLE_POSITIONS)?);
+    let mut rule = default_slot_ctx(cap, CTX, CTX_STEP, MARGIN, &expert_bytes)?;
+    if let Some(ctx) = set {
+        rule.ctx = ctx;
+        rule.rule = "set";
+        rule.chosen =
+            expert_bytes(ctx).map_err(|e| match (nextn, e.downcast_ref::<PlaceError>()) {
+                (Some(n), Some(refusal)) => {
+                    let bytes = u64::try_from(ctx)
+                        .ok()
+                        .and_then(|ctx| n.card_bytes(ctx, slots).ok());
+                    GateError::from(refusal_text(refusal, bytes, ctx, slots))
+                }
+                _ => e,
+            })?;
     }
-    let fit = model::placement::ctx::largest::<GateError>(1, cap, fits)?;
-    let base_at = CTX.min(fit);
-    let base_bytes = card(base_at)?;
-    let margin_ctx =
-        model::placement::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, MARGIN, &card)?;
-    let (ctx, rule) = match set {
-        Some(c) => (c, "set"),
-        None if fit < CTX => (base_at, "card"),
-        None if margin_ctx == CTX => (CTX, "base"),
-        None if margin_ctx == fit => (fit, "fit"),
-        None => (margin_ctx, "margin"),
-    };
-    Ok(GlmCtx {
-        ctx,
-        slots,
-        rule,
-        trained,
-        fit,
-        fit_bytes: card(fit)?,
-        margin_ctx,
-        base_bytes,
-        card_bytes: card(ctx).map_err(|e| match (nextn, e.downcast_ref::<PlaceError>()) {
-            (Some(n), Some(refusal)) => {
-                let bytes = u64::try_from(ctx)
-                    .ok()
-                    .and_then(|ctx| n.card_bytes(ctx, slots).ok());
-                GateError::from(refusal_text(refusal, bytes, ctx, slots))
-            }
-            _ => e,
-        })?,
-    })
-}
-
-impl GlmCtx {
-    /// The `ctx` line on stderr, qwen38's shape with the trained context
-    /// named: every context a slot's, `total` the slots'.
-    fn print(&self) {
-        eprintln!(
-            "ctx rule={} ctx={} slots={} total={} trained={} fit={} fit_card_expert_bytes={} \
-             margin_ctx={} base={CTX} base_card_expert_bytes={} card_expert_bytes={} \
-             lost_bytes={} margin_bytes={MARGIN}",
-            self.rule,
-            self.ctx,
-            self.slots,
-            self.slots * self.ctx,
-            self.trained,
-            self.fit,
-            self.fit_bytes,
-            self.margin_ctx,
-            self.base_bytes,
-            self.card_bytes,
-            self.base_bytes.saturating_sub(self.card_bytes)
-        );
-    }
+    Ok(rule)
 }
 
 /// The target's plan of `slots` resident sequences at `ctx` positions a slot
@@ -542,7 +481,7 @@ struct Placed {
     place: Place,
     tier_batch: Option<TierBatchBytes>,
     machine: Machine,
-    rule: GlmCtx,
+    rule: SlotCtx,
     tier_experts: u64,
 }
 
@@ -559,20 +498,18 @@ impl Placed {
         slots: usize,
     ) -> Result<Placed, GateError> {
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
-        // The context is chosen by a search over one machine, its checkpoints
-        // reserved at the deepest context a load can be granted; the load's
-        // machine, after it, at the context it is granted.
-        let search = glm_machine(
-            place,
-            tier_batch,
-            slots,
-            search_checkpoint_budget(inputs, set)?,
-        )?(inputs.model.layers);
-        let rule = ctx_of(inputs, &search, levers, nextn, set, slots)?;
+        // Every machine reserves its checkpoints at the slot context it is
+        // laid for: the search's probes each at their own, the load's at the
+        // context it is granted.
+        let price = checkpoint_price(inputs)?;
+        let machine_at = |ctx: u64| -> Result<Machine, GateError> {
+            Ok(glm_machine(place, tier_batch, slots, price, ctx)?(
+                inputs.model.layers,
+            ))
+        };
+        let rule = ctx_of(inputs, &machine_at, levers, nextn, set, slots)?;
         let ctx = u64::try_from(rule.ctx)?;
-        let machine = glm_machine(place, tier_batch, slots, checkpoint_budget(inputs, ctx)?)?(
-            inputs.model.layers,
-        );
+        let machine = machine_at(ctx)?;
         let tier_experts =
             glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?;
         Ok(Placed {
@@ -914,7 +851,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         rule,
         ..
     } = placed;
-    rule.print();
+    eprintln!("{}", rule.line(slots));
     if draft_off.is_none() && rule.ctx < NEED {
         return Err(format!(
             "the --ctx {} leaves no positions for the MTP draft's window (token 0 comes out of \
@@ -926,8 +863,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let ctx = u64::try_from(rule.ctx)?;
     // The sequences the load makes pin the body's budget at this context;
     // the plan's machine must reserve at least that.
-    let ckpt = checkpoint_budget(&inputs, ctx)?;
-    check_glm_reserve(&machine, slots, ckpt)?;
+    check_reserve(&machine, slots, checkpoint_budget(&inputs, ctx)?)?;
+    let price = checkpoint_price(&inputs)?;
     // The plans count every slot in their KV terms.
     let (plan, beside, draft_bytes) = match &nextn {
         None => (
@@ -983,7 +920,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         place,
         tier_batch,
         ctx: rule.ctx,
-        checkpoint_budget: ckpt,
+        checkpoint_price: price,
         slots,
         cfg: GlmCfg {
             place: plan_levers,
@@ -1042,9 +979,9 @@ struct SeatArgs {
     tier_batch: Option<TierBatchBytes>,
     /// A slot's context: the stores' rows one sequence serves.
     ctx: usize,
-    /// The host bytes one sequence's checkpoints pin at that context
-    /// ([`checkpoint_budget`]), which the load's machine reserves a slot.
-    checkpoint_budget: u64,
+    /// What one sequence's checkpoints cost ([`checkpoint_price`]), which
+    /// the load's machine reserves a slot at that context.
+    checkpoint_price: Price,
     /// The resident sequences the plan counts and the load makes
     /// ([`Session::add_slots`]).
     slots: usize,
@@ -1129,7 +1066,13 @@ impl Glm {
         let prefill = a.cfg.prefill;
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: glm_machine(a.place, a.tier_batch, a.slots, a.checkpoint_budget)?,
+            machine: glm_machine(
+                a.place,
+                a.tier_batch,
+                a.slots,
+                a.checkpoint_price,
+                u64::try_from(a.ctx)?,
+            )?,
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: a.cfg,

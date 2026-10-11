@@ -286,7 +286,7 @@
 //!   (`paged_small_card_load_names_the_rule`). Beside them, at 27 GiB: the
 //!   checkpoints every resident sequence may pin sit outside the room the
 //!   split fills — the server's arena is the gate's own plan's (no host
-//!   reserve for them) less `checkpoint_bytes(slots)`, and its host need that
+//!   reserve for them) less `pinned_checkpoints(slots)`, and its host need that
 //!   plan's plus the same (`paged_checkpoints_sit_outside_the_arena`, read
 //!   off the `cache` line); the prompt cache's default takes nothing beside
 //!   the room the split fills (`paged_default_cache_is_off_by_the_split`:
@@ -416,7 +416,7 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
+        Body38, checkpoint_budget38, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
@@ -2921,10 +2921,11 @@ mod gate {
         Ok(ok)
     }
 
-    /// The plan's card expert bytes on the gate card at a slot's `ctx`,
-    /// `slots` resident sequences counted (`plan_with_slots`), plain, as the
-    /// server makes it — the clause's flagless server's two, the refusal
-    /// arm's one; `None` when no plan takes the context.
+    /// The plan's routed-expert bytes on the gate card at a slot's `ctx`, the
+    /// stage card's and the NVMe tier's, `slots` resident sequences counted
+    /// (`plan_with_slots`), plain, as the server makes it — the clause's
+    /// flagless server's two, the refusal arm's one; `None` when no plan
+    /// takes the context.
     fn card_at(
         inputs: &PlanInputs,
         levers: &PlanLevers,
@@ -2932,7 +2933,7 @@ mod gate {
         ctx: usize,
         free: Option<u64>,
         slots: usize,
-    ) -> Result<Option<u64>, GateError> {
+    ) -> Result<Option<(u64, u64)>, GateError> {
         let mut machine = machine_for_experts(
             RTX_3090,
             inputs.spec.layers.len(),
@@ -2943,7 +2944,11 @@ mod gate {
         Ok(inputs
             .plan_with_slots(&machine, u64::try_from(ctx)?, levers, experts, slots)
             .ok()
-            .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
+            .and_then(|p| {
+                p.cards
+                    .first()
+                    .map(|c| (c.expert_bytes, p.host.nvme_expert_bytes))
+            }))
     }
 
     /// The gate's own plan of the file on the gate card (`free` bytes free,
@@ -3010,23 +3015,45 @@ mod gate {
         })
     }
 
+    /// The host bytes the seat's `slots` sequences of a slot's `ctx` positions
+    /// pin in checkpoints on the file: `slots` of the body's budget at that
+    /// context (`checkpoint_budget38` over the file's delta layers), the
+    /// reserve the server's machine holds and [`gate_plan_at`]'s does not.
+    fn pinned_checkpoints((ctx, slots): (usize, usize)) -> Result<u64, GateError> {
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::describe(&split)?;
+        let gdn = inputs
+            .spec
+            .layers
+            .iter()
+            .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+            .count();
+        Ok(runtime::seqstate::pinned(
+            slots,
+            checkpoint_budget38(gdn, u64::try_from(ctx)?)?,
+        ))
+    }
+
     /// The `ctx` clause: a plain server with no `--ctx-size` (and no
     /// `--parallel`, so the seat's default two resident slots) prints its
     /// `ctx` line before its load (it is stopped there), against this gate's
     /// own plans of the file — every plan counting the two slots, as the
-    /// seat's does: its context is a slot's, the margin rule's answer
-    /// (`margin`: the line's own `margin_ctx`, which the clause below holds
-    /// to the gate's plans), or the largest the card holds when that is
-    /// fewer than [`CTX`] (`card`), or the prompt cache's clamp of the
-    /// margin's answer (`cache`, composed the seat's way from the cache
+    /// seat's does: its context is a slot's, the common rule's answer
+    /// (`base` when no step past [`CTX`] is within the margin, `fit` when the
+    /// fit is, else `margin`: the line's own `margin_ctx`, which the clause
+    /// below holds to the gate's plans), or the largest the card holds when
+    /// that is fewer than [`CTX`] (`card`), or the prompt cache's clamp of
+    /// the rule's answer (`cache`, composed the seat's way from the cache
     /// line's own ram — the clamp rides MemAvailable as the fit rides the
     /// census); the line's `fit` is the largest slot context the card holds
     /// up to the file's serving cap (`place::serve_ctx`, its
     /// `context_length`) — its plan taken, and the one past it refused when
     /// the card bounds it, else the cap itself — with that plan's card
     /// expert bytes; its `margin_ctx` holds at most the plan's margin fewer
-    /// card expert bytes than the two-slot plan at [`CTX`], and the next
-    /// multiple of [`CTX_STEP`] past it more (or it is the fit). A server
+    /// card expert bytes than the two-slot plan at [`CTX`] and no more NVMe
+    /// expert bytes, and the next multiple of [`CTX_STEP`] past it more of
+    /// either (or it is the fit). A server
     /// with `--ctx-size` set and no `--parallel` takes one slot at the whole
     /// flag (the `from=ctx` rule; the clause's last server holds the line
     /// and the one-request note beside it), and one asked for a context one
@@ -3146,14 +3173,23 @@ mod gate {
             .and_then(|v| v.parse::<u64>().ok())
             .ok_or("a `cache` line without its ram")?;
         let at = |c: usize| card_at(&inputs, &plan_levers, experts, c, free, 2);
-        let base = at(CTX)?.ok_or("no plan at the base context")?;
-        let lost = |c: usize| -> Result<Option<u64>, GateError> {
-            Ok(at(c)?.map(|e| base.saturating_sub(e)))
-        };
+        let (base, base_nvme) = at(CTX)?.ok_or("no plan at the base context")?;
         let margin = model::placement::workstation::MARGIN;
-        let here = lost(margin_ctx)?;
-        let past = lost(margin_ctx + CTX_STEP)?;
+        // Whether the plan at `c` is within the rule's margin of the base's:
+        // at most `margin` fewer card expert bytes and no more NVMe expert
+        // bytes, re-derived from the gate's own plans; `None` when no plan
+        // takes the context.
+        let within = |c: usize| -> Result<Option<bool>, GateError> {
+            Ok(at(c)?.map(|(card, nvme)| base.saturating_sub(card) <= margin && nvme <= base_nvme))
+        };
+        let here = within(margin_ctx)?;
+        let past = within(margin_ctx + CTX_STEP)?;
         let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
+        // The plan's bytes at the line's own context, which the line's
+        // `card_expert_bytes` and `nvme_expert_bytes` name: a context the
+        // cache's bound lowered carries its own plan's bytes, not the rule's.
+        let at_ctx = at(ctx)?;
+        let line_bytes = |k: &str| field(k).and_then(|v| v.parse::<u64>().ok());
         let cap = usize::try_from(serve_ctx(1, &inputs.hp)?)?;
         // PIN(2026-10-02): the fit is the card's largest context up to the file's serving cap
         // (round q38rules: `serve_ctx`, 262,144 for Qwen3.8); where the card holds more, the fit
@@ -3197,20 +3233,29 @@ mod gate {
             inputs.seq_state_bytes(p, None) == seq38_bytes(gdn, qsa, n, false)
                 && inputs.seq_state_bytes(p, Some(&mtp)) == seq38_bytes(gdn, qsa, n, true)
         });
+        // The rule's word by the common precedence, then the cache's bound
+        // where one session's state does not fit its budget.
         // The cache rule's ram is the line's, read at the served context; the
         // derivation holds it at every context, exact where the cap binds as at
         // this server's plan.
         let (want_rule, want_ctx) = if fit < CTX {
             ("card", fit)
-        } else if ram == 0 || state(margin_ctx) <= ram {
-            ("margin", margin_ctx)
         } else {
-            ("cache", cache_ctx(margin_ctx))
+            let word = match margin_ctx {
+                c if c == CTX => "base",
+                c if c == fit => "fit",
+                _ => "margin",
+            };
+            if ram == 0 || state(margin_ctx) <= ram {
+                (word, margin_ctx)
+            } else {
+                ("cache", cache_ctx(margin_ctx))
+            }
         };
         println!(
-            "ctx: the gate's plans: lost at {margin_ctx} {here:?}, at {} {past:?}, fit {fit} \
-             {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({}); the default the rules \
-             compose to: rule {want_rule} ctx {want_ctx} (the cache line's ram {ram})",
+            "ctx: the gate's plans: within the margin at {margin_ctx} {here:?}, at {} {past:?}, fit \
+             {fit} {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({}); the default the \
+             rules compose to: rule {want_rule} ctx {want_ctx} (the cache line's ram {ram})",
             margin_ctx + CTX_STEP,
             if card_bounds {
                 "the card bounds the fit"
@@ -3237,17 +3282,19 @@ mod gate {
         check(
             &mut ok,
             "ctx_line_prints_the_fit_and_the_margin",
-            at_fit == Some(fit_bytes)
+            at_fit.map(|e| e.0) == Some(fit_bytes)
+                && at_ctx.map(|e| e.0) == line_bytes("card_expert_bytes")
+                && at_ctx.map(|e| e.1) == line_bytes("nvme_expert_bytes")
                 && fit <= cap
                 && (if card_bounds {
                     past_fit.is_none()
                 } else {
                     fit == cap
                 })
-                && here.is_some_and(|l| l <= margin)
+                && here == Some(true)
                 && margin_ctx <= fit
                 && (margin_ctx == fit
-                    || (margin_ctx.is_multiple_of(CTX_STEP) && past.is_none_or(|l| l > margin))),
+                    || (margin_ctx.is_multiple_of(CTX_STEP) && past != Some(true))),
         );
         // PIN(2026-10-07): the refusal arm's server takes one slot — a set
         // `--ctx-size` with no `--parallel` is one request's context now, the
@@ -3588,7 +3635,7 @@ mod gate {
     /// the checkpoints of the resident sequences sit outside the room the
     /// split fills (`paged_checkpoints_sit_outside_the_arena`: the `cache`
     /// line's arena (`tier`) is the gate's own plan's, which holds no
-    /// checkpoint reserve, less `checkpoint_bytes(slots)`, and its `need` that
+    /// checkpoint reserve, less `pinned_checkpoints(slots)`, and its `need` that
     /// plan's plus the same); the prompt cache's default is 0 beside the room
     /// the split fills (`paged_default_cache_is_off_by_the_split`); a
     /// residency word set to `off` reaches the `plan` record
@@ -3598,9 +3645,9 @@ mod gate {
     /// the arena with the step). The floor counts the checkpoints too: at the
     /// middle of the band of rooms between the one-slot plan's floor and the
     /// asked two slots' (the gate's own plans' floors, read off
-    /// `HostRoomFloor`, plus `checkpoint_bytes(slots)`) the flagless server
+    /// `HostRoomFloor`, plus `pinned_checkpoints(slots)`) the flagless server
     /// serves one slot, `from=paged`, its `paged` line naming the floor, with
-    /// the arena the gate's own plan has less `checkpoint_bytes(1)`
+    /// the arena the gate's own plan has less `pinned_checkpoints(1)`
     /// (`paged_floor_fallback_serves_one_column`), and `--parallel 2` is
     /// refused by the floor, by name
     /// (`paged_floor_set_parallel_is_refused_by_the_floor`). Last, the small
@@ -3765,7 +3812,7 @@ mod gate {
         // counts them and the arena is the room less the floor they raise.
         // The gate's own plan at the same room, slots and context, whose
         // machine holds no such reserve, differs from the server's by exactly
-        // `checkpoint_bytes(slots)` in each — the split keeps the same host
+        // `pinned_checkpoints(slots)` in each — the split keeps the same host
         // experts (its kept bytes are the need less the room past the
         // arena, both moved by the reserve) — read off the `cache` line's
         // `need` and `tier`, the seat's own terms of the plan it loads. The
@@ -3785,8 +3832,7 @@ mod gate {
                 Ok::<_, GateError>((usize::try_from(ctx)?, usize::try_from(slots)?))
             })
             .transpose()?;
-        let held =
-            bloomery_gpu_gates::residency38::checkpoint_bytes(shape.map_or(1, |(_, slots)| slots));
+        let held = shape.map(pinned_checkpoints).transpose()?.unwrap_or(0);
         let seat = (
             term(cache.as_deref(), "tier"),
             term(cache.as_deref(), "need"),
@@ -3898,8 +3944,8 @@ mod gate {
         // The default count's floor fallback. The floor counts every slot's
         // checkpoints: the gate's own floors (the planner's, read off
         // `HostRoomFloor` at a room of one byte, with no checkpoint reserve)
-        // plus `checkpoint_bytes(slots)` are the server's, so the one-slot
-        // plan's floor sits `checkpoint_bytes(1)` above the two-slot plan's
+        // plus `pinned_checkpoints(slots)` are the server's, so the one-slot
+        // plan's floor sits `pinned_checkpoints(1)` above the two-slot plan's
         // less its own extra checkpoints — a band of rooms the one-slot plan
         // clears and the two the flagless server asks first does not. The
         // server's first plan, at one position (the context search's first),
@@ -3908,9 +3954,8 @@ mod gate {
         // there serves one slot (`from=paged`, its `paged` line naming the
         // floor), and `--parallel 2` is refused by the floor, by name (the
         // context search's first plan fails before the `paged` rule).
-        let held = bloomery_gpu_gates::residency38::checkpoint_bytes(1);
-        let one_floor = host_floor(levers, (CTX, 1), free)? + held;
-        let two_floor = host_floor(levers, (1, 2), free)? + 2 * held;
+        let one_floor = host_floor(levers, (CTX, 1), free)? + pinned_checkpoints((CTX, 1))?;
+        let two_floor = host_floor(levers, (1, 2), free)? + pinned_checkpoints((1, 2))?;
         let band = one_floor < two_floor;
         let room = one_floor + two_floor.saturating_sub(one_floor) / 2;
         println!(
@@ -3939,6 +3984,7 @@ mod gate {
             })
             .transpose()?;
         let arena = term(cache.as_deref(), "tier");
+        let held = shape.map(pinned_checkpoints).transpose()?.unwrap_or(0);
         let bare = shape
             .map(|shape| host_split_at(levers, shape, free, room))
             .transpose()?;

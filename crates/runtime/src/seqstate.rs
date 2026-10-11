@@ -74,15 +74,36 @@ pub fn capacity(budget: u64, bytes: u64) -> Result<usize, CheckpointError> {
     usize::try_from(budget / bytes).map_err(|_| CheckpointError::Budget { budget, bytes })
 }
 
-/// The host bytes one sequence's checkpoints hold at most at a context of
-/// `ctx` positions, a checkpoint copying `point_bytes`: the points one prompt
-/// call over the whole context takes ([`marks`] from 0 to `ctx`), no more
-/// than [`HOST_BUDGET`] fits ([`capacity`]). A ledger of this budget is made
-/// of exactly that many slots, so it is the bound on what the sequence pins;
-/// a later call's start and end points past the whole-context ones displace
-/// the least recently used ([`Ledger::take`]), never grow the pin. Refused by
-/// name for a context of no positions or a checkpoint [`capacity`] refuses.
-pub fn budget_for(ctx: u32, every: u32, point_bytes: u64) -> Result<u64, CheckpointError> {
+/// What one checkpoint of a model costs on the host and how a prompt call
+/// spaces them: the family's own facts, one derivation read by the body that
+/// makes the sequences' `Checkpoints` and by the plan that reserves their
+/// bytes, so the two cannot differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Price {
+    /// The host bytes one checkpoint copies.
+    pub point_bytes: u64,
+    /// The spacing of a prompt call's inner checkpoints ([`marks`]).
+    pub every: u32,
+}
+
+impl Price {
+    /// The host bytes one sequence's checkpoints hold at most in a load of
+    /// `ctx` positions: the points one prompt call over the whole context
+    /// takes ([`marks`] from 0 to `ctx`), no more than [`HOST_BUDGET`] fits
+    /// ([`capacity`]). A ledger of this budget is made of exactly that many
+    /// slots, so it is the bound on what the sequence pins; a later call's
+    /// start and end points past the whole-context ones displace the least
+    /// recently used ([`Ledger::take`]), never grow the pin. Refused by name
+    /// for a context of no positions or past the u32 positions, and a
+    /// checkpoint [`capacity`] refuses.
+    pub fn budget(self, ctx: u64) -> Result<u64, CheckpointError> {
+        let at = u32::try_from(ctx).map_err(|_| CheckpointError::Context { ctx })?;
+        budget_for(at, self.every, self.point_bytes)
+    }
+}
+
+/// [`Price::budget`] over a context of `ctx` u32 positions.
+fn budget_for(ctx: u32, every: u32, point_bytes: u64) -> Result<u64, CheckpointError> {
     let fit = capacity(HOST_BUDGET, point_bytes)?;
     let held = fit.min(marks(0, ctx, every).len());
     u64::try_from(held)
@@ -93,6 +114,30 @@ pub fn budget_for(ctx: u32, every: u32, point_bytes: u64) -> Result<u64, Checkpo
             budget: 0,
             bytes: point_bytes,
         })
+}
+
+/// The host bytes `slots` sequences pin at most when each holds `budget`
+/// ([`Price::budget`]); `u64::MAX` past u64, which no host holds.
+#[must_use]
+pub fn pinned(slots: usize, budget: u64) -> u64 {
+    u64::try_from(slots).map_or(u64::MAX, |n| n.saturating_mul(budget))
+}
+
+/// A ledger of `capacity` points of `point_bytes` against the `budget` it was
+/// made for: refused by name unless its slots are exactly the budget's
+/// bytes, the figure a plan reserved the host for.
+pub fn check_ledger(budget: u64, capacity: usize, point_bytes: u64) -> Result<(), CheckpointError> {
+    let held = u64::try_from(capacity)
+        .ok()
+        .and_then(|n| n.checked_mul(point_bytes));
+    if held != Some(budget) {
+        return Err(CheckpointError::Held {
+            capacity,
+            bytes: point_bytes,
+            budget,
+        });
+    }
+    Ok(())
 }
 
 /// What a cut to at most `asked` positions keeps of the `held` the model
@@ -235,6 +280,15 @@ pub enum CheckpointError {
     },
     /// A forget of position `at`, where no checkpoint stands.
     Unknown { at: u32 },
+    /// A budget asked at a context past the u32 positions the marks are.
+    Context { ctx: u64 },
+    /// A ledger of `capacity` slots of `bytes` that is not the `budget` it
+    /// was made for.
+    Held {
+        capacity: usize,
+        bytes: u64,
+        budget: u64,
+    },
 }
 
 impl fmt::Display for CheckpointError {
@@ -275,6 +329,19 @@ impl fmt::Display for CheckpointError {
             CheckpointError::Unknown { at } => {
                 write!(f, "a forget of position {at}, where no checkpoint stands")
             }
+            CheckpointError::Context { ctx } => write!(
+                f,
+                "a context of {ctx} positions passes the u32 positions a checkpoint stands at"
+            ),
+            CheckpointError::Held {
+                capacity,
+                bytes,
+                budget,
+            } => write!(
+                f,
+                "the checkpoints hold {capacity} slots of {bytes} bytes; the budget is {budget} \
+                 bytes"
+            ),
         }
     }
 }
@@ -1207,6 +1274,116 @@ mod tests {
                 "ctx {ctx} bytes {bytes}"
             );
         }
+    }
+
+    /// A Qwen3.6 point (30 delta layers of 32 value heads: the state's
+    /// 2,097,152 B and the conv ring's 360,448 B each) and a Qwen3.8 point
+    /// (36 delta layers of 48 value heads, and the PLE ring), both spaced at
+    /// the 4,096-token default ubatch: a slot of 2,048 positions holds the one
+    /// point its whole prompt takes, of 10,240 the three (4,096, 8,192 and the
+    /// end), and the host budget's fit caps them at 58 and 32.
+    #[test]
+    fn a_slots_budget_counts_the_points_of_its_prompt() {
+        const Q35: Price = Price {
+            point_bytes: 30 * (2_097_152 + 360_448),
+            every: 4_096,
+        };
+        const Q38: Price = Price {
+            point_bytes: 36 * (3_145_728 + 450_560) + 696_320,
+            every: 4_096,
+        };
+        assert_eq!(Q35.point_bytes, 73_728_000);
+        assert_eq!(Q38.point_bytes, 130_162_688);
+        for (price, points) in [(Q35, [1, 1, 2, 3, 58]), (Q38, [1, 1, 2, 3, 32])] {
+            for (ctx, want) in [2_048, 4_096, 4_097, 10_240, 1 << 20]
+                .into_iter()
+                .zip(points)
+            {
+                let budget = price.budget(ctx).expect("a budget");
+                assert_eq!(budget, want * price.point_bytes, "ctx {ctx}");
+                assert_eq!(
+                    capacity(budget, price.point_bytes),
+                    Ok(want as usize),
+                    "ctx {ctx}"
+                );
+            }
+        }
+        assert_eq!(pinned(2, Q35.budget(2_048).expect("a budget")), 147_456_000);
+        assert_eq!(
+            pinned(2, Q38.budget(10_240).expect("a budget")),
+            780_976_128
+        );
+    }
+
+    /// A deeper context never reserves less for the family's own price, and a
+    /// reserve of slots, each at its share, follows: the plan's search at one
+    /// probe bounds what every shallower load pins.
+    #[test]
+    fn a_priced_reserve_never_falls_with_the_context() {
+        for point_bytes in [73_728_000, 130_162_688] {
+            let price = Price {
+                point_bytes,
+                every: 4_096,
+            };
+            let mut last = 0;
+            for ctx in 1..=140_000u64 {
+                let reserve = pinned(2, price.budget(ctx).expect("a budget"));
+                assert!(reserve >= last, "{point_bytes} B ctx {ctx}");
+                last = reserve;
+            }
+        }
+    }
+
+    /// A budget at a context past the u32 positions and a slot count past u64
+    /// are named, not wrapped.
+    #[test]
+    fn a_price_refuses_a_context_past_the_positions() {
+        let price = Price {
+            point_bytes: 1 << 20,
+            every: 512,
+        };
+        let past = u64::from(u32::MAX) + 1;
+        assert_eq!(
+            price.budget(past),
+            Err(CheckpointError::Context { ctx: past })
+        );
+        assert!(price.budget(u64::from(u32::MAX)).is_ok());
+        assert_eq!(pinned(0, 7), 0);
+        assert_eq!(pinned(3, 7), 21);
+        assert_eq!(pinned(usize::MAX, 7), u64::MAX);
+    }
+
+    /// A ledger is held to the budget it was made for: a capacity of the
+    /// budget's own points passes, any other is refused by name with the slots,
+    /// their bytes and the budget.
+    #[test]
+    fn a_ledger_of_another_budget_is_refused_by_name() {
+        const POINT: u64 = 73_728_000;
+        let price = Price {
+            point_bytes: POINT,
+            every: 4_096,
+        };
+        for ctx in [1, 2_048, 4_097, 10_240, 1 << 20] {
+            let budget = price.budget(ctx).expect("a budget");
+            let slots = capacity(budget, POINT).expect("a capacity");
+            assert_eq!(check_ledger(budget, slots, POINT), Ok(()), "ctx {ctx}");
+            let wrong = check_ledger(budget, slots + 1, POINT);
+            assert_eq!(
+                wrong,
+                Err(CheckpointError::Held {
+                    capacity: slots + 1,
+                    bytes: POINT,
+                    budget,
+                }),
+                "ctx {ctx}"
+            );
+        }
+        let e = check_ledger(2 * POINT + 1, 2, POINT).expect_err("a budget off a slot");
+        assert_eq!(
+            e.to_string(),
+            "the checkpoints hold 2 slots of 73728000 bytes; the budget is 147456001 bytes"
+        );
+        assert!(check_ledger(u64::MAX, usize::MAX, 2).is_err());
     }
 
     fn copy(t: Take) -> usize {

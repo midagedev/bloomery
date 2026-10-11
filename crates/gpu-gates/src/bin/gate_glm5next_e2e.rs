@@ -449,7 +449,7 @@ mod gate {
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
-    use bloomery_gpu_gates::residency38::reserve_glm_checkpoints;
+    use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag};
@@ -460,10 +460,10 @@ mod gate {
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
         Body, CHECKPOINT_EVERY, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode,
-        RouteTapRows, StoreDigest, StoreRows, checkpoint_budget, feed, nextn_store,
-        plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume, seq_resume_prefix,
-        seq_save, set_prefill, set_prefill_group, set_prompt_route_taps, set_taps, step_launches,
-        store_digests, store_rows,
+        RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
+        plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume,
+        seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_route_taps,
+        set_taps, step_launches, store_digests, store_rows,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -2611,8 +2611,11 @@ mod gate {
     /// budget for it.
     fn slot_machine(inputs: &PlanInputs, slots: usize) -> Result<Machine, GateError> {
         let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
-        let ckpt = checkpoint_budget(inputs, u64::try_from(SLOT_CTX)?)?;
-        reserve_glm_checkpoints(&mut machine, slots, ckpt);
+        reserve_checkpoints(
+            &mut machine,
+            Seqs::priced(slots, checkpoint_price(inputs)?),
+            u64::try_from(SLOT_CTX)?,
+        )?;
         Ok(machine)
     }
     /// The drafted passes each slot runs after its prompt's step, and (s3)'s
