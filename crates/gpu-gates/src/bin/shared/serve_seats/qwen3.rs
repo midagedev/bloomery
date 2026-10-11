@@ -732,40 +732,7 @@ struct Q3<B: Body3> {
     stats: bool,
     /// The resident image encoder under `--mmproj` ([`open_encoder`]).
     #[cfg(feature = "vision")]
-    vision: Option<Vision>,
-}
-
-/// The resident image encoder of `--mmproj`: its tower on the card the plan seated it
-/// ([`vision_seat::open_tower`]), the stream its readbacks run on and the model's image input
-/// the server renders and expands image parts by ([`Seat::media_model`]).
-#[cfg(feature = "vision")]
-struct Vision {
-    tower: Box<dyn bloomery_gpu_vision::Tower>,
-    stream: Arc<cuda_core::CudaStream>,
-    /// The width of a row: the text model's embedding, which the tower writes.
-    n_embd: usize,
-    media: vision_seat::SharedMedia,
-}
-
-#[cfg(feature = "vision")]
-impl Vision {
-    /// Every feed's image encoded on the tower and read back as bf16, one row a cell of its grid
-    /// and nothing around them ([`vision_seat::merged_cells`]): the tokens carry the
-    /// delimiters. All in one pair of buffers, each span's positions and rows as ranges of
-    /// them ([`vision_seat::span_rows`]).
-    fn span_rows(&mut self, feeds: &[MediaFeed]) -> Result<vision_seat::SpanRows<()>, GateError> {
-        vision_seat::span_rows(
-            &mut *self.tower,
-            &self.stream,
-            feeds.iter().map(|f| vision_seat::Image {
-                at: f.at,
-                patches: &f.prepared.patches,
-                span_len: f.prepared.span_len,
-            }),
-            self.n_embd,
-            vision_seat::merged_cells,
-        )
-    }
+    vision: Option<vision_seat::Resident>,
 }
 
 impl<B: Body3> Q3<B> {
@@ -835,33 +802,21 @@ impl<B: Body3> Q3<B> {
     }
 }
 
-/// The resident image encoder of `--mmproj` ([`Vision`]), its tower loaded on the card the plan
-/// seated ([`vision_seat::open_tower`]); the `vision` record that follows the load names the
-/// card, which of the two seats it is and the tower's bytes.
+/// The resident image encoder of `--mmproj` ([`vision_seat::Resident`]), its tower loaded on the
+/// card the plan seated; the `vision` record that follows the load names the card, which of the
+/// two seats it is and the tower's bytes.
 #[cfg(feature = "vision")]
 fn open_encoder<B: Body3>(
     s: &app::Session<B>,
     at: Option<Opened>,
-) -> Result<Option<Vision>, GateError> {
+) -> Result<Option<vision_seat::Resident>, GateError> {
     let Some(v) = at else {
         return Ok(None);
     };
     let t = Instant::now();
-    let (stream, tower) = vision_seat::open_tower(s.model().gpu().context(), &v)?;
-    vision_seat::record(
-        &v.seat,
-        (tower.weight_bytes(), tower.scratch_bytes()),
-        vision_seat::ScratchHome::Own,
-        v.cap,
-        t.elapsed().as_secs_f64(),
-    )
-    .eprint();
-    Ok(Some(Vision {
-        n_embd: tower.out_dim(),
-        tower,
-        stream,
-        media: v.media,
-    }))
+    let resident = vision_seat::Resident::open(s.model().gpu().context(), &v)?;
+    resident.announce(&v, vision_seat::ScratchHome::Own, t);
+    Ok(Some(resident))
 }
 
 impl<B: Body3> Seat for Q3<B> {
@@ -877,24 +832,28 @@ impl<B: Body3> Seat for Q3<B> {
         <B as Body3>::prompt(self.s.model_mut(), ids)
     }
 
-    /// The resident encoder's media description ([`Vision::media`]); `None` without `--mmproj`,
-    /// a seat that takes no image.
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
+    /// without `--mmproj`, a seat that takes no image.
     #[cfg(feature = "vision")]
     fn media_model(&self) -> Option<SharedMediaModel> {
-        self.vision.as_ref().map(|v| v.media.clone())
+        self.vision.as_ref().map(vision_seat::Resident::media)
     }
 
-    /// Each feed's image encoded on the resident encoder and read back as bf16
-    /// ([`Vision::span_rows`]), then one prompt call with the images spliced in
-    /// ([`Body3::prompt_media`]), the model's card bound back between the two
-    /// ([`vision_seat::on_encoder_card`]).
+    /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
+    /// its grid and nothing around them ([`vision_seat::merged_cells`]: the tokens carry the
+    /// delimiters; [`vision_seat::Resident::merged_rows`]), then one prompt call with the images
+    /// spliced in ([`Body3::prompt_media`]), the model's card bound back between the two.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        let vision_seat::SpanRows { rows, ats, .. } =
-            vision_seat::on_encoder_card(self.s.model().gpu().context(), || v.span_rows(feeds))?;
+        let vision_seat::SpanRows { rows, ats, .. } = v.merged_rows(
+            self.s.model().gpu().context(),
+            feeds
+                .iter()
+                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
+        )?;
         // Each span borrows its own range of the call's one buffer of rows; its grid is the
         // image's merged-token plan, `nx` along a line (the width).
         let images: Vec<Placed<'_>> = ats
