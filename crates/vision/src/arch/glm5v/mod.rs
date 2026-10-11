@@ -7,9 +7,9 @@
 //! The host side of an image is llama.cpp's mtmd rule for this projector: [`size`] plans the
 //! canvas inside a pixel budget, [`media`] resizes the image onto the canvas's top-left corner over
 //! black, normalizes it with CLIP's statistics and cuts it in merge order with each patch repeated
-//! over the two temporal frames.
-//!
-//! [`crate::arch::open`] still refuses this projector: no tower reads these tables yet.
+//! over the two temporal frames, and [`Media`] is the server's description of the image input.
+//! The pixel budget is the file's own (16 to 8000 merged tokens, [`Hparams::default_limits`])
+//! unless the token limits replace it ([`Hparams::size_rule_at`]).
 
 pub mod card;
 pub mod hparams;
@@ -20,7 +20,7 @@ pub mod size;
 pub mod tensors;
 
 pub use hparams::Hparams;
-pub use media::preprocess;
+pub use media::{Media, preprocess};
 pub use size::{Canvas, SizeRule};
 
 use crate::preprocess::ChannelStats;
