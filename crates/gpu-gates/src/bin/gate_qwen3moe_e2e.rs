@@ -131,8 +131,9 @@
 //!   is at or above [`MARGIN_FLOOR`]; graph = eager; the pass prefill = the
 //!   one-token path, bit for bit (every unit a walk through the host tier's
 //!   batch port) — and the host tier served slots on both of its ports. The
-//!   bands are the card's: a host expert runs ik's own 8-bit rule (Q8_K
-//!   activations) where the card runs q8_1, so no layer's error grows.
+//!   bands are the card's: a host expert runs ik's own 8-bit rule (q8_2 per
+//!   32 values for Q4_K-Q6_K and the 32-block types, Q8_K per 256 for the
+//!   rest) where the card runs q8_1, so no layer's error grows.
 //!   (o7) the file planned under no budget, a plan that keeps every routed
 //!   expert on the card (a refusal by name where the card holds no such plan),
 //!   loaded by the placed opener (`q3place::open_qwen3`): the body is the
