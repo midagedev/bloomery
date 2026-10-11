@@ -1687,6 +1687,8 @@ fn serve_tiered<'w>(
     }
     let slots = tier.slots.slots(tier.layer);
     if slots >= 2 * batch && s.tier_ids.len() <= slots - 2 * batch {
+        tier.slots
+            .note_union(tier.layer, &s.plan.ids, &s.plan.off, false);
         let pin = tier
             .slots
             .ensure_pinned(tier.layer, &s.tier_ids, Claim::Keep)?;
@@ -1704,6 +1706,8 @@ fn serve_tiered<'w>(
         }
         .into());
     }
+    tier.slots
+        .note_union(tier.layer, &s.plan.ids, &s.plan.off, true);
     let batching = Batching {
         tier,
         keep: slots - 2 * batch,
@@ -2013,8 +2017,8 @@ pub enum Claim {
     Keep,
     /// A claim that does not displace the hot set: a miss enters at the cold
     /// end and is the first victim, oldest first, before any hot slot; a hit
-    /// on a hot id refreshes it and a hit on a transient leaves it cold. A
-    /// later [`Claim::Step`] or [`Claim::Keep`] hit turns a transient hot.
+    /// leaves the slot as it is, hot or transient. A later [`Claim::Step`]
+    /// or [`Claim::Keep`] hit turns a transient hot.
     Transient,
 }
 
@@ -2119,6 +2123,15 @@ pub trait TierSlots: Send + Sync {
     /// Layer `layer`, expert `id`, part `part`'s bytes as the tier holds
     /// them; `None` when its slot is unfilled.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
+    /// A prompt union call on `layer`, told once per tiered union call,
+    /// before its first batch's claim, as it takes its path: `batched` when
+    /// its arena ids are more than the layer's slots less two batches. `ids`
+    /// are the call's distinct ids, ascending, those of the plan's host
+    /// segment included, and the columns that list `ids[d]` number
+    /// `off[d + 1] - off[d]`. A call refused before its path is told is not
+    /// told. It must not lock or allocate unless its tier was asked to keep
+    /// the call; a tier that keeps no books takes the default.
+    fn note_union(&self, _layer: usize, _ids: &[u32], _off: &[usize], _batched: bool) {}
 }
 
 /// One layer's tier handle: the layer's own index (the arena's books are
@@ -3129,6 +3142,18 @@ mod tests {
         ensured: std::sync::Mutex<Vec<(usize, Vec<u32>)>>,
         asked: std::sync::Mutex<Vec<(usize, u32, usize)>>,
         pins: std::sync::Mutex<PinLog>,
+        /// What `note_union` was told: the layer, the call's ids and column
+        /// offsets, and whether it took the batched path.
+        told: std::sync::Mutex<Vec<Told>>,
+    }
+
+    /// One `note_union` call as the mock was told it.
+    #[derive(Debug, PartialEq)]
+    struct Told {
+        layer: usize,
+        ids: Vec<u32>,
+        off: Vec<usize>,
+        batched: bool,
     }
 
     /// What the batch pins did, in order, and every read no pin covered.
@@ -3195,6 +3220,7 @@ mod tests {
                 ensured: std::sync::Mutex::new(Vec::new()),
                 asked: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(PinLog::default()),
+                told: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -3219,6 +3245,11 @@ mod tests {
 
         fn asked(&self) -> Vec<(usize, u32, usize)> {
             self.asked.lock().unwrap().clone()
+        }
+
+        /// The path notes so far, taken.
+        fn told(&self) -> Vec<Told> {
+            std::mem::take(&mut self.told.lock().unwrap())
         }
     }
 
@@ -3286,6 +3317,15 @@ mod tests {
                 log.loose.push((id, part));
             }
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
+        }
+
+        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], batched: bool) {
+            self.told.lock().unwrap().push(Told {
+                layer,
+                ids: ids.to_vec(),
+                off: off.to_vec(),
+                batched,
+            });
         }
     }
 
@@ -3679,6 +3719,99 @@ mod tests {
             mock.pins.lock().unwrap().held.is_empty(),
             "no pin outlives the refusal"
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A tiered union call tells its tier its path once, before its first
+    /// batch's claim: the call's distinct ids ascending (the host segment's
+    /// included) with their column offsets, `batched` when its arena ids are
+    /// more than the slots less two batches and not when they fit. A call
+    /// refused before its path (a layer under the floor, an expert past the
+    /// stacks') tells nothing.
+    #[test]
+    fn a_tiered_union_tells_its_tier_its_path_once() {
+        let (embd, ff, n_expert, batch) = (256, 256, 14, 3);
+        let path = layer_file("tiernote", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        let tiered = |slots: usize| {
+            let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+            let mut mock = MockTier::of(&split, &layer, true);
+            mock.slots = slots;
+            let mock = std::sync::Arc::new(mock);
+            layer.attach_tier(4, 0..2, mock.clone());
+            layer.tier.as_mut().expect("the tier just attached").batch = batch;
+            (layer, mock)
+        };
+        let x = Tensor2::from_vec(
+            embd,
+            2,
+            (0..2 * embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let mut us = UnionScratch::new_routed(embd, ff, 10, n_expert).unwrap();
+        let mut out = vec![f32::NAN; 2 * embd];
+        let (layer, mock) = tiered(10);
+        // Five arena ids (2..=6) over ten slots less two batches (four):
+        // batched. Id 4 is listed by both columns.
+        let big = [
+            vec![(2u32, 0.5f32), (3, 0.25), (4, 0.125)],
+            vec![(4, 0.5), (5, 0.25), (6, 0.125)],
+        ];
+        let refs: Vec<&[(u32, f32)]> = big.iter().map(Vec::as_slice).collect();
+        layer
+            .experts_union_into(src, &x, &refs, &mut out, &mut us)
+            .unwrap();
+        assert_eq!(
+            mock.told(),
+            vec![Told {
+                layer: 4,
+                ids: vec![2, 3, 4, 5, 6],
+                off: vec![0, 1, 2, 4, 5, 6],
+                batched: true
+            }],
+            "one note, batched, with the call's ids and offsets"
+        );
+        // Two arena ids (2 and 7) beside the host's id 0: one claim, whole.
+        let small = [vec![(0u32, 0.5f32), (2, 0.25)], vec![(2, 0.5), (7, 0.25)]];
+        let refs: Vec<&[(u32, f32)]> = small.iter().map(Vec::as_slice).collect();
+        layer
+            .experts_union_into(src, &x, &refs, &mut out, &mut us)
+            .unwrap();
+        assert_eq!(
+            mock.told(),
+            vec![Told {
+                layer: 4,
+                ids: vec![0, 2, 7],
+                off: vec![0, 1, 3, 4],
+                batched: false
+            }],
+            "one note, not batched, the host segment's id in the ids"
+        );
+        // Refused before the path: a layer one slot under the floor, and an
+        // expert past the stacks'.
+        let (floor, floor_mock) = tiered(2 * batch);
+        let refs: Vec<&[(u32, f32)]> = big.iter().map(Vec::as_slice).collect();
+        floor
+            .experts_union_into(src, &x, &refs, &mut out, &mut us)
+            .expect_err("a layer under the floor");
+        assert!(
+            floor_mock.told().is_empty(),
+            "the floor's refusal told nothing"
+        );
+        let past = [vec![(14u32, 1.0f32)]];
+        let refs: Vec<&[(u32, f32)]> = past.iter().map(Vec::as_slice).collect();
+        layer
+            .experts_union_into(
+                src,
+                &Tensor2::zeros(embd, 1),
+                &refs,
+                &mut out[..embd],
+                &mut us,
+            )
+            .expect_err("an expert past the stacks'");
+        assert!(mock.told().is_empty(), "the stacks' refusal told nothing");
         std::fs::remove_file(&path).unwrap();
     }
 

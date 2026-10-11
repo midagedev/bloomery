@@ -1631,12 +1631,14 @@ pub static CLEF_ROWS: Kind = Kind {
 /// The NVMe expert tier's arena over one paged load: its counters as the
 /// tier holds them (`NvTierStats`) — the misses `ensure` read, the slots
 /// filled and their bytes and wall, the evictions, the resident bytes (at
-/// or under the budget at every step), the reads the page cache served, and
-/// the drops of the mapping's pages a read brought in, their bytes and wall.
+/// or under the budget at every step), the reads the page cache served, the
+/// drops of the mapping's pages a read brought in, their bytes and wall, and
+/// the prompt union's claims: its calls by path, the ids its claims filled
+/// and found filled, and the ids it claimed as keep and as transient.
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, and the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims).",
     parts: &[
         key("budget", U64, "B"),
         key("paged", U64, "B"),
@@ -1651,6 +1653,12 @@ pub static NVTIER: Kind = Kind {
         key("drops", U64, ""),
         key("drop_bytes", U64, "B"),
         key("drop_ns", U64, "ns"),
+        key("union_small", U64, ""),
+        key("union_batched", U64, ""),
+        key("union_fills", U64, ""),
+        key("union_hits", U64, ""),
+        key("keep_claims", U64, ""),
+        key("transient_claims", U64, ""),
     ],
 };
 
@@ -3341,7 +3349,13 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("buffered_bytes", s.buffered_bytes)
             .u("drops", s.drops)
             .u("drop_bytes", s.drop_bytes)
-            .u("drop_ns", s.drop_ns),
+            .u("drop_ns", s.drop_ns)
+            .u("union_small", s.union_small)
+            .u("union_batched", s.union_batched)
+            .u("union_fills", s.union_fills)
+            .u("union_hits", s.union_hits)
+            .u("keep_claims", s.keep_claims)
+            .u("transient_claims", s.transient_claims),
     )
 }
 
@@ -3756,6 +3770,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `nvtier` record ends with the prompt union's six counters, in the
+    /// order the kind declares them: a record that names one out of order or
+    /// leaves one out panics by name.
+    #[test]
+    fn nvtier_ends_with_the_union_counters() {
+        let line = Record::new(&NVTIER)
+            .u("budget", 100)
+            .u("paged", 200)
+            .u("misses", 3)
+            .u("fills", 4)
+            .u("fill_bytes", 5)
+            .u("fill_ns", 6)
+            .u("evictions", 7)
+            .u("resident_bytes", 8)
+            .u("buffered_reads", 9)
+            .u("buffered_bytes", 10)
+            .u("drops", 11)
+            .u("drop_bytes", 12)
+            .u("drop_ns", 13)
+            .u("union_small", 14)
+            .u("union_batched", 15)
+            .u("union_fills", 16)
+            .u("union_hits", 17)
+            .u("keep_claims", 18)
+            .u("transient_claims", 19)
+            .line();
+        assert!(
+            line.ends_with(
+                "drop_ns=13 union_small=14 union_batched=15 union_fills=16 union_hits=17 \
+                 keep_claims=18 transient_claims=19"
+            ),
+            "{line}"
+        );
+        let names: Vec<&str> = NVTIER.parts.iter().filter_map(Part::value_name).collect();
+        assert_eq!(
+            names[names.len() - 6..],
+            [
+                "union_small",
+                "union_batched",
+                "union_fills",
+                "union_hits",
+                "keep_claims",
+                "transient_claims"
+            ]
+        );
     }
 
     /// Lines as their readers know them.

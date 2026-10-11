@@ -55,7 +55,8 @@
 //! step's and a keep's slots take a fresh tick; a transient's enter at the
 //! cold end (tick 0 and a sequence number in claim order), so the next miss
 //! takes the oldest transient before any hot slot, and a later step or keep
-//! hit turns a transient hot. A batch pin ([`NvTier::pin`]) counts the ids
+//! hit turns a transient hot; a transient claim's hit leaves a hot or
+//! transient slot as it is. A batch pin ([`NvTier::pin`]) counts the ids
 //! of a batch in the same open-read counts a lane's read does, so the books
 //! take none of them until the guard drops. A prompt call's union claims
 //! each batch of its experts as one claim and pin ([`NvTier::prefetch_pinned`]):
@@ -322,11 +323,13 @@ struct Claimed {
 
 /// The books' pass of one `ensure` over layer `layer`'s `ids`: ids the plan's
 /// host segment holds are skipped, a filled one is placed as `kind` says (a
-/// fresh tick; a transient under [`Claim::Transient`] keeps its cold place),
-/// every other takes a slot — the first free, else the victim
+/// fresh tick under [`Claim::Step`] and [`Claim::Keep`]; a hit under
+/// [`Claim::Transient`] leaves the slot as it is, hot or transient), every other takes a slot — the first free, else the victim
 /// ([`pick_slot`]), which it evicts — and is marked filling. A transient
 /// call's own ids are never its victims: a hit on a transient keeps its cold
-/// place, the first place a later miss of the call would look. Pure over the
+/// place, the first place a later miss of the call would look, and a hit on a
+/// hot id keeps its tick, so the ids a keep claim took stay newer than it.
+/// Pure over the
 /// books: no read, no page returned. The `seen` marks are this call's alone;
 /// a mark that outlived its call would skip an expert evicted since, and its
 /// slot would read unfilled. Refused by name before any slot is claimed, the
@@ -423,7 +426,7 @@ fn claim_with(
                 held.add(id, WHAT)?;
             }
             let book = &arena.slots[slot];
-            if kind != Claim::Transient || book.seq.load(Ordering::Relaxed) == 0 {
+            if kind != Claim::Transient {
                 books.tick += 1;
                 book.tick.store(books.tick, Ordering::Relaxed);
                 book.seq.store(0, Ordering::Relaxed);
@@ -669,6 +672,17 @@ impl LayerArena {
         (self.slots[slot].state.load(Ordering::Relaxed) == FILLED).then_some(slot)
     }
 
+    /// Expert `id`'s slot as the books hold it: hot, or a transient (a
+    /// sequence word), or `None` when `id` has no filled slot.
+    fn heat(&self, id: u32) -> Option<Heat> {
+        let book = &self.slots[self.filled(id)?];
+        Some(if book.seq.load(Ordering::Relaxed) == 0 {
+            Heat::Hot
+        } else {
+            Heat::Transient
+        })
+    }
+
     /// A drop's books with nothing read yet: the host segment's ids held,
     /// every other id the arena's.
     fn marks(&self) -> Vec<Mark> {
@@ -900,6 +914,19 @@ pub struct NvTierStats {
     /// the releases of an id the arena held no filled slot of.
     pub releases: u64,
     pub release_misses: u64,
+    /// Prompt union calls on a layer with an arena, by path: those whose
+    /// arena ids fit the layer's slots less two batches (claimed whole) and
+    /// those run in batches ([`TierSlots::note_union`]).
+    pub union_small: u64,
+    pub union_batched: u64,
+    /// Ids the pinned claims ([`NvTier::ensure_pinned`]) filled, and ids
+    /// they found filled.
+    pub union_fills: u64,
+    pub union_hits: u64,
+    /// Ids the pinned claims placed as [`Claim::Keep`] and as
+    /// [`Claim::Transient`]; a pinned [`Claim::Step`] counts in neither.
+    pub keep_claims: u64,
+    pub transient_claims: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -918,6 +945,72 @@ struct Stats {
     mapping_reads: AtomicU64,
     releases: AtomicU64,
     release_misses: AtomicU64,
+    union_small: AtomicU64,
+    union_batched: AtomicU64,
+    union_fills: AtomicU64,
+    union_hits: AtomicU64,
+    keep_claims: AtomicU64,
+    transient_claims: AtomicU64,
+    /// The last union call of each layer, kept when asked for
+    /// ([`NvTier::record_unions`]); unset while off.
+    unions: OnceLock<Mutex<Vec<Option<UnionBook>>>>,
+}
+
+impl Stats {
+    /// A pinned claim's ids as the books found them: `hits` filled already,
+    /// `misses` to fill, placed as `kind` says.
+    fn pinned_claim(&self, kind: Claim, hits: u64, misses: u64) {
+        self.union_hits.fetch_add(hits, Ordering::Relaxed);
+        let of_kind = match kind {
+            Claim::Keep => &self.keep_claims,
+            Claim::Transient => &self.transient_claims,
+            Claim::Step => return,
+        };
+        of_kind.fetch_add(hits + misses, Ordering::Relaxed);
+    }
+
+    /// One union call on a layer with an arena, by the path it took.
+    fn union_call(&self, batched: bool) {
+        let by_path = if batched {
+            &self.union_batched
+        } else {
+            &self.union_small
+        };
+        by_path.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A layer's last union call as the tier was told it
+/// ([`TierSlots::note_union`], kept by [`NvTier::record_unions`]): the path it
+/// took and, for every id of the call the arena serves, ascending, the
+/// columns that listed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnionBook {
+    pub batched: bool,
+    pub cols: Vec<(u32, u32)>,
+}
+
+impl UnionBook {
+    /// The book of a call over `ids` (distinct, ascending) whose id `d` is
+    /// listed by `off[d + 1] - off[d]` columns, less the ids of the plan's
+    /// host segment `host`.
+    fn of(host: &Range<u32>, ids: &[u32], off: &[usize], batched: bool) -> UnionBook {
+        let cols = ids
+            .iter()
+            .zip(off.windows(2))
+            .filter(|(id, _)| !host.contains(id))
+            .map(|(&id, w)| (id, (w[1] - w[0]) as u32))
+            .collect();
+        UnionBook { batched, cols }
+    }
+}
+
+/// A filled slot's place in the books ([`NvTier::slot_heat`]): hot, with a
+/// tick of its own, or a transient at the cold end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Heat {
+    Hot,
+    Transient,
 }
 
 /// What the tier's dropper thread shares with the tier: the split whose
@@ -1372,6 +1465,29 @@ impl NvTier {
             .is_some_and(|l| l.filled(id).is_some())
     }
 
+    /// Whether the books hold layer `layer`'s expert `id` filled as a hot
+    /// slot or as a transient; `None` when unfilled.
+    #[must_use]
+    pub fn slot_heat(&self, layer: usize, id: u32) -> Option<Heat> {
+        self.by_layer.get(layer)?.as_ref()?.heat(id)
+    }
+
+    /// Keep each layer's last union call from now on
+    /// ([`NvTier::last_union`]): an instrument a gate turns on, once; a run
+    /// that does not ask keeps nothing and takes no lock.
+    pub fn record_unions(&self) {
+        self.stats.unions.get_or_init(Mutex::default);
+    }
+
+    /// Layer `layer`'s last union call, when [`NvTier::record_unions`] is on
+    /// and the layer had one.
+    #[must_use]
+    pub fn last_union(&self, layer: usize) -> Option<UnionBook> {
+        let books = self.stats.unions.get()?;
+        let books = books.lock().unwrap_or_else(|e| e.into_inner());
+        books.get(layer)?.clone()
+    }
+
     /// The arena as the leg's [`TierSlots`] handle.
     pub(crate) fn slots(self: &Arc<Self>) -> Arc<dyn TierSlots> {
         self.clone()
@@ -1441,6 +1557,12 @@ impl NvTier {
             mapping_reads: s.mapping_reads.load(Ordering::Relaxed),
             releases: s.releases.load(Ordering::Relaxed),
             release_misses: s.release_misses.load(Ordering::Relaxed),
+            union_small: s.union_small.load(Ordering::Relaxed),
+            union_batched: s.union_batched.load(Ordering::Relaxed),
+            union_fills: s.union_fills.load(Ordering::Relaxed),
+            union_hits: s.union_hits.load(Ordering::Relaxed),
+            keep_claims: s.keep_claims.load(Ordering::Relaxed),
+            transient_claims: s.transient_claims.load(Ordering::Relaxed),
         }
     }
 
@@ -1959,6 +2081,10 @@ impl NvTier {
             }
         };
         self.stats.misses.fetch_add(claim.misses, Ordering::Relaxed);
+        if pin {
+            self.stats
+                .pinned_claim(kind, claim.pinned.len() as u64, claim.misses);
+        }
         for _ in &claim.evicted {
             self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             self.stats
@@ -2002,7 +2128,13 @@ impl NvTier {
                 publish(arena, &mut books, &picks, kind);
             }
         }
-        count_fill(&self.stats, arena, &picks, t0.elapsed().as_nanos() as u64);
+        count_fill(
+            &self.stats,
+            arena,
+            &picks,
+            t0.elapsed().as_nanos() as u64,
+            pin,
+        );
         Ok(held)
     }
 
@@ -2133,7 +2265,7 @@ fn read_pick(mem: &ArenaMem, r: &PickRead) -> Result<(), GpuError> {
 /// Count a fill of `picks` that ended in `wall_ns`: the slots and bytes read,
 /// the wall, the bytes the arena holds now, and the parts read through the
 /// page cache.
-fn count_fill(stats: &Stats, arena: &LayerArena, picks: &[Pick], wall_ns: u64) {
+fn count_fill(stats: &Stats, arena: &LayerArena, picks: &[Pick], wall_ns: u64, pinned: bool) {
     let mut bytes = 0u64;
     for p in picks {
         for (part, r) in arena.parts[p.id as usize].iter().enumerate() {
@@ -2147,6 +2279,11 @@ fn count_fill(stats: &Stats, arena: &LayerArena, picks: &[Pick], wall_ns: u64) {
         }
     }
     stats.fills.fetch_add(picks.len() as u64, Ordering::Relaxed);
+    if pinned {
+        stats
+            .union_fills
+            .fetch_add(picks.len() as u64, Ordering::Relaxed);
+    }
     stats.fill_bytes.fetch_add(bytes, Ordering::Relaxed);
     stats.fill_ns.fetch_add(wall_ns, Ordering::Relaxed);
     stats.resident_bytes.fetch_add(
@@ -2272,7 +2409,7 @@ impl<'a> Inflight<'a> {
             )?;
         }
         if !self.picks.is_empty() {
-            count_fill(stats, arena, &self.picks, wall);
+            count_fill(stats, arena, &self.picks, wall, true);
         }
         Ok(held)
     }
@@ -2381,6 +2518,18 @@ impl TierSlots for NvTier {
         let r = arena.parts[id as usize][part];
         let (at, len) = window_span(arena.slot_off(slot), &arena.windows, part, r);
         Some(self.mem.slice(at, len))
+    }
+
+    fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], batched: bool) {
+        self.stats.union_call(batched);
+        if let Some(books) = self.stats.unions.get() {
+            let book = UnionBook::of(&self.host_ids(layer), ids, off, batched);
+            let mut books = books.lock().unwrap_or_else(|e| e.into_inner());
+            if books.len() <= layer {
+                books.resize(layer + 1, None);
+            }
+            books[layer] = Some(book);
+        }
     }
 }
 
@@ -2677,9 +2826,15 @@ mod tests {
         }
     }
 
-    /// A transient hit on a hot id refreshes it (it stays hot, and is no
-    /// longer the LRU), and on a transient leaves it where it was, the first
-    /// victim.
+    /// A transient hit never demotes a hot id and leaves it where it was in
+    /// the order of use (it is still the LRU), and leaves a transient where
+    /// it was, the first victim.
+    ///
+    /// PIN(2026-10-11): the hot id's last assertion was "refreshed after 1: 1
+    /// is the LRU now"; derived: a refresh puts an id a call merely named
+    /// above the keep ids claimed before it, so once the transients a batch
+    /// frees fall short the least recently used hot slot, a keep id, goes in
+    /// its place (`a_transient_hit_leaves_a_hot_id_s_tick`).
     #[test]
     fn a_transient_hit_never_demotes_a_hot_id_nor_warms_a_transient() {
         let arena = arena_of(8, 3);
@@ -2690,9 +2845,45 @@ mod tests {
         assert_eq!(c.misses, 0, "both hit");
         ensure_as(&arena, &mut books, &[3], Claim::Step);
         assert_eq!(filled_ids(&arena), [0, 1, 3], "2 is still the first victim");
-        // Expert 0 was refreshed after 1: 1 is the LRU now.
+        // Expert 0 keeps its tick, older than 1's: it is the LRU still.
         ensure_as(&arena, &mut books, &[4], Claim::Step);
-        assert_eq!(filled_ids(&arena), [0, 3, 4], "the hot hit stayed hot");
+        assert_eq!(filled_ids(&arena), [1, 3, 4], "the hot hit stayed the LRU");
+    }
+
+    /// A transient claim's hit on a hot id leaves its tick alone, a step's or
+    /// a keep's hit on it takes a fresh one: the hot id the transient call
+    /// merely named stays older than the keep ids claimed before it, so the
+    /// misses that follow take it, not a keep id.
+    #[test]
+    fn a_transient_hit_leaves_a_hot_id_s_tick() {
+        let tick = |arena: &super::LayerArena, id: u32| {
+            let slot = arena.filled(id).expect("filled");
+            arena.slots[slot]
+                .tick
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let arena = arena_of(8, 3);
+        let mut books = super::Books::default();
+        // 0 is hot first (a spare), then the call's keep claim takes 1, 2.
+        ensure_as(&arena, &mut books, &[0], Claim::Step);
+        ensure_as(&arena, &mut books, &[1, 2], Claim::Keep);
+        let before = tick(&arena, 0);
+        let c = ensure_as(&arena, &mut books, &[0], Claim::Transient);
+        assert_eq!(c.misses, 0, "a hit");
+        assert_eq!(tick(&arena, 0), before, "the transient hit left the tick");
+        assert!(before < tick(&arena, 1), "older than the keep ids");
+        // A miss takes 0, the oldest, never a keep id.
+        ensure_as(&arena, &mut books, &[3], Claim::Transient);
+        assert_eq!(filled_ids(&arena), [1, 2, 3], "0 went, the keep ids stayed");
+        // A step or keep hit still refreshes.
+        let arena = arena_of(8, 3);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1, 2], Claim::Step);
+        for kind in [Claim::Step, Claim::Keep] {
+            let before = tick(&arena, 0);
+            ensure_as(&arena, &mut books, &[0], kind);
+            assert!(tick(&arena, 0) > before, "{kind:?}: a fresh tick");
+        }
     }
 
     /// A transient call's own ids are never its victims, whatever order it
@@ -2710,6 +2901,62 @@ mod tests {
             assert_eq!((c.misses, c.evicted.len()), (1, 1), "{names:?}");
             assert_eq!(filled_ids(&arena), [0, 2, 3], "{names:?}: 1 went, not 0");
         }
+    }
+
+    /// The union's counters: a pinned claim's ids go by kind, its hits to
+    /// `union_hits` whatever the kind, a pinned step claim to neither kind;
+    /// the calls by path.
+    #[test]
+    fn the_union_counters_follow_the_claim_kind() {
+        let s = super::Stats::default();
+        s.pinned_claim(Claim::Keep, 3, 5);
+        s.pinned_claim(Claim::Transient, 1, 2);
+        s.pinned_claim(Claim::Step, 4, 1);
+        s.union_call(true);
+        s.union_call(true);
+        s.union_call(false);
+        let load = |a: &AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(load(&s.keep_claims), 8, "3 hits + 5 misses");
+        assert_eq!(load(&s.transient_claims), 3, "1 hit + 2 misses");
+        assert_eq!(load(&s.union_hits), 8, "3 + 1 + 4: a step claim's too");
+        assert_eq!(load(&s.union_fills), 0, "the fill site counts the fills");
+        assert_eq!((load(&s.union_batched), load(&s.union_small)), (2, 1));
+    }
+
+    /// A union book holds the arena's ids of the call with their columns,
+    /// ascending: the plan's host segment is the mapping's and is left out.
+    #[test]
+    fn a_union_book_leaves_out_the_host_segment() {
+        // Ids 1, 2, 3, 6 listed by 2, 1, 4 and 3 columns; 2..4 is the host's.
+        let book = super::UnionBook::of(&(2..4), &[1, 2, 3, 6], &[0, 2, 3, 7, 10], true);
+        assert_eq!(book.cols, [(1, 2), (6, 3)]);
+        assert!(book.batched);
+    }
+
+    /// A slot's heat: a step or keep claim's is hot, a transient's is not,
+    /// a hit of a keep on a transient turns it hot, and an id with no slot
+    /// has none.
+    #[test]
+    fn a_slots_heat_follows_its_claim() {
+        use super::Heat;
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0], Claim::Step);
+        ensure_as(&arena, &mut books, &[1], Claim::Keep);
+        ensure_as(&arena, &mut books, &[2, 3], Claim::Transient);
+        let heat = |ids: &[u32]| ids.iter().map(|&id| arena.heat(id)).collect::<Vec<_>>();
+        assert_eq!(
+            heat(&[0, 1, 2, 3, 4]),
+            [
+                Some(Heat::Hot),
+                Some(Heat::Hot),
+                Some(Heat::Transient),
+                Some(Heat::Transient),
+                None
+            ]
+        );
+        ensure_as(&arena, &mut books, &[3], Claim::Keep);
+        assert_eq!(heat(&[2, 3]), [Some(Heat::Transient), Some(Heat::Hot)]);
     }
 
     /// A pinned batch is no victim, hot or transient, whatever its age: the

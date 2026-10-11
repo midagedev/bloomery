@@ -9,10 +9,11 @@
 //!   greedy steps — every greedy token equal and the prompt's and each
 //!   step's logits row bit for bit the all-RAM arm's.
 //! - `counters` (clause 2): misses > 0, fills > 0, evictions > 0, the
-//!   arena's resident bytes at or under its budget at every step, and no
+//!   arena's resident bytes at or under its budget at every step, no
 //!   buffered read on the box's direct-capable mount
-//!   ([`NvTierStats::buffered_reads`]); the all-RAM arm attached no tier and
-//!   prints no record.
+//!   ([`NvTierStats::buffered_reads`]), and the prompt's union calls run in
+//!   batches ([`NvTierStats::union_batched`] > 0); the all-RAM arm attached no
+//!   tier and prints no record.
 //! - `audit` (clause 3, `--audit`): just before compute, every NVMe-tier
 //!   pick's slot is `memcmp`d against a fresh buffered read of the same file
 //!   range at the six sampled offsets of `nvtier::audit_offsets`
@@ -159,6 +160,20 @@
 //!   ([`NvTier::ensure_here`]) and a prompt batch's on the reader's, where a
 //!   fill through the pool took the dispatch mutex the chain's host compute
 //!   holds.
+//! - `claim` (clause 11): the prompt union's claim rule, read from the arena's
+//!   books right after the prompt call, before any step. Per paged layer the
+//!   call took the path its ids decide (batched when its arena ids are more
+//!   than `S - 2B` of the layer's `S` slots and the batch `B`), the call's top
+//!   `S - 2B` arena ids by column count (ties to the lower id) are filled and
+//!   hot, and no other id of the call is hot: each is a transient or gone. The
+//!   expected set comes from the call's own columns, which the tier keeps for
+//!   the gate ([`NvTier::record_unions`]). The record's union counters are held
+//!   to the same books: keep claims, transient claims and the calls by path sum
+//!   to the layers' sets, and the fills and hits to the ids claimed, the hits
+//!   at most the fills of other claims (the residency's spare is filled hot at
+//!   the load, and a transient hit leaves its tick, so the keep ids outlive it).
+//!   The arena's misses over the [`STEPS`] steps are printed beside the
+//!   replay's prediction ([`STEP_MISSES_PREDICTED`]), not judged.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -208,7 +223,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, SplitWalk};
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
-use bloomery_gpu::host::nvtier::{DropRuns, NvTier, NvTierStats, advice_disjoint};
+use bloomery_gpu::host::nvtier::{DropRuns, Heat, NvTier, NvTierStats, UnionBook, advice_disjoint};
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
@@ -216,6 +231,7 @@ use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with,
 use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg, RESIDENCY38_SPARES};
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
+use model::moe::UNION_BATCH_IDS;
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{HostNeed, HostRead};
@@ -261,6 +277,12 @@ const EXPERT_PARTS: u64 = 3;
 /// The margin the design asks of a plan's window over the lane's span for a
 /// judged 0 of `late` (printed beside each plan).
 const PLAN_MARGIN: f64 = 1.5;
+/// The arena's misses over the paged arm's [`STEPS`] steps the claim rule
+/// predicts, derived from the rule's trace replay (the replay's ratio of the
+/// rule's misses to the mapping union's, over as many steps after a fresh
+/// prompt): printed beside the reading by `claim`, not judged — the replay
+/// runs a static card where the arm moves it.
+const STEP_MISSES_PREDICTED: u64 = 4_000;
 
 fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
@@ -318,6 +340,147 @@ struct ArmRun {
     /// The cut the load set ([`SplitWalk`]), and the refusal of a split by
     /// the width rule asked of the load right after it (`None`: taken).
     split_walk: (SplitWalk, Option<String>),
+    /// The arena's books right after the prompt call, on a load with a tier.
+    claim: Option<ClaimBooks>,
+}
+
+/// One paged layer's arena as the prompt call left it: the union call the
+/// tier was told of, and per expert id the heat of its slot (`None`: no
+/// filled slot).
+struct ClaimLayer {
+    layer: usize,
+    slots: usize,
+    book: Option<UnionBook>,
+    heat: Vec<Option<Heat>>,
+}
+
+/// The arena's books over every paged layer, and the tier's counters, at one
+/// instant: right after the prompt call, before the first step.
+struct ClaimBooks {
+    layers: Vec<ClaimLayer>,
+    stats: NvTierStats,
+}
+
+impl ClaimBooks {
+    /// Read `tier`'s books over `layers` model layers of `experts` experts.
+    fn of(tier: &NvTier, layers: usize, experts: u32) -> ClaimBooks {
+        let layers = (0..layers)
+            .filter(|&l| tier.covers(l))
+            .map(|l| ClaimLayer {
+                layer: l,
+                slots: tier.layer_slots(l),
+                book: tier.last_union(l),
+                heat: (0..experts).map(|id| tier.slot_heat(l, id)).collect(),
+            })
+            .collect();
+        ClaimBooks {
+            layers,
+            stats: tier.stats(),
+        }
+    }
+}
+
+/// The ids a union call claims as keep: the `keep` of its arena ids with the
+/// most columns, ties to the lower id, ascending — every id when `keep` is
+/// at least the call's ids, the call that claims them whole. The rule of
+/// `UnionBatches::lay_out` (`cols` is the call's arena ids ascending).
+fn keep_set(cols: &[(u32, u32)], keep: usize) -> Vec<u32> {
+    let mut ranked = cols.to_vec();
+    ranked.sort_unstable_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
+    let mut ids: Vec<u32> = ranked.iter().take(keep).map(|&(id, _)| id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// What `claim` found over the paged layers, each count a layer's: the path
+/// the call took, the keep set filled and hot, the rest of the call's ids not
+/// hot, and the totals the counters must sum to.
+#[derive(Default)]
+struct ClaimFound {
+    layers: usize,
+    /// Layers with no union call recorded.
+    unrecorded: Vec<usize>,
+    /// Layers whose call took another path than its ids decide.
+    wrong_path: Vec<usize>,
+    /// Keep ids that are not filled and hot.
+    keep_cold: usize,
+    /// Ids of a call outside its keep set that are hot.
+    rest_hot: usize,
+    /// Keep ids over the layers, the call's ids past them, and the layers by
+    /// path the ids decide.
+    keep: u64,
+    transient: u64,
+    batched: u64,
+    small: u64,
+    /// The layers' arena ids a call named, least and most.
+    ids_least: usize,
+    ids_most: usize,
+    /// Filled slots of the arena's after the prompt, hot and transient, over
+    /// the layers.
+    hot: u64,
+    cold: u64,
+    /// The first layer whose sets are wrong, with up to [`BAD_IDS_SHOWN`] of
+    /// each kind of offending id.
+    first_bad: Option<String>,
+}
+
+/// The offending ids `claim` names for its first wrong layer.
+const BAD_IDS_SHOWN: usize = 5;
+
+/// `claim`'s reading of `books`: the batch `batch` of the union.
+fn claim_found(books: &ClaimBooks, batch: usize) -> ClaimFound {
+    let mut f = ClaimFound {
+        ids_least: usize::MAX,
+        ..ClaimFound::default()
+    };
+    for l in &books.layers {
+        f.layers += 1;
+        f.hot += l.heat.iter().flatten().filter(|&&h| h == Heat::Hot).count() as u64;
+        f.cold += l
+            .heat
+            .iter()
+            .flatten()
+            .filter(|&&h| h == Heat::Transient)
+            .count() as u64;
+        let Some(book) = &l.book else {
+            f.unrecorded.push(l.layer);
+            continue;
+        };
+        let keep_n = l.slots.saturating_sub(2 * batch);
+        let n = book.cols.len();
+        f.ids_least = f.ids_least.min(n);
+        f.ids_most = f.ids_most.max(n);
+        if book.batched != (n > keep_n) {
+            f.wrong_path.push(l.layer);
+        }
+        let kept = keep_set(&book.cols, keep_n);
+        let hot_at = |id: u32| l.heat.get(id as usize).copied().flatten() == Some(Heat::Hot);
+        let cold: Vec<u32> = kept.iter().copied().filter(|&id| !hot_at(id)).collect();
+        let hot: Vec<u32> = book
+            .cols
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|id| kept.binary_search(id).is_err() && hot_at(*id))
+            .collect();
+        if f.first_bad.is_none() && !(cold.is_empty() && hot.is_empty()) {
+            f.first_bad = Some(format!(
+                "layer {}: keep ids not hot {:?}, other ids hot {:?}",
+                l.layer,
+                &cold[..cold.len().min(BAD_IDS_SHOWN)],
+                &hot[..hot.len().min(BAD_IDS_SHOWN)]
+            ));
+        }
+        f.keep_cold += cold.len();
+        f.rest_hot += hot.len();
+        f.keep += kept.len() as u64;
+        f.transient += (n - kept.len()) as u64;
+        if n > keep_n {
+            f.batched += 1;
+        } else {
+            f.small += 1;
+        }
+    }
+    f
 }
 
 /// The counters of a span: the tier's and the lane's at its start and at
@@ -496,6 +659,10 @@ fn arm(
             .ok_or("--audit on a load that built no arena")?
             .audit_on()?;
     }
+    // `claim` reads each layer's union call back from the tier.
+    if let Some(t) = &tier {
+        t.record_unions();
+    }
     // The load's boundaries and their late flips go together, so the ring
     // the residency clause holds to the passes' `late` covers the same
     // passes.
@@ -548,6 +715,7 @@ fn arm(
         step_ns: Vec::with_capacity(STEPS),
         steps: None,
         split_walk,
+        claim: None,
     };
     let note = |s: &mut Session<Body38>, run: &mut ArmRun| -> Result<(), GateError> {
         for (_, r) in take_passes(s)? {
@@ -566,6 +734,11 @@ fn arm(
     let t0 = Instant::now();
     let out = s.prompt(ids, Want::Logits)?;
     let prompt_ns = t0.elapsed().as_nanos() as u64;
+    // The arena as the prompt call left it, before the passes' boundaries
+    // and the steps touch it.
+    run.claim = tier
+        .as_deref()
+        .map(|t| ClaimBooks::of(t, plan.model.layers, plan.model.experts as u32));
     let Out::Logits { argmax, row } = out else {
         return Err("a prompt asked for its logits answered an argmax".into());
     };
@@ -1694,17 +1867,19 @@ fn run() -> Result<(), GateError> {
         && s.evictions > 0
         && paged.resident_max <= tier.budget()
         && s.buffered_reads == 0
+        && s.union_batched > 0
         && ram.tier.is_none()
         && ram.stats.is_none();
     println!(
         "counters: misses {}, fills {}, evictions {}, resident at most {} of {} B, buffered reads \
-         {}, all-RAM arm's tier {}: {}",
+         {}, prompt union calls batched {}, all-RAM arm's tier {}: {}",
         s.misses,
         s.fills,
         s.evictions,
         paged.resident_max,
         tier.budget(),
         s.buffered_reads,
+        s.union_batched,
         if ram.tier.is_none() { "none" } else { "built" },
         verdict(counters)
     );
@@ -1896,6 +2071,84 @@ fn run() -> Result<(), GateError> {
         verdict(exclusive)
     );
     pass &= exclusive;
+
+    // `claim` (clause 11): the prompt union's claim rule, read from the
+    // arena's books right after the prompt call. Per paged layer: the path
+    // the call's ids decide, its top `S - 2B` arena ids by columns filled and
+    // hot, and none of its other ids hot. The record's counters are held to
+    // the same layers' sums, and the steps' misses are printed beside the
+    // replay's prediction.
+    let books = paged
+        .claim
+        .as_ref()
+        .ok_or("the paged arm read no claim books")?;
+    let f = claim_found(books, UNION_BATCH_IDS);
+    let c = &books.stats;
+    let paths_ok = f.unrecorded.is_empty()
+        && f.wrong_path.is_empty()
+        && c.union_batched == f.batched
+        && c.union_small == f.small;
+    let sets_ok = f.keep_cold == 0 && f.rest_hot == 0;
+    let sums_ok = c.keep_claims == f.keep
+        && c.transient_claims == f.transient
+        && c.union_fills + c.union_hits == f.keep + f.transient
+        && c.union_hits <= c.fills.saturating_sub(c.union_fills);
+    let claim = f.layers > 0 && paths_ok && sets_ok && sums_ok;
+    // What other claims did to the arena before the read (the residency's
+    // spare filled at the load, the lane's victim fills, a landing's free): a
+    // red that names them is not the rule's.
+    let lane_fills = c.fills.saturating_sub(c.union_fills);
+    let slots = books.layers.first().map_or(0, |l| l.slots);
+    println!(
+        "claim: {} paged layers, each one union call of {}..{} arena ids over its {slots} slots \
+         (keep {} = S - 2B, B {UNION_BATCH_IDS}): batched {} and small {} against the record's \
+         {} and {} ({} layers recorded no call, {} took another path than its ids decide: {})",
+        f.layers,
+        f.ids_least,
+        f.ids_most,
+        slots.saturating_sub(2 * UNION_BATCH_IDS),
+        f.batched,
+        f.small,
+        c.union_batched,
+        c.union_small,
+        f.unrecorded.len(),
+        f.wrong_path.len(),
+        verdict(paths_ok),
+    );
+    println!(
+        "claim: keep claims {} and transient claims {} against the layers' {} and {}, fills {} + \
+         hits {} against the {} ids claimed, the hits at most the {lane_fills} fills of other \
+         claims: {}",
+        c.keep_claims,
+        c.transient_claims,
+        f.keep,
+        f.transient,
+        c.union_fills,
+        c.union_hits,
+        f.keep + f.transient,
+        verdict(sums_ok),
+    );
+    println!(
+        "claim: the calls' top-by-columns keep ids not filled and hot {}, their other ids hot {} \
+         (want 0 and 0; the first wrong layer: {}); after the prompt the arena holds {} hot and {} \
+         transient slots, with {lane_fills} fills of other claims and {} releases before the \
+         read: {}",
+        f.keep_cold,
+        f.rest_hot,
+        f.first_bad.as_deref().unwrap_or("none"),
+        f.hot,
+        f.cold,
+        c.releases,
+        verdict(sets_ok),
+    );
+    println!("claim: {}", verdict(claim));
+    println!(
+        "claim: the arena's misses over the {STEPS} steps {} against the claim rule's prediction \
+         about {STEP_MISSES_PREDICTED} (derived from the rule's replay, a weak anchor: printed, \
+         not judged)",
+        steps.tier(|t| t.misses)
+    );
+    pass &= claim;
 
     // `stepunion` (clause 8): the step port's union of two columns on a
     // paged plan — a load of its own made for two slots (the two arms' plan
