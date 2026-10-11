@@ -182,8 +182,17 @@
 //!   the card's experts through the wide GEMMs over a per-layer map and the
 //!   host's once a unit, against the pass run, within the same bands; (o3)
 //!   a ubatch resize and a pass of two resident slots refused by name, the
-//!   ubatch kept; (o4) the host tier served slots on both of its ports.
-//!   `--placed-only` runs (o) alone.
+//!   ubatch kept; (o4) the host tier served slots on both of its ports;
+//!   (o7) the file planned on device 0 under no budget, a plan that keeps
+//!   every routed expert on the card (a refusal by name where the card holds
+//!   no such plan), loaded by the placed opener (`q3place::open_qwen35`): the
+//!   body is the placed one with no host expert, its five graph steps leave
+//!   the same greedy tokens as the whole-card load's, and (c) holds on it, the
+//!   same [`FREE_BAND`]. FAIL-first: an opener that takes a plan with no host
+//!   expert for the whole load (mutant: `open_qwen35` opening
+//!   `GpuModel::<Body35>::open` when `plan.host.experts == 0`) leaves no
+//!   placed side, and (o7) names it.
+//!   `--placed-only` runs (o) and (o7) alone.
 //!
 //! (m) the memory guard, `--memguard-only` (no model loaded): the census
 //!   free reading, the quiet-card whole decision, the held-card refusal by
@@ -3049,6 +3058,59 @@ mod gate {
         Ok(ok && ok_scratch)
     }
 
+    /// (o7) (module doc): the whole-card load's five greedy tokens first, its
+    /// model dropped before the placed one opens (two whole-sized models
+    /// never share a card), then the placed load by a plan with no host
+    /// expert.
+    fn placed_no_host(man: &RefManifest, toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
+        let whole = {
+            let mut m = open(CTX, KvQ8::F16)?;
+            decode_run(&mut m, toks, false)?.tokens
+        };
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let o = Open35 {
+            ctx: CTX,
+            mma: true,
+            ubatch: U_GATE,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
+        let plan = q.plan(CTX, &PlanLevers::default())?;
+        q.record(&plan, None).print();
+        let on_card = plan.host.experts == 0 && plan.cards[0].experts > 0;
+        println!(
+            "placed plan with no budget: card_experts={} host_experts={} (every expert on the \
+             card) {}",
+            plan.cards[0].experts,
+            plan.host.experts,
+            verdict(on_card)
+        );
+        if !on_card {
+            return Ok(false);
+        }
+        let mut m = q3place::open_qwen35(file, &plan, o, host)?;
+        let placed = m.body("gate_qwen35moe_e2e")?.placed().is_some();
+        println!(
+            "placed no-host load has a placed side {placed} {}",
+            verdict(placed)
+        );
+        if !placed {
+            return Ok(false);
+        }
+        m.set_mode(StepMode::Graph);
+        println!("placed no-host capture graph_nodes={}", m.capture_step()?);
+        let decode = decode_run(&mut m, toks, false)?;
+        let same = decode.tokens == whole;
+        println!(
+            "placed no-host tokens {:?} vs whole-card {whole:?} {}",
+            decode.tokens,
+            verdict(same)
+        );
+        let banded = free(&mut m, man, toks, &decode)?;
+        Ok(same && banded)
+    }
+
     /// The batch set's manifest and its five tokens.
     fn batch_set() -> Result<(RefManifest, Vec<u32>), GateError> {
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
@@ -3171,7 +3233,8 @@ mod gate {
         let host = bloomery_levers::at_main(&[])?.host();
         if std::env::args().any(|a| a == "--placed-only") {
             let (man, toks) = batch_set()?;
-            let ok = placed(&man, &toks, host)?;
+            let mut ok = placed(&man, &toks, host)?;
+            ok &= placed_no_host(&man, &toks, host)?;
             println!("gate_qwen35moe_e2e --placed-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -3222,6 +3285,7 @@ mod gate {
         ok &= checkpoints()?;
         ok &= slots_two(&slots)?;
         ok &= placed(&man, &toks, host)?;
+        ok &= placed_no_host(&man, &toks, host)?;
         ok &= q8_cache()?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {

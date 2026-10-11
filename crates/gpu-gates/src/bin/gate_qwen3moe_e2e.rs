@@ -133,7 +133,14 @@
 //!   batch port) — and the host tier served slots on both of its ports. The
 //!   bands are the card's: a host expert runs ik's own 8-bit rule (Q8_K
 //!   activations) where the card runs q8_1, so no layer's error grows.
-//!   `--placed-only` runs (o) alone.
+//!   (o7) the file planned under no budget, a plan that keeps every routed
+//!   expert on the card (a refusal by name where the card holds no such plan),
+//!   loaded by the placed opener (`q3place::open_qwen3`): the body is the
+//!   placed one with no host expert, and (c) and (g) hold on it, the same
+//!   bands. FAIL-first: an opener that takes a plan with no host expert for
+//!   the whole load (mutant: `open_qwen3` opening `GpuModel::<Body>::open`
+//!   when `plan.host.experts == 0`) leaves no placed side, and (o7) names it.
+//!   `--placed-only` runs (o) and (o7) alone.
 //!
 //! - (y) the Q5_K routed path, on its own loads of [`Y_FILE`] (unsloth's
 //!   Qwen3-Coder `Q5_K_M`, which has no ik reference set, so each clause is
@@ -519,7 +526,8 @@ mod gate {
             None => None,
         };
         if args.iter().any(|a| a == "--placed-only") {
-            let ok = placed(host)?;
+            let mut ok = placed(host)?;
+            ok &= placed_no_host(host)?;
             println!("gate_qwen3moe_e2e --placed-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -635,6 +643,7 @@ mod gate {
         drop(m);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
+        ok &= placed_no_host(host)?;
         ok &= q5_routed(host)?;
         ok &= q8_cache()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
@@ -1425,6 +1434,42 @@ mod gate {
         Ok(Some(GpuModel::<Body>::open_placed(
             file, &plan, opts, host,
         )?))
+    }
+
+    /// (o7) (module doc): the model is dropped before the clause returns.
+    fn placed_no_host(host: HostCfg) -> Result<bool, GateError> {
+        let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+        let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX, KvQ8::F16)?;
+        let plan = q.plan(CTX, &PlanLevers::default())?;
+        q.record(&plan, None).print();
+        let on_card = plan.host.experts == 0 && plan.cards[0].experts > 0;
+        println!(
+            "placed plan with no budget: card_experts={} host_experts={} (every expert on the \
+             card) {}",
+            plan.cards[0].experts,
+            plan.host.experts,
+            verdict(on_card)
+        );
+        if !on_card {
+            return Ok(false);
+        }
+        let opts = Qwen3moeModel::lever_opts(CTX, KvQ8::F16)?;
+        let mut m = q3place::open_qwen3(file, &plan, opts, host)?;
+        let placed = m.body("gate_qwen3moe_e2e")?.placed().is_some();
+        println!(
+            "placed no-host load has a placed side {placed} {}",
+            verdict(placed)
+        );
+        if !placed {
+            return Ok(false);
+        }
+        m.set_mode(StepMode::Graph);
+        println!("placed no-host capture graph_nodes={}", m.capture_step()?);
+        let o = oracle::for_arch(Arch::Qwen3moe)?;
+        let man = o.open(Set::Cpu)?;
+        let mut ok = free(&mut m, &man)?;
+        ok &= greedy(&mut m, None, false)?;
+        Ok(ok)
     }
 
     /// (o) (module doc): the model is dropped before the clause returns.
