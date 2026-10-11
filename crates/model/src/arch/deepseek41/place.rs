@@ -21,7 +21,7 @@ use super::hparams::Hparams;
 use super::kv::KvLayout;
 use super::{roles, spec};
 use crate::arch::coverage;
-use crate::placement::workstation::{self, TierBatchBytes};
+use crate::placement::workstation::{self, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
     checked, joined,
@@ -38,6 +38,18 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's cache and compressor bytes.
     pub kv: KvLayout,
+    /// The host's available bytes when the inputs were read, with the
+    /// reading that decided ([`workstation::host_available_read`]): the
+    /// routed experts the room cannot hold follow it to the NVMe tier
+    /// ([`placement::expert_nvme_tier`]). The engram row tables are on the
+    /// NVMe tier by their role at any room, so no row-table tier runs here. A
+    /// gate that plans an arm by a room of its own sets it, read
+    /// [`HostRead::Given`].
+    pub room: (u64, HostRead),
+    /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
+    /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
+    /// as its `given`. A gate that plans an arm by an arena of its own sets it.
+    pub arena: Option<u64>,
 }
 
 /// The expert tier's prompt-batch bytes plan (b′) reserves for a file of
@@ -82,17 +94,23 @@ impl PlanInputs {
     }
 
     /// [`PlanInputs::read`] without the refusal of unimplemented features: the
-    /// file as it is, for a reader that only describes it.
+    /// file as it is, for a reader that only describes it, and the host's
+    /// room ([`workstation::host_available_read`]) and the arena's given
+    /// bytes, a room that cannot be read refused by name.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let spec = spec::spec_of(&hp, &model, spec::chat(split)?)?;
         let kv = KvLayout::from_file(split, &hp)?;
+        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
+        let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
             model,
             spec,
             kv,
+            room,
+            arena,
         })
     }
 
@@ -130,7 +148,8 @@ impl PlanInputs {
         slots: NonZeroUsize,
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
-        let plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
+        let mut plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
+        placement::expert_nvme_tier(&mut plan, self.room.0, self.arena)?;
         checked(plan).map_err(PlaceError::Broken)
     }
 

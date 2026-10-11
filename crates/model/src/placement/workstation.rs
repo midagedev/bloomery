@@ -39,6 +39,17 @@ pub fn host_available_read() -> Result<(u64, HostRead), String> {
     host_room(&meminfo, &texts)
 }
 
+/// The arena's bytes `BLOOMERY_NVTIER_BYTES` gives the NVMe expert tier
+/// ([`bloomery_placement::placement::expert_nvme_tier`]'s `given`), `None`
+/// unset: read once with the room by a family's `describe`, so a gate that
+/// plans an arm sets the field of its own. A value that is not bytes is
+/// refused by name.
+pub fn nvtier_arena_given() -> Result<Option<u64>, String> {
+    bloomery_levers::nvtier_levers()
+        .map(|levers| levers.bytes)
+        .map_err(|e| format!("BLOOMERY_NVTIER_BYTES: {e}"))
+}
+
 /// One cgroup v2 level's file, read under `/sys/fs/cgroup`.
 fn cgroup_read(path: &str, file: &str) -> std::io::Result<String> {
     std::fs::read_to_string(format!("/sys/fs/cgroup{path}/{file}"))

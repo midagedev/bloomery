@@ -1699,29 +1699,41 @@ fn q8act_bytes(a: &Q8Act) -> usize {
         + 4 * m * 2 * n_sb
 }
 
+/// The first layer of the V4.1 host tier over the card's `layers`: the tier's
+/// first routed layer (the dense lead's FFNs run on the card alone).
+#[must_use]
+pub fn host_first(hp: &Hparams, layers: &Range<usize>) -> usize {
+    layers.start.max(hp.experts.dense_lead)
+}
+
+/// The routed experts' widths the host tier computes at ([`HostWidths`]).
+#[must_use]
+pub fn host_widths(hp: &Hparams) -> HostWidths {
+    HostWidths {
+        embd: hp.n_embd,
+        ff: hp.experts.ff,
+        n_used: hp.experts.n_used,
+    }
+}
+
 /// The V4.1 host tier's computation over the layers `layers` of `file`, the
-/// common [`HostRun`]: its run starts at the tier's first routed layer (the
-/// dense lead's FFNs run on the card alone) and its views are
-/// [`host::layers`]'. Load-time only. A body passes its own mapping, so the
-/// pages its load populated are the ones the step reads; the routed gates and
-/// ups come from `file`'s r8 sidecar when `r8` asks for it and there is one
-/// (the load's `HostCfg::r8`).
+/// common [`HostRun`], with no NVMe tier: its run starts at the tier's first
+/// routed layer ([`host_first`]) and its views are [`host::layers`]'. Load-time
+/// only. A body passes its own mapping, so the pages its load populated are
+/// the ones the step reads; the routed gates and ups come from `file`'s r8
+/// sidecar when `r8` asks for it and there is one (the load's
+/// `HostCfg::r8`). A load by a plan builds the run through the common
+/// `bloomery_gpu::model::host_run` over [`host_first`], [`host_widths`] and
+/// [`host::layers`], which attaches the plan's NVMe tier; this plan-less run
+/// is the gates' over one file.
 pub fn host_run(
     file: Arc<Split>,
     hp: &Hparams,
     layers: Range<usize>,
     r8: bool,
 ) -> Result<HostRun, GpuError> {
-    let first = layers.start.max(hp.experts.dense_lead);
-    HostRun::build(
-        file,
-        first,
-        r8,
-        HostWidths {
-            embd: hp.n_embd,
-            ff: hp.experts.ff,
-            n_used: hp.experts.n_used,
-        },
-        |src| host::layers(src, hp, first..layers.end),
-    )
+    let first = host_first(hp, &layers);
+    HostRun::build(file, first, r8, host_widths(hp), |src| {
+        host::layers(src, hp, first..layers.end)
+    })
 }
