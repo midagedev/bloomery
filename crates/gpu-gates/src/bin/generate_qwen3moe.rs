@@ -382,7 +382,8 @@ mod cli {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
-    use bloomery_gpu_gates::generate::{Place, card_words};
+
+    use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
@@ -409,6 +410,11 @@ mod cli {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use tokenizer::Tokenizer;
+
+    /// The lane's rate a load probed before it planned, and the card it ran
+    /// on: the `lane` line beside the load line (`None`: a load that probes
+    /// nothing).
+    type Lane = Option<bloomery_gpu_gates::generate::Lane>;
 
     // A Qwen3.6 prompt is cut by the qwen3moe pass plan (`PrefillPlan`),
     // whose passes are `MAX_TOKENS` long; each must be a pass `step_rows`
@@ -934,7 +940,7 @@ mod cli {
         (file, levers, experts): (&Split, &Levers, Experts),
         (ctx, logits, slots): (usize, bool, usize),
         arms: &[Arm],
-    ) -> Result<Place, GateError> {
+    ) -> Result<(Place, Lane), GateError> {
         let flag = match arg {
             None => None,
             Some(word) => {
@@ -973,7 +979,9 @@ mod cli {
             )
         })?;
         chosen.record().print();
-        Ok(chosen.place)
+        // The lane's rate, taken before the plan reads the room (`lane_of`).
+        let lane = Some(lane_at(chosen.place)?);
+        Ok((chosen.place, lane))
     }
 
     /// The placement holds an expert tier card: plan (b′).
@@ -1401,22 +1409,22 @@ mod cli {
                 );
             }
         }
-        let (chosen, draft_off) = match family {
+        let (chosen, draft_off, lane) = match family {
             Family::Qwen3 => {
                 draft_refused_on_other(&levers, family)?;
-                let place = place_q3(place.as_deref(), prefill)?;
-                (Chosen::Qwen3(Body::path(prefill)?, place), None)
+                let (place, lane) = place_q3(place.as_deref(), prefill)?;
+                (Chosen::Qwen3(Body::path(prefill)?, place), None, lane)
             }
             Family::Qwen35 => {
                 draft_refused_on_other(&levers, family)?;
-                let place = place_q3(place.as_deref(), prefill)?;
-                (Chosen::Qwen35(Body35::path(prefill)?, place), None)
+                let (place, lane) = place_q3(place.as_deref(), prefill)?;
+                (Chosen::Qwen35(Body35::path(prefill)?, place), None, lane)
             }
             Family::Qwen38 => {
                 if let Some(d) = seed_depth {
                     return Err(no_seed38(d));
                 }
-                let place = place38(
+                let (place, lane) = place38(
                     place.as_deref(),
                     (&file, &levers, experts),
                     (ctx, logits, slots),
@@ -1443,6 +1451,7 @@ mod cli {
                 (
                     Chosen::Qwen38(Body38::path(prefill)?, place, draft, room),
                     off,
+                    lane,
                 )
             }
         };
@@ -1607,6 +1616,7 @@ mod cli {
                     place.map(|p| (p, &levers)),
                     &levers,
                     kv,
+                    lane,
                     t,
                 )?;
                 if slots > 1 {
@@ -1622,6 +1632,7 @@ mod cli {
                     place.map(|p| (p, &levers)),
                     &levers,
                     kv,
+                    lane,
                     t,
                 )?;
                 if slots > 1 {
@@ -1645,6 +1656,7 @@ mod cli {
                         (ctx, mode, slots),
                         (path, place, experts, room),
                         (lever38, draft_off.as_ref()),
+                        lane,
                         t,
                     )?;
                     log38(&mut m, residency, &arms, run.slots)?;
@@ -1672,6 +1684,7 @@ mod cli {
                         (ctx, mode),
                         (path, place, experts, room),
                         lever38,
+                        lane,
                         t,
                     )?;
                     log38(&mut m, residency, &arms, run.slots)?;
@@ -1821,7 +1834,16 @@ mod cli {
             )
             .into());
         }
-        let mut m = open_qwen3(file, (ctx, StepMode::Eager), None, levers, KvQ8::F16, t)?;
+        let mut m = open_qwen3(
+            file,
+            (ctx, StepMode::Eager),
+            None,
+            levers,
+            KvQ8::F16,
+            // A diagnostic dump that resolved no placement: no lane line.
+            None,
+            t,
+        )?;
         let hidden = m.body("generate_qwen3moe")?.hparams().n_embd;
         let out = Path::new(dir);
         let mut dump = taps::Dump::create(out, &ref_model_path()?, hidden)?;
@@ -1892,7 +1914,10 @@ mod cli {
     /// common unset rule (`Place::choose_untiered`) prints its
     /// `place unset` record, set or unset; the flag goes on as given, so an
     /// unset one loads the census pick (`q3place::open_unplaced_qwen3`).
-    fn place_q3(arg: Option<&str>, prefill: Option<&str>) -> Result<Option<Place>, GateError> {
+    fn place_q3(
+        arg: Option<&str>,
+        prefill: Option<&str>,
+    ) -> Result<(Option<Place>, Lane), GateError> {
         let flag = match arg {
             None => None,
             Some(word) => {
@@ -1906,10 +1931,11 @@ mod cli {
                 Some(Place::parse(word)?)
             }
         };
-        q3place::choose(flag, &gpu_census::census()?)?
-            .record()
-            .print();
-        Ok(flag)
+        let chosen = q3place::choose(flag, &gpu_census::census()?)?;
+        chosen.record().print();
+        // The lane's rate, taken before the plan reads the room (`lane_of`).
+        let lane = Some(lane_at(chosen.place)?);
+        Ok((flag, lane))
     }
 
     /// The Qwen3-30B-A3B model of `file` — under `place` by its plan
@@ -1925,6 +1951,7 @@ mod cli {
         place: Option<(Place, &Levers)>,
         levers: &Levers,
         kv: KvQ8,
+        lane: Lane,
         t: Instant,
     ) -> Result<Qwen3moeModel, GateError> {
         let opts = Qwen3moeModel::lever_opts(ctx, kv)?;
@@ -1939,6 +1966,9 @@ mod cli {
         };
         let placed = m.body("generate_qwen3moe")?.placed().is_some();
         m.set_mode(mode);
+        if let Some((card, rate)) = &lane {
+            record::lane(card, rate).print();
+        }
         println!(
             "load arch=qwen3moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
              flash_mma={} ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s \
@@ -1997,6 +2027,7 @@ mod cli {
         place: Option<(Place, &Levers)>,
         levers: &Levers,
         kv: KvQ8,
+        lane: Lane,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
         let o = Open35 {
@@ -2018,6 +2049,9 @@ mod cli {
         let placed = m.body("generate_qwen3moe")?.placed().is_some();
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
+        if let Some((card, rate)) = &lane {
+            record::lane(card, rate).print();
+        }
         println!(
             "load arch=qwen35moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
              flash_mma={} store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s \
@@ -2142,6 +2176,7 @@ mod cli {
         (ctx, mode, slots): (usize, StepMode, usize),
         (path, place, experts, room): (Prompt38, Place, Experts, (u64, HostRead)),
         (lever, draft_off): (Lever38<'static>, Option<&Draft38Off>),
+        lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
@@ -2180,6 +2215,9 @@ mod cli {
         )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
+        if let Some((card, rate)) = &lane {
+            record::lane(card, rate).print();
+        }
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} ctx_max={cap} ctx_train={} \
              verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
@@ -2219,6 +2257,7 @@ mod cli {
         (ctx, mode): (usize, StepMode),
         (path, place, experts, room): (Prompt38, Place, Experts, (u64, HostRead)),
         lever: Lever38<'static>,
+        lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
@@ -2278,6 +2317,9 @@ mod cli {
         )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
+        if let Some((card, rate)) = &lane {
+            record::lane(card, rate).print();
+        }
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} ctx_max={cap} ctx_train={} \
              verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \

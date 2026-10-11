@@ -52,6 +52,7 @@ pub mod iq;
 pub mod iq_sel;
 pub mod kpool;
 pub mod kquant;
+pub mod lane;
 pub mod latent;
 pub mod linear;
 pub mod media;

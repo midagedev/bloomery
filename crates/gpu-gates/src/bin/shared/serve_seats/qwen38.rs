@@ -325,7 +325,7 @@ use bloomery_gpu_gates::bind::{
     SlotStep, Vocab, begin, bind_server, model_props, note_line, parallel_line, placement_of,
     put_back,
 };
-use bloomery_gpu_gates::generate::{BreakEven, Place};
+use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
@@ -1282,6 +1282,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // (b′)'s tier card is held once chosen, below.
     let stage = draft_at.cards.on(&census)?.card_specs()?[0];
     Gpu::hold_card(stage.name, stage.device)?;
+    // The lane's rate, taken before the plan reads the room (`lane_of`).
+    let lane = lane_of(stage)?;
     let mut inputs = PlanInputs::describe(&split)?;
     // The slot count first: it shapes the draft's window condition, the
     // context search itself, and every plan the seat asks for, each counting
@@ -1777,6 +1779,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let open = SeatArgs {
         place: a.place,
+        lane,
         ctx,
         slots,
         pass,
@@ -1903,6 +1906,9 @@ impl PlanKey {
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place38,
+    /// The lane's rate probed before the plans, and the card it ran on:
+    /// the `lane` line beside the `load` line.
+    lane: Lane,
     /// A slot's context: the stores' rows one sequence serves.
     ctx: usize,
     /// The resident sequences the plan counted and the load makes
@@ -2099,6 +2105,7 @@ impl Q38 {
             }
         };
         m.set_mode(StepMode::Graph);
+        record::lane(a.lane.0, &a.lane.1).eprint();
         eprintln!(
             "load arch=qwen4exp resident_bytes={} ctx={} slots={} slot_ctx={} ctx_max={cap} \
              ctx_train={} verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} \

@@ -1193,6 +1193,23 @@ pub static LOAD_DRAFT_OFF38: Kind = Kind {
     parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
 };
 
+/// The host→card lane's rate a load probed before it planned
+/// ([`bloomery_gpu::lane`]).
+pub static LANE: Kind = Kind {
+    name: "lane",
+    head: "lane",
+    doc: "The host→card lane's rate, printed just before the `load` line of the card the load \
+          stages on: the bytes each copy streamed, the copies' median and least rate, and whether \
+          the probe's host extent was page-locked — a pageable copy measures a different lane.",
+    parts: &[
+        key("card", Word, ""),
+        key("bytes", U64, "B"),
+        key("gbs_median", F64(2), "GB/s"),
+        key("gbs_min", F64(2), "GB/s"),
+        key("pinned", Bool, ""),
+    ],
+};
+
 /// A drafted qwen4exp load's MTP head
 /// (`model::arch::qwen35moe::head_list::head_rows_of`).
 pub static MTP_HEAD38: Kind = Kind {
@@ -2948,6 +2965,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &CALL_LAYER,
     &CALL_NEED,
     &CALL_LB,
+    &LANE,
     &LOAD,
     &LOAD_PHASES,
     &HOST_POPULATE,
@@ -3000,6 +3018,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
     &PLACE_UNSET,
     &PROMPT_IDS,
     &PLAN,
+    &LANE,
     &LOAD_GENERATOR,
     &LOAD_PHASES,
     &HOST_POPULATE,
@@ -3017,6 +3036,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &PLACE_UNSET,
     &PLAN,
     &CACHE_CONFIG,
+    &LANE,
     &LOAD_GENERATOR,
     &LOAD_PHASES,
     &HOST_POPULATE,
@@ -3051,6 +3071,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &LISTENING38,
     &CACHE_REUSE,
     &MTP_PROMPT,
+    &LANE,
     &LOAD_DRAFT_OFF38,
     &MTP_HEAD38,
     &MTP_KEEP38,
@@ -3105,6 +3126,7 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
     &HF_FILE,
     &HF_PROGRESS,
     &HF_DONE,
+    &LANE,
     &LOAD_MIMO2,
     &LISTENING_MIMO2,
     &CACHE_REUSE,
@@ -3125,6 +3147,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &PLAN,
     &RESIDENCY_UNSET_GLM,
     &RESIDENCY_HOST,
+    &LANE,
     &LOAD_GENERATOR,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
@@ -3150,6 +3173,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_HOST,
+    &LANE,
     &LOAD_GENERATOR,
     &LOAD_PHASES,
     &HOST_POPULATE,
@@ -3199,6 +3223,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
+    &LANE,
     &LOAD_DRAFT_OFF38,
     &MTP_HEAD38,
     &TAPS_SEQ,
@@ -3362,6 +3387,18 @@ pub fn load_phases(
         .f("body_s", body)
         .f("head_s", head)
         .f("other_s", other)
+}
+
+/// The `lane` record of the rate a load probed on the card it stages on
+/// ([`bloomery_gpu::lane`]), printed just before that load's `load` line.
+#[cfg(feature = "gpu")]
+pub fn lane(card: &str, rate: &bloomery_gpu::lane::LaneRate) -> Record {
+    Record::new(&LANE)
+        .w("card", card)
+        .u("bytes", rate.bytes)
+        .f("gbs_median", rate.gbs_median)
+        .f("gbs_min", rate.gbs_min)
+        .w("pinned", rate.pinned)
 }
 
 /// The `nvtier` record of a load's arena: its budget, the paged bytes it

@@ -188,7 +188,10 @@ gguf 9 2 0
 # entries call (six blocks); the copies q4k_gemv_sel_prefetch, q6k_gemv_sel_prefetch, qwen3moe_qkv_q4k_prefetch and
 # qwen3moe_head_q6k_argmax_prefetch carry their originals' 2 + 6 + 1 + 10 blocks; the gate-up and four router-norm
 # twins carry their originals' 1 + 4 x 2. Each with its SAFETY line.
-gpu 1717 191 10
+# PIN(2026-10-11): then 1717 -> 1718 blocks, new code, not old code relaxed: lane.rs's lane_rate enqueues its
+# pinned-host-to-card copy through cuMemcpyHtoDAsync_v2 itself (one block, its SAFETY line) — the crate's own
+# wrappers are the 2-D htod_2d and per-store methods, neither a plain 1-D extent copy.
+gpu 1718 191 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

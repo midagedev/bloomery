@@ -347,9 +347,9 @@ mod drive {
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_deepseek41::swap;
     use bloomery_gpu_gates::generate::{
-        Diag, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
-        dump_table, mode_name, place_table, read_table, repeat_runs, seed_path, slot_table,
-        write_table,
+        Diag, Lane, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
+        dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
+        slot_table, write_table,
     };
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
@@ -844,6 +844,12 @@ mod drive {
             &Hparams::read(&file).map_err(|e| format!("{}: {e}", path.display()))?,
         );
         let headers = t.elapsed();
+        // The lane's rate, taken before the plan reads the room (`lane_of`).
+        let lane = if a.plan {
+            None
+        } else {
+            Some(lane_at(a.place)?)
+        };
         let machine = a.place.machine(reserve, tier_batch)?;
         // The unset word against the plan the load will use, and the lever
         // record naming what it resolved to, before the plan record the open
@@ -889,6 +895,7 @@ mod drive {
             plan: None,
             pin_main,
             pinned,
+            lane,
             residency,
             plan_n_l,
             hp: None,
@@ -1792,6 +1799,9 @@ mod drive {
         plan: Option<Duration>,
         pin_main: bool,
         pinned: bool,
+        /// The lane's rate probed before the plan, and the card it ran on:
+        /// the `lane` line beside the `load` line.
+        lane: Option<Lane>,
         /// `BLOOMERY_RESIDENCY` as resolved against the pre-plan, for the
         /// `residency host` record.
         residency: ResidencyPick,
@@ -1901,6 +1911,9 @@ mod drive {
             let load = place::with_cards(m, a.place, "generate_ds41", load)
                 .map_err(|e| SessionError::Refused(e.to_string()))?;
             let total = self.t.elapsed();
+            if let Some((card, rate)) = &self.lane {
+                record::lane(card, rate).print();
+            }
             load.u("ctx", a.ctx)
                 .u("layers", hp.n_layer)
                 .u("top_k", top_k)

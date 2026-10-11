@@ -117,7 +117,7 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, Vocab, bind_server, model_props, note_line,
     parallel_line, placement_of, slots_given,
 };
-use bloomery_gpu_gates::generate::{CTX_GRAN, Place, trained_ctx};
+use bloomery_gpu_gates::generate::{CTX_GRAN, Lane, Place, lane_at, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
@@ -317,6 +317,9 @@ struct Mimo {
 /// What the engine thread opens the seat with.
 struct OpenSeat {
     place: Place,
+    /// The lane's rate probed before the plan, and the card it ran on: the
+    /// `lane` line beside the `load` record. `None` under `--plan-only`.
+    lane: Option<Lane>,
     /// A slot's positions: the model loads one slot's stores at it.
     ctx: usize,
     /// The resident slots the plan counts: the model parks `slots − 1` more
@@ -344,6 +347,9 @@ struct Log {
     /// `BLOOMERY_PIN_MAIN`'s ask and whether the pin took.
     pin_main: bool,
     pinned: bool,
+    /// The lane's rate probed before the plan, and the card it ran on: the
+    /// `lane` line beside the `load` record.
+    lane: Option<Lane>,
 }
 
 impl OpenLog<Body> for Log {
@@ -376,6 +382,9 @@ impl OpenLog<Body> for Log {
 impl Log {
     /// The `load` record of `m` with every slot parked.
     fn record(&self, m: &Mimo2Model) {
+        if let Some((card, rate)) = &self.lane {
+            record::lane(card, rate).eprint();
+        }
         Record::new(&record::LOAD_MIMO2)
             .w("arch", "mimo2")
             .u("resident_bytes", m.resident_bytes())
@@ -410,6 +419,7 @@ impl Mimo {
             host_experts: 0,
             card_experts: 0,
             graph_nodes: 0,
+            lane: a.lane,
         };
         let args = OpenArgs {
             place: a.place.name(),
@@ -547,6 +557,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "mimo2")?;
     chosen.record().eprint();
     let place = chosen.place;
+    // The lane's rate, taken before the plan reads the room (`lane_of`).
+    let lane = if a.plan_only {
+        None
+    } else {
+        Some(lane_at(place)?)
+    };
     // `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving
     // placement, which the plan below keeps, moves or turns off. The steps
     // feed ends a decode pass per prompt id, which the machine's rule counts.
@@ -617,6 +633,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let open = OpenSeat {
         place,
+        lane,
         ctx: slot_ctx,
         slots: n,
         path: path.clone(),

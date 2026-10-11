@@ -202,7 +202,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server,
     model_props, nvidia_smi_index, parallel_line, placement_of,
 };
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
+use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
 use bloomery_gpu_gates::vision_seat;
@@ -479,6 +479,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
+    // The lane's rate, taken before the plan reads the room (`lane_of`).
+    let lane = lane_at(placed.place)?;
     let at = ResidencyAt {
         serving_place: a.place != Place::Gate,
         check_finite: false,
@@ -589,6 +591,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let open = SeatArgs {
         place: a.place,
+        lane,
         ctx,
         slots,
         pass,
@@ -779,6 +782,9 @@ const WHAT: &str = "bloomery-serve-ds41";
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place,
+    /// The lane's rate probed before the plan, and the card it ran on: the
+    /// `lane` line beside the `load` line.
+    lane: Lane,
     /// A slot's context: the positions each resident sequence serves.
     ctx: usize,
     /// The resident sequences the plan counts and the load makes.
@@ -1603,6 +1609,7 @@ impl OpenLog<Body> for Log<'_> {
             .w("shadow", "host")
             .u("shadow_bytes", shadow.bytes)
             .u("unified_addressing", shadow.unified_addressing);
+        record::lane(a.lane.0, &a.lane.1).eprint();
         place::with_cards(m, a.place, WHAT, load)
             .map_err(|e| SessionError::Refused(e.to_string()))?
             .w("prefill", b.prefill_mode().name())
