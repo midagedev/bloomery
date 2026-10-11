@@ -403,6 +403,7 @@ blk_pytools() {
     "tools/ref/ds41copy.py --self-test"
     "tools/ref/ds41pp.py self-test"
     "tools/ref/gguf-ranges.py --self-test"
+    "tools/ref/gguf-respell.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
     "tools/ref/lev_ref.py --self-test"
     "tools/ref/nsys-bridge.py --self-test"
