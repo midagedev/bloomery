@@ -215,18 +215,7 @@ impl Family {
         ) {
             return Ok(());
         }
-        let runs = crate::fixture::line(Path::new(&self.runs()?))?;
-        let dumped_from = stated.map(|s| format!("{}{s}", crate::fixture::LINE_PREFIX));
-        if dumped_from.as_deref() == Some(runs.as_str()) {
-            return Ok(());
-        }
-        Err(RefError::Stale {
-            set: set.display().to_string(),
-            dumped_from: dumped_from.unwrap_or_else(|| {
-                "an unstated fixture (the set has no # fixture line)".to_string()
-            }),
-            runs,
-        })
+        crate::fixture::check_stated(set, stated, Path::new(&self.runs()?))
     }
 
     /// `build`, the ik build set `set` names, against the family's
@@ -406,7 +395,7 @@ impl Family {
 }
 
 /// [`RefError::Stale`] unless `dumped_from` is `runs`.
-fn check_same(
+pub(crate) fn check_same(
     set: &Path,
     line: &str,
     dumped_from: Option<&str>,

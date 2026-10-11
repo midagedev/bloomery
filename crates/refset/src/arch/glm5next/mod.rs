@@ -4,12 +4,14 @@
 //! within the positions a latent layer attends whole ([`IK`]), and the DSA
 //! sets past them, dumped with ik's k-pool indexer on ([`IK_DSA`]); the MTP
 //! draft set from the same file by the ik tree that carries the MTP graph,
-//! [`MTP_BUILD`]. The fixture tier's mirror of each is in [`fixture`].
+//! [`MTP_BUILD`]. The fixture tier's mirror of each is in [`fixture`]; the image-input sets
+//! of the fixture tier are [`vis`]'s.
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 pub mod fixture;
+pub mod vis;
 
 /// The first shard of the split set every glm5next set is dumped from and
 /// the tree runs: the identity each set's `# model` line states. The family
@@ -122,7 +124,14 @@ pub static FAMILIES: &[&Family] = &[
     &fixture::IK,
     &fixture::MTP,
     &fixture::IK_DSA,
+    &vis::PREPROC,
+    &vis::TAPS,
+    &vis::CHATIDS,
+    &vis::HIDDEN,
+    &vis::DECODE,
 ];
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vis_tests;

@@ -1,28 +1,33 @@
-//! The image-input oracle sets of the Qwen3-VL family seats
-//! (`tools/ref/clefvis/dump_mtmd.cpp`): llama.cpp mainline's mtmd
-//! `qwen3vl_merger` tower and a family's text model (Clef-Flash's qwen35 on
-//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp), written in the
-//! node-dump set format (`tools/ref/dump_ref.cpp`), so a family's identity
+//! The image-input oracle sets of the seats whose tower llama.cpp mainline's mtmd runs
+//! (`tools/ref/clefvis/dump_mtmd.cpp`): the Qwen3-VL seats' `qwen3vl_merger` (Clef-Flash's qwen35 on
+//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp) and GLM-5.3-Flash's `glm5v`, each with its
+//! text model, written in the node-dump set format (`tools/ref/dump_ref.cpp`), so a family's identity
 //! check ([`crate::arch::qwen35::clefvis`], [`crate::arch::qwen35moe::vis`],
-//! [`crate::arch::qwen4exp::vis`], through [`RefManifest::open`]) already
-//! refuses a set of another file, another build or another architecture and
+//! [`crate::arch::qwen4exp::vis`], [`crate::arch::glm5next::vis`], through [`RefManifest::open`])
+//! already refuses a set of another file, another build or another architecture and
 //! a set without its trailer. This module reads what the format leaves to the
 //! kind of set: the `# clefvis <kind>` line, the mmproj the set names, the
 //! images and spans, and the rows each kind must carry, and hands the values
 //! out by name. What differs between the seats is a [`Profile`], the family's
 //! `Identity::Clefvis` payload: the projector file and its digest, the text
-//! model's width and the image-pad id.
+//! model's width, the image-pad id, the tower layout and, for a seat dumped on a respelled
+//! fixture copy, the [`Respell`] record. What differs between the layouts is read from the set's
+//! own lines, never from the seat: `# projector` (the grid unit, the positions an image advances
+//! the decoder by, the tower's output-end taps), `# positions` (the row of positions the decode
+//! was fed) and `# image_pad_id` (the image token). A set that states none of them is a
+//! `qwen3vl_merger` set, and a family whose [`Profile::projector`] is the other layout refuses it by name.
 //!
 //! - [`Kind::Preproc`] (set A): per image `<name>/inp_raw`, the f32 image after
 //!   mtmd's preprocess, channel-planar `[W, H, 3, 1]`, the tower's graph input.
 //! - [`Kind::Taps`] (set B): per image `<name>/<node>` for the nodes of
 //!   [`tap_names`], and `<name>/embd`, the final embeddings `[n_embd, tokens]`;
-//!   a set tapped [`TapScope::Final`] holds `embd` and the post-LN output
-//!   [`POST_LN`] of every image.
+//!   a set tapped [`TapScope::Final`] holds `embd` and the layout's output-end nodes
+//!   ([`ProjectorKind::final_taps`]: [`POST_LN`], or [`VIT_OUT`], [`AFTER_FC_PROJ`] and
+//!   [`AFTER_FFN_PROJ`]) of every image.
 //! - [`Kind::Hidden`], [`Kind::Prose`] and [`Kind::Bf16Rows`] (sets C, C′, C″):
 //!   one prompt's `result_norm` of every position `[n_embd, ids]` and the
-//!   positions the decode was fed, `mrope_pos` `[3, ids]` (t, y, x), with the
-//!   spans of its images.
+//!   positions the decode was fed, `mrope_pos` `[3, ids]` (t, y, x) or, under `# positions normal`,
+//!   `pos` `[1, ids]`, with the spans of its images.
 //! - [`Kind::ChatIds`] (set E): the ids llama-server's chat path gives one
 //!   request, `ids` `[n]`, the rendered prompt, the chat template's digest and
 //!   the spans of its images.
@@ -30,7 +35,8 @@
 //!   `[steps]`, `result_norm` `[n_embd, steps]` and `n_past` `[steps]`, with
 //!   the position the prompt left and the spans of its images.
 //!
-//! The header lines this reader owns: `# clefvis`, `# mmproj`, `# device`,
+//! The header lines this reader owns: `# clefvis`, `# mmproj`, `# projector`, `# positions`,
+//! `# fixture`, `# respell` and `# text_model` (a seat with a [`Respell`]), `# device`,
 //! `# image columns` and `# image`, `# span columns` and `# span`,
 //! `# tap_effect`, `# prompt`, `# chat`, `# decode`; the rest are
 //! [`RefManifest`]'s.
@@ -63,8 +69,9 @@ pub const IMAGE_PAD_ID: u32 = 248_056;
 /// The text model's width, and so the width of the tower's output rows.
 pub const N_EMBD: usize = 4096;
 
-/// What a seat's sets state that no other seat's do: the projector file and its digest, the text model's width and
-/// the id of its `<|image_pad|>`. A family's `Identity::Clefvis` carries one.
+/// What a seat's sets state that no other seat's do: the projector file and its digest, the text model's width, the
+/// id of its image token, the tower layout and the respelled fixture copy a text model may be. A family's
+/// `Identity::Clefvis` carries one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Profile {
     /// The projector file every set of the seat is dumped with.
@@ -73,8 +80,131 @@ pub struct Profile {
     pub mmproj_sha256: &'static str,
     /// The text model's width, and so the width of the tower's output rows.
     pub n_embd: usize,
-    /// The token id of `<|image_pad|>` in the text model's vocabulary.
+    /// The token id of the image token (`<|image_pad|>`, GLM's `<|image|>`) in the text model's vocabulary.
     pub image_pad_id: u32,
+    /// The tower layout the seat's sets state with their `# projector` line.
+    pub projector: ProjectorKind,
+    /// The seat's text model is a respelled copy of a fixture file, dumped by mainline; none for a seat on a real file.
+    pub respell: Option<Respell>,
+}
+
+/// A fixture file respelled for mainline (`tools/ref/gguf-respell.py`): the copy is the seat's text model, the
+/// original fixture is the identity the sets state through their `# fixture` line, and the copy's own record is the
+/// `# respell` line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Respell {
+    /// The architecture the original states and the copy was respelled from (`bloomery.respell.from`), which
+    /// names the original's fixture directory ([`crate::fixture::first_shard`]) too.
+    pub from: &'static str,
+    /// The copy's first shard, the text model every set of the seat states in `# text_model`.
+    pub copy: &'static str,
+    /// What the copy changed besides names (`bloomery.respell.set`).
+    pub set: &'static str,
+    /// The sha256 of the original's first shard (`bloomery.respell.source_sha256`).
+    pub source_sha256: &'static str,
+}
+
+/// The tower layout a set states with its `# projector` line; a set with no such line is [`ProjectorKind::Qwen3vlMerger`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectorKind {
+    /// mtmd's `qwen3vl_merger`: 32-pixel tokens, M-RoPE positions, the post-LN output end.
+    Qwen3vlMerger,
+    /// mtmd's `glm5v`: patch-size times merge-size pixel tokens (the line states them), normal positions, the
+    /// `vit_out` / `after_fc_proj` / `after_ffn_proj` output end.
+    Glm5v,
+}
+
+/// How the decoder numbers the rows of a prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionKind {
+    /// A (t, y, x) triple a row: an image's grid advances the decoder by `max(nx, ny)`.
+    Mrope,
+    /// One position a row, an image included: it advances the decoder by its tokens.
+    Normal,
+}
+
+impl PositionKind {
+    /// The `# positions` spelling, and the name of the row holding the positions.
+    fn spelling(self) -> (&'static str, &'static str) {
+        match self {
+            PositionKind::Mrope => ("mrope", "mrope_pos"),
+            PositionKind::Normal => ("normal", "pos"),
+        }
+    }
+}
+
+impl ProjectorKind {
+    /// The `# projector` spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectorKind::Qwen3vlMerger => "qwen3vl_merger",
+            ProjectorKind::Glm5v => "glm5v",
+        }
+    }
+
+    /// The positions a decoder of the layout is fed.
+    #[must_use]
+    pub fn positions(self) -> PositionKind {
+        match self {
+            ProjectorKind::Qwen3vlMerger => PositionKind::Mrope,
+            ProjectorKind::Glm5v => PositionKind::Normal,
+        }
+    }
+
+    /// The spelling of the image token in the text model's vocabulary.
+    fn image_token(self) -> &'static str {
+        match self {
+            ProjectorKind::Qwen3vlMerger => "<|image_pad|>",
+            ProjectorKind::Glm5v => "<|image|>",
+        }
+    }
+
+    /// The nodes of a tower tapped [`TapScope::Final`], mtmd's names, in the order the dump writes them.
+    #[must_use]
+    pub fn final_taps(self) -> &'static [&'static str] {
+        match self {
+            ProjectorKind::Qwen3vlMerger => &[POST_LN],
+            ProjectorKind::Glm5v => &[VIT_OUT, AFTER_FC_PROJ, AFTER_FFN_PROJ],
+        }
+    }
+
+    /// Whether the layout's dump taps inside the tower ([`TapScope::Full`], [`TapScope::EmbdOnly`]) as well as its output end.
+    fn taps_inside(self) -> bool {
+        self == ProjectorKind::Qwen3vlMerger
+    }
+}
+
+/// What a set states of its tower: its `# projector` line, or the `qwen3vl_merger` constants of a set with none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Projector {
+    pub kind: ProjectorKind,
+    /// The pixels a token covers a side, patch size times merge size: the sides of the planned image are multiples of it.
+    pub align: usize,
+    /// The side of the patch block a token merges: a token holds `merge * merge` patches.
+    pub merge: usize,
+    /// The preprocess's bounds on an image's pixels, where the line states them.
+    pub image_min_pixels: Option<u64>,
+    pub image_max_pixels: Option<u64>,
+}
+
+impl Projector {
+    /// The layout of a set with no `# projector` line.
+    const QWEN: Projector = Projector {
+        kind: ProjectorKind::Qwen3vlMerger,
+        align: ALIGN,
+        merge: 2,
+        image_min_pixels: None,
+        image_max_pixels: None,
+    };
+
+    /// How far an image of `nx` by `ny` tokens advances the decoder's position.
+    fn n_pos(&self, nx: usize, ny: usize) -> usize {
+        match self.kind.positions() {
+            PositionKind::Mrope => nx.max(ny),
+            PositionKind::Normal => nx * ny,
+        }
+    }
 }
 
 /// The mainline commit the Qwen3.6 and Qwen3.8 image-input sets name in their `# build` line.
@@ -88,9 +218,11 @@ pub static CLEF: Profile = Profile {
     mmproj_sha256: MMPROJ_BF16_SHA256,
     n_embd: N_EMBD,
     image_pad_id: IMAGE_PAD_ID,
+    projector: ProjectorKind::Qwen3vlMerger,
+    respell: None,
 };
 
-/// Patch size times the merge size: the sides of mtmd's planned image are
+/// Patch size times the merge size of the `qwen3vl_merger` layout: the sides of mtmd's planned image are
 /// multiples of it, and a token covers this many pixels a side.
 pub const ALIGN: usize = 32;
 
@@ -112,6 +244,15 @@ pub const POS_EMB: &str = "inp_pos_emb";
 
 /// The post-LN output, after block 26 and before the 2x2 merge.
 pub const POST_LN: &str = "norm_b-27";
+
+/// The `glm5v` tower's last block output after its final norm, `[vit width, merge² x tokens]`, patches in merge-block order.
+pub const VIT_OUT: &str = "vit_out";
+
+/// The `glm5v` tower after the merger, the FC and its LayerNorm and GELU, `[n_embd, tokens]`.
+pub const AFTER_FC_PROJ: &str = "after_fc_proj";
+
+/// The `glm5v` tower's output end, `[n_embd, tokens]`.
+pub const AFTER_FFN_PROJ: &str = "after_ffn_proj";
 
 /// The final embeddings of the clean pass (`mtmd_get_output_embd`).
 pub const EMBD: &str = "embd";
@@ -255,6 +396,10 @@ pub struct ClefvisSet {
     pub kind: Kind,
     /// The seat the family belongs to.
     pub profile: &'static Profile,
+    /// The tower layout the set states ([`Projector`]).
+    pub projector: Projector,
+    /// The image token's id the set states (`# image_pad_id`), where its kind states its prompt's ids.
+    pub image_pad_id: Option<u32>,
     /// `# device cpu`: the CPU twin.
     pub cpu: bool,
     /// The card the dump ran on (`# device … card <name>`), `cpu` for a twin.
@@ -306,20 +451,32 @@ fn lines<'a>(man: &'a RefManifest, key: &str) -> Vec<Vec<&'a str>> {
         .collect()
 }
 
-/// The one line of the header that opens with `# <key>\t`.
-fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
+/// The line of the header that opens with `# <key>\t`, if there is one; two are an error.
+fn opt_one<'a>(man: &'a RefManifest, key: &str) -> Result<Option<Vec<&'a str>>, RefError> {
     let mut v = lines(man, key);
     match v.len() {
-        1 => Ok(v.remove(0)),
-        0 => Err(RefError::missing(
-            &man.dir,
-            format!("{}: no `# {key}` line", man.dir.display()),
-        )),
+        0 => Ok(None),
+        1 => Ok(Some(v.remove(0))),
         n => Err(RefError::malformed(
             At(&man.dir),
             format!("{n} `# {key}` lines, want one"),
         )),
     }
+}
+
+/// The one line of the header that opens with `# <key>\t`.
+fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
+    opt_one(man, key)?.ok_or_else(|| {
+        RefError::missing(
+            &man.dir,
+            format!("{}: no `# {key}` line", man.dir.display()),
+        )
+    })
+}
+
+/// The value of field `i` of a header line's fields when it reads `<key> <value>`.
+fn keyed<'a>(fields: &[&'a str], i: usize, key: &str) -> Option<&'a str> {
+    fields.get(i)?.strip_prefix(key)?.strip_prefix(' ')
 }
 
 impl ClefvisSet {
@@ -361,6 +518,24 @@ impl ClefvisSet {
                 runs: format!("mmproj {} sha256 {}", profile.mmproj, profile.mmproj_sha256),
             });
         }
+        let stated = read_projector(&man)?;
+        let projector = stated.unwrap_or(Projector::QWEN);
+        if projector.kind != profile.projector {
+            return Err(RefError::Foreign {
+                set: dir.display().to_string(),
+                family: family.name,
+                field: "projector",
+                got: stated.map_or_else(
+                    || "(no # projector line: the qwen3vl_merger layout)".to_string(),
+                    |p| p.kind.as_str().to_string(),
+                ),
+                want: profile.projector.as_str().to_string(),
+            });
+        }
+        if let Some(respell) = &profile.respell {
+            check_respell(&man, respell)?;
+        }
+        check_positions(&man, kind, projector.kind)?;
         let dev = one(&man, "device")?;
         let (cpu, card) = match dev[..] {
             [d @ ("cuda" | "cpu"), "threads", _, "card", card, ..] => {
@@ -386,10 +561,17 @@ impl ClefvisSet {
         } else {
             None
         };
+        let image_pad_id = if kind.has_prompt_ids() {
+            Some(read_image_pad_id(&man, projector.kind, profile)?)
+        } else {
+            None
+        };
         let set = ClefvisSet {
             man,
             kind,
             profile,
+            projector,
+            image_pad_id,
             cpu,
             card,
             images,
@@ -436,20 +618,21 @@ impl ClefvisSet {
         Ok(self.tensor(name, INP_RAW)?.1)
     }
 
-    /// Node `node` of image `name`'s tower ([`Kind::Taps`]): a name of [`tap_names`] or
-    /// [`EMBD`]; the row's shape is `[1152, patches]` (`Qcur_rope`: `[72, 16, patches]`),
-    /// `[n_embd, tokens]` for [`EMBD`]. An image holds the nodes of its [`TapScope`] and [`EMBD`];
-    /// every other node is refused by name.
+    /// Node `node` of image `name`'s tower ([`Kind::Taps`]): a name of [`tap_names`], of the
+    /// layout's [`ProjectorKind::final_taps`] or [`EMBD`]; the row's shape is `[1152, patches]`
+    /// (`Qcur_rope`: `[72, 16, patches]`) in a `qwen3vl_merger` tower, `[n_embd, tokens]` for [`EMBD`].
+    /// An image holds the nodes of its [`TapScope`] and [`EMBD`]; every other node is refused by name.
     pub fn tap(&self, name: &str, node: &str) -> Result<(RefRow, Vec<f32>), RefError> {
         self.need(Kind::Taps, "tap")?;
+        let finals = self.projector.kind.final_taps();
         let carries = match self.tap_effect_of(name)?.scope {
             TapScope::Full => true,
-            TapScope::Final => node == POST_LN,
+            TapScope::Final => finals.contains(&node),
             TapScope::EmbdOnly => false,
         };
         if node != EMBD && !carries {
             let only = match self.tap_effect_of(name)?.scope {
-                TapScope::Final => format!("{POST_LN} and {EMBD} only"),
+                TapScope::Final => format!("{} and {EMBD} only", finals.join(", ")),
                 _ => format!("{EMBD} only"),
             };
             return Err(RefError::missing(
@@ -469,23 +652,53 @@ impl ClefvisSet {
         Ok(ik::load_ref_in(&self.man, "result_norm", 0)?.1)
     }
 
-    /// The (t, y, x) the decode was fed for each position (a prompt kind): the image rows' from
-    /// the helper's own batches, a text row's three all its position.
+    /// The (t, y, x) the decode was fed for each position (a prompt kind of M-RoPE positions): the
+    /// image rows' from the helper's own batches, a text row's three all its position.
     pub fn positions(&self) -> Result<Vec<[i32; 3]>, RefError> {
         self.need_prompt("mrope_pos")?;
+        self.need_positions(PositionKind::Mrope)?;
         let v = ik::ref_ints(&self.man, "mrope_pos", 0, RowKind::Tensor, Layout::Flat)?;
-        let to_i32 = |p: i64| {
-            i32::try_from(p).map_err(|_| {
-                RefError::malformed(At(&self.man.dir), format!("position {p} is not an i32"))
-            })
-        };
         v.as_chunks::<3>()
             .0
             .iter()
-            .map(|c| Ok([to_i32(c[0])?, to_i32(c[1])?, to_i32(c[2])?]))
+            .map(|c| Ok([self.to_i32(c[0])?, self.to_i32(c[1])?, self.to_i32(c[2])?]))
             .collect()
     }
 
+    /// The position the decode was fed for each row (a prompt kind of normal positions): an image's
+    /// rows hold the positions after the text before them, one each.
+    pub fn normal_positions(&self) -> Result<Vec<i32>, RefError> {
+        self.need_prompt("pos")?;
+        self.need_positions(PositionKind::Normal)?;
+        ik::ref_ints(&self.man, "pos", 0, RowKind::Tensor, Layout::Flat)?
+            .into_iter()
+            .map(|p| self.to_i32(p))
+            .collect()
+    }
+
+    fn to_i32(&self, p: i64) -> Result<i32, RefError> {
+        i32::try_from(p).map_err(|_| {
+            RefError::malformed(At(&self.man.dir), format!("position {p} is not an i32"))
+        })
+    }
+
+    /// The set's layout feeds `want` positions.
+    fn need_positions(&self, want: PositionKind) -> Result<(), RefError> {
+        let have = self.projector.kind.positions();
+        if have == want {
+            return Ok(());
+        }
+        Err(RefError::malformed(
+            At(&self.man.dir),
+            format!(
+                "{} reads a set of {} positions, this {} set feeds {} positions",
+                want.spelling().1,
+                want.spelling().0,
+                self.projector.kind.as_str(),
+                have.spelling().0
+            ),
+        ))
+    }
     /// The number of ids of the prompt (a prompt kind, a chat-ids or a decode set): its `# tokens_count`.
     pub fn n_ids(&self) -> Result<usize, RefError> {
         self.need_prompt_ids("n_ids")?;
@@ -636,9 +849,9 @@ impl ClefvisSet {
                 return Err(RefError::malformed(&at, format!("image {} twice", i.name)));
             }
             if i.nx * i.ny != i.n_tokens
-                || i.best_w != i.nx * ALIGN
-                || i.best_h != i.ny * ALIGN
-                || i.n_pos != i.nx.max(i.ny)
+                || i.best_w != i.nx * self.projector.align
+                || i.best_h != i.ny * self.projector.align
+                || i.n_pos != self.projector.n_pos(i.nx, i.ny)
             {
                 return Err(RefError::malformed(
                     &at,
@@ -664,19 +877,9 @@ impl ClefvisSet {
                         format!("{}/{EMBD}", i.name),
                         [n_embd, i.n_tokens as u64, 1, 1],
                     )?;
-                    let nodes = match self.tap_effect_of(&i.name)?.scope {
-                        TapScope::Full => tap_names(),
-                        TapScope::Final => vec![POST_LN.to_string()],
-                        TapScope::EmbdOnly => Vec::new(),
-                    };
-                    for n in nodes {
+                    for n in self.tap_nodes(&i.name)? {
                         let r = self.man.tensor(&format!("{}/{n}", i.name), 0)?;
-                        if r.ne.iter().product::<u64>() % (4 * i.n_tokens as u64) != 0 {
-                            return Err(RefError::malformed(
-                                &at,
-                                format!("{}/{n} is {:?}, not a whole row per patch", i.name, r.ne),
-                            ));
-                        }
+                        self.check_tap_shape(i, &n, r.ne)?;
                     }
                 }
                 if self.tap_effect.len() != self.images.len() {
@@ -691,21 +894,10 @@ impl ClefvisSet {
                 }
             }
             Kind::Hidden | Kind::Prose | Kind::Bf16Rows | Kind::ChatIds | Kind::Decode => {
-                let pad = one(&self.man, "image_pad_id")?;
-                if pad != [self.profile.image_pad_id.to_string()] {
-                    return Err(RefError::malformed(
-                        &at,
-                        format!(
-                            "image_pad_id {pad:?}, the vocabulary's <|image_pad|> is {}",
-                            self.profile.image_pad_id
-                        ),
-                    ));
-                }
                 let n = self.n_ids()? as u64;
                 if self.kind.is_prompt() {
                     want("result_norm".to_string(), [n_embd, n, 1, 1])?;
-                    want("mrope_pos".to_string(), [3, n, 1, 1])?;
-                    self.check_int_row("mrope_pos", 3 * n)?;
+                    self.check_positions_row(n)?;
                 }
                 self.check_spans(n as usize)?;
                 if (self.kind == Kind::Prose) != self.images.is_empty() && self.kind != Kind::Decode
@@ -728,6 +920,102 @@ impl ClefvisSet {
             }
         }
         Ok(())
+    }
+
+    /// The nodes the image `name` carries besides [`EMBD`]: the layout's, by the scope its `# tap_effect` states. A
+    /// layout tapped at its output end only refuses the other scopes by name.
+    fn tap_nodes(&self, image: &str) -> Result<Vec<String>, RefError> {
+        let scope = self.tap_effect_of(image)?.scope;
+        if scope != TapScope::Final && !self.projector.kind.taps_inside() {
+            let how = match scope {
+                TapScope::Full => "full",
+                TapScope::Final => "final",
+                TapScope::EmbdOnly => "inp_raw only",
+            };
+            return Err(RefError::malformed(
+                At(&self.man.dir),
+                format!(
+                    "{image}: taps {how}, a {} tower is tapped at its output end only ({})",
+                    self.projector.kind.as_str(),
+                    self.projector.kind.final_taps().join(", ")
+                ),
+            ));
+        }
+        Ok(match scope {
+            TapScope::Full => tap_names(),
+            TapScope::Final => self
+                .projector
+                .kind
+                .final_taps()
+                .iter()
+                .map(|n| (*n).to_string())
+                .collect(),
+            TapScope::EmbdOnly => Vec::new(),
+        })
+    }
+
+    /// Node `n` of image `i` has the shape its layout gives it: a whole row per patch in a `qwen3vl_merger` tower, and
+    /// in a `glm5v` one `merge * merge` rows a token for [`VIT_OUT`] and `[n_embd, tokens]` for the merged nodes.
+    fn check_tap_shape(&self, i: &Image, n: &str, ne: [u64; 4]) -> Result<(), RefError> {
+        let tokens = i.n_tokens as u64;
+        let patches = (self.projector.merge as u64).pow(2) * tokens;
+        let n_embd = self.profile.n_embd as u64;
+        let (ok, refusal) = match (self.projector.kind, n) {
+            (ProjectorKind::Qwen3vlMerger, _) => (
+                ne.iter().product::<u64>() % patches == 0,
+                "not a whole row per patch".to_string(),
+            ),
+            (ProjectorKind::Glm5v, VIT_OUT) => (
+                ne[1..] == [patches, 1, 1],
+                format!("want [width, {patches}, 1, 1]"),
+            ),
+            (ProjectorKind::Glm5v, _) => (
+                ne == [n_embd, tokens, 1, 1],
+                format!("want [{n_embd}, {tokens}, 1, 1]"),
+            ),
+        };
+        if ok {
+            return Ok(());
+        }
+        Err(RefError::malformed(
+            At(&self.man.dir),
+            format!("{}/{n} is {ne:?}, {refusal}", i.name),
+        ))
+    }
+
+    /// A prompt set's positions row is the one its layout names, of `n` positions: `mrope_pos` `[3, n]` or `pos` `[1, n]`.
+    /// The other layout's row is refused by name, so a set whose `# positions` line and rows disagree is not read as
+    /// either.
+    fn check_positions_row(&self, n: u64) -> Result<(), RefError> {
+        let kind = self.projector.kind;
+        let (spelt, row) = kind.positions().spelling();
+        let other = match kind.positions() {
+            PositionKind::Mrope => PositionKind::Normal,
+            PositionKind::Normal => PositionKind::Mrope,
+        };
+        let held = |name: &str| self.man.find(RowKind::Tensor, name, 0).is_some();
+        if !held(row) && held(other.spelling().1) {
+            return Err(RefError::malformed(
+                At(&self.man.dir),
+                format!(
+                    "the {} layout feeds {spelt} positions, the {row} row; the set holds {} instead",
+                    kind.as_str(),
+                    other.spelling().1
+                ),
+            ));
+        }
+        let lanes = match kind.positions() {
+            PositionKind::Mrope => 3,
+            PositionKind::Normal => 1,
+        };
+        let r = self.man.tensor(row, 0)?;
+        if r.ne != [lanes, n, 1, 1] {
+            return Err(RefError::malformed(
+                At(&self.man.dir),
+                format!("{row} is {:?}, want {:?}", r.ne, [lanes, n, 1, 1]),
+            ));
+        }
+        self.check_int_row(row, lanes * n)
     }
 
     /// The int row `name`, of `count` elements, has its lossless i32 twin.
@@ -818,7 +1106,9 @@ impl ClefvisSet {
         }
         self.check_int_row("ids", n)?;
         let ids = self.u32s("ids")?;
-        let pad = self.profile.image_pad_id;
+        let pad = self.image_pad_id.ok_or_else(|| {
+            RefError::missing(&self.man.dir, "a chat-ids set without its image token")
+        })?;
         let mut in_span = vec![false; ids.len()];
         for s in &self.spans {
             in_span[s.at..s.at + s.len].fill(true);
@@ -920,6 +1210,172 @@ fn unescape(raw: &str) -> Result<String, String> {
         });
     }
     Ok(out)
+}
+
+/// `# projector\t<layout>\tpatch_size <n>\tspatial_merge_size <n>\talign <n>\timage_min_pixels <n>\timage_max_pixels <n>`:
+/// the tower layout the set states; none for a set of the `qwen3vl_merger` seats, which state no such line.
+fn read_projector(man: &RefManifest) -> Result<Option<Projector>, RefError> {
+    let Some(f) = opt_one(man, "projector")? else {
+        return Ok(None);
+    };
+    let bad = |what: &str| RefError::malformed(At(&man.dir), format!("# projector {f:?}: {what}"));
+    let kind = match f[0] {
+        "qwen3vl_merger" => ProjectorKind::Qwen3vlMerger,
+        "glm5v" => ProjectorKind::Glm5v,
+        other => {
+            return Err(bad(&format!(
+                "{other:?} is neither qwen3vl_merger nor glm5v"
+            )));
+        }
+    };
+    if f.len() != 6 {
+        return Err(bad(
+            "want <layout>\tpatch_size <n>\tspatial_merge_size <n>\talign <n>\timage_min_pixels <n>\timage_max_pixels <n>",
+        ));
+    }
+    fn num<T: std::str::FromStr>(f: &[&str], i: usize, key: &str) -> Result<T, String> {
+        keyed(f, i, key)
+            .ok_or_else(|| format!("field {i} is not `{key} <n>`"))?
+            .parse()
+            .map_err(|_| format!("{key} is not a number"))
+    }
+    let n = |i, key| num::<usize>(&f, i, key).map_err(|e| bad(&e));
+    let (patch, merge, align) = (
+        n(1, "patch_size")?,
+        n(2, "spatial_merge_size")?,
+        n(3, "align")?,
+    );
+    if patch == 0 || merge == 0 || align != patch * merge {
+        return Err(bad(&format!(
+            "align {align} is not patch_size {patch} x spatial_merge_size {merge}"
+        )));
+    }
+    Ok(Some(Projector {
+        kind,
+        align,
+        merge,
+        image_min_pixels: Some(num(&f, 4, "image_min_pixels").map_err(|e| bad(&e))?),
+        image_max_pixels: Some(num(&f, 5, "image_max_pixels").map_err(|e| bad(&e))?),
+    }))
+}
+
+/// `# positions\t<normal|mrope>`: the positions the decode was fed, which must be the layout's. A prompt set of a layout
+/// whose positions are not M-RoPE's states it (the line is what tells its `pos` row from the other layout's `mrope_pos`);
+/// a `qwen3vl_merger` set states none.
+fn check_positions(man: &RefManifest, kind: Kind, layout: ProjectorKind) -> Result<(), RefError> {
+    let at = At(&man.dir);
+    let want = layout.positions();
+    let stated = match opt_one(man, "positions")? {
+        None => None,
+        Some(f) => Some(match f[..] {
+            ["normal"] => PositionKind::Normal,
+            ["mrope"] => PositionKind::Mrope,
+            _ => {
+                return Err(RefError::malformed(
+                    &at,
+                    format!("# positions {f:?}: want normal or mrope"),
+                ));
+            }
+        }),
+    };
+    match stated {
+        Some(p) if p != want => Err(RefError::malformed(
+            &at,
+            format!(
+                "`# positions {}`, the {} layout feeds {} positions",
+                p.spelling().0,
+                layout.as_str(),
+                want.spelling().0
+            ),
+        )),
+        None if kind.is_prompt() && want != PositionKind::Mrope => Err(RefError::malformed(
+            &at,
+            format!(
+                "a {} prompt set states `# positions {}`, this one states none",
+                layout.as_str(),
+                want.spelling().0
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `# image_pad_id\t<id>`: the image token's id, which is the profile's.
+fn read_image_pad_id(
+    man: &RefManifest,
+    layout: ProjectorKind,
+    profile: &Profile,
+) -> Result<u32, RefError> {
+    let pad = one(man, "image_pad_id")?;
+    let id = match pad[..] {
+        [v] => v.parse::<u32>().ok(),
+        _ => None,
+    };
+    match id {
+        Some(id) if id == profile.image_pad_id => Ok(id),
+        _ => Err(RefError::malformed(
+            At(&man.dir),
+            format!(
+                "image_pad_id {pad:?}, the vocabulary's {} is {}",
+                layout.image_token(),
+                profile.image_pad_id
+            ),
+        )),
+    }
+}
+
+/// A seat whose text model is a respelled fixture copy: the sets state the fixture the copy was cut from, through the
+/// `# fixture` line, against the original's header ([`crate::fixture::first_shard`] of the architecture the copy was
+/// respelled from); the copy as their `# text_model`; and the copy's record, `# respell\tsource <path>\tsource_sha256
+/// <hex>\tfrom <arch>\tset <list or ->`, field by field: the original's first shard, its digest, the old
+/// architecture and the keys changed besides names. A set without the line or with another value is stale by that field.
+fn check_respell(man: &RefManifest, r: &Respell) -> Result<(), RefError> {
+    let set = man.dir.as_path();
+    let original = crate::fixture::first_shard(r.from)?;
+    crate::fixture::check_stated(set, man.header.fixture.as_deref(), Path::new(&original))?;
+    let text = opt_one(man, "text_model")?;
+    crate::family::check_same(
+        set,
+        "# text_model",
+        text.as_ref().and_then(|f| f.first().copied()),
+        r.copy,
+    )?;
+    let Some(f) = opt_one(man, "respell")? else {
+        return Err(RefError::Stale {
+            set: set.display().to_string(),
+            dumped_from: "an unstated respell (the set has no # respell line)".to_string(),
+            runs: format!("the copy of {original} with set {}", r.set),
+        });
+    };
+    if f.len() != 4 {
+        return Err(RefError::malformed(
+            At(&man.dir),
+            format!(
+                "# respell {f:?}: want source <path>\tsource_sha256 <hex>\tfrom <arch>\tset <list or ->"
+            ),
+        ));
+    }
+    for (i, key, want) in [
+        (0, "source", original.as_str()),
+        (1, "source_sha256", r.source_sha256),
+        (2, "from", r.from),
+        (3, "set", r.set),
+    ] {
+        let got = keyed(&f, i, key).ok_or_else(|| {
+            RefError::malformed(
+                At(&man.dir),
+                format!("# respell {f:?}: field {i} is not `{key} <value>`"),
+            )
+        })?;
+        if got != want {
+            return Err(RefError::Stale {
+                set: set.display().to_string(),
+                dumped_from: format!("respell {key} {got}"),
+                runs: format!("respell {key} {want}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn columns_of(man: &RefManifest, kind: &str) -> Result<Option<Columns>, RefError> {
@@ -1096,24 +1552,62 @@ fn read_decode(man: &RefManifest) -> Result<DecodeLine, RefError> {
 #[cfg(test)]
 pub(crate) mod testkit;
 
-/// The families of one Qwen seat's sets, `$prefix` the sets' common name (`ref_<arch>_vis`): the tower's [`Kind::Taps`]
-/// family states the projector as its model file (`# arch clip`), every other kind states the text model; the card's
-/// sets of each kind and the CPU twins the recipe writes sit in one family, the chat ids (no card, no twin) too. The
-/// invoking module names the seat's [`Profile`], architecture, mainline build and the two files as functions.
+/// The families of one seat's sets, `$prefix` the sets' common name (`ref_<arch>_vis`): the tower's [`Kind::Preproc`]
+/// and [`Kind::Taps`] families state the projector as their model file (`# arch clip`), every other kind states the
+/// text model; the card's sets of each kind and the CPU twins the recipe writes sit in one family, the chat ids (no
+/// card, no twin) too. The invoking module names the seat's [`Profile`], architecture, mainline build and the two files
+/// as functions. A Qwen seat's invocation holds the six kinds its dumps write; a seat names its `kinds` when it holds
+/// others (`preproc`, `taps`, `hidden`, `prose`, `bf16rows`, `chatids`, `decode`). `recipe` is the command that
+/// writes the seat's sets, as a set's line of the recipe completes it.
 macro_rules! vis_families {
     (
-        prefix: $prefix:literal, name: $name:literal, model: $arg:literal,
+        recipe: $recipe:literal, prefix: $prefix:literal, name: $name:literal,
         profile: $profile:expr, arch: $arch:expr, build: $build:expr,
         mmproj: $mmproj:expr, text: $text:expr $(,)?
     ) => {
-        /// Set B of the seat's tower: the post-LN output and the final embeddings of each test image.
+        $crate::clefvis::vis_families! {
+            recipe: $recipe, prefix: $prefix, name: $name,
+            profile: $profile, arch: $arch, build: $build,
+            mmproj: $mmproj, text: $text,
+            kinds: [taps, hidden, prose, bf16rows, chatids, decode],
+        }
+    };
+    (
+        recipe: $recipe:literal, prefix: $prefix:literal, name: $name:literal,
+        profile: $profile:expr, arch: $arch:expr, build: $build:expr,
+        mmproj: $mmproj:expr, text: $text:expr,
+        kinds: [$($kind:ident),+ $(,)?] $(,)?
+    ) => {
+        $(
+            $crate::clefvis::vis_families! {
+                @$kind $recipe, $prefix, $name, $profile, $arch, $build, $mmproj, $text
+            }
+        )+
+    };
+
+    (@preproc $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
+        /// Set A: the test images after mtmd's preprocess, the tower's graph input; the card only.
+        pub static PREPROC: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-preproc"),
+            sets: &[concat!($prefix, "_preproc")],
+            resolve: None,
+            recipe: concat!($recipe, " ", $prefix, "_preproc"),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Preproc, &$profile),
+            arch: Some($crate::clefvis::TOWER_ARCH),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($mmproj),
+            draft_runs: None,
+            consumers: &[],
+        };
+    };
+    (@taps $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
+        /// Set B of the seat's tower: the output-end nodes and the final embeddings of each test image.
         pub static TAPS: $crate::family::Family = $crate::family::Family {
             name: concat!($name, "-taps"),
             sets: &[concat!($prefix, "_taps"), concat!($prefix, "_taps.cpu")],
             resolve: None,
             recipe: concat!(
-                "just dump-ref-qvis ",
-                $arg,
+                $recipe,
                 " [--cpu-twin] ",
                 $prefix,
                 "_taps"
@@ -1125,7 +1619,8 @@ macro_rules! vis_families {
             draft_runs: None,
             consumers: &[],
         };
-
+    };
+    (@hidden $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
         /// Set C: `result_norm` of every position of a chat prompt with mainline's tower rows, and the positions fed.
         pub static HIDDEN: $crate::family::Family = $crate::family::Family {
             name: concat!($name, "-hidden"),
@@ -1139,8 +1634,7 @@ macro_rules! vis_families {
             ],
             resolve: None,
             recipe: concat!(
-                "just dump-ref-qvis ",
-                $arg,
+                $recipe,
                 " [--cpu-twin] ",
                 $prefix,
                 "_hidden_c<N>"
@@ -1152,7 +1646,8 @@ macro_rules! vis_families {
             draft_runs: None,
             consumers: &[],
         };
-
+    };
+    (@prose $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
         /// Set C′: the same prompts with each image's rows replaced by prose-id text rows.
         pub static PROSE: $crate::family::Family = $crate::family::Family {
             name: concat!($name, "-prose"),
@@ -1166,8 +1661,7 @@ macro_rules! vis_families {
             ],
             resolve: None,
             recipe: concat!(
-                "just dump-ref-qvis ",
-                $arg,
+                $recipe,
                 " [--cpu-twin] ",
                 $prefix,
                 "_prose_c<N>"
@@ -1179,7 +1673,8 @@ macro_rules! vis_families {
             draft_runs: None,
             consumers: &[],
         };
-
+    };
+    (@bf16rows $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
         /// Set C″: the same prompts with mainline's tower rows rounded to bf16; the card only.
         pub static BF16ROWS: $crate::family::Family = $crate::family::Family {
             name: concat!($name, "-bf16rows"),
@@ -1189,7 +1684,7 @@ macro_rules! vis_families {
                 concat!($prefix, "_bf16rows_c3"),
             ],
             resolve: None,
-            recipe: concat!("just dump-ref-qvis ", $arg, " ", $prefix, "_bf16rows_c<N>"),
+            recipe: concat!($recipe, " ", $prefix, "_bf16rows_c<N>"),
             identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Bf16Rows, &$profile),
             arch: Some($arch),
             build: Some($crate::family::Build::Is($build)),
@@ -1197,7 +1692,8 @@ macro_rules! vis_families {
             draft_runs: None,
             consumers: &[],
         };
-
+    };
+    (@chatids $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
         /// Set E: the ids llama-server's chat path gives each request, with its rendered prompt.
         pub static CHATIDS: $crate::family::Family = $crate::family::Family {
             name: concat!($name, "-chatids"),
@@ -1210,7 +1706,7 @@ macro_rules! vis_families {
                 concat!($prefix, "_chatids_e3"),
             ],
             resolve: None,
-            recipe: concat!("just dump-ref-qvis ", $arg, " --ids"),
+            recipe: concat!($recipe, " --ids"),
             identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::ChatIds, &$profile),
             arch: Some($arch),
             build: Some($crate::family::Build::Is($build)),
@@ -1218,7 +1714,8 @@ macro_rules! vis_families {
             draft_runs: None,
             consumers: &[],
         };
-
+    };
+    (@decode $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
         /// Set F: 32 greedy decode steps after prompts C1 and C2.
         pub static DECODE: $crate::family::Family = $crate::family::Family {
             name: concat!($name, "-decode"),
@@ -1230,8 +1727,7 @@ macro_rules! vis_families {
             ],
             resolve: None,
             recipe: concat!(
-                "just dump-ref-qvis ",
-                $arg,
+                $recipe,
                 " [--cpu-twin] ",
                 $prefix,
                 "_decode_c<N>"

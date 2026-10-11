@@ -7,7 +7,7 @@
 
 use super::{ARCH, MODEL};
 use crate::RefError;
-use crate::clefvis::{Profile, QVIS_LCPP_BUILD, vis_families};
+use crate::clefvis::{Profile, ProjectorKind, QVIS_LCPP_BUILD, vis_families};
 
 /// The projector every Qwen3.6 image-input set is dumped with: lmstudio-community's bf16 file, the repository
 /// `docs/models.md` names for this model, under the box's `/models/mmproj`.
@@ -26,6 +26,8 @@ pub static PROFILE: Profile = Profile {
     mmproj_sha256: MMPROJ_BF16_SHA256,
     n_embd: 2048,
     image_pad_id: 248_056,
+    projector: ProjectorKind::Qwen3vlMerger,
+    respell: None,
 };
 
 /// [`MMPROJ_BF16`], as a tower family's `runs`.
@@ -39,9 +41,9 @@ fn model() -> Result<String, RefError> {
 }
 
 vis_families! {
+    recipe: "just dump-ref-qvis qwen35moe",
     prefix: "ref_qwen35moe_vis",
     name: "qwen35moe-vis",
-    model: "qwen35moe",
     profile: PROFILE,
     arch: ARCH,
     build: QVIS_LCPP_BUILD,
