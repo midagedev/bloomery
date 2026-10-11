@@ -446,6 +446,11 @@ OXREV=$(sed -n '/^\[patch\."https:\/\/github.com\/NVIDIA\/cuda-rust.git"\]/,/^\[
 [ -n "$OXREV" ] || OXREV=$(sed -n 's/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml" | head -1)
 [ -n "$OXREV" ] || { echo "box.sh: no cuda-oxide rev in $HERE/Cargo.toml" >&2; exit 70; }
 OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librustc_codegen_cuda.so && "
+# PATH의 cargo-oxide도 그 핀 rev여야 한다: 더 오래된 cargo-oxide는 .cargo/cuda-oxide.toml의 [target.<triple>] 표를
+# 아무 말 없이 무시해서, 호스트 코드가 CPU 플래그 없이 빌드된다. `cargo install --list`는 git 설치의 rev를 적는다
+# (`cargo-oxide vX (https://...?rev=<rev>#<short>)`). 그 rev가 핀이 아니거나 rev가 없으면 이름을 대고 멈춘다(rc 70).
+OXCLI='{ __c=$(cargo install --list 2>/dev/null | sed -n "s/^cargo-oxide v[^ ]* (.*#\([0-9a-f]\{7,\}\)).*/\1/p" | head -1); case OXREV in "$__c"*) [ -n "$__c" ] ;; *) false ;; esac || { echo "box.sh: the installed cargo-oxide is from rev ${__c:-none}, not the pin OXREV: reinstall it (docs/BUILD.md, cargo install ... --rev OXREV cargo-oxide)" >&2; exit 70; }; unset __c; } && '
+OXCLI=${OXCLI//OXREV/$OXREV}
 case "$*" in
   *"cargo oxide"*) OXIDE="${OXIDE}{ [ -f \"\$CUDA_OXIDE_BACKEND\" ] || { echo \"box.sh: no cuda-oxide backend for rev $OXREV at \$CUDA_OXIDE_BACKEND (tools/box.sh header)\" >&2; exit 70; }; } && { __r=\$(cat \"\${CUDA_OXIDE_BACKEND%/*}/source-rev.txt\" 2>/dev/null); [ \"\$__r\" = $OXREV ] || { echo \"box.sh: the backend at \$CUDA_OXIDE_BACKEND records source rev '\$__r', not $OXREV\" >&2; exit 70; }; unset __r; } && " ;;
 esac
@@ -458,12 +463,21 @@ if [ "$LOCAL" = 1 ]; then
   LOCALX="{ [ \"\${BLOOMERY_LOCK_DIR-}\" = $(printf %q "$LOCK_DIR") ] || { echo \"box.sh: the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode's guard probed the lock directory; set it before tools/box.sh\" >&2; exit 64; }; } && "
   LOCALX+="{ [ \"\${BLOOMERY_ARCH:-sm_86}\" = $RECIPE_ARCH ] || { echo \"box.sh: the environment file set BLOOMERY_ARCH=\$BLOOMERY_ARCH, and the recipe expanded $RECIPE_ARCH (this side's BLOOMERY_ARCH, unset: sm_86): name it in the environment, where the recipes read it\" >&2; exit 64; }; } && "
 fi
+# cargo oxide를 스크립트 안에서 부르는 명령(gate.sh --oxide, release/build.sh)도 같은 확인을 거친다.
+# release/build.sh --check는 바이너리만 읽고 빌드하지 않으므로 거치지 않는다. 그 부분만 빼고 보므로,
+# 같은 명령 안의 다른 release/build.sh 빌드는 여전히 확인을 거친다.
+# 확인은 BLOOMERY_BOX_ENV 뒤에 돈다: 거기서 CARGO_HOME이나 PATH를 바꾸면 빌드가 쓰는 그 설치를 확인한다.
+OXCHECK=
+OXCMD=$*
+case "${OXCMD//release\/build.sh --check/}" in
+  *"cargo oxide"* | *"gate.sh --oxide"* | *"release/build.sh"*) OXCHECK=$OXCLI ;;
+esac
 # serve의 build.rs가 `/props`의 version에 새기는 커밋. 박스 사본에는 .git이 없어서(rsync가 뺀다) 여기서 넘긴다.
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 REMOTE_CMD="source $ENVF && { $PICK
-} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ARCHX$ENVS$LOCALX$*"
+} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $OXIDE$ARCHX$ENVS$OXCHECK$LOCALX$*"
 if [ "$LOCAL" = 1 ]; then
   # ssh carries no environment to the box: the command runs without what this side read, BLOOMERY_MODEL above all (the model
   # crate's tests read that name as a model path), without box.sh's own outputs, which only the profile sets, and without

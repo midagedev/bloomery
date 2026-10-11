@@ -622,6 +622,40 @@ sshlog() {
 rc_is 'box.sh: a command reaches the stub ssh' 0 box "$B/tools/box.sh" 'cargo check'
 sshlog 'box.sh: the guard comes first, before the environment' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 1800  \) && source ~/bloomery-env\.sh && \{ :$'
 sshlog 'box.sh: the command comes last' '^\} && cd ~/repo/x && .*cargo check$'
+# A cargo oxide command also checks that the cargo-oxide on the box's PATH is the pinned rev (an older one ignores the
+# [target.<triple>] tables without a word); any other command does not. The check itself runs here against a stub
+# `cargo install --list`: the pin passes, another rev and a path install stop with rc 70 naming the pin.
+PIN=$(sed -n '/^\[patch\."https:\/\/github.com\/NVIDIA\/cuda-rust.git"\]/,/^\[workspace/s/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$B/Cargo.toml")
+rc_is 'box.sh: a cargo oxide command reaches the stub ssh' 0 box "$B/tools/box.sh" 'cargo oxide build'
+sshlog 'box.sh: a cargo oxide command checks the installed cargo-oxide against the pin' "cargo install --list .*not the pin $PIN"
+rc_is 'box.sh: a cargo oxide command with BLOOMERY_BOX_ENV runs' 0 box env BLOOMERY_BOX_ENV=CARGO_HOME=/opt/c "$B/tools/box.sh" 'cargo oxide build'
+sshlog 'box.sh: the cargo-oxide check runs after BLOOMERY_BOX_ENV' 'export CARGO_HOME=/opt/c && .*\{ __c=\$\(cargo install --list'
+for cmd in 'bash tools/gate.sh --oxide -p x --release --lib' 'bash tools/release/build.sh 0.1.0 abcdef0' \
+  'bash tools/release/build.sh --check /tmp/out && bash tools/release/build.sh 0.1.0 abcdef0'; do
+  rc_is "box.sh: '$cmd' reaches the stub ssh" 0 box "$B/tools/box.sh" "$cmd"
+  sshlog "box.sh: '$cmd' checks the installed cargo-oxide too" "cargo install --list .*not the pin $PIN"
+done
+for cmd in 'cargo check' 'bash tools/release/build.sh --check /tmp/out'; do
+  rc_is "box.sh: '$cmd' reaches the stub ssh" 0 box "$B/tools/box.sh" "$cmd"
+  if grep -q 'cargo install --list' "$tmp/ssh.log"; then fail "box.sh: '$cmd' does not check cargo-oxide" 'the check is in it' "$tmp/ssh.log"; else pass "box.sh: '$cmd' does not check cargo-oxide"; fi
+done
+OXCLI=$(sed -n "s/^OXCLI='\(.*\)'\$/\1/p" "$B/tools/box.sh")
+OXCLI=${OXCLI//OXREV/$PIN}
+mkdir -p "$tmp/oxbin"
+for got in "${PIN:0:8}" 4da6c138 path; do
+  if [ "$got" = path ]; then
+    printf '#!/bin/sh\necho "cargo-oxide v0.2.1 (/src/cuda-oxide/crates/cargo-oxide):"\n' > "$tmp/oxbin/cargo"
+  else
+    printf '#!/bin/sh\necho "cargo-oxide v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=x#%s):"\n' "$got" > "$tmp/oxbin/cargo"
+  fi
+  chmod +x "$tmp/oxbin/cargo"
+  if [ "$got" = "${PIN:0:8}" ]; then
+    run "box.sh: the pinned cargo-oxide passes the check" 0 '^ran$' env PATH="$tmp/oxbin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
+  else
+    run "box.sh: a cargo-oxide from $got is refused by name" 70 "installed cargo-oxide is from rev .*not the pin $PIN" \
+      env PATH="$tmp/oxbin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
+  fi
+done
 rc_is 'box.sh: BLOOMERY_BOX_WAIT and BLOOMERY_HOLD_OWNER reach the guard' 0 box env BLOOMERY_BOX_WAIT=0 BLOOMERY_HOLD_OWNER=03 "$B/tools/box.sh" true
 sshlog 'box.sh: lease_guard 0 03' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 0 03 \) && source '
 rc_is 'box.sh: a read-only command runs' 0 box env BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'ps -e | wc -l'
@@ -893,8 +927,12 @@ else
   unreached 'box.sh: local mode reaches no ssh and no rsync'
   if [ -d "$L" ]; then pass 'box.sh: local mode made its lock directory'; else fail 'box.sh: local mode made its lock directory' "no $L"; fi
   printf 'export CUDA_OXIDE_BACKEND=/x/backend.so\n' > "$tmp/oxide-env.sh"
+  # A cargo oxide command still takes the installed cargo-oxide check in local mode: a stub cargo at the pin passes it.
+  mkdir -p "$tmp/oxpin"
+  printf '#!/bin/sh\necho "cargo-oxide v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=x#%s):"\n' "${PIN:0:8}" > "$tmp/oxpin/cargo"
+  chmod +x "$tmp/oxpin/cargo"
   run 'box.sh: local mode unsets the environment file'"'"'s CUDA_OXIDE_BACKEND and adds no backend check to cargo oxide' 0 'oxide=unset data=' \
-    boxl BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
+    boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
   printf 'export BLOOMERY_LOCK_DIR=%s/elsewhere\n' "$tmp" > "$tmp/lockdir-env.sh"
   run "box.sh: local mode refuses an environment file that moves the lock directory after the guard" 64 \
     'the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode.s guard probed the lock directory' \
