@@ -84,7 +84,7 @@ unsafe extern "C" {
 /// torch's exact GELU on one f32, in its op order: `x · 0.5 · (1 + erf(x · √½))`, every op
 /// rounded on its own (the explicit `_rn` forms are never contracted).
 #[inline(always)]
-fn gelu_erf_dev(x: f32) -> f32 {
+pub(crate) fn gelu_erf_dev(x: f32) -> f32 {
     // SAFETY: `__nv_erff` is a pure libdevice function defined for every f32.
     let e = unsafe { __nv_erff(mul_rn_f32(x, SQRT1_2)) };
     mul_rn_f32(mul_rn_f32(x, 0.5), add_rn_f32(1.0, e))
