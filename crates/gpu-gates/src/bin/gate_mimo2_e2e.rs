@@ -338,22 +338,26 @@ mod gate {
         );
         let blocks = body.blocks();
         let card_layers = blocks.iter().filter(|(_, card)| *card).count();
-        let counted = step_launches(&blocks);
+        // The pins are the q8_0 dense block's; a K-quant block's extra launches are the plan's.
+        let block_extra: usize = body.block_plans().iter().map(|p| p.extra_launches()).sum();
+        let want = NODES_DECODE + block_extra;
+        let counted = step_launches(&blocks) + block_extra;
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
         let nodes = k + b + other;
-        let derived = NODES_HOST + CARD_LAUNCHES * card_layers;
-        let pass = nodes == NODES_DECODE
-            && derived == NODES_DECODE
-            && counted == NODES_DECODE
+        let derived = NODES_HOST + block_extra + CARD_LAUNCHES * card_layers;
+        let pass = nodes == want
+            && derived == want
+            && counted == want
             && b == MEMOPS
-            && k == NODES_DECODE - MEMOPS
+            && k == want - MEMOPS
             && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {NODES_DECODE} = {NODES_HOST} + \
-             {CARD_LAUNCHES} · {card_layers} layers with card experts; the program counts \
-             {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) other={other} {}",
+            "structure decode graph_nodes={nodes} (want {want} = {NODES_HOST} + {block_extra} \
+             block launches + {CARD_LAUNCHES} · {card_layers} layers with card experts; the \
+             program counts {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) \
+             other={other} {}",
             verdict(pass)
         );
         Ok(ok && card_ok && args_ok && pass)
