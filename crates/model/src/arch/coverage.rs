@@ -565,6 +565,19 @@ struct TypePin {
     reads: &'static [GgmlType],
 }
 
+/// The types a gated block's matrices read: the q8_0 pair, or K-quants
+/// (`gpu-deepseek41/src/block.rs` `BLOCK_TYPES`, each a launch of
+/// `gpu/src/site.rs` or the fused K-quant gate·up).
+// PIN(2026-10-11): widened from `[Q8_0]` with the gated block's type dispatch;
+// derivation: each type is read by `site::kgemv` or the fused K-quant gate·up
+// in `enqueue_block`, at the decode site.
+const GATED_BLOCK: &[GgmlType] = &[
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+];
+
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
 /// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
@@ -755,8 +768,8 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::DenseFfn,
         matrices: true,
         names: None,
-        what: "dense block (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "dense block (the body reads q8_0, q4_K, q5_K and q6_K)",
+        reads: GATED_BLOCK,
     },
     TypePin {
         program: Program::Mimo2Body,
@@ -1920,6 +1933,34 @@ mod tests {
                     .to_string()
             )]
         );
+    }
+
+    /// The mimo2 dense block's pin reads the gated block's types (q8_0 and
+    /// the K-quants `enqueue_block` dispatches); any other type is an item
+    /// naming the type.
+    // PIN(2026-10-11): q4_K, q5_K and q6_K joined the dense pin's set (it was
+    // q8_0 alone) with the gated block's type dispatch; derivation: see
+    // `GATED_BLOCK`.
+    #[test]
+    fn the_mimo2_dense_pin_reads_the_gated_blocks_types() {
+        let text = "dense block (the body reads q8_0, q4_K, q5_K and q6_K)";
+        let of = |ty: GgmlType| {
+            items(
+                Program::Mimo2Body,
+                &matrix("ffn_gate.weight", Role::DenseFfn, ty),
+            )
+        };
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+        ] {
+            assert_eq!(of(ty), Vec::<String>::new(), "{ty}");
+        }
+        for ty in [GgmlType::Q3_K, GgmlType::IQ4_XS, GgmlType::F16] {
+            assert_eq!(of(ty), [format!("{ty} {text}")], "{ty}");
+        }
     }
 
     /// The glm5next and mimo2 embedding pins read the set the host row
