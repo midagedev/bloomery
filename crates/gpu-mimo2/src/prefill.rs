@@ -62,7 +62,7 @@ use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
-use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block_cols};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, enqueue_block_cols};
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
@@ -518,14 +518,16 @@ impl Body {
             .map_err(|r| shape(r.to_string()))
     }
 
-    /// Refused by name for a load whose dense block is not q8_0: the batch feed's dense block runs over
-    /// columns, which only the q8_0 block does
-    /// ([`bloomery_gpu_deepseek41::block::BlockPlan::check_cols`]); such a file feeds by steps.
+    /// Refused by name for a load whose dense block is not q8_0: the batch feed's dense block holds no K-quant
+    /// scratch, so such a file feeds by steps.
     fn refuse_k_quant_dense(&self) -> Result<(), GpuError> {
         for (l, c) in self.cfg.iter().enumerate() {
-            if let Some(plan) = c.block {
-                plan.check_cols(WHAT, l)
-                    .map_err(|e| shape(format!("{e}; this file feeds by steps")))?;
+            if let Some(plan) = c.block.filter(|p| !p.is_q8()) {
+                let [gate, up, down] = plan.types();
+                return Err(shape(format!(
+                    "layer {l}'s dense block is gate {gate}, up {up}, down {down}: the batch feed's \
+                     dense block holds no K-quant scratch; this file feeds by steps"
+                )));
             }
         }
         Ok(())
@@ -904,7 +906,11 @@ impl PromptProgram<'_> {
                 h: &mut b.h,
                 y: &mut out,
             };
-            enqueue_block_cols(gpu, w, &self.k.experts, &blk, cn, io)?;
+            let kernels = BlockKernels {
+                experts: &self.k.experts,
+                kquant: self.k.block.as_ref(),
+            };
+            enqueue_block_cols(gpu, w, &kernels, &mut None, &blk, cn, io)?;
         }
         gpu.elem()
             .enqueue_add(stream, &ub.x1, &b.out, t * d.embd, &mut ub.x)

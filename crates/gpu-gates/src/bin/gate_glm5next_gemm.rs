@@ -62,19 +62,20 @@ mod glm5next_tier;
 mod gate {
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu_deepseek41::block::{Block, BlockPlan};
     use bloomery_gpu_gates::gemm32::{HostAct, dot32, host_act};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::T_MAX;
     use bloomery_gpu_glm5next::gemm::{
-        DenseNames, FrontShape, FrontStats, GemmFront, KdaInNames, KdaInRows, LatentInRows,
+        FrontShape, FrontStats, GemmFront, KdaInNames, KdaInRows, LatentInRows,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::FrontWidths;
+    use model::arch::glm5next::place::{DenseForms, FrontWidths};
 
     use crate::glm5next_tier;
 
@@ -557,20 +558,14 @@ mod gate {
         let xn_d = DeviceBuffer::from_host(stream, &xn)?;
         let mut y = nan_buf(stream, m * down.rows)?;
         let before = front.stats();
-        front.dense_ffn(
-            gpu,
-            w,
-            l,
-            m,
-            &xn_d,
-            DenseNames {
-                gate: &gate_n,
-                up: &up_n,
-                down: &down_n,
-            },
+        let blk = Block {
+            plan: BlockPlan::Q8,
+            names: [&gate_n, &up_n, &down_n],
+            ff: fw.ff,
             limit,
-            &mut y,
-        )?;
+            layer: l,
+        };
+        front.dense_ffn(gpu, w, m, &xn_d, &blk, &mut y)?;
         let d = delta(before, front.stats());
         stream.synchronize()?;
         if let Some(f) = gpu.fault()? {
@@ -654,20 +649,19 @@ mod gate {
         )?;
         let xn = nan_buf(stream, s.widths.embd)?;
         let mut y1 = nan_buf(stream, s.widths.embd)?;
-        let r = bare.dense_ffn(
-            gpu,
-            w,
-            LEAD,
-            1,
-            &xn,
-            DenseNames {
-                gate: &names::ffn_gate(LEAD),
-                up: &names::ffn_up(LEAD),
-                down: &names::ffn_down(LEAD),
-            },
-            0.0,
-            &mut y1,
+        let (gate_n, up_n, down_n) = (
+            names::ffn_gate(LEAD),
+            names::ffn_up(LEAD),
+            names::ffn_down(LEAD),
         );
+        let blk = Block {
+            plan: BlockPlan::Q8,
+            names: [&gate_n, &up_n, &down_n],
+            ff: s.widths.ff,
+            limit: 0.0,
+            layer: LEAD,
+        };
+        let r = bare.dense_ffn(gpu, w, 1, &xn, &blk, &mut y1);
         pass &= case("no dense width", "on a front sized for none", r);
         pass &= line(
             "g3 refuse launches no dense width",
@@ -708,6 +702,7 @@ mod gate {
                 q: rows_of(&names::attn_q_b(LATENT))?,
                 heads_v: k_of(&names::attn_output(LATENT))?,
                 ff: k_of(&names::ffn_down(LEAD))?,
+                forms: DenseForms::Q8_0,
             },
         };
         let mut front = GemmFront::open(&gpu, shape)?;
