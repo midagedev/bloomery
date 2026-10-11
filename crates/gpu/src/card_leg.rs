@@ -611,6 +611,8 @@ mod tests {
     use crate::q4k_sel::QuantSel;
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
+    use model::placement::CardFormat;
+    use runtime::words::stream_words;
 
     /// The normed width: the gate·up stacks' K (eight super-blocks).
     const N: usize = 2048;
@@ -630,6 +632,13 @@ mod tests {
     const SEL: [u32; CAP * SPC] = [
         0, 1, 2, 3, 0, 1, HOST, 2, 3, 3, 1, 0, HOST, 2, 1, 0, 2, HOST, 0, 1, 3, 2, 1, 0,
     ];
+    /// The shape of the small tests' buffers.
+    const SHAPE: LegShape = LegShape {
+        cap: CAP,
+        slots_per_col: SPC,
+        n: N,
+        ff: FF,
+    };
 
     /// Next value of a xorshift64 stream.
     fn next(state: &mut u64) -> u64 {
@@ -639,19 +648,31 @@ mod tests {
         *state
     }
 
-    /// `rows` rows of `k` values of `ty` (Q4_K or Q5_K) in the file's block
-    /// bytes: every byte random but each block's two f16 scales, which are
-    /// finite and small, so no dot is NaN.
+    /// `rows` rows of `k` values of `ty` in the file's block bytes: every
+    /// byte random but each block's scales, which are finite and small, so no
+    /// dot is NaN or infinite — the f16 `d` (and `dmin` of Q4_K and Q5_K, `m`
+    /// of Q5_1) or MXFP4's E8M0 byte. Every other byte of these types is a
+    /// valid code, so any draw is a valid block.
     fn stack_bytes(ty: GgmlType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
-        let block = usize::try_from(ty.type_size().expect("a K-quant block")).expect("a size");
+        let block = usize::try_from(ty.type_size().expect("a block size")).expect("a size");
+        let width = usize::try_from(ty.blck_size().expect("a block width")).expect("a width");
+        let f16s = if matches!(ty, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_1) {
+            2
+        } else {
+            1
+        };
         let mut state = seed;
-        let mut out = vec![0u8; rows * (k / 256) * block];
+        let mut out = vec![0u8; rows * (k / width) * block];
         for b in out.chunks_exact_mut(block) {
             for chunk in b.chunks_mut(8) {
                 let v = next(&mut state).to_le_bytes();
                 chunk.copy_from_slice(&v[..chunk.len()]);
             }
-            for scale in b[..4].chunks_mut(2) {
+            if ty == GgmlType::MXFP4 {
+                b[0] = 118 + u8::try_from(next(&mut state) % 4).expect("a byte");
+                continue;
+            }
+            for scale in b[..2 * f16s].chunks_mut(2) {
                 let (exp, mant) = (5 + next(&mut state) % 4, next(&mut state) & 0x3ff);
                 let half = u16::try_from(exp << 10 | mant).expect("an f16");
                 scale.copy_from_slice(&half.to_le_bytes());
@@ -660,22 +681,66 @@ mod tests {
         out
     }
 
-    /// A file of the six stacks `<role>_<ty>` — gate and up `N_CARD · FF`
-    /// rows of `N`, the down `N_CARD · N` rows of `FF` — resident in a
-    /// [`Weights`].
-    fn weights(gpu: &Gpu, tys: [GgmlType; 2]) -> Weights {
+    /// The little-endian words of a byte stream of `rows` rows as the card
+    /// holds it (`runtime::words::stream_words`: zero-padded to whole words a
+    /// row).
+    fn words_of(bytes: &[u8], rows: usize) -> Vec<u32> {
+        let total = stream_words(bytes.len() as u64, rows as u64).expect("a stack of rows");
+        let mut w = vec![0u32; usize::try_from(total).expect("a word count")];
+        for (word, c) in w.iter_mut().zip(bytes.chunks(4)) {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            *word = u32::from_le_bytes(b);
+        }
+        w
+    }
+
+    /// The loader keeps a tensor of `ty` as the file's rows.
+    fn loads_as_file_rows(ty: GgmlType) -> bool {
+        CardFormat::of(ty) == Some(CardFormat::KQuant)
+    }
+
+    /// The resident name of the `role` stack of `ty` that [`weights`] files:
+    /// the file's own tensor for the types the loader keeps as the file's
+    /// rows, a derived weight for the rest.
+    fn stack_name(role: &str, ty: GgmlType) -> String {
+        if loads_as_file_rows(ty) {
+            format!("{role}_{ty}")
+        } else {
+            format!("derived.{role}_{ty}")
+        }
+    }
+
+    /// The stacks `<role>_<ty>` of each type in `tys`, one for each role the
+    /// leg runs the type in — gate and up `N_CARD · ff` rows of `n`, the down
+    /// `N_CARD · n` rows of `ff` — resident in a [`Weights`] as
+    /// `DevWeight::KQuant`, named by [`stack_name`]. The types the loader
+    /// keeps as the file's rows (Q4_K, Q5_K) come through a file written for
+    /// them, so `tys` holds one; the other types' rows are the same word
+    /// stream, filed as derived weights.
+    fn weights(gpu: &Gpu, shape: LegShape, tys: &[GgmlType]) -> Weights {
+        let LegShape { n, ff, .. } = shape;
         let mut decls = Vec::new();
         let mut data = Vec::new();
-        for (i, ty) in tys.into_iter().enumerate() {
-            for (role, rows, k) in [
-                ("gate", N_CARD * FF, N),
-                ("up", N_CARD * FF, N),
-                ("down", N_CARD * N, FF),
+        let mut derived = Vec::new();
+        for (i, &ty) in tys.iter().enumerate() {
+            for (role, rows, k, runs) in [
+                ("gate", N_CARD * ff, n, kernels::card_gate_up_runs(ty)),
+                ("up", N_CARD * ff, n, kernels::card_gate_up_runs(ty)),
+                ("down", N_CARD * n, ff, kernels::card_down_runs(ty)),
             ] {
+                if !runs {
+                    continue;
+                }
                 let seed = 0x9e37_79b9_7f4a_7c15 ^ ((i as u64) << 8 | role.len() as u64);
                 let bytes = stack_bytes(ty, rows, k, seed);
+                let name = stack_name(role, ty);
+                if !loads_as_file_rows(ty) {
+                    derived.push((name, ty, rows, k, bytes));
+                    continue;
+                }
                 decls.push(TensorDecl {
-                    name: format!("{role}_{ty}"),
+                    name,
                     dims: vec![k as u64, rows as u64],
                     type_id: ty.as_u32(),
                     nbytes: bytes.len() as u64,
@@ -699,8 +764,16 @@ mod tests {
         }
         w.finish().expect("a finished file");
         let split = Split::open(&path).expect("the file opens");
-        let weights = Weights::load_where(gpu.stream(), &split, |_| true).expect("resident");
+        let mut weights = Weights::load_where(gpu.stream(), &split, |_| true).expect("resident");
         let _ = std::fs::remove_dir_all(&dir);
+        for (name, ty, rows, k, bytes) in derived {
+            let words = words_of(&bytes, rows);
+            let w = DeviceTensor::upload(gpu.stream(), &words, rows, words.len() / rows)
+                .expect("the stack's words");
+            weights
+                .insert_derived(name, DevWeight::KQuant { ty, w, k })
+                .expect("a free derived name");
+        }
         weights
     }
 
@@ -727,18 +800,13 @@ mod tests {
         let leg = CardLeg::load(&gpu).expect("the leg");
         let kq = KquantKernels::load(gpu.context(), gpu.fault_word()).expect("the kquant module");
         let tys = [GgmlType::Q4_K, GgmlType::Q5_K];
-        let w = weights(&gpu, tys);
+        let w = weights(&gpu, SHAPE, &tys);
         let host_normed: Vec<f32> = (0..CAP * N)
             .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
             .collect();
         let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
         let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
-        let shape = LegShape {
-            cap: CAP,
-            slots_per_col: SPC,
-            n: N,
-            ff: FF,
-        };
+        let shape = SHAPE;
         let rule = Act::SiluMul;
         for ty in tys {
             let names = [
@@ -854,18 +922,278 @@ mod tests {
             }
         }
     }
+
+    /// Tokens the wide test's buffers hold: more than a warp's 32 columns.
+    const WIDE_CAP: usize = 40;
+    /// The wide test's normed width: ten super-blocks, so the last group of
+    /// four in each column's q8_1 planes is partial.
+    const WIDE_N: usize = 2560;
+    /// The wide test's routed width: five super-blocks and forty 32-value
+    /// blocks, a partial last group in both forms of the down's activation.
+    const WIDE_FF: usize = 1280;
+    /// The shape of the wide test's buffers.
+    const WIDE_SHAPE: LegShape = LegShape {
+        cap: WIDE_CAP,
+        slots_per_col: SPC,
+        n: WIDE_N,
+        ff: WIDE_FF,
+    };
+    /// The tokens of the wide test's runs: one, one past a group of eight
+    /// columns, and the buffers' cap.
+    const WIDE_RUNS: [usize; 3] = [1, 9, WIDE_CAP];
+    /// The wide test's cases, `(gate·up type, down type)`: the six types of
+    /// `kernels::card_gate_up_runs` each as a gate·up beside a down of its own
+    /// type, then the three 32-value downs (`kernels::card_down_runs`) beside
+    /// a gate·up that ran before.
+    const WIDE_CASES: [(GgmlType, GgmlType); 9] = [
+        (GgmlType::Q4_K, GgmlType::Q4_K),
+        (GgmlType::Q5_K, GgmlType::Q5_K),
+        (GgmlType::MXFP4, GgmlType::MXFP4),
+        (GgmlType::IQ2_XS, GgmlType::IQ2_XS),
+        (GgmlType::IQ3_XXS, GgmlType::IQ3_XXS),
+        (GgmlType::IQ4_XS, GgmlType::IQ4_XS),
+        (GgmlType::Q4_K, GgmlType::Q5_1),
+        (GgmlType::Q5_K, GgmlType::Q8_0),
+        (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
+    ];
+
+    /// Token `t`'s normed row: a function of `t` alone, so a column holds the
+    /// same values at every `m`.
+    fn wide_row(t: usize) -> Vec<f32> {
+        let mut state = (t as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (0..WIDE_N)
+            .map(|_| ((next(&mut state) >> 33) % 2001) as f32 / 1000.0 - 1.0)
+            .collect()
+    }
+
+    /// Token `t`'s places, a function of `t` alone: slot `j` serves expert
+    /// `(j + t) % N_CARD`, but the slot `(3t + 1) % SPC`, which the card does
+    /// not serve. A run of any `m` therefore mixes duplicates (seven expert
+    /// slots of four experts a token), every card expert and host slots.
+    fn wide_places(t: usize) -> [u32; SPC] {
+        std::array::from_fn(|j| {
+            if j == (3 * t + 1) % SPC {
+                HOST
+            } else {
+                ((j + t) % N_CARD) as u32
+            }
+        })
+    }
+
+    /// `sel` repeats a card expert, names every card expert, and holds a slot
+    /// the card does not serve.
+    fn mixes(sel: &[u32]) -> bool {
+        let mut seen = [0usize; N_CARD];
+        for &place in sel {
+            if let Some(count) = seen.get_mut(place as usize) {
+                *count += 1;
+            }
+        }
+        seen.iter().all(|&c| c > 0) && seen.iter().any(|&c| c > 1) && sel.contains(&HOST)
+    }
+
+    /// What a run's rows of one slot must hold: a host slot's are the
+    /// sentinel, a card slot's are finite, not the sentinel and not all zero.
+    fn slot_state(rows: &[f32], place: u32) -> Result<(), &'static str> {
+        if place == HOST {
+            if rows.iter().all(|v| *v == SENT) {
+                return Ok(());
+            }
+            return Err("a host slot was written");
+        }
+        if !rows.iter().all(|v| v.is_finite() && *v != SENT) {
+            return Err("a card slot holds no finite row the run wrote");
+        }
+        if rows.iter().all(|v| *v == 0.0) {
+            return Err("a card slot's rows are all zero");
+        }
+        Ok(())
+    }
+
+    /// The down rows of a run of the first `m` tokens of `normed` against
+    /// `sel` in `bufs`, filled with the sentinel before it, synchronized and
+    /// fault-free.
+    fn leg_rows(
+        gpu: &Gpu,
+        leg: &CardLeg,
+        bufs: &mut LegBufs,
+        stacks: &LegStacks<'_>,
+        normed: &DeviceBuffer<f32>,
+        sel: &DeviceBuffer<u32>,
+        m: usize,
+    ) -> Vec<f32> {
+        let stream = gpu.stream();
+        let LegShape {
+            cap,
+            slots_per_col,
+            n,
+            ..
+        } = bufs.shape();
+        bufs.down
+            .copy_from_host(stream, &vec![SENT; cap * slots_per_col * n])
+            .expect("the sentinel");
+        let run = LegRun {
+            layer: 0,
+            stacks,
+            normed,
+            m,
+            sel,
+            n_card: N_CARD,
+            rule: Act::SiluMul,
+        };
+        leg.enqueue(gpu, bufs, &run, None)
+            .unwrap_or_else(|e| panic!("a run of {m} tokens: the leg: {e}"));
+        let rows = bufs.down.to_host_vec(stream).expect("the leg's rows");
+        assert!(
+            gpu.take_fault().expect("the fault word").is_none(),
+            "a run of {m} tokens raised a fault"
+        );
+        rows
+    }
+
+    /// A slot's rows are what a one-token run writes for it, whatever `m`
+    /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
+    /// [`kernels::card_down_runs`] admit, in nine cases (`WIDE_CASES`). Runs of
+    /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
+    /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a
+    /// warp's 32, are read through the leg's own quantize steps and buffers;
+    /// the places and rows are functions of the token, so the same token holds
+    /// the same slots in every run. The oracle is the leg's own run of that one
+    /// token in buffers of one token. Each card slot's rows must equal its
+    /// oracle's bit for bit, a host slot must keep its sentinel, and nothing
+    /// past the run's slots may be written. Every case and `m` is judged, and
+    /// the failures are listed together, each naming the slot and its column.
+    ///
+    /// The K-quant test above holds the leg's Q4_K and Q5_K arms to the launches
+    /// the table names at one `m`; this one holds each arm's slots to the
+    /// one-token run across `m`.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_leg_writes_each_slots_one_token_rows_at_any_m() {
+        let ids = |tys: Vec<GgmlType>| {
+            let mut ids: Vec<u32> = tys.into_iter().map(GgmlType::as_u32).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let admitted = |runs: fn(GgmlType) -> bool| {
+            ids((0..64)
+                .map(GgmlType::from_u32)
+                .filter(|&ty| runs(ty))
+                .collect())
+        };
+        assert_eq!(
+            ids(WIDE_CASES.iter().map(|c| c.0).collect()),
+            admitted(kernels::card_gate_up_runs),
+            "the cases' gate·up types are not the types the leg admits"
+        );
+        assert_eq!(
+            ids(WIDE_CASES.iter().map(|c| c.1).collect()),
+            admitted(kernels::card_down_runs),
+            "the cases' down types are not the types the leg admits"
+        );
+        let sel_all: Vec<u32> = (0..WIDE_CAP).flat_map(wide_places).collect();
+        for m in WIDE_RUNS {
+            assert!(
+                mixes(&sel_all[..m * SPC]),
+                "the places of {m} tokens must mix duplicates, every card expert and host slots"
+            );
+        }
+
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let mut tys: Vec<GgmlType> = WIDE_CASES.iter().flat_map(|&(g, d)| [g, d]).collect();
+        tys.sort_by_key(|ty| ty.as_u32());
+        tys.dedup();
+        let w = weights(&gpu, WIDE_SHAPE, &tys);
+        let host_normed: Vec<f32> = (0..WIDE_CAP).flat_map(wide_row).collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
+        let one = LegShape {
+            cap: 1,
+            ..WIDE_SHAPE
+        };
+
+        let mut failures = Vec::new();
+        for (gu, dn) in WIDE_CASES {
+            let names = [
+                stack_name("gate", gu),
+                stack_name("up", gu),
+                stack_name("down", dn),
+            ];
+            let stacks = LegStacks::of(&w, [&names[0], &names[1], &names[2]]).expect("the stacks");
+            stacks.check(N_CARD, WIDE_SHAPE).expect("the stacks' shape");
+            let form = kernels::down(dn).expect("the down's entry").1;
+            let mut one_bufs = LegBufs::for_down(stream, one, form).expect("one token's buffers");
+            let oracle: Vec<Vec<f32>> = (0..WIDE_CAP)
+                .map(|t| {
+                    let row = DeviceBuffer::from_host(stream, &wide_row(t)).expect("a normed row");
+                    let places = wide_places(t);
+                    let sel_t = DeviceBuffer::from_host(stream, &places).expect("a token's places");
+                    let rows = leg_rows(&gpu, &leg, &mut one_bufs, &stacks, &row, &sel_t, 1);
+                    for (j, &place) in places.iter().enumerate() {
+                        if let Err(why) = slot_state(&rows[j * WIDE_N..(j + 1) * WIDE_N], place) {
+                            panic!("{gu}/{dn}: the one-token run of token {t}, slot {j}: {why}");
+                        }
+                    }
+                    rows
+                })
+                .collect();
+
+            for m in WIDE_RUNS {
+                let mut bufs = LegBufs::for_down(stream, WIDE_SHAPE, form).expect("the buffers");
+                let got = leg_rows(&gpu, &leg, &mut bufs, &stacks, &normed, &sel, m);
+                let slots = m * SPC;
+                let mut bad = Vec::new();
+                for (s, &place) in sel_all[..slots].iter().enumerate() {
+                    let (token, j) = (s / SPC, s % SPC);
+                    let got_rows = &got[s * WIDE_N..(s + 1) * WIDE_N];
+                    let want_rows = &oracle[token][j * WIDE_N..(j + 1) * WIDE_N];
+                    let first_diff = (0..WIDE_N)
+                        .find(|&r| got_rows[r].to_bits() != want_rows[r].to_bits())
+                        .map(|r| {
+                            format!(
+                                "row {r}: {:#010x}, the one-token run's {:#010x}",
+                                got_rows[r].to_bits(),
+                                want_rows[r].to_bits()
+                            )
+                        });
+                    let why = match slot_state(got_rows, place) {
+                        Err(why) => Some(why.to_string()),
+                        Ok(()) => first_diff,
+                    };
+                    if let Some(why) = why {
+                        let at = match place {
+                            HOST => "host".to_string(),
+                            expert => format!("expert {expert}"),
+                        };
+                        bad.push(format!("slot {s} (column {token}, {at}): {why}"));
+                    }
+                }
+                if got[slots * WIDE_N..].iter().any(|v| *v != SENT) {
+                    bad.push("the run wrote past its slots".to_string());
+                }
+                let verdict = if bad.is_empty() { "ok" } else { "FAIL" };
+                println!("leg_wide[gate·up {gu}, down {dn}, m = {m}] {verdict}");
+                if let Some(first) = bad.first() {
+                    failures.push(format!(
+                        "gate·up {gu}, down {dn}, m = {m}: {} of {slots} slots; first: {first}",
+                        bad.len()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     /// The buffers of each activation form hold the bytes [`leg_bytes_for`]
     /// counts for their shape.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_the_buffers_hold_the_counted_bytes_of_each_form() {
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
-        let shape = LegShape {
-            cap: CAP,
-            slots_per_col: SPC,
-            n: N,
-            ff: FF,
-        };
+        let shape = SHAPE;
         for form in [DownAct::Q8Act, DownAct::Q8Blocks32] {
             let bufs = LegBufs::for_down(gpu.stream(), shape, form).expect("the buffers");
             assert_eq!(bufs.bytes(), leg_bytes_for(shape, form), "{form:?}");
@@ -886,7 +1214,7 @@ mod tests {
         let stream = gpu.stream();
         let leg = CardLeg::load(&gpu).expect("the leg");
         let ty = GgmlType::Q4_K;
-        let w = weights(&gpu, [ty, GgmlType::Q5_K]);
+        let w = weights(&gpu, SHAPE, &[ty, GgmlType::Q5_K]);
         let names = [
             format!("gate_{ty}"),
             format!("up_{ty}"),
@@ -898,12 +1226,7 @@ mod tests {
             .collect();
         let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
         let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
-        let shape = LegShape {
-            cap: CAP,
-            slots_per_col: SPC,
-            n: N,
-            ff: FF,
-        };
+        let shape = SHAPE;
         let run = LegRun {
             layer: 0,
             stacks: &stacks,
