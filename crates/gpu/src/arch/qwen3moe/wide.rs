@@ -45,11 +45,12 @@ use crate::flash_gqa::{HEAD_256, partials_ms_len, partials_v_len, partials_v_len
 use crate::gated_quant::GateLayout;
 use crate::gemm::{GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, GemmAct, GemmAct32, GemmInput, GemmRoute};
 use crate::hybrid::HOST;
+use crate::kquant::Act;
 use crate::linear::{self, LinearShape};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
-use crate::site::{self, WideIn, WideKernels};
+use crate::site::{self, Gated, GatedIo, SwigluRows, WideIn, WideKernels};
 use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -122,6 +123,16 @@ impl Acts {
             q128: self.q128.as_ref(),
             q32: self.q32.as_ref(),
             f32: Some(f32),
+        }
+    }
+
+    /// The forms a gated block's SwiGLU writes beside the f32 rows `f32`, if
+    /// its down reads them.
+    fn swiglu_rows<'a>(&'a mut self, f32: Option<&'a mut DeviceBuffer<f32>>) -> SwigluRows<'a> {
+        SwigluRows {
+            q128: self.q128.as_mut(),
+            q32: self.q32.as_mut(),
+            f32,
         }
     }
 }
@@ -398,11 +409,24 @@ fn gemm(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let k = WideKernels {
+    site::gemm(
+        c.gpu,
+        &wide_kernels(c)?,
+        (ty, c.w, name),
+        rows,
+        x,
+        (route, input),
+        m,
+        y,
+    )
+}
+
+/// The GEMM kernels a wide site launches.
+fn wide_kernels<'a>(c: &'a Ctx<'_>) -> Result<WideKernels<'a>, GpuError> {
+    Ok(WideKernels {
         gemm: &c.k.gemm,
         g32: &c.k.q35(WHAT)?.g32,
-    };
-    site::gemm(c.gpu, &k, (ty, c.w, name), rows, x, (route, input), m, y)
+    })
 }
 
 /// The one-expert table of a unit of `m` rows: `m` slots on expert 0, slot
@@ -932,19 +956,25 @@ pub(super) fn ffn_card(
         let list = (&*table, GemmInput::Shared { top_k: slots });
         slots_gemm(c, n, &d, list, &hid, rows, m)?;
     }
-    let one = (&*dense, GemmInput::PerSlot);
-    gemm(c, (sh.gate_ty, &sh.gate), d.ff, &hid, one, m, g)?;
-    gemm(c, (sh.up_ty, &sh.up), d.ff, &hid, one, m, u)?;
-    swiglu_into(c, sh.down_ty, (g, u), (m, d.ff), (sh_act, Some(sh_h)))?;
-    gemm(
-        c,
-        (sh.down_ty, &sh.down),
-        d.hidden,
-        &sh_act.input(sh_h),
-        one,
-        m,
-        sh_y,
-    )
+    let shared = Gated {
+        w: c.w,
+        route: dense,
+        gate: (sh.gate_ty, &sh.gate),
+        up: (sh.up_ty, &sh.up),
+        down: (sh.down_ty, &sh.down),
+        ff: d.ff,
+        hidden: d.hidden,
+        rule: Act::SiluMul,
+        input: GemmInput::PerSlot,
+    };
+    let io = GatedIo {
+        x: &hid,
+        gate: g,
+        up: u,
+        rows: sh_act.swiglu_rows(Some(sh_h)),
+        y: sh_y,
+    };
+    site::gated(gpu, &wide_kernels(c)?, &shared, (m, m), io, c.sink)
 }
 
 /// What the combine of a layer split between the card and a host tier reads
@@ -1027,8 +1057,8 @@ pub(super) fn ffn_combine(
     )
 }
 
-/// The slots' half of the FFN at `m` rows: the gate and up GEMMs over
-/// `table` (each slot's column of `hid` as its input picks it), their
+/// The slots' half of the FFN at `m` rows: the gated block over `table`
+/// (each slot's column of `hid` as its input picks it) — gate and up, their
 /// SwiGLU into the form the down's type reads, and the down over the same
 /// table, slot by slot, into `down` — the `m · d.slots()` slots' SwiGLU
 /// forms, gate (`h`), up and down rows. A slot the table lists in no tile
@@ -1047,67 +1077,32 @@ fn slots_gemm(
     ),
     m: usize,
 ) -> Result<(), GpuError> {
-    let n_slots = m * d.slots();
-    gemm(c, (n.gate_ty, &n.gate), d.ff, hid, (table, input), m, h)?;
-    gemm(c, (n.up_ty, &n.up), d.ff, hid, (table, input), m, up)?;
-    swiglu_into(c, n.down_ty, (h, up), (n_slots, d.ff), (act_h, None))?;
-    gemm(
-        c,
-        (n.down_ty, &n.down),
-        d.hidden,
-        &act_h.input(h),
-        (table, GemmInput::PerSlot),
-        n_slots,
-        down,
+    let slots = Gated {
+        w: c.w,
+        route: table,
+        gate: (n.gate_ty, &n.gate),
+        up: (n.up_ty, &n.up),
+        down: (n.down_ty, &n.down),
+        ff: d.ff,
+        hidden: d.hidden,
+        rule: Act::SiluMul,
+        input,
+    };
+    let io = GatedIo {
+        x: hid,
+        gate: h,
+        up,
+        rows: act_h.swiglu_rows(None),
+        y: down,
+    };
+    site::gated(
+        c.gpu,
+        &wide_kernels(c)?,
+        &slots,
+        (m, m * d.slots()),
+        io,
+        c.sink,
     )
-}
-
-/// `silu(gate) · up` over `cols` columns of `ff` values into the form a
-/// down of type `ty` reads: its q8_1 blocks of 128 or q8 blocks of 32 in
-/// `acts` (one launch with the quantizer), or for an F32 down the f32 rows
-/// `rows`, which a routed down does not have (`None`: refused by name, as
-/// the load refuses an F32 routed down).
-fn swiglu_into(
-    c: &Ctx<'_>,
-    ty: SiteTy,
-    (gate, up): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
-    (cols, ff): (usize, usize),
-    (acts, rows): (&mut Acts, Option<&mut DeviceBuffer<f32>>),
-) -> Result<(), GpuError> {
-    const WHAT_S: &str = "qwen3moe::wide::swiglu_into";
-    let stream = c.gpu.stream();
-    match ty.reads() {
-        Form::Q8x128 => {
-            let a = acts.q128.as_mut().ok_or(GpuError::state(
-                WHAT_S,
-                "the wide part's q8_1 blocks of the SwiGLU rows",
-            ))?;
-            c.k.gemm
-                .enqueue_swiglu_quant(stream, gate, up, cols, a, c.sink)
-        }
-        Form::Q8x32 => {
-            let a = acts.q32.as_mut().ok_or(GpuError::state(
-                WHAT_S,
-                "the wide part's q8 blocks of the SwiGLU rows",
-            ))?;
-            c.k.q35(WHAT_S)?
-                .g32
-                .enqueue_swiglu_quant32(stream, gate, up, cols, a, c.sink)
-        }
-        Form::F32 => {
-            let y = rows.ok_or_else(|| {
-                GpuError::shape(
-                    WHAT_S,
-                    format!(
-                        "layer {}: an F32 routed down, which the load refuses (no SwiGLU writes \
-                         its rows)",
-                        c.layer
-                    ),
-                )
-            })?;
-            c.gpu.elem().enqueue_swiglu(stream, gate, up, cols * ff, y)
-        }
-    }
 }
 
 impl GpuModel<Body35> {
