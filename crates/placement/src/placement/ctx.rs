@@ -1,15 +1,16 @@
 //! The serving seats' shared `--ctx` rules: the bisection the seats'
 //! searches run ([`largest`]), the expert-margin guard that bounds a default
 //! context past the seat's floor ([`within_margin`], qwen38's margin rule,
-//! which the glm seat lifts), the search over a context grid both qwen3
-//! defaults run ([`searched`]) and the slot count a `--ctx` flag buys
-//! ([`slots_of`]) — more positions on the card push card experts to the
-//! host, and decode crawls, so a context the flag did not name never trades
-//! away more than the plan's margin of stage-card expert bytes. The plan a
-//! seat probes at each context is its own (the model's placements differ);
-//! these are the terms the seats already share, and every model-specific
-//! input — the plan's bytes, the margin, the step, the trained context —
-//! enters as an argument.
+//! which the glm seat lifts), the prompt-cache guard that bounds it by the
+//! budget the plan leaves at each context ([`within_cache`]), the search over
+//! a context grid both qwen3 defaults run ([`searched`]) and the slot count a
+//! `--ctx` flag buys ([`slots_of`]) — more positions on the card push card
+//! experts to the host, and decode crawls, so a context the flag did not name
+//! never trades away more than the plan's margin of stage-card expert bytes.
+//! The plan a seat probes at each context is its own (the model's placements
+//! differ); these are the terms the seats already share, and every
+//! model-specific input — the plan's bytes, the margin, the step, the trained
+//! context — enters as an argument.
 
 /// Why a slot count was refused.
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +19,22 @@ pub enum CtxError {
     /// refuses it too, so no call can serve a count of no slot.
     #[error("--parallel 0: the server serves no slot")]
     NoSlot,
+    /// No context holds one sequence state in the prompt cache's budget:
+    /// at one position the state takes `state` bytes and the budget is
+    /// `ram`.
+    #[error(
+        "the prompt cache's {ram} bytes hold no sequence state ({state} bytes at one position, \
+         two recurrent copies among its terms); --cache-ram 0 turns it off"
+    )]
+    NoCacheState { state: u64, ram: u64 },
+    /// The context the cache's bound rounded to does not hold its state: the
+    /// budget at `ctx` is under the `state` there, so the budget is not
+    /// monotone across the rounding.
+    #[error(
+        "the prompt cache's bound rounded to a context of {ctx} positions, whose state of \
+         {state} bytes passes the budget of {ram} bytes there"
+    )]
+    CacheRounding { ctx: usize, state: u64, ram: u64 },
 }
 
 /// The resident sequences a seat serves and what set the count, for its
@@ -91,6 +108,52 @@ pub fn within_margin<E>(
         return Ok(c);
     }
     Ok((c / step * step).max(base_at))
+}
+
+/// The context a default keeps when the prompt cache must hold one sequence
+/// state there: `from` when its `state` fits the budget `ram_at` gives at
+/// `from`, else the largest context under `from` that holds, rounded down
+/// to a multiple of `step` (a context under `step` is its own). The budget
+/// is read at the context it bounds, not at `from`: a plan's host need
+/// moves with the context (a unified pool counts the positions' bytes, a
+/// split moves experts), so the budget a smaller context leaves is larger.
+/// `from` is tried first and alone: the budget is not monotone where the
+/// plan's tables change tier, and a search that skipped it could pass a
+/// holding `from` for a smaller context. The rounding keeps the bound: the
+/// returned context holds, checked after it.
+///
+/// # Errors
+/// [`CtxError::NoCacheState`] when not even one position's state holds;
+/// [`CtxError::CacheRounding`] when the rounded context does not hold; the
+/// first error `ram_at` returns.
+pub fn within_cache<E: From<CtxError>>(
+    from: usize,
+    step: usize,
+    state: &dyn Fn(usize) -> u64,
+    ram_at: &dyn Fn(usize) -> Result<u64, E>,
+) -> Result<usize, E> {
+    let holds = |n: usize| Ok::<_, E>(state(n) <= ram_at(n)?);
+    if holds(from)? {
+        return Ok(from);
+    }
+    if !holds(1)? {
+        return Err(CtxError::NoCacheState {
+            state: state(1),
+            ram: ram_at(1)?,
+        }
+        .into());
+    }
+    let c = largest(1, from.saturating_sub(1), holds)?;
+    let ctx = (c / step * step).max(c.min(step));
+    if !holds(ctx)? {
+        return Err(CtxError::CacheRounding {
+            ctx,
+            state: state(ctx),
+            ram: ram_at(ctx)?,
+        }
+        .into());
+    }
+    Ok(ctx)
 }
 
 /// The search a seat's whole-card and placed defaults run over the context
@@ -285,6 +348,107 @@ mod tests {
         let off = dropping(BASE, 4100, 1);
         let got = within_margin(9000, 4100, BASE, 256, 100, &off).expect("a context");
         assert_eq!(got, 4100);
+    }
+
+    /// The cache guard's rows: `from` when its state holds there, else the
+    /// largest context whose state holds the budget there — the budget
+    /// shrinking with the context as a unified pool's need grows with it —
+    /// rounded down to the step, a context under the step its own; a budget
+    /// that does not move with the context (`--cache-ram`) is the plain
+    /// bound; and a search no longer than a halving takes.
+    #[test]
+    fn within_cache_rows() {
+        let state = |n: usize| 3 * n as u64 + 10;
+        // Holds while 3n + 10 <= 1000 - 2n: through 198.
+        let shrinking = |n: usize| Ok::<_, Box<dyn std::error::Error>>(1000 - 2 * n as u64);
+        let rows: [(usize, usize, usize); 6] = [
+            (150, 16, 150),
+            (198, 16, 198),
+            (199, 1, 198),
+            (199, 16, 192),
+            (400, 16, 192),
+            (400, 256, 198),
+        ];
+        for (from, step, want) in rows {
+            let probes = Probes::new();
+            let counted = |n: usize| {
+                probes.take();
+                shrinking(n)
+            };
+            let got = within_cache(from, step, &state, &counted).expect("a context");
+            assert_eq!(got, want, "from {from}, step {step}");
+            assert!(state(got) <= 1000 - 2 * got as u64);
+        }
+        // A constant budget of 100 B holds through 30 positions; a context
+        // under the step is its own.
+        let constant = |_: usize| Ok::<_, Box<dyn std::error::Error>>(100u64);
+        assert_eq!(
+            within_cache(262_144, 256, &state, &constant).expect("a context"),
+            30
+        );
+        assert_eq!(
+            within_cache(30, 256, &state, &constant).expect("a context"),
+            30
+        );
+        assert_eq!(
+            within_cache(31, 256, &state, &constant).expect("a context"),
+            30
+        );
+    }
+
+    /// `from` is tried first: a budget that holds at `from` and fails in
+    /// between (the plan's table changing tier at a context) keeps `from`,
+    /// where a bisection over `1..=from` lands under the gap.
+    #[test]
+    fn within_cache_tries_from_before_the_search() {
+        let state = |n: usize| n as u64;
+        let gap = |n: usize| {
+            Ok::<_, Box<dyn std::error::Error>>(if n <= 100 || n >= 240 { 10_000 } else { 0 })
+        };
+        assert_eq!(within_cache(250, 1, &state, &gap).expect("a context"), 250);
+        assert_eq!(within_cache(239, 1, &state, &gap).expect("a context"), 100);
+    }
+
+    /// The cache guard's refusals, by name: no context holds one position's
+    /// state, a rounding that lands where the state does not hold, and a
+    /// budget read that fails.
+    #[test]
+    fn within_cache_refuses_by_name() {
+        let state = |n: usize| 3 * n as u64 + 10;
+        let none = |_: usize| Ok::<_, Box<dyn std::error::Error>>(5u64);
+        let err = within_cache(1000, 16, &state, &none).expect_err("no state holds");
+        assert_eq!(
+            err.downcast_ref::<CtxError>().map(ToString::to_string),
+            Some(
+                "the prompt cache's 5 bytes hold no sequence state (13 bytes at one position, two \
+                 recurrent copies among its terms); --cache-ram 0 turns it off"
+                    .to_string()
+            )
+        );
+        // Holds at 1, 5 and 7 only: the bisection over 1..=8 ends at 7,
+        // which the step of 4 rounds to 4, where the state does not hold.
+        let state = |n: usize| n as u64;
+        let sparse = |n: usize| {
+            Ok::<_, Box<dyn std::error::Error>>(if matches!(n, 1 | 5 | 7) { 100 } else { 0 })
+        };
+        let err = within_cache(9, 4, &state, &sparse).expect_err("a rounding past the bound");
+        assert_eq!(
+            err.downcast_ref::<CtxError>().map(ToString::to_string),
+            Some(
+                "the prompt cache's bound rounded to a context of 4 positions, whose state of 4 \
+                 bytes passes the budget of 0 bytes there"
+                    .to_string()
+            )
+        );
+        let refused = |n: usize| -> Result<u64, Box<dyn std::error::Error>> {
+            if n < 100 {
+                Ok(1_000)
+            } else {
+                Err("refused".into())
+            }
+        };
+        let err = within_cache(200, 1, &state, &refused).expect_err("a plan refused");
+        assert_eq!(err.to_string(), "refused");
     }
 
     /// The grid search's rows: no trained context is no answer, a trained

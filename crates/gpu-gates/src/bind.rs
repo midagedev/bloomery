@@ -662,11 +662,13 @@ impl CacheRam {
         )
     }
 
-    /// [`CacheRam::of_tier`] at a host reading already taken. A `need`
-    /// under the `tier` and `checkpoints` it holds is refused by name: it is
-    /// a need read without the arena or of a machine with no checkpoint
-    /// reserve, and the budget would take their bytes.
-    fn at(
+    /// [`CacheRam::of_tier`] at a host reading already taken: a caller that
+    /// reads the budget at several needs (the default context's bound) takes
+    /// one reading for all of them. A `need` under the `tier` and
+    /// `checkpoints` it holds is refused by name: it is a need read without
+    /// the arena or of a machine with no checkpoint reserve, and the budget
+    /// would take their bytes.
+    pub fn at(
         set: Option<u64>,
         (available, reading): (u64, HostRead),
         need: u64,

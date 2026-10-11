@@ -137,6 +137,37 @@ pub fn host_only_reason(ty: GgmlType) -> Option<String> {
     ))
 }
 
+/// What a target plan sets aside beside its own terms: `reserve` bytes the
+/// expert rule spreads within on each card (kept beside the plan under the
+/// all-host rule too, so a unified pool counts it), and the draft `mtp` the
+/// load carries, whose saved states the prompt cache's floor counts
+/// ([`PlanInputs::seq_state_bytes`]).
+#[derive(Clone, Copy)]
+struct Beside<'a> {
+    reserve: u64,
+    mtp: Option<&'a MtpInputs>,
+}
+
+impl<'a> Beside<'a> {
+    /// A plan with no draft and no reserve.
+    const fn none() -> Self {
+        Beside::reserve(0)
+    }
+
+    /// A plan with no draft, `reserve` bytes set aside.
+    const fn reserve(reserve: u64) -> Self {
+        Beside { reserve, mtp: None }
+    }
+
+    /// A plan of a load that carries `mtp`, `reserve` bytes set aside.
+    const fn draft(reserve: u64, mtp: &'a MtpInputs) -> Self {
+        Beside {
+            reserve,
+            mtp: Some(mtp),
+        }
+    }
+}
+
 /// A routed stack whose layer keeps every expert on the host under
 /// [`Experts::Card`], and why ([`host_only_reason`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,7 +395,7 @@ impl PlanInputs {
             return Err(PlaceError::Positions { ctx_max });
         }
         check_draft_reserve(machine, None)?;
-        let plan = self.target(machine, ctx_max, levers, experts, 0)?;
+        let plan = self.target(machine, ctx_max, levers, experts, Beside::none())?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -401,7 +432,14 @@ impl PlanInputs {
         let terms = self.seq_terms(None);
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
-        let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
+        let mut plan = self.target_of(
+            machine,
+            ctx_max,
+            levers,
+            experts,
+            Beside::reserve(rows),
+            &kv,
+        )?;
         // The bytes a sequence holds beside its stores ride the card's kv
         // class, out of the budget `rows` reserved above, so
         // [`Plan::violations`] holds the card's bound against them.
@@ -424,12 +462,28 @@ impl PlanInputs {
         }
     }
 
+    /// The host bytes one saved sequence state of `positions` positions
+    /// holds — the prompt cache's entry: every attention layer's positional
+    /// bytes, two copies of a checkpoint ([`KvLayout::state_bytes`]) and, on
+    /// a load that carries `mtp`, the draft's store below the same positions
+    /// and the step's and the pass's arena rows. The engine's own owner is
+    /// `Body38`'s `seq38_bytes`; the gate holds the two equal.
+    #[must_use]
+    pub fn seq_state_bytes(&self, positions: u64, mtp: Option<&MtpInputs>) -> u64 {
+        let draft = mtp.map_or(0, |m| {
+            m.kv.layer_bytes(0, positions) + slot_resident_bytes(&self.hp)
+                - runtime::stores::U32_BYTES
+        });
+        self.kv.state_bytes(positions) + draft
+    }
+
     /// The target's plan, unchecked: every routed expert on the host, or the
     /// expert rule over [`card_routed`]'s layers within each card's budget
-    /// less `reserve` ([`placement::plan_routed_reserving`]) — on a machine
+    /// less `beside`'s reserve ([`placement::plan_routed_reserving`]) — on a machine
     /// with expert tier cards, the stage cards first and each tier the next
     /// ids after them (plan (b′), [`machine_bp`]); then the PLE table's tier
-    /// by the host's room ([`placement::row_table_tier`]). A tier machine
+    /// by the host's room ([`placement::row_table_tier`]), beside the prompt
+    /// cache's floor ([`PlanInputs::target_rule_of`]). A tier machine
     /// under [`Experts::Host`] is refused by name ([`PlaceError::TierHost`]):
     /// its tier would hold nothing.
     fn target<'a>(
@@ -438,13 +492,13 @@ impl PlanInputs {
         ctx_max: u64,
         levers: &PlanLevers,
         experts: Experts,
-        reserve: u64,
+        beside: Beside<'_>,
     ) -> Result<Plan<'a>, PlaceError> {
         let rule = match experts {
             Experts::Host => None,
             Experts::Card => Some(card_routed as RoutedFormat),
         };
-        self.target_rule(machine, ctx_max, levers, rule, reserve)
+        self.target_rule(machine, ctx_max, levers, rule, beside)
     }
 
     /// [`PlanInputs::target`] over `kv`'s per-layer bytes instead of the
@@ -455,14 +509,14 @@ impl PlanInputs {
         ctx_max: u64,
         levers: &PlanLevers,
         experts: Experts,
-        reserve: u64,
+        beside: Beside<'_>,
         kv: &dyn KvBytes,
     ) -> Result<Plan<'a>, PlaceError> {
         let rule = match experts {
             Experts::Host => None,
             Experts::Card => Some(card_routed as RoutedFormat),
         };
-        self.target_rule_of(machine, ctx_max, levers, rule, reserve, kv)
+        self.target_rule_of(machine, ctx_max, levers, rule, beside, kv)
     }
 
     /// The target's plan, unchecked, under the card rule `rule` over `kv`'s
@@ -470,7 +524,11 @@ impl PlanInputs {
     /// expert rule over the layers whose routed stacks `rule` loads within each
     /// card's budget less `reserve` (kept beside the plan under either, so a
     /// unified pool counts it, [`placement::plan_host_routed_reserving`]); then
-    /// the PLE table's tier by the host's room ([`placement::row_table_tier`]).
+    /// the PLE table's tier by the host's room ([`placement::row_table_tier`])
+    /// beside the prompt cache's floor: two saved sequence states at
+    /// `ctx_max` ([`PlanInputs::seq_state_bytes`], the draft's side under
+    /// `beside`'s draft) — a function of the context being planned and the file's
+    /// layers alone, so it needs no plan to be read first.
     /// The all-host rule's own refusal of a tier card
     /// ([`PlaceError::TierHost`]) is wrapped to carry the program's lever and
     /// plan.
@@ -480,7 +538,7 @@ impl PlanInputs {
         ctx_max: u64,
         levers: &PlanLevers,
         rule: Option<RoutedFormat>,
-        reserve: u64,
+        beside: Beside<'_>,
         kv: &dyn KvBytes,
     ) -> Result<Plan<'a>, PlaceError> {
         let mut plan = match rule {
@@ -490,7 +548,7 @@ impl PlanInputs {
                 ctx_max,
                 kv,
                 levers,
-                reserve,
+                beside.reserve,
             )
             .map_err(tier_host)?,
             Some(rule) => placement::plan_routed_reserving(
@@ -500,10 +558,11 @@ impl PlanInputs {
                 kv,
                 levers,
                 rule,
-                reserve,
+                beside.reserve,
             )?,
         };
-        placement::row_table_tier(&mut plan, self.room.0, UBATCH_PLANNED)?;
+        let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
+        placement::row_table_tier(&mut plan, self.room.0, floor, UBATCH_PLANNED)?;
         placement::expert_nvme_tier(&mut plan, self.room.0)?;
         Ok(plan)
     }
@@ -518,9 +577,9 @@ impl PlanInputs {
         ctx_max: u64,
         levers: &PlanLevers,
         rule: Option<RoutedFormat>,
-        reserve: u64,
+        beside: Beside<'_>,
     ) -> Result<Plan<'a>, PlaceError> {
-        self.target_rule_of(machine, ctx_max, levers, rule, reserve, &self.kv)
+        self.target_rule_of(machine, ctx_max, levers, rule, beside, &self.kv)
     }
     /// `levers`, the routed experts by the expert rule over the layers whose
     /// three routed stacks `rule` loads — the card rule of the program that
@@ -544,7 +603,7 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let plan = self.target_rule(machine, ctx_max, levers, Some(rule), 0)?;
+        let plan = self.target_rule(machine, ctx_max, levers, Some(rule), Beside::none())?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -618,7 +677,7 @@ impl PlanInputs {
         let arena = mtp.arena_bytes();
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
-            let plan = self.target(machine, ctx_max, levers, experts, 0)?;
+            let plan = self.target(machine, ctx_max, levers, experts, Beside::draft(0, mtp))?;
             let broken: Vec<Violation> = plan
                 .violations()
                 .into_iter()
@@ -636,7 +695,13 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let plan = self.target(machine, ctx_max, levers, experts, reserve)?;
+        let plan = self.target(
+            machine,
+            ctx_max,
+            levers,
+            experts,
+            Beside::draft(reserve, mtp),
+        )?;
         let t = &plan.cards[0];
         // The draft's term is the reserve the expert rule spread within, so
         // the bound and the budget count one number.
@@ -717,7 +782,14 @@ impl PlanInputs {
         let kv = terms.slots_of(slots as u64);
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
-            let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
+            let mut plan = self.target_of(
+                machine,
+                ctx_max,
+                levers,
+                experts,
+                Beside::draft(rows, mtp),
+                &kv,
+            )?;
             plan.cards[0].grow_kv(rows);
             let broken: Vec<Violation> = plan
                 .violations()
@@ -736,7 +808,14 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let mut plan = self.target_of(machine, ctx_max, levers, experts, reserve + rows, &kv)?;
+        let mut plan = self.target_of(
+            machine,
+            ctx_max,
+            levers,
+            experts,
+            Beside::draft(reserve + rows, mtp),
+            &kv,
+        )?;
         plan.cards[0].grow_kv(rows);
         let t = &plan.cards[0];
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
@@ -1262,6 +1341,9 @@ pub struct KvLayout {
     kinds: Vec<Kind>,
     /// A GDN layer's state and conv ring, in bytes.
     recurrent: u64,
+    /// What one checkpoint copies of a GDN layer: the committed state lane
+    /// and the conv ring ([`recurrent_bytes`], without the other lanes).
+    copy: u64,
     /// The PLE site's layer and its conv ring's bytes.
     ple: Option<(usize, u64)>,
     /// An attention layer's K and V heads and their width.
@@ -1279,10 +1361,12 @@ impl KvLayout {
     #[must_use]
     pub fn of(hp: &Hparams) -> KvLayout {
         let exp = hp.exp.as_ref();
+        let copy = recurrent_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv);
         KvLayout {
             kinds: hp.kinds.clone(),
-            recurrent: recurrent_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv)
+            recurrent: copy
                 + exp.map_or(0, |_| delta_lane_bytes(hp.v_heads, hp.state, DELTA_LANES)),
+            copy,
             ple: exp.and_then(|e| e.ple).map(|p| {
                 (
                     p.layer,
@@ -1324,6 +1408,44 @@ pub fn slot_resident_bytes(hp: &Hparams) -> u64 {
     ((1 + PASS_ROWS) * streams(hp) * hp.n_embd * std::mem::size_of::<f32>() + 4) as u64
 }
 
+impl KvLayout {
+    /// Attention layer `layer`'s positional bytes at `ctx_max` positions.
+    fn attention_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        match &self.select {
+            Some((idx_dim, pools)) => {
+                let pool =
+                    pools.get(layer).copied().filter(|&p| p > 0).expect(
+                        "KvLayout: an attention layer's pool (Hparams::read refuses 0 there)",
+                    );
+                let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
+                selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
+            }
+            None => {
+                let row = if self.q8 {
+                    kv_q8_row_bytes(self.kv_heads, self.head_dim)
+                } else {
+                    kv_row_bytes(self.kv_heads, self.head_dim)
+                };
+                ctx_max * row
+            }
+        }
+    }
+
+    /// The host bytes one saved sequence state of `positions` positions holds
+    /// of the file's own layers: every attention layer's positional bytes
+    /// and two copies of a checkpoint — each GDN layer's committed lane and
+    /// conv ring, and the PLE ring.
+    fn state_bytes(&self, positions: u64) -> u64 {
+        let attention = (0..self.kinds.len())
+            .filter(|&l| self.kinds[l] == Kind::Attention)
+            .map(|l| self.attention_bytes(l, positions))
+            .sum::<u64>();
+        let gdn = self.kinds.iter().filter(|&&k| k == Kind::DeltaRule).count() as u64;
+        let checkpoint = gdn * self.copy + self.ple.map_or(0, |(_, bytes)| bytes);
+        attention + 2 * checkpoint
+    }
+}
+
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         let ple = match self.ple {
@@ -1332,23 +1454,7 @@ impl KvBytes for KvLayout {
         };
         let own = match self.kinds.get(layer) {
             Some(Kind::DeltaRule) => self.recurrent,
-            Some(Kind::Attention) => match &self.select {
-                Some((idx_dim, pools)) => {
-                    let pool = pools.get(layer).copied().filter(|&p| p > 0).expect(
-                        "KvLayout: an attention layer's pool (Hparams::read refuses 0 there)",
-                    );
-                    let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
-                    selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
-                }
-                None => {
-                    let row = if self.q8 {
-                        kv_q8_row_bytes(self.kv_heads, self.head_dim)
-                    } else {
-                        kv_row_bytes(self.kv_heads, self.head_dim)
-                    };
-                    ctx_max * row
-                }
-            },
+            Some(Kind::Attention) => self.attention_bytes(layer, ctx_max),
             None => 0,
         };
         own + ple
@@ -2137,6 +2243,7 @@ mod tests {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
             recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
+            copy: recurrent_bytes(48, 16, 128, 4),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2150,6 +2257,48 @@ mod tests {
         assert_eq!(kv.layer_bytes(3, 4096), 0);
     }
 
+    /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
+    /// one attention, the PLE ring on layer 1) at a context of whole pools
+    /// [derived]: twelve attention layers' 2,304 B a position and 256 B a
+    /// pool of four, and two checkpoints of 36 · 3,596,288 B (the committed
+    /// lane and conv ring, not the four lanes a layer holds) and the PLE
+    /// ring's 696,320 B.
+    #[test]
+    fn qwen38_state_bytes() {
+        let kv = KvLayout {
+            kinds: (0..48)
+                .map(|l| {
+                    if l % 4 == 3 {
+                        Kind::Attention
+                    } else {
+                        Kind::DeltaRule
+                    }
+                })
+                .collect(),
+            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
+            copy: recurrent_bytes(48, 16, 128, 4),
+            ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
+            kv_heads: 2,
+            head_dim: 256,
+            select: Some((
+                128,
+                (0..48).map(|l| if l % 4 == 3 { 4 } else { 0 }).collect(),
+            )),
+            q8: false,
+        };
+        let checkpoint = 36 * 3_596_288 + 696_320;
+        assert_eq!(kv.state_bytes(0), 2 * checkpoint);
+        assert_eq!(
+            kv.state_bytes(262_144),
+            12 * (262_144 * 2304 + 65_536 * 256) + 2 * checkpoint
+        );
+        assert_eq!(kv.state_bytes(262_144), 7_709_409_280);
+        assert_eq!(
+            kv.state_bytes(4097),
+            12 * (4097 * 2304 + 1025 * 256) + 2 * checkpoint
+        );
+    }
+
     /// The cache lever's q8_0 term ([`KvLayout::in_q8`]): a plain attention
     /// layer's K/V at `17/16` bytes a value, a selecting layer's and a GDN
     /// layer's stores untouched (the qwen38 family carries no q8_0 form).
@@ -2158,6 +2307,7 @@ mod tests {
         let plain = KvLayout {
             kinds: vec![Kind::Attention],
             recurrent: 0,
+            copy: 0,
             ple: None,
             kv_heads: 4,
             head_dim: 128,
@@ -2172,6 +2322,7 @@ mod tests {
         let selecting = KvLayout {
             kinds: vec![Kind::Attention],
             recurrent: 0,
+            copy: 0,
             ple: None,
             kv_heads: 2,
             head_dim: 256,
@@ -2973,8 +3124,8 @@ mod tests {
         use models::{Arch, ChatSpec, HeadRows, ModelSpec};
 
         use super::super::{
-            Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes, machine_bp,
-            slot_resident_bytes, tier_batch_of,
+            Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes,
+            machine_bp, slot_resident_bytes, tier_batch_of,
         };
         use super::mtp::{draft, file};
         use crate::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
@@ -3152,7 +3303,14 @@ mod tests {
             };
             let levers = PlanLevers::default();
             let mut plan = inputs
-                .target_of(machine, CTX, &levers, Experts::Host, reserve + rows, &kv)
+                .target_of(
+                    machine,
+                    CTX,
+                    &levers,
+                    Experts::Host,
+                    Beside::reserve(reserve + rows),
+                    &kv,
+                )
                 .expect("the target's plan");
             plan.cards[0].grow_kv(rows);
             plan

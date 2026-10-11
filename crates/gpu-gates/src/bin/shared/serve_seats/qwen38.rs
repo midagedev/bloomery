@@ -1088,27 +1088,28 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
 
 impl Ctx38 {
     /// A default bounded by the prompt cache too: one session's state at its
-    /// slot's context ([`seq38_state`]) fits `ram` bytes, when the cache is
-    /// on. A set context keeps its value; a set budget too small for one
-    /// position's state is refused by name (a default one is 0 already,
-    /// [`CacheRam::holding`]).
-    fn host_bound(self, inputs: &PlanInputs, ram: u64, drafts: bool) -> Result<Ctx38, GateError> {
-        if self.rule == "set" || ram == 0 {
+    /// slot's context ([`seq38_state`]) fits the budget `ram_at` gives
+    /// there, when the cache is on ([`model::placement::ctx::within_cache`]:
+    /// a unified pool's need moves with the context, so the budget is read
+    /// at the context bounded, not at the one the rule read). A set context
+    /// keeps its value, as does a default whose budget is 0 at the rule's
+    /// context (the cache is off: `--cache-ram 0`, or the NVMe tier's split
+    /// fills the room); a set budget too small for one position's state is
+    /// refused by name (a default one is 0 already, [`CacheRam::holding`]).
+    fn host_bound(
+        self,
+        inputs: &PlanInputs,
+        ram_at: &dyn Fn(usize) -> Result<u64, GateError>,
+        drafts: bool,
+    ) -> Result<Ctx38, GateError> {
+        if self.rule == "set" || ram_at(self.ctx)? == 0 {
             return Ok(self);
         }
         let state = |n: usize| seq38_state(inputs, n, drafts);
-        if state(self.ctx) <= ram {
+        let ctx = model::placement::ctx::within_cache(self.ctx, CTX_STEP, &state, ram_at)?;
+        if ctx == self.ctx {
             return Ok(self);
         }
-        if state(1) > ram {
-            return Err(format!(
-                "the prompt cache's {ram} bytes hold no sequence state (two recurrent copies \
-                 among its terms); --cache-ram 0 turns it off"
-            )
-            .into());
-        }
-        let c = model::placement::ctx::largest::<GateError>(1, self.ctx, |n| Ok(state(n) <= ram))?;
-        let ctx = (c / CTX_STEP * CTX_STEP).max(c.min(CTX_STEP));
         Ok(Ctx38 {
             ctx,
             rule: "cache",
@@ -1578,8 +1579,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         (drafted, mtp, head, draft_off)
     };
     let host = plans.host(rule.ctx, set)?;
-    let (slots, from, mtp, head, draft_off, host) = match paged(host.2, slots, mtp)? {
-        Paged::AsAsked => (slots, from, mtp, head, draft_off, host),
+    let (slots, from, mtp, head, draft_off, host, one) = match paged(host.2, slots, mtp)? {
+        Paged::AsAsked => (slots, from, mtp, head, draft_off, host, None),
         Paged::OneColumn { slots: served } => {
             let one = Plans {
                 mtp: None,
@@ -1589,17 +1590,50 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             rule = ctx38(&one, a.ctx)?;
             let (from, draft_off) = one_column(host.2, (slots, served), mtp, draft_off, false);
             let host = one.host(rule.ctx, set)?;
-            mtp_inputs = None;
-            (served, from, false, None, draft_off, host)
+            (served, from, false, None, draft_off, host, Some(one))
         }
     };
     refuse_mtp_levers(&draft_off)?;
     let residency_word = set.filter(|&(r, _)| r != Residency::Off).map(|(_, w)| w);
     refuse_feed(feed, (slots, mtp), residency_word)?;
-    let (need, pool, arena, checkpoints, paged) = host;
-    let cache = CacheRam::of_tier(a.cache_ram, need, pool, (arena, paged), checkpoints)?
-        .holding(seq38_state(&inputs, 1, mtp));
-    let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
+    // The prompt cache's budget, read from the host need at the context the
+    // bound asks about, on one reading of the host's available bytes: the
+    // bound searches contexts, and a reading that moved between two of its
+    // probes would make its answer and its check disagree.
+    let paged_one = one.is_some();
+    let live = one.unwrap_or(plans);
+    let reading = host_available_read()?;
+    let entry = seq38_state(&inputs, 1, mtp);
+    let cache_of = |(need, pool, arena, checkpoints, paged): (u64, u64, u64, u64, u64)| {
+        CacheRam::at(
+            a.cache_ram,
+            reading.clone(),
+            need,
+            pool,
+            (arena, paged),
+            checkpoints,
+        )
+        .map(|c| c.holding(entry))
+    };
+    let first = cache_of(host)?;
+    // A set `--cache-ram` is the same at every context.
+    let ram_at = |n: usize| -> Result<u64, GateError> {
+        match a.cache_ram {
+            Some(_) => Ok(first.ram),
+            None => Ok(cache_of(live.host(n, set)?)?.ram),
+        }
+    };
+    let before = rule.ctx;
+    let rule = rule.host_bound(&inputs, &ram_at, mtp)?;
+    // The cache line names the need of the context the load serves at.
+    let cache = if rule.ctx == before {
+        first
+    } else {
+        cache_of(live.host(rule.ctx, set)?)?
+    };
+    if paged_one {
+        mtp_inputs = None;
+    }
     rule.print();
     eprintln!(
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
