@@ -18,7 +18,10 @@
 //! - (card) right after the load at [`CTX`], the card experts' slot map,
 //!   slots and card copy, checks (i)–(iii) of `shared/glm5next_card.rs`.
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes
-//!   plus [`CARD_NODES`] for each routed layer the plan gives card experts
+//!   plus the launches a K-quant dense block or shared expert adds
+//!   (`BlockPlan::extra_launches`, read from the header and held equal to the
+//!   loaded body's plans) plus [`CARD_NODES`] for each routed layer the plan
+//!   gives card experts
 //!   (its `n_l`, which the host tier's slot map must hold layer for layer),
 //!   [`MEMOPS`] of them stream memory-operation batches (each routed layer's
 //!   go and wait) and the rest kernels, and the program's own count
@@ -463,7 +466,7 @@ mod gate {
         RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
         plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume,
         seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_route_taps,
-        set_taps, step_launches, store_digests, store_rows,
+        set_taps, step_launches, store_digests, store_rows, trunk_blocks,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -787,16 +790,26 @@ mod gate {
         );
         ok &= card_ok;
         let (decode, memops) = (shape.nodes_decode(), shape.memops());
-        let want = decode + CARD_NODES * card_layers.len();
-        let counted = step_launches(&mixers, &ffns, &cards);
+        // The blocks' plans from the header, and the loaded body's: the launches a K-quant block
+        // adds are the plan's, and both sides count them.
+        let header_blocks = trunk_blocks(&glm5next_tier::open()?)?;
+        let block_extra: usize = header_blocks.iter().map(|b| b.extra_launches()).sum();
+        let want = decode + block_extra + CARD_NODES * card_layers.len();
+        let blocks_ok = header_blocks == body.blocks();
+        let counted = step_launches(&mixers, &ffns, &cards, &body.blocks());
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let pass =
-            nodes == want && counted == want && b == memops && k == want - memops && other == 0;
+        let pass = blocks_ok
+            && nodes == want
+            && counted == want
+            && b == memops
+            && k == want - memops
+            && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {want} = {decode} + {CARD_NODES} x {} \
-             card layers; the program counts {counted}) kernel={k} batch_mem_op={b} (want {memops}) \
+            "structure decode graph_nodes={nodes} (want {want} = {decode} + {block_extra} block \
+             launches + {CARD_NODES} x {} card layers; the program counts {counted}; the header's \
+             block plans are the body's {blocks_ok}) kernel={k} batch_mem_op={b} (want {memops}) \
              other={other} {}",
             card_layers.len(),
             verdict(pass)

@@ -26,7 +26,8 @@
 //! `hc_post`), plus the mixer's ([`crate::kda::LAUNCHES`],
 //! [`crate::mla::LAUNCHES`]) and the block's ([`crate::ffn::DENSE_LAUNCHES`],
 //! [`crate::ffn::MOE_LAUNCHES`], and [`crate::ffn::CARD_LAUNCHES`] more on a
-//! layer with card experts); the head adds the mean and its own three.
+//! layer with card experts, [`BlockPlan::extra_launches`] more on a K-quant
+//! block); the head adds the mean and its own three.
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
@@ -34,6 +35,7 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
+use bloomery_gpu_deepseek41::block::BlockPlan;
 use bloomery_gpu_deepseek41::hc::{HcPostArgs, HcQ8Params, HcQ8PreArgs};
 use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
@@ -47,23 +49,31 @@ use crate::{ffn, kda, mla};
 const WHAT: &str = "glm5next Body::enqueue_chain";
 
 /// The launches of the step's captured chain: every layer's
-/// ([`layer_launches`], `cards[l]` whether layer `l` has card experts) and
-/// the head's four.
+/// ([`layer_launches`], `cards[l]` whether layer `l` has card experts,
+/// `blocks[l]` the plan of its dense block or shared expert) and the head's
+/// four.
 #[must_use]
-pub fn step_launches(mixers: &[MixerKind], ffns: &[FfnKind], cards: &[bool]) -> usize {
+pub fn step_launches(
+    mixers: &[MixerKind],
+    ffns: &[FfnKind],
+    cards: &[bool],
+    blocks: &[BlockPlan],
+) -> usize {
     mixers
         .iter()
         .zip(ffns)
         .zip(cards)
-        .map(|((&m, &f), &c)| layer_launches(m, f, c))
+        .zip(blocks)
+        .map(|(((&m, &f), &c), &b)| layer_launches(m, f, c, b))
         .sum::<usize>()
         + 4
 }
 
 /// One layer's launches: two sub-layers' three for the streams, its mixer's
-/// and its block's, with its card experts' when `card`.
+/// and its block's, with its card experts' when `card` and the K-quant
+/// block's own ([`BlockPlan::extra_launches`]).
 #[must_use]
-pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool) -> usize {
+pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool, plan: BlockPlan) -> usize {
     let mix = match mixer {
         MixerKind::DeltaRule => kda::LAUNCHES,
         MixerKind::Latent => mla::LAUNCHES,
@@ -74,7 +84,7 @@ pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool) -> usize {
         FfnKind::Moe if card => ffn::MOE_LAUNCHES + ffn::CARD_LAUNCHES,
         FfnKind::Moe => ffn::MOE_LAUNCHES,
     };
-    2 * 3 + mix + block
+    2 * 3 + mix + block + plan.extra_launches()
 }
 
 /// The stream buffer a row's streams end in after a walk of `layers`
