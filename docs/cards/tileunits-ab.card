@@ -1,0 +1,58 @@
+# tileunits: tile_units rows for every type qdot tiles (crates/model/src/ops.rs), so a host dispatch of IQ3_XXS / IQ4_XS /
+# IQ4_NL (the Q3 file) is cut into lanes by the tile's instruction cost and not by bytes x columns. Draft: the lead runs
+# it after the release batch, one lease on the A6000. Base = main's binary; changed = this branch's.
+#
+# Decomposition [derived]:
+# 1. Where the new rows act. A prompt call (more than DEFER_MAX_COLS = 8 columns) runs the row-lane union when every
+#    stack of a pass has lane units (ops.rs `UnionCall::lanes`, `lane_tile_cost`): Q4_K, Q5_K and Q6_K do, so the
+#    Q4_K gate/up and Q6_K down passes of qwen35moe (Qwen3.6-35B-A3B Q4_K_M) at P = 512 were already priced by the
+#    tile and the new rows change nothing there: effect 0, no run. Neither the union nor the per-token group path
+#    puts a Q4_K and a Q6_K pair in one dispatch (gate/up and down are separate passes). The Q3 file's passes
+#    (IQ3_XXS / IQ4_XS gate/up, IQ4_NL down) have no lane units, so before this change `tile_costs()` was false and
+#    the whole pass was cut by bytes x columns. Calls of at most 8 columns (verify, draft) take `unit_tile_cost` for
+#    every type; the qwen35moe Q6_K down pass there (256 experts, top-8, 2048 x 512, all on the host: assumed) has a slowest
+#    lane 1.0 / 2.9 / 6.9 % over the mean at 2 / 4 / 8 columns under the bytes cut and 0 under the tile cut
+#    [simulated as in 2., before stealing], below the ruler.
+# 2. What mispricing costs. Per row a pair costs bytes x m (old) against runs(m) x fixed + m x per_col (new), m the
+#    expert's columns. IQ3_XXS (692, 106) has a fixed part 6.5 x its per-column share, so the bytes price is off by
+#    up to +35 % between m = 8 and m = 9 (one more run). Simulated (200 draws of 512 tokens each routed to 10 of 512
+#    experts, so m is binomial with mean 10; 32 lanes; the closed-form cut of `dispatch_flat` with experts in order,
+#    two or three a lane; the tile price taken as the truth), the slowest lane's excess over the mean, bytes cut ->
+#    tile cut, at 256 / 384 / 512 experts of a layer on the host: gate/up pass 6.3 / 5.1 / 4.3 % -> 0, down pass
+#    2.5 / 2.1 / 1.8 % -> 0. Weighted by the passes' row work (2/3, 1/3): 5.0 / 4.1 / 3.5 % of the union's row time.
+#    Read from the Mac: 512 experts, top-10 (tools/flow/q38_step.py:249). Not read: the hidden and expert ffn sizes
+#    (taken 2048 and 512; they set the cut's grain only), the host experts a layer (the plan's card experts over its
+#    layers), and which of the gate/up pair is IQ3_XXS (taken the gate).
+# 3. What reaches the wall. The union is ~0.5 of the 512-token prompt (iqtile-ab.card: ~225 ms of 435..500), so at
+#    most 0.5 x 3.5..5.0 % = +1.8..+2.5 % pp tok/s if no steal repaired the cut. Work stealing (BLOOMERY_STEAL, a
+#    lane's block is a quarter of it) repairs part of it, so the band is 0..+2.5 %. It holds 0: the card is a
+#    non-inferiority one (tools/ref/card.py refuses an ab card on a band that holds 0). Rounds: 6, since at 4 the
+#    paired interval (1.05 %) is over the 1.0 % margin.
+# Wall [derived]: 2 arms x 6 rounds = 12 fresh Qwen3.8 loads (~40 s) plus the prompt runs, ~10 min (iqtile-ab.card's
+# 16 runs took 12..16 min).
+# Runner (the lead's, main tree, the full output to a file first):
+# BLOOMERY_HOLD_OWNER=tileunits BLOOMERY_CARD=a6000 BLOOMERY_AB_ROUNDS=6
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/tileunits-ab.card BLOOMERY_GEN_CTX=4352' just depth-gpu-qwen4exp
+#   bin:/root/repo/bloomery/target/release/generate_qwen3moe:prose:512@model=<Q3> prose:512@model=<Q3>
+# (the first is the base arm, main's binary built before the sitting; the second is this branch's, <Q3> the UD-Q3_K_XL
+# first shard.) The verdict's ratios are the runner's `across binaries` table (this binary's arm / the bin: arm, pp
+# tok/s, so changed / base): python3 tools/ref/card.py verdict docs/cards/tileunits-ab.card <the per-round ratios>.
+kind: noninf
+question: does cutting the Q3 file's host passes by the tile cost (rows for IQ3_XXS / IQ4_XS / IQ4_NL) leave the
+  512-token prompt no slower, and by how much faster?
+term: pp tok/s @ prose:512, ctx 4352, A6000, Qwen3.8 UD-Q3_K_XL at its defaults (MTP draft on), changed arm over base,
+  paired by round
+unit: %
+predict: 0..2.5
+rounds: 6
+margin: 1.0 % the default (about the ruler's spread at 6 rounds); the change moves the lane cut only, never a value
+condition: one lease, six rounds, a fresh process per load group, majflt near 0 (no [cold] row), no [cpu-busy] or
+  [other-busy] row; both binaries load the same plan (the plan line's card experts a layer equal); the base arm's
+  pp512 is within the ruler of the iqtile sitting's number; BLOOMERY_STEAL unset (its default on) in every arm
+decide-in: land the rows with `tools/ref/tile-units.sh` rc 0 and the model's lib test green on the box; record the
+  pp512 delta and its interval in the release notes' table only if the lower bound is above 0
+decide-below: the instruction-count price is wrong for the IQ rows (the decode loop's latency, not its instructions):
+  keep the rows for the types whose per-column share is the cost (Q2_K, Q6_K, Q5_1, Q8_0, IQ4_NL), drop the IQ3_XXS /
+  IQ2_XS / IQ3_S rows, and read the slot us per expert (profile level 1) against the derived price before re-fitting
+decide-above: the bytes cut left more idle lanes than the static model says (steal repaired less): re-run with
+  BLOOMERY_STEAL=0 arms to price the steal, and apply the same rows to the 4096-token prompt's host union

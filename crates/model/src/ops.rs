@@ -3150,15 +3150,27 @@ fn row_cost(p: &PairWork<'_>) -> u64 {
 
 /// Instructions per super-block of qdot's tile kernels, in half-instruction
 /// units: the fixed unpack of one run of a weight row, and each column's
-/// share (the loop body of `qdot::tile::<C>` in the disassembly, C = 2, 3, 4,
-/// fitted as fixed + C · per column). A lone column's `dot_row` costs about a
-/// run of one. `None`: no tile kernel.
+/// share (the block loop of `qdot::tile::<C>` in the disassembly, an inner
+/// loop counted at its trips, C = 2 and 4, fitted as fixed + C · per column).
+/// A lone column's `dot_row` costs about a run of one. `None`: no tile
+/// kernel. `tools/ref/tile-units.sh` derives every row from the kernels and
+/// ends 1 on a row the code has left behind.
 fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
     match ty {
+        GgmlType::Q2_K => Some((78, 94)),
         GgmlType::Q3_K => Some((192, 63)),
         GgmlType::Q4_K => Some((96, 97)),
         GgmlType::Q5_K => Some((156, 98)),
+        GgmlType::Q6_K => Some((172, 118)),
+        GgmlType::IQ4_XS => Some((146, 95)),
+        // The grid types decode a super-block's eight sub-blocks in a loop, so their fixed part is large.
+        GgmlType::IQ2_XS => Some((624, 102)),
+        GgmlType::IQ3_XXS => Some((692, 106)),
+        GgmlType::IQ3_S => Some((780, 96)),
         // Per 32-value block (`qdot::k_granularity`): a quarter of an x4 group's instructions.
+        GgmlType::Q5_1 => Some((34, 17)),
+        GgmlType::Q8_0 => Some((14, 16)),
+        GgmlType::IQ4_NL => Some((22, 16)),
         GgmlType::MXFP4 => Some((16, 16)),
         _ => None,
     }
@@ -5697,7 +5709,7 @@ mod tests {
     use super::{
         ExpertStack, GroupInput, RowLayout, Tensor2, UnionCall, UnionPlanView, UnionStack, Weight,
         first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu,
-        matvec_q_local, parse_steal,
+        matvec_q_local, parse_steal, tile_cost_of, tile_units, unit_tile_cost,
     };
     use gguf::{GgmlType, Gguf};
 
@@ -6104,6 +6116,54 @@ mod tests {
         println!(
             "12 rows of a row-lane matrix ran: {:?}",
             r.map(|_| &out[0].data[8..])
+        );
+    }
+
+    /// Every type qdot runs a tile kernel for has a `tile_units` row, so a dispatch of any mix of them (a Q4_K gate/up
+    /// beside a Q6_K down) is cut by the tile's cost and not by bytes × columns, and no other type has a row.
+    #[test]
+    fn tile_units_has_a_row_for_exactly_the_types_qdot_tiles() {
+        // The types of `qdot::tile_kind`.
+        const TILED: [GgmlType; 13] = [
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::IQ2_XS,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ3_S,
+            GgmlType::IQ4_XS,
+            GgmlType::IQ4_NL,
+            GgmlType::MXFP4,
+        ];
+        for raw in 0..64 {
+            let ty = GgmlType::from_u32(raw);
+            if matches!(ty, GgmlType::Unknown(_)) {
+                continue;
+            }
+            assert_eq!(
+                tile_units(ty).is_some(),
+                TILED.contains(&ty),
+                "{ty:?}: tile_units holds a row for exactly the types of qdot::tile_kind"
+            );
+            // A CPU without the tile kernels prices no tile; one with them prices every type qdot tiles.
+            assert_eq!(
+                tile_cost_of(ty, 2048, 16).is_some(),
+                qdot::has_tile(ty),
+                "{ty:?}: qdot tiles it exactly when tile_cost_of prices it"
+            );
+        }
+        // A pair set is cut by the tile when every pair has a tile cost (`RowSet::tile_costs`): a Q4_K gate/up pair
+        // beside a Q6_K down pair does on a CPU with both kernels.
+        let mixed = [GgmlType::Q4_K, GgmlType::Q6_K]
+            .iter()
+            .all(|&ty| unit_tile_cost(ty, RowLayout::Rows, 2048, 16).is_some());
+        assert_eq!(
+            mixed,
+            qdot::has_tile(GgmlType::Q4_K) && qdot::has_tile(GgmlType::Q6_K)
         );
     }
 
