@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use bloomery_levers::{PlanTier, Residency38Pick, Residency38Why, residency38_at_plan};
+use bloomery_levers::{Residency38Pick, Residency38Why, residency38_at_plan};
 use gguf::GgmlType;
 
 use super::churn::ChurnPool;
@@ -393,17 +393,13 @@ const UBATCH_PLANNED: u64 = 4096;
 /// yet); the box's own is [`PLAN_ROOM`].
 const SCOPE_61G: u64 = 61 << 30;
 
-/// The unset residency rule on `plan` (`residency38_at_plan`, fed the plan's
-/// NVMe tier terms) with `MemAvailable` ample, and its churn pool's bytes.
+/// The unset residency rule on `plan` (`residency38_at_plan`) with
+/// `MemAvailable` ample, and its churn pool's bytes.
 fn residency(plan: &Plan<'_>) -> (Residency38Pick, u64) {
     let pool = |pinned| ChurnPool::of(plan, 0, pinned).map(|p| p.bytes);
     let pick = residency38_at_plan(
         plan.n_l.iter().copied(),
         plan.host.experts,
-        PlanTier {
-            paged: plan.host.nvme_expert_bytes,
-            arena: plan.host.nvme_arena_bytes,
-        },
         pool,
         plan.host.headroom_bytes,
         i128::MAX,
@@ -968,6 +964,11 @@ fn a_split_plans_pool_fits_the_room_past_the_arena() {
             "room {room}: {} holds need {need} B + arena {arena} B + pool {pool} B",
             pick.word()
         );
+        // PIN(2026-10-11): the pick on a paged plan is the family's own
+        // rule, `mid-p0-s1` over the empty pool its stacks leave
+        // ([`a_paged_stack_adds_nothing_to_the_churn_pool`]); the removed
+        // paged clause had answered `off` at the 27 GiB room.
+        assert_eq!(pick.word(), "mid-p0-s1", "room {room}: the unset rule");
     }
     // The pool of every card expert, as the unsplit plan holds it.
     let split = plan_at(&q4, &gate, 4096, 1, 27 << 30).expect("the split plan");
@@ -1081,10 +1082,10 @@ fn a_split_leaves_the_run_ahead_window() {
 /// A churn pool leaves out the stacks the plan pages to the NVMe tier, whose
 /// victims the tier's arena serves: on both paged gate plans every layer
 /// pages and the pool at P 0 is empty, while the unsplit twin keeps its whole
-/// pool. The unset rule on the plan that pages through an arena (27 GiB) is
-/// `off`, its why the plan's own paged and arena bytes; on the plan whose
-/// tier has no arena, the mapping path (58 GiB), it resolves `mid-p0-s1` over
-/// that empty pool.
+/// pool. The unset rule resolves `mid-p0-s1` over that empty pool on both:
+/// the plan that pages through an arena (27 GiB) and the one whose tier has
+/// none, the mapping path (58 GiB). No plan clause precedes the family's own
+/// rule, since a promotion reads the arena's slots, not the file mapping.
 #[test]
 fn a_paged_stack_adds_nothing_to_the_churn_pool() {
     let (q4, gate) = (model(false), machine_a(RTX_3090));
@@ -1104,21 +1105,23 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
             "room {room}: the arena"
         );
         let (pick, bytes) = residency(&split);
+        assert_eq!(
+            (pick.word(), bytes),
+            ("mid-p0-s1".to_string(), 0),
+            "room {room}: the unset rule on the paged plan"
+        );
         if arena {
-            let why = Residency38Why::Paged {
-                paged: split.host.nvme_expert_bytes,
-                arena: split.host.nvme_arena_bytes,
-            };
+            // PIN(2026-10-11): `plan (a)` over the plan's 92 fewest card
+            // experts a layer (the 3090 gate plan at ctx 4096 and 27 GiB:
+            // P 0 needs the pool empty, the headroom at least 0 and fewest
+            // at least 2, the spares and one that moves).
             assert_eq!(
                 pick,
-                Residency38Pick { pinned: None, why },
+                Residency38Pick {
+                    pinned: Some(0),
+                    why: Residency38Why::PlanA { fewest: 92 },
+                },
                 "room {room}: the unset rule on the plan that pages through an arena"
-            );
-        } else {
-            assert_eq!(
-                (pick.word(), bytes),
-                ("mid-p0-s1".to_string(), 0),
-                "room {room}: the unset rule on the paged plan"
             );
         }
     }

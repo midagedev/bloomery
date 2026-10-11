@@ -28,12 +28,12 @@
 //!   that arena, its prompt's argmax and logits row bit for bit the all-RAM
 //!   arm's), and the direct-read probe of a mount without direct IO, by
 //!   name.
-//! - `residency` (clause 5): the paged plan's unset rule resolves `off`
-//!   ([`residency38`]: the plan pages through the tier's arena, where a
-//!   promotion copies an expert from its slot when the arena holds it and
-//!   through the file mapping, cold after the tier's drops, when it does
-//!   not), and both arms run a set
-//!   `mid-p0-s1` with an empty churn pool (`ChurnPool::of` leaves the paged
+//! - `residency` (clause 5): the paged plan's unset rule resolves
+//!   `mid-p0-s1` ([`residency38`]: its own terms, the churn pool empty —
+//!   `ChurnPool::of` leaves the paged stacks out — and the headroom not
+//!   negative; a promotion copies an expert from its slot when the arena
+//!   holds it, so no plan-time clause precedes the rule), and both arms run
+//!   a set `mid-p0-s1` with an empty churn pool (`ChurnPool::of` leaves the paged
 //!   stacks out: the arena serves their victims): flips land on the paged
 //!   arm, and its `unresident` and `faulting` are 0 — bug catchers,
 //!   structurally unreachable once the seam serves the victims the arena
@@ -97,11 +97,10 @@
 //! - `stepunion` (clause 8, a load of its own): the step port's union of
 //!   two columns on a paged plan — the plan made for two slots at the same
 //!   room and context (the two arms' plan counts one sequence, and a second
-//!   on it is refused by name), under that plan's unset residency, `off`
-//!   (clause 5's answer, the default the clause judges: the card's split
-//!   stays the plan's, so the same tokens stepped alone sum their experts in
-//!   the same split; a rule that picks `mid` there is refused by name with
-//!   its pick), a prompt in
+//!   on it is refused by name), under a set `off` (the clause's subject is
+//!   the step port's union, not the default: the card's split stays the
+//!   plan's, so the same tokens stepped alone sum their experts in the same
+//!   split), a prompt in
 //!   each slot, then [`STEP_COLS`] passes of both slots' tokens as one
 //!   two-column step against the same token sequences stepped alone on the
 //!   same load (each slot reset, prompted again and fed the recorded
@@ -112,7 +111,10 @@
 //!   so by none: the step port's unions read the arena, and a two-column
 //!   decode leaves no mapping page behind (the old reader keeps every page
 //!   it reads). The arena's misses and fills move over the passes: under
-//!   `off` no lane fills it, so only the step port's unions can. A second
+//!   `off` no lane fills it, so only the step port's unions can — the
+//!   tier's counters name them: the passes' fills and hits are
+//!   `step_fills` and `step_hits`, and the prompt union's `union_fills` and
+//!   `union_hits` do not move (a bug catcher). A second
 //!   such load runs the set `mid-p0-s1` (`stepunion mid`): its flips land
 //!   under the passes, the lane's victim fills and copies racing the
 //!   two-column chain's reads of the arena, and the passes' bits are those of
@@ -980,6 +982,12 @@ struct StepRun {
     flips: usize,
     misses: u64,
     fills: u64,
+    /// The passes' claims by whose they are: the step port's fills and hits,
+    /// and the prompt union's (none are made).
+    step_fills: u64,
+    step_hits: u64,
+    union_fills: u64,
+    union_hits: u64,
     /// The tier census of the passes.
     census: TierCensus,
     before: Pages,
@@ -990,18 +998,17 @@ struct StepRun {
 /// The `stepunion` clause's own arm: a load of its own on the paged plan
 /// made for **two** slots ([`PlanInputs::plan_with_slots`] — the two arms'
 /// plan counts one, and a second sequence on it is refused by name) at the
-/// same room and context, under the unset rule's residency on that plan
-/// (`off`, clause 5's answer: the card's split stays the plan's, so a slot
-/// stepped alone sums its experts in the split its two-column pass did),
-/// serving two slots: a prompt in each, then [`STEP_COLS`] passes of both
+/// same room and context, under a set `off` (the clause's subject is the
+/// step port's union, not the default: the card's split stays the plan's, so
+/// a slot stepped alone sums its experts in the split its two-column pass
+/// did), serving two slots: a prompt in each, then [`STEP_COLS`] passes of both
 /// slots' tokens as one two-column step ([`Session::step_slots`], the step
 /// port's union), then each slot reset, prompted again and fed the recorded
 /// tokens one column a step on the same load. Refused by name: a two-slot
 /// plan that pages nothing or builds no arena (with the plan's numbers), an
 /// arena whose carve falls under the two-column floor (`ArenaFloor::of` at
 /// two columns: the arm's call is wider than the served one the dial sizes
-/// for), and an unset rule that picks `mid` on it (with its pick: the clause
-/// judges the `off` default, never a forced one).
+/// for).
 /// The footprint is read before and after the passes, the prompts' residue
 /// dropped twice first (the second drop takes the pages the first found
 /// busy); `band` `None` (under `--audit`) reads none.
@@ -1030,20 +1037,15 @@ fn stepunion_arm(
         )
         .into());
     }
-    // The residency the unset rule picks on this plan, its `residency
-    // unset` record (the pick and its why) printed: the clause judges that
-    // default, `off`, and refuses by name a plan whose rule picks another.
-    let residency = residency38(&plan, Lever38::Unset(None), Record::print)?;
-    if let Residency::Mid { pinned, spares } = residency {
-        return Err(format!(
-            "the stepunion arm's plan picks mid-p{pinned}-s{spares} under the unset rule; the \
-             clause judges the off default"
-        )
-        .into());
-    }
+    // PIN(2026-10-11): the arm sets `off`; it ran the unset rule's pick, which
+    // was `off` on a paged plan until the plan-time clause went. The clause's
+    // subject is the step port's union, so no lane fills the arena and only
+    // the step claims can; the unset rule's `mid-p0-s1` is the `stepunion mid`
+    // arm's.
+    let residency = residency38(&plan, Lever38::Set(Residency::Off, "off"), Record::print)?;
     println!(
         "stepunion plan: two slots at the room {ROOM} B page {} B on the NVMe tier, arena {} B, \
-         residency off (the unset rule's pick, its record above)",
+         residency off (set: the clause judges the step port's union, not the default)",
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     let ub = ubatch_for(CTX)?;
@@ -1124,6 +1126,10 @@ fn stepunion_arm(
         flips,
         misses: t1.misses - t0.misses,
         fills: t1.fills - t0.fills,
+        step_fills: t1.step_fills - t0.step_fills,
+        step_hits: t1.step_hits - t0.step_hits,
+        union_fills: t1.union_fills - t0.union_fills,
+        union_hits: t1.union_hits - t0.union_hits,
         census,
         before,
         after,
@@ -1613,15 +1619,19 @@ fn run() -> Result<(), GateError> {
     let mut pass = true;
 
     // `residency` (clause 5): the unset rule on the paged plan resolves
-    // `off`.
+    // `mid-p0-s1`, the family's own word.
     let unset = residency38(&plan, Lever38::Unset(None), Record::print)?;
-    let unset_off = matches!(unset, Residency::Off);
+    let unset_mid = unset == MID;
     println!(
         "residency: the unset rule on the paged plan resolves {}: {}",
-        if unset_off { "off" } else { "mid" },
-        verdict(unset_off)
+        if unset_mid {
+            "mid-p0-s1"
+        } else {
+            "another word"
+        },
+        verdict(unset_mid)
     );
-    pass &= unset_off;
+    pass &= unset_mid;
     // The residency word both arms run: a set `mid-p0-s1`, so the paged
     // arm's flips, the seam and a lane's drops stay held.
     let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
@@ -2208,11 +2218,16 @@ fn run() -> Result<(), GateError> {
     let step_bound = window.map(|ra| step.flips as u64 * 15 * ra / 2);
     let step_pages_ok = step_bound.is_none_or(|bound| grown <= bound);
     let served = step.misses > 0 && step.fills > 0;
-    let stepunion = solo_bits && step_pages_ok && served;
+    // Under a set `off` no lane fills the arena and no prompt union runs: the
+    // passes' fills are the step claims', and the union's counters stand.
+    let counted = step.step_fills > 0 && step.union_fills == 0 && step.union_hits == 0;
+    let stepunion = solo_bits && step_pages_ok && served && counted;
     println!(
         "stepunion: {STEP_COLS} two-column passes on a two-slot load, {} tokens and logits rows \
          and both prompts' argmax bit for bit the same sequences stepped alone: {}; {}; misses \
-         +{}, fills +{} over the passes (the arena served them: {served}): {}",
+         +{}, fills +{} over the passes (the arena served them: {served}), step claims: fills \
+         +{} hits +{}, union claims: fills +{} hits +{} (the step port's, none the union's: \
+         {counted}): {}",
         step.tokens.len(),
         verdict(solo_bits),
         match step_bound {
@@ -2234,6 +2249,10 @@ fn run() -> Result<(), GateError> {
         },
         step.misses,
         step.fills,
+        step.step_fills,
+        step.step_hits,
+        step.union_fills,
+        step.union_hits,
         verdict(stepunion)
     );
     pass &= stepunion;

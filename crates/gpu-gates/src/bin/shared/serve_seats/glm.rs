@@ -586,7 +586,6 @@ fn residency_at(
             let pick = glm_residency_at_plan(
                 pick,
                 room.card_experts(),
-                room.tier(),
                 |pinned| room.pool_bytes(pinned),
                 room.headroom(),
                 mem_left,

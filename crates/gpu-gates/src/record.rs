@@ -1654,13 +1654,14 @@ pub static CLEF_ROWS: Kind = Kind {
 /// or under the budget at every step), the reads the page cache served, the
 /// drops of the mapping's pages a read brought in, their bytes and wall, the
 /// residency lane's reads by where they were served (the arena's slot, the
-/// model file's mapping), and the prompt union's claims: its calls by path,
+/// model file's mapping), the prompt union's claims: its calls by path,
 /// the ids its claims filled and found filled, and the ids it claimed as
-/// keep and as transient.
+/// keep and as transient, the step port's claims: the ids they filled and
+/// found filled, and the wall of the fill reader's jobs by kind.
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget, the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled; and the wall the fill reader's jobs ran, the prompt batches' and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
         key("paged", U64, "B"),
@@ -1683,6 +1684,10 @@ pub static NVTIER: Kind = Kind {
         key("union_hits", U64, ""),
         key("keep_claims", U64, ""),
         key("transient_claims", U64, ""),
+        key("step_fills", U64, ""),
+        key("step_hits", U64, ""),
+        key("prompt_run_ns", U64, "ns"),
+        key("victim_run_ns", U64, "ns"),
     ],
 };
 
@@ -1922,8 +1927,8 @@ pub static RESIDENCY_UNSET: Kind = Kind {
     doc: "What BLOOMERY_RESIDENCY unset resolved to in generate_qwen3moe: the word the load runs \
           by (off, or mid-p<P>-s1 on plan (a), P half the plan's fewest card experts a layer) \
           and why, the condition that picked it (the placement, the flags, the file, or the plan: \
-          routed experts paged through the NVMe tier's RAM arena, no card expert, no room, or the \
-          churn pool past the plan's host headroom or past what MemAvailable leaves).",
+          no card expert, no room, or the churn pool past the plan's host headroom or past what \
+          MemAvailable leaves).",
     parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 
@@ -3427,6 +3432,7 @@ pub fn lane(card: &str, rate: &bloomery_gpu::lane::LaneRate) -> Record {
 pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Record> {
     let tier = tier?;
     let s = tier.stats();
+    let ran = tier.reader_stats();
     Some(
         Record::new(&NVTIER)
             .u("budget", tier.budget())
@@ -3449,7 +3455,11 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("union_fills", s.union_fills)
             .u("union_hits", s.union_hits)
             .u("keep_claims", s.keep_claims)
-            .u("transient_claims", s.transient_claims),
+            .u("transient_claims", s.transient_claims)
+            .u("step_fills", s.step_fills)
+            .u("step_hits", s.step_hits)
+            .u("prompt_run_ns", ran.prompt.run_ns)
+            .u("victim_run_ns", ran.victim.run_ns),
     )
 }
 
@@ -3866,9 +3876,10 @@ mod tests {
         }
     }
 
-    /// The `nvtier` record ends with the prompt union's six counters, in the
-    /// order the kind declares them: a record that names one out of order or
-    /// leaves one out panics by name.
+    /// The `nvtier` record ends with the prompt union's six counters, the
+    /// step port's two and the reader's two walls, in the order the kind
+    /// declares them: a record that names one out of order or leaves one out
+    /// panics by name.
     #[test]
     fn nvtier_ends_with_the_union_counters() {
         let line = Record::new(&NVTIER)
@@ -3893,24 +3904,33 @@ mod tests {
             .u("union_hits", 19)
             .u("keep_claims", 20)
             .u("transient_claims", 21)
+            .u("step_fills", 22)
+            .u("step_hits", 23)
+            .u("prompt_run_ns", 24)
+            .u("victim_run_ns", 25)
             .line();
         assert!(
             line.ends_with(
                 "drop_ns=13 slot_reads=14 mapping_reads=15 union_small=16 union_batched=17 \
-                 union_fills=18 union_hits=19 keep_claims=20 transient_claims=21"
+                 union_fills=18 union_hits=19 keep_claims=20 transient_claims=21 step_fills=22 \
+                 step_hits=23 prompt_run_ns=24 victim_run_ns=25"
             ),
             "{line}"
         );
         let names: Vec<&str> = NVTIER.parts.iter().filter_map(Part::value_name).collect();
         assert_eq!(
-            names[names.len() - 6..],
+            names[names.len() - 10..],
             [
                 "union_small",
                 "union_batched",
                 "union_fills",
                 "union_hits",
                 "keep_claims",
-                "transient_claims"
+                "transient_claims",
+                "step_fills",
+                "step_hits",
+                "prompt_run_ns",
+                "victim_run_ns"
             ]
         );
     }

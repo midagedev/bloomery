@@ -919,14 +919,19 @@ pub struct NvTierStats {
     /// those run in batches ([`TierSlots::note_union`]).
     pub union_small: u64,
     pub union_batched: u64,
-    /// Ids the pinned claims ([`NvTier::ensure_pinned`]) filled, and ids
-    /// they found filled.
+    /// Ids the prompt union's pinned claims ([`NvTier::ensure_pinned`] under
+    /// [`Claim::Keep`] and [`Claim::Transient`]) filled, and ids they found
+    /// filled.
     pub union_fills: u64,
     pub union_hits: u64,
     /// Ids the pinned claims placed as [`Claim::Keep`] and as
     /// [`Claim::Transient`]; a pinned [`Claim::Step`] counts in neither.
     pub keep_claims: u64,
     pub transient_claims: u64,
+    /// Ids the pinned [`Claim::Step`] claims (the step port's) filled, and
+    /// ids they found filled: counted here, not in the union's.
+    pub step_fills: u64,
+    pub step_hits: u64,
 }
 
 /// The atomically counted [`NvTierStats`]: a counter a field.
@@ -951,6 +956,8 @@ struct Stats {
     union_hits: AtomicU64,
     keep_claims: AtomicU64,
     transient_claims: AtomicU64,
+    step_fills: AtomicU64,
+    step_hits: AtomicU64,
     /// The last union call of each layer, kept when asked for
     /// ([`NvTier::record_unions`]); unset while off.
     unions: OnceLock<Mutex<Vec<Option<UnionBook>>>>,
@@ -958,15 +965,19 @@ struct Stats {
 
 impl Stats {
     /// A pinned claim's ids as the books found them: `hits` filled already,
-    /// `misses` to fill, placed as `kind` says.
+    /// `misses` to fill, placed as `kind` says. The hits go to the union's
+    /// counter under [`Claim::Keep`] and [`Claim::Transient`], to the step
+    /// port's under [`Claim::Step`].
     fn pinned_claim(&self, kind: Claim, hits: u64, misses: u64) {
-        self.union_hits.fetch_add(hits, Ordering::Relaxed);
-        let of_kind = match kind {
-            Claim::Keep => &self.keep_claims,
-            Claim::Transient => &self.transient_claims,
-            Claim::Step => return,
+        let (hit_counter, of_kind) = match kind {
+            Claim::Keep => (&self.union_hits, Some(&self.keep_claims)),
+            Claim::Transient => (&self.union_hits, Some(&self.transient_claims)),
+            Claim::Step => (&self.step_hits, None),
         };
-        of_kind.fetch_add(hits + misses, Ordering::Relaxed);
+        hit_counter.fetch_add(hits, Ordering::Relaxed);
+        if let Some(of_kind) = of_kind {
+            of_kind.fetch_add(hits + misses, Ordering::Relaxed);
+        }
     }
 
     /// One union call on a layer with an arena, by the path it took.
@@ -1563,6 +1574,8 @@ impl NvTier {
             union_hits: s.union_hits.load(Ordering::Relaxed),
             keep_claims: s.keep_claims.load(Ordering::Relaxed),
             transient_claims: s.transient_claims.load(Ordering::Relaxed),
+            step_fills: s.step_fills.load(Ordering::Relaxed),
+            step_hits: s.step_hits.load(Ordering::Relaxed),
         }
     }
 
@@ -2140,7 +2153,7 @@ impl NvTier {
             arena,
             &picks,
             t0.elapsed().as_nanos() as u64,
-            pin,
+            pin.then_some(kind),
         );
         Ok(held)
     }
@@ -2260,8 +2273,16 @@ fn read_pick(mem: &ArenaMem, r: &PickRead) -> Result<(), GpuError> {
 
 /// Count a fill of `picks` that ended in `wall_ns`: the slots and bytes read,
 /// the wall, the bytes the arena holds now, and the parts read through the
-/// page cache.
-fn count_fill(stats: &Stats, arena: &LayerArena, picks: &[Pick], wall_ns: u64, pinned: bool) {
+/// page cache. A pinned claim's fill (`claim` its kind) is also the union's
+/// under [`Claim::Keep`] and [`Claim::Transient`], the step port's under
+/// [`Claim::Step`]; `None`, an unpinned fill, is neither.
+fn count_fill(
+    stats: &Stats,
+    arena: &LayerArena,
+    picks: &[Pick],
+    wall_ns: u64,
+    claim: Option<Claim>,
+) {
     let mut bytes = 0u64;
     for p in picks {
         for (part, r) in arena.parts[p.id as usize].iter().enumerate() {
@@ -2275,10 +2296,13 @@ fn count_fill(stats: &Stats, arena: &LayerArena, picks: &[Pick], wall_ns: u64, p
         }
     }
     stats.fills.fetch_add(picks.len() as u64, Ordering::Relaxed);
-    if pinned {
-        stats
-            .union_fills
-            .fetch_add(picks.len() as u64, Ordering::Relaxed);
+    let of_claim = match claim {
+        Some(Claim::Keep | Claim::Transient) => Some(&stats.union_fills),
+        Some(Claim::Step) => Some(&stats.step_fills),
+        None => None,
+    };
+    if let Some(of_claim) = of_claim {
+        of_claim.fetch_add(picks.len() as u64, Ordering::Relaxed);
     }
     stats.fill_bytes.fetch_add(bytes, Ordering::Relaxed);
     stats.fill_ns.fetch_add(wall_ns, Ordering::Relaxed);
@@ -2405,7 +2429,7 @@ impl<'a> Inflight<'a> {
             )?;
         }
         if !self.picks.is_empty() {
-            count_fill(stats, arena, &self.picks, wall, true);
+            count_fill(stats, arena, &self.picks, wall, Some(self.kind));
         }
         Ok(held)
     }
@@ -2447,7 +2471,7 @@ fn fill_victims(
         let mut books = books.lock().unwrap_or_else(|e| e.into_inner());
         publish(arena, &mut books, picks, Claim::Step);
     }
-    count_fill(stats, arena, picks, t0.elapsed().as_nanos() as u64, false);
+    count_fill(stats, arena, picks, t0.elapsed().as_nanos() as u64, None);
     Ok(())
 }
 
@@ -2923,8 +2947,8 @@ mod tests {
     }
 
     /// The union's counters: a pinned claim's ids go by kind, its hits to
-    /// `union_hits` whatever the kind, a pinned step claim to neither kind;
-    /// the calls by path.
+    /// `union_hits` under keep and transient and to `step_hits` under step,
+    /// a pinned step claim to neither kind; the calls by path.
     #[test]
     fn the_union_counters_follow_the_claim_kind() {
         let s = super::Stats::default();
@@ -2937,8 +2961,13 @@ mod tests {
         let load = |a: &AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(load(&s.keep_claims), 8, "3 hits + 5 misses");
         assert_eq!(load(&s.transient_claims), 3, "1 hit + 2 misses");
-        assert_eq!(load(&s.union_hits), 8, "3 + 1 + 4: a step claim's too");
-        assert_eq!(load(&s.union_fills), 0, "the fill site counts the fills");
+        assert_eq!(load(&s.union_hits), 4, "3 + 1: a step claim's 4 are not");
+        assert_eq!(load(&s.step_hits), 4, "the step claim's 4");
+        assert_eq!(
+            (load(&s.union_fills), load(&s.step_fills)),
+            (0, 0),
+            "the fill site counts the fills"
+        );
         assert_eq!((load(&s.union_batched), load(&s.union_small)), (2, 1));
     }
 
