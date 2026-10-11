@@ -58,7 +58,7 @@ Script: Appendix A (`python3 -I`, standard library only). Inputs: the 11 held-ou
 (`crates/models/tests/data/head-holdout/*.ids`, 37,624-40,000 ids each) and the two lists.
 
 - **The lists carry no rank.** `tools/ref/draft-vocab.py` writes ascending ids and `HeadRowsError::Unsorted`
-  (`place.rs:2038`, `:2155`) refuses any other order, so "ranked high in both lists (the larger of the two ranks)" cannot be
+  (`parse_head_rows` in `crates/models/src/headpick.rs`) refuses any other order, so "ranked high in both lists (the larger of the two ranks)" cannot be
   built. The neutral bases are therefore: `lowid` (the lowest ids: byte-level BPE numbers tokens in merge order, so this is a
   prior from no data, `draft-vocab.py` docstring); `ec` (ranked by id count in the en+code halves only, then the lowest ids,
   cross-fitted: a base used on half h is trained on the other half); `both` (the ids both lists hold, 45,829, ascending, then
@@ -742,7 +742,7 @@ no per-model branch.
 |---|---|
 | name and place | `<state dir>/<model key, 16 hex>.bprof`; state dir `$XDG_STATE_HOME/bloomery` (else `~/.local/state/bloomery`), mode 0600 (`RESD` holds which experts the user's prompts routed to); lever `BLOOMERY_PROFILE=<dir>\|off`, a registry row |
 | header | magic `BPROF1`, `u32` format version, the model key, the section count |
-| model key | `arch`, `n_layer`, `n_expert`, `vocab_sha256` (the tokenizer digest, `place.rs` `vocab_sha256`), and `tensor_table_sha256`: SHA-256 over every tensor's name, type, dims and size from the GGUF header (to write in `crates/gguf`; header only, no weight read). A path is not an identity: the file moves |
+| model key | `arch`, `n_layer`, `n_expert`, `vocab_sha256` (the tokenizer digest, `models::headpick::vocab_sha256`), and `tensor_table_sha256`: SHA-256 over every tensor's name, type, dims and size from the GGUF header (to write in `crates/gguf`; header only, no weight read). A path is not an identity: the file moves |
 | section | `tag` (4 bytes: `RESD`, `WIDT`), `u32` version, `u32` length, payload, CRC32 of the payload; an unknown tag is carried through a rewrite untouched; every section in the file is card-wide, and a session-scoped tag is refused by the writer |
 | `RESD` payload | per layer x expert `u16` counts (the rule's decayed counts): layers x experts x 2 B, tens of KB `[derived]`; codec in `runtime::swaprule` |
 | `WIDT` payload | the chooser's per-width gains, mean, seen: < 1 KB; codec in `runtime::width` |

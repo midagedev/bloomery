@@ -40,12 +40,10 @@
 //! spreads within its card's budget less the draft's card bytes, so the sum
 //! fits.
 
-use std::path::Path;
-
 use bloomery_placement::slots::{SeqTerms, Stores};
-use gguf::{GgmlType, Split, Value};
-use models::{DraftSpec, Ffn, HcKind, HeadRows, Mixer, ModelSpec, MtpDraft, MtpSource, Role};
-use sha2::{Digest, Sha256};
+use gguf::{GgmlType, Split};
+use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
+use models::{DraftSpec, Ffn, HcKind, Mixer, ModelSpec, MtpDraft, MtpSource, Role};
 
 use super::hparams::{Hparams, Kind};
 use super::{mtp, names, roles, spec};
@@ -1766,7 +1764,7 @@ impl MtpInputs {
         draft: &Split,
         target: &Split,
         inputs: &PlanInputs,
-        rows: HeadRows,
+        rows: HeadSet,
     ) -> Result<MtpInputs, PlaceError> {
         inputs.mtp_borrows()?;
         let d = match mtp::mtp_of(draft, target, &inputs.spec)? {
@@ -1805,7 +1803,7 @@ impl MtpInputs {
             }
             .into());
         }
-        if let HeadRows::List { digest, .. } = &rows {
+        if let HeadSet::List { digest, .. } = &rows {
             let want = vocab_sha256(target)?;
             if *digest != want {
                 return Err(HeadRowsError::Digest {
@@ -1988,251 +1986,6 @@ impl KvBytes for MtpKv {
         let ctx = usize::try_from(ctx_max).expect("MtpKv: a context of usize");
         dense_kv_bytes(self.kv_heads, self.head_dim, ctx)
     }
-}
-
-// ------------------------------------------------------- the head's row list
-
-/// The row list file's first line, before its fields.
-pub const HEAD_ROWS_FORMAT: &str = "# bloomery mtp-head-rows 1";
-
-/// The fields of the row list's first line, in order.
-const HEAD_ROWS_FIELDS: [&str; 3] = ["vocab", "rows", "vocab_sha256"];
-
-/// Why a row list is refused.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum HeadRowsError {
-    #[error("head rows {what}: cannot read: {detail}")]
-    Read { what: String, detail: String },
-    #[error(
-        "head rows {what}: line 1 is not `{HEAD_ROWS_FORMAT} vocab=<n> rows=<n> \
-         vocab_sha256=<64 hex digits>`: {line:?}"
-    )]
-    Header { what: String, line: String },
-    #[error("head rows {what}: the first line's {field}: {detail}")]
-    Field {
-        what: String,
-        field: &'static str,
-        detail: String,
-    },
-    #[error("head rows {what}: a list over a vocabulary of {file}; the target's has {target}")]
-    Vocab {
-        what: String,
-        file: u64,
-        target: u32,
-    },
-    #[error("head rows {what}: vocab_sha256 {file}; the target's tokenizer is {target}")]
-    Digest {
-        what: String,
-        file: String,
-        target: String,
-    },
-    #[error("head rows {what}: line {line}: {text:?} is not a token id")]
-    NotAnId {
-        what: String,
-        line: usize,
-        text: String,
-    },
-    #[error("head rows {what}: line {line}: id {id} is past the vocabulary of {vocab}")]
-    PastVocab {
-        what: String,
-        line: usize,
-        id: u32,
-        vocab: u32,
-    },
-    #[error("head rows {what}: line {line}: id {id} again")]
-    Duplicate { what: String, line: usize, id: u32 },
-    #[error("head rows {what}: line {line}: id {id} after {prev}; the ids ascend")]
-    Unsorted {
-        what: String,
-        line: usize,
-        id: u32,
-        prev: u32,
-    },
-    #[error("head rows {what}: the first line says {said} rows, the file lists {listed}")]
-    Count {
-        what: String,
-        said: u64,
-        listed: usize,
-    },
-    #[error(
-        "head rows {what}: {rows} rows; a list holds 1 to {max} (the whole vocabulary is the \
-         full head)"
-    )]
-    Size { what: String, rows: usize, max: u32 },
-}
-
-/// The row list in `text` (`what` names it in a refusal), for a target of
-/// `vocab` tokens whose tokenizer digests to `digest` ([`vocab_sha256`]):
-/// the first line [`HEAD_ROWS_FORMAT`] and its three fields, then one
-/// decimal id a line. Refused by name: a first line of another form, a field
-/// absent, repeated, unknown or malformed; a vocabulary or a digest other
-/// than the target's; a line that is not an id (a blank one too); an id at
-/// or past `vocab`, repeated, or below the one before; a count other than
-/// the first line's, or outside `1..vocab`.
-pub fn parse_head_rows(
-    what: &str,
-    text: &str,
-    vocab: u32,
-    digest: &[u8; 32],
-) -> Result<HeadRows, HeadRowsError> {
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or("");
-    let header = || HeadRowsError::Header {
-        what: what.to_string(),
-        line: first.to_string(),
-    };
-    let rest = first
-        .strip_prefix(HEAD_ROWS_FORMAT)
-        .filter(|r| r.is_empty() || r.starts_with(' '))
-        .ok_or_else(header)?;
-    let field = |field: &'static str, detail: String| HeadRowsError::Field {
-        what: what.to_string(),
-        field,
-        detail,
-    };
-    let mut values: [Option<&str>; 3] = [None; 3];
-    for pair in rest.split_whitespace() {
-        let (key, value) = pair.split_once('=').ok_or_else(header)?;
-        let Some(i) = HEAD_ROWS_FIELDS.iter().position(|k| *k == key) else {
-            return Err(header());
-        };
-        if values[i].replace(value).is_some() {
-            return Err(field(HEAD_ROWS_FIELDS[i], "is given twice".to_string()));
-        }
-    }
-    let get = |i: usize| values[i].ok_or_else(|| field(HEAD_ROWS_FIELDS[i], "is absent".into()));
-    let number = |i: usize| -> Result<u64, HeadRowsError> {
-        let v = get(i)?;
-        v.parse::<u64>()
-            .map_err(|_| field(HEAD_ROWS_FIELDS[i], format!("{v:?} is not a count")))
-    };
-    let file_vocab = number(0)?;
-    let said = number(1)?;
-    let file_digest = get(2)?;
-    if file_digest.len() != 64 || !file_digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(field(
-            "vocab_sha256",
-            format!("{file_digest:?} is not 64 hex digits"),
-        ));
-    }
-    if file_vocab != u64::from(vocab) {
-        return Err(HeadRowsError::Vocab {
-            what: what.to_string(),
-            file: file_vocab,
-            target: vocab,
-        });
-    }
-    let want = hex(digest);
-    if !file_digest.eq_ignore_ascii_case(&want) {
-        return Err(HeadRowsError::Digest {
-            what: what.to_string(),
-            file: file_digest.to_string(),
-            target: want,
-        });
-    }
-    let mut ids: Vec<u32> = Vec::new();
-    for (i, text) in lines.enumerate() {
-        let line = i + 2;
-        let at = |text: &str| HeadRowsError::NotAnId {
-            what: what.to_string(),
-            line,
-            text: text.to_string(),
-        };
-        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(at(text));
-        }
-        let id: u32 = text.parse().map_err(|_| at(text))?;
-        if id >= vocab {
-            return Err(HeadRowsError::PastVocab {
-                what: what.to_string(),
-                line,
-                id,
-                vocab,
-            });
-        }
-        match ids.last() {
-            Some(&prev) if prev == id => {
-                return Err(HeadRowsError::Duplicate {
-                    what: what.to_string(),
-                    line,
-                    id,
-                });
-            }
-            Some(&prev) if prev > id => {
-                return Err(HeadRowsError::Unsorted {
-                    what: what.to_string(),
-                    line,
-                    id,
-                    prev,
-                });
-            }
-            _ => {}
-        }
-        ids.push(id);
-    }
-    if u64::try_from(ids.len()).ok() != Some(said) {
-        return Err(HeadRowsError::Count {
-            what: what.to_string(),
-            said,
-            listed: ids.len(),
-        });
-    }
-    if ids.is_empty() || ids.len() >= vocab as usize {
-        return Err(HeadRowsError::Size {
-            what: what.to_string(),
-            rows: ids.len(),
-            max: vocab.saturating_sub(1),
-        });
-    }
-    Ok(HeadRows::List {
-        ids: ids.into(),
-        digest: *digest,
-    })
-}
-
-/// The row list at `path` ([`parse_head_rows`]) for the target file
-/// `target`, of `vocab` tokens: its tokenizer digested ([`vocab_sha256`]).
-pub fn read_head_rows(path: &Path, target: &Split, vocab: u32) -> Result<HeadRows, PlaceError> {
-    let what = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|e| HeadRowsError::Read {
-        what: what.clone(),
-        detail: e.to_string(),
-    })?;
-    let digest = vocab_sha256(target)?;
-    Ok(parse_head_rows(&what, &text, vocab, &digest)?)
-}
-
-/// The SHA-256 of `split`'s vocabulary: each entry of
-/// `tokenizer.ggml.tokens`, in id order, as its UTF-8 bytes' count (u64,
-/// little-endian) and the bytes — the array's payload as the file stores it
-/// (`tools/ref/draft-vocab.py` reads the same bytes). Refused by name: no
-/// array, an entry that is not a string, and one holding U+FFFD, which is
-/// what the reader makes of bytes that are not UTF-8, so its bytes are not
-/// the file's.
-pub fn vocab_sha256(split: &Split) -> Result<[u8; 32], PlacementError> {
-    let key = crate::arch::TOKENS;
-    let refuse = |detail: String| PlacementError::Metadata {
-        key: key.to_string(),
-        detail,
-    };
-    let Some(Value::Array(tokens)) = split.value(key) else {
-        return Err(refuse("is absent or not an array".to_string()));
-    };
-    let mut h = Sha256::new();
-    for (i, t) in tokens.iter().enumerate() {
-        let Value::String(s) = t else {
-            return Err(refuse(format!("entry {i} is {t:?}, not a string")));
-        };
-        if s.contains('\u{FFFD}') {
-            return Err(refuse(format!(
-                "entry {i} holds U+FFFD, the reader's stand-in for bytes that are not UTF-8: \
-                 its file bytes cannot be digested"
-            )));
-        }
-        h.update((s.len() as u64).to_le_bytes());
-        h.update(s.as_bytes());
-    }
-    Ok(h.finalize().into())
 }
 
 #[cfg(test)]
@@ -2661,17 +2414,15 @@ mod tests {
     }
 
     mod mtp {
-        use std::sync::Arc;
-
         use gguf::GgmlType;
+        use models::headpick::{HeadSet, vocab_sha256};
         use models::{
-            Act, Borrows, Ffn, Gqa, HcKind, HcSpec, HeadRows, LayerSpec, Mixer, Moe, MtpDraft,
-            MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode, Router, Score, Shared,
+            Act, Borrows, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, Moe, MtpDraft, MtpHeadNorm,
+            MtpInput, MtpSource, Residual, Rope, RopeMode, Router, Score, Shared,
         };
 
         use super::super::{
-            FileTensor, HEAD_ROWS_FORMAT, HeadRowsError, MtpInputs, MtpLoad, mtp_arena_bytes,
-            mtp_tensors, mtp_widened, parse_head_rows, vocab_sha256,
+            FileTensor, MtpInputs, MtpLoad, mtp_arena_bytes, mtp_tensors, mtp_widened,
         };
         use crate::arch::synthetic::header;
         use crate::fileio::hex;
@@ -2698,7 +2449,7 @@ mod tests {
         }
 
         /// Qwen3.8's MTP layer as `mtp_of` reads the shared file.
-        pub(super) fn draft(head_rows: HeadRows) -> MtpDraft {
+        pub(super) fn draft(head_rows: HeadSet) -> MtpDraft {
             MtpDraft {
                 source: MtpSource::File {
                     first_shard: "/m/mtp.gguf".into(),
@@ -2768,7 +2519,7 @@ mod tests {
         /// (name) order: the statement's forms, the indexer's projections
         /// BF16 and its norms F32 [the header dump].
         pub(super) fn file() -> Vec<FileTensor> {
-            let d = draft(HeadRows::Full);
+            let d = draft(HeadSet::Full);
             let mut out: Vec<FileTensor> = mtp_tensors(&d)
                 .expect("the layer's statement")
                 .into_iter()
@@ -2813,8 +2564,8 @@ mod tests {
         const LIST_ROWS: usize = 40_960;
         const MAP: u64 = 993_280;
 
-        fn list(n: usize) -> HeadRows {
-            HeadRows::List {
+        fn list(n: usize) -> HeadSet {
+            HeadSet::List {
                 ids: (0..n as u32).map(|i| i * 6).collect::<Vec<_>>().into(),
                 digest: [7; 32],
             }
@@ -2827,8 +2578,8 @@ mod tests {
         /// rows.
         #[test]
         fn mtp_card_bytes() {
-            for rows in [HeadRows::Full, list(LIST_ROWS)] {
-                let with_list = matches!(rows, HeadRows::List { .. });
+            for rows in [HeadSet::Full, list(LIST_ROWS)] {
+                let with_list = matches!(rows, HeadSet::List { .. });
                 let m = MtpInputs::from_parts(draft(rows), &file()).expect("the draft's inputs");
                 let plan = placement::plan_routed(
                     &m.model,
@@ -2885,7 +2636,7 @@ mod tests {
         /// the indexer's four unread.
         #[test]
         fn mtp_statement_loads() {
-            let t = mtp_tensors(&draft(HeadRows::Full)).expect("the statement");
+            let t = mtp_tensors(&draft(HeadSet::Full)).expect("the statement");
             let count = |f: fn(&MtpLoad) -> bool| t.iter().filter(|x| f(&x.load)).count();
             assert_eq!(t.len(), 32);
             assert_eq!(count(|l| matches!(l, MtpLoad::Card(_))), 26);
@@ -2896,7 +2647,7 @@ mod tests {
         #[test]
         fn a_draft_tensor_of_another_form_absent_or_foreign_is_refused() {
             let err = |f: Vec<FileTensor>| {
-                MtpInputs::from_parts(draft(HeadRows::Full), &f)
+                MtpInputs::from_parts(draft(HeadSet::Full), &f)
                     .expect_err("refused")
                     .to_string()
             };
@@ -2918,7 +2669,7 @@ mod tests {
             let mut f = file();
             f.retain(|t| !t.name.contains("indexer."));
             assert!(
-                MtpInputs::from_parts(draft(HeadRows::Full), &f).is_ok(),
+                MtpInputs::from_parts(draft(HeadSet::Full), &f).is_ok(),
                 "a file without the unread indexer reads"
             );
             let mut f = file();
@@ -2933,174 +2684,6 @@ mod tests {
                 err(f).contains("tensor output.weight: is in the draft file and is none"),
                 "foreign"
             );
-        }
-
-        const DIGEST: [u8; 32] = [0xab; 32];
-
-        fn rows_file(vocab: u32, ids: &[u32], said: usize) -> String {
-            let mut s = format!(
-                "{HEAD_ROWS_FORMAT} vocab={vocab} rows={said} vocab_sha256={}\n",
-                hex(&DIGEST)
-            );
-            for id in ids {
-                s.push_str(&format!("{id}\n"));
-            }
-            s
-        }
-
-        #[test]
-        fn a_row_list_reads() {
-            let got = parse_head_rows("t", &rows_file(10, &[0, 3, 9], 3), 10, &DIGEST);
-            assert_eq!(
-                got,
-                Ok(HeadRows::List {
-                    ids: Arc::from(vec![0, 3, 9]),
-                    digest: DIGEST
-                })
-            );
-        }
-
-        /// A refusal case: what it breaks, the file, the refusal it wants.
-        type Case = (&'static str, String, fn(&HeadRowsError) -> bool);
-
-        /// Every refusal, each by its name.
-        #[test]
-        fn a_row_list_is_refused_by_name() {
-            let digest_line = format!("vocab_sha256={}", hex(&DIGEST));
-            let cases: Vec<Case> = vec![
-                ("no header", "0\n1\n".to_string(), |e| {
-                    matches!(e, HeadRowsError::Header { .. })
-                }),
-                ("empty", String::new(), |e| {
-                    matches!(e, HeadRowsError::Header { .. })
-                }),
-                (
-                    "digest absent",
-                    format!("{HEAD_ROWS_FORMAT} vocab=10 rows=1\n0\n"),
-                    |e| {
-                        matches!(
-                            e,
-                            HeadRowsError::Field {
-                                field: "vocab_sha256",
-                                ..
-                            }
-                        )
-                    },
-                ),
-                (
-                    "field twice",
-                    format!("{HEAD_ROWS_FORMAT} vocab=10 vocab=10 rows=1 {digest_line}\n0\n"),
-                    |e| matches!(e, HeadRowsError::Field { field: "vocab", .. }),
-                ),
-                (
-                    "unknown field",
-                    format!("{HEAD_ROWS_FORMAT} vocab=10 rows=1 size=3 {digest_line}\n0\n"),
-                    |e| matches!(e, HeadRowsError::Header { .. }),
-                ),
-                (
-                    "short digest",
-                    format!("{HEAD_ROWS_FORMAT} vocab=10 rows=1 vocab_sha256=abcd\n0\n"),
-                    |e| {
-                        matches!(
-                            e,
-                            HeadRowsError::Field {
-                                field: "vocab_sha256",
-                                ..
-                            }
-                        )
-                    },
-                ),
-                (
-                    "other digest",
-                    format!(
-                        "{HEAD_ROWS_FORMAT} vocab=10 rows=1 vocab_sha256={}\n0\n",
-                        hex(&[0xcd; 32])
-                    ),
-                    |e| matches!(e, HeadRowsError::Digest { .. }),
-                ),
-                ("other vocab", rows_file(11, &[0], 1), |e| {
-                    matches!(
-                        e,
-                        HeadRowsError::Vocab {
-                            file: 11,
-                            target: 10,
-                            ..
-                        }
-                    )
-                }),
-                ("not an id", rows_file(10, &[0], 1) + "x\n", |e| {
-                    matches!(e, HeadRowsError::NotAnId { line: 3, .. })
-                }),
-                ("blank line", rows_file(10, &[0], 1) + "\n", |e| {
-                    matches!(e, HeadRowsError::NotAnId { line: 3, .. })
-                }),
-                ("signed", rows_file(10, &[], 0) + "+1\n", |e| {
-                    matches!(e, HeadRowsError::NotAnId { line: 2, .. })
-                }),
-                ("past the vocabulary", rows_file(10, &[0, 10], 2), |e| {
-                    matches!(
-                        e,
-                        HeadRowsError::PastVocab {
-                            line: 3,
-                            id: 10,
-                            ..
-                        }
-                    )
-                }),
-                ("duplicate", rows_file(10, &[0, 4, 4], 3), |e| {
-                    matches!(e, HeadRowsError::Duplicate { line: 4, id: 4, .. })
-                }),
-                ("unsorted", rows_file(10, &[0, 5, 4], 3), |e| {
-                    matches!(
-                        e,
-                        HeadRowsError::Unsorted {
-                            line: 4,
-                            id: 4,
-                            prev: 5,
-                            ..
-                        }
-                    )
-                }),
-                ("count", rows_file(10, &[0, 1], 3), |e| {
-                    matches!(
-                        e,
-                        HeadRowsError::Count {
-                            said: 3,
-                            listed: 2,
-                            ..
-                        }
-                    )
-                }),
-                ("no rows", rows_file(10, &[], 0), |e| {
-                    matches!(e, HeadRowsError::Size { rows: 0, .. })
-                }),
-                (
-                    "the whole vocabulary",
-                    rows_file(4, &[0, 1, 2, 3], 4),
-                    |e| {
-                        matches!(
-                            e,
-                            HeadRowsError::Size {
-                                rows: 4,
-                                max: 3,
-                                ..
-                            }
-                        )
-                    },
-                ),
-            ];
-            for (what, text, want) in cases {
-                let vocab = if what == "the whole vocabulary" {
-                    4
-                } else {
-                    10
-                };
-                let got = parse_head_rows("t", &text, vocab, &DIGEST);
-                match got {
-                    Err(e) if want(&e) => {}
-                    other => panic!("{what}: {other:?}"),
-                }
-            }
         }
 
         /// The vocabulary digest: the synthetic header's two tokens, "a" and
@@ -3128,7 +2711,8 @@ mod tests {
         use std::num::NonZeroU64;
 
         use gguf::GgmlType;
-        use models::{Arch, ChatSpec, HeadRows, ModelSpec};
+        use models::headpick::HeadSet;
+        use models::{Arch, ChatSpec, ModelSpec};
 
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes,
@@ -3365,7 +2949,7 @@ mod tests {
         fn slot_plans_count_every_term_per_slot() {
             let (inputs, machine) = (inputs(), machine());
             let mtp =
-                MtpInputs::from_parts(draft(HeadRows::Full), &file()).expect("the draft's inputs");
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();
             for n in [1, 2, 4] {
                 let slots = n as u64;
@@ -3441,7 +3025,7 @@ mod tests {
         fn slot_plans_keep_the_headroom_usable_less_every_term() {
             let (inputs, machine) = (inputs(), machine());
             let mtp =
-                MtpInputs::from_parts(draft(HeadRows::Full), &file()).expect("the draft's inputs");
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();
             let tiered = routed(self::inputs());
             let batch = tier_batch_of(2560, 10, 4096);
@@ -3548,7 +3132,7 @@ mod tests {
         fn bp_reserves_the_drafts_slots() {
             let inputs = inputs();
             let mtp =
-                MtpInputs::from_parts(draft(HeadRows::Full), &file()).expect("the draft's inputs");
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();
             let batch = tier_batch_of(2560, 10, 4096);
             for n in [1, 2, 4] {

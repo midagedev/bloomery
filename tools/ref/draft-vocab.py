@@ -10,7 +10,7 @@ target emits and what the corpora hold.
 --target is the target model's first shard. Its header gives the vocabulary (`tokenizer.ggml.tokens`),
 its digest and the end and padding ids, which the list always holds. The digest is SHA-256 over every
 token in id order: its UTF-8 byte count (u64, little-endian), then the bytes. That is the array's
-payload as the file stores it, and `model::arch::qwen35moe::place::vocab_sha256` computes the same. A
+payload as the file stores it, and `models::headpick::vocab_sha256` computes the same. A
 token whose bytes are not UTF-8, or that holds U+FFFD, is refused by both. The Rust reader decodes
 lossily, so it cannot see such a token's bytes.
 
