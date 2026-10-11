@@ -160,7 +160,7 @@ impl Checkpoints {
     ) -> Result<Checkpoints, GpuError> {
         let cap = seqstate::capacity(budget, point_bytes(&lens)).map_err(refused)?;
         Ok(Checkpoints {
-            ledger: Ledger::new(cap).map_err(refused)?,
+            ledger: Ledger::new(cap, every).map_err(refused)?,
             lens,
             slots: Vec::new(),
             points: Vec::new(),
@@ -204,6 +204,14 @@ impl Checkpoints {
     #[must_use]
     pub fn positions(&self) -> Vec<u32> {
         self.ledger.positions()
+    }
+
+    /// The points a save at `pos` carries, ascending: every anchor of the
+    /// ledger below `pos` and the last point below it
+    /// ([`seqstate::save_points`]). The one pick, whatever the family.
+    #[must_use]
+    pub fn save_points(&self, pos: u32) -> Vec<u32> {
+        seqstate::save_points(&self.ledger.positions(), pos, self.every)
     }
 
     /// What a cut to at most `n` keeps of the `held` positions, and why.

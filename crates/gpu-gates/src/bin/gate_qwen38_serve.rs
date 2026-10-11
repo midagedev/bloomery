@@ -223,6 +223,13 @@
 //!   fixed window; a chooser its clock drives promises no count twice), and
 //!   the seat under its own defaults (the slots clause's second server)
 //!   holds the chooser's records but no id equality.
+//! - the shared-prefix clause ([`prefix`], a server of its own under
+//!   `BLOOMERY_DRAFT=off` and `BLOOMERY_RESIDENCY=off` at a context of two
+//!   checkpoint spacings): a prompt past the first spacing answered and
+//!   another taking the slot, then a request that shares only the prompt's
+//!   first ids restores from the host cache at the spacing's multiple
+//!   below them (the saved state carries the doubling multiples beside its
+//!   last point), its ids a fresh run's.
 //! - the sampled rounds clauses ([`slots_sampled_rounds`], a server of its
 //!   own under `BLOOMERY_DRAFT=off`, `BLOOMERY_RESIDENCY=off` and
 //!   `BLOOMERY_STEP_STATS=1`, `--parallel 2`): two sampled streamed
@@ -418,12 +425,14 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, checkpoint_budget38, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
+        Body38, CHECKPOINT_EVERY, checkpoint_budget38, checkpoint_bytes, seq_positional_bytes,
+        seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
+        PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore, server_log,
+        stage_usable,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -475,6 +484,21 @@ mod gate {
     const POLL: Duration = Duration::from_secs(5);
     /// The greedy requests' length, `generate_qwen3moe -n 16`'s.
     const N_PREDICT: usize = 16;
+    /// The shared-prefix clause's prompt A in ids, the ids C shares with it,
+    /// the `cache_n` C keeps (the checkpoints' first multiple, the doubling
+    /// multiple nearest at or below the shared ids) and the context its
+    /// server holds. The checkpoints' spacing is the ubatch's, so A passes it
+    /// and C shares more than it but not the next multiple.
+    const PREFIX_A: usize = 4_400;
+    const PREFIX_SHARED: usize = 4_200;
+    const PREFIX_KEPT: u64 = CHECKPOINT_EVERY as u64;
+    const PREFIX_CTX: usize = 2 * CHECKPOINT_EVERY as usize;
+    const _: () = assert!(
+        PREFIX_A + N_PREDICT < PREFIX_CTX
+            && PREFIX_KEPT as usize <= PREFIX_SHARED
+            && PREFIX_SHARED < 2 * CHECKPOINT_EVERY as usize
+            && PREFIX_SHARED < PREFIX_A
+    );
     /// The context the servers are started at (`SERVER_ARGS`), and the one
     /// the default's expert cost is counted against.
     const CTX: usize = 4096;
@@ -2685,6 +2709,56 @@ mod gate {
         Ok(ok)
     }
 
+    /// The shared-prefix clause ([`prefix_restore`]) on a server of its own at
+    /// [`PREFIX_CTX`]: prompt A of [`PREFIX_A`] ids from the gate's turn, B
+    /// another turn, and C sharing [`PREFIX_SHARED`] of A's ids keeps
+    /// [`PREFIX_KEPT`] of them from the host cache (the checkpoint at the
+    /// first spacing multiple, which the saved state carries beside its last
+    /// one), its ids a fresh run's.
+    ///
+    /// Mutant: a save that carries its last checkpoint alone (C keeps 0).
+    fn prefix(dir: &Path) -> Result<bool, GateError> {
+        let own = dir.join("prefix");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let ctx = PREFIX_CTX.to_string();
+        let args = [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--place",
+            "gate",
+            "--ctx-size",
+            &ctx,
+            "--slot-save-path",
+            "/tmp",
+            "--parallel",
+            "1",
+        ];
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "off")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        println!("prefix server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let t = PrefixRestore {
+            a: TURN_A,
+            b: TURN_B,
+            tail: STRIPPED_A,
+            a_len: PREFIX_A,
+            shared: PREFIX_SHARED,
+            kept: PREFIX_KEPT,
+            n: N_PREDICT,
+        };
+        prefix_restore(&url, &own, &mut ok, &t, &|| erase(&url))?;
+        println!("prefix server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// The width chooser's own server (the module header): the draft on,
     /// the residency off and `BLOOMERY_MTP_WIDTH=cost`, one greedy request
     /// of the gate's prompt then a one-id flush — the chooser's `mtp width`
@@ -4420,6 +4494,7 @@ mod gate {
         ok &= cache(&url, &err_log, false, "plain")?;
 
         println!("server stopped: {}", served.stop()?);
+        ok &= prefix(dir)?;
         ok &= ctx(dir, levers)?;
         ok &= paged(dir, levers, prompt)?;
         ok &= draft_slot_share(dir)?;

@@ -2382,14 +2382,14 @@ impl Body38 {
 
     /// What every save takes before its copy: the sequence state at `pos`,
     /// where the stores stand (a waiting cut carried out first), the draft's
-    /// side read (blocking), the PLE history and the last point below `pos`
-    /// as the state's host values, the stores lent, and `take` (the copy, on
-    /// the engine stream or on a lane) run on them. The K/V planes' rows, the
-    /// raw keys' and the pooled keys' of positions below `pos`, the recurrent
-    /// stores at `pos` and at the last checkpoint below it (the last prompt
-    /// call's end), each with its PLE history. Refused by name while a verify
-    /// waits, after a call failed past its launch, and when the history
-    /// disagrees.
+    /// side read (blocking), the PLE history and the checkpoints' pick for
+    /// `pos` ([`Checkpoints::save_points`]) as the state's host values, the
+    /// stores lent, and `take` (the copy, on the engine stream or on a lane)
+    /// run on them. The K/V planes' rows, the raw keys' and the pooled keys'
+    /// of positions below `pos`, the recurrent stores at `pos` and at each
+    /// picked point, each with its PLE history. Refused by name while a verify
+    /// waits, after a call failed past its launch, when the history
+    /// disagrees, and for a picked point with no PLE history.
     fn take_state<R>(
         &mut self,
         stream: &CudaStream,
@@ -2425,14 +2425,23 @@ impl Body38 {
                 ),
             ));
         }
-        let points: Vec<(u32, History)> = self
-            .ple_points
-            .iter()
-            .rev()
-            .find(|&&(p, _)| p < pos)
-            .cloned()
+        let points = self
+            .ckpt
+            .save_points(pos)
             .into_iter()
-            .collect();
+            .map(|p| {
+                self.ple_points
+                    .iter()
+                    .find(|&&(q, _)| q == p)
+                    .map(|(_, h)| (p, h.clone()))
+                    .ok_or_else(|| {
+                        GpuError::shape(
+                            WHAT_S,
+                            format!("a snapshot at {pos} picks the point at {p}, which has no PLE history"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<(u32, History)>, GpuError>>()?;
         let lane = self.lane.lane();
         // The draft's rows read the draft's store and the arenas, none of the
         // copies below, and `Copied`'s drop holds its borrow to the end.

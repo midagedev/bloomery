@@ -8,7 +8,8 @@
 //! ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
 //! chat answer held to a completion's ids ([`chat_is_those_ids`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
-//! ([`edit_and_extension`]).
+//! ([`edit_and_extension`]) and of one whose prompt cache holds a saved
+//! state's checkpoints ([`prefix_restore`]).
 
 use std::fs::File;
 use std::io::Write;
@@ -477,6 +478,109 @@ pub fn edit_and_extension(
         ok,
         "extension_keeps_every_held_position",
         held_run.cache_n == 0 && resend.cache_n == held && !resend.tokens.is_empty(),
+    );
+    Ok(())
+}
+
+/// The clause of a seat whose prompt cache carries checkpoints a request can
+/// restore: the prompt `a` answered and saved, another request that takes the
+/// slot, then a request that shares only the first `shared` ids of `a`.
+pub struct PrefixRestore<'a> {
+    /// The texts the long prompts repeat: prompt A's, B's (another prompt,
+    /// whose first id is not A's) and the ids C ends with in place of A's.
+    pub a: &'a str,
+    pub b: &'a str,
+    pub tail: &'a str,
+    /// The ids of A, and the first ones C shares with it.
+    pub a_len: usize,
+    pub shared: usize,
+    /// `cache_n` C keeps: the nearest checkpoint the saved state carries at
+    /// or below `shared`.
+    pub kept: u64,
+    /// The tokens each request makes.
+    pub n: usize,
+}
+
+/// `text` repeated until it holds `len` ids, cut to them.
+fn repeated_ids(
+    url: &dyn Fn(&str) -> String,
+    text: &str,
+    len: usize,
+) -> Result<Vec<u32>, GateError> {
+    let one = tokenized(url, text)?.len().max(1);
+    let mut ids = tokenized(url, &format!("{text} ").repeat(len / one + 2))?;
+    if ids.len() < len {
+        return Err(format!(
+            "{:?} repeated holds {} ids, short of {len}",
+            text,
+            ids.len()
+        )
+        .into());
+    }
+    ids.truncate(len);
+    Ok(ids)
+}
+
+/// A shared prefix restores from the host cache: A of `t.a_len` ids is
+/// answered, B takes the slot (so the slot no longer holds A and A's state is
+/// saved), and C — A's first `t.shared` ids and then another tail — keeps
+/// `t.kept` ids (`cache_n`), restored from the host cache at the nearest
+/// checkpoint of A's state at or below `t.shared`, and answers the ids of C
+/// fed fresh on a dropped slot (`erase`). The cache keeps a state's
+/// checkpoints at the doubling multiples of the spacing and the last one
+/// (`runtime::seqstate::save_points`), so a prefix inside the prompt, below
+/// the last checkpoint, still restores.
+///
+/// Mutant: the save carries the last checkpoint alone (C keeps nothing).
+pub fn prefix_restore(
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+    ok: &mut bool,
+    t: &PrefixRestore,
+    erase: &dyn Fn() -> Result<(), GateError>,
+) -> Result<(), GateError> {
+    let a = repeated_ids(url, t.a, t.a_len)?;
+    let b = repeated_ids(url, t.b, t.a_len / 4)?;
+    let tail = tokenized(url, t.tail)?;
+    if t.shared >= t.a_len || tail.is_empty() || a[t.shared] == tail[0] || a[0] == b[0] {
+        return Err(format!(
+            "the prefix clause's prompts: C shares {} of A's {} ids and then {:?}, A's next id {:?};              B starts {:?} against A's {:?}: C must diverge at {} and B at 0",
+            t.shared,
+            t.a_len,
+            tail.first(),
+            a.get(t.shared),
+            b.first(),
+            a.first(),
+            t.shared
+        )
+        .into());
+    }
+    let c: Vec<u32> = a[..t.shared].iter().chain(&tail).copied().collect();
+    erase()?;
+    let (first, _) = greedy(url, a, t.n, dir, "prefix_a", true)?;
+    let (other, _) = greedy(url, b, t.n, dir, "prefix_b", true)?;
+    let (shared, _) = greedy(url, c.clone(), t.n, dir, "prefix_c", true)?;
+    erase()?;
+    let (cold, _) = greedy(url, c, t.n, dir, "prefix_c_cold", false)?;
+    println!(
+        "prefix: A {} ids, B {} ids, C shares {} of A and keeps {} (want {}); its ids {:?}, cold {:?}",
+        first.prompt.len(),
+        other.prompt.len(),
+        t.shared,
+        shared.cache_n,
+        t.kept,
+        shared.tokens,
+        cold.tokens
+    );
+    check(
+        ok,
+        "prefix_c_restores_the_nearest_checkpoint_from_the_host_cache",
+        !first.tokens.is_empty() && !other.tokens.is_empty() && shared.cache_n == t.kept,
+    );
+    check(
+        ok,
+        "prefix_c_ids_are_a_fresh_runs",
+        !cold.tokens.is_empty() && shared.tokens == cold.tokens && cold.cache_n == 0,
     );
     Ok(())
 }

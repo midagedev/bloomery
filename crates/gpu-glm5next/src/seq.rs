@@ -6,9 +6,10 @@
 //! - every latent layer's latent rows, index rows and pool keys of the held
 //!   positions — the attention's cache, indexed by position;
 //! - every KDA layer's committed state lane and conv ring at the held
-//!   position, and at the last checkpoint below it (the last prompt call's
-//!   end), so a later request that shares only that prefix cuts there — a
-//!   KDA layer keeps no earlier position but a copy;
+//!   position, and at each point the checkpoints' pick carries
+//!   ([`Checkpoints::save_points`]: the doubling marks below the position and
+//!   the last one), so a later request that shares only a prefix cuts at the
+//!   nearest of them — a KDA layer keeps no earlier position but a copy;
 //! - on a NextN load, the layer's store rows of the held positions (its
 //!   latent rows, index rows and pool keys), the positions the store holds,
 //!   and the step's and the verify's arena rows ([`DraftRows`]): what a
@@ -138,8 +139,8 @@ fn lend<'a>(
 
 impl Body {
     /// What every save takes before its copy: a waiting cut carried out, the
-    /// NextN side read, the last checkpoint below `pos` as the point, the
-    /// stores lent, and `take` (the copy, on the engine stream or on a lane)
+    /// NextN side read, the checkpoints' pick for `pos`
+    /// ([`Checkpoints::save_points`]) as the points, the stores lent, and `take` (the copy, on the engine stream or on a lane)
     /// run on them. Refused by name while a verify waits for its commit,
     /// after a step failed past its launch, and on a NextN load whose store
     /// holds positions past `pos`.
@@ -159,12 +160,9 @@ impl Body {
         let draft = self.draft_rows(stream, pos)?;
         let points: Vec<(u32, ())> = self
             .ckpt
-            .positions()
+            .save_points(pos)
             .into_iter()
-            .rev()
-            .find(|&p| p < pos)
             .map(|p| (p, ()))
-            .into_iter()
             .collect();
         let lane = self.s.lanes.committed();
         let (mut positional, mut recurrent) = lend(

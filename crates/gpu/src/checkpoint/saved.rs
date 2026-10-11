@@ -1008,6 +1008,32 @@ mod tests {
         assert_eq!(rec.to_host_vec(&stream).expect("rec"), [3.0; 4]);
     }
 
+    /// (e) A state of 2,200 positions that carries the points 512, 1,024 and
+    /// 2,048 keeps what a request asks to the nearest of them at or below it:
+    /// a prefix inside the prompt comes back at a doubling point, one below
+    /// the first at none, and a request that holds the whole state keeps it.
+    #[test]
+    fn a_state_with_several_points_keeps_the_nearest_at_or_below() {
+        let state = SeqState::<()> {
+            who: who(),
+            positions: 2_200,
+            host: Host::Owned {
+                rows: Vec::new(),
+                recurrent: Vec::new(),
+            },
+            runs: Vec::new(),
+            lens: Vec::new(),
+            current: (),
+            points: [512, 1_024, 2_048].map(|p| (p, ())).to_vec(),
+            landed: OnceLock::new(),
+        };
+        let kept = |asks: [u32; 8]| asks.map(|n| state.keep_point(n));
+        assert_eq!(
+            kept([2_049, 1_500, 1_024, 511, 300, 0, 2_200, 9_000]),
+            [2_048, 1_024, 1_024, 0, 0, 0, 2_200, 2_200]
+        );
+    }
+
     // ----------------------------------------------------- the synthetic model
 
     const POS: u32 = 40;

@@ -3,7 +3,7 @@
 //! `generate_glm5next` on the same card, as one process under the GPU gate
 //! lock.
 //!
-//!     gate_glm5next_serve --arm plain|drafted|slots|unset --dir <out>
+//!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix --dir <out>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
 //! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp
@@ -20,7 +20,8 @@
 //! as two processes, each under its own bound. `slots` runs the drafted
 //! arm's (s5) alone — its server and clauses, nothing else — for a run of
 //! those clauses by name; the recipe runs them inside `drafted`. `unset`
-//! runs the plain arm's last server alone the same way.
+//! runs the plain arm's last server alone the same way, and `prefix` the plain
+//! arm's first server with the shared-prefix clause alone.
 //!
 //! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after four runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
@@ -75,6 +76,10 @@
 //!   keeps the first turn's prompt call's end (`cache_n` its prompt less
 //!   one) and takes no save on the request path (no `cache save` line with
 //!   `off_path=false`: the end states are sealed off it);
+//! - `prefix` ([`prefix`]): a prompt answered and another taking the slot, then a
+//!   request that shares only the prompt's first ids restores from the host
+//!   cache at the nearest checkpoint the saved state carries at or below them
+//!   (the doubling multiples of the spacing), its ids a fresh run's;
 //! - then a third load, the server under `BLOOMERY_DRAFT=mtp
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
 //!   host`, the same `/completion` carries the draft's counts, and its ids
@@ -278,12 +283,12 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
-        self, agree, beside, check, completion, curl, ids_of, json_of, metric, parse_ids, rendered,
-        server_log, stage_usable, tokenized,
+        self, PrefixRestore, agree, beside, check, completion, curl, ids_of, json_of, metric,
+        parse_ids, prefix_restore, rendered, server_log, stage_usable, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
-    use bloomery_gpu_glm5next::checkpoint_price;
+    use bloomery_gpu_glm5next::{CHECKPOINT_EVERY, checkpoint_price};
     use gguf::Split;
     use model::arch::glm5next::place::{
         KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs,
@@ -309,7 +314,8 @@ mod gate {
         bloomery_levers::STEP_STATS,
     ];
 
-    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset --dir <out>";
+    const USAGE: &str =
+        "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix --dir <out>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
@@ -353,6 +359,19 @@ mod gate {
     const POLL: Duration = Duration::from_secs(5);
     /// The greedy requests' length, the CLI's `-n`.
     const N_PREDICT: usize = 16;
+    /// The shared-prefix clause's prompt A in ids, the ids C shares with it,
+    /// and the `cache_n` C keeps: the doubling multiple of the checkpoints'
+    /// spacing nearest at or below the shared ids. A and its answer fit
+    /// [`CTX`]; C shares more than the last multiple but not the next.
+    const PREFIX_A: usize = 1_700;
+    const PREFIX_SHARED: usize = 1_100;
+    const PREFIX_KEPT: u64 = 2 * CHECKPOINT_EVERY as u64;
+    const _: () = assert!(
+        PREFIX_A + N_PREDICT < CTX
+            && PREFIX_KEPT as usize <= PREFIX_SHARED
+            && PREFIX_SHARED < 4 * CHECKPOINT_EVERY as usize
+            && PREFIX_SHARED < PREFIX_A
+    );
     /// The slots clause's requests' length, and the least busy slots a call
     /// its together run books (the module header's derivation).
     const SLOTS_PREDICT: usize = 64;
@@ -402,6 +421,7 @@ mod gate {
         Drafted,
         Slots,
         Unset,
+        Prefix,
     }
 
     impl Arm {
@@ -411,9 +431,11 @@ mod gate {
                 "drafted" => Ok(Arm::Drafted),
                 "slots" => Ok(Arm::Slots),
                 "unset" => Ok(Arm::Unset),
-                other => {
-                    Err(format!("--arm is plain, drafted, slots or unset, not {other}").into())
-                }
+                "prefix" => Ok(Arm::Prefix),
+                other => Err(format!(
+                    "--arm is plain, drafted, slots, unset or prefix, not {other}"
+                )
+                .into()),
             }
         }
     }
@@ -1594,6 +1616,40 @@ mod gate {
         Ok(ok)
     }
 
+    /// The shared-prefix clause ([`prefix_restore`]) on the server at `url`:
+    /// prompt A of [`PREFIX_A`] ids from the gate's turn, B another turn, and
+    /// C sharing [`PREFIX_SHARED`] of A's ids keeps [`PREFIX_KEPT`] of them
+    /// from the host cache (the checkpoint at twice the spacing, which the
+    /// saved state carries beside its last one), its ids a fresh run's.
+    ///
+    /// Mutant: a save that carries its last checkpoint alone (C keeps 0).
+    fn prefix(url: &dyn Fn(&str) -> String, dir: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
+        let t = PrefixRestore {
+            a: TURN_A,
+            b: TURN_B,
+            tail: LATER_A,
+            a_len: PREFIX_A,
+            shared: PREFIX_SHARED,
+            kept: PREFIX_KEPT,
+            n: N_PREDICT,
+        };
+        prefix_restore(url, dir, &mut ok, &t, &|| erase(url, 0))?;
+        Ok(ok)
+    }
+
+    /// The `prefix` arm: the plain arm's server and [`prefix`] alone.
+    fn prefix_alone(dir: &Path) -> Result<bool, GateError> {
+        let err_log = dir.join("server.err");
+        let mut served = Served::spawn(&SERVER_ARGS, dir, PLAIN)?;
+        println!("prefix server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let ok = prefix(&url, dir)?;
+        println!("prefix server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// Under the residency, a state put back runs on the slot map as it
     /// stands (the state carries none): A's turn, B's, A resent — put back (a
     /// `cache load` note), every held position kept, its passes printing
@@ -2527,6 +2583,7 @@ mod gate {
         check(&mut ok, "plain_residency_reset_is_501", st == 501);
         ok &= cache(&url, &err_log, false)?;
         ok &= round_trip(&url, &err_log)?;
+        ok &= prefix(&url, dir)?;
         println!("plain server stopped: {}", served.stop()?);
         let (reference, cli_log) = cli(dir, PLAIN, &ids, true)?;
         println!("generate_glm5next tokens {reference:?}");
@@ -2797,6 +2854,7 @@ mod gate {
             Arm::Drafted => drafted(&a.dir, &levers)?,
             Arm::Slots => slots_flow_together(&a.dir)?,
             Arm::Unset => unset_load(&a.dir)?,
+            Arm::Prefix => prefix_alone(&a.dir)?,
         };
         if ok {
             println!("gate-gpu-glm5next-serve: PASS");

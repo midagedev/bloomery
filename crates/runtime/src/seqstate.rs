@@ -1,7 +1,8 @@
 //! Checkpoints of a model's recurrent state, as pure rules: where a prompt
 //! call takes them ([`marks`]), which prefix a cut keeps ([`Ledger::keep`]),
-//! what a cut restores ([`Ledger::cut`]), and which slot a new one fills
-//! ([`Ledger::take`]) under a host budget ([`capacity`]).
+//! what a cut restores ([`Ledger::cut`]), which slot a new one fills
+//! ([`Ledger::take`]) under a host budget ([`capacity`]), and which points a
+//! save carries away ([`save_points`]).
 //!
 //! A layer with a recurrent store ([`crate::state::copied`]) holds one state
 //! written in place by every position: a cut behind the current position
@@ -65,6 +66,36 @@ pub fn marks(from: u32, to: u32, every: u32) -> Vec<u32> {
     v
 }
 
+/// Whether a point at `pos` is an anchor of checkpoints spaced `every`
+/// positions: `every` times a power of two (`every`, 2·`every`, 4·`every`,
+/// …). None when `every` is 0.
+#[must_use]
+pub fn anchor(pos: u32, every: u32) -> bool {
+    pos.checked_div(every)
+        .is_some_and(|q| pos.is_multiple_of(every) && q.is_power_of_two())
+}
+
+/// The points a save at `pos` carries, ascending, of the `held` points a
+/// ledger spaced `every` positions holds: every anchor ([`anchor`]) below
+/// `pos`, and the last point below `pos`. A request that shares only the
+/// first `n` positions of the saved prompt restores at the nearest carried
+/// point at or below `n`, which is within a factor of 2 of `n` once `n`
+/// reaches the first anchor (the anchors double), and the save carries at
+/// most log2(`pos` / `every`) + 2 points; the last point is what a save
+/// carried alone before. A position the ledger does not hold is skipped,
+/// never made up. `held` is ascending.
+#[must_use]
+pub fn save_points(held: &[u32], pos: u32, every: u32) -> Vec<u32> {
+    let below = held.partition_point(|&p| p < pos);
+    let last = below.checked_sub(1);
+    held[..below]
+        .iter()
+        .enumerate()
+        .filter(|&(i, &p)| anchor(p, every) || Some(i) == last)
+        .map(|(_, &p)| p)
+        .collect()
+}
+
 /// How many checkpoints of `bytes` each fit `budget`: refused by name when
 /// not one does, or when a checkpoint copies nothing.
 pub fn capacity(budget: u64, bytes: u64) -> Result<usize, CheckpointError> {
@@ -96,8 +127,8 @@ impl Price {
     /// two ends, so the point a resumed prefix needs, where the call before
     /// ended, is never the one displaced. A ledger of this budget is made of
     /// exactly that many slots, so it is the bound on what the sequence pins;
-    /// a later call's points past them displace the least recently used
-    /// ([`Ledger::take`]), never grow the pin. Refused by name
+    /// a later call's points past them displace the least recently used that
+    /// is not an anchor ([`Ledger::take`]), never grow the pin. Refused by name
     /// for a context of no positions or past the u32 positions, and a
     /// checkpoint [`capacity`] refuses.
     pub fn budget(self, ctx: u64) -> Result<u64, CheckpointError> {
@@ -387,10 +418,16 @@ struct Point {
 }
 
 /// The checkpoints of one model's recurrent state: at most `cap` slots,
-/// the least recently used point giving its slot up to a new one.
+/// the least recently used point giving its slot up to a new one. Anchors
+/// ([`anchor`] at the spacing `every`) are the last to go: a prompt longer
+/// than the slots gives up its later marks and keeps the doubling ones a
+/// save carries ([`save_points`]), an anchor giving its slot up only when
+/// every point is one.
 #[derive(Clone, Debug)]
 pub struct Ledger {
     cap: usize,
+    /// The spacing of the points the anchors are of; 0 has no anchor.
+    every: u32,
     /// Ascending by position, every one at or below the held position.
     points: Vec<Point>,
     /// Slots made and holding no point.
@@ -405,8 +442,9 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// An empty ledger of `cap` slots, at least one.
-    pub fn new(cap: usize) -> Result<Ledger, CheckpointError> {
+    /// An empty ledger of `cap` slots, at least one, of points spaced
+    /// `every` positions.
+    pub fn new(cap: usize, every: u32) -> Result<Ledger, CheckpointError> {
         if cap == 0 {
             return Err(CheckpointError::Budget {
                 budget: 0,
@@ -415,6 +453,7 @@ impl Ledger {
         }
         Ok(Ledger {
             cap,
+            every,
             points: Vec::new(),
             free: Vec::new(),
             made: 0,
@@ -519,8 +558,9 @@ impl Ledger {
 
     /// A checkpoint at `at`, the position the model stands at: nothing at 0
     /// or where one stands; else a free slot, a new one while fewer than the
-    /// capacity are made, or the least recently used point's. Refused while
-    /// a cut waits, and when a point stands past `at`.
+    /// capacity are made, or the least recently used point's that is not an
+    /// anchor (an anchor's when every point is one). Refused while a cut
+    /// waits, and when a point stands past `at`.
     pub fn take(&mut self, at: u32) -> Result<Take, CheckpointError> {
         if self.pending.is_some() {
             return Err(CheckpointError::Pending { at });
@@ -550,7 +590,7 @@ impl Ledger {
                 .points
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, p)| p.used)
+                .min_by_key(|(_, p)| (anchor(p.pos, self.every), p.used))
                 .ok_or(CheckpointError::Budget {
                     budget: 0,
                     bytes: 0,
@@ -1204,6 +1244,112 @@ mod tests {
         assert!(marks(9, 3, 512).is_empty());
     }
 
+    /// An anchor is the spacing times a power of two; no spacing, no anchor.
+    #[test]
+    fn anchors_are_the_spacing_times_a_power_of_two() {
+        for p in [512, 1_024, 2_048, 4_096, 16_384] {
+            assert!(anchor(p, 512), "{p}");
+        }
+        for p in [0, 256, 1_536, 2_560, 3_072, 2_049] {
+            assert!(!anchor(p, 512), "{p}");
+        }
+        assert!(anchor(4_096, 4_096) && anchor(8_192, 4_096) && anchor(16_384, 4_096));
+        assert!(!anchor(2_048, 4_096) && !anchor(12_288, 4_096));
+        assert!(!anchor(512, 0) && !anchor(0, 0));
+    }
+
+    /// (a) A save of 2,200 positions over the marks of its prompt call carries
+    /// the anchors below it; the last point below it is the anchor at 2,048
+    /// already. One position more and the prompt's end is the last point.
+    #[test]
+    fn a_save_carries_the_anchors_below_it_and_the_last_point() {
+        let held = marks(0, 2_200, 512);
+        assert_eq!(held, [512, 1_024, 1_536, 2_048, 2_200]);
+        assert_eq!(save_points(&held, 2_200, 512), [512, 1_024, 2_048]);
+        assert_eq!(save_points(&held, 2_201, 512), [512, 1_024, 2_048, 2_200]);
+        assert_eq!(save_points(&held, 2_048, 512), [512, 1_024, 1_536]);
+        assert_eq!(save_points(&held, 512, 512), Vec::<u32>::new());
+        assert_eq!(save_points(&[], 2_200, 512), Vec::<u32>::new());
+        // The ubatch spacing of the Qwen3.8 seat: a short prompt has the end
+        // alone, a long one the doubling multiples of 4,096.
+        assert_eq!(save_points(&[2_200], 2_201, 4_096), [2_200]);
+        let long = marks(0, 20_000, 4_096);
+        assert_eq!(
+            save_points(&long, 20_001, 4_096),
+            [4_096, 8_192, 16_384, 20_000]
+        );
+    }
+
+    /// (b) A save of 32,000 positions: the six anchors and the last mark, at
+    /// most log2(pos / every) + 2 points.
+    #[test]
+    fn a_long_save_carries_log_many_points() {
+        let held = marks(0, 32_000, 512);
+        let got = save_points(&held, 32_000, 512);
+        assert_eq!(got, [512, 1_024, 2_048, 4_096, 8_192, 16_384, 31_744]);
+        for pos in [600u32, 2_200, 8_000, 32_000, 1 << 20] {
+            let held = marks(0, pos, 512);
+            let n = save_points(&held, pos, 512).len();
+            assert!(n <= (pos / 512).ilog2() as usize + 2, "pos {pos}: {n}");
+        }
+    }
+
+    /// (c) A ledger that lacks an anchor carries the others: the point is
+    /// skipped, never made up.
+    #[test]
+    fn a_save_skips_a_point_the_ledger_lacks() {
+        let held = [512, 1_536, 2_048, 2_200];
+        assert_eq!(save_points(&held, 2_200, 512), [512, 2_048]);
+        assert_eq!(save_points(&[1_536, 2_200], 2_200, 512), [1_536]);
+    }
+
+    /// (d) A prompt of 32,000 positions through a ledger of 23 slots
+    /// (`HOST_BUDGET` over 179,372,032 bytes): the later marks give their
+    /// slots up and every anchor stays, so the save carries the same points
+    /// as one with room for them all. The ledger made of exactly the anchors
+    /// and the end gives an anchor up only when every point is one.
+    #[test]
+    fn a_full_ledger_gives_up_later_marks_before_an_anchor() {
+        let mut l = Ledger::new(23, 512).unwrap();
+        for at in marks(0, 32_000, 512) {
+            copy(l.take(at).unwrap());
+        }
+        let held = l.positions();
+        assert_eq!(held.len(), 23);
+        for a in [512, 1_024, 2_048, 4_096, 8_192, 16_384] {
+            assert!(held.contains(&a), "{a} in {held:?}");
+        }
+        assert_eq!(held[held.len() - 2..], [31_744, 32_000]);
+        assert_eq!(
+            save_points(&held, 32_000, 512),
+            [512, 1_024, 2_048, 4_096, 8_192, 16_384, 31_744]
+        );
+        assert_eq!(l.stats().evicted, 63 - 23);
+
+        let mut only = Ledger::new(2, 512).unwrap();
+        for at in [512, 1_024] {
+            copy(only.take(at).unwrap());
+        }
+        assert_eq!(
+            only.take(1_536),
+            Ok(Take::Copy {
+                slot: 0,
+                new: false,
+                evicted: Some(512)
+            }),
+            "every point an anchor: the least recent goes"
+        );
+        assert_eq!(
+            only.take(2_048),
+            Ok(Take::Copy {
+                slot: 0,
+                new: false,
+                evicted: Some(1_536)
+            }),
+            "a later non-anchor goes before the anchor at 1,024"
+        );
+    }
+
     #[test]
     fn capacity_by_budget() {
         assert_eq!(capacity(HOST_BUDGET, 179_372_032), Ok(23));
@@ -1216,7 +1362,7 @@ mod tests {
             capacity(100, 0),
             Err(CheckpointError::Budget { .. })
         ));
-        assert!(Ledger::new(0).is_err());
+        assert!(Ledger::new(0, 0).is_err());
     }
 
     /// Two prompt calls that share a short context keep the first call's end:
@@ -1230,8 +1376,11 @@ mod tests {
         };
         for ctx in [64u64, 4_096, 10_240] {
             let budget = price.budget(ctx).expect("a budget");
-            let mut l = Ledger::new(capacity(budget, price.point_bytes).expect("a capacity"))
-                .expect("a ledger");
+            let mut l = Ledger::new(
+                capacity(budget, price.point_bytes).expect("a capacity"),
+                price.every,
+            )
+            .expect("a ledger");
             let (first, end) = (
                 u32::try_from(ctx / 2).expect("a position"),
                 u32::try_from(ctx).expect("a position"),
@@ -1440,7 +1589,7 @@ mod tests {
     /// nearest checkpoint at or below, else nothing — each with its code.
     #[test]
     fn keep_is_the_nearest_checkpoint_below() {
-        let mut l = Ledger::new(4).unwrap();
+        let mut l = Ledger::new(4, 0).unwrap();
         copy(l.take(512).unwrap());
         copy(l.take(640).unwrap());
         let k = |n| l.keep(n, 700);
@@ -1469,7 +1618,7 @@ mod tests {
     /// and stays listed, so the miss it causes reads as an eviction.
     #[test]
     fn take_fills_then_evicts_the_least_recent() {
-        let mut l = Ledger::new(2).unwrap();
+        let mut l = Ledger::new(2, 0).unwrap();
         assert_eq!(l.take(0), Ok(Take::Empty));
         assert_eq!(
             l.take(100),
@@ -1514,7 +1663,7 @@ mod tests {
     /// freed slot before it makes a new one.
     #[test]
     fn dropped_slots_are_reused() {
-        let mut l = Ledger::new(3).unwrap();
+        let mut l = Ledger::new(3, 0).unwrap();
         copy(l.take(100).unwrap());
         copy(l.take(200).unwrap());
         assert_eq!(l.cut(100, 250), Ok(Cut::Restore { slot: 0, at: 100 }));
@@ -1541,7 +1690,7 @@ mod tests {
     /// keep never returns one: the stale point below `n` of a longer branch.
     #[test]
     fn cut_drops_the_abandoned_branch() {
-        let mut l = Ledger::new(8).unwrap();
+        let mut l = Ledger::new(8, 0).unwrap();
         copy(l.take(512).unwrap());
         copy(l.take(640).unwrap());
         assert_eq!(l.cut(512, 643), Ok(Cut::Restore { slot: 0, at: 512 }));
@@ -1561,7 +1710,7 @@ mod tests {
     /// every point.
     #[test]
     fn cuts_named() {
-        let mut l = Ledger::new(4).unwrap();
+        let mut l = Ledger::new(4, 0).unwrap();
         copy(l.take(512).unwrap());
         assert_eq!(
             l.cut(701, 700),
@@ -1587,7 +1736,7 @@ mod tests {
     /// keeps it, a deeper cut replaces it, a reset drops it.
     #[test]
     fn pending_cut_rules() {
-        let mut l = Ledger::new(4).unwrap();
+        let mut l = Ledger::new(4, 0).unwrap();
         copy(l.take(100).unwrap());
         copy(l.take(200).unwrap());
         assert_eq!(l.cut(200, 300), Ok(Cut::Restore { slot: 1, at: 200 }));
@@ -1630,7 +1779,7 @@ mod tests {
     /// point stands is refused by name.
     #[test]
     fn forget_gives_back_one_take() {
-        let mut l = Ledger::new(4).unwrap();
+        let mut l = Ledger::new(4, 0).unwrap();
         let a = copy(l.take(512).unwrap());
         let b = copy(l.take(1024).unwrap());
         assert_ne!(a, b);
@@ -1657,7 +1806,7 @@ mod tests {
 
     #[test]
     fn take_behind_refused() {
-        let mut l = Ledger::new(4).unwrap();
+        let mut l = Ledger::new(4, 0).unwrap();
         copy(l.take(300).unwrap());
         assert_eq!(
             l.take(200),
@@ -1689,7 +1838,7 @@ mod tests {
                 ring: [0; 11],
                 fed: 0,
                 slots: Vec::new(),
-                ledger: Ledger::new(cap).unwrap(),
+                ledger: Ledger::new(cap, 0).unwrap(),
             }
         }
 
