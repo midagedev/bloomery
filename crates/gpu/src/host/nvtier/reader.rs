@@ -6,9 +6,10 @@
 //! files, the spans), and its completion is a latch the caller waits on.
 //!
 //! One queue, by rank: a job of a lower rank is taken before every job of a
-//! higher one, first come first served within a rank. A job's units are taken
-//! in order, so the queue holds one front job at a time and the threads that
-//! find it taken go on to the next.
+//! higher one, first come first served within a rank. A job's rank is its
+//! [`Kind`]'s: a prompt batch's fill goes ahead of every queued victim fill.
+//! A job's units are taken in order, so the queue holds one front job at a
+//! time and the threads that find it taken go on to the next.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,9 +29,35 @@ pub(super) struct Failure {
     pub error: GpuError,
 }
 
+/// What a job fills for, which sets its place in the queue: the one mapping
+/// of a kind to a rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// A prompt batch's misses, read ahead of the compute that waits on them.
+    Prompt,
+    /// A residency flip's victim id: read inside the flip's window, behind
+    /// every queued prompt fill.
+    Victim,
+}
+
+/// The kinds a job is: the length of every per-kind counter.
+const KINDS: usize = 2;
+
+impl Kind {
+    /// The queue rank: lower is taken first, and the index of the kind's
+    /// counters.
+    fn rank(self) -> u8 {
+        match self {
+            Kind::Prompt => 0,
+            Kind::Victim => 1,
+        }
+    }
+}
+
 /// A fill in flight: `units` units of work, each run once on some reader
 /// thread, and the latch [`Reader::wait`] blocks on.
 pub(super) struct Job {
+    kind: Kind,
     units: usize,
     run: Unit,
     state: Mutex<JobState>,
@@ -48,12 +75,14 @@ struct JobState {
 }
 
 impl Job {
-    /// A job of `units` units, each `run(unit)` once.
+    /// A `kind` job of `units` units, each `run(unit)` once.
     pub(super) fn new(
+        kind: Kind,
         units: usize,
         run: impl Fn(usize) -> Result<(), GpuError> + Send + Sync + 'static,
     ) -> Job {
         Job {
+            kind,
             units,
             run: Box::new(run),
             state: Mutex::new(JobState {
@@ -102,25 +131,62 @@ impl Job {
     }
 }
 
-/// What the readers count ([`Reader::stats`]).
+/// What the readers count of one kind of job.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReaderStats {
+pub struct KindStats {
     /// Jobs submitted, and their units (picks) — the fills that ran off the
     /// caller.
     pub jobs: u64,
     pub units: u64,
     /// Waits that found their job unfinished, and the wall they blocked
-    /// (ns): the part of the fills the caller's compute did not hide.
+    /// (ns): the part of the fills the waiter's own work did not hide.
     pub waits: u64,
     pub wait_ns: u64,
 }
 
+/// What the readers count ([`Reader::stats`]): the prompt batches' fills and
+/// the residency flips' victim fills, each kind alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReaderStats {
+    pub prompt: KindStats,
+    pub victim: KindStats,
+}
+
+impl ReaderStats {
+    /// What moved since `base`, an earlier reading of the same reader.
+    #[must_use]
+    pub fn since(&self, base: &ReaderStats) -> ReaderStats {
+        let kind = |now: KindStats, then: KindStats| KindStats {
+            jobs: now.jobs - then.jobs,
+            units: now.units - then.units,
+            waits: now.waits - then.waits,
+            wait_ns: now.wait_ns - then.wait_ns,
+        };
+        ReaderStats {
+            prompt: kind(self.prompt, base.prompt),
+            victim: kind(self.victim, base.victim),
+        }
+    }
+}
+
 #[derive(Default)]
-struct Counters {
+struct KindCounters {
     jobs: AtomicU64,
     units: AtomicU64,
     waits: AtomicU64,
     wait_ns: AtomicU64,
+}
+
+#[derive(Default)]
+struct Counters {
+    /// A kind's counters, at its rank.
+    kinds: [KindCounters; KINDS],
+}
+
+impl Counters {
+    fn of(&self, kind: Kind) -> &KindCounters {
+        &self.kinds[usize::from(kind.rank())]
+    }
 }
 
 /// A job waiting for its units to be taken: `next` is the first unit no
@@ -291,20 +357,21 @@ impl Reader {
         })
     }
 
-    /// Queue `job` at `rank`: its units run on the reader threads, after the
-    /// jobs of a lower or equal rank already queued. Refused by name once
+    /// Queue `job`: its units run on the reader threads, after the jobs of a
+    /// lower or equal rank (its kind's) already queued. Refused by name once
     /// the reader has stopped.
-    pub(super) fn submit(&self, rank: u8, job: Job) -> Result<Arc<Job>, GpuError> {
+    pub(super) fn submit(&self, job: Job) -> Result<Arc<Job>, GpuError> {
+        let rank = job.kind.rank();
         let units = job.units;
         let job = Arc::new(job);
         let mut q = self.shared.queue();
         if q.stop {
             return Err(GpuError::protocol(
-                "NvTier::prefetch_pinned",
+                "NvTier::fill",
                 "a fill queued after the tier's fill reader stopped".to_string(),
             ));
         }
-        let c = &self.shared.counters;
+        let c = self.shared.counters.of(job.kind);
         c.jobs.fetch_add(1, Ordering::Relaxed);
         c.units.fetch_add(units as u64, Ordering::Relaxed);
         {
@@ -339,7 +406,7 @@ impl Reader {
             while s.left > 0 {
                 s = job.done.wait(s).unwrap_or_else(|e| e.into_inner());
             }
-            let c = &self.shared.counters;
+            let c = self.shared.counters.of(job.kind);
             c.waits.fetch_add(1, Ordering::Relaxed);
             c.wait_ns
                 .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -355,12 +422,18 @@ impl Reader {
 
     /// The readers' counters.
     pub(super) fn stats(&self) -> ReaderStats {
-        let c = &self.shared.counters;
+        let of = |kind: Kind| {
+            let c = self.shared.counters.of(kind);
+            KindStats {
+                jobs: c.jobs.load(Ordering::Relaxed),
+                units: c.units.load(Ordering::Relaxed),
+                waits: c.waits.load(Ordering::Relaxed),
+                wait_ns: c.wait_ns.load(Ordering::Relaxed),
+            }
+        };
         ReaderStats {
-            jobs: c.jobs.load(Ordering::Relaxed),
-            units: c.units.load(Ordering::Relaxed),
-            waits: c.waits.load(Ordering::Relaxed),
-            wait_ns: c.wait_ns.load(Ordering::Relaxed),
+            prompt: of(Kind::Prompt),
+            victim: of(Kind::Victim),
         }
     }
 
@@ -429,7 +502,7 @@ impl Drop for Reader {
 
 #[cfg(test)]
 mod tests {
-    use super::{Failure, Job, Reader, StopError};
+    use super::{Failure, Job, Kind, KindStats, Reader, StopError};
     use crate::GpuError;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -453,11 +526,12 @@ mod tests {
         }
     }
 
-    /// A job of a lower rank is taken before every queued job of a higher
-    /// one, and the units of a rank in arrival order. One thread, so the
-    /// order the units start in is the order the queue pops them.
+    /// A prompt fill is taken before every queued victim fill, whenever the
+    /// victim was submitted, and the units of a kind in arrival order. One
+    /// thread, so the order the units start in is the order the queue pops
+    /// them.
     #[test]
-    fn the_reader_takes_prompt_fills_first() {
+    fn the_reader_takes_prompt_fills_before_victims() {
         let reader = Reader::start(1, "test-fill").unwrap();
         let (started_tx, started) = mpsc::channel();
         let (release_tx, release) = mpsc::channel();
@@ -469,25 +543,37 @@ mod tests {
                 Ok(())
             }
         };
-        // The thread is held by a first job, so the next two queue behind it.
+        // The thread is held by a first job, so the next four queue behind
+        // it: a victim, a prompt batch behind that victim, another victim
+        // and another prompt batch.
         let first = reader
-            .submit(1, Job::new(1, held(started_tx, release)))
+            .submit(Job::new(Kind::Prompt, 1, held(started_tx, release)))
             .unwrap();
         assert_eq!(started.recv().unwrap(), 0);
-        let other = reader
-            .submit(1, Job::new(1, tagged("other", &log)))
-            .unwrap();
-        let other_later = reader
-            .submit(1, Job::new(1, tagged("other-later", &log)))
-            .unwrap();
-        let prompt = reader
-            .submit(0, Job::new(1, tagged("prompt", &log)))
-            .unwrap();
+        let jobs: Vec<_> = [
+            (Kind::Victim, "victim"),
+            (Kind::Prompt, "prompt"),
+            (Kind::Victim, "victim-later"),
+            (Kind::Prompt, "prompt-later"),
+        ]
+        .into_iter()
+        .map(|(kind, tag)| reader.submit(Job::new(kind, 1, tagged(tag, &log))).unwrap())
+        .collect();
         release_tx.send(()).unwrap();
-        for j in [&first, &other, &other_later, &prompt] {
+        for j in std::iter::once(&first).chain(&jobs) {
             assert!(reader.wait(j).is_ok());
         }
-        assert_eq!(*log.lock().unwrap(), ["prompt", "other", "other-later"]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["prompt", "prompt-later", "victim", "victim-later"]
+        );
+        let stats = reader.stats();
+        let counted = |k: KindStats| (k.jobs, k.units);
+        assert_eq!(
+            (counted(stats.prompt), counted(stats.victim)),
+            ((3, 3), (2, 2)),
+            "each kind counted alone"
+        );
         reader.stop(Duration::from_secs(10)).unwrap();
     }
 
@@ -500,7 +586,7 @@ mod tests {
         let ran = Arc::new(Mutex::new(Vec::new()));
         let job = {
             let ran = Arc::clone(&ran);
-            Job::new(4, move |u| {
+            Job::new(Kind::Prompt, 4, move |u| {
                 ran.lock().unwrap().push(u);
                 if u == 1 {
                     return Err(GpuError::shape("test", "a short read".to_string()));
@@ -508,17 +594,19 @@ mod tests {
                 Ok(())
             })
         };
-        let job = reader.submit(0, job).unwrap();
+        let job = reader.submit(job).unwrap();
         let Failure { unit, error } = reader.wait(&job).unwrap_err();
         assert_eq!(unit, 1);
         assert!(error.to_string().contains("a short read"), "{error}");
         assert_eq!(*ran.lock().unwrap(), [0, 1], "units 2 and 3 were skipped");
         let boom = reader
-            .submit(0, Job::new(1, |_| panic!("a bad slice")))
+            .submit(Job::new(Kind::Prompt, 1, |_| panic!("a bad slice")))
             .unwrap();
         let e = reader.wait(&boom).unwrap_err().error.to_string();
         assert!(e.contains("panicked") && e.contains("a bad slice"), "{e}");
-        let after = reader.submit(0, Job::new(1, |_| Ok(()))).unwrap();
+        let after = reader
+            .submit(Job::new(Kind::Prompt, 1, |_| Ok(())))
+            .unwrap();
         assert!(reader.wait(&after).is_ok(), "the thread outlived the panic");
         reader.stop(Duration::from_secs(10)).unwrap();
     }
@@ -529,20 +617,25 @@ mod tests {
     #[test]
     fn a_stop_names_an_open_ticket_and_refuses_later_fills() {
         let clean = Reader::start(2, "test-fill").unwrap();
-        let ok = clean.submit(0, Job::new(3, |_| Ok(()))).unwrap();
+        let ok = clean.submit(Job::new(Kind::Prompt, 3, |_| Ok(()))).unwrap();
         assert!(clean.wait(&ok).is_ok());
         assert_eq!(clean.stop(Duration::from_secs(10)), Ok(()));
-        let e = clean.submit(0, Job::new(1, |_| Ok(()))).err().unwrap();
+        let e = clean
+            .submit(Job::new(Kind::Prompt, 1, |_| Ok(())))
+            .err()
+            .unwrap();
         assert!(e.to_string().contains("stopped"), "{e}");
 
         let reader = Reader::start(1, "test-fill").unwrap();
         let (started_tx, started) = mpsc::channel();
         let (release_tx, release) = mpsc::channel();
         let running = reader
-            .submit(0, Job::new(1, held(started_tx, release)))
+            .submit(Job::new(Kind::Prompt, 1, held(started_tx, release)))
             .unwrap();
         assert_eq!(started.recv().unwrap(), 0);
-        let queued = reader.submit(0, Job::new(2, |_| Ok(()))).unwrap();
+        let queued = reader
+            .submit(Job::new(Kind::Prompt, 2, |_| Ok(())))
+            .unwrap();
         // Releases the running unit from another thread once the stop has
         // counted the open jobs: `stop` counts them before it sets the
         // queue's flag, so a release seen after the flag cannot let the two
@@ -575,7 +668,7 @@ mod tests {
         let (started_tx, started) = mpsc::channel();
         let (release_tx, release) = mpsc::channel();
         let job = reader
-            .submit(0, Job::new(1, held(started_tx, release)))
+            .submit(Job::new(Kind::Prompt, 1, held(started_tx, release)))
             .unwrap();
         assert_eq!(started.recv().unwrap(), 0);
         let stopped = reader.stop(Duration::from_millis(50));
