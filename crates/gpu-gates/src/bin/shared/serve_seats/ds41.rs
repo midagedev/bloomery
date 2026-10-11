@@ -228,7 +228,7 @@ use bloomery_gpu_gates::ds41_media;
 #[cfg(feature = "vision")]
 use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
-use vision_seat::{Opened, PleImage, SharedMedia, TextFacts};
+use vision_seat::{Opened, PleImage, TextFacts};
 
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
@@ -819,20 +819,14 @@ struct V41 {
     vision: Option<Vision>,
 }
 
-/// The seat's resident image encoder and the halves its spans splice from:
-/// the encoder on its card, the delimiter rows of its file, the model's
-/// embedding width (a row's width) and the media description the engine
-/// answers ([`Seat::media_model`]). Behind the `vision` feature.
+/// The seat's resident image encoder ([`vision_seat::Resident`], which holds the
+/// media description the engine answers, [`Seat::media_model`]) and the delimiter
+/// rows of its file that its spans splice around the aligner's. Behind the
+/// `vision` feature.
 #[cfg(feature = "vision")]
 struct Vision {
-    tower: Box<dyn bloomery_gpu_vision::Tower>,
-    /// The encoder's own stream: `encode` enqueues on it and the row
-    /// readback synchronizes it.
-    stream: Arc<cuda_core::CudaStream>,
+    resident: vision_seat::Resident,
     delims: ds41_media::Delims,
-    /// The model file's `n_embd`.
-    n_embd: usize,
-    media: SharedMedia,
 }
 
 #[cfg(feature = "vision")]
@@ -840,21 +834,17 @@ impl Vision {
     /// Every feed's image encoded on the resident encoder, its aligner rows read back as bf16
     /// and spliced ([`ds41_media::span_rows`]), all in one pair of buffers — the rows, the
     /// kinds, and each span's positions, rows and kinds as ranges of them
-    /// ([`vision_seat::span_rows`]). The aligner emits the plan's token grid, one row a cell.
+    /// ([`vision_seat::Resident::span_rows`]). The aligner emits the plan's token grid, one
+    /// row a cell.
     fn span_rows(
         &mut self,
         feeds: &[MediaFeed],
     ) -> Result<vision_seat::SpanRows<body::MediaKind>, GateError> {
-        let (n_embd, delims) = (self.n_embd, &self.delims);
-        vision_seat::span_rows(
-            &mut *self.tower,
-            &self.stream,
-            feeds.iter().map(|f| vision_seat::Image {
-                at: f.at,
-                patches: &f.prepared.patches,
-                span_len: f.prepared.span_len,
-            }),
-            n_embd,
+        let (n_embd, delims) = (self.resident.n_embd(), &self.delims);
+        self.resident.span_rows(
+            feeds
+                .iter()
+                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
             |aligner, p| {
                 ds41_media::span_rows(aligner, (p.plan.n_llm_h, p.plan.n_llm_w), n_embd, delims)
             },
@@ -902,28 +892,15 @@ fn open_encoder(s: &mut Session<Body>, a: &SeatArgs) -> Result<Option<Vision>, G
         return Ok(None);
     };
     let t = Instant::now();
-    let (stream, tower) = vision_seat::open_tower(s.model().gpu().context(), v)?;
+    let resident = vision_seat::Resident::open(s.model().gpu().context(), v)?;
     let file =
         gguf::Gguf::open(&v.path).map_err(|e| format!("--mmproj {}: {e}", v.path.display()))?;
     let delims = ds41_media::delims(&file, a.n_embd)?;
     // The prompt batch's media half, beside the batch buffers the session's
     // own ready made.
     body::prepare_media(s.model_mut())?;
-    vision_seat::record(
-        &v.seat,
-        (tower.weight_bytes(), tower.scratch_bytes()),
-        vision_seat::ScratchHome::Own,
-        v.cap,
-        t.elapsed().as_secs_f64(),
-    )
-    .eprint();
-    Ok(Some(Vision {
-        tower,
-        stream,
-        delims,
-        n_embd: a.n_embd,
-        media: v.media.clone(),
-    }))
+    resident.announce(v, vision_seat::ScratchHome::Own, t);
+    Ok(Some(Vision { resident, delims }))
 }
 
 impl V41 {
@@ -1121,11 +1098,11 @@ impl Seat for V41 {
         Ok(next)
     }
 
-    /// The resident encoder's media description ([`Vision::media`]); `None`
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
     /// without `--mmproj`, an engine that takes no image.
     #[cfg(feature = "vision")]
     fn media_model(&self) -> Option<serve::media::SharedMediaModel> {
-        self.vision.as_ref().map(|v| v.media.clone())
+        self.vision.as_ref().map(|v| v.resident.media())
     }
 
     /// Each feed's image encoded on the resident encoder, its aligner rows

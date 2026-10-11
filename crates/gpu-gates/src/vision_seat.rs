@@ -8,22 +8,33 @@
 //! checks are keyed by the projector's type ([`rules`]), never by seat:
 //!
 //! * [`Flags`] — llama-server's spelling: `--mmproj FILE`, `--no-mmproj`, `--image-min-tokens N`,
-//!   `--image-max-tokens N` (8 and 4096 unless the file's projector plans its own sizes).
+//!   `--image-max-tokens N`. A limit not given is the projector's own default ([`Rule`]: 8 and 4096
+//!   for `qwen3vl_merger`, the file's 16 and 8000 for `glm5v`); a projector that plans its own
+//!   sizes takes no limit.
 //! * [`Projector`] — the file opened on the host: its projector type refused by name unless the
-//!   seat takes it, the tower's bytes on its card, the model's image input, and the row width;
-//!   [`Projector::check_text`] holds it against the text model, every mismatch refused by name.
+//!   seat takes it, the limits resolved once, the tower's bytes on its card, the model's image
+//!   input, and the row width; [`Projector::check_text`] holds it against the text model, every
+//!   mismatch refused by name.
 //! * [`open_seat`] — the flags to the opened encoder: the projector held against the text model and
 //!   seated for the plan ([`Opened`]); [`open_tower`] loads its tower on that card.
 //! * [`EncoderSeat`] — where the tower sits: the smallest card outside the plan, else a reserve on
 //!   the stage card ([`reserve_on`] puts the same reserve into a placed plan and a whole-fit probe).
-//! * [`RESERVE`], [`reserve_on`], [`with_reserve`], [`refusal`] and [`table_bytes_per_position`] —
+//! * [`RESERVE`], [`reserve_on`], [`reserve_in`], [`with_reserve`], [`refusal`] and
+//!   [`table_bytes_per_position`] —
 //!   the plan's side of it, in [`crate::image_plan`] (a placement module of every build takes it):
 //!   the tower's reserve in a placed plan and a whole-fit probe, and what a plan adds per position
 //!   of a sequence for a media load.
 //! * [`on_encoder_card`] — binds the tower's card for a tower call and the model's card back.
-//! * [`span_rows`] — a media call's images encoded on the tower and read back as the rows a prompt call
-//!   splices ([`span_rows_of`] is its host half, which takes the readback as a closure); both towers
-//!   write one row of `width` a cell of the plan's token grid.
+//! * [`Resident`] — a serve seat's resident encoder: the tower on its card, its stream, the row
+//!   width and the model's image input; [`Resident::span_rows`] encodes a media call's images and
+//!   reads them back as the rows a prompt call splices, and [`Resident::merged_rows`] is that call
+//!   for a merger tower on the model's card. The seat gives only its model's splice of one image's
+//!   rows.
+//! * [`SpanRows::media_spans`] — the call's spans as the plain [`MediaSpan`]s of a body that takes
+//!   nothing beside a span's positions and rows.
+//! * [`span_rows`] — the same on a tower and stream the caller holds ([`span_rows_of`] is its host
+//!   half, which takes the readback as a closure); every tower writes one row of `width` a cell of
+//!   the plan's token grid.
 //! * [`record`] — the `vision` line after the tower's load.
 
 use std::fmt::Display;
@@ -31,17 +42,20 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bloomery_gpu::media::MediaSpan;
 use cuda_core::CudaContext;
 use gguf::Gguf;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::qwen3vl::TokenLimits;
-use vision::arch::{deepseek41v, qwen3vl};
-use vision::{MediaModel, Patches, VisionError};
+use vision::arch::{deepseek41v, glm5v, qwen3vl};
+use vision::{MediaModel, Patches, Prepared, VisionError};
 
 use crate::GateError;
 use crate::generate::Place;
-pub use crate::image_plan::{RESERVE, refusal, reserve_on, table_bytes_per_position, with_reserve};
+pub use crate::image_plan::{
+    RESERVE, refusal, reserve_in, reserve_on, table_bytes_per_position, with_reserve,
+};
 use crate::record::{self, Record};
 
 /// A [`MediaModel`] the server holds across its threads (`serve::media::SharedMediaModel`).
@@ -114,13 +128,12 @@ impl Flags {
         self.min_tokens.is_some() || self.max_tokens.is_some()
     }
 
-    /// The image-token limits: the flags' values over mtmd's defaults, refused by name when
-    /// `min` is 0 or above `max`.
-    pub fn limits(&self) -> Result<TokenLimits, GateError> {
-        let d = TokenLimits::DEFAULT;
+    /// The image-token limits: the flags' values over `default`, the limits the projector starts
+    /// from when no flag gives one ([`Rule`]), refused by name when `min` is 0 or above `max`.
+    pub fn limits_over(&self, default: TokenLimits) -> Result<TokenLimits, GateError> {
         TokenLimits::new(
-            self.min_tokens.unwrap_or(d.min()),
-            self.max_tokens.unwrap_or(d.max()),
+            self.min_tokens.unwrap_or(default.min()),
+            self.max_tokens.unwrap_or(default.max()),
         )
         .map_err(|e| format!("--image-min-tokens/--image-max-tokens: {e}").into())
     }
@@ -147,6 +160,9 @@ pub struct Rule {
     pub takes_limits: bool,
     /// The row width the projector writes (the text model's embedding width).
     out_dim: fn(&Gguf) -> Result<usize, VisionError>,
+    /// The limits the projector starts from when a flag gives none: its size rule's own (V4.1
+    /// takes none, and the limits it is opened with steer nothing).
+    default_limits: fn(&Gguf) -> Result<TokenLimits, VisionError>,
     /// The most image tokens one image takes, at `limits`.
     cap: fn(&Gguf, TokenLimits) -> Result<usize, VisionError>,
 }
@@ -166,6 +182,7 @@ pub fn rules() -> &'static [Rule] {
             text_rope: Some([11, 11, 10, 0]),
             takes_limits: true,
             out_dim: |f| Ok(qwen3vl::Hparams::read(f)?.out_dim),
+            default_limits: |_| Ok(TokenLimits::DEFAULT),
             cap: |_, limits| Ok(limits.max()),
         },
         Rule {
@@ -177,7 +194,21 @@ pub fn rules() -> &'static [Rule] {
             text_rope: None,
             takes_limits: false,
             out_dim: |f| Ok(deepseek41v::Hparams::read(f)?.out_dim),
+            default_limits: |_| Ok(TokenLimits::DEFAULT),
             cap: |f, _| Ok(deepseek41v::Hparams::read(f)?.grid().max_tokens),
+        },
+        Rule {
+            projector: glm5v::PROJECTOR_TYPE,
+            ids: &[
+                (glm5v::media::BEGIN_OF_IMAGE_ID, "<|begin_of_image|>"),
+                (glm5v::media::END_OF_IMAGE_ID, "<|end_of_image|>"),
+                (glm5v::media::IMAGE_TOKEN_ID, "<|image|>"),
+            ],
+            text_rope: None,
+            takes_limits: true,
+            out_dim: |f| Ok(glm5v::Hparams::read(f)?.out_dim),
+            default_limits: |f| glm5v::Hparams::read(f)?.default_limits(),
+            cap: |_, limits| Ok(limits.max()),
         },
     ];
     RULES
@@ -216,6 +247,9 @@ pub struct Projector {
     pub media: SharedMedia,
     /// The width of a row the projector writes.
     pub out_dim: usize,
+    /// The image-token limits the file was opened at, resolved once: the flags over the
+    /// projector's own defaults ([`Rule`]).
+    pub limits: TokenLimits,
     /// The most image tokens one image takes, which the tower's activations are sized for.
     pub cap: usize,
 }
@@ -224,7 +258,8 @@ impl Projector {
     /// The encoder file at `path`, opened as the type its `clip.projector_type` names and refused
     /// by name when that type is not one of `takes` (the projector types the seat's text model
     /// can run), when the file is not one the host crate runs, or when the limits `flags` gives
-    /// steer a projector that plans its own sizes.
+    /// steer a projector that plans its own sizes. The limits are `flags`' over the projector's
+    /// own defaults, once: the host crate, the cap and the tower all read [`Projector::limits`].
     pub fn open(path: &Path, flags: &Flags, takes: &[&str]) -> Result<Projector, GateError> {
         let at = |e: &dyn Display| format!("--mmproj {}: {e}", path.display());
         let file = Gguf::open(path).map_err(|e| at(&e))?;
@@ -254,7 +289,8 @@ impl Projector {
             ))
             .into());
         }
-        let limits = flags.limits()?;
+        let default = (rule.default_limits)(&file).map_err(|e| at(&e))?;
+        let limits = flags.limits_over(default)?;
         let (card, media) = vision::arch::open(&file, limits).map_err(|e| at(&e))?;
         let out_dim = (rule.out_dim)(&file).map_err(|e| at(&e))?;
         let cap = (rule.cap)(&file, limits).map_err(|e| at(&e))?;
@@ -264,8 +300,23 @@ impl Projector {
             card,
             media,
             out_dim,
+            limits,
             cap,
         })
+    }
+
+    /// The projector seated on `seat`: the file, the model's image input, the cap, the card
+    /// figure and the limits it was opened at ([`Projector::limits`]), which the tower is loaded
+    /// at.
+    fn seated(self, seat: EncoderSeat) -> Opened {
+        Opened {
+            path: self.path,
+            seat,
+            media: self.media,
+            cap: self.cap,
+            card: self.card,
+            limits: self.limits,
+        }
     }
 
     /// The projector against the text model: every mismatch refused by name. `token` is the
@@ -341,7 +392,7 @@ pub struct Opened {
     /// The tower's card figure: the plan's reserve on a stage-reserve seat, and what the tower's
     /// load is held to ([`open_tower`]).
     pub card: CardBytes,
-    /// The image-token limits the tower's activations are sized for.
+    /// The image-token limits the tower's activations are sized for ([`Projector::limits`]).
     pub limits: TokenLimits,
 }
 
@@ -366,14 +417,8 @@ pub fn open_seat(
     };
     let projector = Projector::open(path, flags, takes)?;
     projector.check_text(text, token)?;
-    Ok(Some(Opened {
-        seat: encoder_seat(place, projector.card.total())?,
-        path: projector.path,
-        media: projector.media,
-        cap: projector.cap,
-        card: projector.card,
-        limits: flags.limits()?,
-    }))
+    let seat = encoder_seat(place, projector.card.total())?;
+    Ok(Some(projector.seated(seat)))
 }
 
 /// Where the image encoder sits under `--mmproj`: on a card this process holds that the
@@ -513,6 +558,18 @@ pub struct Image<'a> {
     pub span_len: usize,
 }
 
+impl<'a> Image<'a> {
+    /// The image whose span starts at `at` in the call's ids, as its model's prepare made it.
+    #[must_use]
+    pub fn of(at: usize, prepared: &'a Prepared) -> Image<'a> {
+        Image {
+            at,
+            patches: &prepared.patches,
+            span_len: prepared.span_len,
+        }
+    }
+}
+
 /// A media call's spans in one pair of buffers: the rows (`width` bf16 values a position), the
 /// kind of each position, and each span's ranges of them.
 #[derive(Debug, PartialEq, Eq)]
@@ -520,6 +577,21 @@ pub struct SpanRows<K> {
     pub rows: Vec<u16>,
     pub kinds: Vec<K>,
     pub ats: Vec<SpanAt>,
+}
+
+impl<K> SpanRows<K> {
+    /// The call's spans as [`MediaSpan`]s, each borrowing its own values of [`SpanRows::rows`]: a
+    /// body whose media call takes nothing beside a span's positions and rows.
+    #[must_use]
+    pub fn media_spans(&self) -> Vec<MediaSpan<'_>> {
+        self.ats
+            .iter()
+            .map(|a| MediaSpan {
+                at: a.positions.clone(),
+                rows: &self.rows[a.rows.clone()],
+            })
+            .collect()
+    }
 }
 
 /// One span's ranges: its positions in the call's ids, its values of [`SpanRows::rows`] and its
@@ -554,6 +626,79 @@ pub fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
         },
         splice,
     )
+}
+
+/// A serve seat's resident image encoder under `--mmproj`: the tower on the card the plan seated
+/// it ([`open_tower`]), the stream its readbacks run on, the width of a row (the text model's
+/// embedding, which the tower writes) and the model's image input the server renders and expands
+/// image parts by. What a seat adds is its model's splice of one image's rows.
+#[cfg(feature = "vision")]
+pub struct Resident {
+    tower: Box<dyn bloomery_gpu_vision::Tower>,
+    stream: Arc<cuda_core::CudaStream>,
+    n_embd: usize,
+    media: SharedMedia,
+}
+
+#[cfg(feature = "vision")]
+impl Resident {
+    /// The tower of `at`'s file loaded on its seat's card ([`open_tower`]) with the model's
+    /// context (`model`) bound back; the row width is the tower's.
+    pub fn open(model: &CudaContext, at: &Opened) -> Result<Resident, GateError> {
+        let (stream, tower) = open_tower(model, at)?;
+        Ok(Resident {
+            n_embd: tower.out_dim(),
+            tower,
+            stream,
+            media: at.media.clone(),
+        })
+    }
+
+    /// The `vision` record of the load that began at `started`: the card, which seat it is, the
+    /// tower's bytes, where its activations live and the most image tokens one image takes.
+    pub fn announce(&self, at: &Opened, home: ScratchHome, started: std::time::Instant) {
+        record(
+            &at.seat,
+            (self.tower.weight_bytes(), self.tower.scratch_bytes()),
+            home,
+            at.cap,
+            started.elapsed().as_secs_f64(),
+        )
+        .eprint();
+    }
+
+    /// The model's image input.
+    #[must_use]
+    pub fn media(&self) -> SharedMedia {
+        self.media.clone()
+    }
+
+    /// The width of a row.
+    #[must_use]
+    pub fn n_embd(&self) -> usize {
+        self.n_embd
+    }
+
+    /// [`span_rows`] of `images` on this tower and stream, at the row width.
+    pub fn span_rows<'a, K>(
+        &mut self,
+        images: impl IntoIterator<Item = Image<'a>>,
+        splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
+    ) -> Result<SpanRows<K>, GateError> {
+        span_rows(&mut *self.tower, &self.stream, images, self.n_embd, splice)
+    }
+
+    /// The rows of a merger tower's media call: [`Resident::span_rows`] with [`merged_cells`] (one
+    /// row a cell of each grid, the ids carry the delimiters), the tower's card bound for the calls
+    /// and `model`, the context the seat's body runs on, bound back after them
+    /// ([`on_encoder_card`]).
+    pub fn merged_rows<'a>(
+        &mut self,
+        model: &CudaContext,
+        images: impl IntoIterator<Item = Image<'a>>,
+    ) -> Result<SpanRows<()>, GateError> {
+        on_encoder_card(model, || self.span_rows(images, merged_cells))
+    }
 }
 
 /// The host half of [`span_rows`]: each image encoded and read back as bf16 by `encode`, the
@@ -671,27 +816,26 @@ mod tests {
         Ok(f)
     }
 
-    /// The four flags in llama-server's spelling; `--no-mmproj` has no value, the limits default to
-    /// mtmd's 8 and 4096, and every refusal names its flag.
+    /// The limits a flag set gives over mtmd's defaults for the Qwen3-VL projector (8 and 4096).
+    fn over_qwens(f: &Flags) -> (usize, usize) {
+        let l = f.limits_over(TokenLimits::DEFAULT).unwrap();
+        (l.min(), l.max())
+    }
+
+    /// The four flags in llama-server's spelling; `--no-mmproj` has no value, a limit not given is
+    /// the default the caller passes (mtmd's 8 and 4096 here), and every refusal names its flag.
     #[test]
     fn the_flags_read_llama_servers_spelling() {
         let f = flags(&["--mmproj", "/m/p.gguf", "--image-min-tokens", "16"]).unwrap();
         assert_eq!(f.mmproj().unwrap(), Some(Path::new("/m/p.gguf")));
-        let l = f.limits().unwrap();
-        assert_eq!((l.min(), l.max()), (16, 4096));
+        assert_eq!(over_qwens(&f), (16, 4096));
         assert!(f.sets_limits());
         let f = flags(&["--no-mmproj", "--image-max-tokens", "1024"]).unwrap();
         assert_eq!(f.mmproj().unwrap(), None);
-        assert_eq!(
-            (f.limits().unwrap().min(), f.limits().unwrap().max()),
-            (8, 1024)
-        );
+        assert_eq!(over_qwens(&f), (8, 1024));
         let d = flags(&[]).unwrap();
         assert_eq!((d.mmproj().unwrap(), d.sets_limits()), (None, false));
-        assert_eq!(
-            (d.limits().unwrap().min(), d.limits().unwrap().max()),
-            (8, 4096)
-        );
+        assert_eq!(over_qwens(&d), (8, 4096));
         // Another seat flag is the caller's, and is not consumed.
         let mut other = Flags::default();
         assert!(!other.take("--ctx", &mut ["8"].into_iter()).unwrap());
@@ -705,7 +849,7 @@ mod tests {
                 .and_then(|f| {
                     f.mmproj()
                         .map(|_| ())
-                        .and(f.limits().map(|_| ()))
+                        .and(f.limits_over(TokenLimits::DEFAULT).map(|_| ()))
                         .map_err(|e| e.to_string())
                 })
                 .unwrap_err()
@@ -841,6 +985,7 @@ mod tests {
             },
             media: Arc::new(Stub(token)),
             out_dim,
+            limits: TokenLimits::DEFAULT,
             cap: 4096,
         }
     }
@@ -976,11 +1121,112 @@ mod tests {
         );
     }
 
-    /// A header-only GGUF with `clip.projector_type` `kind`, deleted when dropped.
+    /// The vocabulary of GLM-5.3-Flash's text model, for the ids its projector places.
+    fn glm_vocab(id: u32) -> Option<String> {
+        match id {
+            154_830 => Some("<|begin_of_image|>".to_owned()),
+            154_831 => Some("<|end_of_image|>".to_owned()),
+            154_854 => Some("<|image|>".to_owned()),
+            _ => None,
+        }
+    }
+
+    /// GLM's type is the third row: its three ids, no rope sections asked of the text, and the
+    /// limits steering its plan; the text is held to the ids, each refused by name, and to the row
+    /// width.
+    #[test]
+    fn a_glm5v_projector_is_held_by_its_three_ids() {
+        let row = &rules()[2];
+        assert_eq!(row.projector, "glm5v");
+        assert_eq!(
+            row.ids,
+            [
+                (154_830, "<|begin_of_image|>"),
+                (154_831, "<|end_of_image|>"),
+                (154_854, "<|image|>")
+            ]
+        );
+        assert_eq!((row.text_rope, row.takes_limits), (None, true));
+        let p = projector(2, 4096, 154_854);
+        p.check_text(&facts(4096, None, PleImage::Absent), &glm_vocab)
+            .unwrap();
+        let said = |t: TextFacts, v: &dyn Fn(u32) -> Option<String>| {
+            p.check_text(&t, v).unwrap_err().to_string()
+        };
+        assert_eq!(
+            said(facts(2048, None, PleImage::Absent), &glm_vocab),
+            "--mmproj /m/mmproj.gguf: the encoder's aligner rows are 4096 wide, the model's \
+             embedding is 2048"
+        );
+        assert_eq!(
+            said(facts(4096, None, PleImage::Absent), &|id| {
+                (id != 154_854).then(|| glm_vocab(id)).flatten()
+            }),
+            "--mmproj /m/mmproj.gguf: the glm5v projector's image id 154854 is \"<|image|>\", \
+             and the model's vocabulary holds no such token"
+        );
+        assert_eq!(
+            said(facts(4096, None, PleImage::Absent), &|id| {
+                if id == 154_830 {
+                    Some("<|begin_of_box|>".to_owned())
+                } else {
+                    glm_vocab(id)
+                }
+            }),
+            "--mmproj /m/mmproj.gguf: the glm5v projector's image id 154830 is \
+             \"<|begin_of_image|>\", and the model's vocabulary holds \"<|begin_of_box|>\""
+        );
+        assert_eq!(
+            said(facts(4096, None, PleImage::Id(154_000)), &glm_vocab),
+            "--mmproj /m/mmproj.gguf: the text model's ple.image_token_id is 154000, the \
+             projector's image token is 154854"
+        );
+    }
+
+    /// The keys of GLM-5.3-Flash's mmproj header that the host crate holds a file to
+    /// (`glm5v::Hparams::read`), without the architecture and the projector type.
+    fn glm5v_header() -> Vec<(String, Value)> {
+        let clip =
+            |bits: [u32; 3]| Value::Array(bits.map(|b| Value::F32(f32::from_bits(b))).to_vec());
+        vec![
+            ("clip.has_vision_encoder", Value::Bool(true)),
+            ("clip.use_silu", Value::Bool(true)),
+            ("clip.vision.block_count", Value::U32(24)),
+            ("clip.vision.embedding_length", Value::U32(1024)),
+            ("clip.vision.attention.head_count", Value::U32(16)),
+            ("clip.vision.feed_forward_length", Value::U32(4096)),
+            ("clip.vision.patch_size", Value::U32(14)),
+            ("clip.vision.spatial_merge_size", Value::U32(2)),
+            ("clip.vision.projection_dim", Value::U32(4096)),
+            ("clip.vision.image_size", Value::U32(448)),
+            ("clip.vision.image_min_pixels", Value::U32(12_544)),
+            ("clip.vision.image_max_pixels", Value::U32(6_272_000)),
+            ("clip.vision.swiglu_clamp", Value::F32(10.0)),
+            ("clip.vision.attention.layer_norm_epsilon", Value::F32(1e-5)),
+            (
+                "clip.vision.image_mean",
+                clip([0x3ef6_813a, 0x3eea_685e, 0x3ed1_00ff]),
+            ),
+            (
+                "clip.vision.image_std",
+                clip([0x3e89_89d0, 0x3e85_c974, 0x3e8d_32a8]),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect()
+    }
+
+    /// A header-only GGUF with `clip.projector_type` `kind` and the keys `more`, deleted when
+    /// dropped.
     struct Clip(PathBuf);
 
     impl Clip {
         fn new(kind: Option<&str>) -> Clip {
+            Clip::with(kind, Vec::new())
+        }
+
+        fn with(kind: Option<&str>, more: Vec<(String, Value)>) -> Clip {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let mut kvs = vec![(
@@ -990,6 +1236,7 @@ mod tests {
             if let Some(k) = kind {
                 kvs.push(("clip.projector_type".to_owned(), Value::String(k.into())));
             }
+            kvs.extend(more);
             let layout = gguf::write::Layout::new(&kvs, Vec::new()).expect("layout");
             let path = std::env::temp_dir().join(format!(
                 "bloomery-vision-seat-{}-{}.gguf",
@@ -1011,8 +1258,8 @@ mod tests {
     }
 
     /// The file's own refusals before the host crate reads it: a projector type the seat's text
-    /// cannot run, one with no rule, an absent type, a limit on a projector that plans its own, and
-    /// a file that is no GGUF.
+    /// cannot run, one with no rule, an absent type, a limit on a projector that plans its own, a
+    /// file the host crate refuses by key, and a file that is no GGUF.
     #[test]
     fn the_file_is_refused_by_name_before_it_is_read() {
         let open = |c: &Clip, f: &Flags, takes: &[&str]| {
@@ -1031,13 +1278,28 @@ mod tests {
                 qwen.0.display()
             )
         );
+        let stranger = Clip::new(Some("qwen2vl_merger"));
+        assert_eq!(
+            open(&stranger, &none, &["qwen2vl_merger"]),
+            format!(
+                "--mmproj {}: projector type \"qwen2vl_merger\" has no rule in the vision \
+                 seat's table",
+                stranger.0.display()
+            )
+        );
         let glm = Clip::new(Some("glm5v"));
         assert_eq!(
-            open(&glm, &none, &["glm5v"]),
+            open(&glm, &none, &["deepseek41v"]),
             format!(
-                "--mmproj {}: projector type \"glm5v\" has no rule in the vision seat's table",
+                "--mmproj {}: projector type \"glm5v\"; this seat's text model takes \
+                 [\"deepseek41v\"]",
                 glm.0.display()
             )
+        );
+        let said = open(&glm, &none, &["glm5v"]);
+        assert!(
+            said.starts_with(&format!("--mmproj {}: metadata clip.", glm.0.display())),
+            "{said}"
         );
         let bare = Clip::new(None);
         assert_eq!(
@@ -1063,6 +1325,89 @@ mod tests {
                 .starts_with("--mmproj /nonexistent/mmproj.gguf: "),
             "{e}"
         );
+    }
+
+    /// The limits are resolved once over the projector's own defaults: GLM's file gives 16 and
+    /// 8000 tokens with no flag, each flag moves its own side, and the card figure and the cap
+    /// follow the resolved limits; a minimum over the file's maximum is refused by name. The
+    /// Qwen3-VL and V4.1 rows hand out mtmd's 8 and 4096.
+    #[test]
+    fn the_limits_resolve_once_over_the_projectors_own_defaults() {
+        let glm = Clip::with(Some("glm5v"), glm5v_header());
+        let at = |a: &[&str]| {
+            let f = flags(a).unwrap();
+            Projector::open(&glm.0, &f, &["glm5v"])
+                .map(|p| {
+                    (
+                        p.limits.min(),
+                        p.limits.max(),
+                        p.cap,
+                        p.card.total(),
+                        p.out_dim,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(at(&[]), Ok((16, 8000, 8000, 3_144_794_112, 4096)));
+        assert_eq!(
+            at(&["--image-max-tokens", "1024"]),
+            Ok((16, 1024, 1024, 1_386_172_416, 4096))
+        );
+        assert_eq!(
+            at(&["--image-min-tokens", "100"]),
+            Ok((100, 8000, 8000, 3_144_794_112, 4096))
+        );
+        assert_eq!(
+            at(&["--image-min-tokens", "9000"]),
+            Err(
+                "--image-min-tokens/--image-max-tokens: image size limits: min 9000 and max \
+                 8000 tokens; need 1 <= min <= max"
+                    .to_owned()
+            )
+        );
+        let bare = |kind: &str| {
+            let c = Clip::new(Some(kind));
+            let file = Gguf::open(&c.0).expect("opens");
+            let rule = rules()
+                .iter()
+                .find(|r| r.projector == kind)
+                .expect("a rule");
+            let l = (rule.default_limits)(&file).expect("limits");
+            (l.min(), l.max())
+        };
+        assert_eq!(bare("qwen3vl_merger"), (8, 4096));
+        assert_eq!(bare("deepseek41v"), (8, 4096));
+    }
+
+    /// The seat takes the projector's resolved limits, cap and card figure as they are, so the
+    /// tower is loaded at the limits its card figure was computed for.
+    #[test]
+    fn a_seated_projector_keeps_the_limits_it_was_opened_at() {
+        let mut p = projector(2, 4096, 154_854);
+        p.limits = TokenLimits::new(16, 1024).unwrap();
+        p.cap = 1024;
+        let seat = EncoderSeat {
+            name: "NVIDIA RTX A6000".to_owned(),
+            ordinal: 0,
+            reserve: Some(3),
+        };
+        let at = p.seated(seat.clone());
+        assert_eq!((at.limits.min(), at.limits.max(), at.cap), (16, 1024, 1024));
+        assert_eq!((at.card.total(), at.seat), (3, seat));
+        assert_eq!(at.path, PathBuf::from("/m/mmproj.gguf"));
+    }
+
+    /// An image of a media call reads its three facts off the prepare: the position its span starts
+    /// at, the patches it encodes (those, not a copy) and the positions it takes.
+    #[test]
+    fn an_image_is_read_off_its_prepare() {
+        let prepared = Prepared {
+            span_len: 7,
+            patches: patches(2, 3),
+        };
+        let image = Image::of(5, &prepared);
+        assert_eq!((image.at, image.span_len), (5, 7));
+        assert!(std::ptr::eq(image.patches, &prepared.patches));
     }
 
     /// The `vision` record: the line the old eprintln printed, with the home and the cap added,
@@ -1144,6 +1489,37 @@ mod tests {
         let (span, kinds) = merged_cells(&rows, &patches(2, 3)).unwrap();
         assert_eq!(span, rows);
         assert_eq!(kinds.len(), 6);
+    }
+
+    /// A merger tower's spans become the plain spans of a media call: each at its own positions
+    /// over its own values of the one buffer of rows.
+    #[test]
+    fn merged_spans_are_plain_media_spans_over_the_one_buffer() {
+        let (a, b) = (patches(1, 2), patches(2, 1));
+        let images = [
+            Image {
+                at: 3,
+                patches: &a,
+                span_len: 2,
+            },
+            Image {
+                at: 9,
+                patches: &b,
+                span_len: 2,
+            },
+        ];
+        let mut n = 0u16;
+        let encode = |p: &Patches| -> Result<Vec<u16>, String> {
+            n += 1;
+            Ok((0..(cells(p) * W) as u16).map(|i| n * 100 + i).collect())
+        };
+        let got = span_rows_of(images, W, encode, merged_cells).unwrap();
+        let spans = got.media_spans();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].at, 3..5);
+        assert_eq!(spans[0].rows, [100, 101, 102, 103, 104, 105]);
+        assert_eq!(spans[1].at, 9..11);
+        assert_eq!(spans[1].rows, [200, 201, 202, 203, 204, 205]);
     }
 
     /// A span that adds rows around the tower's: a Start row of 9s, each grid row's cells and a
