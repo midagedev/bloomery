@@ -34,7 +34,7 @@
 //! grouping.
 
 use crate::GpuError;
-use crate::cores::q4k_row_dot_1col;
+use crate::cores::{l2_prefetch, q4k_row_dot_1col};
 use crate::elem::{silu_mul, weighted_expert_sum};
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
@@ -97,6 +97,9 @@ unsafe fn gate_up_row(
     }
     let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
     let col = slot / slots_per_col as usize;
+    let row_bytes = 144 * n_sb as usize;
+    l2_prefetch(wg, row_abs * row_bytes, row_bytes, lane);
+    l2_prefetch(wu, row_abs * row_bytes, row_bytes, lane);
     // The core's caller contract, from this fn's: row_abs < n_experts ·
     // rows_per_expert rows of both stacks, column col < m_cols, iters =
     // ceil(n_sb/4), and all 32 lanes of the warp are here (the return above

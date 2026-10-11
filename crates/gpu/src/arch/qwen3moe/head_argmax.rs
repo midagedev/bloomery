@@ -21,7 +21,7 @@
 //! integer order is that order.
 
 use crate::GpuError;
-use crate::cores::{funnel16, half_to_f32, q6k_chain, q6k_dequant, q6k_sub_scale};
+use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
 use crate::elem::argmax_take;
 use crate::fault::FaultSink;
 use crate::launch_u32;
@@ -115,6 +115,7 @@ mod qwen3moe_head_kernels {
         if row < n_rows as usize {
             let n_sb = n_sb as usize;
             let row_bytes = 210 * n_sb;
+            l2_prefetch(w, row * row_bytes, row_bytes, lane);
             let w16 = lane & 15;
             let half = lane >> 4;
             let qlok = 16 * (w16 & 3);

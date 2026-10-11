@@ -15,7 +15,7 @@
 //! super-block count serves, odd ones included (a 768-value row is 630
 //! bytes and every other row starts at 2 mod 4).
 
-use crate::cores::{funnel16, half_to_f32, q6k_chain, q6k_dequant, q6k_sub_scale};
+use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -87,6 +87,7 @@ mod q6k_sel_kernels {
         let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
         let n_sb = n_sb as usize;
         let row_bytes = 210 * n_sb;
+        l2_prefetch(w, row_abs * row_bytes, row_bytes, lane);
         let q_col = 128 * iters as usize;
         let d8_col = 2 * n_sb;
         let q0c = q_col * slot;

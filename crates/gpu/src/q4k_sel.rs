@@ -39,7 +39,7 @@
 //! [`tile_block`] (over [`tile_at`]) is the one reading of a tile launch's
 //! block, every tiled kernel's prologue, each kernel's work a [`TileWork`].
 
-use crate::cores::q4k_row_dot_1col;
+use crate::cores::{l2_prefetch, q4k_row_dot_1col};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
 use crate::kquant::tiles::{GemvTiles, TiledDown, down_grid};
@@ -384,6 +384,7 @@ mod q4k_sel_kernels {
             return;
         }
         let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+        l2_prefetch(w, row_abs * 144 * n_sb as usize, 144 * n_sb as usize, lane);
         // The core's caller contract, from the launch contract: row_abs <
         // n_experts * rows_per_expert rows of `w`, column slot < n_slots of
         // `q`/`s8`/`d8`, iters = ceil(n_sb/4) from the host, and all 32

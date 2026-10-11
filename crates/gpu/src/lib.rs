@@ -764,8 +764,8 @@ pub(crate) unsafe fn q8_1_quant_vals(
 mod kernels {
     use super::*;
     use crate::cores::{
-        funnel16, half_to_f32, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot, q4k_row_dot_1col,
-        q6k_chain, q6k_dequant, q6k_sub_scale,
+        funnel16, half_to_f32, l2_prefetch, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot,
+        q4k_row_dot_1col, q6k_chain, q6k_dequant, q6k_sub_scale,
     };
 
     // Q3_K packing recap (decode verified against ggml's
@@ -931,6 +931,7 @@ mod kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
+        l2_prefetch(w, row * 144 * n_sb as usize, 144 * n_sb as usize, lane);
         let f0 = q4k_row_dot_1col(w, q, s8, d8, n_sb as usize, iters, row, 0, lane);
         let s0 = warp::reduce_sum_f32(f0);
         if lane == 0 {
@@ -1118,6 +1119,7 @@ mod kernels {
         let m = m_cols as usize;
         let n_sb = n_sb as usize;
         let row_bytes = 210 * n_sb;
+        l2_prefetch(w, row * row_bytes, row_bytes, lane);
         let q_col = 128 * iters as usize; // q8 words per column
         let d8_col = 2 * n_sb; // 128-value blocks per column
 

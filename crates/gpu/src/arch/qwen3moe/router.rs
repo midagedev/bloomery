@@ -54,6 +54,7 @@
 //! them zeroed.
 
 use super::ubatch::UBATCH;
+use crate::cores::l2_prefetch;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::gemm::GEMM_MAX_SLOTS;
@@ -951,6 +952,10 @@ unsafe fn norm_row_body(
     let k = k as usize;
     let n_sb = n_sb as usize;
     let base = t * k;
+    // The row's weights stream into L2 while the norm runs.
+    if t == 0 && wi == 0 && row < rows {
+        l2_prefetch(w, 4 * row * k, 4 * k, lane);
+    }
 
     // Phase A: `norm_quant`'s sum of squares on this block's threads.
     // SAFETY: base + k = (t + 1)·k <= x.len() by this fn's contract; tid <
