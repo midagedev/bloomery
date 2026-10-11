@@ -62,6 +62,7 @@ use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
+use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block_cols};
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
@@ -376,12 +377,12 @@ pub fn prefill_mode(m: &Mimo2Model) -> Result<PrefillMode, GpuError> {
 /// prompt allocates nothing. Returns whether it made any.
 pub fn set_prefill(m: &mut Mimo2Model, mode: PrefillMode) -> Result<bool, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.prompt.mode = mode;
-    if mode == PrefillMode::Steps || body.prompt.batch.is_some() {
-        return Ok(false);
+    let made = mode == PrefillMode::Batch && body.prompt.batch.is_none();
+    if made {
+        body.make_batch(gpu)?;
     }
-    body.make_batch(gpu)?;
-    Ok(true)
+    body.prompt.mode = mode;
+    Ok(made)
 }
 
 /// The batches a prompt group of `m` runs layer by layer: `g` consecutive
@@ -517,6 +518,19 @@ impl Body {
             .map_err(|r| shape(r.to_string()))
     }
 
+    /// Refused by name for a load whose dense block is not q8_0: the batch feed's dense block runs over
+    /// columns, which only the q8_0 block does
+    /// ([`bloomery_gpu_deepseek41::block::BlockPlan::check_cols`]); such a file feeds by steps.
+    fn refuse_k_quant_dense(&self) -> Result<(), GpuError> {
+        for (l, c) in self.cfg.iter().enumerate() {
+            if let Some(plan) = c.block {
+                plan.check_cols(WHAT, l)
+                    .map_err(|e| shape(format!("{e}; this file feeds by steps")))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Refused by name when `units` more units of `cap` tokens and `shared`
     /// more bytes pass the card's free device bytes ([`Gpu::alloc_room`]): the
     /// load's plan reserves none for the prompt batch, so its buffers come out
@@ -549,6 +563,7 @@ impl Body {
             return Ok(());
         }
         self.refuse_late_dense(self.prompt.group)?;
+        self.refuse_k_quant_dense()?;
         let cap = cap_of(self.ctx);
         let n = self.dims.embd;
         let lens = Lens::of(&self.dims, &self.cfg, cap);
@@ -871,20 +886,25 @@ impl PromptProgram<'_> {
             t,
             &mut b.xn,
         )?;
-        let (gate, up) = (w.resident(WHAT, gate)?, w.resident(WHAT, up)?);
+        let plan = c
+            .block
+            .ok_or_else(|| shape(format!("layer {l}: a dense block without its plan")))?;
+        let blk = Block {
+            plan,
+            names: [gate, up, down],
+            ff: c.ffn.ff,
+            limit: c.ffn.limit,
+            layer: l,
+        };
         for (c0, cn) in chunks(t, COL_GROUP) {
             let xs = span(W, &b.xn, c0 * d.embd, cn * d.embd)?;
-            self.k.experts.enqueue_shexp_gate_up_mcol(
-                stream,
-                gate,
-                up,
-                &xs,
-                cn,
-                c.ffn.limit,
-                &mut b.h,
-            )?;
             let mut out = span_mut(W, &mut b.out, c0 * d.embd, cn * d.embd)?;
-            w.q8_gemv_mcol(gpu, WHAT, down, &b.h, cn, &mut out)?;
+            let io = BlockIo {
+                x: &xs,
+                h: &mut b.h,
+                y: &mut out,
+            };
+            enqueue_block_cols(gpu, w, &self.k.experts, &blk, cn, io)?;
         }
         gpu.elem()
             .enqueue_add(stream, &ub.x1, &b.out, t * d.embd, &mut ub.x)
