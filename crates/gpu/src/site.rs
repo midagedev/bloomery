@@ -23,7 +23,9 @@
 //!   int8 GEMM over the q8_1 blocks of 128 values ([`GemmAct`]), Q8_0 the
 //!   32-value GEMM over the q8 blocks of 32 values ([`GemmAct32`]) on the
 //!   q8f32 planes, F32 the F32 tile over the f32 rows (one column a slot, on
-//!   the unit's one-expert table only).
+//!   the unit's one-expert table only). A site's weight is the resident
+//!   tensor of its name, or — a K-quant's — the words a caller holds
+//!   ([`SiteWeight`]).
 //! - [`gated`], a wide gate·up·down block over one table: the gate and up
 //!   [`gemm`]s, the gate·up rule's SwiGLU written into the form the down's
 //!   type reads (the down's activation), and the down [`gemm`] over those
@@ -40,7 +42,7 @@ use crate::kquant::{Act, KquantKernels, SelDown};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
-use crate::{FaultSink, Gpu, GpuError};
+use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
 use gguf::quant::GgmlType;
@@ -357,6 +359,51 @@ pub fn kgemv(
     }
 }
 
+/// Where a wide site reads its weight: the resident tensor of a name
+/// (`Weights`), or the K-quant words a caller holds — a window of experts
+/// laid out as the resident stack of the site's type, kept outside
+/// `Weights`. Both carry the site's name, which a refusal names. A Q8_0 or
+/// F32 site is resident alone: words under any other type than a K-quant's
+/// are refused by name ([`gemm`], [`gated`]).
+#[derive(Clone, Copy)]
+pub enum SiteWeight<'a> {
+    /// The resident weight of this name.
+    Resident(&'a str),
+    /// The words of site `name`, `w`.
+    Words {
+        name: &'a str,
+        w: &'a DeviceTensor<u32>,
+    },
+}
+
+impl<'a> SiteWeight<'a> {
+    /// The site's name.
+    #[must_use]
+    pub fn name(self) -> &'a str {
+        match self {
+            SiteWeight::Resident(name) | SiteWeight::Words { name, .. } => name,
+        }
+    }
+
+    /// Words under a type that is not a K-quant's, refused by name as
+    /// `what`.
+    fn check(self, what: &'static str, ty: SiteTy) -> Result<(), GpuError> {
+        match self {
+            SiteWeight::Words { name, .. } if !ty.kquant() => Err(GpuError::shape(
+                what,
+                format!("{name} is {ty} on words a caller holds; only a K-quant's words launch"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The resident name of a site whose type reads no words (Q8_0, F32).
+    fn resident(self, what: &'static str, ty: SiteTy) -> Result<&'a str, GpuError> {
+        self.check(what, ty)?;
+        Ok(self.name())
+    }
+}
+
 /// The activation forms of a wide unit's rows a [`gemm`] picks from: the
 /// q8_1 blocks of 128 values, the q8 blocks of 32, and the f32 rows. A form
 /// no site of the call reads may be absent.
@@ -383,11 +430,12 @@ impl WideKernels<'_> {
     }
 }
 
-/// `y = W · x` for site `name` of type `ty`, `rows` rows an expert, over the
+/// `y = W · x` for site `src` of type `ty`, `rows` rows an expert, over the
 /// slots `route` holds, `input` picking each slot's column (module doc). A
 /// 32-value GEMM over the unit's one-expert table must find it filled for
 /// exactly `m` slots, and an F32 site runs only there (one column a slot);
-/// a form the site reads that `x` lacks is refused by name.
+/// a form the site reads that `x` lacks is refused by name. `w` holds the
+/// resident weights `src` may name.
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
@@ -395,7 +443,7 @@ impl WideKernels<'_> {
 pub fn gemm(
     gpu: &Gpu,
     k: &WideKernels<'_>,
-    (ty, w, name): (SiteTy, &Weights, &str),
+    (ty, w, src): (SiteTy, &Weights, SiteWeight<'_>),
     rows: usize,
     x: &WideIn<'_>,
     (route, input): (&GemmRoute, GemmInput),
@@ -404,6 +452,7 @@ pub fn gemm(
 ) -> Result<(), GpuError> {
     const WHAT: &str = "site::gemm";
     let stream = gpu.stream();
+    let name = src.name();
     let missing = |form: &'static str| {
         GpuError::shape(
             WHAT,
@@ -431,7 +480,10 @@ pub fn gemm(
                 ty: ty
                     .gemm_weight()
                     .ok_or(GpuError::state(WHAT, "a K-quant's GEMM type"))?,
-                w: kq(w, WHAT, name)?,
+                w: match src {
+                    SiteWeight::Resident(name) => kq(w, WHAT, name)?,
+                    SiteWeight::Words { w, .. } => w,
+                },
                 rows_per_expert: rows,
                 act: x.q128.ok_or_else(|| missing("q8_1 blocks of 128"))?,
                 route,
@@ -441,7 +493,7 @@ pub fn gemm(
         ),
         SiteTy::Q8_0 => {
             dense()?;
-            let (qs, d) = w.q8_planes(WHAT, name)?;
+            let (qs, d) = w.q8_planes(WHAT, src.resident(WHAT, ty)?)?;
             k.g32(
                 WHAT,
                 "the 32-value kernels a Q8_0 site runs on (this load holds none)",
@@ -465,7 +517,13 @@ pub fn gemm(
                 WHAT,
                 "the 32-value kernels an F32 site runs on (this load holds none)",
             )?
-            .enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, rows, m, y)
+            .enqueue_f32_tile(
+                stream,
+                w.f32_tensor(WHAT, src.resident(WHAT, ty)?)?,
+                rows,
+                m,
+                y,
+            )
         }
     }
 }
@@ -477,10 +535,10 @@ pub fn gemm(
 pub struct Gated<'a> {
     pub w: &'a Weights,
     pub route: &'a GemmRoute,
-    /// Gate, up and down: each site's type and tensor name.
-    pub gate: (SiteTy, &'a str),
-    pub up: (SiteTy, &'a str),
-    pub down: (SiteTy, &'a str),
+    /// Gate, up and down: each site's type and weight.
+    pub gate: (SiteTy, SiteWeight<'a>),
+    pub up: (SiteTy, SiteWeight<'a>),
+    pub down: (SiteTy, SiteWeight<'a>),
     /// Rows an expert of the gate and up: the SwiGLU's values a column.
     pub ff: usize,
     /// Rows an expert of the down.
@@ -490,9 +548,20 @@ pub struct Gated<'a> {
 }
 
 impl<'a> Gated<'a> {
-    /// One of the block's sites as [`gemm`] takes it: type, weights, name.
-    fn at(&self, (ty, name): (SiteTy, &'a str)) -> (SiteTy, &'a Weights, &'a str) {
-        (ty, self.w, name)
+    /// One of the block's sites as [`gemm`] takes it: type, weights, weight.
+    fn at(&self, (ty, src): (SiteTy, SiteWeight<'a>)) -> (SiteTy, &'a Weights, SiteWeight<'a>) {
+        (ty, self.w, src)
+    }
+
+    /// What the block refuses whatever the rows: words under a type that is
+    /// not a K-quant's, and a rule the down's SwiGLU launch lacks
+    /// ([`swiglu_launch`]) — checked before the first launch, so a block
+    /// refused here has launched nothing.
+    fn check(&self) -> Result<(), GpuError> {
+        for (ty, src) in [self.gate, self.up, self.down] {
+            src.check("site::gated", ty)?;
+        }
+        swiglu_launch((self.down.0, self.down.1.name()), self.rule).map(|_| ())
     }
 }
 
@@ -520,7 +589,8 @@ pub struct GatedIo<'a> {
 /// `n_slots == m`; on an expert table it is the slots of the `m` columns.
 /// The launches are those of the sites' types ([`gemm`] and the SwiGLU's
 /// quantizer into the down's form); a form a site reads that `io` lacks is
-/// refused by name.
+/// refused by name, and words a site cannot launch ([`SiteWeight`]) before
+/// the first launch.
 pub fn gated(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -529,6 +599,7 @@ pub fn gated(
     io: GatedIo<'_>,
     fault: FaultSink,
 ) -> Result<(), GpuError> {
+    blk.check()?;
     let GatedIo {
         x,
         gate,
@@ -608,7 +679,8 @@ fn swiglu(
     fault: FaultSink,
 ) -> Result<(), GpuError> {
     const WHAT: &str = "site::swiglu";
-    let (ty, name) = blk.down;
+    let (ty, src) = blk.down;
+    let name = src.name();
     let stream = gpu.stream();
     let lacks = |form: &'static str| {
         GpuError::shape(
@@ -616,7 +688,7 @@ fn swiglu(
             format!("{name} is {ty} and reads {form}, which the SwiGLU rows lack"),
         )
     };
-    match swiglu_launch(blk.down, blk.rule)? {
+    match swiglu_launch((ty, name), blk.rule)? {
         SwigluLaunch::Q128 => {
             let a = rows
                 .q128

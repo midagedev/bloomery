@@ -59,11 +59,11 @@ use crate::linear::{self, LinearShape};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
-use crate::site::{self, Gated, GatedIo, SwigluRows, WideIn, WideKernels};
-use crate::tensor::WindowMut;
+use crate::site::{self, Gated, GatedIo, SiteWeight, SwigluRows, WideIn, WideKernels};
+use crate::tensor::{DeviceTensor, WindowMut};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
 /// (`ne[1] <= 8`), and the rows of a captured pass. Past it, the wide arm.
@@ -491,7 +491,7 @@ pub(super) fn gemm_site(
     site::gemm(
         gpu,
         &wide_kernels(k),
-        (ty, w, name),
+        (ty, w, SiteWeight::Resident(name)),
         rows,
         x,
         (route, input),
@@ -1095,7 +1095,7 @@ fn ffn_joined(
         }
         FfnRoute::Dense => (&*dense, GemmInput::PerSlot),
     };
-    slots_gemm(c, n, &d, table, &hid, rows, m)?;
+    slots_gemm(c, (n, None), &d, table, &hid, rows, m)?;
     k.experts.enqueue_combine_tokens(
         stream,
         CombineArgs {
@@ -1261,7 +1261,7 @@ pub(super) fn ffn_card(
     if let Some(table) = table {
         remap.enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
         let list = (&*table, GemmInput::Shared { top_k: slots });
-        slots_gemm(c, n, &d, list, &hid, rows, m)?;
+        slots_gemm(c, (n, None), &d, list, &hid, rows, m)?;
     }
     let Some(sh) = n.apart() else {
         return Ok(());
@@ -1279,9 +1279,9 @@ pub(super) fn ffn_card(
     let shared = Gated {
         w: c.w,
         route: dense,
-        gate: (sh.gate_ty, &sh.gate),
-        up: (sh.up_ty, &sh.up),
-        down: (sh.down_ty, &sh.down),
+        gate: (sh.gate_ty, SiteWeight::Resident(&sh.gate)),
+        up: (sh.up_ty, SiteWeight::Resident(&sh.up)),
+        down: (sh.down_ty, SiteWeight::Resident(&sh.down)),
         ff: d.ff,
         hidden: d.hidden,
         rule: Act::SiluMul,
@@ -1392,15 +1392,76 @@ pub(super) fn ffn_combine(
     )
 }
 
+/// A half of the expert stream's ring as the routed GEMMs read a layer's
+/// stacks ([`ffn_ring`]): its gate, up and down, each a stack of the half's
+/// slots at the layer's own types and row words.
+pub(super) struct RingStacks<'a> {
+    pub(super) gate: &'a DeviceTensor<u32>,
+    pub(super) up: &'a DeviceTensor<u32>,
+    pub(super) down: &'a DeviceTensor<u32>,
+}
+
+/// The ring's part of the apart arm of [`ffn`] over `m` rows, after
+/// [`ffn_card`] and before [`ffn_combine`]: one GEMM batch of a layer's
+/// stream — the routed table over the ring's half from the batch's map
+/// (`map`: the stream's row, a streamed expert's slot in the half, [`HOST`]
+/// for every other expert and for the shared expert's id, the routed count),
+/// then the engine stream waiting the batch's landed event (`wait`), then
+/// the routed slots the table lists through the half's stacks into the rows
+/// [`ffn_card`]'s slots write. The SwiGLU runs every slot's column, so a
+/// slot of the card's stacks gets its form again from its unchanged rows:
+/// the same bits. Only K-quant stacks route; another type is refused by
+/// name before the batch's GEMMs ([`site::gated`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the layer's context, plan, arena and width, the batch's map, table and wait, and the half's stacks (rust-quality R8)"
+)]
+pub(super) fn ffn_ring(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    map: &DeviceBuffer<u32>,
+    table: &mut GemmRoute,
+    wait: Option<&CudaEvent>,
+    ring: &RingStacks<'_>,
+) -> Result<(), GpuError> {
+    const WHAT_R: &str = "qwen3moe::wide::ffn_ring";
+    let stream = c.gpu.stream();
+    let d = s.dims;
+    let slots = d.slots();
+    let Arena {
+        normed,
+        route,
+        h,
+        down,
+        wide,
+        ..
+    } = s;
+    let Wide {
+        act_hid, act_h, up, ..
+    } = wide_of(wide, WHAT_R)?;
+    c.k.q35(WHAT_R)?
+        .g32
+        .enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
+    if let Some(e) = wait {
+        stream.wait(e)?;
+    }
+    let hid = act_hid.input(normed);
+    let list = (&*table, GemmInput::Shared { top_k: slots });
+    slots_gemm(c, (n, Some(ring)), &d, list, &hid, (act_h, h, up, down), m)
+}
+
 /// The slots' half of the FFN at `m` rows: the gated block over `table`
 /// (each slot's column of `hid` as its input picks it) — gate and up, their
 /// SwiGLU into the form the down's type reads, and the down over the same
 /// table, slot by slot, into `down` — the `m · d.slots()` slots' SwiGLU
-/// forms, gate (`h`), up and down rows. A slot the table lists in no tile
-/// keeps its rows.
+/// forms, gate (`h`), up and down rows. The stacks are the plan's `n`, or
+/// with `ring` a half of the expert stream's ring at the plan's types. A
+/// slot the table lists in no tile keeps its rows.
 fn slots_gemm(
     c: &Ctx<'_>,
-    n: &FfnPlan,
+    (n, ring): (&FfnPlan, Option<&RingStacks<'_>>),
     d: &Dims,
     (table, input): (&GemmRoute, GemmInput),
     hid: &WideIn<'_>,
@@ -1415,9 +1476,9 @@ fn slots_gemm(
     let slots = Gated {
         w: c.w,
         route: table,
-        gate: (n.gate_ty, &n.gate),
-        up: (n.up_ty, &n.up),
-        down: (n.down_ty, &n.down),
+        gate: slot_site((n.gate_ty, &n.gate), ring.map(|r| r.gate)),
+        up: slot_site((n.up_ty, &n.up), ring.map(|r| r.up)),
+        down: slot_site((n.down_ty, &n.down), ring.map(|r| r.down)),
         ff: d.ff,
         hidden: d.hidden,
         rule: Act::SiluMul,
@@ -1438,6 +1499,19 @@ fn slots_gemm(
         io,
         c.sink,
     )
+}
+
+/// Site `name` of type `ty` as [`slots_gemm`]'s block reads its weight: the
+/// resident stack, or with `window` the ring's words of the same type.
+fn slot_site<'a>(
+    (ty, name): (SiteTy, &'a str),
+    window: Option<&'a DeviceTensor<u32>>,
+) -> (SiteTy, SiteWeight<'a>) {
+    let src = match window {
+        Some(w) => SiteWeight::Words { name, w },
+        None => SiteWeight::Resident(name),
+    };
+    (ty, src)
 }
 
 impl GpuModel<Body35> {

@@ -64,15 +64,18 @@ use super::plan::{
 };
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
-use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, arena_bytes, route_bytes};
+use super::wide::{
+    self, CardRoute, GEMV_COLS, HostSide, RingStacks, act_col_bytes, arena_bytes, route_bytes,
+};
 use crate::gemm::{Gemm32Kernels, GemmRoute};
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::PassReport;
+use crate::host::swap_source::DEADLINE;
 use crate::host::swap_source::{FileSwap, ResidencyGlue};
-use crate::host::xstream::LandBatch;
+use crate::host::xstream::{self, Costs, LAND_BATCHES, LandBatch, RingLayer, XCfg};
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
@@ -182,11 +185,40 @@ impl RouteShape {
 /// its SwiGLU rows, their q8_1 form (one activation of `m` columns for each
 /// gemv width `m`) and its output; when the arena holds more than
 /// [`GEMV_COLS`] rows, each layer's table over the card's experts (`None`
-/// on a layer with none).
+/// on a layer with none), and once the expert stream runs the ring pass's
+/// buffers ([`PlacedRows::arm_ring`]).
 pub(super) struct PlacedRows {
     sel: DeviceBuffer<u32>,
     shared: Option<SharedRows>,
     routes: Vec<Option<GemmRoute>>,
+    ring: Option<RingRows>,
+}
+
+/// The ring pass's buffers of a wide arena ([`ring_pass`]): the routed table
+/// over a half of the expert stream's ring for the arena's slots, the union
+/// places (`pitch` a row: the card's stacks' experts and the streamed ones,
+/// [`HOST`] for the rest), and per landing batch of a layer's stream the
+/// batch's map `n_expert + 1` wide — the stream's row, then [`HOST`] for the
+/// shared expert's id, which the remap cannot do without ([`widen_map`]).
+struct RingRows {
+    route: GemmRoute,
+    union: DeviceBuffer<u32>,
+    maps: Vec<DeviceBuffer<u32>>,
+    /// The union check's records while it is on ([`Placed::set_ring_check`]).
+    checks: Option<Vec<RingCheck>>,
+}
+
+/// One ring pass's union places as the union check read them back
+/// ([`Placed::set_ring_check`]): the layer, its routed slots on a streamed
+/// expert, and the slots whose place is not the one the stack's row and the
+/// ring's row give — a streamed expert's `n_card` plus its slot in the half,
+/// any other expert's place in the card's stacks or [`HOST`], the shared
+/// slot [`HOST`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingCheck {
+    pub layer: usize,
+    pub streamed: usize,
+    pub wrong: usize,
 }
 
 /// The shared expert's buffers of [`PlacedRows`].
@@ -245,7 +277,38 @@ impl PlacedRows {
             sel,
             shared,
             routes,
+            ring: None,
         })
+    }
+
+    /// The ring pass's buffers for a half of `half_slots` slots of the expert
+    /// stream's ring: its routed table over the arena's slots, the union
+    /// places and [`LAND_BATCHES`] maps of `shape.n_expert + 1` words, every
+    /// word [`HOST`] until a pass writes it. Load-time only; a second arming
+    /// is refused by name.
+    fn arm_ring(
+        &mut self,
+        stream: &CudaStream,
+        shape: RouteShape,
+        half_slots: usize,
+    ) -> Result<(), GpuError> {
+        if self.ring.is_some() {
+            return Err(GpuError::state(
+                WHAT,
+                "pass rows the expert stream's ring is not armed on",
+            ));
+        }
+        let slots = self.sel.len();
+        let map = vec![HOST; shape.n_expert + 1];
+        self.ring = Some(RingRows {
+            route: GemmRoute::new(stream, slots, half_slots)?,
+            union: DeviceBuffer::from_host(stream, &vec![HOST; slots])?,
+            maps: (0..LAND_BATCHES)
+                .map(|_| DeviceBuffer::from_host(stream, &map))
+                .collect::<Result<_, _>>()?,
+            checks: None,
+        });
+        Ok(())
     }
 
     /// Device bytes.
@@ -263,6 +326,11 @@ impl PlacedRows {
                 .flatten()
                 .map(GemmRoute::bytes)
                 .sum::<usize>()
+            + self.ring.as_ref().map_or(0, |r| {
+                r.route.bytes()
+                    + r.union.num_bytes()
+                    + r.maps.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
+            })
     }
 }
 
@@ -335,10 +403,7 @@ impl PlacedSide {
             WHAT,
             "a map of the card's experts for every layer of a wide unit",
         ))?;
-        let row = Window::<u32>::of(slots.buf(), l * n * size_of::<u32>(), n)?;
-        let mut head = WindowMut::<u32>::of_mut(map, 0, n)?;
-        head.copy_from_device_async(&row, stream)?;
-        Ok(())
+        widen_map(stream, (slots.buf(), l * n), n, map)
     }
 
     /// Whether layer `l` holds routed experts on the card: the layers a
@@ -523,6 +588,68 @@ impl Placed {
             ));
         }
         Ok(placed)
+    }
+
+    /// Start the expert stream for `split` ([`HostTier::xstream_start`]: the
+    /// ring sized from the card's free bytes, the lane's probe, `costs` for
+    /// the rule over the router's experts and routed slots) and arm the pass
+    /// rows for its ring ([`PlacedRows::arm_ring`]); a started stream and
+    /// armed rows are left as they are. Refused by name: a pass arena of the
+    /// gemv arm alone (the ring pass is the wide arm's), a load that runs no
+    /// residency machine and the stream's refusals, the card's room among
+    /// them. Load-time only.
+    ///
+    /// [`HostTier::xstream_start`]: crate::host::HostTier::xstream_start
+    pub(super) fn start_xstream(&mut self, gpu: &Gpu, costs: Costs) -> Result<(), GpuError> {
+        let shape = self.side.shape;
+        if self.side.cap <= GEMV_COLS {
+            return Err(GpuError::shape(
+                "BLOOMERY_XSTREAM",
+                format!(
+                    "split on a placed load whose units walk at most {} rows: the ring pass is \
+                     the wide arm's, past {GEMV_COLS} rows",
+                    self.side.cap
+                ),
+            ));
+        }
+        if self.hybrid.xstream().is_none() {
+            let cfg = XCfg::new(costs, shape.n_expert, shape.used, DEADLINE, None);
+            self.hybrid
+                .xstream_start(gpu.context(), gpu.stream(), cfg, xstream::PROBE)?;
+        }
+        if self.pass.ring.is_none() {
+            let half = self
+                .hybrid
+                .xstream()
+                .map_or(0, xstream::XStream::half_slots);
+            self.pass.arm_ring(gpu.stream(), shape, half)?;
+        }
+        Ok(())
+    }
+
+    /// Whether each ring pass reads its union places back against the
+    /// stack's row and the ring's ([`RingCheck`], taken by
+    /// [`Placed::take_ring_checks`]): off at the arming. A debug view, for
+    /// the residency gate: on, every streamed layer's ring pass synchronizes
+    /// the engine stream. Refused by name before `split` armed the ring.
+    pub fn set_ring_check(&mut self, on: bool) -> Result<(), GpuError> {
+        let ring = self.pass.ring.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "pass rows armed for the expert stream's ring (Placed::start_xstream)",
+        ))?;
+        ring.checks = on.then(Vec::new);
+        Ok(())
+    }
+
+    /// The union check's records since the last take, in the order the ring
+    /// passes ran ([`Placed::set_ring_check`]); empty while it is off.
+    pub fn take_ring_checks(&mut self) -> Vec<RingCheck> {
+        self.pass
+            .ring
+            .as_mut()
+            .and_then(|r| r.checks.as_mut())
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Each layer's routed experts on the card, in layer order.
@@ -713,6 +840,34 @@ pub(super) fn counted_arena(
         ));
     }
     Ok(a)
+}
+
+/// `map`'s first `n` words brought to the `n` words of `src` from word `at`
+/// — a layer's row of the slot map's card copy, or a landing batch's row of
+/// the expert stream — in stream order on `stream`, its last entry (the
+/// shared expert's id, [`HOST`]) left as it is: the `n + 1` map the wide
+/// arm's remap reads, which faults on an id at the router's expert count.
+/// One device-to-device copy. A map of other than `n + 1` words is refused
+/// by name.
+fn widen_map(
+    stream: &CudaStream,
+    (src, at): (&DeviceBuffer<u32>, usize),
+    n: usize,
+    map: &mut DeviceBuffer<u32>,
+) -> Result<(), GpuError> {
+    if map.len() != n + 1 {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a map of {} words for {n} experts and the shared expert's id",
+                map.len()
+            ),
+        ));
+    }
+    let row = Window::<u32>::of(src, at * size_of::<u32>(), n)?;
+    let mut head = WindowMut::<u32>::of_mut(map, 0, n)?;
+    head.copy_from_device_async(&row, stream)?;
+    Ok(())
 }
 
 /// Each layer's map of the experts to their places in the card's stacks:
@@ -1244,6 +1399,175 @@ fn card_wide(
     wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table, remap }))
 }
 
+/// Layer `c.layer`'s ring pass over `m` rows (more than [`GEMV_COLS`]) of
+/// arena `s` after its card route ([`card_wide`]), under the layer's stream
+/// `r`: the union places of the unit's routed slots into the ring rows, cut
+/// from the stream's union row read in place (the places read no id past a
+/// row's routed slots, so that row needs no shared entry), then one GEMM
+/// batch a landing batch of the stream — the batch's map widened
+/// ([`widen_map`]) and the half's stacks through it ([`wide::ffn_ring`]),
+/// each behind its own landed event. Returns the union's card places, the
+/// layer's card experts and the streamed ones (`n_card + r.n`), which the
+/// combine reads ([`StreamWalk`]'s back). Refused by name: rows the ring is
+/// not armed on, and a stream of more batches than the rows hold maps for or
+/// of more experts than its half.
+fn ring_pass(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    rows: &mut PlacedRows,
+    s: &mut Arena,
+    m: usize,
+    r: &RingLayer,
+) -> Result<usize, GpuError> {
+    let shape = side.shape;
+    let n_card = side
+        .ffn
+        .get(c.layer)
+        .ok_or(GpuError::state(WHAT, "a placed FFN for every layer"))?
+        .n_card;
+    let ring = rows.ring.as_mut().ok_or(GpuError::state(
+        WHAT,
+        "pass rows armed for the expert stream's ring (Placed::start_xstream)",
+    ))?;
+    if r.batches.len() > ring.maps.len() || r.n > r.half_slots {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {}: a stream of {} experts in {} landing batches over a half of {} \
+                 slots; the ring rows hold {} batch maps",
+                c.layer,
+                r.n,
+                r.batches.len(),
+                r.half_slots,
+                ring.maps.len()
+            ),
+        ));
+    }
+    let n = &c.p.ffn;
+    let (ctx, stream) = (c.gpu.context(), c.gpu.stream());
+    let cols = |name: &str| kq_weight(c.w, name).map(DeviceTensor::cols);
+    let (gate_cols, up_cols, down_cols) = (cols(&n.gate)?, cols(&n.up)?, cols(&n.down)?);
+    // SAFETY: the stream's union row is `n_expert` words of its mapped host
+    // rows, and its half holds `half_slots` experts of this layer's part
+    // bytes in each part from the half's first slot — its gate and up rows
+    // of the card stacks' words, its down rows likewise
+    // (`XStream::ring_layer`); all stay allocated while the stream lives,
+    // past these launches, and the windows are given back below.
+    let (union_map, gate, up, down) = unsafe {
+        (
+            crate::tensor::window::<u32>(r.union_map, shape.n_expert, ctx),
+            DeviceTensor::<u32>::window(r.parts[0], r.half_slots * shape.ff, gate_cols, ctx),
+            DeviceTensor::<u32>::window(r.parts[1], r.half_slots * shape.ff, up_cols, ctx),
+            DeviceTensor::<u32>::window(r.parts[2], r.half_slots * shape.hidden, down_cols, ctx),
+        )
+    };
+    let ran = (|| {
+        side.k.leg.enqueue_places(
+            stream,
+            &PlacesArgs {
+                ids: s.route.ids(),
+                map: &union_map,
+                row_off: 0,
+                n_expert: shape.n_expert,
+                pitch: shape.pitch,
+                used: shape.used,
+                m,
+            },
+            c.sink,
+            &mut ring.union,
+        )?;
+        let stacks = RingStacks {
+            gate: &gate,
+            up: &up,
+            down: &down,
+        };
+        for (b, map) in r.batches.iter().zip(ring.maps.iter_mut()) {
+            b.with_map(ctx, shape.n_expert, |row| {
+                widen_map(stream, (row, 0), shape.n_expert, map)
+            })?;
+            wide::ffn_ring(
+                c,
+                n,
+                s,
+                m,
+                map,
+                &mut ring.route,
+                b.event.as_deref(),
+                &stacks,
+            )?;
+        }
+        if let Some(checks) = ring.checks.as_mut() {
+            let maps = ring.maps.get(..r.batches.len()).unwrap_or_default();
+            let ids = s.route.ids();
+            checks.push(union_check(c, side, (ids, &ring.union), maps, m, n_card)?);
+        }
+        Ok(n_card + r.n)
+    })();
+    drop(std::mem::ManuallyDrop::into_inner(union_map).into_raw_parts());
+    for w in [gate, up, down] {
+        DeviceTensor::release(w);
+    }
+    ran
+}
+
+/// Layer `c.layer`'s union places of `m` rows (`union`, cut from the
+/// unit's `ids`) read back against the stack's row (the slot map's card
+/// copy) and the ring's slots from the layer's widened batch maps (`maps`,
+/// each streamed expert in one of them): [`RingCheck`]. Synchronizes the
+/// engine stream; the union check's alone ([`Placed::set_ring_check`]).
+fn union_check(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    (ids, union): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
+    maps: &[DeviceBuffer<u32>],
+    m: usize,
+    n_card: usize,
+) -> Result<RingCheck, GpuError> {
+    let (shape, l) = (side.shape, c.layer);
+    let (n, pitch) = (shape.n_expert, shape.pitch);
+    let stream = c.gpu.stream();
+    let mut ring = vec![HOST; n];
+    for map in maps {
+        for (r, &i) in ring.iter_mut().zip(&map.to_host_vec(stream)?) {
+            if i != HOST {
+                *r = i;
+            }
+        }
+    }
+    let ids = ids.to_host_vec(stream)?;
+    let got = union.to_host_vec(stream)?;
+    let stack = side.slots.buf().to_host_vec(stream)?;
+    let stack = stack.get(l * n..(l + 1) * n).ok_or(GpuError::state(
+        WHAT,
+        "a row of the slot map's card copy for every layer",
+    ))?;
+    let base = u32::try_from(n_card).map_err(|_| GpuError::shape(WHAT, "a card count past u32"))?;
+    let (mut streamed, mut wrong) = (0, 0);
+    for at in 0..m * pitch {
+        let want = if at % pitch >= shape.used {
+            HOST
+        } else {
+            let id = ids.get(at).map_or(usize::MAX, |&id| id as usize);
+            match (ring.get(id), stack.get(id)) {
+                (Some(&i), _) if i != HOST => {
+                    streamed += 1;
+                    base + i
+                }
+                (_, Some(&p)) => p,
+                _ => HOST,
+            }
+        };
+        if got.get(at) != Some(&want) {
+            wrong += 1;
+        }
+    }
+    Ok(RingCheck {
+        layer: l,
+        streamed,
+        wrong,
+    })
+}
+
 /// What a placed walk reads and writes: the chain's context, its stores,
 /// the arena and its input, the unit's rows, the placed side (a streaming
 /// prompt call's walk brings a layer's map to its pick,
@@ -1444,6 +1768,7 @@ impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
             walk: self,
             stream,
             walk_end,
+            ring_at: None,
         };
         sched::walk(o, layers, leg, &mut w)?;
         let engine = leg.stream();
@@ -1492,6 +1817,32 @@ impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
             stream.wait(e)?;
         }
         Ok(())
+    }
+
+    /// [`BatchWalk`]'s wide back for a layer whose shadow ran the ring pass
+    /// ([`ring_pass`]): the combine over the union places, below `n` the
+    /// card's — its stacks' experts and the streamed ones — and the host
+    /// sums the walk's serve uploaded, which leave the streamed experts out
+    /// (the serve's exclusion set).
+    fn back_union(
+        &mut self,
+        port: &mut BatchLeg<'_, HostRun>,
+        at: At,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        let p = &mut self.p;
+        let lc = ctx_of(p.c, at.layer)?;
+        let ring = p.rows.ring.as_ref().ok_or(GpuError::state(
+            WHAT,
+            "pass rows armed for the expert stream's ring (Placed::start_xstream)",
+        ))?;
+        let host = HostSide {
+            sel: &ring.union,
+            hsum: port.hsum(),
+            n_card: n,
+            leg: &p.side.k.leg,
+        };
+        wide::ffn_combine(&lc, &lc.p.ffn, p.s, p.m, Some(host), None)
     }
 }
 
@@ -1559,15 +1910,19 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
 }
 
 /// A prompt unit's walk in a streaming prompt call (the [`XMode`] lever's
-/// `admit`, [`PromptStream`]): [`BatchWalk`]'s parts with the stream's
-/// around them. At a layer's shadow the return of the layer whose host
-/// service ran last, then — on a layer with card experts — the layer's pick
-/// for the unit, the map and places it moved ([`BatchWalk::moved`]), the
-/// card route under them and the layer's last read of its slots; at its
-/// back the layer's return owed in the returning call's last walk. The
-/// serve of a layer runs after its shadow (the batch order's), so it reads
-/// the host map the pick moved. A unit of at most [`GEMV_COLS`] rows picks
-/// nothing (the pick's floor is past it).
+/// `admit` and `split`, [`PromptStream`]): [`BatchWalk`]'s parts with the
+/// stream's around them. At a layer's shadow the return of the layer whose
+/// host service ran last, then — on a layer with card experts — the layer's
+/// pick for the unit, the map and places it moved ([`BatchWalk::moved`]),
+/// the card route under them, under `split` the ring pass over the layer's
+/// stream ([`ring_pass`]), and the layer's last read of its slots; at its
+/// back the combine — over the union places when the shadow ran the ring
+/// pass ([`BatchWalk::back_union`]) — and the layer's return owed in the
+/// returning call's last walk. The serve of a layer runs after its shadow
+/// (the batch order's), so it reads the host map the pick moved and leaves
+/// out what the layer streamed. A unit of at most [`GEMV_COLS`] rows picks
+/// nothing (the pick's floor is past it); a stream on one is refused by
+/// name, since the gemv arm has no ring pass.
 ///
 /// [`XMode`]: crate::host::xstream::XMode
 struct StreamWalk<'a, 'b, S: Stores + ?Sized> {
@@ -1575,6 +1930,10 @@ struct StreamWalk<'a, 'b, S: Stores + ?Sized> {
     stream: &'b mut PromptStream,
     /// The unit's last position: the call's last walk returns.
     walk_end: usize,
+    /// The layer whose shadow ran the ring pass and its union's card places,
+    /// for that layer's back (one unit: a layer's back runs before the next
+    /// layer's front).
+    ring_at: Option<(usize, usize)>,
 }
 
 impl<'a, S: Stores + ?Sized> LayerProgram for StreamWalk<'a, '_, S> {
@@ -1587,30 +1946,64 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StreamWalk<'a, '_, S> {
     }
 
     /// The return owed, the pick, the moved map and places when it moved
-    /// any, the card's routed experts and the shared expert, the read.
+    /// any, the card's routed experts and the shared expert, the ring pass
+    /// when the layer streams, the read.
     fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let StreamWalk {
             walk,
             stream,
             walk_end,
+            ring_at,
         } = self;
         let m = walk.p.m;
         stream.return_at_shadow(port, at, *walk_end)?;
         let side = &*walk.p.side;
-        let (_, land) = stream.pick(port, at, (m, 1), *walk_end, |l| side.has_card(l))?;
+        let (ring, land) = stream.pick(port, at, (m, 1), *walk_end, |l| side.has_card(l))?;
+        if ring.is_some() && m <= GEMV_COLS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: the expert stream's ring on a unit of {m} rows; the ring pass \
+                     is the wide arm's, past {GEMV_COLS} rows"
+                ),
+            ));
+        }
         if !land.is_empty() {
             walk.moved(l, &land)?;
         }
         walk.shadow(port, at)?;
+        *ring_at = match ring {
+            Some(r) => {
+                let p = &mut walk.p;
+                let lc = ctx_of(p.c, l)?;
+                Some((l, ring_pass(&lc, p.side, p.rows, p.s, m, &r)?))
+            }
+            None => None,
+        };
         let side = &*walk.p.side;
         stream.read(port, l, true, |l| side.has_card(l))
     }
 
-    /// [`BatchWalk`]'s back; then, in the returning call's last walk, the
-    /// layer's return is due, asked at the next layer's shadow.
+    /// [`BatchWalk`]'s back, over the union places when the layer's shadow
+    /// ran the ring pass; then, in the returning call's last walk, the
+    /// layer's return is due, asked at the next layer's shadow. A union kept
+    /// for another layer is refused by name.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.walk.back(port, at)?;
+        match self.ring_at.take() {
+            Some((rl, n)) if rl == at.layer => self.walk.back_union(port, at, n)?,
+            Some((rl, _)) => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {}'s back after layer {rl}'s ring pass: a layer's union is \
+                         read at its own back",
+                        at.layer
+                    ),
+                ));
+            }
+            None => self.walk.back(port, at)?,
+        }
         let l = at.layer;
         if self.stream.returns_here(self.walk_end) && self.walk.p.side.has_card(l) {
             self.stream.owe_return(l);
