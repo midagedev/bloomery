@@ -4,7 +4,8 @@
 //! runner pins.
 //!
 //!     gate_clef_serve --model <gguf> --head <joint_head.safetensors>
-//!                     --clef-model <gguf> --dir <dir>
+//!                     --clef-model <gguf> --image-model <gguf> --mmproj <gguf>
+//!                     --dir <dir> [--hf <repo>[:<quant>]]
 //!
 //! Every server is `bloomery-serve` beside this binary with
 //! `BLOOMERY_REF_MODEL` removed from its environment (the file is named
@@ -21,8 +22,8 @@
 //!   `a4cb4c61`): the answer's `model` is the server's name for the model
 //!   (the file's name under `-m`), not the request's; `/v1/models` lists
 //!   that name in `data` and `models`; `/props` carries the server's
-//!   `engine` object; a request with an image is a 501
-//!   `not_supported_error`;
+//!   `engine` object; a request with an image, on a server with no
+//!   `--mmproj`, is a 501 `not_supported_error` that carries llama.cpp's hint;
 //! - `a_repeat_is_the_same_body`: the same request again is the same body
 //!   byte for byte, `timings` taken out (each request runs from a reset);
 //! - the face both constants of `bloomery-serve`'s drive print
@@ -56,6 +57,32 @@
 //!   file's are printed beside them as a diagnostic: the two files are
 //!   separate quantizations of the backbone.
 //!
+//! - the image input (`--image-model`, Clef-Flash's Q8_0 file the clefvis sets are dumped from, and
+//!   `--mmproj`, its encoder file), each server alone on the card:
+//!   `image_text_control` (the model with no `--mmproj` answers the suite's first request and set
+//!   D's text-only request `t1`: the bodies a media load's text requests are held to);
+//!   `image_encoder_resident` (the server with `--mmproj` prints its `vision` record before it
+//!   listens); `set_d_answers` (every request of set D, `tools/ref/clefvis/requests.jsonl` with
+//!   each image stem its PNG, is a 200 with the release's body shape, usage tokens included, and
+//!   the release's top option on every question; each question's slack — how far the release's
+//!   own decision is from flipping — and the largest |dp| are printed beside it, and `t1`, which
+//!   carries no image, is the text path's own gap); `text_after_images_is_the_text_control` (the
+//!   suite's first request and `t1` answer on the media server, after its image requests, with
+//!   the control's bodies byte for byte: a media load moves no text bit, and a reset takes the
+//!   images away); `image_refusals` (a placeholder typed beside an image, images that alone pass
+//!   the encoder's length, a URL that is no data URL, nine images, a GIF, each a 400 whose
+//!   message names its cause, and videos a 501); `image_after_refusals` (the first image request
+//!   again is the same body: the refusals left the server and its tables as they were).
+//!   `--hf` adds two servers started from the hub, each alone on the card: `hf_picks_the_projector`
+//!   (with no projector flag the seat fetches the repo's own projector, `hf::mmproj_sibling`'s pick,
+//!   prints the `hf file` line of it and the `vision` record, and answers the suite's first request)
+//!   and `hf_no_mmproj_serves_no_image` (with `--no-mmproj` it fetches and loads no projector, and an
+//!   image is a 501 with the hint).
+//!   Set D has no identity of its own (`images.jsonl` states no revision and no trailer), so its
+//!   rows are held to what the run left beside them, as `hw_clef_image_ids_equal_the_release` holds
+//!   them: `reference.jsonl` names the recipe's revision and carries the same `input_ids`, and the
+//!   image grids' counts are the pad runs' lengths. That stands in for a family check.
+//!
 //! Logs per server in `<dir>/<clause>/` (`server.out`, `server.err`, the
 //! bodies).
 
@@ -81,26 +108,39 @@ mod decide_gate;
 mod gate {
     use std::path::{Path, PathBuf};
 
-    use bloomery_gpu_gates::serve_client::curl;
+    use bloomery_gpu_gates::serve_client::{Served, curl};
     use bloomery_gpu_gates::{GateError, checks_failed};
+    use decision::encode::NO_IMAGE_INPUT;
     use decision::head::HeadConfig;
+    use decision::json::{self, Json};
+    use decision::render::dumps;
     use decision::safetensors::write;
     use serde_json::Value;
 
-    use crate::decide_gate::{check, compare, listening, post_raw, refused, spawn, untimed, utf8};
+    use crate::decide_gate::{
+        check, compare, listening, post_raw, probabilities, refused, spawn, untimed, utf8,
+    };
 
     const USAGE: &str = "usage: gate_clef_serve --model <gguf> --head <joint_head.safetensors> \
-                         --clef-model <gguf> --dir <dir>";
+                         --clef-model <gguf> --image-model <gguf> --mmproj <gguf> --dir <dir> \
+                         [--hf <repo>[:<quant>]]";
 
     struct Args {
         model: PathBuf,
         head: PathBuf,
         clef: PathBuf,
+        /// The `qwen35` file the image clauses run: the Q8_0 file the clefvis sets are dumped from.
+        image_model: PathBuf,
+        /// Its encoder file.
+        mmproj: PathBuf,
         dir: PathBuf,
+        /// A `--hf` start's spelling, `<repo>[:<quant>]`: the clauses of the repo's own projector.
+        hf: Option<String>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut model, mut head, mut clef, mut dir) = (None, None, None, None);
+        let (mut image_model, mut mmproj, mut hf) = (None, None, None);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
@@ -110,17 +150,25 @@ mod gate {
                 "--model" => model = Some(PathBuf::from(v)),
                 "--head" => head = Some(PathBuf::from(v)),
                 "--clef-model" => clef = Some(PathBuf::from(v)),
+                "--image-model" => image_model = Some(PathBuf::from(v)),
+                "--mmproj" => mmproj = Some(PathBuf::from(v)),
+                "--hf" => hf = Some(v),
                 "--dir" => dir = Some(PathBuf::from(v)),
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        match (model, head, clef, dir) {
-            (Some(model), Some(head), Some(clef), Some(dir)) => Ok(Args {
-                model,
-                head,
-                clef,
-                dir,
-            }),
+        match (model, head, clef, image_model, mmproj, dir) {
+            (Some(model), Some(head), Some(clef), Some(image_model), Some(mmproj), Some(dir)) => {
+                Ok(Args {
+                    model,
+                    head,
+                    clef,
+                    image_model,
+                    mmproj,
+                    dir,
+                    hf,
+                })
+            }
             _ => Err(USAGE.into()),
         }
     }
@@ -287,6 +335,523 @@ mod gate {
             && v["timings"]["prompt_n"].as_u64().is_some_and(|n| n > 0)
     }
 
+    /// The placeholder Clef's text carries for one image, which only an `images` entry may make.
+    const PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+    /// A file of the repository.
+    fn repo_file(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    /// The rows of a JSON lines file, in order.
+    fn jsonl(path: &Path) -> Result<Vec<Json>, GateError> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| Ok(json::parse(l).map_err(|e| format!("{}: {e}", path.display()))?))
+            .collect()
+    }
+
+    fn id_of(row: &Json) -> Result<String, GateError> {
+        Ok(row
+            .get("id")
+            .and_then(Json::as_str)
+            .ok_or("a row of set D has no id")?
+            .to_owned())
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The test images the gate posts by their stems: the three set D's requests name, and the one
+    /// whose tokens alone pass the encoder's length.
+    const IMAGES: [(&str, &str); 4] = [
+        ("free-448x448", "tools/ref/clefvis/images/free-448x448.png"),
+        ("free-640x480", "tools/ref/clefvis/images/free-640x480.png"),
+        (
+            "free-1024x768",
+            "tools/ref/clefvis/images/free-1024x768.png",
+        ),
+        (
+            "max-2600x1800",
+            "tools/ref/clefvis/images/max-2600x1800.png",
+        ),
+    ];
+
+    /// An image of [`IMAGES`] as a data URL; a stem the gate does not post is refused by name.
+    fn png_url(stem: &str) -> Result<String, GateError> {
+        let (_, rel) = IMAGES
+            .iter()
+            .find(|(s, _)| *s == stem)
+            .ok_or_else(|| format!("the image {stem:?} is not one of the gate's {IMAGES:?}"))?;
+        let path = repo_file(rel);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(format!("data:image/png;base64,{}", base64(&bytes)))
+    }
+
+    /// The snapshot revision the release's runs are made at: the recipe's own `REVISION`.
+    fn release_revision() -> Result<String, GateError> {
+        let path = repo_file("tools/ref/clefvis/clefvis.sh");
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(text
+            .lines()
+            .find_map(|l| l.strip_prefix("REVISION="))
+            .ok_or_else(|| format!("{}: no REVISION line", path.display()))?
+            .to_owned())
+    }
+
+    /// One request of set D: the body a client posts and the release's reply to it.
+    struct Case {
+        id: String,
+        /// The request of `tools/ref/clefvis/requests.jsonl` with each image stem its PNG as a data
+        /// URL, and a `state_tokens` request's state the one the release rendered.
+        body: String,
+        images: usize,
+        /// The release's `systemone()` body.
+        release: Json,
+        /// Whether set D's two files agree on what they hold ([module doc](self)): the recipe's
+        /// revision, the same ids, the image grids' counts the pad runs' lengths.
+        provenance: bool,
+    }
+
+    /// Every request of set D (`$BLOOMERY_DATA/clefvis/ref/`), in the order of `images.jsonl`.
+    fn set_d() -> Result<Vec<Case>, GateError> {
+        let dir = refset::data_dir().join("clefvis/ref");
+        let rows = jsonl(&dir.join("images.jsonl"))?;
+        let reference = jsonl(&dir.join("reference.jsonl"))?;
+        let sent = jsonl(&repo_file("tools/ref/clefvis/requests.jsonl"))?;
+        let revision = release_revision()?;
+        let find = |rows: &[Json], id: &str| -> Result<Json, GateError> {
+            rows.iter()
+                .find(|r| id_of(r).is_ok_and(|i| i == id))
+                .cloned()
+                .ok_or_else(|| format!("{id}: no such row in set D's files").into())
+        };
+        let numbers = |v: Option<&Json>| -> Vec<u64> {
+            match v {
+                Some(Json::Array(a)) => a.iter().filter_map(Json::as_u64).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let mut cases = Vec::new();
+        for row in &rows {
+            let id = id_of(row)?;
+            let pair = find(&reference, &id)?;
+            let Json::Object(pairs) = find(&sent, &id)? else {
+                return Err(format!("{id}: a request is an object").into());
+            };
+            let render = row
+                .get("state_render")
+                .and_then(Json::as_str)
+                .ok_or_else(|| format!("{id}: no state_render"))?;
+            let mut out = Vec::new();
+            let mut images = 0;
+            for (k, v) in &pairs {
+                match (k.as_str(), v) {
+                    ("images", Json::Array(stems)) => {
+                        images = stems.len();
+                        let urls = stems
+                            .iter()
+                            .map(|s| {
+                                let stem = s.as_str().ok_or("an image stem")?;
+                                Ok(Json::Str(png_url(stem)?))
+                            })
+                            .collect::<Result<Vec<_>, GateError>>()?;
+                        out.push((k.clone(), Json::Array(urls)));
+                    }
+                    ("state_tokens", _) => {
+                        out.push(("state".to_owned(), Json::Str(render.to_owned())))
+                    }
+                    _ => out.push((k.clone(), v.clone())),
+                }
+            }
+            // The release's own counts: a grid (t, h, w) is t·h·w / 4 merged tokens, and its pad
+            // runs say the same.
+            let counts: Vec<u64> = match row.get("image_grid_thw") {
+                Some(Json::Array(grids)) => grids
+                    .iter()
+                    .map(|g| numbers(Some(g)).iter().product::<u64>() / 4)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let runs: Vec<u64> = match row.get("image_spans") {
+                Some(Json::Array(spans)) => spans.iter().map(|s| numbers(Some(s))[1]).collect(),
+                _ => Vec::new(),
+            };
+            let said = pair
+                .get("facts")
+                .and_then(|f| f.get("revision"))
+                .and_then(Json::as_str);
+            let provenance = said == Some(revision.as_str())
+                && pair.get("input_ids") == row.get("input_ids")
+                && counts == runs;
+            cases.push(Case {
+                id,
+                body: dumps(&Json::Object(out), false),
+                images,
+                release: pair.get("response").cloned().ok_or("no response")?,
+                provenance,
+            });
+        }
+        Ok(cases)
+    }
+
+    /// A body's structure: every number blanked but the token counts of `usage`, and the model's
+    /// name (the release echoes the request's, the server names the one it serves).
+    fn shape(v: &Json, path: &str) -> Json {
+        match v {
+            Json::Float(_) | Json::Int(_) if !path.ends_with("tokens") => Json::Null,
+            Json::Str(_) if path == ".model" => Json::Null,
+            Json::Object(pairs) => Json::Object(
+                pairs
+                    .iter()
+                    .map(|(k, x)| (k.clone(), shape(x, &format!("{path}.{k}"))))
+                    .collect(),
+            ),
+            Json::Array(items) => Json::Array(items.iter().map(|x| shape(x, path)).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// How far the decision of one answer is from flipping: for a noul `|p - 0.5|`, else half the
+    /// gap of the two most probable options. A probability that moves by at most this flips no top.
+    fn slack(a: &Value) -> f64 {
+        let mut p: Vec<f64> = probabilities(a).into_iter().map(|x| x.1).collect();
+        if a["type"] == "noul" {
+            return p.first().map_or(0.0, |x| (x - 0.5).abs());
+        }
+        p.sort_by(|x, y| y.total_cmp(x));
+        (p[0] - p.get(1).copied().unwrap_or(0.0)) / 2.0
+    }
+
+    /// The server's body for `c` against the release's: whether it has the release's shape and the
+    /// release's top on every question, and the largest |dp|. The release's slack of each question
+    /// is printed beside it.
+    fn answers_like_the_release(c: &Case, served: &str) -> Result<(bool, f64), GateError> {
+        let Some(plain) = untimed(served) else {
+            println!("set D {}: no timings last in {served}", c.id);
+            return Ok((false, 1.0));
+        };
+        // `untimed` cuts at the timings key: the body closes again.
+        let whole = format!("{plain}}}");
+        let ours = json::parse(&whole).map_err(|e| format!("{}: {e}", c.id))?;
+        let shape_equal = shape(&ours, "") == shape(&c.release, "");
+        let (ours_v, release_v): (Value, Value) = (
+            serde_json::from_str(&whole)?,
+            serde_json::from_str(&dumps(&c.release, false))?,
+        );
+        let questions: Vec<String> = release_v["answers"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        let (tops, worst) = compare(&format!("set D {}", c.id), &ours_v, &release_v, &questions);
+        for q in &questions {
+            println!(
+                "set D {}: {q}: the release's slack {:.4}",
+                c.id,
+                slack(&release_v["answers"][q])
+            );
+        }
+        println!(
+            "set D {}: shape equal {shape_equal}, tops equal {tops}, max |dp| {worst:.4}, \
+             {} images, provenance {}, {}",
+            c.id,
+            c.images,
+            c.provenance,
+            serde_json::from_str::<Value>(served).map_or_else(
+                |_| String::new(),
+                |v| serde_json::to_string(&v["timings"]).unwrap_or_default()
+            )
+        );
+        Ok((shape_equal && tops && c.provenance, worst))
+    }
+
+    /// The value of `key=` in a record line.
+    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// The server stopped, its end printed.
+    fn stop(mut s: Served) -> Result<(), GateError> {
+        println!("server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
+    /// `bloomery-serve` with `args` in `<dir>/<name>/`, listening: the server, its logs' directory
+    /// and its address.
+    fn up(dir: &Path, name: &str, args: &[&str]) -> Result<(Served, PathBuf, String), GateError> {
+        let (mut s, d) = spawn(dir, name, args)?;
+        let line = listening(&mut s, &d.join("server.err"))?;
+        println!("{line}");
+        let addr = line
+            .split_once("listening on http://")
+            .and_then(|(_, r)| r.split_whitespace().next())
+            .ok_or("no address in the listening record")?
+            .to_owned();
+        Ok((s, d, addr))
+    }
+
+    /// `body` POSTed to the server at `addr`: whether it is refused with `status`, an error of type
+    /// `kind` and a message that holds every one of `want`.
+    fn refused_with(
+        addr: &str,
+        name: &str,
+        body: &str,
+        (status, kind): (u16, &str),
+        want: &[&str],
+    ) -> Result<bool, GateError> {
+        let (st, reply) = post_raw(&format!("http://{addr}/v1/systemone"), body)?;
+        let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        let pass =
+            st == status && v["error"]["type"] == kind && want.iter().all(|w| message.contains(w));
+        println!("{name}: {st} {kind:?} names {want:?}: {pass}: {message}");
+        Ok(pass)
+    }
+
+    /// The suite's first request, whose `state` is followed by `extra` and which carries `images`
+    /// (data URLs).
+    fn with_images(req: &str, images: &[String], state_extra: &str) -> Result<String, GateError> {
+        let Json::Object(pairs) = json::parse(req)? else {
+            return Err("the suite's request is an object".into());
+        };
+        let mut out = vec![(
+            "images".to_owned(),
+            Json::Array(images.iter().map(|u| Json::Str(u.clone())).collect()),
+        )];
+        for (k, v) in pairs {
+            match (k.as_str(), v) {
+                ("state", Json::Str(s)) => out.push((k, Json::Str(format!("{s}{state_extra}")))),
+                (_, v) => out.push((k, v)),
+            }
+        }
+        Ok(dumps(&Json::Object(out), false))
+    }
+
+    /// The seat started from the hub (`--hf`, module doc): with no projector flag it fetches and
+    /// loads the repo's own projector and serves images; with `--no-mmproj` it serves none.
+    fn hf_projector(a: &Args, hf: &str, req: &str, ok: &mut bool) -> Result<(), GateError> {
+        let (s, d, addr) = up(&a.dir, "hf_projector", &["--hf", hf, "--port", "0"])?;
+        let err = std::fs::read_to_string(d.join("server.err"))?;
+        let (st, body) = post_raw(&format!("http://{addr}/v1/systemone"), req)?;
+        let fetched = err
+            .lines()
+            .any(|l| l.starts_with("hf file") && l.contains("file=mmproj-"));
+        let resident = err.lines().any(|l| l.starts_with("vision "));
+        println!("hf: projector fetched {fetched}, vision record {resident}, request {st}");
+        stop(s)?;
+        check(
+            ok,
+            "hf_picks_the_projector",
+            fetched && resident && st == 200 && untimed(&body).is_some(),
+        );
+
+        let (s, d, addr) = up(
+            &a.dir,
+            "hf_no_mmproj",
+            &["--hf", hf, "--no-mmproj", "--port", "0"],
+        )?;
+        let err = std::fs::read_to_string(d.join("server.err"))?;
+        let image = req.replacen(
+            '{',
+            r#"{"images": ["data:image/png;base64,iVBORw0KGgo="], "#,
+            1,
+        );
+        let (st, reply) = post_raw(&format!("http://{addr}/v1/systemone"), &image)?;
+        let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
+        let none = !err
+            .lines()
+            .any(|l| l.contains("mmproj") || l.starts_with("vision "));
+        println!("hf --no-mmproj: no projector line {none}, image request {st} {reply}");
+        stop(s)?;
+        check(
+            ok,
+            "hf_no_mmproj_serves_no_image",
+            none && st == 501 && v["error"]["message"] == NO_IMAGE_INPUT,
+        );
+        Ok(())
+    }
+
+    /// The image input on Clef-Flash's Q8_0 file and its encoder (module doc).
+    fn image_input(a: &Args, req: &str, ok: &mut bool) -> Result<(), GateError> {
+        let (model, head, mmproj) = (utf8(&a.image_model)?, utf8(&a.head)?, utf8(&a.mmproj)?);
+        let cases = set_d()?;
+        let control = cases
+            .iter()
+            .find(|c| c.images == 0)
+            .ok_or("set D holds no request without an image")?;
+
+        // The control: the same file with no encoder.
+        let (mut s, _d, addr) = up(
+            &a.dir,
+            "image_text_control",
+            &["-m", model, "--head", head, "--port", "0"],
+        )?;
+        let url = format!("http://{addr}/v1/systemone");
+        let (st_first, first) = post_raw(&url, req)?;
+        let (st_t1, t1) = post_raw(&url, &control.body)?;
+        println!("server stopped: {}", s.stop()?);
+        let pass =
+            st_first == 200 && st_t1 == 200 && untimed(&first).is_some() && untimed(&t1).is_some();
+        check(ok, "image_text_control", pass);
+
+        // The server with the encoder.
+        let (mut s, d, addr) = up(
+            &a.dir,
+            "image_serve",
+            &[
+                "-m", model, "--head", head, "--mmproj", mmproj, "--port", "0",
+            ],
+        )?;
+        let url = format!("http://{addr}/v1/systemone");
+        let err = std::fs::read_to_string(d.join("server.err"))?;
+        let record = err.lines().find(|l| l.starts_with("vision ")).unwrap_or("");
+        println!("vision record: {record}");
+        // Where the tower sits decides what the backbone's whole-fit verdict counts: a stage-card
+        // seat holds the tower's bytes among the card's reserves, which the verdict's line names
+        // with the record's weights and activations; a card off the plan holds none.
+        let bytes = ["weights", "scratch"]
+            .iter()
+            .map(|k| field(record, k)?.parse::<u64>().ok())
+            .sum::<Option<u64>>();
+        let fit = err.lines().find(|l| l.starts_with("whole fit at ctx"));
+        println!("whole fit: {fit:?}");
+        let note = "the reserves term holds the image encoder's";
+        let counted = match (field(record, "seat"), fit, bytes) {
+            (Some("stage-reserve"), Some(l), Some(b)) => l.contains(&format!("{note} {b} B")),
+            (Some("off-plan"), Some(l), Some(_)) => !l.contains(note),
+            _ => false,
+        };
+        check(
+            ok,
+            "image_encoder_resident",
+            ["card=", "cap=", "load_s="]
+                .iter()
+                .all(|k| record.contains(k))
+                && counted,
+        );
+
+        let (mut pass, mut worst) = (true, 0f64);
+        // The first image request's body, for the repeat after the refusals.
+        let again = cases
+            .iter()
+            .find(|c| c.images > 0)
+            .ok_or("set D holds no request with an image")?;
+        let mut again_first = None;
+        for c in &cases {
+            let (st, body) = post_raw(&url, &c.body)?;
+            std::fs::write(d.join(format!("{}.json", c.id)), &body)?;
+            println!("set D {}: {st}", c.id);
+            if c.id == again.id && st == 200 {
+                again_first = untimed(&body).map(str::to_owned);
+            }
+            if st != 200 {
+                println!("{body}");
+                pass = false;
+                continue;
+            }
+            let (like, dp) = answers_like_the_release(c, &body)?;
+            pass &= like;
+            // Every answer's |dp| counts but the text control's, the text path's own gap.
+            if c.images > 0 {
+                worst = worst.max(dp);
+            }
+        }
+        println!("set D: worst |dp| over the image requests {worst:.4}");
+        check(ok, "set_d_answers", pass);
+
+        // A media load moves no text bit.
+        let (_, text_first) = post_raw(&url, req)?;
+        let (_, text_t1) = post_raw(&url, &control.body)?;
+        check(
+            ok,
+            "text_after_images_is_the_text_control",
+            untimed(&text_first).is_some()
+                && untimed(&text_first) == untimed(&first)
+                && untimed(&text_t1) == untimed(&t1),
+        );
+
+        // The refusals.
+        let max = png_url("max-2600x1800")?;
+        let one = png_url("free-448x448")?;
+        let nine = vec![one.clone(); 9];
+        let five = vec![max; 5];
+        let gif = "data:image/gif;base64,R0lGODlhAQABAAAAACw=".to_owned();
+        let videos = req.replacen('{', r#"{"videos": ["x"], "#, 1);
+        let mut pass = true;
+        for (name, body, status, kind, want) in [
+            (
+                "placeholder_typed_beside_an_image",
+                with_images(req, std::slice::from_ref(&one), PLACEHOLDER)?,
+                400,
+                "invalid_request_error",
+                vec!["image placeholder"],
+            ),
+            (
+                "images_alone_pass_the_encoders_length",
+                with_images(req, &five, "")?,
+                400,
+                "invalid_request_error",
+                vec!["5 image(s) take", "maximum is 16384"],
+            ),
+            (
+                "not_a_data_url",
+                with_images(req, &["http://example.com/a.png".to_owned()], "")?,
+                400,
+                "invalid_request_error",
+                vec!["images must be data URLs"],
+            ),
+            (
+                "nine_images",
+                with_images(req, &nine, "")?,
+                400,
+                "invalid_request_error",
+                vec!["too many images, the maximum is 8"],
+            ),
+            (
+                "not_a_png_or_jpeg",
+                with_images(req, &[gif], "")?,
+                400,
+                "invalid_request_error",
+                vec!["images[0]", "only image/png and image/jpeg"],
+            ),
+            ("videos", videos, 501, "not_supported_error", vec!["videos"]),
+        ] {
+            pass &= refused_with(&addr, name, &body, (status, kind), &want)?;
+        }
+        check(ok, "image_refusals", pass);
+
+        // The refusals left the server as it was.
+        let (st, repeat) = post_raw(&url, &again.body)?;
+        let same = again_first
+            .as_deref()
+            .is_some_and(|b| st == 200 && untimed(&repeat) == Some(b));
+        check(ok, "image_after_refusals", same);
+        println!("server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
         std::fs::create_dir_all(&a.dir)?;
@@ -419,7 +984,9 @@ mod gate {
         let (st, refused) = post_raw(&url("/v1/systemone"), &image)?;
         println!("/v1/systemone with an image {st} {refused}");
         let refused: Value = serde_json::from_str(&refused).unwrap_or(Value::Null);
-        wire &= st == 501 && refused["error"]["type"] == "not_supported_error";
+        wire &= st == 501
+            && refused["error"]["type"] == "not_supported_error"
+            && refused["error"]["message"] == NO_IMAGE_INPUT;
         check(&mut ok, "speaks_llama_cpps_wire", wire);
         let (st, again) = post_raw(&url("/v1/systemone"), &req)?;
         std::fs::write(d.join("again.json"), &again)?;
@@ -470,6 +1037,11 @@ mod gate {
         // separate quantizations of the backbone, so their answers differ by more than the head.
         let (tops, dp) = compare("qwen35 file vs clef file", &v, &v_own, &questions);
         println!("diagnostic: qwen35 file against clef file: tops equal {tops}, max |dp| {dp:.4}");
+
+        image_input(&a, &req, &mut ok)?;
+        if let Some(hf) = &a.hf {
+            hf_projector(&a, hf, &req, &mut ok)?;
+        }
 
         if ok {
             println!("gate_clef_serve: all checks passed");

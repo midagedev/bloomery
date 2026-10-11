@@ -885,12 +885,18 @@ gate-gpu-qwen35-media:
 # decide with no head, --model qwen3 with --head, a head config no row knows, a head narrower than the backbone,
 # a GGUF of llama.cpp's Clef layout with no decision head) exit before any backbone load, then one
 # server answers the suite's first request on its row's route only, speaks llama.cpp's /v1/systemone wire (the
-# answer's model is the server's, /v1/models, the engine object, an image a 501), the same body again; then the
-# same quantization in llama.cpp's Clef layout (bartowski's current upload, 6.98 GB, the head inside the GGUF in
-# Q8_0; fetched into /root/models/clef-flash/) serves the request with no head flag, and its answers equal the
-# same file's with the release's head (the one difference: the head's dtype). Either card.
-gate-gpu-clef-serve:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2 --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --dir $D'
+# answer's model is the server's, /v1/models, the engine object, an image with no encoder a 501 with llama.cpp's
+# hint), the same body again; then the same quantization in llama.cpp's Clef layout (bartowski's current upload,
+# 6.98 GB, the head inside the GGUF in Q8_0; fetched into /root/models/clef-flash/) serves the request with no head
+# flag, and its answers equal the same file's with the release's head (the one difference: the head's dtype); then
+# the image input on Clef-Flash's Q8_0 file with its bf16 encoder (/root/models/clef-flash/mmproj-*-bf16.gguf): the
+# text control with no encoder, the encoder's `vision` record, set D's six requests (the clefvis oracle's, real file
+# only: $BLOOMERY_DATA/clefvis/ref) answered in the release's shape and top options, the text bodies unmoved by the
+# media load, the image refusals, and the first image request again; ARGS `--hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M`
+# adds the clauses that start the seat from the hub with no projector flag (it fetches the repo's own projector and
+# serves images) and with --no-mmproj (it serves none): a network read. Either card.
+gate-gpu-clef-serve *ARGS:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --image-model /models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf --mmproj /root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf --dir $D {{ARGS}}'
 
 # The decide seat of bloomery-serve on lev (gate_lev_serve's doc): ggml-org/lev-GGUF's Q4_K_M (3.0 GB, a `qwen35`
 # file with `qwen35.decision.type = lev`, fetched into /root/models/lev-4b/) with no head flag; five refusals before
