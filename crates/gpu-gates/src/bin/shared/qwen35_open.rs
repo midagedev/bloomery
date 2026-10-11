@@ -6,8 +6,8 @@
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::image_plan;
 use gguf::Split;
 use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
