@@ -1,7 +1,8 @@
 //! The plan's side of an image input, free of the encoder crates so a placement module every
 //! build includes can take it: the tower's reserve on the stage card, entered into a placed plan's
-//! machine and a whole-fit probe's by one function ([`reserve_on`]), a plan's refusal beside it
-//! ([`refusal`]) and a verdict line's note of it ([`note`]), and what a plan adds per position of a sequence for a media load
+//! machine and a whole-fit probe's by one function ([`reserve_on`]) and read back from a machine
+//! ([`reserve_in`]), a plan's refusal beside it ([`refusal`]) and a verdict line's note of it
+//! ([`note`]), and what a plan adds per position of a sequence for a media load
 //! ([`table_bytes_per_position`]). The seat that owns the rest of the vision seat
 //! (`crate::vision_seat`) re-exports these.
 
@@ -20,6 +21,19 @@ pub fn reserve_on(machine: &mut Machine, reserve: Option<u64>) {
     if let Some(bytes) = reserve {
         machine.cards[0].reserves.push((RESERVE.to_owned(), bytes));
     }
+}
+
+/// The bytes of the tower's reserve on `machine`'s stage card, `None` when the machine carries
+/// none: what a plan built on it refuses beside ([`refusal`]).
+#[must_use]
+pub fn reserve_in(machine: &Machine) -> Option<u64> {
+    machine
+        .cards
+        .first()?
+        .reserves
+        .iter()
+        .find(|(name, _)| name == RESERVE)
+        .map(|&(_, bytes)| bytes)
 }
 
 /// A machine builder (`layers` to its [`Machine`]) with [`reserve_on`] applied to what it builds.
@@ -97,6 +111,8 @@ mod tests {
             probe.cards[0].set_aside_bytes(),
             plain.cards[0].set_aside_bytes() + BYTES
         );
+        assert_eq!(reserve_in(&probe), Some(BYTES));
+        assert_eq!(reserve_in(&plain), None);
         let mut none = plan_a(40);
         reserve_on(&mut none, None);
         assert_eq!(none, plain);
