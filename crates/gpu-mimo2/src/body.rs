@@ -45,6 +45,7 @@ use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu_deepseek41::block::{BlockPlan, BlockScratch, KBlockKernels};
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use bloomery_levers::HostCfg;
@@ -79,17 +80,20 @@ pub(crate) struct Kernels {
     pub rope: RopeNeoxKernels,
     pub flash: FlashGqaKernels,
     pub experts: ExpertKernels,
+    /// The K-quant dense block's kernels: `None` on a file whose dense block is q8_0.
+    pub block: Option<KBlockKernels>,
     pub router: RouterKernels,
     pub handoff: HandoffKernels,
 }
 
 impl Kernels {
-    fn load(gpu: &Gpu) -> Result<Kernels, GpuError> {
+    fn load(gpu: &Gpu, k_block: bool) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             rope: RopeNeoxKernels::load(ctx)?,
             flash: FlashGqaKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
+            block: k_block.then(|| KBlockKernels::load(gpu)).transpose()?,
             router: RouterKernels::load(ctx)?,
             handoff: HandoffKernels::load(ctx)?,
         })
@@ -117,6 +121,8 @@ pub(crate) struct LayerCfg {
     /// The layer's rope table, an index into the body's tables.
     pub rope: usize,
     pub ffn: BlockArgs,
+    /// A dense layer's block by its file's types ([`BlockPlan`]); `None` on a routed layer.
+    pub block: Option<BlockPlan>,
     /// The layer's row in the slot map's card copy, as a word offset
     /// ([`SlotMap::row_offset`]); 0 on a dense layer.
     pub row_off: usize,
@@ -188,6 +194,8 @@ pub(crate) struct Scratch {
     pub y: DeviceBuffer<f32>,
     /// The dense block's gate·up·SwiGLU rows.
     pub h: DeviceBuffer<f32>,
+    /// The K-quant dense block's buffers: `None` on a file whose dense block is q8_0.
+    pub block: Option<BlockScratch>,
     pub rout: RouterOut,
     pub sel: DeviceBuffer<u32>,
     /// The zero selection bias of a router the file gives none.
@@ -199,8 +207,14 @@ pub(crate) struct Scratch {
 
 impl Scratch {
     /// The buffers for a model of `d`, `qkv` rows of the widest layer and
-    /// `ff` the widest dense block. Load-time only.
-    fn new(stream: &CudaStream, d: &Dims, qkv: usize, ff: usize) -> Result<Scratch, GpuError> {
+    /// `ff` the widest dense block, `blocks` the dense blocks' plans with
+    /// their widths. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        d: &Dims,
+        (qkv, ff): (usize, usize),
+        blocks: impl IntoIterator<Item = (BlockPlan, usize)>,
+    ) -> Result<Scratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(Scratch {
             x: z(d.embd)?,
@@ -213,6 +227,7 @@ impl Scratch {
             part_ms: z(flash_gqa::partials_ms_len(1, d.heads))?,
             y: z(d.heads * HEAD)?,
             h: z(ff.max(1))?,
+            block: BlockScratch::new(stream, d.embd, blocks)?,
             rout: RouterOut::new(stream)?,
             sel: DeviceBuffer::zeroed(stream, N_USED)?,
             no_bias: z(N_EXPERT)?,
@@ -239,6 +254,7 @@ impl Scratch {
             &self.rout.weights,
         ];
         f.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self.block.as_ref().map_or(0, BlockScratch::bytes)
             + self.rout.ids.num_bytes()
             + self.sel.num_bytes()
             + self.pos.num_bytes()
@@ -394,9 +410,10 @@ fn check_layer(w: &Weights, c: &LayerCfg, n: &LayerNames, d: &Dims) -> Result<()
             down,
         } => {
             expect_weight(w, norm, false, (1, d.embd))?;
-            expect_weight(w, gate, true, (c.ffn.ff, d.embd))?;
-            expect_weight(w, up, true, (c.ffn.ff, d.embd))?;
-            expect_weight(w, down, true, (d.embd, c.ffn.ff))?;
+            let plan = c
+                .block
+                .ok_or_else(|| shape(format!("a dense layer without its block plan ({gate})")))?;
+            plan.check_resident(w, WHAT, [gate, up, down], (c.ffn.ff, d.embd))?;
         }
         FfnNames::Moe { norm, router, bias } => {
             expect_weight(w, norm, false, (1, d.embd))?;
@@ -487,6 +504,7 @@ fn layer_cfg(
         attn,
         rope,
         ffn,
+        block: None,
         row_off: 0,
     })
 }
@@ -636,7 +654,12 @@ impl Body {
                 ffn: FfnNames::of(l, c.kind.ffn, &c.ffn),
             })
             .collect();
-        for (c, n) in cfg.iter().zip(&names) {
+        for (c, n) in cfg.iter_mut().zip(&names) {
+            if let FfnNames::Dense { gate, up, down, .. } = &n.ffn {
+                let block =
+                    BlockPlan::of_file(&file, WHAT, [gate, up, down], (c.ffn.ff, dims.embd))?;
+                c.block = Some(block);
+            }
             check_layer(w, c, n, &dims)?;
         }
         let card_experts = CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff)?;
@@ -655,7 +678,9 @@ impl Body {
             .max()
             .unwrap_or(0);
         let ff = cfg.iter().map(|c| c.ffn.ff).max().unwrap_or(0);
-        let s = Scratch::new(stream, &dims, qkv, ff)?;
+        let k_block = cfg.iter().any(|c| c.block.is_some_and(|p| !p.is_q8()));
+        let blocks = cfg.iter().filter_map(|c| c.block.map(|p| (p, c.ffn.ff)));
+        let s = Scratch::new(stream, &dims, (qkv, ff), blocks)?;
         let stores = cfg
             .iter()
             .map(|c| Store::new(stream, c.attn.kv_heads, ctx))
@@ -727,7 +752,7 @@ impl Body {
             cfg,
             names,
             dims,
-            k: Kernels::load(gpu)?,
+            k: Kernels::load(gpu, k_block)?,
             s,
             card: card_experts,
             stores,
@@ -788,6 +813,13 @@ impl Body {
             .zip(card)
             .map(|(c, on_card)| (c.kind.ffn, on_card))
             .collect()
+    }
+
+    /// Each dense layer's block plan, in layer order: the launches a K-quant
+    /// block adds are [`BlockPlan::extra_launches`] each.
+    #[must_use]
+    pub fn block_plans(&self) -> Vec<BlockPlan> {
+        self.cfg.iter().filter_map(|c| c.block).collect()
     }
 
     /// What each layer's attention launches take: its kv heads, window,
