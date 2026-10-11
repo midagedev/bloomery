@@ -1,0 +1,43 @@
+# Round q35pfa: Qwen3.6-35B-A3B (qwen35moe, Body35) placed prompt in units of U = 512 rows through the wide arm, where
+# the base walks passes of 8 (MAX_PASS_ROWS). The proxy of the user's RTX 3060 12 GB / i7-12700F measurement
+# (pp 145 tok/s on 1464 ids, card experts 41.7 %, host experts 11.38 GB): the A6000 with BLOOMERY_CARD_BUDGET set to
+# the 3060's usable bytes until the plan prints card_experts 4,270 +- 40 (host_experts 5,970, host_expert_bytes ~
+# 11.38e9), BLOOMERY_HOST_ROOM=27.5G, BLOOMERY_THREADS=8.
+# Per 512 prompt rows [derived from the code's byte and MAC counts]:
+#   host bytes read, base: 64 passes x 40 layers x (22.4 % of the layer's 149 host experts x 1.906 MB) = 163 GB; new:
+#   40 x 149 x 1.906 MB = 11.4 GB (one union read a unit);
+#   host MACs, both: 512 x 8 slots x 58.3 % host x 3 x 512 x 2048 = 7.5 G a layer = 300 G a unit;
+#   card: the trunk and the card experts at 512 rows ~0.15 s a unit, PCIe 40 x 8 MB at 20.5 GB/s = 16 ms.
+# The box differs from the 3060 machine in the ratio that decides the effect: DRAM per MAC rate. The 3060 machine reads
+# ~46 GB/s (163 GB / (512 / 145 s)) beside 8 P-cores of ~190..300 GMAC/s (5..8 MAC/cycle a thread at 4.7 GHz), so its
+# base is read-bound by ~4x. The box's 8 Zen3 threads read 80..120 GB/s [assumed from per-core streaming, the 148 GB/s
+# rating is the whole box] beside ~148..237 GMAC/s (the same 5..8 MAC/cycle at ~3.7 GHz):
+#   base  = 163 GB / 80..120 GB/s + 0.5 ms/row of card  = 3.2..4.5 ms a row = pp 220..310 tok/s;
+#   new   = 0.586 GMAC / 148..237 GMAC/s + 0.3..0.5 ms of card = 2.9..4.5 ms a row = pp 220..345 tok/s.
+# So at the proxy the effect new/base is -29..+57 %, a band that holds 0: no ab card can state it (CARD_UNDER_RULER),
+# and the proxy cannot tell the 3060's +110..+230 % (325..510 over 113..155) from a null. This card therefore carries
+# the new arm's absolute rate, the term the derivation can be wrong about (the host MAC rate c); the 3060 toktape run is
+# the verdict. The rows the run reads beside it (screens, bands [derived]):
+#   pp @ P = 512 and 4096, new:  220..345 and 210..330 tok/s (4096 adds the attention depth term, -3..-8 %);
+#   pp @ P = 512 and 4096, base: 220..310 and 215..300;
+#   decode @ depth 6 and 4096, new over base: -1.5..0 % (about -93..-102 card experts move 0.9..1.0 points of the routed
+#   bytes to the host: +1.5 % host bytes a token, a host-bound upper bound; the 0.6 % ruler resolves it only past 13
+#   rounds a arm, so it is read, not decided).
+kind: profile
+question: does the Qwen3.6 placed prompt in units of 512 rows run at the host union's compute rate the derivation
+  gives, at the 3060-shaped plan on the A6000?
+term: pp tok/s @ P = 4096, lcg prompt, A6000 under BLOOMERY_CARD_BUDGET tuned to card_experts 4,270 +- 40,
+  BLOOMERY_HOST_ROOM=27.5G, BLOOMERY_THREADS=8, Qwen3.6-35B-A3B Q4_K_M placed (plan text reads ubatch:512), q35pfa build
+unit: tok/s
+predict: 210..330
+condition: the q35pfa and base binaries alternate in one lease (the base a bin: arm built in a base worktree
+  before the lease), BLOOMERY_BOX_ENV='BLOOMERY_CARD_BUDGET=<tuned> BLOOMERY_HOST_ROOM=27.5G BLOOMERY_THREADS=8
+  BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/q35pfa.card', the order rotated every round; the plan line
+  of both arms prints card_experts within 4,270 +- 40 (the new arm's budget raised by the arena delta, ~190 MB, so
+  both arms hold the same expert split); no counted row [cold], [cpu-busy] or [other-busy]
+decide-in: the union's compute rate is the derivation's; send the card to the 3060 toktape run and read `stat prompt
+  host` union_ms against the 7.5 G MAC a layer for the 3060's number
+decide-below: the host MAC rate is under 5 MAC/cycle a thread or the union's per-expert fixed cost is large: read
+  `stat prompt host` per service and fit a and c (t(m) = max(W, a + c m)) before the Q6_K tile round (A') is priced
+decide-above: the host rate is above the 5..8 MAC/cycle the derivation takes, or the box's DRAM was never the base's
+  bound: re-derive the 3060 band with the measured c before it is quoted

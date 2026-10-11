@@ -291,7 +291,7 @@ fn wants_bytes(want: Wants, cols: usize, k: usize) -> usize {
 }
 
 /// Bytes of a route table for `slots` slots over `experts` experts.
-fn route_bytes(slots: usize, experts: usize) -> usize {
+pub(super) fn route_bytes(slots: usize, experts: usize) -> usize {
     let tiles = slots / GEMM_BN + experts.min(slots);
     let zeros = if experts == 1 { slots } else { 0 };
     (slots + 2 * tiles + 2 + zeros) * 4
@@ -682,8 +682,8 @@ pub(super) fn ffn(
         return ffn_joined(c, n, s, m, out);
     }
     card_list(c, s, m)?;
-    ffn_card(c, n, s, m)?;
-    ffn_combine(c, n, s, m, out)
+    ffn_card(c, n, s, m, None)?;
+    ffn_combine(c, n, s, m, None, out)
 }
 
 /// The FFN's front at `m` rows ([`ffn`]): `ffn_inp` RMS-normed into `normed`,
@@ -845,12 +845,34 @@ pub(super) fn card_list(c: &Ctx<'_>, s: &mut Arena, m: usize) -> Result<(), GpuE
     )
 }
 
+/// A layer whose routed experts the card holds only in part (a placed
+/// load's, `placed`), for [`ffn_card`]: the stacks the card holds are the
+/// layer's `n_card` experts, in the slot map's order.
+pub(super) struct CardRoute<'a> {
+    /// Expert `e`'s place in the card's stacks, [`HOST`] for an expert the
+    /// host tier computes, and a last entry [`HOST`] for the shared expert's
+    /// id (the routed count): `n_routed + 1` entries.
+    pub(super) map: &'a DeviceBuffer<u32>,
+    /// The routed table over the card's stacks (`n_card` experts, slots for
+    /// the unit's rows); `None` on a layer with no card expert, which
+    /// launches no routed GEMM.
+    pub(super) table: Option<&'a mut GemmRoute>,
+}
+
 /// The card's part of the apart arm of [`ffn`] over `m` rows, after
 /// [`ffn_front`] and [`card_list`]: the routed table over the file's routed
 /// stacks, the routed slots' gate, up, SwiGLU and down into `down`, and the
 /// shared expert's gate, up, SwiGLU and down on the unit's one-expert table
-/// into its own output.
-pub(super) fn ffn_card(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+/// into its own output. `card` is the layer's split of its routed experts
+/// between the card and a host tier; `None` runs every routed expert on the
+/// card, through the arena's own map and table.
+pub(super) fn ffn_card(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    card: Option<CardRoute<'_>>,
+) -> Result<(), GpuError> {
     const WHAT_FFN: &str = "qwen3moe::wide::ffn_card";
     let (gpu, k) = (c.gpu, c.k);
     let stream = gpu.stream();
@@ -880,8 +902,8 @@ pub(super) fn ffn_card(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Res
     let hid = act_hid.input(normed);
     let rows = (act_h, &mut *h, &mut *up, &mut *down);
     let WideApart {
-        map,
-        moe: routed,
+        map: own_map,
+        moe: own_table,
         g,
         u,
         h: sh_h,
@@ -892,18 +914,24 @@ pub(super) fn ffn_card(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Res
         WHAT_FFN,
         "the wide part's buffers of a shared expert kept apart",
     ))?;
+    let (map, table) = match card {
+        None => (&*own_map, Some(own_table)),
+        Some(CardRoute { map, table }) => (map, table),
+    };
     // The routed table over the file's routed stacks, which lists no shared
     // slot.
-    k.q35(WHAT_FFN)?.g32.enqueue_route_remap(
-        stream,
-        route.ids(),
-        map,
-        m * slots,
-        routed,
-        c.sink,
-    )?;
-    let table = (&*routed, GemmInput::Shared { top_k: slots });
-    slots_gemm(c, n, &d, table, &hid, rows, m)?;
+    if let Some(table) = table {
+        k.q35(WHAT_FFN)?.g32.enqueue_route_remap(
+            stream,
+            route.ids(),
+            map,
+            m * slots,
+            table,
+            c.sink,
+        )?;
+        let list = (&*table, GemmInput::Shared { top_k: slots });
+        slots_gemm(c, n, &d, list, &hid, rows, m)?;
+    }
     let one = (&*dense, GemmInput::PerSlot);
     gemm(c, (sh.gate_ty, &sh.gate), d.ff, &hid, one, m, g)?;
     gemm(c, (sh.up_ty, &sh.up), d.ff, &hid, one, m, u)?;
@@ -919,15 +947,29 @@ pub(super) fn ffn_card(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Res
     )
 }
 
+/// What the combine of a layer split between the card and a host tier reads
+/// beside the card's rows ([`ffn_combine`]).
+pub(super) struct HostSide<'a> {
+    /// Each slot's place in the card's stacks, [`HOST`] for the host's
+    /// (`hostleg`'s places), `pitch` a token.
+    pub(super) sel: &'a DeviceBuffer<u32>,
+    /// The host tier's routed sums, `hidden` a token.
+    pub(super) hsum: &'a DeviceBuffer<f32>,
+    /// The layer's experts on the card.
+    pub(super) n_card: usize,
+}
+
 /// The combine of the apart arm of [`ffn`] over `m` rows, after
 /// [`ffn_card`], into `out` (`None`: into `x`): the card's slots, the host's
-/// routed sum, the residual and the shared expert. Every routed slot is the
-/// card's on a whole-card load, so the host's routed sum is the zero rows.
+/// routed sum, the residual and the shared expert. `host` is the places and
+/// the host sums of a layer split with a host tier; `None` runs every
+/// routed slot on the card, so the host's sum is the arena's zero rows.
 pub(super) fn ffn_combine(
     c: &Ctx<'_>,
     n: &FfnPlan,
     s: &mut Arena,
     m: usize,
+    host: Option<HostSide<'_>>,
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     const WHAT_FFN: &str = "qwen3moe::wide::ffn_combine";
@@ -950,11 +992,18 @@ pub(super) fn ffn_combine(
     } = s;
     let wd = wide_of(wide, WHAT_FFN)?;
     let WideApart {
-        sel, y: sh_y, zero, ..
+        sel: own_sel,
+        y: sh_y,
+        zero,
+        ..
     } = wd.apart.as_mut().ok_or(GpuError::state(
         WHAT_FFN,
         "the wide part's buffers of a shared expert kept apart",
     ))?;
+    let (sel, hsum, n_card) = match host {
+        None => (&*own_sel, &*zero, n_routed),
+        Some(HostSide { sel, hsum, n_card }) => (sel, hsum, n_card),
+    };
     let y = match out {
         Some(y) => y,
         None => x,
@@ -965,12 +1014,12 @@ pub(super) fn ffn_combine(
             down,
             w: route.weights(),
             sel,
-            hsum: zero,
+            hsum,
             resid: ffn_inp,
             shared: Some((sh_y, used)),
             rows: d.hidden,
             pitch: d.slots(),
-            n_card: n_routed,
+            n_card,
             m,
             fault: c.sink,
             y,
