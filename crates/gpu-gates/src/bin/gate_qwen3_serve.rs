@@ -353,12 +353,17 @@
 //!   server renders (`/apply-template`, `/tokenize`) is the set's ids with each image's pad run
 //!   cut to the one placeholder id, and the tokens the server evaluates are the set's count.
 //!   FAIL-first: parts of a message joined by a newline throughout, not llama-server's rule;
-//! - `mmproj_image_chat_follows_set_f`: the greedy ids of [`F_STEPS`] steps after the prompts `c1`
-//!   and `c2` equal set F's CUDA ids over the prefix on which the set's CPU twin (a second
-//!   reading of mainline) gives the same ids, at least [`F_MIN_PREFIX`] long and printed; at the
-//!   first difference the oracle's id must be the server's own runner-up within [`F_NEAR_TIE`]
-//!   of its top ([`follows`]). FAIL-first: an image's grid taken as `(ny, nx)`, which `c2`'s
-//!   two images of other proportions show;
+//! - `mmproj_image_chat_follows_set_f`: on a server of its own (`--mmproj`, `--parallel 2`, a
+//!   flagged `--ctx` of [`SET_F_CTX`]: the host experts' rule is not the oracle's, so set F runs
+//!   on a load whose routed experts are all on the card) the greedy ids of [`F_STEPS`] steps after
+//!   the prompts `c1` and `c2` equal set F's CUDA ids over the prefix on which the set's CPU twin
+//!   (a second reading of mainline) gives the same ids, at least [`F_MIN_PREFIX`] long and
+//!   printed; at the first difference the oracle's id must be the server's own runner-up within
+//!   [`F_NEAR_TIE`] of its top ([`follows`]). FAIL-first: an image's grid taken as `(ny, nx)`,
+//!   which `c2`'s two images of other proportions show; the clause's precondition,
+//!   `mmproj_set_f_server_keeps_every_expert_on_the_card`, reads that server's plan record and
+//!   refuses by name a plan that keeps a routed expert on the host (a server at the seat's own
+//!   default `--ctx` does);
 //! - `mmproj_image_slot_beside_a_text_slot`: an image request posted on the second slot while a text
 //!   request decodes on the first answers the ids it answered alone, the text request too, and the
 //!   server ran rounds of both slots. FAIL-first: a media call that lands on the first slot.
@@ -380,7 +385,9 @@
 //! environment (the whole-card load and the budgeted placed one), and the
 //! late arm passes `--parallel 2` (whole-card, no lever); the host-tier
 //! arm (qwen3moe) pins `--parallel 1` (one prompt on
-//! the placed path is the clause).
+//! the placed path is the clause), and set F's image server passes `--parallel 2` at the
+//! flagged `--ctx` [`SET_F_CTX`] (the other image clauses' servers take the seat's own default
+//! `--ctx`).
 //!
 //! Held by another test, and not run here: the search rules of the unset
 //! `--ctx` — the fit, the base and the step, the trained cap, the margin of
@@ -2908,6 +2915,13 @@ mod gate {
     /// The tokens an image request answers: set F's decode steps.
     const F_STEPS: usize = 32;
 
+    /// Set F's server's `--ctx`, a total over `--parallel 2`: a context at which the seat's plan
+    /// keeps every routed expert on a 24 GB card beside the encoder's reserve, its load placed or,
+    /// where the card has room for the whole load, whole. The oracle's ids are the CUDA path's;
+    /// a host expert runs another rule, so past this context the clause would hold the host rule
+    /// to the card's.
+    const SET_F_CTX: usize = 16384;
+
     /// The widest gap between the server's top two logprobs at which an id that parts from the
     /// oracle's counts as a near tie, in nats.
     // PIN(2026-10-11): the Qwen3.6 image seat's own band, under the V4.1 `GREEDY_MARGIN` of 1.5, which
@@ -3350,8 +3364,99 @@ mod gate {
             }),
         );
 
-        image_requests(img, &addr, &err_log, dir, ok)?;
+        image_requests(img, &addr, &err_log, ok)?;
         println!("image server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
+    /// `mmproj_image_chat_follows_set_f`, on a server of its own: `--mmproj` over `--parallel 2` at
+    /// [`SET_F_CTX`]. Its plan record is read first (`mmproj_set_f_server_keeps_every_expert_on_the_card`):
+    /// a plan that keeps a routed expert on the host is refused by name and set F is not run,
+    /// since a host expert's rule is not the oracle's. A load with no plan record is the whole
+    /// model on the card.
+    fn image_set_f(model: &Path, img: &Images, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let d = dir.join("set-f");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mm = img
+            .mmproj
+            .to_str()
+            .ok_or("the projector path is not UTF-8")?;
+        let ctx = SET_F_CTX.to_string();
+        let mut s = Served::spawn_cmd(
+            serve_cmd()?,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "2",
+                "-m",
+                m,
+                "--mmproj",
+                mm,
+                "--ctx",
+                ctx.as_str(),
+            ],
+            &d,
+        )?;
+        let addr = match s.address(&err_log, 900, Duration::from_secs(1)) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("set F's server never listened: {e}");
+                check(ok, "mmproj_set_f_server_listens", false);
+                return Ok(());
+            }
+        };
+        let log = std::fs::read_to_string(&err_log)?;
+        let plan = log.lines().find(|l| l.starts_with("plan "));
+        let host = plan.map_or(Some(0), |l| field_u64(l, "host_experts"));
+        let at = plan
+            .and_then(|l| field_u64(l, "ctx_max"))
+            .unwrap_or(SET_F_CTX as u64);
+        let on_card = host == Some(0);
+        if !on_card {
+            let kept = host.map_or_else(
+                || "an unread count of experts".to_owned(),
+                |h| h.to_string(),
+            );
+            println!(
+                "set F needs every routed expert on the card: the plan at ctx {at} keeps {kept} on \
+                 the host"
+            );
+        }
+        check(
+            ok,
+            "mmproj_set_f_server_keeps_every_expert_on_the_card",
+            on_card,
+        );
+        if on_card {
+            let url = |p: &str| format!("http://{addr}{p}");
+            let mut f = true;
+            for (k, n) in ["c1", "c2"].into_iter().enumerate() {
+                let body = ask(&img.case(n)?, F_STEPS);
+                let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+                std::fs::write(dir.join(format!("chat-{n}.json")), &text)?;
+                let a = answered(st, &text)?;
+                let (agreed, gap, holds) = follows(&a, &img.f[k]);
+                println!(
+                    "F {n}: {} ids, the prompt {} tokens (set {}); equal to the oracle's CUDA ids \
+                     for {agreed} of the {} the oracle's CPU twin agrees on (the gap at the first \
+                     difference {gap:?}), the rule {}; said {:?}",
+                    a.ids.len(),
+                    a.prompt,
+                    img.c[k].ids()?.len(),
+                    img.f[k].agree,
+                    if holds { "holds" } else { "fails" },
+                    a.text.chars().take(80).collect::<String>()
+                );
+                f &= holds && a.prompt == img.c[k].ids()?.len() as u64;
+            }
+            check(ok, "mmproj_image_chat_follows_set_f", f);
+        }
+        println!("set F's server stopped: {}", s.stop()?);
         Ok(())
     }
 
@@ -3444,13 +3549,12 @@ mod gate {
         Ok(said == want)
     }
 
-    /// The image server's request clauses (module header): `mmproj_prompt_ids_are_set_e`,
-    /// `mmproj_image_chat_follows_set_f` and `mmproj_image_slot_beside_a_text_slot`.
+    /// The image server's request clauses (module header): `mmproj_prompt_ids_are_set_e` and
+    /// `mmproj_image_slot_beside_a_text_slot`; set F has a server of its own ([`image_set_f`]).
     fn image_requests(
         img: &Images,
         addr: &str,
         err_log: &Path,
-        dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let url = |p: &str| format!("http://{addr}{p}");
@@ -3487,29 +3591,6 @@ mod gate {
             j1 &= ids == want && served == u64::try_from(oracle.len()).ok();
         }
         check(ok, "mmproj_prompt_ids_are_set_e", j1);
-
-        // F: 32 greedy ids after c1 and c2.
-        let mut f = true;
-        for (k, n) in ["c1", "c2"].into_iter().enumerate() {
-            let body = ask(&img.case(n)?, F_STEPS);
-            let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
-            std::fs::write(dir.join(format!("chat-{n}.json")), &text)?;
-            let a = answered(st, &text)?;
-            let (agreed, gap, holds) = follows(&a, &img.f[k]);
-            println!(
-                "F {n}: {} ids, the prompt {} tokens (set {}); equal to the oracle's CUDA ids for \
-                 {agreed} of the {} the oracle's CPU twin agrees on (the gap at the first \
-                 difference {gap:?}), the rule {}; said {:?}",
-                a.ids.len(),
-                a.prompt,
-                img.c[k].ids()?.len(),
-                img.f[k].agree,
-                if holds { "holds" } else { "fails" },
-                a.text.chars().take(80).collect::<String>()
-            );
-            f &= holds && a.prompt == img.c[k].ids()?.len() as u64;
-        }
-        check(ok, "mmproj_image_chat_follows_set_f", f);
 
         // S6: an image request on one slot beside a text request on the other. Each answers
         // what it answered alone, and the server ran rounds of both slots together.
@@ -3738,7 +3819,8 @@ mod gate {
                 image_without_mmproj_is_refused(model, &img, &d, ok)?;
                 image_plan(model, &img, &d, ok)?;
                 image_whole_fit(model, &img, &d, ok)?;
-                image_server(model, &img, &d, ok)
+                image_server(model, &img, &d, ok)?;
+                image_set_f(model, &img, &d, ok)
             }
             other => Err(format!("{}: images on a {other:?} file", model.display()).into()),
         }
